@@ -4,17 +4,17 @@
 check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
 
-check-net: build/minyarc tests/network_evidence.py
+check-net: build/minyarc build/tooling/tests/net-native-test
 	python3 tests/soak-observer-test.py
-	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/net-native.py --mode native --evidence "$$evidence"
+	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-native-test --mode native --evidence "$$evidence"
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
-	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/net-native.py --mode sanitize --evidence "$$evidence"
+	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-native-test --mode sanitize --evidence "$$evidence"
 endif
 
-check-net-loop: build/minyarc tests/network_evidence.py
-	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-loop.XXXXXX"); echo "Event-loop native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/net-loop.py --mode native --evidence "$$evidence"
+check-net-loop: build/minyarc build/tooling/tests/net-loop-test
+	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-loop.XXXXXX"); echo "Event-loop native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-loop-test --mode native --evidence "$$evidence"
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
-	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/net-loop.py --mode sanitize --evidence "$$evidence"
+	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-loop-test --mode sanitize --evidence "$$evidence"
 endif
 
 check-net-connect: build/minyarc build/tooling/tests/net-connect-test

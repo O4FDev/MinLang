@@ -1,0 +1,172 @@
+use "../tools/testing.min" as test
+use "./net-fixtures.min" as fixtures
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Evidence { enabled: Boolean; directory: Text; root: Text; records: List<Text>; errors: List<Text>; inputs: List<Text>; digests: List<Text>; serial: Integer }
+
+function hashed(evidence: Evidence, path: Text, operation: Text): Text {
+    let scratch = evidence.root + "/build"
+    let log = scratch + "/.net-evidence-" + Text(system.processId())
+    let result = test.run(["sha256sum", "--", path], system.environment(), "", log, 30)
+    files.remove(log)
+    files.remove(log + ".err")
+    if result.status != 0 {
+        evidence.errors.add("{\"operation\": " + json.quote(operation) + ", \"error\": " + json.quote(fixtures.strip(result.errorOutput)) + "}")
+        return ""
+    }
+    return fixtures.split(result.output, 32)[0]
+}
+function quoteOrNull(value: Text): Text {
+    if value == "" { return "null" }
+    return json.quote(value)
+}
+public function create(root: Text, requested: Text, work: Text, sources: List<Text>): Evidence {
+    let directory = work
+    let enabled = requested != ""
+    if enabled {
+        directory = requested
+        if !fixtures.starts(directory, "/") { directory = root + "/" + directory }
+        test.require(test.run(["mkdir", "-p", directory], system.environment(), "", work + "/mkdir-evidence", 10), "create evidence directory")
+        test.check(files.list(directory).length == 0, "network evidence directory must be empty")
+    }
+    let evidence = Evidence { enabled: enabled; directory: directory; root: root; records: []; errors: []; inputs: []; digests: []; serial: 0 }
+    if enabled {
+        let headers = test.run(["find", root + "/runtime", "-name", "*.h", "-type", "f"], system.environment(), "", work + "/headers", 30)
+        test.require(headers, "list runtime headers")
+        let names = sources
+        for line in test.lines(headers.output) { names.add(Text(Bytes(line).slice(root.byteLength + 1, line.byteLength))) }
+        for name in names {
+            evidence.inputs.add(name)
+            evidence.digests.add(hashed(evidence, root + "/" + name, "input hash: " + name))
+        }
+    }
+    return evidence
+}
+function resolveTool(command: Text, environment: List<Text>): Text {
+    if test.contains(command, "/") {
+        if files.pathSize(command) >= 0 {
+            if fixtures.starts(command, "/") { return command }
+            return system.getenv("PWD") + "/" + command
+        }
+        return ""
+    }
+    for directory in fixtures.split(fixtures.value(environment, "PATH"), 58) {
+        if directory != "" && files.pathSize(directory + "/" + command) >= 0 { return directory + "/" + command }
+    }
+    return ""
+}
+public record Outcome { status: Integer; output: Text; errorOutput: Text; failure: Text }
+public function run(evidence: Evidence, command: List<Text>, phase: Text, environment: List<Text>, cwd: Text, seconds: Integer, capture: Boolean, check: Boolean): Outcome {
+    evidence.serial += 1
+    let log = evidence.directory + "/.run-" + Text(evidence.serial)
+    if !evidence.enabled {
+        let result = test.run(command, environment, cwd, log, seconds)
+        files.remove(log)
+        files.remove(log + ".err")
+        if !capture { fixtures.emit(result.output); system.writeStandardError(result.errorOutput) }
+        let failure = ""
+        if result.status == 124 { failure = "TimeoutExpired: " + command[0] }
+        if check && result.status != 0 && failure == "" { failure = "CalledProcessError: " + phase + " returned " + Text(result.status) }
+        return Outcome { status: result.status; output: result.output; errorOutput: result.errorOutput; failure: failure }
+    }
+    let tool = resolveTool(command[0], environment)
+    let toolDigest = ""
+    if tool != "" { toolDigest = hashed(evidence, tool, "tool hash") }
+    let argv: List<Text> = []
+    for item in command { argv.add(json.quote(item)) }
+    let selected: List<Text> = []
+    for name in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "MINYAR_TEST_CLANG", "MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] {
+        for entry in environment {
+            if fixtures.starts(entry, name + "=") { selected.add(json.quote(name) + ": " + json.quote(fixtures.value(environment, name))) }
+        }
+    }
+    let directory = cwd
+    if directory == "" { directory = system.getenv("PWD") }
+    let started = system.monotonicNanoseconds()
+    let result = test.run(command, environment, cwd, log, seconds)
+    let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    let failure = ""
+    let row = ["{\"argv\": [", fixtures.joinWords(argv), "], \"phase\": ", json.quote(phase), ", \"cwd\": ", json.quote(directory),
+        ", \"tool\": ", quoteOrNull(tool), ", \"tool_sha256\": ", quoteOrNull(toolDigest), ", \"environment\": {", joinWithComma(selected), "}"]
+    if result.status == 124 {
+        failure = "TimeoutExpired: " + command[0]
+        row.add(", \"exception\": " + json.quote(failure) + ", \"timed_out\": true")
+    } else {
+        row.add(", \"status\": " + Text(result.status))
+        if check && result.status != 0 {
+            failure = "CalledProcessError: Command returned non-zero exit status " + Text(result.status)
+            row.add(", \"exception\": " + json.quote(failure))
+        }
+    }
+    row.add(", \"elapsed_seconds\": " + Text(elapsed))
+    let prefix = fixtures.padded(evidence.records.length + 1, 2) + "-" + phase
+    for stream in ["stdout", "stderr"] {
+        let data = result.output
+        let source = log
+        if stream == "stderr" { data = result.errorOutput; source = log + ".err" }
+        let path = evidence.directory + "/" + prefix + "." + stream
+        if files.rename(source, path) != 0 { evidence.errors.add("{\"operation\": " + json.quote(stream + " write") + ", \"error\": \"rename failed\"}") }
+        row.add(", " + json.quote(stream) + ": {\"path\": " + json.quote(prefix + "." + stream) + ", \"sha256\": " + quoteOrNull(hashed(evidence, path, stream + " hash")) + ", \"bytes\": " + Text(data.byteLength) + "}")
+    }
+    if tool != "" {
+        let after = hashed(evidence, tool, "tool after hash")
+        row.add(", \"tool_after_sha256\": " + quoteOrNull(after))
+        if after != toolDigest { evidence.errors.add("{\"operation\": \"tool binding\", \"error\": \"command executable changed\"}") }
+    }
+    row.add("}")
+    evidence.records.add(joinText(row))
+    if !capture { fixtures.emit(result.output); system.writeStandardError(result.errorOutput) }
+    if failure == "" && evidence.errors.length > 0 { failure = "RuntimeError: network evidence capture failed: [" + joinWithComma(evidence.errors) + "]" }
+    return Outcome { status: result.status; output: result.output; errorOutput: result.errorOutput; failure: failure }
+}
+public function joinWithComma(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items {
+        if parts.length > 0 { parts.add(", ") }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+public function finish(evidence: Evidence, modes: List<Text>, status: Text, primary: Text) {
+    if !evidence.enabled {
+        test.check(primary == "", primary)
+        return
+    }
+    let inputs: List<Text> = []
+    let after: List<Text> = []
+    for index in 0..evidence.inputs.length {
+        let name = evidence.inputs[index]
+        let current = hashed(evidence, evidence.root + "/" + name, "input after hash: " + name)
+        if current != evidence.digests[index] { evidence.errors.add("{\"operation\": \"input binding\", \"error\": " + json.quote("source input changed: " + name) + "}") }
+        inputs.add(json.quote(name) + ": " + quoteOrNull(evidence.digests[index]))
+        after.add(json.quote(name) + ": " + quoteOrNull(current))
+    }
+    let names = files.list(evidence.directory).sorted()
+    let listed: List<Text> = []
+    for name in names {
+        if !fixtures.starts(name, ".") { listed.add(json.quote(name) + ": " + quoteOrNull(hashed(evidence, evidence.directory + "/" + name, "artifact hash: " + name))) }
+    }
+    let quotedModes: List<Text> = []
+    let native = false
+    for mode in modes {
+        quotedModes.add(json.quote(mode))
+        if fixtures.ends(mode, "native") { native = true }
+    }
+    let final = status
+    if evidence.errors.length > 0 || primary != "" { final = "failed" }
+    let scope = "null"
+    if native { scope = "\"ordinary-launcher-path\"" }
+    let report = ["{\n  \"schema_version\": 1,\n  \"status\": ", json.quote(final), ",\n  \"modes\": [", joinWithComma(quotedModes),
+        "],\n  \"public_program_sanitizer_enabled_by_suite\": false,\n  \"public_program_scope\": ", scope,
+        ",\n  \"windows_sanitizer_enabled_by_suite\": false,\n  \"inputs\": {", joinWithComma(inputs), "},\n  \"inputs_after\": {", joinWithComma(after),
+        "},\n  \"commands\": [", joinWithComma(evidence.records), "],\n  \"files\": {", joinWithComma(listed), "},\n  \"primary_error\": ", quoteOrNull(primary),
+        ",\n  \"evidence_errors\": [", joinWithComma(evidence.errors), "]\n}\n"]
+    writeTextFile(evidence.directory + "/manifest.json", joinText(report))
+    if evidence.errors.length > 0 {
+        system.writeStandardError("Network evidence finalization errors: [" + joinWithComma(evidence.errors) + "]\n")
+        test.check(primary != "", "network evidence finalization failed")
+    }
+    test.check(primary == "", primary)
+}

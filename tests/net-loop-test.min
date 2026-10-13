@@ -1,0 +1,68 @@
+use "./net-fixtures.min" as fixtures
+use "./net-evidence.min" as evidence
+use "../tools/testing.min" as test
+use "system" as system
+
+fixtures.arguments([], ["--mode", "--evidence"])
+let requested = fixtures.option("--mode", "")
+test.check(requested == "" || requested == "native" || requested == "sanitize", "invalid mode: " + requested)
+let context = fixtures.context(false)
+let platform = fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output)
+let windows = platform == "Windows" || fixtures.starts(platform, "MSYS") || fixtures.starts(platform, "MINGW") || fixtures.starts(platform, "CYGWIN")
+if windows && requested == "sanitize" {
+    system.writeStandardError("net-loop-test: error: event-loop sanitizer mode is unavailable in this suite on Windows\n")
+    fixtures.finish(context)
+    exit(2)
+}
+let modes = ["native", "sanitize", "app-native", "app-sanitize"]
+if requested == "native" { modes = ["native", "app-native"] }
+if requested == "sanitize" { modes = ["sanitize", "app-sanitize"] }
+if windows { modes = ["native"] }
+let suffix = ""
+if windows { suffix = ".exe" }
+let clang = fixtures.value(context.environment, "MINYAR_TEST_CLANG")
+if clang == "" { clang = "clang" }
+let record = evidence.create(context.root, fixtures.option("--evidence", ""), context.work, ["tests/net-loop-test.min", "tests/net-evidence.min", "tests/net-fixtures.min",
+    "tests/net-loop.c", "runtime/native/net.c", "tests/net-loop.min", "runtime/minyar_runtime.c", "library/eventloop.min", "library/net.min", "minyar"])
+let leaks = "detect_leaks=0"
+if platform == "Linux" { leaks = "detect_leaks=1" }
+let failure = ""
+if record.enabled { failure = evidence.run(record, [clang, "--version"], "clang-version", context.environment, "", 10, true, true).failure }
+for mode in modes {
+    if failure != "" { break }
+    let executable = record.directory + "/" + mode + suffix
+    let flags = ["-O2"]
+    if !fixtures.ends(mode, "native") { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    if fixtures.starts(mode, "app-") { flags.add("-DMINYAR_APP_EVENT_LOOP=1") }
+    let command = [clang, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-Wall", "-Wextra", "-Werror"]
+    for flag in flags { command.add(flag) }
+    for item in [context.root + "/tests/net-loop.c", context.root + "/runtime/minyar_runtime.c", "-lm", "-o", executable] { command.add(item) }
+    if windows { command.add("-lws2_32") }
+    failure = evidence.run(record, command, mode + "-compile", context.environment, context.root, 600, false, true).failure
+    let environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+    if failure == "" { failure = evidence.run(record, [executable], mode + "-run", environment, "", 30, false, true).failure }
+}
+if failure == "" {
+    if requested != "sanitize" {
+        for mode in ["--debug", "--release"] {
+            if failure != "" { break }
+            let name = Text(Bytes(mode).slice(2, mode.byteLength))
+            let program = record.directory + "/minyar-" + name + suffix
+            let compiled = evidence.run(record, [context.root + "/minyar", mode, context.root + "/tests/net-loop.min", "-o", program], name + "-compile", context.environment, context.root, 60, true, false)
+            failure = compiled.failure
+            if failure == "" && compiled.status != 0 { failure = "AssertionError: " + compiled.errorOutput }
+            if failure == "" {
+                let result = evidence.run(record, [program], name + "-run", context.environment, "", 30, true, true)
+                failure = result.failure
+                if failure == "" && result.output != "loop module verified\n" { failure = "AssertionError: " + result.output + result.errorOutput }
+            }
+        }
+        if failure == "" { print("Compiled Minyar event loop API verified at O0/release") }
+    } else {
+        print("Native event loop ASan/UBSan contracts verified")
+    }
+}
+let status = "failed"
+if failure == "" { status = "passed" }
+evidence.finish(record, modes, status, failure)
+fixtures.finish(context)
