@@ -115,6 +115,23 @@ class OwnershipPolicy(unittest.TestCase):
                                   result.stdout + result.stderr)
                 self.assertFalse(llvm.exists())
 
+    def test_callback_budget_preserves_environment_and_function_boundary(self):
+        source = self.work / 'callback.min'
+        source.write_text('let formatter = function(seed: Integer): Text {\n'
+                          'let value = Text(seed)\nreturn value\n}\nprint(formatter(42))\n')
+        llvm = self.work / 'callback.ll'
+        self.run_tool([COMPILER, source, llvm, '--bounded-owners', '2'])
+        body = re.search(r'^define [^\n]+ @\.minyar\.closure\.\d+\([^\n]+\) noinline \{\n.*?^\}',
+                         llvm.read_text(), re.M | re.S)
+        self.assertIsNotNone(body)
+        self.assertEqual(body.group(0).count('@minyar_callback_check_environment('), 1)
+        self.assertEqual(body.group(0).count('@minyar_rc_enter_stack_v1('), 1)
+        binary = self.work / 'callback.program'
+        self.run_tool([ROOT / 'minyar', '--memory-profile', 'system', '--cleanup-budget', '2',
+                       source, '-o', binary])
+        result = self.run_tool([binary])
+        self.assertEqual((result.stdout, result.stderr), ('42\n', ''))
+
     def test_loop_backedges_service_debt_only_in_ownership_functions(self):
         source = self.work / 'loop-service.min'
         source.write_text('''function owned(count: Integer): Integer {
