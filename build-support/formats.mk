@@ -6,6 +6,7 @@
 .PHONY: check-formats-pipeline check-formats-pipeline-sanitize
 .PHONY: bench-formats bench-compression bench-sha256 bench-tar
 
+build/tooling/tests/compression-provider build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
 check-compression: build/minyarc build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native

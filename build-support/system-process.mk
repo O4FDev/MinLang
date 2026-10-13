@@ -1,5 +1,6 @@
 .PHONY: check-system-services check-system-services-sanitize check-system-process check-system-process-sanitize
 .PHONY: check-system-process-boundary
+build/tooling/tests/system-process-boundary build/tooling/tests/system-services-test build/tooling/tests/system-process-test: build/tooling/tools/clang-driver
 build/tooling/tests/system-process-boundary: TOOL_NATIVE = tests/sha256-test-native.c tests/system-test-path-native.c
 build/tooling/tests/system-process-boundary: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/system-process-boundary: tests/sha256-test-native.c tests/system-test-path-native.c

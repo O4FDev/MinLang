@@ -746,7 +746,7 @@ class BuildWiring(unittest.TestCase):
         fragment = source[begin:end + 1]
         expected = {'build/minyarc', 'tests/generated-llvm-sanitizer.py',
                     'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
-                    'tools/sanitizer_llvm.py', 'tools/clang-driver.py'}
+                    'tools/sanitizer_llvm.py', 'build/tooling/tools/clang-driver'}
 
         def verify(candidate, sanitizer=None, selected=None, directory='/clang64/bin'):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
@@ -755,8 +755,8 @@ class BuildWiring(unittest.TestCase):
                                  'SANITIZER_LIMITED := sanitizer-limit\n'
                                  'PATH := /retained/native/bin:/usr/bin\n'
                                  'MINYAR_SANITIZER_CLANG := ' + (sanitizer or '') + '\n'
-                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
-                                 'build build/minyarc build/yamux-peer:\n')
+                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer build/tooling/tools/clang-driver\n'
+                                 'build build/minyarc build/yamux-peer build/tooling/tools/clang-driver:\n')
                 environment = dict(os.environ)
                 environment.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],

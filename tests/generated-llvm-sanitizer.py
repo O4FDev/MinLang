@@ -21,7 +21,7 @@ from clang_helpers import asan_leak_options
 from test_evidence import terminate_process_tree
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / 'tools/clang-driver.py'
+DRIVER = ROOT / 'build/tooling/tools/clang-driver'
 CLANG = os.environ.get('MINYAR_TEST_CLANG', os.environ.get('LLVM_CC', 'clang'))
 
 
@@ -117,12 +117,12 @@ entry:
     environment = {'MINYAR_CLANG': CLANG, 'MINYAR_RUNTIME_FLAGS': options,
                    'MINYAR_CLANG_FLAGS': options, 'MINYAR_NATIVE_FLAGS': options,
                    'MINYAR_LINK_ARTIFACTS': str(out / 'link-inputs')}
-    observation.success('runtime-compile', [sys.executable, str(DRIVER), 'compile',
+    observation.success('runtime-compile', [str(DRIVER), 'compile',
             '-iquote', str(ROOT/'runtime'), '-c', str(native_source), '-o', str(runtime)],
             environment=environment)
     before = {path.name: digest(path) for path in (raw, llvm, runtime)}
     binary = out / ('unsafe.exe' if os.name == 'nt' else 'unsafe')
-    observation.success('public-link', [sys.executable, str(DRIVER), 'link', str(ROOT),
+    observation.success('public-link', [str(DRIVER), 'link', str(ROOT),
             str(llvm), str(runtime), str(binary), '0'], environment=environment)
     status, stdout, stderr = observation.run('unsafe-run', [str(binary)])
     observation.manifest['files'].update({path.name: digest(path)
@@ -179,6 +179,17 @@ def helper_controls(observation):
         (observation.directory / f'header-{index}.asan.ll').write_bytes(transformed.encode())
         observed.append(dict(index=index, raw_sha256=hashlib.sha256(raw.encode()).hexdigest(),
                              annotated_sha256=hashlib.sha256(transformed.encode()).hexdigest()))
+    native = observation.directory / 'native-headers'
+    native.mkdir()
+    for index, raw in enumerate(variants):
+        source = native / f'header-{index}.raw.ll'
+        source.write_bytes(raw.encode())
+        observation.success(f'native-header-{index}', [str(DRIVER), 'sanitize-llvm', str(source),
+                                                        str(native / f'header-{index}.asan.ll')])
+        assert (native / f'header-{index}.asan.ll').read_bytes() == helper.instrument_address_sanitizer(raw).encode()
+        observation.success(f'native-header-{index}-again', [str(DRIVER), 'sanitize-llvm',
+                str(native / f'header-{index}.asan.ll'), str(native / f'header-{index}.again.ll')])
+        assert (native / f'header-{index}.again.ll').read_bytes() == (native / f'header-{index}.asan.ll').read_bytes()
     for raw in ('declare void @only()\n', 'define void @bad( {\n',
                 'define void @multiline(\n) {\n}\n', 'define void @"bad() {\n',
                 'define void @bad() #9 {\n}\n', 'define void @bad() {\n}\ndefine void @no_body()\n'):
@@ -188,6 +199,11 @@ def helper_controls(observation):
             pass
         else:
             raise AssertionError('malformed function header accepted: ' + repr(raw))
+        source = native / 'malformed.raw.ll'
+        source.write_bytes(raw.encode())
+        status, _, stderr = observation.run('native-malformed', [str(DRIVER), 'sanitize-llvm', str(source),
+                                                                 str(native / 'malformed.asan.ll')])
+        assert status != 0 and stderr.startswith(b'minyar: generated LLVM'), (raw, status, stderr)
     flag_controls = [
         ([], False), (['-fsanitize=undefined'], False),
         (['-fsanitize=address'], True),
@@ -214,7 +230,7 @@ def link_controls(observation):
     raw_before = original.read_bytes()
     native = out / 'ordinary-runtime.o'
     source = out / 'runtime.c'
-    observation.success('ordinary-runtime-compile', [sys.executable, str(DRIVER), 'compile',
+    observation.success('ordinary-runtime-compile', [str(DRIVER), 'compile',
             '-iquote', str(ROOT/'runtime'), '-c', str(source), '-o', str(native)],
             environment={'MINYAR_CLANG': CLANG, 'MINYAR_RUNTIME_FLAGS': '-O1'})
     native_before = digest(native)
@@ -230,7 +246,7 @@ def link_controls(observation):
         evidence = out / (label + '-inputs')
         environment = {'MINYAR_CLANG': CLANG, 'MINYAR_CLANG_FLAGS': flags,
                        'MINYAR_LINK_ARTIFACTS': str(evidence)}
-        observation.success(label + '-link', [sys.executable, str(DRIVER), 'link', str(ROOT),
+        observation.success(label + '-link', [str(DRIVER), 'link', str(ROOT),
                 str(original), str(native), str(binary), '0'], environment=environment)
         stdout, stderr = observation.success(label + '-run', [str(binary)])
         assert stdout == b'42\n' and not stderr, (label, stdout, stderr)
@@ -246,7 +262,7 @@ def link_controls(observation):
             assert not (evidence / 'program.asan.ll').exists()
         # Reusing an evidence generation must fail without replacing its bytes.
         if label == 'enabled':
-            status, _, stderr = observation.run('artifact-collision', [sys.executable, str(DRIVER),
+            status, _, stderr = observation.run('artifact-collision', [str(DRIVER),
                     'link', str(ROOT), str(original), str(native), str(binary), '0'],
                     environment=environment)
             assert status != 0 and b'File exists' in stderr
@@ -266,7 +282,7 @@ def link_controls(observation):
         if index == 2:
             (project / 'runtime/value.h').write_text('#define VALUE 2\n')
         evidence = out / f'cache-{index}-inputs'
-        observation.success(f'cache-link-{index}', [sys.executable, str(DRIVER), 'link', str(project),
+        observation.success(f'cache-link-{index}', [str(DRIVER), 'link', str(project),
                 str(llvm), str(native), str(out/f'cache-{index}'), '0'],
                 environment={'MINYAR_CLANG': CLANG, 'MINYAR_CLANG_FLAGS': '-O1 -fsanitize=address,undefined',
                              'MINYAR_LINK_ARTIFACTS': str(evidence)})
@@ -284,7 +300,7 @@ def link_controls(observation):
     protected.write_bytes(b'prior published executable')
     environment = {'MINYAR_CLANG': CLANG, 'MINYAR_CLANG_FLAGS': '-fsanitize=address',
                    'MINYAR_LINK_ARTIFACTS': str(out/'invalid-header-inputs')}
-    status, _, stderr = observation.run('reject-invalid-header', [sys.executable, str(DRIVER),
+    status, _, stderr = observation.run('reject-invalid-header', [str(DRIVER),
             'link', str(ROOT), str(malformed), str(native), str(protected), '0'],
             environment=environment)
     assert status != 0 and b'sanitizer coverage cannot be assumed' in stderr
@@ -295,7 +311,7 @@ def link_controls(observation):
     for option, expected in (('-O1 -fsanitize=address,undefined', b'object\n'),
                              ('-O1', b'llvm\n')):
         stdout, stderr = observation.success('runtime-format-' + expected.strip().decode(),
-            [sys.executable, str(DRIVER), 'runtime-format'],
+            [str(DRIVER), 'runtime-format'],
             environment={'MINYAR_RUNTIME_FLAGS': option})
         assert stdout == expected and not stderr
     observation.manifest['native_cache_controls'] = dict(objects=identities, stamps=stamps,

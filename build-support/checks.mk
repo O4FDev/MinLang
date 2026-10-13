@@ -76,7 +76,7 @@ check-memory: build/minyarc build/minyar-runtime.o build/tooling/tests/memory
 check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
 
-check-modules: build/minyarc build/minyar-runtime.o
+check-modules: build/minyarc build/minyar-runtime.o build/tooling/tools/clang-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) sh tests/run-module-tests.sh
 
 .PHONY: check-json-parser check-json-parser-sanitize
@@ -127,14 +127,14 @@ check-windows-large-file:
 check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/compiler-stage3.ll
 
-check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic
+check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver
 	$(LIMITED) python3 tests/mutation.py
 
 .PHONY: check-mutation-score-harness
 check-mutation-score-harness: build/tooling/tests/mutation-score-harness build/tooling/tests/mutation-score
 	$(LIMITED) ./build/tooling/tests/mutation-score-harness "$(CURDIR)/build/tooling/tests/mutation-score"
 
-check-mutation-score: check-mutation-score-harness build/tooling/tests/regressions build/tooling/tests/list-literals build/tooling/tests/linkage build/tooling/tests/mutation-score build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters build/tooling/tests/symbol-order build/tooling/tools/test-clang build/tooling/tools/clang-cache build/tooling/tests/compiler-contracts build/tooling/tests/compiler-hardening build/tooling/tests/binary-expression-ownership build/tooling/tests/source-map
+check-mutation-score: check-mutation-score-harness build/tooling/tools/clang-driver build/tooling/tests/regressions build/tooling/tests/list-literals build/tooling/tests/linkage build/tooling/tests/mutation-score build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters build/tooling/tests/symbol-order build/tooling/tools/test-clang build/tooling/tools/clang-cache build/tooling/tests/compiler-contracts build/tooling/tests/compiler-hardening build/tooling/tests/binary-expression-ownership build/tooling/tests/source-map
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
 
 
@@ -193,7 +193,7 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 .PHONY: check-sanitize-core
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
 
-check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions
+check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
@@ -713,7 +713,7 @@ check check-portable: check-redis-protocol check-redis-pipeline
 check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
 
 .PHONY: check-native-cache
-check-native-cache:
+check-native-cache: build/tooling/tools/clang-driver
 	$(LIMITED) python3 tests/native-object-cache.py
 
 .PHONY: check-package-native-inputs
@@ -745,7 +745,8 @@ check-portable: check-native-bytes
 
 
 .PHONY: check-module-test-driver check-build-wiring
-check-module-test-driver: build/minyarc build/minyar-runtime.o build/tooling/tests/module-test-driver
+build/tooling/tests/module-test-driver: build/tooling/tools/clang-driver
+check-module-test-driver: build/minyarc build/minyar-runtime.o build/tooling/tests/module-test-driver build/tooling/tools/clang-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/module-test-driver
 
 check-build-wiring: build/tooling/tests/suite-catalogue
@@ -847,7 +848,7 @@ check-tls-sanitize: check-tls-signing-usage-sanitize
 GENERATED_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
 GENERATED_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call GENERATED_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
 GENERATED_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG))):$(PATH),$(PATH))
-GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-llvm-sanitizer.min tests/llvm_sanitizer.py tests/clang_helpers.py tests/test_evidence.py tools/clang-driver.py tools/sanitizer_llvm.py tools/host_paths.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-llvm-sanitizer.min tests/llvm_sanitizer.py tests/clang_helpers.py tests/test_evidence.py build/tooling/tools/clang-driver tools/sanitizer_llvm.py tools/host_paths.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer

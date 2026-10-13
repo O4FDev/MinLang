@@ -13,7 +13,7 @@ link_module() {
     llvm=$2
     executable=$3
     MINYAR_CLANG="$clang_command" MINYAR_CLANG_FLAGS="$optimization -Wno-override-module" \
-        python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm" \
+        "$project_dir/build/tooling/tools/clang-driver" link "$project_dir" "$llvm" \
         "$project_dir/build/minyar-runtime.o" "$executable" 0
 }
 
