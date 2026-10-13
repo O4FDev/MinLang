@@ -20,7 +20,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_paths import host_path, pinned_llvm
+from host_paths import host_path, pinned_llvm, pinned_lld
 from sanitizer_llvm import address_sanitizer_enabled, thread_sanitizer_enabled, instrument_program_sanitizers
 
 
@@ -259,6 +259,9 @@ def lto_flags(clang, link_flags):
     # Prefer the toolchain's lld when available unless the user chose a linker.
     if platform.system() != 'Darwin' and not any(a.startswith(('-fuse-ld=', '--ld-path=')) for a in link_flags):
         system = platform.system()
+        if system == 'Linux':
+            linker = subprocess.check_output([clang, '-print-prog-name=ld.lld'], text=True, timeout=10).strip()
+            return lto + ['-fuse-ld=' + pinned_lld(linker)]
         windows = system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
         names = ('ld.lld.exe', 'ld.lld') if windows else ('ld.lld',)
         directory = host_path(shutil.which(clang) or clang).resolve().parent

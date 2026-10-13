@@ -46,6 +46,9 @@ from pathlib import Path
 if '--version' in sys.argv:
     print(os.environ.get('TEST_CLANG_VERSION', 'clang version 23.1.2'))
     sys.exit(0)
+if '-print-prog-name=ld.lld' in sys.argv:
+    print(Path(__file__).parent / 'ld.lld')
+    sys.exit(0)
 with open(os.environ['TEST_CLANG_LOG'], 'a') as f:
     f.write(json.dumps(sys.argv[1:]) + '\\n')
 Path(sys.argv[sys.argv.index('-o') + 1]).write_text('; output\\n')
@@ -63,6 +66,7 @@ if '--libs' in sys.argv: print('-lglfw')
         for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_RUNTIME_FLAGS', 'MINYAR_MAKE_FLAGS', 'MAKEFLAGS', 'MFLAGS'):
             self.env.pop(name, None)
         self.source = self.work / 'source file.min'
+        self.write_executable(self.clang.parent / 'ld.lld', 'print("LLD 23.1.2")\n')
         self.source.write_text('print(42)\n')
         self.output = self.work / 'output program'
 
@@ -144,11 +148,20 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
 
     def test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths(self):
         linker = self.clang.parent / 'ld.lld'
-        self.write_executable(linker, 'pass\n')
+        self.write_executable(linker, 'print("LLD 23.1.2")\n')
         environment = self.bootstrap_environment()
         self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']),
                          ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
         self.assertEqual(environment['LIMITED'], self.env['LIMITED'])
+
+    def test_linux_bootstrap_rejects_old_or_missing_matching_linker(self):
+        linker = self.clang.parent / 'ld.lld'
+        self.write_executable(linker, 'print("LLD 18.1.3")\n')
+        with self.assertRaisesRegex(ValueError, 'requires LLVM 23.1.2; unsupported linker'):
+            self.bootstrap_environment()
+        linker.unlink()
+        with self.assertRaisesRegex(ValueError, 'requires LLVM 23.1.2; LLD executable not found'):
+            self.bootstrap_environment()
 
     def test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged(self):
         spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
@@ -255,7 +268,7 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
                 self.assertEqual(os.environ.get('MSYS2_ARG_CONV_EXCL'),existing)
 
     def test_bootstrap_preserves_explicit_limits_lto_and_linker_threads(self):
-        self.write_executable(self.clang.parent / 'ld.lld', 'pass\n')
+        self.write_executable(self.clang.parent / 'ld.lld', 'print("LLD 23.1.2")\n')
         configured = '-flto=thin ' + shlex.quote('-fuse-ld=/linker path/ld.lld') + ' -Wl,--threads=3'
         environment = self.bootstrap_environment({'COMPILER_LTO_FLAGS': configured,
                         'MINYAR_MAX_MEMORY_MIB': '384', 'MINYAR_MAX_CPU_SECONDS': '90'})
