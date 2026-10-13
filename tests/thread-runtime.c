@@ -246,6 +246,75 @@ static long long no_work(long long seed, void *frozen, void *channel) {
     (void)frozen; (void)channel;
     return seed;
 }
+static long long recovery_entry(long long kind, void *frozen, void *channel) {
+    size_t depth = minyar_call_depth;
+    RcFrame *root = rc_frames;
+    if (!kind) return 0;
+    if (kind == 1) {
+        minyar_depth_escaped = 1;
+        assert(!minyar_recovery_enter());
+        assert(minyar_call_depth == depth && rc_frames == root);
+        return 0;
+    }
+    MinyarDepthScope scope;
+    minyar_calldepth_begin(&scope, kind == 3 ? 2 : 1);
+    assert(minyar_recovery_enter());
+    minyar_rc_enter(1);
+    minyar_rc_local_take(0, minyar_bytes_new(64));
+    RcThreadLeaf *child = minyar_thread_spawn(no_work, 42, frozen, channel);
+    minyar_rc_release(child);
+    if (kind == 3) {
+        assert(minyar_recovery_enter());
+        minyar_rc_enter(1);
+        minyar_rc_local_take(0, minyar_bytes_new(32));
+    }
+    assert(!minyar_recovery_enter());
+    assert(minyar_recovery_pending());
+    if (kind == 3) { minyar_rc_leave(); minyar_stack_leave(); }
+    minyar_rc_leave();
+    minyar_stack_leave();
+    assert(minyar_calldepth_end(&scope));
+    assert(minyar_call_depth == depth && rc_frames == root);
+    if (kind != 4) minyar_depth_escaped = 1;
+    return 0;
+}
+static void recovery_results(void) {
+    MinyarBytes *b = minyar_bytes_new(0);
+    RcThreadLeaf *f = minyar_frozen_bytes_copy(b);
+    RcThreadLeaf *c = minyar_bytes_channel_new(0, 1);
+    rc_thread_domain_drain();
+    size_t baseline = atomic_load(&rc_thread_native_bytes);
+    for (long long kind = 0; kind < 5; kind++) {
+        size_t exits = atomic_load(&rc_thread_domain_exits);
+        size_t joins = atomic_load(&rc_thread_native_joins);
+        RcThreadLeaf *t = minyar_thread_spawn(recovery_entry, kind, f, c);
+        int failed = kind > 0 && kind < 4;
+        long long value = 313;
+        assert(minyar_thread_try_join(t, &value) == (failed ? 2 : 0));
+        assert(value == (failed ? 313 : 0));
+        assert(!rc_thread_children);
+        assert(atomic_load(&rc_thread_domain_exits) == exits + (kind > 1 ? 2 : 1));
+        assert(atomic_load(&rc_thread_native_joins) == joins + (kind > 1 ? 2 : 1));
+        for (int repeat = 0; repeat < 3; repeat++) {
+            MinyarRecord *r = minyar_thread_join_result(t);
+            assert(minyar_thread_result_code(r) == (failed ? 2 : 0));
+            if (!failed) assert(minyar_thread_join_result_value(r) == 0);
+            minyar_rc_release(r);
+        }
+        minyar_rc_release(t);
+        rc_thread_domain_drain();
+        assert(atomic_load(&rc_thread_native_bytes) == baseline);
+        assert(!minyar_recovery_pending() && !minyar_call_depth);
+    }
+    RcThreadLeaf *t = minyar_thread_spawn(recovery_entry, 3, f, c);
+    minyar_rc_release(t);
+    minyar_thread_join_children();
+    assert(!rc_thread_children);
+    rc_thread_domain_drain();
+    assert(atomic_load(&rc_thread_native_bytes) == baseline);
+    minyar_rc_release(c); minyar_rc_release(f); minyar_rc_release(b);
+    assert_native_empty();
+}
 static long long self_join(long long seed, void *frozen, void *channel) {
     (void)seed; (void)frozen; (void)channel;
     RcThreadLeaf *self = rc_thread_wrap(rc_thread_current);
@@ -545,6 +614,7 @@ int main(int count, char **arguments) {
     aliases_and_capacity();
     backpressure();
     failures_and_results();
+    recovery_results();
     descendants();
     frozen_forwarding();
     queued_creator_exit();
