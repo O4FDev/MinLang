@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run already compiled QNS endpoints over local UDP; setup is separate."""
-import argparse,hashlib,hmac,importlib.util,json,os,select,socket,subprocess,sys,threading
+import argparse,hashlib,hmac,importlib.util,json,os,select,socket,subprocess,sys,threading,time
 from quic_protocol_artifacts import ProtocolArtifacts
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -10,11 +10,13 @@ CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred
 class RebindingProxy:
  def __init__(self,port,chunk=1048576,delay=.003):
   self.chunk=chunk;self.delay=delay
+  self.started=time.monotonic();self.forwarded=0;self.packets=0;self.waited=0;self.last_forward=0;self.bindings=[]
   self.target=("127.0.0.1",port);self.front=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.front.bind(("127.0.0.1",port+2))
   self.port=self.front.getsockname()[1];self.back=None;self.ports=set();self.stopping=threading.Event();self.error=None
   self.rebind();self.thread=threading.Thread(target=self.run);self.thread.start()
  def rebind(self):
   old=self.back;self.back=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.back.bind(("127.0.0.1",0));self.ports.add(self.back.getsockname()[1])
+  self.bindings.append({"elapsed":time.monotonic()-self.started,"bytes":self.forwarded,"port":self.back.getsockname()[1]})
   if old is not None:old.close()
  def run(self):
   client=None;received=0
@@ -25,14 +27,17 @@ class RebindingProxy:
      data,address=stream.recvfrom(65535)
      if stream is self.front:client=address;self.back.sendto(data,self.target)
      elif client is not None:
-      self.stopping.wait(self.delay)
+      before=time.monotonic();self.stopping.wait(self.delay);self.waited+=time.monotonic()-before
       self.front.sendto(data,client);received+=len(data)
+      self.forwarded+=len(data);self.packets+=1;self.last_forward=time.monotonic()-self.started
       if received>=self.chunk and len(self.ports)<16:received=0;self.rebind()
   except BaseException as error:self.error=error
  def close(self):
   self.stopping.set();self.thread.join(timeout=2);self.front.close();self.back.close()
   if self.thread.is_alive():raise RuntimeError("rebinding proxy did not stop")
   if self.error is not None:raise self.error
+ def progress(self):
+  return {"elapsed":time.monotonic()-self.started,"bytes":self.forwarded,"packets":self.packets,"wait_seconds":self.waited,"last_forward":self.last_forward,"bindings":self.bindings}
 def main():
  p=argparse.ArgumentParser();p.add_argument("--client",type=Path,required=True);p.add_argument("--server",type=Path,required=True)
  p.add_argument("--case",action="append",choices=CASES);p.add_argument("--expect-old-code",action="store_true");p.add_argument("--port",type=int,default=44300)
@@ -70,7 +75,9 @@ def main():
     c=artifacts.run(command,capture_output=True,text=True,timeout=180,case=case)
    finally:
     try:
-     if proxy is not None:proxy.close()
+     if proxy is not None:
+      proxy.close()
+      if sys.exc_info()[0] is not None:print("QNS rebinding progress "+json.dumps(proxy.progress()),file=sys.stderr,flush=True)
     finally:serverout,servererr=server.stop(primary=sys.exc_info()[1])
    labels=[line.split()[0] for line in clientlog.read_text().splitlines()] if clientlog.exists() else []
    serverlabels=[line.split()[0] for line in serverlog.read_text().splitlines()] if serverlog.exists() else []
