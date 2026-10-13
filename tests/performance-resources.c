@@ -24,6 +24,13 @@ struct PerformanceUsage minyar_performanceresources_usage(void) {
     return result;
 }
 
+void *minyar_c_record_copy(const void *source, long long size);
+
+void *minyar_c_value_minyar_performanceresources_usage(void) {
+    struct PerformanceUsage value = minyar_performanceresources_usage();
+    return minyar_c_record_copy(&value, sizeof(value));
+}
+
 int64_t minyar_performanceresources_duplicate(int64_t descriptor) {
     if (descriptor < 0 || descriptor > INT32_MAX) return -EINVAL;
     int result = fcntl((int)descriptor, F_DUPFD_CLOEXEC, 3);
