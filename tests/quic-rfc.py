@@ -772,6 +772,12 @@ def run_gate(directory, sanitize, source_commit=None):
                 write_report(directory, report)
             require(exact_integer(result.returncode), 'child status is not an integer')
             if result.returncode:
+                def publish_child_output():
+                    if result.stdout:
+                        print(result.stdout.decode(errors='replace'), end='', flush=True)
+                    if result.stderr:
+                        print(result.stderr.decode(errors='replace'), end='', file=sys.stderr, flush=True)
+                retention_attempt(report, label + '-console-output', publish_child_output)
                 raise subprocess.CalledProcessError(result.returncode, command,
                                                     output=result.stdout, stderr=result.stderr)
             return result
