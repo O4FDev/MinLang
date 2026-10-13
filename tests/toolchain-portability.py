@@ -538,7 +538,13 @@ output.write_bytes(b'complete executable')
         changed = dict(base, MINYAR_NATIVE_FLAGS='-O0 -DPORTABILITY=1')
         self.assertEqual(len(self.native_calls(self.launch(changed))), 1)
         self.assertEqual(len(self.native_calls(self.launch(changed))), 0)
-        self.assertEqual(len(self.native_calls(self.launch(dict(changed, TEST_CLANG_VERSION='clang version 24.0.0')))), 1)
+        self.assertEqual(len(self.native_calls(self.launch(dict(changed, TEST_CLANG_VERSION='clang version 23.1.2 retained-provider')))), 1)
+        for version in ('18.1.8', '22.1.8', '23.1.3', '24.0.0'):
+            result = subprocess.run([str(self.project / 'minyar'), str(self.source), '-o', str(self.output)],
+                cwd=self.work, env=dict(self.env, TEST_CLANG_VERSION='clang version ' + version),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('Minyar requires LLVM 23.1.2', result.stderr)
 
     def test_graphics_cache_tracks_header_contents_even_with_old_timestamp(self):
         base = {'TEST_GRAPHICS': '1'}

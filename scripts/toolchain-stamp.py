@@ -14,7 +14,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from host_paths import host_path
+from host_paths import host_path, pinned_llvm, LLVM_VERSION
 
 FLAGS = (
     "CPPFLAGS", "CFLAGS", "LLVM_FLAGS", "LDLIBS", "SANITIZER_FLAGS", "COMPILER_RUNTIME_FLAGS",
@@ -66,8 +66,15 @@ def publish_stamp(target, content, max_wait=3.0):
 
 def main():
     target = Path(sys.argv[1])
+    llvm = identity("LLVM_CC", "clang" if sys.platform == "darwin" else "clang-23")
+    try:
+        previous = json.loads(target.read_text()) if target.is_file() else {}
+    except ValueError:
+        previous = {}
+    if previous.get("llvm_cc") != llvm or previous.get("llvm_version") != LLVM_VERSION:
+        pinned_llvm(llvm["command"])
     content = json.dumps({
-        "cc": identity("CC", "cc"), "llvm_cc": identity("LLVM_CC", "clang"),
+        "cc": identity("CC", "cc"), "llvm_cc": llvm, "llvm_version": LLVM_VERSION,
         "flags": {name: os.environ.get(name, "") for name in FLAGS},
     }, sort_keys=True, indent=2).encode() + b"\n"
     if target.is_file() and target.read_bytes() == content:

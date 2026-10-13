@@ -20,7 +20,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_paths import host_path
+from host_paths import host_path, pinned_llvm
 from sanitizer_llvm import address_sanitizer_enabled, thread_sanitizer_enabled, instrument_program_sanitizers
 
 
@@ -207,8 +207,7 @@ def bootstrap(project, targets):
     project = host_path(project)
     (project / 'build').mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
-    if 'MINYAR_CLANG' in environment:
-        environment['LLVM_CC'] = environment['MINYAR_CLANG']
+    environment['LLVM_CC'] = pinned_llvm(environment.get('MINYAR_CLANG', environment.get('LLVM_CC')))
     if 'CC' not in environment:
         environment['CC'] = environment.get('LLVM_CC', 'clang')
     if 'COMPILER_LTO_FLAGS' not in environment:
@@ -520,15 +519,18 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
 def main():
     if sys.version_info < (3, 9):
         raise ValueError('Python 3.9 or newer is required for the portable launcher')
-    clang = os.environ.get('MINYAR_CLANG', os.environ.get('LLVM_CC', 'clang'))
+    clang = os.environ.get('MINYAR_CLANG', os.environ.get('LLVM_CC'))
     if len(sys.argv) >= 4 and sys.argv[1] == 'build':
         bootstrap(sys.argv[2], sys.argv[3:])
         return
     if len(sys.argv) == 3 and sys.argv[1] == 'version':
         version(sys.argv[2])
         return
+    if len(sys.argv) == 2 and sys.argv[1] == 'toolchain':
+        print(pinned_llvm(clang))
+        return
     if len(sys.argv) == 2 and sys.argv[1] == 'doctor':
-        doctor(clang)
+        doctor(pinned_llvm(clang))
         return
     if len(sys.argv) == 2 and sys.argv[1] == 'runtime-format':
         # Clang has already instrumented C emitted as LLVM. Feeding that IR
@@ -539,10 +541,12 @@ def main():
         print('object' if any(option.startswith('-fsanitize=') for option in options) else 'llvm')
         return
     if len(sys.argv) >= 4 and sys.argv[1] == 'compile':
+        clang = pinned_llvm(clang)
         run([clang, *flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module'), *sys.argv[2:]])
         return
     if len(sys.argv) < 7 or sys.argv[1] != 'link':
         raise ValueError('usage: clang-driver.py compile ARGS... | link PROJECT IR RUNTIME OUTPUT RELEASE')
+    clang = pinned_llvm(clang)
     project, llvm, runtime, output, release = sys.argv[2:7]
     debug = len(sys.argv) >= 8 and sys.argv[7] == '1'
     source = sys.argv[8] if len(sys.argv) >= 9 else None

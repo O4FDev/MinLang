@@ -22,10 +22,9 @@ class ToolchainStamp(unittest.TestCase):
             work = Path(temporary)
             first = work / "first compiler.exe"
             second = work / "second compiler.exe"
-            # MSYS checks executable contents as well as permission bits. The
-            # stamp only reads metadata, so use portable native image fixtures.
-            shutil.copy2(sys.executable, first)
-            shutil.copy2(sys.executable, second)
+            for compiler in (first, second):
+                compiler.write_text("#!" + sys.executable + "\nprint(\"clang version 23.1.2\")\n")
+                compiler.chmod(0o755)
             stamp = work / "stamp.json"
             environment = {**os.environ, "CC": native_path(first), "LLVM_CC": native_path(first)}
 
@@ -49,7 +48,7 @@ class ToolchainStamp(unittest.TestCase):
             flags = probe()
             self.assertNotEqual(flags[0], changed[0])
             with second.open("ab") as stream:
-                stream.write(b"replacement compiler, same executable path")
+                stream.write(b"\n")
             self.assertNotEqual(probe()[0], flags[0])
             self.assertEqual(json.loads(stamp.read_text())["flags"]["LLVM_FLAGS"], "-O3 -g")
 
