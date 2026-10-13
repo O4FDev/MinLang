@@ -1,6 +1,8 @@
 set -eu
 test "$(uname -s)" = Linux
 clang=${MINYAR_TEST_CLANG:-clang-23}
+fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}
+images='plain lz4'
 "$clang" --version | head -1 | grep -F '23.1.2'
 mkdir -p build
 work=$(mktemp -d "$PWD/build/erofs-check.XXXXXXXX")
@@ -21,12 +23,18 @@ for kind in worker helper legacy legacy-helper; do
 done
 MINYAR_CLANG="$clang" ./minyar tests/erofs-thread-main.min -o "$work/thread-main"
 "$work/thread-main" "$work/source" "$work/thread-main.erofs"
-/usr/bin/fsck.erofs --extract "$work/thread-main.erofs"
+"$fsck" --extract "$work/thread-main.erofs"
 "$work/writer" "$work/source" "$work/plain.erofs"
-/usr/bin/fsck.erofs --extract "$work/plain.erofs"
+"$fsck" --extract "$work/plain.erofs"
 "$work/writer" "$work/source" "$work/lz4.erofs" 17592186040320 lz4
-/usr/bin/fsck.erofs --extract "$work/lz4.erofs"
+"$fsck" --extract "$work/lz4.erofs"
 test "$(stat -c %s "$work/lz4.erofs")" -lt "$(stat -c %s "$work/plain.erofs")"
+if test "${MINYAR_EROF_ZSTD_KERNEL:-}" != ''; then
+    "$work/writer" "$work/source" "$work/zstd.erofs" 17592186040320 zstd
+    "$fsck" --extract "$work/zstd.erofs"
+    test "$(stat -c %s "$work/zstd.erofs")" -lt "$(stat -c %s "$work/plain.erofs")"
+    images="$images zstd"
+fi
 cp "$work/plain.erofs" "$work/unchanged.erofs"
 if "$work/writer" "$work/source" "$work/unchanged.erofs" 8192; then exit 1; fi
 cmp "$work/plain.erofs" "$work/unchanged.erofs"
@@ -39,9 +47,11 @@ if test "${MINYAR_EROF_KERNEL:-}" != ''; then
     cp "$work/tree" "$work/boot/init"
     stat -c '%u %g' "$work/source" > "$work/boot/owner"
     "$work/writer" "$work/boot" "$work/boot.erofs"
-    /usr/bin/fsck.erofs --extract "$work/boot.erofs"
-    for image in plain lz4; do
-        timeout 60 qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 512 -nodefaults -no-reboot -nographic -serial stdio -kernel "$work/bzImage" -append 'console=ttyS0 panic=-1 root=/dev/vda rootfstype=erofs ro init=/init' -drive "file=$work/boot.erofs,format=raw,if=virtio,readonly=on" -drive "file=$work/$image.erofs,format=raw,if=virtio,readonly=on" > "$work/guest.log" 2>&1
+    "$fsck" --extract "$work/boot.erofs"
+    for image in $images; do
+        kernel=$work/bzImage
+        if test "$image" = zstd; then cp "$MINYAR_EROF_ZSTD_KERNEL" "$work/bzImage-zstd"; kernel=$work/bzImage-zstd; fi
+        timeout 60 qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 512 -nodefaults -no-reboot -nographic -serial stdio -kernel "$kernel" -append 'console=ttyS0 panic=-1 root=/dev/vda rootfstype=erofs ro init=/init' -drive "file=$work/boot.erofs,format=raw,if=virtio,readonly=on" -drive "file=$work/$image.erofs,format=raw,if=virtio,readonly=on" > "$work/guest.log" 2>&1
         tr -d '\r' < "$work/guest.log" > "$work/guest.txt"
         cat "$work/guest.txt"
         grep -Fx EROFS_KVM_PASS "$work/guest.txt"

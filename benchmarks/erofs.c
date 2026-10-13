@@ -41,9 +41,11 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1],"prepare")) { prepare(argv[2]); return 0; }
     require(argc == 6 || argc == 7,"benchmark compare arguments");
     const char *mode = argc == 7 ? argv[6] : "none";
+    require(!strcmp(mode,"none") || !strcmp(mode,"lz4") || !strcmp(mode,"zstd"),"benchmark mode");
     char *writer[] = {argv[2],argv[4],argv[5],"17592186040320",(char *)mode,NULL};
     char *mkfs[] = {argv[3],"--quiet","--preserve-mtime",argv[5],argv[4],NULL,NULL};
     if (!strcmp(mode,"lz4")) { mkfs[3] = "-zlz4"; mkfs[4] = argv[5]; mkfs[5] = argv[4]; }
+    if (!strcmp(mode,"zstd")) { mkfs[3] = "-zzstd,3"; mkfs[4] = argv[5]; mkfs[5] = argv[4]; }
     run(writer,argv[5]); run(mkfs,argv[5]);
     for (int n = 0; n < 5; ++n) {
         uint64_t a, b;

@@ -6,6 +6,8 @@
 #include <limits.h>
 #include <linux/openat2.h>
 #include <lz4.h>
+#include <zstd.h>
+#include <zstd_errors.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -42,6 +44,8 @@ typedef struct {
     int source_fd, output_fd;
     uint64_t maximum, position;
     int compression;
+    int level;
+    ZSTD_CCtx *codec;
 } EWriter;
 
 static uint64_t e_align(uint64_t n, uint64_t a) { return (n + a - 1) & ~(a - 1); }
@@ -271,7 +275,7 @@ static int e_compress(EWriter *w, EInode *i) {
     unsigned char *map = calloc(1, (size_t)i->map_size);
     unsigned char *input = malloc(65536), *encoded = malloc(65536), *output = malloc(65536);
     if (!map || !input || !encoded || !output) error = ENOMEM;
-    if (!error) e16(map + 4, 2);
+    if (!error) { e16(map + 4, 2); map[6] = w->compression == 1 ? 3 : 0; }
     uint64_t at = 0, first_block = w->position / 4096;
     while (!error && at < i->size) {
         size_t size = i->size - at > 65536 ? 65536 : (size_t)(i->size - at);
@@ -285,7 +289,14 @@ static int e_compress(EWriter *w, EInode *i) {
         }
         if (error) break;
         unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
-        int packed = LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536);
+        int packed;
+        if (w->compression == 1) {
+            size_t result = ZSTD_compressCCtx(w->codec, encoded, 65536, input, size, w->level);
+            if (ZSTD_isError(result)) {
+                if (ZSTD_getErrorCode(result) != ZSTD_error_dstSize_tooSmall) { error = ZSTD_getErrorCode(result) == ZSTD_error_memory_allocation ? ENOMEM : EIO; break; }
+                packed = 0;
+            } else packed = (int)result;
+        } else packed = LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536);
         unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
         int compressed = blocks < clusters;
         if (!compressed) blocks = clusters;
@@ -342,11 +353,13 @@ static int e_image(EWriter *w) {
     unsigned char super[128] = {0};
     e32(super, 0xe0f5e1e2); e32(super + 8, 2); super[12] = 12;
     e64(super + 16, w->count); e32(super + 36, (uint32_t)(position / 4096)); e32(super + 40, 1);
-    if (w->compression) { e32(super + 80, 3); e16(super + 84, 1); }
+    if (w->compression) { e32(super + 80, 3); e16(super + 84, w->compression == 1 ? 8 : 1); }
     error = e_write(w->output_fd, super, sizeof(super), 1024);
     if (!error && w->compression) {
-        unsigned char config[16] = {0}; e16(config, 14); e16(config + 2, 65535); e16(config + 4, 16);
-        error = e_write(w->output_fd, config, sizeof(config), 1152);
+        unsigned char config[16] = {0};
+        if (w->compression == 1) { e16(config, 6); config[3] = 6; }
+        else { e16(config, 14); e16(config + 2, 65535); e16(config + 4, 16); }
+        error = e_write(w->output_fd, config, w->compression == 1 ? 8 : 16, 1152);
     }
     for (size_t n = 0; !error && n < w->count; ++n) {
         EInode *i = w->inodes[n];
@@ -381,18 +394,19 @@ static void e_free(EWriter *w) {
     for (size_t n = 0; n < w->count; ++n) {
         EInode *i = w->inodes[n]; free(i->source); free(i->link); free(i->attrs); free(i);
     }
-    free(w->inodes); free(w);
+    free(w->inodes); ZSTD_freeCCtx(w->codec); free(w);
 }
 static int e_directory_image(const char *source, const char *destination, long long compression, long long level, long long maximum) {
-    (void)level;
-    if (compression != 0 && compression != 2) return ENOTSUP;
+    if (compression != 0 && compression != 1 && compression != 2) return ENOTSUP;
+    if (compression == 1 && (level < ZSTD_minCLevel() || level > ZSTD_maxCLevel())) return EINVAL;
     if (maximum < 4096 || maximum > 17592186040320ll) return EINVAL;
     EWriter *w = calloc(1, sizeof(*w));
     if (!w) return ENOMEM;
     w->source_fd = open(source, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (w->source_fd < 0) { int error = errno; free(w); return error; }
-    w->maximum = (uint64_t)maximum; w->compression = (int)compression; w->root = calloc(1, sizeof(*w->root));
+    w->maximum = (uint64_t)maximum; w->compression = (int)compression; w->level = (int)level; w->root = calloc(1, sizeof(*w->root));
     int error = w->root ? 0 : ENOMEM;
+    if (compression == 1) { w->codec = ZSTD_createCCtx(); if (!w->codec) error = ENOMEM; }
     if (!error) { w->root->name = strdup(""); if (!w->root->name) error = ENOMEM; }
     if (!error) error = e_scan(w, w->root, w->source_fd, "", 0);
     char *temporary = NULL;
