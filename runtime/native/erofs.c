@@ -282,15 +282,14 @@ static int e_compress(EWriter *w, EInode *i) {
     if (!error && w->compression == 1 && (ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_compressionLevel, w->level)) || ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_windowLog, 19)))) error = EINVAL;
     if (!error) { e16(map + 4, 7); map[6] = w->compression == 1 ? 3 : 0; }
     uint64_t at = 0, first_block = w->position / 4096;
+    size_t buffered = 0, hint = 1048576;
     while (!error && at < i->size) {
-        size_t size = i->size - at > 1048576 ? 1048576 : (size_t)(i->size - at);
-        memset(input, 0, 1048576);
-        size_t read_size = 0;
-        while (read_size < size) {
-            ssize_t n = pread(fd, input + read_size, size - read_size, (off_t)(at + read_size));
+        size_t size = i->size - at > hint ? hint : (size_t)(i->size - at);
+        while (buffered < size) {
+            ssize_t n = pread(fd, input + buffered, size - buffered, (off_t)(at + buffered));
             if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
             if (!n) { error = ESTALE; break; }
-            read_size += (size_t)n;
+            buffered += (size_t)n;
         }
         if (error) break;
         int packed = 0;
@@ -311,14 +310,23 @@ static int e_compress(EWriter *w, EInode *i) {
             }
             if (!ZSTD_isError(result)) packed = (int)result;
         } else {
-            int consumed = (int)size;
-            packed = LZ4_compress_destSize((const char *)input, (char *)encoded, &consumed, 65536);
-            if (packed > 0 && (size_t)consumed < size) {
-                size = (size_t)consumed & ~(size_t)4095;
-                packed = size ? LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536) : 0;
+            if (hint < 1048576) packed = LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536);
+            if (!packed) {
+                int consumed = (int)size;
+                packed = LZ4_compress_destSize((const char *)input, (char *)encoded, &consumed, 65536);
+                if (packed > 0 && (size_t)consumed < size) {
+                    size = (size_t)consumed & ~(size_t)4095;
+                    packed = size ? LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536) : 0;
+                }
             }
         }
-        if (!packed) size = i->size - at > 65536 ? 65536 : (size_t)(i->size - at);
+        if (!packed) size = buffered > 65536 ? 65536 : buffered;
+        hint = size;
+        if (packed > 0 && packed < 61440) {
+            uint64_t next = (uint64_t)size * 65500 / (unsigned)packed;
+            hint = (size_t)(next > 1048576 ? 1048576 : next) & ~(size_t)4095;
+            if (hint < 4096) hint = 4096;
+        }
         unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
         unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
         int compressed = blocks < clusters;
@@ -338,8 +346,13 @@ static int e_compress(EWriter *w, EInode *i) {
             memset(output, 0, (size_t)physical_size);
             memcpy(output + physical_size - (size_t)packed, encoded, (size_t)packed);
             error = e_write(w->output_fd, output, (size_t)physical_size, w->position);
-        } else error = e_write(w->output_fd, input, (size_t)physical_size, w->position);
+        } else {
+            if (physical_size > size) memset(input + size, 0, (size_t)physical_size - size);
+            error = e_write(w->output_fd, input, (size_t)physical_size, w->position);
+        }
         w->position += physical_size; at += size;
+        buffered -= size;
+        if (buffered) memmove(input, input + size, buffered);
     }
     if (!error) {
         i->stored_blocks = (uint32_t)(w->position / 4096 - first_block);
