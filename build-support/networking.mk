@@ -17,11 +17,11 @@ ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s))
 	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/net-loop.py --mode sanitize --evidence "$$evidence"
 endif
 
-check-net-connect: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/net-connect.py
+check-net-connect: build/minyarc build/tooling/tests/net-connect-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-connect-test
 
-check-net-connect-sanitize: build/minyarc tools/host_paths.py
-	PATH="$(NET_SANITIZER_PATH)" MINYAR_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/net-connect.py --sanitize
+check-net-connect-sanitize: build/minyarc tools/host_paths.py build/tooling/tests/net-connect-test
+	PATH="$(NET_SANITIZER_PATH)" MINYAR_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-connect-test --sanitize
 
 check: check-errors-values check-net check-net-loop check-net-connect
 check-portable: check-errors-values check-net check-net-loop check-net-connect

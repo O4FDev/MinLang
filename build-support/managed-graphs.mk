@@ -23,8 +23,8 @@ check-managed-graphs-bakeoff: $(CYCLE_BAKEOFF_INPUTS) | build
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick --fixture managed-graphs-bakeoff.c
 check check-portable check-sanitize check-managed-graphs-profiles: check-managed-graphs-bakeoff
 
-check-callback-domains:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/callback-domains.py
+check-callback-domains: build/tooling/tests/callback-domains
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/callback-domains
 
 # Incremental fallback uses the POSIX-only module build driver; the native
 # Windows launcher still exercises debug/release profiles and callbacks.

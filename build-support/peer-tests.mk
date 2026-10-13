@@ -317,8 +317,8 @@ check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS)
 check-allocation-faults: build/minyarc
 	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py
 
-check-runtime-size-guards:
-	$(SANITIZER_LIMITED) python3 tests/runtime-size-guards.py
+check-runtime-size-guards: build/tooling/tests/runtime-size-guards
+	$(SANITIZER_LIMITED) ./build/tooling/tests/runtime-size-guards
 
 check-compiler-allocation-faults: build/minyarc build/compiler-stage2.ll build/minyar-runtime.o
 	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py --scope compiler --output build/compiler-allocation-faults.json
