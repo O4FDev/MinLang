@@ -97,15 +97,22 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
             entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
         'worker-close-helper': 'function unsafe(): Integer { zstd.rawCloseDCtx(0); return 0 }\n' +
             entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
+        'worker-buffer-helper': 'function unsafe(): Integer { return zstd.threadRejectionDecompress() }\n' +
+            entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
         'unreviewed-extern-main': 'function dangerous(): Integer { native "not_reviewed" }\n' +
             entry + main.replace('    nativeThreadSetup()', '    nativeThreadSetup()\n    dangerous()'),
     }
+    library = directory / 'library'
+    library.mkdir()
+    (library / 'machine.min').write_bytes((ROOT / 'library/machine.min').read_bytes())
+    (library / 'zstd.min').write_text((ROOT / 'library/zstd.min').read_text() +
+        '\npublic function threadRejectionDecompress(): Integer { return bufferDecompress(0, Bytes(0), Bytes(0)) }\n')
     for label, text in cases.items():
         source = directory / 'rejected.min'
         source.write_text('use "machine" as machine\nuse "zstd" as zstd\n' + text)
         llvm = directory / 'rejected.ll'
         llvm.unlink(missing_ok=True)
-        rejected = subprocess.run([str(selected), str(source), str(llvm), '--library', str(ROOT / 'library'),
+        rejected = subprocess.run([str(selected), str(source), str(llvm), '--library', str(library),
             '--bounded-owners', '32'], capture_output=True, text=True, timeout=90, env=environment)
         assert rejected.returncode != 0 and not llvm.exists(), (label, rejected)
         diagnostic = 'unsafe thread effect'
@@ -113,5 +120,9 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         if label in ('managed-region-list', 'wrong-map-input'): diagnostic = 'wrong thread boundary argument types'
         if label == 'opaque-constructor': diagnostic = 'opaque thread types cannot be constructed'
         assert diagnostic in rejected.stderr + rejected.stdout, (label, rejected)
+        provider = {'worker-native-helper': 'minyar_zstd_rawCreateDCtx',
+                    'worker-close-helper': 'minyar_zstd_rawCloseDCtx',
+                    'worker-buffer-helper': 'minyar_zstd_bufferDecompress'}.get(label)
+        if provider: assert provider in rejected.stderr + rejected.stdout, (label, rejected)
         assert 'AddressSanitizer:' not in rejected.stderr and 'runtime error:' not in rejected.stderr, (label, rejected)
         print(label, args.sanitizer, 'rejected before IR publication', flush=True)
