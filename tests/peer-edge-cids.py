@@ -26,16 +26,17 @@ def command(argv, directory, env, timeout):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binary',type=Path)
+    parser.add_argument('--client-binary',type=Path)
     parser.add_argument('--sanitize',action='store_true')
     parser.add_argument('--evidence',type=Path)
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='minyar-edge-cids-') as folder:
-        directory=args.evidence or Path(folder)
-        directory.mkdir(parents=True,exist_ok=True)
+        if args.evidence:args.evidence.mkdir(parents=True,exist_ok=True)
+        directory=Path(tempfile.mkdtemp(prefix='run-',dir=args.evidence)) if args.evidence else Path(folder)
         env=environment(args.sanitize)
         env.update(GOMAXPROCS='1',GOFLAGS='-p=1',MAKEFLAGS='-j1')
-        client=directory/'client'
-        command([ROOT/'minyar',ROOT/'tests/peer-edge-cids.min','-o',client],directory,env,240)
+        client=args.client_binary or directory/'client'
+        if not args.client_binary:command([ROOT/'minyar',ROOT/'tests/peer-edge-cids.min','-o',client],directory,env,240)
         lab=None
         try:
             lab=Lab(directory/'lab',args.binary,args.sanitize,duration=8000,maximum=1)

@@ -12,13 +12,14 @@ spec=spec_from_file_location('edge_cid_commands',ROOT/'tests/peer-edge-cids.py')
 commands=module_from_spec(spec);spec.loader.exec_module(commands)
 CASES=('limit3','limit8','maximum32768')
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--sanitize',action='store_true');parser.add_argument('--binary',type=Path)
+    parser=argparse.ArgumentParser();parser.add_argument('--sanitize',action='store_true');parser.add_argument('--binary',type=Path);parser.add_argument('--client-binary',type=Path)
     parser.add_argument('--case',choices=CASES,action='append');parser.add_argument('--evidence',type=Path);args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='minyar-edge-cid-stock-') as folder:
-        directory=args.evidence or Path(folder);directory.mkdir(parents=True,exist_ok=True)
-        env=environment(args.sanitize);env['MAKEFLAGS']='-j1';client=directory/'client'
+        if args.evidence:args.evidence.mkdir(parents=True,exist_ok=True)
+        directory=Path(tempfile.mkdtemp(prefix='run-',dir=args.evidence)) if args.evidence else Path(folder)
+        env=environment(args.sanitize);env['MAKEFLAGS']='-j1';client=args.client_binary or directory/'client'
         client_env=dict(env,MINYAR_LINK_ARTIFACTS=str(directory/'client-link'))
-        commands.command([ROOT/'minyar',ROOT/'tests/peer-edge-cid-stock.min','-o',client],directory,client_env,240)
+        if not args.client_binary:commands.command([ROOT/'minyar',ROOT/'tests/peer-edge-cid-stock.min','-o',client],directory,client_env,240)
         # Cases differ only in edge configuration, so one edge build serves all.
         binary=args.binary
         if binary is None:

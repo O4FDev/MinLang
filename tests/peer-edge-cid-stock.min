@@ -7,8 +7,8 @@ use "quiccrypto" as protection
 use "crypto" as crypto
 use "net" as net
 use "errors" as errors
-record Id { sequence: Integer; id: Bytes; token: Bytes }
-record Stock { connection: quic.Connection; socket: Integer; ids: List<Id>; next: Integer; minimum: Integer; response: Boolean }
+record Id { sequence: Integer; id: Bytes; token: Bytes; prior: Integer }
+record Stock { connection: quic.Connection; socket: Integer; ids: List<Id>; next: Integer; minimum: Integer; prior: Integer; limit: Integer; response: Boolean }
 function number(text: Text): Integer { let value=0;for digit in text { value=value*10+Integer(digit)-48 };return value }
 function add(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
 function equal(a: Bytes,b: Bytes): Boolean { return crypto.hex(a)==crypto.hex(b) }
@@ -49,19 +49,27 @@ function observe(st: Stock,wanted: Bytes): Boolean {
             if frame.type==27 && equal(frame.data,wanted) { st.response=true }
             if frame.type==28 || frame.type==29 { return false }
             if frame.type==24 {
-                if frame.data.length<17 || frame.offset!=st.minimum { return false }
+                if frame.data.length!=24 || frame.offset>frame.value { return false }
                 let id=frame.data.slice(0,frame.data.length-16);let token=frame.data.slice(frame.data.length-16,frame.data.length)
                 let known=false
                 for previous in st.ids {
                     if previous.sequence==frame.value {
-                        if !equal(previous.id,id) || !equal(previous.token,token) { return false };known=true
+                        if !equal(previous.id,id) || !equal(previous.token,token) || previous.prior!=frame.offset { return false };known=true
                     } else if equal(previous.id,id) || equal(previous.token,token) { return false }
                 }
                 if frame.value>=st.minimum && !known {
                     if frame.value!=st.next { return false }
+                    let expected=st.minimum
+                    if st.ids.length==st.limit {
+                        if st.prior!=st.minimum { return false }
+                        expected=st.minimum+1
+                    } else if st.ids.length>=st.limit || st.prior!=st.minimum { return false }
+                    if frame.offset!=expected { print("unexpected wire retirement prior "+Text(frame.offset)+" expected "+Text(expected)+" for sequence "+Text(frame.value));return false }
                     let retained: List<Id> = []
                     for previous in st.ids { if previous.sequence>=st.minimum { retained.add(previous) } }
-                    retained.add(Id { sequence:frame.value;id:id;token:token });st.ids=retained;st.next+=1
+                    retained.add(Id { sequence:frame.value;id:id;token:token;prior:frame.offset });st.ids=retained;st.next+=1;st.prior=frame.offset
+                    let active=0;for previous in st.ids { if previous.sequence>=st.prior { active+=1 } }
+                    if active>st.limit || st.ids.length>st.limit+1 { return false }
                 }
             }
         }
@@ -72,11 +80,15 @@ function observe(st: Stock,wanted: Bytes): Boolean {
     }
     return true
 }
-function challenge(st: Stock,destination: Bytes,retire: Boolean,wantedCount: Integer): Boolean {
+function challenge(st: Stock,destination: Bytes,retire: Integer,wantedCount: Integer): Boolean {
     let token=randomBytes(8);let payload=Bytes()
-    if retire { add(payload,25);add(payload,0);st.minimum=1 }
+    if retire>=0 { add(payload,25);add(payload,retire) }
     payload.add(26);payload.addBytes(token);st.response=false
     if !send(st,destination,payload) { return false }
+    if retire>=0 {
+        st.minimum=retire+1
+        let retained: List<Id> = [];for known in st.ids { if known.sequence>=st.minimum { retained.add(known) } };st.ids=retained
+    }
     // Generous for loaded hosts; the loop ends as soon as the response arrives.
     let deadline=net.monotonicMilliseconds()+2000
     while net.monotonicMilliseconds()<deadline && (!st.response || st.ids.length!=wantedCount) {
@@ -102,24 +114,28 @@ function main(): Integer {
         if connection.state==quic.FAILED { print(connection.error);return 12 }
     }
     if !connection.confirmed || !connection.clientTLS.authenticated || connection.remoteIds.length!=2 { return 13 }
-    let ids: List<Id> = [];for known in connection.remoteIds { ids.add(Id { sequence:known.sequence;id:known.id;token:known.token }) }
-    let st=Stock { connection:connection;socket:socket;ids:ids;next:2;minimum:0;response:false }
+    let ids: List<Id> = [];for known in connection.remoteIds { ids.add(Id { sequence:known.sequence;id:known.id;token:known.token;prior:0 }) }
+    let st=Stock { connection:connection;socket:socket;ids:ids;next:2;minimum:0;prior:0;limit:limit;response:false }
     print("authenticated edge with peer limit "+Text(limit)+" and wire CID0/CID1")
     let original=st.ids[0].id
-    if !challenge(st,st.ids[1].id,false,3) { print("edge first CID1 use lost peer or wire CID2 without retiring CID0");return 14 }
+    if !challenge(st,st.ids[1].id,-1,3) { print("edge first CID1 use lost peer or wire CID2 without retiring CID0");return 14 }
     if st.ids[0].sequence!=0 || !equal(st.ids[0].id,original) || st.next!=3 { return 15 }
-    for sequence in 2..limit {
+    for sequence in 2..limit-1 {
         let wanted=min(limit,sequence+2)
-        if !challenge(st,st.ids[sequence].id,false,wanted) || st.next!=wanted { return 16 }
+        if !challenge(st,st.ids[sequence].id,-1,wanted) || st.next!=wanted { print("stock fill failed at "+Text(sequence)+" with next "+Text(st.next)+" and retained "+Text(st.ids.length));return 16 }
     }
-    for known in st.ids { if !challenge(st,known.id,false,limit) || st.next!=limit { return 17 } }
-    if !challenge(st,st.ids[st.ids.length-1].id,true,limit) || st.next!=limit+1 || st.ids[0].sequence!=1 { return 18 }
-    for known in st.ids { if !challenge(st,known.id,false,limit) || st.next!=limit+1 { return 19 } }
-    let token=randomBytes(8);let payload=Bytes();payload.add(26);payload.addBytes(token);st.response=false
-    if !send(st,original,payload) { return 20 }
-    let deadline=net.monotonicMilliseconds()+400
-    while net.monotonicMilliseconds()<deadline { if !observe(st,token) || st.response { return 21 } }
-    if !challenge(st,st.ids[0].id,false,limit) || st.next!=limit+1 { return 22 }
+    for round in 0..1 {
+        let next=limit+round;let old=st.ids[0].id
+        for index in 0..st.ids.length-1 { if !challenge(st,st.ids[index].id,-1,limit) || st.next!=next || st.prior!=round { return 17 } }
+        if !challenge(st,st.ids[st.ids.length-1].id,-1,limit+1) || st.next!=next+1 || st.prior!=round+1 || st.ids[0].sequence!=round || !equal(st.ids[0].id,old) { print("stock pressure failed with next "+Text(st.next)+" retained "+Text(st.ids.length)+" prior "+Text(st.prior));return 16 }
+        for known in st.ids { if !challenge(st,known.id,-1,limit+1) || st.next!=next+1 || st.prior!=round+1 { return 19 } }
+        if !challenge(st,st.ids[1].id,round,limit) || st.next!=next+1 || st.ids[0].sequence!=round+1 { return 18 }
+        let token=randomBytes(8);let payload=Bytes();payload.add(26);payload.addBytes(token);st.response=false
+        if !send(st,old,payload) { return 20 }
+        let deadline=net.monotonicMilliseconds()+400
+        while net.monotonicMilliseconds()<deadline { if !observe(st,token) || st.response { return 21 } }
+        if !challenge(st,st.ids[0].id,-1,limit) || st.next!=next+1 { return 22 }
+    }
     if !send(st,st.ids[0].id,crypto.fromHex("1d00000000")) { return 23 }
     net.close(socket)
     print("GREEN actual edge stock limit "+Text(limit)+": all live IDs route, retired CID0 is silent and replacement remains bounded")
