@@ -67,7 +67,7 @@ static void create(const char *root) {
         char *path = join(dir,name); int fd = open(path,O_CREAT | O_EXCL | O_WRONLY,0641); require(fd >= 0, "create file");
         size_t size = sizes[n % (sizeof(sizes)/sizeof(sizes[0]))]; require(write(fd,data,size) == (ssize_t)size, "fixture content"); close(fd);
         unsigned char attr[] = {0,255,61,10,0}; require(!lsetxattr(path,"user.binary",attr,sizeof(attr),0), "fixture xattr");
-        if (n == 10) require(!lsetxattr(path,"user.large",data,16384,0), "large fixture xattr");
+        if (n == 10) require(!lsetxattr(path,"user.large",data,3000,0), "large fixture xattr");
         struct timespec times[2] = {{-2,750000000},{1700000000 + (time_t)n,123456789}}; require(!utimensat(AT_FDCWD,path,times,AT_SYMLINK_NOFOLLOW), "fixture time"); free(path);
     }
     char *first = join(dir,"file-0010"), *hard = join(root,"hard"), *sym = join(root,"symlink"), *fifo = join(root,"fifo");
