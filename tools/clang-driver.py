@@ -670,9 +670,10 @@ def main():
             from format_provider import format_provider
             from compression_provider import codec_provider
             cflags, provider_libraries = format_provider('lz4', clang, native_flags, link_flags)
+            archive_flags, archive_libraries = format_provider('tararchive', clang, native_flags, link_flags)
             codec_flags, codec_libraries = codec_provider('zstd', clang, native_flags, link_flags)
             native += [native_object(project, clang, base, 'erofs.c',
-                                     [*native_flags, *cflags, *codec_flags]), *provider_libraries, *codec_libraries]
+                                     [*native_flags, *cflags, *archive_flags, *codec_flags]), *provider_libraries, *archive_libraries, *codec_libraries]
         elif library in ('sha256', 'tararchive'):
             from format_provider import format_provider
             cflags, provider_libraries = format_provider(library, clang, native_flags, link_flags)

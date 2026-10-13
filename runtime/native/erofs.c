@@ -27,6 +27,8 @@ struct EInode {
     uint32_t block, links;
     uint64_t map_size;
     uint32_t stored_blocks;
+    int virtual_data;
+    uint64_t data_offset;
     EInode *hash_next;
 };
 struct ENode {
@@ -35,6 +37,9 @@ struct ENode {
     ENode *parent;
     ENode **children;
     size_t count, capacity;
+    ENode **buckets, *hash_next;
+    size_t bucket_count, child_index;
+    uint64_t generation, pending_id;
 };
 typedef struct {
     EInode **inodes;
@@ -47,6 +52,8 @@ typedef struct {
     int level;
     size_t lz4_hint;
     ZSTD_CCtx *codec;
+    int data_fd;
+    uint64_t spool_size;
 } EWriter;
 
 static uint64_t e_align(uint64_t n, uint64_t a) { return (n + a - 1) & ~(a - 1); }
@@ -234,12 +241,12 @@ static int e_dirs(ENode *node, int fd) {
 }
 static int e_copy(EWriter *w, EInode *i) {
     struct open_how how = {.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
-    int fd = (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
+    int fd = i->virtual_data ? dup(w->data_fd) : (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
     if (fd < 0) return errno;
     struct stat st;
     int error = fstat(fd, &st) ? errno : 0;
-    if (!error && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
-    off_t input = 0, output = (off_t)i->block * 4096;
+    if (!error && !i->virtual_data && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
+    off_t input = i->virtual_data ? (off_t)i->data_offset : 0, output = (off_t)i->block * 4096;
     uint64_t remaining = i->size;
     unsigned char *buffer = NULL;
     while (!error && remaining) {
@@ -261,7 +268,7 @@ static int e_copy(EWriter *w, EInode *i) {
         else if (!n) error = ESTALE;
         else remaining -= (uint64_t)n;
     }
-    if (!error) {
+    if (!error && !i->virtual_data) {
         if (fstat(fd, &st)) error = errno;
         else if (st.st_size != i->st.st_size || st.st_mtim.tv_sec != i->st.st_mtim.tv_sec || st.st_mtim.tv_nsec != i->st.st_mtim.tv_nsec || st.st_ctim.tv_sec != i->st.st_ctim.tv_sec || st.st_ctim.tv_nsec != i->st.st_ctim.tv_nsec) error = ESTALE;
     }
@@ -271,11 +278,11 @@ static unsigned e_compact_initial(EInode *i) { return (unsigned)((32 - (e_align(
 static uint64_t e_compact_middle(EInode *i, uint64_t clusters) { unsigned initial = e_compact_initial(i); return clusters > initial ? (clusters - initial) / 16 * 16 : 0; }
 static int e_compress(EWriter *w, EInode *i) {
     struct open_how how = {.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
-    int fd = (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
+    int fd = i->virtual_data ? dup(w->data_fd) : (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
     if (fd < 0) return errno;
     struct stat st;
     int error = fstat(fd, &st) ? errno : 0;
-    if (!error && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
+    if (!error && !i->virtual_data && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
     uint64_t total_clusters = e_align(i->size, 4096) / 4096;
     unsigned char *map = calloc(1, (size_t)(16 + total_clusters * 8));
     unsigned char *compact = calloc(1, (size_t)i->map_size);
@@ -288,7 +295,7 @@ static int e_compress(EWriter *w, EInode *i) {
     while (!error && at < i->size) {
         size_t size = i->size - at > hint ? hint : (size_t)(i->size - at);
         while (buffered < size) {
-            ssize_t n = pread(fd, input + buffered, size - buffered, (off_t)(at + buffered));
+            ssize_t n = pread(fd, input + buffered, size - buffered, (off_t)(at + buffered + (i->virtual_data ? i->data_offset : 0)));
             if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
             if (!n) { error = ESTALE; break; }
             buffered += (size_t)n;
@@ -392,7 +399,7 @@ static int e_compress(EWriter *w, EInode *i) {
         }
         error = e_write(w->output_fd, compact, (size_t)i->map_size, e_align(4096 + i->nid * 32 + 64 + i->attrs_size, 8));
     }
-    if (!error) {
+    if (!error && !i->virtual_data) {
         if (fstat(fd, &st)) error = errno;
         else if (st.st_size != i->st.st_size || st.st_mtim.tv_sec != i->st.st_mtim.tv_sec || st.st_mtim.tv_nsec != i->st.st_mtim.tv_nsec || st.st_ctim.tv_sec != i->st.st_ctim.tv_sec || st.st_ctim.tv_nsec != i->st.st_ctim.tv_nsec) error = ESTALE;
     }
@@ -460,7 +467,7 @@ static int e_image(EWriter *w) {
 static void e_free_node(ENode *node) {
     if (!node) return;
     for (size_t n = 0; n < node->count; ++n) e_free_node(node->children[n]);
-    free(node->children); free(node->name); free(node);
+    free(node->children); free(node->buckets); free(node->name); free(node);
 }
 static void e_free(EWriter *w) {
     e_free_node(w->root);
@@ -493,18 +500,26 @@ static int e_directory_image(const char *source, const char *destination, long l
     if (error && temporary) unlink(temporary);
     free(temporary); close(w->source_fd); e_free(w); return error;
 }
+#include "erofs_layers.h"
 static char *e_text(const MinyarText *text) {
     if (!text || text->byte_length <= 0 || text->byte_length > 1048576 || memchr(text->bytes, 0, (size_t)text->byte_length)) return NULL;
     return strndup((const char *)text->bytes, (size_t)text->byte_length);
 }
-MinyarBytes *minyar_erofs_directoryStatus(const MinyarText *source, const MinyarText *destination, long long compression, long long level, long long maximum) {
-    char *s = e_text(source), *d = e_text(destination);
-    int error = s && d ? e_directory_image(s, d, compression, level, maximum) : EINVAL;
-    free(s); free(d);
+static MinyarBytes *e_result(int error) {
     const char *message = error ? strerror(error) : "";
     size_t length = strlen(message);
     MinyarBytes *result = minyar_bytes_new((long long)length + 8);
     e64((unsigned char *)result->bytes, (uint64_t)error);
     memcpy((unsigned char *)result->bytes + 8, message, length);
     return result;
+}
+MinyarBytes *minyar_erofs_directoryStatus(const MinyarText *source, const MinyarText *destination, long long compression, long long level, long long maximum) {
+    char *s = e_text(source), *d = e_text(destination);
+    int error = s && d ? e_directory_image(s, d, compression, level, maximum) : EINVAL;
+    free(s);free(d);return e_result(error);
+}
+MinyarBytes *minyar_erofs_layersStatus(const MinyarBytes *paths, const MinyarText *destination, long long compression, long long level, long long maximum) {
+    char *d = e_text(destination);
+    int error = d ? e_layers_image(paths, d, compression, level, maximum) : EINVAL;
+    free(d);return e_result(error);
 }
