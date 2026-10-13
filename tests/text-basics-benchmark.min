@@ -1,6 +1,9 @@
 use "../tools/testing.min" as test
 use "system" as system
 use "sha256" as sha
+use "./benchmark-phases.min" as phase
+use "./sha256-support.min" as flags
+use "json" as json
 
 function suffix(path: Text, replacement: Text): Text {
     let raw = Bytes(path)
@@ -106,24 +109,74 @@ let repeats = 9
 let fixture = "text-basics"
 let baselineCompiler = ""
 let batchSize = 16
+let prepareOnly = false
+let runPrepared = false
+let selected = Map<Text, Boolean>()
 let optionIndex = 0
 while optionIndex < argumentCount() {
     let option = argument(optionIndex)
-    test.check(optionIndex + 1 < argumentCount(), "missing Text benchmark option value")
-    optionIndex += 1
-    let value = argument(optionIndex)
-    if option == "--compiler" { compiler = value }
-    else if option == "--runtime" { runtime = value }
-    else if option == "--clang" { clang = value }
-    else if option == "--output" { output = value }
-    else if option == "--repeats" { repeats = Integer(value) }
-    else if option == "--fixture" { fixture = value }
-    else if option == "--baseline-compiler" { baselineCompiler = value }
-    else if option == "--batch-size" { batchSize = Integer(value) }
-    else { fail("unknown Text benchmark option: " + option) }
+    if option == "--prepare-only" { prepareOnly = true }
+    else if option == "--run-prepared" { runPrepared = true }
+    else {
+        test.check(optionIndex + 1 < argumentCount(), "missing Text benchmark option value")
+        optionIndex += 1
+        let value = argument(optionIndex)
+        selected[option] = true
+        if option == "--compiler" { compiler = value }
+        else if option == "--runtime" { runtime = value }
+        else if option == "--clang" { clang = value }
+        else if option == "--output" { output = value }
+        else if option == "--repeats" { repeats = Integer(value) }
+        else if option == "--fixture" { fixture = value }
+        else if option == "--baseline-compiler" { baselineCompiler = value }
+        else if option == "--batch-size" { batchSize = Integer(value) }
+        else { fail("unknown Text benchmark option: " + option) }
+    }
     optionIndex += 1
 }
 test.check(output != "", "Text benchmark requires --output")
+test.check(prepareOnly != runPrepared, "Text benchmark requires exactly one --prepare-only/--run-prepared phase")
+let work = test.scratch()
+let hostname = "seipnxmg.vm"
+if runPrepared { hostname = "5xnqjvps.vm" }
+phase.requireHost(hostname, work)
+test.require(test.run(["/bin/mkdir", "-p", "--", parent(output)], system.environment(), "", work + "/mkdir", 10), "benchmark output directory")
+output = phase.absolute(output, work)
+let manifestPath = output + ".prepared.json"
+let linkFlags = flags.shellWords(system.getenv("MINYAR_TEST_LINK_FLAGS"))
+if runPrepared {
+    let manifest = phase.read(manifestPath)
+    test.check(phase.string(manifest, "kind") == "text-basics-benchmark", "wrong prepared Text benchmark kind")
+    if !selected.has("--compiler") { compiler = phase.string(manifest, "compiler") }
+    if !selected.has("--runtime") { runtime = phase.string(manifest, "runtime") }
+    if !selected.has("--clang") { clang = phase.string(manifest, "clang") }
+    if !selected.has("--baseline-compiler") { baselineCompiler = phase.string(manifest, "baseline_compiler") }
+    if !selected.has("--fixture") { fixture = phase.string(manifest, "fixture") }
+    else { test.check(fixture == phase.string(manifest, "fixture"), "Text fixture differs from preparation") }
+    if selected.has("--repeats") { test.check(repeats == phase.integer(manifest, "repeats"), "Text sample count differs from preparation") }
+    if selected.has("--batch-size") { test.check(batchSize == phase.integer(manifest, "batch_size"), "Text batch size differs from preparation") }
+    repeats = phase.integer(manifest, "repeats")
+    batchSize = phase.integer(manifest, "batch_size")
+    let recordedFlags = phase.array(manifest, "link_flags")
+    if flags.hasEnvironment(system.environment(), "MINYAR_TEST_LINK_FLAGS") { test.check(phase.same(linkFlags, recordedFlags), "Text link profile differs from preparation") }
+    linkFlags = recordedFlags
+    phase.verify(compiler, phase.string(manifest, "compiler_sha256"))
+    phase.verify(runtime, phase.string(manifest, "runtime_sha256"))
+    phase.verify("benchmarks/" + fixture + ".min", phase.string(manifest, "source_sha256"))
+    phase.verify(suffix(output, ".ll"), phase.string(manifest, "llvm_sha256"))
+    phase.verify(suffix(output, ".exe"), phase.string(manifest, "executable_sha256"))
+    phase.verify("/proc/self/exe", phase.string(manifest, "driver_binary_sha256"))
+    phase.verify("tests/text-basics-benchmark.min", phase.string(manifest, "driver_sha256"))
+    phase.verify("tests/benchmark-phases.min", phase.string(manifest, "phase_support_sha256"))
+    phase.verify("tests/sha256-support.min", phase.string(manifest, "flag_support_sha256"))
+    phase.verify("tests/text-basics-benchmark-runtime.c", phase.string(manifest, "adapter_sha256"))
+    let baselineHash = phase.string(manifest, "baseline_compiler_sha256")
+    test.check((baselineCompiler == "") == (baselineHash == ""), "Text baseline selection differs from preparation")
+    if baselineCompiler != "" {
+        phase.verify(baselineCompiler, baselineHash)
+        phase.verify("build/compiler.min", phase.string(manifest, "selfcompile_source_sha256"))
+    }
+}
 test.check(repeats >= 1 && batchSize >= 1, "invalid Text benchmark work bounds")
 test.check(fixture == "text-basics" || fixture == "text-find-prefixes", "unsupported Text benchmark fixture")
 let source = "benchmarks/" + fixture + ".min"
@@ -131,13 +184,20 @@ let checksum = 11200000
 if fixture == "text-find-prefixes" { checksum = -64 }
 let llvm = suffix(output, ".ll")
 let executable = suffix(output, ".exe")
-let work = test.scratch()
-test.require(test.run(["/bin/mkdir", "-p", "--", parent(output)], system.environment(), "", work + "/mkdir", 10), "benchmark output directory")
-test.require(test.run([compiler, source, llvm], system.environment(), "", work + "/compile", 30), "Text benchmark compile")
-let command = [clang, "-O2", "-Wno-override-module"]
-for flag in test.words(test.setting("MINYAR_TEST_LINK_FLAGS", "")) { command.add(flag) }
-for item in [llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
-test.require(test.run(command, system.environment(), "", work + "/link", 60), "Text benchmark link")
+if prepareOnly {
+    test.require(test.run([compiler, source, llvm], system.environment(), "", work + "/compile", 30), "Text benchmark compile")
+    let command = [clang, "-O2", "-Wno-override-module"]
+    for flag in linkFlags { command.add(flag) }
+    for item in [llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", work + "/link", 60), "Text benchmark link")
+    let baselineHash = ""
+    let referenceHash = ""
+    if baselineCompiler != "" { baselineHash = digest(baselineCompiler); referenceHash = digest("build/compiler.min") }
+    let manifest = "{\"kind\":\"text-basics-benchmark\",\"fixture\":" + phase.quote(fixture) + ",\"compiler\":" + phase.quote(compiler) + ",\"runtime\":" + phase.quote(runtime) + ",\"clang\":" + phase.quote(clang) + ",\"baseline_compiler\":" + phase.quote(baselineCompiler) + ",\"repeats\":" + Text(repeats) + ",\"batch_size\":" + Text(batchSize) + ",\"checksum\":" + Text(checksum) + ",\"link_flags\":" + phase.strings(linkFlags) + ",\"source_sha256\":" + phase.quote(digest(source)) + ",\"compiler_sha256\":" + phase.quote(digest(compiler)) + ",\"runtime_sha256\":" + phase.quote(digest(runtime)) + ",\"llvm_sha256\":" + phase.quote(digest(llvm)) + ",\"executable_sha256\":" + phase.quote(digest(executable)) + ",\"baseline_compiler_sha256\":" + phase.quote(baselineHash) + ",\"selfcompile_source_sha256\":" + phase.quote(referenceHash) + ",\"driver_binary_sha256\":" + phase.quote(digest("/proc/self/exe")) + ",\"driver_sha256\":" + phase.quote(digest("tests/text-basics-benchmark.min")) + ",\"phase_support_sha256\":" + phase.quote(digest("tests/benchmark-phases.min")) + ",\"flag_support_sha256\":" + phase.quote(digest("tests/sha256-support.min")) + ",\"adapter_sha256\":" + phase.quote(digest("tests/text-basics-benchmark-runtime.c")) + "}"
+    writeTextFile(manifestPath, manifest + "\n")
+    print("Prepared Text benchmark: " + manifestPath)
+} else {
+test.check(checksum == phase.integer(phase.read(manifestPath), "checksum"), "prepared Text checksum identity changed")
 let samples: List<Float> = []
 for repetition in 0..(repeats + 1) {
     let observation = measured([executable], work + "/workload", 30)
@@ -189,4 +249,5 @@ report += "}"
 writeTextFile(output, report + "\n")
 print(report)
 test.check(passed, "self-compile exceeded the unchanged 1% gate")
+}
 test.removeTree(work)
