@@ -77,7 +77,8 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-cache-') as name:
     valid.chmod(0o600)
     assert build()==(2,0,0,2,0,0)
     good=cache_file.read_bytes();last_output=output.read_bytes()
-    build(tool=ROOT/'build/minyarc',success=False)
+    assert build(tool=ROOT/'build/minyarc')==(2,0,0,2,0,0)
+    build(tool=ROOT/'build/stage0',success=False)
     assert cache_file.read_bytes()==good and output.read_bytes()==last_output
     entry.write_text(source.replace('library.answer()','library.missing()'))
     failure=build(success=False)

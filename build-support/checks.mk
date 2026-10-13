@@ -332,7 +332,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-memory.py
 
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) python3 tests/incremental-modules.py
 	$(LIMITED) python3 tests/incremental-module-driver.py
