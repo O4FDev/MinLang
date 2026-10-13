@@ -1,0 +1,284 @@
+use "../tools/testing.min" as test
+use "./memory-research-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Runner { root: Text; scratch: Text; evidence: Text; stage: Text; timeout: Integer; rows: List<Text>; sources: List<Text>; header: List<Text>; extra: List<Text>; failure: List<Text> }
+function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function padded(value: Integer): Text {
+    let text = Text(value)
+    while text.byteLength < 3 { text = "0" + text }
+    return text
+}
+function report(runner: Runner, status: Text): Text {
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    for entry in runner.header { keys.add(entry) }
+    for entry in runner.extra { values.add(entry) }
+    keys.add("status"); values.add(json.quote(status))
+    keys.add("sources"); values.add(support.array(runner.sources))
+    keys.add("checks"); values.add(support.array(runner.rows))
+    if runner.failure.length > 0 { keys.add("failure"); values.add(json.quote(runner.failure[0])) }
+    return support.object(keys, values) + "\n"
+}
+function save(runner: Runner, status: Text) { writeTextFile(runner.evidence + "/results.json", report(runner, status)) }
+function remember(runner: Runner, key: Text, value: Text) { runner.header.add(key); runner.extra.add(value) }
+function execute(runner: Runner, label: Text, command: List<Text>, environment: List<Text>, cwd: Text): support.Row {
+    let log = runner.evidence + "/logs/" + padded(runner.rows.length) + "-" + label + ".log"
+    let row = support.execute(label, command, environment, cwd, log, runner.timeout)
+    runner.rows.add(support.rowJSON(row))
+    save(runner, "running")
+    if row.returncode != 0 {
+        let reason = "failed"
+        if row.timedOut { reason = "timed out" }
+        runner.failure.add(label + ": " + reason + "; see " + log)
+    } else { print("PASS " + label) }
+    return row
+}
+function ok(runner: Runner): Boolean { return runner.failure.length == 0 }
+function shell(runner: Runner, script: Text, arguments: List<Text>, phase: Text): test.Result {
+    let command = ["/bin/sh", "-c", script, "minyar"]
+    for item in arguments { command.add(item) }
+    return test.run(command, system.environment(), runner.root, runner.scratch + "/" + phase, 600)
+}
+function snapshotFile(runner: Runner, source: Text, relative: Text) {
+    if !ok(runner) { return }
+    let target = runner.stage + "/" + relative
+    support.makeDirectories(support.parent(target))
+    let copied = shell(runner, "cp -p -- \"$1\" \"$2\"", [source, target], "copy")
+    if copied.status != 0 { runner.failure.add("cannot snapshot " + source + ": " + copied.errorOutput); return }
+    runner.sources.add(support.object(["source", "path", "sha256"], [json.quote(source), json.quote(relative), json.quote(support.digest(target))]))
+}
+function snapshotTrees(runner: Runner) {
+    if !ok(runner) { return }
+    let copied = shell(runner, "tar -C \"$1\" --exclude=tests/data --exclude=__pycache__ -cf - tests examples | tar -C \"$2\" -xf - && cd \"$2\" && find tests examples -type f -print0 | sort -z | xargs -0 sha256sum", [runner.root, runner.stage], "trees")
+    if copied.status != 0 { runner.failure.add("cannot snapshot tests and examples: " + copied.errorOutput); return }
+    for line in test.lines(copied.output) {
+        let raw = Bytes(line)
+        if raw.length > 66 {
+            let relative = Text(raw.slice(66, raw.length))
+            runner.sources.add(support.object(["source", "path", "sha256"], [json.quote(runner.root + "/" + relative), json.quote(relative), json.quote(Text(raw.slice(0, 64)))]))
+        }
+    }
+}
+function protectedInputs(runner: Runner): Text {
+    let listed = shell(runner, "{ find tests -type f \\( -name '*performance*' -o -name '*scaling*' -o -name '*budget*' -o -name '*baseline*' -o -path '*/performance/*' \\) ! -path '*/__pycache__/*'; echo build/performance-baseline.json; for path in build/*baseline*.json; do [ -e \"$path\" ] && echo \"$path\"; done; } | LC_ALL=C sort -u", [], "protected")
+    test.require(listed, "list protected inputs")
+    let entries: List<Text> = []
+    for path in test.lines(listed.output) {
+        let digest = support.digest(runner.root + "/" + path)
+        let value = "null"
+        if digest != "" { value = json.quote(digest) }
+        entries.add(json.quote(path) + ": " + value)
+    }
+    let parts: List<Text> = []
+    for index in 0..entries.length { if index > 0 { parts.add(",\n    ") }; parts.add(entries[index]) }
+    return "{\n    " + joinText(parts) + "\n  }"
+}
+function selfPath(root: Text, scratch: Text): Text {
+    let resolved = test.run(["readlink", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", scratch + "/self", 10)
+    if resolved.status == 0 && test.lines(resolved.output).length > 0 { return test.lines(resolved.output)[0] }
+    return root + "/build/tooling/tests/memory-contracts"
+}
+function optionValues(start: Integer): List<Text> {
+    let result: List<Text> = []
+    let position = start
+    while position < argumentCount() && !support.starts(argument(position), "--") { result.add(argument(position)); position += 1 }
+    test.check(result.length > 0, "option needs a value: " + argument(start - 1))
+    return result
+}
+
+if argumentCount() == 3 && argument(0) == "--instrument-llvm" {
+    writeTextFile(argument(2), test.instrument(readTextFile(argument(1))))
+    exit(0)
+}
+let work = test.scratch()
+let root = support.root(work)
+let compilerPath = root + "/build/minyarc"
+let runtimeSource = root + "/runtime/minyar_runtime.c"
+let level = "standard"
+let requestedProfiles = ["eager", "system", "fixed", "lazy"]
+let mode = "both"
+let requestedBudgets = [32]
+let clang = test.setting("CLANG", "clang")
+let timeout = 600
+let outputDirectory = ""
+let invocation = ["memory-contracts"]
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    invocation.add(option)
+    let given = optionValues(index + 1)
+    for value in given { invocation.add(value) }
+    if option == "--compiler" { compilerPath = support.absolute(given[0], root) }
+    else if option == "--runtime-source" { runtimeSource = support.absolute(given[0], root) }
+    else if option == "--level" { level = given[0]; test.check(member(["smoke", "standard", "extended"], level), "unknown level " + level) }
+    else if option == "--profiles" { requestedProfiles = given; for profile in given { test.check(member(["eager", "system", "fixed", "lazy"], profile), "unknown profile " + profile) } }
+    else if option == "--mode" { mode = given[0]; test.check(member(["native", "sanitize", "both"], mode), "unknown mode " + mode) }
+    else if option == "--budgets" { requestedBudgets = []; for value in given { requestedBudgets.add(Integer(value)) } }
+    else if option == "--clang" { clang = given[0] }
+    else if option == "--timeout" { timeout = Integer(given[0]) }
+    else if option == "--output-dir" { outputDirectory = support.absolute(given[0], root) }
+    else { fail("unknown memory contract option: " + option) }
+    index += 1 + given.length
+}
+test.check(timeout > 0, "timeout must be positive and cleanup budgets must be 1..1024")
+let budgets: List<Integer> = []
+for budget in requestedBudgets {
+    test.check(budget >= 1 && budget <= 1024, "timeout must be positive and cleanup budgets must be 1..1024")
+    let seen = false
+    for existing in budgets { if existing == budget { seen = true } }
+    if !seen { budgets.add(budget) }
+}
+let profiles: List<Text> = []
+for profile in requestedProfiles { if !member(profiles, profile) { profiles.add(profile) } }
+let modes = [mode]
+if mode == "both" { modes = ["native", "sanitize"] }
+let parentDirectory = test.setting("TMPDIR", "/tmp")
+if outputDirectory != "" { support.makeDirectories(outputDirectory); parentDirectory = outputDirectory }
+let evidence = parentDirectory + "/minyar-memory-contracts-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+support.makeDirectories(evidence + "/logs")
+let runner = Runner { root: root; scratch: work; evidence: evidence; stage: evidence + "/snapshot"; timeout: timeout; rows: []; sources: []; header: []; extra: []; failure: [] }
+let budgetTexts: List<Text> = []
+let budgetList: List<Text> = []
+for budget in budgets { budgetTexts.add(Text(budget)); if budgetList.length > 0 { budgetList.add(", ") }; budgetList.add(Text(budget)) }
+let protectedBefore = protectedInputs(runner)
+remember(runner, "level", json.quote(level))
+remember(runner, "profiles", support.texts(profiles))
+remember(runner, "modes", support.texts(modes))
+remember(runner, "budgets", "[" + joinText(budgetList) + "]")
+remember(runner, "invocation", support.texts(invocation))
+remember(runner, "protected_before", protectedBefore)
+remember(runner, "scope", json.quote("Correctness only. No timing guarantee, compiler-arena leak claim, launcher-wrapper coverage, or implicit unwinding on explicit exit. Smoke uses the selected compiler directly; normal return is checked by a test-only cleanup oracle. Runtime sanitizers do not instrument the supplied compiler executable."))
+save(runner, "running")
+let stage = runner.stage
+let compiler = stage + "/build/minyarc"
+snapshotFile(runner, compilerPath, "build/minyarc")
+snapshotFile(runner, runtimeSource, "runtime/minyar_runtime.c")
+if ok(runner) {
+    let runtimeDirectory = support.parent(runtimeSource)
+    let headers = files.list(runtimeDirectory)
+    headers.sort()
+    for header in headers { if support.ends(header, ".h") { snapshotFile(runner, runtimeDirectory + "/" + header, "runtime/" + header) } }
+}
+snapshotTrees(runner)
+snapshotFile(runner, root + "/tools/sanitizer_llvm.py", "tools/sanitizer_llvm.py")
+if level == "extended" {
+    for name in ["production-live-oracle", "production-frame-oracle", "production-idle-service", "production-virtual-stress"] {
+        snapshotFile(runner, root + "/experiments/memory/" + name + ".c", "experiments/memory/" + name + ".c")
+    }
+}
+let resolvedClang = ""
+if ok(runner) {
+    let found = shell(runner, "command -v -- \"$1\"", [clang], "clang")
+    if found.status == 0 && test.lines(found.output).length > 0 { resolvedClang = test.lines(found.output)[0] }
+    else { runner.failure.add("C compiler not found: " + clang) }
+}
+let environment: List<Text> = []
+for entry in system.environment() { if !support.starts(entry, "MINYAR_TEST_") { environment.add(entry) } }
+environment = support.setEnvironment(environment, "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
+environment = support.setEnvironment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+environment = support.setEnvironment(environment, "MINYAR_TEST_COMPILER", compiler)
+environment = support.setEnvironment(environment, "MINYAR_TEST_CLANG", resolvedClang)
+if ok(runner) {
+    let kept: List<Text> = []
+    for entry in environment { if support.starts(entry, "MINYAR_") || support.starts(entry, "ASAN_") || support.starts(entry, "UBSAN_") { kept.add(entry) } }
+    remember(runner, "environment", support.texts(kept))
+    let version = execute(runner, "clang-version", support.clangCommand([resolvedClang, "--version"]), environment, stage)
+    remember(runner, "clang_version", json.quote(version.output))
+}
+if ok(runner) {
+    let banner = execute(runner, "compiler-version", [compiler], environment, stage)
+    remember(runner, "compiler_banner", json.quote(banner.output))
+}
+let adapterTarget = selfPath(root, work)
+let languages = ["ownership", "recursive-data", "production-memory"]
+if level == "extended" { languages.add("regressions"); languages.add("adversarial") }
+let nativeLanguages = ["recursive-data", "production-memory", "regressions"]
+for profile in profiles {
+    if !ok(runner) { break }
+    let profileBudgets = budgets
+    if profile == "eager" { profileBudgets = [32] }
+    for budget in profileBudgets {
+        if !ok(runner) { break }
+        for instrumentation in modes {
+            if !ok(runner) { break }
+            let label = profile + "-k" + Text(budget) + "-" + instrumentation
+            let flags = ["-O2"]
+            let linkFlags: List<Text> = []
+            if instrumentation != "native" { flags = ["-O1", "-g", "-fsanitize=address,undefined"]; linkFlags = ["-fsanitize=address,undefined"] }
+            let backend: List<Text> = []
+            if profile == "system" { backend.add("-DMINYAR_SYSTEM_HEAP=1") }
+            if profile == "fixed" || profile == "lazy" { backend.add("-DMINYAR_BOUNDED_HEAP=1") }
+            if profile == "lazy" { backend.add("-DMINYAR_LAZY_HEAP=1") }
+            backend.add("-DMINYAR_RC_POLL_BUDGET=" + Text(budget))
+            let runtime = stage + "/build/minyar-runtime.o"
+            let build = [resolvedClang, "-std=c11"]
+            for flag in flags { build.add(flag) }
+            for flag in backend { build.add(flag) }
+            for item in ["-c", stage + "/tests/memory-contracts-runtime.c", "-o", runtime] { build.add(item) }
+            let built = execute(runner, label + "-runtime", support.clangCommand(build), environment, stage)
+            if !ok(runner) { break }
+            let selected = support.setEnvironment(support.setEnvironment(environment, "MINYAR_TEST_RUNTIME", runtime), "MINYAR_TEST_LINK_FLAGS", support.join(linkFlags))
+            let adapter = stage + "/build/smoke-clang-" + label
+            let quotedFlags = support.join(linkFlags)
+            writeTextFile(adapter, "#!/bin/sh\ncount=$#\nfor arg do\n    if [ -n " + support.quote(quotedFlags) + " ] && [ \"${arg%.ll}\" != \"$arg\" ]; then\n        copy=\"${arg%.ll}.sanitized.ll\"\n        " + support.quote(adapterTarget) + " --instrument-llvm \"$arg\" \"$copy\" || exit 1\n        arg=$copy\n    fi\n    set -- \"$@\" \"$arg\"\ndone\nshift \"$count\"\nexec " + support.quote(resolvedClang) + " " + quotedFlags + " \"$@\"\n")
+            let made = shell(runner, "chmod 755 \"$1\"", [adapter], "adapter")
+            test.require(made, "make smoke adapter executable")
+            let smoke = execute(runner, label + "-smoke", ["sh", stage + "/tests/smoke.sh"], support.setEnvironment(selected, "MINYAR_TEST_CLANG", adapter), stage)
+            if !ok(runner) { break }
+            let artifacts = evidence + "/artifacts/" + label
+            support.makeDirectories(artifacts)
+            let kept = shell(runner, "cp -R -- \"$1\" \"$2/smoke\" && cp -p -- \"$3\" \"$2/runtime.o\"", [stage + "/build/smoke", artifacts, runtime], "artifacts")
+            test.require(kept, "retain smoke artifacts")
+            if level != "smoke" {
+                if profile == "eager" {
+                    let unit = artifacts + "/runtime-unit"
+                    let compileUnit = [resolvedClang, "-std=c11"]
+                    for flag in flags { compileUnit.add(flag) }
+                    for item in [stage + "/tests/runtime-unit.c", "-o", unit] { compileUnit.add(item) }
+                    let unitBuilt = execute(runner, label + "-unit-build", support.clangCommand(compileUnit), environment, stage)
+                    if !ok(runner) { break }
+                    let unitRun = execute(runner, label + "-unit-model", [unit], environment, stage)
+                    if !ok(runner) { break }
+                }
+                for language in languages {
+                    let command = ["python3", stage + "/tests/" + language + ".py"]
+                    if member(nativeLanguages, language) { command = [root + "/build/tooling/tests/" + language] }
+                    let suite = execute(runner, label + "-" + language, command, selected, stage)
+                    if !ok(runner) { break }
+                }
+            }
+        }
+    }
+}
+let bounded: List<Text> = []
+for profile in profiles { if profile != "eager" { bounded.add(profile) } }
+if ok(runner) && level == "extended" && bounded.length > 0 {
+    let command = [root + "/build/tooling/tests/memory-profile-regressions", "--runtime-source", stage + "/runtime/minyar_runtime.c", "--profiles"]
+    for profile in bounded { command.add(profile) }
+    command.add("--budgets")
+    for budget in budgetTexts { command.add(budget) }
+    for item in ["--mode", mode, "--clang", resolvedClang, "--output-dir", evidence + "/runtime-models"] { command.add(item) }
+    let models = execute(runner, "independent-runtime-models", command, environment, stage)
+}
+let status = "passed"
+if !ok(runner) { status = "failed" }
+let protectedAfter = protectedInputs(runner)
+remember(runner, "protected_after", protectedAfter)
+remember(runner, "protected_unchanged", Text(protectedAfter == protectedBefore))
+if protectedAfter != protectedBefore {
+    status = "failed"
+    remember(runner, "protected_failure", json.quote("A protected performance input changed during this run; inspect concurrent work."))
+}
+save(runner, status)
+test.removeTree(work)
+let upper = "PASSED"
+if status != "passed" { upper = "FAILED" }
+print(upper + ": " + evidence + "/results.json")
+if runner.failure.length > 0 { let written = system.writeStandardError(runner.failure[0] + "\n") }
+if status != "passed" { exit(1) }

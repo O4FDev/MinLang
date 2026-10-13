@@ -30,11 +30,13 @@ check-foundation-baseline: build/minyarc build/testing/cycle-runtime.o build/too
 
 check check-portable: check-foundation-baseline
 
-check-memory-contracts: build/minyarc
-	$(LIMITED) python3 tests/memory-contracts.py
+check-memory-contracts: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/recursive-data build/tooling/tests/production-memory
+	$(LIMITED) ./build/tooling/tests/memory-contracts
 
-check-memory-contracts-harness: build/minyarc
-	$(LIMITED) python3 tests/memory-contracts-harness.py
+build/tooling/tests/memory-contracts-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/memory-contracts-harness: build/testing/cycle-runtime.o
+check-memory-contracts-harness: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/memory-contracts-harness
+	$(LIMITED) ./build/tooling/tests/memory-contracts-harness
 
 check: check-memory-contracts-harness
 

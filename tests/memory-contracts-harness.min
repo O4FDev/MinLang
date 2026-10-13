@@ -1,0 +1,211 @@
+use "../tools/testing.min" as test
+use "./memory-research-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+constant PROTECTED: List<Text> = ["tests/scaling.py", "tests/self-compile-budget.py", "tests/performance.py", "tests/performance/runtime.min", "build/performance-baseline.json"]
+record Options { root: Text; runner: Text; compiler: Text; runtimeSource: Text; evidence: Text; outcomes: List<Text> }
+record Contract { status: Integer; output: Text; data: json.Value; directory: Text }
+
+function protectedState(options: Options): List<Text> {
+    let result: List<Text> = []
+    for name in PROTECTED { result.add(name + "=" + support.digest(options.root + "/" + name)) }
+    return result
+}
+function hasKey(value: json.Value, name: Text): Boolean {
+    for key in value.keys { if key == name { return true } }
+    return false
+}
+function failureRows(data: json.Value): List<json.Value> {
+    let rows: List<json.Value> = []
+    for row in json.member(data, "checks").items {
+        if json.member(row, "timed_out").truth || json.string(row, "returncode") != "0" { rows.add(row) }
+    }
+    return rows
+}
+function findBytes(haystack: Bytes, needle: Text, begin: Integer): Integer {
+    let pattern = Bytes(needle)
+    let index = begin
+    while index + pattern.length <= haystack.length {
+        let equal = true
+        for offset in 0..pattern.length { if haystack[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+        index += 1
+    }
+    return -1
+}
+function logs(directory: Text, scratch: Text): List<Bytes> {
+    let found = test.run(["find", directory, "-name", "*.log", "-type", "f"], system.environment(), "", scratch + "/find-logs", 60)
+    test.require(found, "list retained logs")
+    let result: List<Bytes> = []
+    for path in test.lines(found.output) { result.add(files.readFile(path)) }
+    return result
+}
+function logged(directory: Text, scratch: Text, needle: Text): Boolean {
+    for data in logs(directory, scratch) { if findBytes(data, needle, 0) >= 0 { return true } }
+    return false
+}
+function space(byte: Integer): Boolean { return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12 }
+function cleanupDiagnosis(data: Bytes): Boolean {
+    if findBytes(data, "memory cleanup oracle: leaked objects", 0) >= 0 { return true }
+    let start = findBytes(data, "rc_object_count", 0)
+    while start >= 0 {
+        let index = start + 15
+        while index < data.length && space(data[index]) { index += 1 }
+        if findBytes(data, "==", index) == index {
+            index += 2
+            while index < data.length && space(data[index]) { index += 1 }
+            if findBytes(data, "rc_immortal_object_count", index) == index { return true }
+        }
+        start = findBytes(data, "rc_object_count", start + 1)
+    }
+    return false
+}
+function runContracts(options: Options, label: Text, compiler: Text, runtime: Text, timeout: Integer): Contract {
+    let directory = options.evidence + "/" + label
+    support.makeDirectories(directory)
+    let selectedCompiler = options.compiler
+    if compiler != "" { selectedCompiler = compiler }
+    let selectedRuntime = options.runtimeSource
+    if runtime != "" { selectedRuntime = runtime + "/minyar_runtime.c" }
+    let command = [options.runner, "--compiler", selectedCompiler, "--runtime-source", selectedRuntime, "--level", "smoke", "--profiles", "eager", "--mode", "native", "--timeout", Text(timeout), "--output-dir", directory + "/runs"]
+    let outer = timeout * 3
+    if outer < 30 { outer = 30 }
+    let began = system.monotonicNanoseconds()
+    let result = test.run(command, system.environment(), options.root, directory + "/runner.capture", outer)
+    if result.status == 124 && system.monotonicNanoseconds() - began >= outer * 1000000000 {
+        writeTextFile(directory + "/runner.log", "timed out after " + Text(outer) + " seconds\n")
+        fail("The runner failed to enforce its child timeout")
+    }
+    writeTextFile(directory + "/command.json", support.texts(command) + "\n")
+    let output = support.readText(directory + "/runner.capture") + support.readText(directory + "/runner.capture.err")
+    writeTextFile(directory + "/runner.log", output)
+    let found = test.run(["find", directory + "/runs", "-name", "results.json", "-type", "f"], system.environment(), "", directory + "/find", 60)
+    let manifests: List<Text> = []
+    if found.status == 0 { manifests = test.lines(found.output) }
+    test.check(manifests.length > 0, "No retained results.json; see " + directory + "/runner.log")
+    test.check(manifests.length == 1, "Smoke should retain one unambiguous result manifest")
+    let data = json.parse(readTextFile(manifests[0]))
+    test.check(data.kind == json.OBJECT, "results.json is not a JSON object")
+    let status = json.string(data, "status")
+    options.outcomes.add(support.object(["label", "returncode", "manifest", "status"], [json.quote(label), Text(result.status), json.quote(manifests[0]), json.quote(status)]))
+    test.check(status == "passed" || status == "failed" || status == "interrupted", "unexpected manifest status " + status)
+    test.check(json.member(data, "sources").items.length > 0, "Evidence must identify the tested inputs")
+    test.check(json.member(data, "checks").items.length > 0, "Evidence must record the executed checks")
+    for row in json.member(data, "checks").items {
+        for field in ["label", "command", "returncode", "timed_out", "log"] { test.check(hasKey(row, field), "check row lacks " + field) }
+    }
+    return Contract { status: result.status; output: output; data: data; directory: support.parent(manifests[0]) }
+}
+function selected(selectors: List<Text>, family: Text, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for value in selectors { if value == family || value == name || value == family + "." + name { return true } }
+    return false
+}
+function fakeCompiler(options: Options, label: Text, body: Text): Text {
+    let directory = options.evidence + "/inputs"
+    support.makeDirectories(directory)
+    let executable = directory + "/" + label
+    writeTextFile(executable, "#!/bin/sh\n" + body + "\n")
+    test.require(test.run(["chmod", "755", executable], system.environment(), "", executable + ".chmod", 10), "make fake compiler executable")
+    return executable
+}
+
+let work = test.scratch()
+let root = support.root(work)
+let options = Options { root: root; runner: root + "/build/tooling/tests/memory-contracts"; compiler: root + "/build/minyarc"; runtimeSource: root + "/runtime/minyar_runtime.c"; evidence: ""; outcomes: [] }
+let selectors: List<Text> = []
+let names = ["test_real_language_smoke_is_accepted", "test_normal_return_leak_is_rejected", "test_compiler_failure_is_rejected_and_retained", "test_non_utf8_compiler_failure_is_rejected_and_retained", "test_compiler_timeout_is_rejected_and_retained"]
+let family = "MemoryContractsHarnessTests"
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--runner" || option == "--compiler" || option == "--runtime-source" || option == "--output-dir" {
+        test.check(index + 1 < argumentCount(), "option needs a value: " + option)
+        let value = support.absolute(argument(index + 1), root)
+        if option == "--runner" { options.runner = value }
+        if option == "--compiler" { options.compiler = value }
+        if option == "--runtime-source" { options.runtimeSource = value }
+        if option == "--output-dir" { options.evidence = value }
+        index += 2
+    } else {
+        if option != "-v" && option != "--verbose" && option != "-q" && option != "--quiet" {
+            let known = option == family
+            for name in names { if option == name || option == family + "." + name { known = true } }
+            test.check(known, "unknown " + family + " selector: " + option)
+            selectors.add(option)
+        }
+        index += 1
+    }
+}
+if files.pathSize(options.runtimeSource) >= 0 && !support.ends(options.runtimeSource, ".c") { options.runtimeSource = options.runtimeSource + "/minyar_runtime.c" }
+if options.evidence == "" {
+    options.evidence = test.setting("TMPDIR", "/tmp") + "/minyar-memory-contract-harness-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+}
+support.makeDirectories(options.evidence)
+print("Harness evidence: " + options.evidence)
+let before = protectedState(options)
+
+if selected(selectors, family, "test_real_language_smoke_is_accepted") {
+    let contract = runContracts(options, "normal-smoke", "", "", 60)
+    test.check(contract.status == 0, contract.output)
+    test.check(json.string(contract.data, "status") == "passed", "normal smoke did not pass")
+    test.check(failureRows(contract.data).length == 0, "normal smoke recorded failing checks")
+    print("test_real_language_smoke_is_accepted ... ok")
+}
+if selected(selectors, family, "test_normal_return_leak_is_rejected") {
+    let copied = options.evidence + "/inputs/leaked-runtime"
+    support.makeDirectories(copied)
+    test.require(test.run(["sh", "-c", "cp -R -- \"$1\"/. \"$2\"", "minyar", support.parent(options.runtimeSource), copied], system.environment(), "", work + "/copy-runtime", 60), "copy runtime for leak mutant")
+    writeTextFile(copied + "/minyar_runtime.c", readTextFile(copied + "/minyar_runtime.c") + "\n/* Harness mutant: a real allocated object with no owner and no release. */\n#ifndef MINYAR_COMPILER_ARENA\nstatic void *volatile memory_contract_orphan;\n__attribute__((constructor)) static void memory_contract_leak(void) {\n    memory_contract_orphan = rc_allocate_object(64, RC_TEXT);\n}\n#endif\n")
+    let contract = runContracts(options, "normal-return-leak", "", copied, 60)
+    test.check(contract.status != 0, "An orphan allocation escaped the cleanup oracle")
+    test.check(json.string(contract.data, "status") == "failed", "leak run was not marked failed")
+    test.check(failureRows(contract.data).length > 0, "leak run recorded no failing check")
+    let diagnosed = false
+    for data in logs(contract.directory, work) { if cleanupDiagnosis(data) { diagnosed = true } }
+    test.check(diagnosed, "The rejection should retain its cleanup diagnosis")
+    print("test_normal_return_leak_is_rejected ... ok")
+}
+if selected(selectors, family, "test_compiler_failure_is_rejected_and_retained") {
+    let compiler = fakeCompiler(options, "failed-compiler", "echo MINYAR_HARNESS_COMPILER_FAILURE >&2\nexit 23")
+    let contract = runContracts(options, "compiler-failure", compiler, "", 60)
+    test.check(contract.status != 0, "failing compiler was accepted")
+    test.check(json.string(contract.data, "status") == "failed", "failing compiler run was not marked failed")
+    test.check(failureRows(contract.data).length > 0, "failing compiler recorded no failing check")
+    test.check(logged(contract.directory, work, "MINYAR_HARNESS_COMPILER_FAILURE"), "compiler diagnostic was not retained")
+    print("test_compiler_failure_is_rejected_and_retained ... ok")
+}
+if selected(selectors, family, "test_non_utf8_compiler_failure_is_rejected_and_retained") {
+    let compiler = fakeCompiler(options, "binary-diagnostic-compiler", "printf '\\377MINYAR_HARNESS_BINARY_DIAGNOSTIC\\n' >&2\nexit 23")
+    let contract = runContracts(options, "non-utf8-compiler-failure", compiler, "", 60)
+    test.check(contract.status != 0, "binary diagnostic compiler was accepted")
+    test.check(json.string(contract.data, "status") == "failed", "Malformed diagnostics must not strand the report as running")
+    test.check(failureRows(contract.data).length > 0, "binary diagnostic compiler recorded no failing check")
+    test.check(logged(contract.directory, work, "MINYAR_HARNESS_BINARY_DIAGNOSTIC"), "binary diagnostic was not retained")
+    print("test_non_utf8_compiler_failure_is_rejected_and_retained ... ok")
+}
+if selected(selectors, family, "test_compiler_timeout_is_rejected_and_retained") {
+    let compiler = fakeCompiler(options, "sleeping-compiler", "echo MINYAR_HARNESS_COMPILER_SLEEPING >&2\nexec sleep 30")
+    let contract = runContracts(options, "compiler-timeout", compiler, "", 3)
+    test.check(contract.status != 0, "sleeping compiler was accepted")
+    test.check(json.string(contract.data, "status") == "failed", "sleeping compiler run was not marked failed")
+    let timedOut = 0
+    let sleeping = false
+    for row in json.member(contract.data, "checks").items {
+        if json.member(row, "timed_out").truth {
+            timedOut += 1
+            if findBytes(files.readFile(json.string(row, "log")), "MINYAR_HARNESS_COMPILER_SLEEPING", 0) >= 0 { sleeping = true }
+        }
+    }
+    test.check(timedOut > 0, "A killed command must remain distinguishable from an ordinary failure")
+    test.check(sleeping, "Timeout must exercise the compiler descendant, not a preceding build")
+    print("test_compiler_timeout_is_rejected_and_retained ... ok")
+}
+let after = protectedState(options)
+writeTextFile(options.evidence + "/harness-results.json", support.object(["cases", "protected_before", "protected_after"], [support.array(options.outcomes), support.texts(before), support.texts(after)]) + "\n")
+let unchanged = before.length == after.length
+for position in 0..before.length { if before[position] != after[position] { unchanged = false } }
+test.check(unchanged, "Protected performance files changed during harness tests")
+test.removeTree(work)

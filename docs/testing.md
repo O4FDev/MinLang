@@ -226,7 +226,7 @@ entry point for memory work; `make check` still runs the existing project checks
 To test an experimental compiler/runtime pair without installing it:
 
 ```sh
-python3 tests/memory-contracts.py \
+./build/tooling/tests/memory-contracts \
   --compiler /absolute/path/to/candidate-compiler \
   --runtime-source /absolute/path/to/runtime/minyar_runtime.c \
   --level standard --profiles eager system fixed lazy --mode both \
