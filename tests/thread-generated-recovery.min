@@ -1,0 +1,95 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "system" as system
+
+let sanitizer = "native"
+let runtimeRoot = ""
+let expectOld = false
+let selected = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--expect-old" { expectOld = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "option needs a value: " + option)
+    if option == "--sanitizer" { sanitizer = argument(index + 1) }
+    else if option == "--runtime-root" { runtimeRoot = argument(index + 1) }
+    else if option == "--case" { selected = argument(index + 1) }
+    else { fail("unknown option: " + option) }
+    index += 2
+}
+test.check(sanitizer == "native" || sanitizer == "address" || sanitizer == "thread", "invalid sanitizer: " + sanitizer)
+test.check(selected == "" || selected == "normal" || selected == "bridge-reject" || selected == "target-reject" || selected == "accepted-unwind", "invalid case: " + selected)
+let work = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
+if runtimeRoot == "" { runtimeRoot = root }
+let flags = "-O2 -Wno-override-module"
+if sanitizer == "address" { flags = "-O1 -g -fno-omit-frame-pointer -Wno-override-module -fsanitize=address,undefined" }
+if sanitizer == "thread" { flags = "-O1 -g -fno-omit-frame-pointer -Wno-override-module -fsanitize=thread" }
+let environment = support.environment(system.environment(), ["LIMITED", "SANITIZER_LIMITED", "ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS"],
+    ["", "", support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1", "halt_on_error=1:exitcode=66", flags, flags, flags])
+let failures: List<Text> = []
+for probe in 0..33 { failures.add("  %probe.begin." + Text(probe) + " = call i32 @minyar_calldepth_reporting_begin()\n") }
+for probe in 0..32 { failures.add("  %probe.end." + Text(probe) + " = call i32 @minyar_calldepth_reporting_end()\n") }
+let failure = joinText(failures)
+let cases = ["normal", "bridge-reject", "target-reject", "accepted-unwind"]
+if selected != "" { cases = [selected] }
+for resultType in ["Integer", "Nothing"] {
+    let returned = "return"
+    if resultType == "Integer" { returned = "return 0" }
+    let source = work + "/main.min"
+    writeTextFile(source, "use \"calldepth\" as depth\nthread function worker(seed: Integer, input: FrozenBytes, queue: BytesChannel): " + resultType + " {\n    let local = Bytes(64)\n    local.setInt64(0, seed)\n    " + returned + "\n}\nfunction main() {\n    let remaining = depth.remaining()\n    if remaining != -1 { fail(\"main depth scope changed\") }\n    let input = freezeBytes(Bytes(0))\n    let queue = bytesChannel(0, 1)\n    let worker = startThread(worker, 42, input, queue)\n    let joined = joinThreadResult(worker)\n    if joined.ok { print(joined.value) } else { print(joined.code) }\n    closeBytesChannel(queue)\n}\n")
+    for profile in ["system", "eager"] {
+        let raw = work + "/program.ll"
+        let command = [root + "/build/minyarc", source, raw, "--library", root + "/library"]
+        if profile == "system" { command.add("--bounded-owners"); command.add("32") }
+        let compiled = test.run(command, system.environment(), "", work + "/compile", 60)
+        test.check(compiled.status == 0, compiled.output + compiled.errorOutput)
+        let text = readTextFile(raw)
+        test.check(test.contains(text, "declare i32 @minyar_calldepth_reporting_begin()"), "calldepth reporting declaration is missing")
+        let name = ""
+        for line in test.lines(text) {
+            if name == "" && support.starts(line, "; minyar-thread-entry: ") { name = Text(Bytes(line).slice(23, Bytes(line).length)) }
+        }
+        test.check(name != "", "thread entry marker is missing")
+        let bridgeHeader = support.find(text, "define internal i64 @.minyar.thread.bridge." + name + "(", 0)
+        test.check(bridgeHeader >= 0, "thread bridge is missing")
+        let bridgeEntry = support.find(text, "{\nentry:\n", bridgeHeader)
+        test.check(bridgeEntry >= 0 && bridgeEntry < support.find(text, "\n", bridgeHeader) + 1, "thread bridge entry changed")
+        let bridgeEnd = bridgeEntry + 9
+        let workerHeader = support.find(text, "define i64 @.minyar.fn." + name + "(", 0)
+        if workerHeader < 0 { workerHeader = support.find(text, "define void @.minyar.fn." + name + "(", 0) }
+        test.check(workerHeader >= 0, "thread worker definition is missing")
+        let workerEnd = support.find(text, "{", workerHeader) + 1
+        test.check(workerEnd > 0 && workerEnd <= support.find(text, "\n", workerHeader), "thread worker header changed")
+        for item in cases {
+            let position = -1
+            if item == "bridge-reject" { position = bridgeEnd }
+            else if item == "target-reject" {
+                let body = support.find(text, "thread.body:\n", bridgeEnd)
+                test.check(body >= 0, "thread body label is missing")
+                position = body + 13
+            } else if item == "accepted-unwind" {
+                let body = support.find(text, "recovery.body:\n", workerEnd)
+                test.check(body >= 0, "recovery body label is missing")
+                position = body + 15
+            }
+            let changed = text
+            if position >= 0 { changed = Text(Bytes(text).slice(0, position)) + failure + Text(Bytes(text).slice(position, Bytes(text).length)) }
+            let program = work + "/" + item + ".ll"
+            writeTextFile(program, changed)
+            let binary = work + "/" + item + "-run"
+            let runtimeName = "minyar-runtime-eager.o"
+            if profile == "system" { runtimeName = "minyar-default-runtime.o" }
+            let link = support.driver()
+            for argumentValue in ["link", runtimeRoot, program, runtimeRoot + "/build/" + runtimeName, binary, "0"] { link.add(argumentValue) }
+            let linked = test.run(link, environment, "", binary + ".link", 120)
+            test.check(linked.status == 0, linked.output + linked.errorOutput)
+            let observed = test.run([binary], environment, "", binary + ".out", 30)
+            let expected = "2\n"
+            if item == "normal" || expectOld { expected = "0\n" }
+            test.check(observed.status == 0 && observed.output == expected && observed.errorOutput == "", resultType + " " + profile + " " + item + " " + Text(observed.status) + " " + observed.output + observed.errorOutput)
+            print(resultType + "/" + profile + "/" + item + "/" + sanitizer + ": passed")
+        }
+    }
+}
+test.removeTree(work)

@@ -1,0 +1,216 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+constant ENTRY = "thread function worker(seed: Integer, input: NativeRegion, channel: BytesChannel): Integer {\n    return input.getInt64(0)\n}\n"
+constant MAIN = "function main() {\n    nativeThreadSetup()\n    let input = mapNativeRegion(4096, 3, 34, -1, 0)\n    let channel = bytesChannel(0, 1)\n    let workerHandle = startThread(worker, 0, input, channel)\n    joinThread(workerHandle)\n}\n"
+record Context { work: Text; root: Text; selected: Text; environment: List<Text>; serial: Integer }
+function link(context: Context, llvm: Text, binary: Text) {
+    let command = support.driver()
+    for item in ["link", context.root, llvm, context.root + "/build/minyar-default-runtime.o", binary, "0"] { command.add(item) }
+    let linked = test.run(command, context.environment, "", binary + ".link", 240)
+    test.check(linked.status == 0, linked.output + linked.errorOutput)
+}
+function compile(context: Context, source: Text, llvm: Text, library: Text): test.Result {
+    context.serial += 1
+    let command = [context.selected, source, llvm]
+    if library != "" { command.add("--library"); command.add(library) }
+    command.add("--bounded-owners")
+    command.add("32")
+    return test.run(command, context.environment, "", context.work + "/compile-" + Text(context.serial), 90)
+}
+function runtimeControls(context: Context, sanitizer: Text, flags: List<Text>) {
+    cycle.publishEngine(context.root, context.root + "/build/thread-cycle-engine.c")
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    for cycles in [false, true] {
+        for systemHeap in [false, true] {
+            let label = "native-regions-rc-eager"
+            if cycles && systemHeap { label = "native-regions-cycle-system" }
+            else if cycles { label = "native-regions-cycle-eager" }
+            else if systemHeap { label = "native-regions-rc-system" }
+            let binary = context.root + "/build/" + label + "-" + sanitizer
+            let command = [clang, "-std=c11"]
+            for flag in flags { command.add(flag) }
+            for item in ["-Wall", "-Wextra", "-Werror", "-DMINYAR_THREADED=1", "-I" + context.root + "/runtime"] { command.add(item) }
+            if cycles { command.add("-DMINYAR_TEST_CYCLES=1") }
+            if systemHeap { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+            for item in [context.root + "/tests/thread-native-regions.c", "-pthread", "-lm", "-o", binary] { command.add(item) }
+            test.require(test.run(command, context.environment, "", context.work + "/" + label + ".build", 180), "build " + label)
+            let ran = test.run([binary], context.environment, "", context.work + "/" + label + ".run", 60)
+            test.check(ran.status == 0 && ran.errorOutput == "", label + " failed\n" + ran.output + ran.errorOutput)
+            test.check(test.contains(ran.output, "real KVM IO dispatch"), label + " did not dispatch real KVM IO\n" + ran.output)
+            let cases = ["bounds", "negative", "alignment", "value", "result", "protection"]
+            let diagnostics = ["outside", "outside", "aligned", "fit", "unsuccessful", "permit"]
+            for index in 0..cases.length {
+                let stopped = test.run([binary, cases[index]], context.environment, "", context.work + "/" + label + "-" + cases[index], 10)
+                test.check(stopped.status != 0 && stopped.status != 99 && test.contains(stopped.errorOutput, diagnostics[index]), label + " " + cases[index] + " " + Text(stopped.status) + "\n" + stopped.errorOutput)
+            }
+            print(label + " " + sanitizer + " real KVM and six rejected runtime controls passed")
+        }
+    }
+}
+function generatedFixtures(context: Context, sanitizer: Text) {
+    for name in ["native-regions", "native-region-kvm", "native-region-providers"] {
+        let llvm = context.work + "/" + name + ".ll"
+        let compiled = compile(context, context.root + "/tests/thread-fixtures/" + name + ".min", llvm, context.root + "/library")
+        test.check(compiled.status == 0, compiled.output + compiled.errorOutput)
+        let binary = context.work + "/" + name
+        link(context, llvm, binary)
+        let ran = test.run([binary], context.environment, "", binary + ".out", 60)
+        test.check(ran.status == 0 && ran.output == name + " passed\n" && ran.errorOutput == "", name + " failed\n" + ran.output + ran.errorOutput)
+        print(name + " " + sanitizer + " generated language passed")
+    }
+}
+function mainExit(context: Context, sanitizer: Text) {
+    for variant in ["direct", "helper", "children"] {
+        let ending = "exit(result)"
+        if variant == "helper" { ending = "stop(result)" }
+        let text = test.replace(ENTRY, "return input.getInt64(0)", "return seed") + test.replace(test.replace(MAIN, "startThread(worker, 0,", "startThread(worker, 7,"), "    joinThread(workerHandle)", "    let result = joinThread(workerHandle)\n    closeBytesChannel(channel)\n    " + ending)
+        let expected = ""
+        if variant == "helper" { text = "function stop(status: Integer) { exit(status) }\n" + text }
+        if variant == "children" {
+            text = test.replace(text, "return seed", "threadSleepNanoseconds(10000000)\n    print(\"child joined\")\n    return seed")
+            text = test.replace(text, "    let result = joinThread(workerHandle)\n    closeBytesChannel(channel)\n    exit(result)", "    exit(7)")
+            expected = "child joined\n"
+        }
+        let source = context.work + "/main-exit.min"
+        writeTextFile(source, text)
+        let llvm = context.work + "/main-exit.ll"
+        let compiled = compile(context, source, llvm, "")
+        test.check(compiled.status == 0, compiled.output + compiled.errorOutput)
+        let binary = context.work + "/main-exit"
+        link(context, llvm, binary)
+        let ran = test.run([binary], context.environment, "", binary + ".out", 60)
+        test.check(ran.status == 7 && ran.output == expected && ran.errorOutput == "", "main-exit-" + variant + " " + Text(ran.status) + "\n" + ran.output + ran.errorOutput)
+        print("main-exit-" + variant + " " + sanitizer + " joined status passed")
+    }
+}
+function machineControls(context: Context, sanitizer: Text) {
+    for compileOnly in [false, true] {
+        let controls = "machine.pause()\n    machine.fence()\n    controls()"
+        if compileOnly { controls = "machine.out8(244, 7)" }
+        let text = ENTRY + test.replace(MAIN, "    nativeThreadSetup()", "    nativeThreadSetup()\n    " + controls)
+        if !compileOnly { text = "function controls() { machine.pause(); machine.fence() }\n" + text }
+        let source = context.work + "/main-machine.min"
+        writeTextFile(source, "use \"machine\" as machine\n" + text)
+        let llvm = context.work + "/main-machine.ll"
+        let compiled = compile(context, source, llvm, context.root + "/library")
+        test.check(compiled.status == 0, compiled.output + compiled.errorOutput)
+        let emitted = readTextFile(llvm)
+        let symbols = ["pause", "fence"]
+        if compileOnly { symbols = ["out8"] }
+        for name in symbols { test.check(test.contains(emitted, "minyar_machine_" + name), "missing machine symbol " + name) }
+        if compileOnly { test.check(test.contains(emitted, "asm sideeffect \"outb $0, $1\""), "out8 inline assembly changed") }
+        else { test.check(test.contains(emitted, "asm sideeffect \"pause\"") && test.contains(emitted, "fence seq_cst"), "pause/fence lowering changed") }
+        let binary = context.work + "/main-machine"
+        link(context, llvm, binary)
+        if compileOnly {
+            print("main-out8 " + sanitizer + " compile-only passed; not executed")
+        } else {
+            let ran = test.run([binary], context.environment, "", binary + ".out", 60)
+            test.check(ran.status == 0 && ran.output == "" && ran.errorOutput == "", "main-pause-fence\n" + ran.output + ran.errorOutput)
+            print("main-pause-fence " + sanitizer + " bounded direct and helper calls passed")
+        }
+    }
+}
+function rejections(context: Context, sanitizer: Text) {
+    let labels: List<Text> = []
+    let texts: List<Text> = []
+    let worker = "return input.getInt64(0)"
+    labels.add("legacy-main-address"); texts.add(ENTRY + test.replace(test.replace(MAIN, "    nativeThreadSetup()\n", ""), "    let input =", "    let local = Bytes(8)\n    let raw = machine.address(local)\n    let input ="))
+    labels.add("worker-address"); texts.add(test.replace(ENTRY, worker, "return input.address") + MAIN)
+    labels.add("worker-raw"); texts.add(test.replace(ENTRY, worker, "return machine.load64(0)") + MAIN)
+    labels.add("worker-managed-address"); texts.add(test.replace(ENTRY, worker, "let local = Bytes(8)\n    return machine.address(local)") + MAIN)
+    labels.add("worker-setup"); texts.add(test.replace(ENTRY, worker, "nativeThreadSetup()\n    return 0") + MAIN)
+    labels.add("legacy-main-exit"); texts.add(ENTRY + test.replace(test.replace(MAIN, "    nativeThreadSetup()\n", ""), "    joinThread(workerHandle)", "    joinThread(workerHandle)\n    exit(0)"))
+    labels.add("worker-exit"); texts.add(test.replace(ENTRY, worker, "exit(0)\n    return 0") + MAIN)
+    labels.add("worker-exit-helper"); texts.add("function stop() { exit(0) }\n" + test.replace(ENTRY, worker, "stop()\n    return 0") + MAIN)
+    labels.add("managed-input"); texts.add(test.replace(ENTRY, "input: NativeRegion", "input: Bytes") + MAIN)
+    labels.add("managed-region-list"); texts.add(ENTRY + test.replace(MAIN, "    let channel =", "    let managed: List<Bytes> = [Bytes(8)]\n    let invalid = shareNativeRegions(managed)\n    let channel ="))
+    labels.add("opaque-constructor"); texts.add(ENTRY + test.replace(MAIN, "mapNativeRegion(4096, 3, 34, -1, 0)", "NativeRegion(0)"))
+    labels.add("wrong-map-input"); texts.add(ENTRY + test.replace(MAIN, "mapNativeRegion(4096, 3, 34, -1, 0)", "mapNativeRegion(Bytes(8), 3, 34, -1, 0)"))
+    labels.add("worker-native-helper"); texts.add("function unsafe(): Integer { return zstd.rawCreateDCtx() }\n" + test.replace(ENTRY, worker, "return unsafe()") + MAIN)
+    labels.add("worker-decode-helper"); texts.add("function unsafe(): Integer { let ctx = zstd.createDCtx(); let result = zstd.decompressInto(ctx, Bytes(0), Bytes(8)); zstd.closeDCtx(ctx); return result }\n" + test.replace(ENTRY, worker, "return unsafe()") + MAIN)
+    labels.add("worker-close-helper"); texts.add("function unsafe(): Integer { zstd.rawCloseDCtx(0); return 0 }\n" + test.replace(ENTRY, worker, "return unsafe()") + MAIN)
+    labels.add("worker-buffer-helper"); texts.add("function unsafe(): Integer { return zstd.threadRejectionDecompress() }\n" + test.replace(ENTRY, worker, "return unsafe()") + MAIN)
+    labels.add("unreviewed-extern-main"); texts.add("function dangerous(): Integer { native \"not_reviewed\" }\n" + ENTRY + test.replace(MAIN, "    nativeThreadSetup()", "    nativeThreadSetup()\n    dangerous()"))
+    let operations = ["pause", "fence", "out8"]
+    let calls = ["machine.pause()", "machine.fence()", "machine.out8(244, 7)"]
+    for index in 0..operations.length {
+        labels.add("worker-machine-" + operations[index]); texts.add(test.replace(ENTRY, worker, calls[index] + "\n    return 0") + MAIN)
+        labels.add("worker-machine-" + operations[index] + "-helper"); texts.add("function unsafe() { " + calls[index] + " }\n" + test.replace(ENTRY, worker, "unsafe()\n    return 0") + MAIN)
+        labels.add("legacy-main-machine-" + operations[index]); texts.add(ENTRY + test.replace(MAIN, "    nativeThreadSetup()", "    " + calls[index]))
+    }
+    let library = context.work + "/library"
+    test.check(files.makeDirectory(library) == 0, "cannot create rejection library")
+    writeTextFile(library + "/machine.min", readTextFile(context.root + "/library/machine.min"))
+    writeTextFile(library + "/zstd.min", readTextFile(context.root + "/library/zstd.min") + "\npublic function threadRejectionDecompress(): Integer { return bufferDecompress(0, Bytes(0), Bytes(0)) }\n")
+    for index in 0..labels.length {
+        let label = labels[index]
+        let source = context.work + "/rejected.min"
+        writeTextFile(source, "use \"machine\" as machine\nuse \"zstd\" as zstd\n" + texts[index])
+        let llvm = context.work + "/rejected.ll"
+        if files.pathSize(llvm) >= 0 { files.remove(llvm) }
+        let rejected = compile(context, source, llvm, library)
+        let combined = rejected.errorOutput + rejected.output
+        test.check(rejected.status != 0 && files.pathSize(llvm) < 0, label + " was accepted\n" + combined)
+        let diagnostic = "unsafe thread effect"
+        if label == "managed-input" { diagnostic = "thread entry" }
+        if label == "managed-region-list" || label == "wrong-map-input" { diagnostic = "wrong thread boundary argument types" }
+        if label == "opaque-constructor" { diagnostic = "opaque thread types cannot be constructed" }
+        test.check(test.contains(combined, diagnostic), label + " lacks " + diagnostic + "\n" + combined)
+        if label == "worker-native-helper" { test.check(test.contains(combined, "minyar_zstd_rawCreateDCtx"), combined) }
+        if label == "worker-close-helper" { test.check(test.contains(combined, "minyar_zstd_rawCloseDCtx"), combined) }
+        if label == "worker-buffer-helper" { test.check(test.contains(combined, "minyar_zstd_bufferDecompress"), combined) }
+        if label == "legacy-main-exit" || label == "worker-exit" || label == "worker-exit-helper" { test.check(test.contains(combined, "builtin 'exit' 0(1)"), combined) }
+        let marker = support.find(label, "-machine-", 0)
+        if marker >= 0 {
+            let operation = Text(Bytes(label).slice(marker + 9, Bytes(label).length))
+            if test.contains(operation, "-helper") { operation = Text(Bytes(operation).slice(0, Bytes(operation).length - 7)) }
+            let signature = "5()"
+            if operation == "out8" { signature = "5(1,1)" }
+            test.check(test.contains(combined, "native 'minyar_machine_" + operation + "' " + signature), label + "\n" + combined)
+        }
+        test.check(!test.contains(rejected.errorOutput, "AddressSanitizer:") && !test.contains(rejected.errorOutput, "runtime error:"), label + "\n" + rejected.errorOutput)
+        print(label + " " + sanitizer + " rejected before IR publication")
+    }
+}
+
+let sanitizer = "native"
+let runtimeOnly = false
+let languageOnly = false
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--runtime-only" { runtimeOnly = true }
+    else if option == "--language-only" { languageOnly = true }
+    else if option == "--sanitizer" {
+        test.check(index + 1 < argumentCount(), "--sanitizer needs a value")
+        sanitizer = argument(index + 1)
+        index += 1
+    } else { fail("unknown option: " + option) }
+    index += 1
+}
+test.check(sanitizer == "native" || sanitizer == "address" || sanitizer == "thread", "invalid sanitizer: " + sanitizer)
+test.check(support.host() == "Linux", "native-region qualification requires Linux and real KVM")
+let flags = ["-O2"]
+if sanitizer == "address" { flags = ["-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=address,undefined"] }
+if sanitizer == "thread" { flags = ["-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=thread"] }
+let options = support.joined(flags, " ") + " -Wno-override-module"
+let work = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
+let environment = support.environment(system.environment(), ["DEBUGINFOD_URLS", "LIMITED", "SANITIZER_LIMITED", "ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS"],
+    ["", "", "", support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1", "halt_on_error=1:exitcode=66", options, options, options])
+let selected = root + "/build/minyarc"
+if sanitizer == "address" { selected = root + "/build/minyarc-sanitize" }
+let context = Context { work: work; root: root; selected: selected; environment: environment; serial: 0 }
+if !languageOnly { runtimeControls(context, sanitizer, flags) }
+if !runtimeOnly {
+    generatedFixtures(context, sanitizer)
+    mainExit(context, sanitizer)
+    machineControls(context, sanitizer)
+    rejections(context, sanitizer)
+}
+test.removeTree(work)

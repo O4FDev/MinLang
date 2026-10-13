@@ -1,0 +1,229 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+constant ENTRY = "thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer {\n    return seed + input.length\n}\n"
+constant MAIN = "function main() {\n    let bytes = Bytes(8)\n    let frozen = freezeBytes(bytes)\n    let channel = bytesChannel(4096, 8)\n    let workerHandle = startThread(worker, 7, frozen, channel)\n    print(joinThread(workerHandle))\n}\n"
+constant RECOVER_BODY = "\nlet own = freezeBytes(Bytes(seed))\nlet sent = sendFrozen(channel, own)\nreturn seed\n"
+constant RECOVER_MAIN = "\nlet started = startThreadResult(worker, 7, frozen, channel)\nif started.ok {\n    let workerHandle = started.thread\n    let joined = joinThreadResult(workerHandle)\n    if joined.ok { print(joined.value) }\n    print(joined.code)\n}\nlet received = receiveFrozen(channel)\nif received.ok {\n    let retained = received.value\n    print(retained.length)\n}\nlet attempt = tryReceiveFrozen(channel)\nprint(attempt.code)\nlet sent = trySendFrozen(channel, frozen)\ncloseFrozenChannel(channel)\n"
+constant GRAPH_BODY = "\nlet node = Node { text: \"λ🙂\", edges: [] }\nnode.edges.add(node)\nlet local = copyFrozenBytes(input)\nlet aliases: List<Bytes> = [local]\nlet frozen = freezeBytesTake(local)\nlet copied = copyFrozenBytes(frozen)\ncopied.add(3)\nlet sent = trySendBytes(channel, copied)\nlet received = tryReceiveBytes(channel, local)\nlet blocking = sendBytes(channel, copied)\nlet next = receiveBytes(channel, local)\ncloseBytesChannel(channel)\nreturn frozen[0] + input.getUInt8(0) + input.getInt64(0) + aliases[0].length\n"
+constant KERNEL_CALLS = "\nprint(threadProcessId())\nprint(threadSleepNanoseconds(1))\nprint(threadFsync(1))\nprint(threadKernelRun(1))\n"
+constant RESULT_HELPER = "function unsafe(): Result<Integer, Text> {\n    let saved = machine.address(Bytes(1))\n    return Ok<Integer, Text>(saved)\n}\n"
+record Context { work: Text; compiler: Text; root: Text; serial: Integer }
+function build(context: Context, source: Text, names: List<Text>, texts: List<Text>): test.Result {
+    writeTextFile(context.work + "/main.min", source)
+    for index in 0..names.length { writeTextFile(context.work + "/" + names[index], texts[index]) }
+    let ir = context.work + "/program.ll"
+    if files.pathSize(ir) >= 0 { files.remove(ir) }
+    context.serial += 1
+    return test.run([context.compiler, context.work + "/main.min", ir, "--bounded-owners", "32", "--library", context.root + "/library"], system.environment(), "", context.work + "/compile-" + Text(context.serial), 60)
+}
+function accepts(context: Context, source: Text, names: List<Text>, texts: List<Text>): Text {
+    let result = build(context, source, names, texts)
+    test.check(result.status == 0, result.errorOutput + result.output)
+    test.check(files.pathSize(context.work + "/program.ll") >= 0, "accepted source produced no IR")
+    return readTextFile(context.work + "/program.ll")
+}
+function rejects(context: Context, source: Text, names: List<Text>, texts: List<Text>, diagnostic: Text) {
+    let result = build(context, source, names, texts)
+    test.check(result.status != 0, "source was accepted:\n" + source)
+    test.check(files.pathSize(context.work + "/program.ll") < 0, "failed checking published runnable IR")
+    if diagnostic != "" { test.check(test.contains(result.errorOutput + result.output, diagnostic), "missing diagnostic " + diagnostic + "\n" + result.errorOutput + result.output) }
+}
+function accept(context: Context, source: Text): Text { return accepts(context, source, [], []) }
+function reject(context: Context, source: Text, diagnostic: Text) { rejects(context, source, [], [], diagnostic) }
+function before(text: Text, first: Text, second: Text): Boolean {
+    let left = support.find(text, first, 0)
+    let right = support.find(text, second, 0)
+    test.check(left >= 0 && right >= 0, "missing ordering markers " + first + " / " + second)
+    return left < right
+}
+function exactEntrySignature(context: Context) {
+    for signature in ["Text, FrozenBytes, BytesChannel", "Integer, Bytes, BytesChannel", "Integer, FrozenBytes, Integer", "Integer, FrozenBytes", "Integer, FrozenBytes, BytesChannel, Integer"] {
+        let types: List<Text> = []
+        let raw = Bytes(signature)
+        let start = 0
+        for index in 0..(raw.length + 1) {
+            if index == raw.length || raw[index] == 44 {
+                types.add(Text(raw.slice(start, index)))
+                start = index + 2
+            }
+        }
+        let params: List<Text> = []
+        for index in 0..types.length { params.add("p" + Text(index) + ": " + types[index]) }
+        reject(context, "thread function unused(" + support.joined(params, ", ") + "): Integer { return 0 }\n" + ENTRY + MAIN, "thread entry")
+    }
+    for result in ["Text", "Bytes", "FrozenBytes", "Thread", "Boolean"] {
+        reject(context, test.replace(ENTRY, ": Integer {", ": " + result + " {") + MAIN, "thread entry")
+    }
+}
+function namedEntryOnly(context: Context) {
+    for target in ["7", "(worker)", "worker + 1", "function() { return 0 }"] {
+        reject(context, ENTRY + test.replace(MAIN, "startThread(worker,", "startThread(" + target + ","), "startThread")
+    }
+    reject(context, test.replace(ENTRY, "thread function", "function") + MAIN, "thread entry")
+    reject(context, test.replace(ENTRY, "worker(", "main("), "thread entry")
+}
+function opaqueBoundary(context: Context) {
+    for typeName in ["FrozenBytes", "BytesChannel", "Thread", "ThreadStartResult", "ThreadJoinResult", "FrozenBytesChannel", "FrozenBytesResult"] {
+        for expression in [typeName + "(1)", typeName + " { raw: 1 }"] {
+            reject(context, ENTRY + test.replace(MAIN, "let bytes = Bytes(8)", "let forged = " + expression + "\nlet bytes = Bytes(8)"), "")
+        }
+        reject(context, "record " + typeName + " { raw: Integer }\n" + ENTRY + MAIN, "reserved")
+    }
+    for value in ["Bytes(8)", "\"local\"", "[1]", "7", "channel"] {
+        reject(context, ENTRY + test.replace(MAIN, "worker, 7, frozen, channel", "worker, 7, " + value + ", channel"), "")
+    }
+    reject(context, ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", "print(Integer(frozen))"), "")
+    reject(context, ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", "frozen[0] = 7"), "")
+}
+function nativeHandles(context: Context) {
+    reject(context, "function escape(value: FrozenBytes): Integer { native \"test\" }\n" + ENTRY + MAIN, "native")
+    let names = ["take", "start_result_value", "process_id", "try_receive"]
+    let libraries = ["frozen_bytes", "thread", "thread", "frozen_channel"]
+    for index in 0..names.length {
+        reject(context, "function " + names[index] + "(value: Bytes): Bytes { native \"" + libraries[index] + "\" }\n" + ENTRY + MAIN, "native symbol conflicts")
+    }
+}
+function effectGraph(context: Context) {
+    let unsafe = "public function unsafe(value: Bytes): Integer { native \"test\" }\n"
+    let helper = "function middle(n: Integer): Integer { return bottom(n) }\nfunction bottom(n: Integer): Integer { return evil.unsafe(Bytes(n)) }\n"
+    for body in ["let ignored = evil.unsafe(Bytes(1))\nreturn seed", "return middle(seed)"] {
+        rejects(context, "use \"./evil.min\" as evil\n" + helper + test.replace(ENTRY, "return seed + input.length", body) + MAIN, ["evil.min"], [unsafe], "unsafe thread effect")
+    }
+    reject(context, "use \"machine\" as machine\n" + ENTRY + test.replace(MAIN, "let frozen = freezeBytes(bytes)", "let saved = [machine.address(bytes)]\nlet frozen = freezeBytesTake(bytes)"), "unsafe thread effect")
+}
+function callbackBoundaries(context: Context) {
+    let callback = "let callback = function(value: Integer): Integer { return value }\nprint(callback(1))"
+    accept(context, ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", callback))
+    reject(context, test.replace(ENTRY, "return seed + input.length", callback + "\nreturn seed") + MAIN, "unsafe thread effect")
+    let hidden = "use \"machine\" as machine\nfunction unsafe(): Integer { return machine.address(Bytes(1)) }\n"
+    reject(context, hidden + ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", "let callback = function(): Integer { return unsafe() }\nprint(callback())"), "unsafe thread effect")
+    reject(context, "use \"machine\" as machine\n" + RESULT_HELPER + ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", "let value = unsafe()"), "unsafe thread effect")
+}
+function qualifiedEntry(context: Context) {
+    let ir = accepts(context, "use \"./entry.min\" as entry\n" + test.replace(MAIN, "startThread(worker,", "startThread(entry.worker,"), ["entry.min"], [test.replace(ENTRY, "thread function", "public thread function")])
+    test.check(test.contains(ir, "; minyar-thread-entry:"), "qualified entry marker is missing")
+    test.check(test.contains(ir, "@minyar_thread_spawn(ptr @.minyar.thread.bridge."), "qualified entry bridge is missing")
+}
+function nothingBridge(context: Context) {
+    let ir = accept(context, "constant label = \"λ🙂\"\n" + test.replace(test.replace(ENTRY, ": Integer {", " {"), "return seed + input.length", "print(label)") + MAIN)
+    for marker in ["@minyar_thread_text_literal(ptr getelementptr", "ret i64 0", "; minyar-thread-runtime: 1", "call void @minyar_thread_join_children()", "; minyar-thread-effect:"] {
+        test.check(test.contains(ir, marker), "missing " + marker)
+    }
+    let split = support.find(ir, "define internal i64 @.minyar.thread.bridge.", 0)
+    test.check(split >= 0, "Nothing bridge is missing")
+    let bridge = Text(Bytes(ir).slice(split + 43, Bytes(ir).length))
+    test.check(before(bridge, "@minyar_stack_enter", "@.minyar.fn."), "bridge enters the stack after the entry call")
+    test.check(before(bridge, "@minyar_stack_leave", "ret i64 0"), "bridge leaves the stack after returning")
+}
+function maintainedFixtures(context: Context) {
+    let listed = test.run(["sh", "-c", "for path in tests/thread-fixtures/*.min; do printf '%s\\n' \"$path\"; done | LC_ALL=C sort"], system.environment(), "", context.work + "/fixtures", 10)
+    test.require(listed, "list thread fixtures")
+    for path in test.lines(listed.output) {
+        let ir = accept(context, readTextFile(path))
+        test.check(test.contains(ir, "; minyar-thread-runtime: 1") && test.contains(ir, "@minyar_thread_spawn"), path + " lost its thread runtime")
+    }
+}
+function sharedReaders(context: Context) {
+    let ir = accept(context, "record Node { text: Text, edges: List<Node> }\n" + test.replace(ENTRY, "return seed + input.length", GRAPH_BODY) + MAIN)
+    for symbol in ["minyar_frozen_bytes_get_uint8", "minyar_frozen_bytes_get_int64", "minyar_bytes_channel_send", "minyar_bytes_channel_receive"] {
+        test.check(test.contains(ir, "call "), "no calls emitted")
+        test.check(test.contains(ir, "@" + symbol + "("), "missing " + symbol)
+    }
+    test.check(test.contains(ir, "; minyar-cycle-runtime: 1"), "local graph did not select the cycle runtime")
+}
+function parallelAbi(context: Context) {
+    let source = "function count(n: Integer): Integer { if n == 0 { return 0 }\nreturn count(n - 1) + 1 }\n"
+    accept(context, source + test.replace(ENTRY, "return seed + input.length", "return count(seed)") + MAIN)
+    accept(context, "parallel function scalar(n: Integer): Integer { return n + 1 }\n" + ENTRY + MAIN)
+    let scalar = "parallel function scalar(n: Integer): Integer { return n + 1 }\n"
+    let ir = accept(context, scalar + "print(parallelEntry(scalar))\n")
+    test.check(test.contains(ir, "ptrtoint ptr @.minyar.fn.scalar to i64"), "parallel entry address changed")
+    reject(context, scalar + ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", "let raw = [parallelEntry(scalar)]"), "unsafe thread effect")
+}
+function changedHelper(context: Context) {
+    let source = "use \"./helper.min\" as helper\n" + test.replace(ENTRY, "return seed + input.length", "return helper.value(seed)") + MAIN
+    accepts(context, source, ["helper.min"], ["public function value(n: Integer): Integer { return n }\n"])
+    let unsafe = "public function value(n: Integer): Integer { native \"test\" }\n"
+    rejects(context, source, ["helper.min"], [unsafe], "unsafe thread effect")
+    rejects(context, source, ["helper.min"], [unsafe], "unsafe thread effect")
+}
+function frozenChannels(context: Context) {
+    let source = test.replace(test.replace(ENTRY, "channel: BytesChannel", "channel: FrozenBytesChannel"), "return seed + input.length", RECOVER_BODY) + test.replace(test.replace(MAIN, "bytesChannel(4096, 8)", "frozenBytesChannel(4096, 8)"), "let workerHandle = startThread(worker, 7, frozen, channel)\n    print(joinThread(workerHandle))", RECOVER_MAIN)
+    let ir = accept(context, source)
+    for symbol in ["minyar_thread_spawn_result", "minyar_thread_join_result", "minyar_thread_start_result_value", "minyar_thread_join_result_value", "minyar_thread_result_code", "minyar_frozen_result_value", "minyar_frozen_result_code", "minyar_frozen_channel_send"] {
+        test.check(test.contains(ir, "@" + symbol + "("), "missing " + symbol)
+    }
+    reject(context, test.replace(source, "started.thread", "started.value"), "")
+    reject(context, test.replace(source, "print(attempt.code)", "attempt.code = 0"), "")
+    reject(context, test.replace(source, "worker, 7, frozen, channel", "worker, 7, frozen, bytesChannel(8, 8)"), "")
+    reject(context, ENTRY + test.replace(MAIN, "worker, 7, frozen, channel", "worker, 7, frozen, frozenBytesChannel(8, 8)"), "")
+}
+function kernelBuiltins(context: Context) {
+    let ir = accept(context, ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", KERNEL_CALLS))
+    for symbol in ["minyar_thread_process_id", "minyar_thread_sleep_ns", "minyar_thread_fsync", "minyar_thread_kernel_run"] {
+        test.check(test.contains(ir, "@" + symbol + "("), "missing " + symbol)
+    }
+    for expression in ["threadProcessId(1)", "threadSleepNanoseconds(frozen)", "threadFsync(bytes)", "threadKernelRun(channel)"] {
+        reject(context, ENTRY + test.replace(MAIN, "print(joinThread(workerHandle))", expression), "")
+    }
+}
+
+let names = ["test_exact_entry_signature_even_unused", "test_named_entry_only", "test_opaque_nominal_send_boundary",
+    "test_native_signature_cannot_export_handles", "test_complete_resolved_effect_graph", "test_main_callbacks_and_worker_effect_boundaries",
+    "test_public_qualified_entry", "test_literals_constants_and_nothing_bridge", "test_maintained_language_fixtures_compile",
+    "test_shared_readers_channels_and_local_graphs", "test_recursion_and_ordinary_parallel_abi", "test_recheck_changed_same_signature_helper",
+    "test_recoverable_owned_projections_and_frozen_channels", "test_pointer_free_kernel_builtins"]
+let compiler = test.setting("MINYAR_TEST_COMPILER", "build/minyarc-threads")
+let filtered: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    if argument(index) == "--compiler" {
+        test.check(index + 1 < argumentCount(), "--compiler needs a value")
+        compiler = argument(index + 1)
+        index += 2
+    } else {
+        filtered.add(argument(index))
+        index += 1
+    }
+}
+let selectors: List<Text> = []
+for value in filtered {
+    if value == "-v" || value == "--verbose" || value == "-q" || value == "--quiet" { continue }
+    let known = value == "ThreadCompiler"
+    for name in names { if value == name || value == "ThreadCompiler." + name { known = true } }
+    test.check(known, "unknown ThreadCompiler selector: " + value)
+    selectors.add(value)
+}
+let work = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
+let resolved = test.run(["realpath", "--", compiler], system.environment(), "", work + "/compiler", 10)
+test.require(resolved, "resolve thread compiler")
+compiler = test.lines(resolved.output)[0]
+let ran = 0
+for position in 0..names.length {
+    if !port.selected(selectors, "ThreadCompiler", names[position]) { continue }
+    let directory = work + "/case-" + Text(position)
+    test.check(files.makeDirectory(directory) == 0, "cannot create thread check directory")
+    let context = Context { work: directory; compiler: compiler; root: root; serial: 0 }
+    if position == 0 { exactEntrySignature(context) }
+    else if position == 1 { namedEntryOnly(context) }
+    else if position == 2 { opaqueBoundary(context) }
+    else if position == 3 { nativeHandles(context) }
+    else if position == 4 { effectGraph(context) }
+    else if position == 5 { callbackBoundaries(context) }
+    else if position == 6 { qualifiedEntry(context) }
+    else if position == 7 { nothingBridge(context) }
+    else if position == 8 { maintainedFixtures(context) }
+    else if position == 9 { sharedReaders(context) }
+    else if position == 10 { parallelAbi(context) }
+    else if position == 11 { changedHelper(context) }
+    else if position == 12 { frozenChannels(context) }
+    else { kernelBuiltins(context) }
+    ran += 1
+}
+test.removeTree(work)
+print("ThreadCompiler: " + Text(ran) + " checks passed")

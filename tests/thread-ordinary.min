@@ -1,0 +1,46 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+use "sha256" as sha
+
+let base = ""
+let index = 0
+while index < argumentCount() {
+    test.check(argument(index) == "--base-root" && index + 1 < argumentCount(), "usage: thread-ordinary --base-root ROOT")
+    base = argument(index + 1)
+    index += 2
+}
+test.check(base != "", "thread-ordinary requires --base-root")
+let build = "build/thread-ordinary"
+test.check(files.makeDirectory("build") == 0 && files.makeDirectory(build) == 0, "cannot create thread-ordinary build directory")
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", build + "/.root", 10).output)[0]
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let names = ["eager", "system", "arena", "fixed", "lazy"]
+let definitions = ["", "MINYAR_SYSTEM_HEAP=1", "MINYAR_COMPILER_ARENA=1", "MINYAR_BOUNDED_HEAP=1", "MINYAR_LAZY_HEAP=1"]
+for engine in ["rc", "cycle"] {
+    for profile in 0..names.length {
+        for suffix in ["o", "ll"] {
+            let artifacts: List<Text> = []
+            let labels = ["base", "candidate"]
+            let roots = [base, root]
+            for side in 0..2 {
+                let source = ""
+                if engine == "cycle" { source = cycle.engineSource(roots[side]) } else { source = readTextFile(roots[side] + "/runtime/minyar_runtime.c") }
+                let output = build + "/" + engine + "-" + names[profile] + "-" + labels[side] + "." + suffix
+                let command = [clang, "-std=c11", "-O2", "-g0", "-x", "c", "-", "-I" + roots[side] + "/runtime"]
+                if definitions[profile] != "" { command.add("-D" + definitions[profile]) }
+                if suffix == "o" { command.add("-c") } else { command.add("-S"); command.add("-emit-llvm") }
+                command.add("-o")
+                command.add(output)
+                test.require(support.withInput(command, source, system.environment(), "", output + ".build", 60), "compile " + output)
+                let data = readTextFile(output)
+                if suffix == "ll" { data = support.withoutAsmSourceLocations(data) }
+                artifacts.add(data)
+            }
+            test.check(artifacts[0] == artifacts[1], engine + " " + names[profile] + " " + suffix + " changed")
+            print(engine + " " + names[profile] + " " + suffix + " " + sha.hex(sha.digest(Bytes(artifacts[1]))) + " identical")
+        }
+    }
+}

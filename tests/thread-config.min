@@ -1,0 +1,104 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./compiler-port-support.min" as port
+use "./thread-port-support.min" as support
+use "system" as system
+
+function lowered(source: Text): Text {
+    let raw = Bytes(source)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] = raw[index] + 32 } }
+    return Text(raw)
+}
+function depthSupported(host: Text): Boolean {
+    return host == "Linux" || host == "Darwin"
+}
+record Context { work: Text; serial: Integer; clang: Text }
+function compile(context: Context, definitions: List<Text>, source: Text): test.Result {
+    context.serial += 1
+    let command = [context.clang, "-std=c11", "-I", test.setting("MINYAR_THREAD_CONFIG_ROOT", "runtime"), "-I", "runtime"]
+    for item in definitions { command.add("-D" + item) }
+    let input = source
+    if source == "" {
+        for item in ["-x", "c", "-E", "-P", "-"] { command.add(item) }
+        input = "#include \"minyar_thread_config.h\"\nMINYAR_THREAD_LOCAL long probe;\n"
+    } else {
+        for item in ["-x", "c", "-fsyntax-only", "-"] { command.add(item) }
+    }
+    return support.withInput(command, input, system.environment(), "", context.work + "/compile-" + Text(context.serial), 10)
+}
+function depthIsolation(context: Context) {
+    if !depthSupported(support.host()) { return }
+    for optimization in ["-O0", "-O2"] {
+        let program = context.work + "/depth" + optimization
+        let compiled = test.run([context.clang, optimization, "-DMINYAR_THREADED=1", "-DMINYAR_SYSTEM_HEAP=1", "tests/depth-thread-local.c", "-pthread", "-lm", "-o", program], system.environment(), "", program + ".build", 30)
+        test.check(compiled.status == 0, compiled.errorOutput)
+        let executed = test.run([program], system.environment(), "", program + ".run", 10)
+        test.check(executed.status == 0 && executed.output == "" && executed.errorOutput == "", optimization + " depth isolation failed\n" + executed.output + executed.errorOutput)
+    }
+}
+function platformSelection() {
+    for host in ["Linux", "Darwin", "Windows", "MSYS_NT-10.0", "MINGW64_NT-10.0", "CYGWIN_NT-10.0"] {
+        test.check(depthSupported(host) == (host == "Linux" || host == "Darwin"), "depth fixture platform selection changed for " + host)
+    }
+}
+function storageAndProfiles(context: Context) {
+    let profiles: List<List<Text>> = [[], ["MINYAR_SYSTEM_HEAP=1"], ["MINYAR_COMPILER_ARENA=1"], ["MINYAR_BOUNDED_HEAP=1"], ["MINYAR_LAZY_HEAP=1"], ["MINYAR_BOUNDED_RC=1"], ["MINYAR_BOUNDED_RC=1", "MINYAR_SYSTEM_HEAP=1"]]
+    let selectors: List<List<Text>> = [[], ["MINYAR_THREADED=0"], ["MINYAR_THREADED=1"]]
+    for selector in selectors {
+        let enabled = selector.length == 1 && selector[0] == "MINYAR_THREADED=1"
+        for profile in profiles {
+            let unsupported = false
+            for flag in profile {
+                if support.starts(flag, "MINYAR_COMPILER_ARENA=") || support.starts(flag, "MINYAR_BOUNDED_HEAP=") || support.starts(flag, "MINYAR_LAZY_HEAP=") { unsupported = true }
+            }
+            if profile.length == 1 && profile[0] == "MINYAR_BOUNDED_RC=1" { unsupported = true }
+            let bad = enabled && unsupported
+            let definitions: List<Text> = []
+            for item in selector { definitions.add(item) }
+            for item in profile { definitions.add(item) }
+            let result = compile(context, definitions, "")
+            if bad {
+                test.check(result.status != 0, result.output)
+                test.check(test.contains(lowered(result.errorOutput), "managed threads"), result.errorOutput)
+            } else {
+                test.check(result.status == 0, result.errorOutput)
+                test.check(test.contains(result.output, "_Thread_local") == enabled, result.output)
+            }
+        }
+    }
+}
+function invalidSelector(context: Context) {
+    for value in ["2", "-1"] {
+        let result = compile(context, ["MINYAR_THREADED=" + value], "")
+        test.check(result.status != 0, "invalid selector accepted: " + value)
+        test.check(test.contains(result.errorOutput, "MINYAR_THREADED must be 0 or 1"), result.errorOutput)
+    }
+    test.check(compile(context, ["MINYAR_THREADED=bogus"], "#include \"minyar_thread_config.h\"\n").status != 0, "bogus selector accepted")
+}
+function effectiveAllocators(context: Context) {
+    if !depthSupported(support.host()) { return }
+    let engines = [readTextFile("runtime/minyar_runtime.c"), cycle.engineSource(".")]
+    let flags: List<List<Text>> = [["MINYAR_THREADED=1"], ["MINYAR_THREADED=1", "MINYAR_SYSTEM_HEAP=1"], ["MINYAR_THREADED=1", "MINYAR_BOUNDED_RC=1"], ["MINYAR_THREADED=1", "MINYAR_BOUNDED_RC=1", "MINYAR_SYSTEM_HEAP=1"], ["MINYAR_THREADED=0", "MINYAR_COMPILER_ARENA=1"]]
+    let accepted = [true, true, false, true, true]
+    for engine in engines {
+        for index in 0..flags.length {
+            let result = compile(context, flags[index], engine)
+            test.check((result.status == 0) == accepted[index], result.errorOutput)
+            if !accepted[index] { test.check(test.contains(lowered(result.errorOutput), "managed threads"), result.errorOutput) }
+        }
+    }
+}
+
+let names = ["test_depth_thread_isolation", "test_depth_fixture_platform_selection", "test_storage_and_profiles", "test_invalid_selector", "test_runtime_effective_allocators"]
+let selectors = port.selectors("ThreadConfig", names)
+let context = Context { work: test.scratch(); serial: 0; clang: test.setting("MINYAR_TEST_CLANG", "clang") }
+for index in 0..names.length {
+    if !port.selected(selectors, "ThreadConfig", names[index]) { continue }
+    if index == 0 { depthIsolation(context) }
+    else if index == 1 { platformSelection() }
+    else if index == 2 { storageAndProfiles(context) }
+    else if index == 3 { invalidSelector(context) }
+    else { effectiveAllocators(context) }
+}
+test.removeTree(context.work)
+print("ThreadConfig: passed")

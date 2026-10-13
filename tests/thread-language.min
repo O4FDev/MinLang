@@ -1,0 +1,88 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Manifest { sanitizer: Text; path: Text; commands: List<Text>; inputs: List<Text>; environment: List<Text> }
+function save(manifest: Manifest) {
+    if manifest.path == "" { return }
+    writeTextFile(manifest.path + "/manifest.json", "{\n  \"sanitizer\": " + json.quote(manifest.sanitizer) + ",\n  \"commands\": [" + support.joined(manifest.commands, ", ") + "],\n  \"inputs\": {" + support.joined(manifest.inputs, ", ") + "},\n  \"environment\": {" + support.joined(manifest.environment, ", ") + "}\n}\n")
+}
+function remember(manifest: Manifest, label: Text, command: List<Text>, result: test.Result) {
+    manifest.commands.add("{\"label\": " + json.quote(label) + ", \"argv\": " + support.quotedList(command) + ", \"returncode\": " + Text(result.status) + ", \"stdout\": " + json.quote(result.output) + ", \"stderr\": " + json.quote(result.errorOutput) + "}")
+    save(manifest)
+}
+function value(environment: List<Text>, name: Text): Text {
+    for item in environment { if support.starts(item, name + "=") { return Text(Bytes(item).slice(Bytes(name).length + 1, Bytes(item).length)) } }
+    return ""
+}
+
+let sanitizer = "native"
+let artifacts = ""
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "option needs a value: " + argument(index))
+    if argument(index) == "--sanitizer" { sanitizer = argument(index + 1) }
+    else if argument(index) == "--artifacts" { artifacts = argument(index + 1) }
+    else { fail("unknown option: " + argument(index)) }
+    index += 2
+}
+test.check(sanitizer == "native" || sanitizer == "address" || sanitizer == "thread", "invalid sanitizer: " + sanitizer)
+test.check(files.pathSize("runtime/minyar_thread_domain.h") >= 0, "thread language qualification requires the real runtime sibling; no shim/stub is permitted")
+let logs = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", logs + "/root", 10).output)[0]
+let environment = support.environment(system.environment(), ["LIMITED", "SANITIZER_LIMITED", "COMPILER_LTO_FLAGS"], ["", "", ""])
+if sanitizer != "native" {
+    let selected = "thread"
+    if sanitizer == "address" { selected = "address,undefined" }
+    let options = "-O1 -g -fsanitize=" + selected + " -fno-omit-frame-pointer -Wno-override-module"
+    environment = support.environment(environment, ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS", "ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS"],
+        [options, options, options, support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1", "halt_on_error=1:exitcode=66"])
+}
+let manifest = Manifest { sanitizer: sanitizer; path: ""; commands: []; inputs: []; environment: [] }
+for name in ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS", "ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS"] {
+    let found = value(environment, name)
+    if found == "" { manifest.environment.add(json.quote(name) + ": null") } else { manifest.environment.add(json.quote(name) + ": " + json.quote(found)) }
+}
+let directory = ""
+if artifacts != "" {
+    test.check(files.pathSize(artifacts) < 0, "artifact directory already exists: " + artifacts)
+    test.require(test.run(["mkdir", "-p", "--", artifacts], system.environment(), "", logs + "/mkdir", 10), "create artifacts")
+    directory = test.lines(test.run(["sh", "-c", "cd \"$1\" && pwd -P", "minyar", artifacts], system.environment(), "", logs + "/resolve", 10).output)[0]
+    manifest.path = directory
+    let inputs = support.treeFiles(["compiler", "runtime", "library", "tools", "scripts", "build-support"])
+    let fixtures = support.treeFiles(["tests/thread-fixtures"])
+    inputs.add("tests/thread-language.min")
+    for fixture in fixtures { if support.find(fixture, ".min", 0) == Bytes(fixture).length - 4 && support.find(Text(Bytes(fixture).slice(22, Bytes(fixture).length)), "/", 0) < 0 { inputs.add(fixture) } }
+    for item in ["build/minyarc", "build/minyarc-threads", "Makefile", "minyar"] { inputs.add(item) }
+    manifest.inputs = support.digestMembers(inputs)
+} else {
+    directory = test.scratch()
+}
+let fixtures = ["creator-exit", "transfer-local", "nothing-nested", "recovery-unwind", "result-guard"]
+let expectations = ["creator-exit shared frozen passed\n", "managed local transfer passed\n", "Nothing and nested joins passed\n", "recovery and child cleanup passed\n", ""]
+for profile in ["system", "eager"] {
+    for position in 0..fixtures.length {
+        let fixture = fixtures[position]
+        let label = fixture + "-" + profile
+        let output = directory + "/" + label
+        let command = [root + "/minyar", "--memory-profile", profile, root + "/tests/thread-fixtures/" + fixture + ".min", "-o", output]
+        let linkEnvironment = environment
+        if artifacts != "" { linkEnvironment = support.environment(environment, ["MINYAR_LINK_ARTIFACTS"], [directory + "/" + label + "-link"]) }
+        let compiled = test.run(command, linkEnvironment, "", directory + "/" + label + ".build", 300)
+        remember(manifest, label + "-build", command, compiled)
+        test.check(compiled.status == 0, compiled.output + compiled.errorOutput)
+        let ran = test.run([output], environment, "", directory + "/" + label + ".out", 30)
+        remember(manifest, label + "-run", [output], ran)
+        if expectations[position] == "" {
+            let sanitized = test.contains(ran.errorOutput, "AddressSanitizer:") || test.contains(ran.errorOutput, "LeakSanitizer:") || test.contains(ran.errorOutput, "runtime error:") || test.contains(ran.errorOutput, "ThreadSanitizer:")
+            test.check(ran.status != 0 && ran.output == "" && test.contains(ran.errorOutput, "an unsuccessful FrozenBytes Result has no value.") && !sanitized, fixture + "/" + profile + ": " + Text(ran.status) + " " + ran.output + " " + ran.errorOutput)
+        } else {
+            test.check(ran.status == 0 && ran.output == expectations[position] && ran.errorOutput == "", fixture + "/" + profile + ": " + Text(ran.status) + " " + ran.output + " " + ran.errorOutput)
+        }
+        print(fixture + "/" + profile + ": passed with real runtime")
+    }
+}
+if artifacts == "" { test.removeTree(directory) }
+test.removeTree(logs)

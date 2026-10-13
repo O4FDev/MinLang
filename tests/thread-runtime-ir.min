@@ -1,0 +1,87 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+function compile(command: List<Text>, log: Text) {
+    test.require(test.run(command, system.environment(), "", log, 60), "compile " + log)
+}
+function replaced(command: List<Text>, index: Integer, value: Text): List<Text> {
+    let result: List<Text> = []
+    for position in 0..command.length {
+        if position == index { result.add(value) } else { result.add(command[position]) }
+    }
+    return result
+}
+function inserted(command: List<Text>, value: Text): List<Text> {
+    let result = [command[0], value]
+    for position in 1..command.length { result.add(command[position]) }
+    return result
+}
+function atomicRelease(body: Text): Boolean {
+    for line in test.lines(body) {
+        let begin = support.find(line, "atomicrmw sub", 0)
+        while begin >= 0 {
+            let after = begin + 13
+            let raw = Bytes(line)
+            let bounded = after >= raw.length || !((raw[after] >= 48 && raw[after] <= 57) || (raw[after] >= 65 && raw[after] <= 90) || (raw[after] >= 97 && raw[after] <= 122) || raw[after] == 95)
+            if bounded && support.find(line, "acq_rel", after) >= 0 { return true }
+            begin = support.find(line, "atomicrmw sub", begin + 1)
+        }
+    }
+    return false
+}
+
+let tsan = false
+for index in 0..argumentCount() {
+    test.check(argument(index) == "--tsan", "unknown option: " + argument(index))
+    tsan = true
+}
+test.check(files.makeDirectory("build") == 0, "cannot create build directory")
+let engine = cycle.publishEngine(".", "build/thread-cycle-engine.c")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let labels = ["rc", "cycle"]
+let sources = ["runtime/minyar_runtime.c", engine]
+for side in 0..2 {
+    let label = labels[side]
+    let output = "build/thread-" + label + "-ownership.ll"
+    let command = [clang, "-std=c11", "-O1", "-S", "-emit-llvm", "-DMINYAR_THREADED=1", "-DMINYAR_SYSTEM_HEAP=1", "-Iruntime", sources[side], "-o", output]
+    compile(command, output + ".build")
+    let ir = readTextFile(output)
+    let retain = support.functionBody(ir, "minyar_rc_retain")
+    test.check(support.hasWord(retain, "load") && support.hasWord(retain, "store"), "Local RC lost its direct load/store path")
+    test.check(!test.contains(retain, "atomicrmw") && !test.contains(retain, "cmpxchg") && !support.hasWord(retain, "load atomic") && !support.hasWord(retain, "store atomic"), "Local RC became atomic")
+    test.check(atomicRelease(support.functionBody(ir, "rc_thread_control_release")), "Native release lost atomic acquire/release lifetime")
+    let required = ["rc_frames", "rc_free_frames", "rc_pending_count", "rc_bounded_head", "rc_bounded_frame_head", "rc_bounded_chunk_head"]
+    if label == "cycle" { for name in ["rc_cycle_head", "rc_cycle_pending", "rc_cycle_shading", "rc_cycle_enabled"] { required.add(name) } }
+    for name in required {
+        let found = false
+        for line in test.lines(ir) { if support.starts(line, "@" + name + " = ") && test.contains(line, "thread_local") { found = true } }
+        test.check(found, "Missing TLS state: " + name)
+    }
+    if tsan {
+        let instrumented = "build/thread-" + label + "-tsan.ll"
+        let flags = inserted(replaced(command, command.length - 1, instrumented), "-fsanitize=thread")
+        compile(flags, instrumented + ".build")
+        let text = readTextFile(instrumented)
+        let local = support.functionBody(text, "minyar_rc_retain")
+        let shared = support.functionBody(text, "rc_thread_control_release")
+        let payload = support.functionBody(text, "minyar_frozen_bytes_get_uint8")
+        test.check(test.contains(local, "__tsan_read") && test.contains(local, "__tsan_write"), "Local RC accesses lack TSan instrumentation")
+        test.check(test.contains(shared, "__tsan_atomic64_fetch_sub") && test.contains(payload, "__tsan_read1"), "Shared lifetime/payload lacks TSan instrumentation")
+    }
+    let ordinary: List<Text> = []
+    for selector in ["", "0"] {
+        let plain = "build/" + label + "-ordinary-" + selector + ".ll"
+        if selector == "" { plain = "build/" + label + "-ordinary-None.ll" }
+        let flags: List<Text> = []
+        for item in command { if item != "-DMINYAR_THREADED=1" { flags.add(item) } }
+        flags = replaced(flags, flags.length - 1, plain)
+        if selector != "" { flags = inserted(flags, "-DMINYAR_THREADED=" + selector) }
+        compile(flags, plain + ".build")
+        ordinary.add(support.withoutAsmSourceLocations(readTextFile(plain)))
+    }
+    test.check(ordinary[0] == ordinary[1], "Zero selector changed ordinary artifact")
+    print(label + ": plain local RC, atomic native lifetime, domain TLS, ordinary absent/0 identity passed")
+}

@@ -1,0 +1,81 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Control { directory: Text; artifacts: Boolean; commands: List<Text>; inputs: List<Text> }
+function run(control: Control, label: Text, command: List<Text>, environment: List<Text>, recorded: Boolean): test.Result {
+    let result = test.run(command, environment, "", control.directory + "/." + label + ".log", 120)
+    files.remove(control.directory + "/." + label + ".log")
+    files.remove(control.directory + "/." + label + ".log.err")
+    let names: List<Text> = []
+    if recorded {
+        for name in ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS", "TSAN_OPTIONS"] {
+            let found = "null"
+            for item in environment { if support.starts(item, name + "=") { found = json.quote(Text(Bytes(item).slice(Bytes(name).length + 1, Bytes(item).length))) } }
+            names.add(json.quote(name) + ": " + found)
+        }
+    }
+    control.commands.add("{\"label\": " + json.quote(label) + ", \"argv\": " + support.quotedList(command) + ", \"returncode\": " + Text(result.status) + ", \"stdout\": " + json.quote(result.output) + ", \"stderr\": " + json.quote(result.errorOutput) + ", \"environment\": {" + support.joined(names, ", ") + "}}")
+    if control.artifacts {
+        let produced: List<Text> = []
+        for path in support.treeFiles([control.directory]) {
+            let relative = Text(Bytes(path).slice(Bytes(control.directory).length + 1, Bytes(path).length))
+            let raw = Bytes(path)
+            let slash = raw.length - 1
+            while slash >= 0 && raw[slash] != 47 { slash -= 1 }
+            if Text(raw.slice(slash + 1, raw.length)) != "manifest.json" { produced.add(json.quote(relative) + ": " + json.quote(support.digest(path))) }
+        }
+        writeTextFile(control.directory + "/manifest.json", "{\n  \"commands\": [" + support.joined(control.commands, ", ") + "],\n  \"files\": {" + support.joined(produced, ", ") + "},\n  \"inputs\": {" + support.joined(control.inputs, ", ") + "}\n}\n")
+    }
+    return result
+}
+
+let artifacts = ""
+let index = 0
+while index < argumentCount() {
+    test.check(argument(index) == "--artifacts" && index + 1 < argumentCount(), "usage: thread-tsan-control [--artifacts DIR]")
+    artifacts = argument(index + 1)
+    index += 2
+}
+let scratch = test.scratch()
+let directory = scratch + "/control"
+if artifacts != "" {
+    test.check(files.pathSize(artifacts) < 0, "artifact directory already exists: " + artifacts)
+    directory = artifacts
+}
+test.require(test.run(["mkdir", "-p", "--", directory], system.environment(), "", scratch + "/mkdir", 10), "create control directory")
+directory = test.lines(test.run(["sh", "-c", "cd \"$1\" && pwd -P", "minyar", directory], system.environment(), "", scratch + "/resolve", 10).output)[0]
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", scratch + "/root", 10).output)[0]
+let inputs = support.treeFiles(["compiler", "runtime", "library", "tools", "scripts", "build-support"])
+for item in ["tests/thread-tsan-control.min", "build/minyarc-threads", "Makefile"] { inputs.add(item) }
+let control = Control { directory: directory; artifacts: artifacts != ""; commands: []; inputs: support.digestMembers(inputs) }
+writeTextFile(directory + "/race-control.min", "thread function writer(seed: Integer, input: FrozenBytes, queue: BytesChannel): Integer {\n    let status = threadSleepNanoseconds(100000000)\n    return seed\n}\nfunction main() {\n    let frozen = freezeBytes(Bytes(0))\n    let queue = bytesChannel(0, 1)\n    let first = startThread(writer, 1, frozen, queue)\n    let second = startThread(writer, 2, frozen, queue)\n    print(joinThread(first) + joinThread(second))\n}\n")
+let raw = directory + "/compiler.raw.ll"
+let compiled = run(control, "compiler", [root + "/build/minyarc-threads", directory + "/race-control.min", raw, "--bounded-owners", "32"], system.environment(), false)
+test.check(compiled.status == 0, compiled.errorOutput)
+let text = readTextFile(raw)
+let header = support.find(text, "define i64 @.minyar.fn.writer(", 0)
+test.check(header >= 0 && (header == 0 || Bytes(text)[header - 1] == 10), "generated writer entry changed")
+let entry = support.find(text, "{\nentry:\n", header)
+let lineEnd = support.find(text, "\n", header)
+test.check(entry >= 0 && entry + 1 == lineEnd, "generated writer entry changed")
+let position = entry + 9
+let unsafe = directory + "/unsafe.raw.ll"
+writeTextFile(unsafe, Text(Bytes(text).slice(0, position)) + "  store volatile i64 %argument.0, ptr @.thread.tsan.unsafe, align 8\n" + Text(Bytes(text).slice(position, Bytes(text).length)) + "\n@.thread.tsan.unsafe = internal global i64 0, align 8\n")
+let options = "-O1 -g -fsanitize=thread -fno-omit-frame-pointer -Wno-override-module"
+let environment = support.environment(system.environment(), ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_LINK_ARTIFACTS", "TSAN_OPTIONS"], [options, options, options, directory + "/link", "halt_on_error=1:exitcode=66"])
+let binary = directory + "/race-control"
+let link = support.driver()
+for item in ["link", root, unsafe, root + "/build/minyar-default-runtime.o", binary, "0"] { link.add(item) }
+let linked = run(control, "link", link, environment, true)
+test.check(linked.status == 0, linked.errorOutput)
+for line in test.lines(readTextFile(directory + "/link/program.tsan.ll")) {
+    if support.starts(line, "define ") { test.check(test.contains(line, "sanitize_thread"), "generated definition escaped TSan: " + line) }
+}
+let observed = run(control, "race", [binary], environment, true)
+test.check(observed.status != 0 && test.contains(observed.errorOutput, "ThreadSanitizer: data race"), observed.errorOutput)
+test.check(test.contains(observed.errorOutput, "unsafe.raw.ll") || test.contains(observed.errorOutput, "writer"), observed.errorOutput)
+test.removeTree(scratch)
+print("TSan detected the generated LLVM shared-global race")

@@ -1,0 +1,70 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+let mode = "all"
+let sanitize = "none"
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--domain-only" { mode = "domain" }
+    else if option == "--buffers-only" { mode = "buffers" }
+    else if option == "--cache-debt-only" { mode = "cache-debt" }
+    else if option == "--sanitize" {
+        test.check(index + 1 < argumentCount(), "--sanitize needs a value")
+        sanitize = argument(index + 1)
+        test.check(sanitize == "none" || sanitize == "address,undefined" || sanitize == "thread", "invalid sanitizer: " + sanitize)
+        index += 1
+    } else { fail("unknown option: " + option) }
+    index += 1
+}
+test.check(files.makeDirectory("build") == 0, "cannot create build directory")
+cycle.publishEngine(".", "build/thread-cycle-engine.c")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let sources = ["thread-domain.c", "thread-cache-debt.c", "thread-buffers.c", "thread-runtime.c", "thread-os.c"]
+if mode == "cache-debt" { sources = ["thread-cache-debt.c"] }
+else if mode == "buffers" { sources = ["thread-buffers.c"] }
+else if mode == "domain" { sources = ["thread-domain.c"] }
+let environment = support.environment(system.environment(), ["UBSAN_OPTIONS", "TSAN_OPTIONS", "ASAN_OPTIONS"], ["halt_on_error=1", "halt_on_error=1", support.asanLeakOptions()])
+let cases = ["allocation", "allocation-packet", "allocation-detach", "capacity", "bounds", "bounds64", "start-result", "join-result", "frozen-result"]
+let diagnostics = ["memory", "memory", "memory", "capacity", "position", "position", "Result", "Result", "Result"]
+for source in sources {
+    for cycles in [false, true] {
+        for bounded in [false, true] {
+            let stem = Text(Bytes(source).slice(0, Bytes(source).length - 2))
+            let label = stem + "-rc-eager"
+            if cycles && bounded { label = stem + "-cycle-bounded" }
+            else if cycles { label = stem + "-cycle-eager" }
+            else if bounded { label = stem + "-rc-bounded" }
+            let output = "build/" + label
+            let command = [clang, "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-DMINYAR_THREADED=1", "-Iruntime"]
+            if cycles { command.add("-DMINYAR_TEST_CYCLES=1") }
+            if bounded {
+                command.add("-DMINYAR_SYSTEM_HEAP=1")
+                if system.getenv("MINYAR_TEST_RC_BUDGET") != "" { command.add("-DMINYAR_RC_POLL_BUDGET=" + system.getenv("MINYAR_TEST_RC_BUDGET")) }
+            }
+            if system.getenv("MINYAR_TEST_TEXT_CACHE") != "" { command.add("-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=" + system.getenv("MINYAR_TEST_TEXT_CACHE")) }
+            if sanitize != "none" { command.add("-fsanitize=" + sanitize); command.add("-fno-omit-frame-pointer") }
+            for item in ["tests/" + source, "-o", output, "-pthread", "-lm"] { command.add(item) }
+            let shown: List<Text> = []
+            for item in command {
+                if shown.length > 0 { shown.add(" ") }
+                shown.add(item)
+            }
+            print("compile: " + joinText(shown))
+            test.require(test.run(command, system.environment(), "", output + ".build", 120), "compile " + label)
+            let ran = test.run([output], environment, "", output + ".run", 90)
+            test.check(ran.status == 0, label + " failed (" + Text(ran.status) + ")\n" + ran.output + ran.errorOutput)
+            if ran.output != "" { files.writeStandardOutput(ran.output) }
+            if source == "thread-runtime.c" {
+                for position in 0..cases.length {
+                    let stopped = test.run([output, cases[position]], environment, "", output + "." + cases[position], 10)
+                    test.check(stopped.status != 0 && stopped.status != 99 && test.contains(stopped.errorOutput, diagnostics[position]), label + " " + cases[position] + " " + Text(stopped.status) + "\n" + stopped.errorOutput)
+                }
+            }
+            print(label + " " + sanitize + " passed")
+        }
+    }
+}

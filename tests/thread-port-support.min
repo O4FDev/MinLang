@@ -1,0 +1,146 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "json" as json
+use "sha256" as sha
+
+public function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+public function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let index = begin
+    if index < 0 { return -1 }
+    while index + pattern.length <= raw.length {
+        let same = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { same = false; break } }
+        if same { return index }
+        index += 1
+    }
+    return -1
+}
+public function without(base: List<Text>, names: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in base {
+        let keep = true
+        for name in names { if starts(item, name + "=") { keep = false } }
+        if keep { result.add(item) }
+    }
+    return result
+}
+public function environment(base: List<Text>, names: List<Text>, values: List<Text>): List<Text> {
+    let result = without(base, names)
+    for index in 0..names.length { result.add(names[index] + "=" + values[index]) }
+    return result
+}
+public function host(): Text {
+    let work = test.scratch()
+    let result = test.run(["uname", "-s"], system.environment(), "", work + "/uname", 10)
+    test.require(result, "host system")
+    test.removeScratch(work)
+    return test.lines(result.output)[0]
+}
+public function asanLeakOptions(): Text {
+    if host() == "Linux" { return "detect_leaks=1" }
+    return "detect_leaks=0"
+}
+public function withInput(command: List<Text>, input: Text, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): test.Result {
+    writeTextFile(log + ".input", input)
+    let wrapped = ["sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar", log + ".input"]
+    for item in command { wrapped.add(item) }
+    return test.run(wrapped, environment, cwd, log, seconds)
+}
+function word(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+public function hasWord(source: Text, needle: Text): Boolean {
+    let raw = Bytes(source)
+    let length = Bytes(needle).length
+    let index = find(source, needle, 0)
+    while index >= 0 {
+        let before = index == 0 || !word(raw[index - 1])
+        let after = index + length >= raw.length || !word(raw[index + length])
+        if before && after { return true }
+        index = find(source, needle, index + 1)
+    }
+    return false
+}
+public function withoutAsmSourceLocations(source: Text): Text {
+    let identifiers: List<Text> = []
+    let index = find(source, "!srcloc !", 0)
+    let raw = Bytes(source)
+    while index >= 0 {
+        let start = index + 9
+        let end = start
+        while end < raw.length && raw[end] >= 48 && raw[end] <= 57 { end += 1 }
+        if end > start { identifiers.add(Text(raw.slice(start, end))) }
+        index = find(source, "!srcloc !", index + 1)
+    }
+    if identifiers.length == 0 { return source }
+    let parts: List<Text> = []
+    let lines = test.lines(source)
+    for position in 0..lines.length {
+        let line = lines[position]
+        let replaced = line
+        for identifier in identifiers {
+            let prefix = "!" + identifier + " = !{"
+            if starts(line, prefix) && !test.contains(line, "\n") && Bytes(line)[Bytes(line).length - 1] == 125 {
+                replaced = "!" + identifier + " = !{srcloc}"
+            }
+        }
+        parts.add(replaced)
+        if position + 1 < lines.length || Bytes(source)[Bytes(source).length - 1] == 10 { parts.add("\n") }
+    }
+    return joinText(parts)
+}
+public function functionBody(ir: Text, name: Text): Text {
+    let lines = test.lines(ir)
+    for index in 0..lines.length {
+        let line = lines[index]
+        if starts(line, "define") && (Bytes(line).length == 6 || !word(Bytes(line)[6])) && test.contains(line, "@" + name + "(") {
+            let parts: List<Text> = []
+            let brace = find(line, "{", find(line, "@" + name + "(", 0))
+            if brace >= 0 { parts.add(Text(Bytes(line).slice(brace + 1, Bytes(line).length)) + "\n") }
+            for next in (index + 1)..lines.length {
+                if starts(lines[next], "}") { return joinText(parts) }
+                parts.add(lines[next] + "\n")
+            }
+        }
+    }
+    fail("Missing runtime function: " + name)
+}
+public function driver(): List<Text> {
+    return ["python3", "tools/clang-driver.py"]
+}
+public function digest(path: Text): Text {
+    return sha.hex(sha.digest(readBytesFile(path)))
+}
+public function treeFiles(directories: List<Text>): List<Text> {
+    let work = test.scratch()
+    let command = ["sh", "-c", "for directory in \"$@\"; do find \"$directory\" -type f ! -path '*/__pycache__/*'; done | LC_ALL=C sort", "minyar"]
+    for directory in directories { command.add(directory) }
+    let listed = test.run(command, system.environment(), "", work + "/find", 60)
+    test.require(listed, "list manifest inputs")
+    test.removeScratch(work)
+    return test.lines(listed.output)
+}
+public function digestMembers(paths: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for path in paths { result.add(json.quote(path) + ": " + json.quote(digest(path))) }
+    return result
+}
+public function joined(values: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(separator) }
+        parts.add(values[index])
+    }
+    return joinText(parts)
+}
+public function quotedList(values: List<Text>): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add(json.quote(value)) }
+    return "[" + joined(quoted, ", ") + "]"
+}
