@@ -18,7 +18,7 @@ class CompilerContracts(unittest.TestCase):
 function main() {
     let mode = argument(0)
     if mode == "nested-reference" {
-        let cases: List<Text> = ["(\\n value\\n)", "[\\n value\\n]", "{\\n value\\n}", "other\\nvalue"]
+        let cases: List<Text> = ["(\\n value\\n)", "[\\n value\\n]", "{\\n value\\n}", "other\\nvalue", "(\\n other\\n)\\nvalue", "[\\n other\\n]\\nvalue", "[other] + value", "{other} + value", "{other\\nvalue}"]
         let index = 0
         while index < cases.length {
             let kinds: List<Integer> = []
@@ -69,7 +69,7 @@ function main() {
         self.assertEqual((result.returncode, result.stdout, result.stderr), (status, output, error))
 
     def test_nested_reference_scan_crosses_only_nested_line_breaks(self):
-        self.check_mode('nested-reference', 0, 'true\ntrue\ntrue\nfalse\n')
+        self.check_mode('nested-reference', 0, 'true\ntrue\ntrue\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\n')
 
     def test_module_integer_codec_accepts_maximum_and_rejects_overflow(self):
         self.check_mode('module-type', 0, '9223372036854775807\n1\n')
