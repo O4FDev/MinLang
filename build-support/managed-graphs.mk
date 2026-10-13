@@ -2,7 +2,7 @@
 # The historical compiler control is hash-checked, never a mutable baseline.
 .PHONY: check-feature-dispatch check-managed-graphs check-managed-graphs-sanitize check-managed-graphs-profiles check-managed-graphs-launcher check-callbacks check-callbacks-sanitize check-callback-domains check-isolated-workers check-isolated-workers-sanitize
 
-check-feature-dispatch: build/minyarc
+check-feature-dispatch: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/feature-dispatch.py
 
 check-managed-graphs: build/minyarc build/minyarc-callbacks
