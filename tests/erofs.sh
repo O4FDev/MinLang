@@ -13,6 +13,9 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs-api.min -o "$work/api"
 test ! -e "$work/api.erofs"
 "$work/writer" "$work/source" "$work/plain.erofs"
 /usr/bin/fsck.erofs --extract "$work/plain.erofs"
+"$work/writer" "$work/source" "$work/lz4.erofs" 17592186040320 lz4
+/usr/bin/fsck.erofs --extract "$work/lz4.erofs"
+test "$(stat -c %s "$work/lz4.erofs")" -lt "$(stat -c %s "$work/plain.erofs")"
 cp "$work/plain.erofs" "$work/unchanged.erofs"
 if "$work/writer" "$work/source" "$work/unchanged.erofs" 8192; then exit 1; fi
 cmp "$work/plain.erofs" "$work/unchanged.erofs"
@@ -26,9 +29,11 @@ if test "${MINYAR_EROF_KERNEL:-}" != ''; then
     stat -c '%u %g' "$work/source" > "$work/boot/owner"
     "$work/writer" "$work/boot" "$work/boot.erofs"
     /usr/bin/fsck.erofs --extract "$work/boot.erofs"
-    timeout 60 qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 512 -nodefaults -no-reboot -nographic -serial stdio -kernel "$work/bzImage" -append 'console=ttyS0 panic=-1 root=/dev/vda rootfstype=erofs ro init=/init' -drive "file=$work/boot.erofs,format=raw,if=virtio,readonly=on" -drive "file=$work/plain.erofs,format=raw,if=virtio,readonly=on" > "$work/guest.log" 2>&1
-    tr -d '\r' < "$work/guest.log" > "$work/guest.txt"
-    cat "$work/guest.txt"
-    grep -Fx EROFS_KVM_PASS "$work/guest.txt"
+    for image in plain lz4; do
+        timeout 60 qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 512 -nodefaults -no-reboot -nographic -serial stdio -kernel "$work/bzImage" -append 'console=ttyS0 panic=-1 root=/dev/vda rootfstype=erofs ro init=/init' -drive "file=$work/boot.erofs,format=raw,if=virtio,readonly=on" -drive "file=$work/$image.erofs,format=raw,if=virtio,readonly=on" > "$work/guest.log" 2>&1
+        tr -d '\r' < "$work/guest.log" > "$work/guest.txt"
+        cat "$work/guest.txt"
+        grep -Fx EROFS_KVM_PASS "$work/guest.txt"
+    done
 fi
 printf '%s\n' EROFS_CHECK_PASS

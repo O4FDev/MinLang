@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/openat2.h>
+#include <lz4.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -22,6 +23,8 @@ struct EInode {
     size_t attrs_size;
     uint64_t nid, size;
     uint32_t block, links;
+    uint64_t map_size;
+    uint32_t stored_blocks;
     EInode *hash_next;
 };
 struct ENode {
@@ -38,6 +41,7 @@ typedef struct {
     ENode *root;
     int source_fd, output_fd;
     uint64_t maximum, position;
+    int compression;
 } EWriter;
 
 static uint64_t e_align(uint64_t n, uint64_t a) { return (n + a - 1) & ~(a - 1); }
@@ -257,6 +261,62 @@ static int e_copy(EWriter *w, EInode *i) {
     }
     free(buffer); close(fd); return error;
 }
+static int e_compress(EWriter *w, EInode *i) {
+    struct open_how how = {.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
+    int fd = (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
+    if (fd < 0) return errno;
+    struct stat st;
+    int error = fstat(fd, &st) ? errno : 0;
+    if (!error && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
+    unsigned char *map = calloc(1, (size_t)i->map_size);
+    unsigned char *input = malloc(65536), *encoded = malloc(65536), *output = malloc(65536);
+    if (!map || !input || !encoded || !output) error = ENOMEM;
+    if (!error) e16(map + 4, 2);
+    uint64_t at = 0, first_block = w->position / 4096;
+    while (!error && at < i->size) {
+        size_t size = i->size - at > 65536 ? 65536 : (size_t)(i->size - at);
+        memset(input, 0, 65536);
+        size_t read_size = 0;
+        while (read_size < size) {
+            ssize_t n = pread(fd, input + read_size, size - read_size, (off_t)(at + read_size));
+            if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
+            if (!n) { error = ESTALE; break; }
+            read_size += (size_t)n;
+        }
+        if (error) break;
+        unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
+        int packed = LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536);
+        unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
+        int compressed = blocks < clusters;
+        if (!compressed) blocks = clusters;
+        uint64_t physical_size = (uint64_t)blocks * 4096;
+        if (physical_size > w->maximum || w->position > w->maximum - physical_size || w->position / 4096 + blocks >= UINT32_MAX) { error = EFBIG; break; }
+        uint32_t address = (uint32_t)(w->position / 4096);
+        for (unsigned n = 0; n < clusters; ++n) {
+            unsigned char *index = map + 16 + (at / 4096 + n) * 8;
+            if (compressed && n) {
+                e16(index, 2); e16(index + 4, n == 1 ? (uint16_t)(2048 | blocks) : (uint16_t)n); e16(index + 6, (uint16_t)(clusters - n));
+            } else {
+                e16(index, compressed ? 1 : 0); e32(index + 4, address + (compressed ? 0 : n));
+            }
+        }
+        if (compressed) {
+            memset(output, 0, (size_t)physical_size);
+            memcpy(output + physical_size - (size_t)packed, encoded, (size_t)packed);
+            error = e_write(w->output_fd, output, (size_t)physical_size, w->position);
+        } else error = e_write(w->output_fd, input, (size_t)physical_size, w->position);
+        w->position += physical_size; at += size;
+    }
+    if (!error) {
+        i->stored_blocks = (uint32_t)(w->position / 4096 - first_block);
+        error = e_write(w->output_fd, map, (size_t)i->map_size, e_align(4096 + i->nid * 32 + 64 + i->attrs_size, 8));
+    }
+    if (!error) {
+        if (fstat(fd, &st)) error = errno;
+        else if (st.st_size != i->st.st_size || st.st_mtim.tv_sec != i->st.st_mtim.tv_sec || st.st_mtim.tv_nsec != i->st.st_mtim.tv_nsec || st.st_ctim.tv_sec != i->st.st_ctim.tv_sec || st.st_ctim.tv_nsec != i->st.st_ctim.tv_nsec) error = ESTALE;
+    }
+    free(map);free(input);free(encoded);free(output);close(fd);return error;
+}
 static int e_image(EWriter *w) {
     int error = e_dirs(w->root, -1);
     uint64_t metadata = 0;
@@ -264,13 +324,17 @@ static int e_image(EWriter *w) {
         EInode *i = w->inodes[n];
         if ((metadata & 4095) == 4064) metadata += 32;
         i->nid = metadata / 32;
-        metadata = e_align(metadata + 64 + i->attrs_size, 32);
+        if (w->compression && S_ISREG(i->st.st_mode) && i->size) i->map_size = 16 + e_align(i->size, 4096) / 4096 * 8;
+        metadata = e_align(metadata + (i->map_size ? e_align(64 + i->attrs_size, 8) + i->map_size : 64 + i->attrs_size), 32);
     }
     uint64_t position = 4096 + e_align(metadata, 4096);
     for (size_t n = 0; !error && n < w->count; ++n) {
         EInode *i = w->inodes[n];
-        if (position / 4096 >= UINT32_MAX || i->size > w->maximum || position > w->maximum - i->size) { error = EFBIG; break; }
-        i->block = (uint32_t)(position / 4096); position += e_align(i->size, 4096);
+        if (position / 4096 >= UINT32_MAX || (!i->map_size && (i->size > w->maximum || position > w->maximum - i->size))) { error = EFBIG; break; }
+        i->block = (uint32_t)(position / 4096);
+        if (i->map_size) {
+            w->position = position; error = e_compress(w, i); position = w->position;
+        } else position += e_align(i->size, 4096);
     }
     if (error) return error;
     if (position > w->maximum || position / 4096 >= UINT32_MAX) return EFBIG;
@@ -278,13 +342,18 @@ static int e_image(EWriter *w) {
     unsigned char super[128] = {0};
     e32(super, 0xe0f5e1e2); e32(super + 8, 2); super[12] = 12;
     e64(super + 16, w->count); e32(super + 36, (uint32_t)(position / 4096)); e32(super + 40, 1);
+    if (w->compression) { e32(super + 80, 3); e16(super + 84, 1); }
     error = e_write(w->output_fd, super, sizeof(super), 1024);
+    if (!error && w->compression) {
+        unsigned char config[16] = {0}; e16(config, 14); e16(config + 2, 65535); e16(config + 4, 16);
+        error = e_write(w->output_fd, config, sizeof(config), 1152);
+    }
     for (size_t n = 0; !error && n < w->count; ++n) {
         EInode *i = w->inodes[n];
         unsigned char inode[64] = {0};
-        e16(inode, 1); e16(inode + 2, i->attrs_size ? (uint16_t)((i->attrs_size - 12) / 4 + 1) : 0);
+        e16(inode, i->map_size ? 3 : 1); e16(inode + 2, i->attrs_size ? (uint16_t)((i->attrs_size - 12) / 4 + 1) : 0);
         e16(inode + 4, (uint16_t)i->st.st_mode); e64(inode + 8, i->size);
-        uint32_t device = i->block;
+        uint32_t device = i->map_size ? i->stored_blocks : i->block;
         if (S_ISCHR(i->st.st_mode) || S_ISBLK(i->st.st_mode)) {
             unsigned ma = major(i->st.st_rdev), mi = minor(i->st.st_rdev);
             if (ma > 4095 || mi > 1048575) { error = EOVERFLOW; break; }
@@ -296,7 +365,7 @@ static int e_image(EWriter *w) {
         uint64_t at = 4096 + i->nid * 32;
         error = e_write(w->output_fd, inode, sizeof(inode), at);
         if (!error && i->attrs_size) error = e_write(w->output_fd, i->attrs, i->attrs_size, at + 64);
-        if (!error && S_ISREG(i->st.st_mode)) error = e_copy(w, i);
+        if (!error && S_ISREG(i->st.st_mode) && !i->map_size) error = e_copy(w, i);
         if (!error && S_ISLNK(i->st.st_mode)) error = e_write(w->output_fd, i->link, (size_t)i->size, (uint64_t)i->block * 4096);
     }
     if (!error) error = e_dirs(w->root, w->output_fd);
@@ -316,13 +385,13 @@ static void e_free(EWriter *w) {
 }
 static int e_directory_image(const char *source, const char *destination, long long compression, long long level, long long maximum) {
     (void)level;
-    if (compression != 0) return ENOTSUP;
+    if (compression != 0 && compression != 2) return ENOTSUP;
     if (maximum < 4096 || maximum > 17592186040320ll) return EINVAL;
     EWriter *w = calloc(1, sizeof(*w));
     if (!w) return ENOMEM;
     w->source_fd = open(source, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (w->source_fd < 0) { int error = errno; free(w); return error; }
-    w->maximum = (uint64_t)maximum; w->root = calloc(1, sizeof(*w->root));
+    w->maximum = (uint64_t)maximum; w->compression = (int)compression; w->root = calloc(1, sizeof(*w->root));
     int error = w->root ? 0 : ENOMEM;
     if (!error) { w->root->name = strdup(""); if (!w->root->name) error = ENOMEM; }
     if (!error) error = e_scan(w, w->root, w->source_fd, "", 0);

@@ -21,6 +21,7 @@ from host_paths import host_path
 CONFIG = {
     'sha256': ('libcrypto', 'openssl@3', 'openssl/sha.h', 'libcrypto'),
     'tararchive': ('libarchive', 'libarchive', 'archive.h', 'libarchive'),
+    'lz4': ('liblz4', 'lz4', 'lz4.h', 'liblz4'),
 }
 
 
@@ -109,6 +110,19 @@ int main(void) {
 }
 '''
         apis = ('SHA256_Init', 'SHA256_Update', 'SHA256_Final', 'OpenSSL_version_num')
+    elif kind == 'lz4':
+        source = '''#include <lz4.h>
+#include <string.h>
+_Static_assert(sizeof(void *) == 8, "64-bit provider required");
+int main(void) {
+    char packed[32], plain[8];
+    if (LZ4_VERSION_NUMBER < 10903 || LZ4_versionNumber() != LZ4_VERSION_NUMBER) return 1;
+    int size = LZ4_compress_default("erofs", packed, 5, sizeof(packed));
+    if (size <= 0 || LZ4_decompress_safe(packed, plain, size, sizeof(plain)) != 5) return 2;
+    return memcmp(plain, "erofs", 5) != 0;
+}
+'''
+        apis = ('LZ4_versionNumber', 'LZ4_compress_default', 'LZ4_decompress_safe')
     else:
         source = '''#include <archive.h>
 #include <archive_entry.h>
@@ -235,6 +249,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
                 owned = ('openssl' in path.parts or 'openssl' in physical.parts
                          or any(p.name in ('opensslconf.h', 'configuration.h', 'opensslv.h')
                                 for p in (path, physical)))
+            elif kind == 'lz4':
+                owned = any(p.name.startswith('lz4') for p in (path, physical))
             else:
                 owned = any(p.name == 'archive.h' or p.name.startswith('archive_')
                             for p in (path, physical))
@@ -257,7 +273,7 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
         result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
         images = [host_path(value).resolve() for value in result.stdout.splitlines()]
         expected = runtime_library or binary.resolve()
-        count = 4 if kind == 'sha256' else 5
+        count = 4 if kind == 'sha256' else 3 if kind == 'lz4' else 5
         if len(images) != count:
             raise ValueError(f'{kind} provider image identification/API probe failed '
                              f'(status {result.returncode})')
