@@ -77,14 +77,19 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
         assert (ran.returncode, ran.stdout, ran.stderr) == (0, name + ' passed\n', ''), ran
         print(name, args.sanitizer, 'generated language passed', flush=True)
-    for helper in (False, True):
+    for variant in ('direct', 'helper', 'children'):
         source = directory / 'main-exit.min'
         text = entry.replace('return input.getInt64(0)', 'return seed') + main.replace(
             'startThread(worker, 0,', 'startThread(worker, 7,').replace(
             '    joinThread(workerHandle)',
             '    let result = joinThread(workerHandle)\n    closeBytesChannel(channel)\n    ' +
-            ('stop(result)' if helper else 'exit(result)'))
-        if helper: text = 'function stop(status: Integer) { exit(status) }\n' + text
+            ('stop(result)' if variant == 'helper' else 'exit(result)'))
+        expected_stdout = ''
+        if variant == 'helper': text = 'function stop(status: Integer) { exit(status) }\n' + text
+        if variant == 'children':
+            text = text.replace('return seed', 'threadSleepNanoseconds(10000000)\n    print("child joined")\n    return seed')
+            text = text.replace('    let result = joinThread(workerHandle)\n    closeBytesChannel(channel)\n    exit(result)', '    exit(7)')
+            expected_stdout = 'child joined\n'
         source.write_text(text)
         llvm = directory / 'main-exit.ll'
         compiled = subprocess.run([str(selected), str(source), str(llvm), '--bounded-owners', '32'],
@@ -96,8 +101,8 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
             capture_output=True, text=True, timeout=240, env=environment)
         assert linked.returncode == 0, linked.stdout + linked.stderr
         ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
-        assert (ran.returncode, ran.stdout, ran.stderr) == (7, '', ''), ran
-        print('main-exit' + ('-helper' if helper else ''), args.sanitizer, 'joined status passed', flush=True)
+        assert (ran.returncode, ran.stdout, ran.stderr) == (7, expected_stdout, ''), ran
+        print('main-exit-' + variant, args.sanitizer, 'joined status passed', flush=True)
     cases = {
         'legacy-main-address': entry + main.replace('    nativeThreadSetup()\n', '').replace(
             '    let input =', '    let local = Bytes(8)\n    let raw = machine.address(local)\n    let input ='),
