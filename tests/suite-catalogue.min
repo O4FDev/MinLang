@@ -1,0 +1,386 @@
+use "../tools/testing.min" as test
+use "../tools/test-toolchain.min" as toolchain
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Row { path: Text; role: Text; reason: Text; consumers: List<Text> }
+record Catalogue { schema: Boolean; complete: Boolean; sources: List<Row>; fixtures: List<Text>; prefixes: List<Text>; data: List<Text> }
+record Paths { root: Text; real: Map<Text, Text> }
+
+function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(haystack: Bytes, needle: Bytes, from: Integer): Integer {
+    if needle.length == 0 { return from }
+    let last = haystack.length - needle.length
+    let start = from
+    while start <= last {
+        if haystack[start] == needle[0] {
+            let equal = true
+            for index in 1..needle.length { if haystack[start + index] != needle[index] { equal = false; break } }
+            if equal { return start }
+        }
+        start += 1
+    }
+    return -1
+}
+function word(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45
+}
+function token(content: Bytes, name: Text): Boolean {
+    let needle = Bytes(name)
+    let position = find(content, needle, 0)
+    while position >= 0 {
+        let before = position == 0 || !word(content[position - 1])
+        let end = position + needle.length
+        let after = end >= content.length || !word(content[end])
+        if before && after { return true }
+        position = find(content, needle, position + 1)
+    }
+    return false
+}
+function components(path: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 {
+            result.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    return result
+}
+function canonical(path: Text): Boolean {
+    for part in components(path) { if part == "" || part == "." || part == ".." { return false } }
+    return true
+}
+function base(path: Text): Text {
+    let parts = components(path)
+    return parts[parts.length - 1]
+}
+function dot(name: Text): Integer {
+    let raw = Bytes(name)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 46 { index -= 1 }
+    if index > 0 && index < raw.length - 1 { return index }
+    return -1
+}
+function suffix(path: Text): Text {
+    let name = base(path)
+    let index = dot(name)
+    if index < 0 { return "" }
+    let raw = Bytes(name)
+    return Text(raw.slice(index, raw.length))
+}
+function stem(path: Text): Text {
+    let name = base(path)
+    let index = dot(name)
+    if index < 0 { return name }
+    return Text(Bytes(name).slice(0, index))
+}
+function withSuffix(path: Text, extension: Text): Text {
+    let raw = Bytes(path)
+    let name = base(path)
+    let directory = Text(raw.slice(0, raw.length - Bytes(name).length))
+    return directory + stem(path) + extension
+}
+function trimmed(value: Text): Boolean {
+    for byte in Bytes(value) { if byte != 32 && (byte < 9 || byte > 13) { return true } }
+    return false
+}
+function inside(root: Text, path: Text): Boolean {
+    if root == "/" { return starts(path, "/") }
+    return path == root || starts(path, root + "/")
+}
+function field(value: json.Value, name: Text): Text {
+    let found = json.member(value, name)
+    if found.kind == json.STRING { return found.text }
+    return ""
+}
+function strings(value: json.Value): Boolean {
+    if value.kind != json.ARRAY { return false }
+    for item in value.items { if item.kind != json.STRING { return false } }
+    return true
+}
+function textItems(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    for item in value.items { result.add(item.text) }
+    return result
+}
+function load(source: Text): Catalogue {
+    let value = json.parse(source)
+    let catalogue = Catalogue { schema: false; complete: false; sources: []; fixtures: []; prefixes: []; data: [] }
+    if value.kind != json.OBJECT { return catalogue }
+    let version = json.member(value, "schema_version")
+    catalogue.schema = version.kind == json.NUMBER && version.number == 1.0
+    let fixtures = json.member(value, "required_minyar_fixtures")
+    let prefixes = json.member(value, "required_minyar_prefixes")
+    let data = json.member(value, "required_data_fixtures")
+    catalogue.complete = strings(fixtures) && strings(prefixes) && strings(data)
+    if catalogue.complete {
+        catalogue.fixtures = textItems(fixtures)
+        catalogue.prefixes = textItems(prefixes)
+        catalogue.data = textItems(data)
+    }
+    let sources = json.member(value, "sources")
+    if sources.kind != json.ARRAY { return catalogue }
+    for item in sources.items {
+        let consumers: List<Text> = []
+        let declared = json.member(item, "consumers")
+        if declared.kind == json.ARRAY {
+            for consumer in declared.items {
+                if consumer.kind == json.STRING { consumers.add(consumer.text) } else { consumers.add("") }
+            }
+        } else if declared.kind != json.NULL { consumers.add("") }
+        catalogue.sources.add(Row { path: field(item, "path"); role: field(item, "role"); reason: field(item, "reason"); consumers: consumers })
+    }
+    return catalogue
+}
+function inspect(root: Text, names: List<Text>, work: Text): Paths {
+    let unique: List<Text> = []
+    let known = Map<Text, Boolean>()
+    for name in names { if !known.has(name) { known[name] = true; unique.add(name) } }
+    let script = "cd -- \"$1\" || exit 1; shift; pwd -P; count=$#; for path; do if [ -f \"$path\" ]; then set -- \"$@\" \"$path\"; echo f; else echo -; fi; done; shift \"$count\"; if [ \"$#\" -gt 0 ]; then realpath -- \"$@\"; fi"
+    let command = ["/bin/sh", "-c", script, "minyar", root]
+    for name in unique { command.add(name) }
+    let result = test.run(command, system.environment(), "", work + "/inspect", 120)
+    let paths = Paths { root: ""; real: Map<Text, Text>() }
+    if result.status != 0 && test.lines(result.output).length == 0 { return paths }
+    test.require(result, "resolve catalogue paths")
+    let lines = test.lines(result.output)
+    test.check(lines.length >= unique.length + 1, "incomplete catalogue path resolution")
+    paths.root = lines[0]
+    let next = unique.length + 1
+    for index in 0..unique.length {
+        if lines[index + 1] == "f" {
+            test.check(next < lines.length, "incomplete catalogue path resolution")
+            paths.real[unique[index]] = lines[next]
+            next += 1
+        }
+    }
+    test.check(next == lines.length, "unexpected catalogue path resolution")
+    return paths
+}
+function discover(catalogue: Catalogue, root: Text, work: Text): List<Text> {
+    let script = "cd -- \"$1\" || exit 1; [ -d tests ] || exit 0; find tests \\( -type f -o \\( -type l -exec test -f {} \\; \\) \\) -print"
+    let result = test.run(["/bin/sh", "-c", script, "minyar", root], system.environment(), "", work + "/discover", 120)
+    test.require(result, "discover host test sources")
+    let found: List<Text> = []
+    for name in test.lines(result.output) {
+        let extension = suffix(name)
+        let selected = extension == ".py" || extension == ".c" || extension == ".h" || extension == ".m" || extension == ".sh"
+        if member(catalogue.fixtures, name) || member(catalogue.data, name) { selected = true }
+        if extension == ".min" { for prefix in catalogue.prefixes { if starts(name, prefix) { selected = true } } }
+        if selected { found.add(name) }
+    }
+    found.sort()
+    return found
+}
+function listed(names: List<Text>): Text {
+    let parts: List<Text> = []
+    for name in names { parts.add("'" + name + "'") }
+    let result = "["
+    for index in 0..parts.length {
+        if index > 0 { result += ", " }
+        result += parts[index]
+    }
+    return result + "]"
+}
+function validate(catalogue: Catalogue, root: Text, work: Text): Text {
+    if !catalogue.schema || catalogue.sources.length == 0 { return "Missing schema or empty source catalogue" }
+    if !catalogue.complete { return "Missing required fixture lists" }
+    let names: List<Text> = []
+    for row in catalogue.sources {
+        names.add(row.path)
+        for consumer in row.consumers { names.add(consumer) }
+    }
+    let paths = inspect(root, names, work)
+    let seen = Map<Text, Boolean>()
+    let texts = Map<Text, Bytes>()
+    for row in catalogue.sources {
+        let name = row.path
+        if seen.has(name) { return "Duplicate source: " + name }
+        seen[name] = true
+        if !paths.real.has(name) || !inside(paths.root, paths.real[name]) || !starts(name, "tests/") || !canonical(name) { return "Missing or unsafe source: " + name }
+        if !member(["suite", "support", "fixture", "manual", "ungated"], row.role) || !trimmed(row.reason) { return "Missing disposition: " + name }
+        if row.role == "manual" || row.role == "ungated" {
+            if row.consumers.length > 0 { return "Manual/ungated source cannot claim a runner" }
+            continue
+        }
+        let distinct = Map<Text, Boolean>()
+        for consumer in row.consumers { distinct[consumer] = true }
+        let count = 0
+        for consumer in distinct { count += 1 }
+        if row.consumers.length == 0 || count != row.consumers.length { return "Missing or duplicate consumers: " + name }
+        let source = paths.real[name]
+        for consumer in row.consumers {
+            if !paths.real.has(consumer) || !inside(paths.root, paths.real[consumer]) || paths.real[consumer] == source { return "Missing or unsafe consumer: " + consumer }
+            let owner = paths.real[consumer]
+            if !texts.has(owner) { texts[owner] = files.readFile(owner) }
+            let content = texts[owner]
+            let sibling = suffix(name) == ".c" && withSuffix(owner, ".c") == source && find(content, Bytes("Path(__file__).with_suffix('.c')"), 0) >= 0
+            if !sibling && find(content, Bytes(base(name)), 0) < 0 && !token(content, stem(name)) { return "Consumer no longer references source: " + name }
+        }
+    }
+    let actual = discover(catalogue, root, work)
+    let present = Map<Text, Boolean>()
+    let missing: List<Text> = []
+    for name in actual {
+        present[name] = true
+        if !seen.has(name) { missing.add(name) }
+    }
+    let stale: List<Text> = []
+    for name in seen { if !present.has(name) { stale.add(name) } }
+    stale.sort()
+    if missing.length > 0 || stale.length > 0 { return "Uncatalogued sources: " + listed(missing) + "; stale entries: " + listed(stale) }
+    return ""
+}
+function copy(catalogue: Catalogue): Catalogue {
+    let sources: List<Row> = []
+    for row in catalogue.sources {
+        let consumers: List<Text> = []
+        for consumer in row.consumers { consumers.add(consumer) }
+        sources.add(Row { path: row.path; role: row.role; reason: row.reason; consumers: consumers })
+    }
+    return Catalogue { schema: catalogue.schema; complete: catalogue.complete; sources: sources; fixtures: catalogue.fixtures; prefixes: catalogue.prefixes; data: catalogue.data }
+}
+function write(root: Text, name: Text, content: Text) {
+    let path = root
+    test.check(files.makeDirectory(path) == 0, "cannot create control directory")
+    let parts = components(name)
+    for index in 0..(parts.length - 1) {
+        path = path + "/" + parts[index]
+        test.check(files.makeDirectory(path) == 0, "cannot create control directory")
+    }
+    writeTextFile(root + "/" + name, content)
+}
+function remove(root: Text, name: Text) { test.check(files.remove(root + "/" + name) == 0, "cannot remove control file " + name) }
+function reject(candidate: Catalogue, root: Text, work: Text): Integer {
+    test.check(validate(candidate, root, work) != "", "Accepted invalid source catalogue")
+    return 1
+}
+function controls(required: Catalogue, work: Text): Integer {
+    let root = work + "/control"
+    write(root, "tests/example.py", "pass\n")
+    write(root, "Makefile", "check-example:\n\tpython3 tests/example.py\n")
+    let data = Catalogue { schema: true; complete: true; sources: [Row { path: "tests/example.py"; role: "suite"; reason: "Example control suite"; consumers: ["Makefile"] }];
+        fixtures: required.fixtures; prefixes: required.prefixes; data: required.data }
+    let accepted = validate(data, root, work)
+    test.check(accepted == "", "control catalogue rejected: " + accepted)
+    let rejected = 0
+    write(root, "tests/nested/new-suite.py", "pass\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/nested/new-suite.py")
+    write(root, "tests/quic-protocol-artifacts.py", "pass\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/quic-protocol-artifacts.py")
+    write(root, "tests/parallel-signatures/new-managed.min", "parallel function bad(value: Text) {}\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/parallel-signatures/new-managed.min")
+    for name in ["tests/quic-migration-cids.min", "tests/quic-cipher-policy.min", "tests/interop/qns/client.min", "tests/interop/qns/server.min"] {
+        write(root, name, "function main() {}\n")
+        rejected += reject(data, root, work)
+        remove(root, name)
+    }
+    write(root, "tests/cycle-private-retirement-v5.json", "{}\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/cycle-private-retirement-v5.json")
+    write(root, "tests/fixtures/cycle-progress-before-observability.c.txt", "historical input\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/fixtures/cycle-progress-before-observability.c.txt")
+    write(root, "tests/new-native-fixture.m", "int main(void) { return 0; }\n")
+    rejected += reject(data, root, work)
+    remove(root, "tests/new-native-fixture.m")
+    let duplicate = copy(data)
+    duplicate.sources.add(copy(data).sources[0])
+    rejected += reject(duplicate, root, work)
+    let unlisted = copy(data)
+    unlisted.complete = false
+    rejected += reject(unlisted, root, work)
+    remove(root, "tests/example.py")
+    rejected += reject(data, root, work)
+    write(root, "tests/example.py", "pass\n")
+    for change in ["role", "reason", "consumers", "missing", "self", "ungated", "outside"] {
+        let mutant = copy(data)
+        let row = mutant.sources[0]
+        if change == "role" { row.role = "unknown" }
+        if change == "reason" { row.reason = "" }
+        if change == "consumers" { row.consumers = [] }
+        if change == "missing" { row.consumers = ["missing.py"] }
+        if change == "self" { row.consumers = ["tests/example.py"] }
+        if change == "ungated" { row.role = "ungated" }
+        if change == "outside" { row.path = "../outside.py" }
+        rejected += reject(mutant, root, work)
+    }
+    write(root, "Makefile", "check-example:\n\ttrue\n")
+    rejected += reject(data, root, work)
+    write(root, ".github/workflows/ci.yml", "run: python3 tests/example.py\n")
+    write(root, "minyar", "#!/bin/sh\n")
+    write(root, "tests/nested/raw-source.py", "tests/example.py\n")
+    let excluded = ["build/host-binary", ".git/config", "tests/__pycache__/generated.py"]
+    for name in excluded { write(root, name, "must not enter snapshot\n") }
+    let snapshot = toolchain.snapshot(root, work + "/retained-source", work)
+    let copied = copy(data)
+    copied.sources[0].consumers = [".github/workflows/ci.yml", "tests/nested/raw-source.py"]
+    copied.sources.add(Row { path: "tests/nested/raw-source.py"; role: "manual"; reason: "Raw retained source control"; consumers: [] })
+    let retained = validate(copied, snapshot, work)
+    test.check(retained == "", "retained snapshot catalogue rejected: " + retained)
+    for relative in [".github/workflows/ci.yml", "tests/nested/raw-source.py"] {
+        test.check(readTextFile(snapshot + "/" + relative) == readTextFile(root + "/" + relative), "retained snapshot changed the bytes of " + relative)
+        let windows = test.replace(relative, "/", "\\")
+        for wrong in [windows, "/retained-source/" + relative] {
+            test.check(wrong != relative, "noncanonical control matches the canonical path")
+            let mutant = copy(copied)
+            let consumers: List<Text> = []
+            for consumer in mutant.sources[0].consumers {
+                if consumer == relative { consumers.add(wrong) } else { consumers.add(consumer) }
+            }
+            mutant.sources[0].consumers = consumers
+            rejected += reject(mutant, snapshot, work)
+        }
+    }
+    for name in excluded { test.check(files.pathSize(snapshot + "/" + name) < 0, "host artifact entered the snapshot: " + name) }
+    return rejected
+}
+
+let work = test.scratch()
+if argumentCount() == 3 && argument(0) == "--validate" {
+    let invalid = validate(load(readTextFile(argument(1))), argument(2), work)
+    test.removeTree(work)
+    if invalid != "" {
+        system.writeStandardError(invalid + "\n")
+        exit(3)
+    }
+    exit(0)
+}
+if argumentCount() == 2 && argument(0) == "--discover" {
+    let found = discover(load(readTextFile(argument(1) + "/tests/suite-catalogue.json")), argument(1), work)
+    test.removeTree(work)
+    for name in found { print(name) }
+    exit(0)
+}
+test.check(argumentCount() == 0, "usage: suite-catalogue [--validate CATALOGUE ROOT | --discover ROOT]")
+let catalogue = load(readTextFile("tests/suite-catalogue.json"))
+let error = validate(catalogue, ".", work)
+test.check(error == "", error)
+let rejectedControls = controls(catalogue, work)
+let exceptions: List<Text> = []
+for row in catalogue.sources { if row.role == "manual" || row.role == "ungated" { exceptions.add(row.path) } }
+let joined = ""
+for index in 0..exceptions.length {
+    if index > 0 { joined += ", " }
+    joined += exceptions[index]
+}
+test.removeTree(work)
+print(Text(catalogue.sources.length) + " host test sources catalogued; " + Text(rejectedControls) + " invalid controls rejected")
+print("Explicit manual/ungated sources: " + joined)

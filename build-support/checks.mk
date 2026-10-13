@@ -748,7 +748,7 @@ check-portable: check-native-bytes
 check-module-test-driver: build/minyarc build/minyar-runtime.o build/tooling/tests/module-test-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/module-test-driver
 
-check-build-wiring:
+check-build-wiring: build/tooling/tests/suite-catalogue
 	python3 tests/build-wiring.py
 
 check check-portable: check-module-test-driver check-build-wiring

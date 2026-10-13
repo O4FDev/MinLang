@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Probe actual Make prerequisites under POSIX and native Windows host names."""
 import ast
+import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,18 +27,41 @@ def dry_run_commands(stdout):
 
 
 
-def literal(path, name):
-    """A module-level literal assignment, read without importing the module."""
-    tree = ast.parse((ROOT / path).read_text())
-    return next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+def minyar_list(path, function):
+    body = (ROOT / path).read_text().split('public function ' + function + '(): List<Text> {', 1)[1].split('\n}', 1)[0]
+    return re.findall(r'"([^"]+)"', body)
+
+
+def linux_targets():
+    optional = (ROOT / 'tools/linux-matrix.min').read_text().split('for target in [', 1)[1].split(']', 1)[0]
+    return minyar_list('scripts/linux-plan.min', 'correctness') + re.findall(r'"([^"]+)"', optional)
+
+
+def native_catalogue():
+    tool = str(ROOT / 'build/tooling/tests/suite-catalogue')
+
+    def validate(data, root):
+        with tempfile.TemporaryDirectory(prefix='minyar-catalogue-') as directory:
+            path = Path(directory) / 'catalogue.json'
+            path.write_text(json.dumps(data))
+            result = subprocess.run([tool, '--validate', str(path), str(root)], capture_output=True, text=True)
+        if result.returncode == 3:
+            raise ValueError(result.stderr.strip())
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+
+    def discover(root):
+        result = subprocess.run([tool, '--discover', str(root)], capture_output=True, text=True, check=True)
+        return set(result.stdout.splitlines())
+
+    return types.SimpleNamespace(validate=validate, discover=discover)
 
 
 def assert_ci_runs_quic_group(test, *targets):
     """CI gates these targets through the runner's QUIC group, run by a linux-matrix shard."""
-    quic = literal('scripts/check-linux.py', 'QUIC_TARGETS')
+    quic = minyar_list('scripts/linux-plan.min', 'quic')
     workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-    test.assertIn('python3 scripts/check-linux.py', workflow)
+    test.assertIn('./build/tooling/scripts/check-linux', workflow)
     test.assertIn('--group quic', workflow)
     for target in targets:
         test.assertIn(target, quic)
@@ -168,8 +194,7 @@ class BuildWiring(unittest.TestCase):
             old="ROOT/"+repr(name)+","
             mutant=loop_source.replace(old,'',1);self.assertNotEqual(mutant,loop_source)
             with self.assertRaises(AssertionError):verify_inputs(mutant)
-        spec=importlib.util.spec_from_file_location('loop_catalogue',ROOT/'tests/suite-catalogue.py')
-        catalogue=importlib.util.module_from_spec(spec);spec.loader.exec_module(catalogue)
+        catalogue=native_catalogue()
         data=json.loads((ROOT/'tests/suite-catalogue.json').read_text());catalogue.validate(data,ROOT)
         helper=next(row for row in data['sources'] if row['path']=='tests/network_evidence.py')
         self.assertEqual(helper['role'],'support')
@@ -444,16 +469,9 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
                 verify(mutant)
 
-        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body
-                       if isinstance(node, ast.Assign)
-                       and any(isinstance(name, ast.Name) and name.id == 'TARGETS'
-                               for name in node.targets))
+        targets = linux_targets()
         self.assertEqual(targets.count(target), 1)
-        spec = importlib.util.spec_from_file_location(
-            'idle_observability_catalogue', ROOT/'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for name in sorted(name for name in inputs if name.startswith('tests/')):
@@ -537,16 +555,9 @@ class BuildWiring(unittest.TestCase):
             self.assertNotEqual(mutant, source)
             with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
                 verify(mutant)
-        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body
-                       if isinstance(node, ast.Assign)
-                       and any(isinstance(name, ast.Name) and name.id == 'TARGETS'
-                               for name in node.targets))
+        targets = linux_targets()
         self.assertEqual(targets.count(target), 1)
-        spec = importlib.util.spec_from_file_location('ledger_catalogue',
-                                                     ROOT / 'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         rows = {row['path']: row for row in data['sources']}
         self.assertEqual(rows['tests/quic-amplification-ledger.py']['role'], 'suite')
@@ -698,11 +709,7 @@ class BuildWiring(unittest.TestCase):
             self.assertNotEqual(mutant, source)
             with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
                 verify(mutant)
-        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body
-                       if isinstance(node, ast.Assign)
-                       and any(isinstance(target, ast.Name) and target.id == 'TARGETS'
-                               for target in node.targets))
+        targets = linux_targets()
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
         assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
@@ -712,10 +719,7 @@ class BuildWiring(unittest.TestCase):
                        and any(isinstance(target, ast.Name) and target.id == 'VERSION'
                                for target in node.targets))
         self.assertEqual(version, '23.1.2')
-        spec = importlib.util.spec_from_file_location(
-            'quic_rfc_catalogue', ROOT/'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         native = {'build/tooling/tests/quic-migration-cids-test', 'tests/quic-migration-cids-test.min',
@@ -836,10 +840,7 @@ class BuildWiring(unittest.TestCase):
         shim = (ROOT/'tests/llvm_sanitizer.py').read_text()
         self.assertIn('from sanitizer_llvm import',shim)
         self.assertNotIn('def instrument_address_sanitizer',shim)
-        loader = {}
-        exec(compile((ROOT/'scripts/check-linux.py').read_text(), 'linux driver','exec'),
-             {'__name__':'static_linux_driver','__file__':str(ROOT/'scripts/check-linux.py')},loader)
-        self.assertEqual(loader['TARGETS'].count('check-generated-llvm-sanitizer'),1)
+        self.assertEqual(linux_targets().count('check-generated-llvm-sanitizer'),1)
 
     def test_private_retirement_gates_execute_actual_operation_contract(self):
         import importlib.util
@@ -933,8 +934,7 @@ class BuildWiring(unittest.TestCase):
                 (-6,b'',red.replace(b'work <= 16u * rounds + 64u',b'unrelated assertion'),False)):
             with self.assertRaises(AssertionError):
                 driver.validate_failure_control(status,stdout,stderr,timedout)
-        spec=importlib.util.spec_from_file_location('retirement_catalogue',ROOT/'tests/suite-catalogue.py')
-        catalogue=importlib.util.module_from_spec(spec);spec.loader.exec_module(catalogue)
+        catalogue=native_catalogue()
         data=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data,ROOT)
         for name in ('tests/cycle-private-retirement.py','tests/cycle-idle-invalidation.c',
@@ -1038,17 +1038,13 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(recipe=old), self.assertRaises(AssertionError):
                 verify(source.replace(old, new, 1))
 
-        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        targets = linux_targets()
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('check-portable', workflow)
-        self.assertIn('scripts/check-linux.py', workflow)
-        spec = importlib.util.spec_from_file_location('parallel_catalogue', ROOT / 'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        self.assertIn('build/tooling/scripts/check-linux', workflow)
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for name in fixtures | {'tests/parallel-signatures.py'}:
@@ -1112,15 +1108,11 @@ class BuildWiring(unittest.TestCase):
                                         ' '.join(x for x in line.split(': ', 1)[1].split() if x != missing), 1)
                 with self.subTest(missing_gate=missing), self.assertRaises(AssertionError):
                     verify(mutant)
-        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        targets = linux_targets()
         for target in native | sanitize:
             self.assertEqual(targets.count(target), 1)
         assert_ci_runs_quic_group(self, *sorted(native | sanitize))
-        spec = importlib.util.spec_from_file_location('relay_catalogue', ROOT / 'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for name in ('tests/peer-edge-relay.py', 'tests/peer-edge-relay-lifetime.py', 'tests/peer-edge-soak.py'):
@@ -1193,9 +1185,7 @@ class BuildWiring(unittest.TestCase):
             self.assertNotEqual(mutant, source)
             with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
                 verify(mutant)
-        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        targets = linux_targets()
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
         assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
@@ -1207,9 +1197,7 @@ class BuildWiring(unittest.TestCase):
         self.assertEqual(version, '23.1.2')
         # The runner's formatting group installs clang-format==VERSION from scripts/format.py.
         self.assertIn('--group formatting', workflow)
-        spec = importlib.util.spec_from_file_location('ack_catalogue', ROOT / 'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for fixture in ('tests/quic-ack.min',):
@@ -1271,20 +1259,12 @@ class BuildWiring(unittest.TestCase):
                                     + ': ' + dependency, 1)
             with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
                 verify(mutant)
-        namespace = {}
-        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == 'TARGETS':
-                        namespace['TARGETS'] = ast.literal_eval(node.value)
+        namespace = {'TARGETS': linux_targets()}
         for target in (native, sanitize):
             self.assertEqual(namespace['TARGETS'].count(target), 1)
         assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        spec = importlib.util.spec_from_file_location('pto_catalogue', ROOT / 'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for fixture in ('tests/quic-pto.min',):
@@ -1352,13 +1332,12 @@ class BuildWiring(unittest.TestCase):
             spec.loader.exec_module(module)
             return module
 
-        runner = load('registration_linux_runner', 'scripts/check-linux.py')
         for target in (native, sanitize):
-            self.assertEqual(runner.TARGETS.count(target), 1)
+            self.assertEqual(linux_targets().count(target), 1)
         formatter = load('registration_formatter', 'scripts/format.py')
         for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c'):
             self.assertIn(fixture, formatter.FILES)
-        catalogue = load('registration_catalogue', 'tests/suite-catalogue.py')
+        catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c',
@@ -1498,7 +1477,7 @@ class BuildWiring(unittest.TestCase):
                 'build/minyar-default-runtime.o', 'build/minyar-module-build',
                 'build/minyarc-errors-request', 'build/minyar-runtime.o',
                 'build/minyarc-sanitize', 'build/minyar-runtime-sanitize.o',
-                'build/ownership-runtime.o')
+                'build/ownership-runtime.o', 'build/tooling/tests/suite-catalogue')
             makefile.write_text(
                 'include ' + str(ROOT / 'build-support/peer-tests.mk').replace(' ', '\\ ') + '\n'
                 '.PHONY: ' + ' '.join(targets) + '\n' +
@@ -1735,11 +1714,7 @@ class BuildWiring(unittest.TestCase):
             self.assertNotEqual(mutant, fragment, label)
             with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
                 verify(mutant)
-        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
-        targets = next(ast.literal_eval(node.value) for node in tree.body
-                       if isinstance(node, ast.Assign) and any(
-                           isinstance(name, ast.Name) and name.id == 'TARGETS'
-                           for name in node.targets))
+        targets = linux_targets()
         self.assertEqual(targets.count(target), 1)
         workflow = (ROOT/'.github/workflows/ci.yml').read_text()
         self.assertIn('build/linux-evidence/**/build/quic-official-adapter.*', workflow)
@@ -1776,10 +1751,7 @@ class BuildWiring(unittest.TestCase):
                              isinstance(name, ast.Name) and name.id == 'cases'
                              for name in node.targets))
         self.assertEqual(ast.unparse(selection), 'args.case or CASES')
-        spec = importlib.util.spec_from_file_location(
-            'official_adapter_catalogue', ROOT/'tests/suite-catalogue.py')
-        catalogue = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(catalogue)
+        catalogue = native_catalogue()
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         rows = {row['path']: row for row in data['sources']}
         self.assertEqual(rows['tests/quic-official-adapter.py']['role'], 'suite')

@@ -1,0 +1,182 @@
+use "../tools/testing.min" as test
+use "../tools/test-toolchain.min" as toolchain
+use "../tools/check-runner.min" as runner
+use "system" as system
+use "files" as files
+use "json" as json
+
+function write(root: Text, name: Text, content: Bytes) {
+    let path = root
+    test.check(files.makeDirectory(path) == 0, "cannot create fixture directory")
+    let raw = Bytes(name)
+    for index in 0..raw.length {
+        if raw[index] == 47 {
+            path = root + "/" + Text(raw.slice(0, index))
+            test.check(files.makeDirectory(path) == 0, "cannot create fixture directory")
+        }
+    }
+    writeBytesFile(root + "/" + name, content)
+}
+function executable(path: Text, work: Text) {
+    test.require(test.run(["/bin/chmod", "755", path], system.environment(), "", work + "/chmod", 10), "fixture permissions")
+}
+function shell(script: Text, arguments: List<Text>, work: Text, phase: Text): test.Result {
+    let command = ["/bin/sh", "-c", script, "minyar"]
+    for item in arguments { command.add(item) }
+    return test.run(command, system.environment(), "", work + "/" + phase, 60)
+}
+function inventory(root: Text, work: Text): List<Text> {
+    let result = shell("cd -- \"$1\" && find . -type f | LC_ALL=C sort", [root], work, "inventory")
+    test.require(result, "list snapshot files")
+    return test.lines(result.output)
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function sameLines(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function listedIn(names: List<Text>, name: Text): Boolean {
+    for item in names { if item == name { return true } }
+    return false
+}
+function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+function mode(path: Text, octal: Text, work: Text): Boolean {
+    let result = shell("find \"$1\" -prune -perm \"$2\" -print", [path, octal], work, "mode")
+    test.require(result, "inspect file mode")
+    return test.lines(result.output).length == 1
+}
+function source(directory: Text): Text {
+    test.check(files.makeDirectory(directory) == 0, "cannot create fixture directory")
+    let root = directory + "/source"
+    write(root, "Makefile", Bytes("Makefile\n"))
+    write(root, "minyar", Bytes("minyar\n"))
+    write(root, ".github/workflows/ci.yml", Bytes("jobs:\n  native:\n    run: python3 tests/native.py\n"))
+    write(root, "tests/native.py", Bytes("print(\"native\")\n"))
+    return root
+}
+function bytes(prefix: Text, tail: List<Integer>): Bytes {
+    let result = Bytes(prefix)
+    for byte in tail { result.add(byte) }
+    return result
+}
+function required(): Text {
+    let catalogue = json.parse(readTextFile("tests/suite-catalogue.json"))
+    test.check(catalogue.kind == json.OBJECT, "invalid repository catalogue")
+    let parts: List<Text> = []
+    for key in ["required_minyar_fixtures", "required_minyar_prefixes", "required_data_fixtures"] {
+        let names: List<Text> = []
+        for item in json.member(catalogue, key).items { names.add(json.quote(item.text)) }
+        let joined = ""
+        for index in 0..names.length {
+            if index > 0 { joined += "," }
+            joined += names[index]
+        }
+        parts.add(json.quote(key) + ":[" + joined + "]")
+    }
+    return parts[0] + "," + parts[1] + "," + parts[2]
+}
+
+if argumentCount() == 3 && argument(0) == "--pinned" {
+    let scratch = test.scratch()
+    let pinnedPath = toolchain.pinned(argument(1), argument(2), system.environment(), "", scratch)
+    test.removeTree(scratch)
+    print(pinnedPath)
+    exit(0)
+}
+test.check(argumentCount() == 3, "expected SELF SUITE_CATALOGUE MACOS_RUNNER")
+let program = argument(0)
+let catalogueTool = argument(1)
+let macos = argument(2)
+let work = test.scratch()
+let searchPath = test.setting("PATH", "/usr/bin:/bin")
+
+let llvm = work + "/selected-llvm"
+for name in ["llvm23/clang", "llvm23/clang++"] {
+    write(llvm, name, Bytes("#!/bin/sh\nprintf '%s\\n' 'clang version 23.1.2'\n"))
+    executable(llvm + "/" + name, work)
+}
+for name in ["llvm23/ld.lld", "llvm18/ld.lld"] {
+    write(llvm, name, Bytes("#!/bin/sh\nprintf '%s\\n' 'LLD 23.1.2'\n"))
+    executable(llvm + "/" + name, work)
+}
+let pathLinker = runner.environment(system.environment(), "PATH", llvm + "/llvm18:" + searchPath)
+let chosen = test.run([program, "--pinned", llvm + "/llvm23/ld.lld", "lld"], pathLinker, "", work + "/chosen-linker", 30)
+test.require(chosen, "explicit LLVM linker")
+test.check(sameLines(test.lines(chosen.output), [llvm + "/llvm23/ld.lld"]), "explicit LLVM uses its matching linker instead of the PATH linker\n" + chosen.output)
+test.check(files.remove(llvm + "/llvm23/ld.lld") == 0, "remove matching linker")
+let missing = test.run([program, "--pinned", llvm + "/llvm23/ld.lld", "lld"], pathLinker, "", work + "/missing-linker", 30)
+test.check(missing.status != 0 && test.contains(missing.errorOutput, "required tool " + llvm + "/llvm23/ld.lld"), "missing matching linker is not replaced by the PATH linker\n" + missing.output + missing.errorOutput)
+
+let fake = work + "/fake-make"
+write(fake, "make", Bytes("#!/bin/sh\nprintf '%s\\n%s\\n' \"$CC\" \"$LLVM_CC\" > \"$MINYAR_SNAPSHOT_MAKE_RECORD\"\nprintf '# Files\\n\\n.PHONY: check-portable\\n\\ncheck-portable:\\n#  Phony target (prerequisite of .PHONY).\\n\\n# files hash-table stats:\\n'\n"))
+executable(fake + "/make", work)
+let portable = work + "/portable"
+test.check(files.makeDirectory(portable) == 0, "portable runner source")
+for selected in ["/opt/llvm23/bin/clang", "clang-23"] {
+    let environment = runner.environment(system.environment(), "PATH", fake + ":" + searchPath)
+    environment = runner.environment(environment, "CC", selected)
+    environment = runner.environment(environment, "LLVM_CC", selected)
+    environment = runner.environment(environment, "MINYAR_SNAPSHOT_MAKE_RECORD", work + "/make-record")
+    let result = test.run([macos, "--source", portable, "--dry-run", "--jobs", "3", "--no-extras"], environment, "", work + "/portable-plan", 60)
+    test.require(result, "portable runner dry run")
+    let plan = json.parse(result.output)
+    test.check(plan.kind == json.OBJECT, "portable runner prints a JSON plan\n" + result.output)
+    let make: List<Text> = []
+    for item in json.member(plan, "make").items { make.add(item.text) }
+    test.check(sameLines(make, ["make", "-j1"]), "portable runner keeps make free of compiler overrides")
+    test.check(sameLines(test.lines(readTextFile(work + "/make-record")), [selected, selected]), "portable runner preserves the selected compiler spelling for make")
+}
+
+let consumers = work + "/consumers"
+let consumerSource = source(consumers)
+let consumerSnapshot = toolchain.snapshot(consumerSource, consumers + "/retained", consumers)
+test.check(readTextFile(consumerSnapshot + "/.github/workflows/ci.yml") == readTextFile(consumerSource + "/.github/workflows/ci.yml"), "workflow consumer retained byte for byte")
+writeTextFile(consumers + "/catalogue.json", "{\"schema_version\":1," + required() + ",\"sources\":[{\"path\":\"tests/native.py\",\"role\":\"suite\",\"reason\":\"Native CI control\",\"consumers\":[\".github/workflows/ci.yml\"]}]}\n")
+test.require(test.run([catalogueTool, "--validate", consumers + "/catalogue.json", consumerSnapshot], system.environment(), "", consumers + "/validate", 120), "workflow consumers remain reviewable and the catalogue stays valid in the snapshot")
+
+let artifacts = work + "/artifacts"
+let artifactSource = source(artifacts)
+for name in ["build/minyarc", ".git/config", "tests/__pycache__/native.pyc", "tests/stale.pyc"] { write(artifactSource, name, Bytes("host artifact")) }
+let artifactSnapshot = toolchain.snapshot(artifactSource, artifacts + "/retained", artifacts)
+for name in ["build", ".git", "tests/__pycache__", "tests/stale.pyc"] { test.check(!exists(artifactSnapshot + "/" + name), "host artifact inherited: " + name) }
+
+let adapters = work + "/adapters"
+let adapterSource = source(adapters)
+let adapterNames = ["os/arch/x86_64/tlsverify.min", "os/arch/arm64/tlsverify.min", "os/arch/x86_64/aes.min", "os/arch/arm64/aes.min"]
+let adapterBytes = [bytes("x86_64 trust\r\n", [255, 0, 10]), bytes("arm64 trust\r\n", [254, 0, 10]), bytes("x86_64 aes\r\n", [253, 0, 10]), bytes("arm64 aes\r\n", [252, 0, 10])]
+let adapterModes = ["640", "600", "644", "755"]
+for index in 0..adapterNames.length {
+    write(adapterSource, adapterNames[index], adapterBytes[index])
+    test.require(test.run(["/bin/chmod", adapterModes[index], adapterSource + "/" + adapterNames[index]], system.environment(), "", adapters + "/chmod", 10), "adapter mode")
+}
+let expected = inventory(adapterSource, adapters)
+let adapterSnapshot = toolchain.snapshot(adapterSource, adapters + "/retained", adapters)
+let retained = inventory(adapterSnapshot, adapters)
+for index in 0..adapterNames.length {
+    let copied = adapterSnapshot + "/" + adapterNames[index]
+    test.check(exists(copied), "adapter retained: " + adapterNames[index])
+    test.check(same(readBytesFile(copied), adapterBytes[index]), "adapter bytes retained: " + adapterNames[index])
+    test.check(mode(copied, adapterModes[index], adapters), "adapter mode retained: " + adapterNames[index])
+    test.check(listedIn(retained, "./" + adapterNames[index]), "adapter listed in the snapshot: " + adapterNames[index])
+}
+test.check(sameLines(retained, expected), "snapshot holds exactly the source files")
+for name in expected { test.check(same(readBytesFile(adapterSnapshot + "/" + name), readBytesFile(adapterSource + "/" + name)), "snapshot bytes match the source: " + name) }
+
+let nested = work + "/nested"
+let nestedSource = source(nested)
+write(nestedSource, "os/arch/x86_64/tlsverify.min", Bytes("OS source fixture\n"))
+for name in ["build/os/arm64/kernel.elf", "os/build/x86_64/kernel.elf", "os/.git/config", "os/arch/arm64/__pycache__/adapter.pyc", "os/arch/x86_64/stale.pyc"] { write(nestedSource, name, Bytes("host artifact")) }
+let nestedSnapshot = toolchain.snapshot(nestedSource, nested + "/retained", nested)
+test.check(same(readBytesFile(nestedSnapshot + "/os/arch/x86_64/tlsverify.min"), readBytesFile(nestedSource + "/os/arch/x86_64/tlsverify.min")), "OS adapter retained byte for byte")
+let nestedFiles = inventory(nestedSnapshot, nested)
+for name in ["build", "os/build", "os/.git", "os/arch/arm64/__pycache__", "os/arch/x86_64/stale.pyc"] {
+    test.check(!exists(nestedSnapshot + "/" + name), "nested host artifact inherited: " + name)
+    for listed in nestedFiles { test.check(listed != "./" + name && !runner.begins(listed, "./" + name + "/"), "nested host artifact listed: " + listed) }
+}
+test.removeTree(work)
+print("Linux snapshot controls: passed")

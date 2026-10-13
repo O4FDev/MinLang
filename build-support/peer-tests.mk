@@ -58,12 +58,12 @@ check-peer-audit-complete: check-peer-audit
 	python3 tools/check-peer-audit.py --require-complete
 
 .PHONY: check-suite-catalogue
-check-suite-catalogue:
-	python3 tests/suite-catalogue.py
+check-suite-catalogue: build/tooling/tests/suite-catalogue
+	$(LIMITED) ./build/tooling/tests/suite-catalogue
 
 .PHONY: check-linux-snapshot
-check-linux-snapshot:
-	python3 tests/linux-snapshot.py
+check-linux-snapshot: build/tooling/tests/linux-snapshot build/tooling/tests/suite-catalogue build/tooling/scripts/check-macos
+	$(LIMITED) ./build/tooling/tests/linux-snapshot "$(CURDIR)/build/tooling/tests/linux-snapshot" "$(CURDIR)/build/tooling/tests/suite-catalogue" "$(CURDIR)/build/tooling/scripts/check-macos"
 
 check check-portable: check-linux-snapshot
 
