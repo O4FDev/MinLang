@@ -274,7 +274,7 @@ check-scalar-record-storage: build/minyarc build/minyarc-sanitize build/minyar-r
 	$(LIMITED) python3 tests/production-scalar-storage.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/scalar-record-storage.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-scalar-storage.py
-	$(LIMITED) python3 tests/scalar-record-mutation.py
+	$(SANITIZER_LIMITED) python3 tests/scalar-record-mutation.py
 
 check-readonly-parameters: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o
 	$(LIMITED) python3 tests/readonly-parameters.py
