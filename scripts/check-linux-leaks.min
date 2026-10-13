@@ -1,0 +1,40 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "system" as system
+use "files" as files
+use "json" as json
+test.check(argumentCount() == 2, "expected SOURCE PROFILE_DIRECTORY")
+let source = argument(0)
+let profiles = argument(1)
+let work = test.scratch()
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
+environment = runner.environment(environment, "LSAN_OPTIONS", "exitcode=23")
+environment = runner.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+writeTextFile(work + "/control.c", "#include <stdlib.h>\n__attribute__((noinline)) static void forget(void) {\nvoid *p=malloc(37); if(!p) abort(); *(volatile char *)p=1;\n}\nint main(void) { forget(); return 0; }\n")
+test.require(test.run([test.setting("MINYAR_TEST_CLANG", "clang"), "-O0", "-g", "-fsanitize=address,undefined", work + "/control.c", "-o", work + "/control"], environment, "", work + "/compile", 120), "leak detector build")
+let control = test.run([work + "/control"], environment, "", work + "/control-result", 30)
+test.check(control.status == 23 && test.contains(control.errorOutput, "LeakSanitizer: detected memory leaks"), "LeakSanitizer did not detect the deliberate leak\n" + control.errorOutput)
+test.require(test.run([source + "/build/runtime-unit-sanitize"], environment, source, work + "/runtime-unit", 60), "eager runtime LeakSanitizer replay")
+let count = 0
+for directory in files.list(profiles) {
+    if !runner.begins(directory, "minyar-memory-profiles-") { continue }
+    let report = json.parse(readTextFile(profiles + "/" + directory + "/results.json"))
+    test.check(report.kind == json.OBJECT, "invalid focused profile result")
+    if json.string(report, "status") != "passed" { continue }
+    for row in json.member(report, "checks").items {
+        let label = json.string(row, "label")
+        if !runner.begins(label, "system-") || test.contains(label, "-compile") { continue }
+        test.check(json.string(row, "returncode") == "0", "cannot replay a failed focused fixture")
+        let command: List<Text> = []
+        for item in json.member(row, "command").items {
+            test.check(item.kind == json.STRING, "invalid focused fixture command")
+            command.add(item.text)
+        }
+        test.check(command.length > 0 && runner.begins(command[0], profiles + "/") && !test.contains(command[0], "/../"), "focused fixture escaped private run directory")
+        test.require(test.run(command, environment, source, work + "/fixture-" + Text(count), 60), label + " LeakSanitizer replay")
+        count += 1
+        print(label + ": LeakSanitizer passed")
+    }
+}
+test.check(count > 0, "no completed system allocator fixtures found")
+test.removeTree(work)

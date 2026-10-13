@@ -1,0 +1,125 @@
+use "./testing.min" as test
+use "./check-runner.min" as runner
+use "./test-toolchain.min" as toolchain
+use "../scripts/linux-plan.min" as catalogue
+use "system" as system
+use "files" as files
+public function selected(groups: List<Text>, group: Text): Boolean {
+    for item in groups { if item == group { return true } }
+    return false
+}
+public function tierMatches(target: Text, tier: Text): Boolean {
+    if tier == "all" { return true }
+    return (tier == "sanitize") == test.contains(target, "sanitiz")
+}
+function targets(plan: runner.Plan, variant: Integer, names: List<Text>, tier: Text) {
+    for name in names { if tierMatches(name, tier) { runner.addCheck(plan, variant, name) } }
+}
+function env(base: List<Text>, key: Text, value: Text): List<Text> { return runner.environment(base, key, value) }
+public function populate(plan: runner.Plan, source: Text, groups: List<Text>, tier: Text, roots: List<Text>, clang: Text, cxx: Text, dryRun: Boolean) {
+    let base = toolchain.cleanEnvironment()
+    let compiler = toolchain.resolve(clang, base, source, plan.scratch)
+    let cxxCompiler = toolchain.resolve(cxx, base, source, plan.scratch)
+    let linker = toolchain.resolve("ld.lld", base, source, plan.scratch)
+    let make = toolchain.resolve("make", base, source, plan.scratch)
+    let python = toolchain.resolve("python3", base, source, plan.scratch)
+    test.check(files.makeDirectory(source + "/build") == 0, "cannot create build directory")
+    test.check(files.makeDirectory(source + "/build/tooling") == 0, "cannot create tooling directory")
+    let cache = source + "/build/tooling/cache"
+    test.check(files.makeDirectory(cache) == 0, "cannot create shared tooling cache")
+    test.check(files.makeDirectory(cache + "/inputs") == 0, "cannot create immutable source input cache")
+    let wrapper = plan.scratch + "/main-bin"
+    if !dryRun { toolchain.wrap(source, wrapper, compiler, cxxCompiler, linker, cache, plan.scratch) }
+    let environment = env(base, "PATH", wrapper + ":" + test.setting("PATH", "/usr/bin:/bin"))
+    for key in ["CC", "LLVM_CC", "CLANG", "MINYAR_TEST_CLANG"] { environment = env(environment, key, "clang") }
+    environment = env(environment, "CXX", "clang++")
+    environment = env(environment, "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
+    environment = env(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    environment = env(environment, "COMPILER_LTO_FLAGS", "-flto -fuse-ld=lld")
+    environment = env(environment, "MINYAR_AFL_SECONDS", "60")
+    environment = env(environment, "MINYAR_TEST_INPUT_ROOT", cache + "/inputs")
+    let makeArguments = [make, "-j1", "LIMITED=", "SANITIZER_LIMITED=", "CC=clang", "LLVM_CC=clang", "COMPILER_LTO_FLAGS=-flto -fuse-ld=lld"]
+    let main = runner.addVariant(plan, "", source, environment, makeArguments)
+    if selected(groups, "correctness") {
+        if roots.length > 0 { targets(plan, main, roots, "all") }
+        else {
+            targets(plan, main, catalogue.correctness(), tier)
+            for target in ["check-c-layout-records", "check-c-layout-records-sanitize", "check-clang-cache", "check-thread-scaling-protocol", "check-thread-language-tsan", "check-list-basics", "check-list-basics-sanitize", "check-map-basics", "check-map-basics-sanitize"] {
+                if runner.findRule(plan.variants[main].rules, target) >= 0 && tierMatches(target, tier) { runner.addCheck(plan, main, target) }
+            }
+            if tier != "sanitize" {
+                runner.addCheck(plan, main, "check-native-graphics")
+                for prefix in ["compiler", "module-compiler"] {
+                    runner.addCommand(plan, main, prefix + "-bootstrap-behavior", [source + "/build/tooling/tests/compiler-behavior", "--profile", "errors", "--ir", "build/" + prefix + "-stage3.ll"], ["build/tooling/tests/compiler-behavior", "build/testing/cycle-runtime.o", "build/" + prefix + "-stage3.ll"])
+                }
+                runner.addCommand(plan, main, "runtime-unit", ["./build/runtime-unit"], ["build/runtime-unit"])
+                runner.addCommand(plan, main, "bootstrap-portability-gcc", ["/usr/bin/env", "MINYAR_TEST_BOOTSTRAP_CC=gcc", python, "tests/bootstrap-portability.py"], [])
+                runner.addCommand(plan, main, "critical-path-correctness", [python, "experiments/memory/critical-path-study.py", "--compiler", source + "/build/minyarc", "--cc", "clang", "--cxx", "clang++", "--output", plan.scratch + "/critical-path.json"], ["build/minyarc"])
+                runner.addCommand(plan, main, "scalar-path-correctness", [python, "experiments/memory/checked-scalars-study.py", "--compiler", source + "/build/minyarc", "--cc", "clang", "--cxx", "clang++", "--output", plan.scratch + "/scalar-path.json"], ["build/minyarc"])
+            }
+            if tier != "full" {
+                runner.addCommand(plan, main, "regressions-sanitize", ["/usr/bin/env", "MINYAR_TEST_COMPILER=" + source + "/build/minyarc-sanitize", "MINYAR_TEST_RUNTIME=" + source + "/build/minyar-runtime-sanitize.o", "MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined", python, "tests/regressions.py"], ["build/minyarc-sanitize", "build/minyar-runtime-sanitize.o"])
+            }
+        }
+    }
+    if selected(groups, "quic") { targets(plan, main, catalogue.quic(), "all") }
+    if selected(groups, "formats") { targets(plan, main, ["check-formats", "check-formats-sanitize"], "all") }
+    if selected(groups, "redis") { targets(plan, main, ["check-peer-live-redis", "check-peer-live-redis-sanitize"], "all") }
+    if selected(groups, "coverage") { runner.addCheck(plan, main, "check-coverage") }
+    if selected(groups, "afl") { runner.addCheck(plan, main, "check-fuzz-coverage") }
+    let profiles = -1
+    let unit = -1
+    if (selected(groups, "correctness") && roots.length == 0 && tier != "sanitize") || selected(groups, "leaks") {
+        profiles = runner.addCommand(plan, main, "memory-profiles-focused", [python, "tests/memory-profile-regressions.py", "--runtime-source", source + "/runtime/minyar_runtime.c", "--suite", "focused", "--profiles", "system", "fixed", "lazy", "--clang", "clang", "--output-dir", plan.scratch], [])
+    }
+    if (selected(groups, "correctness") && roots.length == 0 && tier != "full") || selected(groups, "leaks") {
+        unit = runner.addCommand(plan, main, "runtime-unit-sanitize", ["./build/runtime-unit-sanitize"], ["build/runtime-unit-sanitize"])
+    }
+    if selected(groups, "leaks") {
+        let replay = runner.addCommand(plan, main, "leaks", [source + "/build/tooling/scripts/check-linux-leaks", source, plan.scratch], ["build/tooling/scripts/check-linux-leaks"])
+        plan.checks[replay].children.add(profiles)
+        plan.checks[replay].children.add(unit)
+    }
+    if selected(groups, "formatting") { runner.addCommand(plan, main, "formatting", [source + "/build/tooling/scripts/format"], ["build/tooling/scripts/format"]) }
+    for name in ["llvm22", "llvm23", "clang18"] {
+        let requested = selected(groups, name)
+        if name == "clang18" { requested = selected(groups, "peer-testing") || selected(groups, "peer-semantics") }
+        if !requested { continue }
+        let version = "18"
+        if name == "llvm22" { version = "22" }
+        if name == "llvm23" { version = "23" }
+        let bin = "/usr/lib/llvm-" + version + "/bin"
+        let variantEnvironment = env(base, "PATH", bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
+        let variantCompiler = toolchain.resolve(bin + "/clang", variantEnvironment, source, plan.scratch)
+        let variantCxx = toolchain.resolve(bin + "/clang++", variantEnvironment, source, plan.scratch)
+        let variantLinker = toolchain.resolve(bin + "/ld.lld", variantEnvironment, source, plan.scratch)
+        let directory = plan.scratch + "/source-" + name
+        if dryRun { directory = source }
+        else { toolchain.snapshot(source, directory, plan.scratch) }
+        let variantBin = plan.scratch + "/bin-" + name
+        if !dryRun { toolchain.wrap(source, variantBin, variantCompiler, variantCxx, variantLinker, cache, plan.scratch) }
+        variantEnvironment = env(variantEnvironment, "PATH", variantBin + ":" + bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
+        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_CLANG", "clang")
+        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_LTO_FLAGS", "-flto -fuse-ld=lld")
+        variantEnvironment = env(variantEnvironment, "MINYAR_LLVM_BIN", bin)
+        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_INPUT_ROOT", cache + "/inputs")
+        let variant = runner.addVariant(plan, name, directory, variantEnvironment, makeArguments)
+        if name == "clang18" {
+            if selected(groups, "peer-testing") { targets(plan, variant, catalogue.peerTesting(), "all") }
+            if selected(groups, "peer-semantics") { targets(plan, variant, catalogue.peerGates(), "all") }
+        } else {
+            targets(plan, variant, catalogue.llvm(), "all")
+            targets(plan, variant, ["check-module-driver-options", "check-native-graphics"], "all")
+            runner.addCommand(plan, variant, "ir-verify", ["/bin/sh", "-c", "llvm-as build/compiler-stage3.ll -o /dev/null && opt -passes=verify -disable-output build/compiler-stage3.ll"], ["build/compiler-stage3.ll"])
+        }
+        for goal in catalogue.launcherArtifacts() {
+            if runner.findRule(plan.variants[variant].rules, goal) >= 0 { runner.addGoal(plan, variant, goal, 300) }
+        }
+    }
+    let mainBuild = roots.length == 0 && (selected(groups, "correctness") || selected(groups, "quic") || selected(groups, "formats") || selected(groups, "redis") || selected(groups, "leaks") || selected(groups, "coverage") || selected(groups, "afl"))
+    if mainBuild {
+        for goal in catalogue.launcherArtifacts() {
+            if runner.findRule(plan.variants[main].rules, goal) >= 0 { runner.addGoal(plan, main, goal, 300) }
+        }
+    }
+}

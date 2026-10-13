@@ -1,0 +1,55 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+if argumentCount() == 3 && argument(0) == "--publish" {
+    print(test.stableInput(readTextFile(argument(2)), argument(2), argument(1)))
+    exit(0)
+}
+let work = test.scratch()
+let root = work + "/inputs"
+test.check(files.makeDirectory(root) == 0, "private shared input directory")
+let original = "print(\"Aa\")\n"
+let collision = "print(\"BB\")\n"
+let first = work + "/first.min"
+let second = work + "/second.min"
+writeTextFile(first, original)
+writeTextFile(second, original)
+test.check(test.stableInput(original, first, "") == first, "shared paths are opt-in")
+let one = test.stableInput(original, first, root)
+let two = test.stableInput(original, second, root)
+test.check(one == two && readTextFile(one) == original, "identical source bytes share one immutable path")
+test.check(readTextFile(first) == original && readTextFile(second) == original, "private source files are retained")
+writeTextFile(second, collision)
+let changed = test.stableInput(collision, second, root)
+test.check(changed != one && readTextFile(changed) == collision && readTextFile(one) == original, "hash collisions preserve both exact sources")
+let mutant = "print(\"AB\")\n"
+writeTextFile(second, mutant)
+let mutated = test.stableInput(mutant, second, root)
+test.check(mutated != one && mutated != changed && readTextFile(mutated) == mutant, "mutants cannot reuse a baseline source")
+let imported = "use \"./sibling.min\"\nprint(42)\n"
+writeTextFile(second, imported)
+test.check(test.stableInput(imported, second, root) == second, "relative imports retain their private source directory")
+for whitespace in ["\t", "\n"] {
+    let multilineImport = "use" + whitespace + "\"./sibling.min\"\nprint(42)\n"
+    writeTextFile(second, multilineImport)
+    test.check(test.stableInput(multilineImport, second, root) == second, "import whitespace cannot move a source out of its private directory")
+}
+let crlf = "print(\"Aa\")\r\n"
+writeTextFile(second, crlf)
+let carriage = test.stableInput(crlf, second, root)
+test.check(carriage != one && readTextFile(carriage) == crlf, "source whitespace remains byte-exact")
+let concurrent = work + "/concurrent"
+test.check(files.makeDirectory(concurrent) == 0, "private concurrent cache")
+writeTextFile(first, original)
+writeTextFile(second, collision)
+let left = test.start([argument(0), "--publish", concurrent, first], system.environment(), "", work + "/left", 10)
+let right = test.start([argument(0), "--publish", concurrent, second], system.environment(), "", work + "/right", 10)
+let leftResult = test.finish(left, work + "/left")
+let rightResult = test.finish(right, work + "/right")
+test.require(leftResult, "concurrent first publication")
+test.require(rightResult, "concurrent colliding publication")
+let leftPath = test.lines(leftResult.output)[0]
+let rightPath = test.lines(rightResult.output)[0]
+test.check(leftPath != rightPath && readTextFile(leftPath) == original && readTextFile(rightPath) == collision, "concurrent collision publication cannot replace another source")
+test.removeTree(work)
+print("Minyar immutable test input controls: passed")

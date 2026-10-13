@@ -192,11 +192,25 @@ public function compiler(): Compiler {
         runtime: setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o");
         clang: setting("MINYAR_TEST_CLANG", "clang"); flags: flags; compileTimeout: compileTimeout; linkTimeout: linkTimeout; runTimeout: runTimeout }
 }
+public function stableInput(source: Text, input: Text, root: Text): Text {
+    if root != "" && !contains(source, "use") {
+        let hash = 0
+        for byte in Bytes(source) { hash = (hash * 31 + byte) % 1000000007 }
+        let directory = root + "/" + Text(Bytes(source).length) + "-" + Text(hash)
+        check(files.makeDirectory(directory) == 0, "cannot create stable source input directory")
+        let publish = "set -e; source=$1; directory=$2; index=0; while [ -e \"$directory/$index.min\" ]; do if cmp -s -- \"$source\" \"$directory/$index.min\"; then printf '%s\\n' \"$directory/$index.min\"; exit 0; fi; index=$((index+1)); done; cp -- \"$source\" \"$directory/$index.min.tmp\"; mv -- \"$directory/$index.min.tmp\" \"$directory/$index.min\"; printf '%s\\n' \"$directory/$index.min\""
+        let published = run(["flock", "-F", directory + "/lock", "/bin/sh", "-c", publish, "minyar", input, directory], system.environment(), "", input + ".publish", 10)
+        require(published, "immutable shared source input")
+        return lines(published.output)[0]
+    }
+    return input
+}
 public function compile(test: Compiler, source: Text): Result {
     test.serial += 1
     let path = test.directory + "/case" + Text(test.serial)
     writeTextFile(path + ".min", source)
-    let result = run([test.executable, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", test.compileTimeout)
+    let input = stableInput(source, path + ".min", system.getenv("MINYAR_TEST_INPUT_ROOT"))
+    let result = run([test.executable, input, path + ".ll"], system.environment(), "", path + ".compile", test.compileTimeout)
     if result.status == 0 && addressEnabled(test.flags) {
         writeTextFile(path + ".ll", instrument(readTextFile(path + ".ll")))
     }

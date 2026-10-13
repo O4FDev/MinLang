@@ -1,0 +1,34 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+let work = test.scratch()
+test.check(files.makeDirectory(work + "/build") == 0, "private build directory")
+writeTextFile(work + "/Makefile", ".PHONY: check-pass check-fail FORCE\ncheck-pass: build/input\n\t@test -f build/input\ncheck-fail:\n\t@echo exact-failure >&2; exit 9\nbuild/input:\n\t@echo built > $@\nFORCE:\n")
+writeTextFile(work + "/build/mutation-score.json", "{\"score_percent\":100,\"minimum_score_percent\":85}\n")
+for target in ["check-pass", "check-fail"] {
+    let output = work + "/" + target
+    let result = test.run([argument(0), "--source", work, "--only", target, "--output-dir", output, "--jobs", "2", "--retries", "0"], system.environment(), "", work + "/run-" + target, 30)
+    let expected = 0
+    if target == "check-fail" { expected = 1 }
+    test.check(result.status == expected, "native runner preserves success/failure status\n" + result.output + result.errorOutput)
+    let found = false
+    for directory in files.list(output) {
+        if !test.contains(directory, "minyar-tests-linux-") { continue }
+        found = true
+        let retained = output + "/" + directory
+        let report = json.parse(readTextFile(retained + "/results.json"))
+        let status = "passed"
+        if expected != 0 { status = "failed" }
+        test.check(json.string(report, "status") == status, "retained status matches process")
+        test.check(files.list(retained + "/logs").length > 0, "retained process output and CPU logs")
+        test.check(readTextFile(retained + "/source/build/mutation-score.json") == readTextFile(work + "/build/mutation-score.json"), "existing mutation artifact preserved byte for byte")
+        for row in json.member(report, "checks").items {
+            test.check(json.string(row, "label") == target, "complete selected check result")
+            test.check(json.string(row, "cpu_user_system_rss_kib") != "", "CPU and peak RSS retained")
+        }
+    }
+    test.check(found, "retained run exists after completion")
+}
+test.removeTree(work)
+print("Minyar Linux runner retained controls: passed")

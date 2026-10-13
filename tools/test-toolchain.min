@@ -1,0 +1,52 @@
+use "./testing.min" as test
+use "./check-runner.min" as runner
+use "system" as system
+use "files" as files
+public function cleanEnvironment(): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() {
+        let discard = runner.begins(entry, "MINYAR_")
+        for key in ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "TMPDIR"] {
+            if runner.begins(entry, key + "=") { discard = true }
+        }
+        if !discard { result.add(entry) }
+    }
+    result = runner.environment(result, "DEBUGINFOD_URLS", "")
+    result = runner.environment(result, "MINYAR_TEST_JOBS", "1")
+    return runner.environment(result, "MINYAR_TEST_SHARED_HOST", "1")
+}
+public function resolve(name: Text, environment: List<Text>, cwd: Text, work: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", name], environment, cwd, work + "/resolve", 10)
+    test.require(result, "required tool " + name)
+    let paths = test.words(result.output)
+    test.check(paths.length == 1 && runner.begins(paths[0], "/"), "tool did not resolve to an absolute path: " + name)
+    return paths[0]
+}
+public function absolute(path: Text, work: Text): Text {
+    let result = test.run(["/bin/pwd", "-P"], system.environment(), path, work + "/pwd", 10)
+    test.require(result, "source directory")
+    return test.lines(result.output)[0]
+}
+function quote(value: Text): Text {
+    return "'" + test.replace(value, "'", "'\"'\"'") + "'"
+}
+public function wrap(source: Text, directory: Text, compiler: Text, cxx: Text, linker: Text, cache: Text, work: Text): Text {
+    test.check(files.makeDirectory(directory) == 0, "cannot create compiler wrapper directory")
+    let driver = source + "/build/tooling/tools/test-clang"
+    let cacheTool = source + "/build/tooling/tools/clang-cache"
+    for name in ["clang", "clang++"] {
+        let real = compiler
+        if name == "clang++" { real = cxx }
+        let script = "#!/bin/sh\nexec " + quote(driver) + " " + quote(cacheTool) + " " + quote(cache) + " " + quote(real) + " " + quote(linker) + " \"$@\"\n"
+        writeTextFile(directory + "/" + name, script)
+        test.require(test.run(["/bin/chmod", "+x", directory + "/" + name], system.environment(), "", work + "/chmod", 10), "compiler wrapper permissions")
+    }
+    test.require(test.run(["/bin/ln", "-sf", "--", linker, directory + "/ld.lld"], system.environment(), "", work + "/linker", 10), "selected linker identity")
+    return directory
+}
+public function snapshot(source: Text, destination: Text, work: Text): Text {
+    test.check(files.makeDirectory(destination) == 0, "cannot create source snapshot")
+    let command = ["/bin/sh", "-c", "set -e; source=$1; destination=$2; archive=$3; tar -C \"$source\" --exclude=./.git --exclude=./build --exclude=__pycache__ -cf \"$archive\" .; tar -C \"$destination\" -xf \"$archive\"", "minyar", source, destination, work + "/source.tar"]
+    test.require(test.run(command, system.environment(), "", work + "/snapshot", 60), "isolated source snapshot")
+    return destination
+}

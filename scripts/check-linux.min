@@ -1,0 +1,90 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "../tools/test-toolchain.min" as toolchain
+use "../tools/linux-matrix.min" as matrixPlan
+use "system" as system
+use "text" as text
+use "errors" as errors
+use "files" as files
+use "json" as json
+function number(value: Text): Integer {
+    let parsed = text.parseInteger(value)
+    test.check(errors.integerOk(parsed), "expected an integer")
+    return errors.integerValue(parsed)
+}
+let source = "."
+let jobs = 8
+let timeout = 1800
+let retries = 1
+let tier = "full"
+let roots: List<Text> = []
+let groups: List<Text> = []
+let matrix = false
+let dryRun = false
+let clang = "clang"
+let cxx = "clang++"
+let output = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--matrix" { matrix = true; index += 1; continue }
+    if option == "--dry-run" { dryRun = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "option requires a value: " + option)
+    let value = argument(index + 1)
+    if option == "--source" { source = value }
+    else if option == "--jobs" { jobs = number(value) }
+    else if option == "--timeout" { timeout = number(value) }
+    else if option == "--retries" { retries = number(value) }
+    else if option == "--tier" { tier = value }
+    else if option == "--only" { roots.add(value) }
+    else if option == "--group" { groups.add(value) }
+    else if option == "--clang" { clang = value }
+    else if option == "--cxx" { cxx = value }
+    else if option == "--output-dir" { output = value }
+    else { fail("unknown option: " + option) }
+    index += 2
+}
+test.check(tier == "full" || tier == "sanitize" || tier == "all", "unknown tier")
+let knownGroups = ["correctness", "formatting", "llvm22", "llvm23", "peer-testing", "peer-semantics", "quic", "formats", "redis", "leaks", "coverage", "afl"]
+if matrix {
+    test.check(groups.length == 0 && roots.length == 0, "matrix already selects every group")
+    groups = knownGroups
+    tier = "all"
+}
+if groups.length == 0 { groups.add("correctness") }
+for group in groups { test.check(matrixPlan.selected(knownGroups, group), "unknown matrix group: " + group) }
+test.check(roots.length == 0 || (groups.length == 1 && groups[0] == "correctness"), "only selects correctness targets")
+let started = system.monotonicNanoseconds()
+let plan = runner.plan(jobs, timeout, retries)
+source = toolchain.absolute(source, plan.scratch)
+if output != "" && !dryRun {
+    test.require(test.run(["mkdir", "-p", "--", output], system.environment(), source, plan.scratch + "/output-directory", 10), "retained run directory")
+    output = toolchain.absolute(output, plan.scratch)
+    let retained = output + "/minyar-tests-linux-" + Text(system.monotonicNanoseconds())
+    test.require(test.run(["mv", "--", plan.scratch, retained], system.environment(), source, output + "/move-run", 10), "retained process scratch")
+    plan.scratch = retained
+}
+matrixPlan.populate(plan, source, groups, tier, roots, clang, cxx, dryRun)
+print("Minyar Linux plan: checks=" + Text(plan.checks.length) + " shared_builds=" + Text(plan.goals.length) + " jobs=" + Text(jobs))
+if dryRun { test.removeTree(plan.scratch); exit(0) }
+let passed = runner.run(plan)
+if output != "" {
+    let rows = ""
+    let separator = ""
+    for check in plan.checks {
+        let status = "failed"
+        if check.state == 2 { status = "passed" }
+        let cpu = ""
+        if check.log != "" { cpu = Text(files.readFile(check.log + ".cpu")) }
+        rows += separator + "{\"label\":" + json.quote(check.label) + ",\"status\":" + json.quote(status) + ",\"log\":" + json.quote(check.log) + ",\"cpu_user_system_rss_kib\":" + json.quote(cpu) + "}"
+        separator = ","
+    }
+    let status = "failed"
+    if passed { status = "passed" }
+    writeTextFile(plan.scratch + "/results.json", "{\"status\":" + json.quote(status) + ",\"checks\":[" + rows + "]}\n")
+    let copy = "set -e; source=$1; destination=$2/source/build; mkdir -p \"$destination\"; for path in \"$source\"/build/quic-official-adapter.* \"$source\"/build/quic-rfc-native.* \"$source\"/build/quic-rfc-sanitize.* \"$source\"/build/mutation-score.json \"$source\"/build/coverage \"$source\"/build/afl-findings \"$source\"/build/peer-results; do [ -e \"$path\" ] || continue; cp -a -- \"$path\" \"$destination/\"; done"
+    test.require(test.run(["/bin/sh", "-c", copy, "minyar", source, plan.scratch], system.environment(), source, plan.scratch + "/artifacts", 120), "existing CI artifacts")
+    print("Linux run: " + plan.scratch)
+} else { test.removeTree(plan.scratch) }
+print("full suite wall_ms=" + Text((system.monotonicNanoseconds() - started) / 1000000))
+if !passed { exit(1) }

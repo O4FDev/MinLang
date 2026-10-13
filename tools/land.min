@@ -1,0 +1,58 @@
+use "./testing.min" as test
+use "./check-runner.min" as runner
+use "system" as system
+use "text" as text
+use "errors" as errors
+function command(args: List<Text>, work: Text, seconds: Integer): test.Result {
+    return test.run(args, system.environment(), "", work + "/command", seconds)
+}
+function require(args: List<Text>, work: Text, seconds: Integer): test.Result {
+    let result = command(args, work, seconds)
+    let shown = ""
+    for arg in args { shown += arg + " " }
+    test.require(result, shown)
+    return result
+}
+let remote = "origin"
+let branch = "v2"
+let jobs = 8
+let checks: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "land option requires a value")
+    let option = argument(index)
+    let value = argument(index + 1)
+    if option == "--remote" { remote = value }
+    else if option == "--branch" { branch = value }
+    else if option == "--only" { checks.add(value) }
+    else if option == "--jobs" {
+        let parsed = text.parseInteger(value)
+        test.check(errors.integerOk(parsed), "invalid land jobs")
+        jobs = errors.integerValue(parsed)
+    } else { fail("unknown land option: " + option) }
+    index += 2
+}
+test.check(jobs >= 1 && jobs <= 8, "land jobs must be 1 through 8")
+test.check(!runner.begins(remote, "-") && !runner.begins(branch, "-"), "invalid Git remote or branch")
+let work = test.scratch()
+let status = require(["git", "status", "--porcelain", "--untracked-files=normal"], work, 30)
+test.check(status.output == "", "land requires a clean worktree\n" + status.output)
+let landed = false
+for attempt in 0..3 {
+    require(["git", "fetch", remote, branch], work, 120)
+    require(["git", "rebase", "FETCH_HEAD"], work, 120)
+    require(["make", "-j" + Text(jobs), "build/tooling/scripts/check-linux"], work, 600)
+    let arguments = ["./build/tooling/scripts/check-linux", "--source", ".", "--jobs", Text(jobs)]
+    if checks.length == 0 { arguments.add("--matrix") }
+    else { for target in checks { arguments.add("--only"); arguments.add(target) } }
+    let checked = command(arguments, work, 7200)
+    print(checked.output + checked.errorOutput)
+    test.require(checked, "land tests")
+    let pushed = command(["git", "push", remote, "HEAD:refs/heads/" + branch], work, 120)
+    if pushed.status == 0 { landed = true; break }
+    print(pushed.output + pushed.errorOutput)
+    test.check(test.contains(pushed.errorOutput, "non-fast-forward") || test.contains(pushed.errorOutput, "fetch first"), "normal push failed")
+}
+test.removeTree(work)
+test.check(landed, "upstream kept moving; nothing force-pushed")
+print("landed on " + branch)

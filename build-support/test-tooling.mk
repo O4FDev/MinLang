@@ -18,6 +18,22 @@ build/testing/cycle-runtime.o: build/testing/cycle-runtime.c $(wildcard runtime/
 	$(LLVM_CC) -O2 -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
 
+.PHONY: check-minyar-runner
+check-minyar-runner: build/tooling/tests/runner build/tooling/tests/linux-runner build/tooling/tests/testing-inputs build/tooling/tests/test-clang build/tooling/tests/clang-cache build/tooling/scripts/check-linux build/tooling/tools/test-clang build/tooling/tools/clang-cache
+	$(LIMITED) ./build/tooling/tests/runner
+	$(LIMITED) ./build/tooling/tests/linux-runner "$(CURDIR)/build/tooling/scripts/check-linux"
+	$(LIMITED) ./build/tooling/tests/testing-inputs "$(CURDIR)/build/tooling/tests/testing-inputs"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/clang-cache "$(LLVM_CC)" "$(CURDIR)/build/tooling/tools/clang-cache"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/test-clang "$(CURDIR)/build/tooling/tools/test-clang" "$(CURDIR)/build/tooling/tools/clang-cache" "$$(command -v $(LLVM_CC))" "$$(command -v ld.lld)"
+
+check: check-minyar-runner
+
+.PHONY: check-minyar-land
+check-minyar-land: build/tooling/tests/land build/tooling/tools/land
+	$(LIMITED) ./build/tooling/tests/land "$(CURDIR)/build/tooling/tools/land"
+
+check: check-minyar-land
+
 .PHONY: check-portable-process
 check-portable-process: build/tooling/tests/portable-process
 	$(LIMITED) ./build/tooling/tests/portable-process

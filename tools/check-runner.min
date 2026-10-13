@@ -1,0 +1,341 @@
+use "./testing.min" as test
+use "system" as system
+use "files" as files
+
+public record Rule { name: Text; prerequisites: List<Text>; phony: Boolean; recipe: Boolean; target: Boolean }
+public function begins(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function findRule(rules: List<Rule>, name: Text): Integer {
+    for index in 0..rules.length { if rules[index].name == name { return index } }
+    return -1
+}
+public function database(source: Text): List<Rule> {
+    let rules: List<Rule> = []
+    let phony: List<Text> = []
+    let active = false
+    let target = true
+    let current = -1
+    for line in test.lines(source) {
+        if line == "# Files" { active = true; continue }
+        if begins(line, "# files hash-table stats") { break }
+        if !active { continue }
+        if line == "" { target = true; current = -1; continue }
+        if line == "# Not a target:" { target = false; continue }
+        if begins(line, "\t") {
+            if current >= 0 { rules[current].recipe = true }
+            continue
+        }
+        if begins(line, "#") {
+            if current >= 0 && begins(line, "#  Phony target") { rules[current].phony = true }
+            continue
+        }
+        let raw = Bytes(line)
+        let colon = -1
+        for index in 0..raw.length { if raw[index] == 58 { colon = index; break } }
+        if colon <= 0 || test.contains(line, "=") { continue }
+        let name = Text(raw.slice(0, colon))
+        if test.words(name).length != 1 { continue }
+        let start = colon + 1
+        if start < raw.length && raw[start] == 58 { start += 1 }
+        let prerequisites: List<Text> = []
+        for item in test.words(Text(raw.slice(start, raw.length))) { if item != "|" { prerequisites.add(item) } }
+        if name == ".PHONY" { for item in prerequisites { phony.add(item) }; continue }
+        current = findRule(rules, name)
+        if current < 0 {
+            rules.add(Rule { name: name; prerequisites: prerequisites; phony: false; recipe: false; target: target })
+            current = rules.length - 1
+        } else {
+            for item in prerequisites { rules[current].prerequisites.add(item) }
+        }
+    }
+    test.check(active, "make printed no file database")
+    for name in phony {
+        let index = findRule(rules, name)
+        if index >= 0 { rules[index].phony = true }
+    }
+    return rules
+}
+public record Variant { name: Text; cwd: Text; environment: List<Text>; make: List<Text>; rules: List<Rule>; builder: Boolean }
+public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer }
+public record Check { label: Text; target: Text; arguments: List<Text>; variant: Integer; children: List<Integer>; goals: List<Integer>;
+    state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean }
+public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean }
+public function plan(jobs: Integer, timeout: Integer, retries: Integer): Plan {
+    test.check(jobs >= 1 && jobs <= 8 && timeout > 0 && retries >= 0, "invalid runner limits")
+    let scratch = test.scratch()
+    test.check(files.makeDirectory(scratch + "/logs") == 0, "cannot create process log directory")
+    return Plan { variants: []; checks: []; goals: []; scratch: scratch; jobs: jobs; timeout: timeout; retries: retries; interrupted: false }
+}
+public function environment(base: List<Text>, key: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in base { if !begins(entry, key + "=") { result.add(entry) } }
+    result.add(key + "=" + value)
+    return result
+}
+public function addVariant(plan: Plan, name: Text, cwd: Text, env: List<Text>, make: List<Text>): Integer {
+    test.check(files.makeDirectory(cwd + "/build") == 0, "cannot create variant build directory")
+    let log = plan.scratch + "/database-" + Text(plan.variants.length)
+    let command: List<Text> = []
+    for item in make { command.add(item) }
+    for item in ["-pq", "FORCE"] { command.add(item) }
+    let result = test.run(command, env, cwd, log, plan.timeout)
+    test.check(result.status <= 1, "make database failed\n" + result.errorOutput)
+    plan.variants.add(Variant { name: name; cwd: cwd; environment: env; make: make; rules: database(result.output); builder: false })
+    return plan.variants.length - 1
+}
+function resource(target: Text, variant: Integer): Text {
+    if target == "check-quic-rfc" || target == "check-quic-rfc-sanitize" { return "udp-port-44300" }
+    if target == "check-modules" || target == "check-sanitize" || target == "check-sanitize-modules" { return Text(variant) + ":build/module-tests" }
+    if begins(target, "check-peer-edge") || begins(target, "check-peer-live-redis") { return "reused-ports" }
+    return ""
+}
+function exclusive(target: Text): Boolean {
+    return target == "check-net-udp-offload" || target == "check-net-udp-offload-sanitize" || target == "check-peer-edge-cids" || target == "check-peer-edge-cids-sanitize"
+}
+function weight(target: Text): Integer {
+    if test.contains(target, "peer-") { return 250 }
+    if test.contains(target, "mutation") { return 240 }
+    if test.contains(target, "ownership") { return 220 }
+    if test.contains(target, "quic") || test.contains(target, "maps") { return 200 }
+    if test.contains(target, "sanitize") { return 100 }
+    return 10
+}
+public function addGoal(plan: Plan, variant: Integer, name: Text, weight: Integer): Integer {
+    for index in 0..plan.goals.length {
+        if plan.goals[index].variant == variant && plan.goals[index].name == name {
+            plan.goals[index].weight += weight
+            return index
+        }
+    }
+    plan.goals.add(Goal { name: name; variant: variant; state: 0; weight: weight; handle: 0; log: ""; started: 0 })
+    return plan.goals.length - 1
+}
+public function addCheck(plan: Plan, variant: Integer, target: Text): Integer {
+    let where = plan.variants[variant]
+    let label = target
+    if where.name != "" { label = where.name + ":" + target }
+    for index in 0..plan.checks.length { if plan.checks[index].label == label { return index } }
+    let ruleIndex = findRule(where.rules, target)
+    test.check(ruleIndex >= 0, "missing check target: " + target)
+    let rule = where.rules[ruleIndex]
+    test.check(rule.phony, "not a phony check target: " + target)
+    let index = plan.checks.length
+    plan.checks.add(Check { label: label; target: target; arguments: []; variant: variant; children: []; goals: []; state: 0;
+        resource: resource(target, variant); exclusive: exclusive(target); weight: weight(target);
+        handle: 0; log: ""; started: 0; retry: 0; builder: false })
+    for prerequisite in rule.prerequisites {
+        let child = findRule(where.rules, prerequisite)
+        if child >= 0 {
+            if where.rules[child].phony {
+                plan.checks[index].children.add(addCheck(plan, variant, prerequisite))
+            } else {
+                if where.rules[child].target { plan.checks[index].goals.add(addGoal(plan, variant, prerequisite, plan.checks[index].weight)) }
+            }
+        }
+    }
+    return index
+}
+public function addCommand(plan: Plan, variant: Integer, label: Text, arguments: List<Text>, goals: List<Text>): Integer {
+    let prefix = plan.variants[variant].name
+    if prefix != "" { label = prefix + ":" + label }
+    for index in 0..plan.checks.length { if plan.checks[index].label == label { return index } }
+    let dependencies: List<Integer> = []
+    for goal in goals { dependencies.add(addGoal(plan, variant, goal, weight(label))) }
+    plan.checks.add(Check { label: label; target: ""; arguments: arguments; variant: variant; children: []; goals: dependencies; state: 0;
+        resource: resource(label, variant); exclusive: exclusive(label); weight: weight(label);
+        handle: 0; log: ""; started: 0; retry: 0; builder: false })
+    return plan.checks.length - 1
+}
+function ready(plan: Plan, check: Check): Boolean {
+    for goal in plan.goals {
+        if goal.variant == check.variant && (goal.state == 0 || goal.state == 1) { return false }
+    }
+    for child in check.children { if plan.checks[child].state != 2 { return false } }
+    for goal in check.goals { if plan.goals[goal].state == 0 || plan.goals[goal].state == 1 { return false } }
+    return true
+}
+function failedGoal(plan: Plan, check: Check): Boolean {
+    for goal in check.goals { if plan.goals[goal].state == 3 { return true } }
+    return false
+}
+function resourceAvailable(plan: Plan, check: Check): Boolean {
+    if check.resource == "" { return true }
+    let count = 0
+    for running in plan.checks { if running.state == 1 && running.resource == check.resource { count += 1 } }
+    let limit = 1
+    if check.resource == "reused-ports" { limit = 3 }
+    return count < limit
+}
+function command(plan: Plan, check: Check): List<Text> {
+    if check.arguments.length > 0 { return check.arguments }
+    let args: List<Text> = []
+    for item in plan.variants[check.variant].make { args.add(item) }
+    for child in check.children { args.add("-o"); args.add(plan.checks[child].target) }
+    args.add(check.target)
+    return args
+}
+function monitored(plan: Plan, variant: Integer, args: List<Text>, log: Text, tmp: Text, label: Text): Integer {
+    test.check(files.makeDirectory(tmp) == 0, "cannot create private process scratch")
+    let env = environment(plan.variants[variant].environment, "TMPDIR", tmp)
+    env = environment(env, "MINYAR_CHECK_LABEL", label)
+    return test.monitoredStart(args, env, plan.variants[variant].cwd, log, plan.timeout)
+}
+function showResult(label: Text, log: Text, status: system.ProcessStatus, started: Integer): Boolean {
+    let passed = status.error == 0 && status.state == system.EXITED && status.exitCode == 0
+    let elapsed = (system.monotonicNanoseconds() - started) / 1000000
+    let outcome = "FAILED"
+    if passed { outcome = "passed" }
+    let usage = Text(files.readFile(log + ".cpu"))
+    let timedOut = status.exitCode == 124 || status.exitCode == 137
+    files.writeStandardOutput(label + ": " + outcome + " wall_ms=" + Text(elapsed) + " status=" + Text(status.exitCode) + " timeout=" + Text(timedOut) + " cpu_user/system/rss_kib=" + usage + "\n")
+    if !passed { files.writeStandardOutput(Text(files.readFile(log)) + Text(files.readFile(log + ".err"))) }
+    return passed
+}
+function pause() {
+    let handle = system.spawn("/usr/bin/sleep", ["sleep", "0.05"], system.environment(), "")
+    test.check(handle > 0 && system.wait(handle).exitCode == 0, "scheduler sleep failed")
+}
+function execute(plan: Plan): Boolean {
+    let signalSocket = system.shutdownSignalSocket()
+    test.check(signalSocket >= 0, "cannot install runner shutdown handling")
+    let remaining = 0
+    for check in plan.checks { if check.state < 2 { remaining += 1 } }
+    for goal in plan.goals { if goal.state < 2 { remaining += 1 } }
+    let attempt = 0
+    let epoch = Text(system.monotonicNanoseconds())
+    let interrupted = false
+    while remaining > 0 {
+        if system.drainShutdownSignals() != 0 { interrupted = true; break }
+        let active = 0
+        let quiet = false
+        let ordinary = false
+        for goal in plan.goals {
+            if goal.state == 1 {
+                let status = system.poll(goal.handle)
+                if status.state != system.PENDING {
+                    let ok = showResult("prerequisite " + goal.name, goal.log, status, goal.started)
+                    goal.state = 3
+                    if ok { goal.state = 2 }
+                    plan.variants[goal.variant].builder = false
+                    remaining -= 1
+                } else { active += 1; ordinary = true }
+            }
+        }
+        for check in plan.checks {
+            if check.state == 1 {
+                let status = system.poll(check.handle)
+                if status.state != system.PENDING {
+                    let ok = showResult(check.label, check.log, status, check.started)
+                    check.state = 3
+                    if ok { check.state = 2 }
+                    if check.builder { plan.variants[check.variant].builder = false }
+                    remaining -= 1
+                } else {
+                    active += 1
+                    if check.exclusive { quiet = true } else { ordinary = true }
+                }
+            }
+        }
+        for check in plan.checks {
+            if check.state == 0 {
+                for child in check.children {
+                    if plan.checks[child].state == 3 {
+                        check.state = 3; remaining -= 1
+                        files.writeStandardOutput(check.label + ": FAILED prerequisite " + plan.checks[child].label + "\n")
+                        break
+                    }
+                }
+            }
+        }
+        let launched = false
+        while active < plan.jobs {
+            let chosenGoal = -1
+            let chosenCheck = -1
+            let best = -1
+            if !quiet {
+                for index in 0..plan.goals.length {
+                    let goal = plan.goals[index]
+                    if goal.state == 0 && !plan.variants[goal.variant].builder && goal.weight > best {
+                        chosenGoal = index; best = goal.weight
+                    }
+                }
+            }
+            for index in 0..plan.checks.length {
+                let check = plan.checks[index]
+                if check.state != 0 || !ready(plan, check) || !resourceAvailable(plan, check) { continue }
+                if check.exclusive {
+                    if ordinary || active >= max(1, plan.jobs / 4) { continue }
+                } else { if quiet { continue } }
+                if failedGoal(plan, check) && active > 0 { continue }
+                let blockedByBuilder = false
+                for running in plan.checks { if running.state == 1 && running.builder { blockedByBuilder = true } }
+                if blockedByBuilder { continue }
+                if check.weight > best { chosenGoal = -1; chosenCheck = index; best = check.weight }
+            }
+            if chosenGoal < 0 && chosenCheck < 0 { break }
+            attempt += 1
+            let log = plan.scratch + "/logs/process-" + epoch + "-" + Text(attempt)
+            let tmp = plan.scratch + "/tmp-" + Text(attempt)
+            if chosenGoal >= 0 {
+                let goal = plan.goals[chosenGoal]
+                let where = plan.variants[goal.variant]
+                let args = ["/usr/bin/flock", "-F", "build/bootstrap.lock"]
+                for item in where.make { args.add(item) }
+                args.add(goal.name)
+                goal.handle = monitored(plan, goal.variant, args, log, tmp, goal.name)
+                test.check(goal.handle > 0, "cannot launch builder")
+                goal.state = 1; goal.log = log; goal.started = system.monotonicNanoseconds()
+                plan.variants[goal.variant].builder = true; ordinary = true
+            } else {
+                let check = plan.checks[chosenCheck]
+                check.builder = failedGoal(plan, check)
+                if check.builder { plan.variants[check.variant].builder = true }
+                check.handle = monitored(plan, check.variant, command(plan, check), log, tmp, check.label)
+                test.check(check.handle > 0, "cannot launch check")
+                check.state = 1; check.log = log; check.started = system.monotonicNanoseconds()
+                if check.exclusive { quiet = true } else { ordinary = true }
+            }
+            active += 1; launched = true
+        }
+        if active == 0 && !launched && remaining > 0 {
+            for check in plan.checks {
+                if check.state == 0 { check.state = 3; remaining -= 1; files.writeStandardOutput(check.label + ": FAILED dependency cycle\n") }
+            }
+            test.check(remaining == 0, "stalled builder plan")
+        }
+        if active > 0 { pause() }
+    }
+    if interrupted {
+        plan.interrupted = true
+        for check in plan.checks { if check.state == 1 { system.sendSignal(system.childProcessId(check.handle), 15); system.wait(check.handle) } }
+        for goal in plan.goals { if goal.state == 1 { system.sendSignal(system.childProcessId(goal.handle), 15); system.wait(goal.handle) } }
+        return false
+    }
+    let passed = true
+    for check in plan.checks { if check.state != 2 { passed = false } }
+    return passed
+}
+
+public function run(plan: Plan): Boolean {
+    let passed = execute(plan)
+    let jobs = plan.jobs
+    for attempt in 0..plan.retries {
+        if passed || plan.interrupted { break }
+        plan.jobs = 1
+        for check in plan.checks {
+            if check.state == 3 {
+                check.state = 0; check.retry += 1
+                files.writeStandardOutput(check.label + ": isolated retry " + Text(check.retry) + "\n")
+            }
+        }
+        for goal in plan.goals { if goal.state == 3 { goal.state = 0 } }
+        passed = execute(plan)
+    }
+    plan.jobs = jobs
+    return passed
+}
