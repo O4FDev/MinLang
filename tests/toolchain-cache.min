@@ -1,0 +1,33 @@
+use "../tools/testing.min" as test
+use "../tools/test-toolchain.min" as toolchain
+use "../tools/check-runner.min" as runner
+use "system" as system
+use "files" as files
+let source = argument(0)
+let compiler = argument(1)
+let cxx = argument(2)
+let linker = argument(3)
+let work = test.scratch()
+let cache = work + "/cache"
+test.check(files.makeDirectory(cache) == 0, "private compiler cache")
+let real = work + "/clang"
+writeTextFile(real, "#!/bin/sh\nrecord=1\nfor arg in \"$@\"; do case \"$arg\" in -E|-print-runtime-dir) record=0;; esac; done\nif [ \"$record\" = 1 ]; then printf 'compile\\n' >>'" + work + "/calls'; fi\nexec '" + compiler + "' \"$@\"\n")
+test.require(test.run(["chmod", "+x", real], system.environment(), "", work + "/permissions", 10), "compiler fixture permissions")
+let first = toolchain.wrap(source, work + "/first-run", real, cxx, linker, cache, work)
+let second = toolchain.wrap(source, work + "/second-run", real, cxx, linker, cache, work)
+test.check(first == second && !test.contains(first, "first-run") && !test.contains(second, "second-run"), "identical toolchains retain their exact PATH across runner invocations")
+let environment = runner.environment(system.environment(), "PATH", first + ":" + system.getenv("PATH"))
+writeTextFile(work + "/fixture.c", "int main(void) { return 0; }\n")
+for name in ["one", "two"] {
+    test.require(test.run([first + "/clang", "-O0", work + "/fixture.c", "-o", work + "/" + name], environment, work, work + "/compile-" + name, 30), "cross-run C artifact reuse")
+}
+test.check(readTextFile(work + "/calls") == "compile\n", "identical source and persistent wrapper PATH perform the C build once")
+test.require(test.run(["cmp", "-s", work + "/one", work + "/two"], environment, work, work + "/bytes", 10), "cached original executable bytes")
+writeTextFile(real, readTextFile(real) + "\n")
+let changed = toolchain.wrap(source, work + "/third-run", real, cxx, linker, cache, work)
+test.check(changed != first, "compiler identity selects a distinct immutable wrapper")
+environment = runner.environment(system.environment(), "PATH", changed + ":" + system.getenv("PATH"))
+test.require(test.run([changed + "/clang", "-O0", work + "/fixture.c", "-o", work + "/changed"], environment, work, work + "/compile-changed", 30), "changed compiler rebuild")
+test.check(test.lines(readTextFile(work + "/calls")).length == 2, "changed compiler cannot reuse the original artifact")
+test.removeTree(work)
+print("persistent compiler wrapper cache controls: passed")

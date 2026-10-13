@@ -10,6 +10,8 @@ build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE)
 
 .PRECIOUS: build/tooling/%.ll
 
+build/tooling/scripts/check-linux: build/tooling/tools/test-clang build/tooling/tools/clang-cache
+
 build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/build-test-runtime
 	mkdir -p $(@D)
 	./build/tooling/tools/build-test-runtime $< $@
