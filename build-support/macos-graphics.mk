@@ -20,7 +20,7 @@ prepare-macos-graphics: build/ci-glfw/source/src/nsgl_context.m
 
 .PHONY: prepare-glfw-provider
 prepare-glfw-provider: build/ci-glfw/source/src/nsgl_context.m
-	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake -S build/ci-glfw/source -B build/ci-glfw/objects -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(CURDIR)/build/ci-glfw/install" -DBUILD_SHARED_LIBS=OFF -DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF $(CI_GLFW_CMAKE_FLAGS)
+	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake -S build/ci-glfw/source -B build/ci-glfw/objects -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(CURDIR)/build/ci-glfw/install" -DCMAKE_INSTALL_NAME_DIR="$(CURDIR)/build/ci-glfw/install/lib" -DBUILD_SHARED_LIBS=ON -DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF $(CI_GLFW_CMAKE_FLAGS)
 	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake --build build/ci-glfw/objects --parallel 2
 	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake --install build/ci-glfw/objects
 
