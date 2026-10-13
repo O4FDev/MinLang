@@ -246,8 +246,16 @@ class Providers(unittest.TestCase):
             source.write_text('#include <archive.h>\nint archive_version_number(void) { return ARCHIVE_VERSION_NUMBER; }\n')
             subprocess.run([self.clang, '-O2', '-c', str(source), '-o', str(object_file)],
                            check=True, capture_output=True, timeout=30)
+            selected = provider_info('tararchive', self.clang, ['-static'])
+            probe, binary = work / 'probe.c', work / 'probe'
+            probe.write_text(_probe_source('tararchive'))
+            flags = [str(object_file), '-Wl,--allow-multiple-definition']
+            subprocess.run([self.clang, '-static', str(probe), *flags,
+                            *selected['libraries'], '-o', str(binary)],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run([str(binary)], check=True, capture_output=True, timeout=30)
             with self.assertRaisesRegex(ValueError, 'static provider API.*selected archive'):
-                provider_info('tararchive', self.clang, ['-static'], [str(object_file)])
+                provider_info('tararchive', self.clang, ['-static'], flags)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux static provider contract')
     def test_static_provider_still_rejects_header_library_version_mismatch(self):
