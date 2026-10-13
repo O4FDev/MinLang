@@ -99,10 +99,10 @@ def compiler_mutations(temporary: Path) -> None:
         # Check emitted guards using valid accesses and the codegen contract;
         # never execute an invalid access through a deliberately widened guard.
         if name.startswith("widen-inline-list-"):
-            command = ["python3", "tests/list-access.py",
+            command = [str(ROOT / "build/tooling/tests/list-access"),
                        "ListAccess.test_inline_access_helpers_preserve_checked_fallback"]
         elif name.startswith("reject-valid-inline-"):
-            command = ["python3", "tests/checked-arithmetic.py",
+            command = [str(ROOT / "build/tooling/tests/checked-arithmetic"),
                        "CheckedArithmetic.test_checks_are_visible_without_lto"]
         else:
             command = ["sh", "tests/run-module-tests.sh"]

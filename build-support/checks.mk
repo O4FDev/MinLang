@@ -118,14 +118,14 @@ check-windows-large-file:
 check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/compiler-stage3.ll
 
-check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
+check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic
 	$(LIMITED) python3 tests/mutation.py
 
 .PHONY: check-mutation-score-harness
 check-mutation-score-harness:
 	python3 tests/mutation-score-harness.py
 
-check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance
+check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
@@ -284,9 +284,9 @@ check-scalar-record-storage: build/minyarc build/minyarc-sanitize build/minyar-r
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-scalar-storage.py
 	$(SANITIZER_LIMITED) python3 tests/scalar-record-mutation.py
 
-check-readonly-parameters: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o
-	$(LIMITED) python3 tests/readonly-parameters.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/readonly-parameters.py
+check-readonly-parameters: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/readonly-parameters
+	$(LIMITED) ./build/tooling/tests/readonly-parameters
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/readonly-parameters
 	$(LIMITED) python3 tests/production-readonly-parameters.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-readonly-parameters.py
 
@@ -418,18 +418,18 @@ check-compiler-hardening-sanitize: build/minyarc-sanitize build/minyarc-modules-
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/compiler-hardening.py
 
 .PHONY: check-list-access check-list-access-sanitize
-check-list-access: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/list-access.py
+check-list-access: build/minyarc build/minyar-runtime.o build/tooling/tests/list-access
+	$(LIMITED) ./build/tooling/tests/list-access
 
-check-list-access-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-access.py
+check-list-access-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/list-access
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/list-access
 
 .PHONY: check-checked-arithmetic check-checked-arithmetic-sanitize check-checked-results check-checked-results-sanitize check-checked-results-frontends check-checked-results-frontends-sanitize
-check-checked-arithmetic: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/checked-arithmetic.py
+check-checked-arithmetic: build/minyarc build/minyar-runtime.o build/tooling/tests/checked-arithmetic
+	$(LIMITED) ./build/tooling/tests/checked-arithmetic
 
-check-checked-arithmetic-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/checked-arithmetic.py
+check-checked-arithmetic-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/checked-arithmetic
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-arithmetic
 
 check-checked-results: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/checked-results.py
@@ -843,10 +843,10 @@ check-list-basics: build/minyarc build/minyar-runtime.o tests/list-basics.py tes
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/list-basics.py
 check-list-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o tests/list-basics.py tests/list-basics.c $(RUNTIME_HEADERS)
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-basics.py
-check-map-basics: build/minyarc build/minyar-runtime.o tests/map-basics.py tests/list-basics.py $(RUNTIME_HEADERS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/map-basics.py
-check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o tests/map-basics.py tests/list-basics.py $(RUNTIME_HEADERS)
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/map-basics.py
+check-map-basics: build/minyarc build/minyar-runtime.o build/tooling/tests/map-basics tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/map-basics
+check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/map-basics tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/map-basics
 check check-portable: check-list-basics check-map-basics
 check-sanitize: check-list-basics-sanitize check-map-basics-sanitize
 

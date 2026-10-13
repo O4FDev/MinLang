@@ -32,8 +32,8 @@ check-list-literals: build/minyarc build/minyarc-modules build/minyar-runtime.o
 check-list-literals-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o
 	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-literals.py
 
-check-list-literal-runtime:
-	$(SANITIZER_LIMITED) python3 tests/list-literal-runtime.py --clang "$(LLVM_CC)"
+check-list-literal-runtime: build/tooling/tests/list-literal-runtime
+	$(SANITIZER_LIMITED) ./build/tooling/tests/list-literal-runtime --clang "$(LLVM_CC)"
 
 check: check-list-literals check-list-literal-runtime
 check-sanitize: check-list-literals-sanitize

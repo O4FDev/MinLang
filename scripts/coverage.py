@@ -310,7 +310,7 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
-    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance')
+    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters')
     run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
 
     compiler_reports = {}
