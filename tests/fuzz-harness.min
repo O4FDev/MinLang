@@ -1,0 +1,125 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Campaign { result: test.Result; report: json.Value; directory: Text }
+
+function script(path: Text, source: Text) {
+    writeTextFile(path, source)
+    test.require(test.run(["/bin/chmod", "755", path], system.environment(), "", path + ".chmod", 10), "chmod " + path)
+}
+function environment(names: List<Text>, values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() {
+        let keep = true
+        for name in names { if test.contains(entry, name + "=") && Text(Bytes(entry).slice(0, Bytes(name).length + 1)) == name + "=" { keep = false } }
+        if keep { result.add(entry) }
+    }
+    for index in 0..names.length { result.add(names[index] + "=" + values[index]) }
+    return result
+}
+function campaign(fuzz: Text, root: Text, label: Text, arguments: List<Text>, names: List<Text>, values: List<Text>, cwd: Text): Campaign {
+    let output = root + "/" + label
+    let command = [fuzz]
+    for item in arguments { command.add(item) }
+    command.add("--output-dir")
+    command.add(output)
+    let result = test.run(command, environment(names, values), cwd, root + "/" + label + ".log", 120)
+    let directories = files.list(output)
+    test.check(directories.length == 1, label + ": expected one campaign directory\n" + result.output + result.errorOutput)
+    let directory = output + "/" + directories[0]
+    test.check(test.contains(result.output, "fuzz evidence: "), label + ": missing evidence path")
+    let report = json.parse(readTextFile(directory + "/results.json"))
+    test.check(report.kind == json.OBJECT, label + ": results.json is not an object")
+    return Campaign { result: result; report: report; directory: directory }
+}
+function failed(observed: Campaign, label: Text, message: Text) {
+    test.check(observed.result.status == 1, label + ": expected failure status, got " + Text(observed.result.status) + "\n" + observed.result.output + observed.result.errorOutput)
+    test.check(json.string(observed.report, "status") == "failed", label + ": report status")
+    test.check(test.contains(json.string(observed.report, "failure"), message), label + ": failure " + json.string(observed.report, "failure"))
+    test.check(test.contains(observed.result.errorOutput, message), label + ": stderr " + observed.result.errorOutput)
+    test.check(files.pathSize(observed.directory + "/evidence.json") >= 0, label + ": failure evidence was not retained")
+}
+function passed(observed: Campaign, label: Text) {
+    test.check(observed.result.status == 0 && json.string(observed.report, "status") == "passed", label + ": expected success\n" + observed.result.output + observed.result.errorOutput)
+    test.check(test.contains(observed.result.output, "deterministic fuzzing passed"), label + ": success summary")
+}
+function lastCommand(observed: Campaign): json.Value {
+    let commands = json.member(observed.report, "commands").items
+    test.check(commands.length > 0, "campaign recorded no commands")
+    return commands[commands.length - 1]
+}
+function corpusRoot(root: Text, name: Text): Text {
+    let directory = root + "/" + name
+    for path in [directory, directory + "/tests", directory + "/tests/fuzz-regressions"] { test.check(files.makeDirectory(path) == 0, "corpus directory") }
+    return directory
+}
+
+test.check(argumentCount() == 1, "usage: fuzz-harness FUZZ")
+let fuzz = argument(0)
+let root = test.scratch()
+let runtime = root + "/runtime.o"
+writeTextFile(runtime, "runtime")
+let status = root + "/status-compiler"
+script(status, "#!/bin/sh\nprintf '%s' \"$FAKE_STDERR\" >&2\nexit \"$FAKE_STATUS\"\n")
+
+let candidate = campaign(fuzz, root, "candidate", ["--cases", "1"], ["MINYAR_TEST_COMPILER", "MINYAR_TEST_RUNTIME"], ["/candidate/compiler", "/candidate/runtime.o"], "")
+failed(candidate, "candidate selection", "/candidate/compiler")
+test.check(json.string(candidate.report, "compiler") == "/candidate/compiler" && json.string(candidate.report, "runtime") == "/candidate/runtime.o", "environment selects candidate compiler and runtime")
+
+let emitter = root + "/emitting-compiler"
+script(emitter, "#!/bin/sh\nprintf 'fake\\n' > \"$2\"\n")
+let linker = root + "/fake-clang"
+script(linker, "#!/bin/sh\nout=; ll=; previous=\nfor item do\n  if [ \"$previous\" = -o ]; then out=$item; fi\n  case $item in *.ll) ll=$item;; esac\n  previous=$item\ndone\nprintf '#!/bin/sh\\ncat \"%s\"\\n' \"${ll%.ll}.expected.stdout\" > \"$out\"\nif [ \"$FAKE_WARN\" = 1 ]; then printf 'echo \"runtime warning\" >&2\\n' >> \"$out\"; fi\nchmod 755 \"$out\"\n")
+let quiet = campaign(fuzz, root, "quiet-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN"], [runtime, "0"], "")
+passed(quiet, "exact fake execution")
+let noisy = campaign(fuzz, root, "noisy-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN"], [runtime, "1"], "")
+failed(noisy, "correct stdout with runtime diagnostics", "changed meaning at -O0")
+test.check(test.contains(json.string(noisy.report, "failure"), "runtime warning"), "runtime diagnostics are reported")
+
+let corpus = corpusRoot(root, "corpus")
+writeTextFile(corpus + "/tests/fuzz-regressions/invalid.min", "print(\"unterminated")
+let corpusCases = [["0", ""], ["37", ""], ["1", "AddressSanitizer: heap-use-after-free"]]
+for index in 0..corpusCases.length {
+    let observed = campaign(fuzz, root, "corpus-" + Text(index), ["--stage", "regressions", "--compiler", status], ["MINYAR_TEST_RUNTIME", "FAKE_STATUS", "FAKE_STDERR"], [runtime, corpusCases[index][0], corpusCases[index][1]], corpus)
+    failed(observed, "rejecting corpus case " + Text(index), "fuzz regression returned for invalid.min")
+}
+let rejected = campaign(fuzz, root, "corpus-accepted", ["--stage", "regressions", "--compiler", status], ["MINYAR_TEST_RUNTIME", "FAKE_STATUS", "FAKE_STDERR"], [runtime, "1", "error: unterminated text"], corpus)
+passed(rejected, "ordinary user rejection")
+
+let undecodable = root + "/undecodable-compiler"
+script(undecodable, "#!/bin/sh\nprintf '\\377' >&2\nexit 1\n")
+let invalid = campaign(fuzz, root, "invalid-utf8", ["--stage", "regressions", "--compiler", undecodable], ["MINYAR_TEST_RUNTIME"], [runtime], corpus)
+passed(invalid, "invalid UTF-8 diagnostics")
+test.check(json.string(lastCommand(invalid), "stderr") == "\\xff", "invalid UTF-8 output was not escaped: " + json.string(lastCommand(invalid), "stderr"))
+
+let empty = corpusRoot(root, "empty")
+failed(campaign(fuzz, root, "empty-corpus", ["--stage", "regressions", "--compiler", status], ["MINYAR_TEST_RUNTIME"], [runtime], empty), "empty regression corpus", "the rejecting fuzz regression corpus is empty")
+
+let seeds = root + "/seeds"
+for path in [seeds, seeds + "/tests", seeds + "/tests/fuzz-corpus", seeds + "/tests/fuzz-corpus/inputs"] { test.check(files.makeDirectory(path) == 0, "seed directory") }
+writeTextFile(seeds + "/tests/fuzz-corpus/inputs/unlisted.min", "print(1)")
+writeTextFile(seeds + "/tests/fuzz-corpus/seeds.json", "{}")
+failed(campaign(fuzz, root, "unlisted-seed", ["--stage", "seeds", "--compiler", status], ["MINYAR_TEST_RUNTIME"], [runtime], seeds), "seed oracle", "every AFL seed must have an explicit semantic or rejecting oracle")
+
+let deliberate = campaign(fuzz, root, "deliberate", ["--cases", "1", "--compiler", status], ["MINYAR_TEST_RUNTIME", "FAKE_STATUS", "FAKE_STDERR"], [runtime, "1", "deliberate oracle failure"], "")
+failed(deliberate, "failure evidence", "deliberate oracle failure")
+let sources = 0
+for name in files.list(deliberate.directory) { if test.contains(name, "expressions-") && test.contains(name, ".min") { sources += 1 } }
+test.check(sources == 1, "failing source was not retained")
+let resolved = test.run(["/bin/sh", "-c", "cd \"$(dirname \"$1\")\" && printf '%s/%s' \"$(pwd -P)\" \"$(basename \"$1\")\"", "sh", status], system.environment(), "", root + "/resolve", 10)
+test.check(json.string(deliberate.report, "compiler") == resolved.output, "report compiler is the resolved candidate")
+test.check(json.string(deliberate.report, "status") == "failed" && json.member(deliberate.report, "compiler_sha256").kind == json.STRING, "machine-readable failure report")
+
+let marker = root + "/orphan-wrote-file"
+let hanging = root + "/hanging-compiler"
+script(hanging, "#!/bin/sh\n(sleep 0.5; echo orphan > \"$FAKE_MARKER\") &\nsleep 10\n")
+let hung = campaign(fuzz, root, "hanging", ["--stage", "hostile", "--cases", "1", "--hostile-timeout", "0.1", "--compiler", hanging], ["MINYAR_TEST_RUNTIME", "FAKE_MARKER"], [runtime, marker], "")
+failed(hung, "hanging compiler", "compiler hung on hostile input 0")
+test.require(test.run(["/bin/sleep", "0.7"], system.environment(), "", root + "/sleep", 10), "sleep")
+test.check(files.pathSize(marker) < 0, "timeout left a descendant running")
+test.check(json.member(lastCommand(hung), "timed_out").truth, "timeout was not recorded")
+
+test.removeTree(root)
+print("fuzz harness: 13 fault-injection checks passed")

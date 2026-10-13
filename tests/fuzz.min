@@ -1,0 +1,598 @@
+use "../tools/testing.min" as test
+use "./evidence-support.min" as evidence
+use "./cpython-random.min" as random
+use "./sha256-support.min" as shell
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Expression { text: Text; value: Integer }
+record Context {
+    trace: evidence.Evidence
+    compiler: Text
+    clang: Text
+    runtime: Text
+    flags: List<Text>
+    temporary: Text
+    commands: List<Text>
+    oracleNames: List<Text>
+    oracleValues: List<Text>
+    report: List<Text>
+    reportValues: List<Text>
+}
+record Result { status: Integer; stdout: Text; stderr: Text; timedOut: Boolean; error: Text }
+
+constant INTERNAL: List<Text> = ["List position", "Text position", "record position", "Segmentation fault", "Assertion",
+    "AddressSanitizer", "UndefinedBehaviorSanitizer", "runtime error:"]
+
+function usage(message: Text) {
+    system.writeStandardError("usage: fuzz [--compiler COMPILER] [--clang CLANG] [--cases CASES] [--hostile-timeout SECONDS] [--program-cases N] [--seed SEED] [--output-dir DIRECTORY] [--stage STAGE]\nfuzz: error: " + message + "\n")
+    exit(2)
+}
+function digitValue(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 122 { return byte - 87 }
+    if byte >= 65 && byte <= 90 { return byte - 55 }
+    return 99
+}
+function integerOption(source: Text, automatic: Boolean, name: Text): Integer {
+    let raw = Bytes(source)
+    let index = 0
+    while index < raw.length && raw[index] <= 32 { index += 1 }
+    let end = raw.length
+    while end > index && raw[end - 1] <= 32 { end -= 1 }
+    let negative = false
+    if index < end && (raw[index] == 43 || raw[index] == 45) { negative = raw[index] == 45; index += 1 }
+    let base = 10
+    if automatic && index + 1 < end && raw[index] == 48 {
+        let marker = raw[index + 1] | 32
+        if marker == 120 { base = 16; index += 2 } else if marker == 111 { base = 8; index += 2 } else if marker == 98 { base = 2; index += 2 }
+        if base != 10 && index < end && raw[index] == 95 { index += 1 }
+    }
+    if index >= end { usage("argument " + name + ": invalid int value: '" + source + "'") }
+    if automatic && base == 10 && raw[index] == 48 {
+        for position in index..end { if raw[position] != 48 && raw[position] != 95 { usage("argument " + name + ": invalid int value: '" + source + "'") } }
+    }
+    let value = 0
+    let previous = 95
+    for position in index..end {
+        let byte = raw[position]
+        if byte == 95 {
+            if previous == 95 || position + 1 == end { usage("argument " + name + ": invalid int value: '" + source + "'") }
+        } else {
+            let digit = digitValue(byte)
+            if digit >= base { usage("argument " + name + ": invalid int value: '" + source + "'") }
+            value = value * base + digit
+        }
+        previous = byte
+    }
+    if negative { return -value }
+    return value
+}
+function floatOption(source: Text, name: Text): Float {
+    let parsed = json.parse(source)
+    if parsed.kind != json.NUMBER { usage("argument " + name + ": invalid float value: '" + source + "'") }
+    return parsed.number
+}
+
+function escapeByte(result: Bytes, byte: Integer) {
+    let hex = Bytes("0123456789abcdef")
+    result.addBytes(Bytes("\\x"))
+    result.add(hex[byte >> 4])
+    result.add(hex[byte & 15])
+}
+function decoded(raw: Bytes): Text {
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        let length = 0
+        let low = 128
+        let high = 191
+        if byte < 128 { length = 1 }
+        else if byte >= 194 && byte <= 223 { length = 2 }
+        else if byte >= 224 && byte <= 239 {
+            length = 3
+            if byte == 224 { low = 160 }
+            if byte == 237 { high = 159 }
+        } else if byte >= 240 && byte <= 244 {
+            length = 4
+            if byte == 240 { low = 144 }
+            if byte == 244 { high = 143 }
+        }
+        let valid = length > 0 && index + length <= raw.length
+        if valid && length > 1 {
+            if raw[index + 1] < low || raw[index + 1] > high { valid = false }
+            for offset in 2..length { if valid && (raw[index + offset] < 128 || raw[index + offset] > 191) { valid = false } }
+        }
+        if valid {
+            result.addBytes(raw.slice(index, index + length))
+            index += length
+        } else {
+            escapeByte(result, byte)
+            index += 1
+        }
+    }
+    return Text(result)
+}
+function rounded(value: Float): Text { return Text(round(value * 1000.0) / 1000.0) }
+function seconds(value: Float): Text {
+    if value == floor(value) { return Text(Integer(value)) }
+    return Text(value)
+}
+function strings(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(evidence.quote(value)) }
+    return "[" + joinWith(parts, ", ") + "]"
+}
+function joinWith(values: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(separator) }
+        parts.add(values[index])
+    }
+    return joinText(parts)
+}
+function object(keys: List<Text>, values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..keys.length { parts.add(evidence.quote(keys[index]) + ": " + values[index]) }
+    return "{" + joinWith(parts, ", ") + "}"
+}
+function pythonText(value: Text): Text { return evidence.quote(value) }
+
+function finish(context: Context, failure: Text) {
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    for index in 0..context.report.length { keys.add(context.report[index]); values.add(context.reportValues[index]) }
+    keys.add("commands")
+    values.add("[\n    " + joinWith(context.commands, ",\n    ") + "\n  ]")
+    if failure == "" {
+        keys.add("status"); values.add("\"passed\"")
+    } else {
+        keys.add("status"); values.add("\"failed\"")
+        keys.add("failure"); values.add(evidence.quote(failure))
+        system.writeStandardError(failure + "\n")
+        evidence.close(context.trace, true)
+    }
+    let parts: List<Text> = []
+    for index in 0..keys.length { parts.add("  " + evidence.quote(keys[index]) + ": " + values[index]) }
+    writeTextFile(context.temporary + "/results.json", "{\n" + joinWith(parts, ",\n") + "\n}\n")
+    print("fuzz evidence: " + context.temporary)
+    if failure != "" { exit(1) }
+}
+function abort(context: Context, message: Text) {
+    finish(context, "AssertionError: " + message)
+}
+function execute(context: Context, arguments: List<Text>, timeout: Float): Result {
+    let started = system.monotonicNanoseconds()
+    let request = evidence.command(arguments, timeout)
+    request.cwd = "."
+    request.allowTimeout = true
+    let raw = evidence.run(context.trace, request)
+    let status = raw.status
+    if raw.timedOut { status = -1 }
+    let result = Result { status: status; stdout: decoded(raw.stdout); stderr: decoded(raw.stderr); timedOut: raw.timedOut; error: raw.error }
+    context.commands.add(object(["command", "cwd", "timeout_seconds", "elapsed_seconds", "status", "timed_out", "stdout", "stderr"],
+        [strings(arguments), evidence.quote(evidence.resolve(".")), seconds(timeout),
+        rounded(Float(system.monotonicNanoseconds() - started) / 1000000000.0), Text(status), Text(raw.timedOut),
+        evidence.quote(result.stdout), evidence.quote(result.stderr)]))
+    return result
+}
+function run(context: Context, arguments: List<Text>, timeout: Float): Result {
+    let result = execute(context, arguments, timeout)
+    if result.timedOut { finish(context, result.error) }
+    return result
+}
+function internal(diagnostics: Text): Boolean {
+    for fragment in INTERNAL { if test.contains(diagnostics, fragment) { return true } }
+    return false
+}
+function assertExecution(context: Context, result: Result, expected: Text, label: Text) {
+    if result.status != 0 || result.stdout != expected || result.stderr != "" {
+        abort(context, label + ": status=" + Text(result.status) + ", expected=" + pythonText(expected) + ", stdout=" + pythonText(result.stdout) + ", stderr=" + pythonText(result.stderr))
+    }
+}
+function stem(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = raw.length - 1
+    while slash >= 0 && raw[slash] != 47 { slash -= 1 }
+    let name = raw.slice(slash + 1, raw.length)
+    let dot = name.length - 1
+    while dot > 0 && name[dot] != 46 { dot -= 1 }
+    if dot <= 0 || dot == name.length - 1 { return Text(name) }
+    return Text(name.slice(0, dot))
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = raw.length - 1
+    while slash >= 0 && raw[slash] != 47 { slash -= 1 }
+    if slash < 0 { return "." }
+    return Text(raw.slice(0, slash))
+}
+function withSuffix(path: Text, suffix: Text): Text { return parent(path) + "/" + stem(path) + suffix }
+function relative(context: Context, path: Text): Text {
+    let prefix = context.trace.path + "/"
+    let raw = Bytes(path)
+    if raw.length > Bytes(prefix).length && Text(raw.slice(0, Bytes(prefix).length)) == prefix { return Text(raw.slice(Bytes(prefix).length, raw.length)) }
+    return path
+}
+function executeLLVM(context: Context, llvm: Text, expected: Text) {
+    let key = relative(context, llvm)
+    let value = object(["stdout", "stderr", "status"], [evidence.quote(expected), "\"\"", "0"])
+    let found = false
+    for index in 0..context.oracleNames.length { if context.oracleNames[index] == key { context.oracleValues[index] = value; found = true } }
+    if !found { context.oracleNames.add(key); context.oracleValues.add(value) }
+    evidence.control(context.trace, "execution_oracles", object(context.oracleNames, context.oracleValues))
+    for optimization in ["-O0", "-O2"] {
+        let executable = parent(llvm) + "/" + stem(llvm) + "-" + Text(Bytes(optimization).slice(2, 3))
+        let command = [context.clang, optimization]
+        for flag in context.flags { command.add(flag) }
+        for item in ["-Wno-override-module", llvm, context.runtime, "-lm", "-o", executable] { command.add(item) }
+        let linked = run(context, command, 30.0)
+        if linked.status != 0 { abort(context, stem(llvm) + ".ll rejected at " + optimization + ":\n" + linked.stderr) }
+        assertExecution(context, run(context, [executable], 8.0), expected, stem(llvm) + ".ll changed meaning at " + optimization)
+    }
+}
+
+function randint(rng: random.State, low: Integer, high: Integer): Integer { return low + random.below(rng, high - low + 1) }
+function expression(rng: random.State, depth: Integer): Expression {
+    if depth >= 4 || random.uniform(rng) < 0.32 {
+        let value = randint(rng, -50, 50)
+        if value >= 0 { return Expression { text: Text(value); value: value } }
+        return Expression { text: "(" + Text(value) + ")"; value: value }
+    }
+    let left = expression(rng, depth + 1)
+    let right = expression(rng, depth + 1)
+    let operator = ["+", "-", "*", "/", "%"][random.below(rng, 5)]
+    if (operator == "/" || operator == "%") && right.value == 0 { operator = "+" }
+    let quotient = 0
+    if right.value != 0 {
+        quotient = abs(left.value) / abs(right.value)
+        if (left.value < 0) != (right.value < 0) { quotient = -quotient }
+    }
+    let value = 0
+    if operator == "+" { value = left.value + right.value }
+    else if operator == "-" { value = left.value - right.value }
+    else if operator == "*" { value = left.value * right.value }
+    else if operator == "/" { value = quotient }
+    else { value = left.value - quotient * right.value }
+    if abs(value) > 1000000000 { return expression(rng, depth + 1) }
+    return Expression { text: "(" + left.text + " " + operator + " " + right.text + ")"; value: value }
+}
+function expressionBatch(context: Context, cases: Integer, seed: Integer) {
+    let rng = random.seeded(Text(seed))
+    let generated: List<Expression> = []
+    for unused in 0..cases { generated.add(expression(rng, 0)) }
+    let source = context.temporary + "/expressions-" + Text(seed) + ".min"
+    let lines: List<Text> = []
+    let expected: List<Text> = []
+    for item in generated { lines.add("print(" + item.text + ")\n"); expected.add(Text(item.value) + "\n") }
+    writeTextFile(source, joinText(lines))
+    let llvm = withSuffix(source, ".ll")
+    let compiled = run(context, [context.compiler, source, llvm], max(8.0, Float(cases) / 20.0))
+    if compiled.status != 0 { abort(context, "valid generated expressions failed:\n" + compiled.stderr) }
+    writeTextFile(withSuffix(source, ".expected.stdout"), joinText(expected))
+    executeLLVM(context, llvm, joinText(expected))
+}
+function semanticProgram(cases: Integer, seed: Integer, outlined: Boolean, expected: List<Text>): Text {
+    let rng = random.seeded(Text(seed))
+    let lines = ["function identity(value: Integer): Integer { return value }",
+        "function mark(values: List<Integer>): Boolean { values.add(1); return true }",
+        "function sumOdd(limit: Integer): Integer {",
+        "    let total = 0",
+        "    for value in 0..100 {",
+        "        if value >= limit { break }",
+        "        if value % 2 == 0 { continue }",
+        "        total = total + value",
+        "    }",
+        "    return total",
+        "}"]
+    for value in [-9223372036854775808, -9223372036854775807, -1, 0, 1, 9223372036854775806, 9223372036854775807] {
+        let term = "(" + Text(value) + ")"
+        if outlined { term = "identity(" + Text(value) + ")" }
+        lines.add("print(" + term + " + 0)")
+        expected.add(Text(value))
+    }
+    for index in 0..cases {
+        let generated = expression(rng, 0)
+        let term = generated.text
+        if outlined { term = "identity(" + generated.text + ")" }
+        lines.add("print(" + term + ")")
+        lines.add("print((" + term + " + 7) - 7)")
+        expected.add(Text(generated.value))
+        expected.add(Text(generated.value))
+        let left = randint(rng, -1000, 1000)
+        let right = randint(rng, -1000, 1000)
+        let operators = ["<", "<=", ">", ">=", "==", "!="]
+        let results = [left < right, left <= right, left > right, left >= right, left == right, left != right]
+        for position in 0..operators.length {
+            lines.add("print((" + Text(left) + ") " + operators[position] + " (" + Text(right) + "))")
+            expected.add(Text(results[position]))
+        }
+        let limit = random.below(rng, 20)
+        lines.add("print(sumOdd(" + Text(limit) + "))")
+        let odd = 0
+        for value in 0..limit { if value % 2 != 0 { odd += value } }
+        expected.add(Text(odd))
+        let suffix = Text(index)
+        for line in ["let state" + suffix + ": List<Integer> = []", "print(false && mark(state" + suffix + "))",
+            "print(true || mark(state" + suffix + "))", "print(state" + suffix + ".length)",
+            "print(true && mark(state" + suffix + "))", "print(false || mark(state" + suffix + "))",
+            "print(state" + suffix + ".length)"] { lines.add(line) }
+        for value in ["false", "true", "0", "true", "true", "2"] { expected.add(value) }
+        let shift = random.below(rng, 8)
+        lines.add("print((" + Text(left) + ") >> " + Text(shift) + ")")
+        lines.add("print((" + Text(left) + ") ^ (" + Text(right) + "))")
+        expected.add(Text(left >> shift))
+        expected.add(Text(left ^ right))
+        let byteValue = -32768 + random.below(rng, 65536)
+        for line in ["let bytes" + suffix + " = Bytes(1)", "bytes" + suffix + ".addInt16(" + Text(byteValue) + ")",
+            "let alias" + suffix + " = bytes" + suffix, "alias" + suffix + "[0] = 255",
+            "print(bytes" + suffix + "[0])", "print(bytes" + suffix + ".getInt16(1))",
+            "print(bytes" + suffix + "[1])", "print(bytes" + suffix + "[2])"] { lines.add(line) }
+        expected.add("255")
+        expected.add(Text(byteValue))
+        expected.add(Text(byteValue & 255))
+        expected.add(Text((byteValue >> 8) & 255))
+        let numerator = randint(rng, -1000, 1000)
+        lines.add("print(Integer(Float(" + Text(numerator) + ") / 4.0))")
+        let quarter = abs(numerator) / 4
+        if numerator < 0 { quarter = -quarter }
+        expected.add(Text(quarter))
+    }
+    return joinWith(lines, "\n") + "\n"
+}
+function semanticRelations(context: Context, cases: Integer, seed: Integer) {
+    for outlined in [false, true] {
+        let expected: List<Text> = []
+        let sourceText = semanticProgram(cases, seed, outlined, expected)
+        let name = "direct"
+        if outlined { name = "outlined" }
+        let source = context.temporary + "/semantic-" + name + ".min"
+        writeTextFile(source, sourceText)
+        let expectedText = joinWith(expected, "\n") + "\n"
+        writeTextFile(withSuffix(source, ".expected.stdout"), expectedText)
+        let llvm = withSuffix(source, ".ll")
+        let result = run(context, [context.compiler, source, llvm], max(20.0, Float(cases)))
+        if result.status != 0 { abort(context, "valid semantic program rejected: " + result.stderr) }
+        executeLLVM(context, llvm, expectedText)
+    }
+}
+function languageSurface(context: Context, cases: Integer, seed: Integer) {
+    let rng = random.seeded(Text(seed))
+    let lines = ["record FuzzPair { left: Integer; right: Integer }",
+        "record FuzzBox { label: Text; values: List<Integer>; pair: FuzzPair }",
+        "function total(values: List<Integer>): Integer {",
+        "    let result = 0",
+        "    let position = 0",
+        "    while position < values.length {",
+        "        result = result + values[position]",
+        "        position = position + 1",
+        "    }",
+        "    return result",
+        "}",
+        "function choose(left: Integer, right: Integer, takeLeft: Boolean): Integer {",
+        "    if takeLeft { return left } else { return right }",
+        "}"]
+    let expected: List<Text> = []
+    let labels = ["ascii", "éclair", "界", "🙂", "e" + Text(Character(769))]
+    for index in 0..cases {
+        let originalValues: List<Integer> = []
+        let count = randint(rng, 1, 6)
+        for unused in 0..count { originalValues.add(randint(rng, -500, 500)) }
+        let replacement = randint(rng, -500, 500)
+        let appended = randint(rng, -500, 500)
+        let replaceAt = random.below(rng, originalValues.length)
+        let values: List<Integer> = []
+        for value in originalValues { values.add(value) }
+        values[replaceAt] = replacement
+        let left = randint(rng, -1000, 1000)
+        let right = randint(rng, -1000, 1000)
+        let takeLeft = (random.word(rng) >> 31) == 1
+        let label = labels[random.below(rng, labels.length)] + Text(index)
+        let prefixLength = random.below(rng, label.length + 1)
+        let name = "values" + Text(index)
+        let suffix = Text(index)
+        lines.add("let " + name + ": List<Integer> = []")
+        for value in originalValues { lines.add(name + ".add(" + Text(value) + ")") }
+        lines.add(name + "[" + Text(replaceAt) + "] = " + Text(replacement))
+        lines.add("let pair" + suffix + " = FuzzPair { left: " + Text(left) + "; right: " + Text(right) + " }")
+        lines.add("let box" + suffix + " = FuzzBox { label: \"" + label + "\" + \"\"; values: " + name + "; pair: pair" + suffix + " }")
+        lines.add("print(total(box" + suffix + ".values))")
+        lines.add("let appended" + suffix + " = box" + suffix + ".values.appended(" + Text(appended) + ")")
+        lines.add("print(total(appended" + suffix + "))")
+        lines.add("print(box" + suffix + ".values.length)")
+        lines.add("print(choose(box" + suffix + ".pair.left, box" + suffix + ".pair.right, " + Text(takeLeft) + "))")
+        lines.add("print(box" + suffix + ".label.slice(0, " + Text(prefixLength) + "))")
+        lines.add("let pieces" + suffix + ": List<Text> = []")
+        let midpoint = label.length / 2
+        lines.add("pieces" + suffix + ".add(\"" + label.slice(0, midpoint) + "\")")
+        lines.add("pieces" + suffix + ".add(\"" + label.slice(midpoint, label.length) + "\")")
+        lines.add("print(joinText(pieces" + suffix + ") == box" + suffix + ".label)")
+        let sum = 0
+        for value in values { sum += value }
+        let chosen = right
+        if takeLeft { chosen = left }
+        for value in [Text(sum), Text(sum + appended), Text(values.length), Text(chosen), label.slice(0, prefixLength), "true"] { expected.add(value) }
+    }
+    let source = context.temporary + "/language-surface.min"
+    let sourceText = joinWith(lines, "\n") + "\n"
+    writeTextFile(source, sourceText)
+    let llvm = context.temporary + "/language-surface.ll"
+    let compiled = run(context, [context.compiler, source, llvm], max(20.0, Float(cases)))
+    if compiled.status != 0 { abort(context, "valid generated language program failed:\n" + compiled.stderr + "\n" + sourceText) }
+    let expectedText = joinWith(expected, "\n") + "\n"
+    writeTextFile(withSuffix(source, ".expected.stdout"), expectedText)
+    for optimization in ["-O0", "-O2"] {
+        let executable = context.temporary + "/language-surface-" + Text(Bytes(optimization).slice(2, 3))
+        let command = [context.clang, optimization]
+        for flag in context.flags { command.add(flag) }
+        for item in ["-Wno-override-module", llvm, context.runtime, "-lm", "-o", executable] { command.add(item) }
+        let linked = run(context, command, 30.0)
+        if linked.status != 0 { abort(context, "generated language LLVM was rejected at " + optimization + ":\n" + linked.stderr) }
+        assertExecution(context, run(context, [executable], 8.0), expectedText, "generated language program changed meaning at " + optimization)
+    }
+}
+function hostileSources(context: Context, cases: Integer, timeout: Float, seed: Integer) {
+    let rng = random.seeded(Text(seed))
+    let alphabet = Bytes("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789(){}[],:;.+-*/!<>=&|_'\" \n\t")
+    for index in 0..cases {
+        let source = context.temporary + "/hostile-" + Text(index) + ".min"
+        let size = randint(rng, 0, 100)
+        let contents = Bytes()
+        for unused in 0..size { contents.add(alphabet[random.below(rng, alphabet.length)]) }
+        writeBytesFile(source, contents)
+        let result = execute(context, [context.compiler, source, context.temporary + "/hostile-" + Text(index) + ".ll"], timeout)
+        if result.timedOut { abort(context, "compiler hung on hostile input " + Text(index) + ": " + pythonText(Text(contents))) }
+        if result.status < 0 { abort(context, "compiler died from signal " + Text(-result.status) + " on hostile input " + Text(index)) }
+        if internal(result.stderr) { abort(context, "internal failure leaked for hostile input " + Text(index) + ": " + pythonText(Text(contents)) + "\n" + result.stderr) }
+        if result.status != 0 && result.status != 1 { abort(context, "unexpected compiler status " + Text(result.status) + " on hostile input " + Text(index)) }
+    }
+}
+function sortedNames(directory: Text, suffix: Text): List<Text> {
+    let names: List<Text> = []
+    for name in files.list(directory) {
+        let raw = Bytes(name)
+        let tail = Bytes(suffix)
+        let path = directory + "/" + name
+        if raw.length >= tail.length && Text(raw.slice(raw.length - tail.length, raw.length)) == suffix && files.pathSize(path) >= 0 && fileExists(path) { names.add(name) }
+    }
+    names.sort()
+    return names
+}
+function regressionCorpus(context: Context) {
+    let names = sortedNames("tests/fuzz-regressions", ".min")
+    if names.length == 0 { abort(context, "the rejecting fuzz regression corpus is empty") }
+    for name in names {
+        let source = evidence.resolve("tests/fuzz-regressions/" + name)
+        let result = run(context, [context.compiler, source, context.temporary + "/" + stem(name) + ".ll"], 2.0)
+        if result.status != 1 || result.stdout != "" || result.stderr == "" || internal(result.stderr) {
+            abort(context, "fuzz regression returned for " + name + ":\n" + result.stderr)
+        }
+    }
+}
+function seedCorpus(context: Context) {
+    let root = "tests/fuzz-corpus"
+    let seeds = json.parse(readTextFile(root + "/seeds.json"))
+    let actual = sortedNames(root + "/inputs", "")
+    let declared: List<Text> = []
+    for name in seeds.keys { declared.add(name) }
+    declared.sort()
+    let matches = seeds.kind == json.OBJECT && declared.length > 0 && declared.length == actual.length
+    if matches { for index in 0..declared.length { if declared[index] != actual[index] { matches = false } } }
+    if !matches { abort(context, "every AFL seed must have an explicit semantic or rejecting oracle in seeds.json") }
+    for name in declared {
+        let expected = json.member(seeds, name)
+        let source = context.temporary + "/seed-" + name
+        writeBytesFile(source, readBytesFile(root + "/inputs/" + name))
+        let llvm = withSuffix(source, ".ll")
+        let result = run(context, [context.compiler, source, llvm], 8.0)
+        if expected.kind == json.NULL {
+            if result.status != 1 || result.stdout != "" || result.stderr == "" || internal(result.stderr) {
+                abort(context, "rejecting AFL seed " + name + " returned " + Text(result.status) + ": " + result.stderr)
+            }
+        } else {
+            if result.status != 0 { abort(context, "valid AFL seed " + name + " rejected: " + result.stderr) }
+            writeTextFile(withSuffix(source, ".expected.stdout"), expected.text)
+            executeLLVM(context, llvm, expected.text)
+        }
+    }
+}
+function moduleChain(context: Context, modules: Integer) {
+    let directory = context.temporary + "/module-chain"
+    test.check(files.makeDirectory(directory) == 0, "cannot create module chain directory")
+    writeTextFile(directory + "/module0.min", "public function value(): Integer {\n    return 1\n}\n")
+    for index in 1..modules {
+        writeTextFile(directory + "/module" + Text(index) + ".min", "use \"./module" + Text(index - 1) + ".min\" as previous\n\npublic function value(): Integer {\n    return previous.value() + 1\n}\n")
+    }
+    let entry = directory + "/main.min"
+    writeTextFile(entry, "use \"./nested/../module" + Text(modules - 1) + ".min\" as last\n\nprint(last.value())\n")
+    test.check(files.makeDirectory(directory + "/nested") == 0, "cannot create nested module directory")
+    let first = context.temporary + "/module-chain-first.ll"
+    let second = context.temporary + "/module-chain-second.ll"
+    for output in [first, second] {
+        let compiled = run(context, [context.compiler, entry, output], 8.0)
+        if compiled.status != 0 { abort(context, "generated module chain failed:\n" + compiled.stderr) }
+    }
+    if readTextFile(first) != readTextFile(second) { abort(context, "compiling the same module graph twice was not deterministic") }
+    executeLLVM(context, first, Text(modules) + "\n")
+}
+
+let compilerOption = test.setting("MINYAR_TEST_COMPILER", "build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let cases = integerOption(test.setting("MINYAR_FUZZ_CASES", "200"), false, "--cases")
+let hostileTimeout = 2.0
+let programCases = -1
+let seed = 0x4D494E594152
+let outputDirectory = "build/fuzz"
+let stage = ""
+let position = 0
+while position < argumentCount() {
+    let option = argument(position)
+    let value = ""
+    let raw = Bytes(option)
+    let equals = -1
+    for index in 0..raw.length { if raw[index] == 61 && equals < 0 { equals = index } }
+    if equals > 0 && raw[0] == 45 {
+        value = Text(raw.slice(equals + 1, raw.length))
+        option = Text(raw.slice(0, equals))
+    } else {
+        if position + 1 >= argumentCount() { usage("argument " + option + ": expected one argument") }
+        position += 1
+        value = argument(position)
+    }
+    if option == "--compiler" { compilerOption = value }
+    else if option == "--clang" { clang = value }
+    else if option == "--cases" { cases = integerOption(value, false, "--cases") }
+    else if option == "--hostile-timeout" { hostileTimeout = floatOption(value, "--hostile-timeout") }
+    else if option == "--program-cases" { programCases = integerOption(value, false, "--program-cases") }
+    else if option == "--seed" { seed = integerOption(value, true, "--seed") }
+    else if option == "--output-dir" { outputDirectory = value }
+    else if option == "--stage" { stage = value }
+    else { usage("unrecognized arguments: " + option) }
+    position += 1
+}
+let stages = ["expressions", "language", "semantic", "hostile", "regressions", "seeds", "modules"]
+let knownStage = stage == ""
+for name in stages { if name == stage { knownStage = true } }
+if !knownStage { usage("argument --stage: invalid choice: '" + stage + "'") }
+if cases < 1 || (programCases != -1 && programCases < 1) { usage("case counts must be positive") }
+if !(hostileTimeout > 0.0 && hostileTimeout < 1.0e308) { usage("--hostile-timeout must be positive and finite") }
+let compiler = evidence.resolve(compilerOption)
+let runtime = test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o")
+if system.getenv("MINYAR_TEST_RUNTIME") == "" && files.pathSize(runtime) < 0 { runtime = "runtime/minyar_runtime.c" }
+let flags = shell.shellWords(system.getenv("MINYAR_TEST_LINK_FLAGS"))
+let programCount = programCases
+if programCount == -1 { programCount = max(8, min(40, cases / 5)) }
+let trace = evidence.openIn(outputDirectory, "campaign", [compiler, runtime])
+let programText = "null"
+if programCases != -1 { programText = Text(programCases) }
+evidence.control(trace, "arguments", object(["compiler", "clang", "cases", "hostile_timeout", "program_cases", "seed", "output_dir"],
+    [evidence.quote(compilerOption), evidence.quote(clang), Text(cases), Text(hostileTimeout), programText, Text(seed), evidence.quote(outputDirectory)]))
+let context = Context { trace: trace; compiler: compiler; clang: clang; runtime: runtime; flags: flags; temporary: trace.path;
+    commands: []; oracleNames: []; oracleValues: [];
+    report: ["seed", "expressions", "program_cases", "compiler", "runtime", "clang", "link_flags", "math_flags", "hostile_timeout_seconds"];
+    reportValues: [Text(seed), Text(cases), Text(programCount), evidence.quote(compiler), evidence.quote(evidence.resolve(runtime)), evidence.quote(clang),
+        strings(flags), "[\"-lm\"]", Text(hostileTimeout)] }
+if files.pathSize(compiler) < 0 || !fileExists(compiler) { finish(context, "FileNotFoundError: [Errno 2] No such file or directory: " + evidence.quote(compiler)) }
+if files.pathSize(runtime) < 0 || !fileExists(runtime) { finish(context, "FileNotFoundError: [Errno 2] No such file or directory: " + evidence.quote(runtime)) }
+context.report.add("compiler_sha256")
+context.reportValues.add(evidence.quote(evidence.digest(compiler)))
+context.report.add("runtime_sha256")
+context.reportValues.add(evidence.quote(evidence.digest(runtime)))
+let remaining = cases
+let batch = 0
+while (stage == "" || stage == "expressions") && remaining > 0 {
+    let size = min(200, remaining)
+    expressionBatch(context, size, seed + batch)
+    remaining -= size
+    batch += 1
+}
+if stage == "" || stage == "language" { languageSurface(context, programCount, seed ^ 0x53555246414345) }
+if stage == "" || stage == "semantic" { semanticRelations(context, programCount, seed ^ 0x53454D414E544943) }
+if stage == "" || stage == "hostile" { hostileSources(context, cases, hostileTimeout, seed ^ 0xBAD5EED) }
+if stage == "" || stage == "regressions" { regressionCorpus(context) }
+if stage == "" || stage == "seeds" { seedCorpus(context) }
+if stage == "" || stage == "modules" { moduleChain(context, 24) }
+finish(context, "")
+print("deterministic fuzzing passed: " + Text(cases) + " expressions, " + Text(programCount) + " full-language cases, " + Text(programCount) + " semantic cases in two forms, " + Text(cases) + " hostile inputs, 24 modules (all valid programs at O0/O2)")
