@@ -31,7 +31,7 @@ done
 "$work/writer" none "$work/raw.erofs" "$work/base.tar" "$work/additions.tar" "$work/upper.tar"
 cmp "$work/none.erofs" "$work/gzip.erofs"
 cmp "$work/none.erofs" "$work/raw.erofs"
-for kind in 0 1 2; do
+for kind in 0 1 2 3 4 5 6 7 8 9; do
     cp "$work/none.erofs" "$work/unchanged.erofs"
     if "$work/writer" none "$work/unchanged.erofs" "$work/bad-$kind.tar"; then exit 1; fi
     cmp "$work/none.erofs" "$work/unchanged.erofs"
