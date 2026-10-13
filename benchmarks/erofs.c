@@ -40,13 +40,18 @@ int main(int argc, char **argv) {
     require(argc >= 3,"benchmark arguments");
     if (!strcmp(argv[1],"prepare")) { prepare(argv[2]); return 0; }
     require(argc == 6 || argc == 7,"benchmark compare arguments");
+    int layers = !strcmp(argv[1],"compare-layers");
     const char *mode = argc == 7 ? argv[6] : "none";
     require(!strcmp(mode,"none") || !strcmp(mode,"lz4") || !strcmp(mode,"zstd"),"benchmark mode");
     char *writer[] = {argv[2],argv[4],argv[5],"17592186040320",(char *)mode,NULL};
-    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime","--workers=1","-C65536",argv[5],argv[4],NULL,NULL};
+    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime","--workers=1","-C65536",argv[5],argv[4],NULL,NULL,NULL};
     if (strcmp(mode,"none")) { mkfs[5] = !strcmp(mode,"lz4") ? "-zlz4" : "-zzstd,3"; mkfs[6] = argv[5]; mkfs[7] = argv[4]; }
+    if (layers) {
+        writer[1] = (char *)mode; writer[2] = argv[5]; writer[3] = argv[4]; writer[4] = NULL;
+        size_t at = strcmp(mode,"none") ? 8 : 7; mkfs[at] = "--tar=f";
+    }
     uint64_t a_bytes, b_bytes;
-    printf("mode=%s level=%s max_physical_cluster_bytes=%u workers=1 input_bytes=1073741824\n",mode,!strcmp(mode,"zstd") ? "3" : !strcmp(mode,"lz4") ? "default-fast" : "none",strcmp(mode,"none") ? 65536u : 4096u); fflush(stdout);
+    printf("entry=%s mode=%s level=%s max_physical_cluster_bytes=%u workers=1 input_bytes=1073741824\n",layers ? "layers" : "directory",mode,!strcmp(mode,"zstd") ? "3" : !strcmp(mode,"lz4") ? "default-fast" : "none",strcmp(mode,"none") ? 65536u : 4096u); fflush(stdout);
     run(writer,argv[5],&a_bytes); run(mkfs,argv[5],&b_bytes);
     for (int n = 0; n < 5; ++n) {
         uint64_t a, b;
