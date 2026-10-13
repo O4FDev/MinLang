@@ -133,6 +133,9 @@ check-scaling: build/minyarc
 check-budget: build/minyarc build/compiler-stage3.ll
 	python3 tests/self-compile-budget.py
 
+build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-compiler-runtime.ll
+	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
 .PHONY: check-sanitized-fixed-point check-generated-sanitizer
 check-generated-sanitizer:
 	$(SANITIZER_LIMITED) python3 tests/generated-stack-sanitizer.py --clang "$(LLVM_CC)"

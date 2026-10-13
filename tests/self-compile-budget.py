@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Check fixed resource ceilings for self-compilation.
-
-Run outside scripts/with-limits.sh, as make check-budget does: background
-priority changes scheduling and inflates absolute timings. The test uses the
-best 90th-percentile result across batches to reduce sensitivity to transient
-host load. CPU, memory, and instruction limits are checked separately."""
-
 from __future__ import annotations
 
 import platform
+import hashlib
+import json
+import math
+import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from compiler_output import check_compiler_behavior, validate_compile_output as validate_output
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments/memory"))
+from measurement_stats import paired_cpu_ratio_summary
 
 try:
     import resource
@@ -29,15 +28,105 @@ OUTPUT = ROOT / "build" / "self-compile-budget.ll"
 RUNS = 100
 BATCHES = 3
 
-# Recalibrated on an Apple M-series laptop after line-and-column diagnostics,
-# stack guards, ownership-transfer lowering and the expanded compiler/runtime
-# surface landed. A sparse Unicode index without its sequential cursor measured
-# 25--26 ms CPU; adding the cursor reduced repeated measurements to 14.6--14.9
-# ms. Retain useful shared-host headroom without allowing that regression back.
-MAX_WALL_P90_MS = 25.0
-MAX_CPU_P90_MS = 22.0
 MAX_PEAK_RSS_MIB = 17.0
 MAX_INSTRUCTIONS = 75_000_000
+MAX_PAIRED_RATIO = 1.02
+
+
+def file_identity(path: Path) -> dict:
+    return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def record_comparison(previous: Path, source: Path, manifest: Path) -> None:
+    toolchain = json.loads((ROOT / "build/.toolchain.json").read_text())
+    configuration = {"previous_ref": os.environ["MINYAR_BUDGET_PREVIOUS_REF"],
+                     "current_ref": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                     "toolchain": toolchain,
+                     "clang": file_identity(Path(toolchain["llvm_cc"]["path"])),
+                     "artifacts": {name: file_identity(path) for name, path in {
+                         "current": COMPILER, "previous": previous, "input": source,
+                         "runtime": ROOT / "build/minyar-compiler-runtime.ll"}.items()}}
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(configuration, indent=2) + "\n")
+
+
+def wall_comparison(previous: Path, source: Path, manifest: Path, report: Path) -> dict:
+    if resource is None:
+        raise SystemExit("same-input compiler comparison requires child CPU measurements")
+    configuration = json.loads(manifest.read_text())
+    paths = {"current": COMPILER, "previous": previous, "input": source,
+             "runtime": ROOT / "build/minyar-compiler-runtime.ll"}
+    identities = {name: file_identity(path) for name, path in paths.items()}
+    if configuration["artifacts"] != identities:
+        raise SystemExit("same-input compiler comparison identity mismatch")
+    if configuration["toolchain"]["llvm_version"] != "23.1.2":
+        raise SystemExit("same-input compiler comparison requires LLVM 23.1.2")
+    stamp = ROOT / "build/.toolchain.json"
+    clang = Path(configuration["toolchain"]["llvm_cc"]["path"])
+    if json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]:
+        raise SystemExit("same-input compiler comparison toolchain changed")
+    result = {"configuration": configuration, "pairs": [], "status": "running"}
+    outputs = {name: OUTPUT.with_name("wall-comparison-" + name + ".ll")
+               for name in ("current", "previous")}
+
+    def measured(name):
+        output = outputs[name]
+        output.unlink(missing_ok=True)
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        started = time.perf_counter()
+        process = subprocess.run([str(paths[name]), str(source), str(output)], text=True,
+                                 capture_output=True, close_fds=sys.platform != "darwin")
+        elapsed = time.perf_counter() - started
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+        validate_output(process, output, "same-input " + name)
+        if any(not math.isfinite(value) or value <= 0 for value in (elapsed, cpu)):
+            raise SystemExit("invalid same-input compiler duration")
+        return {"wall": elapsed, "cpu": cpu}
+
+    try:
+        for name in outputs:
+            measured(name)
+        for batch in range(BATCHES):
+            for index in range(RUNS):
+                order = ("current", "previous") if (batch * RUNS + index) % 2 == 0 else ("previous", "current")
+                pair = {"batch": batch, "index": index, "order": list(order)}
+                result["pairs"].append(pair)
+                for name in order:
+                    pair[name] = measured(name)
+                pair["ratios"] = {clock: pair["current"][clock] / pair["previous"][clock]
+                                  for clock in ("wall", "cpu")}
+        if {name: file_identity(path) for name, path in paths.items()} != identities:
+            raise SystemExit("same-input compiler comparison artifacts changed")
+        if json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]:
+            raise SystemExit("same-input compiler comparison toolchain changed")
+        for output in outputs.values():
+            check_compiler_behavior(output)
+        result["summaries"] = {clock: paired_cpu_ratio_summary(
+            [pair["current"][clock] for pair in result["pairs"]],
+            [pair["previous"][clock] for pair in result["pairs"]]) for clock in ("wall", "cpu")}
+        enforce_paired_budget(result)
+        result["status"] = "passed"
+        return result
+    except BaseException as error:
+        result["status"] = "failed"
+        result["error"] = str(error)
+        raise
+    finally:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(result, indent=2) + "\n")
+
+
+def enforce_paired_budget(result: dict) -> None:
+    failures = []
+    for clock in ("wall", "cpu"):
+        summary = result["summaries"][clock]
+        upper = summary["confidence_interval"]["upper"]
+        print(f"  same-input {clock} current/previous median {summary['median']:.6f}, 95% upper {upper:.6f} (limit {MAX_PAIRED_RATIO:.2f})")
+        if not math.isfinite(upper) or upper > MAX_PAIRED_RATIO:
+            failures.append(f"{clock} paired 95% upper {upper:.6f} exceeds {MAX_PAIRED_RATIO:.2f}")
+    if failures:
+        raise SystemExit("same-input compiler budget exceeded:\n  " + "\n  ".join(failures))
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -74,6 +163,9 @@ def retired_instructions() -> int | None:
 
 
 def main() -> None:
+    if len(sys.argv) == 5 and sys.argv[1] == "--record-comparison":
+        record_comparison(*map(Path, sys.argv[2:]))
+        return
     if not COMPILER.exists():
         raise SystemExit(f"build {COMPILER.relative_to(ROOT)} first (make build/minyarc)")
 
@@ -81,47 +173,19 @@ def main() -> None:
     warm_up = compile_once()
     validate_compile_output(warm_up)
 
-    wall_p90 = float("inf")
-    cpu_p90: float | None = float("inf") if resource else None
-    for _ in range(BATCHES):
-        walls: list[float] = []
-        cpus: list[float] = []
-        for _ in range(RUNS):
-            # Cleanup and correctness I/O stay outside the measured interval.
-            OUTPUT.unlink(missing_ok=True)
-            before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
-            started = time.perf_counter()
-            result = compile_once()
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            if before:
-                after = resource.getrusage(resource.RUSAGE_CHILDREN)
-            validate_compile_output(result)
-            walls.append(elapsed_ms)
-            if before:
-                cpus.append(((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)) * 1000)
-        wall_p90 = min(wall_p90, percentile(walls, 0.9))
-        if cpu_p90 is not None:
-            cpu_p90 = min(cpu_p90, percentile(cpus, 0.9))
+    instructions = retired_instructions()
     peak_rss_mib = None
     if resource:
         units = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         peak_rss_mib = units / (1024 * 1024) if sys.platform == "darwin" else units / 1024
-    instructions = retired_instructions()
-
-    print(f"self-compile, best of {BATCHES} batches of {RUNS} runs on {platform.machine()}:")
-    print(f"  wall 90th percentile: {wall_p90:.2f} ms (limit {MAX_WALL_P90_MS:.2f} ms)")
-    if cpu_p90 is not None:
-        print(f"  CPU 90th percentile:  {cpu_p90:.2f} ms (limit {MAX_CPU_P90_MS:.2f} ms)")
+    print(f"self-compile resources on {platform.machine()}:")
     if peak_rss_mib is not None:
         print(f"  peak memory:          {peak_rss_mib:.1f} MiB (limit {MAX_PEAK_RSS_MIB:.1f} MiB)")
     if instructions is not None:
         print(f"  instructions retired: {instructions / 1e6:.2f} M (limit {MAX_INSTRUCTIONS / 1e6:.2f} M)")
 
     failures = []
-    if wall_p90 > MAX_WALL_P90_MS:
-        failures.append(f"wall 90th percentile {wall_p90:.2f} ms is over the {MAX_WALL_P90_MS:.2f} ms budget")
-    if cpu_p90 is not None and cpu_p90 > MAX_CPU_P90_MS:
-        failures.append(f"CPU 90th percentile {cpu_p90:.2f} ms is over the {MAX_CPU_P90_MS:.2f} ms budget")
+    paired = sys.platform == "darwin" or "MINYAR_BUDGET_PREVIOUS_COMPILER" in os.environ
     if peak_rss_mib is not None and peak_rss_mib > MAX_PEAK_RSS_MIB:
         failures.append(f"peak memory {peak_rss_mib:.1f} MiB is over the {MAX_PEAK_RSS_MIB:.1f} MiB budget")
     if instructions is not None and instructions > MAX_INSTRUCTIONS:
@@ -129,6 +193,12 @@ def main() -> None:
     if failures:
         raise SystemExit("self-compile budget exceeded:\n  " + "\n  ".join(failures))
     check_compiler_behavior(OUTPUT)
+    if paired:
+        required = ("MINYAR_BUDGET_PREVIOUS_COMPILER", "MINYAR_BUDGET_FIXED_INPUT", "MINYAR_BUDGET_COMPARISON_MANIFEST")
+        if any(name not in os.environ for name in required):
+            raise SystemExit("macOS wall qualification requires the matched previous compiler and fixed input")
+        wall_comparison(*(Path(os.environ[name]) for name in required),
+                        ROOT / "build/performance-evidence/self-compile-pairs.json")
     print("self-compile budget met")
 
 
