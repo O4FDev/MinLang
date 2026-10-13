@@ -1,0 +1,105 @@
+use "../../tools/testing.min" as test
+use "../../tools/cycle-runtime.min" as cycles
+use "../sha256-support.min" as shell
+use "system" as system
+use "files" as files
+
+function checked(command: List<Text>, environment: List<Text>, log: Text): test.Result {
+    let result = test.run(command, environment, "", log, 600)
+    test.check(result.status == 0, joinText(command) + ":\n" + result.output + result.errorOutput)
+    return result
+}
+function absolute(path: Text, work: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "cd \"$(dirname -- \"$1\")\" && printf '%s/%s' \"$(pwd -P)\" \"$(basename -- \"$1\")\"", "sh", path], system.environment(), "", work + "/resolve", 10)
+    test.require(result, "resolve " + path)
+    return result.output
+}
+function sanitizerEnabled(flags: List<Text>, sanitizer: Text): Boolean {
+    let enabled = false
+    for flag in flags {
+        let raw = Bytes(flag)
+        let equals = -1
+        for index in 0..raw.length { if raw[index] == 61 && equals < 0 { equals = index } }
+        if equals < 0 { continue }
+        let option = Text(raw.slice(0, equals))
+        let names = Text(raw.slice(equals + 1, raw.length))
+        let listed = false
+        let negated = false
+        let start = 0
+        let bytes = Bytes(names)
+        for index in 0..(bytes.length + 1) {
+            if index == bytes.length || bytes[index] == 44 {
+                let name = Text(bytes.slice(start, index))
+                if name == sanitizer { listed = true }
+                if name == sanitizer || name == "all" { negated = true }
+                start = index + 1
+            }
+        }
+        if option == "-fsanitize" && listed { enabled = true }
+        else if option == "-fno-sanitize" && negated { enabled = false }
+    }
+    return enabled
+}
+function linked(command: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in command { if item != "-lm" { result.add(item) } }
+    result.add("-lm")
+    return result
+}
+
+let work = test.scratch()
+let current = absolute(".", work)
+let root = Text(Bytes(current).slice(0, Bytes(current).length - 2))
+let compiler = absolute(test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc"), work)
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let flags = shell.shellWords(system.getenv("MINYAR_TEST_LINK_FLAGS"))
+test.check(!sanitizerEnabled(flags, "thread"), "coverage programs do not instrument ThreadSanitizer LLVM")
+let environment = system.environment()
+for name in ["MINYAR_CALLBACK_COMPILER", "MINYAR_ERRORS_COMPILER", "MINYAR_TEST_MODULE_COMPILER", "MINYAR_MODULE_CALLBACK_COMPILER"] {
+    environment = shell.environment(environment, name, compiler)
+}
+let suites = ["callbacks", "errors-language", "errors-values", "thread-compiler", "incremental-language-hardening", "incremental-modules"]
+if fileExists(root + "/compiler/stages/c-layout.min") { suites.add("c-layout-records") }
+let native: List<Boolean> = []
+let targets = ["make", "-s"]
+for suite in suites {
+    let isNative = !fileExists(root + "/tests/" + suite + ".py") && fileExists(root + "/tests/" + suite + ".min")
+    native.add(isNative)
+    if isNative { targets.add("build/tooling/tests/" + suite) }
+}
+if targets.length > 2 {
+    let result = test.run(targets, environment, root, work + "/make", 600)
+    test.check(result.status == 0, joinText(targets) + ":\n" + result.output + result.errorOutput)
+}
+for index in 0..suites.length {
+    let command = ["python3", root + "/tests/" + suites[index] + ".py"]
+    if native[index] { command = [root + "/build/tooling/tests/" + suites[index]] }
+    let result = test.run(command, environment, root, work + "/" + suites[index], 600)
+    test.check(result.status == 0, joinText(command) + ":\n" + result.output + result.errorOutput)
+    print(suites[index] + ": passed")
+}
+let runtimeSource = work + "/runtime.c"
+writeTextFile(runtimeSource, cycles.engineSource(root) + "\n#include \"minyar_stack_frames.h\"\n")
+let runtime = work + "/runtime.o"
+let compileRuntime = [clang, "-O1"]
+for flag in flags { compileRuntime.add(flag) }
+for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", root + "/runtime", "-c", runtimeSource, "-o", runtime] { compileRuntime.add(item) }
+checked(compileRuntime, system.environment(), work + "/runtime")
+let names = ["nested", "ownership", "control-flow", "limits", "results-imports"]
+let outputs = ["7\n-1\n", "0\nfresh text\n3\n", "42\nfalse\nfalse\n10\n", "-1\n0\n14\n14\n0\nfalse\n42\n-1\n", "12\nfalse\n"]
+for index in 0..names.length {
+    let llvm = work + "/" + names[index] + ".ll"
+    checked([compiler, root + "/tests/calldepth/" + names[index] + ".min", llvm, "--bounded-owners", "32", "--library", root + "/library"], system.environment(), work + "/compile")
+    if sanitizerEnabled(flags, "address") { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+    for optimization in ["-O0", "-O2"] {
+        let executable = work + "/" + names[index] + optimization
+        let command = [clang, optimization]
+        for flag in flags { command.add(flag) }
+        for item in ["-Wno-override-module", llvm, runtime, "-pthread", "-lm", "-o", executable] { command.add(item) }
+        checked(linked(command), system.environment(), work + "/link")
+        let result = checked([executable], system.environment(), work + "/run")
+        test.check(result.output == outputs[index] && result.errorOutput == "", names[index] + ": unexpected output " + result.output + result.errorOutput)
+    }
+    print(names[index] + ": passed")
+}
+test.removeTree(work)
