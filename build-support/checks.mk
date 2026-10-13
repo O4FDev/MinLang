@@ -10,8 +10,13 @@ check: check-runtime-cache
 check-ownership-policy: build/minyarc build/minyarc-modules build/minyar-module-build
 	$(LIMITED) python3 tests/ownership-policy.py
 
-check-stack-ownership:
-	$(SANITIZER_LIMITED) python3 tests/stack-ownership.py --clang "$(LLVM_CC)"
+STACK_OWNERSHIP_BOUNDED = $(foreach profile,system fixed lazy,$(foreach budget,1 2 8 9 32 1024,$(foreach mode,native sanitize,check-stack-ownership-$(profile)-$(budget)-$(mode))))
+STACK_OWNERSHIP_FALLBACK = $(foreach profile,eager arena,$(foreach mode,native sanitize,check-stack-ownership-$(profile)-32-$(mode)))
+.PHONY: $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK)
+check-stack-ownership: $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK)
+$(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK): build/tooling/tests/stack-ownership tests/stack-ownership-runtime.c tests/stack-ownership-fallback.c tests/stack-ownership-runtime-source.h experiments/memory/production-live-oracle.c $(RUNTIME_HEADERS)
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/stack-ownership $(word 4,$(subst -, ,$@)) $(word 5,$(subst -, ,$@)) $(word 6,$(subst -, ,$@))
+
 
 check: check-ownership-policy check-stack-ownership
 
@@ -58,8 +63,8 @@ check-conformance: build/minyarc build/minyar-runtime.o build/tooling/tests/conf
 
 check: check-conformance
 
-check-memory: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/memory.py
+check-memory: build/minyarc build/minyar-runtime.o build/tooling/tests/memory
+	$(LIMITED) ./build/tooling/tests/memory
 
 check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
@@ -170,13 +175,13 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
-check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
+check-sanitize: build/tooling/tests/memory check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/regressions.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/memory.py Memory.test_shared_returned_and_nested_values
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
 check-stress: build/minyarc build/minyar-runtime.o
 	MINYAR_FUZZ_CASES=2000 $(LIMITED) python3 tests/fuzz.py
@@ -243,10 +248,10 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	grep -q "block comment is missing its closing" build/comment-error.txt
 	@echo "Minyar -> LLVM IR -> native executable verified"
 
-check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o
+check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory
 	$(LIMITED) python3 tests/ownership.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/memory.py Memory.test_shared_returned_and_nested_values
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
 check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize build/ownership-runtime.o
 	$(LIMITED) python3 tests/adversarial.py
