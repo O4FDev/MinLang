@@ -39,7 +39,21 @@ def observe(process, timeout, period=1):
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     previous_handlers = {}
+    closed = False
+    def cleanup():
+        nonlocal closed
+        if closed: return
+        closed = True
+        try:
+            selector.close()
+            stop(process)
+            process.stdout.close()
+            if process.stderr is not None: process.stderr.close()
+        finally:
+            for value, handler in previous_handlers.items():
+                signal.signal(value, handler)
     def interrupt(signum, frame):
+        cleanup()
         raise KeyboardInterrupt(f'soak observation interrupted by signal {signum}')
     try:
         # The native target owns another session, so driver termination alone
@@ -69,14 +83,7 @@ def observe(process, timeout, period=1):
                     yield {'line': line.decode('utf-8'), 'elapsed_seconds': time.monotonic() - started}
                 if len(pending) > 65536: raise ValueError('soak output line exceeded 64 KiB')
     finally:
-        try:
-            selector.close()
-            stop(process)
-            process.stdout.close()
-            if process.stderr is not None: process.stderr.close()
-        finally:
-            for value, handler in previous_handlers.items():
-                signal.signal(value, handler)
+        cleanup()
 
 def memory_summary(samples, warmup=60):
     # Online centered moments consume iterators without retaining sample rows.
