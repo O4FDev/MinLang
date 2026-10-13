@@ -145,6 +145,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
@@ -160,6 +161,23 @@ jobs:
         run: |
           make LIMITED= SANITIZER_LIMITED= build/minyarc build/compiler-stage3.ll build/minyar-runtime.o
           cmp build/compiler-stage2.ll build/compiler-stage3.ll
+      - name: Build previous v2 compiler with the same runtime and flags
+        env:
+          PREVIOUS_V2: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$PREVIOUS_V2" ] || [ "$PREVIOUS_V2" = 0000000000000000000000000000000000000000 ]; then PREVIOUS_V2="$(git rev-parse HEAD^)"; fi
+          git fetch --no-tags origin "$PREVIOUS_V2"
+          control="$(mktemp -d "$RUNNER_TEMP/minyar-budget-previous.XXXXXXXX")"
+          mkdir -p "$control/build"
+          git archive "$PREVIOUS_V2" compiler build-support/compiler.mk | tar -x -C "$control"
+          make -C "$control" -f build-support/compiler.mk build/compiler.min
+          cp "$control/build/compiler.min" build/compiler-budget-input.min
+          ./build/minyarc build/compiler-budget-input.min build/compiler-budget-previous.ll
+          make LIMITED= SANITIZER_LIMITED= build/minyarc-budget-previous
+          MINYAR_BUDGET_PREVIOUS_REF="$PREVIOUS_V2" python3 tests/self-compile-budget.py --record-comparison build/minyarc-budget-previous build/compiler-budget-input.min build/performance-evidence/compiler-comparison.json
+          echo "MINYAR_BUDGET_PREVIOUS_COMPILER=$GITHUB_WORKSPACE/build/minyarc-budget-previous" >> "$GITHUB_ENV"
+          echo "MINYAR_BUDGET_FIXED_INPUT=$GITHUB_WORKSPACE/build/compiler-budget-input.min" >> "$GITHUB_ENV"
+          echo "MINYAR_BUDGET_COMPARISON_MANIFEST=$GITHUB_WORKSPACE/build/performance-evidence/compiler-comparison.json" >> "$GITHUB_ENV"
       - name: Record native platform and PMU availability
         run: |
           mkdir -p build/performance-evidence
@@ -168,7 +186,7 @@ jobs:
           sysctl -n machdep.cpu.brand_string | tee build/performance-evidence/cpu.txt
           /usr/bin/time -l true 2> build/performance-evidence/pmu.txt
           cat build/performance-evidence/pmu.txt
-      - name: Enforce unchanged supported self-compilation ceilings
+      - name: Enforce paired CPU and wall bounds plus absolute RSS and instructions
         run: |
           set -o pipefail
           make LIMITED= SANITIZER_LIMITED= check-budget | tee build/performance-evidence/self-compile-budget.txt
@@ -182,7 +200,7 @@ jobs:
         run: |
           set -o pipefail
           make LIMITED= SANITIZER_LIMITED= check-performance | tee build/performance-evidence/performance.txt
-      - name: Upload platform and unchanged-gate evidence
+      - name: Upload platform and paired compiler measurements
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
