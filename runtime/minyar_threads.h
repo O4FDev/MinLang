@@ -14,7 +14,7 @@ typedef struct RcManagedThread {
 #else
     pthread_t thread;
 #endif
-    unsigned joining, joined;
+    unsigned joining, joined, finished;
     long long result, status;
     /* Accessed only by the creator domain, never by the worker/destructor. */
     struct RcManagedThread *parent_next;
@@ -63,6 +63,7 @@ static void *rc_thread_entry(void *pointer) {
     rc_thread_mutex_lock(&t->mutex);
     t->result = result;
     t->status = status;
+    t->finished = 1;
     rc_thread_mutex_unlock(&t->mutex);
     rc_thread_current = NULL;
     rc_thread_control_release(t); /* Running share survives all local teardown. */
