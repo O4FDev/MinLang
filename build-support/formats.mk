@@ -45,6 +45,10 @@ check-formats-pipeline: build/minyarc
 check-formats-pipeline-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/formats.py --sanitize
 
+.PHONY: check-erofs
+check-erofs: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) bash tests/erofs.sh
+
 check-formats: check-formats-wiring check-format-provider check-compression check-sha256 check-tar check-formats-pipeline
 check-formats-sanitize: check-compression-sanitize check-sha256-sanitize check-tar-sanitize check-formats-pipeline-sanitize
 

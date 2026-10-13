@@ -661,6 +661,10 @@ def main():
                 native += ['-pthread']
         elif library == 'quicinteropio':
             native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
+        elif library == 'erofs':
+            if platform.system() != 'Linux':
+                raise ValueError('the erofs package currently supports Linux')
+            native += [native_object(project, clang, base, 'erofs.c', native_flags)]
         elif library in ('sha256', 'tararchive'):
             from format_provider import format_provider
             cflags, provider_libraries = format_provider(library, clang, native_flags, link_flags)
