@@ -124,7 +124,7 @@ LAUNCHER_ARTIFACTS = ['build/minyarc', 'build/minyarc-modules', 'build/minyar-mo
 
 
 def tier_of(label):
-    return 'sanitize' if 'sanitiz' in label else 'full'
+    return 'sanitize' if 'sanitiz' in label or label in ('check-thread-language-tsan', 'check-thread-generated-recovery-tsan') else 'full'
 
 
 def in_tier(label, tier):
