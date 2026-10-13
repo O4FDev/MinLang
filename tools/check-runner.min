@@ -179,6 +179,10 @@ function command(plan: Plan, check: Check): List<Text> {
     args.add(check.target)
     return args
 }
+function slots(label: Text, jobs: Integer): Integer {
+    if label == "check-mutation-score" { return min(4, jobs) }
+    return 1
+}
 function monitored(plan: Plan, variant: Integer, args: List<Text>, log: Text, tmp: Text, label: Text): Integer {
     test.check(files.makeDirectory(tmp) == 0, "cannot create private process scratch")
     let alias = "/tmp/minyar-tests-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
@@ -186,6 +190,7 @@ function monitored(plan: Plan, variant: Integer, args: List<Text>, log: Text, tm
     writeTextFile(log + ".scratch-alias", alias)
     let env = environment(plan.variants[variant].environment, "TMPDIR", alias)
     env = environment(env, "MINYAR_CHECK_LABEL", label)
+    if label == "check-mutation-score" { env = environment(env, "MINYAR_TEST_JOBS", Text(slots(label, plan.jobs))) }
     return test.monitoredStart(args, env, plan.variants[variant].cwd, log, plan.timeout)
 }
 function removeAlias(log: Text) {
@@ -244,7 +249,7 @@ function execute(plan: Plan): Boolean {
                     if check.builder { plan.variants[check.variant].builder = false }
                     remaining -= 1
                 } else {
-                    active += 1
+                    active += slots(check.label, plan.jobs)
                     if check.exclusive { quiet = true } else { ordinary = true }
                 }
             }
@@ -276,6 +281,7 @@ function execute(plan: Plan): Boolean {
             for index in 0..plan.checks.length {
                 let check = plan.checks[index]
                 if check.state != 0 || !ready(plan, check) || !resourceAvailable(plan, check) { continue }
+                if active + slots(check.label, plan.jobs) > plan.jobs { continue }
                 if check.exclusive {
                     if ordinary || active >= max(1, plan.jobs / 4) { continue }
                 } else { if quiet { continue } }
@@ -308,7 +314,9 @@ function execute(plan: Plan): Boolean {
                 check.state = 1; check.log = log; check.started = system.monotonicNanoseconds()
                 if check.exclusive { quiet = true } else { ordinary = true }
             }
-            active += 1; launched = true
+            let cost = 1
+            if chosenCheck >= 0 { cost = slots(plan.checks[chosenCheck].label, plan.jobs) }
+            active += cost; launched = true
         }
         if active == 0 && !launched && remaining > 0 {
             for check in plan.checks {
