@@ -1,0 +1,245 @@
+use "../tools/testing.min" as test
+use "./cpython-random.min" as random
+use "machine" as machine
+use "system" as system
+
+public function open(path: Text): Integer { native "codecoracle" }
+public function close(): Integer { native "codecoracle" }
+function rawCompress(src: Integer, length: Integer, dst: Integer, capacity: Integer, format: Integer, level: Integer): Integer { native "codecoracle" }
+function rawDecompress(src: Integer, length: Integer, dst: Integer, capacity: Integer, format: Integer): Integer { native "codecoracle" }
+function rawZCompress(src: Integer, length: Integer, dst: Integer, capacity: Integer, level: Integer): Integer { native "codecoracle" }
+function rawZDecompress(src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function createCCtx(): Integer { native "codecoracle" }
+function createDCtx(): Integer { native "codecoracle" }
+function createCDict(src: Integer, length: Integer, level: Integer): Integer { native "codecoracle" }
+function createDDict(src: Integer, length: Integer): Integer { native "codecoracle" }
+function closeCCtx(handle: Integer) { native "codecoracle" }
+function closeDCtx(handle: Integer) { native "codecoracle" }
+function closeCDict(handle: Integer) { native "codecoracle" }
+function closeDDict(handle: Integer) { native "codecoracle" }
+function rawDictCompress(handle: Integer, dictionary: Integer, src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function rawDictDecompress(handle: Integer, dictionary: Integer, src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function zcompress(src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function zdecompress(src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function dictCompress(src: Integer, length: Integer, dst: Integer, capacity: Integer, dictionary: Integer, dictionaryLength: Integer): Integer { native "codecoracle" }
+function dictDecompress(src: Integer, length: Integer, dst: Integer, capacity: Integer, dictionary: Integer, dictionaryLength: Integer): Integer { native "codecoracle" }
+function checksum(src: Integer, length: Integer, dst: Integer, capacity: Integer): Integer { native "codecoracle" }
+function compress(input: Bytes, format: Integer, level: Integer, dictionary: Bytes): Bytes { native "codecoracle" }
+function inflate(input: Bytes, format: Integer): Bytes { native "codecoracle" }
+function inflateStatus(): Integer { native "codecoracle" }
+function crc32(input: Bytes): Integer { native "codecoracle" }
+record Decoded { count: Integer; value: Bytes }
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function append(target: Bytes, source: Bytes) { for byte in source { target.add(byte) } }
+function repeated(source: Bytes, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { append(result, source) }
+    return result
+}
+function sequence(count: Integer): Bytes {
+    let result = Bytes(count)
+    for index in 0..count { result[index] = index & 255 }
+    return result
+}
+function gzip(input: Bytes): Bytes { let output = compress(input, 0, 9, Bytes()); output[9] = 255; return output }
+function decode(kind: Integer, input: Bytes, capacity: Integer, format: Integer): Decoded {
+    let guarded = Bytes(capacity + 2)
+    for index in 0..guarded.length { guarded[index] = 0xa5 }
+    let source = machine.address(input)
+    let destination = machine.address(guarded) + 1
+    let count = 0
+    if kind == 0 { count = rawDecompress(source, input.length, destination, capacity, format) }
+    else if kind == 1 { count = rawZDecompress(source, input.length, destination, capacity) }
+    else { count = zdecompress(source, input.length, destination, capacity) }
+    test.check(guarded[0] == 0xa5 && guarded[guarded.length - 1] == 0xa5, "codec decompression overwrote a guard")
+    test.check(count <= capacity, "codec decompression exceeded destination capacity")
+    let length = count
+    if length < 0 { length = 0 }
+    return Decoded { count: count; value: guarded.slice(1, length + 1) }
+}
+function equal(actual: Decoded, expected: Bytes, phase: Text) { test.check(actual.count == expected.length && same(actual.value, expected), phase) }
+function independent(actual: Bytes, expected: Bytes, format: Integer) {
+    let value = inflate(actual, format)
+    test.check(inflateStatus() >= 0 && same(value, expected), "independent complete zlib decoder disagreed")
+}
+public function qualify(chunk: Text) {
+    let rng = random.seeded("5005")
+    let hello = Bytes("hello")
+    hello.add(0); append(hello, Bytes("world"))
+    let cases = [Bytes(), Bytes("x"), repeated(hello, 25), repeated(sequence(256), 16), random.bytes(rng, 65536)]
+    for data in cases {
+        let destination = Bytes(data.length + 512)
+        for format in 0..3 {
+            let count = rawCompress(machine.address(data), data.length, machine.address(destination), destination.length, format, 6)
+            test.check(count > 0, "raw deflate compression failed")
+            independent(destination.slice(0, count), data, format)
+            let packed = compress(data, format, 6, Bytes())
+            equal(decode(0, packed, data.length, format), data, "independent deflate frame changed")
+            if data.length > 0 { test.check(decode(0, packed, data.length - 1, format).count == -2, "deflate one-short cap changed") }
+            if packed.length < 500 { for cut in 0..packed.length { test.check(decode(0, packed.slice(0, cut), data.length, format).count == -3, "deflate truncation changed at " + Text(cut)) } }
+            let trailing = packed.slice(0, packed.length)
+            append(trailing, Bytes("xx"))
+            let expected = -8
+            if format == 0 { expected = -4 }
+            test.check(decode(0, trailing, data.length, format).count == expected, "deflate trailing-data diagnosis changed")
+            if format != 2 {
+                let positions = [-1, -4]
+                if format == 0 { positions = [-1, -5] }
+                for position in positions {
+                    let broken = packed.slice(0, packed.length)
+                    broken[broken.length + position] = broken[broken.length + position] ^ 0x80
+                    test.check(decode(0, broken, data.length, format).count == -4, "deflate trailer integrity changed")
+                }
+            }
+        }
+        let count = zcompress(machine.address(data), data.length, machine.address(destination), destination.length)
+        test.check(count > 0, "independent zstd compression failed")
+        let packed = destination.slice(0, count)
+        equal(decode(1, packed, data.length, 0), data, "independent zstd frame changed")
+        if data.length > 0 { test.check(decode(1, packed, data.length - 1, 0).count == -2, "zstd one-short cap changed") }
+        let cuts = packed.length
+        if cuts > 100 { cuts = 100 }
+        for cut in 0..cuts { test.check(decode(1, packed.slice(0, cut), data.length, 0).count < 0, "zstd truncation was accepted") }
+        count = rawZCompress(machine.address(data), data.length, machine.address(destination), destination.length, 3)
+        test.check(count > 0, "raw zstd compression failed")
+        equal(decode(2, destination.slice(0, count), data.length, 0), data, "independent zstd decoder disagreed")
+    }
+    let empty = gzip(Bytes())
+    let packed = gzip(Bytes("abc"))
+    append(packed, repeated(empty, 4))
+    equal(decode(0, packed, 3, 0), Bytes("abc"), "concatenated gzip empty members changed")
+    equal(decode(0, repeated(empty, 5), 0, 0), Bytes(), "zero-cap gzip empty members changed")
+    let extra = packed.slice(0, packed.length)
+    append(extra, gzip(Bytes("x")))
+    test.check(decode(0, extra, 3, 0).count == -2, "gzip extra nonempty member exceeded cap")
+    for cut in 1..empty.length {
+        let truncated = packed.slice(0, packed.length)
+        append(truncated, empty.slice(0, cut))
+        test.check(decode(0, truncated, 3, 0).count == -3, "gzip empty-member truncation changed")
+    }
+    let base = gzip(Bytes("header fields"))
+    let header = base.slice(0, 10)
+    header[3] = 0x1e
+    header.add(3); header.add(0)
+    append(header, Bytes("abcname")); header.add(0); append(header, Bytes("comment")); header.add(0)
+    let crc = crc32(header) & 65535
+    header.add(crc & 255); header.add(crc >> 8)
+    let optional = header.slice(0, header.length)
+    append(optional, base.slice(10, base.length))
+    equal(decode(0, optional, 13, 0), Bytes("header fields"), "gzip optional metadata changed")
+    let broken = optional.slice(0, optional.length)
+    broken[header.length - 1] = broken[header.length - 1] ^ 1
+    test.check(decode(0, broken, 13, 0).count == -4, "gzip header CRC was accepted")
+    broken = base.slice(0, base.length)
+    broken[0] = broken[0] ^ 1
+    test.check(decode(0, broken, 13, 0).count == -4, "gzip broken magic was accepted")
+    let payload = repeated(Bytes("checksum payload"), 20)
+    let destination = Bytes(1024)
+    let count = checksum(machine.address(payload), payload.length, machine.address(destination), destination.length)
+    test.check(count > 0, "checksummed reference zstd frame failed")
+    packed = destination.slice(0, count)
+    equal(decode(1, packed, 320, 0), payload, "zstd checksum exact-cap changed")
+    broken = packed.slice(0, packed.length)
+    broken[broken.length - 1] = broken[broken.length - 1] ^ 1
+    test.check(decode(1, broken, 320, 0).count == -4, "zstd corrupted checksum was accepted")
+    test.check(decode(1, broken, 100, 0).count == -2, "zstd output-cap error precedence changed")
+    equal(decode(1, repeated(packed, 2), 640, 0), repeated(payload, 2), "concatenated zstd payload changed")
+    let skippable = Bytes()
+    for byte in [0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 97, 98, 99] { skippable.add(byte) }
+    let skipped = skippable.slice(0, skippable.length)
+    append(skipped, packed); append(skipped, skippable)
+    equal(decode(1, skipped, 320, 0), payload, "zstd skippable frames changed")
+    let request = Bytes("dictionary request")
+    count = zcompress(machine.address(request), request.length, machine.address(destination), destination.length)
+    test.check(count > 0, "dictionary-ID reference frame failed")
+    let frame = destination.slice(0, count)
+    test.check((frame[4] & 3) == 0, "reference frame unexpectedly requests a dictionary")
+    frame[4] = frame[4] | 1
+    let requested = frame.slice(0, 5)
+    requested.add(0x2a)
+    append(requested, frame.slice(5, frame.length))
+    test.check(decode(1, requested, 18, 0).count == -5, "zstd dictionary request changed")
+    packed = compress(repeated(Bytes("dictionary"), 20), 1, 6, Bytes("dictionary"))
+    test.check(decode(0, packed, 200, 1).count == -5, "zlib FDICT diagnosis changed")
+    let dictionary = Bytes()
+    for byte in [0x37, 0xa4, 0x30, 0xec] { dictionary.add(byte) }
+    append(dictionary, repeated(Bytes("common dictionary record / payload / "), 100))
+    let original = dictionary.slice(0, dictionary.length)
+    let cd = createCDict(machine.address(dictionary), dictionary.length, 3)
+    let dd = createDDict(machine.address(dictionary), dictionary.length)
+    let ctx = createCCtx()
+    let dctx = createDCtx()
+    test.check(cd != 0 && dd != 0 && ctx != 0 && dctx != 0, "RAW dictionary or context creation failed")
+    payload = repeated(original.slice(4, original.length), 2)
+    destination = Bytes(payload.length + 512)
+    for index in 0..dictionary.length { dictionary[index] = 0 }
+    count = rawDictCompress(ctx, cd, machine.address(payload), payload.length, machine.address(destination), destination.length)
+    test.check(count > 0, "RAW dictionary compression failed")
+    let output = Bytes(payload.length + 1)
+    test.check(dictDecompress(machine.address(destination), count, machine.address(output), payload.length, machine.address(original), original.length) == payload.length, "independent RAW dictionary decompression length changed")
+    test.check(same(output.slice(0, payload.length), payload), "independent RAW dictionary decompression changed bytes")
+    count = dictCompress(machine.address(payload), payload.length, machine.address(destination), destination.length, machine.address(original), original.length)
+    test.check(count > 0, "independent RAW dictionary compression failed")
+    test.check(rawDictDecompress(dctx, dd, machine.address(destination), count, machine.address(output), payload.length) == payload.length, "copied RAW dictionary decompression length changed")
+    test.check(same(output.slice(0, payload.length), payload), "copied RAW dictionary decompression changed bytes")
+    test.check(rawDictDecompress(dctx, dd, machine.address(destination), count - 1, machine.address(output), payload.length) < 0, "dictionary truncation was accepted")
+    test.check(rawDictDecompress(dctx, dd, machine.address(destination), count, machine.address(output), payload.length) == payload.length, "dictionary failure poisoned context reuse")
+    closeCCtx(ctx); closeDCtx(dctx); closeCDict(cd); closeDDict(dd)
+    let source = sequence(64)
+    count = zcompress(machine.address(source), source.length, machine.address(destination), destination.length)
+    test.check(count > 0, "zstd mutation seed compression failed")
+    let seed = destination.slice(0, count)
+    for iteration in 0..400 {
+        let changed = seed.slice(0, seed.length)
+        let at = random.below(rng, changed.length)
+        changed[at] = changed[at] ^ (1 << random.below(rng, 8))
+        let observed = decode(1, changed, 256, 0)
+        let expected = decode(2, changed, 256, 0)
+        if expected.count < 0 { test.check(observed.count < 0, "zstd mutation rejected by oracle was accepted") }
+        else { test.check(observed.count == expected.count && same(observed.value, expected.value), "zstd accepted mutation differs from independent decoder") }
+    }
+    for format in 0..2 {
+        seed = gzip(sequence(64))
+        if format == 1 { seed = compress(sequence(64), 1, 6, Bytes()) }
+        for iteration in 0..400 {
+            let changed = seed.slice(0, seed.length)
+            let at = random.below(rng, changed.length)
+            changed[at] = changed[at] ^ (1 << random.below(rng, 8))
+            let observed = decode(0, changed, 256, format)
+            let expected = inflate(changed, format)
+            if inflateStatus() < 0 { test.check(observed.count < 0, "deflate mutation rejected by oracle was accepted") }
+            else { equal(observed, expected, "deflate accepted mutation differs from independent decoder") }
+        }
+    }
+    print("native interop/fuzz chunk=" + chunk + ": ok")
+}
+public function driver(executable: Text, directory: Text, environment: List<Text>) {
+    let source = directory + "/input.bin"
+    let output = directory + "/output.bin"
+    let payload = repeated(sequence(256), 100)
+    let names = ["gzip", "zlib", "raw"]
+    for format in 0..3 {
+        writeBytesFile(source, payload)
+        let result = test.run([executable, names[format], "compress", source, output, Text(payload.length + 1024)], environment, "", directory + "/file-compress-" + Text(format), 180)
+        test.require(result, "compression file driver")
+        test.check(result.output == "0\n", "compression file status changed")
+        independent(readBytesFile(output), payload, format)
+        let packed = compress(payload, format, 6, Bytes())
+        writeBytesFile(source, packed)
+        result = test.run([executable, names[format], "decompress", source, output, Text(payload.length)], environment, "", directory + "/file-decompress-" + Text(format), 180)
+        test.require(result, "decompression file driver")
+        test.check(result.output == "0\n" && same(readBytesFile(output), payload), "decompression file bytes or status changed")
+        result = test.run([executable, names[format], "decompress", source, output, Text(payload.length - 1)], environment, "", directory + "/file-limit-" + Text(format), 180)
+        test.require(result, "one-short file driver")
+        test.check(result.output == "-2\n" && readBytesFile(output).length == 0, "one-short file status or empty output changed")
+        writeBytesFile(source, packed.slice(0, packed.length - 1))
+        result = test.run([executable, names[format], "decompress", source, output, Text(payload.length)], environment, "", directory + "/file-truncated-" + Text(format), 180)
+        test.require(result, "truncated file driver")
+        test.check(result.output == "-3\n", "truncated file status changed")
+    }
+}
+

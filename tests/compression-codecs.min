@@ -1,0 +1,181 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as support
+use "./compression-codecs-oracle.min" as oracle
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Provider { flags: List<Text>; libraries: List<Text> }
+function query(context: support.Context, kind: Text): test.Result { return test.run(["python3", "tools/compression_provider.py", kind, "--clang", context.clang], context.environment, "", context.directory + "/provider-" + kind, 180) }
+function provider(context: support.Context, kind: Text): Provider {
+    let result = query(context, kind)
+    test.require(result, "production codec provider query")
+    let parsed = json.parse(result.output)
+    let flags = json.member(parsed, "cflags")
+    let libraries = json.member(parsed, "libraries")
+    test.check(flags.kind == json.ARRAY && libraries.kind == json.ARRAY, "invalid production codec provider arguments")
+    let compile: List<Text> = []
+    let link: List<Text> = []
+    for item in flags.items { test.check(item.kind == json.STRING, "invalid codec provider C flag"); compile.add(item.text) }
+    for item in libraries.items { test.check(item.kind == json.STRING, "invalid codec provider library"); link.add(item.text) }
+    return Provider { flags: compile; libraries: link }
+}
+function basename(path: Text): Text {
+    let raw = Bytes(path)
+    let begin = 0
+    for index in 0..raw.length { if raw[index] == 47 { begin = index + 1 } }
+    return Text(raw.slice(begin, raw.length))
+}
+function releaseMismatch(source: Text): Text {
+    let raw = Bytes(source)
+    let needle = Bytes("#define ZSTD_VERSION_RELEASE")
+    for start in 0..(raw.length - needle.length + 1) {
+        let matches = true
+        for index in 0..needle.length { if raw[start + index] != needle[index] { matches = false; break } }
+        if matches {
+            let begin = start + needle.length
+            test.check(begin < raw.length && raw[begin] <= 32, "invalid zstd release macro")
+            while begin < raw.length && raw[begin] <= 32 { begin += 1 }
+            let end = begin
+            while end < raw.length && raw[end] >= 48 && raw[end] <= 57 { end += 1 }
+            test.check(end > begin, "missing zstd release version")
+            return Text(raw.slice(0, begin)) + Text(Integer(Text(raw.slice(begin, end))) + 1) + Text(raw.slice(end, raw.length))
+        }
+    }
+    fail("missing zstd version release macro")
+    return ""
+}
+function providerContracts(context: support.Context, selected: Provider) {
+    test.check(selected.libraries.length > 0, "missing zstd static archive")
+    let archive = selected.libraries[0]
+    let raw = Bytes(archive)
+    test.check(raw.length > 0 && raw[0] == 47 && basename(archive) == "libzstd.a", "zstd provider must use an absolute matching static archive")
+    let include = ""
+    for index in 0..selected.flags.length { if selected.flags[index] == "-isystem" && index + 1 < selected.flags.length { include = selected.flags[index + 1]; break } }
+    test.check(include != "", "missing provider system header path")
+    let prefix = context.directory + "/isolated-provider"
+    support.run(context, ["mkdir", "-p", "--", prefix + "/include", prefix + "/lib"])
+    for name in ["zstd.h", "zstd_errors.h"] { support.run(context, ["cp", "--", include + "/" + name, prefix + "/include/" + name]) }
+    let original = context.environment
+    context.environment = support.environment(original, "MINYAR_ZSTD_PREFIX", prefix)
+    let missing = query(context, "zstd")
+    test.check(missing.status != 0 && test.contains(missing.output + missing.errorOutput, "same provider"), "missing matching absolute zstd archive was accepted")
+    support.run(context, ["cp", "--", archive, prefix + "/lib/libzstd.a"])
+    let matched = provider(context, "zstd")
+    test.check(matched.libraries.length > 0 && matched.libraries[0] == prefix + "/lib/libzstd.a", "isolated zstd prefix selected another archive")
+    let header = prefix + "/include/zstd.h"
+    writeTextFile(header, releaseMismatch(readTextFile(header)))
+    let mismatch = query(context, "zstd")
+    test.check(mismatch.status != 0 && test.contains(mismatch.output + mismatch.errorOutput, "version mismatch"), "mismatched zstd header/archive version was accepted")
+    context.environment = original
+    print("matched static provider contracts: ok")
+}
+function joined(flags: List<Text>): Text {
+    let pieces: List<Text> = []
+    for index in 0..flags.length { if index > 0 { pieces.add(" ") }; pieces.add("'" + test.replace(flags[index], "'", "'\\''") + "'") }
+    return joinText(pieces)
+}
+function nativeLink(context: support.Context, flags: List<Text>, cflags: List<Text>, libraries: List<Text>, sources: List<Text>, output: Text) {
+    let command = [context.clang]
+    for flag in flags { command.add(flag) }
+    for flag in cflags { command.add(flag) }
+    for source in sources { command.add(source) }
+    for library in libraries { command.add(library) }
+    for item in ["-o", output, "-lm"] { command.add(item) }
+    support.run(context, command)
+}
+function expected(context: support.Context, executable: Text, output: Text) { test.check(support.run(context, [executable]).output == output, "compression fixture output changed: " + executable) }
+
+let mode = "native"
+let nativeOnly = false
+let selectedCompiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let selectedClang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let artifacts = ""
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--native-only" { nativeOnly = true }
+    else if option == "--mode" || option == "--compiler" || option == "--clang" || option == "--artifacts" {
+        test.check(optionIndex + 1 < argumentCount(), "missing codec option value")
+        optionIndex += 1
+        if option == "--mode" { mode = argument(optionIndex) }
+        else if option == "--compiler" { selectedCompiler = argument(optionIndex) }
+        else if option == "--clang" { selectedClang = argument(optionIndex) }
+        else { artifacts = argument(optionIndex) }
+    } else { fail("unknown codec option: " + option) }
+    optionIndex += 1
+}
+test.check(mode == "native" || mode == "sanitize", "unknown codec mode")
+let scratch = test.scratch()
+let context = support.context(scratch, false)
+context.compiler = selectedCompiler
+context.clang = selectedClang
+context.timeout = 180
+context.environment = support.environment(context.environment, "ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1")
+context.environment = support.environment(context.environment, "UBSAN_OPTIONS", "halt_on_error=1")
+if artifacts != "" {
+    support.run(context, ["mkdir", "-p", "--", artifacts])
+    context.directory = test.lines(support.run(context, ["readlink", "-f", "--", artifacts]).output)[0]
+}
+let zstd = provider(context, "zstd")
+let deflate = provider(context, "deflate")
+providerContracts(context, zstd)
+let cflags = zstd.flags.slice(0, zstd.flags.length)
+for flag in deflate.flags { cflags.add(flag) }
+let libraries = zstd.libraries.slice(0, zstd.libraries.length)
+for library in deflate.libraries { libraries.add(library) }
+let flags = ["-O2"]
+if mode == "sanitize" { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+for chunk in ["4294967295", "7"] {
+    let executable = context.directory + "/native-" + chunk
+    let nativeFlags = ["-std=c11", "-Wall", "-Wextra", "-Werror"]
+    for flag in flags { nativeFlags.add(flag) }
+    nativeFlags.add("-DMINYAR_COMPRESSION_CHUNK=" + chunk)
+    nativeLink(context, nativeFlags, cflags, libraries, ["tests/compression-native.c", "runtime/native/zstd.c", "runtime/native/deflate.c"], executable)
+    expected(context, executable, "compression-native: ok\n")
+    let shared = context.directory + "/oracles-" + chunk + ".so"
+    nativeLink(context, ["-std=c11", "-O2", "-fPIC", "-shared", "-Wall", "-Wextra", "-Werror", "-DMINYAR_COMPRESSION_CHUNK=" + chunk, "-Wl,--exclude-libs,ALL"], cflags, libraries, ["runtime/native/zstd.c", "runtime/native/deflate.c", "tests/compression-reference.c"], shared)
+    test.check(oracle.open(shared) == 0, "cannot load private independent codec cohort")
+    oracle.qualify(chunk)
+    if chunk != "7" { test.check(oracle.close() == 0, "cannot close private codec cohort") }
+}
+if !nativeOnly {
+    context.compiler = test.lines(support.run(context, ["readlink", "-f", "--", context.compiler]).output)[0]
+    support.run(context, ["test", "-f", context.compiler])
+    let runtime = context.directory + "/runtime.o"
+    let command = [context.clang]
+    for flag in flags { command.add(flag) }
+    for item in ["-DMINYAR_SYSTEM_HEAP=1", "-c", "runtime/minyar_runtime.c", "-o", runtime] { command.add(item) }
+    support.run(context, command)
+    let launcher = test.lines(support.run(context, ["readlink", "-m", "--", "build/minyarc"]).output)[0]
+    let binaries: List<Text> = []
+    for name in ["compression", "compression-driver", "compression-stream"] {
+        let raw = context.directory + "/" + name + ".raw.ll"
+        support.run(context, [context.compiler, "tests/" + name + ".min", raw, "--library", "library"])
+        let ir = raw
+        if mode == "sanitize" { ir = context.directory + "/" + name + ".asan.ll"; writeTextFile(ir, test.instrument(readTextFile(raw))) }
+        let binary = context.directory + "/" + name + "-manual"
+        let manualFlags = flags.slice(0, flags.length)
+        manualFlags.add("-Wno-override-module")
+        nativeLink(context, manualFlags, cflags, libraries, [ir, runtime, "runtime/native/zstd.c", "runtime/native/deflate.c"], binary)
+        binaries.add(binary)
+        let environment = support.environment(context.environment, "MINYAR_CLANG", context.clang)
+        environment = support.environment(environment, "MINYAR_CLANG_FLAGS", joined(flags))
+        environment = support.environment(environment, "MINYAR_NATIVE_FLAGS", joined(flags))
+        let normal = context.directory + "/" + name + "-driver"
+        let result = test.run(["python3", "tools/clang-driver.py", "link", context.root, raw, runtime, normal, "0"], environment, "", context.directory + "/normal-link-" + name, 180)
+        test.require(result, "production compression link driver")
+        if name == "compression" || name == "compression-stream" { expected(context, binary, name + ": ok\n"); expected(context, normal, name + ": ok\n") }
+        if context.compiler == launcher {
+            let normalLauncher = context.directory + "/" + name + "-normal"
+            environment = support.environment(environment, "MINYAR_RUNTIME_FLAGS", joined(flags))
+            result = test.run(["./minyar", "tests/" + name + ".min", "-o", normalLauncher], environment, "", context.directory + "/launcher-link-" + name, 180)
+            test.require(result, "standard compression launcher")
+            if name == "compression" || name == "compression-stream" { expected(context, normalLauncher, name + ": ok\n") }
+        }
+    }
+    oracle.driver(binaries[1], context.directory, context.environment)
+}
+test.check(oracle.close() == 0, "cannot close final private codec cohort")
+test.removeTree(scratch)
+print("compression " + mode + ": all selected contracts passed")
