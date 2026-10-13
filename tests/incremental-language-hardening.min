@@ -1,0 +1,112 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "system" as system
+use "files" as files
+
+record Case { context: test.Compiler; directory: Text; entry: Text; prior: Text; next: Text; stats: Text; llvm: Text; moduleCompiler: Text }
+function open(context: test.Compiler, moduleCompiler: Text, name: Text): Case {
+    let directory = context.directory + "/" + name
+    test.check(files.makeDirectory(directory) == 0, "cannot create case directory")
+    writeTextFile(directory + "/prior.state", "")
+    return Case { context: context; directory: directory; entry: directory + "/main.min"; prior: directory + "/prior.state"; next: directory + "/next.state"; stats: directory + "/stats.txt"; llvm: directory + "/incremental.ll"; moduleCompiler: moduleCompiler }
+}
+function compare(item: Case, expected: Text, fallback: Boolean, library: Text, native: Text) {
+    let options: List<Text> = []
+    if library != "" { options = ["--library", library] }
+    let direct = item.directory + "/direct.ll"
+    let commands = [[item.context.executable, item.entry, direct], [item.moduleCompiler, item.entry, item.llvm, "--module-state", item.prior, item.next, item.stats]]
+    for command in commands {
+        for option in options { command.add(option) }
+        let result = test.run(command, system.environment(), "", item.directory + "/compile", 30)
+        test.check(result.status == 0, result.errorOutput)
+    }
+    if fallback {
+        let stats = test.words(readTextFile(item.stats))
+        test.check(stats[0] == "0", "fallback reused stale code")
+        test.check(stats[6] == "false", "fallback reused stale type tables")
+        test.check(readTextFile(item.next) == "", "fallback published unsupported cache interfaces")
+    } else if readTextFile(item.next) != "" {
+        writeTextFile(item.prior, readTextFile(item.next))
+    }
+    for llvm in [direct, item.llvm] {
+        if test.addressEnabled(item.context.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+        for optimization in ["-O0", "-O2"] {
+            let executable = llvm + optimization
+            let command = [item.context.clang, optimization]
+            for flag in item.context.flags { command.add(flag) }
+            for value in ["-Wno-override-module", llvm, item.context.runtime] { command.add(value) }
+            if native != "" { command.add(native) }
+            for value in ["-o", executable, "-lm"] { command.add(value) }
+            let link = test.run(command, system.environment(), "", executable + ".link", 30)
+            test.check(link.status == 0, link.errorOutput)
+            let result = test.run([executable], system.environment(), "", executable + ".run", 10)
+            test.check(result.status == 0, result.errorOutput)
+            test.check(result.output == expected, "incremental program output changed\n" + result.output)
+        }
+    }
+}
+function constants(item: Case) {
+    let library = item.directory + "/values.min"
+    writeTextFile(library, "public function answer(): Integer { return 40 }\n")
+    writeTextFile(item.entry, "use \"./values.min\" as values\nprint(values.answer() + 2)\n")
+    compare(item, "42\n", false, "", "")
+    test.check(readTextFile(item.prior) != "", "control did not publish a reusable cache")
+    let saved = readTextFile(item.prior)
+    writeTextFile(library, "public constant ANSWER = 41\n")
+    writeTextFile(item.entry, "use \"./values.min\" as values\nprint(values.ANSWER + 1)\n")
+    compare(item, "42\n", true, "", "")
+    writeTextFile(library, "public constant ANSWER = 99\n")
+    compare(item, "100\n", true, "", "")
+    writeTextFile(item.directory + "/other.min", "public constant ANSWER = 8\n")
+    writeTextFile(item.entry, "use \"./other.min\" as values\nprint(values.ANSWER + 1)\n")
+    compare(item, "9\n", true, "", "")
+    test.check(readTextFile(item.prior) == saved, "constant fallback replaced the cache")
+    writeTextFile(library, "public function answer(): Integer { return 6 }\n")
+    writeTextFile(item.entry, "use \"./values.min\" as values\nprint(values.answer())\n")
+    compare(item, "6\n", false, "", "")
+}
+function privateConstants(item: Case) {
+    writeTextFile(item.entry, "constant VALUE = 2.5\nprint(VALUE)\n")
+    compare(item, "2.5\n", true, "", "")
+}
+function newlineSyntax(item: Case) {
+    writeTextFile(item.entry, "function category(\nvalue: Integer\n): Integer {\nif value < 0 { return 1 }\nelse if value == 0 { return 2 }\nelse { return 3 }\n}\nprint(category(\n0\n))\n")
+    compare(item, "2\n", false, "", "")
+    compare(item, "2\n", false, "", "")
+    test.check(test.words(readTextFile(item.stats))[0] == "1", "newline syntax did not reuse the cache")
+}
+function nativeLinkage(item: Case) {
+    writeTextFile(item.directory + "/native.min", "public function answer(): Integer { native \"test\" }\n")
+    writeTextFile(item.directory + "/native.c", "#include <stdint.h>\nint64_t minyar_test_answer(void) { return 42; }\n")
+    writeTextFile(item.entry, "use \"./native.min\" as native\nprint(native.answer())\n")
+    compare(item, "42\n", true, "", item.directory + "/native.c")
+    compare(item, "42\n", true, "", item.directory + "/native.c")
+}
+function packagePaths(item: Case) {
+    let first = item.directory + "/library-one"
+    let second = item.directory + "/library-two"
+    test.check(files.makeDirectory(first) == 0 && files.makeDirectory(second) == 0, "cannot create library directories")
+    writeTextFile(first + "/numbers.min", "public function answer(): Integer { return 42 }\n")
+    writeTextFile(second + "/numbers.min", "public function answer(): Integer { return 7 }\n")
+    writeTextFile(item.entry, "use \"numbers\" as numbers\nprint(numbers.answer())\n")
+    compare(item, "42\n", true, first, "")
+    compare(item, "7\n", true, second, "")
+}
+
+let names = ["test_constants_and_import_edits_cannot_reuse_stale_code", "test_private_entry_constants", "test_newline_syntax_retains_normal_cache_reuse", "test_native_linkage_survives_incremental_mode", "test_package_path_edits_use_the_selected_library"]
+let selectors = port.selectors("IncrementalLanguageHardening", names)
+let context = port.compiler()
+let moduleCompiler = test.setting("MINYAR_TEST_MODULE_COMPILER", "build/minyarc-modules")
+let ran = 0
+for index in 0..names.length {
+    if !port.selected(selectors, "IncrementalLanguageHardening", names[index]) { continue }
+    let item = open(context, moduleCompiler, "case-" + Text(index))
+    if index == 0 { constants(item) }
+    else if index == 1 { privateConstants(item) }
+    else if index == 2 { newlineSyntax(item) }
+    else if index == 3 { nativeLinkage(item) }
+    else { packagePaths(item) }
+    ran += 1
+}
+test.removeTree(context.directory)
+print("IncrementalLanguageHardening: " + Text(ran) + " checks passed")
