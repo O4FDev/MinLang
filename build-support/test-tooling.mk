@@ -23,3 +23,12 @@ check-portable-process: build/tooling/tests/portable-process
 	$(LIMITED) ./build/tooling/tests/portable-process
 
 check check-portable: check-portable-process
+
+.PHONY: check-clang-cache
+check-clang-cache: build/tooling/tests/clang-cache build/tooling/tools/clang-cache
+	$(SANITIZER_LIMITED) ./build/tooling/tests/clang-cache "$(LLVM_CC)" "$(CURDIR)/build/tooling/tools/clang-cache"
+
+check: check-clang-cache
+
+build/tooling/tools/clang-cache: build/tooling/tools/clang-cache.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) runtime/native/sha256.c
+	$(LLVM_CC) $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@

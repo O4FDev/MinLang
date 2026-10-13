@@ -1,0 +1,83 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+let work = test.scratch()
+let compiler = argument(0)
+let cacheTool = argument(1)
+let cache = work + "/cache"
+let real = work + "/clang"
+writeTextFile(real, "#!/bin/sh\nrecord=1\nfor argument in \"$@\"; do case \"$argument\" in -E|-print-runtime-dir) record=0;; esac; done\nif [ \"$record\" = 1 ]; then printf 'compile\\n' >> '" + work + "/calls'; fi\nexec '" + compiler + "' \"$@\"\n")
+test.require(test.run(["/bin/chmod", "+x", real], system.environment(), "", work + "/chmod", 10), "fixture permission")
+writeTextFile(work + "/one.ll", "define i32 @main() {\n  ret i32 0\n}\n")
+writeTextFile(work + "/other.ll", readTextFile(work + "/one.ll"))
+function compile(tool: Text, real: Text, cache: Text, source: Text, output: Text, optimization: Text, log: Text): test.Result {
+    return test.run([tool, tool, cache, real, optimization, "-Wno-override-module", source, "-o", output], system.environment(), "", log, 30)
+}
+test.require(compile(cacheTool, real, cache, work + "/one.ll", work + "/one", "-O0", work + "/first"), "first real compiler invocation")
+test.require(compile(cacheTool, real, cache, work + "/other.ll", work + "/two", "-O0", work + "/second"), "equivalent source cache hit")
+test.check(readTextFile(work + "/calls") == "compile\n", "equivalent LLVM links compile once")
+test.require(test.run([work + "/two"], system.environment(), "", work + "/run", 10), "cached executable executes")
+test.require(compile(cacheTool, real, cache, work + "/one.ll", work + "/optimized", "-O2", work + "/flags"), "changed flags compile")
+test.check(test.lines(readTextFile(work + "/calls")).length == 2, "optimization flags invalidate cache")
+writeTextFile(work + "/one.ll", "define i32 @main() {\n  ret i32 7\n}\n")
+test.require(compile(cacheTool, real, cache, work + "/one.ll", work + "/changed", "-O0", work + "/contents"), "changed LLVM compiles")
+test.check(test.run([work + "/changed"], system.environment(), "", work + "/changed-run", 10).status == 7, "changed input affects executable")
+test.check(test.lines(readTextFile(work + "/calls")).length == 3, "content changes invalidate cache")
+writeTextFile(work + "/bad.ll", "invalid LLVM\n")
+for attempt in 0..2 {
+    let result = compile(cacheTool, real, cache, work + "/bad.ll", work + "/bad", "-O0", work + "/error" + Text(attempt))
+    test.check(result.status != 0 && result.errorOutput != "", "compiler failure preserves diagnostics")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == 5, "failed compiles never cached")
+writeTextFile(real, readTextFile(real) + "\n")
+test.require(compile(cacheTool, real, cache, work + "/other.ll", work + "/identity", "-O0", work + "/identity-log"), "compiler identity control")
+test.check(test.lines(readTextFile(work + "/calls")).length == 6, "compiler changes invalidate cache")
+function compileC(tool: Text, real: Text, cache: Text, source: Text, output: Text, flags: List<Text>, environment: List<Text>, log: Text): test.Result {
+    let command = [tool, tool, cache, real]
+    for flag in flags { command.add(flag) }
+    for item in [source, "-o", output] { command.add(item) }
+    return test.run(command, environment, "", log, 30)
+}
+let fixture = work + "/fixture.c"
+let header = work + "/private.h"
+let headerSource = "#define EXPECTED 2\nstatic int hidden;\nstatic _Thread_local int per_thread;\nstatic inline int step(void) { hidden++; per_thread++; return hidden + per_thread; }\n"
+writeTextFile(header, headerSource)
+writeTextFile(fixture, "#include \"private.h\"\n#include <stdio.h>\nint main(void) { int (*pointer)(void) = step; if (pointer != step || hidden != 0 || per_thread != 0 || pointer() != 2 || hidden != 1 || per_thread != 1) return 9; printf(\"%d\\n\", EXPECTED + VALUE); return 0; }\n")
+let nativeFlags = ["-O0", "-std=c11", "-DVALUE=0"]
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-one", nativeFlags, system.environment(), work + "/c-first"), "original complete C translation unit")
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-two", nativeFlags, system.environment(), work + "/c-hit"), "exact complete C translation unit cache hit")
+test.check(test.lines(readTextFile(work + "/calls")).length == 7, "identical configured C fixtures compile once")
+test.require(test.run(["/usr/bin/cmp", "-s", work + "/c-one", work + "/c-two"], system.environment(), "", work + "/c-identical", 10), "exact C artifact bytes are reused")
+let cRun = test.run([work + "/c-two"], system.environment(), "", work + "/c-run", 10)
+test.check(cRun.status == 0 && cRun.output == "2\n" && cRun.errorOutput == "", "cached fixture retains private static/TLS state, inline calls and pointer identity")
+writeTextFile(header, test.replace(headerSource, "EXPECTED 2", "EXPECTED 3"))
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-header", nativeFlags, system.environment(), work + "/c-header-log"), "changed included header")
+test.check(test.run([work + "/c-header"], system.environment(), "", work + "/c-header-run", 10).output == "3\n", "header changes reach executable")
+test.check(test.lines(readTextFile(work + "/calls")).length == 8, "included header bytes invalidate cache")
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-macro", ["-O0", "-std=c11", "-DVALUE=7"], system.environment(), work + "/c-macro-log"), "changed private fixture macro")
+test.check(test.run([work + "/c-macro"], system.environment(), "", work + "/c-macro-run", 10).output == "10\n", "fixture macro changes reach executable")
+test.check(test.lines(readTextFile(work + "/calls")).length == 9, "macro configuration invalidates cache")
+let sanFlags = ["-O1", "-g", "-std=c11", "-DVALUE=0", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-san-one", sanFlags, system.environment(), work + "/c-san-first"), "original instrumented fixture pipeline")
+test.require(compileC(cacheTool, real, cache, fixture, work + "/c-san-two", sanFlags, system.environment(), work + "/c-san-hit"), "exact instrumented fixture cache hit")
+test.check(test.lines(readTextFile(work + "/calls")).length == 10, "instrumented fixture has its own exact artifact")
+let sanRun = test.run([work + "/c-san-two"], system.environment(), "", work + "/c-san-run", 10)
+test.check(sanRun.status == 0 && sanRun.output == "3\n" && sanRun.errorOutput == "", "cached instrumentation retains private fixture assertions")
+let negative = work + "/negative.c"
+writeTextFile(negative, "#include <stdlib.h>\nint main(void) { volatile int *pointer = malloc(sizeof(int)); *pointer = 42; free((void *)pointer); return *pointer; }\n")
+for suffix in ["one", "two"] {
+    test.require(compileC(cacheTool, real, cache, negative, work + "/negative-" + suffix, ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"], system.environment(), work + "/negative-link-" + suffix), "instrumented negative link")
+    let result = test.run([work + "/negative-" + suffix], system.environment(), "", work + "/negative-run-" + suffix, 10)
+    test.check(result.status != 0 && test.contains(result.errorOutput, "heap-use-after-free"), "cache miss and hit retain the ASan negative oracle")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == 11, "negative fixture reuses only its identical instrumented artifact")
+let budget: List<Text> = []
+for entry in system.environment() { if !test.contains(entry, "MINYAR_CHECK_LABEL=") { budget.add(entry) } }
+budget.add("MINYAR_CHECK_LABEL=budget-control")
+for suffix in ["one", "two"] { test.require(compileC(cacheTool, real, cache, fixture, work + "/budget-" + suffix, nativeFlags, budget, work + "/budget-link-" + suffix), "budget fixture bypass") }
+test.check(test.lines(readTextFile(work + "/calls")).length == 13, "budget measurements never reuse compiler work")
+writeTextFile(fixture, "#include <stdio.h>\nint main(void) { puts(__TIME__); return 0; }\n")
+for suffix in ["one", "two"] { test.require(compileC(cacheTool, real, cache, fixture, work + "/volatile-" + suffix, ["-O0"], system.environment(), work + "/volatile-link-" + suffix), "volatile preprocessor input bypass") }
+test.check(test.lines(readTextFile(work + "/calls")).length == 15, "volatile time macros cannot publish an artifact cache hit")
+test.removeTree(work)
+print("Minyar compiler cache: passed")
