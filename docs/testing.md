@@ -11,7 +11,7 @@ targets are recorded in the hardening review.
 incremental launcher from an empty build directory with default development
 limits, toolchain and project paths containing spaces, and explicit LTO flags.
 It skips hosts without the POSIX incremental frontend.
-`tests/launcher-bootstrap-policy.py` independently checks that this interactive
+`tests/launcher-bootstrap-policy.min` independently checks that this interactive
 bootstrap context preserves resource caps, cannot raise an inherited hard CPU
 cap, stays scoped to bootstrap, and leaves bulk-check background policy intact.
 

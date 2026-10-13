@@ -1,0 +1,93 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha256
+
+function flags(stamp: json.Value): Text {
+    return json.string(json.member(stamp, "flags"), "COMPILER_LTO_FLAGS")
+}
+function program(binary: Text, log: Text): Text {
+    let result = test.run([binary], system.environment(), "", log, 10)
+    test.require(result, "cold bootstrap program")
+    return result.output
+}
+let scratch = test.scratch()
+let kernel = test.lines(support.output(["uname", "-s"], scratch + "/kernel"))[0]
+let clang = support.which(test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang")), scratch + "/which-clang")
+test.check(clang != "", "Clang is required for the cold bootstrap test")
+let root = test.lines(support.output(["pwd", "-P"], scratch + "/root"))[0]
+let work = scratch + "/minyar cold toolchain"
+let project = work + "/project with spaces"
+for directory in [work, project] { test.check(files.makeDirectory(directory) == 0, "cold bootstrap directories") }
+for name in ["compiler", "bootstrap", "runtime", "vendor", "tools", "scripts", "build-support", "library"] {
+    test.require(test.run(["cp", "-RLp", root + "/" + name, project + "/" + name], system.environment(), "", scratch + "/copy-tree", 120), "copy cold bootstrap tree " + name)
+}
+for name in ["Makefile", "minyar"] {
+    test.require(test.run(["cp", "-p", root + "/" + name, project + "/" + name], system.environment(), "", scratch + "/copy-file", 30), "copy cold bootstrap file " + name)
+}
+let selected = work + "/clang with spaces"
+writeTextFile(selected, "#!/bin/sh\nexec '" + clang + "' \"$@\"\n")
+test.require(test.run(["chmod", "755", selected], system.environment(), "", scratch + "/selected-mode", 10), "selected Clang mode")
+let selectedLinker = test.lines(support.output([clang, "-print-prog-name=ld.lld"], scratch + "/linker-name"))[0]
+let linker = support.which(selectedLinker, scratch + "/which-linker")
+test.check(linker != "", "Minyar requires LLVM 23.1.2; LLD executable not found: " + selectedLinker)
+let version = test.run([linker, "--version"], system.environment(), "", scratch + "/linker-version", 10)
+let versionWords = support.split(test.replace(test.replace(version.output, "\n", " "), "\t", " "), " ")
+let pinned = false
+for index in 0..(versionWords.length - 1) { if versionWords[index] == "LLD" && versionWords[index + 1] == "23.1.2" { pinned = true } }
+test.check(version.status == 0 && pinned, "Minyar requires LLVM 23.1.2; unsupported linker " + selectedLinker + ": " + version.output)
+let linkerIsFile = support.isFile(linker, scratch + "/linker-file")
+if linkerIsFile {
+    test.require(test.run(["ln", "-s", linker, work + "/ld.lld"], system.environment(), "", scratch + "/linker-link", 10), "link pinned LLD")
+}
+let environment: List<Text> = []
+for entry in system.environment() {
+    let keep = true
+    for name in ["LIMITED", "SANITIZER_LIMITED", "MAKEFLAGS", "MFLAGS", "COMPILER_LTO_FLAGS", "LLVM_FLAGS", "CC", "LLVM_CC", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG"] {
+        if support.starts(entry, name + "=") { keep = false }
+    }
+    if keep { environment.add(entry) }
+}
+environment.add("MINYAR_CLANG=" + selected)
+writeTextFile(project + "/leaf.min", "public function answer(values: List<Integer>): Integer {\nvalues.add(2)\nreturn values[0] + values[1]\n}\n")
+let source = project + "/main.min"
+writeTextFile(source, "use \"./leaf.min\" as leaf\nprint(leaf.answer([40]))\n")
+let binary = project + "/answer program"
+let command = [project + "/minyar", "--incremental", "--release", source, "-o", binary]
+let cold = test.run(command, environment, "", scratch + "/cold", 240)
+test.check(cold.status == 0, "cold bootstrap failed\n" + cold.output + cold.errorOutput)
+test.check(program(binary, scratch + "/cold-program") == "42\n", "cold bootstrap program output")
+let stamp = json.parse(readTextFile(project + "/build/.toolchain.json"))
+let explicit = flags(stamp)
+let options = support.shellWords(explicit)
+if kernel == "Linux" && linkerIsFile {
+    test.check(support.has(options, "-Wl,--threads=1"), "cold bootstrap bounds linker threads: " + explicit)
+    let chosen: List<Text> = []
+    for option in options { if support.starts(option, "-fuse-ld=") { chosen.add(Text(Bytes(option).slice(9, Bytes(option).length))) } }
+    test.check(chosen.length == 1 && support.resolve(chosen[0], scratch + "/chosen") == support.resolve(linker, scratch + "/pinned"), "cold bootstrap selects the pinned linker: " + explicit)
+}
+let again = test.run(command, support.merge(environment, ["COMPILER_LTO_FLAGS=" + explicit]), "", scratch + "/explicit", 240)
+test.check(again.status == 0, "explicit LTO bootstrap failed\n" + again.output + again.errorOutput)
+test.check(program(binary, scratch + "/explicit-program") == "42\n", "explicit LTO program output")
+test.check(flags(json.parse(readTextFile(project + "/build/.toolchain.json"))) == explicit, "explicit LTO flags must be retained exactly")
+let evidence = system.getenv("MINYAR_BOOTSTRAP_EVIDENCE")
+if evidence != "" {
+    let quoted: List<Text> = []
+    for option in options { quoted.add(json.quote(option)) }
+    let limits: List<Text> = []
+    for pair in [["MINYAR_MAX_MEMORY_MIB", "768"], ["MINYAR_MAX_CPU_SECONDS", "240"], ["MINYAR_MAX_FILE_BLOCKS", "262144"], ["MINYAR_NICE_PRIORITY", "15"]] {
+        limits.add("    " + json.quote(pair[0]) + ": " + json.quote(test.setting(pair[0], pair[1])))
+    }
+    let hashes: List<Text> = []
+    for name in ["tools/toolchain.sh", "tools/clang-driver.min", "tools/clang-driver-host.c", "build/compiler.min", "scripts/with-limits.sh", "tests/toolchain-bootstrap.min"] {
+        hashes.add("    " + json.quote(name) + ": " + json.quote(sha256.hex(sha256.digest(readBytesFile(root + "/" + name)))))
+    }
+    writeTextFile(evidence, "{\n  \"platform\": " + json.quote(support.output(["uname", "-srm"], scratch + "/platform")) +
+        ",\n  \"clang\": " + json.quote(support.output([clang, "--version"], scratch + "/clang-version")) +
+        ",\n  \"cold_default_returncode\": 0,\n  \"explicit_flags_returncode\": 0,\n  \"output\": \"42\\n\",\n  \"compiler_lto_options\": [" + support.join(quoted, ", ") +
+        "],\n  \"limited_override\": false,\n  \"resource_limits\": {\n" + support.join(limits, ",\n") + "\n  },\n  \"source_sha256\": {\n" + support.join(hashes, ",\n") + "\n  }\n}\n")
+}
+test.removeTree(scratch)
+print("cold public incremental bootstrap: default development limits, spaced toolchain paths and explicit LTO flags verified")

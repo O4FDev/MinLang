@@ -43,11 +43,11 @@ check: check-memory-contracts-harness
 .PHONY: check-release-build check-critical-path check-launcher-isolation
 check: check-launcher-isolation
 
-check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tools/clang-driver
-	$(LIMITED) python3 tests/launcher-isolation.py
+check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tools/clang-driver build/tooling/tests/launcher-isolation
+	$(LIMITED) ./build/tooling/tests/launcher-isolation
 
-check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
-	$(LIMITED) python3 tests/release-build.py
+check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tests/release-build
+	$(LIMITED) ./build/tooling/tests/release-build
 
 build/tooling/experiments/memory/critical-path-study.ll: experiments/memory/study-support.min experiments/memory/measurement-stats.min tests/cpython-random.min
 build/tooling/experiments/memory/critical-path-study: TOOL_RUNTIME = build/testing/cycle-runtime.o
@@ -405,13 +405,13 @@ build/tooling/tests/incremental-module-mutation: TOOL_NATIVE = runtime/native/sh
 build/tooling/tests/incremental-module-mutation: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/incremental-module-mutation: runtime/native/sha256.c
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions build/tooling/tests/launcher-isolation
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) ./build/tooling/tests/incremental-modules
 	$(LIMITED) ./build/tooling/tests/incremental-module-driver
 	$(LIMITED) ./build/tooling/tests/incremental-module-delta
 	$(LIMITED) ./build/tooling/tests/incremental-module-artifacts
-	$(LIMITED) python3 tests/incremental-launcher.py
+	$(LIMITED) ./build/tooling/tests/launcher-isolation --incremental
 	$(LIMITED) ./build/tooling/tests/incremental-module-regressions
 
 check: check-incremental-modules
@@ -442,9 +442,12 @@ check-toolchain-stamp:
 check-toolchain-portability: build/tooling/tools/clang-driver
 	python3 tests/toolchain-portability.py
 
+build/tooling/tests/toolchain-bootstrap: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/toolchain-bootstrap: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/toolchain-bootstrap: runtime/native/sha256.c
 .PHONY: check-cold-bootstrap
-check-cold-bootstrap:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/toolchain-bootstrap.py
+check-cold-bootstrap: build/tooling/tests/toolchain-bootstrap
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/toolchain-bootstrap
 
 check-module-driver-options: build/tooling/tests/module-driver-options
 	./build/tooling/tests/module-driver-options
@@ -661,8 +664,8 @@ check-memory-regressions: build/tooling/tests/memory-research-regressions
 check-memory-regressions-sanitize: build/tooling/tests/memory-research-regressions
 	$(SANITIZER_LIMITED) ./build/tooling/tests/memory-research-regressions --clang "$(LLVM_CC)" --sanitize
 
-check-bootstrap-policy:
-	python3 tests/launcher-bootstrap-policy.py
+check-bootstrap-policy: build/tooling/tests/launcher-bootstrap-policy
+	./build/tooling/tests/launcher-bootstrap-policy
 
 check-portable check: check-peer-semantics check-memory-regressions check-bootstrap-policy
 check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize

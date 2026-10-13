@@ -1,0 +1,175 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+record Fixture { scratch: Text; work: Text; log: Text; wrappers: List<Text>; environment: List<Text>; payload: Text; zsh: Text; serial: Integer }
+record Observation { arguments: List<Text>; cpu: Text; file: Text; priority: Integer }
+
+constant POLICY_SOURCE = "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"${POLICY_NO_MEMORY:-}\" = 1 ] && [ \"$argument\" = -m ]; then exit 64; fi\ndone\nprintf '%s\\n' \"$@\" > \"$POLICY_LOG\"\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m|-c) shift 2 ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\nexec \"$@\"\n"
+
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "BootstrapScheduling." + name { return true } }
+    return false
+}
+function setup(root: Text): Fixture {
+    let scratch = test.scratch()
+    let work = scratch + "/minyar bootstrap policy"
+    test.check(files.makeDirectory(work) == 0, "bootstrap policy work")
+    let policy = work + "/fake taskpolicy"
+    writeTextFile(policy, POLICY_SOURCE)
+    let wrappers: List<Text> = []
+    for name in ["with-limits.sh", "with-sanitizer-limits.sh"] {
+        let wrapper = work + "/" + name
+        writeTextFile(wrapper, test.replace(readTextFile(root + "/scripts/" + name), "/usr/sbin/taskpolicy", "'" + policy + "'"))
+        wrappers.add(wrapper)
+    }
+    let payload = work + "/payload with spaces.sh"
+    writeTextFile(payload, "printf '%s\\n' \"$(ulimit -St)\" \"$(ulimit -Sf)\" \"$(nice)\"\n")
+    test.require(test.run(["chmod", "755", policy], system.environment(), "", scratch + "/mode", 10), "fake taskpolicy mode")
+    let environment: List<Text> = []
+    for entry in support.environment(["POLICY_LOG=" + work + "/policy.log"]) {
+        let keep = true
+        for name in ["MINYAR_INTERACTIVE_BOOTSTRAP=", "MINYAR_NICE_PRIORITY=", "MINYAR_MAX_CPU_SECONDS=", "MINYAR_MAX_MEMORY_MIB=", "MINYAR_MAX_FILE_BLOCKS=", "POLICY_NO_MEMORY="] {
+            if support.starts(entry, name) { keep = false }
+        }
+        if keep { environment.add(entry) }
+    }
+    let zsh = support.which("zsh", scratch + "/which-zsh")
+    return Fixture { scratch: scratch; work: work; log: work + "/policy.log"; wrappers: wrappers; environment: environment; payload: payload; zsh: zsh; serial: 0 }
+}
+function ownPriority(fixture: Fixture): Integer {
+    return Integer(test.lines(support.output(["nice"], fixture.scratch + "/own-priority"))[0])
+}
+function invoke(fixture: Fixture, wrapper: Text, extra: List<Text>): Observation {
+    fixture.serial += 1
+    let result = test.run([fixture.zsh, wrapper, "/bin/bash", fixture.payload], support.merge(fixture.environment, extra), "", fixture.scratch + "/invoke" + Text(fixture.serial), 10)
+    test.check(result.status == 0, "bootstrap wrapper failed\n" + result.errorOutput)
+    let values = test.lines(result.output)
+    test.check(values.length == 3, "bootstrap payload output\n" + result.output)
+    return Observation { arguments: test.lines(readTextFile(fixture.log)); cpu: values[0]; file: values[1]; priority: Integer(values[2]) }
+}
+function prefix(values: List<Text>, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { if index < values.length { parts.add(values[index]) } }
+    return support.join(parts, " ")
+}
+function fileWithin(value: Text, blocks: Integer): Boolean {
+    if value == "unlimited" { return false }
+    return Integer(value) <= blocks
+}
+function finish(fixture: Fixture) {
+    test.removeTree(fixture.scratch)
+}
+let names = ["test_bulk_checks_keep_background_policy", "test_interactive_bootstrap_uses_normal_qos_with_the_same_caps", "test_foreground_context_retains_custom_caps",
+    "test_context_cannot_raise_an_inherited_hard_cpu_cap", "test_older_taskpolicy_keeps_scheduling_cpu_and_file_limits", "test_public_launcher_scopes_context_to_bootstrap"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "BootstrapScheduling." + name { valid = true } }
+    test.check(valid, "unknown bootstrap policy case " + argument(index))
+}
+let rootScratch = test.scratch()
+let root = test.lines(support.output(["pwd", "-P"], rootScratch + "/root"))[0]
+let posix = support.which("zsh", rootScratch + "/which-zsh") != ""
+test.removeTree(rootScratch)
+if !posix {
+    print("Bootstrap policy: skipped, POSIX launcher and zsh limits required")
+    exit(0)
+}
+let cases = 0
+if chosen("test_bulk_checks_keep_background_policy") {
+    let fixture = setup(root)
+    for wrapper in fixture.wrappers {
+        let observed = invoke(fixture, wrapper, [])
+        test.check(prefix(observed.arguments, 5) == "-b -c background -m 768", "bulk policy arguments " + support.join(observed.arguments, " "))
+        test.check(support.has(observed.arguments, "15"), "bulk policy priority")
+        test.check(observed.cpu == "240", "bulk policy CPU cap " + observed.cpu)
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_interactive_bootstrap_uses_normal_qos_with_the_same_caps") {
+    let fixture = setup(root)
+    let floor = min(19, ownPriority(fixture) + 15)
+    for wrapper in fixture.wrappers {
+        let observed = invoke(fixture, wrapper, ["MINYAR_INTERACTIVE_BOOTSTRAP=1"])
+        test.check(prefix(observed.arguments, 2) == "-m 768", "interactive memory policy")
+        test.check(!support.has(observed.arguments, "-b") && !support.has(observed.arguments, "background"), "interactive bootstrap must not be background")
+        test.check(observed.cpu == "240", "interactive CPU cap")
+        test.check(fileWithin(observed.file, 262144), "interactive file cap " + observed.file)
+        test.check(observed.priority >= floor, "interactive priority " + Text(observed.priority))
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_foreground_context_retains_custom_caps") {
+    let fixture = setup(root)
+    for wrapper in fixture.wrappers {
+        let observed = invoke(fixture, wrapper, ["MINYAR_INTERACTIVE_BOOTSTRAP=1", "MINYAR_MAX_CPU_SECONDS=17", "MINYAR_MAX_MEMORY_MIB=96", "MINYAR_MAX_FILE_BLOCKS=19", "MINYAR_NICE_PRIORITY=0"])
+        test.check(prefix(observed.arguments, 2) == "-m 96", "custom memory policy")
+        test.check(observed.cpu == "17", "custom CPU cap")
+        test.check(fileWithin(observed.file, 19), "custom file cap " + observed.file)
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_context_cannot_raise_an_inherited_hard_cpu_cap") {
+    let fixture = setup(root)
+    for wrapper in fixture.wrappers {
+        fixture.serial += 1
+        let command = [fixture.zsh, "-c", "ulimit -SH -t 2; exec \"$@\"", "nested", fixture.zsh, wrapper, "/bin/bash", fixture.payload]
+        let result = test.run(command, support.merge(fixture.environment, ["MINYAR_INTERACTIVE_BOOTSTRAP=1"]), "", fixture.scratch + "/nested" + Text(fixture.serial), 10)
+        test.check(result.status != 0, "hard CPU cap must refuse a larger context")
+        test.check(!support.exists(fixture.log), "policy must not run after a cap failure")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_older_taskpolicy_keeps_scheduling_cpu_and_file_limits") {
+    let fixture = setup(root)
+    let floor = min(19, ownPriority(fixture) + 15)
+    for wrapper in fixture.wrappers {
+        for interactive in ["0", "1"] {
+            let observed = invoke(fixture, wrapper, ["POLICY_NO_MEMORY=1", "MINYAR_INTERACTIVE_BOOTSTRAP=" + interactive])
+            test.check(!support.has(observed.arguments, "-m"), "older taskpolicy must not receive memory policy")
+            test.check(support.has(observed.arguments, "-b") == (interactive == "0"), "older taskpolicy background selection")
+            test.check(observed.cpu == "240", "older taskpolicy CPU cap")
+            test.check(fileWithin(observed.file, 262144), "older taskpolicy file cap")
+            test.check(observed.priority >= floor, "older taskpolicy priority")
+        }
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_public_launcher_scopes_context_to_bootstrap") {
+    let fixture = setup(root)
+    let project = fixture.work + "/project with spaces"
+    let fakes = fixture.work + "/fake tools"
+    for directory in [project, project + "/tools", project + "/build", project + "/build/tooling", project + "/build/tooling/tools", fakes] { test.check(files.makeDirectory(directory) == 0, "launcher project directories") }
+    test.require(test.run(["cp", "-p", root + "/minyar", project + "/minyar"], system.environment(), "", fixture.scratch + "/copy-launcher", 10), "copy public launcher")
+    test.require(test.run(["cp", "-p", root + "/tools/toolchain.sh", project + "/tools/toolchain.sh"], system.environment(), "", fixture.scratch + "/copy-toolchain", 10), "copy bootstrap toolchain script")
+    writeTextFile(project + "/build/minyarc", "#!/bin/sh\nprintf '; mock IR\\n' > \"$2\"\n")
+    let driver = project + "/build/tooling/tools/clang-driver"
+    writeTextFile(driver, "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\nif [ \"$1\" = link ]; then printf 'fake output' > \"$5\"; fi\n")
+    writeTextFile(fakes + "/make", "#!/bin/sh\nprintf 'build %s\\n' \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\n")
+    test.require(test.run(["chmod", "755", project + "/build/minyarc", driver, fakes + "/make"], system.environment(), "", fixture.scratch + "/fake-modes", 10), "fake launcher tool modes")
+    let source = project + "/source with spaces.min"
+    writeTextFile(source, "print(42)\n")
+    let environment = support.merge(fixture.environment, ["PATH=" + fakes + ":" + system.getenv("PATH")])
+    for options in [["--check"], ["--release", "--memory-profile", "eager"]] {
+        if support.exists(fixture.log) { test.check(files.remove(fixture.log) == 0, "clear launcher policy log") }
+        let command = [project + "/minyar"]
+        for option in options { command.add(option) }
+        command.add(source)
+        fixture.serial += 1
+        let result = test.run(command, environment, fixture.work, fixture.scratch + "/launcher" + Text(fixture.serial), 30)
+        test.check(result.status == 0, "public launcher failed\n" + result.errorOutput)
+        let rows = test.lines(readTextFile(fixture.log))
+        test.check(rows.length > 0 && rows[0] == "build 1", "bootstrap must run in the interactive context: " + support.join(rows, "; "))
+        for index in 1..rows.length { test.check(support.ends(rows[index], " none"), "bootstrap context must not leak into program linking: " + rows[index]) }
+    }
+    finish(fixture)
+    cases += 1
+}
+print("Bootstrap policy: " + Text(cases) + " cases passed")

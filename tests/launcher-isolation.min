@@ -1,0 +1,242 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+record Fixture { scratch: Text; work: Text; project: Text; wrapper: Text; environment: List<Text>; arguments: List<Text>; incremental: Boolean; serial: Integer }
+record Job { handle: Integer; identity: Text; value: Integer; output: Text; log: Text }
+
+constant WRAPPER_SOURCE = "#!/bin/sh\nreal=$LAUNCHER_TEST_REAL_CLANG\nif [ $# -eq 1 ] && { [ \"$1\" = --version ] || [ \"$1\" = -print-prog-name=ld.lld ]; }; then exec \"$real\" \"$@\"; fi\nwork=$LAUNCHER_TEST_WORK\nidentity=$LAUNCHER_TEST_ID\nmode=${LAUNCHER_TEST_MODE:-}\nruntime=0\nsource=\nfor argument in \"$@\"; do\n  case \"$argument\" in -c|-emit-llvm) runtime=1 ;; esac\n  case \"$argument\" in *.c) [ -n \"$source\" ] || source=$argument ;; esac\ndone\nif [ $runtime -eq 1 ]; then\n  printf '%s\\n' \"$@\" > \"$work/$identity-runtime.args\"\n  cp -- \"$source\" \"$work/$identity-runtime.c\"\n  exec \"$real\" \"$@\"\nfi\nprintf '%s\\n' \"$@\" > \"$work/$identity.args.tmp\"\nmv -- \"$work/$identity.args.tmp\" \"$work/$identity.args\"\nif [ \"$mode\" = barrier ]; then\n  count=0\n  while [ ! -e \"$work/first.args\" ] || [ ! -e \"$work/second.args\" ]; do\n    count=$((count + 1))\n    if [ $count -gt 6000 ]; then echo 'link barrier timed out: both compilers must complete' >&2; exit 1; fi\n    sleep 0.005\n  done\nfi\nif [ \"$mode\" = failure ]; then exit 37; fi\nif [ \"$mode\" = signal ]; then kill -TERM \"$PPID\"; exit 0; fi\nexec \"$real\" \"$@\"\n"
+
+function chosen(name: Text): Boolean {
+    let selected = false
+    let any = false
+    for index in 0..argumentCount() {
+        if argument(index) != "--incremental" {
+            any = true
+            if argument(index) == name || argument(index) == "LauncherIsolation." + name || argument(index) == "IncrementalLauncher." + name { selected = true }
+        }
+    }
+    return !any || selected
+}
+function incremental(): Boolean {
+    for index in 0..argumentCount() { if argument(index) == "--incremental" { return true } }
+    return false
+}
+function copyFile(fixture: Fixture, source: Text, destination: Text) {
+    fixture.serial += 1
+    test.require(test.run(["cp", "-p", source, destination], system.environment(), "", fixture.scratch + "/copy" + Text(fixture.serial), 30), "copy " + source)
+}
+function copyTree(fixture: Fixture, source: Text, destination: Text) {
+    fixture.serial += 1
+    test.require(test.run(["cp", "-RLp", source, destination], system.environment(), "", fixture.scratch + "/copy" + Text(fixture.serial), 60), "copy tree " + source)
+}
+function setup(root: Text): Fixture {
+    let scratch = test.scratch()
+    let work = scratch + "/minyar launcher isolation"
+    let project = work + "/project with spaces"
+    for directory in [work, project, project + "/build"] { test.check(files.makeDirectory(directory) == 0, "launcher isolation directories") }
+    let arguments: List<Text> = []
+    if incremental() { arguments.add("--incremental") }
+    let fixture = Fixture { scratch: scratch; work: work; project: project; wrapper: scratch + "/minyar-clang-barrier"; environment: []; arguments: arguments; incremental: incremental(); serial: 0 }
+    copyFile(fixture, root + "/minyar", project + "/minyar")
+    let names = ["minyarc", "minyarc-errors-request", "minyar-runtime.o", "minyar-runtime-release.ll", "tooling/tools/clang-driver"]
+    if fixture.incremental { names.add("minyarc-modules"); names.add("minyar-module-build") }
+    for directory in [project + "/build/tooling", project + "/build/tooling/tools"] { test.check(files.makeDirectory(directory) == 0, "launcher isolation driver directories") }
+    for name in names { copyFile(fixture, root + "/build/" + name, project + "/build/" + name) }
+    let targets: List<Text> = []
+    for name in names { targets.add("build/" + name) }
+    let rule = support.join(targets, " ")
+    writeTextFile(project + "/Makefile", ".PHONY: " + rule + "\n" + rule + ":\n\t@:\n")
+    copyTree(fixture, root + "/runtime", project + "/runtime")
+    copyTree(fixture, root + "/tools", project + "/tools")
+    writeTextFile(fixture.wrapper, WRAPPER_SOURCE)
+    test.require(test.run(["chmod", "755", fixture.wrapper], system.environment(), "", scratch + "/wrapper-mode", 10), "launcher wrapper mode")
+    let clang = support.which(test.setting("MINYAR_TEST_CLANG", "clang"), scratch + "/which-clang")
+    let environment: List<Text> = []
+    for entry in support.environment(["MINYAR_CLANG=" + fixture.wrapper, "MINYAR_CLANG_FLAGS=-O1 -Wno-override-module", "LAUNCHER_TEST_WORK=" + work, "LAUNCHER_TEST_REAL_CLANG=" + clang, "MAKEFLAGS=-j1"]) {
+        if !support.starts(entry, "MFLAGS=") && !support.starts(entry, "LAUNCHER_TEST_ID=") && !support.starts(entry, "LAUNCHER_TEST_MODE=") { environment.add(entry) }
+    }
+    fixture.environment = environment
+    return fixture
+}
+function command(fixture: Fixture, identity: Text, text: Text, release: Boolean): List<Text> {
+    let directory = fixture.work + "/" + identity
+    test.check(files.makeDirectory(directory) == 0, "launcher source directory")
+    writeTextFile(directory + "/same source name.min", text)
+    let result = [fixture.project + "/minyar"]
+    for argument in fixture.arguments { result.add(argument) }
+    if release { result.add("--release") }
+    for item in [directory + "/same source name.min", "-o", directory + "/output with spaces"] { result.add(item) }
+    return result
+}
+function outputPath(fixture: Fixture, identity: Text): Text {
+    return fixture.work + "/" + identity + "/output with spaces"
+}
+function environmentFor(fixture: Fixture, extra: List<Text>): List<Text> {
+    return support.merge(fixture.environment, extra)
+}
+function launch(fixture: Fixture, arguments: List<Text>, extra: List<Text>, label: Text): test.Result {
+    return test.run(arguments, environmentFor(fixture, extra), fixture.work, fixture.scratch + "/" + label, 45)
+}
+function programOutput(fixture: Fixture, path: Text): Text {
+    fixture.serial += 1
+    let result = test.run([path], system.environment(), "", fixture.scratch + "/program" + Text(fixture.serial), 10)
+    test.require(result, "launcher program")
+    return result.output
+}
+function assertClean(fixture: Fixture) {
+    let remaining = files.list(fixture.project + "/build/programs")
+    test.check(files.lastError() == 0 && remaining.length == 0, "invocation intermediate files/directories must be removed")
+    if fixture.incremental && support.exists(fixture.project + "/build/module-cache") {
+        for name in files.list(fixture.project + "/build/module-cache") { test.check(!support.starts(name, "invocation."), "incremental invocation cache must be removed") }
+    }
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending <= 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function basename(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    return Text(raw.slice(start, raw.length))
+}
+function concurrent(root: Text, release: Boolean) {
+    let fixture = setup(root)
+    let jobs: List<Job> = []
+    for pair in [["first", "111"], ["second", "222"]] {
+        let identity = pair[0]
+        let arguments = command(fixture, identity, "print(" + pair[1] + ")\n", release)
+        let log = fixture.scratch + "/" + identity + ".launch"
+        let handle = test.start(arguments, environmentFor(fixture, ["LAUNCHER_TEST_ID=" + identity, "LAUNCHER_TEST_MODE=barrier"]), fixture.work, log, 45)
+        jobs.add(Job { handle: handle; identity: identity; value: Integer(pair[1]); output: outputPath(fixture, identity); log: log })
+    }
+    let programs: List<Text> = []
+    for job in jobs {
+        let result = test.finish(job.handle, job.log)
+        test.check(result.status == 0, "concurrent launcher build\n" + result.output + result.errorOutput)
+        test.check(programOutput(fixture, job.output) == Text(job.value) + "\n", "concurrent launcher program output")
+        let arguments = test.lines(readTextFile(fixture.work + "/" + job.identity + ".args"))
+        test.check(support.has(arguments, "-O1"), "concurrent launcher custom flags")
+        let lto = false
+        for argument in arguments { if support.starts(argument, "-flto") { lto = true } }
+        test.check(lto == release, "concurrent launcher LTO selection")
+        let runtime = "runtime.o"
+        if release { runtime = "runtime.ll" }
+        let runtimePath = ""
+        for argument in arguments { if runtimePath == "" && basename(argument) == runtime { runtimePath = argument } }
+        test.check(runtimePath != "" && support.starts(basename(parent(runtimePath)), "invocation."), "launcher runtime is invocation-local")
+        test.check(parent(parent(runtimePath)) == fixture.project + "/build/programs", "launcher runtime lives in project programs")
+        let config = readTextFile(fixture.work + "/" + job.identity + "-runtime.c")
+        test.check(test.contains(config, "#define MINYAR_SYSTEM_HEAP 1"), "launcher runtime uses the system heap")
+        test.check(test.contains(config, "#define MINYAR_RC_POLL_BUDGET 32"), "launcher runtime poll budget")
+        let program = ""
+        for argument in arguments { if program == "" && test.contains(argument, "/build/programs/") && support.ends(argument, ".ll") { program = argument } }
+        programs.add(program)
+    }
+    test.check(programs[0] != "" && programs[1] != "" && programs[0] != programs[1], "concurrent programs need private IR")
+    assertClean(fixture)
+    test.removeTree(fixture.scratch)
+}
+let names = ["test_same_basename_concurrent_development_builds", "test_same_basename_concurrent_release_builds", "test_clang_path_with_spaces_and_custom_flags",
+    "test_compiler_failure_cleans_intermediates", "test_nonrequest_probe_failures_preserve_primary_diagnostic", "test_linker_failure_and_signal_clean_intermediates",
+    "test_check_mode_validates_real_modules_without_native_dependencies"]
+for index in 0..argumentCount() {
+    let valid = argument(index) == "--incremental"
+    for name in names { if argument(index) == name || argument(index) == "LauncherIsolation." + name || argument(index) == "IncrementalLauncher." + name { valid = true } }
+    test.check(valid, "unknown launcher isolation case " + argument(index))
+}
+let rootScratch = test.scratch()
+let root = test.lines(support.output(["pwd", "-P"], rootScratch + "/root"))[0]
+test.removeTree(rootScratch)
+let cases = 0
+if chosen("test_same_basename_concurrent_development_builds") { concurrent(root, false); cases += 1 }
+if chosen("test_same_basename_concurrent_release_builds") { concurrent(root, true); cases += 1 }
+if chosen("test_clang_path_with_spaces_and_custom_flags") {
+    let fixture = setup(root)
+    let spaced = fixture.work + "/custom clang with spaces"
+    copyFile(fixture, fixture.wrapper, spaced)
+    let arguments = command(fixture, "custom", "print(42)\n", false)
+    let result = launch(fixture, arguments, ["MINYAR_CLANG=" + spaced, "LAUNCHER_TEST_ID=custom"], "custom")
+    test.check(result.status == 0, "spaced clang launcher\n" + result.errorOutput)
+    test.check(programOutput(fixture, outputPath(fixture, "custom")) == "42\n", "spaced clang program output")
+    test.check(support.has(test.lines(readTextFile(fixture.work + "/custom.args")), "-O1"), "spaced clang custom flags")
+    assertClean(fixture)
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+if chosen("test_compiler_failure_cleans_intermediates") {
+    let fixture = setup(root)
+    let result = launch(fixture, command(fixture, "invalid", "print(missingName)\n", false), ["LAUNCHER_TEST_ID=invalid"], "invalid")
+    test.check(result.status == 1, "compiler failure status " + Text(result.status))
+    test.check(test.contains(result.errorOutput, "can't find a value"), "compiler failure diagnostic\n" + result.errorOutput)
+    test.check(!support.exists(outputPath(fixture, "invalid")), "compiler failure produced output")
+    test.check(!support.exists(fixture.work + "/invalid.args"), "linker must not run")
+    assertClean(fixture)
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+if chosen("test_nonrequest_probe_failures_preserve_primary_diagnostic") {
+    let fixture = setup(root)
+    let arguments = command(fixture, "probe-failure", "print(missingName)\n", false)
+    let original = launch(fixture, arguments, ["LAUNCHER_TEST_ID=probe-failure"], "probe-original")
+    test.check(original.status == 1, "probe baseline status")
+    test.check(test.contains(original.errorOutput, "can't find a value"), "probe baseline diagnostic")
+    let probe = fixture.project + "/build/minyarc-errors-request"
+    for status in [0, 1, 37, 143] {
+        writeTextFile(probe, "#!/bin/sh\nprintf partial > \"$2\"\nprintf \"probe-only diagnostic\\n\" >&2\nexit " + Text(status) + "\n")
+        test.require(test.run(["chmod", "755", probe], system.environment(), "", fixture.scratch + "/probe-mode", 10), "probe mode")
+        let result = launch(fixture, arguments, ["LAUNCHER_TEST_ID=probe-failure"], "probe" + Text(status))
+        test.check(result.status == original.status && result.output == original.output && result.errorOutput == original.errorOutput, "probe failure " + Text(status) + " changed the primary diagnostic\n" + result.errorOutput)
+        test.check(!support.exists(outputPath(fixture, "probe-failure")), "probe failure produced output")
+        test.check(!support.exists(fixture.work + "/probe-failure.args"), "probe failure ran the linker")
+        assertClean(fixture)
+    }
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+if chosen("test_linker_failure_and_signal_clean_intermediates") {
+    let fixture = setup(root)
+    for pair in [["failure", "37"], ["signal", "143"]] {
+        let mode = pair[0]
+        let result = launch(fixture, command(fixture, mode, "print(42)\n", false), ["LAUNCHER_TEST_ID=" + mode, "LAUNCHER_TEST_MODE=" + mode], mode)
+        test.check(result.status == Integer(pair[1]), mode + " linker status " + Text(result.status) + "\n" + result.errorOutput)
+        test.check(!support.exists(outputPath(fixture, mode)), mode + " produced output")
+        assertClean(fixture)
+    }
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+if chosen("test_check_mode_validates_real_modules_without_native_dependencies") {
+    let fixture = setup(root)
+    copyTree(fixture, root + "/library", fixture.project + "/library")
+    let source = fixture.work + "/source without extension"
+    let original = "use \"graphics\" as graphics\nuse \"./answer.min\" as answer\nprint(answer.value())\n"
+    writeTextFile(fixture.work + "/answer.min", "public function value(): Integer { return 42 }\n")
+    let serial = 0
+    for text in [original, original + "print(missingName)\n"] {
+        serial += 1
+        let status = 0
+        if serial == 2 { status = 1 }
+        writeTextFile(source, text)
+        let arguments = [fixture.project + "/minyar"]
+        for argument in fixture.arguments { arguments.add(argument) }
+        arguments.add("--check")
+        arguments.add(source)
+        let result = launch(fixture, arguments, ["LAUNCHER_TEST_ID=check"], "check" + Text(serial))
+        test.check(result.status == status, "check mode status\n" + result.output + result.errorOutput)
+        test.check(readTextFile(source) == text, "check mode must not rewrite its source")
+        if status != 0 { test.check(test.contains(result.errorOutput, "can't find a value"), "check mode diagnostic") }
+        else { test.check(test.contains(result.output, "checked "), "check mode summary") }
+        test.check(!support.exists(fixture.work + "/check.args") && !support.exists(fixture.work + "/check-runtime.args"), "check mode ran Clang")
+        assertClean(fixture)
+    }
+    if fixture.incremental { test.check(support.isDirectory(fixture.project + "/build/module-cache", fixture.scratch + "/cache-probe"), "--check must exercise the incremental driver") }
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+print("Launcher isolation: " + Text(cases) + " cases passed")
