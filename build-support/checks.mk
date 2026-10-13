@@ -516,8 +516,8 @@ check: check-runtime-numeric
 check-sanitize: check-runtime-numeric-sanitize
 
 .PHONY: check-fuzz-afl-harness
-check-fuzz-afl-harness:
-	python3 tests/fuzz-afl-harness.py
+check-fuzz-afl-harness: build/tooling/tests/fuzz-afl-harness
+	./build/tooling/tests/fuzz-afl-harness
 
 .PHONY: check-bootstrap-portability
 check-bootstrap-portability: build/compiler.min build/tooling/tests/bootstrap-portability
