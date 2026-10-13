@@ -1,0 +1,149 @@
+use "system" as system
+use "files" as files
+
+public function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+public function contains(source: Text, needle: Text): Boolean {
+    let haystack = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > haystack.length { return false }
+    for start in 0..(haystack.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length {
+            if haystack[start + index] != pattern[index] { equal = false; break }
+        }
+        if equal { return true }
+    }
+    return false
+}
+public function lines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 {
+            result.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+public function words(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        let space = index == raw.length
+        if index < raw.length { space = raw[index] <= 32 }
+        if space {
+            if start < index { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+public function setting(name: Text, fallback: Text): Text {
+    let value = system.getenv(name)
+    if value == "" { return fallback }
+    return value
+}
+public record Result { status: Integer; output: Text; errorOutput: Text }
+public function start(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
+    check(command.length > 0 && seconds > 0, "invalid process request")
+    let argv = ["sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", log,
+        "/usr/bin/timeout", "--kill-after=2", Text(seconds), "/usr/bin/env", "--"]
+    for item in command { argv.add(item) }
+    return system.spawn("/bin/sh", argv, environment, cwd)
+}
+public function finish(handle: Integer, log: Text): Result {
+    check(handle > 0, "process launch failed: " + Text(handle))
+    let status = system.wait(handle)
+    check(status.error == 0 && status.state == system.EXITED, "process wait failed")
+    let output = Text(files.readFile(log))
+    check(files.lastError() == 0, "cannot read process output")
+    let errorOutput = Text(files.readFile(log + ".err"))
+    check(files.lastError() == 0, "cannot read process diagnostics")
+    return Result { status: status.exitCode; output: output; errorOutput: errorOutput }
+}
+public function run(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Result {
+    return finish(start(command, environment, cwd, log, seconds), log)
+}
+public function require(result: Result, phase: Text) {
+    check(result.status == 0, phase + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+}
+public function scratch(): Text {
+    let parent = setting("TMPDIR", "/tmp")
+    let path = parent + "/minyar-tests-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    check(files.makeDirectory(path) == 0, "cannot create test scratch")
+    return path
+}
+public function removeScratch(path: Text) {
+    for name in files.list(path) { check(files.remove(path + "/" + name) == 0, "cannot remove scratch file") }
+    check(files.removeDirectory(path) == 0, "cannot remove test scratch")
+}
+public function addressEnabled(flags: List<Text>): Boolean {
+    let enabled = false
+    for flag in flags {
+        if contains(flag, "-fsanitize=") && contains(flag, "address") { enabled = true }
+        if contains(flag, "-fno-sanitize=") && (contains(flag, "address") || contains(flag, "all")) { enabled = false }
+    }
+    return enabled
+}
+public function instrument(source: Text): Text {
+    let result: List<Text> = []
+    let count = 0
+    for line in lines(source) {
+        let tokens = words(line)
+        if tokens.length > 0 && tokens[0] == "define" {
+            let raw = Bytes(line)
+            check(raw.length > 0 && raw[raw.length - 1] == 123, "unsupported LLVM function header")
+            check(contains(line, "@") && contains(line, ")"), "invalid LLVM function header")
+            if !contains(line, "sanitize_address") {
+                line = Text(raw.slice(0, raw.length - 1)) + "sanitize_address {"
+            }
+            count += 1
+        }
+        result.add(line + "\n")
+    }
+    check(count > 0, "LLVM contains no functions")
+    return joinText(result)
+}
+public record Compiler { directory: Text; serial: Integer; executable: Text; runtime: Text; clang: Text; flags: List<Text> }
+public function compiler(): Compiler {
+    return Compiler { directory: scratch(); serial: 0;
+        executable: setting("MINYAR_TEST_COMPILER", "./build/minyarc");
+        runtime: setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o");
+        clang: setting("MINYAR_TEST_CLANG", "clang"); flags: words(setting("MINYAR_TEST_LINK_FLAGS", "")) }
+}
+public function compile(test: Compiler, source: Text): Result {
+    test.serial += 1
+    let path = test.directory + "/case" + Text(test.serial)
+    writeTextFile(path + ".min", source)
+    let result = run([test.executable, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", 30)
+    if result.status == 0 && addressEnabled(test.flags) {
+        writeTextFile(path + ".ll", instrument(readTextFile(path + ".ll")))
+    }
+    return result
+}
+public function rejects(test: Compiler, source: Text, diagnostic: Text) {
+    let result = compile(test, source)
+    check(result.status != 0 && result.status != 124 && result.status != 137, "expected compiler rejection\n" + result.output + result.errorOutput)
+    check(contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.output + result.errorOutput)
+    check(files.pathSize(test.directory + "/case" + Text(test.serial) + ".ll") < 0, "rejected source emitted LLVM")
+}
+public function executes(test: Compiler, source: Text, expected: Text) {
+    require(compile(test, source), "compile")
+    let path = test.directory + "/case" + Text(test.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [test.clang, optimization, "-Wno-override-module"]
+        for flag in test.flags { command.add(flag) }
+        for item in [path + ".ll", test.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        require(run(command, system.environment(), "", path + ".link", 120), "link")
+        let result = run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        require(result, "execution")
+        check(result.errorOutput == "", "unexpected execution diagnostics\n" + result.errorOutput)
+        check(result.output == expected, "unexpected output at " + optimization + "\n" + result.output + "expected\n" + expected)
+    }
+}
