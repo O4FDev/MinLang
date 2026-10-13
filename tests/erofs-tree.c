@@ -70,6 +70,22 @@ static void create(const char *root) {
         if (n == 10) require(!lsetxattr(path,"user.large",data,3000,0), "large fixture xattr");
         struct timespec times[2] = {{-2,750000000},{1700000000 + (time_t)n,123456789}}; require(!utimensat(AT_FDCWD,path,times,AT_SYMLINK_NOFOLLOW), "fixture time"); free(path);
     }
+    char *extent = join(root,"extent-mixed"), *extent_hard = join(root,"extent-hard");
+    unsigned char *mixed = malloc(1048576); require(mixed != NULL, "extent memory");
+    int extent_fd = open(extent,O_CREAT | O_EXCL | O_WRONLY,0641); require(extent_fd >= 0, "extent file");
+    uint64_t random = 0x1782738eeb29a41full;
+    for (unsigned block = 0; block < 4; ++block) {
+        for (size_t n = 0; n < 1048576; ++n) {
+            random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+            mixed[n] = block == 0 ? (unsigned char)random : block == 1 ? 0 : block == 2 ? (unsigned char)(n % 71 + 32) : n % 4096 < 512 ? (unsigned char)random : (unsigned char)(n % 71 + 32);
+        }
+        require(write(extent_fd,mixed,1048576) == 1048576, "extent content");
+    }
+    require(write(extent_fd,mixed,4097) == 4097 && !close(extent_fd), "extent tail");
+    free(mixed); require(!link(extent,extent_hard), "extent hardlink");
+    struct timespec extent_times[2] = {{-2,750000000},{1700000999,123456789}};
+    require(!utimensat(AT_FDCWD,extent,extent_times,AT_SYMLINK_NOFOLLOW), "extent time");
+    free(extent);free(extent_hard);
     char *first = join(dir,"file-0010"), *hard = join(root,"hard"), *sym = join(root,"symlink"), *fifo = join(root,"fifo");
     require(!link(first,hard), "fixture hardlink"); require(!symlink("many/../hard",sym), "fixture symlink"); require(!mkfifo(fifo,0640), "fixture fifo");
     require(!lsetxattr(dir,"user.directory","directory",9,0), "directory attribute");
