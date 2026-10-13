@@ -1,0 +1,223 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./cpython-random.min" as random
+use "files" as files
+
+function literal(text: Text): Text {
+    let escaped = test.replace(text, "\\", "\\\\")
+    escaped = test.replace(escaped, "\"", "\\\"")
+    escaped = test.replace(escaped, "\n", "\\n")
+    escaped = test.replace(escaped, "\r", "\\r")
+    escaped = test.replace(escaped, "\t", "\\t")
+    return "\"" + escaped + "\""
+}
+function program(lines: List<Text>): Text {
+    let parts: List<Text> = []
+    for line in lines { parts.add(line + "\n") }
+    return joinText(parts)
+}
+function compiled(context: test.Compiler, source: Text): Text {
+    let result = test.compile(context, source)
+    test.check(result.status == 0, result.errorOutput)
+    return readTextFile(context.directory + "/case" + Text(context.serial) + ".ll")
+}
+function borrowedParameters(context: test.Compiler) {
+    port.executes(context, "record Box { words: List<Text> }\nfunction alias(value: Text): Text { return value }\nfunction mutate(value: Text, words: List<Text>): Text {\nwords[0] = \"replacement\" + \"!\"\nlet original = value\nvalue = alias(value)\nvalue = \"local\" + \"!\"\nwords.add(original)\nreturn original\n}\nfunction recursive(value: Text, depth: Integer): Text {\nif depth == 0 { return value }\nreturn recursive(value, depth - 1)\n}\nfunction replace(box: Box, other: Box): Box {\nbox = other\nreturn box\n}\nlet words: List<Text> = []\nwords.add(\"original\" + \"!\")\nlet box = Box { words: words }\nprint(mutate(box.words[0], words))\nprint(words[0])\nprint(words[1])\nprint(recursive(\"recursive\" + \"!\", 80))\nprint(replace(box, Box { words: words }).words[1])\n", "original!\nreplacement!\noriginal!\nrecursive!\noriginal!\n", 0, "")
+}
+function readonlyParameter(context: test.Compiler) {
+    let llvm = compiled(context, "record Point { x: Integer }\nfunction read(point: Point): Integer { return point.x }\nprint(read(Point { x: 7 }))\n")
+    let found = false
+    let begin = port.find(llvm, "define ", 0)
+    while begin >= 0 && !found {
+        let next = port.find(llvm, "define ", begin + 7)
+        let stop = Bytes(llvm).length
+        if next >= 0 { stop = next }
+        let part = Text(Bytes(llvm).slice(begin + 7, stop))
+        if port.starts(part, "i64 ") && test.contains(part, "(ptr %argument.0)") {
+            let end = port.find(part, "\n}", 0)
+            let body = part
+            if end >= 0 { body = Text(Bytes(part).slice(0, end)) }
+            test.check(!test.contains(body, "call void @minyar_rc_"), "readonly parameter used an ownership frame\n" + body)
+            found = true
+        }
+        begin = next
+    }
+    test.check(found, "readonly parameter function is missing")
+}
+function sourceTruncations(context: test.Compiler) {
+    let source = "record Box { text: Text }\nfunction make(value: Text): Box { return Box { text: value } }\nlet boxes: List<Box> = []\nboxes.add(make(\"hello\"))\nif boxes.length > 0 { print(boxes[0].text) }\n"
+    for end in 0..source.length {
+        let result = test.compile(context, source.slice(0, end))
+        test.check(result.status == 0 || result.status == 1, "prefix " + Text(end) + " status " + Text(result.status) + "\n" + result.errorOutput)
+        if result.status == 1 {
+            test.check(!test.contains(result.errorOutput, "List position"), "prefix " + Text(end) + " used a List-position failure")
+            test.check(test.contains(result.errorOutput, "Minyar stopped:"), "prefix " + Text(end) + " lacks a language diagnostic\n" + result.errorOutput)
+        }
+    }
+}
+function diagnosedLine(errors: Text, line: Integer): Boolean {
+    for text in test.lines(errors) {
+        for prefix in ["line " + Text(line) + ", column ", ":" + Text(line) + ", column "] {
+            let begin = port.find(text, prefix, 0)
+            while begin >= 0 {
+                let raw = Bytes(text)
+                let position = begin + Bytes(prefix).length
+                let digits = position
+                while position < raw.length && raw[position] >= 48 && raw[position] <= 57 { position += 1 }
+                if position > digits && position < raw.length && raw[position] == 58 && port.find(text, "missing", position + 1) >= 0 { return true }
+                begin = port.find(text, prefix, begin + 1)
+            }
+        }
+    }
+    return false
+}
+function diagnosticLines(context: test.Compiler) {
+    for source in ["let text = \"first\nsecond\"\nprint(missing)\n", "let character = '\n'\nprint(missing)\n", "let text = \"first\\\nsecond\"\nprint(missing)\n", "/* first\nsecond */\nprint(missing)\n"] {
+        let result = test.compile(context, source)
+        test.check(result.status == 1, "multiline literal source was accepted")
+        test.check(diagnosedLine(result.errorOutput, 3), "diagnostic line changed\n" + result.errorOutput)
+    }
+}
+function receiverSurvives(context: test.Compiler) {
+    port.executes(context, "record Box { words: List<Text> }\nfunction box(word: Text): Box {\nlet words: List<Text> = []\nwords.add(word + \"!\")\nreturn Box { words: words }\n}\nfunction replace(boxes: List<Box>): Integer {\nboxes[0] = box(\"new\")\nreturn 0\n}\nfunction end(boxes: List<Box>): Integer {\nboxes[0] = box(\"last\")\nreturn 3\n}\nlet boxes: List<Box> = []\nboxes.add(box(\"old\"))\nprint(boxes[0].words[replace(boxes)])\nprint(boxes[0].words[0].slice(replace(boxes), end(boxes)))\nprint(boxes[0].words[0])\n", "old!\nnew\nlast!\n", 0, "")
+}
+function listGrows(context: test.Compiler) {
+    port.executes(context, "function grow(words: List<Text>): Text {\nlet first = words[0]\nlet i = 0\nwhile i < 5000 {\nwords.add(Text(i) + \"!\")\ni = i + 1\n}\nwords[0] = \"replaced\" + \"!\"\nreturn first\n}\nlet words: List<Text> = []\nwords.add(\"original\" + \"!\")\nwords.add(grow(words))\nprint(words[0])\nprint(words[words.length - 1])\nprint(words.length)\n", "replaced!\noriginal!\n5002\n", 0, "")
+}
+function evaluationOrder(context: test.Compiler) {
+    port.executes(context, "function index(values: List<Text>, events: List<Integer>): Integer {\nevents.add(1)\nvalues.add(\"extra\")\nreturn 0\n}\nfunction value(values: List<Text>, events: List<Integer>): Text {\nevents.add(2)\nlet before = values[0]\nvalues[0] = \"temporary\" + \"!\"\nreturn before + \"!\"\n}\nlet values: List<Text> = []\nvalues.add(\"original\" + \"!\")\nlet events: List<Integer> = []\nvalues[index(values, events)] = value(values, events)\nprint(events[0])\nprint(events[1])\nprint(values[0])\n", "1\n2\noriginal!!\n", 0, "")
+}
+function shortCircuit(context: test.Compiler) {
+    port.executes(context, "function mark(events: List<Integer>, id: Integer, result: Boolean): Boolean {\nlet temporary = Text(id) + \"!\"\nevents.add(id)\nreturn result && temporary.length > 0\n}\nlet events: List<Integer> = []\nprint(false && mark(events, 1, true))\nprint(true || mark(events, 2, false))\nprint(mark(events, 3, false) || mark(events, 4, true) && mark(events, 5, false))\nprint((mark(events, 6, true) || mark(events, 7, true)) && mark(events, 8, true))\nlet i = 0\nwhile i < events.length {\nprint(events[i])\ni = i + 1\n}\n", "false\ntrue\nfalse\ntrue\n3\n4\n5\n6\n8\n", 0, "")
+}
+function shadowing(context: test.Compiler) {
+    port.executes(context, "record Pair { left: Text; right: Text }\nfunction make(n: Integer): Pair {\nlet text = \"outer\" + \"!\"\nlet index = 0\nwhile index < 4 {\nif index == n {\nlet text = Text(index) + \"!\"\nif n % 2 == 0 {\nreturn Pair { right: text; left: \"even\" + \"!\" }\n} else {\nlet text = \"odd\" + text\nreturn Pair { left: text; right: \"right\" + \"!\" }\n}\n}\nlet text = index\nindex = text + 1\n}\nreturn Pair { left: text; right: text }\n}\nlet i = 0\nwhile i < 5 {\nlet pair = make(i)\nprint(pair.left)\nprint(pair.right)\ni = i + 1\n}\n", "even!\n0!\nodd1!\nright!\neven!\n2!\nodd3!\nright!\nouter!\nouter!\n", 0, "")
+}
+function diamond(context: test.Compiler) {
+    port.executes(context, "record Leaf { text: Text }\nrecord Pair { left: Leaf; right: Leaf }\nrecord Root { first: Pair; second: Pair }\nfunction leaf(): Leaf { return Leaf { text: \"leaf\" + \"!\" } }\nfunction pair(value: Leaf): Pair { return Pair { left: value; right: value } }\nfunction root(): Root {\nlet shared = leaf()\nreturn Root { second: pair(shared); first: pair(shared) }\n}\nlet roots: List<Root> = []\nlet i = 0\nwhile i < 1000 {\nroots.add(root())\ni = i + 1\n}\nlet saved = roots[0].first.left\nroots[0] = root()\nprint(saved.text)\nprint(roots[999].second.right.text)\n", "leaf!\nleaf!\n", 0, "")
+}
+function transferDestinations(context: test.Compiler) {
+    port.executes(context, "record Box { text: Text }\nfunction identity(text: Text): Text { return text }\nfunction make(): Text { return identity(\"a\" + \"b\") + \"c\" }\nfunction box(): Box { return Box { text: (make()) } }\nlet text = (make())\ntext = Text(text)\nlet boxes: List<Box> = []\nboxes.add((box()))\nboxes.add(Box { text: make() + identity(text) })\nboxes[0] = box()\nlet words: List<Text> = []\nwords.add(boxes[1].text.slice(0, 3) + Text('🙂'))\nprint(text)\nprint(boxes[0].text)\nprint(boxes[1].text)\nprint(words[0])\n", "abc\nabc\nabcabc\nabc🙂\n", 0, "")
+}
+function unicodeProperties(context: test.Compiler) {
+    let alphabet = ["a", Text(Character(0)), "é", Text(Character(769)), "界", "🙂", Text(Character(1114111)), "\"", "\\"]
+    for seed in 0..8 {
+        let rng = random.seeded(Text(seed))
+        let pieces: List<Text> = []
+        for piece in 0..5 {
+            let size = 1 + random.below(rng, 8)
+            let characters: List<Text> = []
+            for index in 0..size { characters.add(alphabet[random.below(rng, alphabet.length)]) }
+            pieces.add(joinText(characters))
+        }
+        let joined = joinText(pieces)
+        let lines = ["let parts: List<Text> = []"]
+        for piece in pieces { lines.add("parts.add(" + literal(piece) + " + \"\")") }
+        let copied: List<Text> = []
+        for index in 0..pieces.length {
+            if index > 0 { copied.add(" + ") }
+            copied.add(literal(pieces[index]))
+        }
+        for line in ["let text = joinText(parts)", "let copied = " + joinText(copied), "print(text == copied)", "print(text.length)", "print(text.byteLength)"] { lines.add(line) }
+        let expected = ["true", Text(joined.length), Text(joined.byteLength)]
+        for index in 0..8 {
+            let start = random.below(rng, joined.length + 1)
+            let end = start + random.below(rng, joined.length + 1 - start)
+            lines.add("print(text.slice(" + Text(start) + ", " + Text(end) + ") == " + literal(joined.slice(start, end)) + ")")
+            expected.add("true")
+        }
+        for index in 0..joined.length {
+            lines.add("print(Text(text[" + Text(index) + "]) == " + literal(Text(joined[index])) + ")")
+            expected.add("true")
+        }
+        port.executes(context, program(lines), program(expected), 0, "")
+    }
+}
+function arithmeticOracle(context: test.Compiler) {
+    let rng = random.seeded("419")
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    let divisors: List<Integer> = []
+    for value in -19..20 { if value != 0 { divisors.add(value) } }
+    for unused in 0..180 {
+        let left = -1000000 + random.below(rng, 2000001)
+        let right = divisors[random.below(rng, divisors.length)]
+        let quotient = abs(left) / abs(right)
+        if (left < 0) != (right < 0) { quotient = -quotient }
+        let remainder = left - quotient * right
+        let l = "(" + Text(left) + ")"
+        let r = "(" + Text(right) + ")"
+        source.add("print(" + l + " / " + r + ")")
+        source.add("print(" + l + " % " + r + ")")
+        source.add("print((" + l + " / " + r + ") * " + r + " + " + l + " % " + r + " == " + l + ")")
+        expected.add(Text(quotient))
+        expected.add(Text(remainder))
+        expected.add("true")
+    }
+    port.executes(context, program(source), program(expected), 0, "")
+}
+function typeGraph(context: test.Compiler) {
+    let records: List<Text> = []
+    for index in 0..400 {
+        let fields: List<Text> = []
+        if index < 399 { fields.add("next: List<R" + Text(index + 1) + ">") } else { fields.add("number: Integer") }
+        if index < 398 { fields.add("skip: List<List<R" + Text(index + 2) + ">>") }
+        let joined: List<Text> = []
+        for position in 0..fields.length {
+            if position > 0 { joined.add("; ") }
+            joined.add(fields[position])
+        }
+        records.add("record R" + Text(index) + " { " + joinText(joined) + " }")
+    }
+    compiled(context, program(records))
+    records[399] = "record R399 { back: List<List<R7>> }"
+    let llvm = compiled(context, program(records) + "function attach(values: List<R7>, value: R7) { values.add(value) }\n")
+    test.check(files.pathSize(context.directory + "/case" + Text(context.serial) + ".ll") >= 0, "managed graph produced no LLVM")
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1\n"), "hidden back edge did not select the cycle runtime")
+}
+function unreachableTypes(context: test.Compiler) {
+    for body in ["return 1\nprint(\"text\" - 1)", "if true { return 1 } else { print(\"text\" - 1) }\nreturn 2"] {
+        port.rejects(context, "function f(): Integer {\n" + body + "\n}\n", "different types")
+    }
+}
+function transferOwners(context: test.Compiler) {
+    let ir = compiled(context, "record Point { x: Integer }\nfunction make(): Point { return Point { x: 3 } }\nlet points: List<Point> = []\npoints.add(make())\npoints.add(Point { x: 4 })\nlet text = \"a\" + \"b\"\nprint(text)\n")
+    test.check(test.contains(ir, "call void @minyar_list_add_take"), "List add no longer takes ownership")
+    test.check(test.contains(ir, "call void @minyar_rc_local_take"), "local take is missing")
+    test.check(!test.contains(ir, "call void @minyar_rc_keep"), "temporary owner was kept")
+    test.check(!test.contains(ir, "call void @minyar_rc_step"), "temporary owner was stepped")
+}
+
+let names = ["test_borrowed_parameters_can_be_reassigned_and_escape", "test_readonly_parameter_needs_no_ownership_frame",
+    "test_source_truncations_produce_language_diagnostics", "test_diagnostic_lines_after_multiline_literals",
+    "test_receiver_survives_mutation_in_index_and_slice_arguments", "test_list_grows_while_evaluating_its_own_add_argument",
+    "test_index_and_rhs_evaluation_order", "test_short_circuit_effects_and_temporary_lifetimes",
+    "test_shadowing_and_early_returns_through_nested_scopes", "test_nested_construction_returns_and_shared_diamond",
+    "test_owned_expressions_cross_every_transfer_destination", "test_unicode_metamorphic_properties",
+    "test_arithmetic_against_integer_oracle", "test_large_acyclic_type_graph_and_hidden_back_edge",
+    "test_unreachable_code_still_has_type_checks", "test_transfer_operations_replace_temporary_owners"]
+let selectors = port.selectors("Adversarial", names)
+let context = port.compiler()
+let ran = 0
+for index in 0..names.length {
+    if !port.selected(selectors, "Adversarial", names[index]) { continue }
+    if index == 0 { borrowedParameters(context) }
+    else if index == 1 { readonlyParameter(context) }
+    else if index == 2 { sourceTruncations(context) }
+    else if index == 3 { diagnosticLines(context) }
+    else if index == 4 { receiverSurvives(context) }
+    else if index == 5 { listGrows(context) }
+    else if index == 6 { evaluationOrder(context) }
+    else if index == 7 { shortCircuit(context) }
+    else if index == 8 { shadowing(context) }
+    else if index == 9 { diamond(context) }
+    else if index == 10 { transferDestinations(context) }
+    else if index == 11 { unicodeProperties(context) }
+    else if index == 12 { arithmeticOracle(context) }
+    else if index == 13 { typeGraph(context) }
+    else if index == 14 { unreachableTypes(context) }
+    else { transferOwners(context) }
+    ran += 1
+}
+test.removeTree(context.directory)
+print("Adversarial: " + Text(ran) + " checks passed")

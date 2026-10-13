@@ -273,9 +273,11 @@ check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o 
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
-check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize build/ownership-runtime.o
-	$(LIMITED) python3 tests/adversarial.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/adversarial.py
+build/tooling/tests/adversarial: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/adversarial: tests/sha256-test-native.c
+check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize build/ownership-runtime.o build/tooling/tests/adversarial
+	$(LIMITED) ./build/tooling/tests/adversarial
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/adversarial
 
 check-ownership-mutation: build/tooling/tests/ownership-mutation
 	$(LIMITED) ./build/tooling/tests/ownership-mutation
