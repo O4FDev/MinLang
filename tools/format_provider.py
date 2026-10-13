@@ -190,7 +190,7 @@ def _runtime_dll(library, prefix, stem):
 
 def _static_inputs(result, library, apis, clang, binary):
     for api in apis:
-        definitions = [line for line in result.stderr.splitlines() if re.search(
+        definitions = [line for line in (result.stdout + result.stderr).splitlines() if re.search(
             r': definition of (?:symbol )?' + re.escape(api) + r'\s*$', line)]
         if len(definitions) != 1 or not re.search(
                 r'^(?:[^\n]*?: )?' + re.escape(str(library)) + r'\([^)]*\):',
