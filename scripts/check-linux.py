@@ -219,7 +219,7 @@ def main():
     build = [name for name in BUILD if (a.tier != 'full' or tier_of(name) == 'full') and main_build]
     plan = {'source': str(source), 'jobs': a.jobs, 'tier': a.tier, 'groups': groups, 'build_targets': build,
             'correctness_targets': targets,
-            'additional': ['stage2/stage3 LLVM byte equality', 'runtime unit native + ASan/UBSan',
+            'additional': ['stage3 compiler and module behavior', 'runtime unit native + ASan/UBSan',
                            'ordinary source regressions with sanitized compiler/runtime',
                            'focused system/fixed/lazy ownership and debt matrix',
                            'critical-path correctness and zero-allocation oracles (no --measure)'],
@@ -342,9 +342,9 @@ def main():
     Check = check_runner.Check
     python = sys.executable
 
-    def fixed_point(prefix):
-        return [python, '-c', 'from pathlib import Path; assert Path("build/' + prefix + '-stage2.ll").read_bytes() == '
-                'Path("build/' + prefix + '-stage3.ll").read_bytes(), "' + prefix.replace('-', ' ') + ' fixed point differs"']
+    def compiler_behavior(prefix):
+        return [python, 'tests/compiler-behavior.py', '--profile', 'errors', '--ir',
+                'build/' + prefix + '-stage3.ll']
 
     selected = set(groups)
     full, sanitize = a.tier != 'sanitize' and not a.only, a.tier != 'full' and not a.only
@@ -383,8 +383,8 @@ def main():
             # The shared build runs in the builder lane; checks needing its goals wait for it.
             add(Check('build', make + build, tier=a.tier, builds=build, group='correctness', expected=60))
         if full and correctness:
-            add(Check('compiler-fixed-point', fixed_point('compiler'), goals=['build/compiler-stage3.ll'], group='correctness'),
-                Check('module-compiler-fixed-point', fixed_point('module-compiler'),
+            add(Check('compiler-bootstrap-behavior', compiler_behavior('compiler'), goals=['build/compiler-stage3.ll'], group='correctness'),
+                Check('module-compiler-bootstrap-behavior', compiler_behavior('module-compiler'),
                       goals=['build/module-compiler-stage3.ll'], group='correctness'),
                 Check('runtime-unit', ['./build/runtime-unit'], goals=['build/runtime-unit'], group='correctness'),
                 Check('bootstrap-portability-gcc', [python, 'tests/bootstrap-portability.py'], group='correctness',
