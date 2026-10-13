@@ -16,8 +16,13 @@ function usage(message: Text) {
     exit(2)
 }
 
+function resultManifest(out: Text, header: Text, digests: List<Text>, run: Integer, failures: Integer, mismatches: List<Text>, passed: Boolean) {
+    writeTextFile(out + "/manifest.json", header + ",\n  \"frontend_sha256\": {" + support.joined(digests, ", ") + "},\n  \"result_tests\": {\"run\": " + Text(run) + ", \"failures\": " + Text(failures) + ", \"errors\": 0, \"skipped\": 0},\n  \"source_after_mismatches\": [" + support.joined(mismatches, ", ") + "],\n  \"passed\": " + Text(passed) + "\n}\n")
+}
+
 let sanitize = false
-let profiles = ["system", "fixed", "lazy", "eager"]
+let requested: List<Text> = []
+let profilesGiven = false
 let budgets = [1, 32, 1024]
 let evidence = ""
 let index = 0
@@ -35,7 +40,8 @@ while index < argumentCount() {
         if values.length == 0 { usage(option + " needs values") }
         if option == "--profiles" {
             for value in values { if !contains(["system", "fixed", "lazy", "eager"], value) { usage("invalid profile: " + value) } }
-            profiles = values
+            requested = values
+            profilesGiven = true
         } else {
             let parsed: List<Integer> = []
             for value in values {
@@ -47,6 +53,10 @@ while index < argumentCount() {
     } else { usage("unknown option: " + option) }
 }
 if evidence == "" { usage("the following arguments are required: --evidence") }
+let windows = groups.windowsHost()
+let selection = groups.profileSelection(requested, profilesGiven, windows)
+if selection.error != "" { usage(selection.error) }
+let profiles = selection.profiles
 if !sanitize && system.getenv("MINYAR_TEST_LINK_FLAGS") != "" { fail("Native registration gate requires uninstrumented link flags") }
 let logs = test.scratch()
 test.require(test.run(["mkdir", "-p", "--", evidence], system.environment(), "", logs + "/mkdir", 10), "create evidence directory")
@@ -55,7 +65,7 @@ test.check(files.makeDirectory("build") == 0, "cannot create build directory")
 let generated = cycle.publishEngine(".", "")
 let fixtureNames = ["cycle-registration-exposure.c", "cycle-late-registration.c"]
 let expectations = ["registration exposure owning paths and queue integrity exact cleanup zero\n", "late registration 96 owning-path schedules exact cleanup zero\n"]
-let inputs = ["tests/cycle-registration.min", "tests/cycle-additive.min", "tests/cycle-port-support.min", "tests/cycle-additive.c", "tests/cycle-registration-exposure.c", "tests/cycle-late-registration.c", "tests/cycle-late-registration.min", "tools/cycle-runtime.min", "tests/frontend-fixtures.min", "tests/memory-contracts-runtime.c", "runtime/minyar_runtime.c"]
+let inputs = ["tests/cycle-registration.min", "tests/cycle-port-support.min", "tests/thread-port-support.min", "tools/testing.min", "tools/test-runtime.min", "tests/cycle-additive.c", "tests/cycle-registration-exposure.c", "tests/cycle-late-registration.c", "tests/cycle-late-registration.min", "tools/cycle-runtime.min", "tests/frontend-fixtures.min", "tests/memory-contracts-runtime.c", "runtime/minyar_runtime.c"]
 for path in support.treeFiles(["runtime"]) {
     let raw = Bytes(path)
     if Text(raw.slice(raw.length - 2, raw.length)) == ".h" && support.find(Text(raw.slice(8, raw.length)), "/", 0) < 0 { inputs.add(path) }
@@ -88,6 +98,7 @@ for profile in profiles {
             let name = fixtureNames[fixture]
             let label = Text(Bytes(name).slice(0, Bytes(name).length - 2)) + "-" + profile + "-k" + Text(budget)
             let binary = out + "/" + label
+            if windows { binary = binary + ".exe" }
             let command = [tool]
             for flag in flags { command.add(flag) }
             for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", "runtime"] { command.add(item) }
@@ -95,7 +106,7 @@ for profile in profiles {
             if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
             if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
             for item in ["-DMINYAR_BOUNDED_HEAP_BYTES=1048576", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "tests/" + name, "-lm", "-o", binary] { command.add(item) }
-            plan.add(groups.Group { label: label; binary: binary; phases: [groups.Phase { label: "compile"; argv: command }, groups.Phase { label: "run-built-in"; argv: [binary] }] })
+            plan.add(groups.Group { label: label; binary: binary; phases: [groups.Phase { label: "compile"; argv: command }, groups.Phase { label: "run-built-in"; argv: [binary] }]; fields: ", \"fixture\": " + json.quote(name) + ", \"profile\": " + json.quote(profile) + ", \"cleanup_budget\": " + Text(budget) })
             planFixtures.add(fixture)
         }
     }
@@ -119,21 +130,24 @@ for position in 0..outcomes.length {
 let quoted: List<Text> = []
 for profile in profiles { quoted.add(json.quote(profile)) }
 let asan = support.asanLeakOptions() + ":halt_on_error=1"
-let header = "{\n  \"schema_version\": 1,\n  \"sanitize\": " + Text(sanitize) + ",\n  \"profiles\": [" + support.joined(quoted, ", ") + "],\n  \"unsupported_profiles\": [],\n  \"bounded_heap_bytes\": 1048576,\n  \"cases\": [" + support.joined(cases, ", ") + "],\n  \"resources\": [" + support.joined(resources, ", ") + "],\n  \"source_sha256\": {" + support.joined(fingerprints, ", ") + "},\n  \"generated_engine_sha256\": " + json.quote(support.digest(generated)) + ",\n  \"compiler\": {\"path\": " + json.quote(tool) + ", \"sha256\": " + json.quote(support.digest(tool)) + ", \"version\": " + json.quote(version.output) + "},\n  \"environment\": {\"ASAN_OPTIONS\": " + json.quote(asan) + ", \"UBSAN_OPTIONS\": \"halt_on_error=1:print_stacktrace=1\"},\n  \"schedule_mode\": \"built-in main(void); no runtime graph-size arguments\",\n  \"exposure_controls\": {\"phase\": 96, \"fresh\": 48, \"append\": 24, \"shared\": 8, \"reuse\": 64, \"other\": 9, \"public_long_list\": \"2 only at bounded cleanup budget 1\"},\n  \"late_registration_controls\": {\"phase\": 96, \"queued_full_root\": 1},\n  \"result_oracle\": {\"stdout\": \"42\\n41\\n\", \"stderr\": \"\", \"status\": 0, \"optimizations\": [\"-O0\", \"-O2\"], \"runtime_profile\": \"system\", \"cleanup_budget\": 1}"
+let header = "{\n  \"schema_version\": 1,\n  \"sanitize\": " + Text(sanitize) + ",\n  \"profiles\": [" + support.joined(quoted, ", ") + "],\n  \"unsupported_profiles\": [" + support.joined(selection.unsupported, ", ") + "],\n  \"bounded_heap_bytes\": 1048576,\n  \"cases\": [" + support.joined(cases, ", ") + "],\n  \"resources\": [" + support.joined(resources, ", ") + "],\n  \"source_sha256\": {" + support.joined(fingerprints, ", ") + "},\n  \"generated_engine_sha256\": " + json.quote(support.digest(generated)) + ",\n  \"compiler\": {\"path\": " + json.quote(tool) + ", \"sha256\": " + json.quote(support.digest(tool)) + ", \"version\": " + json.quote(version.output) + "},\n  \"environment\": {\"ASAN_OPTIONS\": " + json.quote(asan) + ", \"UBSAN_OPTIONS\": \"halt_on_error=1:print_stacktrace=1\"},\n  \"schedule_mode\": \"built-in main(void); no runtime graph-size arguments\",\n  \"exposure_controls\": {\"phase\": 96, \"fresh\": 48, \"append\": 24, \"shared\": 8, \"reuse\": 64, \"other\": 9, \"public_long_list\": \"2 only at bounded cleanup budget 1\"},\n  \"late_registration_controls\": {\"phase\": 96, \"queued_full_root\": 1},\n  \"result_oracle\": {\"stdout\": \"42\\n41\\n\", \"stderr\": \"\", \"status\": 0, \"optimizations\": [\"-O0\", \"-O2\"], \"runtime_profile\": \"system\", \"cleanup_budget\": 1}"
 writeTextFile(out + "/manifest.json", header + ",\n  \"passed\": false\n}\n")
 test.check(failures.length == 0, support.joined(failures, "\n"))
 let frontend = fixtures.fixture("MINYAR_ERRORS_COMPILER", "./build/minyarc-errors")
 if sanitize { frontend.compiler.flags = ["-fsanitize=address,undefined"] } else { frontend.compiler.flags = [] }
 frontend.compiler.clang = tool
 frontend.runtimeFlags = ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=1"]
+frontend.environment = environment
 let frontendDigests: List<Text> = []
 for path in [frontend.compiler.executable, "compiler/errors-compiler.min", "build-support/compiler.mk"] { frontendDigests.add(json.quote(path) + ": " + json.quote(support.digest(path))) }
+resultManifest(out, header, frontendDigests, 1, 1, [], false)
 fixtures.executes(frontend, readTextFile("tests/cycle-late-registration.min"), "42\n41\n", ["-O0", "-O2"], 0, "", true)
+resultManifest(out, header, frontendDigests, 2, 1, [], false)
 fixtures.executes(frontend, "record Node {\n    good: List<Result<Callback<Integer, Integer>, Text>>\n    bad: List<Result<Text, Callback<Integer, Integer>>>\n}\nlet node = Node { good: []; bad: [] }\nlet callback = function(n: Integer): Integer { return n + node.good.length + node.bad.length }\nnode.good.add(Ok<Callback<Integer, Integer>, Text>(callback))\nnode.bad.add(Err<Text, Callback<Integer, Integer>>(callback))\nmatch node.good[0] { Ok(f) { print(f(40)) } Err(e) { print(e) } }\nmatch node.bad[0] { Ok(v) { print(v) } Err(f) { print(f(39)) } }\n", "42\n41\n", ["-O0", "-O2"], 0, "", true)
 test.removeTree(frontend.compiler.directory)
 let mismatches: List<Text> = []
 for path in inputs { if support.digest(path) != support.digest(out + "/input-sources/" + path) { mismatches.add(json.quote(path)) } }
+resultManifest(out, header, frontendDigests, 2, 0, mismatches, mismatches.length == 0)
 test.check(mismatches.length == 0, "sources changed during registration: " + support.joined(mismatches, ", "))
-writeTextFile(out + "/manifest.json", header + ",\n  \"frontend_sha256\": {" + support.joined(frontendDigests, ", ") + "},\n  \"result_tests\": {\"run\": 2, \"failures\": 0, \"errors\": 0, \"skipped\": 0},\n  \"source_after_mismatches\": [],\n  \"passed\": true\n}\n")
 test.removeTree(logs)
 print("cycle registration exposure and late registration passed")
