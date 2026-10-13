@@ -9,12 +9,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import sys
 import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from host_paths import host_path, pinned_llvm, LLVM_VERSION
+from host_paths import host_path, pinned_llvm, pinned_lld, LLVM_VERSION
 
 FLAGS = (
     "CPPFLAGS", "CFLAGS", "LLVM_FLAGS", "LDLIBS", "SANITIZER_FLAGS", "COMPILER_RUNTIME_FLAGS",
@@ -22,8 +23,8 @@ FLAGS = (
 )
 
 
-def identity(name, default):
-    command = os.environ.get(name, default)
+def identity(name, default, command=None):
+    command = command if command is not None else os.environ.get(name, default)
     resolved = shutil.which(command)
     if resolved is None:
         raise ValueError(f"{name}: compiler executable not found: {command}")
@@ -73,8 +74,22 @@ def main():
         previous = {}
     if previous.get("llvm_cc") != llvm or previous.get("llvm_version") != LLVM_VERSION:
         pinned_llvm(llvm["command"])
+    linker = None
+    options = shlex.split(os.environ.get("LLVM_FLAGS", "")) + shlex.split(os.environ.get("COMPILER_LTO_FLAGS", ""))
+    if sys.platform.startswith("linux") and any(option.startswith("-flto") for option in options):
+        selected = next((option.split("=", 1)[1] for option in reversed(options) if option.startswith("--ld-path=")), None)
+        if selected is None:
+            selected = next((option.split("=", 1)[1] for option in reversed(options) if option.startswith("-fuse-ld=")), "lld")
+        if selected == "lld":
+            selected = str(host_path(llvm["path"]).parent / "ld.lld")
+        elif not Path(selected).is_absolute():
+            selected = shutil.which(selected) or shutil.which("ld." + selected) or selected
+        linker = identity("LLD", selected, command=selected)
+        if previous.get("linker") != linker or previous.get("llvm_version") != LLVM_VERSION:
+            pinned_lld(selected)
     content = json.dumps({
         "cc": identity("CC", "cc"), "llvm_cc": llvm, "llvm_version": LLVM_VERSION,
+        "linker": linker,
         "flags": {name: os.environ.get(name, "") for name in FLAGS},
     }, sort_keys=True, indent=2).encode() + b"\n"
     if target.is_file() and target.read_bytes() == content:

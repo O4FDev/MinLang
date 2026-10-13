@@ -34,3 +34,15 @@ def pinned_llvm(command=None):
         actual = result.stdout.splitlines()[0] if result.stdout else result.stderr.strip()
         raise ValueError(f"Minyar requires LLVM {LLVM_VERSION}; unsupported compiler {command}: {actual}")
     return resolved
+
+
+def pinned_lld(command):
+    resolved = shutil.which(command)
+    if resolved is None:
+        raise ValueError(f"Minyar requires LLVM {LLVM_VERSION}; LLD executable not found: {command}")
+    result = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=10)
+    match = re.search(r"\bLLD (\d+\.\d+\.\d+)(?=\s|$)", result.stdout)
+    if result.returncode or not match or match[1] != LLVM_VERSION:
+        actual = result.stdout.splitlines()[0] if result.stdout else result.stderr.strip()
+        raise ValueError(f"Minyar requires LLVM {LLVM_VERSION}; unsupported linker {command}: {actual}")
+    return resolved

@@ -17,6 +17,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ToolchainStamp(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux ThinLTO selects LLD')
+    def test_thin_lto_requires_matching_linker_and_tracks_replacement(self):
+        with tempfile.TemporaryDirectory(prefix='minyar linker ') as temporary:
+            work = Path(temporary)
+            compiler = work / 'clang'
+            linker = work / 'ld.lld'
+            compiler.write_text('#!' + sys.executable + '\nprint("clang version 23.1.2")\n')
+            compiler.chmod(0o755)
+            stamp = work / 'stamp.json'
+            environment = {**os.environ, 'CC': str(compiler), 'LLVM_CC': str(compiler),
+                           'COMPILER_LTO_FLAGS': '-flto=thin -fuse-ld=lld', 'LLVM_FLAGS': '-O2'}
+            def probe():
+                return subprocess.run([sys.executable, str(ROOT / 'scripts/toolchain-stamp.py'), str(stamp)],
+                                      env=environment, capture_output=True, text=True, timeout=10)
+            def install(version):
+                linker.write_text('#!' + sys.executable + '\nprint("LLD ' + version + '")\n')
+                linker.chmod(0o755)
+            install('18.1.3')
+            result = probe()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('requires LLVM 23.1.2; unsupported linker', result.stderr)
+            self.assertFalse(stamp.exists())
+            install('23.1.2')
+            self.assertEqual(probe().returncode, 0)
+            original = stamp.read_bytes(), stamp.stat().st_mtime_ns
+            self.assertEqual(json.loads(original[0])['linker']['path'], str(linker.resolve()))
+            self.assertEqual(probe().returncode, 0)
+            self.assertEqual((stamp.read_bytes(), stamp.stat().st_mtime_ns), original)
+            install('23.1.0')
+            result = probe()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('LLD 23.1.0', result.stderr)
+            self.assertEqual(stamp.read_bytes(), original[0])
+            linker.unlink()
+            result = probe()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('executable not found', result.stderr)
+
     def test_identity_flags_and_replaced_binary(self):
         with tempfile.TemporaryDirectory(prefix="minyar toolchain ") as temporary:
             work = Path(temporary)
