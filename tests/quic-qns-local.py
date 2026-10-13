@@ -6,10 +6,11 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location("qns_certificates",ROOT/"tests/tls-local.py")
 fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
-CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred","preferred-ipv6","resumption40","zerortt40","rebind-routes","rebind-pending")
+CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred","preferred-ipv6","resumption40","zerortt40","rebind-routes","rebind-pending","rebind-silent")
 class RebindingProxy:
- def __init__(self,port,chunk=1048576,delay=.003):
+ def __init__(self,port,chunk=1048576,delay=.003,silent=False):
   self.chunk=chunk;self.delay=delay;self.delivery_at=None
+  self.silent=silent;self.holding=False;self.quiet_at=0;self.quiet_rebounds=0;self.client_after_rebind=0
   self.started=time.monotonic();self.forwarded=0;self.packets=0;self.waited=0;self.last_forward=0;self.bindings=[]
   self.target=("127.0.0.1",port);self.front=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.front.bind(("127.0.0.1",port+2))
   self.port=self.front.getsockname()[1];self.back=None;self.ports=set();self.stopping=threading.Event();self.error=None
@@ -29,19 +30,27 @@ class RebindingProxy:
     ready,_,_=select.select([self.front,self.back],[],[],.1)
     for stream in ready:
      data,address=stream.recvfrom(65535)
-     if stream is self.front:client=address;self.back.sendto(data,self.target)
+     if stream is self.front:
+      client=address;self.back.sendto(data,self.target);self.quiet_at=time.monotonic()
+      if self.quiet_rebounds:self.client_after_rebind+=1
      elif client is not None:
+      if self.holding:continue
       before=time.monotonic();self.stopping.wait(self.delivery_delay(before));self.waited+=time.monotonic()-before
       self.front.sendto(data,client);received+=len(data)
       self.forwarded+=len(data);self.packets+=1;self.last_forward=time.monotonic()-self.started
-      if received>=self.chunk and len(self.ports)<16:received=0;self.rebind()
+      if received>=self.chunk and len(self.ports)<16:
+       if self.silent:
+        if not self.quiet_rebounds:self.holding=True;self.quiet_at=time.monotonic()
+       else:received=0;self.rebind()
+    if self.holding and time.monotonic()-self.quiet_at>=.2:
+     self.rebind();self.quiet_rebounds+=1;self.holding=False
   except BaseException as error:self.error=error
  def close(self):
   self.stopping.set();self.thread.join(timeout=2);self.front.close();self.back.close()
   if self.thread.is_alive():raise RuntimeError("rebinding proxy did not stop")
   if self.error is not None:raise self.error
  def progress(self):
-  return {"elapsed":time.monotonic()-self.started,"bytes":self.forwarded,"packets":self.packets,"wait_seconds":self.waited,"last_forward":self.last_forward,"bindings":self.bindings}
+  return {"elapsed":time.monotonic()-self.started,"bytes":self.forwarded,"packets":self.packets,"wait_seconds":self.waited,"last_forward":self.last_forward,"bindings":self.bindings,"quiet_rebounds":self.quiet_rebounds,"client_after_rebind":self.client_after_rebind}
 def main():
  p=argparse.ArgumentParser();p.add_argument("--client",type=Path,required=True);p.add_argument("--server",type=Path,required=True)
  p.add_argument("--case",action="append",choices=CASES);p.add_argument("--expect-old-code",action="store_true");p.add_argument("--port",type=int,default=44300)
@@ -61,9 +70,9 @@ def main():
    for name in names:(www/name).write_bytes(payload)
    serverlog=d/(case+"-server.keys");clientlog=d/(case+"-client.keys")
    artifacts.bind_files(case,"payloads",[www]);artifacts.bind_files(case,"downloads",[downloads]);artifacts.bind_files(case,"keylogs",[serverlog,clientlog])
-   testcase={"multiplex1999":"transfer","multiconnect50":"multiconnect","ipv6":"transfer","preferred":"connectionmigration","preferred-ipv6":"connectionmigration","resumption40":"resumption","zerortt40":"zerortt","rebind-routes":"transfer","rebind-pending":"transfer"}.get(case,case)
+   testcase={"multiplex1999":"transfer","multiconnect50":"multiconnect","ipv6":"transfer","preferred":"connectionmigration","preferred-ipv6":"connectionmigration","resumption40":"resumption","zerortt40":"zerortt","rebind-routes":"transfer","rebind-pending":"transfer","rebind-silent":"transfer"}.get(case,case)
    command=[str(a.server.resolve()),str(ca.path("server","pk8")),str(ca.path("root","der")),str(serverlog),str(www),testcase,str(ca.path("server","der"))]
-   if not a.expect_old_code:command+=["--port="+str(a.port)]
+   if not a.expect_old_code or case=="rebind-silent":command+=["--port="+str(a.port)]
    if case=="preferred":command+=["--preferred-ipv4=7f000001","--preferred-port="+str(a.port+1)]
    if case=="preferred-ipv6":command+=["--preferred-ipv4=00000000","--preferred-ipv6=00000000000000000000000000000001","--preferred-port="+str(a.port+1)]
    server=artifacts.endpoint(command,case+"-server",case=case,peer_timeout=180)
@@ -75,6 +84,7 @@ def main():
     host="::1" if case in ("ipv6","preferred-ipv6") else "127.0.0.1"
     if case=="rebind-routes":proxy=RebindingProxy(a.port)
     if case=="rebind-pending":proxy=RebindingProxy(a.port,65536,0)
+    if case=="rebind-silent":proxy=RebindingProxy(a.port,65536,0,silent=True)
     command=[str(a.client.resolve()),str(ca.path("root","der")),host,str(proxy.port if proxy else a.port),str(clientlog),str(downloads),testcase,*names]
     c=artifacts.run(command,capture_output=True,text=True,timeout=180,case=case)
    finally:
@@ -111,10 +121,14 @@ def main():
    elif case in ("preferred","preferred-ipv6") and (c.returncode or not files_ok or not preferred_tuple_ok or "QNS preferred path validated" not in c.stdout):semantic=92
    elif case in ("resumption40","zerortt40") and (c.returncode or not files_ok or labels.count("CLIENT_HANDSHAKE_TRAFFIC_SECRET")!=2):semantic=102
    elif case in ("rebind-routes","rebind-pending") and (c.returncode or not files_ok or len(proxy.ports)<12):semantic=112
-   expected={"multiplex1999":42,"multiconnect50":52,"keyupdate":62,"ipv6":72}.get(case,0) if a.expect_old_code else 0
-   results.append({"case":case,"client_status":c.returncode,"semantic_status":semantic,"expected":expected,"matched":semantic==expected,
+   elif case=="rebind-silent" and (c.returncode or not files_ok or len(proxy.ports)!=2 or proxy.quiet_rebounds!=1 or proxy.client_after_rebind<1):semantic=113
+   expected={"multiplex1999":42,"multiconnect50":52,"keyupdate":62,"ipv6":72,"rebind-silent":113}.get(case,0) if a.expect_old_code else 0
+   matched=semantic==expected
+   if case=="rebind-silent" and a.expect_old_code:
+    matched=matched and c.returncode==13 and len(proxy.ports)==2 and proxy.quiet_rebounds==1 and proxy.client_after_rebind==0 and proxy.forwarded>=65536
+   results.append({"case":case,"client_status":c.returncode,"semantic_status":semantic,"expected":expected,"matched":matched,
       "client_stdout":c.stdout,"client_stderr":c.stderr,"server_stdout":serverout,"server_stderr":servererr,
-      "files_match":files_ok,"rebound_routes":len(proxy.ports) if proxy else 0,"preferred_tuple_match":preferred_tuple_ok,"authenticated_preferred_tuples":preferred_tuples,"reciprocal_epoch_secrets":reciprocal,"handshakes":labels.count("CLIENT_HANDSHAKE_TRAFFIC_SECRET"),
+      "files_match":files_ok,"rebound_routes":len(proxy.ports) if proxy else 0,"quiet_rebounds":proxy.quiet_rebounds if proxy else 0,"client_after_rebind":proxy.client_after_rebind if proxy else 0,"preferred_tuple_match":preferred_tuple_ok,"authenticated_preferred_tuples":preferred_tuples,"reciprocal_epoch_secrets":reciprocal,"handshakes":labels.count("CLIENT_HANDSHAKE_TRAFFIC_SECRET"),
       "client_epochs":sorted(set(x for x in labels if x.startswith("CLIENT_TRAFFIC_SECRET_"))),
       "server_epochs":sorted(set(x for x in serverlabels if x.startswith("SERVER_TRAFFIC_SECRET_")))})
   passed=all(x["matched"] and not x["client_stderr"] and not x["server_stderr"] for x in results)
