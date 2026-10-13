@@ -243,7 +243,8 @@ static int e_copy(EWriter *w, EInode *i) {
     uint64_t remaining = i->size;
     unsigned char *buffer = NULL;
     while (!error && remaining) {
-        size_t count = remaining > 1048576 ? 1048576 : (size_t)remaining;
+        uint64_t limit = buffer ? 1048576 : 1073741824;
+        size_t count = remaining > limit ? (size_t)limit : (size_t)remaining;
         ssize_t n;
         if (!buffer) {
             n = copy_file_range(fd, &input, w->output_fd, &output, count, 0);
