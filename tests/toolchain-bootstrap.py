@@ -54,7 +54,8 @@ with tempfile.TemporaryDirectory(prefix='minyar cold toolchain ') as temporary:
     options = shlex.split(stamp['flags']['COMPILER_LTO_FLAGS'])
     if platform.system() == 'Linux' and linker.is_file():
         assert '-Wl,--threads=1' in options, options
-        assert '-fuse-ld=' + str(work / 'ld.lld') in options, options
+        selected_linkers = [Path(option[len('-fuse-ld='):]) for option in options if option.startswith('-fuse-ld=')]
+        assert len(selected_linkers) == 1 and selected_linkers[0].resolve() == linker.resolve(), options
     # Explicitly supplying the same safe flags is a supported opt-in and must
     # keep the caller's exact string, rather than rewriting configuration.
     explicit = stamp['flags']['COMPILER_LTO_FLAGS']
