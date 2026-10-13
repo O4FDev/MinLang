@@ -1,0 +1,1045 @@
+use "./driver-support.min" as host
+use "./llvm-sanitizer.min" as sanitizer
+use "./driver-providers.min" as providers
+use "system" as system
+use "files" as files
+
+constant DEFAULT_FLAGS = "-O2 -Wno-override-module"
+
+function linkerChosen(options: List<Text>): Boolean {
+    for option in options { if option.startsWith("-fuse-ld=") || option.startsWith("--ld-path=") { return true } }
+    return false
+}
+public function ltoFlags(clang: Text, linkFlags: List<Text>): List<Text> {
+    let lto = ["-flto=thin"]
+    let platform = host.hostName()
+    if platform == "Darwin" || linkerChosen(linkFlags) { return lto }
+    if platform == "Linux" {
+        let linker = host.strip(host.captureOutput([clang, "-print-prog-name=ld.lld"], 10))
+        lto.add("-fuse-ld=" + host.pinnedLld(linker))
+        return lto
+    }
+    let isWindows = host.windows()
+    let names = ["ld.lld"]
+    if isWindows { names = ["ld.lld.exe", "ld.lld"] }
+    let selected = host.which(clang)
+    if selected == "" { selected = clang }
+    let directory = host.parentPath(host.resolveName(selected))
+    for linker in names {
+        let sibling = host.joinPath(directory, linker)
+        if host.isFile(sibling) {
+            if isWindows {
+                lto.add("-fuse-ld=lld")
+                lto.add("--ld-path=" + sibling)
+            } else { lto.add("-fuse-ld=" + sibling) }
+            return lto
+        }
+    }
+    for linker in names {
+        if host.which(linker) != "" {
+            lto.add("-fuse-ld=lld")
+            return lto
+        }
+    }
+    return lto
+}
+
+function clangIdentity(clang: Text): Bytes {
+    let executable = host.which(clang)
+    if executable == "" { host.stop("cannot find Clang: " + clang) }
+    let path = host.resolveName(executable)
+    let info = host.fileStatus(path)
+    if info.kind == "" { host.stop(host.osError(2, path)) }
+    let identity = Bytes("[" + info.device + ", " + info.inode + ", " + Text(info.size) + ", " + Text(info.modified) + ", " + Text(info.changed) + "]")
+    identity.addBytes(Bytes(host.captureOutput([clang, "--version"], 0)))
+    identity.addBytes(Bytes(host.jsonList([path, host.hostName(), host.hostMachine()])))
+    return identity
+}
+function headers(project: Text, extensions: List<Text>): List<Text> {
+    let found: List<Text> = []
+    host.walk(project, "runtime", found)
+    let result: List<Text> = []
+    for path in found { if host.listed(extensions, host.suffixOf(path)) { result.add(path) } }
+    return result
+}
+function digestOf(identity: Bytes, project: Text, dependencies: List<Text>): Text {
+    for dependency in dependencies {
+        identity.addBytes(Bytes(dependency))
+        identity.add(0)
+        identity.addBytes(host.readBytes(project + "/" + dependency))
+    }
+    return host.hashBytes(identity)
+}
+function compileObject(project: Text, command: List<Text>, source: Text, output: Text) {
+    let directory = project + "/build/native"
+    let staging = host.temporaryDirectory(directory, host.stemOf(output) + "-")
+    let staged = staging + "/object.o"
+    let arguments = host.copied(command)
+    for item in ["-c", source, "-o", staged] { arguments.add(item) }
+    host.run(arguments)
+    if files.rename(staged, output) != 0 { host.stop(host.osError(files.lastError(), output)) }
+    host.release(staging)
+}
+function nativeObject(project: Text, clang: Text, base: Bytes, name: Text, compileFlags: List<Text>): Text {
+    let source = "runtime/native/" + name
+    let dependencies = [source]
+    for header in headers(project, [".h"]) { dependencies.add(header) }
+    if name.startsWith("securecrypto") || name.startsWith("update") {
+        let vendor = files.list(project + "/vendor/monocypher")
+        vendor.sort()
+        for entry in vendor { dependencies.add("vendor/monocypher/" + entry) }
+    }
+    let identity = base.slice(0, base.length)
+    identity.addBytes(Bytes(host.jsonList([name]) + host.jsonList(compileFlags)))
+    let directory = project + "/build/native"
+    host.makeDirectories(directory)
+    let output = directory + "/" + host.stemOf(name) + "-" + digestOf(identity, project, dependencies) + ".o"
+    if !host.isFile(output) {
+        let command = [clang]
+        for item in compileFlags { command.add(item) }
+        compileObject(project, command, project + "/" + source, output)
+    }
+    return output
+}
+
+record PackageInput { name: Text; kind: Text; path: Text }
+function nativeUsage() {
+    system.writeStandardError("usage: clang-driver [--native-source NATIVE_SOURCE] [--native-object NATIVE_OBJECT]\n")
+}
+function packageInputs(arguments: List<Text>): List<PackageInput> {
+    let sources: List<Text> = []
+    let objects: List<Text> = []
+    let index = 0
+    while index < arguments.length {
+        let item = arguments[index]
+        let kind = ""
+        let value = ""
+        if item == "--native-source" || item == "--native-object" {
+            if index + 1 >= arguments.length {
+                nativeUsage()
+                system.writeStandardError("clang-driver: error: argument " + item + ": expected one argument\n")
+                host.leave(2)
+            }
+            kind = item
+            value = arguments[index + 1]
+            index += 2
+        } else if item.startsWith("--native-source=") || item.startsWith("--native-object=") {
+            kind = host.textSlice(item, 0, 15)
+            value = host.textSlice(item, 16, item.byteLength)
+            index += 1
+        } else {
+            let rest: List<Text> = []
+            for position in index..arguments.length { rest.add(arguments[position]) }
+            nativeUsage()
+            system.writeStandardError("clang-driver: error: unrecognized arguments: " + host.joined(rest, " ") + "\n")
+            host.leave(2)
+        }
+        if kind == "--native-source" { sources.add(value) } else { objects.add(value) }
+    }
+    let inputs: List<PackageInput> = []
+    for pass in 0..2 {
+        let values = sources
+        let kind = "source"
+        let suffixes = [".c", ".m"]
+        if pass == 1 { values = objects; kind = "object"; suffixes = [".o", ".a", ".obj", ".lib"] }
+        for value in values {
+            let separator = host.findText(value, "=", 0)
+            let valid = separator > 0 && separator + 1 < value.byteLength
+            if valid {
+                for byte in Bytes(host.textSlice(value, 0, separator)) {
+                    if !(host.isWord(byte) && byte < 128) { valid = false }
+                }
+            }
+            if !valid { host.stop("native " + kind + " requires NAME=FILE: " + value) }
+            let path = host.resolveName(host.textSlice(value, separator + 1, value.byteLength))
+            if !host.listed(suffixes, host.suffixOf(path)) || !host.isFile(path) {
+                host.stop("native " + kind + " must be a readable " + host.joined(suffixes, ", ") + " file: " + path)
+            }
+            inputs.add(PackageInput { name: host.textSlice(value, 0, separator); kind: kind; path: path })
+        }
+    }
+    return inputs
+}
+function packageNames(inputs: List<PackageInput>): List<Text> {
+    let names: List<Text> = []
+    for input in inputs { names.add(input.name) }
+    return host.sortedUnique(names)
+}
+
+function engineSource(project: Text): Text {
+    let source = host.readText(project + "/runtime/minyar_runtime.c")
+    for pair in [["minyar_rc.h", "minyar_cycle_rc.h"], ["minyar_collections.h", "minyar_cycle_collections.h"]] {
+        let directive = "#include \"" + pair[0] + "\""
+        if host.countText(source, directive) != 1 { host.stop("cycle runtime requires exactly one " + directive) }
+        source = host.replaceText(source, directive, "#include \"" + pair[1] + "\"")
+    }
+    let prefix = "#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n"
+    return "#define MINYAR_SORT_GRAPH 1\n" + prefix + source + "\n#include \"minyar_callbacks.h\"\n"
+}
+function runtimeConfiguration(project: Text, runtime: Text, purpose: Text): Text {
+    let file = host.baseName(runtime)
+    let local = host.parentPath(runtime) + "/runtime.c"
+    if (file == "runtime.o" || file == "runtime.ll") && host.isFile(local) { return host.readText(local) }
+    if file.startsWith("minyar-default-runtime") { return host.readText(project + "/runtime/minyar_default_runtime.c") }
+    if file.startsWith("minyar-runtime-eager") { return "#include \"minyar_runtime.c\"\n" }
+    host.stop("cannot select " + purpose + " for " + runtime)
+    return ""
+}
+function configuredSource(project: Text, runtime: Text): Text {
+    let configuration = runtimeConfiguration(project, runtime, "cycle runtime policy")
+    let directive = "#include \"minyar_runtime.c\""
+    if host.countText(configuration, directive) != 1 { host.stop("cycle runtime configuration must include the engine once") }
+    return host.replaceText(configuration, directive, engineSource(project))
+}
+function threadSource(project: Text, runtime: Text, cycles: Boolean): Text {
+    let configuration = runtimeConfiguration(project, runtime, "thread memory policy")
+    for macro in ["MINYAR_COMPILER_ARENA", "MINYAR_BOUNDED_HEAP", "MINYAR_LAZY_HEAP"] {
+        if host.hasText(configuration, "#define " + macro) {
+            host.stop("managed threads require system or eager memory profile; pools/arena are unsupported")
+        }
+    }
+    if !host.isFile(project + "/runtime/minyar_thread_domain.h") {
+        host.stop("checked thread runtime dependency is missing: minyar_thread_domain.h")
+    }
+    if cycles { configuration = configuredSource(project, runtime) }
+    return "#undef MINYAR_THREADED\n#define MINYAR_THREADED 1\n" + configuration
+}
+function variantRuntime(project: Text, clang: Text, label: Text, source: Text, options: List<Text>, extensions: List<Text>): Text {
+    let identity = clangIdentity(clang)
+    identity.addBytes(Bytes(host.jsonList(options)))
+    identity.addBytes(Bytes(source))
+    let directory = project + "/build/native"
+    host.makeDirectories(directory)
+    let output = directory + "/" + label + "-" + digestOf(identity, project, headers(project, extensions)) + ".o"
+    if !host.isFile(output) {
+        let staging = host.temporaryDirectory(directory, label + "-")
+        host.writeBytes(staging + "/runtime.c", Bytes(source))
+        let command = [clang]
+        for item in options { command.add(item) }
+        for item in ["-iquote", project + "/runtime", "-c", staging + "/runtime.c", "-o", staging + "/runtime.o"] { command.add(item) }
+        host.run(command)
+        if files.rename(staging + "/runtime.o", output) != 0 { host.stop(host.osError(files.lastError(), output)) }
+        host.release(staging)
+    }
+    return output
+}
+function runtimeOptions(clang: Text, release: Text, linkFlags: List<Text>): List<Text> {
+    let options = host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS)
+    if release == "1" { options.add(ltoFlags(clang, linkFlags)[0]) }
+    return options
+}
+
+constant SCALARS: List<Text> = ["", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double", "bool", "uint32_t"]
+record Layout { key: Integer; mode: Integer; size: Integer; alignment: Integer; fields: List<Integer> }
+record Signature { callee: Text; kinds: List<Text> }
+record LayoutState { layouts: List<Layout>; calls: List<Signature>; completed: List<Integer>; active: List<Integer>; pieces: List<Text> }
+function digits(value: Text, extra: Integer): Boolean {
+    if value == "" { return false }
+    for byte in Bytes(value) { if !host.isDigit(byte) && byte != extra { return false } }
+    return true
+}
+function decimal(value: Text): Integer {
+    if !digits(value, -1) { host.stop("invalid literal for int() with base 10: " + host.pythonText(value)) }
+    return Integer(value)
+}
+function sameLayout(left: Layout, right: Layout): Boolean {
+    if left.mode != right.mode || left.size != right.size || left.alignment != right.alignment || left.fields.length != right.fields.length { return false }
+    for index in 0..left.fields.length { if left.fields[index] != right.fields[index] { return false } }
+    return true
+}
+function valueKind(value: Text): Boolean {
+    if value == "1" || value == "3" || value == "4" || value == "5" || value == "7" || value == "p" { return true }
+    return value.byteLength > 1 && value.startsWith("C") && digits(host.textAfter(value, "C"), -1)
+}
+function readLayouts(lines: List<Text>): LayoutState {
+    let state = LayoutState { layouts: []; calls: []; completed: []; active: []; pieces: [] }
+    for line in lines {
+        if line.startsWith("; minyar-c-layout: ") {
+            let parts = host.strip(host.textAfter(line, "; minyar-c-layout: ")).split("|")
+            if parts.length < 5 { host.stop("invalid C-layout ABI metadata") }
+            for part in parts { if !digits(part, 44) { host.stop("invalid C-layout ABI metadata") } }
+            let key = decimal(parts[0])
+            let mode = decimal(parts[1])
+            let size = decimal(parts[2])
+            let alignment = decimal(parts[3])
+            let fields: List<Integer> = []
+            let valid = true
+            for index in 4..parts.length {
+                let values = parts[index].split(",")
+                if values.length != 3 { valid = false }
+                for value in values { fields.add(decimal(value)) }
+            }
+            let layout = Layout { key: key; mode: mode; size: size; alignment: alignment; fields: fields }
+            if layout.mode != 1 && layout.mode != 2 { valid = false }
+            if layout.size <= 0 || (layout.alignment != 1 && layout.alignment != 2 && layout.alignment != 4 && layout.alignment != 8) { valid = false }
+            if valid {
+                let index = 0
+                while index + 2 < fields.length {
+                    if fields[index + 1] + fields[index + 2] > layout.size || fields[index + 2] <= 0 { valid = false }
+                    index += 3
+                }
+            }
+            if !valid { host.stop("invalid C-layout ABI fields") }
+            let replaced = false
+            for existing in state.layouts {
+                if existing.key == layout.key {
+                    if !sameLayout(existing, layout) { host.stop("conflicting C-layout ABI metadata") }
+                    replaced = true
+                }
+            }
+            if !replaced { state.layouts.add(layout) }
+        } else if line.startsWith("; minyar-c-value: ") {
+            let parts = host.strip(host.textAfter(line, "; minyar-c-value: ")).split("|")
+            let valid = parts.length >= 2 && parts[0].startsWith("minyar_") && parts[0].byteLength > 7
+            if valid {
+                for byte in Bytes(parts[0]) { if !(host.isWord(byte) && byte < 128) { valid = false } }
+                for index in 1..parts.length { if !valueKind(parts[index]) { valid = false } }
+            }
+            if !valid { host.stop("invalid C-layout native ABI signature") }
+            for index in 2..parts.length { if parts[index] == "5" { host.stop("Nothing cannot be a C-layout ABI parameter") } }
+            let kinds: List<Text> = []
+            for index in 1..parts.length { kinds.add(parts[index]) }
+            let known = false
+            for existing in state.calls {
+                if existing.callee == parts[0] {
+                    if host.joined(existing.kinds, "|") != host.joined(kinds, "|") { host.stop("conflicting C-layout native ABI signatures") }
+                    known = true
+                }
+            }
+            if !known { state.calls.add(Signature { callee: parts[0]; kinds: kinds }) }
+        }
+    }
+    return state
+}
+function containsKey(values: List<Integer>, key: Integer): Boolean {
+    for value in values { if value == key { return true } }
+    return false
+}
+function emitRecord(state: LayoutState, key: Integer) {
+    if containsKey(state.completed, key) { return }
+    let position = -1
+    for index in 0..state.layouts.length { if state.layouts[index].key == key { position = index } }
+    if containsKey(state.active, key) || position < 0 { host.stop("invalid inline C-layout record dependency") }
+    state.active.add(key)
+    let layout = state.layouts[position]
+    let index = 0
+    while index < layout.fields.length {
+        if layout.fields[index] >= 1000 { emitRecord(state, layout.fields[index] - 1000) }
+        index += 3
+    }
+    let packed = ""
+    if layout.mode == 2 { packed = " __attribute__((packed))" }
+    let name = "minyar_c_record_" + Text(key)
+    state.pieces.add("struct" + packed + " " + name + " {\n")
+    let field = 0
+    index = 0
+    while index < layout.fields.length {
+        let kind = layout.fields[index]
+        let width = layout.fields[index + 2]
+        let declaration = ""
+        if kind == 0 { declaration = "unsigned char field" + Text(field) + "[" + Text(width) + "]" }
+        else if kind >= 1000 { declaration = "struct minyar_c_record_" + Text(kind - 1000) + " field" + Text(field) }
+        else if kind >= 1 && kind <= 12 { declaration = SCALARS[kind] + " field" + Text(field) }
+        else { host.stop("invalid C-layout scalar representation") }
+        state.pieces.add(declaration + ";\n")
+        field += 1
+        index += 3
+    }
+    state.pieces.add("};\n")
+    state.pieces.add("_Static_assert(sizeof(struct " + name + ") == " + Text(layout.size) + ", \"C-layout size mismatch\");\n")
+    state.pieces.add("_Static_assert(_Alignof(struct " + name + ") == " + Text(layout.alignment) + ", \"C-layout alignment mismatch\");\n")
+    field = 0
+    index = 0
+    while index < layout.fields.length {
+        state.pieces.add("_Static_assert(offsetof(struct " + name + ", field" + Text(field) + ") == " + Text(layout.fields[index + 1]) + ", \"C-layout offset mismatch\");\n")
+        field += 1
+        index += 3
+    }
+    let remaining: List<Integer> = []
+    for value in state.active { if value != key { remaining.add(value) } }
+    state.active.truncate(0)
+    for value in remaining { state.active.add(value) }
+    state.completed.add(key)
+}
+function valueType(state: LayoutState, kind: Text): Text {
+    if kind.startsWith("C") {
+        let key = Integer(host.textAfter(kind, "C"))
+        emitRecord(state, key)
+        return "struct minyar_c_record_" + Text(key)
+    }
+    if kind == "1" { return "long long" }
+    if kind == "3" { return "uint32_t" }
+    if kind == "4" { return "bool" }
+    if kind == "5" { return "void" }
+    if kind == "7" { return "double" }
+    return "void *"
+}
+function layoutSource(lines: List<Text>): Text {
+    let state = readLayouts(lines)
+    if state.calls.length == 0 { return "" }
+    state.pieces.add("#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n#include <string.h>\n")
+    state.pieces.add("extern void *minyar_c_record_copy(const void *, long long);\n")
+    let callees: List<Text> = []
+    for call in state.calls { callees.add(call.callee) }
+    callees.sort()
+    for callee in callees {
+        let kinds: List<Text> = []
+        for call in state.calls { if call.callee == callee { kinds = call.kinds } }
+        let result = kinds[0]
+        let returnType = valueType(state, result)
+        let types: List<Text> = []
+        for index in 1..kinds.length { types.add(valueType(state, kinds[index])) }
+        let declared = "void"
+        if types.length > 0 { declared = host.joined(types, ", ") }
+        state.pieces.add("extern " + returnType + " " + callee + "(" + declared + ");\n")
+        let bridgeReturn = returnType
+        if result.startsWith("C") { bridgeReturn = "void *" }
+        let arguments: List<Text> = []
+        for index in 0..types.length {
+            if kinds[index + 1].startsWith("C") { arguments.add("const void *argument" + Text(index)) }
+            else { arguments.add(types[index] + " argument" + Text(index)) }
+        }
+        let parameters = "void"
+        if arguments.length > 0 { parameters = host.joined(arguments, ", ") }
+        state.pieces.add(bridgeReturn + " minyar_c_value_" + callee + "(" + parameters + ") {\n")
+        let values: List<Text> = []
+        for index in 0..types.length {
+            if kinds[index + 1].startsWith("C") {
+                state.pieces.add(types[index] + " value" + Text(index) + ";\nmemcpy(&value" + Text(index) + ", argument" + Text(index) + ", sizeof(value" + Text(index) + "));\n")
+                values.add("value" + Text(index))
+            } else { values.add("argument" + Text(index)) }
+        }
+        let invocation = callee + "(" + host.joined(values, ", ") + ")"
+        if result.startsWith("C") { state.pieces.add(returnType + " value = " + invocation + ";\nreturn minyar_c_record_copy(&value, sizeof(value));\n") }
+        else if result == "5" { state.pieces.add(invocation + ";\n") }
+        else { state.pieces.add("return " + invocation + ";\n") }
+        state.pieces.add("}\n")
+    }
+    return joinText(state.pieces)
+}
+function layoutObject(project: Text, clang: Text, compileFlags: List<Text>, lines: List<Text>): Text {
+    let generated = layoutSource(lines)
+    if generated == "" { return "" }
+    let identity = clangIdentity(clang)
+    identity.addBytes(Bytes(host.jsonList(compileFlags)))
+    identity.addBytes(Bytes(generated))
+    let directory = project + "/build/native"
+    host.makeDirectories(directory)
+    let output = directory + "/c-layout-abi-" + host.hashBytes(identity) + ".o"
+    if !host.isFile(output) {
+        let staging = host.temporaryDirectory(directory, "c-layout-abi-")
+        host.writeBytes(staging + "/abi.c", Bytes(generated))
+        let command = [clang]
+        for item in compileFlags { command.add(item) }
+        for item in ["-c", staging + "/abi.c", "-o", staging + "/abi.o"] { command.add(item) }
+        host.run(command)
+        if files.rename(staging + "/abi.o", output) != 0 { host.stop(host.osError(files.lastError(), output)) }
+        host.release(staging)
+    }
+    return output
+}
+
+record Glfw { cflags: List<Text>; libraries: List<Text> }
+function glfwFlags(): Glfw {
+    let pkg = host.which("pkg-config")
+    if pkg != "" && host.capture([pkg, "--exists", "glfw3"], 0).status == 0 {
+        return Glfw { cflags: host.shellSplit(host.captureOutput([pkg, "--cflags", "glfw3"], 0), "pkg-config");
+            libraries: host.shellSplit(host.captureOutput([pkg, "--libs", "glfw3"], 0), "pkg-config") }
+    }
+    let brew = host.which("brew")
+    if brew != "" {
+        let result = host.capture([brew, "--prefix", "glfw"], 0)
+        let prefix = host.strip(result.output)
+        if result.status == 0 && host.isDirectory(prefix + "/include") {
+            return Glfw { cflags: ["-I" + prefix + "/include"]; libraries: ["-L" + prefix + "/lib", "-lglfw"] }
+        }
+    }
+    host.stop("the graphics package needs GLFW: 'brew install glfw' on macOS, 'sudo apt install libglfw3-dev' on Debian/Ubuntu, or 'pacman -S mingw-w64-ucrt-x86_64-glfw' in MSYS2 UCRT64")
+    return Glfw { cflags: []; libraries: [] }
+}
+function graphics(project: Text, clang: Text, base: Bytes, nativeFlags: List<Text>): List<Text> {
+    let glfw = glfwFlags()
+    let result = [nativeObject(project, clang, base, "graphics.c", host.extended(nativeFlags, glfw.cflags))]
+    for item in glfw.libraries { result.add(item) }
+    let platform = host.hostName()
+    if platform == "Darwin" { for item in ["-framework", "OpenGL", "-framework", "Cocoa", "-framework", "IOKit"] { result.add(item) } }
+    else if host.windows() { result.add("-lopengl32") }
+    else { result.add("-lGL") }
+    return result
+}
+
+function effectiveOptimization(options: List<Text>): Text {
+    let value = "null"
+    for option in options {
+        if option.startsWith("-O") {
+            let level = host.textAfter(option, "-O")
+            if level == "" { value = "\"1\"" }
+            else if level == "s" || level == "z" || level == "g" || level == "fast" || digits(level, -1) { value = host.jsonText(level) }
+        }
+    }
+    return value
+}
+record Binding { original: Text; retained: Text; digest: Text; size: Integer; error: Text; failure: Text }
+function unbound(original: Text, failure: Text, message: Text): Binding {
+    return Binding { original: original; retained: ""; digest: ""; size: 0; error: message; failure: failure }
+}
+function binding(path: Text, retained: Text): Binding {
+    let original = host.resolveName(path)
+    let target = host.resolveName(retained)
+    let before = host.load(original)
+    if before.error != 0 { return unbound(original, host.osRepr(before.error), host.osError(before.error, original)) }
+    if original != target {
+        let stored = host.store(target, before.data)
+        if stored < 0 { return unbound(original, host.osRepr(stored), host.osError(stored, target)) }
+    }
+    let copied = host.load(target)
+    if copied.error != 0 { return unbound(original, host.osRepr(copied.error), host.osError(copied.error, target)) }
+    let after = host.load(original)
+    if after.error != 0 { return unbound(original, host.osRepr(after.error), host.osError(after.error, original)) }
+    let first = host.hashBytes(before.data)
+    if first != host.hashBytes(copied.data) || first != host.hashBytes(after.data) {
+        let message = "link input changed while retaining evidence"
+        return unbound(original, "ValueError(" + host.pythonText(message) + ")", message)
+    }
+    return Binding { original: original; retained: host.baseName(target); digest: first; size: before.data.length; error: ""; failure: "" }
+}
+function bindingFailed(link: Link, value: Binding): Boolean { return failedWith(link, value.failure, value.error) }
+function bindingObject(doc: host.Document, value: Binding): Integer {
+    let row = host.jsonObject(doc)
+    host.jsonPut(doc, row, "original", host.jsonString(doc, value.original))
+    host.jsonPut(doc, row, "retained", host.jsonString(doc, value.retained))
+    for key in ["sha256", "source_before_sha256", "retained_sha256", "source_after_sha256"] {
+        host.jsonPut(doc, row, key, host.jsonString(doc, value.digest))
+    }
+    host.jsonPut(doc, row, "bytes", host.jsonNumber(doc, value.size))
+    return row
+}
+
+record Link { doc: host.Document; root: Integer; directory: Text; artifacts: Boolean; rows: List<Integer>; originals: List<Text>; failure: Text; message: Text; status: Integer }
+function failed(link: Link, message: Text): Boolean {
+    link.message = message
+    link.failure = "ValueError(" + host.pythonText(message) + ")"
+    return false
+}
+function failedWith(link: Link, failure: Text, message: Text): Boolean {
+    link.message = message
+    link.failure = failure
+    return false
+}
+function exited(link: Link, status: Integer): Boolean {
+    link.status = status
+    link.failure = "SystemExit(" + Text(status) + ")"
+    return false
+}
+function checkedRows(link: Link, key: Text, mismatch: Text, compare: Text): Boolean {
+    for index in 0..link.rows.length {
+        let value = host.hashFile(link.originals[index])
+        host.jsonPut(link.doc, link.rows[index], key, host.jsonString(link.doc, value))
+        if host.jsonText(value) != host.jsonScalar(link.doc, link.rows[index], compare) { return failed(link, mismatch) }
+    }
+    return true
+}
+function publish(link: Link, command: List<Text>, output: Text, source: Text): Boolean {
+    let destination = output
+    let directory = host.parentPath(destination)
+    host.guard(true)
+    let staging = host.temporaryDirectory(directory, ".minyar-link-")
+    let staged = staging + "/" + host.baseName(destination)
+    let actual = host.copied(command)
+    actual.add("-o")
+    actual.add(staged)
+    let doc = link.doc
+    if link.artifacts {
+        host.jsonPut(doc, link.root, "actual_command", host.jsonStrings(doc, actual))
+        host.jsonPut(doc, link.root, "staged_requested_path", host.jsonString(doc, host.resolveName(staged)))
+        let selected = host.which(command[0])
+        if selected == "" { selected = command[0] }
+        let compiler = host.resolveName(selected)
+        let compilerHash = host.hashFile(compiler)
+        let pre = host.jsonObject(doc)
+        host.jsonPut(doc, pre, "selected_command", host.jsonString(doc, command[0]))
+        host.jsonPut(doc, pre, "resolved_path", host.jsonString(doc, compiler))
+        host.jsonPut(doc, pre, "sha256", host.jsonString(doc, compilerHash))
+        host.jsonPut(doc, link.root, "compiler_pre_link", pre)
+        let tools = host.jsonLookup(doc, link.root, "tools")
+        if host.jsonText(compiler) != host.jsonScalar(doc, link.root, "compiler") || host.jsonText(compilerHash) != host.jsonScalar(doc, tools, "clang.bin") {
+            host.release(staging)
+            host.guard(false)
+            return failed(link, "selected link compiler changed")
+        }
+        if !checkedRows(link, "pre_link_sha256", "retained link input changed before Clang", "retained_sha256") {
+            host.release(staging)
+            host.guard(false)
+            return false
+        }
+        host.jsonPut(doc, link.root, "link_attempted", host.jsonBool(doc, true))
+    }
+    let status = host.spawn(actual, [], true, "", "", 0)
+    if link.artifacts && status > host.INTERRUPTED {
+        host.jsonPut(doc, link.root, "link_subprocess_status", host.jsonNumber(doc, status))
+    }
+    let signal = host.pendingSignal()
+    if status <= host.INTERRUPTED { signal = host.INTERRUPTED - status }
+    if signal == 0 && status != 0 {
+        host.release(staging)
+        host.guard(false)
+        return exited(link, status)
+    }
+    if signal == 0 && !host.isFile(staged) && host.isFile(staged + ".exe") {
+        staged = staged + ".exe"
+        destination = destination + ".exe"
+    }
+    if signal == 0 && link.artifacts {
+        let bound = binding(staged, link.directory + "/program.staged" + host.suffixOf(staged))
+        if bound.error != "" {
+            host.release(staging)
+            host.guard(false)
+            return bindingFailed(link, bound)
+        }
+        let row = host.jsonObject(doc)
+        host.jsonPut(doc, row, "path", host.jsonString(doc, host.resolveName(staged)))
+        host.jsonPut(doc, row, "retained", host.jsonString(doc, bound.retained))
+        host.jsonPut(doc, row, "sha256", host.jsonString(doc, bound.digest))
+        host.jsonPut(doc, row, "bytes", host.jsonNumber(doc, bound.size))
+        host.jsonPut(doc, link.root, "staged_output", row)
+        if !checkedRows(link, "post_link_sha256", "link input changed while Clang ran", "pre_link_sha256") {
+            host.release(staging)
+            host.guard(false)
+            return false
+        }
+    }
+    if signal == 0 { signal = host.pendingSignal() }
+    if signal != 0 {
+        host.release(staging)
+        host.guard(false)
+        return exited(link, 128 + signal)
+    }
+    if source != "" && host.exists(destination) && host.sameFile(destination, source) {
+        host.release(staging)
+        host.guard(false)
+        return failed(link, "refusing to replace the source file; choose a different -o path: " + destination)
+    }
+    if files.rename(staged, destination) != 0 {
+        let message = host.osError(files.lastError(), staged)
+        host.release(staging)
+        host.guard(false)
+        return failedWith(link, "OSError(" + host.pythonText(message) + ")", message)
+    }
+    if link.artifacts {
+        let bound = binding(destination, link.directory + "/program" + host.suffixOf(destination))
+        if bound.error != "" {
+            host.release(staging)
+            host.guard(false)
+            return bindingFailed(link, bound)
+        }
+        let row = host.jsonObject(doc)
+        host.jsonPut(doc, row, "path", host.jsonString(doc, host.resolveName(destination)))
+        host.jsonPut(doc, row, "retained", host.jsonString(doc, bound.retained))
+        host.jsonPut(doc, row, "sha256", host.jsonString(doc, bound.digest))
+        host.jsonPut(doc, row, "bytes", host.jsonNumber(doc, bound.size))
+        host.jsonPut(doc, link.root, "final_output", row)
+        let stagedRow = host.jsonLookup(doc, link.root, "staged_output")
+        if host.jsonScalar(doc, stagedRow, "sha256") != host.jsonText(bound.digest) || host.jsonScalar(doc, stagedRow, "bytes") != Text(bound.size) {
+            host.release(staging)
+            host.guard(false)
+            return failed(link, "published link output changed")
+        }
+    }
+    host.release(staging)
+    host.guard(false)
+    return true
+}
+function publishMessage(link: Link) {
+    if link.status != 0 { host.leave(link.status) }
+    host.stop(link.message)
+}
+function linkProgram(clang: Text, linkFlags: List<Text>, lto: List<Text>, llvm: Text, runtime: Text, native: List<Text>, libraries: List<Text>, output: Text, source: Text) {
+    let address = sanitizer.addressEnabled(linkFlags)
+    let thread = sanitizer.threadEnabled(linkFlags)
+    let enabled = address || thread
+    let requested = host.setting("MINYAR_LINK_ARTIFACTS", "")
+    let command = [clang]
+    for group in [linkFlags, lto] { for item in group { command.add(item) } }
+    if !enabled && requested == "" {
+        command.add(llvm)
+        command.add(runtime)
+        for group in [native, libraries] { for item in group { command.add(item) } }
+        let link = Link { doc: host.newDocument(); root: 0; directory: ""; artifacts: false; rows: []; originals: []; failure: ""; message: ""; status: 0 }
+        if !publish(link, command, output, source) { publishMessage(link) }
+        return
+    }
+    let artifacts = requested != ""
+    let directory = ""
+    if artifacts {
+        directory = host.resolveName(requested)
+        host.makeDirectories(host.parentPath(directory))
+        let created = host.makeDirectory(directory)
+        if created != 0 { host.stop(host.osError(created, directory)) }
+    } else { directory = host.temporaryDirectory("", "minyar-program-sanitize-") }
+    let doc = host.newDocument()
+    let root = 0
+    let mode = "native"
+    if address { mode = "asan" } else if thread { mode = "tsan" }
+    let combined = host.extended(linkFlags, lto)
+    host.jsonPut(doc, root, "schema", host.jsonNumber(doc, 2))
+    host.jsonPut(doc, root, "address_sanitizer_enabled", host.jsonBool(doc, address))
+    host.jsonPut(doc, root, "thread_sanitizer_enabled", host.jsonBool(doc, thread))
+    host.jsonPut(doc, root, "program_ir_cached", host.jsonBool(doc, false))
+    host.jsonPut(doc, root, "runtime_reannotated", host.jsonBool(doc, false))
+    host.jsonPut(doc, root, "link_flags", host.jsonStrings(doc, linkFlags))
+    host.jsonPut(doc, root, "lto_flags", host.jsonStrings(doc, lto))
+    host.jsonPut(doc, root, "optimization", host.jsonRaw(doc, effectiveOptimization(combined)))
+    host.jsonPut(doc, root, "mode", host.jsonString(doc, mode))
+    host.jsonPut(doc, root, "compiler_selected_command", host.jsonString(doc, clang))
+    let inputs = host.jsonArray(doc)
+    host.jsonPut(doc, root, "inputs", inputs)
+    let tools = host.jsonObject(doc)
+    host.jsonPut(doc, root, "tools", tools)
+    let bindings = host.jsonObject(doc)
+    host.jsonPut(doc, root, "tool_bindings", bindings)
+    host.jsonPut(doc, root, "link_attempted", host.jsonBool(doc, false))
+    host.jsonPut(doc, root, "artifact_directory", host.jsonString(doc, directory))
+    let retention = host.jsonArray(doc)
+    host.jsonPut(doc, root, "retention_errors", retention)
+    let link = Link { doc: doc; root: root; directory: directory; artifacts: artifacts; rows: []; originals: []; failure: ""; message: ""; status: 0 }
+    let succeeded = linkSteps(link, clang, command, linkFlags, llvm, runtime, native, libraries, output, source, address, thread, enabled)
+    if succeeded {
+        host.jsonPut(doc, root, "link_status", host.jsonNumber(doc, 0))
+        if artifacts {
+            host.jsonPut(doc, root, "binary_sha256", host.jsonRaw(doc, host.jsonScalar(doc, host.jsonLookup(doc, root, "final_output"), "sha256")))
+        }
+    } else { host.jsonPut(doc, root, "link_error", host.jsonString(doc, link.failure)) }
+    if artifacts {
+        if !host.exists(directory + "/clang-driver") {
+            let self = host.load(host.selfPath())
+            let copied = self.error
+            if copied == 0 { copied = host.store(directory + "/clang-driver", self.data) }
+            if copied < 0 { retentionError(doc, retention, "helper-retention", host.osRepr(copied)) }
+        }
+        let written = host.store(directory + "/manifest.json", Bytes(host.jsonRender(doc, root, "") + "\n"))
+        if written < 0 {
+            retentionError(doc, retention, "manifest-retention", host.osRepr(written))
+            host.store(directory + "/manifest-retention-error.json", Bytes(host.jsonRender(doc, root, "") + "\n"))
+        }
+        if succeeded && doc.children[retention].length > 0 { host.stop("could not retain complete final link evidence") }
+    }
+    if !succeeded { publishMessage(link) }
+    if !artifacts { host.release(directory) }
+}
+function retentionError(doc: host.Document, retention: Integer, phase: Text, error: Text) {
+    let row = host.jsonObject(doc)
+    host.jsonPut(doc, row, "phase", host.jsonString(doc, phase))
+    host.jsonPut(doc, row, "error", host.jsonString(doc, error))
+    host.jsonPush(doc, retention, row)
+}
+function linkSteps(link: Link, clang: Text, prefix: List<Text>, linkFlags: List<Text>, llvm: Text, runtime: Text, native: List<Text>, libraries: List<Text>,
+    output: Text, source: Text, address: Boolean, thread: Boolean, enabled: Boolean): Boolean {
+    let doc = link.doc
+    let root = link.root
+    let directory = link.directory
+    let loaded = host.load(llvm)
+    if loaded.error != 0 { return failedWith(link, host.osRepr(loaded.error), host.osError(loaded.error, llvm)) }
+    let raw = loaded.data
+    let program = llvm
+    host.jsonPut(doc, root, "raw_program", host.jsonString(doc, host.resolveName(llvm)))
+    host.jsonPut(doc, root, "raw_sha256", host.jsonString(doc, host.hashBytes(raw)))
+    if link.artifacts {
+        let bound = binding(llvm, directory + "/program.raw.ll")
+        if bound.error != "" { return bindingFailed(link, bound) }
+        let row = bindingObject(doc, bound)
+        host.jsonPut(doc, root, "raw_program_input", row)
+        link.rows.add(row)
+        link.originals.add(bound.original)
+    }
+    let retainedProgram = "program.raw.ll"
+    if address { retainedProgram = "program.asan.ll" } else if thread { retainedProgram = "program.tsan.ll" }
+    if enabled {
+        program = directory + "/" + retainedProgram
+        let annotated = sanitizer.program(Text(raw), linkFlags)
+        if annotated.error != "" {
+            failed(link, annotated.error)
+            host.jsonPut(doc, root, "phase", host.jsonString(doc, "program-annotation"))
+            host.jsonPut(doc, root, "error", host.jsonString(doc, link.failure))
+            return false
+        }
+        let written = host.store(program, Bytes(annotated.text))
+        if written < 0 { return failedWith(link, host.osRepr(written), host.osError(written, program)) }
+    }
+    let command = host.copied(prefix)
+    command.add(program)
+    command.add(runtime)
+    for group in [native, libraries] { for item in group { command.add(item) } }
+    host.jsonPut(doc, root, "command", host.jsonStrings(doc, command))
+    host.jsonPut(doc, root, "linked_program_sha256", host.jsonString(doc, host.hashFile(program)))
+    if link.artifacts {
+        let bound = binding(program, directory + "/" + retainedProgram)
+        if bound.error != "" { return bindingFailed(link, bound) }
+        let row = bindingObject(doc, bound)
+        host.jsonPut(doc, row, "role", host.jsonString(doc, "program"))
+        host.jsonPut(doc, row, "format", host.jsonString(doc, "llvm"))
+        host.jsonPut(doc, root, "program_input", row)
+        link.rows.add(row)
+        link.originals.add(bound.original)
+        let labels = ["runtime"]
+        let paths = [runtime]
+        for index in 0..native.length {
+            labels.add("native-" + Text(index))
+            paths.add(native[index])
+        }
+        let inputs = host.jsonLookup(doc, root, "inputs")
+        for index in 0..paths.length {
+            if !host.isFile(paths[index]) { continue }
+            let suffix = host.suffixOf(paths[index])
+            let input = binding(paths[index], directory + "/" + labels[index] + suffix)
+            if input.error != "" { return bindingFailed(link, input) }
+            let inputRow = bindingObject(doc, input)
+            let role = "provider"
+            if index == 0 { role = "runtime" }
+            let format = "native_input"
+            if suffix == ".o" { format = "native_object" } else if suffix == ".ll" || suffix == ".bc" { format = "llvm" }
+            host.jsonPut(doc, inputRow, "role", host.jsonString(doc, role))
+            host.jsonPut(doc, inputRow, "format", host.jsonString(doc, format))
+            host.jsonPush(doc, inputs, inputRow)
+            link.rows.add(inputRow)
+            link.originals.add(input.original)
+        }
+        let tools = host.jsonLookup(doc, root, "tools")
+        let bindings = host.jsonLookup(doc, root, "tool_bindings")
+        let self = host.selfPath()
+        let driver = binding(self, directory + "/clang-driver")
+        if driver.error != "" { return bindingFailed(link, driver) }
+        host.jsonPut(doc, tools, "clang-driver", host.jsonString(doc, driver.digest))
+        host.jsonPut(doc, bindings, "clang-driver", bindingObject(doc, driver))
+        let selected = host.which(clang)
+        if selected == "" { selected = clang }
+        let compiler = host.resolveName(selected)
+        let bound = binding(compiler, directory + "/clang.bin")
+        if bound.error != "" { return bindingFailed(link, bound) }
+        host.jsonPut(doc, tools, "clang.bin", host.jsonString(doc, bound.digest))
+        host.jsonPut(doc, bindings, "clang.bin", bindingObject(doc, bound))
+        host.jsonPut(doc, root, "compiler", host.jsonString(doc, compiler))
+        host.jsonPut(doc, root, "compiler_version", host.jsonString(doc, host.captureOutput([clang, "--version"], 0)))
+    }
+    return publish(link, command, output, source)
+}
+
+function libraryNamed(libraries: List<Text>, name: Text): Boolean { return host.listed(libraries, name) }
+function linkCommand(arguments: List<Text>) {
+    let clang = host.pinnedLlvm(host.selectedClang())
+    let project = arguments[0]
+    let llvm = arguments[1]
+    let runtime = arguments[2]
+    let output = arguments[3]
+    let release = arguments[4]
+    let debug = arguments.length >= 6 && arguments[5] == "1"
+    let source = ""
+    if arguments.length >= 7 { source = arguments[6] }
+    let extra: List<Text> = []
+    for index in 7..max(7, arguments.length) { extra.add(arguments[index]) }
+    let inputs = packageInputs(extra)
+    let resolvedOutput = host.resolveName(output)
+    for input in inputs {
+        if input.path == resolvedOutput || (host.exists(output) && host.sameFile(input.path, output)) {
+            host.stop("refusing to replace a native input; choose a different -o path: " + output)
+        }
+    }
+    let fallback = DEFAULT_FLAGS
+    if release != "1" && debug { fallback = "-O0 -g -Wno-override-module" }
+    let linkFlags = host.flags("MINYAR_CLANG_FLAGS", fallback)
+    let native: List<Text> = []
+    let libraries: List<Text> = []
+    let cycles = false
+    let threaded = false
+    let layoutLines: List<Text> = []
+    for entry in host.lines(host.readText(llvm)) {
+        let line = entry
+        if line.endsWith("\r") { line = host.textSlice(line, 0, line.byteLength - 1) }
+        if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { layoutLines.add(line) }
+        if line.startsWith("; minyar-native-library: ") {
+            let library = host.strip(host.textAfter(line, "; minyar-native-library: "))
+            if !host.listed(libraries, library) { libraries.add(library) }
+            if library == "callbackruntime" { cycles = true }
+        }
+        if line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" { cycles = true }
+        if line == "; minyar-thread-runtime: 1" { threaded = true }
+    }
+    libraries.sort()
+    let isWindows = host.windows()
+    if threaded {
+        let options = runtimeOptions(clang, release, linkFlags)
+        if !isWindows { options.add("-pthread") }
+        runtime = variantRuntime(project, clang, "thread-runtime", threadSource(project, runtime, cycles), options, [".h", ".c"])
+        if !isWindows { native.add("-pthread") }
+    } else if cycles {
+        runtime = variantRuntime(project, clang, "cycle-runtime", configuredSource(project, runtime), runtimeOptions(clang, release, linkFlags), [".h"])
+    }
+    let nativeFlags = host.flags("MINYAR_NATIVE_FLAGS", host.shellJoin(linkFlags))
+    if layoutLines.length > 0 {
+        let bridge = layoutObject(project, clang, nativeFlags, layoutLines)
+        if bridge != "" { native.add(bridge) }
+    }
+    if cycles && libraryNamed(libraries, "macos") { nativeFlags.add("-DMINYAR_APP_MANAGED_CLEANUP=1") }
+    if libraryNamed(libraries, "net") && (libraryNamed(libraries, "macos") || libraryNamed(libraries, "windows")) {
+        nativeFlags.add("-DMINYAR_APP_EVENT_LOOP=1")
+    }
+    let packages = packageNames(inputs)
+    let base = Bytes()
+    let needsBase = false
+    for library in libraries { if library != "machine" && library != "machine_arm64" { needsBase = true } }
+    if needsBase { base = clangIdentity(clang) }
+    let platform = host.hostName()
+    let darwin = platform == "Darwin"
+    if (libraryNamed(libraries, "securecrypto") && !host.listed(packages, "securecrypto")) || (libraryNamed(libraries, "update") && !host.listed(packages, "update")) {
+        native.add(nativeObject(project, clang, base, "update_monocypher.c", nativeFlags))
+    }
+    let objc = host.extended(nativeFlags, ["-fobjc-arc", "-fmodules"])
+    for library in libraries {
+        if host.listed(packages, library) { continue }
+        if library == "graphics" { for item in graphics(project, clang, base, nativeFlags) { native.add(item) } }
+        else if library == "macos" {
+            if !darwin { host.stop("the macos package requires macOS and the Apple command-line tools") }
+            native.add(nativeObject(project, clang, base, "macos.m", objc))
+            for item in ["-framework", "AppKit"] { native.add(item) }
+        } else if library == "http" {
+            if !darwin { host.stop("the http package currently requires macOS and the Apple command-line tools") }
+            native.add(nativeObject(project, clang, base, "http.m", objc))
+            for item in ["-framework", "AppKit", "-framework", "Security"] { native.add(item) }
+        } else if library == "windows" {
+            if !isWindows { host.stop("the windows package requires Windows and its native UI") }
+            native.add(nativeObject(project, clang, base, "windows.c", nativeFlags))
+            for item in ["-luser32", "-lgdi32", "-lshell32", "-lcomctl32"] { native.add(item) }
+        } else if library == "schannel" {
+            if !isWindows { host.stop("the schannel package requires Windows and its TLS provider") }
+            native.add(nativeObject(project, clang, base, "schannel.c", nativeFlags))
+            for item in ["-lsecur32", "-lcrypt32", "-lbcrypt", "-lncrypt", "-lws2_32"] { native.add(item) }
+            if !libraryNamed(libraries, "tlsverify") { native.add(nativeObject(project, clang, base, "tlsverify.c", nativeFlags)) }
+        } else if library == "wincert" {
+            if !isWindows { host.stop("the wincert package requires Windows and its certificate store") }
+            native.add(nativeObject(project, clang, base, "wincert.c", nativeFlags))
+            for item in ["-lcrypt32", "-lbcrypt", "-lncrypt"] { native.add(item) }
+        } else if library == "machine" || library == "machine_arm64" || library == "callbackruntime" {
+        } else if library == "net" {
+            native.add(nativeObject(project, clang, base, "net.c", nativeFlags))
+            if isWindows { native.add("-lws2_32") }
+        } else if library == "update" {
+            for name in ["update.c", "update_ed25519.c"] { native.add(nativeObject(project, clang, base, name, nativeFlags)) }
+        } else if library == "workers" {
+            native.add(nativeObject(project, clang, base, "workers.c", nativeFlags))
+            if isWindows { native.add("-ladvapi32") } else { native.add("-pthread") }
+        } else if library == "system" {
+            native.add(nativeObject(project, clang, base, "system.c", nativeFlags))
+            if isWindows { native.add("-lpsapi") } else { native.add("-pthread") }
+        } else if library == "files" {
+            if isWindows { host.stop("the files package currently supports macOS and Linux") }
+            native.add(nativeObject(project, clang, base, "files.c", nativeFlags))
+            native.add("-pthread")
+        } else if library == "quicinteropio" {
+            native.add(nativeObject(project, clang, base, "quicinteropio.c", nativeFlags))
+        } else if library == "erofs" {
+            if platform != "Linux" { host.stop("the erofs package currently supports Linux") }
+            let lz4 = providers.formatProvider("lz4", clang, nativeFlags, linkFlags)
+            let archive = providers.formatProvider("tararchive", clang, nativeFlags, linkFlags)
+            let codec = providers.codecProvider("zstd", clang, nativeFlags, linkFlags)
+            let options = host.copied(nativeFlags)
+            for group in [lz4.cflags, archive.cflags, codec.cflags] { for item in group { options.add(item) } }
+            native.add(nativeObject(project, clang, base, "erofs.c", options))
+            for group in [lz4.libraries, archive.libraries, codec.libraries] { for item in group { native.add(item) } }
+        } else if library == "sha256" || library == "tararchive" {
+            let selected = providers.formatProvider(library, clang, nativeFlags, linkFlags)
+            native.add(nativeObject(project, clang, base, library + ".c", host.extended(nativeFlags, selected.cflags)))
+            for item in selected.libraries { native.add(item) }
+        } else if library == "aes" {
+            native.add(nativeObject(project, clang, base, "aes.c", nativeFlags))
+            if isWindows { native.add("-lbcrypt") } else if !darwin { native.add("-lcrypto") }
+        } else if library == "zstd" || library == "deflate" {
+            let selected = providers.codecProvider(library, clang, nativeFlags, linkFlags)
+            native.add(nativeObject(project, clang, base, library + ".c", host.extended(nativeFlags, selected.cflags)))
+            for item in selected.libraries { native.add(item) }
+        } else if library == "securecrypto" {
+            native.add(nativeObject(project, clang, base, "securecrypto.c", nativeFlags))
+        } else if library == "tlsverify" {
+            native.add(nativeObject(project, clang, base, "tlsverify.c", nativeFlags))
+            if darwin { for item in ["-framework", "Security", "-framework", "CoreFoundation"] { native.add(item) } }
+            else if isWindows { for item in ["-lcrypt32", "-lbcrypt", "-lncrypt", "-lws2_32"] { native.add(item) } }
+            else { native.add("-lcrypto") }
+        } else if library == "keychain" {
+            if !darwin { host.stop("the keychain package requires macOS") }
+            native.add(nativeObject(project, clang, base, "keychain.c", nativeFlags))
+            for item in ["-framework", "Security", "-framework", "CoreFoundation"] { native.add(item) }
+        } else if library == "winnotify" {
+            if !isWindows { host.stop("the winnotify package requires Windows") }
+            let notification = nativeObject(project, clang, base, "winnotify.c", nativeFlags)
+            if !host.listed(native, notification) { native.add(notification) }
+            for item in ["-luser32", "-lshell32", "-ladvapi32", "-lole32", "-luuid", "-lbcrypt", "-lruntimeobject"] { native.add(item) }
+        } else if library == "desktop" {
+            if darwin {
+                native.add(nativeObject(project, clang, base, "desktop.m", objc))
+                for framework in ["AppKit", "UserNotifications", "ServiceManagement", "Network", "IOKit"] {
+                    native.add("-framework")
+                    native.add(framework)
+                }
+            } else {
+                native.add(nativeObject(project, clang, base, "desktop.c", nativeFlags))
+                if isWindows {
+                    let notification = nativeObject(project, clang, base, "winnotify.c", nativeFlags)
+                    if !host.listed(native, notification) { native.add(notification) }
+                    for item in ["-luser32", "-lshell32", "-ladvapi32", "-lole32", "-loleaut32", "-liphlpapi", "-luuid", "-lws2_32", "-lbcrypt", "-lruntimeobject"] { native.add(item) }
+                }
+            }
+        } else { host.stop("the program uses an unknown native library: " + library) }
+    }
+    let lto: List<Text> = []
+    if release == "1" { lto = ltoFlags(clang, linkFlags) }
+    let math: List<Text> = []
+    if !darwin { math.add("-lm") }
+    if packages.length > 0 {
+        let temporary = host.temporaryDirectory("", "minyar-package-native-")
+        for name in packages {
+            if !libraryNamed(libraries, name) { continue }
+            for input in inputs {
+                if input.name != name { continue }
+                if input.kind == "source" {
+                    let object = temporary + "/" + Text(native.length) + ".o"
+                    let command = [clang]
+                    for item in nativeFlags { command.add(item) }
+                    for item in ["-iquote", project + "/runtime", "-c", input.path, "-o", object] { command.add(item) }
+                    host.run(command)
+                    native.add(object)
+                } else { native.add(input.path) }
+            }
+        }
+    }
+    linkProgram(clang, linkFlags, lto, llvm, runtime, native, math, output, source)
+}
+
+function compile(arguments: List<Text>) {
+    let clang = host.pinnedLlvm(host.selectedClang())
+    let command = [clang]
+    for item in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { command.add(item) }
+    for item in arguments { command.add(item) }
+    host.run(command)
+}
+function runtimeFormat() {
+    let format = "llvm"
+    for option in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { if option.startsWith("-fsanitize=") { format = "object" } }
+    print(format)
+}
+function sanitizeFile(arguments: List<Text>) {
+    let annotated = sanitizer.instrument(host.readText(arguments[0]), "sanitize_address")
+    if annotated.error != "" { host.stop(annotated.error) }
+    host.writeBytes(arguments[1], Bytes(annotated.text))
+}
+
+let given: List<Text> = []
+for index in 1..max(1, argumentCount()) { given.add(argument(index)) }
+let command = ""
+if argumentCount() > 0 { command = argument(0) }
+if command == "toolchain" && given.length == 0 { print(host.pinnedLlvm(host.selectedClang())) }
+else if command == "runtime-format" && given.length == 0 { runtimeFormat() }
+else if command == "compile" && given.length >= 2 { compile(given) }
+else if command == "link" && given.length >= 5 { linkCommand(given) }
+else if command == "sanitize-llvm" && given.length == 2 { sanitizeFile(given) }
+else if command == "format-provider" { providers.formatCommand(given) }
+else if command == "codec-provider" { providers.codecCommand(given) }
+else { host.stop("usage: clang-driver compile ARGS... | link PROJECT IR RUNTIME OUTPUT RELEASE") }
+host.leave(0)

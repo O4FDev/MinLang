@@ -1,0 +1,773 @@
+use "./driver-support.min" as host
+use "system" as system
+
+public record Provider { cflags: List<Text>; libraries: List<Text> }
+
+function within(prefix: Text, path: Text): Boolean {
+    if prefix == "/" { return path != "/" && path.startsWith("/") }
+    return path.startsWith(prefix + "/")
+}
+function sortedPaths(paths: List<Text>): List<Text> {
+    let separator = Text(Bytes(1))
+    let keys: List<Text> = []
+    for path in paths { keys.add(host.replaceText(path, "/", separator)) }
+    let result: List<Text> = []
+    for key in host.sortedUnique(keys) { result.add(host.replaceText(key, separator, "/")) }
+    return result
+}
+function pythonJson(value: Text): Text {
+    let digits = "0123456789abcdef"
+    let parts: List<Text> = ["\""]
+    for character in value {
+        let code = Integer(character)
+        if code == 34 { parts.add("\\\"") }
+        else if code == 92 { parts.add("\\\\") }
+        else if code == 10 { parts.add("\\n") }
+        else if code == 13 { parts.add("\\r") }
+        else if code == 9 { parts.add("\\t") }
+        else if code == 8 { parts.add("\\b") }
+        else if code == 12 { parts.add("\\f") }
+        else if code >= 32 && code < 127 { parts.add(Text(character)) }
+        else {
+            let units: List<Integer> = [code]
+            if code > 65535 {
+                let shifted = code - 65536
+                units = [55296 + shifted / 1024, 56320 + shifted % 1024]
+            }
+            for unit in units {
+                parts.add("\\u" + Text(digits[unit / 4096]) + Text(digits[unit / 256 % 16]) + Text(digits[unit / 16 % 16]) + Text(digits[unit % 16]))
+            }
+        }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+function pythonList(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(pythonJson(item)) }
+    return "[" + host.joined(parts, ",") + "]"
+}
+function fromHex(value: Text): Bytes {
+    let result = Bytes()
+    let raw = Bytes(value)
+    let index = 0
+    while index + 1 < raw.length {
+        let high = raw[index]
+        let low = raw[index + 1]
+        if high >= 97 { high -= 87 } else { high -= 48 }
+        if low >= 97 { low -= 87 } else { low -= 48 }
+        result.add(high * 16 + low)
+        index += 2
+    }
+    return result
+}
+function upper(value: Text): Text {
+    let raw = Bytes(value)
+    let result = Bytes()
+    for byte in raw {
+        if byte >= 97 && byte <= 122 { result.add(byte - 32) } else { result.add(byte) }
+    }
+    return Text(result)
+}
+function decimalBytes(value: Bytes): Integer {
+    let start = 0
+    let end = value.length
+    while start < end && host.isSpace(value[start]) { start += 1 }
+    while end > start && host.isSpace(value[end - 1]) { end -= 1 }
+    if start == end { return -1 }
+    let negative = false
+    if value[start] == 45 || value[start] == 43 {
+        negative = value[start] == 45
+        start += 1
+    }
+    if start == end || end - start > 18 { return -1 }
+    let result = 0
+    for index in start..end {
+        if !host.isDigit(value[index]) { return -1 }
+        result = result * 10 + value[index] - 48
+    }
+    if negative { return -2 }
+    return result
+}
+function littleEndian(value: Bytes, start: Integer, count: Integer, big: Boolean): Integer {
+    let result = 0
+    for offset in 0..count {
+        let index = start + offset
+        if big { index = start + count - 1 - offset }
+        result = result + (value[index] << (8 * offset))
+    }
+    return result
+}
+function prefixed(value: Bytes, pattern: List<Integer>): Boolean {
+    if value.length < pattern.length { return false }
+    for index in 0..pattern.length { if value[index] != pattern[index] { return false } }
+    return true
+}
+function reject(path: Text, reason: Text) {
+    host.stop(path + " must be a real static archive: " + reason)
+}
+function symbolDefinitions(output: Text): List<Text> {
+    let result: List<Text> = []
+    for line in host.lines(output) {
+        let fields = host.words(line)
+        if fields.length != 3 || fields[1] != "T" { continue }
+        let hex = true
+        for byte in Bytes(fields[0]) {
+            if !(host.isDigit(byte) || (byte >= 97 && byte <= 102) || (byte >= 65 && byte <= 70)) { hex = false }
+        }
+        let symbol = fields[2]
+        if symbol.startsWith("_") { symbol = host.textAfter(symbol, "_") }
+        let valid = hex && symbol != ""
+        for byte in Bytes(symbol) { if !(host.isWord(byte) && byte < 128) { valid = false } }
+        if valid { result.add(symbol) }
+    }
+    return result
+}
+public function staticArchive(path: Text, clang: Text, required: List<Text>) {
+    let data = host.readBytes(path)
+    if !prefixed(data, [33, 60, 97, 114, 99, 104, 62, 10]) { reject(path, "thin archives, shared libraries and linker scripts are unsupported") }
+    let offset = 8
+    let objects = 0
+    while offset < data.length {
+        if offset + 60 > data.length || data[offset + 58] != 96 || data[offset + 59] != 10 { reject(path, "malformed member header") }
+        let size = decimalBytes(data.slice(offset + 48, offset + 58))
+        if size == -1 { reject(path, "malformed member size") }
+        if size < 0 || offset + 60 + size > data.length { reject(path, "truncated member") }
+        let label = host.strip(Text(data.slice(offset, offset + 16)))
+        let member = data.slice(offset + 60, offset + 60 + size)
+        offset += 60 + size + size % 2
+        if label.startsWith("#1/") {
+            let length = decimalBytes(Bytes(host.textAfter(label, "#1/")))
+            if length == -1 { reject(path, "malformed extended member name") }
+            if length < 0 || length > member.length { reject(path, "truncated extended member name") }
+            let end = length
+            while end > 0 && member[end - 1] == 0 { end -= 1 }
+            label = Text(member.slice(0, end))
+            member = member.slice(length, member.length)
+        }
+        if label == "/" || label == "//" || label == "/SYM64/" || label.startsWith("__.SYMDEF") { continue }
+        objects += 1
+        if prefixed(member, [127, 69, 76, 70]) {
+            if member.length < 20 || (member[5] != 1 && member[5] != 2) { reject(path, "invalid ELF member") }
+            if littleEndian(member, 16, 2, member[5] == 2) != 1 { reject(path, "ELF member is not relocatable") }
+        } else if prefixed(member, [206, 250, 237, 254]) || prefixed(member, [207, 250, 237, 254]) || prefixed(member, [254, 237, 250, 206]) || prefixed(member, [254, 237, 250, 207]) {
+            let big = member[0] != 206 && member[0] != 207
+            if member.length < 28 || littleEndian(member, 12, 4, big) != 1 { reject(path, "Mach-O member is not MH_OBJECT") }
+        } else if member.length >= 20 && (littleEndian(member, 0, 2, false) == 34404 || littleEndian(member, 0, 2, false) == 43620 || littleEndian(member, 0, 2, false) == 332) {
+            let count = littleEndian(member, 2, 2, false)
+            let optional = littleEndian(member, 16, 2, false)
+            let flags = littleEndian(member, 18, 2, false)
+            if optional != 0 || flags & 8194 != 0 || count == 0 || 20 + 40 * count > member.length { reject(path, "COFF member is not a relocatable object") }
+            for index in 0..count {
+                if prefixed(member.slice(20 + 40 * index, 28 + 40 * index), [46, 105, 100, 97, 116, 97]) { reject(path, "COFF import-library member") }
+            }
+        } else { reject(path, "unsupported object or short COFF import member") }
+    }
+    if offset != data.length || objects == 0 { reject(path, "empty or malformed archive") }
+    let selected = host.which(clang)
+    if selected == "" { selected = clang }
+    let directory = host.parentPath(host.resolveName(selected))
+    let nm = ""
+    for candidate in [directory + "/llvm-nm", directory + "/nm"] { if nm == "" && host.isFile(candidate) { nm = candidate } }
+    if nm == "" { nm = host.which("llvm-nm") }
+    if nm == "" { nm = host.which("nm") }
+    if nm == "" { reject(path, "install llvm-nm or nm to verify static symbol definitions") }
+    let result = host.capture([nm, "-g", path], 0)
+    if result.status != 0 {
+        reject(path, "cannot inspect symbol definitions (Command '" + host.commandText([nm, "-g", path]) + "' returned non-zero exit status " + Text(result.status) + ".)")
+    }
+    let definitions = symbolDefinitions(result.output)
+    let missing: List<Text> = []
+    for name in required { if !host.listed(definitions, name) { missing.add(name) } }
+    if missing.length > 0 { reject(path, "missing static definitions: " + host.joined(missing.sorted(), ", ")) }
+}
+
+function strippedOutput(command: List<Text>, seconds: Integer): Text {
+    return host.strip(host.captureOutput(command, seconds))
+}
+record Query { ok: Boolean; text: Text }
+function optional(command: List<Text>, seconds: Integer): Query {
+    if host.which(command[0]) == "" { return Query { ok: false; text: "" } }
+    let result = host.capture(command, seconds)
+    if result.status != 0 { return Query { ok: false; text: "" } }
+    return Query { ok: true; text: host.strip(result.output) }
+}
+function dependencyPaths(output: Text): List<Text> {
+    let joined = host.replaceText(output, "\\\n", "")
+    let colon = host.findText(joined, ":", 0)
+    let raw = Bytes("")
+    if colon >= 0 { raw = Bytes(host.textAfter(host.textSlice(joined, colon, joined.byteLength), ":")) }
+    let result: List<Text> = []
+    let index = 0
+    while index < raw.length {
+        while index < raw.length && host.isSpace(raw[index]) { index += 1 }
+        if index >= raw.length { break }
+        let value = Bytes()
+        while index < raw.length && !host.isSpace(raw[index]) {
+            if raw[index] == 92 && index + 1 < raw.length && raw[index + 1] != 10 {
+                let next = raw[index + 1]
+                if next == 32 || next == 9 || next == 35 || next == 92 { value.add(next) } else { value.add(92); value.add(next) }
+                index += 2
+            } else {
+                value.add(raw[index])
+                index += 1
+            }
+        }
+        result.add(host.replaceText(Text(value), "$$", "$"))
+    }
+    return result
+}
+
+function retainFailure(source: Text, binary: Text, result: host.Captured, compile: List<Text>): Text {
+    let retained = host.resolveName(host.keptDirectory("", "minyar-codec-provider-failed-"))
+    host.copyFile(source, retained + "/probe.c")
+    host.copyFile(binary, retained + "/" + host.baseName(binary))
+    host.writeBytes(retained + "/stdout", Bytes(result.output))
+    host.writeBytes(retained + "/stderr", Bytes(result.errors))
+    host.writeBytes(retained + "/result.json", Bytes("{\n  \"command\": [\n    " + host.jsonText(binary) + "\n  ],\n  \"returncode\": " + Text(result.status) + ",\n  \"compile_command\": " + host.jsonList(compile) + "\n}\n"))
+    return retained
+}
+
+public function codecProvider(codec: Text, clang: Text, compileFlags: List<Text>, linkFlags: List<Text>): Provider {
+    if codec != "zstd" && codec != "deflate" { host.stop("unknown codec") }
+    let zstd = codec == "zstd"
+    let name = "zlib"
+    let package = "zlib"
+    let header = "zlib.h"
+    let archive = "libz.a"
+    if zstd { name = "zstd"; package = "libzstd"; header = "zstd.h"; archive = "libzstd.a" }
+    let variable = "MINYAR_" + upper(name) + "_PREFIX"
+    let override = host.setting(variable, "")
+    let msys = host.setting("MINGW_PREFIX", "")
+    let isWindows = host.windows()
+    let darwin = host.hostName() == "Darwin"
+    let prefix = ""
+    let include = ""
+    let lib = ""
+    let dependencies: List<Text> = []
+    if override != "" {
+        prefix = host.resolveName(override)
+        include = prefix + "/include"
+        lib = prefix + "/lib"
+    } else if isWindows {
+        if msys == "" { host.stop(name + " needs the active MSYS2 MINGW_PREFIX or an explicit matched provider prefix") }
+        prefix = host.resolveName(msys)
+        include = prefix + "/include"
+        lib = prefix + "/lib"
+    } else {
+        let found = optional(["pkg-config", "--variable=prefix", package], 0)
+        let included = Query { ok: false; text: "" }
+        let library = Query { ok: false; text: "" }
+        let linked = Query { ok: false; text: "" }
+        if found.ok { included = optional(["pkg-config", "--variable=includedir", package], 0) }
+        if included.ok { library = optional(["pkg-config", "--variable=libdir", package], 0) }
+        if library.ok { linked = optional(["pkg-config", "--libs", "--static", package], 0) }
+        if linked.ok {
+            prefix = host.resolveName(found.text)
+            include = host.resolveName(included.text)
+            lib = host.resolveName(library.text)
+            for item in host.shellSplit(linked.text, "pkg-config") {
+                if item != "-lzstd" && item != "-lz" && !item.startsWith("-L") { dependencies.add(item) }
+            }
+        } else {
+            if !darwin || host.which("brew") == "" {
+                host.stop("install matched " + name + " development headers and static archive, or set " + variable)
+            }
+            prefix = host.resolveName(strippedOutput(["brew", "--prefix", name], 0))
+            include = prefix + "/include"
+            lib = prefix + "/lib"
+        }
+    }
+    prefix = host.resolveName(prefix)
+    include = host.resolveName(include)
+    lib = host.resolveName(lib)
+    if host.hasText(prefix + include + lib, "\\") {
+        host.stop("literal backslash provider paths are unsupported on POSIX; select a prefix without backslashes")
+    }
+    if !zstd && darwin && !within(prefix, lib) { lib = prefix + "/lib" }
+    if !host.isDirectory(prefix) || !host.isFile(include + "/" + header) { host.stop(name + " header missing from provider " + prefix) }
+    let candidates = [lib + "/" + archive]
+    if override == "" && !isWindows {
+        let printed = strippedOutput([clang, "-print-file-name=" + archive], 0)
+        if printed != archive { candidates.add(host.resolveName(printed)) }
+    }
+    if !zstd && darwin { for item in [lib + "/libz.tbd", lib + "/libz.dylib"] { candidates.add(item) } }
+    let selected = ""
+    for candidate in candidates { if selected == "" && host.isFile(candidate) { selected = host.resolveName(candidate) } }
+    if selected == "" || !within(prefix, selected) || !within(prefix, include) {
+        host.stop(name + " requires " + archive + " and " + header + " from the same provider prefix " + prefix)
+    }
+    if isWindows {
+        let active = prefix
+        if msys != "" { active = host.resolveName(msys) }
+        let executable = host.which(clang)
+        if executable == "" { executable = clang }
+        if active != prefix || !within(active, host.resolveName(executable)) {
+            host.stop("codec provider and compiler must use the same MSYS2 prefix/CRT")
+        }
+    }
+    if zstd { staticArchive(selected, clang, ["ZSTD_versionNumber", "ZSTD_createCDict_advanced", "ZSTD_createDDict_advanced"]) }
+    else if host.suffixOf(selected) == ".a" { staticArchive(selected, clang, ["zlibVersion", "deflateInit2_", "inflateInit2_"]) }
+    let cflags = ["-isystem", include]
+    let libraries = [selected]
+    for item in dependencies { libraries.add(item) }
+    let probe = "#include <zlib.h>\n#include <string.h>\nint main(void) { return strcmp(zlibVersion(), ZLIB_VERSION) != 0; }\n"
+    if zstd {
+        probe = "#define ZSTD_STATIC_LINKING_ONLY\n#include <zstd.h>\n#include <zstd_errors.h>\nint main(void) {\n    const char raw[] = \"raw dictionary\";\n    ZSTD_customMem memory = {0};\n    ZSTD_CDict *c = ZSTD_createCDict_advanced(raw, sizeof(raw), ZSTD_dlm_byCopy,\n        ZSTD_dct_rawContent, ZSTD_getCParams(1, 0, sizeof(raw)), memory);\n    ZSTD_DDict *d = ZSTD_createDDict_advanced(raw, sizeof(raw), ZSTD_dlm_byCopy,\n        ZSTD_dct_rawContent, memory);\n    int failed = !c || !d || ZSTD_versionNumber() != ZSTD_VERSION_NUMBER;\n    ZSTD_freeCDict(c); ZSTD_freeDDict(d); return failed;\n}\n"
+    }
+    probe = "_Static_assert(sizeof(void *) == 8, \"64-bit provider required\");\n" + probe
+    let directory = host.temporaryDirectory("", "minyar-codec-provider-")
+    let source = directory + "/probe.c"
+    let binary = directory + "/probe"
+    if isWindows { binary = directory + "/probe.exe" }
+    host.writeBytes(source, Bytes(probe))
+    let command = [clang]
+    for group in [compileFlags, cflags] { for item in group { command.add(item) } }
+    let traced = host.extended(command, ["-M", "-MT", "minyar_codec", source])
+    let trace = host.capture(traced, 30)
+    if trace.status != 0 { host.stop(name + " provider header probe failed:\n" + trace.errors) }
+    let found: List<Text> = []
+    for value in dependencyPaths(trace.output) { if !value.endsWith("probe.c") { found.add(host.resolveName(value)) } }
+    let headers = sortedPaths(found)
+    let primary = host.resolveName(include + "/" + header)
+    let owned = ["zlib.h", "zconf.h"]
+    if zstd { owned = ["zstd.h", "zstd_errors.h"] }
+    let valid = host.listed(headers, primary)
+    for path in headers { if host.listed(owned, host.baseName(path)) && !within(prefix, path) { valid = false } }
+    if !valid { host.stop(name + " primary and secondary headers must belong to provider prefix " + prefix) }
+    let identity = Bytes()
+    for path in host.extended(headers, [selected]) {
+        identity.addBytes(Bytes(path))
+        identity.add(0)
+        identity.addBytes(host.readBytes(path))
+    }
+    let fingerprint = host.hashBytes(identity)
+    cflags.add("-DMINYAR_CODEC_PROVIDER_" + upper(host.textSlice(fingerprint, 0, 16)) + "=1")
+    let compile = [clang]
+    for group in [compileFlags, cflags, [source], libraries, linkFlags, ["-o", binary]] { for item in group { compile.add(item) } }
+    let built = host.capture(compile, 30)
+    if built.status != 0 { host.stop(name + " matched static provider ABI probe failed:\n" + built.errors) }
+    let executed = host.capture([binary], 30)
+    if executed.status != 0 {
+        let retained = retainFailure(source, binary, executed, compile)
+        host.stop(name + " provider runtime verification failed (exit " + Text(executed.status) + "); header/static archive version equality not established; retained " + retained + "\n" + executed.output + executed.errors)
+    }
+    host.release(directory)
+    return Provider { cflags: cflags; libraries: libraries }
+}
+
+function apis(kind: Text): List<Text> {
+    if kind == "sha256" { return ["SHA256_Init", "SHA256_Update", "SHA256_Final", "OpenSSL_version_num"] }
+    if kind == "lz4" { return ["LZ4_versionNumber", "LZ4_compress_default", "LZ4_decompress_safe"] }
+    return ["archive_version_number", "archive_read_new", "archive_read_free", "archive_entry_new", "archive_entry_free"]
+}
+function probeSource(kind: Text, isWindows: Boolean, shared: Boolean, dll: Text, static: Boolean): Text {
+    let source = ""
+    if kind == "sha256" {
+        source = "#define OPENSSL_SUPPRESS_DEPRECATED\n#include <openssl/sha.h>\n#include <openssl/crypto.h>\n#include <string.h>\n_Static_assert(sizeof(void *) == 8, \"64-bit provider required\");\nint main(void) {\n    SHA256_CTX state;\n    unsigned char digest[32];\n    static const unsigned char expected[32] = {\n        0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,\n        0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,\n        0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,\n        0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad\n    };\n    if (OpenSSL_version_num() != OPENSSL_VERSION_NUMBER) return 1;\n    if (!SHA256_Init(&state) || !SHA256_Update(&state, \"abc\", 3)\n        || !SHA256_Final(digest, &state)) return 2;\n    return memcmp(digest, expected, 32) != 0;\n}\n"
+    } else if kind == "lz4" {
+        source = "#include <lz4.h>\n#include <string.h>\n_Static_assert(sizeof(void *) == 8, \"64-bit provider required\");\nint main(void) {\n    char packed[32], plain[8];\n    if (LZ4_VERSION_NUMBER < 10903 || LZ4_versionNumber() != LZ4_VERSION_NUMBER) return 1;\n    int size = LZ4_compress_default(\"erofs\", packed, 5, sizeof(packed));\n    if (size <= 0 || LZ4_decompress_safe(packed, plain, size, sizeof(plain)) != 5) return 2;\n    return memcmp(plain, \"erofs\", 5) != 0;\n}\n"
+    } else {
+        source = "#include <archive.h>\n#include <archive_entry.h>\n_Static_assert(sizeof(void *) == 8, \"64-bit provider required\");\nint main(void) {\n    struct archive *reader;\n    struct archive_entry *entry;\n    if (archive_version_number() != ARCHIVE_VERSION_NUMBER) return 1;\n    reader = archive_read_new();\n    entry = archive_entry_new();\n    if (!reader || !entry) return 2;\n    archive_entry_free(entry);\n    return archive_read_free(reader) != ARCHIVE_OK;\n}\n"
+    }
+    let implementation = "#include <dlfcn.h>\n#include <stdio.h>\nstatic int provider_image(const void *address) {\n    Dl_info image;\n    if (!dladdr(address, &image) || !image.dli_fname) return 0;\n    return puts(image.dli_fname) >= 0;\n}\n"
+    if static {
+        implementation = "#include <stdint.h>\n#include <unistd.h>\n#include <stdio.h>\nextern const char __executable_start[], _end[];\nstatic int provider_image(const void *address) {\n    char path[4096];\n    uintptr_t value = (uintptr_t)address;\n    ssize_t length;\n    if (value < (uintptr_t)__executable_start || value >= (uintptr_t)_end) return 0;\n    length = readlink(\"/proc/self/exe\", path, sizeof(path) - 1);\n    if (length <= 0 || length >= (ssize_t)sizeof(path) - 1) return 0;\n    path[length] = 0;\n    return puts(path) >= 0;\n}\n"
+    } else if isWindows {
+        implementation = "#include <windows.h>\n#include <stdio.h>\nstatic int provider_image(const void *address) {\n    HMODULE module;\n    char path[32768];\n    DWORD length;\n    if (!address) return 0;\n    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |\n            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address,\n            &module)) return 0;\n    length = GetModuleFileNameA(module, path, sizeof(path));\n    if (!length || length >= sizeof(path)) return 0;\n    return puts(path) >= 0;\n}\n"
+    }
+    let calls: List<Text> = []
+    for api in apis(kind) {
+        let address = "(const void *)&" + api
+        if isWindows && dll != "" { address = "(const void *)GetProcAddress(GetModuleHandleA(" + host.jsonText(dll) + "), \"" + api + "\")" }
+        else if shared && !isWindows { address = "dlsym(RTLD_DEFAULT, \"" + api + "\")" }
+        calls.add("    if (!provider_image(" + address + ")) return 3;")
+    }
+    source = "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n" + implementation + host.replaceText(source, "int main(void) {", "int main(void) {\n" + host.joined(calls, "\n"))
+    if static && kind == "tararchive" {
+        source = host.replaceText(source, "if (!reader || !entry) return 2;", "if (!reader || !entry) return 2;\n    if (archive_read_support_format_all(reader) != ARCHIVE_OK) return 2;")
+    }
+    return source
+}
+function runtimeDll(library: Text, prefix: Text, stem: Text): Text {
+    let data = host.readBytes(library)
+    let pattern = Bytes(upper(stem))
+    let names: List<Text> = []
+    let index = 0
+    while index + pattern.length <= data.length {
+        let equal = true
+        for offset in 0..pattern.length {
+            let value = data[index + offset]
+            if value >= 97 && value <= 122 { value -= 32 }
+            if value != pattern[offset] { equal = false; break }
+        }
+        if equal {
+            let end = index + pattern.length
+            while end < data.length && data[end] != 0 && data[end] != 47 && data[end] != 92 && data[end] != 13 && data[end] != 10 {
+                if end + 4 < data.length && data[end] == 46 && (data[end + 1] == 100 || data[end + 1] == 68) && (data[end + 2] == 108 || data[end + 2] == 76) && (data[end + 3] == 108 || data[end + 3] == 76) && data[end + 4] == 0 {
+                    let value = Text(data.slice(index, end + 4))
+                    if !host.listed(names, value) { names.add(value) }
+                    break
+                }
+                end += 1
+            }
+        }
+        index += 1
+    }
+    if names.length != 1 { host.stop("cannot identify one runtime DLL in import archive " + library) }
+    let runtime = host.resolveName(prefix + "/bin/" + names[0])
+    if !host.isFile(runtime) || !within(prefix, runtime) { host.stop("provider runtime DLL is missing from " + prefix + "/bin") }
+    return runtime
+}
+function definedBy(line: Text, library: Text): Boolean {
+    let start = 0
+    while start >= 0 {
+        let index = host.findText(line, library + "(", start)
+        if index < 0 { return false }
+        let prefixed = index == 0 || (index >= 2 && host.textSlice(line, index - 2, index) == ": ")
+        let closing = host.findText(line, ")", index + library.byteLength)
+        if prefixed && closing >= 0 && closing + 1 < line.byteLength && host.textSlice(line, closing, closing + 2) == "):" {
+            return true
+        }
+        start = index + 1
+    }
+    return false
+}
+function wordPresent(text: Text, name: Text): Boolean {
+    let raw = Bytes(text)
+    let index = host.findText(text, name, 0)
+    while index >= 0 {
+        let before = index == 0 || !host.isWord(raw[index - 1])
+        let end = index + name.byteLength
+        let after = end >= raw.length || !host.isWord(raw[end])
+        if before && after { return true }
+        index = host.findText(text, name, index + 1)
+    }
+    return false
+}
+function staticInputs(result: host.Captured, library: Text, required: List<Text>, clang: Text, binary: Text): List<Text> {
+    for api in required {
+        let definitions: List<Text> = []
+        for line in host.lines(result.output + result.errors) {
+            let trimmed = host.strip(line)
+            if trimmed.endsWith(": definition of " + api) || trimmed.endsWith(": definition of symbol " + api) { definitions.add(line) }
+        }
+        if definitions.length != 1 || !definedBy(definitions[0], library) {
+            host.stop("static provider API " + api + " must be defined by selected archive " + library)
+        }
+    }
+    let readelf = strippedOutput([clang, "-print-prog-name=llvm-readelf"], 30)
+    let metadata = strippedOutput([readelf, "--program-headers", "--dynamic", binary], 30)
+    if wordPresent(metadata, "INTERP") || wordPresent(metadata, "NEEDED") { host.stop("static provider probe must not load dynamic dependencies") }
+    let paths: List<Text> = []
+    for line in host.lines(result.output) {
+        let value = host.strip(line)
+        if value.endsWith(")") {
+            let raw = Bytes(value)
+            let boundary = -1
+            for index in 0..(raw.length - 1) { if raw[index] == 41 { boundary = index } }
+            let opening = -1
+            for index in (boundary + 1)..(raw.length - 1) { if opening < 0 && raw[index] == 40 { opening = index } }
+            if opening >= 0 { value = Text(raw.slice(0, opening)) }
+        }
+        if host.suffixOf(value) == ".a" && host.isFile(value) { paths.add(host.resolveName(value)) }
+    }
+    if !host.listed(paths, library) { host.stop("static provider linker did not identify selected archive") }
+    return sortedPaths(paths)
+}
+
+public record FormatInfo { kind: Text; prefix: Text; include: Text; library: Text; inputs: List<Text>; digests: List<Text>; digest: Text;
+    runtime: Text; clang: Text; compileFlags: List<Text>; linkFlags: List<Text>; cflags: List<Text>; libraries: List<Text> }
+public function formatInfo(kind: Text, clang: Text, compileFlags: List<Text>, linkFlags: List<Text>): FormatInfo {
+    let package = ""
+    let formula = ""
+    let header = ""
+    let stem = ""
+    if kind == "sha256" { package = "libcrypto"; formula = "openssl@3"; header = "openssl/sha.h"; stem = "libcrypto" }
+    else if kind == "tararchive" { package = "libarchive"; formula = "libarchive"; header = "archive.h"; stem = "libarchive" }
+    else if kind == "lz4" { package = "liblz4"; formula = "lz4"; header = "lz4.h"; stem = "liblz4" }
+    else { host.stop("unknown format provider: " + kind) }
+    let variable = "MINYAR_" + upper(kind) + "_PREFIX"
+    let override = host.setting(variable, "")
+    let active = host.setting("MINGW_PREFIX", "")
+    let isWindows = host.windows()
+    let system = host.hostName()
+    let static = false
+    if system == "Linux" { for flag in host.extended(compileFlags, linkFlags) { if flag == "-static" || flag == "-static-pie" { static = true } } }
+    let dependencies: List<Text> = []
+    let prefix = ""
+    let include = ""
+    let lib = ""
+    if override != "" || isWindows {
+        let value = override
+        if value == "" { value = active }
+        if value == "" { host.stop(kind + " requires an active MSYS2 MINGW_PREFIX or an explicit matched provider prefix") }
+        prefix = host.resolveName(value)
+        include = prefix + "/include"
+        lib = prefix + "/lib"
+    } else {
+        let found = optional(["pkg-config", "--variable=prefix", package], 30)
+        let included = Query { ok: false; text: "" }
+        let library = Query { ok: false; text: "" }
+        let linked = Query { ok: false; text: "" }
+        if found.ok { included = optional(["pkg-config", "--variable=includedir", package], 30) }
+        if included.ok { library = optional(["pkg-config", "--variable=libdir", package], 30) }
+        if library.ok { linked = optional(["pkg-config", "--libs", "--static", package], 30) }
+        let extra = Query { ok: true; text: "" }
+        let wantsXml = false
+        if linked.ok {
+            for item in host.shellSplit(linked.text, "pkg-config") { if item == "-lxml2" { wantsXml = true } }
+            if static && wantsXml { extra = optional(["pkg-config", "--libs", "--static", "libxml-2.0"], 30) }
+        }
+        if linked.ok && extra.ok {
+            prefix = host.resolveName(found.text)
+            include = host.resolveName(included.text)
+            lib = host.resolveName(library.text)
+            let own = "-l" + host.textAfter(stem, "lib")
+            for item in host.shellSplit(linked.text, "pkg-config") { if item != own && !item.startsWith("-L") { dependencies.add(item) } }
+            if static && wantsXml {
+                for item in host.shellSplit(extra.text, "pkg-config") { dependencies.add(item) }
+                let icu = false
+                for item in dependencies { if item.startsWith("-licu") { icu = true } }
+                if icu { dependencies.add("-lstdc++") }
+            }
+        } else {
+            if system != "Darwin" || host.which("brew") == "" {
+                host.stop("install the " + package + " development package or set " + variable)
+            }
+            prefix = host.resolveName(strippedOutput(["brew", "--prefix", formula], 30))
+            include = prefix + "/include"
+            lib = prefix + "/lib"
+        }
+    }
+    if !isWindows && host.hasText(prefix + include + lib, "\\") {
+        host.stop(kind + " literal backslash provider paths are unsupported by Clang Make dependencies; use a prefix without backslashes")
+    }
+    if !host.isFile(include + "/" + header) || !within(prefix, host.resolveName(include)) {
+        host.stop(kind + " headers must belong to provider prefix " + prefix)
+    }
+    if isWindows {
+        let executable = host.which(clang)
+        if executable == "" { executable = clang }
+        let activePrefix = prefix
+        if active != "" { activePrefix = host.resolveName(active) }
+        if activePrefix != prefix || !within(activePrefix, host.resolveName(executable)) {
+            host.stop("format provider and compiler must use the same MSYS2 prefix/CRT")
+        }
+    }
+    let names = [stem + ".so", stem + ".a"]
+    if static { names = [stem + ".a"] }
+    else if isWindows { names = [stem + ".dll.a", stem + ".a"] }
+    else if system == "Darwin" { names = [stem + ".dylib", stem + ".a"] }
+    let candidates: List<Text> = []
+    for item in names { candidates.add(lib + "/" + item) }
+    if override == "" && !isWindows {
+        for item in names {
+            let printed = strippedOutput([clang, "-print-file-name=" + item], 30)
+            if printed != item { candidates.add(printed) }
+        }
+    }
+    let library = ""
+    for candidate in candidates { if library == "" && host.isFile(candidate) { library = host.resolveName(candidate) } }
+    if library == "" || !within(prefix, library) {
+        host.stop(kind + " library and headers must come from one provider prefix " + prefix)
+    }
+    if static { staticArchive(library, clang, apis(kind)) }
+    let cflags = ["-I" + include]
+    let libraries = [library]
+    for item in dependencies { libraries.add(item) }
+    if static {
+        let grouped = ["-Wl,--start-group"]
+        for item in libraries { grouped.add(item) }
+        grouped.add("-Wl,--end-group")
+        libraries = grouped
+    }
+    let libraryName = host.baseName(library)
+    let shared = !isWindows && (host.hasText(libraryName, ".so") || host.suffixOf(library) == ".dylib")
+    let imported = isWindows && libraryName.endsWith(".dll.a")
+    let runtimeLibrary = ""
+    if imported { runtimeLibrary = runtimeDll(library, prefix, stem) }
+    else if shared { runtimeLibrary = library }
+    if shared { for item in ["-Xlinker", "-rpath", "-Xlinker", host.parentPath(library)] { libraries.add(item) } }
+    let directory = host.temporaryDirectory("", "minyar-format-provider-")
+    let source = directory + "/probe.c"
+    let binary = directory + "/probe"
+    if isWindows { binary = directory + "/probe.exe" }
+    let dll = ""
+    if imported { dll = host.baseName(runtimeLibrary) }
+    host.writeBytes(source, Bytes(probeSource(kind, isWindows, shared, dll, static)))
+    let command = [clang]
+    for group in [compileFlags, cflags] { for item in group { command.add(item) } }
+    let dependencyOutput = strippedOutput(host.extended(command, ["-M", "-MT", "minyar_provider", source]), 30)
+    let sourcePath = host.resolveName(source)
+    let found: List<Text> = []
+    for value in dependencyPaths(dependencyOutput) {
+        let physical = host.resolveName(value)
+        if physical == sourcePath { continue }
+        let owned = false
+        let candidatesNamed = [value, physical]
+        for path in candidatesNamed {
+            let file = host.baseName(path)
+            if kind == "sha256" {
+                if host.listed(path.split("/"), "openssl") || file == "opensslconf.h" || file == "configuration.h" || file == "opensslv.h" { owned = true }
+            } else if kind == "lz4" {
+                if file.startsWith("lz4") { owned = true }
+            } else if file == "archive.h" || file.startsWith("archive_") { owned = true }
+        }
+        if owned && !within(prefix, physical) {
+            host.stop(kind + " provider-owned header " + physical + " must belong to provider prefix " + prefix)
+        }
+        found.add(physical)
+    }
+    let headers = sortedPaths(found)
+    if !host.listed(headers, host.resolveName(include + "/" + header)) {
+        host.stop(kind + " compiler did not select its matched primary header")
+    }
+    let identityFlags: List<Text> = []
+    if static {
+        identityFlags.add("-Wl,-t")
+        for api in apis(kind) { identityFlags.add("-Wl,--trace-symbol=" + api) }
+    } else if !isWindows && system != "Darwin" { identityFlags.add("-ldl") }
+    let link = host.copied(command)
+    for group in [[source], linkFlags, libraries, identityFlags, ["-o", binary]] { for item in group { link.add(item) } }
+    let built = host.capture(link, 30)
+    if built.status != 0 { host.stop(kind + " matched provider compile/link probe failed:\n" + built.errors) }
+    let staticFound: List<Text> = []
+    if static { staticFound = staticInputs(built, library, apis(kind), clang, binary) }
+    let executed = host.capture([binary], 30)
+    let images: List<Text> = []
+    for line in host.lines(executed.output) { images.add(host.resolveName(line)) }
+    let expected = runtimeLibrary
+    if expected == "" { expected = host.resolveName(binary) }
+    let count = 5
+    if kind == "sha256" { count = 4 } else if kind == "lz4" { count = 3 }
+    if images.length != count { host.stop(kind + " provider image identification/API probe failed (status " + Text(executed.status) + ")") }
+    for image in images {
+        if image != expected || (runtimeLibrary != "" && !within(prefix, image)) {
+            host.stop(kind + " loaded provider image " + image + " does not match selected library " + library + " (expected image " + expected + "); check install name/SONAME and the consumer loader environment")
+        }
+    }
+    if executed.status != 0 { host.stop(kind + " provider version/64-bit API probe failed (status " + Text(executed.status) + ")") }
+    let actualLibrary = ""
+    if runtimeLibrary != "" { actualLibrary = images[0] }
+    let collected = host.extended(headers, [library])
+    for item in staticFound { collected.add(item) }
+    if actualLibrary != "" { collected.add(actualLibrary) }
+    let inputs = sortedPaths(collected)
+    let identity = Bytes("[" + pythonJson(kind) + "," + pythonJson(clang) + "," + pythonList(compileFlags) + "," + pythonList(linkFlags) + "]")
+    identity.add(0)
+    let digests: List<Text> = []
+    for path in inputs {
+        let value = host.hashFile(path)
+        digests.add(value)
+        identity.addBytes(Bytes(path))
+        identity.add(0)
+        identity.addBytes(fromHex(value))
+    }
+    host.release(directory)
+    let fingerprint = host.hashBytes(identity)
+    cflags.add("-DMINYAR_FORMAT_PROVIDER_" + upper(host.textSlice(fingerprint, 0, 16)) + "=1")
+    return FormatInfo { kind: kind; prefix: prefix; include: include; library: library; inputs: inputs; digests: digests; digest: fingerprint;
+        runtime: actualLibrary; clang: clang; compileFlags: compileFlags; linkFlags: linkFlags; cflags: cflags; libraries: libraries }
+}
+public function formatProvider(kind: Text, clang: Text, compileFlags: List<Text>, linkFlags: List<Text>): Provider {
+    let info = formatInfo(kind, clang, compileFlags, linkFlags)
+    return Provider { cflags: info.cflags; libraries: info.libraries }
+}
+
+function usage(program: Text, text: Text, message: Text) {
+    system.writeStandardError(text + "\n" + program + ": error: " + message + "\n")
+    host.leave(2)
+}
+public function formatCommand(arguments: List<Text>) {
+    let program = "format-provider"
+    let text = "usage: format-provider [-h] [--clang CLANG] [--flags FLAGS] [--link-flags LINK_FLAGS] {sha256,tararchive,lz4} kind"
+    let kind = ""
+    let clang = "clang"
+    let compile = ""
+    let link = ""
+    let index = 0
+    while index < arguments.length {
+        let item = arguments[index]
+        let matched = ""
+        for name in ["--clang", "--flags", "--link-flags"] { if item == name || item.startsWith(name + "=") { matched = name } }
+        if matched != "" {
+            let value = ""
+            if item == matched {
+                if index + 1 >= arguments.length { usage(program, text, "argument " + matched + ": expected one argument") }
+                index += 1
+                value = arguments[index]
+            } else { value = host.textAfter(item, matched + "=") }
+            if matched == "--clang" { clang = value } else if matched == "--flags" { compile = value } else { link = value }
+        } else if kind == "" && !item.startsWith("-") {
+            if item != "sha256" && item != "tararchive" && item != "lz4" {
+                usage(program, text, "argument kind: invalid choice: " + host.pythonText(item) + " (choose from 'sha256', 'tararchive', 'lz4')")
+            }
+            kind = item
+        } else { usage(program, text, "unrecognized arguments: " + item) }
+        index += 1
+    }
+    if kind == "" { usage(program, text, "the following arguments are required: kind") }
+    let info = formatInfo(kind, clang, host.shellSplit(compile, "flags"), host.shellSplit(link, "link-flags"))
+    let doc = host.newDocument()
+    let root = 0
+    host.jsonPut(doc, root, "kind", host.jsonString(doc, info.kind))
+    host.jsonPut(doc, root, "prefix", host.jsonString(doc, info.prefix))
+    host.jsonPut(doc, root, "include", host.jsonString(doc, info.include))
+    host.jsonPut(doc, root, "library", host.jsonString(doc, info.library))
+    let receipt = host.jsonArray(doc)
+    for position in 0..info.inputs.length {
+        let row = host.jsonObject(doc)
+        host.jsonPut(doc, row, "path", host.jsonString(doc, info.inputs[position]))
+        host.jsonPut(doc, row, "sha256", host.jsonString(doc, info.digests[position]))
+        host.jsonPush(doc, receipt, row)
+    }
+    host.jsonPut(doc, root, "inputs", receipt)
+    host.jsonPut(doc, root, "sha256", host.jsonString(doc, info.digest))
+    if info.runtime == "" { host.jsonPut(doc, root, "runtime_library", host.jsonRaw(doc, "null")) }
+    else { host.jsonPut(doc, root, "runtime_library", host.jsonString(doc, info.runtime)) }
+    host.jsonPut(doc, root, "clang", host.jsonString(doc, info.clang))
+    host.jsonPut(doc, root, "compile_flags", host.jsonStrings(doc, info.compileFlags))
+    host.jsonPut(doc, root, "link_flags", host.jsonStrings(doc, info.linkFlags))
+    host.jsonPut(doc, root, "cflags", host.jsonStrings(doc, info.cflags))
+    host.jsonPut(doc, root, "libraries", host.jsonStrings(doc, info.libraries))
+    print(host.jsonRender(doc, root, ""))
+}
+public function codecCommand(arguments: List<Text>) {
+    let program = "codec-provider"
+    let text = "usage: codec-provider [-h] --clang CLANG [--compile-flag COMPILE_FLAG] [--link-flag LINK_FLAG] {zstd,deflate}"
+    let kind = ""
+    let clang = ""
+    let compile: List<Text> = []
+    let link: List<Text> = []
+    let index = 0
+    while index < arguments.length {
+        let item = arguments[index]
+        let matched = ""
+        for name in ["--clang", "--compile-flag", "--link-flag"] { if item == name || item.startsWith(name + "=") { matched = name } }
+        if matched != "" {
+            let value = ""
+            if item == matched {
+                if index + 1 >= arguments.length || arguments[index + 1].startsWith("-") { usage(program, text, "argument " + matched + ": expected one argument") }
+                index += 1
+                value = arguments[index]
+            } else { value = host.textAfter(item, matched + "=") }
+            if matched == "--clang" { clang = value } else if matched == "--compile-flag" { compile.add(value) } else { link.add(value) }
+        } else if kind == "" && !item.startsWith("-") {
+            if item != "zstd" && item != "deflate" {
+                usage(program, text, "argument kind: invalid choice: " + host.pythonText(item) + " (choose from 'zstd', 'deflate')")
+            }
+            kind = item
+        } else { usage(program, text, "unrecognized arguments: " + item) }
+        index += 1
+    }
+    if kind == "" || clang == "" {
+        let missing: List<Text> = []
+        if kind == "" { missing.add("kind") }
+        if clang == "" { missing.add("--clang") }
+        usage(program, text, "the following arguments are required: " + host.joined(missing, ", "))
+    }
+    host.pinnedLlvm(clang)
+    let selected = codecProvider(kind, clang, compile, link)
+    print("{\"cflags\": " + host.jsonList(selected.cflags) + ", \"libraries\": " + host.jsonList(selected.libraries) + "}")
+}

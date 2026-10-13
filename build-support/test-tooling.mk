@@ -18,6 +18,9 @@ build/tooling/tools/build-test-runtime: TOOL_RUNTIME = build/minyar-runtime.o
 build/tooling/tools/build-test-runtime: TOOL_NATIVE =
 build/tooling/tools/build-test-runtime: TOOL_LIBS =
 
+build/tooling/tools/clang-driver: build/tooling/tools/clang-driver.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) tools/clang-driver-host.c runtime/minyar_native.h
+	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) tools/clang-driver-host.c -pthread -lm -o $@
+
 build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/build-test-runtime
 	mkdir -p $(@D)
 	./build/tooling/tools/build-test-runtime $< $@

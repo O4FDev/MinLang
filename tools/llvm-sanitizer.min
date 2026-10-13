@@ -1,0 +1,228 @@
+public function addressEnabled(flags: List<Text>): Boolean { return enabled(flags, "address") }
+public function threadEnabled(flags: List<Text>): Boolean { return enabled(flags, "thread") }
+function enabled(flags: List<Text>, sanitizer: Text): Boolean {
+    let result = false
+    for flag in flags {
+        if flag.startsWith("-fsanitize=") {
+            for item in Text(Bytes(flag).slice(11, flag.byteLength)).split(",") { if item == sanitizer { result = true } }
+        } else if flag.startsWith("-fno-sanitize=") {
+            for item in Text(Bytes(flag).slice(14, flag.byteLength)).split(",") { if item == sanitizer || item == "all" { result = false } }
+        }
+    }
+    return result
+}
+
+public record Annotated { text: Text; error: Text }
+record Masked { bytes: Bytes; error: Text }
+function unquoted(source: Bytes): Masked {
+    let result = source.slice(0, source.length)
+    let quoted = false
+    let escaped = false
+    for index in 0..source.length {
+        let value = source[index]
+        if quoted {
+            result[index] = 32
+            if escaped { escaped = false }
+            else if value == 92 { escaped = true }
+            else if value == 34 { quoted = false }
+        } else if value == 34 {
+            result[index] = 32
+            quoted = true
+        }
+    }
+    if quoted { return Masked { bytes: result; error: "generated LLVM has an unterminated quoted header token" } }
+    return Masked { bytes: result; error: "" }
+}
+function space(value: Integer): Boolean { return value == 32 || (value >= 9 && value <= 13) || (value >= 28 && value <= 31) }
+function word(value: Integer): Boolean {
+    return (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || (value >= 97 && value <= 122) || value == 95 || value >= 128
+}
+function identifier(value: Integer): Boolean { return word(value) || value == 45 || value == 36 || value == 46 }
+function matches(source: Bytes, start: Integer, pattern: Bytes): Boolean {
+    if start + pattern.length > source.length { return false }
+    for offset in 0..pattern.length { if source[start + offset] != pattern[offset] { return false } }
+    return true
+}
+function mentions(attributes: Bytes, name: Bytes): Boolean {
+    let index = 0
+    while index + name.length <= attributes.length {
+        if matches(attributes, index, name) {
+            let before = true
+            if index > 0 {
+                let value = attributes[index - 1]
+                before = !(word(value) || value == 46 || value == 64 || value == 45)
+            }
+            let after = true
+            if index + name.length < attributes.length {
+                let value = attributes[index + name.length]
+                after = !(word(value) || value == 46 || value == 45)
+            }
+            if before && after { return true }
+        }
+        index += 1
+    }
+    return false
+}
+record Group { name: Text; source: Bytes }
+function group(line: Bytes): Group {
+    let none = Group { name: ""; source: Bytes() }
+    let keyword = Bytes("attributes")
+    if !matches(line, 0, keyword) { return none }
+    let index = keyword.length
+    if index >= line.length || !space(line[index]) { return none }
+    while index < line.length && space(line[index]) { index += 1 }
+    if index >= line.length || line[index] != 35 { return none }
+    index += 1
+    let start = index
+    while index < line.length && line[index] >= 48 && line[index] <= 57 { index += 1 }
+    if index == start { return none }
+    let number = Text(line.slice(start, index))
+    while index < line.length && space(line[index]) { index += 1 }
+    if index >= line.length || line[index] != 61 { return none }
+    index += 1
+    while index < line.length && space(line[index]) { index += 1 }
+    if index >= line.length || line[index] != 123 { return none }
+    let end = line.length
+    while end > index && space(line[end - 1]) { end -= 1 }
+    if end <= index + 1 || line[end - 1] != 125 { return none }
+    return Group { name: number; source: line.slice(index + 1, end - 1) }
+}
+function definition(line: Bytes): Boolean {
+    let index = 0
+    while index < line.length && space(line[index]) { index += 1 }
+    let keyword = Bytes("define")
+    if !matches(line, index, keyword) { return false }
+    let next = index + keyword.length
+    return next >= line.length || !word(line[next])
+}
+function functionStart(header: Bytes, masked: Bytes): Integer {
+    let index = 0
+    while index < header.length {
+        if header[index] != 64 { index += 1; continue }
+        let position = index + 1
+        let named = false
+        if position < header.length && header[position] == 34 {
+            position += 1
+            while position < header.length && header[position] != 34 {
+                if header[position] == 92 { position += 1 }
+                position += 1
+            }
+            if position < header.length { position += 1; named = true }
+        } else {
+            let start = position
+            while position < header.length && identifier(header[position]) { position += 1 }
+            named = position > start
+        }
+        if named {
+            while position < header.length && space(header[position]) { position += 1 }
+            if position < header.length && header[position] == 40 {
+                if masked[index] == 64 && masked[position] == 40 { return position }
+                index = position + 1
+                continue
+            }
+        }
+        index += 1
+    }
+    return -1
+}
+public function instrument(source: Text, attribute: Text): Annotated {
+    let raw = Bytes(source)
+    let lines: List<Bytes> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 {
+            lines.add(raw.slice(start, index + 1))
+            start = index + 1
+        }
+    }
+    if start < raw.length { lines.add(raw.slice(start, raw.length)) }
+    let names: List<Text> = []
+    let groups: List<Bytes> = []
+    for line in lines {
+        let end = line.length
+        if end > 0 && line[end - 1] == 10 { end -= 1 }
+        if end > 0 && line[end - 1] == 13 { end -= 1 }
+        let found = group(line.slice(0, end))
+        if found.name != "" {
+            let masked = unquoted(found.source)
+            if masked.error != "" { return Annotated { text: ""; error: masked.error } }
+            let replaced = false
+            for index in 0..names.length { if names[index] == found.name { groups[index] = masked.bytes; replaced = true } }
+            if !replaced { names.add(found.name); groups.add(masked.bytes) }
+        }
+    }
+    let pattern = Bytes(attribute)
+    let definitions = 0
+    let output: List<Text> = []
+    for line in lines {
+        if !definition(line) { output.add(Text(line)); continue }
+        definitions += 1
+        let end = line.length
+        if end > 0 && line[end - 1] == 10 {
+            end -= 1
+            if end > 0 && line[end - 1] == 13 { end -= 1 }
+        }
+        let header = line.slice(0, end)
+        let ending = Text(line.slice(end, line.length))
+        let masking = unquoted(header)
+        if masking.error != "" { return Annotated { text: ""; error: masking.error } }
+        let masked = masking.bytes
+        let opening = functionStart(header, masked)
+        let last = masked.length
+        while last > 0 && space(masked[last - 1]) { last -= 1 }
+        if opening < 0 || last == 0 || masked[last - 1] != 123 {
+            return Annotated { text: ""; error: "generated LLVM function headers changed; sanitizer coverage cannot be assumed" }
+        }
+        let depth = 0
+        let closing = -1
+        for position in opening..masked.length {
+            if masked[position] == 40 { depth += 1 }
+            else if masked[position] == 41 {
+                depth -= 1
+                if depth == 0 { closing = position; break }
+            }
+        }
+        if closing < 0 { return Annotated { text: ""; error: "generated LLVM parameter list changed" } }
+        let brace = masked.length - 1
+        while masked[brace] != 123 { brace -= 1 }
+        let attributes = Bytes()
+        if brace > closing + 1 { attributes = masked.slice(closing + 1, brace) }
+        for value in attributes {
+            if value == 123 || value == 125 { return Annotated { text: ""; error: "generated LLVM function attributes changed" } }
+        }
+        let annotated = mentions(attributes, pattern)
+        let index = 0
+        while index < attributes.length {
+            if attributes[index] == 35 {
+                let digits = index + 1
+                while digits < attributes.length && attributes[digits] >= 48 && attributes[digits] <= 57 { digits += 1 }
+                if digits > index + 1 && (digits == attributes.length || !word(attributes[digits])) {
+                    let number = Text(attributes.slice(index + 1, digits))
+                    let known = false
+                    for position in 0..names.length {
+                        if names[position] == number {
+                            known = true
+                            if mentions(groups[position], pattern) { annotated = true }
+                        }
+                    }
+                    if !known { return Annotated { text: ""; error: "generated LLVM refers to a missing attribute group" } }
+                    index = digits
+                    continue
+                }
+            }
+            index += 1
+        }
+        if annotated { output.add(Text(line)) }
+        else { output.add(Text(header.slice(0, brace)) + attribute + " " + Text(header.slice(brace, header.length)) + ending) }
+    }
+    if definitions == 0 {
+        return Annotated { text: ""; error: "generated LLVM contains no function definitions; sanitizer coverage cannot be assumed" }
+    }
+    return Annotated { text: joinText(output); error: "" }
+}
+public function program(source: Text, flags: List<Text>): Annotated {
+    let result = Annotated { text: source; error: "" }
+    if addressEnabled(flags) { result = instrument(result.text, "sanitize_address") }
+    if result.error == "" && threadEnabled(flags) { result = instrument(result.text, "sanitize_thread") }
+    return result
+}

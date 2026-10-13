@@ -1,0 +1,576 @@
+use "system" as system
+use "files" as files
+
+function hostNameNative(): Text { native "driverhost" }
+public function hostMachine(): Text { native "driverhost" }
+public function resolvePath(path: Text): Text { native "driverhost" }
+function statusNative(path: Text): Text { native "driverhost" }
+public function executable(path: Text): Boolean { native "driverhost" }
+public function selfPath(): Text { native "driverhost" }
+function makeTemporary(directory: Text, prefix: Text): Text { native "driverhost" }
+public function makeDirectory(path: Text): Integer { native "driverhost" }
+public function guard(enabled: Boolean): Integer { native "driverhost" }
+public function pendingSignal(): Integer { native "driverhost" }
+function execute(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer): Integer { native "driverhost" }
+public function hashBytes(data: Bytes): Text { native "driverhost" }
+function hashFileNative(path: Text): Text { native "driverhost" }
+public function errorText(code: Integer): Text { native "driverhost" }
+public function lastError(): Integer { native "driverhost" }
+function registerTemporary(path: Text): Integer { native "driverhost" }
+function releaseTemporary(path: Text): Integer { native "driverhost" }
+function cleanupTemporaries(): Integer { native "driverhost" }
+function captureDirectoryNative(): Text { native "driverhost" }
+function rememberCapture(path: Text): Integer { native "driverhost" }
+
+public constant LLVM_VERSION = "23.1.2"
+public constant TIMED_OUT = -100000
+public constant INTERRUPTED = -200000
+public function hostName(): Text {
+    let selected = setting("MINYAR_TEST_HOST_SYSTEM", "")
+    if selected == "" { return hostNameNative() }
+    return selected
+}
+public function cleanup() { cleanupTemporaries() }
+public function stop(message: Text) {
+    cleanup()
+    system.writeStandardError("minyar: " + message + "\n")
+    exit(1)
+}
+public function leave(status: Integer) {
+    cleanup()
+    exit(status)
+}
+public function release(path: Text) { releaseTemporary(path) }
+public function temporaryDirectory(parent: Text, prefix: Text): Text {
+    let path = keptDirectory(parent, prefix)
+    registerTemporary(path)
+    return path
+}
+public function keptDirectory(parent: Text, prefix: Text): Text {
+    let directory = parent
+    if directory == "" { directory = setting("TMPDIR", "/tmp") }
+    if !directory.startsWith("/") { directory = resolveName(directory) }
+    let path = makeTemporary(directory, prefix)
+    if path == "" { stop(osError(lastError(), directory + "/" + prefix)) }
+    return path
+}
+public function osError(code: Integer, path: Text): Text {
+    let number = code
+    if number < 0 { number = -number }
+    return "[Errno " + Text(number) + "] " + errorText(number) + ": " + pythonText(path)
+}
+
+public function setting(name: Text, fallback: Text): Text {
+    let value = system.getenv(name)
+    if value == "" && system.lastError() != 0 { return fallback }
+    return value
+}
+
+public function textSlice(value: Text, start: Integer, end: Integer): Text {
+    return Text(Bytes(value).slice(start, end))
+}
+public function textAfter(value: Text, prefix: Text): Text {
+    return textSlice(value, prefix.byteLength, value.byteLength)
+}
+public function findText(value: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(value)
+    let pattern = Bytes(needle)
+    let index = start
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+        index += 1
+    }
+    return -1
+}
+public function hasText(value: Text, needle: Text): Boolean { return findText(value, needle, 0) >= 0 }
+public function countText(value: Text, needle: Text): Integer {
+    let total = 0
+    let index = findText(value, needle, 0)
+    while index >= 0 {
+        total += 1
+        index = findText(value, needle, index + needle.byteLength)
+    }
+    return total
+}
+public function replaceText(value: Text, needle: Text, replacement: Text): Text {
+    let parts: List<Text> = []
+    let start = 0
+    let index = findText(value, needle, 0)
+    while index >= 0 {
+        parts.add(textSlice(value, start, index))
+        parts.add(replacement)
+        start = index + needle.byteLength
+        index = findText(value, needle, start)
+    }
+    parts.add(textSlice(value, start, value.byteLength))
+    return joinText(parts)
+}
+public function joined(items: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { parts.add(separator) }
+        parts.add(items[index])
+    }
+    return joinText(parts)
+}
+public function lines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 {
+            result.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+public function isSpace(byte: Integer): Boolean {
+    return byte == 32 || (byte >= 9 && byte <= 13) || byte == 28 || byte == 29 || byte == 30 || byte == 31
+}
+public function strip(value: Text): Text {
+    let raw = Bytes(value)
+    let start = 0
+    let end = raw.length
+    while start < end && isSpace(raw[start]) { start += 1 }
+    while end > start && isSpace(raw[end - 1]) { end -= 1 }
+    return Text(raw.slice(start, end))
+}
+public function words(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        let gap = index == raw.length
+        if index < raw.length { gap = isSpace(raw[index]) }
+        if gap {
+            if start < index { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+public function isDigit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+public function isWord(byte: Integer): Boolean {
+    return isDigit(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte >= 128
+}
+public function listed(items: List<Text>, value: Text): Boolean {
+    for item in items { if item == value { return true } }
+    return false
+}
+public function copied(items: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in items { result.add(item) }
+    return result
+}
+public function extended(items: List<Text>, more: List<Text>): List<Text> {
+    let result = copied(items)
+    for item in more { result.add(item) }
+    return result
+}
+public function sortedUnique(items: List<Text>): List<Text> {
+    let ordered = items.sorted()
+    let result: List<Text> = []
+    for item in ordered { if result.length == 0 || result[result.length - 1] != item { result.add(item) } }
+    return result
+}
+
+public function shellSplit(value: Text, name: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(value)
+    let token = Bytes()
+    let state = 0
+    let pending = false
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        index += 1
+        if state == 1 {
+            if byte == 39 { state = 0 } else { token.add(byte) }
+        } else if state == 2 {
+            if byte == 34 { state = 0 }
+            else if byte == 92 {
+                if index >= raw.length { stop(name + ": No escaped character") }
+                let next = raw[index]
+                if next == 34 || next == 92 { token.add(next); index += 1 } else { token.add(92) }
+            } else { token.add(byte) }
+        } else if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if pending { result.add(Text(token)); token = Bytes(); pending = false }
+        } else if byte == 92 {
+            if index >= raw.length { stop(name + ": No escaped character") }
+            token.add(raw[index])
+            index += 1
+            pending = true
+        } else if byte == 39 { state = 1; pending = true }
+        else if byte == 34 { state = 2; pending = true }
+        else { token.add(byte); pending = true }
+    }
+    if state != 0 { stop(name + ": No closing quotation") }
+    if pending { result.add(Text(token)) }
+    return result
+}
+public function shellQuote(value: Text): Text {
+    if value == "" { return "''" }
+    for byte in Bytes(value) {
+        let safe = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 ||
+            byte == 64 || byte == 37 || byte == 43 || byte == 61 || byte == 58 || byte == 44 || byte == 46 || byte == 47 || byte == 45
+        if !safe { return "'" + replaceText(value, "'", "'\"'\"'") + "'" }
+    }
+    return value
+}
+public function shellJoin(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(shellQuote(item)) }
+    return joined(parts, " ")
+}
+public function flags(name: Text, fallback: Text): List<Text> {
+    return shellSplit(setting(name, fallback), name)
+}
+
+public function jsonText(value: Text): Text {
+    let digits = "0123456789abcdef"
+    let parts: List<Text> = ["\""]
+    let raw = Bytes(value)
+    let start = 0
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte == 34 || byte == 92 || byte < 32 {
+            parts.add(Text(raw.slice(start, index)))
+            if byte == 34 { parts.add("\\\"") }
+            else if byte == 92 { parts.add("\\\\") }
+            else if byte == 10 { parts.add("\\n") }
+            else if byte == 13 { parts.add("\\r") }
+            else if byte == 9 { parts.add("\\t") }
+            else { parts.add("\\u00" + Text(digits[byte / 16]) + Text(digits[byte % 16])) }
+            start = index + 1
+        }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    parts.add("\"")
+    return joinText(parts)
+}
+public function jsonList(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(jsonText(item)) }
+    return "[" + joined(parts, ", ") + "]"
+}
+public function pythonText(value: Text): Text {
+    let quote = "'"
+    if hasText(value, "'") && !hasText(value, "\"") { quote = "\"" }
+    let escaped = replaceText(value, "\\", "\\\\")
+    if quote == "'" { escaped = replaceText(escaped, "'", "\\'") }
+    escaped = replaceText(replaceText(replaceText(escaped, "\n", "\\n"), "\r", "\\r"), "\t", "\\t")
+    return quote + escaped + quote
+}
+
+public record Document { kinds: List<Integer>; texts: List<Text>; keys: List<List<Text>>; children: List<List<Integer>> }
+public function newDocument(): Document {
+    return Document { kinds: [0]; texts: [""]; keys: [[]]; children: [[]] }
+}
+function jsonNode(doc: Document, kind: Integer, text: Text): Integer {
+    doc.kinds.add(kind)
+    doc.texts.add(text)
+    doc.keys.add([])
+    doc.children.add([])
+    return doc.kinds.length - 1
+}
+public function jsonObject(doc: Document): Integer { return jsonNode(doc, 0, "") }
+public function jsonArray(doc: Document): Integer { return jsonNode(doc, 1, "") }
+public function jsonRaw(doc: Document, value: Text): Integer { return jsonNode(doc, 2, value) }
+public function jsonString(doc: Document, value: Text): Integer { return jsonNode(doc, 2, jsonText(value)) }
+public function jsonNumber(doc: Document, value: Integer): Integer { return jsonNode(doc, 2, Text(value)) }
+public function jsonBool(doc: Document, value: Boolean): Integer {
+    if value { return jsonNode(doc, 2, "true") }
+    return jsonNode(doc, 2, "false")
+}
+public function jsonStrings(doc: Document, items: List<Text>): Integer {
+    let result = jsonArray(doc)
+    for item in items { jsonPush(doc, result, jsonString(doc, item)) }
+    return result
+}
+public function jsonPut(doc: Document, target: Integer, key: Text, value: Integer) {
+    let names = doc.keys[target]
+    for index in 0..names.length {
+        if names[index] == key { doc.children[target][index] = value; return }
+    }
+    doc.keys[target].add(key)
+    doc.children[target].add(value)
+}
+public function jsonPush(doc: Document, target: Integer, value: Integer) {
+    doc.children[target].add(value)
+}
+public function jsonLookup(doc: Document, target: Integer, key: Text): Integer {
+    let names = doc.keys[target]
+    for index in 0..names.length { if names[index] == key { return doc.children[target][index] } }
+    return -1
+}
+public function jsonScalar(doc: Document, target: Integer, key: Text): Text {
+    let found = jsonLookup(doc, target, key)
+    if found < 0 { return "" }
+    return doc.texts[found]
+}
+public function jsonRender(doc: Document, target: Integer, indent: Text): Text {
+    if doc.kinds[target] == 2 { return doc.texts[target] }
+    let children = doc.children[target]
+    let opening = "{"
+    let closing = "}"
+    if doc.kinds[target] == 1 { opening = "["; closing = "]" }
+    if children.length == 0 { return opening + closing }
+    let parts: List<Text> = [opening, "\n"]
+    let inner = indent + "  "
+    for index in 0..children.length {
+        parts.add(inner)
+        if doc.kinds[target] == 0 { parts.add(jsonText(doc.keys[target][index]) + ": ") }
+        parts.add(jsonRender(doc, children[index], inner))
+        if index + 1 < children.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add(indent + closing)
+    return joinText(parts)
+}
+
+public function baseName(path: Text): Text {
+    let raw = Bytes(path)
+    let end = raw.length
+    while end > 1 && raw[end - 1] == 47 { end -= 1 }
+    let index = end - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return Text(raw.slice(index + 1, end))
+}
+public function parentPath(path: Text): Text {
+    let raw = Bytes(path)
+    let end = raw.length
+    while end > 1 && raw[end - 1] == 47 { end -= 1 }
+    let index = end - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    if index < 0 { return "." }
+    if index == 0 { return "/" }
+    while index > 1 && raw[index - 1] == 47 { index -= 1 }
+    return Text(raw.slice(0, index))
+}
+public function suffixOf(path: Text): Text {
+    let file = Bytes(baseName(path))
+    let index = file.length - 1
+    while index > 0 && file[index] != 46 { index -= 1 }
+    if index <= 0 || index == file.length - 1 { return "" }
+    return Text(file.slice(index, file.length))
+}
+public function stemOf(path: Text): Text {
+    let file = baseName(path)
+    return textSlice(file, 0, file.byteLength - suffixOf(path).byteLength)
+}
+public function joinPath(directory: Text, child: Text): Text {
+    if directory.endsWith("/") { return directory + child }
+    return directory + "/" + child
+}
+public function resolveName(path: Text): Text {
+    let resolved = resolvePath(path)
+    if resolved == "" { return path }
+    return resolved
+}
+public record Status { kind: Text; device: Text; inode: Text; size: Integer; modified: Integer; changed: Integer }
+public function fileStatus(path: Text): Status {
+    let fields = words(statusNative(path))
+    if fields.length != 6 { return Status { kind: ""; device: ""; inode: ""; size: -1; modified: 0; changed: 0 } }
+    return Status { kind: fields[0]; device: fields[1]; inode: fields[2]; size: Integer(fields[3]); modified: Integer(fields[4]); changed: Integer(fields[5]) }
+}
+public function isFile(path: Text): Boolean { return fileStatus(path).kind == "f" }
+public function isDirectory(path: Text): Boolean { return fileStatus(path).kind == "d" }
+public function exists(path: Text): Boolean { return fileStatus(path).kind != "" }
+public function sameFile(first: Text, second: Text): Boolean {
+    let left = fileStatus(first)
+    let right = fileStatus(second)
+    return left.kind != "" && right.kind != "" && left.device == right.device && left.inode == right.inode
+}
+public function makeDirectories(path: Text) {
+    if isDirectory(path) { return }
+    let above = parentPath(path)
+    if above != path && above != "." && above != "/" { makeDirectories(above) }
+    let created = makeDirectory(path)
+    if created != 0 && !isDirectory(path) { stop(osError(created, path)) }
+}
+public function hashFile(path: Text): Text {
+    let digest = hashFileNative(path)
+    if digest == "" { stop(osError(lastError(), path)) }
+    return digest
+}
+public record Loaded { data: Bytes; error: Integer }
+public function load(path: Text): Loaded {
+    if isDirectory(path) { return Loaded { data: Bytes(); error: -21 } }
+    let data = files.readFile(path)
+    return Loaded { data: data; error: files.lastError() }
+}
+public function store(path: Text, data: Bytes): Integer {
+    let file = files.open(path, files.WRITE + files.CREATE + files.TRUNCATE)
+    if file < 0 { return file }
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written < 0 { return written }
+    return closed
+}
+public function osRepr(code: Integer): Text {
+    let number = code
+    if number < 0 { number = -number }
+    let kind = "OSError"
+    if number == 2 { kind = "FileNotFoundError" }
+    else if number == 13 { kind = "PermissionError" }
+    else if number == 17 { kind = "FileExistsError" }
+    else if number == 20 { kind = "NotADirectoryError" }
+    else if number == 21 { kind = "IsADirectoryError" }
+    return kind + "(" + Text(number) + ", " + pythonText(errorText(number)) + ")"
+}
+public function readBytes(path: Text): Bytes {
+    let loaded = load(path)
+    if loaded.error != 0 { stop(osError(loaded.error, path)) }
+    return loaded.data
+}
+public function readText(path: Text): Text { return Text(readBytes(path)) }
+public function writeBytes(path: Text, data: Bytes) {
+    let status = store(path, data)
+    if status < 0 { stop(osError(status, path)) }
+}
+public function copyFile(source: Text, destination: Text) {
+    writeBytes(destination, readBytes(source))
+}
+public function walk(root: Text, relative: Text, found: List<Text>) {
+    let directory = root
+    if relative != "" { directory = root + "/" + relative }
+    let names = files.list(directory)
+    names.sort()
+    for entry in names {
+        if entry == "." || entry == ".." { continue }
+        let path = entry
+        if relative != "" { path = relative + "/" + entry }
+        let kind = fileStatus(root + "/" + path).kind
+        if kind == "d" { walk(root, path, found) }
+        else if kind == "f" { found.add(path) }
+    }
+}
+
+public function which(command: Text): Text {
+    if command == "" { return "" }
+    if hasText(command, "/") {
+        if executable(command) { return command }
+        return ""
+    }
+    let path = setting("PATH", "/bin:/usr/bin")
+    for directory in path.split(":") {
+        let candidate = command
+        if directory != "" { candidate = joinPath(directory, command) }
+        if executable(candidate) { return candidate }
+    }
+    return ""
+}
+
+function vector(items: List<Text>): Bytes {
+    let encoded = Bytes(8)
+    encoded.setInt64(0, items.length)
+    for item in items {
+        let bytes = Bytes(item)
+        encoded.addInt64(bytes.length)
+        encoded.addBytes(bytes)
+    }
+    return encoded
+}
+public function commandText(command: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in command { parts.add(pythonText(item)) }
+    return "[" + joined(parts, ", ") + "]"
+}
+public function spawn(command: List<Text>, environment: List<Text>, inherit: Boolean, output: Text, errors: Text, seconds: Integer): Integer {
+    let status = execute(vector(command), vector(environment), inherit, output, errors, seconds * 1000)
+    if status == TIMED_OUT { stop("Command '" + commandText(command) + "' timed out after " + Text(seconds) + " seconds") }
+    if status < 0 && status > TIMED_OUT { stop(osError(status, command[0])) }
+    return status
+}
+public function run(command: List<Text>) {
+    let status = spawn(command, [], true, "", "", 0)
+    if status <= INTERRUPTED { leave(128 + INTERRUPTED - status) }
+    if status != 0 { leave(status) }
+}
+public record Captured { status: Integer; output: Text; errors: Text }
+function captureDirectory(): Text {
+    let directory = captureDirectoryNative()
+    if directory == "" {
+        directory = temporaryDirectory("", "minyar-driver-")
+        rememberCapture(directory)
+    }
+    return directory
+}
+public function capture(command: List<Text>, seconds: Integer): Captured {
+    let directory = captureDirectory()
+    let status = spawn(command, [], true, directory + "/stdout", directory + "/stderr", seconds)
+    return Captured { status: status; output: readText(directory + "/stdout"); errors: readText(directory + "/stderr") }
+}
+public function captureOutput(command: List<Text>, seconds: Integer): Text {
+    let result = capture(command, seconds)
+    if result.status != 0 {
+        stop("Command '" + commandText(command) + "' returned non-zero exit status " + Text(result.status) + ".")
+    }
+    return result.output
+}
+
+public function windows(): Boolean {
+    let name = hostName()
+    return name == "Windows" || name.startsWith("MSYS") || name.startsWith("MINGW") || name.startsWith("CYGWIN")
+}
+public function versionOf(output: Text, label: Text): Text {
+    let raw = Bytes(output)
+    let pattern = Bytes(label + " ")
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let found = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { found = false; break } }
+        if found && (index == 0 || !isWord(raw[index - 1])) {
+            let position = index + pattern.length
+            let groups = 0
+            let valid = true
+            while groups < 3 && valid {
+                let start = position
+                while position < raw.length && isDigit(raw[position]) { position += 1 }
+                if position == start { valid = false }
+                groups += 1
+                if valid && groups < 3 {
+                    if position < raw.length && raw[position] == 46 { position += 1 } else { valid = false }
+                }
+            }
+            if valid && (position == raw.length || isSpace(raw[position])) {
+                return Text(raw.slice(index + pattern.length, position))
+            }
+        }
+        index += 1
+    }
+    return ""
+}
+function firstLine(result: Captured): Text {
+    if result.output != "" { return lines(result.output)[0] }
+    return strip(result.errors)
+}
+public function selectedClang(): Text {
+    let fallback = "clang-23"
+    if hostName() == "Darwin" { fallback = "clang" }
+    return setting("MINYAR_CLANG", setting("LLVM_CC", fallback))
+}
+public function pinnedLlvm(command: Text): Text {
+    let resolved = which(command)
+    if resolved == "" {
+        stop("Minyar requires LLVM " + LLVM_VERSION + "; Clang executable not found: " + command + ". Select it with MINYAR_CLANG or LLVM_CC.")
+    }
+    let result = capture([resolved, "--version"], 10)
+    if result.status != 0 || versionOf(result.output, "clang version") != LLVM_VERSION {
+        stop("Minyar requires LLVM " + LLVM_VERSION + "; unsupported compiler " + command + ": " + firstLine(result))
+    }
+    return resolved
+}
+public function pinnedLld(command: Text): Text {
+    let resolved = which(command)
+    if resolved == "" { stop("Minyar requires LLVM " + LLVM_VERSION + "; LLD executable not found: " + command) }
+    let result = capture([resolved, "--version"], 10)
+    if result.status != 0 || versionOf(result.output, "LLD") != LLVM_VERSION {
+        stop("Minyar requires LLVM " + LLVM_VERSION + "; unsupported linker " + command + ": " + firstLine(result))
+    }
+    return resolved
+}
