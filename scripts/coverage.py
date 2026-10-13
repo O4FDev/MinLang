@@ -308,7 +308,7 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
-    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage')
+    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage', 'peer-research-semantics', 'peer-research-reachability')
     run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
 
     compiler_reports = {}

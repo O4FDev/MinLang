@@ -1,0 +1,188 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+
+function lines(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(value + "\n") }
+    return joinText(parts)
+}
+function numbers(values: List<Integer>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(Text(value) + "\n") }
+    return joinText(parts)
+}
+function project(context: test.Compiler, source: Text, expected: Text) {
+    let llvm = port.executes(context, source, expected, 0, "")
+    if test.addressEnabled(context.flags) {
+        let definitions = 0
+        let sanitized = 0
+        for line in test.lines(llvm) {
+            if port.starts(line, "define") {
+                definitions += 1
+                if test.contains(line, " sanitize_address ") { sanitized += 1 }
+            }
+        }
+        test.check(sanitized > 0 && sanitized == definitions, "generated definitions lack sanitize_address")
+    }
+}
+function halfMinimumDigits(): Text {
+    let digits = [1]
+    for step in 0..1075 {
+        let carry = 0
+        for index in 0..digits.length {
+            let value = digits[index] * 5 + carry
+            digits[index] = value % 10
+            carry = value / 10
+        }
+        while carry > 0 { digits.add(carry % 10); carry = carry / 10 }
+    }
+    let parts: List<Text> = []
+    for index in 0..digits.length { parts.add(Text(digits[digits.length - 1 - index])) }
+    return joinText(parts)
+}
+function scientific(digits: Text, exponent: Integer): Text {
+    let raw = Bytes(digits)
+    return Text(raw.slice(0, 1)) + "." + Text(raw.slice(1, raw.length)) + "e" + Text(exponent)
+}
+
+let names = ["test_shared_bytes_and_independent_slice_survive_replacement", "test_shared_row_and_explicit_snapshot_survive_outer_replacement", "test_unused_literal_effects_and_ordered_shared_state", "test_effectful_iterables_evaluate_once_and_retain_body_storage", "test_nan_ordered_comparisons_negation_and_boolean_returns", "test_source_underflow_and_signed_zero_have_exact_binary64_bits", "test_middle_boolean_literal_preserves_all_prior_effects", "test_binary64_halfway_even_addition_at_unit_spacing_boundary", "test_wide_returned_record_preserves_fields_effect_order_and_retained_alias", "test_text_equality_after_nul_at_every_short_mismatch_position", "test_scalar_loop_capture_survives_mutation_continue_and_break", "test_euclidean_remainder_composes_at_signed_boundaries", "test_integer_extrema_are_scalar_results_across_shared_mutation"]
+let family = "PeerProjections"
+let selectors = port.selectors(family, names)
+let context = port.compiler()
+let low = -9223372036854775807 - 1
+let high = 9223372036854775807
+
+if port.selected(selectors, family, "test_shared_bytes_and_independent_slice_survive_replacement") {
+    project(context, "function copyAndWrite(source: Bytes): Bytes {\nsource[1] = 122\nlet copy = source.slice(2, 3)\ncopy[0] = 121\nreturn copy\n}\nlet source = Bytes(4)\nfor i in 0..4 { source[i] = 97 }\nlet alias = source\nlet copy = copyAndWrite(source)\nfor b in source { print(b) }\nfor b in alias { print(b) }\nprint(copy[0])\nsource[2] = 121\nfor b in alias { print(b) }\nsource = Bytes()\nalias = Bytes()\nprint(copy.length)\nprint(copy[0])\n",
+        "97\n122\n97\n97\n97\n122\n97\n97\n121\n97\n122\n121\n97\n1\n121\n")
+}
+if port.selected(selectors, family, "test_shared_row_and_explicit_snapshot_survive_outer_replacement") {
+    project(context, "let row = [0, 0, 0]\nlet rows = [row, [4, 5, 6]]\nlet alias = rows[0]\nlet snapshot: List<Integer> = []\nfor value in alias { snapshot.add(value) }\nrows[0][1] = 15\nprint(alias[1])\nprint(snapshot[1])\nprint(rows[1][1])\nrows[0] = [7, 8, 9]\nrows = []\nrow = []\nprint(alias[1])\nprint(snapshot[1])\nprint(alias.length)\nprint(snapshot.length)\n",
+        "15\n0\n5\n15\n0\n3\n3\n")
+}
+if port.selected(selectors, family, "test_unused_literal_effects_and_ordered_shared_state") {
+    project(context, "function touch(state: List<Integer>): Integer {\nstate[0] = state[0] + 1\nreturn 0\n}\nfunction weighted(state: List<Integer>, weight: Integer, digit: Integer): Integer {\nstate[0] = state[0] + weight\nstate[1] = state[1] * 10 + digit\nreturn weight\n}\nlet state = [0, 0]\nlet unused = [touch(state), touch(state)]\nprint(state[0])\nstate[0] = 0\nlet values = [weighted(state, 1, 1), weighted(state, 2, 2), weighted(state, 4, 3), weighted(state, 8, 4)]\nfor value in values { print(value) }\nprint(state[0])\nprint(state[1])\n",
+        "2\n1\n2\n4\n8\n15\n1234\n")
+}
+if port.selected(selectors, family, "test_effectful_iterables_evaluate_once_and_retain_body_storage") {
+    project(context, "function listSource(state: List<Integer>, empty: Boolean): List<Integer> {\nstate[0] = state[0] + 1\nstate[1] = state[1] * 10 + 1\nif empty { return [] }\nreturn [1, 2, 3, 4, 5]\n}\nfunction byteSource(state: List<Integer>, empty: Boolean): Bytes {\nstate[0] = state[0] + 1\nstate[1] = state[1] * 10 + 2\nif empty { return Bytes() }\nlet bytes = Bytes(5)\nfor i in 0..5 { bytes[i] = i + 1 }\nreturn bytes\n}\nfunction textSource(state: List<Integer>, empty: Boolean): Text {\nstate[0] = state[0] + 1\nstate[1] = state[1] * 10 + 3\nif empty { return \"\" + \"\" }\nreturn \"abcd\" + Text('☺')\n}\nfunction body(state: List<Integer>, value: Integer) {\nlet churn = [\"body:\" + Text(value), Text(value)]\nstate[2] = state[2] + 1\nstate[3] = state[3] + value\nstate[4] = state[4] + churn[0].length\n}\nlet state = [0, 0, 0, 0, 0]\nfor value in listSource(state, false) { print(value); body(state, value) }\nfor value in state { print(value) }\nstate[2] = 0\nstate[3] = 0\nstate[4] = 0\nfor value in byteSource(state, false) { print(value); body(state, value) }\nfor value in state { print(value) }\nstate[2] = 0\nstate[3] = 0\nstate[4] = 0\nfor value in textSource(state, false) { print(Integer(value)); body(state, Integer(value)) }\nfor value in state { print(value) }\nstate[2] = 0\nstate[3] = 0\nstate[4] = 0\nfor value in listSource(state, true) { body(state, value) }\nfor value in byteSource(state, true) { body(state, value) }\nfor value in textSource(state, true) { body(state, Integer(value)) }\nfor value in state { print(value) }\n",
+        numbers([1, 2, 3, 4, 5, 1, 1, 5, 15, 30, 1, 2, 3, 4, 5, 2, 12, 5, 15, 30, 97, 98, 99, 100, 9786, 3, 123, 5, 10180, 38, 6, 123123, 0, 0, 0]))
+}
+if port.selected(selectors, family, "test_nan_ordered_comparisons_negation_and_boolean_returns") {
+    let helpers = ["equal", "unequal", "less", "greater", "atMost", "atLeast"]
+    let operators = ["==", "!=", "<", ">", "<=", ">="]
+    let answers = [false, true, false, false, false, false]
+    let source: List<Text> = []
+    for index in 0..helpers.length { source.add("function " + helpers[index] + "(left: Float, right: Float): Boolean { return left " + operators[index] + " right }") }
+    source.add("let nan = 0.0 / 0.0")
+    source.add("let one = 1.0")
+    let expected: List<Text> = []
+    let lefts = ["nan", "one", "nan"]
+    let rights = ["nan", "nan", "one"]
+    for helper in [false, true] {
+        for pair in 0..lefts.length {
+            for index in 0..helpers.length {
+                let expression = lefts[pair] + " " + operators[index] + " " + rights[pair]
+                if helper { expression = helpers[index] + "(" + lefts[pair] + ", " + rights[pair] + ")" }
+                source.add("print(" + expression + ")")
+                source.add("print(!(" + expression + "))")
+                source.add("print(!(!(" + expression + ")))")
+                let answer = answers[index]
+                expected.add(Text(answer))
+                expected.add(Text(!answer))
+                expected.add(Text(answer))
+            }
+        }
+    }
+    source.add("print(less(1.0, 2.0))")
+    source.add("print(!less(1.0, 2.0))")
+    source.add("function left(state: List<Integer>): Float {\nstate[0] = state[0] * 10 + 1\nreturn 0.0 / 0.0\n}\nfunction right(state: List<Integer>): Float {\nstate[0] = state[0] * 10 + 2\nreturn 1.0\n}\nlet state = [0]\nprint(left(state) < right(state))\nprint(state[0])")
+    for value in ["true", "false", "false", "12"] { expected.add(value) }
+    project(context, lines(source), lines(expected))
+}
+if port.selected(selectors, family, "test_source_underflow_and_signed_zero_have_exact_binary64_bits") {
+    let digits = halfMinimumDigits()
+    let raw = Bytes(digits)
+    test.check(raw.length == 752 && Text(raw.slice(0, 17)) == "24703282292062327", "half minimum digits")
+    let tail = false
+    for index in 17..raw.length { if raw[index] != 48 { tail = true } }
+    test.check(tail, "half minimum lies strictly between the shortest neighbours")
+    let tie = scientific(digits, -324)
+    let parts = [digits]
+    for index in 0..24 { parts.add("0") }
+    parts.add("1")
+    let above = scientific(joinText(parts), -324)
+    let literals = ["2.4703282292062327e-324", "2.4703282292062328e-324", "-2.4703282292062327e-324", "-2.4703282292062328e-324", "0.0e123", "-0.0e123", tie, "-" + tie, above, "-" + above, "1.0e-10000", "-1.0e-10000"]
+    let bits = [0, 1, low, low + 1, 0, low, 0, low, 1, low + 1, 0, low]
+    let source: List<Text> = []
+    for index in 0..literals.length { source.add("function value" + Text(index) + "(): Float { return " + literals[index] + " }") }
+    source.add("let bytes = Bytes()")
+    for literal in literals { source.add("bytes.addFloat64(" + literal + ")") }
+    for index in 0..literals.length { source.add("bytes.addFloat64(value" + Text(index) + "())") }
+    for offset in 0..(2 * literals.length) { source.add("print(bytes.getInt64(" + Text(offset * 8) + "))") }
+    let expected: List<Integer> = []
+    for pass in 0..2 { for value in bits { expected.add(value) } }
+    project(context, lines(source), numbers(expected))
+}
+if port.selected(selectors, family, "test_middle_boolean_literal_preserves_all_prior_effects") {
+    project(context, "function observe(events: List<Integer>, id: Integer, result: Boolean): Boolean {\nevents.add(id)\nreturn result\n}\nfunction decisive(events: List<Integer>, result: Boolean): Boolean {\nlet temporary = Text(3) + \"!\"\nevents.add(3)\nif temporary.length != 2 { fail(\"the decisive helper lost its temporary\") }\nreturn result\n}\nlet events: List<Integer> = []\nprint(observe(events, 1, true) && observe(events, 2, true) && false && observe(events, 9, true))\nprint(events.length)\nfor id in events { print(id) }\nevents = []\nprint(observe(events, 1, true) && observe(events, 2, true) && decisive(events, false) && observe(events, 9, true))\nprint(events.length)\nfor id in events { print(id) }\nevents = []\nprint(observe(events, 1, false) || observe(events, 2, false) || true || observe(events, 9, false))\nprint(events.length)\nfor id in events { print(id) }\nevents = []\nprint(observe(events, 1, false) || observe(events, 2, false) || decisive(events, true) || observe(events, 9, false))\nprint(events.length)\nfor id in events { print(id) }\n",
+        "false\n2\n1\n2\nfalse\n3\n1\n2\n3\ntrue\n2\n1\n2\ntrue\n3\n1\n2\n3\n")
+}
+if port.selected(selectors, family, "test_binary64_halfway_even_addition_at_unit_spacing_boundary") {
+    project(context, "function add(left: Float, right: Float): Float {\nreturn left + right\n}\nlet x = 9007199254740992.0\nprint(x + 1.0 == x)\nprint(x + 2.0 == 9007199254740994.0)\nprint((x + 2.0) - x)\nprint(add(x, 1.0) == x)\nprint(add(x, 2.0) == 9007199254740994.0)\nprint(add(x, 2.0) - x)\nlet bits = Bytes()\nbits.addFloat64(x + 1.0)\nbits.addFloat64(x + 2.0)\nbits.addFloat64(add(x, 1.0))\nbits.addFloat64(add(x, 2.0))\nfor i in 0..4 { print(bits.getInt64(i * 8)) }\n",
+        "true\ntrue\n2.0\ntrue\ntrue\n2.0\n4845873199050653696\n4845873199050653697\n4845873199050653696\n4845873199050653697\n")
+}
+if port.selected(selectors, family, "test_wide_returned_record_preserves_fields_effect_order_and_retained_alias") {
+    let expected: List<Integer> = []
+    for digit in 1..9 { expected.add(digit) }
+    for digit in 1..9 { expected.add(11 * digit) }
+    for value in [87654321, 111, 11] { expected.add(value) }
+    for index in 0..8 { expected.add(8) }
+    expected.add(111)
+    for digit in 2..9 { expected.add(11 * digit) }
+    project(context, "record Wide { a: Integer; b: Integer; c: Integer; d: Integer; e: Integer; f: Integer; g: Integer; h: Integer }\nfunction initial(): Wide {\nreturn Wide { a: 1; b: 2; c: 3; d: 4; e: 5; f: 6; g: 7; h: 8 }\n}\nfunction show(value: Wide) {\nprint(value.a); print(value.b); print(value.c); print(value.d)\nprint(value.e); print(value.f); print(value.g); print(value.h)\n}\nfunction mark(trace: List<Integer>, digit: Integer): Integer {\ntrace[0] = trace[0] * 10 + digit\nreturn digit * 11\n}\nfunction make(trace: List<Integer>): Wide {\nreturn Wide {\nh: mark(trace, 8); g: mark(trace, 7); f: mark(trace, 6); e: mark(trace, 5)\nd: mark(trace, 4); c: mark(trace, 3); b: mark(trace, 2); a: mark(trace, 1)\n}\n}\nfunction echo(value: Wide): Wide { return value }\nshow(initial())\nlet trace = [0]\nlet holder = [make(trace)]\nlet kept = echo(holder[0])\nlet scalar = kept.a\nshow(kept)\nprint(trace[0])\nholder[0].a = 111\nprint(kept.a)\nprint(scalar)\nholder[0] = initial()\nholder = []\nfor i in 0..8 { let temporary = initial(); print(temporary.h) }\nshow(kept)\n",
+        numbers(expected))
+}
+if port.selected(selectors, family, "test_text_equality_after_nul_at_every_short_mismatch_position") {
+    let sizes: List<Integer> = []
+    for size in 0..18 { sizes.add(size) }
+    for size in [31, 32, 33] { sizes.add(size) }
+    let listed: List<Text> = []
+    for index in 0..sizes.length { if index > 0 { listed.add(", ") }; listed.add(Text(sizes[index])) }
+    let source = "function build(size: Integer, changed: Integer): Text {\nlet result = \"\"\nfor position in 0..size {\nlet code = 65\nif position == size / 2 { code = 0 }\nif position == changed { code = 66 }\nresult = result + Text(Character(code))\n}\nreturn result\n}\nlet sizes = [" + joinText(listed) + "]\nfor size in sizes {\nlet left = build(size, -1)\nlet right = build(size, -1)\nprint(left == right)\nprint(left != right)\nprint(left.length)\nprint(left.byteLength)\nprint(left == right + \"C\")\nfor position in 0..size {\nprint(left == build(size, position))\nprint(left != build(size, position))\n}\n}\nlet zero = Text(Character(0))\nlet left = \"é\" + zero + \"🙂\"\nlet equal = Text(Character(233)) + zero + Text(Character(128578))\nlet different = \"é\" + zero + \"🙃\"\nprint(left == equal)\nprint(left != equal)\nprint(left == different)\nprint(left != different)\nprint(left.length)\nprint(left.byteLength)\nprint(Integer(left[1]))\nprint(left.slice(1, 3) == zero + \"🙂\")\n"
+    let expected: List<Text> = []
+    for size in sizes {
+        for value in ["true", "false", Text(size), Text(size), "false"] { expected.add(value) }
+        for position in 0..size { expected.add("false"); expected.add("true") }
+    }
+    for value in ["true", "false", "false", "true", "3", "7", "0", "true"] { expected.add(value) }
+    project(context, source, lines(expected))
+}
+if port.selected(selectors, family, "test_scalar_loop_capture_survives_mutation_continue_and_break") {
+    project(context, "let source = [4, 7, 9, 13]\nlet alias = source\nlet position = 0\nlet visits = 0\nlet tail = 0\nlet captured = 0\nlet rebound = 0\nlet trace = 0\nlet allocated = 0\nfor value in source {\nlet index = position\nposition += 1\nvisits += 1\ntrace = trace * 10 + index + 1\nsource[index] += 100\ncaptured = captured * 100 + value\nvalue = 900 + index\nrebound += value\nlet pieces = [\"Q\", \"R\", \"S\"]\nallocated += joinText(pieces).length\nif index == 0 { continue }\nif index == 2 { break }\ntail += 1\n}\nprint(captured)\nprint(visits)\nprint(position)\nprint(tail)\nprint(rebound)\nprint(trace)\nprint(allocated)\nsource = []\nfor value in alias { print(value) }\n",
+        numbers([40709, 3, 3, 1, 2703, 123, 9, 104, 107, 109, 13]))
+}
+if port.selected(selectors, family, "test_euclidean_remainder_composes_at_signed_boundaries") {
+    let lefts = [0, 0, -19, 27, -27, 27, -27, 9223372036854775807, -9223372036854775806, -2147483648, 1234, 7540113804746346429]
+    let rights = [0, -19, 0, 36, 36, -36, -36, 9223372036854775806, 4611686018427387903, 1234, -2147483648, 4660046610375530309]
+    let source = ["function euclid(left: Integer, right: Integer): Integer {\nlet a = abs(left)\nlet b = abs(right)\nwhile b != 0 {\nlet next = a % b\na = b\nb = next\n}\nreturn a\n}\n"]
+    let calls: List<Text> = []
+    for index in 0..lefts.length { calls.add("print(euclid(" + Text(lefts[index]) + ", " + Text(rights[index]) + "))") }
+    source.add(lines(calls))
+    project(context, joinText(source), numbers([0, 19, 19, 9, 9, 9, 9, 1, 4611686018427387903, 2, 2, 1]))
+}
+if port.selected(selectors, family, "test_integer_extrema_are_scalar_results_across_shared_mutation") {
+    let firsts = [0, -7, 0, 1, low, high, low, high]
+    let seconds = [0, -7, 1, 0, high, low, low, high]
+    let lows = [0, -7, 0, 0, low, low, low, high]
+    let highs = [0, -7, 1, 1, high, high, low, high]
+    let calls: List<Text> = []
+    let expected: List<Integer> = []
+    for index in 0..firsts.length {
+        calls.add("inspect(" + Text(firsts[index]) + ", " + Text(seconds[index]) + ")")
+        for value in [111, 222, lows[index], highs[index]] { expected.add(value) }
+    }
+    project(context, "record Limits { low: Integer; high: Integer }\nfunction limits(values: List<Integer>): Limits {\nreturn Limits { low: min(values[0], values[1]); high: max(values[0], values[1]) }\n}\nfunction inspect(first: Integer, second: Integer) {\nlet values = [first, second]\nlet alias = values\nlet saved = limits(values)\nalias[0] = 111\nalias[1] = 222\nprint(values[0])\nprint(values[1])\nvalues = []\nalias = []\nprint(saved.low)\nprint(saved.high)\n}\n" + lines(calls),
+        numbers(expected))
+}
+test.removeTree(context.directory)

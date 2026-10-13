@@ -1,0 +1,199 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+
+record Magnitude { high: Integer; low: Integer }
+constant MASK: Integer = 4294967295
+constant MINIMUM: Integer = -9223372036854775807 - 1
+constant MAXIMUM: Integer = 9223372036854775807
+function bits(value: Integer): Magnitude { return Magnitude { high: (value >> 32) & MASK; low: value & MASK } }
+function magnitude(value: Integer): Magnitude {
+    let raw = bits(value)
+    if value >= 0 { return raw }
+    let low = ((~raw.low) & MASK) + 1
+    return Magnitude { high: (((~raw.high) & MASK) + (low >> 32)) & MASK; low: low & MASK }
+}
+function atLeast(left: Magnitude, right: Magnitude): Boolean {
+    if left.high != right.high { return left.high > right.high }
+    return left.low >= right.low
+}
+function minus(left: Magnitude, right: Magnitude): Magnitude {
+    let low = left.low - right.low
+    let borrow = 0
+    if low < 0 { low += MASK + 1; borrow = 1 }
+    return Magnitude { high: left.high - right.high - borrow; low: low }
+}
+function signed(value: Magnitude, negative: Boolean): Integer {
+    let raw = (value.high << 32) | value.low
+    if negative { return wrappingSubtract(0, raw) }
+    return raw
+}
+function divideModel(left: Integer, right: Integer): List<Integer> {
+    let remainder = magnitude(left)
+    let divisor = magnitude(right)
+    let partial = Magnitude { high: 0; low: 0 }
+    let quotient = Magnitude { high: 0; low: 0 }
+    for step in 0..64 {
+        let bit = 63 - step
+        let source = remainder.low
+        if bit >= 32 { source = remainder.high }
+        let incoming = (source >> (bit % 32)) & 1
+        partial = Magnitude { high: ((partial.high << 1) | (partial.low >> 31)) & MASK; low: ((partial.low << 1) & MASK) | incoming }
+        if atLeast(partial, divisor) {
+            partial = minus(partial, divisor)
+            if bit >= 32 { quotient.high = quotient.high | (1 << (bit - 32)) } else { quotient.low = quotient.low | (1 << bit) }
+        }
+    }
+    return [signed(quotient, (left < 0) != (right < 0)), signed(partial, left < 0)]
+}
+function lines(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(value + "\n") }
+    return joinText(parts)
+}
+function halves(value: Integer): Text {
+    let sign = ""
+    if value < 0 { sign = "-" }
+    let fraction = ".0"
+    if abs(value) % 2 == 1 { fraction = ".5" }
+    return sign + Text(abs(value) / 2) + fraction
+}
+
+let names = ["test_swift_unicode_value_survives_indexing_then_consuming_join", "test_rust_scope_void_call_can_finish_a_void_function", "test_swift_single_scalar_literals_keep_the_scalar_value", "test_swift_string_literals_preserve_multiple_scalars", "test_swift_float_array_literal_keeps_order_and_values", "test_swift_nested_array_construction_uses_distinct_rows", "test_zig_short_circuit_skips_traps_and_keeps_all_live_effects", "test_go_utf8_scalar_iteration_and_text_construction_agree", "test_go_empty_text_iteration_does_not_touch_outer_binding", "test_llvm_divide_shift_wrapping_add_matches_signed_remainder", "test_nim_discarded_overflowing_result_still_traps", "test_go_sparse_bit_signed_division_matches_shift_subtract_model", "test_go_append_value_order_preserves_the_original_input"]
+let family = "PeerSemanticTests"
+let selectors = port.selectors(family, names)
+let context = port.compiler()
+
+if port.selected(selectors, family, "test_swift_unicode_value_survives_indexing_then_consuming_join") {
+    port.executes(context, "let text = \"é🙂\" + \"!\"\nprint(text.length)\nprint(Integer(text[0]))\nprint(Integer(text[1]))\ntext = text + \"ABC\"\nprint(text.length)\nprint(text.byteLength)\nfor character in text { print(Integer(character)) }\nprint(text.slice(0, 2))\n",
+        "3\n233\n128578\n6\n10\n233\n128578\n33\n65\n66\n67\né🙂\n", 0, "")
+}
+if port.selected(selectors, family, "test_rust_scope_void_call_can_finish_a_void_function") {
+    port.executes(context, "function finish() { print(23) }\nfunction run() { return finish() }\nrun()\n", "23\n", 0, "")
+}
+if port.selected(selectors, family, "test_swift_single_scalar_literals_keep_the_scalar_value") {
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for character in "bβ𝔹" {
+        let point = Text(Integer(character))
+        let literal = Text(character)
+        source.add("print(Integer('" + literal + "'))")
+        source.add("print(Character(" + point + ") == '" + literal + "')")
+        source.add("print(Text(Character(" + point + ")) == \"" + literal + "\")")
+        for value in [point, "true", "true"] { expected.add(value) }
+    }
+    port.executes(context, lines(source), lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_swift_string_literals_preserve_multiple_scalars") {
+    port.executes(context, "let text = \"🇦🇺\" + \"\"\nprint(text.length)\nprint(text.byteLength)\nprint(Integer(text[0]))\nprint(Integer(text[1]))\nprint(text.slice(0, 1) + text.slice(1, 2) == text)\n",
+        "2\n8\n127462\n127482\ntrue\n", 0, "")
+}
+if port.selected(selectors, family, "test_swift_float_array_literal_keeps_order_and_values") {
+    let literal: List<Text> = []
+    let expected = ["192"]
+    for index in 0..192 {
+        let doubled = (index * 17) % 11 - 5
+        if index > 0 { literal.add(", ") }
+        literal.add(halves(doubled))
+        expected.add(Text(doubled))
+    }
+    let source = "let values: List<Float> = [" + joinText(literal) + "]\nprint(values.length)\nfor value in values { print(Integer(value * 2.0)) }\n"
+    port.executes(context, source, lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_swift_nested_array_construction_uses_distinct_rows") {
+    port.executes(context, "let rows: List<List<Integer>> = []\nfor row in 0..10 {\n    let values: List<Integer> = []\n    for column in 0..10 { values.add(row * 10 + column) }\n    rows.add(values)\n}\nrows[0][0] = -1\nprint(rows[0][0])\nprint(rows[1][0])\nprint(rows[9][9])\n",
+        "-1\n10\n99\n", 0, "")
+}
+if port.selected(selectors, family, "test_zig_short_circuit_skips_traps_and_keeps_all_live_effects") {
+    port.executes(context, "function trap(): Boolean {\n    let zero = 0\n    return 1 / zero == 0\n}\nfunction observe(events: List<Integer>, id: Integer, result: Boolean): Boolean {\n    events.add(id)\n    return result\n}\nlet events: List<Integer> = []\nprint(true || trap())\nprint(false && trap())\nprint(observe(events, 1, false) || observe(events, 2, true))\nprint(observe(events, 3, true) && observe(events, 4, false))\nprint(true || observe(events, 5, false))\nprint(false && observe(events, 6, true))\nfor event in events { print(event) }\n",
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\n1\n2\n3\n4\n", 0, "")
+}
+if port.selected(selectors, family, "test_go_utf8_scalar_iteration_and_text_construction_agree") {
+    let text = "abc日本語"
+    let source = "let text = \"" + text + "\" + \"\"\nlet rebuilt = \"\"\nfor character in text {\nprint(Integer(character))\nrebuilt = rebuilt + Text(character)\n}\nprint(rebuilt == text)\nprint(rebuilt.length)\nprint(rebuilt.byteLength)\n"
+    let expected: List<Text> = []
+    for character in text { expected.add(Text(Integer(character))) }
+    for value in ["true", "6", "12"] { expected.add(value) }
+    port.executes(context, source, lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_go_empty_text_iteration_does_not_touch_outer_binding") {
+    port.executes(context, "let character = 'β'\nlet visits = 0\nfor character in \"\" {\n    visits += 1\n    print(character)\n}\nprint(visits)\nprint(Integer(character))\n", "0\n946\n", 0, "")
+}
+if port.selected(selectors, family, "test_llvm_divide_shift_wrapping_add_matches_signed_remainder") {
+    let values = [MINIMUM, MINIMUM + 1, -(1 << 62), -65537, -65, -64, -63, -5, -4, -3, -1, 0, 1, 3, 4, 5, 63, 64, 65, 65537, 1 << 62, MAXIMUM - 1, MAXIMUM]
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for power in [2, 4, 6, 30, 61] {
+        let divisor = 1 << power
+        source.add("function remainder" + Text(power) + "(x: Integer): Integer {\nreturn wrappingAdd((x / -" + Text(divisor) + ") << " + Text(power) + ", x)\n}\n")
+        for value in values {
+            let remainder = value & (divisor - 1)
+            if value < 0 { remainder = -(wrappingSubtract(0, value) & (divisor - 1)) }
+            expected.add(Text(remainder))
+            source.add("print(remainder" + Text(power) + "(" + Text(value) + "))\n")
+        }
+    }
+    port.executes(context, joinText(source), lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_nim_discarded_overflowing_result_still_traps") {
+    port.executes(context, "function calculate(a: Integer, b: Integer) {\n    let discarded = a - b\n}\nfunction left(): Integer { print(11); return -2 }\nfunction right(): Integer { print(22); return 9223372036854775807 }\ncalculate(left(), right())\nprint(33)\n",
+        "11\n22\n", 1, "Minyar stopped: this Integer calculation is outside the supported range.\n")
+}
+if port.selected(selectors, family, "test_go_sparse_bit_signed_division_matches_shift_subtract_model") {
+    let candidates = [0, -1, MINIMUM, MAXIMUM]
+    for bit in [0, 1, 7, 15, 31, 32, 61, 62] {
+        for offset in [-1, 0, 1] {
+            candidates.add((1 << bit) + offset)
+            candidates.add(-((1 << bit) + offset))
+        }
+    }
+    candidates.sort()
+    let values: List<Integer> = []
+    for value in candidates { if values.length == 0 || values[values.length - 1] != value { values.add(value) } }
+    let divisors = [MINIMUM, -(1 << 32) - 1, -257, -3, -1, 1, 3, 257, (1 << 32) + 1, 1 << 62, MAXIMUM]
+    let source = ["function quotient(a: Integer, b: Integer): Integer { return a / b }\n", "function remainder(a: Integer, b: Integer): Integer { return a % b }\n"]
+    let expected: List<Text> = []
+    for left in values {
+        for right in divisors {
+            if left == MINIMUM && right == -1 { continue }
+            let model = divideModel(left, right)
+            source.add("print(quotient(" + Text(left) + ", " + Text(right) + "))\n")
+            source.add("print(remainder(" + Text(left) + ", " + Text(right) + "))\n")
+            expected.add(Text(model[0]))
+            expected.add(Text(model[1]))
+        }
+    }
+    port.executes(context, joinText(source), lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_go_append_value_order_preserves_the_original_input") {
+    let lengths = [0, 0, 3, 3, 0, 0, 3, 3]
+    let additions = [[0], [0, 1, 2, 0], [1], [1, 2, 0], [2], [0, 1, 2, 1], [0], [0, 0, 2]]
+    let kinds = ["Boolean", "Integer", "Float", "Text"]
+    let literals = [["true", "false", "true"], ["-17", "0", "9223372036854775807"], ["-0.5", "0.0", "2.5"], ["\"β\"", "\"𝔹\"", "\"abc\""]]
+    let printed = [["true", "false", "true"], ["-17", "0", "9223372036854775807"], ["-0.5", "0.0", "2.5"], ["β", "𝔹", "abc"]]
+    for kind in 0..kinds.length {
+        let values = literals[kind]
+        let source: List<Text> = []
+        let expected: List<Text> = []
+        for index in 0..lengths.length {
+            let name = Text(index)
+            let original: List<Text> = []
+            for item in 0..lengths[index] { original.add(values[item]) }
+            let joined: List<Text> = []
+            for item in 0..original.length { if item > 0 { joined.add(", ") }; joined.add(original[item]) }
+            source.add("let before" + name + ": List<" + kinds[kind] + "> = [" + joinText(joined) + "]\n")
+            source.add("let after" + name + " = before" + name + "\n")
+            for item in additions[index] { source.add("after" + name + " = after" + name + ".appended(" + values[item] + ")\n") }
+            source.add("print(before" + name + ".length)\n")
+            source.add("print(after" + name + ".length)\n")
+            source.add("for value in before" + name + " { print(value) }\n")
+            source.add("for value in after" + name + " { print(value) }\n")
+            expected.add(Text(lengths[index]))
+            expected.add(Text(lengths[index] + additions[index].length))
+            for item in 0..lengths[index] { expected.add(printed[kind][item]) }
+            for item in 0..lengths[index] { expected.add(printed[kind][item]) }
+            for item in additions[index] { expected.add(printed[kind][item]) }
+        }
+        port.executes(context, joinText(source), lines(expected), 0, "")
+    }
+}
+test.removeTree(context.directory)
