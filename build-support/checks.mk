@@ -651,18 +651,15 @@ check-sanitize: check-symbol-order-sanitize
 # Focused original adaptations and runtime invariants; no upstream corpus or
 # archived research baseline is required by these maintained regressions.
 .PHONY: check-peer-semantics check-peer-semantics-sanitize check-memory-regressions check-memory-regressions-sanitize check-bootstrap-policy
-PEER_SEMANTIC_SUITES = peer-memory-nim-koka-lean peer-memory-nim-koka-followups
-PEER_SEMANTIC_TOOLS = build/tooling/tests/peer-research-semantics build/tooling/tests/peer-research-reachability build/tooling/tests/memory-research-peer-projections
+PEER_SEMANTIC_TOOLS = build/tooling/tests/peer-research-semantics build/tooling/tests/peer-research-reachability build/tooling/tests/memory-research-peer-projections build/tooling/tests/peer-memory-nim-koka-lean build/tooling/tests/peer-memory-nim-koka-followups
 $(PEER_SEMANTIC_TOOLS): TOOL_NATIVE = tests/sha256-test-native.c
 $(PEER_SEMANTIC_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(PEER_SEMANTIC_TOOLS): tests/sha256-test-native.c
 
 check-peer-semantics: build/minyarc build/minyar-runtime.o $(PEER_SEMANTIC_TOOLS)
-	@set -e; for suite in $(PEER_SEMANTIC_SUITES); do $(LIMITED) python3 "tests/$$suite.py"; done
 	@set -e; for tool in $(PEER_SEMANTIC_TOOLS); do $(LIMITED) "./$$tool"; done
 
 check-peer-semantics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_SEMANTIC_TOOLS)
-	@set -e; for suite in $(PEER_SEMANTIC_SUITES); do ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 "tests/$$suite.py"; done
 	@set -e; for tool in $(PEER_SEMANTIC_TOOLS); do ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./$$tool"; done
 
 check-memory-regressions: build/tooling/tests/memory-research-regressions
