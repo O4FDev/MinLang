@@ -1365,6 +1365,86 @@ function stockStale(st: CidStock): Integer {
     if !stockDrain(st) || stockSignature(st.subject)!=before || st.observed.length!=2 { return 68 }
     print("real receive-range pruning discarded an old authenticated unused-CID packet without issuing a spare");return 0
 }
+function pressureDrain(st: CidStock, sequence: Integer, prior: Integer, lose: Boolean): Integer {
+    let copies=0;let first=-1
+    for turn in 0..32 {
+        st.now+=10
+        for packet in quic.pollDatagrams(st.subject,st.now) {
+            let header=wire.header(packet.data,0,st.peer.local.length)
+            if !header.valid || header.kind!=wire.ONE_RTT { return -1 }
+            let opened=protection.unprotect(st.peer.spaces[2].read,packet.data,header.numberOffset,-1)
+            let parsed=wire.frames(opened.payload);let replacement=false;let eliciting=false
+            if !opened.valid || !parsed.valid { return -1 }
+            for frame in parsed.frames {
+                if frame.type!=0 && frame.type!=2 && frame.type!=3 && frame.type!=28 && frame.type!=29 { eliciting=true }
+                if frame.type==24 {
+                    if frame.value!=sequence || frame.offset!=prior || frame.data.length!=24 { return -1 }
+                    let id=frame.data.slice(0,8);let token=frame.data.slice(8,24);let owned=false
+                    for known in st.subject.localIds { if known.sequence==sequence && crypto.hex(known.id)==crypto.hex(id) && crypto.hex(known.token)==crypto.hex(token) { owned=true } }
+                    if !owned { return -1 }
+                    if st.observed.length==sequence {
+                        for known in st.observed { if crypto.hex(known.id)==crypto.hex(id) || (known.token.length==16 && crypto.hex(known.token)==crypto.hex(token)) { return -1 } }
+                        st.observed.add(StockId { sequence:sequence;id:id;token:token;prior:prior })
+                    } else {
+                        if st.observed.length!=sequence+1 { return -1 }
+                        let known=st.observed[sequence]
+                        if crypto.hex(known.id)!=crypto.hex(id) || crypto.hex(known.token)!=crypto.hex(token) || known.prior!=prior { return -1 }
+                    }
+                    let active=0;for known in st.observed { if known.sequence>=frame.offset { active+=1 } }
+                    if active>st.limit { return -1 }
+                    replacement=true;copies+=1
+                    if first<0 { first=opened.number }
+                }
+            }
+            if eliciting && !(lose && replacement && copies==1) { stockAck(st,opened.number);if !st.valid { return -1 } }
+        }
+        if copies>0 && (!lose || copies>=2) {
+            if lose { stockAck(st,first);if !st.valid { return -1 } }
+            return copies
+        }
+        if lose && copies==1 {
+            let deadline=quic.nextTimer(st.subject)
+            if deadline<=st.now || deadline>st.now+10000 { return -1 }
+            st.now=deadline
+        }
+    }
+    return copies
+}
+function stockPressure(st: CidStock, lose: Boolean, protectedRoute: Boolean): Integer {
+    if !st.valid { return 65 }
+    let limit=min(st.limit,8)
+    for sequence in 1..limit {
+        let result=stockUseCheck(st,sequence,min(limit,sequence+2),min(limit,sequence+2),"pressure setup exceeded the negotiated live CID limit")
+        if result!=0 { return result }
+    }
+    if protectedRoute && !errors.booleanOk(quic.probePath(st.subject,7,st.now)) { return 65 }
+    for round in 0..16 {
+        let next=st.subject.nextLocalSequence;let current=stockId(st.subject,next-1);let oldest=st.subject.localIds[0].sequence;let old=stockId(st.subject,oldest)
+        let packet=stockReceive(st,current,crypto.fromHex("1a0001020304050607"))
+        if protectedRoute {
+            let signature=stockSignature(st.subject)
+            if !stockDrain(st) || st.subject.nextLocalSequence!=next || st.subject.localIds.length!=limit || stockSignature(st.subject)!=signature { return 68 }
+            print("retained real candidate route preserved its oldest local CID under pressure");return 0
+        }
+        let copies=pressureDrain(st,next,oldest+1,lose && round==0)
+        if copies==0 { print("semantic failure: full CID inventory has no retirement-backed wire spare");return 66 }
+        if copies<0 || st.subject.nextLocalSequence!=next+1 || st.observed.length!=next+1 || st.subject.localIds.length!=limit+1 || !quic.ownsConnectionId(st.subject,old) { return 68 }
+        let signature=stockSignature(st.subject)
+        st.now+=1;quic.receivePath(st.subject,packet,0,st.now)
+        let oldPacket=stockReceive(st,old,crypto.fromHex("0100000000"));let header=wire.header(oldPacket,0,st.subject.local.length)
+        let opened=protection.unprotect(st.subject.spaces[2].read,oldPacket,header.numberOffset,-1)
+        if !opened.valid || !stockReceived(st.subject,opened.number) { return 68 }
+        let replacement=stockId(st.subject,next)
+        stockReceive(st,replacement,crypto.fromHex("1a08090a0b0c0d0e0f"))
+        if !stockDrain(st) || stockSignature(st.subject)!=signature { return 68 }
+        stockRetire(st,replacement,oldest)
+        if !st.valid || !stockDrain(st) || st.subject.localIds.length!=limit || st.subject.nextLocalSequence!=next+1 || quic.ownsConnectionId(st.subject,old) { return 68 }
+        let largest=st.subject.spaces[2].largest;signature=stockSignature(st.subject)
+        stockReceive(st,old,crypto.fromHex("0100000000"))
+        if st.subject.spaces[2].largest!=largest || stockSignature(st.subject)!=signature { return 68 }
+    }
+    print("retirement-backed wire spares respected peer limit "+Text(limit)+"; old aliases survived until actual retirement; sixteen rounds bounded pending requests and loss replay");return 0
+}
 function stockMode(mode: Text): Boolean {
     for selected in ["cid-stock-single-path","cid-stock-receive-size","cid-stock-receive-size-server","cid-stock-first-use","cid-stock-first-use-server","cid-stock-chain","cid-stock-loss","cid-stock-loss-server","cid-stock-reorder","cid-stock-retired-spare","cid-stock-retire-order","cid-stock-limit2","cid-stock-limit3","cid-stock-cap8","cid-stock-large-limit","cid-stock-spoof","cid-stock-discarded-route","cid-stock-wrong-response","cid-stock-malformed","cid-stock-forbidden-server","cid-stock-close","cid-stock-retire-current","cid-stock-retire-unissued","cid-stock-stale"] { if mode==selected { return true } }
     return false
@@ -1623,6 +1703,10 @@ function responseRetry(p: Pair, mode: Text): Integer {
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
+    if mode=="cid-pressure-limit2" || mode=="cid-pressure-limit4" || mode=="cid-pressure-limit8" || mode=="cid-pressure-loss" || mode=="cid-pressure-route" {
+        let limit=4;if mode=="cid-pressure-limit2" { limit=2 };if mode=="cid-pressure-limit8" { limit=8 }
+        return stockPressure(stockPair(root,identity,key,client,clientKey,limit,false),mode=="cid-pressure-loss",mode=="cid-pressure-route")
+    }
     if stockMode(mode) {
         let limit=8
         if mode=="cid-stock-limit2" { limit=2 }

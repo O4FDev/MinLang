@@ -19,6 +19,11 @@ SPEC = importlib.util.spec_from_file_location("quic_cid_certificates", CA_SOURCE
 FIXTURES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURES)
 BASELINE = {
+    "cid-pressure-limit2": (66, "semantic failure: full CID inventory has no retirement-backed wire spare"),
+    "cid-pressure-limit4": (66, "semantic failure: full CID inventory has no retirement-backed wire spare"),
+    "cid-pressure-limit8": (66, "semantic failure: full CID inventory has no retirement-backed wire spare"),
+    "cid-pressure-loss": (66, "semantic failure: full CID inventory has no retirement-backed wire spare"),
+    "cid-pressure-route": (0, "retained real candidate route preserved its oldest local CID under pressure"),
     "response-padding-client": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
     "response-padding-server": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
     "response-padding-width1": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),

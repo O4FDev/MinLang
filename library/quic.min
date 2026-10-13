@@ -69,7 +69,7 @@ public record Connection {
     paceCredit: Float; paceAt: Integer; paceNext: Integer
     ackExponent: Integer; idleTimeout: Integer; failedAuthentication: Integer
     activePath: Integer; incomingPath: Integer; paths: List<Path>; outgoingPaths: List<Integer>; peerDisabledMigration: Boolean
-    highestAuthenticatedLocalSequence: Integer
+    highestAuthenticatedLocalSequence: Integer; localRetirePrior: Integer
 }
 function contains(values: List<Integer>, value: Integer): Boolean { for item in values { if item == value { return true } }; return false }
 function add(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
@@ -231,10 +231,12 @@ function issueConnectionIds(connection: Connection) {
     // retirement of an unused spare can make room for one bounded replacement.
     let newest = -1
     for known in connection.localIds { newest = max(newest,known.sequence) }
+    let live = 0
+    for known in connection.localIds { if known.sequence >= connection.localRetirePrior { live += 1 } }
     let limit = min(connection.peerIdLimit,8); let target = min(2,limit)
-    if newest <= connection.highestAuthenticatedLocalSequence { target = min(limit,max(2,connection.localIds.length + 1)) }
+    if newest <= connection.highestAuthenticatedLocalSequence { target = min(limit,max(2,live + 1)) }
     let attempts = 0
-    while connection.localIds.length < target {
+    while live < target {
         if connection.nextLocalSequence > wire.MAX_VARINT || attempts >= 8 { terminate(connection, 1, "connection ID generation exhausted"); return }
         attempts += 1
         let entropy = randomBytes(24)
@@ -247,10 +249,24 @@ function issueConnectionIds(connection: Connection) {
         connection.localIds.add(ConnectionId { sequence: sequence; id: id; token: token }); connection.connectionIdVersion += 1
         let prior = sequence
         for known in connection.localIds { prior = min(prior, known.sequence) }
+        prior = max(prior,connection.localRetirePrior)
         let frame = Bytes(); add(frame, 24); add(frame, sequence); add(frame, prior)
         frame.add(id.length); frame.addBytes(id); frame.addBytes(token)
         enqueue(connection, 2, frame, false)
+        live += 1
     }
+}
+function pressureConnectionIds(connection: Connection) {
+    let limit = min(connection.peerIdLimit,8);let live = 0;let oldest = -1;let newest = -1;let id = Bytes()
+    for known in connection.localIds {
+        if known.sequence < connection.localRetirePrior { return }
+        live += 1;newest = max(newest,known.sequence)
+        if oldest < 0 || known.sequence < oldest { oldest = known.sequence;id = known.id }
+    }
+    if live < limit || oldest < 0 || oldest >= newest || newest > connection.highestAuthenticatedLocalSequence { return }
+    for path in connection.paths { if equal(path.localId,id) { return } }
+    connection.localRetirePrior = oldest + 1
+    issueConnectionIds(connection)
 }
 function parameters(local: Bytes, original: Bytes, server: Boolean): Bytes {
     let result = Bytes()
@@ -305,7 +321,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         paceCredit: 12000.0; paceAt: -1; paceNext: -1
         ackExponent: 3; idleTimeout: 45000; failedAuthentication: 0
         activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); remoteSequence: 0; remoteId: destination; localId: local; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
-        highestAuthenticatedLocalSequence: 0
+        highestAuthenticatedLocalSequence: 0; localRetirePrior: 0
     }
     if entropy.length < 80 || destination.length < 1 || destination.length > 20 { terminate(result, 1, "invalid QUIC entropy or destination connection ID") }
     return result
@@ -1398,7 +1414,9 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             continue
         }
         if level == 2 && packet.number == space.largest { path.localId = header.destination }
+        let peerChallenge = false
         for frame in parsed.frames {
+            if frame.type == 26 { peerChallenge = true }
             processFrame(connection, level, frame, header.destination)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
@@ -1409,6 +1427,11 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
            connection.state == ESTABLISHED && connection.confirmed && !connection.closing && !connection.draining {
             connection.highestAuthenticatedLocalSequence = localSequence
             issueConnectionIds(connection)
+            if connection.state == FAILED || connection.state == CLOSED { return }
+        }
+        if peerChallenge && localSequence == connection.highestAuthenticatedLocalSequence && header.kind == wire.ONE_RTT &&
+           connection.state == ESTABLISHED && connection.confirmed && !connection.closing && !connection.draining {
+            pressureConnectionIds(connection)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
         // A key-phase response can itself contain only ACK frames. Confirm
