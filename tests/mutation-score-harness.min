@@ -1,5 +1,9 @@
 use "../tools/testing.min" as test
 use "../tools/mutation.min" as mutation
+use "../tools/mutation-campaign.min" as campaign
+use "system" as system
+use "files" as files
+use "json" as json
 function outcome(kind: Text): mutation.Outcome { return mutation.Outcome { kind: kind; stage: "test" } }
 let source = "let values: List<Integer> = []\n// == !=\n/* >= */\nprint(\"<= &&\")\nif 1 <= 2 && 3 > 2 {}"
 let sites = mutation.discover(source)
@@ -25,3 +29,65 @@ test.check(mutation.gate(true, 100, passing, 85) == "", "exact 85 percent floor 
 passing[0] = outcome("survived")
 test.check(mutation.gate(true, 100, passing, 85) != "", "84 percent fails unchanged floor")
 print("Minyar mutation score controls: passed")
+let work = test.scratch()
+let serial = 0
+function control(work: Text, serial: Integer, seedStatus: Integer, linkStatus: Integer, check: Text, source: Text, minimum: Float, jobs: Integer, worker: Text): json.Value {
+    let root = work + "/case-" + Text(serial)
+    test.check(files.makeDirectory(root) == 0 && files.makeDirectory(root + "/build") == 0, "campaign control directories")
+    writeTextFile(root + "/source.min", source)
+    for name in ["baseline", "runtime", "compiler-runtime"] { writeTextFile(root + "/" + name, name) }
+    let seed = "#!/bin/sh\nset -eu\n"
+    if seedStatus == 124 { seed += "/bin/sleep 5\n" }
+    if seedStatus != 0 { seed += "exit " + Text(seedStatus) + "\n" }
+    else { seed += "printf 'fixture\\n' >\"$3\"\n" }
+    writeTextFile(root + "/seed", seed)
+    writeTextFile(root + "/clang", "#!/bin/sh\nset -eu\nlast=''\nfor arg in \"$@\"; do last=$arg; done\nprintf 'fixture\\n' >\"$last\"\nexit " + Text(linkStatus) + "\n")
+    test.require(test.run(["chmod", "+x", root + "/seed", root + "/clang"], system.environment(), "", root + "/permissions", 10), "control tool permissions")
+    let config = campaign.Campaign { root: root; source: root + "/source.min"; baseline: root + "/baseline"; seed: root + "/seed"; compilerRuntime: root + "/compiler-runtime"; runtime: root + "/runtime"; clang: root + "/clang"; minimum: minimum; limit: 16; jobs: jobs; timeout: 1; checks: [campaign.Command { arguments: ["/bin/sh", "-c", check] }]; work: root + "/campaign"; workerExecutable: worker }
+    let passed = campaign.run(config)
+    let report = json.parse(readTextFile(root + "/build/mutation-score.json"))
+    test.check((json.string(report, "gate_failure") == "") == passed, "campaign result matches actual process gate")
+    return report
+}
+let kill = "test -f \"$MINYAR_TEST_SOURCE\" || exit 127; case \"$MINYAR_TEST_COMPILER\" in */baseline) exit 0;; *) exit 9;; esac"
+let single = "if 1 == 2 {}"
+let killed = control(work, 0, 0, 0, kill, single, 85.0, 1, argument(0))
+test.check(json.member(killed, "baseline_passed").truth && json.member(killed, "killed_mutants").number == 1.0 && json.member(killed, "score_percent").number == 100.0, "real child failure kills the mutant after a passing baseline")
+let survived = control(work, 1, 0, 0, "exit 0", single, 85.0, 1, argument(0))
+test.check(json.member(survived, "viable_mutants").number == 1.0 && json.member(survived, "score_percent").number == 0.0 && json.string(survived, "gate_failure") != "", "surviving mutant fails 85 percent floor")
+let baselineFailed = control(work, 2, 0, 0, "printf partial >&2; exit 9", single, 85.0, 1, argument(0))
+test.check(!json.member(baselineFailed, "baseline_passed").truth && json.member(baselineFailed, "outcomes").items.length == 0 && json.member(baselineFailed, "killed_mutants").number == 0.0, "failing baseline cannot become killed mutants")
+test.check(json.string(json.member(baselineFailed, "commands").items[0], "stderr") == "partial", "failed baseline diagnostics are retained")
+let baselineTimeout = control(work, 3, 0, 0, "printf started; printf partial >&2; sleep 5", single, 85.0, 1, argument(0))
+test.check(!json.member(baselineTimeout, "baseline_passed").truth && json.member(json.member(baselineTimeout, "commands").items[0], "timed_out").truth, "timed-out baseline fails before mutation and preserves partial output")
+test.check(json.string(json.member(baselineTimeout, "commands").items[0], "stderr") == "partial", "timeout does not lose partial diagnostics")
+let noSites = control(work, 4, 0, 0, "exit 0", "print(42)", 0.0, 1, argument(0))
+test.check(json.member(noSites, "selected_sites").number == 0.0 && json.member(noSites, "score_percent").kind == json.NULL && json.string(noSites, "gate_failure") != "", "empty campaigns fail even with zero floor")
+for status in [9, 124, 127] {
+    let report = control(work, 5 + status, status, 0, "exit 0", single, 0.0, 1, argument(0))
+    test.check(json.member(report, "viable_mutants").number == 0.0 && json.string(report, "gate_failure") != "", "build failure, timeout and missing tool never count as viable")
+}
+let failedLink = control(work, 200, 0, 9, "exit 0", single, 0.0, 1, argument(0))
+test.check(json.member(failedLink, "stillborn_mutants").number == 1.0 && json.string(failedLink, "gate_failure") != "", "failed link cannot satisfy the gate")
+let ordered = control(work, 201, 0, 0, "test -f \"$MINYAR_TEST_SOURCE\" || exit 127; case \"$MINYAR_TEST_COMPILER\" in */mutant-1) exit 9;; *) exit 0;; esac", "if 1 == 2 {}\nif 3 == 4 {}\nif 5 == 6 {}", 0.0, 3, argument(0))
+let outcomes = json.member(ordered, "outcomes").items
+test.check(outcomes.length == 3 && json.string(outcomes[0], "outcome") == "survived" && json.string(outcomes[1], "outcome") == "killed" && json.string(outcomes[2], "outcome") == "survived", "parallel workers retain campaign order and exact outcomes")
+test.check(json.member(outcomes[0], "line").number == 1.0 && json.member(outcomes[1], "line").number == 2.0 && json.member(outcomes[2], "line").number == 3.0, "parallel mutant metadata retains source order")
+for row in json.member(ordered, "commands").items {
+    let phase = json.string(row, "phase")
+    let compiler = json.string(row, "compiler")
+    let source = json.string(row, "compiler_source")
+    if phase == "baseline" { test.check(test.contains(compiler, "/baseline") && test.contains(source, "/source.min"), "baseline receives actual source and compiler") }
+    else if test.contains(phase, ":test") { test.check(test.contains(compiler, "/mutant-") && test.contains(source, "/mutant-") && test.contains(source, ".min"), "every mutant suite receives its private compiler and source") }
+}
+let fuzz = campaign.Command { arguments: ["python3", "tests/fuzz.py"] }
+let first = campaign.arguments(fuzz, work + "/first")
+let second = campaign.arguments(fuzz, work + "/second")
+test.check(first[first.length - 1] != second[second.length - 1], "concurrent campaigns keep private fuzz output paths")
+let env = campaign.environment(campaign.Campaign { root: work; source: ""; baseline: ""; seed: ""; compilerRuntime: ""; runtime: "runtime"; clang: ""; minimum: 85.0; limit: 16; jobs: 1; timeout: 1; checks: []; work: ""; workerExecutable: "" }, "compiler", "source", work)
+test.check(test.contains(joinText(env), "MINYAR_MODULE_TEST_DIR=" + work + "/module-tests"), "concurrent module tests keep private output paths")
+let checkNames = ""
+for command in campaign.checks("root") { checkNames += joinText(command.arguments) }
+for name in ["source-map", "symbol-order", "readonly-parameters", "compiler-contracts", "thread-compiler"] { test.check(test.contains(checkNames, name), "campaign retains internal and parameter optimization suite: " + name) }
+test.removeTree(work)
+print("native mutation campaign process controls: passed")
