@@ -7,8 +7,8 @@ check-conformance`. Rejection wording is indexed separately by
 
 | Specification requirement | Primary conformance evidence | Negative and boundary evidence |
 | --- | --- | --- |
-| Bindings, lexical blocks, assignment, and shadowing | `bindings-and-scope/program.min` | `tests/adversarial.py`, `tests/readonly-parameters.py` |
-| 64-bit arithmetic, comparisons, Boolean-only conditions, and evaluation | `numbers-and-comparisons/program.min` | `tests/errors/integer-too-large.min`, `tests/runtime/integer-overflow.min`, `tests/runtime/divide-by-zero.min`, `tests/adversarial.py` |
+| Bindings, lexical blocks, assignment, and shadowing | `bindings-and-scope/program.min` | `tests/adversarial.min`, `tests/readonly-parameters.py` |
+| 64-bit arithmetic, comparisons, Boolean-only conditions, and evaluation | `numbers-and-comparisons/program.min` | `tests/errors/integer-too-large.min`, `tests/runtime/integer-overflow.min`, `tests/runtime/divide-by-zero.min`, `tests/adversarial.min` |
 | Unicode Text, Character, indexing, slicing, conversions, and joining | `text-and-lists/program.min` | `tests/regressions.py`, `tests/runtime/text-slice-out-of-bounds.min`, `tests/integer-text-cache.py` |
 | List literals, inference, aliases, append, replacement, and bounds | `text-and-lists/program.min` | `tests/runtime/lists.min`, `tests/runtime/list-out-of-bounds.min`, `tests/ownership.min` |
 | Automatic lifetime, aliases, recursive acyclic values, fresh-List recursive construction, and cycle rejection | `memory-lifetime/program.min` | `tests/recursive-data.py`, `tests/production-memory.min`, `tests/ownership-mutation.py` |
