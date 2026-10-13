@@ -1,0 +1,92 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Context { directory: Text; clang: Text; environment: List<Text>; serial: List<Integer>; codecTools: Text }
+public function context(clang: Text): Context { return Context { directory: test.scratch(); clang: clang; environment: system.environment(); serial: [0]; codecTools: test.setting("MINYAR_COMPRESSION_PROVIDER_TOOLS", "tools") } }
+public function run(context: Context, command: List<Text>, seconds: Integer): test.Result {
+    context.serial[0] += 1
+    let log = context.directory + "/operation-" + Text(context.serial[0])
+    if seconds > 0 { return test.run(command, context.environment, "", log, seconds) }
+    let argv = ["sh", "-c", "log=$1; shift; exec /usr/bin/env -- \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", log]
+    for item in command { argv.add(item) }
+    return test.finish(system.spawn("/bin/sh", argv, context.environment, ""), log)
+}
+public function require(context: Context, command: List<Text>, seconds: Integer) { test.require(run(context, command, seconds), "provider fixture operation") }
+public function joined(flags: List<Text>): Text {
+    let result: List<Text> = []
+    for index in 0..flags.length { if index > 0 { result.add(" ") }; result.add("'" + test.replace(flags[index], "'", "'\\''") + "'") }
+    return joinText(result)
+}
+public function query(context: Context, kind: Text, format: Boolean, compileFlags: List<Text>, linkFlags: List<Text>): test.Result {
+    let command: List<Text> = []
+    if format { command = ["python3", "tools/format_provider.py", kind, "--clang", context.clang, "--flags=" + joined(compileFlags), "--link-flags=" + joined(linkFlags)] }
+    else {
+        command = ["python3", context.codecTools + "/compression_provider.py", kind, "--clang", context.clang]
+        for flag in compileFlags { command.add("--compile-flag=" + flag) }
+        for flag in linkFlags { command.add("--link-flag=" + flag) }
+    }
+    return run(context, command, 0)
+}
+public function info(context: Context, kind: Text, format: Boolean, compileFlags: List<Text>, linkFlags: List<Text>): json.Value {
+    let result = query(context, kind, format, compileFlags, linkFlags)
+    test.require(result, "actual provider resolution")
+    let value = json.parse(result.output)
+    test.check(value.kind == json.OBJECT, "invalid provider query object")
+    return value
+}
+public function rejected(result: test.Result, reason: Text) { test.check(result.status != 0 && test.contains(result.output + result.errorOutput, reason), "provider rejection did not contain " + reason + "\n" + result.output + result.errorOutput) }
+public function strings(value: json.Value, name: Text): List<Text> {
+    let items = json.member(value, name)
+    test.check(items.kind == json.ARRAY, "missing provider argument array " + name)
+    let result: List<Text> = []
+    for item in items.items { test.check(item.kind == json.STRING, "non-text provider argument"); result.add(item.text) }
+    return result
+}
+public function same(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = -1
+    for index in 0..raw.length { if raw[index] == 47 { slash = index } }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return Text(raw.slice(0, slash))
+}
+public function basename(path: Text): Text { let raw = Bytes(path); let directory = parent(path); let begin = directory.byteLength + 1; if directory == "." { begin = 0 }; if directory == "/" { begin = 1 }; return Text(raw.slice(begin, raw.length)) }
+public function child(path: Text, prefix: Text): Boolean {
+    let raw = Bytes(path)
+    let directory = Bytes(prefix)
+    return raw.length > directory.length && Text(raw.slice(0, directory.length)) == prefix && raw[directory.length] == 47
+}
+public function contains(values: List<Text>, wanted: Text): Boolean { for value in values { if value == wanted { return true } }; return false }
+public function directory(context: Context): Text {
+    context.serial[0] += 1
+    let path = context.directory + "/case-" + Text(context.serial[0])
+    test.check(files.makeDirectory(path) == 0, "cannot create private provider fixture")
+    return path
+}
+public function included(value: json.Value): Text {
+    let flags = strings(value, "cflags")
+    for index in 0..flags.length { if flags[index] == "-isystem" && index + 1 < flags.length { return flags[index + 1] } }
+    fail("missing provider system include")
+    return ""
+}
+public function setEnvironment(context: Context, name: Text, value: Text) { context.environment = support.environment(context.environment, name, value) }
+public function selected(name: Text, selectors: List<Text>): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "Providers" || selector == name || selector == "Providers." + name { return true } }
+    return false
+}
+public function validate(names: List<Text>, selectors: List<Text>) {
+    for selector in selectors {
+        let found = selector == "Providers"
+        for name in names { if selector == name || selector == "Providers." + name { found = true } }
+        test.check(found, "unknown provider test selector: " + selector)
+    }
+}

@@ -1,0 +1,101 @@
+use "../tools/testing.min" as test
+use "./provider-test-support.min" as provider
+use "system" as system
+use "files" as files
+
+function prefix(context: provider.Context, include: Text): Text {
+    let path = provider.directory(context) + "/provider space's"
+    provider.require(context, ["mkdir", "-p", "--", path + "/include", path + "/lib"], 0)
+    for name in ["zstd.h", "zstd_errors.h"] { provider.require(context, ["cp", "--", include + "/" + name, path + "/include/" + name], 0) }
+    return path
+}
+function rejectArchive(context: provider.Context, prefix: Text, reason: Text) {
+    let original = context.environment
+    provider.setEnvironment(context, "MINYAR_ZSTD_PREFIX", prefix)
+    provider.rejected(provider.query(context, "zstd", false, [], []), reason)
+    context.environment = original
+}
+
+let names = ["test_matched_real_archive_and_effective_flags", "test_renamed_real_shared_library_rejected", "test_link_script_and_thin_archive_rejected", "test_short_coff_import_archive_rejected", "test_archive_without_advanced_definitions_rejected", "test_foreign_primary_and_secondary_headers_rejected", "test_literal_backslash_prefix_has_explicit_diagnostic"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() { let option = argument(index); if option != "-v" && option != "-q" { selectors.add(option) } }
+provider.validate(names, selectors)
+let context = provider.context(test.setting("MINYAR_TEST_CLANG", "clang"))
+let baseline = provider.info(context, "zstd", false, [], [])
+let include = provider.included(baseline)
+let libraries = provider.strings(baseline, "libraries")
+test.check(libraries.length > 0, "missing real zstd archive")
+let archive = libraries[0]
+if provider.selected(names[0], selectors) {
+    let path = prefix(context, include)
+    provider.require(context, ["cp", "--", archive, path + "/lib/libzstd.a"], 0)
+    let original = context.environment
+    provider.setEnvironment(context, "MINYAR_ZSTD_PREFIX", path)
+    let first = provider.info(context, "zstd", false, ["-O1"], ["-O1"])
+    test.check(provider.strings(first, "libraries")[0] == path + "/lib/libzstd.a", "effective flags selected a different zstd archive")
+    let before = provider.strings(first, "cflags")
+    let header = path + "/include/zstd_errors.h"
+    writeTextFile(header, readTextFile(header) + "\n")
+    test.check(!provider.same(before, provider.strings(provider.info(context, "zstd", false, [], []), "cflags")), "secondary zstd header changed without fingerprint refresh")
+    context.environment = original
+}
+if provider.selected(names[1], selectors) {
+    let shared = ""
+    for name in ["libzstd.dylib", "libzstd.so"] {
+        let candidate = provider.parent(archive) + "/" + name
+        if files.pathSize(candidate) >= 0 { shared = candidate; break }
+    }
+    if shared == "" { print("SKIP provider has no shared-library fixture") }
+    else { let path = prefix(context, include); provider.require(context, ["cp", "--", shared, path + "/lib/libzstd.a"], 0); rejectArchive(context, path, "real static archive") }
+}
+if provider.selected(names[2], selectors) {
+    let path = prefix(context, include)
+    for payload in ["INPUT(-lzstd)\n", "!<thin>\n"] { writeTextFile(path + "/lib/libzstd.a", payload); rejectArchive(context, path, "real static archive") }
+}
+if provider.selected(names[3], selectors) {
+    let path = prefix(context, include)
+    let member = provider.parent(path) + "/import.o"
+    let data = Bytes(20)
+    data[2] = 255; data[3] = 255
+    for byte in Bytes("ZSTD_createDDict_advanced") { data.add(byte) }
+    data.add(0)
+    for byte in Bytes("zstd.dll") { data.add(byte) }
+    data.add(0)
+    writeBytesFile(member, data)
+    provider.require(context, ["ar", "rcs", path + "/lib/libzstd.a", member], 0)
+    rejectArchive(context, path, "real static archive")
+}
+if provider.selected(names[4], selectors) {
+    let path = prefix(context, include)
+    let source = provider.parent(path) + "/other.c"
+    let object = provider.parent(path) + "/other.o"
+    writeTextFile(source, "int unrelated(void) { return 1; }\n")
+    provider.require(context, [context.clang, "-c", source, "-o", object], 0)
+    provider.require(context, ["ar", "rcs", path + "/lib/libzstd.a", object], 0)
+    rejectArchive(context, path, "missing static definitions")
+}
+if provider.selected(names[5], selectors) {
+    for codec in ["zstd", "deflate"] {
+        let original = provider.info(context, codec, false, [], [])
+        let headers = ["zstd.h", "zstd_errors.h"]
+        if codec == "deflate" { headers = ["zlib.h", "zconf.h"] }
+        let directory = provider.directory(context)
+        for name in headers {
+            let foreign = directory + "/" + name
+            provider.require(context, ["cp", "--", provider.included(original) + "/" + name, foreign], 0)
+            let options = ["-I", directory]
+            if name == "zconf.h" { options = ["-include", foreign] }
+            provider.rejected(provider.query(context, codec, false, options, []), "headers must belong to provider prefix")
+            test.check(files.remove(foreign) == 0, "cannot remove foreign provider header")
+        }
+    }
+}
+if provider.selected(names[6], selectors) {
+    let path = prefix(context, include)
+    let target = provider.parent(path) + "/provider back\\slash"
+    test.check(files.rename(path, target) == 0, "cannot rename literal-backslash prefix")
+    provider.require(context, ["cp", "--", archive, target + "/lib/libzstd.a"], 0)
+    rejectArchive(context, target, "literal backslash provider paths are unsupported")
+}
+test.removeTree(context.directory)
+print("compression provider: all selected contracts passed")

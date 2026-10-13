@@ -1,0 +1,373 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in start..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let position = 0
+    while true {
+        let matched = find(source, needle, position)
+        if matched < 0 { return found }
+        found += 1
+        position = matched + Bytes(needle).length
+    }
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "OwnershipPolicy." + name { return true } }
+    return false
+}
+record Configuration { work: Text; clang: Text; compiler: Text; moduleCompiler: Text; driver: Text; runtimeDirectory: Text; serial: Integer }
+record Stage { label: Text; budget: Text; reused: Integer }
+function run(configuration: Configuration, command: List<Text>, success: Boolean): test.Result {
+    configuration.serial += 1
+    let result = test.run(command, system.environment(), "", configuration.work + "/run" + Text(configuration.serial), 120)
+    test.check(result.status != 124 && result.status != 137, "ownership policy process timeout\n" + result.output + result.errorOutput)
+    test.check((result.status == 0) == success, "ownership policy tool status\n" + joinText(command) + "\n" + result.output + result.errorOutput)
+    return result
+}
+function mkdir(path: Text) { test.check(files.makeDirectory(path) == 0, "ownership policy fixture directory") }
+function pack(fields: List<Text>): Text {
+    let pieces: List<Text> = []
+    for field in fields { pieces.add(Text(field.length) + "\n" + field) }
+    return joinText(pieces)
+}
+function ownersSource(publicFunctions: Boolean): Text {
+    let pieces: List<Text> = []
+    for number in 1..10 {
+        if publicFunctions { pieces.add("public ") }
+        pieces.add("function owners" + Text(number) + "(seed: Integer): Text {\n")
+        for index in 0..number { pieces.add("let value" + Text(index) + " = Text(seed + " + Text(index) + ")\n") }
+        pieces.add("return ")
+        for index in 0..number {
+            if index > 0 { pieces.add(" + ") }
+            pieces.add("value" + Text(index))
+        }
+        pieces.add("\n}\n")
+    }
+    return joinText(pieces)
+}
+function expectedOwners(number: Integer): Text {
+    let pieces: List<Text> = []
+    for index in 0..number { pieces.add(Text(40000 + index)) }
+    pieces.add("\n")
+    return joinText(pieces)
+}
+function native(configuration: Configuration, llvm: Text, budget: Text, expected: Text) {
+    let runtime = configuration.work + "/runtime-" + budget + ".o"
+    if files.pathSize(runtime) < 0 {
+        let wrapper = configuration.work + "/runtime-" + budget + ".c"
+        let source = "#include \"minyar_runtime.c\"\n"
+        if budget != "1" { source += "#include \"minyar_stack_frames.h\"\n" }
+        writeTextFile(wrapper, source)
+        run(configuration, [configuration.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=" + budget, "-iquote", configuration.runtimeDirectory, "-c", wrapper, "-o", runtime], true)
+    }
+    let raw = Bytes(llvm)
+    test.check(ends(llvm, ".ll"), "ownership policy LLVM fixture extension")
+    let binary = Text(raw.slice(0, raw.length - 3)) + ".program"
+    run(configuration, [configuration.clang, "-O1", "-Wno-override-module", llvm, runtime, "-o", binary, "-lm"], true)
+    let result = run(configuration, [binary], true)
+    test.check(result.output == expected && result.errorOutput == "", "ownership policy native output\n" + result.output + result.errorOutput)
+}
+record Function { header: Text; body: Text }
+function functions(source: Text): List<Function> {
+    let result: List<Function> = []
+    let header = ""
+    let pieces: List<Text> = []
+    for line in test.lines(source) {
+        if header == "" && starts(line, "define ") { header = line; pieces = [line + "\n"] }
+        else if header != "" {
+            pieces.add(line)
+            if line == "}" { result.add(Function { header: header; body: joinText(pieces) }); header = ""; pieces = [] }
+            else { pieces.add("\n") }
+        }
+    }
+    test.check(header == "", "ownership policy unterminated LLVM function")
+    return result
+}
+function symbol(name: Text, modules: Boolean): Text {
+    if modules { return "@\".minyar.fn.minyar.module|" + name + "|" }
+    return "@.minyar.fn." + name + "("
+}
+function body(definitions: List<Function>, name: Text, modules: Boolean): Function {
+    for definition in definitions { if test.contains(definition.header, symbol(name, modules)) { return definition } }
+    fail("ownership policy missing emitted function " + name)
+    return Function { header: ""; body: "" }
+}
+function decimalSymbol(header: Text, prefix: Text, delimiter: Text): Text {
+    let position = find(header, prefix, 0)
+    if position < 0 { return "" }
+    let raw = Bytes(header)
+    let start = position + Bytes(prefix).length
+    let ending = start
+    while ending < raw.length && raw[ending] >= 48 && raw[ending] <= 57 { ending += 1 }
+    if ending == start || !starts(Text(raw.slice(ending, raw.length)), delimiter) { return "" }
+    return Text(raw.slice(start, ending))
+}
+function selected(llvm: Text, budget: Text, modules: Boolean) {
+    let definitions = functions(readTextFile(llvm))
+    let limit = 0
+    if budget != "" {
+        let value = 0
+        for byte in Bytes(budget) { if value < 9 { value = value * 10 + byte - 48 } }
+        limit = value - 1
+        if limit > 8 { limit = 8 }
+    }
+    let seen: List<Boolean> = []
+    for index in 0..9 { seen.add(false) }
+    for definition in definitions {
+        if ends(definition.header, " noinline {") {
+            let prefix = "@.minyar.fn.owners"
+            let delimiter = "("
+            if modules { prefix = "@\".minyar.fn.minyar.module|owners"; delimiter = "|" }
+            let number = decimalSymbol(definition.header, prefix, delimiter)
+            if number != "" {
+                let owner = Integer(number)
+                test.check(owner >= 1 && owner <= limit, "ownership policy unexpected selected owner " + number + " budget " + budget)
+                seen[owner] = true
+            }
+        }
+    }
+    for number in 1..9 {
+        test.check(seen[number] == (number <= limit), "ownership policy exact selected owner set " + Text(number) + " budget " + budget)
+        if seen[number] {
+            let owner = body(definitions, "owners" + Text(number), modules)
+            test.check(ends(owner.header, " noinline {"), "ownership policy selected function header")
+            test.check(count(owner.body, "call void @minyar_stack_enter()") == 1, "ownership policy stack-enter count")
+            test.check(count(owner.body, "call void @minyar_rc_enter_stack_v1(") == 1, "ownership policy frame-enter count")
+            test.check(!test.contains(owner.body, "call void @minyar_rc_enter(i64"), "stack ownership must replace the heap frame")
+        }
+    }
+    let caller = body(definitions, "caller", modules)
+    test.check(!test.contains(caller.header, "noinline"), "ownership policy caller function boundary")
+    test.check(!test.contains(caller.body, "@minyar_rc_enter_stack_v1") && !test.contains(caller.body, "@minyar_rc_leave_stack_v1"), "ownership policy caller must not use bounded frame")
+    test.check(test.contains(caller.body, "@minyar_rc_enter("), "ownership policy caller heap frame")
+}
+function stats(path: Text, reused: Integer, compiled: Integer) {
+    let fields = test.words(readTextFile(path))
+    test.check(fields.length >= 2 && Integer(fields[0]) == reused && Integer(fields[1]) == compiled, "ownership policy exact reuse/compile stats " + path)
+}
+function direct(configuration: Configuration, directory: Text, entry: Text, label: Text, previous: Text, state: Text, budget: Text, reused: Integer, compiled: Integer): Text {
+    let llvm = directory + "/" + label + ".ll"
+    let report = directory + "/" + label + ".stats"
+    run(configuration, [configuration.moduleCompiler, entry, llvm, "--module-state", previous, state, report, "--bounded-owners", budget], true)
+    stats(report, reused, compiled)
+    return llvm
+}
+function noInvocations(path: Text) {
+    let names = files.list(path)
+    test.check(files.lastError() == 0, "ownership policy cache directory")
+    for name in names { test.check(!starts(name, "invocation."), "ownership policy leftover invocation storage") }
+}
+let names = ["test_ordinary_budget_selection_and_errors", "test_callback_budget_preserves_environment_and_function_boundary", "test_loop_backedges_service_debt_only_in_ownership_functions", "test_source_runtime_names_keep_bounded_ownership_calls_separate", "test_module_policy_transitions_and_native_output", "test_source_edit_delta_direct_and_driver"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "OwnershipPolicy." + name { valid = true } }
+    test.check(valid, "unknown ownership policy case " + argument(index))
+}
+let configuration = Configuration { work: test.scratch(); clang: test.setting("MINYAR_TEST_CLANG", "clang"); compiler: test.setting("MINYAR_TEST_COMPILER", "./build/minyarc"); moduleCompiler: test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules"); driver: test.setting("MINYAR_MODULE_DRIVER", "./build/minyar-module-build"); runtimeDirectory: test.setting("MINYAR_TEST_RUNTIME_SOURCE_DIRECTORY", "runtime"); serial: 0 }
+let budgets = ["1", "2", "8", "9", "32"]
+let invalid = ["", "0", "000", "-1", "+1", "2x", "9x", "1.0", "１２"]
+if chosen("test_ordinary_budget_selection_and_errors") {
+    let source = configuration.work + "/ordinary.min"
+    writeTextFile(source, ownersSource(false) + "function caller(seed: Integer): Text { let value = owners8(seed); return value }\nprint(caller(40000))\n")
+    let ordinary = configuration.work + "/ordinary.ll"
+    run(configuration, [configuration.compiler, source, ordinary], true)
+    let allBudgets = ["1", "2", "8", "9", "32", "1024", "0002", "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"]
+    for budget in allBudgets {
+        let llvm = configuration.work + "/budget-" + budget + ".ll"
+        run(configuration, [configuration.compiler, source, llvm, "--bounded-owners", budget], true)
+        selected(llvm, budget, false)
+        if budget == "1" { test.check(readTextFile(llvm) == readTextFile(ordinary), "K1 byte-identical ordinary LLVM") }
+        for configured in budgets { if budget == configured { native(configuration, llvm, budget, expectedOwners(8)) } }
+    }
+    for compilerIndex in 0..2 {
+        let compiler = configuration.compiler
+        if compilerIndex == 1 { compiler = configuration.moduleCompiler }
+        for index in 0..invalid.length {
+            let llvm = configuration.work + "/invalid-" + Text(compilerIndex) + "-" + Text(index) + ".ll"
+            let result = run(configuration, [compiler, source, llvm, "--bounded-owners", invalid[index]], false)
+            test.check(test.contains(result.output + result.errorOutput, "cleanup budget must be a positive decimal integer"), "ownership policy malformed budget diagnostic")
+            test.check(files.pathSize(llvm) < 0, "ownership policy invalid budget emitted LLVM")
+        }
+    }
+}
+if chosen("test_callback_budget_preserves_environment_and_function_boundary") {
+    let source = configuration.work + "/callback.min"
+    let llvm = configuration.work + "/callback.ll"
+    writeTextFile(source, "let formatter = function(seed: Integer): Text {\nlet value = Text(seed)\nreturn value\n}\nprint(formatter(42))\n")
+    run(configuration, [configuration.compiler, source, llvm, "--bounded-owners", "2"], true)
+    let found = false
+    for definition in functions(readTextFile(llvm)) {
+        if !found && ends(definition.header, " noinline {") && decimalSymbol(definition.header, "@.minyar.closure.", "(") != "" {
+            found = true
+            test.check(count(definition.body, "@minyar_callback_check_environment(") == 1, "ownership callback environment check count")
+            test.check(count(definition.body, "@minyar_rc_enter_stack_v1(") == 1, "ownership callback stack frame count")
+        }
+    }
+    test.check(found, "ownership policy emitted bounded callback function")
+    let binary = configuration.work + "/callback.program"
+    run(configuration, [test.setting("MINYAR_PUBLIC_LAUNCHER", "./minyar"), "--memory-profile", "system", "--cleanup-budget", "2", source, "-o", binary], true)
+    let result = run(configuration, [binary], true)
+    test.check(result.output == "42\n" && result.errorOutput == "", "ownership callback launcher result")
+}
+if chosen("test_loop_backedges_service_debt_only_in_ownership_functions") {
+    let source = configuration.work + "/loop-service.min"
+    let llvm = configuration.work + "/loop-service.ll"
+    writeTextFile(source, "function owned(count: Integer): Integer {\n let text = Text(count)\n let position = 0\n while position < count { position = position + 1 }\n print(text)\n return position\n}\nfunction scalar(count: Integer): Integer {\n let position = 0\n while position < count { position = position + 1 }\n return position\n}\nprint(owned(3))\nprint(scalar(3))\n")
+    run(configuration, [configuration.compiler, source, llvm], true)
+    let definitions = functions(readTextFile(llvm))
+    test.check(test.contains(body(definitions, "owned", false).body, "@minyar_rc_step()"), "ownership function loop backedge must service debt")
+    test.check(!test.contains(body(definitions, "scalar", false).body, "@minyar_rc_step()"), "scalar loop backedge must not service ownership debt")
+}
+if chosen("test_source_runtime_names_keep_bounded_ownership_calls_separate") {
+    let definitions = "function minyar_rc_enter_stack_v1(seed: Integer): Text {\nlet value = Text(seed) + \"enter\"\nreturn value\n}\nfunction minyar_rc_leave_stack_v1(seed: Integer): List<Integer> {\nlet values = [seed, seed + 1]\nreturn values\n}\n"
+    let sourceBody = "function work(seed: Integer): Text {\nlet text = PREFIXminyar_rc_enter_stack_v1(seed)\nlet values = PREFIXminyar_rc_leave_stack_v1(seed)\nreturn text + \" \" + Text(values[1])\n}\nprint(work(41))\n"
+    for modules in [false, true] {
+        let directory = configuration.work + "/runtime-names-ordinary"
+        if modules { directory = configuration.work + "/runtime-names-module" }
+        mkdir(directory)
+        let source = directory + "/main.min"
+        if modules {
+            writeTextFile(directory + "/helpers.min", test.replace(definitions, "function ", "public function "))
+            writeTextFile(source, "use \"./helpers.min\" as helpers\n" + test.replace(sourceBody, "PREFIX", "helpers."))
+        } else { writeTextFile(source, definitions + test.replace(sourceBody, "PREFIX", "")) }
+        let llvm = directory + "/main.ll"
+        if modules {
+            let empty = directory + "/empty"
+            writeTextFile(empty, "")
+            run(configuration, [configuration.moduleCompiler, source, llvm, "--module-state", empty, directory + "/state", directory + "/stats", "--bounded-owners", "9"], true)
+        } else { run(configuration, [configuration.compiler, source, llvm, "--bounded-owners", "9"], true) }
+        let generated = readTextFile(llvm)
+        for name in ["minyar_rc_enter_stack_v1", "minyar_rc_leave_stack_v1"] {
+            let emittedDefinition = false
+            let emittedCall = false
+            for line in test.lines(generated) {
+                if starts(line, "define ") && test.contains(line, symbol(name, modules)) { emittedDefinition = true }
+                if test.contains(line, "call ") && test.contains(line, symbol(name, modules)) { emittedCall = true }
+            }
+            test.check(emittedDefinition && emittedCall, "ownership policy user/runtime symbol separation " + name)
+            test.check(test.contains(generated, "call void @" + name + "("), "ownership policy separate runtime bounded-owner call " + name)
+        }
+        native(configuration, llvm, "9", "41enter 42\n")
+    }
+}
+if chosen("test_module_policy_transitions_and_native_output") {
+    let directory = configuration.work + "/policy"
+    mkdir(directory)
+    writeTextFile(directory + "/owners.min", ownersSource(true))
+    let entry = directory + "/main.min"
+    let source = "use \"./owners.min\" as owners\nfunction caller(seed: Integer): Text { let value = owners.owners8(seed); return value }\nprint(caller(40000))\n"
+    let expected = expectedOwners(8)
+    for number in 1..10 { source += "print(owners.owners" + Text(number) + "(40000))\n"; expected += expectedOwners(number) }
+    writeTextFile(entry, source)
+    let state = directory + "/empty"
+    writeTextFile(state, "")
+    let sequence = [
+        Stage { label: "ordinary-cold"; budget: ""; reused: 0 },
+        Stage { label: "ordinary-warm"; budget: ""; reused: 2 },
+        Stage { label: "k1"; budget: "1"; reused: 2 },
+        Stage { label: "k2"; budget: "2"; reused: 0 },
+        Stage { label: "k2-warm"; budget: "2"; reused: 2 },
+        Stage { label: "k8"; budget: "8"; reused: 0 },
+        Stage { label: "k9"; budget: "9"; reused: 0 },
+        Stage { label: "k32"; budget: "32"; reused: 2 },
+        Stage { label: "ordinary-return"; budget: ""; reused: 0 }
+    ]
+    let ordinary = ""
+    let first = true
+    for stage in sequence {
+        let llvm = directory + "/" + stage.label + ".ll"
+        let newstate = directory + "/" + stage.label + ".state"
+        let report = directory + "/" + stage.label + ".stats"
+        let command = [configuration.moduleCompiler, entry, llvm, "--module-state", state, newstate, report]
+        if stage.budget != "" { command.add("--bounded-owners"); command.add(stage.budget) }
+        run(configuration, command, true)
+        selected(llvm, stage.budget, true)
+        stats(report, stage.reused, 2 - stage.reused)
+        if first { ordinary = readTextFile(llvm); first = false }
+        if stage.label == "ordinary-warm" || stage.label == "k1" || stage.label == "ordinary-return" { test.check(readTextFile(llvm) == ordinary, "ownership policy ordinary/K1 identity " + stage.label) }
+        if !ends(stage.label, "warm") && stage.label != "ordinary-return" {
+            let budget = stage.budget
+            if budget == "" { budget = "32" }
+            native(configuration, llvm, budget, expected)
+        }
+        let size = files.pathSize(newstate)
+        test.check(size >= 0, "ownership policy state was not emitted")
+        if size > 0 { state = newstate }
+    }
+    test.check(sequence.length == 9, "ownership policy all nine cache transitions")
+}
+if chosen("test_source_edit_delta_direct_and_driver") {
+    for budget in budgets {
+        let directory = configuration.work + "/delta-" + budget
+        mkdir(directory)
+        let library = directory + "/library.min"
+        let entry = directory + "/main.min"
+        let empty = directory + "/empty"
+        let original = "public function value(n: Integer): Text { let text = Text(n); return text }\n"
+        writeTextFile(library, original)
+        writeTextFile(entry, "use \"./library.min\" as lib\nprint(lib.value(40))\n")
+        writeTextFile(empty, "")
+        let base = directory + "/base"
+        let delta = directory + "/delta"
+        let warm = directory + "/warm"
+        let plan = directory + "/plan"
+        direct(configuration, directory, entry, "cold", empty, base, budget, 0, 2)
+        writeTextFile(library, test.replace(original, "Text(n)", "Text(n + 1)"))
+        writeTextFile(plan, pack(["minyar-module-plan-v1", base, empty, "opaque-test-base-identity"]))
+        let edited = direct(configuration, directory, entry, "edit", plan, delta, budget, 1, 1)
+        test.check(starts(readTextFile(delta), pack(["minyar-module-delta-v3"])), "ownership policy exact delta version")
+        writeTextFile(plan, pack(["minyar-module-plan-v1", base, delta, "opaque-test-base-identity"]))
+        let replayed = direct(configuration, directory, entry, "warm", plan, warm, budget, 2, 0)
+        test.check(readTextFile(edited) == readTextFile(replayed), "ownership policy direct edited/warm byte identity")
+        writeTextFile(library, original)
+        let llvm = directory + "/driver.ll"
+        let cache = directory + "/cache"
+        let report = directory + "/driver.stats"
+        let command = [configuration.driver, configuration.moduleCompiler, entry, llvm, cache, report, "--bounded-owners", budget]
+        for stage in ["cold", "edit", "warm"] {
+            let reused = 0
+            if stage == "edit" { reused = 1; writeTextFile(library, test.replace(original, "Text(n)", "Text(n + 1)")) }
+            if stage == "warm" { reused = 2 }
+            run(configuration, command, true)
+            stats(report, reused, 2 - reused)
+            noInvocations(cache)
+            if stage != "cold" { test.check(readTextFile(llvm) == readTextFile(edited), "ownership policy driver/direct edited byte identity " + stage) }
+        }
+        if budget == "32" { native(configuration, llvm, budget, "41\n") }
+    }
+    for index in 0..invalid.length {
+        let llvm = configuration.work + "/driver-invalid-" + Text(index) + ".ll"
+        let result = run(configuration, [configuration.driver, configuration.moduleCompiler, entry, llvm, configuration.work + "/invalid-cache", "--bounded-owners", invalid[index]], false)
+        test.check(test.contains(result.errorOutput, "ownership budget must be a positive ASCII decimal integer"), "ownership policy driver ASCII budget diagnostic")
+        test.check(files.pathSize(llvm) < 0, "ownership policy invalid driver budget emitted LLVM")
+    }
+}
+test.check(budgets.length == 5 && invalid.length == 9, "ownership policy exact budget/invalid domains")
+test.removeTree(configuration.work)
+print("Ownership policy: passed")
