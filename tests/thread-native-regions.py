@@ -77,6 +77,27 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
         assert (ran.returncode, ran.stdout, ran.stderr) == (0, name + ' passed\n', ''), ran
         print(name, args.sanitizer, 'generated language passed', flush=True)
+    for helper in (False, True):
+        source = directory / 'main-exit.min'
+        text = entry.replace('return input.getInt64(0)', 'return seed') + main.replace(
+            'startThread(worker, 0,', 'startThread(worker, 7,').replace(
+            '    joinThread(workerHandle)',
+            '    let result = joinThread(workerHandle)\n    closeBytesChannel(channel)\n    ' +
+            ('stop(result)' if helper else 'exit(result)'))
+        if helper: text = 'function stop(status: Integer) { exit(status) }\n' + text
+        source.write_text(text)
+        llvm = directory / 'main-exit.ll'
+        compiled = subprocess.run([str(selected), str(source), str(llvm), '--bounded-owners', '32'],
+            capture_output=True, text=True, timeout=90, env=environment)
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        binary = directory / 'main-exit'
+        linked = subprocess.run(['python3', str(ROOT / 'tools/clang-driver.py'), 'link', str(ROOT), str(llvm),
+            str(ROOT / 'build/minyar-default-runtime.o'), str(binary), '0'],
+            capture_output=True, text=True, timeout=240, env=environment)
+        assert linked.returncode == 0, linked.stdout + linked.stderr
+        ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
+        assert (ran.returncode, ran.stdout, ran.stderr) == (7, '', ''), ran
+        print('main-exit' + ('-helper' if helper else ''), args.sanitizer, 'joined status passed', flush=True)
     cases = {
         'legacy-main-address': entry + main.replace('    nativeThreadSetup()\n', '').replace(
             '    let input =', '    let local = Bytes(8)\n    let raw = machine.address(local)\n    let input ='),
@@ -85,6 +106,11 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         'worker-managed-address': entry.replace('return input.getInt64(0)',
             'let local = Bytes(8)\n    return machine.address(local)') + main,
         'worker-setup': entry.replace('return input.getInt64(0)', 'nativeThreadSetup()\n    return 0') + main,
+        'legacy-main-exit': entry + main.replace('    nativeThreadSetup()\n', '').replace(
+            '    joinThread(workerHandle)', '    joinThread(workerHandle)\n    exit(0)'),
+        'worker-exit': entry.replace('return input.getInt64(0)', 'exit(0)\n    return 0') + main,
+        'worker-exit-helper': 'function stop() { exit(0) }\n' +
+            entry.replace('return input.getInt64(0)', 'stop()\n    return 0') + main,
         'managed-input': entry.replace('input: NativeRegion', 'input: Bytes') + main,
         'managed-region-list': entry + main.replace('    let channel =',
             '    let managed: List<Bytes> = [Bytes(8)]\n    let invalid = shareNativeRegions(managed)\n    let channel ='),
@@ -124,5 +150,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
                     'worker-close-helper': 'minyar_zstd_rawCloseDCtx',
                     'worker-buffer-helper': 'minyar_zstd_bufferDecompress'}.get(label)
         if provider: assert provider in rejected.stderr + rejected.stdout, (label, rejected)
+        if label in ('legacy-main-exit', 'worker-exit', 'worker-exit-helper'):
+            assert "builtin 'exit' 0(1)" in rejected.stderr + rejected.stdout, (label, rejected)
         assert 'AddressSanitizer:' not in rejected.stderr and 'runtime error:' not in rejected.stderr, (label, rejected)
         print(label, args.sanitizer, 'rejected before IR publication', flush=True)
