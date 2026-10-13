@@ -129,7 +129,7 @@ def verify_result(kind, report, cases, binaries, source):
                     and row.get('reciprocal_epoch_secrets') is True
                     and row.get('client_stderr') == '' and row.get('server_stderr') == '',
                     'local endpoint assertion or sanitizer diagnostic failed')
-            if row.get('case') == 'rebind-routes':
+            if row.get('case') in ('rebind-routes', 'rebind-pending'):
                 require(exact_integer(row.get('rebound_routes'), minimum=12),
                         'repeated rebinding did not exceed the old route bound')
             preferred = {
@@ -288,7 +288,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
         mapping = {'multiplex1999': 'transfer', 'multiconnect50': 'multiconnect',
                    'ipv6': 'transfer', 'preferred': 'connectionmigration',
                    'preferred-ipv6': 'connectionmigration',
-                   'resumption40': 'resumption', 'zerortt40': 'zerortt', 'rebind-routes': 'transfer',
+                   'resumption40': 'resumption', 'zerortt40': 'zerortt', 'rebind-routes': 'transfer', 'rebind-pending': 'transfer',
                    'keyupdate': 'keyupdate', 'chacha20': 'chacha20'}
         require(case in mapping, 'unknown local endpoint case')
         testcase = mapping[case]
@@ -297,7 +297,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
         names = ['file' + str(index) for index in range(count)]
         expected = [str(binaries['client'].resolve()), fixture('root.der'),
                     '::1' if case in ('ipv6', 'preferred-ipv6') else '127.0.0.1',
-                    '44302' if case == 'rebind-routes' else '44300',
+                    '44302' if case in ('rebind-routes', 'rebind-pending') else '44300',
                     str(workspace / (case + '-client.keys')),
                     str(workspace / (case + '-downloads')), testcase, *names]
         expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),

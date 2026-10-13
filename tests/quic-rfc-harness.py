@@ -459,7 +459,7 @@ class QuicRfcHarness(unittest.TestCase):
             mapping={'multiplex1999':'transfer','multiconnect50':'multiconnect',
                      'ipv6':'transfer','preferred':'connectionmigration','preferred-ipv6':'connectionmigration',
                      'resumption40':'resumption','zerortt40':'zerortt',
-                     'keyupdate':'keyupdate','chacha20':'chacha20','rebind-routes':'transfer'}
+                     'keyupdate':'keyupdate','chacha20':'chacha20','rebind-routes':'transfer','rebind-pending':'transfer'}
             self.assertEqual(set(mapping),set(RFC.declared_cases(ROOT/'tests/quic-qns-local.py','CASES')))
             for case,testcase in mapping.items():
                 count=1999 if case=='multiplex1999' else 50 if case=='multiconnect50' else (
@@ -470,7 +470,7 @@ class QuicRfcHarness(unittest.TestCase):
                     keylogs=sorted(['fixtures/'+case+'-client.keys','fixtures/'+case+'-server.keys']))
                 client=[str(binaries['client'].resolve()),str(workspace/'root.der'),
                         '::1' if case in ('ipv6','preferred-ipv6') else '127.0.0.1',
-                        '44302' if case=='rebind-routes' else '44300',
+                        '44302' if case in ('rebind-routes','rebind-pending') else '44300',
                         str(workspace/(case+'-client.keys')),str(workspace/(case+'-downloads')),
                         testcase,*names]
                 server=[str(binaries['server'].resolve()),str(workspace/'server.pk8'),

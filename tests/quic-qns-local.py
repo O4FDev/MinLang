@@ -6,9 +6,10 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location("qns_certificates",ROOT/"tests/tls-local.py")
 fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
-CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred","preferred-ipv6","resumption40","zerortt40","rebind-routes")
+CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred","preferred-ipv6","resumption40","zerortt40","rebind-routes","rebind-pending")
 class RebindingProxy:
- def __init__(self,port):
+ def __init__(self,port,chunk=1048576,delay=.003):
+  self.chunk=chunk;self.delay=delay
   self.target=("127.0.0.1",port);self.front=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.front.bind(("127.0.0.1",port+2))
   self.port=self.front.getsockname()[1];self.back=None;self.ports=set();self.stopping=threading.Event();self.error=None
   self.rebind();self.thread=threading.Thread(target=self.run);self.thread.start()
@@ -24,9 +25,9 @@ class RebindingProxy:
      data,address=stream.recvfrom(65535)
      if stream is self.front:client=address;self.back.sendto(data,self.target)
      elif client is not None:
-      self.stopping.wait(.003)
+      self.stopping.wait(self.delay)
       self.front.sendto(data,client);received+=len(data)
-      if received>=1048576 and len(self.ports)<16:received=0;self.rebind()
+      if received>=self.chunk and len(self.ports)<16:received=0;self.rebind()
   except BaseException as error:self.error=error
  def close(self):
   self.stopping.set();self.thread.join(timeout=2);self.front.close();self.back.close()
@@ -51,7 +52,7 @@ def main():
    for name in names:(www/name).write_bytes(payload)
    serverlog=d/(case+"-server.keys");clientlog=d/(case+"-client.keys")
    artifacts.bind_files(case,"payloads",[www]);artifacts.bind_files(case,"downloads",[downloads]);artifacts.bind_files(case,"keylogs",[serverlog,clientlog])
-   testcase={"multiplex1999":"transfer","multiconnect50":"multiconnect","ipv6":"transfer","preferred":"connectionmigration","preferred-ipv6":"connectionmigration","resumption40":"resumption","zerortt40":"zerortt","rebind-routes":"transfer"}.get(case,case)
+   testcase={"multiplex1999":"transfer","multiconnect50":"multiconnect","ipv6":"transfer","preferred":"connectionmigration","preferred-ipv6":"connectionmigration","resumption40":"resumption","zerortt40":"zerortt","rebind-routes":"transfer","rebind-pending":"transfer"}.get(case,case)
    command=[str(a.server.resolve()),str(ca.path("server","pk8")),str(ca.path("root","der")),str(serverlog),str(www),testcase,str(ca.path("server","der"))]
    if not a.expect_old_code:command+=["--port="+str(a.port)]
    if case=="preferred":command+=["--preferred-ipv4=7f000001","--preferred-port="+str(a.port+1)]
@@ -64,6 +65,7 @@ def main():
      raise RuntimeError(("server setup",server.process.poll(),greeting))
     host="::1" if case in ("ipv6","preferred-ipv6") else "127.0.0.1"
     if case=="rebind-routes":proxy=RebindingProxy(a.port)
+    if case=="rebind-pending":proxy=RebindingProxy(a.port,65536,0)
     command=[str(a.client.resolve()),str(ca.path("root","der")),host,str(proxy.port if proxy else a.port),str(clientlog),str(downloads),testcase,*names]
     c=artifacts.run(command,capture_output=True,text=True,timeout=180,case=case)
    finally:
@@ -97,7 +99,7 @@ def main():
    elif case=="ipv6" and (c.returncode or not files_ok):semantic=72
    elif case in ("preferred","preferred-ipv6") and (c.returncode or not files_ok or not preferred_tuple_ok or "QNS preferred path validated" not in c.stdout):semantic=92
    elif case in ("resumption40","zerortt40") and (c.returncode or not files_ok or labels.count("CLIENT_HANDSHAKE_TRAFFIC_SECRET")!=2):semantic=102
-   elif case=="rebind-routes" and (c.returncode or not files_ok or len(proxy.ports)<12):semantic=112
+   elif case in ("rebind-routes","rebind-pending") and (c.returncode or not files_ok or len(proxy.ports)<12):semantic=112
    expected={"multiplex1999":42,"multiconnect50":52,"keyupdate":62,"ipv6":72}.get(case,0) if a.expect_old_code else 0
    results.append({"case":case,"client_status":c.returncode,"semantic_status":semantic,"expected":expected,"matched":semantic==expected,
       "client_stdout":c.stdout,"client_stderr":c.stderr,"server_stdout":serverout,"server_stderr":servererr,
