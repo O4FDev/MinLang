@@ -28,13 +28,13 @@ static void prepare(const char *directory) {
     }
     free(data);
 }
-static uint64_t run(char **arguments, const char *output) {
+static uint64_t run(char **arguments, const char *output, uint64_t *bytes) {
     unlink(output);
     uint64_t start = now(); pid_t child = fork(); require(child >= 0,"benchmark fork");
     if (!child) { int null = open("/dev/null",O_WRONLY); require(null >= 0 && dup2(null,STDOUT_FILENO) >= 0,"benchmark stdout"); execv(arguments[0],arguments); perror(arguments[0]); _exit(127); }
     int status = 0; while (waitpid(child,&status,0) < 0) require(errno == EINTR,"benchmark wait");
     uint64_t elapsed = now() - start; require(WIFEXITED(status) && !WEXITSTATUS(status),"benchmark process");
-    struct stat st; require(!stat(output,&st) && st.st_size > 0,"benchmark output"); unlink(output); return elapsed;
+    struct stat st; require(!stat(output,&st) && st.st_size > 0,"benchmark output"); *bytes = (uint64_t)st.st_size; unlink(output); return elapsed;
 }
 int main(int argc, char **argv) {
     require(argc >= 3,"benchmark arguments");
@@ -43,15 +43,16 @@ int main(int argc, char **argv) {
     const char *mode = argc == 7 ? argv[6] : "none";
     require(!strcmp(mode,"none") || !strcmp(mode,"lz4") || !strcmp(mode,"zstd"),"benchmark mode");
     char *writer[] = {argv[2],argv[4],argv[5],"17592186040320",(char *)mode,NULL};
-    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime",argv[5],argv[4],NULL,NULL};
-    if (!strcmp(mode,"lz4")) { mkfs[3] = "-zlz4"; mkfs[4] = argv[5]; mkfs[5] = argv[4]; }
-    if (!strcmp(mode,"zstd")) { mkfs[3] = "-zzstd,3"; mkfs[4] = argv[5]; mkfs[5] = argv[4]; }
-    run(writer,argv[5]); run(mkfs,argv[5]);
+    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime","--workers=1","-C65536",argv[5],argv[4],NULL,NULL};
+    if (strcmp(mode,"none")) { mkfs[5] = !strcmp(mode,"lz4") ? "-zlz4" : "-zzstd,3"; mkfs[6] = argv[5]; mkfs[7] = argv[4]; }
+    uint64_t a_bytes, b_bytes;
+    printf("mode=%s level=%s max_physical_cluster_bytes=%u workers=1 input_bytes=1073741824\n",mode,!strcmp(mode,"zstd") ? "3" : !strcmp(mode,"lz4") ? "default-fast" : "none",strcmp(mode,"none") ? 65536u : 4096u); fflush(stdout);
+    run(writer,argv[5],&a_bytes); run(mkfs,argv[5],&b_bytes);
     for (int n = 0; n < 5; ++n) {
         uint64_t a, b;
-        if (n & 1) { b = run(mkfs,argv[5]); a = run(writer,argv[5]); }
-        else { a = run(writer,argv[5]); b = run(mkfs,argv[5]); }
-        printf("%s repeat=%d minyar_ns=%llu mkfs_ns=%llu ratio=%.4f\n",mode,n+1,(unsigned long long)a,(unsigned long long)b,(double)a/(double)b);fflush(stdout);
+        if (n & 1) { b = run(mkfs,argv[5],&b_bytes); a = run(writer,argv[5],&a_bytes); }
+        else { a = run(writer,argv[5],&a_bytes); b = run(mkfs,argv[5],&b_bytes); }
+        printf("%s repeat=%d minyar_ns=%llu mkfs_ns=%llu ratio=%.4f minyar_bytes=%llu mkfs_bytes=%llu size_ratio=%.6f bar=%s\n",mode,n+1,(unsigned long long)a,(unsigned long long)b,(double)a/(double)b,(unsigned long long)a_bytes,(unsigned long long)b_bytes,(double)a_bytes/(double)b_bytes,a_bytes <= b_bytes + b_bytes / 100 && a < b ? "PASS" : "FAIL");fflush(stdout);
     }
     return 0;
 }

@@ -22,16 +22,16 @@ flags=(-std=gnu11 -O2 -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
     -DHAVE_LINUX_FALLOC_H -DHAVE_LINUX_FS_H -DHAVE_LINUX_XATTR_H
     -DHAVE_COPY_FILE_RANGE -DHAVE_POSIX_FADVISE -DHAVE_PWRITEV
     -DHAVE_SYS_RESOURCE_H -DHAVE_GETRLIMIT -DHAVE_SYS_SENDFILE_H -DHAVE_SENDFILE
-    -DHAVE_SYS_STATFS_H -DHAVE_FSTATFS)
+    -DHAVE_SYS_STATFS_H -DHAVE_FSTATFS -DEROFS_MT_ENABLED=1 -DHAVE_PTHREAD_H)
 sources=(config io cache super inode xattr exclude namei data compress compressor zmap decompress
     compress_hints hashmap sha256 blobchunk dir fragments dedupe uuid_unparse uuid tar block_list
     rebuild diskbuf bitops dedupe_ext vmdk kite_deflate compressor_deflate xxhash
-    compressor_lz4 compressor_lz4hc compressor_libzstd)
+    compressor_lz4 compressor_lz4hc compressor_libzstd workqueue)
 for source in "${sources[@]}"; do
     "$clang" "${flags[@]}" -c "lib/$source.c" -o "objects/$source.o"
 done
 for tool in fsck mkfs dump; do
-    "$clang" "${flags[@]}" "$tool/main.c" objects/*.o -llz4 -lzstd -o "$tool/$tool.erofs"
+    "$clang" "${flags[@]}" "$tool/main.c" objects/*.o -llz4 -lzstd -pthread -o "$tool/$tool.erofs"
 done
 fsck/fsck.erofs -V
 mkfs/mkfs.erofs --help 2>&1 | tail -3
