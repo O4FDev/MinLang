@@ -217,58 +217,80 @@ class PerformanceMetrics(unittest.TestCase):
             self.assertEqual(len(samples), 2)
 
     def test_each_timed_sample_requires_fresh_output_outside_timing_interval(self):
-        # Warm-up and first measured sample succeed. The second measured sample
-        # must not reuse their output or disappear behind the earlier timing.
-        for mode, message in ((None, None), ('failure', 'failed with status 1'),
-                              ('no-output', 'produced no LLVM'), ('wrong-output', 'invalid compiler LLVM')):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as name:
-                output, reference, compiler = (Path(name) / file for file in ('output.ll', 'reference.ll', 'compiler'))
-                reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
-                compiler.write_bytes(b'controlled fixture')
-                output.write_bytes(reference.read_bytes())
-                state = {'active': False, 'calls': 0, 'unlinks': 0, 'validations': 0}
-                ticks = iter((10, 10.001, 20, 20.002))
-                original_unlink = Path.unlink
-                original_validate = budget.validate_compile_output
+        from types import SimpleNamespace
+        modes = ((None, None), ('failure', 'failed with status 1'),
+                 ('no-output', 'produced no LLVM'), ('wrong-output', 'invalid compiler LLVM'))
+        for role in ('current', 'previous'):
+            for mode, message in modes:
+                with self.subTest(role=role, mode=mode), tempfile.TemporaryDirectory() as name:
+                    root = Path(name)
+                    (root / 'build').mkdir()
+                    paths = {key: root / key for key in ('current', 'previous', 'input', 'clang')}
+                    paths['runtime'] = root / 'build/minyar-compiler-runtime.ll'
+                    for key, path in paths.items():
+                        path.write_bytes(key.encode())
+                    toolchain = {'llvm_version': '23.1.2', 'llvm_cc': {'path': str(paths['clang'])}}
+                    (root / 'build/.toolchain.json').write_text(json.dumps(toolchain))
+                    manifest = root / 'configuration.json'
+                    manifest.write_text(json.dumps({'toolchain': toolchain,
+                        'environment': budget.configuration_environment(),
+                        'clang': budget.file_identity(paths['clang']),
+                        'artifacts': {key: budget.file_identity(path) for key, path in paths.items() if key != 'clang'}}))
+                    expected = b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n'
+                    outputs = {key: root / ('wall-comparison-' + key + '.ll') for key in ('current', 'previous')}
+                    for output in outputs.values():
+                        output.write_bytes(expected)
+                    state = {'active': False, 'calls': {'current': 0, 'previous': 0},
+                             'unlinks': {'current': 0, 'previous': 0}, 'validations': {'current': 0, 'previous': 0}}
+                    ticks = iter(value for index in range(6) for value in (index, index + 0.001))
+                    usage = iter(SimpleNamespace(ru_utime=index * 0.001, ru_stime=0) for index in range(12))
+                    original_unlink = Path.unlink
+                    original_validate = budget.validate_output
 
-                def unlink(path, *args, **kwargs):
-                    if path == output:
-                        self.assertFalse(state['active'], 'cleanup entered timed interval')
-                        state['unlinks'] += 1
-                    return original_unlink(path, *args, **kwargs)
+                    def unlink(path, *args, **kwargs):
+                        for key, output in outputs.items():
+                            if path == output:
+                                self.assertFalse(state['active'], 'cleanup entered timed interval')
+                                state['unlinks'][key] += 1
+                        return original_unlink(path, *args, **kwargs)
 
-                def clock():
-                    state['active'] = not state['active']
-                    return next(ticks)
+                    def clock():
+                        state['active'] = not state['active']
+                        return next(ticks)
 
-                def compile_once():
-                    self.assertFalse(output.is_file(), 'stale output survived into sample')
-                    state['calls'] += 1
-                    bad = state['calls'] == 3 and mode is not None
-                    if not bad or mode == 'wrong-output':
-                        output.write_bytes(b'wrong output' if bad else reference.read_bytes())
-                    return subprocess.CompletedProcess(['compiler'], 1 if bad and mode == 'failure' else 0, '', '')
+                    def compile(command, **kwargs):
+                        key = Path(command[0]).name
+                        output = Path(command[2])
+                        self.assertEqual(command[1], str(paths['input']))
+                        self.assertFalse(output.is_file(), 'stale output survived into sample')
+                        state['calls'][key] += 1
+                        bad = key == role and state['calls'][key] == 3 and mode is not None
+                        if not bad or mode == 'wrong-output':
+                            output.write_bytes(b'wrong output' if bad else expected)
+                        return subprocess.CompletedProcess(command, 1 if bad and mode == 'failure' else 0, '', '')
 
-                def validate(result, phase='self-compile'):
-                    self.assertFalse(state['active'], 'correctness I/O entered timed interval')
-                    state['validations'] += 1
-                    original_validate(result, phase)
+                    def validate(result, output, phase):
+                        self.assertFalse(state['active'], 'correctness I/O entered timed interval')
+                        key = next(key for key, path in outputs.items() if path == output)
+                        state['validations'][key] += 1
+                        original_validate(result, output, phase)
 
-                with patch.object(budget, 'OUTPUT', output), \
-                        patch.object(budget, 'COMPILER', compiler), patch.object(budget, 'resource', None), \
-                        patch.object(budget, 'RUNS', 2), patch.object(budget, 'BATCHES', 1), \
-                        patch.object(budget, 'compile_once', side_effect=compile_once), \
-                        patch.object(budget, 'validate_compile_output', side_effect=validate), \
-                        patch.object(budget, 'retired_instructions', return_value=None), \
-                        patch.object(budget, 'check_compiler_behavior'), \
-                        patch.object(budget.time, 'perf_counter', side_effect=clock), \
-                        patch.object(Path, 'unlink', new=unlink), patch('sys.stdout', new_callable=io.StringIO):
-                    if message:
-                        with self.assertRaisesRegex(SystemExit, message):
-                            budget.main()
-                    else:
-                        budget.main()
-                self.assertEqual(state, {'active': False, 'calls': 3, 'unlinks': 3, 'validations': 3})
+                    with patch.object(budget, 'ROOT', root), patch.object(budget, 'OUTPUT', root / 'output.ll'), \
+                            patch.object(budget, 'COMPILER', paths['current']), \
+                            patch.object(budget, 'RUNS', 2), patch.object(budget, 'BATCHES', 1), \
+                            patch.object(budget.subprocess, 'run', side_effect=compile), \
+                            patch.object(budget, 'validate_output', side_effect=validate), \
+                            patch.object(budget.resource, 'getrusage', side_effect=lambda _: next(usage)), \
+                            patch.object(budget, 'check_compiler_behavior'), \
+                            patch.object(budget.time, 'perf_counter', side_effect=clock), \
+                            patch.object(Path, 'unlink', new=unlink), patch('sys.stdout', new_callable=io.StringIO):
+                        if message:
+                            with self.assertRaisesRegex(SystemExit, message):
+                                budget.wall_comparison(paths['previous'], paths['input'], manifest, root / 'pairs.json')
+                        else:
+                            budget.wall_comparison(paths['previous'], paths['input'], manifest, root / 'pairs.json')
+                    counts = {'current': 2 if message and role == 'previous' else 3, 'previous': 3}
+                    self.assertEqual(state, {'active': False, 'calls': counts, 'unlinks': counts, 'validations': counts})
 
 
 if __name__ == '__main__':
