@@ -234,7 +234,7 @@ MinyarList *minyar_list_slice(const MinyarList *list, long long start, long long
         minyar_list_references(result);
     list_reserve(result, end - start);
     for (long long position = start; position < end; position++) {
-            minyar_list_add(result, list->values[position]);
+        minyar_list_add(result, list->values[position]);
     }
     return result;
 }
