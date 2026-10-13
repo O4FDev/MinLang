@@ -137,9 +137,14 @@ static void layered(const char *root) {
     char *data = join(root,"new-data"); unsigned char binary[] = {0,255,61,10,0};
     require(!lsetxattr(data,"user.layer",binary,sizeof(binary),0) && !lsetxattr(data,"trusted.layer","trusted",7,0), "layer xattrs");
     layer_acl(data,"system.posix_acl_access",0);
+    unsigned char capability[20] = {1,0,0,2,0,4};
+    require(!lsetxattr(data,"security.capability",capability,sizeof(capability),0), "layer capability");
     const char *aliases[] = {"forward-one","forward-two"};
     for (unsigned n = 0; n < 2; ++n) { char *path = join(root,aliases[n]); require(!link(data,path), "forward hardlink"); free(path); }
     free(data);
+    layer_file(root,"epoch","epoch",0641);
+    char *epoch = join(root,"epoch"); struct timespec epoch_times[2] = {{-1,750000000},{-1,750000000}};
+    require(!utimensat(AT_FDCWD,epoch,epoch_times,AT_SYMLINK_NOFOLLOW), "negative fractional epoch");free(epoch);
     char *hard = join(root,"hard"), *kept = join(root,"kept"); require(!link(hard,kept), "retained lower hardlink");free(hard);free(kept);
     char *sym = join(root,"symlink"); require(!unlink(sym) && !symlink("./hard",sym), "replaced symlink"); layer_metadata(sym,0777,1234,2345);free(sym);
     char *fifo = join(root,"fifo"); require(!unlink(fifo) && !mkfifo(fifo,0640), "replaced fifo"); layer_metadata(fifo,0640,1234,2345);free(fifo);
