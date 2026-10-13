@@ -84,6 +84,7 @@ build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_N
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: tests/evidence-support-native.c runtime/native/sha256.c
 check-evidence-harness: build/minyarc build/minyar-runtime.o build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay
+	python3 tests/evidence-harness.py
 	./build/tooling/tests/evidence-harness "$(CURDIR)/build/tooling/tests/evidence-harness" "$(CURDIR)/build/tooling/tests/evidence-replay"
 
 .PHONY: check-performance-metrics
