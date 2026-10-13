@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Public launcher argv and native cache contracts, without a cold bootstrap."""
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shlex
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import unittest
 from unittest.mock import patch
@@ -576,6 +580,53 @@ output.write_bytes(b'complete executable')
         os.utime(self.clang, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertEqual(self.clang.stat().st_size, before.st_size)
         self.assertEqual(len(self.native_calls(self.launch(base))), 1)
+
+    def test_macos_ci_release_installation_is_private_verified_and_strict(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        blocks = re.findall(r'- name: Select pinned LLVM 23\.1\.2\n        run: \|\n((?:          [^\n]*\n)+)', workflow)
+        self.assertEqual(len(blocks), 6)
+        self.assertEqual(len(set(blocks)), 1)
+        published = 'd7c26fc6177e42842e2d1ffaad31aec057c56a924392b1a23d830abe2c5d53b1'
+        self.assertIn(published, blocks[0])
+        self.assertIn('https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-macOS-ARM64.tar.xz', blocks[0])
+        self.assertNotIn('brew pin llvm', workflow)
+        self.assertNotIn('brew --prefix llvm', workflow)
+        archive = self.work / 'fixture.tar.xz'
+        payload = b'#!/bin/sh\nprintf "%s\\n" "clang version 23.1.2"\n'
+        with tarfile.open(archive, 'w:xz') as output:
+            entry = tarfile.TarInfo('LLVM-23.1.2-macOS-ARM64/bin/clang')
+            entry.size = len(payload)
+            entry.mode = 0o755
+            output.addfile(entry, io.BytesIO(payload))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        script = ''.join(line[10:] + '\n' for line in blocks[0].splitlines()).replace(published, digest)
+        for name, body in (('uname', 'printf "%s\\n" "${TEST_ARCH:-arm64}"'),
+                           ('curl', 'while [ "$1" != -o ]; do shift; done; cp "$MINYAR_ASSET_FIXTURE" "$2"')):
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        for mode in ('valid', 'corrupt', 'wrong-architecture'):
+            directory = self.work / mode
+            directory.mkdir()
+            fixture = directory / 'download.tar.xz'
+            fixture.write_bytes(archive.read_bytes() + (b'changed' if mode == 'corrupt' else b''))
+            env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
+                       RUNNER_TEMP=str(directory), GITHUB_ENV=str(directory / 'env'),
+                       GITHUB_PATH=str(directory / 'path'), MINYAR_ASSET_FIXTURE=str(fixture),
+                       TEST_ARCH='x86_64' if mode == 'wrong-architecture' else 'arm64')
+            result = subprocess.run(['bash', '-eu', '-c', script], cwd=ROOT, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            selected = directory / 'minyar-llvm-23.1.2/bin/clang'
+            with self.subTest(mode=mode):
+                if mode == 'valid':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[-1], str(selected))
+                    self.assertEqual((directory / 'path').read_text(), str(selected.parent) + '\n')
+                    self.assertEqual((directory / 'env').read_text().splitlines(),
+                                     [name + '=' + str(selected) for name in ('CC', 'LLVM_CC', 'MINYAR_CLANG', 'MINYAR_TEST_CLANG')])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(selected.exists())
 
 
 if __name__ == '__main__':
