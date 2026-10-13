@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minyar own TLS/yamux vs pinned independent Go TLS/HashiCorp yamux."""
-import argparse,hashlib,importlib.util,json,os,subprocess,tempfile
+import argparse,hashlib,importlib.util,json,os,shutil,subprocess,tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('tls_tests',ROOT/'tests/tls-local.py');fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
@@ -26,9 +26,13 @@ def main():
                 # acquired. The peer's parser, state machine and payload oracle
                 # remain intact; ordinary unmodified peer runs are separate.
                 scheduled=original.replace(anchor,'\ttime.Sleep(25 * time.Millisecond)\n\n'+anchor)
-                override=Path(d)/'stream-scheduled.go';override.write_text(scheduled)
-                overlay=Path(d)/'go-overlay.json';overlay.write_text(json.dumps({'Replace':{str(source):str(override)}}))
-                arguments.append('-overlay='+str(overlay))
+                replacement=Path(d)/'yamux-scheduled';shutil.copytree(module['Dir'],replacement)
+                override=replacement/'stream.go';override.chmod(override.stat().st_mode|0o200);override.write_text(scheduled)
+                modfile=Path(d)/'scheduled.mod'
+                shutil.copyfile(ROOT/'tests/interop/yamux/go.mod',modfile)
+                shutil.copyfile(ROOT/'tests/interop/yamux/go.sum',modfile.with_suffix('.sum'))
+                subprocess.run(['go','mod','edit','-modfile='+str(modfile),'-replace=github.com/hashicorp/yamux='+str(replacement)],cwd=ROOT/'tests/interop/yamux',env=environment,check=True,timeout=30)
+                arguments.append('-modfile='+str(modfile))
                 print('Go FIN scheduler original='+hashlib.sha256(source.read_bytes()).hexdigest()+' scheduled='+hashlib.sha256(override.read_bytes()).hexdigest(),flush=True)
             subprocess.run([*arguments,'-o',str(go),'.'],cwd=ROOT/'tests/interop/yamux',env=environment,check=True,timeout=120)
         fixtures.compile_program(ROOT/('tests/transport-churn.min' if o.streams else 'tests/transport-tcp.min'),native)
