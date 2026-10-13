@@ -1,0 +1,212 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "sha256" as sha256
+
+record Fixture { directory: Text; signer: Text; driver: Text; artifact: Bytes; digest: Text; fields: List<Text>; serial: Integer }
+record Request { fields: List<Text>; raw: Bytes; useRaw: Boolean; corrupt: Boolean; floor: Integer; highest: Text; previous: Text; device: Text; root: Text; artifact: Bytes; useArtifact: Boolean; now: Integer }
+record Outcome { lines: List<Text>; metadata: Bytes }
+
+function setup(): Fixture {
+    let directory = test.scratch()
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    let signer = directory + "/signer"
+    test.require(test.run([clang, "-O2", "tests/update-sign.c", "vendor/monocypher/monocypher.c", "vendor/monocypher/monocypher-ed25519.c", "-o", signer], system.environment(), "", directory + "/signer.build", 120), "build update signer")
+    let driver = directory + "/driver"
+    test.require(test.run(["./minyar", "--library", "library", "tests/update-driver.min", "-o", driver], support.environment(["LIMITED=", "SANITIZER_LIMITED="]), "", directory + "/driver.build", 600), "build update driver")
+    let artifact = Bytes("fixture executable")
+    for byte in [0, 255] { artifact.add(byte) }
+    artifact.addBytes(Bytes("binary"))
+    let digest = sha256.hex(sha256.digest(artifact))
+    let fields = ["MINYAR-UPDATE-1", "org.tolum.peer", support.hostTarget(directory), "stable", "1", "1.1.0",
+        "1799999990", "1800003600", "100", "https://updates.example/releases/" + digest + "/agent", digest, Text(artifact.length)]
+    return Fixture { directory: directory; signer: signer; driver: driver; artifact: artifact; digest: digest; fields: fields; serial: 0 }
+}
+function request(fixture: Fixture): Request {
+    return Request { fields: support.copy(fixture.fields); raw: Bytes(); useRaw: false; corrupt: false; floor: 0; highest: "1.0.0"; previous: ""; device: "device"; root: ""; artifact: Bytes(); useArtifact: false; now: 1800000000 }
+}
+function sign(fixture: Fixture, manifest: Text): Bytes {
+    fixture.serial += 1
+    let signed = test.run([fixture.signer, manifest], system.environment(), "", fixture.directory + "/sign" + Text(fixture.serial), 10)
+    test.require(signed, "sign update metadata")
+    let raw = readBytesFile(fixture.directory + "/sign" + Text(fixture.serial))
+    test.check(raw.length == 64, "the signer must preserve binary signature bytes")
+    return raw
+}
+function invoke(fixture: Fixture, value: Request): Outcome {
+    let metadata = value.raw
+    if !value.useRaw { metadata = Bytes(support.join(value.fields, "\n") + "\n") }
+    let manifest = fixture.directory + "/release.manifest"
+    let signature = fixture.directory + "/release.sig"
+    writeBytesFile(manifest, metadata)
+    let signed = sign(fixture, manifest)
+    if value.corrupt { signed[0] = signed[0] ^ 1 }
+    writeBytesFile(signature, signed)
+    let command = [fixture.driver, manifest, signature]
+    if value.root == "" {
+        for item in ["inspect", value.device, Text(value.floor), value.highest, value.previous] { command.add(item) }
+    } else {
+        let package = fixture.directory + "/artifact"
+        if value.useArtifact { writeBytesFile(package, value.artifact) } else { writeBytesFile(package, fixture.artifact) }
+        for item in [value.root, package, Text(value.now)] { command.add(item) }
+    }
+    fixture.serial += 1
+    let result = test.run(command, system.environment(), "", fixture.directory + "/driver" + Text(fixture.serial), 10)
+    test.check(result.status == 0, "update driver failed\n" + result.errorOutput)
+    return Outcome { lines: test.lines(result.output); metadata: metadata }
+}
+function expect(actual: List<Text>, expected: List<Text>, label: Text) {
+    test.check(support.join(actual, ",") == support.join(expected, ","), label + ": " + support.join(actual, ",") + " expected " + support.join(expected, ","))
+}
+function rejected(fixture: Fixture, value: Request, label: Text) {
+    expect(invoke(fixture, value).lines, ["false", "false", "10"], label)
+}
+let names = ["test_valid_metadata_and_signature_mutation", "test_signer_binary_output_survives_every_byte_value", "test_signed_malformed_fields_are_recoverable",
+    "test_replay_equivocation_and_version_order_are_independent", "test_rollouts_use_nested_stable_cohorts_at_all_boundaries", "test_failed_artifact_persists_floor_and_retry_recovers"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "UpdatePolicy." + name { valid = true } }
+    test.check(valid, "unknown update policy case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "UpdatePolicy." + name { return true } }
+    return false
+}
+let fixture = setup()
+let cases = 0
+if chosen("test_valid_metadata_and_signature_mutation") {
+    expect(invoke(fixture, request(fixture)).lines, ["true", "true", "0"], "valid metadata")
+    let corrupt = request(fixture)
+    corrupt.corrupt = true
+    rejected(fixture, corrupt, "corrupt signature")
+    cases += 1
+}
+if chosen("test_signer_binary_output_survives_every_byte_value") {
+    let observed = Bytes(256)
+    for index in 0..256 {
+        let manifest = fixture.directory + "/binary-signature-input"
+        writeTextFile(manifest, "binary-signature-" + Text(index))
+        for byte in sign(fixture, manifest) { observed[byte] = 1 }
+    }
+    for byte in observed { test.check(byte == 1, "signer pipe lost a byte value") }
+    cases += 1
+}
+if chosen("test_signed_malformed_fields_are_recoverable") {
+    let digest = fixture.digest
+    let replacements = [
+        ["", "MINYAR-UPDATE-2"], ["org.attacker.app"], ["other-platform"], ["beta"],
+        ["0", "-1", "+1", "01", "2147483648", "999999999999999999999"],
+        ["1.0.0-beta", "01.2.3", "1.2", "1.2.3.4", "1..3", "1.2.2147483648", "0.9.0"],
+        ["1800000301", "-1", "999999999999999999999"],
+        ["1800000000", "1799999990", "1801000000"], ["0", "2", "9", "11", "99", "101", "010"],
+        ["http://updates.example/agent", "https://updates.example.evil/agent",
+            "https://updates.example/releases/" + digest + "/../evil",
+            "https://updates.example/releases/" + digest + "/%2e%2e",
+            "https://updates.example/releases/" + digest + "/agent?x=1"],
+        [support.repeat("a", 63), support.repeat("A", 64), support.repeat("g", 64)], ["0", "-1", "134217729", "2.0", "02"]]
+    for index in 0..replacements.length {
+        for replacement in replacements[index] {
+            let value = request(fixture)
+            value.fields[index] = replacement
+            rejected(fixture, value, "field " + Text(index) + " = " + replacement)
+        }
+    }
+    let valid = Bytes(support.join(fixture.fields, "\n") + "\n")
+    let trailing = valid.slice(0, valid.length)
+    trailing.addBytes(Bytes("junk"))
+    let leading = Bytes("\n")
+    leading.addBytes(valid)
+    let extra = valid.slice(0, valid.length)
+    extra.add(10)
+    let pieces = support.split(Text(valid), "org.tolum.peer")
+    let embedded = Bytes(pieces[0])
+    for index in 1..pieces.length {
+        embedded.addBytes(Bytes("org.tolum.peer"))
+        embedded.add(0)
+        embedded.addBytes(Bytes(pieces[index]))
+    }
+    let raws = [valid.slice(0, valid.length - 1), trailing, leading,
+        Bytes(test.replace(Text(valid), "\n", "\r\n")), embedded, extra]
+    for raw in raws {
+        let value = request(fixture)
+        value.raw = raw
+        value.useRaw = true
+        rejected(fixture, value, "raw metadata " + Text(raw.length))
+    }
+    cases += 1
+}
+if chosen("test_replay_equivocation_and_version_order_are_independent") {
+    let digest = sha256.hex(sha256.digest(invoke(fixture, request(fixture)).metadata))
+    let value = request(fixture)
+    value.floor = 1
+    value.previous = digest
+    expect(invoke(fixture, value).lines, ["true", "true", "0"], "same previous digest")
+    value.floor = 2
+    rejected(fixture, value, "floor rollback")
+    value.floor = 1
+    value.previous = support.repeat("a", 64)
+    rejected(fixture, value, "equivocation")
+    let highest = request(fixture)
+    highest.highest = "1.2.0"
+    rejected(fixture, highest, "version rollback")
+    let ordered = request(fixture)
+    ordered.fields[5] = "1.10.0"
+    ordered.highest = "1.9.99"
+    expect(invoke(fixture, ordered).lines, ["true", "true", "0"], "numeric version order")
+    cases += 1
+}
+if chosen("test_rollouts_use_nested_stable_cohorts_at_all_boundaries") {
+    let devices: List<Text> = []
+    for cohort in 0..100 { devices.add("") }
+    let found = 0
+    for index in 0..5000 {
+        let device = "device-" + Text(index)
+        let digest = sha256.digest(Bytes("MINYAR-UPDATE-COHORT-V1\norg.tolum.peer\nstable\n" + device))
+        let cohort = (((digest[0] * 256 + digest[1]) * 256 + digest[2]) * 256 + digest[3]) % 100
+        if devices[cohort] == "" { devices[cohort] = device; found += 1 }
+    }
+    test.check(found == 100, "every rollout cohort has a device")
+    for rollout in [1, 10, 100] {
+        for cohort in [0, 1, 9, 10, 99] {
+            let value = request(fixture)
+            value.fields[8] = Text(rollout)
+            value.device = devices[cohort]
+            expect(invoke(fixture, value).lines, ["true", support.flag(cohort < rollout), "0"], "rollout " + Text(rollout) + " cohort " + Text(cohort))
+        }
+    }
+    cases += 1
+}
+if chosen("test_failed_artifact_persists_floor_and_retry_recovers") {
+    let root = fixture.directory + "/installation"
+    support.privateDirectory(root, fixture.directory + "/installation.mode")
+    let malicious = request(fixture)
+    malicious.root = root
+    malicious.artifact = Bytes("malicious")
+    malicious.useArtifact = true
+    expect(invoke(fixture, malicious).lines, ["false", "6"], "malicious artifact")
+    test.check(support.isFile(root + "/state", fixture.directory + "/state.probe"), "failed artifact persists state")
+    test.check(!support.exists(root + "/versions"), "failed artifact publishes no versions")
+    let install = request(fixture)
+    install.root = root
+    expect(invoke(fixture, install).lines, ["true", "true"], "retry install")
+    let published = readBytesFile(root + "/versions/" + fixture.digest + ".bin")
+    test.check(support.same(published, fixture.artifact), "published artifact bytes")
+    expect(invoke(fixture, install).lines, ["true", "false"], "repeat install")
+    let older = request(fixture)
+    older.root = root
+    older.fields[4] = "2"
+    older.fields[5] = "1.0.0"
+    let before = readBytesFile(root + "/state")
+    expect(invoke(fixture, older).lines, ["false", "10"], "older version")
+    test.check(support.same(readBytesFile(root + "/state"), before), "rejected install keeps state")
+    let early = request(fixture)
+    early.root = root
+    early.now = 1799999999
+    expect(invoke(fixture, early).lines, ["false", "7"], "clock before state")
+    writeBytesFile(root + "/state", Bytes("corrupt"))
+    expect(invoke(fixture, install).lines, ["false", "7"], "corrupt state")
+    cases += 1
+}
+test.removeTree(fixture.directory)
+print("Update policy: " + Text(cases) + " cases passed")

@@ -1,9 +1,12 @@
+build/tooling/tests/update-policy: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/update-policy: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/update-policy: runtime/native/sha256.c
 .PHONY: check-shipping
-check-shipping: build/minyarc build/tooling/tests/http-bounded-test
+check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/shipping.py
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/update-manifest.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/update-native.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/update-policy.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-native
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-policy
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http-bounded-test
 
 check: check-shipping

@@ -1,0 +1,178 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+public function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+    }
+    return -1
+}
+public function split(source: Text, separator: Text): List<Text> {
+    let raw = Bytes(source)
+    let pattern = Bytes(separator)
+    let result: List<Text> = []
+    let start = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal {
+            result.add(Text(raw.slice(start, index)))
+            index += pattern.length
+            start = index
+        } else { index += 1 }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+public function join(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+public function repeat(text: Text, count: Integer): Text {
+    let pieces: List<Text> = []
+    for index in 0..count { pieces.add(text) }
+    return joinText(pieces)
+}
+public function has(values: List<Text>, expected: Text): Boolean {
+    for value in values { if value == expected { return true } }
+    return false
+}
+public function copy(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { result.add(value) }
+    return result
+}
+public function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function flag(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+public function environment(overrides: List<Text>): List<Text> {
+    return merge(system.environment(), overrides)
+}
+public function merge(base: List<Text>, overrides: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in base {
+        let keep = true
+        for override in overrides {
+            let raw = Bytes(override)
+            let ending = 0
+            while ending < raw.length && raw[ending] != 61 { ending += 1 }
+            if starts(entry, Text(raw.slice(0, ending + 1))) { keep = false }
+        }
+        if keep { result.add(entry) }
+    }
+    for entry in overrides { result.add(entry) }
+    return result
+}
+public function output(command: List<Text>, log: Text): Text {
+    let result = test.run(command, system.environment(), "", log, 30)
+    test.require(result, command[0])
+    return result.output
+}
+public function hostTarget(work: Text): Text {
+    let kernel = test.lines(output(["uname", "-s"], work + "/uname-s"))[0]
+    let machine = test.lines(output(["uname", "-m"], work + "/uname-m"))[0]
+    let platform = "linux"
+    if kernel == "Darwin" { platform = "macos" }
+    else { test.check(kernel == "Linux", "unsupported host kernel " + kernel) }
+    let architecture = "x86_64"
+    if machine == "arm64" || machine == "aarch64" { architecture = "arm64" }
+    return platform + "-" + architecture
+}
+public function privateDirectory(path: Text, log: Text) {
+    test.check(files.makeDirectory(path) == 0, "create private test directory " + path)
+    test.require(test.run(["chmod", "700", path], system.environment(), "", log, 10), "private test directory")
+}
+public function exists(path: Text): Boolean {
+    return files.pathSize(path) >= 0
+}
+public function isFile(path: Text, log: Text): Boolean {
+    return test.run(["test", "-f", path], system.environment(), "", log, 10).status == 0
+}
+public function isDirectory(path: Text, log: Text): Boolean {
+    return test.run(["test", "-d", path], system.environment(), "", log, 10).status == 0
+}
+public function shellWords(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let token = Bytes()
+    let quote = 0
+    let active = false
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if quote == 39 {
+            if byte == 39 { quote = 0 } else { token.add(byte) }
+        } else if quote == 34 {
+            if byte == 34 { quote = 0 }
+            else if byte == 92 && index + 1 < raw.length && (raw[index + 1] == 34 || raw[index + 1] == 92 || raw[index + 1] == 36 || raw[index + 1] == 96) { index += 1; token.add(raw[index]) }
+            else { token.add(byte) }
+        } else if byte == 39 || byte == 34 { quote = byte; active = true }
+        else if byte == 92 { test.check(index + 1 < raw.length, "unterminated shell escape"); index += 1; token.add(raw[index]); active = true }
+        else if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if active { result.add(Text(token)); token = Bytes(); active = false }
+        } else { token.add(byte); active = true }
+        index += 1
+    }
+    test.check(quote == 0, "unterminated shell quote")
+    if active { result.add(Text(token)) }
+    return result
+}
+public function which(name: Text, log: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", name], system.environment(), "", log, 10)
+    if result.status != 0 { return "" }
+    return test.lines(result.output)[0]
+}
+public function resolve(path: Text, log: Text): Text {
+    return test.lines(output(["readlink", "-f", "--", path], log))[0]
+}
+public function shellQuote(word: Text): Text {
+    let raw = Bytes(word)
+    if raw.length == 0 { return "''" }
+    let safe = true
+    for byte in raw {
+        let plain = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        for allowed in Bytes("_@%+=:,./-") { if byte == allowed { plain = true } }
+        if !plain { safe = false }
+    }
+    if safe { return word }
+    return "'" + test.replace(word, "'", "'\"'\"'") + "'"
+}
+public function shellJoin(words: List<Text>): Text {
+    let quoted: List<Text> = []
+    for word in words { quoted.add(shellQuote(word)) }
+    return join(quoted, " ")
+}
+public function kernel(log: Text): Text {
+    return test.lines(output(["uname", "-s"], log))[0]
+}
