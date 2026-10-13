@@ -1,0 +1,49 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "text" as text
+use "errors" as errors
+function integer(value: Text): Integer {
+    let result = text.parseInteger(value)
+    test.check(errors.integerOk(result), "invalid resident memory result")
+    return errors.integerValue(result)
+}
+function repeat(value: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(value) }
+    return joinText(parts)
+}
+let compiler = test.compiler()
+let sharedOnly = argumentCount() == 1 && argument(0) == "--shared"
+test.check(argumentCount() == 0 || sharedOnly, "expected optional --shared")
+if !sharedOnly {
+    let source = "let original = \"" + repeat("x", 32768) + "\"\nlet index = 0\nwhile index < 4000 {\nlet copy = original.slice(0, original.length)\nindex = index + 1\n}\nprint(index)\n"
+    test.require(test.compile(compiler, source), "discarded Text compilation")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let host = test.run(["uname", "-s"], system.environment(), "", path + ".host", 10)
+    test.require(host, "resident memory platform")
+    let darwin = host.output == "Darwin\n"
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "discarded Text link")
+        let measure = ["/usr/bin/time", "-f", "%M", "-o", path + ".rss", path + ".exe"]
+        if darwin { measure = ["/usr/bin/time", "-l", path + ".exe"] }
+        let observed = test.run(measure, system.environment(), "", path + ".measure", 30)
+        test.check(observed.status == 0 && observed.output == "4000\n", "discarded Text retains exact execution result")
+        let resident = -1
+        if darwin {
+            for line in test.lines(observed.errorOutput) {
+                if test.contains(line, "maximum resident set size") { resident = integer(test.words(line)[0]) }
+            }
+        } else { resident = integer(test.words(readTextFile(path + ".rss"))[0]) * 1024 }
+        test.check(resident >= 0 && resident < 48 * 1024 * 1024, "discarded Text retained " + Text(resident) + " resident bytes at " + optimization)
+        print("discarded Text " + optimization + ": " + Text(resident) + " resident bytes")
+    }
+}
+let churn = "function churn(): Text {\nlet original = \"" + repeat("x", 32768) + "\"\nlet index = 0\nwhile index < 100 {\nlet copy = original.slice(0, original.length)\nindex = index + 1\n}\nreturn \"tail\" + \"!\"\n}\n"
+let shared = "record Pair { first: Text; second: Text }\nrecord Leaf { label: Text }\nrecord Node { children: List<Leaf>; label: Text }\nfunction pair(left: Text, right: Text): Pair {\nreturn Pair { first: left; second: right }\n}\nfunction node(): Node {\nlet children: List<Leaf> = []\nlet result = Node { children: children; label: \"retained\" + \"!\" }\nchildren.add(Leaf { label: result.label })\nreturn result\n}\n" + churn + "let retained = node()\nlet alias = retained.children\nlet result = pair(\"head\" + \"!\", churn())\nlet constructed = Pair { first: \"field\" + \"!\"; second: churn() }\nprint(result.first)\nprint(result.second)\nprint(constructed.first)\nprint(constructed.second)\nprint(alias[0].label)\nlet index = 0\nwhile index < 1000 {\nlet discarded = node()\nindex = index + 1\n}\nprint(alias[0].label)\n"
+test.executes(compiler, shared, "head!\ntail!\nfield!\ntail!\nretained!\nretained!\n")
+test.removeTree(compiler.directory)
+print("native memory reclamation and alias controls: passed")

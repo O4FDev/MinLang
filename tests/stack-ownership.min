@@ -1,0 +1,60 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "../tools/test-toolchain.min" as toolchain
+use "system" as system
+use "text" as text
+use "errors" as errors
+function budget(value: Text): Integer {
+    let parsed = text.parseInteger(value)
+    test.check(errors.integerOk(parsed), "invalid cleanup budget")
+    return errors.integerValue(parsed)
+}
+function checkProfile(profile: Text, budget: Integer, mode: Text) {
+    test.check(profile == "system" || profile == "fixed" || profile == "lazy" || profile == "eager" || profile == "arena", "invalid ownership profile")
+    test.check(mode == "native" || mode == "sanitize", "invalid ownership mode")
+    test.check(budget >= 1 && budget <= 1024, "invalid ownership budget")
+    let work = test.scratch()
+    let root = toolchain.absolute(".", work)
+    let wrapper = root + "/tests/stack-ownership-runtime-source.h"
+    let bounded = profile == "system" || profile == "fixed" || profile == "lazy"
+    let fixture = "tests/stack-ownership-fallback.c"
+    if bounded { fixture = "tests/stack-ownership-runtime.c" }
+    let optimization = "-O2"
+    if mode == "sanitize" { optimization = "-O1" }
+    let command = [test.setting("MINYAR_TEST_CLANG", "clang"), "-std=c11", optimization, "-g", "-iquote", root + "/runtime",
+        "-DMINYAR_RUNTIME_SOURCE=\"" + wrapper + "\"", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget)]
+    if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+    if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+    if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+    if profile == "arena" { command.add("-DMINYAR_COMPILER_ARENA=1") }
+    if mode == "sanitize" {
+        command.add("-fsanitize=address,undefined")
+        command.add("-fno-omit-frame-pointer")
+    }
+    for item in [root + "/" + fixture, "-lm", "-o", work + "/program"] { command.add(item) }
+    let env = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:detect_stack_use_after_return=1")
+    env = runner.environment(env, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    test.require(test.run(command, env, "", work + "/compile", 120), "ownership fixture compile")
+    let execute = [work + "/program"]
+    if bounded { execute.add("require-stack") }
+    let result = test.run(execute, env, "", work + "/execute", 120)
+    test.require(result, "ownership fixture execution")
+    let expected = "PASS private API"
+    if bounded { expected = "PASS stack-contract" }
+    test.check(test.contains(result.output, expected), "missing ownership assertions\n" + result.output)
+    print(profile + "-k" + Text(budget) + "-" + mode + ": " + result.output)
+    test.removeTree(work)
+}
+if argumentCount() == 3 {
+    checkProfile(argument(0), budget(argument(1)), argument(2))
+} else {
+    test.check(argumentCount() == 0, "expected PROFILE BUDGET MODE")
+    for profile in ["system", "fixed", "lazy"] {
+        for budget in [1, 2, 8, 9, 32, 1024] {
+            for mode in ["native", "sanitize"] { checkProfile(profile, budget, mode) }
+        }
+    }
+    for profile in ["eager", "arena"] {
+        for mode in ["native", "sanitize"] { checkProfile(profile, 32, mode) }
+    }
+}
