@@ -20,8 +20,10 @@ check check-portable: check-errors-language-bounded
 
 .PHONY: check-errors-launcher
 
-check-errors-launcher: build/minyarc-errors-request build/minyarc-errors build/minyarc-callbacks build/minyar-runtime.o $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-launcher.py
+build/tooling/tests/errors-launcher: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/errors-launcher: tests/sha256-test-native.c
+check-errors-launcher: build/minyarc-errors-request build/minyarc-errors build/minyarc-callbacks build/minyar-runtime.o $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS) build/tooling/tests/errors-launcher
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-launcher
 
 check check-portable: check-errors-launcher
 

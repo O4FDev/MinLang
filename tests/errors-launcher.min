@@ -1,0 +1,188 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "system" as system
+use "files" as files
+
+constant SIMPLE = "let r = Ok<Integer, Text>(0)\nmatch r { Ok(v) { print(v) } Err(e) { print(e) } }\n"
+constant NESTED = "record Holder { items: List<Result<Callback<Result<Integer, Text>>, Text>> }\nlet h = Holder { items: [] }\nlet call = function(): Result<Integer, Text> { return Ok<Integer, Text>(7) }\nh.items.add(Ok<Callback<Result<Integer, Text>>, Text>(call))\nmatch h.items[0] {\n    Ok(f) { match f() { Ok(v) { print(v) } Err(e) { print(e) } } }\n    Err(e) { print(e) }\n}\n"
+constant CALLBACK_FIRST = "let f = function(n: Integer): Integer { return n + 1 }\nlet r = Err<Integer, Text>(\"bad\")\nmatch r { Ok(v) { print(f(v)) } Err(e) { print(e) } }\n"
+constant RECORD_NAME = "record Result { n: Integer }\nlet f = function(x: Result): Integer { return x.n }\nlet r = Ok<Integer, Text>(1)\nmatch r { Ok(v) { print(v) } Err(e) { print(e) } }\n"
+constant PACKET = "public record Failure { message: Text }\npublic function make(): Callback<Result<List<Result<Integer, Failure>>, Failure>> {\n    return function(): Result<List<Result<Integer, Failure>>, Failure> {\n        return Ok<List<Result<Integer, Failure>>, Failure>([Ok<Integer, Failure>(9)])\n    }\n}\n"
+constant IMPORTED = "use \"./packet.min\" as packet\nfunction invoke(): Result<Integer, packet.Failure> {\n    let f = packet.make()\n    let values = try f()\n    let n = try values[0]\n    return Ok<Integer, packet.Failure>(n)\n}\nmatch invoke() { Ok(v) { print(v) } Err(e) { print(e.message) } }\n"
+
+record Context { directory: Text; serial: Integer; root: Text; probe: Text; compiler: Text; clang: Text }
+function source(context: Context, text: Text): Text {
+    context.serial += 1
+    let path = context.directory + "/program-" + Text(context.serial) + ".min"
+    writeTextFile(path, text)
+    return path
+}
+function stem(path: Text): Text {
+    let raw = Bytes(path)
+    return Text(raw.slice(0, raw.length - 4))
+}
+function request(context: Context, path: Text, status: Integer, flags: List<Text>): test.Result {
+    let output = stem(path) + ".probe.ll"
+    if files.pathSize(output) >= 0 { files.remove(output) }
+    let command = [context.probe, path, output]
+    for flag in flags { command.add(flag) }
+    command.add("--library")
+    command.add(context.root + "/library")
+    let result = test.run(command, system.environment(), "", output + ".log", 30)
+    test.check(result.status == status, "request status " + Text(result.status) + " for " + path + "\n" + result.errorOutput)
+    test.check(result.output == "", "request wrote standard output")
+    test.check((files.pathSize(output) >= 0) == (result.status == 0), "request output presence changed")
+    if result.status == 0 { test.check(result.errorOutput == "", "successful request wrote diagnostics\n" + result.errorOutput) }
+    return result
+}
+function launcherEnvironment(context: Context): List<Text> {
+    let removed = ["MINYAR_CLANG", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG_FLAGS", "MFLAGS", "LLVM_CC", "CC", "MAKEFLAGS"]
+    let result: List<Text> = []
+    for item in system.environment() {
+        let keep = true
+        for name in removed { if port.starts(item, name + "=") { keep = false } }
+        if keep { result.add(item) }
+    }
+    for item in ["LLVM_CC=" + context.clang, "CC=" + context.clang, "MAKEFLAGS=-j1", "MINYAR_CLANG_FLAGS=-O0 -Wno-override-module"] { result.add(item) }
+    return result
+}
+function has(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function launcher(context: Context, path: Text, options: List<Text>, status: Integer, trace: Boolean): test.Result {
+    let output = stem(path) + ".program"
+    let check = has(options, "--check")
+    let arguments = ["sh"]
+    if trace { arguments.add("-x") }
+    arguments.add(context.root + "/minyar")
+    if !check { arguments.add("--debug") }
+    for option in options { arguments.add(option) }
+    arguments.add(path)
+    if !check { arguments.add("-o"); arguments.add(output) }
+    let result = test.run(arguments, launcherEnvironment(context), context.root, stem(path) + ".launcher", 120)
+    test.check(result.status == status, "launcher status " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    test.check(result.status != 87, "internal request escaped public launcher")
+    if status != 0 { test.check(files.pathSize(output) < 0, "failed launcher left a program") }
+    return result
+}
+function executesLauncher(context: Context, text: Text, expected: Text, options: List<Text>) {
+    let path = source(context, text)
+    let flags: List<Text> = []
+    for index in 0..options.length {
+        if options[index] == "--library" { flags.add(options[index]); flags.add(options[index + 1]) }
+    }
+    request(context, path, 0, flags)
+    let result = launcher(context, path, options, 0, false)
+    let executable = stem(path) + ".program"
+    test.check(result.output == "built " + executable + "\n", "launcher output changed\n" + result.output)
+    test.check(result.errorOutput == "", "selected frontend leaked primary diagnostics\n" + result.errorOutput)
+    let run = test.run([executable], system.environment(), "", executable + ".run", 30)
+    test.check(run.status == 0 && run.output == expected && run.errorOutput == "", "launched program result\n" + run.output + run.errorOutput)
+}
+function primary(context: Context, path: Text, library: Boolean): test.Result {
+    let command = [context.compiler, path, stem(path) + ".core.ll"]
+    if library { command.add("--library"); command.add(context.root + "/library") }
+    return test.run(command, system.environment(), "", stem(path) + ".core", 30)
+}
+function nestedCallbacks(context: Context) {
+    let sources = [SIMPLE, NESTED, CALLBACK_FIRST, RECORD_NAME]
+    let outputs = ["0\n", "7\n", "bad\n", "1\n"]
+    for index in 0..sources.length { executesLauncher(context, sources[index], outputs[index], []) }
+}
+function importedPayloads(context: Context) {
+    writeTextFile(context.directory + "/packet.min", PACKET)
+    executesLauncher(context, IMPORTED, "9\n", [])
+    executesLauncher(context, test.replace(IMPORTED, "./packet.min", "packet"), "9\n", ["--library", context.directory])
+    request(context, source(context, "use \"./packet.min\" as packet\nprint(\"alive\")\n"), 0, [])
+}
+function incrementalDispatch(context: Context) {
+    writeTextFile(context.directory + "/packet.min", PACKET)
+    for unused in 0..2 { executesLauncher(context, IMPORTED, "9\n", ["--incremental"]) }
+    let bad = source(context, test.replace(IMPORTED, "print(v)", "print(missing)"))
+    request(context, bad, 1, [])
+    let result = launcher(context, bad, ["--incremental", "--check"], 1, false)
+    test.check(test.contains(result.errorOutput, bad), "incremental diagnostic lost its path\n" + result.errorOutput)
+    test.check(test.contains(result.errorOutput, "find a value named 'missing'"), "incremental diagnostic changed\n" + result.errorOutput)
+}
+function headerDiagnostics(context: Context) {
+    for text in ["let r: Result<Integer> = 1\n", "let r = Ok<Integer, Text>\n", "let r: List<Result<Integer, Text> = []\n"] {
+        let path = source(context, text)
+        request(context, path, 1, [])
+        let expected = primary(context, path, true)
+        let shown = launcher(context, path, ["--check"], 1, false)
+        test.check(shown.errorOutput == expected.errorOutput, "public diagnostics differ from primary\n" + shown.errorOutput + "\n" + expected.errorOutput)
+    }
+    let texts = ["let r = Ok<Integer, Text>(\n", "let r = Ok<Integer, Text>(\"wrong\")\n", "let r = Ok<Integer, Text>(1)\nmatch r { Ok(v) {} }\n"]
+    let diagnostics = ["", "result payload has the wrong type", "match must handle both Ok and Err"]
+    for index in 0..texts.length {
+        let path = source(context, texts[index])
+        request(context, path, 1, [])
+        let result = launcher(context, path, ["--check"], 1, false)
+        if diagnostics[index] != "" { test.check(test.contains(result.errorOutput, diagnostics[index]), "missing diagnostic: " + diagnostics[index] + "\n" + result.errorOutput) }
+        test.check(!test.contains(result.errorOutput, "unknown type 'Result'"), "Result header reached the ordinary frontend\n" + result.errorOutput)
+    }
+}
+function ordinaryDiagnostics(context: Context) {
+    for text in ["let x: Missing = 1\n", "let x = 1 + true\n"] {
+        let path = source(context, text)
+        request(context, path, 1, [])
+        let expected = primary(context, path, true)
+        let shown = launcher(context, path, ["--check"], 1, false)
+        test.check(shown.errorOutput == expected.errorOutput, "public diagnostics differ from primary\n" + shown.errorOutput + "\n" + expected.errorOutput)
+    }
+    let path = source(context, "print(\"Result<Integer, Text> Ok<Integer, Text>( match try >>\")\n// Result<Integer, Text>\nlet Result = 2\nlet Ok = 3\nlet Err = 4\nprint(Result < Ok)\nprint(Err >> 1)\n")
+    let control = primary(context, path, false)
+    test.check(control.status == 0, control.errorOutput)
+    request(context, path, 0, [])
+    let shown = launcher(context, path, ["--check"], 0, true)
+    test.check(!test.contains(shown.errorOutput, "build/minyarc-errors"), "ordinary source selected the errors frontend")
+    test.check(!test.contains(shown.errorOutput, "errors-request"), "ordinary source ran the request frontend")
+}
+function callbackFrontend(context: Context) {
+    let path = source(context, "let f = function(n: Integer): Integer { return n + 1 }\nprint(f(2))\n")
+    let control = primary(context, path, false)
+    test.check(control.status == 0, control.errorOutput)
+    request(context, path, 0, [])
+    let shown = launcher(context, path, ["--check"], 0, true)
+    test.check(test.contains(shown.errorOutput, "build/minyarc"), "callback source did not run a compiler")
+    let raw = Bytes(shown.errorOutput)
+    let begin = port.find(shown.errorOutput, "build/minyarc-errors", 0)
+    while begin >= 0 {
+        let after = begin + 20
+        test.check(after < raw.length && raw[after] > 32, "callback source selected the errors frontend")
+        begin = port.find(shown.errorOutput, "build/minyarc-errors", begin + 1)
+    }
+}
+function requestBudgets(context: Context) {
+    let path = source(context, SIMPLE)
+    for budget in [1, 32, 1024] {
+        request(context, path, 0, ["--bounded-owners", Text(budget), "--freestanding"])
+        executesLauncher(context, SIMPLE, "0\n", ["--memory-profile", "fixed", "--heap-bytes", "1048576", "--cleanup-budget", Text(budget)])
+    }
+}
+
+let names = ["test_constructor_nested_callback_and_ordinary_record_names", "test_imported_public_payloads_and_library_order",
+    "test_incremental_imported_dispatch_is_repeatable", "test_complete_header_and_parser_diagnostics_remain_distinct",
+    "test_nonrequest_diagnostics_and_successful_ordinary_path", "test_callable_request_without_result_keeps_callback_frontend",
+    "test_request_forwards_budgets_freestanding_and_bounded_runtime"]
+let selectors = port.selectors("ErrorsLauncher", names)
+let ran = 0
+for index in 0..names.length {
+    if !port.selected(selectors, "ErrorsLauncher", names[index]) { continue }
+    let directory = test.scratch()
+    let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", directory + "/root", 10).output)[0]
+    let context = Context { directory: directory; serial: 0; root: root;
+        probe: test.setting("MINYAR_ERRORS_REQUEST_COMPILER", root + "/build/minyarc-errors-request");
+        compiler: test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc"); clang: test.setting("MINYAR_TEST_CLANG", "clang") }
+    if index == 0 { nestedCallbacks(context) }
+    else if index == 1 { importedPayloads(context) }
+    else if index == 2 { incrementalDispatch(context) }
+    else if index == 3 { headerDiagnostics(context) }
+    else if index == 4 { ordinaryDiagnostics(context) }
+    else if index == 5 { callbackFrontend(context) }
+    else { requestBudgets(context) }
+    test.removeTree(directory)
+    ran += 1
+}
+print("ErrorsLauncher: " + Text(ran) + " checks passed")
