@@ -42,7 +42,22 @@ function safeFlag(arg: Text): Boolean {
     }
     return begins(arg, "-Wno-") || begins(arg, "-fsanitize=") || begins(arg, "-fno-sanitize=") || begins(arg, "-fuse-ld=") || begins(arg, "--ld-path=") || begins(arg, "-D") || begins(arg, "-U") || begins(arg, "-I")
 }
-function cFingerprint(args: List<Text>, source: Text, sanitizer: Boolean): Text {
+function providers(compiler: Text, work: Text): Text {
+    let resource = test.run([compiler, "-print-runtime-dir"], system.environment(), "", work + "/resource", 10)
+    if resource.status != 0 || resource.errorOutput != "" || test.lines(resource.output).length != 1 { return "" }
+    let directory = test.lines(resource.output)[0]
+    let names = files.list(directory)
+    if files.lastError() != 0 { return "" }
+    names.sort()
+    let result = ""
+    for name in names {
+        if (begins(name, "libclang_rt.asan") || begins(name, "libclang_rt.ubsan")) && (suffix(name, ".a") || suffix(name, ".so")) {
+            result += "SANITIZER:" + directory + "/" + name + ":" + hashFile(directory + "/" + name) + "\n"
+        }
+    }
+    return result
+}
+function cFingerprint(args: List<Text>, source: Text, sanitizer: Boolean, toolchain: Boolean): Text {
     let work = test.scratch()
     let command = [args[0]]
     let index = 1
@@ -84,25 +99,9 @@ function cFingerprint(args: List<Text>, source: Text, sanitizer: Boolean): Text 
             if cwd.status != 0 { fingerprint = "" }
             else { fingerprint += "CWD:" + cwd.output }
         }
-        if fingerprint != "" && sanitizer {
-            let resource = test.run([args[0], "-print-runtime-dir"], system.environment(), "", work + "/resource", 10)
-            if resource.status != 0 || resource.errorOutput != "" || test.lines(resource.output).length != 1 { fingerprint = "" }
-            else {
-                let directory = test.lines(resource.output)[0]
-                let names = files.list(directory)
-                if files.lastError() != 0 { fingerprint = "" }
-                else {
-                    names.sort()
-                    let providers = 0
-                    for name in names {
-                        if (begins(name, "libclang_rt.asan") || begins(name, "libclang_rt.ubsan")) && (suffix(name, ".a") || suffix(name, ".so")) {
-                            fingerprint += "SANITIZER:" + directory + "/" + name + ":" + hashFile(directory + "/" + name) + "\n"
-                            providers += 1
-                        }
-                    }
-                    if providers == 0 { fingerprint = "" }
-                }
-            }
+        if fingerprint != "" && sanitizer && !toolchain {
+            let runtime = providers(args[0], work)
+            if runtime == "" { fingerprint = "" } else { fingerprint += runtime }
         }
     }
     test.removeTree(work)
@@ -111,6 +110,11 @@ function cFingerprint(args: List<Text>, source: Text, sanitizer: Boolean): Text 
 if argumentCount() == 6 && argument(0) == "--toolchain-key" {
     let parts = ["minyar-test-toolchain-v1\n"]
     for index in 1..argumentCount() { parts.add(argument(index) + ":" + hashFile(argument(index)) + "\n") }
+    if files.pathSize("/usr/bin/ld") >= 0 { parts.add("DEFAULT_LINKER:" + hashFile("/usr/bin/ld") + "\n") }
+    let work = test.scratch()
+    parts.add(providers(argument(3), work))
+    parts.add(providers(argument(4), work))
+    test.removeTree(work)
     print(hex(sha.digest(Bytes(joinText(parts)))))
     exit(0)
 }
@@ -118,7 +122,12 @@ test.check(argumentCount() >= 4, "expected SELF CACHE REAL [--locked] CLANG_ARGU
 let self = argument(0)
 let cache = argument(1)
 let real = argument(2)
-let locked = argument(3) == "--locked"
+let lockedEntry = ""
+if begins(argument(3), "--locked=") { lockedEntry = Text(Bytes(argument(3)).slice(9, Bytes(argument(3)).length)) }
+let locked = lockedEntry != ""
+let toolchain = system.getenv("MINYAR_TOOLCHAIN_KEY")
+let toolchainLinker = system.getenv("MINYAR_TOOLCHAIN_LINKER")
+let identified = Bytes(toolchain).length == 64
 let start = 3
 if locked { start += 1 }
 let args = [real]
@@ -163,7 +172,7 @@ while index < argumentCount() {
                 if suffix(arg, ".ll") { kind = "llvm" }
                 if suffix(arg, ".bc") { kind = "bitcode" }
                 if suffix(arg, ".a") { kind = "archive:" + arg }
-                key.add("INPUT:" + kind + ":" + hashFile(arg) + "\n")
+                if !locked { key.add("INPUT:" + kind + ":" + hashFile(arg) + "\n") }
                 inputs += 1
             }
         } else {
@@ -197,18 +206,23 @@ if cSources.length == 0 {
         if arg == "-g" || arg == "-g0" || arg == "-c" || arg == "-Wall" || arg == "-Wextra" || arg == "-Werror" || begins(arg, "-D") || begins(arg, "-U") || begins(arg, "-I") || arg == "-iquote" || arg == "-isystem" || arg == "-Xclang" || arg == "-disable-llvm-passes" || begins(arg, "-std=") { exit(execute(args)) }
     }
 }
-for source in cSources {
-    let fingerprint = cFingerprint(args, source, sanitizer)
-    if fingerprint == "" { exit(execute(args)) }
-    key.add(fingerprint)
-}
-key.add("SELF:" + hashFile(self) + "\nCOMPILER:" + hashFile(real) + "\n")
-if files.pathSize("/usr/bin/ld") >= 0 { key.add("DEFAULT_LINKER:" + hashFile("/usr/bin/ld") + "\n") }
-for path in linkerPaths { key.add("LINKER:" + hashFile(path) + "\n") }
-test.check(files.makeDirectory(cache) == 0, "cannot create compiler cache")
-let entry = cache + "/" + hex(sha.digest(Bytes(joinText(key))))
+let entry = lockedEntry
 if !locked {
-    let command = ["/usr/bin/flock", "-F", entry + ".lock", self, self, cache, real, "--locked"]
+    for source in cSources {
+        let fingerprint = cFingerprint(args, source, sanitizer, identified)
+        if fingerprint == "" { exit(execute(args)) }
+        key.add(fingerprint)
+    }
+    if identified { key.add("TOOLCHAIN:" + toolchain + "\nCOMPILER:" + real + "\n") }
+    else {
+        key.add("SELF:" + hashFile(self) + "\nCOMPILER:" + hashFile(real) + "\n")
+        if files.pathSize("/usr/bin/ld") >= 0 { key.add("DEFAULT_LINKER:" + hashFile("/usr/bin/ld") + "\n") }
+    }
+    for path in linkerPaths { if !identified || path != toolchainLinker { key.add("LINKER:" + hashFile(path) + "\n") } }
+    test.check(files.makeDirectory(cache) == 0, "cannot create compiler cache")
+    entry = cache + "/" + hex(sha.digest(Bytes(joinText(key))))
+    if files.pathSize(entry) >= 0 { exit(execute(["/bin/cp", "-p", "--", entry, output])) }
+    let command = ["/usr/bin/flock", "-F", entry + ".lock", self, self, cache, real, "--locked=" + entry]
     for index in start..argumentCount() { command.add(argument(index)) }
     exit(execute(command))
 }
