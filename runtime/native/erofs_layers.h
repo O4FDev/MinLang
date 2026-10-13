@@ -8,6 +8,128 @@ typedef struct {
     size_t attrs_size;
 } ELink;
 typedef struct { ELink *links; size_t count, capacity; uint64_t next_id; } ELayer;
+typedef struct { int present; int64_t seconds; long nanos; } ETime;
+
+static int e_tar_number(const unsigned char *p, size_t size, int64_t *result) {
+    if (p[0] & 128) {
+        __int128 number = (int)(p[0] & 127) - ((p[0] & 64) ? 128 : 0);
+        for (size_t n = 1; n < size; ++n) number = number * 256 + p[n];
+        if (number < INT64_MIN || number > INT64_MAX) return EOVERFLOW;
+        *result = (int64_t)number; return 0;
+    }
+    uint64_t number = 0; size_t at = 0;
+    while (at < size && (p[at] == ' ' || !p[at])) ++at;
+    while (at < size && p[at] >= '0' && p[at] <= '7') {
+        unsigned digit = p[at++] - '0';
+        if (number > ((uint64_t)INT64_MAX - digit) / 8) return EOVERFLOW;
+        number = number * 8 + digit;
+    }
+    while (at < size) if (p[at] && p[at] != ' ') return EINVAL; else ++at;
+    *result = (int64_t)number; return 0;
+}
+static int e_pax_time(const unsigned char *p, size_t size, ETime *result) {
+    if (!size) { result->present = 0; return 0; }
+    size_t at = 0, digits = 0;
+    int negative = p[0] == '-'; if (negative || p[0] == '+') ++at;
+    uint64_t seconds = 0, limit = (uint64_t)INT64_MAX + (unsigned)negative;
+    while (at < size && p[at] >= '0' && p[at] <= '9') {
+        unsigned digit = p[at++] - '0'; ++digits;
+        if (seconds > (limit - digit) / 10) return EOVERFLOW;
+        seconds = seconds * 10 + digit;
+    }
+    if (!digits) return EINVAL;
+    long nanos = 0; unsigned places = 0;
+    if (at < size) {
+        if (p[at++] != '.' || at == size) return EINVAL;
+        while (at < size) {
+            unsigned digit = p[at++] - '0'; if (digit > 9) return EINVAL;
+            if (places++ < 9) nanos = nanos * 10 + digit;
+        }
+    }
+    while (places++ < 9) nanos *= 10;
+    if (negative && nanos) {
+        if (seconds >= (uint64_t)INT64_MAX + 1) return EOVERFLOW;
+        result->seconds = -(int64_t)seconds - 1; result->nanos = 1000000000 - nanos;
+    } else { result->seconds = negative ? seconds == (uint64_t)INT64_MAX + 1 ? INT64_MIN : -(int64_t)seconds : (int64_t)seconds; result->nanos = nanos; }
+    result->present = 1; return 0;
+}
+static int e_read_exact(int fd, void *buffer, size_t size, uint64_t offset) {
+    unsigned char *p = buffer;
+    while (size) {
+        ssize_t n = pread(fd,p,size,(off_t)offset);
+        if (n < 0) { if (errno == EINTR) continue; return errno; }
+        if (!n) return EINVAL;
+        p += n; size -= (size_t)n; offset += (uint64_t)n;
+    }
+    return 0;
+}
+static int e_tar_mtime(EWriter *w, uint64_t start, uint64_t end, uint64_t position, ETime *global, struct archive_entry *entry) {
+    uint64_t offset = start + e_align(position,512), metadata = 0;
+    ETime local = {0}; int local_seen = 0;
+    for (unsigned chain = 0; chain < 64; ++chain) {
+        unsigned char header[512];
+        if (offset > end || end - offset < 512) return EINVAL;
+        int error = e_read_exact(w->data_fd,header,sizeof(header),offset); if (error) return error;
+        offset += 512;
+        unsigned kind = header[156];
+        if (kind != 'x' && kind != 'g' && kind != 'X' && kind != 'L' && kind != 'K' && kind != 'A' && kind != 'V') {
+            int64_t seconds; error = e_tar_number(header + 136,12,&seconds); if (error) return error;
+            ETime time = local_seen ? local : *global;
+            archive_entry_set_mtime(entry,time.present ? time.seconds : seconds,time.present ? time.nanos : 0); return 0;
+        }
+        int64_t length; error = e_tar_number(header + 124,12,&length);
+        if (error) return error;
+        if (length < 0 || (uint64_t)length > 2097152 - metadata || (uint64_t)length > end - offset) return EOVERFLOW;
+        metadata += (uint64_t)length;
+        if (kind == 'x' || kind == 'g' || kind == 'X') {
+            unsigned char *data = malloc((size_t)length + 1); if (!data) return ENOMEM;
+            error = e_read_exact(w->data_fd,data,(size_t)length,offset);
+            size_t at = 0;
+            while (!error && at < (size_t)length) {
+                size_t first = at; uint64_t record = 0;
+                while (at < (size_t)length && data[at] >= '0' && data[at] <= '9') {
+                    unsigned digit = data[at++] - '0';
+                    if (record > ((uint64_t)length - digit) / 10) { error = EINVAL; break; }
+                    record = record * 10 + digit;
+                }
+                if (error) break;
+                if (at == first || at >= (size_t)length || data[at++] != ' ' || record > (uint64_t)length - first || record < at - first + 3 || data[first + record - 1] != '\n') { error = EINVAL; break; }
+                size_t key = at, finish = first + (size_t)record - 1;
+                while (at < finish && data[at] != '=') ++at;
+                if (at == finish) { error = EINVAL; break; }
+                if (at - key == 5 && !memcmp(data + key,"mtime",5)) {
+                    ETime *time = kind == 'g' ? global : &local;
+                    if (kind != 'g') local_seen = 1;
+                    error = e_pax_time(data + at + 1,finish - at - 1,time);
+                }
+                at = finish + 1;
+            }
+            free(data); if (error) return error;
+        }
+        offset += e_align((uint64_t)length,512);
+    }
+    return ELOOP;
+}
+static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *end) {
+    struct archive *raw = archive_read_new(); if (!raw) return ENOMEM;
+    int error = 0;
+    if (archive_read_support_format_raw(raw) != ARCHIVE_OK || archive_read_support_filter_none(raw) != ARCHIVE_OK || archive_read_support_filter_gzip(raw) != ARCHIVE_OK || archive_read_support_filter_zstd(raw) != ARCHIVE_OK) error = ENOTSUP;
+    if (!error && archive_read_open_filename(raw,path,1048576) != ARCHIVE_OK) error = EINVAL;
+    struct archive_entry *entry;
+    if (!error && archive_read_next_header(raw,&entry) != ARCHIVE_OK) error = EINVAL;
+    unsigned char *buffer = malloc(1048576); if (!buffer) error = ENOMEM;
+    *start = w->spool_size;
+    while (!error) {
+        la_ssize_t n = archive_read_data(raw,buffer,1048576);
+        if (n < 0) { error = EINVAL; break; }
+        if (!n) break;
+        if ((uint64_t)n > 17592186040320ull - w->spool_size) { error = EFBIG; break; }
+        error = e_write(w->data_fd,buffer,(size_t)n,w->spool_size); w->spool_size += (uint64_t)n;
+    }
+    *end = w->spool_size; free(buffer);
+    if (archive_read_free(raw) != ARCHIVE_OK && !error) error = EINVAL;
+    return error;
+}
 
 static int e_normalize(const char *path, char **result) {
     if (!path || *path == '/') return EINVAL;
@@ -256,20 +378,28 @@ static int e_resolve_links(EWriter *w, ELayer *layer, uint64_t generation) {
     return 0;
 }
 static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
+    uint64_t start, end;
+    int error = e_spool_tar(w,path,&start,&end); if (error) return error;
     struct archive *reader = archive_read_new();
     if (!reader) return ENOMEM;
-    int error = 0;
-    if (archive_read_support_format_tar(reader) != ARCHIVE_OK || archive_read_support_filter_none(reader) != ARCHIVE_OK || archive_read_support_filter_gzip(reader) != ARCHIVE_OK || archive_read_support_filter_zstd(reader) != ARCHIVE_OK) error = ENOTSUP;
-    if (!error && archive_read_open_filename(reader, path, 1048576) != ARCHIVE_OK) error = EINVAL;
+    int fd = dup(w->data_fd);
+    if (fd < 0) error = errno;
+    if (!error && lseek(fd,(off_t)start,SEEK_SET) < 0) error = errno;
+    if (!error && (archive_read_support_format_tar(reader) != ARCHIVE_OK || archive_read_support_filter_none(reader) != ARCHIVE_OK)) error = ENOTSUP;
+    if (!error && archive_read_open_fd(reader,fd,1048576) != ARCHIVE_OK) error = EINVAL;
     ELayer layer = {0};
+    ETime global = {0};
     unsigned char *buffer = malloc(1048576);
     if (!buffer) error = ENOMEM;
     struct archive_entry *entry;
     size_t headers = 0;
     while (!error) {
+        la_int64_t position = archive_filter_bytes(reader,0);
         int status = archive_read_next_header(reader, &entry);
         if (status == ARCHIVE_EOF) break;
         if (status != ARCHIVE_OK || ++headers > 1000000) { error = EINVAL; break; }
+        if (position < 0) { error = EINVAL; break; }
+        error = e_tar_mtime(w,start,end,(uint64_t)position,&global,entry); if (error) break;
         char *name = NULL;
         error = e_normalize(archive_entry_pathname(entry), &name);
         if (error) break;
@@ -307,16 +437,21 @@ static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
                     EInode *inode = NULL; error = e_archive_inode(w, entry, &inode);
                     if (!error) node->inode = inode;
                     if (!error && S_ISREG(inode->st.st_mode)) {
-                        inode->data_offset = w->spool_size;
-                        if (inode->size > 17592186040320ull - w->spool_size) error = EFBIG;
-                        uint64_t copied = 0;
-                        while (!error && copied < inode->size) {
-                            size_t want = inode->size - copied > 1048576 ? 1048576 : (size_t)(inode->size - copied);
-                            la_ssize_t n = archive_read_data(reader, buffer, want);
-                            if (n <= 0) { error = EINVAL; break; }
-                            error = e_write(w->data_fd, buffer, (size_t)n, inode->data_offset + copied); copied += (uint64_t)n;
-                        }
-                        w->spool_size += inode->size;
+                        la_int64_t offset = archive_filter_bytes(reader,0);
+                        if (offset < 0) error = EINVAL;
+                        else inode->data_offset = start + (uint64_t)offset;
+                        if (!error && archive_entry_sparse_count(entry) > 0) {
+                            inode->data_offset = w->spool_size;
+                            if (inode->size > 17592186040320ull - w->spool_size) error = EFBIG;
+                            uint64_t copied = 0;
+                            while (!error && copied < inode->size) {
+                                size_t want = inode->size - copied > 1048576 ? 1048576 : (size_t)(inode->size - copied);
+                                la_ssize_t n = archive_read_data(reader,buffer,want);
+                                if (n <= 0) { error = EINVAL; break; }
+                                error = e_write(w->data_fd,buffer,(size_t)n,inode->data_offset + copied); copied += (uint64_t)n;
+                            }
+                            w->spool_size += inode->size;
+                        } else if (!error && (inode->data_offset > end || inode->size > end - inode->data_offset)) error = EINVAL;
                     }
                 }
             }
@@ -328,6 +463,7 @@ static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
     for (size_t n = 0; n < layer.count; ++n) { free(layer.links[n].path); free(layer.links[n].target); free(layer.links[n].attrs); }
     free(layer.links);free(buffer);
     if (archive_read_free(reader) != ARCHIVE_OK && !error) error = EINVAL;
+    if (fd >= 0) close(fd);
     return error;
 }
 static int e_count_tree(ENode *node) {
