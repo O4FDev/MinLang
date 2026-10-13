@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import hashlib
 import importlib.util
@@ -315,6 +316,7 @@ def main() -> int:
 
     compiler_reports = {}
     self_outputs = []
+    commands = []
     for phase, directory, compiler, compiler_edges in compiler_runs:
         suite_env = {
             **env,
@@ -322,24 +324,30 @@ def main() -> int:
             "MINYAR_TEST_COMPILER": str(compiler),
             "MINYAR_TEST_RUNTIME": str(runtime_object),
             "MINYAR_TEST_LINK_FLAGS": " ".join(["-fprofile-instr-generate", *math_flags]),
+            "MINYAR_TEST_JOBS": "1",
         }
+        commands.append(([sys.executable, "tests/coverage-programs/check.py"], suite_env, 600))
         for suite in COMPILER_SUITES:
             # Comparator suites select classes; callback frontends are separate compilers.
             name, *selection = suite.split()
             if name in native_suites:
-                run([str(ROOT / 'build/tooling/tests' / name), *selection], env=suite_env)
+                commands.append(([str(ROOT / 'build/tooling/tests' / name), *selection], suite_env, 180))
             else:
-                run([sys.executable, f"tests/{name}.py", *selection], env=suite_env)
-        run([sys.executable, "tests/coverage-programs/check.py"], env=suite_env, timeout=600)
-        run([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], env=suite_env)
-        run([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
-             "--output-dir", str(directory / "numeric")], env=suite_env)
-        run([sys.executable, "tests/fuzz.py", "--cases", "200", "--program-cases", "40",
-             "--output-dir", str(directory / "fuzz")], env=suite_env)
+                commands.append(([sys.executable, f"tests/{name}.py", *selection], suite_env, 180))
+        commands.append(([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], suite_env, 180))
+        commands.append(([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
+                          "--output-dir", str(directory / "numeric")], suite_env, 180))
+        commands.append(([sys.executable, "tests/fuzz.py", "--cases", "200", "--program-cases", "40",
+                          "--output-dir", str(directory / "fuzz")], suite_env, 180))
         # Both instrumentation orders must preserve exact compiler output.
-        output = directory / "self.ll"
-        run([str(compiler), "build/compiler.min", str(output)], env=suite_env)
-        self_outputs.append(output.read_bytes())
+        commands.append(([str(compiler), "build/compiler.min", str(directory / "self.ll")], suite_env, 180))
+    jobs = max(1, int(os.environ.get("MINYAR_TEST_JOBS") or 1))
+    with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+        futures = [pool.submit(run, command, env=suite_env, timeout=timeout) for command, suite_env, timeout in commands]
+        for future in futures:
+            future.result()
+    for phase, directory, compiler, compiler_edges in compiler_runs:
+        self_outputs.append((directory / "self.ll").read_bytes())
         compiler_reports[phase] = compiler_edge_coverage(compiler_edges)
     if self_outputs[0] != self_outputs[1] or self_outputs[0] != (ROOT / "build/compiler-stage2.ll").read_bytes():
         raise RuntimeError("coverage instrumentation changed self-hosted compiler output")
