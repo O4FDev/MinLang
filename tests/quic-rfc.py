@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from host_paths import host_path
 from sanitizer_llvm import address_sanitizer_enabled, instrument_address_sanitizer
 
+PORT = int(os.environ.get('MINYAR_QUIC_RFC_PORT', '44300'))
 BINARIES = {
     'migration': 'tests/quic-migration-cids.min',
     'cipher': 'tests/quic-cipher-policy.min',
@@ -38,8 +39,8 @@ DRIVERS = (
     ('cipher', 'tests/quic-cipher-policy.py', 'BASELINE',
      ('--binary', 'cipher')),
     ('local', 'tests/quic-qns-local.py', 'CASES',
-     ('--client', 'client', '--server', 'server')),
-    ('vn', 'tests/quic-vn-probe.py', None, ('--server', 'server')),
+     ('--client', 'client', '--server', 'server', '--port', str(PORT))),
+    ('vn', 'tests/quic-vn-probe.py', None, ('--server', 'server', '--port', str(PORT))),
 )
 OPTIMIZATIONS = ('0', '2')
 
@@ -138,8 +139,8 @@ def verify_result(kind, report, cases, binaries, source):
                         and exact_integer(row.get('client_after_rebind'), minimum=1),
                         'silent download did not speak from the rebound tuple')
             preferred = {
-                'preferred': 'QNS authenticated preferred address ipv4=7f000001:44301 ipv6=00000000000000000000000000000000:0',
-                'preferred-ipv6': 'QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:44301',
+                'preferred': 'QNS authenticated preferred address ipv4=7f000001:' + str(PORT + 1) + ' ipv6=00000000000000000000000000000000:0',
+                'preferred-ipv6': 'QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:' + str(PORT + 1),
             }
             if row.get('case') in preferred:
                 expected = [preferred[row['case']]]
@@ -302,18 +303,18 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
         names = ['file' + str(index) for index in range(count)]
         expected = [str(binaries['client'].resolve()), fixture('root.der'),
                     '::1' if case in ('ipv6', 'preferred-ipv6') else '127.0.0.1',
-                    '44302' if case in ('rebind-routes', 'rebind-pending', 'rebind-silent') else '44300',
+                    str(PORT + 2) if case in ('rebind-routes', 'rebind-pending', 'rebind-silent') else str(PORT),
                     str(workspace / (case + '-client.keys')),
                     str(workspace / (case + '-downloads')), testcase, *names]
         expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
             fixture('root.der'), str(workspace / (case + '-server.keys')),
-            str(workspace / (case + '-www')), testcase, fixture('server.der'), '--port=44300']
+            str(workspace / (case + '-www')), testcase, fixture('server.der'), '--port=' + str(PORT)]
         if case == 'preferred':
-            expected_server += ['--preferred-ipv4=7f000001', '--preferred-port=44301']
+            expected_server += ['--preferred-ipv4=7f000001', '--preferred-port=' + str(PORT + 1)]
         if case == 'preferred-ipv6':
             expected_server += ['--preferred-ipv4=00000000',
                                 '--preferred-ipv6=00000000000000000000000000000001',
-                                '--preferred-port=44301']
+                                '--preferred-port=' + str(PORT + 1)]
         require(command == expected and endpoint == expected_server,
                 'local testcase/client-server/fixture argv binding mismatch')
         require(roles['payloads'] == ['fixtures/' + case + '-www/' + name for name in sorted(names)]
@@ -325,7 +326,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
     require(kind == 'vn' and case == 'reserved-version', 'unknown version-negotiation case')
     expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
         fixture('root.der'), str(workspace / 'keys'), str(workspace / 'www'),
-        'transfer', fixture('server.der'), '--port=44300']
+        'transfer', fixture('server.der'), '--port=' + str(PORT)]
     require(command is None and endpoint == expected_server,
             'version-negotiation server/fixture argv binding mismatch')
     require(roles['packets'] == ['fixtures/request.bin', 'fixtures/response.bin']

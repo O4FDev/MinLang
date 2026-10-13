@@ -18,8 +18,8 @@ check-quic-rfc: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_I
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-rfc.py --optimization both --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	python3 tests/quic-rfc-harness.py
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-rfc.py --optimization both --sanitize --artifacts "$$artifacts/run"
+	MINYAR_QUIC_RFC_PORT=44310 python3 tests/quic-rfc-harness.py
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-rfc.py --optimization both --sanitize --artifacts "$$artifacts/run"
 
 check check-portable check-quic: check-quic-rfc
 check-sanitize check-quic-sanitize: check-quic-rfc-sanitize
