@@ -1,7 +1,42 @@
 /* The real disposable Keychain fixture calls this while its identity exists. */
 #include "../runtime/native/http.m"
 #include <assert.h>
+#include <objc/runtime.h>
 extern void minyar_rc_release(void *);
+
+static void http_fixture_challenge(id delegate, SEL selector, NSURLSession *session,
+                                  NSURLSessionTask *task, NSURLAuthenticationChallenge *challenge,
+                                  void (^handler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
+    (void)delegate; (void)selector; (void)session;
+    MHRequest *request=requestFor(task);
+    const char *anchor=getenv("MINYAR_TEST_OS_TLS_CA");
+    if (!anchor || ![challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+        http_authenticate(request,challenge,handler); return;
+    }
+    NSURL *origin=[NSURL URLWithString:[NSString stringWithUTF8String:getenv("MINYAR_TEST_OS_TLS_URL")]];
+    NSURLProtectionSpace *space=challenge.protectionSpace;
+    NSURL *challenged=[NSURL URLWithString:[NSString stringWithFormat:@"%@://%@:%ld/",space.protocol,space.host,(long)space.port]];
+    if (!request || request.done || space.isProxy || challenge.previousFailureCount || !http_same_origin(origin,challenged)) {
+        handler(NSURLSessionAuthChallengeCancelAuthenticationChallenge,nil); return;
+    }
+    NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:anchor]];
+    SecCertificateRef certificate=data?SecCertificateCreateWithData(NULL,(__bridge CFDataRef)data):NULL;
+    SecTrustRef trust=space.serverTrust;
+    BOOL valid=NO;
+    if (certificate && trust) {
+        SecPolicyRef policy=SecPolicyCreateSSL(true,(__bridge CFStringRef)space.host);
+        NSArray *anchors=@[(__bridge id)certificate];
+        assert(policy && SecTrustSetPolicies(trust,policy)==errSecSuccess);
+        assert(SecTrustSetNetworkFetchAllowed(trust,false)==errSecSuccess);
+        assert(SecTrustSetAnchorCertificates(trust,(__bridge CFArrayRef)anchors)==errSecSuccess);
+        assert(SecTrustSetAnchorCertificatesOnly(trust,true)==errSecSuccess);
+        valid=SecTrustEvaluateWithError(trust,NULL);
+        CFRelease(policy);
+    }
+    if (certificate) CFRelease(certificate);
+    handler(valid?NSURLSessionAuthChallengeUseCredential:NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+            valid?[NSURLCredential credentialForTrust:trust]:nil);
+}
 
 static MinyarText http_test_text(const char *value) {
     return (MinyarText){(const unsigned char *)value,(long long)strlen(value),-1,NULL,NULL};
@@ -66,6 +101,10 @@ void minyar_test_http_identity(const MinyarBytes *reference) { @autoreleasepool 
     });
     const char *url=getenv("MINYAR_TEST_OS_TLS_URL");
     if (url) {
+        SEL selector=@selector(URLSession:task:didReceiveChallenge:completionHandler:);
+        Method method=class_getInstanceMethod([MHDelegate class],selector);
+        assert(method);
+        class_replaceMethod([MHDelegate class],selector,(IMP)http_fixture_challenge,method_getTypeEncoding(method));
         MinyarText method=http_test_text("GET"),address=http_test_text(url),blank=http_test_text("");
         long long handle=minyar_http_beginWithIdentity(&method,&address,&blank,&blank,reference,&empty);
         assert(minyar_http_wait(handle,10));

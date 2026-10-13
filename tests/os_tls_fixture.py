@@ -1,9 +1,3 @@
-"""Independent OpenSSL mTLS peer and one exact, disposable CI trust anchor.
-
-Installing a root is restricted to GitHub's disposable macOS runner. It never
-runs on a developer workstation. Cleanup removes only the generated root.
-"""
-from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -37,10 +31,12 @@ class Peer:
     def __init__(self, directory, client_certificate):
         self.directory = Path(directory)
         self.root = self.directory/'os-root.pem'
+        self.anchor = self.directory/'os-root.der'
         self.accepted = 0
         self.spied = 0
         openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
                 '-subj', '/CN=Minyar disposable OS TLS root', '-keyout', self.directory/'os-root.key', '-out', self.root)
+        openssl('x509', '-in', self.root, '-outform', 'DER', '-out', self.anchor)
         openssl('req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost',
                 '-keyout', self.directory/'os-server.key', '-out', self.directory/'os-server.csr')
         extensions = self.directory/'os-server.ext'
@@ -97,35 +93,12 @@ class Peer:
         self.thread.start()
         self.url = f'https://127.0.0.1:{self.server.server_port}/'
 
-    @contextmanager
-    def trusted(self):
+    def explicit_anchor(self):
         if not (sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true'
                 and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
                 and os.environ.get('RUNNER_OS') == 'macOS'):
-            raise RuntimeError('OS root installation requires a disposable GitHub macOS runner')
-        fingerprint = openssl('x509', '-in', self.root, '-noout', '-fingerprint', '-sha1').strip().split('=')[1].replace(':', '')
-        keychain = '/Library/Keychains/System.keychain'
-        installed = False
-        try:
-            subprocess.run(['sudo', '-n', 'security', 'add-trusted-cert', '-d', '-r', 'trustRoot', '-k', keychain, self.root],
-                           check=True, capture_output=True, timeout=30)
-            installed = True
-            yield
-        finally:
-            # Exact freshly generated certificate only. A cleanup failure fails
-            # the test; it cannot turn a failed handshake into a pass.
-            failures = []
-            for command in (['sudo', '-n', 'security', 'remove-trusted-cert', '-d', self.root],
-                            ['sudo', '-n', 'security', 'delete-certificate', '-Z', fingerprint, keychain]):
-                try:
-                    result = subprocess.run(command, capture_output=True, timeout=30)
-                except subprocess.TimeoutExpired as error:
-                    failures.append(str(error))
-                else:
-                    if result.returncode:
-                        failures.append(result.stderr.decode(errors='replace'))
-            if installed and failures:
-                raise RuntimeError('could not remove the disposable OS TLS root: ' + '; '.join(failures))
+            raise RuntimeError('explicit OS TLS fixture anchors require a disposable GitHub macOS runner')
+        return self.anchor
 
     def close(self):
         self.server.shutdown()

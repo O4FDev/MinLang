@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Disposable-keychain signatures with real Security.framework and eager RC."""
 import os
+import hashlib
 from contextlib import ExitStack
 from pathlib import Path
 import subprocess
@@ -24,13 +25,20 @@ with tempfile.TemporaryDirectory(prefix='minyar-keychain-', dir=ROOT/'build') as
     peer = Peer(temp, temp/'cert.pem') if os.environ.get('GITHUB_ACTIONS') == 'true' else None
     if peer:
         cleanup.callback(peer.close)
-    def execute(executable, keychain, *, rejected=False):
+    public_chain = ROOT/'tests/fixtures/system-root-public-chain.bin'
+    assert hashlib.sha256(public_chain.read_bytes()).hexdigest() == '1026800ed0440b976845a5046779c7601b13f349c0e32df710b7d23f3382d6b7'
+    def execute(executable, keychain, *, rejected=False, anchor=None):
         environment=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',UBSAN_OPTIONS='halt_on_error=1')
+        environment['MINYAR_TEST_SYSTEM_ROOT_CHAIN']=str(public_chain)
+        for name in ('MINYAR_TEST_OS_TLS_CA', 'MINYAR_TEST_OS_TLS_REJECT'):
+            environment.pop(name, None)
         if peer:
             environment['MINYAR_TEST_OS_TLS_URL']=peer.url
             environment['MINYAR_TEST_OS_TLS_REDIRECT']=peer.url+'redirect'
         if rejected:
             environment['MINYAR_TEST_OS_TLS_REJECT']='1'
+        if anchor:
+            environment['MINYAR_TEST_OS_TLS_CA']=str(anchor)
         subprocess.run([executable,temp/'identity.p12',keychain],check=True,timeout=30,env=environment)
     for sanitized in (False, True):
         mode = 'sanitize' if sanitized else 'native'
@@ -50,8 +58,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-keychain-', dir=ROOT/'build') as
         if peer:
             execute(executable,temp/(mode+'-untrusted.keychain-db'),rejected=True)
             before=peer.accepted
-            with peer.trusted():
-                execute(executable,temp/(mode+'.keychain-db'))
+            execute(executable,temp/(mode+'.keychain-db'),anchor=peer.explicit_anchor())
             assert peer.accepted==before+2 and peer.spied==0, (peer.accepted,peer.spied)
         else:
             execute(executable,temp/(mode+'.keychain-db'))
