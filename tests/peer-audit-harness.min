@@ -1,0 +1,287 @@
+use "../tools/testing.min" as test
+use "files" as files
+use "json" as json
+use "../tools/peer-audit.min" as audit
+
+function put(target: json.Value, name: Text, value: json.Value) {
+    for index in 0..target.keys.length {
+        if target.keys[index] == name { target.items[index] = value; return }
+    }
+    target.keys.add(name)
+    target.items.add(value)
+}
+let family = "AuditHarness"
+let shared = audit.newDomains()
+
+function writeRows(path: Text, rows: List<json.Value>) {
+    let parts: List<Text> = []
+    for row in rows { parts.add(audit.encode(row)); parts.add("\n") }
+    writeTextFile(path, joinText(parts))
+}
+function readRow(path: Text): json.Value {
+    let row = json.parse(test.lines(readTextFile(path))[0])
+    test.check(row.kind == json.OBJECT, "fixture row is not an object: " + path)
+    return row
+}
+function fixture(): Text {
+    let root = test.scratch()
+    for language in audit.languages() {
+        let directory = root + "/" + language
+        test.check(files.makeDirectory(directory) == 0, "cannot create " + directory)
+        let file = audit.object(["path", "sha256", "status"], [audit.text("test"), audit.text("hash"), audit.text("reviewed")])
+        let inventory = audit.object(["schema_version", "repo", "sha", "files", "total", "reviewed", "discovery_complete", "case_enumeration_complete"],
+            [audit.integer(1), audit.text("example/" + language), audit.text("frozen"), audit.array([file]), audit.integer(1), audit.integer(1), audit.boolean(true), audit.boolean(true)])
+        writeTextFile(directory + "/inventory.json", audit.encode(inventory))
+        let row = audit.object(["language", "repo", "revision", "path", "source_sha256", "case_id", "lines", "disposition", "reason", "implementation_needed"],
+            [audit.text(language), audit.text("example/" + language), audit.text("frozen"), audit.text("test"), audit.text("hash"), audit.text("assertion"), audit.integers([1, 1]), audit.text("covered"), audit.text("Controlled fixture"), audit.boolean(false)])
+        writeRows(directory + "/decisions.jsonl", [row])
+    }
+    return root
+}
+function mutateInventory(root: Text, name: Text, value: json.Value) {
+    let path = root + "/python/inventory.json"
+    let row = json.parse(readTextFile(path))
+    put(row, name, value)
+    writeTextFile(path, audit.encode(row))
+}
+function inspect(root: Text, shared: audit.Domains): json.Value { return audit.inspect(audit.newAudit(shared), root, "") }
+function complete(report: json.Value): Boolean { return json.member(report, "complete").truth }
+function hasErrors(report: json.Value): Boolean { return json.member(report, "errors").items.length > 0 }
+function languageRow(report: json.Value, language: Text): json.Value {
+    for row in json.member(report, "languages").items { if json.member(row, "language").text == language { return row } }
+    fail("language missing from report: " + language)
+}
+function count(row: json.Value, name: Text): Integer { return Integer(json.member(row, name).text) }
+function digestFile(path: Text): Text { return audit.digest(files.readFile(path)) }
+
+function test_complete_control_and_pending_discovery(root: Text, shared: audit.Domains) {
+    test.check(complete(inspect(root, shared)), "controlled ledger is complete")
+    mutateInventory(root, "discovery_complete", audit.boolean(false))
+    test.check(!complete(inspect(root, shared)), "pending discovery blocks completion")
+}
+function test_pending_file_cannot_be_hidden_by_declared_count(root: Text, shared: audit.Domains) {
+    mutateInventory(root, "files", audit.array([audit.object(["path", "sha256", "status"], [audit.text("test"), audit.text("hash"), audit.text("pending")])]))
+    let report = inspect(root, shared)
+    test.check(!complete(report), "pending file blocks completion")
+    test.check(hasErrors(report), "pending file hidden by declared count is an error")
+}
+function test_reviewed_file_requires_case_or_support_explanation(root: Text, shared: audit.Domains) {
+    writeTextFile(root + "/python/decisions.jsonl", "")
+    test.check(hasErrors(inspect(root, shared)), "reviewed file without decisions is an error")
+    mutateInventory(root, "files", audit.array([audit.object(["path", "sha256", "status", "no_tests", "scope_disposition", "review_reason"],
+        [audit.text("test"), audit.text("hash"), audit.text("reviewed"), audit.boolean(true), audit.text("support"), audit.text("Empty fixture consumed by import case")])]))
+    test.check(complete(inspect(root, shared)), "explicit support scope completes the reviewed file")
+}
+function test_missing_case_enumeration_blocks_completion(root: Text, shared: audit.Domains) {
+    mutateInventory(root, "case_enumeration_complete", audit.boolean(false))
+    let report = inspect(root, shared)
+    test.check(!complete(report), "pending case enumeration blocks completion")
+    test.check(!hasErrors(report), "pending case enumeration is not an inconsistency")
+}
+function test_deferred_disposition_blocks_completion_after_source_review(root: Text, shared: audit.Domains) {
+    let path = root + "/python/decisions.jsonl"
+    let row = readRow(path)
+    put(row, "disposition", audit.text("defer"))
+    put(row, "implementation_needed", audit.boolean(false))
+    put(row, "reason", audit.text("Source read; applicability decision still unresolved"))
+    writeRows(path, [row])
+    let report = inspect(root, shared)
+    test.check(!hasErrors(report), "deferred decision is consistent")
+    test.check(!complete(report), "deferred decision blocks completion")
+    test.check(count(json.member(report, "languages").items[0], "deferred_decisions") == 1, "one deferred decision counted")
+}
+function test_implementation_needs_matching_evidence(root: Text, shared: audit.Domains) {
+    let path = root + "/python/decisions.jsonl"
+    let implementations = root + "/implementations.jsonl"
+    let row = readRow(path)
+    put(row, "disposition", audit.text("adapt"))
+    put(row, "implementation_needed", audit.boolean(true))
+    writeRows(path, [row])
+    test.check(!complete(inspect(root, shared)), "needed implementation blocks completion")
+    let keys: List<Text> = []
+    let values: List<json.Value> = []
+    for key in audit.keyFields() { keys.add(key); values.add(json.member(row, key)) }
+    let resolution = audit.object(keys, values)
+    writeRows(implementations, [resolution])
+    test.check(hasErrors(inspect(root, shared)), "resolution without tests or validation is an error")
+    let valid = "tests/peer-audit-harness.min:AuditHarness.test_implementation_needs_matching_evidence"
+    put(resolution, "tests", audit.texts([valid]))
+    put(resolution, "validation", audit.texts(["controlled-pass"]))
+    writeRows(implementations, [resolution])
+    test.check(complete(inspect(root, shared)), "resolved implementation completes")
+    put(resolution, "source_sha256", json.member(row, "source_sha256"))
+    writeRows(implementations, [resolution])
+    test.check(complete(inspect(root, shared)), "matching recorded source hash completes")
+    put(resolution, "source_sha256", audit.text("different-source"))
+    writeRows(implementations, [resolution])
+    test.check(hasErrors(inspect(root, shared)), "different recorded source hash is an error")
+    put(resolution, "source_sha256", json.member(row, "source_sha256"))
+    for invalid in ["tests/nonexistent-peer-test.py", "tests/peer-audit-harness.min:AuditHarness.test_missing", "tests/peer-audit-harness.min:WrongClass.test_implementation_needs_matching_evidence"] {
+        put(resolution, "tests", audit.texts([invalid]))
+        writeRows(implementations, [resolution])
+        test.check(hasErrors(inspect(root, shared)), "invalid test reference is an error: " + invalid)
+    }
+    put(resolution, "tests", audit.texts([valid]))
+    put(resolution, "case_id", audit.text("different-case"))
+    writeRows(implementations, [resolution])
+    test.check(hasErrors(inspect(root, shared)), "resolution for an unknown case is an error")
+}
+function test_orphan_review_scope_reports_error(root: Text, shared: audit.Domains) {
+    mutateInventory(root, "reviewed_file_scopes", audit.array([audit.object(["path", "sha256"], [audit.text("missing"), audit.text("hash")])]))
+    let report = inspect(root, shared)
+    test.check(!complete(report), "orphan review scope blocks completion")
+    test.check(hasErrors(report), "orphan review scope is an error")
+}
+function generatedRows(root: Text, shared: audit.Domains): List<json.Value> {
+    let rowPath = root + "/python/decisions.jsonl"
+    let row = readRow(rowPath)
+    let artifact = root + "/python/generated-domains.jsonl"
+    let cohorts: List<json.Value> = []
+    for operation in ["truncating-division", "remainder", "floor-division"] {
+        cohorts.add(audit.object(["operation", "count", "disposition", "rule"], [audit.text(operation), audit.integer(16), audit.text("covered"), audit.text("controlled rule")]))
+    }
+    let domain = audit.object(["repo", "revision", "path", "source_sha256", "schema_version", "domain_id", "ordered_values", "excluded_pairs", "case_identity", "review_method", "oracle_rules", "total_instances", "reviewed_instances", "cohorts"],
+        [json.member(row, "repo"), json.member(row, "revision"), json.member(row, "path"), json.member(row, "source_sha256"), audit.integer(1), audit.text("controlled-domain"), audit.integers([-2, -1, 1, 2]), audit.array([]),
+         audit.text("operator/a-index/b-index"), audit.text("controlled finite proof"), audit.object(["integer"], [audit.text("exact quotient and remainder")]), audit.integer(48), audit.integer(48), audit.array(cohorts)])
+    writeRows(artifact, [domain])
+    let rows: List<json.Value> = []
+    for cohort in cohorts {
+        let operation = json.member(cohort, "operation")
+        let reference = audit.object(["artifact", "sha256", "domain_id", "cohort", "instances"],
+            [audit.text("tests/data/peer/python/generated-domains.jsonl"), audit.text(digestFile(artifact)), audit.text("controlled-domain"), operation, audit.integer(16)])
+        rows.add(audit.replaced(audit.replaced(row, "case_id", operation), "generated_domain", reference))
+    }
+    writeRows(rowPath, rows)
+    test.check(complete(inspect(root, shared)), "every generated cohort referenced completes")
+    writeRows(rowPath, [rows[0]])
+    let incomplete = inspect(root, shared)
+    test.check(!complete(incomplete), "unreferenced cohorts block completion")
+    test.check(!hasErrors(incomplete), "unreferenced cohorts are not inconsistent")
+    test.check(count(json.member(incomplete, "languages").items[0], "unchecked_generated_domains") == 2, "two unreferenced cohorts counted")
+    writeRows(rowPath, rows)
+    put(json.member(domain, "cohorts").items[0], "count", audit.integer(15))
+    writeRows(artifact, [domain])
+    test.check(hasErrors(inspect(root, shared)), "artifact hash and cardinality changes are errors")
+    for item in rows { put(json.member(item, "generated_domain"), "sha256", audit.text(digestFile(artifact))) }
+    writeRows(rowPath, rows)
+    test.check(hasErrors(inspect(root, shared)), "cohort cardinality mismatch is an error")
+    return rows
+}
+function test_generated_domain_hash_and_cardinality_are_required(root: Text, shared: audit.Domains) { generatedRows(root, shared) }
+function test_all_generated_references_cannot_be_deleted(root: Text, shared: audit.Domains) {
+    generatedRows(root, shared)
+    let artifact = root + "/python/generated-domains.jsonl"
+    let domain = readRow(artifact)
+    put(json.member(domain, "cohorts").items[0], "count", audit.integer(16))
+    writeRows(artifact, [domain])
+    let path = root + "/python/decisions.jsonl"
+    let row = audit.removed(readRow(path), "generated_domain")
+    writeRows(path, [row])
+    let report = inspect(root, shared)
+    test.check(!hasErrors(report), "deleting every reference is not an inconsistency")
+    test.check(!complete(report), "deleting every reference blocks completion")
+    test.check(count(json.member(report, "languages").items[0], "unchecked_generated_domains") == 3, "all three cohorts remain unchecked")
+}
+function test_zig_domain_requires_every_reference_and_resolution(root: Text, shared: audit.Domains) {
+    let domain = audit.zigExpected(shared)
+    let source = audit.zigSource()
+    let directory = root + "/zig"
+    let artifact = directory + "/log-int-generated-domain.json"
+    writeTextFile(artifact, audit.encode(domain))
+    let inventory = audit.object(["schema_version", "repo", "sha", "files", "total", "reviewed", "discovery_complete", "case_enumeration_complete"],
+        [audit.integer(1), json.member(source, "repo"), json.member(source, "revision"),
+         audit.array([audit.object(["path", "sha256", "status"], [json.member(source, "path"), json.member(source, "source_sha256"), audit.text("reviewed")])]),
+         audit.integer(1), audit.integer(1), audit.boolean(true), audit.boolean(true)])
+    writeTextFile(directory + "/inventory.json", audit.encode(inventory))
+    let rows: List<json.Value> = []
+    for cohort in json.member(domain, "cohorts").items {
+        let id = json.member(cohort, "id").text
+        let kind = json.member(cohort, "disposition")
+        let row = audit.copy(source)
+        put(row, "case_id", audit.text("generated-domain/" + id))
+        put(row, "lines", audit.integers([1, 1]))
+        put(row, "disposition", kind)
+        put(row, "reason", audit.text("Controlled exact domain"))
+        put(row, "implementation_needed", audit.boolean(kind.text == "adapt"))
+        put(row, "generated_domain", audit.object(["artifact", "sha256", "domain_id", "cohort", "instances"],
+            [audit.text("tests/data/peer/zig/log-int-generated-domain.json"), audit.text(digestFile(artifact)), json.member(domain, "domain_id"), audit.text(id), json.member(cohort, "instances")]))
+        rows.add(row)
+    }
+    let path = directory + "/decisions.jsonl"
+    writeRows(path, rows)
+    let report = inspect(root, shared)
+    test.check(!hasErrors(report), "exact zig domain references are consistent")
+    test.check(!complete(report), "unresolved zig adaptations block completion")
+    let resolutions: List<json.Value> = []
+    for row in rows {
+        if !json.member(row, "implementation_needed").truth { continue }
+        let resolution = audit.copy(row)
+        put(resolution, "tests", audit.texts(["tests/peer-audit-harness.min:AuditHarness.test_zig_domain_requires_every_reference_and_resolution"]))
+        put(resolution, "validation", audit.texts(["controlled-pass"]))
+        resolutions.add(resolution)
+    }
+    writeRows(root + "/implementations.jsonl", resolutions)
+    test.check(complete(inspect(root, shared)), "resolved zig domain completes")
+    let fewer: List<json.Value> = []
+    for index in 0..(rows.length - 1) { fewer.add(rows[index]) }
+    writeRows(path, fewer)
+    test.check(!complete(inspect(root, shared)), "missing zig cohort reference blocks completion")
+    writeRows(root + "/implementations.jsonl", [])
+    let ordinary = audit.copy(source)
+    put(ordinary, "case_id", audit.text("ordinary"))
+    put(ordinary, "lines", audit.integers([1, 1]))
+    put(ordinary, "disposition", audit.text("covered"))
+    put(ordinary, "implementation_needed", audit.boolean(false))
+    put(ordinary, "reason", audit.text("Another ordinary source case"))
+    writeRows(path, [ordinary])
+    report = inspect(root, shared)
+    test.check(!hasErrors(report), "ordinary zig row is consistent")
+    test.check(!complete(report), "unreferenced zig domain blocks completion")
+    test.check(count(languageRow(report, "zig"), "unchecked_generated_domains") == 4, "all four zig cohorts remain unchecked")
+}
+function test_duplicate_and_mismatched_decisions_rejected(root: Text, shared: audit.Domains) {
+    let path = root + "/python/decisions.jsonl"
+    let row = readRow(path)
+    writeRows(path, [row, row])
+    test.check(hasErrors(inspect(root, shared)), "duplicate decision is an error")
+    put(row, "source_sha256", audit.text("different"))
+    writeRows(path, [row])
+    test.check(hasErrors(inspect(root, shared)), "decision hash mismatch is an error")
+}
+
+let names = ["test_complete_control_and_pending_discovery", "test_pending_file_cannot_be_hidden_by_declared_count", "test_reviewed_file_requires_case_or_support_explanation", "test_missing_case_enumeration_blocks_completion", "test_deferred_disposition_blocks_completion_after_source_review", "test_implementation_needs_matching_evidence", "test_orphan_review_scope_reports_error", "test_generated_domain_hash_and_cardinality_are_required", "test_all_generated_references_cannot_be_deleted", "test_zig_domain_requires_every_reference_and_resolution", "test_duplicate_and_mismatched_decisions_rejected"]
+for index in 0..argumentCount() {
+    let value = argument(index)
+    let valid = value == family || value == "-v"
+    for name in names { if value == name || value == family + "." + name { valid = true } }
+    test.check(valid, "unknown " + family + " selector: " + value)
+}
+let ran = 0
+for name in names {
+    let chosen = true
+    let selectors = 0
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        if value == "-v" { continue }
+        if selectors == 0 { chosen = false }
+        selectors += 1
+        if value == family || value == name || value == family + "." + name { chosen = true }
+    }
+    if !chosen { continue }
+    let root = fixture()
+    if name == "test_complete_control_and_pending_discovery" { test_complete_control_and_pending_discovery(root, shared) }
+    if name == "test_pending_file_cannot_be_hidden_by_declared_count" { test_pending_file_cannot_be_hidden_by_declared_count(root, shared) }
+    if name == "test_reviewed_file_requires_case_or_support_explanation" { test_reviewed_file_requires_case_or_support_explanation(root, shared) }
+    if name == "test_missing_case_enumeration_blocks_completion" { test_missing_case_enumeration_blocks_completion(root, shared) }
+    if name == "test_deferred_disposition_blocks_completion_after_source_review" { test_deferred_disposition_blocks_completion_after_source_review(root, shared) }
+    if name == "test_implementation_needs_matching_evidence" { test_implementation_needs_matching_evidence(root, shared) }
+    if name == "test_orphan_review_scope_reports_error" { test_orphan_review_scope_reports_error(root, shared) }
+    if name == "test_generated_domain_hash_and_cardinality_are_required" { test_generated_domain_hash_and_cardinality_are_required(root, shared) }
+    if name == "test_all_generated_references_cannot_be_deleted" { test_all_generated_references_cannot_be_deleted(root, shared) }
+    if name == "test_zig_domain_requires_every_reference_and_resolution" { test_zig_domain_requires_every_reference_and_resolution(root, shared) }
+    if name == "test_duplicate_and_mismatched_decisions_rejected" { test_duplicate_and_mismatched_decisions_rejected(root, shared) }
+    test.removeTree(root)
+    ran += 1
+    print(family + "." + name + " ... ok")
+}
+print("Ran " + Text(ran) + " " + family + " tests: OK")

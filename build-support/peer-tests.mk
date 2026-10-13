@@ -55,17 +55,22 @@ check-stateful-lists-sanitize: build/minyarc-sanitize build/ownership-runtime.o 
 	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stateful-lists
 
 check-sanitize: check-stateful-lists-sanitize
-check-peer-audit-harness:
-	python3 tests/peer-audit-harness.py
-	python3 tests/peer-go-domains.py
-	python3 tests/peer-zig-domains.py
+PEER_AUDIT_PROGRAMS = build/tooling/tools/check-peer-audit build/tooling/tests/peer-audit-harness build/tooling/tests/peer-go-domains build/tooling/tests/peer-zig-domains
+$(PEER_AUDIT_PROGRAMS): TOOL_NATIVE = runtime/native/sha256.c
+$(PEER_AUDIT_PROGRAMS): TOOL_LIBS = $(TOOL_CRYPTO)
+$(PEER_AUDIT_PROGRAMS): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(PEER_AUDIT_PROGRAMS): runtime/native/sha256.c build/testing/cycle-runtime.o
+check-peer-audit-harness: build/tooling/tests/peer-audit-harness build/tooling/tests/peer-go-domains build/tooling/tests/peer-zig-domains
+	./build/tooling/tests/peer-audit-harness
+	./build/tooling/tests/peer-go-domains
+	./build/tooling/tests/peer-zig-domains
 
 .PHONY: check-peer-audit check-peer-audit-complete
-check-peer-audit: check-peer-audit-harness
-	python3 tools/check-peer-audit.py
+check-peer-audit: check-peer-audit-harness build/tooling/tools/check-peer-audit
+	./build/tooling/tools/check-peer-audit
 
 check-peer-audit-complete: check-peer-audit
-	python3 tools/check-peer-audit.py --require-complete
+	./build/tooling/tools/check-peer-audit --require-complete
 
 .PHONY: check-suite-catalogue
 check-suite-catalogue: build/tooling/tests/suite-catalogue

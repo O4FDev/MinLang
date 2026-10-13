@@ -1,0 +1,178 @@
+use "../tools/testing.min" as test
+use "json" as json
+use "../tools/peer-audit.min" as audit
+
+function put(target: json.Value, name: Text, value: json.Value) {
+    for index in 0..target.keys.length {
+        if target.keys[index] == name { target.items[index] = value; return }
+    }
+    target.keys.add(name)
+    target.items.add(value)
+}
+let family = "ZigDomains"
+
+function ledgerRows(domain: json.Value): List<json.Value> {
+    let rows: List<json.Value> = []
+    for cohort in json.member(domain, "cohorts").items {
+        let row = audit.copy(audit.zigSource())
+        let kind = json.member(cohort, "disposition")
+        put(row, "case_id", audit.text("generated-domain/" + json.member(cohort, "id").text))
+        put(row, "disposition", kind)
+        put(row, "implementation_needed", audit.boolean(kind.text == "adapt"))
+        put(row, "generated_domain", audit.object(["domain_id", "cohort", "instances"], [json.member(domain, "domain_id"), json.member(cohort, "id"), json.member(cohort, "instances")]))
+        rows.add(row)
+    }
+    return rows
+}
+function resolutionsFor(rows: List<json.Value>): List<json.Value> {
+    let result: List<json.Value> = []
+    for row in rows { if json.member(row, "implementation_needed").truth { result.add(audit.copy(row)) } }
+    return result
+}
+function rejectsDomain(shared: audit.Domains, broken: json.Value, label: Text) {
+    test.check(audit.zigValidateDomain(shared, broken).error != "", "zig domain accepted " + label)
+}
+function cohortAt(domain: json.Value, index: Integer): json.Value { return json.member(domain, "cohorts").items[index] }
+function plus(value: json.Value, suffix: Text): json.Value { return audit.text(value.text + suffix) }
+function without(rows: List<json.Value>, skipped: Integer): List<json.Value> {
+    let result: List<json.Value> = []
+    for index in 0..rows.length { if index != skipped { result.add(rows[index]) } }
+    return result
+}
+
+function test_complete_exact_domain_and_reference_partition(shared: audit.Domains) {
+    let domain = audit.zigExpected(shared)
+    let counts: List<Text> = []
+    for cohort in json.member(domain, "cohorts").items { counts.add(json.member(cohort, "instances").text) }
+    test.check(counts.length == 4 && counts[0] == "514804" && counts[1] == "210" && counts[2] == "65815" && counts[3] == "65899", "zig cohort cardinalities")
+    test.check(json.member(domain, "total_instances").text == "646728", "zig total instances")
+    let validated = audit.zigValidateDomain(shared, domain)
+    test.check(validated.error == "", validated.error)
+    let names = audit.zigCohortNames()
+    test.check(validated.ids.length == names.length, "zig cohort order")
+    for index in 0..names.length { test.check(validated.ids[index] == names[index], "zig cohort order") }
+    let rows = ledgerRows(domain)
+    let failure = audit.zigValidateComplete(shared, domain, rows, resolutionsFor(rows))
+    test.check(failure == "", failure)
+}
+function test_concrete_boundary_identities_and_exclusions(shared: audit.Domains) {
+    let wanted = ["bits64/base2/power63/below", "bits64/base2/power63/at", "bits16/base1025/power1/at", "bits2/base3/one", "bits16/n65535"]
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    for instance in audit.zigInstances() {
+        let selected = false
+        for name in wanted { if instance.identity == name { selected = true } }
+        if !selected { continue }
+        keys.add(instance.cohort + " " + instance.identity)
+        values.add(Text(instance.base) + "," + audit.u64Text(instance.value) + "," + Text(instance.expected))
+    }
+    let expectedKeys = ["boundary-representable bits64/base2/power63/below", "boundary-outside-integer bits64/base2/power63/at", "boundary-representable bits16/base1025/power1/at", "boundary-representable bits2/base3/one", "log2-comparison bits16/n65535", "log10-comparison bits16/n65535"]
+    let expectedValues = ["2,9223372036854775807,62", "2,9223372036854775808,63", "1025,1025,1", "3,1,0", "2,65535,15", "10,65535,4"]
+    for index in 0..expectedKeys.length {
+        let found = ""
+        for position in 0..keys.length { if keys[position] == expectedKeys[index] { found = values[position] } }
+        test.check(found == expectedValues[index], "zig instance " + expectedKeys[index] + ": " + found)
+    }
+}
+function test_wrong_source_hash_revision_or_domain_is_rejected(shared: audit.Domains) {
+    for field in ["source_sha256", "revision", "path", "repo", "domain_id"] {
+        let broken = audit.zigExpected(shared)
+        put(broken, field, plus(json.member(broken, field), "wrong"))
+        rejectsDomain(shared, broken, "a changed " + field)
+    }
+}
+function test_missing_extra_duplicate_or_deferred_cohort_is_rejected(shared: audit.Domains) {
+    for operation in ["missing", "extra", "duplicate", "defer", "wrong-adapt"] {
+        let broken = audit.zigExpected(shared)
+        let cohorts = json.member(broken, "cohorts")
+        if operation == "missing" { put(broken, "cohorts", audit.array(without(cohorts.items, cohorts.items.length - 1))) }
+        if operation == "extra" { cohorts.items.add(audit.copy(cohorts.items[0])) }
+        if operation == "duplicate" { cohorts.items[1] = audit.copy(cohorts.items[0]) }
+        if operation == "defer" { put(cohorts.items[0], "disposition", audit.text("defer")) }
+        if operation == "wrong-adapt" { put(cohorts.items[1], "disposition", audit.text("adapt")) }
+        rejectsDomain(shared, broken, operation)
+    }
+}
+function test_altered_inputs_or_oracles_counts_and_axes_are_rejected(shared: audit.Domains) {
+    for field in ["input_sha256", "oracle_sha256", "instances"] {
+        let broken = audit.zigExpected(shared)
+        let value = audit.text("0000000000000000000000000000000000000000000000000000000000000000")
+        if field == "instances" { value = audit.integer(514803) }
+        put(cohortAt(broken, 0), field, value)
+        rejectsDomain(shared, broken, "a changed cohort " + field)
+    }
+    for mutation in 0..6 {
+        let broken = audit.zigExpected(shared)
+        let axes = json.member(broken, "axes")
+        let bases = json.member(axes, "base_inclusive")
+        let bits = json.member(axes, "boundary_bits_inclusive")
+        if mutation == 0 { bases.items[1] = audit.integer(1024) }
+        if mutation == 1 { bits.items[0] = audit.boolean(true) }
+        if mutation == 2 { put(broken, "total_instances", audit.integer(646727)) }
+        if mutation == 3 { put(broken, "reviewed_instances", audit.integer(0)) }
+        if mutation == 4 { put(broken, "execution_claim", audit.boolean(true)) }
+        if mutation == 5 { put(broken, "ignored_unknown_field", audit.array([])) }
+        rejectsDomain(shared, broken, "axis or total mutation " + Text(mutation))
+    }
+}
+function test_ledger_mismatch_and_suppressed_implementation_are_rejected(shared: audit.Domains) {
+    let domain = audit.zigExpected(shared)
+    let rows = ledgerRows(domain)
+    for mutation in 0..6 {
+        let row = audit.copy(rows[0])
+        let reference = json.member(row, "generated_domain")
+        if mutation == 0 { put(row, "source_sha256", audit.text("0000000000000000000000000000000000000000000000000000000000000000")) }
+        if mutation == 1 { put(row, "disposition", audit.text("defer")) }
+        if mutation == 2 { put(row, "implementation_needed", audit.boolean(false)) }
+        if mutation == 3 { put(row, "case_id", audit.text("wrong")) }
+        if mutation == 4 { put(reference, "instances", audit.integer(1)) }
+        if mutation == 5 { put(reference, "cohort", audit.text("unknown")) }
+        test.check(audit.zigValidateReference(shared, row, json.member(row, "generated_domain"), domain).error != "", "zig reference accepted ledger mutation " + Text(mutation))
+    }
+}
+function test_unreferenced_and_unresolved_cohorts_cannot_complete(shared: audit.Domains) {
+    let domain = audit.zigExpected(shared)
+    let rows = ledgerRows(domain)
+    let resolutions = resolutionsFor(rows)
+    for index in 0..4 {
+        test.check(audit.zigValidateComplete(shared, domain, without(rows, index), resolutions) != "", "zig completion accepted a missing cohort " + Text(index))
+    }
+    let duplicated = without(rows, -1)
+    duplicated.add(rows[0])
+    test.check(audit.zigValidateComplete(shared, domain, duplicated, resolutions) != "", "zig completion accepted a duplicate cohort reference")
+    for index in 0..3 {
+        test.check(audit.zigValidateComplete(shared, domain, rows, without(resolutions, index)) != "", "zig completion accepted a missing resolution " + Text(index))
+    }
+}
+
+let names = ["test_complete_exact_domain_and_reference_partition", "test_concrete_boundary_identities_and_exclusions", "test_wrong_source_hash_revision_or_domain_is_rejected", "test_missing_extra_duplicate_or_deferred_cohort_is_rejected", "test_altered_inputs_or_oracles_counts_and_axes_are_rejected", "test_ledger_mismatch_and_suppressed_implementation_are_rejected", "test_unreferenced_and_unresolved_cohorts_cannot_complete"]
+for index in 0..argumentCount() {
+    let value = argument(index)
+    let valid = value == family || value == "-v"
+    for name in names { if value == name || value == family + "." + name { valid = true } }
+    test.check(valid, "unknown " + family + " selector: " + value)
+}
+let shared = audit.newDomains()
+let ran = 0
+for name in names {
+    let chosen = true
+    let selectors = 0
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        if value == "-v" { continue }
+        if selectors == 0 { chosen = false }
+        selectors += 1
+        if value == family || value == name || value == family + "." + name { chosen = true }
+    }
+    if !chosen { continue }
+    if name == "test_complete_exact_domain_and_reference_partition" { test_complete_exact_domain_and_reference_partition(shared) }
+    if name == "test_concrete_boundary_identities_and_exclusions" { test_concrete_boundary_identities_and_exclusions(shared) }
+    if name == "test_wrong_source_hash_revision_or_domain_is_rejected" { test_wrong_source_hash_revision_or_domain_is_rejected(shared) }
+    if name == "test_missing_extra_duplicate_or_deferred_cohort_is_rejected" { test_missing_extra_duplicate_or_deferred_cohort_is_rejected(shared) }
+    if name == "test_altered_inputs_or_oracles_counts_and_axes_are_rejected" { test_altered_inputs_or_oracles_counts_and_axes_are_rejected(shared) }
+    if name == "test_ledger_mismatch_and_suppressed_implementation_are_rejected" { test_ledger_mismatch_and_suppressed_implementation_are_rejected(shared) }
+    if name == "test_unreferenced_and_unresolved_cohorts_cannot_complete" { test_unreferenced_and_unresolved_cohorts_cannot_complete(shared) }
+    ran += 1
+    print(family + "." + name + " ... ok")
+}
+print("Ran " + Text(ran) + " " + family + " tests: OK")

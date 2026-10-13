@@ -1,0 +1,1423 @@
+use "files" as files
+use "json" as json
+use "sha256" as sha256
+
+public constant MAXIMUM = 9223372036854775807
+public constant MINIMUM = -9223372036854775808
+public constant GO_REVISION = "6f5c275ebdc454197fff5f1496521c8f81e20eef"
+
+public record Check { known: Boolean; error: Text }
+public record Cohorts { ids: List<Text>; cohorts: List<json.Value>; error: Text }
+public record U64 { high: Integer; low: Integer; overflow: Boolean }
+public record ZigInstance { cohort: Text; identity: Text; base: Integer; value: U64; expected: Integer }
+public record Domains { expected: List<json.Value> }
+public record DomainSet { identity: Text; path: Text; directory: Text; ids: List<Text>; domains: List<json.Value> }
+record Loaded { identity: Text; error: Text }
+record Reference { identity: Text; domain: Text; cohort: Text; error: Text }
+public record Audit { domains: Domains; sets: List<DomainSet>; names: Map<Text, Map<Text, Boolean>>; files: Map<Text, Boolean> }
+public record ZigReference { cohort: Text; error: Text }
+record Scope { indent: Integer; body: Integer; name: Text }
+record Source { present: Boolean; data: Bytes }
+record Span { begin: Integer; end: Integer }
+record Members { keys: List<Text>; spans: List<Span> }
+record FileEntry { truthy: Boolean; hasSha: Boolean; sha: Text; noTests: Boolean; reason: Boolean; support: Boolean }
+record Outcome { error: Text; needed: Integer; unchecked: Integer; deferred: Integer }
+
+public function languages(): List<Text> { return ["python", "swift", "cpp", "rust", "go", "zig", "javascript", "java", "ruby", "lua"] }
+public function keyFields(): List<Text> { return ["language", "repo", "revision", "path", "case_id"] }
+public function newDomains(): Domains { return Domains { expected: [] } }
+public function newAudit(shared: Domains): Audit { return Audit { domains: shared; sets: []; names: Map<Text, Map<Text, Boolean>>(); files: Map<Text, Boolean>() } }
+
+function isWord(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    if raw.length < bytes.length { return false }
+    for index in 0..bytes.length { if raw[index] != bytes[index] { return false } }
+    return true
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    if raw.length < bytes.length { return false }
+    let offset = raw.length - bytes.length
+    for index in 0..bytes.length { if raw[offset + index] != bytes[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let matched = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { matched = false; break } }
+        if matched { return index }
+    }
+    return -1
+}
+function contains(source: Text, needle: Text): Boolean { return find(source, needle, 0) >= 0 }
+function cut(source: Text, begin: Integer, end: Integer): Text { return Text(Bytes(source).slice(begin, end)) }
+function split(source: Text, separator: Integer): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let begin = 0
+    for index in 0..raw.length {
+        if raw[index] == separator {
+            result.add(Text(raw.slice(begin, index)))
+            begin = index + 1
+        }
+    }
+    result.add(Text(raw.slice(begin, raw.length)))
+    return result
+}
+function hasText(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function baseName(path: Text): Text {
+    let raw = Bytes(path)
+    let begin = 0
+    for index in 0..raw.length { if raw[index] == 47 { begin = index + 1 } }
+    return Text(raw.slice(begin, raw.length))
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let end = 0
+    for index in 0..raw.length { if raw[index] == 47 { end = index } }
+    return Text(raw.slice(0, end))
+}
+function blank(line: Bytes): Boolean {
+    for byte in line { if byte != 32 && byte != 9 && byte != 13 && byte != 11 && byte != 12 { return false } }
+    return true
+}
+function hexDigit(value: Integer): Text { return Text(Bytes("0123456789abcdef").slice(value, value + 1)) }
+function quoted(value: Text): Text {
+    let parts: List<Text> = ["\""]
+    let raw = Bytes(value)
+    let begin = 0
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte != 34 && byte != 92 && byte >= 32 { continue }
+        parts.add(Text(raw.slice(begin, index)))
+        if byte == 34 { parts.add("\\\"") }
+        if byte == 92 { parts.add("\\\\") }
+        if byte < 32 { parts.add("\\u00" + hexDigit(byte / 16) + hexDigit(byte % 16)) }
+        begin = index + 1
+    }
+    parts.add(Text(raw.slice(begin, raw.length)))
+    parts.add("\"")
+    return joinText(parts)
+}
+public function encode(value: json.Value): Text {
+    if value.kind == json.STRING { return quoted(value.text) }
+    if value.kind == json.ARRAY {
+        let parts: List<Text> = ["["]
+        for index in 0..value.items.length {
+            if index > 0 { parts.add(", ") }
+            parts.add(encode(value.items[index]))
+        }
+        parts.add("]")
+        return joinText(parts)
+    }
+    if value.kind == json.OBJECT {
+        let parts: List<Text> = ["{"]
+        for index in 0..value.keys.length {
+            if index > 0 { parts.add(", ") }
+            parts.add(quoted(value.keys[index]))
+            parts.add(": ")
+            parts.add(encode(value.items[index]))
+        }
+        parts.add("}")
+        return joinText(parts)
+    }
+    return value.text
+}
+public function digest(data: Bytes): Text { return sha256.hex(sha256.digest(data)) }
+public function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+
+public function text(value: Text): json.Value { return json.Value { kind: json.STRING; text: value; number: 0.0; truth: false; items: []; keys: [] } }
+public function integer(value: Integer): json.Value { return json.Value { kind: json.NUMBER; text: Text(value); number: Float(value); truth: false; items: []; keys: [] } }
+public function decimal(value: Text): json.Value { return json.Value { kind: json.NUMBER; text: value; number: 0.0; truth: false; items: []; keys: [] } }
+public function boolean(value: Boolean): json.Value {
+    let spelling = "false"
+    if value { spelling = "true" }
+    return json.Value { kind: json.BOOLEAN; text: spelling; number: 0.0; truth: value; items: []; keys: [] }
+}
+public function jsonNull(): json.Value { return json.Value { kind: json.NULL; text: "null"; number: 0.0; truth: false; items: []; keys: [] } }
+public function array(items: List<json.Value>): json.Value { return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] } }
+public function object(keys: List<Text>, items: List<json.Value>): json.Value { return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys } }
+public function texts(values: List<Text>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(text(value)) }
+    return array(items)
+}
+public function integers(values: List<Integer>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(integer(value)) }
+    return array(items)
+}
+public function has(value: json.Value, name: Text): Boolean {
+    if value.kind != json.OBJECT { return false }
+    for key in value.keys { if key == name { return true } }
+    return false
+}
+public function member(value: json.Value, name: Text): json.Value { return json.member(value, name) }
+public function replaced(source: json.Value, name: Text, value: json.Value): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    let found = false
+    for index in 0..source.keys.length {
+        keys.add(source.keys[index])
+        if source.keys[index] == name {
+            items = items.appended(value)
+            found = true
+        } else { items = items.appended(source.items[index]) }
+    }
+    if !found {
+        keys.add(name)
+        items = items.appended(value)
+    }
+    return object(keys, items)
+}
+public function removed(source: json.Value, name: Text): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for index in 0..source.keys.length {
+        if source.keys[index] != name {
+            keys.add(source.keys[index])
+            items = items.appended(source.items[index])
+        }
+    }
+    return object(keys, items)
+}
+public function copy(value: json.Value): json.Value {
+    let items: List<json.Value> = []
+    for item in value.items { items = items.appended(copy(item)) }
+    let keys: List<Text> = []
+    for key in value.keys { keys.add(key) }
+    return json.Value { kind: value.kind; text: value.text; number: value.number; truth: value.truth; items: items; keys: keys }
+}
+public function truthy(value: json.Value): Boolean {
+    if value.kind == json.NULL || value.kind == json.INVALID { return false }
+    if value.kind == json.BOOLEAN { return value.truth }
+    if value.kind == json.STRING { return value.text != "" }
+    if value.kind == json.NUMBER { return value.number != 0.0 || (isInteger(value) && canonical(value.text) != "0") }
+    return value.items.length > 0
+}
+public function isInteger(value: json.Value): Boolean {
+    if value.kind != json.NUMBER { return false }
+    for byte in Bytes(value.text) { if byte == 46 || byte == 101 || byte == 69 { return false } }
+    return true
+}
+function canonical(spelling: Text): Text {
+    if spelling == "-0" { return "0" }
+    return spelling
+}
+function smallInteger(value: json.Value): Boolean {
+    if !isInteger(value) { return false }
+    let raw = Bytes(value.text)
+    return raw.length <= 18
+}
+function integerValue(value: json.Value): Integer { return Integer(value.text) }
+function numeric(value: json.Value): Float {
+    if value.kind == json.BOOLEAN {
+        if value.truth { return 1.0 }
+        return 0.0
+    }
+    return value.number
+}
+public function equal(left: json.Value, right: json.Value): Boolean {
+    let leftNumber = left.kind == json.NUMBER || left.kind == json.BOOLEAN
+    let rightNumber = right.kind == json.NUMBER || right.kind == json.BOOLEAN
+    if leftNumber && rightNumber {
+        if isInteger(left) && isInteger(right) { return canonical(left.text) == canonical(right.text) }
+        if left.kind == json.BOOLEAN && isInteger(right) { return canonical(right.text) == Text(Integer(numeric(left))) }
+        if right.kind == json.BOOLEAN && isInteger(left) { return canonical(left.text) == Text(Integer(numeric(right))) }
+        return numeric(left) == numeric(right)
+    }
+    if left.kind != right.kind { return false }
+    if left.kind == json.STRING { return left.text == right.text }
+    if left.kind == json.NULL { return true }
+    if left.kind == json.ARRAY {
+        if left.items.length != right.items.length { return false }
+        for index in 0..left.items.length { if !equal(left.items[index], right.items[index]) { return false } }
+        return true
+    }
+    if left.kind == json.OBJECT {
+        if left.keys.length != right.keys.length { return false }
+        for index in 0..left.keys.length {
+            if !has(right, left.keys[index]) || !equal(left.items[index], json.member(right, left.keys[index])) { return false }
+        }
+        return true
+    }
+    return false
+}
+public function same(actual: json.Value, expected: json.Value): Boolean {
+    if expected.kind == json.NUMBER {
+        if !isInteger(expected) { return actual.kind == json.NUMBER && !isInteger(actual) && actual.number == expected.number }
+        return isInteger(actual) && canonical(actual.text) == canonical(expected.text)
+    }
+    if actual.kind != expected.kind { return false }
+    if expected.kind == json.BOOLEAN { return actual.truth == expected.truth }
+    if expected.kind == json.STRING { return actual.text == expected.text }
+    if expected.kind == json.NULL { return true }
+    if expected.kind == json.ARRAY {
+        if actual.items.length != expected.items.length { return false }
+        for index in 0..expected.items.length { if !same(actual.items[index], expected.items[index]) { return false } }
+        return true
+    }
+    if expected.kind == json.OBJECT {
+        if actual.keys.length != expected.keys.length { return false }
+        for key in expected.keys { if !has(actual, key) { return false } }
+        for index in 0..expected.keys.length {
+            if !same(json.member(actual, expected.keys[index]), expected.items[index]) { return false }
+        }
+        return true
+    }
+    return false
+}
+function identityPart(value: json.Value): Text {
+    if value.kind == json.STRING { return "s" + Text(Bytes(value.text).length) + ":" + value.text }
+    if value.kind == json.NUMBER { return "n" + canonical(value.text) }
+    if value.kind == json.BOOLEAN { return "n" + Text(Integer(numeric(value))) }
+    if value.kind == json.NULL { return "z" }
+    return "j" + json.pretty(value, "")
+}
+public function identity(row: json.Value, names: List<Text>): Text {
+    let parts: List<Text> = []
+    for field in names { parts.add(identityPart(json.member(row, field))); parts.add("|") }
+    return joinText(parts)
+}
+public function complete(row: json.Value, names: List<Text>): Boolean {
+    for field in names { if !has(row, field) { return false } }
+    return true
+}
+
+public function u64(value: Integer): U64 { return U64 { high: value / 4294967296; low: value % 4294967296; overflow: false } }
+public function u64Words(high: Integer, low: Integer): U64 { return U64 { high: high; low: low; overflow: false } }
+public function u64Times(value: U64, factor: Integer): U64 {
+    let low = value.low * factor
+    let high = value.high * factor + low / 4294967296
+    return U64 { high: high % 4294967296; low: low % 4294967296; overflow: value.overflow || high >= 4294967296 }
+}
+public function u64Less(left: U64, right: U64): Boolean {
+    if left.high != right.high { return left.high < right.high }
+    return left.low < right.low
+}
+public function u64Pred(value: U64): U64 {
+    if value.low > 0 { return U64 { high: value.high; low: value.low - 1; overflow: value.overflow } }
+    return U64 { high: value.high - 1; low: 4294967295; overflow: value.overflow }
+}
+public function u64Fits(value: U64): Boolean { return value.high < 2147483648 }
+public function u64Maximum(bits: Integer): U64 {
+    if bits == 64 { return U64 { high: 4294967295; low: 4294967295; overflow: false } }
+    if bits >= 32 { return U64 { high: (1 << (bits - 32)) - 1; low: 4294967295; overflow: false } }
+    return U64 { high: 0; low: (1 << bits) - 1; overflow: false }
+}
+public function u64Text(value: U64): Text {
+    if value.high < 2147483648 { return Text(value.high * 4294967296 + value.low) }
+    let limbs = [value.high / 65536, value.high % 65536, value.low / 65536, value.low % 65536]
+    let digits: List<Text> = []
+    let nonzero = true
+    while nonzero {
+        let remainder = 0
+        nonzero = false
+        for index in 0..limbs.length {
+            let current = remainder * 65536 + limbs[index]
+            limbs[index] = current / 10
+            remainder = current % 10
+            if limbs[index] != 0 { nonzero = true }
+        }
+        digits.add(Text(remainder))
+    }
+    let parts: List<Text> = []
+    let index = digits.length - 1
+    while index >= 0 { parts.add(digits[index]); index -= 1 }
+    return joinText(parts)
+}
+
+function goSigned(): List<Integer> {
+    let word = 4294967296
+    let half = 2147483648
+    return [0, 1, 2, 3, 100, 10001, half - 1, half, half + 1, word - (1 << 30), word - 1, word, word + 1, 2 * word,
+        MAXIMUM - 9999, MAXIMUM, 0x789abcdef0123456, -1, -2, -3, -100, -10001, -(half - 1), -half, -(half + 1),
+        -(word - (1 << 30)), -word, -word + 1, -2 * word, MINIMUM + 10000, MINIMUM + 1, MINIMUM, -0x789abcde * word + 0xf0123456]
+}
+function goUnsigned(): List<U64> {
+    let word = 4294967296
+    let half = 2147483648
+    let values: List<U64> = []
+    for value in [0, 1, 2, 3, 100, 10001, half - 1, half, half + 1, word - (1 << 30), word - 1, word, word + 1, 2 * word, MAXIMUM - 9999, MAXIMUM] { values.add(u64(value)) }
+    values.add(u64Words(word - (1 << 30), 0))
+    values.add(u64Words(word - 1, 0))
+    values.add(u64Words(word - 1, word - 100))
+    values.add(u64Words(word - 1, word - 1))
+    values.add(u64(0x789abcdef0123456))
+    values.add(u64Words(0xfedcba98, 0x76543210))
+    return values
+}
+function goShifts(): List<U64> {
+    let word = 4294967296
+    let values: List<U64> = []
+    for value in [0, 1, 2, 3, 15, 16, 17, 31, 32, 33, 61, 62, 63, 64, 65, word - 1, word, word + 1, (1 << 28) * word] { values.add(u64(value)) }
+    values.add(u64Words(1 << 31, 0))
+    values.add(u64Words(word - 1, 0))
+    values.add(u64Words(word - 1, word - 1))
+    return values
+}
+function u64Values(values: List<U64>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(decimal(u64Text(value))) }
+    return array(items)
+}
+function indexTokens(): List<Text> { return ["0", "1", "2", "3", "10", "20", "vminus1", "v0", "v1", "v2", "v3", "v10", "v20"] }
+public function goSupportedPaths(): List<Text> {
+    return ["test/rotate.go", "test/slice3.go", "test/rangegen.go", "test/64bit.go", "test/chan/select5.go", "test/rotate0.go", "test/rotate1.go", "test/rotate2.go", "test/rotate3.go"]
+}
+function fields(domain: json.Value, keys: List<Text>, values: List<json.Value>): Text {
+    for index in 0..keys.length {
+        if !has(domain, keys[index]) { return "Missing domain field " + keys[index] }
+        if !same(json.member(domain, keys[index]), values[index]) { return "Invalid " + keys[index] }
+    }
+    return ""
+}
+function disposition(row: json.Value, domain: json.Value, expected: Text, artifactKey: Text): Text {
+    if !same(json.member(row, "disposition"), text(expected)) { return "Invalid row disposition" }
+    if !same(json.member(row, "implementation_needed"), boolean(expected == "adapt")) { return "Invalid implementation_needed" }
+    return fields(domain, ["per_instance_disposition", artifactKey], [text(expected), boolean(false)])
+}
+function rotate(row: json.Value, domain: json.Value): Text {
+    let caseId = json.member(row, "case_id").text
+    let mode = -1
+    let width = -1
+    for candidate in 0..4 {
+        for bits in [8, 16, 32, 64] {
+            if caseId == "mode" + Text(candidate) + "/bits" + Text(bits) + "/exhaustive-rule" { mode = candidate; width = bits }
+        }
+    }
+    if mode < 0 { return "Invalid rotate case identifier" }
+    let error = fields(domain, ["mode", "bits", "unsigned", "inverted", "left_shift_inclusive", "right_shift_inclusive", "join", "order", "instances"],
+        [integer(mode), integer(width), boolean(mode % 2 == 1), boolean((mode / 2) % 2 == 1), integers([0, width]), integers([0, width]), texts(["|", "^"]), texts(["left-then-right", "right-then-left"]), integer(4 * (width + 1) * (width + 1))])
+    if error != "" { return error }
+    return disposition(row, domain, "reject", "individually_read_generated_source")
+}
+function tokenValue(token: Text): Integer {
+    if token == "vminus1" { return -1 }
+    if starts(token, "v") { return Integer(cut(token, 1, Bytes(token).length)) }
+    return Integer(token)
+}
+function tokenConstant(token: Text): Boolean { return token != "vminus1" && !starts(token, "v") }
+function slice(row: json.Value, domain: json.Value): Text {
+    let base = json.member(domain, "base")
+    if base.kind != json.STRING || (base.text != "array" && base.text != "slice") { return "Invalid slice base" }
+    if !same(json.member(row, "case_id"), text(base.text + "/exhaustive-rule")) { return "Invalid slice case identifier" }
+    let tokens = indexTokens()
+    let count = 0
+    for first in tokens {
+        for second in tokens {
+            for third in tokens {
+                let a = tokenValue(first)
+                let b = tokenValue(second)
+                let c = tokenValue(third)
+                let ac = tokenConstant(first)
+                let bc = tokenConstant(second)
+                let cc = tokenConstant(third)
+                let outside = base.text == "array" && ((ac && a > 10) || (bc && b > 10) || (cc && c > 10))
+                if (ac && bc && a > b) || (bc && cc && b > c) || (ac && cc && a > c) || outside { continue }
+                count += 1
+            }
+        }
+    }
+    let error = fields(domain, ["index_tokens", "instances", "filter", "instance_table"],
+        [texts(tokens), integer(count), text("Skip pairs of compile-time indices in descending order, and array compile-time indices>10."), text("inventory.generated_domains[test/slice3.go].instances")])
+    if error != "" { return error }
+    return disposition(row, domain, "reject", "individually_read_generated_source")
+}
+function codeCount(level: Integer, depth: Integer, doubled: Integer): Integer {
+    let branches = 7 + 10 * level
+    if level < depth { branches = 2 * branches + codeCount(level + 1, depth, doubled) }
+    if level == doubled { return branches * 2 }
+    return branches
+}
+function range(row: json.Value, domain: json.Value): Text {
+    let longForm = json.member(domain, "long")
+    let depthValue = json.member(domain, "depth")
+    let doubleValue = json.member(domain, "double")
+    if longForm.kind != json.BOOLEAN || !isInteger(depthValue) || !isInteger(doubleValue) { return "Invalid range configuration types" }
+    if !smallInteger(depthValue) || !smallInteger(doubleValue) { return "Invalid range depth" }
+    let depth = integerValue(depthValue)
+    let doubled = integerValue(doubleValue)
+    let deepest = 5
+    if longForm.truth { deepest = 2 }
+    if depth < 1 || depth > deepest { return "Invalid range depth" }
+    let highest = -1
+    if longForm.truth { highest = depth }
+    if doubled < -1 || doubled > highest { return "Invalid range double level" }
+    let count = codeCount(0, depth, doubled)
+    let pairs = count
+    if longForm.truth { pairs = count * (count + 1) / 2 }
+    let kind = "short"
+    if longForm.truth { kind = "long" }
+    if !same(json.member(row, "case_id"), text(kind + "/depth" + Text(depth) + "/double" + Text(doubled) + "/exhaustive-rule")) { return "Invalid range case identifier" }
+    let rule = "0<=j=k<code"
+    if longForm.truth { rule = "0<=j<=k<code" }
+    let error = fields(domain, ["code_count", "pair_functions", "pair_domain", "pair_inputs", "all_function_inputs_inclusive", "total_trace_comparisons"],
+        [integer(count), integer(pairs), text(rule), text("[j,k], including duplicate when equal"), integers([0, count - 1]), integer(2 * pairs + count)])
+    if error != "" { return error }
+    return disposition(row, domain, "reject", "individually_read_generated_source")
+}
+function shiftCount(width: Integer, shifts: List<U64>, length: Integer): Integer {
+    let count = 0
+    for shift in shifts {
+        if width == 64 || (shift.high == 0 && shift.low < (1 << width)) { count += 2 * length }
+    }
+    return count
+}
+function integer64(row: json.Value, domain: json.Value): Text {
+    let caseId = json.member(row, "case_id").text
+    let parts = split(caseId, 47)
+    if parts[0] != "int64" && parts[0] != "uint64" { return "Invalid 64-bit operand type" }
+    let signed = parts[0] == "int64"
+    let values = u64Values(goUnsigned())
+    if signed { values = integers(goSigned()) }
+    let result = "reject"
+    if parts.length == 3 && parts[1] == "unary" {
+        let operator = parts[2]
+        if operator != "+" && operator != "-" && operator != "^" { return "Invalid unary operator" }
+        let error = fields(domain, ["values", "operator", "instances"], [values, text(operator), integer(values.items.length)])
+        if error != "" { return error }
+        if signed && operator == "-" { result = "adapt" }
+        let oracle = "upstream width-limited unary operation"
+        if result == "adapt" { oracle = "-value unless MIN then checked overflow" }
+        error = fields(domain, ["oracle"], [text(oracle)])
+        if error != "" { return error }
+        return disposition(row, domain, result, "generated_artifacts_individually_read")
+    }
+    if parts.length == 5 && parts[2] == "shifts" {
+        let placement = parts[1]
+        let host = parts[3]
+        if (placement != "var-var" && placement != "const-var" && placement != "var-const") || (host != "host32" && host != "host64") || parts[4] != "exhaustive-rule" {
+            return "Invalid shift configuration"
+        }
+        let hostWidth = 32
+        if host == "host64" { hostWidth = 64 }
+        let names = ["uint64", "uint32"]
+        let widths = [64, 32]
+        if placement == "var-var" {
+            names = ["uint64", "uint", "uint32", "uint16", "uint8"]
+            widths = [64, hostWidth, 32, 16, 8]
+        }
+        let shifts = goShifts()
+        let count = 0
+        for width in widths { count += shiftCount(width, shifts, values.items.length) }
+        let widthItems: List<json.Value> = []
+        for width in widths { widthItems = widthItems.appended(integer(width)) }
+        let error = fields(domain, ["left_values", "shift_values", "directions", "shift_operand_types", "instances", "filter"],
+            [values, u64Values(shifts), texts(["<<", ">>"]), object(names, widthItems), integer(count), text("execute typed variant iff shift count fits that unsigned width")])
+        if error != "" { return error }
+        return disposition(row, domain, "reject", "generated_artifacts_individually_read")
+    }
+    let prefix = parts[0] + "/"
+    let suffix = "/exhaustive-rule"
+    let placement = ""
+    for candidate in ["var-var", "const-var", "var-const"] { if starts(caseId, prefix + candidate + "/") { placement = candidate } }
+    if placement == "" || !ends(caseId, suffix) { return "Invalid binary configuration" }
+    let begin = Bytes(prefix + placement + "/").length
+    let end = Bytes(caseId).length - Bytes(suffix).length
+    if end < begin { return "Invalid binary configuration" }
+    let operator = cut(caseId, begin, end)
+    if !hasText(["+", "*", "/", "%", "&", "|", "^", "-", "&^"], operator) { return "Invalid binary configuration" }
+    let excluded: List<json.Value> = []
+    if operator == "/" || operator == "%" {
+        for value in values.items { excluded = excluded.appended(array([value, integer(0)])) }
+        if signed { excluded = excluded.appended(integers([MINIMUM, -1])) }
+    }
+    let error = fields(domain, ["left_values", "right_values", "operator", "placement", "exclude_pairs", "instances", "oracle"],
+        [values, values, text(operator), text(placement), array(excluded), integer(values.items.length * values.items.length - excluded.length),
+         text("exact signed arithmetic with checked overflow; quotient=sign(a*b)*floor(abs(a)/abs(b)), remainder=a-quotient*b")])
+    if error != "" { return error }
+    if signed && hasText(["+", "-", "*", "/", "%"], operator) { result = "adapt" }
+    return disposition(row, domain, result, "generated_artifacts_individually_read")
+}
+function select(row: json.Value, domain: json.Value): Text {
+    let families = ["recv", "send", "recvOrder", "sendOrder", "nonblock"]
+    let counts = [1 + 3 * 5 * 16, 1 + 3 * 16, 2 + 3 * 4 * 16, 1 + 3 * 16, 2 * 256]
+    let family = json.member(domain, "family")
+    let position = -1
+    if family.kind == json.STRING { for index in 0..families.length { if families[index] == family.text { position = index } } }
+    if position < 0 { return "Invalid select family" }
+    if !same(json.member(row, "case_id"), text(family.text + "/exhaustive-rule")) { return "Invalid select case identifier" }
+    let error = fields(domain, ["instances"], [integer(counts[position])])
+    if error != "" { return error }
+    return disposition(row, domain, "reject", "generated_artifacts_individually_read")
+}
+public function validateInlineDomain(row: json.Value): Check {
+    let domain = json.member(row, "generated_domain")
+    if domain.kind != json.OBJECT || has(domain, "artifact") { return Check { known: false; error: "" } }
+    let path = json.member(row, "path")
+    if path.kind != json.STRING || !hasText(goSupportedPaths(), path.text) { return Check { known: false; error: "" } }
+    if !same(json.member(row, "language"), text("go")) { return Check { known: true; error: "Invalid language" } }
+    if !same(json.member(row, "repo"), text("golang/go")) { return Check { known: true; error: "Invalid repository" } }
+    if !same(json.member(row, "revision"), text(GO_REVISION)) { return Check { known: true; error: "Invalid revision" } }
+    if json.member(row, "case_id").kind != json.STRING { return Check { known: true; error: "Missing case identifier" } }
+    let error = ""
+    let driver = -1
+    for mode in 0..4 { if path.text == "test/rotate" + Text(mode) + ".go" { driver = mode } }
+    if driver >= 0 {
+        error = fields(domain, ["generator", "mode"], [text("test/rotate.go"), integer(driver)])
+        if error == "" && !same(json.member(row, "case_id"), text("driver-mode" + Text(driver))) { error = "Invalid driver identifier" }
+        if error == "" && !same(json.member(row, "disposition"), text("covered")) { error = "Invalid driver disposition" }
+        if error == "" && !same(json.member(row, "implementation_needed"), boolean(false)) { error = "Invalid driver implementation_needed" }
+    } else {
+        if path.text == "test/rotate.go" { error = rotate(row, domain) }
+        if path.text == "test/slice3.go" { error = slice(row, domain) }
+        if path.text == "test/rangegen.go" { error = range(row, domain) }
+        if path.text == "test/64bit.go" { error = integer64(row, domain) }
+        if path.text == "test/chan/select5.go" { error = select(row, domain) }
+    }
+    return Check { known: true; error: error }
+}
+
+public function zigSource(): json.Value {
+    return object(["language", "repo", "revision", "path", "source_sha256"],
+        [text("zig"), text("ziglang/zig"), text("738d2be9d6b6ef3ff3559130c05159ef53336224"), text("lib/std/math/log_int.zig"), text("a8cdf0eaabcde7493ad607be576a84bb73d10402e45cb8a1b8c9d542529d7278")])
+}
+public function zigCohortNames(): List<Text> { return ["boundary-representable", "boundary-outside-integer", "log2-comparison", "log10-comparison"] }
+function bitLength(value: Integer): Integer {
+    let count = 0
+    let rest = value
+    while rest > 0 { rest = rest / 2; count += 1 }
+    return count
+}
+public function zigInstances(): List<ZigInstance> {
+    let result: List<ZigInstance> = []
+    for bits in 2..65 {
+        let maximum = u64Maximum(bits)
+        let highest = 1025
+        if bits < 11 { highest = (1 << bits) - 1 }
+        for base in 2..(highest + 1) {
+            result.add(ZigInstance { cohort: "boundary-representable"; identity: "bits" + Text(bits) + "/base" + Text(base) + "/one"; base: base; value: u64(1); expected: 0 })
+            let exponent = 1
+            let power = u64(base)
+            while !power.overflow && !u64Less(maximum, power) {
+                let below = u64Pred(power)
+                for branch in ["below", "at"] {
+                    let value = below
+                    let expected = exponent - 1
+                    if branch == "at" { value = power; expected = exponent }
+                    let cohort = "boundary-outside-integer"
+                    if u64Fits(value) { cohort = "boundary-representable" }
+                    result.add(ZigInstance { cohort: cohort; identity: "bits" + Text(bits) + "/base" + Text(base) + "/power" + Text(exponent) + "/" + branch; base: base; value: value; expected: expected })
+                }
+                exponent += 1
+                power = u64Times(power, base)
+            }
+        }
+    }
+    for base in [2, 10] {
+        let widths = [2, 3, 4, 8, 16]
+        if base == 10 { widths = [4, 5, 6, 8, 16] }
+        for bits in widths {
+            for value in 1..(1 << bits) {
+                let expected = Text(value).length - 1
+                if base == 2 { expected = bitLength(value) - 1 }
+                result.add(ZigInstance { cohort: "log" + Text(base) + "-comparison"; identity: "bits" + Text(bits) + "/n" + Text(value); base: base; value: u64(value); expected: expected })
+            }
+        }
+    }
+    return result
+}
+function zigBuild(): json.Value {
+    let names = zigCohortNames()
+    let counts = [0, 0, 0, 0]
+    let inputs: List<sha256.State> = []
+    let oracles: List<sha256.State> = []
+    for name in names { inputs.add(sha256.new()); oracles.add(sha256.new()) }
+    for instance in zigInstances() {
+        let position = 0
+        for index in 0..names.length { if names[index] == instance.cohort { position = index } }
+        counts[position] += 1
+        let prefix = "[\"" + instance.identity + "\"," + Text(instance.base) + "," + u64Text(instance.value)
+        sha256.update(inputs[position], Bytes(prefix + "]\n"))
+        sha256.update(oracles[position], Bytes(prefix + "," + Text(instance.expected) + "]\n"))
+    }
+    let cohorts: List<json.Value> = []
+    let total = 0
+    for index in 0..names.length {
+        let kind = "adapt"
+        if names[index] == "boundary-outside-integer" { kind = "reject" }
+        cohorts = cohorts.appended(object(["id", "instances", "disposition", "input_sha256", "oracle_sha256"],
+            [text(names[index]), integer(counts[index]), text(kind), text(sha256.hex(sha256.finalize(inputs[index]))), text(sha256.hex(sha256.finalize(oracles[index])))]))
+        total += counts[index]
+    }
+    let axes = object(["boundary_bits_inclusive", "base_inclusive", "base_maximum", "power_rule", "boundary_branches", "log2_bits", "log10_bits", "comparison_inputs", "integer_maximum"],
+        [integers([2, 64]), integers([2, 1025]), text("min((1<<bits)-1,1025)"), text("base**exponent <= (1<<bits)-1; exponent starts at1"), texts(["one", "below", "at"]),
+         integers([2, 3, 4, 8, 16]), integers([4, 5, 6, 8, 16]), text("1..(1<<bits)-1 inclusive"), integer(MAXIMUM)])
+    let source = zigSource()
+    let keys = ["schema_version", "schema", "domain_id"]
+    let items = [integer(1), text("zig-log-int-v1"), text("zig-log-int-full-domain")]
+    for index in 0..source.keys.length {
+        keys.add(source.keys[index])
+        items = items.appended(source.items[index])
+    }
+    for key in ["axes", "case_identity", "hash_encoding", "oracle_rules", "review_method", "cohorts", "total_instances", "reviewed_instances", "execution_claim"] { keys.add(key) }
+    for item in [axes, text("cohort plus width/base/power/branch, or width/n; duplicate operands at different widths remain distinct"),
+        text("UTF-8 compact JSON arrays followed by LF, in source order within each cohort; inputs=[identity,base,input], oracles=[identity,base,input,expected]"),
+        text("boundary one=0, below power exponent-1, at power exponent; log2=bit_length-1; log10=decimal digit count-1"),
+        text("Derived from complete pinned generator and helpers; generated instances are mathematically enumerated, not individually read source files"),
+        array(cohorts), integer(total), integer(total), boolean(false)] { items = items.appended(item) }
+    return object(keys, items)
+}
+public function zigExpected(domains: Domains): json.Value {
+    if domains.expected.length == 0 { domains.expected = [zigBuild()] }
+    return copy(domains.expected[0])
+}
+public function zigValidateDomain(domains: Domains, domain: json.Value): Cohorts {
+    if domains.expected.length == 0 { domains.expected = [zigBuild()] }
+    if !same(domain, domains.expected[0]) { return Cohorts { ids: []; cohorts: []; error: "Zig log domain differs from its exact expected descriptor" } }
+    let result = Cohorts { ids: []; cohorts: []; error: "" }
+    for cohort in json.member(domain, "cohorts").items {
+        result.ids.add(json.member(cohort, "id").text)
+        result.cohorts = result.cohorts.appended(cohort)
+    }
+    return result
+}
+public function zigValidateReference(domains: Domains, row: json.Value, reference: json.Value, domain: json.Value): ZigReference {
+    let cohorts = zigValidateDomain(domains, domain)
+    if cohorts.error != "" { return ZigReference { cohort: ""; error: cohorts.error } }
+    let source = zigSource()
+    for index in 0..source.keys.length {
+        if !same(json.member(row, source.keys[index]), source.items[index]) { return ZigReference { cohort: ""; error: "Incorrect value at row." + source.keys[index] } }
+    }
+    if !same(json.member(reference, "domain_id"), json.member(domain, "domain_id")) { return ZigReference { cohort: ""; error: "Incorrect value at reference.domain_id" } }
+    let cohort = json.member(reference, "cohort")
+    let position = -1
+    if cohort.kind == json.STRING { for index in 0..cohorts.ids.length { if cohorts.ids[index] == cohort.text { position = index } } }
+    if position < 0 { return ZigReference { cohort: ""; error: "Unknown Zig log cohort" } }
+    let selected = cohorts.cohorts[position]
+    if !same(json.member(reference, "instances"), json.member(selected, "instances")) { return ZigReference { cohort: ""; error: "Incorrect value at reference.instances" } }
+    if !same(json.member(row, "disposition"), json.member(selected, "disposition")) { return ZigReference { cohort: ""; error: "Incorrect value at row.disposition" } }
+    if !same(json.member(row, "implementation_needed"), boolean(json.member(selected, "disposition").text == "adapt")) { return ZigReference { cohort: ""; error: "Incorrect value at row.implementation_needed" } }
+    if !same(json.member(row, "case_id"), text("generated-domain/" + cohort.text)) { return ZigReference { cohort: ""; error: "Incorrect value at row.case_id" } }
+    return ZigReference { cohort: cohort.text; error: "" }
+}
+public function zigValidateComplete(domains: Domains, domain: json.Value, rows: List<json.Value>, resolutions: List<json.Value>): Text {
+    let expected = zigValidateDomain(domains, domain)
+    if expected.error != "" { return expected.error }
+    let referenced: List<Text> = []
+    let referencedRows: List<json.Value> = []
+    for row in rows {
+        let check = zigValidateReference(domains, row, json.member(row, "generated_domain"), domain)
+        if check.error != "" { return check.error }
+        if hasText(referenced, check.cohort) { return "Duplicate cohort reference: " + check.cohort }
+        referenced.add(check.cohort)
+        referencedRows = referencedRows.appended(row)
+    }
+    if referenced.length != expected.ids.length { return "Unreferenced Zig log cohorts" }
+    for id in expected.ids { if !hasText(referenced, id) { return "Unreferenced Zig log cohorts" } }
+    let resolved: List<Text> = []
+    for row in resolutions { resolved.add(identity(row, keyFields())) }
+    for index in 0..referenced.length {
+        let row = referencedRows[index]
+        if truthy(json.member(row, "implementation_needed")) && !hasText(resolved, identity(row, keyFields())) { return "Unresolved Zig log cohort: " + referenced[index] }
+    }
+    return ""
+}
+
+public function jsonLines(path: Text): List<Text> {
+    let result: List<Text> = []
+    if !exists(path) { return result }
+    let raw = files.readFile(path)
+    let begin = 0
+    for index in 0..(raw.length + 1) {
+        if index < raw.length && raw[index] != 10 { continue }
+        let line = raw.slice(begin, index)
+        begin = index + 1
+        if !blank(line) { result.add(Text(line)) }
+    }
+    return result
+}
+public function parseLine(line: Text, path: Text): json.Value {
+    let value = json.parse(line)
+    if value.kind == json.INVALID { fail("invalid JSON line in " + path + ": " + value.text) }
+    return value
+}
+function space(raw: Bytes, index: Integer): Integer {
+    let position = index
+    while position < raw.length && (raw[position] == 32 || raw[position] == 9 || raw[position] == 10 || raw[position] == 13) { position += 1 }
+    return position
+}
+function stringEnd(raw: Bytes, index: Integer): Integer {
+    let position = index + 1
+    while position < raw.length && raw[position] != 34 {
+        if raw[position] == 92 { position += 2 } else { position += 1 }
+    }
+    return position + 1
+}
+function valueEnd(raw: Bytes, begin: Integer): Integer {
+    if begin >= raw.length { return begin }
+    let first = raw[begin]
+    if first == 34 { return stringEnd(raw, begin) }
+    if first == 123 || first == 91 {
+        let depth = 0
+        let position = begin
+        while position < raw.length {
+            let byte = raw[position]
+            if byte == 34 {
+                position = stringEnd(raw, position)
+                continue
+            }
+            if byte == 123 || byte == 91 { depth += 1 }
+            if byte == 125 || byte == 93 {
+                depth -= 1
+                if depth == 0 { return position + 1 }
+            }
+            position += 1
+        }
+        return position
+    }
+    let position = begin
+    while position < raw.length && raw[position] != 44 && raw[position] != 125 && raw[position] != 93 && raw[position] != 32 && raw[position] != 9 && raw[position] != 10 && raw[position] != 13 { position += 1 }
+    return position
+}
+function documentSpan(raw: Bytes): Span {
+    let begin = space(raw, 0)
+    return Span { begin: begin; end: valueEnd(raw, begin) }
+}
+function plainString(raw: Bytes, begin: Integer, end: Integer): Boolean {
+    if end - begin < 2 || raw[begin] != 34 || raw[end - 1] != 34 { return false }
+    for index in (begin + 1)..(end - 1) { if raw[index] == 92 || raw[index] < 32 { return false } }
+    return true
+}
+function members(raw: Bytes, span: Span): Members {
+    let result = Members { keys: []; spans: [] }
+    if span.end <= span.begin || raw[span.begin] != 123 { return result }
+    let position = space(raw, span.begin + 1)
+    while position < span.end && raw[position] == 34 {
+        let keyEnd = stringEnd(raw, position)
+        let key = ""
+        if plainString(raw, position, keyEnd) { key = Text(raw.slice(position + 1, keyEnd - 1)) } else { key = json.parse(Text(raw.slice(position, keyEnd))).text }
+        position = space(raw, keyEnd)
+        if position >= span.end || raw[position] != 58 { return result }
+        let begin = space(raw, position + 1)
+        let end = valueEnd(raw, begin)
+        result.keys.add(key)
+        result.spans.add(Span { begin: begin; end: end })
+        position = space(raw, end)
+        if position < span.end && raw[position] == 44 { position = space(raw, position + 1) }
+    }
+    return result
+}
+function elements(raw: Bytes, span: Span): List<Span> {
+    let result: List<Span> = []
+    if span.end <= span.begin || raw[span.begin] != 91 { return result }
+    let position = space(raw, span.begin + 1)
+    while position < span.end && raw[position] != 93 {
+        let end = valueEnd(raw, position)
+        result.add(Span { begin: position; end: end })
+        position = space(raw, end)
+        if position < span.end && raw[position] == 44 { position = space(raw, position + 1) }
+    }
+    return result
+}
+function hasMember(found: Members, name: Text): Boolean {
+    for key in found.keys { if key == name { return true } }
+    return false
+}
+function memberSpan(found: Members, name: Text): Span {
+    for index in 0..found.keys.length { if found.keys[index] == name { return found.spans[index] } }
+    return Span { begin: -1; end: -1 }
+}
+function parseSpan(raw: Bytes, span: Span): json.Value {
+    if span.begin < 0 { return jsonNull() }
+    if plainString(raw, span.begin, span.end) { return text(Text(raw.slice(span.begin + 1, span.end - 1))) }
+    return json.parse(Text(raw.slice(span.begin, span.end)))
+}
+function memberValue(raw: Bytes, found: Members, name: Text): json.Value { return parseSpan(raw, memberSpan(found, name)) }
+function entryFields(raw: Bytes, found: Members): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for index in 0..found.keys.length {
+        let key = found.keys[index]
+        if key == "path" || key == "sha256" || key == "status" || key == "review_status" || key == "no_tests" || key == "review_reason" || key == "scope_disposition" {
+            keys.add(key)
+            items = items.appended(parseSpan(raw, found.spans[index]))
+        }
+    }
+    return object(keys, items)
+}
+function fileEntry(entry: json.Value, size: Integer): FileEntry {
+    let noTests = json.member(entry, "no_tests")
+    return FileEntry { truthy: size > 0; hasSha: has(entry, "sha256"); sha: identityPart(json.member(entry, "sha256")); noTests: noTests.kind == json.BOOLEAN && noTests.truth; reason: truthy(json.member(entry, "review_reason")); support: equal(json.member(entry, "scope_disposition"), text("support")) }
+}
+function setFor(audit: Audit, identity: Text): Integer {
+    for index in 0..audit.sets.length { if audit.sets[index].identity == identity { return index } }
+    return -1
+}
+function divisionDomain(domain: json.Value, ids: List<Text>): Text {
+    let version = json.member(domain, "schema_version")
+    let id = json.member(domain, "domain_id")
+    if !has(domain, "schema_version") || !has(domain, "domain_id") || !has(domain, "ordered_values") || !has(domain, "excluded_pairs") { return "Malformed generated domain" }
+    if !equal(version, integer(1)) || (id.kind == json.STRING && hasText(ids, id.text)) { return "Invalid/duplicate generated domain" }
+    let values = json.member(domain, "ordered_values")
+    if values.kind != json.ARRAY { return "Division domain requires distinct nonzero Integer operands" }
+    let numbers: List<Integer> = []
+    let valid = values.items.length > 0
+    for value in values.items {
+        if !smallInteger(value) { valid = false; continue }
+        let number = integerValue(value)
+        if number == 0 || number < -2147483648 || number >= 2147483648 { valid = false }
+        for other in numbers { if other == number { valid = false } }
+        numbers.add(number)
+    }
+    if !valid { return "Division domain requires distinct nonzero Integer operands" }
+    let pairs = json.member(domain, "excluded_pairs")
+    let dividends: List<Integer> = []
+    let divisors: List<Integer> = []
+    for item in pairs.items {
+        let dividend = json.member(item, "dividend")
+        let divisor = json.member(item, "divisor")
+        if !has(item, "dividend") || !has(item, "divisor") { return "Malformed generated domain" }
+        let known = smallInteger(dividend) && smallInteger(divisor)
+        let a = 0
+        let b = 0
+        if known { a = integerValue(dividend); b = integerValue(divisor) }
+        let present = false
+        let left = false
+        let right = false
+        for number in numbers { if known && number == a { left = true }; if known && number == b { right = true } }
+        for index in 0..dividends.length { if known && dividends[index] == a && divisors[index] == b { present = true } }
+        if present || !left || !right { return "Invalid domain exclusions" }
+        dividends.add(a)
+        divisors.add(b)
+    }
+    let count = 0
+    for a in numbers {
+        for b in numbers {
+            let skipped = false
+            for index in 0..dividends.length { if dividends[index] == a && divisors[index] == b { skipped = true } }
+            if skipped { continue }
+            let magnitude = abs(a) / abs(b)
+            let quotient = magnitude
+            if (a < 0) != (b < 0) { quotient = -magnitude }
+            let remainder = a - quotient * b
+            let signed = remainder == 0 || (remainder < 0) == (a < 0)
+            if !(quotient >= -2147483648 && quotient < 2147483648 && remainder >= -2147483648 && remainder < 2147483648 && abs(remainder) < abs(b) && signed) {
+                return "Signed int32 removal proof fails for generated pair"
+            }
+            count += 1
+        }
+    }
+    let cohorts = json.member(domain, "cohorts")
+    if cohorts.kind != json.ARRAY { return "Malformed generated domain" }
+    let operations: List<Text> = []
+    for cohort in cohorts.items {
+        let operation = json.member(cohort, "operation").text
+        if !has(cohort, "operation") { return "Malformed generated domain" }
+        if !hasText(operations, operation) { operations.add(operation) }
+    }
+    let wanted = ["truncating-division", "remainder", "floor-division"]
+    let sameOperations = operations.length == wanted.length
+    for operation in wanted { if !hasText(operations, operation) { sameOperations = false } }
+    if !sameOperations || cohorts.items.length != 3 { return "Unknown division-domain cohorts" }
+    for cohort in cohorts.items {
+        if !has(cohort, "count") || !has(cohort, "disposition") { return "Malformed generated domain" }
+        let kind = json.member(cohort, "disposition")
+        if !equal(json.member(cohort, "count"), integer(count)) || !truthy(json.member(cohort, "rule")) || kind.kind != json.STRING || !hasText(["adapt", "covered", "reject", "defer"], kind.text) {
+            return "Generated cohort cardinality/disposition mismatch"
+        }
+    }
+    if !has(domain, "total_instances") || !has(domain, "reviewed_instances") { return "Malformed generated domain" }
+    if !equal(json.member(domain, "total_instances"), integer(count * cohorts.items.length)) || !equal(json.member(domain, "reviewed_instances"), json.member(domain, "total_instances")) {
+        return "Incomplete generated instance decisions"
+    }
+    if !truthy(json.member(domain, "case_identity")) || !truthy(json.member(domain, "review_method")) || !truthy(json.member(domain, "oracle_rules")) {
+        return "Missing generated instance identity/review/oracle rules"
+    }
+    return ""
+}
+function loadDomains(audit: Audit, path: Text, expected: Text): Loaded {
+    let key = path + "\n" + expected
+    if setFor(audit, key) >= 0 { return Loaded { identity: key; error: "" } }
+    if !exists(path) { return Loaded { identity: key; error: "No such generated domain artifact: " + path } }
+    let data = files.readFile(path)
+    if digest(data) != expected { return Loaded { identity: key; error: "Generated domain artifact hash mismatch" } }
+    let group = DomainSet { identity: key; path: path; directory: parent(path); ids: []; domains: [] }
+    if ends(path, ".json") {
+        let domain = json.parse(Text(data))
+        if domain.kind != json.OBJECT { return Loaded { identity: key; error: "Malformed generated domain JSON" } }
+        let cohorts = zigValidateDomain(audit.domains, domain)
+        if cohorts.error != "" { return Loaded { identity: key; error: cohorts.error } }
+        group.ids.add(json.member(domain, "domain_id").text)
+        group.domains = group.domains.appended(domain)
+    } else {
+        let begin = 0
+        for index in 0..(data.length + 1) {
+            if index < data.length && data[index] != 10 { continue }
+            let line = data.slice(begin, index)
+            begin = index + 1
+            if blank(line) { continue }
+            let domain = json.parse(Text(line))
+            if domain.kind != json.OBJECT { return Loaded { identity: key; error: "Malformed generated domain JSON" } }
+            let error = divisionDomain(domain, group.ids)
+            if error != "" { return Loaded { identity: key; error: error } }
+            group.ids.add(json.member(domain, "domain_id").text)
+            group.domains = group.domains.appended(domain)
+        }
+    }
+    audit.sets.add(group)
+    return Loaded { identity: key; error: "" }
+}
+function checkGenerated(audit: Audit, root: Text, language: Text, row: json.Value): Reference {
+    let reference = json.member(row, "generated_domain")
+    let artifact = json.member(reference, "artifact")
+    if artifact.kind != json.STRING { return Reference { identity: ""; domain: ""; cohort: ""; error: "Malformed generated domain reference" } }
+    let name = baseName(artifact.text)
+    if artifact.text != "tests/data/peer/" + language + "/" + name && artifact.text != "docs/research/exhaustive/" + language + "/" + name {
+        return Reference { identity: ""; domain: ""; cohort: ""; error: "Generated domain artifact must be inside its language directory" }
+    }
+    let hash = json.member(reference, "sha256")
+    if hash.kind != json.STRING { return Reference { identity: ""; domain: ""; cohort: ""; error: "Malformed generated domain hash" } }
+    let loaded = loadDomains(audit, root + "/" + language + "/" + name, hash.text)
+    if loaded.error != "" { return Reference { identity: ""; domain: ""; cohort: ""; error: loaded.error } }
+    let group = audit.sets[setFor(audit, loaded.identity)]
+    let wanted = json.member(reference, "domain_id")
+    let position = -1
+    if wanted.kind == json.STRING { for index in 0..group.ids.length { if group.ids[index] == wanted.text { position = index } } }
+    if position < 0 { return Reference { identity: ""; domain: ""; cohort: ""; error: "Unknown generated domain identifier" } }
+    let domain = group.domains[position]
+    if json.member(domain, "schema").text == "zig-log-int-v1" {
+        let check = zigValidateReference(audit.domains, row, reference, domain)
+        if check.error != "" { return Reference { identity: ""; domain: ""; cohort: ""; error: check.error } }
+        return Reference { identity: loaded.identity; domain: group.ids[position]; cohort: check.cohort; error: "" }
+    }
+    for key in ["repo", "revision", "path", "source_sha256"] {
+        if !has(domain, key) || !has(row, key) { return Reference { identity: ""; domain: ""; cohort: ""; error: "Malformed generated domain reference" } }
+        if !equal(json.member(domain, key), json.member(row, key)) { return Reference { identity: ""; domain: ""; cohort: ""; error: "Generated domain does not match its reviewed source" } }
+    }
+    let selected = -1
+    let cohorts = json.member(domain, "cohorts").items
+    for index in 0..cohorts.length { if selected < 0 && equal(json.member(cohorts[index], "operation"), json.member(reference, "cohort")) { selected = index } }
+    if selected < 0 { return Reference { identity: ""; domain: ""; cohort: ""; error: "Generated reference names no cohort" } }
+    let cohort = cohorts[selected]
+    if !equal(json.member(cohort, "count"), json.member(reference, "instances")) || !equal(json.member(cohort, "disposition"), json.member(row, "disposition")) {
+        return Reference { identity: ""; domain: ""; cohort: ""; error: "Generated reference disagrees with its cohort" }
+    }
+    return Reference { identity: loaded.identity; domain: group.ids[position]; cohort: json.member(cohort, "operation").text; error: "" }
+}
+
+function pythonLineStarts(source: Bytes): List<Boolean> {
+    let result: List<Boolean> = [true]
+    let state = 0
+    let quote = 0
+    let depth = 0
+    let index = 0
+    while index < source.length {
+        let byte = source[index]
+        if state == 0 {
+            if byte == 35 {
+                while index < source.length && source[index] != 10 { index += 1 }
+                continue
+            }
+            if byte == 39 || byte == 34 {
+                quote = byte
+                if index + 2 < source.length && source[index + 1] == byte && source[index + 2] == byte { state = 2; index += 3 } else { state = 1; index += 1 }
+                continue
+            }
+            if byte == 40 || byte == 91 || byte == 123 { depth += 1 }
+            if (byte == 41 || byte == 93 || byte == 125) && depth > 0 { depth -= 1 }
+            if byte == 92 && index + 1 < source.length && source[index + 1] == 10 {
+                result.add(false)
+                index += 2
+                continue
+            }
+            if byte == 10 { result.add(depth == 0) }
+            index += 1
+            continue
+        }
+        if byte == 92 {
+            if index + 1 < source.length && source[index + 1] == 10 { result.add(false) }
+            index += 2
+            continue
+        }
+        if state == 1 {
+            if byte == quote || byte == 10 { state = 0 }
+            if byte == 10 { result.add(depth == 0) }
+            index += 1
+            continue
+        }
+        if byte == quote && index + 2 < source.length && source[index + 1] == quote && source[index + 2] == quote {
+            state = 0
+            index += 3
+            continue
+        }
+        if byte == 10 { result.add(false) }
+        index += 1
+    }
+    return result
+}
+function indentation(line: Bytes): Integer {
+    let count = 0
+    while count < line.length && (line[count] == 32 || line[count] == 9) { count += 1 }
+    return count
+}
+function wordAfter(line: Bytes, begin: Integer): Text {
+    let end = begin
+    while end < line.length && isWord(line[end]) { end += 1 }
+    return Text(line.slice(begin, end))
+}
+function startsAt(line: Bytes, begin: Integer, prefix: Text): Boolean {
+    let bytes = Bytes(prefix)
+    if begin + bytes.length > line.length { return false }
+    for index in 0..bytes.length { if line[begin + index] != bytes[index] { return false } }
+    return true
+}
+public function pythonNames(source: Bytes): List<Text> {
+    let names: List<Text> = []
+    let normal = pythonLineStarts(source)
+    let scopes: List<Scope> = []
+    let number = 0
+    let begin = 0
+    for index in 0..(source.length + 1) {
+        if index < source.length && source[index] != 10 { continue }
+        let line = source.slice(begin, index)
+        begin = index + 1
+        let start = normal[number]
+        number += 1
+        if !start { continue }
+        let indent = indentation(line)
+        if indent == line.length || line[indent] == 35 { continue }
+        let kept: List<Scope> = []
+        for scope in scopes {
+            if scope.body < 0 && indent > scope.indent { scope.body = indent }
+            if indent > scope.indent { kept.add(scope) }
+        }
+        scopes = kept
+        let offset = indent
+        if startsAt(line, offset, "async def ") { offset += 6 }
+        if startsAt(line, offset, "def ") {
+            let name = wordAfter(line, offset + 4)
+            names.add(name)
+            if scopes.length > 0 {
+                let owner = scopes[scopes.length - 1]
+                if owner.body == indent && owner.name != "" { names.add(owner.name + "." + name) }
+            }
+            scopes.add(Scope { indent: indent; body: -1; name: "" })
+            continue
+        }
+        if startsAt(line, indent, "class ") {
+            scopes.add(Scope { indent: indent; body: -1; name: wordAfter(line, indent + 6) })
+        }
+    }
+    return names
+}
+function minyarNames(source: Bytes): Map<Text, Boolean> {
+    let names = Map<Text, Boolean>()
+    let state = 0
+    let begin = 0
+    let index = 0
+    while index < source.length {
+        let byte = source[index]
+        if state == 0 {
+            if byte == 47 && index + 1 < source.length && source[index + 1] == 47 {
+                while index < source.length && source[index] != 10 { index += 1 }
+                continue
+            }
+            if byte == 47 && index + 1 < source.length && source[index + 1] == 42 { state = 3; index += 2; continue }
+            if byte == 34 { state = 1; begin = index + 1; index += 1; continue }
+            if byte == 39 { state = 2; index += 1; continue }
+            if startsAt(source, index, "function ") && (index == 0 || !isWord(source[index - 1])) {
+                names["function " + wordAfter(source, index + 9)] = true
+                index += 9
+                continue
+            }
+            index += 1
+            continue
+        }
+        if state == 3 {
+            if byte == 42 && index + 1 < source.length && source[index + 1] == 47 { state = 0; index += 2; continue }
+            index += 1
+            continue
+        }
+        if byte == 92 { index += 2; continue }
+        if state == 1 && byte == 34 {
+            names["\"" + Text(source.slice(begin, index)) + "\""] = true
+            state = 0
+        }
+        if state == 2 && byte == 39 { state = 0 }
+        index += 1
+    }
+    return names
+}
+function declares(audit: Audit, path: Text, target: Text): Boolean {
+    if !audit.names.has(path) {
+        if ends(path, ".min") { audit.names[path] = minyarNames(files.readFile(path)) } else {
+            let names = Map<Text, Boolean>()
+            for name in pythonNames(files.readFile(path)) { names[name] = true }
+            audit.names[path] = names
+        }
+    }
+    let names = audit.names[path]
+    if ends(path, ".py") { return names.has(target) }
+    let parts = split(target, 46)
+    let name = parts[parts.length - 1]
+    if !names.has("function " + name) && !names.has("\"" + name + "\"") { return false }
+    if parts.length == 1 { return true }
+    let owner = cut(target, 0, Bytes(target).length - Bytes(name).length - 1)
+    return names.has("\"" + owner + "\"") || names.has("\"" + owner + ".\"")
+}
+function safeRelative(path: Text): Boolean {
+    if path == "" || starts(path, "/") { return false }
+    for part in split(path, 47) { if part == ".." { return false } }
+    return true
+}
+function lineCount(data: Bytes, lf: Boolean): Integer {
+    if lf {
+        let count = 1
+        for byte in data { if byte == 10 { count += 1 } }
+        return count
+    }
+    let count = 0
+    let index = 0
+    let open = false
+    while index < data.length {
+        let byte = data[index]
+        if byte == 10 || byte == 13 {
+            count += 1
+            open = false
+            if byte == 13 && index + 1 < data.length && data[index + 1] == 10 { index += 1 }
+        } else { open = true }
+        index += 1
+    }
+    if open { count += 1 }
+    return count
+}
+
+public function inspect(audit: Audit, root: Text, sourceRoot: Text): json.Value {
+    let errors: List<Text> = []
+    let summary: List<json.Value> = []
+    let resolutions = Map<Text, Text>()
+    let resolutionKeys: List<Text> = []
+    for line in jsonLines(root + "/implementations.jsonl") {
+        let row = parseLine(line, root + "/implementations.jsonl")
+        require(complete(row, keyFields()), "implementation row lacks a ledger key field")
+        let key = identity(row, keyFields())
+        if resolutions.has(key) { errors.add("Duplicate implementation resolution: " + key) } else { resolutionKeys.add(key) }
+        if !truthy(json.member(row, "tests")) || !truthy(json.member(row, "validation")) { errors.add("Implementation lacks tests/validation: " + key) }
+        for reference in json.member(row, "tests").items {
+            let position = find(reference.text, ":", 0)
+            let relative = reference.text
+            let target = ""
+            if position >= 0 {
+                relative = cut(reference.text, 0, position)
+                target = cut(reference.text, position + 1, Bytes(reference.text).length)
+            }
+            if !audit.files.has(relative) { audit.files[relative] = safeRelative(relative) && files.pathSize(relative) >= 0 && files.list(relative).length == 0 }
+            if !audit.files[relative] {
+                errors.add("Implementation test file missing or outside workspace: " + reference.text)
+                continue
+            }
+            let segments = split(target, 46)
+            if !starts(segments[segments.length - 1], "test_") || !(ends(relative, ".py") || ends(relative, ".min")) { continue }
+            if !declares(audit, relative, target) { errors.add("Implementation test method missing: " + reference.text) }
+        }
+        let recorded = json.member(row, "source_sha256")
+        if recorded.kind == json.NULL { resolutions[key] = "" } else { resolutions[key] = identityPart(recorded) }
+    }
+    let seenResolutions = Map<Text, Boolean>()
+    let referenced = Map<Text, Boolean>()
+    for language in languages() {
+        let directory = root + "/" + language
+        let path = directory + "/inventory.json"
+        if !exists(path) {
+            errors.add("Missing inventory: " + language)
+            continue
+        }
+        let raw = files.readFile(path)
+        let top = documentSpan(raw)
+        require(top.begin < raw.length && raw[top.begin] == 123, "invalid inventory JSON: " + path)
+        let inventory = members(raw, top)
+        if !equal(memberValue(raw, inventory, "schema_version"), integer(1)) { errors.add("Unknown inventory schema: " + language) }
+        let repositories = [top]
+        if hasMember(inventory, "repositories") { repositories = elements(raw, memberSpan(inventory, "repositories")) }
+        let entries = Map<Text, FileEntry>()
+        let fileCount = 0
+        let reviewed = Map<Text, Boolean>()
+        let reviewedKeys: List<Text> = []
+        for repositorySpan in repositories {
+            let repository = members(raw, repositorySpan)
+            let repositoryName = memberValue(raw, repository, "repo")
+            let revision = memberValue(raw, repository, "sha")
+            let keyed = hasMember(repository, "repo") && hasMember(repository, "sha")
+            for entrySpan in elements(raw, memberSpan(repository, "files")) {
+                require(raw[entrySpan.begin] == 123, "inventory file entry is not an object")
+                let found = members(raw, entrySpan)
+                let entry = entryFields(raw, found)
+                require(keyed && has(entry, "path"), "inventory file entry lacks repo, sha or path")
+                let key = identity(object(["repo", "revision", "path"], [repositoryName, revision, json.member(entry, "path")]), ["repo", "revision", "path"])
+                if entries.has(key) { errors.add("Duplicate inventory path: " + key) } else { fileCount += 1 }
+                entries[key] = fileEntry(entry, found.keys.length)
+                let status = json.member(entry, "review_status")
+                if has(entry, "status") { status = json.member(entry, "status") }
+                if status.kind == json.STRING && status.text == "reviewed" && !reviewed.has(key) { reviewed[key] = true; reviewedKeys.add(key) }
+            }
+            for entrySpan in elements(raw, memberSpan(repository, "reviewed_file_scopes")) {
+                require(raw[entrySpan.begin] == 123, "review scope entry is not an object")
+                let entry = entryFields(raw, members(raw, entrySpan))
+                require(keyed && has(entry, "path"), "review scope lacks repo, sha or path")
+                let key = identity(object(["repo", "revision", "path"], [repositoryName, revision, json.member(entry, "path")]), ["repo", "revision", "path"])
+                if !entries.has(key) || entries[key].sha != identityPart(json.member(entry, "sha256")) { errors.add("Review scope missing/hash mismatch: " + key) }
+                if !reviewed.has(key) { reviewed[key] = true; reviewedKeys.add(key) }
+            }
+        }
+        let artifacts: List<Text> = []
+        for name in files.list(directory) {
+            if ends(name, ".json") && contains(name, "generated") && find(name, "domain", find(name, "generated", 0) + 9) >= 0 { artifacts.add(directory + "/" + name) }
+        }
+        if exists(directory + "/generated-domains.jsonl") { artifacts.add(directory + "/generated-domains.jsonl") }
+        for artifact in artifacts.sorted() {
+            let loaded = loadDomains(audit, artifact, digest(files.readFile(artifact)))
+            if loaded.error != "" { errors.add("Malformed generated domain in " + language + ": " + loaded.error) }
+        }
+        let decisions = jsonLines(directory + "/decisions.jsonl")
+        let seen = Map<Text, Boolean>()
+        let decided = Map<Text, Boolean>()
+        let checked = Map<Text, Source>()
+        let needed = 0
+        let unchecked = 0
+        let deferred = 0
+        for line in decisions {
+            let row = parseLine(line, directory + "/decisions.jsonl")
+            let problem = decision(audit, root, language, row, errors, seen, decided, entries, resolutions, seenResolutions, referenced, sourceRoot, checked)
+            if problem.error != "" { errors.add("Malformed decision in " + language + ": " + problem.error) }
+            needed += problem.needed
+            unchecked += problem.unchecked
+            deferred += problem.deferred
+        }
+        for group in audit.sets {
+            if group.directory != directory { continue }
+            for index in 0..group.ids.length {
+                for cohort in json.member(group.domains[index], "cohorts").items {
+                    let name = json.member(cohort, "operation")
+                    if !has(cohort, "operation") { name = json.member(cohort, "id") }
+                    if !referenced.has(group.identity + "\n" + group.ids[index] + "\n" + name.text) { unchecked += 1 }
+                }
+            }
+        }
+        for key in reviewedKeys {
+            if decided.has(key) { continue }
+            let supported = false
+            if entries.has(key) { supported = entries[key].noTests && entries[key].reason && entries[key].support }
+            if !supported { errors.add("Reviewed file lacks decisions or explicit support scope: " + key) }
+        }
+        let totals = memberValue(raw, inventory, "totals")
+        let declaredTotal = json.member(totals, "files")
+        if hasMember(inventory, "total") { declaredTotal = memberValue(raw, inventory, "total") }
+        let declaredReviewed = json.member(totals, "reviewed_files")
+        if hasMember(inventory, "reviewed") { declaredReviewed = memberValue(raw, inventory, "reviewed") }
+        if !equal(declaredTotal, integer(fileCount)) || !equal(declaredReviewed, integer(reviewedKeys.length)) {
+            errors.add("Inconsistent file counts: " + language + ": declared " + declaredTotal.text + "/" + declaredReviewed.text + ", actual " + Text(fileCount) + "/" + Text(reviewedKeys.length))
+        }
+        let discovery = boolean(false)
+        if hasMember(inventory, "discovery_complete") { discovery = memberValue(raw, inventory, "discovery_complete") }
+        let enumeration = boolean(false)
+        if hasMember(inventory, "case_enumeration_complete") { enumeration = memberValue(raw, inventory, "case_enumeration_complete") }
+        summary = summary.appended(object(["language", "inventory_files", "reviewed_files", "pending_files", "decision_rows", "unresolved_implementations", "deferred_decisions", "unchecked_generated_domains", "discovery_complete", "case_enumeration_complete"],
+            [text(language), integer(fileCount), integer(reviewedKeys.length), integer(fileCount - reviewedKeys.length), integer(decisions.length), integer(needed), integer(deferred), integer(unchecked), discovery, enumeration]))
+    }
+    for key in resolutionKeys {
+        if !seenResolutions.has(key) { errors.add("Implementation resolution has no matching needed decision: " + key) }
+    }
+    let finished = summary.length == languages().length && errors.length == 0
+    for row in summary {
+        let zero = equal(json.member(row, "pending_files"), integer(0)) && equal(json.member(row, "unresolved_implementations"), integer(0)) && equal(json.member(row, "unchecked_generated_domains"), integer(0)) && equal(json.member(row, "deferred_decisions"), integer(0))
+        if !zero || !truthy(json.member(row, "discovery_complete")) || !truthy(json.member(row, "case_enumeration_complete")) { finished = false }
+    }
+    let consistency = "passed"
+    if errors.length > 0 { consistency = "failed" }
+    return object(["consistency", "complete", "scope", "languages", "errors"],
+        [text(consistency), boolean(finished), text("Recorded evidence consistency, not independent proof that source was read"), array(summary), texts(errors)])
+}
+function require(condition: Boolean, message: Text) { if !condition { fail(message) } }
+function decision(audit: Audit, root: Text, language: Text, row: json.Value, errors: List<Text>, seen: Map<Text, Boolean>, decided: Map<Text, Boolean>, entries: Map<Text, FileEntry>, resolutions: Map<Text, Text>, seenResolutions: Map<Text, Boolean>, referenced: Map<Text, Boolean>, sourceRoot: Text, checked: Map<Text, Source>): Outcome {
+    let outcome = Outcome { error: ""; needed: 0; unchecked: 0; deferred: 0 }
+    for field in keyFields() { if !has(row, field) { outcome.error = "'" + field + "'"; return outcome } }
+    let key = identity(row, keyFields())
+    if seen.has(key) { errors.add("Duplicate decision: " + key) }
+    seen[key] = true
+    let fileKey = identity(row, ["repo", "revision", "path"])
+    decided[fileKey] = true
+    let rowLanguage = json.member(row, "language")
+    let matched = rowLanguage.kind == json.STRING && rowLanguage.text == language && entries.has(fileKey) && entries[fileKey].truthy
+    if matched {
+        if !entries[fileKey].hasSha { outcome.error = "'sha256'"; return outcome }
+        if !has(row, "source_sha256") { outcome.error = "'source_sha256'"; return outcome }
+        matched = entries[fileKey].sha == identityPart(json.member(row, "source_sha256"))
+    }
+    if !matched { errors.add("Decision not matched to frozen inventory: " + key) }
+    let domain = json.member(row, "generated_domain")
+    if truthy(domain) {
+        if has(domain, "artifact") {
+            let reference = checkGenerated(audit, root, language, row)
+            if reference.error != "" { outcome.error = reference.error; return outcome }
+            referenced[reference.identity + "\n" + reference.domain + "\n" + reference.cohort] = true
+        } else {
+            let check = validateInlineDomain(row)
+            if check.error != "" { outcome.error = check.error; return outcome }
+            if !check.known { outcome.unchecked += 1 }
+        }
+    }
+    let lines = json.member(row, "lines")
+    if lines.kind != json.ARRAY || lines.items.length != 2 { outcome.error = "invalid lines"; return outcome }
+    let first = lines.items[0]
+    let last = lines.items[1]
+    let validSpan = smallInteger(first) && smallInteger(last)
+    let start = 0
+    let end = 0
+    if validSpan { start = integerValue(first); end = integerValue(last) }
+    if !validSpan || start < 1 || end < start { errors.add("Invalid source span: " + key) }
+    if !has(row, "disposition") { outcome.error = "'disposition'"; return outcome }
+    let kind = json.member(row, "disposition")
+    let knownKind = kind.kind == json.STRING && hasText(["adapt", "covered", "reject", "defer"], kind.text)
+    if !knownKind || !truthy(json.member(row, "reason")) { errors.add("Missing/invalid disposition: " + key) }
+    if kind.kind == json.STRING && kind.text == "defer" { outcome.deferred += 1 }
+    let needed = json.member(row, "implementation_needed")
+    if needed.kind != json.BOOLEAN { errors.add("Missing implementation decision: " + key) }
+    if truthy(needed) {
+        if resolutions.has(key) {
+            seenResolutions[key] = true
+            let recordedHash = resolutions[key]
+            if recordedHash != "" && !has(row, "source_sha256") { outcome.error = "'source_sha256'"; return outcome }
+            if recordedHash != "" && recordedHash != identityPart(json.member(row, "source_sha256")) {
+                errors.add("Implementation source hash differs from reviewed decision: " + key)
+            }
+        } else { outcome.needed += 1 }
+    }
+    if sourceRoot != "" {
+        if !checked.has(fileKey) {
+            let names = split(json.member(row, "repo").text, 47)
+            let name = names[names.length - 1]
+            let folder = ""
+            for candidate in [sourceRoot + "/" + name, sourceRoot + "/" + name + "-" + json.member(row, "revision").text] {
+                if folder == "" && files.list(candidate).length > 0 { folder = candidate }
+            }
+            let file = folder + "/" + json.member(row, "path").text
+            if folder == "" || files.pathSize(file) < 0 || files.list(file).length > 0 {
+                errors.add("Missing acquired source: " + fileKey)
+                checked[fileKey] = Source { present: false; data: Bytes() }
+            } else {
+                let data = files.readFile(file)
+                if digest(data) != json.member(row, "source_sha256").text { errors.add("Acquired source hash mismatch: " + fileKey) }
+                checked[fileKey] = Source { present: true; data: data }
+            }
+        }
+        let source = checked[fileKey]
+        if source.present && validSpan {
+            let lf = json.member(row, "line_numbering").kind == json.STRING && json.member(row, "line_numbering").text == "lf"
+            if end > lineCount(source.data, lf) { errors.add("Source span beyond EOF: " + key) }
+        }
+    }
+    return outcome
+}

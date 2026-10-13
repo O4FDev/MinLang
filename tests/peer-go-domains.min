@@ -1,0 +1,236 @@
+use "../tools/testing.min" as test
+use "files" as files
+use "json" as json
+use "../tools/peer-audit.min" as audit
+
+function put(target: json.Value, name: Text, value: json.Value) {
+    for index in 0..target.keys.length {
+        if target.keys[index] == name { target.items[index] = value; return }
+    }
+    target.keys.add(name)
+    target.items.add(value)
+}
+let family = "GoDomainTests"
+
+record Row { path: Text; identity: Text; row: json.Value }
+
+function lineFor(raw: Bytes, begin: Integer): Integer {
+    let index = begin
+    while index < raw.length && raw[index] != 10 { index += 1 }
+    return index
+}
+function loadRows(): List<Row> {
+    let raw = files.readFile("tests/data/peer/go/decisions.jsonl")
+    let needle = Bytes("\"generated_domain\"")
+    let rows: List<Row> = []
+    let begin = 0
+    while begin < raw.length {
+        let end = lineFor(raw, begin)
+        let found = false
+        let index = begin
+        while !found && index + needle.length <= end {
+            let same = true
+            for offset in 0..needle.length { if raw[index + offset] != needle[offset] { same = false; break } }
+            if same { found = true }
+            index += 1
+        }
+        if found {
+            let row = json.parse(Text(raw.slice(begin, end)))
+            test.check(row.kind == json.OBJECT, "invalid go decision row")
+            let path = json.member(row, "path").text
+            let domain = json.member(row, "generated_domain")
+            let supported = false
+            for candidate in audit.goSupportedPaths() { if candidate == path { supported = true } }
+            if supported && audit.has(row, "generated_domain") && !audit.has(domain, "artifact") {
+                rows.add(Row { path: path; identity: json.member(row, "case_id").text; row: row })
+            }
+        }
+        begin = end + 1
+    }
+    return rows
+}
+function caseRow(rows: List<Row>, path: Text, identity: Text): json.Value {
+    for row in rows { if row.path == path && row.identity == identity { return audit.copy(row.row) } }
+    fail("missing go domain row " + path + " " + identity)
+}
+function domainOf(row: json.Value): json.Value { return json.member(row, "generated_domain") }
+function reject(row: json.Value, label: Text) {
+    test.check(audit.validateInlineDomain(row).error != "", "go domain accepted " + label)
+}
+function number(value: json.Value): Integer { return Integer(value.text) }
+function bump(target: json.Value, name: Text, delta: Integer) { put(target, name, audit.integer(number(json.member(target, name)) + delta)) }
+function instancesFor(rows: List<Row>, path: Text): Integer {
+    let total = 0
+    for row in rows { if row.path == path { total += number(json.member(domainOf(row.row), "instances")) } }
+    return total
+}
+
+function test_all_recorded_families_validate(rows: List<Row>) {
+    test.check(rows.length == 111, "expected 111 recorded go domain rows, found " + Text(rows.length))
+    for row in rows {
+        let check = audit.validateInlineDomain(row.row)
+        test.check(check.known && check.error == "", "go domain " + row.path + " " + row.identity + ": " + check.error)
+    }
+}
+function test_rotate_cartesian_cardinality_and_axis_corruption(rows: List<Row>) {
+    test.check(instancesFor(rows, "test/rotate.go") == 90944, "rotate instances")
+    let names = ["instances", "left_shift_inclusive", "join", "unsigned", "bits", "individually_read_generated_source"]
+    let values = [audit.integer(16384), audit.integers([0, 63]), audit.texts(["|"]), audit.boolean(true), audit.boolean(true), audit.boolean(true)]
+    for index in 0..names.length {
+        let row = caseRow(rows, "test/rotate.go", "mode0/bits64/exhaustive-rule")
+        put(domainOf(row), names[index], values[index])
+        reject(row, "rotate " + names[index])
+    }
+}
+function test_driver_mode_is_tied_to_source(rows: List<Row>) {
+    let row = caseRow(rows, "test/rotate2.go", "driver-mode2")
+    put(domainOf(row), "mode", audit.integer(3))
+    reject(row, "driver mode")
+}
+function test_slice_filter_count_and_tokens(rows: List<Row>) {
+    test.check(instancesFor(rows, "test/slice3.go") == 3150, "slice instances")
+    let row = caseRow(rows, "test/slice3.go", "array/exhaustive-rule")
+    bump(domainOf(row), "instances", 1)
+    reject(row, "slice instances")
+    row = caseRow(rows, "test/slice3.go", "slice/exhaustive-rule")
+    let tokens = json.member(domainOf(row), "index_tokens")
+    tokens.items[6] = audit.text("vminus2")
+    reject(row, "slice token")
+    row = caseRow(rows, "test/slice3.go", "array/exhaustive-rule")
+    put(domainOf(row), "filter", audit.text("no exclusions"))
+    reject(row, "slice filter")
+}
+function test_range_counts_do_not_drop_duplicate_inputs(rows: List<Row>) {
+    let row = caseRow(rows, "test/rangegen.go", "long/depth2/double1/exhaustive-rule")
+    test.check(number(json.member(domainOf(row), "code_count")) == 136, "range code count")
+    bump(domainOf(row), "total_trace_comparisons", -136)
+    reject(row, "range trace comparisons")
+    row = caseRow(rows, "test/rangegen.go", "short/depth5/double-1/exhaustive-rule")
+    let inputs = json.member(domainOf(row), "all_function_inputs_inclusive")
+    inputs.items[1] = audit.integer(number(inputs.items[1]) + 1)
+    reject(row, "range inputs")
+    row = caseRow(rows, "test/rangegen.go", "long/depth2/double0/exhaustive-rule")
+    put(domainOf(row), "double", audit.integer(3))
+    reject(row, "range double")
+}
+function test_arithmetic_domain_exclusions_and_values(rows: List<Row>) {
+    let identity = "int64/var-var///exhaustive-rule"
+    let row = caseRow(rows, "test/64bit.go", identity)
+    let pairs = json.member(domainOf(row), "exclude_pairs")
+    let shorter: List<json.Value> = []
+    for index in 0..(pairs.items.length - 1) { shorter.add(pairs.items[index]) }
+    put(domainOf(row), "exclude_pairs", audit.array(shorter))
+    bump(domainOf(row), "instances", 1)
+    reject(row, "dropped exclusion")
+    row = caseRow(rows, "test/64bit.go", identity)
+    pairs = json.member(domainOf(row), "exclude_pairs")
+    pairs.items.add(pairs.items[0])
+    reject(row, "duplicate exclusion")
+    row = caseRow(rows, "test/64bit.go", "int64/const-var/+/exhaustive-rule")
+    let values = json.member(domainOf(row), "left_values")
+    let last = values.items.length - 1
+    values.items[last] = audit.integer(-number(values.items[last]))
+    reject(row, "negated value")
+    row = caseRow(rows, "test/64bit.go", "int64/unary/-")
+    let unary = json.member(domainOf(row), "values")
+    unary.items[0] = audit.boolean(false)
+    reject(row, "Boolean value")
+    row = caseRow(rows, "test/64bit.go", "int64/var-var/+/exhaustive-rule")
+    put(domainOf(row), "oracle", audit.text("wrap every overflow modulo 2**64"))
+    reject(row, "wrapping oracle")
+}
+function test_shift_guards_and_host_width(rows: List<Row>) {
+    let row = caseRow(rows, "test/64bit.go", "int64/var-var/shifts/host32/exhaustive-rule")
+    put(json.member(domainOf(row), "shift_operand_types"), "uint", audit.integer(64))
+    reject(row, "host width")
+    row = caseRow(rows, "test/64bit.go", "uint64/const-var/shifts/host64/exhaustive-rule")
+    bump(domainOf(row), "instances", 44)
+    reject(row, "shift instances")
+}
+function test_select_dynamic_tree_not_flat_boolean_product(rows: List<Row>) {
+    let families = ["recv", "send", "recvOrder", "sendOrder", "nonblock"]
+    let expected = [241, 49, 194, 49, 512]
+    let seen: List<Text> = []
+    let total = 0
+    for row in rows {
+        if row.path != "test/chan/select5.go" { continue }
+        let domain = domainOf(row.row)
+        let name = json.member(domain, "family").text
+        let position = -1
+        for index in 0..families.length { if families[index] == name { position = index } }
+        test.check(position >= 0, "unexpected select family " + name)
+        test.check(number(json.member(domain, "instances")) == expected[position], "select family " + name + " instances")
+        for other in seen { test.check(other != name, "duplicate select family " + name) }
+        seen.add(name)
+        total += number(json.member(domain, "instances"))
+    }
+    test.check(seen.length == families.length, "every select family recorded")
+    test.check(total == 1045, "select instances")
+    let row = caseRow(rows, "test/chan/select5.go", "recv/exhaustive-rule")
+    put(domainOf(row), "instances", audit.integer(1 + 4 * 5 * 16))
+    reject(row, "flat select product")
+}
+function test_disposition_cannot_hide_required_adaptation(rows: List<Row>) {
+    let row = caseRow(rows, "test/64bit.go", "int64/var-const/*/exhaustive-rule")
+    put(row, "disposition", audit.text("reject"))
+    put(row, "implementation_needed", audit.boolean(false))
+    put(domainOf(row), "per_instance_disposition", audit.text("reject"))
+    reject(row, "hidden adaptation")
+    row = caseRow(rows, "test/rotate.go", "mode1/bits8/exhaustive-rule")
+    put(row, "disposition", audit.text("covered"))
+    put(domainOf(row), "per_instance_disposition", audit.text("covered"))
+    reject(row, "covered rotate")
+}
+function test_unknown_or_external_schema_remains_unchecked(rows: List<Row>) {
+    let empty = audit.object([], [])
+    let check = audit.validateInlineDomain(empty)
+    test.check(!check.known && check.error == "", "empty row is unchecked")
+    check = audit.validateInlineDomain(audit.object(["path", "generated_domain"], [audit.text("test/unknown.go"), audit.object([], [])]))
+    test.check(!check.known && check.error == "", "unknown path is unchecked")
+    check = audit.validateInlineDomain(audit.object(["path", "generated_domain"], [audit.text("test/64bit.go"), audit.object(["artifact"], [audit.text("somewhere")])]))
+    test.check(!check.known && check.error == "", "external artifact is unchecked")
+}
+function test_missing_fields_and_wrong_revision_are_contradictions(rows: List<Row>) {
+    let row = caseRow(rows, "test/rotate.go", "mode0/bits8/exhaustive-rule")
+    put(row, "generated_domain", audit.removed(domainOf(row), "instances"))
+    reject(row, "missing instances")
+    row = caseRow(rows, "test/rangegen.go", "short/depth1/double-1/exhaustive-rule")
+    put(row, "revision", audit.text("different revision"))
+    reject(row, "wrong revision")
+}
+
+let names = ["test_all_recorded_families_validate", "test_rotate_cartesian_cardinality_and_axis_corruption", "test_driver_mode_is_tied_to_source", "test_slice_filter_count_and_tokens", "test_range_counts_do_not_drop_duplicate_inputs", "test_arithmetic_domain_exclusions_and_values", "test_shift_guards_and_host_width", "test_select_dynamic_tree_not_flat_boolean_product", "test_disposition_cannot_hide_required_adaptation", "test_unknown_or_external_schema_remains_unchecked", "test_missing_fields_and_wrong_revision_are_contradictions"]
+for index in 0..argumentCount() {
+    let value = argument(index)
+    let valid = value == family || value == "-v"
+    for name in names { if value == name || value == family + "." + name { valid = true } }
+    test.check(valid, "unknown " + family + " selector: " + value)
+}
+let rows = loadRows()
+let ran = 0
+for name in names {
+    let chosen = true
+    let selectors = 0
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        if value == "-v" { continue }
+        if selectors == 0 { chosen = false }
+        selectors += 1
+        if value == family || value == name || value == family + "." + name { chosen = true }
+    }
+    if !chosen { continue }
+    if name == "test_all_recorded_families_validate" { test_all_recorded_families_validate(rows) }
+    if name == "test_rotate_cartesian_cardinality_and_axis_corruption" { test_rotate_cartesian_cardinality_and_axis_corruption(rows) }
+    if name == "test_driver_mode_is_tied_to_source" { test_driver_mode_is_tied_to_source(rows) }
+    if name == "test_slice_filter_count_and_tokens" { test_slice_filter_count_and_tokens(rows) }
+    if name == "test_range_counts_do_not_drop_duplicate_inputs" { test_range_counts_do_not_drop_duplicate_inputs(rows) }
+    if name == "test_arithmetic_domain_exclusions_and_values" { test_arithmetic_domain_exclusions_and_values(rows) }
+    if name == "test_shift_guards_and_host_width" { test_shift_guards_and_host_width(rows) }
+    if name == "test_select_dynamic_tree_not_flat_boolean_product" { test_select_dynamic_tree_not_flat_boolean_product(rows) }
+    if name == "test_disposition_cannot_hide_required_adaptation" { test_disposition_cannot_hide_required_adaptation(rows) }
+    if name == "test_unknown_or_external_schema_remains_unchecked" { test_unknown_or_external_schema_remains_unchecked(rows) }
+    if name == "test_missing_fields_and_wrong_revision_are_contradictions" { test_missing_fields_and_wrong_revision_are_contradictions(rows) }
+    ran += 1
+    print(family + "." + name + " ... ok")
+}
+print("Ran " + Text(ran) + " " + family + " tests: OK")
