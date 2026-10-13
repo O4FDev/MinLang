@@ -6,7 +6,8 @@ images='plain lz4'
 "$clang" --version | head -1 | grep -F '23.1.2'
 mkdir -p build
 work=$(mktemp -d "$PWD/build/erofs-check.XXXXXXXX")
-trap 'rm -rf "$work"' EXIT
+fallback=''
+trap 'rm -rf "$work"; if test -n "$fallback"; then rm -rf "$fallback"; fi' EXIT
 MINYAR_CLANG="$clang" ./minyar tests/erofs.min -o "$work/writer"
 MINYAR_CLANG="$clang" ./minyar tests/erofs-api.min -o "$work/api"
 "$clang" -std=c11 -O2 -Wall -Wextra -Werror -static tests/erofs-tree.c -o "$work/tree"
@@ -26,6 +27,13 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs-thread-main.min -o "$work/thread-main
 "$fsck" --extract "$work/thread-main.erofs"
 "$work/writer" "$work/source" "$work/plain.erofs"
 "$fsck" --extract "$work/plain.erofs"
+if test -d /dev/shm && test -w /dev/shm && test "$(stat -c %d /dev/shm)" != "$(stat -c %d "$work")"; then
+    fallback=$(mktemp -d /dev/shm/minyar-erofs.XXXXXXXX)
+    "$work/tree" create "$fallback/source"
+    "$work/writer" "$fallback/source" "$work/fallback.erofs"
+    "$fsck" --extract "$work/fallback.erofs"
+    images="$images fallback"
+fi
 "$work/writer" "$work/source" "$work/lz4.erofs" 17592186040320 lz4
 "$fsck" --extract "$work/lz4.erofs"
 test "$(stat -c %s "$work/lz4.erofs")" -lt "$(stat -c %s "$work/plain.erofs")"
