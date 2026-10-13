@@ -1,0 +1,210 @@
+use "../tools/testing.min" as test
+use "./text-basics-oracles.min" as numbers
+
+public record Time { seconds: Integer; nanos: Integer }
+public record Member { path: Bytes; link: Bytes; type: Integer; size: Integer; uid: Integer; gid: Integer; time: Time; payload: Bytes; attributes: Map<Text, Bytes> }
+function require(value: Boolean, message: Text) { test.check(value, "independent tar policy: " + message) }
+function terminated(source: Bytes, start: Integer, length: Integer): Bytes {
+    let end = start
+    while end < start + length && source[end] != 0 { end += 1 }
+    return source.slice(start, end)
+}
+function number(source: Bytes, start: Integer, length: Integer): Integer {
+    let value = 0
+    if (source[start] & 128) != 0 {
+        value = source[start] & 127
+        if (source[start] & 64) != 0 { value -= 128 }
+        for index in (start + 1)..(start + length) {
+            require(value >= -36028797018963968 && value <= 36028797018963967, "numeric overflow")
+            value = value * 256 + source[index]
+        }
+        return value
+    }
+    let left = start
+    let right = start + length
+    while left < right && (source[left] == 0 || source[left] == 32) { left += 1 }
+    while right > left && (source[right - 1] == 0 || source[right - 1] == 32) { right -= 1 }
+    for index in left..right {
+        require(source[index] >= 48 && source[index] <= 55, "numeric grammar")
+        require(value <= 1152921504606846975, "numeric overflow")
+        value = value * 8 + source[index] - 48
+    }
+    return value
+}
+function decimal(raw: Bytes, negativeAllowed: Boolean): Integer {
+    require(raw.length > 0, "PAX integer grammar")
+    let start = 0
+    if raw[0] == 45 && negativeAllowed { start = 1 }
+    require(start < raw.length, "PAX integer grammar")
+    for index in start..raw.length { require(raw[index] >= 48 && raw[index] <= 57, "PAX integer grammar") }
+    let model = numbers.integerModel(raw)
+    require(model != "invalid", "PAX integer overflow")
+    return Integer(model)
+}
+function timestamp(raw: Bytes): Time {
+    require(raw.length > 0, "PAX timestamp grammar")
+    let start = 0
+    let negative = raw[0] == 45
+    if negative { start = 1 }
+    let dot = raw.length
+    for index in start..raw.length {
+        if raw[index] == 46 { require(dot == raw.length, "PAX timestamp grammar"); dot = index }
+        else { require(raw[index] >= 48 && raw[index] <= 57, "PAX timestamp grammar") }
+    }
+    require(dot > start && (dot == raw.length || dot + 1 < raw.length), "PAX timestamp grammar")
+    let seconds = decimal(raw.slice(0, dot), true)
+    let fraction = 0
+    if dot < raw.length {
+        for index in (dot + 1)..raw.length {
+            if index - dot <= 9 { fraction = fraction * 10 + raw[index] - 48 }
+            else { require(raw[index] == 48, "timestamp precision/range") }
+        }
+        let digits = raw.length - dot - 1
+        while digits < 9 { fraction *= 10; digits += 1 }
+    }
+    if negative && fraction > 0 {
+        require(seconds > -9223372036854775808, "timestamp precision/range")
+        return Time { seconds: seconds - 1; nanos: 1000000000 - fraction }
+    }
+    return Time { seconds: seconds; nanos: fraction }
+}
+function metadata(attributes: Map<Text, Bytes>) {
+    require(attributes.length <= 4096, "attribute count/metadata limit")
+    let size = 0
+    for key in attributes { size += key.byteLength + attributes[key].length }
+    require(size <= 1048576, "attribute count/metadata limit")
+}
+function records(data: Bytes, attributes: Map<Text, Bytes>, global: Boolean) {
+    let at = 0
+    while at < data.length {
+        let stop = at
+        let size = 0
+        while stop < data.length && data[stop] != 32 {
+            require(data[stop] >= 48 && data[stop] <= 57, "PAX length syntax")
+            require(size <= data.length, "PAX record span")
+            size = size * 10 + data[stop] - 48
+            stop += 1
+        }
+        require(stop < data.length && stop > at, "PAX length syntax")
+        let end = at + size
+        require(size >= stop - at + 4 && end <= data.length && data[end - 1] == 10, "PAX record span")
+        let equals = stop + 1
+        while equals < end - 1 && data[equals] != 61 { equals += 1 }
+        require(equals > stop + 1 && equals < end - 1, "PAX keyword")
+        for index in (stop + 1)..equals { require(data[index] >= 33 && data[index] <= 126 && data[index] != 61, "PAX keyword") }
+        let key = Text(data.slice(stop + 1, equals))
+        let value = data.slice(equals + 1, end - 1)
+        require(!key.startsWith("GNU.sparse.") && key != "SCHILY.realsize" && !(key == "SCHILY.filetype" && Text(value) == "sparse"), "unsupported sparse attributes")
+        if global && value.length == 0 { attributes.remove(key) } else { attributes[key] = value }
+        at = end
+    }
+    metadata(attributes)
+}
+function noNull(value: Bytes): Boolean { for byte in value { if byte == 0 { return false } }; return true }
+public function scan(source: Bytes): List<Member> {
+    let at = 0
+    let result: List<Member> = []
+    let globals = Map<Text, Bytes>()
+    let local = Map<Text, Bytes>()
+    let chain = 0
+    let extensions = 0
+    let headers = 0
+    let longPath = Bytes()
+    let longLink = Bytes()
+    while true {
+        require(source.length - at >= 512, "missing/truncated header/footer")
+        let zero = true
+        for index in at..(at + 512) { if source[index] != 0 { zero = false; break } }
+        if zero {
+            require(chain == 0, "dangling extension")
+            require(source.length - at >= 1024 && (source.length - at) % 512 == 0, "two end blocks/zero record padding")
+            for index in at..source.length { require(source[index] == 0, "two end blocks/zero record padding") }
+            return result
+        }
+        headers += 1
+        require(headers <= 1000000, "header limit")
+        let magic = source.slice(at + 257, at + 265)
+        let emptyMagic = true
+        for byte in magic { if byte != 0 { emptyMagic = false } }
+        require(emptyMagic || Text(magic) == "ustar\u{0}00" || Text(magic) == "ustar  \u{0}", "magic/version")
+        let unsignedSum = 0
+        let signedSum = 0
+        for offset in 0..512 {
+            let byte = source[at + offset]
+            if offset >= 148 && offset < 156 { byte = 32 }
+            unsignedSum += byte
+            if byte >= 128 { signedSum += byte - 256 } else { signedSum += byte }
+        }
+        let checksum = number(source, at + 148, 8)
+        require(checksum == unsignedSum || checksum == signedSum, "checksum or numeric grammar")
+        let mode = number(source, at + 100, 8)
+        let uid = number(source, at + 108, 8)
+        let gid = number(source, at + 116, 8)
+        let size = number(source, at + 124, 12)
+        let time = Time { seconds: number(source, at + 136, 12); nanos: 0 }
+        let major = number(source, at + 329, 8)
+        let minor = number(source, at + 337, 8)
+        require(mode >= 0 && size >= 0 && major >= 0 && minor >= 0, "negative mode/size/device")
+        let type = source[at + 156]
+        if type == 0 { type = 48 }
+        let extension = type == 120 || type == 103 || type == 76 || type == 75
+        let attributes = Map<Text, Bytes>()
+        let path = terminated(source, at, 100)
+        let prefix = terminated(source, at + 345, 155)
+        if prefix.length > 0 && Text(magic) == "ustar\u{0}00" { prefix.add(47); prefix.addBytes(path); path = prefix }
+        let link = terminated(source, at + 157, 100)
+        if extension {
+            chain += 1
+            extensions += size
+            require(chain <= 64 && extensions <= 1048576, "extension chain/metadata limit")
+        } else {
+            require(type >= 48 && type <= 54, "unsupported member type/sparse")
+            for key in globals { attributes[key] = globals[key] }
+            for key in local { attributes[key] = local[key] }
+            let erase: List<Text> = []
+            for key in attributes { if attributes[key].length == 0 { erase.add(key) } }
+            for key in erase { attributes.remove(key) }
+            metadata(attributes)
+            for key in attributes {
+                let value = attributes[key]
+                if key == "size" || key == "uid" || key == "gid" || key == "SCHILY.devmajor" || key == "SCHILY.devminor" {
+                    let integer = decimal(value, key != "size")
+                    if key == "size" { size = integer }
+                    else if key == "uid" { uid = integer }
+                    else if key == "gid" { gid = integer }
+                }
+                if key == "mtime" { time = timestamp(value) }
+            }
+            if longPath.length > 0 { path = longPath }
+            if longLink.length > 0 { link = longLink }
+            if attributes.has("path") { path = attributes["path"] }
+            if attributes.has("linkpath") { link = attributes["linkpath"] }
+            require(path.length > 0 && path.length <= 4096 && noNull(path), "byte name limit/NUL")
+            require(link.length <= 4096 && noNull(link), "byte name limit/NUL")
+            for key in ["uname", "gname"] { if attributes.has(key) { require(attributes[key].length <= 4096 && noNull(attributes[key]), "byte name limit/NUL") } }
+            require(type == 48 || size == 0, "nonregular payload")
+        }
+        let payload = at + 512
+        let padding = (512 - size % 512) % 512
+        require(size <= source.length - payload && padding <= source.length - payload - size, "payload/padding truncation")
+        let end = payload + size + padding
+        if extension {
+            let data = source.slice(payload, payload + size)
+            if type == 120 || type == 103 {
+                if type == 103 { records(data, globals, true) } else { records(data, local, false) }
+            } else {
+                if data.length > 0 && data[data.length - 1] == 0 { data = data.slice(0, data.length - 1) }
+                require(data.length > 0 && data.length <= 4096 && noNull(data), "GNU byte name limit/NUL")
+                if type == 76 { longPath = data } else { longLink = data }
+            }
+        } else {
+            result.add(Member { path: path; link: link; type: type; size: size; uid: uid; gid: gid; time: time; payload: source.slice(payload, payload + size); attributes: attributes })
+            chain = 0
+            extensions = 0
+            local.clear()
+            longPath = Bytes()
+            longLink = Bytes()
+        }
+        at = end
+    }
+}

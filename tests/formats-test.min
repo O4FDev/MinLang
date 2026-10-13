@@ -1,0 +1,153 @@
+use "../tools/testing.min" as test
+use "./text-basics-oracles.min" as hex
+use "./formats-oracles.min" as tarOracle
+use "system" as system
+use "json" as json
+
+record Provider { flags: List<Text>; libraries: List<Text> }
+function digest(input: Bytes): Bytes { native "formatstest" }
+function gunzip(input: Bytes, output: Bytes): Integer { native "formatstest" }
+function unzstd(input: Bytes, output: Bytes): Integer { native "formatstest" }
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+function provider(kind: Text, clang: Text, flags: List<Text>, environment: List<Text>, directory: Text): Provider {
+    let command: List<Text> = []
+    if kind == "zstd" || kind == "deflate" {
+        command = ["python3", "tools/compression_provider.py", kind, "--clang", clang]
+        for flag in flags { command.add("--compile-flag=" + flag) }
+    } else {
+        let joined = ""
+        for index in 0..flags.length { if index > 0 { joined += " " }; joined += flags[index] }
+        command = ["python3", "tools/format_provider.py", kind, "--clang", clang, "--flags=" + joined]
+    }
+    let result = test.run(command, environment, "", directory + "/provider-" + kind, 120)
+    test.require(result, "production " + kind + " provider query")
+    let value = json.parse(result.output)
+    let cflags = json.member(value, "cflags")
+    let libraries = json.member(value, "libraries")
+    test.check(cflags.kind == json.ARRAY && libraries.kind == json.ARRAY, "production provider returned invalid additive arguments")
+    let compile: List<Text> = []
+    let link: List<Text> = []
+    for item in cflags.items { test.check(item.kind == json.STRING, "invalid provider C flag"); compile.add(item.text) }
+    for item in libraries.items { test.check(item.kind == json.STRING, "invalid provider library argument"); link.add(item.text) }
+    return Provider { flags: compile; libraries: link }
+}
+function rows(output: Text): Map<Text, Text> {
+    let result = Map<Text, Text>()
+    for line in test.lines(output) {
+        let raw = Bytes(line)
+        let equals = -1
+        for index in 0..raw.length { if raw[index] == 61 { equals = index; break } }
+        test.check(equals > 0, "invalid formats protocol row")
+        result[Text(raw.slice(0, equals))] = Text(raw.slice(equals + 1, raw.length))
+    }
+    return result
+}
+
+let sanitize = false
+let artifacts = ""
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--sanitize" { sanitize = true }
+    else if option == "--artifacts" {
+        test.check(optionIndex + 1 < argumentCount(), "missing formats artifact path")
+        optionIndex += 1
+        artifacts = argument(optionIndex)
+    } else { fail("unknown formats option: " + option) }
+    optionIndex += 1
+}
+let scratch = test.scratch()
+let directory = scratch
+if artifacts != "" {
+    test.require(test.run(["/bin/mkdir", "-p", "--", artifacts], system.environment(), "", scratch + "/mkdir", 10), "formats artifact directory")
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), artifacts, scratch + "/location", 10)
+    test.require(location, "formats artifact path")
+    directory = test.lines(location.output)[0]
+}
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let flags = ["-O2"]
+if sanitize { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let environment = setting(system.environment(), "ASAN_OPTIONS", "detect_leaks=1")
+environment = setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+let raw = directory + "/formats.ll"
+test.require(test.run([compiler, "tests/formats.min", raw, "--library", "library"], environment, "", directory + "/compile", 120), "formats fixture compile")
+let generated = readTextFile(raw)
+test.check(!test.contains(generated, "securecrypto") && !test.contains(generated, "monocypher"), "standalone formats link pulled an unrelated crypto package")
+let manualIR = directory + "/formats-manual.ll"
+writeTextFile(manualIR, generated)
+if test.addressEnabled(flags) { writeTextFile(manualIR, test.instrument(readTextFile(manualIR))) }
+let runtime = directory + "/runtime.o"
+let command = [clang]
+for flag in flags { command.add(flag) }
+for item in ["-DMINYAR_SYSTEM_HEAP=1", "-c", "runtime/minyar_runtime.c", "-o", runtime] { command.add(item) }
+test.require(test.run(command, environment, "", directory + "/runtime-compile", 120), "formats runtime compile")
+let native: List<Text> = []
+let libraries: List<Text> = []
+for kind in ["zstd", "deflate", "sha256", "tararchive"] {
+    let selected = provider(kind, clang, flags, environment, directory)
+    let object = directory + "/" + kind + ".o"
+    command = [clang]
+    for flag in flags { command.add(flag) }
+    for flag in selected.flags { command.add(flag) }
+    for item in ["-c", "runtime/native/" + kind + ".c", "-o", object] { command.add(item) }
+    test.require(test.run(command, environment, "", directory + "/native-" + kind, 120), "formats native provider compile")
+    native.add(object)
+    for library in selected.libraries { libraries.add(library) }
+}
+let manual = directory + "/formats-manual"
+command = [clang]
+for flag in flags { command.add(flag) }
+for item in ["-Wno-override-module", manualIR, runtime] { command.add(item) }
+for object in native { command.add(object) }
+for library in libraries { command.add(library) }
+for item in ["-o", manual, "-lm"] { command.add(item) }
+test.require(test.run(command, environment, "", directory + "/manual-link", 120), "manual formats link")
+let normal = directory + "/formats-driver"
+let joined = ""
+for index in 0..flags.length { if index > 0 { joined += " " }; joined += flags[index] }
+let driverEnvironment = setting(environment, "MINYAR_CLANG", clang)
+driverEnvironment = setting(driverEnvironment, "MINYAR_CLANG_FLAGS", joined)
+driverEnvironment = setting(driverEnvironment, "MINYAR_NATIVE_FLAGS", joined)
+let project = test.run(["/bin/pwd", "-P"], system.environment(), "", directory + "/project", 10)
+test.require(project, "formats project directory")
+test.require(test.run(["python3", "tools/clang-driver.py", "link", test.lines(project.output)[0], raw, runtime, normal, "0"], driverEnvironment, "", directory + "/driver-link", 120), "standard production formats driver")
+let output = test.run([manual], environment, "", directory + "/manual-run", 120)
+test.require(output, "manual formats execution")
+let standard = test.run([normal], environment, "", directory + "/driver-run", 120)
+test.require(standard, "standard formats execution")
+test.check(standard.output == output.output, "manual and standard driver differ")
+let values = rows(output.output)
+let layer = hex.fromHex(values["tar"])
+let packed = hex.fromHex(values["zstd"])
+test.check(hex.hex(digest(layer)) == values["sha256"], "independent SHA-256 disagreed with layer digest")
+let inflated = Bytes(layer.length)
+test.check(gunzip(hex.fromHex(values["gzip"]), inflated) == layer.length && same(inflated, layer), "independent gzip decompression changed the layer")
+let target = Bytes(layer.length)
+test.check(unzstd(packed, target) == layer.length, "independent ZSTD_decompress returned the wrong length")
+test.check(same(target, layer), "independent zstd decompression changed the layer")
+let members = tarOracle.scan(layer)
+test.check(members.length == 3, "independent structural tar scan found the wrong member count")
+test.check(members[0].attributes.has("VENDOR.binary") && same(members[0].attributes["VENDOR.binary"], hex.fromHex("00ff0a3d")), "binary PAX attribute changed")
+let names = ["layer/binary", "layer/.wh.deleted", "layer/link"]
+for index in 0..names.length { test.check(Text(members[index].path) == names[index], "independent tar member name changed") }
+test.check(members[0].payload.length == 256, "binary tar payload length changed")
+for index in 0..256 { test.check(members[0].payload[index] == index, "binary tar payload changed") }
+test.check(members[0].uid == 123 && members[0].gid == 456 && Float(members[0].time.seconds) + Float(members[0].time.nanos) / 1000000000.0 == -1.25, "independent tar identity or fractional time changed")
+test.check(members[1].size == 0 && members[2].type == 50 && Text(members[2].link) == "binary", "independent tar whiteout or symlink changed")
+test.removeTree(scratch)
+print("formats: OCI layer, byte metadata, gzip/zstd, standalone streaming SHA, manual+standard link passed")
