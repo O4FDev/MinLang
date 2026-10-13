@@ -46,7 +46,8 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 def compile_once() -> subprocess.CompletedProcess[str]:
-    return subprocess.run([str(COMPILER), str(SOURCE), str(OUTPUT)], text=True, capture_output=True)
+    return subprocess.run([str(COMPILER), str(SOURCE), str(OUTPUT)], text=True, capture_output=True,
+                          close_fds=sys.platform != "darwin")
 
 
 def validate_compile_output(result: subprocess.CompletedProcess[str], phase: str = "self-compile") -> None:
@@ -62,7 +63,7 @@ def retired_instructions() -> int | None:
         # A stale valid file must not disguise a failed/no-output invocation.
         OUTPUT.unlink(missing_ok=True)
         result = subprocess.run(["/usr/bin/time", "-l", str(COMPILER), str(SOURCE), str(OUTPUT)],
-                                text=True, capture_output=True)
+                                text=True, capture_output=True, close_fds=sys.platform != "darwin")
         validate_compile_output(result, "profiled self-compile")
         match = re.search(r"(\d+)\s+instructions retired", result.stderr)
         if not match:
