@@ -1,0 +1,63 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "system" as system
+use "json" as json
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let output = ""
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "lazy configuration option needs a value")
+    let option = argument(index)
+    if option == "--clang" { clang = argument(index + 1) }
+    else if option == "--output" { output = argument(index + 1) }
+    else { fail("unknown lazy configuration option") }
+    index += 2
+}
+let work = test.scratch()
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
+let rows: List<Text> = []
+for size in [67108864, 68719476736, 1099511627776] {
+    for mode in ["native", "sanitize"] {
+        let executable = work + "/capacity-" + Text(size) + "-" + mode
+        let command = [clang, "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror"]
+        if mode == "sanitize" { command.add("-fsanitize=address,undefined") }
+        for item in ["-DMINYAR_BOUNDED_HEAP_BYTES=" + Text(size) + "ULL", "tests/lazy-heap.c", "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", work + "/compile", 60), "lazy heap capacity compile")
+        let result = test.run([executable], environment, "", work + "/run", 60)
+        test.require(result, "lazy heap capacity")
+        let row = "{\"capacity\":" + Text(size) + ",\"sanitized\":" + Text(mode == "sanitize") + ",\"output\":" + json.quote(result.output.trim()) + "}"
+        rows.add(row)
+        print(row)
+        if mode == "sanitize" && size > 67108864 {
+            let failed = test.run([executable, "sanitizer-limit"], environment, "", work + "/limit", 30)
+            test.check(failed.status != 0 && failed.status != 124 && test.contains(failed.errorOutput, "sanitizer block limit"), "lazy heap sanitizer limit changed\n" + failed.errorOutput)
+        }
+    }
+}
+for mapping in [1, 2] {
+    for mode in ["native", "sanitize"] {
+        let executable = work + "/failure-" + Text(mapping) + "-" + mode
+        let command = [clang, "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror"]
+        if mode == "sanitize" { command.add("-fsanitize=address,undefined") }
+        for item in ["-DFAIL_MAPPING=" + Text(mapping), "tests/lazy-mmap-failure.c", "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", work + "/failure-compile", 60), "lazy mapping rollback compile")
+        let result = test.run([executable], environment, "", work + "/failure", 30)
+        test.check(result.status == 1, "lazy mapping rollback status changed\n" + result.errorOutput)
+        test.check(test.contains(result.errorOutput, "injected mapping failure rolled back correctly"), "lazy mapping rollback assertion missing")
+        let diagnostic = "virtual reservation failed"
+        if mapping == 2 { diagnostic = "metadata reservation failed" }
+        test.check(test.contains(result.errorOutput, diagnostic), "lazy mapping failure diagnostic changed")
+        let row = "{\"failure_mapping\":" + Text(mapping) + ",\"sanitized\":" + Text(mode == "sanitize") + ",\"output\":" + json.quote(result.errorOutput.trim()) + "}"
+        rows.add(row)
+        print(row)
+    }
+}
+if output != "" {
+    let data = "["
+    for index in 0..rows.length {
+        if index > 0 { data += "," }
+        data += rows[index]
+    }
+    writeTextFile(output, data + "]\n")
+}
+test.removeTree(work)
