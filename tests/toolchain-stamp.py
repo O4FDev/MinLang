@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Toolchain changes invalidate artifacts; unchanged probes preserve mtimes."""
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 from clang_helpers import native_path
 
@@ -29,7 +27,7 @@ class ToolchainStamp(unittest.TestCase):
             environment = {**os.environ, 'CC': str(compiler), 'LLVM_CC': str(compiler),
                            'COMPILER_LTO_FLAGS': '-flto=thin -fuse-ld=lld', 'LLVM_FLAGS': '-O2'}
             def probe():
-                return subprocess.run([sys.executable, str(ROOT / 'scripts/toolchain-stamp.py'), str(stamp)],
+                return subprocess.run(['sh', str(ROOT / 'tools/toolchain.sh'), 'stamp', str(stamp)],
                                       env=environment, capture_output=True, text=True, timeout=10)
             def install(version):
                 linker.write_text('#!' + sys.executable + '\nprint("LLD ' + version + '")\n')
@@ -71,7 +69,7 @@ class ToolchainStamp(unittest.TestCase):
 
             def probe():
                 result = subprocess.run(
-                    [sys.executable, str(ROOT / "scripts/toolchain-stamp.py"), str(stamp)],
+                    ["sh", str(ROOT / "tools/toolchain.sh"), "stamp", str(stamp)],
                     env=environment, capture_output=True, text=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -95,61 +93,72 @@ class ToolchainStamp(unittest.TestCase):
 
 
 class StampFilesystemClock(unittest.TestCase):
-    def setUp(self):
-        spec = importlib.util.spec_from_file_location('stamp_module', ROOT / 'scripts/toolchain-stamp.py')
-        self.stamp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.stamp)
-
-    def exercise(self, timestamps, max_wait=0.3, prior=100):
+    def exercise(self, timestamps, prior=100):
         temporary = tempfile.TemporaryDirectory(prefix='stamp-clock-')
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        work = Path(temporary.name)
+        root = work / 'stamps'
+        root.mkdir()
         target = root / 'stamp.json'
         target.write_bytes(b'original')
-        real_utime = os.utime
-        real_replace = os.replace
-        real_utime(target, ns=(prior * 1_000_000_000, prior * 1_000_000_000))
-        elapsed = [0.0]
-        wall = [100.9]
-        observed = []
-        values = iter(timestamps)
-        def touch(path, *args, **kwargs):
-            stamp = next(values, timestamps[-1])
-            real_utime(path, ns=(stamp, stamp))
-            observed.append(stamp)
-        def replace(path, destination):
-            self.assertGreaterEqual(Path(path).stat().st_mtime_ns // 1_000_000_000, max(100, prior) + 1)
-            real_replace(path, destination)
-        def sleep(duration):
-            elapsed[0] += duration
-            wall[0] = 101.9
-        # Userspace time has crossed the second; the filesystem initially has
-        # not. Only observing UTIME_NOW on the temporary inode can certify it.
-        with mock.patch.object(self.stamp.time, 'time', side_effect=lambda: wall[0]), \
-             mock.patch.object(self.stamp.time, 'monotonic', side_effect=lambda: elapsed[0]), \
-             mock.patch.object(self.stamp.time, 'sleep', side_effect=sleep), \
-             mock.patch.object(self.stamp.os, 'utime', side_effect=touch), \
-             mock.patch.object(self.stamp.os, 'replace', side_effect=replace):
-            try:
-                self.stamp.publish_stamp(target, b'changed', max_wait=max_wait)
-            except TimeoutError:
-                self.assertEqual(target.read_bytes(), b'original')
-                self.assertEqual(list(root.iterdir()), [target])
-                raise
-        self.assertEqual(target.read_bytes(), b'changed')
+        os.utime(target, ns=(prior * 1_000_000_000, prior * 1_000_000_000))
+        tools = work / 'tools'
+        tools.mkdir()
+        sequence = work / 'sequence.json'
+        sequence.write_text(json.dumps(timestamps))
+        log = work / 'clock.jsonl'
+        compiler = work / 'clang'
+        compiler.write_text('#!' + sys.executable + '\nprint("clang version 23.1.2")\n')
+        compiler.chmod(0o755)
+        fakes = {
+            'date': 'print(100)\n',
+            'sleep': 'pass\n',
+            'touch': ('import json,os,sys\n'
+                      'values=json.load(open(os.environ["STAMP_SEQUENCE"]))\n'
+                      'log=os.environ["STAMP_LOG"]\n'
+                      'count=sum(1 for line in open(log) if line.startswith("touch")) if os.path.exists(log) else 0\n'
+                      'stamp=values[min(count,len(values)-1)]\n'
+                      'os.utime(sys.argv[-1],ns=(stamp,stamp))\n'
+                      'open(log,"a").write("touch "+str(stamp)+"\\n")\n'),
+            'mv': ('import os,sys\n'
+                   'source,destination=sys.argv[-2],sys.argv[-1]\n'
+                   'open(os.environ["STAMP_LOG"],"a").write("replace "+str(os.stat(source).st_mtime_ns)+"\\n")\n'
+                   'os.replace(source,destination)\n'),
+        }
+        for name, code in fakes.items():
+            path = tools / name
+            path.write_text('#!' + sys.executable + '\n' + code)
+            path.chmod(0o755)
+        environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                           CC=str(compiler), LLVM_CC=str(compiler), COMPILER_LTO_FLAGS='', LLVM_FLAGS='',
+                           STAMP_SEQUENCE=str(sequence), STAMP_LOG=str(log))
+        result = subprocess.run(['sh', str(ROOT / 'tools/toolchain.sh'), 'stamp', str(target)],
+                                env=environment, capture_output=True, text=True, timeout=30)
+        rows = log.read_text().splitlines() if log.exists() else []
+        observed = [int(row.split()[1]) for row in rows if row.startswith('touch')]
+        replaced = [int(row.split()[1]) for row in rows if row.startswith('replace')]
+        if result.returncode:
+            self.assertEqual(target.read_bytes(), b'original')
+            self.assertEqual(list(root.iterdir()), [target])
+            self.assertEqual(replaced, [])
+            raise TimeoutError(result.stderr)
+        self.assertEqual(len(replaced), 1)
+        self.assertGreaterEqual(replaced[0] // 1_000_000_000, max(100, prior) + 1)
+        self.assertNotEqual(target.read_bytes(), b'original')
+        self.assertEqual(json.loads(target.read_text())['llvm_version'], '23.1.2')
         self.assertEqual(list(root.iterdir()), [target])
-        return observed, elapsed[0]
+        return observed
 
     def test_userspace_boundary_does_not_certify_filesystem_boundary(self):
-        observed, _ = self.exercise([100_990_000_000, 101_001_000_000])
+        observed = self.exercise([100_990_000_000, 101_001_000_000])
         self.assertEqual(observed, [100_990_000_000, 101_001_000_000])
 
     def test_stalled_filesystem_fails_bounded_without_replacing_stamp(self):
         with self.assertRaisesRegex(TimeoutError, 'filesystem timestamp'):
-            self.exercise([100_999_999_999], max_wait=0.12)
+            self.exercise([100_999_999_999])
 
     def test_clock_rollback_still_requires_newer_than_prior_stamp(self):
-        observed, _ = self.exercise([103_999_999_999, 104_000_000_000], prior=103)
+        observed = self.exercise([103_999_999_999, 104_000_000_000], prior=103)
         self.assertEqual(observed[-1], 104_000_000_000)
 
 

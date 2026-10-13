@@ -112,8 +112,8 @@ export COMPILER_RUNTIME_FLAGS COMPILER_LTO_FLAGS PROGRAM_RUNTIME_FLAGS BOUNDED_F
 .PHONY: FORCE
 FORCE:
 
-build/.toolchain.json: FORCE scripts/toolchain-stamp.py tools/host_paths.py | build
-	@python3 scripts/toolchain-stamp.py $@
+build/.toolchain.json: FORCE tools/toolchain.sh | build
+	@sh tools/toolchain.sh stamp $@
 
 .PHONY: check-native-records
 check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o build/tooling/tests/native-records

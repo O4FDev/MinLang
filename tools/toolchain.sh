@@ -308,10 +308,158 @@ version() {
     fi
 }
 
+json_string() {
+    _value=$1
+    _json=
+    while [ -n "$_value" ]; do
+        _next=${_value#?}
+        _char=${_value%"$_next"}
+        _value=$_next
+        case $_char in
+            \\) _json="$_json\\\\" ;;
+            '"') _json="$_json\\\"" ;;
+            "$tab") _json="$_json\\t" ;;
+            "$cr") _json="$_json\\r" ;;
+            "$newline") _json="$_json\\n" ;;
+            *) _json=$_json$_char ;;
+        esac
+    done
+    _json="\"$_json\""
+}
+
+resolve_file() {
+    _path=$1
+    _count=0
+    while [ -h "$_path" ] && [ "$_count" -lt 40 ]; do
+        _link=$(readlink "$_path")
+        case $_link in /*) _path=$_link ;; *) _path=$(dirname -- "$_path")/$_link ;; esac
+        _count=$((_count + 1))
+    done
+    _directory=$(CDPATH= cd -- "$(dirname -- "$_path")" && pwd -P)
+    resolved_file=${_directory%/}/${_path##*/}
+}
+
+nanoseconds() {
+    _seconds=${1%%.*}
+    case $1 in *.*) _fraction=${1#*.}000000000 ;; *) _fraction=000000000 ;; esac
+    _fraction=$(printf '%.9s' "$_fraction" | sed 's/^0*//')
+    echo $((_seconds * 1000000000 + ${_fraction:-0}))
+}
+
+modified_seconds() {
+    stat -L -c %Y "$1" 2>/dev/null || stat -L -f %m "$1"
+}
+
+file_identity() {
+    _name=$1
+    _command=$2
+    _found=$(find_command "$_command") || fail "$_name: compiler executable not found: $_command"
+    resolve_file "$_found"
+    _fields=$(stat -L -c '%d %i %s %.9Y %.9Z' "$resolved_file" 2>/dev/null || stat -L -f '%d %i %z %Fm %Fc' "$resolved_file") || fail "$_name: cannot inspect $resolved_file"
+    set -f
+    set -- $_fields
+    set +f
+    json_string "$_command"
+    _quoted_command=$_json
+    json_string "$resolved_file"
+    identity="{
+    \"changed_ns\": $(nanoseconds "$5"),
+    \"command\": $_quoted_command,
+    \"device\": $1,
+    \"inode\": $2,
+    \"modified_ns\": $(nanoseconds "$4"),
+    \"path\": $_json,
+    \"size\": $3
+  }"
+}
+
+publish_stamp() {
+    _target=$1
+    _previous=0
+    if [ -e "$_target" ]; then _previous=$(modified_seconds "$_target"); fi
+    _now=$(date +%s)
+    if [ "$_now" -gt "$_previous" ]; then _boundary=$((_now + 1)); else _boundary=$((_previous + 1)); fi
+    stamp_temporary=$(mktemp "$_target.XXXXXXXX")
+    trap 'rm -f -- "$stamp_temporary"' 0
+    trap 'exit 1' HUP INT TERM
+    printf '%s' "$2" > "$stamp_temporary"
+    _attempts=0
+    while :; do
+        touch "$stamp_temporary"
+        [ "$(modified_seconds "$stamp_temporary")" -lt "$_boundary" ] || break
+        _attempts=$((_attempts + 1))
+        [ "$_attempts" -le 60 ] || fail 'filesystem timestamp did not cross the required whole-second boundary'
+        sleep 0.05
+    done
+    mv -f -- "$stamp_temporary" "$_target"
+    trap - 0
+}
+
+stamp() {
+    target=$1
+    previous=
+    if [ -f "$target" ]; then previous=$(cat "$target"; printf x); previous=${previous%x}; fi
+    if [ "$(host_system)" = Darwin ]; then default_clang=clang; else default_clang=clang-23; fi
+    file_identity CC "${CC-cc}"
+    cc_identity=$identity
+    llvm_command=${LLVM_CC-$default_clang}
+    file_identity LLVM_CC "$llvm_command"
+    llvm_identity=$identity
+    version_line="  \"llvm_version\": \"$llvm_version\""
+    case $previous in
+        *"\"llvm_cc\": $llvm_identity"*"$version_line"*) ;;
+        *) pinned compiler "$llvm_command" ;;
+    esac
+    linker_identity=null
+    split_words options "${LLVM_FLAGS-} ${COMPILER_LTO_FLAGS-}" options
+    eval "set -- $options"
+    lto=0
+    for option in "$@"; do case $option in -flto*) lto=1 ;; esac; done
+    if [ "$(host_system)" = Linux ] && [ "$lto" = 1 ]; then
+        selected=
+        for option in "$@"; do case $option in --ld-path=*) selected=${option#*=} ;; esac; done
+        if [ -z "$selected" ]; then
+            selected=lld
+            for option in "$@"; do case $option in -fuse-ld=*) selected=${option#*=} ;; esac; done
+        fi
+        case $selected in
+            lld) selected=$("$llvm_command" -print-prog-name=ld.lld) || fail "Command '['$llvm_command', '-print-prog-name=ld.lld']' returned non-zero exit status $?." ;;
+            /*) ;;
+            *) selected=$(find_command "$selected" || find_command "ld.$selected" || printf '%s\n' "$selected") ;;
+        esac
+        file_identity LLD "$selected"
+        linker_identity=$identity
+        case $previous in
+            *"\"linker\": $linker_identity"*"$version_line"*) ;;
+            *) pinned linker "$selected" ;;
+        esac
+    fi
+    flags=
+    for name in BOUNDED_FLAGS CFLAGS COMPILER_LTO_FLAGS COMPILER_RUNTIME_FLAGS CPPFLAGS LDLIBS LLVM_FLAGS PROGRAM_RUNTIME_FLAGS SANITIZER_FLAGS; do
+        eval "value=\${$name-}"
+        json_string "$value"
+        flags="$flags${flags:+,$newline}    \"$name\": $_json"
+    done
+    content="{
+  \"cc\": $cc_identity,
+  \"flags\": {
+$flags
+  },
+  \"linker\": $linker_identity,
+  \"llvm_cc\": $llvm_identity,
+$version_line
+}
+"
+    [ "$content" != "$previous" ] || return 0
+    mkdir -p "$(dirname -- "$target")"
+    publish_stamp "$target" "$content"
+}
+
 command=${1-}
 [ "$#" -eq 0 ] || shift
-usage='usage: toolchain.sh toolchain | doctor | version PROJECT | bootstrap PROJECT TARGET...'
+usage='usage: toolchain.sh toolchain | doctor | version PROJECT | stamp TARGET | bootstrap PROJECT TARGET...'
 case $command:$# in
+    stamp:1) stamp "$1" ;;
     toolchain:0) toolchain ;;
     doctor:0) doctor ;;
     version:1) version "$1" ;;
