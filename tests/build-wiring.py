@@ -731,7 +731,10 @@ class BuildWiring(unittest.TestCase):
         source = (ROOT / 'build-support/checks.mk').read_text()
         marker = '# Real unsafe generated-program accesses must fail'
         self.assertIn(marker, source)
-        fragment = source[source.index(marker):]
+        aggregate = 'check check-portable check-sanitize: check-generated-llvm-sanitizer'
+        begin = source.index(marker)
+        end = source.index('\n', source.index(aggregate, begin))
+        fragment = source[begin:end + 1]
         expected = {'build/minyarc', 'tests/generated-llvm-sanitizer.py',
                     'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
                     'tools/sanitizer_llvm.py', 'tools/clang-driver.py'}

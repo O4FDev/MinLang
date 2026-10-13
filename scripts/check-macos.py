@@ -82,12 +82,6 @@ def main():
         p.error('trailing arguments must be make variables (VAR=VALUE)')
     if platform.system() != 'Darwin' and not a.dry_run:
         print('note: this runner is meant for macOS; use scripts/check-linux.py on Linux', file=sys.stderr)
-    if a.jobs > 1 and not any(item.startswith('CC=') for item in a.make_vars):
-        # The Makefile defaults CC to cc, but the minyar launcher's nested make
-        # falls back to clang; each switch rewrites the toolchain stamp and
-        # rebuilds every compiler. Serially that only costs time; in parallel
-        # it would rebuild artifacts other checks are using.
-        a.make_vars.append('CC=clang')
     env = {name: value for name, value in os.environ.items() if name not in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL')}
     # Each make is serial; concurrency comes from running several checks at once.
     make = ['make', '-j1', *a.make_vars]

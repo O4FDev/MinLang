@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Keep strict suite consumers inside isolated correctness source snapshots."""
 import hashlib
+import contextlib
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -77,6 +81,24 @@ class LinuxSnapshot(unittest.TestCase):
                 RUNNER.check_runner.Check('late-input', ['test', '-f', 'late'], goals=['late'], expected=10)]
             runner.run_all(checks)
             self.assertEqual(runner.results, {'frontend-identity': 'passed', 'late-input': 'passed'})
+
+    def test_portable_runner_preserves_selected_compiler_spelling(self):
+        spec = importlib.util.spec_from_file_location('portable_checks', ROOT / 'scripts/check-macos.py')
+        portable = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(portable)
+        rule = portable.check_runner.Rule('check-portable', [], [], 'check-portable')
+        rule.phony = True
+        for selected in ('/opt/llvm23/bin/clang', 'clang-23'):
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, CC=selected, LLVM_CC=selected), \
+                 mock.patch.object(sys, 'argv', ['check-macos.py', '--dry-run', '--jobs', '3', '--no-extras']), \
+                 mock.patch.object(portable.platform, 'system', return_value='Darwin'), \
+                 mock.patch.object(portable.check_runner, 'make_database', return_value={'check-portable': rule}) as database, \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(portable.main(), 0)
+            self.assertEqual(json.loads(output.getvalue())['make'], ['make', '-j1'])
+            self.assertEqual(database.call_args.args[2]['CC'], selected)
+            self.assertEqual(database.call_args.args[2]['LLVM_CC'], selected)
 
     def test_workflow_consumers_remain_reviewable_and_catalogue_valid(self):
         with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:
