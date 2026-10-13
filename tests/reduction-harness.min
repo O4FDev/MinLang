@@ -1,0 +1,96 @@
+use "./evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+
+function contains(source: Text, needle: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > raw.length { return false }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return true }
+    }
+    return false
+}
+function shellQuote(value: Text): Text {
+    let raw = Bytes(value)
+    let result = Bytes("'")
+    for byte in raw {
+        if byte == 39 { result.addBytes(Bytes("'\\''")) } else { result.add(byte) }
+    }
+    result.add(39)
+    return Text(result)
+}
+function setting(name: Text, fallback: Text): Text {
+    let value = system.getenv(name)
+    if value == "" { return fallback }
+    return value
+}
+function reduce(trace: evidence.Evidence, tool: Text, source: Text, compiler: Text, output: Text, oracle: List<Text>, seconds: Float, phase: Text): evidence.Command {
+    let command = [tool, source, "--compiler", compiler, "--output", output, "--oracle"]
+    for item in oracle { command.add(item) }
+    let request = evidence.command(command, seconds)
+    request.cwd = trace.path
+    request.phase = phase
+    return request
+}
+
+let compiler = evidence.resolve(setting("MINYAR_TEST_COMPILER", "build/minyarc"))
+let clang = setting("MINYAR_TEST_CLANG", "clang")
+let runtime = evidence.resolve(setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o"))
+let tool = evidence.resolve("build/tooling/tools/reduce-minyar")
+let trace = evidence.open("reduction-harness", [compiler, runtime])
+let source = trace.path + "/failure.min"
+writeTextFile(source, "function bug(value: Integer): Integer { return value + 1 }\nprint(\"unrelated prefix\")\nprint(bug(41))\nprint(\"unrelated suffix\")\n")
+let oracle = trace.path + "/oracle.sh"
+writeTextFile(oracle, "binary=\"${1%.ll}.exe\"\n" + shellQuote(clang) + " -O0 -Wno-override-module \"$1\" " + shellQuote(runtime) + " -o \"$binary\" -lm >/dev/null 2>&1 || exit 2\n\"$binary\" >\"$binary.out\" 2>\"$binary.err\" || exit 1\n[ -s \"$binary.err\" ] && exit 1\ngrep -q '42$' \"$binary.out\" || exit 1\nexit 0\n")
+let output = trace.path + "/reduced.min"
+let reduced = reduce(trace, tool, source, compiler, output, ["/bin/sh", "oracle.sh", "{llvm}"], 60.0, "reduce")
+reduced.check = true
+evidence.run(trace, reduced)
+
+let protected = trace.path + "/protected.min"
+let sidecar = protected + ".json"
+writeTextFile(sidecar, "preserve this report")
+let refusal = evidence.run(trace, reduce(trace, tool, source, compiler, protected, ["/bin/sh", oracle, "{llvm}"], 20.0, "command"))
+evidence.expect(trace, refusal.status != 0 && files.pathSize(protected) < 0, "reduction overwrote an existing report sidecar")
+evidence.expect(trace, readTextFile(sidecar) == "preserve this report", "existing report sidecar changed")
+let reducedText = readTextFile(output)
+evidence.expect(trace, !contains(reducedText, "unrelated") && contains(reducedText, "function bug") && contains(reducedText, "print(bug(41))"), reducedText)
+let report = json.parse(readTextFile(output + ".json"))
+evidence.expect(trace, json.member(report, "original_lines").text == "4" && json.member(report, "reduced_lines").text == "2", readTextFile(output + ".json"))
+evidence.expect(trace, json.string(report, "status") == "reduced" && json.string(report, "output") == output && json.string(report, "source") == source, "reduction report paths")
+
+let refused = trace.path + "/refused.min"
+let negative = evidence.run(trace, reduce(trace, tool, source, compiler, refused, ["/bin/sh", "-c", "exit 1", "sh", "{source}"], 20.0, "negative-control"))
+evidence.expect(trace, negative.status != 0 && files.pathSize(refused) < 0, "non-reproducing oracle produced a reduction")
+evidence.expect(trace, contains(Text(negative.stderr), "Original source does not compile and reproduce the requested failure"), Text(negative.stderr))
+
+let named = trace.path + "/name-sensitive.min"
+let relocation = evidence.run(trace, reduce(trace, tool, source, compiler, named, ["/bin/sh", "-c", "case \"$(basename \"$1\")\" in failure.min) exit 0;; esac; exit 1", "sh", "{source}"], 30.0, "negative-relocation"))
+evidence.expect(trace, relocation.status != 0 && files.pathSize(named) < 0, "name-sensitive oracle certified a renamed deliverable")
+evidence.expect(trace, contains(Text(relocation.stderr), "does not preserve the oracle"), Text(relocation.stderr))
+
+let moduleDirectory = trace.path + "/import-case"
+evidence.expect(trace, files.makeDirectory(moduleDirectory) == 0, "import case directory")
+writeTextFile(moduleDirectory + "/helper.min", "public function answer(): Integer { return 42 }\n")
+let moduleSource = moduleDirectory + "/entry.min"
+writeTextFile(moduleSource, "use \"./helper.min\" as helper\nprint(\"unrelated\")\nprint(helper.answer())\n")
+let moduleOutput = trace.path + "/relocated/entry.min"
+let imports = reduce(trace, tool, moduleSource, compiler, moduleOutput, ["/bin/sh", oracle, "{llvm}"], 60.0, "reduce-imports")
+imports.inherit = false
+imports.environment = evidence.setVariable(system.environment(), "MINYAR_TEST_EVIDENCE", moduleDirectory + "/evidence")
+imports.check = true
+evidence.run(trace, imports)
+evidence.expect(trace, files.pathSize(trace.path + "/relocated/helper.min") >= 0, "imported module was not relocated")
+let relocatedLLVM = trace.path + "/relocated.ll"
+let compile = evidence.command([compiler, moduleOutput, relocatedLLVM], 20.0)
+compile.check = true
+evidence.run(trace, compile)
+let rerun = evidence.command(["/bin/sh", oracle, relocatedLLVM], 20.0)
+rerun.check = true
+evidence.run(trace, rerun)
+evidence.close(trace, false)
+print("Reduction preserves the compiled mismatch, required definitions, and rejects a false baseline")

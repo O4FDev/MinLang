@@ -188,7 +188,7 @@ corrected rejections of a runtime variant that validates inside `readTextFile`.
 Replay one recorded command with:
 
 ```sh
-python3 tests/test_evidence.py build/test-evidence/RUN/evidence.json --command 0
+./build/tooling/tests/evidence-replay build/test-evidence/RUN/evidence.json --command 0
 ```
 
 Replay checks the original retained paths and frozen file/tool hashes. It does
@@ -198,7 +198,7 @@ for generated execution cases. Keep the workspace and original compiler/runtime
 available. Running a recorded compile/link command can update its recorded output
 files, so preserve a copy before experimenting with different inputs.
 
-`tools/reduce-minyar.py` performs bounded line-deletion reduction of a valid
+`build/tooling/tools/reduce-minyar` (built from `tools/reduce-minyar.min`) performs bounded line-deletion reduction of a valid
 Minyar program using an explicit oracle command (`--oracle`, with `{source}` or
 `{llvm}` placeholders). The original and each accepted candidate must compile;
 oracle exit zero means the same failure persists. Timeouts/signals abort instead

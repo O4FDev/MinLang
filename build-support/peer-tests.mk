@@ -341,8 +341,12 @@ build/tooling/tests/codegen: build/testing/cycle-runtime.o
 check-codegen: build/minyarc build/tooling/tests/codegen
 	$(LIMITED) ./build/tooling/tests/codegen
 
-check-reduction-harness: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/reduction-harness.py
+build/tooling/tests/reduction-harness.ll build/tooling/tools/reduce-minyar.ll: tests/evidence-support.min
+build/tooling/tests/reduction-harness build/tooling/tools/reduce-minyar: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
+build/tooling/tests/reduction-harness build/tooling/tools/reduce-minyar: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/reduction-harness build/tooling/tools/reduce-minyar: tests/evidence-support-native.c runtime/native/sha256.c
+check-reduction-harness: build/minyarc build/minyar-runtime.o build/tooling/tests/reduction-harness build/tooling/tools/reduce-minyar
+	$(LIMITED) ./build/tooling/tests/reduction-harness
 
 check: check-evidence-harness check-peer-regressions check-allocation-faults check-compiler-allocation-faults check-runtime-size-guards check-reduction-harness
 

@@ -1,0 +1,309 @@
+use "../tests/evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Options { source: Text; output: Text; compiler: Text; timeout: Float; maximumAttempts: Integer; oracle: List<Text> }
+record Reducer { trace: evidence.Evidence; compiler: Text; candidate: Text; llvm: Text; work: Text; oracle: List<Text>; timeout: Float; maximumAttempts: Integer; attempts: Integer }
+
+function usage(message: Text) {
+    system.writeStandardError("usage: reduce-minyar SOURCE --output OUTPUT [--compiler COMPILER] [--timeout SECONDS] [--max-attempts N] --oracle ARGUMENT...\nreduce-minyar: error: " + message + "\n")
+    exit(2)
+}
+function refuse(message: Text) {
+    system.writeStandardError("ValueError: " + message + "\n")
+    exit(1)
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+function contains(source: Text, needle: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > raw.length { return false }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return true }
+    }
+    return false
+}
+function replace(source: Text, needle: Text, replacement: Text): Text {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        let equal = index + pattern.length <= raw.length
+        if equal { for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } } }
+        if equal { result.addBytes(Bytes(replacement)); index += pattern.length }
+        else { result.add(raw[index]); index += 1 }
+    }
+    return Text(result)
+}
+function name(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = raw.length - 1
+    while slash >= 0 && raw[slash] != 47 { slash -= 1 }
+    return Text(raw.slice(slash + 1, raw.length))
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = raw.length - 1
+    while slash >= 0 && raw[slash] != 47 { slash -= 1 }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return Text(raw.slice(0, slash))
+}
+function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+function isFile(path: Text): Boolean {
+    if files.pathSize(path) < 0 { return false }
+    files.list(path)
+    return files.lastError() != 0
+}
+function isDirectory(path: Text): Boolean {
+    if files.pathSize(path) < 0 { return false }
+    files.list(path)
+    return files.lastError() == 0
+}
+function makeDirectories(path: Text) {
+    if path == "" || path == "/" || path == "." || isDirectory(path) { return }
+    makeDirectories(parent(path))
+    if files.makeDirectory(path) != 0 { fail("cannot create directory " + path) }
+}
+function minFiles(directory: Text, excluded: Text, result: List<Text>) {
+    for entry in files.list(directory) {
+        let path = directory + "/" + entry
+        if excluded != "" && (path == excluded || starts(path, excluded + "/")) { continue }
+        let linked = evidence.resolve(path) != path
+        if !linked && isDirectory(path) { minFiles(path, excluded, result) }
+        else if Bytes(entry).length > 4 && Text(Bytes(entry).slice(Bytes(entry).length - 4, Bytes(entry).length)) == ".min" {
+            if linked { result.add("!" + path) } else if isFile(path) { result.add(path) }
+        }
+    }
+}
+function lines(source: Text): List<Text> {
+    let raw = Bytes(source)
+    let result: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        let end = -1
+        if byte == 10 || byte == 11 || byte == 12 || byte == 28 || byte == 29 || byte == 30 { end = index + 1 }
+        else if byte == 13 {
+            end = index + 1
+            if index + 1 < raw.length && raw[index + 1] == 10 { end = index + 2 }
+        } else if byte == 194 && index + 1 < raw.length && raw[index + 1] == 133 { end = index + 2 }
+        else if byte == 226 && index + 2 < raw.length && raw[index + 1] == 128 && (raw[index + 2] == 168 || raw[index + 2] == 169) { end = index + 3 }
+        if end > 0 {
+            result.add(Text(raw.slice(start, end)))
+            start = end
+            index = end
+        } else { index += 1 }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+function substituted(oracle: List<Text>, source: Text, llvm: Text): List<Text> {
+    let result: List<Text> = []
+    for item in oracle { result.add(replace(replace(item, "{source}", source), "{llvm}", llvm)) }
+    return result
+}
+function interesting(reducer: Reducer, candidate: List<Text>): Boolean {
+    reducer.attempts += 1
+    evidence.expect(reducer.trace, reducer.attempts <= reducer.maximumAttempts, "Reduction attempt budget exhausted; evidence retained")
+    writeTextFile(reducer.candidate, joinText(candidate))
+    if exists(reducer.llvm) { files.remove(reducer.llvm) }
+    let compile = evidence.command([reducer.compiler, reducer.candidate, reducer.llvm], reducer.timeout)
+    compile.phase = "compile"
+    let compiled = evidence.run(reducer.trace, compile)
+    if compiled.status == 1 { return false }
+    evidence.expect(reducer.trace, compiled.status == 0 && isFile(reducer.llvm), "Compiler failed abnormally during reduction")
+    let check = evidence.command(substituted(reducer.oracle, reducer.candidate, reducer.llvm), reducer.timeout)
+    check.cwd = reducer.work
+    check.phase = "interestingness"
+    let result = evidence.run(reducer.trace, check)
+    evidence.expect(reducer.trace, result.status >= 0, "Oracle died from a signal; reduction is inconclusive")
+    return result.status == 0
+}
+function without(current: List<Text>, start: Integer, width: Integer): List<Text> {
+    let result: List<Text> = []
+    for index in 0..current.length { if index < start || index >= start + width { result.add(current[index]) } }
+    return result
+}
+function strings(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(evidence.quote(value)) }
+    let joined: List<Text> = []
+    for index in 0..parts.length { if index > 0 { joined.add(", ") }; joined.add(parts[index]) }
+    return "[" + joinText(joined) + "]"
+}
+
+let options = Options { source: ""; output: ""; compiler: "build/minyarc"; timeout: 30.0; maximumAttempts: 1000; oracle: [] }
+let oracleSeen = false
+let position = 0
+while position < argumentCount() {
+    let value = argument(position)
+    if value == "--oracle" {
+        oracleSeen = true
+        for index in (position + 1)..argumentCount() { options.oracle.add(argument(index)) }
+        break
+    }
+    let option = value
+    let attached = ""
+    let hasAttached = false
+    if starts(value, "--") && contains(value, "=") {
+        let raw = Bytes(value)
+        let equals = 0
+        while raw[equals] != 61 { equals += 1 }
+        option = Text(raw.slice(0, equals))
+        attached = Text(raw.slice(equals + 1, raw.length))
+        hasAttached = true
+    }
+    if option == "--output" || option == "--compiler" || option == "--timeout" || option == "--max-attempts" {
+        let argumentValue = attached
+        if !hasAttached {
+            if position + 1 >= argumentCount() { usage("argument " + option + ": expected one argument") }
+            position += 1
+            argumentValue = argument(position)
+        }
+        if option == "--output" { options.output = argumentValue }
+        if option == "--compiler" { options.compiler = argumentValue }
+        if option == "--timeout" {
+            let parsed = json.parse(argumentValue)
+            if parsed.kind != json.NUMBER { usage("argument --timeout: invalid float value: '" + argumentValue + "'") }
+            options.timeout = parsed.number
+        }
+        if option == "--max-attempts" {
+            let parsed = json.parse(argumentValue)
+            if parsed.kind != json.NUMBER || contains(argumentValue, ".") || contains(argumentValue, "e") || contains(argumentValue, "E") { usage("argument --max-attempts: invalid int value: '" + argumentValue + "'") }
+            options.maximumAttempts = Integer(parsed.number)
+        }
+    } else if starts(value, "-") && value != "-" {
+        usage("unrecognized arguments: " + value)
+    } else if options.source == "" {
+        options.source = value
+    } else {
+        usage("unrecognized arguments: " + value)
+    }
+    position += 1
+}
+if options.source == "" || options.output == "" || !oracleSeen {
+    usage("the following arguments are required: source, --output, --oracle")
+}
+if options.timeout <= 0.0 || options.maximumAttempts < 1 { usage("timeout and attempt budget must be positive") }
+
+let source = evidence.resolve(options.source)
+if exists(options.output) || exists(options.output + ".json") { refuse("Refusing to overwrite existing reduced source or report: " + options.output) }
+let placeholder = false
+for item in options.oracle { if contains(item, "{source}") || contains(item, "{llvm}") { placeholder = true } }
+if options.oracle.length == 0 || !placeholder { refuse("Oracle command must refer to {source} or {llvm}") }
+let oracle: List<Text> = []
+for item in options.oracle {
+    if isFile(item) { oracle.add(evidence.resolve(item)) } else { oracle.add(item) }
+}
+let compiler = evidence.resolve(options.compiler)
+let inputs = [compiler, source]
+for item in oracle { if isFile(item) { inputs.add(item) } }
+let trace = evidence.open("reduction", inputs)
+evidence.control(trace, "oracle", strings(oracle))
+let snapshot: List<Text> = []
+minFiles(parent(source), trace.path, snapshot)
+let work = trace.path + "/modules"
+evidence.expect(trace, files.makeDirectory(work) == 0, "cannot create module snapshot directory")
+let sourceDirectory = parent(source)
+for original in snapshot {
+    evidence.expect(trace, !starts(original, "!"), "Module snapshot does not follow symlinks: " + Text(Bytes(original).slice(1, Bytes(original).length)))
+    let destination = work + Text(Bytes(original).slice(Bytes(sourceDirectory).length, Bytes(original).length))
+    makeDirectories(parent(destination))
+    writeBytesFile(destination, readBytesFile(original))
+}
+let candidate = work + "/" + name(source)
+let outputName = name(options.output)
+evidence.expect(trace, outputName == name(source) || !exists(work + "/" + outputName), "Output name collides with a snapshotted module: " + outputName)
+let reducer = Reducer { trace: trace; compiler: compiler; candidate: candidate; llvm: trace.path + "/candidate.ll"; work: work;
+    oracle: oracle; timeout: options.timeout; maximumAttempts: options.maximumAttempts; attempts: 0 }
+let originalLines = lines(readTextFile(source))
+evidence.expect(trace, interesting(reducer, originalLines), "Original source does not compile and reproduce the requested failure")
+let current = originalLines
+let partitions = 2
+while current.length > 0 {
+    let width = max(1, (current.length + partitions - 1) / partitions)
+    let changed = false
+    let start = 0
+    while start < current.length {
+        let smaller = without(current, start, width)
+        if interesting(reducer, smaller) {
+            current = smaller
+            partitions = max(2, partitions - 1)
+            changed = true
+            break
+        }
+        start += width
+    }
+    if !changed {
+        if partitions >= current.length { break }
+        partitions = min(current.length, partitions * 2)
+    }
+}
+evidence.expect(trace, interesting(reducer, current), "Final reproducer is unstable")
+let outputDirectory = parent(options.output)
+makeDirectories(outputDirectory)
+let modules: List<Text> = []
+minFiles(work, "", modules)
+for original in modules {
+    if original == candidate { continue }
+    let destination = outputDirectory + Text(Bytes(original).slice(Bytes(work).length, Bytes(original).length))
+    if exists(destination) {
+        let left = readBytesFile(destination)
+        let right = readBytesFile(original)
+        let same = left.length == right.length
+        if same { for index in 0..left.length { if left[index] != right[index] { same = false; break } } }
+        evidence.expect(trace, same, "Output would overwrite a different module: " + destination)
+    }
+}
+for original in modules {
+    if original == candidate { continue }
+    let destination = outputDirectory + Text(Bytes(original).slice(Bytes(work).length, Bytes(original).length))
+    makeDirectories(parent(destination))
+    if !exists(destination) { writeBytesFile(destination, readBytesFile(original)) }
+}
+writeTextFile(options.output, joinText(current))
+let output = evidence.resolve(options.output)
+let finalLLVM = trace.path + "/final.ll"
+let compileFinal = evidence.command([compiler, output, finalLLVM], options.timeout)
+compileFinal.phase = "compile-final"
+compileFinal.allowTimeout = true
+let compiled = evidence.run(trace, compileFinal)
+if compiled.status != 0 || compiled.timedOut || !isFile(finalLLVM) {
+    files.remove(output)
+    evidence.expect(trace, false, "Relocated reduced source does not compile")
+}
+let reproduce = evidence.command(substituted(oracle, output, finalLLVM), options.timeout)
+reproduce.cwd = evidence.resolve(outputDirectory)
+reproduce.phase = "interestingness-final"
+reproduce.allowTimeout = true
+let reproduced = evidence.run(trace, reproduce)
+if reproduced.status != 0 || reproduced.timedOut {
+    files.remove(output)
+    evidence.expect(trace, false, "Relocated reduced source does not preserve the oracle")
+}
+let keys = ["status", "source", "output", "original_lines", "reduced_lines", "attempts", "oracle", "scope"]
+let values = [evidence.quote("reduced"), evidence.quote(source), evidence.quote(output), Text(originalLines.length), Text(current.length),
+    Text(reducer.attempts), strings(oracle), evidence.quote("Line deletion preserving compile success and the supplied oracle; not global minimality")]
+let pretty: List<Text> = []
+let compact: List<Text> = []
+for index in 0..keys.length {
+    pretty.add("  " + evidence.quote(keys[index]) + ": " + values[index])
+    compact.add(evidence.quote(keys[index]) + ": " + values[index])
+}
+let prettyParts: List<Text> = []
+for index in 0..pretty.length { if index > 0 { prettyParts.add(",\n") }; prettyParts.add(pretty[index]) }
+let compactParts: List<Text> = []
+for index in 0..compact.length { if index > 0 { compactParts.add(", ") }; compactParts.add(compact[index]) }
+writeTextFile(options.output + ".json", "{\n" + joinText(prettyParts) + "\n}\n")
+evidence.close(trace, false)
+print("{" + joinText(compactParts) + "}")
