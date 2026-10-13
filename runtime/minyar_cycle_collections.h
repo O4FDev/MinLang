@@ -205,6 +205,25 @@ void minyar_list_clear(MinyarList *list) {
     list->length = 0;
 }
 
+void minyar_list_truncate(MinyarList *list, long long length) {
+    if ((unsigned long long)length > (unsigned long long)list->length)
+        minyar_stop("List truncate length is outside its length.");
+#ifndef MINYAR_COMPILER_ARENA
+    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+        while (list->length > length) {
+            long long value = list->values[--list->length];
+            list->values[list->length] = 0;
+            if (kind == RC_TRACED)
+                rc_cycle_edge_remove((void *)(uintptr_t)value);
+            minyar_rc_release((void *)(uintptr_t)value);
+        }
+        return;
+    }
+#endif
+    list->length = length;
+}
+
 static MINYAR_COLD MINYAR_NORETURN void list_position_stop(long long position, long long length) {
     char message[128];
     snprintf(message, sizeof(message), "List position %lld is outside its length of %lld.",
@@ -216,6 +235,46 @@ long long minyar_list_get(const MinyarList *list, long long position) {
     if ((unsigned long long)position >= (unsigned long long)list->length)
         list_position_stop(position, list->length);
     return list->values[position];
+}
+
+long long minyar_list_pop(MinyarList *list) {
+    if (!list->length)
+        list_position_stop(-1, 0);
+    long long value = list->values[--list->length];
+    list->values[list->length] = 0;
+#ifndef MINYAR_COMPILER_ARENA
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_TRACED)
+        rc_cycle_edge_remove((void *)(uintptr_t)value);
+#endif
+    return value;
+}
+
+MinyarList *minyar_list_slice(const MinyarList *list, long long start, long long end,
+                              long long references) {
+    if (start < 0 || end < start || end > list->length)
+        minyar_stop("List slice positions are outside its length.");
+#ifndef MINYAR_COMPILER_ARENA
+    int traced = (((RcObject *)list - 1)->ownership & 7) == RC_TRACED;
+    MinyarList *result = traced ? minyar_list_new_traced() : minyar_list_new();
+#else
+    MinyarList *result = minyar_list_new();
+#endif
+    if (references)
+        minyar_list_references(result);
+    list_reserve(result, end - start);
+    for (long long position = start; position < end; position++) {
+#ifndef MINYAR_COMPILER_ARENA
+        long long value = list->values[position];
+        if (traced) {
+            minyar_rc_retain_traced((void *)(uintptr_t)value);
+            rc_cycle_edge_insert(result, (void *)(uintptr_t)value);
+            result->values[result->length++] = value;
+            rc_cycle_commit_insert(result, (void *)(uintptr_t)value);
+        } else
+#endif
+            minyar_list_add(result, list->values[position]);
+    }
+    return result;
 }
 
 static void minyar_list_set_owned(MinyarList *list, long long position, long long value,
