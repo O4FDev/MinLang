@@ -138,8 +138,8 @@ check-mutation-score: check-mutation-score-harness build/tooling/tests/regressio
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
 
 
-build/tooling/tests/performance-test build/tooling/tests/scaling-test: TOOL_NATIVE = tests/performance-resources.c tests/performance-test-runtime.c
-build/tooling/tests/performance-test build/tooling/tests/scaling-test: tests/performance-resources.c tests/performance-test-runtime.c
+build/tooling/tests/performance-test build/tooling/tests/scaling-test: TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/performance-test build/tooling/tests/scaling-test: tests/performance-resources.c
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/tooling/tests/compiler-behavior build/tooling/tests/performance-test
 	$(LIMITED) ./build/tooling/tests/performance-test
 
