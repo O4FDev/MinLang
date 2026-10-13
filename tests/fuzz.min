@@ -234,6 +234,102 @@ function executeLLVM(context: Context, llvm: Text, expected: Text) {
     }
 }
 
+function magnitudeQuotient(left: Integer, right: Integer): Integer {
+    let multiples = [right]
+    let powers = [1]
+    while multiples[multiples.length - 1] <= left - multiples[multiples.length - 1] {
+        multiples.add(multiples[multiples.length - 1] + multiples[multiples.length - 1])
+        powers.add(powers[powers.length - 1] + powers[powers.length - 1])
+    }
+    let quotient = 0
+    let remainder = left
+    let index = multiples.length - 1
+    while index >= 0 {
+        if multiples[index] <= remainder {
+            remainder -= multiples[index]
+            quotient += powers[index]
+        }
+        index -= 1
+    }
+    return quotient
+}
+function magnitude(value: Integer): Integer {
+    if value < 0 { return 0 - value }
+    return value
+}
+function decimal(value: Integer): Text {
+    if value == -9223372036854775807 - 1 { return "-9223372036854775808" }
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    let powers = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 10000000000, 100000000000,
+        1000000000000, 10000000000000, 100000000000000, 1000000000000000, 10000000000000000, 100000000000000000, 1000000000000000000]
+    let remaining = magnitude(value)
+    let parts: List<Text> = []
+    if value < 0 { parts.add("-") }
+    let started = false
+    let index = powers.length - 1
+    while index >= 0 {
+        let count = 0
+        while remaining >= powers[index] {
+            remaining -= powers[index]
+            count += 1
+        }
+        if count > 0 || started || index == 0 {
+            parts.add(digits[count])
+            started = true
+        }
+        index -= 1
+    }
+    return joinText(parts)
+}
+function booleanText(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+function shiftRight(value: Integer, shift: Integer): Integer {
+    let divisor = 1
+    for unused in 0..shift { divisor += divisor }
+    if value >= 0 { return magnitudeQuotient(value, divisor) }
+    return 0 - magnitudeQuotient(-1 - value, divisor) - 1
+}
+function unsigned16(value: Integer): Integer {
+    if value < 0 { return value + 65536 }
+    return value
+}
+function exclusive16(left: Integer, right: Integer): Integer {
+    let first = unsigned16(left)
+    let second = unsigned16(right)
+    let bits = [1]
+    for unused in 0..15 { bits.add(bits[bits.length - 1] + bits[bits.length - 1]) }
+    let result = 0
+    let index = bits.length - 1
+    while index >= 0 {
+        let one = first >= bits[index]
+        if one { first -= bits[index] }
+        let other = second >= bits[index]
+        if other { second -= bits[index] }
+        if one != other { result += bits[index] }
+        index -= 1
+    }
+    if result >= 32768 { return result - 65536 }
+    return result
+}
+function scalars(text: Text): List<Text> {
+    let raw = Bytes(text)
+    let result: List<Text> = []
+    let index = 0
+    while index < raw.length {
+        let width = 1
+        if raw[index] >= 240 { width = 4 } else if raw[index] >= 224 { width = 3 } else if raw[index] >= 192 { width = 2 }
+        result.add(Text(raw.slice(index, index + width)))
+        index += width
+    }
+    return result
+}
+function joinRange(parts: List<Text>, start: Integer, end: Integer): Text {
+    let selected: List<Text> = []
+    for index in start..end { selected.add(parts[index]) }
+    return joinText(selected)
+}
 function randint(rng: random.State, low: Integer, high: Integer): Integer { return low + random.below(rng, high - low + 1) }
 function expression(rng: random.State, depth: Integer): Expression {
     if depth >= 4 || random.uniform(rng) < 0.32 {
@@ -247,8 +343,8 @@ function expression(rng: random.State, depth: Integer): Expression {
     if (operator == "/" || operator == "%") && right.value == 0 { operator = "+" }
     let quotient = 0
     if right.value != 0 {
-        quotient = abs(left.value) / abs(right.value)
-        if (left.value < 0) != (right.value < 0) { quotient = -quotient }
+        quotient = magnitudeQuotient(magnitude(left.value), magnitude(right.value))
+        if (left.value < 0) != (right.value < 0) { quotient = 0 - quotient }
     }
     let value = 0
     if operator == "+" { value = left.value + right.value }
@@ -266,7 +362,7 @@ function expressionBatch(context: Context, cases: Integer, seed: Integer) {
     let source = context.temporary + "/expressions-" + Text(seed) + ".min"
     let lines: List<Text> = []
     let expected: List<Text> = []
-    for item in generated { lines.add("print(" + item.text + ")\n"); expected.add(Text(item.value) + "\n") }
+    for item in generated { lines.add("print(" + item.text + ")\n"); expected.add(decimal(item.value) + "\n") }
     writeTextFile(source, joinText(lines))
     let llvm = withSuffix(source, ".ll")
     let compiled = run(context, [context.compiler, source, llvm], max(8.0, Float(cases) / 20.0))
@@ -291,7 +387,7 @@ function semanticProgram(cases: Integer, seed: Integer, outlined: Boolean, expec
         let term = "(" + Text(value) + ")"
         if outlined { term = "identity(" + Text(value) + ")" }
         lines.add("print(" + term + " + 0)")
-        expected.add(Text(value))
+        expected.add(decimal(value))
     }
     for index in 0..cases {
         let generated = expression(rng, 0)
@@ -299,21 +395,26 @@ function semanticProgram(cases: Integer, seed: Integer, outlined: Boolean, expec
         if outlined { term = "identity(" + generated.text + ")" }
         lines.add("print(" + term + ")")
         lines.add("print((" + term + " + 7) - 7)")
-        expected.add(Text(generated.value))
-        expected.add(Text(generated.value))
+        expected.add(decimal(generated.value))
+        expected.add(decimal(generated.value))
         let left = randint(rng, -1000, 1000)
         let right = randint(rng, -1000, 1000)
         let operators = ["<", "<=", ">", ">=", "==", "!="]
-        let results = [left < right, left <= right, left > right, left >= right, left == right, left != right]
+        let difference = left - right
+        let results = [difference < 0, difference <= 0, difference > 0, difference >= 0, difference == 0, difference != 0]
         for position in 0..operators.length {
             lines.add("print((" + Text(left) + ") " + operators[position] + " (" + Text(right) + "))")
-            expected.add(Text(results[position]))
+            expected.add(booleanText(results[position]))
         }
         let limit = random.below(rng, 20)
         lines.add("print(sumOdd(" + Text(limit) + "))")
         let odd = 0
-        for value in 0..limit { if value % 2 != 0 { odd += value } }
-        expected.add(Text(odd))
+        let isOdd = false
+        for value in 0..limit {
+            if isOdd { odd += value }
+            isOdd = !isOdd
+        }
+        expected.add(decimal(odd))
         let suffix = Text(index)
         for line in ["let state" + suffix + ": List<Integer> = []", "print(false && mark(state" + suffix + "))",
             "print(true || mark(state" + suffix + "))", "print(state" + suffix + ".length)",
@@ -323,22 +424,24 @@ function semanticProgram(cases: Integer, seed: Integer, outlined: Boolean, expec
         let shift = random.below(rng, 8)
         lines.add("print((" + Text(left) + ") >> " + Text(shift) + ")")
         lines.add("print((" + Text(left) + ") ^ (" + Text(right) + "))")
-        expected.add(Text(left >> shift))
-        expected.add(Text(left ^ right))
+        expected.add(decimal(shiftRight(left, shift)))
+        expected.add(decimal(exclusive16(left, right)))
         let byteValue = -32768 + random.below(rng, 65536)
         for line in ["let bytes" + suffix + " = Bytes(1)", "bytes" + suffix + ".addInt16(" + Text(byteValue) + ")",
             "let alias" + suffix + " = bytes" + suffix, "alias" + suffix + "[0] = 255",
             "print(bytes" + suffix + "[0])", "print(bytes" + suffix + ".getInt16(1))",
             "print(bytes" + suffix + "[1])", "print(bytes" + suffix + "[2])"] { lines.add(line) }
+        let unsignedByte = unsigned16(byteValue)
+        let highByte = magnitudeQuotient(unsignedByte, 256)
         expected.add("255")
-        expected.add(Text(byteValue))
-        expected.add(Text(byteValue & 255))
-        expected.add(Text((byteValue >> 8) & 255))
+        expected.add(decimal(byteValue))
+        expected.add(decimal(unsignedByte - highByte * 256))
+        expected.add(decimal(highByte))
         let numerator = randint(rng, -1000, 1000)
         lines.add("print(Integer(Float(" + Text(numerator) + ") / 4.0))")
-        let quarter = abs(numerator) / 4
-        if numerator < 0 { quarter = -quarter }
-        expected.add(Text(quarter))
+        let quarter = magnitudeQuotient(magnitude(numerator), 4)
+        if numerator < 0 { quarter = 0 - quarter }
+        expected.add(decimal(quarter))
     }
     return joinWith(lines, "\n") + "\n"
 }
@@ -389,8 +492,9 @@ function languageSurface(context: Context, cases: Integer, seed: Integer) {
         let left = randint(rng, -1000, 1000)
         let right = randint(rng, -1000, 1000)
         let takeLeft = (random.word(rng) >> 31) == 1
-        let label = labels[random.below(rng, labels.length)] + Text(index)
-        let prefixLength = random.below(rng, label.length + 1)
+        let label = labels[random.below(rng, labels.length)] + decimal(index)
+        let characters = scalars(label)
+        let prefixLength = random.below(rng, characters.length + 1)
         let name = "values" + Text(index)
         let suffix = Text(index)
         lines.add("let " + name + ": List<Integer> = []")
@@ -405,15 +509,15 @@ function languageSurface(context: Context, cases: Integer, seed: Integer) {
         lines.add("print(choose(box" + suffix + ".pair.left, box" + suffix + ".pair.right, " + Text(takeLeft) + "))")
         lines.add("print(box" + suffix + ".label.slice(0, " + Text(prefixLength) + "))")
         lines.add("let pieces" + suffix + ": List<Text> = []")
-        let midpoint = label.length / 2
-        lines.add("pieces" + suffix + ".add(\"" + label.slice(0, midpoint) + "\")")
-        lines.add("pieces" + suffix + ".add(\"" + label.slice(midpoint, label.length) + "\")")
+        let midpoint = magnitudeQuotient(characters.length, 2)
+        lines.add("pieces" + suffix + ".add(\"" + joinRange(characters, 0, midpoint) + "\")")
+        lines.add("pieces" + suffix + ".add(\"" + joinRange(characters, midpoint, characters.length) + "\")")
         lines.add("print(joinText(pieces" + suffix + ") == box" + suffix + ".label)")
         let sum = 0
         for value in values { sum += value }
         let chosen = right
         if takeLeft { chosen = left }
-        for value in [Text(sum), Text(sum + appended), Text(values.length), Text(chosen), label.slice(0, prefixLength), "true"] { expected.add(value) }
+        for value in [decimal(sum), decimal(sum + appended), decimal(values.length), decimal(chosen), joinRange(characters, 0, prefixLength), "true"] { expected.add(value) }
     }
     let source = context.temporary + "/language-surface.min"
     let sourceText = joinWith(lines, "\n") + "\n"
@@ -515,7 +619,7 @@ function moduleChain(context: Context, modules: Integer) {
         if compiled.status != 0 { abort(context, "generated module chain failed:\n" + compiled.stderr) }
     }
     if readTextFile(first) != readTextFile(second) { abort(context, "compiling the same module graph twice was not deterministic") }
-    executeLLVM(context, first, Text(modules) + "\n")
+    executeLLVM(context, first, decimal(modules) + "\n")
 }
 
 let compilerOption = test.setting("MINYAR_TEST_COMPILER", "build/minyarc")

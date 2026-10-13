@@ -97,7 +97,7 @@ check-module-performance: build/minyarc build/minyar-runtime.o
 
 check: check-module-performance
 
-build/tooling/tests/fuzz.ll: tests/evidence-support.min
+build/tooling/tests/fuzz.ll: tests/evidence-support.min tests/cpython-random.min tests/sha256-support.min
 build/tooling/tests/fuzz: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
 build/tooling/tests/fuzz: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/fuzz: tests/evidence-support-native.c runtime/native/sha256.c
