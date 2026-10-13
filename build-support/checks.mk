@@ -183,7 +183,10 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
-check-sanitize: build/tooling/tests/memory check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions
+.PHONY: check-sanitize-core
+check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
+
+check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
