@@ -33,7 +33,7 @@ check check-portable: check-foundation-baseline
 check-memory-contracts: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/recursive-data build/tooling/tests/production-memory
 	$(LIMITED) ./build/tooling/tests/memory-contracts
 
-build/tooling/tests/memory-contracts-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/memory-contracts-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/memory-contracts-harness: build/testing/cycle-runtime.o
 check-memory-contracts-harness: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/memory-contracts-harness
 	$(LIMITED) ./build/tooling/tests/memory-contracts-harness
@@ -52,7 +52,7 @@ check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-r
 check-critical-path: build/minyarc
 	$(LIMITED) python3 experiments/memory/critical-path-study.py
 
-build/tooling/tests/regressions: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/regressions: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/regressions: build/testing/cycle-runtime.o
 check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions
 	$(LIMITED) ./build/tooling/tests/regressions
@@ -139,8 +139,8 @@ check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
 check-scaling: build/minyarc
 	$(LIMITED) python3 tests/scaling.py
 
-build/tooling/tests/self-compile-budget: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/self-compile-budget: private TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/self-compile-budget: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget: TOOL_NATIVE = tests/performance-resources.c
 build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o tests/performance-resources.c
 # Run absolute self-compilation checks without background scheduling.
 check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
@@ -329,8 +329,8 @@ check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-tex
 	$(SANITIZER_LIMITED) ./build/tooling/tests/system-configurations
 	$(SANITIZER_LIMITED) ./build/tooling/tests/lazy-configurations --clang "$(LLVM_CC)"
 
-build/tooling/tests/production-memory: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/production-memory: private TOOL_LIBS = -lcrypto
+build/tooling/tests/production-memory: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/production-memory: TOOL_LIBS = -lcrypto
 build/tooling/tests/production-memory: tests/sha256-test-native.c
 check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/recursive-data build/tooling/experiments/memory/production-contract-model build/tooling/tests/recursive-mutation build/tooling/tests/production-memory
 	$(LIMITED) ./build/tooling/tests/recursive-data
@@ -514,7 +514,7 @@ check-bootstrap-records: build/stage0 build/tooling/tests/bootstrap-records
 check-portable check: check-bootstrap-records
 
 .PHONY: check-measurement-stats
-build/tooling/tests/measurement-stats: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/measurement-stats: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/measurement-stats: build/testing/cycle-runtime.o
 check-measurement-stats: build/tooling/tests/measurement-stats
 	./build/tooling/tests/measurement-stats
@@ -522,8 +522,8 @@ check-measurement-stats: build/tooling/tests/measurement-stats
 check-portable check: check-measurement-stats
 
 .PHONY: check-budget-harness
-build/tooling/tests/self-compile-budget-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/self-compile-budget-harness: private TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/self-compile-budget-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget-harness: TOOL_NATIVE = tests/performance-resources.c
 build/tooling/tests/self-compile-budget-harness: build/testing/cycle-runtime.o tests/performance-resources.c
 check-budget-harness: build/tooling/tests/self-compile-budget-harness
 	./build/tooling/tests/self-compile-budget-harness
@@ -582,8 +582,8 @@ check-sanitize: check-symbol-order-sanitize
 .PHONY: check-peer-semantics check-peer-semantics-sanitize check-memory-regressions check-memory-regressions-sanitize check-bootstrap-policy
 PEER_SEMANTIC_SUITES = peer-memory-nim-koka-lean peer-memory-nim-koka-followups
 PEER_SEMANTIC_TOOLS = build/tooling/tests/peer-research-semantics build/tooling/tests/peer-research-reachability build/tooling/tests/memory-research-peer-projections
-$(PEER_SEMANTIC_TOOLS): private TOOL_NATIVE = tests/sha256-test-native.c
-$(PEER_SEMANTIC_TOOLS): private TOOL_LIBS = -lcrypto
+$(PEER_SEMANTIC_TOOLS): TOOL_NATIVE = tests/sha256-test-native.c
+$(PEER_SEMANTIC_TOOLS): TOOL_LIBS = -lcrypto
 $(PEER_SEMANTIC_TOOLS): tests/sha256-test-native.c
 
 check-peer-semantics: build/minyarc build/minyar-runtime.o $(PEER_SEMANTIC_TOOLS)
