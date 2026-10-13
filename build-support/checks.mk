@@ -135,11 +135,13 @@ check-mutation-score: check-mutation-score-harness build/tooling/tests/regressio
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
 
 
-check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
-	$(LIMITED) python3 tests/performance.py
+build/tooling/tests/performance-test build/tooling/tests/scaling-test: private TOOL_NATIVE = tests/performance-resources.c tests/performance-test-runtime.c
+build/tooling/tests/performance-test build/tooling/tests/scaling-test: tests/performance-resources.c tests/performance-test-runtime.c
+check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/tooling/tests/compiler-behavior build/tooling/tests/performance-test
+	$(LIMITED) ./build/tooling/tests/performance-test
 
-check-scaling: build/minyarc
-	$(LIMITED) python3 tests/scaling.py
+check-scaling: build/minyarc build/tooling/tests/scaling-test
+	$(LIMITED) ./build/tooling/tests/scaling-test
 
 build/tooling/tests/self-compile-budget: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/self-compile-budget: TOOL_NATIVE = tests/performance-resources.c

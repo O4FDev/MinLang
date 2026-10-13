@@ -1,0 +1,171 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+record Usage native "c" { userMicroseconds: Int64; systemMicroseconds: Int64; maximumRss: Int64; error: Int64 }
+function usage(): Usage { native "performanceresources" value }
+function duplicate(descriptor: Integer): Integer { native "performanceresources" }
+function duplicateTo(descriptor: Integer, target: Integer): Integer { native "performanceresources" }
+public record Run { status: Integer; output: Text; errorOutput: Text; wall: Float; cpu: Float; rss: Integer; usage: Boolean }
+public function seconds(microseconds: Integer): Float { return Float(microseconds / 1000000) + Float(microseconds % 1000000) * 0.000001 }
+public function measure(command: List<Text>, log: Text, limit: Integer): Run {
+    let stdout = files.open(log, files.WRITE | files.CREATE | files.TRUNCATE)
+    let stderr = files.open(log + ".err", files.WRITE | files.CREATE | files.TRUNCATE)
+    test.check(stdout >= 0 && stderr >= 0, "measured capture files")
+    let savedOut = duplicate(1); let savedErr = duplicate(2)
+    test.check(savedOut >= 0 && savedErr >= 0, "measured capture saved descriptors")
+    let before = usage(); let started = system.monotonicNanoseconds()
+    test.check(duplicateTo(stdout, 1) == 1 && duplicateTo(stderr, 2) == 2, "measured capture descriptors")
+    let handle = system.spawn(command[0], command, system.environment(), "")
+    test.check(duplicateTo(savedOut, 1) == 1 && duplicateTo(savedErr, 2) == 2, "restore measured capture descriptors")
+    let watchdog = 0
+    if handle > 0 {
+        watchdog = system.spawn("/bin/sh", ["sh", "-c", "trap 'kill \"$sleeper\" 2>/dev/null; exit 0' TERM; sleep \"$1\" & sleeper=$!; wait \"$sleeper\"; kill -KILL \"$2\" 2>/dev/null", "minyar", Text(limit), Text(system.childProcessId(handle))], system.environment(), "")
+    }
+    let status = system.ProcessStatus { state: system.WAIT_ERROR; exitCode: 0; signal: 0; error: handle }
+    if handle > 0 { status = system.wait(handle) }
+    let stopped = system.monotonicNanoseconds(); let after = usage()
+    let timedOut = false
+    if watchdog > 0 {
+        let watched = system.poll(watchdog)
+        if watched.state == system.PENDING { system.sendSignal(system.childProcessId(watchdog), 15); system.wait(watchdog) }
+        else { timedOut = status.state == system.SIGNALED && status.signal == 9 }
+    }
+    test.check(files.close(savedOut) == 0 && files.close(savedErr) == 0 && files.close(stdout) == 0 && files.close(stderr) == 0, "measured descriptor cleanup")
+    test.check(handle <= 0 || watchdog > 0, "measured process watchdog launch failed")
+    test.check(!timedOut, "command timed out after " + Text(limit) + " seconds: " + joined(command, " "))
+    if handle <= 0 { return Run { status: handle; output: ""; errorOutput: "process launch failed: " + command[0]; wall: 0.0; cpu: 0.0; rss: 0; usage: false } }
+    test.check(status.error == 0 && (status.state == system.EXITED || status.state == system.SIGNALED), "measured process wait failed")
+    let code = status.exitCode
+    if status.state == system.SIGNALED { code = 128 + status.signal }
+    let measured = before.error == 0 && after.error == 0
+    let cpu = 0.0
+    if measured { cpu = (seconds(after.userMicroseconds) - seconds(before.userMicroseconds)) + (seconds(after.systemMicroseconds) - seconds(before.systemMicroseconds)) }
+    let wall = Float(stopped) / 1000000000.0 - Float(started) / 1000000000.0
+    return Run { status: code; output: readTextFile(log); errorOutput: readTextFile(log + ".err"); wall: wall; cpu: cpu; rss: after.maximumRss; usage: measured }
+}
+public function joined(values: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..values.length { if index > 0 { pieces.add(separator) }; pieces.add(values[index]) }
+    return joinText(pieces)
+}
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source); let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function validate(result: Run, output: Text, phase: Text): Text {
+    if result.status != 0 { return phase + " failed with status " + Text(result.status) + ":\n" + result.errorOutput }
+    if files.pathSize(output) < 0 { return phase + " produced no LLVM output" }
+    for line in test.lines(readTextFile(output)) { if starts(line, "define i32 @main(") || starts(line, "define fastcc i32 @main(") { return "" } }
+    return phase + " produced invalid compiler LLVM output"
+}
+public function fixed(value: Float, places: Integer): Text {
+    test.check(places >= 0 && places <= 3, "unsupported decimal places")
+    let bits = Bytes(); bits.addFloat64(value); let raw = bits.getInt64(0)
+    let exponent = (raw >> 52) & 2047
+    let mantissa = raw & 4503599627370495
+    if exponent == 2047 {
+        if mantissa != 0 { return "nan" }
+        if raw < 0 { return "-inf" }
+        return "inf"
+    }
+    if exponent == 0 { exponent = 1 } else { mantissa = mantissa | 4503599627370496 }
+    let shift = 1075 - exponent
+    test.check(shift > 0, "measurement out of formatting range")
+    let scale = 1; let count = 0
+    while count < places { scale = scale * 10; count += 1 }
+    let scaled = mantissa * scale
+    let whole = 0
+    if shift < 63 {
+        whole = scaled >> shift
+        let remainder = scaled - (whole << shift)
+        let half = 1 << (shift - 1)
+        if remainder > half || (remainder == half && whole % 2 == 1) { whole += 1 }
+    } else if shift == 63 && scaled > 4611686018427387904 { whole = 1 }
+    let digits = Text(whole)
+    while digits.length < places + 1 { digits = "0" + digits }
+    let split = digits.length - places
+    let result = digits.slice(0, split)
+    if places > 0 { result = result + "." + digits.slice(split, digits.length) }
+    if raw < 0 { result = "-" + result }
+    return result
+}
+public function pythonFloat(value: Float): Text {
+    let source = Text(value)
+    if source == "NaN" || source == "Infinity" || source == "-Infinity" || value == 0.0 { return source }
+    let raw = Bytes(source)
+    let negative = raw[0] == 45
+    let digits = Bytes(); let before = 0; let point = false; let exponent = 0
+    let index = 0; if negative { index = 1 }
+    while index < raw.length && raw[index] != 101 {
+        if raw[index] == 46 { point = true } else { digits.add(raw[index]); if !point { before += 1 } }
+        index += 1
+    }
+    if index < raw.length {
+        index += 1
+        let sign = 1
+        if raw[index] == 45 { sign = -1; index += 1 } else if raw[index] == 43 { index += 1 }
+        let magnitude = 0
+        while index < raw.length { magnitude = magnitude * 10 + raw[index] - 48; index += 1 }
+        exponent = sign * magnitude
+    }
+    let start = 0
+    while start + 1 < digits.length && digits[start] == 48 { start += 1; before -= 1 }
+    let end = digits.length
+    while end > start + 1 && digits[end - 1] == 48 { end -= 1 }
+    let significant = Text(digits.slice(start, end))
+    let count = end - start
+    let power = before - 1 + exponent
+    let output = ""
+    if power >= -4 && power < 16 {
+        if power < 0 {
+            output = "0."
+            let zeros = 0
+            while zeros < -power - 1 { output += "0"; zeros += 1 }
+            output += significant
+        } else if count > power + 1 { output = significant.slice(0, power + 1) + "." + significant.slice(power + 1, count) }
+        else {
+            output = significant
+            let filled = count
+            while filled < power + 1 { output += "0"; filled += 1 }
+            output += ".0"
+        }
+    } else {
+        output = significant.slice(0, 1)
+        if count > 1 { output += "." + significant.slice(1, count) }
+        output += "e"
+        if power < 0 { output += "-" } else { output += "+" }
+        let magnitude = abs(power)
+        if magnitude < 10 { output += "0" }
+        output += Text(magnitude)
+    }
+    if negative { output = "-" + output }
+    return output
+}
+public function padLeft(source: Text, width: Integer): Text {
+    let result = source
+    while result.length < width { result = " " + result }
+    return result
+}
+public function padRight(source: Text, width: Integer): Text {
+    let result = source
+    while result.length < width { result += " " }
+    return result
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source); let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+public function moduleChain(directory: Text, count: Integer): Text {
+    test.check(files.pathSize(directory) < 0 && files.makeDirectory(directory) == 0, "cannot create module workload directory " + directory)
+    writeTextFile(directory + "/module0.min", "public function value(): Integer {\n    return 1\n}\n")
+    for index in 1..count {
+        writeTextFile(directory + "/module" + Text(index) + ".min", "use \"./module" + Text(index - 1) + ".min\" as previous\n\npublic function value(): Integer {\n    return previous.value() + 1\n}\n")
+    }
+    let entry = directory + "/main.min"
+    writeTextFile(entry, "use \"./module" + Text(count - 1) + ".min\" as last\n\nprint(last.value())\n")
+    return entry
+}

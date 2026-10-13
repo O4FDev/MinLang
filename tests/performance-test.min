@@ -1,0 +1,282 @@
+use "../tools/testing.min" as test
+use "./performance-test-support.min" as timing
+use "system" as system
+use "files" as files
+use "json" as json
+record Context { work: Text; darwin: Boolean; clang: Text; runtime: Text; keys: List<Text>; values: List<Float> }
+record Best { seconds: Float; run: timing.Run }
+function compiler(): Text { return "build/minyarc" }
+function output(): Text { return "build/compiler-performance-check.ll" }
+function resultsPath(): Text { return "build/performance.json" }
+function baselinePath(): Text { return "build/performance-baseline.json" }
+function usage(): Text { return "usage: performance-test [-h] [--clang CLANG] [--tolerance TOLERANCE]\n                        [--save-baseline]\n" }
+function help(): Text {
+    return usage() + "\nMeasure compiler and generated-program performance.\n\n1. Self-compilation checks resource ceilings and compiler behavior.\n2. Scaling checks compare workloads at two sizes, the second four times larger.\n3. Measurements are saved to build/performance.json and compared against\n   build/performance-baseline.json when it exists. Use --save-baseline to create\n   a baseline. Measurements exceeding the configured tolerance fail.\n\noptions:\n  -h, --help            show this help message and exit\n  --clang CLANG\n  --tolerance TOLERANCE\n  --save-baseline       store this run as the comparison baseline"
+}
+function usageError(message: Text) {
+    system.writeStandardError(usage() + "performance-test: error: " + message + "\n")
+    exit(2)
+}
+function stop(context: Context, message: Text) {
+    test.removeTree(context.work)
+    fail(message)
+}
+function store(context: Context, key: Text, value: Float) { context.keys.add(key); context.values.add(value) }
+function decimal(source: Text): json.Value {
+    let words = test.words(source)
+    if words.length != 1 { return json.parse("invalid") }
+    let raw = Bytes(words[0])
+    if raw.length > 1 && raw[0] == 43 { return json.parse(Text(raw.slice(1, raw.length))) }
+    return json.parse(words[0])
+}
+function option(name: Text): Text {
+    if Bytes(name).length < 3 { return "" }
+    for candidate in ["--clang", "--tolerance", "--save-baseline", "--help"] { if timing.starts(candidate, name) { return candidate } }
+    return ""
+}
+function bestOf(command: List<Text>, log: Text): Best {
+    let result = timing.measure(command, log, 60)
+    if result.status != 0 { return Best { seconds: 0.0; run: result } }
+    let best = 0.0
+    for repeat in 0..3 {
+        result = timing.measure(command, log, 60)
+        let elapsed = result.wall
+        if result.usage { elapsed = result.cpu }
+        if repeat == 0 || elapsed < best { best = elapsed }
+        if result.status != 0 { break }
+    }
+    return Best { seconds: best; run: result }
+}
+function behavior(context: Context) {
+    let result = test.run(["build/tooling/tests/compiler-behavior", "--ir", output(), "--profile", "core"], system.environment(), "", context.work + "/behavior", 180)
+    if result.status != 0 { stop(context, "self-compiled compiler behavior failed:\n" + result.output + result.errorOutput) }
+}
+function selfCompile(context: Context) {
+    if files.pathSize(output()) >= 0 { test.check(files.remove(output()) == 0, "cannot remove stale compiler output") }
+    let result = timing.measure([compiler(), "build/compiler.min", output()], context.work + "/self-compile", 20)
+    if result.status != 0 { stop(context, "self-compile failed during performance check:\n" + result.errorOutput) }
+    if result.wall > 20.0 { stop(context, "self-compile took " + timing.fixed(result.wall, 2) + "s; limit is 20.00s") }
+    let invalid = timing.validate(result, output(), "performance-check self-compile")
+    if invalid != "" { stop(context, invalid) }
+    store(context, "self-compile.wall", result.wall)
+    let details = "wall " + timing.fixed(result.wall, 3) + "s"
+    if result.usage {
+        let rss = Float(result.rss) / 1024.0
+        if context.darwin { rss = Float(result.rss) / 1048576.0 }
+        if result.cpu > 2.0 { stop(context, "self-compile used " + timing.fixed(result.cpu, 2) + "s CPU; limit is 2.00s") }
+        if rss > 64.0 { stop(context, "self-compile used " + timing.fixed(rss, 1) + " MiB; limit is 64.0 MiB") }
+        store(context, "self-compile.cpu", result.cpu)
+        store(context, "self-compile.rss-mib", rss)
+        details += ", CPU " + timing.fixed(result.cpu, 3) + "s, peak " + timing.fixed(rss, 1) + " MiB"
+    }
+    behavior(context)
+    print("self-compile: " + details)
+}
+function statements(count: Integer, directory: Text): Text {
+    let lines = ["let total = 0\n", "let step = 0\n"]
+    for index in 0..count {
+        lines.add("step = (step + " + Text(index % 13) + ") % 101\n")
+        lines.add("total = total + step * 2 - step / 3\n")
+        if index % 50 == 0 { lines.add("while step > 100 {\n    step = step - 1\n}\n") }
+    }
+    lines.add("print(total)\n")
+    let source = directory + "/statements-" + Text(count) + ".min"
+    writeTextFile(source, lines)
+    return source
+}
+function locals(count: Integer, directory: Text): Text {
+    let lines = ["function main() {\n"]
+    for index in 0..count { lines.add("    let value" + Text(index) + " = " + Text(index) + "\n") }
+    lines.add("    print(value" + Text(count - 1) + ")\n}\n")
+    let source = directory + "/locals-" + Text(count) + ".min"
+    writeTextFile(source, lines)
+    return source
+}
+function functions(count: Integer, directory: Text): Text {
+    let lines: List<Text> = []
+    for index in 0..count { lines.add("function compute" + Text(index) + "(value: Integer): Integer {\n    return value + " + Text(index) + "\n}\n") }
+    lines.add("let total = 0\n")
+    for index in 0..count { lines.add("total = total + compute" + Text(index) + "(" + Text(index % 5) + ")\n") }
+    lines.add("print(total)\n")
+    let source = directory + "/functions-" + Text(count) + ".min"
+    writeTextFile(source, lines)
+    return source
+}
+function records(count: Integer, directory: Text): Text {
+    let lines: List<Text> = []
+    for index in 0..count { lines.add("record Shape" + Text(index) + " {\n    width: Integer\n    label: Text\n}\n") }
+    lines.add("let shape = Shape" + Text(count - 1) + " { width: 1, label: \"last\" }\nprint(shape.width)\n")
+    let source = directory + "/records-" + Text(count) + ".min"
+    writeTextFile(source, lines)
+    return source
+}
+function generate(name: Text, count: Integer, directory: Text): Text {
+    if name == "statements" { return statements(count, directory) }
+    if name == "locals" { return locals(count, directory) }
+    if name == "functions" { return functions(count, directory) }
+    if name == "records" { return records(count, directory) }
+    return timing.moduleChain(directory + "/modules-" + Text(count), count)
+}
+function compileScaling(context: Context) {
+    let names = ["statements", "locals", "modules", "functions", "records"]
+    let sizes = [2000, 4000, 32, 500, 500]
+    let limits = [7.0, 7.0, 7.0, 7.0, 7.0]
+    for workload in 0..names.length {
+        let name = names[workload]
+        let timings: List<Float> = []
+        for size in [sizes[workload], sizes[workload] * 4] {
+            let source = generate(name, size, context.work)
+            let llvm = context.work + "/" + name + "-" + Text(size) + ".ll"
+            let measured = bestOf([compiler(), source, llvm], context.work + "/compile-" + name + "-" + Text(size))
+            if measured.run.status != 0 { stop(context, "compile workload '" + name + "' failed at size " + Text(size) + ":\n" + measured.run.errorOutput) }
+            timings.add(measured.seconds)
+            store(context, "compile." + name + "." + Text(size), measured.seconds)
+        }
+        let small = timings[0]; let large = timings[1]
+        let ratio = large / max(small, 0.001)
+        store(context, "compile." + name + ".ratio", ratio)
+        print("compile " + timing.padRight(name, 11) + " " + timing.padLeft(Text(sizes[workload]), 6) + " -> " + timing.fixed(small, 3) + "s   x4 -> " + timing.fixed(large, 3) + "s   ratio " + timing.fixed(ratio, 1))
+        if large >= 0.02 && ratio > limits[workload] {
+            stop(context, "compile workload '" + name + "' scaled by " + timing.fixed(ratio, 1) + "x for 4x more input; limit is " + timing.fixed(limits[workload], 1) + "x")
+        }
+    }
+}
+function expectedBenchmarkOutput(scale: Integer): Text {
+    let listCount = 200000 * scale
+    let recordCount = 100000 * scale
+    let textCount = 100000 * scale
+    let arithmeticCount = 500000 * scale
+    let callCount = 20 * scale
+    let listTotal = 0
+    for index in 0..listCount { listTotal += index % 97 }
+    let recordTotal = recordCount * (recordCount - 1) / 2
+    let textTotal = textCount + textCount + 2 * textCount
+    let total = 0
+    for position in 0..arithmeticCount { total = (total + position * 3 - position / 2 + position % 5) % 1000003 }
+    let callTotal = callCount * 610
+    return Text(listTotal) + "\n" + Text(recordTotal) + "\n" + Text(textTotal) + "\n" + Text(total) + "\n" + Text(callTotal) + "\n"
+}
+function runtimeScaling(context: Context) {
+    let llvm = context.work + "/runtime-benchmark.ll"
+    let executable = context.work + "/runtime-benchmark"
+    let compiled = test.run([compiler(), "tests/performance/runtime.min", llvm], system.environment(), "", context.work + "/benchmark-compile", 60)
+    if compiled.status != 0 { stop(context, "runtime benchmark failed to compile:\n" + compiled.errorOutput) }
+    let command = [context.clang, "-O0", "-Wno-override-module", llvm, context.runtime, "-o", executable]
+    if !context.darwin { command.add("-lm") }
+    let linked = test.run(command, system.environment(), "", context.work + "/benchmark-link", 60)
+    if linked.status != 0 { stop(context, "could not link runtime-benchmark.ll:\n" + linked.errorOutput) }
+    let timings: List<Float> = []
+    for scale in [2, 8] {
+        let measured = bestOf([executable, Text(scale)], context.work + "/benchmark-" + Text(scale))
+        if measured.run.status != 0 { stop(context, "runtime benchmark failed at scale " + Text(scale) + ":\n" + measured.run.errorOutput) }
+        let expected = expectedBenchmarkOutput(scale)
+        if measured.run.output != expected {
+            stop(context, "runtime benchmark produced the wrong result at scale " + Text(scale) + ":\nexpected:\n" + expected + "actual:\n" + measured.run.output)
+        }
+        timings.add(measured.seconds)
+        store(context, "runtime.benchmark." + Text(scale), measured.seconds)
+    }
+    let small = timings[0]; let large = timings[1]
+    let ratio = large / max(small, 0.001)
+    store(context, "runtime.benchmark.ratio", ratio)
+    print("runtime benchmark   scale " + timing.padLeft("2", 2) + " -> " + timing.fixed(small, 3) + "s   x4 -> " + timing.fixed(large, 3) + "s   ratio " + timing.fixed(ratio, 1))
+    if large >= 0.02 && ratio > 7.0 { stop(context, "runtime benchmark scaled by " + timing.fixed(ratio, 1) + "x for 4x more work; limit is 7.0x") }
+}
+function resultsJSON(context: Context): Text {
+    let ordered = context.keys.sorted()
+    let parts = ["{\n"]
+    for position in 0..ordered.length {
+        let value = 0.0
+        for index in 0..context.keys.length { if context.keys[index] == ordered[position] { value = context.values[index] } }
+        parts.add("  " + json.quote(ordered[position]) + ": " + timing.pythonFloat(value))
+        if position + 1 < ordered.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add("}\n")
+    return joinText(parts)
+}
+function compareWithBaseline(context: Context, tolerance: Float) {
+    if files.pathSize(baselinePath()) < 0 {
+        print("no baseline at " + baselinePath() + "; run with --save-baseline to create one")
+        return
+    }
+    let baseline = json.parse(readTextFile(baselinePath()))
+    test.check(baseline.kind == json.OBJECT, "invalid performance baseline " + baselinePath())
+    let regressions: List<Text> = []
+    for index in 0..context.keys.length {
+        let key = context.keys[index]; let value = context.values[index]
+        let previous = json.member(baseline, key)
+        if previous.kind == json.NULL || timing.ends(key, ".ratio") || timing.ends(key, ".rss-mib") { continue }
+        test.check(previous.kind == json.NUMBER, "invalid baseline measurement " + key)
+        if value >= 0.02 && previous.number > 0.0 && value > previous.number * tolerance {
+            regressions.add("  " + key + ": " + timing.fixed(previous.number, 3) + " -> " + timing.fixed(value, 3) + " (" + timing.fixed(value / previous.number, 2) + "x)")
+        }
+    }
+    if regressions.length > 0 { fail("performance regressed past " + timing.fixed(tolerance, 2) + "x of the baseline:\n" + timing.joined(regressions, "\n")) }
+    print("no measurement regressed past " + timing.fixed(tolerance, 2) + "x of the baseline")
+}
+function main(): Integer {
+    let clang = system.getenv("MINYAR_TEST_CLANG")
+    if system.lastError() != 0 { clang = "clang" }
+    let toleranceText = system.getenv("MINYAR_PERF_TOLERANCE")
+    if system.lastError() != 0 { toleranceText = "1.5" }
+    let parsed = decimal(toleranceText)
+    test.check(parsed.kind == json.NUMBER, "invalid MINYAR_PERF_TOLERANCE: " + toleranceText)
+    let tolerance = parsed.number
+    let save = false
+    let unknown: List<Text> = []
+    let positional = false
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        index += 1
+        if positional || !timing.starts(item, "-") || item == "-" { unknown.add(item); continue }
+        if item == "--" { positional = true; continue }
+        if item == "-h" { print(help()); return 0 }
+        let raw = Bytes(item); let name = item; let value = ""; let attached = false
+        for position in 0..raw.length { if !attached && raw[position] == 61 { name = Text(raw.slice(0, position)); value = Text(raw.slice(position + 1, raw.length)); attached = true } }
+        let chosen = option(name)
+        if chosen == "" { unknown.add(item); continue }
+        if chosen == "--help" { print(help()); return 0 }
+        if chosen == "--save-baseline" {
+            if attached { usageError("argument --save-baseline: ignored explicit argument '" + value + "'") }
+            save = true
+            continue
+        }
+        if !attached {
+            let missing = index >= argumentCount()
+            if !missing {
+                let following = Bytes(argument(index))
+                missing = following.length > 1 && following[0] == 45 && !(following[1] >= 48 && following[1] <= 57) && following[1] != 46
+            }
+            if missing { usageError("argument " + chosen + ": expected one argument") }
+            value = argument(index)
+            index += 1
+        }
+        if chosen == "--clang" { clang = value }
+        else {
+            let number = decimal(value)
+            if number.kind != json.NUMBER { usageError("argument --tolerance: invalid float value: '" + value + "'") }
+            tolerance = number.number
+        }
+    }
+    if unknown.length > 0 { usageError("unrecognized arguments: " + timing.joined(unknown, " ")) }
+    let work = test.scratch()
+    let platform = timing.measure(["/usr/bin/uname", "-s"], work + "/platform", 10)
+    test.check(platform.status == 0, "performance platform query failed:\n" + platform.errorOutput)
+    let runtime = "build/minyar-runtime.o"
+    if files.pathSize(runtime) < 0 { runtime = "runtime/minyar_runtime.c" }
+    let context = Context { work: work; darwin: test.lines(platform.output)[0] == "Darwin"; clang: clang; runtime: runtime; keys: []; values: [] }
+    selfCompile(context)
+    compileScaling(context)
+    runtimeScaling(context)
+    test.removeTree(work)
+    test.check(files.makeDirectory("build") == 0, "cannot create build directory")
+    writeTextFile(resultsPath(), resultsJSON(context))
+    if save {
+        writeBytesFile(baselinePath(), readBytesFile(resultsPath()))
+        print("saved baseline to " + baselinePath())
+    } else { compareWithBaseline(context, tolerance) }
+    print("performance checks passed")
+    return 0
+}
