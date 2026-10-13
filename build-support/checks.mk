@@ -370,7 +370,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/production-memory
 
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) python3 tests/incremental-modules.py
 	$(LIMITED) python3 tests/incremental-module-driver.py
@@ -388,7 +388,7 @@ check-incremental-module-performance: build/minyarc-modules build/minyar-module-
 check: check-incremental-module-performance
 
 .PHONY: check-incremental-modules-sanitize
-check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll build/tooling/tests/recursive-data
+check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll build/tooling/tests/recursive-data build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-modules.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-driver.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-delta.py

@@ -29,7 +29,7 @@ def main():
             env.update(ASAN_OPTIONS='detect_leaks=0',
                        MINYAR_TEST_RUNTIME=str(ROOT / 'build/ownership-runtime.o'),
                        MINYAR_TEST_LINK_FLAGS='-fsanitize=address,undefined')
-        for test in ('regressions.py', 'ownership.py', 'recursive-data'):
+        for test in ('regressions.py', 'ownership', 'recursive-data'):
             if args.sanitize:
                 # Deliberate runtime errors do not run normal-exit cleanup.
                 # Use the ordinary sanitizer runtime for those regressions;
