@@ -51,7 +51,8 @@ class ScalingProtocol(unittest.TestCase):
             mock = patch.object(scaling, target, replacement) if '.' not in target else None
             if '.' in target:
                 owner, attribute = target.split('.')
-                mock = patch.object(getattr(scaling, owner), attribute, replacement)
+                mock = patch.object(getattr(scaling, owner), attribute, replacement,
+                                    create=owner == 'os' and attribute == 'sched_getaffinity')
             mock.start()
             self.addCleanup(mock.stop)
         self.clock = 0
