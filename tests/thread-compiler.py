@@ -1,6 +1,7 @@
 
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -232,7 +233,7 @@ print(threadKernelRun(1))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--compiler', type=Path, default=ROOT / 'build/minyarc-threads')
+    parser.add_argument('--compiler', type=Path, default=Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc-threads')))
     args, remaining = parser.parse_known_args()
     COMPILER = args.compiler.resolve()
     unittest.main(argv=[__file__, *remaining])

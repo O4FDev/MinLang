@@ -104,6 +104,8 @@ def select_sites(sites: list[Site], limit: int) -> list[Site]:
 
 
 CHECKS = (
+    [os.sys.executable, "tests/compiler-contracts.py"],
+    [os.sys.executable, "tests/thread-compiler.py"],
     [os.sys.executable, "tests/diagnostics.py"],
     [os.sys.executable, "tests/conformance.py"],
     [os.sys.executable, "tests/regressions.py"],

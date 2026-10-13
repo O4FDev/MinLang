@@ -77,7 +77,7 @@ def compiler_mutations(temporary: Path) -> None:
         ),
     }
     for name, (before, after) in mutations.items():
-        if name == 'allow-cycles':
+        if name in ('allow-cycles', 'allow-module-side-effects'):
             start = original.index('function loadModule(')
             end = original.index('\nfunction ', start)
             body = replace_once(original[start:end], before, after, name)

@@ -181,6 +181,8 @@ class MutationScoreHarness(unittest.TestCase):
         self.assertIn("tests/source-map.py", scripts)
         self.assertIn("tests/symbol-order.py", scripts)
         self.assertIn("tests/readonly-parameters.py", scripts)
+        self.assertIn("tests/compiler-contracts.py", scripts)
+        self.assertIn("tests/thread-compiler.py", scripts)
 
     def test_discovery_excludes_literals_comments_and_list_types(self):
         source = 'let values: List<Integer> = []\n// == !=\n/* >= */\nprint("<= &&")\nif 1 <= 2 && 3 > 2 {}'
