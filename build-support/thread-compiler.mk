@@ -2,6 +2,16 @@
 .PHONY: check-thread-scaling-protocol
 .PHONY: check-thread-language-tsan
 .PHONY: check-thread-generated-recovery check-thread-generated-recovery-sanitize check-thread-generated-recovery-tsan
+.PHONY: check-thread-native-regions check-thread-native-regions-sanitize check-thread-native-regions-tsan
+
+check-thread-native-regions: build/minyarc build/minyar-default-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-native-regions.py
+
+check-thread-native-regions-sanitize: build/minyarc-sanitize build/minyar-default-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-native-regions.py --sanitizer address
+
+check-thread-native-regions-tsan: build/minyarc build/minyar-default-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-native-regions.py --sanitizer thread
 
 check-thread-generated-recovery: build/minyarc-threads build/minyar-default-runtime.o build/minyar-runtime-eager.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-generated-recovery.py
@@ -35,3 +45,7 @@ check-thread-tsan-control: build/minyarc-threads build/minyar-default-runtime.o
 
 check check-portable: check-thread-compiler check-thread-effects check-thread-language check-thread-scaling-protocol check-thread-generated-recovery
 check-sanitize: check-thread-language-sanitize check-thread-language-tsan check-thread-tsan-control check-thread-generated-recovery-sanitize check-thread-generated-recovery-tsan
+ifeq ($(shell uname -s),Linux)
+check check-portable: check-thread-native-regions
+check-sanitize: check-thread-native-regions-sanitize check-thread-native-regions-tsan
+endif

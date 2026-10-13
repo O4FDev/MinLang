@@ -106,5 +106,10 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         rejected = subprocess.run([str(selected), str(source), str(llvm), '--library', str(ROOT / 'library'),
             '--bounded-owners', '32'], capture_output=True, text=True, timeout=90, env=environment)
         assert rejected.returncode != 0 and not llvm.exists(), (label, rejected)
+        diagnostic = 'unsafe thread effect'
+        if label == 'managed-input': diagnostic = 'thread entry'
+        if label in ('managed-region-list', 'wrong-map-input'): diagnostic = 'wrong thread boundary argument types'
+        if label == 'opaque-constructor': diagnostic = 'opaque thread types cannot be constructed'
+        assert diagnostic in rejected.stderr + rejected.stdout, (label, rejected)
         assert 'AddressSanitizer:' not in rejected.stderr and 'runtime error:' not in rejected.stderr, (label, rejected)
         print(label, args.sanitizer, 'rejected before IR publication', flush=True)

@@ -1,8 +1,9 @@
 function isThreadType(type: Integer): Boolean {
-    return type >= 9 && type <= 15
+    return type >= 9 && type <= 18
 }
 
 function isThreadBuiltin(name: Text): Boolean {
+    if name == "nativeThreadSetup" || name == "mapNativeRegion" || name == "tryMapNativeRegion" || name == "shareNativeRegions" || name == "nativeRegionAddress" || name == "threadKernelKick" || name == "threadEventfd" || name == "threadEventfdRead" || name == "threadEventfdNotify" { return true }
     return name == "freezeBytes" || name == "freezeBytesTake" || name == "copyFrozenBytes" || name == "bytesChannel" || name == "trySendBytes" || name == "sendBytes" || name == "tryReceiveBytes" || name == "receiveBytes" || name == "closeBytesChannel" || name == "startThread" || name == "joinThread" || name == "startThreadResult" || name == "joinThreadResult" || name == "frozenBytesChannel" || name == "trySendFrozen" || name == "sendFrozen" || name == "tryReceiveFrozen" || name == "receiveFrozen" || name == "closeFrozenChannel" || name == "threadProcessId" || name == "threadSleepNanoseconds" || name == "threadFsync" || name == "threadKernelRun"
 }
 
@@ -65,10 +66,21 @@ function threadParameters(name: Text, actual: List<Integer>, expected: List<Inte
     if !correct { fail(name + " has the wrong thread boundary argument types") }
 }
 
-function threadBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, target: Text, channelType: Integer, resultType: List<Integer>): Text {
+function threadBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, target: Text, inputType: Integer, channelType: Integer, resultType: List<Integer>): Text {
     let expected: List<Integer> = []
     let result = 5
     let callee = ""
+    if name == "nativeThreadSetup" { callee = "minyar_native_thread_setup" }
+    if name == "mapNativeRegion" || name == "tryMapNativeRegion" {
+        expected = [1, 1, 1, 1, 1]; result = 16; callee = "minyar_native_region_map"
+        if name == "tryMapNativeRegion" { result = 18; callee = "minyar_native_region_try_map" }
+    }
+    if name == "shareNativeRegions" { expected.add(100016); result = 17; callee = "minyar_native_regions_share" }
+    if name == "nativeRegionAddress" { expected.add(16); result = 1; callee = "minyar_native_region_address" }
+    if name == "threadKernelKick" { expected = [11, 16]; result = 1; callee = "minyar_thread_kernel_kick" }
+    if name == "threadEventfd" { expected.add(1); result = 1; callee = "minyar_thread_eventfd" }
+    if name == "threadEventfdRead" { expected.add(1); result = 1; callee = "minyar_thread_eventfd_read" }
+    if name == "threadEventfdNotify" { expected = [1, 1]; result = 1; callee = "minyar_thread_eventfd_notify" }
     if name == "freezeBytes" { expected.add(8); result = 9; callee = "minyar_frozen_bytes_copy" }
     if name == "freezeBytesTake" { expected.add(8); result = 9; callee = "minyar_frozen_bytes_take" }
     if name == "copyFrozenBytes" { expected.add(9); result = 8; callee = "minyar_frozen_bytes_local_copy" }
@@ -99,13 +111,13 @@ function threadBuiltin(output: List<Text>, textState: List<Text>, state: List<In
     if name == "threadFsync" { expected.add(1); result = 1; callee = "minyar_thread_fsync" }
     if name == "threadKernelRun" { expected.add(1); result = 1; callee = "minyar_thread_kernel_run" }
     if name == "startThread" || name == "startThreadResult" {
-        expected.add(1); expected.add(9); expected.add(channelType); result = 11; callee = "minyar_thread_spawn"
+        expected.add(1); expected.add(inputType); expected.add(channelType); result = 11; callee = "minyar_thread_spawn"
         if name == "startThreadResult" { result = 12; callee = "minyar_thread_spawn_result" }
     }
     threadParameters(name, types, expected)
     if name == "startThread" || name == "startThreadResult" {
         let bridgeValues: List<Text> = ["@.minyar.thread.bridge." + target, values[0], values[1], values[2]]
-        let bridgeTypes: List<Integer> = [9, 1, 9, channelType]
+        let bridgeTypes: List<Integer> = [9, 1, inputType, channelType]
         if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "spawn", target, "1(1,9,10)") }
         setType(resultType, result)
         return emitCall(output, textState, state, result, callee, bridgeValues, bridgeTypes)
@@ -131,6 +143,64 @@ function threadFrozenMethod(context: CompilerContext, localNames: List<Text>, lo
     return emitCall(output, textState, state, 1, callee, pairOf(receiver, position), types)
 }
 
+function threadRegionMember(output: List<Text>, textState: List<Text>, state: List<Integer>, receiver: Text, type: Integer, member: Text, resultType: List<Integer>): Text {
+    let callee = "minyar_native_region_length"
+    if type == 17 { callee = "minyar_native_regions_length" }
+    if member == "address" && type == 16 {
+        callee = "minyar_native_region_address"
+        threadNote(output, textState[1], "builtin", "nativeRegionAddress", "1(16)")
+    } else if member != "length" { fail("a native region exposes only length and main-only address") }
+    setType(resultType, 1)
+    let types: List<Integer> = [type]
+    let values: List<Text> = [receiver]
+    return emitCall(output, textState, state, 1, callee, values, types)
+}
+
+function threadRegionMethod(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, type: Integer, member: Text, resultType: List<Integer>): Text {
+    let expected: List<Integer> = [1]
+    let result = 1
+    let callee = ""
+    if type == 17 {
+        if member != "get" { fail("NativeRegions exposes only checked get") }
+        result = 16; callee = "minyar_native_regions_get"
+    } else {
+        if member == "getUInt8" { callee = "minyar_native_region_get_uint8" }
+        if member == "getUInt16" { callee = "minyar_native_region_get_uint16" }
+        if member == "getUInt32" { callee = "minyar_native_region_get_uint32" }
+        if member == "getInt64" { callee = "minyar_native_region_get_int64" }
+        if member == "setUInt8" { callee = "minyar_native_region_set_uint8"; expected.add(1); result = 5 }
+        if member == "setUInt16" { callee = "minyar_native_region_set_uint16"; expected.add(1); result = 5 }
+        if member == "setUInt32" { callee = "minyar_native_region_set_uint32"; expected.add(1); result = 5 }
+        if member == "setInt64" { callee = "minyar_native_region_set_int64"; expected.add(1); result = 5 }
+        if member == "loadAcquireUInt8" { callee = "minyar_native_region_load_u8" }
+        if member == "storeReleaseUInt8" { callee = "minyar_native_region_store_u8"; expected.add(1); result = 5 }
+        if member == "loadAcquireUInt32" { callee = "minyar_native_region_load_u32" }
+        if member == "storeReleaseUInt32" { callee = "minyar_native_region_store_u32"; expected.add(1); result = 5 }
+        if member == "compareExchangeUInt32" { callee = "minyar_native_region_cas_u32"; expected.add(1); expected.add(1) }
+        if member == "loadAcquireInt64" { callee = "minyar_native_region_load_i64" }
+        if member == "storeReleaseInt64" { callee = "minyar_native_region_store_i64"; expected.add(1); result = 5 }
+        if member == "atomicAddInt64" { callee = "minyar_native_region_add_i64"; expected.add(1) }
+        if member == "copyFromBytes" { callee = "minyar_native_region_copy_from"; expected.add(8); result = 5 }
+        if member == "copyToBytes" { callee = "minyar_native_region_copy_to"; expected.add(1); result = 8 }
+        if member == "kernelRun" { callee = "minyar_native_region_kernel_run" }
+        if callee == "" { fail("unknown checked native region method") }
+    }
+    let values: List<Text> = [receiver]
+    let types: List<Integer> = [type]
+    let i = 0
+    while i < expected.length {
+        if i > 0 { expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",") }
+        let argumentType: List<Integer> = [expected[i]]
+        values.add(parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType))
+        requireType(context.tokenLines, state, argumentType[0], expected[i], "wrong checked native region argument type")
+        types.add(argumentType[0])
+        i = i + 1
+    }
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    setType(resultType, result)
+    return emitCall(output, textState, state, result, callee, values, types)
+}
+
 function threadValidateEntries(globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, counts: List<Integer>, parameters: List<Integer>) {
     let prefix = "; minyar-thread-entry: "
     let i = 0
@@ -144,16 +214,52 @@ function threadValidateEntries(globals: List<Text>, names: List<Text>, kinds: Li
                 valid = counts[function] == 3 && (results[function] == 1 || results[function] == 5)
                 if valid {
                     let first = functionParameterOffset(counts, function)
-                    valid = parameters[first] == 1 && parameters[first + 1] == 9 && (parameters[first + 2] == 10 || parameters[first + 2] == 14)
+                    valid = parameters[first] == 1 && (parameters[first + 1] == 9 || parameters[first + 1] == 16 || parameters[first + 1] == 17) && (parameters[first + 2] == 10 || parameters[first + 2] == 14)
                 }
             }
-            if !valid { fail("thread entry '" + readableDeclarationName(name) + "' requires (Integer, FrozenBytes, BytesChannel or FrozenBytesChannel) and Integer or Nothing result") }
+            if !valid { fail("thread entry '" + readableDeclarationName(name) + "' requires (Integer, FrozenBytes or native region capability, BytesChannel or FrozenBytesChannel) and Integer or Nothing result") }
         }
         i = i + 1
     }
 }
 
 function threadNativeAllowed(name: Text, signature: Text): Boolean { return false }
+
+function threadNativeSetupAllowed(name: Text, signature: Text): Boolean {
+    if name == "minyar_zstd_rawCreateDCtx" { return signature == "1()" }
+    if name == "minyar_zstd_rawCloseDCtx" { return signature == "5(1)" }
+    if name == "minyar_zstd_bufferDecompress" { return signature == "1(1,8,8)" }
+    if name == "minyar_machine_address" { return signature == "1(8)" }
+    if name == "minyar_machine_syscall" { return signature == "1(1,1,1,1,1,1,1)" }
+    if name == "minyar_machine_load8" || name == "minyar_machine_load16" || name == "minyar_machine_load32" || name == "minyar_machine_load64" || name == "minyar_machine_read8" || name == "minyar_machine_read16" || name == "minyar_machine_read32" || name == "minyar_machine_read64" || name == "minyar_machine_loadAcquire32" || name == "minyar_machine_loadAcquire64" { return signature == "1(1)" }
+    if name == "minyar_machine_store8" || name == "minyar_machine_store16" || name == "minyar_machine_store32" || name == "minyar_machine_store64" || name == "minyar_machine_write8" || name == "minyar_machine_write16" || name == "minyar_machine_write32" || name == "minyar_machine_write64" || name == "minyar_machine_storeRelease32" || name == "minyar_machine_storeRelease64" { return signature == "5(1,1)" }
+    if name == "minyar_machine_copy" || name == "minyar_machine_fill8" || name == "minyar_machine_fill32" { return signature == "5(1,1,1)" }
+    if name == "minyar_machine_atomicAdd" { return signature == "1(1,1)" }
+    if name == "minyar_machine_compareExchange32" || name == "minyar_machine_compareExchange64" { return signature == "1(1,1,1)" }
+    return false
+}
+
+function threadNativeSetupEnabled(callers: List<Text>, kinds: List<Text>, names: List<Text>): Boolean {
+    let pending: List<Text> = ["main"]
+    let seen: List<Text> = []
+    let cursor = 0
+    while cursor < pending.length {
+        let caller = pending[cursor]
+        cursor = cursor + 1
+        if findText(seen, caller) < 0 {
+            seen.add(caller)
+            let i = 0
+            while i < callers.length {
+                if callers[i] == caller {
+                    if kinds[i] == "builtin" && names[i] == "nativeThreadSetup" { return true }
+                    if kinds[i] == "call" { pending.add(names[i]) }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return false
+}
 
 function threadBuiltinAllowed(name: Text): Boolean {
     return isThreadBuiltin(name) || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply" || name == "Bytes" || name == "Text" || name == "Float" || name == "Integer" || name == "Character" || name == "print" || name == "fail" || name == "joinText" || name == "argument" || name == "argumentCount"
@@ -204,6 +310,7 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
         }
         i = i + 1
     }
+    let nativeSetup = threadNativeSetupEnabled(callers, kinds, names)
     let pass = 0
     while pass < 2 {
         let pending: List<Text> = []
@@ -252,8 +359,10 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
                             pending.add("callback")
                         } else if kind == "native" {
                             allowed = threadNativeAllowed(name, signatures[i])
+                            if pass == 0 && nativeSetup { allowed = threadNativeSetupAllowed(name, signatures[i]) }
                         } else if kind == "builtin" {
                             allowed = threadBuiltinAllowed(name)
+                            if pass == 1 && (name == "nativeThreadSetup" || name == "nativeRegionAddress") { allowed = false }
                         } else if kind == "constant" {
                             let managed = "; minyar-module-constant: " + name + "|managed\n"
                             if pass == 1 && findText(metadata, managed) >= 0 { allowed = false }
@@ -276,6 +385,38 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
 function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, recoverable: Boolean) {
     if !threadMode(globals) { return }
     let declarations: List<Text> = [
+        "declare void @minyar_native_thread_setup()",
+        "declare ptr @minyar_native_region_map(i64, i64, i64, i64, i64)",
+        "declare ptr @minyar_native_region_try_map(i64, i64, i64, i64, i64)",
+        "declare ptr @minyar_native_region_result_value(ptr)",
+        "declare i64 @minyar_native_region_length(ptr)",
+        "declare i64 @minyar_native_region_address(ptr)",
+        "declare ptr @minyar_native_regions_share(ptr)",
+        "declare i64 @minyar_native_regions_length(ptr)",
+        "declare ptr @minyar_native_regions_get(ptr, i64)",
+        "declare i64 @minyar_native_region_get_uint8(ptr, i64)",
+        "declare i64 @minyar_native_region_get_uint16(ptr, i64)",
+        "declare i64 @minyar_native_region_get_uint32(ptr, i64)",
+        "declare i64 @minyar_native_region_get_int64(ptr, i64)",
+        "declare void @minyar_native_region_set_uint8(ptr, i64, i64)",
+        "declare void @minyar_native_region_set_uint16(ptr, i64, i64)",
+        "declare void @minyar_native_region_set_uint32(ptr, i64, i64)",
+        "declare void @minyar_native_region_set_int64(ptr, i64, i64)",
+        "declare i64 @minyar_native_region_load_u8(ptr, i64)",
+        "declare void @minyar_native_region_store_u8(ptr, i64, i64)",
+        "declare i64 @minyar_native_region_load_u32(ptr, i64)",
+        "declare void @minyar_native_region_store_u32(ptr, i64, i64)",
+        "declare i64 @minyar_native_region_cas_u32(ptr, i64, i64, i64)",
+        "declare i64 @minyar_native_region_load_i64(ptr, i64)",
+        "declare void @minyar_native_region_store_i64(ptr, i64, i64)",
+        "declare i64 @minyar_native_region_add_i64(ptr, i64, i64)",
+        "declare void @minyar_native_region_copy_from(ptr, i64, ptr)",
+        "declare ptr @minyar_native_region_copy_to(ptr, i64, i64)",
+        "declare i64 @minyar_native_region_kernel_run(ptr, i64)",
+        "declare i64 @minyar_thread_kernel_kick(ptr, ptr)",
+        "declare i64 @minyar_thread_eventfd(i64)",
+        "declare i64 @minyar_thread_eventfd_read(i64)",
+        "declare i64 @minyar_thread_eventfd_notify(i64, i64)",
         "declare ptr @minyar_frozen_bytes_copy(ptr)",
         "declare ptr @minyar_frozen_bytes_take(ptr)",
         "declare ptr @minyar_frozen_bytes_local_copy(ptr)",
@@ -381,6 +522,7 @@ function threadResultMember(output: List<Text>, textState: List<Text>, state: Li
     let callee = "minyar_thread_join_result_value"
     if type == 12 && member == "thread" { result = 11; callee = "minyar_thread_start_result_value" }
     else if type == 15 && member == "value" { result = 9; callee = "minyar_frozen_result_value" }
+    else if type == 18 && member == "region" { result = 16; callee = "minyar_native_region_result_value" }
     else if type != 13 || member != "value" { fail("opaque thread result exposes only ok, code and its checked successful payload") }
     setType(resultType, result)
     return emitCall(output, textState, state, result, callee, values, types)
@@ -391,11 +533,12 @@ function threadFeatureName(name: Text): Boolean {
     if length < 6 || length > 22 { return false }
     let first = name[0]
     if first >= 'A' && first <= 'Z' {
-        return name == "FrozenBytes" || name == "BytesChannel" || name == "Thread" || name == "ThreadStartResult" || name == "ThreadJoinResult" || name == "FrozenBytesChannel" || name == "FrozenBytesResult"
+        return name == "FrozenBytes" || name == "BytesChannel" || name == "Thread" || name == "ThreadStartResult" || name == "ThreadJoinResult" || name == "FrozenBytesChannel" || name == "FrozenBytesResult" || name == "NativeRegion" || name == "NativeRegions" || name == "NativeRegionResult"
     }
     if length < 9 { return false }
     let second = name[1]
     let plausible = false
+    if first == 'm' || first == 'n' { plausible = true }
     if first == 'f' && second == 'r' { plausible = true }
     if first == 'c' && ((second == 'l' && name[2] == 'o') || (second == 'o' && name[2] == 'p')) { plausible = true }
     if first == 'b' && second == 'y' { plausible = true }

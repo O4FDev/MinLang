@@ -1,0 +1,98 @@
+use "machine" as machine
+
+function checked(result: Integer): Integer {
+    if result < 0 { fail("KVM setup code " + Text(result)) }
+    return result
+}
+function ioctlBytes(fd: Integer, request: Integer, data: Bytes): Integer {
+    return checked(machine.syscall(16, fd, request, machine.address(data), 0, 0, 0))
+}
+thread function dispatch(fd: Integer, input: NativeRegions, channel: BytesChannel): Integer {
+    let slot = input.get(0)
+    let run = input.get(1)
+    while slot.loadAcquireUInt32(0) != 3 {
+        let result = run.kernelRun(fd)
+        if slot.loadAcquireUInt32(0) == 3 { break }
+        slot.setInt64(8, result)
+        slot.atomicAddInt64(32, 1)
+        let prior = slot.compareExchangeUInt32(0, 0, 1)
+        if prior == 3 { break }
+        if prior != 0 { fail("invalid publish state") }
+        if threadEventfdNotify(slot.getInt64(24), 1) != 0 { fail("exit notification") }
+        while slot.loadAcquireUInt32(0) == 1 { threadSleepNanoseconds(100000) }
+        prior = slot.compareExchangeUInt32(0, 2, 0)
+        if prior == 3 { break }
+        if prior != 2 { fail("invalid resume state") }
+    }
+    return 0
+}
+thread function spin(fd: Integer, run: NativeRegion, channel: BytesChannel): Integer {
+    return run.kernelRun(fd)
+}
+function main() {
+    nativeThreadSetup()
+    let path = Bytes("/dev/kvm")
+    path.add(0)
+    let kvm = checked(machine.syscall(2, machine.address(path), 524290, 0, 0, 0, 0))
+    if checked(machine.syscall(16, kvm, 44544, 0, 0, 0, 0)) != 12 { fail("KVM API") }
+    let vm = checked(machine.syscall(16, kvm, 44545, 0, 0, 0, 0))
+    let memory = mapNativeRegion(4096, 3, 34, -1, 0)
+    memory.setUInt8(0, 228)
+    memory.setUInt8(1, 16)
+    memory.setUInt8(2, 230)
+    memory.setUInt8(3, 17)
+    memory.setUInt8(4, 244)
+    let descriptor = Bytes(32)
+    descriptor.setInt64(16, 4096)
+    descriptor.setInt64(24, memory.address)
+    ioctlBytes(vm, 1075883590, descriptor)
+    let fd = checked(machine.syscall(16, vm, 44609, 0, 0, 0, 0))
+    let size = checked(machine.syscall(16, kvm, 44548, 0, 0, 0, 0))
+    let run = mapNativeRegion(size, 3, 1, fd, 0)
+    let sregs = Bytes(312)
+    ioctlBytes(fd, 2167975555, sregs)
+    sregs.setInt64(0, 0)
+    sregs.setUInt16(12, 0)
+    ioctlBytes(fd, 1094233732, sregs)
+    let regs = Bytes(144)
+    regs.setInt64(136, 2)
+    ioctlBytes(fd, 1083223682, regs)
+    let event = checked(threadEventfd(524288))
+    let slot = mapNativeRegion(64, 3, 34, -1, 0)
+    slot.setInt64(16, fd)
+    slot.setInt64(24, event)
+    slot.setInt64(40, run.address)
+    let regions: List<NativeRegion> = [slot, run]
+    let shared = shareNativeRegions(regions)
+    let channel = bytesChannel(0, 1)
+    let worker = startThread(dispatch, fd, shared, channel)
+    for exit in 0..3 {
+        if threadEventfdRead(event) != 1 || slot.loadAcquireUInt32(0) != 1 || slot.getInt64(8) != 0 { fail("exit handoff") }
+        if exit < 2 {
+            if run.getUInt32(8) != 2 { fail("IO exit") }
+            let position = run.getInt64(40)
+            if exit == 0 { run.setUInt8(position, 42) }
+            else if run.getUInt8(position) != 42 { fail("IO dispatch") }
+            slot.storeReleaseUInt32(0, 2)
+        } else {
+            if run.getUInt32(8) != 5 { fail("HLT exit") }
+            slot.storeReleaseUInt32(0, 3)
+            let kicked = threadKernelKick(worker, run)
+            if kicked != 0 && kicked != -3 { fail("parked kick") }
+        }
+    }
+    if joinThread(worker) != 0 || slot.loadAcquireUInt32(0) != 3 || slot.loadAcquireInt64(32) != 3 { fail("stop or join") }
+    memory.setUInt8(0, 235)
+    memory.setUInt8(1, 254)
+    regs.setInt64(128, 0)
+    ioctlBytes(fd, 1083223682, regs)
+    run.storeReleaseUInt8(1, 0)
+    let spinning = startThread(spin, fd, run, channel)
+    if threadKernelKick(spinning, run) != 0 || joinThread(spinning) != -4 { fail("entering kick") }
+    checked(machine.syscall(3, event, 0, 0, 0, 0, 0))
+    checked(machine.syscall(3, fd, 0, 0, 0, 0, 0))
+    checked(machine.syscall(3, vm, 0, 0, 0, 0, 0))
+    checked(machine.syscall(3, kvm, 0, 0, 0, 0, 0))
+    closeBytesChannel(channel)
+    print("native-region-kvm passed")
+}
