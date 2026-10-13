@@ -56,7 +56,7 @@ if '--libs' in sys.argv: print('-lglfw')
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
                         MINYAR_CLANG=str(self.clang), TEST_CLANG_LOG=str(self.log),
                         TEST_GLFW_INCLUDE=str(self.include), LIMITED='', SANITIZER_LIMITED='')
-        for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_RUNTIME_FLAGS', 'MAKEFLAGS', 'MFLAGS'):
+        for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_RUNTIME_FLAGS', 'MINYAR_MAKE_FLAGS', 'MAKEFLAGS', 'MFLAGS'):
             self.env.pop(name, None)
         self.source = self.work / 'source file.min'
         self.source.write_text('print(42)\n')
@@ -145,6 +145,52 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
         self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']),
                          ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
         self.assertEqual(environment['LIMITED'], self.env['LIMITED'])
+
+    def test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        for extra, expected in (('', []), ('-j4 -o "build/compiler stage2.ll"',
+                                         ['-j4', '-o', 'build/compiler stage2.ll'])):
+            with patch.dict(driver.os.environ, dict(self.env, MINYAR_MAKE_FLAGS=extra), clear=True), \
+                 patch.object(driver, 'run') as run:
+                driver.bootstrap(self.project, ['build/minyarc-modules'])
+            self.assertEqual(run.call_args.args[0],
+                             ['make', '-s', '-C', str(self.project), *expected, 'build/minyarc-modules'])
+
+    def test_bootstrap_rejects_malformed_make_options_before_make(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        with patch.dict(driver.os.environ, dict(self.env, MINYAR_MAKE_FLAGS='-o "unterminated'), clear=True), \
+             patch.object(driver, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'MINYAR_MAKE_FLAGS'):
+                driver.bootstrap(self.project, ['build/minyarc-modules'])
+        run.assert_not_called()
+
+    def test_bootstrap_assume_old_keeps_compiler_and_rebuilds_current_runtime(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        compiler = self.project / 'build/compiler-stage2.ll'
+        runtime = self.project / 'build/runtime.o'
+        header = self.project / 'current-runtime.h'
+        compiler.write_text('verified compiler bytes\n')
+        (self.project / 'current.min').write_text('newer prerequisite\n')
+        os.utime(compiler, (1, 1))
+        (self.project / 'Makefile').write_text(
+            '.PHONY: check\ncheck: build/compiler-stage2.ll build/runtime.o\n'
+            'build/compiler-stage2.ll: current.min\n\tfalse\n'
+            'build/runtime.o: current-runtime.h\n\tcp $< $@\n')
+        for value in ('first current runtime\n', 'second current runtime\n'):
+            header.write_text(value)
+            if runtime.exists():
+                os.utime(runtime, (1, 1))
+            with patch.dict(driver.os.environ,
+                            dict(self.env, MINYAR_MAKE_FLAGS='-j4 -o build/compiler-stage2.ll'), clear=True):
+                driver.bootstrap(self.project, ['check'])
+            self.assertEqual(compiler.read_text(), 'verified compiler bytes\n')
+            self.assertEqual(runtime.read_text(), value)
 
     def test_windows_release_discovers_native_lld_exe_without_changing_explicit_linker(self):
         spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')

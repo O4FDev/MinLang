@@ -244,7 +244,7 @@ def bootstrap(project, targets):
         else:
             import fcntl
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        run(['make', '-s', '-C', str(project), *targets], env=environment)
+        run(['make', '-s', '-C', str(project), *flags('MINYAR_MAKE_FLAGS', ''), *targets], env=environment)
 
 
 def lto_flags(clang, link_flags):
