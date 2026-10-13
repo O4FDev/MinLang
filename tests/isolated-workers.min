@@ -1,0 +1,125 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+
+record Context { compiler: test.Compiler; runtime: Text }
+
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "IsolatedWorkers." + name || argument(index) == "IsolatedWorkers" { return true } }
+    return false
+}
+function literal(value: Text): Text {
+    return "\"" + test.replace(test.replace(value, "\\", "\\\\"), "\"", "\\\"") + "\""
+}
+function compile(context: Context, source: Text): Text {
+    let compiler = context.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    test.check(result.status == 0, "worker fixture compilation failed\n" + result.errorOutput)
+    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return path
+}
+function link(context: Context, path: Text): Text {
+    let compiler = context.compiler
+    let command = [compiler.clang, "-O2"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", path + ".ll", context.runtime, "runtime/native/workers.c", "-lm", "-o", path + ".exe"] { command.add(item) }
+    let linked = test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout)
+    test.check(linked.status == 0, "worker fixture link failed\n" + linked.errorOutput)
+    return path + ".exe"
+}
+function workerProgram(context: Context, source: Text, expected: Text) {
+    let executable = link(context, compile(context, source))
+    let result = test.run([executable], system.environment(), "", executable + ".run", 10)
+    test.check(result.status == 0, "worker fixture failed\n" + result.errorOutput)
+    test.check(result.output == expected, "worker fixture output\n" + result.output + "expected\n" + expected)
+    test.check(result.errorOutput == "", "worker fixture diagnostics\n" + result.errorOutput)
+}
+function frame(values: List<Integer>): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    return result
+}
+let names = ["test_messages_copy_and_domains_run_independently", "test_empty_messages_are_success_and_child_exit_is_eof", "test_malformed_worker_output_is_a_recoverable_failure",
+    "test_poll_result_remains_independent_and_stale_identity_is_rejected", "test_backpressure_accepts_no_partial_frame_and_close_releases_queue", "test_every_truncated_frame_prefix_and_oversized_header",
+    "test_supported_backend_and_spawn_failure_are_values", "test_mode_arguments_preserve_empty_unicode_quotes_and_backslashes", "test_pending_reads_survive_registry_growth_and_frames_remain_separate"]
+for index in 0..argumentCount() {
+    let valid = argument(index) == "IsolatedWorkers"
+    for name in names { if argument(index) == name || argument(index) == "IsolatedWorkers." + name { valid = true } }
+    test.check(valid, "unknown isolated worker case " + argument(index))
+}
+let context = Context { compiler: test.compiler(); runtime: test.setting("MINYAR_WORKER_RUNTIME", "build/minyar-default-runtime.o") }
+let directory = context.compiler.directory
+let cases = 0
+if chosen("test_messages_copy_and_domains_run_independently") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    let input = workers.readMessage()\n    if !errors.bytesOk(input) { fail(\"worker read failed\") }\n    let message = errors.bytesValue(input)\n    message[0] = message[0] + 1\n    if !errors.integerOk(workers.reply(message)) { fail(\"worker reply failed\") }\n} else {\n    let first = workers.value(workers.spawnSelf(\"echo\"))\n    let second = workers.value(workers.spawnSelf(\"echo\"))\n    let input = Bytes(3)\n    input[0] = 40\n    input[1] = 0\n    input[2] = 255\n    if !errors.integerOk(workers.send(first, input)) { fail(\"send failed\") }\n    if !errors.integerOk(workers.send(second, input)) { fail(\"send failed\") }\n    input[0] = 7\n    let a = workers.receive(first, 2000)\n    let b = workers.receive(second, 2000)\n    print(errors.bytesValue(a)[0])\n    print(errors.bytesValue(b)[0])\n    print(input[0])\n    print(errors.bytesValue(a)[1])\n    print(errors.bytesValue(a)[2])\n    print(errors.booleanValue(workers.close(first)))\n    print(errors.booleanValue(workers.close(second)))\n    print(errors.integerOk(workers.send(first, input)))\n}\n", "41\n41\n7\n0\n255\ntrue\ntrue\nfalse\n")
+    cases += 1
+}
+if chosen("test_empty_messages_are_success_and_child_exit_is_eof") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    let input = workers.readMessage()\n    if errors.bytesStatus(input) != errors.successStatus() { fail(\"empty frame was not success\") }\n    workers.reply(errors.bytesValue(input))\n} else {\n    let worker = workers.value(workers.spawnSelf(\"empty\"))\n    workers.send(worker, Bytes())\n    let empty = workers.receive(worker, 2000)\n    print(errors.bytesStatus(empty))\n    print(errors.bytesValue(empty).length)\n    print(errors.bytesStatus(workers.receive(worker, 2000)))\n    workers.close(worker)\n    print(workers.ok(workers.spawn(\"/path/that/does/not/exist\", \"bad\")))\n}\n", "0\n0\n2\nfalse\n")
+    cases += 1
+}
+if chosen("test_malformed_worker_output_is_a_recoverable_failure") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    print(\"not a framed message\")\n} else {\n    let worker = workers.value(workers.spawnSelf(\"malformed\"))\n    let result = workers.receive(worker, 2000)\n    print(errors.bytesStatus(result))\n    print(errors.isError(errors.bytesError(result)))\n    print(errors.booleanValue(workers.close(worker)))\n}\n", "3\ntrue\ntrue\n")
+    cases += 1
+}
+if chosen("test_poll_result_remains_independent_and_stale_identity_is_rejected") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    let input = workers.readMessage()\n    workers.reply(errors.bytesValue(input))\n} else {\n    let first = workers.value(workers.spawnSelf(\"poll\"))\n    let polled = workers.receive(first, 0)\n    print(errors.bytesStatus(polled))\n    print(errors.bytesStatus(workers.receive(first, -2)))\n    workers.send(first, Bytes())\n    print(errors.bytesStatus(workers.receive(first, 2000)))\n    print(errors.bytesStatus(polled))\n    workers.close(first)\n    let next = workers.value(workers.spawnSelf(\"replacement\"))\n    print(errors.integerOk(workers.send(first, Bytes())))\n    print(errors.booleanOk(workers.close(first)))\n    workers.close(next)\n}\n", "1\n3\n0\n1\nfalse\nfalse\n")
+    cases += 1
+}
+if chosen("test_backpressure_accepts_no_partial_frame_and_close_releases_queue") {
+    let waiting = directory + "/waiting-worker.c"
+    writeTextFile(waiting, "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n")
+    let built = directory + "/waiting-worker.exe"
+    let compiled = test.run([context.compiler.clang, "-std=c11", "-O2", waiting, "-o", built], system.environment(), "", directory + "/waiting.build", 30)
+    test.check(compiled.status == 0, "idle worker compilation failed\n" + compiled.errorOutput)
+    let child = directory + "/waiting worker é.exe"
+    test.require(test.run(["mv", "--", built, child], system.environment(), "", directory + "/waiting.rename", 10), "rename idle worker")
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nlet worker = workers.value(workers.spawn(" + literal(child) + ", \"blocked\"))\nlet message = Bytes(16777216)\nprint(errors.integerOk(workers.send(worker, message)))\nprint(errors.integerOk(workers.send(worker, message)))\nlet blocked = workers.send(worker, message)\nprint(errors.integerOk(blocked))\nprint(errors.isWouldBlock(errors.integerError(blocked)))\nprint(errors.bytesStatus(workers.receive(worker, 0)))\nprint(errors.booleanValue(workers.close(worker)))\n", "true\ntrue\nfalse\ntrue\n1\ntrue\n")
+    cases += 1
+}
+if chosen("test_every_truncated_frame_prefix_and_oversized_header") {
+    let executable = link(context, compile(context, "use \"workers\" as workers\nuse \"errors\" as errors\nlet result = workers.readMessage()\nlet status = Bytes(1)\nstatus[0] = errors.bytesStatus(result)\nworkers.reply(status)\n"))
+    let packet = frame([3, 0, 0, 0, 97, 0, 255])
+    let frames: List<Bytes> = []
+    let statuses: List<Integer> = []
+    for length in 0..packet.length {
+        frames.add(packet.slice(0, length))
+        if length == 0 { statuses.add(2) } else { statuses.add(3) }
+    }
+    for pair in [[0, 0], [1, 0], [2, 3], [3, 3]] {
+        if pair[0] == 0 { frames.add(packet) }
+        if pair[0] == 1 { frames.add(frame([0, 0, 0, 0])) }
+        if pair[0] == 2 { frames.add(frame([1, 0, 0, 1])) }
+        if pair[0] == 3 { frames.add(frame([255, 255, 255, 255])) }
+        statuses.add(pair[1])
+    }
+    for index in 0..frames.length {
+        let input = directory + "/frame" + Text(index)
+        writeBytesFile(input, frames[index])
+        let run = test.run(["/bin/sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar", input, executable, "--minyar-worker", "parser"], system.environment(), "", input + ".run", 3)
+        test.check(run.status == 0, "worker parser failed\n" + run.errorOutput)
+        test.check(support.same(Bytes(run.output), frame([1, 0, 0, 0, statuses[index]])), "worker parser status for frame " + Text(index))
+    }
+    cases += 1
+}
+if chosen("test_supported_backend_and_spawn_failure_are_values") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nprint(workers.supported())\nlet result = workers.spawn(\"/path/that/does/not/exist\", \"unavailable\")\nprint(workers.ok(result))\nprint(errors.isError(workers.error(result)))\n", "true\nfalse\ntrue\n")
+    cases += 1
+}
+if chosen("test_mode_arguments_preserve_empty_unicode_quotes_and_backslashes") {
+    for mode in ["", "two words", "é🙂 device", "a\"b", "trailing\\", "\\\"quoted\\\""] {
+        let value = literal(mode)
+        workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    let response = Bytes(1)\n    if workers.mode() == " + value + " { response[0] = 1 }\n    workers.reply(response)\n} else {\n    let worker = workers.value(workers.spawnSelf(" + value + "))\n    print(errors.bytesValue(workers.receive(worker, 2000))[0])\n    workers.close(worker)\n}\n", "1\n")
+    }
+    cases += 1
+}
+if chosen("test_pending_reads_survive_registry_growth_and_frames_remain_separate") {
+    workerProgram(context, "use \"workers\" as workers\nuse \"errors\" as errors\nif workers.isWorker() {\n    let first = workers.readMessage()\n    let second = workers.readMessage()\n    workers.reply(errors.bytesValue(first))\n    workers.reply(errors.bytesValue(second))\n} else {\n    let pool: List<workers.Worker> = []\n    for index in 0..12 {\n        let worker = workers.value(workers.spawnSelf(\"pending\"))\n        pool.add(worker)\n        if errors.bytesStatus(workers.receive(worker, 0)) != errors.wouldBlockStatus() { fail(\"poll did not wait\") }\n    }\n    for index in 0..12 {\n        let message = Bytes(1)\n        message[0] = index\n        workers.send(pool[index], message)\n        message[0] = index + 100\n        workers.send(pool[index], message)\n        message[0] = 255\n    }\n    for index in 0..12 {\n        let first = workers.receive(pool[index], 2000)\n        let second = workers.receive(pool[index], 2000)\n        if errors.bytesValue(first)[0] != index || errors.bytesValue(second)[0] != index + 100 { fail(\"copied frame changed\") }\n        if errors.bytesStatus(workers.receive(pool[index], 2000)) != errors.endOfStreamStatus() { fail(\"other child inherited the pipe\") }\n        if !errors.booleanOk(workers.close(pool[index])) { fail(\"close failed\") }\n    }\n    print(\"stable\")\n}\n", "stable\n")
+    cases += 1
+}
+test.removeTree(directory)
+print("Isolated workers: " + Text(cases) + " cases passed")

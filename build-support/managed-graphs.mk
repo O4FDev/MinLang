@@ -46,8 +46,8 @@ endif
 check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS) build/tooling/tests/managed-graphs-launcher
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher
 
-check-isolated-workers: build/minyarc build/minyar-default-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/isolated-workers.py
+check-isolated-workers: build/minyarc build/minyar-default-runtime.o build/tooling/tests/isolated-workers
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/isolated-workers
 
 build/minyar-default-runtime-sanitize.o: runtime/minyar_default_runtime.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) $(BUILD_RULES) | build
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -c $< -o $@
@@ -58,8 +58,8 @@ check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sa
 check-callbacks-sanitize: build/minyarc-callbacks-sanitize build/tooling/tests/callbacks
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/callbacks
 
-check-isolated-workers-sanitize: build/minyarc-sanitize build/minyar-default-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_WORKER_RUNTIME=./build/minyar-default-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/isolated-workers.py
+check-isolated-workers-sanitize: build/minyarc-sanitize build/minyar-default-runtime-sanitize.o build/tooling/tests/isolated-workers
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_WORKER_RUNTIME=./build/minyar-default-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/isolated-workers
 
 # The pre-existing type-reachability oracles now require parsed feature
 # dispatch for cyclic cases; all acyclic and invalid-type cases are retained.
