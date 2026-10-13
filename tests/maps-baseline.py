@@ -23,7 +23,7 @@ def main():
     a = p.parse_args()
     if hasattr(os, 'sched_getaffinity'):
         os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
-    source = ROOT / 'compiler/foundation-baseline.min'
+    source = ROOT / 'build/compiler-baseline-control.min'
     assert hashlib.sha256(source.read_bytes()).hexdigest() == 'a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf'
     directory = ROOT / 'build/maps-baseline'
     directory.mkdir(parents=True, exist_ok=True)

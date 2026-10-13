@@ -17,7 +17,7 @@ EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 # Minyar fixtures normally belong to harnesses. These maintained regressions
 # also have explicit mandatory dispositions, unlike generated Minyar samples.
-REQUIRED_MINYAR_FIXTURES = {'tests/glfw-software-source.min', 'tests/reserved-names.min', 'tests/octal-literals.min', 'tests/cycle-late-registration.min', 'tests/generated-llvm-sanitizer.min', 'tests/quic-pto.min', 'tests/quic-ack.min', 'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.min', 'tests/interop/qns/client.min', 'tests/interop/qns/server.min'}
+REQUIRED_MINYAR_FIXTURES = {'tests/compiler-behavior.min', 'tests/glfw-software-source.min', 'tests/reserved-names.min', 'tests/octal-literals.min', 'tests/cycle-late-registration.min', 'tests/generated-llvm-sanitizer.min', 'tests/quic-pto.min', 'tests/quic-ack.min', 'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.min', 'tests/interop/qns/client.min', 'tests/interop/qns/server.min'}
 REQUIRED_MINYAR_PREFIXES = ('tests/parallel-signatures/',)
 REQUIRED_DATA_FIXTURES = {'tests/cycle-private-retirement-v5.json', 'tests/fixtures/cycle-progress-before-observability.c.txt'}
 

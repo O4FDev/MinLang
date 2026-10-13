@@ -145,7 +145,7 @@ def main():
     clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     compiler = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc')).resolve()
     tool_paths = [compiler, Path(shutil.which(clang) or clang).resolve(), Path(sys.executable).resolve()]
-    inputs = [ROOT / name for name in ('build/compiler.min', 'compiler/foundation-baseline.min',
+    inputs = [ROOT / name for name in ('build/compiler.min', 'build-support/compiler.mk',
               'runtime/minyar_runtime.c', 'runtime/minyar_default_runtime.c',
               'runtime/freestanding/runtime.c', 'library/machine.min',
               'library/arch/arm64/machine.min', 'tests/raw-syscall.py', 'tests/raw-syscall-native.c',

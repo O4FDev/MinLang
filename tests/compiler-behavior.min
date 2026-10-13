@@ -1,0 +1,62 @@
+use "../tools/testing.min" as test
+use "files" as files
+use "system" as system
+function checkCompiler(executable: Text, runtime: Text, profile: Text, clang: Text) {
+    let compiler = test.compiler()
+    compiler.executable = executable
+    compiler.runtime = runtime
+    compiler.clang = clang
+    compiler.flags = []
+    compiler.compileTimeout = 120
+    compiler.linkTimeout = 120
+    compiler.runTimeout = 120
+    writeTextFile(compiler.directory + "/values.min", "public function value(): Integer { return 42 }\n")
+    test.executes(compiler, "function sum(n: Integer): Integer {\nlet value = 0\nwhile n > 0 { value = value + n; n = n - 1 }\nreturn value\n}\nprint(sum(100))\nprint(false && 1 / 0 == 0)\n", "5050\nfalse\n")
+    test.executes(compiler, "record Box { value: Text }\nfunction box(): Box { return Box { value: \"hello\" + \" world\" } }\nlet boxes: List<Box> = [box(), box()]\nprint(boxes[1].value)\nprint(\"é🙂\".length)\nprint(Integer('中'))\n", "hello world\n2\n20013\n")
+    test.executes(compiler, "use \"./values.min\" as values\nprint(values.value())\n", "42\n")
+    if profile == "callbacks" || profile == "errors" || profile == "calldepth" || profile == "threads" {
+        test.executes(compiler, "let base = 40\nlet add: Callback<Integer, Integer> = function(value: Integer): Integer { return base + value }\nprint(add(2))\n", "42\n")
+    }
+    if profile == "errors" || profile == "calldepth" || profile == "threads" {
+        test.executes(compiler, "let value = Ok<Integer, Text>(42)\nmatch value { Ok(number) { print(number) } Err(error) { print(error) } }\n", "42\n")
+    }
+    compiler.compileTimeout = 30
+    let sources = ["print(missing)\n", "print(9223372036854775808)\n", "let value: Integer = \"wrong\"\n"]
+    let diagnostics = ["can't find a value named", "outside the supported range", "declared type"]
+    for index in 0..sources.length {
+        let result = test.compile(compiler, sources[index])
+        test.check(result.status == 1 && test.contains(result.errorOutput, diagnostics[index]), "compiler rejection changed\n" + result.errorOutput)
+        test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid input left LLVM")
+    }
+    test.removeScratch(compiler.directory)
+    print(executable + ": compiler behaviour passed (" + profile + ")")
+}
+let compilers: List<Text> = []
+let inputs: List<Text> = []
+let profile = "core"
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "compiler behavior option needs a value")
+    let option = argument(index)
+    let value = argument(index + 1)
+    if option == "--compiler" { compilers.add(value) }
+    else if option == "--ir" { inputs.add(value) }
+    else if option == "--profile" { profile = value }
+    else { fail("unknown compiler behavior option: " + option) }
+    index += 2
+}
+test.check(compilers.length + inputs.length > 0, "compiler behavior requires a compiler or IR")
+let runtime = "build/minyar-runtime.o"
+if profile != "core" { runtime = "build/testing/cycle-runtime.o" }
+let work = test.scratch()
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+for index in 0..inputs.length {
+    let executable = work + "/compiler-" + Text(index)
+    let command = [clang, "-O2", "-Wno-override-module"]
+    for flag in test.words(test.setting("COMPILER_LTO_FLAGS", "-flto=thin")) { command.add(flag) }
+    for item in [inputs[index], "build/minyar-compiler-runtime.ll", "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", work + "/link", 120), "compiler IR link")
+    compilers.add(executable)
+}
+for compiler in compilers { checkCompiler(compiler, runtime, profile, clang) }
+test.removeScratch(work)

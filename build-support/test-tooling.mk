@@ -9,3 +9,11 @@ build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE)
 	$(LLVM_CC) $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) -pthread -lm -o $@
 
 .PRECIOUS: build/tooling/%.ll
+
+build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/build-test-runtime
+	mkdir -p $(@D)
+	./build/tooling/tools/build-test-runtime $< $@
+
+build/testing/cycle-runtime.o: build/testing/cycle-runtime.c $(wildcard runtime/minyar_*.h)
+	$(LLVM_CC) -O2 -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
+

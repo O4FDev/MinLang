@@ -91,8 +91,13 @@ build/minyar-module-build: tools/module-build.c build/.toolchain.json | build
 build/minyar-module-build-sanitize: tools/module-build.c build/.toolchain.json | build
 	$(SANITIZER_LIMITED) "$(CC)" -std=c11 -Wall -Wextra -Werror $(SANITIZER_FLAGS) $< -o $@
 
-build/compiler-baseline-control.min: compiler/foundation-baseline.min | build
-	cp $< $@
+FOUNDATION_BASELINE_COMMIT = 4f2d21e541e886bb81f4cd2daee7f11d518fe53b
+FOUNDATION_BASELINE_SHA256 = a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf
+
+build/compiler-baseline-control.min: build-support/compiler.mk | build
+	git show $(FOUNDATION_BASELINE_COMMIT):compiler/foundation-baseline.min > $@.tmp 2>/dev/null || curl --fail --location --retry 3 https://raw.githubusercontent.com/O4FDev/MinLang/$(FOUNDATION_BASELINE_COMMIT)/compiler/foundation-baseline.min -o $@.tmp
+	printf '%s  %s\n' '$(FOUNDATION_BASELINE_SHA256)' '$@.tmp' | shasum -a 256 --check
+	mv $@.tmp $@
 
 build/compiler-baseline-control.ll: build/compiler-baseline-control.min build/minyarc
 	$(LIMITED) ./build/minyarc $< $@
