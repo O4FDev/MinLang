@@ -161,7 +161,7 @@ def main():
             raise ValueError("Native registration gate requires uninstrumented link flags")
         language = load("registration_errors_language", "tests/errors-language.py")
         for name in (language.FRONTEND, ROOT / "compiler/errors-compiler.min",
-                     ROOT / "compiler/source.py"):
+                     ROOT / "build-support/compiler.mk"):
             report.setdefault("frontend_sha256", {})[str(name)] = hashlib.sha256(name.read_bytes()).hexdigest()
 
         class Fixture(language.ErrorsLanguage):

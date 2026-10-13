@@ -431,7 +431,7 @@ class QuicRfcHarness(unittest.TestCase):
             names={'minyar','Makefile','tests/quic-rfc.py','tests/quic-rfc-harness.py',
                    'tests/tls-local.py','tests/test_evidence.py','tests/clang_helpers.py',
                    'tests/quic_protocol_artifacts.py','tests/quic-protocol-artifacts.py','tests/interop/qns/endpoint.py',
-                   'compiler/source.py','compiler/stages/pipeline.min',
+                   'build-support/compiler.mk','compiler/stages/pipeline.min',
                    'compiler/stages/expressions.min','vendor/monocypher/LICENCE.md',
                    'vendor/monocypher/NOTICE','runtime/native/abi.h'}
             names.update(RFC.BINARIES.values())

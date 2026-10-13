@@ -1,7 +1,32 @@
-COMPILER_SOURCES = compiler/compiler.min compiler/source.py compiler/closure-compiler.min compiler/errors-compiler.min compiler/calldepth-compiler.min compiler/thread-compiler.min $(wildcard compiler/stages/*.min)
+COMPILER_SOURCES = compiler/stages/source.min \
+	compiler/stages/lexer.min \
+	compiler/stages/symbols.min \
+	compiler/stages/declarations.min \
+	compiler/stages/runtime-abi.min \
+	compiler/stages/types.min $(wildcard compiler/stages/c-layout.min) \
+	compiler/stages/ownership.min \
+	compiler/stages/operators.min \
+	compiler/stages/expressions.min \
+	compiler/stages/statements.min \
+	compiler/stages/literals.min \
+	compiler/stages/calls.min \
+	compiler/stages/assignment.min \
+	compiler/stages/native.min \
+	compiler/stages/effects.min \
+	compiler/stages/functions.min \
+	compiler/stages/pipeline.min \
+	compiler/stages/modules.min \
+	compiler/stages/incremental.min \
+	compiler/closure-compiler.min \
+	compiler/errors-compiler.min \
+	compiler/calldepth-compiler.min \
+	compiler/thread-compiler.min \
+	compiler/compiler.min
 
-build/compiler.min: $(COMPILER_SOURCES) | build
-	python3 compiler/source.py $@
+build/compiler.min: $(COMPILER_SOURCES) build-support/compiler.mk | build
+	cat $(COMPILER_SOURCES) > $@.tmp
+	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' $@.tmp
+	mv $@.tmp $@
 
 build/stage0: bootstrap/stage0.c vendor/stb_ds.h build/.toolchain.json | build
 	"$(CC)" $(CPPFLAGS) $(CFLAGS) $< -o $@
