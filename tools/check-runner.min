@@ -66,7 +66,7 @@ public function database(source: Text): List<Rule> {
 public record Variant { name: Text; cwd: Text; environment: List<Text>; make: List<Text>; rules: List<Rule>; builder: Boolean; built: Map<Text, Boolean> }
 public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer; members: Map<Text, Boolean> }
 public record Check { label: Text; target: Text; arguments: List<Text>; variant: Integer; children: List<Integer>; goals: List<Integer>;
-    state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean; wall: Integer }
+    state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean; wall: Integer; cpu: Integer; cost: Integer }
 public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean }
 public function plan(jobs: Integer, timeout: Integer, retries: Integer): Plan {
     test.check(jobs >= 1 && jobs <= 16 && timeout > 0 && retries >= 0, "invalid runner limits")
@@ -130,7 +130,7 @@ public function addCheck(plan: Plan, variant: Integer, target: Text): Integer {
     let index = plan.checks.length
     plan.checks.add(Check { label: label; target: target; arguments: []; variant: variant; children: []; goals: []; state: 0;
         resource: resource(target, variant); exclusive: exclusive(target); weight: weight(target);
-        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0 })
+        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0; cpu: 0; cost: 0 })
     for prerequisite in rule.prerequisites {
         let child = findRule(where.rules, prerequisite)
         if child >= 0 {
@@ -151,27 +151,56 @@ public function addCommand(plan: Plan, variant: Integer, label: Text, arguments:
     for goal in goals { dependencies.add(addGoal(plan, variant, goal, weight(label))) }
     plan.checks.add(Check { label: label; target: ""; arguments: arguments; variant: variant; children: []; goals: dependencies; state: 0;
         resource: resource(label, variant); exclusive: exclusive(label); weight: weight(label);
-        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0 })
+        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0; cpu: 0; cost: 0 })
     return plan.checks.length - 1
 }
-function durations(history: Text): Map<Text, Integer> {
+function durations(history: Text, field: Integer): Map<Text, Integer> {
     let result = Map<Text, Integer>()
     if files.pathSize(history) <= 0 { return result }
     for line in test.lines(readTextFile(history)) {
         let fields = test.words(line)
-        if fields.length != 2 { continue }
-        let parsed = text.parseInteger(fields[1])
+        if fields.length <= field { continue }
+        let parsed = text.parseInteger(fields[field])
         if errors.integerOk(parsed) { result[fields[0]] = errors.integerValue(parsed) }
     }
     return result
 }
+function milliseconds(value: Text): Integer {
+    let raw = Bytes(value)
+    let whole = 0
+    let fraction = 0
+    let digits = -1
+    for byte in raw {
+        if byte == 46 { digits = 0; continue }
+        if byte < 48 || byte > 57 { return -1 }
+        if digits < 0 { whole = whole * 10 + byte - 48 }
+        else if digits < 3 { fraction = fraction * 10 + byte - 48; digits += 1 }
+    }
+    while digits >= 0 && digits < 3 { fraction *= 10; digits += 1 }
+    return whole * 1000 + fraction
+}
+function cpuUsage(log: Text): Integer {
+    let lines = test.lines(Text(files.readFile(log + ".cpu")))
+    if lines.length == 0 { return 0 }
+    let fields = test.words(lines[lines.length - 1])
+    if fields.length != 3 { return 0 }
+    let user = milliseconds(fields[0])
+    let kernel = milliseconds(fields[1])
+    if user < 0 || kernel < 0 { return 0 }
+    return user + kernel
+}
 public function prioritize(plan: Plan, history: Text) {
-    let known = durations(history)
+    let known = durations(history, 1)
+    let used = durations(history, 2)
     let base: List<Integer> = []
     let priority: List<Integer> = []
     for check in plan.checks {
         let estimate = check.weight * 1000
         if known.has(check.label) { estimate = known[check.label] }
+        check.cost = slots(check.label, plan.jobs)
+        if known.has(check.label) && used.has(check.label) && known[check.label] > 0 {
+            check.cost = max(1, min(check.cost, (used[check.label] + known[check.label] - 1) / known[check.label]))
+        }
         base.add(estimate)
         priority.add(estimate)
     }
@@ -187,10 +216,15 @@ public function prioritize(plan: Plan, history: Text) {
     for index in 0..plan.checks.length { plan.checks[index].weight = priority[index] }
 }
 public function remember(plan: Plan, history: Text) {
-    let known = durations(history)
-    for check in plan.checks { if check.wall > 0 { known[check.label] = check.wall } }
+    let known = durations(history, 1)
+    let used = durations(history, 2)
+    for check in plan.checks { if check.wall > 0 { known[check.label] = check.wall; used[check.label] = check.cpu } }
     let rows: List<Text> = []
-    for label in known { rows.add(label + " " + Text(known[label]) + "\n") }
+    for label in known {
+        let row = label + " " + Text(known[label])
+        if used.has(label) { row += " " + Text(used[label]) }
+        rows.add(row + "\n")
+    }
     rows.sort()
     let temporary = history + ".tmp-" + Text(system.processId())
     writeTextFile(temporary, joinText(rows))
@@ -272,6 +306,10 @@ function command(plan: Plan, check: Check): List<Text> {
     args.add(check.target)
     return args
 }
+function admission(plan: Plan, check: Check): Integer {
+    if check.cost > 0 { return min(check.cost, plan.jobs) }
+    return slots(check.label, plan.jobs)
+}
 function slots(label: Text, jobs: Integer): Integer {
     for parallel in ["check-mutation-score", "check-coverage", "check-quic-native-O0", "check-quic-native-O2", "check-quic-native-sanitize", "check-maps", "check-maps-sanitize", "check-cycle-additive", "check-cycle-additive-sanitize"] {
         if label == parallel { return min(4, jobs) }
@@ -346,13 +384,14 @@ function execute(plan: Plan): Boolean {
                 let status = system.poll(check.handle)
                 if status.state != system.PENDING {
                     check.wall = (system.monotonicNanoseconds() - check.started) / 1000000
+                    check.cpu = cpuUsage(check.log)
                     let ok = showResult(check.label, check.log, status, check.started)
                     check.state = 3
                     if ok { check.state = 2 }
                     if check.builder { plan.variants[check.variant].builder = false }
                     remaining -= 1
                 } else {
-                    active += slots(check.label, plan.jobs)
+                    active += admission(plan, check)
                     if check.exclusive { quiet = true } else { ordinary = true }
                 }
             }
@@ -392,7 +431,7 @@ function execute(plan: Plan): Boolean {
                 let blockedByBuilder = false
                 for running in plan.checks { if running.state == 1 && running.builder { blockedByBuilder = true } }
                 if blockedByBuilder { continue }
-                if active + slots(check.label, plan.jobs) > plan.jobs {
+                if active + admission(plan, check) > plan.jobs {
                     if check.weight > waiting { waiting = check.weight }
                     continue
                 }
@@ -423,7 +462,7 @@ function execute(plan: Plan): Boolean {
                 if check.exclusive { quiet = true } else { ordinary = true }
             }
             let cost = 1
-            if chosenCheck >= 0 { cost = slots(plan.checks[chosenCheck].label, plan.jobs) }
+            if chosenCheck >= 0 { cost = admission(plan, plan.checks[chosenCheck]) }
             active += cost; launched = true
         }
         if active == 0 && !launched && remaining > 0 {
