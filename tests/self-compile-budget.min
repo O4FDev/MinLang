@@ -1,0 +1,69 @@
+use "../tools/testing.min" as test
+use "./performance-support.min" as budget
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+function checked(result: budget.Outcome) { if !result.ok { fail(result.error) } }
+function functional() {
+    let work = test.scratch()
+    let context = budget.fixtureComparison(work, budget.RUNS, budget.BATCHES)
+    let result = budget.comparison(context); checked(result)
+    let pairs = json.member(result.value, "pairs")
+    test.check(pairs.kind == json.ARRAY && pairs.items.length == 300, "all three100-sample batches retained")
+    test.check(context.control.calls[0] == 301 && context.control.calls[1] == 301 && context.control.behaviorCalls == 2, "two warmups/all600 measured compiles/two behavior checks")
+    for index in 0..pairs.items.length {
+        let pair = pairs.items[index]
+        test.check(data.number(pair, "batch") == index / 100 && data.number(pair, "index") == index % 100, "every batch/index retained")
+        let order = json.member(pair, "order")
+        let first = "current"; let second = "previous"; if index % 2 != 0 { first = "previous"; second = "current" }
+        test.check(order.items.length == 2 && order.items[0].text == first && order.items[1].text == second, "all300 pairs alternate")
+        for clock in ["wall", "cpu"] {
+            test.check(json.member(json.member(pair, "ratios"), clock).number == 1.0, "every independent wall/CPU observation retained")
+            let summary = json.member(json.member(result.value, "summaries"), clock)
+            test.check(data.number(summary, "sample_count") == 300 && json.member(summary, "median").number == 1.0 && json.member(json.member(summary, "confidence_interval"), "upper").number == 1.0, "all300 same-input clock samples included")
+        }
+    }
+    test.check(budget.equal(json.parse(readTextFile(context.report)), result.value), "durable complete comparison report")
+    test.check(budget.resourceBudget(data.decimal(17.0), data.integer(75000000)).ok, "inclusive original resource floors")
+    test.check(!budget.resourceBudget(data.decimal(17.000001), data.integer(75000000)).ok && !budget.resourceBudget(data.decimal(17.0), data.integer(75000001)).ok, "both independent original resource limits")
+    test.removeTree(work)
+    print("self-compile functional budget controls passed")
+}
+function main(): Integer {
+    if argumentCount() == 1 && argument(0) == "--functional" { functional(); return 0 }
+    let work = test.scratch()
+    let rootResult = budget.capture(["/bin/pwd", "-P"], work + "/root")
+    test.require(rootResult, "self-compile repository root")
+    let root = test.lines(rootResult.output)[0]
+    let platform = budget.capture(["/usr/bin/uname", "-s"], work + "/platform")
+    test.require(platform, "budget platform")
+    let darwin = test.lines(platform.output)[0] == "Darwin"
+    let compiler = test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc")
+    let source = test.setting("MINYAR_TEST_COMPILER_SOURCE", root + "/build/compiler.min")
+    let output = root + "/build/self-compile-budget.ll"
+    let context = budget.Comparison { root: root; current: compiler; previous: ""; input: source; runtime: root + "/build/minyar-compiler-runtime.ll"; manifest: ""; report: root + "/build/performance-evidence/self-compile-pairs.json"; work: work; runs: budget.RUNS; batches: budget.BATCHES; darwin: darwin; control: budget.backend(false) }
+    if argumentCount() == 4 && argument(0) == "--record-comparison" {
+        context.previous = argument(1); context.input = argument(2); context.manifest = argument(3)
+        budget.recordComparison(context); test.removeTree(work); return 0
+    }
+    test.check(argumentCount() == 0, "unknown self-compile budget option")
+    test.check(darwin, "real self-compile resource/timing qualification is restricted to the owner macOS CI; use --functional for Linux controls")
+    test.check(files.pathSize(compiler) >= 0, "build build/minyarc first (make build/minyarc)")
+    budget.clear(output)
+    checked(budget.validate(budget.capture([compiler, source, output], work + "/warmup"), output, "self-compile"))
+    let instructions = budget.profile(context.control, compiler, source, output, work + "/profile", darwin); checked(instructions)
+    let usage = budget.usage(); let rss = data.nullValue()
+    if usage.error == 0 { rss = data.decimal(Float(usage.maximumRss) / 1048576.0) }
+    checked(budget.resourceBudget(rss, instructions.value))
+    checked(budget.behavior(context, output))
+    let previous = system.getenv("MINYAR_BUDGET_PREVIOUS_COMPILER"); let present = system.lastError() == 0
+    let fixed = system.getenv("MINYAR_BUDGET_FIXED_INPUT"); present = present && system.lastError() == 0
+    let manifest = system.getenv("MINYAR_BUDGET_COMPARISON_MANIFEST"); present = present && system.lastError() == 0
+    test.check(present, "macOS wall qualification requires the matched previous compiler and fixed input")
+    context.previous = previous; context.input = fixed; context.manifest = manifest
+    checked(budget.comparison(context))
+    test.removeTree(work)
+    print("self-compile budget met")
+    return 0
+}

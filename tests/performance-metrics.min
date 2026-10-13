@@ -1,0 +1,179 @@
+use "../tools/testing.min" as test
+use "./performance-support.min" as metrics
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "PerformanceMetrics." + name { return true } }
+    return false
+}
+function matches(result: metrics.Outcome, expected: Text, label: Text) { test.check(result.ok && metrics.equal(result.value, json.parse(expected)), label) }
+function rejects(result: metrics.Outcome, message: Text) { test.check(!result.ok && test.contains(result.error, message), "required rejection: " + message) }
+function summary(median: Float, upper: Float): json.Value {
+    return data.object(["median", "confidence_interval"], [data.decimal(median), data.object(["upper"], [data.decimal(upper)])])
+}
+function paired(median: Float, upper: Float): json.Value { return data.object(["summaries"], [data.object(["wall", "cpu"], [summary(median, upper), summary(median, upper)])]) }
+let zero = Float(argumentCount() - argumentCount())
+let nan = zero / zero
+let infinity = 1.0 / zero
+if selected("test_phase_totals_and_peak_memory_keep_distinct_units") {
+    let phases = json.parse("[{\"cpu_ms\":2.5,\"wall_ms\":11,\"peak_rss_mib\":8},{\"cpu_ms\":7.5,\"wall_ms\":3,\"peak_rss_mib\":23},{\"cpu_ms\":1,\"wall_ms\":2,\"peak_rss_mib\":5}]").items
+    let original = json.pretty(data.array(phases), "")
+    matches(metrics.combine(phases), "{\"cpu_ms\":11,\"wall_ms\":16,\"peak_rss_mib\":23}", "time sums / RSS maximum distinct units")
+    test.check(json.pretty(data.array(phases), "") == original, "phase inputs unchanged")
+    matches(metrics.summarize(phases), "{\"cpu_ms\":2.5,\"wall_ms\":3,\"peak_rss_mib\":23}", "repeated time medians / RSS maximum")
+}
+if selected("test_unavailable_measurements_never_become_zero_or_partial_totals") {
+    for missing in [json.parse("{\"cpu_ms\":null,\"wall_ms\":4}"), json.parse("{\"wall_ms\":4}")] {
+        let observed = json.parse("{\"cpu_ms\":20,\"wall_ms\":8}")
+        for rows in [data.array([missing, observed]), data.array([observed, missing])] {
+            matches(metrics.combine(rows.items), "{\"cpu_ms\":null,\"wall_ms\":12}", "no partial CPU total")
+            matches(metrics.summarize(rows.items), "{\"cpu_ms\":null,\"wall_ms\":6}", "no partial CPU median")
+        }
+    }
+    let rows = json.parse("[{\"cpu_ms\":2,\"wall_ms\":3,\"peak_rss_mib\":8},{\"cpu_ms\":4,\"wall_ms\":5}]").items
+    matches(metrics.combine(rows), "{\"cpu_ms\":6,\"wall_ms\":8,\"peak_rss_mib\":null}", "unavailable peak total")
+    let measured = metrics.summarize(rows)
+    test.check(measured.ok && json.member(measured.value, "peak_rss_mib").kind == json.NULL, "unavailable peak summary")
+}
+if selected("test_invalid_measurements_cannot_silently_disable_comparisons") {
+    for repeated in [false, true] {
+        rejects(metrics.aggregate([], repeated), "at least one")
+        for key in ["cpu_ms", "wall_ms", "peak_rss_mib"] {
+            for invalid in [data.decimal(-1.0), data.decimal(nan), data.decimal(infinity), data.decimal(-infinity), data.boolean(true), data.text("3")] {
+                let row = json.parse("{\"cpu_ms\":1,\"wall_ms\":2,\"peak_rss_mib\":3}")
+                data.set(row, key, invalid)
+                rejects(metrics.aggregate([row], repeated), "invalid nonnegative finite measurement")
+            }
+        }
+    }
+}
+if selected("test_real_measurement_producer_reports_unavailable_cpu") {
+    let work = test.scratch()
+    let produced = metrics.functionalProducer(["/bin/true"], work + "/producer", false)
+    test.check(produced.ok && json.member(produced.value, "cpu_ms").kind == json.NULL && json.member(produced.value, "wall_ms").number >= 0.0, "real child producer unavailable CPU with functional wall fixture")
+    test.removeTree(work)
+}
+if selected("test_complete_build_report_sums_each_phase_and_retains_inputs") {
+    let work = test.scratch()
+    let result = metrics.controlledReport(true, true, false, false, work)
+    test.check(result.ok, result.error)
+    let rows = json.member(result.value, "rows"); test.check(rows.items.length == 5, "all complete build scenarios")
+    for row in rows.items {
+        test.check(metrics.equal(json.member(row, "median_ms"), json.parse("{\"driver\":{\"cpu_ms\":3,\"wall_ms\":5},\"production\":{\"cpu_ms\":7,\"wall_ms\":10}}")), "complete phase totals retained")
+        for sample in json.member(json.member(row, "samples"), "driver").items {
+            test.check(metrics.equal(json.member(sample, "frontend_ms"), json.parse("{\"cpu_ms\":1,\"wall_ms\":2}")), "frontend raw input retained")
+            test.check(metrics.equal(json.member(sample, "link_ms"), json.parse("{\"cpu_ms\":2,\"wall_ms\":3}")), "link raw input retained")
+        }
+        test.check(json.string(row, "cpu_ceiling_status") == "not-requested", "unrequested ceiling explicit")
+    }
+    test.removeTree(work)
+}
+if selected("test_complete_build_without_cpu_and_frontend_ceiling_are_reported") {
+    for link in [true, false] {
+        let work = test.scratch(); let enforce = !link
+        let result = metrics.controlledReport(link, false, enforce, false, work); test.check(result.ok, result.error)
+        let rows = json.member(result.value, "rows"); test.check(rows.items.length == 5, "all unavailable CPU scenarios")
+        for row in rows.items {
+            let medians = json.member(row, "median_ms")
+            for label in ["driver", "production"] { test.check(json.member(json.member(medians, label), "cpu_ms").kind == json.NULL, "unavailable complete CPU never zero") }
+            let driverWall = 2.0; let productionWall = 7.0; let status = "unavailable"
+            if link { driverWall = 5.0; productionWall = 10.0; status = "not-requested" }
+            test.check(json.member(json.member(medians, "driver"), "wall_ms").number == driverWall && json.member(json.member(medians, "production"), "wall_ms").number == productionWall, "available complete wall totals")
+            test.check(json.string(row, "cpu_ceiling_status") == status, "unavailable frontend ceiling disposition")
+        }
+        test.removeTree(work)
+    }
+}
+if selected("test_available_cpu_still_enforces_the_regression_ceiling") {
+    let work = test.scratch(); rejects(metrics.controlledReport(false, true, true, true, work), "incremental CPU ceiling exceeded"); test.removeTree(work)
+}
+if selected("test_profiled_failures_and_stale_or_wrong_output_are_rejected") {
+    let modes = ["failure", "no-output", "wrong-output"]
+    let messages = ["failed with status 1", "produced no LLVM", "invalid compiler LLVM"]
+    for index in 0..modes.length {
+        let work = test.scratch(); let output = work + "/output.ll"; writeTextFile(output, metrics.compilerLLVM())
+        let control = metrics.backend(true); control.mode = modes[index]
+        rejects(metrics.profile(control, "", "", output, work + "/profile", true), messages[index])
+        test.check(control.profileCalls == 1, "invalid first profile stopped after one sample")
+        test.removeTree(work)
+    }
+}
+if selected("test_each_profile_sample_requires_fresh_compiler_output") {
+    let work = test.scratch(); let control = metrics.backend(true); let output = work + "/output.ll"
+    let result = metrics.profile(control, "", "", output, work + "/profile", true)
+    test.check(result.ok && result.value.number == 7.0 && control.profileCalls == 5, "fresh five profile samples retain minimum7")
+    test.removeTree(work)
+}
+if selected("test_valid_missing_counter_is_unavailable") {
+    let work = test.scratch(); let control = metrics.backend(true); control.mode = "missing"
+    let result = metrics.profile(control, "", "", work + "/output.ll", work + "/profile", true)
+    test.check(result.ok && result.value.kind == json.NULL && control.profileCalls == 1, "valid output without counter unavailable after first sample")
+    test.removeTree(work)
+}
+if selected("test_later_profile_failure_cannot_reuse_an_earlier_good_sample") {
+    let work = test.scratch(); let control = metrics.backend(true); control.mode = "later"; control.profileCounts = [7, 1]
+    rejects(metrics.profile(control, "", "", work + "/output.ll", work + "/profile", true), "failed with status 1")
+    test.check(control.profileCalls == 2, "later profile failure cannot reuse first cheap valid sample")
+    test.removeTree(work)
+}
+if selected("test_each_timed_sample_requires_fresh_output_outside_timing_interval") {
+    let modes = ["", "failure", "no-output", "wrong-output"]
+    let messages = ["", "failed with status 1", "produced no LLVM", "invalid compiler LLVM"]
+    for role in ["current", "previous"] {
+        for index in 0..modes.length {
+            let work = test.scratch(); let context = metrics.fixtureComparison(work, 2, 1)
+            context.control.mode = modes[index]; context.control.role = role
+            for name in ["current", "previous"] { writeTextFile(work + "/wall-comparison-" + name + ".ll", metrics.compilerLLVM()) }
+            let result = metrics.comparison(context)
+            if messages[index] != "" { rejects(result, messages[index]) } else { test.check(result.ok, result.error) }
+            let current = 3; if messages[index] != "" && role == "previous" { current = 2 }
+            let expected = [current, 3]
+            test.check(!context.control.active, "clock inactive after all timed sample modes")
+            for position in 0..2 { test.check(context.control.calls[position] == expected[position] && context.control.unlinks[position] == expected[position] && context.control.validations[position] == expected[position], "exact sample/unlink/validation counts") }
+            test.removeTree(work)
+        }
+    }
+}
+if selected("test_paired_limits_and_resource_budgets") || argumentCount() == 0 {
+    test.check(metrics.pairedBudget(paired(1.01, 1.05)).ok, "both paired limits inclusive")
+    for clock in ["wall", "cpu"] {
+        for index in 0..5 {
+            let candidate = paired(1.01, 1.05)
+            let entry = json.member(json.member(candidate, "summaries"), clock); let expected = "paired median"
+            if index == 0 { data.set(entry, "median", data.decimal(1.010001)) }
+            if index == 1 { data.set(entry, "median", data.decimal(1.02)) }
+            if index == 2 { data.set(json.member(entry, "confidence_interval"), "upper", data.decimal(1.050001)); expected = "paired 95% upper" }
+            if index == 3 { data.set(entry, "median", data.decimal(nan)) }
+            if index == 4 { data.set(json.member(entry, "confidence_interval"), "upper", data.decimal(infinity)); expected = "paired 95% upper" }
+            rejects(metrics.pairedBudget(candidate), expected)
+        }
+    }
+    test.check(metrics.RUNS == 100 && metrics.BATCHES == 3 && metrics.MAX_PEAK_RSS_MIB == 17.0 && metrics.MAX_INSTRUCTIONS == 75000000, "original full resource and sample budgets")
+    for clock in ["wall", "cpu"] {
+        let work = test.scratch(); let context = metrics.fixtureComparison(work, 2, 1); context.control.zeroClock = clock
+        rejects(metrics.comparison(context), "invalid same-input compiler duration"); test.removeTree(work)
+    }
+}
+if selected("test_comparison_identity_controls") {
+    for changed in ["current", "previous", "input", "runtime", "clang", "configuration", "flags", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET"] {
+        let work = test.scratch(); let context = metrics.fixtureComparison(work, 2, 1)
+        if changed == "runtime" { writeTextFile(context.runtime, "changed") }
+        else if changed == "configuration" { writeTextFile(work + "/build/.toolchain.json", "{}") }
+        else if changed == "flags" {
+            let stamp = json.parse(readTextFile(work + "/build/.toolchain.json"))
+            data.set(json.member(stamp, "flags"), "LLVM_FLAGS", data.text("-O3"))
+            writeTextFile(work + "/build/.toolchain.json", json.pretty(stamp, ""))
+        } else if changed == "SDKROOT" || changed == "MACOSX_DEPLOYMENT_TARGET" {
+            let manifest = json.parse(readTextFile(context.manifest))
+            data.set(json.member(manifest, "environment"), changed, data.text("changed SDK environment"))
+            writeTextFile(context.manifest, json.pretty(manifest, ""))
+        } else { writeTextFile(work + "/" + changed, "changed") }
+        let result = metrics.comparison(context)
+        test.check(!result.ok && context.control.calls[0] == 0 && context.control.calls[1] == 0, "changed artifact/toolchain/flags/SDK rejected before either compiler")
+        test.removeTree(work)
+    }
+}
+print("performance metric controls passed")
