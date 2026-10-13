@@ -1,0 +1,51 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "system" as system
+
+let clang = test.setting("CLANG", "clang")
+test.check(argumentCount() == 0 || argumentCount() == 2, "bounded configuration controls accept only --clang PATH")
+if argumentCount() == 2 { test.check(argument(0) == "--clang", "unknown bounded configuration option"); clang = argument(1) }
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "bounded configuration project directory")
+let root = test.lines(rootResult.output)[0]
+let environment = arguments.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
+for budget in [1, 32, 1024] {
+    for sanitized in [false, true] {
+        let index = 0
+        if sanitized { index = 1 }
+        let executable = work + "/bounded-" + Text(budget) + "-" + Text(index)
+        let command = [clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget)]
+        if sanitized { for flag in ["-O1", "-g", "-fsanitize=address,undefined"] { command.add(flag) } }
+        else { command.add("-O2") }
+        let frameCommand = command.slice(0, command.length)
+        for item in [root + "/tests/bounded-runtime.c", "-o", executable, "-lm"] { command.add(item) }
+        test.require(test.run(command, environment, root, executable + ".build", 60), "bounded runtime build")
+        let checked = test.run([executable], environment, root, executable + ".models", 120)
+        test.check(checked.status == 0, "bounded models/capacity recovery failed\n" + checked.output + checked.errorOutput)
+        let frames = work + "/frames-" + Text(budget) + "-" + Text(index)
+        for item in [root + "/tests/bounded-frame-retirement.c", "-o", frames, "-lm"] { frameCommand.add(item) }
+        test.require(test.run(frameCommand, environment, root, frames + ".build", 60), "bounded frame retirement build")
+        let retired = test.run([frames], environment, root, frames + ".models", 120)
+        test.check(retired.status == 0, "bounded frame models failed\n" + retired.output + retired.errorOutput)
+        let exhausted = test.run([executable, "oom"], environment, root, executable + ".oom", 30)
+        test.check(exhausted.status != 0, "oversized allocation unexpectedly succeeded")
+        test.check(test.contains(exhausted.errorOutput, "bounded heap is exhausted"), "bounded heap exhaustion diagnostic changed\n" + exhausted.errorOutput)
+        if sanitized {
+            let stale = test.run([executable, "stale"], environment, root, executable + ".stale", 30)
+            test.check(stale.status != 0, "stale pool read unexpectedly survived ASan")
+            test.check(test.contains(stale.errorOutput, "AddressSanitizer") && test.contains(stale.errorOutput, "use-after-poison"), "stale pool poison diagnostic changed\n" + stale.errorOutput)
+        }
+        let label = "native"
+        if sanitized { label = "ASan/UBSan" }
+        print("poll budget " + Text(budget) + ", " + label + ": models, capacity recovery and failure diagnostics passed")
+    }
+}
+let definitions = ["MINYAR_BOUNDED_HEAP_BYTES=1000", "MINYAR_BOUNDED_HEAP_BYTES=6000", "MINYAR_RC_POLL_BUDGET=0", "MINYAR_RC_POLL_BUDGET=1025"]
+let diagnostics = ["bounded heap", "power of two", "cleanup budget", "cleanup budget"]
+for index in 0..definitions.length {
+    let result = test.run([clang, "-std=c11", "-DMINYAR_BOUNDED_HEAP=1", "-D" + definitions[index], "-fsyntax-only", root + "/runtime/minyar_runtime.c"], environment, root, work + "/invalid-" + Text(index), 30)
+    test.check(result.status != 0 && test.contains(result.errorOutput, diagnostics[index]), "invalid bounded heap capacity/budget was not intentionally rejected\n" + result.errorOutput)
+}
+test.removeTree(work)
+print("invalid heap capacities and cleanup budgets rejected at compilation")

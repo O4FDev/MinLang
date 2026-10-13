@@ -1,0 +1,59 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "./system-test-build.min" as build
+use "system" as system
+
+let language = false
+let prebuilt = false
+let mode = "native"
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--language" { language = true }
+    else if option == "--prebuilt" { prebuilt = true }
+    else if option == "--mode" {
+        test.check(optionIndex + 1 < argumentCount(), "missing system services mode")
+        optionIndex += 1
+        mode = argument(optionIndex)
+    } else { fail("unknown system services option: " + option) }
+    optionIndex += 1
+}
+test.check(mode == "native" || mode == "sanitize", "unknown system services mode")
+let work = test.scratch()
+let root = build.root(work)
+let platform = build.platform(work)
+let windows = system.getenv("OS") == "Windows_NT" || test.contains(platform, "MSYS") || test.contains(platform, "MINGW") || test.contains(platform, "CYGWIN") || platform == "Windows"
+let binary = work + "/services"
+if windows { binary += ".exe" }
+let command = [test.setting("MINYAR_TEST_CLANG", "clang"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1"]
+if mode == "sanitize" { for flag in ["-g", "-fsanitize=address,undefined"] { command.add(flag) } }
+for value in [root + "/tests/system-services.c", "-o", binary] { command.add(value) }
+if windows { command.add("-lpsapi") }
+else if platform != "Darwin" { command.add("-lm") }
+test.require(test.run(command, system.environment(), root, binary + ".build", 30), "native system services build")
+let environment = arguments.environment(system.environment(), "MINYAR_SYSTEM_TEST", "snowman-☃")
+environment = arguments.environment(environment, "MINYAR_SYSTEM_EMPTY", "")
+environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=0")
+environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+environment = build.unset(environment, "MINYAR_SYSTEM_MISSING")
+let diagnostic = Bytes("diagnostic")
+diagnostic.add(0)
+diagnostic.addBytes(Bytes("λ\n"))
+for selected in ["environment", "limits", "signals", "stderr"] {
+    let result = test.run([binary, selected], environment, root, binary + "." + selected, 10)
+    test.check(result.status == 0, "system " + selected + " fixture failed\n" + result.errorOutput)
+    test.check(result.output == "", "system " + selected + " unexpectedly wrote stdout\n" + result.output)
+    let expected = ""
+    if selected == "stderr" { expected = Text(diagnostic) }
+    test.check(result.errorOutput == expected, "system " + selected + " stderr bytes changed")
+    print("system " + selected + ": passed")
+}
+if language {
+    build.buildLanguage(root, root + "/tests/system-services.min", binary, prebuilt, mode == "sanitize")
+    let result = test.run([binary], environment, root, binary + ".language", 10)
+    test.check(result.status == 0, "system services language fixture failed\n" + result.errorOutput)
+    test.check(result.output == "system services: passed\n", "system services language stdout changed\n" + result.output)
+    test.check(result.errorOutput == "system services: stderr λ\n", "system services language stderr changed")
+    print("system language services: passed")
+}
+test.removeTree(work)

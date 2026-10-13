@@ -1,0 +1,92 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "./tar-benchmark-support.min" as identity
+use "system" as system
+use "files" as files
+use "json" as json
+
+public function unset(environment: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = Bytes(name + "=")
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.length || Text(raw.slice(0, prefix.length)) != Text(prefix) { result.add(entry) }
+    }
+    return result
+}
+public function digest(path: Text): Text { return identity.digest(path) }
+public function quote(value: Text): Text { return identity.quote(value) }
+public function strings(values: List<Text>): Text { return identity.strings(values) }
+public function serialize(value: json.Value): Text { return identity.serialize(value) }
+public function root(work: Text): Text {
+    let result = test.run(["pwd", "-P"], system.environment(), "", work + "/project", 10)
+    test.require(result, "system fixture project directory")
+    return test.lines(result.output)[0]
+}
+public function platform(work: Text): Text {
+    let result = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+    test.require(result, "system fixture platform")
+    return identity.trim(result.output)
+}
+public function resolve(path: Text, work: Text): Text {
+    let result = test.run(["readlink", "-m", "-z", "--", path], system.environment(), "", work + "/resolve", 10)
+    test.require(result, "system fixture path resolution")
+    let bytes = Bytes(result.output)
+    test.check(bytes.length > 1 && bytes[bytes.length - 1] == 0, "invalid system fixture resolved path")
+    return Text(bytes.slice(0, bytes.length - 1))
+}
+public function commandPath(command: Text, work: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "command -v -- \"$1\"", "minyar", command], system.environment(), "", work + "/command-path", 10)
+    test.require(result, "system fixture compiler resolution")
+    let bytes = Bytes(result.output)
+    test.check(bytes.length > 1 && bytes[bytes.length - 1] == 10, "missing system fixture compiler path")
+    return resolve(Text(bytes.slice(0, bytes.length - 1)), work)
+}
+public function unbounded(command: List<Text>, cwd: Text, log: Text): test.Result {
+    let invocation = ["/bin/sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", log]
+    for item in command { invocation.add(item) }
+    return test.finish(system.spawn("/bin/sh", invocation, system.environment(), cwd), log)
+}
+function outputSuffix(binary: Text, suffix: Text): Text {
+    let bytes = Bytes(binary)
+    let start = 0
+    let dot = -1
+    for index in 0..bytes.length {
+        if bytes[index] == 47 || bytes[index] == 92 { start = index + 1; dot = -1 }
+        else if bytes[index] == 46 { dot = index }
+    }
+    if dot > start { return Text(bytes.slice(0, dot)) + suffix }
+    return binary + suffix
+}
+public function buildLanguage(root: Text, source: Text, binary: Text, prebuilt: Boolean, sanitize: Boolean) {
+    if !prebuilt {
+        test.require(test.run([root + "/minyar", source, "-o", binary], system.environment(), root, binary + ".build", 180), "system language production launcher")
+        return
+    }
+    let compiler = root + "/build/minyarc"
+    if files.pathSize(compiler) < 0 { compiler += ".exe" }
+    let before = digest(compiler)
+    let runtime = root + "/build/minyar-default-runtime.o"
+    let originalRuntime = digest(runtime)
+    let ir = outputSuffix(binary, ".ll")
+    print("prebuilt compiler " + before + " runtime " + originalRuntime)
+    let command = [compiler, source, ir, "--bounded-owners", "32", "--library", root + "/library"]
+    print("compile " + strings(command))
+    test.require(test.run(command, system.environment(), root, binary + ".compile", 120), "prebuilt system language compiler")
+    let environment = system.environment()
+    if sanitize {
+        runtime = outputSuffix(binary, ".runtime.o")
+        let flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+        command = [test.setting("MINYAR_TEST_CLANG", "clang"), "-std=c11"]
+        for flag in flags { command.add(flag) }
+        for item in ["-c", root + "/runtime/minyar_default_runtime.c", "-o", runtime] { command.add(item) }
+        test.require(test.run(command, system.environment(), root, binary + ".runtime", 60), "prebuilt sanitized system runtime")
+        environment = arguments.environment(environment, "MINYAR_CLANG_FLAGS", "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module")
+        environment = arguments.environment(environment, "MINYAR_NATIVE_FLAGS", "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer")
+    }
+    command = ["python3", root + "/tools/clang-driver.py", "link", root, ir, runtime, binary, "0"]
+    print("link " + strings(command))
+    test.require(test.run(command, environment, root, binary + ".link", 120), "prebuilt production system native link")
+    test.check(digest(compiler) == before, "prebuilt system compiler bytes changed")
+    test.check(digest(root + "/build/minyar-default-runtime.o") == originalRuntime, "prebuilt system runtime bytes changed")
+}

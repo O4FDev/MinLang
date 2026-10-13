@@ -1,0 +1,180 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as source
+use "./system-test-build.min" as build
+use "./tar-benchmark-support.min" as identity
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Context { root: Text; directory: Text; records: List<Text>; failures: List<Text>; serial: List<Integer> }
+function command(context: Context, args: List<Text>, name: Text): test.Result {
+    let invocation = ["/bin/sh", "-c", "exec \"$@\" 2>&1", "minyar"]
+    for arg in args { invocation.add(arg) }
+    let result = test.run(invocation, system.environment(), context.root, context.directory + "/" + name + ".capture", 60)
+    let log = context.directory + "/" + name + ".log"
+    writeBytesFile(log, Bytes(result.output))
+    context.records.add("{\"command\":" + build.strings(args) + ",\"exit_code\":" + Text(result.status) + ",\"log\":" + build.quote(name + ".log") + ",\"log_sha256\":" + build.quote(build.digest(log)) + "}")
+    return result
+}
+function check(context: Context, condition: Boolean, name: Text, detail: Text) {
+    if !condition { context.failures.add("{\"check\":" + build.quote(name) + ",\"detail\":" + build.quote(detail) + "}") }
+    let status = ": passed"
+    if !condition { status = ": FAILED" }
+    print(name + status)
+}
+function joined(values: List<Text>): Text {
+    let result = ""
+    for index in 0..values.length { if index > 0 { result += "," }; result += values[index] }
+    return result
+}
+function block(text: Text, begin: Text, end: Text, label: Text): Text {
+    let first = source.find(text, begin, 0)
+    test.check(first >= 0, "missing " + label)
+    let last = source.find(text, end, first + begin.byteLength)
+    test.check(last >= 0, "unterminated " + label)
+    return Text(Bytes(text).slice(first, last + end.byteLength))
+}
+function macro(text: Text, name: Text): Text {
+    let prefix = "#define " + name
+    for line in test.lines(text) {
+        let bytes = Bytes(line)
+        if source.starts(line, prefix) && bytes.length > prefix.byteLength && (bytes[prefix.byteLength] == 32 || bytes[prefix.byteLength] == 9) {
+            test.check(test.words(line).length >= 3, "reference macro has no value: " + name)
+            return line
+        }
+    }
+    fail("missing reference macro: " + name)
+}
+function compact(text: Text): Text {
+    let output = Bytes()
+    for byte in Bytes(text) { if byte != 32 && byte != 9 && byte != 10 && byte != 13 && byte != 11 && byte != 12 { output.add(byte) } }
+    return Text(output)
+}
+function wordByte(byte: Integer): Boolean {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95
+}
+function word(text: Text, needle: Text): Boolean {
+    let raw = Bytes(text)
+    let begin = 0
+    while begin <= raw.length {
+        let index = source.find(text, needle, begin)
+        if index < 0 { return false }
+        let end = index + needle.byteLength
+        if (index == 0 || !wordByte(raw[index - 1])) && (end == raw.length || !wordByte(raw[end])) { return true }
+        begin = index + 1
+    }
+    return false
+}
+function layout(context: Context, clang: Text, resource: Text, reference: Text, header: Text) {
+    let declaration = block(readTextFile(header), "typedef struct SystemKernelAction {", "} SystemKernelAction;", "provider kernel action declaration")
+    writeTextFile(context.directory + "/system-action.h", "#include <stdint.h>\n" + declaration + "\n")
+    let generic = readTextFile(reference + "/linux-v6.8-generic-signal.h")
+    let kernel = readTextFile(reference + "/linux-v6.8-kernel-signal.h")
+    let sigset = block(generic, "typedef struct {", "} sigset_t;", "pinned kernel signal set")
+    test.check(compact(sigset) == "typedefstruct{unsignedlongsig[_NSIG_WORDS];}sigset_t;", "pinned signal set declaration shape changed")
+    let action = block(kernel, "struct sigaction {", "\n};", "pinned kernel signal action")
+    let macros = ""
+    for name in ["_NSIG", "_NSIG_BPW", "_NSIG_WORDS"] { if macros != "" { macros += "\n" }; macros += macro(generic, name) }
+    let targets = ["x86_64-linux-gnu", "aarch64-linux-gnu"]
+    let headers = ["linux-v6.8-x86-signal.h", "linux-v6.8-arm64-signal.h"]
+    for index in 0..targets.length {
+        let restorer = macro(readTextFile(reference + "/" + headers[index]), "SA_RESTORER")
+        let generated = "#define __BITS_PER_LONG (__SIZEOF_LONG__ * 8)\n" + macros + "\n" + restorer + "\n#define __ARCH_HAS_SA_RESTORER\n" + "typedef void (*__sighandler_t)(int);\ntypedef void (*__sigrestore_t)(void);\n" + sigset + "\n" + action + "\n"
+        writeTextFile(context.directory + "/kernel-action.h", generated)
+        writeTextFile(context.directory + "/" + targets[index] + "-kernel-action.h", generated)
+        let args = [clang, "--target=" + targets[index], "-std=c11", "-ffreestanding", "-nostdinc", "-isystem", resource + "/include", "-I", context.directory, "-Wall", "-Wextra", "-Werror", "-fsyntax-only", context.root + "/tests/system-process-abi.c"]
+        let result = command(context, args, targets[index] + "-layout")
+        check(context, result.status == 0, targets[index] + " kernel layout", result.output)
+    }
+}
+function instrumentation(context: Context, clang: Text) {
+    let objdump = test.setting("MINYAR_TEST_OBJDUMP", "objdump")
+    let extras = ["-fsanitize-coverage=trace-pc-guard", "-fprofile-instr-generate", "-fcoverage-mapping", "-fstack-protector-all", "-finstrument-functions"]
+    for mode in ["native", "asan-ubsan", "tsan"] {
+        let sanitizer: List<Text> = []
+        if mode == "asan-ubsan" { sanitizer = ["-fsanitize=address,undefined"] }
+        if mode == "tsan" { sanitizer = ["-fsanitize=thread"] }
+        for optimization in ["O0", "O1", "O2"] {
+            let name = mode + "-" + optimization
+            let output = context.directory + "/" + name + ".o"
+            let args = [clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-" + optimization, "-g"]
+            for flag in sanitizer { args.add(flag) }
+            for flag in extras { args.add(flag) }
+            for item in ["-c", context.root + "/runtime/native/system.c", "-o", output] { args.add(item) }
+            let result = command(context, args, name + "-build")
+            check(context, result.status == 0, name + " compile", result.output)
+            if result.status != 0 { continue }
+            let assembly = command(context, [objdump, "-dr", "--disassemble=system_clone_child", output], name + "-disassembly")
+            let raw = assembly.output
+            check(context, assembly.status == 0 && test.contains(raw, "<system_clone_child>:") && (word(raw, "syscall") || word(raw, "svc")), name + " real child body", "")
+            check(context, !word(raw, "call") && !word(raw, "callq") && !word(raw, "bl") && !word(raw, "blr"), name + " zero child calls", "")
+            let excluded = true
+            for needle in ["__tsan", "__asan", "__ubsan", "__sanitizer", "__cyg_profile", "__stack_chk", "__llvm_profile", "@TPOFF", "@TLS", "%fs:", "%gs:"] { if test.contains(raw, needle) { excluded = false } }
+            check(context, excluded, name + " no instrumentation or TLS references", "")
+            let symbols = command(context, [objdump, "-t", output], name + "-symbols").output
+            if mode == "tsan" { check(context, test.contains(symbols, "__tsan_func_entry"), name + " TSan enabled outside child", "") }
+            if mode == "asan-ubsan" { check(context, test.contains(symbols, "__asan"), name + " ASan enabled outside child", "") }
+            let last = context.records.length - 1
+            let entry = context.records[last]
+            context.records[last] = Text(Bytes(entry).slice(0, entry.byteLength - 1)) + ",\"object_sha256\":" + build.quote(build.digest(output)) + "}"
+        }
+    }
+    let unsupported = command(context, [clang, "-std=c11", "-Wno-builtin-macro-redefined", "-D__has_attribute(x)=0", "-fsyntax-only", context.root + "/runtime/native/system.c"], "unsupported-attributes")
+    check(context, unsupported.status != 0 && test.contains(unsupported.output, "requires complete child instrumentation exclusion"), "unsupported exclusion capability fails closed", unsupported.output)
+}
+
+let checks = "all"
+let evidence = ""
+let evidenceGiven = false
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    test.check(optionIndex + 1 < argumentCount(), "missing system boundary option value")
+    optionIndex += 1
+    if option == "--checks" { checks = argument(optionIndex) }
+    else if option == "--evidence" { evidence = argument(optionIndex); evidenceGiven = true }
+    else { fail("unknown system process boundary option: " + option) }
+    optionIndex += 1
+}
+test.check(checks == "all" || checks == "abi" || checks == "instrumentation", "unknown system process boundary checks")
+let scratch = test.scratch()
+let root = build.root(scratch)
+let platform = build.platform(scratch)
+test.check(checks == "abi" || platform == "Linux", "native Linux child audits require a Linux host; target ABI controls use --checks abi")
+let directory = scratch
+if evidenceGiven {
+    test.check(evidence != "", "system boundary evidence directory must not already exist")
+    test.check(files.pathSize(evidence) < 0, "system boundary evidence directory must not already exist")
+    test.require(test.run(["mkdir", "-p", "--", evidence], system.environment(), root, scratch + "/mkdir", 10), "system boundary evidence directory")
+    directory = build.resolve(evidence, scratch)
+}
+let context = Context { root: root; directory: directory; records: []; failures: []; serial: [0] }
+let header = root + "/runtime/native/system_process.h"
+let sources: List<Text> = []
+for path in ["runtime/native/system_process.h", "runtime/native/system.c", "tests/system-process-abi.c", "tests/system-process-boundary.min", "tests/system-test-build.min"] { sources.add(build.quote(path) + ":" + build.quote(build.digest(root + "/" + path))) }
+let reference = root + "/tests/system-process-abi-reference"
+let references = json.parse(readTextFile(reference + "/sources.json"))
+test.check(references.kind == json.ARRAY, "system boundary pinned reference catalogue must be an array")
+for entry in references.items {
+    let name = json.string(entry, "file")
+    let expected = json.string(entry, "sha256")
+    test.check(build.digest(reference + "/" + name) == expected, "system boundary pinned kernel source identity changed: " + name)
+    sources.add(build.quote("tests/system-process-abi-reference/" + name) + ":" + build.quote(expected))
+}
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+command(context, [clang, "--version"], "clang-version")
+let resourceResult = build.unbounded([clang, "-print-resource-dir"], root, scratch + "/resource-directory")
+test.require(resourceResult, "system boundary compiler resource directory")
+let resource = identity.trim(resourceResult.output)
+let compiler = build.commandPath(clang, scratch)
+if checks == "abi" || checks == "all" { layout(context, clang, resource, reference, header) }
+if checks == "instrumentation" || checks == "all" { instrumentation(context, clang) }
+let created = test.run(["date", "-u", "+%Y-%m-%dT%H:%M:%S.%6N+00:00"], system.environment(), root, scratch + "/created", 10)
+test.require(created, "system boundary UTC timestamp")
+let host = test.run(["uname", "-a"], system.environment(), root, scratch + "/host", 10)
+test.require(host, "system boundary host description")
+writeTextFile(directory + "/receipt.json", "{\"created_utc\":" + build.quote(identity.trim(created.output)) + ",\"checks\":" + build.quote(checks) + ",\"host\":" + build.quote(identity.trim(host.output)) + ",\"compiler\":" + build.quote(compiler) + ",\"compiler_sha256\":" + build.quote(build.digest(compiler)) + ",\"sources\":{" + joined(sources) + "},\"references\":" + build.serialize(references) + ",\"commands\":[" + joined(context.records) + "],\"failures\":[" + joined(context.failures) + "],\"native_aarch64_execution\":false}\n")
+print("boundary controls: " + Text(context.failures.length) + " failures")
+let failed = context.failures.length > 0
+test.removeTree(scratch)
+if failed { fail("system process boundary controls failed") }
