@@ -308,7 +308,7 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
-    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage', 'peer-research-semantics', 'peer-research-reachability')
+    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage', 'peer-research-semantics', 'peer-research-reachability', 'fuzz')
     run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
 
     compiler_reports = {}
@@ -334,7 +334,7 @@ def main() -> int:
         commands.append(([str(ROOT / "build/tooling/tests/linkage"), "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], suite_env, 180))
         commands.append(([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
                           "--output-dir", str(directory / "numeric")], suite_env, 180))
-        commands.append(([sys.executable, "tests/fuzz.py", "--cases", "200", "--program-cases", "40",
+        commands.append(([str(ROOT / "build/tooling/tests/fuzz"), "--cases", "200", "--program-cases", "40",
                           "--output-dir", str(directory / "fuzz")], suite_env, 180))
         # Both instrumentation orders must preserve exact compiler output.
         commands.append(([str(compiler), "build/compiler.min", str(directory / "self.ll")], suite_env, 180))

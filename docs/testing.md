@@ -494,9 +494,9 @@ corpus must be nonempty; success, unexpected statuses and internal failures
 all fail its replay.
 
 ```sh
-python3 tests/fuzz.py --cases 2000 --program-cases 40 --seed 0x20261002 \
+./build/tooling/tests/fuzz --cases 2000 --program-cases 40 --seed 0x20261002 \
   --output-dir /tmp/minyar-fuzz-evidence
-python3 tests/fuzz-harness.py
+make check-fuzz-harness
 ```
 
 Campaign directories retain sources, expected output, emitted LLVM, executables
