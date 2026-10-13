@@ -48,11 +48,11 @@ check-sanitize check-quic-sanitize: check-net-udp-offload-sanitize
 OS_TLS_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
 OS_TLS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call OS_TLS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
 OS_TLS_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG))):$(PATH),$(PATH))
-check-os-tlsverify: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-tlsverify.py
+check-os-tlsverify: build/minyarc build/tooling/tests/os-tlsverify-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/os-tlsverify-test
 
-check-os-tlsverify-sanitize: build/minyarc tools/toolchain.sh
-	PATH="$(OS_TLS_SANITIZER_PATH)" MINYAR_CLANG=$(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/os-tlsverify.py --sanitize
+check-os-tlsverify-sanitize: build/minyarc tools/toolchain.sh build/tooling/tests/os-tlsverify-test
+	PATH="$(OS_TLS_SANITIZER_PATH)" MINYAR_CLANG=$(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/os-tlsverify-test --sanitize
 
 check check-portable: check-os-tlsverify
 check-sanitize: check-os-tlsverify-sanitize

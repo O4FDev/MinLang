@@ -1,0 +1,223 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+record Case { name: Text; certificate: Text; host: Text; accepted: Boolean; intermediate: Text; mutual: Boolean; identity: Text }
+record Literal { name: Text; certificate: Text; host: Text; sni: Text; accepted: Boolean }
+record Served { output: Text; peer: Boolean; names: List<Text>; errors: Text }
+
+function body(): Text {
+    let parts = ["Minyar spoke authenticated TLS 1.3: ", "ééé", " "]
+    for index in 0..40000 { parts.add("x") }
+    return joinText(parts)
+}
+function serve(context: fixtures.Context, ca: fixtures.Authority, peer: Text, certificate: Text, intermediate: Text, mutual: Boolean, sni: Text): fixtures.Process {
+    let chain = fixtures.path(ca, certificate, "pem")
+    if intermediate != "" {
+        chain = fixtures.path(ca, certificate, "chain")
+        let joined = readBytesFile(fixtures.path(ca, certificate, "pem"))
+        joined.addBytes(readBytesFile(fixtures.path(ca, intermediate, "pem")))
+        writeBytesFile(chain, joined)
+    }
+    let roots = "-"
+    if mutual { roots = fixtures.path(ca, "root", "pem") }
+    return fixtures.launch(context, [peer, "server", chain, fixtures.path(ca, certificate, "key"), "http/1.1", roots, sni, context.work + "/body"], 30)
+}
+function finished(process: fixtures.Process): Served {
+    let result = fixtures.collect(process)
+    test.check(result.status == 0, "local TLS server did not shut down (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    let names: List<Text> = []
+    let errors: List<Text> = []
+    let peer = false
+    for line in test.lines(result.output) {
+        if fixtures.starts(line, "SNI ") { names.add(Text(Bytes(line).slice(4, line.byteLength))) }
+        if fixtures.starts(line, "ERROR ") { errors.add(line) }
+        if line == "PEER present" { peer = true }
+    }
+    return Served { output: result.output; peer: peer; names: names; errors: joinText(errors) }
+}
+function accepted(result: test.Result, expected: Text): Boolean {
+    return result.status == 0 && test.contains(result.output, "200 OK") && test.contains(result.output, expected)
+}
+function literalSni(context: fixtures.Context, ca: fixtures.Authority, peer: Text, program: Text, expected: Text) {
+    let addresses = fixtures.options()
+    addresses.san = "DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1"
+    fixtures.leaf(ca, "literal-addresses", "root", addresses)
+    let mismatch = fixtures.options()
+    mismatch.san = "IP:192.0.2.1,IP:2001:db8::1"
+    fixtures.leaf(ca, "literal-mismatch", "root", mismatch)
+    fixtures.leaf(ca, "literal-untrusted", "untrusted", addresses)
+    let cases = [Literal { name: "DNS retains SNI"; certificate: "literal-addresses"; host: "localhost"; sni: "localhost"; accepted: true },
+        Literal { name: "IPv4 omits SNI"; certificate: "literal-addresses"; host: "127.0.0.1"; sni: "-"; accepted: true },
+        Literal { name: "IPv6 omits SNI"; certificate: "literal-addresses"; host: "::1"; sni: "-"; accepted: true },
+        Literal { name: "expanded IPv6 omits SNI"; certificate: "literal-addresses"; host: "0:0:0:0:0:0:0:1"; sni: "-"; accepted: true },
+        Literal { name: "DNS requires DNS SAN"; certificate: "literal-mismatch"; host: "localhost"; sni: "localhost"; accepted: false },
+        Literal { name: "IPv4 requires matching IP SAN"; certificate: "literal-mismatch"; host: "127.0.0.1"; sni: "-"; accepted: false },
+        Literal { name: "IPv6 requires matching IP SAN"; certificate: "literal-mismatch"; host: "::1"; sni: "-"; accepted: false },
+        Literal { name: "IPv4 requires trusted issuer"; certificate: "literal-untrusted"; host: "127.0.0.1"; sni: "-"; accepted: false },
+        Literal { name: "IPv6 requires trusted issuer"; certificate: "literal-untrusted"; host: "::1"; sni: "-"; accepted: false }]
+    let failures: List<Text> = []
+    for item in cases {
+        let server = serve(context, ca, peer, item.certificate, "", false, item.sni)
+        let port = fixtures.ready(context, server)
+        let result = fixtures.run(context, [program, Text(port), item.host, fixtures.path(ca, "root", "der")], 20)
+        let served = finished(server)
+        let success = accepted(result, expected)
+        let saw = served.names.length > 0
+        for name in served.names { if name != item.sni { saw = false } }
+        let rejected = result.status == 1 && (test.contains(result.output, "invalid certificate chain or hostname") || test.contains(result.output, "did not verify"))
+        let observed = joinText(served.names)
+        if success != item.accepted || result.errorOutput != "" || !saw || (!item.accepted && !rejected) {
+            failures.add(item.name + ": accepted=" + Text(success) + " expected=" + Text(item.accepted) + " sni=" + observed + " expected_sni=" + item.sni +
+                " code=" + Text(result.status) + " stdout=" + Text(Bytes(result.output).slice(0, min(300, result.output.byteLength))) + " stderr=" + result.errorOutput + " peer=" + served.errors + "\n")
+        }
+        let verdict = "rejected"
+        if success { verdict = "accepted" }
+        print("TLS " + item.name + ": observed_sni=" + observed + " " + verdict)
+    }
+    test.check(failures.length == 0, joinText(failures))
+}
+
+fixtures.arguments(["--sanitize", "--literal-sni-only"], [])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+if fixtures.flag("--sanitize") {
+    for name in ["MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { context.environment = fixtures.withSetting(context.environment, name, "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer") }
+}
+let expected = body()
+writeTextFile(context.work + "/body", expected)
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+fixtures.root(ca, "untrusted")
+let peer = fixtures.opensslPeer(context)
+let program = context.work + "/client.exe"
+if fixtures.flag("--literal-sni-only") {
+    fixtures.compileProgram(context, "tests/tls-client.min", program)
+    literalSni(context, ca, peer, program, expected)
+    print("TLS literal SNI and certificate authentication checks passed")
+    fixtures.finish(context)
+    exit(0)
+}
+fixtures.openssl(context, ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
+    "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,digitalSignature",
+    "-addext", "extendedKeyUsage=serverAuth", "-addext", "subjectAltName=DNS:localhost",
+    "-keyout", fixtures.path(ca, "self-signed", "key"), "-out", fixtures.path(ca, "self-signed", "pem")])
+fixtures.leaf(ca, "valid", "root", fixtures.options())
+fixtures.leaf(ca, "ec", "root", fixtures.ec("serverAuth"))
+let wrongHost = fixtures.options()
+wrongHost.san = "DNS:attacker.invalid"
+fixtures.leaf(ca, "wrong-host", "root", wrongHost)
+fixtures.leaf(ca, "expired", "root", fixtures.expired(fixtures.options()))
+fixtures.leaf(ca, "future", "root", fixtures.future(fixtures.options()))
+fixtures.leaf(ca, "client-only", "root", fixtures.usage("clientAuth"))
+let commonName = fixtures.options()
+commonName.san = ""
+fixtures.leaf(ca, "cn-only", "root", commonName)
+let wildcard = fixtures.options()
+wildcard.san = "DNS:*.example.test"
+fixtures.leaf(ca, "wildcard", "root", wildcard)
+let intermediate = fixtures.options()
+intermediate.ca = true
+fixtures.leaf(ca, "intermediate", "root", intermediate)
+fixtures.leaf(ca, "device", "root", fixtures.usage("clientAuth"))
+fixtures.leaf(ca, "ec-device", "root", fixtures.ec("clientAuth"))
+fixtures.leaf(ca, "unknown-issuer", "untrusted", fixtures.options())
+fixtures.leaf(ca, "via-intermediate", "intermediate", fixtures.options())
+fixtures.leaf(ca, "not-ca", "root", fixtures.options())
+fixtures.leaf(ca, "via-not-ca", "not-ca", fixtures.options())
+let expiredIntermediate = fixtures.expired(fixtures.options())
+expiredIntermediate.ca = true
+fixtures.leaf(ca, "expired-intermediate", "root", expiredIntermediate)
+fixtures.leaf(ca, "via-expired-intermediate", "expired-intermediate", fixtures.options())
+fixtures.leaf(ca, "untrusted-device", "untrusted", fixtures.usage("clientAuth"))
+for curve in ["384", "521"] {
+    let server = fixtures.options()
+    server.curve = "P-" + curve
+    fixtures.leaf(ca, "p" + curve, "root", server)
+    let device = fixtures.ec("clientAuth")
+    device.curve = "P-" + curve
+    fixtures.leaf(ca, "p" + curve + "-device", "root", device)
+}
+let critical = fixtures.options()
+critical.extra = "1.2.3.4=critical,DER:05:00"
+fixtures.leaf(ca, "unknown-critical", "root", critical)
+let constrained = fixtures.options()
+constrained.ca = true
+constrained.extra = "nameConstraints=critical,permitted;DNS:.example.test"
+fixtures.leaf(ca, "constrained-intermediate", "root", constrained)
+fixtures.leaf(ca, "violates-constraints", "constrained-intermediate", fixtures.options())
+let satisfies = fixtures.options()
+satisfies.san = "DNS:device.example.test"
+fixtures.leaf(ca, "satisfies-constraints", "constrained-intermediate", satisfies)
+let corrupted = readBytesFile(fixtures.path(ca, "valid", "der"))
+corrupted[corrupted.length - 1] = corrupted[corrupted.length - 1] ^ 1
+writeBytesFile(fixtures.path(ca, "bad-signature", "der"), corrupted)
+writeBytesFile(fixtures.path(ca, "bad-signature", "key"), readBytesFile(fixtures.path(ca, "valid", "key")))
+fixtures.openssl(context, ["x509", "-inform", "DER", "-in", fixtures.path(ca, "bad-signature", "der"), "-out", fixtures.path(ca, "bad-signature", "pem")])
+let fetch = context.work + "/fetch.exe"
+fixtures.compileProgram(context, "tests/tls-client.min", program)
+fixtures.compileProgram(context, "examples/fetch/main.min", fetch)
+let cases = [Case { name: "trusted RSA"; certificate: "valid"; host: "localhost"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "trusted ECDSA"; certificate: "ec"; host: "localhost"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "trusted ECDSA P-384"; certificate: "p384"; host: "localhost"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "trusted ECDSA P-521"; certificate: "p521"; host: "localhost"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "IP subjectAltName"; certificate: "valid"; host: "127.0.0.1"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "wildcard single label"; certificate: "wildcard"; host: "device.example.test"; accepted: true; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "full intermediate chain"; certificate: "via-intermediate"; host: "localhost"; accepted: true; intermediate: "intermediate"; mutual: false; identity: "" },
+    Case { name: "permitted name constraint"; certificate: "satisfies-constraints"; host: "device.example.test"; accepted: true; intermediate: "constrained-intermediate"; mutual: false; identity: "" },
+    Case { name: "wrong hostname"; certificate: "wrong-host"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "expired leaf"; certificate: "expired"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "not yet valid leaf"; certificate: "future"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "wrong extended key usage"; certificate: "client-only"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "unknown issuer"; certificate: "unknown-issuer"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "untrusted self-signed leaf"; certificate: "self-signed"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "missing intermediate"; certificate: "via-intermediate"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "issuer is not a CA"; certificate: "via-not-ca"; host: "localhost"; accepted: false; intermediate: "not-ca"; mutual: false; identity: "" },
+    Case { name: "expired intermediate"; certificate: "via-expired-intermediate"; host: "localhost"; accepted: false; intermediate: "expired-intermediate"; mutual: false; identity: "" },
+    Case { name: "forged certificate issuer signature"; certificate: "bad-signature"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "unknown critical extension"; certificate: "unknown-critical"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "violated name constraint"; certificate: "violates-constraints"; host: "localhost"; accepted: false; intermediate: "constrained-intermediate"; mutual: false; identity: "" },
+    Case { name: "common name without SAN"; certificate: "cn-only"; host: "localhost"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "wildcard multiple labels"; certificate: "wildcard"; host: "a.b.example.test"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "wildcard bare suffix"; certificate: "wildcard"; host: "example.test"; accepted: false; intermediate: ""; mutual: false; identity: "" },
+    Case { name: "required client certificate absent"; certificate: "valid"; host: "localhost"; accepted: false; intermediate: ""; mutual: true; identity: "" },
+    Case { name: "RSA mutual TLS"; certificate: "valid"; host: "localhost"; accepted: true; intermediate: ""; mutual: true; identity: "device" },
+    Case { name: "ECDSA mutual TLS"; certificate: "valid"; host: "localhost"; accepted: true; intermediate: ""; mutual: true; identity: "ec-device" },
+    Case { name: "ECDSA P-384 mutual TLS"; certificate: "valid"; host: "localhost"; accepted: true; intermediate: ""; mutual: true; identity: "p384-device" },
+    Case { name: "ECDSA P-521 mutual TLS"; certificate: "valid"; host: "localhost"; accepted: true; intermediate: ""; mutual: true; identity: "p521-device" },
+    Case { name: "untrusted client identity"; certificate: "valid"; host: "localhost"; accepted: false; intermediate: ""; mutual: true; identity: "untrusted-device" },
+    Case { name: "client identity has server-only usage"; certificate: "valid"; host: "localhost"; accepted: false; intermediate: ""; mutual: true; identity: "valid" },
+    Case { name: "client certificate/key mismatch"; certificate: "valid"; host: "localhost"; accepted: false; intermediate: ""; mutual: true; identity: "device" }]
+for item in cases {
+    let server = serve(context, ca, peer, item.certificate, item.intermediate, item.mutual, "*")
+    let port = fixtures.ready(context, server)
+    let command = [program, Text(port), item.host, fixtures.path(ca, "root", "der")]
+    if item.identity != "" {
+        let key = item.identity
+        if item.name == "client certificate/key mismatch" { key = "valid" }
+        command.add(fixtures.path(ca, item.identity, "der"))
+        command.add(fixtures.path(ca, key, "pk8"))
+    }
+    let result = fixtures.run(context, command, 20)
+    let served = finished(server)
+    let success = accepted(result, expected)
+    let crashed = result.status >= 124 || result.errorOutput != ""
+    test.check(success == item.accepted && (item.accepted || !crashed), item.name + ": acceptance=" + Text(success) + ", expected=" + Text(item.accepted) + ", code=" + Text(result.status) + "\n" +
+        Text(Bytes(result.output).slice(0, min(500, result.output.byteLength))) + "\n" + result.errorOutput + "\n" + served.errors)
+    test.check(!(item.accepted && item.mutual) || served.peer, item.name + ": server saw no client certificate")
+    let verdict = "rejected"
+    if item.accepted { verdict = "accepted" }
+    print("TLS " + item.name + ": " + verdict)
+}
+literalSni(context, ca, peer, program, expected)
+let server = serve(context, ca, peer, "unknown-issuer", "", false, "*")
+let port = fixtures.ready(context, server)
+let fetched = fixtures.run(context, [fetch, "https://localhost:" + Text(port) + "/"], 20)
+finished(server)
+test.check(fetched.status == 1 && !test.contains(fetched.output, "200 OK") && test.contains(fetched.output, "TLS failed:"), "portable HTTP accepted an untrusted issuer: " + fetched.output)
+print("TLS portable HTTP default OS trust: untrusted issuer rejected")
+let protocol = context.work + "/protocol.exe"
+fixtures.compileProgram(context, "tests/tls-protocol.min", protocol)
+let checked = fixtures.run(context, [protocol, fixtures.path(ca, "root", "der"), fixtures.path(ca, "valid", "der"), fixtures.path(ca, "valid", "pk8"), fixtures.path(ca, "ec", "der")], 60)
+test.check(checked.status == 0 && checked.errorOutput == "", "TLS protocol regressions: " + checked.output + " " + checked.errorOutput)
+print(fixtures.strip(checked.output))
+print("TLS 1.3 certificate, mutual authentication, and adversarial protocol checks passed")
+fixtures.finish(context)

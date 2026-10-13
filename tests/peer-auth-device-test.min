@@ -1,0 +1,51 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+record Case { name: Text; issuer: Text; san: Text; usage: Text; validity: Text; device: Text; exit: Text; revoked: Text; expected: Text }
+
+fixtures.arguments(["--sanitize"], [])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+if sanitize { context.environment = fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1") }
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+fixtures.root(ca, "unknown-root")
+fixtures.leaf(ca, "server", "root", fixtures.options())
+let device = "URI:hearth://device/device-a"
+let cases = [Case { name: "good"; issuer: "root"; san: device; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "BOUND device-a exit-a" },
+    Case { name: "wrong-device"; issuer: "root"; san: "URI:hearth://device/device-b"; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "BIND_ERROR 11" },
+    Case { name: "no-uri"; issuer: "root"; san: "DNS:device-a"; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "BIND_ERROR 11" },
+    Case { name: "uri-suffix"; issuer: "root"; san: "URI:hearth://device/device-a/evil"; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "BIND_ERROR 11" },
+    Case { name: "two-uri"; issuer: "root"; san: "URI:hearth://device/device-a,URI:hearth://device/device-b"; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "BIND_ERROR 11" },
+    Case { name: "unknown-ca"; issuer: "unknown-root"; san: device; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "TLS_ERROR" },
+    Case { name: "wrong-eku"; issuer: "root"; san: device; usage: "serverAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "TLS_ERROR" },
+    Case { name: "expired"; issuer: "root"; san: device; usage: "clientAuth"; validity: "expired"; device: "device-a"; exit: "exit-a"; revoked: "live"; expected: "TLS_ERROR" },
+    Case { name: "revoked"; issuer: "root"; san: device; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "revoked"; expected: "BIND_ERROR 11" },
+    Case { name: "revocation-update"; issuer: "root"; san: device; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit-a"; revoked: "revoke-after-bind"; expected: "BIND_REVOKED" },
+    Case { name: "invalid-registry-exit"; issuer: "root"; san: device; usage: "clientAuth"; validity: "valid"; device: "device-a"; exit: "exit/a"; revoked: "live"; expected: "BIND_ERROR 11" }]
+for item in cases {
+    let options = fixtures.ec(item.usage)
+    options.san = item.san
+    if item.validity == "expired" { options = fixtures.expired(options) }
+    fixtures.leaf(ca, item.name, item.issuer, options)
+}
+let binary = context.work + "/server"
+fixtures.compileProgram(context, "tests/peer-auth-device.min", binary)
+let peer = fixtures.opensslPeer(context)
+for item in cases {
+    let server = fixtures.launch(context, [binary, fixtures.path(ca, "server", "der"), fixtures.path(ca, "server", "pk8"), fixtures.path(ca, "root", "der"), item.device, item.exit, item.revoked], 20)
+    let port = fixtures.ready(context, server)
+    let client = fixtures.run(context, [peer, "client", Text(port), fixtures.path(ca, "root", "pem"), "localhost", "hearth-peer-test", "-", fixtures.path(ca, item.name, "pem"), fixtures.path(ca, item.name, "key"), ""], 15)
+    let response = ""
+    if client.status == 0 { response = client.output }
+    let served = fixtures.collect(server)
+    test.check(test.contains(served.output, item.expected), item.name + " " + Text(served.status) + "\n" + served.output + served.errorOutput)
+    let status = 0
+    if item.expected == "TLS_ERROR" { status = 1 }
+    test.check(served.status == status, item.name + " server status " + Text(served.status) + "\n" + served.errorOutput)
+    let wanted = ""
+    if fixtures.starts(item.expected, "BOUND ") { wanted = "bound" }
+    test.check(response == wanted, item.name + " response " + response + "\n" + client.errorOutput)
+}
+print("Peer device auth: " + Text(cases.length) + " actual independent OpenSSL mTLS/registry/revocation cases passed")
+fixtures.finish(context)

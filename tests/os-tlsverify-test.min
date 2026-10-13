@@ -1,0 +1,28 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let program = "use \"tls\" as tls\nuse \"tlsverify\" as trust\nuse \"aes\" as aes\n\nfor certificates in [Bytes(), Bytes(128)] {\n    if trust.chain(\"localhost\", certificates, Bytes()) == \"\" { fail(\"server trust accepted\") }\n    if trust.clientChain(certificates, Bytes()) == \"\" { fail(\"client trust accepted\") }\n    if trust.currentCertificateExpiry(certificates) != 0 { fail(\"positive certificate expiry\") }\n    if trust.currentCertificateExpiry(certificates) > trust.currentTimeMilliseconds() { fail(\"current peer identity\") }\n    if trust.signature(certificates, 0x0403, Bytes(), Bytes()) { fail(\"signature accepted\") }\n    if trust.sign(certificates, 0x0403, Bytes()).length != 0 { fail(\"signature produced\") }\n    if trust.p256Public(certificates).length != 0 { fail(\"public key produced\") }\n    if trust.p256(certificates, Bytes(65)).length != 0 { fail(\"shared secret produced\") }\n}\nif trust.p256Key().length != 0 { fail(\"private key produced\") }\nif trust.currentTimeMilliseconds() != 0 { fail(\"clock fabricated\") }\nif aes.encrypt(Bytes(16), Bytes(12), Bytes(), Bytes()).length != 0 { fail(\"ciphertext produced\") }\nif aes.decrypt(Bytes(16), Bytes(12), Bytes(), Bytes(16)).length != 0 { fail(\"plaintext accepted\") }\nif aes.block(Bytes(16), Bytes(16)).length != 0 { fail(\"block produced\") }\nprint(\"os-tlsverify: unavailable\")\n"
+
+fixtures.arguments(["--sanitize"], ["--source"])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let source = fixtures.option("--source", context.root)
+if !fixtures.starts(source, "/") { source = context.root + "/" + source }
+let leaks = "detect_leaks=0"
+let uname = fixtures.execute(context, ["uname", "-s"], 10, "uname")
+if fixtures.strip(uname.output) == "Linux" { leaks = "detect_leaks=1" }
+context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks + ":halt_on_error=1"), "UBSAN_OPTIONS", "halt_on_error=1")
+let fixture = context.work + "/trust.min"
+writeTextFile(fixture, program)
+for architecture in ["x86_64", "arm64"] {
+    for mode in ["--debug", "--release"] {
+        let binary = context.work + "/" + architecture + mode + ".exe"
+        let command = [source + "/minyar", mode, "--library", source + "/os/arch/" + architecture, fixture, "-o", binary]
+        print(joinText([command[0], " ", mode, " --library ", command[3], " ", fixture, " -o ", binary]))
+        let built = test.run(command, context.environment, source, fixtures.logPath(context, "build"), 180)
+        test.check(built.status == 0, architecture + " " + mode + " build failed (" + Text(built.status) + ")\n" + built.output + built.errorOutput)
+        let result = test.run([binary], context.environment, source, fixtures.logPath(context, "run"), 10)
+        test.check(result.status == 0 && result.output == "os-tlsverify: unavailable\n" && result.errorOutput == "", architecture + " " + mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+        print(architecture + " " + mode + ": compatibility and rejection passed")
+    }
+}
+fixtures.finish(context)
