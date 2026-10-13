@@ -45,9 +45,13 @@ check-formats-pipeline: build/minyarc
 check-formats-pipeline-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/formats.py --sanitize
 
-.PHONY: check-erofs check-erofs-reference
-check-erofs: build/minyarc tests/erofs.min tests/erofs-api.min tests/erofs-thread-main.min tests/erofs-thread-worker.min tests/erofs-thread-helper.min tests/erofs-thread-legacy.min tests/erofs-thread-legacy-helper.min
+.PHONY: check-erofs check-erofs-reference check-erofs-layers
+check-erofs: build/minyarc tests/erofs.min tests/erofs-api.min tests/erofs-thread-main.min tests/erofs-thread-worker.min tests/erofs-thread-helper.min tests/erofs-thread-legacy.min tests/erofs-thread-legacy-helper.min tests/erofs-layers.sh tests/erofs-layers.min tests/erofs-layer-driver.min tests/erofs-tree.c tests/erofs-layers-thread-main.min tests/erofs-layers-thread-worker.min tests/erofs-layers-thread-helper.min tests/erofs-layers-thread-legacy.min tests/erofs-layers-thread-legacy-helper.min library/erofs.min runtime/native/erofs.c runtime/native/erofs_layers.h
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) bash tests/erofs.sh
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) bash tests/erofs-layers.sh
+
+check-erofs-layers: build/minyarc tests/erofs-layers.sh tests/erofs-layers.min tests/erofs-layer-driver.min tests/erofs-tree.c tests/erofs-layers-thread-main.min tests/erofs-layers-thread-worker.min tests/erofs-layers-thread-helper.min tests/erofs-layers-thread-legacy.min tests/erofs-layers-thread-legacy-helper.min library/erofs.min runtime/native/erofs.c runtime/native/erofs_layers.h
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) bash tests/erofs-layers.sh
 
 check-erofs-reference:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" bash tests/erofs-reference.sh
