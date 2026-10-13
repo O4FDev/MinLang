@@ -1,0 +1,116 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./cpython-random.min" as random
+use "files" as files
+
+function acceptsManagedGraph(context: test.Compiler, source: Text) {
+    let result = test.compile(context, source)
+    test.check(result.status == 0, "managed graph compilation failed\n" + result.errorOutput)
+    let llvm = context.directory + "/case" + Text(context.serial) + ".ll"
+    test.check(files.pathSize(llvm) >= 0, "managed graph emitted no LLVM")
+    test.check(test.contains(readTextFile(llvm), "; minyar-cycle-runtime: 1\n"), "managed graph lacks the cycle runtime marker")
+}
+function lines(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(value + "\n") }
+    return joinText(parts)
+}
+function listed(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length { if index > 0 { parts.add(", ") }; parts.add(values[index]) }
+    return joinText(parts)
+}
+
+let names = ["test_fresh_return_calls_preserve_caller_temporaries", "test_empty_literal_context_flows_through_nested_calls_and_add", "test_nested_literal_type_context_cannot_accept_void_or_wrong_scalars", "test_generated_shared_recursive_graphs_and_escaping_aliases", "test_constructor_borrow_survives_later_argument_replacement", "test_recursive_borrow_escapes_after_ancestor_replacement", "test_module_aliases_cannot_hide_cycle_write", "test_module_identity_keeps_unrelated_outer_list_mutable", "test_nested_list_write_inside_helper_cannot_hide_cycle", "test_empty_recursive_lists_are_not_mutable_through_return_alias"]
+let family = "ProductionMemory"
+let selectors = port.selectors(family, names)
+let context = port.compiler()
+
+if port.selected(selectors, family, "test_fresh_return_calls_preserve_caller_temporaries") {
+    let expected = ["4001140022", "5001150022", "6001160026", "7001170012800118001280017"]
+    for i in 0..8 { expected.add(Text(90000 + i) + Text(91003 + i)) }
+    port.executes(context, "function fresh(n: Integer): Text { return Text(n) }\nfunction nested(n: Integer): Text { return fresh(n) }\nfunction recursive(n: Integer, depth: Integer): Text {\nif depth == 0 { return fresh(n) }\nreturn recursive(n + 1, depth - 1)\n}\nfunction pair(n: Integer): Text { return fresh(n) + nested(n + 1) }\nfunction compose(n: Integer): Text { return pair(n) + recursive(n + 2, 4) }\nprint(fresh(40011) + fresh(40022))\nprint(fresh(50011) + nested(50022))\nprint(fresh(60011) + recursive(60022, 4))\nprint(pair(70011) + compose(80011))\nlet i = 0\nwhile i < 8 {\nprint(fresh(90000 + i) + recursive(91000 + i, 3))\ni = i + 1\n}\n",
+        lines(expected), 0, "")
+}
+if port.selected(selectors, family, "test_empty_literal_context_flows_through_nested_calls_and_add") {
+    port.executes(context, "record Node { children: List<Node> }\nfunction nodes(values: List<Node>): List<Node> { return values }\nfunction layers(values: List<List<Node>>): List<List<Node>> { return values }\nfunction first(values: List<List<Node>>, fallback: List<Node>): List<Node> {\nif values.length > 0 { return values[0] }\nreturn fallback\n}\nlet a = nodes([])\nlet b = layers([nodes([]), []])\nprint(a.length)\nprint(b.length)\nprint(first(layers([[]]), nodes([])).length)\nlet ordinary: List<List<Integer>> = []\nordinary.add([])\nordinary.add([1, 2])\nprint(ordinary[0].length)\nprint(ordinary[1][1])\nprint(joinText([]))\n",
+        "0\n2\n0\n0\n2\n\n", 0, "")
+}
+if port.selected(selectors, family, "test_nested_literal_type_context_cannot_accept_void_or_wrong_scalars") {
+    port.rejects(context, "function count(values: List<List<Integer>>): Integer { return values.length }\nprint(count([[print(1)]]))\n", "Nothing cannot be stored in a List")
+    port.rejects(context, "function count(values: List<List<Integer>>): Integer { return values.length }\nprint(count([[true]]))\n", "all values in a List literal must have the same type")
+}
+if port.selected(selectors, family, "test_generated_shared_recursive_graphs_and_escaping_aliases") {
+    for seed in 0..8 {
+        let generator = random.seeded(Text(seed + 19061))
+        let source = ["record Node { value: Integer; children: List<Node> }", "record Wrapper { node: Node }", "function score(node: Node): Integer {", "let result = node.value", "let i = 0", "while i < node.children.length {", "result = result + score(node.children[i])", "i = i + 1", "}", "return result", "}", "function make(): List<Wrapper> {"]
+        let scores: List<Integer> = []
+        for node in 0..24 {
+            let children: List<Integer> = []
+            if node > 0 {
+                let count = random.below(generator, 4)
+                for draw in 0..count { children.add(random.below(generator, node)) }
+            }
+            let value = random.below(generator, 101) - 50
+            let total = value
+            let references: List<Text> = []
+            for child in children { total += scores[child]; references.add("n" + Text(child)) }
+            scores.add(total)
+            source.add("let children" + Text(node) + ": List<Node> = [" + listed(references) + "]")
+            source.add("let n" + Text(node) + " = Node { value: " + Text(value) + "; children: children" + Text(node) + " }")
+        }
+        let selected: List<Integer> = []
+        for draw in 0..6 { selected.add(random.below(generator, 24)) }
+        let wrappers: List<Text> = []
+        for node in selected { wrappers.add("Wrapper { node: n" + Text(node) + " }") }
+        for value in ["return [" + listed(wrappers) + "]", "}", "let values = make()", "let alias = values"] { source.add(value) }
+        let savedSteps: List<Integer> = []
+        let savedScores: List<Integer> = []
+        for step in 0..24 {
+            let slot = random.below(generator, 6)
+            let other = random.below(generator, 6)
+            if step % 3 != 0 {
+                source.add("alias[" + Text(slot) + "] = values[" + Text(other) + "]")
+                selected[slot] = selected[other]
+            } else {
+                source.add("let saved" + Text(step) + " = values[" + Text(slot) + "].node")
+                savedSteps.add(step)
+                savedScores.add(scores[selected[slot]])
+            }
+        }
+        let expected: List<Text> = []
+        source.add("values = []")
+        for index in 0..savedSteps.length { source.add("print(score(saved" + Text(savedSteps[index]) + "))"); expected.add(Text(savedScores[index])) }
+        source.add("alias = []")
+        for index in 0..savedSteps.length { source.add("print(score(saved" + Text(savedSteps[index]) + "))"); expected.add(Text(savedScores[index])) }
+        port.executes(context, lines(source), lines(expected), 0, "")
+    }
+}
+if port.selected(selectors, family, "test_constructor_borrow_survives_later_argument_replacement") {
+    port.executes(context, "record Node { name: Text; children: List<Node> }\nrecord Wrapper { node: Node }\nrecord Pair { first: Node; second: Node }\nfunction leaf(name: Text): Node { return Node { name: name; children: [] } }\nfunction replace(values: List<Wrapper>): Node {\nvalues[0] = Wrapper { node: leaf(\"new\" + \"!\") }\nreturn leaf(\"second\" + \"!\")\n}\nlet values: List<Wrapper> = [Wrapper { node: leaf(\"old\" + \"!\") }]\nlet pair = Pair { first: values[0].node; second: replace(values) }\nprint(pair.first.name)\nprint(pair.second.name)\nprint(values[0].node.name)\nlet tree: List<Node> = [values[0].node, replace(values)]\nprint(tree[0].name)\nprint(tree[1].name)\n",
+        "old!\nsecond!\nnew!\nnew!\nsecond!\n", 0, "")
+}
+if port.selected(selectors, family, "test_recursive_borrow_escapes_after_ancestor_replacement") {
+    port.executes(context, "record Node { text: Text; children: List<Node> }\nfunction leaf(text: Text): Node { return Node { text: text; children: [] } }\nfunction pick(node: Node, depth: Integer): Node {\nif depth == 0 { return node }\nreturn pick(node.children[0], depth - 1)\n}\nfunction take(node: Node): Node {\nlet result = pick(node, 2)\nnode = leaf(\"replacement\" + \"!\")\nreturn result\n}\nfunction make(): Node {\nlet shared = leaf(\"survivor\" + \"!\")\nlet middle = Node { text: \"middle\"; children: [shared, shared] }\nreturn Node { text: \"root\"; children: [middle, middle] }\n}\nlet root = make()\nlet survivor = take(root)\nroot = leaf(\"new root\" + \"!\")\nprint(survivor.text)\nprint(root.text)\n",
+        "survivor!\nnew root!\n", 0, "")
+}
+if port.selected(selectors, family, "test_module_aliases_cannot_hide_cycle_write") {
+    writeTextFile(context.directory + "/node.min", "public record Node { children: List<Node> }\npublic function empty(): Node { return Node { children: [] } }\n")
+    test.check(files.makeDirectory(context.directory + "/nested") == 0, "cannot create nested module directory")
+    for write in ["children.add(node)", "children[0] = node"] {
+        acceptsManagedGraph(context, "use \"./node.min\" as a\nuse \"./nested/../node.min\" as b\nlet children: List<a.Node> = [a.empty()]\nlet node = b.Node { children: children }\n" + write + "\n")
+    }
+}
+if port.selected(selectors, family, "test_module_identity_keeps_unrelated_outer_list_mutable") {
+    writeTextFile(context.directory + "/tree.min", "public record Node { children: List<Node>; text: Text }\npublic function leaf(text: Text): Node { return Node { children: []; text: text } }\n")
+    writeTextFile(context.directory + "/wrapper.min", "use \"./tree.min\" as t\npublic record Node { tree: t.Node }\n")
+    port.executes(context, "use \"./tree.min\" as tree\nuse \"./wrapper.min\" as wrapper\nlet values: List<wrapper.Node> = []\nvalues.add(wrapper.Node { tree: tree.leaf(\"one\") })\nlet saved = values[0].tree\nvalues[0] = wrapper.Node { tree: tree.leaf(\"two\") }\nprint(saved.text)\nprint(values[0].tree.text)\n",
+        "one\ntwo\n", 0, "")
+}
+if port.selected(selectors, family, "test_nested_list_write_inside_helper_cannot_hide_cycle") {
+    acceptsManagedGraph(context, "record Node { layers: List<List<Node>> }\nfunction attach(target: List<Node>, node: Node) { target.add(node) }\nlet inner: List<Node> = []\nlet layers: List<List<Node>> = [inner]\nlet node = Node { layers: layers }\nattach(inner, node)\n")
+}
+if port.selected(selectors, family, "test_empty_recursive_lists_are_not_mutable_through_return_alias") {
+    acceptsManagedGraph(context, "record Node { children: List<Node> }\nfunction identity(values: List<Node>): List<Node> { return values }\nlet values: List<Node> = []\nlet node = Node { children: values }\nidentity(values).add(node)\n")
+}
+test.removeTree(context.directory)
