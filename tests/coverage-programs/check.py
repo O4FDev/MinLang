@@ -17,6 +17,7 @@ CLANG = os.environ.get('MINYAR_TEST_CLANG', 'clang')
 FLAGS = shlex.split(os.environ.get('MINYAR_TEST_LINK_FLAGS', ''))
 SUITES = ('callbacks', 'errors-language', 'errors-values', 'thread-compiler',
           'incremental-language-hardening', 'incremental-modules')
+NATIVE_SUITES = {'errors-values', 'c-layout-records'}
 CASES = {
     'nested': '7\n-1\n',
     'ownership': '0\nfresh text\n3\n',
@@ -40,8 +41,10 @@ def main():
     suites = list(SUITES)
     if (ROOT / 'compiler/stages/c-layout.min').is_file():
         suites.append('c-layout-records')
+    checked(['make', '-s', *['build/tooling/tests/' + suite for suite in suites if suite in NATIVE_SUITES]], cwd=ROOT, env=environment)
     for suite in suites:
-        result = checked([sys.executable, str(ROOT / 'tests' / (suite + '.py'))],
+        command = [str(ROOT / 'build/tooling/tests' / suite)] if suite in NATIVE_SUITES else [sys.executable, str(ROOT / 'tests' / (suite + '.py'))]
+        result = checked(command,
                          cwd=ROOT, env=environment)
         print(suite + ': passed', flush=True)
     with tempfile.TemporaryDirectory(prefix='minyar-integrated-coverage-') as temporary:
