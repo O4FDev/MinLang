@@ -16,9 +16,13 @@ build/ci-glfw/source/src/nsgl_context.m: build/ci-glfw/glfw.tar.gz build/tooling
 .PHONY: prepare-macos-graphics
 prepare-macos-graphics: build/ci-glfw/source/src/nsgl_context.m
 	test "$$(uname -s)" = Darwin
-	cmake -S build/ci-glfw/source -B build/ci-glfw/objects -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(CURDIR)/build/ci-glfw/install" -DBUILD_SHARED_LIBS=OFF -DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF
-	cmake --build build/ci-glfw/objects --parallel 2
-	cmake --install build/ci-glfw/objects
+	$(MAKE) prepare-glfw-provider
+
+.PHONY: prepare-glfw-provider
+prepare-glfw-provider: build/ci-glfw/source/src/nsgl_context.m
+	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake -S build/ci-glfw/source -B build/ci-glfw/objects -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(CURDIR)/build/ci-glfw/install" -DBUILD_SHARED_LIBS=OFF -DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF $(CI_GLFW_CMAKE_FLAGS)
+	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake --build build/ci-glfw/objects --parallel 2
+	env -u CFLAGS -u CPPFLAGS -u LDLIBS cmake --install build/ci-glfw/objects
 
 .PHONY: check-glfw-software-source
 check-glfw-software-source: build/tooling/tests/glfw-software-source build/tooling/tools/glfw-software-source build/ci-glfw/glfw.tar.gz
