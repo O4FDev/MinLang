@@ -387,7 +387,7 @@ def main():
                 Check('module-compiler-bootstrap-behavior', compiler_behavior('module-compiler'),
                       goals=['build/module-compiler-stage3.ll'], group='correctness'),
                 Check('runtime-unit', ['./build/runtime-unit'], goals=['build/runtime-unit'], group='correctness'),
-                Check('bootstrap-portability-gcc', [python, 'tests/bootstrap-portability.py'], group='correctness',
+                Check('bootstrap-portability-gcc', ['./build/tooling/tests/bootstrap-portability'], goals=['build/tooling/tests/bootstrap-portability', 'build/compiler.min'], group='correctness',
                       extra_env={'MINYAR_TEST_BOOTSTRAP_CC': 'gcc'}))
         # The leak replay reruns the sanitized runtime unit binary and the focused profiles' fixtures.
         if (sanitize and correctness) or 'leaks' in selected:
