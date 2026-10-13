@@ -1,0 +1,221 @@
+use "../tools/testing.min" as test
+use "../experiments/memory/measurement-stats.min" as stats
+use "./cpython-random.min" as random
+use "json" as json
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "MeasurementStats." + name { return true } }
+    return false
+}
+function require(outcome: stats.Outcome): stats.Summary {
+    test.check(outcome.ok && outcome.error == "", "measurement summary failed: " + outcome.error)
+    return outcome.summary
+}
+function rejected(outcome: stats.Outcome) { test.check(!outcome.ok && outcome.error != "", "expected runtime measurement ValueError equivalent") }
+function floatsEqual(actual: List<Float>, expected: List<Float>, name: Text) {
+    test.check(actual.length == expected.length, name + " length")
+    for index in 0..actual.length { test.check(actual[index] == expected[index], name + " position " + Text(index)) }
+}
+function integersEqual(actual: List<Integer>, expected: List<Integer>, name: Text) {
+    test.check(actual.length == expected.length, name + " length")
+    for index in 0..actual.length { test.check(actual[index] == expected[index], name + " position " + Text(index)) }
+}
+function ordinaryMedian(values: List<Integer>): Float {
+    let ordered = values.sorted()
+    let middle = ordered.length / 2
+    if ordered.length % 2 != 0 { return Float(ordered[middle]) }
+    return (Float(ordered[middle - 1]) + Float(ordered[middle])) / 2.0
+}
+function sameSummary(first: stats.Summary, second: stats.Summary) {
+    test.check(first.sampleCount == second.sampleCount && first.median == second.median && first.minimum == second.minimum && first.maximum == second.maximum, "repeatable complete paired summary")
+    floatsEqual(first.ratios, second.ratios, "repeatable paired ratios")
+    let left = first.confidenceInterval
+    let right = second.confidenceInterval
+    test.check(left.level == right.level && left.lower == right.lower && left.upper == right.upper && left.method == right.method && left.quantileMethod == right.quantileMethod && left.seed == right.seed && left.resamples == right.resamples && left.assumption == right.assumption, "repeatable complete bootstrap interval")
+}
+function uniformOracle() {
+    let corpus = json.parse(readTextFile(test.setting("MINYAR_UNIFORM_CORPUS", "tests/fixtures/cpython-uniform.json")))
+    let seeds = ["0", "1", "7", "19", "31", "20261002", "-7", "18446744073709551617"]
+    test.check(corpus.kind == json.OBJECT && corpus.keys.length == 8, "CPython uniform corpus seed domain")
+    let draws = 0
+    for seed in seeds {
+        let expected = json.member(corpus, seed)
+        test.check(expected.kind == json.ARRAY && expected.items.length == 700, "CPython uniform corpus must cross twist boundaries")
+        let generator = random.seeded(seed)
+        for index in 0..expected.items.length {
+            let pair = expected.items[index]
+            test.check(pair.kind == json.ARRAY && pair.items.length == 2 && pair.items[0].kind == json.NUMBER && pair.items[1].kind == json.NUMBER, "CPython uniform exact rational fixture")
+            let numerator = Integer(pair.items[0].number)
+            let denominator = Integer(pair.items[1].number)
+            let actual = random.uniform(generator)
+            test.check(actual == Float(numerator) / Float(denominator), "CPython exact53bit uniform seed " + seed + " draw " + Text(index))
+            draws += 1
+        }
+    }
+    test.check(draws == 5600, "all exact CPython uniform draws retained")
+}
+function summaryOracle(summary: stats.Summary, index: Integer) {
+    let corpus = json.parse(readTextFile(test.setting("MINYAR_MEASUREMENT_SUMMARY_CORPUS", "tests/fixtures/measurement-summary.json")))
+    test.check(corpus.kind == json.ARRAY && corpus.items.length == 2, "CPython paired summary oracle domain")
+    test.check(json.pretty(stats.summaryJSON(summary), "") == json.pretty(corpus.items[index], ""), "exact CPython paired summary metadata/ratio/interval " + Text(index))
+}
+function inputsJSON(source: Text): List<stats.Input> {
+    let parsed = json.parse(source)
+    test.check(parsed.kind == json.ARRAY, "measurement qualification input array")
+    let values: List<stats.Input> = []
+    for value in parsed.items {
+        if value.kind == json.NUMBER { values.add(stats.floatValue(value.number)) }
+        else if value.kind == json.BOOLEAN { values.add(stats.booleanValue(value.truth)) }
+        else if value.kind == json.STRING { values.add(stats.textValue(value.text)) }
+        else { test.check(value.kind == json.NULL, "measurement qualification scalar input"); values.add(stats.nullValue()) }
+    }
+    return values
+}
+if argumentCount() > 0 && argument(0) == "--random-uniform" {
+    test.check(argumentCount() == 3, "--random-uniform SEED COUNT")
+    let generator = random.seeded(argument(1))
+    let count = Integer(argument(2))
+    test.check(count > 0, "positive qualification draw count")
+    for index in 0..count { print(Integer(random.uniform(generator) * 9007199254740992.0)) }
+    exit(0)
+}
+if argumentCount() > 0 && argument(0) == "--summary-json" {
+    test.check(argumentCount() == 5, "--summary-json NUMERATOR_JSON DENOMINATOR_JSON SEED RESAMPLES")
+    let result = require(stats.pairedCpuRatioSummary(inputsJSON(argument(1)), inputsJSON(argument(2)), stats.integerValue(Integer(argument(3))), stats.integerValue(Integer(argument(4)))))
+    print(json.pretty(stats.summaryJSON(result), ""))
+    exit(0)
+}
+let names = ["test_adjacent_pairs_differ_from_separate_medians", "test_identical_pairs_have_exact_unit_interval", "test_known_scale_is_invariant_to_duration_units", "test_bootstrap_resamples_pairs_and_reports_its_method", "test_local_seed_is_repeatable_and_does_not_change_global_rng", "test_one_pair_keeps_exact_observation", "test_extreme_observations_are_retained", "test_large_finite_ratios_do_not_overflow_their_median", "test_invalid_values_are_rejected_in_either_language", "test_empty_or_mismatched_pairs_are_rejected", "test_overflowed_or_underflowed_ratios_are_rejected", "test_invalid_bootstrap_parameters_are_rejected"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "MeasurementStats." + name { valid = true } }
+    test.check(valid, "unknown measurement statistics case " + argument(index))
+}
+let globalGenerator = random.seeded("20261002")
+for draw in 0..37 { random.uniform(globalGenerator) }
+let cases = 0
+if chosen("test_adjacent_pairs_differ_from_separate_medians") {
+    let numerator = [10, 20, 30]
+    let denominator = [1, 100, 10]
+    let beforeNumerator: List<Integer> = []
+    let beforeDenominator: List<Integer> = []
+    for value in numerator { beforeNumerator.add(value) }
+    for value in denominator { beforeDenominator.add(value) }
+    let result = require(stats.integerSummary(numerator, denominator, 7, 1000))
+    test.check(result.sampleCount == 3, "adjacent paired sample count")
+    floatsEqual(result.ratios, [10.0, 0.2, 3.0], "position-preserving paired ratios")
+    test.check(result.median == 3.0, "median of paired ratios")
+    test.check(ordinaryMedian(numerator) / ordinaryMedian(denominator) == 2.0, "separate medians have a different ratio")
+    test.check(result.minimum == 0.2 && result.maximum == 10.0, "full paired range")
+    integersEqual(numerator, beforeNumerator, "numerator input preservation")
+    integersEqual(denominator, beforeDenominator, "denominator input preservation")
+    cases += 1
+}
+if chosen("test_identical_pairs_have_exact_unit_interval") {
+    let result = require(stats.defaultSummary(stats.integers([1, 10, 1000]), stats.integers([1, 10, 1000])))
+    test.check(result.median == 1.0, "identical pairs median")
+    floatsEqual(result.ratios, [1.0, 1.0, 1.0], "identical pairs ratios")
+    test.check(result.minimum == 1.0 && result.maximum == 1.0, "identical pairs full range")
+    test.check(result.confidenceInterval.lower == 1.0 && result.confidenceInterval.upper == 1.0 && result.confidenceInterval.level == 0.95, "identical pairs exact unit95percent interval")
+    test.check(result.confidenceInterval.seed == 20261002 && result.confidenceInterval.resamples == 10000, "original bootstrap defaults")
+    cases += 1
+}
+if chosen("test_known_scale_is_invariant_to_duration_units") {
+    let scales = 0
+    for units in [1, 1000, 1000000] {
+        let result = require(stats.integerSummary([5 * units, 10 * units, 50 * units], [4 * units, 8 * units, 40 * units], 31, 200))
+        floatsEqual(result.ratios, [1.25, 1.25, 1.25], "duration-unit invariant paired ratios")
+        test.check(result.median == 1.25 && result.confidenceInterval.lower == 1.25 && result.confidenceInterval.upper == 1.25, "duration-unit invariant median/interval")
+        scales += 1
+    }
+    test.check(scales == 3, "all duration scales")
+    cases += 1
+}
+if chosen("test_bootstrap_resamples_pairs_and_reports_its_method") {
+    let result = require(stats.integerSummary([1, 4], [1, 1], 7, 1000))
+    test.check(result.median == 2.5, "two-pair median")
+    let interval = result.confidenceInterval
+    test.check(interval.lower == 1.0 && interval.upper == 4.0, "two-pair bootstrap endpoint distribution")
+    test.check(interval.seed == 7 && interval.resamples == 1000, "explicit bootstrap controls")
+    test.check(interval.method == "percentile bootstrap of paired-ratio medians", "bootstrap method metadata")
+    test.check(interval.quantileMethod == "linear interpolation", "bootstrap quantile method")
+    summaryOracle(require(stats.integerSummary([1, 4], [1, 1], 7, 41)), 1)
+    test.check(stats.percentile([1.0, 2.5, 4.0], 0.25) == 1.75, "linear interpolation between bootstrap observations")
+    cases += 1
+}
+if chosen("test_local_seed_is_repeatable_and_does_not_change_global_rng") {
+    let before: List<Integer> = []
+    for word in globalGenerator.words { before.add(word) }
+    let position = globalGenerator.position[0]
+    let first = require(stats.integerSummary([3, 4, 9, 7], [1, 3, 2, 5], 19, 211))
+    let second = require(stats.integerSummary([3, 4, 9, 7], [1, 3, 2, 5], 19, 211))
+    sameSummary(first, second)
+    integersEqual(globalGenerator.words, before, "ambient global RNG state")
+    test.check(globalGenerator.position[0] == position, "ambient global RNG cursor")
+    test.check(first.sampleCount == 4 && first.ratios.length == 4, "repeatable full paired observation count")
+    summaryOracle(first, 0)
+    uniformOracle()
+    integersEqual(globalGenerator.words, before, "uniform qualification global RNG isolation")
+    test.check(globalGenerator.position[0] == position, "uniform qualification global RNG cursor")
+    cases += 1
+}
+if chosen("test_one_pair_keeps_exact_observation") {
+    let result = require(stats.integerSummary([2], [4], 1, 100))
+    floatsEqual(result.ratios, [0.5], "one-pair retained observation")
+    test.check(result.median == 0.5 && result.confidenceInterval.lower == 0.5 && result.confidenceInterval.upper == 0.5, "one-pair exact interval")
+    cases += 1
+}
+if chosen("test_extreme_observations_are_retained") {
+    let result = require(stats.integerSummary([1, 1, 1, 1000000], [1, 1, 1, 1], 7, 1000))
+    test.check(result.sampleCount == 4, "outlier observation count")
+    floatsEqual(result.ratios, [1.0, 1.0, 1.0, 1000000.0], "untrimmed complete ratios")
+    test.check(result.maximum == 1000000.0, "extreme observation must remain in full range")
+    cases += 1
+}
+if chosen("test_large_finite_ratios_do_not_overflow_their_median") {
+    let result = require(stats.floatSummary([1e308, 1e308], [1.0, 1.0], 7, 100))
+    test.check(result.median == 1e308 && result.confidenceInterval.lower == 1e308 && result.confidenceInterval.upper == 1e308, "overflow-safe finite median and interval")
+    cases += 1
+}
+if chosen("test_invalid_values_are_rejected_in_either_language") {
+    let zero = 0.0
+    let bad = [stats.integerValue(0), stats.integerValue(-1), stats.floatValue(zero / zero), stats.floatValue(1.0 / zero), stats.floatValue(-1.0 / zero), stats.booleanValue(true), stats.textValue("1"), stats.nullValue()]
+    let rejectedValues = 0
+    for value in bad {
+        rejected(stats.defaultSummary([stats.integerValue(1), value, stats.integerValue(2)], stats.integers([1, 1, 1])))
+        rejected(stats.defaultSummary(stats.integers([1, 1, 1]), [stats.integerValue(1), value, stats.integerValue(2)]))
+        rejectedValues += 2
+    }
+    test.check(rejectedValues == 16, "all invalid values on both sides")
+    cases += 1
+}
+if chosen("test_empty_or_mismatched_pairs_are_rejected") {
+    let empty: List<stats.Input> = []
+    rejected(stats.defaultSummary(empty, empty))
+    rejected(stats.defaultSummary(stats.integers([1]), empty))
+    rejected(stats.defaultSummary(empty, stats.integers([1])))
+    rejected(stats.defaultSummary(stats.integers([1, 2]), stats.integers([1])))
+    cases += 1
+}
+if chosen("test_overflowed_or_underflowed_ratios_are_rejected") {
+    rejected(stats.defaultSummary(stats.floats([1e308]), stats.floats([1e-308])))
+    rejected(stats.defaultSummary(stats.floats([1e-308]), stats.floats([1e308])))
+    cases += 1
+}
+if chosen("test_invalid_bootstrap_parameters_are_rejected") {
+    let resamples = [stats.integerValue(0), stats.integerValue(-1), stats.booleanValue(true), stats.floatValue(1.5)]
+    let rejectedParameters = 0
+    for value in resamples {
+        rejected(stats.pairedCpuRatioSummary(stats.integers([1]), stats.integers([1]), stats.integerValue(stats.DEFAULT_BOOTSTRAP_SEED), value))
+        rejectedParameters += 1
+    }
+    let seeds = [stats.booleanValue(true), stats.floatValue(1.5), stats.textValue("7")]
+    for value in seeds {
+        rejected(stats.pairedCpuRatioSummary(stats.integers([1]), stats.integers([1]), value, stats.integerValue(stats.DEFAULT_BOOTSTRAP_RESAMPLES)))
+        rejectedParameters += 1
+    }
+    test.check(rejectedParameters == 7, "all invalid bootstrap parameter kinds")
+    cases += 1
+}
+if argumentCount() == 0 { test.check(cases == 12, "all twelve measurement statistics tests") }
+print("Measurement statistics: passed")

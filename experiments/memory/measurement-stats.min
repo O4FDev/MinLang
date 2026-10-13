@@ -1,0 +1,145 @@
+use "../../tests/cpython-random.min" as random
+use "json" as json
+public constant DEFAULT_BOOTSTRAP_SEED = 20261002
+public constant DEFAULT_BOOTSTRAP_RESAMPLES = 10000
+public constant NULL_INPUT = 0
+public constant INTEGER_INPUT = 1
+public constant FLOAT_INPUT = 2
+public constant BOOLEAN_INPUT = 3
+public constant TEXT_INPUT = 4
+public constant UNREPRESENTABLE_INPUT = 5
+public record Input { kind: Integer; integer: Integer; number: Float; text: Text }
+public function integerValue(value: Integer): Input {
+    return Input { kind: INTEGER_INPUT; integer: value; number: 0.0; text: Text(value) }
+}
+public function floatValue(value: Float): Input {
+    return Input { kind: FLOAT_INPUT; integer: 0; number: value; text: "" }
+}
+public function booleanValue(value: Boolean): Input {
+    return Input { kind: BOOLEAN_INPUT; integer: 0; number: 0.0; text: Text(value) }
+}
+public function textValue(value: Text): Input {
+    return Input { kind: TEXT_INPUT; integer: 0; number: 0.0; text: value }
+}
+public function nullValue(): Input {
+    return Input { kind: NULL_INPUT; integer: 0; number: 0.0; text: "" }
+}
+public function unrepresentableInteger(value: Text): Input {
+    return Input { kind: UNREPRESENTABLE_INPUT; integer: 0; number: 0.0; text: value }
+}
+public record Interval { level: Float; lower: Float; upper: Float; method: Text; quantileMethod: Text; seed: Integer; resamples: Integer; assumption: Text }
+public record Summary { sampleCount: Integer; median: Float; ratios: List<Float>; minimum: Float; maximum: Float; confidenceInterval: Interval }
+public record Outcome { ok: Boolean; error: Text; summary: Summary }
+record Durations { ok: Boolean; error: Text; values: List<Float> }
+function failure(message: Text): Outcome {
+    let interval = Interval { level: 0.0; lower: 0.0; upper: 0.0; method: ""; quantileMethod: ""; seed: 0; resamples: 0; assumption: "" }
+    return Outcome { ok: false; error: message; summary: Summary { sampleCount: 0; median: 0.0; ratios: []; minimum: 0.0; maximum: 0.0; confidenceInterval: interval } }
+}
+public function finite(value: Float): Boolean { return value == value && value - value == 0.0 }
+function positiveDurations(values: List<Input>, label: Text): Durations {
+    let durations: List<Float> = []
+    for index in 0..values.length {
+        let value = values[index]
+        let location = label + "[" + Text(index) + "]"
+        if value.kind == UNREPRESENTABLE_INPUT { return Durations { ok: false; error: location + " must be representable as a finite number"; values: [] } }
+        if value.kind != INTEGER_INPUT && value.kind != FLOAT_INPUT { return Durations { ok: false; error: location + " must be a positive finite number"; values: [] } }
+        let duration = value.number
+        if value.kind == INTEGER_INPUT { duration = Float(value.integer) }
+        if !finite(duration) || duration <= 0.0 { return Durations { ok: false; error: location + " must be a positive finite number"; values: [] } }
+        durations.add(duration)
+    }
+    return Durations { ok: true; error: ""; values: durations }
+}
+public function median(values: List<Float>): Float {
+    let ordered = values.sorted()
+    let middle = ordered.length / 2
+    if ordered.length % 2 != 0 { return ordered[middle] }
+    let lower = ordered[middle - 1]
+    let upper = ordered[middle]
+    return lower + (upper - lower) / 2.0
+}
+public function percentile(ordered: List<Float>, probability: Float): Float {
+    let position = Float(ordered.length - 1) * probability
+    let lower = Integer(position)
+    let upper = lower + 1
+    if upper >= ordered.length { upper = ordered.length - 1 }
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - Float(lower))
+}
+public function pairedCpuRatioSummary(numeratorCpuNs: List<Input>, denominatorCpuNs: List<Input>, seed: Input, resamples: Input): Outcome {
+    if seed.kind != INTEGER_INPUT { return failure("bootstrap seed must be an integer") }
+    if resamples.kind != INTEGER_INPUT || resamples.integer <= 0 { return failure("bootstrap resamples must be a positive integer") }
+    let numerator = positiveDurations(numeratorCpuNs, "numerator_cpu_ns")
+    if !numerator.ok { return failure(numerator.error) }
+    let denominator = positiveDurations(denominatorCpuNs, "denominator_cpu_ns")
+    if !denominator.ok { return failure(denominator.error) }
+    if numerator.values.length != denominator.values.length || numerator.values.length == 0 { return failure("timing measurements need the same nonzero number of pairs") }
+    let ratios: List<Float> = []
+    for index in 0..numerator.values.length {
+        let ratio = numerator.values[index] / denominator.values[index]
+        if !finite(ratio) || ratio <= 0.0 { return failure("each pair ratio must be representable as a positive finite number") }
+        ratios.add(ratio)
+    }
+    let generator = random.seeded(Text(seed.integer))
+    let count = ratios.length
+    let bootstrap: List<Float> = []
+    for unused in 0..resamples.integer {
+        let sample: List<Float> = []
+        for draw in 0..count { sample.add(ratios[Integer(random.uniform(generator) * Float(count))]) }
+        bootstrap.add(median(sample))
+    }
+    bootstrap.sort()
+    let minimum = ratios[0]
+    let maximum = ratios[0]
+    for ratio in ratios {
+        if ratio < minimum { minimum = ratio }
+        if ratio > maximum { maximum = ratio }
+    }
+    let interval = Interval { level: 0.95; lower: percentile(bootstrap, 0.025); upper: percentile(bootstrap, 0.975); method: "percentile bootstrap of paired-ratio medians"; quantileMethod: "linear interpolation"; seed: seed.integer; resamples: resamples.integer; assumption: "Observed pairs are resampled as independent observations." }
+    return Outcome { ok: true; error: ""; summary: Summary { sampleCount: count; median: median(ratios); ratios: ratios; minimum: minimum; maximum: maximum; confidenceInterval: interval } }
+}
+public function defaultSummary(numeratorCpuNs: List<Input>, denominatorCpuNs: List<Input>): Outcome {
+    return pairedCpuRatioSummary(numeratorCpuNs, denominatorCpuNs, integerValue(DEFAULT_BOOTSTRAP_SEED), integerValue(DEFAULT_BOOTSTRAP_RESAMPLES))
+}
+public function floats(values: List<Float>): List<Input> {
+    let result: List<Input> = []
+    for value in values { result.add(floatValue(value)) }
+    return result
+}
+public function integers(values: List<Integer>): List<Input> {
+    let result: List<Input> = []
+    for value in values { result.add(integerValue(value)) }
+    return result
+}
+public function floatSummary(numeratorCpuNs: List<Float>, denominatorCpuNs: List<Float>, seed: Integer, resamples: Integer): Outcome {
+    return pairedCpuRatioSummary(floats(numeratorCpuNs), floats(denominatorCpuNs), integerValue(seed), integerValue(resamples))
+}
+public function integerSummary(numeratorCpuNs: List<Integer>, denominatorCpuNs: List<Integer>, seed: Integer, resamples: Integer): Outcome {
+    return pairedCpuRatioSummary(integers(numeratorCpuNs), integers(denominatorCpuNs), integerValue(seed), integerValue(resamples))
+}
+function jsonNumber(text: Text, number: Float): json.Value {
+    return json.Value { kind: json.NUMBER; text: text; number: number; truth: false; items: []; keys: [] }
+}
+function jsonText(text: Text): json.Value {
+    return json.Value { kind: json.STRING; text: text; number: 0.0; truth: false; items: []; keys: [] }
+}
+function jsonObject(keys: List<Text>, values: List<json.Value>): json.Value {
+    return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: values; keys: keys }
+}
+public function summaryJSON(summary: Summary): json.Value {
+    let ratios: List<json.Value> = []
+    for ratio in summary.ratios { ratios.add(jsonNumber(Text(ratio), ratio)) }
+    let interval = summary.confidenceInterval
+    let confidence = jsonObject(["level", "lower", "upper", "method", "quantile_method", "seed", "resamples", "assumption"], [
+        jsonNumber(Text(interval.level), interval.level),
+        jsonNumber(Text(interval.lower), interval.lower),
+        jsonNumber(Text(interval.upper), interval.upper),
+        jsonText(interval.method),
+        jsonText(interval.quantileMethod),
+        jsonNumber(Text(interval.seed), Float(interval.seed)),
+        jsonNumber(Text(interval.resamples), Float(interval.resamples)),
+        jsonText(interval.assumption)
+    ])
+    let range = jsonObject(["minimum", "maximum"], [jsonNumber(Text(summary.minimum), summary.minimum), jsonNumber(Text(summary.maximum), summary.maximum)])
+    let values = json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: ratios; keys: [] }
+    return jsonObject(["sample_count", "median", "ratios", "range", "confidence_interval"], [jsonNumber(Text(summary.sampleCount), Float(summary.sampleCount)), jsonNumber(Text(summary.median), summary.median), values, range, confidence])
+}
