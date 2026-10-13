@@ -1,0 +1,239 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "./cycle-port-support.min" as groups
+use "./evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+
+constant COLLECTOR_HASH = "8f0a89de20ecae298e54b030cea789840c513521771ba35517643a5212fd9b61"
+constant HEAP_BYTES = 4194304
+record Gate { out: Text; root: Text; evidence: evidence.Evidence; environment: List<Text>; cases: List<Text>; flags: List<Text>; compiler: Text; header: Text }
+function contains(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function usage(message: Text) {
+    system.writeStandardError("cycle-private-retirement: error: " + message + "\n")
+    exit(2)
+}
+function save(gate: Gate, passed: Boolean, baseline: Boolean, mismatches: List<Text>) {
+    writeTextFile(gate.out + "/manifest.json", gate.header + ",\n  \"cases\": [" + support.joined(gate.cases, ",\n    ") + "],\n  \"baseline_failure_control\": " + Text(baseline) + ",\n  \"source_after_mismatches\": " + support.quotedList(mismatches) + ",\n  \"passed\": " + Text(passed) + "\n}\n")
+}
+function observe(gate: Gate, label: Text, argv: List<Text>, binary: Text, expected: Text): evidence.Outcome {
+    let request = evidence.command(argv, 180.0)
+    request.cwd = gate.root
+    request.phase = label
+    request.inherit = false
+    request.environment = gate.environment
+    let outcome = evidence.run(gate.evidence, request)
+    writeBytesFile(gate.out + "/" + label + ".stdout", outcome.stdout)
+    writeBytesFile(gate.out + "/" + label + ".stderr", outcome.stderr)
+    let row = "{\"label\": " + json.quote(label) + ", \"command\": " + support.quotedList(argv) + ", \"returncode\": " + Text(outcome.status) + ", \"timed_out\": " + Text(outcome.timedOut) + ", \"stdout_sha256\": " + json.quote(support.digest(gate.out + "/" + label + ".stdout")) + ", \"stderr_sha256\": " + json.quote(support.digest(gate.out + "/" + label + ".stderr"))
+    if binary != "" && files.pathSize(binary) >= 0 { row = row + ", \"binary_sha256\": " + json.quote(support.digest(binary)) }
+    if expected != "" { row = row + ", \"expected_outcome\": " + json.quote(expected) }
+    gate.cases.add(row + "}")
+    save(gate, false, false, [])
+    return outcome
+}
+function compileFixture(gate: Gate, label: Text, profile: Text, budget: Integer, include: Text): Text {
+    let binary = gate.out + "/" + label
+    let command = [gate.compiler]
+    for flag in gate.flags { command.add(flag) }
+    for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", include] { command.add(item) }
+    if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+    if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+    if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+    for item in ["-DMINYAR_BOUNDED_HEAP_BYTES=" + Text(HEAP_BYTES), "-DMINYAR_RC_POLL_BUDGET=" + Text(budget), gate.root + "/tests/cycle-idle-invalidation.c", "-lm", "-o", binary] { command.add(item) }
+    let result = observe(gate, label + "-compile", command, binary, "")
+    test.check(result.status == 0 && result.stdout.length == 0 && result.stderr.length == 0, label + " compile failed\n" + Text(result.stderr))
+    return binary
+}
+function plan(profile: Text, budget: Integer): List<List<Text>> {
+    let commands: List<List<Text>> = []
+    for mode in ["borrow", "fieldless", "private", "replacement", "remove-live", "new-child", "anchor-transfer", "shared-child", "cross-component", "unknown-cycle"] {
+        let arguments = ["32", mode]
+        if mode == "private" && profile == "system" && budget == 1 { arguments.add("assert-local") }
+        commands.add(arguments)
+    }
+    for mode in ["active-local", "active-full"] { for phase in ["1", "2", "3"] { commands.add(["32", mode, phase]) } }
+    if profile != "eager" {
+        for mode in ["phase", "local-mark", "local-sweep", "full-mark", "full-sweep", "transfer", "drop", "rebuild"] {
+            for recent in ["0", "1"] { commands.add(["32", "queued", mode, recent]) }
+        }
+        for generation in ["0", "1"] { commands.add(["32", "certificate", generation]) }
+        commands.add(["32", "reuse"])
+        commands.add(["32", "unknown-after-drop"])
+    }
+    if profile == "system" && budget == 1 { for count in ["256", "2048"] { commands.add([count, "private", "assert-local"]) } }
+    return commands
+}
+function validateOperation(stdout: Text, stderr: Text, arguments: List<Text>) {
+    test.check(stdout == "", "retirement control wrote stdout")
+    let n = arguments[0]
+    let operation = arguments[1]
+    if operation == "certificate" {
+        test.check(stderr == "", "certificate exclusion control wrote unexpected stderr")
+        return
+    }
+    let prefix = ""
+    if contains(["borrow", "fieldless", "private", "replacement", "remove-live"], operation) { prefix = "IDLE label=" + operation + " n=" + n + " rounds=8 " }
+    else if contains(["new-child", "anchor-transfer", "shared-child", "cross-component", "unknown-cycle"], operation) { prefix = "POSITIVE label=" + operation + " n=" + n + " " }
+    else if support.starts(operation, "active-") {
+        let local = "0"
+        if operation == "active-local" { local = "1" }
+        prefix = "ACTIVE n=" + n + " phase=" + arguments[2] + " local=" + local + " "
+    } else if operation == "queued" { prefix = "QUEUED n=" + n + " mode=" + arguments[2] + " recent=" + arguments[3] + " " }
+    else if operation == "reuse" { prefix = "REUSE n=" + n + " rounds=128 " }
+    else if operation == "unknown-after-drop" { prefix = "UNKNOWN_AFTER_DROP n=" + n + " " }
+    else { fail("unknown retirement operation") }
+    let newlines = 0
+    for byte in Bytes(stderr) { if byte == 10 { newlines += 1 } }
+    test.check(support.starts(stderr, prefix) && newlines == 1, "retirement control lacks its exact operation ledger\n" + stderr)
+}
+function numberAfter(text: Text, marker: Text): Integer {
+    let begin = support.find(text, marker, 0)
+    if begin < 0 { return -1 }
+    let raw = Bytes(text)
+    let position = begin + Bytes(marker).length
+    let start = position
+    while position < raw.length && raw[position] >= 48 && raw[position] <= 57 { position += 1 }
+    if position == start { return -1 }
+    return groups.parseInteger(Text(raw.slice(start, position)))
+}
+function validateFailureControl(status: Integer, stdout: Text, stderr: Text, timedOut: Boolean) {
+    test.check(status != 0 && !timedOut && stdout == "", "v5 did not fail its locality bound cleanly")
+    let marker = "IDLE label=private n=32 rounds=8 units="
+    let units = numberAfter(stderr, marker)
+    let begin = support.find(stderr, marker, 0)
+    let epochs = -1
+    if units >= 0 {
+        let after = Text(Bytes(stderr).slice(begin + Bytes(marker).length + Bytes(Text(units)).length, Bytes(stderr).length))
+        if support.starts(after, " epochs=") { epochs = numberAfter(after, " epochs=") }
+    }
+    test.check(units > 192 && epochs > 0, "v5 failure lacks the private work/epoch counterexample")
+    test.check(test.contains(stderr, "work <= 16u * rounds + 64u"), "v5 failed outside the final private locality assertion")
+}
+
+let sanitize = false
+let profiles = ["system", "fixed", "lazy", "eager"]
+let budgets = [1, 32, 1024]
+let target = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--sanitize" { sanitize = true; index += 1; continue }
+    if option == "--evidence" {
+        if index + 1 >= argumentCount() { usage("--evidence needs a value") }
+        target = argument(index + 1)
+        index += 2
+    } else if option == "--profiles" || option == "--budgets" {
+        let values: List<Text> = []
+        index += 1
+        while index < argumentCount() && !support.starts(argument(index), "--") { values.add(argument(index)); index += 1 }
+        if values.length == 0 { usage(option + " needs values") }
+        if option == "--profiles" {
+            for value in values { if !contains(["system", "fixed", "lazy", "eager"], value) { usage("invalid profile: " + value) } }
+            profiles = values
+        } else {
+            let parsed: List<Integer> = []
+            for value in values {
+                if !contains(["1", "32", "1024"], value) { usage("invalid budget: " + value) }
+                parsed.add(groups.parseInteger(value))
+            }
+            budgets = parsed
+        }
+    } else { usage("unknown option: " + option) }
+}
+if target == "" { usage("the following arguments are required: --evidence") }
+let logs = test.scratch()
+test.check(files.pathSize(target) < 0, "evidence directory already exists: " + target)
+test.require(test.run(["mkdir", "-p", "--", target], system.environment(), "", logs + "/mkdir", 10), "create evidence directory")
+let out = test.lines(test.run(["sh", "-c", "cd \"$1\" && pwd -P", "minyar", target], system.environment(), "", logs + "/resolve", 10).output)[0]
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", logs + "/root", 10).output)[0]
+let inputs = ["tests/cycle-private-retirement.min", "tests/cycle-idle-invalidation.c", "tests/cycle-additive.c", "tests/cycle-port-support.min", "tests/cycle-private-retirement-v5.json", "tests/fixtures/cycle-private-retirement-v5-collector.h", "tools/cycle-runtime.min", "tests/evidence-support.min", "runtime/minyar_runtime.c"]
+let headers: List<Text> = []
+for path in support.treeFiles(["runtime"]) {
+    let raw = Bytes(path)
+    if Text(raw.slice(raw.length - 2, raw.length)) == ".h" && support.find(Text(raw.slice(8, raw.length)), "/", 0) < 0 { inputs.add(path); headers.add(path) }
+}
+let fingerprints = support.digestMembers(inputs)
+let originalDigests: List<Text> = []
+for path in inputs {
+    originalDigests.add(support.digest(path))
+    let destination = out + "/input-sources/" + path
+    let raw = Bytes(destination)
+    let slash = raw.length - 1
+    while raw[slash] != 47 { slash -= 1 }
+    test.require(test.run(["mkdir", "-p", "--", Text(raw.slice(0, slash))], system.environment(), "", logs + "/copy", 10), "create retained source directory")
+    writeBytesFile(destination, readBytesFile(path))
+}
+let generated = cycle.publishEngine(".", "")
+writeBytesFile(out + "/managed-graphs-engine.c", readBytesFile(generated))
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let located = test.run(["sh", "-c", "path=$(command -v -- \"$1\" || printf '%s' \"$1\"); realpath -- \"$path\"", "minyar", clang], system.environment(), "", logs + "/tool", 10)
+test.require(located, "resolve clang")
+let compiler = test.lines(located.output)[0]
+writeBytesFile(out + "/clang.bin", readBytesFile(compiler))
+let environment = support.environment(system.environment(), ["ASAN_OPTIONS", "UBSAN_OPTIONS"], [support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1"])
+let flags = ["-O2"]
+if sanitize { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let quoted: List<Text> = []
+for profile in profiles { quoted.add(json.quote(profile)) }
+let budgetTexts: List<Text> = []
+for budget in budgets { budgetTexts.add(Text(budget)) }
+let locality = "[]"
+if contains(profiles, "system") && contains(budgetTexts, "1") { locality = "[32, 256, 2048]" }
+let header = "{\n  \"schema_version\": 1,\n  \"sanitize\": " + Text(sanitize) + ",\n  \"profiles\": [" + support.joined(quoted, ", ") + "],\n  \"unsupported_profiles\": [],\n  \"heap_bytes\": 4194304,\n  \"source_sha256\": {" + support.joined(fingerprints, ", ") + "},\n  \"engine_sha256\": " + json.quote(support.digest(out + "/managed-graphs-engine.c")) + ",\n  \"compiler\": {\"path\": " + json.quote(compiler) + ", \"sha256\": " + json.quote(support.digest(compiler)) + "},\n  \"environment\": {\"ASAN_OPTIONS\": " + json.quote(support.asanLeakOptions() + ":halt_on_error=1") + ", \"UBSAN_OPTIONS\": \"halt_on_error=1:print_stacktrace=1\"},\n  \"broad_nodes\": 32,\n  \"private_locality_nodes\": " + locality + ",\n  \"budgets\": [" + support.joined(budgetTexts, ", ") + "],\n  \"scope\": \"Deterministic phase/work/cleanup; no CPU idle certification\""
+let trail = evidence.openIn(out + "/commands", "private-retirement", inputs)
+evidence.control(trail, "sanitize", Text(sanitize))
+evidence.control(trail, "heap_bytes", "4194304")
+let gate = Gate { out: out; root: root; evidence: trail; environment: environment; cases: []; flags: flags; compiler: compiler; header: header }
+save(gate, false, false, [])
+let version = observe(gate, "compiler-version", [compiler, "--version"], "", "")
+test.check(version.status == 0, "compiler version failed")
+for profile in profiles {
+    let selected = budgets
+    if profile == "eager" { selected = [32] }
+    for budget in selected {
+        let label = profile + "-k" + Text(budget)
+        let binary = compileFixture(gate, label, profile, budget, root + "/runtime")
+        let commands = plan(profile, budget)
+        for position in 0..commands.length {
+            let argv = [binary]
+            for item in commands[position] { argv.add(item) }
+            let observed = observe(gate, label + "-case-" + Text(position), argv, binary, "")
+            test.check(observed.status == 0, label + " " + support.joined(commands[position], " ") + "\n" + Text(observed.stderr))
+            validateOperation(Text(observed.stdout), Text(observed.stderr), commands[position])
+            print(label + " " + support.joined(commands[position], " ") + ": 0")
+        }
+    }
+}
+let baseline = json.parse(readTextFile("tests/cycle-private-retirement-v5.json"))
+let baselineHeaders = json.member(baseline, "headers")
+test.check(json.member(baseline, "schema_version").number == 1.0 && baselineHeaders.keys.length == 2, "v5 baseline schema changed")
+test.check(json.string(baseline, "collector_sha256") == COLLECTOR_HASH, "v5 collector digest changed")
+test.check(support.digest("tests/fixtures/cycle-private-retirement-v5-collector.h") == COLLECTOR_HASH, "frozen v5 collector changed")
+let controlHeaders = out + "/failure-control/runtime"
+test.require(test.run(["mkdir", "-p", "--", controlHeaders], system.environment(), "", logs + "/control", 10), "create failure control headers")
+for path in headers { writeBytesFile(controlHeaders + "/" + Text(Bytes(path).slice(8, Bytes(path).length)), readBytesFile(path)) }
+let names = ["minyar_cycles.h", "minyar_cycle_bounded_rc.h"]
+let digests = ["43d0e0c2084d490951b7423eea74454f6c7111c58a1d4cf271468fda77910368", "0733390de720af61681de03fd02ef3f66d3e8c2d315de54f26e7c6e258ed29ab"]
+for position in 0..names.length {
+    let row = json.member(baselineHeaders, names[position])
+    test.check(row.kind == json.OBJECT, "v5 baseline lacks " + names[position])
+    writeTextFile(controlHeaders + "/" + names[position], json.string(row, "source"))
+    test.check(json.string(row, "sha256") == digests[position] && support.digest(controlHeaders + "/" + names[position]) == digests[position], "v5 header digest changed: " + names[position])
+}
+writeBytesFile(controlHeaders + "/minyar_cycles_collect.h", readBytesFile("tests/fixtures/cycle-private-retirement-v5-collector.h"))
+test.check(support.digest(controlHeaders + "/minyar_cycles_collect.h") == COLLECTOR_HASH, "retained v5 collector changed")
+let controlBinary = compileFixture(gate, "v5-failure-control", "system", 1, controlHeaders)
+let failure = observe(gate, "v5-locality-expected-failure", [controlBinary, "32", "private", "assert-local"], controlBinary, "v5 runtime locality assertion; not a product pass")
+validateFailureControl(failure.status, Text(failure.stdout), Text(failure.stderr), failure.timedOut)
+let mismatches: List<Text> = []
+for position in 0..inputs.length { if support.digest(inputs[position]) != originalDigests[position] { mismatches.add(inputs[position]) } }
+test.check(mismatches.length == 0, "sources changed during the gate: " + support.joined(mismatches, ", "))
+test.check(readTextFile(generated) == readTextFile(out + "/managed-graphs-engine.c"), "generated engine changed")
+save(gate, true, true, mismatches)
+test.removeTree(logs)

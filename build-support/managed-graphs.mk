@@ -67,6 +67,13 @@ check-sanitize: check-managed-graphs-sanitize check-callbacks-sanitize check-man
 CYCLE_SANITIZER_CLANG = $(or $(MINYAR_SANITIZER_CLANG),$(LLVM_CC))
 CYCLE_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(dir $(MINYAR_SANITIZER_CLANG)):$(PATH),$(PATH))
 
+build/tooling/tests/cycle-witness.ll: tests/cycle-port-support.min tests/thread-port-support.min
+build/tooling/tests/cycle-progress.ll: tests/cycle-port-support.min tests/thread-port-support.min
+build/tooling/tests/cycle-additive.ll: tests/cycle-port-support.min tests/thread-port-support.min
+build/tooling/tests/cycle-registration.ll: tests/cycle-port-support.min tests/thread-port-support.min
+build/tooling/tests/cycle-private-retirement.ll: tests/cycle-port-support.min tests/thread-port-support.min
+build/tooling/tests/cycle-registration.ll: tests/frontend-fixtures.min
+build/tooling/tests/cycle-private-retirement.ll: tests/evidence-support.min
 .PHONY: check-cycle-progress check-cycle-progress-sanitize
 build/tooling/tests/cycle-progress: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/cycle-progress: TOOL_LIBS = $(TOOL_CRYPTO)
@@ -128,13 +135,16 @@ check-sanitize: check-cycle-registration-exposure-sanitize
 
 # Every C command takes N OPERATION [ARGS]; these are production-header controls.
 .PHONY: check-cycle-private-retirement check-cycle-private-retirement-sanitize
-CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/fixtures/cycle-private-retirement-v5-collector.h tests/cycle-additive.c tests/cycle-additive.min tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+CYCLE_PRIVATE_RETIREMENT_INPUTS = build/tooling/tests/cycle-private-retirement tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/fixtures/cycle-private-retirement-v5-collector.h tests/cycle-additive.c runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+build/tooling/tests/cycle-private-retirement: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
+build/tooling/tests/cycle-private-retirement: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/cycle-private-retirement: tests/evidence-support-native.c runtime/native/sha256.c
 check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-private-retirement.py --evidence "$$evidence/run"
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --evidence "$$evidence/run"
 check-cycle-private-retirement-sanitize: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-XXXXXX"); \
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-private-retirement.py --sanitize --evidence "$$evidence/run"
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --evidence "$$evidence/run"
 check: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-portable: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-managed-graphs-profiles: check-cycle-private-retirement check-cycle-private-retirement-sanitize

@@ -1,4 +1,7 @@
 .PHONY: check-thread-ordinary check-thread-runtime-ir check-thread-domain check-thread-buffers check-thread-runtime check-thread-runtime-sanitize check-thread-runtime-tsan
+build/tooling/tests/thread-runtime.ll: tests/thread-port-support.min
+build/tooling/tests/thread-runtime-ir.ll: tests/thread-port-support.min
+build/tooling/tests/thread-ordinary.ll: tests/thread-port-support.min
 build/tooling/tests/thread-runtime: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/thread-runtime: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-runtime: runtime/native/sha256.c
