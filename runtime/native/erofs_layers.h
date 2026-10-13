@@ -122,11 +122,51 @@ static int e_remove_lower(ENode *node, uint64_t layer) {
     if (node->parent && node->generation < layer && !node->count) { e_delete_child(node); return 1; }
     return 0;
 }
+static int e_acl_order(const void *a, const void *b) {
+    const unsigned char *x = a, *y = b;
+    unsigned xt = x[0] | (unsigned)x[1] << 8, yt = y[0] | (unsigned)y[1] << 8;
+    if (xt != yt) return xt < yt ? -1 : 1;
+    uint32_t xi = x[4] | (uint32_t)x[5] << 8 | (uint32_t)x[6] << 16 | (uint32_t)x[7] << 24;
+    uint32_t yi = y[4] | (uint32_t)y[5] << 8 | (uint32_t)y[6] << 16 | (uint32_t)y[7] << 24;
+    return xi < yi ? -1 : xi > yi;
+}
+static int e_archive_acl(struct archive_entry *entry, int wanted, const char *key) {
+    if (!(archive_entry_acl_types(entry) & wanted)) return 0;
+    int count = archive_entry_acl_reset(entry, wanted);
+    if (count < 1 || count > 8191) return EOVERFLOW;
+    unsigned char *data = calloc(1, 4 + (size_t)count * 8);
+    if (!data) return ENOMEM;
+    e32(data, 2);
+    size_t used = 0;
+    int error = 0, type, perm, tag, qualifier, status;
+    const char *name;
+    while ((status = archive_entry_acl_next(entry, wanted, &type, &perm, &tag, &qualifier, &name)) == ARCHIVE_OK) {
+        unsigned code;
+        uint32_t id = UINT32_MAX;
+        if (used >= (size_t)count || type != wanted || (perm & ~7)) { error = EINVAL; break; }
+        if (tag == ARCHIVE_ENTRY_ACL_USER_OBJ) code = 1;
+        else if (tag == ARCHIVE_ENTRY_ACL_USER) code = 2;
+        else if (tag == ARCHIVE_ENTRY_ACL_GROUP_OBJ) code = 4;
+        else if (tag == ARCHIVE_ENTRY_ACL_GROUP) code = 8;
+        else if (tag == ARCHIVE_ENTRY_ACL_MASK) code = 16;
+        else if (tag == ARCHIVE_ENTRY_ACL_OTHER) code = 32;
+        else { error = ENOTSUP; break; }
+        if (code == 2 || code == 8) { if (qualifier < 0) { error = ENOTSUP; break; } id = (uint32_t)qualifier; }
+        unsigned char *p = data + 4 + used++ * 8; e16(p, (uint16_t)code); e16(p + 2, (uint16_t)perm); e32(p + 4, id);
+    }
+    if (!error && status != ARCHIVE_EOF) error = EINVAL;
+    if (!error) { qsort(data + 4, used, 8, e_acl_order); archive_entry_xattr_add_entry(entry, key, data, 4 + used * 8); }
+    free(data); return error;
+}
 static int e_archive_attrs(EInode *inode, struct archive_entry *entry) {
+    if (archive_entry_acl_types(entry) & ARCHIVE_ENTRY_ACL_TYPE_NFS4) return ENOTSUP;
+    int error = e_archive_acl(entry, ARCHIVE_ENTRY_ACL_TYPE_ACCESS, "system.posix_acl_access");
+    if (!error) error = e_archive_acl(entry, ARCHIVE_ENTRY_ACL_TYPE_DEFAULT, "system.posix_acl_default");
+    if (error) return error;
     int count = archive_entry_xattr_reset(entry);
     if (!count) return 0;
     size_t capacity = 0, size = 12;
-    int error = e_grow((void **)&inode->attrs, &capacity, size, 1);
+    error = e_grow((void **)&inode->attrs, &capacity, size, 1);
     if (error) return error;
     memset(inode->attrs, 0, size);
     const char *name; const void *value; size_t value_size;

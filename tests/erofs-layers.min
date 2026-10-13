@@ -1,0 +1,88 @@
+use "tar" as tar
+use "erofs" as erofs
+use "errors" as errors
+use "deflate" as deflate
+use "zstd" as zstd
+
+function require(ok: Boolean, message: Text) { if !ok { fail(message) } }
+function member(path: Text, kind: Integer, data: Bytes, mode: Integer, link: Text): tar.Entry {
+    let value = tar.entry(Bytes(path), kind)
+    value.mode = mode; value.uid = 70000; value.gid = 80000
+    value.mtime = 1700000500; value.mtimeNanos = 123456789
+    value.link = Bytes(link)
+    if kind == tar.REGULAR { value.size = data.length }
+    return value
+}
+function add(output: tar.Writer, value: tar.Entry, data: Bytes) {
+    require(errors.booleanOk(tar.append(output, value, data)), "layer fixture append")
+}
+function put(output: tar.Writer, path: Text, kind: Integer, data: Text, mode: Integer, link: Text) {
+    add(output, member(path, kind, Bytes(data), mode, link), Bytes(data))
+}
+function finish(output: tar.Writer): Bytes {
+    let result = tar.finish(output)
+    require(errors.bytesOk(result), "layer fixture finish")
+    return errors.bytesValue(result)
+}
+let directory = argument(0)
+let lower = tar.writer(16777216)
+put(lower, "switch", tar.REGULAR, "old", 420, "")
+put(lower, "removed", tar.DIRECTORY, "", 493, "")
+put(lower, "removed/child", tar.REGULAR, "old", 420, "")
+put(lower, "dir-to-file", tar.DIRECTORY, "", 493, "")
+put(lower, "dir-to-file/child", tar.REGULAR, "old", 420, "")
+writeBytesFile(directory + "/additions.tar", finish(lower))
+
+let upper = tar.writer(16777216)
+put(upper, "many/new-first", tar.REGULAR, "before", 417, "")
+put(upper, "many/.wh..wh..opq", tar.REGULAR, "", 0, "")
+put(upper, "many/new-last", tar.REGULAR, "after", 417, "")
+put(upper, ".wh.removed", tar.REGULAR, "", 0, "")
+put(upper, "dir-to-file", tar.REGULAR, "now-file", 417, "")
+put(upper, "switch/new", tar.REGULAR, "new", 417, "")
+put(upper, "switch", tar.DIRECTORY, "", 489, "")
+put(upper, "kept", tar.HARDLINK, "", 417, "hard")
+put(upper, "forward-one", tar.HARDLINK, "", 416, "forward-two")
+put(upper, "forward-two", tar.HARDLINK, "", 416, "new-data")
+let binary = Bytes(5); binary[1] = 255; binary[2] = 61; binary[3] = 10
+let value = member("new-data", tar.REGULAR, Bytes("layer-data"), 416, "")
+value.attributes.add(tar.Attribute { key: Bytes("SCHILY.xattr.user.layer"); value: binary })
+value.attributes.add(tar.Attribute { key: Bytes("SCHILY.xattr.trusted.layer"); value: Bytes("trusted") })
+value.attributes.add(tar.Attribute { key: Bytes("SCHILY.acl.access"); value: Bytes("user::rw-,user:1234:r--,group::r--,mask::r--,other::---") })
+add(upper, value, Bytes("layer-data"))
+value = member("symlink", tar.SYMLINK, Bytes(), 511, "./hard")
+value.uid = 1234; value.gid = 2345; add(upper, value, Bytes())
+put(upper, ".wh.symlink", tar.REGULAR, "", 0, "")
+value = member(".wh.fifo", tar.CHARACTER, Bytes(), 0, ""); add(upper, value, Bytes())
+value = member("fifo", tar.FIFO, Bytes(), 416, ""); value.uid = 1234; value.gid = 2345; add(upper, value, Bytes())
+value = member("char", tar.CHARACTER, Bytes(), 384, "")
+value.uid = 1234; value.gid = 2345; value.deviceMajor = 4095; value.deviceMinor = 1048575; add(upper, value, Bytes())
+value = member("block", tar.BLOCK, Bytes(), 416, "")
+value.uid = 1234; value.gid = 2345; value.deviceMajor = 259; value.deviceMinor = 1048575; add(upper, value, Bytes())
+value = member(".", tar.DIRECTORY, Bytes(), 489, "")
+value.mtime = -2; value.mtimeNanos = 750000000
+value.attributes.add(tar.Attribute { key: Bytes("SCHILY.xattr.user.root"); value: binary })
+value.attributes.add(tar.Attribute { key: Bytes("SCHILY.acl.default"); value: Bytes("user::rwx,user:1234:rwx,group::r-x,mask::rwx,other::--x") })
+add(upper, value, Bytes())
+let wire = finish(upper)
+let compressed = zstd.compress(wire, 3, 16777216)
+require(zstd.ok(compressed), "layer zstd fixture")
+writeBytesFile(directory + "/upper.tar.zstd", zstd.data(compressed))
+let gzip = deflate.compress(wire, deflate.GZIP, 6, 16777216)
+require(deflate.ok(gzip), "layer gzip fixture")
+writeBytesFile(directory + "/upper.tar.gz", deflate.data(gzip))
+writeBytesFile(directory + "/upper.tar", wire)
+
+for kind in 0..3 {
+    let bad = tar.writer(8192)
+    if kind == 0 { put(bad, "../escape", tar.REGULAR, "bad", 420, "") }
+    if kind == 1 { put(bad, "a", tar.HARDLINK, "", 420, "b"); put(bad, "b", tar.HARDLINK, "", 420, "a") }
+    if kind == 2 { put(bad, "a", tar.HARDLINK, "", 420, "missing") }
+    writeBytesFile(directory + "/bad-" + Text(kind) + ".tar", finish(bad))
+}
+let options = erofs.defaults()
+require(errors.isError(erofs.writeLayers([""], directory + "/invalid.erofs", options)), "empty layer path")
+require(errors.isError(erofs.writeLayers(["missing"], directory + "/invalid.erofs", options)), "missing layer path")
+let nul = "bad\0path"
+require(errors.isError(erofs.writeLayers([nul], directory + "/invalid.erofs", options)), "NUL layer path")
+print("EROFS_LAYER_FIXTURES_PASS")

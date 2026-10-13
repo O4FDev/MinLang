@@ -406,6 +406,10 @@ static int e_compress(EWriter *w, EInode *i) {
     free(map);free(compact);free(input);free(encoded);free(output);close(fd);return error;
 }
 static int e_image(EWriter *w) {
+    size_t root = 0;
+    while (root < w->count && w->inodes[root] != w->root->inode) ++root;
+    if (root == w->count) return EINVAL;
+    if (root) { EInode *inode = w->inodes[root]; memmove(w->inodes + 1, w->inodes, root * sizeof(*w->inodes)); w->inodes[0] = inode; }
     int error = e_dirs(w->root, -1);
     uint64_t metadata = 0;
     for (size_t n = 0; !error && n < w->count; ++n) {
