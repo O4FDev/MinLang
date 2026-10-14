@@ -4,7 +4,9 @@ Run on an otherwise idle Linux Boat sandbox with the built core and callback
 frontends, Rust and Swift available:
 
 ```sh
-python3 benchmarks/list-sort/run.py --lock /home/user/ws3/build.lock --repeats 5
+make build/minyarc build/minyarc-callbacks build/tooling/benchmarks/list-sort/run
+./build/tooling/benchmarks/list-sort/run --lock /home/user/ws3/build.lock --prepare-only
+(flock 9 && ./build/tooling/benchmarks/list-sort/run --lock /home/user/ws3/build.lock --run-prepared --repeats 5) 9>/home/user/ws3/build.lock
 ```
 
 The runner fixes CPU affinity, rejects other active WS3 build jobs, rotates
