@@ -1,0 +1,447 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "json" as json
+use "sha256" as sha256
+use "system" as system
+use "files" as files
+
+public constant DEFAULT_TEMPORARY = "/home/minyar/lab/quic-runner-tmp"
+public constant IMAGE = "minyar-interop:development"
+
+public record Check { ok: Boolean; value: Text; error: Text }
+public record Verdict { ok: Boolean; error: Text; servers: List<Text>; clients: List<Text>; succeeded: Integer }
+public record Options { runner: Text; artifacts: Text; servers: Text; clients: Text; tests: Text; mustInclude: Text; temporary: Text
+    python: Text; tshark: Text; docker: Text; git: Text; platform: Text; effectiveUser: Integer; environment: List<Text>; deadline: Integer; controller: Text }
+public record Outcome { status: Integer; error: Text; manifest: Text }
+
+function failed(message: Text): Check { return Check { ok: false; value: ""; error: message } }
+function accepted(value: Text): Check { return Check { ok: true; value: value; error: "" } }
+function rejected(message: Text): Verdict { return Verdict { ok: false; error: message; servers: []; clients: []; succeeded: 0 } }
+function variable(environment: List<Text>, name: Text): Text {
+    for entry in environment { if quic.starts(entry, name + "=") { return quic.after(entry, name + "=") } }
+    return ""
+}
+function digit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+
+public function tshark(output: Text): Check {
+    let version = ""
+    let rows = test.lines(output)
+    if rows.length > 0 { version = rows[0] }
+    let raw = Bytes(version)
+    let marker = Bytes("(Wireshark) ")
+    let major = -1
+    let minor = -1
+    let index = 0
+    while major < 0 && index + marker.length <= raw.length {
+        if Text(raw.slice(index, index + marker.length)) == "(Wireshark) " {
+            let at = index + marker.length
+            let start = at
+            while at < raw.length && digit(raw[at]) { at += 1 }
+            if at > start && at < raw.length && raw[at] == 46 {
+                let dot = at
+                at += 1
+                let second = at
+                while at < raw.length && digit(raw[at]) { at += 1 }
+                if at > second && dot - start <= 9 && at - second <= 9 {
+                    major = Integer(Text(raw.slice(start, dot)))
+                    minor = Integer(Text(raw.slice(second, at)))
+                }
+            }
+        }
+        index += 1
+    }
+    if major < 0 || major < 4 || (major == 4 && minor < 5) {
+        return failed("official interop requires Wireshark 4.5.0 or newer: " + version)
+    }
+    return accepted(version)
+}
+
+public function selectedNames(value: Text, label: Text): Check {
+    let names = quic.split(value, 44)
+    let seen: List<Text> = []
+    for name in names {
+        let raw = Bytes(name)
+        let valid = raw.length > 0
+        for byte in raw {
+            if !(digit(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45) { valid = false }
+        }
+        for earlier in seen { if earlier == name { valid = false } }
+        if !valid { return failed("invalid " + label + " selection") }
+        seen.add(name)
+    }
+    return accepted(value)
+}
+
+public function runnerEnvironment(base: List<Text>, temporary: Text): List<Text> {
+    let result = base
+    for name in ["CERTS", "SERVER_WWW", "CLIENT_WWW", "SERVER_DOWNLOADS", "CLIENT_DOWNLOADS", "SERVER_LOGS", "CLIENT_LOGS"] {
+        result = quic.setting(result, name, temporary)
+    }
+    result = quic.setting(result, "SERVER", IMAGE)
+    result = quic.setting(result, "CLIENT", IMAGE)
+    result = quic.setting(result, "REQUESTS_SERVER", "")
+    result = quic.setting(result, "REQUESTS_CLIENT", "")
+    result = quic.setting(result, "TMPDIR", temporary)
+    return quic.setting(result, "PYTHONUNBUFFERED", "1")
+}
+
+function contains(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function sameSet(actual: List<Text>, expected: List<Text>): Boolean {
+    for value in actual { if !contains(expected, value) { return false } }
+    for value in expected { if !contains(actual, value) { return false } }
+    return true
+}
+function unique(values: List<Text>): Boolean {
+    let sorted = values.sorted()
+    for index in 1..sorted.length { if sorted[index] == sorted[index - 1] { return false } }
+    return true
+}
+function representation(value: json.Value): Text {
+    if value.kind == json.NULL { return "None" }
+    if value.kind == json.STRING { return "'" + value.text + "'" }
+    if data.isTrue(value) { return "True" }
+    if data.isFalse(value) { return "False" }
+    return data.dumps(value)
+}
+
+public function validateMatrix(matrix: json.Value, selectedServers: Text, selectedClients: Text, selectedTests: Text, mustInclude: Text): Verdict {
+    let checks = [selectedNames(selectedServers, "server"), selectedNames(selectedClients, "client"), selectedNames(selectedTests, "test"), selectedNames(mustInclude, "required implementation")]
+    for check in checks { if !check.ok { return rejected(check.error) } }
+    let servers = quic.split(selectedServers, 44)
+    let clients = quic.split(selectedClients, 44)
+    let tests = quic.split(selectedTests, 44)
+    if quic.split(mustInclude, 44).length != 1 { return rejected("exactly one required implementation is supported by the official runner") }
+    let paired = false
+    for server in servers { for client in clients { if server == mustInclude || client == mustInclude { paired = true } } }
+    if !paired { return rejected("selection contains no pair with " + mustInclude) }
+    if !data.isObject(matrix) { return rejected("official matrix must be a JSON object") }
+    let axes: List<List<Text>> = []
+    for label in ["servers", "clients"] {
+        let expected = servers
+        if label == "clients" { expected = clients }
+        let actual = data.field(matrix, label)
+        if !data.allTexts(actual) || actual.items.length == 0 || !unique(data.texts(actual)) || !sameSet(data.texts(actual), expected) {
+            return rejected("official matrix " + label + " differ from the requested selection")
+        }
+        axes.add(data.texts(actual))
+    }
+    let metadata = data.field(matrix, "tests")
+    if !data.isObject(metadata) || metadata.keys.length == 0 { return rejected("official matrix has no test metadata") }
+    let abbreviations: List<Text> = []
+    for name in tests {
+        let matches: List<Text> = []
+        for index in 0..metadata.keys.length {
+            let row = metadata.items[index]
+            if data.isObject(row) && data.equalsText(data.field(row, "name"), name) { matches.add(metadata.keys[index]) }
+        }
+        if matches.length != 1 { return rejected("missing or ambiguous official metadata for " + name) }
+        abbreviations.add(matches[0])
+    }
+    let cells = data.field(matrix, "results")
+    if !data.isArray(cells) || cells.items.length != axes[0].length * axes[1].length { return rejected("official matrix has missing or extra pair cells") }
+    let pairServers: List<Text> = []
+    let pairClients: List<Text> = []
+    let succeeded = 0
+    for clientIndex in 0..axes[1].length {
+        let client = axes[1][clientIndex]
+        for serverIndex in 0..axes[0].length {
+            let server = axes[0][serverIndex]
+            if mustInclude != server && mustInclude != client { continue }
+            let pair = server + "/" + client
+            let cell = cells.items[clientIndex * axes[0].length + serverIndex]
+            if !data.isArray(cell) || cell.items.length == 0 { return rejected("empty official results for " + pair) }
+            let names: List<Text> = []
+            let codes: List<Text> = []
+            for row in cell.items {
+                if !data.isObject(row) || !data.isText(data.field(row, "name")) || !data.isText(data.field(row, "abbr")) {
+                    return rejected("malformed official result for " + pair)
+                }
+                names.add(data.field(row, "name").text)
+                codes.add(data.field(row, "abbr").text)
+            }
+            if !unique(names) || !unique(codes) { return rejected("ambiguous official results for " + pair) }
+            for testIndex in 0..tests.length {
+                let name = tests[testIndex]
+                let matching: List<json.Value> = []
+                for row in cell.items { if data.field(row, "name").text == name { matching = matching.appended(row) } }
+                if matching.length != 1 || data.field(matching[0], "abbr").text != abbreviations[testIndex] {
+                    return rejected("missing or mismatched " + name + " result for " + pair)
+                }
+                let result = data.field(matching[0], "result")
+                if !data.equalsText(result, "succeeded") {
+                    return rejected(name + " for " + pair + " did not succeed: " + representation(result))
+                }
+                succeeded += 1
+            }
+            pairServers.add(server)
+            pairClients.add(client)
+        }
+    }
+    return Verdict { ok: true; error: ""; servers: pairServers; clients: pairClients; succeeded: succeeded }
+}
+
+public function verdictJSON(verdict: Verdict): json.Value {
+    if !verdict.ok { return data.object(["status", "error"], [data.string("failed"), data.string(verdict.error)]) }
+    let pairs: List<json.Value> = []
+    for index in 0..verdict.servers.length {
+        pairs = pairs.appended(data.object(["server", "client"], [data.string(verdict.servers[index]), data.string(verdict.clients[index])]))
+    }
+    return data.object(["status", "pairs", "succeeded_cases"], [data.string("succeeded"), data.array(pairs), data.number(verdict.succeeded)])
+}
+
+public function matrixEvidence(path: Text, servers: Text, clients: Text, tests: Text, mustInclude: Text, runnerStatus: Integer): json.Value {
+    let present = files.pathSize(path) >= 0
+    let raw = Bytes()
+    let verdict = rejected("cannot read official matrix: " + path)
+    if present {
+        raw = files.readFile(path)
+        if files.lastError() != 0 { present = false; verdict = rejected("cannot read official matrix: " + files.errorText(files.lastError())) }
+    }
+    if present {
+        let matrix = data.decode(raw)
+        if matrix.kind == json.INVALID { verdict = rejected(matrix.text) }
+        else { verdict = validateMatrix(matrix, servers, clients, tests, mustInclude) }
+    }
+    let status = runnerStatus
+    if status == 0 && !verdict.ok { status = 1 }
+    let hash = data.none()
+    let size = data.none()
+    if present { hash = data.string(sha256.hex(sha256.digest(raw))); size = data.number(raw.length) }
+    return data.object(["runner_status", "status", "matrix_sha256", "matrix_bytes", "result_validation"],
+        [data.number(runnerStatus), data.number(status), hash, size, verdictJSON(verdict)])
+}
+
+public function networkNamespace(entry: json.Value): Check {
+    if data.equalsText(data.field(data.field(entry, "HostConfig"), "NetworkMode"), "host") { return failed("host network mode is forbidden") }
+    let pid = data.field(data.field(entry, "State"), "Pid")
+    if !data.exactInteger(pid) || data.integer(pid) <= 0 { return failed("endpoint has no running namespace") }
+    return accepted(pid.text)
+}
+public function pinnedNamespace(): Text {
+    return "pid=$1; shift; exec 3</proc/\"$pid\"/ns/net || exit 90; [ \"$(stat -L -c %d:%i /proc/self/fd/3)\" != \"$(stat -L -c %d:%i /proc/self/ns/net)\" ] || exit 91; "
+}
+
+function capture(command: List<Text>, environment: List<Text>, cwd: Text, scratch: Text, seconds: Integer): test.Result {
+    let log = scratch + "/command-" + Text(system.monotonicNanoseconds())
+    let result = test.run(command, environment, cwd, log, seconds)
+    files.remove(log)
+    files.remove(log + ".err")
+    return result
+}
+function trimmed(value: Text): Text {
+    let raw = Bytes(value)
+    let start = 0
+    let end = raw.length
+    while start < end && raw[start] <= 32 { start += 1 }
+    while end > start && raw[end - 1] <= 32 { end -= 1 }
+    return Text(raw.slice(start, end))
+}
+function resolved(path: Text, scratch: Text): Text {
+    let result = capture(["/bin/sh", "-c", "cd -- \"$1\" && pwd -P", "minyar", path], system.environment(), "", scratch, 30)
+    test.require(result, "resolve " + path)
+    return trimmed(result.output)
+}
+function canonical(path: Text, scratch: Text): Text {
+    let result = capture(["realpath", "--", path], system.environment(), "", scratch, 30)
+    test.require(result, "resolve " + path)
+    return trimmed(result.output)
+}
+function directory(path: Text, scratch: Text) {
+    test.require(capture(["mkdir", "-p", "--", path], system.environment(), "", scratch, 30), "create " + path)
+}
+
+function configure(options: Options, node: Text, temporary: Text, scratch: Text): Check {
+    let inspected = capture([options.docker, "inspect", node], options.environment, "", scratch, 60)
+    if inspected.status != 0 { return Check { ok: false; value: ""; error: "" } }
+    let parsed = data.decode(Bytes(inspected.output))
+    if !data.isArray(parsed) || parsed.items.length == 0 { return failed("unreadable endpoint inspection") }
+    let entry = parsed.items[0]
+    let pid = data.field(data.field(entry, "State"), "Pid")
+    if !data.exactInteger(pid) || data.integer(pid) == 0 { return accepted("") }
+    let capabilities = data.field(data.field(entry, "HostConfig"), "CapAdd")
+    if !data.equalsText(data.field(data.field(entry, "Config"), "User"), "65534:65534") || (data.isArray(capabilities) && capabilities.items.length > 0) {
+        return failed(node + " must have a nonroot user and no additional capabilities")
+    }
+    let namespace = networkNamespace(entry)
+    if !namespace.ok { return namespace }
+    let network = "193.167.0.2"
+    let v6 = "fd00:cafe:cafe:0::2"
+    if node == "server" { network = "193.167.100.2"; v6 = "fd00:cafe:cafe:100::2" }
+    let enter = "nsenter --net=/proc/self/fd/3"
+    let script = pinnedNamespace() + enter + " ip -4 route replace default via \"$1\" >/dev/null && " + enter + " ip -6 route replace default via \"$2\" >/dev/null && " + enter + " ethtool -K eth0 tx off >/dev/null"
+    let routed = capture(["/bin/sh", "-c", script, "minyar", namespace.value, network, v6], options.environment, "", scratch, 60)
+    if routed.status == 90 { return failed("endpoint has no running namespace") }
+    if routed.status == 91 { return failed("endpoint namespace equals host namespace") }
+    if routed.status != 0 { return Check { ok: false; value: ""; error: "" } }
+    let mounts = data.field(entry, "Mounts")
+    for mount in mounts.items {
+        let destination = data.field(mount, "Destination").text
+        if destination != "/certs" && destination != "/www" && destination != "/downloads" { return failed("unexpected endpoint mount") }
+        let path = canonical(data.field(mount, "Source").text, scratch)
+        if !quic.starts(path, temporary + "/") { return failed("endpoint mount is outside ephemeral runner files") }
+        let mode = "755"
+        if destination == "/downloads" { mode = "777" }
+        test.require(capture(["chmod", mode, "--", path], system.environment(), "", scratch, 30), "endpoint mount mode")
+        let links = capture(["find", path, "-mindepth", "1", "-type", "l"], system.environment(), "", scratch, 60)
+        test.require(links, "endpoint fixture inventory")
+        if trimmed(links.output) != "" { return failed("unexpected fixture symlink") }
+        test.require(capture(["find", path, "-mindepth", "1", "-type", "d", "-exec", "chmod", "755", "{}", "+"], system.environment(), "", scratch, 60), "endpoint fixture directories")
+        if destination != "/downloads" {
+            test.require(capture(["find", path, "-mindepth", "1", "!", "-type", "d", "-exec", "chmod", "444", "{}", "+"], system.environment(), "", scratch, 60), "endpoint fixture files")
+        }
+    }
+    let identity = data.field(entry, "Id").text
+    let ready = capture([options.docker, "exec", "--user", "65534:65534", identity, "sh", "-c", "mkdir -p /logs/qlog && touch /tmp/network-ready"], options.environment, "", scratch, 60)
+    if ready.status != 0 { return Check { ok: false; value: ""; error: "" } }
+    return accepted(identity)
+}
+
+function selectedImplementations(servers: Text, clients: Text): Text {
+    let names = quic.split(servers + "," + clients, 44)
+    names.sort()
+    let result: List<Text> = []
+    for name in names { if result.length == 0 || result[result.length - 1] != name { result.add(name) } }
+    return quic.joined(result, ",")
+}
+function elapsed(started: Integer): Text { return quic.seconds(started) }
+function failure(message: Text): Outcome { return Outcome { status: 1; error: message; manifest: "" } }
+function stopped(handle: Integer): system.ProcessStatus {
+    let child = system.childProcessId(handle)
+    if child > 0 { system.sendSignal(child, 15) }
+    let limit = system.monotonicNanoseconds() + 20000000000
+    let status = system.poll(handle)
+    while status.state == system.PENDING && system.monotonicNanoseconds() < limit {
+        quic.pause(100)
+        status = system.poll(handle)
+    }
+    if status.state == system.PENDING {
+        if child > 0 { system.sendSignal(child, 9) }
+        status = system.wait(handle)
+    }
+    return status
+}
+
+public function control(options: Options): Outcome {
+    if options.platform != "Linux" || options.effectiveUser != 0 || variable(options.environment, "MINYAR_REMOTE_LOAD") != "1" {
+        return failure("remote Linux admin orchestration required")
+    }
+    let scratch = test.scratch()
+    let probe = capture([options.tshark, "--version"], options.environment, "", scratch, 60)
+    if probe.status != 0 { test.removeTree(scratch); return failure("tshark version probe failed") }
+    let version = tshark(probe.output)
+    if !version.ok { test.removeTree(scratch); return failure(version.error) }
+    let runner = resolved(options.runner, scratch)
+    directory(options.artifacts, scratch)
+    let artifacts = resolved(options.artifacts, scratch)
+    directory(options.temporary, scratch)
+    let temporary = resolved(options.temporary, scratch)
+    let names = files.list(runner)
+    names.sort()
+    for name in names {
+        if quic.starts(name, ".") || !quic.ends(name, ".py") { continue }
+        let contents = readTextFile(runner + "/" + name)
+        let changed = test.replace(contents, "dir=\"/tmp\"", "dir=\"" + temporary + "\"")
+        if changed != contents { writeTextFile(runner + "/" + name, changed) }
+    }
+    for pair in [[options.servers, "servers"], [options.clients, "clients"], [options.tests, "tests"], [options.mustInclude, "must_include"]] {
+        let check = selectedNames(pair[0], pair[1])
+        if !check.ok { test.removeTree(scratch); return failure(check.error) }
+    }
+    if quic.split(options.mustInclude, 44).length != 1 {
+        test.removeTree(scratch)
+        return failure("exactly one required implementation is supported by the official runner")
+    }
+    let registry = runner + "/implementations_quic.json"
+    let implementations = data.decode(files.readFile(registry))
+    test.check(data.isObject(implementations), "official implementation registry must be a JSON object")
+    implementations = data.with(implementations, "minyar", data.object(["image", "url", "role"], [data.string(IMAGE), data.string("local-development"), data.string("both")]))
+    writeTextFile(registry, data.pretty(implementations) + "\n")
+    let compose = runner + "/docker-compose.yml"
+    writeTextFile(compose, test.replace(readTextFile(compose), "    cap_add:\n      - NET_ADMIN\n    ulimits:", "    ulimits:"))
+    let ngtcp2 = variable(options.environment, "MINYAR_NGTCP2_IMAGE")
+    if ngtcp2 == "" { ngtcp2 = "minyar-ngtcp2:lab" }
+    let replacements = "quiche=minyar-quiche:lab,quinn=minyar-quinn:lab,ngtcp2=" + ngtcp2 + ",msquic=minyar-msquic:lab"
+    let environment = runnerEnvironment(options.environment, temporary)
+    let invocation = [options.python, runner + "/run.py", "-s", options.servers, "-c", options.clients, "-i", options.mustInclude, "-t", options.tests,
+        "-r", replacements, "-j", artifacts + "/matrix.json", "-l", artifacts + "/logs", "-n", selectedImplementations(options.servers, options.clients)]
+    let started = system.monotonicNanoseconds()
+    let configured: List<Text> = []
+    let launch = ["sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>&1", "minyar", artifacts + "/runner.log"]
+    for item in invocation { launch.add(item) }
+    let handle = system.spawn("/bin/sh", launch, environment, runner)
+    test.check(handle > 0, "cannot launch the official runner")
+    let error = ""
+    let status = system.poll(handle)
+    while status.state == system.PENDING && error == "" {
+        if system.monotonicNanoseconds() - started > options.deadline * 1000000000 { error = "interop matrix deadline exceeded"; break }
+        for node in ["server", "client"] {
+            let inspected = capture([options.docker, "inspect", "--format", "{{.Id}} {{.State.Running}}", node], options.environment, "", scratch, 60)
+            let identifier = trimmed(inspected.output)
+            if inspected.status == 0 && quic.ends(identifier, " true") && !contains(configured, identifier) {
+                let found = configure(options, node, temporary, scratch)
+                if !found.ok && found.error != "" { error = found.error; break }
+                if found.ok && found.value != "" { configured.add(identifier) }
+            }
+        }
+        if error != "" { break }
+        quic.pause(100)
+        status = system.poll(handle)
+    }
+    if status.state == system.PENDING { status = stopped(handle) }
+    let cleanup = environment
+    for name in ["SERVER_WWW", "CLIENT_WWW", "SERVER_DOWNLOADS", "CLIENT_DOWNLOADS", "CERTS"] { cleanup = quic.setting(cleanup, name, temporary) }
+    cleanup = quic.setting(cleanup, "SERVER", IMAGE)
+    cleanup = quic.setting(cleanup, "CLIENT", IMAGE)
+    capture([options.docker, "compose", "--env-file", "empty.env", "down", "--timeout", "5"], cleanup, runner, scratch, 120)
+    if error != "" { test.removeTree(scratch); return failure(error) }
+    let runnerStatus = status.exitCode
+    if status.state == system.SIGNALED { runnerStatus = -status.signal }
+    let commit = capture([options.git, "-c", "safe.directory=" + runner, "rev-parse", "HEAD"], options.environment, runner, scratch, 60)
+    test.require(commit, "official runner commit")
+    let controller = files.readFile(options.controller)
+    test.check(files.lastError() == 0, "cannot read controller identity")
+    let manifest = data.object(["runner_commit", "tshark", "elapsed_seconds", "configured_endpoints", "tests", "servers", "clients", "must_include", "controller_sha256"],
+        [data.string(trimmed(commit.output)), data.string(version.value), data.decimal(elapsed(started)), data.number(configured.length), data.string(options.tests),
+        data.string(options.servers), data.string(options.clients), data.string(options.mustInclude), data.string(sha256.hex(sha256.digest(controller)))])
+    let evidence = matrixEvidence(artifacts + "/matrix.json", options.servers, options.clients, options.tests, options.mustInclude, runnerStatus)
+    for index in 0..evidence.keys.length { manifest = data.with(manifest, evidence.keys[index], evidence.items[index]) }
+    writeTextFile(artifacts + "/manifest.json", data.pretty(manifest) + "\n")
+    test.removeTree(scratch)
+    return Outcome { status: data.integer(data.field(manifest, "status")); error: ""; manifest: data.dumps(manifest) }
+}
+
+function effectiveUser(): Integer {
+    if files.pathSize("/proc/self/status") < 0 { return -1 }
+    for line in test.lines(Text(files.readFile("/proc/self/status"))) {
+        let fields = test.words(line)
+        if fields.length >= 3 && fields[0] == "Uid:" { return Integer(fields[2]) }
+    }
+    return -1
+}
+function platformName(): Text {
+    if files.pathSize("/proc/sys/kernel/ostype") < 0 { return "" }
+    return trimmed(Text(files.readFile("/proc/sys/kernel/ostype")))
+}
+
+public function main(): Integer {
+    let values = ["", "", "minyar", "minyar,quiche,ngtcp2,msquic", "handshake,transfer", "minyar", DEFAULT_TEMPORARY, "python3"]
+    let flags = ["--runner", "--artifacts", "--servers", "--clients", "--tests", "--must-include", "--temporary", "--python"]
+    let index = 0
+    while index < argumentCount() {
+        let known = -1
+        for position in 0..flags.length { if argument(index) == flags[position] { known = position } }
+        if known < 0 || index + 1 >= argumentCount() { system.writeStandardError("usage: quic-interop --runner DIR --artifacts DIR [--servers S] [--clients C] [--tests T] [--must-include NAME] [--temporary DIR] [--python PATH]\n"); return 2 }
+        values[known] = argument(index + 1)
+        index += 2
+    }
+    if values[0] == "" || values[1] == "" { system.writeStandardError("--runner and --artifacts are required\n"); return 2 }
+    let outcome = control(Options { runner: values[0]; artifacts: values[1]; servers: values[2]; clients: values[3]; tests: values[4]; mustInclude: values[5]; temporary: values[6]
+        python: values[7]; tshark: "tshark"; docker: "docker"; git: "git"; platform: platformName(); effectiveUser: effectiveUser(); environment: system.environment(); deadline: 3600; controller: "/proc/self/exe" })
+    if outcome.error != "" { fail(outcome.error) }
+    print(outcome.manifest)
+    return outcome.status
+}

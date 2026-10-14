@@ -1,0 +1,80 @@
+use "../tools/testing.min" as test
+use "./quic-interop.min" as interop
+use "./quic-test-support.min" as quic
+use "json" as json
+use "system" as system
+use "files" as files
+
+function value(environment: List<Text>, name: Text): Text {
+    for entry in environment { if quic.starts(entry, name + "=") { return quic.after(entry, name + "=") } }
+    return ""
+}
+function identity(format: Text, work: Text): Text {
+    let result = test.run(["stat", "-L", "-c", format, "/proc/self/ns/net"], system.environment(), "", work + "/stat-" + Text(system.monotonicNanoseconds()), 10)
+    test.require(result, "namespace identity")
+    return quic.output(result, "namespace identity")[0]
+}
+function entry(pid: Integer, mode: Text): json.Value {
+    let parsed = json.parse("{\"State\": {\"Pid\": " + Text(pid) + "}, \"HostConfig\": {\"NetworkMode\": \"" + mode + "\"}}")
+    test.check(parsed.kind == json.OBJECT, "namespace fixture")
+    return parsed
+}
+function pin(pid: Integer, work: Text, tail: Text): Integer {
+    return system.spawn("/bin/sh", ["sh", "-c", interop.pinnedNamespace() + tail, "minyar", Text(pid), work], system.environment(), "")
+}
+
+let platform = ""
+if files.pathSize("/proc/sys/kernel/ostype") >= 0 { platform = quic.output(test.Result { status: 0; output: Text(files.readFile("/proc/sys/kernel/ostype")); errorOutput: "" }, "platform")[0] }
+let root = false
+if files.pathSize("/proc/self/status") >= 0 {
+    for line in test.lines(Text(files.readFile("/proc/self/status"))) {
+        let fields = test.words(line)
+        if fields.length >= 3 && fields[0] == "Uid:" && fields[2] == "0" { root = true }
+    }
+}
+if platform != "Linux" || !root || system.getenv("MINYAR_REMOTE_LOAD") != "1" { fail("remote admin correctness test required") }
+let work = test.scratch()
+let environment = interop.runnerEnvironment([], interop.DEFAULT_TEMPORARY)
+test.check(value(environment, "SERVER") != "" && value(environment, "CLIENT") != "", "runner images missing")
+for name in ["CERTS", "SERVER_WWW", "CLIENT_WWW", "SERVER_DOWNLOADS", "CLIENT_DOWNLOADS", "SERVER_LOGS", "CLIENT_LOGS"] {
+    test.check(value(environment, name) == interop.DEFAULT_TEMPORARY, "runner fixture directory differs: " + name)
+}
+for mode in ["host", "bridge"] {
+    let check = interop.networkNamespace(entry(system.processId(), mode))
+    if check.ok {
+        let handle = pin(Integer(check.value), work, "exit 0")
+        test.check(handle > 0, "namespace pin launch")
+        test.check(system.wait(handle).exitCode == 91, "host namespace accepted")
+    }
+}
+let host = identity("%d:%i", work)
+let hostInode = identity("%i", work)
+let child = system.spawn("/usr/bin/unshare", ["unshare", "--net", "sleep", "30"], system.environment(), "")
+test.check(child > 0, "unshare launch")
+let pid = system.childProcessId(child)
+let deadline = system.monotonicNanoseconds() + 5000000000
+let holder = -1
+while holder < 0 && system.monotonicNanoseconds() < deadline {
+    let check = interop.networkNamespace(entry(pid, "bridge"))
+    test.check(check.ok, "new namespace entry rejected")
+    let handle = pin(pid, work, "work=$1; stat -L -c %i /proc/self/fd/3 >\"$work/pinned.tmp\" && mv \"$work/pinned.tmp\" \"$work/pinned\" || exit 92; while [ ! -e \"$work/go\" ]; do sleep 0.01; done; nsenter --net=/proc/self/fd/3 stat -Lc %i /proc/self/ns/net >\"$work/actual\"")
+    test.check(handle > 0, "namespace pin launch")
+    while files.pathSize(work + "/pinned") < 0 && system.poll(handle).state == system.PENDING { quic.pause(10) }
+    if files.pathSize(work + "/pinned") > 0 { holder = handle } else {
+        let status = system.wait(handle)
+        test.check(status.exitCode == 91 || status.exitCode == 90, "namespace pin failed: " + Text(status.exitCode))
+        quic.pause(10)
+    }
+}
+test.check(holder > 0, "new namespace was not created")
+let pinned = test.lines(readTextFile(work + "/pinned"))[0]
+system.sendSignal(pid, 15)
+system.wait(child)
+test.check(files.pathSize("/proc/" + Text(pid) + "/ns/net") < 0, "exited endpoint namespace remains visible")
+writeTextFile(work + "/go", "")
+test.check(system.wait(holder).exitCode == 0, "pinned namespace entry failed")
+let actual = test.lines(readTextFile(work + "/actual"))[0]
+test.check(actual == pinned && pinned != hostInode, "pinned namespace identity differs")
+test.check(identity("%d:%i", work) == host, "host namespace changed")
+test.removeTree(work)
+print("Interop namespaces: host mode/inode rejected; pinned FD survives endpoint exit and host namespace remains unchanged")

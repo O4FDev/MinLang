@@ -1,0 +1,109 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "json" as json
+use "sha256" as sha256
+use "system" as system
+use "files" as files
+
+function usage(message: Text) {
+    system.writeStandardError("usage: quic-peer-soak --peer-binary PATH --fixtures DIR --address ADDRESS --duration SECONDS --peers COUNT [--interval-ms MS] [--setup-delay-ms MS] --report PATH --log PATH\nquic-peer-soak: error: " + message + "\n")
+    exit(2)
+}
+function number(value: Text, name: Text): Integer {
+    let raw = Bytes(value)
+    let start = 0
+    if raw.length > 0 && raw[0] == 45 { start = 1 }
+    if raw.length == start || raw.length > 18 { usage("argument " + name + ": invalid int value: '" + value + "'") }
+    for index in start..raw.length { if raw[index] < 48 || raw[index] > 57 { usage("argument " + name + ": invalid int value: '" + value + "'") } }
+    return Integer(value)
+}
+function configuration(name: Text, scratch: Text): Integer {
+    let result = test.run(["getconf", name], system.environment(), "", scratch + "/getconf", 10)
+    test.require(result, "getconf " + name)
+    return Integer(quic.output(result, "getconf")[0])
+}
+function sample(pid: Integer, page: Integer, ticks: Integer, started: Integer): json.Value {
+    let path = "/proc/" + Text(pid) + "/stat"
+    let raw = files.readFile(path)
+    if files.lastError() != 0 || raw.length == 0 { return data.none() }
+    let close = -1
+    for index in 0..raw.length { if raw[index] == 41 { close = index } }
+    let fields = test.words(Text(raw.slice(close + 1, raw.length)))
+    let load = test.words(Text(files.readFile("/proc/loadavg")))
+    let cpu = Float(Integer(fields[11]) + Integer(fields[12])) / Float(ticks)
+    return data.object(["rss_bytes", "cpu_seconds", "elapsed_seconds", "host_load_average"],
+        [data.number(Integer(fields[21]) * page), data.decimal(Text(cpu)), data.decimal(quic.seconds(started)), data.array([data.decimal(load[0]), data.decimal(load[1]), data.decimal(load[2])])])
+}
+function publish(path: Text, report: json.Value) { writeTextFile(path, data.pretty(report) + "\n") }
+
+let names = ["--peer-binary", "--fixtures", "--address", "--duration", "--peers", "--interval-ms", "--setup-delay-ms", "--report", "--log"]
+let values = ["", "", "", "", "", "15000", "10", "", ""]
+let index = 0
+while index < argumentCount() {
+    let known = -1
+    for position in 0..names.length { if argument(index) == names[position] { known = position } }
+    if known < 0 { usage("unrecognized arguments: " + argument(index)) }
+    if index + 1 >= argumentCount() { usage("argument " + names[known] + ": expected one argument") }
+    values[known] = argument(index + 1)
+    index += 2
+}
+for position in [0, 1, 2, 3, 4, 7, 8] { if values[position] == "" { usage("the following arguments are required: " + names[position]) } }
+let duration = number(values[3], "--duration")
+let peers = number(values[4], "--peers")
+let interval = number(values[5], "--interval-ms")
+let setup = number(values[6], "--setup-delay-ms")
+let linux = files.pathSize("/proc/sys/kernel/ostype") >= 0 && test.contains(Text(files.readFile("/proc/sys/kernel/ostype")), "Linux")
+if !linux || system.getenv("MINYAR_REMOTE_LOAD") != "1" { usage("remote Linux opt-in required") }
+if peers < 1 || peers > 16384 || duration < 1 || interval < 1 || setup < 0 || setup > 10000 { usage("invalid bounded scale configuration") }
+let command = [values[0], values[2], values[1] + "/root.der", values[1] + "/client.der", values[1] + "/client.pk8", Text(duration), Text(peers), Text(interval)]
+let idleText = system.getenv("MINYAR_QUINN_IDLE_SECONDS")
+if idleText == "" { idleText = "0" }
+let idle = number(idleText, "MINYAR_QUINN_IDLE_SECONDS")
+if idle < 0 || idle > 120 { usage("invalid bounded idle window") }
+let scratch = test.scratch()
+let page = configuration("PAGESIZE", scratch)
+let ticks = configuration("CLK_TCK", scratch)
+let binary = files.readFile(values[0])
+test.check(files.lastError() == 0, "cannot read the independent peer binary")
+let started = system.monotonicNanoseconds()
+let samples: List<json.Value> = []
+let header = data.object(["peers", "duration_after_all_authenticated", "idle_seconds", "heartbeat_interval_ms", "setup_delay_ms", "binary_sha256"],
+    [data.number(peers), data.number(duration), data.number(idle), data.number(interval), data.number(setup), data.string(sha256.hex(sha256.digest(binary)))])
+let environment = quic.setting(system.environment(), "MINYAR_QUINN_SETUP_DELAY_MS", Text(setup))
+let launch = ["sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>&1", "minyar", values[8]]
+for item in command { launch.add(item) }
+let handle = system.spawn("/bin/sh", launch, environment, "")
+test.check(handle > 0, "cannot start the independent peer")
+let pid = system.childProcessId(handle)
+let report = data.with(data.with(header, "samples", data.array(samples)), "pid", data.number(pid))
+print("PEER_PID " + Text(pid))
+let limit = duration + 660 + idle + (peers * 5 + 999) / 1000
+let status = system.poll(handle)
+while status.state == system.PENDING {
+    if system.monotonicNanoseconds() - started > limit * 1000000000 {
+        system.sendSignal(pid, 15)
+        system.wait(handle)
+        fail("independent peer exceeded setup/run deadline")
+    }
+    let observed = sample(pid, page, ticks, started)
+    if observed.kind == json.NULL { break }
+    samples = samples.appended(observed)
+    report = data.with(report, "samples", data.array(samples))
+    publish(values[7], report)
+    quic.pause(10000)
+    status = system.poll(handle)
+}
+if status.state == system.PENDING { status = system.wait(handle) }
+let code = status.exitCode
+if status.state == system.SIGNALED { code = -status.signal }
+report = data.with(data.with(report, "status", data.number(code)), "elapsed_seconds", data.decimal(quic.seconds(started)))
+publish(values[7], report)
+test.removeTree(scratch)
+if code != 0 {
+    let log = readTextFile(values[8])
+    let raw = Bytes(log)
+    let start = 0
+    if raw.length > 4000 { start = raw.length - 4000 }
+    fail(Text(raw.slice(start, raw.length)))
+}
