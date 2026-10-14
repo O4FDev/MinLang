@@ -1,0 +1,125 @@
+use "../tools/testing.min" as test
+use "./peer-support.min" as peer
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Outcome { result: test.Result; report: json.Value }
+
+constant FAMILY = "PeerReports"
+constant NAMES: List<Text> = ["test_partial_exclusions", "test_skipped_capability", "test_skip_after_work", "test_domain_partial",
+    "test_wrong_result", "test_setup_failure"]
+
+function fixture() {
+    let suite = peer.suite(FAMILY, "tests/evidence-peer-reports.min", NAMES)
+    if suite.child && suite.selected.length == 1 && suite.selected[0] == "test_setup_failure" { fail("required compiler unavailable") }
+    let c = peer.begin(suite)
+    if c.name == "test_partial_exclusions" {
+        peer.control(c, "platform_exclusions", peer.jsonTexts(["normalization-sensitive-name"]))
+        let printed = peer.runChecked(c, ["/bin/sh", "-c", "echo 42"], "execute", 5)
+        peer.equal(c, printed.output, "42\n", "partial stdout")
+        let marker = system.getenv("PEER_REPORT_WORKSPACES")
+        if marker != "" { writeTextFile(marker, c.directory) }
+    }
+    if c.name == "test_skipped_capability" { peer.skip(c, "requires a Linux character device") }
+    if c.name == "test_skip_after_work" {
+        let printed = peer.runChecked(c, ["/bin/sh", "-c", "echo work"], "execute", 5)
+        peer.equal(c, printed.output, "work\n", "work before skip")
+        peer.skip(c, "missing optional capability")
+    }
+    if c.name == "test_domain_partial" {
+        let exclusion = peer.jsonObject()
+        peer.put(exclusion, "domain", peer.jsonText("overflow"))
+        peer.put(exclusion, "count", peer.jsonInteger(3))
+        peer.put(exclusion, "reason", peer.jsonText("normal-exit selection"))
+        peer.control(c, "domain_exclusions", peer.jsonArray([exclusion]))
+        let coverage = peer.jsonObject()
+        peer.put(coverage, "overflow_processes_executed", peer.jsonInteger(0))
+        peer.control(c, "domain_coverage", coverage)
+    }
+    if c.name == "test_wrong_result" { peer.equalInteger(c, 1, 2, "O2 variant") }
+    peer.finish(c)
+}
+
+function run(self: Text, scratch: Text, label: Text, selectors: List<Text>, gate: Text): Outcome {
+    let results = scratch + "/" + label + "-results"
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !peer.starts(entry, "MINYAR_PEER_RESULTS=") && !peer.starts(entry, "MINYAR_PEER_GATE=") && !peer.starts(entry, "MINYAR_PEER_OBSERVATION=") &&
+            !peer.starts(entry, "PEER_REPORT_") && !peer.starts(entry, "MINYAR_TEST_EVIDENCE=") { environment.add(entry) }
+    }
+    environment.add("PEER_REPORT_FIXTURE=1")
+    environment.add("PEER_REPORT_WORKSPACES=" + scratch + "/" + label + "-workspace")
+    environment.add("MINYAR_PEER_RESULTS=" + results)
+    environment.add("MINYAR_TEST_EVIDENCE=" + scratch + "/" + label + "-evidence")
+    if gate != "" { environment.add("MINYAR_PEER_GATE=" + gate) }
+    let command = [self]
+    for item in selectors { command.add(FAMILY + "." + item) }
+    let result = test.run(command, environment, "", scratch + "/" + label + ".log", 300)
+    let reports: List<Text> = []
+    for name in files.list(results) { if peer.ends(name, ".json") { reports.add(name) } }
+    test.check(reports.length == 1, label + ": expected one peer report\n" + result.output + result.errorOutput)
+    let report = json.parse(readTextFile(results + "/" + reports[0]))
+    test.check(report.kind == json.OBJECT, label + ": invalid peer report")
+    return Outcome { result: result; report: report }
+}
+function selected(report: json.Value, index: Integer): json.Value { return json.member(report, "selected").items[index] }
+function skipReason(row: json.Value): Text {
+    let skips = json.member(row, "skips")
+    test.check(skips.kind == json.ARRAY && skips.items.length > 0, "missing skip record")
+    return json.member(skips.items[0], "reason").text
+}
+
+function test_peer_report_preserves_exclusions_and_skips_after_success(self: Text, scratch: Text) {
+    let outcome = run(self, scratch, "skips", ["test_partial_exclusions", "test_skipped_capability", "test_skip_after_work"], "")
+    test.check(outcome.result.status == 0, "partial and skipped cases must not fail the run\n" + outcome.result.output + outcome.result.errorOutput)
+    let report = outcome.report
+    test.check(json.member(report, "successful").truth, "partial and skipped cases must keep the run successful")
+    test.check(!json.member(report, "complete_selection").truth, "partial or skipped cases claimed a complete selection")
+    let outcomes: List<Text> = []
+    for row in json.member(report, "selected").items { outcomes.add(json.member(row, "outcome").text) }
+    test.check(peer.joined(outcomes, ",") == "partial,skipped,skipped", "peer outcomes " + peer.joined(outcomes, ","))
+    let exclusions = json.member(selected(report, 0), "exclusions")
+    test.check(exclusions.kind == json.ARRAY && exclusions.items.length == 1 && exclusions.items[0].text == "normalization-sensitive-name", "platform exclusions were not preserved")
+    test.check(skipReason(selected(report, 1)) == "requires a Linux character device", "skip reason was not preserved")
+    test.check(skipReason(selected(report, 2)) == "missing optional capability", "skip after work was not preserved")
+    let workspace = readTextFile(scratch + "/skips-workspace")
+    test.check(workspace != "" && files.pathSize(workspace) < 0 && files.list(workspace).length == 0, "successful partial case kept its evidence workspace")
+}
+
+function test_peer_report_records_domain_omissions_without_claiming_full_pass(self: Text, scratch: Text) {
+    let outcome = run(self, scratch, "domain", ["test_domain_partial"], "check-peer-ownership")
+    test.check(outcome.result.status == 0, "domain-partial case failed\n" + outcome.result.output + outcome.result.errorOutput)
+    let report = outcome.report
+    test.check(json.member(report, "gate").text == "check-peer-ownership", "peer gate was not recorded")
+    test.check(!json.member(report, "complete_selection").truth, "domain omissions claimed a complete selection")
+    let row = selected(report, 0)
+    test.check(json.member(row, "outcome").text == "partial", "domain omissions were not partial")
+    let exclusions = json.member(row, "domain_exclusions")
+    test.check(exclusions.kind == json.ARRAY && exclusions.items.length == 1 && json.member(exclusions.items[0], "count").text == "3", "domain exclusion count was not preserved")
+    test.check(json.member(json.member(row, "domain_coverage"), "overflow_processes_executed").text == "0", "domain coverage was not preserved")
+}
+
+function test_peer_report_never_promotes_subtest_or_setup_failure_to_pass(self: Text, scratch: Text) {
+    let outcome = run(self, scratch, "failures", ["test_wrong_result", "test_setup_failure"], "")
+    test.check(outcome.result.status != 0, "failed peer cases passed the run")
+    let report = outcome.report
+    test.check(!json.member(report, "successful").truth, "failed peer cases reported success")
+    test.check(!json.member(report, "complete_selection").truth, "failed peer cases claimed a complete selection")
+    test.check(json.member(selected(report, 0), "outcome").text == "failed", "wrong result was not a failure")
+    test.check(json.member(selected(report, 1), "outcome").text == "failed", "setup failure was not a failure")
+    let failures = json.member(report, "failures")
+    test.check(failures.kind == json.ARRAY && failures.items.length == 2, "expected both failed cases in the failure list")
+    test.check(peer.contains(json.member(failures.items[1], "detail").text, "required compiler unavailable"), "setup failure detail was not retained")
+}
+
+if system.getenv("PEER_REPORT_FIXTURE") == "1" { fixture() }
+else {
+    test.check(argumentCount() == 1, "usage: evidence-peer-reports SELF")
+    let scratch = test.scratch()
+    test_peer_report_preserves_exclusions_and_skips_after_success(argument(0), scratch)
+    test_peer_report_records_domain_omissions_without_claiming_full_pass(argument(0), scratch)
+    test_peer_report_never_promotes_subtest_or_setup_failure_to_pass(argument(0), scratch)
+    test.removeTree(scratch)
+    print("peer report harness: 3 cases passed")
+}

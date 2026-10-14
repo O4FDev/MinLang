@@ -97,9 +97,15 @@ build/tooling/tests/evidence-harness.ll build/tooling/tests/evidence-replay.ll: 
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: tests/evidence-support-native.c runtime/native/sha256.c
-check-evidence-harness: build/minyarc build/minyar-runtime.o build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay
+build/tooling/tests/evidence-peer-reports.ll: tests/peer-support.min tests/cpython-random.min
+build/tooling/tests/evidence-peer-reports: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/evidence-peer-reports: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/evidence-peer-reports: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/evidence-peer-reports: runtime/native/sha256.c build/testing/cycle-runtime.o
+check-evidence-harness: build/minyarc build/minyar-runtime.o build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay build/tooling/tests/evidence-peer-reports
 	python3 tests/evidence-harness.py
 	./build/tooling/tests/evidence-harness "$(CURDIR)/build/tooling/tests/evidence-harness" "$(CURDIR)/build/tooling/tests/evidence-replay"
+	$(LIMITED) ./build/tooling/tests/evidence-peer-reports "$(CURDIR)/build/tooling/tests/evidence-peer-reports"
 
 .PHONY: check-performance-metrics
 build/tooling/tests/performance-metrics: TOOL_RUNTIME = build/testing/cycle-runtime.o
