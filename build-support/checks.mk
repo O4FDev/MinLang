@@ -110,7 +110,7 @@ check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o build/toolin
 
 # Explicit because AFL++ is an optional developer/CI dependency and campaigns
 # are duration-based. MINYAR_AFL_SECONDS controls the bounded run length.
-check-fuzz-coverage: check-fuzz-afl-harness build/minyarc
+check-fuzz-coverage: check-fuzz-afl-harness build/minyarc build/tooling/tools/sanitize-llvm
 	sh scripts/fuzz-afl.sh
 
 COVERAGE_TOOLS = build/tooling/scripts/coverage build/tooling/tests/coverage-harness build/tooling/tests/coverage-inlining
@@ -555,7 +555,7 @@ check: check-runtime-numeric
 check-sanitize: check-runtime-numeric-sanitize
 
 .PHONY: check-fuzz-afl-harness
-check-fuzz-afl-harness: build/tooling/tests/fuzz-afl-harness
+check-fuzz-afl-harness: build/tooling/tests/fuzz-afl-harness build/tooling/tools/sanitize-llvm
 	./build/tooling/tests/fuzz-afl-harness
 
 .PHONY: check-bootstrap-portability
