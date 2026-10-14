@@ -1,0 +1,447 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "deflate" as deflate
+use "../../tools/testing.min" as test
+use "./process.min" as process
+use "./archive.min" as archive
+
+constant SECRET = "MINYAR_PHASE1_ATACAMA_AGE_KEY"
+constant BASE_WORKFLOW_SHA = "9389fa0a06af9faaa02316b35c5a3e4fe6df2b98c34ff67c99f0cc9e84182574"
+
+record Paths { here: Text; helper: Text; make: Text; age: Text; keygen: Text }
+record Outcome { status: Integer; output: Bytes; errors: Bytes }
+record Evidence { names: List<Text>; values: List<Bytes> }
+record Fixture {
+    root: Text; key: Text; recipient: Text; fakeKey: Text; repo: Text; sha: Text
+    archive: Bytes; cipher: Text; metadata: Text; bin: Text; output: Text; environment: List<Text>
+    archiveBytes: Integer; archiveDigest: Text; cipherBytes: Integer; cipherDigest: Text
+}
+
+function readBytes(path: Text): Bytes {
+    let data = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot read " + path)
+    return data
+}
+
+function write(path: Text, data: Bytes) {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    test.check(file >= 0, "cannot create " + path)
+    test.check(files.write(file, data, 0, data.length) == data.length && files.close(file) == 0, "cannot write " + path)
+}
+
+function stripped(source: Text): Text {
+    let data = Bytes(source)
+    let start = 0
+    let end = data.length
+    while start < end && data[start] <= 32 { start += 1 }
+    while end > start && data[end - 1] <= 32 { end -= 1 }
+    return Text(data.slice(start, end))
+}
+
+function has(data: Bytes, needle: Text): Boolean {
+    return process.find(data, Bytes(needle)) >= 0
+}
+
+function run(fixture: Fixture, argv: List<Text>, label: Text): test.Result {
+    let result = test.run(argv, system.environment(), "", fixture.root + "/" + label + ".log", 8)
+    test.require(result, label)
+    return result
+}
+
+function gzip(data: Bytes): Bytes {
+    let packed = deflate.compress(data, deflate.GZIP, 9, data.length * 2 + 1024)
+    test.check(deflate.ok(packed), "cannot gzip synthetic input")
+    return deflate.data(packed)
+}
+
+function frozenCiphertextAndPublicMetadataAreByteBound(paths: Paths) {
+    let meta = json.parseBytes(readBytes(paths.here + "/atacama-input.json"), 1048576)
+    let cipher = readBytes(paths.here + "/atacama-085b55736fda.tar.gz.age")
+    test.check(json.string(meta, "source_files") == "15", "source_files")
+    test.check(json.string(meta, "source_commit") == "085b55736fda3f7e583170d7e54c66d4eaaaedb6", "source_commit")
+    test.check(json.string(meta, "source_archive_sha256") == "c6a384748b935538ed9993159e94272f8dcdf7ec15a9c29cf30e662034416e69", "source_archive_sha256")
+    test.check(json.string(meta, "public_recipient") == "age1d8ycp2hg3trz0kng5nsu70vux9x632fd7qy3wdjlk5cm7lpzgemsl5q6e2", "public_recipient")
+    test.check(cipher.length == 249086, "ciphertext length")
+    test.check(json.member(meta, "ciphertext_bytes").kind == json.NUMBER && json.string(meta, "ciphertext_bytes") == Text(cipher.length), "ciphertext_bytes")
+    test.check(process.digest(cipher) == "96937f6a37dc15c30506bdb9531747322ff0d77e046d2b1efca0f41dc68ad0da", "ciphertext digest")
+    test.check(process.digest(cipher) == json.string(meta, "ciphertext_sha256"), "ciphertext_sha256")
+}
+
+function existingJobsUnchangedAndMissingGatesAdded(paths: Paths) {
+    let data = readBytes(paths.here + "/../workflows/ci.yml")
+    let marker = Bytes("\n  macos-phase1-desktop:\n")
+    let at = process.find(data, marker)
+    test.check(at >= 0, "missing Phase1 Darwin qualification jobs")
+    test.check(process.digest(data.slice(0, at)) == BASE_WORKFLOW_SHA, "existing jobs changed: " + process.digest(data.slice(0, at)))
+    let added = data.slice(at + marker.length, data.length)
+    for target in ["check-macos", "check-http", "check-graphics-render", "check-managed-graphs-profiles", "check-sanitize"] {
+        test.check(has(added, target), "missing " + target)
+    }
+    test.check(has(added, "MINYAR_PHASE1_ATACAMA_AGE_KEY"), "missing private key binding")
+    test.check(has(added, "github.repository == 'O4FDev/MinLang'"), "missing repository guard")
+    test.check(has(added, "github.ref == 'refs/heads/v2'"), "missing branch guard")
+    test.check(has(added, "github.event_name == 'workflow_dispatch'"), "missing dispatch guard")
+    test.check(has(added, "github.event_name == 'push'"), "missing push guard")
+    test.check(!has(added, "continue-on-error"), "continue-on-error present")
+    test.check(!has(added, "if: env.MINYAR_PHASE1_ATACAMA_AGE_KEY"), "private job is optional")
+    test.check(has(added, "path: ${{ runner.temp }}/phase1-atacama-evidence.age"), "missing encrypted evidence upload")
+}
+
+function temporary(): Text {
+    let parent = test.setting("TMPDIR", "/tmp")
+    for attempt in 0..100 {
+        let name = Bytes()
+        for byte in randomBytes(8) { name.add(97 + byte % 26) }
+        let path = parent + "/minyar-ci-fake-" + Text(name)
+        let created = process.makeDirectory(path, 0o700)
+        if created == 0 { return path }
+        test.check(created == -17, "cannot create test directory")
+    }
+    fail("cannot create test directory")
+}
+
+function metadataText(fixture: Fixture): Text {
+    return "{\"source_commit\": \"" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + "\", \"source_tree\": \"" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" +
+        "\", \"source_files\": 1, \"source_archive_bytes\": " + Text(fixture.archiveBytes) +
+        ", \"source_archive_sha256\": " + process.quote(fixture.archiveDigest) +
+        ", \"ciphertext_bytes\": " + Text(fixture.cipherBytes) +
+        ", \"ciphertext_sha256\": " + process.quote(fixture.cipherDigest) +
+        ", \"public_recipient\": " + process.quote(fixture.recipient) + "}"
+}
+
+function writeMetadata(fixture: Fixture) {
+    write(fixture.metadata, Bytes(metadataText(fixture)))
+}
+
+function setMode(fixture: Fixture, mode: Text) {
+    write(fixture.bin + "/make-mode", Bytes(mode))
+}
+
+function withSecret(environment: List<Text>, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !process.begins(entry, SECRET + "=") { result.add(entry) } }
+    result.add(SECRET + "=" + value)
+    return result
+}
+
+function withoutSecret(environment: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !process.begins(entry, SECRET + "=") { result.add(entry) } }
+    return result
+}
+
+function encryptArchive(fixture: Fixture, paths: Paths, data: Bytes, label: Text) {
+    let zipped = fixture.root + "/" + label + ".gz"
+    write(zipped, gzip(data))
+    run(fixture, [paths.age, "-r", fixture.recipient, "-o", fixture.cipher, zipped], label + "-encrypt")
+    let cipher = readBytes(fixture.cipher)
+    fixture.archive = data
+    fixture.archiveBytes = data.length
+    fixture.archiveDigest = process.digest(data)
+    fixture.cipherBytes = cipher.length
+    fixture.cipherDigest = process.digest(cipher)
+}
+
+function setUp(paths: Paths): Fixture {
+    let root = temporary()
+    test.check(process.changeMode(root, 0o700) == 0, "cannot protect test directory")
+    let fixture = Fixture {
+        root: root; key: root + "/fake-key"; recipient: ""; fakeKey: ""; repo: root + "/repo"; sha: ""
+        archive: Bytes(); cipher: root + "/input.age"; metadata: root + "/metadata.json"; bin: root + "/bin"
+        output: root + "/evidence.age"; environment: []; archiveBytes: 0; archiveDigest: ""; cipherBytes: 0; cipherDigest: ""
+    }
+    run(fixture, [paths.keygen, "-o", fixture.key], "keygen")
+    fixture.recipient = stripped(run(fixture, [paths.keygen, "-y", fixture.key], "recipient").output)
+    fixture.fakeKey = Text(readBytes(fixture.key))
+    test.check(process.makeDirectory(fixture.repo, 0o700) == 0, "cannot create fake repository")
+    write(fixture.repo + "/minyar", Bytes("#!/bin/sh\nexit 0\n"))
+    test.check(process.changeMode(fixture.repo + "/minyar", 0o755) == 0, "cannot mark fake launcher executable")
+    write(fixture.repo + "/.gitignore", Bytes("build/\n"))
+    run(fixture, ["git", "init", "-q", fixture.repo], "git-init")
+    run(fixture, ["git", "-C", fixture.repo, "add", "."], "git-add")
+    run(fixture, ["git", "-C", fixture.repo, "-c", "user.name=CI test", "-c", "user.email=ci@example.invalid", "commit", "-qm", "test(ci): fake source"], "git-commit")
+    fixture.sha = stripped(run(fixture, ["git", "-C", fixture.repo, "rev-parse", "HEAD"], "git-head").output)
+    encryptArchive(fixture, paths, archive.write(["Makefile"], [Bytes("# synthetic private input\n")]), "input")
+    writeMetadata(fixture)
+    test.check(process.makeDirectory(fixture.bin, 0o700) == 0, "cannot create fake tool directory")
+    run(fixture, ["ln", "-s", paths.make, fixture.bin + "/make"], "fake-make")
+    setMode(fixture, "exit 0")
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !process.begins(entry, "PATH=") && !process.begins(entry, "RUNNER_TEMP=") && !process.begins(entry, SECRET + "=") { environment.add(entry) }
+    }
+    environment.add("PATH=" + fixture.bin + ":" + system.getenv("PATH"))
+    environment.add("RUNNER_TEMP=" + root)
+    fixture.environment = withSecret(environment, fixture.fakeKey)
+    return fixture
+}
+
+function startHelper(fixture: Fixture, paths: Paths): Integer {
+    files.remove(fixture.root + "/helper.out")
+    files.remove(fixture.root + "/helper.err")
+    let argv = ["sh", "-c", "out=$1; err=$2; shift 2; exec \"$@\" >\"$out\" 2>\"$err\"", "sh", fixture.root + "/helper.out", fixture.root + "/helper.err",
+        paths.helper, "--repository", fixture.repo, "--sha", fixture.sha, "--input", fixture.cipher,
+        "--metadata", fixture.metadata, "--evidence", fixture.output]
+    let handle = system.spawn("/bin/sh", argv, fixture.environment, "")
+    test.check(handle > 0, "cannot start private helper")
+    return handle
+}
+
+function finishHelper(fixture: Fixture, handle: Integer, seconds: Integer): Outcome {
+    let deadline = system.monotonicNanoseconds() + seconds * 1000000000
+    let state = system.poll(handle)
+    while state.state == system.PENDING {
+        if system.monotonicNanoseconds() > deadline {
+            system.sendSignal(system.childProcessId(handle), 9)
+            system.wait(handle)
+            fail("private helper timed out")
+        }
+        process.pause(20)
+        state = system.poll(handle)
+    }
+    test.check(state.error == 0, "cannot wait for private helper")
+    let status = state.exitCode
+    if state.state == system.SIGNALED { status = -state.signal }
+    return Outcome { status: status; output: readBytes(fixture.root + "/helper.out"); errors: readBytes(fixture.root + "/helper.err") }
+}
+
+function invoke(fixture: Fixture, paths: Paths): Outcome {
+    return finishHelper(fixture, startHelper(fixture, paths), 12)
+}
+
+function evidence(fixture: Fixture, paths: Paths): Evidence {
+    let plain = fixture.root + "/evidence.tar.gz"
+    files.remove(plain)
+    run(fixture, [paths.age, "-d", "-i", fixture.key, "-o", plain, fixture.output], "evidence-decrypt")
+    let inflated = deflate.decompress(readBytes(plain), deflate.GZIP, 67108864)
+    test.check(deflate.ok(inflated), "evidence is not gzip")
+    let listing = archive.read(deflate.data(inflated))
+    test.check(listing.ok, "evidence is not a tar archive: " + listing.error)
+    let result = Evidence { names: []; values: [] }
+    for member in listing.members {
+        let name = Text(member.name)
+        result.names.add(name)
+        test.check(!test.contains(name, "identity.txt"), "identity in evidence")
+        if archive.isFile(member) {
+            test.check(!has(member.data, fixture.fakeKey), "key in evidence")
+            test.check(!has(member.data, "AGE-SECRET-KEY-"), "identity in evidence")
+            result.values.add(member.data)
+        }
+    }
+    return result
+}
+
+function receiptPresent(found: Evidence): Boolean {
+    for name in found.names { if process.ends(name, "make-receipt.json") { return true } }
+    return false
+}
+
+function assertPrivate(fixture: Fixture, result: Outcome) {
+    let publicOutput = result.output.slice(0, result.output.length)
+    publicOutput.addBytes(result.errors)
+    for sentinel in ["PRIVATE_", "AGE-SECRET-KEY", "Traceback", "Makefile"] {
+        test.check(!has(publicOutput, sentinel), "private content in public output")
+    }
+    let lines = process.split(Text(result.output), 10)
+    for index in 0..lines.length {
+        let line = lines[index]
+        if index == lines.length - 1 && line == "" { continue }
+        let value = json.parseBytes(Bytes(line), 65536)
+        test.check(value.kind == json.OBJECT && value.keys.length == 3, "unexpected status line: " + line)
+        for key in ["stage", "status", "sha"] {
+            test.check(json.member(value, key).kind == json.STRING, "unexpected status line: " + line)
+        }
+        let stage = json.string(value, "stage")
+        test.check(stage == "input" || stage == "source" || stage == "make" || stage == "evidence" || stage == "qualification", "unexpected stage: " + line)
+        let status = json.string(value, "status")
+        test.check(status == "passed" || status == "failed", "unexpected status: " + line)
+    }
+    test.check(result.errors.length == 0, "helper wrote public diagnostics")
+    for name in files.list(fixture.root) {
+        test.check(!process.begins(name, "minyar-atacama-private-"), "private workspace not cleaned")
+    }
+}
+
+function tearDown(fixture: Fixture) {
+    test.check(process.removeTree(fixture.root), "cannot remove test directory")
+}
+
+function stdoutStderrGrandchildrenKeysAndFreshBuildArePrivate(paths: Paths) {
+    let fixture = setUp(paths)
+    let result = invoke(fixture, paths)
+    test.check(result.status == 0, "helper failed: " + Text(result.status))
+    assertPrivate(fixture, result)
+    let found = evidence(fixture, paths)
+    let joined = Bytes()
+    for value in found.values {
+        joined.addBytes(value)
+        joined.add(10)
+    }
+    test.check(has(joined, "PRIVATE_GRANDCHILD_SENTINEL"), "grandchild output missing from evidence")
+    test.check(has(joined, "PRIVATE_STDERR_SENTINEL"), "Make stderr missing from evidence")
+    test.check(has(joined, "PRIVATE_IR_SENTINEL"), "private IR missing from evidence")
+    test.check(receiptPresent(found), "Make receipt missing from evidence")
+    test.check(!process.info(fixture.repo + "/build", false).exists, "public checkout got private IR")
+    tearDown(fixture)
+}
+
+function failedMakeStatusIsNotHiddenByEncryption(paths: Paths) {
+    let fixture = setUp(paths)
+    setMode(fixture, "exit 7")
+    let result = invoke(fixture, paths)
+    test.check(result.status == 7, "Make status hidden: " + Text(result.status))
+    assertPrivate(fixture, result)
+    test.check(receiptPresent(evidence(fixture, paths)), "Make receipt missing from evidence")
+    tearDown(fixture)
+}
+
+function wrongKeyMissingKeyTamperingAndHashMismatchPreventMake(paths: Paths) {
+    let fixture = setUp(paths)
+    for name in ["wrong-key", "missing-key", "tampered", "archive-hash", "cipher-hash"] {
+        let original = readBytes(fixture.cipher)
+        let originalDigest = fixture.cipherDigest
+        if name == "wrong-key" {
+            let other = fixture.root + "/other-key"
+            run(fixture, [paths.keygen, "-o", other], "other-key")
+            fixture.environment = withSecret(fixture.environment, Text(readBytes(other)))
+        } else if name == "missing-key" {
+            fixture.environment = withoutSecret(fixture.environment)
+        } else if name == "tampered" {
+            let changed = original.slice(0, original.length)
+            changed[changed.length - 1] = changed[changed.length - 1] ^ 1
+            write(fixture.cipher, changed)
+            fixture.cipherDigest = process.digest(changed)
+        } else if name == "archive-hash" {
+            fixture.archiveDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+        } else {
+            fixture.cipherDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+        writeMetadata(fixture)
+        let result = invoke(fixture, paths)
+        test.check(result.status != 0, name + ": helper passed on bad input")
+        assertPrivate(fixture, result)
+        test.check(!receiptPresent(evidence(fixture, paths)), name + ": Make ran on bad input")
+        write(fixture.cipher, original)
+        fixture.cipherDigest = originalDigest
+        fixture.archiveDigest = process.digest(fixture.archive)
+        fixture.environment = withSecret(fixture.environment, fixture.fakeKey)
+    }
+    tearDown(fixture)
+}
+
+function encryptionFailureHasNoPlaintextFallbackOrStaleCiphertext(paths: Paths) {
+    let fixture = setUp(paths)
+    let wrapper = fixture.bin + "/age"
+    write(wrapper, Bytes("#!/bin/sh\ncase \"$1\" in --encrypt) exit 9;; esac\nexec \"" + paths.age + "\" \"$@\"\n"))
+    test.check(process.changeMode(wrapper, 0o755) == 0, "cannot mark age wrapper executable")
+    write(fixture.output, Bytes("stale ciphertext must not survive"))
+    let result = invoke(fixture, paths)
+    test.check(result.status != 0, "encryption failure passed")
+    assertPrivate(fixture, result)
+    test.check(!process.info(fixture.output, false).exists, "encryption failed open")
+    setMode(fixture, "exit 7")
+    result = invoke(fixture, paths)
+    test.check(result.status == 7, "Make status hidden: " + Text(result.status))
+    assertPrivate(fixture, result)
+    test.check(!process.info(fixture.output, false).exists, "failed Make gained a plaintext fallback")
+    tearDown(fixture)
+}
+
+function unsafeArchiveFailsBeforeMake(paths: Paths) {
+    let fixture = setUp(paths)
+    files.remove(fixture.cipher)
+    encryptArchive(fixture, paths, archive.write(["../escape"], [Bytes("x")]), "replacement")
+    writeMetadata(fixture)
+    let result = invoke(fixture, paths)
+    test.check(result.status != 0, "unsafe archive passed")
+    assertPrivate(fixture, result)
+    test.check(!process.info(fixture.root + "/escape", false).exists, "archive escaped its workspace")
+    test.check(!receiptPresent(evidence(fixture, paths)), "Make ran on an unsafe archive")
+    tearDown(fixture)
+}
+
+function sourceModeChangeCannotPass(paths: Paths) {
+    let fixture = setUp(paths)
+    setMode(fixture, "chmod")
+    let result = invoke(fixture, paths)
+    test.check(result.status != 0, "source mode change passed")
+    assertPrivate(fixture, result)
+    evidence(fixture, paths)
+    tearDown(fixture)
+}
+
+function liveChild(fixture: Fixture): Integer {
+    for name in files.list(fixture.root) {
+        if !process.begins(name, "minyar-atacama-private-") { continue }
+        let path = fixture.root + "/" + name + "/downstream/build/live-child-pid"
+        if files.pathSize(path) > 0 {
+            let value = 0
+            for byte in files.readFile(path) {
+                if byte < 48 || byte > 57 { return 0 }
+                value = value * 10 + byte - 48
+            }
+            return value
+        }
+    }
+    return 0
+}
+
+function cancelledMakeClosesDescendantsAndEncryptsFailure(paths: Paths) {
+    let fixture = setUp(paths)
+    setMode(fixture, "sleep")
+    let handle = startHelper(fixture, paths)
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    let descendant = liveChild(fixture)
+    while descendant == 0 && system.monotonicNanoseconds() < deadline {
+        process.pause(20)
+        descendant = liveChild(fixture)
+    }
+    if descendant == 0 {
+        system.sendSignal(system.childProcessId(handle), 9)
+        system.wait(handle)
+        fail("synthetic Make did not start")
+    }
+    test.check(system.sendSignal(system.childProcessId(handle), 15) == 0, "cannot cancel private helper")
+    let result = finishHelper(fixture, handle, 5)
+    test.check(result.status == 143, "cancelled helper status: " + Text(result.status))
+    assertPrivate(fixture, result)
+    let state = test.run(["ps", "-o", "stat=", "-p", Text(descendant)], system.environment(), "", fixture.root + "/descendant.log", 2)
+    let shown = stripped(state.output)
+    test.check(shown == "" || process.begins(shown, "Z"), "owned descendant survived cancellation")
+    evidence(fixture, paths)
+    tearDown(fixture)
+}
+
+function main(): Integer {
+    let root = process.currentDirectory()
+    if argumentCount() > 0 { root = argument(0) }
+    let paths = Paths {
+        here: root + "/.github/phase1"; helper: root + "/build/tooling/.github/phase1/private-atacama"
+        make: root + "/build/tooling/.github/phase1/fake-make"; age: ""; keygen: ""
+    }
+    frozenCiphertextAndPublicMetadataAreByteBound(paths)
+    print("ok Coverage.test_frozen_ciphertext_and_public_metadata_are_byte_bound")
+    existingJobsUnchangedAndMissingGatesAdded(paths)
+    print("ok Coverage.test_existing_jobs_unchanged_and_missing_gates_added")
+    test.check(process.info(paths.helper, true).exists, "private downstream helper is missing")
+    paths.age = process.which("age", system.environment())
+    paths.keygen = process.which("age-keygen", system.environment())
+    test.check(paths.age != "" && paths.keygen != "", "age and age-keygen are required for orchestration checks")
+    test.check(process.info(paths.make, true).exists, "synthetic Make is missing")
+    stdoutStderrGrandchildrenKeysAndFreshBuildArePrivate(paths)
+    print("ok Privacy.test_stdout_stderr_grandchildren_keys_and_fresh_build_are_private")
+    failedMakeStatusIsNotHiddenByEncryption(paths)
+    print("ok Privacy.test_failed_make_status_is_not_hidden_by_encryption")
+    wrongKeyMissingKeyTamperingAndHashMismatchPreventMake(paths)
+    print("ok Privacy.test_wrong_key_missing_key_tampering_and_hash_mismatch_prevent_make")
+    encryptionFailureHasNoPlaintextFallbackOrStaleCiphertext(paths)
+    print("ok Privacy.test_encryption_failure_has_no_plaintext_fallback_or_stale_ciphertext")
+    unsafeArchiveFailsBeforeMake(paths)
+    print("ok Privacy.test_unsafe_archive_fails_before_make")
+    sourceModeChangeCannotPass(paths)
+    print("ok Privacy.test_source_mode_change_cannot_pass")
+    cancelledMakeClosesDescendantsAndEncryptsFailure(paths)
+    print("ok Privacy.test_cancelled_make_closes_descendants_and_encrypts_failure")
+    return 0
+}

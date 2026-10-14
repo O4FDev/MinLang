@@ -1,0 +1,276 @@
+public constant REGULAR = 48
+public constant DIRECTORY = 53
+
+public record Member { name: Bytes; type: Integer; mode: Integer; size: Integer; data: Bytes }
+public record Listing { ok: Boolean; error: Text; members: List<Member> }
+record Field { key: Bytes; value: Bytes }
+
+function failed(message: Text): Listing {
+    return Listing { ok: false; error: message; members: [] }
+}
+
+public function isFile(member: Member): Boolean {
+    return member.type == REGULAR || member.type == 0 || member.type == 55
+}
+
+public function isDirectory(member: Member): Boolean { return member.type == DIRECTORY }
+
+function terminated(source: Bytes, start: Integer, end: Integer): Bytes {
+    let stop = start
+    while stop < end && source[stop] != 0 { stop += 1 }
+    return source.slice(start, stop)
+}
+
+function number(source: Bytes, start: Integer, end: Integer): Integer {
+    if source[start] == 128 || source[start] == 255 {
+        let value = 0
+        for index in (start + 1)..end {
+            if value > 36028797018963967 { return -1 }
+            value = value * 256 + source[index]
+        }
+        if source[start] == 255 { return -1 }
+        return value
+    }
+    let field = terminated(source, start, end)
+    let first = 0
+    let last = field.length
+    while first < last && (field[first] == 32 || field[first] == 0) { first += 1 }
+    while last > first && (field[last - 1] == 32 || field[last - 1] == 0) { last -= 1 }
+    let value = 0
+    for index in first..last {
+        let digit = field[index] - 48
+        if digit < 0 || digit > 7 || value > 1152921504606846975 { return -1 }
+        value = value * 8 + digit
+    }
+    return value
+}
+
+function checksum(block: Bytes): Boolean {
+    let expected = number(block, 148, 156)
+    if expected < 0 { return false }
+    let unsigned = 256
+    let signed = 256
+    for index in 0..512 {
+        if index >= 148 && index < 156 { continue }
+        unsigned += block[index]
+        if block[index] >= 128 { signed += block[index] - 256 } else { signed += block[index] }
+    }
+    return expected == unsigned || expected == signed
+}
+
+function zero(block: Bytes): Boolean {
+    for byte in block { if byte != 0 { return false } }
+    return true
+}
+
+function blocks(size: Integer): Integer {
+    return (size + 511) / 512 * 512
+}
+
+function stripSlashes(name: Bytes): Bytes {
+    let end = name.length
+    while end > 0 && name[end - 1] == 47 { end -= 1 }
+    return name.slice(0, end)
+}
+
+function withoutSlash(name: Bytes): Bytes {
+    if name.length > 0 && name[name.length - 1] == 47 { return name.slice(0, name.length - 1) }
+    return name
+}
+
+function decimal(source: Bytes): Integer {
+    if source.length == 0 { return -1 }
+    let value = 0
+    for byte in source {
+        if byte < 48 || byte > 57 || value > 922337203685477579 { return -1 }
+        value = value * 10 + byte - 48
+    }
+    return value
+}
+
+function records(data: Bytes, fields: List<Field>): Boolean {
+    let position = 0
+    while position < data.length {
+        let cursor = position
+        while cursor < data.length && data[cursor] >= 48 && data[cursor] <= 57 { cursor += 1 }
+        if cursor == position || cursor >= data.length || data[cursor] != 32 { return true }
+        let length = decimal(data.slice(position, cursor))
+        let keyStart = cursor + 1
+        let equals = keyStart
+        while equals < data.length && data[equals] != 61 { equals += 1 }
+        if equals == keyStart || equals >= data.length { return true }
+        if length <= 0 { return false }
+        let end = position + length - 1
+        if end < equals + 1 || end > data.length { return false }
+        let key = data.slice(keyStart, equals)
+        let value = data.slice(equals + 1, end)
+        let replaced = false
+        for field in fields {
+            if same(field.key, key) { field.value = value; replaced = true }
+        }
+        if !replaced { fields.add(Field { key: key; value: value }) }
+        position += length
+    }
+    return true
+}
+
+function lookup(fields: List<Field>, key: Text): Bytes {
+    for field in fields { if same(field.key, Bytes(key)) { return field.value } }
+    return Bytes()
+}
+
+function known(fields: List<Field>, key: Text): Boolean {
+    for field in fields { if same(field.key, Bytes(key)) { return true } }
+    return false
+}
+
+public function read(source: Bytes): Listing {
+    let members: List<Member> = []
+    let globals: List<Field> = []
+    let offset = 0
+    let chained = false
+    let longName = Bytes()
+    let hasLongName = false
+    let extended: List<Field> = []
+    let hasExtended = false
+    while true {
+        if source.length - offset < 512 {
+            if offset == 0 { return failed("empty file") }
+            if chained { return failed("truncated header") }
+            break
+        }
+        let block = source.slice(offset, offset + 512)
+        if zero(block) {
+            if chained { return failed("missing member header") }
+            break
+        }
+        if !checksum(block) {
+            if offset == 0 || chained { return failed("invalid header") }
+            break
+        }
+        let type = block[156]
+        let name = terminated(block, 0, 100)
+        let mode = number(block, 100, 108)
+        let size = number(block, 124, 136)
+        let prefix = terminated(block, 345, 500)
+        if mode < 0 || size < 0 { return failed("invalid header") }
+        if type == 0 && name.length > 0 && name[name.length - 1] == 47 { type = DIRECTORY }
+        if type == DIRECTORY { name = stripSlashes(name) }
+        if prefix.length > 0 && type != 76 && type != 75 && type != 83 {
+            let joined = prefix.slice(0, prefix.length)
+            joined.add(47)
+            joined.addBytes(name)
+            name = joined
+        }
+        let start = offset + 512
+        if type == 76 || type == 75 || type == 120 || type == 103 || type == 88 {
+            if size > source.length - start { return failed("unexpected end of data") }
+            let data = source.slice(start, start + size)
+            offset = start + blocks(size)
+            if type == 76 {
+                longName = terminated(data, 0, data.length)
+                hasLongName = true
+            } else if type == 120 || type == 88 {
+                let local: List<Field> = []
+                for field in globals { local.add(Field { key: field.key; value: field.value }) }
+                if !records(data, local) { return failed("invalid header") }
+                extended = local
+                hasExtended = true
+            } else if type == 103 {
+                if !records(data, globals) { return failed("invalid header") }
+            }
+            chained = true
+            continue
+        }
+        if hasLongName {
+            name = longName
+            if type == DIRECTORY { name = withoutSlash(name) }
+        }
+        if hasExtended {
+            for field in extended {
+                if begins(field.key, "GNU.sparse.") { return failed("unsupported sparse member") }
+            }
+            if known(extended, "path") {
+                name = lookup(extended, "path")
+                if type == DIRECTORY { name = withoutSlash(name) }
+            }
+            if known(extended, "size") {
+                size = decimal(lookup(extended, "size"))
+                if size < 0 { size = 0 }
+            }
+        }
+        let member = Member { name: name; type: type; mode: mode; size: size; data: Bytes() }
+        let supported = type == 49 || type == 50 || type == 51 || type == 52 || type == DIRECTORY || type == 54
+        if isFile(member) || type == 83 || !supported {
+            if size > source.length - start { return failed("unexpected end of data") }
+            member.data = source.slice(start, start + size)
+            offset = start + blocks(size)
+        } else {
+            offset = start
+        }
+        members.add(member)
+        chained = false
+        hasLongName = false
+        hasExtended = false
+        extended = []
+    }
+    return Listing { ok: true; error: ""; members: members }
+}
+
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+
+function begins(source: Bytes, prefix: Text): Boolean {
+    let pattern = Bytes(prefix)
+    if source.length < pattern.length { return false }
+    for index in 0..pattern.length { if source[index] != pattern[index] { return false } }
+    return true
+}
+
+function octal(block: Bytes, start: Integer, width: Integer, value: Integer) {
+    let digits = width - 1
+    let remaining = value
+    for index in 0..digits {
+        block[start + digits - 1 - index] = 48 + remaining % 8
+        remaining = remaining / 8
+    }
+    block[start + digits] = 0
+}
+
+public function header(name: Text, mode: Integer, size: Integer, type: Integer): Bytes {
+    let block = Bytes(512)
+    let raw = Bytes(name)
+    for index in 0..raw.length { block[index] = raw[index] }
+    octal(block, 100, 8, mode)
+    octal(block, 108, 8, 0)
+    octal(block, 116, 8, 0)
+    octal(block, 124, 12, size)
+    octal(block, 136, 12, 0)
+    block[156] = type
+    let magic = Bytes("ustar")
+    for index in 0..magic.length { block[257 + index] = magic[index] }
+    block[263] = 48
+    block[264] = 48
+    for index in 148..156 { block[index] = 32 }
+    let sum = 0
+    for byte in block { sum += byte }
+    octal(block, 148, 7, sum)
+    block[155] = 32
+    return block
+}
+
+public function write(names: List<Text>, contents: List<Bytes>): Bytes {
+    let output = Bytes()
+    for index in 0..names.length {
+        let data = contents[index]
+        output.addBytes(header(names[index], 0o644, data.length, REGULAR))
+        output.addBytes(data)
+        output.resize(blocks(output.length))
+    }
+    output.resize(output.length + 1024)
+    output.resize((output.length + 10239) / 10240 * 10240)
+    return output
+}

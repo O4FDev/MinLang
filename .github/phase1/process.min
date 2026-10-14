@@ -1,0 +1,205 @@
+use "files" as files
+use "sha256" as sha
+
+public constant RUNNING = 1048576
+public constant REGULAR = 1
+public constant DIRECTORY = 2
+public constant LINK = 3
+
+public function lastError(): Integer { native "phase1" }
+public function umask(mask: Integer): Integer { native "phase1" }
+public function makeDirectory(path: Text, mode: Integer): Integer { native "phase1" }
+public function changeMode(path: Text, mode: Integer): Integer { native "phase1" }
+function status(path: Text, follow: Boolean): Bytes { native "phase1" }
+public function executable(path: Text): Boolean { native "phase1" }
+public function descriptorOpen(descriptor: Integer): Boolean { native "phase1" }
+public function currentDirectory(): Text { native "phase1" }
+public function redirect(path: Text): Integer { native "phase1" }
+public function writeAll(descriptor: Integer, data: Bytes): Integer { native "phase1" }
+public function closeDescriptor(descriptor: Integer): Integer { native "phase1" }
+function spawnNative(path: Text, argv: Bytes, envp: Bytes, cwd: Text, output: Text, merge: Boolean): Integer { native "phase1" }
+public function wait(pid: Integer, block: Boolean): Integer { native "phase1" }
+public function pause(milliseconds: Integer) { native "phase1" }
+
+public record Info { exists: Boolean; kind: Integer; mode: Integer; size: Integer }
+
+public function info(path: Text, follow: Boolean): Info {
+    let raw = status(path, follow)
+    if raw.length != 24 { return Info { exists: false; kind: 0; mode: 0; size: 0 } }
+    return Info { exists: true; kind: raw.getInt64(0); mode: raw.getInt64(8); size: raw.getInt64(16) }
+}
+
+function vector(items: List<Text>): Bytes {
+    let encoded = Bytes(8)
+    encoded.setInt64(0, items.length)
+    for item in items {
+        let bytes = Bytes(item)
+        let length = Bytes(8)
+        length.setInt64(0, bytes.length)
+        encoded.addBytes(length)
+        encoded.addBytes(bytes)
+    }
+    return encoded
+}
+
+public function spawn(path: Text, argv: List<Text>, environment: List<Text>, cwd: Text, output: Text, merge: Boolean): Integer {
+    return spawnNative(path, vector(argv), vector(environment), cwd, output, merge)
+}
+
+public function exitCode(state: Integer): Integer {
+    if state >= 256 { return 128 + state - 256 }
+    return state
+}
+
+public function begins(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    let offset = raw.length - pattern.length
+    for index in 0..pattern.length { if raw[offset + index] != pattern[index] { return false } }
+    return true
+}
+
+public function find(haystack: Bytes, needle: Bytes): Integer {
+    if needle.length == 0 { return 0 }
+    if needle.length > haystack.length { return -1 }
+    for start in 0..(haystack.length - needle.length + 1) {
+        let equal = true
+        for index in 0..needle.length {
+            if haystack[start + index] != needle[index] { equal = false; break }
+        }
+        if equal { return start }
+    }
+    return -1
+}
+
+public function contains(source: Text, needle: Text): Boolean {
+    return find(Bytes(source), Bytes(needle)) >= 0
+}
+
+public function split(source: Text, separator: Integer): List<Text> {
+    let raw = Bytes(source)
+    let parts: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == separator {
+            parts.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    return parts
+}
+
+public function setting(environment: List<Text>, name: Text): Text {
+    let prefix = name + "="
+    for entry in environment {
+        if begins(entry, prefix) { return Text(Bytes(entry).slice(Bytes(prefix).length, Bytes(entry).length)) }
+    }
+    return ""
+}
+
+public function present(environment: List<Text>, name: Text): Boolean {
+    for entry in environment { if begins(entry, name + "=") { return true } }
+    return false
+}
+
+public function which(name: Text, environment: List<Text>): Text {
+    if contains(name, "/") { return name }
+    let search = "/bin:/usr/bin"
+    if present(environment, "PATH") { search = setting(environment, "PATH") }
+    for directory in split(search, 58) {
+        let base = directory
+        if base == "" { base = "." }
+        let candidate = base + "/" + name
+        if executable(candidate) { return candidate }
+    }
+    return ""
+}
+
+public function digest(data: Bytes): Text {
+    return sha.hex(sha.digest(data))
+}
+
+public function fileDigest(path: Text): Text {
+    let data = files.readFile(path)
+    if files.lastError() != 0 { return "" }
+    return digest(data)
+}
+
+public function quote(text: Text): Text {
+    let raw = Bytes(text)
+    let output = Bytes()
+    output.add(34)
+    let digits = Bytes("0123456789abcdef")
+    for byte in raw {
+        if byte == 34 { output.add(92); output.add(34) }
+        else if byte == 92 { output.add(92); output.add(92) }
+        else if byte == 10 { output.add(92); output.add(110) }
+        else if byte == 13 { output.add(92); output.add(114) }
+        else if byte == 9 { output.add(92); output.add(116) }
+        else if byte < 32 || byte == 127 {
+            output.addBytes(Bytes("\\u00"))
+            output.add(digits[byte / 16])
+            output.add(digits[byte % 16])
+        } else { output.add(byte) }
+    }
+    output.add(34)
+    return Text(output)
+}
+
+public function textArray(items: List<Text>): Text {
+    let parts: List<Text> = ["["]
+    for index in 0..items.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(quote(items[index]))
+    }
+    parts.add("]")
+    return joinText(parts)
+}
+
+public function sortedNames(path: Text): List<Text> {
+    return files.list(path).sorted()
+}
+
+public function removeTree(path: Text): Boolean {
+    let found = info(path, false)
+    if !found.exists { return false }
+    if found.kind != DIRECTORY { return files.remove(path) == 0 }
+    let removed = true
+    for name in files.list(path) {
+        if !removeTree(path + "/" + name) { removed = false }
+    }
+    return files.removeDirectory(path) == 0 && removed
+}
+
+public function walk(root: Text, relative: Text, found: List<Text>) {
+    let base = root
+    if relative != "" { base = root + "/" + relative }
+    for name in sortedNames(base) {
+        let child = name
+        if relative != "" { child = relative + "/" + name }
+        found.add(child)
+        if info(root + "/" + child, false).kind == DIRECTORY { walk(root, child, found) }
+    }
+}
+
+public function makeDirectories(path: Text, mode: Integer): Boolean {
+    let raw = Bytes(path)
+    for index in 1..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 {
+            let prefix = Text(raw.slice(0, index))
+            let created = makeDirectory(prefix, mode)
+            if created != 0 && info(prefix, true).kind != DIRECTORY { return false }
+        }
+    }
+    return true
+}

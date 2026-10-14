@@ -372,18 +372,31 @@ jobs:
   phase1-ci-orchestration:
     name: Phase1 private input orchestration checks
     runs-on: macos-15
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.12'
-      - name: Install standard age
-        run: brew install age
+      - name: Install standard age and the native crypto provider
+        run: brew install age pkg-config openssl@3
+      - name: Select pinned LLVM 23.1.2
+        run: |
+          test "$(uname -m)" = arm64
+          archive="$RUNNER_TEMP/LLVM-23.1.2-macOS-ARM64.tar.xz"
+          llvm_prefix="$RUNNER_TEMP/minyar-llvm-23.1.2"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-macOS-ARM64.tar.xz -o "$archive"
+          printf '%s  %s\n' d7c26fc6177e42842e2d1ffaad31aec057c56a924392b1a23d830abe2c5d53b1 "$archive" | shasum -a 256 --check
+          mkdir -p "$llvm_prefix"
+          tar -xJf "$archive" -C "$llvm_prefix" --strip-components=1
+          llvm_bin="$llvm_prefix/bin"
+          echo "$llvm_bin" >> "$GITHUB_PATH"
+          for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=$llvm_bin/clang" >> "$GITHUB_ENV"; done
+          MINYAR_CLANG="$llvm_bin/clang" sh tools/toolchain.sh toolchain
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Build the Phase1 orchestration tools
+        run: make LIMITED= SANITIZER_LIMITED= phase1-tools
       - name: Check missing gates and synthetic private input invariants
-        run: python3 .github/phase1/test-qualification.py
+        run: ./build/tooling/.github/phase1/test-qualification
 
   macos-phase1-private-atacama:
     name: macOS private frozen Atacama public build
@@ -415,11 +428,13 @@ jobs:
           for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=$llvm_bin/clang" >> "$GITHUB_ENV"; done
           MINYAR_CLANG="$llvm_bin/clang" sh tools/toolchain.sh toolchain
           echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Build the private orchestration helper
+        run: make LIMITED= SANITIZER_LIMITED= build/tooling/.github/phase1/private-atacama
       - name: Run frozen owning check test all privately on exact current source
         env:
           MINYAR_PHASE1_ATACAMA_AGE_KEY: ${{ secrets.MINYAR_PHASE1_ATACAMA_AGE_KEY }}
         run: >-
-          python3 .github/phase1/private-atacama.py
+          ./build/tooling/.github/phase1/private-atacama
           --repository "$GITHUB_WORKSPACE" --sha "$GITHUB_SHA"
           --input .github/phase1/atacama-085b55736fda.tar.gz.age
           --metadata .github/phase1/atacama-input.json

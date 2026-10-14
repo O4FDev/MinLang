@@ -1,0 +1,108 @@
+use "system" as system
+use "files" as files
+use "./process.min" as process
+
+constant SECRET = "MINYAR_PHASE1_ATACAMA_AGE_KEY"
+
+function check(condition: Boolean, message: Text) {
+    if !condition {
+        system.writeStandardError("AssertionError: " + message + "\n")
+        exit(1)
+    }
+}
+
+function identityVisible(root: Text): Boolean {
+    for name in files.list(root) {
+        if name == "identity.txt" { return true }
+        let path = root + "/" + name
+        if process.info(path, false).kind == process.DIRECTORY && identityVisible(path) { return true }
+    }
+    return false
+}
+
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+
+function write(path: Text, data: Text) {
+    let bytes = Bytes(data)
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    check(file >= 0, "cannot create " + path)
+    check(files.write(file, bytes, 0, bytes.length) == bytes.length && files.close(file) == 0, "cannot write " + path)
+}
+
+function main(): Integer {
+    files.writeStandardOutput("PRIVATE_STDOUT_SENTINEL\n")
+    system.writeStandardError("PRIVATE_STDERR_SENTINEL\n")
+    let environment = system.environment()
+    check(!process.present(environment, SECRET), "private key inherited")
+    for descriptor in 3..32 { check(!process.descriptorOpen(descriptor), "inherited extra fd") }
+    check(!identityVisible(".."), "identity visible to Make")
+    let count = argumentCount()
+    check(count >= 3 && argument(count - 3) == "check" && argument(count - 2) == "test" && argument(count - 1) == "all", "unexpected Make goals")
+    let minyar = ""
+    let argv = ["make"]
+    for index in 0..count {
+        argv.add(argument(index))
+        if minyar == "" && process.begins(argument(index), "MINYAR=") {
+            minyar = Text(Bytes(argument(index)).slice(7, Bytes(argument(index)).length))
+        }
+    }
+    check(minyar != "", "missing MINYAR")
+    let candidate = parent(minyar)
+    let state = process.info(candidate, true)
+    check(state.exists && state.mode & 0o077 == 0, "candidate checkout is not private")
+    let built = process.makeDirectory(candidate + "/build", 0o777)
+    check((built == 0 || built == -17) && process.makeDirectory(candidate + "/build/programs", 0o777) == 0, "cannot create candidate build")
+    write(candidate + "/build/programs/private.ll", "PRIVATE_IR_SENTINEL")
+    let script = "if [ -n \"${" + SECRET + "+x}\" ]; then exit 1; fi; echo PRIVATE_GRANDCHILD_SENTINEL; echo PRIVATE_GRANDCHILD_ERROR >&2"
+    let grandchild = system.spawn("/bin/sh", ["sh", "-c", script], environment, "")
+    check(grandchild > 0, "cannot start grandchild")
+    let finished = system.wait(grandchild)
+    check(finished.state == system.EXITED && finished.exitCode == 0, "grandchild saw the private key")
+    check(process.makeDirectory("build", 0o777) == 0, "cannot create downstream build")
+    let names: List<Text> = []
+    for entry in environment {
+        let separator = process.find(Bytes(entry), Bytes("="))
+        if separator < 0 { continue }
+        let raw = Bytes(entry)
+        names.add(process.quote(Text(raw.slice(0, separator))) + ": " + process.quote(Text(raw.slice(separator + 1, raw.length))))
+    }
+    let pieces = ["{\"argv\": ", process.textArray(argv), ", \"env\": {"]
+    for index in 0..names.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add(names[index])
+    }
+    pieces.add("}}")
+    write("build/make-receipt.json", joinText(pieces))
+    let search = process.split(process.setting(environment, "PATH"), 58)
+    let mode = ""
+    if search.length > 0 && files.pathSize(search[0] + "/make-mode") >= 0 {
+        mode = Text(files.readFile(search[0] + "/make-mode"))
+    }
+    if mode == "chmod" {
+        check(process.changeMode("Makefile", 0o755) == 0, "cannot change source mode")
+        return 0
+    }
+    if mode == "sleep" {
+        let child = system.spawn("/bin/sleep", ["sleep", "8"], environment, "")
+        check(child > 0, "cannot start descendant")
+        write("build/live-child-pid", Text(system.childProcessId(child)))
+        process.pause(8000)
+        return 0
+    }
+    if process.begins(mode, "exit ") { return text(mode) }
+    return 0
+}
+
+function text(mode: Text): Integer {
+    let raw = Bytes(mode)
+    let value = 0
+    for index in 5..raw.length { value = value * 10 + raw[index] - 48 }
+    return value
+}

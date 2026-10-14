@@ -1,0 +1,807 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "deflate" as deflate
+use "text" as text
+use "errors" as errors
+use "./process.min" as process
+use "./archive.min" as archive
+
+constant SECRET = "MINYAR_PHASE1_ATACAMA_AGE_KEY"
+
+record Command { argv: List<Text>; cwd: Text; pid: Integer; returncode: Integer; seconds: Float; finished: Boolean }
+record Binding { path: Text; mode: Integer; size: Integer; digest: Text }
+record Number { ok: Boolean; value: Integer }
+record Options { repository: Text; sha: Text; input: Text; metadata: Text; evidence: Text }
+
+record Run {
+    statusFd: Integer
+    workspace: Text
+    identity: Text
+    environment: List<Text>
+    active: Integer
+    reaped: Boolean
+    commands: List<Command>
+    result: Integer
+    makeResult: Integer
+    hasMakeResult: Boolean
+    signal: Integer
+    watching: Boolean
+    sha: Text
+    failed: Boolean
+    failureType: Text
+    failure: Text
+    receiptFailureType: Text
+    receiptFailure: Text
+    input: Text
+    commit: Text
+    tree: Text
+    hasCandidate: Boolean
+    cleanAfter: Boolean
+    artifacts: List<Text>
+    hasArtifacts: Boolean
+}
+
+function isSha(value: Text): Boolean {
+    let raw = Bytes(value)
+    if raw.length != 40 { return false }
+    for byte in raw {
+        if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false }
+    }
+    return true
+}
+
+function report(run: Run, stage: Text, passed: Boolean) {
+    let state = "failed"
+    if passed { state = "passed" }
+    let sha = ""
+    if isSha(run.sha) { sha = run.sha }
+    let line = "{\"sha\": " + process.quote(sha) + ", \"stage\": " + process.quote(stage) + ", \"status\": " + process.quote(state) + "}\n"
+    process.writeAll(run.statusFd, Bytes(line))
+}
+
+function failWith(run: Run, kind: Text, message: Text) {
+    if run.failed { return }
+    run.failed = true
+    run.failureType = kind
+    run.failure = message
+}
+
+function logLine(line: Text) {
+    files.writeStandardOutput(line + "\n")
+}
+
+function interrupted(run: Run): Boolean {
+    if !run.watching { return false }
+    let received = system.drainShutdownSignals()
+    if received != 0 && run.signal == 0 { run.signal = received }
+    if run.signal != 0 {
+        failWith(run, "InterruptedError", "qualification interrupted")
+        return true
+    }
+    return false
+}
+
+function stripped(data: Bytes): Text {
+    let start = 0
+    let end = data.length
+    while start < end && data[start] <= 32 { start += 1 }
+    while end > start && data[end - 1] <= 32 { end -= 1 }
+    return Text(data.slice(start, end))
+}
+
+function absolute(path: Text): Text {
+    if process.begins(path, "/") { return path }
+    return process.currentDirectory() + "/" + path
+}
+
+function store(run: Run, path: Text, data: Bytes): Boolean {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 {
+        failWith(run, "OSError", "cannot write " + path)
+        return false
+    }
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written != data.length || closed != 0 {
+        failWith(run, "OSError", "cannot write " + path)
+        return false
+    }
+    return true
+}
+
+function load(run: Run, path: Text): Bytes {
+    let data = files.readFile(path)
+    if files.lastError() != 0 { failWith(run, "OSError", "cannot read " + path) }
+    return data
+}
+
+function processStates(run: Run, pid: Integer): Boolean {
+    let path = process.which("ps", run.environment)
+    if path == "" {
+        failWith(run, "FileNotFoundError", "[Errno 2] No such file or directory: 'ps'")
+        return false
+    }
+    let capture = run.workspace + "/.process-states"
+    let child = process.spawn(path, ["ps", "-g", Text(pid), "-o", "stat="], run.environment, "", capture, false)
+    if child <= 0 {
+        failWith(run, "OSError", "cannot inspect process group")
+        return false
+    }
+    let deadline = system.monotonicNanoseconds() + 2000000000
+    let state = process.wait(child, false)
+    while state == process.RUNNING {
+        if system.monotonicNanoseconds() > deadline {
+            system.sendSignal(child, 9)
+            process.wait(child, true)
+            files.remove(capture)
+            failWith(run, "TimeoutExpired", "process group inspection timed out")
+            return false
+        }
+        process.pause(10)
+        state = process.wait(child, false)
+    }
+    let output = files.readFile(capture)
+    files.remove(capture)
+    let start = 0
+    let word = false
+    for index in 0..(output.length + 1) {
+        let space = index == output.length
+        if index < output.length { space = output[index] <= 32 }
+        if space {
+            if word && output[start] != 90 { return false }
+            word = false
+        } else if !word {
+            word = true
+            start = index
+        }
+    }
+    return true
+}
+
+function closeGroup(run: Run, pid: Integer) {
+    let sent = system.sendSignal(-pid, 15)
+    if sent == -3 { return }
+    if sent == -1 {
+        if processStates(run, pid) { return }
+        failWith(run, "PermissionError", "[Errno 1] Operation not permitted")
+        return
+    }
+    if sent < 0 {
+        failWith(run, "OSError", "cannot signal process group")
+        return
+    }
+    if run.active == pid && !run.reaped {
+        let deadline = system.monotonicNanoseconds() + 200000000
+        while system.monotonicNanoseconds() < deadline {
+            if process.wait(pid, false) != process.RUNNING {
+                run.reaped = true
+                break
+            }
+            process.pause(10)
+        }
+    }
+    process.pause(50)
+    let killed = system.sendSignal(-pid, 9)
+    if killed == -1 && !processStates(run, pid) {
+        failWith(run, "PermissionError", "[Errno 1] Operation not permitted")
+    }
+}
+
+function launch(run: Run, argv: List<Text>, cwd: Text, output: Text, merge: Boolean, environment: List<Text>, required: Boolean): Integer {
+    let directory = cwd
+    if directory == "" { directory = run.workspace }
+    let record = Command { argv: argv; cwd: directory; pid: 0; returncode: 0; seconds: 0.0; finished: false }
+    run.commands.add(record)
+    logLine("{\"argv\": " + process.textArray(argv) + ", \"cwd\": " + process.quote(directory) + "}")
+    if interrupted(run) { return -1 }
+    let started = system.monotonicNanoseconds()
+    let path = process.which(argv[0], environment)
+    if path == "" {
+        failWith(run, "FileNotFoundError", "[Errno 2] No such file or directory: '" + argv[0] + "'")
+        return -1
+    }
+    let pid = process.spawn(path, argv, environment, directory, output, merge)
+    if pid <= 0 {
+        failWith(run, "OSError", "[Errno " + Text(-pid) + "] cannot start '" + argv[0] + "'")
+        return -1
+    }
+    record.pid = pid
+    run.active = pid
+    run.reaped = false
+    let delay = 1
+    let state = process.wait(pid, false)
+    while state == process.RUNNING {
+        if interrupted(run) {
+            closeGroup(run, pid)
+            if !run.reaped { process.wait(pid, true) }
+            run.active = 0
+            return -1
+        }
+        process.pause(delay)
+        if delay < 32 { delay = delay * 2 }
+        state = process.wait(pid, false)
+    }
+    run.reaped = true
+    if state < 0 {
+        failWith(run, "ChildProcessError", "cannot wait for private command")
+        run.active = 0
+        return -1
+    }
+    let returncode = state
+    if state >= 256 { returncode = 256 - state }
+    record.returncode = returncode
+    record.seconds = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    record.finished = true
+    if argv[0] == "make" {
+        run.makeResult = returncode
+        if returncode < 0 { run.makeResult = 128 - returncode }
+        run.hasMakeResult = true
+        run.result = run.makeResult
+    }
+    if required && returncode != 0 { failWith(run, "RuntimeError", "private command failed") }
+    closeGroup(run, pid)
+    run.active = 0
+    return returncode
+}
+
+function execute(run: Run, argv: List<Text>, cwd: Text, output: Text, required: Boolean): Integer {
+    if run.failed { return -1 }
+    return launch(run, argv, cwd, output, false, run.environment, required)
+}
+
+function integer(run: Run, meta: json.Value, name: Text): Number {
+    if !present(meta, name) {
+        failWith(run, "KeyError", "'" + name + "'")
+        return Number { ok: false; value: 0 }
+    }
+    let value = json.member(meta, name)
+    if value.kind != json.NUMBER { return Number { ok: false; value: 0 } }
+    let parsed = text.parseInteger(value.text)
+    if !errors.integerOk(parsed) { return Number { ok: false; value: 0 } }
+    return Number { ok: true; value: errors.integerValue(parsed) }
+}
+
+function string(run: Run, meta: json.Value, name: Text): Text {
+    if !present(meta, name) {
+        failWith(run, "KeyError", "'" + name + "'")
+        return ""
+    }
+    let value = json.member(meta, name)
+    if value.kind != json.STRING { return "-" }
+    return value.text
+}
+
+function present(meta: json.Value, name: Text): Boolean {
+    if meta.kind != json.OBJECT { return false }
+    for key in meta.keys { if key == name { return true } }
+    return false
+}
+
+function serialize(value: json.Value): Text {
+    if value.kind == json.STRING { return process.quote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN {
+        if value.truth { return "true" }
+        return "false"
+    }
+    if value.kind == json.NUMBER { return value.text }
+    let parts: List<Text> = []
+    if value.kind == json.ARRAY {
+        parts.add("[")
+        for index in 0..value.items.length {
+            if index > 0 { parts.add(", ") }
+            parts.add(serialize(value.items[index]))
+        }
+        parts.add("]")
+        return joinText(parts)
+    }
+    parts.add("{")
+    for index in 0..value.items.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(process.quote(value.keys[index]) + ": " + serialize(value.items[index]))
+    }
+    parts.add("}")
+    return joinText(parts)
+}
+
+function bindingText(binding: Binding): Text {
+    return "{\"path\": " + process.quote(binding.path) + ", \"mode\": " + Text(binding.mode) + ", \"bytes\": " + Text(binding.size) + ", \"sha256\": " + process.quote(binding.digest) + "}"
+}
+
+function snapshot(run: Run, source: Text, bindings: List<Binding>) {
+    let changed = false
+    for binding in bindings {
+        let path = source + "/" + binding.path
+        let found = process.info(path, false)
+        if !found.exists {
+            failWith(run, "FileNotFoundError", "[Errno 2] No such file or directory")
+            return
+        }
+        if found.kind != process.REGULAR {
+            failWith(run, "ValueError", "source type changed")
+            return
+        }
+        if found.mode != binding.mode || found.size != binding.size || process.fileDigest(path) != binding.digest { changed = true }
+    }
+    if changed { failWith(run, "ValueError", "source bytes or modes changed") }
+}
+
+function parts(name: Bytes): List<Text> {
+    let found: List<Text> = []
+    let start = 0
+    for index in 0..(name.length + 1) {
+        if index == name.length || name[index] == 47 {
+            let part = Text(name.slice(start, index))
+            if part != "" && part != "." { found.add(part) }
+            start = index + 1
+        }
+    }
+    return found
+}
+
+function ensureDirectory(run: Run, root: Text, segments: List<Text>, count: Integer): Boolean {
+    let path = root
+    for index in 0..count {
+        path = path + "/" + segments[index]
+        let created = process.makeDirectory(path, 0o777)
+        if created != 0 && process.info(path, false).kind != process.DIRECTORY {
+            failWith(run, "FileExistsError", "[Errno 17] File exists")
+            return false
+        }
+    }
+    return true
+}
+
+function extract(run: Run, data: Bytes, source: Text, count: Integer): List<Binding> {
+    let bindings: List<Binding> = []
+    let listing = archive.read(data)
+    if !listing.ok {
+        failWith(run, "ReadError", listing.error)
+        return bindings
+    }
+    let seen = Map<Text, Boolean>()
+    let fileCount = 0
+    for member in listing.members {
+        let segments = parts(member.name)
+        let unsafe = segments.length == 0 || (member.name.length > 0 && member.name[0] == 47)
+        for segment in segments { if segment == ".." || segment == ".git" { unsafe = true } }
+        let name = Text(member.name)
+        if seen.has(name) { unsafe = true }
+        if !(archive.isFile(member) || archive.isDirectory(member)) || member.mode & ~0o777 != 0 { unsafe = true }
+        if unsafe {
+            failWith(run, "ValueError", "unsafe private archive")
+            return bindings
+        }
+        seen[name] = true
+        if archive.isFile(member) { fileCount += 1 }
+    }
+    if fileCount != count {
+        failWith(run, "ValueError", "private file count mismatch")
+        return bindings
+    }
+    for member in listing.members {
+        let segments = parts(member.name)
+        if archive.isDirectory(member) {
+            if !ensureDirectory(run, source, segments, segments.length) { return bindings }
+            continue
+        }
+        if !ensureDirectory(run, source, segments, segments.length - 1) { return bindings }
+        let path = source + "/" + joinWith(segments, "/")
+        let file = files.open(path, files.WRITE | files.CREATE | files.EXCLUSIVE)
+        if file < 0 {
+            failWith(run, "FileExistsError", "[Errno 17] File exists")
+            return bindings
+        }
+        let written = files.write(file, member.data, 0, member.data.length)
+        if files.close(file) != 0 || written != member.data.length {
+            failWith(run, "OSError", "cannot extract private source")
+            return bindings
+        }
+        if process.changeMode(path, member.mode) != 0 {
+            failWith(run, "OSError", "cannot set private source mode")
+            return bindings
+        }
+        bindings.add(Binding { path: Text(member.name); mode: member.mode; size: member.size; digest: process.fileDigest(path) })
+    }
+    snapshot(run, source, bindings)
+    return bindings
+}
+
+function joinWith(items: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(items[index])
+    }
+    return joinText(pieces)
+}
+
+function machO(data: Bytes): Boolean {
+    if data.length < 4 { return false }
+    let a = data[0]
+    let b = data[1]
+    let c = data[2]
+    let d = data[3]
+    return (a == 207 && b == 250 && c == 237 && d == 254) || (a == 254 && b == 237 && c == 250 && d == 207) ||
+        (a == 202 && b == 254 && c == 186 && d == 190) || (a == 190 && b == 186 && c == 254 && d == 202)
+}
+
+function artifacts(run: Run, label: Text, root: Text) {
+    if !process.info(root, true).exists { return }
+    let found: List<Text> = []
+    process.walk(root, "", found)
+    for relative in found {
+        let path = root + "/" + relative
+        let entry = process.info(path, false)
+        if entry.kind != process.REGULAR { continue }
+        let data = load(run, path)
+        if run.failed { return }
+        run.artifacts.add("{\"path\": " + process.quote(label + "/" + relative) + ", \"bytes\": " + Text(entry.size) +
+            ", \"sha256\": " + process.quote(process.digest(data)) + ", \"mode\": " + Text(entry.mode) + "}")
+        if machO(data) {
+            execute(run, ["otool", "-hv", path], "", "", true)
+            execute(run, ["otool", "-L", path], "", "", true)
+            if run.failed { return }
+        }
+    }
+}
+
+function qualify(run: Run, options: Options, meta: json.Value): Integer {
+    if !isSha(options.sha) {
+        failWith(run, "ValueError", "invalid candidate SHA")
+        return 1
+    }
+    run.sha = options.sha
+    let cipherSize = integer(run, meta, "ciphertext_bytes")
+    if run.failed { return 1 }
+    let input = process.info(options.input, true)
+    if !input.exists {
+        failWith(run, "FileNotFoundError", "[Errno 2] No such file or directory: " + process.quote(options.input))
+        return 1
+    }
+    let cipherDigest = string(run, meta, "ciphertext_sha256")
+    if run.failed { return 1 }
+    if !cipherSize.ok || input.size != cipherSize.value || process.fileDigest(options.input) != cipherDigest {
+        failWith(run, "ValueError", "ciphertext binding mismatch")
+        return 1
+    }
+    if run.identity == "" {
+        failWith(run, "ValueError", "required private input key missing")
+        return 1
+    }
+    let key = run.workspace + "/identity.txt"
+    let zipped = run.workspace + "/input.tar.gz"
+    if store(run, key, Bytes(run.identity)) && process.changeMode(key, 0o600) == 0 {
+        run.identity = ""
+        execute(run, ["age", "--decrypt", "--identity", key, "--output", zipped, absolute(options.input)], "", "", true)
+    } else {
+        failWith(run, "OSError", "cannot store private input key")
+    }
+    run.identity = ""
+    files.remove(key)
+    if run.failed { return 1 }
+    let expected = integer(run, meta, "source_archive_bytes")
+    if run.failed { return 1 }
+    if !expected.ok || expected.value <= 0 || expected.value > 64 * 1024 * 1024 {
+        failWith(run, "ValueError", "invalid private archive size")
+        return 1
+    }
+    let compressed = load(run, zipped)
+    if run.failed { return 1 }
+    let inflated = deflate.decompress(compressed, deflate.GZIP, expected.value)
+    if !deflate.ok(inflated) && deflate.status(inflated) != deflate.LIMIT {
+        failWith(run, "BadGzipFile", "invalid private input compression")
+        return 1
+    }
+    let data = deflate.data(inflated)
+    let archiveDigest = string(run, meta, "source_archive_sha256")
+    if run.failed { return 1 }
+    if !deflate.ok(inflated) || data.length != expected.value || process.digest(data) != archiveDigest {
+        failWith(run, "ValueError", "original archive binding mismatch")
+        return 1
+    }
+    if !store(run, run.workspace + "/input.tar", data) { return 1 }
+    let source = run.workspace + "/downstream"
+    if process.makeDirectory(source, 0o700) != 0 {
+        failWith(run, "FileExistsError", "[Errno 17] File exists")
+        return 1
+    }
+    let count = integer(run, meta, "source_files")
+    if run.failed { return 1 }
+    if !count.ok { count.value = -1 }
+    let bindings = extract(run, data, source, count.value)
+    if run.failed { return 1 }
+    let rows: List<Text> = []
+    for binding in bindings { rows.add("  " + bindingText(binding)) }
+    let bindingsText = "[\n" + joinWith(rows, ",\n") + "\n]"
+    if bindings.length == 0 { bindingsText = "[]" }
+    if !store(run, run.workspace + "/private-source-bindings.json", Bytes(bindingsText)) { return 1 }
+    run.input = serialize(meta)
+    report(run, "input", true)
+    if interrupted(run) { return 1 }
+
+    let candidate = run.workspace + "/candidate"
+    execute(run, ["git", "clone", "--no-hardlinks", "--no-checkout", absolute(options.repository), candidate], "", "", true)
+    if run.failed { return 1 }
+    if process.changeMode(candidate, 0o700) != 0 {
+        failWith(run, "OSError", "cannot protect candidate checkout")
+        return 1
+    }
+    execute(run, ["git", "checkout", "--detach", options.sha], candidate, "", true)
+    let head = run.workspace + "/candidate-head.txt"
+    let tree = run.workspace + "/candidate-tree.txt"
+    let clean = run.workspace + "/candidate-before.txt"
+    execute(run, ["git", "rev-parse", "HEAD"], candidate, head, true)
+    execute(run, ["git", "rev-parse", "HEAD^{tree}"], candidate, tree, true)
+    execute(run, ["git", "status", "--porcelain"], candidate, clean, true)
+    if run.failed { return 1 }
+    let headText = stripped(load(run, head))
+    let dirty = load(run, clean).length > 0
+    let treeText = stripped(load(run, tree))
+    if run.failed { return 1 }
+    if headText != options.sha || dirty {
+        failWith(run, "ValueError", "candidate source mismatch or dirty checkout")
+        return 1
+    }
+    run.commit = options.sha
+    run.tree = treeText
+    run.hasCandidate = true
+    report(run, "source", true)
+    for argv in [["age", "--version"], ["clang", "--version"], ["xcrun", "--show-sdk-path"]] {
+        execute(run, argv, "", "", false)
+        if run.failed { return 1 }
+    }
+    let python = process.which("python3", run.environment)
+    if python == "" { python = "python3" }
+    let result = execute(run, ["make", "MINYAR=" + candidate + "/minyar", "MINYAR_PYTHON=" + python, "check", "test", "all"], source, "", false)
+    if run.failed { return 1 }
+    run.result = result
+    if result < 0 { run.result = 128 - result }
+    snapshot(run, source, bindings)
+    if run.failed { return 1 }
+    let after = run.workspace + "/candidate-after.txt"
+    execute(run, ["git", "status", "--porcelain"], candidate, after, true)
+    if run.failed { return 1 }
+    if load(run, after).length > 0 {
+        failWith(run, "ValueError", "candidate changed during qualification")
+        return 1
+    }
+    run.cleanAfter = true
+    artifacts(run, "candidate-build", candidate + "/build")
+    artifacts(run, "downstream-build", source + "/build")
+    if run.failed { return 1 }
+    run.hasArtifacts = true
+    report(run, "make", result == 0)
+    return run.result
+}
+
+function commandText(command: Command): Text {
+    let pieces = ["{\"argv\": ", process.textArray(command.argv), ", \"cwd\": ", process.quote(command.cwd)]
+    if command.pid > 0 { pieces.add(", \"pid\": " + Text(command.pid)) }
+    if command.finished {
+        pieces.add(", \"returncode\": " + Text(command.returncode))
+        pieces.add(", \"seconds\": " + Text(command.seconds))
+    }
+    pieces.add("}")
+    return joinText(pieces)
+}
+
+function receipt(run: Run): Text {
+    let commands: List<Text> = []
+    for command in run.commands { commands.add("    " + commandText(command)) }
+    let fields: List<Text> = []
+    if commands.length == 0 { fields.add("  \"commands\": []") }
+    else { fields.add("  \"commands\": [\n" + joinWith(commands, ",\n") + "\n  ]") }
+    fields.add("  \"result\": " + Text(run.result))
+    if run.hasMakeResult { fields.add("  \"make_result\": " + Text(run.makeResult)) }
+    if run.input != "" { fields.add("  \"input\": " + run.input) }
+    if run.hasCandidate {
+        let candidate = "{\"commit\": " + process.quote(run.commit) + ", \"tree\": " + process.quote(run.tree) + ", \"clean_before\": true"
+        if run.cleanAfter { candidate = candidate + ", \"clean_after\": true" }
+        fields.add("  \"candidate\": " + candidate + "}")
+    }
+    if run.hasArtifacts {
+        let rows: List<Text> = []
+        for row in run.artifacts { rows.add("    " + row) }
+        if rows.length == 0 { fields.add("  \"native_artifacts\": []") }
+        else { fields.add("  \"native_artifacts\": [\n" + joinWith(rows, ",\n") + "\n  ]") }
+    }
+    if run.signal != 0 { fields.add("  \"signal\": " + Text(run.signal)) }
+    if run.receiptFailureType != "" {
+        fields.add("  \"failure_type\": " + process.quote(run.receiptFailureType))
+        fields.add("  \"failure\": " + process.quote(run.receiptFailure))
+    }
+    return "{\n" + joinWith(fields, ",\n") + "\n}"
+}
+
+function encrypt(run: Run, recipient: Text, output: Text) {
+    files.remove(run.workspace + "/identity.txt")
+    run.identity = ""
+    if !store(run, run.workspace + "/receipt.json", Bytes(receipt(run))) { return }
+    let names: List<Text> = []
+    for name in process.sortedNames(run.workspace) {
+        if name == "evidence.tar.gz" || name == "evidence.age" || name == "input.tar" || name == "input.tar.gz" || name == "identity.txt" { continue }
+        if name == "candidate" {
+            if process.info(run.workspace + "/candidate/build", true).exists {
+                if files.rename(run.workspace + "/candidate/build", run.workspace + "/candidate-build") != 0 {
+                    failWith(run, "OSError", "cannot stage candidate build evidence")
+                    return
+                }
+                names.add("candidate-build")
+            }
+            continue
+        }
+        names.add(name)
+    }
+    let evidence = run.workspace + "/evidence.tar.gz"
+    let command = ["tar", "-czf", evidence]
+    for name in names { command.add(name) }
+    let environment: List<Text> = []
+    for entry in run.environment { environment.add(entry) }
+    environment.add("COPYFILE_DISABLE=1")
+    launch(run, command, run.workspace, run.workspace + "/evidence-tar.log", true, environment, true)
+    if run.failed { return }
+    let cipher = run.workspace + "/evidence.age"
+    execute(run, ["age", "--encrypt", "--recipient", recipient, "--output", cipher, evidence], "", "", true)
+    if run.failed { return }
+    let sealed = process.info(cipher, false)
+    if !sealed.exists || sealed.kind != process.REGULAR || sealed.size == 0 {
+        failWith(run, "ValueError", "evidence encryption produced no ciphertext")
+        return
+    }
+    if files.rename(cipher, output) != 0 {
+        failWith(run, "OSError", "cannot publish encrypted evidence")
+        return
+    }
+    report(run, "evidence", true)
+}
+
+function recipientValid(value: Text): Boolean {
+    let raw = Bytes(value)
+    if raw.length < 5 || !process.begins(value, "age1") { return false }
+    for index in 4..raw.length {
+        let byte = raw[index]
+        if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 122)) { return false }
+    }
+    return true
+}
+
+function parseOptions(run: Run): Options {
+    let options = Options { repository: ""; sha: ""; input: ""; metadata: ""; evidence: "" }
+    let given: List<Text> = []
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        let name = item
+        let value = ""
+        let separator = process.find(Bytes(item), Bytes("="))
+        let assigned = process.begins(item, "--") && separator > 0
+        if assigned {
+            name = Text(Bytes(item).slice(0, separator))
+            value = Text(Bytes(item).slice(separator + 1, Bytes(item).length))
+        } else if index + 1 < argumentCount() {
+            value = argument(index + 1)
+            index += 1
+        } else {
+            failWith(run, "SystemExit", "2")
+            return options
+        }
+        if name == "--repository" { options.repository = value }
+        else if name == "--sha" { options.sha = value }
+        else if name == "--input" { options.input = value }
+        else if name == "--metadata" { options.metadata = value }
+        else if name == "--evidence" { options.evidence = value }
+        else {
+            failWith(run, "SystemExit", "2")
+            return options
+        }
+        given.add(name)
+        index += 1
+    }
+    for required in ["--repository", "--sha", "--input", "--metadata", "--evidence"] {
+        let found = false
+        for name in given { if name == required { found = true } }
+        if !found {
+            failWith(run, "SystemExit", "2")
+            return options
+        }
+    }
+    return options
+}
+
+function fallback(): Integer {
+    files.writeStandardOutput("{\"stage\":\"qualification\",\"status\":\"failed\",\"sha\":\"\"}\n")
+    return 1
+}
+
+function workspaceIn(parent: Text): Text {
+    for attempt in 0..100 {
+        let random = randomBytes(6)
+        let digits = Bytes("abcdefghijklmnopqrstuvwxyz0123456789_")
+        let name = Bytes()
+        for byte in random { name.add(digits[byte % digits.length]) }
+        let path = parent + "/minyar-atacama-private-" + Text(name)
+        let created = process.makeDirectory(path, 0o700)
+        if created == 0 { return path }
+        if created != -17 { return "" }
+    }
+    return ""
+}
+
+function main(): Integer {
+    process.umask(0o077)
+    let parent = system.getenv("RUNNER_TEMP")
+    if system.lastError() != 0 { return fallback() }
+    let workspace = workspaceIn(parent)
+    if workspace == "" || process.changeMode(workspace, 0o700) != 0 { return fallback() }
+    let statusFd = process.redirect(workspace + "/helper.log")
+    if statusFd < 0 { return fallback() }
+    let identity = system.getenv(SECRET)
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        for name in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET"] {
+            if process.begins(entry, name + "=") { environment.add(entry) }
+        }
+    }
+    environment.add("GITHUB_ACTIONS=true")
+    environment.add("PYTHONDONTWRITEBYTECODE=1")
+    let run = Run {
+        statusFd: statusFd; workspace: workspace; identity: identity; environment: environment
+        active: 0; reaped: true; commands: []; result: 1; makeResult: 0; hasMakeResult: false; signal: 0
+        watching: false; sha: ""; failed: false; failureType: ""; failure: ""; receiptFailureType: ""
+        receiptFailure: ""; input: ""; commit: ""; tree: ""; hasCandidate: false; cleanAfter: false
+        artifacts: []; hasArtifacts: false
+    }
+    let result = 1
+    let output = ""
+    let recipient = ""
+    let destination = false
+    let options = parseOptions(run)
+    if !run.failed {
+        output = absolute(options.evidence)
+        let removed = files.remove(output)
+        if removed != 0 && removed != -2 { failWith(run, "OSError", "cannot remove stale evidence") }
+    }
+    let meta = json.parse("null")
+    if !run.failed {
+        let raw = files.readFile(options.metadata)
+        if files.lastError() != 0 { failWith(run, "FileNotFoundError", "cannot read metadata") }
+        else {
+            meta = json.parseBytes(raw, 1048576)
+            if meta.kind == json.INVALID { failWith(run, "JSONDecodeError", meta.text) }
+        }
+    }
+    if !run.failed {
+        destination = meta.kind == json.OBJECT
+        recipient = string(run, meta, "public_recipient")
+        if !run.failed && !recipientValid(recipient) { failWith(run, "ValueError", "invalid evidence recipient") }
+    }
+    if !run.failed {
+        if system.shutdownSignalSocket() < 0 { failWith(run, "OSError", "cannot install interruption handling") }
+        else { run.watching = true }
+    }
+    if !run.failed { result = qualify(run, options, meta) }
+    if run.failed {
+        run.receiptFailureType = run.failureType
+        run.receiptFailure = run.failure
+        report(run, "qualification", false)
+        result = run.result
+        if result == 0 { result = 1 }
+        if run.failureType == "InterruptedError" && (!run.hasMakeResult || run.makeResult == 0) { result = 128 + run.signal }
+    }
+    run.watching = false
+    if run.active != 0 { closeGroup(run, run.active) }
+    run.result = result
+    run.failed = false
+    if destination && output != "" { encrypt(run, recipient, output) }
+    else { failWith(run, "ValueError", "no validated evidence destination") }
+    if run.failed {
+        report(run, "evidence", false)
+        if result == 0 { result = 1 }
+    }
+    report(run, "qualification", result == 0)
+    if !process.removeTree(workspace) { return 1 }
+    process.closeDescriptor(statusFd)
+    return result
+}
