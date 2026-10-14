@@ -1,0 +1,1723 @@
+use "json" as json
+use "system" as system
+use "../../quic-json.min" as data
+use "./owned-common.min" as common
+use "./owned-process.min" as process
+
+public record OwnerSpec {
+    value: json.Value
+    project: Text
+    nonce: Text
+    sim: List<Text>
+    server: List<Text>
+    client: List<Text>
+    minyarImage: Text
+    runnerRoot: Text
+    composePath: Text
+    fixtureRoot: Text
+    artifacts: Text
+}
+
+function projectName(value: Text): Boolean {
+    return value.startsWith("minyar-qns-") && common.lowerHex(value.slice(11, value.length), 24)
+}
+function imageId(value: json.Value): Boolean {
+    return value.kind == json.STRING && value.text.startsWith("sha256:") && common.lowerHex(value.text.slice(7, value.text.length), 64)
+}
+function canonical(value: json.Value): Text {
+    if value.kind != json.STRING { return "" }
+    let candidate = value.text
+    if !common.isAbsolute(candidate) || common.resolvePath(candidate) != common.normalize(candidate) || common.isSymlink(candidate) { return "" }
+    return common.normalize(candidate)
+}
+public function ownerSpec(value: json.Value): Result<OwnerSpec, common.Failure> {
+    if !data.equalsInteger(data.field(value, "schema_version"), 1) { return Err<OwnerSpec, common.Failure>(common.ownership("owner schema must be exact integer 1")) }
+    let project = data.field(value, "project")
+    if project.kind != json.STRING || !projectName(project.text) { return Err<OwnerSpec, common.Failure>(common.ownership("invalid unique project")) }
+    let nonce = data.field(value, "nonce")
+    if nonce.kind != json.STRING || !common.lowerHex(nonce.text, 64) { return Err<OwnerSpec, common.Failure>(common.ownership("invalid owner nonce")) }
+    let images = data.field(value, "images")
+    let roles = common.ROLES
+    if images.kind != json.OBJECT || !common.sameSet(common.keysOf(images), roles) || common.unique(common.keysOf(images)).length != images.keys.length {
+        return Err<OwnerSpec, common.Failure>(common.ownership("three exact image roles required"))
+    }
+    for role in roles {
+        let pool = data.field(images, role)
+        if pool.kind != json.ARRAY || pool.items.length == 0 || common.unique(common.textList(pool)).length != pool.items.length {
+            return Err<OwnerSpec, common.Failure>(common.ownership("invalid pinned image ID"))
+        }
+        for item in pool.items { if !imageId(item) { return Err<OwnerSpec, common.Failure>(common.ownership("invalid pinned image ID")) } }
+        if (role == "sim" && pool.items.length != 1) || (role != "sim" && pool.items.length > 2) {
+            return Err<OwnerSpec, common.Failure>(common.ownership("unbounded cell image set"))
+        }
+    }
+    let server = common.textList(data.field(images, "server"))
+    let client = common.textList(data.field(images, "client"))
+    let minyar = data.field(value, "minyar_image")
+    let minyarImage = ""
+    if minyar.kind != json.NULL {
+        if minyar.kind != json.STRING || !common.member(server, minyar.text) || !common.member(client, minyar.text) {
+            return Err<OwnerSpec, common.Failure>(common.ownership("Minyar image outside pinned endpoint pools"))
+        }
+        minyarImage = minyar.text
+    }
+    let paths: List<Text> = []
+    for name in ["runner_root", "compose_path", "fixture_root", "artifacts"] {
+        let resolved = canonical(data.field(value, name))
+        if resolved == "" { return Err<OwnerSpec, common.Failure>(common.ownership("owner path must be canonical absolute")) }
+        paths.add(resolved)
+    }
+    if common.parentOf(paths[1]) != paths[0] { return Err<OwnerSpec, common.Failure>(common.ownership("compose path outside private runner")) }
+    if paths[2] == paths[3] || common.within(paths[2], paths[3]) || common.within(paths[3], paths[2]) {
+        return Err<OwnerSpec, common.Failure>(common.ownership("fixture and evidence trees overlap"))
+    }
+    if !common.equalText(data.field(value, "runner_commit"), common.PIN) { return Err<OwnerSpec, common.Failure>(common.ownership("unreviewed runner")) }
+    return Ok<OwnerSpec, common.Failure>(OwnerSpec {
+        value: value; project: project.text; nonce: nonce.text
+        sim: common.textList(data.field(images, "sim")); server: server; client: client; minyarImage: minyarImage
+        runnerRoot: paths[0]; composePath: paths[1]; fixtureRoot: paths[2]; artifacts: paths[3]
+    })
+}
+public function imagesFor(spec: OwnerSpec, role: Text): List<Text> {
+    if role == "sim" { return spec.sim }
+    if role == "server" { return spec.server }
+    if role == "client" { return spec.client }
+    return []
+}
+public function scope(spec: OwnerSpec): process.Admission {
+    return process.Admission { artifacts: spec.artifacts; project: spec.project; nonce: spec.nonce }
+}
+public function labels(spec: OwnerSpec, role: Text): json.Value {
+    let keys = ["com.docker.compose.project", common.OWNER_LABEL]
+    let values = [data.string(spec.project), data.string(spec.nonce)]
+    if role != "" { keys.add("com.docker.compose.service"); values = values.appended(data.string(role)) }
+    return data.object(keys, values)
+}
+public function networkRoles(role: Text): List<Text> {
+    if role == "sim" { return ["leftnet", "rightnet"] }
+    if role == "server" { return ["rightnet"] }
+    return ["leftnet"]
+}
+function labelsMatch(found: json.Value, expected: json.Value): Boolean {
+    for index in 0..expected.keys.length {
+        if !common.equalText(data.field(found, expected.keys[index]), expected.items[index].text) { return false }
+    }
+    return true
+}
+function textArray(value: json.Value, expected: List<Text>): Boolean {
+    return value.kind == json.ARRAY && common.allStrings(value) && common.sameTexts(common.textList(value), expected)
+}
+function emptyOrNull(value: json.Value): Boolean {
+    return value.kind == json.NULL || (value.kind == json.ARRAY && value.items.length == 0)
+}
+public function container(spec: OwnerSpec, entry: json.Value): Result<Text, common.Failure> {
+    let identity = data.field(entry, "Id")
+    if identity.kind != json.STRING || !common.lowerHex(identity.text, 64) { return Err<Text, common.Failure>(common.ownership("full immutable container ID required")) }
+    let config = data.field(entry, "Config")
+    let found = data.field(config, "Labels")
+    let roleValue = data.field(found, "com.docker.compose.service")
+    let roles = common.ROLES
+    if roleValue.kind != json.STRING || !common.member(roles, roleValue.text) || !labelsMatch(found, labels(spec, roleValue.text)) {
+        return Err<Text, common.Failure>(common.ownership("container owner labels differ"))
+    }
+    let role = roleValue.text
+    let image = data.field(entry, "Image")
+    if !common.equalText(data.field(entry, "Name"), "/" + spec.project + "-" + role) || image.kind != json.STRING || !common.member(imagesFor(spec, role), image.text) {
+        return Err<Text, common.Failure>(common.ownership("container name or image ID differs"))
+    }
+    if !common.equalText(data.field(found, "com.docker.compose.project.working_dir"), spec.runnerRoot) ||
+        !common.equalText(data.field(found, "com.docker.compose.project.config_files"), spec.composePath) {
+        return Err<Text, common.Failure>(common.ownership("container compose source differs"))
+    }
+    let host = data.field(entry, "HostConfig")
+    let modes: List<Text> = []
+    for name in networkRoles(role) { modes.add(spec.project + "_" + name) }
+    let mode = data.field(host, "NetworkMode")
+    if !common.isFalse(data.field(host, "Privileged")) || mode.kind != json.STRING || !common.member(modes, mode.text) ||
+        !common.equalText(data.field(host, "PidMode"), "") || !common.equalText(data.field(host, "IpcMode"), "private") ||
+        !common.equalText(data.field(host, "CpusetCpus"), "7") || !data.equalsInteger(data.field(host, "NanoCpus"), 1000000000) {
+        return Err<Text, common.Failure>(common.ownership("container resource/namespace configuration differs"))
+    }
+    if role == "server" || role == "client" {
+        if !common.equalText(data.field(config, "User"), "65534:65534") || !textArray(data.field(host, "CapDrop"), ["ALL"]) ||
+            !emptyOrNull(data.field(host, "CapAdd")) || !textArray(data.field(host, "SecurityOpt"), ["no-new-privileges:true"]) {
+            return Err<Text, common.Failure>(common.ownership("endpoint capability/user configuration differs"))
+        }
+        let mounts = data.field(entry, "Mounts")
+        let destinations: List<Text> = []
+        for mount in mounts.items { destinations.add(common.textOf(data.field(mount, "Destination"))) }
+        if mounts.kind != json.ARRAY || mounts.items.length != 3 || !common.sameSet(destinations, ["/www", "/downloads", "/certs"]) {
+            return Err<Text, common.Failure>(common.ownership("endpoint bind mounts differ"))
+        }
+        for mount in mounts.items {
+            let source = common.textOf(data.field(mount, "Source"))
+            let writable = common.equalText(data.field(mount, "Destination"), "/downloads")
+            let flag = data.field(mount, "RW")
+            if !common.equalText(data.field(mount, "Type"), "bind") || !common.isAbsolute(source) || !common.within(spec.fixtureRoot, common.resolvePath(source)) ||
+                common.isSymlink(source) || flag.kind != json.BOOLEAN || flag.truth != writable {
+                return Err<Text, common.Failure>(common.ownership("endpoint bind ownership differs"))
+            }
+        }
+    } else if !textArray(data.field(host, "CapAdd"), ["NET_ADMIN", "NET_RAW"]) && !textArray(data.field(host, "CapAdd"), ["CAP_NET_ADMIN", "CAP_NET_RAW"]) {
+        return Err<Text, common.Failure>(common.ownership("simulator capabilities differ"))
+    }
+    let attached = data.field(data.field(entry, "NetworkSettings"), "Networks")
+    if attached.kind != json.OBJECT || !common.sameSet(common.keysOf(attached), modes) || common.unique(common.keysOf(attached)).length != modes.length {
+        return Err<Text, common.Failure>(common.ownership("complete endpoint network membership differs"))
+    }
+    let running = data.field(data.field(entry, "State"), "Running")
+    if running.kind != json.BOOLEAN { return Err<Text, common.Failure>(common.ownership("endpoint phase missing")) }
+    for item in attached.items {
+        let network = data.field(item, "NetworkID")
+        if item.kind != json.OBJECT || network.kind != json.STRING || (!common.lowerHex(network.text, 64) && !(!running.truth && network.text == "")) {
+            return Err<Text, common.Failure>(common.ownership("immutable endpoint network ID missing"))
+        }
+    }
+    return Ok<Text, common.Failure>(role)
+}
+public function network(spec: OwnerSpec, entry: json.Value, owned: List<Text>): Result<Text, common.Failure> {
+    let identity = data.field(entry, "Id")
+    if identity.kind != json.STRING || !common.lowerHex(identity.text, 64) { return Err<Text, common.Failure>(common.ownership("full immutable network ID required")) }
+    let name = data.field(entry, "Name")
+    if name.kind != json.STRING || (name.text != spec.project + "_leftnet" && name.text != spec.project + "_rightnet") || !labelsMatch(data.field(entry, "Labels"), labels(spec, "")) {
+        return Err<Text, common.Failure>(common.ownership("network owner labels differ"))
+    }
+    let members = common.keysOf(data.field(entry, "Containers"))
+    let foreign = false
+    for member in members { if !common.member(owned, member) { foreign = true } }
+    if !common.equalText(data.field(entry, "Driver"), "bridge") || !common.isFalse(data.field(entry, "Internal")) || foreign {
+        return Err<Text, common.Failure>(common.ownership("network has unowned members or mode"))
+    }
+    return Ok<Text, common.Failure>(identity.text)
+}
+function idsOf(entries: List<json.Value>): List<Text> {
+    let result: List<Text> = []
+    for entry in entries { result.add(common.textOf(data.field(entry, "Id"))) }
+    return result
+}
+public function configuredTopology(spec: OwnerSpec, entries: List<json.Value>, networks: List<json.Value>): Result<json.Value, common.Failure> {
+    let owned = idsOf(entries)
+    let names: List<Text> = []
+    let ids: List<Text> = []
+    for entry in networks {
+        let checked = try network(spec, entry, owned)
+        let name = common.textOf(data.field(entry, "Name"))
+        if common.member(names, name) { return Err<json.Value, common.Failure>(common.ownership("colliding configured bridges")) }
+        names.add(name)
+        ids.add(common.textOf(data.field(entry, "Id")))
+    }
+    let containerKeys: List<Text> = []
+    let containerValues: List<json.Value> = []
+    for entry in entries {
+        let role = try container(spec, entry)
+        let bridgeNames: List<Text> = []
+        let bridgeIds: List<json.Value> = []
+        for suffix in networkRoles(role) {
+            let full = spec.project + "_" + suffix
+            let index = indexOf(names, full)
+            if index < 0 { return Err<json.Value, common.Failure>(failure("KeyError", full)) }
+            bridgeNames.add(full)
+            bridgeIds = bridgeIds.appended(data.string(ids[index]))
+        }
+        containerKeys.add(common.textOf(data.field(entry, "Id")))
+        containerValues = containerValues.appended(data.object(bridgeNames, bridgeIds))
+        let attached = data.field(data.field(entry, "NetworkSettings"), "Networks")
+        for index in 0..attached.keys.length {
+            let name = attached.keys[index]
+            let found = common.textOf(data.field(attached.items[index], "NetworkID"))
+            let position = indexOf(names, name)
+            if position < 0 { return Err<json.Value, common.Failure>(failure("KeyError", name)) }
+            if found != "" && found != ids[position] { return Err<json.Value, common.Failure>(common.ownership("declared endpoint bridge differs")) }
+        }
+    }
+    let networkValues: List<json.Value> = []
+    for value in ids { networkValues = networkValues.appended(data.string(value)) }
+    let value = data.object(["schema_version", "project", "nonce", "containers", "networks"],
+        [data.number(1), data.string(spec.project), data.string(spec.nonce), data.object(containerKeys, containerValues), data.object(names, networkValues)])
+    let wrote = try common.atomicJson(common.joinPath(spec.artifacts, "configured-topology.json"), value)
+    return Ok<json.Value, common.Failure>(value)
+}
+function failure(kind: Text, message: Text): common.Failure { return common.failure(kind, message) }
+function indexOf(values: List<Text>, value: Text): Integer {
+    for index in 0..values.length { if values[index] == value { return index } }
+    return -1
+}
+function roleNetworks(spec: OwnerSpec, role: Text): List<Text> {
+    let result: List<Text> = []
+    for suffix in networkRoles(role) { result.add(spec.project + "_" + suffix) }
+    return result
+}
+public function verifiedTopology(spec: OwnerSpec, entries: List<json.Value>, networks: List<json.Value>): Result<Boolean, common.Failure> {
+    let ownedIds: List<Text> = []
+    let ownedRoles: List<Text> = []
+    for entry in entries {
+        let role = try container(spec, entry)
+        let identity = common.textOf(data.field(entry, "Id"))
+        if !common.member(ownedIds, identity) { ownedIds.add(identity); ownedRoles.add(role) }
+    }
+    if ownedIds.length != entries.length { return Err<Boolean, common.Failure>(common.ownership("colliding endpoint identities")) }
+    let names: List<Text> = []
+    let byName: List<json.Value> = []
+    for entry in networks {
+        let checked = try network(spec, entry, ownedIds)
+        let name = common.textOf(data.field(entry, "Name"))
+        if common.member(names, name) { return Err<Boolean, common.Failure>(common.ownership("colliding network names")) }
+        names.add(name)
+        byName = byName.appended(entry)
+    }
+    let configured: List<json.Value> = []
+    for entry in entries {
+        let identity = common.textOf(data.field(entry, "Id"))
+        let running = common.isTrue(data.field(data.field(entry, "State"), "Running"))
+        let attached = data.field(data.field(entry, "NetworkSettings"), "Networks")
+        for index in 0..attached.keys.length {
+            let name = attached.keys[index]
+            let networkId = common.textOf(data.field(attached.items[index], "NetworkID"))
+            let position = indexOf(names, name)
+            if position < 0 { return Err<Boolean, common.Failure>(common.ownership("declared owned bridge missing")) }
+            let bridge = byName[position]
+            let bridgeId = common.textOf(data.field(bridge, "Id"))
+            let member = common.hasKey(data.field(bridge, "Containers"), identity)
+            if running {
+                if networkId != bridgeId || !member { return Err<Boolean, common.Failure>(common.ownership("running endpoint bridge membership is not reciprocal")) }
+            } else if networkId == "" || !member {
+                if configured.length == 0 {
+                    let loaded = try common.readJson(common.joinPath(spec.artifacts, "configured-topology.json"))
+                    if !data.equalsInteger(data.field(loaded, "schema_version"), 1) || !common.equalText(data.field(loaded, "project"), spec.project) ||
+                        !common.equalText(data.field(loaded, "nonce"), spec.nonce) {
+                        return Err<Boolean, common.Failure>(common.ownership("configured bridge receipt ownership differs"))
+                    }
+                    configured = configured.appended(loaded)
+                }
+                let role = ownedRoles[indexOf(ownedIds, identity)]
+                let expectedNames: List<Text> = []
+                let expectedIds: List<json.Value> = []
+                for full in roleNetworks(spec, role) {
+                    let at = indexOf(names, full)
+                    if at < 0 { return Err<Boolean, common.Failure>(failure("KeyError", full)) }
+                    expectedNames.add(full)
+                    expectedIds = expectedIds.appended(data.string(common.textOf(data.field(byName[at], "Id"))))
+                }
+                let expected = data.object(expectedNames, expectedIds)
+                let recorded = data.field(data.field(configured[0], "containers"), identity)
+                let matches = recorded.kind == json.OBJECT && data.equal(recorded, expected) && recorded.keys.length == expected.keys.length
+                for at in 0..expectedNames.length {
+                    if !data.equal(data.field(data.field(configured[0], "networks"), expectedNames[at]), expectedIds[at]) { matches = false }
+                }
+                if !matches || (networkId != "" && networkId != bridgeId) {
+                    return Err<Boolean, common.Failure>(common.ownership("stopped endpoint does not bind checked configured bridge IDs"))
+                }
+            } else if networkId != bridgeId { return Err<Boolean, common.Failure>(common.ownership("stopped endpoint bridge ID differs")) }
+        }
+    }
+    for position in 0..names.length {
+        let bridge = byName[position]
+        for identity in common.keysOf(data.field(bridge, "Containers")) {
+            let at = indexOf(ownedIds, identity)
+            if at < 0 || !common.member(roleNetworks(spec, ownedRoles[at]), names[position]) {
+                return Err<Boolean, common.Failure>(common.ownership("role attached to unexpected bridge"))
+            }
+            let entry = entries[indexOfEntry(entries, identity)]
+            let attached = data.field(data.field(data.field(entry, "NetworkSettings"), "Networks"), names[position])
+            if !common.equalText(data.field(attached, "NetworkID"), common.textOf(data.field(bridge, "Id"))) {
+                return Err<Boolean, common.Failure>(common.ownership("bridge membership is not reciprocal"))
+            }
+        }
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+function indexOfEntry(entries: List<json.Value>, identity: Text): Integer {
+    for index in 0..entries.length { if common.equalText(data.field(entries[index], "Id"), identity) { return index } }
+    return -1
+}
+
+public record Daemon {
+    kind: Text
+    path: Text
+    spec: List<OwnerSpec>
+    docker: Text
+    cli: List<common.Binding>
+    commands: process.Commands
+    containersHook: List<Callback<Result<List<Text>, common.Failure>>>
+    inspectHook: List<Callback<Text, Result<json.Value, common.Failure>>>
+    networksHook: List<Callback<Result<List<json.Value>, common.Failure>>>
+    commandHook: List<Callback<List<Text>, process.RunOptions, Result<process.Output, common.Failure>>>
+    runnerHook: List<Callback<List<Text>, process.RunOptions, Result<process.Output, common.Failure>>>
+}
+public function jsonDaemon(path: Text): Daemon {
+    return Daemon { kind: "json"; path: path; spec: []; docker: ""; cli: []; commands: process.memoryCommands(); containersHook: []; inspectHook: []; networksHook: []; commandHook: []; runnerHook: [] }
+}
+public function dockerShell(spec: OwnerSpec): Daemon {
+    return Daemon { kind: "docker"; path: ""; spec: [spec]; docker: ""; cli: []; commands: process.memoryCommands(); containersHook: []; inspectHook: []; networksHook: []; commandHook: []; runnerHook: [] }
+}
+public function which(name: Text): Text {
+    for directory in system.getenv("PATH").split(":") {
+        if directory == "" { continue }
+        let candidate = directory + "/" + name
+        let info = common.stat(candidate)
+        if info.kind == 1 && info.mode & 73 != 0 { return candidate }
+    }
+    return ""
+}
+function hexBytes(raw: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes()
+    for byte in raw { result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+    return Text(result)
+}
+public function dockerDaemon(spec: OwnerSpec, root: Text, allowReal: Boolean, dockerPath: Text): Result<Daemon, common.Failure> {
+    if !allowReal { return Err<Daemon, common.Failure>(common.ownership("real Docker backend not authorized")) }
+    let made = try common.makeDirectories(root)
+    let commands = try process.rawCommands(common.joinPath(root, "command-" + Text(system.processId()) + "-" + hexBytes(randomBytes(12))))
+    let docker = dockerPath
+    if docker == "" { docker = which("docker") }
+    if docker == "" { return Err<Daemon, common.Failure>(common.ownership("existing Docker CLI missing")) }
+    let cli = try common.binding(docker)
+    let daemon = dockerShell(spec)
+    daemon.docker = docker
+    daemon.cli.add(cli)
+    daemon.commands = commands
+    return Ok<Daemon, common.Failure>(daemon)
+}
+
+function jsonAction(path: Text, name: Text, identity: Text): Result<json.Value, common.Failure> {
+    let state = try common.readJson(path)
+    let id = data.none()
+    if identity != "" { id = data.string(identity) }
+    let event = data.object(["backend", "operation", "immutable_id"], [data.string("mock"), data.string(name), id])
+    let events = common.valuesOf(data.field(state, "events")).appended(event)
+    state = data.with(state, "events", data.array(events))
+    let wrote = try common.atomicJson(path, state)
+    if common.equalText(data.field(state, "fail"), name) { return Err<json.Value, common.Failure>(common.cleanup("controlled mock " + name + " failure")) }
+    return Ok<json.Value, common.Failure>(state)
+}
+public function jsonContainers(path: Text): Result<List<Text>, common.Failure> {
+    let state = try common.readJson(path)
+    return Ok<List<Text>, common.Failure>(common.keysOf(data.field(state, "containers")))
+}
+public function jsonInspect(path: Text, identity: Text): Result<json.Value, common.Failure> {
+    let state = try common.readJson(path)
+    let containers = data.field(state, "containers")
+    if !common.hasKey(containers, identity) { return Err<json.Value, common.Failure>(failure("KeyError", identity)) }
+    return Ok<json.Value, common.Failure>(data.field(containers, identity))
+}
+public function jsonNetworks(path: Text): Result<List<json.Value>, common.Failure> {
+    let state = try common.readJson(path)
+    return Ok<List<json.Value>, common.Failure>(common.valuesOf(data.field(state, "networks")))
+}
+function jsonRetain(path: Text, identity: Text, target: Text): Result<Boolean, common.Failure> {
+    let state = try jsonAction(path, "retain", identity)
+    let made = try common.makeDirectory(target)
+    return common.writeText(common.joinPath(target, "daemon.log"), "mock owned endpoint log\n")
+}
+function jsonAbort(path: Text, identity: Text): Result<Boolean, common.Failure> {
+    let acted = try jsonAction(path, "abort", identity)
+    let state = try common.readJson(path)
+    state = common.setPath(state, ["containers", identity, "State"], data.object(["Running", "ExitCode"], [data.boolean(false), data.number(137)]))
+    return common.atomicJson(path, state)
+}
+function jsonRemove(path: Text, identity: Text): Result<Boolean, common.Failure> {
+    let acted = try jsonAction(path, "remove", identity)
+    let state = try common.readJson(path)
+    if !common.hasKey(data.field(state, "containers"), identity) { return Err<Boolean, common.Failure>(failure("KeyError", identity)) }
+    state = common.removePath(state, ["containers", identity])
+    let networks = data.field(state, "networks")
+    for key in common.keysOf(networks) {
+        if common.hasKey(data.field(data.field(networks, key), "Containers"), identity) {
+            state = common.removePath(state, ["networks", key, "Containers", identity])
+        }
+    }
+    return common.atomicJson(path, state)
+}
+function jsonRemoveNetwork(path: Text, identity: Text): Result<Boolean, common.Failure> {
+    let acted = try jsonAction(path, "remove_network", identity)
+    let state = try common.readJson(path)
+    if !common.hasKey(data.field(state, "networks"), identity) { return Err<Boolean, common.Failure>(failure("KeyError", identity)) }
+    return common.atomicJson(path, common.removePath(state, ["networks", identity]))
+}
+
+public function lines(raw: Bytes): List<Text> {
+    let result: List<Text> = []
+    for line in Text(raw).split("\n") {
+        let value = line
+        if value.endsWith("\r") { value = value.slice(0, value.length - 1) }
+        result.add(value)
+    }
+    if result.length > 0 && result[result.length - 1] == "" { result.pop() }
+    return result
+}
+public function commandOf(daemon: Daemon, args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+    if daemon.commandHook.length > 0 {
+        let hook = daemon.commandHook[0]
+        return hook(args, settings)
+    }
+    if daemon.kind != "docker" { return Err<process.Output, common.Failure>(failure("AttributeError", "'JsonDaemon' object has no attribute 'command'")) }
+    let current = try common.binding(daemon.docker)
+    if daemon.cli.length == 0 || !common.sameBinding(current, daemon.cli[0]) || current.path != daemon.cli[0].path {
+        return Err<process.Output, common.Failure>(common.ownership("Docker CLI bytes changed"))
+    }
+    let admitted = false
+    if args.length > 0 && args[0] == "compose" { for token in args { if token == "create" || token == "up" { admitted = true } } }
+    let chosen = process.RunOptions { timeout: settings.timeout; check: settings.check; maxBytes: settings.maxBytes; returnBytes: settings.returnBytes; admission: []; stream: settings.stream }
+    if admitted && daemon.spec.length > 0 { chosen.admission.add(scope(daemon.spec[0])) }
+    let argv = [daemon.docker]
+    for token in args { argv.add(token) }
+    if daemon.runnerHook.length > 0 {
+        let runner = daemon.runnerHook[0]
+        return runner(argv, chosen)
+    }
+    return process.run(daemon.commands, argv, chosen)
+}
+function timed(seconds: Integer): process.RunOptions { return process.options(seconds * common.SECOND) }
+public function containersOf(daemon: Daemon): Result<List<Text>, common.Failure> {
+    if daemon.containersHook.length > 0 {
+        let hook = daemon.containersHook[0]
+        return hook()
+    }
+    if daemon.kind == "json" { return jsonContainers(daemon.path) }
+    let output = try commandOf(daemon, ["ps", "-aq", "--no-trunc", "--filter", "label=com.docker.compose.project=" + daemon.spec[0].project], timed(10))
+    return Ok<List<Text>, common.Failure>(lines(output.payload))
+}
+public function inspectOf(daemon: Daemon, identity: Text): Result<json.Value, common.Failure> {
+    if daemon.inspectHook.length > 0 {
+        let hook = daemon.inspectHook[0]
+        return hook(identity)
+    }
+    if daemon.kind == "json" { return jsonInspect(daemon.path, identity) }
+    let output = try commandOf(daemon, ["inspect", identity], timed(10))
+    let value = data.decode(output.payload)
+    if value.kind != json.ARRAY || value.items.length == 0 { return Err<json.Value, common.Failure>(failure("JSONDecodeError", "docker inspect output")) }
+    return Ok<json.Value, common.Failure>(value.items[0])
+}
+public function networksOf(daemon: Daemon): Result<List<json.Value>, common.Failure> {
+    if daemon.networksHook.length > 0 {
+        let hook = daemon.networksHook[0]
+        return hook()
+    }
+    if daemon.kind == "json" { return jsonNetworks(daemon.path) }
+    let output = try commandOf(daemon, ["network", "ls", "-q", "--no-trunc", "--filter", "label=com.docker.compose.project=" + daemon.spec[0].project], timed(10))
+    let result: List<json.Value> = []
+    for identity in lines(output.payload) {
+        let raw = try commandOf(daemon, ["network", "inspect", identity], timed(10))
+        let value = data.decode(raw.payload)
+        if value.kind != json.ARRAY || value.items.length == 0 { return Err<List<json.Value>, common.Failure>(failure("JSONDecodeError", "docker network inspect output")) }
+        result = result.appended(value.items[0])
+    }
+    return Ok<List<json.Value>, common.Failure>(result)
+}
+public function retainOf(daemon: Daemon, identity: Text, target: Text): Result<Boolean, common.Failure> {
+    if daemon.kind == "json" { return jsonRetain(daemon.path, identity, target) }
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(daemon.spec[0], entry)
+    let made = try common.makeDirectory(target)
+    let logs = try commandOf(daemon, ["logs", "--timestamps", identity], timed(10))
+    let wrote = try common.writeBytes(common.joinPath(target, "daemon.log"), logs.payload)
+    let first = try copyBounded(daemon, identity, "/logs/.", common.joinPath(target, "logs"))
+    return copyBounded(daemon, identity, "/tmp/.", common.joinPath(target, "tmp"))
+}
+public function abortOf(daemon: Daemon, identity: Text): Result<Boolean, common.Failure> {
+    if daemon.kind == "json" { return jsonAbort(daemon.path, identity) }
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(daemon.spec[0], entry)
+    if common.isTrue(data.field(data.field(entry, "State"), "Running")) {
+        let killed = try commandOf(daemon, ["kill", "--signal", "KILL", identity], timed(10))
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function stopOf(daemon: Daemon, identity: Text): Result<Boolean, common.Failure> {
+    if daemon.kind == "json" {
+        let acted = try jsonAction(daemon.path, "stop", identity)
+        return Ok<Boolean, common.Failure>(true)
+    }
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(daemon.spec[0], entry)
+    let stopped = try commandOf(daemon, ["stop", "--time", "5", identity], timed(10))
+    return Ok<Boolean, common.Failure>(true)
+}
+public function removeOf(daemon: Daemon, identity: Text): Result<Boolean, common.Failure> {
+    if daemon.kind == "json" { return jsonRemove(daemon.path, identity) }
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(daemon.spec[0], entry)
+    let removed = try commandOf(daemon, ["rm", "-f", identity], timed(10))
+    return Ok<Boolean, common.Failure>(true)
+}
+public function removeNetworkOf(daemon: Daemon, identity: Text): Result<Boolean, common.Failure> {
+    if daemon.kind == "json" { return jsonRemoveNetwork(daemon.path, identity) }
+    let removed = try commandOf(daemon, ["network", "rm", identity], timed(10))
+    return Ok<Boolean, common.Failure>(true)
+}
+
+function octal(header: Bytes, start: Integer, size: Integer): Integer {
+    if header[start] == 128 || header[start] == 255 {
+        let value = 0
+        for index in (start + 1)..(start + size) { value = value * 256 + header[index] }
+        return value
+    }
+    let value = 0
+    let seen = false
+    for index in start..(start + size) {
+        let byte = header[index]
+        if byte == 0 || byte == 32 { if seen { break }; continue }
+        if byte < 48 || byte > 55 { return -1 }
+        seen = true
+        value = value * 8 + byte - 48
+    }
+    return value
+}
+function terminated(header: Bytes, start: Integer, size: Integer): Text {
+    let end = start
+    while end < start + size && header[end] != 0 { end += 1 }
+    return Text(header.slice(start, end))
+}
+function checksumValid(header: Bytes): Boolean {
+    let expected = octal(header, 148, 8)
+    let total = 0
+    for index in 0..512 {
+        if index >= 148 && index < 156 { total += 32 } else { total += header[index] }
+    }
+    return expected == total
+}
+function paxPath(payload: Bytes): Text {
+    let position = 0
+    let result = ""
+    while position < payload.length {
+        let space = position
+        while space < payload.length && payload[space] != 32 { space += 1 }
+        let length = common.integerText(Text(payload.slice(position, space)))
+        if length <= 0 || position + length > payload.length { return result }
+        let record = Text(payload.slice(space + 1, position + length - 1))
+        if record.startsWith("path=") { result = record.slice(5, record.length) }
+        position += length
+    }
+    return result
+}
+function readExact(fd: Integer, offset: Integer, size: Integer): Bytes {
+    let result = Bytes()
+    while result.length < size {
+        let chunk = common.readAt(fd, offset + result.length, size - result.length)
+        if chunk.length == 0 { return result }
+        result.addBytes(chunk)
+    }
+    return result
+}
+function extractArchive(fd: Integer, target: Text, deadline: Integer): Result<Boolean, common.Failure> {
+    let offset = 0
+    let total = 0
+    let members = 0
+    let longName = ""
+    let extended = ""
+    while true {
+        let header = readExact(fd, offset, 512)
+        if header.length == 0 { break }
+        if header.length < 512 { return Err<Boolean, common.Failure>(failure("ReadError", "unexpected end of data")) }
+        let zero = true
+        for byte in header { if byte != 0 { zero = false; break } }
+        if zero { break }
+        if !checksumValid(header) { return Err<Boolean, common.Failure>(failure("ReadError", "invalid header")) }
+        let size = octal(header, 124, 12)
+        if size < 0 { return Err<Boolean, common.Failure>(failure("ReadError", "invalid header")) }
+        let kind = header[156]
+        let payloadStart = offset + 512
+        let padded = (size + 511) / 512 * 512
+        if kind == 76 || kind == 120 || kind == 103 {
+            if size > 1048576 { return Err<Boolean, common.Failure>(common.ownership("container copy bound exceeded")) }
+            let payload = readExact(fd, payloadStart, size)
+            if payload.length < size { return Err<Boolean, common.Failure>(common.ownership("truncated container archive")) }
+            if kind == 76 { longName = terminated(payload, 0, payload.length) }
+            if kind == 120 { extended = paxPath(payload) }
+            offset = payloadStart + padded
+            continue
+        }
+        let name = terminated(header, 0, 100)
+        if Text(header.slice(257, 262)) == "ustar" {
+            let prefix = terminated(header, 345, 155)
+            if prefix != "" { name = prefix + "/" + name }
+        }
+        if longName != "" { name = longName }
+        if extended != "" { name = extended }
+        longName = ""
+        extended = ""
+        members += 1
+        if members > common.MAX_FILES || size > common.MAX_BYTES - total || common.now() > deadline {
+            return Err<Boolean, common.Failure>(common.ownership("container copy bound exceeded"))
+        }
+        let directory = kind == 53
+        let regular = kind == 48 || kind == 0 || kind == 55
+        while directory && name.endsWith("/") && name.length > 1 { name = name.slice(0, name.length - 1) }
+        let parts = common.components(name)
+        let unsafe = common.isAbsolute(name) || !(directory || regular)
+        for part in name.split("/") { if part == ".." { unsafe = true } }
+        if unsafe { return Err<Boolean, common.Failure>(common.ownership("unsafe container archive member")) }
+        if parts.length == 0 {
+            if directory { offset = payloadStart + padded; continue }
+            return Err<Boolean, common.Failure>(common.ownership("unsafe container archive member"))
+        }
+        let output = common.joinPath(target, common.joinParts(parts))
+        let made = try common.makeDirectories(common.parentOf(output))
+        if common.exists(output) {
+            if directory && common.isDirectory(output) && !common.isSymlink(output) { offset = payloadStart + padded; continue }
+            return Err<Boolean, common.Failure>(common.ownership("colliding container archive member"))
+        }
+        if directory {
+            let created = try common.makeDirectory(output)
+            offset = payloadStart + padded
+            continue
+        }
+        total += size
+        let out = common.openFile(output, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438)
+        if out < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-out, output)) }
+        let remaining = size
+        let position = payloadStart
+        while remaining > 0 {
+            if common.now() > deadline { common.closeFd(out); return Err<Boolean, common.Failure>(common.ownership("container copy bound exceeded")) }
+            let block = common.readAt(fd, position, min(common.CHUNK, remaining))
+            if block.length == 0 { common.closeFd(out); return Err<Boolean, common.Failure>(common.ownership("truncated container archive")) }
+            common.writeAll(out, block)
+            remaining -= block.length
+            position += block.length
+        }
+        common.closeFd(out)
+        offset = payloadStart + padded
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function copyBounded(daemon: Daemon, identity: Text, source: Text, target: Text): Result<Boolean, common.Failure> {
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(daemon.spec[0], entry)
+    let deadline = common.now() + 20 * common.SECOND
+    let settings = timed(20)
+    settings.returnBytes = false
+    let archive = try commandOf(daemon, ["cp", identity + ":" + source, "-"], settings)
+    if archive.path == "" { return Err<Boolean, common.Failure>(common.ownership("container copy must retain bounded raw archive bytes")) }
+    let bound = try common.streamBinding(archive.path, common.MAX_BYTES, deadline, "")
+    if common.isSymlink(target) || (common.present(target) && !common.isDirectory(target)) {
+        return Err<Boolean, common.Failure>(common.ownership("container copy destination is not an owned directory"))
+    }
+    let made = try common.makeDirectories(target)
+    let fd = common.openFile(archive.path, 0, 0)
+    if fd < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-fd, archive.path)) }
+    let outcome = extractArchive(fd, target, deadline)
+    common.closeFd(fd)
+    let extracted = try outcome
+    if common.now() > deadline { return Err<Boolean, common.Failure>(common.ownership("container copy bound exceeded")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+
+function digitsAt(value: Text, start: Integer, size: Integer): Integer {
+    if start + size > value.length { return -1 }
+    return common.integerText(value.slice(start, start + size))
+}
+function civilDays(year: Integer, month: Integer, day: Integer): Integer {
+    let y = year
+    if month <= 2 { y = y - 1 }
+    let era = y / 400
+    if y < 0 && y % 400 != 0 { era = era - 1 }
+    let yoe = y - era * 400
+    let shifted = month + 9
+    if month > 2 { shifted = month - 3 }
+    let doy = (153 * shifted + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+public function isoNanoseconds(value: Text): List<Integer> {
+    let year = digitsAt(value, 0, 4)
+    let month = digitsAt(value, 5, 2)
+    let day = digitsAt(value, 8, 2)
+    let hour = digitsAt(value, 11, 2)
+    let minute = digitsAt(value, 14, 2)
+    let second = digitsAt(value, 17, 2)
+    if value.length < 19 || year < 0 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 ||
+        value.slice(4, 5) != "-" || value.slice(7, 8) != "-" || (value.slice(10, 11) != "T" && value.slice(10, 11) != " ") || value.slice(13, 14) != ":" || value.slice(16, 17) != ":" {
+        return []
+    }
+    let position = 19
+    let fraction = 0
+    if position < value.length && value.slice(position, position + 1) == "." {
+        position += 1
+        let digits = 0
+        while position < value.length && digitsAt(value, position, 1) >= 0 {
+            if digits < 9 { fraction = fraction * 10 + digitsAt(value, position, 1) }
+            digits += 1
+            position += 1
+        }
+        if digits == 0 { return [] }
+        while digits < 9 { fraction = fraction * 10; digits += 1 }
+    }
+    let offset = 0
+    let zone = value.slice(position, value.length)
+    if zone == "Z" { offset = 0 }
+    else if zone.length == 6 && (zone.startsWith("+") || zone.startsWith("-")) && zone.slice(3, 4) == ":" {
+        let hours = digitsAt(zone, 1, 2)
+        let minutes = digitsAt(zone, 4, 2)
+        if hours < 0 || minutes < 0 { return [] }
+        offset = hours * 3600 + minutes * 60
+        if zone.startsWith("-") { offset = -offset }
+    } else if zone != "" { return [] }
+    let total = ((civilDays(year, month, day) * 24 + hour) * 60 + minute) * 60 + second - offset
+    return [total * common.SECOND + fraction]
+}
+function exitedLine(stdout: Text, name: Text, status: Integer): Boolean {
+    let needle = "exited with code " + Text(status)
+    let rest = stdout
+    while true {
+        let found = rest.find(name)
+        if found < 0 { return false }
+        let after = rest.slice(found + name.length, rest.length)
+        let spaces = 0
+        while spaces < after.length && (after.slice(spaces, spaces + 1) == " " || after.slice(spaces, spaces + 1) == "\t" || after.slice(spaces, spaces + 1) == "\n" || after.slice(spaces, spaces + 1) == "\r") { spaces += 1 }
+        if spaces > 0 && after.slice(spaces, after.length).startsWith(needle) {
+            let tail = after.slice(spaces + needle.length, after.length)
+            if tail == "" || tail.startsWith(" ") || tail.startsWith("\n") || tail.startsWith("\t") || tail.startsWith("\r") { return true }
+        }
+        rest = rest.slice(found + 1, rest.length)
+    }
+    return false
+}
+function lineIndex(values: List<Text>, wanted: Text): Integer {
+    for index in 0..values.length { if values[index] == wanted { return index } }
+    return -1
+}
+function unsupportedFor(entry: json.Value, role: Text, status: Integer, unsupported: json.Value): Boolean {
+    if status != 127 || unsupported.kind != json.OBJECT || !common.equalText(data.field(unsupported, "role"), role) { return false }
+    let testcase = data.field(unsupported, "testcase")
+    if testcase.kind != json.STRING || testcase.text == "" || common.member(common.KNOWN_TESTCASES, testcase.text) { return false }
+    let environment = common.textList(data.field(data.field(entry, "Config"), "Env"))
+    let roles = 0
+    let cases = 0
+    for item in environment {
+        if item == "ROLE=" + role { roles += 1 }
+        if item == "TESTCASE=" + testcase.text { cases += 1 }
+    }
+    return roles == 1 && cases == 1
+}
+public function recordedComposeStop(spec: OwnerSpec, identity: Text, entry: json.Value, entries: List<json.Value>, unsupported: json.Value): Result<Boolean, common.Failure> {
+    let state = data.field(entry, "State")
+    let exitStatus = common.integerOf(data.field(state, "ExitCode"))
+    if !common.isInteger(data.field(state, "ExitCode")) || (exitStatus != 137 && exitStatus != 143) { return Ok<Boolean, common.Failure>(false) }
+    let force = exitStatus == 137
+    if force {
+        let role = try container(spec, entry)
+        if role != "server" || spec.minyarImage == "" || common.equalText(data.field(entry, "Image"), spec.minyarImage) || !common.isFalse(data.field(state, "OOMKilled")) {
+            return Ok<Boolean, common.Failure>(false)
+        }
+    }
+    let intentPath = common.joinPath(spec.artifacts, "create-admission.json")
+    let intent = data.none()
+    match common.readJson(intentPath) {
+        Ok(value) { intent = value }
+        Err(problem) { return Ok<Boolean, common.Failure>(false) }
+    }
+    if !common.equalText(data.field(intent, "project"), spec.project) || !common.equalText(data.field(intent, "nonce"), spec.nonce) ||
+        !common.equalText(data.field(intent, "state"), "closed") || !common.isTrue(data.field(intent, "certified")) {
+        return Ok<Boolean, common.Failure>(false)
+    }
+    let created = common.textList(data.field(intent, "created_ids"))
+    if !common.sameSet(created, idsOf(entries)) || !common.member(created, identity) { return Ok<Boolean, common.Failure>(false) }
+    let receipt = data.field(intent, "up_receipt")
+    let argv = common.textList(data.field(receipt, "argv"))
+    if receipt.kind != json.OBJECT || argv.length == 0 { return Ok<Boolean, common.Failure>(false) }
+    let prefix = [argv[0], "compose", "--project-name", spec.project, "--file", spec.composePath, "--env-file", common.joinPath(spec.runnerRoot, "empty.env"), "up"]
+    if argv.length < prefix.length || !common.sameTexts(argv.slice(0, prefix.length), prefix) || !common.member(argv.slice(prefix.length, argv.length), "--abort-on-container-exit") {
+        return Ok<Boolean, common.Failure>(false)
+    }
+    let status = data.field(receipt, "status")
+    let lifetime = data.field(receipt, "lifetime")
+    let problems = data.field(receipt, "finalization_errors")
+    if !(data.equalsInteger(status, 0) || data.equalsInteger(status, 127)) || !common.isFalse(data.field(receipt, "timed_out")) ||
+        data.field(receipt, "primary_exception").kind != json.NULL || problems.items.length > 0 ||
+        !common.equalText(data.field(lifetime, "state"), "closed") || !common.isTrue(data.field(lifetime, "certified")) {
+        return Ok<Boolean, common.Failure>(false)
+    }
+    let streams: List<Text> = []
+    for name in ["stdout", "stderr"] {
+        let bound = data.field(receipt, name)
+        let target = common.textOf(data.field(bound, "path"))
+        if target == "" || common.resolvePath(target) != target || common.isSymlink(target) || !common.within(common.joinPath(spec.artifacts, "daemon-commands"), target) {
+            return Ok<Boolean, common.Failure>(false)
+        }
+        match common.streamBinding(target, common.MAX_BYTES, common.now() + 10 * common.SECOND, "") {
+            Ok(value) { if !common.boundEquals(bound, value) { return Ok<Boolean, common.Failure>(false) } }
+            Err(problem) {
+                if problem.kind == "OwnershipError" { return Err<Boolean, common.Failure>(problem) }
+                return Ok<Boolean, common.Failure>(false)
+            }
+        }
+        streams.add(Text(common.readOr(target)))
+    }
+    let tail = argv.slice(prefix.length, argv.length)
+    if force {
+        let paired = false
+        for index in 0..(tail.length - 1) { if tail[index] == "--timeout" && tail[index + 1] == "10" { paired = true } }
+        if !data.equalsInteger(status, 0) || !paired { return Ok<Boolean, common.Failure>(false) }
+    }
+    let trigger = false
+    let finished = ""
+    let receiptStatus = common.integerOf(status)
+    for value in entries {
+        let role = try container(spec, value)
+        let valueState = data.field(value, "State")
+        let code = common.integerOf(data.field(valueState, "ExitCode"))
+        let allowed = code == 0 || unsupportedFor(value, role, code, unsupported)
+        if (role == "client" || role == "server") && common.member(tail, role) && common.isFalse(data.field(valueState, "Running")) && allowed && code == receiptStatus &&
+            exitedLine(streams[0], spec.project + "-" + role, code) {
+            trigger = true
+            finished = common.textOf(data.field(valueState, "FinishedAt"))
+        }
+    }
+    if !trigger { return Ok<Boolean, common.Failure>(false) }
+    if force {
+        let stopped = isoNanoseconds(common.textOf(data.field(state, "FinishedAt")))
+        let started = isoNanoseconds(finished)
+        if stopped.length == 0 || started.length == 0 || stopped[0] - started[0] < 9 * common.SECOND { return Ok<Boolean, common.Failure>(false) }
+    }
+    let stripped: List<Text> = []
+    for line in streams[1].split("\n") { stripped.add(line.trim()) }
+    let abort = lineIndex(stripped, "Compose Stopping Aborting on container exit...")
+    let role = try container(spec, entry)
+    let name = spec.project + "-" + role
+    let stopping = lineIndex(stripped, "Container " + name + " Stopping")
+    let done = lineIndex(stripped, "Container " + name + " Stopped")
+    if abort < 0 || stopping < 0 || done < 0 { return Ok<Boolean, common.Failure>(false) }
+    return Ok<Boolean, common.Failure>(abort < stopping && stopping < done)
+}
+
+public record CleanupResult {
+    reason: Text
+    verified: List<Text>
+    problems: List<common.StageError>
+    status: Text
+    primary: List<common.Failure>
+    stateIds: List<Text>
+    stateValues: List<json.Value>
+    admission: List<json.Value>
+    aborts: List<Text>
+    composeStops: List<Text>
+    remainingIds: List<Text>
+    remainingNetworks: List<Text>
+    inventoried: Boolean
+    retentionErrors: List<common.StageError>
+    watched: Boolean
+}
+public function cleanupJson(spec: OwnerSpec, result: CleanupResult): json.Value {
+    let primary = data.none()
+    if result.primary.length > 0 { primary = common.exception(result.primary[0]) }
+    let admission = data.none()
+    if result.admission.length > 0 { admission = result.admission[0] }
+    let aborts: List<json.Value> = []
+    for identity in result.aborts { aborts = aborts.appended(data.object(["immutable_id", "signal"], [data.string(identity), data.string("SIGKILL")])) }
+    let keys = ["schema_version", "scope", "reason", "project", "nonce", "verified_ids", "errors", "status", "primary_exception", "states_before_cleanup", "admission", "owned_abort_requests"]
+    let values = [data.number(1), data.string("owned IDs only; mock backend is not actual daemon proof"), data.string(result.reason), data.string(spec.project), data.string(spec.nonce),
+        common.stringList(result.verified), common.stageList(result.problems), data.string(result.status), primary, data.object(result.stateIds, result.stateValues), admission, data.array(aborts)]
+    if result.composeStops.length > 0 { keys.add("recorded_compose_stops"); values = values.appended(common.stringList(result.composeStops)) }
+    if result.inventoried {
+        keys.add("remaining_ids"); values = values.appended(common.stringList(result.remainingIds))
+        keys.add("remaining_networks"); values = values.appended(common.stringList(result.remainingNetworks))
+    }
+    if result.watched { keys.add("retention_errors"); values = values.appended(common.stageList(result.retentionErrors)) }
+    return data.object(keys, values)
+}
+function cleanupError(result: CleanupResult, stage: Text, problem: common.Failure) {
+    result.problems.add(common.stageError(stage, problem))
+    if result.primary.length > 0 { common.note(result.primary[0], stage + ": " + problem.message) }
+}
+function stateOf(result: CleanupResult, identity: Text): json.Value {
+    for index in 0..result.stateIds.length { if result.stateIds[index] == identity { return result.stateValues[index] } }
+    return data.none()
+}
+function ownedInventory(spec: OwnerSpec, daemon: Daemon, root: Text, result: CleanupResult, owned: List<Text>, entries: List<json.Value>, networks: List<Text>): Result<List<json.Value>, common.Failure> {
+    let ids = try containersOf(daemon)
+    if common.unique(ids).length != ids.length || ids.length > 3 { return Err<List<json.Value>, common.Failure>(common.ownership("duplicate/unbounded project IDs")) }
+    let roles: List<Text> = []
+    let collected: List<json.Value> = []
+    for identity in ids {
+        let entry = try inspectOf(daemon, identity)
+        if !common.equalText(data.field(entry, "Id"), identity) { return Err<List<json.Value>, common.Failure>(common.ownership("inspect ID mismatch")) }
+        let role = try container(spec, entry)
+        if common.member(roles, role) { return Err<List<json.Value>, common.Failure>(common.ownership("colliding service identities")) }
+        roles.add(role)
+        owned.add(identity)
+        collected = collected.appended(entry)
+        let state = data.field(entry, "State")
+        result.stateIds.add(identity)
+        result.stateValues = result.stateValues.appended(state)
+        if data.field(state, "Running").kind != json.BOOLEAN || !common.isInteger(data.field(state, "ExitCode")) {
+            return Err<List<json.Value>, common.Failure>(common.ownership("endpoint state primitive types differ"))
+        }
+    }
+    let networkEntries = try networksOf(daemon)
+    let current: List<json.Value> = []
+    for identity in owned {
+        let entry = try inspectOf(daemon, identity)
+        current = current.appended(entry)
+    }
+    let verified = try verifiedTopology(spec, current, networkEntries)
+    for entry in networkEntries {
+        let identity = try network(spec, entry, owned)
+        networks.add(identity)
+    }
+    for identity in owned { result.verified.add(identity) }
+    let inspected: List<json.Value> = []
+    for identity in owned {
+        let entry = try inspectOf(daemon, identity)
+        inspected = inspected.appended(entry)
+    }
+    let latest = try networksOf(daemon)
+    let wrote = try common.atomicJson(common.joinPath(root, "owned-inspect.json"), data.object(["containers", "networks"], [data.array(inspected), data.array(latest)]))
+    return Ok<List<json.Value>, common.Failure>(collected)
+}
+function allowedUnsupported(spec: OwnerSpec, daemon: Daemon, identity: Text, state: json.Value, unsupported: json.Value): Result<Boolean, common.Failure> {
+    let entry = try inspectOf(daemon, identity)
+    let role = try container(spec, entry)
+    let requested = data.field(unsupported, "role")
+    let testcase = data.field(unsupported, "testcase")
+    let environment = common.textList(data.field(data.field(entry, "Config"), "Env"))
+    let roles = 0
+    let cases = 0
+    for item in environment {
+        if item == "ROLE=" + role { roles += 1 }
+        if testcase.kind == json.STRING && item == "TESTCASE=" + testcase.text { cases += 1 }
+    }
+    if common.equalText(requested, role) && testcase.kind == json.STRING && testcase.text != "" && !common.member(common.KNOWN_TESTCASES, testcase.text) && roles == 1 && cases == 1 {
+        return Ok<Boolean, common.Failure>(data.equalsInteger(data.field(state, "ExitCode"), 127))
+    }
+    return Ok<Boolean, common.Failure>(false)
+}
+function networkRemoval(spec: OwnerSpec, daemon: Daemon, identity: Text): Result<Boolean, common.Failure> {
+    let current = try networksOf(daemon)
+    for entry in current {
+        if common.equalText(data.field(entry, "Id"), identity) {
+            let checked = try network(spec, entry, [])
+            return removeNetworkOf(daemon, identity)
+        }
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+function finalInventory(daemon: Daemon, result: CleanupResult): Result<Boolean, common.Failure> {
+    let ids = try containersOf(daemon)
+    let networks = try networksOf(daemon)
+    result.remainingIds.truncate(0)
+    for identity in ids { result.remainingIds.add(identity) }
+    result.remainingNetworks.truncate(0)
+    for entry in networks { result.remainingNetworks.add(common.textOf(data.field(entry, "Id"))) }
+    result.inventoried = true
+    if ids.length > 0 || networks.length > 0 { return Err<Boolean, common.Failure>(common.cleanup("owned daemon objects remain")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function newCleanup(reason: Text, primary: List<common.Failure>): CleanupResult {
+    return CleanupResult { reason: reason; verified: []; problems: []; status: "cleaning"; primary: primary; stateIds: []; stateValues: []; admission: []; aborts: []
+        composeStops: []; remainingIds: []; remainingNetworks: []; inventoried: false; retentionErrors: []; watched: false }
+}
+public function cleanupOwned(spec: OwnerSpec, daemon: Daemon, root: Text, reason: Text, primary: List<common.Failure>, unsupported: json.Value, abortFirst: Boolean, revoke: Boolean): Result<CleanupResult, common.Failure> {
+    let made = try common.makeFreshDirectory(root)
+    let result = newCleanup(reason, primary)
+    match closeAdmission(spec, revoke) {
+        Ok(value) { result.admission = result.admission.appended(value) }
+        Err(problem) { cleanupError(result, "create-admission", problem) }
+    }
+    let owned: List<Text> = []
+    let networks: List<Text> = []
+    let entries: List<json.Value> = []
+    match ownedInventory(spec, daemon, root, result, owned, entries, networks) {
+        Ok(collected) { entries = collected }
+        Err(problem) {
+            cleanupError(result, "ownership", problem)
+            owned.truncate(0)
+            networks.truncate(0)
+        }
+    }
+    if abortFirst {
+        for identity in owned {
+            if common.isTrue(data.field(stateOf(result, identity), "Running")) {
+                result.aborts.add(identity)
+                match abortOf(daemon, identity) {
+                    Ok(value) {}
+                    Err(problem) { cleanupError(result, "abort", problem) }
+                }
+            }
+        }
+    }
+    for identity in owned {
+        let state = stateOf(result, identity)
+        let allowed = false
+        if unsupported.kind != json.NULL {
+            match allowedUnsupported(spec, daemon, identity, state, unsupported) {
+                Ok(value) { allowed = value }
+                Err(problem) { cleanupError(result, "compliance-reinspection", problem) }
+            }
+        }
+        let code = common.integerOf(data.field(state, "ExitCode"))
+        let running = common.isTrue(data.field(state, "Running"))
+        let composeStop = false
+        if code == 137 || code == 143 {
+            if !running {
+                let entry = try inspectOf(daemon, identity)
+                let recorded = try recordedComposeStop(spec, identity, entry, entries, unsupported)
+                composeStop = recorded
+            }
+        }
+        if composeStop { result.composeStops.add(identity) }
+        if !running && code != 0 && !allowed && !composeStop {
+            cleanupError(result, "unexpected-endpoint-exit", common.cleanup("endpoint exited before owned stop: " + Text(code)))
+        }
+        match retainOf(daemon, identity, common.joinPath(root, identity + "-before-stop")) {
+            Ok(value) {}
+            Err(problem) { cleanupError(result, "retention", problem) }
+        }
+        match stopOf(daemon, identity) {
+            Ok(value) {}
+            Err(problem) { cleanupError(result, "stop", problem) }
+        }
+        match removeOf(daemon, identity) {
+            Ok(value) {}
+            Err(problem) { cleanupError(result, "remove", problem) }
+        }
+    }
+    for identity in networks {
+        match networkRemoval(spec, daemon, identity) {
+            Ok(value) {}
+            Err(problem) { cleanupError(result, "network-remove", problem) }
+        }
+    }
+    match finalInventory(daemon, result) {
+        Ok(value) {}
+        Err(problem) { cleanupError(result, "final-inventory", problem) }
+    }
+    if result.problems.length == 0 { result.status = "passed" } else { result.status = "failed" }
+    let ledger = common.joinPath(root, "cleanup.json")
+    match common.atomicJson(ledger, cleanupJson(spec, result)) {
+        Ok(value) {}
+        Err(problem) {
+            cleanupError(result, "finalization", problem)
+            result.status = "failed"
+            match common.atomicJson(ledger, cleanupJson(spec, result)) {
+                Ok(value) {}
+                Err(final) { cleanupError(result, "failure-ledger-finalization", final) }
+            }
+            if primary.length == 0 { return Err<CleanupResult, common.Failure>(problem) }
+        }
+    }
+    if primary.length > 0 { return Ok<CleanupResult, common.Failure>(result) }
+    if result.status != "passed" { return Err<CleanupResult, common.Failure>(common.cleanup("owned cleanup failed; retained cleanup.json")) }
+    return Ok<CleanupResult, common.Failure>(result)
+}
+
+public function admissionWrite(spec: OwnerSpec, value: json.Value): Result<Boolean, common.Failure> {
+    let lock = try process.admissionLock(scope(spec), 2 * common.SECOND)
+    let outcome = admissionWriteLocked(spec, value)
+    process.admissionUnlock(lock)
+    return outcome
+}
+function admissionWriteLocked(spec: OwnerSpec, value: json.Value): Result<Boolean, common.Failure> {
+    let admitted = try process.requireAdmission(scope(spec))
+    return common.atomicJson(common.joinPath(spec.artifacts, "create-admission.json"), value)
+}
+function closeLocked(spec: OwnerSpec, revoke: Boolean): Result<json.Value, common.Failure> {
+    let intent = common.joinPath(spec.artifacts, "create-admission.json")
+    if revoke {
+        let revoked = common.joinPath(spec.artifacts, "admission-revoked.json")
+        if !common.exists(revoked) {
+            let wrote = try common.atomicJson(revoked, data.object(["schema_version", "project", "nonce", "revoked"], [data.number(1), data.string(spec.project), data.string(spec.nonce), data.boolean(true)]))
+        }
+    }
+    if !common.exists(intent) {
+        return Ok<json.Value, common.Failure>(data.object(["state", "certified", "revoked"], [data.string("not-opened"), data.boolean(true), data.boolean(revoke)]))
+    }
+    let value = try common.readJson(intent)
+    if !common.equalText(data.field(value, "project"), spec.project) || !common.equalText(data.field(value, "nonce"), spec.nonce) {
+        return Err<json.Value, common.Failure>(common.ownership("create intent ownership differs"))
+    }
+    return Ok<json.Value, common.Failure>(value)
+}
+function abortRecorded(spec: OwnerSpec): Result<List<json.Value>, common.Failure> {
+    let root = common.joinPath(spec.artifacts, "daemon-commands")
+    let actions: List<json.Value> = []
+    if !common.exists(root) { return Ok<List<json.Value>, common.Failure>(actions) }
+    let entries = try common.boundedPaths(root, common.MAX_FILES, common.now() + 10 * common.SECOND)
+    for record in entries {
+        if common.nameOf(record) != "commands.json" { continue }
+        let receipt = try common.readJson(record)
+        for command in data.field(receipt, "commands").items {
+            let identity = data.field(command, "process_identity")
+            if identity.kind != json.OBJECT || !common.isInteger(data.field(identity, "pid")) || !common.isInteger(data.field(identity, "start_ticks")) { continue }
+            let known: List<common.Member> = []
+            for member in data.field(data.field(command, "lifetime"), "members").items {
+                if member.kind != json.OBJECT || !common.isInteger(data.field(member, "pid")) || !common.isInteger(data.field(member, "start_ticks")) ||
+                    !common.isInteger(data.field(member, "pgid")) || !common.isInteger(data.field(member, "session")) {
+                    return Err<List<json.Value>, common.Failure>(common.ownership("CLI descendant receipt types differ"))
+                }
+                let candidate = common.readMember(member)
+                if common.sameIdentity(common.processIdentity(candidate.pid), candidate) { process.putMember(known, candidate) }
+            }
+            let receipts: List<process.Receipt> = []
+            let drained = try process.drainCli(common.readMember(identity), known, receipts, common.now() + 2 * common.SECOND, false)
+            for item in receipts { actions = actions.appended(process.receiptJson(item)) }
+        }
+    }
+    return Ok<List<json.Value>, common.Failure>(actions)
+}
+public function closeAdmission(spec: OwnerSpec, revoke: Boolean): Result<json.Value, common.Failure> {
+    let lock = try process.admissionLock(scope(spec), 2 * common.SECOND)
+    let loaded = closeLocked(spec, revoke)
+    process.admissionUnlock(lock)
+    let value = try loaded
+    if common.hasKey(value, "state") && common.equalText(data.field(value, "state"), "not-opened") && !common.hasKey(value, "project") { return Ok<json.Value, common.Failure>(value) }
+    if !common.equalText(data.field(value, "state"), "closed") {
+        let actions = try abortRecorded(spec)
+        value = data.with(value, "state", data.string("interrupted-uncertified"))
+        value = data.with(value, "certified", data.boolean(false))
+        value = data.with(value, "owned_cli_abort_receipts", data.array(actions))
+        let relock = try process.admissionLock(scope(spec), 2 * common.SECOND)
+        let wrote = common.atomicJson(common.joinPath(spec.artifacts, "create-admission.json"), value)
+        process.admissionUnlock(relock)
+        let written = try wrote
+        return Err<json.Value, common.Failure>(common.cleanup("in-flight create/start admission cannot certify daemon absence"))
+    }
+    if !common.isTrue(data.field(value, "certified")) { return Err<json.Value, common.Failure>(common.cleanup("create admission did not close successfully")) }
+    return Ok<json.Value, common.Failure>(value)
+}
+
+public record Sample { cpu: Float; ram: Float }
+public record CpuTotals { total: Integer; idle: Integer; set: Boolean }
+public function noTotals(): CpuTotals { return CpuTotals { total: 0; idle: 0; set: false } }
+public function resourceSample(previous: CpuTotals): Result<Sample, common.Failure> {
+    let hooked = try common.fault("sample", "")
+    let stat = Text(common.readOr("/proc/stat"))
+    let first = stat.split("\n")[0]
+    let fields: List<Text> = []
+    for part in first.split(" ") { if part != "" { fields.add(part) } }
+    if fields.length < 9 { return Err<Sample, common.Failure>(failure("ValueError", "unreadable /proc/stat")) }
+    let total = 0
+    let values: List<Integer> = []
+    for index in 1..9 { values.add(common.integerText(fields[index])); total += values[index - 1] }
+    let idle = values[3] + values[4]
+    let usage = 0.0
+    if previous.set && total != previous.total {
+        usage = 100.0 * (1.0 - Float(idle - previous.idle) / Float(total - previous.total))
+    }
+    previous.total = total
+    previous.idle = idle
+    previous.set = true
+    let available = -1
+    let memoryTotal = -1
+    for line in Text(common.readOr("/proc/meminfo")).split("\n") {
+        let parts: List<Text> = []
+        for part in line.split(" ") { if part != "" { parts.add(part) } }
+        if parts.length >= 2 && parts[0] == "MemAvailable:" { available = common.integerText(parts[1]) }
+        if parts.length >= 2 && parts[0] == "MemTotal:" { memoryTotal = common.integerText(parts[1]) }
+    }
+    if available < 0 || memoryTotal <= 0 { return Err<Sample, common.Failure>(failure("KeyError", "MemAvailable")) }
+    return Ok<Sample, common.Failure>(Sample { cpu: usage; ram: 100.0 * (1.0 - Float(available) / Float(memoryTotal)) })
+}
+public function checkedIdentity(pid: Integer): Result<common.Member, common.Failure> {
+    let hooked = try common.fault("identity", Text(pid))
+    return Ok<common.Member, common.Failure>(common.processIdentity(pid))
+}
+function floatText(value: Float): Text { return Text(value) }
+function monitorLoop(spec: OwnerSpec, controller: common.Member, guard: common.Member, deadline: Integer, interval: Integer, samples: List<Sample>, reason: List<Text>, observed: List<json.Value>, output: Text): Result<Boolean, common.Failure> {
+    let previous = noTotals()
+    let index = 0
+    let rows: List<json.Value> = []
+    while reason.length == 0 {
+        let sample = try resourceSample(previous)
+        if samples.length > 0 {
+            sample = samples[min(index, samples.length - 1)]
+            index += 1
+        }
+        rows = rows.appended(data.object(["time", "cpu_percent", "ram_percent"], [data.decimal(common.durationText(common.now())), data.decimal(floatText(sample.cpu)), data.decimal(floatText(sample.ram))]))
+        let controllerNow = try checkedIdentity(controller.pid)
+        if !common.sameIdentity(controllerNow, controller) { reason.add("controller-death") }
+        else {
+            let guardNow = try checkedIdentity(guard.pid)
+            if !common.sameIdentity(guardNow, guard) { reason.add("guard-death") }
+            else if common.now() >= deadline { reason.add("deadline") }
+            else if sample.cpu >= 75.0 || sample.ram >= 75.0 { reason.add("resource-abort") }
+            else { common.pause(max(500, interval / common.MILLISECOND)) }
+        }
+    }
+    let watchdog = common.processIdentity(system.processId())
+    let wrote = try common.atomicJson(common.joinPath(output, "monitor.json"), data.object(["schema_version", "controller", "guard", "watchdog", "deadline_monotonic", "reason", "samples"],
+        [data.number(1), common.identityJson(controller), common.identityJson(guard), common.identityJson(watchdog), data.decimal(common.durationText(deadline)), data.string(reason[0]), data.array(rows)]))
+    return Ok<Boolean, common.Failure>(true)
+}
+public function watchOwned(spec: OwnerSpec, daemon: Daemon, controller: common.Member, guard: common.Member, deadline: Integer, output: Text, interval: Integer, samples: List<Sample>): Result<CleanupResult, common.Failure> {
+    if controller.pid < 0 || controller.startTicks < 0 || guard.pid < 0 || guard.startTicks < 0 {
+        return Err<CleanupResult, common.Failure>(common.ownership("exact controller/guard process identities required"))
+    }
+    let made = try common.makeFreshDirectory(output)
+    let reason: List<Text> = []
+    let primary: List<common.Failure> = []
+    let problems: List<common.StageError> = []
+    let observed: List<json.Value> = []
+    let results: List<CleanupResult> = []
+    let resultJson: List<json.Value> = []
+    match monitorLoop(spec, controller, guard, deadline, interval, samples, reason, observed, output) {
+        Ok(value) {}
+        Err(problem) {
+            primary.add(problem)
+            if reason.length == 0 { reason.add("monitor-failure") }
+            watchSecondary(problems, primary, "monitor", problem)
+        }
+    }
+    match cleanupOwned(spec, daemon, common.joinPath(output, "cleanup"), reason[0], primary, data.none(), true, true) {
+        Ok(value) { results.add(value); resultJson = resultJson.appended(cleanupJson(spec, value)) }
+        Err(problem) {
+            if primary.length == 0 { primary.add(problem) }
+            watchSecondary(problems, primary, "cleanup", problem)
+            let ledger = common.joinPath(output, "cleanup/cleanup.json")
+            if common.exists(ledger) {
+                match common.readJson(ledger) {
+                    Ok(value) { resultJson = resultJson.appended(value) }
+                    Err(readFailure) { watchSecondary(problems, primary, "cleanup-ledger-read", readFailure) }
+                }
+            }
+        }
+    }
+    match common.treeRetention(common.joinPath(output, "retained-trees"), common.MAX_BYTES, common.MAX_FILES) {
+        Ok(retention) {
+            match common.capture(retention, spec.runnerRoot, "runner_root") {
+                Ok(row) {}
+                Err(problem) { watchSecondary(problems, primary, "runner_root", problem) }
+            }
+            match common.capture(retention, spec.fixtureRoot, "fixture_root") {
+                Ok(row) {}
+                Err(problem) { watchSecondary(problems, primary, "fixture_root", problem) }
+            }
+        }
+        Err(problem) { watchSecondary(problems, primary, "retention-setup", problem) }
+    }
+    let status = "passed"
+    if primary.length > 0 || problems.length > 0 || resultJson.length == 0 || !common.equalText(data.field(resultJson[0], "status"), "passed") { status = "failed" }
+    let remainingIds = data.none()
+    let remainingNetworks = data.none()
+    match containersOf(daemon) {
+        Ok(ids) {
+            match networksOf(daemon) {
+                Ok(networks) {
+                    remainingIds = common.stringList(ids)
+                    let networkIds: List<Text> = []
+                    for entry in networks { networkIds.add(common.textOf(data.field(entry, "Id"))) }
+                    remainingNetworks = common.stringList(networkIds)
+                    if ids.length > 0 || networks.length > 0 {
+                        watchSecondary(problems, primary, "final-inventory", common.cleanup("owned daemon objects appeared or remain after retention"))
+                        status = "failed"
+                    }
+                }
+                Err(problem) { watchSecondary(problems, primary, "final-inventory", problem); status = "failed" }
+            }
+        }
+        Err(problem) { watchSecondary(problems, primary, "final-inventory", problem); status = "failed" }
+    }
+    let final = finalJson(reason[0], status, primary, problems, resultJson, remainingIds, remainingNetworks)
+    let finalPath = common.joinPath(output, "watch-final.json")
+    match common.atomicJson(finalPath, final) {
+        Ok(value) {}
+        Err(problem) {
+            watchSecondary(problems, primary, "watch-finalization", problem)
+            if primary.length == 0 { primary.add(problem) }
+            status = "failed"
+            match common.atomicJson(finalPath, finalJson(reason[0], status, primary, problems, resultJson, remainingIds, remainingNetworks)) {
+                Ok(value) {}
+                Err(last) { watchSecondary(problems, primary, "failure-ledger-finalization", last) }
+            }
+        }
+    }
+    if primary.length > 0 { return Err<CleanupResult, common.Failure>(primary[0]) }
+    if status != "passed" { return Err<CleanupResult, common.Failure>(common.cleanup("watchdog cleanup or retention failed; retained watch-final.json")) }
+    let result = results[0]
+    result.watched = true
+    for item in problems { result.retentionErrors.add(item) }
+    return Ok<CleanupResult, common.Failure>(result)
+}
+function watchSecondary(problems: List<common.StageError>, primary: List<common.Failure>, stage: Text, problem: common.Failure) {
+    problems.add(common.stageError(stage, problem))
+    if primary.length > 0 { common.note(primary[0], stage + ": " + problem.message) }
+}
+function finalJson(reason: Text, status: Text, primary: List<common.Failure>, problems: List<common.StageError>, cleanup: List<json.Value>, remainingIds: json.Value, remainingNetworks: json.Value): json.Value {
+    let exception = data.none()
+    if primary.length > 0 { exception = common.exception(primary[0]) }
+    let result = data.none()
+    if cleanup.length > 0 { result = cleanup[0] }
+    return data.object(["schema_version", "reason", "status", "primary_exception", "errors", "cleanup", "remaining_ids", "remaining_networks"],
+        [data.number(1), data.string(reason), data.string(status), exception, common.stageList(problems), result, remainingIds, remainingNetworks])
+}
+
+public record Fixture { path: Text; cleaned: Boolean }
+public record Registry { fixtureRoot: Text; retention: common.TreeRetention; directories: List<Fixture>; problems: List<common.StageError>; statePath: Text; token: Text }
+public function fixtureRegistry(fixtureRoot: Text, artifacts: Text): Result<Registry, common.Failure> {
+    let made = try common.makeDirectories(fixtureRoot)
+    let retention = try common.treeRetention(artifacts, common.MAX_BYTES, common.MAX_FILES)
+    return Ok<Registry, common.Failure>(Registry { fixtureRoot: common.resolvePath(fixtureRoot); retention: retention; directories: []; problems: []; statePath: ""; token: "" })
+}
+public function registryTemporary(registry: Registry, directory: Text, prefix: Text): Result<Text, common.Failure> {
+    if common.resolvePath(directory) != registry.fixtureRoot { return Err<Text, common.Failure>(common.ownership("fixture temporary directory outside owned prefix")) }
+    let made = common.temporaryDirectory(directory, prefix)
+    if made == "" { return Err<Text, common.Failure>(common.systemFailure(common.lastErrno(), directory)) }
+    registry.directories.add(Fixture { path: made; cleaned: false })
+    let saved = try saveRegistry(registry)
+    return Ok<Text, common.Failure>(made)
+}
+public function findFixture(registry: Registry, target: Text): Integer {
+    for index in 0..registry.directories.length { if registry.directories[index].path == target { return index } }
+    return -1
+}
+public function registryCleanup(registry: Registry, target: Text): Result<Boolean, common.Failure> {
+    let index = findFixture(registry, target)
+    if index < 0 { return Err<Boolean, common.Failure>(common.ownership("cleanup of unregistered fixture refused")) }
+    let entry = registry.directories[index]
+    if entry.cleaned { return Ok<Boolean, common.Failure>(true) }
+    let row = try common.capture(registry.retention, entry.path, "runner-fixture")
+    let removed = try common.removeTree(entry.path)
+    entry.cleaned = true
+    return saveRegistry(registry)
+}
+public function registryRetain(registry: Registry, target: Text): Result<Boolean, common.Failure> {
+    if findFixture(registry, target) < 0 { return Err<Boolean, common.Failure>(common.ownership("cleanup of unregistered fixture refused")) }
+    let row = try common.capture(registry.retention, target, "pre-cleanup-fixture")
+    return saveRegistry(registry)
+}
+function registryJson(registry: Registry): json.Value {
+    let entries: List<json.Value> = []
+    for entry in registry.directories { entries = entries.appended(data.object(["path", "cleaned"], [data.string(entry.path), data.boolean(entry.cleaned)])) }
+    return data.object(["schema_version", "errors", "directories"], [data.number(1), common.stageList(registry.problems), data.array(entries)])
+}
+public function saveRegistry(registry: Registry): Result<Boolean, common.Failure> {
+    if registry.statePath == "" { return Ok<Boolean, common.Failure>(true) }
+    let entries: List<json.Value> = []
+    for entry in registry.directories { entries = entries.appended(data.object(["path", "cleaned"], [data.string(entry.path), data.boolean(entry.cleaned)])) }
+    return common.atomicJson(registry.statePath, data.object(["schema_version", "token", "fixture_root", "directories", "errors"],
+        [data.number(1), data.string(registry.token), data.string(registry.fixtureRoot), data.array(entries), common.stageList(registry.problems)]))
+}
+public function registryFinish(registry: Registry, primary: List<common.Failure>): Result<Boolean, common.Failure> {
+    for entry in registry.directories {
+        match registryCleanup(registry, entry.path) {
+            Ok(value) {}
+            Err(problem) {
+                registry.problems.add(common.StageError { stage: ""; kind: problem.kind; message: problem.message })
+                if primary.length > 0 { common.note(primary[0], "retention: " + problem.message) }
+            }
+        }
+    }
+    match common.atomicJson(common.joinPath(registry.retention.root, "registry.json"), registryJson(registry)) {
+        Ok(value) {}
+        Err(problem) {
+            if primary.length == 0 { return Err<Boolean, common.Failure>(problem) }
+            common.note(primary[0], "registry finalization: " + problem.message)
+        }
+    }
+    let saved = saveRegistry(registry)
+    if primary.length == 0 && registry.problems.length > 0 { return Err<Boolean, common.Failure>(common.cleanup("fixture retention failed")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function persistentRegistry(config: json.Value, token: Text): Result<Registry, common.Failure> {
+    let fixtureRoot = common.textOf(data.field(config, "fixture_root"))
+    let retained = common.textOf(data.field(config, "retained_fixtures"))
+    if fixtureRoot == "" || retained == "" || !common.lowerHex(token, 32) { return Err<Registry, common.Failure>(common.ownership("owned runner registry configuration differs")) }
+    let statePath = retained + ".registry.json"
+    if !common.present(statePath) {
+        let registry = try fixtureRegistry(fixtureRoot, retained)
+        registry.statePath = statePath
+        registry.token = token
+        let saved = try saveRegistry(registry)
+        return Ok<Registry, common.Failure>(registry)
+    }
+    let state = try common.readJson(statePath)
+    if !common.equalText(data.field(state, "token"), token) { return Err<Registry, common.Failure>(common.ownership("fixture registry belongs to another runner")) }
+    let retention = try common.reopenRetention(retained, common.MAX_BYTES, common.MAX_FILES)
+    let registry = Registry { fixtureRoot: common.textOf(data.field(state, "fixture_root")); retention: retention; directories: []; problems: []; statePath: statePath; token: token }
+    for entry in data.field(state, "directories").items {
+        registry.directories.add(Fixture { path: common.textOf(data.field(entry, "path")); cleaned: common.isTrue(data.field(entry, "cleaned")) })
+    }
+    for entry in data.field(state, "errors").items {
+        registry.problems.add(common.StageError { stage: common.textOf(data.field(entry, "stage")); kind: common.textOf(data.field(entry, "type")); message: common.textOf(data.field(entry, "message")) })
+    }
+    return Ok<Registry, common.Failure>(registry)
+}
+
+public function composeUpArgv(spec: OwnerSpec, argv: List<Text>): Result<List<Text>, common.Failure> {
+    if argv.length < 4 || argv[0] != "compose" || argv[1] != "--env-file" || argv[2] != "empty.env" || argv[3] != "up" {
+        return Err<List<Text>, common.Failure>(common.ownership("unreviewed compose command"))
+    }
+    let roles: List<Text> = []
+    let roleNames = common.ROLES
+    let index = 4
+    while index < argv.length {
+        let token = argv[index]
+        if common.member(roleNames, token) { roles.add(token); index += 1 }
+        else if token == "--timeout" {
+            if index + 1 >= argv.length || (argv[index + 1] != "0" && argv[index + 1] != "10") { return Err<List<Text>, common.Failure>(common.ownership("unreviewed compose timeout")) }
+            index += 2
+        } else if token == "--abort-on-container-exit" || token == "-V" { index += 1 }
+        else { return Err<List<Text>, common.Failure>(common.ownership("unreviewed compose option or workload")) }
+    }
+    if roles.length == 0 || common.unique(roles).length != roles.length { return Err<List<Text>, common.Failure>(common.ownership("exact selected compose roles required")) }
+    let result = ["compose", "--project-name", spec.project, "--file", spec.composePath, "--env-file", common.joinPath(spec.runnerRoot, "empty.env"), "up", "--pull", "never"]
+    for token in argv.slice(4, argv.length) { result.add(token) }
+    return Ok<List<Text>, common.Failure>(result)
+}
+
+public function prepareFixtureAccess(spec: OwnerSpec, daemon: Daemon): Result<json.Value, common.Failure> {
+    let identities = try containersOf(daemon)
+    if common.unique(identities).length != identities.length || identities.length > 3 { return Err<json.Value, common.Failure>(common.ownership("ambiguous fixture endpoint IDs")) }
+    let mounts: List<json.Value> = []
+    for identity in identities {
+        let entry = try inspectOf(daemon, identity)
+        if !common.equalText(data.field(entry, "Id"), identity) { return Err<json.Value, common.Failure>(common.ownership("fixture endpoint ID mismatch")) }
+        let role = try container(spec, entry)
+        if role != "sim" { for mount in data.field(entry, "Mounts").items { mounts = mounts.appended(mount) } }
+    }
+    let current: List<json.Value> = []
+    for identity in identities {
+        let entry = try inspectOf(daemon, identity)
+        current = current.appended(entry)
+    }
+    let networks = try networksOf(daemon)
+    let verified = try verifiedTopology(spec, current, networks)
+    let paths = [spec.fixtureRoot]
+    let modes = [493]
+    for mount in mounts {
+        let root = common.textOf(data.field(mount, "Source"))
+        let ancestor = common.parentOf(root)
+        while ancestor != spec.fixtureRoot {
+            if !common.within(spec.fixtureRoot, ancestor) { return Err<json.Value, common.Failure>(common.ownership("fixture ancestor outside owned prefix")) }
+            paths.add(ancestor)
+            modes.add(493)
+            if ancestor == "/" { break }
+            ancestor = common.parentOf(ancestor)
+        }
+        let downloads = common.equalText(data.field(mount, "Destination"), "/downloads")
+        let tree = try common.boundedPaths(root, common.MAX_FILES, common.now() + 30 * common.SECOND)
+        let candidates = [root]
+        for item in tree { candidates.add(item) }
+        for item in candidates {
+            if common.isSymlink(item) || !(common.isDirectory(item) || common.isFile(item)) { return Err<json.Value, common.Failure>(common.ownership("unreviewed fixture path")) }
+            let mode = 420
+            if common.isDirectory(item) { mode = 493 }
+            if downloads { mode = 438; if common.isDirectory(item) { mode = 511 } }
+            paths.add(item)
+            modes.add(mode)
+        }
+    }
+    let receipt: List<json.Value> = []
+    for index in 0..paths.length {
+        let before = common.modeOf(paths[index])
+        let changed = common.changeMode(paths[index], modes[index])
+        if changed < 0 { return Err<json.Value, common.Failure>(common.systemFailure(-changed, paths[index])) }
+        let after = common.modeOf(paths[index])
+        if after != modes[index] { return Err<json.Value, common.Failure>(common.ownership("fixture permission preparation failed")) }
+        receipt = receipt.appended(data.object(["path", "mode_before", "mode_after"], [data.string(paths[index]), data.number(before), data.number(after)]))
+    }
+    return Ok<json.Value, common.Failure>(data.object(["schema_version", "scope", "verified_ids", "permissions"],
+        [data.number(1), data.string("ephemeral verified endpoint bind mounts only"), common.stringList(identities), data.array(receipt)]))
+}
+
+public function runnerDaemon(configPath: Text): Result<Daemon, common.Failure> {
+    let config = try common.readJson(configPath)
+    if !common.isTrue(data.field(config, "execution_authorized")) { return Err<Daemon, common.Failure>(common.ownership("official Docker execution remains held")) }
+    let spec = try ownerSpec(data.field(config, "owner_spec"))
+    let cli = data.field(config, "docker_cli")
+    let path = common.textOf(data.field(cli, "path"))
+    let current = common.bindingOr(path)
+    if path == "" || current.bytes < 0 || current.path != path || !common.boundEquals(cli, current) {
+        return Err<Daemon, common.Failure>(common.ownership("configured Docker CLI binding differs"))
+    }
+    return dockerDaemon(spec, common.joinPath(spec.artifacts, "daemon-commands"), true, path)
+}
+public function copyRunnerLogs(daemon: Daemon, role: Text, directory: Text): Result<Boolean, common.Failure> {
+    let spec = daemon.spec[0]
+    if !common.member(common.ROLES, role) { return Err<Boolean, common.Failure>(common.ownership("unknown runner log role")) }
+    let target = common.resolvePath(directory)
+    if !common.within(spec.fixtureRoot, target) { return Err<Boolean, common.Failure>(common.ownership("log copy outside fixture tree")) }
+    let ids: List<Text> = []
+    let current = try containersOf(daemon)
+    for identity in current {
+        let entry = try inspectOf(daemon, identity)
+        let found = try container(spec, entry)
+        if found == role { ids.add(identity) }
+    }
+    if ids.length != 1 { return Err<Boolean, common.Failure>(common.ownership("log copy requires one verified immutable endpoint ID")) }
+    return copyBounded(daemon, ids[0], "/logs/.", target)
+}
+
+public function cleanupPreviousPhase(spec: OwnerSpec, daemon: Daemon): Result<Boolean, common.Failure> {
+    let ids = try containersOf(daemon)
+    let networks = try networksOf(daemon)
+    if ids.length == 0 && networks.length == 0 { return Ok<Boolean, common.Failure>(true) }
+    let index = 0
+    while common.present(common.joinPath(spec.artifacts, "between-up-" + Text(index))) { index += 1 }
+    let phasePath = common.joinPath(spec.artifacts, "phase.json")
+    let unsupported = data.none()
+    if common.exists(phasePath) {
+        let phase = try common.readJson(phasePath)
+        unsupported = data.field(phase, "unsupported_compliance")
+    }
+    let result = try cleanupOwned(spec, daemon, common.joinPath(spec.artifacts, "between-up-" + Text(index)), "upstream-next-phase", [], unsupported, false, false)
+    return Ok<Boolean, common.Failure>(true)
+}
+public function prepareRunnerPhase(spec: OwnerSpec, daemon: Daemon): Result<Boolean, common.Failure> {
+    let lock = try process.admissionLock(scope(spec), 2 * common.SECOND)
+    let admitted = process.requireAdmission(scope(spec))
+    process.admissionUnlock(lock)
+    let allowed = try admitted
+    return cleanupPreviousPhase(spec, daemon)
+}
+public function environmentValue(environment: List<Text>, name: Text): List<Text> {
+    for item in environment { if item.startsWith(name + "=") { return [item.slice(name.length + 1, item.length)] } }
+    return []
+}
+function upper(role: Text): Text {
+    if role == "server" { return "SERVER" }
+    if role == "client" { return "CLIENT" }
+    return "SIM"
+}
+public function dockerEntry(spec: OwnerSpec, daemon: Daemon, argv: List<Text>, environment: List<Text>): Result<Integer, common.Failure> {
+    if argv.length >= 4 && argv[0] == "compose" && argv[1] == "--env-file" && argv[2] == "empty.env" && argv[3] == "up" {
+        return composeUp(spec, daemon, argv, environment)
+    }
+    if argv.length >= 4 && argv[0] == "compose" && argv[1] == "--env-file" && argv[2] == "empty.env" && argv[3] == "stop" {
+        let roles = argv.slice(4, argv.length)
+        let roleNames = common.ROLES
+        let valid = roles.length > 0 && common.unique(roles).length == roles.length
+        for role in roles { if !common.member(roleNames, role) { valid = false } }
+        if !valid { return Err<Integer, common.Failure>(common.ownership("unreviewed stop roles")) }
+        let ids: List<Text> = []
+        let current = try containersOf(daemon)
+        for identity in current {
+            let entry = try inspectOf(daemon, identity)
+            let role = try container(spec, entry)
+            if common.member(roles, role) { ids.add(identity) }
+        }
+        for identity in ids { let stopped = try stopOf(daemon, identity) }
+        return Ok<Integer, common.Failure>(0)
+    }
+    return Err<Integer, common.Failure>(common.ownership("Docker operation outside reviewed official adapter"))
+}
+function composeUp(spec: OwnerSpec, daemon: Daemon, argv: List<Text>, environment: List<Text>): Result<Integer, common.Failure> {
+    let lock = try process.admissionLock(scope(spec), 2 * common.SECOND)
+    let admitted = process.requireAdmission(scope(spec))
+    process.admissionUnlock(lock)
+    let allowed = try admitted
+    let command = try composeUpArgv(spec, argv)
+    for role in ["server", "client"] {
+        let selected = environmentValue(environment, upper(role))
+        if selected.length == 0 || !common.member(imagesFor(spec, role), selected[0]) {
+            return Err<Integer, common.Failure>(common.ownership("selected endpoint image is outside pinned cell"))
+        }
+    }
+    let cleaned = try cleanupPreviousPhase(spec, daemon)
+    let requested = argv.slice(4, argv.length)
+    let role = ""
+    if requested.length >= 2 && requested[requested.length - 2] == "sim" && requested[requested.length - 1] == "client" { role = "client" }
+    else if requested.length == 2 && requested[0] == "-V" && requested[1] == "server" { role = "server" }
+    let unsupported = data.none()
+    if role != "" {
+        let testcase = environmentValue(environment, "TESTCASE_" + upper(role))
+        if testcase.length > 0 && testcase[0] != "" && !common.member(common.KNOWN_TESTCASES, testcase[0]) {
+            unsupported = data.object(["role", "testcase"], [data.string(role), data.string(testcase[0])])
+        }
+    }
+    let serverImage = environmentValue(environment, "SERVER")
+    let clientImage = environmentValue(environment, "CLIENT")
+    let wrotePhase = try common.atomicJson(common.joinPath(spec.artifacts, "phase.json"), data.object(["schema_version", "actual_argv", "unsupported_compliance", "selected_images"],
+        [data.number(1), common.stringList(command), unsupported, data.object(["server", "client"], [data.string(serverImage[0]), data.string(clientImage[0])])]))
+    let roleNames = common.ROLES
+    let requestedRoles: List<Text> = []
+    for token in requested { if common.member(roleNames, token) { requestedRoles.add(token) } }
+    let roles: List<Text> = []
+    let endpoints = common.member(requestedRoles, "server") || common.member(requestedRoles, "client")
+    for name in roleNames { if common.member(requestedRoles, name) || (name == "sim" && endpoints) { roles.add(name) } }
+    let upIndex = 0
+    for index in 0..command.length { if command[index] == "up" { upIndex = index; break } }
+    let create = command.slice(0, upIndex)
+    if common.member(requested, "-V") { for token in ["up", "--no-start", "--pull", "never", "--no-build", "-V"] { create.add(token) } }
+    else { for token in ["create", "--pull", "never", "--no-build", "--no-recreate"] { create.add(token) } }
+    for name in roles { create.add(name) }
+    let intended: List<json.Value> = []
+    for name in roles {
+        let image = spec.sim[0]
+        if name != "sim" { image = environmentValue(environment, upper(name))[0] }
+        intended = intended.appended(data.object(["name", "role", "image", "labels"], [data.string(spec.project + "-" + name), data.string(name), data.string(image), labels(spec, name)]))
+    }
+    let intent = data.object(["schema_version", "project", "nonce", "state", "certified", "intended_containers", "create_argv", "upstream_argv", "workload_argv"],
+        [data.number(1), data.string(spec.project), data.string(spec.nonce), data.string("creating"), data.boolean(false), data.array(intended),
+            common.stringList(create), common.stringList(argv), common.stringList(command)])
+    let opened = try admissionWrite(spec, intent)
+    let holder = IntentHolder { value: intent }
+    let statuses: List<Integer> = []
+    match workload(spec, daemon, holder, create, command, roles, requestedRoles, statuses) {
+        Ok(value) {}
+        Err(primary) {
+            let interrupted = data.with(data.with(holder.value, "state", data.string("interrupted-uncertified")), "primary_exception", common.exception(primary))
+            match admissionWrite(spec, interrupted) {
+                Ok(value) {}
+                Err(secondary) { common.note(primary, "admission failure ledger: " + secondary.message) }
+            }
+            return Err<Integer, common.Failure>(primary)
+        }
+    }
+    return Ok<Integer, common.Failure>(statuses[0])
+}
+record IntentHolder { value: json.Value }
+function workload(spec: OwnerSpec, daemon: Daemon, holder: IntentHolder, create: List<Text>, upCommand: List<Text>, roles: List<Text>, requestedRoles: List<Text>, statuses: List<Integer>): Result<Boolean, common.Failure> {
+    let created = try commandOf(daemon, create, timed(30))
+    let createdIds = try containersOf(daemon)
+    let createdEntries: List<json.Value> = []
+    let createdRoles: List<Text> = []
+    for identity in createdIds {
+        let entry = try inspectOf(daemon, identity)
+        createdEntries = createdEntries.appended(entry)
+        let role = try container(spec, entry)
+        createdRoles.add(role)
+    }
+    if !common.sameSet(createdRoles, roles) || createdIds.length != roles.length {
+        return Err<Boolean, common.Failure>(common.ownership("created endpoint roles differ from intent"))
+    }
+    for entry in createdEntries {
+        if !common.isFalse(data.field(data.field(entry, "State"), "Running")) { return Err<Boolean, common.Failure>(common.ownership("endpoint started before fixture preparation")) }
+    }
+    let createdNetworks = try networksOf(daemon)
+    let configured = try configuredTopology(spec, createdEntries, createdNetworks)
+    let verified = try verifiedTopology(spec, createdEntries, createdNetworks)
+    let permissions = try prepareFixtureAccess(spec, daemon)
+    let wrote = try common.atomicJson(common.joinPath(spec.artifacts, "fixture-permissions.json"), permissions)
+    holder.value = data.with(data.with(holder.value, "state", data.string("starting")), "created_ids", common.stringList(createdIds))
+    let starting = try admissionWrite(spec, holder.value)
+    let upIndex = 0
+    for index in 0..upCommand.length { if upCommand[index] == "up" { upIndex = index; break } }
+    let roleNames = common.ROLES
+    let command = upCommand.slice(0, upIndex + 1)
+    command.add("--no-build")
+    command.add("--no-recreate")
+    for token in upCommand.slice(upIndex + 1, upCommand.length) { if !common.member(roleNames, token) && token != "-V" { command.add(token) } }
+    for token in requestedRoles { command.add(token) }
+    holder.value = data.with(holder.value, "workload_argv", common.stringList(command))
+    let attached = try admissionWrite(spec, holder.value)
+    let settings = timed(330)
+    settings.check = false
+    settings.stream = true
+    let raw = try commandOf(daemon, command, settings)
+    if daemon.commands.rows.length == 0 { return Err<Boolean, common.Failure>(failure("IndexError", "list index out of range")) }
+    let receiptRow = daemon.commands.rows[daemon.commands.rows.length - 1]
+    holder.value = data.with(holder.value, "up_receipt", process.rowJson(receiptRow))
+    let after = try containersOf(daemon)
+    if !common.sameSet(after, createdIds) || common.unique(after).length != common.unique(createdIds).length {
+        return Err<Boolean, common.Failure>(common.ownership("workload container IDs changed after precreate"))
+    }
+    let current: List<json.Value> = []
+    for identity in createdIds {
+        let entry = try inspectOf(daemon, identity)
+        current = current.appended(entry)
+    }
+    let networks = try networksOf(daemon)
+    let checked = try verifiedTopology(spec, current, networks)
+    for row in daemon.commands.rows {
+        if row.lifetime.rootExited { return Err<Boolean, common.Failure>(common.cleanup("compose root exited with active descendants; admission uncertified")) }
+    }
+    let status = -1
+    if receiptRow.status.length > 0 { status = receiptRow.status[0] }
+    let statusValue = data.none()
+    if receiptRow.status.length > 0 { statusValue = data.number(status) }
+    holder.value = data.with(data.with(data.with(holder.value, "state", data.string("closed")), "certified", data.boolean(true)), "workload_status", statusValue)
+    let closed = try admissionWrite(spec, holder.value)
+    statuses.add(status)
+    return Ok<Boolean, common.Failure>(true)
+}

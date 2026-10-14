@@ -1539,37 +1539,45 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('./build/tooling/tests/', result.stdout)
 
     def test_quic_official_adapter_requires_all_linux_controls(self):
-        import importlib.util
         import json
         import re
         fragment = (ROOT/'build-support/quic-official-adapter.mk').read_text()
         target = 'check-quic-official-adapter'
-        inputs = {'tests/quic-official-adapter.py',
-                  'tests/interop/qns/owned_adapter.py',
-                  'tests/interop/qns/controls-requirements.txt',
-                  'scripts/check-quic-official-inputs.py',
+        inputs = {'tests/quic-official-adapter.min',
+                  'tests/quic-official-support.min',
+                  'tests/quic-official-inputs.min',
+                  'scripts/check-quic-official-inputs.min',
+                  'tests/interop/qns/owned-adapter.min',
+                  'tests/interop/qns/owned-adapter.c',
+                  'tests/interop/qns/owned-common.min',
+                  'tests/interop/qns/owned-process.min',
+                  'tests/interop/qns/owned-daemon.min',
+                  'tests/interop/qns/owned-derive.min',
+                  'tests/quic-json.min',
                   'tests/quic-simulator-shutdown.min',
                   'tests/interop/qns/simulator-shutdown.sh',
                   'tests/quic-qns-endpoint-lifecycle.min',
                   'tests/interop/qns/endpoint.min'}
+        tools = {'build/tooling/scripts/check-quic-official-inputs',
+                 'build/tooling/tests/quic-official-inputs',
+                 'build/tooling/tests/quic-official-adapter',
+                 'build/tooling/tests/interop/qns/owned-adapter'}
         aggregates = ('check', 'check-portable', 'check-quic', 'check-quic-sanitize',
                       'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-sanitize')
 
         def verify(candidate, host='Linux', operating_system='', ready=False):
             with tempfile.TemporaryDirectory(prefix='owned adapter Make rules ') as folder:
                 directory = Path(folder).resolve()
-                for name in inputs:
+                for name in inputs | {'runtime/native/sha256.c'}:
                     path = directory/name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes((ROOT/name).read_bytes())
                 records = []
                 if ready:
-                    for name in ('build/quic-interop-runner-740c05a.git/.ready.json',
-                                 'build/quic-official-controls-venv/.ready.json'):
-                        path = directory/name
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text('{"mock_ready_not_verification":true}\n')
-                        records.append((path, path.read_bytes()))
+                    path = directory/'build/quic-interop-runner-740c05a.git/.ready.json'
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('{"mock_ready_not_verification":true}\n')
+                    records.append((path, path.read_bytes()))
                 uname = directory/'uname'
                 uname.write_text('#!/bin/sh\nprintf "%s\\n" "'+host+'"\n')
                 uname.chmod(0o755)
@@ -1600,35 +1608,38 @@ class BuildWiring(unittest.TestCase):
                 if not supported:
                     self.assertIn('Linux adapter controls required', commands)
                     self.assertIn('exit 2', commands)
-                    self.assertNotIn('prepare-', commands)
-                    self.assertNotIn('check-quic-official-inputs.py controls ', commands)
+                    self.assertNotIn('prepare-runner', commands)
+                    self.assertNotIn('check-quic-official-inputs controls ', commands)
                     self.assertFalse(rules.get(target, set()))
                     return
                 self.assertTrue(inputs <= rules.get(target, set()))
+                self.assertTrue(tools <= rules.get(target, set()))
+                self.assertNotIn('python', commands)
                 controls = [line for line in commands.splitlines()
-                            if ' -E scripts/check-quic-official-inputs.py controls ' in line]
+                            if ' ./build/tooling/scripts/check-quic-official-inputs controls ' in line]
                 self.assertEqual(len(controls), 1)
                 command = controls[0]
                 self.assertIn('ordinary-limit ', command)
                 self.assertNotIn('sanitizer-limit', command)
                 self.assertIn('--repository "', command)
                 self.assertIn('--artifacts "$artifacts/run"', command)
+                self.assertIn('--controls "'+str(directory/'build/tooling/tests/quic-official-adapter')+'"', command)
+                self.assertIn('--adapter "'+str(directory/'build/tooling/tests/interop/qns/owned-adapter')+'"', command)
                 self.assertIn(str(directory/'build/quic-official-adapter.'), commands)
                 self.assertIn(str(directory/'build/quic-interop-runner-740c05a.git'), command)
-                self.assertNotIn(' -E tests/quic-official-adapter.py ', commands)
-                for forbidden in ('--case ', '--sanitize', ' -O ', '/home/user/',
+                checks = [line for line in commands.splitlines()
+                          if 'ordinary-limit ./build/tooling/tests/quic-official-inputs' in line]
+                self.assertEqual(len(checks), 1)
+                for forbidden in ('--case ', '--sanitize', '/home/user/',
                                   'docker ', 'compose ', '--pull ', '--build '):
                     self.assertNotIn(forbidden, command)
                 self.assertIn('mktemp -d "$(abspath build)', candidate)
-                for preparation in ('prepare-runner', 'prepare-python'):
-                    if ready:
-                        self.assertNotIn(preparation, commands)
-                    else:
-                        self.assertIn(preparation, commands)
+                if ready:
+                    self.assertNotIn('prepare-runner', commands)
+                else:
+                    self.assertIn('check-quic-official-inputs prepare-runner', commands)
                 for path, data in records:
                     self.assertEqual(path.read_bytes(), data)
-                self.assertIn('--requirements "tests/interop/qns/controls-requirements.txt"',
-                              commands)
 
         verify(fragment)
         verify(fragment, ready=True)
@@ -1650,20 +1661,20 @@ class BuildWiring(unittest.TestCase):
                 verify(mutant)
         for label, old, new in (
                 ('case filter', 'controls --repository', 'controls --case criteria-no-pull --repository'),
-                ('ordinary limiter omitted', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/',
-                 '"$(QUIC_OFFICIAL_PYTHON)" -E scripts/'),
-                ('wrong limiter', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/',
-                 '$(SANITIZER_LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/'),
-                ('optimized Python', '-E scripts/check-quic-official-inputs.py controls',
-                 '-O scripts/check-quic-official-inputs.py controls'),
+                ('ordinary limiter omitted', '$(LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls',
+                 './build/tooling/scripts/check-quic-official-inputs controls'),
+                ('wrong limiter', '$(LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls',
+                 '$(SANITIZER_LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls'),
                 ('private cache', '$(abspath build)/quic-interop-runner-740c05a.git',
                  '/home/user/private-runner'),
                 ('relative artifacts', '$(abspath build)/quic-official-adapter.',
                  'build/quic-official-adapter.'),
                 ('existing artifact leaf', '$$artifacts/run', '$$artifacts'),
                 ('missing pin argument', 'controls --repository "$(QUIC_OFFICIAL_RUNNER)"', 'controls'),
-                ('missing dependency verification', 'scripts/check-quic-official-inputs.py controls',
-                 'scripts/check-quic-official-inputs.py ignored')):
+                ('missing adapter binary', ' --adapter "$(abspath build/tooling/tests/interop/qns/owned-adapter)"', ''),
+                ('missing verifier tests', '$(LIMITED) ./build/tooling/tests/quic-official-inputs; ', ''),
+                ('missing dependency verification', 'check-quic-official-inputs controls',
+                 'check-quic-official-inputs ignored')):
             mutant = fragment.replace(old, new, 1)
             self.assertNotEqual(mutant, fragment, label)
             with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
@@ -1674,465 +1685,34 @@ class BuildWiring(unittest.TestCase):
         self.assertIn('build/linux-evidence/**/build/quic-official-adapter.*', workflow)
         # Linux uploads come from the runner's evidence; macOS and Windows from quic-native.
         self.assertEqual(workflow.count('            build/quic-official-adapter.*'), 1)
-        driver = ast.parse((ROOT/'tests/quic-official-adapter.py').read_text())
-        cases = []
-        for node in driver.body:
-            if isinstance(node, ast.Assign) and any(
-                    isinstance(name, ast.Name) and name.id == 'CASES' for name in node.targets):
-                cases.extend(ast.literal_eval(node.value))
-            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == 'CASES':
-                if isinstance(node.value, ast.Name):
-                    declaration = next(item.value for item in driver.body
-                                       if isinstance(item, ast.Assign) and any(
-                                           isinstance(name, ast.Name) and name.id == node.value.id
-                                           for name in item.targets))
-                    cases.extend(ast.literal_eval(declaration))
-                else:
-                    cases.extend(ast.literal_eval(node.value))
-        forwarding_cases = ('raw-forward-incremental', 'raw-forward-stderr-status',
-                            'raw-forward-no-duplicate', 'raw-forward-empty',
-                            'raw-forward-private-json', 'raw-forward-backpressure')
+        driver = (ROOT/'tests/quic-official-adapter.min').read_text()
+
+        def declared(name):
+            start = driver.index('constant '+name+': List<Text> = [')
+            return re.findall(r'"([a-z0-9-]+)"', driver[start:driver.index(']', start)])
+        cases = declared('CASES')
+        forwarding_cases = declared('FORWARD_CASES')
+        self.assertEqual(forwarding_cases, ['raw-forward-incremental', 'raw-forward-stderr-status',
+                                            'raw-forward-no-duplicate', 'raw-forward-empty',
+                                            'raw-forward-private-json', 'raw-forward-backpressure'])
         self.assertEqual(len(cases), 113)
         self.assertEqual(len(set(cases)), 113)
         self.assertTrue(set(forwarding_cases) <= set(cases))
         original_cases = [case for case in cases if case not in forwarding_cases]
         self.assertEqual(len(original_cases), 107)
         self.assertEqual(len(set(original_cases)), 107)
-        main = next(node for node in driver.body
-                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
-        selection = next(node.value for node in ast.walk(main)
-                         if isinstance(node, ast.Assign) and any(
-                             isinstance(name, ast.Name) and name.id == 'cases'
-                             for name in node.targets))
-        self.assertEqual(ast.unparse(selection), 'args.case or CASES')
+        self.assertIn('    let cases = all\n    if selected.length > 0 { cases = selected }\n', driver)
+        self.assertFalse(list(ROOT.glob('tests/interop/qns/*.py')))
         catalogue = native_catalogue()
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         rows = {row['path']: row for row in data['sources']}
-        self.assertEqual(rows['tests/quic-official-adapter.py']['role'], 'suite')
+        self.assertEqual(rows['tests/interop/qns/owned-adapter.c']['role'], 'support')
         self.assertIn('build-support/quic-official-adapter.mk',
-                      rows['tests/quic-official-adapter.py']['consumers'])
-        self.assertEqual(rows['tests/interop/qns/owned_adapter.py']['role'], 'support')
-        self.assertIn('tests/quic-official-adapter.py',
-                      rows['tests/interop/qns/owned_adapter.py']['consumers'])
-        for missing in ('tests/quic-official-adapter.py',
-                        'tests/interop/qns/owned_adapter.py'):
-            candidate = dict(data, sources=[row for row in data['sources']
-                                           if row['path'] != missing])
-            with self.subTest(omitted_source=missing), self.assertRaises(ValueError):
-                catalogue.validate(candidate, ROOT)
-
-    def test_quic_python_preparation_publishes_only_verified_inputs(self):
-        import importlib.util
-        import json
-        from unittest.mock import patch
-        spec = importlib.util.spec_from_file_location(
-            'official_adapter_publication', ROOT/'scripts/check-quic-official-inputs.py')
-        checker = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(checker)
-        for failure in ('venv', 'pip', 'verify', 'race', ''):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory(
-                    prefix='controls cache publication ') as folder:
-                root = Path(folder).resolve()
-                destination = root/'controls'
-                stages = []
-                def command(argv, timeout=30):
-                    self.assertFalse(destination.exists())
-                    if 'venv' in argv:
-                        stage = Path(argv[-1])
-                        stages.append(stage)
-                        (stage/'bin').mkdir()
-                        (stage/'bin/python').symlink_to(sys.executable)
-                        (stage/'pyvenv.cfg').write_text('retained environment\n')
-                        if failure == 'venv':
-                            raise subprocess.CalledProcessError(1, argv)
-                        return b''
-                    if 'pip' in argv:
-                        if failure == 'pip':
-                            raise subprocess.CalledProcessError(1, argv)
-                        return b''
-                    self.assertIn('verify-python', argv)
-                    if failure == 'verify':
-                        return b'{}'
-                    prefix = Path(argv[5].split('=', 1)[1])
-                    checker.require_empty_pycache(prefix)
-                    module = checker.binding(stages[-1]/'pyvenv.cfg')
-                    report = {'verified': True,
-                              'contract': checker.requirements_contract(checker.REQUIREMENTS),
-                              'implementation': 'cpython',
-                              'python': checker.binding((stages[-1]/'bin/python').resolve()),
-                              'module': module, 'packages': [module],
-                              'bytecode_route': {'prefix': str(prefix),
-                                                 'dont_write_bytecode': True}}
-                    if failure == 'race':
-                        destination.mkdir()
-                        (destination/'sentinel').write_bytes(b'other cache')
-                    return json.dumps(report).encode()
-                with patch.object(checker, 'require_linux'), \
-                        patch.object(checker, 'require_supported_python'), \
-                        patch.object(checker.Commands, 'run', side_effect=command):
-                    if failure:
-                        with self.assertRaises((ValueError, OSError,
-                                                subprocess.CalledProcessError)):
-                            checker.prepare_python(destination, checker.REQUIREMENTS)
-                    else:
-                        result = checker.prepare_python(destination, checker.REQUIREMENTS)
-                        self.assertTrue(result['verified'])
-                self.assertEqual(len(stages), 1)
-                self.assertEqual((stages[0]/'pyvenv.cfg').read_text(),
-                                 'retained environment\n')
-                if failure == 'race':
-                    self.assertEqual((destination/'sentinel').read_bytes(), b'other cache')
-                    self.assertFalse((destination/'.ready.json').exists())
-                elif failure:
-                    self.assertFalse(destination.exists())
-                    self.assertFalse(destination.is_symlink())
-                    self.assertFalse((stages[0]/'.ready.json').exists())
-                    original = (stages[0]/'pyvenv.cfg').stat().st_mtime_ns
-                    failure = ''
-                    with patch.object(checker, 'require_linux'), \
-                            patch.object(checker, 'require_supported_python'), \
-                            patch.object(checker.Commands, 'run', side_effect=command):
-                        self.assertTrue(checker.prepare_python(
-                            destination, checker.REQUIREMENTS)['verified'])
-                    self.assertEqual(len(stages), 2)
-                    self.assertEqual(destination.resolve(), stages[-1])
-                    self.assertFalse((stages[0]/'.ready.json').exists())
-                    self.assertEqual((stages[0]/'pyvenv.cfg').stat().st_mtime_ns, original)
-                else:
-                    self.assertTrue(destination.is_symlink())
-                    self.assertEqual(destination.resolve(), stages[0])
-                    self.assertTrue(json.loads((destination/'.ready.json').read_text())['verified'])
-                    with patch.object(checker.Commands, 'run') as launched:
-                        with self.assertRaises(ValueError):
-                            checker.prepare_python(destination, checker.REQUIREMENTS)
-                        launched.assert_not_called()
-        with tempfile.TemporaryDirectory(prefix='dangling controls cache ') as folder:
-            destination = Path(folder).resolve()/'controls'
-            destination.symlink_to(destination.parent/'missing', target_is_directory=True)
-            with patch.object(checker, 'require_linux'), \
-                    patch.object(checker, 'require_supported_python'), \
-                    patch.object(checker.Commands, 'run') as launched:
-                with self.assertRaises(ValueError):
-                    checker.prepare_python(destination, checker.REQUIREMENTS)
-                launched.assert_not_called()
-            self.assertTrue(destination.is_symlink())
-
-    def test_quic_official_prerequisites_refuse_false_readiness(self):
-        import hashlib
-        import importlib.util
-        import json
-        from unittest.mock import patch
-        spec = importlib.util.spec_from_file_location(
-            'official_adapter_inputs', ROOT/'scripts/check-quic-official-inputs.py')
-        checker = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(checker)
-        with tempfile.TemporaryDirectory(prefix='owned adapter Git objects ') as folder:
-            root = Path(folder)
-            repository = root/'repository'
-            subprocess.run(['git', 'init', '--bare', str(repository)],
-                           check=True, capture_output=True, timeout=15)
-            names = sorted(set(checker.PRIMARY_NAMES) |
-                           {f'fixture-{i:02}.txt' for i in range(35)})
-            self.assertEqual(len(names), 40)
-            objects, entries, primary = {}, [], {}
-            for name in names:
-                data = ('retained source '+name+'\n').encode()
-                result = subprocess.run(['git', '-C', str(repository),
-                                         'hash-object', '-w', '--stdin'], input=data,
-                                        check=True, capture_output=True, timeout=15)
-                blob = result.stdout.decode().strip()
-                objects[name] = blob
-                entries.append(f'100644 blob {blob}\t{name}\n'.encode())
-                if name in checker.PRIMARY_NAMES:
-                    primary[name] = hashlib.sha256(data).hexdigest()
-            tree = subprocess.run(['git', '-C', str(repository), 'mktree'],
-                                  input=b''.join(entries), check=True,
-                                  capture_output=True, timeout=15).stdout.decode().strip()
-            pin = subprocess.run(
-                ['git', '-C', str(repository), '-c', 'user.name=Fixture',
-                 '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
-                 'commit-tree', tree], input=b'Owned source fixture\n', check=True,
-                capture_output=True, timeout=15).stdout.decode().strip()
-            with patch.object(checker, 'load_contract', return_value=(pin, primary)):
-                verified = checker.verify_runner(repository)
-                self.assertTrue(verified['verified'])
-                self.assertEqual(len(verified['files']), 40)
-                for name in checker.PRIMARY_NAMES:
-                    changed = dict(primary, **{name: '0'*64})
-                    with patch.object(checker, 'load_contract', return_value=(pin, changed)):
-                        with self.subTest(corrupt_primary=name), self.assertRaises(ValueError):
-                            checker.verify_runner(repository)
-                with patch.object(checker, 'load_contract', return_value=('0'*40, primary)):
-                    with self.assertRaises((ValueError, subprocess.CalledProcessError)):
-                        checker.verify_runner(repository)
-                graft = repository/'info/grafts'
-                graft.write_text(pin+'\n')
-                with self.assertRaises(ValueError):
-                    checker.verify_runner(repository)
-                graft.unlink()
-                subprocess.run(['git', '-C', str(repository), 'update-ref',
-                                'refs/replace/'+pin, pin], check=True,
-                               capture_output=True, timeout=15)
-                with self.assertRaises(ValueError):
-                    checker.verify_runner(repository)
-                subprocess.run(['git', '-C', str(repository), 'update-ref', '-d',
-                                'refs/replace/'+pin], check=True,
-                               capture_output=True, timeout=15)
-                blob = objects[names[-1]]
-                (repository/'objects'/blob[:2]/blob[2:]).unlink()
-                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
-                    checker.verify_runner(repository)
-        with tempfile.TemporaryDirectory(prefix='false adapter readiness ') as folder:
-            root = Path(folder)
-            with patch.object(checker.Commands, 'run', return_value=b''):
-                with self.assertRaises((ValueError, OSError)):
-                    checker.prepare_runner(root/'runner')
-            self.assertFalse((root/'runner/.ready.json').exists())
-            with patch.object(checker.Commands, 'run', return_value=b''):
-                with self.assertRaises((ValueError, OSError, json.JSONDecodeError)):
-                    checker.prepare_python(root/'venv',
-                                           ROOT/'tests/interop/qns/controls-requirements.txt')
-            self.assertFalse((root/'venv/.ready.json').exists())
-            for mode in ('runner', 'venv'):
-                poisoned = root/('poisoned-'+mode)
-                poisoned.mkdir()
-                sentinel = poisoned/'poison'
-                sentinel.write_bytes(b'not a verified cache')
-                with patch.object(checker.Commands, 'run') as launched:
-                    with self.subTest(existing_poison=mode), self.assertRaises(ValueError):
-                        if mode == 'runner':
-                            checker.prepare_runner(poisoned)
-                        else:
-                            checker.prepare_python(poisoned, checker.REQUIREMENTS)
-                    launched.assert_not_called()
-                self.assertEqual(sentinel.read_bytes(), b'not a verified cache')
-                self.assertFalse((poisoned/'.ready.json').exists())
-            external = root/'provided'
-            external.mkdir()
-            before = set(external.rglob('*'))
-            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
-                checker.verify_runner(external)
-            self.assertEqual(set(external.rglob('*')), before)
-        with tempfile.TemporaryDirectory(prefix='wrong wheel version route ') as folder:
-            from types import SimpleNamespace
-            version_flags = SimpleNamespace(**{
-                name: getattr(sys.flags, name) for name in dir(sys.flags)
-                if isinstance(getattr(sys.flags, name), (int, bool))})
-            version_flags.safe_path = True
-            with patch.object(checker.sys, 'flags', version_flags), \
-                    patch.object(checker.sys, 'pycache_prefix', os.path.realpath(folder)), \
-                    patch.object(checker.sys, 'dont_write_bytecode', True), \
-                    patch.object(checker.importlib.metadata, 'version', return_value='0'):
-                with self.assertRaisesRegex(ValueError, 'PyYAML version differs'):
-                    checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
-        for version in ((3, 11), (3, 13), (3, 14)):
-            with patch.object(checker.sys, 'version_info', version):
-                with self.subTest(unverified_abi=version), self.assertRaises(ValueError):
-                    checker.require_supported_python()
-        from types import SimpleNamespace
-        trusted_flags = SimpleNamespace(**{
-            name: getattr(sys.flags, name) for name in dir(sys.flags)
-            if isinstance(getattr(sys.flags, name), (int, bool))})
-        trusted_flags.safe_path = True
-        with patch.object(checker.sys, 'implementation', SimpleNamespace(name='pypy')):
-            with self.assertRaises(ValueError):
-                checker.require_supported_python()
-        with tempfile.TemporaryDirectory(prefix='controls wheel byte proof ') as folder:
-            import base64
-            root = Path(folder).resolve()
-            module = root/'yaml/__init__.py'
-            module.parent.mkdir()
-            module.write_bytes(b'retained module fixture\n')
-            expected = base64.urlsafe_b64encode(
-                hashlib.sha256(module.read_bytes()).digest()).decode().rstrip('=')
-            class Entry:
-                hash = SimpleNamespace(mode='sha256', value=expected)
-                def __str__(self):
-                    return 'yaml/__init__.py'
-            distribution = SimpleNamespace(files=[Entry()],
-                                           locate_file=lambda item: root/str(item))
-            yaml = SimpleNamespace(__file__=str(module), __version__='6.0.2')
-            cache = root/'fresh-bytecode'
-            cache.mkdir()
-            with patch.object(checker.sys, 'flags', trusted_flags), \
-                    patch.object(checker.sys, 'pycache_prefix', str(cache)), \
-                    patch.object(checker.sys, 'dont_write_bytecode', True), \
-                    patch.object(checker.importlib.util, 'find_spec',
-                                 return_value=SimpleNamespace(
-                                     origin=str(module),
-                                     loader=checker.importlib.machinery.SourceFileLoader('yaml', str(module)))), \
-                    patch.object(checker.importlib.metadata, 'version', return_value='6.0.2'), \
-                    patch.object(checker.importlib.metadata, 'distribution',
-                                 return_value=distribution), \
-                    patch.object(checker.importlib, 'import_module', return_value=yaml) as imported:
-                class AlternateLoader(checker.importlib.machinery.SourceFileLoader):
-                    pass
-                for origin, loader in (
-                        (str(root/'shadow/yaml.py'),
-                         checker.importlib.machinery.SourceFileLoader('yaml', str(root/'shadow/yaml.py'))),
-                        (str(module), AlternateLoader('yaml', str(module))),
-                        (str(module), None)):
-                    with patch.object(checker.importlib.util, 'find_spec',
-                                      return_value=SimpleNamespace(origin=origin, loader=loader)):
-                        with self.subTest(unverified_origin=origin, loader=type(loader).__name__):
-                            with self.assertRaisesRegex(ValueError, 'verified source file'):
-                                checker.verify_python(checker.REQUIREMENTS)
-                        imported.assert_not_called()
-                report = checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
-                self.assertTrue(report['verified'])
-                self.assertEqual(imported.call_count, 1)
-                module.write_bytes(b'changed module fixture\n')
-                with self.assertRaises(ValueError):
-                    checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
-                self.assertEqual(imported.call_count, 1)
-        hostile = {'GIT_DIR': '/wrong/repository', 'GIT_WORK_TREE': '/wrong/worktree',
-                   'GIT_REPLACE_REF_BASE': 'refs/hostile', 'GIT_CONFIG_COUNT': '1',
-                   'GIT_CONFIG_KEY_0': 'include.path', 'GIT_CONFIG_VALUE_0': '/wrong/config',
-                   'GIT_CONFIG_SYSTEM': '/wrong/system', 'GIT_CONFIG_GLOBAL': '/wrong/global',
-                   'GIT_CONFIG_NOSYSTEM': '0', 'GIT_NO_REPLACE_OBJECTS': '0'}
-        with patch.dict(os.environ, hostile):
-            clean = checker.git_environment()
-            self.assertEqual({key: value for key, value in clean.items()
-                              if key.startswith('GIT_')},
-                             {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
-                              'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_TERMINAL_PROMPT': '0'})
-            with tempfile.TemporaryDirectory(prefix='adapter launch routing ') as folder:
-                root = Path(folder).resolve()
-                repository = root/'trusted-repository'
-                repository.mkdir()
-                selections = []
-                def harmless_child(argv, **kwargs):
-                    selections.append((list(argv), kwargs['env']))
-                    self.assertEqual(kwargs['env'], clean)
-                    self.assertEqual(argv[1:5], ['-E', '-B', '-P', '-X'])
-                    self.assertTrue(argv[5].startswith('pycache_prefix='))
-                    cache = Path(argv[5].split('=', 1)[1])
-                    checker.require_empty_pycache(cache)
-                    if len(selections) == 1:
-                        self.assertEqual(argv[6:8],
-                                         [str(ROOT/'scripts/check-quic-official-inputs.py'),
-                                          'verify'])
-                        self.assertIn(str(repository), argv)
-                        result = {'verified': True, 'runner': {'verified': True},
-                                  'python': {'verified': True,
-                                             'bytecode_route': {'prefix': str(cache),
-                                                                'dont_write_bytecode': True}}}
-                        return subprocess.CompletedProcess(argv, 0, json.dumps(result).encode(), b'')
-                    self.assertEqual(argv[6], str(ROOT/'tests/quic-official-adapter.py'))
-                    self.assertEqual(argv[7:],
-                                     ['--pinned-runner', str(repository),
-                                      '--artifacts', str(root/'run')])
-                    self.assertNotIn('--case', argv)
-                    (root/'run').mkdir()
-                    return subprocess.CompletedProcess(argv, 0, b'ALL107 mock controls\n', b'')
-                with patch.object(checker.subprocess, 'run', side_effect=harmless_child):
-                    report = checker.run_controls(repository, checker.REQUIREMENTS, root/'run')
-                self.assertTrue(report['verified'])
-                self.assertEqual(len(selections), 2)
-                self.assertEqual(selections[0][1], selections[1][1])
-                self.assertEqual(report['git_environment'],
-                                 {key: value for key, value in clean.items() if key.startswith('GIT_')})
-                for tamper in ('poisoned route', 'missing route report', 'failed verification'):
-                    calls = []
-                    def poisoned_preflight(argv, **kwargs):
-                        calls.append(list(argv))
-                        cache = Path(argv[5].split('=', 1)[1])
-                        result = {'verified': True, 'runner': {'verified': True},
-                                  'python': {'verified': True,
-                                             'bytecode_route': {'prefix': str(cache),
-                                                                'dont_write_bytecode': True}}}
-                        if tamper == 'poisoned route':
-                            (cache/'unexpected.pyc').write_bytes(b'not fresh')
-                        elif tamper == 'missing route report':
-                            result['python'].pop('bytecode_route')
-                        else:
-                            result['verified'] = False
-                        return subprocess.CompletedProcess(argv, 0, json.dumps(result).encode(), b'')
-                    with patch.object(checker.subprocess, 'run', side_effect=poisoned_preflight):
-                        with self.subTest(tamper=tamper), self.assertRaises(ValueError):
-                            checker.run_controls(repository, checker.REQUIREMENTS,
-                                                 root/('refused-'+tamper.replace(' ', '-')))
-                    self.assertEqual(len(calls), 1)
-                with patch.object(checker.Commands, 'run') as launched:
-                    with self.assertRaises(ValueError):
-                        checker.run_controls(repository, checker.REQUIREMENTS, root/'run')
-                    launched.assert_not_called()
-        with tempfile.TemporaryDirectory(prefix='valid altered adapter bytecode ') as folder:
-            import base64
-            import py_compile
-            root = Path(folder).resolve()
-            module = root/'yaml/__init__.py'
-            module.parent.mkdir()
-            module.write_text("__version__='6.0.2'\nSOURCE_MARKER='verified source'\n")
-            altered = root/'altered.py'
-            altered.write_text("__version__='6.0.2'\nSOURCE_MARKER='altered valid cache'\n")
-            with patch.object(sys, 'pycache_prefix', None):
-                cached = Path(importlib.util.cache_from_source(str(module)))
-            cached.parent.mkdir()
-            py_compile.compile(str(altered), cfile=str(cached), doraise=True,
-                               invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-            expected = base64.urlsafe_b64encode(
-                hashlib.sha256(module.read_bytes()).digest()).decode().rstrip('=')
-            class Entry:
-                hash = SimpleNamespace(mode='sha256', value=expected)
-                def __str__(self):
-                    return 'yaml/__init__.py'
-            distribution = SimpleNamespace(files=[Entry()],
-                                           locate_file=lambda item: root/str(item))
-            with patch.dict(sys.modules), patch.object(sys, 'path', [str(root)]+sys.path), \
-                    patch.object(checker.importlib.metadata, 'version', return_value='6.0.2'), \
-                    patch.object(checker.importlib.metadata, 'distribution', return_value=distribution):
-                for name in list(sys.modules):
-                    if name == 'yaml' or name.startswith('yaml.'):
-                        sys.modules.pop(name)
-                with patch.object(sys, 'pycache_prefix', None), \
-                        patch.object(sys, 'dont_write_bytecode', False):
-                    imported = importlib.import_module('yaml')
-                    self.assertEqual(imported.SOURCE_MARKER, 'altered valid cache')
-                    sys.modules.pop('yaml')
-                    with self.assertRaises(ValueError):
-                        checker.verify_python(checker.REQUIREMENTS)
-                    self.assertNotIn('yaml', sys.modules)
-                cache = root/'exclusive-clean-route'
-                cache.mkdir()
-                with patch.object(sys, 'flags', trusted_flags), \
-                        patch.object(sys, 'pycache_prefix', str(cache)), \
-                        patch.object(sys, 'dont_write_bytecode', True):
-                    verified = checker.verify_python(checker.REQUIREMENTS)
-                    self.assertTrue(verified['verified'])
-                    self.assertEqual(sys.modules['yaml'].SOURCE_MARKER, 'verified source')
-                    self.assertFalse(list(cache.iterdir()))
-                    sys.modules.pop('yaml')
-                    (cache/'unexpected.pyc').write_bytes(cached.read_bytes())
-                    with self.assertRaises(ValueError):
-                        checker.verify_python(checker.REQUIREMENTS)
-                    self.assertNotIn('yaml', sys.modules)
-                untrusted_flags = SimpleNamespace(**vars(trusted_flags))
-                untrusted_flags.safe_path = False
-                with patch.object(sys, 'flags', untrusted_flags), \
-                        patch.object(sys, 'dont_write_bytecode', True), \
-                        patch.object(checker.importlib, 'import_module') as imported:
-                    with self.assertRaisesRegex(ValueError, 'safe import path'):
-                        checker.verify_python(checker.REQUIREMENTS)
-                    imported.assert_not_called()
-                for route, no_write in ((None, True), ('relative', True),
-                                        (str(root/'absent'), True), (str(cache), False)):
-                    with patch.object(sys, 'pycache_prefix', route), \
-                            patch.object(sys, 'dont_write_bytecode', no_write), \
-                            patch.object(checker.importlib, 'import_module') as imported:
-                        with self.subTest(route=route, no_write=no_write), self.assertRaises(ValueError):
-                            checker.verify_python(checker.REQUIREMENTS)
-                        imported.assert_not_called()
-        with tempfile.TemporaryDirectory(prefix='invalid adapter requirements ') as folder:
-            requirement = Path(folder)/'requirements.txt'
-            for content in ('', 'PyYAML\n', 'PyYAML==6.0.3\n',
-                            'PyYAML==6.0.2\nPyYAML==6.0.2\n',
-                            'PyYAML==6.0.2\npyshark==0.6\n'):
-                requirement.write_text(content)
-                with self.subTest(content=content), self.assertRaises(ValueError):
-                    checker.requirements_contract(requirement)
-
-
+                      rows['tests/interop/qns/owned-adapter.c']['consumers'])
+        candidate = dict(data, sources=[row for row in data['sources']
+                                       if row['path'] != 'tests/interop/qns/owned-adapter.c'])
+        with self.subTest(omitted_source='tests/interop/qns/owned-adapter.c'), self.assertRaises(ValueError):
+            catalogue.validate(candidate, ROOT)
 
     def test_os_tlsverify_sanitizer_selects_override_and_complete_directory(self):
         import json

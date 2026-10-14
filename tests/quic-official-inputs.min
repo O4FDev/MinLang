@@ -1,0 +1,200 @@
+use "json" as json
+use "system" as system
+use "./quic-json.min" as data
+use "./interop/qns/owned-common.min" as common
+use "../scripts/check-quic-official-inputs.min" as inputs
+
+record Report { failures: List<Text>; passed: List<Integer> }
+
+function expect(report: Report, condition: Boolean, name: Text) {
+    if condition { report.passed[0] += 1 } else { report.failures.add(name) }
+}
+function refused(outcome: Result<json.Value, common.Failure>, kind: Text): Boolean {
+    match outcome {
+        Ok(value) { return false }
+        Err(problem) { return kind == "" || problem.kind == kind }
+    }
+}
+function git(ledger: inputs.Commands, argv: List<Text>): Result<Text, common.Failure> {
+    let output = try inputs.run(ledger, argv, 30 * common.SECOND)
+    return Ok<Text, common.Failure>(Text(output).trim())
+}
+function fresh(): inputs.Commands { return inputs.commands(system.environment()) }
+function listing(directory: Text): List<Text> {
+    match common.boundedPaths(directory, common.MAX_FILES, 0) {
+        Ok(values) { return values.sorted() }
+        Err(problem) { return ["unreadable"] }
+    }
+}
+function synthetic(report: Report, scratch: Text, root: Text): Result<Boolean, common.Failure> {
+    let ledger = fresh()
+    let tool = inputs.which("git")
+    let repository = common.joinPath(scratch, "repository")
+    let work = common.joinPath(scratch, "work")
+    let initialized = try git(ledger, [tool, "init", "--bare", repository])
+    let made = try common.makeDirectory(work)
+    let names: List<Text> = []
+    let primary = common.PINNED_NAMES
+    for name in primary { names.add(name) }
+    for index in 0..35 { names.add("fixture-" + common.zeroFill(index, 2) + ".txt") }
+    names.sort()
+    expect(report, names.length == 40, "forty fixture files")
+    let digests: List<Text> = []
+    for name in primary {
+        let payload = "retained source " + name + "\n"
+        digests.add(common.digestBytes(Bytes(payload)))
+    }
+    for name in names { let wrote = try common.writeText(common.joinPath(work, name), "retained source " + name + "\n") }
+    let added = try git(ledger, [tool, "--git-dir=" + repository, "--work-tree=" + work, "add", "-A"])
+    let tree = try git(ledger, [tool, "--git-dir=" + repository, "write-tree"])
+    let pin = try git(ledger, [tool, "--git-dir=" + repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+        "commit-tree", tree, "-m", "Owned source fixture"])
+    let contract = inputs.Contract { pin: pin; names: primary.slice(0, primary.length); digests: digests }
+    match inputs.verifyRunner(repository, fresh(), contract, root) {
+        Ok(value) {
+            expect(report, common.isTrue(data.field(value, "verified")), "synthetic runner verified")
+            expect(report, data.field(value, "files").items.length == 40, "synthetic runner inventory")
+        }
+        Err(problem) { report.failures.add("synthetic runner refused: " + problem.message) }
+    }
+    for index in 0..primary.length {
+        let changed = digests.slice(0, digests.length)
+        changed[index] = support64("0")
+        expect(report, refused(inputs.verifyRunner(repository, fresh(), inputs.Contract { pin: pin; names: contract.names; digests: changed }, root), "ValueError"), "corrupt primary " + primary[index])
+    }
+    expect(report, refused(inputs.verifyRunner(repository, fresh(), inputs.Contract { pin: support40("0"); names: contract.names; digests: digests }, root), ""), "wrong pin refused")
+    let graft = common.joinPath(repository, "info/grafts")
+    let madeInfo = try common.makeDirectories(common.parentOf(graft))
+    let grafted = try common.writeText(graft, pin + "\n")
+    expect(report, refused(inputs.verifyRunner(repository, fresh(), contract, root), "ValueError"), "graft refused")
+    common.removeFile(graft)
+    let replaced = try git(ledger, [tool, "-C", repository, "update-ref", "refs/replace/" + pin, pin])
+    expect(report, refused(inputs.verifyRunner(repository, fresh(), contract, root), "ValueError"), "replacement ref refused")
+    let restored = try git(ledger, [tool, "-C", repository, "update-ref", "-d", "refs/replace/" + pin])
+    let blob = try git(ledger, [tool, "--git-dir=" + repository, "hash-object", common.joinPath(work, names[names.length - 1])])
+    common.removeFile(common.joinPath(repository, "objects/" + blob.slice(0, 2) + "/" + blob.slice(2, blob.length)))
+    expect(report, refused(inputs.verifyRunner(repository, fresh(), contract, root), ""), "missing object refused")
+    return Ok<Boolean, common.Failure>(true)
+}
+function support64(digit: Text): Text { return repeatText(digit, 64) }
+function support40(digit: Text): Text { return repeatText(digit, 40) }
+function repeatText(value: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(value) }
+    return joinText(parts)
+}
+function replacedLedger(): inputs.Commands {
+    let ledger = fresh()
+    ledger.replaced.add(function(argv: List<Text>, timeout: Integer): Result<Bytes, common.Failure> { return Ok<Bytes, common.Failure>(Bytes()) })
+    return ledger
+}
+function readiness(report: Report, scratch: Text, root: Text): Result<Boolean, common.Failure> {
+    let pinned = try inputs.contract()
+    let base = common.joinPath(scratch, "false-readiness")
+    let made = try common.makeDirectory(base)
+    let runner = common.joinPath(base, "runner")
+    expect(report, refused(inputs.prepareRunner(runner, replacedLedger(), pinned, root), ""), "false runner readiness refused")
+    expect(report, !common.present(common.joinPath(runner, ".ready.json")), "no false runner readiness")
+    let poisoned = common.joinPath(base, "poisoned-runner")
+    let madePoison = try common.makeDirectory(poisoned)
+    let sentinel = common.joinPath(poisoned, "poison")
+    let wrote = try common.writeText(sentinel, "not a verified cache")
+    let ledger = replacedLedger()
+    expect(report, refused(inputs.prepareRunner(poisoned, ledger, pinned, root), "ValueError"), "existing poison refused")
+    expect(report, ledger.launched[0] == 0, "existing poison launched nothing")
+    expect(report, Text(common.readOr(sentinel)) == "not a verified cache", "existing poison untouched")
+    expect(report, !common.present(common.joinPath(poisoned, ".ready.json")), "existing poison not ready")
+    let external = common.joinPath(base, "provided")
+    let madeExternal = try common.makeDirectory(external)
+    let before = listing(external)
+    expect(report, refused(inputs.verifyRunner(external, fresh(), pinned, root), ""), "external directory refused")
+    expect(report, common.sameTexts(listing(external), before), "external directory unchanged")
+    expect(report, refused(inputs.verifyRunner("relative/runner", fresh(), pinned, root), "ValueError"), "relative repository refused")
+    return Ok<Boolean, common.Failure>(true)
+}
+function hostile(): List<Text> {
+    return ["PATH=" + system.getenv("PATH"), "GIT_DIR=/wrong/repository", "GIT_WORK_TREE=/wrong/worktree", "GIT_REPLACE_REF_BASE=refs/hostile", "GIT_CONFIG_COUNT=1",
+        "GIT_CONFIG_KEY_0=include.path", "GIT_CONFIG_VALUE_0=/wrong/config", "GIT_CONFIG_SYSTEM=/wrong/system", "GIT_CONFIG_GLOBAL=/wrong/global",
+        "GIT_CONFIG_NOSYSTEM=0", "GIT_NO_REPLACE_OBJECTS=0"]
+}
+function gitOnly(environment: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in environment { if item.startsWith("GIT_") { result.add(item) } }
+    return result
+}
+record Selection { argv: List<List<Text>>; environment: List<List<Text>> }
+function routing(report: Report, scratch: Text, root: Text): Result<Boolean, common.Failure> {
+    let clean = inputs.gitEnvironment(hostile())
+    expect(report, common.sameTexts(gitOnly(clean), ["GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_REPLACE_OBJECTS=1", "GIT_TERMINAL_PROMPT=0"]), "hostile Git routing removed")
+    let base = common.joinPath(scratch, "routing")
+    let made = try common.makeDirectory(base)
+    let repository = common.joinPath(base, "trusted-repository")
+    let madeRepository = try common.makeDirectory(repository)
+    let own = common.selfExecutable()
+    let selections = Selection { argv: []; environment: [] }
+    let ledger = inputs.commands(hostile())
+    ledger.executor.add(function(argv: List<Text>, environment: List<Text>, timeout: Integer): Result<inputs.Execution, common.Failure> {
+        selections.argv.add(argv)
+        selections.environment.add(environment)
+        let output = "ALL113 mock controls\n"
+        if selections.argv.length == 1 {
+            output = data.dumps(data.object(["verified", "runner"], [data.boolean(true), data.object(["verified"], [data.boolean(true)])]))
+        }
+        return Ok<inputs.Execution, common.Failure>(inputs.Execution { status: 0; stdout: Bytes(output); stderr: Bytes(); timedOut: false })
+    })
+    let run = common.joinPath(base, "run")
+    match inputs.runControls(repository, run, own, own, own, ledger, root) {
+        Ok(value) {
+            expect(report, common.isTrue(data.field(value, "verified")), "routed controls verified")
+            expect(report, data.equal(data.field(value, "git_environment"), inputs.gitSettings(clean)), "routed Git environment reported")
+        }
+        Err(problem) { report.failures.add("routed controls refused: " + problem.message) }
+    }
+    expect(report, selections.argv.length == 2, "verify then controls")
+    if selections.argv.length == 2 {
+        expect(report, common.sameTexts(selections.argv[0], [own, "verify", "--repository", repository, "--root", root]), "fresh verification argv")
+        expect(report, common.sameTexts(selections.argv[1], [own, "--pinned-runner", repository, "--artifacts", run, "--adapter", own]), "exact controls argv")
+        expect(report, !common.member(selections.argv[1], "--case"), "no control selection")
+        expect(report, common.sameTexts(selections.environment[0], selections.environment[1]) && common.sameTexts(selections.environment[0], clean), "same clean routing")
+    }
+    let tampered = Selection { argv: []; environment: [] }
+    let refusing = inputs.commands(hostile())
+    refusing.executor.add(function(argv: List<Text>, environment: List<Text>, timeout: Integer): Result<inputs.Execution, common.Failure> {
+        tampered.argv.add(argv)
+        let output = data.dumps(data.object(["verified", "runner"], [data.boolean(false), data.object(["verified"], [data.boolean(true)])]))
+        return Ok<inputs.Execution, common.Failure>(inputs.Execution { status: 0; stdout: Bytes(output); stderr: Bytes(); timedOut: false })
+    })
+    expect(report, refused(inputs.runControls(repository, common.joinPath(base, "refused-failed-verification"), own, own, own, refusing, root), "ValueError"), "failed verification refused")
+    expect(report, tampered.argv.length == 1, "failed verification launched no controls")
+    let existing = common.joinPath(base, "existing")
+    let madeExisting = try common.makeDirectory(existing)
+    let idle = inputs.commands(hostile())
+    expect(report, refused(inputs.runControls(repository, existing, own, own, own, idle, root), "ValueError"), "existing artifacts refused")
+    expect(report, idle.launched[0] == 0, "existing artifacts launched nothing")
+    return Ok<Boolean, common.Failure>(true)
+}
+function section(report: Report, name: Text, outcome: Result<Boolean, common.Failure>) {
+    match outcome {
+        Ok(value) {}
+        Err(problem) { report.failures.add(name + " setup failed: " + problem.kind + ": " + problem.message) }
+    }
+}
+function main(): Integer {
+    let root = common.realPath(".")
+    let base = system.getenv("TMPDIR")
+    if base == "" { base = "/tmp" }
+    let scratch = common.temporaryDirectory(common.realPath(base), "quic-official-inputs.")
+    if scratch == "" { system.writeStandardError("cannot create scratch directory\n"); return 2 }
+    let report = Report { failures: []; passed: [0] }
+    section(report, "synthetic", synthetic(report, scratch, root))
+    section(report, "readiness", readiness(report, scratch, root))
+    section(report, "routing", routing(report, scratch, root))
+    match common.removeTree(scratch) {
+        Ok(value) {}
+        Err(problem) { report.failures.add("scratch cleanup: " + problem.message) }
+    }
+    for failure in report.failures { system.writeStandardError("FAIL " + failure + "\n") }
+    print("quic official inputs: " + Text(report.passed[0]) + " passed, " + Text(report.failures.length) + " failed")
+    if report.failures.length > 0 { return 1 }
+    return 0
+}

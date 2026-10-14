@@ -1,0 +1,451 @@
+use "json" as json
+use "system" as system
+use "../../quic-json.min" as data
+use "./owned-common.min" as common
+use "./owned-process.min" as process
+use "./owned-daemon.min" as daemon
+
+record YamlLine { indent: Integer; content: Text }
+record YamlCursor { lines: List<YamlLine>; position: Integer }
+
+function yamlFailure(message: Text): common.Failure { return common.ownership("pinned compose YAML outside the reviewed subset: " + message) }
+function yamlLines(source: Text): Result<List<YamlLine>, common.Failure> {
+    let result: List<YamlLine> = []
+    for raw in source.split("\n") {
+        let line = raw
+        if line.endsWith("\r") { line = line.slice(0, line.length - 1) }
+        let indent = 0
+        while indent < line.length && line.slice(indent, indent + 1) == " " { indent += 1 }
+        let content = line.slice(indent, line.length)
+        if content == "" || content.startsWith("#") { continue }
+        if content.startsWith("\t") || common.contains(content, " #") || content.startsWith("&") || content.startsWith("*") || content.startsWith("{") ||
+            content.startsWith("[") || content.startsWith("|") || content.startsWith(">") || content.startsWith("---") || content.startsWith("%") {
+            return Err<List<YamlLine>, common.Failure>(yamlFailure(content))
+        }
+        while content.endsWith(" ") { content = content.slice(0, content.length - 1) }
+        result.add(YamlLine { indent: indent; content: content })
+    }
+    return Ok<List<YamlLine>, common.Failure>(result)
+}
+function plainInteger(value: Text): Boolean {
+    let raw = Bytes(value)
+    let start = 0
+    if raw.length > 0 && (raw[0] == 45 || raw[0] == 43) { start = 1 }
+    if start == raw.length { return false }
+    for index in start..raw.length { if raw[index] < 48 || raw[index] > 57 { return false } }
+    return true
+}
+function scalar(value: Text): Result<json.Value, common.Failure> {
+    if value.startsWith("\"") {
+        if !value.endsWith("\"") || value.length < 2 { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        let inner = value.slice(1, value.length - 1)
+        if common.contains(inner, "\\") || common.contains(inner, "\"") { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        return Ok<json.Value, common.Failure>(data.string(inner))
+    }
+    if value.startsWith("'") {
+        if !value.endsWith("'") || value.length < 2 { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        return Ok<json.Value, common.Failure>(data.string(common.replaceAll(value.slice(1, value.length - 1), "''", "'")))
+    }
+    if value == "" || value == "~" || value == "null" || value == "Null" || value == "NULL" { return Ok<json.Value, common.Failure>(data.none()) }
+    for word in ["true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON"] { if value == word { return Ok<json.Value, common.Failure>(data.boolean(true)) } }
+    for word in ["false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"] { if value == word { return Ok<json.Value, common.Failure>(data.boolean(false)) } }
+    if plainInteger(value) {
+        let digits = value
+        if digits.startsWith("-") || digits.startsWith("+") { digits = digits.slice(1, digits.length) }
+        if digits.length > 1 && digits.startsWith("0") { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        if digits.length > 18 { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        return Ok<json.Value, common.Failure>(data.number(common.integerText(value)))
+    }
+    let first = Bytes(value)[0]
+    if (first >= 48 && first <= 57) || first == 46 || first == 45 || first == 43 {
+        let dots = common.count(value, ".")
+        let colons = common.count(value, ":")
+        if (dots == 1 && colons == 0 && !common.contains(value, "/")) || common.contains(value, "_") { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        if colons > 0 && dots == 0 && !common.contains(value, "/") {
+            let numeric = true
+            for part in value.split(":") { if !plainInteger(part) { numeric = false } }
+            if numeric { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+        }
+    }
+    if value.startsWith("!") || value.startsWith("@") || value.startsWith("`") || common.contains(value, ": ") { return Err<json.Value, common.Failure>(yamlFailure(value)) }
+    return Ok<json.Value, common.Failure>(data.string(value))
+}
+function keyAndValue(content: Text): List<Text> {
+    if content.startsWith("\"") || content.startsWith("'") { return [] }
+    let separator = content.find(": ")
+    if separator > 0 { return [content.slice(0, separator), content.slice(separator + 2, content.length)] }
+    if content.endsWith(":") && content.length > 1 && !common.contains(content.slice(0, content.length - 1), ":") { return [content.slice(0, content.length - 1), ""] }
+    return []
+}
+function isItem(content: Text): Boolean { return content == "-" || content.startsWith("- ") }
+function parseBlock(cursor: YamlCursor, indent: Integer): Result<json.Value, common.Failure> {
+    if cursor.position >= cursor.lines.length { return Ok<json.Value, common.Failure>(data.none()) }
+    let line = cursor.lines[cursor.position]
+    if line.indent != indent { return Err<json.Value, common.Failure>(yamlFailure("indentation")) }
+    if isItem(line.content) { return parseSequence(cursor, indent) }
+    return parseMapping(cursor, indent, "")
+}
+function childValue(cursor: YamlCursor, indent: Integer): Result<json.Value, common.Failure> {
+    if cursor.position < cursor.lines.length {
+        let next = cursor.lines[cursor.position]
+        if next.indent > indent { return parseBlock(cursor, next.indent) }
+        if next.indent == indent && isItem(next.content) { return parseSequence(cursor, indent) }
+    }
+    return Ok<json.Value, common.Failure>(data.none())
+}
+function parseMapping(cursor: YamlCursor, indent: Integer, firstContent: Text): Result<json.Value, common.Failure> {
+    let keys: List<Text> = []
+    let values: List<json.Value> = []
+    let pending = firstContent
+    while true {
+        let content = pending
+        if content == "" {
+            if cursor.position >= cursor.lines.length { break }
+            let line = cursor.lines[cursor.position]
+            if line.indent != indent || isItem(line.content) {
+                if line.indent > indent { return Err<json.Value, common.Failure>(yamlFailure(line.content)) }
+                break
+            }
+            content = line.content
+            cursor.position += 1
+        }
+        pending = ""
+        let pair = keyAndValue(content)
+        if pair.length != 2 { return Err<json.Value, common.Failure>(yamlFailure(content)) }
+        let key = try scalar(pair[0])
+        if key.kind != json.STRING || common.member(keys, key.text) { return Err<json.Value, common.Failure>(yamlFailure(pair[0])) }
+        keys.add(key.text)
+        if pair[1] == "" {
+            let child = try childValue(cursor, indent)
+            values = values.appended(child)
+        } else {
+            let leaf = try scalar(pair[1])
+            values = values.appended(leaf)
+        }
+    }
+    return Ok<json.Value, common.Failure>(data.object(keys, values))
+}
+function parseSequence(cursor: YamlCursor, indent: Integer): Result<json.Value, common.Failure> {
+    let items: List<json.Value> = []
+    while cursor.position < cursor.lines.length {
+        let line = cursor.lines[cursor.position]
+        if line.indent != indent || !isItem(line.content) {
+            if line.indent > indent { return Err<json.Value, common.Failure>(yamlFailure(line.content)) }
+            break
+        }
+        cursor.position += 1
+        let rest = ""
+        if line.content.length > 2 { rest = line.content.slice(2, line.content.length) }
+        if rest == "" {
+            let child = try childValue(cursor, indent)
+            items = items.appended(child)
+        } else if keyAndValue(rest).length == 2 {
+            let mapping = try parseMapping(cursor, indent + 2, rest)
+            items = items.appended(mapping)
+        } else {
+            let item = try scalar(rest)
+            items = items.appended(item)
+        }
+    }
+    return Ok<json.Value, common.Failure>(data.array(items))
+}
+public function parseYaml(source: Text): Result<json.Value, common.Failure> {
+    let lines = try yamlLines(source)
+    let cursor = YamlCursor { lines: lines; position: 0 }
+    if lines.length == 0 { return Ok<json.Value, common.Failure>(data.none()) }
+    let value = try parseBlock(cursor, lines[0].indent)
+    if cursor.position != lines.length { return Err<json.Value, common.Failure>(yamlFailure("trailing content")) }
+    return Ok<json.Value, common.Failure>(value)
+}
+
+public function quotedPython(value: Text): Text { return "'" + value + "'" }
+function safeQuoted(value: Text): Boolean {
+    return !common.contains(value, "'") && !common.contains(value, "\\") && !common.contains(value, "\n")
+}
+public function hookSource(adapter: Text, config: Text): Text {
+    return joinText([
+        "import os\nimport subprocess\n\n", "_ADAPTER = ", quotedPython(adapter), "\n_CONFIG = ", quotedPython(config), "\n_TOKEN = os.urandom(16).hex()\n\n\n",
+        "def _owned(*arguments):\n",
+        "    result = subprocess.run([_ADAPTER, *arguments, \"--config\", _CONFIG, \"--token\", _TOKEN],\n",
+        "                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n",
+        "    if result.returncode != 0:\n",
+        "        raise RuntimeError(result.stderr.decode(\"utf-8\", \"replace\").strip() or \"owned adapter failed\")\n",
+        "    return result.stdout.decode(\"utf-8\")\n\n\n",
+        "class temporary_directory:\n",
+        "    def __init__(self, suffix=None, prefix=None, dir=None, ignore_cleanup_errors=False, *, delete=True):\n",
+        "        self.name = _owned(\"fixture-create\", \"--dir\", \"\" if dir is None else str(dir),\n",
+        "                           \"--prefix\", \"tmp\" if prefix is None else str(prefix)).rstrip(\"\\n\")\n",
+        "        self.cleaned = False\n\n",
+        "    def cleanup(self):\n",
+        "        if not self.cleaned:\n",
+        "            _owned(\"fixture-cleanup\", self.name)\n",
+        "            self.cleaned = True\n\n",
+        "    def __enter__(self):\n",
+        "        return self.name\n\n",
+        "    def __exit__(self, kind, value, trace):\n",
+        "        try:\n",
+        "            self.cleanup()\n",
+        "        except BaseException as error:\n",
+        "            if value is None:\n",
+        "                raise\n",
+        "            value.add_note(\"fixture cleanup: \" + str(error))\n",
+        "            try:\n",
+        "                _owned(\"fixture-error\", type(error).__name__, str(error))\n",
+        "            except BaseException as ledger:\n",
+        "                value.add_note(\"fixture cleanup ledger: \" + str(ledger))\n",
+        "        return False\n\n\n",
+        "def prepare_runner_phase():\n",
+        "    _owned(\"prepare-phase\")\n\n\n",
+        "def retained_cleanup_dir(directory):\n",
+        "    _owned(\"fixture-retain\", str(directory))\n\n\n",
+        "def copy_runner_logs(role, directory):\n",
+        "    _owned(\"copy-logs\", role, str(directory))\n\n\n",
+        "def author_execute(main):\n",
+        "    primary = None\n",
+        "    try:\n",
+        "        return main()\n",
+        "    except BaseException as error:\n",
+        "        primary = error\n",
+        "        raise\n",
+        "    finally:\n",
+        "        arguments = [\"author-finish\"]\n",
+        "        if primary is not None:\n",
+        "            arguments += [\"--primary-type\", type(primary).__name__, \"--primary-message\", str(primary)]\n",
+        "        notes = []\n",
+        "        try:\n",
+        "            result = subprocess.run([_ADAPTER, *arguments, \"--config\", _CONFIG, \"--token\", _TOKEN],\n",
+        "                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n",
+        "            notes = [line[6:] for line in result.stdout.decode(\"utf-8\", \"replace\").splitlines() if line.startswith(\"note: \")]\n",
+        "            if result.returncode != 0:\n",
+        "                raise RuntimeError(result.stderr.decode(\"utf-8\", \"replace\").strip() or \"owned adapter failed\")\n",
+        "        except BaseException as secondary:\n",
+        "            if primary is None:\n",
+        "                raise\n",
+        "            primary.add_note(\"registry cleanup: \" + str(secondary))\n",
+        "            for note in notes:\n",
+        "                primary.add_note(note)\n",
+        "        else:\n",
+        "            if primary is not None:\n",
+        "                for note in notes:\n",
+        "                    primary.add_note(note)\n"
+    ])
+}
+public function wrapperSource(adapter: Text, config: Text): Text {
+    return "#!/bin/sh\nexec " + quotedPython(adapter) + " docker-entry --config " + quotedPython(config) + " \"$@\"\n"
+}
+
+public function lineSpan(lines: List<Text>, header: Text): List<Integer> {
+    let start = -1
+    for index in 0..lines.length { if lines[index].startsWith(header) { start = index; break } }
+    if start < 0 { return [] }
+    let indent = 0
+    while indent < lines[start].length && lines[start].slice(indent, indent + 1) == " " { indent += 1 }
+    let header = start
+    let depth = 0
+    while header < lines.length {
+        for character in lines[header] {
+            if character == '(' || character == '[' { depth += 1 }
+            if character == ')' || character == ']' { depth -= 1 }
+        }
+        if depth <= 0 && lines[header].trim().endsWith(":") { break }
+        header += 1
+    }
+    if header >= lines.length { return [] }
+    let last = header
+    for index in (header + 1)..lines.length {
+        let line = lines[index]
+        if line.trim() == "" { continue }
+        let depth = 0
+        while depth < line.length && line.slice(depth, depth + 1) == " " { depth += 1 }
+        if depth <= indent { break }
+        last = index
+    }
+    return [start, last]
+}
+function splitKeep(source: Text): List<Text> {
+    let result: List<Text> = []
+    let parts = source.split("\n")
+    for index in 0..parts.length {
+        if index + 1 < parts.length { result.add(parts[index] + "\n") }
+        else if parts[index] != "" { result.add(parts[index]) }
+    }
+    return result
+}
+function replaceSpan(source: Text, header: Text, replacement: List<Text>): Result<Text, common.Failure> {
+    let lines = splitKeep(source)
+    let span = lineSpan(lines, header)
+    if span.length != 2 { return Err<Text, common.Failure>(common.ownership("pinned function span missing: " + header)) }
+    let result: List<Text> = []
+    for line in lines.slice(0, span[0]) { result.add(line) }
+    for line in replacement { result.add(line) }
+    for line in lines.slice(span[1] + 1, lines.length) { result.add(line) }
+    return Ok<Text, common.Failure>(joinText(result))
+}
+function sourceText(files: List<Text>, contents: List<Bytes>, name: Text): Bytes {
+    for index in 0..files.length { if files[index] == name { return contents[index] } }
+    return Bytes()
+}
+public function editedSource(name: Text, original: Text, fixtureRoot: Text): Result<Text, common.Failure> {
+    let value = common.replaceAll(original, "dir=\"/tmp\"", "dir=" + quotedPython(fixtureRoot))
+    value = common.replaceAll(value, "tempfile.TemporaryDirectory(", "_AuthorTemporaryDirectory(")
+    value = "from owned_hooks import temporary_directory as _AuthorTemporaryDirectory\n" + value
+    if name == "interop.py" {
+        let marker = "        status = TestResult.FAILED\n        output = \"\"\n        expired = False\n"
+        if common.count(value, marker) != 1 { return Err<Text, common.Failure>(common.ownership("pinned timed-run setup marker differs")) }
+        value = common.replaceAll(value, marker, "        from owned_hooks import prepare_runner_phase\n        prepare_runner_phase()\n\n" + marker)
+    }
+    if name == "testcase.py" {
+        let replaced = try replaceSpan(value, "def docker_cleanup_dir(", ["def docker_cleanup_dir(directory: str):\n", "    from owned_hooks import retained_cleanup_dir\n", "    retained_cleanup_dir(directory)\n"])
+        value = replaced
+    }
+    return Ok<Text, common.Failure>(value)
+}
+public function ownedCompose(original: Text, spec: daemon.OwnerSpec): Result<json.Value, common.Failure> {
+    let compose = try parseYaml(original)
+    let services = data.field(compose, "services")
+    let networks = data.field(compose, "networks")
+    if services.kind != json.OBJECT || networks.kind != json.OBJECT { return Err<json.Value, common.Failure>(yamlFailure("services or networks")) }
+    let roleNames = common.ROLES
+    let serviceKeys: List<Text> = []
+    let serviceValues: List<json.Value> = []
+    for index in 0..services.keys.length {
+        let role = services.keys[index]
+        let service = data.with(services.items[index], "container_name", data.string(spec.project + "-" + role))
+        if common.member(roleNames, role) {
+            service = data.with(service, "labels", data.object([common.OWNER_LABEL], [data.string(spec.nonce)]))
+            service = data.with(service, "cpuset", data.string("7"))
+            service = data.with(service, "cpus", data.decimal("1.0"))
+        }
+        if role == "server" || role == "client" {
+            service = data.with(service, "user", data.string("65534:65534"))
+            if common.hasKey(service, "cap_add") { service = data.without(service, "cap_add") }
+            service = data.with(service, "cap_drop", data.strings(["ALL"]))
+            service = data.with(service, "security_opt", data.strings(["no-new-privileges:true"]))
+        }
+        if role == "sim" { service = data.with(service, "image", data.string(spec.sim[0])) }
+        serviceKeys.add(role)
+        serviceValues = serviceValues.appended(service)
+    }
+    let networkValues: List<json.Value> = []
+    for item in networks.items {
+        let base = item
+        if base.kind != json.OBJECT { base = data.object([], []) }
+        networkValues = networkValues.appended(data.with(base, "labels", data.object([common.OWNER_LABEL], [data.string(spec.nonce)])))
+    }
+    compose = data.with(compose, "services", data.object(serviceKeys, serviceValues))
+    compose = data.with(compose, "networks", data.object(networks.keys, networkValues))
+    return Ok<json.Value, common.Failure>(compose)
+}
+function implementationsFor(original: Bytes, names: List<Text>, images: List<Text>): Result<json.Value, common.Failure> {
+    let value = data.decode(original)
+    if value.kind != json.OBJECT { return Err<json.Value, common.Failure>(common.failure("JSONDecodeError", "implementations_quic.json")) }
+    for index in 0..names.length {
+        let image = images[index]
+        if !image.startsWith("sha256:") || !common.lowerHex(image.slice(7, image.length), 64) { return Err<json.Value, common.Failure>(common.ownership("registry image must be pinned ID")) }
+        if names[index] == "minyar" {
+            value = data.with(value, "minyar", data.object(["image", "url", "role"], [data.string(image), data.string("local-minyar-fixture"), data.string("both")]))
+        } else {
+            if !common.hasKey(value, names[index]) { return Err<json.Value, common.Failure>(common.ownership("unknown official peer")) }
+            value = data.with(value, names[index], data.with(data.field(value, names[index]), "image", data.string(image)))
+        }
+    }
+    return Ok<json.Value, common.Failure>(value)
+}
+function writeOwned(path: Text, payload: Bytes): Result<Boolean, common.Failure> {
+    let made = try common.makeDirectories(common.parentOf(path))
+    return common.writeBytes(path, payload)
+}
+function digestValue(payload: Bytes): json.Value {
+    return data.object(["sha256", "bytes"], [data.string(common.digestBytes(payload)), data.number(payload.length)])
+}
+public function deriveRunner(pinned: Text, destination: Text, spec: daemon.OwnerSpec, names: List<Text>, images: List<Text>, adapter: Text): Result<json.Value, common.Failure> {
+    if !safeQuoted(adapter) || !safeQuoted(destination) || !safeQuoted(spec.fixtureRoot) { return Err<json.Value, common.Failure>(common.ownership("derived runner paths must not need quoting")) }
+    let made = try common.makeFreshDirectory(destination)
+    let records = try process.rawCommands(common.joinPath(destination, "preparation-commands"))
+    let git = daemon.which("git")
+    if git == "" { return Err<json.Value, common.Failure>(common.ownership("existing git missing for pinned source fixture")) }
+    let listing = try process.runBytes(records, [git, "-C", pinned, "ls-tree", "-r", "--name-only", common.PIN], process.options(10 * common.SECOND))
+    let files = daemon.lines(listing)
+    let contents: List<Bytes> = []
+    let bindingKeys: List<Text> = []
+    let bindingValues: List<json.Value> = []
+    for name in files {
+        let original = try process.runBytes(records, [git, "-C", pinned, "show", common.PIN + ":" + name], process.options(10 * common.SECOND))
+        contents.add(original)
+        let wrote = try writeOwned(common.joinPath(destination, name), original)
+        let retained = common.joinPath(common.joinPath(destination, "pinned-originals"), name)
+        let kept = try writeOwned(retained, original)
+        let copied = try common.readBytes(retained)
+        let after = try process.runBytes(records, [git, "-C", pinned, "show", common.PIN + ":" + name], process.options(10 * common.SECOND))
+        bindingKeys.add(name)
+        bindingValues = bindingValues.appended(data.object(["original_before", "retained", "original_after", "retained_path"],
+            [digestValue(original), digestValue(copied), digestValue(after), data.string("pinned-originals/" + name)]))
+        if common.digestBytes(original) != common.digestBytes(copied) || common.digestBytes(original) != common.digestBytes(after) || original.length != copied.length || original.length != after.length {
+            return Err<json.Value, common.Failure>(common.ownership("pinned source bytes changed during retention"))
+        }
+    }
+    let pinnedNames = common.PINNED_NAMES
+    let pinnedDigests = common.PINNED_DIGESTS
+    for index in 0..pinnedNames.length {
+        if !common.member(files, pinnedNames[index]) || common.digestBytes(sourceText(files, contents, pinnedNames[index])) != pinnedDigests[index] {
+            return Err<json.Value, common.Failure>(common.ownership("pinned runner source hash differs: " + pinnedNames[index]))
+        }
+    }
+    for name in ["interop.py", "testcase.py", "testcases_quic.py"] {
+        let edited = try editedSource(name, Text(sourceText(files, contents, name)), spec.fixtureRoot)
+        let wrote = try common.writeText(common.joinPath(destination, name), edited)
+    }
+    let derivedCriteria = try common.readBytes(common.joinPath(destination, "testcases_quic.py"))
+    let normalized = Text(derivedCriteria)
+    let prefix = "from owned_hooks import temporary_directory as _AuthorTemporaryDirectory\n"
+    if normalized.startsWith(prefix) { normalized = normalized.slice(prefix.length, normalized.length) }
+    normalized = common.replaceAll(common.replaceAll(normalized, "_AuthorTemporaryDirectory(", "tempfile.TemporaryDirectory("), "dir=" + quotedPython(spec.fixtureRoot), "dir=\"/tmp\"")
+    if normalized != Text(sourceText(files, contents, "testcases_quic.py")) { return Err<json.Value, common.Failure>(common.ownership("official testcase criteria changed")) }
+    let compose = try ownedCompose(Text(sourceText(files, contents, "docker-compose.yml")), spec)
+    let composeWrote = try common.writeText(common.joinPath(destination, "docker-compose.yml"), data.pretty(compose) + "\n")
+    let implementations = try implementationsFor(sourceText(files, contents, "implementations_quic.json"), names, images)
+    let implementationsWrote = try common.writeText(common.joinPath(destination, "implementations_quic.json"), data.pretty(implementations) + "\n")
+    let interop = try common.readBytes(common.joinPath(destination, "interop.py"))
+    let copied = try replaceSpan(Text(interop), "    def _copy_logs(", ["    def _copy_logs(self, container, directory):\n", "        from owned_hooks import copy_runner_logs\n", "        copy_runner_logs(container, directory.name)\n"])
+    let interopWrote = try common.writeText(common.joinPath(destination, "interop.py"), copied)
+    let run = Text(sourceText(files, contents, "run.py"))
+    if common.count(run, "    sys.exit(main())") != 1 { return Err<json.Value, common.Failure>(common.ownership("unexpected runner entrypoint")) }
+    run = common.replaceAll(run, "    sys.exit(main())", "    from owned_hooks import author_execute\n    sys.exit(author_execute(main))")
+    let runWrote = try common.writeText(common.joinPath(destination, "run.py"), run)
+    let config = common.joinPath(destination, "owned-runner.json")
+    let ownedAdapter = common.joinPath(destination, "owned-bin/owned-adapter")
+    let hooks = try common.writeText(common.joinPath(destination, "owned_hooks.py"), hookSource(ownedAdapter, config))
+    let adapterBytes = try common.readBytes(adapter)
+    let binary = try writeOwned(ownedAdapter, adapterBytes)
+    common.changeMode(ownedAdapter, 448)
+    let docker = daemon.which("docker")
+    let cli = data.none()
+    if docker != "" {
+        let bound = try common.binding(docker)
+        cli = common.boundPath(bound)
+    }
+    let wroteConfig = try common.atomicJson(config, data.object(["fixture_root", "retained_fixtures", "owner_spec", "execution_authorized", "docker_cli"],
+        [data.string(spec.fixtureRoot), data.string(common.joinPath(spec.artifacts, "fixtures")), spec.value, data.boolean(false), cli]))
+    let wrapper = common.joinPath(destination, "owned-bin/docker")
+    let wroteWrapper = try common.writeText(wrapper, wrapperSource(ownedAdapter, config))
+    common.changeMode(wrapper, 448)
+    let originalKeys: List<Text> = []
+    let originalValues: List<json.Value> = []
+    for index in 0..files.length { originalKeys.add(files[index]); originalValues = originalValues.appended(digestValue(contents[index])) }
+    let derivedPaths = try common.boundedPaths(destination, common.MAX_FILES, 0)
+    let relative: List<Text> = []
+    for item in derivedPaths { if common.isFile(item) { relative.add(common.relativeTo(item, destination)) } }
+    relative.sort()
+    let derivedValues: List<json.Value> = []
+    for item in relative {
+        let bound = try common.binding(common.joinPath(destination, item))
+        derivedValues = derivedValues.appended(common.boundPath(bound))
+    }
+    let commandRows: List<json.Value> = []
+    for row in records.rows { commandRows = commandRows.appended(process.rowJson(row)) }
+    let report = data.object(["schema_version", "runner_commit", "original_files", "derived_files", "original_bindings", "preparation_commands", "official_criteria_unchanged", "scope"],
+        [data.number(1), data.string(common.PIN), data.object(originalKeys, originalValues), data.object(relative, derivedValues), data.object(bindingKeys, bindingValues),
+            data.array(commandRows), data.boolean(true), data.string("source preparation only; no runner, Docker or network execution")])
+    let wroteReport = try common.atomicJson(common.joinPath(destination, "derivation.json"), report)
+    return Ok<json.Value, common.Failure>(report)
+}

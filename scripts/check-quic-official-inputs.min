@@ -1,0 +1,457 @@
+use "json" as json
+use "system" as system
+use "../tests/quic-json.min" as data
+use "../tests/interop/qns/owned-common.min" as common
+
+public constant URL = "https://github.com/quic-interop/quic-interop-runner.git"
+public constant FILE_COUNT = 40
+public constant CONTRACT_SOURCE = "tests/interop/qns/owned-common.min"
+public constant SOURCES: List<Text> = [
+    "scripts/check-quic-official-inputs.min", "tests/quic-official-adapter.min", "tests/quic-official-support.min",
+    "tests/interop/qns/owned-adapter.min", "tests/interop/qns/owned-common.min", "tests/interop/qns/owned-process.min",
+    "tests/interop/qns/owned-daemon.min", "tests/interop/qns/owned-derive.min", "tests/interop/qns/owned-adapter.c", "tests/quic-json.min"
+]
+
+public record Contract { pin: Text; names: List<Text>; digests: List<Text> }
+public record Execution { status: Integer; stdout: Bytes; stderr: Bytes; timedOut: Boolean }
+public record CommandRow { argv: List<Text>; timeout: Integer; status: List<Integer>; timedOut: Boolean; toolBefore: common.Binding; toolAfter: List<common.Binding>; toolError: Text; stdout: Bytes; stderr: Bytes }
+public record Commands {
+    rows: List<CommandRow>
+    environment: List<Text>
+    launched: List<Integer>
+    replaced: List<Callback<List<Text>, Integer, Result<Bytes, common.Failure>>>
+    executor: List<Callback<List<Text>, List<Text>, Integer, Result<Execution, common.Failure>>>
+}
+record Cache { kinds: List<Text>; ids: List<Text>; payloads: List<Bytes> }
+record Walk { files: List<json.Value>; trees: List<json.Value>; seen: List<Text>; names: List<Text>; digests: List<Text> }
+
+function valueError(message: Text): common.Failure { return common.failure("ValueError", message) }
+public function gitEnvironment(source: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in source { if !item.startsWith("GIT_") { result.add(item) } }
+    for item in ["GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_REPLACE_OBJECTS=1", "GIT_TERMINAL_PROMPT=0"] { result.add(item) }
+    return result
+}
+public function gitSettings(environment: List<Text>): json.Value {
+    let keys: List<Text> = []
+    let values: List<json.Value> = []
+    for item in environment {
+        if item.startsWith("GIT_") {
+            let separator = item.find("=")
+            keys.add(item.slice(0, separator))
+            values = values.appended(data.string(item.slice(separator + 1, item.length)))
+        }
+    }
+    return data.object(keys, values)
+}
+public function commands(environment: List<Text>): Commands {
+    return Commands { rows: []; environment: gitEnvironment(environment); launched: [0]; replaced: []; executor: [] }
+}
+public function which(name: Text): Text {
+    if name.find("/") >= 0 { return name }
+    for directory in system.getenv("PATH").split(":") {
+        if directory == "" { continue }
+        let candidate = directory + "/" + name
+        let info = common.stat(candidate)
+        if info.kind == 1 && info.mode & 73 != 0 { return candidate }
+    }
+    return ""
+}
+public function bindingOf(source: Text): Result<common.Binding, common.Failure> {
+    let value = try common.streamBinding(source, common.MAX_BYTES, 0, "")
+    value.path = source
+    return Ok<common.Binding, common.Failure>(value)
+}
+function base64(payload: Bytes): Text {
+    let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    let result = Bytes()
+    let index = 0
+    while index < payload.length {
+        let first = payload[index]
+        let second = 0
+        let third = 0
+        if index + 1 < payload.length { second = payload[index + 1] }
+        if index + 2 < payload.length { third = payload[index + 2] }
+        result.add(alphabet[first >> 2])
+        result.add(alphabet[((first & 3) << 4) | (second >> 4)])
+        if index + 1 < payload.length { result.add(alphabet[((second & 15) << 2) | (third >> 6)]) } else { result.add(61) }
+        if index + 2 < payload.length { result.add(alphabet[third & 63]) } else { result.add(61) }
+        index += 3
+    }
+    return Text(result)
+}
+public function rowJson(row: CommandRow): json.Value {
+    let timeout = data.none()
+    if row.timeout > 0 { timeout = common.seconds(row.timeout) }
+    let status = data.none()
+    if row.status.length > 0 { status = data.number(row.status[0]) }
+    let keys = ["argv", "timeout_seconds", "status", "tool_before"]
+    let values = [common.stringList(row.argv), timeout, status, common.boundPath(row.toolBefore)]
+    if row.timedOut { keys.add("timed_out"); values = values.appended(data.boolean(true)) }
+    if row.toolAfter.length > 0 { keys.add("tool_after"); values = values.appended(common.boundPath(row.toolAfter[0])) }
+    if row.toolError != "" { keys.add("tool_after_error"); values = values.appended(data.string(row.toolError)) }
+    keys.add("stdout_base64")
+    values = values.appended(data.string(base64(row.stdout)))
+    keys.add("stderr_base64")
+    values = values.appended(data.string(base64(row.stderr)))
+    return data.object(keys, values)
+}
+public function rowsJson(ledger: Commands): json.Value {
+    let items: List<json.Value> = []
+    for row in ledger.rows { items = items.appended(rowJson(row)) }
+    return data.array(items)
+}
+function readAll(fds: List<Integer>, deadline: Integer, outputs: List<Bytes>): Boolean {
+    let open = [true, true]
+    while open[0] || open[1] {
+        let wait = 100
+        if deadline > 0 {
+            let remaining = (deadline - common.now()) / common.MILLISECOND
+            if remaining <= 0 { return false }
+            wait = min(100, remaining)
+        }
+        let active: List<Integer> = []
+        let slots: List<Integer> = []
+        for index in 0..2 { if open[index] { active.add(fds[index]); slots.add(index) } }
+        let ready = common.pollFds(active, wait)
+        for position in 0..active.length {
+            if !ready[position] { continue }
+            let chunk = common.readSome(active[position], common.CHUNK)
+            if chunk.length == 0 { open[slots[position]] = false } else { outputs[slots[position]].addBytes(chunk) }
+        }
+    }
+    return true
+}
+function execute(argv: List<Text>, environment: List<Text>, timeout: Integer): Result<Execution, common.Failure> {
+    let input = common.openFile("/dev/null", 0, 0)
+    let outPair = common.pipePair()
+    let errPair = common.pipePair()
+    if input < 0 || outPair < 0 || errPair < 0 { return Err<Execution, common.Failure>(common.failure("OSError", "cannot prepare command streams")) }
+    let pid = common.spawnWith(argv[0], argv, environment, input, outPair & 4294967295, errPair & 4294967295, -1, 0)
+    common.closeFd(input)
+    common.closeFd(outPair & 4294967295)
+    common.closeFd(errPair & 4294967295)
+    let fds = [outPair >> 32, errPair >> 32]
+    if pid < 0 {
+        for fd in fds { common.closeFd(fd) }
+        return Err<Execution, common.Failure>(common.systemFailure(-pid, argv[0]))
+    }
+    let deadline = 0
+    if timeout > 0 { deadline = common.now() + timeout }
+    let outputs = [Bytes(), Bytes()]
+    let finished = readAll(fds, deadline, outputs)
+    for fd in fds { common.closeFd(fd) }
+    if !finished { system.sendSignal(pid, 9) }
+    let status = -1
+    while true {
+        let reaped = common.reapNoHang(pid)
+        if reaped > 0 { status = reaped - 1000000; break }
+        if reaped < 0 { break }
+        if finished && deadline > 0 && common.now() > deadline { system.sendSignal(pid, 9); finished = false }
+        common.pause(2)
+    }
+    return Ok<Execution, common.Failure>(Execution { status: status; stdout: outputs[0]; stderr: outputs[1]; timedOut: !finished })
+}
+public function run(ledger: Commands, argv: List<Text>, timeout: Integer): Result<Bytes, common.Failure> {
+    ledger.launched[0] += 1
+    if ledger.replaced.length > 0 {
+        let replaced = ledger.replaced[0]
+        return replaced(argv, timeout)
+    }
+    let found = which(argv[0])
+    if found == "" { found = argv[0] }
+    let tool = common.resolvePath(found)
+    let before = try bindingOf(tool)
+    let outcome = Execution { status: -1; stdout: Bytes(); stderr: Bytes(); timedOut: false }
+    if ledger.executor.length > 0 {
+        let executor = ledger.executor[0]
+        let produced = try executor(argv, ledger.environment, timeout)
+        outcome = produced
+    } else {
+        let produced = try execute(argv, ledger.environment, timeout)
+        outcome = produced
+    }
+    let row = CommandRow { argv: argv; timeout: timeout; status: []; timedOut: outcome.timedOut; toolBefore: before; toolAfter: []; toolError: ""; stdout: outcome.stdout; stderr: outcome.stderr }
+    ledger.rows.add(row)
+    if outcome.timedOut {
+        return Err<Bytes, common.Failure>(common.failure("TimeoutExpired", "Command '" + data.dumps(common.stringList(argv)) + "' timed out after " + common.durationText(timeout) + " seconds"))
+    }
+    row.status.add(outcome.status)
+    match bindingOf(tool) {
+        Ok(after) {
+            row.toolAfter.add(after)
+            if !common.sameBinding(before, after) { row.toolError = "prerequisite command executable changed" }
+        }
+        Err(problem) { row.toolError = problem.message }
+    }
+    if outcome.status != 0 {
+        return Err<Bytes, common.Failure>(common.failure("CalledProcessError", "Command '" + data.dumps(common.stringList(argv)) + "' returned non-zero exit status " + Text(outcome.status) + "."))
+    }
+    if row.toolError != "" { return Err<Bytes, common.Failure>(valueError(row.toolError)) }
+    return Ok<Bytes, common.Failure>(outcome.stdout)
+}
+function trimmed(raw: Bytes): Text { return Text(raw).trim() }
+
+public function contract(): Result<Contract, common.Failure> {
+    let names = common.PINNED_NAMES
+    let digests = common.PINNED_DIGESTS
+    if common.PIN != "740c05a10b61d65e8abd3ad38d60898004d335d9" || !common.sameSet(names, ["run.py", "interop.py", "testcase.py", "testcases_quic.py", "docker-compose.yml"]) ||
+        names.length != 5 || digests.length != names.length {
+        return Err<Contract, common.Failure>(valueError("adapter pin contract differs"))
+    }
+    for digest in digests { if !common.lowerHex(digest, 64) { return Err<Contract, common.Failure>(valueError("invalid primary source digest")) } }
+    return Ok<Contract, common.Failure>(Contract { pin: common.PIN; names: names.slice(0, names.length); digests: digests.slice(0, digests.length) })
+}
+public function objectId(kind: Text, payload: Bytes): Text {
+    let framed = Bytes(kind + " " + Text(payload.length))
+    framed.add(0)
+    framed.addBytes(payload)
+    return common.sha1Hex(framed)
+}
+function readObject(ledger: Commands, prefix: List<Text>, cache: Cache, kind: Text, identity: Text): Result<Bytes, common.Failure> {
+    if !common.lowerHex(identity, 40) { return Err<Bytes, common.Failure>(valueError("invalid pinned object identity")) }
+    for index in 0..cache.ids.length { if cache.ids[index] == identity && cache.kinds[index] == kind { return Ok<Bytes, common.Failure>(cache.payloads[index]) } }
+    let typed = prefix.slice(0, prefix.length)
+    for token in ["cat-file", "-t", identity] { typed.add(token) }
+    let actual = try run(ledger, typed, 30 * common.SECOND)
+    if trimmed(actual) != kind { return Err<Bytes, common.Failure>(valueError("pinned object type differs")) }
+    let read = prefix.slice(0, prefix.length)
+    for token in ["cat-file", kind, identity] { read.add(token) }
+    let payload = try run(ledger, read, 30 * common.SECOND)
+    if objectId(kind, payload) != identity { return Err<Bytes, common.Failure>(valueError("pinned Git object content differs")) }
+    cache.kinds.add(kind)
+    cache.ids.add(identity)
+    cache.payloads.add(payload)
+    return Ok<Bytes, common.Failure>(payload)
+}
+function hexByte(value: Integer): Text {
+    let digits = "0123456789abcdef"
+    return digits.slice(value >> 4, (value >> 4) + 1) + digits.slice(value & 15, (value & 15) + 1)
+}
+function walkTree(ledger: Commands, prefix: List<Text>, cache: Cache, walk: Walk, identity: Text, parent: Text, ancestors: List<Text>): Result<Boolean, common.Failure> {
+    if common.member(ancestors, identity) || ancestors.length > 64 { return Err<Boolean, common.Failure>(valueError("invalid pinned tree recursion")) }
+    let payload = try readObject(ledger, prefix, cache, "tree", identity)
+    walk.trees = walk.trees.appended(data.object(["path", "object", "sha256", "bytes"], [data.string(parent), data.string(identity), data.string(common.digestBytes(payload)), data.number(payload.length)]))
+    let offset = 0
+    let lineage = ancestors.appended(identity)
+    while offset < payload.length {
+        let space = offset
+        while space < payload.length && payload[space] != 32 { space += 1 }
+        let zero = space + 1
+        while zero < payload.length && payload[zero] != 0 { zero += 1 }
+        if space >= payload.length || zero >= payload.length || zero + 21 > payload.length { return Err<Boolean, common.Failure>(valueError("malformed pinned tree entry")) }
+        let mode = Text(payload.slice(offset, space))
+        let name = Text(payload.slice(space + 1, zero))
+        if name == "" || name == "." || name == ".." || common.contains(name, "/") || common.contains(name, "\\") { return Err<Boolean, common.Failure>(valueError("unsafe pinned tree path")) }
+        let pieces: List<Text> = []
+        for index in (zero + 1)..(zero + 21) { pieces.add(hexByte(payload[index])) }
+        let child = joinText(pieces)
+        let key = name
+        if parent != "." { key = parent + "/" + name }
+        if common.member(walk.seen, key) { return Err<Boolean, common.Failure>(valueError("duplicate pinned path")) }
+        walk.seen.add(key)
+        offset = zero + 21
+        if mode == "40000" || mode == "040000" {
+            let nested = try walkTree(ledger, prefix, cache, walk, child, key, lineage)
+        } else if mode == "100644" || mode == "100755" || mode == "120000" {
+            let content = try readObject(ledger, prefix, cache, "blob", child)
+            walk.names.add(key)
+            walk.digests.add(common.digestBytes(content))
+            walk.files = walk.files.appended(data.object(["path", "mode", "object", "sha256", "bytes"],
+                [data.string(key), data.string(mode), data.string(child), data.string(common.digestBytes(content)), data.number(content.length)]))
+        } else { return Err<Boolean, common.Failure>(valueError("unsupported pinned Git object mode")) }
+    }
+    if offset != payload.length { return Err<Boolean, common.Failure>(valueError("truncated pinned tree")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+function sortedFiles(walk: Walk): json.Value {
+    let order = walk.names.sorted()
+    let items: List<json.Value> = []
+    for name in order {
+        for item in walk.files { if common.equalText(data.field(item, "path"), name) { items = items.appended(item) } }
+    }
+    return data.array(items)
+}
+public function verifyRunner(repository: Text, ledger: Commands, pinned: Contract, root: Text): Result<json.Value, common.Failure> {
+    if !common.isAbsolute(repository) || !common.isDirectory(repository) {
+        return Err<json.Value, common.Failure>(valueError("runner repository requires an existing absolute directory"))
+    }
+    let contractPath = common.joinPath(root, CONTRACT_SOURCE)
+    let contractBefore = try bindingOf(contractPath)
+    let git = which("git")
+    if git == "" { return Err<json.Value, common.Failure>(valueError("Git is required for pinned source controls")) }
+    let versionBytes = try run(ledger, [git, "--version"], 30 * common.SECOND)
+    let version = trimmed(versionBytes)
+    if !version.startsWith("git version ") { return Err<json.Value, common.Failure>(valueError("Git version provenance missing")) }
+    let prefix = [git, "--no-replace-objects", "-C", repository]
+    let gitDirBytes = try run(ledger, prefix.appended("rev-parse").appended("--absolute-git-dir"), 30 * common.SECOND)
+    let commonBytes = try run(ledger, prefix.appended("rev-parse").appended("--git-common-dir"), 30 * common.SECOND)
+    let gitDir = trimmed(gitDirBytes)
+    let commonDir = trimmed(commonBytes)
+    if gitDir == "" || commonDir == "" { return Err<json.Value, common.Failure>(valueError("missing Git repository identity")) }
+    if !common.isAbsolute(commonDir) { commonDir = common.joinPath(repository, commonDir) }
+    for directory in [gitDir, commonDir] {
+        if common.present(common.joinPath(directory, "info/grafts")) { return Err<json.Value, common.Failure>(valueError("runner graft ambiguity is forbidden")) }
+    }
+    let replacements = try run(ledger, prefix.appended("for-each-ref").appended("--format=%(refname)").appended("refs/replace"), 30 * common.SECOND)
+    if trimmed(replacements) != "" { return Err<json.Value, common.Failure>(valueError("runner replacement objects are forbidden")) }
+    let cache = Cache { kinds: []; ids: []; payloads: [] }
+    let commit = try readObject(ledger, prefix, cache, "commit", pinned.pin)
+    let first = Text(commit).split("\n")[0]
+    if !first.startsWith("tree ") { return Err<json.Value, common.Failure>(valueError("pinned commit lacks its tree")) }
+    let rootTree = first.slice(5, first.length)
+    let walk = Walk { files: []; trees: []; seen: []; names: []; digests: [] }
+    let walked = try walkTree(ledger, prefix, cache, walk, rootTree, ".", [])
+    if walk.names.length != FILE_COUNT { return Err<json.Value, common.Failure>(valueError("pinned runner must contain every expected file")) }
+    for index in 0..pinned.names.length {
+        let found = false
+        for position in 0..walk.names.length { if walk.names[position] == pinned.names[index] && walk.digests[position] == pinned.digests[index] { found = true } }
+        if !found { return Err<json.Value, common.Failure>(valueError("primary runner source differs: " + pinned.names[index])) }
+    }
+    for index in 0..cache.ids.length {
+        let read = prefix.slice(0, prefix.length)
+        for token in ["cat-file", cache.kinds[index], cache.ids[index]] { read.add(token) }
+        let after = try run(ledger, read, 30 * common.SECOND)
+        if Text(after) != Text(cache.payloads[index]) || after.length != cache.payloads[index].length || objectId(cache.kinds[index], after) != cache.ids[index] {
+            return Err<json.Value, common.Failure>(valueError("pinned source changed during verification"))
+        }
+    }
+    let contractAfter = try bindingOf(contractPath)
+    if !common.sameBinding(contractBefore, contractAfter) { return Err<json.Value, common.Failure>(valueError("adapter pin contract changed during verification")) }
+    return Ok<json.Value, common.Failure>(data.object(["verified", "scope", "contract_before", "contract_after", "repository", "git_version", "commit", "tree", "files", "trees", "commands"],
+        [data.boolean(true), data.string("Git source objects only; no runner execution"), common.boundPath(contractBefore), common.boundPath(contractAfter),
+            data.string(repository), data.string(version), data.string(pinned.pin), data.string(rootTree), sortedFiles(walk), data.array(walk.trees), rowsJson(ledger)]))
+}
+public function writeReady(target: Text, report: json.Value): Result<Boolean, common.Failure> {
+    let fd = common.openFile(target, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_EXCLUSIVE, 438)
+    if fd < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-fd, target)) }
+    let wrote = common.writeAll(fd, common.jsonBytes(report))
+    common.closeFd(fd)
+    if wrote < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-wrote, target)) }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function prepareRunner(repository: Text, ledger: Commands, pinned: Contract, root: Text): Result<json.Value, common.Failure> {
+    if !common.isAbsolute(repository) || common.present(repository) {
+        return Err<json.Value, common.Failure>(valueError("default runner cache must be fresh; existing inputs are not repaired"))
+    }
+    let parent = common.parentOf(repository)
+    let made = try common.makeDirectories(parent)
+    let stage = common.temporaryDirectory(parent, common.nameOf(repository) + ".stage.")
+    if stage == "" { return Err<json.Value, common.Failure>(common.systemFailure(common.lastErrno(), parent)) }
+    let git = which("git")
+    if git == "" { return Err<json.Value, common.Failure>(valueError("Git is required for pinned source preparation")) }
+    let initialized = try run(ledger, [git, "init", "--bare", stage], 30 * common.SECOND)
+    let fetched = try run(ledger, [git, "-C", stage, "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", URL, pinned.pin], 180 * common.SECOND)
+    let report = try verifyRunner(stage, ledger, pinned, root)
+    let ready = try writeReady(common.joinPath(stage, ".ready.json"), report)
+    let published = common.renameNoReplace(stage, repository)
+    if published < 0 { return Err<json.Value, common.Failure>(common.failure("OSError", "[Errno " + Text(-published) + "] exclusive cache publication failed")) }
+    return Ok<json.Value, common.Failure>(data.object(["verified", "published", "preparation"], [data.boolean(true), data.string(repository), report]))
+}
+function sourceBindings(paths: List<Text>): Result<List<common.Binding>, common.Failure> {
+    let result: List<common.Binding> = []
+    for item in paths {
+        let bound = try bindingOf(item)
+        result.add(bound)
+    }
+    return Ok<List<common.Binding>, common.Failure>(result)
+}
+function sameBindings(left: List<common.Binding>, right: List<common.Binding>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index].path != right[index].path || !common.sameBinding(left[index], right[index]) { return false } }
+    return true
+}
+function bindingsJson(values: List<common.Binding>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(common.boundPath(value)) }
+    return data.array(items)
+}
+public function runControls(repository: Text, artifacts: Text, verifier: Text, controls: Text, adapter: Text, ledger: Commands, root: Text): Result<json.Value, common.Failure> {
+    let parent = common.parentOf(artifacts)
+    if !common.isAbsolute(repository) || !common.isDirectory(repository) || !common.isAbsolute(artifacts) || common.present(artifacts) ||
+        !common.isDirectory(parent) || common.resolvePath(parent) != common.normalize(parent) {
+        return Err<json.Value, common.Failure>(valueError("controls need an explicit repository and fresh absolute artifacts"))
+    }
+    let paths = [verifier, controls, adapter]
+    let sources = SOURCES
+    for item in sources { paths.add(common.joinPath(root, item)) }
+    let before = try sourceBindings(paths)
+    let raw = try run(ledger, [verifier, "verify", "--repository", repository, "--root", root], 0)
+    let inputs = data.decode(raw)
+    if inputs.kind != json.OBJECT || !common.isTrue(data.field(inputs, "verified")) || data.field(inputs, "runner").kind != json.OBJECT ||
+        !common.isTrue(data.field(data.field(inputs, "runner"), "verified")) {
+        return Err<json.Value, common.Failure>(valueError("fresh verified inputs are required before controls"))
+    }
+    let current = try sourceBindings(paths)
+    if !sameBindings(before, current) { return Err<json.Value, common.Failure>(valueError("control sources changed before launch")) }
+    let output = try run(ledger, [controls, "--pinned-runner", repository, "--artifacts", artifacts, "--adapter", adapter], 0)
+    let after = try sourceBindings(paths)
+    if !sameBindings(before, after) { return Err<json.Value, common.Failure>(valueError("control sources changed during launch")) }
+    return Ok<json.Value, common.Failure>(data.object(["verified", "scope", "inputs", "sources_before", "sources_after", "git_environment", "commands"],
+        [data.boolean(true), data.string("all113 safe/mock controls; no Docker authority"), inputs, bindingsJson(before), bindingsJson(after), gitSettings(ledger.environment), rowsJson(ledger)]))
+}
+function option(name: Text): Text {
+    let index = 1
+    while index + 1 < argumentCount() {
+        if argument(index) == name { return argument(index + 1) }
+        index += 2
+    }
+    return ""
+}
+function failed(ledger: Commands, problem: common.Failure): Integer {
+    system.writeStandardError("adapter input verification failed: " + problem.message + "\n")
+    system.writeStandardError(data.dumps(data.object(["verified", "error_type", "error", "commands"],
+        [data.boolean(false), data.string(problem.kind), data.string(problem.message), rowsJson(ledger)])) + "\n")
+    return 1
+}
+public function main(): Integer {
+    let ledger = commands(system.environment())
+    if argumentCount() == 0 || (argumentCount() - 1) % 2 != 0 { return failed(ledger, valueError("usage: check-quic-official-inputs (prepare-runner|verify|controls) --OPTION VALUE ...")) }
+    let mode = argument(0)
+    if !common.present("/proc/self/stat") { return failed(ledger, valueError("Linux adapter controls required before dependency setup")) }
+    let report = option("--report")
+    if report != "" && (!common.isAbsolute(report) || common.present(report)) { return failed(ledger, valueError("--report must be a fresh absolute file")) }
+    let root = option("--root")
+    if root == "" { root = common.realPath(".") }
+    let pinned = contract()
+    let value = data.none()
+    match pinned {
+        Ok(found) {
+            if mode == "prepare-runner" {
+                if option("--repository") == "" { return failed(ledger, valueError("--repository required")) }
+                match prepareRunner(option("--repository"), ledger, found, root) {
+                    Ok(result) { value = result }
+                    Err(problem) { return failed(ledger, problem) }
+                }
+            } else if mode == "verify" {
+                if option("--repository") == "" { return failed(ledger, valueError("--repository required")) }
+                match verifyRunner(option("--repository"), ledger, found, root) {
+                    Ok(result) {
+                        let sources: List<json.Value> = []
+                        let names = SOURCES
+                        for item in names { sources = sources.appended(common.boundPath(common.bindingOr(common.joinPath(root, item)))) }
+                        value = data.object(["verified", "scope", "runner", "sources"], [data.boolean(true), data.string("safe controls prerequisites; no Docker execution"), result, data.array(sources)])
+                    }
+                    Err(problem) { return failed(ledger, problem) }
+                }
+            } else if mode == "controls" {
+                if option("--repository") == "" || option("--artifacts") == "" || option("--controls") == "" || option("--adapter") == "" {
+                    return failed(ledger, valueError("--repository, --artifacts, --controls and --adapter required"))
+                }
+                match runControls(option("--repository"), option("--artifacts"), common.selfExecutable(), option("--controls"), option("--adapter"), ledger, root) {
+                    Ok(result) { value = result }
+                    Err(problem) { return failed(ledger, problem) }
+                }
+            } else { return failed(ledger, valueError("unknown mode " + mode)) }
+        }
+        Err(problem) { return failed(ledger, problem) }
+    }
+    if report != "" {
+        match writeReady(report, value) {
+            Ok(done) {}
+            Err(problem) { return failed(ledger, problem) }
+        }
+    }
+    print(data.dumps(value))
+    return 0
+}

@@ -1,0 +1,224 @@
+use "json" as json
+use "system" as system
+use "../../quic-json.min" as data
+use "./owned-common.min" as common
+use "./owned-process.min" as process
+use "./owned-daemon.min" as owned
+use "./owned-derive.min" as derive
+
+record Invocation { command: Text; positional: List<Text>; names: List<Text>; values: List<Text> }
+
+public function ownedExec(fd: Integer, encoded: Text): Integer {
+    let value = json.parse(encoded)
+    if value.kind != json.ARRAY || value.items.length == 0 || !data.allTexts(value) { return 125 }
+    return common.gateExec(fd, data.texts(value), 5000)
+}
+function parse(): Invocation {
+    let result = Invocation { command: ""; positional: []; names: []; values: [] }
+    if argumentCount() == 0 { return result }
+    result.command = argument(0)
+    let index = 1
+    while index < argumentCount() {
+        let value = argument(index)
+        if value.startsWith("--") && index + 1 < argumentCount() {
+            result.names.add(value)
+            result.values.add(argument(index + 1))
+            index += 2
+        } else {
+            result.positional.add(value)
+            index += 1
+        }
+    }
+    return result
+}
+function option(invocation: Invocation, name: Text): Text {
+    for index in 0..invocation.names.length { if invocation.names[index] == name { return invocation.values[index] } }
+    return ""
+}
+function options(invocation: Invocation, name: Text): List<Text> {
+    let result: List<Text> = []
+    for index in 0..invocation.names.length { if invocation.names[index] == name { result.add(invocation.values[index]) } }
+    return result
+}
+function report(problem: common.Failure): Integer {
+    let lines = [problem.kind + ": " + problem.message]
+    for value in problem.notes { lines.add(value) }
+    let pieces: List<Text> = []
+    for line in lines { pieces.add(line + "\n") }
+    system.writeStandardError(joinText(pieces))
+    return 1
+}
+function done(outcome: Result<Boolean, common.Failure>): Integer {
+    match outcome {
+        Ok(value) { return 0 }
+        Err(problem) { return report(problem) }
+    }
+}
+function loadConfig(invocation: Invocation): Result<json.Value, common.Failure> {
+    let path = option(invocation, "--config")
+    if path == "" { return Err<json.Value, common.Failure>(common.ownership("owned runner configuration required")) }
+    return common.readJson(path)
+}
+function registryFor(invocation: Invocation): Result<owned.Registry, common.Failure> {
+    let config = try loadConfig(invocation)
+    return owned.persistentRegistry(config, option(invocation, "--token"))
+}
+function fixtureCreate(invocation: Invocation): Result<Boolean, common.Failure> {
+    let registry = try registryFor(invocation)
+    let made = try owned.registryTemporary(registry, option(invocation, "--dir"), option(invocation, "--prefix"))
+    print(made)
+    return Ok<Boolean, common.Failure>(true)
+}
+function fixtureCleanup(invocation: Invocation): Result<Boolean, common.Failure> {
+    if invocation.positional.length != 1 { return Err<Boolean, common.Failure>(common.ownership("fixture cleanup requires one path")) }
+    let registry = try registryFor(invocation)
+    return owned.registryCleanup(registry, invocation.positional[0])
+}
+function fixtureRetain(invocation: Invocation): Result<Boolean, common.Failure> {
+    if invocation.positional.length != 1 { return Err<Boolean, common.Failure>(common.ownership("fixture retention requires one path")) }
+    let registry = try registryFor(invocation)
+    return owned.registryRetain(registry, invocation.positional[0])
+}
+function fixtureError(invocation: Invocation): Result<Boolean, common.Failure> {
+    if invocation.positional.length != 2 { return Err<Boolean, common.Failure>(common.ownership("fixture error requires a type and message")) }
+    let registry = try registryFor(invocation)
+    registry.problems.add(common.StageError { stage: ""; kind: invocation.positional[0]; message: invocation.positional[1] })
+    return owned.saveRegistry(registry)
+}
+function failureLedger(invocation: Invocation, primary: common.Failure, secondary: common.Failure): Integer {
+    let configPath = option(invocation, "--config")
+    let directory = common.parentOf(common.resolvePath(configPath))
+    let problems: List<json.Value> = []
+    match common.readJson(configPath) {
+        Ok(config) {
+            let artifacts = common.textOf(data.field(data.field(config, "owner_spec"), "artifacts"))
+            if artifacts != "" { directory = artifacts }
+        }
+        Err(problem) {
+            problems = problems.appended(data.object(["stage", "type", "message"], [data.string("failure-ledger-config"), data.string(problem.kind), data.string(problem.message)]))
+            print("note: author failure ledger config: " + problem.message)
+        }
+    }
+    let ledger = data.object(["schema_version", "primary", "secondary", "errors"], [data.number(1), common.exception(primary), common.exception(secondary), data.array(problems)])
+    match common.atomicJson(common.joinPath(directory, "author-finalization-failure.json"), ledger) {
+        Ok(value) {}
+        Err(problem) {
+            print("note: author failure ledger: " + problem.message)
+            match common.atomicJson(common.joinPath(common.parentOf(common.resolvePath(configPath)), "author-finalization-failure.json"), ledger) {
+                Ok(value) {}
+                Err(last) { print("note: author fallback ledger: " + last.message) }
+            }
+        }
+    }
+    return report(secondary)
+}
+function authorFinish(invocation: Invocation): Integer {
+    let primary: List<common.Failure> = []
+    let kind = option(invocation, "--primary-type")
+    if kind != "" { primary.add(common.failure(kind, option(invocation, "--primary-message"))) }
+    match registryFor(invocation) {
+        Ok(registry) {
+            match owned.registryFinish(registry, primary) {
+                Ok(value) {
+                    if primary.length > 0 { for value in primary[0].notes { print("note: " + value) } }
+                    return 0
+                }
+                Err(problem) {
+                    if primary.length == 0 { return report(problem) }
+                    return failureLedger(invocation, primary[0], problem)
+                }
+            }
+        }
+        Err(problem) {
+            if primary.length == 0 { return report(problem) }
+            return failureLedger(invocation, primary[0], problem)
+        }
+    }
+    return 1
+}
+function preparePhase(invocation: Invocation): Result<Boolean, common.Failure> {
+    let daemon = try owned.runnerDaemon(option(invocation, "--config"))
+    return owned.prepareRunnerPhase(daemon.spec[0], daemon)
+}
+function copyLogs(invocation: Invocation): Result<Boolean, common.Failure> {
+    if invocation.positional.length != 2 { return Err<Boolean, common.Failure>(common.ownership("log copy requires a role and directory")) }
+    let daemon = try owned.runnerDaemon(option(invocation, "--config"))
+    return owned.copyRunnerLogs(daemon, invocation.positional[0], invocation.positional[1])
+}
+function dockerEntry(invocation: Invocation): Integer {
+    match owned.runnerDaemon(option(invocation, "--config")) {
+        Ok(daemon) {
+            match owned.dockerEntry(daemon.spec[0], daemon, invocation.positional, system.environment()) {
+                Ok(status) { return status }
+                Err(problem) { return report(problem) }
+            }
+        }
+        Err(problem) { return report(problem) }
+    }
+    return 1
+}
+function identityFile(path: Text): Result<common.Member, common.Failure> {
+    let value = try common.readJson(path)
+    if !common.isInteger(data.field(value, "pid")) || !common.isInteger(data.field(value, "start_ticks")) { return Ok<common.Member, common.Failure>(common.noMember()) }
+    return Ok<common.Member, common.Failure>(common.readMember(value))
+}
+function mockWatch(invocation: Invocation): Result<Boolean, common.Failure> {
+    let specValue = try common.readJson(option(invocation, "--spec"))
+    let spec = try owned.ownerSpec(specValue)
+    let controller = try identityFile(option(invocation, "--controller"))
+    let guard = try identityFile(option(invocation, "--guard"))
+    let deadline = common.integerText(option(invocation, "--deadline"))
+    let result = try owned.watchOwned(spec, owned.jsonDaemon(option(invocation, "--mock-watch")), controller, guard, deadline, option(invocation, "--output"), 50 * common.MILLISECOND, [])
+    return Ok<Boolean, common.Failure>(true)
+}
+function deriveCommand(invocation: Invocation): Result<Boolean, common.Failure> {
+    let specValue = try common.readJson(option(invocation, "--spec"))
+    let spec = try owned.ownerSpec(specValue)
+    let names: List<Text> = []
+    let images: List<Text> = []
+    for value in options(invocation, "--image") {
+        let separator = value.find("=")
+        if separator <= 0 { return Err<Boolean, common.Failure>(common.ownership("registry image must be NAME=IMAGE")) }
+        names.add(value.slice(0, separator))
+        images.add(value.slice(separator + 1, value.length))
+    }
+    let adapter = option(invocation, "--adapter")
+    if adapter == "" { adapter = common.selfExecutable() }
+    let report = try derive.deriveRunner(option(invocation, "--pinned"), option(invocation, "--destination"), spec, names, images, adapter)
+    return Ok<Boolean, common.Failure>(true)
+}
+
+public function main(): Integer {
+    if argumentCount() == 4 && argument(0) == "--owned-exec-fd" && argument(2) == "--owned-exec-json" {
+        let fd = common.integerText(argument(1))
+        if fd < 0 { return 125 }
+        return ownedExec(fd, argument(3))
+    }
+    let invocation = parse()
+    if invocation.command == "--mock-watch" {
+        let watched = Invocation { command: "--mock-watch"; positional: []; names: []; values: [] }
+        let index = 0
+        while index + 1 < argumentCount() {
+            watched.names.add(argument(index))
+            watched.values.add(argument(index + 1))
+            index += 2
+        }
+        return done(mockWatch(watched))
+    }
+    if invocation.command == "docker-entry" {
+        if argumentCount() < 3 || argument(1) != "--config" { return report(common.ownership("owned runner configuration required")) }
+        let entry = Invocation { command: "docker-entry"; positional: []; names: ["--config"]; values: [argument(2)] }
+        for index in 3..argumentCount() { entry.positional.add(argument(index)) }
+        return dockerEntry(entry)
+    }
+    if invocation.command == "fixture-create" { return done(fixtureCreate(invocation)) }
+    if invocation.command == "fixture-cleanup" { return done(fixtureCleanup(invocation)) }
+    if invocation.command == "fixture-retain" { return done(fixtureRetain(invocation)) }
+    if invocation.command == "fixture-error" { return done(fixtureError(invocation)) }
+    if invocation.command == "author-finish" { return authorFinish(invocation) }
+    if invocation.command == "prepare-phase" { return done(preparePhase(invocation)) }
+    if invocation.command == "copy-logs" { return done(copyLogs(invocation)) }
+    if invocation.command == "derive" { return done(deriveCommand(invocation)) }
+    system.writeStandardError("usage: owned-adapter (docker-entry|fixture-create|fixture-cleanup|fixture-retain|fixture-error|author-finish|prepare-phase|copy-logs|derive|--mock-watch) ...\n")
+    return 2
+}

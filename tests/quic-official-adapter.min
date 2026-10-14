@@ -1,0 +1,2527 @@
+use "json" as json
+use "system" as system
+use "./quic-json.min" as data
+use "./quic-official-support.min" as support
+use "./interop/qns/owned-common.min" as common
+use "./interop/qns/owned-process.min" as process
+use "./interop/qns/owned-daemon.min" as adapter
+use "./interop/qns/owned-derive.min" as derive
+
+constant CASES: List<Text> = [
+    "successful-cleanup", "partial-setup-retention", "controller-death", "guard-death",
+    "deadline", "resource-abort", "unknown-container-id", "colliding-service", "wrong-label",
+    "wrong-image", "cleanup-command-failure", "primary-retention-failure", "retention-bounds", "criteria-no-pull",
+    "tree-primary-finalization", "raw-nonzero-status", "root-exited-descendant", "unexpected-endpoint-exit", "unsupported-compliance-exit",
+    "controller-before-create", "controller-partial-create", "controller-before-retention", "controller-after-criterion", "retention-late-mutation",
+    "raw-evidence-reuse", "raw-primary-finalization", "duplicate-container-ids", "wrong-network-label", "unowned-network-member", "fixture-access", "fixture-access-unowned",
+    "startup-permissions-before-start", "watch-cleanup-retains-tree", "watch-sample-failure", "watch-identity-failure", "watch-monitor-failure", "author-registry-primary",
+    "late-reinspection-failure", "foreign-network-mode", "host-pid-mode", "host-ipc-mode", "extra-network-membership", "wrong-network-id", "raw-cli-exited-descendant",
+    "raw-cli-delayed-create", "retention-stream-bound", "retention-lazy-file-bound", "retention-final-deadline", "copy-size-bound",
+    "raw-cli-escaped-descendant", "admission-kill-before-create", "admission-kill-partial-create", "admission-kill-before-retention", "admission-kill-after-criterion",
+    "admission-quiet-inflight", "admission-foreign-intent", "raw-stream-overlimit", "copy-safe-archive", "copy-unsafe-archive",
+    "raw-partial-initialization", "raw-escaped-timeout", "raw-foreign-child-boundary", "startup-server-compliance", "startup-client-compliance", "watch-primary-cleanup-secondary",
+    "raw-restoration-failure", "retention-manifest-deadline", "copy-official-fixture-layout",
+    "up-status-one", "up-status-unsupported", "created-declared-networks", "stopped-declared-networks", "admission-not-opened-revoked", "admission-closed-revoked",
+    "watch-late-object", "pidfd-check-signal-race", "session-extinction-latch", "root-wnowait-before-drain", "close-secondary-preserves-primary", "close-state-secondary-preserves-primary",
+    "admitted-cli-success", "admitted-cli-publication-failure", "admitted-cli-revoked-at-spawn", "admitted-cli-controller-death", "admission-close-lock-race",
+    "phase-next-admission", "created-wrong-configured-id", "stopped-wrong-configured-id", "raw-birthday-failure", "raw-birthday-failure-escaped",
+    "held-empty-nonready", "held-empty-later-ready", "held-empty-already-ready", "compose-server-renewal", "compose-client-renewal", "compose-workload-attachment",
+    "retained-file-sentinel", "retained-file-timeout", "retained-file-nonzero", "pidfd-post-popen-emfile", "pidfd-post-popen-attribute", "pidfd-post-popen-gate-close",
+    "sigchld-preflight-ignored", "server-exit-live-simulator", "compose-unknown-service", "compose-dependency-recreation", "compose-dependency-foreign-object",
+    "raw-forward-incremental", "raw-forward-stderr-status", "raw-forward-no-duplicate", "raw-forward-empty", "raw-forward-private-json", "raw-forward-backpressure"
+]
+constant FORWARD_CASES: List<Text> = ["raw-forward-incremental", "raw-forward-stderr-status", "raw-forward-no-duplicate", "raw-forward-empty", "raw-forward-private-json", "raw-forward-backpressure"]
+
+record Context { adapter: Text; pinned: Text; self: Text }
+
+function one(): Text { return support.identifier("1") }
+function two(): Text { return support.identifier("2") }
+function three(): Text { return support.identifier("3") }
+function seven(): Text { return support.identifier("7") }
+function eight(): Text { return support.identifier("8") }
+function foreign(): Text { return support.identifier("f") }
+function path(root: Text, name: Text): Text { return common.joinPath(root, name) }
+function setFault(hook: Callback<Text, Text, Result<Boolean, common.Failure>>) {
+    let seams = common.SEAMS
+    seams.fault = hook
+}
+function setClock(hook: Callback<Integer>) {
+    let seams = common.SEAMS
+    seams.clock = hook
+}
+function ok(): Result<Boolean, common.Failure> { return Ok<Boolean, common.Failure>(true) }
+function caughtOutput(outcome: Result<process.Output, common.Failure>): List<common.Failure> {
+    match outcome {
+        Ok(value) { return [] }
+        Err(problem) { return [problem] }
+    }
+}
+function caughtCleanup(outcome: Result<adapter.CleanupResult, common.Failure>): List<common.Failure> {
+    match outcome {
+        Ok(value) { return [] }
+        Err(problem) { return [problem] }
+    }
+}
+function caughtRow(outcome: Result<common.TreeRow, common.Failure>): List<common.Failure> {
+    match outcome {
+        Ok(value) { return [] }
+        Err(problem) { return [problem] }
+    }
+}
+function isKind(caught: List<common.Failure>, kind: Text): Boolean { return caught.length > 0 && caught[0].kind == kind }
+function isSame(caught: List<common.Failure>, original: common.Failure): Boolean { return caught.length > 0 && common.same(caught[0], original) }
+function cleanupRun(setup: support.Setup, root: Text, reason: Text, primary: List<common.Failure>): Result<json.Value, common.Failure> {
+    match adapter.cleanupOwned(setup.owner, setup.daemon, path(root, "cleanup"), reason, primary, data.none(), false, true) {
+        Ok(result) { return Ok<json.Value, common.Failure>(adapter.cleanupJson(setup.owner, result)) }
+        Err(problem) {
+            if problem.kind != "CleanupError" { return Err<json.Value, common.Failure>(problem) }
+            return common.readJson(path(root, "cleanup/cleanup.json"))
+        }
+    }
+}
+function cleanupOutcome(result: json.Value, expected: Text): support.Outcome {
+    let found = support.outcome(common.textOf(data.field(result, "status")), expected)
+    support.detail(found, "cleanup", result)
+    return found
+}
+function eventsOf(setup: support.Setup): List<json.Value> {
+    match support.events(setup) {
+        Ok(values) { return values }
+        Err(problem) { return [] }
+    }
+}
+function containersOf(setup: support.Setup): List<Text> {
+    match adapter.jsonContainers(setup.path) {
+        Ok(values) { return values }
+        Err(problem) { return ["unreadable"] }
+    }
+}
+function networksOf(setup: support.Setup): List<json.Value> {
+    match adapter.jsonNetworks(setup.path) {
+        Ok(values) { return values }
+        Err(problem) { return [support.empty()] }
+    }
+}
+function currentIdentity(): common.Member { return common.processIdentity(system.processId()) }
+function subreaperValue(): Integer { return common.subreaperGet() }
+function rowOf(records: process.Commands): process.Row { return records.rows[0] }
+
+function recordedStop(setup: support.Setup, identity: Text, entry: json.Value, entries: List<json.Value>): Boolean {
+    match adapter.recordedComposeStop(setup.owner, identity, entry, entries, data.none()) {
+        Ok(value) { return value }
+        Err(problem) { return false }
+    }
+}
+function successfulCleanup(setup: support.Setup, root: Text, state: json.Value): Result<Boolean, common.Failure> {
+    let owner = setup.owner
+    let raw = path(owner.artifacts, "daemon-commands/compose-output")
+    let made = try common.makeDirectories(raw)
+    let stdout = path(raw, "stdout")
+    let stderr = path(raw, "stderr")
+    let wroteOut = try common.writeText(stdout, owner.project + "-client exited with code 0\n")
+    let stderrText = "Compose Stopping Aborting on container exit...\nContainer " + owner.project + "-sim Stopping\nContainer " + owner.project + "-sim Stopped\nContainer " +
+        owner.project + "-server Stopping\nContainer " + owner.project + "-server Stopped\n"
+    let wroteErr = try common.writeText(stderr, stderrText)
+    let stdoutBinding = try common.binding(stdout)
+    let stderrBinding = try common.binding(stderr)
+    let receipt = support.obj(["argv", "status", "timed_out", "primary_exception", "finalization_errors", "lifetime", "stdout", "stderr"],
+        [support.texts(["/usr/bin/docker", "compose", "--project-name", owner.project, "--file", owner.composePath, "--env-file", path(owner.runnerRoot, "empty.env"), "up", "--timeout", "10",
+            "--abort-on-container-exit", "sim", "client", "server"]), support.number(0), support.flag(false), support.none(), data.array([]),
+            support.obj(["state", "certified"], [support.text("closed"), support.flag(true)]), common.boundPath(stdoutBinding), common.boundPath(stderrBinding)])
+    let intent = support.obj(["project", "nonce", "state", "certified", "created_ids", "up_receipt"],
+        [support.text(owner.project), support.text(owner.nonce), support.text("closed"), support.flag(true), support.texts(common.keysOf(data.field(state, "containers"))), receipt])
+    let admission = path(owner.artifacts, "create-admission.json")
+    let entries = common.valuesOf(data.field(state, "containers"))
+    let simulatorEntry = data.field(data.field(state, "containers"), one())
+    let strict = true
+    for mutant in [data.with(intent, "certified", support.flag(false)), data.with(intent, "created_ids", data.array([])),
+        data.with(intent, "up_receipt", data.with(receipt, "status", support.number(1)))] {
+        let wrote = try common.atomicJson(admission, mutant)
+        strict = !recordedStop(setup, one(), simulatorEntry, entries) && strict
+    }
+    let restored = try common.atomicJson(admission, intent)
+    let edited = try common.writeText(stderr, stderrText + "unbound edit")
+    strict = !recordedStop(setup, one(), simulatorEntry, entries) && strict
+    let back = try common.writeText(stderr, stderrText)
+    let peerEntry = data.field(data.field(state, "containers"), two())
+    for mutant in [data.with(peerEntry, "Image", support.text(support.image())), common.setPath(peerEntry, ["State", "OOMKilled"], support.flag(true)),
+        common.setPath(peerEntry, ["State", "FinishedAt"], support.text("2026-10-11T16:00:11Z"))] {
+        strict = !recordedStop(setup, two(), mutant, entries) && strict
+    }
+    for invalid in [["CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_ADMIN"], ["CAP_NET_ADMIN", "CAP_NET_ADMIN"], ["CAP_NET_ADMIN", "NET_RAW"], []] {
+        let mutant = common.setPath(simulatorEntry, ["HostConfig", "CapAdd"], support.texts(invalid))
+        match adapter.container(owner, mutant) {
+            Ok(role) { strict = false }
+            Err(problem) { if problem.kind != "OwnershipError" { strict = false } }
+        }
+    }
+    return Ok<Boolean, common.Failure>(strict)
+}
+function mockCleanup(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let strict = true
+    if name == "successful-cleanup" {
+        state = common.setPath(state, ["containers", one(), "HostConfig", "CapAdd"], support.texts(["CAP_NET_ADMIN", "CAP_NET_RAW"]))
+        let ids = [one(), two(), three()]
+        let codes = [143, 137, 0]
+        let finished = ["2026-10-11T16:00:20Z", "2026-10-11T16:00:20Z", "2026-10-11T16:00:10Z"]
+        for index in 0..3 {
+            state = common.setPath(state, ["containers", ids[index], "State"], support.obj(["Running", "ExitCode", "OOMKilled", "FinishedAt"],
+                [support.flag(false), support.number(codes[index]), support.flag(false), support.text(finished[index])]))
+        }
+        state = common.setPath(state, ["containers", two(), "Image"], support.text(support.peer()))
+        let computed = try successfulCleanup(setup, root, state)
+        strict = computed
+    }
+    if name == "partial-setup-retention" {
+        let containers = data.field(state, "containers")
+        state = data.with(state, "containers", support.obj([two()], [data.field(containers, two())]))
+        let rightnet = common.setPath(data.field(data.field(state, "networks"), eight()), ["Containers"], support.obj([two()], [support.empty()]))
+        state = data.with(state, "networks", support.obj([eight()], [rightnet]))
+        let stored = try support.store(setup, state)
+        let registry = try adapter.fixtureRegistry(setup.owner.fixtureRoot, path(root, "retained-fixtures"))
+        let temporary = try adapter.registryTemporary(registry, setup.owner.fixtureRoot, "partial-")
+        let payload = Bytes("mock private fixture bytes")
+        let wrote = try common.writeBytes(path(temporary, "server.pk8"), payload)
+        let original = common.failure("RuntimeError", "controlled partial setup failure")
+        let finished = try adapter.registryFinish(registry, [original])
+        let result = try cleanupRun(setup, root, "control", [original])
+        let found = cleanupOutcome(result, "passed")
+        let retained = false
+        for row in registry.retention.rows { if common.findFile(row, "server.pk8").digest == common.digestBytes(payload) { retained = true } }
+        support.check(found, "fixture_retained", retained)
+        support.check(found, "source_fixture_cleaned", !common.exists(temporary))
+        support.check(found, "primary_identity", common.equalText(data.field(data.field(result, "primary_exception"), "message"), original.message))
+        return Ok<support.Outcome, common.Failure>(found)
+    }
+    if name == "unknown-container-id" {
+        let entry = data.with(data.field(data.field(state, "containers"), two()), "Id", support.text(support.repeat("2", 12)))
+        state = common.removePath(state, ["containers", two()])
+        state = common.setPath(state, ["containers", support.repeat("2", 12)], entry)
+    } else if name == "colliding-service" {
+        state = common.setPath(state, ["containers", three(), "Config", "Labels", "com.docker.compose.service"], support.text("server"))
+    } else if name == "wrong-label" {
+        state = common.setPath(state, ["containers", two(), "Config", "Labels", common.OWNER_LABEL], support.text(foreign()))
+    } else if name == "wrong-image" {
+        state = common.setPath(state, ["containers", two(), "Image"], support.text("sha256:" + foreign()))
+    } else if name == "cleanup-command-failure" {
+        state = data.with(state, "fail", support.text("stop"))
+    } else if name == "unexpected-endpoint-exit" {
+        state = common.setPath(state, ["containers", two(), "State"], support.obj(["Running", "ExitCode"], [support.flag(false), support.number(139)]))
+    } else if name == "wrong-network-label" {
+        state = common.setPath(state, ["networks", seven(), "Labels", common.OWNER_LABEL], support.text(foreign()))
+    } else if name == "unowned-network-member" {
+        state = common.setPath(state, ["networks", seven(), "Containers", foreign()], support.empty())
+    }
+    let stored = try support.store(setup, state)
+    if name == "duplicate-container-ids" {
+        setup.daemon.containersHook.add(function(): Result<List<Text>, common.Failure> { return Ok<List<Text>, common.Failure>([support.identifier("2"), support.identifier("2")]) })
+    }
+    let result = try cleanupRun(setup, root, "control", [])
+    let recorded = eventsOf(setup)
+    let rejected = common.member(["unknown-container-id", "colliding-service", "wrong-label", "wrong-image", "duplicate-container-ids", "wrong-network-label", "unowned-network-member"], name)
+    let expected = "passed"
+    if rejected || name == "cleanup-command-failure" || name == "unexpected-endpoint-exit" { expected = "failed" }
+    let found = cleanupOutcome(result, expected)
+    support.check(found, "no_unowned_mutation", !rejected || recorded.length == 0)
+    let exact = true
+    for event in recorded {
+        let identity = data.field(event, "immutable_id")
+        if identity.kind != json.NULL && Bytes(identity.text).length != 64 { exact = false }
+    }
+    support.check(found, "exact_immutable_ids", exact)
+    if name == "successful-cleanup" { support.check(found, "exact_simulator_capabilities", strict) }
+    if name == "cleanup-command-failure" {
+        support.check(found, "failure_is_not_passed", common.equalText(data.field(result, "status"), "failed"))
+        support.check(found, "remove_after_stop_failure", containersOf(setup).length == 0)
+    }
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+function sleeper(context: Context): Result<support.Child, common.Failure> {
+    return support.startChild(["/bin/sleep", "10"], "", "", common.SPAWN_SESSION)
+}
+function processControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let children: List<Integer> = []
+    let outcome = processBody(context, name, root, setup, children)
+    let index = children.length - 1
+    while index >= 0 { support.terminate(children[index]); index -= 1 }
+    return outcome
+}
+function processBody(context: Context, name: Text, root: Text, setup: support.Setup, children: List<Integer>): Result<support.Outcome, common.Failure> {
+    if name.startsWith("controller-") && name != "controller-death" {
+        let state = try support.readState(setup)
+        let count = 3
+        if name == "controller-before-create" { count = 0 }
+        if name == "controller-partial-create" { count = 1 }
+        let stored = try support.store(setup, support.keepContainers(state, count))
+        let marked = try common.atomicJson(path(root, "phase-marker.json"), support.obj(["scope", "phase", "created_objects"],
+            [support.text("simulated controller phase; no official workload"), support.text(name), support.number(count)]))
+    }
+    let controller = try sleeper(context)
+    children.add(controller.pid)
+    let guard = try sleeper(context)
+    children.add(guard.pid)
+    let controllerId = common.processIdentity(controller.pid)
+    let guardId = common.processIdentity(guard.pid)
+    let wroteController = try common.atomicJson(path(root, "controller.json"), common.identityJson(controllerId))
+    let wroteGuard = try common.atomicJson(path(root, "guard.json"), common.identityJson(guardId))
+    if name == "guard-death" || name.startsWith("controller-") {
+        let deadline = common.now() + 4 * common.SECOND
+        let argv = [context.adapter, "--mock-watch", setup.path, "--spec", path(root, "spec.json"), "--controller", path(root, "controller.json"),
+            "--guard", path(root, "guard.json"), "--deadline", Text(deadline), "--output", path(root, "watch")]
+        let watcher = try support.startChild(argv, path(root, "watch.stdout"), path(root, "watch.stderr"), common.SPAWN_SESSION)
+        children.add(watcher.pid)
+        let watcherId = common.processIdentity(watcher.pid)
+        let victim = controller.pid
+        let victimId = controllerId
+        if name == "guard-death" { victim = guard.pid; victimId = guardId }
+        system.sendSignal(victim, 15)
+        support.waitFor(victim, 2000)
+        let status = support.waitFor(watcher.pid, 6000)
+        let separate = common.processGroupOf(system.processId()) != watcherId.pid
+        let stdoutBinding = try common.binding(path(root, "watch.stdout"))
+        let stderrBinding = try common.binding(path(root, "watch.stderr"))
+        let recorded = try common.atomicJson(path(root, "watch-command.json"), support.obj(["argv", "timeout_seconds", "status", "stdout", "stderr", "watchdog_identity", "victim_identity", "separate_session"],
+            [support.texts(argv), support.number(6), support.number(status), common.boundPath(stdoutBinding), common.boundPath(stderrBinding), common.identityJson(watcherId), common.identityJson(victimId), support.flag(separate)]))
+        let result = try common.readJson(path(root, "watch/cleanup/cleanup.json"))
+        let monitor = try common.readJson(path(root, "watch/monitor.json"))
+        let expectedReason = "controller-death"
+        if name == "guard-death" { expectedReason = "guard-death" }
+        let found = cleanupOutcome(result, "passed")
+        support.check(found, "watcher_exit_zero", status == 0)
+        support.check(found, "independent_watch_survived_victim", common.equalText(data.field(monitor, "reason"), expectedReason))
+        support.check(found, "watchdog_separate_session", separate)
+        support.check(found, "all_daemon_objects_removed", containersOf(setup).length == 0 && networksOf(setup).length == 0)
+        return Ok<support.Outcome, common.Failure>(found)
+    }
+    let samples: List<adapter.Sample> = []
+    if name == "resource-abort" { samples.add(adapter.Sample { cpu: 75.0; ram: 0.0 }) }
+    let watched = try adapter.watchOwned(setup.owner, setup.daemon, controllerId, guardId, common.now() + 50 * common.MILLISECOND, path(root, "watch"), 50 * common.MILLISECOND, samples)
+    let monitor = try common.readJson(path(root, "watch/monitor.json"))
+    let found = cleanupOutcome(adapter.cleanupJson(setup.owner, watched), "passed")
+    support.check(found, "exact_reason", common.equalText(data.field(monitor, "reason"), name))
+    let firstSample = data.field(monitor, "samples").items
+    support.check(found, "threshold_not_loosened", name != "resource-abort" || (firstSample.length > 0 && data.field(firstSample[0], "cpu_percent").text == "75.0"))
+    let operations: List<Text> = []
+    for event in eventsOf(setup) { operations.add(common.textOf(data.field(event, "operation"))) }
+    support.check(found, "abort_before_retention", name != "resource-abort" || (operations.length >= 3 && operations[0] == "abort" && operations[1] == "abort" && operations[2] == "abort"))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+function treePrimary(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let tree = path(setup.owner.fixtureRoot, "partial")
+    let made = try common.makeDirectory(tree)
+    let fixture = path(tree, "fixture")
+    let wrote = try common.writeText(fixture, "fixture")
+    let retention = try common.treeRetention(path(root, "retained"), common.MAX_BYTES, common.MAX_FILES)
+    let original = common.failure("RuntimeError", "original read failure")
+    let failed = [false]
+    let target = common.resolvePath(fixture)
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "stream-read" && common.resolvePath(detail) == target { return Err<Boolean, common.Failure>(original) }
+        if point == "json-write" && common.nameOf(detail) == "retention.json" && !failed[0] {
+            failed[0] = true
+            return Err<Boolean, common.Failure>(common.failure("OSError", "secondary finalization failure"))
+        }
+        return ok()
+    })
+    let caught: List<common.Failure> = []
+    match common.capture(retention, tree, "partial") {
+        Ok(row) {}
+        Err(problem) { caught.add(problem) }
+    }
+    common.resetSeams()
+    let status = "failed"
+    if isSame(caught, original) { status = "passed" }
+    let found = support.outcome(status, "passed")
+    support.check(found, "primary_identity", isSame(caught, original))
+    support.check(found, "secondary_note", original.notes.length > 0)
+    let ledger = false
+    for item in retention.problems { if item.stage == "retention-finalization" { ledger = true } }
+    support.check(found, "secondary_ledger", ledger)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function rawStatus(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let argv = ["/bin/sh", "-c", "printf 'controlled unsupported\\n'; printf 'raw stderr\\n' >&2; exit 127"]
+    let settings = process.options(5 * common.SECOND)
+    settings.check = false
+    let output = try process.runBytes(records, argv, settings)
+    let row = rowOf(records)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "exact_nonzero_status", row.status.length > 0 && row.status[0] == 127)
+    support.check(found, "raw_stdout", Text(output) == "controlled unsupported\n")
+    support.check(found, "raw_stderr", Text(common.readOr(row.stderr.path)) == "raw stderr\n")
+    support.check(found, "actual_argv", common.sameTexts(row.argv, argv))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function descendant(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let childArgv = [context.self, "--helper", "descendant", setup.path, two(), root]
+    let controllerArgv = [context.self, "--helper", "controller", root]
+    for value in childArgv { controllerArgv.add(value) }
+    let controller = try support.startChild(controllerArgv, path(root, "controller.stdout"), path(root, "controller.stderr"), common.SPAWN_SESSION)
+    let controllerId = common.processIdentity(controller.pid)
+    let descendantPid = [-1]
+    let outcome = descendantBody(context, root, setup, controller, controllerId, childArgv, controllerArgv, descendantPid)
+    if running(controller.pid) { support.terminate(controller.pid) }
+    if descendantPid[0] > 0 && common.processIdentity(descendantPid[0]).pid >= 0 { system.sendSignal(descendantPid[0], 15) }
+    return outcome
+}
+function running(pid: Integer): Boolean { return support.running(pid) }
+function descendantBody(context: Context, root: Text, setup: support.Setup, controller: support.Child, controllerId: common.Member, childArgv: List<Text>, controllerArgv: List<Text>, descendantPid: List<Integer>): Result<support.Outcome, common.Failure> {
+    support.waitExists(path(root, "descendant-pid.json"), 2000)
+    let pid = support.jsonNumber(path(root, "descendant-pid.json"), "pid")
+    descendantPid[0] = pid
+    let descendantId = common.processIdentity(pid)
+    let controllerStatus = support.waitFor(controller.pid, 2000)
+    let result = try adapter.watchOwned(setup.owner, setup.daemon, controllerId, currentIdentity(), common.now() + 3 * common.SECOND, path(root, "watch"), 20 * common.MILLISECOND, [])
+    let deadline = common.now() + 3 * common.SECOND
+    while common.sameIdentity(common.processIdentity(pid), descendantId) && common.now() < deadline { common.pause(20) }
+    let exitRecord = try common.readJson(path(root, "descendant-exit.json"))
+    let actualParent = try common.readJson(path(root, "actual-parent.json"))
+    let stdoutBinding = try common.binding(path(root, "descendant.stdout"))
+    let stderrBinding = try common.binding(path(root, "descendant.stderr"))
+    let recorded = try common.atomicJson(path(root, "descendant-command.json"), support.obj(["argv", "status", "timeout_seconds", "stdout", "stderr", "controller_argv", "controller_identity", "descendant_identity", "controller_exit_status", "actual_parent"],
+        [support.texts(childArgv), data.field(exitRecord, "status"), support.number(3), common.boundPath(stdoutBinding), common.boundPath(stderrBinding), support.texts(controllerArgv),
+            common.identityJson(controllerId), common.identityJson(descendantId), support.number(controllerStatus), actualParent]))
+    let found = cleanupOutcome(adapter.cleanupJson(setup.owner, result), "passed")
+    support.check(found, "controller_natural_exit", controllerStatus == 0)
+    support.check(found, "actual_descendant_parent", data.equalsInteger(data.field(actualParent, "parent_pid"), controller.pid))
+    support.check(found, "separate_descendant_removed", data.equalsInteger(data.field(exitRecord, "status"), 0) && common.processIdentity(pid).pid < 0)
+    support.check(found, "daemon_ids_removed", containersOf(setup).length == 0)
+    support.check(found, "controller_death_detected", result.reason == "controller-death")
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function unsupportedExit(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    state = common.setPath(state, ["containers", two(), "State"], support.obj(["Running", "ExitCode"], [support.flag(false), support.number(127)]))
+    state = common.setPath(state, ["containers", two(), "Config", "Env"], support.texts(["ROLE=server", "TESTCASE=unknown-safe-control"]))
+    let stored = try support.store(setup, state)
+    let result = try adapter.cleanupOwned(setup.owner, setup.daemon, path(root, "cleanup"), "unsupported-control", [], support.obj(["role", "testcase"], [support.text("server"), support.text("unknown-safe-control")]), false, true)
+    let found = cleanupOutcome(adapter.cleanupJson(setup.owner, result), "passed")
+    let index = -1
+    for position in 0..result.stateIds.length { if result.stateIds[position] == two() { index = position } }
+    support.check(found, "specific_unsupported_mode", index >= 0 && data.equalsInteger(data.field(result.stateValues[index], "ExitCode"), 127))
+    support.check(found, "all_owned_ids_removed", containersOf(setup).length == 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function lateMutation(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let tree = path(setup.owner.fixtureRoot, "mutable")
+    let made = try common.makeDirectory(tree)
+    let a = try common.writeText(path(tree, "a"), "original-a")
+    let b = try common.writeText(path(tree, "b"), "original-b")
+    let retention = try common.treeRetention(path(root, "retained"), common.MAX_BYTES, common.MAX_FILES)
+    let copied: List<Text> = []
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "stream-copied" {
+            if copied.length > 0 { support.quietly(common.writeText(copied[0], "changed-after-first-copy")) } else { copied.add(detail) }
+        }
+        return ok()
+    })
+    let outcome = common.capture(retention, tree, "mutable")
+    common.resetSeams()
+    match outcome {
+        Ok(row) { return Ok<support.Outcome, common.Failure>(support.outcome("passed", "failed")) }
+        Err(problem) {
+            if problem.kind != "OwnershipError" { return Err<support.Outcome, common.Failure>(problem) }
+            let found = support.outcome("failed", "failed")
+            support.detail(found, "reason", support.text(problem.message))
+            return Ok<support.Outcome, common.Failure>(found)
+        }
+    }
+}
+function rawReuse(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let output = try process.runBytes(records, ["/bin/sh", "-c", "echo retained"], process.options(5 * common.SECOND))
+    let prior = try common.readBytes(path(root, "commands/commands.json"))
+    let rejected = false
+    match process.rawCommands(path(root, "commands")) {
+        Ok(again) {}
+        Err(problem) { rejected = problem.kind == "FileExistsError" }
+    }
+    let after = try common.readBytes(path(root, "commands/commands.json"))
+    let found = support.outcome("passed", "passed")
+    support.check(found, "reused_artifact_root_rejected", rejected)
+    support.check(found, "old_bytes_unchanged", Text(after) == Text(prior))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function rawPrimary(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let original = common.failure("RuntimeError", "original process setup failure")
+    let failed = [false]
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "popen" { return Err<Boolean, common.Failure>(original) }
+        if point == "json-write" && common.nameOf(detail) == "commands.json" && records.rows.length > 0 && records.rows[0].primary.length > 0 && !failed[0] {
+            failed[0] = true
+            return Err<Boolean, common.Failure>(common.failure("OSError", "secondary raw finalization failure"))
+        }
+        return ok()
+    })
+    let caught = caughtOutput(process.run(records, ["/bin/sh", "-c", ":"], process.options(5 * common.SECOND)))
+    common.resetSeams()
+    let status = "failed"
+    if isSame(caught, original) { status = "passed" }
+    let found = support.outcome(status, "passed")
+    support.check(found, "primary_identity", isSame(caught, original))
+    support.check(found, "secondary_ledger", records.rows.length > 0 && rowOf(records).problems.length > 0)
+    support.check(found, "secondary_note", original.notes.length > 0)
+    support.check(found, "durable_failure", common.isFile(path(root, "commands/commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function mountSource(state: json.Value, identity: Text, index: Integer): Text {
+    return common.textOf(data.field(data.field(data.field(data.field(state, "containers"), identity), "Mounts").items[index], "Source"))
+}
+function fixtureAccess(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let source = path(mountSource(state, two(), 2), "fixture")
+    common.changeMode(source, 384)
+    let before = common.modeOf(source)
+    if name == "fixture-access-unowned" {
+        state = common.setPath(state, ["containers", three(), "Config", "Labels", common.OWNER_LABEL], support.text(foreign()))
+        let stored = try support.store(setup, state)
+    }
+    let expected = "passed"
+    if name == "fixture-access-unowned" { expected = "failed" }
+    match adapter.prepareFixtureAccess(setup.owner, setup.daemon) {
+        Ok(receipt) {
+            let wrote = try common.atomicJson(path(root, "permission-receipt.json"), receipt)
+            let downloads = mountSource(state, two(), 1)
+            let found = support.outcome("passed", expected)
+            support.check(found, "ephemeral_cert_readable", common.modeOf(source) == 420)
+            support.check(found, "downloads_writable", common.modeOf(downloads) == 511)
+            let prefixed = true
+            for row in data.field(receipt, "permissions").items {
+                let item = common.textOf(data.field(row, "path"))
+                if item != setup.owner.fixtureRoot && !common.within(setup.owner.fixtureRoot, item) { prefixed = false }
+            }
+            support.check(found, "only_fixture_prefix", prefixed)
+            return Ok<support.Outcome, common.Failure>(found)
+        }
+        Err(problem) {
+            if problem.kind != "OwnershipError" { return Err<support.Outcome, common.Failure>(problem) }
+            let found = support.outcome("failed", expected)
+            support.detail(found, "reason", support.text(problem.message))
+            support.check(found, "unowned_rejected_before_permission_change", common.modeOf(source) == before)
+            return Ok<support.Outcome, common.Failure>(found)
+        }
+    }
+}
+function primaryRetention(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let registry = try adapter.fixtureRegistry(setup.owner.fixtureRoot, path(root, "retained"))
+    let original = common.failure("RuntimeError", "original setup failure")
+    let directory = try adapter.registryTemporary(registry, setup.owner.fixtureRoot, "primary-")
+    let wrote = try common.writeText(path(directory, "fixture"), "retained fixture")
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "capture" { return Err<Boolean, common.Failure>(common.failure("OSError", "controlled retention failure")) }
+        return ok()
+    })
+    let caught = [original]
+    match adapter.registryFinish(registry, [original]) {
+        Ok(value) {}
+        Err(problem) { caught = [problem] }
+    }
+    common.resetSeams()
+    support.quietly(common.removeTree(directory))
+    let status = "failed"
+    if isSame(caught, original) { status = "passed" }
+    let found = support.outcome(status, "passed")
+    support.check(found, "primary_identity", isSame(caught, original))
+    support.check(found, "secondary_retained", registry.problems.length > 0)
+    support.check(found, "secondary_note", original.notes.length > 0)
+    let recorded = try common.atomicJson(path(root, "primary-result.json"), support.outcomeJson(found))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function retentionBounds(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let tree = path(setup.owner.fixtureRoot, "large")
+    let made = try common.makeDirectory(tree)
+    let wrote = try common.writeText(path(tree, "a"), "1234")
+    let retention = try common.treeRetention(path(root, "retained"), 3, common.MAX_FILES)
+    match common.capture(retention, tree, "bound") {
+        Ok(row) {
+            let found = support.outcome("failed", "passed")
+            support.check(found, "bound_fails_coverage", false)
+            return Ok<support.Outcome, common.Failure>(found)
+        }
+        Err(problem) {
+            if problem.kind != "OwnershipError" { return Err<support.Outcome, common.Failure>(problem) }
+            let found = support.outcome("passed", "passed")
+            support.check(found, "bound_fails_coverage", problem.message == "retention bound exceeded")
+            support.check(found, "failed_inventory_retained", retention.rows.length > 0 && retention.rows[0].status == "failed")
+            return Ok<support.Outcome, common.Failure>(found)
+        }
+    }
+}
+
+function splitLines(source: Text): List<Text> {
+    let result: List<Text> = []
+    for line in source.split("\n") { result.add(line) }
+    return result
+}
+function indentOf(line: Text): Integer {
+    let depth = 0
+    while depth < line.length && line.slice(depth, depth + 1) == " " { depth += 1 }
+    return depth
+}
+function tryExtent(lines: List<Text>, start: Integer, last: Integer): Integer {
+    let indent = indentOf(lines[start])
+    let end = start
+    for index in (start + 1)..(last + 1) {
+        let line = lines[index]
+        if line.trim() == "" { continue }
+        let depth = indentOf(line)
+        if depth < indent { break }
+        if depth == indent {
+            let body = line.trim()
+            if !(body.startsWith("except") || body.startsWith("else:") || body.startsWith("finally:")) { break }
+        }
+        end = index
+    }
+    return end
+}
+function timedRunChecks(source: Text): List<Boolean> {
+    let lines = splitLines(source)
+    let span = derive.lineSpan(lines, "    def _run_test(")
+    if span.length != 2 { return [false, false] }
+    let prepared = -1
+    let timed: List<Integer> = []
+    let ends: List<Integer> = []
+    for index in span[0]..(span[1] + 1) {
+        if lines[index] == "        prepare_runner_phase()" && prepared < 0 { prepared = index }
+        if lines[index] == "        try:" {
+            let end = tryExtent(lines, index, span[1])
+            let body = joinText(lines.slice(index, end + 1))
+            if common.contains(body, "subprocess.run(") { timed.add(index); ends.add(end) }
+        }
+    }
+    let before = prepared >= 0 && timed.length == 1 && prepared < timed[0]
+    let unchanged = timed.length == 1
+    if timed.length == 1 {
+        let body = joinText(lines.slice(timed[0], ends[0] + 1))
+        let rest = body
+        let seen = 0
+        while true {
+            let found = rest.find("timeout=")
+            if found < 0 { break }
+            seen += 1
+            let after = rest.slice(found + 8, rest.length)
+            if !after.startsWith("test.timeout()") { unchanged = false }
+            rest = after
+        }
+        if seen == 0 { unchanged = false }
+    }
+    return [before, unchanged]
+}
+function hookScript(): Text {
+    return joinText([
+        "import json, os, sys\n", "sys.path.insert(0, sys.argv[1])\n", "import owned_hooks as m\n", "result = {}\n",
+        "d = m.temporary_directory(dir=sys.argv[2], prefix='hook-')\n", "open(os.path.join(d.name, 'fixture'), 'w').write('hook fixture')\n",
+        "result['created'] = d.name\n", "d.cleanup()\n", "result['cleaned'] = not os.path.exists(d.name)\n",
+        "try:\n    m.retained_cleanup_dir(os.path.join(sys.argv[2], 'unregistered'))\nexcept RuntimeError as error:\n    result['unregistered'] = str(error)\n",
+        "try:\n    m.copy_runner_logs('server', sys.argv[2])\nexcept RuntimeError as error:\n    result['held'] = str(error)\n",
+        "try:\n    m.prepare_runner_phase()\nexcept RuntimeError as error:\n    result['phase'] = str(error)\n",
+        "result['finished'] = m.author_execute(lambda: 7)\n", "print(json.dumps(result))\n"
+    ])
+}
+function criteriaControl(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let derivedRoot = path(root, "derived")
+    let value = data.with(data.with(setup.value, "runner_root", support.text(derivedRoot)), "compose_path", support.text(path(derivedRoot, "docker-compose.yml")))
+    let owner = try adapter.ownerSpec(value)
+    let report = try derive.deriveRunner(context.pinned, derivedRoot, owner, ["minyar", "quiche"], [support.image(), support.peer()], context.adapter)
+    let good = try adapter.composeUpArgv(owner, ["compose", "--env-file", "empty.env", "up", "--abort-on-container-exit", "--timeout", "10", "sim", "client", "server"])
+    let rejected = 0
+    for command in [["pull", "anything"], ["compose", "--env-file", "empty.env", "up", "--pull", "always", "server"], ["compose", "--env-file", "empty.env", "up", "iperf_client"],
+        ["compose", "--env-file", "empty.env", "up", "--build", "server"]] {
+        match adapter.composeUpArgv(owner, command) {
+            Ok(argv) {}
+            Err(problem) { if problem.kind == "OwnershipError" { rejected += 1 } }
+        }
+    }
+    let config = try common.readJson(path(derivedRoot, "owned-runner.json"))
+    let wrapper = path(derivedRoot, "owned-bin/docker")
+    let wrapperArgv = [wrapper, "compose", "--env-file", "empty.env", "up", "server"]
+    let wrapped = try support.capture(wrapperArgv, root, "wrapper", 5000)
+    let stdoutBinding = try common.binding(path(root, "wrapper.stdout"))
+    let stderrBinding = try common.binding(path(root, "wrapper.stderr"))
+    let recorded = try common.atomicJson(path(root, "wrapper-command.json"), support.obj(["argv", "status", "timeout_seconds", "stdout", "stderr"],
+        [support.texts(wrapperArgv), support.number(wrapped.status), support.number(5), common.boundPath(stdoutBinding), common.boundPath(stderrBinding)]))
+    let interop = try common.readBytes(path(derivedRoot, "interop.py"))
+    let timedChecks = timedRunChecks(Text(interop))
+    let phaseRoot = path(root, "phase-control")
+    let madePhase = try common.makeDirectory(phaseRoot)
+    let phase = try support.setup(phaseRoot)
+    let cleaned = false
+    match adapter.prepareRunnerPhase(phase.owner, phase.daemon) {
+        Ok(done) { cleaned = containersOf(phase).length == 0 && networksOf(phase).length == 0 && common.isFile(path(phase.owner.artifacts, "between-up-0/cleanup.json")) }
+        Err(problem) { cleaned = false }
+    }
+    let python = adapter.which("python3")
+    let hooks = try support.capture([python, "-I", "-c", hookScript(), derivedRoot, owner.fixtureRoot], root, "hooks", 30000)
+    let hookResult = data.decode(hooks.output)
+    let created = common.textOf(data.field(hookResult, "created"))
+    let retainedRow = false
+    match common.readJson(path(owner.artifacts, "fixtures/retention.json")) {
+        Ok(retention) {
+            for row in data.field(retention, "trees").items {
+                if common.equalText(data.field(row, "original"), common.resolvePath(created)) && common.equalText(data.field(row, "status"), "retained") { retainedRow = true }
+            }
+        }
+        Err(problem) {}
+    }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "official_criteria_unchanged", common.isTrue(data.field(report, "official_criteria_unchanged")))
+    let pinnedDigests = common.PINNED_DIGESTS
+    support.check(found, "pinned_original_hash", common.equalText(data.field(data.field(data.field(report, "original_files"), "testcases_quic.py"), "sha256"), pinnedDigests[3]))
+    support.check(found, "previous_phase_prepared_before_timeout", timedChecks[0])
+    support.check(found, "original_test_timeout_unchanged", timedChecks[1])
+    support.check(found, "previous_owned_objects_retained_and_removed", cleaned)
+    let neverPull = false
+    let exactProject = false
+    for index in 0..(good.length - 1) {
+        if good[index] == "--pull" && good[index + 1] == "never" { neverPull = true }
+        if good[index] == "--project-name" && good[index + 1] == owner.project { exactProject = true }
+    }
+    support.check(found, "explicit_never_pull", neverPull)
+    support.check(found, "exact_project", exactProject)
+    support.check(found, "all_unreviewed_commands_rejected", rejected == 4)
+    support.check(found, "execution_stays_held", common.isFalse(data.field(config, "execution_authorized")) && wrapped.status != 0 &&
+        common.contains(Text(wrapped.error), "official Docker execution remains held"))
+    support.check(found, "hooks_create_owned_fixture", created != "" && common.within(owner.fixtureRoot, created))
+    support.check(found, "hooks_cleanup_retains_then_removes", common.isTrue(data.field(hookResult, "cleaned")) && retainedRow)
+    support.check(found, "hooks_refuse_unregistered_cleanup", common.contains(common.textOf(data.field(hookResult, "unregistered")), "cleanup of unregistered fixture refused"))
+    support.check(found, "hooks_keep_execution_held", common.contains(common.textOf(data.field(hookResult, "held")), "official Docker execution remains held") &&
+        common.contains(common.textOf(data.field(hookResult, "phase")), "official Docker execution remains held"))
+    support.check(found, "hooks_author_finish_registry", data.equalsInteger(data.field(hookResult, "finished"), 7) && common.isFile(path(owner.artifacts, "fixtures/registry.json")))
+    support.detail(found, "hooks", support.obj(["status", "stdout", "stderr"], [support.number(hooks.status), support.text(Text(hooks.output)), support.text(Text(hooks.error))]))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+record MockCompose { template: json.Value }
+function startupControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let template = try support.readState(setup)
+    let containers = data.field(template, "containers")
+    for entry in containers.items {
+        for mount in data.field(entry, "Mounts").items {
+            let source = common.textOf(data.field(mount, "Source"))
+            common.changeMode(source, 448)
+            common.changeMode(path(source, "fixture"), 384)
+        }
+    }
+    let ids = containers.keys
+    for identity in ids { template = common.setPath(template, ["containers", identity, "State"], support.obj(["Running", "ExitCode"], [support.flag(false), support.number(0)])) }
+    let cleared = try support.store(setup, support.obj(["containers", "networks", "events"], [support.empty(), support.empty(), data.array([])]))
+    let recorded: List<Text> = []
+    let rows = process.memoryCommands()
+    let holder = MockCompose { template: template }
+    setup.daemon.commands = rows
+    let statePath = setup.path
+    let roleNames = common.ROLES
+    setup.daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+        let operation = ""
+        for token in args { if operation == "" && (token == "up" || token == "create" || token == "start") { operation = token } }
+        if operation == "up" && common.member(args, "--no-start") { operation = "create" }
+        recorded.add(operation)
+        let current = try common.readJson(statePath)
+        if operation == "create" {
+            let selected: List<Text> = []
+            for token in args { if common.member(roleNames, token) { selected.add(token) } }
+            let all = data.field(holder.template, "containers")
+            let keys: List<Text> = []
+            let values: List<json.Value> = []
+            for index in 0..all.keys.length {
+                let service = common.textOf(data.field(data.field(data.field(all.items[index], "Config"), "Labels"), "com.docker.compose.service"))
+                if common.member(selected, service) { keys.add(all.keys[index]); values = values.appended(all.items[index]) }
+            }
+            let created = data.with(holder.template, "containers", support.obj(keys, values))
+            let networks = data.field(created, "networks")
+            let networkValues: List<json.Value> = []
+            for network in networks.items {
+                let members = data.field(network, "Containers")
+                let kept: List<Text> = []
+                let keptValues: List<json.Value> = []
+                for index in 0..members.keys.length { if common.member(keys, members.keys[index]) { kept.add(members.keys[index]); keptValues = keptValues.appended(members.items[index]) } }
+                networkValues = networkValues.appended(data.with(network, "Containers", support.obj(kept, keptValues)))
+            }
+            let wrote = try common.atomicJson(statePath, data.with(created, "networks", support.obj(networks.keys, networkValues)))
+        } else if operation == "up" && data.field(current, "containers").keys.length == 0 {
+            let wrote = try common.atomicJson(statePath, holder.template)
+        }
+        if operation == "up" || operation == "start" {
+            let latest = try common.readJson(statePath)
+            let readable = true
+            for entry in data.field(latest, "containers").items {
+                for mount in data.field(entry, "Mounts").items {
+                    let source = common.textOf(data.field(mount, "Source"))
+                    let downloads = common.equalText(data.field(mount, "Destination"), "/downloads")
+                    let directoryMode = 493
+                    let fileMode = 420
+                    if downloads { directoryMode = 511; fileMode = 438 }
+                    if common.modeOf(source) != directoryMode || common.modeOf(path(source, "fixture")) != fileMode { readable = false }
+                }
+            }
+            if readable { recorded.add("permissions-ready") } else { recorded.add("permissions-private") }
+        }
+        let stderrPath = path(root, "command-" + Text(recorded.length) + ".stderr")
+        let wrote = try common.writeText(stderrPath, "")
+        let row = process.newRow(args, settings.timeout)
+        row.status.add(0)
+        let bound = try common.binding(stderrPath)
+        row.stderr = bound
+        rows.rows.add(row)
+        return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: "" })
+    })
+    let argv = ["compose", "--env-file", "empty.env", "up"]
+    if name == "startup-server-compliance" { for token in ["-V", "server"] { argv.add(token) } }
+    else if name == "startup-client-compliance" { for token in ["-V", "sim", "client"] { argv.add(token) } }
+    else { for token in ["--abort-on-container-exit", "--timeout", "10", "sim", "client", "server"] { argv.add(token) } }
+    let status = try adapter.dockerEntry(setup.owner, setup.daemon, argv, ["SERVER=" + support.image(), "CLIENT=" + support.image()])
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "events", support.texts(recorded))
+    support.check(found, "entry_status", status == 0)
+    let startedLater = common.member(recorded, "start") || common.member(recorded.slice(1, recorded.length), "up")
+    support.check(found, "created_before_started", recorded.length > 0 && recorded[0] == "create" && startedLater)
+    support.check(found, "verified_permissions_before_start", common.member(recorded, "permissions-ready") && !common.member(recorded, "permissions-private"))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function watchFault(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let original = common.failure("RuntimeError", "controlled primary " + name)
+    let current = currentIdentity()
+    if name == "watch-cleanup-retains-tree" {
+        let state = try support.readState(setup)
+        let stored = try support.store(setup, data.with(state, "fail", support.text("remove")))
+    }
+    let once = [false]
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if name == "watch-sample-failure" && point == "sample" { return Err<Boolean, common.Failure>(original) }
+        if name == "watch-identity-failure" && point == "identity" { return Err<Boolean, common.Failure>(original) }
+        if name == "watch-monitor-failure" && point == "json-write" && common.nameOf(detail) == "monitor.json" && !once[0] {
+            once[0] = true
+            return Err<Boolean, common.Failure>(original)
+        }
+        return ok()
+    })
+    let caught = caughtCleanup(adapter.watchOwned(setup.owner, setup.daemon, current, current, common.now() - 10 * common.MILLISECOND, path(root, "watch"), 500 * common.MILLISECOND, []))
+    common.resetSeams()
+    let found = support.outcome("passed", "passed")
+    if caught.length > 0 { support.detail(found, "caught", support.text(caught[0].message)) } else { support.detail(found, "caught", support.none()) }
+    support.check(found, "failure_not_pass", caught.length > 0)
+    support.check(found, "primary_preserved", name == "watch-cleanup-retains-tree" || isSame(caught, original))
+    support.check(found, "tree_retained_despite_failure", common.isFile(path(root, "watch/retained-trees/retention.json")))
+    support.check(found, "durable_final_inventory", common.isFile(path(root, "watch/watch-final.json")))
+    support.check(found, "cleanup_attempted", eventsOf(setup).length > 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function registryPrimary(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let config = path(root, "owned-runner.json")
+    let hooks = try common.writeText(path(root, "owned_hooks.py"), derive.hookSource(context.adapter, config))
+    let script = joinText([
+        "import json, sys\n", "sys.path.insert(0, sys.argv[1])\n", "import owned_hooks as m\n",
+        "original = RuntimeError('controlled main primary')\n", "def main():\n    raise original\n",
+        "try:\n    m.author_execute(main)\nexcept BaseException as caught:\n",
+        "    print(json.dumps({'identity': caught is original, 'notes': list(getattr(original, '__notes__', []))}))\n",
+        "else:\n    print(json.dumps({'identity': False, 'notes': []}))\n"
+    ])
+    let python = adapter.which("python3")
+    let ran = try support.capture([python, "-I", "-c", script, root], root, "author", 30000)
+    let result = data.decode(ran.output)
+    let ledgerPath = path(root, "author-finalization-failure.json")
+    let ledger = data.none()
+    match common.readJson(ledgerPath) {
+        Ok(value) { ledger = value }
+        Err(problem) {}
+    }
+    let secondary = common.textOf(data.field(data.field(ledger, "secondary"), "message"))
+    let noted = false
+    for item in common.textList(data.field(result, "notes")) {
+        if item.startsWith("registry cleanup: ") && secondary != "" && common.contains(item, secondary) { noted = true }
+    }
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "hook", support.obj(["status", "stdout", "stderr"], [support.number(ran.status), support.text(Text(ran.output)), support.text(Text(ran.error))]))
+    support.check(found, "primary_identity", common.isTrue(data.field(result, "identity")))
+    support.check(found, "secondary_note", noted)
+    support.check(found, "durable_primary_secondary", common.isFile(ledgerPath) && common.equalText(data.field(data.field(ledger, "primary"), "message"), "controlled main primary"))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function reinspect(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let counts = [0]
+    let statePath = setup.path
+    let target = one()
+    setup.daemon.inspectHook.add(function(identity: Text): Result<json.Value, common.Failure> {
+        if identity == target {
+            counts[0] += 1
+            if counts[0] == 4 { return Err<json.Value, common.Failure>(common.failure("OSError", "controlled late reinspect failure")) }
+        }
+        return adapter.jsonInspect(statePath, identity)
+    })
+    let primary = common.failure("RuntimeError", "main remains primary")
+    let escaped = false
+    let ledger = support.none()
+    match adapter.cleanupOwned(setup.owner, setup.daemon, path(root, "cleanup"), "late-inspect", [primary], support.obj(["role", "testcase"], [support.text("server"), support.text("unknown-control")]), false, true) {
+        Ok(result) { ledger = adapter.cleanupJson(setup.owner, result) }
+        Err(problem) { escaped = true }
+    }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "durable_cleanup", common.isFile(path(root, "cleanup/cleanup.json")))
+    support.check(found, "nonpass_secondary", common.equalText(data.field(ledger, "status"), "failed"))
+    support.check(found, "cleanup_continued", containersOf(setup).length == 0)
+    support.check(found, "primary_not_replaced", !escaped)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function networkControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let project = setup.owner.project
+    if name == "foreign-network-mode" { state = common.setPath(state, ["containers", two(), "HostConfig", "NetworkMode"], support.text("foreign_bridge")) }
+    else if name == "host-pid-mode" { state = common.setPath(state, ["containers", two(), "HostConfig", "PidMode"], support.text("host")) }
+    else if name == "host-ipc-mode" { state = common.setPath(state, ["containers", two(), "HostConfig", "IpcMode"], support.text("host")) }
+    else {
+        let networkKeys = [project + "_rightnet"]
+        let networkValues = [support.obj(["NetworkID"], [support.text(eight())])]
+        if name == "extra-network-membership" { networkKeys.add("foreign"); networkValues = networkValues.appended(support.obj(["NetworkID"], [support.text(foreign())])) }
+        else { networkValues = [support.obj(["NetworkID"], [support.text(foreign())])] }
+        state = common.setPath(state, ["containers", two(), "NetworkSettings", "Networks"], support.obj(networkKeys, networkValues))
+    }
+    let stored = try support.store(setup, state)
+    let result = try cleanupRun(setup, root, "control", [])
+    let found = support.outcome("passed", "passed")
+    support.check(found, "foreign_network_rejected", common.equalText(data.field(result, "status"), "failed"))
+    support.check(found, "no_foreign_mutation", eventsOf(setup).length == 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function cliDescendant(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let marker = path(root, "delayed-create.json")
+    let pidfile = path(root, "descendant.json")
+    let parentFile = path(root, "parent.json")
+    let permit = path(root, "create-permit")
+    let escaped = "0"
+    if name == "raw-cli-escaped-descendant" { escaped = "1" }
+    let argv = [context.self, "--helper", "cli", pidfile, "120", context.self, "--helper", "plugin", marker, parentFile, permit, escaped]
+    let descendantPid = [-1]
+    let outcome = cliDescendantBody(context, records, argv, marker, pidfile, parentFile, permit, descendantPid)
+    if descendantPid[0] > 0 && common.processIdentity(descendantPid[0]).pid >= 0 { system.sendSignal(descendantPid[0], 15) }
+    return outcome
+}
+function cliDescendantBody(context: Context, records: process.Commands, argv: List<Text>, marker: Text, pidfile: Text, parentFile: Text, permit: Text, descendantPid: List<Integer>): Result<support.Outcome, common.Failure> {
+    let raw = try process.runBytes(records, argv, process.options(3 * common.SECOND))
+    let touched = try common.touch(permit)
+    let pid = support.jsonNumber(pidfile, "pid")
+    descendantPid[0] = pid
+    let descendant = common.processIdentity(pid)
+    common.pause(550)
+    let actual = try common.readJson(parentFile)
+    let row = rowOf(records)
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "argv", support.texts(argv))
+    support.detail(found, "actual_parent", actual)
+    support.check(found, "real_root_exited_descendant", data.equalsInteger(data.field(actual, "parent_pid"), row.identity.pid))
+    support.check(found, "descendant_drained_before_return", descendant.pid < 0)
+    support.check(found, "delayed_create_prevented", !common.exists(marker))
+    support.check(found, "lifetime_certified", row.lifetime.certified)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function boundedRetention(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let tree = path(root, "bounded-source")
+    let made = try common.makeDirectory(tree)
+    let file = path(tree, "a")
+    let wrote = try common.writeText(file, "abcd")
+    let maximum = 20
+    if name == "retention-stream-bound" { maximum = 3 }
+    let retention = try common.treeRetention(path(root, "retained"), maximum, 2)
+    let attempts: List<Text> = []
+    let yielded = [0]
+    let clock = [0]
+    let resolvedFile = common.resolvePath(file)
+    let resolvedTree = common.resolvePath(tree)
+    if name == "retention-stream-bound" {
+        setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+            if point == "stream-chunk" && common.resolvePath(detail) == resolvedFile { attempts.add("read") }
+            return ok()
+        })
+    } else if name == "retention-lazy-file-bound" {
+        for index in 0..6 { let extra = try common.writeText(path(tree, Text(index)), "x") }
+        setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+            if point == "enumerate" && common.resolvePath(detail) == resolvedTree {
+                yielded[0] += 1
+                if yielded[0] > 3 { return Err<Boolean, common.Failure>(common.failure("RuntimeError", "enumerated past the admission bound")) }
+            }
+            return ok()
+        })
+    } else {
+        setClock(function(): Integer {
+            clock[0] += 1
+            if clock[0] <= 2 { return 0 }
+            return 31 * common.SECOND
+        })
+    }
+    let caught = caughtRow(common.capture(retention, tree, "bounded"))
+    common.resetSeams()
+    let found = support.outcome("passed", "passed")
+    support.check(found, "bound_rejected_before_unbounded_read", isKind(caught, "OwnershipError"))
+    support.check(found, "whole_read_not_attempted", attempts.length == 0)
+    support.check(found, "enumeration_bounded", yielded[0] <= 3)
+    support.check(found, "failed_manifest", retention.rows.length > 0 && retention.rows[0].status == "failed")
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function shellDaemon(setup: support.Setup): adapter.Daemon {
+    let daemon = adapter.dockerShell(setup.owner)
+    let statePath = setup.path
+    daemon.inspectHook.add(function(identity: Text): Result<json.Value, common.Failure> { return adapter.jsonInspect(statePath, identity) })
+    return daemon
+}
+function copyBound(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let daemon = shellDaemon(setup)
+    let commands: List<Text> = []
+    let archive = path(root, "archive.tar")
+    daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+        commands.add(args[0])
+        if args[0] == "cp" {
+            let wrote = try common.writeBytes(archive, support.tarHeader("oversize", 536870913, 48))
+            return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: archive })
+        }
+        return Ok<process.Output, common.Failure>(process.Output { payload: Bytes("mock log"); path: "" })
+    })
+    let rejected = false
+    match adapter.retainOf(daemon, two(), path(root, "copy")) {
+        Ok(value) {}
+        Err(problem) { rejected = problem.kind == "OwnershipError" }
+    }
+    let copies = 0
+    for command in commands { if command == "cp" { copies += 1 } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "oversize_copy_rejected", rejected)
+    support.check(found, "copy_bound_precedes_second_copy", copies <= 1)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function intendedContainers(setup: support.Setup): json.Value {
+    let items: List<json.Value> = []
+    let roles = common.ROLES
+    for role in roles {
+        let roleImage = support.image()
+        if role == "sim" { roleImage = support.simulator() }
+        items = items.appended(support.obj(["name", "role", "image", "labels"], [support.text(setup.owner.project + "-" + role), support.text(role), support.text(roleImage), adapter.labels(setup.owner, role)]))
+    }
+    return data.array(items)
+}
+function admissionControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let count = 3
+    if name == "admission-kill-before-create" || name == "admission-quiet-inflight" || name == "admission-foreign-intent" { count = 0 }
+    if name == "admission-kill-partial-create" { count = 1 }
+    let stored = try support.store(setup, support.keepContainers(state, count))
+    let closed = name == "admission-kill-after-criterion"
+    let nonce = setup.owner.nonce
+    if name == "admission-foreign-intent" { nonce = foreign() }
+    let phase = "creating"
+    if closed { phase = "closed" }
+    let intent = support.obj(["schema_version", "project", "nonce", "state", "certified", "intended_containers", "scope"],
+        [support.number(1), support.text(setup.owner.project), support.text(nonce), support.text(phase), support.flag(closed), intendedContainers(setup), support.text("mock phase only")])
+    let wrote = try common.atomicJson(path(setup.owner.artifacts, "create-admission.json"), intent)
+    let result = try cleanupRun(setup, root, "control", [])
+    let expected = "failed"
+    if closed { expected = "passed" }
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "cleanup", result)
+    support.check(found, "exact_nonpass_unless_closed", common.equalText(data.field(result, "status"), expected))
+    support.check(found, "daemon_final_inventory_retained", common.hasKey(result, "remaining_ids") && data.field(result, "remaining_ids").items.length == 0)
+    let uncertain = closed
+    for item in data.field(result, "errors").items { if common.equalText(data.field(item, "stage"), "create-admission") { uncertain = true } }
+    support.check(found, "creation_uncertainty_retained", uncertain)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function rawStream(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let settings = process.options(3 * common.SECOND)
+    settings.maxBytes = 32
+    let caught = caughtOutput(process.run(records, [context.self, "--helper", "bytes", "4096"], settings))
+    let row = rowOf(records)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "stream_bound_failed", isKind(caught, "OwnershipError"))
+    support.check(found, "retained_stream_bounded", row.stdout.bytes >= 0 && row.stdout.bytes <= 32)
+    support.check(found, "process_lifetime_nonpass", !row.lifetime.certified)
+    support.check(found, "raw_failure_ledger", common.isFile(path(root, "commands/commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function archiveControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let daemon = shellDaemon(setup)
+    let member = "log.txt"
+    if name == "copy-unsafe-archive" { member = "../foreign" }
+    let raw = path(root, "archive.tar")
+    let wrote = try common.writeBytes(raw, support.tarArchive([member], [Bytes("log")]))
+    daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+        return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: raw })
+    })
+    let rejected = false
+    match adapter.copyBounded(daemon, two(), "/logs/.", path(root, "copy")) {
+        Ok(value) {}
+        Err(problem) { rejected = problem.kind == "OwnershipError" }
+    }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "archive_expected_result", rejected == (name == "copy-unsafe-archive"))
+    support.check(found, "no_foreign_write", !common.exists(path(root, "foreign")))
+    support.check(found, "positive_exact_bytes", name != "copy-safe-archive" || Text(common.readOr(path(root, "copy/log.txt"))) == "log")
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function partialCli(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let original = common.failure("RuntimeError", "controlled second pipe registration failure")
+    let prior = subreaperValue()
+    let registered = [0]
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "register" {
+            registered[0] += 1
+            if registered[0] == 2 { return Err<Boolean, common.Failure>(original) }
+        }
+        return ok()
+    })
+    let caught = caughtOutput(process.run(records, ["/bin/sleep", "10"], process.options(3 * common.SECOND)))
+    common.resetSeams()
+    let row = rowOf(records)
+    let receipts = row.lifetime.receipts
+    let exact = receipts.length > 0
+    for receipt in receipts { if receipt.identity.startTicks < 0 { exact = false } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "primary_identity", isSame(caught, original))
+    support.check(found, "owned_root_gone", row.identity.pid >= 0 && common.processIdentity(row.identity.pid).pid < 0)
+    support.check(found, "no_adopted_descendants", process.directChildren().length == 0)
+    support.check(found, "subreaper_restored", subreaperValue() == prior)
+    support.check(found, "exact_cleanup_receipts", exact)
+    support.check(found, "failure_ledger_retained", row.primary.length > 0 && row.primary[0].message == original.message && common.isFile(path(root, "commands/commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function timeoutCli(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let marker = path(root, "delayed-create.json")
+    let parent = path(root, "actual-parent.json")
+    let argv = [context.self, "--helper", "cli", "-", "10000", context.self, "--helper", "escaped", marker, parent]
+    let prior = subreaperValue()
+    let caught = caughtOutput(process.run(records, argv, process.options(2 * common.SECOND)))
+    let row = rowOf(records)
+    let actual = try common.readJson(parent)
+    let escapedPid = common.integerOf(data.field(actual, "pid"))
+    let bound = false
+    for receipt in row.lifetime.receipts {
+        if receipt.identity.pid == escapedPid && receipt.identity.startTicks >= 0 {
+            for member in row.lifetime.members {
+                if member.pid == escapedPid && member.session == escapedPid && member.startTicks == receipt.identity.startTicks { bound = true }
+            }
+        }
+    }
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "actual_parent", actual)
+    support.check(found, "actual_timeout", isKind(caught, "TimeoutExpired") && row.timedOut)
+    support.check(found, "actual_descendant", data.equalsInteger(data.field(actual, "parent_pid"), row.identity.pid))
+    support.check(found, "both_root_and_escaped_descendant_gone", common.processIdentity(escapedPid).pid < 0 && common.processIdentity(row.identity.pid).pid < 0)
+    support.check(found, "escaped_birthday_bound", bound)
+    support.check(found, "no_delayed_create", !common.exists(marker))
+    support.check(found, "interrupted_lifetime_nonpass", !row.lifetime.certified)
+    support.check(found, "subreaper_restored", subreaperValue() == prior)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function foreignCli(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let foreignChild = try sleeper(context)
+    let birthday = common.processIdentity(foreignChild.pid)
+    let prior = subreaperValue()
+    let outcome = foreignBody(context, root, foreignChild, birthday, prior)
+    support.terminate(foreignChild.pid)
+    return outcome
+}
+function foreignBody(context: Context, root: Text, foreignChild: support.Child, birthday: common.Member, prior: Integer): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let caught = caughtOutput(process.run(records, ["/bin/sh", "-c", ":"], process.options(2 * common.SECOND)))
+    let found = support.outcome("passed", "passed")
+    support.check(found, "foreign_boundary_rejected", isKind(caught, "OwnershipError"))
+    support.check(found, "foreign_process_untouched", support.running(foreignChild.pid) && common.sameIdentity(common.processIdentity(foreignChild.pid), birthday))
+    support.check(found, "no_arbitrary_signal", rowOf(records).lifetime.receipts.length == 0)
+    support.check(found, "subreaper_unchanged", subreaperValue() == prior)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function watchSecondary(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let stored = try support.store(setup, data.with(state, "fail", support.text("stop")))
+    let original = common.failure("RuntimeError", "original monitor failure")
+    let current = currentIdentity()
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "sample" { return Err<Boolean, common.Failure>(original) }
+        return ok()
+    })
+    let caught = caughtCleanup(adapter.watchOwned(setup.owner, setup.daemon, current, current, common.now() + common.SECOND, path(root, "watch"), 500 * common.MILLISECOND, []))
+    common.resetSeams()
+    let final = try common.readJson(path(root, "watch/watch-final.json"))
+    let stopLedger = false
+    for item in data.field(data.field(final, "cleanup"), "errors").items { if common.equalText(data.field(item, "stage"), "stop") { stopLedger = true } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "main_primary_identity", isSame(caught, original))
+    support.check(found, "secondary_cleanup_ledger", stopLedger)
+    support.check(found, "secondary_note", common.hasNote(original, "controlled mock stop failure"))
+    support.check(found, "nonpass_preserved", common.equalText(data.field(final, "status"), "failed"))
+    support.check(found, "tree_retained", common.isFile(path(root, "watch/retained-trees/retention.json")))
+    support.check(found, "final_ids_empty", data.field(final, "remaining_ids").kind == json.ARRAY && data.field(final, "remaining_ids").items.length == 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function restoration(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let prior = subreaperValue()
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "prctl-restore" { return Err<Boolean, common.Failure>(common.failure("OSError", "prctl reported failure after restoring")) }
+        return ok()
+    })
+    let caught = caughtOutput(process.run(records, ["/bin/sh", "-c", "echo harmless"], process.options(3 * common.SECOND)))
+    common.resetSeams()
+    let ledger = false
+    for item in rowOf(records).problems { if common.contains(item.message, "restoration") { ledger = true } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "restoration_failure_nonpass", isKind(caught, "CleanupError"))
+    support.check(found, "failure_raw_ledger", ledger)
+    support.check(found, "actual_control_restores_flag", subreaperValue() == prior)
+    support.check(found, "owned_lifetime_closed", process.directChildren().length == 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function manifestDeadline(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let tree = path(root, "tree")
+    let made = try common.makeDirectory(tree)
+    let wrote = try common.writeText(path(tree, "a"), "retained")
+    let retention = try common.treeRetention(path(root, "retained"), common.MAX_BYTES, common.MAX_FILES)
+    let clock = [0]
+    setClock(function(): Integer { return clock[0] })
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "json-write" && common.nameOf(detail) == "retention.json" { clock[0] = 31 * common.SECOND }
+        return ok()
+    })
+    let caught = caughtRow(common.capture(retention, tree, "late-finalization"))
+    common.resetSeams()
+    let retained = try common.readJson(path(retention.root, "retention.json"))
+    let found = support.outcome("passed", "passed")
+    support.check(found, "whole_operation_deadline_nonpass", isKind(caught, "OwnershipError"))
+    let trees = data.field(retained, "trees").items
+    support.check(found, "late_manifest_not_retained_success", trees.length > 0 && common.equalText(data.field(trees[0], "status"), "failed"))
+    support.check(found, "raw_bound_failure_retained", data.field(retained, "errors").items.length > 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function copyLayout(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let daemon = shellDaemon(setup)
+    let statePath = setup.path
+    daemon.containersHook.add(function(): Result<List<Text>, common.Failure> { return adapter.jsonContainers(statePath) })
+    let raw = path(root, "archive.tar")
+    let wrote = try common.writeBytes(raw, support.tarArchive(["keys.log"], [Bytes("log")]))
+    daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+        return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: raw })
+    })
+    let destination = path(setup.owner.fixtureRoot, "official-logdir")
+    let made = try common.makeDirectory(destination)
+    let copied = try adapter.copyRunnerLogs(daemon, "server", destination)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "upstream_logdir_contents_preserved", common.isFile(path(destination, "keys.log")))
+    support.check(found, "no_unrequested_subdirectory", !common.exists(path(destination, "owned-logs")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+record Fake { setup: support.Setup; template: json.Value; status: Integer; after: List<Boolean>; recorded: List<Text>; rows: process.Commands; output: Bytes; error: Bytes; root: Text }
+function fakeRow(fake: Fake, operation: Text, code: Integer, stderr: Text): Result<Boolean, common.Failure> {
+    let stderrPath = path(fake.root, "raw-" + Text(fake.rows.rows.length) + ".stderr")
+    let wrote = try common.writeText(stderrPath, stderr)
+    let row = process.newRow([operation], 0)
+    row.operation = operation
+    row.status.add(code)
+    let bound = try common.binding(stderrPath)
+    row.stderr = bound
+    row.lifetime.certified = true
+    fake.rows.rows.add(row)
+    return ok()
+}
+function fakeCommand(fake: Fake, args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
+    let operation = ""
+    for token in args { if operation == "" && (token == "create" || token == "up") { operation = token } }
+    if operation == "" { operation = args[0] }
+    fake.recorded.add(operation)
+    if operation == "create" { let wrote = try common.atomicJson(fake.setup.path, fake.template) }
+    let code = 0
+    let stderr = "inspection stderr\n"
+    if operation == "up" { code = fake.status; stderr = "exact up stderr\n" }
+    let row = try fakeRow(fake, operation, code, stderr)
+    if operation == "up" && settings.stream { fake.error.addBytes(Bytes("exact up stderr\n")) }
+    if operation == "up" { fake.after[0] = true }
+    return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: "" })
+}
+function receiptDaemon(root: Text, status: Integer): Result<Fake, common.Failure> {
+    let setup = try support.setup(root)
+    let template = try support.readState(setup)
+    for identity in data.field(template, "containers").keys {
+        template = common.setPath(template, ["containers", identity, "State"], support.obj(["Running", "ExitCode"], [support.flag(false), support.number(0)]))
+    }
+    let cleared = try support.store(setup, support.obj(["containers", "networks", "events"], [support.empty(), support.empty(), data.array([])]))
+    let fake = Fake { setup: setup; template: template; status: status; after: [false]; recorded: []; rows: process.memoryCommands(); output: Bytes(); error: Bytes(); root: root }
+    setup.daemon.commands = fake.rows
+    let statePath = setup.path
+    setup.daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> { return fakeCommand(fake, args, settings) })
+    setup.daemon.containersHook.add(function(): Result<List<Text>, common.Failure> {
+        if fake.after[0] { let row = try fakeRow(fake, "post-ps", 0, "inspection stderr\n") }
+        return adapter.jsonContainers(statePath)
+    })
+    setup.daemon.inspectHook.add(function(identity: Text): Result<json.Value, common.Failure> {
+        if fake.after[0] { let row = try fakeRow(fake, "post-inspect", 0, "inspection stderr\n") }
+        return adapter.jsonInspect(statePath, identity)
+    })
+    setup.daemon.networksHook.add(function(): Result<List<json.Value>, common.Failure> {
+        if fake.after[0] { let row = try fakeRow(fake, "post-network", 0, "inspection stderr\n") }
+        return adapter.jsonNetworks(statePath)
+    })
+    return Ok<Fake, common.Failure>(fake)
+}
+function invokeFake(fake: Fake): Result<Integer, common.Failure> {
+    return adapter.dockerEntry(fake.setup.owner, fake.setup.daemon, ["compose", "--env-file", "empty.env", "up", "--abort-on-container-exit", "--timeout", "10", "sim", "client", "server"],
+        ["SERVER=" + support.image(), "CLIENT=" + support.image()])
+}
+function upReceipt(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let code = 127
+    if name == "up-status-one" { code = 1 }
+    let fake = try receiptDaemon(root, code)
+    let status = try invokeFake(fake)
+    let intent = try common.readJson(path(fake.setup.owner.artifacts, "create-admission.json"))
+    let later = false
+    for row in fake.rows.rows { if row.operation.startsWith("post-") && row.status.length > 0 && row.status[0] == 0 { later = true } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "exact_up_status", status == code)
+    support.check(found, "exact_up_stderr", Text(fake.error) == "exact up stderr\n")
+    support.check(found, "intent_binds_up_status", data.equalsInteger(data.field(intent, "workload_status"), code))
+    support.check(found, "successful_later_inspection_present", later)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function declaredTopology(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let phase = "exited"
+    if name.startsWith("created") { phase = "created" }
+    let containerIds: List<Text> = []
+    let configured: List<json.Value> = []
+    for index in 0..data.field(state, "containers").keys.length {
+        let identity = data.field(state, "containers").keys[index]
+        let entry = data.field(data.field(state, "containers"), identity)
+        state = common.setPath(state, ["containers", identity, "State"], support.obj(["Running", "ExitCode", "Status"], [support.flag(false), support.number(0), support.text(phase)]))
+        let attached = data.field(data.field(entry, "NetworkSettings"), "Networks")
+        let networkIds: List<json.Value> = []
+        for item in attached.items { networkIds = networkIds.appended(data.field(item, "NetworkID")) }
+        containerIds.add(identity)
+        configured = configured.appended(support.obj(attached.keys, networkIds))
+        for bridge in attached.keys {
+            state = common.setPath(state, ["containers", identity, "NetworkSettings", "Networks", bridge], support.obj(["NetworkID", "EndpointID"], [support.text(""), support.text("")]))
+        }
+    }
+    let networkNames: List<Text> = []
+    let networkIdValues: List<json.Value> = []
+    for identity in data.field(state, "networks").keys {
+        state = common.setPath(state, ["networks", identity, "Containers"], support.empty())
+        networkNames.add(common.textOf(data.field(data.field(data.field(state, "networks"), identity), "Name")))
+        networkIdValues = networkIdValues.appended(support.text(identity))
+    }
+    let wrote = try common.atomicJson(path(setup.owner.artifacts, "configured-topology.json"), support.obj(["schema_version", "project", "nonce", "containers", "networks"],
+        [support.number(1), support.text(setup.owner.project), support.text(setup.owner.nonce), support.obj(containerIds, configured), support.obj(networkNames, networkIdValues)]))
+    let accepted = false
+    match adapter.verifiedTopology(setup.owner, common.valuesOf(data.field(state, "containers")), common.valuesOf(data.field(state, "networks"))) {
+        Ok(value) { accepted = true }
+        Err(problem) {}
+    }
+    let live = false
+    for network in data.field(state, "networks").items { if data.field(network, "Containers").keys.length > 0 { live = true } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "honest_declared_phase_accepted", accepted)
+    support.check(found, "no_live_endpoint_members", !live)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function revoked(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let fake = try receiptDaemon(root, 0)
+    let owner = fake.setup.owner
+    if name == "admission-closed-revoked" {
+        let wrote = try common.atomicJson(path(owner.artifacts, "create-admission.json"), support.obj(["schema_version", "project", "nonce", "state", "certified"],
+            [support.number(1), support.text(owner.project), support.text(owner.nonce), support.text("closed"), support.flag(true)]))
+    }
+    let closed = try adapter.closeAdmission(owner, true)
+    let refused = false
+    match invokeFake(fake) {
+        Ok(status) {}
+        Err(problem) { refused = problem.kind == "OwnershipError" || problem.kind == "CleanupError" }
+    }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "delayed_wrapper_refused", refused)
+    support.check(found, "no_create_after_closure", fake.recorded.length == 0)
+    support.check(found, "persistent_revocation", common.isFile(path(owner.artifacts, "admission-revoked.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function lateObject(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let template = try support.readState(setup)
+    let late = data.with(template, "containers", support.obj([two()], [data.field(data.field(template, "containers"), two())]))
+    let rightnet = common.setPath(data.field(data.field(template, "networks"), eight()), ["Containers"], support.obj([two()], [support.empty()]))
+    late = data.with(late, "networks", support.obj([eight()], [rightnet]))
+    let statePath = setup.path
+    let current = currentIdentity()
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "captured" && detail == "runner_root" { support.quietly(common.atomicJson(statePath, late)) }
+        return ok()
+    })
+    let caught = caughtCleanup(adapter.watchOwned(setup.owner, setup.daemon, current, current, common.now() - 10 * common.MILLISECOND, path(root, "watch"), 500 * common.MILLISECOND, []))
+    common.resetSeams()
+    let final = try common.readJson(path(root, "watch/watch-final.json"))
+    let found = support.outcome("passed", "passed")
+    support.check(found, "late_object_forces_nonpass", isKind(caught, "CleanupError") && common.equalText(data.field(final, "status"), "failed"))
+    support.check(found, "late_immutable_identity_retained", common.sameTexts(common.textList(data.field(final, "remaining_ids")), [two()]))
+    support.check(found, "tree_retention_survives", common.isFile(path(root, "watch/retained-trees/retention.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+record MockState { done: List<Boolean>; held: List<common.Member>; opens: List<common.Member>; numeric: List<Integer> }
+function mockHandle(state: MockState, identity: common.Member): process.Handle {
+    let exited = [false]
+    return process.Handle {
+        identity: identity
+        ready: function(): Result<Boolean, common.Failure> { return Ok<Boolean, common.Failure>(exited[0]) }
+        send: function(signal: Integer): Result<Boolean, common.Failure> {
+            state.held.add(identity)
+            state.done[0] = true
+            exited[0] = true
+            return Ok<Boolean, common.Failure>(true)
+        }
+        close: function(): Result<Boolean, common.Failure> { return ok() }
+    }
+}
+function pidfdControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let member = common.Member { pid: 424242; startTicks: 77; pgid: 424243; session: 424243; origin: "" }
+    let identity = common.Member { pid: 424243; startTicks: 76; pgid: -1; session: -1; origin: "" }
+    let state = MockState { done: [false]; held: []; opens: []; numeric: [] }
+    let ops = process.OPS
+    ops.members = function(owned: common.Member, known: List<common.Member>, adopt: Boolean): Result<List<common.Member>, common.Failure> {
+        if state.done[0] { return Ok<List<common.Member>, common.Failure>([]) }
+        return Ok<List<common.Member>, common.Failure>([member])
+    }
+    ops.openHandle = function(value: common.Member): Result<process.Handle, common.Failure> {
+        state.opens.add(value)
+        return Ok<process.Handle, common.Failure>(mockHandle(state, value))
+    }
+    let known: List<common.Member> = []
+    let receipts: List<process.Receipt> = []
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "scope", support.text("mock transition only; no actual PID reuse or signal"))
+    if name == "session-extinction-latch" {
+        state.done[0] = true
+        let first = try process.drainCli(identity, known, receipts, common.now() + common.SECOND, true)
+        state.done[0] = false
+        let second = try process.drainCli(identity, known, receipts, common.now() + common.SECOND, true)
+        support.check(found, "permanent_extinction_refuses_numeric_reuse", state.numeric.length == 0 && state.held.length == 0)
+        support.check(found, "no_reopened_membership", known.length == 0)
+    } else {
+        let drained = try process.drainCli(identity, known, receipts, common.now() + common.SECOND, true)
+        support.check(found, "no_numeric_pid_signal", state.numeric.length == 0)
+        support.check(found, "signal_uses_held_birth_handle", state.held.length > 0 && state.opens.length > 0)
+        support.check(found, "owned_signal_receipt", receipts.length > 0)
+    }
+    process.resetOps()
+    let numericValues: List<json.Value> = []
+    for pid in state.numeric { numericValues = numericValues.appended(support.number(pid)) }
+    let heldValues: List<json.Value> = []
+    for item in state.held { heldValues = heldValues.appended(support.obj(["identity", "signal"], [common.identityJson(item), support.number(9)])) }
+    support.detail(found, "numeric_requests", data.array(numericValues))
+    support.detail(found, "held_requests", data.array(heldValues))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function wnowait(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let early: List<Text> = []
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "reap" && records.rows.length > 0 && records.rows[0].lifetime.state != "closed" { early.add(detail) }
+        return ok()
+    })
+    let completed = false
+    match process.run(records, ["/bin/sh", "-c", "echo harmless completion"], process.options(3 * common.SECOND)) {
+        Ok(output) { completed = true }
+        Err(problem) {}
+    }
+    common.resetSeams()
+    let found = support.outcome("passed", "passed")
+    support.check(found, "no_poll_before_drain", early.length == 0)
+    support.check(found, "actual_harmless_completion", completed)
+    support.check(found, "raw_receipt_retained", common.isFile(path(root, "commands/commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function closePrimary(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let original = common.failure("RuntimeError", "original second registration sentinel")
+    let attempts: List<Text> = []
+    let failed = [false]
+    let registered = [0]
+    let prior = subreaperValue()
+    let stateFailure = name == "close-state-secondary-preserves-primary"
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "register" {
+            registered[0] += 1
+            if registered[0] == 2 { return Err<Boolean, common.Failure>(original) }
+        }
+        if point == "pipe-close" {
+            attempts.add(detail)
+            if detail == "stdout" && !failed[0] {
+                failed[0] = true
+                return Err<Boolean, common.Failure>(common.failure("OSError", "secondary stdout close failure"))
+            }
+        }
+        if point == "pipe-state" && stateFailure && detail == "stdout" { return Err<Boolean, common.Failure>(common.failure("OSError", "secondary close state failure")) }
+        if point == "selector-close" { attempts.add("selector") }
+        return ok()
+    })
+    let caught = caughtOutput(process.run(records, ["/bin/sleep", "10"], process.options(3 * common.SECOND)))
+    common.resetSeams()
+    let flag = subreaperValue()
+    let row = rowOf(records)
+    let ledger = false
+    for item in row.problems { if common.contains(item.message, "stdout close") { ledger = true } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "original_primary_identity", isSame(caught, original))
+    support.check(found, "stderr_and_selector_attempted", common.member(attempts, "stderr") && common.member(attempts, "selector"))
+    support.check(found, "restoration_attempted", flag == prior)
+    support.check(found, "secondary_ledger", ledger)
+    support.check(found, "secondary_note", common.hasNote(original, "stdout close"))
+    support.check(found, "final_raw_ledger", common.isFile(path(root, "commands/commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function admittedControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let owner = setup.owner
+    let records = try process.rawCommands(path(root, "commands"))
+    let marker = path(root, "executed")
+    let wrote = try common.atomicJson(path(owner.artifacts, "create-admission.json"), support.obj(["schema_version", "project", "nonce", "state", "certified"],
+        [support.number(1), support.text(owner.project), support.text(owner.nonce), support.text("creating"), support.flag(false)]))
+    let original = common.failure("RuntimeError", "original publication failure")
+    let raised = [false]
+    if name == "admitted-cli-publication-failure" {
+        setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+            if point == "json-write" && common.nameOf(detail) == "commands.json" && records.rows.length > 0 && records.rows[0].identity.pid >= 0 && !raised[0] {
+                raised[0] = true
+                return Err<Boolean, common.Failure>(original)
+            }
+            return ok()
+        })
+    }
+    if name == "admitted-cli-revoked-at-spawn" {
+        match adapter.closeAdmission(owner, true) {
+            Ok(value) {}
+            Err(problem) { if problem.kind != "CleanupError" { return Err<support.Outcome, common.Failure>(problem) } }
+        }
+    }
+    let argv = [context.self, "--helper", "admitted", marker]
+    let settings = process.options(3 * common.SECOND)
+    settings.admission.add(adapter.scope(owner))
+    let raw = Bytes()
+    let caught: List<common.Failure> = []
+    match process.run(records, argv, settings) {
+        Ok(output) { raw = output.payload }
+        Err(problem) { caught.add(problem) }
+    }
+    common.resetSeams()
+    let row = rowOf(records)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "raw_ledger", common.isFile(path(records.root, "commands.json")))
+    support.check(found, "no_remaining_children", process.directChildren().length == 0)
+    if name == "admitted-cli-success" {
+        let launcher = common.bindingOr(context.adapter)
+        support.check(found, "actual_owned_execution", Text(raw) == "admitted\n" && common.exists(marker))
+        support.check(found, "launcher_and_intended_argv_bound", common.sameTexts(row.argv, argv) && row.launcher.length > 0 &&
+            row.launcherSource.path == launcher.path && common.sameBinding(row.launcherSource, launcher))
+        support.check(found, "status_and_lifetime", row.status.length > 0 && row.status[0] == 0 && row.lifetime.certified)
+    } else if name == "admitted-cli-publication-failure" {
+        support.check(found, "primary_identity", isSame(caught, original))
+        support.check(found, "no_unpublished_execution", !common.exists(marker))
+        support.check(found, "birthday_published", row.identity.pid >= 0)
+        support.check(found, "nonpass", !row.lifetime.certified)
+    } else {
+        support.check(found, "revocation_rejected", isKind(caught, "OwnershipError"))
+        support.check(found, "never_spawned", row.identity.pid < 0)
+        support.check(found, "no_execution", !common.exists(marker))
+    }
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function birthdayFailure(context: Context, root: Text, escaped: Boolean): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let original = common.failure("RuntimeError", "original root birthday failure")
+    let created: List<Integer> = []
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "spawned" { created.add(common.integerText(detail)) }
+        if point == "birthday" { return Err<Boolean, common.Failure>(original) }
+        return ok()
+    })
+    let parent = path(root, "escaped-birthday.json")
+    let argv = ["/bin/sleep", "10"]
+    if escaped { argv = [context.self, "--helper", "cli", "-", "10000", context.self, "--helper", "escaped", path(root, "escaped-marker"), parent] }
+    let caught = caughtOutput(process.run(records, argv, process.options(2 * common.SECOND)))
+    common.resetSeams()
+    let row = rowOf(records)
+    let gone = true
+    for pid in created { if common.processIdentity(pid).pid >= 0 { gone = false } }
+    let held = true
+    for receipt in row.lifetime.receipts { if receipt.authority != "held-pidfd" { held = false } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "primary_identity", isSame(caught, original))
+    support.check(found, "owned_child_gone", gone)
+    support.check(found, "raw_ledger", common.isFile(path(records.root, "commands.json")))
+    support.check(found, "no_numeric_signal", held)
+    if escaped {
+        support.check(found, "would_escape_target_never_executed", !common.exists(parent))
+        support.check(found, "bootstrap_closed_before_restore", row.gate.reaped)
+        support.check(found, "no_target_permit", !row.gate.permitSent)
+    }
+    for pid in created { if support.running(pid) { support.terminate(pid) } }
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function readyOf(handle: process.Handle): Boolean {
+    match process.handleReady(handle) {
+        Ok(value) { return value }
+        Err(problem) { return false }
+    }
+}
+function parentDeath(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let owner = setup.owner
+    let marker = path(root, "executed")
+    let receipt = path(root, "published.json")
+    let wrote = try common.atomicJson(path(owner.artifacts, "create-admission.json"), support.obj(["schema_version", "project", "nonce", "state", "certified"],
+        [support.number(1), support.text(owner.project), support.text(owner.nonce), support.text("creating"), support.flag(false)]))
+    let argv = [context.self, "--helper", "raw-controller", path(root, "spec.json"), path(root, "inner"), receipt, marker, context.adapter]
+    let prior = try process.subreaperBegin()
+    let handles: List<process.Handle> = []
+    let pids: List<Integer> = []
+    let outcome = parentDeathBody(context, root, argv, marker, receipt, handles, pids)
+    for handle in handles {
+        if !readyOf(handle) { support.quietly(process.handleSend(handle, 9)) }
+    }
+    for pid in pids { support.waitFor(pid, 2000) }
+    for handle in handles {
+        common.reapNoHang(handle.identity.pid)
+        support.quietly(process.handleClose(handle))
+    }
+    common.subreaperSet(prior)
+    return outcome
+}
+function parentDeathBody(context: Context, root: Text, argv: List<Text>, marker: Text, receipt: Text, handles: List<process.Handle>, pids: List<Integer>): Result<support.Outcome, common.Failure> {
+    let child = try support.startChild(argv, path(root, "controller.stdout"), path(root, "controller.stderr"), common.SPAWN_SESSION)
+    pids.add(child.pid)
+    let identity = try process.childBirthday(child.pid)
+    let held = try process.openProcessHandle(identity)
+    handles.add(held)
+    let deadline = common.now() + 3 * common.SECOND
+    while !readyOf(held) && common.now() < deadline { common.pause(10) }
+    if !readyOf(held) { return Err<support.Outcome, common.Failure>(common.failure("RuntimeError", "controlled controller did not exit")) }
+    let published = try common.readJson(receipt)
+    let bootstrap = common.readMember(data.field(published, "process_identity"))
+    let boot = try process.openProcessHandle(bootstrap)
+    handles.add(boot)
+    while !readyOf(boot) && common.now() < deadline { common.pause(10) }
+    let natural = readyOf(boot)
+    let status = support.waitFor(child.pid, 2000)
+    let fields = common.statFields(bootstrap.pid)
+    let known: List<common.Member> = []
+    if fields.length >= 20 {
+        known.add(common.Member { pid: bootstrap.pid; startTicks: bootstrap.startTicks; pgid: common.integerText(fields[2]); session: common.integerText(fields[3]); origin: "recorded-bootstrap" })
+    }
+    let actions: List<process.Receipt> = []
+    let drained = try process.drainCli(identity, known, actions, common.now() + 2 * common.SECOND, false)
+    let actionValues: List<json.Value> = []
+    for action in actions { actionValues = actionValues.appended(process.receiptJson(action)) }
+    let stdoutBinding = try common.binding(path(root, "controller.stdout"))
+    let stderrBinding = try common.binding(path(root, "controller.stderr"))
+    let recorded = try common.atomicJson(path(root, "actual-death.json"), support.obj(["scope", "controller", "bootstrap", "argv", "status", "natural_bootstrap_exit", "actions", "stdout", "stderr"],
+        [support.text("owned harmless child, no Docker"), common.identityJson(identity), common.identityJson(bootstrap), support.texts(argv), support.number(status), support.flag(natural),
+            data.array(actionValues), common.boundPath(stdoutBinding), common.boundPath(stderrBinding)]))
+    let found = support.outcome("passed", "passed")
+    support.check(found, "actual_controller_death", status == 23)
+    support.check(found, "blocked_child_exits_on_eof", natural)
+    support.check(found, "no_unpublished_execution", !common.exists(marker))
+    support.check(found, "drained_and_no_signal_needed", drained && actions.length == 0)
+    support.check(found, "durable_identity_before_permit", data.field(published, "launcher_argv").items.length > 0 &&
+        common.equalText(data.field(data.field(published, "lifetime"), "state"), "running"))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function lockRace(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let owner = setup.owner
+    let intentPath = path(owner.artifacts, "create-admission.json")
+    let wrote = try common.atomicJson(intentPath, support.obj(["schema_version", "project", "nonce", "state", "certified"],
+        [support.number(1), support.text(owner.project), support.text(owner.nonce), support.text("closed"), support.flag(true)]))
+    let argv = [context.self, "--helper", "close-admission", path(root, "spec.json")]
+    let lock = try process.admissionLock(adapter.scope(owner), 2 * common.SECOND)
+    let started = support.startChild(argv, path(root, "close.stdout"), path(root, "close.stderr"), common.SPAWN_SESSION)
+    common.pause(50)
+    let before = !common.exists(path(owner.artifacts, "admission-revoked.json"))
+    process.admissionUnlock(lock)
+    let child = try started
+    let status = support.waitFor(child.pid, 3000)
+    let caught: List<common.Failure> = []
+    match adapter.admissionWrite(owner, support.obj(["schema_version", "project", "nonce", "state", "certified"],
+        [support.number(1), support.text(owner.project), support.text(owner.nonce), support.text("creating"), support.flag(false)])) {
+        Ok(value) {}
+        Err(problem) { if problem.kind == "OwnershipError" { caught.add(problem) } }
+    }
+    let stdoutBinding = try common.binding(path(root, "close.stdout"))
+    let stderrBinding = try common.binding(path(root, "close.stderr"))
+    let recorded = try common.atomicJson(path(root, "closer-command.json"), support.obj(["argv", "timeout_seconds", "status", "stdout", "stderr"],
+        [support.texts(argv), support.number(3), support.number(status), common.boundPath(stdoutBinding), common.boundPath(stderrBinding)]))
+    let intent = try common.readJson(intentPath)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "closure_waited_for_atomic_scope", before)
+    support.check(found, "actual_closer_success", status == 0)
+    support.check(found, "permanent_closure_refuses_write", caught.length > 0)
+    support.check(found, "no_reopened_intent", common.equalText(data.field(intent, "state"), "closed"))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function phaseNext(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let fake = try receiptDaemon(root, 0)
+    let first = try invokeFake(fake)
+    let second = try invokeFake(fake)
+    let found = support.outcome("passed", "passed")
+    support.check(found, "two_owned_phases", first == 0 && second == 0)
+    support.check(found, "phase_cleanup_not_global_revocation", !common.exists(path(fake.setup.owner.artifacts, "admission-revoked.json")))
+    support.check(found, "previous_owned_ids_retained", common.isFile(path(fake.setup.owner.artifacts, "between-up-0/cleanup.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function wrongConfigured(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let setup = try support.setup(root)
+    let state = try support.readState(setup)
+    let containerIds: List<Text> = []
+    let configured: List<json.Value> = []
+    for identity in data.field(state, "containers").keys {
+        let entry = data.field(data.field(state, "containers"), identity)
+        state = common.setPath(state, ["containers", identity, "State", "Running"], support.flag(false))
+        let attached = data.field(data.field(entry, "NetworkSettings"), "Networks")
+        let bridgeIds: List<json.Value> = []
+        for bridge in attached.keys {
+            state = common.setPath(state, ["containers", identity, "NetworkSettings", "Networks", bridge], support.obj(["NetworkID", "EndpointID"], [support.text(""), support.text("")]))
+            let digit = "8"
+            if bridge.endsWith("leftnet") { digit = "7" }
+            if identity == two() && bridge == setup.owner.project + "_rightnet" { digit = "f" }
+            bridgeIds = bridgeIds.appended(support.text(support.identifier(digit)))
+        }
+        containerIds.add(identity)
+        configured = configured.appended(support.obj(attached.keys, bridgeIds))
+    }
+    let networkNames: List<Text> = []
+    let networkIds: List<json.Value> = []
+    for identity in data.field(state, "networks").keys {
+        state = common.setPath(state, ["networks", identity, "Containers"], support.empty())
+        networkNames.add(common.textOf(data.field(data.field(data.field(state, "networks"), identity), "Name")))
+        networkIds = networkIds.appended(support.text(identity))
+    }
+    let wrote = try common.atomicJson(path(setup.owner.artifacts, "configured-topology.json"), support.obj(["schema_version", "project", "nonce", "containers", "networks"],
+        [support.number(1), support.text(setup.owner.project), support.text(setup.owner.nonce), support.obj(containerIds, configured), support.obj(networkNames, networkIds)]))
+    let rejected = false
+    match adapter.verifiedTopology(setup.owner, common.valuesOf(data.field(state, "containers")), common.valuesOf(data.field(state, "networks"))) {
+        Ok(value) {}
+        Err(problem) { rejected = problem.kind == "OwnershipError" }
+    }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "foreign_configured_bridge_rejected", rejected)
+    support.check(found, "no_daemon_mutation", eventsOf(setup).length == 0)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function heldEmpty(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let identity = common.Member { pid: 424255; startTicks: 901; pgid: -1; session: -1; origin: "" }
+    let member = common.Member { pid: 424256; startTicks: 902; pgid: 424255; session: 424255; origin: "" }
+    let ready = [name == "held-empty-already-ready"]
+    let signals: List<Integer> = []
+    let closed = [false]
+    let laterReady = name == "held-empty-later-ready"
+    let handle = process.Handle {
+        identity: member
+        ready: function(): Result<Boolean, common.Failure> { return Ok<Boolean, common.Failure>(ready[0]) }
+        send: function(signal: Integer): Result<Boolean, common.Failure> {
+            signals.add(signal)
+            if laterReady { ready[0] = true }
+            return Ok<Boolean, common.Failure>(true)
+        }
+        close: function(): Result<Boolean, common.Failure> { closed[0] = true; return ok() }
+    }
+    let ops = process.OPS
+    ops.members = function(owned: common.Member, known: List<common.Member>, adopt: Boolean): Result<List<common.Member>, common.Failure> {
+        return Ok<List<common.Member>, common.Failure>([])
+    }
+    let known = [member]
+    let handles = [handle]
+    let receipts: List<process.Receipt> = []
+    let drained = process.drainHeld(identity, known, receipts, common.now() + 50 * common.MILLISECOND, handles)
+    let latched = process.extinct(identity)
+    process.resetOps()
+    process.forgetExtinction(identity)
+    let result = try drained
+    let found = support.outcome("passed", "passed")
+    support.check(found, "empty_rows_do_not_override_held_life", result == (name != "held-empty-nonready"))
+    support.check(found, "extinction_only_when_ready", latched == (name != "held-empty-nonready"))
+    support.check(found, "held_signal_when_nonready", (signals.length > 0) == (name != "held-empty-already-ready"))
+    support.check(found, "no_early_handle_release", !closed[0])
+    let receiptValues: List<json.Value> = []
+    for receipt in receipts { receiptValues = receiptValues.appended(process.receiptJson(receipt)) }
+    let wrote = try common.atomicJson(path(root, "held-transitions.json"), support.obj(["scope", "receipts", "ready", "result", "latched", "signals"],
+        [support.text("mock thread-group-exit transition only; no real foreign PID/reuse"), data.array(receiptValues), support.flag(ready[0]), support.flag(result), support.flag(latched), support.number(signals.length)]))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+record Model { created: List<Text>; monitored: List<Text>; started: List<Text>; recreate: List<Boolean>; injected: List<Text>; alive: List<Boolean>; complete: List<Boolean> }
+function visitRole(role: Text, roles: List<Text>, dependencies: List<List<Text>>, args: List<Text>, started: List<Text>) {
+    if common.member(started, role) { return }
+    if !common.member(args, "--no-deps") {
+        for index in 0..roles.length { if roles[index] == role { for dependency in dependencies[index] { visitRole(dependency, roles, dependencies, args, started) } } }
+    }
+    started.add(role)
+}
+function serviceOf(entry: json.Value): Text {
+    return common.textOf(data.field(data.field(data.field(entry, "Config"), "Labels"), "com.docker.compose.service"))
+}
+function filterCreated(state: json.Value, roles: List<Text>): json.Value {
+    let containers = data.field(state, "containers")
+    let keys: List<Text> = []
+    let values: List<json.Value> = []
+    for index in 0..containers.keys.length { if common.member(roles, serviceOf(containers.items[index])) { keys.add(containers.keys[index]); values = values.appended(containers.items[index]) } }
+    let result = data.with(state, "containers", support.obj(keys, values))
+    let networks = data.field(result, "networks")
+    let networkValues: List<json.Value> = []
+    for network in networks.items {
+        let members = data.field(network, "Containers")
+        let kept: List<Text> = []
+        let keptValues: List<json.Value> = []
+        for index in 0..members.keys.length { if common.member(keys, members.keys[index]) { kept.add(members.keys[index]); keptValues = keptValues.appended(members.items[index]) } }
+        networkValues = networkValues.appended(data.with(network, "Containers", support.obj(kept, keptValues)))
+    }
+    return data.with(result, "networks", support.obj(networks.keys, networkValues))
+}
+function serverExitState(state: json.Value, started: List<Text>): json.Value {
+    let result = state
+    let containers = data.field(state, "containers")
+    for index in 0..containers.keys.length {
+        let identity = containers.keys[index]
+        let role = serviceOf(containers.items[index])
+        let alive = role == "sim" && common.member(started, "sim")
+        let code = 0
+        if role == "server" { code = 127 }
+        result = common.setPath(result, ["containers", identity, "State"], support.obj(["Running", "ExitCode"], [support.flag(alive), support.number(code)]))
+        let attached = data.field(data.field(containers.items[index], "NetworkSettings"), "Networks")
+        for bridge in attached.keys {
+            let networks = data.field(result, "networks")
+            for position in 0..networks.keys.length {
+                if common.equalText(data.field(networks.items[position], "Name"), bridge) {
+                    let networkId = networks.keys[position]
+                    if alive {
+                        result = common.setPath(result, ["networks", networkId, "Containers", identity], support.empty())
+                        result = common.setPath(result, ["containers", identity, "NetworkSettings", "Networks", bridge, "NetworkID"], support.text(networkId))
+                    } else {
+                        if common.hasKey(data.field(data.field(data.field(result, "networks"), networkId), "Containers"), identity) {
+                            result = common.removePath(result, ["networks", networkId, "Containers", identity])
+                        }
+                        result = common.setPath(result, ["containers", identity, "NetworkSettings", "Networks", bridge, "NetworkID"], support.text(""))
+                    }
+                }
+            }
+        }
+    }
+    return result
+}
+function exactCompose(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "pinned-input-commands"))
+    let git = adapter.which("git")
+    if git == "" { return Err<support.Outcome, common.Failure>(common.ownership("existing git missing for pinned source fixture")) }
+    let settings = process.options(5 * common.SECOND)
+    settings.maxBytes = 65536
+    let pinned = try process.runBytes(records, [git, "-C", context.pinned, "show", common.PIN + ":docker-compose.yml"], settings)
+    let fixture = path(root, "pinned-compose.yml")
+    let wroteFixture = try common.writeBytes(fixture, pinned)
+    let graphRoles: List<Text> = []
+    let graphDependencies: List<List<Text>> = []
+    let current = -1
+    let depends = false
+    for line in Text(pinned).split("\n") {
+        if line.startsWith("  ") && !line.startsWith("    ") && line.endsWith(":") {
+            let role = line.trim()
+            graphRoles.add(role.slice(0, role.length - 1))
+            graphDependencies.add([])
+            current = graphRoles.length - 1
+            depends = false
+        } else if current >= 0 && line == "    depends_on:" { depends = true }
+        else if depends && line.startsWith("      - ") { graphDependencies[current].add(line.slice(8, line.length)) }
+        else if line != "" && !line.startsWith("      ") { depends = false }
+    }
+    let roleNames = common.ROLES
+    let expectedDependencies: List<List<Text>> = [[], ["sim"], ["sim"]]
+    let graphValid = true
+    let selectedRoles: List<Text> = []
+    let selectedDependencies: List<List<Text>> = []
+    for index in 0..roleNames.length {
+        let position = -1
+        for at in 0..graphRoles.length { if graphRoles[at] == roleNames[index] { position = at } }
+        if position < 0 || !common.sameTexts(graphDependencies[position], expectedDependencies[index]) { graphValid = false }
+        else { selectedRoles.add(roleNames[index]); selectedDependencies.add(graphDependencies[position]) }
+    }
+    if !graphValid { return Err<support.Outcome, common.Failure>(common.ownership("pinned endpoint dependency graph differs")) }
+    let serverPhase = common.member(["compose-server-renewal", "server-exit-live-simulator", "compose-dependency-recreation", "compose-dependency-foreign-object"], name)
+    let upStatus = 0
+    if name == "server-exit-live-simulator" { upStatus = 127 }
+    let fake = try receiptDaemon(root, upStatus)
+    let owner = fake.setup.owner
+    let statePath = fake.setup.path
+    let commands: List<List<Text>> = []
+    let model = Model { created: []; monitored: []; started: []; recreate: []; injected: []; alive: []; complete: [] }
+    fake.setup.daemon.commandHook.truncate(0)
+    fake.setup.daemon.commandHook.add(function(args: List<Text>, chosen: process.RunOptions): Result<process.Output, common.Failure> {
+        commands.add(args.slice(0, args.length))
+        let prepare = common.member(args, "create") || common.member(args, "--no-start")
+        let modeled: List<Text> = []
+        for token in args {
+            if token == "up" && common.member(args, "--no-start") { modeled.add("create") } else { modeled.add(token) }
+        }
+        let raw = try fakeCommand(fake, modeled, chosen)
+        let state = try common.readJson(statePath)
+        if prepare {
+            let roles: List<Text> = []
+            for token in args { if common.member(roleNames, token) { roles.add(token) } }
+            state = filterCreated(state, roles)
+            model.created.truncate(0)
+            for identity in data.field(state, "containers").keys.sorted() { model.created.add(identity) }
+        } else {
+            let started: List<Text> = []
+            for token in args { if common.member(roleNames, token) { model.monitored.add(token); visitRole(token, selectedRoles, selectedDependencies, args, started) } }
+            for role in started { model.started.add(role) }
+            model.recreate.add(!common.member(args, "--no-recreate"))
+            if name == "server-exit-live-simulator" {
+                state = serverExitState(state, started)
+                let containers = data.field(state, "containers")
+                model.alive.add(common.isTrue(data.field(data.field(data.field(containers, support.identifier("1")), "State"), "Running")))
+                let complete = true
+                for entry in containers.items {
+                    if common.member(model.monitored, serviceOf(entry)) && common.isTrue(data.field(data.field(entry, "State"), "Running")) { complete = false }
+                }
+                model.complete.add(complete)
+                let stored = try common.atomicJson(statePath, state)
+                let modelWrote = try common.atomicJson(path(root, "monitor-model.json"), support.obj(["monitored_services", "started_services", "events", "simulator_alive", "monitor_complete"],
+                    [support.texts(model.monitored), support.texts(model.started), data.array([support.obj(["service", "event"], [support.text("sim"), support.text("running")]),
+                        support.obj(["service", "event", "status"], [support.text("server"), support.text("exited"), support.number(127)])]), support.flag(model.alive[0]), support.flag(complete)]))
+                if !complete { return Err<process.Output, common.Failure>(process.timeoutFailure(args, chosen.timeout)) }
+                let unsupported = Bytes("mock server UNSUPPORTED\n")
+                if chosen.stream { fake.output.addBytes(unsupported) }
+                return Ok<process.Output, common.Failure>(process.Output { payload: unsupported; path: "" })
+            }
+            if name == "compose-dependency-recreation" || name == "compose-dependency-foreign-object" {
+                let entry = data.field(data.field(state, "containers"), support.identifier("1"))
+                if name == "compose-dependency-recreation" { state = common.removePath(state, ["containers", support.identifier("1")]) }
+                else { entry = common.setPath(entry, ["Config", "Labels", "com.docker.compose.service"], support.text("foreign")) }
+                entry = data.with(entry, "Id", support.text(support.identifier("9")))
+                state = common.setPath(state, ["containers", support.identifier("9")], entry)
+                model.injected.add(support.identifier("9"))
+            }
+        }
+        let stored = try common.atomicJson(statePath, state)
+        return Ok<process.Output, common.Failure>(raw)
+    })
+    let argv = ["compose", "--env-file", "empty.env", "up"]
+    if serverPhase { for token in ["-V", "server"] { argv.add(token) } }
+    else if name == "compose-client-renewal" { for token in ["--timeout", "0", "--abort-on-container-exit", "-V", "sim", "client"] { argv.add(token) } }
+    else { for token in ["--abort-on-container-exit", "--timeout", "10", "sim", "client", "server"] { argv.add(token) } }
+    if name == "compose-unknown-service" { argv.add("foreign") }
+    let environment = ["SERVER=" + support.image(), "CLIENT=" + support.image()]
+    if name == "server-exit-live-simulator" { environment.add("TESTCASE_SERVER=mock-unsupported") }
+    let status = -1
+    let caught: List<common.Failure> = []
+    match adapter.dockerEntry(owner, fake.setup.daemon, argv, environment) {
+        Ok(value) { status = value }
+        Err(problem) {
+            if problem.kind != "OwnershipError" && problem.kind != "TimeoutExpired" { return Err<support.Outcome, common.Failure>(problem) }
+            caught.add(problem)
+        }
+    }
+    let prefix = ["compose", "--project-name", owner.project, "--file", owner.composePath, "--env-file", path(owner.runnerRoot, "empty.env")]
+    let createdRoles = ["sim", "server", "client"]
+    let attachedRoles = ["sim", "client", "server"]
+    let flags = ["--abort-on-container-exit", "--timeout", "10"]
+    let startOrder = ["sim", "client", "server"]
+    if serverPhase { createdRoles = ["sim", "server"]; attachedRoles = ["server"]; flags = []; startOrder = ["sim", "server"] }
+    else if name == "compose-client-renewal" { createdRoles = ["sim", "client"]; attachedRoles = ["sim", "client"]; flags = ["--timeout", "0", "--abort-on-container-exit"]; startOrder = ["sim", "client"] }
+    let expectedPrepare = prefix.slice(0, prefix.length)
+    if common.member(argv, "-V") { for token in ["up", "--no-start", "--pull", "never", "--no-build", "-V"] { expectedPrepare.add(token) } }
+    else { for token in ["create", "--pull", "never", "--no-build", "--no-recreate"] { expectedPrepare.add(token) } }
+    for role in createdRoles { expectedPrepare.add(role) }
+    let expectedAttached = prefix.slice(0, prefix.length)
+    for token in ["up", "--no-build", "--no-recreate", "--pull", "never"] { expectedAttached.add(token) }
+    for token in flags { expectedAttached.add(token) }
+    for role in attachedRoles { expectedAttached.add(role) }
+    let commandValues: List<json.Value> = []
+    for command in commands { commandValues = commandValues.appended(support.texts(command)) }
+    let caughtValue = support.none()
+    if caught.length > 0 { caughtValue = common.exception(caught[0]) }
+    let commandRows: List<json.Value> = []
+    for row in records.rows { commandRows = commandRows.appended(process.rowJson(row)) }
+    let fixtureBinding = try common.binding(fixture)
+    let recorded = try common.atomicJson(path(root, "phase-argv.json"), support.obj(["scope", "pinned_commit", "pinned_fixture", "pinned_source_commands", "upstream", "commands", "expected_prepare", "expected_attached", "caught"],
+        [support.text("mock pinned source phases and monitor; no actual Docker behavior proof"), support.text(common.PIN), common.boundPath(fixtureBinding), data.array(commandRows),
+            support.texts(argv), data.array(commandValues), support.texts(expectedPrepare), support.texts(expectedAttached), caughtValue]))
+    let found = support.outcome("passed", "passed")
+    if name == "compose-unknown-service" {
+        support.check(found, "unknown_selected_service_rejected", isKind(caught, "OwnershipError"))
+        support.check(found, "no_daemon_command", commands.length == 0)
+    } else if name == "compose-dependency-recreation" || name == "compose-dependency-foreign-object" {
+        let admission = try common.readJson(path(owner.artifacts, "create-admission.json"))
+        let latest = try common.readJson(statePath)
+        support.check(found, "changed_dependency_objects_rejected", isKind(caught, "OwnershipError"))
+        support.check(found, "admission_uncertified", common.equalText(data.field(admission, "state"), "interrupted-uncertified") && common.isFalse(data.field(admission, "certified")))
+        support.check(found, "exact_precreated_dependency_ids", common.sameTexts(common.textList(data.field(admission, "created_ids")), model.created))
+        support.check(found, "injected_object_retained", model.injected.length > 0 && common.hasKey(data.field(latest, "containers"), model.injected[0]))
+    } else {
+        let exact = commands.length == 2 && common.sameTexts(commands[0], expectedPrepare) && common.sameTexts(commands[1], expectedAttached)
+        let conflict = false
+        for command in commands { if common.member(command, "-V") && common.member(command, "--no-recreate") { conflict = true } }
+        let expectedStatus = 0
+        if name == "server-exit-live-simulator" { expectedStatus = 127 }
+        support.check(found, "exact_setup_and_attached_argv", exact)
+        support.check(found, "no_flag_conflict", !conflict)
+        support.check(found, "attached_abort_timeout_preserved", commands.length > 0 && common.sameTexts(commands[commands.length - 1], expectedAttached))
+        support.check(found, "exact_up_status", status == expectedStatus)
+        support.check(found, "original_selected_monitor_roles", common.sameTexts(model.monitored, attachedRoles))
+        support.check(found, "dependency_start_order", common.sameTexts(model.started, startOrder))
+        support.check(found, "no_dependency_recreation", model.recreate.length > 0 && !model.recreate[0])
+        if name == "server-exit-live-simulator" {
+            support.check(found, "server_returns_with_simulator_alive", caught.length == 0 && model.complete.length > 0 && model.complete[0] && model.alive.length > 0 && model.alive[0])
+            support.check(found, "exact_unsupported_output", Text(fake.output) == "mock server UNSUPPORTED\n")
+        }
+    }
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function retainedFile(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let original = common.failure("RuntimeError", "original retained file sentinel")
+    let timeoutOriginal = process.timeoutFailure(["owned"], 100 * common.MILLISECOND)
+    let injections: List<Text> = []
+    let nonzero = name == "retained-file-nonzero"
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "file-close" && (detail == "000.stdout" || detail == "000.stderr") && !common.member(injections, detail) {
+            injections.add(detail)
+            return Err<Boolean, common.Failure>(common.failure("OSError", "secondary retained " + detail + " FILE close"))
+        }
+        if point == "select" && !nonzero {
+            if name == "retained-file-timeout" { return Err<Boolean, common.Failure>(timeoutOriginal) }
+            return Err<Boolean, common.Failure>(original)
+        }
+        return ok()
+    })
+    let argv = ["/bin/sleep", "10"]
+    if nonzero { argv = ["/bin/sh", "-c", "echo status37; exit 37"] }
+    let caught = caughtOutput(process.run(records, argv, process.options(3 * common.SECOND)))
+    common.resetSeams()
+    let row = rowOf(records)
+    let desired = false
+    if nonzero { desired = isKind(caught, "CleanupError") && caught[0].message == "owned command failed: 37" && row.status.length > 0 && row.status[0] == 37 }
+    else if name == "retained-file-timeout" { desired = isSame(caught, timeoutOriginal) }
+    else { desired = isSame(caught, original) }
+    let fileErrors = 0
+    for item in row.problems { if common.contains(item.message, "retained") && common.contains(item.message, "FILE close") { fileErrors += 1 } }
+    let notes = 0
+    if caught.length > 0 { for value in caught[0].notes { if common.contains(value, "FILE close") { notes += 1 } } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "original_primary_identity_or_exact37", desired)
+    support.check(found, "both_retained_FILES_closed", common.sameSet(injections, ["000.stdout", "000.stderr"]))
+    support.check(found, "secondary_FILE_errors_retained", fileErrors == 2)
+    support.check(found, "secondary_notes_on_primary", notes == 2)
+    support.check(found, "owned_children_drained", process.directChildren().length == 0)
+    support.check(found, "final_raw_ledger", common.isFile(path(records.root, "commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function postPidfd(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let target = path(root, "target-executed")
+    let original = common.failure("OSError", "[Errno 24] one-shot post-Popen pidfd allocation")
+    if name == "pidfd-post-popen-attribute" { original = common.failure("AttributeError", "one-shot post-Popen pidfd missing") }
+    let created: List<Integer> = []
+    let failed = [false]
+    let restored: List<Boolean> = []
+    let closeFault = [false]
+    let prior = subreaperValue()
+    let gateCase = name == "pidfd-post-popen-gate-close"
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "spawned" { created.add(common.integerText(detail)) }
+        if point == "pidfd-open" && created.length > 0 && common.integerText(detail) == created[created.length - 1] && !failed[0] {
+            failed[0] = true
+            return Err<Boolean, common.Failure>(original)
+        }
+        if point == "gate-close" && gateCase && detail == "gate_write" && !closeFault[0] {
+            closeFault[0] = true
+            return Err<Boolean, common.Failure>(common.failure("OSError", "secondary bootstrap gate FILE descriptor close"))
+        }
+        if point == "prctl-restore" {
+            let all = true
+            for pid in created { if common.exitedNoWait(pid) != -10 { all = false } }
+            restored.add(all)
+        }
+        return ok()
+    })
+    let caught = caughtOutput(process.run(records, [context.self, "--helper", "write-sleep", target], process.options(3 * common.SECOND)))
+    common.resetSeams()
+    common.pause(100)
+    let row = rowOf(records)
+    let reaped = true
+    for pid in created { if common.exitedNoWait(pid) != -10 { reaped = false } }
+    let allRestored = restored.length > 0
+    for value in restored { if !value { allRestored = false } }
+    let held = true
+    for receipt in row.lifetime.receipts { if receipt.authority != "held-pidfd" { held = false } }
+    let found = support.outcome("passed", "passed")
+    support.check(found, "actual_post_Popen_fault", failed[0] && created.length > 0)
+    support.check(found, "original_fd_error_identity", isSame(caught, original))
+    support.check(found, "target_never_executed", !common.exists(target))
+    support.check(found, "exact_bootstrap_reaped", reaped)
+    support.check(found, "restore_after_owned_closure", allRestored)
+    support.check(found, "nonpass_raw_ledger", !row.lifetime.certified && common.isFile(path(records.root, "commands.json")))
+    support.check(found, "no_numeric_signal_fallback", held)
+    if gateCase {
+        support.check(found, "actual_secondary_gate_close", closeFault[0])
+        support.check(found, "gate_close_preserves_primary", isSame(caught, original) && common.hasNote(original, "gate FILE descriptor close"))
+    }
+    for pid in created { if support.running(pid) { support.terminate(pid) } }
+    common.subreaperSet(prior)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function sigchld(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let records = try process.rawCommands(path(root, "commands"))
+    let created: List<Integer> = []
+    setFault(function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+        if point == "spawned" { created.add(common.integerText(detail)) }
+        return ok()
+    })
+    common.sigchldSet(true)
+    let caught = caughtOutput(process.run(records, ["/bin/sleep", "3"], process.options(100 * common.MILLISECOND)))
+    common.sigchldSet(false)
+    common.resetSeams()
+    let found = support.outcome("passed", "passed")
+    support.check(found, "SIGCHLD_ignored_rejected_prelaunch", isKind(caught, "OwnershipError"))
+    support.check(found, "no_child_spawned", created.length == 0)
+    support.check(found, "raw_rejection_ledger", common.isFile(path(records.root, "commands.json")))
+    return Ok<support.Outcome, common.Failure>(found)
+}
+function forwardReplay(context: Context, root: Text): Result<support.Outcome, common.Failure> {
+    let fake = try receiptDaemon(root, 0)
+    let payload = Bytes("ready-out\ntail-out\n")
+    let calls: List<List<Text>> = []
+    let streams: List<Boolean> = []
+    fake.setup.daemon.commandHook.truncate(0)
+    fake.setup.daemon.commandHook.add(function(args: List<Text>, chosen: process.RunOptions): Result<process.Output, common.Failure> {
+        let raw = try fakeCommand(fake, args, chosen)
+        calls.add(args.slice(0, args.length))
+        streams.add(chosen.stream)
+        if common.member(args, "up") {
+            if chosen.stream { fake.output.addBytes(payload) }
+            return Ok<process.Output, common.Failure>(process.Output { payload: payload; path: "" })
+        }
+        return Ok<process.Output, common.Failure>(raw)
+    })
+    let status = try invokeFake(fake)
+    let intent = try common.readJson(path(fake.setup.owner.artifacts, "create-admission.json"))
+    let ups: List<Integer> = []
+    let createStreamed = false
+    for index in 0..calls.length {
+        if common.member(calls[index], "up") { ups.add(index) }
+        if common.member(calls[index], "create") && streams[index] { createStreamed = true }
+    }
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "scope", support.text("actual docker_entry with mocked Docker boundaries only"))
+    support.check(found, "adapter_branch_completed", status == 0 && common.equalText(data.field(intent, "state"), "closed") && common.isTrue(data.field(intent, "certified")))
+    support.check(found, "actual_workload_opt_in", ups.length == 1 && streams[ups[0]])
+    support.check(found, "stdout_replay_absent", Text(fake.output) == Text(payload))
+    support.check(found, "stderr_replay_absent", Text(fake.error) == "exact up stderr\n")
+    support.check(found, "create_not_forwarded", !createStreamed)
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+record Pipes { fds: List<Integer>; open: List<Boolean>; output: Bytes; error: Bytes }
+function pump(pipes: Pipes, milliseconds: Integer): Boolean {
+    let deadline = common.now() + milliseconds * common.MILLISECOND
+    while pipes.open[0] || pipes.open[1] {
+        let remaining = (deadline - common.now()) / common.MILLISECOND
+        if remaining <= 0 { return false }
+        let fds: List<Integer> = []
+        let slots: List<Integer> = []
+        for index in 0..2 { if pipes.open[index] { fds.add(pipes.fds[index]); slots.add(index) } }
+        let ready = common.pollFds(fds, min(20, remaining))
+        for position in 0..fds.length {
+            if !ready[position] { continue }
+            let chunk = common.readSome(fds[position], common.CHUNK)
+            if chunk.length == 0 {
+                pipes.open[slots[position]] = false
+                common.closeFd(fds[position])
+            } else if slots[position] == 0 { pipes.output.addBytes(chunk) } else { pipes.error.addBytes(chunk) }
+        }
+    }
+    return true
+}
+function absentMember(value: json.Value): Boolean {
+    let fields = common.statFields(common.integerOf(data.field(value, "pid")))
+    if fields.length < 20 { return true }
+    return common.integerText(fields[19]) != common.integerOf(data.field(value, "start_ticks"))
+}
+function forwarding(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    let mode = "stream"
+    if name == "raw-forward-private-json" { mode = "private" }
+    if name == "raw-forward-backpressure" { mode = "blocked" }
+    let empty = name == "raw-forward-empty"
+    let code = 0
+    if name == "raw-forward-stderr-status" { code = 7 }
+    let ready = "ready-out\n"
+    if empty { ready = "" } else if mode == "private" { ready = "{\"inspect\":\"mock\"}\n" }
+    let warning = "ready-err\n"
+    let tail = "tail-out\n"
+    let tailError = "tail-err\n"
+    if empty || mode == "private" { warning = ""; tail = ""; tailError = "" }
+    let emitted = path(root, "emitted.json")
+    let release = path(root, "release")
+    let workerResult = path(root, "worker-result.json")
+    let producer = [context.self, "--helper", "producer", emitted, release, mode, Text(code), ready, warning, tail, tailError]
+    let timeout = 5000
+    if mode == "blocked" { timeout = 1000 }
+    let workerArgv = [context.self, "--helper", "worker", context.adapter, root, mode, Text(timeout)]
+    for value in producer { workerArgv.add(value) }
+    let prior = try process.subreaperBegin()
+    let outPair = common.pipePair()
+    let errPair = common.pipePair()
+    let pid = common.spawn(context.self, workerArgv, -1, outPair & 4294967295, errPair & 4294967295, -1, common.SPAWN_PARENT_DEATH)
+    common.closeFd(outPair & 4294967295)
+    common.closeFd(errPair & 4294967295)
+    if pid < 0 {
+        common.subreaperSet(prior)
+        return Err<support.Outcome, common.Failure>(common.systemFailure(-pid, context.self))
+    }
+    let pipes = Pipes { fds: [outPair >> 32, errPair >> 32]; open: [true, true]; output: Bytes(); error: Bytes() }
+    let handles: List<process.Handle> = []
+    let custody: List<Text> = []
+    let forced = [false]
+    let workerIdentity = common.processIdentity(pid)
+    match process.openOwnedChildHandle(pid) {
+        Ok(handle) { handle.identity = workerIdentity; handles.add(handle) }
+        Err(problem) {}
+    }
+    let early = Pipes { fds: []; open: []; output: Bytes(); error: Bytes() }
+    let expired = [false]
+    let live = [false]
+    let earlyPrivate = Pipes { fds: []; open: []; output: Bytes(); error: Bytes() }
+    let producerIdentity = support.none()
+    let workerStatus = [-1]
+    support.waitExists(emitted, 4000)
+    if common.exists(emitted) {
+        match common.readJson(emitted) {
+            Ok(value) {
+                producerIdentity = value
+                match process.openProcessHandle(common.readMember(value)) {
+                    Ok(handle) { handles.add(handle) }
+                    Err(problem) {}
+                }
+            }
+            Err(problem) {}
+        }
+    }
+    if mode == "blocked" {
+        let deadline = common.now() + 7 * common.SECOND
+        while !common.exists(workerResult) && support.running(pid) && common.now() < deadline { common.pause(10) }
+    } else {
+        let finished = pump(pipes, 400)
+        if !finished || support.running(pid) {
+            expired[0] = true
+            early.output.addBytes(pipes.output)
+            early.error.addBytes(pipes.error)
+            live[0] = support.running(pid)
+            earlyPrivate.output.addBytes(common.readOr(path(root, "commands/000.stdout")))
+            earlyPrivate.error.addBytes(common.readOr(path(root, "commands/000.stderr")))
+        }
+        support.quietly(common.touch(release))
+    }
+    support.quietly(common.touch(release))
+    pump(pipes, 8000)
+    workerStatus[0] = support.waitFor(pid, 8000)
+    if workerStatus[0] == -999 {
+        forced[0] = true
+        system.sendSignal(pid, 15)
+        workerStatus[0] = support.waitFor(pid, 2000)
+        if workerStatus[0] == -999 { system.sendSignal(pid, 9); workerStatus[0] = support.waitFor(pid, 2000) }
+    }
+    for orphan in process.directChildren() {
+        forced[0] = true
+        match process.openProcessHandle(orphan) {
+            Ok(handle) {
+                handles.add(handle)
+                if !readyOf(handle) { support.quietly(process.handleSend(handle, 9)); custody.add("killed " + Text(orphan.pid)) }
+            }
+            Err(problem) {}
+        }
+        support.waitFor(orphan.pid, 2000)
+        custody.add("reaped " + Text(orphan.pid))
+    }
+    let deadline = common.now() + 2 * common.SECOND
+    let allReady = false
+    while common.now() < deadline {
+        allReady = true
+        for handle in handles { if !readyOf(handle) { allReady = false } }
+        if allReady { break }
+        common.pause(10)
+    }
+    for handle in handles { support.quietly(process.handleClose(handle)) }
+    let restored = common.subreaperSet(prior) == 0
+    let wroteCustody = try common.atomicJson(path(root, "custody.json"), support.obj(["outer_group", "driver_identity", "forced_cleanup", "events", "handles_ready", "subreaper_restored"],
+        [support.number(common.processGroup()), common.identityJson(currentIdentity()), support.flag(forced[0]), support.texts(custody), support.flag(allReady), support.flag(restored)]))
+    if !allReady { return Err<support.Outcome, common.Failure>(common.failure("RuntimeError", "harmless test lifetime remains unresolved")) }
+    let value = try common.readJson(workerResult)
+    let row = data.field(value, "row")
+    let lifetime = data.field(row, "lifetime")
+    let workerBirth = try common.readJson(path(root, "worker-ready.json"))
+    let privateOutput = common.readOr(common.textOf(data.field(data.field(row, "stdout"), "path")))
+    let privateError = common.readOr(common.textOf(data.field(data.field(row, "stderr"), "path")))
+    let closedMembers = true
+    for member in data.field(lifetime, "members").items { if !absentMember(member) { closedMembers = false } }
+    let workerAbsent = workerIdentity.pid >= 0 && common.processIdentity(workerIdentity.pid).pid < 0
+    let producerAbsent = producerIdentity.kind == json.OBJECT && absentMember(producerIdentity)
+    let found = support.outcome("passed", "passed")
+    support.detail(found, "scope", support.text("harmless forwarding control only; no Docker/network or official verdict"))
+    support.detail(found, "worker_status", support.number(workerStatus[0]))
+    support.detail(found, "worker_result", value)
+    support.check(found, "real_child_executed", data.field(row, "process_identity").kind == json.OBJECT)
+    support.check(found, "source_unchanged", common.isTrue(data.field(value, "source_equal")))
+    support.check(found, "physical_lifetime_closed", closedMembers && workerAbsent && producerAbsent && allReady)
+    support.check(found, "root_wait_recorded", common.isInteger(data.field(row, "status")))
+    support.check(found, "no_forced_worker_cleanup", !forced[0])
+    support.check(found, "sink_mode_restored", data.equal(data.field(value, "blocking_before"), data.field(value, "blocking_after")))
+    support.check(found, "outer_group_owns_worker", data.equalsInteger(data.field(workerBirth, "pgid"), common.processGroup()))
+    support.check(found, "kernel_death_chain", data.equalsInteger(data.field(workerBirth, "parent_pid"), system.processId()) && data.equalsInteger(data.field(workerBirth, "parent_death_signal"), 9) &&
+        data.equalsInteger(data.field(producerIdentity, "parent_pid"), pid) && data.equalsInteger(data.field(producerIdentity, "parent_death_signal"), 9))
+    let producerPid = common.integerOf(data.field(producerIdentity, "pid"))
+    support.check(found, "producer_separate_session_bound", producerPid > 0 && data.equalsInteger(data.field(producerIdentity, "pgid"), producerPid) &&
+        data.equalsInteger(data.field(producerIdentity, "session"), producerPid) &&
+        data.equalsInteger(data.field(data.field(row, "process_identity"), "pid"), producerPid) &&
+        data.equal(data.field(data.field(row, "process_identity"), "start_ticks"), data.field(producerIdentity, "start_ticks")))
+    support.check(found, "subreaper_restored", restored)
+    let failure = data.field(value, "failure")
+    if mode == "blocked" {
+        support.check(found, "actual_timeout_preserved", common.equalText(data.field(failure, "type"), "TimeoutExpired") && common.isTrue(data.field(row, "timed_out")) &&
+            common.equalText(data.field(data.field(row, "primary_exception"), "type"), "TimeoutExpired"))
+        support.check(found, "abort_not_certified", common.isFalse(data.field(lifetime, "certified")))
+        support.check(found, "private_retention_bounded", common.integerOf(data.field(data.field(row, "stdout"), "bytes")) <= common.MAX_BYTES)
+        support.check(found, "control_worker_not_protocol_verdict", workerStatus[0] == 0)
+    } else {
+        support.check(found, "normal_child_status", data.equalsInteger(data.field(row, "status"), code) && workerStatus[0] == code)
+        support.check(found, "normal_lifetime_state_closed", common.equalText(data.field(lifetime, "state"), "closed"))
+        support.check(found, "normal_lifetime_certified", common.isTrue(data.field(lifetime, "certified")))
+        support.check(found, "caller_timeout_observed", expired[0] && live[0])
+        support.check(found, "private_exact_stdout", Text(privateOutput) == ready + tail)
+        support.check(found, "private_exact_stderr", Text(privateError) == warning + tailError)
+        if empty {
+            support.check(found, "empty_still_literal_error", early.output.length == 0)
+            support.check(found, "no_fabricated_upstream_bytes", pipes.output.length == 0 && pipes.error.length == 0)
+        } else if mode == "private" {
+            support.check(found, "structured_json_not_forwarded", early.output.length == 0 && early.error.length == 0 && pipes.output.length == 0 && pipes.error.length == 0)
+            let privateRoot = path(root, "private-spec")
+            let madePrivate = try common.makeDirectory(privateRoot)
+            let privateSetup = try support.setup(privateRoot)
+            let mockCli = path(root, "mock-cli")
+            let wroteCli = try common.writeText(mockCli, "mock binding, never executed")
+            let daemon = adapter.dockerShell(privateSetup.owner)
+            daemon.docker = mockCli
+            let cliBinding = try common.binding(mockCli)
+            daemon.cli.add(cliBinding)
+            let captured: List<Boolean> = []
+            daemon.runnerHook.add(function(argv: List<Text>, chosen: process.RunOptions): Result<process.Output, common.Failure> {
+                captured.add(chosen.stream)
+                return Ok<process.Output, common.Failure>(process.Output { payload: Bytes("{\"mock\":true}"); path: "" })
+            })
+            let inspected = try adapter.commandOf(daemon, ["inspect", "mock"], process.options(10 * common.SECOND))
+            let created = try adapter.commandOf(daemon, ["compose", "create", "mock"], process.options(10 * common.SECOND))
+            support.check(found, "inspect_create_default_private", captured.length == 2 && !captured[0] && !captured[1])
+        } else {
+            support.check(found, "early_ready_stdout", early.output.length > 0 && Text(early.output).startsWith(ready))
+            support.check(found, "early_ready_stderr", early.error.length > 0 && Text(early.error).startsWith(warning))
+            support.check(found, "early_private_before_forward", Text(earlyPrivate.output).startsWith(ready) && Text(earlyPrivate.error).startsWith(warning))
+            support.check(found, "upstream_exact_once", Text(pipes.output) == ready + tail && Text(pipes.error) == warning + tailError)
+        }
+    }
+    return Ok<support.Outcome, common.Failure>(found)
+}
+
+function runCase(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
+    if name == "raw-forward-no-duplicate" { return forwardReplay(context, root) }
+    if name.startsWith("raw-forward-") { return forwarding(context, name, root) }
+    if name.startsWith("held-empty-") { return heldEmpty(context, name, root) }
+    if name.startsWith("compose-") || name == "server-exit-live-simulator" { return exactCompose(context, name, root) }
+    if name.startsWith("retained-file-") { return retainedFile(context, name, root) }
+    if name == "sigchld-preflight-ignored" { return sigchld(context, root) }
+    if name.startsWith("pidfd-post-popen-") { return postPidfd(context, name, root) }
+    if name == "raw-birthday-failure" { return birthdayFailure(context, root, false) }
+    if name == "raw-birthday-failure-escaped" { return birthdayFailure(context, root, true) }
+    if name == "admitted-cli-controller-death" { return parentDeath(context, root) }
+    if name == "admission-close-lock-race" { return lockRace(context, root) }
+    if name == "phase-next-admission" { return phaseNext(context, root) }
+    if name == "created-wrong-configured-id" || name == "stopped-wrong-configured-id" { return wrongConfigured(context, root) }
+    if name.startsWith("admitted-cli-") { return admittedControl(context, name, root) }
+    if name == "up-status-one" || name == "up-status-unsupported" { return upReceipt(context, name, root) }
+    if name == "created-declared-networks" || name == "stopped-declared-networks" { return declaredTopology(context, name, root) }
+    if name == "admission-not-opened-revoked" || name == "admission-closed-revoked" { return revoked(context, name, root) }
+    if name == "watch-late-object" { return lateObject(context, root) }
+    if name == "pidfd-check-signal-race" || name == "session-extinction-latch" { return pidfdControl(context, name, root) }
+    if name == "root-wnowait-before-drain" { return wnowait(context, root) }
+    if name == "close-secondary-preserves-primary" || name == "close-state-secondary-preserves-primary" { return closePrimary(context, name, root) }
+    if name == "copy-official-fixture-layout" { return copyLayout(context, root) }
+    if name == "raw-restoration-failure" { return restoration(context, root) }
+    if name == "retention-manifest-deadline" { return manifestDeadline(context, root) }
+    if name == "raw-partial-initialization" { return partialCli(context, root) }
+    if name == "raw-escaped-timeout" { return timeoutCli(context, root) }
+    if name == "raw-foreign-child-boundary" { return foreignCli(context, root) }
+    if name.startsWith("startup-") { return startupControl(context, name, root) }
+    if name == "watch-primary-cleanup-secondary" { return watchSecondary(context, root) }
+    if name.startsWith("raw-cli-") { return cliDescendant(context, name, root) }
+    if name.startsWith("admission-") { return admissionControl(context, name, root) }
+    if name == "raw-stream-overlimit" { return rawStream(context, root) }
+    if name == "copy-safe-archive" || name == "copy-unsafe-archive" { return archiveControl(context, name, root) }
+    if name.startsWith("watch-") { return watchFault(context, name, root) }
+    if name == "author-registry-primary" { return registryPrimary(context, root) }
+    if name == "late-reinspection-failure" { return reinspect(context, root) }
+    if common.member(["foreign-network-mode", "host-pid-mode", "host-ipc-mode", "extra-network-membership", "wrong-network-id"], name) { return networkControl(context, name, root) }
+    if name.startsWith("retention-") && name != "retention-late-mutation" && name != "retention-bounds" { return boundedRetention(context, name, root) }
+    if name == "copy-size-bound" { return copyBound(context, root) }
+    if name.startsWith("controller-") || name == "guard-death" || name == "deadline" || name == "resource-abort" { return processControl(context, name, root) }
+    if name == "tree-primary-finalization" { return treePrimary(context, root) }
+    if name == "raw-nonzero-status" { return rawStatus(context, root) }
+    if name == "root-exited-descendant" { return descendant(context, root) }
+    if name == "unsupported-compliance-exit" { return unsupportedExit(context, root) }
+    if name == "retention-late-mutation" { return lateMutation(context, root) }
+    if name == "raw-evidence-reuse" { return rawReuse(context, root) }
+    if name == "raw-primary-finalization" { return rawPrimary(context, root) }
+    if name.startsWith("fixture-access") { return fixtureAccess(context, name, root) }
+    if name == "primary-retention-failure" { return primaryRetention(context, root) }
+    if name == "retention-bounds" { return retentionBounds(context, root) }
+    if name == "criteria-no-pull" { return criteriaControl(context, root) }
+    return mockCleanup(context, name, root)
+}
+function retainInput(inputs: Text, role: Text, source: Text): Result<json.Value, common.Failure> {
+    let payload = try common.readBytes(source)
+    let retained = path(inputs, role)
+    let wrote = try common.writeBytes(retained, payload)
+    let bound = try common.binding(retained)
+    return Ok<json.Value, common.Failure>(support.obj(["original_before", "retained"],
+        [support.obj(["sha256", "bytes"], [support.text(common.digestBytes(payload)), support.number(payload.length)]), common.boundPath(bound)]))
+}
+function refuse(message: Text): Integer {
+    system.writeStandardError("quic-official-adapter: " + message + "\n")
+    return 2
+}
+function controls(): Integer {
+    let artifacts = ""
+    let pinned = "/home/user/minyar-overnight/security/interop-lab/runner"
+    let launcher = ""
+    let selected: List<Text> = []
+    let index = 0
+    while index + 1 < argumentCount() {
+        let option = argument(index)
+        if option == "--artifacts" { artifacts = argument(index + 1) }
+        else if option == "--pinned-runner" { pinned = argument(index + 1) }
+        else if option == "--adapter" { launcher = argument(index + 1) }
+        else if option == "--case" { selected.add(argument(index + 1)) }
+        else { return refuse("unknown option " + option) }
+        index += 2
+    }
+    if index != argumentCount() { return refuse("options take one value") }
+    if !common.isAbsolute(artifacts) || common.present(artifacts) { return refuse("--artifacts requires a fresh absolute path") }
+    if !common.isAbsolute(launcher) || !common.isFile(launcher) { return refuse("--adapter requires the built owned adapter") }
+    let all = CASES
+    for name in selected { if !common.member(all, name) { return refuse("unknown case " + name) } }
+    let cases = all
+    if selected.length > 0 { cases = selected }
+    let context = Context { adapter: launcher; pinned: pinned; self: common.selfExecutable() }
+    match common.makeDirectories(artifacts) {
+        Ok(value) {}
+        Err(problem) { return refuse(problem.message) }
+    }
+    let inputs = path(artifacts, "inputs")
+    support.quietly(common.makeDirectory(inputs))
+    let roles = ["driver", "helper"]
+    let sources = [context.self, launcher]
+    let inputValues: List<json.Value> = []
+    for position in 0..2 {
+        match retainInput(inputs, roles[position], sources[position]) {
+            Ok(value) { inputValues = inputValues.appended(value) }
+            Err(problem) { return refuse(problem.message) }
+        }
+    }
+    let results: List<json.Value> = []
+    let passed = true
+    for name in cases {
+        let root = path(artifacts, name)
+        support.quietly(common.makeDirectory(root))
+        common.resetSeams()
+        process.resetOps()
+        process.setLauncher(launcher)
+        let status = "setup-or-control-error"
+        let expected = "defined-control-result"
+        let matched = false
+        let result = support.none()
+        match runCase(context, name, root) {
+            Ok(found) {
+                status = found.status
+                expected = found.expected
+                matched = support.matched(found)
+                result = support.outcomeJson(found)
+            }
+            Err(problem) {
+                result = support.obj(["status", "exception"], [support.text(status), common.exception(problem)])
+            }
+        }
+        common.resetSeams()
+        process.resetOps()
+        support.quietly(common.atomicJson(path(root, "result.json"), result))
+        if !matched { passed = false }
+        results = results.appended(support.obj(["case", "expected", "status", "matched"], [support.text(name), support.text(expected), support.text(status), support.flag(matched)]))
+    }
+    let inputKeys: List<Text> = []
+    let inputItems: List<json.Value> = []
+    for position in 0..2 {
+        let after = common.bindingOr(sources[position])
+        let before = data.field(inputValues[position], "original_before")
+        let retained = data.field(inputValues[position], "retained")
+        let exact = common.boundEquals(before, after) && data.equal(data.field(retained, "sha256"), data.field(before, "sha256")) && data.equal(data.field(retained, "bytes"), data.field(before, "bytes"))
+        if !exact { passed = false }
+        inputKeys.add(roles[position])
+        inputItems = inputItems.appended(data.with(data.with(inputValues[position], "original_after", common.boundPath(after)), "copied_exact", support.flag(exact)))
+    }
+    let names: List<Text> = []
+    let bindings: List<json.Value> = []
+    match common.boundedPaths(artifacts, 1000000, 0) {
+        Ok(entries) {
+            let relative: List<Text> = []
+            for entry in entries { if common.isFile(entry) { relative.add(common.relativeTo(entry, artifacts)) } }
+            relative.sort()
+            for item in relative { names.add(item); bindings = bindings.appended(common.boundPath(common.bindingOr(path(artifacts, item)))) }
+        }
+        Err(problem) { passed = false }
+    }
+    let status = "failed"
+    if passed { status = "passed" }
+    let summary = support.obj(["schema_version", "scope", "status", "inputs", "declared_cases", "results"],
+        [support.number(1), support.text("mock daemon and owned harmless process controls only; no actual Docker, peer, compiler or network traffic"), support.text(status),
+            support.obj(inputKeys, inputItems), support.texts(cases), data.array(results)])
+    support.quietly(common.atomicJson(path(artifacts, "results.json"), data.with(summary, "files", support.obj(names, bindings))))
+    print(data.pretty(summary))
+    if passed { return 0 }
+    return 1
+}
+function main(): Integer {
+    if argumentCount() >= 2 && argument(0) == "--helper" { return support.runHelper() }
+    return controls()
+}

@@ -1,0 +1,915 @@
+use "json" as json
+use "system" as system
+use "files" as files
+use "../../quic-json.min" as data
+use "./owned-common.min" as common
+
+public record Handle {
+    identity: common.Member
+    ready: Callback<Result<Boolean, common.Failure>>
+    send: Callback<Integer, Result<Boolean, common.Failure>>
+    close: Callback<Result<Boolean, common.Failure>>
+}
+public record Receipt { identity: common.Member; signal: Text; owned: common.Member; authority: Text; attempted: Boolean }
+public record Ops {
+    members: Callback<common.Member, List<common.Member>, Boolean, Result<List<common.Member>, common.Failure>>
+    openHandle: Callback<common.Member, Result<Handle, common.Failure>>
+    extinct: List<Text>
+    unresolved: List<Text>
+    held: List<Handle>
+    launcher: List<Text>
+    spawnFlags: List<Integer>
+}
+
+function realMembers(): Callback<common.Member, List<common.Member>, Boolean, Result<List<common.Member>, common.Failure>> {
+    return function(identity: common.Member, known: List<common.Member>, adopt: Boolean): Result<List<common.Member>, common.Failure> {
+        return cliMembers(identity, known, adopt)
+    }
+}
+function realOpen(): Callback<common.Member, Result<Handle, common.Failure>> {
+    return function(identity: common.Member): Result<Handle, common.Failure> { return openProcessHandle(identity) }
+}
+function defaultOps(): Ops {
+    return Ops { members: realMembers(); openHandle: realOpen(); extinct: []; unresolved: []; held: []; launcher: []; spawnFlags: [0] }
+}
+public constant OPS: Ops = defaultOps()
+
+public function resetOps() {
+    let ops = OPS
+    ops.members = realMembers()
+    ops.openHandle = realOpen()
+    ops.spawnFlags[0] = 0
+}
+public function setLauncher(path: Text) {
+    let ops = OPS
+    ops.launcher.truncate(0)
+    ops.launcher.add(path)
+}
+public function launcherPath(): Text {
+    let ops = OPS
+    if ops.launcher.length > 0 { return ops.launcher[0] }
+    return common.selfExecutable()
+}
+public function cliKey(identity: common.Member): Text { return Text(identity.pid) + ":" + Text(identity.startTicks) }
+public function extinct(identity: common.Member): Boolean {
+    let ops = OPS
+    return common.member(ops.extinct, cliKey(identity))
+}
+public function forgetExtinction(identity: common.Member) {
+    let ops = OPS
+    let kept: List<Text> = []
+    for key in ops.extinct { if key != cliKey(identity) { kept.add(key) } }
+    ops.extinct.truncate(0)
+    for key in kept { ops.extinct.add(key) }
+}
+function latchExtinction(identity: common.Member): Result<Boolean, common.Failure> {
+    let ops = OPS
+    let key = cliKey(identity)
+    if !common.member(ops.extinct, key) && ops.extinct.length >= common.MAX_FILES {
+        return Err<Boolean, common.Failure>(common.ownership("owned CLI extinction ledger bound exceeded"))
+    }
+    if !common.member(ops.extinct, key) { ops.extinct.add(key) }
+    return Ok<Boolean, common.Failure>(true)
+}
+
+public function findMember(values: List<common.Member>, pid: Integer): Integer {
+    for index in 0..values.length { if values[index].pid == pid { return index } }
+    return -1
+}
+public function putMember(values: List<common.Member>, value: common.Member) {
+    let index = findMember(values, value.pid)
+    if index >= 0 { values[index] = value } else { values.add(value) }
+}
+public function copyMembers(values: List<common.Member>): List<common.Member> {
+    let result: List<common.Member> = []
+    for value in values { result.add(value) }
+    return result
+}
+public function findHandle(values: List<Handle>, pid: Integer): Integer {
+    for index in 0..values.length { if values[index].identity.pid == pid { return index } }
+    return -1
+}
+public function handleReady(handle: Handle): Result<Boolean, common.Failure> {
+    let ready = handle.ready
+    return ready()
+}
+public function handleSend(handle: Handle, signal: Integer): Result<Boolean, common.Failure> {
+    let send = handle.send
+    return send(signal)
+}
+public function handleClose(handle: Handle): Result<Boolean, common.Failure> {
+    let close = handle.close
+    return close()
+}
+public function allReady(values: List<Handle>): Result<Boolean, common.Failure> {
+    for handle in values {
+        let ready = try handleReady(handle)
+        if !ready { return Ok<Boolean, common.Failure>(false) }
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+
+public function procEntries(): List<Integer> {
+    let result: List<Integer> = []
+    for name in files.list("/proc") {
+        let pid = common.integerText(name)
+        if pid > 0 { result.add(pid) }
+    }
+    return result
+}
+public function directChildren(): List<common.Member> {
+    let self = system.processId()
+    let result: List<common.Member> = []
+    for pid in procEntries() {
+        let fields = common.statFields(pid)
+        if fields.length >= 20 && common.integerText(fields[1]) == self {
+            result.add(common.Member { pid: pid; startTicks: common.integerText(fields[19]); pgid: common.integerText(fields[2]); session: common.integerText(fields[3]); origin: "exclusive-subreaper-child" })
+        }
+    }
+    return result
+}
+public function sessionMembers(pgid: Integer): List<common.Member> {
+    let result: List<common.Member> = []
+    for pid in procEntries() {
+        let fields = common.statFields(pid)
+        if fields.length >= 20 && common.integerText(fields[2]) == pgid && common.integerText(fields[3]) == pgid {
+            result.add(common.Member { pid: pid; startTicks: common.integerText(fields[19]); pgid: pgid; session: pgid; origin: "" })
+        }
+    }
+    return result
+}
+public function cliMembers(identity: common.Member, known: List<common.Member>, adopt: Boolean): Result<List<common.Member>, common.Failure> {
+    let rootMatches = false
+    let fields = common.statFields(identity.pid)
+    if fields.length >= 20 { rootMatches = common.integerText(fields[19]) == identity.startTicks }
+    let direct = adopt && identity.origin == "direct-unreaped-Popen"
+    rootMatches = rootMatches || direct
+    let open = rootMatches && !extinct(identity)
+    let result: List<common.Member> = []
+    if open { for value in sessionMembers(identity.pid) { result.add(value) } }
+    if adopt && open {
+        for value in directChildren() { if value.pid != identity.pid && findMember(result, value.pid) < 0 { result.add(value) } }
+    }
+    for value in known {
+        let current = common.statFields(value.pid)
+        if current.length >= 20 && common.integerText(current[19]) == value.startTicks && findMember(result, value.pid) < 0 {
+            result.add(common.Member { pid: value.pid; startTicks: value.startTicks; pgid: common.integerText(current[2]); session: common.integerText(current[3]); origin: value.origin })
+        }
+    }
+    return Ok<List<common.Member>, common.Failure>(result)
+}
+
+public function pidfdHandle(fd: Integer, identity: common.Member): Handle {
+    let closed = [false]
+    return Handle {
+        identity: identity
+        ready: function(): Result<Boolean, common.Failure> {
+            let status = common.pidfdReady(fd)
+            if status < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-status, "")) }
+            return Ok<Boolean, common.Failure>(status == 1)
+        }
+        send: function(signal: Integer): Result<Boolean, common.Failure> {
+            let status = common.pidfdSend(fd, signal)
+            if status == 0 { return Ok<Boolean, common.Failure>(true) }
+            if status == -3 {
+                if common.pidfdReady(fd) == 1 { return Ok<Boolean, common.Failure>(false) }
+                return Err<Boolean, common.Failure>(common.systemFailure(3, ""))
+            }
+            return Err<Boolean, common.Failure>(common.systemFailure(-status, ""))
+        }
+        close: function(): Result<Boolean, common.Failure> {
+            if closed[0] { return Ok<Boolean, common.Failure>(true) }
+            let status = common.closeFd(fd)
+            closed[0] = true
+            if status < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-status, "")) }
+            return Ok<Boolean, common.Failure>(true)
+        }
+    }
+}
+public function openProcessHandle(identity: common.Member): Result<Handle, common.Failure> {
+    let fd = common.pidfdOpen(identity.pid)
+    if fd < 0 { return Err<Handle, common.Failure>(common.systemFailure(-fd, "")) }
+    let fields = common.statFields(identity.pid)
+    if fields.length < 20 {
+        common.closeFd(fd)
+        return Err<Handle, common.Failure>(common.systemFailure(2, "/proc/" + Text(identity.pid) + "/stat"))
+    }
+    if common.integerText(fields[19]) != identity.startTicks {
+        common.closeFd(fd)
+        return Err<Handle, common.Failure>(common.ownership("pidfd birthday differs"))
+    }
+    return Ok<Handle, common.Failure>(pidfdHandle(fd, identity))
+}
+public function openHandle(identity: common.Member): Result<Handle, common.Failure> {
+    let ops = OPS
+    let opener = ops.openHandle
+    return opener(identity)
+}
+public function openOwnedChildHandle(pid: Integer): Result<Handle, common.Failure> {
+    let hooked = try common.fault("pidfd-open", Text(pid))
+    let fd = common.pidfdOpen(pid)
+    if fd < 0 { return Err<Handle, common.Failure>(common.systemFailure(-fd, "")) }
+    return Ok<Handle, common.Failure>(pidfdHandle(fd, common.Member { pid: pid; startTicks: -1; pgid: -1; session: -1; origin: "direct-unreaped-Popen" }))
+}
+public function childBirthday(pid: Integer): Result<common.Member, common.Failure> {
+    let hooked = try common.fault("birthday", Text(pid))
+    let fields = common.statFields(pid)
+    if fields.length < 20 { return Err<common.Member, common.Failure>(common.systemFailure(2, "/proc/" + Text(pid) + "/stat")) }
+    if common.integerText(fields[2]) != pid || common.integerText(fields[3]) != pid {
+        return Err<common.Member, common.Failure>(common.ownership("CLI did not enter its owned session"))
+    }
+    return Ok<common.Member, common.Failure>(common.Member { pid: pid; startTicks: common.integerText(fields[19]); pgid: -1; session: -1; origin: "" })
+}
+
+function discover(identity: common.Member, known: List<common.Member>, adopt: Boolean, handles: List<Handle>): Result<Boolean, common.Failure> {
+    let ops = OPS
+    let found: List<common.Member> = []
+    if !extinct(identity) {
+        let members = ops.members
+        let fetched = try members(identity, known, adopt)
+        found = fetched
+    }
+    for value in found {
+        let index = findMember(known, value.pid)
+        if index >= 0 && !common.sameIdentity(known[index], value) {
+            return Err<Boolean, common.Failure>(common.ownership("CLI descendant birthday changed"))
+        }
+        putMember(known, value)
+        let skip = false
+        if findHandle(handles, value.pid) < 0 {
+            match openHandle(value) {
+                Ok(handle) { handles.add(handle) }
+                Err(problem) {
+                    if !common.lookupMissing(problem) { return Err<Boolean, common.Failure>(problem) }
+                    skip = true
+                }
+            }
+        }
+        if !skip {
+            let held = handles[findHandle(handles, value.pid)]
+            if !common.sameIdentity(held.identity, value) {
+                return Err<Boolean, common.Failure>(common.ownership("held descendant birthday differs"))
+            }
+        }
+    }
+    return allReady(handles)
+}
+function finishDrain(identity: common.Member, known: List<common.Member>): Result<Boolean, common.Failure> {
+    let latched = try latchExtinction(identity)
+    for value in known { if value.pid != identity.pid { common.reapNoHang(value.pid) } }
+    return Ok<Boolean, common.Failure>(true)
+}
+function drainLoop(identity: common.Member, known: List<common.Member>, receipts: List<Receipt>, deadline: Integer, adopt: Boolean, handles: List<Handle>): Result<Boolean, common.Failure> {
+    while common.now() < deadline {
+        let done = try discover(identity, known, adopt, handles)
+        if done { return finishDrain(identity, known) }
+        for handle in handles {
+            let ready = try handleReady(handle)
+            if !ready {
+                let attempted = try handleSend(handle, 9)
+                receipts.add(Receipt { identity: handle.identity; signal: "SIGKILL"; owned: identity; authority: "held-pidfd"; attempted: attempted })
+            }
+        }
+        common.pause(10)
+    }
+    let done = try discover(identity, known, adopt, handles)
+    if done { return finishDrain(identity, known) }
+    return Ok<Boolean, common.Failure>(false)
+}
+public function drainHeld(identity: common.Member, known: List<common.Member>, receipts: List<Receipt>, deadline: Integer, handles: List<Handle>): Result<Boolean, common.Failure> {
+    return drainLoop(identity, known, receipts, deadline, true, handles)
+}
+function closeAll(values: List<Handle>): Result<Boolean, common.Failure> {
+    for handle in values { let closed = try handleClose(handle) }
+    return Ok<Boolean, common.Failure>(true)
+}
+function unresolve(identity: common.Member, values: List<Handle>) {
+    let ops = OPS
+    if !common.member(ops.unresolved, cliKey(identity)) { ops.unresolved.add(cliKey(identity)) }
+    for handle in values { ops.held.add(handle) }
+}
+public function drainCli(identity: common.Member, known: List<common.Member>, receipts: List<Receipt>, deadline: Integer, adopt: Boolean): Result<Boolean, common.Failure> {
+    let handles: List<Handle> = []
+    let result = drainLoop(identity, known, receipts, deadline, adopt, handles)
+    let finished = finishLocal(handles)
+    match finished {
+        Ok(ready) { if !ready { unresolve(identity, handles) } }
+        Err(problem) {
+            unresolve(identity, handles)
+            match result {
+                Ok(value) { return Err<Boolean, common.Failure>(problem) }
+                Err(primary) { common.note(primary, "held CLI ownership finalization: " + problem.message) }
+            }
+        }
+    }
+    return result
+}
+function finishLocal(handles: List<Handle>): Result<Boolean, common.Failure> {
+    let ready = try allReady(handles)
+    if !ready { return Ok<Boolean, common.Failure>(false) }
+    let closed = try closeAll(handles)
+    return Ok<Boolean, common.Failure>(true)
+}
+
+public function subreaperBegin(): Result<Integer, common.Failure> {
+    if common.threadCount() != 1 || directChildren().length > 0 {
+        return Err<Integer, common.Failure>(common.ownership("CLI lifetime requires an exclusive Linux child scope"))
+    }
+    let prior = common.subreaperGet()
+    if prior < 0 || common.subreaperSet(1) < 0 { return Err<Integer, common.Failure>(common.ownership("owned CLI subreaper setup failed")) }
+    return Ok<Integer, common.Failure>(prior)
+}
+public function subreaperRestore(prior: Integer): Result<Boolean, common.Failure> {
+    let status = common.subreaperSet(prior)
+    let failed = status < 0
+    match common.fault("prctl-restore", Text(prior)) {
+        Ok(value) {}
+        Err(problem) { failed = true }
+    }
+    if failed { return Err<Boolean, common.Failure>(common.cleanup("owned CLI subreaper restoration failed")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function lifetimePreflight(): Result<Integer, common.Failure> {
+    if common.machine() != "x86_64" { return Err<Integer, common.Failure>(common.ownership("owned CLI kernel ABI requires Linux x86_64")) }
+    let query = common.sigchldQuery()
+    if query < 0 { return Err<Integer, common.Failure>(common.ownership("SIGCHLD kernel state unavailable")) }
+    if query >> 32 != 0 { return Err<Integer, common.Failure>(common.ownership("owned CLI requires default non-autoreap SIGCHLD")) }
+    let flags = query & 4294967295
+    if flags & 2 != 0 { return Err<Integer, common.Failure>(common.ownership("SIGCHLD kernel handler/autoreap flags differ")) }
+    let fd = common.pidfdOpen(system.processId())
+    if fd < 0 { return Err<Integer, common.Failure>(common.systemFailure(-fd, "")) }
+    let sent = common.pidfdSend(fd, 0)
+    common.closeFd(fd)
+    if sent < 0 { return Err<Integer, common.Failure>(common.systemFailure(-sent, "")) }
+    return Ok<Integer, common.Failure>(flags)
+}
+public function preflightJson(flags: Integer): json.Value {
+    return data.object(["kernel_abi", "SIGCHLD", "kernel_flags", "SA_NOCLDWAIT", "pidfd_kernel_probe", "WNOWAIT_available"],
+        [data.string("linux-x86_64"), data.string("SIG_DFL"), data.number(flags), data.boolean(false), data.boolean(true), data.boolean(true)])
+}
+
+public record Admission { artifacts: Text; project: Text; nonce: Text }
+public function admissionLock(scope: Admission, timeout: Integer): Result<Integer, common.Failure> {
+    let lock = common.joinPath(scope.artifacts, "admission.lock")
+    let fd = common.openFile(lock, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_APPEND, 438)
+    if fd < 0 { return Err<Integer, common.Failure>(common.systemFailure(-fd, lock)) }
+    let deadline = common.now() + timeout
+    while true {
+        let status = common.flockTry(fd)
+        if status == 0 { break }
+        if status != -11 {
+            common.closeFd(fd)
+            return Err<Integer, common.Failure>(common.systemFailure(-status, lock))
+        }
+        if common.now() >= deadline {
+            common.closeFd(fd)
+            return Err<Integer, common.Failure>(common.cleanup("admission lock deadline exceeded"))
+        }
+        common.pause(10)
+    }
+    return Ok<Integer, common.Failure>(fd)
+}
+public function admissionUnlock(fd: Integer) {
+    common.flockRelease(fd)
+    common.closeFd(fd)
+}
+public function requireAdmission(scope: Admission): Result<Boolean, common.Failure> {
+    if common.exists(common.joinPath(scope.artifacts, "admission-revoked.json")) {
+        return Err<Boolean, common.Failure>(common.ownership("daemon creation admission permanently revoked"))
+    }
+    let intent = common.joinPath(scope.artifacts, "create-admission.json")
+    if common.exists(intent) {
+        let value = try common.readJson(intent)
+        if !common.equalText(data.field(value, "project"), scope.project) || !common.equalText(data.field(value, "nonce"), scope.nonce) ||
+            common.equalText(data.field(value, "state"), "interrupted-uncertified") {
+            return Err<Boolean, common.Failure>(common.ownership("creation admission is interrupted or foreign"))
+        }
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+
+public record Gate { permitSent: Boolean; reaped: Boolean; wnowait: Boolean; preflight: List<Integer> }
+public record Lifetime { state: Text; certified: Boolean; receipts: List<Receipt>; members: List<common.Member>; rootExited: Boolean; unresolved: List<common.Member>; recordedUnresolved: Boolean }
+public record Row {
+    argv: List<Text>
+    timeout: Integer
+    status: List<Integer>
+    timedOut: Boolean
+    primary: List<common.Failure>
+    problems: List<common.StageError>
+    owner: common.Member
+    identity: common.Member
+    lifetime: Lifetime
+    gate: Gate
+    launcher: List<Text>
+    launcherSource: common.Binding
+    stdout: common.Binding
+    stderr: common.Binding
+    operation: Text
+}
+public record Commands { root: Text; rows: List<Row> }
+public record RunOptions { timeout: Integer; check: Boolean; maxBytes: Integer; returnBytes: Boolean; admission: List<Admission>; stream: Boolean }
+public record Output { payload: Bytes; path: Text }
+
+public function options(timeout: Integer): RunOptions {
+    return RunOptions { timeout: timeout; check: true; maxBytes: common.MAX_BYTES; returnBytes: true; admission: []; stream: false }
+}
+public function newRow(argv: List<Text>, timeout: Integer): Row {
+    return Row {
+        argv: argv; timeout: timeout; status: []; timedOut: false; primary: []; problems: []
+        owner: common.processIdentity(system.processId()); identity: common.noMember()
+        lifetime: Lifetime { state: "intent"; certified: false; receipts: []; members: []; rootExited: false; unresolved: []; recordedUnresolved: false }
+        gate: Gate { permitSent: false; reaped: false; wnowait: false; preflight: [] }
+        launcher: []; launcherSource: common.emptyBinding(); stdout: common.emptyBinding(); stderr: common.emptyBinding(); operation: ""
+    }
+}
+public function rawCommands(root: Text): Result<Commands, common.Failure> {
+    let made = try common.makeFreshDirectory(root)
+    return Ok<Commands, common.Failure>(Commands { root: common.normalize(root); rows: [] })
+}
+public function memoryCommands(): Commands { return Commands { root: ""; rows: [] } }
+public function receiptJson(value: Receipt): json.Value {
+    return data.object(["identity", "signal", "owned_cli", "authority", "attempted"],
+        [common.identityJson(value.identity), data.string(value.signal), common.identityJson(value.owned), data.string(value.authority), data.boolean(value.attempted)])
+}
+function membersJson(values: List<common.Member>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(common.identityJson(value)) }
+    return data.array(items)
+}
+public function rowJson(row: Row): json.Value {
+    let status = data.none()
+    if row.status.length > 0 { status = data.number(row.status[0]) }
+    let primary = data.none()
+    if row.primary.length > 0 { primary = common.exception(row.primary[0]) }
+    let receipts: List<json.Value> = []
+    for value in row.lifetime.receipts { receipts = receipts.appended(receiptJson(value)) }
+    let lifetimeKeys = ["state", "certified", "receipts", "members", "root_exited_with_descendants"]
+    let lifetimeValues = [data.string(row.lifetime.state), data.boolean(row.lifetime.certified), data.array(receipts), membersJson(row.lifetime.members), data.boolean(row.lifetime.rootExited)]
+    if row.lifetime.recordedUnresolved { lifetimeKeys.add("unresolved_handles"); lifetimeValues = lifetimeValues.appended(membersJson(row.lifetime.unresolved)) }
+    let preflight = data.none()
+    if row.gate.preflight.length > 0 { preflight = preflightJson(row.gate.preflight[0]) }
+    let gateKeys = ["permit_sent", "owned_bootstrap_reaped", "preflight"]
+    let gateValues = [data.boolean(row.gate.permitSent), data.boolean(row.gate.reaped), preflight]
+    if row.gate.wnowait { gateKeys.add("WNOWAIT_exit_observed"); gateValues = gateValues.appended(data.boolean(true)) }
+    let keys = ["argv", "timeout_seconds", "status", "timed_out", "primary_exception", "finalization_errors", "owner_process_identity", "process_identity", "lifetime", "bootstrap_gate"]
+    let values = [common.stringList(row.argv), common.seconds(row.timeout), status, data.boolean(row.timedOut), primary, common.stageList(row.problems),
+        common.identityJson(row.owner), common.identityJson(row.identity), data.object(lifetimeKeys, lifetimeValues), data.object(gateKeys, gateValues)]
+    if row.launcher.length > 0 {
+        keys.add("launcher_argv"); values = values.appended(common.stringList(row.launcher))
+        keys.add("launcher_source"); values = values.appended(common.boundPath(row.launcherSource))
+    }
+    if row.stdout.bytes >= 0 { keys.add("stdout"); values = values.appended(common.boundPath(row.stdout)) }
+    if row.stderr.bytes >= 0 { keys.add("stderr"); values = values.appended(common.boundPath(row.stderr)) }
+    if row.operation != "" { keys.add("operation"); values = values.appended(data.string(row.operation)) }
+    return data.object(keys, values)
+}
+public function commandsJson(commands: Commands): json.Value {
+    let rows: List<json.Value> = []
+    for row in commands.rows { rows = rows.appended(rowJson(row)) }
+    return data.object(["schema_version", "commands"], [data.number(1), data.array(rows)])
+}
+public function save(commands: Commands): Result<Boolean, common.Failure> {
+    return common.atomicJson(common.joinPath(commands.root, "commands.json"), commandsJson(commands))
+}
+public function timeoutFailure(argv: List<Text>, timeout: Integer): common.Failure {
+    return common.failure("TimeoutExpired", "Command '" + data.dumps(common.stringList(argv)) + "' timed out after " + common.durationText(timeout) + " seconds")
+}
+
+record RunState {
+    commands: Commands
+    row: Row
+    argv: List<Text>
+    settings: RunOptions
+    primary: List<common.Failure>
+    child: List<Integer>
+    ownerClosed: List<Boolean>
+    rootHandle: List<Handle>
+    known: List<common.Member>
+    handles: List<Handle>
+    deadline: Integer
+    subreaper: List<Integer>
+    retained: List<Integer>
+    pipes: List<Integer>
+    registered: List<Integer>
+    gate: List<Integer>
+    selector: List<Boolean>
+    outPath: Text
+    errPath: Text
+}
+function secondary(state: RunState, stage: Text, problem: common.Failure) {
+    state.row.problems.add(common.stageError(stage, problem))
+    state.row.lifetime.certified = false
+    if state.primary.length > 0 { common.note(state.primary[0], stage + ": " + problem.message) }
+}
+function attempt(state: RunState, stage: Text, outcome: Result<Boolean, common.Failure>) {
+    match outcome {
+        Ok(value) {}
+        Err(problem) { secondary(state, stage, problem) }
+    }
+}
+function capturePrimary(state: RunState, problem: common.Failure) {
+    state.primary.truncate(0)
+    state.primary.add(problem)
+    state.row.timedOut = problem.kind == "TimeoutExpired"
+    state.row.primary.truncate(0)
+    state.row.primary.add(problem)
+}
+
+public function run(commands: Commands, argv: List<Text>, settings: RunOptions): Result<Output, common.Failure> {
+    let index = commands.rows.length
+    let outPath = common.joinPath(commands.root, common.zeroFill(index, 3) + ".stdout")
+    let errPath = common.joinPath(commands.root, common.zeroFill(index, 3) + ".stderr")
+    let row = newRow(argv, settings.timeout)
+    commands.rows.add(row)
+    let state = RunState {
+        commands: commands; row: row; argv: argv; settings: settings; primary: []; child: []; ownerClosed: [true]; rootHandle: []
+        known: []; handles: []; deadline: common.now() + settings.timeout; subreaper: []; retained: [-1, -1]; pipes: [-1, -1]
+        registered: []; gate: [-1, -1]; selector: [false]; outPath: outPath; errPath: errPath
+    }
+    match runBody(state) {
+        Ok(value) {}
+        Err(problem) {
+            if state.primary.length == 0 { capturePrimary(state, problem) }
+            else if !common.same(problem, state.primary[0]) { secondary(state, "command body", problem) }
+        }
+    }
+    finishRun(state)
+    if state.primary.length > 0 { return Err<Output, common.Failure>(state.primary[0]) }
+    if row.problems.length > 0 { return Err<Output, common.Failure>(common.cleanup("owned CLI cleanup/finalization failed; retained command ledger")) }
+    if !settings.returnBytes { return Ok<Output, common.Failure>(Output { payload: Bytes(); path: outPath }) }
+    let payload = try common.readBytes(outPath)
+    return Ok<Output, common.Failure>(Output { payload: payload; path: "" })
+}
+public function runBytes(commands: Commands, argv: List<Text>, settings: RunOptions): Result<Bytes, common.Failure> {
+    let output = try run(commands, argv, settings)
+    return Ok<Bytes, common.Failure>(output.payload)
+}
+
+function runBody(state: RunState): Result<Boolean, common.Failure> {
+    let row = state.row
+    let stdoutFd = common.openFile(state.outPath, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438)
+    if stdoutFd < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-stdoutFd, state.outPath)) }
+    state.retained[0] = stdoutFd
+    let stderrFd = common.openFile(state.errPath, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438)
+    if stderrFd < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-stderrFd, state.errPath)) }
+    state.retained[1] = stderrFd
+    let saved = try save(state.commands)
+    let ops = OPS
+    if ops.unresolved.length > 0 { return Err<Boolean, common.Failure>(common.ownership("previous owned CLI lifetime remains unresolved")) }
+    let flags = try lifetimePreflight()
+    row.gate.preflight.add(flags)
+    let prior = try subreaperBegin()
+    state.subreaper.add(prior)
+    let locks: List<Integer> = []
+    if state.settings.admission.length > 0 {
+        let lock = try admissionLock(state.settings.admission[0], 2 * common.SECOND)
+        locks.add(lock)
+    }
+    let gated = gatedLaunch(state)
+    for lock in locks { admissionUnlock(lock) }
+    let launched = try gated
+    if row.problems.length > 0 { return Err<Boolean, common.Failure>(common.cleanup("owned bootstrap gate finalization failed")) }
+    return monitor(state)
+}
+function gatedLaunch(state: RunState): Result<Boolean, common.Failure> {
+    let row = state.row
+    if state.settings.admission.length > 0 { let admitted = try requireAdmission(state.settings.admission[0]) }
+    let pair = common.pipePair()
+    if pair < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-pair, "")) }
+    state.gate[0] = pair >> 32
+    state.gate[1] = pair & 4294967295
+    let launcher = launcherPath()
+    let launch = [launcher, "--owned-exec-fd", "3", "--owned-exec-json", data.dumps(common.stringList(state.argv))]
+    row.launcher.truncate(0)
+    for value in launch { row.launcher.add(value) }
+    let source = try common.binding(launcher)
+    row.launcherSource = source
+    let saved = try save(state.commands)
+    let inner = spawnAndPermit(state, launcher, launch)
+    match inner {
+        Ok(value) {}
+        Err(problem) {
+            capturePrimary(state, problem)
+            if state.child.length > 0 && row.identity.pid < 0 {
+                match childBirthday(state.child[0]) {
+                    Ok(identity) { row.identity = identity }
+                    Err(evidence) { secondary(state, "bootstrap birthday evidence", evidence) }
+                }
+            }
+        }
+    }
+    closeGate(state)
+    return inner
+}
+function closeGateFd(name: Text, fd: Integer): Result<Boolean, common.Failure> {
+    let hooked = try common.fault("gate-close", name)
+    let status = common.closeFd(fd)
+    if status < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-status, "")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+function closeGate(state: RunState) {
+    let names = ["gate_read", "gate_write"]
+    for index in 0..2 {
+        let fd = state.gate[index]
+        if fd < 0 { continue }
+        let before = state.row.problems.length
+        attempt(state, names[index] + " close", closeGateFd(names[index], fd))
+        if state.row.problems.length != before { attempt(state, names[index] + " close retry", closeGateFd(names[index], fd)) }
+        state.gate[index] = -1
+    }
+}
+function spawnAndPermit(state: RunState, launcher: Text, launch: List<Text>): Result<Boolean, common.Failure> {
+    let row = state.row
+    let hooked = try common.fault("popen", state.argv[0])
+    let outPair = common.pipePair()
+    if outPair < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-outPair, "")) }
+    let errPair = common.pipePair()
+    if errPair < 0 {
+        common.closeFd(outPair >> 32)
+        common.closeFd(outPair & 4294967295)
+        return Err<Boolean, common.Failure>(common.systemFailure(-errPair, ""))
+    }
+    let ops = OPS
+    let pid = common.spawn(launcher, launch, -1, outPair & 4294967295, errPair & 4294967295, state.gate[0], common.SPAWN_SESSION | ops.spawnFlags[0])
+    common.closeFd(outPair & 4294967295)
+    common.closeFd(errPair & 4294967295)
+    if pid < 0 {
+        common.closeFd(outPair >> 32)
+        common.closeFd(errPair >> 32)
+        return Err<Boolean, common.Failure>(common.systemFailure(-pid, launcher))
+    }
+    state.pipes[0] = outPair >> 32
+    state.pipes[1] = errPair >> 32
+    state.child.add(pid)
+    state.ownerClosed[0] = false
+    let announced = try common.fault("spawned", Text(pid))
+    let handle = try openOwnedChildHandle(pid)
+    state.rootHandle.add(handle)
+    let identity = try childBirthday(pid)
+    row.identity = identity
+    handle.identity = common.Member { pid: pid; startTicks: identity.startTicks; pgid: pid; session: pid; origin: "held-root-pidfd" }
+    putMember(state.known, handle.identity)
+    state.handles.add(handle)
+    row.lifetime.members = copyMembers(state.known)
+    row.lifetime.state = "running"
+    let saved = try save(state.commands)
+    if state.settings.admission.length > 0 { let admitted = try requireAdmission(state.settings.admission[0]) }
+    let wrote = common.writeAll(state.gate[1], Bytes("G"))
+    if wrote < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-wrote, "")) }
+    row.gate.permitSent = true
+    return Ok<Boolean, common.Failure>(true)
+}
+function liveDescendant(state: RunState): Result<Boolean, common.Failure> {
+    for handle in state.handles {
+        if handle.identity.pid != state.child[0] {
+            let ready = try handleReady(handle)
+            if !ready { return Ok<Boolean, common.Failure>(true) }
+        }
+    }
+    return Ok<Boolean, common.Failure>(false)
+}
+function observe(state: RunState, identity: common.Member): Result<Boolean, common.Failure> {
+    let ops = OPS
+    let members = ops.members
+    let found = try members(identity, state.known, true)
+    for value in found {
+        let index = findMember(state.known, value.pid)
+        if index >= 0 && !common.sameIdentity(state.known[index], value) { return Err<Boolean, common.Failure>(common.ownership("CLI birthday changed")) }
+        putMember(state.known, value)
+        if findHandle(state.handles, value.pid) < 0 {
+            match openHandle(value) {
+                Ok(handle) { state.handles.add(handle) }
+                Err(problem) { if !common.lookupMissing(problem) { return Err<Boolean, common.Failure>(problem) } }
+            }
+        }
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+function forwardLoop(state: RunState, target: Integer, payload: Bytes): Result<Boolean, common.Failure> {
+    let offset = 0
+    while offset < payload.length {
+        let remaining = state.deadline - common.now()
+        if remaining <= 0 { return Err<Boolean, common.Failure>(timeoutFailure(state.argv, state.settings.timeout)) }
+        let wrote = common.writeSome(target, payload, offset)
+        if wrote == -11 {
+            common.pollWritable(target, min(20, max(1, remaining / common.MILLISECOND)))
+            continue
+        }
+        if wrote < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-wrote, "")) }
+        if wrote == 0 { return Err<Boolean, common.Failure>(common.ownership("forward stream made no progress")) }
+        offset += wrote
+    }
+    return Ok<Boolean, common.Failure>(true)
+}
+function forward(state: RunState, target: Integer, payload: Bytes): Result<Boolean, common.Failure> {
+    let blocking = common.getBlocking(target)
+    if blocking < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-blocking, "")) }
+    let switched = common.setBlocking(target, false)
+    if switched < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-switched, "")) }
+    let outcome = forwardLoop(state, target, payload)
+    let restored = common.setBlocking(target, blocking == 1)
+    if restored < 0 {
+        match outcome {
+            Ok(value) { return Err<Boolean, common.Failure>(common.systemFailure(-restored, "")) }
+            Err(problem) { secondary(state, "forward stream mode restore", common.systemFailure(-restored, "")) }
+        }
+    }
+    return outcome
+}
+function monitor(state: RunState): Result<Boolean, common.Failure> {
+    let row = state.row
+    let pid = state.child[0]
+    let identity = row.identity
+    state.selector[0] = true
+    let first = try common.fault("register", "stdout")
+    state.registered.add(0)
+    let second = try common.fault("register", "stderr")
+    state.registered.add(1)
+    let total = 0
+    while true {
+        let exited = common.exitedNoWait(pid)
+        if exited < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-exited, "")) }
+        let observed = try observe(state, identity)
+        row.lifetime.members = copyMembers(state.known)
+        let saved = try save(state.commands)
+        if exited == 1 {
+            let live = try liveDescendant(state)
+            if live {
+                row.lifetime.rootExited = true
+                let drained = try drainHeld(identity, state.known, row.lifetime.receipts, common.now() + 2 * common.SECOND, state.handles)
+                if !drained { return Err<Boolean, common.Failure>(common.cleanup("CLI descendants not drained")) }
+            }
+        }
+        if exited == 1 && state.registered.length == 0 { break }
+        if common.now() > state.deadline { return Err<Boolean, common.Failure>(timeoutFailure(state.argv, state.settings.timeout)) }
+        let selected = try common.fault("select", "")
+        let fds: List<Integer> = []
+        for slot in state.registered { fds.add(state.pipes[slot]) }
+        let ready = common.pollFds(fds, 20)
+        let still: List<Integer> = []
+        for position in 0..fds.length {
+            let slot = state.registered[position]
+            if !ready[position] { still.add(slot); continue }
+            let chunk = common.readSome(fds[position], min(common.CHUNK, state.settings.maxBytes - total + 1))
+            if chunk.length == 0 {
+                let code = common.lastErrno()
+                if code != 0 && code != 11 { return Err<Boolean, common.Failure>(common.systemFailure(code, "")) }
+                if code == 11 { still.add(slot) }
+                continue
+            }
+            still.add(slot)
+            if total + chunk.length > state.settings.maxBytes { return Err<Boolean, common.Failure>(common.ownership("command stream bound exceeded")) }
+            total += chunk.length
+            let kept = common.writeAll(state.retained[slot], chunk)
+            if kept < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-kept, "")) }
+            if state.settings.stream { let forwarded = try forward(state, slot + 1, chunk) }
+        }
+        state.registered.truncate(0)
+        for slot in still { state.registered.add(slot) }
+    }
+    let certified = try drainHeld(identity, state.known, row.lifetime.receipts, common.now() + 2 * common.SECOND, state.handles)
+    row.lifetime.certified = certified
+    let ready = try allReady(state.handles)
+    if !certified || !ready { return Err<Boolean, common.Failure>(common.cleanup("CLI lifetime not certified closed")) }
+    row.lifetime.state = "closed"
+    row.lifetime.members = copyMembers(state.known)
+    let status = try waitChild(pid, 100 * common.MILLISECOND)
+    row.status.truncate(0)
+    row.status.add(status)
+    state.ownerClosed[0] = true
+    if state.settings.check && status != 0 { return Err<Boolean, common.Failure>(common.cleanup("owned command failed: " + Text(status))) }
+    return Ok<Boolean, common.Failure>(true)
+}
+public function waitChild(pid: Integer, timeout: Integer): Result<Integer, common.Failure> {
+    let hooked = try common.fault("reap", Text(pid))
+    let deadline = common.now() + timeout
+    while true {
+        let status = common.reapNoHang(pid)
+        if status < 0 { return Err<Integer, common.Failure>(common.systemFailure(-status, "")) }
+        if status > 0 { return Ok<Integer, common.Failure>(status - 1000000) }
+        if common.now() > deadline { return Err<Integer, common.Failure>(timeoutFailure([Text(pid)], timeout)) }
+        common.pause(1)
+    }
+    return Ok<Integer, common.Failure>(0)
+}
+function finishBootstrap(state: RunState): Result<Boolean, common.Failure> {
+    let pid = state.child[0]
+    let expiry = common.now() + 6 * common.SECOND
+    while common.exitedNoWait(pid) != 1 {
+        if common.now() >= expiry { return Err<Boolean, common.Failure>(common.cleanup("unreleased bootstrap exit not observed")) }
+        common.pause(10)
+    }
+    if state.rootHandle.length > 0 {
+        let ready = try handleReady(state.rootHandle[0])
+        if !ready { return Err<Boolean, common.Failure>(common.cleanup("held bootstrap thread group exit not ready")) }
+    }
+    let settled = try allReady(state.handles)
+    if !settled { return Err<Boolean, common.Failure>(common.cleanup("held bootstrap descendants unresolved")) }
+    let status = try waitChild(pid, 100 * common.MILLISECOND)
+    state.row.status.truncate(0)
+    state.row.status.add(status)
+    state.ownerClosed[0] = true
+    state.row.gate.reaped = true
+    state.row.gate.wnowait = true
+    return Ok<Boolean, common.Failure>(true)
+}
+function finishLifetime(state: RunState): Result<Boolean, common.Failure> {
+    let identity = state.row.identity
+    let drained = try drainHeld(identity, state.known, state.row.lifetime.receipts, common.now() + 2 * common.SECOND, state.handles)
+    let ready = try allReady(state.handles)
+    if !drained || !ready { return Err<Boolean, common.Failure>(common.cleanup("held CLI lifetime unresolved")) }
+    let status = try waitChild(state.child[0], 100 * common.MILLISECOND)
+    state.row.status.truncate(0)
+    state.row.status.add(status)
+    state.ownerClosed[0] = true
+    return Ok<Boolean, common.Failure>(true)
+}
+function closePipe(name: Text, fd: Integer): Result<Boolean, common.Failure> {
+    let hooked = try common.fault("pipe-close", name)
+    let status = common.closeFd(fd)
+    if status < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-status, "")) }
+    return Ok<Boolean, common.Failure>(true)
+}
+function closeRetained(name: Text, fd: Integer, closed: List<Boolean>): Result<Boolean, common.Failure> {
+    if !closed[0] {
+        closed[0] = true
+        let status = common.closeFd(fd)
+        if status < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-status, "")) }
+    }
+    return common.fault("file-close", name)
+}
+function unresolvedEvidence(state: RunState): Result<Boolean, common.Failure> {
+    state.row.lifetime.unresolved.truncate(0)
+    for handle in state.handles {
+        let ready = try handleReady(handle)
+        if !ready { state.row.lifetime.unresolved.add(handle.identity) }
+    }
+    state.row.lifetime.recordedUnresolved = true
+    return Ok<Boolean, common.Failure>(true)
+}
+function bindEvidence(state: RunState, slot: Integer): Result<Boolean, common.Failure> {
+    let deadline = state.deadline
+    if state.primary.length > 0 { deadline = 0 }
+    let target = state.outPath
+    if slot == 1 { target = state.errPath }
+    let value = try common.streamBinding(target, state.settings.maxBytes, deadline, "")
+    value.path = common.resolvePath(target)
+    if slot == 0 { state.row.stdout = value } else { state.row.stderr = value }
+    return Ok<Boolean, common.Failure>(true)
+}
+function finishRun(state: RunState) {
+    let row = state.row
+    closeGate(state)
+    if state.child.length > 0 && !state.ownerClosed[0] {
+        if !row.gate.permitSent { attempt(state, "unreleased bootstrap closure", finishBootstrap(state)) }
+        else { attempt(state, "CLI descendant/root cleanup", finishLifetime(state)) }
+    }
+    row.lifetime.members = copyMembers(state.known)
+    if state.child.length > 0 {
+        let names = ["stdout", "stderr"]
+        for index in 0..2 {
+            let fd = state.pipes[index]
+            if fd < 0 { continue }
+            match common.fault("pipe-state", names[index]) {
+                Ok(value) {}
+                Err(problem) { secondary(state, names[index] + " pipe state", problem) }
+            }
+            let before = row.problems.length
+            attempt(state, names[index] + " pipe close", closePipe(names[index], fd))
+            if row.problems.length != before { attempt(state, names[index] + " pipe close retry", closePipe(names[index], fd)) }
+            state.pipes[index] = -1
+        }
+    }
+    if state.selector[0] { attempt(state, "selector close", common.fault("selector-close", "")) }
+    if state.ownerClosed[0] {
+        for handle in state.handles { attempt(state, "held pidfd close", handleClose(handle)) }
+        if state.rootHandle.length > 0 && findHandle(state.handles, state.child[0]) < 0 { attempt(state, "root pidfd close", handleClose(state.rootHandle[0])) }
+        if state.subreaper.length > 0 { attempt(state, "subreaper restoration", subreaperRestore(state.subreaper[0])) }
+    } else {
+        let ops = OPS
+        let key = Text(state.child[0]) + ":-1"
+        if row.identity.pid >= 0 { key = cliKey(row.identity) }
+        if !common.member(ops.unresolved, key) { ops.unresolved.add(key) }
+        for handle in state.handles { ops.held.add(handle) }
+        for handle in state.rootHandle { ops.held.add(handle) }
+        row.lifetime.state = "ownership-retained"
+        attempt(state, "unresolved ownership evidence", unresolvedEvidence(state))
+        secondary(state, "ownership retained", common.cleanup("owned bootstrap/CLI closure unproven; handles and subreaper retained"))
+    }
+    let fileNames = ["stdout", "stderr"]
+    let leaf = [common.nameOf(state.outPath), common.nameOf(state.errPath)]
+    for index in 0..2 {
+        let fd = state.retained[index]
+        if fd < 0 { continue }
+        let closed = [false]
+        let before = row.problems.length
+        attempt(state, "retained " + fileNames[index] + " FILE close", closeRetained(leaf[index], fd, closed))
+        if row.problems.length != before { attempt(state, "retained " + fileNames[index] + " FILE close retry", closeRetained(leaf[index], fd, closed)) }
+        state.retained[index] = -1
+    }
+    if state.primary.length > 0 || row.problems.length > 0 { row.lifetime.certified = false }
+    for index in 0..2 { attempt(state, fileNames[index] + " evidence finalization", bindEvidence(state, index)) }
+    attempt(state, "command ledger finalization", save(state.commands))
+    if row.problems.length > 0 { attempt(state, "command failure ledger", save(state.commands)) }
+}

@@ -1,0 +1,499 @@
+use "json" as json
+use "system" as system
+use "./quic-json.min" as data
+use "./interop/qns/owned-common.min" as common
+use "./interop/qns/owned-process.min" as process
+use "./interop/qns/owned-daemon.min" as adapter
+
+public record Check { name: Text; passed: Boolean }
+public record Outcome { status: Text; expected: Text; checks: List<Check>; keys: List<Text>; values: List<json.Value> }
+public record Setup { owner: adapter.OwnerSpec; daemon: adapter.Daemon; path: Text; value: json.Value; root: Text }
+public record Child { pid: Integer; outPath: Text; errPath: Text }
+public record Captured { status: Integer; output: Bytes; error: Bytes; timedOut: Boolean }
+
+public function quietly(outcome: Result<Boolean, common.Failure>) {
+    match outcome {
+        Ok(value) {}
+        Err(problem) {}
+    }
+}
+public function repeat(value: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(value) }
+    return joinText(parts)
+}
+public function identifier(digit: Text): Text { return repeat(digit, 64) }
+public function image(): Text { return "sha256:" + repeat("a", 64) }
+public function peer(): Text { return "sha256:" + repeat("b", 64) }
+public function simulator(): Text { return "sha256:" + repeat("c", 64) }
+
+public function outcome(status: Text, expected: Text): Outcome {
+    return Outcome { status: status; expected: expected; checks: []; keys: []; values: [] }
+}
+public function check(result: Outcome, name: Text, passed: Boolean) { result.checks.add(Check { name: name; passed: passed }) }
+public function detail(result: Outcome, key: Text, value: json.Value) {
+    result.keys.add(key)
+    result.values = result.values.appended(value)
+}
+public function outcomeJson(result: Outcome): json.Value {
+    let keys = ["status"]
+    let values = [data.string(result.status)]
+    for index in 0..result.keys.length { keys.add(result.keys[index]); values = values.appended(result.values[index]) }
+    if result.checks.length > 0 {
+        let names: List<Text> = []
+        let flags: List<json.Value> = []
+        for item in result.checks { names.add(item.name); flags = flags.appended(data.boolean(item.passed)) }
+        keys.add("checks")
+        values = values.appended(data.object(names, flags))
+    }
+    return data.object(keys, values)
+}
+public function matched(result: Outcome): Boolean {
+    if result.status != result.expected { return false }
+    for item in result.checks { if !item.passed { return false } }
+    return true
+}
+
+public function readState(setup: Setup): Result<json.Value, common.Failure> { return common.readJson(setup.path) }
+public function store(setup: Setup, value: json.Value): Result<Boolean, common.Failure> { return common.atomicJson(setup.path, value) }
+public function events(setup: Setup): Result<List<json.Value>, common.Failure> {
+    let state = try readState(setup)
+    return Ok<List<json.Value>, common.Failure>(common.valuesOf(data.field(state, "events")))
+}
+public function obj(keys: List<Text>, values: List<json.Value>): json.Value { return data.object(keys, values) }
+public function text(value: Text): json.Value { return data.string(value) }
+public function number(value: Integer): json.Value { return data.number(value) }
+public function flag(value: Boolean): json.Value { return data.boolean(value) }
+public function none(): json.Value { return data.none() }
+public function empty(): json.Value { return data.object([], []) }
+public function texts(values: List<Text>): json.Value { return data.strings(values) }
+
+public function setup(root: Text): Result<Setup, common.Failure> {
+    let runner = common.joinPath(root, "runner")
+    let fixtures = common.joinPath(root, "fixtures")
+    let evidence = common.joinPath(root, "evidence")
+    for path in [runner, fixtures, evidence] { let made = try common.makeDirectory(path) }
+    let project = "minyar-qns-" + repeat("d", 24)
+    let value = obj(["schema_version", "runner_commit", "project", "nonce", "images", "minyar_image", "runner_root", "compose_path", "fixture_root", "artifacts"],
+        [number(1), text(common.PIN), text(project), text(repeat("e", 64)),
+            obj(["sim", "server", "client"], [texts([simulator()]), texts([image(), peer()]), texts([image(), peer()])]), text(image()),
+            text(runner), text(common.joinPath(runner, "docker-compose.yml")), text(fixtures), text(evidence)])
+    let owner = try adapter.ownerSpec(value)
+    let roles = common.ROLES
+    let containerKeys: List<Text> = []
+    let containerValues: List<json.Value> = []
+    for index in 0..roles.length {
+        let role = roles[index]
+        let identity = identifier(Text(index + 1))
+        let mounts: List<json.Value> = []
+        if role != "sim" {
+            for destination in ["/www", "/downloads", "/certs"] {
+                let source = common.joinPath(fixtures, role + common.replaceAll(destination, "/", "-"))
+                let made = try common.makeDirectory(source)
+                let wrote = try common.writeText(common.joinPath(source, "fixture"), role + destination)
+                mounts = mounts.appended(obj(["Type", "Source", "Destination", "RW"], [text("bind"), text(source), text(destination), flag(destination == "/downloads")]))
+            }
+        }
+        let labels = data.with(data.with(adapter.labels(owner, role), "com.docker.compose.project.working_dir", text(runner)), "com.docker.compose.project.config_files", text(common.joinPath(runner, "docker-compose.yml")))
+        let user = "65534:65534"
+        let entryImage = image()
+        let capAdd = none()
+        let capDrop = texts(["ALL"])
+        let security = texts(["no-new-privileges:true"])
+        if role == "sim" { user = ""; entryImage = simulator(); capAdd = texts(["NET_ADMIN", "NET_RAW"]); capDrop = none(); security = texts([]) }
+        let mode = project + "_rightnet"
+        if role == "client" { mode = project + "_leftnet" }
+        let networkNames: List<Text> = []
+        let networkValues: List<json.Value> = []
+        for name in adapter.networkRoles(role) {
+            networkNames.add(project + "_" + name)
+            let digit = "8"
+            if name == "leftnet" { digit = "7" }
+            networkValues = networkValues.appended(obj(["NetworkID"], [text(identifier(digit))]))
+        }
+        containerKeys.add(identity)
+        containerValues = containerValues.appended(obj(["Id", "Name", "Image", "Config", "Mounts", "State", "HostConfig", "NetworkSettings"],
+            [text(identity), text("/" + project + "-" + role), text(entryImage), obj(["Labels", "User"], [labels, text(user)]), data.array(mounts),
+                obj(["Running", "ExitCode"], [flag(true), number(0)]),
+                obj(["Privileged", "NetworkMode", "CpusetCpus", "NanoCpus", "CapAdd", "CapDrop", "SecurityOpt", "PidMode", "IpcMode"],
+                    [flag(false), text(mode), text("7"), number(1000000000), capAdd, capDrop, security, text(""), text("private")]),
+                obj(["Networks"], [obj(networkNames, networkValues)])]))
+    }
+    let networkKeys: List<Text> = []
+    let networkItems: List<json.Value> = []
+    let names = ["leftnet", "rightnet"]
+    for index in 0..2 {
+        let identity = identifier(Text(index + 7))
+        let members: List<Text> = []
+        let memberValues: List<json.Value> = []
+        for position in 0..containerKeys.length {
+            let attached = data.field(data.field(containerValues[position], "NetworkSettings"), "Networks")
+            if common.hasKey(attached, project + "_" + names[index]) { members.add(containerKeys[position]); memberValues = memberValues.appended(empty()) }
+        }
+        networkKeys.add(identity)
+        networkItems = networkItems.appended(obj(["Id", "Name", "Labels", "Driver", "Internal", "Containers"],
+            [text(identity), text(project + "_" + names[index]), adapter.labels(owner, ""), text("bridge"), flag(false), obj(members, memberValues)]))
+    }
+    let state = common.joinPath(root, "daemon.json")
+    let wrote = try common.atomicJson(state, obj(["scope", "containers", "networks", "events"],
+        [text("mock daemon only"), obj(containerKeys, containerValues), obj(networkKeys, networkItems), data.array([])]))
+    let spec = try common.atomicJson(common.joinPath(root, "spec.json"), value)
+    return Ok<Setup, common.Failure>(Setup { owner: owner; daemon: adapter.jsonDaemon(state); path: state; value: value; root: root })
+}
+public function keepContainers(state: json.Value, count: Integer): json.Value {
+    let containers = data.field(state, "containers")
+    let keys = containers.keys.slice(0, count)
+    let values: List<json.Value> = []
+    for index in 0..count { values = values.appended(containers.items[index]) }
+    let result = data.with(state, "containers", obj(keys, values))
+    let networks = data.field(result, "networks")
+    let networkValues: List<json.Value> = []
+    for network in networks.items {
+        let members: List<Text> = []
+        let memberValues: List<json.Value> = []
+        for index in 0..keys.length {
+            let attached = data.field(data.field(values[index], "NetworkSettings"), "Networks")
+            if common.hasKey(attached, common.textOf(data.field(network, "Name"))) { members.add(keys[index]); memberValues = memberValues.appended(empty()) }
+        }
+        networkValues = networkValues.appended(data.with(network, "Containers", obj(members, memberValues)))
+    }
+    return data.with(result, "networks", obj(networks.keys, networkValues))
+}
+
+public function devNull(): Integer { return common.openFile("/dev/null", common.OPEN_WRITE, 0) }
+public function startChild(argv: List<Text>, outPath: Text, errPath: Text, flags: Integer): Result<Child, common.Failure> {
+    let out = devNull()
+    if outPath != "" { out = common.openFile(outPath, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438) }
+    let err = devNull()
+    if errPath != "" { err = common.openFile(errPath, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438) }
+    if out < 0 || err < 0 { return Err<Child, common.Failure>(common.failure("OSError", "cannot open child streams")) }
+    let pid = common.spawn(argv[0], argv, -1, out, err, -1, flags)
+    common.closeFd(out)
+    common.closeFd(err)
+    if pid < 0 { return Err<Child, common.Failure>(common.systemFailure(-pid, argv[0])) }
+    return Ok<Child, common.Failure>(Child { pid: pid; outPath: outPath; errPath: errPath })
+}
+public function waitFor(pid: Integer, milliseconds: Integer): Integer {
+    let deadline = common.now() + milliseconds * common.MILLISECOND
+    while true {
+        let status = common.reapNoHang(pid)
+        if status > 0 { return status - 1000000 }
+        if status < 0 { return -1000 }
+        if common.now() > deadline { return -999 }
+        common.pause(5)
+    }
+    return -999
+}
+public function running(pid: Integer): Boolean { return common.reapNoHang(pid) == 0 }
+public function terminate(pid: Integer) {
+    if common.reapNoHang(pid) != 0 { return }
+    system.sendSignal(pid, 15)
+    if waitFor(pid, 2000) == -999 {
+        system.sendSignal(pid, 9)
+        waitFor(pid, 2000)
+    }
+}
+public function capture(argv: List<Text>, root: Text, name: Text, milliseconds: Integer): Result<Captured, common.Failure> {
+    let outPath = common.joinPath(root, name + ".stdout")
+    let errPath = common.joinPath(root, name + ".stderr")
+    let child = try startChild(argv, outPath, errPath, common.SPAWN_SESSION)
+    let status = waitFor(child.pid, milliseconds)
+    let timedOut = status == -999
+    if timedOut { terminate(child.pid) }
+    return Ok<Captured, common.Failure>(Captured { status: status; output: common.readOr(outPath); error: common.readOr(errPath); timedOut: timedOut })
+}
+public function waitExists(path: Text, milliseconds: Integer): Boolean {
+    let deadline = common.now() + milliseconds * common.MILLISECOND
+    while !common.exists(path) {
+        if common.now() > deadline { return false }
+        common.pause(10)
+    }
+    return true
+}
+public function jsonNumber(path: Text, key: Text): Integer {
+    match common.readJson(path) {
+        Ok(value) { return common.integerOf(data.field(value, key)) }
+        Err(problem) { return -1 }
+    }
+}
+
+function octalField(value: Integer, width: Integer): Bytes {
+    let digits = Bytes()
+    let rest = value
+    while rest > 0 { digits.add(48 + rest % 8); rest = rest / 8 }
+    let result = Bytes()
+    let padding = width - 1 - digits.length
+    for index in 0..padding { result.add(48) }
+    let position = digits.length - 1
+    while position >= 0 { result.add(digits[position]); position -= 1 }
+    result.add(0)
+    return result
+}
+public function tarHeader(name: Text, size: Integer, kind: Integer): Bytes {
+    let header = Bytes(512)
+    let raw = Bytes(name)
+    for index in 0..raw.length { header[index] = raw[index] }
+    let fields = [octalField(420, 8), octalField(0, 8), octalField(0, 8), octalField(size, 12), octalField(0, 12)]
+    let offsets = [100, 108, 116, 124, 136]
+    for index in 0..5 { for position in 0..fields[index].length { header[offsets[index] + position] = fields[index][position] } }
+    header[156] = kind
+    let magic = Bytes("ustar")
+    for index in 0..5 { header[257 + index] = magic[index] }
+    header[263] = 48
+    header[264] = 48
+    for index in 148..156 { header[index] = 32 }
+    let total = 0
+    for byte in header { total += byte }
+    let sum = octalField(total, 7)
+    for index in 0..7 { header[148 + index] = sum[index] }
+    header[155] = 32
+    return header
+}
+public function tarArchive(names: List<Text>, payloads: List<Bytes>): Bytes {
+    let result = Bytes()
+    for index in 0..names.length {
+        result.addBytes(tarHeader(names[index], payloads[index].length, 48))
+        result.addBytes(payloads[index])
+        let padding = (512 - payloads[index].length % 512) % 512
+        result.addBytes(Bytes(padding))
+    }
+    result.addBytes(Bytes(1024))
+    return result
+}
+
+function helperArgument(index: Integer): Text { return argument(index) }
+function writeJson(path: Text, value: json.Value): Integer {
+    match common.atomicJson(path, value) {
+        Ok(done) { return 0 }
+        Err(problem) { return 1 }
+    }
+}
+function selfBirth(): json.Value {
+    let fields = common.statFields(system.processId())
+    return obj(["pid", "start_ticks", "pgid", "session", "parent_pid", "parent_death_signal"],
+        [number(system.processId()), number(common.integerText(fields[19])), number(common.integerText(fields[2])), number(common.integerText(fields[3])),
+            number(common.parentProcess()), number(common.deathSignal())])
+}
+function helperDescendant(): Integer {
+    let daemonPath = helperArgument(2)
+    let identity = helperArgument(3)
+    let root = helperArgument(4)
+    quietly(common.writeText(common.joinPath(root, "actual-parent.json"), data.dumps(obj(["parent_pid", "pid"], [number(common.parentProcess()), number(system.processId())]))))
+    let end = common.now() + 6 * common.SECOND
+    while common.now() < end {
+        match common.readJson(daemonPath) {
+            Ok(state) {
+                if !common.hasKey(data.field(state, "containers"), identity) {
+                    quietly(common.writeText(common.joinPath(root, "descendant-exit.json"), data.dumps(obj(["status"], [number(0)]))))
+                    return 0
+                }
+            }
+            Err(problem) {}
+        }
+        common.pause(20)
+    }
+    quietly(common.writeText(common.joinPath(root, "descendant-exit.json"), data.dumps(obj(["status"], [number(4)]))))
+    return 4
+}
+function helperController(): Integer {
+    let root = helperArgument(2)
+    let argv: List<Text> = []
+    for index in 3..argumentCount() { argv.add(argument(index)) }
+    match startChild(argv, common.joinPath(root, "descendant.stdout"), common.joinPath(root, "descendant.stderr"), common.SPAWN_SESSION) {
+        Ok(child) { quietly(common.writeText(common.joinPath(root, "descendant-pid.json"), data.dumps(obj(["pid"], [number(child.pid)])))) }
+        Err(problem) { return 3 }
+    }
+    common.pause(150)
+    return 0
+}
+function helperCli(): Integer {
+    let pidfile = helperArgument(2)
+    let sleep = common.integerText(helperArgument(3))
+    let argv: List<Text> = []
+    for index in 4..argumentCount() { argv.add(argument(index)) }
+    let pid = common.spawn(argv[0], argv, -1, -1, -1, -1, 0)
+    if pid < 0 { return 3 }
+    if pidfile != "-" { quietly(common.writeText(pidfile, data.dumps(obj(["pid"], [number(pid)])))) }
+    common.pause(sleep)
+    return 0
+}
+function helperPlugin(): Integer {
+    let marker = helperArgument(2)
+    let parentFile = helperArgument(3)
+    let permit = helperArgument(4)
+    if helperArgument(5) == "1" { common.createSession() }
+    quietly(common.writeText(parentFile, data.dumps(obj(["pid", "parent_pid"], [number(system.processId()), number(common.parentProcess())]))))
+    let end = common.now() + 3 * common.SECOND
+    while !common.exists(permit) {
+        if common.now() > end { return 5 }
+        common.pause(10)
+    }
+    quietly(common.writeText(marker, data.dumps(obj(["mock_created_id", "owner"], [text(identifier("2")), text("controlled-only")]))))
+    common.pause(150)
+    return 0
+}
+function helperEscaped(): Integer {
+    let marker = helperArgument(2)
+    let parentFile = helperArgument(3)
+    common.createSession()
+    quietly(common.writeText(parentFile, data.dumps(obj(["pid", "parent_pid"], [number(system.processId()), number(common.parentProcess())]))))
+    common.pause(5000)
+    quietly(common.writeText(marker, "delayed mock create"))
+    common.pause(10000)
+    return 0
+}
+function helperProducer(): Integer {
+    let emitted = helperArgument(2)
+    let release = helperArgument(3)
+    let mode = helperArgument(4)
+    let code = common.integerText(helperArgument(5))
+    common.writeAll(1, Bytes(helperArgument(6)))
+    common.writeAll(2, Bytes(helperArgument(7)))
+    let temporary = emitted + ".tmp"
+    quietly(common.writeText(temporary, data.dumps(selfBirth())))
+    common.renameReplace(temporary, emitted)
+    if mode == "blocked" {
+        let payload = Bytes(2 * 1024 * 1024)
+        for index in 0..payload.length { payload[index] = 120 }
+        common.writeAll(1, payload)
+    } else {
+        let end = common.now() + 8 * common.SECOND
+        while !common.exists(release) {
+            if common.now() > end { return 9 }
+            common.pause(10)
+        }
+    }
+    common.writeAll(1, Bytes(helperArgument(8)))
+    common.writeAll(2, Bytes(helperArgument(9)))
+    return code
+}
+function helperWorker(): Integer {
+    let launcher = helperArgument(2)
+    let root = helperArgument(3)
+    let mode = helperArgument(4)
+    let timeout = common.integerText(helperArgument(5))
+    let argv: List<Text> = []
+    for index in 6..argumentCount() { argv.add(argument(index)) }
+    let before = common.bindingOr(launcher)
+    let birth = common.processIdentity(system.processId())
+    writeJson(common.joinPath(root, "worker-ready.json"), obj(["identity", "pgid", "parent_pid", "parent_death_signal"],
+        [common.identityJson(birth), number(common.processGroup()), number(common.parentProcess()), number(common.deathSignal())]))
+    process.setLauncher(launcher)
+    let ops = process.OPS
+    ops.spawnFlags[0] = common.SPAWN_PARENT_DEATH
+    let blocking = [common.getBlocking(1), common.getBlocking(2)]
+    let failure = none()
+    let raw = Bytes()
+    let records = process.memoryCommands()
+    match process.rawCommands(common.joinPath(root, "commands")) {
+        Ok(created) { records = created }
+        Err(problem) { return 3 }
+    }
+    let settings = process.options(timeout * common.MILLISECOND)
+    settings.check = false
+    settings.stream = mode != "private"
+    match process.run(records, argv, settings) {
+        Ok(output) { raw = output.payload }
+        Err(problem) { failure = common.exception(problem) }
+    }
+    ops.spawnFlags[0] = 0
+    let after = common.bindingOr(launcher)
+    let row = none()
+    if records.rows.length > 0 { row = process.rowJson(records.rows[0]) }
+    writeJson(common.joinPath(root, "worker-result.json"), obj(["row", "failure", "api_present", "blocking_before", "blocking_after", "source_equal", "raw_sha256"],
+        [row, failure, flag(true), obj(["stdout", "stderr"], [number(blocking[0]), number(blocking[1])]),
+            obj(["stdout", "stderr"], [number(common.getBlocking(1)), number(common.getBlocking(2))]),
+            flag(common.sameBinding(before, after) && before.bytes >= 0), text(common.digestBytes(raw))]))
+    if failure.kind != json.NULL { return 0 }
+    if records.rows.length > 0 && records.rows[0].status.length > 0 { return records.rows[0].status[0] }
+    return 0
+}
+function helperRawController(): Integer {
+    let specPath = helperArgument(2)
+    let inner = helperArgument(3)
+    let receipt = helperArgument(4)
+    let marker = helperArgument(5)
+    let launcher = helperArgument(6)
+    process.setLauncher(launcher)
+    let specValue = data.none()
+    match common.readJson(specPath) {
+        Ok(value) { specValue = value }
+        Err(problem) { return 3 }
+    }
+    match adapter.ownerSpec(specValue) {
+        Ok(owner) {
+            match process.rawCommands(inner) {
+                Ok(records) {
+                    let seams = common.SEAMS
+                    seams.fault = function(point: Text, detail: Text): Result<Boolean, common.Failure> {
+                        if point == "json-write" && common.nameOf(detail) == "commands.json" && records.rows.length > 0 && records.rows[0].identity.pid >= 0 {
+                            quietly(common.atomicJson(receipt, process.rowJson(records.rows[0])))
+                            common.exitNow(23)
+                        }
+                        return Ok<Boolean, common.Failure>(true)
+                    }
+                    let settings = process.options(3 * common.SECOND)
+                    settings.admission.add(adapter.scope(owner))
+                    match process.run(records, [common.selfExecutable(), "--helper", "write", marker, "must not execute"], settings) {
+                        Ok(output) { return 0 }
+                        Err(problem) { return 4 }
+                    }
+                }
+                Err(problem) { return 3 }
+            }
+        }
+        Err(problem) { return 3 }
+    }
+    return 3
+}
+function helperCloseAdmission(): Integer {
+    match common.readJson(helperArgument(2)) {
+        Ok(value) {
+            match adapter.ownerSpec(value) {
+                Ok(owner) {
+                    match adapter.closeAdmission(owner, true) {
+                        Ok(result) { return 0 }
+                        Err(problem) { system.writeStandardError(problem.kind + ": " + problem.message + "\n"); return 1 }
+                    }
+                }
+                Err(problem) { return 1 }
+            }
+        }
+        Err(problem) { return 1 }
+    }
+    return 1
+}
+public function runHelper(): Integer {
+    let mode = helperArgument(1)
+    if mode == "descendant" { return helperDescendant() }
+    if mode == "controller" { return helperController() }
+    if mode == "cli" { return helperCli() }
+    if mode == "plugin" { return helperPlugin() }
+    if mode == "escaped" { return helperEscaped() }
+    if mode == "producer" { return helperProducer() }
+    if mode == "worker" { return helperWorker() }
+    if mode == "raw-controller" { return helperRawController() }
+    if mode == "close-admission" { return helperCloseAdmission() }
+    if mode == "write" {
+        quietly(common.writeText(helperArgument(2), helperArgument(3)))
+        return 0
+    }
+    if mode == "admitted" {
+        quietly(common.writeText(helperArgument(2), "owned harmless execution"))
+        print("admitted")
+        return 0
+    }
+    if mode == "write-sleep" {
+        quietly(common.writeText(helperArgument(2), "must not execute"))
+        common.pause(10000)
+        return 0
+    }
+    if mode == "bytes" {
+        let payload = Bytes(common.integerText(helperArgument(2)))
+        for index in 0..payload.length { payload[index] = 120 }
+        common.writeAll(1, payload)
+        return 0
+    }
+    system.writeStandardError("unknown helper\n")
+    return 2
+}

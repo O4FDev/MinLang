@@ -1,0 +1,846 @@
+use "json" as json
+use "system" as system
+use "files" as files
+use "sha256" as sha256
+use "../../quic-json.min" as data
+
+public constant PIN = "740c05a10b61d65e8abd3ad38d60898004d335d9"
+public constant PINNED_NAMES: List<Text> = ["run.py", "interop.py", "testcase.py", "testcases_quic.py", "docker-compose.yml"]
+public constant PINNED_DIGESTS: List<Text> = [
+    "e6242d2fc0ed77fc894976d656abcfd2b15283a546a5f1be5fa3c8fcdf0dde0e",
+    "19bf7696ba0558a9d381b81ba7742a411a9a9ec47b328f6cfa684a0dedddf511",
+    "e87106cbac52a66640fdca3e52dc936ff1c3cc6735dc61c376a6575e3a8cefcf",
+    "8e004e1e58a1b5a83e8e02c59ff7cf53dfb397b756e868629aa241b523a12e91",
+    "be0cb079b0c41ad6d398daec6924b8ef8b8a689e4632434404d141b3c0267eec"
+]
+public constant OWNER_LABEL = "io.minyar.qns.owner"
+public constant ROLES: List<Text> = ["sim", "server", "client"]
+public constant MAX_BYTES = 536870912
+public constant MAX_FILES = 10000
+public constant CHUNK = 65536
+public constant SECOND = 1000000000
+public constant MILLISECOND = 1000000
+public constant KNOWN_TESTCASES: List<Text> = ["handshake", "transfer", "retry", "resumption", "zerortt", "multiconnect", "rebind-port", "rebind-addr", "chacha20", "keyupdate", "connectionmigration"]
+
+public record Failure { serial: Integer; kind: Text; message: Text; notes: List<Text> }
+public record StageError { stage: Text; kind: Text; message: Text }
+public record Seams {
+    clock: Callback<Integer>
+    fault: Callback<Text, Text, Result<Boolean, Failure>>
+    serial: List<Integer>
+}
+
+function realClock(): Callback<Integer> {
+    return function(): Integer { return system.monotonicNanoseconds() }
+}
+function noFault(): Callback<Text, Text, Result<Boolean, Failure>> {
+    return function(point: Text, detail: Text): Result<Boolean, Failure> { return Ok<Boolean, Failure>(true) }
+}
+function defaultSeams(): Seams {
+    return Seams { clock: realClock(); fault: noFault(); serial: [0] }
+}
+public constant SEAMS: Seams = defaultSeams()
+
+public function resetSeams() {
+    let seams = SEAMS
+    seams.clock = realClock()
+    seams.fault = noFault()
+}
+public function now(): Integer {
+    let seams = SEAMS
+    let clock = seams.clock
+    return clock()
+}
+public function fault(point: Text, detail: Text): Result<Boolean, Failure> {
+    let seams = SEAMS
+    let hook = seams.fault
+    return hook(point, detail)
+}
+
+public function failure(kind: Text, message: Text): Failure {
+    let seams = SEAMS
+    seams.serial[0] += 1
+    return Failure { serial: seams.serial[0]; kind: kind; message: message; notes: [] }
+}
+public function ownership(message: Text): Failure { return failure("OwnershipError", message) }
+public function cleanup(message: Text): Failure { return failure("CleanupError", message) }
+public function same(left: Failure, right: Failure): Boolean { return left.serial == right.serial }
+public function note(primary: Failure, value: Text) { primary.notes.add(value) }
+public function hasNote(primary: Failure, needle: Text): Boolean {
+    for value in primary.notes { if contains(value, needle) { return true } }
+    return false
+}
+public function errorText(code: Integer): Text { return files.errorText(code) }
+public function systemFailure(code: Integer, detail: Text): Failure {
+    let kind = "OSError"
+    if code == 2 { kind = "FileNotFoundError" }
+    else if code == 3 { kind = "ProcessLookupError" }
+    else if code == 10 { kind = "ChildProcessError" }
+    else if code == 1 || code == 13 { kind = "PermissionError" }
+    else if code == 17 { kind = "FileExistsError" }
+    else if code == 20 { kind = "NotADirectoryError" }
+    else if code == 21 { kind = "IsADirectoryError" }
+    else if code == 11 { kind = "BlockingIOError" }
+    else if code == 32 { kind = "BrokenPipeError" }
+    let message = "[Errno " + Text(code) + "] " + errorText(code)
+    if detail != "" { message = message + ": '" + detail + "'" }
+    return failure(kind, message)
+}
+public function lookupMissing(value: Failure): Boolean {
+    return value.kind == "FileNotFoundError" || value.kind == "ProcessLookupError"
+}
+public function exception(value: Failure): json.Value {
+    return data.object(["type", "message"], [data.string(value.kind), data.string(value.message)])
+}
+public function stageError(stage: Text, value: Failure): StageError {
+    return StageError { stage: stage; kind: value.kind; message: value.message }
+}
+public function stageJson(value: StageError): json.Value {
+    if value.stage == "" { return data.object(["type", "message"], [data.string(value.kind), data.string(value.message)]) }
+    return data.object(["stage", "type", "message"], [data.string(value.stage), data.string(value.kind), data.string(value.message)])
+}
+public function stageList(values: List<StageError>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(stageJson(value)) }
+    return data.array(items)
+}
+
+public function contains(source: Text, needle: Text): Boolean { return source.find(needle) >= 0 }
+public function replaceAll(source: Text, needle: Text, replacement: Text): Text {
+    if needle == "" { return source }
+    let parts: List<Text> = []
+    let rest = source
+    while true {
+        let found = rest.find(needle)
+        if found < 0 { break }
+        parts.add(rest.slice(0, found))
+        parts.add(replacement)
+        rest = rest.slice(found + needle.length, rest.length)
+    }
+    parts.add(rest)
+    return joinText(parts)
+}
+public function count(source: Text, needle: Text): Integer {
+    if needle == "" { return 0 }
+    let total = 0
+    let rest = source
+    while true {
+        let found = rest.find(needle)
+        if found < 0 { return total }
+        total += 1
+        rest = rest.slice(found + needle.length, rest.length)
+    }
+    return total
+}
+public function zeroFill(value: Integer, width: Integer): Text {
+    let result = Text(value)
+    while result.length < width { result = "0" + result }
+    return result
+}
+public function lowerHex(value: Text, size: Integer): Boolean {
+    let raw = Bytes(value)
+    if raw.length != size { return false }
+    for byte in raw { if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false } }
+    return true
+}
+public function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+public function sameTexts(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function sameSet(left: List<Text>, right: List<Text>): Boolean {
+    return sameTexts(unique(left.sorted()), unique(right.sorted()))
+}
+public function unique(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { if !member(result, value) { result.add(value) } }
+    return result
+}
+public function durationText(nanoseconds: Integer): Text {
+    if nanoseconds % SECOND == 0 { return Text(nanoseconds / SECOND) }
+    let whole = Text(nanoseconds / SECOND)
+    let fraction = zeroFill(nanoseconds % SECOND, 9)
+    while fraction.endsWith("0") { fraction = fraction.slice(0, fraction.length - 1) }
+    return whole + "." + fraction
+}
+public function seconds(nanoseconds: Integer): json.Value { return data.decimal(durationText(nanoseconds)) }
+
+public function lastErrno(): Integer { native "ownedadapter" }
+public function pidfdOpen(pid: Integer): Integer { native "ownedadapter" }
+public function pidfdSend(fd: Integer, signal: Integer): Integer { native "ownedadapter" }
+public function pidfdReady(fd: Integer): Integer { native "ownedadapter" }
+public function closeFd(fd: Integer): Integer { native "ownedadapter" }
+public function subreaperGet(): Integer { native "ownedadapter" }
+public function subreaperSet(value: Integer): Integer { native "ownedadapter" }
+public function deathSignal(): Integer { native "ownedadapter" }
+public function exitedNoWait(pid: Integer): Integer { native "ownedadapter" }
+public function reapNoHang(pid: Integer): Integer { native "ownedadapter" }
+public function sigchldQuery(): Integer { native "ownedadapter" }
+public function sigchldSet(ignore: Boolean): Integer { native "ownedadapter" }
+public function pipePair(): Integer { native "ownedadapter" }
+function spawnNative(path: Text, arguments: Bytes, environment: Bytes, input: Integer, output: Integer, error: Integer, gate: Integer, flags: Integer): Integer { native "ownedadapter" }
+public function readSome(fd: Integer, limit: Integer): Bytes { native "ownedadapter" }
+public function readAt(fd: Integer, offset: Integer, limit: Integer): Bytes { native "ownedadapter" }
+function pollReadable(fds: Bytes, timeout: Integer): Bytes { native "ownedadapter" }
+public function writeSome(fd: Integer, payload: Bytes, offset: Integer): Integer { native "ownedadapter" }
+public function writeAll(fd: Integer, payload: Bytes): Integer { native "ownedadapter" }
+public function pollWritable(fd: Integer, timeout: Integer): Integer { native "ownedadapter" }
+public function getBlocking(fd: Integer): Integer { native "ownedadapter" }
+public function setBlocking(fd: Integer, blocking: Boolean): Integer { native "ownedadapter" }
+public function openFile(path: Text, flags: Integer, mode: Integer): Integer { native "ownedadapter" }
+public function flockTry(fd: Integer): Integer { native "ownedadapter" }
+public function flockRelease(fd: Integer): Integer { native "ownedadapter" }
+public function renameNoReplace(source: Text, target: Text): Integer { native "ownedadapter" }
+public function renameReplace(source: Text, target: Text): Integer { native "ownedadapter" }
+public function createSession(): Integer { native "ownedadapter" }
+public function parentProcess(): Integer { native "ownedadapter" }
+public function processGroup(): Integer { native "ownedadapter" }
+public function processGroupOf(pid: Integer): Integer { native "ownedadapter" }
+public function machine(): Text { native "ownedadapter" }
+public function readLink(path: Text): Text { native "ownedadapter" }
+public function realPath(path: Text): Text { native "ownedadapter" }
+function statPath(path: Text, follow: Boolean): Bytes { native "ownedadapter" }
+public function changeMode(path: Text, mode: Integer): Integer { native "ownedadapter" }
+public function makeDirectoryNative(path: Text, mode: Integer): Integer { native "ownedadapter" }
+public function removeFile(path: Text): Integer { native "ownedadapter" }
+public function removeDirectory(path: Text): Integer { native "ownedadapter" }
+public function temporaryDirectory(directory: Text, prefix: Text): Text { native "ownedadapter" }
+public function directoryOpen(path: Text): Integer { native "ownedadapter" }
+public function directoryNext(handle: Integer): Text { native "ownedadapter" }
+public function directoryClose(handle: Integer): Integer { native "ownedadapter" }
+public function sleepMilliseconds(milliseconds: Integer): Integer { native "ownedadapter" }
+public function exitNow(status: Integer): Integer { native "ownedadapter" }
+function gateExecNative(fd: Integer, arguments: Bytes, timeout: Integer): Integer { native "ownedadapter" }
+public function sha1Hex(payload: Bytes): Text { native "ownedadapter" }
+
+public constant OPEN_WRITE = 1
+public constant OPEN_CREATE = 2
+public constant OPEN_TRUNCATE = 4
+public constant OPEN_EXCLUSIVE = 8
+public constant OPEN_APPEND = 16
+public constant OPEN_NOFOLLOW = 32
+public constant SPAWN_SESSION = 1
+public constant SPAWN_PARENT_DEATH = 2
+
+public function vector(items: List<Text>): Bytes {
+    let result = Bytes()
+    for item in items { result.addBytes(Bytes(item)); result.add(0) }
+    return result
+}
+public function spawn(path: Text, argv: List<Text>, input: Integer, output: Integer, error: Integer, gate: Integer, flags: Integer): Integer {
+    return spawnWith(path, argv, [], input, output, error, gate, flags)
+}
+public function spawnWith(path: Text, argv: List<Text>, environment: List<Text>, input: Integer, output: Integer, error: Integer, gate: Integer, flags: Integer): Integer {
+    for item in argv { if contains(item, Text(Bytes(1))) { return -22 } }
+    for item in environment { if contains(item, Text(Bytes(1))) { return -22 } }
+    if argv.length == 0 { return -22 }
+    let encoded = Bytes()
+    if environment.length > 0 { encoded = vector(environment) }
+    return spawnNative(path, vector(argv), encoded, input, output, error, gate, flags)
+}
+public function gateExec(fd: Integer, argv: List<Text>, timeout: Integer): Integer {
+    return gateExecNative(fd, vector(argv), timeout)
+}
+public function pollFds(fds: List<Integer>, timeout: Integer): List<Boolean> {
+    let raw = Bytes()
+    for fd in fds { raw.addInt32(fd) }
+    let ready = pollReadable(raw, timeout)
+    let result: List<Boolean> = []
+    for index in 0..fds.length { result.add(index < ready.length && ready[index] != 0) }
+    return result
+}
+public function pause(milliseconds: Integer) { sleepMilliseconds(milliseconds) }
+public function selfExecutable(): Text { return readLink("/proc/self/exe") }
+public function threadCount(): Integer {
+    let status = Text(files.readFile("/proc/self/status"))
+    for line in status.split("\n") {
+        if line.startsWith("Threads:") { return integerText(line.slice(8, line.length).trim()) }
+    }
+    return -1
+}
+public function integerText(value: Text): Integer {
+    let raw = Bytes(value)
+    if raw.length == 0 || raw.length > 18 { return -1 }
+    let result = 0
+    let start = 0
+    let negative = raw[0] == 45
+    if negative { start = 1 }
+    if start == raw.length { return -1 }
+    for index in start..raw.length {
+        if raw[index] < 48 || raw[index] > 57 { return -1 }
+        result = result * 10 + raw[index] - 48
+    }
+    if negative { return -result }
+    return result
+}
+
+public function isAbsolute(path: Text): Boolean { return path.startsWith("/") }
+public function components(path: Text): List<Text> {
+    let result: List<Text> = []
+    for part in path.split("/") { if part != "" && part != "." { result.add(part) } }
+    return result
+}
+public function normalize(path: Text): Text {
+    let parts = components(path)
+    if !isAbsolute(path) {
+        if parts.length == 0 { return "." }
+        return joinParts(parts)
+    }
+    return "/" + joinParts(parts)
+}
+public function joinParts(parts: List<Text>): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add("/") }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+public function joinPath(base: Text, name: Text): Text {
+    if isAbsolute(name) { return normalize(name) }
+    if name == "" || name == "." { return normalize(base) }
+    if base.endsWith("/") { return normalize(base + name) }
+    return normalize(base + "/" + name)
+}
+public function parentOf(path: Text): Text {
+    let parts = components(path)
+    if parts.length == 0 {
+        if isAbsolute(path) { return "/" }
+        return "."
+    }
+    let kept = parts.slice(0, parts.length - 1)
+    if isAbsolute(path) { return "/" + joinParts(kept) }
+    if kept.length == 0 { return "." }
+    return joinParts(kept)
+}
+public function nameOf(path: Text): Text {
+    let parts = components(path)
+    if parts.length == 0 { return "" }
+    return parts[parts.length - 1]
+}
+public function within(ancestor: Text, path: Text): Boolean {
+    let root = normalize(ancestor)
+    let value = normalize(path)
+    if root == value { return false }
+    if root == "/" { return isAbsolute(value) }
+    return value.startsWith(root + "/")
+}
+public function relativeTo(path: Text, root: Text): Text {
+    let value = normalize(path)
+    let base = normalize(root)
+    if value == base { return "." }
+    if base == "/" { return value.slice(1, value.length) }
+    return value.slice(base.length + 1, value.length)
+}
+public function resolvePath(path: Text): Text {
+    let absolute = path
+    if !isAbsolute(path) { absolute = realPath(".") + "/" + path }
+    let parts: List<Text> = []
+    for part in absolute.split("/") { if part != "" && part != "." { parts.add(part) } }
+    let existing = parts.length
+    while existing > 0 {
+        let prefix = "/" + joinParts(parts.slice(0, existing))
+        if lstat(prefix).error == 0 { break }
+        existing -= 1
+    }
+    let base = "/"
+    if existing > 0 {
+        let prefix = "/" + joinParts(parts.slice(0, existing))
+        let resolved = realPath(prefix)
+        if resolved != "" { base = resolved } else { base = prefix }
+    }
+    let result = components(base)
+    for part in parts.slice(existing, parts.length) {
+        if part == ".." { if result.length > 0 { result.pop() } }
+        else { result.add(part) }
+    }
+    return "/" + joinParts(result)
+}
+
+public record Stat { error: Integer; kind: Integer; mode: Integer; size: Integer; inode: Integer }
+function decodeStat(raw: Bytes): Stat {
+    return Stat { error: raw.getInt64(0); kind: raw.getInt64(8); mode: raw.getInt64(16); size: raw.getInt64(24); inode: raw.getInt64(32) }
+}
+public function lstat(path: Text): Stat { return decodeStat(statPath(path, false)) }
+public function stat(path: Text): Stat { return decodeStat(statPath(path, true)) }
+public function isSymlink(path: Text): Boolean { return lstat(path).kind == 3 }
+public function isDirectory(path: Text): Boolean { return stat(path).kind == 2 }
+public function isFile(path: Text): Boolean { return stat(path).kind == 1 }
+public function exists(path: Text): Boolean { return stat(path).error == 0 }
+public function present(path: Text): Boolean { return lstat(path).error == 0 }
+public function modeOf(path: Text): Integer { return stat(path).mode & 511 }
+
+public function makeDirectory(path: Text): Result<Boolean, Failure> {
+    let status = makeDirectoryNative(path, 511)
+    if status < 0 { return Err<Boolean, Failure>(systemFailure(-status, path)) }
+    return Ok<Boolean, Failure>(true)
+}
+public function makeDirectories(path: Text): Result<Boolean, Failure> {
+    let value = normalize(path)
+    if isDirectory(value) { return Ok<Boolean, Failure>(true) }
+    let parent = parentOf(value)
+    if parent != value && !isDirectory(parent) {
+        let made = try makeDirectories(parent)
+    }
+    let status = makeDirectoryNative(value, 511)
+    if status < 0 && !(status == -17 && isDirectory(value)) { return Err<Boolean, Failure>(systemFailure(-status, value)) }
+    return Ok<Boolean, Failure>(true)
+}
+public function makeFreshDirectory(path: Text): Result<Boolean, Failure> {
+    let parent = parentOf(normalize(path))
+    let made = try makeDirectories(parent)
+    return makeDirectory(path)
+}
+public function writeBytes(path: Text, payload: Bytes): Result<Boolean, Failure> {
+    let fd = openFile(path, OPEN_WRITE + OPEN_CREATE + OPEN_TRUNCATE, 438)
+    if fd < 0 { return Err<Boolean, Failure>(systemFailure(-fd, path)) }
+    let wrote = writeAll(fd, payload)
+    let closed = closeFd(fd)
+    if wrote < 0 { return Err<Boolean, Failure>(systemFailure(-wrote, path)) }
+    if closed < 0 { return Err<Boolean, Failure>(systemFailure(-closed, path)) }
+    return Ok<Boolean, Failure>(true)
+}
+public function writeText(path: Text, value: Text): Result<Boolean, Failure> { return writeBytes(path, Bytes(value)) }
+public function touch(path: Text): Result<Boolean, Failure> {
+    let fd = openFile(path, OPEN_WRITE + OPEN_CREATE, 438)
+    if fd < 0 { return Err<Boolean, Failure>(systemFailure(-fd, path)) }
+    closeFd(fd)
+    return Ok<Boolean, Failure>(true)
+}
+public function readBytes(path: Text): Result<Bytes, Failure> {
+    let fd = openFile(path, 0, 0)
+    if fd < 0 { return Err<Bytes, Failure>(systemFailure(-fd, path)) }
+    let result = Bytes()
+    while true {
+        let chunk = readSome(fd, CHUNK)
+        if chunk.length == 0 {
+            let code = lastErrno()
+            if code != 0 { closeFd(fd); return Err<Bytes, Failure>(systemFailure(code, path)) }
+            break
+        }
+        result.addBytes(chunk)
+    }
+    closeFd(fd)
+    return Ok<Bytes, Failure>(result)
+}
+public function readOr(path: Text): Bytes {
+    match readBytes(path) {
+        Ok(value) { return value }
+        Err(problem) { return Bytes() }
+    }
+}
+public function removeTree(path: Text): Result<Boolean, Failure> {
+    let info = lstat(path)
+    if info.error != 0 { return Err<Boolean, Failure>(systemFailure(info.error, path)) }
+    if info.kind != 2 {
+        let status = removeFile(path)
+        if status < 0 { return Err<Boolean, Failure>(systemFailure(-status, path)) }
+        return Ok<Boolean, Failure>(true)
+    }
+    let handle = directoryOpen(path)
+    if handle < 0 { return Err<Boolean, Failure>(systemFailure(-handle, path)) }
+    let names: List<Text> = []
+    while true {
+        let name = directoryNext(handle)
+        if name == "" { break }
+        names.add(name)
+    }
+    directoryClose(handle)
+    for name in names { let removed = try removeTree(path + "/" + name) }
+    let status = removeDirectory(path)
+    if status < 0 { return Err<Boolean, Failure>(systemFailure(-status, path)) }
+    return Ok<Boolean, Failure>(true)
+}
+
+public function readJson(path: Text): Result<json.Value, Failure> {
+    let raw = try readBytes(path)
+    let value = data.decode(raw)
+    if value.kind == json.INVALID { return Err<json.Value, Failure>(failure("JSONDecodeError", value.text)) }
+    return Ok<json.Value, Failure>(value)
+}
+public function jsonBytes(value: json.Value): Bytes { return Bytes(data.pretty(value) + "\n") }
+public function atomicJson(path: Text, value: json.Value): Result<Boolean, Failure> {
+    let hooked = try fault("json-write", path)
+    let temporary = joinPath(parentOf(path), nameOf(path) + ".tmp")
+    let payload = jsonBytes(value)
+    let wrote = try writeBytes(temporary, payload)
+    let back = try readBytes(temporary)
+    if Text(back) != Text(payload) { return Err<Boolean, Failure>(failure("RuntimeError", "retained JSON write mismatch")) }
+    let moved = renameReplace(temporary, path)
+    if moved < 0 { return Err<Boolean, Failure>(systemFailure(-moved, path)) }
+    let final = try readBytes(path)
+    if Text(final) != Text(payload) { return Err<Boolean, Failure>(failure("RuntimeError", "retained JSON final mismatch")) }
+    return Ok<Boolean, Failure>(true)
+}
+
+public function path(value: json.Value, keys: List<Text>): json.Value {
+    let current = value
+    for key in keys { current = data.field(current, key) }
+    return current
+}
+public function setPath(value: json.Value, keys: List<Text>, item: json.Value): json.Value {
+    if keys.length == 0 { return item }
+    let head = keys[0]
+    let child = data.field(value, head)
+    if value.kind != json.OBJECT { return data.object([head], [setPath(child, keys.slice(1, keys.length), item)]) }
+    return data.with(value, head, setPath(child, keys.slice(1, keys.length), item))
+}
+public function removePath(value: json.Value, keys: List<Text>): json.Value {
+    if keys.length == 0 { return value }
+    if keys.length == 1 { return data.without(value, keys[0]) }
+    return data.with(value, keys[0], removePath(data.field(value, keys[0]), keys.slice(1, keys.length)))
+}
+public function hasKey(value: json.Value, key: Text): Boolean { return data.present(value, key) }
+public function keysOf(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    if value.kind == json.OBJECT { for key in value.keys { result.add(key) } }
+    return result
+}
+public function valuesOf(value: json.Value): List<json.Value> {
+    let result: List<json.Value> = []
+    for item in value.items { result = result.appended(item) }
+    return result
+}
+public function textOf(value: json.Value): Text {
+    if value.kind == json.STRING { return value.text }
+    return ""
+}
+public function isInteger(value: json.Value): Boolean { return data.exactInteger(value) }
+public function integerOf(value: json.Value): Integer {
+    if !data.exactInteger(value) { return -1 }
+    return data.integer(value)
+}
+public function equalText(value: json.Value, expected: Text): Boolean { return value.kind == json.STRING && value.text == expected }
+public function isFalse(value: json.Value): Boolean { return data.isFalse(value) }
+public function isTrue(value: json.Value): Boolean { return data.isTrue(value) }
+public function stringList(values: List<Text>): json.Value { return data.strings(values) }
+public function textList(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    if value.kind != json.ARRAY { return result }
+    for item in value.items { if item.kind == json.STRING { result.add(item.text) } }
+    return result
+}
+public function allStrings(value: json.Value): Boolean { return data.allTexts(value) }
+
+public record Binding { path: Text; digest: Text; bytes: Integer }
+public function emptyBinding(): Binding { return Binding { path: ""; digest: ""; bytes: -1 } }
+public function sameBinding(left: Binding, right: Binding): Boolean { return left.digest == right.digest && left.bytes == right.bytes }
+public function bindingValue(value: Binding): json.Value {
+    return data.object(["sha256", "bytes"], [data.string(value.digest), data.number(value.bytes)])
+}
+public function boundPath(value: Binding): json.Value {
+    if value.bytes < 0 { return data.none() }
+    return data.object(["path", "sha256", "bytes"], [data.string(value.path), data.string(value.digest), data.number(value.bytes)])
+}
+public function boundEquals(value: json.Value, expected: Binding): Boolean {
+    return equalText(data.field(value, "sha256"), expected.digest) && data.equalsInteger(data.field(value, "bytes"), expected.bytes)
+}
+
+public function streamBinding(source: Text, limit: Integer, deadline: Integer, copyTo: Text): Result<Binding, Failure> {
+    let hooked = try fault("stream-read", source)
+    if isSymlink(source) { return Err<Binding, Failure>(ownership("nonregular bound input")) }
+    let info = stat(source)
+    if info.error != 0 { return Err<Binding, Failure>(systemFailure(info.error, source)) }
+    if info.kind != 1 { return Err<Binding, Failure>(ownership("nonregular bound input")) }
+    if info.size > limit { return Err<Binding, Failure>(ownership("retention bound exceeded")) }
+    let fd = openFile(source, 0, 0)
+    if fd < 0 { return Err<Binding, Failure>(systemFailure(-fd, source)) }
+    let output = -1
+    if copyTo != "" {
+        output = openFile(copyTo, OPEN_WRITE + OPEN_CREATE + OPEN_TRUNCATE, 438)
+        if output < 0 { closeFd(fd); return Err<Binding, Failure>(systemFailure(-output, copyTo)) }
+    }
+    let result = streamLoop(source, fd, output, limit, deadline)
+    closeFd(fd)
+    if output >= 0 { closeFd(output) }
+    let value = try result
+    if deadline > 0 && now() > deadline { return Err<Binding, Failure>(ownership("retention bound exceeded")) }
+    if copyTo != "" { let copied = try fault("stream-copied", source) }
+    return Ok<Binding, Failure>(value)
+}
+function streamLoop(source: Text, fd: Integer, output: Integer, limit: Integer, deadline: Integer): Result<Binding, Failure> {
+    let total = 0
+    let state = sha256.new()
+    while true {
+        if deadline > 0 && now() > deadline { return Err<Binding, Failure>(ownership("retention bound exceeded")) }
+        let hooked = try fault("stream-chunk", source)
+        let size = min(CHUNK, limit - total + 1)
+        let chunk = readSome(fd, size)
+        if chunk.length == 0 {
+            let code = lastErrno()
+            if code != 0 { return Err<Binding, Failure>(systemFailure(code, source)) }
+            break
+        }
+        total += chunk.length
+        if total > limit { return Err<Binding, Failure>(ownership("retention bound exceeded")) }
+        sha256.update(state, chunk)
+        if output >= 0 {
+            let wrote = writeAll(output, chunk)
+            if wrote < 0 { return Err<Binding, Failure>(systemFailure(-wrote, source)) }
+        }
+    }
+    return Ok<Binding, Failure>(Binding { path: ""; digest: sha256.hex(sha256.finalize(state)); bytes: total })
+}
+public function binding(source: Text): Result<Binding, Failure> {
+    let value = try streamBinding(source, MAX_BYTES, 0, "")
+    value.path = resolvePath(source)
+    return Ok<Binding, Failure>(value)
+}
+public function bindingOr(source: Text): Binding {
+    match binding(source) {
+        Ok(value) { return value }
+        Err(problem) { return emptyBinding() }
+    }
+}
+public function digestBytes(payload: Bytes): Text {
+    let state = sha256.new()
+    sha256.update(state, payload)
+    return sha256.hex(sha256.finalize(state))
+}
+
+public record Walker { root: Text; handles: List<Integer>; directories: List<Text>; seen: List<Integer>; maximum: Integer; deadline: Integer }
+public function walk(root: Text, maximum: Integer, deadline: Integer): Result<Walker, Failure> {
+    let handle = directoryOpen(root)
+    if handle < 0 { return Err<Walker, Failure>(systemFailure(-handle, root)) }
+    return Ok<Walker, Failure>(Walker { root: root; handles: [handle]; directories: [normalize(root)]; seen: [0]; maximum: maximum; deadline: deadline })
+}
+public function closeWalk(walker: Walker) {
+    while walker.handles.length > 0 { directoryClose(walker.handles.pop()); walker.directories.pop() }
+}
+public function nextPath(walker: Walker): Result<Text, Failure> {
+    while walker.handles.length > 0 {
+        if walker.deadline > 0 && now() > walker.deadline { closeWalk(walker); return Err<Text, Failure>(ownership("retention bound exceeded")) }
+        let top = walker.handles.length - 1
+        let name = directoryNext(walker.handles[top])
+        if name == "" {
+            let code = lastErrno()
+            if code != 0 { closeWalk(walker); return Err<Text, Failure>(systemFailure(code, walker.directories[top])) }
+            directoryClose(walker.handles.pop())
+            walker.directories.pop()
+            continue
+        }
+        walker.seen[0] += 1
+        if walker.seen[0] > walker.maximum { closeWalk(walker); return Err<Text, Failure>(ownership("retention bound exceeded")) }
+        let entry = walker.directories[top] + "/" + name
+        match fault("enumerate", walker.root) {
+            Ok(value) {}
+            Err(problem) { closeWalk(walker); return Err<Text, Failure>(problem) }
+        }
+        let info = lstat(entry)
+        if info.kind == 3 { closeWalk(walker); return Err<Text, Failure>(ownership("symlink in retained tree")) }
+        if info.kind == 2 {
+            let handle = directoryOpen(entry)
+            if handle < 0 { closeWalk(walker); return Err<Text, Failure>(systemFailure(-handle, entry)) }
+            walker.handles.add(handle)
+            walker.directories.add(entry)
+        } else if info.kind != 1 { closeWalk(walker); return Err<Text, Failure>(ownership("nonregular retained input")) }
+        return Ok<Text, Failure>(entry)
+    }
+    return Ok<Text, Failure>("")
+}
+public function boundedPaths(root: Text, maximum: Integer, deadline: Integer): Result<List<Text>, Failure> {
+    let walker = try walk(root, maximum, deadline)
+    let result: List<Text> = []
+    while true {
+        let entry = try nextPath(walker)
+        if entry == "" { break }
+        result.add(entry)
+    }
+    return Ok<List<Text>, Failure>(result)
+}
+
+public record TreeFile { name: Text; before: Binding; retained: Binding; after: Binding; originalFinal: Binding; retainedFinal: Binding }
+public record TreeRow { original: Text; retained: Text; files: List<TreeFile>; status: Text; error: List<StageError> }
+public record TreeRetention { root: Text; maxBytes: Integer; maxFiles: Integer; previous: List<json.Value>; previousErrors: List<json.Value>; rows: List<TreeRow>; problems: List<StageError> }
+
+public function treeRetention(root: Text, maxBytes: Integer, maxFiles: Integer): Result<TreeRetention, Failure> {
+    let made = try makeFreshDirectory(root)
+    return Ok<TreeRetention, Failure>(TreeRetention { root: normalize(root); maxBytes: maxBytes; maxFiles: maxFiles; previous: []; previousErrors: []; rows: []; problems: [] })
+}
+public function reopenRetention(root: Text, maxBytes: Integer, maxFiles: Integer): Result<TreeRetention, Failure> {
+    if !isDirectory(root) || isSymlink(root) { return treeRetention(root, maxBytes, maxFiles) }
+    let retention = TreeRetention { root: normalize(root); maxBytes: maxBytes; maxFiles: maxFiles; previous: []; previousErrors: []; rows: []; problems: [] }
+    let ledger = joinPath(root, "retention.json")
+    if present(ledger) {
+        let value = try readJson(ledger)
+        retention.previous = valuesOf(data.field(value, "trees"))
+        retention.previousErrors = valuesOf(data.field(value, "errors"))
+    }
+    return Ok<TreeRetention, Failure>(retention)
+}
+function treeFileJson(item: TreeFile): json.Value {
+    let keys = ["original_before", "retained", "original_after"]
+    let values = [bindingValue(item.before), bindingValue(item.retained), bindingValue(item.after)]
+    if item.originalFinal.bytes >= 0 { keys.add("original_final"); values = values.appended(bindingValue(item.originalFinal)) }
+    if item.retainedFinal.bytes >= 0 { keys.add("retained_final"); values = values.appended(bindingValue(item.retainedFinal)) }
+    return data.object(keys, values)
+}
+public function treeRowJson(row: TreeRow): json.Value {
+    let names: List<Text> = []
+    let items: List<json.Value> = []
+    for item in row.files { names.add(item.name); items = items.appended(treeFileJson(item)) }
+    let keys = ["original", "retained", "files", "status"]
+    let values = [data.string(row.original), data.string(row.retained), data.object(names, items), data.string(row.status)]
+    if row.error.length > 0 { keys.add("error"); values = values.appended(stageJson(row.error[0])) }
+    return data.object(keys, values)
+}
+public function retentionJson(retention: TreeRetention): json.Value {
+    let trees = retention.previous.slice(0, retention.previous.length)
+    for row in retention.rows { trees = trees.appended(treeRowJson(row)) }
+    let problems = retention.previousErrors.slice(0, retention.previousErrors.length)
+    for item in retention.problems { problems = problems.appended(stageJson(item)) }
+    return data.object(["schema_version", "trees", "errors"], [data.number(1), data.array(trees), data.array(problems)])
+}
+public function retentionRowCount(retention: TreeRetention): Integer { return retention.previous.length + retention.rows.length }
+function sanitizeLabel(label: Text): Text {
+    let raw = Bytes(label)
+    let result = Bytes()
+    for byte in raw {
+        if (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45 { result.add(byte) }
+        else { result.add(95) }
+    }
+    return Text(result)
+}
+public function findFile(row: TreeRow, name: Text): Binding {
+    for item in row.files { if item.name == name { return item.before } }
+    return emptyBinding()
+}
+
+public function capture(retention: TreeRetention, source: Text, label: Text): Result<TreeRow, Failure> {
+    let hooked = try fault("capture", label)
+    if isSymlink(source) { return Err<TreeRow, Failure>(ownership("symlink retention root")) }
+    let resolved = resolvePath(source)
+    if isSymlink(resolved) || !isDirectory(resolved) { return Err<TreeRow, Failure>(ownership("retention requires a real owned directory")) }
+    let target = joinPath(retention.root, zeroFill(retentionRowCount(retention), 3) + "-" + sanitizeLabel(label))
+    let made = try makeDirectory(target)
+    let row = TreeRow { original: resolved; retained: nameOf(target); files: []; status: "retaining"; error: [] }
+    retention.rows.add(row)
+    let deadline = [0]
+    let primary: List<Failure> = []
+    match captureBody(retention, row, resolved, target, deadline) {
+        Ok(value) {}
+        Err(problem) {
+            primary.add(problem)
+            row.status = "failed"
+            row.error.add(StageError { stage: ""; kind: problem.kind; message: problem.message })
+            retention.problems.add(row.error[0])
+        }
+    }
+    match finishCapture(retention, deadline[0]) {
+        Ok(value) {}
+        Err(secondary) {
+            if primary.length == 0 {
+                row.status = "failed"
+                row.error.truncate(0)
+                row.error.add(StageError { stage: "retention-finalization"; kind: secondary.kind; message: secondary.message })
+                retention.problems.add(row.error[0])
+                match atomicJson(joinPath(retention.root, "retention.json"), retentionJson(retention)) {
+                    Ok(value) {}
+                    Err(last) { note(secondary, "retention failure ledger: " + last.message) }
+                }
+                return Err<TreeRow, Failure>(secondary)
+            }
+            retention.problems.add(StageError { stage: "retention-finalization"; kind: secondary.kind; message: secondary.message })
+            note(primary[0], "retention finalization: " + secondary.message)
+            match atomicJson(joinPath(retention.root, "retention.json"), retentionJson(retention)) {
+                Ok(value) {}
+                Err(final) { note(primary[0], "failure ledger finalization: " + final.message) }
+            }
+        }
+    }
+    if primary.length > 0 { return Err<TreeRow, Failure>(primary[0]) }
+    let hookedAfter = try fault("captured", label)
+    return Ok<TreeRow, Failure>(row)
+}
+function finishCapture(retention: TreeRetention, deadline: Integer): Result<Boolean, Failure> {
+    let wrote = try atomicJson(joinPath(retention.root, "retention.json"), retentionJson(retention))
+    if deadline > 0 && now() > deadline { return Err<Boolean, Failure>(ownership("retention bound exceeded")) }
+    return Ok<Boolean, Failure>(true)
+}
+function captureBody(retention: TreeRetention, row: TreeRow, source: Text, target: Text, deadline: List<Integer>): Result<Boolean, Failure> {
+    deadline[0] = now() + 30 * SECOND
+    let walker = try walk(source, retention.maxFiles, deadline[0])
+    let outcome = captureEntries(retention, row, source, target, deadline[0], walker)
+    closeWalk(walker)
+    let copied = try outcome
+    let entries = try boundedPaths(source, retention.maxFiles, deadline[0])
+    let names: List<Text> = []
+    for entry in entries { if isFile(entry) { names.add(relativeTo(entry, source)) } }
+    let recorded: List<Text> = []
+    for item in row.files { recorded.add(item.name) }
+    if !sameSet(names, recorded) { return Err<Boolean, Failure>(ownership("retained tree inventory changed")) }
+    for item in row.files {
+        let originalFinal = try streamBinding(joinPath(source, item.name), item.before.bytes, deadline[0], "")
+        item.originalFinal = originalFinal
+        let retainedFinal = try streamBinding(joinPath(target, item.name), item.before.bytes, deadline[0], "")
+        item.retainedFinal = retainedFinal
+        if !sameBinding(item.before, item.originalFinal) || !sameBinding(item.before, item.retainedFinal) {
+            return Err<Boolean, Failure>(ownership("retained tree bytes changed before finalization"))
+        }
+    }
+    if now() > deadline[0] { return Err<Boolean, Failure>(ownership("retention bound exceeded")) }
+    row.status = "retained"
+    return Ok<Boolean, Failure>(true)
+}
+function captureEntries(retention: TreeRetention, row: TreeRow, source: Text, target: Text, deadline: Integer, walker: Walker): Result<Boolean, Failure> {
+    let size = 0
+    while true {
+        let entry = try nextPath(walker)
+        if entry == "" { break }
+        if isDirectory(entry) { continue }
+        if row.files.length >= retention.maxFiles { return Err<Boolean, Failure>(ownership("retention bound exceeded")) }
+        let name = relativeTo(entry, source)
+        let remaining = retention.maxBytes - size
+        if stat(entry).size > remaining { return Err<Boolean, Failure>(ownership("retention bound exceeded")) }
+        let output = joinPath(target, name)
+        let made = try makeDirectories(parentOf(output))
+        let before = try streamBinding(entry, remaining, deadline, output)
+        size += before.bytes
+        let after = try streamBinding(entry, before.bytes, deadline, "")
+        let copied = try streamBinding(output, before.bytes, deadline, "")
+        row.files.add(TreeFile { name: name; before: before; retained: copied; after: after; originalFinal: emptyBinding(); retainedFinal: emptyBinding() })
+        if !sameBinding(before, copied) || !sameBinding(before, after) { return Err<Boolean, Failure>(ownership("retained file changed")) }
+    }
+    return Ok<Boolean, Failure>(true)
+}
+
+public record Member { pid: Integer; startTicks: Integer; pgid: Integer; session: Integer; origin: Text }
+public function noMember(): Member { return Member { pid: -1; startTicks: -1; pgid: -1; session: -1; origin: "" } }
+public function statFields(pid: Integer): List<Text> {
+    let raw = files.readFile("/proc/" + Text(pid) + "/stat")
+    let result: List<Text> = []
+    if raw.length == 0 { return result }
+    let position = -1
+    for index in 0..(raw.length - 1) { if raw[index] == 41 && raw[index + 1] == 32 { position = index } }
+    if position < 0 { return result }
+    for part in Text(raw.slice(position + 2, raw.length)).trim().split(" ") { if part != "" { result.add(part) } }
+    return result
+}
+public function processIdentity(pid: Integer): Member {
+    let fields = statFields(pid)
+    if fields.length < 20 || fields[0] == "Z" || fields[0] == "X" { return noMember() }
+    return Member { pid: pid; startTicks: integerText(fields[19]); pgid: -1; session: -1; origin: "" }
+}
+public function identityJson(value: Member): json.Value {
+    if value.pid < 0 { return data.none() }
+    let keys = ["pid", "start_ticks"]
+    let ticks = data.none()
+    if value.startTicks >= 0 { ticks = data.number(value.startTicks) }
+    let values = [data.number(value.pid), ticks]
+    if value.pgid >= 0 { keys.add("pgid"); values = values.appended(data.number(value.pgid)) }
+    if value.session >= 0 { keys.add("session"); values = values.appended(data.number(value.session)) }
+    if value.origin != "" { keys.add("origin"); values = values.appended(data.string(value.origin)) }
+    return data.object(keys, values)
+}
+public function readMember(value: json.Value): Member {
+    if value.kind != json.OBJECT { return noMember() }
+    let result = Member { pid: integerOf(data.field(value, "pid")); startTicks: integerOf(data.field(value, "start_ticks")); pgid: -1; session: -1; origin: textOf(data.field(value, "origin")) }
+    if isInteger(data.field(value, "pgid")) { result.pgid = integerOf(data.field(value, "pgid")) }
+    if isInteger(data.field(value, "session")) { result.session = integerOf(data.field(value, "session")) }
+    return result
+}
+public function sameIdentity(left: Member, right: Member): Boolean { return left.pid == right.pid && left.startTicks == right.startTicks }
