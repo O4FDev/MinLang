@@ -158,7 +158,7 @@ build/tooling/tests/self-compile-budget: TOOL_RUNTIME = build/testing/cycle-runt
 build/tooling/tests/self-compile-budget: TOOL_NATIVE = tests/performance-resources.c
 build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o tests/performance-resources.c
 # Run absolute self-compilation checks without background scheduling.
-check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
+check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget build/tooling/tests/compiler-behavior
 	./build/tooling/tests/self-compile-budget
 
 build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-compiler-runtime.ll
