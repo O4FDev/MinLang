@@ -1,0 +1,380 @@
+use "system" as system
+use "files" as files
+use "sha256" as sha256
+use "json" as json
+
+record Completed { status: Integer; output: Text; errorOutput: Text }
+record Arguments { binary: Text; output: Text; appId: Text; name: Text; icon: Text; licenses: List<Text>; runtimeVersion: Text }
+record Bundled { name: Text; path: Text }
+
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function contains(source: Text, needle: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > raw.length { return false }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return true }
+    }
+    return false
+}
+function replaceAll(source: Text, needle: Text, replacement: Text): Text {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let parts: List<Text> = []
+    let start = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { parts.add(Text(raw.slice(start, index))); parts.add(replacement); index += pattern.length; start = index } else { index += 1 }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    return joinText(parts)
+}
+function lines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 10 || raw[index] == 13 {
+            result.add(Text(raw.slice(start, index)))
+            if raw[index] == 13 && index + 1 < raw.length && raw[index + 1] == 10 { index += 1 }
+            start = index + 1
+        }
+        index += 1
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+function strip(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && (raw[begin] == 32 || (raw[begin] >= 9 && raw[begin] <= 13)) { begin += 1 }
+    while end > begin && (raw[end - 1] == 32 || (raw[end - 1] >= 9 && raw[end - 1] <= 13)) { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function letter(byte: Integer): Boolean { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 }
+function digit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+function identifier(component: Bytes, dash: Boolean): Boolean {
+    if component.length == 0 || !letter(component[0]) { return false }
+    for byte in component { if !letter(byte) && !digit(byte) && !(dash && byte == 45) { return false } }
+    return true
+}
+function validApplication(value: Text): Boolean {
+    let components: List<Bytes> = []
+    let raw = Bytes(value)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 46 {
+            components.add(raw.slice(start, index))
+            start = index + 1
+        }
+    }
+    if components.length < 3 { return false }
+    for index in 0..components.length {
+        if !identifier(components[index], index == components.length - 1) { return false }
+    }
+    return true
+}
+function validRuntime(value: Text): Boolean {
+    let raw = Bytes(value)
+    if raw.length == 0 || !(letter(raw[0]) && raw[0] != 95 || digit(raw[0])) { return false }
+    for byte in raw { if !letter(byte) && !digit(byte) && byte != 46 && byte != 45 { return false } }
+    return true
+}
+function validName(value: Text): Boolean {
+    if strip(value) == "" { return false }
+    for byte in Bytes(value) { if byte == 13 || byte == 10 || byte == 0 { return false } }
+    return true
+}
+function hexDigit(byte: Integer): Boolean { return digit(byte) || (byte >= 97 && byte <= 102) }
+function dependency(line: Text): List<Text> {
+    let none: List<Text> = []
+    let raw = Bytes(line)
+    let index = 0
+    while index < raw.length && (raw[index] == 32 || (raw[index] >= 9 && raw[index] <= 13)) { index += 1 }
+    let begin = index
+    while index < raw.length && !(raw[index] == 32 || (raw[index] >= 9 && raw[index] <= 13)) { index += 1 }
+    if index == begin { return none }
+    let name = Text(raw.slice(begin, index))
+    let arrow = Bytes(" => /")
+    if index + arrow.length > raw.length { return none }
+    for offset in 0..arrow.length { if raw[index + offset] != arrow[offset] { return none } }
+    let pathStart = index + 4
+    let end = pathStart + 2
+    while end + 4 <= raw.length {
+        if raw[end] == 32 && raw[end + 1] == 40 && raw[end + 2] == 48 && raw[end + 3] == 120 {
+            let cursor = end + 4
+            while cursor < raw.length && hexDigit(raw[cursor]) { cursor += 1 }
+            if cursor > end + 4 && cursor < raw.length && raw[cursor] == 41 {
+                return [name, Text(raw.slice(pathStart, end))]
+            }
+        }
+        end += 1
+    }
+    return none
+}
+function capture(command: List<Text>): Completed {
+    let base = system.getenv("TMPDIR")
+    if base == "" { base = "/tmp" }
+    let log = base + "/minyar-flatpak-run-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    let argv = ["sh", "-c", "out=$1; shift; exec \"$@\" >\"$out\" 2>\"$out.err\"", "minyar", log]
+    for item in command { argv.add(item) }
+    let handle = system.spawn("/bin/sh", argv, system.environment(), "")
+    let status = 127
+    if handle > 0 {
+        let waited = system.wait(handle)
+        status = waited.exitCode
+        if waited.state == system.SIGNALED { status = 128 + waited.signal }
+    }
+    let output = Text(files.readFile(log))
+    let errorOutput = Text(files.readFile(log + ".err"))
+    files.remove(log)
+    files.remove(log + ".err")
+    return Completed { status: status; output: output; errorOutput: errorOutput }
+}
+function single(command: List<Text>): Text {
+    let result = capture(command)
+    if result.status != 0 { return "" }
+    let found = lines(result.output)
+    if found.length == 0 { return "" }
+    return found[0]
+}
+function resolveStrict(path: Text): Text { return single(["readlink", "-e", "--", path]) }
+function resolveLoose(path: Text): Text { return single(["readlink", "-m", "--", path]) }
+function absolute(path: Text): Text {
+    if starts(path, "/") { return path }
+    return single(["pwd", "-P"]) + "/" + path
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending <= 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function baseName(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    return Text(raw.slice(start, raw.length))
+}
+function lowerSuffix(path: Text): Text {
+    let raw = Bytes(baseName(path))
+    let dot = -1
+    for index in 0..raw.length { if raw[index] == 46 { dot = index } }
+    if dot <= 0 || dot == raw.length - 1 { return "" }
+    let result = Bytes()
+    for byte in raw.slice(dot, raw.length) {
+        if byte >= 65 && byte <= 90 { result.add(byte + 32) } else { result.add(byte) }
+    }
+    return Text(result)
+}
+function usage(message: Text): Integer {
+    system.writeStandardError("usage: linux-flatpak.min [-h] -o OUTPUT --app-id APP_ID --name NAME --icon ICON --license LICENSE [--runtime-version RUNTIME_VERSION] binary\nlinux-flatpak.min: error: " + message + "\n")
+    return 2
+}
+function failed(message: Text): Integer {
+    system.writeStandardError("Flatpak packaging failed: " + message + "\n")
+    return 1
+}
+function processFailure(result: Completed, command: List<Text>): Text {
+    if result.errorOutput != "" { return result.errorOutput }
+    if result.output != "" { return result.output }
+    let parts: List<Text> = []
+    for item in command {
+        if parts.length > 0 { parts.add(" ") }
+        parts.add(item)
+    }
+    return "Command '" + joinText(parts) + "' returned non-zero exit status " + Text(result.status) + "."
+}
+function hex(path: Text): Text {
+    return sha256.hex(sha256.digest(files.readFile(path)))
+}
+function main(): Integer {
+    let values = Arguments { binary: ""; output: ""; appId: ""; name: ""; icon: ""; licenses: []; runtimeVersion: "51" }
+    let seen: List<Text> = []
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        if item == "-h" || item == "--help" {
+            system.writeStandardError("usage: linux-flatpak.min [-h] -o OUTPUT --app-id APP_ID --name NAME --icon ICON --license LICENSE [--runtime-version RUNTIME_VERSION] binary\n")
+            return 0
+        }
+        let option = item
+        let value = ""
+        let inline = false
+        let raw = Bytes(item)
+        if starts(item, "--") {
+            for position in 0..raw.length {
+                if !inline && raw[position] == 61 { option = Text(raw.slice(0, position)); value = Text(raw.slice(position + 1, raw.length)); inline = true }
+            }
+        }
+        if option == "-o" || option == "--output" || option == "--app-id" || option == "--name" || option == "--icon" || option == "--license" || option == "--runtime-version" {
+            if !inline {
+                if index + 1 >= argumentCount() { return usage("argument " + option + ": expected one argument") }
+                value = argument(index + 1)
+                index += 1
+            }
+            if option == "-o" || option == "--output" { values.output = value; seen.add("--output") }
+            if option == "--app-id" { values.appId = value; seen.add(option) }
+            if option == "--name" { values.name = value; seen.add(option) }
+            if option == "--icon" { values.icon = value; seen.add(option) }
+            if option == "--license" { values.licenses.add(value); seen.add(option) }
+            if option == "--runtime-version" { values.runtimeVersion = value }
+        } else if starts(item, "-") && item != "-" {
+            return usage("unrecognized arguments: " + item)
+        } else {
+            if values.binary != "" { return usage("unrecognized arguments: " + item) }
+            values.binary = item
+        }
+        index += 1
+    }
+    let missing: List<Text> = []
+    if values.binary == "" { missing.add("binary") }
+    for required in ["--output", "--app-id", "--name", "--icon", "--license"] {
+        let present = false
+        for name in seen { if name == required { present = true } }
+        if !present { missing.add(required) }
+    }
+    if missing.length > 0 {
+        let parts: List<Text> = []
+        for index in 0..missing.length {
+            if index > 0 { parts.add(", ") }
+            parts.add(missing[index])
+        }
+        return usage("the following arguments are required: " + joinText(parts))
+    }
+    if single(["uname", "-s"]) != "Linux" { return usage("Flatpak packaging requires Linux") }
+    if !validApplication(values.appId) { return usage("--app-id must be a reverse-DNS application ID") }
+    if !validRuntime(values.runtimeVersion) { return usage("invalid runtime version") }
+    if !validName(values.name) { return usage("--name must be a nonempty single line") }
+    let binary = resolveStrict(values.binary)
+    if binary == "" { return failed("No such file or directory: '" + values.binary + "'") }
+    let icon = resolveStrict(values.icon)
+    if icon == "" { return failed("No such file or directory: '" + values.icon + "'") }
+    let licenses: List<Text> = []
+    for license in values.licenses {
+        let resolved = resolveStrict(license)
+        if resolved == "" { return failed("No such file or directory: '" + license + "'") }
+        licenses.add(resolved)
+    }
+    let head = files.readFile(binary)
+    if head.length < 4 || head[0] != 127 || head[1] != 69 || head[2] != 76 || head[3] != 70 { return failed("input must be an ELF executable") }
+    if lowerSuffix(icon) != ".svg" { return failed("--icon must be an SVG file") }
+    let output = absolute(values.output)
+    let outputLink = capture(["test", "-L", output]).status == 0
+    let resolvedOutput = resolveLoose(output)
+    let collides = resolvedOutput == binary || resolvedOutput == icon
+    for license in licenses { if resolvedOutput == license { collides = true } }
+    if outputLink || collides { return failed("output must not overwrite an input or symbolic link") }
+    for tool in ["flatpak", "patchelf", "ldd"] {
+        if capture(["sh", "-c", "command -v \"$1\"", "minyar", tool]).status != 0 { return failed("missing required tool: " + tool) }
+    }
+    let inspected = capture(["ldd", binary])
+    if inspected.status != 0 { return failed(processFailure(inspected, ["ldd", binary])) }
+    let dependencies = inspected.output
+    if contains(dependencies, "not found") { return failed("input has unresolved host dependencies:\n" + dependencies) }
+    let bundled: List<Bundled> = []
+    for line in lines(dependencies) {
+        let match = dependency(line)
+        if match.length == 2 && (starts(match[0], "libswift") || match[0] == "libdispatch.so" || match[0] == "libBlocksRuntime.so") {
+            let resolved = resolveStrict(match[1])
+            if resolved == "" { return failed("No such file or directory: '" + match[1] + "'") }
+            let replaced = false
+            for entry in bundled { if entry.name == match[0] { entry.path = resolved; replaced = true } }
+            if !replaced { bundled.add(Bundled { name: match[0]; path: resolved }) }
+        }
+    }
+    if capture(["mkdir", "-p", "--", parent(output)]).status != 0 { return failed("cannot create " + parent(output)) }
+    let base = system.getenv("TMPDIR")
+    if base == "" { base = "/tmp" }
+    let root = single(["mktemp", "-d", base + "/minyar-flatpak-XXXXXXXX"])
+    if root == "" { return failed("cannot create a temporary directory") }
+    let status = package(values, binary, icon, licenses, bundled, output, root)
+    capture(["rm", "-rf", "--", root])
+    return status
+}
+function step(command: List<Text>): Text {
+    let result = capture(command)
+    if result.status != 0 { return processFailure(result, command) }
+    return ""
+}
+function package(values: Arguments, binary: Text, icon: Text, licenses: List<Text>, bundled: List<Bundled>, output: Text, root: Text): Integer {
+    let app = root + "/app"
+    let error = step(["flatpak", "build-init", app, values.appId, "org.gnome.Sdk", "org.gnome.Platform", values.runtimeVersion])
+    if error != "" { return failed(error) }
+    let content = app + "/files"
+    error = step(["mkdir", "-p", "--", content + "/bin"])
+    if error != "" { return failed(error) }
+    if files.makeDirectory(content + "/lib") != 0 { return failed("cannot create " + content + "/lib") }
+    let executable = content + "/bin/minyar-app"
+    for command in [["cp", "-p", "--", binary, executable], ["chmod", "755", executable], ["patchelf", "--set-rpath", "$ORIGIN/../lib", executable]] {
+        error = step(command)
+        if error != "" { return failed(error) }
+    }
+    for entry in bundled {
+        let destination = content + "/lib/" + entry.name
+        for command in [["cp", "-p", "--", entry.path, destination], ["patchelf", "--set-rpath", "$ORIGIN", destination]] {
+            error = step(command)
+            if error != "" { return failed(error) }
+        }
+    }
+    let applications = content + "/share/applications"
+    let icons = content + "/share/icons/hicolor/scalable/apps"
+    let notices = content + "/share/licenses/" + values.appId
+    for directory in [applications, icons, notices] {
+        error = step(["mkdir", "-p", "--", directory])
+        if error != "" { return failed(error) }
+    }
+    let name = replaceAll(values.name, "\\", "\\\\")
+    writeTextFile(applications + "/" + values.appId + ".desktop", "[Desktop Entry]\nType=Application\nName=" + name + "\nExec=minyar-app\nIcon=" + values.appId + "\nTerminal=false\nCategories=Utility;\n")
+    error = step(["cp", "--", icon, icons + "/" + values.appId + ".svg"])
+    if error != "" { return failed(error) }
+    for index in 0..licenses.length {
+        error = step(["cp", "--", licenses[index], notices + "/" + Text(index + 1) + "-" + baseName(licenses[index])])
+        if error != "" { return failed(error) }
+    }
+    let manifest: List<Text> = ["{\n  \"application\": ", json.quote(hex(binary)), ",\n  \"runtime\": ", json.quote("org.gnome.Platform/" + values.runtimeVersion), ",\n  \"bundled\": "]
+    if bundled.length == 0 { manifest.add("{}") } else {
+        manifest.add("{\n")
+        for index in 0..bundled.length {
+            manifest.add("    " + json.quote(bundled[index].name) + ": " + json.quote(hex(bundled[index].path)))
+            if index + 1 < bundled.length { manifest.add(",") }
+            manifest.add("\n")
+        }
+        manifest.add("  }")
+    }
+    manifest.add("\n}\n")
+    writeTextFile(notices + "/build-provenance.json", joinText(manifest))
+    let check = capture(["flatpak", "build", app, "ldd", "-r", "/app/bin/minyar-app"])
+    if check.status != 0 { return failed(processFailure(check, ["flatpak", "build", app, "ldd", "-r", "/app/bin/minyar-app"])) }
+    let report = check.output + check.errorOutput
+    if contains(report, "not found") || contains(report, "undefined symbol:") { return failed("target runtime cannot satisfy dependencies:\n" + report) }
+    let repository = root + "/repo"
+    let bundle = root + "/application.flatpak"
+    for command in [["flatpak", "build-finish", "--socket=wayland", "--device=dri", "--command=minyar-app", app],
+            ["flatpak", "build-export", repository, app],
+            ["flatpak", "build-bundle", repository, bundle, values.appId, "--runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo"]] {
+        error = step(command)
+        if error != "" { return failed(error) }
+    }
+    let stage = single(["mktemp", parent(output) + "/.minyar-flatpak-XXXXXXXX"])
+    if stage == "" { return failed("cannot create a staging file in " + parent(output)) }
+    error = step(["cp", "--", bundle, stage])
+    if error == "" && files.rename(stage, output) != 0 { error = "cannot replace " + output }
+    if files.pathSize(stage) >= 0 { files.remove(stage) }
+    if error != "" { return failed(error) }
+    print("Packaged " + output + " with " + Text(bundled.length) + " runtime libraries")
+    return 0
+}

@@ -7,8 +7,11 @@ $(RELEASE_TOOLS): TOOL_NATIVE = scripts/release-native.c
 $(RELEASE_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(RELEASE_TOOLS): build/testing/cycle-runtime.o scripts/release-native.c
 build/tooling/tests/shipping.ll: scripts/release.min tests/release-support.min
+build/tooling/scripts/linux-flatpak: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/scripts/linux-flatpak: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/scripts/linux-flatpak: runtime/native/sha256.c
 .PHONY: check-shipping
-check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy build/tooling/tests/shipping
+check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy build/tooling/tests/shipping build/tooling/scripts/linux-flatpak
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/shipping
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/update-manifest.py
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-native
