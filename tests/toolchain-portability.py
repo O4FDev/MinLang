@@ -636,7 +636,7 @@ int main(int count, char **arguments) {
     def test_macos_ci_release_installation_is_private_verified_and_strict(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         blocks = re.findall(r'- name: Select pinned LLVM 23\.1\.2\n        run: \|\n((?:          [^\n]*\n)+)', workflow)
-        self.assertEqual(len(blocks), 6)
+        self.assertEqual(len(blocks), 7)
         self.assertEqual(len(set(blocks)), 1)
         published = 'd7c26fc6177e42842e2d1ffaad31aec057c56a924392b1a23d830abe2c5d53b1'
         self.assertIn(published, blocks[0])
