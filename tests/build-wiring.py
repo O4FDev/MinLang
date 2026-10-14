@@ -87,7 +87,7 @@ class BuildWiring(unittest.TestCase):
             makefile.write_text(
                 'LLVM_CC := retained-clang\nSANITIZER_LIMITED := sanitizer-limit\n'
                 'include ' + str(ROOT / 'build-support/managed-graphs.mk').replace(' ', '\\ ') + '\n'
-                '.PHONY: build\nbuild:\n\t@:\n')
+                '.PHONY: build\nbuild:\n\t@:\nbuild/tooling/%:\n\t@echo TOOL $@\n')
             env = dict(os.environ)
             env.pop('MAKEFLAGS', None)
             result = subprocess.run(
@@ -103,14 +103,14 @@ class BuildWiring(unittest.TestCase):
             for gate in ('check', 'check-portable', 'check-sanitize', 'check-managed-graphs-profiles'):
                 self.assertIn(target, rules.get(gate, set()), gate)
             for source in ('tests/managed-graphs-bakeoff.c', 'tests/managed-graphs-runtime.c',
-                           'tests/managed-graphs-profiles.py', 'runtime/minyar_runtime.c'):
+                           'build/tooling/tests/managed-graphs-profiles', 'runtime/minyar_runtime.c'):
                 self.assertIn(source, rules.get(target, set()))
             commands = dry_run_commands(result.stdout)
             selected = [line for line in commands.splitlines()
-                        if 'python3 tests/managed-graphs-profiles.py' in line]
+                        if './build/tooling/tests/managed-graphs-profiles' in line]
             self.assertEqual(selected, [
-                'MINYAR_TEST_CLANG="retained-clang" sanitizer-limit python3 '
-                'tests/managed-graphs-profiles.py --quick --fixture managed-graphs-bakeoff.c'])
+                'MINYAR_TEST_CLANG="retained-clang" sanitizer-limit '
+                './build/tooling/tests/managed-graphs-profiles --quick --fixture managed-graphs-bakeoff.c'])
 
 
 
@@ -1465,7 +1465,10 @@ class BuildWiring(unittest.TestCase):
                 'include ' + str(ROOT / 'build-support/managed-graphs.mk').replace(' ', '\\ ') + '\n'
                 '.PHONY: build/minyarc build/minyarc-callbacks build/minyarc-modules build/minyar-module-build\n'
                 'build/minyarc build/minyarc-callbacks build/minyarc-modules build/minyar-module-build:\n'
-                '\t@echo ARTIFACT $@\n')
+                '\t@echo ARTIFACT $@\n'
+                '.PHONY: build/tooling/tests/managed-graphs-launcher tests/sha256-test-native.c runtime/native/sha256.c\n'
+                'build/tooling/tests/managed-graphs-launcher tests/sha256-test-native.c runtime/native/sha256.c:\n'
+                '\t@echo TOOL $@\n')
             for system, os_value, incremental in (
                     ('Linux', '', True), ('Darwin', '', True), ('Windows_NT', 'Windows_NT', False),
                     ('MINGW64_NT-10.0', '', False), ('MSYS_NT-10.0', '', False),
@@ -1483,7 +1486,7 @@ class BuildWiring(unittest.TestCase):
                     expected = {'build/minyarc', 'build/minyarc-callbacks'}
                     if incremental: expected |= {'build/minyarc-modules', 'build/minyar-module-build'}
                     self.assertEqual(artifacts, expected)
-                    self.assertIn('tests/managed-graphs-launcher.py', result.stdout)
+                    self.assertIn('./build/tooling/tests/managed-graphs-launcher', result.stdout)
 
 
     def test_peer_driver_gates_prepare_the_request_frontend(self):
