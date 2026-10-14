@@ -1,0 +1,144 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+use "./qmp.min" as qmp
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function contains(source: Text, needle: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > raw.length { return false }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return true }
+    }
+    return false
+}
+
+function readLine(connection: Integer, buffer: Bytes): json.Value {
+    while true {
+        for index in 0..buffer.length {
+            if buffer[index] == 10 {
+                let line = buffer.slice(0, index)
+                let rest = buffer.slice(index + 1, buffer.length)
+                buffer.clear()
+                buffer.addBytes(rest)
+                return json.parseBytes(line, 65536)
+            }
+        }
+        check(net.ready(connection, 5000), "fake QMP client went silent")
+        let chunk = net.receive(connection, 4096)
+        check(chunk.length > 0, "fake QMP client disconnected")
+        buffer.addBytes(chunk)
+    }
+}
+
+function sendAll(connection: Integer, text: Text) {
+    let data = Bytes(text)
+    check(net.send(connection, data) == data.length, "fake QMP send failed")
+}
+
+function serve(mode: Text, portFile: Text): Integer {
+    let listener = net.listen("127.0.0.1", 0, 1)
+    check(listener >= 0, "cannot listen: " + net.lastError())
+    writeTextFile(portFile + ".partial", Text(net.localPort(listener)))
+    check(files.rename(portFile + ".partial", portFile) == 0, "cannot publish fake QMP port")
+    check(net.ready(listener, 10000), "fake QMP client never connected")
+    let connection = net.accept(listener)
+    check(connection >= 0, "cannot accept: " + net.lastError())
+    net.close(listener)
+    check(net.nonBlocking(connection, false), "cannot block fake QMP connection")
+    let buffer = Bytes()
+    sendAll(connection, "{\"QMP\":{}}\r\n")
+    let capability = readLine(connection, buffer)
+    check(json.member(capability, "execute").text == "qmp_capabilities", "missing capability negotiation")
+    sendAll(connection, "{\"id\": " + json.member(capability, "id").text + ", \"return\": {}}\n")
+    let request = readLine(connection, buffer)
+    let identifier = json.member(request, "id").text
+    if mode == "fragmented" {
+        let data = Bytes("{\"event\":\"RESET\"}\n{\"id\": " + identifier + ", \"return\": {\"status\": \"running\"}}\n")
+        for byte in data {
+            let piece = Bytes()
+            piece.add(byte)
+            check(net.send(connection, piece) == 1, "fake QMP send failed")
+        }
+    } else if mode == "error" {
+        sendAll(connection, "{\"id\": " + identifier + ", \"error\": {\"desc\": \"invalid input\"}}\n")
+    }
+    net.close(connection)
+    return 0
+}
+
+function pause(milliseconds: Integer) {
+    let created = loop.create()
+    check(errors.integerOk(created), "cannot create a timer")
+    loop.wait(errors.integerValue(created), milliseconds, 1)
+    loop.close(errors.integerValue(created))
+}
+
+function exchange(self: Text, scratch: Text, mode: Text): qmp.Reply {
+    let portFile = scratch + "/" + mode + ".port"
+    let server = system.spawn(self, [self, "--serve", mode, portFile], system.environment(), "")
+    check(server > 0, "cannot start fake QMP server")
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while files.pathSize(portFile) <= 0 {
+        check(system.monotonicNanoseconds() < deadline && system.poll(server).state == system.PENDING, "fake QMP server did not start")
+        pause(20)
+    }
+    let port = 0
+    for byte in files.readFile(portFile) { port = port * 10 + byte - 48 }
+    let client = qmp.open("127.0.0.1", port)
+    check(client.error == "", "QMP handshake failed: " + client.error)
+    let command = "query-status"
+    if mode == "error" { command = "input-send-event" }
+    let reply = qmp.command(client, command, "")
+    qmp.close(client)
+    let finish = system.monotonicNanoseconds() + 5000000000
+    let state = system.poll(server)
+    while state.state == system.PENDING {
+        if system.monotonicNanoseconds() > finish {
+            system.sendSignal(system.childProcessId(server), 9)
+            system.wait(server)
+            fail("fake QMP server did not finish")
+        }
+        pause(20)
+        state = system.poll(server)
+    }
+    check(state.state == system.EXITED && state.exitCode == 0, "fake QMP server failed")
+    return reply
+}
+
+function main(): Integer {
+    if argumentCount() == 3 && argument(0) == "--serve" { return serve(argument(1), argument(2)) }
+    let self = "build/tooling/os/tools/test-qemu-drive"
+    if argumentCount() > 0 { self = argument(0) }
+    let scratch = system.getenv("TMPDIR")
+    if scratch == "" { scratch = "/tmp" }
+    scratch = scratch + "/qemu-drive-test-" + Text(system.processId())
+    check(files.makeDirectory(scratch) == 0, "cannot create scratch")
+
+    let reply = exchange(self, scratch, "fragmented")
+    check(reply.ok, "fragmented reply failed: " + reply.error)
+    check(json.member(json.member(reply.value, "return"), "status").text == "running", "fragmented reply lost its value")
+    print("ok QMPTests.test_fragmented_reply_and_event")
+
+    reply = exchange(self, scratch, "error")
+    check(!reply.ok, "command error was treated as success")
+    check(contains(reply.error, "invalid input"), "command error lost its description: " + reply.error)
+    print("ok QMPTests.test_command_error_is_not_success")
+
+    reply = exchange(self, scratch, "disconnect")
+    check(!reply.ok && reply.error == "QEMU closed the QMP connection", "disconnect was not reported: " + reply.error)
+    print("ok QMPTests.test_disconnect_is_not_an_infinite_wait")
+
+    for name in files.list(scratch) { files.remove(scratch + "/" + name) }
+    files.removeDirectory(scratch)
+    return 0
+}

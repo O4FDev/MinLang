@@ -207,7 +207,8 @@ still cause individual late frames even when sustained animation exceeds
 
 ## Reproducible input and display checks
 
-`python3 tools/qemu-drive.py scenario.json` boots a headless test VM of the
+`../build/tooling/os/tools/qemu-drive scenario.json` (built from the repository
+root with `make build/tooling/os/tools/qemu-drive`) boots a headless test VM of the
 `MOS_ARCH` build (`x86_64` by default, or `arm64`). A scenario
 is an array of actions such as `["type", "moving demo"]`, `["key", "ret"]`,
 `["click", 1683, 538]`, `["sweep", 100, 100, 1600, 900, 3]`, `["wait", 2]`,
@@ -215,7 +216,7 @@ and `["shot", "result"]`. A key may also be a chord, for example
 `["key", ["ctrl", "backspace"]]`. Wait for queued input and animation to
 settle before asserting screenshot contents.
 
-Set `MOS_ATTACH=/tmp/minyar-visible-qmp.sock` to drive the visible VM started
+Set `MOS_ATTACH=127.0.0.1:4445` to drive the visible VM started
 by `tools/show.sh`. Only one QMP client can attach at a time. `MOS_OUT` selects
 the screenshot directory; `MOS_SERIAL` selects the headless serial log;
 `MOS_QEMU` can override the headless CPU/accelerator flags. Actions are logged

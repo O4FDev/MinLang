@@ -143,5 +143,5 @@ build/drive build/Atacama.app/Contents/MacOS/application 47391 history
 build/drive build/Atacama.app/Contents/MacOS/application 47391 stream
 
 # Minyar-OS
-make -C os && echo '[["wait", 15], ["shot", "desktop"]]' > /tmp/s.json && python3 os/tools/qemu-drive.py /tmp/s.json
+make -C os && make build/tooling/os/tools/qemu-drive && echo '[["wait", 15], ["shot", "desktop"]]' > /tmp/s.json && ./build/tooling/os/tools/qemu-drive /tmp/s.json
 ```

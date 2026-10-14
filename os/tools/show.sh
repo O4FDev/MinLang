@@ -5,7 +5,7 @@
 # the x86_64 build. The serial
 # console goes to /tmp/minyar-visible-serial.txt and the QEMU monitor listens on
 # /tmp/minyar-visible.sock (try: echo "screendump /tmp/s.ppm" | nc -U /tmp/minyar-visible.sock);
-# QMP listens on /tmp/minyar-visible-qmp.sock for MOS_ATTACH in qemu-drive.py.
+# QMP listens on 127.0.0.1:4445 for MOS_ATTACH in build/tooling/os/tools/qemu-drive.
 here=${0:A:h}
 # zsh starts background jobs at a lower priority; QEMU should not be.
 setopt no_bg_nice
@@ -43,7 +43,7 @@ else
 fi
 pid=$(python3 - "$qemu" -name "Minyar OS" -m 1G -smp 4 "${machine[@]}" \
   -display cocoa,full-screen=on,$zoom \
-  -serial file:/tmp/minyar-visible-serial.txt -monitor unix:/tmp/minyar-visible.sock,server,nowait -qmp unix:/tmp/minyar-visible-qmp.sock,server,nowait \
+  -serial file:/tmp/minyar-visible-serial.txt -monitor unix:/tmp/minyar-visible.sock,server,nowait -qmp tcp:127.0.0.1:4445,server,nowait \
   -netdev user,id=net0 -device e1000,netdev=net0 <<'PY'
 import subprocess, sys
 # A separate session survives terminal/tool process-group cleanup as well as

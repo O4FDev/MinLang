@@ -1,0 +1,126 @@
+use "system" as system
+use "json" as json
+use "net" as net
+
+public record Connection { socket: Integer; sequence: Integer; buffer: Bytes; error: Text; connected: Boolean }
+public record Reply { ok: Boolean; value: json.Value; error: Text }
+
+function failed(message: Text): Reply {
+    return Reply { ok: false; value: json.parse("null"); error: message }
+}
+
+public function quote(text: Text): Text {
+    let raw = Bytes(text)
+    let output = Bytes()
+    output.add(34)
+    let digits = Bytes("0123456789abcdef")
+    for byte in raw {
+        if byte == 34 || byte == 92 { output.add(92); output.add(byte) }
+        else if byte == 10 { output.add(92); output.add(110) }
+        else if byte < 32 {
+            output.addBytes(Bytes("\\u00"))
+            output.add(digits[byte / 16])
+            output.add(digits[byte % 16])
+        } else { output.add(byte) }
+    }
+    output.add(34)
+    return Text(output)
+}
+
+public function serialize(value: json.Value): Text {
+    if value.kind == json.STRING { return quote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN {
+        if value.truth { return "true" }
+        return "false"
+    }
+    if value.kind == json.NUMBER { return value.text }
+    let parts: List<Text> = []
+    if value.kind == json.ARRAY {
+        parts.add("[")
+        for index in 0..value.items.length {
+            if index > 0 { parts.add(", ") }
+            parts.add(serialize(value.items[index]))
+        }
+        parts.add("]")
+        return joinText(parts)
+    }
+    parts.add("{")
+    for index in 0..value.items.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(quote(value.keys[index]) + ": " + serialize(value.items[index]))
+    }
+    parts.add("}")
+    return joinText(parts)
+}
+
+function has(value: json.Value, name: Text): Boolean {
+    if value.kind != json.OBJECT { return false }
+    for key in value.keys { if key == name { return true } }
+    return false
+}
+
+public function read(connection: Connection, deadline: Integer, timeout: Text): Reply {
+    while true {
+        let newline = -1
+        for index in 0..connection.buffer.length {
+            if connection.buffer[index] == 10 { newline = index; break }
+        }
+        if newline >= 0 {
+            let line = connection.buffer.slice(0, newline)
+            connection.buffer = connection.buffer.slice(newline + 1, connection.buffer.length)
+            let value = json.parseBytes(line, 16777216)
+            if value.kind == json.INVALID { return failed("invalid QMP JSON: " + value.text) }
+            return Reply { ok: true; value: value; error: "" }
+        }
+        let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
+        if remaining <= 0 || !net.ready(connection.socket, remaining) { return failed(timeout) }
+        let chunk = net.receive(connection.socket, 65536)
+        if chunk.length == 0 { return failed("QEMU closed the QMP connection") }
+        connection.buffer.addBytes(chunk)
+    }
+}
+
+public function command(connection: Connection, name: Text, arguments: Text): Reply {
+    connection.sequence += 1
+    let message = "{\"execute\": " + quote(name) + ", \"id\": " + Text(connection.sequence)
+    if arguments != "" { message = message + ", \"arguments\": " + arguments }
+    let data = Bytes(message + "}\n")
+    if net.send(connection.socket, data) != data.length { return failed("QMP send failed: " + net.lastError()) }
+    let deadline = system.monotonicNanoseconds() + 10000000000
+    while true {
+        let reply = read(connection, deadline, "QMP timed out: " + name)
+        if !reply.ok { return reply }
+        let identifier = json.member(reply.value, "id")
+        if identifier.kind != json.NUMBER || identifier.text != Text(connection.sequence) { continue }
+        if has(reply.value, "error") {
+            return failed("QMP " + name + ": " + serialize(json.member(reply.value, "error")))
+        }
+        return reply
+    }
+}
+
+public function open(host: Text, port: Integer): Connection {
+    let connection = Connection { socket: net.connect(host, port); sequence: 0; buffer: Bytes(); error: ""; connected: false }
+    if connection.socket < 0 {
+        connection.error = "cannot connect to QMP: " + net.lastError()
+        return connection
+    }
+    connection.connected = true
+    let greeting = read(connection, system.monotonicNanoseconds() + 10000000000, "timed out")
+    if !greeting.ok { connection.error = greeting.error }
+    else if !has(greeting.value, "QMP") { connection.error = "QMP greeting missing" }
+    else {
+        let ready = command(connection, "qmp_capabilities", "")
+        if !ready.ok { connection.error = ready.error }
+    }
+    if connection.error != "" { close(connection) }
+    return connection
+}
+
+public function close(connection: Connection) {
+    if connection.socket >= 0 {
+        net.close(connection.socket)
+        connection.socket = -1
+    }
+}

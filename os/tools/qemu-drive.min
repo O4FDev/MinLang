@@ -1,0 +1,358 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+use "./qmp.min" as qmp
+
+record Drive { connection: qmp.Connection; timer: Integer; out: Text; error: Text }
+
+function setting(name: Text, fallback: Text): Text {
+    let value = system.getenv(name)
+    if system.lastError() != 0 { return fallback }
+    return value
+}
+
+function words(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        let space = index == raw.length
+        if index < raw.length { space = raw[index] <= 32 }
+        if space {
+            if start < index { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+
+function which(name: Text): Text {
+    let raw = Bytes(setting("PATH", "/bin:/usr/bin"))
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 58 {
+            let directory = Text(raw.slice(start, index))
+            if directory == "" { directory = "." }
+            if files.pathSize(directory + "/" + name) >= 0 { return directory + "/" + name }
+            start = index + 1
+        }
+    }
+    return ""
+}
+
+function sleep(drive: Drive, milliseconds: Integer) {
+    if milliseconds > 0 { loop.wait(drive.timer, milliseconds, 1) }
+}
+
+function projectRoot(): Text {
+    let prefix = ""
+    for depth in 0..16 {
+        if files.pathSize(prefix + "os/tools/qemu-drive.min") >= 0 { return prefix }
+        prefix = prefix + "../"
+    }
+    return ""
+}
+
+function host(): Text {
+    let capture = setting("TMPDIR", "/tmp") + "/mos-drive-host-" + Text(system.processId())
+    let handle = system.spawn("/bin/sh", ["sh", "-c", "uname -sm >\"$1\"", "sh", capture], system.environment(), "")
+    if handle <= 0 { return "" }
+    system.wait(handle)
+    let found = Text(files.readFile(capture))
+    files.remove(capture)
+    return found
+}
+
+function qemuCommand(port: Integer, serial: Text): List<Text> {
+    let arch = setting("MOS_ARCH", "x86_64")
+    let build = projectRoot() + "build/os/" + arch
+    let image = setting("MOS_IMAGE", build + "/minyar-os.img")
+    let kernel = setting("MOS_KERNEL", build + "/kernel.elf")
+    let common = ["-m", "1G", "-display", "none", "-serial", "file:" + serial, "-qmp", "tcp:127.0.0.1:" + Text(port) + ",server,nowait",
+        "-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
+    if arch == "arm64" {
+        let accel = "tcg"
+        let cpu = "max"
+        let platform = words(host())
+        if platform.length == 2 && platform[0] == "Darwin" && platform[1] == "arm64" { accel = "hvf"; cpu = "host" }
+        let command = ["qemu-system-aarch64", "-M", "virt"]
+        for item in common { command.add(item) }
+        for item in ["-kernel", kernel, "-device", "bochs-display",
+            "-drive", "if=none,id=disk,file=" + image + ",format=raw,snapshot=on",
+            "-device", "virtio-blk-pci,drive=disk,disable-legacy=on",
+            "-device", "virtio-keyboard-pci,disable-legacy=on", "-device", "virtio-tablet-pci,disable-legacy=on",
+            "-device", "virtio-rng-pci,disable-legacy=on"] { command.add(item) }
+        for item in words(setting("MOS_QEMU", "-smp 4 -accel " + accel + " -cpu " + cpu)) { command.add(item) }
+        return command
+    }
+    let command = ["qemu-system-x86_64", "-cpu", "max", "-vga", "std"]
+    for item in common { command.add(item) }
+    for item in ["-drive", "file=" + image + ",format=raw,if=ide", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"] { command.add(item) }
+    for item in words(setting("MOS_QEMU", "-smp 4 -accel tcg,thread=multi")) { command.add(item) }
+    return command
+}
+
+function keysFor(character: Character): List<Text> {
+    if character == ' ' { return ["spc"] }
+    if character == '.' { return ["dot"] }
+    if character == ',' { return ["comma"] }
+    if character == '?' { return ["shift", "slash"] }
+    if character == '/' { return ["slash"] }
+    if Integer(character) == 39 { return ["apostrophe"] }
+    if character == '-' { return ["minus"] }
+    if character == '!' { return ["shift", "1"] }
+    if character == ':' { return ["shift", "semicolon"] }
+    if character == ';' { return ["semicolon"] }
+    if character == '$' { return ["shift", "4"] }
+    if character == '"' { return ["shift", "apostrophe"] }
+    if character == '(' { return ["shift", "9"] }
+    if character == ')' { return ["shift", "0"] }
+    if character == '&' { return ["shift", "7"] }
+    if Integer(character) == 10 { return ["ret"] }
+    if character >= 'A' && character <= 'Z' { return ["shift", Text(Character(Integer(character) + 32))] }
+    return [Text(character)]
+}
+
+function keyEvents(keys: List<Text>): Text {
+    let parts: List<Text> = []
+    for key in keys { parts.add("{\"type\": \"qcode\", \"data\": " + qmp.quote(key) + "}") }
+    return "{\"keys\": [" + joinWith(parts, ", ") + "], \"hold-time\": 30}"
+}
+
+function joinWith(items: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(items[index])
+    }
+    return joinText(pieces)
+}
+
+function position(x: Integer, y: Integer): Text {
+    return "{\"events\": [{\"type\": \"abs\", \"data\": {\"axis\": \"x\", \"value\": " + Text(x) +
+        "}}, {\"type\": \"abs\", \"data\": {\"axis\": \"y\", \"value\": " + Text(y) + "}}]}"
+}
+
+function button(name: Text, down: Boolean): Text {
+    let state = "false"
+    if down { state = "true" }
+    return "{\"events\": [{\"type\": \"btn\", \"data\": {\"down\": " + state + ", \"button\": " + qmp.quote(name) + "}}]}"
+}
+
+function send(drive: Drive, name: Text, arguments: Text): Boolean {
+    if drive.error != "" { return false }
+    let reply = qmp.command(drive.connection, name, arguments)
+    if !reply.ok { drive.error = reply.error }
+    return reply.ok
+}
+
+function number(value: json.Value): Float {
+    return value.number
+}
+
+function scaled(value: Float, extent: Float): Integer {
+    return Integer(value * 32767.0 / extent)
+}
+
+function makeDirectories(path: Text) {
+    let raw = Bytes(path)
+    for index in 1..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 { files.makeDirectory(Text(raw.slice(0, index))) }
+    }
+}
+
+function shaped(items: List<json.Value>, count: Integer, numbers: Integer): Boolean {
+    if items.length < count { return false }
+    for index in 1..(numbers + 1) { if items[index].kind != json.NUMBER { return false } }
+    return true
+}
+
+function arity(kind: Text, items: List<json.Value>): Boolean {
+    if kind == "wait" || kind == "scroll" { return shaped(items, 2, 1) }
+    if kind == "type" || kind == "shot" || kind == "window" { return shaped(items, 2, 0) && items[1].kind == json.STRING }
+    if kind == "key" { return shaped(items, 2, 0) }
+    if kind == "move" || kind == "click" { return shaped(items, 3, 2) }
+    if kind == "sweep" { return shaped(items, 6, 5) }
+    return true
+}
+
+function step(drive: Drive, value: json.Value) {
+    let kind = ""
+    if value.kind == json.ARRAY && value.items.length > 0 { kind = value.items[0].text }
+    let wall = Float(system.wallClockMicroseconds()) / 1000000.0
+    files.writeStandardOutput("{\"wall\": " + Text(wall) + ", \"step\": " + qmp.serialize(value) + "}\n")
+    let items = value.items
+    if !arity(kind, items) {
+        drive.error = "invalid test step: " + qmp.serialize(value)
+        return
+    }
+    if kind == "wait" {
+        sleep(drive, Integer(number(items[1]) * 1000.0))
+    } else if kind == "type" {
+        for character in items[1].text {
+            if !send(drive, "send-key", keyEvents(keysFor(character))) { return }
+            sleep(drive, 30)
+        }
+    } else if kind == "key" {
+        let keys: List<Text> = []
+        if items[1].kind == json.ARRAY {
+            for key in items[1].items { keys.add(key.text) }
+        } else { keys.add(items[1].text) }
+        if !send(drive, "send-key", keyEvents(keys)) { return }
+        sleep(drive, 40)
+    } else if kind == "move" || kind == "click" {
+        if !send(drive, "input-send-event", position(scaled(number(items[1]), 1720.0), scaled(number(items[2]), 1080.0))) { return }
+        if kind == "click" {
+            sleep(drive, 80)
+            if !send(drive, "input-send-event", button("left", true)) { return }
+            sleep(drive, 80)
+            send(drive, "input-send-event", button("left", false))
+        }
+    } else if kind == "sweep" {
+        let x0 = number(items[1])
+        let y0 = number(items[2])
+        let x1 = number(items[3])
+        let y1 = number(items[4])
+        let seconds = number(items[5])
+        let count = max(Integer(seconds * 200.0), 1)
+        let started = system.monotonicNanoseconds()
+        for index in 0..(count + 1) {
+            let t = Float(index) / Float(count)
+            if !send(drive, "input-send-event", position(scaled(x0 + (x1 - x0) * t, 1720.0), scaled(y0 + (y1 - y0) * t, 1080.0))) { return }
+            if index < count {
+                let target = started + Integer(seconds * 1000000000.0 * Float(index + 1) / Float(count))
+                sleep(drive, (target - system.monotonicNanoseconds()) / 1000000)
+            }
+        }
+        let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+        files.writeStandardOutput("{\"sweep_events\": " + Text(count + 1) + ", \"elapsed\": " + Text(elapsed) + "}\n")
+    } else if kind == "scroll" {
+        let amount = Integer(number(items[1]))
+        let name = "wheel-up"
+        if amount > 0 { name = "wheel-down" }
+        for index in 0..abs(amount) {
+            if !send(drive, "input-send-event", button(name, true)) { return }
+            if !send(drive, "input-send-event", button(name, false)) { return }
+        }
+    } else if kind == "shot" {
+        send(drive, "screendump", "{\"filename\": " + qmp.quote(drive.out + "/" + items[1].text + ".ppm") + "}")
+    } else if kind == "window" {
+        let window = setting("MOS_WINDOW", "")
+        let tool = which("screencapture")
+        if window == "" || tool == "" {
+            drive.error = "screencapture needs MOS_WINDOW"
+            return
+        }
+        let handle = system.spawn(tool, ["screencapture", "-x", "-o", "-l", window, drive.out + "/" + items[1].text + ".png"], system.environment(), "")
+        let status = system.wait(handle)
+        if handle <= 0 || status.state != system.EXITED || status.exitCode != 0 { drive.error = "screencapture failed" }
+    } else {
+        drive.error = "Unknown test step: " + kind
+    }
+}
+
+function attachAddress(value: Text): List<Text> {
+    let raw = Bytes(value)
+    let colon = -1
+    for index in 0..raw.length { if raw[index] == 58 { colon = index } }
+    if colon < 0 { return ["127.0.0.1", value] }
+    return [Text(raw.slice(0, colon)), Text(raw.slice(colon + 1, raw.length))]
+}
+
+function port(text: Text): Integer {
+    let value = 0
+    let raw = Bytes(text)
+    if raw.length == 0 { return -1 }
+    for byte in raw {
+        if byte < 48 || byte > 57 || value > 65535 { return -1 }
+        value = value * 10 + byte - 48
+    }
+    return value
+}
+
+function main(): Integer {
+    if argumentCount() != 1 {
+        system.writeStandardError("usage: qemu-drive SCRIPT_JSON\n")
+        return 2
+    }
+    let steps = json.parseBytes(files.readFile(argument(0)), 16777216)
+    if steps.kind != json.ARRAY {
+        system.writeStandardError("qemu-drive: invalid scenario " + argument(0) + "\n")
+        return 1
+    }
+    let created = loop.create()
+    if !errors.integerOk(created) {
+        system.writeStandardError("qemu-drive: cannot create a timer\n")
+        return 1
+    }
+    let drive = Drive { connection: qmp.Connection { socket: -1; sequence: 0; buffer: Bytes(); error: ""; connected: false }
+        timer: errors.integerValue(created); out: setting("MOS_OUT", "/tmp/mos-shots"); error: "" }
+    makeDirectories(drive.out)
+    let attach = setting("MOS_ATTACH", "")
+    let serial = setting("MOS_SERIAL", "/tmp/mos-drive-serial.txt")
+    let address = "127.0.0.1"
+    let target = 0
+    let qemu = 0
+    if attach != "" {
+        let parts = attachAddress(attach)
+        address = parts[0]
+        target = port(parts[1])
+        if target <= 0 { drive.error = "MOS_ATTACH must be PORT or HOST:PORT" }
+    } else {
+        let probe = net.listen("127.0.0.1", 0, 1)
+        if probe < 0 { drive.error = "cannot choose a QMP port: " + net.lastError() }
+        else {
+            target = net.localPort(probe)
+            net.close(probe)
+            let command = qemuCommand(target, serial)
+            let path = which(command[0])
+            if path == "" { drive.error = "cannot find " + command[0] }
+            else {
+                qemu = system.spawn(path, command, system.environment(), "")
+                if qemu <= 0 { drive.error = "cannot start " + command[0] }
+            }
+        }
+    }
+    if drive.error == "" {
+        for attempt in 0..100 {
+            drive.connection = qmp.open(address, target)
+            if drive.connection.connected { break }
+            if qemu > 0 && system.poll(qemu).state != system.PENDING {
+                qemu = 0
+                break
+            }
+            sleep(drive, 50)
+        }
+        if drive.connection.error != "" { drive.error = drive.connection.error }
+    }
+    if drive.error == "" {
+        for value in steps.items {
+            step(drive, value)
+            if drive.error != "" { break }
+        }
+    }
+    qmp.close(drive.connection)
+    if qemu > 0 {
+        system.sendSignal(system.childProcessId(qemu), 9)
+        system.wait(qemu)
+    }
+    loop.close(drive.timer)
+    if drive.error != "" {
+        system.writeStandardError("qemu-drive: " + drive.error + "\n")
+        return 1
+    }
+    if attach == "" {
+        let log = files.readFile(serial)
+        if files.lastError() != 0 {
+            system.writeStandardError("qemu-drive: cannot read " + serial + "\n")
+            return 1
+        }
+        let start = 0
+        if log.length > 3000 { start = log.length - 3000 }
+        files.writeStandardOutput(Text(log.slice(start, log.length)) + "\n")
+    }
+    return 0
+}
