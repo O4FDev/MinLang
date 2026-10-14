@@ -969,7 +969,8 @@ class BuildWiring(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix='minyar parallel ABI wiring ') as folder:
                 makefile = Path(folder) / 'probe.mk'
                 artifacts = {'build/' + x for x in ordinary | instrumented} | stage3 | {
-                    'build/minyar-runtime.o', 'build'}
+                    'build/minyar-runtime.o', 'build', 'build/testing/cycle-runtime.o',
+                    'build/tooling/tests/compiler-behavior'}
                 makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(sorted(artifacts)) +
                                    '\n' + ' '.join(sorted(artifacts)) + ':\n\t@echo ARTIFACT $@\n')
                 env = dict(os.environ)
@@ -995,6 +996,7 @@ class BuildWiring(unittest.TestCase):
                                                 'tests/regressions.py', 'build/minyar-runtime.o'}
                                     <= rules[target], target)
                 self.assertTrue(stage3 <= rules[native])
+                self.assertIn('build/tooling/tests/compiler-behavior', rules[native])
                 commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 tests/parallel-signatures.py;'), 2)
                 self.assertIn('for frontend in minyarc minyarc-callbacks minyarc-errors;', commands)
@@ -1009,7 +1011,7 @@ class BuildWiring(unittest.TestCase):
                                   commands.replace('\\', '/'))
                 for family in ('compiler', 'closure-compiler', 'errors-compiler'):
                     self.assertIn(f'--ir build/{family}-stage3.ll', commands)
-                self.assertIn('tests/compiler-behavior.py', commands)
+                self.assertEqual(commands.count('./build/tooling/tests/compiler-behavior --profile'), 3)
                 self.assertNotIn('cmp build/', commands)
 
         verify(source)
