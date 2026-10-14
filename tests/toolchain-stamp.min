@@ -1,0 +1,209 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "./toolchain-files.min" as tf
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Snapshot { data: Bytes; time: Integer }
+record Clock { failed: Boolean; errorOutput: Text; observed: List<Integer> }
+
+function chosen(group: Text, name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() {
+        if argument(index) == name || argument(index) == group + "." + name || argument(index) == group { return true }
+    }
+    return false
+}
+function compilerScript(linker: Text): Text {
+    return "for argument in \"$@\"; do\n    if [ \"$argument\" = -print-prog-name=ld.lld ]; then printf '%s\\n' " + support.shellQuote(linker) + "; exit 0; fi\ndone\nprintf '%s\\n' 'clang version 23.1.2'\n"
+}
+function linkerScript(version: Text): Text {
+    return "printf '%s\\n' " + support.shellQuote("LLD " + version) + "\n"
+}
+function probe(root: Text, stamp: Text, environment: List<Text>, logs: tf.Logs): test.Result {
+    return tf.run(logs, ["sh", root + "/tools/toolchain.sh", "stamp", stamp], environment, "", 10)
+}
+function snapshot(root: Text, stamp: Text, environment: List<Text>, logs: tf.Logs): Snapshot {
+    let result = probe(root, stamp, environment, logs)
+    test.check(result.status == 0, "toolchain stamp failed (" + Text(result.status) + ")\n" + result.errorOutput)
+    return Snapshot { data: readBytesFile(stamp); time: tf.mtime(stamp) }
+}
+function sameSnapshot(left: Snapshot, right: Snapshot): Boolean {
+    return support.same(left.data, right.data) && left.time == right.time
+}
+
+function thinLto(root: Text, base: Text, logs: tf.Logs) {
+    let work = base + "/minyar linker thin"
+    tf.directory(work)
+    let compiler = work + "/clang"
+    let linker = work + "/ld.lld"
+    tf.executable(compiler, compilerScript(linker), logs)
+    let stamp = work + "/stamp.json"
+    let environment = support.merge(system.environment(), ["CC=" + compiler, "LLVM_CC=" + compiler,
+        "COMPILER_LTO_FLAGS=-flto=thin -fuse-ld=lld", "LLVM_FLAGS=-O2"])
+    tf.executable(linker, linkerScript("18.1.3"), logs)
+    let result = probe(root, stamp, environment, logs)
+    test.check(result.status != 0, "an old matching linker must be rejected")
+    test.check(test.contains(result.errorOutput, "requires LLVM 23.1.2; unsupported linker"), "old linker diagnostic\n" + result.errorOutput)
+    test.check(!support.exists(stamp), "a rejected linker must not publish a stamp")
+    tf.executable(linker, linkerScript("23.1.2"), logs)
+    let original = snapshot(root, stamp, environment, logs)
+    let resolved = support.resolve(linker, tf.next(logs))
+    test.check(json.string(json.member(json.parse(Text(original.data)), "linker"), "path") == resolved, "stamp records the resolved linker path " + resolved + "\n" + Text(original.data))
+    test.check(sameSnapshot(snapshot(root, stamp, environment, logs), original), "an unchanged linker probe must preserve the stamp bytes and mtime")
+    tf.executable(linker, linkerScript("23.1.0"), logs)
+    result = probe(root, stamp, environment, logs)
+    test.check(result.status != 0, "a replaced mismatched linker must be rejected")
+    test.check(test.contains(result.errorOutput, "LLD 23.1.0"), "replaced linker diagnostic\n" + result.errorOutput)
+    test.check(support.same(readBytesFile(stamp), original.data), "a rejected linker replacement must keep the previous stamp")
+    tf.remove(linker)
+    result = probe(root, stamp, environment, logs)
+    test.check(result.status != 0, "a missing linker must be rejected")
+    test.check(test.contains(result.errorOutput, "executable not found"), "missing linker diagnostic\n" + result.errorOutput)
+}
+
+function identityFlags(root: Text, base: Text, logs: tf.Logs) {
+    let work = base + "/minyar toolchain identity"
+    tf.directory(work)
+    let first = work + "/first compiler.exe"
+    let second = work + "/second compiler.exe"
+    let linker = work + "/ld.lld"
+    tf.executable(linker, linkerScript("23.1.2"), logs)
+    for compiler in [first, second] { tf.executable(compiler, compilerScript(linker), logs) }
+    let stamp = work + "/stamp.json"
+    let environment = support.merge(system.environment(), ["CC=" + first, "LLVM_CC=" + first])
+    let original = snapshot(root, stamp, environment, logs)
+    test.check(sameSnapshot(snapshot(root, stamp, environment, logs), original), "an unchanged toolchain must preserve the stamp bytes and mtime")
+    environment = support.merge(environment, ["LLVM_CC=" + second])
+    let changed = snapshot(root, stamp, environment, logs)
+    test.check(!support.same(changed.data, original.data), "a different LLVM_CC must change the stamp")
+    test.check(changed.time / 1000000000 > original.time / 1000000000, "GNU Make 3.81 compares timestamps at whole-second precision")
+    test.check(sameSnapshot(snapshot(root, stamp, environment, logs), changed), "an unchanged second compiler must preserve the stamp")
+    environment = support.merge(environment, ["LLVM_FLAGS=-O3 -g"])
+    let flags = snapshot(root, stamp, environment, logs)
+    test.check(!support.same(flags.data, changed.data), "changed LLVM_FLAGS must change the stamp")
+    tf.append(second, Bytes("\n"))
+    test.check(!support.same(snapshot(root, stamp, environment, logs).data, flags.data), "a replaced compiler binary must change the stamp")
+    test.check(json.string(json.member(json.parse(readTextFile(stamp)), "flags"), "LLVM_FLAGS") == "-O3 -g", "stamp records LLVM_FLAGS")
+}
+
+function touchScript(): Text {
+    return "count=0\nif [ -f \"$STAMP_LOG\" ]; then\n    while IFS= read -r row; do case $row in touch*) count=$((count + 1)) ;; esac; done < \"$STAMP_LOG\"\nfi\ntotal=0\nwhile IFS= read -r value; do total=$((total + 1)); done < \"$STAMP_SEQUENCE\"\nindex=$count\nif [ \"$index\" -ge \"$total\" ]; then index=$((total - 1)); fi\nline=0\nstamp=\nwhile IFS= read -r value; do\n    if [ \"$line\" = \"$index\" ]; then stamp=$value; fi\n    line=$((line + 1))\ndone < \"$STAMP_SEQUENCE\"\nfor target do :; done\n\"$STAMP_TOUCH\" -r \"$STAMP_SEQUENCE.$index\" -- \"$target\" || exit 1\nprintf 'touch %s\\n' \"$stamp\" >> \"$STAMP_LOG\"\n"
+}
+function moveScript(): Text {
+    return "source=\nprevious=\nfor argument do source=$previous; previous=$argument; done\ndestination=$previous\nmodified=$(stat -L -c %.9Y \"$source\" 2>/dev/null || stat -L -f %Fm \"$source\") || exit 1\nprintf 'replace %s\\n' \"$modified\" >> \"$STAMP_LOG\"\nexec \"$STAMP_MV\" -f -- \"$source\" \"$destination\"\n"
+}
+function exercise(root: Text, base: Text, label: Text, timestamps: List<Integer>, prior: Integer, logs: tf.Logs): Clock {
+    let work = base + "/stamp-clock-" + label
+    tf.directory(work)
+    let stamps = work + "/stamps"
+    tf.directory(stamps)
+    let target = stamps + "/stamp.json"
+    writeTextFile(target, "original")
+    tf.setModified(target, prior * 1000000000)
+    let tools = work + "/tools"
+    tf.directory(tools)
+    let sequence = work + "/sequence"
+    let rows: List<Text> = []
+    for index in 0..timestamps.length {
+        rows.add(Text(timestamps[index]) + "\n")
+        let reference = sequence + "." + Text(index)
+        writeTextFile(reference, "")
+        tf.setModified(reference, timestamps[index])
+    }
+    writeTextFile(sequence, joinText(rows))
+    let log = work + "/clock.log"
+    let compiler = work + "/clang"
+    tf.executable(compiler, "printf '%s\\n' 'clang version 23.1.2'\n", logs)
+    let touch = support.which("touch", tf.next(logs))
+    let move = support.which("mv", tf.next(logs))
+    test.check(touch != "" && move != "", "touch and mv are required")
+    tf.executable(tools + "/date", "printf '%s\\n' 100\n", logs)
+    tf.executable(tools + "/sleep", ":\n", logs)
+    tf.executable(tools + "/touch", touchScript(), logs)
+    tf.executable(tools + "/mv", moveScript(), logs)
+    let environment = support.merge(system.environment(), ["PATH=" + tools + ":" + system.getenv("PATH"),
+        "CC=" + compiler, "LLVM_CC=" + compiler, "COMPILER_LTO_FLAGS=", "LLVM_FLAGS=",
+        "STAMP_SEQUENCE=" + sequence, "STAMP_LOG=" + log, "STAMP_TOUCH=" + touch, "STAMP_MV=" + move])
+    let result = tf.run(logs, ["sh", root + "/tools/toolchain.sh", "stamp", target], environment, "", 30)
+    let observed: List<Integer> = []
+    let replaced: List<Integer> = []
+    if support.exists(log) {
+        for row in test.lines(readTextFile(log)) {
+            let fields = test.words(row)
+            if fields.length == 2 && fields[0] == "touch" { observed.add(tf.digits(fields[1])) }
+            if fields.length == 2 && fields[0] == "replace" { replaced.add(tf.nanoseconds(fields[1])) }
+        }
+    }
+    let only = tf.equal(tf.listing(stamps), ["stamp.json"])
+    if result.status != 0 {
+        test.check(support.same(readBytesFile(target), Bytes("original")), "a failed stamp publication must keep the previous stamp")
+        test.check(only, "a failed stamp publication must not leave temporaries: " + tf.show(tf.listing(stamps)))
+        test.check(replaced.length == 0, "a failed stamp publication must not replace the stamp")
+        return Clock { failed: true; errorOutput: result.errorOutput; observed: observed }
+    }
+    test.check(replaced.length == 1, "the stamp must be replaced exactly once, saw " + Text(replaced.length))
+    test.check(replaced[0] / 1000000000 >= max(100, prior) + 1, "the replaced stamp must be newer than both the clock and the prior stamp: " + Text(replaced[0]))
+    test.check(!support.same(readBytesFile(target), Bytes("original")), "the stamp must be replaced")
+    test.check(json.string(json.parse(readTextFile(target)), "llvm_version") == "23.1.2", "the stamp records the LLVM version")
+    test.check(only, "stamp publication must not leave temporaries: " + tf.show(tf.listing(stamps)))
+    return Clock { failed: false; errorOutput: result.errorOutput; observed: observed }
+}
+function succeeded(clock: Clock): List<Integer> {
+    test.check(!clock.failed, "stamp publication failed\n" + clock.errorOutput)
+    return clock.observed
+}
+function integers(values: List<Integer>): Text {
+    let shown: List<Text> = []
+    for value in values { shown.add(Text(value)) }
+    return "[" + support.join(shown, ", ") + "]"
+}
+
+let names = ["test_thin_lto_requires_matching_linker_and_tracks_replacement", "test_identity_flags_and_replaced_binary",
+    "test_userspace_boundary_does_not_certify_filesystem_boundary", "test_stalled_filesystem_fails_bounded_without_replacing_stamp",
+    "test_clock_rollback_still_requires_newer_than_prior_stamp"]
+let groups = ["ToolchainStamp", "ToolchainStamp", "StampFilesystemClock", "StampFilesystemClock", "StampFilesystemClock"]
+for index in 0..argumentCount() {
+    let valid = false
+    for position in 0..names.length {
+        let word = argument(index)
+        if word == names[position] || word == groups[position] + "." + names[position] || word == groups[position] { valid = true }
+    }
+    test.check(valid, "unknown toolchain stamp case " + argument(index))
+}
+let scratch = test.scratch()
+let logs = tf.logs(scratch + "/logs")
+let root = test.lines(support.output(["pwd", "-P"], tf.next(logs)))[0]
+let kernel = support.kernel(tf.next(logs))
+let cases = 0
+let skipped = 0
+if chosen("ToolchainStamp", "test_thin_lto_requires_matching_linker_and_tracks_replacement") {
+    if kernel == "Linux" {
+        thinLto(root, scratch, logs)
+        cases += 1
+    } else { skipped += 1 }
+}
+if chosen("ToolchainStamp", "test_identity_flags_and_replaced_binary") {
+    identityFlags(root, scratch, logs)
+    cases += 1
+}
+if chosen("StampFilesystemClock", "test_userspace_boundary_does_not_certify_filesystem_boundary") {
+    let observed = succeeded(exercise(root, scratch, "userspace", [100990000000, 101001000000], 100, logs))
+    test.check(observed.length == 2 && observed[0] == 100990000000 && observed[1] == 101001000000, "observed touches " + integers(observed))
+    cases += 1
+}
+if chosen("StampFilesystemClock", "test_stalled_filesystem_fails_bounded_without_replacing_stamp") {
+    let clock = exercise(root, scratch, "stalled", [100999999999], 100, logs)
+    test.check(clock.failed, "a stalled filesystem clock must fail the stamp publication")
+    test.check(test.contains(clock.errorOutput, "filesystem timestamp"), "stalled filesystem diagnostic\n" + clock.errorOutput)
+    cases += 1
+}
+if chosen("StampFilesystemClock", "test_clock_rollback_still_requires_newer_than_prior_stamp") {
+    let observed = succeeded(exercise(root, scratch, "rollback", [103999999999, 104000000000], 103, logs))
+    test.check(observed.length > 0 && observed[observed.length - 1] == 104000000000, "observed touches " + integers(observed))
+    cases += 1
+}
+test.removeTree(scratch)
+if skipped > 0 { print("Toolchain stamp: " + Text(cases) + " cases passed, " + Text(skipped) + " skipped (Linux ThinLTO selects LLD)") }
+else { print("Toolchain stamp: " + Text(cases) + " cases passed") }

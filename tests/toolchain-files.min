@@ -1,0 +1,142 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+public function modified(path: Text): Integer { native "toolchainfiles" }
+public function accessed(path: Text): Integer { native "toolchainfiles" }
+public function setTimes(path: Text, accessTime: Integer, modifyTime: Integer): Integer { native "toolchainfiles" }
+public function identity(path: Text): Text { native "toolchainfiles" }
+public function pause(milliseconds: Integer): Integer { native "toolchainfiles" }
+
+public record Logs { directory: Text; serial: Integer }
+
+public function logs(directory: Text): Logs {
+    test.check(files.makeDirectory(directory) == 0, "cannot create log directory " + directory)
+    return Logs { directory: directory; serial: 0 }
+}
+public function next(logs: Logs): Text {
+    logs.serial += 1
+    return logs.directory + "/command-" + Text(logs.serial)
+}
+public function run(logs: Logs, command: List<Text>, environment: List<Text>, cwd: Text, seconds: Integer): test.Result {
+    return test.run(command, environment, cwd, next(logs), seconds)
+}
+public function directory(path: Text) {
+    test.check(files.makeDirectory(path) == 0, "cannot create directory " + path)
+}
+public function directories(path: Text, logs: Logs) {
+    test.require(run(logs, ["mkdir", "-p", "--", path], system.environment(), "", 10), "create directories " + path)
+}
+public function mtime(path: Text): Integer {
+    let value = modified(path)
+    test.check(value >= 0, "cannot inspect " + path + ": " + files.errorText(-value))
+    return value
+}
+public function atime(path: Text): Integer {
+    let value = accessed(path)
+    test.check(value >= 0, "cannot inspect " + path + ": " + files.errorText(-value))
+    return value
+}
+public function setModified(path: Text, nanoseconds: Integer) {
+    stamp(path, nanoseconds, nanoseconds)
+}
+public function stamp(path: Text, accessTime: Integer, modifyTime: Integer) {
+    let status = setTimes(path, accessTime, modifyTime)
+    test.check(status == 0, "cannot set timestamps of " + path + ": " + files.errorText(-status))
+}
+public function executable(path: Text, body: Text, logs: Logs) {
+    writeTextFile(path, "#!/bin/sh\n" + body)
+    test.require(run(logs, ["chmod", "755", path], system.environment(), "", 10), "chmod " + path)
+}
+public function append(path: Text, data: Bytes) {
+    let handle = files.open(path, files.WRITE | files.APPEND)
+    test.check(handle >= 0, "cannot open " + path + " for appending")
+    let written = files.write(handle, data, 0, data.length)
+    let closed = files.close(handle)
+    test.check(written == data.length && closed == 0, "cannot append to " + path)
+}
+public function remove(path: Text) {
+    test.check(files.remove(path) == 0, "cannot remove " + path)
+}
+public function listing(path: Text): List<Text> {
+    let names = files.list(path)
+    test.check(files.lastError() == 0, "cannot list " + path)
+    names.sort()
+    return names
+}
+public function equal(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function show(values: List<Text>): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add("'" + value + "'") }
+    return "[" + support.join(quoted, ", ") + "]"
+}
+public function without(environment: List<Text>, names: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in environment {
+        let keep = true
+        for name in names { if support.starts(entry, name + "=") { keep = false } }
+        if keep { result.add(entry) }
+    }
+    return result
+}
+public function present(environment: List<Text>, name: Text): Boolean {
+    for entry in environment { if support.starts(entry, name + "=") { return true } }
+    return false
+}
+public function lookup(environment: List<Text>, name: Text): Text {
+    for entry in environment {
+        if support.starts(entry, name + "=") { return Text(Bytes(entry).slice(Bytes(name).length + 1, Bytes(entry).length)) }
+    }
+    return ""
+}
+public function calls(path: Text): List<List<Text>> {
+    let result: List<List<Text>> = []
+    if files.pathSize(path) < 0 { return result }
+    let raw = files.readFile(path)
+    let current: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 31 {
+            current.add(Text(raw.slice(start, index)))
+            start = index + 1
+        } else if raw[index] == 10 {
+            result.add(current)
+            current = []
+            start = index + 1
+        }
+    }
+    return result
+}
+public function digits(text: Text): Integer {
+    let raw = Bytes(text)
+    test.check(raw.length > 0, "expected a decimal number")
+    let value = 0
+    for byte in raw {
+        test.check(byte >= 48 && byte <= 57, "expected a decimal number: " + text)
+        value = value * 10 + (byte - 48)
+    }
+    return value
+}
+public function nanoseconds(text: Text): Integer {
+    let parts = support.split(text, ".")
+    let value = digits(parts[0]) * 1000000000
+    if parts.length > 1 {
+        let fraction = Bytes(parts[1] + "000000000").slice(0, 9)
+        value += digits(Text(fraction))
+    }
+    return value
+}
+public function argumentLogger(variable: Text): Text {
+    return "{ printf '%s\\037' \"$@\"; printf '\\n'; } >> \"$" + variable + "\"\n"
+}
+public function outputArgument(): Text {
+    return "target=\nfound=0\nnext=0\nfor argument in \"$@\"; do\n    if [ \"$next\" = 1 ]; then target=$argument; found=1; break; fi\n    if [ \"$argument\" = -o ]; then next=1; fi\ndone\n[ \"$found\" = 1 ] || exit 1\n"
+}
+public function flagged(variable: Text, names: Text): Text {
+    return variable + "=0\nfor argument in \"$@\"; do case $argument in " + names + ") " + variable + "=1 ;; esac; done\n"
+}

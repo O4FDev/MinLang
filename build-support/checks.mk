@@ -436,11 +436,18 @@ check-incremental-module-mutation: build/minyarc-modules build/module-compiler.m
 	$(LIMITED) ./build/tooling/tests/incremental-module-mutation
 
 .PHONY: check-toolchain-stamp check-toolchain-portability check-fuzz-harness check-coverage-harness check-runtime-bytes check-runtime-bytes-sanitize check-compiler-hardening check-incremental-language-hardening check-module-driver-options check-native-graphics
-check-toolchain-stamp:
-	python3 tests/toolchain-stamp.py
+TOOLCHAIN_TEST_TOOLS = build/tooling/tests/toolchain-stamp build/tooling/tests/toolchain-portability build/tooling/tests/native-object-cache
+$(TOOLCHAIN_TEST_TOOLS): tests/toolchain-files.c
+$(addsuffix .ll,$(TOOLCHAIN_TEST_TOOLS)): tests/toolchain-files.min tests/release-support.min
+build/tooling/tests/toolchain-stamp build/tooling/tests/native-object-cache: TOOL_NATIVE = tests/toolchain-files.c
+build/tooling/tests/toolchain-portability: TOOL_NATIVE = tests/toolchain-files.c runtime/native/sha256.c
+build/tooling/tests/toolchain-portability: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/toolchain-portability: runtime/native/sha256.c
+check-toolchain-stamp: build/tooling/tests/toolchain-stamp
+	./build/tooling/tests/toolchain-stamp
 
-check-toolchain-portability: build/tooling/tools/clang-driver
-	python3 tests/toolchain-portability.py
+check-toolchain-portability: build/tooling/tools/clang-driver build/tooling/tests/toolchain-portability
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/toolchain-portability
 
 build/tooling/tests/toolchain-bootstrap: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/toolchain-bootstrap: TOOL_LIBS = $(TOOL_CRYPTO)
@@ -773,8 +780,8 @@ check check-portable: check-redis-protocol check-redis-pipeline
 check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
 
 .PHONY: check-native-cache
-check-native-cache: build/tooling/tools/clang-driver
-	$(LIMITED) python3 tests/native-object-cache.py
+check-native-cache: build/tooling/tools/clang-driver build/tooling/tests/native-object-cache
+	$(LIMITED) ./build/tooling/tests/native-object-cache
 
 .PHONY: check-package-native-inputs
 check-package-native-inputs: build/minyarc build/tooling/tests/package-native-inputs
