@@ -1,0 +1,480 @@
+use "../tools/testing.min" as test
+use "../tools/llvm-sanitizer.min" as sanitizer
+use "./cpython-random.min" as random
+use "system" as system
+use "json" as json
+use "sha256" as sha
+
+constant SIGN = -9223372036854775808
+constant FRACTION = 0xfffffffffffff
+constant LIMB = 0x3fffffff
+record Golden { bits: Integer; text: Text }
+record Cases { bits: List<Integer>; golden: List<Golden> }
+record Decimal { valid: Boolean; negative: Boolean; digits: List<Integer>; exponent: Integer }
+record Campaign { evidence: Text; serial: Integer; header: Text; commands: List<Text>; results: List<Text>; benchmark: Text }
+
+function hex(value: Integer): Text {
+    let alphabet = Bytes("0123456789abcdef")
+    let raw = Bytes(16)
+    for index in 0..16 { raw[15 - index] = alphabet[(value >> (index * 4)) & 15] }
+    return Text(raw)
+}
+function joined(values: List<Text>): Text {
+    let pieces: List<Text> = []
+    for value in values {
+        if pieces.length > 0 { pieces.add(",") }
+        pieces.add(value)
+    }
+    return joinText(pieces)
+}
+function strings(values: List<Text>): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add(json.quote(value)) }
+    return "[" + joined(quoted) + "]"
+}
+function bitsOf(value: Float): Integer {
+    let raw = Bytes(8)
+    raw.setFloat64(0, value)
+    return raw.getInt64(0)
+}
+function power(exponent: Integer): Integer {
+    if exponent >= -1022 { return (exponent + 1023) << 52 }
+    return 1 << (exponent + 1074)
+}
+function randomBits(state: random.State, count: Integer): Integer {
+    let low = random.word(state)
+    let high = random.word(state)
+    if count < 64 { high = high >> (64 - count) }
+    return low | (high << 32)
+}
+function oracleCases(count: Integer, seed: Integer): Cases {
+    let golden = [Golden { bits: 0; text: "0.0" }, Golden { bits: SIGN; text: "-0.0" },
+        Golden { bits: 0x3ff0000000000000; text: "1.0" }, Golden { bits: SIGN | 0x3ff0000000000000; text: "-1.0" },
+        Golden { bits: 0x4045000000000000; text: "42.0" }, Golden { bits: SIGN | 0x4045000000000000; text: "-42.0" },
+        Golden { bits: 0x3fb999999999999a; text: "0.1" }, Golden { bits: 0x3fd3333333333334; text: "0.30000000000000004" },
+        Golden { bits: 0x3e7ad7f29abcaf48; text: "0.0000001" }, Golden { bits: 0x3e45798ee2308c3a; text: "1.0e-8" },
+        Golden { bits: 0x4415af1d78b58c40; text: "100000000000000000000.0" }, Golden { bits: 0x444b1ae4d6e2ef50; text: "1.0e+21" },
+        Golden { bits: 0x433fffffffffffff; text: "9007199254740991.0" }, Golden { bits: SIGN | 0x433fffffffffffff; text: "-9007199254740991.0" },
+        Golden { bits: 0x4340000000000000; text: "9007199254740992.0" },
+        Golden { bits: 0x3fe0000000000000; text: "0.5" }, Golden { bits: 0x3ff4000000000000; text: "1.25" }, Golden { bits: 0x4004000000000000; text: "2.5" },
+        Golden { bits: 0x0eb0000000000000; text: "6.142758149716505e-238" }, Golden { bits: 1; text: "5.0e-324" },
+        Golden { bits: 0x7fefffffffffffff; text: "1.7976931348623157e+308" },
+        Golden { bits: 0x7ff0000000000000; text: "Infinity" }, Golden { bits: SIGN | 0x7ff0000000000000; text: "-Infinity" },
+        Golden { bits: 0x7ff8000000000000; text: "NaN" }]
+    let generated: List<Integer> = []
+    for entry in golden { generated.add(entry.bits) }
+    let lowest = -1074
+    for exponent in lowest..1024 {
+        let value = power(exponent)
+        for item in [value, SIGN | value, value - 1, value + 1, SIGN | (value - 1), SIGN | (value + 1)] { generated.add(item) }
+    }
+    for value in [0, 0x3ff0000000000000, 0x3e7ad7f29abcaf48, 0x3e45798ee2308c3a, 0x4415af1d78b58c40, 0x444b1ae4d6e2ef50, 0x4330000000000000, 0x4340000000000000] {
+        if value == 0 { generated.add(SIGN | 1); generated.add(1) }
+        else { generated.add(value - 1); generated.add(value + 1) }
+    }
+    let state = random.seeded(Text(seed))
+    for unused in 0..count { generated.add(randomBits(state, 64)) }
+    let width = (1 << 54) - 1
+    for unused in 0..(count / 4) {
+        let drawn = randomBits(state, 54)
+        while drawn >= width { drawn = randomBits(state, 54) }
+        generated.add(bitsOf(Float(drawn - (1 << 53) + 1)))
+    }
+    return Cases { bits: generated; golden: golden }
+}
+
+function times(value: List<Integer>, factor: Integer, addend: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let carry = addend
+    for limb in value {
+        let product = limb * factor + carry
+        result.add(product & LIMB)
+        carry = product >> 30
+    }
+    while carry > 0 { result.add(carry & LIMB); carry = carry >> 30 }
+    return result
+}
+function scaled(value: List<Integer>, tens: Integer, twos: Integer): List<Integer> {
+    let result = value
+    let remaining = tens
+    while remaining > 0 {
+        let step = min(remaining, 9)
+        let factor = 1
+        for unused in 0..step { factor = factor * 10 }
+        result = times(result, factor, 0)
+        remaining -= step
+    }
+    let shifted: List<Integer> = []
+    for unused in 0..(twos / 30) { shifted.add(0) }
+    for limb in times(result, 1 << (twos % 30), 0) { shifted.add(limb) }
+    return shifted
+}
+function compare(left: List<Integer>, right: List<Integer>): Integer {
+    let index = max(left.length, right.length) - 1
+    while index >= 0 {
+        let a = 0
+        if index < left.length { a = left[index] }
+        let b = 0
+        if index < right.length { b = right[index] }
+        if a < b { return -1 }
+        if a > b { return 1 }
+        index -= 1
+    }
+    return 0
+}
+function number(digits: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    for digit in digits { result = times(result, 10, digit) }
+    return result
+}
+function against(value: List<Integer>, exponent: Integer, bound: Integer, twos: Integer): Integer {
+    return compare(scaled(value, max(exponent, 0), max(-twos, 0)), scaled(times([], 1, bound), max(-exponent, 0), max(twos, 0)))
+}
+function within(digits: List<Integer>, exponent: Integer, encoded: Integer): Boolean {
+    let biased = (encoded >> 52) & 2047
+    let mantissa = encoded & FRACTION
+    let twos = -1076
+    if biased > 0 { mantissa = mantissa | (FRACTION + 1); twos = biased - 1077 }
+    let lower = 4 * mantissa - 2
+    if (encoded & FRACTION) == 0 && biased > 1 { lower = 4 * mantissa - 1 }
+    let inclusive = mantissa % 2 == 0
+    let value = number(digits)
+    let above = against(value, exponent, 4 * mantissa + 2, twos)
+    if above > 0 || (above == 0 && !inclusive) { return false }
+    if mantissa == 0 { return true }
+    let below = against(value, exponent, lower, twos)
+    return below > 0 || (below == 0 && inclusive)
+}
+function parsed(text: Text): Decimal {
+    let invalid = Decimal { valid: false; negative: false; digits: []; exponent: 0 }
+    let raw = Bytes(text)
+    let index = 0
+    let negative = false
+    if index < raw.length && (raw[index] == 45 || raw[index] == 43) { negative = raw[index] == 45; index += 1 }
+    let digits: List<Integer> = []
+    let exponent = 0
+    let seen = 0
+    let point = false
+    while index < raw.length && ((raw[index] >= 48 && raw[index] <= 57) || (raw[index] == 46 && !point)) {
+        if raw[index] == 46 { point = true }
+        else {
+            seen += 1
+            if digits.length > 0 || raw[index] != 48 { digits.add(raw[index] - 48) }
+            if point { exponent -= 1 }
+        }
+        index += 1
+    }
+    if seen == 0 { return invalid }
+    if index < raw.length && (raw[index] == 101 || raw[index] == 69) {
+        index += 1
+        let sign = 1
+        if index < raw.length && (raw[index] == 45 || raw[index] == 43) {
+            if raw[index] == 45 { sign = -1 }
+            index += 1
+        }
+        let value = 0
+        let count = 0
+        while index < raw.length && raw[index] >= 48 && raw[index] <= 57 {
+            if value < 100000000 { value = value * 10 + raw[index] - 48 }
+            count += 1
+            index += 1
+        }
+        if count == 0 { return invalid }
+        exponent += sign * value
+    }
+    if index != raw.length { return invalid }
+    let end = digits.length
+    while end > 0 && digits[end - 1] == 0 { end -= 1; exponent += 1 }
+    let significant: List<Integer> = []
+    for position in 0..end { significant.add(digits[position]) }
+    return Decimal { valid: true; negative: negative; digits: significant; exponent: exponent }
+}
+function rounds(decimal: Decimal, encoded: Integer): Boolean {
+    if !decimal.valid || decimal.negative != (encoded < 0) { return false }
+    if decimal.digits.length > 0 {
+        let position = decimal.exponent + decimal.digits.length - 1
+        if position > 310 { return false }
+        if position < -330 { return (encoded & 0x7fffffffffffffff) == 0 }
+    }
+    return within(decimal.digits, decimal.exponent, encoded)
+}
+function spelled(digits: List<Integer>, exponent: Integer): Text {
+    let pieces: List<Text> = []
+    for digit in digits { pieces.add(Text(digit)) }
+    return joinText(pieces) + "e" + Text(exponent)
+}
+function shorter(decimal: Decimal, encoded: Integer): Text {
+    let count = decimal.digits.length
+    if count < 2 { return "" }
+    let down: List<Integer> = []
+    for position in 0..(count - 1) { down.add(decimal.digits[position]) }
+    if within(down, decimal.exponent + 1, encoded) { return spelled(down, decimal.exponent + 1) }
+    let up: List<Integer> = []
+    let last = down.length - 1
+    while last >= 0 && down[last] == 9 { last -= 1 }
+    if last < 0 { up.add(1) }
+    for position in 0..down.length {
+        if position < last { up.add(down[position]) }
+        else if position == last { up.add(down[position] + 1) }
+        else { up.add(0) }
+    }
+    if within(up, decimal.exponent + 1, encoded) { return spelled(up, decimal.exponent + 1) }
+    return ""
+}
+function mismatch(cases: Cases, encoded: Integer, text: Text): Text {
+    for entry in cases.golden {
+        if entry.bits == encoded && text != entry.text { return "golden " + hex(encoded) + ": expected " + json.quote(entry.text) + ", got " + json.quote(text) }
+    }
+    let biased = (encoded >> 52) & 2047
+    if biased == 2047 && (encoded & FRACTION) != 0 {
+        if text != "NaN" { return "NaN spelling changed: " + text }
+    } else if biased == 2047 {
+        let expected = "Infinity"
+        if encoded < 0 { expected = "-Infinity" }
+        if text != expected { return "infinity spelling changed: " + text }
+    } else {
+        let decimal = parsed(text)
+        if !rounds(decimal, encoded) { return "bit roundtrip failed: " + hex(encoded) + " -> " + json.quote(text) }
+        if !test.contains(text, ".") && !test.contains(text, "e") { return "Float lost its point/exponent: " + text }
+        let candidate = shorter(decimal, encoded)
+        if candidate != "" { return "not shortest: " + hex(encoded) + " -> " + text + ", exact reference reads back from " + candidate }
+    }
+    if text.byteLength >= 48 { return "formatter exceeded its production buffer: " + text }
+    return ""
+}
+
+function report(campaign: Campaign, status: Text): Text {
+    let benchmark = ""
+    if campaign.benchmark != "" { benchmark = "," + campaign.benchmark }
+    return "{" + campaign.header + ",\"commands\":[" + joined(campaign.commands) + "],\"results\":[" + joined(campaign.results) + "]" + benchmark + "," + status + "}\n"
+}
+function fault(campaign: Campaign, message: Text) {
+    writeTextFile(campaign.evidence + "/results.json", report(campaign, "\"status\":\"failed\",\"failure\":" + json.quote(message)))
+    print(message)
+    print("numeric evidence: " + campaign.evidence)
+    exit(1)
+}
+function require(campaign: Campaign, condition: Boolean, message: Text) {
+    if !condition { fault(campaign, message) }
+}
+function run(campaign: Campaign, command: List<Text>, environment: List<Text>, input: Text, seconds: Integer): Text {
+    campaign.serial += 1
+    let log = campaign.evidence + "/command-" + Text(campaign.serial)
+    let argv = command
+    if input != "" {
+        argv = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" <\"$input\"", "minyar", input]
+        for item in command { argv.add(item) }
+    }
+    let result = test.run(argv, environment, "", log, seconds)
+    campaign.commands.add("{\"command\":" + strings(command) + ",\"status\":" + Text(result.status) + ",\"log\":" + json.quote(log) + "}")
+    require(campaign, result.status == 0 && result.errorOutput == "", "command failed: " + strings(command) + "; status=" + Text(result.status) + "; stderr=" + result.errorOutput)
+    return result.output
+}
+function verify(campaign: Campaign, cases: Cases, output: Text) {
+    let lines = test.lines(output)
+    require(campaign, lines.length == cases.bits.length, "formatter returned " + Text(lines.length) + " lines for " + Text(cases.bits.length) + " values")
+    for index in 0..lines.length {
+        let error = mismatch(cases, cases.bits[index], lines[index])
+        require(campaign, error == "", error)
+    }
+}
+function budget(campaign: Campaign, formatter: Text, environment: List<Text>): Text {
+    run(campaign, [formatter, "--bounds"], environment, "", 120)
+    let output = run(campaign, [formatter, "--budget"], environment, "", 120)
+    require(campaign, json.parse(output).kind == json.OBJECT, "formatter budget is not a JSON object: " + output)
+    return output.trim()
+}
+function linked(command: List<Text>, darwin: Boolean): List<Text> {
+    if darwin { return command }
+    for item in command {
+        if item == "-c" || item == "-S" || item == "-E" || item == "-fsyntax-only" || item == "--version" || item == "-v" { return command }
+    }
+    let result: List<Text> = []
+    for item in command { if item != "-lm" { result.add(item) } }
+    result.add("-lm")
+    return result
+}
+function usage(message: Text) {
+    system.writeStandardError("usage: runtime-numeric [--cc CC] [--compiler PATH] [--cases N] [--seed N] [--mode native|sanitize|both] [--output-dir DIR] [--baseline-executable PATH] [--benchmark] [--iterations N] [--formatter PATH]\nruntime-numeric: error: " + message + "\n")
+    exit(2)
+}
+function integer(value: Text): Integer {
+    let raw = Bytes(value)
+    let index = 0
+    let negative = false
+    if index < raw.length && (raw[index] == 45 || raw[index] == 43) { negative = raw[index] == 45; index += 1 }
+    let base = 10
+    if index + 1 < raw.length && raw[index] == 48 && (raw[index + 1] == 120 || raw[index + 1] == 88) { base = 16; index += 2 }
+    else if index + 1 < raw.length && raw[index] == 48 && (raw[index + 1] == 111 || raw[index + 1] == 79) { base = 8; index += 2 }
+    else if index + 1 < raw.length && raw[index] == 48 && (raw[index + 1] == 98 || raw[index + 1] == 66) { base = 2; index += 2 }
+    if index >= raw.length { usage("invalid integer value: " + value) }
+    let result = 0
+    while index < raw.length {
+        let byte = raw[index]
+        let digit = base
+        if byte >= 48 && byte <= 57 { digit = byte - 48 }
+        else if byte >= 97 && byte <= 102 { digit = byte - 87 }
+        else if byte >= 65 && byte <= 70 { digit = byte - 55 }
+        if byte == 95 && index > 0 && index + 1 < raw.length { digit = -1 }
+        if digit >= base { usage("invalid integer value: " + value) }
+        if digit >= 0 {
+            if result > (9223372036854775807 - digit) / base { usage("integer value out of range: " + value) }
+            result = result * base + digit
+        }
+        index += 1
+    }
+    if negative { return -result }
+    return result
+}
+function median(values: List<Float>): Float {
+    let ordered = values.sorted()
+    if ordered.length % 2 == 1 { return ordered[ordered.length / 2] }
+    return (ordered[ordered.length / 2 - 1] + ordered[ordered.length / 2]) / 2.0
+}
+
+let cc = test.setting("MINYAR_TEST_CLANG", "clang")
+let compiler = test.setting("MINYAR_TEST_COMPILER", "build/minyarc")
+let count = 20000
+let seed = 0x4e554d45524943
+let mode = "both"
+let outputDirectory = "build/numeric"
+let baseline = ""
+let benchmark = false
+let iterations = 100000
+let formatter = ""
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--benchmark" { benchmark = true; index += 1 }
+    else {
+        if index + 1 >= argumentCount() { usage("argument " + name + " expects a value") }
+        let value = argument(index + 1)
+        if name == "--cc" { cc = value }
+        else if name == "--compiler" { compiler = value }
+        else if name == "--cases" { count = integer(value) }
+        else if name == "--seed" { seed = integer(value) }
+        else if name == "--mode" {
+            if value != "native" && value != "sanitize" && value != "both" { usage("argument --mode: invalid choice: " + value) }
+            mode = value
+        }
+        else if name == "--output-dir" { outputDirectory = value }
+        else if name == "--baseline-executable" { baseline = value }
+        else if name == "--iterations" { iterations = integer(value) }
+        else if name == "--formatter" { formatter = value }
+        else { usage("unrecognized argument: " + name) }
+        index += 2
+    }
+}
+if count < 1 || iterations < 1 { usage("case and iteration counts must be positive") }
+let linkFlags = test.words(test.setting("MINYAR_TEST_LINK_FLAGS", ""))
+let runtime = test.setting("MINYAR_TEST_RUNTIME", "runtime/minyar_runtime.c")
+let bootstrap = test.scratch()
+let made = test.run(["/bin/sh", "-c", "mkdir -p -- \"$1\" && cd -- \"$1\" && mktemp -d \"$(pwd -P)/campaign-XXXXXXXX\"", "minyar", outputDirectory], system.environment(), "", bootstrap + "/campaign", 10)
+let host = test.run(["uname", "-s", "-r", "-m"], system.environment(), "", bootstrap + "/platform", 10)
+test.require(made, "create numeric evidence directory")
+test.require(host, "identify numeric host")
+test.removeScratch(bootstrap)
+let platform = host.output.trim()
+let darwin = test.words(platform)[0] == "Darwin"
+let header = "\"seed\":" + Text(seed) + ",\"platform\":" + json.quote(platform) + ",\"compiler\":" + json.quote(compiler) + ",\"runtime\":" + json.quote(runtime) + ",\"link_flags\":" + strings(linkFlags) + ",\"numeric_header_sha256\":" + json.quote(sha.hex(sha.digest(readBytesFile("runtime/minyar_numbers.h"))))
+let campaign = Campaign { evidence: test.lines(made.output)[0]; serial: 0; header: header; commands: []; results: []; benchmark: "" }
+let cases = oracleCases(count, seed)
+let pieces: List<Text> = []
+for value in cases.bits { pieces.add(hex(value) + "\n") }
+let input = campaign.evidence + "/input.bits"
+writeTextFile(input, pieces)
+let native = ""
+if formatter != "" {
+    verify(campaign, cases, run(campaign, [formatter], system.environment(), input, 120))
+    let measured = budget(campaign, formatter, system.environment())
+    campaign.results.add("{\"mode\":\"formatter\",\"formatter\":" + json.quote(formatter) + ",\"roundtrip_values\":" + Text(cases.bits.length) + ",\"golden_values\":" + Text(cases.golden.length) + ",\"budget\":" + measured + "}")
+} else {
+    let llvm = campaign.evidence + "/numeric-formatting.ll"
+    run(campaign, [compiler, "tests/numeric-formatting.min", llvm], system.environment(), "", 120)
+    let expected = readTextFile("tests/numeric-formatting.stdout")
+    let modes = [mode]
+    if mode == "both" { modes = ["native", "sanitize"] }
+    for selected in modes {
+        let executable = campaign.evidence + "/numeric-" + selected
+        let flags = ["-O2"]
+        let instrumentation: List<Text> = []
+        let environment = system.environment()
+        let language = llvm
+        if selected == "sanitize" {
+            instrumentation = ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+            flags = ["-O1"]
+            for flag in instrumentation { flags.add(flag) }
+            environment = []
+            for entry in system.environment() { if !entry.startsWith("ASAN_OPTIONS=") && !entry.startsWith("UBSAN_OPTIONS=") { environment.add(entry) } }
+            environment.add("ASAN_OPTIONS=" + system.getenv("ASAN_OPTIONS") + ":halt_on_error=1:abort_on_error=1:detect_leaks=0")
+            environment.add("UBSAN_OPTIONS=" + system.getenv("UBSAN_OPTIONS") + ":halt_on_error=1:print_stacktrace=1")
+            language = campaign.evidence + "/numeric-formatting-sanitize.ll"
+            let prepared = sanitizer.program(readTextFile(llvm), flags)
+            require(campaign, prepared.error == "", prepared.error)
+            writeTextFile(language, prepared.text)
+        }
+        let command = [cc]
+        for flag in flags { command.add(flag) }
+        command.add("tests/runtime-numeric.c")
+        for flag in linkFlags { command.add(flag) }
+        command.add("-o")
+        command.add(executable)
+        run(campaign, linked(command, darwin), system.environment(), "", 120)
+        verify(campaign, cases, run(campaign, [executable], environment, input, 120))
+        let measured = budget(campaign, executable, environment)
+        for optimization in ["-O0", "-O2"] {
+            let program = campaign.evidence + "/language-" + selected + "-" + Text(Bytes(optimization).slice(2, 3))
+            let link = [cc, optimization]
+            for flag in instrumentation { link.add(flag) }
+            for item in ["-Wno-override-module", language, runtime] { link.add(item) }
+            for flag in linkFlags { link.add(flag) }
+            link.add("-o")
+            link.add(program)
+            run(campaign, linked(link, darwin), system.environment(), "", 120)
+            let actual = run(campaign, [program], environment, "", 120)
+            require(campaign, actual == expected, "numeric aliases changed at " + selected + " " + optimization + ": " + json.quote(actual))
+        }
+        campaign.results.add("{\"mode\":" + json.quote(selected) + ",\"roundtrip_values\":" + Text(cases.bits.length) + ",\"golden_values\":" + Text(cases.golden.length) + ",\"budget\":" + measured + ",\"language_aliases\":[\"O0\",\"O2\"]}")
+        if selected == "native" { native = executable }
+    }
+}
+let summaries: List<Text> = []
+if benchmark {
+    require(campaign, native != "" && baseline != "", "benchmark requires native mode and --baseline-executable")
+    let rows: List<Text> = []
+    for kind in ["integer", "mixed", "fractional"] {
+        let baselineSeconds: List<Float> = []
+        let candidateSeconds: List<Float> = []
+        let samples: List<Text> = []
+        let checksums: List<Text> = []
+        for sample in 0..7 {
+            let names = ["baseline", "candidate"]
+            if sample % 2 == 1 { names = ["candidate", "baseline"] }
+            for name in names {
+                let binary = native
+                if name == "baseline" { binary = baseline }
+                let output = run(campaign, [binary, "--bench", kind, Text(iterations)], system.environment(), "", 120)
+                let row = json.parse(output)
+                let checksum = json.member(row, "checksum")
+                let seconds = json.member(row, "cpu_seconds")
+                require(campaign, row.kind == json.OBJECT && checksum.kind == json.NUMBER && seconds.kind == json.NUMBER, "benchmark output is not a measurement: " + output)
+                samples.add("{\"name\":" + json.quote(name) + ",\"result\":" + output.trim() + "}")
+                let known = false
+                for item in checksums { if item == checksum.text { known = true } }
+                if !known { checksums.add(checksum.text) }
+                if name == "baseline" { baselineSeconds.add(seconds.number) } else { candidateSeconds.add(seconds.number) }
+            }
+        }
+        require(campaign, checksums.length == 1, "benchmark observable output changed for " + kind)
+        let baselineMedian = median(baselineSeconds)
+        let candidateMedian = median(candidateSeconds)
+        let summary = "{\"kind\":" + json.quote(kind) + ",\"baseline_median_seconds\":" + Text(baselineMedian) + ",\"candidate_median_seconds\":" + Text(candidateMedian) + ",\"speedup\":" + Text(baselineMedian / candidateMedian) + "}"
+        summaries.add(summary)
+        rows.add("{\"kind\":" + json.quote(kind) + ",\"samples\":[" + joined(samples) + "],\"baseline_median_seconds\":" + Text(baselineMedian) + ",\"candidate_median_seconds\":" + Text(candidateMedian) + ",\"speedup\":" + Text(baselineMedian / candidateMedian) + "}")
+    }
+    campaign.benchmark = "\"benchmark\":[" + joined(rows) + "],\"baseline_executable_sha256\":" + json.quote(sha.hex(sha.digest(readBytesFile(baseline))))
+}
+writeTextFile(campaign.evidence + "/results.json", report(campaign, "\"status\":\"passed\""))
+print("numeric evidence: " + campaign.evidence)
+print("[" + joined(campaign.results) + "]")
+if summaries.length > 0 { print("[" + joined(summaries) + "]") }

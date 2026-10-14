@@ -109,7 +109,7 @@ check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o build/toolin
 check-fuzz-coverage: check-fuzz-afl-harness build/minyarc
 	sh scripts/fuzz-afl.sh
 
-check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/text-basics-model
+check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/text-basics-model build/tooling/tests/runtime-numeric
 	MINYAR_MIN_COMPILER_EDGE_COVERAGE=$(MIN_COMPILER_EDGE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_LINE_COVERAGE=$(MIN_RUNTIME_LINE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_BRANCH_COVERAGE=$(MIN_RUNTIME_BRANCH_COVERAGE) \
@@ -529,11 +529,15 @@ format: build/tooling/scripts/format
 	./build/tooling/scripts/format --write
 
 .PHONY: check-runtime-numeric check-runtime-numeric-sanitize
-check-runtime-numeric: build/minyarc
-	$(LIMITED) python3 tests/runtime-numeric.py --mode native
+build/tooling/tests/runtime-numeric.ll: tests/cpython-random.min
+build/tooling/tests/runtime-numeric: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/runtime-numeric: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/runtime-numeric: runtime/native/sha256.c
+check-runtime-numeric: build/minyarc build/tooling/tests/runtime-numeric
+	$(LIMITED) ./build/tooling/tests/runtime-numeric --mode native
 
-check-runtime-numeric-sanitize: build/minyarc
-	$(SANITIZER_LIMITED) python3 tests/runtime-numeric.py --mode sanitize
+check-runtime-numeric-sanitize: build/minyarc build/tooling/tests/runtime-numeric
+	$(SANITIZER_LIMITED) ./build/tooling/tests/runtime-numeric --mode sanitize
 
 check-portable: check-runtime-numeric
 check: check-runtime-numeric

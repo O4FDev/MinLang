@@ -6,7 +6,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import hashlib
-import importlib.util
 import math
 import os
 import re
@@ -292,18 +291,8 @@ def main() -> int:
     runtime_numeric = run_dir / "runtime-numeric-profile"
     run([clang, "-O0", "-g", "-fprofile-instr-generate", "-fcoverage-mapping",
          str(ROOT / "tests/runtime-numeric.c"), *math_flags, "-o", str(runtime_numeric)], env=env)
-    run([str(runtime_numeric), "--bounds"], env=env)
-    run([str(runtime_numeric), "--budget"], env=env)
-    spec = importlib.util.spec_from_file_location("numeric_oracle", ROOT / "tests/runtime-numeric.py")
-    sys.path.insert(0, str(ROOT / "tests"))
-    numeric_oracle = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(numeric_oracle)
-    numeric_bits, numeric_golden = numeric_oracle.oracle_cases(2000, 0x4e554d45524943)
-    numeric_input = "".join(f"{value:016x}\n" for value in numeric_bits)
-    (run_dir / "numeric.bits").write_text(numeric_input)
-    numeric_result = run([str(runtime_numeric)], env=env, input=numeric_input)
-    numeric_oracle.verify_output(numeric_bits, numeric_result.stdout, numeric_golden)
-    (run_dir / "numeric.stdout").write_text(numeric_result.stdout)
+    run([str(ROOT / "build/tooling/tests/runtime-numeric"), "--formatter", str(runtime_numeric), "--cases", "2000",
+         "--output-dir", str(run_dir / "numeric")], env=env)
     thread_flags = [] if os.name == "nt" else ["-pthread"]
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
@@ -332,7 +321,7 @@ def main() -> int:
             else:
                 commands.append(([sys.executable, f"tests/{name}.py", *selection], suite_env, 180))
         commands.append(([str(ROOT / "build/tooling/tests/linkage"), "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], suite_env, 180))
-        commands.append(([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
+        commands.append(([str(ROOT / "build/tooling/tests/runtime-numeric"), "--mode", "native", "--cases", "2000",
                           "--output-dir", str(directory / "numeric")], suite_env, 180))
         commands.append(([str(ROOT / "build/tooling/tests/fuzz"), "--cases", "200", "--program-cases", "40",
                           "--output-dir", str(directory / "fuzz")], suite_env, 180))
