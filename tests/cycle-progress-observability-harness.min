@@ -1,0 +1,555 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "./cycle-progress-observability.min" as idle
+
+record Ledger { open: List<Integer>; consumed: List<Integer>; releases: List<Integer>; next: Integer; pipes: Integer }
+record Fake {
+    calls: List<Text>
+    verify: idle.Failure
+    terminate: idle.Failure
+    accounting: idle.Failure
+    counts: List<Integer>
+    countIndex: Integer
+    activeBefore: Integer
+    activeAfter: Integer
+    terminated: Boolean
+    status: Integer
+    closeRaise: idle.Failure
+    closeReturns: List<idle.Failure>
+    closeAttempted: Boolean
+    resumed: Boolean
+    clocks: List<Integer>
+    clockIndex: Integer
+}
+record Pipes { closed: List<Text>; communications: Integer; killed: Boolean }
+record Spy { contracts: Integer; launches: Integer }
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+function scratch(): Text {
+    let parent = system.getenv("TMPDIR")
+    if parent == "" { parent = "/tmp" }
+    let path = parent + "/idle observation control " + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    check(files.makeDirectory(path) == 0, "cannot create harness scratch " + path)
+    return path
+}
+function removeTree(path: Text) {
+    let kind = idle.pathKind(path)
+    if kind == 2 {
+        for name in files.list(path) { removeTree(path + "/" + name) }
+        check(files.removeDirectory(path) == 0, "cannot remove " + path)
+    } else if kind >= 0 {
+        check(files.remove(path) == 0, "cannot remove " + path)
+    }
+}
+function directory(root: Text, name: Text): Text {
+    let path = root + "/" + name
+    check(files.makeDirectory(path) == 0, "cannot create " + path)
+    return path
+}
+function exists(path: Text): Boolean { return idle.pathKind(path) >= 0 }
+function bytes(prefix: Text, values: List<Integer>): Bytes {
+    let result = Bytes(prefix)
+    for value in values { result.add(value) }
+    return result
+}
+function noted(failure: idle.Failure, needle: Text): Boolean {
+    for note in failure.notes { if idle.has(note, needle) { return true } }
+    return false
+}
+function realOwner(destination: Text, report: idle.Report): idle.CommandRecords {
+    return idle.commandRecords(destination, report, idle.ownedLauncher(idle.newKernel()))
+}
+function request(timeout: Float): idle.JobRequest {
+    return idle.JobRequest { argv: ["owned-command"]; executable: "/bin/true"; cwd: "."; stdoutPath: "out"; stderrPath: "err";
+        timeout: timeout; environment: [] }
+}
+function fake(): Fake {
+    return Fake { calls: []; verify: idle.none(); terminate: idle.none(); accounting: idle.none(); counts: []; countIndex: 0;
+        activeBefore: 0; activeAfter: 0; terminated: false; status: 0; closeRaise: idle.none(); closeReturns: [];
+        closeAttempted: false; resumed: false; clocks: []; clockIndex: 0 }
+}
+function fakeApi(state: Fake): idle.JobApi {
+    return idle.JobApi {
+        createJob: function(): idle.Failure {
+            state.calls.add("create owned process group")
+            return idle.none()
+        }
+        spawnSuspended: function(job: idle.JobRequest): idle.Spawned {
+            state.calls.add("suspended spawn in a new session")
+            return idle.Spawned { pid: 123; failure: idle.none() }
+        }
+        verifyAssignment: function(pid: Integer): idle.Failure {
+            state.calls.add("verify own group")
+            return state.verify
+        }
+        resume: function(pid: Integer): idle.Failure {
+            state.calls.add("resume")
+            state.resumed = true
+            return idle.none()
+        }
+        active: function(): idle.Counted {
+            if idle.failed(state.accounting) { return idle.Counted { value: 0; failure: state.accounting } }
+            let value = state.activeBefore
+            if state.terminated { value = state.activeAfter }
+            if state.countIndex < state.counts.length {
+                value = state.counts[state.countIndex]
+                state.countIndex += 1
+            }
+            state.calls.add("active=" + Text(value))
+            return idle.Counted { value: value; failure: idle.none() }
+        }
+        terminate: function(): idle.Failure {
+            state.calls.add("terminate")
+            if idle.failed(state.terminate) { return state.terminate }
+            state.terminated = true
+            return idle.none()
+        }
+        status: function(pid: Integer): idle.Counted {
+            state.calls.add("root status")
+            return idle.Counted { value: state.status; failure: idle.none() }
+        }
+        close: function(): idle.Closed {
+            state.calls.add("close owned descriptors")
+            state.closeAttempted = true
+            return idle.Closed { failures: state.closeReturns; failure: state.closeRaise }
+        }
+        clock: function(): Integer {
+            if state.clocks.length == 0 { return system.monotonicNanoseconds() }
+            check(state.clockIndex < state.clocks.length, "owned job read its clock more often than the control allows")
+            let value = state.clocks[state.clockIndex]
+            state.clockIndex += 1
+            return value
+        }
+        pause: function(nanoseconds: Integer): idle.Failure { return idle.none() }
+    }
+}
+function index(values: List<Text>, wanted: Text): Integer {
+    for position in 0..values.length { if values[position] == wanted { return position } }
+    return -1
+}
+
+function optimizedOrUnknownModesRefuseBeforeCompilationOrEvidence(root: Text) {
+    for mode in ["flag", "option"] {
+        let destination = root + "/" + mode
+        let spy = Spy { contracts: 0; launches: 0 }
+        let defaults = idle.defaultHooks()
+        let hooks = idle.Hooks {
+            contract: function(baseline: Text, current: Text): idle.Sections {
+                spy.contracts += 1
+                return idle.contract(baseline, current)
+            }
+            launcher: idle.Launcher { launch: function(request: idle.LaunchRequest): idle.Launched {
+                spy.launches += 1
+                let launch = defaults.launcher.launch
+                return launch(request)
+            } }
+            writer: idle.writer()
+        }
+        let arguments = ["-O", "--evidence", destination]
+        if mode == "option" { arguments = ["--evidence", destination, "--optimize"] }
+        let outcome = idle.run(arguments, hooks)
+        check(outcome.kind == "SystemExit", mode + ": refusal must be a usage error: " + idle.describe(outcome))
+        check(idle.has(outcome.message, "usage"), mode + ": refusal must explain usage")
+        check(!exists(destination), mode + ": refused run created evidence")
+        check(spy.contracts == 0 && spy.launches == 0, mode + ": refused run compiled or launched")
+    }
+}
+
+function exitedParentDoesNotReleaseDescendantOwnership(root: Text) {
+    let destination = directory(root, "exited-parent")
+    let report = idle.newReport()
+    let owner = realOwner(destination, report)
+    let late = destination + "/late.txt"
+    let script = destination + "/exit-parent.sh"
+    writeTextFile(script, "(sleep 1.5; printf late > \"$1\") &\necho PARENT_EXIT\n")
+    let outcome = idle.runCommand(owner, ["/bin/sh", script, late], 0.3, "exited-parent")
+    check(outcome.failure.kind == "TimeoutExpired", "exited parent must time out while its descendant lives: " + idle.describe(outcome.failure))
+    let row = report.commands[0]
+    check(row.timedOut, "exited parent row is not timed out")
+    check(row.hasStatus && row.status == 0, "exited parent status " + Text(row.status))
+    check(row.cleanup.status == "completed", "exited parent cleanup " + row.cleanup.status)
+    idle.pause(1600000000)
+    check(!exists(late), "exited parent descendant remained executable")
+}
+
+function secondaryKillCloseWaitFailuresPreserveTimeout(root: Text) {
+    let destination = directory(root, "secondary-failure")
+    let report = idle.newReport()
+    let launcher = idle.Launcher { launch: function(request: idle.LaunchRequest): idle.Launched {
+        let process = idle.Process {
+            pid: function(): Integer { return 70001 }
+            communicate: function(timeout: Float): idle.Communicated {
+                return idle.Communicated { stdout: Bytes(); stderr: Bytes(); failure: idle.raised("TimeoutExpired", "Command '['owned']' timed out after 0.1 seconds") }
+            }
+            terminateOwned: function(): idle.Failure { return idle.raised("OSError", "injected tree failure") }
+            kill: function(): idle.Failure { return idle.raised("OSError", "injected kill failure") }
+            wait: function(timeout: Float): idle.Failure { return idle.raised("OSError", "injected wait failure") }
+            openStreams: function(): List<Text> { return ["stdout", "stderr"] }
+            closeStream: function(name: Text): idle.Failure { return idle.raised("OSError", "injected close failure") }
+            returncode: function(): idle.Code { return idle.Code { known: false; value: 0 } }
+        }
+        return idle.Launched { process: process; failure: idle.none() }
+    } }
+    let owner = idle.commandRecords(destination, report, launcher)
+    let outcome = idle.runCommand(owner, ["/bin/sh", "-c", ":"], 0.1, "secondary-failure")
+    check(outcome.failure.kind == "TimeoutExpired", "secondary failures replaced the timeout: " + idle.describe(outcome.failure))
+    check(report.commands[0].timedOut, "secondary failure row is not timed out")
+    check(report.commands[0].cleanup.status == "failed", "secondary failure cleanup " + report.commands[0].cleanup.status)
+    let messages: List<Text> = []
+    for row in report.finalizationErrors { messages.add(row.message) }
+    let joined = joinText(messages)
+    for expected in ["kill failure", "close failure", "wait failure"] {
+        check(idle.has(joined, expected), "finalization errors lack " + expected)
+        check(noted(outcome.failure, expected), "timeout notes lack " + expected)
+    }
+}
+
+function ownedDescriptorsLiveUntilClose(root: Text) {
+    for failing in ["none", "first-pipe", "second-pipe", "spawn", "release"] {
+        let ledger = Ledger { open: []; consumed: []; releases: []; next: 10; pipes: 0 }
+        let kernel = idle.Kernel {
+            pipe: function(): Bytes {
+                ledger.pipes += 1
+                let result = Bytes(24)
+                if (failing == "first-pipe" && ledger.pipes == 1) || (failing == "second-pipe" && ledger.pipes == 2) {
+                    result.setInt64(0, -24)
+                    return result
+                }
+                result.setInt64(8, ledger.next)
+                result.setInt64(16, ledger.next + 1)
+                ledger.open.add(ledger.next)
+                ledger.open.add(ledger.next + 1)
+                ledger.next += 2
+                return result
+            }
+            spawn: function(call: idle.SpawnCall): Integer {
+                for descriptor in [call.resumeRead, call.reportWrite] {
+                    check(index(textValues(ledger.open), Text(descriptor)) >= 0, failing + ": spawn received a released descriptor")
+                    ledger.open = without(ledger.open, descriptor)
+                    ledger.consumed.add(descriptor)
+                }
+                if failing == "spawn" { return -11 }
+                return 4242
+            }
+            group: function(processId: Integer): Integer { return processId }
+            resume: function(resumeWrite: Integer, reportRead: Integer): Integer { return 0 }
+            reap: function(processId: Integer): Bytes { return Bytes(16) }
+            signal: function(processId: Integer, number: Integer): Integer { return 0 }
+            release: function(descriptor: Integer): Integer {
+                check(index(textValues(ledger.open), Text(descriptor)) >= 0, failing + ": descriptor released twice or never owned")
+                ledger.open = without(ledger.open, descriptor)
+                ledger.releases.add(descriptor)
+                if failing == "release" && ledger.releases.length == 1 { return -5 }
+                return 0
+            }
+            clock: function(): Integer { return 0 }
+            pause: function(nanoseconds: Integer): Integer { return 0 }
+        }
+        let job = idle.posixJob(kernel)
+        let spawned = idle.spawnSuspended(job, request(1.0))
+        let failingSpawn = failing == "first-pipe" || failing == "second-pipe" || failing == "spawn"
+        check(idle.failed(spawned.failure) == failingSpawn, failing + ": unexpected spawn outcome " + idle.describe(spawned.failure))
+        let retained = 2
+        if failing == "first-pipe" { retained = 0 }
+        check(job.retained.length == retained, failing + ": retained " + Text(job.retained.length) + " descriptors")
+        check(job.initialized == (failing != "first-pipe"), failing + ": ownership state")
+        for descriptor in job.retained {
+            check(index(textValues(ledger.open), Text(descriptor)) >= 0, failing + ": retained descriptor was released before close")
+        }
+        check(ledger.releases.length == 0, failing + ": descriptors released before close")
+        let owned = job.retained.length
+        let closed = idle.closePosix(job)
+        check(!idle.failed(closed.failure), failing + ": close raised")
+        check(ledger.releases.length == owned, failing + ": close did not release each descriptor exactly once")
+        if failing == "release" {
+            check(closed.failures.length == 1, failing + ": release failure was not reported")
+            let again = idle.closePosix(job)
+            check(again.failures.length == 0 && ledger.releases.length == owned, failing + ": close retried a released descriptor")
+        } else {
+            check(closed.failures.length == 0, failing + ": unexpected release failures")
+        }
+        check(job.retained.length == 0, failing + ": descriptors remain retained after close")
+        check(!job.initialized, failing + ": ownership remains initialized after close")
+        check(ledger.open.length == 0, failing + ": descriptors leaked")
+    }
+}
+function textValues(values: List<Integer>): List<Text> {
+    let result: List<Text> = []
+    for value in values { result.add(Text(value)) }
+    return result
+}
+function without(values: List<Integer>, removed: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let dropped = false
+    for value in values {
+        if value == removed && !dropped { dropped = true } else { result.add(value) }
+    }
+    return result
+}
+
+function invalidTimeoutRefusesBeforeCreation() {
+    for timeout in [0.0, -1.0, 1.0 / 0.0, 0.0 / 0.0] {
+        let state = fake()
+        let report = idle.newJobReport()
+        let outcome = idle.ownedJobRun(fakeApi(state), request(timeout), report)
+        check(outcome.kind == "ValueError" && idle.has(outcome.message, "positive and finite"), "invalid timeout " + Text(timeout) + ": " + idle.describe(outcome))
+        check(index(state.calls, "create owned process group") < 0, "invalid preparation executed a native API")
+        check(!report.started && !report.resumed && !report.closed, "invalid timeout report " + Text(timeout))
+    }
+}
+
+function cleanupFailuresPreserveAssignmentError() {
+    let state = fake()
+    state.verify = idle.raised("ValueError", "original assignment error")
+    state.terminate = idle.raised("OSError", "injected job termination failure")
+    state.accounting = idle.raised("OSError", "injected accounting failure")
+    state.closeReturns = [idle.raised("OSError", "injected handle closure failure")]
+    let report = idle.newJobReport()
+    let outcome = idle.ownedJobRun(fakeApi(state), request(1.0), report)
+    check(outcome.kind == "ValueError" && idle.has(outcome.message, "original assignment error"), "assignment error replaced: " + idle.describe(outcome))
+    check(state.closeAttempted, "owned descriptors were not closed")
+    check(!report.closed, "failed cleanup reported closure")
+    for message in ["termination failure", "accounting failure", "closure failure"] {
+        check(noted(outcome, message), "assignment error notes lack " + message)
+    }
+}
+
+function assignsBeforeResumeAndKeepsDescendantsOwned() {
+    let state = fake()
+    state.counts = [2, 1, 0]
+    let report = idle.newJobReport()
+    let outcome = idle.ownedJobRun(fakeApi(state), request(1.0), report)
+    check(!idle.failed(outcome), "owned run failed: " + idle.describe(outcome))
+    let expected = ["create owned process group", "suspended spawn in a new session", "verify own group", "resume"]
+    for position in 0..expected.length {
+        check(state.calls.length > position && state.calls[position] == expected[position], "owned call order: " + joinText(state.calls))
+    }
+    check(index(state.calls, "active=0") >= 0 && index(state.calls, "active=0") < index(state.calls, "close owned descriptors"), "descriptors closed before the group emptied")
+    check(report.closed, "owned group not closed")
+    check(report.ownership == "owned-process-group", "ownership " + report.ownership)
+    check(report.assignment == "setsid-before-exec", "assignment " + report.assignment)
+}
+
+function exitedRootTimeoutRequiresZeroCount() {
+    let state = fake()
+    state.activeBefore = 1
+    state.activeAfter = 0
+    state.clocks = [0, 2000000000, 3000000000]
+    let report = idle.newJobReport()
+    let outcome = idle.ownedJobRun(fakeApi(state), request(1.0), report)
+    check(outcome.kind == "TimeoutExpired", "exited root timeout: " + idle.describe(outcome))
+    check(state.terminated, "owned group was not terminated")
+    check(report.hasActive && report.activeProcesses == 0, "active processes remain")
+    check(report.closed, "owned group not closed")
+    check(report.timedOut, "timeout not reported")
+    check(report.hasStatus && report.status == 0, "root status not retained")
+}
+
+function assignmentOrCloseFailureNeverReleasesUncontainedCode() {
+    let state = fake()
+    state.verify = idle.raised("ValueError", "controlled assignment failure")
+    state.activeBefore = 1
+    state.activeAfter = 0
+    state.status = 253
+    state.closeRaise = idle.raised("OSError", "controlled close failure")
+    let report = idle.newJobReport()
+    let outcome = idle.ownedJobRun(fakeApi(state), request(1.0), report)
+    check(outcome.kind == "ValueError" && idle.has(outcome.message, "controlled assignment failure"), "assignment failure replaced: " + idle.describe(outcome))
+    check(!state.resumed, "uncontained command resumed")
+    check(!report.closed, "failed close reported closure")
+    check(noted(outcome, "controlled close failure"), "assignment failure notes lack the close failure")
+}
+
+function rawStreamsAreRetainedWithoutTextNormalization(root: Text) {
+    let destination = directory(root, "raw")
+    let report = idle.newReport()
+    let owner = realOwner(destination, report)
+    let outcome = idle.runCommand(owner, ["/bin/sh", "-c", "printf 'raw\\r\\n\\377'; printf 'err\\r\\n\\376' >&2"], 5.0, "raw")
+    check(!idle.failed(outcome.failure), "raw command failed: " + idle.describe(outcome.failure))
+    let stdout = bytes("raw", [13, 10, 255])
+    let stderr = bytes("err", [13, 10, 254])
+    check(idle.sameBytes(outcome.stdout, stdout), "raw stdout changed")
+    check(idle.sameBytes(outcome.stderr, stderr), "raw stderr changed")
+    let row = report.commands[0]
+    check(idle.sameBytes(readBytesFile(destination + "/" + row.stdoutPath), stdout) && row.stdoutBytes == stdout.length, "retained stdout changed")
+    check(idle.sameBytes(readBytesFile(destination + "/" + row.stderrPath), stderr) && row.stderrBytes == stderr.length, "retained stderr changed")
+    check(!row.timedOut, "raw command timed out")
+    check(row.hasStatus && row.status == 0, "raw command status")
+    check(row.executableSha256 != "", "raw command executable digest missing")
+}
+
+function procState(pid: Integer): Text {
+    let path = "/proc/" + Text(pid) + "/stat"
+    let file = files.open(path, files.READ)
+    if file < 0 { return "" }
+    let content = files.readAt(file, 0, 4096)
+    files.close(file)
+    let text = Text(content)
+    let marker = idle.find(text, ") ")
+    if marker < 0 { return "" }
+    let raw = Bytes(text)
+    return Text(raw.slice(marker + 2, marker + 3))
+}
+function ownedTimeoutEndsDescendantThenNextCommandRuns(root: Text) {
+    let destination = directory(root, "timeout")
+    let report = idle.newReport()
+    let owner = realOwner(destination, report)
+    let childPid = destination + "/child.pid"
+    let late = destination + "/late.txt"
+    let script = destination + "/parent.sh"
+    writeTextFile(script, "(sleep 1.5; printf late > \"$2\") &\nchild=$!\nprintf '%s' \"$child\" > \"$1\"\necho OWNED_CHILD \"$child\"\nsleep 30\n")
+    let outcome = idle.runCommand(owner, ["/bin/sh", script, childPid, late], 0.3, "owned-timeout")
+    check(outcome.failure.kind == "TimeoutExpired", "owned timeout: " + idle.describe(outcome.failure))
+    let row = report.commands[0]
+    check(row.timedOut, "owned timeout row is not timed out")
+    check(row.cleanup.action == "owned-process-group", "cleanup action " + row.cleanup.action)
+    check(row.cleanup.status == "completed", "cleanup status " + row.cleanup.status)
+    check(row.hasStatus, "owned timeout status missing")
+    check(idle.pathKind(childPid) == 1, "owned descendant never recorded its pid")
+    let pid = 0
+    for byte in readBytesFile(childPid) { pid = pid * 10 + byte - 48 }
+    idle.pause(1600000000)
+    check(!exists(late), "timed-out descendant remained executable")
+    if idle.linux() {
+        let state = procState(pid)
+        check(state == "" || state == "Z", "owned descendant is still live")
+    }
+    let next = idle.runCommand(owner, ["/bin/sh", "-c", "echo 'next case'"], 5.0, "next-case")
+    check(!idle.failed(next.failure) && next.status == 0, "next case failed: " + idle.describe(next.failure))
+    let text = Text(next.stdout)
+    while idle.ends(text, "\n") || idle.ends(text, "\r") { text = Text(Bytes(text).slice(0, Bytes(text).length - 1)) }
+    check(text == "next case", "next case output " + text)
+    check(report.commands[1].hasStatus && report.commands[1].status == 0, "next case row status")
+}
+
+function cleanupFailureIsRecordedAndNeverAPass(root: Text) {
+    let destination = directory(root, "cleanup-error")
+    let report = idle.newReport()
+    let pipes = Pipes { closed: []; communications: 0; killed: false }
+    let launcher = idle.Launcher { launch: function(request: idle.LaunchRequest): idle.Launched {
+        let process = idle.Process {
+            pid: function(): Integer { return 70002 }
+            communicate: function(timeout: Float): idle.Communicated {
+                pipes.communications += 1
+                if pipes.communications == 1 {
+                    return idle.Communicated { stdout: Bytes(); stderr: Bytes(); failure: idle.raised("TimeoutExpired", "Command '['controlled']' timed out after 0.1 seconds") }
+                }
+                return idle.Communicated { stdout: Bytes(); stderr: Bytes(); failure: idle.none() }
+            }
+            terminateOwned: function(): idle.Failure { return idle.raised("RuntimeError", "controlled cleanup failure") }
+            kill: function(): idle.Failure {
+                pipes.killed = true
+                return idle.none()
+            }
+            wait: function(timeout: Float): idle.Failure { return idle.none() }
+            openStreams: function(): List<Text> {
+                let open: List<Text> = []
+                for name in ["stdout", "stderr"] { if index(pipes.closed, name) < 0 { open.add(name) } }
+                return open
+            }
+            closeStream: function(name: Text): idle.Failure {
+                pipes.closed.add(name)
+                return idle.none()
+            }
+            returncode: function(): idle.Code {
+                if pipes.killed { return idle.Code { known: true; value: -9 } }
+                return idle.Code { known: false; value: 0 }
+            }
+        }
+        return idle.Launched { process: process; failure: idle.none() }
+    } }
+    let owner = idle.commandRecords(destination, report, launcher)
+    let outcome = idle.runCommand(owner, ["/bin/sh", "-c", ":"], 0.1, "cleanup-error")
+    check(outcome.failure.kind == "TimeoutExpired", "cleanup failure replaced the timeout: " + idle.describe(outcome.failure))
+    let row = report.commands[0]
+    check(row.timedOut, "cleanup failure row is not timed out")
+    check(row.cleanup.status == "failed", "cleanup failure status " + row.cleanup.status)
+    let recorded = false
+    for error in row.cleanup.errors { if idle.has(error.message, "controlled cleanup failure") { recorded = true } }
+    check(recorded, "cleanup failure was not recorded")
+    check(row.hasStatus && row.status == -9, "cleanup failure status " + Text(row.status))
+}
+
+function finalizationPreservesPrimaryException(root: Text) {
+    let report = idle.newReport()
+    let primary = idle.raised("ValueError", "original failure")
+    let blocked = idle.Writer {
+        write: function(path: Text, data: Bytes): idle.Failure { return idle.raised("OSError", "manifest blocked") }
+        rename: function(from: Text, to: Text): idle.Failure { return idle.none() }
+    }
+    let first = idle.finalize(root, report, primary, blocked)
+    check(!idle.failed(first), "finalization replaced the primary failure")
+    check(primary.message == "original failure", "primary message changed")
+    check(!report.passed, "blocked manifest passed")
+    let recorded = false
+    for row in report.finalizationErrors { if idle.has(row.message, "manifest blocked") { recorded = true } }
+    check(recorded, "manifest failure not recorded")
+    check(noted(primary, "manifest blocked"), "primary notes lack the manifest failure")
+    let second = idle.finalize(root, report, idle.none(), blocked)
+    check(second.kind == "OSError" && idle.has(second.message, "manifest blocked"), "manifest failure without a primary was hidden")
+}
+
+function setupFailureHasDurableNonpassingManifest(root: Text) {
+    let destination = root + "/setup-failure"
+    let defaults = idle.defaultHooks()
+    let hooks = idle.Hooks {
+        contract: function(baseline: Text, current: Text): idle.Sections {
+            return idle.Sections { helpers: ""; window: ""; failure: idle.raised("ValueError", "contract setup red") }
+        }
+        launcher: defaults.launcher
+        writer: defaults.writer
+    }
+    let outcome = idle.run(["--evidence", destination], hooks)
+    check(outcome.kind == "ValueError" && idle.has(outcome.message, "contract setup red"), "setup failure: " + idle.describe(outcome))
+    let manifest = json.parse(readTextFile(destination + "/manifest.json"))
+    check(manifest.kind == json.OBJECT, "setup manifest is not an object")
+    let passed = json.member(manifest, "passed")
+    check(passed.kind == json.BOOLEAN && !passed.truth, "setup manifest passed")
+    check(idle.has(json.string(manifest, "exception"), "contract setup red"), "setup manifest lacks the exception")
+    let cases = json.member(manifest, "cases")
+    check(cases.kind == json.ARRAY && cases.items.length == 0, "setup manifest has cases")
+}
+
+function ownedLaunchRequestsOneSessionBeforeExec() {
+    let source = readTextFile("tests/cycle-progress-observability-native.c")
+    let module = readTextFile("tests/cycle-progress-observability.min")
+    check(idle.find(source, "fork(") >= 0 && idle.find(source, "fork(") == lastIndex(source, "fork("), "owned launch must create exactly one process")
+    check(idle.find(source, "setsid(") >= 0 && idle.find(source, "setsid(") == lastIndex(source, "setsid("), "owned launch must request exactly one session")
+    check(idle.find(source, "execve(") >= 0 && idle.find(source, "execve(") == lastIndex(source, "execve("), "owned launch must execute exactly once")
+    check(idle.find(source, "fork(") < idle.find(source, "setsid(") && idle.find(source, "setsid(") < idle.find(source, "execve("), "session must precede execution")
+    check(!idle.has(module, "system.spawn("), "commands must launch only through the owned suspended spawn")
+}
+function lastIndex(source: Text, needle: Text): Integer {
+    let result = -1
+    let raw = Bytes(source)
+    let offset = 0
+    while offset < raw.length {
+        let found = idle.find(Text(raw.slice(offset, raw.length)), needle)
+        if found < 0 { break }
+        result = offset + found
+        offset = result + 1
+    }
+    return result
+}
+
+let root = scratch()
+optimizedOrUnknownModesRefuseBeforeCompilationOrEvidence(root)
+exitedParentDoesNotReleaseDescendantOwnership(root)
+secondaryKillCloseWaitFailuresPreserveTimeout(root)
+ownedDescriptorsLiveUntilClose(root)
+invalidTimeoutRefusesBeforeCreation()
+cleanupFailuresPreserveAssignmentError()
+assignsBeforeResumeAndKeepsDescendantsOwned()
+exitedRootTimeoutRequiresZeroCount()
+assignmentOrCloseFailureNeverReleasesUncontainedCode()
+rawStreamsAreRetainedWithoutTextNormalization(root)
+ownedTimeoutEndsDescendantThenNextCommandRuns(root)
+cleanupFailureIsRecordedAndNeverAPass(root)
+finalizationPreservesPrimaryException(directory(root, "finalization"))
+setupFailureHasDurableNonpassingManifest(root)
+ownedLaunchRequestsOneSessionBeforeExec()
+removeTree(root)
+print("idle observability harness: 15 cases passed")

@@ -1,0 +1,1399 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+use "./evidence-support.min" as evidence
+
+constant BASELINE = "tests/fixtures/cycle-progress-before-observability.c.txt"
+constant FIXTURE = "tests/cycle-progress.c"
+constant BASELINE_SHA256 = "1ab79ac428e106daf8d6f2aa8d1388571be3cc3d836ac6ccc9cd558bbf0e84b4"
+constant START = "    double start = wall_seconds(), cpu_start = cpu_seconds();\n"
+constant END = "    /* Unreachable cycles must disappear"
+constant PREFIX = "cycle progress idle failure:"
+constant CALLS = "WCPWRDVSWWCP"
+constant ACTION = "owned-process-group"
+constant ASSIGNMENT = "setsid-before-exec"
+constant LOOP = "    while (wall_seconds() - start < seconds) {
+        minyar_rc_retain_traced(nodes[1]);
+        minyar_rc_release(nodes[1]);
+        long long wait = service_wait(20);
+        assert(rc_object_count == N);
+        assert(minyar_record_get(nodes[0], 0) == slot(nodes[0]));
+        if (wait > 0) {
+            waits++;
+            sleep_ms(wait);
+        }
+    }
+"
+constant MOCK = "
+#define _WIN32 1
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef uint64_t ULONGLONG;
+typedef struct { uint32_t dwLowDateTime, dwHighDateTime; } FILETIME;
+typedef union {
+    struct { uint32_t LowPart, HighPart; };
+    uint64_t QuadPart;
+} ULARGE_INTEGER;
+static char calls[64];
+static unsigned call_count, cpu_calls;
+static ULONGLONG kernels[2], users[2], wall_tick = 1000, wall_advance;
+static void trace(char value) {
+    if (call_count + 1 >= sizeof(calls)) exit(90);
+    calls[call_count++] = value;
+    calls[call_count] = 0;
+}
+static void mock_assert_failure(const char *expression) {
+    fprintf(stderr, \"MOCK_ASSERT %s\\nMOCK_CALLS %s\\n\", expression, calls);
+    exit(42);
+}
+#define assert(value) do { if (!(value)) mock_assert_failure(#value); } while (0)
+static void *GetCurrentProcess(void) { trace('C'); return (void *)(uintptr_t)1; }
+static int GetProcessTimes(void *process, FILETIME *created, FILETIME *exited,
+                           FILETIME *kernel, FILETIME *user) {
+    (void)created;
+    (void)exited;
+    trace('P');
+    assert(process == (void *)(uintptr_t)1 && cpu_calls < 2);
+    kernel->dwLowDateTime = (uint32_t)kernels[cpu_calls];
+    kernel->dwHighDateTime = (uint32_t)(kernels[cpu_calls] >> 32);
+    user->dwLowDateTime = (uint32_t)users[cpu_calls];
+    user->dwHighDateTime = (uint32_t)(users[cpu_calls] >> 32);
+    cpu_calls++;
+    return 1;
+}
+static ULONGLONG GetTickCount64(void) { trace('W'); return wall_tick; }
+typedef struct { long long self; } MinyarRecord;
+static MinyarRecord records[2];
+static MinyarRecord *nodes[2] = {&records[0], &records[1]};
+static unsigned N = 2048;
+static size_t rc_object_count = 2048, waits;
+static long long slot(void *value) { return (long long)(uintptr_t)value; }
+static void minyar_rc_retain_traced(void *value) {
+    assert(value == nodes[1]); trace('R');
+}
+static void minyar_rc_release(void *value) {
+    assert(value == nodes[1]); trace('D');
+}
+static long long service_wait(long long timeout) {
+    assert(timeout == 20); trace('V'); return 20;
+}
+static long long minyar_record_get(MinyarRecord *record, long long index) {
+    assert(record == nodes[0] && index == 0); return record->self;
+}
+static void sleep_ms(long long milliseconds) {
+    assert(milliseconds == 20); trace('S'); wall_tick += wall_advance;
+}
+"
+constant MAIN = "
+int main(int argc, char **argv) {
+    assert(argc == 6);
+    kernels[0] = strtoull(argv[1], NULL, 10);
+    kernels[1] = strtoull(argv[2], NULL, 10);
+    users[0] = strtoull(argv[3], NULL, 10);
+    users[1] = strtoull(argv[4], NULL, 10);
+    wall_advance = strtoull(argv[5], NULL, 10);
+    records[0].self = slot(nodes[0]);
+    double seconds = 1.0;
+__WINDOW__
+    assert(cpu_calls == 2);
+    printf(\"MOCK_CALLS %s\\n\", calls);
+    return 0;
+}
+"
+
+public record Failure { kind: Text; message: Text; notes: List<Text> }
+public record ErrorRow { stage: Text; exception: Text; message: Text }
+public record Code { known: Boolean; value: Integer }
+public record Counted { value: Integer; failure: Failure }
+public record Spawned { pid: Integer; failure: Failure }
+public record Closed { failures: List<Failure>; failure: Failure }
+public record Sections { helpers: Text; window: Text; failure: Failure }
+
+public record JobRequest { argv: List<Text>; executable: Text; cwd: Text; stdoutPath: Text; stderrPath: Text; timeout: Float; environment: List<Text> }
+public record JobReport {
+    started: Boolean
+    resumed: Boolean
+    timedOut: Boolean
+    hasStatus: Boolean
+    status: Integer
+    hasActive: Boolean
+    activeProcesses: Integer
+    cleanupErrors: List<Text>
+    ownership: Text
+    jobCreated: Boolean
+    pid: Integer
+    assignment: Text
+    assignmentVerified: Boolean
+    terminationRequested: Boolean
+    closed: Boolean
+    exception: Text
+}
+public record JobApi {
+    createJob: Callback<Failure>
+    spawnSuspended: Callback<JobRequest, Spawned>
+    verifyAssignment: Callback<Integer, Failure>
+    resume: Callback<Integer, Failure>
+    active: Callback<Counted>
+    terminate: Callback<Failure>
+    status: Callback<Integer, Counted>
+    close: Callback<Closed>
+    clock: Callback<Integer>
+    pause: Callback<Integer, Failure>
+}
+
+public record SpawnCall { path: Text; argv: List<Text>; environment: List<Text>; cwd: Text; stdoutPath: Text; stderrPath: Text; resumeRead: Integer; resumeWrite: Integer; reportRead: Integer; reportWrite: Integer }
+public record Kernel {
+    pipe: Callback<Bytes>
+    spawn: Callback<SpawnCall, Integer>
+    group: Callback<Integer, Integer>
+    resume: Callback<Integer, Integer, Integer>
+    reap: Callback<Integer, Bytes>
+    signal: Callback<Integer, Integer, Integer>
+    release: Callback<Integer, Integer>
+    clock: Callback<Integer>
+    pause: Callback<Integer, Integer>
+}
+public record PosixJob {
+    kernel: Kernel
+    pid: Integer
+    reaped: Boolean
+    exitCode: Integer
+    initialized: Boolean
+    retained: List<Integer>
+    released: List<Integer>
+    resumeWrite: Integer
+    reportRead: Integer
+}
+
+public record Cleanup { action: Text; status: Text; ownedPid: Integer; errors: List<ErrorRow> }
+public record CommandRow {
+    argv: List<Text>
+    cwd: Text
+    label: Text
+    timeout: Float
+    timedOut: Boolean
+    hasStatus: Boolean
+    status: Integer
+    executable: Text
+    executableSha256: Text
+    cleanup: Cleanup
+    pid: Integer
+    startNewSession: Boolean
+    exception: Text
+    elapsed: Float
+    stdoutPath: Text
+    stdoutSha256: Text
+    stdoutBytes: Integer
+    stderrPath: Text
+    stderrSha256: Text
+    stderrBytes: Integer
+    owner: JobReport
+}
+public record InputRow { name: Text; before: Text; retainedPath: Text; retained: Text; after: Text; finalSha: Text }
+public record CaseRow { name: Text; fixture: Text; argv: List<Text>; status: Integer; commandIndex: Integer; stdout: Text; stderr: Text; binary: Text }
+public record CompileRow { argv: List<Text>; status: Integer; stdout: Text; stderr: Text; source: Text; commandIndex: Integer }
+public record FileRow { name: Text; sha256: Text; bytes: Integer }
+public record CompilerRow { path: Text; before: Text; versionStdout: Text; versionStderr: Text; after: Text }
+public record Report {
+    passed: Boolean
+    scope: Text
+    inputs: List<InputRow>
+    cases: List<CaseRow>
+    compile: List<CompileRow>
+    commands: List<CommandRow>
+    finalizationErrors: List<ErrorRow>
+    unhashedFiles: List<Text>
+    hashedFiles: List<FileRow>
+    hasCompiler: Boolean
+    compiler: CompilerRow
+    exception: Text
+}
+
+public record Communicated { stdout: Bytes; stderr: Bytes; failure: Failure }
+public record Process {
+    pid: Callback<Integer>
+    communicate: Callback<Float, Communicated>
+    terminateOwned: Callback<Failure>
+    kill: Callback<Failure>
+    wait: Callback<Float, Failure>
+    openStreams: Callback<List<Text>>
+    closeStream: Callback<Text, Failure>
+    returncode: Callback<Code>
+}
+public record LaunchRequest { argv: List<Text>; executable: Text; cwd: Text; evidencePath: Text; label: Text; timeout: Float; row: CommandRow }
+public record Launched { process: Process; failure: Failure }
+public record Launcher { launch: Callback<LaunchRequest, Launched> }
+public record Writer { write: Callback<Text, Bytes, Failure>; rename: Callback<Text, Text, Failure> }
+public record CommandRecords { evidencePath: Text; report: Report; launcher: Launcher; root: Text }
+public record CommandResult { status: Integer; stdout: Bytes; stderr: Bytes; failure: Failure }
+public record Hooks { contract: Callback<Text, Text, Sections>; launcher: Launcher; writer: Writer }
+
+record RunState { out: Bytes; err: Bytes; primary: Failure; secondary: Failure; hasProcess: Boolean; process: Process }
+record OwnedState { job: PosixJob; report: JobReport; request: JobRequest; ran: Boolean; reported: Boolean; failure: Failure }
+record Field { name: Text; whole: Boolean; integer: Integer; real: Float }
+record Probe { name: Text; value: Text }
+
+function pipeNative(): Bytes { native "idleowner" }
+function spawnNative(path: Text, arguments: Bytes, environment: Bytes, cwd: Text, output: Text, errors: Text,
+    resumeRead: Integer, resumeWrite: Integer, reportRead: Integer, reportWrite: Integer): Integer { native "idleowner" }
+function groupNative(processId: Integer): Integer { native "idleowner" }
+function resumeNative(resumeWrite: Integer, reportRead: Integer): Integer { native "idleowner" }
+function reapNative(processId: Integer): Bytes { native "idleowner" }
+function releaseNative(descriptor: Integer): Integer { native "idleowner" }
+function sleepNative(nanoseconds: Integer): Integer { native "idleowner" }
+function adoptNative(): Integer { native "idleowner" }
+function kindNative(path: Text): Integer { native "idleowner" }
+function parseFloatNative(text: Text): Float { native "idleowner" }
+function linuxNative(): Boolean { native "idleowner" }
+
+public function none(): Failure { return Failure { kind: ""; message: ""; notes: [] } }
+public function raised(kind: Text, message: Text): Failure { return Failure { kind: kind; message: message; notes: [] } }
+public function failed(failure: Failure): Boolean { return failure.kind != "" }
+public function describe(failure: Failure): Text { return failure.kind + ": " + failure.message }
+function copied(failure: Failure): Failure {
+    let notes: List<Text> = []
+    for note in failure.notes { notes.add(note) }
+    return Failure { kind: failure.kind; message: failure.message; notes: notes }
+}
+function osError(code: Integer, subject: Text): Failure {
+    return raised("OSError", "[Errno " + Text(-code) + "] " + files.errorText(code) + ": " + subject)
+}
+public function linux(): Boolean { return linuxNative() }
+public function pathKind(path: Text): Integer { return kindNative(path) }
+public function parseFloat(text: Text): Float { return parseFloatNative(text) }
+public function pause(nanoseconds: Integer) { sleepNative(nanoseconds) }
+
+public function find(source: Text, needle: Text): Integer {
+    let haystack = Bytes(source)
+    let pattern = Bytes(needle)
+    if pattern.length > haystack.length { return -1 }
+    for start in 0..(haystack.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length {
+            if haystack[start + index] != pattern[index] { equal = false; break }
+        }
+        if equal { return start }
+    }
+    return -1
+}
+public function has(source: Text, needle: Text): Boolean { return find(source, needle) >= 0 }
+function occurrences(source: Text, needle: Text): Integer {
+    let haystack = Bytes(source)
+    let pattern = Bytes(needle)
+    let result = 0
+    let start = 0
+    while start + pattern.length <= haystack.length {
+        let equal = true
+        for index in 0..pattern.length {
+            if haystack[start + index] != pattern[index] { equal = false; break }
+        }
+        if equal { result += 1; start += pattern.length } else { start += 1 }
+    }
+    return result
+}
+function cut(source: Text, start: Integer, end: Integer): Text {
+    let raw = Bytes(source)
+    let first = clamp(start, 0, raw.length)
+    let last = clamp(end, 0, raw.length)
+    if last <= first { return "" }
+    return Text(raw.slice(first, last))
+}
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    return raw.length >= bytes.length && Text(raw.slice(raw.length - bytes.length, raw.length)) == suffix
+}
+public function replaced(source: Text, needle: Text, replacement: Text): Text {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let parts: List<Text> = []
+    let start = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal {
+            parts.add(Text(raw.slice(start, index)))
+            parts.add(replacement)
+            index += pattern.length
+            start = index
+        } else { index += 1 }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    return joinText(parts)
+}
+public function splitLines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 { result.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+public function decoded(data: Bytes): Text {
+    let result = Bytes()
+    let index = 0
+    while index < data.length {
+        if data[index] == 13 {
+            result.add(10)
+            if index + 1 < data.length && data[index + 1] == 10 { index += 1 }
+        } else { result.add(data[index]) }
+        index += 1
+    }
+    return Text(result)
+}
+public function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function digestBytes(data: Bytes): Text {
+    let state = sha.new()
+    if !sha.update(state, data) { fail("SHA-256 update failed") }
+    return sha.hex(sha.finalize(state))
+}
+public function readChecked(path: Text): Counted {
+    let data = files.readFile(path)
+    let error = files.lastError()
+    if error != 0 { return Counted { value: error; failure: osError(error, path) } }
+    return Counted { value: 0; failure: none() }
+}
+function fileDigest(path: Text): Text {
+    let data = files.readFile(path)
+    if files.lastError() != 0 { return "" }
+    return digestBytes(data)
+}
+public function writeChecked(path: Text, data: Bytes): Failure {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return osError(file, path) }
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written < 0 { return osError(written, path) }
+    if closed < 0 { return osError(closed, path) }
+    return none()
+}
+function renameChecked(from: Text, to: Text): Failure {
+    let renamed = files.rename(from, to)
+    if renamed < 0 { return osError(renamed, from) }
+    return none()
+}
+public function writer(): Writer {
+    return Writer {
+        write: function(path: Text, data: Bytes): Failure { return writeChecked(path, data) }
+        rename: function(from: Text, to: Text): Failure { return renameChecked(from, to) }
+    }
+}
+function parentOf(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index > 0 && raw[index] != 47 { index -= 1 }
+    if index <= 0 { return "." }
+    return Text(raw.slice(0, index))
+}
+function makeDirectories(path: Text): Failure {
+    if path == "" || path == "." || path == "/" { return none() }
+    if kindNative(path) == 2 { return none() }
+    let parent = makeDirectories(parentOf(path))
+    if failed(parent) { return parent }
+    let made = files.makeDirectory(path)
+    if made < 0 { return osError(made, path) }
+    return none()
+}
+function pythonList(values: List<Text>): Text {
+    let parts: List<Text> = ["["]
+    for index in 0..values.length {
+        if index > 0 { parts.add(", ") }
+        parts.add("'" + values[index] + "'")
+    }
+    parts.add("]")
+    return joinText(parts)
+}
+function seconds(value: Float): Text {
+    if value == floor(value) && abs(value) < 1000000000000.0 { return Text(Integer(value)) }
+    return Text(value)
+}
+function expired(argv: List<Text>, timeout: Float): Failure {
+    return raised("TimeoutExpired", "Command '" + pythonList(argv) + "' timed out after " + seconds(timeout) + " seconds")
+}
+function span(timeout: Float): Integer {
+    if timeout >= 9000000000.0 { return 9000000000000000000 }
+    return Integer(timeout * 1000000000.0)
+}
+
+public function newJobReport(): JobReport {
+    return JobReport { started: false; resumed: false; timedOut: false; hasStatus: false; status: 0; hasActive: false;
+        activeProcesses: 0; cleanupErrors: []; ownership: ACTION; jobCreated: false; pid: 0; assignment: "";
+        assignmentVerified: false; terminationRequested: false; closed: false; exception: "" }
+}
+function counted(api: JobApi, report: JobReport): Counted {
+    let active = api.active
+    let result = active()
+    if failed(result.failure) { return result }
+    if result.value < 0 { return Counted { value: 0; failure: raised("RuntimeError", "Invalid owned job accounting count") } }
+    report.hasActive = true
+    report.activeProcesses = result.value
+    return result
+}
+function cleanupAttempt(report: JobReport, stage: Text, failure: Failure): Boolean {
+    if !failed(failure) { return true }
+    report.cleanupErrors.add(stage + ": " + failure.message)
+    return false
+}
+public function ownedJobRun(api: JobApi, request: JobRequest, report: JobReport): Failure {
+    report.started = false
+    report.resumed = false
+    report.timedOut = false
+    report.hasStatus = false
+    report.hasActive = false
+    report.cleanupErrors = []
+    report.ownership = ACTION
+    let clock = api.clock
+    let pacing = api.pause
+    let created = false
+    let pid = 0
+    let primary = none()
+    let timeout = request.timeout
+    if !(timeout > 0.0) || timeout - timeout != 0.0 {
+        primary = raised("ValueError", "Owned command timeout must be positive and finite")
+    } else {
+        let create = api.createJob
+        let made = create()
+        if failed(made) { primary = made } else {
+            created = true
+            report.jobCreated = true
+            let spawn = api.spawnSuspended
+            let spawned = spawn(request)
+            if failed(spawned.failure) { primary = spawned.failure } else {
+                pid = spawned.pid
+                report.started = true
+                report.pid = pid
+                report.assignment = ASSIGNMENT
+                let verify = api.verifyAssignment
+                let verified = verify(pid)
+                if failed(verified) { primary = verified } else {
+                    report.assignmentVerified = true
+                    let resume = api.resume
+                    let resumed = resume(pid)
+                    if failed(resumed) { primary = resumed } else {
+                        report.resumed = true
+                        let deadline = clock() + span(timeout)
+                        while true {
+                            let active = counted(api, report)
+                            if failed(active.failure) { primary = active.failure; break }
+                            if active.value == 0 { break }
+                            if clock() >= deadline {
+                                report.timedOut = true
+                                primary = expired(request.argv, timeout)
+                                break
+                            }
+                            let paced = pacing(20000000)
+                            if failed(paced) { primary = paced; break }
+                        }
+                        if !failed(primary) {
+                            let status = api.status
+                            let finished = status(pid)
+                            if failed(finished.failure) { primary = finished.failure } else {
+                                report.hasStatus = true
+                                report.status = finished.value
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if failed(primary) { report.exception = describe(primary) }
+    if created {
+        if !report.hasActive || report.activeProcesses != 0 {
+            let terminate = api.terminate
+            report.terminationRequested = cleanupAttempt(report, "job termination", terminate())
+            let limit = clock() + 5000000000
+            while true {
+                let active = counted(api, report)
+                if !cleanupAttempt(report, "job accounting", active.failure) || active.value == 0 { break }
+                if clock() >= limit {
+                    report.cleanupErrors.add("owned job still has active processes")
+                    break
+                }
+                if !cleanupAttempt(report, "cleanup pacing", pacing(20000000)) { break }
+            }
+        }
+        if pid > 0 && report.hasActive && report.activeProcesses == 0 && !report.hasStatus {
+            let status = api.status
+            let finished = status(pid)
+            if cleanupAttempt(report, "root terminal status", finished.failure) {
+                report.hasStatus = true
+                report.status = finished.value
+            }
+        }
+    }
+    let close = api.close
+    let closed = close()
+    if cleanupAttempt(report, "handle closure", closed.failure) {
+        for problem in closed.failures { report.cleanupErrors.add("handle close: " + problem.message) }
+    }
+    report.closed = report.hasActive && report.activeProcesses == 0 && report.cleanupErrors.length == 0
+    if failed(primary) {
+        for message in report.cleanupErrors { primary.notes.add("Owned job cleanup: " + message) }
+        return primary
+    }
+    if report.cleanupErrors.length > 0 || !report.closed {
+        return raised("RuntimeError", "Contained owned command cleanup is not certified")
+    }
+    return none()
+}
+
+function pack(values: List<Text>): Bytes {
+    let packed = Bytes()
+    for value in values { packed.addBytes(Bytes(value)); packed.add(0) }
+    return packed
+}
+public function newKernel(): Kernel {
+    adoptNative()
+    return Kernel {
+        pipe: function(): Bytes { return pipeNative() }
+        spawn: function(call: SpawnCall): Integer {
+            return spawnNative(call.path, pack(call.argv), pack(call.environment), call.cwd, call.stdoutPath, call.stderrPath,
+                call.resumeRead, call.resumeWrite, call.reportRead, call.reportWrite)
+        }
+        group: function(processId: Integer): Integer { return groupNative(processId) }
+        resume: function(resumeWrite: Integer, reportRead: Integer): Integer { return resumeNative(resumeWrite, reportRead) }
+        reap: function(processId: Integer): Bytes { return reapNative(processId) }
+        signal: function(processId: Integer, number: Integer): Integer { return system.sendSignal(processId, number) }
+        release: function(descriptor: Integer): Integer { return releaseNative(descriptor) }
+        clock: function(): Integer { return system.monotonicNanoseconds() }
+        pause: function(nanoseconds: Integer): Integer { return sleepNative(nanoseconds) }
+    }
+}
+public function posixJob(kernel: Kernel): PosixJob {
+    return PosixJob { kernel: kernel; pid: 0; reaped: false; exitCode: 0; initialized: false; retained: []; released: [];
+        resumeWrite: -1; reportRead: -1 }
+}
+function spawnPosix(job: PosixJob, request: JobRequest): Spawned {
+    let pipe = job.kernel.pipe
+    let first = pipe()
+    if first.getInt64(0) != 0 { return Spawned { pid: 0; failure: osError(first.getInt64(0), "owned resume pipe") } }
+    job.initialized = true
+    let resumeRead = first.getInt64(8)
+    job.resumeWrite = first.getInt64(16)
+    job.retained.add(resumeRead)
+    job.retained.add(job.resumeWrite)
+    let second = pipe()
+    if second.getInt64(0) != 0 { return Spawned { pid: 0; failure: osError(second.getInt64(0), "owned report pipe") } }
+    job.reportRead = second.getInt64(8)
+    let reportWrite = second.getInt64(16)
+    job.retained.add(job.reportRead)
+    job.retained.add(reportWrite)
+    let spawn = job.kernel.spawn
+    let pid = spawn(SpawnCall { path: request.executable; argv: request.argv; environment: request.environment; cwd: request.cwd;
+        stdoutPath: request.stdoutPath; stderrPath: request.stderrPath; resumeRead: resumeRead; resumeWrite: job.resumeWrite;
+        reportRead: job.reportRead; reportWrite: reportWrite })
+    job.retained = [job.resumeWrite, job.reportRead]
+    if pid < 0 { return Spawned { pid: 0; failure: osError(pid, request.executable) } }
+    job.pid = pid
+    return Spawned { pid: pid; failure: none() }
+}
+public function reapPosix(job: PosixJob) {
+    if job.pid <= 0 { return }
+    let reap = job.kernel.reap
+    let raw = reap(job.pid)
+    let state = raw.getInt64(0)
+    if (state == 1 || state == 2) && !job.reaped {
+        job.reaped = true
+        job.exitCode = raw.getInt64(8)
+        if state == 2 { job.exitCode = -raw.getInt64(8) }
+    }
+}
+function verifyPosix(job: PosixJob, pid: Integer): Failure {
+    let group = job.kernel.group
+    let found = group(pid)
+    if found < 0 { return osError(found, "owned process group") }
+    if found != pid { return raised("RuntimeError", "Original command was not atomically assigned to the owned process group") }
+    return none()
+}
+function resumePosix(job: PosixJob): Failure {
+    let resume = job.kernel.resume
+    let result = resume(job.resumeWrite, job.reportRead)
+    if result < 0 { return osError(result, "owned command execution") }
+    return none()
+}
+function activePosix(job: PosixJob): Counted {
+    if job.pid <= 0 { return Counted { value: 0; failure: none() } }
+    reapPosix(job)
+    let signal = job.kernel.signal
+    let probed = signal(-job.pid, 0)
+    if probed == 0 || probed == -1 { return Counted { value: 1; failure: none() } }
+    if probed == -3 { return Counted { value: 0; failure: none() } }
+    return Counted { value: 0; failure: osError(probed, "owned process group accounting") }
+}
+function terminatePosix(job: PosixJob): Failure {
+    if job.pid <= 0 { return none() }
+    let signal = job.kernel.signal
+    let killed = signal(-job.pid, 9)
+    if killed == 0 || killed == -3 { return none() }
+    return osError(killed, "owned process group termination")
+}
+function statusPosix(job: PosixJob): Counted {
+    reapPosix(job)
+    if job.reaped { return Counted { value: job.exitCode; failure: none() } }
+    return Counted { value: 0; failure: raised("RuntimeError", "Owned root is not terminal after group closure") }
+}
+public function closePosix(job: PosixJob): Closed {
+    let failures: List<Failure> = []
+    let release = job.kernel.release
+    for descriptor in job.retained {
+        let released = release(descriptor)
+        job.released.add(descriptor)
+        if released < 0 { failures.add(osError(released, "owned descriptor " + Text(descriptor))) }
+    }
+    job.retained = []
+    job.initialized = false
+    return Closed { failures: failures; failure: none() }
+}
+public function spawnSuspended(job: PosixJob, request: JobRequest): Spawned { return spawnPosix(job, request) }
+public function posixApi(job: PosixJob): JobApi {
+    return JobApi {
+        createJob: function(): Failure { return none() }
+        spawnSuspended: function(request: JobRequest): Spawned { return spawnPosix(job, request) }
+        verifyAssignment: function(pid: Integer): Failure { return verifyPosix(job, pid) }
+        resume: function(pid: Integer): Failure { return resumePosix(job) }
+        active: function(): Counted { return activePosix(job) }
+        terminate: function(): Failure { return terminatePosix(job) }
+        status: function(pid: Integer): Counted { return statusPosix(job) }
+        close: function(): Closed { return closePosix(job) }
+        clock: function(): Integer {
+            let clock = job.kernel.clock
+            return clock()
+        }
+        pause: function(nanoseconds: Integer): Failure {
+            let pacing = job.kernel.pause
+            let paused = pacing(nanoseconds)
+            if paused < 0 { return osError(paused, "owned job pacing") }
+            return none()
+        }
+    }
+}
+
+function readOutput(path: Text): Bytes {
+    if kindNative(path) != 1 { return Bytes() }
+    return files.readFile(path)
+}
+function communicateOwned(state: OwnedState): Communicated {
+    if !state.ran {
+        state.ran = true
+        state.failure = ownedJobRun(posixApi(state.job), state.request, state.report)
+    }
+    let out = readOutput(state.request.stdoutPath)
+    let err = readOutput(state.request.stderrPath)
+    if state.report.timedOut && !state.reported {
+        state.reported = true
+        return Communicated { stdout: out; stderr: err; failure: copied(state.failure) }
+    }
+    if !state.report.closed || state.report.cleanupErrors.length > 0 {
+        let message = "Owned process group closure not certified"
+        for problem in state.report.cleanupErrors { message = message + "; " + problem }
+        return Communicated { stdout: out; stderr: err; failure: raised("RuntimeError", message) }
+    }
+    if failed(state.failure) && !state.report.timedOut {
+        return Communicated { stdout: out; stderr: err; failure: raised("RuntimeError", "Owned process preparation/launch failed: " + describe(state.failure)) }
+    }
+    return Communicated { stdout: out; stderr: err; failure: none() }
+}
+function waitOwnedRoot(state: OwnedState, timeout: Float): Failure {
+    let clock = state.job.kernel.clock
+    let pacing = state.job.kernel.pause
+    let deadline = clock() + span(timeout)
+    while true {
+        reapPosix(state.job)
+        if state.job.pid <= 0 || state.job.reaped { return none() }
+        if clock() >= deadline { return expired(state.request.argv, timeout) }
+        pacing(20000000)
+    }
+    return none()
+}
+function terminateOwnedGroup(state: OwnedState): Failure {
+    if state.report.closed && state.report.hasActive && state.report.activeProcesses == 0 { return none() }
+    let primary = raised("RuntimeError", "Owned process group interrupted; final zero-active report unavailable")
+    let stopped = terminatePosix(state.job)
+    if failed(stopped) { primary.notes.add("group kill: " + stopped.message) }
+    let waited = waitOwnedRoot(state, 5.0)
+    if failed(waited) { primary.notes.add("root wait: " + waited.message) }
+    return primary
+}
+function killOwnedRoot(state: OwnedState): Failure {
+    if state.job.pid <= 0 || state.job.reaped { return none() }
+    let signal = state.job.kernel.signal
+    let killed = signal(state.job.pid, 9)
+    if killed == 0 || killed == -3 { return none() }
+    return osError(killed, "owned root kill")
+}
+function launchOwned(kernel: Kernel, request: LaunchRequest): Launched {
+    let directory = request.evidencePath + "/" + request.label + "-owned"
+    let placeholder = idleProcess()
+    if kindNative(directory) >= 0 { return Launched { process: placeholder; failure: raised("FileExistsError", "Owned command directory exists: " + directory) } }
+    let made = files.makeDirectory(directory)
+    if made < 0 { return Launched { process: placeholder; failure: osError(made, directory) } }
+    let state = OwnedState { job: posixJob(kernel); report: request.row.owner; request: JobRequest { argv: request.argv;
+        executable: request.executable; cwd: request.cwd; stdoutPath: directory + "/target.stdout.bin";
+        stderrPath: directory + "/target.stderr.bin"; timeout: request.timeout; environment: system.environment() };
+        ran: false; reported: false; failure: none() }
+    let process = Process {
+        pid: function(): Integer { return state.job.pid }
+        communicate: function(timeout: Float): Communicated { return communicateOwned(state) }
+        terminateOwned: function(): Failure { return terminateOwnedGroup(state) }
+        kill: function(): Failure { return killOwnedRoot(state) }
+        wait: function(timeout: Float): Failure { return waitOwnedRoot(state, timeout) }
+        openStreams: function(): List<Text> {
+            let open: List<Text> = []
+            return open
+        }
+        closeStream: function(name: Text): Failure { return none() }
+        returncode: function(): Code { return Code { known: state.report.hasStatus; value: state.report.status } }
+    }
+    return Launched { process: process; failure: none() }
+}
+public function ownedLauncher(kernel: Kernel): Launcher {
+    return Launcher { launch: function(request: LaunchRequest): Launched { return launchOwned(kernel, request) } }
+}
+public function idleProcess(): Process {
+    return Process {
+        pid: function(): Integer { return 0 }
+        communicate: function(timeout: Float): Communicated { return Communicated { stdout: Bytes(); stderr: Bytes(); failure: none() } }
+        terminateOwned: function(): Failure { return none() }
+        kill: function(): Failure { return none() }
+        wait: function(timeout: Float): Failure { return none() }
+        openStreams: function(): List<Text> {
+            let open: List<Text> = []
+            return open
+        }
+        closeStream: function(name: Text): Failure { return none() }
+        returncode: function(): Code { return Code { known: false; value: 0 } }
+    }
+}
+
+public function newReport(): Report {
+    return Report { passed: false; scope: "mocked observability only; no historical failure replay"; inputs: []; cases: [];
+        compile: []; commands: []; finalizationErrors: []; unhashedFiles: []; hashedFiles: []; hasCompiler: false;
+        compiler: CompilerRow { path: ""; before: ""; versionStdout: ""; versionStderr: ""; after: "" }; exception: "" }
+}
+function errorJson(row: ErrorRow): Text {
+    return "{\"exception\": " + evidence.quote(row.exception) + ", \"message\": " + evidence.quote(row.message) + ", \"stage\": " + evidence.quote(row.stage) + "}"
+}
+function secondary(report: Report, primary: Failure, stage: Text, error: Failure) {
+    let row = ErrorRow { stage: stage; exception: error.kind; message: error.message }
+    report.passed = false
+    report.finalizationErrors.add(row)
+    if failed(primary) { primary.notes.add("idle observation finalization: " + errorJson(row)) }
+}
+public function commandRecords(directory: Text, report: Report, launcher: Launcher): CommandRecords {
+    return CommandRecords { evidencePath: directory; report: report; launcher: launcher; root: evidence.resolve(".") }
+}
+function attempt(report: Report, row: CommandRow, state: RunState, stage: Text, failure: Failure): Boolean {
+    if !failed(failure) { return true }
+    row.cleanup.status = "failed"
+    row.cleanup.errors.add(ErrorRow { stage: stage; exception: failure.kind; message: failure.message })
+    secondary(report, state.primary, stage, failure)
+    if !failed(state.secondary) { state.secondary = failure }
+    return false
+}
+function closePipes(report: Report, row: CommandRow, state: RunState) {
+    let open = state.process.openStreams
+    let close = state.process.closeStream
+    for name in open() { attempt(report, row, state, name + "-close", close(name)) }
+}
+function recordStatus(row: CommandRow, process: Process) {
+    let returncode = process.returncode
+    let code = returncode()
+    row.hasStatus = code.known
+    row.status = code.value
+}
+function cleanupProcess(report: Report, row: CommandRow, state: RunState) {
+    let pid = state.process.pid
+    row.cleanup = Cleanup { action: ACTION; status: "started"; ownedPid: pid(); errors: [] }
+    let terminate = state.process.terminateOwned
+    let kill = state.process.kill
+    if !attempt(report, row, state, "owned-tree-terminate", terminate()) {
+        attempt(report, row, state, "fallback-child-kill", kill())
+    }
+    let communicate = state.process.communicate
+    let drained = communicate(10.0)
+    if attempt(report, row, state, "post-cleanup-drain", drained.failure) {
+        state.out = drained.stdout
+        state.err = drained.stderr
+    } else {
+        attempt(report, row, state, "fallback-child-kill", kill())
+        closePipes(report, row, state)
+        let wait = state.process.wait
+        attempt(report, row, state, "fallback-child-wait", wait(5.0))
+    }
+    recordStatus(row, state.process)
+    if row.cleanup.status != "failed" { row.cleanup.status = "completed" }
+}
+public function runCommand(owner: CommandRecords, command: List<Text>, timeout: Float, label: Text): CommandResult {
+    let row = CommandRow { argv: command; cwd: owner.root; label: label; timeout: timeout; timedOut: false; hasStatus: false;
+        status: 0; executable: ""; executableSha256: ""; cleanup: Cleanup { action: "none"; status: "not-needed"; ownedPid: 0; errors: [] };
+        pid: 0; startNewSession: false; exception: ""; elapsed: 0.0; stdoutPath: ""; stdoutSha256: ""; stdoutBytes: 0;
+        stderrPath: ""; stderrSha256: ""; stderrBytes: 0; owner: newJobReport() }
+    let report = owner.report
+    report.commands.add(row)
+    let began = system.monotonicNanoseconds()
+    let state = RunState { out: Bytes(); err: Bytes(); primary: none(); secondary: none(); hasProcess: false; process: idleProcess() }
+    let result = CommandResult { status: 0; stdout: Bytes(); stderr: Bytes(); failure: none() }
+    let requested = command[0]
+    let executable = ""
+    if has(requested, "/") { executable = evidence.resolve(requested) } else {
+        executable = evidence.locate(requested, owner.root, system.environment())
+        if executable == "" { state.primary = raised("FileNotFoundError", "Missing command executable: " + requested) }
+    }
+    if !failed(state.primary) {
+        row.executable = executable
+        let data = files.readFile(executable)
+        let error = files.lastError()
+        if error != 0 { state.primary = osError(error, executable) } else { row.executableSha256 = digestBytes(data) }
+    }
+    if !failed(state.primary) {
+        let launch = owner.launcher.launch
+        let launched = launch(LaunchRequest { argv: command; executable: executable; cwd: owner.root; evidencePath: owner.evidencePath;
+            label: label; timeout: timeout; row: row })
+        if failed(launched.failure) { state.primary = launched.failure } else {
+            state.process = launched.process
+            state.hasProcess = true
+            row.startNewSession = true
+            let communicate = state.process.communicate
+            let communicated = communicate(timeout)
+            let pid = state.process.pid
+            row.pid = pid()
+            if failed(communicated.failure) { state.primary = communicated.failure } else {
+                state.out = communicated.stdout
+                state.err = communicated.stderr
+                recordStatus(row, state.process)
+                result.status = row.status
+            }
+        }
+    }
+    if failed(state.primary) {
+        row.timedOut = state.primary.kind == "TimeoutExpired"
+        row.exception = describe(state.primary)
+        if state.hasProcess {
+            cleanupProcess(report, row, state)
+            recordStatus(row, state.process)
+        }
+    }
+    row.elapsed = Float(system.monotonicNanoseconds() - began) / 1000000000.0
+    let path = owner.evidencePath + "/" + label + ".stdout.bin"
+    if attempt(report, row, state, label + "-stdout-retention", writeChecked(path, state.out)) {
+        row.stdoutPath = label + ".stdout.bin"
+        row.stdoutSha256 = digestBytes(state.out)
+        row.stdoutBytes = state.out.length
+    }
+    path = owner.evidencePath + "/" + label + ".stderr.bin"
+    if attempt(report, row, state, label + "-stderr-retention", writeChecked(path, state.err)) {
+        row.stderrPath = label + ".stderr.bin"
+        row.stderrSha256 = digestBytes(state.err)
+        row.stderrBytes = state.err.length
+    }
+    if state.hasProcess { closePipes(report, row, state) }
+    result.stdout = state.out
+    result.stderr = state.err
+    if failed(state.primary) { result.failure = state.primary } else if failed(state.secondary) { result.failure = state.secondary }
+    return result
+}
+
+function quotedList(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(evidence.quote(value)) }
+    return "[" + joinTextWith(parts, ", ") + "]"
+}
+function joinTextWith(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+function nullable(value: Text): Text {
+    if value == "" { return "null" }
+    return evidence.quote(value)
+}
+function errorRows(rows: List<ErrorRow>): Text {
+    let parts: List<Text> = []
+    for row in rows { parts.add(errorJson(row)) }
+    return "[" + joinTextWith(parts, ", ") + "]"
+}
+function jobJson(report: JobReport): Text {
+    let status = "null"
+    if report.hasStatus { status = Text(report.status) }
+    let active = "null"
+    if report.hasActive { active = Text(report.activeProcesses) }
+    return "{\"ownership\": " + evidence.quote(report.ownership) + ", \"job_created\": " + Text(report.jobCreated) +
+        ", \"started\": " + Text(report.started) + ", \"pid\": " + Text(report.pid) + ", \"assignment\": " + evidence.quote(report.assignment) +
+        ", \"assignment_verified\": " + Text(report.assignmentVerified) + ", \"resumed\": " + Text(report.resumed) +
+        ", \"timed_out\": " + Text(report.timedOut) + ", \"status\": " + status + ", \"active_processes\": " + active +
+        ", \"termination_requested\": " + Text(report.terminationRequested) + ", \"cleanup_errors\": " + quotedList(report.cleanupErrors) +
+        ", \"closed\": " + Text(report.closed) + ", \"exception\": " + nullable(report.exception) + "}"
+}
+function commandJson(row: CommandRow): Text {
+    let status = "null"
+    if row.hasStatus { status = Text(row.status) }
+    let cleanup = "{\"action\": " + evidence.quote(row.cleanup.action) + ", \"status\": " + evidence.quote(row.cleanup.status)
+    if row.cleanup.ownedPid != 0 { cleanup = cleanup + ", \"owned_pid\": " + Text(row.cleanup.ownedPid) }
+    if row.cleanup.errors.length > 0 { cleanup = cleanup + ", \"errors\": " + errorRows(row.cleanup.errors) }
+    let parts = ["{\"argv\": " + quotedList(row.argv), "\"cwd\": " + evidence.quote(row.cwd), "\"label\": " + evidence.quote(row.label),
+        "\"timeout_seconds\": " + seconds(row.timeout), "\"timed_out\": " + Text(row.timedOut), "\"status\": " + status,
+        "\"executable\": " + nullable(row.executable), "\"executable_sha256\": " + nullable(row.executableSha256), "\"cleanup\": " + cleanup + "}",
+        "\"pid\": " + Text(row.pid), "\"start_new_session\": " + Text(row.startNewSession), "\"owner\": " + jobJson(row.owner)]
+    if row.exception != "" { parts.add("\"exception\": " + evidence.quote(row.exception)) }
+    parts.add("\"elapsed_seconds\": " + Text(row.elapsed))
+    if row.stdoutPath != "" {
+        parts.add("\"stdout_path\": " + evidence.quote(row.stdoutPath))
+        parts.add("\"stdout_sha256\": " + evidence.quote(row.stdoutSha256))
+        parts.add("\"stdout_bytes\": " + Text(row.stdoutBytes))
+    }
+    if row.stderrPath != "" {
+        parts.add("\"stderr_path\": " + evidence.quote(row.stderrPath))
+        parts.add("\"stderr_sha256\": " + evidence.quote(row.stderrSha256))
+        parts.add("\"stderr_bytes\": " + Text(row.stderrBytes))
+    }
+    return joinTextWith(parts, ", ") + "}"
+}
+function rendered(items: List<Text>): Text {
+    if items.length == 0 { return "[]" }
+    return "[\n    " + joinTextWith(items, ",\n    ") + "\n  ]"
+}
+public function reportJson(report: Report): Text {
+    let inputs: List<Text> = []
+    for row in report.inputs {
+        let entry = evidence.quote(row.name) + ": {\"before_sha256\": " + evidence.quote(row.before) + ", \"retained_path\": " +
+            evidence.quote(row.retainedPath) + ", \"retained_sha256\": " + evidence.quote(row.retained) + ", \"after_sha256\": " + evidence.quote(row.after)
+        if row.finalSha != "" { entry = entry + ", \"final_sha256\": " + evidence.quote(row.finalSha) }
+        inputs.add(entry + "}")
+    }
+    let cases: List<Text> = []
+    for row in report.cases {
+        cases.add("{\"case\": " + evidence.quote(row.name) + ", \"fixture\": " + evidence.quote(row.fixture) + ", \"argv\": " + quotedList(row.argv) +
+            ", \"status\": " + Text(row.status) + ", \"command_index\": " + Text(row.commandIndex) + ", \"stdout\": " + evidence.quote(row.stdout) +
+            ", \"stderr\": " + evidence.quote(row.stderr) + ", \"binary_sha256\": " + evidence.quote(row.binary) + "}")
+    }
+    let compiles: List<Text> = []
+    for row in report.compile {
+        compiles.add("{\"argv\": " + quotedList(row.argv) + ", \"status\": " + Text(row.status) + ", \"stdout\": " + evidence.quote(row.stdout) +
+            ", \"stderr\": " + evidence.quote(row.stderr) + ", \"source_sha256\": " + evidence.quote(row.source) + ", \"command_index\": " + Text(row.commandIndex) + "}")
+    }
+    let commands: List<Text> = []
+    for row in report.commands { commands.add(commandJson(row)) }
+    let errors: List<Text> = []
+    for row in report.finalizationErrors { errors.add(errorJson(row)) }
+    let fileRows: List<Text> = []
+    for row in report.hashedFiles { fileRows.add(evidence.quote(row.name) + ": {\"sha256\": " + evidence.quote(row.sha256) + ", \"bytes\": " + Text(row.bytes) + "}") }
+    let parts = ["{\n  \"passed\": " + Text(report.passed), "  \"scope\": " + evidence.quote(report.scope),
+        "  \"inputs\": {" + joinTextWith(inputs, ", ") + "}", "  \"cases\": " + rendered(cases), "  \"compile\": " + rendered(compiles),
+        "  \"commands\": " + rendered(commands), "  \"finalization_errors\": " + rendered(errors), "  \"unhashed_files\": " + quotedList(report.unhashedFiles)]
+    if report.hasCompiler {
+        let compiler = "  \"compiler\": {\"path\": " + evidence.quote(report.compiler.path) + ", \"before_sha256\": " + evidence.quote(report.compiler.before) +
+            ", \"version_stdout_path\": " + evidence.quote(report.compiler.versionStdout) + ", \"version_stderr_path\": " + evidence.quote(report.compiler.versionStderr)
+        if report.compiler.after != "" { compiler = compiler + ", \"after_sha256\": " + evidence.quote(report.compiler.after) }
+        parts.add(compiler + "}")
+    }
+    parts.add("  \"files\": {" + joinTextWith(fileRows, ", ") + "}")
+    if report.exception != "" { parts.add("  \"exception\": " + evidence.quote(report.exception)) }
+    return joinTextWith(parts, ",\n") + "\n}"
+}
+
+function inventory(directory: Text, relative: Text, names: List<Text>): Failure {
+    let entries = files.list(directory)
+    let error = files.lastError()
+    if error != 0 { return osError(error, directory) }
+    for name in entries {
+        let item = name
+        if relative != "" { item = relative + "/" + name }
+        names.add(item)
+        if kindNative(directory + "/" + name) == 2 {
+            let nested = inventory(directory + "/" + name, item, names)
+            if failed(nested) { return nested }
+        }
+    }
+    return none()
+}
+function baseName(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return Text(raw.slice(index + 1, raw.length))
+}
+public function finalize(directory: Text, report: Report, primary: Failure, output: Writer): Failure {
+    let failure = none()
+    let names: List<Text> = []
+    let listed = inventory(directory, "", names)
+    if failed(listed) {
+        names = []
+        secondary(report, primary, "file-inventory", listed)
+        failure = listed
+    }
+    names.sort()
+    for name in names {
+        let path = directory + "/" + name
+        if kindNative(path) != 1 || baseName(name) == "manifest.json" { continue }
+        let data = files.readFile(path)
+        let error = files.lastError()
+        if error != 0 {
+            report.unhashedFiles.add(name)
+            let problem = osError(error, path)
+            secondary(report, primary, "file-retention:" + name, problem)
+            if !failed(failure) { failure = problem }
+            continue
+        }
+        let row = FileRow { name: name; sha256: digestBytes(data); bytes: data.length }
+        let replacedRow = false
+        for index in 0..report.hashedFiles.length {
+            if report.hashedFiles[index].name == name { report.hashedFiles[index] = row; replacedRow = true }
+        }
+        if !replacedRow { report.hashedFiles.add(row) }
+    }
+    let pending = directory + "/manifest.json.tmp"
+    let write = output.write
+    let stored = write(pending, Bytes(reportJson(report) + "\n"))
+    if !failed(stored) {
+        let rename = output.rename
+        stored = rename(pending, directory + "/manifest.json")
+    }
+    if failed(stored) {
+        secondary(report, primary, "manifest-retention", stored)
+        if !failed(failure) { failure = stored }
+    }
+    if !failed(primary) && failed(failure) { return failure }
+    return none()
+}
+
+public function sections(source: Text): Sections {
+    let helperStart = find(source, "static double wall_seconds(void) {")
+    let helperEnd = find(source, "static void sleep_ms(")
+    let windowStart = find(source, START)
+    let windowEnd = find(source, END)
+    if helperStart < 0 || helperEnd < 0 || windowStart < 0 || windowEnd < 0 {
+        return Sections { helpers: ""; window: ""; failure: raised("ValueError", "substring not found") }
+    }
+    return Sections { helpers: cut(source, helperStart, helperEnd); window: cut(source, windowStart, windowEnd); failure: none() }
+}
+function contractFailure(message: Text): Sections {
+    return Sections { helpers: ""; window: ""; failure: raised("AssertionError", message) }
+}
+public function contract(baseline: Text, current: Text): Sections {
+    let historical = files.readFile(BASELINE)
+    if files.lastError() != 0 { return Sections { helpers: ""; window: ""; failure: osError(files.lastError(), BASELINE) } }
+    if digestBytes(historical) != BASELINE_SHA256 { return contractFailure("historical fixture digest changed") }
+    let old = sections(baseline)
+    if failed(old.failure) { return old }
+    let now = sections(current)
+    if failed(now.failure) { return now }
+    if has(old.window, PREFIX) { return contractFailure("historical window already logs idle evidence") }
+    if !has(now.window, PREFIX) { return contractFailure("idle failure must retain its timed evidence") }
+    if occurrences(old.window, LOOP) != 1 || occurrences(now.window, LOOP) != 1 { return contractFailure("timed loop changed") }
+    for token in ["GetProcessTimes(", "GetCurrentProcess(", "GetTickCount64("] {
+        if occurrences(old.helpers, token) != 1 || occurrences(now.helpers, token) != 1 { return contractFailure("helper API count changed: " + token) }
+    }
+    if occurrences(old.window, "cpu_seconds()") != 2 || occurrences(now.window, "cpu_seconds()") != 2 { return contractFailure("cpu_seconds() endpoints changed") }
+    if occurrences(old.window, "wall_seconds()") != 3 || occurrences(now.window, "wall_seconds()") != 3 { return contractFailure("wall_seconds() calls changed") }
+    if occurrences(now.window, "assert(waits > 0);") != 1 { return contractFailure("waits assertion changed") }
+    if occurrences(now.window, "assert(idle_cpu <= 0.02);") != 1 { return contractFailure("idle gate changed") }
+    let prefix = find(now.window, PREFIX)
+    let waits = find(now.window, "assert(waits > 0);")
+    let idleGate = find(now.window, "assert(idle_cpu <= 0.02);")
+    let ending = find(now.window, "cpu_end = cpu_seconds()")
+    if !(prefix < waits) || !(prefix < idleGate) { return contractFailure("idle evidence must precede both assertions") }
+    if ending < 0 || !(ending < prefix) { return contractFailure("idle evidence must follow the CPU endpoint") }
+    let helperStart = "static double wall_seconds(void) {"
+    let sleepStart = "static void sleep_ms("
+    let baseHelper = find(baseline, helperStart)
+    let nowHelper = find(current, helperStart)
+    let baseSleep = find(baseline, sleepStart)
+    let nowSleep = find(current, sleepStart)
+    let baseWindow = find(baseline, START)
+    let nowWindow = find(current, START)
+    let baseEnd = find(baseline, END)
+    let nowEnd = find(current, END)
+    if cut(baseline, 0, baseHelper) != cut(current, 0, nowHelper) { return contractFailure("prelude changed") }
+    if cut(baseline, baseSleep, baseWindow) != cut(current, nowSleep, nowWindow) { return contractFailure("sleep and setup changed") }
+    if cut(baseline, baseEnd, Bytes(baseline).length) != cut(current, nowEnd, Bytes(current).length) { return contractFailure("cleanup and output changed") }
+    let cpuHelper = find(old.helpers, "static double cpu_seconds(void) {")
+    if cpuHelper < 0 { return Sections { helpers: ""; window: ""; failure: raised("ValueError", "substring not found") } }
+    if !has(now.helpers, cut(old.helpers, 0, cpuHelper)) { return contractFailure("wall clock helper changed") }
+    return now
+}
+
+function field(name: Text, value: Integer): Field { return Field { name: name; whole: true; integer: value; real: 0.0 } }
+function real(name: Text, value: Float): Field { return Field { name: name; whole: false; integer: 0; real: value } }
+public function expectedDelta(values: List<Integer>): Float {
+    return Float(values[1] + values[3]) / 10000000.0 - Float(values[0] + values[2]) / 10000000.0
+}
+public function expectedIdle(values: List<Integer>): Float {
+    let wallEnd = Float(1000 + values[4]) / 1000.0
+    return expectedDelta(values) / (wallEnd - 1.0)
+}
+function expected(values: List<Integer>): List<Field> {
+    let cpuStart = Float(values[0] + values[2]) / 10000000.0
+    let cpuEnd = Float(values[1] + values[3]) / 10000000.0
+    let wallStart = 1.0
+    let wallEnd = Float(1000 + values[4]) / 1000.0
+    let elapsed = wallEnd - wallStart
+    let delta = cpuEnd - cpuStart
+    return [field("calls", 2), field("kernel_begin", values[0]), field("kernel_end", values[1]), field("user_begin", values[2]),
+        field("user_end", values[3]), real("cpu_start", cpuStart), real("cpu_end", cpuEnd), real("cpu_delta", delta),
+        real("wall_start", wallStart), real("wall_end", wallEnd), real("elapsed", elapsed), real("idle_cpu", delta / elapsed)]
+}
+function parseWhole(text: Text): Counted {
+    let raw = Bytes(text)
+    let index = 0
+    let negative = false
+    if raw.length > 0 && (raw[0] == 45 || raw[0] == 43) { negative = raw[0] == 45; index = 1 }
+    if index >= raw.length { return Counted { value: 0; failure: raised("ValueError", "invalid literal for int(): " + text) } }
+    let value = 0
+    while index < raw.length {
+        if raw[index] < 48 || raw[index] > 57 { return Counted { value: 0; failure: raised("ValueError", "invalid literal for int(): " + text) } }
+        value = value * 10 + raw[index] - 48
+        index += 1
+    }
+    if negative { value = -value }
+    return Counted { value: value; failure: none() }
+}
+function lowerName(byte: Integer): Boolean { return (byte >= 97 && byte <= 122) || byte == 95 }
+function evidenceFields(line: Text): List<Probe> {
+    let found: List<Probe> = []
+    let raw = Bytes(line)
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 61 && index > 0 && lowerName(raw[index - 1]) {
+            let start = index
+            while start > 0 && lowerName(raw[start - 1]) { start -= 1 }
+            let stop = index + 1
+            while stop < raw.length && raw[stop] > 32 { stop += 1 }
+            if stop > index + 1 {
+                let entry = Probe { name: Text(raw.slice(start, index)); value: Text(raw.slice(index + 1, stop)) }
+                let replacedEntry = false
+                for position in 0..found.length {
+                    if found[position].name == entry.name { found[position] = entry; replacedEntry = true }
+                }
+                if !replacedEntry { found.add(entry) }
+                index = stop
+                continue
+            }
+        }
+        index += 1
+    }
+    return found
+}
+function assertion(message: Text): Failure { return raised("AssertionError", message) }
+function caseDetail(name: Text, label: Text, result: CommandResult): Text {
+    return "(" + name + ", " + label + ", status " + Text(result.status) + ", stdout " + evidence.quote(decoded(result.stdout)) + ", stderr " + evidence.quote(decoded(result.stderr)) + ")"
+}
+function checkCase(name: Text, values: List<Integer>, binaries: List<Text>, owner: CommandRecords, report: Report): Failure {
+    let want = expected(values)
+    let failing = !(want[11].real <= 0.02)
+    let labels = ["before", "after"]
+    let results: List<CommandResult> = []
+    for index in 0..2 {
+        let label = labels[index]
+        let binary = binaries[index]
+        let argv = [binary]
+        for value in values { argv.add(Text(value)) }
+        let raw = runCommand(owner, argv, 10.0, name + "-" + label)
+        if failed(raw.failure) { return raw.failure }
+        let stdout = decoded(raw.stdout)
+        let stderr = decoded(raw.stderr)
+        results.add(raw)
+        report.cases.add(CaseRow { name: name; fixture: label; argv: argv; status: raw.status; commandIndex: report.commands.length - 1;
+            stdout: stdout; stderr: stderr; binary: fileDigest(binary) })
+        let status = 0
+        if failing { status = 42 }
+        if raw.status != status { return assertion(caseDetail(name, label, raw)) }
+        if failing {
+            if stdout != "" { return assertion("failing control wrote standard output " + caseDetail(name, label, raw)) }
+            if !ends(stderr, "MOCK_ASSERT idle_cpu <= 0.02\nMOCK_CALLS " + CALLS + "\n") { return assertion("failing control assertion " + caseDetail(name, label, raw)) }
+        } else {
+            if stdout != "MOCK_CALLS " + CALLS + "\n" { return assertion("passing control output " + caseDetail(name, label, raw)) }
+            if stderr != "" { return assertion("passing control diagnostics " + caseDetail(name, label, raw)) }
+        }
+    }
+    let before = results[0]
+    let after = results[1]
+    if before.status != after.status { return assertion("before and after disagree on " + name) }
+    if !failing {
+        if decoded(before.stdout) != decoded(after.stdout) || decoded(before.stderr) != decoded(after.stderr) { return assertion("passing outputs changed on " + name) }
+        return none()
+    }
+    if has(decoded(before.stderr), PREFIX) { return assertion("historical fixture logged idle evidence on " + name) }
+    let lines = splitLines(decoded(after.stderr))
+    if lines.length != 3 || !starts(lines[0], PREFIX) { return assertion("idle evidence line missing on " + name + ": " + decoded(after.stderr)) }
+    let actual = evidenceFields(lines[0])
+    let names: List<Text> = []
+    for entry in actual { names.add(entry.name) }
+    names.sort()
+    let wanted: List<Text> = []
+    for entry in want { wanted.add(entry.name) }
+    wanted.sort()
+    if joinTextWith(names, ",") != joinTextWith(wanted, ",") { return assertion("(" + name + ", " + joinTextWith(names, ",") + ")") }
+    for entry in want {
+        let text = ""
+        for item in actual { if item.name == entry.name { text = item.value } }
+        if entry.whole {
+            let parsed = parseWhole(text)
+            if failed(parsed.failure) { return parsed.failure }
+            if parsed.value != entry.integer { return assertion("(" + name + ", " + entry.name + ", " + text + ", " + Text(entry.integer) + ")") }
+        } else if !(parseFloatNative(text) == entry.real) {
+            return assertion("(" + name + ", " + entry.name + ", " + text + ", " + Text(entry.real) + ")")
+        }
+    }
+    return none()
+}
+public function idleControls(): List<Probe> {
+    return [Probe { name: "zero"; value: "2000000 2000000 3000000 3000000 1000" },
+        Probe { name: "exact-boundary"; value: "0 200000 0 0 1000" },
+        Probe { name: "kernel-failure"; value: "2000000 2300000 3000000 3000000 1000" },
+        Probe { name: "user-failure"; value: "2000000 2000000 3000000 3400000 1000" },
+        Probe { name: "high-word-carry"; value: Text((1 << 32) - 150000) + " " + Text((1 << 32) + 150000) + " " + Text((2 << 32) + 10001) + " " + Text((2 << 32) + 10001) + " 1000" },
+        Probe { name: "wall-overshoot"; value: "2000000 2300000 3000000 3000000 1250" },
+        Probe { name: "double-boundary"; value: "10000000000000000 10000000000200000 0 0 1000" },
+        Probe { name: "double-failure"; value: "10000000000000000 10000000000300000 0 0 1000" }]
+}
+public function caseValues(probe: Probe): List<Integer> {
+    let values: List<Integer> = []
+    for word in splitWords(probe.value) { values.add(parseWhole(word).value) }
+    return values
+}
+function splitWords(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 32 {
+            if start < index { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+function setting(name: Text, fallback: Text): Text {
+    let value = system.getenv(name)
+    if value == "" && system.lastError() != 0 { return fallback }
+    return value
+}
+public function observedInputs(): List<Text> {
+    return [BASELINE, FIXTURE, "tests/cycle-progress-observability.min", "tests/cycle-progress-observability-native.c",
+        "tests/evidence-support.min", "tests/evidence-support-native.c"]
+}
+function gate(directory: Text, report: Report, hooks: Hooks): Failure {
+    for name in observedInputs() {
+        let raw = files.readFile(name)
+        if files.lastError() != 0 { return osError(files.lastError(), name) }
+        let before = digestBytes(raw)
+        let retained = directory + "/inputs/" + name
+        let made = makeDirectories(parentOf(retained))
+        if failed(made) { return made }
+        let stored = writeChecked(retained, raw)
+        if failed(stored) { return stored }
+        let copySha = fileDigest(retained)
+        let after = fileDigest(name)
+        report.inputs.add(InputRow { name: name; before: before; retainedPath: "inputs/" + name; retained: copySha; after: after; finalSha: "" })
+        if before != copySha || before != after { return raised("ValueError", "Idle observability input changed while copying: " + name) }
+    }
+    let baseline = Text(files.readFile(BASELINE))
+    let current = Text(files.readFile(FIXTURE))
+    let contractCall = hooks.contract
+    let contracted = contractCall(baseline, current)
+    if failed(contracted.failure) { return contracted.failure }
+    let owner = commandRecords(directory, report, hooks.launcher)
+    let compiler = setting("MINYAR_TEST_CLANG", "clang")
+    let version = runCommand(owner, [compiler, "--version"], 10.0, "compiler-version")
+    if failed(version.failure) { return version.failure }
+    if version.status != 0 { return raised("RuntimeError", "Idle mock compiler version probe failed") }
+    let probe = report.commands[report.commands.length - 1]
+    report.compiler = CompilerRow { path: probe.executable; before: probe.executableSha256; versionStdout: probe.stdoutPath;
+        versionStderr: probe.stderrPath; after: "" }
+    report.hasCompiler = true
+    let binaries: List<Text> = []
+    for label in ["before", "after"] {
+        let parts = contracted
+        if label == "before" { parts = sections(baseline) }
+        if failed(parts.failure) { return parts.failure }
+        let source = directory + "/" + label + "-mock.c"
+        let written = writeChecked(source, Bytes(MOCK + parts.helpers + replaced(MAIN, "__WINDOW__", parts.window)))
+        if failed(written) { return written }
+        let binary = directory + "/" + label + "-mock"
+        let argv = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", source, "-o", binary]
+        let result = runCommand(owner, argv, 30.0, label + "-compile")
+        if failed(result.failure) { return result.failure }
+        report.compile.add(CompileRow { argv: argv; status: result.status; stdout: decoded(result.stdout); stderr: decoded(result.stderr);
+            source: fileDigest(source); commandIndex: report.commands.length - 1 })
+        if result.status != 0 { return assertion(decoded(result.stderr)) }
+        binaries.add(binary)
+    }
+    let controls = idleControls()
+    if expectedDelta(caseValues(controls[6])) == Float(200000) / 10000000.0 { return assertion("double-boundary must keep the double-subtraction oracle") }
+    if expectedDelta(caseValues(controls[7])) == Float(300000) / 10000000.0 { return assertion("double-failure must keep the double-subtraction oracle") }
+    for control in controls {
+        let checked = checkCase(control.name, caseValues(control), binaries, owner, report)
+        if failed(checked) { return checked }
+    }
+    for row in report.inputs {
+        row.finalSha = fileDigest(row.name)
+        if row.finalSha != row.before { return raised("ValueError", "Idle observability input changed during execution: " + row.name) }
+    }
+    report.compiler.after = fileDigest(report.compiler.path)
+    if report.compiler.after != report.compiler.before { return raised("ValueError", "Idle mock compiler changed during execution") }
+    if report.finalizationErrors.length > 0 { return raised("RuntimeError", "Idle observability raw evidence retention failed") }
+    report.passed = true
+    print("idle observability: " + Text(controls.length) + " mocked controls passed; no performance claim")
+    return none()
+}
+public function defaultHooks(): Hooks {
+    return Hooks {
+        contract: function(baseline: Text, current: Text): Sections { return contract(baseline, current) }
+        launcher: ownedLauncher(newKernel())
+        writer: writer()
+    }
+}
+public function run(arguments: List<Text>, hooks: Hooks): Failure {
+    let target = "build/cycle-progress-observability"
+    let index = 0
+    while index < arguments.length {
+        let option = arguments[index]
+        if option == "--evidence" && index + 1 < arguments.length && arguments[index + 1] != "" {
+            target = arguments[index + 1]
+            index += 2
+        } else if starts(option, "--evidence=") && Bytes(option).length > 11 {
+            target = cut(option, 11, Bytes(option).length)
+            index += 1
+        } else {
+            return raised("SystemExit", "usage: cycle-progress-observability [--evidence EVIDENCE]; unrecognized or incomplete argument: " + option)
+        }
+    }
+    let directory = evidence.resolve(target)
+    if kindNative(directory) >= 0 { return raised("ValueError", "Idle observability evidence must be a fresh directory") }
+    let made = makeDirectories(directory)
+    if failed(made) { return made }
+    let report = newReport()
+    let primary = gate(directory, report, hooks)
+    if failed(primary) { report.exception = describe(primary) }
+    let finalized = finalize(directory, report, primary, hooks.writer)
+    if failed(primary) { return primary }
+    return finalized
+}
+function main(): Integer {
+    let arguments: List<Text> = []
+    for index in 0..argumentCount() { arguments.add(argument(index)) }
+    let outcome = run(arguments, defaultHooks())
+    if !failed(outcome) { return 0 }
+    system.writeStandardError(describe(outcome) + "\n")
+    for note in outcome.notes { system.writeStandardError(note + "\n") }
+    if outcome.kind == "SystemExit" { return 2 }
+    return 1
+}

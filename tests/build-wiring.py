@@ -412,11 +412,9 @@ class BuildWiring(unittest.TestCase):
         aggregates = {'check', 'check-portable', 'check-sanitize',
                       'check-managed-graphs-profiles', 'check-cycle-progress',
                       'check-cycle-progress-sanitize'}
-        inputs = {'tests/cycle-progress-observability.py',
-                  'tests/cycle-progress-observability-harness.py', 'tests/cycle-progress.c',
-                  'tests/fixtures/cycle-progress-before-observability.c.txt',
-                  'tests/clang_helpers.py', 'tests/test_evidence.py',
-                  'tests/windows_job_owner.py', 'tools/host_paths.py'}
+        inputs = {'build/tooling/tests/cycle-progress-observability',
+                  'build/tooling/tests/cycle-progress-observability-harness', 'tests/cycle-progress.c',
+                  'tests/fixtures/cycle-progress-before-observability.c.txt'}
         source = (ROOT/'build-support/managed-graphs.mk').read_text()
         marker = '# Mocked idle observability preserves the historical metric.'
         self.assertIn(marker, source)
@@ -445,10 +443,10 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn(target, rules.get(aggregate, set()), aggregate)
                 self.assertTrue(inputs <= rules.get(target, set()))
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('python3 tests/cycle-progress-observability.py'), 1)
-                self.assertEqual(commands.count('python3 tests/cycle-progress-observability-harness.py'), 1)
+                self.assertEqual(commands.count('./build/tooling/tests/cycle-progress-observability --evidence'), 1)
+                self.assertEqual(commands.count('./build/tooling/tests/cycle-progress-observability-harness'), 1)
                 self.assertIn('MINYAR_TEST_CLANG="retained-clang"', commands)
-                self.assertIn('retained-limited python3', commands)
+                self.assertIn('retained-limited ./build/tooling/tests/cycle-progress-observability', commands)
                 self.assertIn('--evidence "$evidence/run"', commands)
                 self.assertIn((ROOT/'build/cycle-progress-observability.').as_posix(),
                               commands.replace('\\', '/'))
@@ -476,8 +474,8 @@ class BuildWiring(unittest.TestCase):
                 ('relative evidence', '$(abspath build)/cycle-progress-observability.',
                  'build/cycle-progress-observability.'),
                 ('filtered controls', '--evidence', '--case zero --evidence'),
-                ('runtime replay', 'python3 tests/cycle-progress-observability.py',
-                 'python3 tests/cycle-progress.py')):
+                ('runtime replay', './build/tooling/tests/cycle-progress-observability --evidence',
+                 './build/tooling/tests/cycle-progress --evidence')):
             mutant = fragment.replace(old, new, 1)
             self.assertNotEqual(fragment, mutant)
             with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
@@ -494,13 +492,13 @@ class BuildWiring(unittest.TestCase):
                 catalogue.validate(dict(data, sources=[row for row in data['sources']
                                                        if row['path'] != name]), ROOT)
         row = next(row for row in data['sources']
-                   if row['path'] == 'tests/cycle-progress-observability.py')
-        self.assertEqual(row['role'], 'suite')
+                   if row['path'] == 'tests/cycle-progress-observability-native.c')
+        self.assertEqual(row['role'], 'support')
         self.assertIn('build-support/managed-graphs.mk', row['consumers'])
         historical = next(row for row in data['sources']
                           if row['path'] == 'tests/fixtures/cycle-progress-before-observability.c.txt')
         self.assertEqual(historical['role'], 'fixture')
-        self.assertEqual(historical['consumers'], ['tests/cycle-progress-observability.py'])
+        self.assertEqual(historical['consumers'], ['tests/cycle-progress-observability.min'])
 
 
     def test_quic_ledger_requires_full_offline_controls(self):

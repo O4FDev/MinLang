@@ -163,10 +163,17 @@ check-sanitize: check-cycle-private-retirement-sanitize
 # Mocked idle observability preserves the historical metric.
 # This deterministic API contract does not replay a Windows idle failure.
 .PHONY: check-cycle-progress-observability
-check-cycle-progress-observability: tests/cycle-progress-observability.py tests/cycle-progress-observability-harness.py tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt tests/clang_helpers.py tests/test_evidence.py tests/windows_job_owner.py tools/host_paths.py | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability-harness.py
+IDLE_OBSERVABILITY_TOOLS = build/tooling/tests/cycle-progress-observability build/tooling/tests/cycle-progress-observability-harness
+build/tooling/tests/cycle-progress-observability.ll: tests/evidence-support.min
+build/tooling/tests/cycle-progress-observability-harness.ll: tests/cycle-progress-observability.min tests/evidence-support.min
+$(IDLE_OBSERVABILITY_TOOLS): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(IDLE_OBSERVABILITY_TOOLS): TOOL_NATIVE = tests/cycle-progress-observability-native.c tests/evidence-support-native.c runtime/native/sha256.c
+$(IDLE_OBSERVABILITY_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
+$(IDLE_OBSERVABILITY_TOOLS): build/testing/cycle-runtime.o tests/cycle-progress-observability-native.c tests/evidence-support-native.c runtime/native/sha256.c
+check-cycle-progress-observability: build/tooling/tests/cycle-progress-observability build/tooling/tests/cycle-progress-observability-harness tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-progress-observability-harness
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability.py --evidence "$$evidence/run"
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-progress-observability --evidence "$$evidence/run"
 check check-cycle-progress check-cycle-progress-sanitize check-managed-graphs-profiles check-portable check-sanitize: check-cycle-progress-observability
 
 # Leaf churn uses the existing rooted-graph driver and its complete C schedule.
