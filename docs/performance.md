@@ -84,8 +84,9 @@ broader borrow and last-use inference remains a measured optimization target.
 ```sh
 make check-module-performance
 make check-incremental-module-performance
-python3 tests/incremental-module-performance.py --link --sizes 400 --shapes wide
-python3 tests/incremental-module-memory.py
+make build/tooling/tests/incremental-module-performance build/tooling/tests/incremental-module-memory
+./build/tooling/tests/incremental-module-performance --link --sizes 400 --shapes wide
+./build/tooling/tests/incremental-module-memory
 ```
 
 The ordinary module benchmark measures fresh frontend processes for chains,

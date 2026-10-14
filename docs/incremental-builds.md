@@ -98,8 +98,9 @@ files concurrently with a build when requiring a coherent source snapshot.
 make check-incremental-modules
 make check-incremental-modules-sanitize
 make check-incremental-module-performance
-python3 tests/incremental-module-performance.py --link --sizes 400 --shapes wide
-python3 tests/incremental-module-memory.py
+make build/tooling/tests/incremental-module-performance build/tooling/tests/incremental-module-memory
+./build/tooling/tests/incremental-module-performance --link --sizes 400 --shapes wide
+./build/tooling/tests/incremental-module-memory
 ```
 
 The normal `make check` includes incremental correctness and frontend performance
