@@ -165,8 +165,10 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
         linker = self.clang.parent / 'ld.lld'
         self.write_executable(linker, 'print("LLD 23.1.2")\n')
         environment = self.bootstrap_environment()
-        self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']),
-                         ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
+        flags = shlex.split(environment['COMPILER_LTO_FLAGS'])
+        self.assertTrue(len(flags) == 3 and flags[1].startswith('-fuse-ld='), flags)
+        flags[1] = '-fuse-ld=' + str(Path(flags[1].removeprefix('-fuse-ld=')).resolve())
+        self.assertEqual(flags, ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
         self.assertEqual(environment['LIMITED'], self.env['LIMITED'])
 
     def test_linux_bootstrap_rejects_old_or_missing_matching_linker(self):
