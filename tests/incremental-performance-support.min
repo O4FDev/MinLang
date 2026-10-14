@@ -1,16 +1,11 @@
 use "../tools/testing.min" as test
 use "./performance-support.min" as metrics
 use "../experiments/memory/study-support.min" as data
-use "system" as system
 use "files" as files
 use "json" as json
-use "eventloop" as loop
-use "errors" as errors
-function duplicate(descriptor: Integer): Integer { native "performanceresources" }
-function duplicateTo(descriptor: Integer, target: Integer): Integer { native "performanceresources" }
-public record Options { sizes: List<Integer>; shapes: List<Text>; repeats: Integer; compiler: Text; output: Text; clang: Text; link: Boolean; enforce: Boolean; prepare: Boolean; prepared: Text; functional: Boolean; cpuAvailable: Boolean; inflated: Boolean }
-public function options(root: Text): Options {
-    let result = Options { sizes: [100, 400]; shapes: ["chain", "wide", "shared"]; repeats: 5; compiler: root + "/build/minyarc-modules"; output: root + "/build/incremental-module-performance.json"; clang: test.setting("MINYAR_TEST_CLANG", "/usr/lib/llvm-23/bin/clang"); link: false; enforce: false; prepare: false; prepared: ""; functional: false; cpuAvailable: true; inflated: false }
+public record Options { sizes: List<Integer>; shapes: List<Text>; repeats: Integer; compiler: Text; output: Text; clang: Text; link: Boolean; enforce: Boolean; prepare: Boolean; prepared: Text; functional: Boolean; cpuAvailable: Boolean; inflated: Boolean; darwin: Boolean }
+public function options(root: Text, darwin: Boolean): Options {
+    let result = Options { sizes: [100, 400]; shapes: ["chain", "wide", "shared"]; repeats: 5; compiler: root + "/build/minyarc-modules"; output: root + "/build/incremental-module-performance.json"; clang: test.setting("MINYAR_TEST_CLANG", test.setting("LLVM_CC", "clang")); link: false; enforce: false; prepare: false; prepared: ""; functional: false; cpuAvailable: true; inflated: false; darwin: darwin }
     let index = 0
     while index < argumentCount() {
         let option = argument(index)
@@ -51,63 +46,41 @@ public function options(root: Text): Options {
     for count in result.sizes { test.check(count > 0, "positive sizes and repeats required") }
     for shape in result.shapes { test.check(shape == "chain" || shape == "wide" || shape == "shared", "invalid graph shape") }
     let phases = 0; if result.prepare { phases += 1 }; if result.prepared != "" { phases += 1 }; if result.functional { phases += 1 }
-    test.check(phases == 1, "use --prepare-only on minyar-linux, --run-prepared on quiet exclusive minyar-bench-2, or --functional")
+    test.check(phases <= 1, "incremental performance phase must be singular")
     return result
 }
-public function generate(directory: Text, shape: Text, count: Integer): Text {
-    test.check(files.makeDirectory(directory) == 0, "graph directory")
-    let values: List<Integer> = []
-    for index in 0..count {
-        let dependencies: List<Integer> = []
-        if shape == "chain" { if index > 0 { dependencies.add(index - 1) } }
-        else if shape == "shared" { let start = index - 2; if start < 0 { start = 0 }; for dependency in start..index { dependencies.add(dependency) } }
-        let pieces: List<Text> = []; let expressions: List<Text> = []; let total = 0
-        for dependency in dependencies { pieces.add("use \"./m" + Text(dependency) + ".min\" as d" + Text(dependency) + "\n"); expressions.add("d" + Text(dependency) + ".value()"); total += values[dependency] }
-        for functionIndex in 0..4 {
-            pieces.add("function helper" + Text(functionIndex) + "(input: Integer): Integer {\n    let result = input\n")
-            for unused in 0..12 { pieces.add("    result = result + 1\n") }
-            pieces.add("    return result\n}\n")
-        }
-        let expression = "1"; if expressions.length > 0 { expression = metrics.joined(expressions, " + ") } else { total = 1 }
-        pieces.add("public function value(): Integer {\n    let result = (" + expression + ") % 1000\n")
-        for functionIndex in 0..4 { pieces.add("    result = helper" + Text(functionIndex) + "(result)\n") }
-        pieces.add("    return result\n}\n"); values.add(total % 1000 + 48)
-        writeTextFile(directory + "/m" + Text(index) + ".min", joinText(pieces))
-    }
-    let imports: List<Text> = []; let calls: List<Text> = []
-    for index in 0..count { if shape == "wide" || index == count - 1 { imports.add("use \"./m" + Text(index) + ".min\" as d" + Text(index) + "\n"); calls.add("d" + Text(index) + ".value()") } }
-    writeTextFile(directory + "/main.min", joinText(imports) + "function main() {\n    print(" + metrics.joined(calls, " + ") + ")\n}\n")
-    return directory + "/main.min"
-}
 public record Context { options: Options; root: Text; work: Text; report: json.Value; manifest: json.Value; serial: Integer; measuredCalls: Integer }
-function hash(path: Text, work: Text): Text { return json.string(metrics.fileIdentity(path, work + "/hash", false), "sha256") }
+function hash(options: Options, path: Text, work: Text): Text { return json.string(metrics.fileIdentity(path, work + "/hash", options.darwin), "sha256") }
 function copy(source: Text, target: Text, work: Text) { test.require(metrics.capture(["/bin/cp", "-p", source, target], work + "/copy"), "freeze measurement artifact") }
-function host(work: Text): Text { let result = metrics.capture(["/bin/hostname"], work + "/host"); test.require(result, "measurement host"); return test.lines(result.output)[0] }
 function save(context: Context) { files.makeDirectory(data.parent(context.options.output)); writeTextFile(context.options.output, json.pretty(context.report, "") + "\n") }
 function expect(context: Context, condition: Boolean, message: Text) {
     if !condition { data.set(context.report, "status", data.text("failed")); data.set(context.report, "error", data.text(message)); save(context); fail(message) }
 }
 function configuration(options: Options): json.Value { return data.object(["sizes", "shapes", "repeats", "link", "enforce", "clang"], [data.integerArray(options.sizes), data.strings(options.shapes), data.integer(options.repeats), data.boolean(options.link), data.boolean(options.enforce), data.text(options.clang)]) }
-public function prepare(options: Options, root: Text): Text {
-    let work = test.scratch()
-    test.check(host(work) == "seipnxmg.vm", "preparation requires minyar-linux")
+function freeze(options: Options, root: Text, work: Text): json.Value {
     let identities = data.object([], []); let labels = ["driver", "compiler", "production", "runtime.o"]
     let sources = [root + "/build/minyar-module-build", options.compiler, root + "/build/minyarc", root + "/build/minyar-runtime.o"]
     for index in 0..labels.length {
-        let digest = hash(sources[index], work); copy(sources[index], work + "/" + labels[index], work)
-        test.check(hash(work + "/" + labels[index], work) == digest, "same frozen compiler/runtime bytes")
+        let digest = hash(options, sources[index], work); copy(sources[index], work + "/" + labels[index], work)
+        test.check(hash(options, work + "/" + labels[index], work) == digest, "same frozen compiler/runtime bytes")
         data.set(identities, labels[index], data.text(digest))
     }
+    for shape in options.shapes { for count in options.sizes { metrics.generate(work + "/" + shape + "-" + Text(count), shape, count, 4, 12) } }
+    return identities
+}
+public function prepare(options: Options, root: Text): Text {
+    let work = test.scratch()
+    let identities = freeze(options, root, work)
+    options.clang = metrics.executable(options.clang, work + "/clang-path")
     let version = metrics.capture([options.clang, "--version"], work + "/clang-version"); test.require(version, "LLVM version")
     test.check(test.contains(version.output, "clang version 23.1.2"), "LLVM exactly23.1.2 required")
     let linker = "/usr/lib/llvm-23/bin/ld.lld"; let linkerVersion = metrics.capture([linker, "--version"], work + "/linker-version"); test.require(linkerVersion, "LLVM linker version")
     test.check(test.contains(linkerVersion.output, "LLD 23.1.2"), "matching LLVM linker required")
     let toolchain = json.parse(readTextFile(root + "/build/.toolchain.json"))
     test.check(json.string(toolchain, "llvm_version") == "23.1.2", "matched compiler toolchain")
-    for shape in options.shapes { for count in options.sizes { generate(work + "/" + shape + "-" + Text(count), shape, count) } }
     let sourceHashes = data.object([], [])
-    for shape in options.shapes { for count in options.sizes { let directory = shape + "-" + Text(count); for name in files.list(work + "/" + directory) { data.set(sourceHashes, directory + "/" + name, data.text(hash(work + "/" + directory + "/" + name, work))) } } }
-    let manifest = data.object(["config", "artifacts", "source_hashes", "clang_sha256", "clang_version", "linker_sha256", "linker_version", "toolchain", "environment", "workspace_source_sha256"], [configuration(options), identities, sourceHashes, data.text(hash(options.clang, work)), data.text(version.output), data.text(hash(linker, work)), data.text(linkerVersion.output), toolchain, metrics.configurationEnvironment(), data.text(hash(test.setting("MINYAR_TEST_COMPILER_SOURCE", root + "/build/compiler.min"), work))])
+    for shape in options.shapes { for count in options.sizes { let directory = shape + "-" + Text(count); for name in files.list(work + "/" + directory) { data.set(sourceHashes, directory + "/" + name, data.text(hash(options, work + "/" + directory + "/" + name, work))) } } }
+    let manifest = data.object(["config", "artifacts", "source_hashes", "clang_sha256", "clang_version", "linker_sha256", "linker_version", "toolchain", "environment", "workspace_source_sha256"], [configuration(options), identities, sourceHashes, data.text(hash(options, options.clang, work)), data.text(version.output), data.text(hash(options, linker, work)), data.text(linkerVersion.output), toolchain, metrics.configurationEnvironment(), data.text(hash(options, test.setting("MINYAR_TEST_COMPILER_SOURCE", root + "/build/compiler.min"), work))])
     writeTextFile(work + "/prepared.json", json.pretty(manifest, "") + "\n")
     print(work + "/prepared.json")
     return work
@@ -118,28 +91,32 @@ public function context(options: Options, root: Text): Context {
     if options.functional {
         work = test.scratch()
         for label in ["driver", "compiler", "production", "runtime.o"] { writeTextFile(work + "/" + label, label) }
-        for shape in options.shapes { for count in options.sizes { generate(work + "/" + shape + "-" + Text(count), shape, count) } }
+        for shape in options.shapes { for count in options.sizes { metrics.generate(work + "/" + shape + "-" + Text(count), shape, count, 4, 12) } }
+    } else if options.prepared == "" {
+        work = test.scratch()
+        manifest = data.object(["artifacts"], [freeze(options, root, work)])
+        options.clang = metrics.executable(options.clang, work + "/clang-path")
     } else {
         work = data.parent(options.prepared); manifest = json.parse(readTextFile(options.prepared))
-        test.check(host(work) == "5xnqjvps.vm", "measured builds require quiet exclusive minyar-bench-2")
         let frozen = json.member(manifest, "config")
         options.sizes = []; for value in json.member(frozen, "sizes").items { options.sizes.add(Integer(value.text)) }
         options.shapes = []; for value in json.member(frozen, "shapes").items { options.shapes.add(value.text) }
         options.repeats = data.number(frozen, "repeats"); options.link = json.member(frozen, "link").truth; options.enforce = json.member(frozen, "enforce").truth; options.clang = json.string(frozen, "clang")
         let identities = json.member(manifest, "artifacts")
-        for label in identities.keys { test.check(hash(work + "/" + label, work) == json.string(identities, label), "prepared artifact identity") }
+        for label in identities.keys { test.check(hash(options, work + "/" + label, work) == json.string(identities, label), "prepared artifact identity") }
         let sourceHashes = json.member(manifest, "source_hashes")
-        for source in sourceHashes.keys { test.check(hash(work + "/" + source, work) == json.string(sourceHashes, source), "prepared same graph source identity") }
-        test.check(hash(options.clang, work) == json.string(manifest, "clang_sha256") && hash("/usr/lib/llvm-23/bin/ld.lld", work) == json.string(manifest, "linker_sha256"), "prepared Clang/linker identities")
+        for source in sourceHashes.keys { test.check(hash(options, work + "/" + source, work) == json.string(sourceHashes, source), "prepared same graph source identity") }
+        test.check(hash(options, options.clang, work) == json.string(manifest, "clang_sha256") && hash(options, "/usr/lib/llvm-23/bin/ld.lld", work) == json.string(manifest, "linker_sha256"), "prepared Clang/linker identities")
         test.check(metrics.equal(metrics.configurationEnvironment(), json.member(manifest, "environment")), "prepared SDK identities")
     }
     let platform = metrics.capture(["/usr/bin/uname", "-a"], work + "/platform"); test.require(platform, "benchmark platform")
     let artifacts = data.object([], [])
-    for label in ["driver", "compiler", "production", "runtime"] { let filename = label; if label == "runtime" { filename = "runtime.o" }; data.set(artifacts, label, data.text(hash(work + "/" + filename, work))) }
+    for label in ["driver", "compiler", "production", "runtime"] { let filename = label; if label == "runtime" { filename = "runtime.o" }; data.set(artifacts, label, data.text(hash(options, work + "/" + filename, work))) }
     let clangVersion = data.text("controlled clang version\n")
-    if !options.functional { clangVersion = json.member(manifest, "clang_version") }
+    if options.prepared != "" { clangVersion = json.member(manifest, "clang_version") }
+    else if !options.functional { let version = metrics.capture([options.clang, "--version"], work + "/clang-version"); test.require(version, "Clang version"); clangVersion = data.text(version.output) }
     let report = data.object(["platform", "includes_native_link", "method", "rows", "artifacts", "metric_units", "missing_metric_policy", "clang"], [data.text(platform.output), data.boolean(options.link), data.text("Measure the complete native cache driver against direct production builds."), data.array([]), artifacts, data.object(["cpu_ms", "wall_ms"], [data.text("child user plus system CPU milliseconds"), data.text("elapsed milliseconds")]), data.text("An unavailable phase or sample makes its aggregate unavailable; no zero substitution."), clangVersion])
-    if !options.functional { data.set(report, "prepared_configuration", manifest) }
+    if options.prepared != "" { data.set(report, "prepared_configuration", manifest) }
     return Context { options: options; root: root; work: work; report: report; manifest: manifest; serial: 0; measuredCalls: 0 }
 }
 function fixtureCommand(context: Context, label: Text, command: List<Text>, count: Integer): test.Result {
@@ -155,39 +132,6 @@ function fixtureCommand(context: Context, label: Text, command: List<Text>, coun
     else { for index in 0..(command.length - 1) { if command[index] == "-o" { writeTextFile(command[index + 1], "functional linked artifact") } } }
     return test.Result { status: 0; output: ""; errorOutput: "" }
 }
-function actualTimed(context: Context, command: List<Text>, log: Text): metrics.Outcome {
-    let stdout = files.open(log, files.WRITE | files.CREATE | files.TRUNCATE); let stderr = files.open(log + ".err", files.WRITE | files.CREATE | files.TRUNCATE)
-    test.check(stdout >= 0 && stderr >= 0, "timed capture files")
-    let savedOut = duplicate(1); let savedErr = duplicate(2)
-    test.check(savedOut >= 0 && savedErr >= 0, "timed capture saved descriptors")
-    let loopResult = loop.create(); test.check(errors.integerOk(loopResult), "timed timeout loop"); let eventLoop = errors.integerValue(loopResult)
-    let before = metrics.usage(); let start = system.monotonicNanoseconds()
-    test.check(duplicateTo(stdout, 1) == 1 && duplicateTo(stderr, 2) == 2, "timed capture descriptors")
-    let handle = system.spawn(command[0], command, system.environment(), "")
-    test.check(duplicateTo(savedOut, 1) == 1 && duplicateTo(savedErr, 2) == 2, "restore timed capture descriptors")
-    let status = system.ProcessStatus { state: system.WAIT_ERROR; exitCode: 0; signal: 0; error: handle }
-    let timeout = false
-    if handle > 0 {
-        status = system.poll(handle)
-        while status.state == system.PENDING {
-            if system.monotonicNanoseconds() - start >= 30000000000 {
-                timeout = true; system.sendSignal(system.childProcessId(handle), 9); status = system.wait(handle); break
-            }
-            let batch = loop.wait(eventLoop, 1, 1); test.check(!errors.isError(loop.batchError(batch)), "timed wait")
-            status = system.poll(handle)
-        }
-    }
-    let wall = Float(system.monotonicNanoseconds() - start) / 1000000.0; let after = metrics.usage()
-    test.check(errors.booleanOk(loop.close(eventLoop)), "timed loop cleanup")
-    test.check(files.close(savedOut) == 0 && files.close(savedErr) == 0 && files.close(stdout) == 0 && files.close(stderr) == 0, "timed descriptor cleanup")
-    if timeout { return metrics.failure("compile measurement timed out after30seconds: " + readTextFile(log + ".err")) }
-    if status.error != 0 || status.state != system.EXITED || status.exitCode != 0 { return metrics.failure(readTextFile(log + ".err")) }
-    let cpu = data.nullValue()
-    if before.error == 0 && after.error == 0 {
-        cpu = data.decimal(1000.0 * (Float(after.userMicroseconds) / 1000000.0 + Float(after.systemMicroseconds) / 1000000.0 - Float(before.userMicroseconds) / 1000000.0 - Float(before.systemMicroseconds) / 1000000.0))
-    }
-    return metrics.success(data.object(["cpu_ms", "wall_ms"], [cpu, data.decimal(wall)]))
-}
 function timed(context: Context, label: Text, command: List<Text>, count: Integer): json.Value {
     context.serial += 1; context.measuredCalls += 1
     let result = metrics.success(data.nullValue())
@@ -195,7 +139,7 @@ function timed(context: Context, label: Text, command: List<Text>, count: Intege
         let process = fixtureCommand(context, label, command, count)
         expect(context, process.status == 0, process.errorOutput)
         result = metrics.success(metrics.controlledPhase(label, context.options.cpuAvailable, context.options.inflated))
-    } else { result = actualTimed(context, command, context.work + "/phase" + Text(context.serial)) }
+    } else { result = metrics.timed(command, context.work + "/phase" + Text(context.serial), 30) }
     expect(context, result.ok, result.error)
     return result.value
 }
@@ -215,12 +159,7 @@ public function run(context: Context) {
             for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit", "cold"] {
                 writeTextFile(entry, original); writeTextFile(library, libOriginal)
                 if scenario == "entry-edit" { writeTextFile(entry, test.replace(original, "    print(", "    let changed = 1\n    print(")) }
-                if scenario == "dependency-edit" {
-                    let raw = Bytes(libOriginal); let needle = Bytes("result = result + 1"); let position = -1
-                    for start in 0..(raw.length - needle.length + 1) { let same = true; for index in 0..needle.length { if raw[start + index] != needle[index] { same = false; break } }; if same { position = start; break } }
-                    expect(context, position >= 0, "original dependency edit site")
-                    writeTextFile(library, Text(raw.slice(0, position)) + "result = result + 2" + Text(raw.slice(position + needle.length, raw.length)))
-                }
+                if scenario == "dependency-edit" { writeTextFile(library, metrics.replaceFirst(libOriginal, "result = result + 1", "result = result + 2")) }
                 if scenario == "interface-edit" { writeTextFile(library, libOriginal + "\npublic record Added { value: Integer }\n") }
                 let productionSamples: List<json.Value> = []; let driverSamples: List<json.Value> = []; let counters: List<Text> = []
                 timed(context, "production", production, count)
@@ -233,7 +172,11 @@ public function run(context: Context) {
                         let measurement = timed(context, label, command, count)
                         if options.link {
                             let llvm = directory + "/cached.ll"; if label == "production" { llvm = directory + "/production.ll" }
-                            let linked = timed(context, "clang", [options.clang, "-O0", "-Wno-override-module", "--ld-path=/usr/lib/llvm-23/bin/ld.lld", llvm, context.work + "/runtime.o", "-o", directory + "/" + label + "-program", "-lm"], count)
+                            let link = [options.clang, "-O0", "-Wno-override-module"]
+                            if options.prepared != "" { link.add("--ld-path=/usr/lib/llvm-23/bin/ld.lld") }
+                            for item in [llvm, context.work + "/runtime.o", "-o", directory + "/" + label + "-program"] { link.add(item) }
+                            if !options.darwin { link.add("-lm") }
+                            let linked = timed(context, "clang", link, count)
                             let frontend = measurement; let combined = metrics.combine([frontend, linked]); expect(context, combined.ok, combined.error); measurement = combined.value
                             data.set(measurement, "frontend_ms", frontend); data.set(measurement, "link_ms", linked)
                         }
@@ -270,8 +213,10 @@ public function run(context: Context) {
     }
     if !options.functional {
         let artifacts = json.member(context.manifest, "artifacts")
-        for label in artifacts.keys { expect(context, hash(context.work + "/" + label, context.work) == json.string(artifacts, label), "frozen compiler/runtime unchanged after measurement") }
-        expect(context, hash(options.clang, context.work) == json.string(context.manifest, "clang_sha256") && hash("/usr/lib/llvm-23/bin/ld.lld", context.work) == json.string(context.manifest, "linker_sha256"), "matched LLVM23 unchanged after measurement")
+        for label in artifacts.keys { expect(context, hash(options, context.work + "/" + label, context.work) == json.string(artifacts, label), "frozen compiler/runtime unchanged after measurement") }
+    }
+    if options.prepared != "" {
+        expect(context, hash(options, options.clang, context.work) == json.string(context.manifest, "clang_sha256") && hash(options, "/usr/lib/llvm-23/bin/ld.lld", context.work) == json.string(context.manifest, "linker_sha256"), "matched LLVM23 unchanged after measurement")
         expect(context, metrics.equal(metrics.configurationEnvironment(), json.member(context.manifest, "environment")), "matched SDK unchanged after measurement")
     }
     save(context)
