@@ -667,7 +667,11 @@ check check-portable check-quic check-quic-sanitize: check-quic-interop-results
 # Native suite levels are independent children so a parallel runner overlaps them.
 .PHONY: check-quic check-quic-sanitize check-quic-native-O0 check-quic-native-O2 check-quic-native-sanitize
 QUIC_SUITE_TOOLS = build/tooling/tests/quic-suite-test build/tooling/tests/quic-crypto-test build/tooling/tests/quic-wire-test \
-    build/tooling/tests/quic-dispatch-test build/tooling/tests/quic-transport-test build/tooling/tests/quic-migration-cids-test
+    build/tooling/tests/quic-dispatch-test build/tooling/tests/quic-transport-test build/tooling/tests/quic-migration-cids-test \
+    build/tooling/tests/securecrypto-test build/tooling/tests/tls-server-test build/tooling/tests/tls-keyshare-test \
+    build/tooling/tests/tls-signing-usage-test build/tooling/tests/tls-validity-test build/tooling/tests/yamux-churn-test \
+    build/tooling/tests/transport-cancel-test build/tooling/tests/tls-resumption-expiry-test \
+    build/tooling/tests/tls-handshake-validity-test build/tooling/tests/transport-go-test
 
 check-quic-native-O0: build/minyarc $(QUIC_SUITE_TOOLS)
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-suite-test --artifacts build/quic-native-O0
