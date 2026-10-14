@@ -1,0 +1,1098 @@
+use "../scripts/release.min" as release
+use "../scripts/update-bundle.min" as bundle
+use "../scripts/update-manifest.min" as manifest
+use "../scripts/update-support.min" as support
+use "system" as system
+use "files" as files
+use "sha256" as sha256
+use "json" as json
+
+public record Arguments { native: Text; output: Text; openssl: Text; cc: Text; signtool: Text; ephemeralMacosCi: Boolean; macosCertificate: Text; macosThumbprint: Text; macosKeychain: Text; ownedBoatWindows: Boolean; report: Text; target: Text }
+public record Command { args: List<Text>; timeout: Integer; closedInput: Boolean; environment: List<Text>; check: Boolean }
+public record Outcome { kind: Text; message: Text; detail: Text }
+public record Ran { outcome: Outcome; result: support.Execution }
+public record Report { keys: List<Text>; values: List<Text>; mutations: List<Text> }
+public record Identities { signer: Text; wrong: Text; keychain: Text; certificate: Text }
+public record Fixture { outcome: Outcome; source: Text; entry: Text; resource: Text }
+public record Decoded { outcome: Outcome; entry: Text }
+public record Exit { status: Integer; output: Text; errorOutput: Text }
+public record Hooks {
+    platform: Text
+    machine: Text
+    environment: List<Text>
+    run: Callback<Command, support.Execution>
+    makeDirectory: Callback<Text, Boolean, Outcome>
+    staging: Callback<Text, Text, support.Located>
+    unstage: Callback<Text, Outcome>
+    generation: Callback<Text, Text, support.Located>
+    writeReport: Callback<Text, Text, Outcome>
+    publish: Callback<Text, Text, Outcome>
+    defaultFixture: Boolean
+    fixture: Callback<Text, Text, Text, Fixture>
+    signer: Callback<Bytes, Text, Text, Text, Callback<List<Text>, support.Execution>, manifest.Signature>
+    pipeline: Callback<Arguments, Text, Text, Report, Outcome>
+    authorize: Boolean
+    ciGuard: Boolean
+    verifyEnvelopes: Boolean
+    checkMutations: Boolean
+    replacePipeline: Boolean
+}
+record Signing { timedOut: Boolean }
+
+constant MAGIC = "MINYAR-BUNDLE-1\n"
+constant DOMAIN = "MINYAR-UPDATE-SIGNATURE-V1"
+
+public function succeeded(): Outcome { return Outcome { kind: ""; message: ""; detail: "" } }
+public function ok(outcome: Outcome): Boolean { return outcome.kind == "" }
+public function failure(kind: Text, message: Text): Outcome { return Outcome { kind: kind; message: message; detail: "" } }
+public function require(condition: Boolean, message: Text): Outcome {
+    if condition { return succeeded() }
+    return failure("ValueError", message)
+}
+function fromRelease(outcome: release.Outcome): Outcome {
+    if outcome.kind == "" { return succeeded() }
+    if outcome.kind == "value" { return failure("ValueError", outcome.message) }
+    if outcome.kind == "process" { return failure("CalledProcessError", outcome.message) }
+    if outcome.kind == "exists" { return failure("FileExistsError", outcome.message) }
+    return failure("OSError", outcome.message)
+}
+function osFailure(code: Integer, path: Text): Outcome {
+    if code == -2 { return failure("FileNotFoundError", support.describe(code, path)) }
+    if code == -17 { return failure("FileExistsError", support.describe(code, path)) }
+    return failure("OSError", support.describe(code, path))
+}
+
+public function getenv(hooks: Hooks, name: Text): Text {
+    for entry in hooks.environment {
+        if support.starts(entry, name + "=") { return Text(Bytes(entry).slice(Bytes(name).length + 1, Bytes(entry).length)) }
+    }
+    return ""
+}
+function hasenv(hooks: Hooks, name: Text): Boolean {
+    for entry in hooks.environment { if support.starts(entry, name + "=") { return true } }
+    return false
+}
+function merged(base: List<Text>, extra: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in base {
+        let keep = true
+        for override in extra {
+            let raw = Bytes(override)
+            let ending = 0
+            while ending < raw.length && raw[ending] != 61 { ending += 1 }
+            if support.starts(entry, Text(raw.slice(0, ending + 1))) { keep = false }
+        }
+        if keep { result.add(entry) }
+    }
+    for entry in extra { result.add(entry) }
+    return result
+}
+function execute(command: Command, environment: List<Text>): support.Execution {
+    let capture = support.temporaryDirectory(support.temporaryRoot(), "minyar-pipeline-run-")
+    if capture.error != 0 { return support.Execution { status: -1; output: Bytes(); errorOutput: ""; timedOut: false; launch: capture.error } }
+    let out = capture.path + "/stdout"
+    let err = capture.path + "/stderr"
+    let input = "/dev/stdin"
+    if command.closedInput { input = "/dev/null" }
+    let argv = ["sh", "-c", "in=$1; out=$2; err=$3; shift 3; exec \"$@\" <\"$in\" >\"$out\" 2>\"$err\"", "sh", input, out, err]
+    for word in command.args { argv.add(word) }
+    let handle = system.spawn("/bin/sh", argv, merged(environment, command.environment), "")
+    if handle <= 0 {
+        support.removeTree(capture.path)
+        return support.Execution { status: -1; output: Bytes(); errorOutput: ""; timedOut: false; launch: handle }
+    }
+    let timedOut = false
+    let state = system.poll(handle)
+    if command.timeout <= 0 { state = system.wait(handle) }
+    else {
+        let deadline = system.monotonicNanoseconds() + command.timeout * 1000000000
+        while state.error == 0 && state.state == system.PENDING {
+            if system.monotonicNanoseconds() >= deadline {
+                timedOut = true
+                system.sendSignal(system.childProcessId(handle), 9)
+                state = system.wait(handle)
+                break
+            }
+            support.pause(10)
+            state = system.poll(handle)
+        }
+    }
+    let code = state.exitCode
+    if state.state == system.SIGNALED { code = -state.signal }
+    if state.error != 0 { code = -1 }
+    let output = files.readFile(out)
+    let errorOutput = Text(files.readFile(err))
+    support.removeTree(capture.path)
+    if !timedOut && code == 127 && output.length == 0 && support.find(errorOutput, "not found") >= 0 { return support.Execution { status: code; output: output; errorOutput: errorOutput; timedOut: false; launch: -2 } }
+    return support.Execution { status: code; output: output; errorOutput: errorOutput; timedOut: timedOut; launch: 0 }
+}
+public function command(args: List<Text>): Command {
+    return Command { args: args; timeout: 60; closedInput: true; environment: []; check: true }
+}
+public function call(hooks: Hooks, request: Command): Ran {
+    let run = hooks.run
+    let result = run(request)
+    let outcome = succeeded()
+    if result.launch != 0 { outcome = osFailure(result.launch, request.args[0]) }
+    else if result.timedOut { outcome = Outcome { kind: "TimeoutExpired"; message: "Command " + support.pythonText(support.pythonList(request.args)) + " timed out after " + Text(request.timeout) + " seconds"; detail: "" } }
+    else if request.check && result.status != 0 { outcome = Outcome { kind: "CalledProcessError"; message: support.commandFailure(request.args, result, 0); detail: result.errorOutput } }
+    return Ran { outcome: outcome; result: result }
+}
+function tool(hooks: Hooks, args: List<Text>): Ran {
+    return call(hooks, command(args))
+}
+function releaseRunner(hooks: Hooks): Callback<List<Text>, release.Completed> {
+    return function(args: List<Text>): release.Completed {
+        let ran = tool(hooks, args)
+        let status = ran.result.status
+        if ran.result.launch != 0 || ran.result.timedOut { status = 1 }
+        return release.Completed { status: status; output: Text(ran.result.output); errorOutput: ran.result.errorOutput }
+    }
+}
+function signingRunner(hooks: Hooks, environment: List<Text>, state: Signing): Callback<List<Text>, support.Execution> {
+    return function(args: List<Text>): support.Execution {
+        let request = command(args)
+        request.environment = environment
+        let run = hooks.run
+        let result = run(request)
+        if result.timedOut { state.timedOut = true }
+        return result
+    }
+}
+public function defaultSigner(): Callback<Bytes, Text, Text, Text, Callback<List<Text>, support.Execution>, manifest.Signature> {
+    return function(data: Bytes, key: Text, openssl: Text, passphrase: Text, run: Callback<List<Text>, support.Execution>): manifest.Signature {
+        return manifest.signedWith(data, key, openssl, passphrase, run)
+    }
+}
+
+function directoryMaker(): Callback<Text, Boolean, Outcome> {
+    return function(path: Text, parents: Boolean): Outcome {
+        if parents {
+            let code = support.makeDirectories(path)
+            if code != 0 { return osFailure(code, path) }
+            return succeeded()
+        }
+        if support.linkStatus(path).error == 0 { return osFailure(-17, path) }
+        let code = files.makeDirectory(path)
+        if code != 0 { return osFailure(code, path) }
+        return succeeded()
+    }
+}
+function privateMaker(): Callback<Text, Text, support.Located> {
+    return function(parent: Text, prefix: Text): support.Located { return support.temporaryDirectory(parent, prefix) }
+}
+function stagingCleaner(): Callback<Text, Outcome> {
+    return function(path: Text): Outcome {
+        let code = support.removeTree(path)
+        if code != 0 { return osFailure(code, path) }
+        return succeeded()
+    }
+}
+function reportWriter(): Callback<Text, Text, Outcome> {
+    return function(path: Text, text: Text): Outcome { return writeReport(path, text) }
+}
+function publisher(): Callback<Text, Text, Outcome> {
+    return function(source: Text, destination: Text): Outcome { return fromRelease(release.publishDirectory(source, destination)) }
+}
+function systemRunner(): Callback<Command, support.Execution> {
+    return function(request: Command): support.Execution { return execute(request, system.environment()) }
+}
+public function defaults(): Hooks {
+    let platform = "unknown"
+    let kernel = support.execute(["uname", "-s"], 10)
+    let name = support.join(support.split(Text(kernel.output), 10), "")
+    if name == "Darwin" { platform = "darwin" }
+    if name == "Linux" { platform = "linux" }
+    let machine = support.execute(["uname", "-m"], 10)
+    return Hooks { platform: platform; machine: support.lower(support.join(support.split(Text(machine.output), 10), "")); environment: system.environment();
+        run: systemRunner(); makeDirectory: directoryMaker(); staging: privateMaker(); unstage: stagingCleaner(); generation: privateMaker();
+        writeReport: reportWriter(); publish: publisher(); defaultFixture: true;
+        fixture: function(work: Text, cc: Text, native: Text): Fixture { return Fixture { outcome: failure("ValueError", "native fixture override is not configured"); source: ""; entry: ""; resource: "" } };
+        signer: defaultSigner();
+        pipeline: function(arguments: Arguments, work: Text, publication: Text, target: Report): Outcome { return failure("ValueError", "pipeline override is not configured") };
+        authorize: true; ciGuard: true; verifyEnvelopes: true; checkMutations: true; replacePipeline: false }
+}
+
+public function quote(value: Text): Text {
+    let raw = Bytes(value)
+    let out = Bytes("\"")
+    let hex = Bytes("0123456789abcdef")
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if byte == 34 { out.addBytes(Bytes("\\\"")) }
+        else if byte == 92 { out.addBytes(Bytes("\\\\")) }
+        else if byte == 10 { out.addBytes(Bytes("\\n")) }
+        else if byte == 13 { out.addBytes(Bytes("\\r")) }
+        else if byte == 9 { out.addBytes(Bytes("\\t")) }
+        else if byte == 8 { out.addBytes(Bytes("\\b")) }
+        else if byte == 12 { out.addBytes(Bytes("\\f")) }
+        else if byte < 32 || byte == 127 {
+            out.addBytes(Bytes("\\u00")); out.add(hex[byte >> 4]); out.add(hex[byte & 15])
+        } else if byte < 128 { out.add(byte) }
+        else {
+            let code = 0
+            let width = 1
+            if byte >= 240 { code = byte & 7; width = 4 } else if byte >= 224 { code = byte & 15; width = 3 } else { code = byte & 31; width = 2 }
+            for offset in 1..width { if index + offset < raw.length { code = code * 64 + (raw[index + offset] & 63) } }
+            index += width - 1
+            let units: List<Integer> = []
+            if code >= 65536 {
+                let reduced = code - 65536
+                units.add(55296 + (reduced >> 10))
+                units.add(56320 + (reduced & 1023))
+            } else { units.add(code) }
+            for unit in units {
+                out.addBytes(Bytes("\\u"))
+                out.add(hex[(unit >> 12) & 15]); out.add(hex[(unit >> 8) & 15]); out.add(hex[(unit >> 4) & 15]); out.add(hex[unit & 15])
+            }
+        }
+        index += 1
+    }
+    out.add(34)
+    return Text(out)
+}
+public function flag(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+function indent(level: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..level { parts.add("  ") }
+    return joinText(parts)
+}
+public function jsonObject(keys: List<Text>, values: List<Text>, level: Integer): Text {
+    if keys.length == 0 { return "{}" }
+    let parts: List<Text> = ["{\n"]
+    for index in 0..keys.length {
+        parts.add(indent(level + 1) + quote(keys[index]) + ": " + values[index])
+        if index + 1 < keys.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add(indent(level) + "}")
+    return joinText(parts)
+}
+public function jsonArray(values: List<Text>, level: Integer): Text {
+    if values.length == 0 { return "[]" }
+    let parts: List<Text> = ["[\n"]
+    for index in 0..values.length {
+        parts.add(indent(level + 1) + values[index])
+        if index + 1 < values.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add(indent(level) + "]")
+    return joinText(parts)
+}
+public function newReport(): Report {
+    return Report { keys: []; values: []; mutations: [] }
+}
+public function setKey(target: Report, key: Text, value: Text) {
+    for index in 0..target.keys.length {
+        if target.keys[index] == key { target.values[index] = value; return }
+    }
+    target.keys.add(key)
+    target.values.add(value)
+}
+public function valueOf(target: Report, key: Text): Text {
+    for index in 0..target.keys.length {
+        if target.keys[index] == key {
+            if target.values[index] == "@mutations" {
+                let quoted: List<Text> = []
+                for label in target.mutations { quoted.add(quote(label)) }
+                return jsonArray(quoted, 1)
+            }
+            return target.values[index]
+        }
+    }
+    return ""
+}
+public function hasKey(target: Report, key: Text): Boolean {
+    for name in target.keys { if name == key { return true } }
+    return false
+}
+public function render(target: Report): Text {
+    let values: List<Text> = []
+    for key in target.keys { values.add(valueOf(target, key)) }
+    return jsonObject(target.keys, values, 0)
+}
+
+function randomHex(count: Integer): Text {
+    let file = files.open("/dev/urandom", files.READ)
+    if file < 0 { fail("cannot open the system random source") }
+    let data = files.readAt(file, 0, count)
+    files.close(file)
+    if data.length != count { fail("short read from the system random source") }
+    return support.hex(data)
+}
+function upper(value: Text): Text {
+    let raw = Bytes(value)
+    for index in 0..raw.length { if raw[index] >= 97 && raw[index] <= 122 { raw[index] = raw[index] - 32 } }
+    return Text(raw)
+}
+function hexDigits(value: Text, count: Integer): Boolean {
+    let raw = Bytes(value)
+    if raw.length != count { return false }
+    for byte in raw {
+        if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102) || (byte >= 65 && byte <= 70)) { return false }
+    }
+    return true
+}
+public function requireEphemeralMacosCi(hooks: Hooks, path: Text, explicit: Boolean): Outcome {
+    if !hooks.ciGuard { return succeeded() }
+    let allowed = explicit && hooks.platform == "darwin" && getenv(hooks, "GITHUB_ACTIONS") == "true" && getenv(hooks, "RUNNER_OS") == "macOS" &&
+        getenv(hooks, "RUNNER_ENVIRONMENT") == "github-hosted" && getenv(hooks, "RUNNER_TEMP") != ""
+    if !allowed { return require(false, "automatic Mac credentials require --ephemeral-macos-ci on an ephemeral GitHub-hosted macOS runner; owner Mac is refused") }
+    let runnerTemp = support.resolve(getenv(hooks, "RUNNER_TEMP"))
+    if runnerTemp.error != 0 { return require(false, "ephemeral Mac RUNNER_TEMP must be an existing directory") }
+    if !support.isDirectory(support.status(runnerTemp.path)) { return require(false, "ephemeral Mac RUNNER_TEMP must be an existing directory") }
+    let target = support.looseResolve(path)
+    return require(target.error == 0 && support.within(target.path, runnerTemp.path), "ephemeral Mac credentials/output must be under RUNNER_TEMP")
+}
+public function requireOwnedBoatWindows(hooks: Hooks, explicit: Boolean): Outcome {
+    return require(false, "Windows signing requires actual native Windows Python on OWN Boat")
+}
+public function rejected(hooks: Hooks, action: Callback<Outcome>, label: Text, mutations: List<Text>): Outcome {
+    if !hooks.checkMutations { return succeeded() }
+    let outcome = action()
+    if outcome.kind == "ValueError" || outcome.kind == "CalledProcessError" { mutations.add(label); return succeeded() }
+    if ok(outcome) { return failure("ValueError", "mutation accepted: " + label) }
+    return outcome
+}
+
+function trustInventory(hooks: Hooks): Ran {
+    let values: List<Text> = []
+    for flags in [["security", "dump-trust-settings"], ["security", "dump-trust-settings", "-d"]] {
+        let request = command(flags)
+        request.check = false
+        let ran = call(hooks, request)
+        if !ok(ran.outcome) { return ran }
+        let combined = ran.result.output.slice(0, ran.result.output.length)
+        combined.addBytes(Bytes(ran.result.errorOutput))
+        if ran.result.status != 0 && support.find(Text(combined), "No Trust Settings") < 0 {
+            return Ran { outcome: require(false, "cannot inventory certificate trust"); result: ran.result }
+        }
+        values.add(Text(ran.result.status) + "\n" + support.hex(ran.result.output) + "\n" + support.hex(Bytes(ran.result.errorOutput)))
+    }
+    return Ran { outcome: succeeded(); result: support.Execution { status: 0; output: Bytes(support.join(values, "\n")); errorOutput: ""; timedOut: false; launch: 0 } }
+}
+function attempt(failures: List<Text>, label: Text, outcome: Outcome) {
+    if outcome.kind == "ValueError" || outcome.kind == "CalledProcessError" || outcome.kind == "TimeoutExpired" || outcome.kind == "OSError" || outcome.kind == "FileNotFoundError" || outcome.kind == "FileExistsError" {
+        failures.add(label + ": " + outcome.kind)
+    }
+}
+function exists(path: Text): Boolean {
+    return support.linkStatus(path).error == 0
+}
+function credentialSetup(hooks: Hooks, credentials: Text, openssl: Text, keychain: Text, password: Text, state: Signing, identities: Identities): Outcome {
+    for name in ["signer", "wrong"] {
+        let key = credentials + "/" + name + ".pem"
+        let pem = credentials + "/" + name + ".crt"
+        let created = tool(hooks, [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", pem, "-days", "1", "-sha256",
+            "-subj", "/CN=Minyar TEST ONLY " + randomHex(16), "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,digitalSignature", "-addext", "extendedKeyUsage=codeSigning"])
+        if !ok(created.outcome) { return created.outcome }
+        let converted = tool(hooks, [openssl, "x509", "-in", pem, "-outform", "DER", "-out", credentials + "/" + name + ".der"])
+        if !ok(converted.outcome) { return converted.outcome }
+    }
+    let p12 = credentials + "/TEST-signer.p12"
+    let export = command([openssl, "pkcs12", "-export", "-legacy", "-inkey", credentials + "/signer.pem", "-in", credentials + "/signer.crt", "-out", p12, "-passout", "env:MINYAR_TEST_P12_PASSWORD"])
+    export.environment = ["MINYAR_TEST_P12_PASSWORD=" + password]
+    let exported = call(hooks, export)
+    if !ok(exported.outcome) { return exported.outcome }
+    for step in [["security", "create-keychain", "-p", password, keychain], ["security", "unlock-keychain", "-p", password, keychain],
+            ["security", "import", p12, "-k", keychain, "-P", password, "-T", "/usr/bin/codesign"],
+            ["security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", password, keychain]] {
+        let done = tool(hooks, step)
+        if !ok(done.outcome) { return done.outcome }
+    }
+    state.timedOut = true
+    let trusted = tool(hooks, ["sudo", "-n", "security", "add-trusted-cert", "-d", "-r", "trustRoot", "-p", "codeSign", "-a", "/usr/bin/codesign", "-k", keychain, credentials + "/signer.crt"])
+    if !ok(trusted.outcome) { return trusted.outcome }
+    identities.signer = certificateThumbprint(credentials + "/signer.der")
+    identities.wrong = certificateThumbprint(credentials + "/wrong.der")
+    identities.keychain = keychain
+    identities.certificate = credentials + "/signer.der"
+    return succeeded()
+}
+public function certificateThumbprint(path: Text): Text {
+    return upper(sha1(files.readFile(path)))
+}
+function sha1(data: Bytes): Text { native "releasenative" }
+public function macosCredentials(hooks: Hooks, credentials: Text, openssl: Text, target: Report, ephemeralCi: Boolean, body: Callback<Identities, Outcome>): Outcome {
+    let guarded = requireEphemeralMacosCi(hooks, credentials, ephemeralCi)
+    if !ok(guarded) { return guarded }
+    let keychain = credentials + "/TEST-signing.keychain-db"
+    let password = randomHex(24)
+    let before = tool(hooks, ["security", "list-keychains", "-d", "user"])
+    if !ok(before.outcome) { return before.outcome }
+    let trustBefore = trustInventory(hooks)
+    if !ok(trustBefore.outcome) { return trustBefore.outcome }
+    let trustAttempted = Signing { timedOut: false }
+    let identities = Identities { signer: ""; wrong: ""; keychain: ""; certificate: "" }
+    let outcome = credentialSetup(hooks, credentials, openssl, keychain, password, trustAttempted, identities)
+    if ok(outcome) { outcome = body(identities) }
+    let failures: List<Text> = []
+    if trustAttempted.timedOut {
+        attempt(failures, "admin TEST trust removal", tool(hooks, ["sudo", "-n", "security", "remove-trusted-cert", "-d", credentials + "/signer.crt"]).outcome)
+    }
+    if exists(keychain) {
+        attempt(failures, "TEST keychain deletion", tool(hooks, ["security", "delete-keychain", keychain]).outcome)
+    }
+    attempt(failures, "TEST keychain absence", require(!exists(keychain), "TEST keychain remains"))
+    let after = tool(hooks, ["security", "list-keychains", "-d", "user"])
+    if ok(after.outcome) { attempt(failures, "search list preservation", require(support.same(after.result.output, before.result.output), "keychain search list drift")) }
+    else { attempt(failures, "search list preservation", after.outcome) }
+    let trustAfter = trustInventory(hooks)
+    if ok(trustAfter.outcome) { attempt(failures, "trust preservation", require(support.same(trustAfter.result.output, trustBefore.result.output), "user/admin trust drift")) }
+    else { attempt(failures, "trust preservation", trustAfter.outcome) }
+    let status = "verified"
+    if failures.length > 0 { status = "FAILED" }
+    let quoted: List<Text> = []
+    for item in failures { quoted.add(quote(item)) }
+    setKey(target, "macosCredentialCleanup", jsonObject(["status", "failures", "scope"], [quote(status), jsonArray(quoted, 2), quote("own admin codeSign/codesign TEST trust and temporary keychain; prior search list/user/admin trust preserved")], 1))
+    if failures.length > 0 { return failure("ValueError", "Mac CI cleanup failed; no publication: " + support.join(failures, "; ")) }
+    return outcome
+}
+public function provisionedMacosCredentials(hooks: Hooks, certificate: Text, thumbprint: Text, keychain: Text, target: Report, body: Callback<Identities, Outcome>): Outcome {
+    let certificatePath = support.resolve(certificate)
+    if certificatePath.error != 0 { return osFailure(certificatePath.error, certificate) }
+    let keychainPath = support.resolve(keychain)
+    if keychainPath.error != 0 { return osFailure(keychainPath.error, keychain) }
+    let regular = require(support.isRegular(support.status(certificatePath.path)) && support.isRegular(support.status(keychainPath.path)), "provisioned TEST DER/keychain must already exist")
+    if !ok(regular) { return regular }
+    let pinned = require(hexDigits(thumbprint, 40) && certificateThumbprint(certificatePath.path) == upper(thumbprint), "provisioned TEST certificate thumbprint mismatch")
+    if !ok(pinned) { return pinned }
+    let wrong = "0000000000000000000000000000000000000000"
+    if upper(thumbprint) == wrong { wrong = "1111111111111111111111111111111111111111" }
+    let outcome = body(Identities { signer: upper(thumbprint); wrong: wrong; keychain: keychainPath.path; certificate: certificatePath.path })
+    setKey(target, "macosCredentialCleanup", quote("operator-owned provisioned identity left intact; no automatic OS setting mutation"))
+    return outcome
+}
+
+public function decodedPath(data: Bytes): Decoded {
+    for byte in data { if byte >= 128 { return Decoded { outcome: failure("UnicodeDecodeError", "'ascii' codec can't decode the bundle path"); entry: "" } } }
+    let value = Text(data)
+    let length = require(data.length >= 1 && data.length <= 512, "invalid decoded path length")
+    if !ok(length) { return Decoded { outcome: length; entry: "" } }
+    for part in support.split(value, 47) {
+        let raw = Bytes(part)
+        let valid = raw.length >= 1 && raw.length <= 64 && part != "." && part != ".." && raw[0] != 32 && raw[raw.length - 1] != 46 && raw[raw.length - 1] != 32
+        if valid {
+            for byte in raw {
+                let allowed = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 46 || byte == 95 || byte == 32 || byte == 45
+                if !allowed { valid = false }
+            }
+        }
+        if !valid { return Decoded { outcome: require(false, "invalid decoded path"); entry: "" } }
+        let stem = upper(support.split(part, 46)[0])
+        let reserved = stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" || stem == "CONIN$" || stem == "CONOUT$"
+        let device = Bytes(stem)
+        if device.length == 4 && (support.starts(stem, "COM") || support.starts(stem, "LPT")) && device[3] >= 48 && device[3] <= 57 { reserved = true }
+        if reserved { return Decoded { outcome: require(false, "reserved decoded path"); entry: "" } }
+    }
+    return Decoded { outcome: succeeded(); entry: value }
+}
+record Reader { data: Bytes; offset: Integer; error: Outcome }
+function take(reader: Reader, length: Integer): Bytes {
+    if !ok(reader.error) { return Bytes() }
+    if length < 0 || length > reader.data.length - reader.offset { reader.error = require(false, "truncated bundle"); return Bytes() }
+    let value = reader.data.slice(reader.offset, reader.offset + length)
+    reader.offset += length
+    return value
+}
+function number(raw: Bytes): Integer {
+    let value = 0
+    for byte in raw { value = value * 256 + byte }
+    return value
+}
+public function decode(data: Bytes, destination: Text): Decoded {
+    let reader = Reader { data: data; offset: 0; error: succeeded() }
+    let large = require(data.length <= 134217728, "bundle too large")
+    if !ok(large) { return Decoded { outcome: large; entry: "" } }
+    let magic = take(reader, 16)
+    if !ok(reader.error) { return Decoded { outcome: reader.error; entry: "" } }
+    if !support.same(magic, Bytes(MAGIC)) { return Decoded { outcome: require(false, "wrong bundle domain"); entry: "" } }
+    let entryLength = number(take(reader, 4))
+    let entryBytes = take(reader, entryLength)
+    if !ok(reader.error) { return Decoded { outcome: reader.error; entry: "" } }
+    let entry = decodedPath(entryBytes)
+    if !ok(entry.outcome) { return entry }
+    let count = number(take(reader, 4))
+    if !ok(reader.error) { return Decoded { outcome: reader.error; entry: "" } }
+    if count < 1 || count > 4096 { return Decoded { outcome: require(false, "invalid bundle entry count"); entry: "" } }
+    let seen = Map<Text, Boolean>()
+    let executable = Map<Text, Boolean>()
+    if exists(destination) { return Decoded { outcome: osFailure(-17, destination); entry: "" } }
+    let made = files.makeDirectory(destination)
+    if made != 0 { return Decoded { outcome: osFailure(made, destination); entry: "" } }
+    for index in 0..count {
+        let header = take(reader, 14)
+        if !ok(reader.error) { return Decoded { outcome: reader.error; entry: "" } }
+        let kind = header[0]
+        let mode = header[1]
+        let length = number(header.slice(2, 6))
+        if header[6] >= 128 { return Decoded { outcome: require(false, "truncated bundle"); entry: "" } }
+        let size = number(header.slice(6, 14))
+        let nameBytes = take(reader, length)
+        if !ok(reader.error) { return Decoded { outcome: reader.error; entry: "" } }
+        let decoded = decodedPath(nameBytes)
+        if !ok(decoded.outcome) { return decoded }
+        let name = decoded.entry
+        let folded = support.lower(name)
+        if seen.has(folded) { return Decoded { outcome: require(false, "duplicate bundle path"); entry: "" } }
+        seen[folded] = true
+        let path = destination + "/" + name
+        let parentPath = support.parent(path)
+        if !(parentPath == destination || support.isDirectory(support.status(parentPath))) { return Decoded { outcome: require(false, "missing parent record"); entry: "" } }
+        if kind == 68 {
+            if mode != 0 || size != 0 { return Decoded { outcome: require(false, "invalid directory record"); entry: "" } }
+            if exists(path) { return Decoded { outcome: osFailure(-17, path); entry: "" } }
+            let created = files.makeDirectory(path)
+            if created != 0 { return Decoded { outcome: osFailure(created, path); entry: "" } }
+        } else {
+            if kind != 70 || (mode != 0 && mode != 1) { return Decoded { outcome: require(false, "invalid file record"); entry: "" } }
+            let file = files.open(path, files.WRITE + files.CREATE + files.EXCLUSIVE)
+            if file < 0 { return Decoded { outcome: osFailure(file, path); entry: "" } }
+            let content = take(reader, size)
+            if !ok(reader.error) { files.close(file); return Decoded { outcome: reader.error; entry: "" } }
+            let written = files.write(file, content, 0, content.length)
+            files.close(file)
+            if written != content.length { return Decoded { outcome: failure("OSError", "short write: " + path); entry: "" } }
+            let modeText = "644"
+            if mode == 1 { modeText = "755"; executable[name] = true }
+            let changed = support.execute(["chmod", modeText, path], 10)
+            if changed.status != 0 { return Decoded { outcome: failure("OSError", "cannot chmod " + path); entry: "" } }
+        }
+    }
+    if reader.offset != data.length || !executable.has(entry.entry) { return Decoded { outcome: require(false, "bundle tail or nonexecutable entrypoint"); entry: "" } }
+    return Decoded { outcome: succeeded(); entry: entry.entry }
+}
+function splitLines(data: Bytes): List<Text> {
+    let result: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < data.length {
+        let byte = data[index]
+        if byte == 10 || byte == 13 || byte == 11 || byte == 12 || byte == 28 || byte == 29 || byte == 30 {
+            result.add(Text(data.slice(start, index)))
+            if byte == 13 && index + 1 < data.length && data[index + 1] == 10 { index += 1 }
+            start = index + 1
+        }
+        index += 1
+    }
+    if start < data.length { result.add(Text(data.slice(start, data.length))) }
+    return result
+}
+function canonicalNumber(value: Text): Boolean {
+    let raw = Bytes(value)
+    if raw.length == 0 { return false }
+    if raw[0] == 48 { return raw.length == 1 }
+    for byte in raw { if byte < 48 || byte > 57 { return false } }
+    return raw.length <= 18
+}
+function domainBytes(domain: Text): Bytes {
+    let value = Bytes(domain)
+    value.add(0)
+    return value
+}
+public function verifyEnvelope(hooks: Hooks, envelope: Bytes, artifact: Bytes, publicKey: Bytes, openssl: Text, scratch: Text, domain: Text, target: Text): Outcome {
+    if !hooks.verifyEnvelopes { return succeeded() }
+    let size = require(envelope.length > 64 && envelope.length <= 4160, "invalid envelope size")
+    if !ok(size) { return size }
+    let signature = envelope.slice(0, 64)
+    let data = envelope.slice(64, envelope.length)
+    if !exists(scratch) {
+        let maker = hooks.makeDirectory
+        let made = maker(scratch, false)
+        if !ok(made) { return made }
+    }
+    let prefix = Bytes()
+    for byte in [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0] { prefix.add(byte) }
+    prefix.addBytes(publicKey)
+    let message = domainBytes(domain)
+    message.addBytes(data)
+    for pair in [["public.der", "0"], ["signature", "1"], ["message", "2"]] {
+        let content = prefix
+        if pair[1] == "1" { content = signature }
+        if pair[1] == "2" { content = message }
+        let code = support.writeFile(scratch + "/" + pair[0], content)
+        if code != 0 { return osFailure(code, scratch + "/" + pair[0]) }
+    }
+    let verified = tool(hooks, [openssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", scratch + "/public.der", "-sigfile", scratch + "/signature", "-in", scratch + "/message"])
+    if !ok(verified.outcome) { return verified.outcome }
+    for byte in data { if byte >= 128 { return failure("UnicodeDecodeError", "'ascii' codec can't decode the metadata") } }
+    let fields = splitLines(data)
+    let joined: List<Text> = []
+    for field in fields { joined.add(field); joined.add("\n") }
+    let structure = require(fields.length == 12 && support.same(data, Bytes(joinText(joined))), "invalid metadata structure")
+    if !ok(structure) { return structure }
+    let policy = require(fields[0] == "MINYAR-UPDATE-1" && fields[1] == "org.minyar.test" && fields[2] == target && fields[3] == "test", "metadata policy mismatch")
+    if !ok(policy) { return policy }
+    let sequence = require(fields[4] == "1" && fields[5] == "1.0.0" && fields[8] == "100", "metadata policy mismatch")
+    if !ok(sequence) { return sequence }
+    let stamps = require(canonicalNumber(fields[6]) && canonicalNumber(fields[7]), "invalid TEST timestamp")
+    if !ok(stamps) { return stamps }
+    let issued = support.integerValue(fields[6])
+    let expires = support.integerValue(fields[7])
+    let now = system.wallClockMicroseconds() / 1000000
+    let fresh = require(expires - issued > 0 && expires - issued <= 604800 && issued <= now && now < expires, "expired or invalid TEST metadata")
+    if !ok(fresh) { return fresh }
+    let digest = sha256.hex(sha256.digest(artifact))
+    let bound = require(fields[10] == digest && fields[11] == Text(artifact.length), "artifact hash/size mismatch")
+    if !ok(bound) { return bound }
+    return require(fields[9] == "https://updates.invalid/releases/" + digest + "/TEST-fixture.bundle", "artifact origin mismatch")
+}
+
+function fixturePlist(): Text {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleExecutable</key>\n\t<string>fixture</string>\n\t<key>CFBundleIdentifier</key>\n\t<string>org.minyar.test</string>\n\t<key>CFBundleName</key>\n\t<string>Minyar TEST ONLY</string>\n\t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n\t<key>CFBundleShortVersionString</key>\n\t<string>1.0.0</string>\n\t<key>CFBundleVersion</key>\n\t<string>1</string>\n</dict>\n</plist>\n"
+}
+public function nativeFixture(hooks: Hooks, work: Text, cc: Text, native: Text): Fixture {
+    let source = work + "/tiny.c"
+    writeTextFile(source, "int main(void) { return 0; }\n")
+    let tree = work + "/input"
+    let maker = hooks.makeDirectory
+    let made = maker(tree, false)
+    if !ok(made) { return Fixture { outcome: made; source: ""; entry: ""; resource: "" } }
+    if native != "macos" { return Fixture { outcome: require(false, "native mode requires the actual OS; Windows requires native Python on Boat"); source: ""; entry: ""; resource: "" } }
+    let app = tree + "/TEST-fixture.app"
+    for directory in [app + "/Contents/MacOS", app + "/Contents/Resources"] {
+        let created = maker(directory, true)
+        if !ok(created) { return Fixture { outcome: created; source: ""; entry: ""; resource: "" } }
+    }
+    writeTextFile(app + "/Contents/Resources/TEST-resource.txt", "Minyar TEST ONLY resource\n")
+    writeTextFile(app + "/Contents/Info.plist", fixturePlist())
+    let sdk = tool(hooks, ["xcrun", "--show-sdk-path"])
+    if !ok(sdk.outcome) { return Fixture { outcome: sdk.outcome; source: ""; entry: ""; resource: "" } }
+    let root = support.join(support.split(Text(sdk.result.output), 10), "")
+    let compiled = tool(hooks, [cc, "-isysroot", root, "-Os", source, "-o", app + "/Contents/MacOS/fixture"])
+    if !ok(compiled.outcome) { return Fixture { outcome: compiled.outcome; source: ""; entry: ""; resource: "" } }
+    return Fixture { outcome: succeeded(); source: app; entry: "TEST-fixture.app/Contents/MacOS/fixture"; resource: "TEST-fixture.app/Contents/Resources/TEST-resource.txt" }
+}
+
+public function authorizeContext(hooks: Hooks, arguments: Arguments): Outcome {
+    if !hooks.authorize { return succeeded() }
+    let native = require(arguments.native == "macos" && hooks.platform == "darwin", "native mode requires the actual OS; Windows requires native Python on Boat")
+    if !ok(native) { return native }
+    let tool = require(arguments.signtool == "", "--signtool is Windows-only")
+    if !ok(tool) { return tool }
+    let boat = require(!arguments.ownedBoatWindows, "--owned-boat-windows is Windows-only")
+    if !ok(boat) { return boat }
+    let any = arguments.macosCertificate != "" || arguments.macosThumbprint != "" || arguments.macosKeychain != ""
+    let all = arguments.macosCertificate != "" && arguments.macosThumbprint != "" && arguments.macosKeychain != ""
+    if arguments.ephemeralMacosCi {
+        let single = require(!any, "choose ephemeral CI or provisioned Mac identity, never both")
+        if !ok(single) { return single }
+        let guarded = requireEphemeralMacosCi(hooks, arguments.output, true)
+        if !ok(guarded) { return guarded }
+    } else {
+        let explicit = require(all, "Mac harness defaults to refusal: use explicit ephemeral CI or OWNER-RUN/CI provisioned TEST identity")
+        if !ok(explicit) { return explicit }
+        let checked = provisionedMacosCredentials(hooks, arguments.macosCertificate, arguments.macosThumbprint, arguments.macosKeychain, newReport(), function(identities: Identities): Outcome { return succeeded() })
+        if !ok(checked) { return checked }
+    }
+    return fromRelease(release.testOutput(arguments.output, ""))
+}
+
+record Flow { arguments: Arguments; work: Text; publication: Text; target: Report; hooks: Hooks; fixture: Fixture; credentials: Text }
+public function pipeline(hooks: Hooks, arguments: Arguments, work: Text, publication: Text, target: Report): Outcome {
+    let authorized = authorizeContext(hooks, arguments)
+    if !ok(authorized) { return authorized }
+    if arguments.native == "macos" && arguments.ephemeralMacosCi {
+        let guarded = requireEphemeralMacosCi(hooks, work, true)
+        if !ok(guarded) { return guarded }
+    }
+    let makeFixture = hooks.fixture
+    let fixture = Fixture { outcome: succeeded(); source: ""; entry: ""; resource: "" }
+    if hooks.defaultFixture { fixture = nativeFixture(hooks, work, arguments.cc, arguments.native) }
+    else { fixture = makeFixture(work, arguments.cc, arguments.native) }
+    if !ok(fixture.outcome) { return fixture.outcome }
+    let credentials = work + "/credentials"
+    let maker = hooks.makeDirectory
+    let made = maker(credentials, false)
+    if !ok(made) { return made }
+    let mode = support.execute(["chmod", "700", credentials], 10)
+    if mode.status != 0 { return failure("OSError", "cannot protect " + credentials) }
+    setKey(target, "rejectedMutations", "@mutations")
+    let flow = Flow { arguments: arguments; work: work; publication: publication; target: target; hooks: hooks; fixture: fixture; credentials: credentials }
+    let body = function(identities: Identities): Outcome { return signedFlow(flow, identities) }
+    let outcome = succeeded()
+    if arguments.ephemeralMacosCi { outcome = macosCredentials(hooks, credentials, arguments.openssl, target, true, body) }
+    else { outcome = provisionedMacosCredentials(hooks, arguments.macosCertificate, arguments.macosThumbprint, arguments.macosKeychain, target, body) }
+    if !ok(outcome) { return outcome }
+    let removed = support.removeTree(credentials)
+    if removed != 0 { return osFailure(removed, credentials) }
+    let absent = require(!exists(credentials), "TEST credential files remain after cleanup")
+    if !ok(absent) { return absent }
+    setKey(target, "privateCredentialFiles", quote("removed before publication"))
+    return succeeded()
+}
+function verifySigned(flow: Flow, root: Text, thumbprint: Text): Outcome {
+    return fromRelease(release.verifyTestMacos(root + "/" + support.name(flow.fixture.source), thumbprint, releaseRunner(flow.hooks)))
+}
+function sign(flow: Flow, metadata: Bytes, key: Text, passphrase: Text, secret: Text): manifest.Signature {
+    let state = Signing { timedOut: false }
+    let signer = flow.hooks.signer
+    let result = signer(metadata, key, flow.arguments.openssl, passphrase, signingRunner(flow.hooks, [passphrase + "=" + secret], state))
+    if state.timedOut && result.error == "" { result.error = "signing process timed out" }
+    if state.timedOut { result.error = "TimeoutExpired:" + result.error }
+    return result
+}
+function signingFailure(result: manifest.Signature): Outcome {
+    if support.starts(result.error, "TimeoutExpired:") { return failure("TimeoutExpired", Text(Bytes(result.error).slice(15, Bytes(result.error).length))) }
+    return failure("ValueError", result.error)
+}
+function signedFlow(flow: Flow, identities: Identities): Outcome {
+    let hooks = flow.hooks
+    let arguments = flow.arguments
+    let source = flow.fixture.source
+    let mutations = flow.target.mutations
+    let signedRoot = flow.publication + "/signed"
+    let maker = hooks.makeDirectory
+    let made = maker(signedRoot, false)
+    if !ok(made) { return made }
+    let signedOutput = signedRoot + "/" + support.name(source)
+    let certificate = identities.certificate
+    if certificate == "" { certificate = flow.credentials + "/signer.der" }
+    let signed = fromRelease(release.testMacos(source, signedOutput, certificate, identities.signer, identities.keychain, arguments.openssl, releaseRunner(hooks)))
+    if !ok(signed) { return signed }
+    let preserved = require(!exists(source + "/Contents/_CodeSignature"), "signing did not preserve the unsigned input")
+    if !ok(preserved) { return preserved }
+    let verified = verifySigned(flow, signedRoot, identities.signer)
+    if !ok(verified) { return verified }
+    let wrongCertificate = rejected(hooks, function(): Outcome { return verifySigned(flow, signedRoot, identities.wrong) }, "wrong OS certificate", mutations)
+    if !ok(wrongCertificate) { return wrongCertificate }
+    let artifact = flow.publication + "/TEST-fixture.bundle"
+    let encoded = bundle.prepare(signedRoot, artifact, flow.fixture.entry)
+    if encoded.error != "" { return failure("ValueError", encoded.error) }
+    let key = flow.credentials + "/TEST-update.pem"
+    let passphrase = "MINYAR_TEST_UPDATE_PASSPHRASE_" + upper(randomHex(8))
+    let secret = randomHex(24)
+    let generate = command([arguments.openssl, "genpkey", "-algorithm", "ED25519", "-aes-256-cbc", "-pass", "env:" + passphrase, "-out", key])
+    generate.environment = [passphrase + "=" + secret]
+    let generated = call(hooks, generate)
+    if !ok(generated.outcome) { return generated.outcome }
+    let exportRequest = command([arguments.openssl, "pkey", "-in", key, "-passin", "env:" + passphrase, "-pubout", "-outform", "DER"])
+    exportRequest.environment = [passphrase + "=" + secret]
+    let exported = call(hooks, exportRequest)
+    if !ok(exported.outcome) { return exported.outcome }
+    let publicDer = exported.result.output
+    let sized = require(publicDer.length == 44, "unexpected Ed25519 public key")
+    if !ok(sized) { return sized }
+    let publicKey = publicDer.slice(12, 44)
+    let issued = system.wallClockMicroseconds() / 1000000 - 1
+    let staticRoot = flow.publication + "/TEST-local-publication"
+    let lastError = Signing { timedOut: false }
+    let signFlow = flow
+    let plan = manifest.prepare(artifact, staticRoot, "org.minyar.test", arguments.target, "test", 1, "1.0.0", issued, issued + 3600, 100, "https://updates.invalid",
+        function(data: Bytes): manifest.Signature {
+            let result = sign(signFlow, data, key, passphrase, secret)
+            if support.starts(result.error, "TimeoutExpired:") { lastError.timedOut = true }
+            return result
+        })
+    if plan.error != "" {
+        if lastError.timedOut { return failure("TimeoutExpired", plan.error) }
+        return failure("ValueError", plan.error)
+    }
+    let parsed = json.parse(plan.plan)
+    let objects = json.member(parsed, "objects")
+    if objects.kind != json.ARRAY || objects.items.length != 2 { return failure("ValueError", "unexpected publication plan") }
+    let envelope = files.readFile(staticRoot + "/" + json.string(objects.items[1], "key"))
+    let data = files.readFile(staticRoot + "/" + json.string(objects.items[0], "key"))
+    let scratch = flow.work + "/verify"
+    let envelopeChecked = verifyEnvelope(hooks, envelope, data, publicKey, arguments.openssl, scratch, DOMAIN, arguments.target)
+    if !ok(envelopeChecked) { return envelopeChecked }
+    let decodedRoot = flow.publication + "/decoded"
+    let decoded = decode(data, decodedRoot)
+    if !ok(decoded.outcome) { return decoded.outcome }
+    let entryMatch = require(decoded.entry == flow.fixture.entry, "decoded entrypoint mismatch")
+    if !ok(entryMatch) { return entryMatch }
+    let decodedVerified = verifySigned(flow, decodedRoot, identities.signer)
+    if !ok(decodedVerified) { return decodedVerified }
+    let executed = tool(hooks, [decodedRoot + "/" + flow.fixture.entry])
+    if !ok(executed.outcome) { return executed.outcome }
+    let wrongKey = flow.credentials + "/TEST-wrong-update.pem"
+    let wrongGenerated = tool(hooks, [arguments.openssl, "genpkey", "-algorithm", "ED25519", "-out", wrongKey])
+    if !ok(wrongGenerated.outcome) { return wrongGenerated.outcome }
+    let wrongExported = tool(hooks, [arguments.openssl, "pkey", "-in", wrongKey, "-pubout", "-outform", "DER"])
+    if !ok(wrongExported.outcome) { return wrongExported.outcome }
+    let wrongDer = wrongExported.result.output
+    let wrongPublic = Bytes()
+    if wrongDer.length > 12 { wrongPublic = wrongDer.slice(12, wrongDer.length) }
+    let openssl = arguments.openssl
+    let target = arguments.target
+    let checks: List<Outcome> = []
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, envelope, data, wrongPublic, openssl, scratch, DOMAIN, target) }, "wrong Ed25519 key", mutations))
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, envelope, data, publicKey, openssl, scratch, "MINYAR-WRONG-DOMAIN", target) }, "wrong signature domain", mutations))
+    let metadataMutation = envelope.slice(0, envelope.length)
+    metadataMutation[64 + 16] = metadataMutation[64 + 16] ^ 1
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, metadataMutation, data, publicKey, openssl, scratch, DOMAIN, target) }, "metadata mutation", mutations))
+    let signatureMutation = envelope.slice(0, envelope.length)
+    signatureMutation[0] = signatureMutation[0] ^ 1
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, signatureMutation, data, publicKey, openssl, scratch, DOMAIN, target) }, "signature mutation", mutations))
+    let artifactMutation = data.slice(0, data.length)
+    artifactMutation[artifactMutation.length - 1] = artifactMutation[artifactMutation.length - 1] ^ 1
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, envelope, artifactMutation, publicKey, openssl, scratch, DOMAIN, target) }, "artifact mutation", mutations))
+    let truncated = data.slice(0, data.length - 1)
+    checks.add(rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, envelope, truncated, publicKey, openssl, scratch, DOMAIN, target) }, "artifact truncation", mutations))
+    for check in checks { if !ok(check) { return check } }
+    let replacements = [["0", "MINYAR-UPDATE-2"], ["1", "org.other.test"], ["2", "linux-x86_64"], ["3", "stable"], ["4", "2"], ["5", "9.0.0"], ["7", "1"], ["8", "10"], ["9", "https://wrong.invalid/releases/fixture"]]
+    for replacement in replacements {
+        let fields = splitLines(envelope.slice(64, envelope.length))
+        fields[support.integerValue(replacement[0])] = replacement[1]
+        let parts: List<Text> = []
+        for field in fields { parts.add(field); parts.add("\n") }
+        let metadata = Bytes(joinText(parts))
+        let resigned = sign(flow, metadata, key, passphrase, secret)
+        if resigned.error != "" { return signingFailure(resigned) }
+        let candidate = resigned.signature.slice(0, resigned.signature.length)
+        candidate.addBytes(metadata)
+        let policy = rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, candidate, data, publicKey, openssl, scratch, DOMAIN, target) }, "signed policy field mutation " + replacement[0], mutations)
+        if !ok(policy) { return policy }
+    }
+    let resourcePath = decodedRoot + "/" + flow.fixture.resource
+    let resourceWritten = support.writeFile(resourcePath, Bytes("unsigned altered resource\n"))
+    if resourceWritten != 0 { return osFailure(resourceWritten, resourcePath) }
+    let changed = flow.work + "/TEST-resource-mutated.bundle"
+    let reencoded = bundle.prepare(decodedRoot, changed, flow.fixture.entry)
+    if reencoded.error != "" { return failure("ValueError", reencoded.error) }
+    let changedData = files.readFile(changed)
+    let resourceCheck = rejected(hooks, function(): Outcome { return verifyEnvelope(hooks, envelope, changedData, publicKey, openssl, scratch, DOMAIN, target) }, "resource mutation", mutations)
+    if !ok(resourceCheck) { return resourceCheck }
+    let sealed = rejected(hooks, function(): Outcome { return verifySigned(flow, decodedRoot, identities.signer) }, "macOS sealed resource mutation", mutations)
+    if !ok(sealed) { return sealed }
+    support.removeTree(decodedRoot)
+    let again = decode(data, decodedRoot)
+    if !ok(again.outcome) { return again.outcome }
+    let executablePath = decodedRoot + "/" + flow.fixture.entry
+    let body = files.readFile(executablePath)
+    let small = require(body.length > 128, "native fixture is too small")
+    if !ok(small) { return small }
+    body[128] = body[128] ^ 1
+    let rewritten = support.writeFile(executablePath, body)
+    if rewritten != 0 { return osFailure(rewritten, executablePath) }
+    let executableCheck = rejected(hooks, function(): Outcome { return verifySigned(flow, decodedRoot, identities.signer) }, "native executable mutation", mutations)
+    if !ok(executableCheck) { return executableCheck }
+    support.removeTree(decodedRoot)
+    let restored = decode(data, decodedRoot)
+    if !ok(restored.outcome) { return restored.outcome }
+    let final = verifySigned(flow, decodedRoot, identities.signer)
+    if !ok(final) { return final }
+    let copied = support.writeFile(flow.publication + "/TEST-os-certificate.der", files.readFile(certificate))
+    if copied != 0 { return osFailure(copied, flow.publication + "/TEST-os-certificate.der") }
+    let publicWritten = support.writeFile(flow.publication + "/TEST-update-public-key.hex", Bytes(support.hex(publicKey) + "\n"))
+    if publicWritten != 0 { return osFailure(publicWritten, flow.publication + "/TEST-update-public-key.hex") }
+    setKey(flow.target, "osCertificateSHA1", quote(identities.signer))
+    setKey(flow.target, "ed25519PublicKeyHex", quote(support.hex(publicKey)))
+    setKey(flow.target, "artifactSHA256", quote(sha256.hex(sha256.digest(data))))
+    setKey(flow.target, "artifactBytes", Text(data.length))
+    setKey(flow.target, "nativeVerification", quote("real OS signature verified before and after bundle decoding"))
+    return succeeded()
+}
+
+public function writeReport(path: Text, text: Text): Outcome {
+    let parentPath = support.parent(path)
+    let made = support.makeDirectories(parentPath)
+    if made != 0 { return osFailure(made, parentPath) }
+    let temporary = support.temporaryFile(parentPath, ".minyar-test-report-")
+    if temporary.descriptor < 0 { return osFailure(temporary.descriptor, parentPath) }
+    let data = Bytes(text + "\n")
+    let written = files.write(temporary.descriptor, data, 0, data.length)
+    files.close(temporary.descriptor)
+    if written == data.length { written = 0 } else if written >= 0 { written = -5 }
+    let outcome = succeeded()
+    if written != 0 { outcome = osFailure(written, temporary.path) }
+    else {
+        let linked = support.execute(["ln", "--", temporary.path, path], 10)
+        if linked.status != 0 { outcome = failure("FileExistsError", "[Errno 17] File exists: " + support.pythonText(path)) }
+    }
+    files.remove(temporary.path)
+    return outcome
+}
+
+function usage(message: Text): Exit {
+    return Exit { status: 2; output: ""; errorOutput: "usage: release-pipeline.min [-h] --native {macos,windows} --output OUTPUT --openssl OPENSSL --cc CC [--signtool SIGNTOOL] [--ephemeral-macos-ci] [--macos-certificate MACOS_CERTIFICATE] [--macos-thumbprint MACOS_THUMBPRINT] [--macos-keychain MACOS_KEYCHAIN] [--owned-boat-windows] [--report REPORT]\nrelease-pipeline.min: error: " + message + "\n" }
+}
+public function blank(): Arguments {
+    return Arguments { native: ""; output: ""; openssl: ""; cc: ""; signtool: ""; ephemeralMacosCi: false; macosCertificate: ""; macosThumbprint: ""; macosKeychain: ""; ownedBoatWindows: false; report: ""; target: "" }
+}
+function sourceDigests(): Text {
+    let names = ["scripts/release.min", "scripts/update-bundle.min", "scripts/update-manifest.min", "tests/release-pipeline.min"]
+    let values: List<Text> = []
+    for name in names { values.add(quote(sha256.hex(sha256.digest(files.readFile(name))))) }
+    return jsonObject(names, values, 1)
+}
+public function invoke(argv: List<Text>, hooks: Hooks): Exit {
+    let arguments = blank()
+    let given: List<Text> = []
+    let index = 0
+    while index < argv.length {
+        let item = argv[index]
+        let option = item
+        let inline = ""
+        let hasInline = false
+        let raw = Bytes(item)
+        if support.starts(item, "--") {
+            for position in 0..raw.length { if !hasInline && raw[position] == 61 { option = Text(raw.slice(0, position)); inline = Text(raw.slice(position + 1, raw.length)); hasInline = true } }
+        }
+        if item == "-h" || item == "--help" { return Exit { status: 0; output: "usage: release-pipeline.min [-h] --native {macos,windows} --output OUTPUT --openssl OPENSSL --cc CC [--signtool SIGNTOOL] [--ephemeral-macos-ci] [--macos-certificate MACOS_CERTIFICATE] [--macos-thumbprint MACOS_THUMBPRINT] [--macos-keychain MACOS_KEYCHAIN] [--owned-boat-windows] [--report REPORT]\n\nTEST ONLY: real tiny native signing, updater roundtrip, mutations and cleanup.\n"; errorOutput: "" } }
+        if option == "--ephemeral-macos-ci" || option == "--owned-boat-windows" {
+            if hasInline { return usage("argument " + option + ": ignored explicit argument " + support.pythonText(inline)) }
+            if option == "--ephemeral-macos-ci" { arguments.ephemeralMacosCi = true } else { arguments.ownedBoatWindows = true }
+            index += 1
+            continue
+        }
+        let known = option == "--native" || option == "--output" || option == "--openssl" || option == "--cc" || option == "--signtool" || option == "--macos-certificate" || option == "--macos-thumbprint" || option == "--macos-keychain" || option == "--report"
+        if !known { return usage("unrecognized arguments: " + item) }
+        let value = inline
+        if !hasInline {
+            if index + 1 >= argv.length { return usage("argument " + option + ": expected one argument") }
+            value = argv[index + 1]
+            index += 1
+        }
+        if option == "--native" {
+            if value != "macos" && value != "windows" { return usage("argument --native: invalid choice: " + support.pythonText(value) + " (choose from 'macos', 'windows')") }
+            arguments.native = value
+        }
+        if option == "--output" { arguments.output = value }
+        if option == "--openssl" { arguments.openssl = value }
+        if option == "--cc" { arguments.cc = value }
+        if option == "--signtool" { arguments.signtool = value }
+        if option == "--macos-certificate" { arguments.macosCertificate = value }
+        if option == "--macos-thumbprint" { arguments.macosThumbprint = value }
+        if option == "--macos-keychain" { arguments.macosKeychain = value }
+        if option == "--report" { arguments.report = value }
+        given.add(option)
+        index += 1
+    }
+    let missing: List<Text> = []
+    for name in ["--native", "--output", "--openssl", "--cc"] {
+        let present = false
+        for item in given { if item == name { present = true } }
+        if !present { missing.add(name) }
+    }
+    if missing.length > 0 { return usage("the following arguments are required: " + support.join(missing, ", ")) }
+    return perform(arguments, hooks)
+}
+function perform(arguments: Arguments, hooks: Hooks): Exit {
+    let target = newReport()
+    let started = false
+    let reportPath = ""
+    let work = ""
+    let publication = ""
+    let published = false
+    let outcome = authorizeContext(hooks, arguments)
+    let output = ""
+    if ok(outcome) {
+        outcome = fromRelease(release.testOutput(arguments.output, ""))
+        output = release.absolute(arguments.output)
+    }
+    if ok(outcome) && arguments.report != "" {
+        outcome = fromRelease(release.testOutput(arguments.report, ".json"))
+        reportPath = release.absolute(arguments.report)
+        if ok(outcome) {
+            let reportResolved = support.looseResolve(reportPath)
+            let outputResolved = support.looseResolve(output)
+            outcome = require(!support.within(reportResolved.path, outputResolved.path), "external report cannot be inside unpublished output")
+        }
+    }
+    if ok(outcome) {
+        let machine = hooks.machine
+        outcome = require(machine == "arm64" || machine == "aarch64" || machine == "amd64" || machine == "x86_64", "unsupported native architecture")
+        if ok(outcome) {
+            let architecture = "-x86_64"
+            if machine == "arm64" || machine == "aarch64" { architecture = "-arm64" }
+            arguments.target = arguments.native + architecture
+            started = true
+            setKey(target, "schema", "1")
+            setKey(target, "testOnly", "true")
+            setKey(target, "native", quote(arguments.native))
+            setKey(target, "target", quote(arguments.target))
+            setKey(target, "status", quote("running"))
+            setKey(target, "sourceSHA256", sourceDigests())
+            setKey(target, "externalPublication", quote("none"))
+            setKey(target, "productionAcceptance", quote("not performed"))
+            setKey(target, "appleNotarization", quote("unavailable: self-signed TEST certificate cannot obtain Apple notarization, staple or Gatekeeper acceptance"))
+            setKey(target, "windowsTimestamp", quote("TEST ONLY: omitted; production still requires RFC3161 SHA256 and /tw"))
+            let version = tool(hooks, [arguments.openssl, "version"])
+            outcome = version.outcome
+            if ok(outcome) { outcome = require(support.starts(Text(version.result.output), "OpenSSL 3."), "OpenSSL 3 required") }
+        }
+    }
+    if ok(outcome) {
+        let maker = hooks.makeDirectory
+        outcome = maker(support.parent(output), true)
+    }
+    if ok(outcome) {
+        let generation = hooks.generation
+        let located = generation(support.parent(output), ".minyar-test-generation-")
+        if located.error != 0 { outcome = osFailure(located.error, support.parent(output)) } else { publication = located.path }
+    }
+    if ok(outcome) {
+        let staging = hooks.staging
+        let located = staging(support.parent(output), ".minyar-test-pipeline-")
+        if located.error != 0 { outcome = osFailure(located.error, support.parent(output)) }
+        else {
+            work = located.path
+            if hooks.replacePipeline {
+                let replacement = hooks.pipeline
+                outcome = replacement(arguments, work, publication, target)
+            } else { outcome = pipeline(hooks, arguments, work, publication, target) }
+            let unstage = hooks.unstage
+            let cleaned = unstage(work)
+            if !ok(cleaned) { outcome = cleaned }
+        }
+    }
+    if ok(outcome) { outcome = require(!exists(work), "private staging remains; no generation published") }
+    if ok(outcome) {
+        setKey(target, "stagingCleanup", quote("verified: removed before publication"))
+        setKey(target, "status", quote("passed"))
+        setKey(target, "generationPublished", "true")
+        let code = support.writeFile(publication + "/TEST-report.json", Bytes(render(target) + "\n"))
+        if code != 0 { outcome = osFailure(code, publication + "/TEST-report.json") }
+    }
+    if ok(outcome) {
+        let publish = hooks.publish
+        outcome = publish(publication, output)
+        if ok(outcome) { published = true }
+    }
+    if ok(outcome) && reportPath != "" {
+        let writer = hooks.writeReport
+        outcome = writer(reportPath, render(target))
+    }
+    if ok(outcome) { return Exit { status: 0; output: render(target) + "\n"; errorOutput: "" } }
+    let errorOutput: List<Text> = []
+    if started {
+        setKey(target, "status", quote("FAILED"))
+        setKey(target, "errorType", quote(outcome.kind))
+        setKey(target, "generationPublished", flag(published))
+        if publication != "" && exists(publication) {
+            let removed = support.removeTree(publication)
+            if removed != 0 { setKey(target, "unpublishedGenerationCleanupError", quote("OSError")) }
+        }
+        if publication == "" || !exists(publication) { setKey(target, "unpublishedGenerationCleanup", quote("verified: absent")) }
+        else { setKey(target, "unpublishedGenerationCleanup", quote("FAILED: unpublished staging remains")) }
+        if work == "" { setKey(target, "stagingCleanup", quote("not created")) }
+        else if !exists(work) { setKey(target, "stagingCleanup", quote("verified: removed")) }
+        else { setKey(target, "stagingCleanup", quote("not verified")) }
+        if reportPath != "" {
+            let writer = hooks.writeReport
+            let written = writer(reportPath, render(target))
+            if !ok(written) { setKey(target, "externalReportError", quote(written.kind)) }
+        }
+        errorOutput.add(render(target) + "\n")
+    }
+    let message = outcome.message
+    if outcome.kind == "CalledProcessError" || outcome.kind == "TimeoutExpired" { message = outcome.kind }
+    let summary = "no successful generation"
+    if published { summary = "generation published; external status reporting failed" }
+    errorOutput.add("TEST pipeline failed; " + summary + ": " + message + "\n" + outcome.detail)
+    return Exit { status: 1; output: ""; errorOutput: joinText(errorOutput) }
+}
+
+function main(): Integer {
+    let argv: List<Text> = []
+    for index in 0..argumentCount() { argv.add(argument(index)) }
+    let exit = invoke(argv, defaults())
+    if exit.output != "" { files.writeStandardOutput(exit.output) }
+    if exit.errorOutput != "" { system.writeStandardError(exit.errorOutput) }
+    return exit.status
+}

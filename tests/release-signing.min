@@ -1,0 +1,723 @@
+use "../tools/testing.min" as test
+use "../scripts/release.min" as release
+use "../scripts/update-manifest.min" as manifest
+use "../scripts/update-support.min" as support
+use "./release-pipeline.min" as pipeline
+use "./release-support.min" as helpers
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Fixture { root: Text; app: Text; cert: Text; thumb: Text; keychain: Text; calls: List<List<Text>>; subject: Text }
+record Counter { calls: Integer; failure: Integer; closing: Boolean }
+record Observed { active: Boolean; invocation: Integer; operation: Integer; signingCall: Integer; phase: Integer; commands: List<List<Text>>; timeouts: List<Integer>; closed: List<Boolean>; published: List<Text> }
+record Stages { works: List<Text>; commits: Integer }
+
+constant SUBJECT = "CN=Minyar TEST ONLY aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+function machO(text: Text): Bytes {
+    let data = Bytes()
+    for byte in [207, 250, 237, 254] { data.add(byte) }
+    data.addBytes(Bytes(text))
+    return data
+}
+function makeDirectories(path: Text) {
+    test.check(support.makeDirectories(path) == 0, "create " + path)
+}
+function setup(): Fixture {
+    let root = test.scratch()
+    let resolved = support.resolve(root)
+    test.check(resolved.error == 0, "resolve scratch")
+    root = resolved.path
+    let app = root + "/input.app"
+    makeDirectories(app + "/Contents/MacOS")
+    makeDirectories(app + "/Contents/Resources")
+    writeBytesFile(app + "/Contents/MacOS/main", machO("unsigned fixture"))
+    writeTextFile(app + "/Contents/Resources/text", "unsigned resource")
+    let cert = root + "/TEST-certificate.der"
+    writeTextFile(cert, "contract certificate")
+    let keychain = root + "/TEST.keychain-db"
+    writeTextFile(keychain, "fixture")
+    return Fixture { root: root; app: app; cert: cert; thumb: pipeline.certificateThumbprint(cert); keychain: keychain; calls: []; subject: SUBJECT }
+}
+function finish(fixture: Fixture) {
+    test.removeTree(fixture.root)
+}
+function prefix(args: List<Text>, expected: List<Text>): Boolean {
+    if args.length < expected.length { return false }
+    for index in 0..expected.length { if args[index] != expected[index] { return false } }
+    return true
+}
+function contains(args: List<Text>, value: Text): Boolean {
+    for item in args { if item == value { return true } }
+    return false
+}
+function respond(fixture: Fixture, args: List<Text>): release.Completed {
+    let output = ""
+    if prefix(args, ["openssl", "x509"]) && contains(args, "-subject") { output = "subject=" + fixture.subject + "\nissuer=" + fixture.subject + "\n" }
+    else if prefix(args, ["openssl", "x509"]) && contains(args, "-ext") { output = "X509v3 Extended Key Usage:\n    Code Signing\n" }
+    return release.Completed { status: 0; output: output; errorOutput: "" }
+}
+function tool(fixture: Fixture): Callback<List<Text>, release.Completed> {
+    return function(args: List<Text>): release.Completed {
+        fixture.calls.add(args)
+        return respond(fixture, args)
+    }
+}
+function sign(fixture: Fixture, output: Text, run: Callback<List<Text>, release.Completed>): release.Outcome {
+    return release.testMacos(fixture.app, output, fixture.cert, fixture.thumb, fixture.keychain, "openssl", run)
+}
+function expect(outcome: release.Outcome, kinds: List<Text>, needle: Text, label: Text) {
+    test.check(contains(kinds, outcome.kind), label + ": expected " + helpers.join(kinds, " or ") + ", got '" + outcome.kind + "' " + outcome.message)
+    test.check(needle == "" || test.contains(outcome.message, needle), label + ": message lacks '" + needle + "': " + outcome.message)
+}
+function expectPipeline(outcome: pipeline.Outcome, kinds: List<Text>, needle: Text, label: Text) {
+    test.check(contains(kinds, outcome.kind), label + ": expected " + helpers.join(kinds, " or ") + ", got '" + outcome.kind + "' " + outcome.message)
+    test.check(needle == "" || test.contains(outcome.message, needle), label + ": message lacks '" + needle + "': " + outcome.message)
+}
+function staged(root: Text, prefixText: Text): Integer {
+    let count = 0
+    for name in files.list(root) { if support.starts(name, prefixText) { count += 1 } }
+    return count
+}
+function ciEnvironment(runnerTemp: Text): List<Text> {
+    return ["GITHUB_ACTIONS=true", "RUNNER_OS=macOS", "RUNNER_ENVIRONMENT=github-hosted", "RUNNER_TEMP=" + runnerTemp]
+}
+function success(output: Bytes): support.Execution {
+    return support.Execution { status: 0; output: output; errorOutput: ""; timedOut: false; launch: 0 }
+}
+function recorder(counter: Counter): Callback<pipeline.Command, support.Execution> {
+    return function(request: pipeline.Command): support.Execution {
+        counter.calls += 1
+        return success(Bytes())
+    }
+}
+function guarded(counters: List<Counter>): pipeline.Hooks {
+    let hooks = pipeline.defaults()
+    let run = Counter { calls: 0; failure: -1; closing: false }
+    let made = Counter { calls: 0; failure: -1; closing: false }
+    let stages = Counter { calls: 0; failure: -1; closing: false }
+    let generations = Counter { calls: 0; failure: -1; closing: false }
+    let reports = Counter { calls: 0; failure: -1; closing: false }
+    let fixtures = Counter { calls: 0; failure: -1; closing: false }
+    for counter in [run, made, stages, generations, reports, fixtures] { counters.add(counter) }
+    hooks.run = recorder(run)
+    hooks.makeDirectory = function(path: Text, parents: Boolean): pipeline.Outcome { made.calls += 1; return pipeline.succeeded() }
+    hooks.staging = function(parent: Text, prefixText: Text): support.Located { stages.calls += 1; return support.Located { error: -1; path: "" } }
+    hooks.generation = function(parent: Text, prefixText: Text): support.Located { generations.calls += 1; return support.Located { error: -1; path: "" } }
+    hooks.writeReport = function(path: Text, text: Text): pipeline.Outcome { reports.calls += 1; return pipeline.succeeded() }
+    hooks.defaultFixture = false
+    hooks.fixture = function(work: Text, cc: Text, native: Text): pipeline.Fixture { fixtures.calls += 1; return pipeline.Fixture { outcome: pipeline.succeeded(); source: ""; entry: ""; resource: "" } }
+    return hooks
+}
+function untouched(counters: List<Counter>, label: Text) {
+    let names = ["run", "mkdir", "TemporaryDirectory", "mkdtemp", "write_report", "native_fixture"]
+    for index in 0..counters.length { test.check(counters[index].calls == 0, label + ": " + names[index] + " was called") }
+}
+function parsedReport(path: Text): json.Value {
+    let value = json.parse(readTextFile(path))
+    test.check(value.kind == json.OBJECT, "report is a JSON object")
+    return value
+}
+function member(value: json.Value, name: Text): Text {
+    return json.string(value, name)
+}
+function memberBoolean(value: json.Value, name: Text): Boolean {
+    let found = json.member(value, name)
+    test.check(found.kind == json.BOOLEAN, name + " is a boolean")
+    return found.truth
+}
+function argumentAt(args: List<Text>, name: Text): Text {
+    for index in 0..(args.length - 1) { if args[index] == name { return args[index + 1] } }
+    return ""
+}
+function derPublic(): Bytes {
+    let data = Bytes()
+    for byte in [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0] { data.add(byte) }
+    data.addBytes(Bytes(helpers.repeat("P", 32)))
+    return data
+}
+
+let names = ["test_non_test_or_existing_outputs_are_refused_before_tools", "test_certificate_identity_pin_and_code_signing_usage_are_mandatory",
+    "test_explicit_test_macos_and_windows_never_invoke_production_services", "test_every_tool_failure_and_warning_leaves_no_test_publication_or_stage",
+    "test_late_output_collision_preserves_other_owners_generation", "test_native_modes_refuse_wrong_host_before_any_tool_or_output",
+    "test_macos_default_and_incomplete_ci_refuse_before_any_tool_or_output", "test_direct_macos_credential_context_is_guarded_before_tools",
+    "test_pipeline_api_default_refuses_before_fixture_tools_or_certdirs", "test_windows_requires_owned_boat_context_before_any_tool_or_directory",
+    "test_provisioned_macos_identity_never_creates_or_cleans_os_credentials", "test_ci_guard_requires_work_under_runner_temp",
+    "test_ci_guard_refuses_missing_or_file_runner_temp_before_any_operations", "test_initial_ed25519_timeouts_clean_credentials_and_never_publish",
+    "test_signed_policy_ed25519_timeouts_clean_credentials_and_never_publish", "test_production_manifest_default_retains_existing_subprocess_options",
+    "test_mac_ci_cleanup_attempts_all_steps_and_refuses_failures_or_drift", "test_independent_decoder_refuses_escape_duplicates_and_truncation",
+    "test_cleanup_failure_prevents_atomic_pipeline_publication", "test_test_cli_has_no_production_credential_or_service_options",
+    "test_production_macos_uses_only_explicit_provisioned_keychain_paths"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "TestSigning." + name { valid = true } }
+    test.check(valid, "unknown release signing case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "TestSigning." + name { return true } }
+    return false
+}
+
+function signerTimeout(fixture: Fixture, signingCall: Integer, phase: Integer) {
+    let output = fixture.root + "/TEST-timeout-macos-" + Text(signingCall) + "-" + Text(phase)
+    let reportPath = output + ".json"
+    let state = Observed { active: false; invocation: -1; operation: 0; signingCall: signingCall; phase: phase; commands: []; timeouts: []; closed: []; published: [] }
+    let certificate = files.readFile(fixture.cert)
+    let hooks = pipeline.defaults()
+    hooks.environment = ciEnvironment(fixture.root)
+    hooks.platform = "darwin"
+    hooks.machine = "x86_64"
+    hooks.ciGuard = false
+    hooks.authorize = false
+    hooks.verifyEnvelopes = false
+    hooks.checkMutations = false
+    hooks.defaultFixture = false
+    let source = fixture.app
+    hooks.fixture = function(work: Text, cc: Text, native: Text): pipeline.Fixture {
+        let tree = work + "/input"
+        test.check(files.makeDirectory(tree) == 0, "fixture tree")
+        let copy = tree + "/TEST-fixture.app"
+        test.require(test.run(["cp", "-RPp", "--", source, copy], system.environment(), "", work + "/fixture.copy", 30), "copy fixture app")
+        test.require(test.run(["chmod", "755", copy + "/Contents/MacOS/main"], system.environment(), "", work + "/fixture.mode", 10), "fixture mode")
+        return pipeline.Fixture { outcome: pipeline.succeeded(); source: copy; entry: "TEST-fixture.app/Contents/MacOS/main"; resource: "TEST-fixture.app/Contents/Resources/text" }
+    }
+    let subject = fixture.subject
+    hooks.run = function(request: pipeline.Command): support.Execution {
+        let args = request.args
+        state.commands.add(args)
+        if state.active {
+            state.timeouts.add(request.timeout)
+            state.closed.add(request.closedInput)
+            let current = state.operation
+            state.operation += 1
+            if state.invocation == state.signingCall && current == state.phase {
+                return support.Execution { status: -9; output: Bytes(); errorOutput: ""; timedOut: true; launch: 0 }
+            }
+        }
+        let output = Bytes()
+        if args[0] == "mock-openssl" {
+            if args[1] == "version" { output = Bytes("OpenSSL 3.0.0") }
+            else if args[1] == "req" {
+                writeTextFile(argumentAt(args, "-keyout"), "mocked OS private key")
+                writeTextFile(argumentAt(args, "-out"), "mocked OS certificate")
+            } else if (args[1] == "x509" || args[1] == "pkcs12" || args[1] == "genpkey") && contains(args, "-out") { writeBytesFile(argumentAt(args, "-out"), certificate) }
+            else if args[1] == "x509" && contains(args, "-subject") { output = Bytes("subject=" + subject + "\nissuer=" + subject + "\n") }
+            else if args[1] == "x509" && contains(args, "-ext") { output = Bytes("X509v3 Extended Key Usage:\n    Code Signing\n") }
+            else if args[1] == "pkey" { output = derPublic() }
+            else if args[1] == "pkeyutl" && contains(args, "-sign") { output = Bytes(helpers.repeat("S", 64)) }
+        } else if prefix(args, ["security", "create-keychain"]) { writeTextFile(args[args.length - 1], "") }
+        else if prefix(args, ["security", "delete-keychain"]) { test.check(files.remove(args[args.length - 1]) == 0, "delete mocked keychain") }
+        else if prefix(args, ["security", "list-keychains"]) { output = Bytes("unchanged search list") }
+        else if prefix(args, ["security", "dump-trust-settings"]) { output = Bytes("unchanged trust") }
+        return success(output)
+    }
+    let production = pipeline.defaultSigner()
+    hooks.signer = function(data: Bytes, key: Text, openssl: Text, passphrase: Text, run: Callback<List<Text>, support.Execution>): manifest.Signature {
+        state.invocation += 1
+        state.operation = 0
+        state.active = true
+        let result = production(data, key, openssl, passphrase, run)
+        state.active = false
+        return result
+    }
+    let realPublish = hooks.publish
+    hooks.publish = function(from: Text, to: Text): pipeline.Outcome {
+        state.published.add(to)
+        return realPublish(from, to)
+    }
+    let exit = pipeline.invoke(["--native", "macos", "--output", output, "--report", reportPath, "--cc", "mock-clang", "--openssl", "mock-openssl", "--ephemeral-macos-ci"], hooks)
+    let label = "timeout at signing call " + Text(signingCall) + " phase " + Text(phase)
+    test.check(exit.status == 1, label + ": exit " + Text(exit.status) + "\n" + exit.errorOutput)
+    for entry in hooks.environment { test.check(!support.starts(entry, "MINYAR_TEST_UPDATE_PASSPHRASE_"), label + ": passphrase leaked into the environment") }
+    let value = parsedReport(reportPath)
+    test.check(state.invocation == signingCall, label + ": signing invocations " + Text(state.invocation))
+    test.check(member(value, "status") == "FAILED", label + ": report status")
+    test.check(member(value, "errorType") == "TimeoutExpired", label + ": error type " + member(value, "errorType"))
+    test.check(!memberBoolean(value, "generationPublished"), label + ": generation published")
+    test.check(member(value, "stagingCleanup") == "verified: removed", label + ": staging cleanup " + member(value, "stagingCleanup"))
+    test.check(!support.exists(output), label + ": output exists")
+    for destination in state.published { test.check(destination != output, label + ": output was published") }
+    test.check(staged(fixture.root, ".minyar-test-pipeline-") == 0, label + ": private staging remains")
+    test.check(staged(fixture.root, ".minyar-test-generation-") == 0, label + ": unpublished generation remains")
+    let removedTrust = false
+    let deletedKeychain = false
+    for command in state.commands {
+        if prefix(command, ["sudo", "-n", "security", "remove-trusted-cert"]) { removedTrust = true }
+        if prefix(command, ["security", "delete-keychain"]) { deletedKeychain = true }
+    }
+    test.check(removedTrust && deletedKeychain, label + ": credential cleanup commands")
+    test.check(json.string(json.member(value, "macosCredentialCleanup"), "status") == "verified", label + ": credential cleanup status")
+    test.check(state.timeouts.length > 0, label + ": no signing process observed")
+    for index in 0..state.timeouts.length {
+        test.check(state.timeouts[index] == 60, label + ": signing process timeout " + Text(state.timeouts[index]))
+        test.check(state.closed[index], label + ": signing process stdin must be closed")
+    }
+}
+
+let cases = 0
+if chosen("test_non_test_or_existing_outputs_are_refused_before_tools") {
+    let fixture = setup()
+    for name in ["release.app", "test-fixture.app", "TEST-fixture.wrong"] {
+        expect(sign(fixture, fixture.root + "/" + name, tool(fixture)), ["value"], "", "non-TEST output " + name)
+    }
+    let existing = fixture.root + "/TEST-existing.app"
+    test.check(files.makeDirectory(existing) == 0, "existing output")
+    writeTextFile(existing + "/previous", "previous")
+    expect(sign(fixture, existing, tool(fixture)), ["exists"], "", "existing TEST output")
+    test.check(fixture.calls.length == 0, "refused outputs invoked tools")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_certificate_identity_pin_and_code_signing_usage_are_mandatory") {
+    let fixture = setup()
+    let out = fixture.root + "/TEST-output.app"
+    expect(release.testMacos(fixture.app, out, fixture.cert, helpers.repeat("B", 40), fixture.keychain, "openssl", tool(fixture)), ["value"], "thumbprint mismatch", "thumbprint mismatch")
+    test.check(fixture.calls.length == 0, "thumbprint mismatch invoked tools")
+    for subject in ["CN=Developer ID Application: Owner", "CN=Minyar TEST ONLY", SUBJECT + ",O=Unexpected"] {
+        fixture.subject = subject
+        expect(sign(fixture, out, tool(fixture)), ["value"], "randomized", "subject " + subject)
+    }
+    fixture.subject = SUBJECT
+    let issuer = function(args: List<Text>): release.Completed {
+        fixture.calls.add(args)
+        let result = respond(fixture, args)
+        if contains(args, "-issuer") { result.output = "subject=" + fixture.subject + "\nissuer=CN=production CA\n" }
+        return result
+    }
+    expect(sign(fixture, out, issuer), ["value"], "", "production issuer")
+    for usage in ["", "X509v3 Extended Key Usage:\n    TLS Web Server Authentication\n", "X509v3 Extended Key Usage:\n    Code Signing, TLS Web Server Authentication\n"] {
+        let invalid = function(args: List<Text>): release.Completed {
+            fixture.calls.add(args)
+            let result = respond(fixture, args)
+            if contains(args, "-ext") { result.output = usage }
+            return result
+        }
+        expect(sign(fixture, out, invalid), ["value"], "Code Signing", "extended key usage")
+    }
+    test.check(!support.exists(out), "refused certificate created output")
+    for call in fixture.calls { test.check(!prefix(call, ["codesign", "--force"]), "refused certificate signed an artifact") }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_explicit_test_macos_and_windows_never_invoke_production_services") {
+    let fixture = setup()
+    let mac = fixture.root + "/TEST-signed.app"
+    expect(sign(fixture, mac, tool(fixture)), [""], "", "TEST macOS signing")
+    let signs: List<List<Text>> = []
+    for call in fixture.calls { if prefix(call, ["codesign", "--force"]) { signs.add(call) } }
+    test.check(signs.length == 2, "TEST signing commands " + Text(signs.length))
+    for command in signs {
+        test.check(contains(command, "--timestamp=none") && contains(command, "--keychain") && contains(command, fixture.thumb) && !contains(command, "--deep"), "TEST signing command " + helpers.join(command, " "))
+    }
+    let verify: List<Text> = []
+    for call in fixture.calls { if verify.length == 0 && prefix(call, ["codesign", "--verify"]) { verify = call } }
+    test.check(argumentAt(verify, "-R") == "certificate leaf = H\"" + fixture.thumb + "\"", "pinned leaf requirement")
+    for call in fixture.calls { test.check(call[0] != "xcrun" && call[0] != "spctl" && call[0] != "hdiutil", "production service invoked: " + call[0]) }
+    test.check(readTextFile(mac + "/Contents/Resources/text") == "unsigned resource", "TEST output resource")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_every_tool_failure_and_warning_leaves_no_test_publication_or_stage") {
+    let fixture = setup()
+    expect(sign(fixture, fixture.root + "/TEST-baseline-macos.app", tool(fixture)), [""], "", "baseline TEST signing")
+    let total = fixture.calls.length
+    for phase in 0..total {
+        for code in [1, 2] {
+            let output = fixture.root + "/TEST-failure-macos.app"
+            let counter = Counter { calls: 0; failure: phase; closing: false }
+            let failing = function(args: List<Text>): release.Completed {
+                counter.calls += 1
+                if counter.calls - 1 == counter.failure { return release.Completed { status: code; output: "failed phase"; errorOutput: "" } }
+                return respond(fixture, args)
+            }
+            expect(sign(fixture, output, failing), ["process"], "", "TEST failure at call " + Text(phase) + " status " + Text(code))
+            test.check(!support.exists(output), "failed TEST signing published output")
+            test.check(staged(fixture.root, ".minyar-test-sign-") == 0, "failed TEST signing left a stage")
+        }
+    }
+    test.check(helpers.same(files.readFile(fixture.app + "/Contents/MacOS/main"), machO("unsigned fixture")), "source app was signed")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_late_output_collision_preserves_other_owners_generation") {
+    let fixture = setup()
+    let output = fixture.root + "/TEST-race-macos.app"
+    let collide = function(args: List<Text>): release.Completed {
+        if prefix(args, ["codesign", "--verify"]) {
+            test.check(files.makeDirectory(output) == 0, "raced generation")
+            writeTextFile(output + "/previous", "prior generation")
+        }
+        fixture.calls.add(args)
+        return respond(fixture, args)
+    }
+    expect(sign(fixture, output, collide), ["exists"], "", "late output collision")
+    test.check(readTextFile(output + "/previous") == "prior generation", "late collision replaced the prior generation")
+    test.check(staged(fixture.root, ".minyar-test-sign-") == 0, "late collision left a stage")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_native_modes_refuse_wrong_host_before_any_tool_or_output") {
+    let fixture = setup()
+    for native in ["macos", "windows"] {
+        let counters: List<Counter> = []
+        let hooks = guarded(counters)
+        hooks.platform = "linux"
+        let exit = pipeline.invoke(["--native", native, "--output", fixture.root + "/TEST-output", "--openssl", "openssl", "--cc", "clang"], hooks)
+        test.check(exit.status == 1, native + " wrong host exit " + Text(exit.status))
+        test.check(counters[0].calls == 0, native + " wrong host ran a tool")
+    }
+    test.check(!support.exists(fixture.root + "/TEST-output"), "wrong host created output")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_macos_default_and_incomplete_ci_refuse_before_any_tool_or_output") {
+    let fixture = setup()
+    let empty: List<Text> = []
+    let configurations = [empty, empty,
+        ["GITHUB_ACTIONS=true", "RUNNER_OS=macOS", "RUNNER_ENVIRONMENT=self-hosted", "RUNNER_TEMP=" + fixture.root],
+        ["GITHUB_ACTIONS=false", "RUNNER_OS=macOS", "RUNNER_ENVIRONMENT=github-hosted", "RUNNER_TEMP=" + fixture.root]]
+    for index in 0..configurations.length {
+        let counters: List<Counter> = []
+        let hooks = guarded(counters)
+        hooks.platform = "darwin"
+        hooks.environment = configurations[index]
+        let argv = ["--native", "macos", "--output", fixture.root + "/TEST-output", "--openssl", "openssl", "--cc", "clang"]
+        if index > 0 { argv.add("--ephemeral-macos-ci") }
+        let exit = pipeline.invoke(argv, hooks)
+        test.check(exit.status == 1, "configuration " + Text(index) + " exit " + Text(exit.status))
+        untouched(counters, "configuration " + Text(index))
+    }
+    test.check(!support.exists(fixture.root + "/TEST-output"), "refused macOS context created output")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_direct_macos_credential_context_is_guarded_before_tools") {
+    let fixture = setup()
+    let counters: List<Counter> = []
+    let hooks = guarded(counters)
+    hooks.environment = []
+    let entered = Counter { calls: 0; failure: -1; closing: false }
+    let outcome = pipeline.macosCredentials(hooks, fixture.root, "openssl", pipeline.newReport(), false, function(identities: pipeline.Identities): pipeline.Outcome { entered.calls += 1; return pipeline.succeeded() })
+    expectPipeline(outcome, ["ValueError"], "ephemeral", "owner Mac credential setup")
+    test.check(entered.calls == 0, "owner Mac credential setup was allowed")
+    test.check(counters[0].calls == 0, "owner Mac credential setup ran a tool")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_pipeline_api_default_refuses_before_fixture_tools_or_certdirs") {
+    let fixture = setup()
+    let counters: List<Counter> = []
+    let hooks = guarded(counters)
+    hooks.environment = []
+    hooks.platform = "darwin"
+    let arguments = pipeline.blank()
+    arguments.native = "macos"
+    arguments.output = fixture.root + "/TEST-output"
+    arguments.cc = "clang"
+    let outcome = pipeline.pipeline(hooks, arguments, fixture.root, fixture.root + "/TEST-output", pipeline.newReport())
+    expectPipeline(outcome, ["ValueError"], "defaults to refusal", "pipeline API default")
+    test.check(counters[5].calls == 0 && counters[0].calls == 0 && counters[1].calls == 0, "pipeline API default touched fixtures, tools or directories")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_windows_requires_owned_boat_context_before_any_tool_or_directory") {
+    let fixture = setup()
+    for owned in [false, true] {
+        let counters: List<Counter> = []
+        let hooks = guarded(counters)
+        hooks.environment = []
+        hooks.platform = "win32"
+        let argv = ["--native", "windows", "--output", fixture.root + "/TEST-output", "--openssl", "openssl", "--cc", "clang", "--signtool", "signtool"]
+        if owned { argv.add("--owned-boat-windows") }
+        let exit = pipeline.invoke(argv, hooks)
+        test.check(exit.status == 1, "Windows context exit " + Text(exit.status))
+        test.check(counters[0].calls == 0 && counters[1].calls == 0, "Windows context touched tools or directories")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_provisioned_macos_identity_never_creates_or_cleans_os_credentials") {
+    let fixture = setup()
+    let counters: List<Counter> = []
+    let hooks = guarded(counters)
+    let target = pipeline.newReport()
+    let certificate = support.resolve(fixture.cert).path
+    let thumb = fixture.thumb
+    let outcome = pipeline.provisionedMacosCredentials(hooks, fixture.cert, fixture.thumb, fixture.keychain, target, function(identity: pipeline.Identities): pipeline.Outcome {
+        test.check(identity.signer == thumb, "provisioned signer")
+        test.check(identity.certificate == certificate, "provisioned certificate")
+        return pipeline.succeeded()
+    })
+    expectPipeline(outcome, [""], "", "provisioned identity")
+    test.check(counters[0].calls == 0, "provisioned identity ran a tool")
+    test.check(test.contains(pipeline.valueOf(target, "macosCredentialCleanup"), "operator-owned"), "provisioned cleanup report")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_ci_guard_requires_work_under_runner_temp") {
+    let fixture = setup()
+    let counters: List<Counter> = []
+    let hooks = guarded(counters)
+    hooks.environment = ciEnvironment(fixture.root)
+    hooks.platform = "darwin"
+    expectPipeline(pipeline.requireEphemeralMacosCi(hooks, fixture.root + "/credentials", true), [""], "", "credentials under RUNNER_TEMP")
+    expectPipeline(pipeline.requireEphemeralMacosCi(hooks, support.parent(fixture.root) + "/outside", true), ["ValueError"], "", "credentials outside RUNNER_TEMP")
+    expectPipeline(pipeline.requireEphemeralMacosCi(hooks, fixture.root + "/credentials", false), ["ValueError"], "", "implicit CI context")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_ci_guard_refuses_missing_or_file_runner_temp_before_any_operations") {
+    let fixture = setup()
+    for root in [fixture.root + "/missing-runner-temp", fixture.cert] {
+        let output = root + "/TEST-output"
+        let reportPath = fixture.root + "/TEST-root-refusal.json"
+        let counters: List<Counter> = []
+        let hooks = guarded(counters)
+        hooks.environment = ciEnvironment(root)
+        hooks.platform = "darwin"
+        let exit = pipeline.invoke(["--native", "macos", "--ephemeral-macos-ci", "--output", output, "--report", reportPath, "--cc", "mock-clang", "--openssl", "mock-openssl"], hooks)
+        test.check(exit.status == 1, "invalid RUNNER_TEMP exit " + Text(exit.status))
+        let entered = Counter { calls: 0; failure: -1; closing: false }
+        let direct = pipeline.macosCredentials(hooks, root + "/credentials", "mock-openssl", pipeline.newReport(), true, function(identities: pipeline.Identities): pipeline.Outcome { entered.calls += 1; return pipeline.succeeded() })
+        expectPipeline(direct, ["ValueError", "OSError", "FileNotFoundError"], "", "invalid runner root direct credentials")
+        test.check(entered.calls == 0, "invalid runner root admitted direct credentials")
+        untouched(counters, "invalid RUNNER_TEMP " + root)
+        test.check(!support.exists(output), "invalid RUNNER_TEMP created output")
+        test.check(!support.exists(reportPath), "invalid RUNNER_TEMP wrote a report")
+    }
+    test.check(!support.exists(fixture.root + "/missing-runner-temp"), "missing RUNNER_TEMP was created")
+    test.check(readTextFile(fixture.cert) == "contract certificate", "certificate changed")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_initial_ed25519_timeouts_clean_credentials_and_never_publish") {
+    for phase in 0..3 {
+        let fixture = setup()
+        signerTimeout(fixture, 0, phase)
+        finish(fixture)
+    }
+    cases += 1
+}
+if chosen("test_signed_policy_ed25519_timeouts_clean_credentials_and_never_publish") {
+    for signingCall in [1, 9] {
+        for phase in 0..3 {
+            let fixture = setup()
+            signerTimeout(fixture, signingCall, phase)
+            finish(fixture)
+        }
+    }
+    cases += 1
+}
+if chosen("test_production_manifest_default_retains_existing_subprocess_options") {
+    let fixture = setup()
+    let fake = fixture.root + "/mock-openssl"
+    let log = fixture.root + "/openssl.log"
+    writeTextFile(fake, "#!/bin/sh\nlog=\"$(dirname -- \"$0\")/openssl.log\"\nprintf '%s\\037' \"$0\" \"$@\" >> \"$log\"\nprintf '\\n' >> \"$log\"\nif [ \"$1\" = pkey ]; then printf '\\060\\052\\060\\005\\006\\003\\053\\145\\160\\003\\041\\000PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP'; fi\nfor argument in \"$@\"; do if [ \"$argument\" = -sign ]; then printf 'SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'; fi; done\nexit 0\n")
+    test.require(test.run(["chmod", "755", fake], system.environment(), "", fixture.root + "/fake.mode", 10), "fake openssl mode")
+    let signature = manifest.signed(Bytes("production contract"), fixture.cert, fake, "OWNER_PASSPHRASE_ENV")
+    test.check(signature.error == "", "production signer: " + signature.error)
+    test.check(helpers.same(signature.signature, Bytes(helpers.repeat("S", 64))) && helpers.same(signature.publicKey, Bytes(helpers.repeat("P", 32))), "production signer output")
+    let calls: List<List<Text>> = []
+    let separator = Bytes()
+    separator.add(31)
+    for line in test.lines(readTextFile(log)) {
+        let parts = helpers.split(line, Text(separator))
+        let args: List<Text> = []
+        for index in 0..(parts.length - 1) { args.add(parts[index]) }
+        calls.add(args)
+    }
+    test.check(calls.length == 3, "production signer process count " + Text(calls.length))
+    for command in calls { test.check(command[0] == fake, "production signer executable " + command[0]) }
+    for index in 0..2 { test.check(argumentAt(calls[index], "-passin") == "env:OWNER_PASSPHRASE_ENV", "production signer passphrase source") }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_mac_ci_cleanup_attempts_all_steps_and_refuses_failures_or_drift") {
+    let fixture = setup()
+    for failure in ["trust removal", "keychain deletion", "search list drift", "trust drift", "partial setup"] {
+        let credentials = fixture.root + "/" + helpers.join(helpers.split(failure, " "), "-")
+        test.check(files.makeDirectory(credentials) == 0, "credentials directory")
+        let target = pipeline.newReport()
+        let calls: List<List<Text>> = []
+        let state = Counter { calls: 0; failure: -1; closing: false }
+        let hooks = pipeline.defaults()
+        hooks.environment = ciEnvironment(fixture.root)
+        hooks.platform = "darwin"
+        hooks.run = function(request: pipeline.Command): support.Execution {
+            let args = request.args
+            calls.add(args)
+            if prefix(args, ["openssl", "req"]) { writeTextFile(argumentAt(args, "-out"), "TEST cert") }
+            if prefix(args, ["openssl", "x509"]) { writeTextFile(argumentAt(args, "-out"), "TEST DER") }
+            if prefix(args, ["security", "create-keychain"]) { writeTextFile(args[args.length - 1], "") }
+            if prefix(args, ["sudo", "-n", "security", "add-trusted-cert"]) && failure == "partial setup" { return support.Execution { status: 1; output: Bytes(); errorOutput: ""; timedOut: false; launch: 0 } }
+            if prefix(args, ["sudo", "-n", "security", "remove-trusted-cert"]) {
+                state.closing = true
+                if failure == "trust removal" { return support.Execution { status: 1; output: Bytes(); errorOutput: ""; timedOut: false; launch: 0 } }
+            }
+            if prefix(args, ["security", "delete-keychain"]) {
+                if failure == "keychain deletion" { return support.Execution { status: 1; output: Bytes(); errorOutput: ""; timedOut: false; launch: 0 } }
+                test.check(files.remove(args[args.length - 1]) == 0, "delete keychain fixture")
+            }
+            let output = Bytes()
+            if prefix(args, ["security", "list-keychains"]) {
+                if state.closing && failure == "search list drift" { output = Bytes("drift") } else { output = Bytes("login") }
+            }
+            if prefix(args, ["security", "dump-trust-settings"]) && state.closing && failure == "trust drift" { output = Bytes("drift") }
+            return success(output)
+        }
+        let outcome = pipeline.macosCredentials(hooks, credentials, "openssl", target, true, function(identities: pipeline.Identities): pipeline.Outcome { return pipeline.succeeded() })
+        expectPipeline(outcome, ["ValueError", "CalledProcessError"], "", failure)
+        let deleted = false
+        for call in calls { if prefix(call, ["security", "delete-keychain"]) { deleted = true } }
+        test.check(deleted, failure + ": keychain deletion was not attempted")
+        let inventoried = false
+        let start = calls.length - 3
+        if start < 0 { start = 0 }
+        for index in start..calls.length { if prefix(calls[index], ["security", "dump-trust-settings"]) { inventoried = true } }
+        test.check(inventoried, failure + ": trust inventory was not rechecked last")
+        let cleanup = json.parse(pipeline.valueOf(target, "macosCredentialCleanup"))
+        let expected = "FAILED"
+        if failure == "partial setup" { expected = "verified" }
+        test.check(json.string(cleanup, "status") == expected, failure + ": cleanup status " + json.string(cleanup, "status"))
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_independent_decoder_refuses_escape_duplicates_and_truncation") {
+    let fixture = setup()
+    let variants: List<Bytes> = []
+    for group in [["../main"], ["main", "MAIN"], ["main"], ["main"]] {
+        let data = Bytes("MINYAR-BUNDLE-1\n")
+        for byte in [0, 0, 0, 4] { data.add(byte) }
+        data.addBytes(Bytes("main"))
+        for byte in [0, 0, 0, group.length] { data.add(byte) }
+        for name in group {
+            let encoded = Bytes(name)
+            data.add(70)
+            data.add(1)
+            for byte in [0, 0, 0, encoded.length, 0, 0, 0, 0, 0, 0, 0, 1] { data.add(byte) }
+            data.addBytes(encoded)
+            data.addBytes(Bytes("x"))
+        }
+        variants.add(data)
+    }
+    variants[2] = variants[2].slice(0, variants[2].length - 1)
+    variants[3].addBytes(Bytes("tail"))
+    for index in 0..variants.length {
+        let decoded = pipeline.decode(variants[index], fixture.root + "/decoded-" + Text(index))
+        expectPipeline(decoded.outcome, ["ValueError", "UnicodeDecodeError"], "", "hostile bundle " + Text(index))
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_cleanup_failure_prevents_atomic_pipeline_publication") {
+    let fixture = setup()
+    let failures = ["openssl", "credential cleanup", "staging cleanup", "publication", "report", ""]
+    for index in 0..failures.length {
+        let failure = failures[index]
+        let output = fixture.root + "/TEST-output-" + Text(index)
+        let reportPath = fixture.root + "/TEST-status-" + Text(index) + ".json"
+        let stages = Stages { works: []; commits: 0 }
+        let hooks = pipeline.defaults()
+        hooks.authorize = false
+        hooks.ciGuard = false
+        hooks.machine = "arm64"
+        hooks.run = function(request: pipeline.Command): support.Execution {
+            if failure == "openssl" { return support.Execution { status: 1; output: Bytes(); errorOutput: ""; timedOut: false; launch: 0 } }
+            return success(Bytes("OpenSSL 3.6.0"))
+        }
+        hooks.replacePipeline = true
+        hooks.pipeline = function(arguments: pipeline.Arguments, work: Text, publication: Text, target: pipeline.Report): pipeline.Outcome {
+            stages.works.add(work)
+            writeTextFile(publication + "/TEST-evidence.txt", "public fixture")
+            if failure == "credential cleanup" { return pipeline.failure("ValueError", "credential cleanup failed") }
+            return pipeline.succeeded()
+        }
+        let cleaner = hooks.unstage
+        hooks.unstage = function(path: Text): pipeline.Outcome {
+            let cleaned = cleaner(path)
+            if failure == "staging cleanup" { return pipeline.failure("OSError", "private staging cleanup failed") }
+            return cleaned
+        }
+        let realPublish = hooks.publish
+        hooks.publish = function(source: Text, destination: Text): pipeline.Outcome {
+            stages.commits += 1
+            test.check(stages.works.length > 0, "publication before staging")
+            for work in stages.works { test.check(!support.exists(work), "publication before private staging cleanup") }
+            let report = json.parse(readTextFile(source + "/TEST-report.json"))
+            test.check(json.string(report, "stagingCleanup") == "verified: removed before publication", "published report staging status")
+            if failure == "publication" { return pipeline.failure("OSError", "atomic commit failed") }
+            return realPublish(source, destination)
+        }
+        let realWriter = hooks.writeReport
+        hooks.writeReport = function(path: Text, text: Text): pipeline.Outcome {
+            if failure == "report" { return pipeline.failure("OSError", "external report failed") }
+            return realWriter(path, text)
+        }
+        let exit = pipeline.invoke(["--native", "macos", "--output", output, "--openssl", "openssl", "--cc", "clang", "--ephemeral-macos-ci", "--report", reportPath], hooks)
+        let label = "cleanup failure '" + failure + "'"
+        if failure == "" { test.check(exit.status == 0, label + ": exit " + Text(exit.status) + "\n" + exit.errorOutput) }
+        else { test.check(exit.status == 1, label + ": exit " + Text(exit.status)) }
+        let expectedCommits = 1
+        if failure == "openssl" || failure == "credential cleanup" || failure == "staging cleanup" { expectedCommits = 0 }
+        test.check(stages.commits == expectedCommits, label + ": publication attempts " + Text(stages.commits))
+        test.check(support.exists(output) == (failure == "report" || failure == ""), label + ": output existence")
+        test.check(staged(fixture.root, ".minyar-test-pipeline-") == 0, label + ": private staging remains")
+        test.check(staged(fixture.root, ".minyar-test-generation-") == 0, label + ": unpublished generation remains")
+        if failure == "report" {
+            test.check(test.contains(exit.errorOutput, "generation published; external status reporting failed"), label + ": published failure summary")
+            test.check(test.contains(exit.errorOutput, "\"generationPublished\": true"), label + ": published failure report")
+        } else {
+            let value = parsedReport(reportPath)
+            let status = "FAILED"
+            if failure == "" { status = "passed" }
+            test.check(member(value, "status") == status, label + ": report status " + member(value, "status"))
+            test.check(memberBoolean(value, "generationPublished") == (failure == ""), label + ": report publication flag")
+            if failure == "openssl" { test.check(member(value, "stagingCleanup") == "not created", label + ": staging status") }
+            if failure != "" { test.check(test.contains(exit.errorOutput, "no successful generation"), label + ": failure summary") }
+        }
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_test_cli_has_no_production_credential_or_service_options") {
+    let fixture = setup()
+    let cli = test.setting("MINYAR_RELEASE_TOOL", "build/tooling/scripts/release")
+    for native in ["test-macos", "test-windows"] {
+        for option in ["--notary-profile", "--timestamp", "--machine-store", "--azure-dlib"] {
+            let result = test.run([cli, native, option, "production"], system.environment(), "", fixture.root + "/cli", 30)
+            test.check(result.status != 0, native + " accepted " + option)
+        }
+    }
+    let help = test.run([cli, "--help"], system.environment(), "", fixture.root + "/help", 30)
+    test.require(help, "release help")
+    test.check(test.contains(help.output, "TEST ONLY"), "release help must describe TEST ONLY modes")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_production_macos_uses_only_explicit_provisioned_keychain_paths") {
+    let fixture = setup()
+    let production = function(args: List<Text>): release.Completed {
+        fixture.calls.add(args)
+        let result = respond(fixture, args)
+        if prefix(args, ["hdiutil", "create"]) { writeTextFile(args[args.length - 1], "contract DMG") }
+        if prefix(args, ["xcrun", "notarytool", "submit"]) { result.output = "{\"status\": \"Accepted\"}" }
+        return result
+    }
+    let settings = release.options()
+    settings.keychain = fixture.keychain
+    settings.notaryKeychain = fixture.keychain
+    expect(release.macos(fixture.app, fixture.root + "/production.dmg", "Developer ID Application: Owner (TEAM)", "owner-notary", settings, release.Hooks { run: production; replace: release.systemReplace() }), [""], "", "production signing")
+    let keychain = support.resolve(fixture.keychain).path
+    for command in fixture.calls {
+        if prefix(command, ["codesign", "--force"]) || prefix(command, ["xcrun", "notarytool", "submit"]) {
+            test.check(argumentAt(command, "--keychain") == keychain, "explicit keychain path in " + helpers.join(command, " "))
+        }
+        test.check(command[0] != "security" && command[0] != "sudo", "production signing changed credentials")
+    }
+    finish(fixture)
+    cases += 1
+}
+print("Release signing: " + Text(cases) + " cases passed")
