@@ -1,0 +1,196 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Owned { name: Text; process: fixtures.Process }
+record Case { context: fixtures.Context; directory: Text; mode: Text; owned: List<Owned>; fields: List<Text>; commands: List<Text>; teardown: List<Text> }
+
+function quoted(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(json.quote(item)) }
+    return "[" + joinWithComma(parts) + "]"
+}
+function joinWithComma(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items {
+        if parts.length > 0 { parts.add(", ") }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+function digest(context: fixtures.Context, path: Text): Text {
+    return fixtures.split(fixtures.execute(context, ["sha256sum", "--", path], 60, "hash " + path).output, 32)[0]
+}
+function report(item: Case, status: Text, failure: Text): Text {
+    let text = "{\"mode\": " + json.quote(item.mode) + ", \"status\": " + status + ", \"commands\": {" + joinWithComma(item.commands) + "}, \"helper_teardown\": {" + joinWithComma(item.teardown) + "}"
+    for entry in item.fields { text = text + ", " + entry }
+    if failure != "" { text = text + ", \"failure\": " + json.quote(failure) }
+    return text + "}"
+}
+function close(item: Case) {
+    for entry in item.owned {
+        let stopped = fixtures.stop(entry.process)
+        item.teardown.add(json.quote(entry.name) + ": {\"status\": " + Text(stopped.status) + ", \"method\": \"failure cleanup\"}")
+    }
+    item.owned = []
+}
+function require(item: Case, condition: Boolean, message: Text) {
+    if condition { return }
+    close(item)
+    writeTextFile(item.directory + "/result.json", report(item, "\"NONPASS\"", message) + "\n")
+    test.check(false, message)
+}
+function launch(item: Case, name: Text, command: List<Text>): fixtures.Process {
+    let process = fixtures.launch(item.context, command, 600)
+    item.owned.add(Owned { name: name; process: process })
+    item.commands.add(json.quote(name) + ": " + quoted(command))
+    return process
+}
+function release(item: Case, name: Text) {
+    let kept: List<Owned> = []
+    for entry in item.owned { if entry.name != name { kept.add(entry) } }
+    item.owned = kept
+}
+function readyPort(item: Case, process: fixtures.Process, name: Text): Integer {
+    let line = fixtures.firstLine(item.context, process, 15000)
+    require(item, fixtures.starts(line, "READY "), name + " did not become ready: " + line)
+    return fixtures.number(fixtures.split(line, 32)[1])
+}
+function contains(lines: List<Text>, wanted: Text): Integer {
+    for index in 0..lines.length { if lines[index] == wanted { return index } }
+    return -1
+}
+function runCase(context: fixtures.Context, mode: Text, evidence: Text, native: Text, quinn: Text, go: Text, proxy: Text, ca: fixtures.Authority) {
+    let directory = evidence + "/" + mode
+    test.check(files.makeDirectory(directory) == 0, "create case directory")
+    let item = Case { context: context; directory: directory; mode: mode; owned: []; fields: []; commands: []; teardown: [] }
+    let mid = mode == "mid"
+    let quic = fixtures.Process { handle: 0; log: ""; line: "" }
+    let udpPort = 9
+    if mid {
+        quic = launch(item, "quinn", [quinn, "server", fixtures.path(ca, "root", "der"), fixtures.path(ca, "server", "der"), fixtures.path(ca, "server", "pk8")])
+        udpPort = readyPort(item, quic, "QUIC server")
+    }
+    let blocked = "0"
+    if mode == "initial" { blocked = "1" }
+    let controlled = "0"
+    if mid { controlled = "1" }
+    let blackhole = launch(item, "proxy", [proxy, Text(udpPort), blocked, controlled])
+    let proxyLine = fixtures.firstLine(context, blackhole, 15000)
+    require(item, fixtures.starts(proxyLine, "READY "), "UDP proxy did not become ready: " + proxyLine)
+    let proxyPorts = fixtures.split(proxyLine, 32)
+    let tcp = launch(item, "go", [go, "server", fixtures.path(ca, "root", "pem"), fixtures.path(ca, "server", "pem"), fixtures.path(ca, "server", "key")])
+    let tcpPort = readyPort(item, tcp, "Go TLS server")
+    let command = [native, mode, proxyPorts[1], Text(tcpPort), proxyPorts[2], fixtures.path(ca, "client", "der"), fixtures.path(ca, "client", "pk8"), fixtures.path(ca, "root", "der"), fixtures.path(ca, "server", "der")]
+    item.commands.add("\"native\": " + quoted(command))
+    let began = system.monotonicNanoseconds()
+    let client = fixtures.run(context, command, 25)
+    let elapsed = Float(system.monotonicNanoseconds() - began) / 1000000000.0
+    writeTextFile(directory + "/native.stdout", client.output)
+    writeTextFile(directory + "/native.stderr", client.errorOutput)
+    let stats = fixtures.stop(blackhole)
+    release(item, "proxy")
+    let counters = json.parse(fixtures.strip(test.lines(stats.output)[test.lines(stats.output).length - 1]))
+    let forwarded = Integer(json.member(counters, "forwarded").number)
+    let blackholed = Integer(json.member(counters, "blocked_dropped").number)
+    let events = json.member(counters, "events").items
+    let failures = json.member(counters, "failures").items
+    item.fields.add("\"native_status\": " + Text(client.status))
+    item.fields.add("\"elapsed_seconds\": " + Text(elapsed))
+    item.fields.add("\"proxy\": {\"forwarded\": " + Text(forwarded) + ", \"dropped\": " + Text(Integer(json.member(counters, "dropped").number)) + ", \"blocked_dropped\": " + Text(blackholed) + "}")
+    item.fields.add("\"control_events\": " + fixtures.strip(json.pretty(json.member(counters, "events"), "")))
+    item.fields.add("\"control_errors\": " + fixtures.strip(json.pretty(json.member(counters, "failures"), "")))
+    require(item, stats.status == 0 && stats.errorOutput == "", "UDP proxy failed (" + Text(stats.status) + ")\n" + stats.errorOutput)
+    require(item, client.status == 0 && client.errorOutput == "", "native client (" + Text(client.status) + ")\n" + client.output + client.errorOutput)
+    let lines = test.lines(client.output)
+    let needed = false
+    for line in lines { if fixtures.starts(line, "TCP_NEEDED generation=1 elapsed_ms=") { needed = true } }
+    require(item, needed, "missing TCP_NEEDED\n" + client.output)
+    require(item, contains(lines, "TCP_AUTHENTICATED fresh") >= 0 && contains(lines, "TCP_STREAMS_COMPLETE 16 bytes=524288") >= 0, "missing fresh TCP proof\n" + client.output)
+    require(item, json.member(counters, "blocked").truth && blackholed > 0, "no real UDP packet was blackholed")
+    if mid {
+        let echo = contains(lines, "QUIC_ECHO authenticated")
+        let acknowledged = contains(lines, "UDP_BLOCKED acknowledged")
+        let fresh = contains(lines, "TCP_AUTHENTICATED fresh")
+        require(item, echo >= 0 && acknowledged >= 0 && echo < acknowledged && acknowledged < fresh, "mid-connection ordering\n" + client.output)
+        require(item, events.length == 1 && failures.length == 0, "blackhole control events " + stats.output)
+    } else {
+        require(item, contains(lines, "QUIC_ECHO authenticated") < 0 && forwarded == 0, "initial blackhole forwarded QUIC\n" + client.output)
+    }
+    let tcpResult = fixtures.settle(tcp, 10000)
+    require(item, tcpResult.status == 0 && test.contains(tcpResult.output, "Go TLS/yamux: 16 authenticated multiplexed half-closed streams passed"), "Go TLS oracle (" + Text(tcpResult.status) + ")\n" + tcpResult.output + tcpResult.errorOutput)
+    release(item, "go")
+    writeTextFile(directory + "/go.stdout", tcpResult.output)
+    writeTextFile(directory + "/go.stderr", tcpResult.errorOutput)
+    item.teardown.add("\"go\": {\"status\": " + Text(tcpResult.status) + ", \"method\": \"normal exit\"}")
+    if mid {
+        require(item, system.poll(quic.handle).state == system.PENDING, "QUIC oracle exited before expected cleanup")
+        let quicResult = fixtures.stop(quic)
+        release(item, "quinn")
+        writeTextFile(directory + "/quinn.stdout", quicResult.output)
+        writeTextFile(directory + "/quinn.stderr", quicResult.errorOutput)
+        item.teardown.add("\"quinn\": {\"status\": " + Text(quicResult.status) + ", \"method\": \"owned SIGTERM after native/TCP proof\", \"normal_exit_leak_claim\": false}")
+        require(item, quicResult.status == 143, "QUIC oracle status " + Text(quicResult.status))
+        require(item, quicResult.errorOutput == "", "Quinn oracle diagnostics\n" + quicResult.errorOutput)
+    }
+    require(item, tcpResult.errorOutput == "", "Go oracle diagnostics\n" + tcpResult.errorOutput)
+    let text = report(item, "0", "")
+    writeTextFile(directory + "/result.json", text + "\n")
+    print("GREEN " + text)
+}
+
+fixtures.arguments(["--sanitize"], ["--binary", "--peer-binary", "--go-binary", "--evidence", "--mode"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+for name in ["--binary", "--peer-binary", "--go-binary"] {
+    let value = fixtures.option(name, "")
+    if value != "" { test.check(fixtures.run(context, ["test", "-f", value], 10).status == 0, "prebuilt binaries must be files") }
+}
+let requested = fixtures.option("--evidence", "")
+test.check(requested != "", "--evidence is required")
+let mode = fixtures.option("--mode", "both")
+test.check(mode == "initial" || mode == "mid" || mode == "both", "invalid mode: " + mode)
+let evidence = requested
+if !fixtures.starts(evidence, "/") { evidence = context.root + "/" + evidence }
+fixtures.execute(context, ["mkdir", "-p", evidence], 10, "create evidence directory")
+test.check(files.list(evidence).length == 0, "evidence directory must be empty")
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let native = fixtures.option("--binary", evidence + "/native")
+let quinn = fixtures.option("--peer-binary", context.root + "/build/interop-quinn/release/minyar-quinn-interop")
+let go = fixtures.option("--go-binary", context.root + "/build/yamux-peer")
+let builds: List<Text> = []
+if fixtures.option("--peer-binary", "") == "" {
+    let command = ["cargo", "build", "--release", "--locked", "--manifest-path", context.root + "/tests/interop/quinn/Cargo.toml", "--target-dir", context.root + "/build/interop-quinn", "--bin", "minyar-quinn-interop", "-j1"]
+    test.require(test.run(command, fixtures.withSetting(context.environment, "CARGO_BUILD_JOBS", "1"), "", fixtures.logPath(context, "cargo"), 300), "build Quinn oracle")
+    builds.add(quoted(command))
+}
+if fixtures.option("--go-binary", "") == "" {
+    fixtures.execute(context, ["mkdir", "-p", context.root + "/build"], 10, "create build directory")
+    let command = ["go", "build", "-p=1", "-mod=readonly", "-o", go, "."]
+    test.require(test.run(command, fixtures.withSetting(context.environment, "GOMAXPROCS", "1"), context.root + "/tests/interop/yamux", fixtures.logPath(context, "go"), 120), "build Go TLS oracle")
+    builds.add(quoted(command))
+}
+if fixtures.option("--binary", "") == "" {
+    fixtures.compileProgram(context, "tests/transport-udp-fallback.min", native)
+    builds.add(quoted([context.root + "/minyar", "--library", context.root + "/library", context.root + "/tests/transport-udp-fallback.min", "-o", native]))
+}
+let proxy = fixtures.helper(context, "tests/udp-blackhole.c", "udp-blackhole", "")
+let ca = fixtures.authority(context, evidence + "/certificates")
+fixtures.root(ca, "root")
+fixtures.leaf(ca, "server", "root", fixtures.options())
+fixtures.leaf(ca, "client", "root", fixtures.usage("clientAuth"))
+let binaries: List<Text> = []
+let names = ["native", "quinn", "go"]
+let paths = [native, quinn, go]
+for index in 0..3 { binaries.add(json.quote(names[index]) + ": {\"path\": " + json.quote(paths[index]) + ", \"sha256\": " + json.quote(digest(context, paths[index])) + "}") }
+writeTextFile(evidence + "/inputs.json", "{\n  \"build_commands\": [" + joinWithComma(builds) + "],\n  \"sanitized_requested\": " + fixtures.truth(sanitize) + ",\n  \"binaries\": {" + joinWithComma(binaries) + "}\n}\n")
+let cases = ["initial", "mid"]
+if mode != "both" { cases = [mode] }
+for kind in cases { runCase(context, kind, evidence, native, quinn, go, proxy, ca) }
+fixtures.finish(context)
