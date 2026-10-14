@@ -21,6 +21,21 @@ class ObserverTests(unittest.TestCase):
         return subprocess.Popen([sys.executable, '-c', source], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True)
 
+    def communicate_within_cpu(self, child, cpu_seconds, stall_seconds=30, wall_seconds=300):
+        ticks = os.sysconf('SC_CLK_TCK')
+        deadline = time.monotonic() + wall_seconds
+        used, stalled = -1, 0
+        while True:
+            try:
+                return child.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                fields = Path(f'/proc/{child.pid}/stat').read_text().rsplit(')', 1)[1].split()
+                consumed = int(fields[11]) + int(fields[12])
+                stalled = stalled + 1 if consumed == used else 0
+                used = consumed
+                if consumed > cpu_seconds * ticks or stalled >= stall_seconds or time.monotonic() > deadline:
+                    raise
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'fixture birth receipts use Linux procfs')
     def test_tls_peer_releases_membership_on_all_close_outcomes(self):
         # Compile ONLY the literal maintained peer function, not the public
@@ -617,7 +632,7 @@ finally:
 '''
         child = self.child(source)
         try:
-            stdout, stderr = child.communicate(timeout=12)
+            stdout, stderr = self.communicate_within_cpu(child, 12)
             sys.stdout.buffer.write(stdout); sys.stdout.buffer.flush()
             self.assertEqual(child.returncode, 0, stderr)
             self.assertEqual(stderr, b'')
