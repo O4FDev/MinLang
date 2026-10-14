@@ -738,13 +738,9 @@ check-sanitize: check-quic-sanitize
 # Pinned Quinn peer in every CI mode. Modes that build the same Minyar endpoint
 # reuse it: ten endpoint builds become four within one recipe.
 .PHONY: check-quic-quinn
-check-quic-quinn: build/minyarc | build
-	@set -e; cache=$$(mktemp -d "$(abspath build)/quic-quinn-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	$(LIMITED) python3 tests/quic-quinn.py; \
-	MINYAR_QUINN_KEY_UPDATE=1 $(LIMITED) python3 tests/quic-quinn.py; \
-	$(LIMITED) python3 tests/quic-quinn.py --migration; \
-	$(LIMITED) python3 tests/quic-quinn.py --resumption; \
-	$(LIMITED) python3 tests/quic-quinn.py --early
+build/tooling/tests/quic-quinn.ll: tests/quic-test-support.min
+check-quic-quinn: build/minyarc build/tooling/tests/quic-quinn | build
+	$(LIMITED) ./build/tooling/tests/quic-quinn
 
 .PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
 check-redis-protocol: build/minyarc build/minyar-runtime.o build/tooling/tests/redis-protocol-test

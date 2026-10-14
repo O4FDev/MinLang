@@ -1,0 +1,89 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+
+constant QUINN = "build/interop-quinn/debug/minyar-quinn-interop"
+
+record Mode { name: Text; variables: List<Text>; resumption: Boolean; early: Boolean; migration: Boolean }
+
+function readyLine(log: Text, handle: Integer, seconds: Integer): Text {
+    let limit = system.monotonicNanoseconds() + seconds * 1000000000
+    while system.monotonicNanoseconds() < limit {
+        let raw = files.readFile(log)
+        for index in 0..raw.length { if raw[index] == 10 { return Text(raw.slice(0, index)) } }
+        if system.poll(handle).state != system.PENDING { return Text(raw) }
+        quic.pause(10)
+    }
+    return ""
+}
+function remainder(output: Text): Text {
+    let raw = Bytes(output)
+    for index in 0..raw.length { if raw[index] == 10 { return Text(raw.slice(index + 1, raw.length)) } }
+    return ""
+}
+function exchange(server: List<Text>, client: List<Text>, environment: List<Text>, work: Text, label: Text, resumption: Boolean) {
+    let log = work + "/" + label + "-server"
+    let handle = test.start(server, environment, "", log, 60)
+    test.check(handle > 0, "cannot start " + label + " server")
+    let ready = readyLine(log, handle, 20)
+    if !quic.starts(ready, "READY ") {
+        let result = test.finish(handle, log)
+        fail(label + " server did not report readiness: " + ready + "\n" + result.output + result.errorOutput)
+    }
+    let command = [client[0], test.words(ready)[1]]
+    for index in 1..client.length { command.add(client[index]) }
+    let answered = test.run(command, environment, "", work + "/" + label + "-client", 20)
+    let served = test.finish(handle, log)
+    let out = remainder(served.output)
+    test.check(answered.status == 0 && served.status == 0, label + " exchange failed: client " + Text(answered.status) + "\n" + answered.output + answered.errorOutput +
+        "\nserver " + Text(served.status) + "\n" + out + served.errorOutput)
+    if resumption { test.check(test.contains(out, "RESUMED 1"), label + " server did not resume: " + out) }
+    files.writeStandardOutput(answered.output)
+    files.writeStandardOutput(out)
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == "--" + name { return true } }
+    return false
+}
+
+let modes = [
+    Mode { name: "default"; variables: []; resumption: false; early: false; migration: false },
+    Mode { name: "key-update"; variables: ["MINYAR_QUINN_KEY_UPDATE"]; resumption: false; early: false; migration: false },
+    Mode { name: "migration"; variables: ["MINYAR_QUINN_REBIND"]; resumption: false; early: false; migration: true },
+    Mode { name: "resumption"; variables: ["MINYAR_QUINN_RESUME"]; resumption: true; early: false; migration: false },
+    Mode { name: "early"; variables: ["MINYAR_QUINN_EARLY", "MINYAR_QUINN_RESUME"]; resumption: true; early: true; migration: false }
+]
+for index in 0..argumentCount() {
+    let known = false
+    for mode in modes { if argument(index) == "--" + mode.name { known = true } }
+    test.check(known, "unknown Quinn mode: " + argument(index))
+}
+let work = test.scratch()
+let built = test.run(["cargo", "build", "--locked", "--manifest-path", "tests/interop/quinn/Cargo.toml", "--target-dir", "build/interop-quinn"], system.environment(), "", work + "/cargo", 300)
+test.require(built, "Quinn peer build")
+let ca = quic.mutual(work + "/certificates")
+let programs: List<Text> = []
+for name in ["quic-udp-server", "quic-soak-server", "quic-udp-client", "quic-udp-resumption"] {
+    programs.add(quic.program("tests/" + name + ".min", work + "/" + name + ".exe", false))
+}
+let root = quic.path(ca, "root", "der")
+for mode in modes {
+    if !selected(mode.name) { continue }
+    let environment = system.environment()
+    for name in mode.variables { environment = quic.setting(environment, name, "1") }
+    let server = [programs[0], quic.path(ca, "server", "der"), quic.path(ca, "server", "pk8"), root]
+    if mode.resumption {
+        server = [programs[1], quic.path(ca, "server", "der"), quic.path(ca, "server", "pk8"), root, "5000", "16"]
+        if mode.early { server.add("early") } else { server.add("tickets") }
+    }
+    exchange(server, [QUINN, root, quic.path(ca, "client", "der"), quic.path(ca, "client", "pk8")], environment, work, mode.name + "-minyar-server", mode.resumption)
+    let client = [programs[2]]
+    if mode.resumption { client = [programs[3]] }
+    for value in [root, quic.path(ca, "client", "der"), quic.path(ca, "client", "pk8")] { client.add(value) }
+    if mode.migration { client.add("migration") }
+    if mode.early { client.add("early") }
+    exchange([QUINN, "server", root, quic.path(ca, "server", "der"), quic.path(ca, "server", "pk8")], client, environment, work, mode.name + "-quinn-server", false)
+}
+test.removeTree(work)
