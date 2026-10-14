@@ -1,0 +1,134 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-protocol-support.min" as protocol
+use "net" as net
+use "errors" as errors
+use "system" as system
+use "files" as files
+
+constant RESERVED = 168430090
+
+function exchange(owner: protocol.Artifacts, server: protocol.Endpoint, packet: Bytes, port: Integer): Bytes {
+    if protocol.fault(owner, "vn-response") {
+        protocol.awaitExit(server, 5)
+        let response = Bytes()
+        for byte in [128, 0, 0, 0, 0, 8] { response.add(byte) }
+        response.addBytes(packet.slice(15, 23))
+        response.add(8)
+        response.addBytes(packet.slice(6, 14))
+        for byte in [0, 0, 0, 1] { response.add(byte) }
+        return response
+    }
+    let client = net.udp("127.0.0.1", 0)
+    if client < 0 { return Bytes() }
+    let response = Bytes()
+    if net.udpConnect(client, "127.0.0.1", port) && errors.integerOk(net.write(client, packet)) && net.ready(client, 3000) {
+        let received = net.receiveDatagram(client, 65535)
+        if errors.bytesStatus(received) == 0 { response = errors.bytesValue(received) }
+    }
+    net.close(client)
+    return response
+}
+function verify(packet: Bytes, response: Bytes, versions: List<Integer>): Text {
+    if response.length == 0 { return "no Version Negotiation response" }
+    if response.length < 27 || response[0] & 128 == 0 || response[1] != 0 || response[2] != 0 || response[3] != 0 || response[4] != 0 { return "not a Version Negotiation packet" }
+    let at = 5
+    let destinationLength = response[at]
+    at += 1
+    if at + destinationLength > response.length { return "not a Version Negotiation packet" }
+    let destination = response.slice(at, at + destinationLength)
+    at += destinationLength
+    if at >= response.length { return "not a Version Negotiation packet" }
+    let sourceLength = response[at]
+    at += 1
+    if at + sourceLength > response.length { return "not a Version Negotiation packet" }
+    let source = response.slice(at, at + sourceLength)
+    at += sourceLength
+    if (response.length - at) % 4 != 0 { return "malformed version list" }
+    while at < response.length {
+        versions.add(((response[at] * 256 + response[at + 1]) * 256 + response[at + 2]) * 256 + response[at + 3])
+        at += 4
+    }
+    let supported = false
+    let reserved = false
+    for version in versions {
+        if version == 1 { supported = true }
+        if version == RESERVED { reserved = true }
+    }
+    if quic.hex(destination) != quic.hex(packet.slice(15, 23)) || quic.hex(source) != quic.hex(packet.slice(6, 14)) || !supported || reserved { return "VN bindings or v1 policy failed" }
+    if response.length > 3 * packet.length { return "strict3x unvalidated response budget exceeded" }
+    return ""
+}
+
+let server = ""
+let port = 44300
+let directory = ""
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "missing option value: " + argument(index))
+    if argument(index) == "--server" { server = argument(index + 1) }
+    else if argument(index) == "--port" { port = Integer(argument(index + 1)) }
+    else if argument(index) == "--artifacts" { directory = argument(index + 1) }
+    else { fail("unknown option: " + argument(index)) }
+    index += 2
+}
+test.check(server != "", "--server is required")
+server = protocol.absolute(server, quic.root())
+let endpointSource = "tests/interop/qns/endpoint.py"
+let owner = protocol.open("minyar-vn", directory, ["tests/quic-vn-probe.min", server, "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min", "tests/interop/qns/server.min", endpointSource], ["reserved-version"])
+let workspace = owner.workspace
+let ca = protocol.authority(owner)
+quic.rootCertificate(ca, "root")
+quic.leaf(ca, "server", "root", "DNS:localhost,IP:127.0.0.1", "serverAuth")
+test.check(files.makeDirectory(workspace + "/www") == 0, "cannot create version-negotiation www")
+protocol.certificatesReady(owner)
+protocol.bindFiles(owner, "reserved-version", "packets", [workspace + "/request.bin", workspace + "/response.bin"])
+protocol.bindFiles(owner, "reserved-version", "keylogs", [workspace + "/keys"])
+let command = [server, quic.path(ca, "server", "pk8"), quic.path(ca, "root", "der"), workspace + "/keys", workspace + "/www", "transfer", quic.path(ca, "server", "der"), "--port=" + Text(port)]
+let endpoint = protocol.endpoint(owner, command, workspace + "/vn-server", "reserved-version", 3)
+let primary = endpoint.startup
+let fields: List<Text> = []
+if primary == "" {
+    let ready = protocol.readyLine(owner, endpoint)
+    primary = ready.error
+    if primary == "" && ready.output != "QNS server ready\n" { primary = "server setup: " + ready.output }
+}
+if primary == "" {
+    let packet = Bytes()
+    for byte in [192, 10, 10, 10, 10, 8] { packet.add(byte) }
+    let destination = randomBytes(8)
+    let source = randomBytes(8)
+    packet.addBytes(destination)
+    packet.add(8)
+    packet.addBytes(source)
+    packet.addBytes(Bytes(1200 - packet.length))
+    writeBytesFile(workspace + "/request.bin", packet)
+    let response = exchange(owner, endpoint, packet, port)
+    writeBytesFile(workspace + "/response.bin", response)
+    let versions: List<Integer> = []
+    primary = verify(packet, response, versions)
+    if primary == "" {
+        let numbers: List<Text> = []
+        for version in versions { numbers.add(Text(version)) }
+        let hashes = quic.digests([workspace + "/request.bin", workspace + "/response.bin", server], owner.scratch + "/.report")
+        fields = ["\"request_path\": \"fixtures/request.bin\"", "\"response_path\": \"fixtures/response.bin\"", "\"reserved_version\": \"0xa0a0a0a\"",
+            "\"versions\": [" + quic.joined(numbers, ", ") + "]", "\"request_bytes\": " + Text(packet.length), "\"response_bytes\": " + Text(response.length),
+            "\"request_sha256\": " + quic.string(hashes[0]), "\"response_sha256\": " + quic.string(hashes[1]), "\"server_sha256\": " + quic.string(hashes[2]),
+            "\"result\": \"passed\"", "\"official_case_disabled\": true"]
+    }
+}
+if endpoint.startup == "" {
+    let stopped = protocol.stop(owner, endpoint, primary)
+    if primary == "" && stopped.error != "" { primary = stopped.error }
+    if primary == "" && stopped.errorOutput != "" { primary = stopped.errorOutput }
+}
+let report = ""
+if primary == "" { report = protocol.publish(owner, fields, true) }
+let passed = protocol.finish(owner, primary)
+if primary != "" {
+    system.writeStandardError("quic-vn-probe: " + primary + "\n")
+    for note in owner.notes { system.writeStandardError("note: " + note + "\n") }
+    exit(1)
+}
+files.writeStandardOutput(report)
+if !passed { exit(1) }

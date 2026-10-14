@@ -668,7 +668,7 @@ check check-portable: check-tls
 QUIC_TEST_TOOLS = quic-ack-test quic-pto-test quic-suite-test quic-crypto-test quic-wire-test quic-dispatch-test \
     quic-transport-test quic-migration-cids-test quic-cipher-policy-test
 $(QUIC_TEST_TOOLS:%=build/tooling/tests/%.ll): tests/quic-test-support.min
-build/tooling/tests/quic-migration-cids-test.ll build/tooling/tests/quic-cipher-policy-test.ll: tests/quic-protocol-support.min
+build/tooling/tests/quic-migration-cids-test.ll build/tooling/tests/quic-cipher-policy-test.ll: tests/quic-protocol-support.min tests/quic-json.min
 build/tooling/tests/quic-wire-test.ll: tests/cpython-random.min
 
 # ACK scheduling gates retain both native and sanitizer optimizations.

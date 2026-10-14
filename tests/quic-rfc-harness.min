@@ -1,0 +1,593 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-protocol-support.min" as protocol
+use "./quic-json.min" as data
+use "./quic-rfc.min" as rfc
+use "json" as json
+use "system" as system
+use "files" as files
+
+constant ZEROS = "0000000000000000000000000000000000000000000000000000000000000000"
+
+record Harness { root: Text; work: Text; serial: List<Integer>; checks: List<Integer>; port: Integer }
+
+function folder(harness: Harness): Text {
+    harness.serial[0] += 1
+    let path = harness.work + "/case-" + Text(harness.serial[0])
+    test.check(files.makeDirectory(path) == 0, "cannot create harness folder")
+    return path
+}
+function contextFor(harness: Harness, directory: Text): rfc.Context { return rfc.newContext(harness.root, directory, harness.port) }
+function expect(harness: Harness, condition: Boolean, message: Text) {
+    test.check(condition, message)
+    harness.checks[0] += 1
+}
+function rejects(harness: Harness, error: Text, label: Text) { expect(harness, error != "", "mutation accepted: " + label) }
+function accepts(harness: Harness, error: Text, label: Text) { expect(harness, error == "", label + ": " + error) }
+function parsed(source: Text): json.Value {
+    let value = json.parse(source)
+    test.check(value.kind != json.INVALID, "invalid harness JSON: " + source)
+    return value
+}
+function shell(harness: Harness, script: Text, arguments: List<Text>, environment: List<Text>): test.Result {
+    let command = ["/bin/sh", "-c", script, "minyar"]
+    for value in arguments { command.add(value) }
+    let log = harness.work + "/.shell-" + Text(system.monotonicNanoseconds())
+    return test.run(command, environment, "", log, 300)
+}
+function item(value: json.Value, index: Integer): json.Value { return value.items[index] }
+function replaced(list: json.Value, index: Integer, value: json.Value): json.Value {
+    let items: List<json.Value> = []
+    for position in 0..list.items.length {
+        if position == index { items = items.appended(value) } else { items = items.appended(list.items[position]) }
+    }
+    return data.array(items)
+}
+function appended(list: json.Value, value: json.Value): json.Value { return data.array(list.items.appended(value)) }
+function nested(value: json.Value, path: List<Text>, replacement: json.Value): json.Value {
+    if path.length == 0 { return replacement }
+    let rest: List<Text> = []
+    for index in 1..path.length { rest.add(path[index]) }
+    if data.isArray(value) {
+        let position = Integer(path[0])
+        return replaced(value, position, nested(value.items[position], rest, replacement))
+    }
+    return data.with(value, path[0], nested(data.field(value, path[0]), rest, replacement))
+}
+function removed(value: json.Value, path: List<Text>): json.Value {
+    let parent: List<Text> = []
+    for index in 0..path.length - 1 { parent.add(path[index]) }
+    let holder = value
+    for name in parent {
+        if data.isArray(holder) { holder = holder.items[Integer(name)] } else { holder = data.field(holder, name) }
+    }
+    return nested(value, parent, data.without(holder, path[path.length - 1]))
+}
+function binaries(directory: Text): rfc.Binaries {
+    let paths: List<Text> = []
+    for name in rfc.binaryNames() {
+        writeTextFile(directory + "/" + name, name)
+        paths.add(directory + "/" + name)
+    }
+    return rfc.Binaries { names: rfc.binaryNames(); paths: paths }
+}
+function fakeClang(directory: Text, status: Integer, hook: Text): Text {
+    let path = directory + "/selected-clang"
+    let tail = "previous=\nfor argument in \"$@\"; do if [ \"$previous\" = -o ]; then printf 'benign staged native binary' >\"$argument\"; break; fi; previous=$argument; done\n"
+    if status != 0 { tail = "exit " + Text(status) + "\n" }
+    writeTextFile(path, "#!/bin/sh\nfor argument in \"$@\"; do if [ \"$argument\" = --version ]; then echo 'benign clang version 23.1.2'; exit 0; fi; done\n" +
+        "{ printf '['; first=1; for argument in \"$0\" \"$@\"; do if [ $first = 0 ]; then printf ', '; fi; first=0; printf '\"%s\"' \"$(printf '%s' \"$argument\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\"; done; printf ']\\n'; } >>\"$HARNESS_CLANG_LOG\"\n" +
+        hook + tail)
+    test.require(test.run(["chmod", "755", path], system.environment(), "", path + ".chmod", 10), "fake compiler mode")
+    return path
+}
+function driverLink(harness: Harness, directory: Text, compiler: Text, flags: List<Text>, raw: Text, runtime: Text, output: Text, artifacts: Text, extra: List<Text>, executable: Text): test.Result {
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !quic.starts(entry, "MINYAR_NATIVE_FLAGS=") && !quic.starts(entry, "MINYAR_RUNTIME_FLAGS=") { environment.add(entry) }
+    }
+    environment = quic.setting(environment, "MINYAR_CLANG", compiler)
+    environment = quic.setting(environment, "MINYAR_CLANG_FLAGS", quic.joined(flags, " "))
+    environment = quic.setting(environment, "MINYAR_LINK_ARTIFACTS", artifacts)
+    environment = quic.setting(environment, "HARNESS_CLANG_LOG", directory + "/clang.jsonl")
+    let command = [executable, "link", directory, raw, runtime, output, "0", "0", ""]
+    for value in extra { command.add(value) }
+    return test.run(command, environment, "", directory + "/driver-" + Text(system.monotonicNanoseconds()), 120)
+}
+function driver(harness: Harness): Text { return harness.root + "/build/tooling/tools/clang-driver" }
+function linkOptimization(harness: Harness, flags: List<Text>): json.Value {
+    let directory = folder(harness)
+    let compiler = fakeClang(directory, 0, "")
+    writeTextFile(directory + "/raw.ll", "define i32 @main() {\nentry:\n  ret i32 0\n}\n")
+    writeTextFile(directory + "/runtime.o", "runtime")
+    let result = driverLink(harness, directory, compiler, flags, directory + "/raw.ll", directory + "/runtime.o", directory + "/output", directory + "/link", [], driver(harness))
+    test.check(result.status == 0, "native link driver failed: " + result.errorOutput)
+    return data.field(data.decode(readBytesFile(directory + "/link/manifest.json")), "optimization")
+}
+
+function pacing(harness: Harness) {
+    for quantum in [19000000, 24000000] {
+        let state = protocol.Pacing { delay: 3000000; deliveryAt: 0; started: false }
+        let now = 0
+        for index in 0..300 {
+            let delay = protocol.deliveryDelay(state, now)
+            expect(harness, delay >= 0, "negative pacing delay")
+            if delay > 0 { now += quantum }
+            now += 100000
+        }
+        expect(harness, now >= 900000000 && now < 900000000 + quantum + 1000000, "coalesced pacing did not recover: " + Text(now))
+    }
+    let state = protocol.Pacing { delay: 3000000; deliveryAt: 0; started: false }
+    expect(harness, protocol.deliveryDelay(state, 0) == 3000000, "first pacing delay differs")
+    let last = 0
+    for index in 0..9 {
+        last = protocol.deliveryDelay(state, 60000000000)
+        expect(harness, last >= 0, "negative catch-up delay")
+    }
+    expect(harness, last > 0, "idle catch-up was unbounded")
+    let unpaced = protocol.Pacing { delay: 0; deliveryAt: 0; started: false }
+    for now in [0, 1000000000, 60000000000] { expect(harness, protocol.deliveryDelay(unpaced, now) == 0, "unpaced proxy delayed delivery") }
+}
+
+function inventories(harness: Harness) {
+    let directory = folder(harness)
+    let source = directory + "/cases.min"
+    writeTextFile(source, "constant NAMES: List<Text> = [\n    \"a\",\n    \"b\"]\nconstant CODES: List<Integer> = [0, 1]\n")
+    let found = rfc.declaredCases(source, "NAMES")
+    expect(harness, found.error == "" && quic.joined(found.values, ",") == "a,b", "native case inventory differs")
+    for content in ["constant NAMES: List<Text> = []\n", "constant NAMES: List<Text> = [\"a\", \"a\"]\n", "constant NAMES: List<Text> = [\"\"]\n", "constant NAMES: List<Text> = [1]\n",
+        "constant NAMES: List<Text> = names()\n", "constant NAMES: List<Integer> = [0]\n", "constant NAMES: List<Text> = [\"a\"]\nconstant NAMES: List<Text> = [\"b\"]\n"] {
+        writeTextFile(source, content)
+        rejects(harness, rfc.declaredCases(source, "NAMES").error, content)
+    }
+}
+
+function numeric(harness: Harness) {
+    for source in ["true", "false", "0.0", "2.0", "\"0\"", "null"] { expect(harness, !rfc.exactInteger(parsed(source), -9223372036854775807, 9223372036854775807), "inexact integer accepted: " + source) }
+    for source in ["-127", "0", "2", "1200"] { expect(harness, rfc.exactInteger(parsed(source), -9223372036854775807, 9223372036854775807), "exact integer rejected: " + source) }
+    expect(harness, !rfc.exactInteger(parsed("-1"), 0, 9223372036854775807), "minimum ignored")
+    expect(harness, !rfc.exactInteger(parsed("5"), -9223372036854775807, 4), "maximum ignored")
+    expect(harness, data.equalsText(linkOptimization(harness, ["-O0", "-ObjC"]), "0"), "-ObjC changed optimization")
+    expect(harness, data.equalsText(linkOptimization(harness, ["-O2", "-O"]), "1"), "-O did not select level 1")
+    expect(harness, data.equalsText(linkOptimization(harness, ["-O0", "-Ofast", "-O2"]), "2"), "last optimization did not win")
+    for flag in ["-ObjC", "-ObjC++", "-Other", "-O2garbage"] { expect(harness, data.isNull(linkOptimization(harness, [flag])), "non-optimization flag selected a level: " + flag) }
+}
+
+function migrationReport(harness: Harness, context: rfc.Context, binaries: rfc.Binaries, source: Text): json.Value {
+    return parsed("{\"baseline\": false, \"compiler_invoked\": false, \"results\": [{\"case\": \"a\", \"expected_returncode\": 0, \"returncode\": 0, \"matched\": true, \"stdout\": \"passed\\n\", \"stderr\": \"\"}, " +
+        "{\"case\": \"b\", \"expected_returncode\": 0, \"returncode\": 0, \"matched\": true, \"stdout\": \"passed\\n\", \"stderr\": \"\"}], \"binary_sha256\": " + quic.string(rfc.digest(context, rfc.binary(binaries, "migration"))) +
+        ", \"test_source_sha256\": " + quic.string(rfc.digest(context, source)) + "}")
+}
+function hashes(context: rfc.Context, binaries: rfc.Binaries): Text {
+    return "{\"client\": " + quic.string(rfc.digest(context, rfc.binary(binaries, "client"))) + ", \"server\": " + quic.string(rfc.digest(context, rfc.binary(binaries, "server"))) + "}"
+}
+function reports(harness: Harness) {
+    let directory = folder(harness)
+    let context = contextFor(harness, directory)
+    let fixtures = binaries(directory)
+    let source = directory + "/source.min"
+    writeTextFile(source, "function main() {}\n")
+    let positive = migrationReport(harness, context, fixtures, source)
+    accepts(harness, rfc.verifyResult(context, "migration", positive, ["a", "b"], fixtures, source), "positive migration report")
+    let rows = data.field(positive, "results")
+    let mutations = [data.with(positive, "results", data.array([item(rows, 0)])), data.with(positive, "results", data.array([item(rows, 1), item(rows, 0)])),
+        data.with(positive, "results", appended(rows, item(rows, 0))), data.with(positive, "baseline", data.boolean(true)), data.with(positive, "compiler_invoked", data.boolean(true)),
+        data.with(positive, "binary_sha256", data.string(ZEROS)), data.with(positive, "test_source_sha256", data.string(ZEROS))]
+    for mutant in mutations { rejects(harness, rfc.verifyResult(context, "migration", mutant, ["a", "b"], fixtures, source), "migration report mutation") }
+    for key in ["expected_returncode", "returncode"] {
+        for value in ["true", "false", "0.0", "\"0\"", "1"] {
+            rejects(harness, rfc.verifyResult(context, "migration", nested(positive, ["results", "0", key], parsed(value)), ["a", "b"], fixtures, source), key + "=" + value)
+        }
+    }
+    let local = parsed("{\"binary_hashes\": " + hashes(context, fixtures) + ", \"results\": [{\"case\": \"keyupdate\", \"expected\": 0, \"semantic_status\": 0, \"client_status\": 0, \"matched\": true, \"files_match\": true, \"reciprocal_epoch_secrets\": true, \"client_stderr\": \"\", \"server_stderr\": \"\"}]}")
+    accepts(harness, rfc.verifyResult(context, "local", local, ["keyupdate"], fixtures, ""), "positive local report")
+    for key in ["expected", "semantic_status", "client_status"] {
+        for value in ["false", "0.0", "62"] { rejects(harness, rfc.verifyResult(context, "local", nested(local, ["results", "0", key], parsed(value)), ["keyupdate"], fixtures, ""), key + "=" + value) }
+    }
+    let vn = parsed("{\"result\": \"passed\", \"server_sha256\": " + quic.string(rfc.digest(context, rfc.binary(fixtures, "server"))) + ", \"reserved_version\": \"0xa0a0a0a\", \"versions\": [1], \"request_bytes\": 1200, \"response_bytes\": 27}")
+    accepts(harness, rfc.verifyResult(context, "vn", vn, ["reserved-version"], fixtures, ""), "positive version-negotiation report")
+    for pair in [["request_bytes", "true"], ["request_bytes", "1200.0"], ["request_bytes", "1199"], ["response_bytes", "false"], ["response_bytes", "27.0"], ["response_bytes", "3601"],
+        ["versions", "[true]"], ["versions", "[1.0]"], ["versions", "[1, 1]"], ["versions", "[168430090]"]] {
+        rejects(harness, rfc.verifyResult(context, "vn", data.with(vn, pair[0], parsed(pair[1])), [], fixtures, ""), pair[0] + "=" + pair[1])
+    }
+}
+
+function preferred(harness: Harness) {
+    let directory = folder(harness)
+    let context = contextFor(harness, directory)
+    let fixtures = binaries(directory)
+    for name in ["preferred", "preferred-ipv6"] {
+        let expected = rfc.preferredTuple(context, name)
+        let row = parsed("{\"case\": " + quic.string(name) + ", \"expected\": 0, \"semantic_status\": 0, \"client_status\": 0, \"matched\": true, \"files_match\": true, \"reciprocal_epoch_secrets\": true, \"client_stderr\": \"\", \"server_stderr\": \"\", \"preferred_tuple_match\": true, \"authenticated_preferred_tuples\": " +
+            quic.quoted([expected]) + ", \"client_stdout\": " + quic.string(expected + "\n") + "}")
+        let report = data.object(["binary_hashes", "results"], [parsed(hashes(context, fixtures)), data.array([row])])
+        accepts(harness, rfc.verifyResult(context, "local", report, [name], fixtures, ""), "positive preferred tuple")
+        let wrong = test.replace(expected, Text(context.port + 1), "0")
+        let changes = [["preferred_tuple_match", "false"], ["preferred_tuple_match", "1"], ["authenticated_preferred_tuples", "[]"], ["authenticated_preferred_tuples", quic.quoted([expected, expected])],
+            ["authenticated_preferred_tuples", quic.quoted([wrong])], ["client_stdout", quic.string(wrong + "\n")], ["client_stdout", quic.string(expected + "\n" + expected + "\n")]]
+        for change in changes {
+            rejects(harness, rfc.verifyResult(context, "local", nested(report, ["results", "0", change[0]], parsed(change[1])), [name], fixtures, ""), name + " " + change[0] + "=" + change[1])
+        }
+    }
+}
+
+record Link { directory: Text; artifacts: Text; binary: Text; manifest: json.Value }
+function linkFixture(harness: Harness, sanitize: Boolean): Link {
+    let directory = folder(harness)
+    let compiler = fakeClang(directory, 0, "")
+    writeTextFile(directory + "/transient-program.ll", "; minyar-native-library: provider\ndefine i32 @main() {\nentry:\n  ret i32 0\n}\n")
+    writeTextFile(directory + "/actual-runtime.o", "unchanged native runtime object")
+    writeTextFile(directory + "/actual-provider.o", "provider object bytes")
+    let result = driverLink(harness, directory, compiler, rfc.requestedFlags("0", sanitize), directory + "/transient-program.ll", directory + "/actual-runtime.o", directory + "/endpoint", directory + "/link",
+        ["--native-object", "provider=" + directory + "/actual-provider.o"], driver(harness))
+    test.check(result.status == 0, "native link fixture failed: " + result.errorOutput)
+    let observed = test.lines(readTextFile(directory + "/clang.jsonl"))
+    let manifest = data.decode(readBytesFile(directory + "/link/manifest.json"))
+    expect(harness, observed.length == 1 && data.equal(data.field(manifest, "actual_command"), parsed(observed[0])), "observed link argv differs from the manifest")
+    return Link { directory: directory; artifacts: directory + "/link"; binary: directory + "/endpoint"; manifest: manifest }
+}
+function writeManifest(link: Link, value: json.Value) { writeTextFile(link.artifacts + "/manifest.json", data.dumps(value)) }
+function lateFlag(value: json.Value, flags: List<Text>): json.Value {
+    let command = data.field(value, "command")
+    for flag in flags { command = appended(command, data.string(flag)) }
+    let actual = appended(appended(command, data.string("-o")), data.field(value, "staged_requested_path"))
+    return data.with(data.with(value, "command", command), "actual_command", actual)
+}
+function links(harness: Harness) {
+    let link = linkFixture(harness, true)
+    let context = contextFor(harness, link.directory)
+    let positive = link.manifest
+    let identity = data.field(data.field(positive, "tools"), "clang.bin").text
+    accepts(harness, rfc.verifyLink(context, link.artifacts, link.binary, true, "0", identity), "positive sanitized link")
+    let mutations: List<json.Value> = []
+    for pair in [["schema", "true"], ["schema", "2.0"], ["schema", "1"], ["link_status", "false"], ["link_status", "0.0"], ["link_status", "1"],
+        ["link_subprocess_status", "false"], ["link_subprocess_status", "0.0"], ["link_subprocess_status", "1"]] {
+        mutations = mutations.appended(data.with(positive, pair[0], parsed(pair[1])))
+    }
+    mutations = mutations.appended(nested(positive, ["compiler_pre_link", "sha256"], data.string(ZEROS)))
+    mutations = mutations.appended(data.with(positive, "link_flags", data.strings(["-O2"])))
+    mutations = mutations.appended(data.with(positive, "optimization", data.string("2")))
+    for flag in ["-O2", "-fno-sanitize=address", "-fno-sanitize=undefined", "-fno-sanitize=all"] { mutations = mutations.appended(lateFlag(positive, [flag])) }
+    mutations = mutations.appended(lateFlag(positive, ["-fno-sanitize=undefined", "-fsanitize=undefined"]))
+    mutations = mutations.appended(data.with(positive, "command", appended(data.field(positive, "command"), data.string("/extra/runtime.ll"))))
+    mutations = mutations.appended(data.with(positive, "command", appended(data.field(positive, "command"), data.string("/extra/provider.o"))))
+    mutations = mutations.appended(data.with(positive, "inputs", data.array([item(data.field(positive, "inputs"), 0)])))
+    mutations = mutations.appended(nested(positive, ["raw_program_input", "pre_link_sha256"], data.string(ZEROS)))
+    mutations = mutations.appended(nested(positive, ["raw_program_input", "retained_sha256"], data.string(ZEROS)))
+    mutations = mutations.appended(nested(positive, ["tool_bindings", "clang.bin", "source_after_sha256"], data.string(ZEROS)))
+    let actual = data.field(positive, "actual_command")
+    mutations = mutations.appended(data.with(positive, "actual_command", replaced(actual, actual.items.length - 1, data.string("/other/stage"))))
+    mutations = mutations.appended(nested(positive, ["staged_output", "bytes"], data.boolean(true)))
+    mutations = mutations.appended(nested(positive, ["final_output", "bytes"], data.decimal(data.field(data.field(positive, "final_output"), "bytes").text + ".0")))
+    mutations = mutations.appended(data.with(positive, "runtime_reannotated", data.boolean(true)))
+    mutations = mutations.appended(data.with(positive, "retention_errors", parsed("[{\"phase\": \"copy\"}]")))
+    for mutant in mutations {
+        writeManifest(link, mutant)
+        rejects(harness, rfc.verifyLink(context, link.artifacts, link.binary, true, "0", ""), "link manifest mutation")
+    }
+    writeManifest(link, lateFlag(positive, ["-fno-sanitize-recover=undefined"]))
+    accepts(harness, rfc.verifyLink(context, link.artifacts, link.binary, true, "0", ""), "recovery policy flag")
+    writeManifest(link, positive)
+    writeTextFile(link.artifacts + "/native-0.o", "corrupt provider")
+    rejects(harness, rfc.verifyLink(context, link.artifacts, link.binary, true, "0", ""), "corrupt provider")
+    let native = linkFixture(harness, false)
+    let nativeContext = contextFor(harness, native.directory)
+    accepts(harness, rfc.verifyLink(nativeContext, native.artifacts, native.binary, false, "0", ""), "positive native link")
+    for flag in ["-fsanitize=address", "-fsanitize=undefined", "-fno-sanitize=undefined", "@unrepresented-flags"] {
+        writeManifest(native, lateFlag(native.manifest, [flag]))
+        rejects(harness, rfc.verifyLink(nativeContext, native.artifacts, native.binary, false, "0", ""), "native override " + flag)
+    }
+    expect(harness, Text(readBytesFile(native.artifacts + "/program.raw.ll")) == Text(readBytesFile(native.directory + "/transient-program.ll")), "retained raw program differs")
+}
+
+function producerFailures(harness: Harness) {
+    let directory = folder(harness)
+    writeTextFile(directory + "/raw.ll", "define i32 @main() {\n ret i32 0\n}\n")
+    writeTextFile(directory + "/runtime.o", "runtime")
+    let failing = fakeClang(directory, 37, "")
+    let status = driverLink(harness, directory, failing, rfc.requestedFlags("0", false), directory + "/raw.ll", directory + "/runtime.o", directory + "/output", directory + "/evidence", [], driver(harness))
+    expect(harness, status.status == 37, "child link status was replaced: " + Text(status.status))
+    let report = data.decode(readBytesFile(directory + "/evidence/manifest.json"))
+    expect(harness, data.equalsInteger(data.field(report, "link_subprocess_status"), 37) && test.contains(data.field(report, "link_error").text, "SystemExit"), "failed link manifest differs")
+    let unreadable = directory + "/execute-only-driver"
+    test.require(shell(harness, "cp -p -- \"$1\" \"$2\" && chmod 111 \"$2\"", [driver(harness), unreadable], system.environment()), "execute-only driver")
+    let failed = driverLink(harness, directory, fakeClang(directory, 0, ""), rfc.requestedFlags("0", false), directory + "/raw.ll", directory + "/runtime.o", directory + "/second-output", directory + "/setup-failure", [], unreadable)
+    expect(harness, failed.status != 0 && test.contains(failed.errorOutput, "Permission denied"), "unreadable driver identity was accepted")
+    let setup = data.decode(readBytesFile(directory + "/setup-failure/manifest.json"))
+    expect(harness, data.isFalse(data.field(setup, "link_attempted")) && data.field(setup, "retention_errors").items.length > 0, "setup failure manifest differs")
+    let retained = folder(harness)
+    writeTextFile(retained + "/raw.ll", "define i32 @main() {\n ret i32 0\n}\n")
+    writeTextFile(retained + "/runtime.o", "runtime")
+    let blocking = fakeClang(retained, 37, "mkdir \"$MINYAR_LINK_ARTIFACTS/manifest.json\"\n")
+    let observed = driverLink(harness, retained, blocking, rfc.requestedFlags("0", false), retained + "/raw.ll", retained + "/runtime.o", retained + "/output", retained + "/failed-link", [], driver(harness))
+    expect(harness, observed.status == 37, "manifest retention failure replaced child status")
+    let fallback = data.decode(readBytesFile(retained + "/failed-link/manifest-retention-error.json"))
+    expect(harness, data.equalsInteger(data.field(fallback, "link_subprocess_status"), 37) && test.contains(data.field(fallback, "link_error").text, "SystemExit") &&
+        data.equalsText(data.field(item(data.field(fallback, "retention_errors"), 0), "phase"), "manifest-retention"), "manifest retention fallback differs")
+}
+
+function gateFailures(harness: Harness) {
+    for phase in ["snapshot", "copy", "evidence"] {
+        let directory = folder(harness) + "/gate"
+        let environment = quic.setting(system.environment(), "MINYAR_QUIC_RFC_FAULT", phase)
+        let result = test.run([harness.root + "/build/tooling/tests/quic-rfc", "--optimization", "both", "--artifacts", directory], environment, "", harness.work + "/gate-" + phase, 600)
+        let original = "original " + phase
+        if phase == "evidence" { original = "original Evidence" }
+        expect(harness, result.status != 0 && test.contains(result.errorOutput, original), "gate replaced the original " + phase + " failure")
+        let report = data.decode(readBytesFile(directory + "/manifest.json"))
+        expect(harness, data.isFalse(data.field(report, "passed")) && data.equalsText(data.field(data.field(report, "error"), "message"), original), "gate failure manifest differs for " + phase)
+    }
+    let directory = folder(harness)
+    let report = rfc.Report { value: parsed("{\"passed\": true, \"retention_errors\": []}") }
+    rfc.writeReport(directory, report, true)
+    expect(harness, data.isFalse(data.field(report.value, "passed")) && files.pathSize(directory + "/manifest-retention-error.json") > 0 &&
+        data.equalsText(data.field(item(data.field(report.value, "retention_errors"), 0), "phase"), "manifest-write"), "manifest write failure was not retained")
+    let copies = folder(harness)
+    writeTextFile(copies + "/source", "original")
+    let context = contextFor(harness, copies)
+    let corrupt = "set -e; root=$1; target=$2; list=$3; mkdir -p \"$target\"; while read -r name; do printf 'wrong' >\"$target/$name\"; done <\"$list\""
+    rejects(harness, rfc.boundCopies(context, copies, ["source"], copies + "/copy", corrupt).error, "corrupt bound copy")
+}
+
+function driverArtifacts(harness: Harness) {
+    let base = folder(harness)
+    let project = base + "/project"
+    let artifacts = base + "/artifacts"
+    test.require(shell(harness, "mkdir -p \"$1/fixtures\" \"$2\"", [artifacts, project], system.environment()), "artifact fixture")
+    let names = ["tests/quic-migration-cids-test.min", "tests/quic-migration-cids.min", "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min"]
+    let context = contextFor(harness, base)
+    context.root = project
+    let hashes: List<Text> = []
+    for name in names {
+        test.require(shell(harness, "mkdir -p \"$(dirname -- \"$1\")\" && printf '%s' \"$2\" >\"$1\"", [project + "/" + name, name], system.environment()), "source fixture")
+        hashes.add(rfc.digest(context, project + "/" + name))
+    }
+    let binary = base + "/migration"
+    writeTextFile(binary, "benign native fixture")
+    let fixtures = rfc.Binaries { names: ["migration"]; paths: [binary] }
+    let certificates = ["fixtures/root.der", "fixtures/server.der", "fixtures/server.pk8", "fixtures/client.der", "fixtures/client.pk8"]
+    for name in certificates { writeTextFile(artifacts + "/" + name, name) }
+    let commands: List<json.Value> = []
+    let labels = ["", "a", "b"]
+    for index in 0..3 {
+        let label = labels[index]
+        let command = data.strings(["openssl", "version"])
+        if label != "" {
+            let argv = [binary]
+            for name in certificates { argv.add(artifacts + "/" + name) }
+            argv.add(label)
+            command = data.strings(argv)
+        }
+        let timeout = 60
+        let phase = "protocol-case"
+        let caseValue = data.string(label)
+        let executable = rfc.digest(context, binary)
+        if label == "" { timeout = 30; phase = "certificate-fixture"; caseValue = data.none(); executable = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+        let row = data.object(["command", "cwd", "timeout", "phase", "case", "returncode", "status", "timed_out", "executable_sha256"],
+            [command, data.string(project), data.number(timeout), data.string(phase), caseValue, data.number(0), data.number(0), data.boolean(false), data.string(executable)])
+        for stream in ["stdout", "stderr"] {
+            let path = artifacts + "/" + Text(index) + "." + stream
+            if label != "" && stream == "stdout" { writeTextFile(path, "passed\r\n") } else { writeTextFile(path, "") }
+            row = data.with(data.with(data.with(row, stream + "_path", data.string(path)), stream + "_sha256", data.string(rfc.digest(context, path))), stream + "_bytes", data.number(files.pathSize(path)))
+        }
+        commands = commands.appended(row)
+    }
+    let references: List<json.Value> = []
+    for pair in [["a", "1"], ["b", "2"]] {
+        let raw = [Text(0) + ".stdout", "0.stderr", pair[1] + ".stdout", pair[1] + ".stderr"].sorted()
+        let all: List<Text> = []
+        for name in certificates { all.add(name) }
+        for name in raw { all.add(name) }
+        references = references.appended(data.object(["case", "command_indices", "endpoint_indices", "fixture_workspace", "file_roles", "files"],
+            [data.string(pair[0]), parsed("[0, " + pair[1] + "]"), data.array([]), data.string(artifacts + "/fixtures"),
+            data.object(["certificates", "raw_output"], [data.strings(certificates.sorted()), data.strings(raw)]), data.strings(all.sorted())]))
+    }
+    let printed = data.object(["declared_cases", "case_inventory", "results"], [data.strings(["a", "b"]), data.array(references),
+        parsed("[{\"case\": \"a\", \"stdout\": \"passed\\n\", \"stderr\": \"\"}, {\"case\": \"b\", \"stdout\": \"passed\\n\", \"stderr\": \"\"}]")])
+    writeTextFile(artifacts + "/results.json", data.dumps(printed))
+    let inventory = rfc.artifactInventory(context, artifacts)
+    let fileHashes: List<json.Value> = []
+    let fileSizes: List<json.Value> = []
+    for index in 0..inventory.names.length { fileHashes = fileHashes.appended(data.string(inventory.hashes[index])); fileSizes = fileSizes.appended(data.number(inventory.sizes[index])) }
+    let inputKeys: List<Text> = []
+    let inputValues: List<json.Value> = []
+    for index in 0..names.length { inputKeys.add(project + "/" + names[index]); inputValues = inputValues.appended(data.string(hashes[index])) }
+    inputKeys.add(binary)
+    inputValues = inputValues.appended(data.string(rfc.digest(context, binary)))
+    let positive = data.object(["schema_version", "status", "finalization_errors", "unhashed_files", "workspace", "inputs", "commands", "endpoint_commands", "declared_cases", "case_inventory", "files", "file_bytes"],
+        [data.number(1), data.string("passed"), data.array([]), data.array([]), data.string(artifacts + "/fixtures"), data.object(inputKeys, inputValues), data.array(commands), data.array([]),
+        data.strings(["a", "b"]), data.array(references), data.object(inventory.names, fileHashes), data.object(inventory.names, fileSizes)])
+    writeTextFile(artifacts + "/manifest.json", data.dumps(positive))
+    let tools: List<rfc.Tool> = []
+    accepts(harness, rfc.verifyDriverArtifacts(context, artifacts, "migration", printed, ["a", "b"], fixtures, names, hashes, tools), "positive driver artifacts")
+    let first = project + "/" + names[0]
+    let mutations = [data.with(positive, "schema_version", data.boolean(true)), data.with(positive, "schema_version", data.decimal("1.0")),
+        data.with(positive, "finalization_errors", parsed("[{\"exception\": \"Failure\"}]")), data.with(positive, "unhashed_files", data.strings(["lost-output.bin"])),
+        data.without(positive, "finalization_errors"), data.without(positive, "unhashed_files"),
+        nested(positive, ["inputs", first], data.string(ZEROS)), removed(positive, ["inputs", first]),
+        nested(positive, ["files", "fixtures/root.der"], data.string(ZEROS)), removed(positive, ["files", "fixtures/root.der"]), nested(positive, ["file_bytes", "fixtures/root.der"], data.boolean(true)),
+        nested(positive, ["commands", "1", "status"], data.decimal("0.0")), nested(positive, ["commands", "1", "returncode"], data.boolean(false)), nested(positive, ["commands", "1", "timeout"], data.decimal("60.0")),
+        nested(positive, ["commands", "1", "command", "6"], data.string("b")), nested(positive, ["commands", "1", "command"], data.strings([binary, "a"])),
+        nested(positive, ["commands", "1", "command", "1"], data.string(artifacts + "/fixtures/server.der")), nested(positive, ["commands", "1", "stdout_sha256"], data.string(ZEROS)),
+        removed(positive, ["commands", "1", "stdout_path"]), nested(positive, ["commands", "1", "stdout_bytes"], data.boolean(true)),
+        data.with(positive, "case_inventory", data.array([references[1], references[0]])), nested(positive, ["case_inventory", "0", "files"], data.array([])),
+        nested(positive, ["case_inventory", "0", "command_indices"], parsed("[0]")), nested(positive, ["case_inventory", "0", "command_indices"], parsed("[0, true]")),
+        removed(positive, ["case_inventory", "0", "file_roles", "certificates"])]
+    for mutant in mutations {
+        writeTextFile(artifacts + "/manifest.json", data.dumps(mutant))
+        rejects(harness, rfc.verifyDriverArtifacts(context, artifacts, "migration", printed, ["a", "b"], fixtures, names, hashes, tools), "driver artifact mutation")
+    }
+}
+
+function snapshot(harness: Harness) {
+    let project = folder(harness)
+    let names = ["minyar", "Makefile", "tests/quic-rfc.min", "tests/quic-rfc-harness.min", "tests/quic-protocol-artifacts.min", rfc.endpointSource(), "build-support/compiler.mk",
+        "compiler/stages/pipeline.min", "compiler/stages/expressions.min", "vendor/monocypher/LICENCE.md", "vendor/monocypher/NOTICE", "runtime/native/abi.h"]
+    for name in rfc.binaryNames() { names.add(rfc.binarySource(name)) }
+    for kind in rfc.driverKinds() { names.add(rfc.driverSource(kind)) }
+    for name in rfc.nativeSupport() { names.add(name) }
+    let unique: List<Text> = []
+    for name in names.sorted() { if unique.length == 0 || unique[unique.length - 1] != name { unique.add(name) } }
+    for name in unique { test.require(shell(harness, "mkdir -p \"$(dirname -- \"$1\")\" && printf '%s' \"$2\" >\"$1\"", [project + "/" + name, name], system.environment()), "snapshot fixture") }
+    let context = contextFor(harness, folder(harness))
+    context.root = project
+    let before = rfc.snapshotInputs(context)
+    expect(harness, before.error == "" && quic.joined(before.names, "\n") == quic.joined(unique, "\n"), "snapshot inventory differs:\n" + quic.joined(before.names, "\n"))
+    writeTextFile(project + "/vendor/monocypher/NOTICE", "changed cache metadata")
+    let after = rfc.snapshotInputs(context)
+    expect(harness, quic.joined(after.hashes, ",") != quic.joined(before.hashes, ","), "vendor metadata change was not observed")
+}
+
+function invocations(harness: Harness) {
+    let directory = folder(harness)
+    let workspace = directory + "/fixtures"
+    test.check(files.makeDirectory(workspace) == 0, "invocation fixture")
+    let context = contextFor(harness, directory)
+    let fixtures = binaries(directory)
+    let certificates = ["fixtures/root.der", "fixtures/server.der", "fixtures/server.pk8", "fixtures/client.der", "fixtures/client.pk8"]
+    for name in certificates { writeTextFile(directory + "/" + name, name) }
+    let roles = data.object(["certificates"], [data.strings(certificates.sorted())])
+    let migration = [rfc.resolved(context, rfc.binary(fixtures, "migration"))]
+    for name in certificates { migration.add(directory + "/" + name) }
+    migration.add("a")
+    accepts(harness, rfc.verifyInvocation(context, "migration", "a", data.strings(migration), data.none(), roles, directory, fixtures), "positive migration argv")
+    let truncated: List<Text> = []
+    for index in 0..migration.length - 1 { truncated.add(migration[index]) }
+    let relabeled = truncated.appended("b")
+    let shifted = [migration[0], migration[2]]
+    for index in 2..migration.length { shifted.add(migration[index]) }
+    for pair in [["b", "full"], ["a", "truncated"], ["a", "relabeled"], ["a", "shifted"]] {
+        let argv = migration
+        if pair[1] == "truncated" { argv = truncated } else if pair[1] == "relabeled" { argv = relabeled } else if pair[1] == "shifted" { argv = shifted }
+        rejects(harness, rfc.verifyInvocation(context, "migration", pair[0], data.strings(argv), data.none(), roles, directory, fixtures), "migration argv " + pair[1])
+    }
+    let declared = rfc.declaredCases(harness.root + "/tests/quic-qns-local.min", "CASES")
+    let mapping = ["multiplex1999", "multiconnect50", "ipv6", "preferred", "preferred-ipv6", "resumption40", "zerortt40", "keyupdate", "chacha20", "rebind-routes", "rebind-pending", "rebind-silent"]
+    expect(harness, quic.joined(mapping.sorted(), ",") == quic.joined(declared.values.sorted(), ","), "local testcase mapping differs from declared cases")
+    for name in mapping {
+        let count = 1
+        if name == "multiplex1999" { count = 1999 } else if name == "multiconnect50" { count = 50 } else if name == "resumption40" || name == "zerortt40" { count = 40 }
+        let names: List<Text> = []
+        for index in 0..count { names.add("file" + Text(index)) }
+        let payloads: List<Text> = []
+        let downloads: List<Text> = []
+        for file in names.sorted() { payloads.add("fixtures/" + name + "-www/" + file); downloads.add("fixtures/" + name + "-downloads/" + file) }
+        let localRoles = data.with(data.with(data.with(roles, "payloads", data.strings(payloads)), "downloads", data.strings(downloads)), "keylogs",
+            data.strings(["fixtures/" + name + "-client.keys", "fixtures/" + name + "-server.keys"].sorted()))
+        let host = "127.0.0.1"
+        if name == "ipv6" || name == "preferred-ipv6" { host = "::1" }
+        let port = context.port
+        if name == "rebind-routes" || name == "rebind-pending" || name == "rebind-silent" { port = context.port + 2 }
+        let testcase = rfc.localTestcase(name)
+        let client = [rfc.resolved(context, rfc.binary(fixtures, "client")), workspace + "/root.der", host, Text(port), workspace + "/" + name + "-client.keys", workspace + "/" + name + "-downloads", testcase]
+        for file in names { client.add(file) }
+        let server = [rfc.resolved(context, rfc.binary(fixtures, "server")), workspace + "/server.pk8", workspace + "/root.der", workspace + "/" + name + "-server.keys", workspace + "/" + name + "-www", testcase, workspace + "/server.der", "--port=" + Text(context.port)]
+        if name == "preferred" { server.add("--preferred-ipv4=7f000001"); server.add("--preferred-port=" + Text(context.port + 1)) }
+        if name == "preferred-ipv6" { for value in ["--preferred-ipv4=00000000", "--preferred-ipv6=00000000000000000000000000000001", "--preferred-port=" + Text(context.port + 1)] { server.add(value) } }
+        accepts(harness, rfc.verifyInvocation(context, "local", name, data.strings(client), data.strings(server), localRoles, directory, fixtures), "positive local argv " + name)
+        for location in 0..8 {
+            let wrong: List<Text> = []
+            for index in 0..client.length { if index == location { wrong.add("incorrect") } else { wrong.add(client[index]) } }
+            rejects(harness, rfc.verifyInvocation(context, "local", name, data.strings(wrong), data.strings(server), localRoles, directory, fixtures), name + " client argument " + Text(location))
+        }
+        for location in 0..server.length {
+            let wrong: List<Text> = []
+            for index in 0..server.length { if index == location { wrong.add("incorrect") } else { wrong.add(server[index]) } }
+            rejects(harness, rfc.verifyInvocation(context, "local", name, data.strings(client), data.strings(wrong), localRoles, directory, fixtures), name + " server argument " + Text(location))
+        }
+    }
+    let vnRoles = data.with(data.with(roles, "packets", data.strings(["fixtures/request.bin", "fixtures/response.bin"])), "keylogs", data.array([]))
+    let server = [rfc.resolved(context, rfc.binary(fixtures, "server")), workspace + "/server.pk8", workspace + "/root.der", workspace + "/keys", workspace + "/www", "transfer", workspace + "/server.der", "--port=" + Text(context.port)]
+    accepts(harness, rfc.verifyInvocation(context, "vn", "reserved-version", data.none(), data.strings(server), vnRoles, directory, fixtures), "positive version-negotiation argv")
+    for location in 0..server.length {
+        let wrong: List<Text> = []
+        for index in 0..server.length { if index == location { wrong.add("incorrect") } else { wrong.add(server[index]) } }
+        rejects(harness, rfc.verifyInvocation(context, "vn", "reserved-version", data.none(), data.strings(wrong), vnRoles, directory, fixtures), "version-negotiation argument " + Text(location))
+    }
+}
+
+function shutdownStates(harness: Harness) {
+    for source in ["{\"status_before_shutdown\": null, \"owned_termination_requested\": true, \"status\": -15}", "{\"status_before_shutdown\": 0, \"owned_termination_requested\": false, \"status\": 0}"] {
+        accepts(harness, rfc.verifyShutdownState(parsed(source)), "positive shutdown state")
+    }
+    for source in ["{\"status_before_shutdown\": -11, \"owned_termination_requested\": false, \"status\": -11}", "{\"status_before_shutdown\": 7, \"owned_termination_requested\": false, \"status\": 7}",
+        "{\"status_before_shutdown\": 0.0, \"owned_termination_requested\": false, \"status\": 0}", "{\"status_before_shutdown\": false, \"owned_termination_requested\": false, \"status\": 0}",
+        "{\"status_before_shutdown\": null, \"owned_termination_requested\": false, \"status\": 0}", "{\"status_before_shutdown\": 0, \"owned_termination_requested\": true, \"status\": 0}",
+        "{\"status_before_shutdown\": 0, \"owned_termination_requested\": false, \"status\": -11}", "{\"status_before_shutdown\": null, \"owned_termination_requested\": 1, \"status\": -15}",
+        "{\"status_before_shutdown\": null, \"owned_termination_requested\": true, \"status\": -15.0}"] {
+        rejects(harness, rfc.verifyShutdownState(parsed(source)), source)
+    }
+    for name in ["status_before_shutdown", "owned_termination_requested", "status"] {
+        rejects(harness, rfc.verifyShutdownState(data.without(parsed("{\"status_before_shutdown\": null, \"owned_termination_requested\": true, \"status\": -15}"), name)), "missing " + name)
+    }
+}
+
+function receipt(signal: Integer): json.Value {
+    return parsed("{\"pid\": 123, \"pgid\": 123, \"attempted\": true, \"signal\": " + Text(signal) + ", \"grace_seconds\": 5, \"wait_timed_out\": false, \"result\": \"sent\"}")
+}
+function endpoint(strategy: Text): json.Value {
+    return data.object(["pid", "status_before_shutdown", "owned_termination_requested", "status", "lifecycle"], [data.number(123), data.none(), data.boolean(true), data.number(-15),
+        data.object(["healthy_before_shutdown", "cleanup_complete", "passed", "termination_strategy", "expected_final_status", "escalated", "cleanup_errors", "receipt"],
+        [data.boolean(true), data.boolean(true), data.boolean(true), data.string(strategy), data.number(-15), data.boolean(false), data.array([]), receipt(15)])])
+}
+function lifecycles(harness: Harness) {
+    let context = contextFor(harness, harness.work)
+    let row = endpoint("posix-sigterm")
+    let checked = rfc.verifyLifecycle(context, row)
+    expect(harness, checked.error == "" && checked.receipts.length == 0, "positive POSIX lifecycle: " + checked.error)
+    let already = data.with(data.with(data.with(row, "status_before_shutdown", data.number(0)), "owned_termination_requested", data.boolean(false)), "status", data.number(0))
+    already = nested(nested(nested(already, ["lifecycle", "termination_strategy"], data.string("already-exited")), ["lifecycle", "expected_final_status"], data.number(0)), ["lifecycle", "receipt"], data.object([], []))
+    accepts(harness, rfc.verifyLifecycle(context, already).error, "already exited lifecycle")
+    let previous = data.with(receipt(15), "wait_timed_out", data.boolean(true))
+    let escalated = data.with(endpoint("posix-sigkill-after-grace"), "status", data.number(-9))
+    escalated = nested(nested(nested(escalated, ["lifecycle", "expected_final_status"], data.number(-9)), ["lifecycle", "escalated"], data.boolean(true)), ["lifecycle", "receipt"], data.with(receipt(9), "previous", previous))
+    accepts(harness, rfc.verifyLifecycle(context, escalated).error, "escalated lifecycle")
+    let mutations = [data.with(data.with(row, "status_before_shutdown", data.number(-11)), "owned_termination_requested", data.boolean(false)), data.with(row, "status", data.number(0)),
+        nested(row, ["lifecycle", "expected_final_status"], data.number(0)), nested(row, ["lifecycle", "expected_final_status"], data.boolean(true)), nested(row, ["lifecycle", "passed"], data.boolean(false)),
+        nested(row, ["lifecycle", "healthy_before_shutdown"], data.boolean(false)), nested(row, ["lifecycle", "cleanup_complete"], data.boolean(false)),
+        nested(row, ["lifecycle", "cleanup_errors"], parsed("[{\"exception\": \"Failure\"}]")), nested(row, ["lifecycle", "termination_strategy"], data.string("any-zero-or-signal")),
+        nested(row, ["lifecycle", "escalated"], data.boolean(true)), nested(row, ["lifecycle", "receipt", "pid"], data.number(124)), nested(row, ["lifecycle", "receipt", "pgid"], data.number(124)),
+        nested(row, ["lifecycle", "receipt", "signal"], data.number(9)), nested(row, ["lifecycle", "receipt", "signal"], data.boolean(true)), nested(row, ["lifecycle", "receipt", "attempted"], data.boolean(false)),
+        nested(row, ["lifecycle", "receipt", "grace_seconds"], data.number(6)), nested(row, ["lifecycle", "receipt", "grace_seconds"], data.decimal("5.0")),
+        nested(row, ["lifecycle", "receipt", "result"], data.string("pending")), nested(row, ["lifecycle", "receipt", "wait_timed_out"], data.boolean(true)), nested(row, ["lifecycle", "receipt", "previous"], receipt(15))]
+    for mutant in mutations { rejects(harness, rfc.verifyLifecycle(context, mutant).error, "lifecycle mutation") }
+    for name in ["healthy_before_shutdown", "cleanup_complete", "passed", "termination_strategy", "expected_final_status", "escalated", "cleanup_errors", "receipt"] {
+        rejects(harness, rfc.verifyLifecycle(context, removed(row, ["lifecycle", name])).error, "missing lifecycle " + name)
+    }
+    for pair in [["wait_timed_out", "false"], ["signal", "9"], ["pid", "124"]] {
+        rejects(harness, rfc.verifyLifecycle(context, nested(escalated, ["lifecycle", "receipt", "previous", pair[0]], parsed(pair[1]))).error, "escalation " + pair[0])
+    }
+    let windows = rfc.Context { root: context.root; scratch: context.scratch; port: context.port; windows: true }
+    let native = data.with(endpoint("windows-taskkill-tree"), "status", data.number(1))
+    native = nested(nested(native, ["lifecycle", "expected_final_status"], data.number(1)), ["lifecycle", "receipt"],
+        parsed("{\"pid\": 123, \"native_pid\": 456, \"pid_source\": \"proc-winpid\", \"python_os_name\": \"posix\", \"argv\": [\"taskkill.exe\", \"-F\", \"-T\", \"-PID\", \"456\"], \"timeout_seconds\": 10, \"attempted\": true, \"status\": 0}"))
+    let accepted = rfc.verifyLifecycle(windows, native)
+    expect(harness, accepted.error == "" && accepted.receipts.length == 1, "positive native lifecycle: " + accepted.error)
+    let changes = [["pid", "124"], ["native_pid", "0"], ["native_pid", "true"], ["argv", "[\"taskkill.exe\", \"-F\", \"-PID\", \"456\"]"], ["status", "1"], ["status", "false"], ["pid_source", "\"popen\""],
+        ["timeout_seconds", "11"], ["attempted", "false"]]
+    for change in changes { rejects(harness, rfc.verifyLifecycle(windows, nested(native, ["lifecycle", "receipt", change[0]], parsed(change[1]))).error, "native receipt " + change[0]) }
+    rejects(harness, rfc.verifyLifecycle(windows, data.with(native, "status", data.number(-11))).error, "native generic exit")
+    rejects(harness, rfc.verifyLifecycle(windows, nested(native, ["lifecycle", "escalated"], data.boolean(true))).error, "native inferred escalation")
+    let empty = rfc.artifactInventory(context, folder(harness))
+    expect(harness, rfc.lifecycleRaw(windows, harness.work, native, empty) != "", "missing native termination output accepted")
+}
+
+let root = quic.root()
+let port = 44300
+if system.getenv("MINYAR_QUIC_RFC_PORT") != "" { port = Integer(system.getenv("MINYAR_QUIC_RFC_PORT")) }
+let harness = Harness { root: root; work: test.scratch(); serial: [0]; checks: [0]; port: port }
+pacing(harness)
+inventories(harness)
+numeric(harness)
+reports(harness)
+preferred(harness)
+links(harness)
+producerFailures(harness)
+gateFailures(harness)
+driverArtifacts(harness)
+snapshot(harness)
+invocations(harness)
+shutdownStates(harness)
+lifecycles(harness)
+test.removeTree(harness.work)
+print("QUIC RFC harness: " + Text(harness.checks[0]) + " controls passed")

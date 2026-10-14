@@ -1,45 +1,335 @@
 use "../tools/testing.min" as test
 use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "json" as json
 use "system" as system
 use "files" as files
 
-public record Artifacts { root: Text; label: Text; path: Text; workspace: Text; scratch: Text; inputs: Text; declared: List<Text>; ledger: quic.Evidence; shared: List<Text>; passed: Boolean; environment: List<Text> }
+public record Role { label: Text; role: Text; paths: List<Text> }
+public record Endpoint { argv: List<Text>; label: Text; peerTimeout: Integer; cwd: Text; binaryHash: Text; stdoutPath: Text; stderrPath: Text
+    handle: Integer; pid: Integer; started: Integer; consumed: Text; readyHash: Text; readinessTimedOut: Boolean; stopped: Boolean
+    exitedBefore: Boolean; statusBefore: Integer; requested: Boolean; lifecycle: Text; status: Integer; elapsed: Text
+    stdoutHash: Text; stdoutBytes: Integer; stderrHash: Text; stderrBytes: Integer; primary: Text; startup: Text; passed: Boolean; done: Boolean; code: Integer }
+public record Output { output: Text; errorOutput: Text; error: Text }
+public record Artifacts { root: Text; label: Text; path: Text; workspace: Text; scratch: Text; inputs: Text; declared: List<Text>; ledger: quic.Evidence; shared: List<Text>; passed: Boolean; environment: List<Text>
+    endpoints: List<Endpoint>; roles: List<Role>; errors: List<Text>; notes: List<Text>; faults: List<Text> }
 
 public function absolute(path: Text, root: Text): Text {
     if quic.starts(path, "/") { return path }
     return root + "/" + path
 }
+function faults(): List<Text> {
+    let value = system.getenv("MINYAR_QUIC_PROTOCOL_FAULT")
+    if value == "" { return [] }
+    return quic.split(value, 44)
+}
+public function fault(owner: Artifacts, name: Text): Boolean {
+    for index in 0..owner.faults.length {
+        if owner.faults[index] == name {
+            owner.faults[index] = ""
+            return true
+        }
+    }
+    return false
+}
+function inputDigests(paths: List<Text>, scratch: Text): Text {
+    if paths.length == 0 { return "{}" }
+    return quic.digestObject(quic.fileDigests(paths, scratch + "/.inputs"))
+}
+public function alive(item: Endpoint): Boolean { return !(item.done || exited(item)) }
 public function open(label: Text, requested: Text, inputs: List<Text>, declared: List<Text>): Artifacts {
     let root = quic.root()
     let paths: List<Text> = []
     for input in inputs { paths.add(absolute(input, root)) }
     if requested == "" {
         let scratch = test.scratch()
-        let digests = quic.fileDigests(paths, scratch + "/.inputs")
-        return Artifacts { root: root; label: label; path: ""; workspace: scratch; scratch: scratch; inputs: quic.digestObject(digests); declared: declared;
-            ledger: quic.unrecorded(scratch); shared: []; passed: false; environment: system.environment() }
+        return Artifacts { root: root; label: label; path: ""; workspace: scratch; scratch: scratch; inputs: inputDigests(paths, scratch); declared: declared;
+            ledger: quic.unrecorded(scratch); shared: []; passed: false; environment: system.environment(); endpoints: []; roles: []; errors: []; notes: []; faults: faults() }
     }
     test.check(quic.starts(requested, "/") && files.pathSize(requested) < 0, "--artifacts requires a fresh absolute path")
     test.check(files.makeDirectory(requested) == 0, "cannot create protocol artifacts")
     test.check(files.makeDirectory(requested + "/fixtures") == 0, "cannot create protocol fixture workspace")
     let scratch = test.scratch()
-    let digests = quic.fileDigests(paths, scratch + "/.inputs")
-    return Artifacts { root: root; label: label; path: requested; workspace: requested + "/fixtures"; scratch: scratch; inputs: quic.digestObject(digests); declared: declared;
-        ledger: quic.evidence(requested); shared: []; passed: false; environment: system.environment() }
+    return Artifacts { root: root; label: label; path: requested; workspace: requested + "/fixtures"; scratch: scratch; inputs: inputDigests(paths, scratch); declared: declared;
+        ledger: quic.evidence(requested); shared: []; passed: false; environment: system.environment(); endpoints: []; roles: []; errors: []; notes: []; faults: faults() }
 }
 public function authority(owner: Artifacts): quic.Authority { return quic.recorded(owner.workspace, owner.ledger) }
 public function certificatesReady(owner: Artifacts) {
-    let names = files.list(owner.workspace)
+    let listed = test.run(["find", owner.workspace, "-maxdepth", "1", "-type", "f"], owner.environment, "", owner.scratch + "/.shared", 30)
+    test.require(listed, "certificate inventory")
+    let names: List<Text> = []
+    for line in test.lines(listed.output) { if !quic.starts(quic.after(line, owner.workspace + "/"), ".") { names.add(line) } }
     names.sort()
-    for name in names {
-        if !quic.starts(name, ".") { owner.shared.add(owner.workspace + "/" + name) }
-    }
+    for name in names { owner.shared.add(name) }
 }
+public function awaitExit(item: Endpoint, seconds: Integer): Boolean { return waited(item, seconds) }
 public function run(owner: Artifacts, command: List<Text>, limit: Integer, label: Text): test.Result {
     owner.ledger.label[0] = label
     let result = quic.observe(owner.ledger, "protocol-case", command, owner.environment, "", limit)
     owner.ledger.label[0] = ""
     return result
+}
+public function bindFiles(owner: Artifacts, label: Text, role: Text, paths: List<Text>) {
+    for index in 0..owner.roles.length {
+        if owner.roles[index].label == label && owner.roles[index].role == role { owner.roles[index].paths = paths; return }
+    }
+    owner.roles.add(Role { label: label; role: role; paths: paths })
+}
+function digestFile(owner: Artifacts, path: Text): Text { return quic.digest(path, owner.scratch + "/.digest-" + Text(system.monotonicNanoseconds())) }
+function digestBytes(owner: Artifacts, value: Bytes): Text {
+    let path = owner.scratch + "/.bytes-" + Text(system.monotonicNanoseconds())
+    writeBytesFile(path, value)
+    let result = digestFile(owner, path)
+    test.check(files.remove(path) == 0, "cannot remove digest input")
+    return result
+}
+public function normalized(value: Text): Text { return test.replace(test.replace(value, "\r\n", "\n"), "\r", "\n") }
+function exited(item: Endpoint): Boolean {
+    if item.handle <= 0 { return true }
+    let status = system.poll(item.handle)
+    if status.state == system.PENDING { return false }
+    item.code = status.exitCode
+    if status.state == system.SIGNALED { item.code = -status.signal }
+    item.handle = 0
+    return true
+}
+function processGroup(owner: Artifacts, pid: Integer): Integer {
+    let log = owner.scratch + "/.group-" + Text(system.monotonicNanoseconds())
+    let result = test.run(["ps", "-o", "pgid=", "-p", Text(pid)], owner.environment, "", log, 10)
+    files.remove(log)
+    files.remove(log + ".err")
+    let fields = test.words(result.output)
+    if result.status != 0 || fields.length != 1 { return -1 }
+    return Integer(fields[0])
+}
+constant SESSION = "defined(POSIX::setsid()) or die \"setsid: $!\\n\"; exec { $ARGV[0] } @ARGV or die \"exec: $!\\n\""
+public function endpoint(owner: Artifacts, command: List<Text>, stem: Text, label: Text, peerTimeout: Integer): Endpoint {
+    let item = Endpoint { argv: command; label: label; peerTimeout: peerTimeout; cwd: owner.root; binaryHash: digestFile(owner, command[0]); stdoutPath: stem + ".stdout.bin"; stderrPath: stem + ".stderr.bin"
+        handle: 0; pid: 0; started: system.monotonicNanoseconds(); consumed: ""; readyHash: ""; readinessTimedOut: false; stopped: false
+        exitedBefore: false; statusBefore: 0; requested: false; lifecycle: ""; status: 0; elapsed: "0.0"
+        stdoutHash: ""; stdoutBytes: 0; stderrHash: ""; stderrBytes: 0; primary: ""; startup: ""; passed: false; done: false; code: 0 }
+    writeTextFile(item.stdoutPath, "")
+    writeTextFile(item.stderrPath, "")
+    let argv = ["perl", "-MPOSIX", "-e", SESSION, "--", "/bin/sh", "-c", "out=$1; err=$2; shift 2; exec \"$@\" >>\"$out\" 2>>\"$err\"", "minyar", item.stdoutPath, item.stderrPath]
+    for value in command { argv.add(value) }
+    item.handle = system.spawn("/usr/bin/perl", argv, owner.environment, "")
+    test.check(item.handle > 0, "cannot start owned endpoint: " + command[0])
+    item.pid = system.childProcessId(item.handle)
+    owner.endpoints.add(item)
+    for step in ["capture-first", "capture-second"] {
+        if fault(owner, step) {
+            item.startup = "controlled " + step + " start failure"
+            stop(owner, item, item.startup)
+            return item
+        }
+    }
+    return item
+}
+public function readyLine(owner: Artifacts, item: Endpoint): Output {
+    if fault(owner, "readiness") { return Output { output: ""; errorOutput: ""; error: "controlled readiness failure" } }
+    let limit = system.monotonicNanoseconds() + 10000000000
+    let consumed = Bytes()
+    let complete = false
+    while !complete {
+        let finished = item.done || exited(item)
+        if finished { item.done = true }
+        let raw = files.readFile(item.stdoutPath)
+        for index in 0..raw.length {
+            if raw[index] == 10 { consumed = raw.slice(0, index + 1); complete = true; break }
+        }
+        if !complete && finished { consumed = raw; complete = true }
+        if !complete && system.monotonicNanoseconds() >= limit {
+            item.readinessTimedOut = true
+            return Output { output: ""; errorOutput: ""; error: "" }
+        }
+        if !complete { quic.pause(10) }
+    }
+    item.consumed = Text(consumed)
+    item.readyHash = digestBytes(owner, consumed)
+    return Output { output: normalized(item.consumed); errorOutput: ""; error: "" }
+}
+record Slot { value: json.Value }
+function signalGroup(owner: Artifacts, item: Endpoint, signal: Integer, receipt: Slot): Text {
+    let group = processGroup(owner, item.pid)
+    if group != item.pid { return "endpoint no longer owns its process group" }
+    receipt.value = data.object(["pid", "pgid", "attempted", "signal", "grace_seconds", "wait_timed_out", "result"],
+        [data.number(item.pid), data.number(group), data.boolean(true), data.number(signal), data.number(5), data.boolean(false), data.string("pending")])
+    if fault(owner, "termination") { return "controlled termination failure" }
+    if system.sendSignal(-group, signal) != 0 { return "cannot signal owned endpoint process group" }
+    receipt.value = data.with(receipt.value, "result", data.string("sent"))
+    return ""
+}
+function waited(item: Endpoint, seconds: Integer): Boolean {
+    let limit = system.monotonicNanoseconds() + seconds * 1000000000
+    while !(item.done || exited(item)) {
+        if system.monotonicNanoseconds() >= limit { return false }
+        quic.pause(10)
+    }
+    item.done = true
+    return true
+}
+function failureJSON(stage: Text, message: Text): Text {
+    return data.dumps(data.object(["stage", "exception", "message"], [data.string(stage), data.string("RuntimeError"), data.string(message)]))
+}
+public function stop(owner: Artifacts, item: Endpoint, primary: Text): Output {
+    if item.stopped {
+        let raw = Bytes(Text(files.readFile(item.stdoutPath)))
+        let prefix = Bytes(item.consumed)
+        let output = Text(raw)
+        if quic.starts(output, item.consumed) { output = Text(raw.slice(prefix.length, raw.length)) }
+        return Output { output: normalized(output); errorOutput: normalized(Text(files.readFile(item.stderrPath))); error: "" }
+    }
+    let errors: List<Text> = []
+    let finished = item.done || exited(item)
+    if finished { item.done = true; item.exitedBefore = true; item.statusBefore = item.code }
+    item.requested = !finished
+    let healthy = !finished || item.code == 0
+    let strategy = "already-exited"
+    let expected = 0
+    let escalated = false
+    let receipt = Slot { value: data.object([], []) }
+    if item.requested {
+        strategy = "posix-sigterm"
+        expected = -15
+        let failure = signalGroup(owner, item, 15, receipt)
+        let timedOut = false
+        if failure == "" && !waited(item, 5) {
+            receipt.value = data.with(receipt.value, "wait_timed_out", data.boolean(true))
+            timedOut = true
+        }
+        if failure != "" { errors.add(failureJSON("termination", failure)) }
+        if (failure != "" || timedOut) && !(item.done || exited(item)) {
+            escalated = true
+            let previous = receipt.value
+            strategy = "posix-sigkill-after-grace"
+            expected = -9
+            let forced = signalGroup(owner, item, 9, receipt)
+            receipt.value = data.with(receipt.value, "previous", previous)
+            if forced != "" { errors.add(failureJSON("forced-termination", forced)) }
+            else if !waited(item, 5) { errors.add(failureJSON("forced-termination", "owned endpoint did not exit after SIGKILL")) }
+        }
+    }
+    let complete = item.done || exited(item)
+    if complete { item.done = true }
+    item.stopped = complete
+    item.status = item.code
+    item.elapsed = quic.seconds(item.started)
+    let lifecycle = data.object(["healthy_before_shutdown", "termination_strategy", "expected_final_status", "escalated", "cleanup_errors", "receipt"],
+        [data.boolean(healthy), data.string(strategy), data.number(expected), data.boolean(escalated), data.array([]), receipt.value])
+    let cleanup: List<json.Value> = []
+    for error in errors { cleanup = cleanup.appended(json.parse(error)) }
+    lifecycle = data.with(lifecycle, "cleanup_errors", data.array(cleanup))
+    if fault(owner, "retention") {
+        let message = "controlled retention failure"
+        cleanup = cleanup.appended(json.parse(failureJSON("cleanup-or-retention", message)))
+        lifecycle = data.with(data.with(data.with(lifecycle, "cleanup_errors", data.array(cleanup)), "passed", data.boolean(false)), "cleanup_complete", data.boolean(item.stopped))
+        item.lifecycle = data.dumps(lifecycle)
+        item.passed = false
+        owner.passed = false
+        if primary == "" { return Output { output: ""; errorOutput: ""; error: message } }
+        item.primary = primary
+        owner.notes.add("owned endpoint secondary failure: RuntimeError: " + message)
+        return Output { output: ""; errorOutput: ""; error: "" }
+    }
+    item.stdoutHash = digestFile(owner, item.stdoutPath)
+    item.stdoutBytes = files.pathSize(item.stdoutPath)
+    item.stderrHash = digestFile(owner, item.stderrPath)
+    item.stderrBytes = files.pathSize(item.stderrPath)
+    item.passed = healthy && complete && errors.length == 0 && item.status == expected
+    lifecycle = data.with(data.with(lifecycle, "cleanup_complete", data.boolean(complete)), "passed", data.boolean(item.passed))
+    item.lifecycle = data.dumps(lifecycle)
+    let raw = files.readFile(item.stdoutPath)
+    let output = Text(raw)
+    if quic.starts(output, item.consumed) { output = Text(raw.slice(Bytes(item.consumed).length, raw.length)) }
+    let result = Output { output: normalized(output); errorOutput: normalized(Text(files.readFile(item.stderrPath))); error: "" }
+    if !item.passed {
+        let message = "owned endpoint lifecycle failed: " + item.lifecycle
+        if primary == "" { result.error = message; return result }
+        owner.notes.add(message)
+        item.primary = primary
+    }
+    return result
+}
+function endpointJSON(item: Endpoint): json.Value {
+    let keys = ["argv", "case", "peer_timeout_seconds", "readiness_timeout_seconds", "shutdown_grace_seconds", "cwd", "timed_out", "binary_sha256", "stdout_path", "stderr_path", "pid"]
+    let values = [data.strings(item.argv), data.string(item.label), data.number(item.peerTimeout), data.number(10), data.number(5), data.string(item.cwd), data.boolean(false),
+        data.string(item.binaryHash), data.string(item.stdoutPath), data.string(item.stderrPath), data.number(item.pid)]
+    let row = data.object(keys, values)
+    if item.startup != "" { row = data.with(row, "startup_exception", data.string("RuntimeError")) }
+    if item.readinessTimedOut { row = data.with(row, "readiness_timed_out", data.boolean(true)) }
+    if item.readyHash != "" { row = data.with(row, "ready_line_sha256", data.string(item.readyHash)) }
+    if item.lifecycle != "" {
+        let before = data.none()
+        if item.exitedBefore { before = data.number(item.statusBefore) }
+        row = data.with(data.with(row, "status_before_shutdown", before), "owned_termination_requested", data.boolean(item.requested))
+        row = data.with(row, "lifecycle", json.parse(item.lifecycle))
+        row = data.with(data.with(row, "status", data.number(item.status)), "elapsed_seconds", data.decimal(item.elapsed))
+        if item.stdoutHash != "" {
+            row = data.with(data.with(row, "stdout_sha256", data.string(item.stdoutHash)), "stdout_bytes", data.number(item.stdoutBytes))
+            row = data.with(data.with(row, "stderr_sha256", data.string(item.stderrHash)), "stderr_bytes", data.number(item.stderrBytes))
+        }
+    }
+    if item.primary != "" { row = data.with(row, "primary_exception", data.string("RuntimeError")) }
+    return row
+}
+public function endpointRow(item: Endpoint): Text { return data.dumps(endpointJSON(item)) }
+public function endpointRecords(owner: Artifacts): Text {
+    let rows: List<Text> = []
+    for item in owner.endpoints { rows.add(data.dumps(endpointJSON(item))) }
+    return "[" + quic.joined(rows, ",\n    ") + "]"
+}
+public record Running { command: List<Text>; label: Text; limit: Integer; started: Integer; log: Text; handle: Integer; done: Boolean; status: Integer }
+public function launch(owner: Artifacts, command: List<Text>, limit: Integer, label: Text): Running {
+    let log = owner.ledger.scratch + "/.unrecorded-" + Text(system.monotonicNanoseconds())
+    if owner.ledger.directory != "" { log = owner.ledger.directory + "/command-" + quic.after(Text(1000 + owner.ledger.commands.length), "1") + ".stdout.bin" }
+    let handle = test.start(command, owner.environment, "", log, limit)
+    test.check(handle > 0, "cannot start protocol command: " + command[0])
+    return Running { command: command; label: label; limit: limit; started: system.monotonicNanoseconds(); log: log; handle: handle; done: false; status: 0 }
+}
+public function active(item: Running): Boolean {
+    if item.done { return false }
+    let status = system.poll(item.handle)
+    if status.state == system.PENDING { return true }
+    test.check(status.error == 0, "protocol command wait failed")
+    item.done = true
+    item.status = status.exitCode
+    if status.state == system.SIGNALED { item.status = 128 + status.signal }
+    return false
+}
+public function collect(owner: Artifacts, item: Running): test.Result {
+    if !item.done {
+        let status = system.wait(item.handle)
+        test.check(status.error == 0, "protocol command wait failed")
+        item.done = true
+        item.status = status.exitCode
+        if status.state == system.SIGNALED { item.status = 128 + status.signal }
+    }
+    let result = test.Result { status: item.status; output: Text(files.readFile(item.log)); errorOutput: Text(files.readFile(item.log + ".err")) }
+    let ledger = owner.ledger
+    if ledger.directory == "" {
+        test.check(files.remove(item.log) == 0 && files.remove(item.log + ".err") == 0, "cannot remove command log")
+        return result
+    }
+    let base = Text(Bytes(item.log).slice(0, Bytes(item.log).length - 11))
+    test.check(files.rename(item.log + ".err", base + ".stderr.bin") == 0, "cannot retain raw diagnostics")
+    let elapsed = quic.seconds(item.started)
+    let executable = quic.resolve(item.command[0], "", owner.environment, ledger.root)
+    let inventory = [base + ".stdout.bin", base + ".stderr.bin"]
+    if executable != "" { inventory.add(executable) }
+    let hashes = quic.digests(inventory, base + ".digest")
+    let executableHash = ""
+    if executable != "" { executableHash = hashes[2] }
+    ledger.commands.add(quic.Command { argv: item.command; cwd: ledger.root; timeout: item.limit; phase: "protocol-case"; label: item.label; executable: executable
+        executableHash: executableHash; status: result.status; seconds: elapsed; stdoutPath: base + ".stdout.bin"; stderrPath: base + ".stderr.bin"
+        stdoutHash: hashes[0]; stderrHash: hashes[1]; stdoutBytes: files.pathSize(base + ".stdout.bin"); stderrBytes: files.pathSize(base + ".stderr.bin")
+        output: result.output; errorOutput: result.errorOutput })
+    return result
+}
+public record Pacing { delay: Integer; deliveryAt: Integer; started: Boolean }
+public function deliveryDelay(pacing: Pacing, now: Integer): Integer {
+    if !pacing.started { pacing.deliveryAt = now; pacing.started = true }
+    pacing.deliveryAt = max(pacing.deliveryAt, now - 8 * pacing.delay) + pacing.delay
+    return max(0, pacing.deliveryAt - now)
 }
 function relative(owner: Artifacts, path: Text): Text { return quic.after(path, owner.path + "/") }
 function regular(owner: Artifacts, paths: List<Text>): List<Text> {
@@ -61,6 +351,7 @@ public function caseInventory(owner: Artifacts): Text {
     let rows: List<Text> = []
     for label in owner.declared {
         let commands: List<Text> = []
+        let endpoints: List<Text> = []
         let raw: List<Text> = []
         for index in 0..owner.ledger.commands.length {
             let item = owner.ledger.commands[index]
@@ -70,13 +361,28 @@ public function caseInventory(owner: Artifacts): Text {
                 raw.add(relative(owner, item.stderrPath))
             }
         }
+        for index in 0..owner.endpoints.length {
+            let item = owner.endpoints[index]
+            if item.label == label {
+                endpoints.add(Text(index))
+                raw.add(relative(owner, item.stdoutPath))
+                raw.add(relative(owner, item.stderrPath))
+            }
+        }
         let certificates = regular(owner, owner.shared)
-        let outputs = unique(raw)
         let all: List<Text> = []
         for value in certificates { all.add(value) }
+        let roles = "\"certificates\": " + quic.quoted(certificates)
+        for role in owner.roles {
+            if role.label != label { continue }
+            let found = regular(owner, role.paths)
+            for value in found { all.add(value) }
+            roles = roles + ", " + quic.string(role.role) + ": " + quic.quoted(found)
+        }
+        let outputs = unique(raw)
         for value in outputs { all.add(value) }
-        rows.add("{\"case\": " + quic.string(label) + ", \"command_indices\": [" + quic.joined(commands, ", ") + "], \"endpoint_indices\": []" +
-            ", \"fixture_workspace\": " + quic.string(owner.workspace) + ", \"file_roles\": {\"certificates\": " + quic.quoted(certificates) +
+        rows.add("{\"case\": " + quic.string(label) + ", \"command_indices\": [" + quic.joined(commands, ", ") + "], \"endpoint_indices\": [" + quic.joined(endpoints, ", ") + "]" +
+            ", \"fixture_workspace\": " + quic.string(owner.workspace) + ", \"file_roles\": {" + roles +
             ", \"raw_output\": " + quic.quoted(outputs) + "}, \"files\": " + quic.quoted(unique(all)) + "}")
     }
     return "[" + quic.joined(rows, ",\n    ") + "]"
@@ -94,8 +400,18 @@ public function publish(owner: Artifacts, fields: List<Text>, passed: Boolean): 
     if owner.path != "" { writeTextFile(owner.path + "/results.json", report) }
     return report
 }
-public function close(owner: Artifacts): Boolean {
-    let passed = owner.passed
+public function close(owner: Artifacts): Boolean { return finish(owner, "") }
+public function finish(owner: Artifacts, primary: Text): Boolean {
+    for item in owner.endpoints {
+        if item.stopped { continue }
+        let stopped = stop(owner, item, primary)
+        if stopped.error != "" {
+            owner.errors.add(failureJSON("endpoint-cleanup", stopped.error))
+            owner.passed = false
+        }
+    }
+    if primary != "" { owner.passed = false }
+    let passed = owner.passed && owner.errors.length == 0
     if owner.path == "" {
         test.removeTree(owner.scratch)
         return passed
@@ -116,9 +432,11 @@ public function close(owner: Artifacts): Boolean {
     }
     let status = "failed"
     if passed { status = "passed" }
+    let exception = ""
+    if primary != "" { exception = ",\n  \"exception\": " + quic.string(primary) }
     writeTextFile(owner.path + "/manifest.json", ["{\n  \"schema_version\": 1,\n  \"status\": ", quic.string(status), ",\n  \"workspace\": ", quic.string(owner.workspace),
-        ",\n  \"inputs\": ", owner.inputs, ",\n  \"commands\": ", quic.commandRecords(owner.ledger), ",\n  \"endpoint_commands\": [],\n  \"declared_cases\": ", quic.quoted(owner.declared), ",\n  \"case_inventory\": ", caseInventory(owner), ",\n  \"files\": {", quic.joined(entries, ", "),
-        "},\n  \"file_bytes\": {", quic.joined(sizes, ", "), "},\n  \"finalization_errors\": [],\n  \"unhashed_files\": []\n}\n"])
+        ",\n  \"inputs\": ", owner.inputs, ",\n  \"commands\": ", quic.commandRecords(owner.ledger), ",\n  \"endpoint_commands\": ", endpointRecords(owner), ",\n  \"declared_cases\": ", quic.quoted(owner.declared), ",\n  \"case_inventory\": ", caseInventory(owner), ",\n  \"files\": {", quic.joined(entries, ", "),
+        "},\n  \"file_bytes\": {", quic.joined(sizes, ", "), "},\n  \"finalization_errors\": [", quic.joined(owner.errors, ", "), "],\n  \"unhashed_files\": []", exception, "\n}\n"])
     test.removeTree(owner.scratch)
     return passed
 }
@@ -150,7 +468,7 @@ public function baseline(label: Text, summary: Text, driver: Text, source: Text,
     test.check(files.pathSize(binary) >= 0, "binary does not exist: " + binary)
     let cases = names
     if requested.length > 0 { cases = requested }
-    let owner = open(label, directory, [driver, source, "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", binary], cases)
+    let owner = open(label, directory, [driver, source, "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min", binary], cases)
     let ca = authority(owner)
     quic.rootCertificate(ca, "root")
     quic.leaf(ca, "server", "root", "DNS:localhost,IP:127.0.0.1", "serverAuth")

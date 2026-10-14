@@ -591,9 +591,10 @@ class BuildWiring(unittest.TestCase):
         import re
         source=(ROOT/'build-support/quic-rfc.mk').read_text()
         helper='check-quic-protocol-artifacts'
-        inputs={'tests/quic-protocol-artifacts.py','tests/quic_protocol_artifacts.py',
-                'tests/quic-qns-local.py','tests/quic-vn-probe.py','tests/test_evidence.py',
-                'tests/clang_helpers.py','tests/tls-local.py','tests/interop/qns/endpoint.py'}
+        inputs={'build/tooling/tests/quic-protocol-artifacts','build/tooling/tests/quic-qns-local',
+                'build/tooling/tests/quic-vn-probe','tests/quic-protocol-artifacts.min',
+                'tests/quic-protocol-support.min','tests/quic-qns-local.min','tests/quic-vn-probe.min',
+                'tests/interop/qns/endpoint.py'}
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='QUIC owned lifecycle rules ') as folder:
                 makefile=Path(folder)/'probe.mk'
@@ -611,7 +612,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn(helper,rules.get(gate,set()))
                 self.assertTrue(inputs<=rules.get(helper,set()))
                 commands=dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('python3 tests/quic-protocol-artifacts.py'),1)
+                self.assertEqual(commands.count('./build/tooling/tests/quic-protocol-artifacts --artifacts'),1)
                 self.assertIn('--artifacts "$artifacts/run"',commands)
                 self.assertIn((ROOT/'build/quic-protocol-artifacts.').as_posix(),commands.replace('\\','/'))
                 self.assertNotIn('--expect-old-code',commands)
@@ -626,19 +627,15 @@ class BuildWiring(unittest.TestCase):
             mutant=source.replace(line,line.replace(' '+dependency,'',1),1)
             with self.subTest(missing_input=dependency),self.assertRaises(AssertionError):verify(mutant)
         for name,old,new in (
-                ('old code oracle','tests/quic-protocol-artifacts.py --artifacts',
-                    'tests/quic-protocol-artifacts.py --expect-old-code --artifacts'),
-                ('filtered control','tests/quic-protocol-artifacts.py --artifacts',
-                    'tests/quic-protocol-artifacts.py --case healthy-shutdown --artifacts'),
+                ('old code oracle','tests/quic-protocol-artifacts --artifacts',
+                    'tests/quic-protocol-artifacts --expect-old-code --artifacts'),
+                ('filtered control','tests/quic-protocol-artifacts --artifacts',
+                    'tests/quic-protocol-artifacts --case healthy-shutdown --artifacts'),
                 ('relative evidence','$(abspath build)/quic-protocol-artifacts.',
                     'build/quic-protocol-artifacts.')):
             mutant=source.replace(old,new,1)
             self.assertNotEqual(source,mutant)
             with self.subTest(invalid_helper=name),self.assertRaises(AssertionError):verify(mutant)
-        catalogue=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
-        row=next(row for row in catalogue['sources'] if row['path']=='tests/quic-protocol-artifacts.py')
-        self.assertEqual(row['role'],'suite')
-        self.assertIn('build-support/quic-rfc.mk',row['consumers'])
 
     def test_quic_rfc_gates_keep_all_drivers_and_public_frontends(self):
         import importlib.util
@@ -648,18 +645,19 @@ class BuildWiring(unittest.TestCase):
         native, sanitize = 'check-quic-rfc', 'check-quic-rfc-sanitize'
         frontends = {'build/minyarc', 'build/minyarc-callbacks',
                      'build/minyarc-errors-request', 'build/minyarc-errors'}
-        inputs = {'minyar', 'build/tooling/tools/clang-driver', 'tools/sanitizer_llvm.py',
-                  'tests/quic-rfc.py', 'tests/quic-rfc-harness.py',
-                  'tests/test_evidence.py', 'tests/clang_helpers.py',
-                  'tests/tls-local.py', 'tests/quic_protocol_artifacts.py', 'tests/quic-protocol-artifacts.py',
+        inputs = {'minyar', 'build/tooling/tools/clang-driver', 'tools/llvm-sanitizer.min',
+                  'build/tooling/tests/quic-rfc', 'tests/quic-rfc.min',
+                  'build/tooling/tests/quic-rfc-harness', 'tests/quic-rfc-harness.min',
+                  'tests/quic-protocol-artifacts.min',
                   'tests/interop/qns/endpoint.py', 'library/quic.min', 'library/tls.min',
                   'library/tlsserver.min', 'build/tooling/tests/quic-migration-cids-test',
                   'tests/quic-migration-cids-test.min', 'tests/quic-migration-cids.min',
                   'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
                   'tests/quic-cipher-policy.min', 'tests/quic-protocol-support.min',
-                  'tests/quic-test-support.min', 'tools/testing.min', 'tests/quic-qns-local.py',
-                  'tests/quic-vn-probe.py', 'tests/interop/qns/client.min',
-                  'tests/interop/qns/server.min'}
+                  'tests/quic-test-support.min', 'tests/quic-json.min', 'tools/testing.min',
+                  'build/tooling/tests/quic-qns-local', 'tests/quic-qns-local.min',
+                  'build/tooling/tests/quic-vn-probe', 'tests/quic-vn-probe.min',
+                  'tests/interop/qns/client.min', 'tests/interop/qns/server.min'}
 
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='QUIC RFC Make rules ') as folder:
@@ -686,7 +684,7 @@ class BuildWiring(unittest.TestCase):
                 for target in (native, sanitize):
                     self.assertTrue(frontends | inputs <= rules.get(target, set()), target)
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('python3 tests/quic-rfc.py'), 2)
+                self.assertEqual(commands.count('./build/tooling/tests/quic-rfc --optimization'), 2)
                 self.assertEqual(commands.count('--optimization both'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
                 self.assertEqual(commands.count('mktemp -d "'), 3)
@@ -733,9 +731,13 @@ class BuildWiring(unittest.TestCase):
         catalogue.validate(data, ROOT)
         native = {'build/tooling/tests/quic-migration-cids-test', 'tests/quic-migration-cids-test.min',
                   'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
-                  'tests/quic-protocol-support.min', 'tests/quic-test-support.min', 'tools/testing.min'}
+                  'tests/quic-protocol-support.min', 'tests/quic-test-support.min', 'tools/testing.min',
+                  'build/tooling/tests/quic-rfc', 'tests/quic-rfc.min', 'build/tooling/tests/quic-rfc-harness',
+                  'tests/quic-rfc-harness.min', 'tests/quic-protocol-artifacts.min', 'tests/quic-json.min',
+                  'build/tooling/tests/quic-qns-local', 'tests/quic-qns-local.min',
+                  'build/tooling/tests/quic-vn-probe', 'tests/quic-vn-probe.min'}
         for name in sorted(inputs - native - {'minyar', 'build/tooling/tools/clang-driver',
-                                              'tools/sanitizer_llvm.py', 'library/quic.min',
+                                              'tools/llvm-sanitizer.min', 'library/quic.min',
                                               'library/tls.min', 'library/tlsserver.min'}):
             self.assertIn(name, catalogue.discover(ROOT))
             with self.subTest(missing_source=name), self.assertRaises(ValueError):

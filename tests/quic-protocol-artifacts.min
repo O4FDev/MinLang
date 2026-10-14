@@ -1,0 +1,229 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-protocol-support.min" as protocol
+use "./quic-json.min" as data
+use "json" as json
+use "system" as system
+use "files" as files
+
+constant CASES: List<Text> = ["thread-first", "thread-second", "qns-readiness", "vn-readiness", "qns-unexpected-exit", "vn-unexpected-exit", "healthy-shutdown", "forced-shutdown", "primary-cleanup-error", "thread-retention-error", "qns-retention-error", "context-retention-error"]
+constant CODES: List<Integer> = [42, 52, 62, 72, 82, 83, 0, 0, 94, 96, 97, 98]
+constant READINESS = "controlled readiness failure"
+
+record Outcome { error: Text; notes: List<Text>; alive: Boolean; command: List<Text>; children: List<Text>; endpoints: List<Text>; forced: Boolean }
+
+function script(path: Text, body: Text) {
+    writeTextFile(path, "#!/bin/sh\n" + body)
+    test.require(test.run(["chmod", "755", path], system.environment(), "", path + ".chmod", 10), "fixture mode")
+    files.remove(path + ".chmod")
+    files.remove(path + ".chmod.err")
+}
+function has(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function noted(notes: List<Text>, wanted: Text): Boolean {
+    for note in notes { if test.contains(note, wanted) { return true } }
+    return false
+}
+function startError(control: Text): Text {
+    if control == "thread-second" { return "controlled capture-second start failure" }
+    return "controlled capture-first start failure"
+}
+function lifecycle(control: Text, command: List<Text>, artifacts: Text): Outcome {
+    let owner = protocol.open("lifecycle", artifacts, [], [control])
+    if control == "thread-first" || control == "thread-retention-error" || control == "primary-cleanup-error" { owner.faults.add("capture-first") }
+    if control == "thread-second" { owner.faults.add("capture-second") }
+    if control == "primary-cleanup-error" { owner.faults.add("termination") }
+    if control == "thread-retention-error" || control == "context-retention-error" { owner.faults.add("retention") }
+    let endpoint = protocol.endpoint(owner, command, owner.workspace + "/endpoint", control, 30)
+    let primary = endpoint.startup
+    if primary == "" {
+        let ready = protocol.readyLine(owner, endpoint)
+        if ready.error != "" { primary = ready.error } else if ready.output != "QNS server ready\n" { primary = "controlled readiness setup failed" }
+    }
+    if primary == "" && control == "context-retention-error" { primary = READINESS }
+    if primary == "" {
+        let stopped = protocol.stop(owner, endpoint, "")
+        if stopped.error != "" { primary = stopped.error }
+    }
+    protocol.finish(owner, primary)
+    let alive = protocol.alive(endpoint)
+    if alive { system.sendSignal(-endpoint.pid, 9); protocol.awaitExit(endpoint, 5) }
+    let rows: List<Text> = []
+    for item in owner.endpoints { rows.add(protocol.endpointRow(item)) }
+    let forced = false
+    if endpoint.lifecycle != "" {
+        let state = json.parse(endpoint.lifecycle)
+        let receipt = data.field(state, "receipt")
+        forced = data.isTrue(data.field(state, "passed")) && data.equalsText(data.field(state, "termination_strategy"), "posix-sigkill-after-grace") && data.isTrue(data.field(data.field(receipt, "previous"), "wait_timed_out"))
+    }
+    let status = "null"
+    if endpoint.done { status = Text(endpoint.code) }
+    return Outcome { error: primary; notes: owner.notes; alive: alive; command: command; children: ["{\"pid\": " + Text(endpoint.pid) + ", \"status\": " + status + "}"]; endpoints: rows; forced: forced }
+}
+function driver(control: Text, work: Text, artifacts: Text): Outcome {
+    let qns = quic.starts(control, "qns-")
+    let exits = quic.ends(control, "unexpected-exit")
+    let tail = "exec sleep 30\n"
+    if exits { tail = "exit 43\n" }
+    script(work + "/server", "echo \"$$\" >\"" + work + "/server.pid\"\nprintf 'QNS server ready\\n'\n" + tail)
+    script(work + "/client", "downloads=$5\nsleep 1\ncp \"${downloads%-downloads}-www\"/* \"$downloads\"/\n")
+    let fault = ""
+    if control == "qns-readiness" || control == "vn-readiness" { fault = "readiness" }
+    if control == "qns-retention-error" { fault = "readiness,retention" }
+    if control == "vn-unexpected-exit" { fault = "vn-response" }
+    let environment = quic.setting(system.environment(), "MINYAR_QUIC_PROTOCOL_FAULT", fault)
+    let command = ["./build/tooling/tests/quic-vn-probe", "--server", work + "/server"]
+    if qns { command = ["./build/tooling/tests/quic-qns-local", "--client", work + "/client", "--server", work + "/server", "--case", "chacha20"] }
+    if artifacts != "" { command.add("--artifacts"); command.add(artifacts) }
+    let result = test.run(command, environment, "", work + "/driver", 120)
+    let error = ""
+    let notes: List<Text> = []
+    if result.status != 0 {
+        error = "driver failed without a primary failure"
+        for line in test.lines(result.errorOutput) {
+            if quic.starts(line, "note: ") { notes.add(quic.after(line, "note: ")) }
+            else if quic.starts(line, "quic-qns-local: ") && error == "driver failed without a primary failure" { error = quic.after(line, "quic-qns-local: ") }
+            else if quic.starts(line, "quic-vn-probe: ") && error == "driver failed without a primary failure" { error = quic.after(line, "quic-vn-probe: ") }
+        }
+    }
+    let pid = 0
+    if files.pathSize(work + "/server.pid") > 0 { pid = Integer(test.words(readTextFile(work + "/server.pid"))[0]) }
+    let alive = pid > 0 && system.sendSignal(pid, 0) == 0
+    if alive { system.sendSignal(-pid, 9); system.sendSignal(pid, 9) }
+    let rows: List<Text> = []
+    if artifacts != "" && files.pathSize(artifacts + "/manifest.json") > 0 {
+        let manifest = data.decode(readBytesFile(artifacts + "/manifest.json"))
+        for item in data.field(manifest, "endpoint_commands").items { rows.add(data.dumps(item)) }
+    }
+    return Outcome { error: error; notes: notes; alive: alive; command: [work + "/server"]; children: ["{\"pid\": " + Text(pid) + ", \"status\": null}"]; endpoints: rows; forced: false }
+}
+function verdict(control: Text, outcome: Outcome): List<Text> {
+    let exits = quic.ends(control, "unexpected-exit")
+    let expected = ""
+    if quic.starts(control, "thread-") || control == "primary-cleanup-error" { expected = startError(control) }
+    else if test.contains(control, "readiness") || control == "qns-retention-error" || control == "context-retention-error" { expected = READINESS }
+    if expected != "" && outcome.error != expected {
+        let code = "90"
+        if control == "thread-retention-error" { code = "96" } else if control == "qns-retention-error" { code = "97" } else if control == "context-retention-error" { code = "98" }
+        return [code, "primary controlled exception identity was replaced"]
+    }
+    if test.contains(control, "retention-error") && !noted(outcome.notes, "controlled retention failure") { return ["99", "secondary retention failure was not preserved"] }
+    if outcome.alive {
+        let code = "92"
+        if control == "thread-first" { code = "42" } else if control == "thread-second" { code = "52" } else if control == "qns-readiness" { code = "62" } else if control == "vn-readiness" { code = "72" }
+        return [code, "owned endpoint survived primary failure"]
+    }
+    if exits && outcome.error == "" {
+        if quic.starts(control, "qns-") { return ["82", "successful fixture accepted unexpectedly exited server43"] }
+        return ["83", "successful fixture accepted unexpectedly exited server43"]
+    }
+    if control == "primary-cleanup-error" && !noted(outcome.notes, "controlled termination failure") { return ["94", "cleanup error was not retained with primary failure"] }
+    if control == "forced-shutdown" && outcome.error == "" && !outcome.forced { return ["95", "forced owned shutdown receipt failed"] }
+    if (control == "healthy-shutdown" || control == "forced-shutdown") && outcome.error != "" { return ["91", outcome.error] }
+    return ["0", "controlled primary failure preserved, owned endpoint stopped and unexpected server exit rejected"]
+}
+
+let expectOld = false
+let expectC3 = false
+let directory = ""
+let requested: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--expect-old-code" { expectOld = true; index += 1; continue }
+    if name == "--expect-c3" { expectC3 = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "missing option value: " + name)
+    if name == "--artifacts" { directory = argument(index + 1) }
+    else if name == "--case" {
+        let known = CASES
+        test.check(has(known, argument(index + 1)), "invalid control: " + argument(index + 1))
+        requested.add(argument(index + 1))
+    } else { fail("unknown option: " + name) }
+    index += 2
+}
+if directory != "" {
+    test.check(quic.starts(directory, "/") && files.pathSize(directory) < 0, "--artifacts requires a fresh absolute path")
+    test.check(files.makeDirectory(directory) == 0, "cannot create control artifacts")
+}
+let names = CASES
+let codes = CODES
+let cases: List<Text> = []
+let reds: List<Integer> = []
+for position in 0..names.length {
+    let name = names[position]
+    if requested.length > 0 && !has(requested, name) { continue }
+    if expectOld && has(["forced-shutdown", "primary-cleanup-error", "thread-retention-error", "qns-retention-error", "context-retention-error"], name) { continue }
+    cases.add(name)
+    reds.add(codes[position])
+}
+let work = test.scratch()
+let rows: List<Text> = []
+let passed = true
+for position in 0..cases.length {
+    let control = cases[position]
+    let target = ""
+    if directory != "" {
+        target = directory + "/" + control
+        test.check(files.makeDirectory(target) == 0, "cannot create control artifacts")
+    }
+    let fixture = work + "/" + control
+    test.check(files.makeDirectory(fixture) == 0, "cannot create control fixture")
+    let outcome = Outcome { error: ""; notes: []; alive: false; command: []; children: []; endpoints: []; forced: false }
+    if quic.starts(control, "qns-") || quic.starts(control, "vn-") {
+        let artifacts = ""
+        if target != "" { artifacts = target + "/endpoint-artifacts" }
+        outcome = driver(control, fixture, artifacts)
+    } else {
+        let prefix = ""
+        if control == "forced-shutdown" { prefix = "trap '' TERM; " }
+        let artifacts = ""
+        if target != "" { artifacts = target + "/endpoint-artifacts" }
+        outcome = lifecycle(control, ["/bin/sh", "-c", prefix + "printf 'QNS server ready\\n'; exec sleep 30"], artifacts)
+    }
+    let result = verdict(control, outcome)
+    let expected = 0
+    if expectOld || expectC3 { expected = reds[position] }
+    let matched = Integer(result[0]) == expected
+    if !matched { passed = false }
+    let primary = "null"
+    if outcome.error != "" { primary = quic.string(outcome.error) }
+    rows.add("{\"case\": " + quic.string(control) + ", \"status\": " + result[0] + ", \"expected\": " + Text(expected) + ", \"matched\": " + Text(matched) + ", \"message\": " + quic.string(result[1]) +
+        ", \"actual_child_command\": " + quic.quoted(outcome.command) + ", \"children\": [" + quic.joined(outcome.children, ", ") + "], \"primary_exception\": " + primary +
+        ", \"primary_notes\": " + quic.quoted(outcome.notes) + ", \"alive_before_test_cleanup\": " + Text(outcome.alive) + ", \"endpoint_commands\": [" + quic.joined(outcome.endpoints, ", ") + "]}")
+}
+let sources = ["tests/quic-protocol-artifacts.min", "tests/quic-protocol-support.min", "tests/quic-qns-local.min", "tests/quic-vn-probe.min", "build/tooling/tests/quic-qns-local", "build/tooling/tests/quic-vn-probe"]
+let inputs = quic.digestObject(quic.fileDigests(sources, work + "/.inputs"))
+let status = "failed"
+if passed { status = "passed" }
+let report = "{\n  \"schema_version\": 1,\n  \"scope\": \"controlled fixture lifecycle only\",\n  \"declared_cases\": " + quic.quoted(cases) + ",\n  \"results\": [\n    " + quic.joined(rows, ",\n    ") +
+    "\n  ],\n  \"inputs\": " + inputs + ",\n  \"status\": " + quic.string(status) + "\n}\n"
+if directory != "" {
+    writeTextFile(directory + "/results.json", report)
+    let listed = test.run(["find", ".", "-type", "f"], system.environment(), directory, work + "/.inventory", 60)
+    test.require(listed, "control artifact inventory")
+    let found: List<Text> = []
+    for line in test.lines(listed.output) { found.add(quic.after(line, "./")) }
+    found.sort()
+    let paths: List<Text> = []
+    for name in found { paths.add(directory + "/" + name) }
+    let hashes = quic.digests(paths, work + "/.hashes")
+    let entries: List<Text> = []
+    let sizes: List<Text> = []
+    for position in 0..found.length {
+        entries.add(quic.string(found[position]) + ": " + quic.string(hashes[position]))
+        sizes.add(quic.string(found[position]) + ": " + Text(files.pathSize(paths[position])))
+    }
+    let inventory: List<Text> = []
+    for control in cases {
+        let owned: List<Text> = []
+        for name in found { if quic.starts(name, control + "/") { owned.add(name) } }
+        inventory.add("{\"case\": " + quic.string(control) + ", \"files\": " + quic.quoted(owned) + "}")
+    }
+    writeTextFile(directory + "/manifest.json", "{\n  \"schema_version\": 1,\n  \"scope\": \"controlled fixture lifecycle only\",\n  \"status\": " + quic.string(status) + ",\n  \"inputs\": " + inputs +
+        ",\n  \"declared_cases\": " + quic.quoted(cases) + ",\n  \"files\": {" + quic.joined(entries, ", ") + "},\n  \"file_bytes\": {" + quic.joined(sizes, ", ") + "},\n  \"case_inventory\": [" + quic.joined(inventory, ", ") + "]\n}\n")
+}
+test.removeTree(work)
+files.writeStandardOutput(report)
+if !passed { exit(1) }

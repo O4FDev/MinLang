@@ -1,0 +1,1195 @@
+use "../tools/testing.min" as test
+use "../tools/llvm-sanitizer.min" as sanitizer
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "json" as json
+use "system" as system
+use "files" as files
+
+public record Context { root: Text; scratch: Text; port: Integer; windows: Boolean }
+public record Inventory { names: List<Text>; hashes: List<Text>; sizes: List<Integer>; index: Map<Text, Integer>; error: Text }
+public record Binaries { names: List<Text>; paths: List<Text> }
+public record Cases { values: List<Text>; error: Text }
+public record Lifecycle { error: Text; receipts: List<json.Value> }
+
+public function newContext(root: Text, scratch: Text, port: Integer): Context { return Context { root: root; scratch: scratch; port: port; windows: false } }
+public function binaryNames(): List<Text> { return ["migration", "cipher", "client", "server"] }
+public function binarySource(name: Text): Text {
+    if name == "migration" { return "tests/quic-migration-cids.min" }
+    if name == "cipher" { return "tests/quic-cipher-policy.min" }
+    if name == "client" { return "tests/interop/qns/client.min" }
+    return "tests/interop/qns/server.min"
+}
+public function driverKinds(): List<Text> { return ["migration", "cipher", "local", "vn"] }
+public function driverSource(kind: Text): Text {
+    if kind == "migration" { return "tests/quic-migration-cids-test.min" }
+    if kind == "cipher" { return "tests/quic-cipher-policy-test.min" }
+    if kind == "local" { return "tests/quic-qns-local.min" }
+    return "tests/quic-vn-probe.min"
+}
+public function driverSymbol(kind: Text): Text {
+    if kind == "migration" || kind == "cipher" { return "NAMES" }
+    if kind == "local" { return "CASES" }
+    return ""
+}
+public function nativeSupport(): List<Text> { return ["tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min"] }
+public function endpointSource(): Text { return "tests/interop/qns/endpoint.py" }
+public function binary(binaries: Binaries, name: Text): Text {
+    for index in 0..binaries.names.length { if binaries.names[index] == name { return binaries.paths[index] } }
+    return ""
+}
+
+function stamp(): Text { return Text(system.monotonicNanoseconds()) }
+public function digest(context: Context, path: Text): Text {
+    if files.pathSize(path) < 0 { return "" }
+    return quic.digest(path, context.scratch + "/.digest-" + stamp())
+}
+public function digestBytes(context: Context, value: Bytes): Text {
+    let path = context.scratch + "/.bytes-" + stamp()
+    writeBytesFile(path, value)
+    let result = digest(context, path)
+    files.remove(path)
+    return result
+}
+function shell(context: Context, script: Text, arguments: List<Text>): test.Result {
+    let command = ["/bin/sh", "-c", script, "minyar"]
+    for value in arguments { command.add(value) }
+    let log = context.scratch + "/.shell-" + stamp()
+    let result = test.run(command, system.environment(), "", log, 120)
+    files.remove(log)
+    files.remove(log + ".err")
+    return result
+}
+public function resolved(context: Context, path: Text): Text {
+    let result = shell(context, "if [ -d \"$1\" ]; then cd -- \"$1\" && pwd -P; else d=$(dirname -- \"$1\") && b=$(basename -- \"$1\") && cd -- \"$d\" 2>/dev/null && r=$(pwd -P) && if [ -L \"$b\" ]; then realpath -- \"$b\"; else printf '%s/%s\\n' \"$r\" \"$b\"; fi; fi", [path])
+    if result.status != 0 { return path }
+    let rows = test.lines(result.output)
+    if rows.length == 0 { return path }
+    return rows[0]
+}
+public function artifactInventory(context: Context, directory: Text): Inventory {
+    let empty = Inventory { names: []; hashes: []; sizes: []; index: Map<Text, Integer>(); error: "" }
+    let linked = shell(context, "cd -- \"$1\" && find . -type l", [directory])
+    if linked.status != 0 { empty.error = "missing inventory directory"; return empty }
+    if test.words(linked.output).length > 0 { empty.error = "symlink artifact inventory entry"; return empty }
+    let listed = shell(context, "cd -- \"$1\" && find . -type f", [directory])
+    let names: List<Text> = []
+    for line in test.lines(listed.output) { names.add(quic.after(line, "./")) }
+    names.sort()
+    let paths: List<Text> = []
+    for name in names { paths.add(directory + "/" + name) }
+    let hashes: List<Text> = []
+    if paths.length > 0 { hashes = quic.digests(paths, context.scratch + "/.inventory-" + stamp()) }
+    let sizes: List<Integer> = []
+    let index = Map<Text, Integer>()
+    for position in 0..names.length { sizes.add(files.pathSize(paths[position])); index[names[position]] = position }
+    return Inventory { names: names; hashes: hashes; sizes: sizes; index: index; error: "" }
+}
+function listed(inventory: Inventory, name: Text): Boolean { return inventory.index.has(name) }
+function hashOf(inventory: Inventory, name: Text): Text { return inventory.hashes[inventory.index[name]] }
+function sizeOf(inventory: Inventory, name: Text): Integer { return inventory.sizes[inventory.index[name]] }
+public function retainedPath(directory: Text, relative: json.Value, inventory: Inventory): Text {
+    if !data.isText(relative) || relative.text == "" || test.contains(relative.text, "\\") { return "" }
+    if quic.starts(relative.text, "/") { return "" }
+    for part in quic.split(relative.text, 47) { if part == ".." { return "" } }
+    if !listed(inventory, relative.text) { return "" }
+    return directory + "/" + relative.text
+}
+
+public function exactInteger(value: json.Value, minimum: Integer, maximum: Integer): Boolean {
+    return data.exactInteger(value) && data.integer(value) >= minimum && data.integer(value) <= maximum
+}
+function anyInteger(value: json.Value): Boolean { return data.exactInteger(value) }
+function zero(value: json.Value): Boolean { return data.equalsInteger(value, 0) }
+public function sha256Value(value: json.Value): Boolean {
+    if !data.isText(value) || Bytes(value.text).length != 64 { return false }
+    for byte in Bytes(value.text) { if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false } }
+    return true
+}
+function textList(value: json.Value): Boolean { return data.isArray(value) && value.items.length > 0 && data.allTexts(value) }
+function uniqueTexts(values: List<Text>): Boolean {
+    let sorted = values.sorted()
+    for index in 1..sorted.length { if sorted[index] == sorted[index - 1] { return false } }
+    return true
+}
+function textsEqual(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function normalized(value: Text): Text { return test.replace(test.replace(value, "\r\n", "\n"), "\r", "\n") }
+
+public function declaredCases(path: Text, symbol: Text): Cases {
+    let failure = Cases { values: []; error: "case inventory must have one literal declaration" }
+    if files.pathSize(path) < 0 { return failure }
+    let raw = files.readFile(path)
+    let prefix = Bytes("constant " + symbol + ": List<Text> = ")
+    let literals: List<Text> = []
+    let at = 0
+    while at < raw.length {
+        let start = at == 0 || raw[at - 1] == 10
+        let matches = start && at + prefix.length < raw.length
+        if matches { for offset in 0..prefix.length { if raw[at + offset] != prefix[offset] { matches = false; break } } }
+        if matches && raw[at + prefix.length] == 91 {
+            let open = at + prefix.length
+            let end = -1
+            for position in open..raw.length {
+                if raw[position] == 93 && (position + 1 == raw.length || raw[position + 1] == 10) { end = position; break }
+            }
+            if end >= 0 { literals.add(Text(raw.slice(open, end + 1))); at = end + 1; continue }
+        }
+        at += 1
+    }
+    if literals.length != 1 { return failure }
+    let value = json.parse(literals[0])
+    if !data.isArray(value) { return Cases { values: []; error: "case inventory must be a literal collection" } }
+    let values: List<Text> = []
+    for item in value.items {
+        if !data.isText(item) || item.text == "" { return Cases { values: []; error: "empty, duplicate or non-text author cases" } }
+        values.add(item.text)
+    }
+    if values.length == 0 || !uniqueTexts(values) { return Cases { values: []; error: "empty, duplicate or non-text author cases" } }
+    return Cases { values: values; error: "" }
+}
+
+function hexValue(source: Text): Integer {
+    let raw = Bytes(source)
+    let start = 0
+    if raw.length >= 2 && raw[0] == 48 && (raw[1] == 120 || raw[1] == 88) { start = 2 }
+    if raw.length == start || raw.length - start > 15 { return -1 }
+    let value = 0
+    for index in start..raw.length {
+        let byte = raw[index]
+        let digit = -1
+        if byte >= 48 && byte <= 57 { digit = byte - 48 }
+        if byte >= 97 && byte <= 102 { digit = byte - 87 }
+        if byte >= 65 && byte <= 70 { digit = byte - 55 }
+        if digit < 0 { return -1 }
+        value = value * 16 + digit
+    }
+    return value
+}
+public function preferredTuple(context: Context, name: Text): Text {
+    if name == "preferred" { return "QNS authenticated preferred address ipv4=7f000001:" + Text(context.port + 1) + " ipv6=00000000000000000000000000000000:0" }
+    return "QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:" + Text(context.port + 1)
+}
+public function verifyResult(context: Context, kind: Text, report: json.Value, cases: List<Text>, binaries: Binaries, source: Text): Text {
+    if !data.isObject(report) { return "author result must be an object" }
+    if kind == "vn" {
+        if !data.equalsText(data.field(report, "result"), "passed") { return "version negotiation did not pass" }
+        if !data.equalsText(data.field(report, "server_sha256"), digest(context, binary(binaries, "server"))) { return "version-negotiation binary mismatch" }
+        let versions = data.field(report, "versions")
+        if !data.isArray(versions) || versions.items.length == 0 { return "invalid version-negotiation versions" }
+        let seen: List<Text> = []
+        let supported = false
+        let reserved = false
+        for item in versions.items {
+            if !exactInteger(item, 0, 4294967295) { return "invalid version-negotiation versions" }
+            seen.add(item.text)
+            if data.integer(item) == 1 { supported = true }
+            if data.integer(item) == 168430090 { reserved = true }
+        }
+        if !uniqueTexts(seen) { return "invalid version-negotiation versions" }
+        let label = data.field(report, "reserved_version")
+        if !data.isText(label) || hexValue(label.text) != 168430090 || !supported || reserved { return "version-negotiation policy mismatch" }
+        if !data.equalsInteger(data.field(report, "request_bytes"), 1200) || !exactInteger(data.field(report, "response_bytes"), 1, 3600) { return "version-negotiation response size mismatch" }
+        return ""
+    }
+    let rows = data.field(report, "results")
+    if !data.isArray(rows) || rows.items.length != cases.length { return "author case inventory missing, reordered or filtered" }
+    for index in 0..rows.items.length {
+        let row = rows.items[index]
+        if !data.isObject(row) || !data.equalsText(data.field(row, "case"), cases[index]) { return "author case inventory missing, reordered or filtered" }
+    }
+    if kind == "migration" || kind == "cipher" {
+        if !data.isFalse(data.field(report, "baseline")) || !data.isFalse(data.field(report, "compiler_invoked")) { return "old-code oracle or nested compiler invoked" }
+        if !data.equalsText(data.field(report, "binary_sha256"), digest(context, binary(binaries, kind))) || !data.equalsText(data.field(report, "test_source_sha256"), digest(context, source)) { return "author source or binary mismatch" }
+        for row in rows.items {
+            if !zero(data.field(row, "expected_returncode")) || !zero(data.field(row, "returncode")) || !data.isTrue(data.field(row, "matched")) || !data.equalsText(data.field(row, "stderr"), "") {
+                return "protocol assertion or sanitizer diagnostic failed"
+            }
+        }
+        return ""
+    }
+    let hashes = data.field(report, "binary_hashes")
+    if !data.isObject(hashes) || hashes.keys.length != 2 || !data.equalsText(data.field(hashes, "client"), digest(context, binary(binaries, "client"))) || !data.equalsText(data.field(hashes, "server"), digest(context, binary(binaries, "server"))) {
+        return "local endpoint binary mismatch"
+    }
+    for row in rows.items {
+        let ok = zero(data.field(row, "expected")) && zero(data.field(row, "semantic_status")) && zero(data.field(row, "client_status")) && data.isTrue(data.field(row, "matched")) &&
+            data.isTrue(data.field(row, "files_match")) && data.isTrue(data.field(row, "reciprocal_epoch_secrets")) && data.equalsText(data.field(row, "client_stderr"), "") && data.equalsText(data.field(row, "server_stderr"), "")
+        if !ok { return "local endpoint assertion or sanitizer diagnostic failed" }
+        let name = data.field(row, "case").text
+        if (name == "rebind-routes" || name == "rebind-pending") && !exactInteger(data.field(row, "rebound_routes"), 12, 9223372036854775807) { return "repeated rebinding did not exceed the old route bound" }
+        if name == "rebind-silent" && !(data.equalsInteger(data.field(row, "rebound_routes"), 2) && data.equalsInteger(data.field(row, "quiet_rebounds"), 1) && exactInteger(data.field(row, "client_after_rebind"), 1, 9223372036854775807)) {
+            return "silent download did not speak from the rebound tuple"
+        }
+        if name == "preferred" || name == "preferred-ipv6" {
+            let expected = preferredTuple(context, name)
+            let tuples = data.field(row, "authenticated_preferred_tuples")
+            let printed = data.field(row, "client_stdout")
+            let lines: List<Text> = []
+            if data.isText(printed) { for line in test.lines(printed.text) { if quic.starts(line, "QNS authenticated preferred address ") { lines.add(line) } } }
+            if !data.isTrue(data.field(row, "preferred_tuple_match")) || !data.allTexts(tuples) || !textsEqual(data.texts(tuples), [expected]) || !data.isText(printed) || !textsEqual(lines, [expected]) {
+                return "authenticated preferred address tuple mismatch"
+            }
+        }
+    }
+    return ""
+}
+
+function posixAction(action: json.Value, pid: Integer, signal: Integer, timedOut: Boolean): Boolean {
+    return data.isObject(action) && data.equalsInteger(data.field(action, "pid"), pid) && data.equalsInteger(data.field(action, "pgid"), pid) && data.isTrue(data.field(action, "attempted")) &&
+        data.equalsInteger(data.field(action, "signal"), signal) && data.equalsInteger(data.field(action, "grace_seconds"), 5) && data.field(action, "wait_timed_out").kind == json.BOOLEAN &&
+        data.field(action, "wait_timed_out").truth == timedOut && data.equalsText(data.field(action, "result"), "sent")
+}
+public function verifyShutdownState(row: json.Value): Text {
+    if !data.isObject(row) || !data.present(row, "status_before_shutdown") || !data.present(row, "owned_termination_requested") || !anyInteger(data.field(row, "status")) {
+        return "endpoint shutdown observation missing"
+    }
+    let prior = data.field(row, "status_before_shutdown")
+    let requested = data.field(row, "owned_termination_requested")
+    if !(data.isNull(prior) || data.equalsInteger(prior, 0)) || requested.kind != json.BOOLEAN || requested.truth != data.isNull(prior) {
+        return "endpoint exited unexpectedly or shutdown ownership is inconsistent"
+    }
+    if !data.isNull(prior) && !data.equalsInteger(data.field(row, "status"), 0) { return "endpoint status changed after its normal exit" }
+    return ""
+}
+public function verifyLifecycle(context: Context, row: json.Value): Lifecycle {
+    let state = verifyShutdownState(row)
+    if state != "" { return Lifecycle { error: state; receipts: [] } }
+    if !exactInteger(data.field(row, "pid"), 1, 9223372036854775807) { return Lifecycle { error: "endpoint owned process identity missing"; receipts: [] } }
+    let lifecycle = data.field(row, "lifecycle")
+    let status = data.field(row, "status")
+    let expected = data.field(lifecycle, "expected_final_status")
+    let cleanup = data.field(lifecycle, "cleanup_errors")
+    if !data.isObject(lifecycle) || !data.isTrue(data.field(lifecycle, "healthy_before_shutdown")) || !data.isTrue(data.field(lifecycle, "cleanup_complete")) || !data.isTrue(data.field(lifecycle, "passed")) ||
+        !data.isArray(cleanup) || cleanup.items.length != 0 || data.field(lifecycle, "escalated").kind != json.BOOLEAN || !anyInteger(expected) || data.integer(expected) != data.integer(status) {
+        return Lifecycle { error: "endpoint lifecycle did not prove healthy complete cleanup"; receipts: [] }
+    }
+    let strategy = data.field(lifecycle, "termination_strategy")
+    let receipt = data.field(lifecycle, "receipt")
+    let escalated = data.field(lifecycle, "escalated").truth
+    if !data.isObject(receipt) { return Lifecycle { error: "endpoint termination receipt missing"; receipts: [] } }
+    if data.equalsInteger(data.field(row, "status_before_shutdown"), 0) {
+        if !data.equalsText(strategy, "already-exited") || data.integer(expected) != 0 || escalated || receipt.keys.length != 0 {
+            return Lifecycle { error: "normal endpoint exit acquired an inconsistent termination receipt"; receipts: [] }
+        }
+        return Lifecycle { error: ""; receipts: [] }
+    }
+    if data.equalsText(strategy, "already-exited") { return Lifecycle { error: "running endpoint lacks owned termination"; receipts: [] } }
+    let pid = data.integer(data.field(row, "pid"))
+    if data.equalsText(strategy, "posix-sigterm") || data.equalsText(strategy, "posix-sigkill-after-grace") {
+        if context.windows { return Lifecycle { error: "POSIX termination cannot certify a Windows endpoint"; receipts: [] } }
+        let kill = data.equalsText(strategy, "posix-sigkill-after-grace")
+        let final = -15
+        if kill { final = -9 }
+        if escalated != kill || data.integer(expected) != final { return Lifecycle { error: "POSIX final status differs from its exact termination action"; receipts: [] } }
+        let signal = 15
+        if kill { signal = 9 }
+        if !posixAction(receipt, pid, signal, false) { return Lifecycle { error: "unproved owned POSIX termination action"; receipts: [] } }
+        if kill {
+            let previous = data.field(receipt, "previous")
+            if !posixAction(previous, pid, 15, true) { return Lifecycle { error: "unproved owned POSIX termination action"; receipts: [] } }
+            if data.present(previous, "previous") { return Lifecycle { error: "ambiguous POSIX escalation chain"; receipts: [] } }
+        } else if data.present(receipt, "previous") { return Lifecycle { error: "unexplained POSIX prior termination action"; receipts: [] } }
+        return Lifecycle { error: ""; receipts: [] }
+    }
+    if !data.equalsText(strategy, "windows-taskkill-tree") || !context.windows || escalated || data.integer(expected) != 1 {
+        return Lifecycle { error: "unsupported or unproved native termination strategy"; receipts: [] }
+    }
+    let native = data.field(receipt, "native_pid")
+    let name = data.field(receipt, "python_os_name")
+    let source = "proc-winpid"
+    if data.equalsText(name, "nt") { source = "popen" }
+    let argv = data.strings(["taskkill.exe", "-F", "-T", "-PID", native.text])
+    let timedOut = data.field(receipt, "wait_timed_out")
+    let ok = data.equalsInteger(data.field(receipt, "pid"), pid) && exactInteger(native, 1, 9223372036854775807) && (data.equalsText(name, "nt") || data.equalsText(name, "posix")) &&
+        data.equalsText(data.field(receipt, "pid_source"), source) && (!data.equalsText(name, "nt") || data.integer(native) == pid) && data.equal(data.field(receipt, "argv"), argv) &&
+        data.equalsInteger(data.field(receipt, "timeout_seconds"), 10) && data.isTrue(data.field(receipt, "attempted")) && data.equalsInteger(data.field(receipt, "status"), 0) &&
+        (!data.present(receipt, "wait_timed_out") || data.isFalse(timedOut)) && !data.present(receipt, "previous")
+    if !ok { return Lifecycle { error: "native termination ownership/action receipt differs"; receipts: [] } }
+    return Lifecycle { error: ""; receipts: [receipt] }
+}
+
+function fixture(directory: Text, roles: json.Value, name: Text): Text {
+    let relative = "fixtures/" + name
+    if !test.contains("\n" + quic.joined(data.texts(data.field(roles, "certificates")), "\n") + "\n", "\n" + relative + "\n") { return "" }
+    return directory + "/" + relative
+}
+public function localTestcase(name: Text): Text {
+    if name == "multiplex1999" || name == "ipv6" || name == "rebind-routes" || name == "rebind-pending" || name == "rebind-silent" { return "transfer" }
+    if name == "multiconnect50" { return "multiconnect" }
+    if name == "preferred" || name == "preferred-ipv6" { return "connectionmigration" }
+    if name == "resumption40" { return "resumption" }
+    if name == "zerortt40" { return "zerortt" }
+    if name == "keyupdate" || name == "chacha20" { return name }
+    return ""
+}
+public function verifyInvocation(context: Context, kind: Text, name: Text, command: json.Value, endpoint: json.Value, roles: json.Value, directory: Text, binaries: Binaries): Text {
+    let workspace = directory + "/fixtures"
+    if kind == "migration" || kind == "cipher" {
+        let expected = [resolved(context, binary(binaries, kind))]
+        for item in ["root.der", "server.der", "server.pk8", "client.der", "client.pk8"] {
+            let path = fixture(directory, roles, item)
+            if path == "" { return "invocation certificate fixture omitted" }
+            expected.add(path)
+        }
+        expected.add(name)
+        if !data.equal(command, data.strings(expected)) || !data.isNull(endpoint) { return "case label differs from complete migration/cipher argv" }
+        return ""
+    }
+    if kind == "local" {
+        let testcase = localTestcase(name)
+        if testcase == "" { return "unknown local endpoint case" }
+        let count = 1
+        if name == "multiplex1999" { count = 1999 } else if name == "multiconnect50" { count = 50 } else if name == "resumption40" || name == "zerortt40" { count = 40 }
+        let names: List<Text> = []
+        for index in 0..count { names.add("file" + Text(index)) }
+        let root = fixture(directory, roles, "root.der")
+        let key = fixture(directory, roles, "server.pk8")
+        let certificate = fixture(directory, roles, "server.der")
+        if root == "" || key == "" || certificate == "" { return "invocation certificate fixture omitted" }
+        let host = "127.0.0.1"
+        if name == "ipv6" || name == "preferred-ipv6" { host = "::1" }
+        let port = context.port
+        if name == "rebind-routes" || name == "rebind-pending" || name == "rebind-silent" { port = context.port + 2 }
+        let client = [resolved(context, binary(binaries, "client")), root, host, Text(port), workspace + "/" + name + "-client.keys", workspace + "/" + name + "-downloads", testcase]
+        for item in names { client.add(item) }
+        let server = [resolved(context, binary(binaries, "server")), key, root, workspace + "/" + name + "-server.keys", workspace + "/" + name + "-www", testcase, certificate, "--port=" + Text(context.port)]
+        if name == "preferred" { server.add("--preferred-ipv4=7f000001"); server.add("--preferred-port=" + Text(context.port + 1)) }
+        if name == "preferred-ipv6" { for item in ["--preferred-ipv4=00000000", "--preferred-ipv6=00000000000000000000000000000001", "--preferred-port=" + Text(context.port + 1)] { server.add(item) } }
+        if !data.equal(command, data.strings(client)) || !data.equal(endpoint, data.strings(server)) { return "local testcase/client-server/fixture argv binding mismatch" }
+        let sorted = names.sorted()
+        let payloads: List<Text> = []
+        let downloads: List<Text> = []
+        for item in sorted { payloads.add("fixtures/" + name + "-www/" + item); downloads.add("fixtures/" + name + "-downloads/" + item) }
+        let keylogs = ["fixtures/" + name + "-client.keys", "fixtures/" + name + "-server.keys"].sorted()
+        if !data.equal(data.field(roles, "payloads"), data.strings(payloads)) || !data.equal(data.field(roles, "downloads"), data.strings(downloads)) || !data.equal(data.field(roles, "keylogs"), data.strings(keylogs)) {
+            return "local payload/download/keylog case mapping mismatch"
+        }
+        return ""
+    }
+    if kind != "vn" || name != "reserved-version" { return "unknown version-negotiation case" }
+    let root = fixture(directory, roles, "root.der")
+    let key = fixture(directory, roles, "server.pk8")
+    let certificate = fixture(directory, roles, "server.der")
+    if root == "" || key == "" || certificate == "" { return "invocation certificate fixture omitted" }
+    let server = [resolved(context, binary(binaries, "server")), key, root, workspace + "/keys", workspace + "/www", "transfer", certificate, "--port=" + Text(context.port)]
+    if !data.isNull(command) || !data.equal(endpoint, data.strings(server)) { return "version-negotiation server/fixture argv binding mismatch" }
+    let keylogs = data.field(roles, "keylogs")
+    if !data.equal(data.field(roles, "packets"), data.strings(["fixtures/request.bin", "fixtures/response.bin"])) || !(data.equal(keylogs, data.strings([])) || data.equal(keylogs, data.strings(["fixtures/keys"]))) {
+        return "version-negotiation packet/keylog case mapping mismatch"
+    }
+    return ""
+}
+
+public function requestedFlags(optimization: Text, sanitize: Boolean): List<Text> {
+    let flags = ["-O" + optimization, "-Wno-override-module"]
+    if sanitize { for flag in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { flags.add(flag) } }
+    return flags
+}
+public function effectiveOptimization(arguments: List<Text>): Text {
+    let value = "none"
+    for argument in arguments {
+        if !quic.starts(argument, "-O") { continue }
+        let rest = quic.after(argument, "-O")
+        let digits = Bytes(rest).length > 0
+        for byte in Bytes(rest) { if byte < 48 || byte > 57 { digits = false } }
+        if rest == "" { value = "1" }
+        else if digits || rest == "s" || rest == "z" || rest == "g" || rest == "fast" { value = rest }
+    }
+    return value
+}
+function suffixed(value: Text, suffixes: List<Text>): Boolean {
+    for suffix in suffixes { if quic.ends(value, suffix) { return true } }
+    return false
+}
+function sanitizerOptions(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { if quic.starts(value, "-fsanitize=") || quic.starts(value, "-fno-sanitize=") { result.add(value) } }
+    return result
+}
+function sublist(values: List<Text>, start: Integer, end: Integer): List<Text> {
+    let result: List<Text> = []
+    for index in start..end { result.add(values[index]) }
+    return result
+}
+function bound(context: Context, directory: Text, row: json.Value, immediate: Boolean, inventory: Inventory): Text {
+    if !data.isObject(row) || !data.isText(data.field(row, "original")) || !quic.starts(data.field(row, "original").text, "/") { return "!missing absolute input identity" }
+    let path = retainedPath(directory, data.field(row, "retained"), inventory)
+    if path == "" { return "!missing or escaped retained file" }
+    let relative = data.field(row, "retained").text
+    if !data.equalsInteger(data.field(row, "bytes"), sizeOf(inventory, relative)) || sizeOf(inventory, relative) < 0 { return "!retained byte size mismatch" }
+    let value = hashOf(inventory, relative)
+    let fields = ["sha256", "source_before_sha256", "retained_sha256", "source_after_sha256"]
+    if immediate { fields.add("pre_link_sha256"); fields.add("post_link_sha256") }
+    for name in fields {
+        if !sha256Value(data.field(row, name)) || data.field(row, name).text != value { return "!input before/copy/after byte binding mismatch" }
+    }
+    return data.field(row, "original").text
+}
+function failed(value: Text): Boolean { return quic.starts(value, "!") }
+function reason(value: Text): Text { return quic.after(value, "!") }
+
+public function verifyLink(context: Context, directory: Text, binaryPath: Text, sanitize: Boolean, optimization: Text, compilerIdentity: Text): Text {
+    let report = data.decode(readBytesFile(directory + "/manifest.json"))
+    if !data.isObject(report) { return "final-link schema 2 required" }
+    let inventory = artifactInventory(context, directory)
+    if inventory.error != "" { return inventory.error }
+    if !data.equalsInteger(data.field(report, "schema"), 2) { return "final-link schema 2 required" }
+    let mode = "native"
+    if sanitize { mode = "asan" }
+    let sanitizeFlag = data.field(report, "address_sanitizer_enabled")
+    let retention = data.field(report, "retention_errors")
+    if !zero(data.field(report, "link_status")) || !zero(data.field(report, "link_subprocess_status")) || !data.isTrue(data.field(report, "link_attempted")) ||
+        sanitizeFlag.kind != json.BOOLEAN || sanitizeFlag.truth != sanitize || !data.isFalse(data.field(report, "program_ir_cached")) || !data.isFalse(data.field(report, "runtime_reannotated")) ||
+        !data.equalsText(data.field(report, "mode"), mode) || !data.equalsText(data.field(report, "optimization"), optimization) || !data.isArray(retention) || retention.items.length != 0 {
+        return "effective program sanitizer/link provenance mismatch"
+    }
+    let linkFlags = data.field(report, "link_flags")
+    if !data.equal(linkFlags, data.strings(requestedFlags(optimization, sanitize))) || !data.equal(data.field(report, "lto_flags"), data.strings([])) { return "requested flags changed" }
+    let artifact = data.field(report, "artifact_directory")
+    if !data.isText(artifact) || resolved(context, artifact.text) != resolved(context, directory) { return "link artifact directory mismatch" }
+    let rawPath = retainedPath(directory, data.string("program.raw.ll"), inventory)
+    if rawPath == "" { return "missing or escaped retained file" }
+    let raw = readBytesFile(rawPath)
+    let rawHash = hashOf(inventory, "program.raw.ll")
+    let rawOriginal = bound(context, directory, data.field(report, "raw_program_input"), true, inventory)
+    if failed(rawOriginal) { return reason(rawOriginal) }
+    if !data.equalsText(data.field(report, "raw_program"), rawOriginal) || !data.equalsText(data.field(report, "raw_sha256"), rawHash) { return "transient raw generated program binding mismatch" }
+    let linked = raw
+    let linkedName = "program.raw.ll"
+    if sanitize {
+        linkedName = "program.asan.ll"
+        let linkedPath = retainedPath(directory, data.string(linkedName), inventory)
+        if linkedPath == "" { return "missing or escaped retained file" }
+        linked = readBytesFile(linkedPath)
+        let canonical = sanitizer.instrument(Text(raw), "sanitize_address")
+        if canonical.error != "" || canonical.text != Text(linked) || Text(linked) == Text(raw) { return "linked program is not canonical ASan annotation" }
+    }
+    let program = data.field(report, "program_input")
+    let linkedOriginal = bound(context, directory, program, true, inventory)
+    if failed(linkedOriginal) { return reason(linkedOriginal) }
+    if !data.equalsText(data.field(program, "role"), "program") || !data.equalsText(data.field(program, "format"), "llvm") || !data.equalsText(data.field(program, "retained"), linkedName) ||
+        !data.equalsText(data.field(report, "linked_program_sha256"), hashOf(inventory, linkedName)) {
+        return "linked generated program changed"
+    }
+    if !((sanitize && resolved(context, linkedOriginal) == resolved(context, directory + "/program.asan.ll")) || (!sanitize && linkedOriginal == rawOriginal)) { return "actual generated input route mismatch" }
+    let commandValue = data.field(report, "command")
+    let actualValue = data.field(report, "actual_command")
+    let staged = data.field(report, "staged_requested_path")
+    if !textList(commandValue) || !data.allTexts(actualValue) || !data.isText(staged) { return "actual staged-output argv mismatch" }
+    let command = data.texts(commandValue)
+    let expectedActual = data.texts(commandValue)
+    expectedActual.add("-o")
+    expectedActual.add(staged.text)
+    let actual = data.texts(actualValue)
+    if !textsEqual(actual, expectedActual) { return "actual staged-output argv mismatch" }
+    let flags = data.texts(linkFlags)
+    if !data.equalsText(data.field(report, "compiler_selected_command"), command[0]) || command.length < 1 + flags.length || !textsEqual(sublist(command, 1, 1 + flags.length), flags) { return "selected compiler or link flags changed" }
+    let middle = sublist(actual, 1, actual.length - 2)
+    let indirect = false
+    for value in middle { if quic.starts(value, "@") { indirect = true } }
+    if effectiveOptimization(middle) != optimization || sanitizer.addressEnabled(middle) != sanitize || indirect { return "actual argv overrides requested optimization or sanitizer mode" }
+    if !textsEqual(sanitizerOptions(middle), sanitizerOptions(flags)) { return "actual argv changes the exact requested sanitizer options" }
+    let irInputs: List<Text> = []
+    for value in sublist(command, 1, command.length) { if suffixed(value, [".ll", ".bc"]) { irInputs.add(value) } }
+    if !textsEqual(irInputs, [linkedOriginal]) { return "extra or missing program/runtime LLVM input" }
+    let inputs = data.field(report, "inputs")
+    if !data.isArray(inputs) { return "native input inventory missing" }
+    for row in inputs.items { if !data.isObject(row) { return "native input inventory missing" } }
+    let runtimes: List<json.Value> = []
+    for row in inputs.items { if data.equalsText(data.field(row, "role"), "runtime") { runtimes = runtimes.appended(row) } }
+    if runtimes.length != 1 || !data.equalsText(data.field(runtimes[0], "retained"), "runtime.o") || !data.equalsText(data.field(runtimes[0], "format"), "native_object") || !quic.ends(data.field(runtimes[0], "original").text, ".o") {
+        return "runtime must be one native object, not LLVM"
+    }
+    let natives: List<Text> = []
+    for row in inputs.items {
+        let original = bound(context, directory, row, true, inventory)
+        if failed(original) { return reason(original) }
+        natives.add(original)
+    }
+    for row in inputs.items {
+        let role = data.field(row, "role")
+        let format = data.field(row, "format")
+        if !(data.equalsText(role, "runtime") || data.equalsText(role, "provider")) || !(data.equalsText(format, "native_object") || data.equalsText(format, "native_input")) { return "ambiguous native link inventory" }
+    }
+    if !uniqueTexts(natives) { return "ambiguous native link inventory" }
+    let actualNative: List<Text> = []
+    for value in sublist(command, 1, command.length) {
+        if !quic.starts(value, "-") && suffixed(value, [".o", ".obj", ".a", ".lib", ".so", ".dylib"]) { actualNative.add(value) }
+    }
+    if !textsEqual(actualNative, natives) { return "unrepresented or unused native link input" }
+    let tools = data.field(report, "tools")
+    let bindings = data.field(report, "tool_bindings")
+    let names = ["clang-driver", "clang.bin"]
+    if !data.isObject(tools) || !data.isObject(bindings) || tools.keys.length != 2 || bindings.keys.length != 2 { return "canonical helper or compiler evidence missing" }
+    for name in names {
+        if !data.present(tools, name) || !data.present(bindings, name) { return "canonical helper or compiler evidence missing" }
+    }
+    for name in names {
+        let original = bound(context, directory, data.field(bindings, name), false, inventory)
+        if failed(original) { return reason(original) }
+        if !data.equalsText(data.field(data.field(bindings, name), "retained"), name) || !listed(inventory, name) || !data.equalsText(data.field(tools, name), hashOf(inventory, name)) { return "retained tool binding mismatch" }
+    }
+    if !data.equalsText(data.field(tools, "clang-driver"), digest(context, context.root + "/build/tooling/tools/clang-driver")) { return "canonical link helper mismatch" }
+    let compiler = data.field(report, "compiler_pre_link")
+    let version = data.field(report, "compiler_version")
+    if !data.isObject(compiler) || !data.equalsText(data.field(compiler, "selected_command"), command[0]) || !data.isText(data.field(compiler, "resolved_path")) ||
+        !data.equalsText(data.field(report, "compiler"), data.field(compiler, "resolved_path").text) || !data.equalsText(data.field(data.field(bindings, "clang.bin"), "original"), data.field(compiler, "resolved_path").text) ||
+        !data.equalsText(data.field(compiler, "sha256"), data.field(tools, "clang.bin").text) || !data.isText(version) || version.text == "" {
+        return "actual compiler bytes/version mismatch"
+    }
+    if compilerIdentity != "" && !data.equalsText(data.field(compiler, "sha256"), compilerIdentity) { return "selected compiler byte identity changed" }
+    let hashes: List<Text> = []
+    let sizes: List<Integer> = []
+    for pair in [["staged_output", "program.staged"], ["final_output", "program"]] {
+        let row = data.field(report, pair[0])
+        if !data.isObject(row) || !data.equalsText(data.field(row, "retained"), pair[1]) || !data.isText(data.field(row, "path")) || !quic.starts(data.field(row, "path").text, "/") { return "staged/final output identity absent" }
+        let path = retainedPath(directory, data.string(pair[1]), inventory)
+        if path == "" { return "missing or escaped retained file" }
+        if !exactInteger(data.field(row, "bytes"), 1, 9223372036854775807) || data.integer(data.field(row, "bytes")) != sizeOf(inventory, pair[1]) || !data.equalsText(data.field(row, "sha256"), hashOf(inventory, pair[1])) {
+            return "staged/final output bytes mismatch"
+        }
+        hashes.add(data.field(row, "sha256").text)
+        sizes.add(data.integer(data.field(row, "bytes")))
+    }
+    let stagedPath = data.field(data.field(report, "staged_output"), "path").text
+    if stagedPath != staged.text && stagedPath != staged.text + ".exe" { return "actual staged output path mismatch" }
+    let binaryHash = digest(context, binaryPath)
+    if resolved(context, data.field(data.field(report, "final_output"), "path").text) != resolved(context, binaryPath) || hashes[0] != hashes[1] || sizes[0] != sizes[1] ||
+        hashes[0] != binaryHash || sizes[0] != files.pathSize(binaryPath) || !data.equalsText(data.field(report, "binary_sha256"), binaryHash) {
+        return "final binary binding mismatch"
+    }
+    return ""
+}
+
+public record Tool { name: Text; source: Text; before: Text }
+function rawFile(directory: Text, row: json.Value, stream: Text, inventory: Inventory): Text {
+    let path = data.field(row, stream + "_path")
+    if !data.isText(path) || !quic.starts(path.text, directory + "/") { return "!author raw output escaped artifact directory" }
+    let relative = quic.after(path.text, directory + "/")
+    if !listed(inventory, relative) || !data.equalsText(data.field(row, stream + "_sha256"), hashOf(inventory, relative)) || !data.equalsInteger(data.field(row, stream + "_bytes"), sizeOf(inventory, relative)) {
+        return "!author raw output byte binding mismatch"
+    }
+    return relative
+}
+function readFirstLine(path: Text): Bytes {
+    let raw = files.readFile(path)
+    for index in 0..raw.length { if raw[index] == 10 { return raw.slice(0, index + 1) } }
+    return raw
+}
+function memberIndex(values: List<Integer>, wanted: Integer): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function hasText(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+public function requiredInputs(context: Context, kind: Text, binaries: Binaries): List<Text> {
+    let names = [driverSource(kind)]
+    for name in nativeSupport() { names.add(name) }
+    let selected = [kind]
+    if kind == "local" { selected = ["client", "server"] } else if kind == "vn" { selected = ["server"] }
+    for name in selected { names.add(binarySource(name)) }
+    if kind == "local" || kind == "vn" { names.add(endpointSource()) }
+    let result: List<Text> = []
+    for name in names { result.add(context.root + "/" + name) }
+    for name in selected { result.add(resolved(context, binary(binaries, name))) }
+    return result
+}
+function endpointRaw(context: Context, directory: Text, row: json.Value, inventory: Inventory): List<Text> {
+    let result: List<Text> = []
+    for stream in ["stdout", "stderr"] { result.add(rawFile(directory, row, stream, inventory)) }
+    let lifecycle = verifyLifecycle(context, row)
+    if lifecycle.error != "" { result.add("!" + lifecycle.error); return result }
+    for receipt in lifecycle.receipts { for stream in ["stdout", "stderr"] { result.add(rawFile(directory, receipt, stream, inventory)) } }
+    return result
+}
+public function lifecycleRaw(context: Context, directory: Text, row: json.Value, inventory: Inventory): Text {
+    let lifecycle = verifyLifecycle(context, row)
+    if lifecycle.error != "" { return lifecycle.error }
+    for receipt in lifecycle.receipts {
+        for stream in ["stdout", "stderr"] {
+            let value = rawFile(directory, receipt, stream, inventory)
+            if failed(value) { return reason(value) }
+        }
+    }
+    return ""
+}
+function firstFailure(values: List<Text>): Text {
+    for value in values { if failed(value) { return reason(value) } }
+    return ""
+}
+
+public function verifyDriverArtifacts(context: Context, directory: Text, kind: Text, parsed: json.Value, declared: List<Text>, binaries: Binaries, sourceNames: List<Text>, sourceHashes: List<Text>, tools: List<Tool>): Text {
+    let manifest = data.decode(readBytesFile(directory + "/manifest.json"))
+    if !data.isObject(manifest) || !data.equalsInteger(data.field(manifest, "schema_version"), 1) || !data.equalsText(data.field(manifest, "status"), "passed") ||
+        !data.equal(data.field(manifest, "finalization_errors"), data.array([])) || !data.equal(data.field(manifest, "unhashed_files"), data.array([])) {
+        return "author artifact manifest did not pass complete retention"
+    }
+    if !data.equal(data.decode(readBytesFile(directory + "/results.json")), parsed) { return "printed author results differ from retained results" }
+    let cases = declared
+    if cases.length == 0 {
+        let printed = data.field(parsed, "declared_cases")
+        if !data.allTexts(printed) { return "author artifact case inventory missing" }
+        cases = data.texts(printed)
+    }
+    if cases.length == 0 || !uniqueTexts(cases) || hasText(cases, "") { return "author artifact case inventory missing" }
+    if !data.equal(data.field(manifest, "declared_cases"), data.strings(cases)) || !data.equal(data.field(parsed, "declared_cases"), data.strings(cases)) { return "declared case artifact inventory mismatch" }
+    let inventory = artifactInventory(context, directory)
+    if inventory.error != "" { return inventory.error }
+    let actualNames: List<Text> = []
+    let actualHashes: List<json.Value> = []
+    let actualSizes: List<json.Value> = []
+    for index in 0..inventory.names.length {
+        if inventory.names[index] == "manifest.json" { continue }
+        actualNames.add(inventory.names[index])
+        actualHashes = actualHashes.appended(data.string(inventory.hashes[index]))
+        actualSizes = actualSizes.appended(data.number(inventory.sizes[index]))
+    }
+    if !data.equal(data.field(manifest, "files"), data.object(actualNames, actualHashes)) { return "author exact file hash inventory mismatch" }
+    let bytes = data.field(manifest, "file_bytes")
+    if !data.equal(bytes, data.object(actualNames, actualSizes)) { return "author exact file size inventory mismatch" }
+    for value in bytes.items { if !exactInteger(value, 0, 9223372036854775807) { return "author exact file size inventory mismatch" } }
+    let inputs = data.field(manifest, "inputs")
+    let expectedNames: List<Text> = []
+    let expectedHashes: List<Text> = []
+    for index in 0..sourceNames.length { expectedNames.add(context.root + "/" + sourceNames[index]); expectedHashes.add(sourceHashes[index]) }
+    for path in binaries.paths { expectedNames.add(resolved(context, path)); expectedHashes.add(digest(context, path)) }
+    let expected = Map<Text, Text>()
+    for index in 0..expectedNames.length { expected[expectedNames[index]] = expectedHashes[index] }
+    if !data.isObject(inputs) || inputs.keys.length == 0 { return "author source/binary input binding mismatch" }
+    for index in 0..inputs.keys.length {
+        if !expected.has(inputs.keys[index]) || !data.equalsText(inputs.items[index], expected[inputs.keys[index]]) { return "author source/binary input binding mismatch" }
+    }
+    for name in requiredInputs(context, kind, binaries) { if !data.present(inputs, name) { return "author required source/binary inputs omitted" } }
+    let commands = data.field(manifest, "commands")
+    let endpoints = data.field(manifest, "endpoint_commands")
+    if !data.isArray(commands) || !data.isArray(endpoints) { return "author command/endpoint observations missing" }
+    for row in commands.items {
+        let ok = data.isObject(row) && textList(data.field(row, "command")) && data.isText(data.field(row, "cwd")) && quic.starts(data.field(row, "cwd").text, "/") &&
+            exactInteger(data.field(row, "timeout"), 1, 9223372036854775807) && anyInteger(data.field(row, "returncode")) && zero(data.field(row, "status")) &&
+            data.integer(data.field(row, "returncode")) == data.integer(data.field(row, "status")) && data.isFalse(data.field(row, "timed_out")) && sha256Value(data.field(row, "executable_sha256"))
+        if !ok { return "author command observation incomplete" }
+        if data.equalsText(data.field(row, "phase"), "certificate-fixture") && tools.length > 0 {
+            let executable = data.field(row, "executable")
+            let identity = ""
+            if data.isText(executable) {
+                let source = resolved(context, executable.text)
+                for tool in tools { if tool.source == source && identity == "" { identity = tool.before } }
+            }
+            if identity == "" || data.field(row, "executable_sha256").text != identity { return "certificate tool differs from recorded executable bytes/version" }
+        }
+        let raw = firstFailure([rawFile(directory, row, "stdout", inventory), rawFile(directory, row, "stderr", inventory)])
+        if raw != "" { return raw }
+    }
+    let timeout = 180
+    if kind == "vn" { timeout = 3 }
+    for row in endpoints.items {
+        let requested = data.field(row, "owned_termination_requested")
+        let readiness = data.field(row, "readiness_timed_out")
+        let ok = data.isObject(row) && textList(data.field(row, "argv")) && anyInteger(data.field(row, "status")) && data.equalsInteger(data.field(row, "peer_timeout_seconds"), timeout) &&
+            data.equalsInteger(data.field(row, "readiness_timeout_seconds"), 10) && data.equalsInteger(data.field(row, "shutdown_grace_seconds"), 5) && requested.kind == json.BOOLEAN &&
+            (!data.present(row, "readiness_timed_out") || data.isFalse(readiness)) && data.isFalse(data.field(row, "timed_out"))
+        if !ok { return "author endpoint status/deadline observation incomplete" }
+        let executable = resolved(context, data.field(row, "argv").items[0].text)
+        if !expected.has(executable) || !data.equalsText(data.field(row, "binary_sha256"), expected[executable]) { return "author endpoint binary binding mismatch" }
+        let raw = firstFailure(endpointRaw(context, directory, row, inventory))
+        if raw != "" { return raw }
+        let first = readFirstLine(data.field(row, "stdout_path").text)
+        if normalized(Text(first)) != "QNS server ready\n" || !data.equalsText(data.field(row, "ready_line_sha256"), digestBytes(context, first)) { return "exact endpoint readiness marker changed" }
+    }
+    let rows = data.field(manifest, "case_inventory")
+    if !data.isArray(rows) || rows.items.length != cases.length || !data.equal(data.field(parsed, "case_inventory"), rows) { return "author case references missing/reordered" }
+    for index in 0..rows.items.length {
+        if !data.isObject(rows.items[index]) || !data.equalsText(data.field(rows.items[index], "case"), cases[index]) { return "author case references missing/reordered" }
+    }
+    let referencedCommands: List<Integer> = []
+    let referencedEndpoints: List<Integer> = []
+    let required = ["certificates", "raw_output"]
+    if kind == "local" { for name in ["payloads", "downloads", "keylogs"] { required.add(name) } }
+    if kind == "vn" { for name in ["packets", "keylogs"] { required.add(name) } }
+    for row in rows.items {
+        let name = data.field(row, "case").text
+        let ci = data.field(row, "command_indices")
+        let ei = data.field(row, "endpoint_indices")
+        let listedFiles = data.field(row, "files")
+        if !data.isArray(ci) || !data.isArray(ei) { return "invalid per-case command/endpoint references" }
+        let commandIndices: List<Integer> = []
+        let endpointIndices: List<Integer> = []
+        for value in ci.items {
+            if !exactInteger(value, 0, commands.items.length - 1) || memberIndex(commandIndices, data.integer(value)) { return "invalid per-case command/endpoint references" }
+            commandIndices.add(data.integer(value))
+        }
+        for value in ei.items {
+            if !exactInteger(value, 0, endpoints.items.length - 1) || memberIndex(endpointIndices, data.integer(value)) { return "invalid per-case command/endpoint references" }
+            endpointIndices.add(data.integer(value))
+        }
+        if !data.isArray(listedFiles) || listedFiles.items.length == 0 || !data.allTexts(listedFiles) || !uniqueTexts(data.texts(listedFiles)) { return "missing/wrong per-case fixture/hash references" }
+        let caseFiles = data.texts(listedFiles)
+        for value in caseFiles { if !listed(inventory, value) || value == "manifest.json" { return "missing/wrong per-case fixture/hash references" } }
+        let roles = data.field(row, "file_roles")
+        if !data.isObject(roles) || roles.keys.length != required.length { return "per-case role/files inventory is incomplete" }
+        let union: List<Text> = []
+        for role in required {
+            let values = data.field(roles, role)
+            if !data.present(roles, role) || !data.isArray(values) || !data.allTexts(values) || !uniqueTexts(data.texts(values)) { return "per-case role/files inventory is incomplete" }
+            for value in data.texts(values) {
+                if !listed(inventory, value) { return "per-case role/files inventory is incomplete" }
+                if !hasText(union, value) { union.add(value) }
+            }
+        }
+        union.sort()
+        if data.field(roles, "certificates").items.length == 0 || data.field(roles, "raw_output").items.length == 0 || !textsEqual(union, caseFiles) { return "per-case role/files inventory is incomplete" }
+        if kind == "local" && (data.field(roles, "payloads").items.length == 0 || data.field(roles, "downloads").items.length == 0 || data.field(roles, "keylogs").items.length == 0) {
+            return "local payload/download/keylog evidence omitted"
+        }
+        let own: List<Integer> = []
+        let prerequisites: List<Integer> = []
+        let ownEndpoints: List<Integer> = []
+        for position in 0..commands.items.length {
+            if data.equalsText(data.field(commands.items[position], "case"), name) { own.add(position) }
+            if data.equalsText(data.field(commands.items[position], "phase"), "certificate-fixture") { prerequisites.add(position) }
+        }
+        for position in 0..endpoints.items.length { if data.equalsText(data.field(endpoints.items[position], "case"), name) { ownEndpoints.add(position) } }
+        let wanted: List<Integer> = []
+        for value in own { wanted.add(value) }
+        for value in prerequisites { if !memberIndex(wanted, value) { wanted.add(value) } }
+        let commandsMatch = wanted.length == commandIndices.length
+        for value in commandIndices { if !memberIndex(wanted, value) { commandsMatch = false } }
+        let endpointsMatch = ownEndpoints.length == endpointIndices.length
+        for value in endpointIndices { if !memberIndex(ownEndpoints, value) { endpointsMatch = false } }
+        if !commandsMatch || !endpointsMatch || (own.length == 0 && ownEndpoints.length == 0) { return "per-case execution references incomplete" }
+        let workspace = data.field(row, "fixture_workspace")
+        let declaredWorkspace = data.field(manifest, "workspace")
+        if !data.isText(workspace) || !data.isText(declaredWorkspace) || resolved(context, workspace.text) != resolved(context, declaredWorkspace.text) { return "per-case fixture workspace mismatch" }
+        let rawNames: List<Text> = []
+        for position in commandIndices {
+            for value in [rawFile(directory, commands.items[position], "stdout", inventory), rawFile(directory, commands.items[position], "stderr", inventory)] {
+                if failed(value) { return reason(value) }
+                if !hasText(caseFiles, value) { return "per-case raw command files missing" }
+                if !hasText(rawNames, value) { rawNames.add(value) }
+            }
+        }
+        for position in endpointIndices {
+            for value in endpointRaw(context, directory, endpoints.items[position], inventory) {
+                if failed(value) { return reason(value) }
+                if !hasText(caseFiles, value) { return "per-case raw endpoint/termination files missing" }
+                if !hasText(rawNames, value) { rawNames.add(value) }
+            }
+        }
+        rawNames.sort()
+        if !data.equal(data.field(roles, "raw_output"), data.strings(rawNames)) { return "raw per-case role inventory mismatch" }
+        let result = data.none()
+        let results = data.field(parsed, "results")
+        if data.isArray(results) { for item in results.items { if data.isNull(result) && data.equalsText(data.field(item, "case"), name) { result = item } } }
+        if kind == "migration" || kind == "cipher" || kind == "local" {
+            if own.length != 1 { return "ambiguous per-case protocol execution" }
+            let observation = commands.items[own[0]]
+            let selected = binary(binaries, kind)
+            if kind == "local" { selected = binary(binaries, "client") }
+            let limit = 60
+            if kind == "local" { limit = 180 }
+            if resolved(context, data.field(observation, "command").items[0].text) != resolved(context, selected) || !data.equalsText(data.field(observation, "executable_sha256"), digest(context, selected)) ||
+                !data.equalsInteger(data.field(observation, "timeout"), limit) {
+                return "per-case binary/timeout identity mismatch"
+            }
+            let prefix = ""
+            if kind == "local" { prefix = "client_" }
+            if data.isNull(result) || !data.equalsText(data.field(result, prefix + "stdout"), normalized(Text(files.readFile(data.field(observation, "stdout_path").text)))) ||
+                !data.equalsText(data.field(result, prefix + "stderr"), normalized(Text(files.readFile(data.field(observation, "stderr_path").text)))) {
+                return "printed protocol result differs from retained raw bytes"
+            }
+        }
+        if kind == "local" {
+            if ownEndpoints.length != 1 { return "local server observation missing" }
+            let observation = endpoints.items[ownEndpoints[0]]
+            let output = files.readFile(data.field(observation, "stdout_path").text)
+            let greeting = readFirstLine(data.field(observation, "stdout_path").text)
+            if !data.equalsText(data.field(result, "server_stdout"), normalized(Text(output.slice(greeting.length, output.length)))) ||
+                !data.equalsText(data.field(result, "server_stderr"), normalized(Text(files.readFile(data.field(observation, "stderr_path").text)))) {
+                return "printed server result differs from retained raw bytes"
+            }
+        }
+        if ownEndpoints.length > 1 { return "ambiguous per-case server invocation" }
+        let caseCommand = data.none()
+        if own.length > 0 { caseCommand = data.field(commands.items[own[0]], "command") }
+        let caseEndpoint = data.none()
+        if ownEndpoints.length > 0 { caseEndpoint = data.field(endpoints.items[ownEndpoints[0]], "argv") }
+        let invocation = verifyInvocation(context, kind, name, caseCommand, caseEndpoint, roles, directory, binaries)
+        if invocation != "" { return invocation }
+        for value in commandIndices { if !memberIndex(referencedCommands, value) { referencedCommands.add(value) } }
+        for value in endpointIndices { if !memberIndex(referencedEndpoints, value) { referencedEndpoints.add(value) } }
+    }
+    if referencedCommands.length != commands.items.length || referencedEndpoints.length != endpoints.items.length { return "unreferenced author observations" }
+    if kind == "vn" {
+        for stream in ["request", "response"] {
+            let relative = data.field(parsed, stream + "_path")
+            let path = retainedPath(directory, relative, inventory)
+            if path == "" { return "missing or escaped retained file" }
+            let firstFiles = data.texts(data.field(rows.items[0], "files"))
+            if !hasText(firstFiles, relative.text) || !data.equalsInteger(data.field(parsed, stream + "_bytes"), sizeOf(inventory, relative.text)) ||
+                !data.equalsText(data.field(parsed, stream + "_sha256"), hashOf(inventory, relative.text)) {
+                return "version-negotiation packet bytes not retained"
+            }
+        }
+    }
+    return ""
+}
+
+public record Report { value: json.Value }
+public record Copy { before: Text; retained: Text; after: Text; source: Text; copy: Text }
+public record Copies { names: List<Text>; rows: List<Copy>; error: Text }
+public record Snapshot { names: List<Text>; hashes: List<Text>; error: Text }
+public constant COPY = "set -e; root=$1; target=$2; list=$3; mkdir -p \"$target\"; tar -C \"$root\" -cf - -T \"$list\" | tar -C \"$target\" -xf -"
+
+public function set(report: Report, name: Text, value: json.Value) { report.value = data.with(report.value, name, value) }
+function retentionError(report: Report, phase: Text, error: Text) {
+    set(report, "passed", data.boolean(false))
+    let errors = data.field(report.value, "retention_errors")
+    set(report, "retention_errors", data.array(errors.items.appended(data.object(["phase", "error"], [data.string(phase), data.string(error)]))))
+}
+function store(path: Text, value: Text): Boolean {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return false }
+    let raw = Bytes(value)
+    let written = files.write(file, raw, 0, raw.length)
+    return files.close(file) == 0 && written == raw.length
+}
+public function writeReport(directory: Text, report: Report, failPrimary: Boolean) {
+    if !failPrimary && store(directory + "/manifest.json", data.pretty(report.value) + "\n") { return }
+    retentionError(report, "manifest-write", "cannot write " + directory + "/manifest.json")
+    store(directory + "/manifest-retention-error.json", data.pretty(report.value) + "\n")
+}
+function fault(name: Text): Boolean { return system.getenv("MINYAR_QUIC_RFC_FAULT") == name }
+
+public function snapshotInputs(context: Context): Snapshot {
+    let extra = ["tests/quic-rfc.min", "tests/quic-rfc-harness.min", "tests/quic-protocol-artifacts.min", endpointSource()]
+    for name in binaryNames() { extra.add(binarySource(name)) }
+    for kind in driverKinds() { extra.add(driverSource(kind)) }
+    for name in nativeSupport() { extra.add(name) }
+    let script = "cd -- \"$1\" && shift && { printf '%s\\n' minyar Makefile \"$@\"; find bootstrap compiler library runtime tools build-support scripts \\( -type f -o -type l \\) \\( -name '*.min' -o -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.py' -o -name '*.sh' -o -name '*.mk' -o -name '*.patch' -o -name '*.inc' -o -name '*.S' -o -name '*.s' \\); find vendor \\( -type f -o -type l \\); } | LC_ALL=C sort -u"
+    let arguments = [context.root]
+    for name in extra { arguments.add(name) }
+    let listedNames = shell(context, script, arguments)
+    if listedNames.status != 0 { return Snapshot { names: []; hashes: []; error: "source snapshot inventory failed" } }
+    let names: List<Text> = []
+    for line in test.lines(listedNames.output) { if line != "" { names.add(line) } }
+    let checked = [context.root]
+    for name in names { checked.add(name) }
+    let links = shell(context, "cd -- \"$1\" && shift && for name in \"$@\"; do if [ -L \"$name\" ] || [ ! -f \"$name\" ]; then printf '%s\\n' \"$name\"; fi; done", checked)
+    if test.words(links.output).length > 0 { return Snapshot { names: []; hashes: []; error: "symlink source snapshot input" } }
+    let paths: List<Text> = []
+    for name in names { paths.add(context.root + "/" + name) }
+    return Snapshot { names: names; hashes: quic.digests(paths, context.scratch + "/.snapshot-" + stamp()), error: "" }
+}
+public function boundCopies(context: Context, root: Text, names: List<Text>, target: Text, copier: Text): Copies {
+    let sources: List<Text> = []
+    let targets: List<Text> = []
+    for name in names { sources.add(root + "/" + name); targets.add(target + "/" + name) }
+    let before = quic.digests(sources, context.scratch + "/.before-" + stamp())
+    let list = context.scratch + "/.copy-" + stamp()
+    writeTextFile(list, quic.joined(names, "\n") + "\n")
+    let copied = shell(context, copier, [root, target, list])
+    files.remove(list)
+    if copied.status != 0 { return Copies { names: names; rows: []; error: "source copy failed: " + copied.errorOutput } }
+    let retained = quic.digests(targets, context.scratch + "/.retained-" + stamp())
+    let after = quic.digests(sources, context.scratch + "/.after-" + stamp())
+    let rows: List<Copy> = []
+    let base = resolved(context, root)
+    let copies = resolved(context, target)
+    for index in 0..names.length {
+        if before[index] != retained[index] || before[index] != after[index] { return Copies { names: names; rows: []; error: "source before/copy/after changed: " + sources[index] } }
+        rows.add(Copy { before: before[index]; retained: retained[index]; after: after[index]; source: base + "/" + names[index]; copy: copies + "/" + names[index] })
+    }
+    return Copies { names: names; rows: rows; error: "" }
+}
+function copyJSON(row: Copy): json.Value {
+    return data.object(["before", "retained", "after", "source", "copy"], [data.string(row.before), data.string(row.retained), data.string(row.after), data.string(row.source), data.string(row.copy)])
+}
+function single(context: Context, source: Text, target: Text): Copies {
+    let before = digest(context, source)
+    let copied = shell(context, "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -- \"$1\" \"$2\"", [source, target])
+    if before == "" || copied.status != 0 { return Copies { names: [source]; rows: []; error: "cannot copy " + source } }
+    let retained = digest(context, target)
+    let after = digest(context, source)
+    if before != retained || before != after { return Copies { names: [source]; rows: []; error: "source before/copy/after changed: " + source } }
+    return Copies { names: [source]; rows: [Copy { before: before; retained: retained; after: after; source: resolved(context, source); copy: resolved(context, target) }]; error: "" }
+}
+
+public record Gate { context: Context; directory: Text; report: Report; environment: List<Text>; serial: Integer }
+function variable(environment: List<Text>, name: Text): Text {
+    for entry in environment { if quic.starts(entry, name + "=") { return quic.after(entry, name + "=") } }
+    return ""
+}
+function without(environment: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !quic.starts(entry, name + "=") { result.add(entry) } }
+    return result
+}
+function append(report: Report, name: Text, value: json.Value) {
+    set(report, name, data.array(data.field(report.value, name).items.appended(value)))
+}
+function run(gate: Gate, label: Text, command: List<Text>, environment: List<Text>, limit: Integer): test.Result {
+    let started = system.monotonicNanoseconds()
+    let stem = gate.directory + "/" + label
+    let result = test.run(command, environment, gate.context.root, stem + ".stdout", limit)
+    files.rename(stem + ".stdout.err", stem + ".stderr")
+    let executable = quic.resolve(command[0], gate.context.root, environment, gate.context.root)
+    let hash = data.none()
+    if executable != "" { hash = data.string(digest(gate.context, executable)) }
+    let path = data.none()
+    if executable != "" { path = data.string(executable) }
+    let recorded: List<Text> = []
+    for entry in environment {
+        let at = entry.find("=")
+        if at <= 0 { continue }
+        let name = entry.slice(0, at)
+        if quic.starts(name, "MINYAR_") || name == "ASAN_OPTIONS" || name == "UBSAN_OPTIONS" || name == "MAKEFLAGS" { recorded.add(name) }
+    }
+    let keys: List<Text> = []
+    let values: List<json.Value> = []
+    for name in recorded { keys.add(name); values = values.appended(data.string(variable(environment, name))) }
+    let row = data.object(["command", "cwd", "timeout", "phase", "stdin", "executable", "executable_sha256", "environment", "timed_out", "returncode", "elapsed_seconds", "label", "wall_seconds"],
+        [data.strings(command), data.string(gate.context.root), data.number(limit), data.string(label), data.object(["mode"], [data.string("eof")]), path, hash, data.object(keys, values),
+        data.boolean(result.status == 124), data.number(result.status), data.decimal(quic.seconds(started)), data.string(label), data.decimal(quic.seconds(started))])
+    for stream in ["stdout", "stderr"] {
+        let file = stem + "." + stream
+        if files.pathSize(file) >= 0 {
+            row = data.with(data.with(data.with(row, stream + "_path", data.string(label + "." + stream)), stream + "_sha256", data.string(digest(gate.context, file))), stream + "_bytes", data.number(files.pathSize(file)))
+        } else { retentionError(gate.report, label + "-" + stream, "missing retained " + stream) }
+    }
+    append(gate.report, "commands", row)
+    writeReport(gate.directory, gate.report, false)
+    if result.status != 0 {
+        files.writeStandardOutput(result.output)
+        system.writeStandardError(result.errorOutput)
+    }
+    return result
+}
+function finalDigest(gate: Gate, row: json.Value): json.Value {
+    let source = digest(gate.context, data.field(row, "source").text)
+    let copy = digest(gate.context, data.field(row, "copy").text)
+    if source == "" { retentionError(gate.report, "final-source", data.field(row, "source").text) }
+    if copy == "" { retentionError(gate.report, "final-copy", data.field(row, "copy").text) }
+    return data.with(data.with(row, "final_source", data.string(source)), "final_copy", data.string(copy))
+}
+function matched(group: json.Value): Boolean {
+    if group.items.length == 0 { return false }
+    for row in group.items {
+        let before = data.field(row, "before").text
+        if data.field(row, "retained").text != before || data.field(row, "after").text != before || data.field(row, "final_source").text != before || data.field(row, "final_copy").text != before { return false }
+    }
+    return true
+}
+public function driverTool(context: Context, kind: Text): Text {
+    let source = driverSource(kind)
+    return context.root + "/build/tooling/" + source.slice(0, source.length - 4)
+}
+function failGate(gate: Gate, message: Text): Text {
+    set(gate.report, "error", data.object(["type", "message"], [data.string("ValueError"), data.string(message)]))
+    return message
+}
+function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>): Text {
+    let context = gate.context
+    if fault("snapshot") { return "original snapshot" }
+    if before.error != "" { return before.error }
+    let names: List<json.Value> = []
+    for hash in before.hashes { names = names.appended(data.string(hash)) }
+    set(gate.report, "source_before", data.object(before.names, names))
+    if fault("copy") { return "original copy" }
+    let copies = boundCopies(context, context.root, before.names, gate.directory + "/source", COPY)
+    if copies.error != "" { return copies.error }
+    let copyRows: List<json.Value> = []
+    for index in 0..copies.rows.length {
+        if copies.rows[index].before != before.hashes[index] { return "source changed before retention" }
+        copyRows = copyRows.appended(copyJSON(copies.rows[index]))
+    }
+    set(gate.report, "source_copies", data.object(before.names, copyRows))
+    let frontKeys: List<Text> = []
+    let frontRows: List<json.Value> = []
+    for name in ["minyarc", "minyarc-callbacks", "minyarc-errors-request", "minyarc-errors"] {
+        let path = context.root + "/build/" + name
+        if files.pathSize(path) < 0 { return "public frontend prerequisite absent: " + name }
+        let copied = single(context, path, gate.directory + "/frontends/" + name)
+        if copied.error != "" { return copied.error }
+        frontKeys.add(name)
+        frontRows = frontRows.appended(copyJSON(copied.rows[0]))
+        set(gate.report, "frontends", data.object(frontKeys, frontRows))
+    }
+    if fault("evidence") { return "original Evidence" }
+    let clang = variable(gate.environment, "MINYAR_TEST_CLANG")
+    if clang == "" { clang = variable(gate.environment, "MINYAR_CLANG") }
+    if clang == "" { clang = variable(gate.environment, "LLVM_CC") }
+    if clang == "" { clang = "clang" }
+    let platform = shell(context, "uname -s", [])
+    let leaks = "detect_leaks=0"
+    if test.lines(platform.output).length > 0 && test.lines(platform.output)[0] == "Linux" { leaks = "detect_leaks=1" }
+    let environment = quic.setting(without(gate.environment, "MINYAR_LINK_ARTIFACTS"), "MAKEFLAGS", "-j1")
+    environment = quic.setting(environment, "MINYAR_CLANG", clang)
+    environment = quic.setting(environment, "ASAN_OPTIONS", leaks + ":halt_on_error=1")
+    environment = quic.setting(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    let version = run(gate, "clang-version", [clang, "--version"], environment, 30)
+    if version.status != 0 { return "clang version probe failed" }
+    let executable = quic.resolve(clang, context.root, environment, context.root)
+    let compiler = digest(context, executable)
+    set(gate.report, "compiler_version", data.string(version.output))
+    set(gate.report, "compiler_sha256", data.string(compiler))
+    if !sha256Value(data.string(compiler)) { return "selected compiler identity missing" }
+    let toolKeys: List<Text> = ["clang"]
+    let clangCopy = single(context, executable, gate.directory + "/tools/clang.bin")
+    if clangCopy.error != "" { return clangCopy.error }
+    if clangCopy.rows[0].before != compiler { return "selected compiler changed while retaining" }
+    let toolRows: List<json.Value> = [copyJSON(clangCopy.rows[0])]
+    tools.add(Tool { name: "clang"; source: clangCopy.rows[0].source; before: clangCopy.rows[0].before })
+    let probe = run(gate, "openssl-version", ["openssl", "version"], environment, 30)
+    if probe.status != 0 { return "openssl version probe failed" }
+    let openssl = quic.resolve("openssl", context.root, environment, context.root)
+    let opensslCopy = single(context, openssl, gate.directory + "/tools/openssl.bin")
+    if opensslCopy.error != "" { return opensslCopy.error }
+    toolKeys.add("openssl")
+    toolRows = toolRows.appended(data.with(data.with(copyJSON(opensslCopy.rows[0]), "version_stdout", data.string(probe.output)), "version_stderr", data.string(probe.errorOutput)))
+    tools.add(Tool { name: "openssl"; source: opensslCopy.rows[0].source; before: opensslCopy.rows[0].before })
+    for kind in driverKinds() {
+        let copied = single(context, driverTool(context, kind), gate.directory + "/tools/" + kind + "-driver.bin")
+        if copied.error != "" { return copied.error }
+        toolKeys.add(kind + "-driver")
+        toolRows = toolRows.appended(copyJSON(copied.rows[0]))
+        tools.add(Tool { name: kind + "-driver"; source: copied.rows[0].source; before: copied.rows[0].before })
+    }
+    set(gate.report, "external_tools", data.object(toolKeys, toolRows))
+    for optimization in ["0", "2"] {
+        let flags = quic.joined(requestedFlags(optimization, sanitize), " ")
+        let mode = environment
+        for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { mode = quic.setting(mode, name, flags) }
+        let paths: List<Text> = []
+        for name in binaryNames() {
+            let output = gate.directory + "/" + name + "-O" + optimization
+            let link = gate.directory + "/link-" + name + "-O" + optimization
+            let built = run(gate, "build-" + name + "-O" + optimization, [context.root + "/minyar", "--library", context.root + "/library", context.root + "/" + binarySource(name), "-o", output],
+                quic.setting(mode, "MINYAR_LINK_ARTIFACTS", link), 180)
+            if built.status != 0 { return "build-" + name + "-O" + optimization + " failed with status " + Text(built.status) }
+            paths.add(output)
+            let checked = verifyLink(context, link, output, sanitize, optimization, compiler)
+            if checked != "" { return checked }
+            append(gate.report, "links", data.object(["name", "optimization", "manifest"], [data.string(name), data.string(optimization), data.decode(readBytesFile(link + "/manifest.json"))]))
+        }
+        let binaries = Binaries { names: binaryNames(); paths: paths }
+        for kind in driverKinds() {
+            let child = gate.directory + "/driver-" + kind + "-O" + optimization
+            let command = [driverTool(context, kind)]
+            if kind == "migration" || kind == "cipher" { command.add("--binary"); command.add(binary(binaries, kind)) }
+            if kind == "local" { for value in ["--client", binary(binaries, "client"), "--server", binary(binaries, "server"), "--port", Text(context.port)] { command.add(value) } }
+            if kind == "vn" { for value in ["--server", binary(binaries, "server"), "--port", Text(context.port)] { command.add(value) } }
+            command.add("--artifacts")
+            command.add(child)
+            let result = run(gate, "run-" + kind + "-O" + optimization, command, mode, 600)
+            if result.status != 0 { return "run-" + kind + "-O" + optimization + " failed with status " + Text(result.status) }
+            if result.errorOutput != "" { return "unexpected driver or sanitizer stderr" }
+            let parsed = data.decode(Bytes(result.output))
+            if parsed.kind == json.INVALID { return "driver output is not JSON: " + parsed.text }
+            let cases = ["reserved-version"]
+            if driverSymbol(kind) != "" {
+                let declared = declaredCases(context.root + "/" + driverSource(kind), driverSymbol(kind))
+                if declared.error != "" { return declared.error }
+                cases = declared.values
+            }
+            let source = driverSource(kind)
+            if kind == "migration" || kind == "cipher" { source = binarySource(kind) }
+            let verified = verifyResult(context, kind, parsed, cases, binaries, context.root + "/" + source)
+            if verified != "" { return verified }
+            let artifacts = verifyDriverArtifacts(context, child, kind, parsed, cases, binaries, before.names, before.hashes, tools)
+            if artifacts != "" { return artifacts }
+            append(gate.report, "drivers", data.object(["kind", "optimization", "cases", "result", "manifest"],
+                [data.string(kind), data.string(optimization), data.strings(cases), parsed, data.decode(readBytesFile(child + "/manifest.json"))]))
+            print("QUIC RFC O" + optimization + " " + kind + " passed")
+        }
+    }
+    return ""
+}
+public function runGate(context: Context, directory: Text, sanitize: Boolean, sourceCommit: Text): Integer {
+    let commit = data.none()
+    if sourceCommit != "" { commit = data.string(sourceCommit) }
+    let platform = shell(context, "uname -srm", [])
+    let report = Report { value: data.object(["schema_version", "passed", "sanitize", "optimization", "platform", "source_commit", "source_before", "source_copies", "frontends", "external_tools", "commands", "links", "drivers", "retention_errors", "runtime_scope"],
+        [data.number(1), data.boolean(false), data.boolean(sanitize), data.strings(["0", "2"]), data.string(quic.joined(test.lines(platform.output), " ")), commit, data.object([], []), data.object([], []),
+        data.object([], []), data.object([], []), data.array([]), data.array([]), data.array([]), data.array([]), data.string("Observed native link object; compile count is not independently measured.")]) }
+    let state = Gate { context: context; directory: directory; report: report; environment: system.environment(); serial: 0 }
+    writeReport(directory, report, false)
+    let tools: List<Tool> = []
+    let before = Snapshot { names: []; hashes: []; error: "" }
+    if !fault("snapshot") { before = snapshotInputs(context) }
+    let error = body(state, sanitize, before, tools)
+    if error != "" { failGate(state, error) }
+    let after = snapshotInputs(context)
+    if after.error != "" { retentionError(report, "source-after", after.error) }
+    else {
+        let names: List<json.Value> = []
+        for hash in after.hashes { names = names.appended(data.string(hash)) }
+        set(report, "source_after", data.object(after.names, names))
+    }
+    let retained = artifactInventory(context, directory + "/source")
+    if retained.error != "" && error == "" { retentionError(report, "source-copy-inventory", retained.error) }
+    let retainedHashes: List<json.Value> = []
+    for hash in retained.hashes { retainedHashes = retainedHashes.appended(data.string(hash)) }
+    set(report, "retained_inputs", data.object(retained.names, retainedHashes))
+    for group in ["frontends", "external_tools"] {
+        let value = data.field(report.value, group)
+        let rows: List<json.Value> = []
+        for item in value.items { rows = rows.appended(finalDigest(state, item)) }
+        set(report, group, data.object(value.keys, rows))
+    }
+    let same = error == "" && before.error == "" && after.error == "" && textsEqual(before.names, after.names) && textsEqual(before.hashes, after.hashes) &&
+        textsEqual(before.names, retained.names) && textsEqual(before.hashes, retained.hashes)
+    let errors = data.field(report.value, "retention_errors")
+    let passed = same && matched(data.field(report.value, "frontends")) && matched(data.field(report.value, "external_tools")) && errors.items.length == 0
+    set(report, "passed", data.boolean(passed))
+    let artifacts = artifactInventory(context, directory)
+    let keys: List<Text> = []
+    let hashes: List<json.Value> = []
+    for index in 0..artifacts.names.length {
+        if artifacts.names[index] == "manifest.json" || artifacts.names[index] == "manifest-retention-error.json" { continue }
+        keys.add(artifacts.names[index])
+        hashes = hashes.appended(data.string(artifacts.hashes[index]))
+    }
+    set(report, "artifacts", data.object(keys, hashes))
+    writeReport(directory, report, fault("manifest-write"))
+    if error != "" {
+        system.writeStandardError("quic-rfc: " + error + "\n")
+        return 1
+    }
+    if !data.isTrue(data.field(report.value, "passed")) {
+        system.writeStandardError("quic-rfc: input/frontend provenance or evidence retention failed\n")
+        return 1
+    }
+    return 0
+}
+
+public function main(): Integer {
+    let sanitize = false
+    let directory = ""
+    let index = 0
+    while index < argumentCount() {
+        let name = argument(index)
+        if name == "--sanitize" { sanitize = true; index += 1; continue }
+        test.check(index + 1 < argumentCount(), "missing option value: " + name)
+        if name == "--optimization" { test.check(argument(index + 1) == "both", "invalid optimization: " + argument(index + 1)) }
+        else if name == "--artifacts" { directory = argument(index + 1) }
+        else { fail("unknown option: " + name) }
+        index += 2
+    }
+    test.check(quic.starts(directory, "/"), "evidence path must be absolute")
+    test.check(files.pathSize(directory) < 0, "evidence path must be fresh")
+    let scratch = test.scratch()
+    test.require(test.run(["mkdir", "-p", "--", directory], system.environment(), "", scratch + "/mkdir", 30), "create evidence directory")
+    let port = 44300
+    let configured = system.getenv("MINYAR_QUIC_RFC_PORT")
+    if configured != "" { port = Integer(configured) }
+    let context = Context { root: quic.root(); scratch: scratch; port: port; windows: false }
+    let status = runGate(context, resolved(context, directory), sanitize, system.getenv("MINYAR_SOURCE_COMMIT"))
+    test.removeTree(scratch)
+    return status
+}

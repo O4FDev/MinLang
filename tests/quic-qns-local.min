@@ -1,0 +1,340 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-protocol-support.min" as protocol
+use "net" as net
+use "eventloop" as eventloop
+use "errors" as errors
+use "sha256" as sha256
+use "system" as system
+use "files" as files
+
+constant CASES: List<Text> = ["multiplex1999", "multiconnect50", "keyupdate", "chacha20", "ipv6", "preferred", "preferred-ipv6", "resumption40", "zerortt40", "rebind-routes", "rebind-pending", "rebind-silent"]
+
+record Binding { elapsed: Text; bytes: Integer; port: Integer }
+record Proxy { port: Integer; target: Integer; front: Integer; back: Integer; loop: Integer; sleeper: Integer; registration: Integer; chunk: Integer; pacing: protocol.Pacing
+    silent: Boolean; holding: Boolean; quietAt: Integer; quietRebounds: Integer; clientAfterRebind: Integer; started: Integer; forwarded: Integer; packets: Integer
+    waited: Integer; lastForward: Integer; bindings: List<Binding>; ports: List<Integer>; client: Text; clientPort: Integer; received: Integer; error: Text }
+
+function ok(result: errors.IntegerResult, message: Text) { test.check(errors.integerOk(result), message) }
+function rebind(proxy: Proxy) {
+    let old = proxy.back
+    proxy.back = net.udp("127.0.0.1", 0)
+    test.check(proxy.back >= 0, "cannot bind rebinding proxy route")
+    let port = net.localPort(proxy.back)
+    let known = false
+    for value in proxy.ports { if value == port { known = true } }
+    if !known { proxy.ports.add(port) }
+    proxy.bindings.add(Binding { elapsed: quic.seconds(proxy.started); bytes: proxy.forwarded; port: port })
+    if old >= 0 {
+        test.check(errors.booleanOk(eventloop.remove(proxy.loop, proxy.registration)), "cannot remove old proxy route")
+        net.close(old)
+    }
+    let watched = eventloop.watch(proxy.loop, proxy.back, eventloop.readableInterest(), 2)
+    ok(watched, "cannot watch proxy route")
+    proxy.registration = errors.integerValue(watched)
+}
+function idle(): Proxy {
+    return Proxy { port: 0; target: 0; front: -1; back: -1; loop: -1; sleeper: -1; registration: 0; chunk: 0
+        pacing: protocol.Pacing { delay: 0; deliveryAt: 0; started: false }; silent: false; holding: false; quietAt: 0; quietRebounds: 0; clientAfterRebind: 0
+        started: system.monotonicNanoseconds(); forwarded: 0; packets: 0; waited: 0; lastForward: 0; bindings: []; ports: []; client: ""; clientPort: 0; received: 0; error: "" }
+}
+function proxy(port: Integer, chunk: Integer, delay: Integer, silent: Boolean): Proxy {
+    let loop = eventloop.create()
+    let sleeper = eventloop.create()
+    ok(loop, "cannot create proxy loop")
+    ok(sleeper, "cannot create proxy timer")
+    let front = net.udp("127.0.0.1", port + 2)
+    test.check(front >= 0, "cannot bind rebinding proxy front")
+    let value = Proxy { port: net.localPort(front); target: port; front: front; back: -1; loop: errors.integerValue(loop); sleeper: errors.integerValue(sleeper); registration: 0; chunk: chunk
+        pacing: protocol.Pacing { delay: delay; deliveryAt: 0; started: false }; silent: silent; holding: false; quietAt: 0; quietRebounds: 0; clientAfterRebind: 0
+        started: system.monotonicNanoseconds(); forwarded: 0; packets: 0; waited: 0; lastForward: 0; bindings: []; ports: []; client: ""; clientPort: 0; received: 0; error: "" }
+    ok(eventloop.watch(value.loop, front, eventloop.readableInterest(), 1), "cannot watch proxy front")
+    rebind(value)
+    return value
+}
+function pause(proxy: Proxy, nanoseconds: Integer) {
+    if nanoseconds <= 0 { return }
+    let milliseconds = (nanoseconds + 999999) / 1000000
+    eventloop.wait(proxy.sleeper, milliseconds, 1)
+}
+function receive(socket: Integer): List<net.Datagram> {
+    let batch = net.receiveDatagrams(socket, 1, 65535)
+    if !net.datagramBatchOk(batch) { return [] }
+    return net.datagrams(batch)
+}
+function step(proxy: Proxy) {
+    let progressed = false
+    for packet in receive(proxy.front) {
+        let data = errors.bytesValue(net.datagramData(packet))
+        proxy.client = net.datagramSource(packet)
+        proxy.clientPort = net.datagramPort(packet)
+        net.sendDatagramTo(proxy.back, "127.0.0.1", proxy.target, data)
+        proxy.quietAt = system.monotonicNanoseconds()
+        if proxy.quietRebounds > 0 { proxy.clientAfterRebind += 1 }
+        progressed = true
+    }
+    for packet in receive(proxy.back) {
+        progressed = true
+        if proxy.client == "" || proxy.holding { continue }
+        let data = errors.bytesValue(net.datagramData(packet))
+        let before = system.monotonicNanoseconds()
+        pause(proxy, protocol.deliveryDelay(proxy.pacing, before))
+        proxy.waited += system.monotonicNanoseconds() - before
+        net.sendDatagramTo(proxy.front, proxy.client, proxy.clientPort, data)
+        proxy.received += data.length
+        proxy.forwarded += data.length
+        proxy.packets += 1
+        proxy.lastForward = system.monotonicNanoseconds() - proxy.started
+        if proxy.received >= proxy.chunk && proxy.ports.length < 16 {
+            if proxy.silent {
+                if proxy.quietRebounds == 0 { proxy.holding = true; proxy.quietAt = system.monotonicNanoseconds() }
+            } else {
+                proxy.received = 0
+                rebind(proxy)
+            }
+        }
+    }
+    if proxy.holding && system.monotonicNanoseconds() - proxy.quietAt >= 200000000 {
+        rebind(proxy)
+        proxy.quietRebounds += 1
+        proxy.holding = false
+    }
+    if !progressed { eventloop.wait(proxy.loop, 10, 4) }
+}
+function close(proxy: Proxy) {
+    eventloop.remove(proxy.loop, proxy.registration)
+    net.close(proxy.front)
+    net.close(proxy.back)
+    eventloop.close(proxy.loop)
+    eventloop.close(proxy.sleeper)
+}
+function decimal(nanoseconds: Integer): Text {
+    let fraction = Text(1000000000 + nanoseconds % 1000000000)
+    return Text(nanoseconds / 1000000000) + "." + quic.after(fraction, "1")
+}
+function progress(proxy: Proxy): Text {
+    let rows: List<Text> = []
+    for binding in proxy.bindings { rows.add("{\"elapsed\": " + binding.elapsed + ", \"bytes\": " + Text(binding.bytes) + ", \"port\": " + Text(binding.port) + "}") }
+    return "{\"elapsed\": " + quic.seconds(proxy.started) + ", \"bytes\": " + Text(proxy.forwarded) + ", \"packets\": " + Text(proxy.packets) + ", \"wait_seconds\": " + decimal(proxy.waited) +
+        ", \"last_forward\": " + decimal(proxy.lastForward) + ", \"bindings\": [" + quic.joined(rows, ", ") + "], \"quiet_rebounds\": " + Text(proxy.quietRebounds) + ", \"client_after_rebind\": " + Text(proxy.clientAfterRebind) + "}"
+}
+
+function hmac(key: Bytes, message: Bytes): Bytes {
+    let block = Bytes(64)
+    let material = key
+    if material.length > 64 { material = sha256.digest(key) }
+    for index in 0..material.length { block[index] = material[index] }
+    let inner = Bytes()
+    let outer = Bytes()
+    for index in 0..64 { inner.add(block[index] ^ 54); outer.add(block[index] ^ 92) }
+    inner.addBytes(message)
+    outer.addBytes(sha256.digest(inner))
+    return sha256.digest(outer)
+}
+function labels(path: Text): List<Text> {
+    let result: List<Text> = []
+    if files.pathSize(path) < 0 { return result }
+    for line in test.lines(readTextFile(path)) {
+        let fields = test.words(line)
+        if fields.length > 0 { result.add(fields[0]) }
+    }
+    return result
+}
+function secret(path: Text, label: Text): Text {
+    let found = ""
+    if files.pathSize(path) < 0 { return found }
+    for line in test.lines(readTextFile(path)) {
+        let fields = test.words(line)
+        if fields.length >= 3 && fields[0] == label { found = fields[2] }
+    }
+    return found
+}
+function count(values: List<Text>, wanted: Text): Integer {
+    let total = 0
+    for value in values { if value == wanted { total += 1 } }
+    return total
+}
+function has(values: List<Text>, wanted: Text): Boolean { return count(values, wanted) > 0 }
+function epochs(values: List<Text>, prefix: Text): List<Text> {
+    let result: List<Text> = []
+    for value in values.sorted() {
+        if quic.starts(value, prefix) && (result.length == 0 || result[result.length - 1] != value) { result.add(value) }
+    }
+    return result
+}
+function testcase(name: Text): Text {
+    if name == "multiplex1999" || name == "ipv6" || name == "rebind-routes" || name == "rebind-pending" || name == "rebind-silent" { return "transfer" }
+    if name == "multiconnect50" { return "multiconnect" }
+    if name == "preferred" || name == "preferred-ipv6" { return "connectionmigration" }
+    if name == "resumption40" { return "resumption" }
+    if name == "zerortt40" { return "zerortt" }
+    return name
+}
+
+let client = ""
+let server = ""
+let requested: List<Text> = []
+let expectOld = false
+let port = 44300
+let directory = ""
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--expect-old-code" { expectOld = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "missing option value: " + name)
+    let value = argument(index + 1)
+    if name == "--client" { client = value }
+    else if name == "--server" { server = value }
+    else if name == "--port" { port = Integer(value) }
+    else if name == "--artifacts" { directory = value }
+    else if name == "--case" {
+        let cases = CASES
+        test.check(has(cases, value), "invalid case: " + value)
+        requested.add(value)
+    } else { fail("unknown option: " + name) }
+    index += 2
+}
+test.check(client != "" && server != "", "--client and --server are required")
+let root = quic.root()
+client = protocol.absolute(client, root)
+server = protocol.absolute(server, root)
+let selected = CASES
+if requested.length > 0 { selected = requested }
+let endpointSource = "tests/interop/qns/endpoint.py"
+let owner = protocol.open("minyar-qns-local", directory, ["tests/quic-qns-local.min", client, server, "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min",
+    "tests/interop/qns/client.min", "tests/interop/qns/server.min", endpointSource], selected)
+let workspace = owner.workspace
+let ca = protocol.authority(owner)
+quic.rootCertificate(ca, "root")
+quic.leaf(ca, "server", "root", "DNS:localhost,IP:127.0.0.1,IP:::1", "serverAuth")
+protocol.certificatesReady(owner)
+let rows: List<Text> = []
+let primary = ""
+let allPassed = true
+for name in selected {
+    let www = workspace + "/" + name + "-www"
+    let downloads = workspace + "/" + name + "-downloads"
+    test.check(files.makeDirectory(www) == 0 && files.makeDirectory(downloads) == 0, "cannot create case directories")
+    let total = 1
+    if name == "multiplex1999" { total = 1999 } else if name == "multiconnect50" { total = 50 } else if name == "resumption40" || name == "zerortt40" { total = 40 }
+    let size = 1048576
+    if total == 1999 { size = 32 } else if total == 50 { size = 1024 } else if total == 40 { size = 5000 }
+    if name == "rebind-routes" { size = 16777216 }
+    let names: List<Text> = []
+    for position in 0..total { names.add("file" + Text(position)) }
+    let payload = Bytes(size)
+    for position in 0..size { payload[position] = (position * 17 + 3) % 256 }
+    for file in names { writeBytesFile(www + "/" + file, payload) }
+    let serverLog = workspace + "/" + name + "-server.keys"
+    let clientLog = workspace + "/" + name + "-client.keys"
+    protocol.bindFiles(owner, name, "payloads", [www])
+    protocol.bindFiles(owner, name, "downloads", [downloads])
+    protocol.bindFiles(owner, name, "keylogs", [serverLog, clientLog])
+    let mode = testcase(name)
+    let command = [server, quic.path(ca, "server", "pk8"), quic.path(ca, "root", "der"), serverLog, www, mode, quic.path(ca, "server", "der")]
+    if !expectOld || name == "rebind-silent" { command.add("--port=" + Text(port)) }
+    if name == "preferred" { command.add("--preferred-ipv4=7f000001"); command.add("--preferred-port=" + Text(port + 1)) }
+    if name == "preferred-ipv6" { for value in ["--preferred-ipv4=00000000", "--preferred-ipv6=00000000000000000000000000000001", "--preferred-port=" + Text(port + 1)] { command.add(value) } }
+    let endpoint = protocol.endpoint(owner, command, workspace + "/" + name + "-server", name, 180)
+    if endpoint.startup != "" { primary = endpoint.startup; break }
+    let ready = protocol.readyLine(owner, endpoint)
+    if ready.error != "" { primary = ready.error }
+    else if ready.output != "QNS server ready\n" { primary = "server setup: " + ready.output }
+    let result = test.Result { status: -1; output: ""; errorOutput: "" }
+    let relay = false
+    let routes = idle()
+    if primary == "" {
+        let host = "127.0.0.1"
+        if name == "ipv6" || name == "preferred-ipv6" { host = "::1" }
+        if name == "rebind-routes" { routes = proxy(port, 1048576, 3000000, false); relay = true }
+        if name == "rebind-pending" { routes = proxy(port, 65536, 0, false); relay = true }
+        if name == "rebind-silent" { routes = proxy(port, 65536, 0, true); relay = true }
+        let target = port
+        if relay { target = routes.port }
+        let arguments = [client, quic.path(ca, "root", "der"), host, Text(target), clientLog, downloads, mode]
+        for file in names { arguments.add(file) }
+        let running = protocol.launch(owner, arguments, 180, name)
+        while protocol.active(running) { if relay { step(routes) } else { quic.pause(10) } }
+        result = protocol.collect(owner, running)
+        if relay { close(routes) }
+    }
+    let stopped = protocol.stop(owner, endpoint, primary)
+    if primary != "" {
+        if relay { system.writeStandardError("QNS rebinding progress " + progress(routes) + "\n") }
+        break
+    }
+    if stopped.error != "" { primary = stopped.error; break }
+    let clientLabels = labels(clientLog)
+    let serverLabels = labels(serverLog)
+    let reciprocal = true
+    if name == "keyupdate" {
+        let info = Bytes()
+        info.add(0); info.add(32); info.add(13)
+        info.addBytes(Bytes("tls13 quic ku"))
+        info.add(0)
+        info.add(1)
+        for side in ["CLIENT", "SERVER"] {
+            let old = quic.fromHex(secret(clientLog, side + "_TRAFFIC_SECRET_0"))
+            let updated = quic.hex(hmac(old, info))
+            reciprocal = reciprocal && quic.hex(quic.fromHex(secret(clientLog, side + "_TRAFFIC_SECRET_1"))) == updated && quic.hex(quic.fromHex(secret(serverLog, side + "_TRAFFIC_SECRET_1"))) == updated
+        }
+    }
+    let filesOk = true
+    for file in names {
+        let path = downloads + "/" + file
+        if files.pathSize(path) < 0 || Text(readBytesFile(path)) != Text(payload) { filesOk = false }
+    }
+    let tupleOk = true
+    let tuples: List<Text> = []
+    if name == "preferred" || name == "preferred-ipv6" {
+        for line in test.lines(result.output) { if quic.starts(line, "QNS authenticated preferred address ") { tuples.add(line) } }
+        let expectedTuple = "QNS authenticated preferred address ipv4=7f000001:" + Text(port + 1) + " ipv6=00000000000000000000000000000000:0"
+        if name == "preferred-ipv6" { expectedTuple = "QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:" + Text(port + 1) }
+        tupleOk = tuples.length == 1 && tuples[0] == expectedTuple
+    }
+    let failed = result.status != 0 || !filesOk
+    let semantic = 0
+    if name == "multiplex1999" && failed { semantic = 42 }
+    else if name == "multiconnect50" && (failed || count(clientLabels, "CLIENT_HANDSHAKE_TRAFFIC_SECRET") != 50) { semantic = 52 }
+    else if name == "keyupdate" && (failed || !has(clientLabels, "CLIENT_TRAFFIC_SECRET_1") || !has(serverLabels, "SERVER_TRAFFIC_SECRET_1") || !reciprocal) { semantic = 62 }
+    else if name == "chacha20" && failed { semantic = 82 }
+    else if name == "ipv6" && failed { semantic = 72 }
+    else if (name == "preferred" || name == "preferred-ipv6") && (failed || !tupleOk || !test.contains(result.output, "QNS preferred path validated")) { semantic = 92 }
+    else if (name == "resumption40" || name == "zerortt40") && (failed || count(clientLabels, "CLIENT_HANDSHAKE_TRAFFIC_SECRET") != 2) { semantic = 102 }
+    else if (name == "rebind-routes" || name == "rebind-pending") && (failed || routes.ports.length < 12) { semantic = 112 }
+    else if name == "rebind-silent" && (failed || routes.ports.length != 2 || routes.quietRebounds != 1 || routes.clientAfterRebind < 1) { semantic = 113 }
+    let expected = 0
+    if expectOld {
+        if name == "multiplex1999" { expected = 42 } else if name == "multiconnect50" { expected = 52 } else if name == "keyupdate" { expected = 62 }
+        else if name == "ipv6" { expected = 72 } else if name == "rebind-silent" { expected = 113 }
+    }
+    let matched = semantic == expected
+    if name == "rebind-silent" && expectOld {
+        matched = matched && result.status == 13 && routes.ports.length == 2 && routes.quietRebounds == 1 && routes.clientAfterRebind == 0 && routes.forwarded >= 65536
+    }
+    if !matched || result.errorOutput != "" || stopped.errorOutput != "" { allPassed = false }
+    let rebound = 0
+    let quiet = 0
+    let after = 0
+    if relay { rebound = routes.ports.length; quiet = routes.quietRebounds; after = routes.clientAfterRebind }
+    rows.add("{\"case\": " + quic.string(name) + ", \"client_status\": " + Text(result.status) + ", \"semantic_status\": " + Text(semantic) + ", \"expected\": " + Text(expected) +
+        ", \"matched\": " + Text(matched) + ", \"client_stdout\": " + quic.string(protocol.normalized(result.output)) + ", \"client_stderr\": " + quic.string(protocol.normalized(result.errorOutput)) +
+        ", \"server_stdout\": " + quic.string(stopped.output) + ", \"server_stderr\": " + quic.string(stopped.errorOutput) + ", \"files_match\": " + Text(filesOk) +
+        ", \"rebound_routes\": " + Text(rebound) + ", \"quiet_rebounds\": " + Text(quiet) + ", \"client_after_rebind\": " + Text(after) +
+        ", \"preferred_tuple_match\": " + Text(tupleOk) + ", \"authenticated_preferred_tuples\": " + quic.quoted(tuples) + ", \"reciprocal_epoch_secrets\": " + Text(reciprocal) +
+        ", \"handshakes\": " + Text(count(clientLabels, "CLIENT_HANDSHAKE_TRAFFIC_SECRET")) + ", \"client_epochs\": " + quic.quoted(epochs(clientLabels, "CLIENT_TRAFFIC_SECRET_")) +
+        ", \"server_epochs\": " + quic.quoted(epochs(serverLabels, "SERVER_TRAFFIC_SECRET_")) + "}")
+}
+let report = ""
+if primary == "" {
+    let hashes = quic.digests([client, server], owner.scratch + "/.binaries")
+    report = protocol.publish(owner, ["\"binary_hashes\": {\"client\": " + quic.string(hashes[0]) + ", \"server\": " + quic.string(hashes[1]) + "}", "\"results\": [\n    " + quic.joined(rows, ",\n    ") + "\n  ]"], allPassed)
+}
+let closed = protocol.finish(owner, primary)
+if primary != "" {
+    system.writeStandardError("quic-qns-local: " + primary + "\n")
+    for note in owner.notes { system.writeStandardError("note: " + note + "\n") }
+    exit(1)
+}
+files.writeStandardOutput(report)
+if !allPassed || !closed { exit(1) }
