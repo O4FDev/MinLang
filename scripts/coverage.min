@@ -1,0 +1,1129 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+use "text" as texts
+use "errors" as errors
+
+public constant VALUE_ERROR = 1
+public constant RUNTIME_ERROR = 2
+constant FRACTION = 0xfffffffffffff
+constant LIMB = 0x3fffffff
+constant INFINITE_BITS = 0x7ff0000000000000
+public constant COMPILER_SUITES: List<Text> = ["diagnostics", "conformance", "regressions", "feature-dispatch", "compiler-hardening", "list-access",
+    "checked-arithmetic", "checked-scalars", "readonly-parameters",
+    "statement-nesting",
+    "peer-research-semantics", "peer-research-reachability",
+    "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups",
+    "maps", "list-sort NaturalSort", "text-basics",
+    "collections-integration CollectionConstants",
+    "module-constants", "octal-literals", "reserved-names", "checked-results"]
+constant NATIVE_SUITES: List<Text> = ["octal-literals", "reserved-names", "diagnostics", "conformance", "list-access", "checked-arithmetic", "readonly-parameters", "checked-scalars", "module-constants", "statement-nesting", "compiler-hardening", "checked-results", "feature-dispatch", "errors-values", "c-layout-records", "maps", "list-sort", "text-basics", "collections-integration", "linkage", "peer-research-semantics", "peer-research-reachability", "fuzz", "coverage-programs/check", "callbacks", "errors-language", "thread-compiler", "incremental-language-hardening", "incremental-modules", "regressions", "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups", "runtime-numeric"]
+
+public record Problem { kind: Integer; message: Text }
+public record Runner { live: Boolean; root: Text; logs: Text; serial: Integer; replies: List<Text>; fallback: Text; commands: List<List<Text>> }
+public record Setting { present: Boolean; value: Text }
+public record Floor { valid: Boolean; value: Float; message: Text }
+public record Percent { problem: Problem; value: Float }
+public record Tool { name: Text; path: Text }
+public record Identity { name: Text; path: Text; version: Text; major: Integer; release: Text }
+public record Toolchain { problem: Problem; identities: List<Identity> }
+public record Edges { problem: Problem; count: Integer; covered: Integer; percent: Float }
+public record Metric { name: Text; keys: List<Text>; values: List<Integer>; measured: Boolean; percent: Float }
+public record FileRow { filename: Text; summary: json.Value; digest: Text }
+public record RuntimeCoverage { problem: Problem; totals: List<Metric>; mapped: List<FileRow> }
+record Decimal { valid: Boolean; negative: Boolean; digits: List<Integer>; exponent: Integer }
+record Scanner { raw: Bytes; position: Integer; error: Text }
+record Span { start: Integer; end: Integer }
+record Job { command: List<Text>; environment: List<Text>; seconds: Integer }
+record Phase { name: Text; directory: Text; compiler: Text; edges: Text }
+
+public function ok(): Problem { return Problem { kind: 0; message: "" } }
+function problem(kind: Integer, message: Text): Problem { return Problem { kind: kind; message: message } }
+function require(found: Problem) {
+    if found.kind == VALUE_ERROR { fail("ValueError: " + found.message) }
+    if found.kind != 0 { fail("RuntimeError: " + found.message) }
+}
+
+function startsBytes(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function endsBytes(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    let offset = raw.length - pattern.length
+    for index in 0..pattern.length { if raw[offset + index] != pattern[index] { return false } }
+    return true
+}
+function spaced(command: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in command {
+        if parts.length > 0 { parts.add(" ") }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+function spaceCode(code: Integer): Boolean {
+    return (code >= 9 && code <= 13) || (code >= 28 && code <= 32) || code == 133 || code == 160 || code == 5760 ||
+        (code >= 8192 && code <= 8202) || code == 8232 || code == 8233 || code == 8239 || code == 8287 || code == 12288
+}
+public function stripped(source: Text): Text {
+    let first = 0
+    let last = source.length
+    while first < last && spaceCode(Integer(source[first])) { first += 1 }
+    while last > first && spaceCode(Integer(source[last - 1])) { last -= 1 }
+    return source.slice(first, last)
+}
+
+public function lookup(environment: List<Text>, name: Text): Setting {
+    let prefix = name + "="
+    let width = Bytes(prefix).length
+    for entry in environment {
+        if startsBytes(entry, prefix) {
+            let raw = Bytes(entry)
+            return Setting { present: true; value: Text(raw.slice(width, raw.length)) }
+        }
+    }
+    return Setting { present: false; value: "" }
+}
+public function withSetting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !startsBytes(entry, name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+public function settingOr(environment: List<Text>, name: Text, fallback: Text): Text {
+    let found = lookup(environment, name)
+    if found.present { return found.value }
+    return fallback
+}
+
+public function liveRunner(root: Text, logs: Text): Runner {
+    return Runner { live: true; root: root; logs: logs; serial: 0; replies: []; fallback: ""; commands: [] }
+}
+public function fakeRunner(root: Text, fallback: Text, replies: List<Text>): Runner {
+    return Runner { live: false; root: root; logs: ""; serial: 0; replies: replies; fallback: fallback; commands: [] }
+}
+function nextLog(runner: Runner): Text {
+    runner.serial += 1
+    return runner.logs + "/command-" + Text(runner.serial)
+}
+public function execute(runner: Runner, command: List<Text>, environment: List<Text>, seconds: Integer): test.Result {
+    return test.run(command, environment, runner.root, nextLog(runner), seconds)
+}
+function failure(command: List<Text>, result: test.Result): Text {
+    return "command failed (" + Text(result.status) + "): " + spaced(command) + "\n" + result.output + result.errorOutput
+}
+public function run(runner: Runner, command: List<Text>, environment: List<Text>, seconds: Integer): Text {
+    if !runner.live {
+        runner.commands.add(command)
+        let index = 0
+        while index + 1 < runner.replies.length {
+            if runner.replies[index] == command[0] { return runner.replies[index + 1] }
+            index += 2
+        }
+        return runner.fallback
+    }
+    let result = execute(runner, command, environment, seconds)
+    if result.status != 0 { fail(failure(command, result)) }
+    return result.output
+}
+function runExpecting(runner: Runner, command: List<Text>, environment: List<Text>, status: Integer, output: Text, errorOutput: Text) {
+    let result = execute(runner, command, environment, 180)
+    if result.status != status || result.output != output || result.errorOutput != errorOutput {
+        fail("unexpected result from " + spaced(command) + ": " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    }
+}
+
+public function findTool(runner: Runner, environment: List<Text>, variable: Text, name: Text): Text {
+    let configured = settingOr(environment, variable, "")
+    if configured != "" { return configured }
+    let found = execute(runner, ["/bin/sh", "-c", "command -v \"$1\"", "sh", name], environment, 30)
+    if found.status == 0 && stripped(found.output) != "" { return stripped(found.output) }
+    let xcrun = execute(runner, ["/bin/sh", "-c", "command -v \"$1\"", "sh", "xcrun"], environment, 30)
+    if xcrun.status == 0 && stripped(xcrun.output) != "" {
+        let result = execute(runner, [stripped(xcrun.output), "-f", name], environment, 60)
+        if result.status == 0 { return stripped(result.output) }
+    }
+    system.writeStandardError("coverage tool '" + name + "' is required (set " + variable + " to override)\n")
+    exit(1)
+}
+
+function bitsOf(value: Float): Integer {
+    let raw = Bytes(8)
+    raw.setFloat64(0, value)
+    return raw.getInt64(0)
+}
+function floatOf(bits: Integer): Float {
+    let raw = Bytes(8)
+    raw.setInt64(0, bits)
+    return raw.getFloat64(0)
+}
+function hundredths(value: Float): Float {
+    let bits = bitsOf(value)
+    let biased = (bits >> 52) & 2047
+    let mantissa = bits & FRACTION
+    let twos = -1074
+    if biased > 0 { mantissa = mantissa | (FRACTION + 1); twos = biased - 1075 }
+    if twos >= 0 { return value }
+    let shift = -twos
+    if shift > 60 { return 0.0 }
+    let product = mantissa * 100
+    let whole = product >> shift
+    let remainder = product - (whole << shift)
+    let half = 1 << (shift - 1)
+    if remainder > half || (remainder == half && whole % 2 == 1) { whole += 1 }
+    return Float(whole) / 100.0
+}
+public function percentage(covered: Integer, count: Integer): Percent {
+    if count <= 0 || covered < 0 || covered > count {
+        return Percent { problem: problem(VALUE_ERROR, "invalid coverage denominator: covered=" + Text(covered) + ", count=" + Text(count)); value: 0.0 }
+    }
+    return Percent { problem: ok(); value: hundredths(100.0 * Float(covered) / Float(count)) }
+}
+
+function times(value: List<Integer>, factor: Integer, addend: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let carry = addend
+    for limb in value {
+        let product = limb * factor + carry
+        result.add(product & LIMB)
+        carry = product >> 30
+    }
+    while carry > 0 { result.add(carry & LIMB); carry = carry >> 30 }
+    return result
+}
+function scaled(value: List<Integer>, tens: Integer, twos: Integer): List<Integer> {
+    let result = value
+    let remaining = tens
+    while remaining > 0 {
+        let step = min(remaining, 9)
+        let factor = 1
+        for unused in 0..step { factor = factor * 10 }
+        result = times(result, factor, 0)
+        remaining -= step
+    }
+    let shifted: List<Integer> = []
+    for unused in 0..(twos / 30) { shifted.add(0) }
+    for limb in times(result, 1 << (twos % 30), 0) { shifted.add(limb) }
+    return shifted
+}
+function compareLimbs(left: List<Integer>, right: List<Integer>): Integer {
+    let index = max(left.length, right.length) - 1
+    while index >= 0 {
+        let a = 0
+        if index < left.length { a = left[index] }
+        let b = 0
+        if index < right.length { b = right[index] }
+        if a < b { return -1 }
+        if a > b { return 1 }
+        index -= 1
+    }
+    return 0
+}
+function limbs(digits: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    for digit in digits { result = times(result, 10, digit) }
+    return result
+}
+function against(value: List<Integer>, exponent: Integer, bound: Integer, twos: Integer): Integer {
+    return compareLimbs(scaled(value, max(exponent, 0), max(-twos, 0)), scaled(times([], 1, bound), max(-exponent, 0), max(twos, 0)))
+}
+function placement(value: List<Integer>, exponent: Integer, encoded: Integer): Integer {
+    let biased = (encoded >> 52) & 2047
+    let mantissa = encoded & FRACTION
+    let twos = -1076
+    if biased > 0 { mantissa = mantissa | (FRACTION + 1); twos = biased - 1077 }
+    let inclusive = mantissa % 2 == 0
+    let above = against(value, exponent, 4 * mantissa + 2, twos)
+    if above > 0 || (above == 0 && !inclusive) { return 1 }
+    if mantissa == 0 { return 0 }
+    let lower = 4 * mantissa - 2
+    if (encoded & FRACTION) == 0 && biased > 1 { lower = 4 * mantissa - 1 }
+    let below = against(value, exponent, lower, twos)
+    if below > 0 || (below == 0 && inclusive) { return 0 }
+    return -1
+}
+function decimalBits(digits: List<Integer>, exponent: Integer): Integer {
+    if digits.length == 0 { return 0 }
+    let position = exponent + digits.length - 1
+    if position < -400 { return 0 }
+    if position > 308 { return INFINITE_BITS }
+    let used = min(digits.length, 18)
+    let leading = 0
+    for index in 0..used { leading = leading * 10 + digits[index] }
+    let scale = exponent + digits.length - used
+    let half = scale / 2
+    let approximation = Float(leading) * pow(10.0, Float(half)) * pow(10.0, Float(scale - half))
+    let bits = bitsOf(approximation)
+    if bits >= INFINITE_BITS { bits = INFINITE_BITS - 1 }
+    let value = limbs(digits)
+    while bits < INFINITE_BITS {
+        let place = placement(value, exponent, bits)
+        if place == 0 { return bits }
+        bits += place
+    }
+    return INFINITE_BITS
+}
+function digitByte(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+function digitRun(raw: Bytes, start: Integer): Integer {
+    if start >= raw.length || !digitByte(raw[start]) { return start }
+    let index = start + 1
+    while index < raw.length {
+        if digitByte(raw[index]) { index += 1 }
+        else if raw[index] == 95 && index + 1 < raw.length && digitByte(raw[index + 1]) { index += 2 }
+        else { break }
+    }
+    return index
+}
+function decimalText(source: Text): Decimal {
+    let invalid = Decimal { valid: false; negative: false; digits: []; exponent: 0 }
+    if !texts.validUTF8(Bytes(source)) { return invalid }
+    let raw = Bytes(stripped(source))
+    let index = 0
+    let negative = false
+    if index < raw.length && (raw[index] == 43 || raw[index] == 45) { negative = raw[index] == 45; index += 1 }
+    let digits: List<Integer> = []
+    let exponent = 0
+    let integerEnd = digitRun(raw, index)
+    for position in index..integerEnd { if raw[position] != 95 { digits.add(raw[position] - 48) } }
+    let seen = integerEnd > index
+    index = integerEnd
+    if index < raw.length && raw[index] == 46 {
+        let fractionEnd = digitRun(raw, index + 1)
+        for position in (index + 1)..fractionEnd {
+            if raw[position] != 95 { digits.add(raw[position] - 48); exponent -= 1 }
+        }
+        if fractionEnd > index + 1 { seen = true }
+        index = fractionEnd
+    }
+    if !seen { return invalid }
+    if index < raw.length && (raw[index] == 101 || raw[index] == 69) {
+        index += 1
+        let sign = 1
+        if index < raw.length && (raw[index] == 43 || raw[index] == 45) {
+            if raw[index] == 45 { sign = -1 }
+            index += 1
+        }
+        let end = digitRun(raw, index)
+        if end == index { return invalid }
+        let value = 0
+        for position in index..end {
+            if raw[position] != 95 && value < 100000000 { value = value * 10 + raw[position] - 48 }
+        }
+        exponent += sign * value
+        index = end
+    }
+    if index != raw.length { return invalid }
+    let first = 0
+    while first < digits.length && digits[first] == 0 { first += 1 }
+    let last = digits.length
+    while last > first && digits[last - 1] == 0 { last -= 1; exponent += 1 }
+    let significant: List<Integer> = []
+    for position in first..last { significant.add(digits[position]) }
+    return Decimal { valid: true; negative: negative; digits: significant; exponent: exponent }
+}
+function decimalFloat(token: Text): Float {
+    let decimal = decimalText(token)
+    let value = floatOf(decimalBits(decimal.digits, decimal.exponent))
+    if decimal.negative { return -value }
+    return value
+}
+public function minimumCoverage(environment: List<Text>, name: Text): Floor {
+    let rejected = Floor { valid: false; value: 0.0; message: name + " must be finite and between 0 and 100" }
+    let decimal = decimalText(settingOr(environment, name, "0"))
+    if !decimal.valid { return rejected }
+    if decimal.digits.length == 0 { return Floor { valid: true; value: 0.0; message: "" } }
+    if decimal.exponent + decimal.digits.length - 1 >= 3 { return rejected }
+    let bits = decimalBits(decimal.digits, decimal.exponent)
+    if decimal.negative && bits != 0 { return rejected }
+    let value = floatOf(bits)
+    if value > 100.0 { return rejected }
+    return Floor { valid: true; value: value; message: "" }
+}
+
+function wordByte(byte: Integer): Boolean {
+    return digitByte(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function spaceByte(byte: Integer): Boolean { return (byte >= 9 && byte <= 13) || (byte >= 28 && byte <= 32) }
+function lowered(byte: Integer): Integer {
+    if byte >= 65 && byte <= 90 { return byte + 32 }
+    return byte
+}
+function wordAt(raw: Bytes, start: Integer, word: Text): Boolean {
+    let pattern = Bytes(word)
+    if start + pattern.length > raw.length { return false }
+    for index in 0..pattern.length { if lowered(raw[start + index]) != pattern[index] { return false } }
+    return true
+}
+function spacesAt(raw: Bytes, start: Integer): Integer {
+    let index = start
+    while index < raw.length && spaceByte(raw[index]) { index += 1 }
+    return index
+}
+function digitsAt(raw: Bytes, start: Integer): Integer {
+    let index = start
+    while index < raw.length && digitByte(raw[index]) { index += 1 }
+    return index
+}
+public function versionRelease(version: Text): Text {
+    let raw = Bytes(version)
+    for start in 0..raw.length {
+        if start > 0 && wordByte(raw[start - 1]) { continue }
+        let cursor = -1
+        if wordAt(raw, start, "clang") { cursor = start + 5 }
+        else if wordAt(raw, start, "llvm") { cursor = start + 4 }
+        if cursor < 0 { continue }
+        let gap = spacesAt(raw, cursor)
+        if gap == cursor || !wordAt(raw, gap, "version") { continue }
+        cursor = gap + 7
+        gap = spacesAt(raw, cursor)
+        if gap == cursor { continue }
+        let release = gap
+        let major = digitsAt(raw, release)
+        if major == release || major >= raw.length || raw[major] != 46 { continue }
+        let minor = digitsAt(raw, major + 1)
+        if minor == major + 1 || minor >= raw.length || raw[minor] != 46 { continue }
+        let patch = digitsAt(raw, minor + 1)
+        if patch == minor + 1 { continue }
+        if patch < raw.length && !spaceByte(raw[patch]) { continue }
+        return Text(raw.slice(release, patch))
+    }
+    return ""
+}
+public function toolchainIdentity(runner: Runner, tools: List<Tool>, environment: List<Text>): Toolchain {
+    let identities: List<Identity> = []
+    for tool in tools {
+        let version = stripped(run(runner, [tool.path, "--version"], environment, 180))
+        let release = versionRelease(version)
+        let parsed = texts.parseInteger(release.split(".")[0])
+        if release == "" || !errors.integerOk(parsed) {
+            return Toolchain { problem: problem(VALUE_ERROR, "cannot identify LLVM version for " + tool.name + ": " + tool.path); identities: identities }
+        }
+        identities.add(Identity { name: tool.name; path: tool.path; version: version; major: errors.integerValue(parsed); release: release })
+    }
+    let matching = identities.length > 0
+    for identity in identities { if identity.major != identities[0].major { matching = false } }
+    if !matching {
+        return Toolchain { problem: problem(VALUE_ERROR, "coverage requires matching LLVM major versions for Clang, opt, llvm-cov and llvm-profdata"); identities: identities }
+    }
+    for identity in identities {
+        if identity.release != "23.1.2" {
+            return Toolchain { problem: problem(VALUE_ERROR, "coverage requires pinned LLVM 23.1.2 for Clang, opt, llvm-cov and llvm-profdata"); identities: identities }
+        }
+    }
+    return Toolchain { problem: ok(); identities: identities }
+}
+
+public function buildCompilerRuntime(runner: Runner, destination: Text, clang: Text, environment: List<Text>) {
+    run(runner, [clang, "-O2", "-DMINYAR_COMPILER_ARENA=1", "-c", runner.root + "/runtime/minyar_runtime.c", "-o", destination], environment, 180)
+}
+function tripleByte(byte: Integer): Boolean { return wordByte(byte) || byte == 46 }
+public function validTriple(triple: Text): Boolean {
+    let raw = Bytes(triple)
+    let parts = 1
+    let width = 0
+    for byte in raw {
+        if byte == 45 {
+            if width == 0 { return false }
+            parts += 1
+            width = 0
+        } else if tripleByte(byte) { width += 1 }
+        else { return false }
+    }
+    return width > 0 && parts >= 3
+}
+public function instrumentCompilerIr(runner: Runner, source: Text, destination: Text, clang: Text, opt: Text, phase: Text, environment: List<Text>): Problem {
+    if phase != "before-inlining" && phase != "after-inlining" { return problem(VALUE_ERROR, "unknown coverage phase: " + phase) }
+    if phase == "before-inlining" {
+        let triple = stripped(run(runner, [clang, "-dumpmachine"], environment, 180))
+        if !validTriple(triple) { return problem(VALUE_ERROR, "selected Clang did not provide a valid target triple") }
+        run(runner, [opt, "--mtriple=" + triple, "-passes=sancov-module", "-sanitizer-coverage-level=3",
+            "-sanitizer-coverage-trace-pc-guard", "-S", source, "-o", destination], environment, 180)
+        return ok()
+    }
+    run(runner, [clang, "-O0", "-S", "-emit-llvm", "-fsanitize-coverage=trace-pc-guard", "-Wno-override-module", source, "-o", destination], environment, 180)
+    return ok()
+}
+
+function buildRuntimeHarness(runner: Runner, source: Text, destination: Text, clang: Text, definitions: List<Text>, linkFlags: List<Text>, environment: List<Text>): Text {
+    let command = [clang, "-O0", "-g", "-fprofile-instr-generate", "-fcoverage-mapping"]
+    for item in definitions { command.add(item) }
+    command.add(runner.root + "/tests/" + source)
+    for item in linkFlags { command.add(item) }
+    command.add("-o")
+    command.add(destination)
+    run(runner, command, environment, 180)
+    return destination
+}
+function runFeatureHarnesses(runner: Runner, directory: Text, clang: Text, linkFlags: List<Text>, environment: List<Text>): List<Text> {
+    let maps = buildRuntimeHarness(runner, "map-runtime.c", directory + "/runtime-maps-profile", clang, [], linkFlags, environment)
+    if !startsBytes(run(runner, [maps], environment, 180), "map runtime: ") { fail("RuntimeError: map runtime harness did not report its contracts") }
+    runExpecting(runner, [maps, "missing"], environment, 1, "", "Minyar stopped: Map key is absent.\n")
+    let textHarness = buildRuntimeHarness(runner, "text-basics.c", directory + "/runtime-text-profile", clang, [], linkFlags, environment)
+    run(runner, [runner.root + "/build/tooling/tests/text-basics-model", "--executable", textHarness], environment, 180)
+    let sort = buildRuntimeHarness(runner, "list-sort-runtime.c", directory + "/runtime-sort-profile", clang, [], linkFlags, environment)
+    runExpecting(runner, [sort], environment, 0, "natural-models-alias-copy-float-text-comparator-stability-ok\n", "")
+    for mutation in ["set", "add"] {
+        runExpecting(runner, [sort, mutation], environment, 1, "", "Minyar stopped: the List was mutated during its sort comparator.\n")
+    }
+    let depth = buildRuntimeHarness(runner, "calldepth-runtime.c", directory + "/runtime-calldepth-profile", clang, ["-DMINYAR_FALLBACK_CALL_DEPTH=16"], linkFlags, environment)
+    run(runner, [depth], environment, 180)
+    let harnesses = [maps, textHarness, sort, depth]
+    let names = ["global", "fallback"]
+    let definitions = [["-DMINYAR_MAX_CALL_DEPTH=2"], ["-DMINYAR_MAX_CALL_DEPTH=1000", "-DMINYAR_FALLBACK_CALL_DEPTH=16"]]
+    let controls = [["global", "bounded", "physical", "escape"], ["fallback"]]
+    for index in 0..names.length {
+        let executable = buildRuntimeHarness(runner, "calldepth-reporting.c", directory + "/runtime-calldepth-reporting-" + names[index] + "-profile", clang, definitions[index], linkFlags, environment)
+        for control in controls[index] {
+            let expected = "nested failure; success; alive\n"
+            if control == "escape" { expected = "escaped pending status 2\n" }
+            runExpecting(runner, [executable, control], environment, 0, expected, "")
+        }
+        harnesses.add(executable)
+    }
+    return harnesses
+}
+
+public function compilerEdgeCoverage(directory: Text): Edges {
+    let names: List<Text> = []
+    for name in files.list(directory) { if endsBytes(name, ".edges") { names.add(name) } }
+    let total = 0
+    let merged = Bytes()
+    for name in names.sorted() {
+        let path = directory + "/" + name
+        let data = files.readFile(path)
+        if files.lastError() != 0 { return Edges { problem: problem(RUNTIME_ERROR, "cannot read compiler edge profile: " + path); count: 0; covered: 0; percent: 0.0 } }
+        if data.length < 8 { return Edges { problem: problem(RUNTIME_ERROR, "truncated compiler edge profile: " + path); count: 0; covered: 0; percent: 0.0 } }
+        let count = data.getInt64(0)
+        if count == 0 || data.length - 8 != count { return Edges { problem: problem(RUNTIME_ERROR, "invalid compiler edge profile: " + path); count: 0; covered: 0; percent: 0.0 } }
+        if total == 0 {
+            total = count
+            merged = data.slice(8, data.length)
+        } else if count != total {
+            return Edges { problem: problem(RUNTIME_ERROR, "instrumented compiler edge counts changed within one coverage run"); count: 0; covered: 0; percent: 0.0 }
+        } else {
+            let index = 0
+            while index + 8 <= count {
+                merged.setInt64(index, merged.getInt64(index) | data.getInt64(8 + index))
+                index += 8
+            }
+            while index < count {
+                merged[index] = merged[index] | data[8 + index]
+                index += 1
+            }
+        }
+    }
+    let covered = 0
+    for byte in merged { if byte != 0 { covered += 1 } }
+    let measured = percentage(covered, total)
+    return Edges { problem: measured.problem; count: total; covered: covered; percent: measured.value }
+}
+
+function skipSpace(scan: Scanner) {
+    while scan.position < scan.raw.length {
+        let byte = scan.raw[scan.position]
+        if byte != 32 && byte != 9 && byte != 10 && byte != 13 { return }
+        scan.position += 1
+    }
+}
+function invalidJson(scan: Scanner, message: Text): Boolean {
+    if scan.error == "" { scan.error = message + " at byte " + Text(scan.position) }
+    return false
+}
+function skipString(scan: Scanner): Boolean {
+    scan.position += 1
+    while scan.position < scan.raw.length {
+        let byte = scan.raw[scan.position]
+        if byte == 34 { scan.position += 1; return true }
+        if byte < 32 { return invalidJson(scan, "unescaped string control") }
+        if byte == 92 { scan.position += 1 }
+        scan.position += 1
+    }
+    return invalidJson(scan, "unfinished string")
+}
+function skipWord(scan: Scanner, word: Text): Boolean {
+    let pattern = Bytes(word)
+    if scan.position + pattern.length > scan.raw.length { return invalidJson(scan, "unexpected end") }
+    for index in 0..pattern.length { if scan.raw[scan.position + index] != pattern[index] { return invalidJson(scan, "unexpected character") } }
+    scan.position += pattern.length
+    return true
+}
+function numberByte(byte: Integer): Boolean { return digitByte(byte) || byte == 45 || byte == 43 || byte == 46 || byte == 101 || byte == 69 }
+function skipValue(scan: Scanner, depth: Integer): Boolean {
+    skipSpace(scan)
+    if depth > 64 { return invalidJson(scan, "nesting too deep") }
+    if scan.position >= scan.raw.length { return invalidJson(scan, "unexpected end") }
+    let byte = scan.raw[scan.position]
+    if byte == 34 { return skipString(scan) }
+    if byte == 123 || byte == 91 {
+        let closing = 93
+        if byte == 123 { closing = 125 }
+        scan.position += 1
+        skipSpace(scan)
+        if scan.position < scan.raw.length && scan.raw[scan.position] == closing { scan.position += 1; return true }
+        while true {
+            if byte == 123 {
+                skipSpace(scan)
+                if scan.position >= scan.raw.length || scan.raw[scan.position] != 34 { return invalidJson(scan, "expected a member name") }
+                if !skipString(scan) { return false }
+                skipSpace(scan)
+                if scan.position >= scan.raw.length || scan.raw[scan.position] != 58 { return invalidJson(scan, "expected ':'") }
+                scan.position += 1
+            }
+            if !skipValue(scan, depth + 1) { return false }
+            skipSpace(scan)
+            if scan.position >= scan.raw.length { return invalidJson(scan, "unfinished container") }
+            let next = scan.raw[scan.position]
+            scan.position += 1
+            if next == closing { return true }
+            if next != 44 { return invalidJson(scan, "expected ',' or a closing bracket") }
+        }
+    }
+    if byte == 116 { return skipWord(scan, "true") }
+    if byte == 102 { return skipWord(scan, "false") }
+    if byte == 110 { return skipWord(scan, "null") }
+    let start = scan.position
+    while scan.position < scan.raw.length && numberByte(scan.raw[scan.position]) { scan.position += 1 }
+    if scan.position == start { return invalidJson(scan, "unexpected character") }
+    return true
+}
+function decoded(scan: Scanner, span: Span): json.Value {
+    return json.parse(Text(scan.raw.slice(span.start, span.end)))
+}
+function members(scan: Scanner, span: Span, names: List<Text>): List<Span> {
+    let found: List<Span> = []
+    for unused in names { found.add(Span { start: -1; end: -1 }) }
+    scan.position = span.start
+    skipSpace(scan)
+    if scan.position >= scan.raw.length || scan.raw[scan.position] != 123 { invalidJson(scan, "expected an object"); return found }
+    scan.position += 1
+    skipSpace(scan)
+    if scan.position < scan.raw.length && scan.raw[scan.position] == 125 { scan.position += 1; return found }
+    while scan.error == "" {
+        skipSpace(scan)
+        if scan.position >= scan.raw.length || scan.raw[scan.position] != 34 { invalidJson(scan, "expected a member name"); return found }
+        let keyStart = scan.position
+        if !skipString(scan) { return found }
+        let key = decoded(scan, Span { start: keyStart; end: scan.position }).text
+        skipSpace(scan)
+        if scan.position >= scan.raw.length || scan.raw[scan.position] != 58 { invalidJson(scan, "expected ':'"); return found }
+        scan.position += 1
+        skipSpace(scan)
+        let valueStart = scan.position
+        if !skipValue(scan, 1) { return found }
+        for index in 0..names.length { if names[index] == key { found[index] = Span { start: valueStart; end: scan.position } } }
+        skipSpace(scan)
+        if scan.position >= scan.raw.length { invalidJson(scan, "unfinished object"); return found }
+        let next = scan.raw[scan.position]
+        scan.position += 1
+        if next == 125 { return found }
+        if next != 44 { invalidJson(scan, "expected ',' or '}'"); return found }
+    }
+    return found
+}
+function elements(scan: Scanner, span: Span): List<Span> {
+    let found: List<Span> = []
+    scan.position = span.start
+    skipSpace(scan)
+    if scan.position >= scan.raw.length || scan.raw[scan.position] != 91 { invalidJson(scan, "expected an array"); return found }
+    scan.position += 1
+    skipSpace(scan)
+    if scan.position < scan.raw.length && scan.raw[scan.position] == 93 { scan.position += 1; return found }
+    while scan.error == "" {
+        skipSpace(scan)
+        let valueStart = scan.position
+        if !skipValue(scan, 1) { return found }
+        found.add(Span { start: valueStart; end: scan.position })
+        skipSpace(scan)
+        if scan.position >= scan.raw.length { invalidJson(scan, "unfinished array"); return found }
+        let next = scan.raw[scan.position]
+        scan.position += 1
+        if next == 93 { return found }
+        if next != 44 { invalidJson(scan, "expected ',' or ']'"); return found }
+    }
+    return found
+}
+function normalized(path: Text, base: Text): Text {
+    let full = path
+    if !startsBytes(path, "/") { full = base + "/" + path }
+    let parts: List<Text> = []
+    for part in full.split("/") {
+        if part == "" || part == "." { continue }
+        if part == ".." {
+            if parts.length > 0 { parts.pop() }
+            continue
+        }
+        parts.add(part)
+    }
+    let pieces: List<Text> = []
+    for part in parts { pieces.add("/" + part) }
+    if pieces.length == 0 { return "/" }
+    return joinText(pieces)
+}
+function inside(path: Text, directory: Text): Boolean {
+    if path == directory { return true }
+    if directory == "/" { return startsBytes(path, "/") }
+    return startsBytes(path, directory + "/")
+}
+function integerToken(token: Text): Boolean {
+    let raw = Bytes(token)
+    if raw.length == 0 { return false }
+    let start = 0
+    if raw[0] == 45 { start = 1 }
+    if start == raw.length { return false }
+    for index in start..raw.length { if !digitByte(raw[index]) { return false } }
+    return true
+}
+function runtimeFailure(message: Text): RuntimeCoverage {
+    return RuntimeCoverage { problem: problem(VALUE_ERROR, message); totals: []; mapped: [] }
+}
+function metricValue(metric: Metric, key: Text): Integer {
+    for index in 0..metric.keys.length { if metric.keys[index] == key { return metric.values[index] } }
+    return -1
+}
+function hasKey(metric: Metric, key: Text): Boolean {
+    for name in metric.keys { if name == key { return true } }
+    return false
+}
+public function aggregateRuntimeCoverage(exported: Bytes, runtimeDirectory: Text, base: Text): RuntimeCoverage {
+    let scan = Scanner { raw: exported; position: 0; error: "" }
+    let top = members(scan, Span { start: 0; end: exported.length }, ["data"])
+    if scan.error != "" { return runtimeFailure("invalid llvm-cov export: " + scan.error) }
+    skipSpace(scan)
+    if scan.position != exported.length { return runtimeFailure("invalid llvm-cov export: trailing data at byte " + Text(scan.position)) }
+    if top[0].start < 0 { return runtimeFailure("expected one merged llvm-cov export") }
+    let data = elements(scan, top[0])
+    if scan.error != "" || data.length != 1 { return runtimeFailure("expected one merged llvm-cov export") }
+    let fileList = members(scan, data[0], ["files"])
+    if scan.error != "" || fileList[0].start < 0 { return runtimeFailure("llvm-cov export has no files list") }
+    let rows = elements(scan, fileList[0])
+    if scan.error != "" { return runtimeFailure("invalid llvm-cov files list: " + scan.error) }
+    let directory = normalized(runtimeDirectory, base)
+    let totals: List<Metric> = []
+    let mapped: List<FileRow> = []
+    for row in rows {
+        let fields = members(scan, row, ["filename", "summary"])
+        if scan.error != "" || fields[0].start < 0 || fields[1].start < 0 { return runtimeFailure("llvm-cov file entry lacks filename or summary") }
+        let name = decoded(scan, fields[0])
+        if name.kind != json.STRING { return runtimeFailure("llvm-cov filename is not a string") }
+        let filename = normalized(name.text, base)
+        if !inside(filename, directory) { continue }
+        for earlier in mapped { if earlier.filename == filename { return runtimeFailure("duplicate runtime coverage mapping: " + filename) } }
+        let summary = decoded(scan, fields[1])
+        if summary.kind != json.OBJECT { return runtimeFailure("llvm-cov summary is not an object: " + filename) }
+        mapped.add(FileRow { filename: filename; summary: summary; digest: "" })
+        for index in 0..summary.keys.length {
+            let metricName = summary.keys[index]
+            let values = summary.items[index]
+            if values.kind != json.OBJECT { return runtimeFailure("llvm-cov summary metric is not an object: " + metricName) }
+            let slot = -1
+            for position in 0..totals.length { if totals[position].name == metricName { slot = position } }
+            if slot < 0 {
+                totals.add(Metric { name: metricName; keys: []; values: []; measured: false; percent: 0.0 })
+                slot = totals.length - 1
+            }
+            let total = totals[slot]
+            for position in 0..values.keys.length {
+                let key = values.keys[position]
+                if key == "percent" { continue }
+                let item = values.items[position]
+                if item.kind != json.NUMBER || !integerToken(item.text) { return runtimeFailure("llvm-cov summary value is not an integer: " + metricName + "." + key) }
+                let amount = Integer(item.text)
+                let found = false
+                for keyIndex in 0..total.keys.length {
+                    if total.keys[keyIndex] == key { total.values[keyIndex] = total.values[keyIndex] + amount; found = true }
+                }
+                if !found { total.keys.add(key); total.values.add(amount) }
+            }
+        }
+    }
+    let lines = -1
+    for metric in totals { if metric.name == "lines" { lines = metricValue(metric, "count") } }
+    if mapped.length == 0 || lines <= 0 { return runtimeFailure("instrumented runtime produced no mapped lines") }
+    for metric in totals {
+        if !hasKey(metric, "count") { return runtimeFailure("llvm-cov summary lacks count for " + metric.name) }
+        let count = metricValue(metric, "count")
+        if count != 0 {
+            if !hasKey(metric, "covered") { return runtimeFailure("llvm-cov summary lacks covered for " + metric.name) }
+            let measured = percentage(metricValue(metric, "covered"), count)
+            if measured.problem.kind != 0 { return RuntimeCoverage { problem: measured.problem; totals: []; mapped: [] } }
+            metric.measured = true
+            metric.percent = measured.value
+        }
+    }
+    return RuntimeCoverage { problem: ok(); totals: totals; mapped: mapped }
+}
+
+function hexDigits(value: Integer, width: Integer): Text {
+    let alphabet = Bytes("0123456789abcdef")
+    let raw = Bytes(width)
+    for index in 0..width { raw[width - 1 - index] = alphabet[(value >> (index * 4)) & 15] }
+    return Text(raw)
+}
+public function quoted(source: Text): Text {
+    let parts: List<Text> = ["\""]
+    for character in source {
+        let code = Integer(character)
+        if code == 34 { parts.add("\\\"") }
+        else if code == 92 { parts.add("\\\\") }
+        else if code == 10 { parts.add("\\n") }
+        else if code == 13 { parts.add("\\r") }
+        else if code == 9 { parts.add("\\t") }
+        else if code == 8 { parts.add("\\b") }
+        else if code == 12 { parts.add("\\f") }
+        else if code < 32 { parts.add("\\u" + hexDigits(code, 4)) }
+        else if code < 128 { parts.add(Text(character)) }
+        else if code < 65536 { parts.add("\\u" + hexDigits(code, 4)) }
+        else {
+            let offset = code - 65536
+            parts.add("\\u" + hexDigits(55296 + (offset >> 10), 4) + "\\u" + hexDigits(56320 + (offset & 1023), 4))
+        }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+public function pythonFloat(value: Float): Text {
+    let shown = Text(value)
+    if value == 0.0 { return shown }
+    let raw = Bytes(shown)
+    let negative = raw[0] == 45
+    let digits: List<Integer> = []
+    let before = 0
+    let point = false
+    let index = 0
+    if negative { index = 1 }
+    while index < raw.length && raw[index] != 101 {
+        if raw[index] == 46 { point = true }
+        else {
+            digits.add(raw[index] - 48)
+            if !point { before += 1 }
+        }
+        index += 1
+    }
+    let power = 0
+    if index < raw.length { power = Integer(Text(raw.slice(index + 1, raw.length))) }
+    let scale = power + before - digits.length
+    let first = 0
+    while first < digits.length && digits[first] == 0 { first += 1 }
+    let last = digits.length
+    while last > first && digits[last - 1] == 0 { last -= 1; scale += 1 }
+    let significant: List<Text> = []
+    for position in first..last { significant.add(Text(digits[position])) }
+    let count = significant.length
+    let decimal = scale + count - 1
+    let pieces: List<Text> = []
+    if negative { pieces.add("-") }
+    if decimal >= -4 && decimal < 16 {
+        if decimal >= 0 {
+            for position in 0..(decimal + 1) {
+                if position < count { pieces.add(significant[position]) } else { pieces.add("0") }
+            }
+            pieces.add(".")
+            if decimal + 1 < count { for position in (decimal + 1)..count { pieces.add(significant[position]) } }
+            else { pieces.add("0") }
+        } else {
+            pieces.add("0.")
+            for unused in 0..(-decimal - 1) { pieces.add("0") }
+            for digit in significant { pieces.add(digit) }
+        }
+    } else {
+        pieces.add(significant[0])
+        if count > 1 {
+            pieces.add(".")
+            for position in 1..count { pieces.add(significant[position]) }
+        }
+        pieces.add("e")
+        if decimal < 0 { pieces.add("-") } else { pieces.add("+") }
+        let magnitude = abs(decimal)
+        if magnitude < 10 { pieces.add("0") }
+        pieces.add(Text(magnitude))
+    }
+    return joinText(pieces)
+}
+function numberText(token: Text): Text {
+    if integerToken(token) {
+        let raw = Bytes(token)
+        let zero = true
+        for byte in raw { if byte != 45 && byte != 48 { zero = false } }
+        if zero { return "0" }
+        return token
+    }
+    return pythonFloat(decimalFloat(token))
+}
+function objectText(keys: List<Text>, values: List<Text>, indent: Text): Text {
+    if keys.length == 0 { return "{}" }
+    let parts: List<Text> = ["{"]
+    for index in 0..keys.length {
+        if index > 0 { parts.add(",") }
+        parts.add("\n" + indent + "  " + quoted(keys[index]) + ": " + values[index])
+    }
+    parts.add("\n" + indent + "}")
+    return joinText(parts)
+}
+function arrayText(values: List<Text>, indent: Text): Text {
+    if values.length == 0 { return "[]" }
+    let parts: List<Text> = ["["]
+    for index in 0..values.length {
+        if index > 0 { parts.add(",") }
+        parts.add("\n" + indent + "  " + values[index])
+    }
+    parts.add("\n" + indent + "]")
+    return joinText(parts)
+}
+function valueText(value: json.Value, indent: Text): Text {
+    if value.kind == json.STRING { return quoted(value.text) }
+    if value.kind == json.NUMBER { return numberText(value.text) }
+    if value.kind == json.BOOLEAN { if value.truth { return "true" } else { return "false" } }
+    if value.kind == json.NULL { return "null" }
+    let rendered: List<Text> = []
+    for item in value.items { rendered.add(valueText(item, indent + "  ")) }
+    if value.kind == json.ARRAY { return arrayText(rendered, indent) }
+    return objectText(value.keys, rendered, indent)
+}
+function edgesText(edges: Edges, indent: Text): Text {
+    return objectText(["count", "covered", "percent"], [Text(edges.count), Text(edges.covered), pythonFloat(edges.percent)], indent)
+}
+function metricText(metric: Metric, indent: Text): Text {
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    for index in 0..metric.keys.length { keys.add(metric.keys[index]); values.add(Text(metric.values[index])) }
+    keys.add("percent")
+    if metric.measured { values.add(pythonFloat(metric.percent)) } else { values.add("null") }
+    return objectText(keys, values, indent)
+}
+function digestFile(path: Text): Text {
+    return sha.hex(sha.digest(readBytesFile(path)))
+}
+function profiled(clang: Text, items: List<Text>): List<Text> {
+    let result = [clang, "-O0", "-g", "-fprofile-instr-generate", "-fcoverage-mapping"]
+    for item in items { result.add(item) }
+    return result
+}
+function jobCount(environment: List<Text>): Integer {
+    let configured = settingOr(environment, "MINYAR_TEST_JOBS", "")
+    if configured == "" { return 1 }
+    let parsed = texts.parseInteger(configured)
+    if !errors.integerOk(parsed) { fail("ValueError: invalid literal for int() with base 10: " + quoted(configured)) }
+    return max(1, errors.integerValue(parsed))
+}
+function pause() {
+    let handle = system.spawn("/bin/sleep", ["sleep", "0.2"], system.environment(), "")
+    if handle > 0 { system.wait(handle) }
+}
+function runJobs(runner: Runner, jobs: List<Job>, width: Integer) {
+    let handles: List<Integer> = []
+    let logs: List<Text> = []
+    let failures: List<Text> = []
+    let active: List<Integer> = []
+    let next = 0
+    while next < jobs.length || active.length > 0 {
+        while active.length < width && next < jobs.length {
+            let log = nextLog(runner)
+            logs.add(log)
+            failures.add("")
+            handles.add(test.start(jobs[next].command, jobs[next].environment, runner.root, log, jobs[next].seconds))
+            active.add(next)
+            next += 1
+        }
+        let remaining: List<Integer> = []
+        for index in active {
+            test.check(handles[index] > 0, "process launch failed: " + Text(handles[index]))
+            let status = system.poll(handles[index])
+            if status.state == system.PENDING { remaining.add(index); continue }
+            test.check(status.error == 0 && (status.state == system.EXITED || status.state == system.SIGNALED), "process wait failed")
+            let code = status.exitCode
+            if status.state == system.SIGNALED { code = 128 + status.signal }
+            if code != 0 {
+                let result = test.Result { status: code; output: Text(files.readFile(logs[index])); errorOutput: Text(files.readFile(logs[index] + ".err")) }
+                failures[index] = failure(jobs[index].command, result)
+            }
+        }
+        if remaining.length == active.length && remaining.length > 0 { pause() }
+        active = remaining
+    }
+    for message in failures { if message != "" { fail("RuntimeError: " + message) } }
+}
+public function repositoryRoot(scratch: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "pwd -P"], system.environment(), "", scratch + "/root", 10)
+    test.require(result, "resolve the repository root")
+    return stripped(result.output)
+}
+
+function metricNamed(totals: List<Metric>, name: Text): Metric {
+    for item in totals { if item.name == name { return item } }
+    fail("KeyError: " + quoted(name))
+}
+function measuredPercent(totals: List<Metric>, name: Text): Float {
+    let found = metricNamed(totals, name)
+    if !found.measured { fail("TypeError: runtime " + name + " coverage has no percentage") }
+    return found.percent
+}
+
+function main(): Integer {
+    let environment = system.environment()
+    let minimumCompiler = minimumCoverage(environment, "MINYAR_MIN_COMPILER_EDGE_COVERAGE")
+    let minimumLines = minimumCoverage(environment, "MINYAR_MIN_RUNTIME_LINE_COVERAGE")
+    let minimumBranches = minimumCoverage(environment, "MINYAR_MIN_RUNTIME_BRANCH_COVERAGE")
+    for gate in [minimumCompiler, minimumLines, minimumBranches] { if !gate.valid { fail("ValueError: " + gate.message) } }
+    let logs = test.scratch()
+    let root = repositoryRoot(logs)
+    let runner = liveRunner(root, logs)
+    let clang = settingOr(environment, "MINYAR_TEST_CLANG", "clang")
+    let profdata = findTool(runner, environment, "LLVM_PROFDATA", "llvm-profdata")
+    let llvmCov = findTool(runner, environment, "LLVM_COV", "llvm-cov")
+    let opt = findTool(runner, environment, "LLVM_OPT", "opt")
+    let tools = toolchainIdentity(runner, [Tool { name: "clang"; path: clang }, Tool { name: "opt"; path: opt },
+        Tool { name: "llvm_cov"; path: llvmCov }, Tool { name: "profdata"; path: profdata }], environment)
+    require(tools.problem)
+    let coverageRoot = root + "/build/coverage"
+    run(runner, ["mkdir", "-p", coverageRoot], environment, 30)
+    let runDirectory = ""
+    while runDirectory == "" {
+        let candidate = coverageRoot + "/run-" + sha.hex(randomBytes(4))
+        if files.pathSize(candidate) < 0 && files.makeDirectory(candidate) == 0 { runDirectory = candidate }
+    }
+    let profiles = runDirectory + "/profiles"
+    test.check(files.makeDirectory(profiles) == 0, "cannot create " + profiles)
+    environment = withSetting(environment, "LLVM_PROFILE_FILE", profiles + "/%p-%m.profraw")
+    environment = withSetting(environment, "MINYAR_TEST_CLANG", clang)
+
+    run(runner, ["make", "-s", "LIMITED=", "SANITIZER_LIMITED=", "build/compiler-stage2.ll", "build/minyarc-modules"], environment, 180)
+    let compilerRuntime = runDirectory + "/compiler-arena-runtime.o"
+    buildCompilerRuntime(runner, compilerRuntime, clang, environment)
+    let phases: List<Phase> = []
+    for name in ["before-inlining", "after-inlining"] {
+        let directory = runDirectory + "/" + name
+        test.check(files.makeDirectory(directory) == 0, "cannot create " + directory)
+        let edges = directory + "/compiler-edges"
+        test.check(files.makeDirectory(edges) == 0, "cannot create " + edges)
+        let instrumented = directory + "/compiler-coverage.ll"
+        require(instrumentCompilerIr(runner, root + "/build/compiler-stage2.ll", instrumented, clang, opt, name, environment))
+        let compiler = directory + "/minyarc-profile"
+        run(runner, [clang, "-O0", "-g", "-Wno-override-module", instrumented, compilerRuntime, root + "/tests/compiler-coverage-runtime.c", "-lm", "-o", compiler], environment, 180)
+        phases.add(Phase { name: name; directory: directory; compiler: compiler; edges: edges })
+    }
+    let runtimeObject = runDirectory + "/runtime-profile.o"
+    run(runner, profiled(clang, ["-DMINYAR_RC_TESTING=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtimeObject]), environment, 180)
+    let runtimeUnit = runDirectory + "/runtime-unit-profile"
+    run(runner, profiled(clang, [root + "/tests/runtime-unit.c", "-lm", "-o", runtimeUnit]), environment, 180)
+    run(runner, [runtimeUnit], environment, 180)
+    let runtimeBytes = runDirectory + "/runtime-bytes-profile"
+    run(runner, profiled(clang, [root + "/tests/runtime-bytes.c", "-lm", "-o", runtimeBytes]), environment, 180)
+    run(runner, [runtimeBytes], environment, 180)
+    let runtimeNumeric = runDirectory + "/runtime-numeric-profile"
+    run(runner, profiled(clang, [root + "/tests/runtime-numeric.c", "-lm", "-o", runtimeNumeric]), environment, 180)
+    run(runner, [root + "/build/tooling/tests/runtime-numeric", "--formatter", runtimeNumeric, "--cases", "2000", "--output-dir", runDirectory + "/numeric"], environment, 180)
+    let harnesses = runFeatureHarnesses(runner, runDirectory, clang, ["-lm", "-pthread"], environment)
+
+    let targets = ["make", "-s"]
+    for name in NATIVE_SUITES { targets.add("build/tooling/tests/" + name) }
+    run(runner, targets, environment, 180)
+
+    let jobs: List<Job> = []
+    for phase in phases {
+        let suiteEnvironment = withSetting(environment, "MINYAR_SANCOV_DIR", phase.edges)
+        suiteEnvironment = withSetting(suiteEnvironment, "MINYAR_TEST_COMPILER", phase.compiler)
+        suiteEnvironment = withSetting(suiteEnvironment, "MINYAR_TEST_RUNTIME", runtimeObject)
+        suiteEnvironment = withSetting(suiteEnvironment, "MINYAR_TEST_LINK_FLAGS", "-fprofile-instr-generate -lm")
+        suiteEnvironment = withSetting(suiteEnvironment, "MINYAR_TEST_JOBS", "1")
+        jobs.add(Job { command: [root + "/build/tooling/tests/coverage-programs/check"]; environment: suiteEnvironment; seconds: 600 })
+        for suite in COMPILER_SUITES {
+            let words = suite.split(" ")
+            let suiteCommand = [root + "/build/tooling/tests/" + words[0]]
+            for index in 1..words.length { suiteCommand.add(words[index]) }
+            jobs.add(Job { command: suiteCommand; environment: suiteEnvironment; seconds: 180 })
+        }
+        jobs.add(Job { command: [root + "/build/tooling/tests/linkage", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"]; environment: suiteEnvironment; seconds: 180 })
+        jobs.add(Job { command: [root + "/build/tooling/tests/runtime-numeric", "--mode", "native", "--cases", "2000", "--output-dir", phase.directory + "/numeric"]; environment: suiteEnvironment; seconds: 180 })
+        jobs.add(Job { command: [root + "/build/tooling/tests/fuzz", "--cases", "200", "--program-cases", "40", "--output-dir", phase.directory + "/fuzz"]; environment: suiteEnvironment; seconds: 180 })
+        jobs.add(Job { command: [phase.compiler, "build/compiler.min", phase.directory + "/self.ll"]; environment: suiteEnvironment; seconds: 180 })
+    }
+    runJobs(runner, jobs, jobCount(environment))
+    let reports: List<Edges> = []
+    for phase in phases {
+        let measured = compilerEdgeCoverage(phase.edges)
+        require(measured.problem)
+        reports.add(measured)
+    }
+    let fixedPoint = readTextFile(root + "/build/compiler-stage2.ll")
+    for phase in phases {
+        if readTextFile(phase.directory + "/self.ll") != fixedPoint { fail("RuntimeError: coverage instrumentation changed self-hosted compiler output") }
+    }
+
+    let rawProfiles: List<Text> = []
+    for name in files.list(profiles).sorted() { if endsBytes(name, ".profraw") { rawProfiles.add(profiles + "/" + name) } }
+    if rawProfiles.length == 0 { fail("RuntimeError: instrumented checks produced no coverage profiles") }
+    let merged = runDirectory + "/coverage.profdata"
+    let merge = [profdata, "merge", "-sparse"]
+    for path in rawProfiles { merge.add(path) }
+    merge.add("-o")
+    merge.add(merged)
+    run(runner, merge, environment, 180)
+    let exportCommand = [llvmCov, "export", runtimeUnit, "-object=" + runtimeBytes, "-object=" + runtimeNumeric]
+    for harness in harnesses { exportCommand.add("-object=" + harness) }
+    exportCommand.add("-instr-profile=" + merged)
+    let exported = run(runner, exportCommand, environment, 180)
+    let runtime = aggregateRuntimeCoverage(Bytes(exported), root + "/runtime", root)
+    require(runtime.problem)
+    for row in runtime.mapped { row.digest = digestFile(row.filename) }
+
+    let toolNames: List<Text> = []
+    let toolTexts: List<Text> = []
+    for identity in tools.identities {
+        toolNames.add(identity.name)
+        toolTexts.add(objectText(["path", "version", "major", "release"], [quoted(identity.path), quoted(identity.version), Text(identity.major), quoted(identity.release)], "    "))
+    }
+    let suites: List<Text> = []
+    for suite in COMPILER_SUITES { suites.add(quoted(suite)) }
+    let compilerText = objectText(["measurement", "source_sha256", "ir_sha256", "edges", "after_inlining_edges", "instrumented_outputs_match_fixed_point"],
+        [quoted("SanitizerCoverage distinct LLVM control-flow edges, IDs assigned before inlining; no function or guard exclusions"),
+         quoted(digestFile(root + "/build/compiler.min")), quoted(digestFile(root + "/build/compiler-stage2.ll")),
+         edgesText(reports[0], "    "), edgesText(reports[1], "    "), "true"], "  ")
+    let metricNames: List<Text> = []
+    let metricTexts: List<Text> = []
+    for item in runtime.totals { metricNames.add(item.name); metricTexts.add(metricText(item, "    ")) }
+    let fileTexts: List<Text> = []
+    for row in runtime.mapped {
+        fileTexts.add(objectText(["filename", "summary", "source_sha256"], [quoted(row.filename), valueText(row.summary, "      "), quoted(row.digest)], "    "))
+    }
+    let report = objectText(["run_directory", "profiles", "tools", "compiler_runtime", "target_triple", "compiler_suites", "compiler", "runtime", "runtime_files", "runtime_configuration"],
+        [quoted(runDirectory), Text(rawProfiles.length), objectText(toolNames, toolTexts, "  "),
+         objectText(["configuration", "object_sha256"], [quoted("MINYAR_COMPILER_ARENA=1; isolated selected-Clang C build at O2"), quoted(digestFile(compilerRuntime))], "  "),
+         quoted(stripped(run(runner, [clang, "-dumpmachine"], environment, 180))), arrayText(suites, "  "), compilerText,
+         objectText(metricNames, metricTexts, "  "), arrayText(fileTexts, "  "),
+         quoted("eager reference counting; compiler-arena, bounded/pool, and optional native backends are separate configurations")], "")
+    writeTextFile(runDirectory + "/coverage.json", report + "\n")
+    print(report)
+
+    let failures: List<Text> = []
+    let compilerPercent = reports[0].percent
+    if compilerPercent < minimumCompiler.value {
+        failures.add("compiler edge coverage " + pythonFloat(compilerPercent) + "% < " + pythonFloat(minimumCompiler.value) + "%")
+    }
+    let linePercent = measuredPercent(runtime.totals, "lines")
+    if linePercent < minimumLines.value {
+        failures.add("runtime line coverage " + pythonFloat(linePercent) + "% < " + pythonFloat(minimumLines.value) + "%")
+    }
+    let branchPercent = measuredPercent(runtime.totals, "branches")
+    if branchPercent < minimumBranches.value {
+        failures.add("runtime branch coverage " + pythonFloat(branchPercent) + "% < " + pythonFloat(minimumBranches.value) + "%")
+    }
+    test.removeTree(logs)
+    if failures.length > 0 {
+        let message: List<Text> = []
+        for item in failures {
+            if message.length > 0 { message.add("; ") }
+            message.add(item)
+        }
+        system.writeStandardError("coverage gate failed: " + joinText(message) + "\n")
+        return 1
+    }
+    return 0
+}

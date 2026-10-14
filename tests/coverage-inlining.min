@@ -1,0 +1,63 @@
+use "../tools/testing.min" as test
+use "../scripts/coverage.min" as coverage
+use "system" as system
+use "files" as files
+
+function source(calls: Integer): Text {
+    let parts = ["@effect = internal global i32 0\ndefine internal void @helper(i1 %condition) alwaysinline {\nentry:\n  br i1 %condition, label %yes, label %no\nyes:\n  store volatile i32 1, ptr @effect\n  ret void\nno:\n  store volatile i32 2, ptr @effect\n  ret void\n}\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  %condition = icmp ugt i32 %argc, 1\n"]
+    for unused in 0..calls { parts.add("  call void @helper(i1 %condition)\n") }
+    parts.add("  %result = load volatile i32, ptr @effect\n  ret i32 %result\n}\n")
+    return joinText(parts)
+}
+
+if argumentCount() > 0 {
+    for index in 0..argumentCount() {
+        let item = argument(index)
+        test.check(item == "CoverageInlining" || item == "CoverageInlining.test_shared_branch_identity_survives_inlining" || item == "test_shared_branch_identity_survives_inlining", "unknown coverage inlining selector " + item)
+    }
+}
+let scratch = test.scratch()
+let root = coverage.repositoryRoot(scratch)
+let logs = scratch + "/logs"
+test.check(files.makeDirectory(logs) == 0, "cannot create coverage inlining logs")
+let runner = coverage.liveRunner(root, logs)
+let environment = system.environment()
+let clang = coverage.settingOr(environment, "MINYAR_TEST_CLANG", "clang")
+let opt = coverage.findTool(runner, environment, "LLVM_OPT", "opt")
+let phases: List<Text> = []
+let callCounts: List<Integer> = []
+let counts: List<Integer> = []
+for phase in ["before-inlining", "after-inlining"] {
+    for calls in [1, 16] {
+        let work = scratch + "/" + phase + "-" + Text(calls)
+        test.check(files.makeDirectory(work) == 0, "cannot create " + work)
+        let input = work + "/source.ll"
+        writeTextFile(input, source(calls))
+        let instrumented = work + "/instrumented.ll"
+        let workEnvironment = coverage.withSetting(environment, "MINYAR_SANCOV_DIR", work)
+        let found = coverage.instrumentCompilerIr(runner, input, instrumented, clang, opt, phase, workEnvironment)
+        test.check(found.kind == 0, phase + ": " + found.message)
+        let executable = work + "/program"
+        coverage.run(runner, [clang, "-O0", "-Wno-override-module", instrumented, root + "/tests/compiler-coverage-runtime.c", "-o", executable], workEnvironment, 180)
+        let arguments = [[executable], [executable, "take-other-arm"]]
+        let expected = [2, 1]
+        for index in 0..arguments.length {
+            let result = coverage.execute(runner, arguments[index], workEnvironment, 10)
+            test.check(result.status == expected[index], phase + " " + Text(calls) + ": expected status " + Text(expected[index]) + ", got " + Text(result.status) + "\n" + result.errorOutput)
+        }
+        let edges = coverage.compilerEdgeCoverage(work)
+        test.check(edges.problem.kind == 0, phase + " " + Text(calls) + ": " + edges.problem.message)
+        test.check(edges.covered == edges.count, "both distinct branch arms must remain measured")
+        phases.add(phase)
+        callCounts.add(calls)
+        counts.add(edges.count)
+    }
+}
+function countFor(phases: List<Text>, callCounts: List<Integer>, counts: List<Integer>, phase: Text, calls: Integer): Integer {
+    for index in 0..phases.length { if phases[index] == phase && callCounts[index] == calls { return counts[index] } }
+    fail("missing coverage inlining measurement " + phase + " " + Text(calls))
+}
+test.check(countFor(phases, callCounts, counts, "before-inlining", 1) == countFor(phases, callCounts, counts, "before-inlining", 16), "inlined copies inflated the distinct-branch denominator")
+test.check(countFor(phases, callCounts, counts, "after-inlining", 16) > countFor(phases, callCounts, counts, "after-inlining", 1), "raw measurement must still expose duplicated branch sites")
+test.removeTree(scratch)
+print("test_shared_branch_identity_survives_inlining ... ok")

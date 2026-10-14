@@ -113,11 +113,17 @@ check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o build/toolin
 check-fuzz-coverage: check-fuzz-afl-harness build/minyarc
 	sh scripts/fuzz-afl.sh
 
-check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/text-basics-model build/tooling/tests/runtime-numeric
+COVERAGE_TOOLS = build/tooling/scripts/coverage build/tooling/tests/coverage-harness build/tooling/tests/coverage-inlining
+COVERAGE_SUITE_TOOLS = $(addprefix build/tooling/tests/,octal-literals reserved-names diagnostics conformance list-access checked-arithmetic readonly-parameters checked-scalars module-constants statement-nesting compiler-hardening checked-results feature-dispatch errors-values c-layout-records maps list-sort text-basics collections-integration linkage peer-research-semantics peer-research-reachability fuzz coverage-programs/check callbacks errors-language thread-compiler incremental-language-hardening incremental-modules regressions peer-memory-nim-koka-lean peer-memory-nim-koka-followups runtime-numeric)
+$(COVERAGE_TOOLS): TOOL_NATIVE = runtime/native/sha256.c
+$(COVERAGE_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
+$(COVERAGE_TOOLS): runtime/native/sha256.c
+build/tooling/tests/coverage-harness.ll build/tooling/tests/coverage-inlining.ll: scripts/coverage.min
+check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/text-basics-model build/tooling/scripts/coverage $(COVERAGE_SUITE_TOOLS)
 	MINYAR_MIN_COMPILER_EDGE_COVERAGE=$(MIN_COMPILER_EDGE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_LINE_COVERAGE=$(MIN_RUNTIME_LINE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_BRANCH_COVERAGE=$(MIN_RUNTIME_BRANCH_COVERAGE) \
-	python3 scripts/coverage.py
+	./build/tooling/scripts/coverage
 
 check-stack-overflow: build/minyarc build/minyar-runtime.o build/tooling/tests/stack-overflow
 	$(LIMITED) ./build/tooling/tests/stack-overflow
@@ -452,12 +458,12 @@ check-native-graphics: build/tooling/tests/native-graphics
 check-fuzz-harness: build/tooling/tests/fuzz-harness build/tooling/tests/fuzz
 	./build/tooling/tests/fuzz-harness "$(CURDIR)/build/tooling/tests/fuzz"
 
-check-coverage-harness:
-	python3 tests/coverage-harness.py
+check-coverage-harness: build/tooling/tests/coverage-harness
+	./build/tooling/tests/coverage-harness
 
 .PHONY: check-coverage-inlining
-check-coverage-inlining:
-	MINYAR_TEST_CLANG="$${MINYAR_TEST_CLANG:-$(LLVM_CC)}" python3 tests/coverage-inlining.py
+check-coverage-inlining: build/tooling/tests/coverage-inlining
+	MINYAR_TEST_CLANG="$${MINYAR_TEST_CLANG:-$(LLVM_CC)}" ./build/tooling/tests/coverage-inlining
 
 check-runtime-bytes: build/tooling/tests/runtime-bytes
 	$(LIMITED) ./build/tooling/tests/runtime-bytes --clang "$(LLVM_CC)"

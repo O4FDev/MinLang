@@ -1,0 +1,191 @@
+use "../tools/testing.min" as test
+use "../scripts/coverage.min" as coverage
+use "system" as system
+use "files" as files
+
+constant NAMES: List<Text> = ["test_coverage_compiler_runtime_uses_selected_clang_and_arena_source",
+    "test_tool_versions_are_recorded_and_mismatches_fail_before_instrumentation",
+    "test_matching_unsupported_release_is_rejected",
+    "test_pre_inlining_instrumentation_uses_the_selected_backend_target",
+    "test_missing_or_invalid_target_metadata_cannot_choose_an_implicit_target",
+    "test_runtime_aggregation_includes_headers_and_excludes_tests",
+    "test_empty_runtime_mapping_cannot_report_full_coverage",
+    "test_empty_denominator_cannot_report_full_coverage",
+    "test_edge_profiles_merge_branches_and_reject_inconsistent_denominators",
+    "test_invalid_threshold_cannot_disable_gate"]
+
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() {
+        if argument(index) == "CoverageHarness" || argument(index) == "CoverageHarness." + name || argument(index) == name { return true }
+    }
+    return false
+}
+function has(values: List<Text>, expected: Text): Boolean {
+    for value in values { if value == expected { return true } }
+    return false
+}
+function sameList(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function raises(found: coverage.Problem, kind: Integer, pattern: Text, label: Text) {
+    test.check(found.kind == kind, label + ": expected error kind " + Text(kind) + ", got " + Text(found.kind) + " " + found.message)
+    test.check(test.contains(found.message, pattern), label + ": error does not match " + pattern + ": " + found.message)
+}
+function tools(): List<coverage.Tool> {
+    return [coverage.Tool { name: "clang"; path: "chosen clang" }, coverage.Tool { name: "opt"; path: "chosen opt" },
+        coverage.Tool { name: "llvm_cov"; path: "chosen cov" }, coverage.Tool { name: "profdata"; path: "chosen profdata" }]
+}
+function metric(found: coverage.RuntimeCoverage, name: Text): coverage.Metric {
+    for item in found.totals { if item.name == name { return item } }
+    fail("missing runtime metric " + name)
+}
+function identity(toolchain: coverage.Toolchain, name: Text): coverage.Identity {
+    for item in toolchain.identities { if item.name == name { return item } }
+    fail("missing toolchain identity " + name)
+}
+function summaryFile(name: Text, lineCount: Integer, lineCovered: Integer, branchCount: Integer, branchCovered: Integer): Text {
+    return "{\"filename\": \"" + name + "\", \"summary\": {\"lines\": {\"count\": " + Text(lineCount) + ", \"covered\": " + Text(lineCovered) +
+        ", \"percent\": 100}, \"branches\": {\"count\": " + Text(branchCount) + ", \"covered\": " + Text(branchCovered) + ", \"percent\": 100}}}"
+}
+function edgeProfile(count: Integer, bitmap: List<Integer>): Bytes {
+    let data = Bytes()
+    data.addInt64(count)
+    for byte in bitmap { data.add(byte) }
+    return data
+}
+
+for index in 0..argumentCount() {
+    let known = argument(index) == "CoverageHarness"
+    for name in NAMES { if argument(index) == name || argument(index) == "CoverageHarness." + name { known = true } }
+    test.check(known, "unknown coverage harness selector " + argument(index))
+}
+let scratch = test.scratch()
+let root = coverage.repositoryRoot(scratch)
+let ran = 0
+
+if selected(NAMES[0]) {
+    let runner = coverage.fakeRunner(root, "", [])
+    coverage.buildCompilerRuntime(runner, "isolated-runtime.o", "chosen clang", [])
+    test.check(runner.commands.length == 1, "compiler runtime: expected one command")
+    let command = runner.commands[runner.commands.length - 1]
+    test.check(command[0] == "chosen clang", "compiler runtime: selected Clang was not used")
+    test.check(has(command, "-DMINYAR_COMPILER_ARENA=1"), "compiler runtime: arena configuration missing")
+    test.check(has(command, root + "/runtime/minyar_runtime.c"), "compiler runtime: arena source missing")
+    test.check(!has(command, root + "/build/minyar-compiler-runtime.ll"), "compiler runtime: prebuilt runtime used")
+    print(NAMES[0] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[1]) {
+    let identities = coverage.toolchainIdentity(coverage.fakeRunner(root, "LLVM version 23.1.2\n", []), tools(), [])
+    test.check(identities.problem.kind == 0, "toolchain identity: " + identities.problem.message)
+    test.check(identity(identities, "clang").path == "chosen clang", "toolchain identity: clang path")
+    test.check(identity(identities, "opt").major == 23, "toolchain identity: opt major")
+    let mismatch = coverage.toolchainIdentity(coverage.fakeRunner(root, "LLVM version 23.0.0\n", ["chosen cov", "LLVM version 17.0.0\n"]), tools(), [])
+    raises(mismatch.problem, coverage.VALUE_ERROR, "matching LLVM", "toolchain mismatch")
+    print(NAMES[1] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[2]) {
+    for release in ["18.1.8", "22.1.8", "23.1.3", "24.0.0"] {
+        let runner = coverage.fakeRunner(root, "LLVM version " + release + "\n", [])
+        let found = coverage.toolchainIdentity(runner, [coverage.Tool { name: "clang"; path: "clang" }, coverage.Tool { name: "opt"; path: "opt" }], [])
+        raises(found.problem, coverage.VALUE_ERROR, "pinned LLVM 23.1.2", "release " + release)
+    }
+    print(NAMES[2] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[3]) {
+    for triple in ["arm64-apple-darwin25.0.0", "x86_64-unknown-linux-gnu"] {
+        let runner = coverage.fakeRunner(root, triple + "\n", [])
+        let found = coverage.instrumentCompilerIr(runner, "source.ll", "instrumented.ll", "selected clang", "selected opt", "before-inlining", [])
+        test.check(found.kind == 0, triple + ": " + found.message)
+        test.check(runner.commands.length >= 2, triple + ": opt was not run")
+        test.check(sameList(runner.commands[0], ["selected clang", "-dumpmachine"]), triple + ": target was not read from the selected Clang")
+        test.check(has(runner.commands[1], "--mtriple=" + triple), triple + ": opt did not use the selected target")
+        test.check(has(runner.commands[1], "-passes=sancov-module"), triple + ": opt did not run sancov-module")
+    }
+    print(NAMES[3] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[4]) {
+    for triple in ["", "\n", "unknown", "arm64 apple darwin", "arm64-apple-darwin\nx86_64-unknown-linux-gnu"] {
+        let runner = coverage.fakeRunner(root, triple, [])
+        let found = coverage.instrumentCompilerIr(runner, "source.ll", "instrumented.ll", "selected clang", "selected opt", "before-inlining", [])
+        raises(found, coverage.VALUE_ERROR, "target triple", "triple " + coverage.quoted(triple))
+        test.check(runner.commands.length == 1, "opt must not run without a valid target")
+    }
+    print(NAMES[4] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[5]) {
+    let exported = "{\"data\": [{\"files\": [" + summaryFile("/project/runtime/minyar_runtime.c", 10, 10, 2, 2) + ", " +
+        summaryFile("/project/runtime/minyar_numbers.h", 90, 0, 18, 0) + ", " +
+        summaryFile("/project/tests/runtime-unit.c", 200, 200, 50, 50) + ", " +
+        summaryFile("/project/runtime-neighbor/foreign.c", 200, 200, 50, 50) + "]}]}"
+    let found = coverage.aggregateRuntimeCoverage(Bytes(exported), "/project/runtime", root)
+    test.check(found.problem.kind == 0, "aggregation: " + found.problem.message)
+    let lines = metric(found, "lines")
+    test.check(sameList(lines.keys, ["count", "covered"]) && lines.values[0] == 100 && lines.values[1] == 10 && lines.measured && lines.percent == 10.0, "aggregation: line totals")
+    let branches = metric(found, "branches")
+    test.check(branches.measured && branches.percent == 10.0, "aggregation: branch percent")
+    test.check(found.mapped.length == 2, "aggregation: expected two runtime files, got " + Text(found.mapped.length))
+    print(NAMES[5] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[6]) {
+    let found = coverage.aggregateRuntimeCoverage(Bytes("{\"data\": [{\"files\": []}]}"), "/project/runtime", root)
+    raises(found.problem, coverage.VALUE_ERROR, "", "empty runtime mapping")
+    print(NAMES[6] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[7]) {
+    raises(coverage.percentage(0, 0).problem, coverage.VALUE_ERROR, "", "empty denominator")
+    print(NAMES[7] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[8]) {
+    let directory = test.scratch()
+    let first = directory + "/1.edges"
+    let second = directory + "/2.edges"
+    writeBytesFile(first, edgeProfile(3, [1, 0, 0]))
+    writeBytesFile(second, edgeProfile(3, [0, 1, 0]))
+    let merged = coverage.compilerEdgeCoverage(directory)
+    test.check(merged.problem.kind == 0 && merged.count == 3 && merged.covered == 2 && merged.percent == 66.67, "edge merge: " + Text(merged.count) + " " + Text(merged.covered) + " " + Text(merged.percent) + " " + merged.problem.message)
+    let broken = Bytes("broken")
+    let malformed = [broken, edgeProfile(0, []), edgeProfile(4, [1, 1, 0, 0]), edgeProfile(3, [1])]
+    for index in 0..malformed.length {
+        writeBytesFile(second, malformed[index])
+        raises(coverage.compilerEdgeCoverage(directory).problem, coverage.RUNTIME_ERROR, "", "malformed edge profile " + Text(index))
+    }
+    test.removeScratch(directory)
+    print(NAMES[8] + " ... ok")
+    ran += 1
+}
+
+if selected(NAMES[9]) {
+    for value in ["nan", "inf", "-inf", "-1", "101", "invalid", ""] {
+        let found = coverage.minimumCoverage(coverage.withSetting(system.environment(), "TEST_FLOOR", value), "TEST_FLOOR")
+        test.check(!found.valid, "threshold " + coverage.quoted(value) + " was accepted")
+    }
+    let accepted = coverage.minimumCoverage(coverage.withSetting(system.environment(), "TEST_FLOOR", "79.5"), "TEST_FLOOR")
+    test.check(accepted.valid && accepted.value == 79.5, "threshold 79.5 was not accepted exactly")
+    let absent = coverage.minimumCoverage([], "TEST_FLOOR")
+    test.check(absent.valid && absent.value == 0.0, "an unset threshold must default to 0")
+    print(NAMES[9] + " ... ok")
+    ran += 1
+}
+
+test.check(ran > 0, "no coverage harness test was selected")
+test.removeTree(scratch)
+print("coverage harness: " + Text(ran) + " tests passed")
