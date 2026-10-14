@@ -9,6 +9,12 @@
 #include <io.h>
 #include <fcntl.h>
 #endif
+#if defined(__APPLE__) && defined(__has_feature)
+#if __has_feature(address_sanitizer)
+const char *__asan_default_options(void);
+const char *__asan_default_options(void) { return "external_symbolizer_path=/usr/bin/atos"; }
+#endif
+#endif
 static void test_cwd(char *out, size_t capacity) {
 #ifdef _WIN32
     wchar_t wide[4096];
