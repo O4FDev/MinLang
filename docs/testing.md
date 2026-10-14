@@ -118,7 +118,7 @@ activation, the precise OOM diagnostic, and successful normal-return ownership
 drain. Fatal OOM is not required to unwind. The wrapper and its controls live
 entirely under `tests/`; production allocator code is unchanged. Results are in
 `build/allocation-faults.json`. Use `--mode native` or `--mode sanitize` with
-`python3 tests/allocation-faults.py` for a focused run.
+`./build/tooling/tests/allocation-faults` for a focused run.
 
 Both scopes also sweep live-payload byte budgets. The baseline records every
 allocation, moving replacement and free. An independent trace reconstruction

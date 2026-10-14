@@ -9,16 +9,16 @@ check-conformance`. Rejection wording is indexed separately by
 | --- | --- | --- |
 | Bindings, lexical blocks, assignment, and shadowing | `bindings-and-scope/program.min` | `tests/adversarial.min`, `tests/readonly-parameters.py` |
 | 64-bit arithmetic, comparisons, Boolean-only conditions, and evaluation | `numbers-and-comparisons/program.min` | `tests/errors/integer-too-large.min`, `tests/runtime/integer-overflow.min`, `tests/runtime/divide-by-zero.min`, `tests/adversarial.min` |
-| Unicode Text, Character, indexing, slicing, conversions, and joining | `text-and-lists/program.min` | `tests/regressions.py`, `tests/runtime/text-slice-out-of-bounds.min`, `tests/integer-text-cache.py` |
+| Unicode Text, Character, indexing, slicing, conversions, and joining | `text-and-lists/program.min` | `tests/regressions.min`, `tests/runtime/text-slice-out-of-bounds.min`, `tests/integer-text-cache.py` |
 | List literals, inference, aliases, append, replacement, and bounds | `text-and-lists/program.min` | `tests/runtime/lists.min`, `tests/runtime/list-out-of-bounds.min`, `tests/ownership.min` |
 | Automatic lifetime, aliases, recursive acyclic values, fresh-List recursive construction, and cycle rejection | `memory-lifetime/program.min` | `tests/recursive-data.py`, `tests/production-memory.min`, `tests/ownership-mutation.py` |
 | Required typed record fields, nested records, and field assignment | `records/program.min`, `loops-and-assignment/program.min` | `tests/errors/record-*.min`, `tests/scalar-record-storage.py` |
-| Float arithmetic, conversions, math functions, hex literals, and bitwise operators | `floats-and-bits/program.min` | `tests/regressions.py` |
-| Bytes storage, typed little-endian access, and binary files | `bytes/program.min` | `tests/regressions.py` |
+| Float arithmetic, conversions, math functions, hex literals, and bitwise operators | `floats-and-bits/program.min` | `tests/regressions.min` |
+| Bytes storage, typed little-endian access, and binary files | `bytes/program.min` | `tests/regressions.min` |
 | Field assignment that replaces containers mid-statement, aliases, and call-free index reads | `field-assignment-stress/program.min` | AddressSanitizer and all memory profiles |
 | for loops, break, continue, and compound assignment | `loops-and-assignment/program.min` | `tests/errors/record-field-assignment.min` |
-| Top-level order, functions, returns, branches, loops, and explicit main | `programs-and-entry-points/program.min`, `explicit-main/program.min` | `tests/errors/top-level-*.min`, `tests/errors/mixed-entry-points.min`, `tests/regressions.py` |
-| Arguments, file reads/writes, invalid UTF-8, and I/O failures | `explicit-main/program.min` | `tests/regressions.py` |
+| Top-level order, functions, returns, branches, loops, and explicit main | `programs-and-entry-points/program.min`, `explicit-main/program.min` | `tests/errors/top-level-*.min`, `tests/errors/mixed-entry-points.min`, `tests/regressions.min` |
+| Arguments, file reads/writes, invalid UTF-8, and I/O failures | `explicit-main/program.min` | `tests/regressions.min` |
 | Modules, visibility, identity, paths, packages, and import cycles | `tests/modules/` | `tests/run-module-tests.sh`, `tests/incremental-modules.min` |
 | Statement termination, continuations, comments, and literal lexing | `programs-and-entry-points/program.min` | `tests/errors/statements-on-one-line.min`, `tests/fuzz-regressions/`, `tests/diagnostics.py` |
 

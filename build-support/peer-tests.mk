@@ -103,7 +103,6 @@ build/tooling/tests/evidence-peer-reports: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/evidence-peer-reports: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/evidence-peer-reports: runtime/native/sha256.c build/testing/cycle-runtime.o
 check-evidence-harness: build/minyarc build/minyar-runtime.o build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay build/tooling/tests/evidence-peer-reports
-	python3 tests/evidence-harness.py
 	./build/tooling/tests/evidence-harness "$(CURDIR)/build/tooling/tests/evidence-harness" "$(CURDIR)/build/tooling/tests/evidence-replay"
 	$(LIMITED) ./build/tooling/tests/evidence-peer-reports "$(CURDIR)/build/tooling/tests/evidence-peer-reports"
 
