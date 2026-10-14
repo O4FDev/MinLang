@@ -92,10 +92,10 @@ check check-portable: check-json-parser
 check-sanitize: check-json-parser-sanitize
 
 .PHONY: check-module-performance
-build/tooling/tests/module-performance.ll build/tooling/tests/incremental-module-performance.ll: tests/performance-support.min experiments/memory/study-support.min experiments/memory/measurement-stats.min
-build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance: TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance: TOOL_NATIVE = tests/performance-resources.c
-build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance: build/testing/cycle-runtime.o tests/performance-resources.c
+build/tooling/tests/module-performance.ll build/tooling/tests/incremental-module-performance.ll build/tooling/tests/incremental-module-memory.ll: tests/performance-support.min experiments/memory/study-support.min experiments/memory/measurement-stats.min
+build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance build/tooling/tests/incremental-module-memory: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance build/tooling/tests/incremental-module-memory: TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/module-performance build/tooling/tests/incremental-module-performance build/tooling/tests/incremental-module-memory: build/testing/cycle-runtime.o tests/performance-resources.c
 check-module-performance: build/minyarc build/minyar-runtime.o build/tooling/tests/module-performance
 	$(LIMITED) ./build/tooling/tests/module-performance
 

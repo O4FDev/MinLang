@@ -1,0 +1,101 @@
+use "../tools/testing.min" as test
+use "./performance-support.min" as metrics
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+function method(): Text {
+    return "Record OS-reported peak RSS for separate compiler/cache-driver processes.\n\nThis is the maximum child RSS reported by an isolated resource-usage worker, not the sum\nof simultaneous parent/child RSS. Only the stated wide graph is measured.\n"
+}
+function worker(): Integer {
+    let command: List<Text> = []
+    for index in 2..argumentCount() { command.add(argument(index)) }
+    let result = metrics.capture(command, argument(1))
+    let usage = metrics.usage(); test.check(usage.error == 0, "child resource usage unavailable")
+    print(json.pretty(data.object(["status", "stderr", "rss"], [data.integer(result.status), data.text(result.errorOutput), data.integer(usage.maximumRss)]), ""))
+    return 0
+}
+function selfPath(root: Text, work: Text): Text {
+    let resolved = metrics.capture(["/usr/bin/readlink", "/proc/" + Text(system.processId()) + "/exe"], work + "/self")
+    if resolved.status == 0 && test.lines(resolved.output).length > 0 { return test.lines(resolved.output)[0] }
+    return root + "/build/tooling/tests/incremental-module-memory"
+}
+function main(): Integer {
+    if argumentCount() >= 3 && argument(0) == "--worker" { return worker() }
+    if argumentCount() == 1 && (argument(0) == "--help" || argument(0) == "-h") {
+        print("incremental-module-memory [--modules N] [--compiler PATH] [--output PATH]")
+        return 0
+    }
+    let work = test.scratch()
+    let rootResult = metrics.capture(["/bin/pwd", "-P"], work + "/root"); test.require(rootResult, "incremental memory root")
+    let root = test.lines(rootResult.output)[0]
+    let modules = 400; let compiler = root + "/build/minyarc-modules"; let output = root + "/build/incremental-module-memory.json"
+    let index = 0
+    while index < argumentCount() {
+        let name = argument(index); let value = ""; let position = -1; let raw = Bytes(name)
+        for offset in 0..raw.length { if raw[offset] == 61 { position = offset; break } }
+        if position >= 0 { value = Text(raw.slice(position + 1, raw.length)); name = Text(raw.slice(0, position)) }
+        else { index += 1; test.check(index < argumentCount(), "option requires value: " + name); value = argument(index) }
+        if name == "--modules" { modules = Integer(value) }
+        else if name == "--compiler" { compiler = value }
+        else if name == "--output" { output = value }
+        else { fail("unknown incremental memory option " + name) }
+        index += 1
+    }
+    test.check(modules >= 1, "positive module count required")
+    let kernel = metrics.capture(["/usr/bin/uname", "-s"], work + "/kernel"); test.require(kernel, "platform name")
+    let platformName = test.lines(kernel.output)[0]
+    test.check(platformName == "Darwin" || platformName == "Linux", "requires POSIX resource usage on macOS or Linux")
+    let darwin = platformName == "Darwin"
+    let platform = metrics.capture(["/usr/bin/uname", "-a"], work + "/platform"); test.require(platform, "platform description")
+    let artifacts = data.object([], []); let rows: List<json.Value> = []
+    let report = data.object(["platform", "method", "modules", "shape", "artifacts", "rows"], [data.text(test.lines(platform.output)[0]), data.text(method()), data.integer(modules), data.text("wide"), artifacts, data.array(rows)])
+    let labels = ["driver", "compiler", "production"]; let sources = [root + "/build/minyar-module-build", compiler, root + "/build/minyarc"]
+    for position in 0..labels.length {
+        data.set(artifacts, labels[position], json.member(metrics.fileIdentity(sources[position], work + "/identity-" + labels[position], darwin), "sha256"))
+        test.require(metrics.capture(["/bin/cp", "-p", sources[position], work + "/" + labels[position]], work + "/copy-" + labels[position]), "freeze " + labels[position])
+    }
+    let entry = metrics.generate(work + "/graph", "wide", modules, 4, 12).entry
+    let original = readTextFile(entry); let library = data.parent(entry) + "/m0.min"; let libOriginal = readTextFile(library)
+    let cache = work + "/cache"; let stats = work + "/stats"
+    let production = [work + "/production", entry, work + "/base.ll"]
+    let driver = [work + "/driver", work + "/compiler", entry, work + "/cached.ll", cache, stats]
+    let initial = metrics.timed(driver, work + "/initial", 30); test.check(initial.ok, initial.error)
+    let file = ""
+    for name in files.list(cache) { if file == "" && data.ends(name, ".cache") { file = cache + "/" + name } }
+    test.check(file != "", "driver produced a baseline cache")
+    let baseline = readBytesFile(file)
+    let executable = selfPath(root, work); let serial = 0
+    let divisor = 1024.0; if darwin { divisor = 1048576.0 }
+    for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit", "cold"] {
+        writeTextFile(entry, original); writeTextFile(library, libOriginal)
+        if scenario == "entry-edit" { writeTextFile(entry, test.replace(original, "    print(", "    let changed = 1\n    print(")) }
+        if scenario == "dependency-edit" { writeTextFile(library, metrics.replaceFirst(libOriginal, "result = result + 1", "result = result + 2")) }
+        if scenario == "interface-edit" { writeTextFile(library, libOriginal + "\npublic record Added { value: Integer }\n") }
+        let peak = data.object([], [])
+        for label in ["production", "driver"] {
+            let command = production; if label == "driver" { command = driver }
+            if scenario == "cold" { metrics.clear(file) } else { writeBytesFile(file, baseline) }
+            metrics.clear(file + ".delta")
+            serial += 1
+            let invocation = [executable, "--worker", work + "/measured" + Text(serial)]
+            for item in command { invocation.add(item) }
+            let result = test.run(invocation, system.environment(), "", work + "/worker" + Text(serial), 30)
+            test.require(result, "isolated resource-usage worker")
+            let measured = json.parse(result.output)
+            test.check(data.number(measured, "status") == 0, label + " " + scenario + " failed: " + json.string(measured, "stderr"))
+            data.set(peak, label, data.decimal(Float(data.number(measured, "rss")) / divisor))
+        }
+        let cacheBytes = 0; let deltaBytes = 0
+        for name in files.list(cache) {
+            if test.contains(name, ".cache") { cacheBytes += files.pathSize(cache + "/" + name) }
+            if data.ends(name, ".delta") { deltaBytes += files.pathSize(cache + "/" + name) }
+        }
+        rows.add(data.object(["scenario", "peak_rss_mib", "cache_bytes", "delta_bytes", "counters"], [data.text(scenario), peak, data.integer(cacheBytes), data.integer(deltaBytes), data.text(readTextFile(stats).trim())]))
+    }
+    files.makeDirectory(data.parent(output))
+    writeTextFile(output, json.pretty(report, "") + "\n")
+    print(json.pretty(data.array(rows), ""))
+    test.removeTree(work)
+    return 0
+}
