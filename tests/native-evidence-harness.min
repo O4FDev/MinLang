@@ -1,0 +1,105 @@
+use "../tools/testing.min" as test
+use "./native-evidence.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Child { result: test.Result; base: Text }
+
+function executable(path: Text, source: Text) {
+    writeTextFile(path, source)
+    test.require(test.run(["/bin/chmod", "755", path], system.environment(), "", path + ".chmod", 10), "chmod " + path)
+}
+function environment(overrides: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() {
+        let keep = true
+        for item in overrides {
+            let raw = Bytes(item)
+            let name = item
+            for index in 0..raw.length { if raw[index] == 61 { name = Text(raw.slice(0, index)); break } }
+            if test.contains(entry, "=") && Bytes(entry).length > Bytes(name).length && Text(Bytes(entry).slice(0, Bytes(name).length + 1)) == name + "=" { keep = false }
+        }
+        if keep { result.add(entry) }
+    }
+    for item in overrides { result.add(item) }
+    return result
+}
+function child(self: Text, scratch: Text, label: Text, mode: Text, arguments: List<Text>, overrides: List<Text>): Child {
+    let base = scratch + "/" + label + "-evidence"
+    test.check(files.makeDirectory(base) == 0, "cannot create child evidence base")
+    let command = [self, mode]
+    for item in arguments { command.add(item) }
+    let settings = [ "MINYAR_TEST_EVIDENCE=" + base ]
+    for item in overrides { settings.add(item) }
+    let result = test.run(command, environment(settings), "", scratch + "/" + label + ".log", 300)
+    return Child { result: result; base: base }
+}
+function failedManifests(base: Text): Integer {
+    let count = 0
+    for name in files.list(base) {
+        let manifest = base + "/" + name + "/evidence.json"
+        if test.contains(name, "regression") && files.pathSize(manifest) >= 0 {
+            let report = json.parse(readTextFile(manifest))
+            if json.string(report, "status") == "failed" { count += 1 }
+        }
+    }
+    return count
+}
+function fileProgram(destination: Text, contents: Text) {
+    let context = evidence.context("regression", "FileProgram.runTest", "tests/native-evidence-harness.min")
+    evidence.executes(context, "writeTextFile(argument(0), \"" + contents + "\")\nprint(\"done\")\n", "done\n", 0, "", [destination],
+        [evidence.FileOutput { path: destination; contents: Bytes("fresh") }])
+    evidence.close(context, false)
+}
+function strayProgram() {
+    let context = evidence.context("regression", "StrayStderr.runTest", "tests/native-evidence-harness.min")
+    evidence.executes(context, "print(42)\n", "42\n", 0, "", [], [])
+    evidence.close(context, false)
+}
+
+function fileOutputsRequireFreshExactBytesForEveryOptimization(self: Text, scratch: Text, clang: Text) {
+    let destination = scratch + "/result.bin"
+    let fresh = child(self, scratch, "fresh", "--file-program", [destination, "fresh"], [])
+    test.check(fresh.result.status == 0, "fresh file outputs failed\n" + fresh.result.output + fresh.result.errorOutput)
+    test.check(Text(readBytesFile(destination)) == "fresh", "fresh file output bytes")
+    let log = scratch + "/mutations.log"
+    let wrapper = scratch + "/omit-second-write"
+    executable(wrapper, "#!/bin/sh\nset -e\nmutate=0\nfor item do if [ \"$item\" = -O2 ]; then mutate=1; fi; done\nfor item do\n  shift\n  case \"$item\" in\n    *.ll) if [ \"$mutate\" = 1 ]; then grep -c 'call void @minyar_write_text_file(' \"$item\" >> \"$MINYAR_HARNESS_LOG\" || :; grep -v 'call void @minyar_write_text_file(' \"$item\" > \"$item.mutated.ll\" || :; item=\"$item.mutated.ll\"; fi;;\n  esac\n  set -- \"$@\" \"$item\"\ndone\nexec \"$MINYAR_HARNESS_CLANG\" \"$@\"\n")
+    let missing = child(self, scratch, "missing", "--file-program", [destination, "fresh"],
+        ["MINYAR_TEST_CLANG=" + wrapper, "MINYAR_HARNESS_CLANG=" + clang, "MINYAR_HARNESS_LOG=" + log])
+    test.check(files.pathSize(log) >= 0 && test.lines(readTextFile(log)).length == 1 && test.lines(readTextFile(log))[0] == "1", "exactly one O2 file write must be removed")
+    test.check(missing.result.status != 0, "missing O2 file output passed")
+    test.check(test.contains(missing.result.errorOutput, "native program file bytes differ"), "missing file output was not a file-output failure\n" + missing.result.errorOutput)
+    test.check(failedManifests(missing.base) == 1, "missing file output did not retain failed evidence")
+    let wrong = child(self, scratch, "wrong", "--file-program", [destination, "wrong"], [])
+    test.check(wrong.result.status != 0, "wrong file bytes passed")
+    test.check(test.contains(wrong.result.errorOutput, "native program file bytes differ"), "wrong file bytes were not a file-output failure\n" + wrong.result.errorOutput)
+    test.check(Text(readBytesFile(destination)) == "wrong", "wrong-byte program did not run")
+}
+
+function correctStdoutWithUnexpectedStderrIsRejectedAndRetained(self: Text, scratch: Text) {
+    let wrapper = scratch + "/stray-stderr-link"
+    executable(wrapper, "#!/bin/sh\nout=\nprevious=\nfor item do\n  if [ \"$previous\" = -o ]; then out=$item; fi\n  previous=$item\ndone\nprintf '#!/bin/sh\\nprintf \"42\\\\n\"\\nprintf \"unexpected\\\\n\" >&2\\n' > \"$out\"\nchmod 755 \"$out\"\n")
+    let stray = child(self, scratch, "stray", "--stray-program", [], ["MINYAR_TEST_CLANG=" + wrapper])
+    test.check(stray.result.status != 0, "unexpected stderr passed")
+    test.check(test.contains(stray.result.errorOutput, "native output/status/stderr differs"), "unexpected stderr was not an output failure\n" + stray.result.errorOutput)
+    test.check(failedManifests(stray.base) == 1, "unexpected stderr did not retain exactly one failed manifest")
+}
+
+test.check(argumentCount() >= 1, "usage: native-evidence-harness SELF | --file-program PATH CONTENTS | --stray-program")
+let mode = argument(0)
+if mode == "--file-program" {
+    test.check(argumentCount() == 3, "usage: --file-program PATH CONTENTS")
+    fileProgram(argument(1), argument(2))
+} else if mode == "--stray-program" {
+    strayProgram()
+} else {
+    test.check(argumentCount() == 1, "usage: native-evidence-harness SELF")
+    let scratch = test.scratch()
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    fileOutputsRequireFreshExactBytesForEveryOptimization(mode, scratch, clang)
+    correctStdoutWithUnexpectedStderrIsRejectedAndRetained(mode, scratch)
+    test.removeTree(scratch)
+    print("native evidence harness: 2 cases passed")
+}

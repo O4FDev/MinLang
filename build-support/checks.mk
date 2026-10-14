@@ -55,10 +55,11 @@ build/tooling/experiments/memory/critical-path-study: build/testing/cycle-runtim
 check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
 	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
 
-build/tooling/tests/regressions: TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/regressions: build/testing/cycle-runtime.o
-check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions
+build/tooling/tests/regressions build/tooling/tests/native-evidence-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/regressions build/tooling/tests/native-evidence-harness: build/testing/cycle-runtime.o
+check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions build/tooling/tests/native-evidence-harness
 	$(LIMITED) ./build/tooling/tests/regressions
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/native-evidence-harness "$(CURDIR)/build/tooling/tests/native-evidence-harness"
 
 check-diagnostics: build/minyarc build/tooling/tests/diagnostics
 	$(LIMITED) ./build/tooling/tests/diagnostics
