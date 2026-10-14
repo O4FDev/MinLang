@@ -68,10 +68,12 @@ static int intercepted_closedir(DIR *d) {
     if (directory_mode == 3) { errno = EACCES; return -1; }
     return rc;
 }
+#ifndef __APPLE__
 static int intercepted_datasync(int fd) {
     if (atomic_load(&sync_failure)) { errno = EIO; return -1; }
     return fdatasync(fd);
 }
+#endif
 static ssize_t intercepted_pwrite(int fd, const void *data, size_t count, off_t position) {
     if (positioned_io) { positioned_calls++; return count ? 1 : 0; }
     return pwrite(fd, data, count, position);
@@ -88,7 +90,9 @@ static ssize_t intercepted_pread(int fd, void *data, size_t count, off_t positio
 #define pthread_create intercepted_create
 #define readdir intercepted_readdir
 #define closedir intercepted_closedir
+#ifndef __APPLE__
 #define fdatasync intercepted_datasync
+#endif
 #define pwrite intercepted_pwrite
 #define pread intercepted_pread
 #define FILES_MAX_SYNCERS 32
@@ -263,7 +267,6 @@ static void child_descriptors(const char *executable) {
     assert(!minyar_files_syncerStop(h));
 }
 int main(int argc, char **argv) {
-    (void)intercepted_datasync; /* Darwin uses the strong fcntl branch. */
     assert(argc >= 2); const char *mode = argv[1];
     if (!strcmp(mode, "names")) names();
     else if (!strcmp(mode, "listing")) listing(argc > 2 ? atoi(argv[2]) : 0);
