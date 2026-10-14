@@ -7,8 +7,7 @@ use "json" as json
 public record Evidence { enabled: Boolean; directory: Text; root: Text; records: List<Text>; errors: List<Text>; inputs: List<Text>; digests: List<Text>; serial: Integer }
 
 function hashed(evidence: Evidence, path: Text, operation: Text): Text {
-    let scratch = evidence.root + "/build"
-    let log = scratch + "/.net-evidence-" + Text(system.processId())
+    let log = evidence.directory + "/.net-evidence-" + Text(system.processId())
     let result = test.run(["sha256sum", "--", path], system.environment(), "", log, 30)
     files.remove(log)
     files.remove(log + ".err")
@@ -31,16 +30,18 @@ public function create(root: Text, requested: Text, work: Text, sources: List<Te
         test.require(test.run(["mkdir", "-p", directory], system.environment(), "", work + "/mkdir-evidence", 10), "create evidence directory")
         test.check(files.list(directory).length == 0, "network evidence directory must be empty")
     }
-    let evidence = Evidence { enabled: enabled; directory: directory; root: root; records: []; errors: []; inputs: []; digests: []; serial: 0 }
-    if enabled {
-        let headers = test.run(["find", root + "/runtime", "-name", "*.h", "-type", "f"], system.environment(), "", work + "/headers", 30)
-        test.require(headers, "list runtime headers")
-        let names = sources
-        for line in test.lines(headers.output) { names.add(Text(Bytes(line).slice(root.byteLength + 1, line.byteLength))) }
-        for name in names {
-            evidence.inputs.add(name)
-            evidence.digests.add(hashed(evidence, root + "/" + name, "input hash: " + name))
-        }
+    if !enabled { return Evidence { enabled: false; directory: directory; root: root; records: []; errors: []; inputs: []; digests: []; serial: 0 } }
+    let headers = test.run(["find", root + "/runtime", "-name", "*.h", "-type", "f"], system.environment(), "", work + "/headers", 30)
+    test.require(headers, "list runtime headers")
+    let names = sources
+    for line in test.lines(headers.output) { names.add(Text(Bytes(line).slice(root.byteLength + 1, line.byteLength))) }
+    return bound(root, directory, names)
+}
+public function bound(root: Text, directory: Text, names: List<Text>): Evidence {
+    let evidence = Evidence { enabled: true; directory: directory; root: root; records: []; errors: []; inputs: []; digests: []; serial: 0 }
+    for name in names {
+        evidence.inputs.add(name)
+        evidence.digests.add(hashed(evidence, root + "/" + name, "input hash: " + name))
     }
     return evidence
 }
@@ -88,7 +89,7 @@ public function run(evidence: Evidence, command: List<Text>, phase: Text, enviro
     let result = test.run(command, environment, cwd, log, seconds)
     let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
     let failure = ""
-    let row = ["{\"argv\": [", fixtures.joinWords(argv), "], \"phase\": ", json.quote(phase), ", \"cwd\": ", json.quote(directory),
+    let row = ["{\"argv\": [", joinWithComma(argv), "], \"phase\": ", json.quote(phase), ", \"cwd\": ", json.quote(directory),
         ", \"tool\": ", quoteOrNull(tool), ", \"tool_sha256\": ", quoteOrNull(toolDigest), ", \"environment\": {", joinWithComma(selected), "}"]
     if result.status == 124 {
         failure = "TimeoutExpired: " + command[0]
@@ -107,7 +108,11 @@ public function run(evidence: Evidence, command: List<Text>, phase: Text, enviro
         let source = log
         if stream == "stderr" { data = result.errorOutput; source = log + ".err" }
         let path = evidence.directory + "/" + prefix + "." + stream
-        if files.rename(source, path) != 0 { evidence.errors.add("{\"operation\": " + json.quote(stream + " write") + ", \"error\": \"rename failed\"}") }
+        let moved = files.rename(source, path)
+        if moved != 0 {
+            evidence.errors.add("{\"operation\": " + json.quote(stream + " write") + ", \"error\": " + json.quote("cannot publish " + prefix + "." + stream + ": " + files.errorText(moved)) + "}")
+            files.remove(source)
+        }
         row.add(", " + json.quote(stream) + ": {\"path\": " + json.quote(prefix + "." + stream) + ", \"sha256\": " + quoteOrNull(hashed(evidence, path, stream + " hash")) + ", \"bytes\": " + Text(data.byteLength) + "}")
     }
     if tool != "" {
@@ -130,10 +135,21 @@ public function joinWithComma(items: List<Text>): Text {
     return joinText(parts)
 }
 public function finish(evidence: Evidence, modes: List<Text>, status: Text, primary: Text) {
-    if !evidence.enabled {
-        test.check(primary == "", primary)
-        return
-    }
+    let failure = primary
+    if evidence.enabled { failure = finalize(evidence, modes, status, primary) }
+    test.check(failure == "", failure)
+}
+function publish(path: Text, text: Text): Text {
+    let file = files.open(path, files.WRITE + files.CREATE + files.TRUNCATE)
+    if file < 0 { return files.errorText(file) }
+    let data = Bytes(text)
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written < 0 { return files.errorText(written) }
+    if closed < 0 { return files.errorText(closed) }
+    return ""
+}
+public function finalize(evidence: Evidence, modes: List<Text>, status: Text, primary: Text): Text {
     let inputs: List<Text> = []
     let after: List<Text> = []
     for index in 0..evidence.inputs.length {
@@ -163,10 +179,53 @@ public function finish(evidence: Evidence, modes: List<Text>, status: Text, prim
         ",\n  \"windows_sanitizer_enabled_by_suite\": false,\n  \"inputs\": {", joinWithComma(inputs), "},\n  \"inputs_after\": {", joinWithComma(after),
         "},\n  \"commands\": [", joinWithComma(evidence.records), "],\n  \"files\": {", joinWithComma(listed), "},\n  \"primary_error\": ", quoteOrNull(primary),
         ",\n  \"evidence_errors\": [", joinWithComma(evidence.errors), "]\n}\n"]
-    writeTextFile(evidence.directory + "/manifest.json", joinText(report))
+    let written = publish(evidence.directory + "/manifest.json", joinText(report))
+    if written != "" { evidence.errors.add("{\"operation\": \"manifest write\", \"error\": " + json.quote(written) + "}") }
     if evidence.errors.length > 0 {
         system.writeStandardError("Network evidence finalization errors: [" + joinWithComma(evidence.errors) + "]\n")
-        test.check(primary != "", "network evidence finalization failed")
+        if primary == "" { return "network evidence finalization failed" }
     }
-    test.check(primary == "", primary)
+    return primary
+}
+public function quotedList(items: List<Text>): Text {
+    let quoted: List<Text> = []
+    for item in items { quoted.add(json.quote(item)) }
+    return "[" + joinWithComma(quoted) + "]"
+}
+function scenario(name: Text, evidence: Evidence, fields: Text) {
+    fixtures.emit("{\"scenario\": " + json.quote(name) + ", \"directory\": " + json.quote(evidence.directory) + fields + ", \"records\": [" + joinWithComma(evidence.records) + "], \"errors\": [" + joinWithComma(evidence.errors) + "]}\n")
+}
+function controlDirectory(parent: Text, name: Text): Text {
+    let directory = parent + "/" + name
+    test.check(files.makeDirectory(directory) == 0 && files.list(directory).length == 0, "create empty evidence control " + name)
+    return directory
+}
+public function controls(parent: Text) {
+    let stream = controlDirectory(parent, "stream")
+    let streamEvidence = bound(stream, stream, [])
+    test.check(files.makeDirectory(stream + "/01-provider.stdout") == 0, "obstruct provider stdout")
+    let provider = run(streamEvidence, ["/bin/sh", "-c", "printf 'provider stdout'; printf 'provider stderr' >&2; exit 37"], "provider", system.environment(), "", 30, true, true)
+    test.check(files.makeDirectory(stream + "/manifest.json") == 0, "obstruct manifest")
+    let finalized = finalize(streamEvidence, ["native"], "failed", provider.failure)
+    scenario("stream", streamEvidence, ", \"status\": " + Text(provider.status) + ", \"failure\": " + json.quote(provider.failure) + ", \"finalized\": " + json.quote(finalized) +
+        ", \"stderr\": " + json.quote(Text(files.readFile(stream + "/01-provider.stderr"))))
+    let binding = controlDirectory(parent, "binding")
+    let tool = binding + "/owned-tool"
+    writeTextFile(tool, "#!/bin/sh\nprintf changed > \"$0\"\n")
+    test.require(test.run(["chmod", "755", tool], system.environment(), "", parent + "/chmod", 10), "make owned tool executable")
+    let bindingEvidence = bound(binding, binding, [])
+    let mutated = run(bindingEvidence, [tool], "binding", system.environment(), "", 30, true, true)
+    scenario("binding", bindingEvidence, ", \"status\": " + Text(mutated.status) + ", \"failure\": " + json.quote(mutated.failure))
+    let inputs = controlDirectory(parent, "inputs")
+    writeTextFile(inputs + "/owned-source", "original")
+    let inputEvidence = bound(inputs, inputs, ["owned-source"])
+    writeTextFile(inputs + "/owned-source", "changed")
+    scenario("inputs", inputEvidence, ", \"finalized\": " + json.quote(finalize(inputEvidence, ["native"], "passed", "")))
+    let index = 0
+    for modes in [["native"], ["native", "sanitize"], ["sanitize"]] {
+        let directory = controlDirectory(parent, "scope-" + Text(index))
+        let scoped = bound(directory, directory, [])
+        scenario("scope", scoped, ", \"modes\": " + quotedList(modes) + ", \"finalized\": " + json.quote(finalize(scoped, modes, "passed", "")))
+        index += 1
+    }
 }

@@ -1,6 +1,18 @@
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
 .PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize
+NET_FIXTURE_TOOLS = http-package-test http-bounded-test httpserver-test httpserver-front-test net-native-test net-loop-test \
+    net-udp-offload-test os-tlsverify-test peer-auth-mutants-test peer-auth-device-test peer-auth-test peer-wire-flow-test \
+    peer-live-redis-test peer-live-test peer-wire-test redis-pipeline-test redis-protocol-test securecrypto-test \
+    tls-handshake-validity-test tls-keyshare-test tls-signing-usage-test tls-local-test tls-resumption-expiry-test \
+    yamux-churn-test tls-server-test transport-cancel-test tls-validity-test transport-go-test
+$(NET_FIXTURE_TOOLS:%=build/tooling/tests/%.ll): tests/net-fixtures.min
+build/tooling/tests/net-loop-test.ll build/tooling/tests/net-native-test.ll: tests/net-evidence.min
+build/tooling/tests/httpserver-test.ll build/tooling/tests/httpserver-front-test.ll build/tooling/benchmarks/httpserver/compare.ll: tests/net-wire.min tests/net-fixtures.min
+build/tooling/tests/httpserver-front-test.ll build/tooling/benchmarks/httpserver/compare.ll: benchmarks/httpserver/front-oracle.min
+build/tooling/tests/http-package-test.ll build/tooling/tests/peer-live-redis-test.ll: tests/net-redis.min
+build/tooling/tests/peer-auth-test.ll build/tooling/tests/peer-wire-flow-test.ll: tests/peer-grants.min
+build/tooling/tests/peer-wire-test.ll build/tooling/tests/redis-protocol-test.ll build/tooling/tests/tls-validity-test.ll: tests/cpython-random.min
 check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
 

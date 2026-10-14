@@ -69,6 +69,50 @@ def native_catalogue():
     return types.SimpleNamespace(validate=validate, discover=discover)
 
 
+def network_tool(name):
+    return ROOT / 'build/tooling/tests' / name
+
+
+def mode_probe(tool, host, arguments):
+    with tempfile.TemporaryDirectory(prefix='network mode probe ') as folder:
+        uname = Path(folder) / 'uname'
+        uname.write_text('#!/bin/sh\nprintf "%s\\n" "' + host + '"\n')
+        uname.chmod(0o755)
+        environment = dict(os.environ, PATH=folder + os.pathsep + os.environ['PATH'])
+        return subprocess.run([str(tool), '--print-modes', *arguments], cwd=ROOT, env=environment,
+                              capture_output=True, text=True, timeout=60)
+
+
+def mode_stub(directory, table):
+    path = Path(directory) / 'mode-mutant'
+    path.write_text('#!' + sys.executable + '\n'
+        'import json,subprocess,sys\n'
+        'host=subprocess.run(["uname","-s"],capture_output=True,text=True).stdout.strip()\n'
+        'windows=host.startswith(("MSYS","MINGW","CYGWIN","Windows"))\n'
+        'mode=sys.argv[sys.argv.index("--mode")+1] if "--mode" in sys.argv else None\n'
+        'if windows and mode=="sanitize":\n'
+        ' print("error: sanitizer mode is unavailable on Windows",file=sys.stderr);sys.exit(2)\n'
+        'print(json.dumps(' + repr({repr(key): value for key, value in table.items()}) + '[repr((windows,mode))]))\n')
+    path.chmod(0o755)
+    return path
+
+
+def make_rules(fragment):
+    with tempfile.TemporaryDirectory(prefix='make rule probe ') as folder:
+        probe = Path(folder) / 'probe.mk'
+        probe.write_text(fragment + '\n.PHONY: probe\nprobe:\n')
+        environment = dict(os.environ)
+        environment.pop('MAKEFLAGS', None)
+        result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'probe'], cwd=ROOT, env=environment,
+                                capture_output=True, text=True, timeout=15)
+    rules = {}
+    for line in result.stdout.splitlines():
+        match = re.match(r'^([\w./-]+):(?: *)([^#=]*)$', line)
+        if match:
+            rules.setdefault(match[1], set()).update(match[2].split())
+    return rules
+
+
 def assert_ci_runs_quic_group(test, *targets):
     """CI gates these targets through the runner's QUIC group, run by a linux-matrix shard."""
     quic = minyar_list('scripts/linux-plan.min', 'quic')
@@ -116,11 +160,6 @@ class BuildWiring(unittest.TestCase):
 
 
     def test_event_loop_native_and_sanitizer_keep_distinct_limits(self):
-        import argparse
-        import contextlib
-        import importlib.util
-        import io
-        import json
         fragment = (ROOT/'build-support/networking.mk').read_text()
         def verify(candidate, host='Linux', operating_system=''):
             with tempfile.TemporaryDirectory(prefix='loop limits Make rules ') as folder:
@@ -166,139 +205,79 @@ class BuildWiring(unittest.TestCase):
             mutant=fragment.replace(old,new,1);self.assertNotEqual(mutant,fragment)
             with self.assertRaises((AssertionError,StopIteration)):verify(mutant)
 
-        spec=importlib.util.spec_from_file_location('loop_mode_contract',ROOT/'tests/net-loop.py')
-        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
-        definition=next(n for n in ast.parse((ROOT/'tests/net-loop.py').read_text()).body
-                        if isinstance(n,ast.FunctionDef) and n.name=='selected_modes')
-        source=ast.get_source_segment((ROOT/'tests/net-loop.py').read_text(),definition)
-        def verify_modes(candidate):
+        def verify_modes(tool):
             for windows,mode,expected in (
                     (False,None,['native','sanitize','app-native','app-sanitize']),
                     (False,'native',['native','app-native']),
                     (False,'sanitize',['sanitize','app-sanitize']),
                     (True,None,['native']),(True,'native',['native'])):
-                scope={'WINDOWS':windows};exec(candidate,scope)
-                self.assertEqual(scope['selected_modes'](argparse.ArgumentParser(),mode),expected)
-            scope={'WINDOWS':True};exec(candidate,scope)
-            with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as error:
-                scope['selected_modes'](argparse.ArgumentParser(),'sanitize')
-            self.assertEqual(error.exception.code,2)
-        verify_modes(source)
-        for old,new in (("['native', 'app-native']","['native']"),
-                        ("['sanitize', 'app-sanitize']","['sanitize']"),
-                        ("['native', 'sanitize', 'app-native', 'app-sanitize']",
-                         "['native', 'app-native', 'sanitize', 'app-sanitize']")):
-            mutant=source.replace(old,new,1);self.assertNotEqual(mutant,source)
-            with self.assertRaises(AssertionError):verify_modes(mutant)
+                result=mode_probe(tool,'MSYS_NT-10.0' if windows else 'Linux',['--mode',mode] if mode else [])
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(json.loads(result.stdout),expected)
+            result=mode_probe(tool,'MSYS_NT-10.0',['--mode','sanitize'])
+            self.assertEqual(result.returncode,2)
+        verify_modes(network_tool('net-loop-test'))
+        table={(False,None):['native','sanitize','app-native','app-sanitize'],
+               (False,'native'):['native','app-native'],(False,'sanitize'):['sanitize','app-sanitize'],
+               (True,None):['native'],(True,'native'):['native']}
+        with tempfile.TemporaryDirectory(prefix='loop mode mutants ') as folder:
+            for key,value in (((False,'native'),['native']),((False,'sanitize'),['sanitize']),
+                              ((False,None),['native','app-native','sanitize','app-sanitize'])):
+                mutant=dict(table);mutant[key]=value
+                with self.assertRaises(AssertionError):verify_modes(mode_stub(folder,mutant))
         def verify_inputs(candidate):
-            main=next(n for n in ast.parse(candidate).body
-                      if isinstance(n,ast.FunctionDef) and n.name=='main')
-            sources=next(n.value for n in ast.walk(main) if isinstance(n,ast.Assign)
-                         and any(isinstance(target,ast.Name) and target.id=='sources'
-                                 for target in n.targets))
-            bound={n.right.value for n in sources.elts if isinstance(n,ast.BinOp)
-                   and isinstance(n.left,ast.Name) and n.left.id=='ROOT'
-                   and isinstance(n.right,ast.Constant)}
-            self.assertIn('tests/network_evidence.py',bound)
+            start=candidate.index('evidence.create(')
+            listing=candidate[candidate.index('[',start):candidate.index(']',start)+1]
+            bound=set(re.findall(r'"([^"]+)"',listing))
+            self.assertIn('tests/net-evidence.min',bound)
             self.assertIn('runtime/native/net.c',bound)
-        loop_source=(ROOT/'tests/net-loop.py').read_text()
+        loop_source=(ROOT/'tests/net-loop-test.min').read_text()
         verify_inputs(loop_source)
-        for name in ('tests/network_evidence.py','runtime/native/net.c'):
-            old="ROOT/"+repr(name)+","
-            mutant=loop_source.replace(old,'',1);self.assertNotEqual(mutant,loop_source)
+        for name in ('tests/net-evidence.min','runtime/native/net.c'):
+            mutant=loop_source.replace('"'+name+'", ','',1);self.assertNotEqual(mutant,loop_source)
             with self.assertRaises(AssertionError):verify_inputs(mutant)
-        catalogue=native_catalogue()
-        data=json.loads((ROOT/'tests/suite-catalogue.json').read_text());catalogue.validate(data,ROOT)
-        helper=next(row for row in data['sources'] if row['path']=='tests/network_evidence.py')
-        self.assertEqual(helper['role'],'support')
-        self.assertEqual(set(helper['consumers']),{'tests/net-native.py','tests/net-loop.py'})
-        with self.assertRaises(ValueError):
-            catalogue.validate(dict(data,sources=[row for row in data['sources']
-                if row['path']!='tests/network_evidence.py']),ROOT)
+        def verify_helper(candidate):
+            rules=make_rules(candidate)
+            for tool in ('net-loop-test','net-native-test'):
+                self.assertIn('tests/net-evidence.min',rules.get('build/tooling/tests/'+tool+'.ll',set()))
+        verify_helper(fragment)
+        dependency=next(line for line in fragment.splitlines()
+                        if line.startswith('build/tooling/') and line.endswith(': tests/net-evidence.min'))
+        with self.assertRaises(AssertionError):verify_helper(fragment.replace(dependency,'',1))
 
     def test_network_evidence_preserves_primary_and_finalizes_independently(self):
-        import contextlib
-        import importlib.util
-        import io
-        import json
-        from unittest.mock import patch
-        spec = importlib.util.spec_from_file_location(
-            'network_evidence_contract', ROOT/'tests/net-native.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
-        real_write_bytes = Path.write_bytes
-        real_write_text = Path.write_text
         with tempfile.TemporaryDirectory(prefix='network evidence controls ') as folder:
-            directory = Path(folder)
-            records, errors = [], []
-            attempted = []
-            def one_shot_stream(path, data):
-                attempted.append(path.name)
-                if path.name.endswith('.stdout') and attempted.count(path.name) == 1:
-                    raise OSError('sentinel stream write failure')
-                return real_write_bytes(path, data)
-            provider = subprocess.CompletedProcess([sys.executable], 37,
-                                                   b'provider stdout', b'provider stderr')
-            with patch.object(driver.subprocess, 'run', return_value=provider), patch.object(
-                    Path, 'write_bytes', one_shot_stream), self.assertRaises(
-                        subprocess.CalledProcessError) as failed:
-                driver.captured_run(directory, records, errors, [sys.executable],
-                                    phase='provider', check=True, capture_output=True)
-            self.assertEqual(failed.exception.returncode, 37)
-            self.assertEqual((directory/'01-provider.stderr').read_bytes(), b'provider stderr')
-            self.assertIn('01-provider.stdout', attempted)
-            self.assertIn('01-provider.stderr', attempted)
-            manifest_attempts = []
-            def one_shot_manifest(path, data, *args, **kwargs):
-                manifest_attempts.append(path.name)
-                if path.name == 'manifest.json' and manifest_attempts.count(path.name) == 1:
-                    raise OSError('sentinel manifest write failure')
-                return real_write_text(path, data, *args, **kwargs)
-            with patch.object(Path, 'write_text', one_shot_manifest), contextlib.redirect_stderr(
-                    io.StringIO()) as raw:
-                driver.finalize_evidence(directory, {}, records, errors, ['native'],
-                                         'failed', failed.exception)
-            self.assertEqual(manifest_attempts, ['manifest.json'])
-            self.assertIn('sentinel stream write failure', raw.getvalue())
-            self.assertIn('sentinel manifest write failure', raw.getvalue())
-            self.assertEqual(records[0]['status'], 37)
-            self.assertTrue(any(row['operation'] == 'manifest write' for row in errors))
-        with tempfile.TemporaryDirectory(prefix='network tool mutation ') as folder:
-            directory = Path(folder)
-            tool = directory/'owned-tool'
-            tool.write_bytes(b'original')
-            records, errors = [], []
-            def mutate_tool(*args, **kwargs):
-                tool.write_bytes(b'changed')
-                return subprocess.CompletedProcess([str(tool)], 0, b'', b'')
-            with patch.object(driver.subprocess, 'run', side_effect=mutate_tool), self.assertRaises(
-                    RuntimeError):
-                driver.captured_run(directory, records, errors, [tool], phase='binding',
-                                    check=True, capture_output=True)
-            self.assertTrue(any(row['operation'] == 'tool binding' for row in errors))
-        with tempfile.TemporaryDirectory(prefix='network source mutation ') as folder:
-            directory = Path(folder)
-            source = directory/'owned-source'
-            source.write_bytes(b'original')
-            inputs = {'owned-source': driver.digest(source)}
-            source.write_bytes(b'changed')
-            errors = []
-            with patch.object(driver, 'ROOT', directory), contextlib.redirect_stderr(
-                    io.StringIO()), self.assertRaises(RuntimeError):
-                driver.finalize_evidence(directory, inputs, [], errors, ['native'], 'passed')
-            manifest = json.loads((directory/'manifest.json').read_text())
+            result = subprocess.run([str(network_tool('net-native-test')), '--evidence-controls', folder],
+                                    cwd=ROOT, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            def operations(row):
+                return [error['operation'] for error in row['errors']]
+            stream = next(row for row in rows if row['scenario'] == 'stream')
+            self.assertEqual(stream['status'], 37)
+            self.assertTrue(stream['failure'].startswith('CalledProcessError'), stream)
+            self.assertEqual(stream['finalized'], stream['failure'])
+            self.assertEqual(stream['stderr'], 'provider stderr')
+            self.assertEqual((Path(stream['directory'])/'01-provider.stderr').read_bytes(), b'provider stderr')
+            self.assertIn('stdout write', operations(stream))
+            self.assertNotIn('stderr write', operations(stream))
+            self.assertEqual(operations(stream).count('manifest write'), 1)
+            self.assertIn('stdout write', result.stderr)
+            self.assertIn('manifest write', result.stderr)
+            self.assertEqual(stream['records'][0]['status'], 37)
+            binding = next(row for row in rows if row['scenario'] == 'binding')
+            self.assertTrue(binding['failure'].startswith('RuntimeError'), binding)
+            self.assertIn('tool binding', operations(binding))
+            inputs = next(row for row in rows if row['scenario'] == 'inputs')
+            self.assertEqual(inputs['finalized'], 'network evidence finalization failed')
+            manifest = json.loads((Path(inputs['directory'])/'manifest.json').read_text())
             self.assertEqual(manifest['status'], 'failed')
-            self.assertTrue(any(row['operation'] == 'input binding' for row in errors))
-
-
-        for modes, expected_scope in (
-                (['native'], 'ordinary-launcher-path'),
-                (['native', 'sanitize'], 'ordinary-launcher-path'),
-                (['sanitize'], None)):
-            with tempfile.TemporaryDirectory(prefix='network public scope ') as folder:
-                directory = Path(folder)
-                driver.finalize_evidence(directory, {}, [], [], modes, 'passed')
-                manifest = json.loads((directory/'manifest.json').read_text())
+            self.assertIn('input binding', operations(inputs))
+            scopes = [row for row in rows if row['scenario'] == 'scope']
+            self.assertEqual([row['modes'] for row in scopes], [['native'], ['native', 'sanitize'], ['sanitize']])
+            for row, expected_scope in zip(scopes, ('ordinary-launcher-path', 'ordinary-launcher-path', None)):
+                self.assertEqual(row['finalized'], '')
+                manifest = json.loads((Path(row['directory'])/'manifest.json').read_text())
                 self.assertFalse(manifest['public_program_sanitizer_enabled_by_suite'])
                 self.assertEqual(manifest['public_program_scope'], expected_scope)
                 self.assertNotIn('public_program_sanitized', manifest)
@@ -380,28 +359,19 @@ class BuildWiring(unittest.TestCase):
                 verify(mutant)
 
 
-        import argparse
-        import contextlib
-        import importlib.util
-        import io
-        from unittest.mock import patch
-        spec = importlib.util.spec_from_file_location(
-            'network_native_mode_contract', ROOT/'tests/net-native.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
-        parser = argparse.ArgumentParser()
+        tool = network_tool('net-native-test')
         for windows, mode, expected in (
                 (False, None, ['native', 'sanitize']),
                 (False, 'native', ['native']), (False, 'sanitize', ['sanitize']),
                 (True, None, ['native']), (True, 'native', ['native'])):
-            with self.subTest(windows=windows, mode=mode), patch.object(
-                    driver, 'WINDOWS', windows):
-                self.assertEqual(driver.selected_modes(parser, mode), expected)
-        with patch.object(driver, 'WINDOWS', True), contextlib.redirect_stderr(
-                io.StringIO()) as error, self.assertRaises(SystemExit) as rejected:
-            driver.selected_modes(parser, 'sanitize')
-        self.assertEqual(rejected.exception.code, 2)
-        self.assertIn('unavailable on Windows', error.getvalue())
+            with self.subTest(windows=windows, mode=mode):
+                result = mode_probe(tool, 'MSYS_NT-10.0' if windows else 'Linux',
+                                    ['--mode', mode] if mode else [])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+        rejected = mode_probe(tool, 'MSYS_NT-10.0', ['--mode', 'sanitize'])
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn('unavailable on Windows', rejected.stderr)
 
     def test_cycle_progress_observability_is_mandatory_without_idle_replay(self):
         import importlib.util
