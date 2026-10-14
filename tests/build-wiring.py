@@ -510,8 +510,10 @@ class BuildWiring(unittest.TestCase):
         fragment_path = ROOT / 'build-support/quic-ledger.mk'
         source = fragment_path.read_text()
         target = 'check-quic-amplification-ledger'
-        inputs = {'tests/quic-amplification-ledger.py',
-                  'tests/quic_amplification_ledger.py'}
+        inputs = {'tests/quic-amplification-ledger.min', 'tests/quic-ledger-support.min',
+                  'tests/quic-ledger-checker.min', 'tests/quic-ledger-crypto.c',
+                  'build/tooling/tests/quic-amplification-ledger', 'build/tooling/tests/quic-ledger-checker',
+                  'build/tooling/tools/clang-driver'}
 
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='QUIC ledger Make rules ') as folder:
@@ -537,7 +539,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn(target, rules.get(gate, set()), gate)
                 self.assertTrue(inputs <= rules.get(target, set()))
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('python3 -E tests/quic-amplification-ledger.py'), 1)
+                self.assertEqual(commands.count('./build/tooling/tests/quic-amplification-ledger --artifacts'), 1)
                 self.assertIn('--artifacts "$artifacts/run"', commands)
                 self.assertIn((ROOT / 'build/quic-ledger.').as_posix(),
                               commands.replace('\\', '/'))
@@ -563,8 +565,7 @@ class BuildWiring(unittest.TestCase):
                 verify(mutant)
         for label, old, new in (
                 ('filtered cases', '--artifacts', '--case exact3x --artifacts'),
-                ('relative artifact path', '$(abspath build)/quic-ledger.', 'build/quic-ledger.'),
-                ('inherited optimization', 'python3 -E ', 'python3 -O ')):
+                ('relative artifact path', '$(abspath build)/quic-ledger.', 'build/quic-ledger.')):
             mutant = source.replace(old, new, 1)
             self.assertNotEqual(mutant, source)
             with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
@@ -574,13 +575,10 @@ class BuildWiring(unittest.TestCase):
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         rows = {row['path']: row for row in data['sources']}
-        self.assertEqual(rows['tests/quic-amplification-ledger.py']['role'], 'suite')
+        self.assertEqual(rows['tests/quic-ledger-crypto.c']['role'], 'support')
         self.assertIn('build-support/quic-ledger.mk',
-                      rows['tests/quic-amplification-ledger.py']['consumers'])
-        self.assertEqual(rows['tests/quic_amplification_ledger.py']['role'], 'support')
-        self.assertIn('tests/quic-amplification-ledger.py',
-                      rows['tests/quic_amplification_ledger.py']['consumers'])
-        for missing in sorted(inputs):
+                      rows['tests/quic-ledger-crypto.c']['consumers'])
+        for missing in ('tests/quic-ledger-crypto.c',):
             candidate = dict(data, sources=[row for row in data['sources']
                                            if row['path'] != missing])
             with self.subTest(omitted_source=missing), self.assertRaises(ValueError):

@@ -1,0 +1,652 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "./quic-ledger-support.min" as ledger
+use "json" as json
+use "system" as system
+use "files" as files
+
+constant CASES: List<Text> = ["exact3x", "one-byte-over", "forged-handshake", "invalid-handshake-frame", "coalesced-once", "route-credit-isolated", "connection-credit-isolated", "unknown-cid", "cross-connection-coalescing", "capture-duplicate", "real-retransmission", "truncated-pcap", "pcapng", "big-endian-pcap", "ipv6", "aes256-handshake", "chacha-handshake", "rfc-chacha-vector", "peer-policy-unknown", "server-before-credit", "missing-authenticated-boundary", "closing-handshake", "ack-never-sent", "ack-issued-handshake", "missing-server-keylog", "pcapng-capture-loss", "pcapng-dropcount", "pcapng-multiple-interface", "handshake-replay-same-route", "handshake-replay-new-route", "fresh-handshake-new-route", "nonminimal-frame-type", "crypto-end-overflow", "crypto-wide-length", "pcap-time-decrease", "pcapng-time-decrease", "pcap-nanoseconds", "pcapng-decimal-resolution", "pcapng-binary-resolution", "pcapng-time-offset", "pcap-invalid-subsecond", "cli-unbound-policy", "cli-retained-input-binding", "cli-retained-mutation", "cli-original-mutation", "cli-missing-input", "cli-provider-error", "cli-primary-finalization-error", "initial-token-policy-unknown", "receipt-byte-graph", "receipt-runtime-missing", "receipt-provider-changed", "receipt-extra-link-input", "receipt-compiler-mismatch", "receipt-flags-mismatch", "receipt-tool-changed", "receipt-unreviewed-link-tool", "receipt-staging-mismatch", "receipt-extra-program", "receipt-final-mismatch", "pcap-client-first-equal-time", "pcap-server-first-equal-time", "receipt-schema-float", "receipt-status-bool", "receipt-raw-mismatch", "receipt-policy-bool", "frontend-byte-graph", "frontend-status-bool", "frontend-status-float", "frontend-help-argv", "frontend-output-mismatch", "endpoint-command-tuple", "endpoint-command-mismatch", "endpoint-tuple-mismatch"]
+
+record Wire { direction: Text; payload: Bytes; port: Integer }
+record Fixture { capture: Bytes; logs: Bytes; connections: Integer; policy: Text; expected: Text }
+record Outcome { capture: Bytes; logs: Bytes; report: json.Value; expected: Text; checks: List<Text>; values: List<Boolean> }
+
+function range(start: Integer, end: Integer): Bytes {
+    let result = Bytes()
+    for value in start..end { result.add(value) }
+    return result
+}
+function client(): Bytes { return Bytes("client01") }
+function server(): Bytes { return Bytes("server01") }
+function secret(): Bytes { return range(0, 32) }
+function number(value: Integer): Bytes {
+    if value < 64 { return ledger.bigEndian(value, 1) }
+    test.check(value < 16384, "fixture varint out of range")
+    return ledger.bigEndian(value | 16384, 2)
+}
+function cat(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+function single(value: Integer): Bytes { return ledger.bigEndian(value, 1) }
+function initial(size: Integer, clientId: Bytes, serverId: Bytes, direction: Text, kind: Integer, token: Bytes): Bytes {
+    let destination = serverId
+    if direction == "client" && kind == 0 { destination = Bytes("original") } else if direction != "client" { destination = clientId }
+    let source = serverId
+    if direction == "client" { source = clientId }
+    let header = cat([single(193 | (kind << 4)), single(0), single(0), single(0), single(1), single(destination.length), destination, single(source.length), source])
+    if kind == 0 { header = cat([header, number(token.length), token]) }
+    let width = 2
+    if size - header.length - 1 < 64 { width = 1 }
+    let length = size - header.length - width
+    return cat([header, number(length), Bytes(length)])
+}
+function clientInitial(): Bytes { return initial(1200, client(), server(), "client", 0, Bytes()) }
+function serverInitial(): Bytes { return initial(1200, client(), server(), "server", 0, Bytes()) }
+function short(size: Integer, clientId: Bytes): Bytes { return cat([single(64), clientId, Bytes(size - 1 - clientId.length)]) }
+function handshake(material: Bytes, clientId: Bytes, serverId: Bytes, suite: Text, payload: Bytes, direction: Text, packetNumber: Integer): Bytes {
+    let destination = serverId
+    let source = clientId
+    if direction != "client" { destination = clientId; source = serverId }
+    let chacha = suite == "CHACHA20"
+    let bits = 256
+    if suite == "AES256" { bits = 384 }
+    let size = 16
+    if chacha || suite == "AES256" { size = 32 }
+    let pn = ledger.bigEndian(packetNumber, 2)
+    let header = cat([single(225), single(0), single(0), single(0), single(1), single(destination.length), destination, single(source.length), source, number(pn.length + payload.length + 16)])
+    let key = ledger.expand(material, "quic key", size, bits)
+    let iv = ledger.expand(material, "quic iv", 12, bits)
+    let nonce = iv.slice(0, 12)
+    let counter = ledger.bigEndian(packetNumber, 8)
+    for index in 0..8 { nonce[4 + index] = nonce[4 + index] ^ counter[index] }
+    let sealed = ledger.seal(chacha, key, nonce, cat([header, pn]), payload)
+    let packet = cat([header, pn, sealed])
+    let offset = header.length
+    let hp = ledger.expand(material, "quic hp", size, bits)
+    let sample = packet.slice(offset + 4, offset + 20)
+    let state = ledger.failure()
+    let hpMask = ledger.mask(state, hp, sample, chacha)
+    packet[0] = packet[0] ^ (hpMask[0] & 15)
+    for index in 0..2 { packet[offset + index] = packet[offset + index] ^ hpMask[index + 1] }
+    return packet
+}
+function defaultHandshake(): Bytes { return handshake(secret(), client(), server(), "AES128", payload("01000000"), "client", 0) }
+function payload(hex: Text): Bytes { return quic.fromHex(hex) }
+function wire(packet: Bytes, direction: Text, port: Integer, ipv6: Boolean): Bytes {
+    let source = "193.167.0.1"
+    let destination = "193.167.100.100"
+    if ipv6 { source = "fd00:cafe::1"; destination = "fd00:cafe::100" }
+    let sourcePort = port
+    let destinationPort = 443
+    if direction == "server" { let swap = source; source = destination; destination = swap; sourcePort = 443; destinationPort = port }
+    let datagram = cat([ledger.bigEndian(sourcePort, 2), ledger.bigEndian(destinationPort, 2), ledger.bigEndian(packet.length + 8, 2), ledger.bigEndian(0, 2), packet])
+    if ipv6 {
+        return cat([ledger.bigEndian(6 << 28, 4), ledger.bigEndian(datagram.length, 2), single(17), single(64), ledger.parseAddress(source), ledger.parseAddress(destination), datagram])
+    }
+    return cat([single(69), single(0), ledger.bigEndian(datagram.length + 20, 2), ledger.bigEndian(0, 2), ledger.bigEndian(0, 2), single(64), single(17), ledger.bigEndian(0, 2),
+        ledger.parseAddress(source), ledger.parseAddress(destination), datagram])
+}
+function little(value: Integer, width: Integer): Bytes {
+    let result = Bytes(width)
+    let rest = value
+    for index in 0..width { result[index] = rest & 255; rest = rest >> 8 }
+    return result
+}
+function packed(value: Integer, width: Integer, bigEndian: Boolean): Bytes {
+    if bigEndian { return ledger.bigEndian(value, width) }
+    return little(value, width)
+}
+function pcap(frames: List<Bytes>, bigEndian: Boolean, duplicate: Boolean, stamps: List<List<Integer>>, nanoseconds: Boolean): Bytes {
+    let magic = quic.fromHex("d4c3b2a1")
+    if bigEndian { magic = quic.fromHex("a1b2c3d4") }
+    if nanoseconds { magic = quic.fromHex("4d3cb2a1"); if bigEndian { magic = quic.fromHex("a1b23c4d") } }
+    let result = cat([magic, packed(2, 2, bigEndian), packed(4, 2, bigEndian), packed(0, 4, bigEndian), packed(0, 4, bigEndian), packed(65535, 4, bigEndian), packed(101, 4, bigEndian)])
+    for index in 0..frames.length {
+        let stamp = index
+        if duplicate && index == 1 { stamp = 0 }
+        let seconds = 1
+        let fraction = stamp
+        if stamps.length > 0 { seconds = stamps[index][0]; fraction = stamps[index][1] }
+        result.addBytes(cat([packed(seconds, 4, bigEndian), packed(fraction, 4, bigEndian), packed(frames[index].length, 4, bigEndian), packed(frames[index].length, 4, bigEndian), frames[index]]))
+    }
+    return result
+}
+function pcapBlock(kind: Integer, body: Bytes): Bytes {
+    let padded = cat([body, Bytes((4 - body.length % 4) % 4)])
+    let size = padded.length + 12
+    return cat([little(kind, 4), little(size, 4), padded, little(size, 4)])
+}
+function pcapng(frames: List<Bytes>, drop: Integer, epbdrop: Integer, multiple: Boolean, stamps: List<Integer>, resolution: Integer, offset: Integer): Bytes {
+    let interfaceOptions = cat([little(9, 2), little(1, 2), single(resolution), Bytes(3), little(14, 2), little(8, 2), little(offset, 8), Bytes(4)])
+    let result = cat([pcapBlock(168627466, cat([little(439041101, 4), little(1, 2), little(0, 2), little(-1, 8)])), pcapBlock(1, cat([little(101, 2), little(0, 2), little(65535, 4), interfaceOptions]))])
+    if multiple { result.addBytes(pcapBlock(1, cat([little(101, 2), little(0, 2), little(65535, 4)]))) }
+    for index in 0..frames.length {
+        let frame = frames[index]
+        let padding = Bytes((4 - frame.length % 4) % 4)
+        let option = Bytes()
+        if epbdrop != 0 && index == 0 { option = cat([little(4, 2), little(8, 2), little(epbdrop, 8), Bytes(4)]) }
+        let stamp = index + 1
+        if stamps.length > 0 { stamp = stamps[index] }
+        let interface = 0
+        if multiple && index == 1 { interface = 1 }
+        result.addBytes(pcapBlock(6, cat([little(interface, 4), little(stamp >> 32, 4), little(stamp & 4294967295, 4), little(frame.length, 4), little(frame.length, 4), frame, padding, option])))
+    }
+    result.addBytes(pcapBlock(5, cat([little(0, 4), little(0, 4), little(frames.length + 1, 4), little(5, 2), little(8, 2), little(drop, 8), Bytes(4)])))
+    return result
+}
+function keylog(material: Bytes, random: Bytes, direction: Text): Bytes {
+    return Bytes(direction + "_HANDSHAKE_TRAFFIC_SECRET " + quic.hex(random) + " " + quic.hex(material) + "\n")
+}
+function defaultLog(): Bytes { return keylog(secret(), range(32, 64), "CLIENT") }
+function serverSecret(): Bytes { return range(128, 160) }
+
+function fixtures(name: Text): Fixture {
+    let hs = defaultHandshake()
+    let logs = defaultLog()
+    let connections = 1
+    let policy = "handshake-only"
+    let expected = "passed"
+    let sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: serverInitial(); port: 12345 },
+        Wire { direction: "server"; payload: short(1200, client()); port: 12345 }, Wire { direction: "server"; payload: short(1200, client()); port: 12345 },
+        Wire { direction: "client"; payload: hs; port: 12345 }, Wire { direction: "server"; payload: short(5000, client()); port: 12345 }]
+    if name == "pcap-client-first-equal-time" || name == "pcap-server-first-equal-time" {
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: serverInitial(); port: 12345 }, Wire { direction: "client"; payload: hs; port: 12345 }]
+        if name == "pcap-server-first-equal-time" { sequence = [sequence[1], sequence[0], sequence[2]] }
+        expected = "coverage-limited"
+    } else if name == "initial-token-policy-unknown" {
+        sequence[0] = Wire { direction: "client"; payload: initial(1200, client(), server(), "client", 0, Bytes("opaque token")); port: 12345 }
+        expected = "coverage-limited"
+    } else if name == "one-byte-over" {
+        sequence[3] = Wire { direction: "server"; payload: short(1201, client()); port: 12345 }
+        expected = "failed"
+    } else if name == "forged-handshake" || name == "invalid-handshake-frame" || name == "closing-handshake" || name == "ack-never-sent" {
+        let bad = Bytes()
+        if name == "forged-handshake" { bad = hs.slice(0, hs.length); bad[bad.length - 1] = bad[bad.length - 1] ^ 1 }
+        else if name == "closing-handshake" { bad = handshake(secret(), client(), server(), "AES128", payload("1c000000"), "client", 0) }
+        else if name == "ack-never-sent" { bad = handshake(secret(), client(), server(), "AES128", payload("0201000000"), "client", 0) }
+        else { bad = handshake(secret(), client(), server(), "AES128", payload("08000000"), "client", 0) }
+        sequence = [sequence[0], sequence[1], sequence[2], sequence[3], Wire { direction: "client"; payload: bad; port: 12345 }, Wire { direction: "server"; payload: short(3 * bad.length + 1, client()); port: 12345 }]
+        expected = "failed"
+        if name == "ack-never-sent" { logs = cat([logs, keylog(serverSecret(), range(32, 64), "SERVER")]) }
+    } else if name == "handshake-replay-same-route" || name == "handshake-replay-new-route" || name == "fresh-handshake-new-route" {
+        let rebound = 12346
+        if name == "handshake-replay-same-route" { rebound = 12345 }
+        let next = hs
+        if name == "fresh-handshake-new-route" { next = handshake(secret(), client(), server(), "AES128", payload("01000000"), "client", 1) }
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: serverInitial(); port: 12345 },
+            Wire { direction: "client"; payload: hs; port: 12345 }, Wire { direction: "client"; payload: next; port: rebound }]
+        if name == "handshake-replay-new-route" { sequence.add(Wire { direction: "server"; payload: short(3 * hs.length + 1, client()); port: 12346 }); expected = "failed" }
+        else if name == "fresh-handshake-new-route" { sequence.add(Wire { direction: "server"; payload: short(5000, client()); port: 12346 }) }
+    } else if name == "nonminimal-frame-type" || name == "crypto-end-overflow" || name == "crypto-wide-length" {
+        let plaintext = payload("40010000")
+        if name == "crypto-end-overflow" { plaintext = cat([payload("06ffffffffffffffff"), payload("017a")]) }
+        if name == "crypto-wide-length" { plaintext = payload("0640004001" + "7a00") }
+        let candidate = handshake(secret(), client(), server(), "AES128", plaintext, "client", 0)
+        sequence = [sequence[0], sequence[1], sequence[2], sequence[3], Wire { direction: "client"; payload: candidate; port: 12345 }, Wire { direction: "server"; payload: short(3 * candidate.length + 1, client()); port: 12345 }]
+        expected = "failed"
+        if name == "crypto-wide-length" { expected = "passed" }
+    } else if name == "coalesced-once" {
+        let combined = cat([clientInitial(), initial(200, client(), server(), "client", 1, Bytes())])
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: serverInitial(); port: 12345 },
+            Wire { direction: "client"; payload: combined; port: 12345 }, Wire { direction: "server"; payload: short(6600, client()); port: 12345 }, Wire { direction: "client"; payload: hs; port: 12345 }]
+    } else if name == "route-credit-isolated" {
+        sequence = [sequence[0], sequence[1], Wire { direction: "client"; payload: clientInitial(); port: 12346 }, Wire { direction: "server"; payload: short(2401, client()); port: 12345 }, Wire { direction: "client"; payload: hs; port: 12345 }]
+        expected = "failed"
+    } else if name == "connection-credit-isolated" {
+        let second = handshake(range(64, 96), Bytes("client02"), Bytes("server02"), "AES128", payload("01000000"), "client", 0)
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "client"; payload: initial(1200, Bytes("client02"), Bytes("server02"), "client", 0, Bytes()); port: 12345 },
+            Wire { direction: "server"; payload: serverInitial(); port: 12345 }, Wire { direction: "server"; payload: short(2401, client()); port: 12345 },
+            Wire { direction: "server"; payload: initial(1200, Bytes("client02"), Bytes("server02"), "server", 0, Bytes()); port: 12345 },
+            Wire { direction: "client"; payload: hs; port: 12345 }, Wire { direction: "client"; payload: second; port: 12345 }]
+        logs = cat([logs, keylog(range(64, 96), range(96, 128), "CLIENT")])
+        connections = 2
+        expected = "failed"
+    } else if name == "ack-issued-handshake" || name == "missing-server-keylog" {
+        let issued = handshake(serverSecret(), client(), server(), "AES128", payload("01000000"), "server", 0)
+        if name == "ack-issued-handshake" { logs = cat([logs, keylog(serverSecret(), range(32, 64), "SERVER")]) } else { expected = "coverage-limited" }
+        let acknowledged = handshake(secret(), client(), server(), "AES128", payload("0200000000"), "client", 0)
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: serverInitial(); port: 12345 },
+            Wire { direction: "server"; payload: issued; port: 12345 }, Wire { direction: "client"; payload: acknowledged; port: 12345 }, Wire { direction: "server"; payload: short(5000, client()); port: 12345 }]
+    } else if name == "unknown-cid" {
+        sequence = [Wire { direction: "client"; payload: clientInitial(); port: 12345 }, Wire { direction: "server"; payload: initial(1200, Bytes("client02"), server(), "server", 0, Bytes()); port: 12345 }]
+        expected = "coverage-limited"
+    } else if name == "cross-connection-coalescing" {
+        sequence = [Wire { direction: "client"; payload: cat([clientInitial(), initial(1200, Bytes("client02"), Bytes("server02"), "client", 0, Bytes())]); port: 12345 }]
+        expected = "coverage-limited"
+    } else if name == "capture-duplicate" {
+        sequence = [sequence[0], sequence[0]]
+        expected = "coverage-limited"
+    } else if name == "real-retransmission" {
+        sequence = [sequence[0], sequence[0], sequence[1], Wire { direction: "server"; payload: short(6000, client()); port: 12345 }, Wire { direction: "client"; payload: hs; port: 12345 }]
+    } else if name == "truncated-pcap" { expected = "coverage-limited" }
+    else if name == "aes256-handshake" {
+        let material = range(0, 48)
+        logs = keylog(material, range(32, 64), "CLIENT")
+        sequence[4] = Wire { direction: "client"; payload: handshake(material, client(), server(), "AES256", payload("01000000"), "client", 0); port: 12345 }
+    } else if name == "chacha-handshake" {
+        sequence[4] = Wire { direction: "client"; payload: handshake(secret(), client(), server(), "CHACHA20", payload("01000000"), "client", 0); port: 12345 }
+    } else if name == "peer-policy-unknown" {
+        sequence[3] = Wire { direction: "server"; payload: short(1201, client()); port: 12345 }
+        policy = "peer-unknown"
+        expected = "coverage-limited"
+    } else if name == "missing-authenticated-boundary" {
+        sequence = [sequence[0], sequence[1], sequence[2], sequence[3]]
+        expected = "coverage-limited"
+    }
+    if name == "pcapng-capture-loss" || name == "pcapng-dropcount" || name == "pcapng-multiple-interface" { expected = "coverage-limited" }
+    let frames: List<Bytes> = []
+    for item in sequence { frames.add(wire(item.payload, item.direction, item.port, name == "ipv6")) }
+    let none: List<List<Integer>> = []
+    let flat: List<Integer> = []
+    let capture = pcap(frames, name == "big-endian-pcap", name == "capture-duplicate", none, false)
+    if quic.starts(name, "pcapng") {
+        let drop = 0
+        let epb = 0
+        if name == "pcapng-capture-loss" { drop = 1 }
+        if name == "pcapng-dropcount" { epb = 1 }
+        capture = pcapng(frames, drop, epb, name == "pcapng-multiple-interface", flat, 6, 0)
+    }
+    if name == "pcap-time-decrease" {
+        let stamps = [[1, 2], [1, 1]]
+        for index in 0..(frames.length - 2) { stamps.add([1, index + 3]) }
+        capture = pcap(frames, false, false, stamps, false)
+        expected = "coverage-limited"
+    } else if name == "pcapng-time-decrease" {
+        let stamps = [2, 1]
+        for index in 3..(frames.length + 1) { stamps.add(index) }
+        capture = pcapng(frames, 0, 0, false, stamps, 6, 0)
+        expected = "coverage-limited"
+    } else if name == "pcap-invalid-subsecond" {
+        let stamps = [[1, 1000000]]
+        for index in 1..frames.length { stamps.add([2, index]) }
+        capture = pcap(frames, false, false, stamps, false)
+        expected = "coverage-limited"
+    } else if name == "pcap-nanoseconds" {
+        let stamps: List<List<Integer>> = []
+        for index in 0..frames.length { stamps.add([1, 123456789 + index]) }
+        capture = pcap(frames, false, false, stamps, true)
+    } else if name == "pcapng-decimal-resolution" {
+        let stamps: List<Integer> = []
+        for index in 0..frames.length { stamps.add(123456789 + index) }
+        capture = pcapng(frames, 0, 0, false, stamps, 9, 0)
+    } else if name == "pcapng-binary-resolution" {
+        let stamps: List<Integer> = []
+        for index in 0..frames.length { stamps.add(129 + index) }
+        capture = pcapng(frames, 0, 0, false, stamps, 138, 0)
+    } else if name == "pcapng-time-offset" { capture = pcapng(frames, 0, 0, false, flat, 9, 60) }
+    if name == "truncated-pcap" { capture = capture.slice(0, capture.length - 1) }
+    if name == "pcap-client-first-equal-time" || name == "pcap-server-first-equal-time" {
+        let stamps: List<List<Integer>> = []
+        for index in 0..frames.length { stamps.add([1, 0]) }
+        capture = pcap(frames, false, false, stamps, false)
+    }
+    return Fixture { capture: capture; logs: logs; connections: connections; policy: policy; expected: expected }
+}
+
+function outcome(capture: Bytes, logs: Bytes, report: json.Value, expected: Text): Outcome { return Outcome { capture: capture; logs: logs; report: report; expected: expected; checks: []; values: [] } }
+function check(result: Outcome, name: Text, value: Boolean) { result.checks.add(name); result.values.add(value) }
+function row(report: json.Value, index: Integer): json.Value { return data.field(report, "rows").items[index] }
+function limited(message: Text): json.Value { return data.object(["status", "exception", "reason"], [data.string("coverage-limited"), data.string("CoverageError"), data.string(message)]) }
+
+function analysisCase(name: Text): Outcome {
+    let fixture = fixtures(name)
+    let address = "193.167.100.100"
+    if name == "ipv6" { address = "fd00:cafe::100" }
+    let analysis = ledger.analyze(fixture.capture, [fixture.logs], [address], 443, fixture.policy, fixture.connections)
+    let report = analysis.report
+    if analysis.error != "" { report = limited(analysis.error) }
+    let result = outcome(fixture.capture, fixture.logs, report, fixture.expected)
+    let rows = data.present(report, "rows")
+    if name == "coalesced-once" && data.equalsText(data.field(report, "status"), "passed") {
+        test.check(data.equalsInteger(data.field(row(report, 2), "udp_payload_bytes"), 1400) && data.equalsInteger(data.field(row(report, 2), "received"), 2600), "coalesced UDP was counted more than once")
+    }
+    if name == "connection-credit-isolated" && data.equalsText(data.field(report, "status"), "failed") {
+        test.check(data.equalsInteger(data.field(report, "connection_count"), 2) && data.equal(data.field(report, "violations"), json.parse("[3]")), "cross-connection credit was shared")
+    }
+    let hsLength = defaultHandshake().length
+    if quic.starts(name, "handshake-replay") && rows {
+        let fourth = row(report, 3)
+        let credit = hsLength
+        if quic.ends(name, "same-route") { credit = 1200 + 2 * hsLength }
+        check(result, "first_boundary_retained", data.equal(data.field(report, "authenticated_boundaries"), json.parse("[2]")))
+        check(result, "replay_cannot_release_boundary", data.isNull(data.field(fourth, "authentication")))
+        check(result, "replay_udp_credit_counted", data.equalsInteger(data.field(fourth, "received"), credit))
+        check(result, "rebound_stays_unvalidated", quic.ends(name, "same-route") || data.isFalse(data.field(fourth, "validated_after")))
+    }
+    if name == "fresh-handshake-new-route" && rows { check(result, "distinct_packet_validates_new_route", data.equal(data.field(report, "authenticated_boundaries"), json.parse("[2, 3]"))) }
+    if (name == "nonminimal-frame-type" || name == "crypto-end-overflow") && rows {
+        let plaintext = payload("40010000")
+        if name == "crypto-end-overflow" { plaintext = cat([payload("06ffffffffffffffff"), payload("017a")]) }
+        check(result, "invalid_plaintext_not_boundary", data.isNull(data.field(row(report, 4), "authentication")))
+        check(result, "discarded_udp_credit_counted", data.equalsInteger(data.field(row(report, 4), "received"), 1200 + handshake(secret(), client(), server(), "AES128", plaintext, "client", 0).length))
+    }
+    let exact = ""
+    if name == "pcap-nanoseconds" { exact = "[1123456789, 1000000000]" }
+    if name == "pcapng-decimal-resolution" { exact = "[123456789, 1000000000]" }
+    if name == "pcapng-binary-resolution" { exact = "[129, 1024]" }
+    if name == "pcapng-time-offset" { exact = "[60000000001, 1000000000]" }
+    if exact != "" && rows { check(result, "exact_declared_timestamp_resolution", data.equal(data.field(row(report, 0), "timestamp_exact"), json.parse(exact))) }
+    return result
+}
+
+function binding(path: Text): json.Value {
+    let raw = files.readFile(path)
+    return data.object(["path", "sha256", "bytes"], [data.string(path), data.string(ledger.sha(raw)), data.number(raw.length)])
+}
+function authorityCase(name: Text, target: Text): Outcome {
+    let expected = "coverage-limited"
+    if name == "frontend-byte-graph" || name == "endpoint-command-tuple" { expected = "passed" }
+    let store = ledger.retention(target)
+    let state = ledger.failure()
+    let graph = data.none()
+    if quic.starts(name, "frontend-") {
+        let root = target + "/mock-source"
+        let serverPath = root + "/tests/interop/qns/server.min"
+        let quicPath = root + "/library/quic.min"
+        test.require(test.run(["mkdir", "-p", root + "/tests/interop/qns", root + "/library"], system.environment(), "", target + "/.mkdir", 10), "mock source tree")
+        writeTextFile(serverPath, "mock server")
+        writeTextFile(quicPath, "mock quic")
+        writeTextFile(target + "/server.ll", "mock generated LLVM")
+        writeTextFile(target + "/compiler", "mock frontend bytes")
+        writeTextFile(target + "/stdout", "")
+        writeTextFile(target + "/stderr", "")
+        let raw = data.object(["original", "sha256", "bytes"], [data.string(target + "/server.ll"), data.string(ledger.sha(Bytes("mock generated LLVM"))), data.number(19)])
+        let argv = data.strings([target + "/compiler", serverPath, target + "/server.ll", "--bounded-owners", "32", "--library", root + "/library"])
+        let status = data.number(0)
+        if name == "frontend-status-bool" { status = data.boolean(false) }
+        if name == "frontend-status-float" { status = data.decimal("0.0") }
+        if name == "frontend-help-argv" { argv = data.strings([target + "/compiler", "--help", serverPath]) }
+        if name == "frontend-output-mismatch" { raw = data.with(raw, "sha256", data.string("0000000000000000000000000000000000000000000000000000000000000000")) }
+        let record = data.object(["compiler", "argv", "status", "timed_out", "timeout_seconds", "output", "stdout", "stderr"],
+            [binding(target + "/compiler"), argv, status, data.boolean(false), data.number(120), binding(target + "/server.ll"), binding(target + "/stdout"), binding(target + "/stderr")])
+        let sources = data.object(["server", "quic"], [binding(serverPath), binding(quicPath)])
+        graph = ledger.checkedFrontendGraph(state, record, sources, raw, store)
+    } else {
+        let project = "minyar-qns-aaaaaaaaaaaaaaaaaaaaaaaa"
+        let addresses = ["193.167.100.100", "fd00:cafe:cafe:100::100"]
+        let path = data.string("python3")
+        let args = data.strings(["/opt/minyar/endpoint.py"])
+        if name == "endpoint-command-mismatch" { path = data.string("other"); args = data.strings(["--help"]) }
+        let endpoint = data.object(["Path", "Args", "Config", "NetworkSettings"], [path, args,
+            data.object(["Entrypoint", "Cmd"], [data.strings(["python3", "/opt/minyar/endpoint.py"]), data.none()]),
+            data.object(["Networks"], [data.object([project + "_rightnet"], [data.object(["IPAddress", "GlobalIPv6Address"], [data.string(addresses[0]), data.string(addresses[1])])])])])
+        let runAddresses = addresses
+        let selected = addresses
+        if name == "endpoint-tuple-mismatch" { runAddresses = ["193.167.100.101"]; selected = ["193.167.100.101"] }
+        let run = data.object(["project", "server_addresses", "server_port"], [data.string(project), data.strings(runAddresses), data.number(443)])
+        graph = ledger.checkedEndpointMode(state, endpoint, run, selected, 443)
+    }
+    let report = data.object(["status", "graph"], [data.string("passed"), graph])
+    if ledger.failed(state) { report = data.object(["status", "reason"], [data.string("coverage-limited"), data.string(ledger.errorParts(state.message[0])[1])]) }
+    report = data.with(report, "scope", data.string("mock graph shape only; no compiler or endpoint execution and no official authority"))
+    return outcome(Bytes(), Bytes(), report, expected)
+}
+
+function receiptItem(directory: Text, name: Text, raw: Bytes, original: Text, role: Text, format: Text): json.Value {
+    writeBytesFile(directory + "/" + name, raw)
+    let digest = ledger.sha(raw)
+    let value = data.object(["original", "retained", "sha256", "bytes", "source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256", "post_link_sha256"],
+        [data.string(original), data.string(name), data.string(digest), data.number(raw.length), data.string(digest), data.string(digest), data.string(digest), data.string(digest), data.string(digest)])
+    if role != "" { value = data.with(value, "role", data.string(role)) }
+    if format != "" { value = data.with(value, "format", data.string(format)) }
+    return value
+}
+function compilerPath(): Text {
+    let selected = system.getenv("MINYAR_TEST_CLANG")
+    if selected == "" { selected = "clang" }
+    let resolved = quic.resolve(selected, "", system.environment(), quic.root())
+    test.check(resolved != "", "receipt control needs a clang binary on PATH")
+    return resolved
+}
+function receiptCase(name: Text, target: Text, driver: Text): Outcome {
+    let buildRoot = target + "/build"
+    test.check(files.makeDirectory(buildRoot) == 0, "receipt build directory")
+    let raw = receiptItem(buildRoot, "program.raw.ll", Bytes("define i32 @main() { ret i32 0 }\n"), target + "/server.ll", "program", "llvm")
+    let objects = [receiptItem(buildRoot, "runtime.o", Bytes("mock-runtime"), target + "/runtime.o", "runtime", "native_object")]
+    for index in 0..6 { objects = objects.appended(receiptItem(buildRoot, "native-" + Text(index) + ".o", Bytes("mock-provider-" + Text(index)), target + "/provider-" + Text(index) + ".o", "provider", "native_object")) }
+    let compiler = compilerPath()
+    let driverBytes = files.readFile(driver)
+    let compilerBytes = files.readFile(compiler)
+    let driverItem = receiptItem(buildRoot, "clang-driver", driverBytes, ledger.canonicalPath(driver), "", "")
+    let compilerItem = receiptItem(buildRoot, "clang.bin", compilerBytes, ledger.canonicalPath(compiler), "", "")
+    let staged = target + "/.minyar-link-control/server"
+    let final = data.with(receiptItem(buildRoot, "program", Bytes("mock-linked-output"), target + "/server", "", ""), "path", data.string(target + "/server"))
+    let stagedItem = data.with(receiptItem(buildRoot, "program.staged", Bytes("mock-linked-output"), staged, "", ""), "path", data.string(staged))
+    let command = [compiler, "-O2", "-Wno-override-module", data.field(raw, "original").text]
+    for index in 0..3 { command.add(data.field(objects[index], "original").text) }
+    command.add("-lcrypto")
+    for index in 3..7 { command.add(data.field(objects[index], "original").text) }
+    command.add("-lcrypto")
+    command.add("-lm")
+    let actual: List<Text> = []
+    for value in command { actual.add(value) }
+    actual.add("-o")
+    actual.add(staged)
+    let tools = data.object(["clang-driver", "clang.bin"], [driverItem, compilerItem])
+    let toolHashes = data.object(["clang-driver", "clang.bin"], [data.field(driverItem, "sha256"), data.field(compilerItem, "sha256")])
+    let compilerRecord = data.object(["selected_command", "resolved_path", "sha256"], [data.string(compiler), data.field(compilerItem, "original"), data.field(compilerItem, "sha256")])
+    let build = data.object(["schema", "mode", "optimization", "link_attempted", "link_status", "link_subprocess_status", "retention_errors", "link_flags", "lto_flags", "address_sanitizer_enabled",
+        "raw_program_input", "program_input", "inputs", "tools", "tool_bindings", "raw_sha256", "linked_program_sha256", "compiler_selected_command", "compiler_pre_link", "command", "actual_command",
+        "staged_requested_path", "staged_output", "final_output", "binary_sha256"],
+        [data.number(2), data.string("native"), data.string("2"), data.boolean(true), data.number(0), data.number(0), data.array([]), data.strings(["-O2", "-Wno-override-module"]), data.array([]),
+        data.boolean(false), raw, raw, data.array(objects), toolHashes, tools, data.field(raw, "sha256"), data.field(raw, "sha256"), data.string(compiler), compilerRecord,
+        data.strings(command), data.strings(actual), data.string(staged), stagedItem, final, data.field(final, "sha256")])
+    if name == "receipt-schema-float" { build = data.with(build, "schema", data.decimal("2.0")) }
+    else if name == "receipt-status-bool" { build = data.with(build, "link_status", data.boolean(false)) }
+    else if name == "receipt-raw-mismatch" { build = data.with(build, "raw_sha256", data.string("0000000000000000000000000000000000000000000000000000000000000000")) }
+    else if name == "receipt-runtime-missing" {
+        let rest: List<json.Value> = []
+        for index in 1..objects.length { rest = rest.appended(objects[index]) }
+        build = data.with(build, "inputs", data.array(rest))
+    }
+    else if name == "receipt-provider-changed" { writeTextFile(buildRoot + "/native-0.o", "changed provider") }
+    else if name == "receipt-extra-link-input" { build = data.with(build, "actual_command", data.strings(insertBefore(actual, actual.length - 2, target + "/unrepresented.o"))) }
+    else if name == "receipt-compiler-mismatch" { build = data.with(build, "compiler_pre_link", data.with(compilerRecord, "selected_command", data.string("/different/compiler"))) }
+    else if name == "receipt-flags-mismatch" { build = data.with(build, "actual_command", data.strings(insertBefore(actual, 1, "-O0"))) }
+    else if name == "receipt-tool-changed" { writeTextFile(buildRoot + "/clang-driver", "changed tool") }
+    else if name == "receipt-unreviewed-link-tool" {
+        let unreviewed = Bytes("self-consistent but unreviewed canonical tool")
+        writeBytesFile(buildRoot + "/clang-driver", unreviewed)
+        let digest = ledger.sha(unreviewed)
+        let item = data.with(driverItem, "bytes", data.number(unreviewed.length))
+        for field in ["sha256", "source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256", "post_link_sha256"] { item = data.with(item, field, data.string(digest)) }
+        build = data.with(data.with(build, "tool_bindings", data.with(tools, "clang-driver", item)), "tools", data.with(toolHashes, "clang-driver", data.string(digest)))
+    }
+    else if name == "receipt-staging-mismatch" {
+        let changed: List<Text> = []
+        for index in 0..actual.length { if index == actual.length - 1 { changed.add(target + "/server") } else { changed.add(actual[index]) } }
+        build = data.with(build, "actual_command", data.strings(changed))
+    }
+    else if name == "receipt-extra-program" { build = data.with(build, "actual_command", data.strings(insertBefore(actual, actual.length - 2, data.field(raw, "original").text))) }
+    else if name == "receipt-final-mismatch" { writeTextFile(buildRoot + "/program", "different output") }
+    writeTextFile(target + "/mock-build.json", data.pretty(build) + "\n")
+    let evidence = target + "/checked-inputs"
+    test.check(files.makeDirectory(evidence) == 0, "receipt evidence directory")
+    let store = ledger.retention(evidence)
+    let state = ledger.failure()
+    if name == "receipt-policy-bool" {
+        let policy = data.with(ledger.policyContract(), "early_cid_validation", data.number(0))
+        writeTextFile(target + "/policy.json", data.dumps(data.object(["schema_version", "policy", "capture_origin", "evidence_kind"], [data.number(1), policy, data.string("synthetic-control"), data.string("mocked-control")])))
+        let request = ledger.Request { capture: ""; origin: "synthetic-control"; keylogs: []; addresses: []; port: 443; source: ""; binary: ""; receipt: target + "/policy.json"; driver: driver }
+        ledger.checkedPolicyReceipt(state, request, store)
+        test.check(ledger.failed(state), "mocked policy unexpectedly supplied official authority")
+        let reason = ledger.errorParts(state.message[0])[1]
+        let status = "passed"
+        if reason == "unreviewed endpoint validation policy" { status = "coverage-limited" }
+        return outcome(Bytes(), Bytes(), data.object(["status", "reason", "scope"], [data.string(status), data.string(reason), data.string("policy-header exact-type control only")]), "coverage-limited")
+    }
+    let graph = ledger.checkedLinkGraph(state, build, buildRoot, store, driver)
+    let report = data.object(["status", "graph"], [data.string("passed"), graph])
+    if ledger.failed(state) { report = data.object(["status", "reason"], [data.string("coverage-limited"), data.string(ledger.errorParts(state.message[0])[1])]) }
+    let expected = "coverage-limited"
+    if name == "receipt-byte-graph" { expected = "passed" }
+    let result = outcome(Bytes(), Bytes(), report, expected)
+    if name == "receipt-unreviewed-link-tool" { check(result, "exact_canonical_tool_rejection", data.equalsText(data.field(report, "reason"), "unreviewed canonical link tool")) }
+    let inputs = ledger.inputsJSON(store)
+    result.report = data.with(data.with(result.report, "scope", data.string("mock byte-graph validation only; no endpoint ran and no official policy authority")), "retained_inputs", inputs)
+    writeTextFile(target + "/retention.json", data.pretty(inputs) + "\n")
+    return result
+}
+function insertBefore(values: List<Text>, position: Integer, value: Text): List<Text> {
+    let result: List<Text> = []
+    for index in 0..values.length {
+        if index == position { result.add(value) }
+        result.add(values[index])
+    }
+    return result
+}
+
+function cliCase(name: Text, target: Text, checker: Text): Outcome {
+    let fixture = fixtures("exact3x")
+    writeBytesFile(target + "/trace.pcap", fixture.capture)
+    writeBytesFile(target + "/client.keys", fixture.logs)
+    writeTextFile(target + "/unreviewed.source", "arbitrary policy text")
+    writeTextFile(target + "/unreviewed.binary", "arbitrary binary")
+    let capture = target + "/trace.pcap"
+    if name == "cli-missing-input" { capture = target + "/missing.pcap" }
+    let policy = "peer-unknown"
+    if name == "cli-unbound-policy" { policy = "handshake-only" }
+    let argv = [checker, "--capture", capture, "--capture-origin", "official-server-trace", "--keylog", target + "/client.keys", "--server-address", "193.167.100.100", "--policy", policy, "--artifacts", target + "/checker"]
+    if name == "cli-unbound-policy" { for value in ["--policy-source", target + "/unreviewed.source", "--policy-binary", target + "/unreviewed.binary"] { argv.add(value) } }
+    let fault = ""
+    if name == "cli-retained-mutation" { fault = "retained-mutation" }
+    if name == "cli-original-mutation" { fault = "original-mutation" }
+    if name == "cli-provider-error" { fault = "provider" }
+    if name == "cli-primary-finalization-error" { fault = "provider,finalization" }
+    let environment = quic.setting(system.environment(), "MINYAR_LEDGER_FAULT", fault)
+    let process = test.run(argv, environment, "", target + "/child", 60)
+    test.check(files.rename(target + "/child", target + "/child.stdout") == 0 && files.rename(target + "/child.err", target + "/child.stderr") == 0, "cannot retain checker output")
+    let stdout = files.readFile(target + "/child.stdout")
+    let stderr = files.readFile(target + "/child.stderr")
+    let command = data.object(["argv", "status", "timeout_seconds", "stdout", "stderr"], [data.strings(argv), data.number(process.status), data.number(60),
+        data.object(["path", "sha256", "bytes"], [data.string("child.stdout"), data.string(ledger.sha(stdout)), data.number(stdout.length)]),
+        data.object(["path", "sha256", "bytes"], [data.string("child.stderr"), data.string(ledger.sha(stderr)), data.number(stderr.length)])])
+    writeTextFile(target + "/command.json", data.pretty(command) + "\n")
+    let expected = "coverage-limited"
+    if name == "cli-retained-input-binding" { expected = "passed" }
+    let report = data.object(["status"], [data.string("missing-durable-ledger")])
+    if files.pathSize(target + "/checker/ledger.json") >= 0 { report = data.decode(readBytesFile(target + "/checker/ledger.json")) }
+    let result = outcome(fixture.capture, fixture.logs, report, expected)
+    let exit = 2
+    if expected == "passed" { exit = 0 }
+    check(result, "exact_exit_status", process.status == exit)
+    if name == "cli-retained-input-binding" {
+        let inputs = data.field(report, "inputs")
+        let exact = data.isObject(inputs) && inputs.items.length > 0
+        for value in inputs.items {
+            let before = data.field(value, "original_before")
+            if !data.equal(before, data.field(value, "retained")) || !data.equal(before, data.field(value, "original_after")) || !data.isTrue(data.field(value, "copied_exact")) { exact = false }
+        }
+        check(result, "checked_before_copy_after", exact)
+    } else if name == "cli-provider-error" || name == "cli-primary-finalization-error" {
+        check(result, "primary_error_preserved", data.equalsText(data.field(data.field(report, "primary_exception"), "type"), "OriginalProviderFailure"))
+        if name == "cli-primary-finalization-error" { check(result, "secondary_error_retained", data.field(report, "finalization_errors").items.length > 0) }
+    }
+    return result
+}
+
+function runCase(name: Text, target: Text, checker: Text, driver: Text): Outcome {
+    if quic.starts(name, "cli-") { return cliCase(name, target, checker) }
+    if quic.starts(name, "receipt-") { return receiptCase(name, target, driver) }
+    if quic.starts(name, "frontend-") || quic.starts(name, "endpoint-") { return authorityCase(name, target) }
+    if name == "rfc-chacha-vector" {
+        let material = quic.fromHex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
+        let hp = ledger.expand(material, "quic hp", 32, 256)
+        test.check(quic.hex(hp) == "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4", "RFC9001 A.5 HKDF oracle")
+        let state = ledger.failure()
+        test.check(quic.hex(ledger.mask(state, hp, quic.fromHex("5e5cd55c41f69080575d7999c25a5bfb"), true)) == "aefefe7d03", "RFC9001 A.5 HP oracle")
+        return outcome(Bytes(), Bytes(), data.object(["status", "oracle"], [data.string("passed"), data.string("RFC9001 A.5")]), "passed")
+    }
+    if name == "server-before-credit" {
+        let accounting = ledger.ledger("handshake-only")
+        let route = ["193.167.0.1", "12345", "193.167.100.100", "443"]
+        ledger.record(accounting, "connection-a", route, "server", 1, data.none(), [], [])
+        ledger.record(accounting, "connection-a", route, "client", 1200, data.object(["synthetic_control"], [data.boolean(true)]), [], [])
+        return outcome(Bytes(), Bytes(), ledger.result(accounting), "failed")
+    }
+    return analysisCase(name)
+}
+
+let directory = ""
+let requested: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "missing option value: " + argument(index))
+    if argument(index) == "--artifacts" { directory = argument(index + 1) }
+    else if argument(index) == "--case" {
+        let known = false
+        let names = CASES
+        for name in names { if name == argument(index + 1) { known = true } }
+        test.check(known, "invalid case: " + argument(index + 1))
+        requested.add(argument(index + 1))
+    } else { fail("unknown option: " + argument(index)) }
+    index += 2
+}
+let cases = CASES
+if requested.length > 0 { cases = requested }
+let scratch = ""
+if directory != "" {
+    test.check(quic.starts(directory, "/") && files.pathSize(directory) < 0, "--artifacts requires a fresh absolute path")
+    test.check(files.makeDirectory(directory) == 0, "cannot create ledger control artifacts")
+} else {
+    scratch = test.scratch()
+    directory = scratch
+}
+let checker = quic.root() + "/build/tooling/tests/quic-ledger-checker"
+let driver = quic.root() + "/build/tooling/tools/clang-driver"
+let rows: List<Text> = []
+let passed = true
+for name in cases {
+    let target = directory + "/" + name
+    test.check(files.makeDirectory(target) == 0, "cannot create case directory")
+    let result = runCase(name, target, checker, driver)
+    if result.checks.length > 0 {
+        let keys: List<json.Value> = []
+        for position in 0..result.checks.length { keys = keys.appended(data.boolean(result.values[position])) }
+        result.report = data.with(result.report, "control_checks", data.object(result.checks, keys))
+    }
+    writeBytesFile(target + "/trace.pcap", result.capture)
+    writeBytesFile(target + "/client.keys", result.logs)
+    writeTextFile(target + "/ledger.json", data.pretty(result.report) + "\n")
+    let status = data.field(result.report, "status").text
+    let matched = status == result.expected
+    for value in result.values { if !value { matched = false } }
+    if !matched { passed = false }
+    rows.add("{\"case\": " + quic.string(name) + ", \"status\": " + quic.string(status) + ", \"expected\": " + quic.string(result.expected) + ", \"matched\": " + Text(matched) + "}")
+}
+let sources = ["tests/quic-amplification-ledger.min", "tests/quic-ledger-support.min", "tests/quic-ledger-checker.min", "tests/quic-ledger-crypto.c"]
+let inputs = quic.digestObject(quic.fileDigests(sources, directory + "/.inputs"))
+let provider = ledger.provider()
+let status = "failed"
+if passed { status = "passed" }
+let report = "{\n  \"schema_version\": 1,\n  \"scope\": \"synthetic capture and independent accounting controls only\",\n  \"status\": " + quic.string(status) + ",\n  \"inputs\": " + inputs +
+    ",\n  \"crypto_provider\": " + data.dumps(ledger.providerJSON(provider)) + ",\n  \"declared_cases\": " + quic.quoted(cases) + ",\n  \"results\": [\n    " + quic.joined(rows, ",\n    ") + "\n  ]\n}\n"
+writeTextFile(directory + "/results.json", report)
+let listed = test.run(["find", ".", "-type", "f", "!", "-name", ".inputs*"], system.environment(), directory, directory + "/.inventory", 60)
+test.require(listed, "control inventory")
+let found: List<Text> = []
+for line in test.lines(listed.output) { let name = quic.after(line, "./"); if !quic.starts(name, ".inventory") { found.add(name) } }
+found.sort()
+let paths: List<Text> = []
+for name in found { paths.add(directory + "/" + name) }
+let hashes = quic.digests(paths, directory + "/.inventory-hashes")
+let entries: List<Text> = []
+let sizes: List<Text> = []
+for position in 0..found.length {
+    entries.add(quic.string(found[position]) + ": " + quic.string(hashes[position]))
+    sizes.add(quic.string(found[position]) + ": " + Text(files.pathSize(paths[position])))
+}
+let inventory: List<Text> = []
+for name in cases {
+    let owned: List<Text> = []
+    for file in found { if quic.starts(file, name + "/") { owned.add(file) } }
+    inventory.add("{\"case\": " + quic.string(name) + ", \"files\": " + quic.quoted(owned) + "}")
+}
+writeTextFile(directory + "/manifest.json", "{\n  \"schema_version\": 1,\n  \"status\": " + quic.string(status) + ",\n  \"inputs\": " + inputs + ",\n  \"declared_cases\": " + quic.quoted(cases) +
+    ",\n  \"files\": {" + quic.joined(entries, ", ") + "},\n  \"file_bytes\": {" + quic.joined(sizes, ", ") + "},\n  \"case_inventory\": [" + quic.joined(inventory, ", ") + "]\n}\n")
+files.writeStandardOutput(report)
+if scratch != "" { test.removeTree(scratch) }
+if !passed { exit(1) }

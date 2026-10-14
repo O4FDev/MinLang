@@ -1,0 +1,1402 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "json" as json
+use "errors" as errors
+use "sha256" as sha256
+use "system" as system
+use "files" as files
+
+function hmacNative(bits: Integer, key: Bytes, message: Bytes): Bytes { native "quicledger" }
+public function block(key: Bytes, input: Bytes): Bytes { native "quicledger" }
+public function chacha(key: Bytes, iv: Bytes, length: Integer): Bytes { native "quicledger" }
+public function seal(chachaSuite: Boolean, key: Bytes, nonce: Bytes, additional: Bytes, plaintext: Bytes): Bytes { native "quicledger" }
+function openNative(chachaSuite: Boolean, key: Bytes, nonce: Bytes, additional: Bytes, sealed: Bytes): Bytes { native "quicledger" }
+function providerVersion(): Text { native "quicledger" }
+function providerLibrary(): Text { native "quicledger" }
+
+public function sha(value: Bytes): Text { return sha256.hex(sha256.digest(value)) }
+public function hmac(bits: Integer, key: Bytes, message: Bytes): Bytes { return hmacNative(bits, key, message) }
+public record Opened { valid: Boolean; plaintext: Bytes }
+public function open(chachaSuite: Boolean, key: Bytes, nonce: Bytes, additional: Bytes, sealed: Bytes): Opened {
+    let raw = openNative(chachaSuite, key, nonce, additional, sealed)
+    if raw.length == 0 || raw[0] != 1 { return Opened { valid: false; plaintext: Bytes() } }
+    return Opened { valid: true; plaintext: raw.slice(1, raw.length) }
+}
+public function same(left: Bytes, right: Bytes): Boolean { return left.length == right.length && Text(left) == Text(right) }
+function concat(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+public function bigEndian(value: Integer, width: Integer): Bytes {
+    let result = Bytes(width)
+    let rest = value
+    let index = width - 1
+    while index >= 0 { result[index] = rest & 255; rest = rest >> 8; index -= 1 }
+    return result
+}
+
+public record Provider { version: Text; path: Text; sha256: Text; bytes: Integer; error: Text }
+public function provider(): Provider {
+    let faults = quic.split(system.getenv("MINYAR_LEDGER_FAULT"), 44)
+    let injected = false
+    for fault in faults { if fault == "provider" { injected = true } }
+    if injected { return Provider { version: ""; path: ""; sha256: ""; bytes: 0; error: "OriginalProviderFailure: original provider failure" } }
+    let path = providerLibrary()
+    let raw = Bytes()
+    if path != "" { raw = files.readFile(path) }
+    return Provider { version: providerVersion(); path: path; sha256: sha(raw); bytes: raw.length; error: "" }
+}
+public function providerJSON(value: Provider): json.Value {
+    let inputs = data.object([], [])
+    if value.path != "" { inputs = data.object([value.path], [data.object(["sha256", "bytes"], [data.string(value.sha256), data.number(value.bytes)])]) }
+    return data.object(["version", "inputs"], [data.string(value.version), inputs])
+}
+
+public record Failure { message: List<Text> }
+public function failure(): Failure { return Failure { message: [""] } }
+public function failed(state: Failure): Boolean { return state.message[0] != "" }
+public function raise(state: Failure, message: Text) { if state.message[0] == "" { state.message[0] = message } }
+
+function need(state: Failure, raw: Bytes, at: Integer, size: Integer): Bytes {
+    if at < 0 || size < 0 || at + size > raw.length {
+        raise(state, "truncated capture or protocol field")
+        return Bytes(max(min(size, 65536), 0))
+    }
+    return raw.slice(at, at + size)
+}
+function unsigned(raw: Bytes, at: Integer, width: Integer, little: Boolean): Integer {
+    let value = 0
+    for index in 0..width {
+        let position = at + index
+        if little { position = at + width - 1 - index }
+        value = value * 256 + raw[position]
+    }
+    return value
+}
+function signed64(raw: Bytes, at: Integer, little: Boolean): Integer {
+    if little { return raw.getInt64(at) }
+    let swapped = Bytes(8)
+    for index in 0..8 { swapped[index] = raw[at + 7 - index] }
+    return swapped.getInt64(0)
+}
+function signed32(raw: Bytes, at: Integer, little: Boolean): Integer {
+    let value = unsigned(raw, at, 4, little)
+    if value >= 2147483648 { return value - 4294967296 }
+    return value
+}
+function gcd(left: Integer, right: Integer): Integer {
+    let a = abs(left)
+    let b = abs(right)
+    while b != 0 { let rest = a % b; a = b; b = rest }
+    return a
+}
+
+public record Exact { numerator: Integer; denominator: Integer }
+function exact(state: Failure, ticks: Integer, denominator: Integer, offset: Integer): Exact {
+    let scaled = errors.checkedMultiply(offset, denominator)
+    if !errors.integerOk(scaled) { raise(state, "capture timestamp exceeds exact accounting range"); return Exact { numerator: 0; denominator: 1 } }
+    let total = errors.checkedAdd(ticks, errors.integerValue(scaled))
+    if !errors.integerOk(total) { raise(state, "capture timestamp exceeds exact accounting range"); return Exact { numerator: 0; denominator: 1 } }
+    let value = errors.integerValue(total)
+    let divisor = gcd(value, denominator)
+    if divisor == 0 { divisor = 1 }
+    return Exact { numerator: value / divisor; denominator: denominator / divisor }
+}
+public function compare(left: Exact, right: Exact): Integer {
+    let leftWhole = left.numerator / left.denominator
+    let rightWhole = right.numerator / right.denominator
+    let leftRest = left.numerator % left.denominator
+    let rightRest = right.numerator % right.denominator
+    if leftRest < 0 { leftRest += left.denominator; leftWhole -= 1 }
+    if rightRest < 0 { rightRest += right.denominator; rightWhole -= 1 }
+    if leftWhole != rightWhole { if leftWhole < rightWhole { return -1 } else { return 1 } }
+    let a = errors.checkedMultiply(leftRest, right.denominator)
+    let b = errors.checkedMultiply(rightRest, left.denominator)
+    if !errors.integerOk(a) || !errors.integerOk(b) { fail("capture timestamp comparison exceeds exact accounting range") }
+    if errors.integerValue(a) < errors.integerValue(b) { return -1 }
+    if errors.integerValue(a) > errors.integerValue(b) { return 1 }
+    return 0
+}
+
+public record Record { offset: Integer; timestamp: List<Integer>; exact: Exact; resolution: Integer; timeOffset: Integer; interface: Integer; section: Integer; linktype: Integer; frame: Bytes }
+record Interface { link: Integer; snaplen: Integer; denominator: Integer; offset: Integer }
+record Option { kind: Integer; value: Bytes }
+function options(state: Failure, raw: Bytes, little: Boolean): List<Option> {
+    let result: List<Option> = []
+    let at = 0
+    while at < raw.length && !failed(state) {
+        let header = need(state, raw, at, 4)
+        if failed(state) { return result }
+        let kind = unsigned(header, 0, 2, little)
+        let size = unsigned(header, 2, 2, little)
+        at += 4
+        if kind == 0 {
+            let trailing = false
+            for index in at..raw.length { if raw[index] != 0 { trailing = true } }
+            if size != 0 || trailing { raise(state, "malformed pcapng option terminator") }
+            return result
+        }
+        let value = need(state, raw, at, size)
+        if failed(state) { return result }
+        at += (size + 3) & -4
+        if at > raw.length { raise(state, "truncated pcapng option"); return result }
+        result.add(Option { kind: kind; value: value })
+    }
+    return result
+}
+function power(base: Integer, exponent: Integer): Integer {
+    let result = 1
+    for index in 0..exponent { result *= base }
+    return result
+}
+function zero64(value: Bytes, little: Boolean): Boolean {
+    for byte in value { if byte != 0 { return false } }
+    return true
+}
+public function capture(state: Failure, raw: Bytes): List<Record> {
+    let records: List<Record> = []
+    let pcapng = raw.length >= 4 && raw[0] == 10 && raw[1] == 13 && raw[2] == 13 && raw[3] == 10
+    if pcapng {
+        let at = 0
+        let little = true
+        let known = false
+        let interfaces: List<Interface> = []
+        let section = -1
+        while at < raw.length && !failed(state) {
+            let header = need(state, raw, at, 12)
+            if failed(state) { return records }
+            if header[0] == 10 && header[1] == 13 && header[2] == 13 && header[3] == 10 {
+                if header[8] == 77 && header[9] == 60 && header[10] == 43 && header[11] == 26 { little = true }
+                else if header[8] == 26 && header[9] == 43 && header[10] == 60 && header[11] == 77 { little = false }
+                else { raise(state, "invalid pcapng byte order"); return records }
+                known = true
+                interfaces = []
+                section += 1
+            }
+            if !known { raise(state, "pcapng packet before section"); return records }
+            let kind = unsigned(header, 0, 4, little)
+            let size = unsigned(header, 4, 4, little)
+            if size < 12 || size % 4 != 0 { raise(state, "invalid pcapng block length"); return records }
+            let blockBytes = need(state, raw, at, size)
+            if failed(state) { return records }
+            if unsigned(blockBytes, size - 4, 4, little) != size { raise(state, "pcapng block length mismatch"); return records }
+            let body = blockBytes.slice(8, size - 4)
+            if kind == 1 {
+                let fixed = need(state, body, 0, 8)
+                if failed(state) { return records }
+                let denominator = 1000000
+                let offset = 0
+                let seen: List<Integer> = []
+                for option in options(state, body.slice(8, body.length), little) {
+                    if option.kind == 9 || option.kind == 14 {
+                        for earlier in seen { if earlier == option.kind { raise(state, "duplicate pcapng timestamp option") } }
+                        seen.add(option.kind)
+                    }
+                    if option.kind == 9 {
+                        if option.value.length != 1 { raise(state, "invalid pcapng timestamp resolution") }
+                        else if option.value[0] & 128 != 0 {
+                            if option.value[0] & 127 > 62 { raise(state, "pcapng timestamp resolution exceeds exact accounting range") } else { denominator = power(2, option.value[0] & 127) }
+                        } else {
+                            if option.value[0] > 18 { raise(state, "pcapng timestamp resolution exceeds exact accounting range") } else { denominator = power(10, option.value[0]) }
+                        }
+                    } else if option.kind == 14 {
+                        if option.value.length != 8 { raise(state, "invalid pcapng timestamp offset") } else { offset = signed64(option.value, 0, little) }
+                    }
+                }
+                if failed(state) { return records }
+                interfaces.add(Interface { link: unsigned(fixed, 0, 2, little); snaplen: unsigned(fixed, 4, 4, little); denominator: denominator; offset: offset })
+            } else if kind == 6 {
+                let fixed = need(state, body, 0, 20)
+                if failed(state) { return records }
+                let interface = unsigned(fixed, 0, 4, little)
+                let high = unsigned(fixed, 4, 4, little)
+                let low = unsigned(fixed, 8, 4, little)
+                let caplen = unsigned(fixed, 12, 4, little)
+                let original = unsigned(fixed, 16, 4, little)
+                if interface >= interfaces.length { raise(state, "unknown pcapng interface"); return records }
+                if caplen != original { raise(state, "truncated pcapng packet"); return records }
+                let selected = interfaces[interface]
+                if selected.snaplen != 0 && caplen > selected.snaplen { raise(state, "pcapng packet exceeds snapshot length"); return records }
+                let frame = need(state, body, 20, caplen)
+                if failed(state) { return records }
+                let start = 20 + ((caplen + 3) & -4)
+                let tail = Bytes()
+                if start < body.length { tail = body.slice(start, body.length) }
+                for option in options(state, tail, little) {
+                    if option.kind == 4 && (option.value.length != 8 || !zero64(option.value, little)) { raise(state, "capture reports dropped packets") }
+                }
+                if failed(state) { return records }
+                if high >= 2147483648 { raise(state, "capture timestamp exceeds exact accounting range"); return records }
+                let moment = exact(state, high * 4294967296 + low, selected.denominator, selected.offset)
+                if failed(state) { return records }
+                records.add(Record { offset: at; timestamp: [high, low]; exact: moment; resolution: selected.denominator; timeOffset: selected.offset; interface: interface; section: section; linktype: selected.link; frame: frame })
+            } else if kind == 5 {
+                let fixed = need(state, body, 0, 12)
+                if failed(state) { return records }
+                if unsigned(fixed, 0, 4, little) >= interfaces.length { raise(state, "unknown statistics interface"); return records }
+                for option in options(state, body.slice(12, body.length), little) {
+                    if (option.kind == 5 || option.kind == 7) && (option.value.length != 8 || !zero64(option.value, little)) { raise(state, "capture reports dropped packets") }
+                }
+                if failed(state) { return records }
+            } else if kind == 2 || kind == 3 { raise(state, "unsupported packet block cannot be omitted"); return records }
+            else if kind != 168627466 && kind != 4 && kind != 10 && kind != 2989 && kind != 1073744813 { raise(state, "unknown pcapng block cannot be omitted"); return records }
+            at += size
+        }
+        return records
+    }
+    if raw.length < 4 { raise(state, "unsupported capture format"); return records }
+    let little = true
+    let denominator = 1000000
+    if raw[0] == 212 && raw[1] == 195 && raw[2] == 178 && raw[3] == 161 { little = true }
+    else if raw[0] == 161 && raw[1] == 178 && raw[2] == 195 && raw[3] == 212 { little = false }
+    else if raw[0] == 77 && raw[1] == 60 && raw[2] == 178 && raw[3] == 161 { little = true; denominator = 1000000000 }
+    else if raw[0] == 161 && raw[1] == 178 && raw[2] == 60 && raw[3] == 77 { little = false; denominator = 1000000000 }
+    else { raise(state, "unsupported capture format"); return records }
+    let header = need(state, raw, 4, 20)
+    if failed(state) { return records }
+    if unsigned(header, 0, 2, little) != 2 || unsigned(header, 2, 2, little) != 4 { raise(state, "unsupported pcap version"); return records }
+    let snaplen = unsigned(header, 12, 4, little)
+    let linktype = unsigned(header, 16, 4, little)
+    let at = 24
+    while at < raw.length {
+        let fixed = need(state, raw, at, 16)
+        if failed(state) { return records }
+        let seconds = unsigned(fixed, 0, 4, little)
+        let fraction = unsigned(fixed, 4, 4, little)
+        let caplen = unsigned(fixed, 8, 4, little)
+        let original = unsigned(fixed, 12, 4, little)
+        if caplen != original { raise(state, "truncated pcap packet"); return records }
+        if snaplen != 0 && caplen > snaplen { raise(state, "pcap packet exceeds snapshot length"); return records }
+        if fraction >= denominator { raise(state, "invalid pcap subsecond timestamp"); return records }
+        let moment = exact(state, seconds * denominator + fraction, denominator, 0)
+        let frame = need(state, raw, at + 16, caplen)
+        if failed(state) { return records }
+        records.add(Record { offset: at; timestamp: [seconds, fraction]; exact: moment; resolution: denominator; timeOffset: 0; interface: 0; section: 0; linktype: linktype & 65535; frame: frame })
+        at += 16 + caplen
+    }
+    return records
+}
+
+function hexGroup(value: Integer): Text {
+    let digits = Bytes("0123456789abcdef")
+    if value == 0 { return "0" }
+    let result = Bytes()
+    let started = false
+    for shift in [12, 8, 4, 0] {
+        let digit = (value >> shift) & 15
+        if digit != 0 || started { result.add(digits[digit]); started = true }
+    }
+    return Text(result)
+}
+public function formatAddress(raw: Bytes): Text {
+    if raw.length == 4 { return Text(raw[0]) + "." + Text(raw[1]) + "." + Text(raw[2]) + "." + Text(raw[3]) }
+    let groups: List<Integer> = []
+    for index in 0..8 { groups.add(raw[index * 2] * 256 + raw[index * 2 + 1]) }
+    let bestStart = -1
+    let bestLength = 0
+    let index = 0
+    while index < 8 {
+        if groups[index] == 0 {
+            let start = index
+            while index < 8 && groups[index] == 0 { index += 1 }
+            if index - start > bestLength && index - start >= 2 { bestStart = start; bestLength = index - start }
+        } else { index += 1 }
+    }
+    if raw.length == 16 && bestStart == 0 && bestLength == 5 && groups[5] == 65535 {
+        return "::ffff:" + Text(raw[12]) + "." + Text(raw[13]) + "." + Text(raw[14]) + "." + Text(raw[15])
+    }
+    let parts: List<Text> = []
+    let position = 0
+    while position < 8 {
+        if position == bestStart {
+            parts.add("")
+            if position == 0 { parts.add("") }
+            position += bestLength
+            if position == 8 { parts.add("") }
+        } else { parts.add(hexGroup(groups[position])); position += 1 }
+    }
+    return quic.joined(parts, ":")
+}
+function hexDigit(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    return -1
+}
+function decimalOctet(text: Text): Integer {
+    let raw = Bytes(text)
+    if raw.length == 0 || raw.length > 3 || (raw.length > 1 && raw[0] == 48) { return -1 }
+    let value = 0
+    for byte in raw { if byte < 48 || byte > 57 { return -1 }; value = value * 10 + byte - 48 }
+    if value > 255 { return -1 }
+    return value
+}
+function ipv4(text: Text): Bytes {
+    let parts = quic.split(text, 46)
+    if parts.length != 4 { return Bytes() }
+    let result = Bytes()
+    for part in parts {
+        let value = decimalOctet(part)
+        if value < 0 { return Bytes() }
+        result.add(value)
+    }
+    return result
+}
+function ipv6Groups(text: Text): List<Integer> {
+    let result: List<Integer> = []
+    if text == "" { return result }
+    let parts = quic.split(text, 58)
+    for index in 0..parts.length {
+        let part = parts[index]
+        if index == parts.length - 1 && test.contains(part, ".") {
+            let tail = ipv4(part)
+            if tail.length != 4 { return [-1] }
+            result.add(tail[0] * 256 + tail[1])
+            result.add(tail[2] * 256 + tail[3])
+            continue
+        }
+        let raw = Bytes(part)
+        if raw.length == 0 || raw.length > 4 { return [-1] }
+        let value = 0
+        for byte in raw {
+            let digit = hexDigit(byte)
+            if digit < 0 { return [-1] }
+            value = value * 16 + digit
+        }
+        result.add(value)
+    }
+    return result
+}
+public function parseAddress(text: Text): Bytes {
+    if !test.contains(text, ":") { return ipv4(text) }
+    let marker = text.find("::")
+    let groups: List<Integer> = []
+    if marker >= 0 {
+        let head = ipv6Groups(text.slice(0, marker))
+        let tail = ipv6Groups(text.slice(marker + 2, text.length))
+        if test.contains(text.slice(marker + 2, text.length), "::") { return Bytes() }
+        for value in head { if value < 0 { return Bytes() } }
+        for value in tail { if value < 0 { return Bytes() } }
+        if head.length + tail.length > 7 { return Bytes() }
+        for value in head { groups.add(value) }
+        for index in 0..(8 - head.length - tail.length) { groups.add(0) }
+        for value in tail { groups.add(value) }
+    } else {
+        groups = ipv6Groups(text)
+        for value in groups { if value < 0 { return Bytes() } }
+        if groups.length != 8 { return Bytes() }
+    }
+    let result = Bytes()
+    for value in groups { result.add(value >> 8); result.add(value & 255) }
+    return result
+}
+public function normalizeAddress(text: Text): Text {
+    let raw = parseAddress(text)
+    if raw.length == 0 { return "" }
+    return formatAddress(raw)
+}
+
+public record Datagram { valid: Boolean; source: Text; sourcePort: Integer; destination: Text; destinationPort: Integer; payload: Bytes }
+function noDatagram(): Datagram { return Datagram { valid: false; source: ""; sourcePort: 0; destination: ""; destinationPort: 0; payload: Bytes() } }
+public function udp(state: Failure, original: Bytes, linktype: Integer): Datagram {
+    let frame = original
+    if linktype == 1 {
+        let protocol = unsigned(need(state, frame, 12, 2), 0, 2, false)
+        let at = 14
+        while !failed(state) && (protocol == 33024 || protocol == 34984) {
+            protocol = unsigned(need(state, frame, at + 2, 2), 0, 2, false)
+            at += 4
+        }
+        if failed(state) || (protocol != 2048 && protocol != 34525) { return noDatagram() }
+        frame = frame.slice(min(at, frame.length), frame.length)
+    } else if linktype == 113 {
+        let protocol = unsigned(need(state, frame, 14, 2), 0, 2, false)
+        if failed(state) || (protocol != 2048 && protocol != 34525) { return noDatagram() }
+        frame = frame.slice(min(16, frame.length), frame.length)
+    } else if linktype == 276 {
+        let protocol = unsigned(need(state, frame, 0, 2), 0, 2, false)
+        if failed(state) || (protocol != 2048 && protocol != 34525) { return noDatagram() }
+        frame = frame.slice(min(20, frame.length), frame.length)
+    } else if linktype != 101 && linktype != 228 && linktype != 229 { raise(state, "unsupported capture linktype"); return noDatagram() }
+    let version = need(state, frame, 0, 1)[0] >> 4
+    if failed(state) { return noDatagram() }
+    let at = 0
+    let source = ""
+    let destination = ""
+    if version == 4 {
+        let header = need(state, frame, 0, 20)
+        if failed(state) { return noDatagram() }
+        let length = unsigned(header, 2, 2, false)
+        at = (header[0] & 15) * 4
+        if at < 20 || length < at { raise(state, "invalid IPv4 length"); return noDatagram() }
+        frame = need(state, frame, 0, length)
+        if failed(state) { return noDatagram() }
+        if unsigned(header, 6, 2, false) & 16383 != 0 { raise(state, "fragmented IPv4 is outside ledger scope"); return noDatagram() }
+        if header[9] != 17 { return noDatagram() }
+        source = formatAddress(header.slice(12, 16))
+        destination = formatAddress(header.slice(16, 20))
+    } else if version == 6 {
+        let header = need(state, frame, 0, 40)
+        if failed(state) { return noDatagram() }
+        let length = unsigned(header, 4, 2, false)
+        if length == 0 { raise(state, "IPv6 jumbogram is outside ledger scope"); return noDatagram() }
+        frame = need(state, frame, 0, 40 + length)
+        if failed(state) { return noDatagram() }
+        at = 40
+        let protocol = header[6]
+        for index in 0..16 {
+            if protocol != 0 && protocol != 43 && protocol != 60 && protocol != 51 { break }
+            let extension = need(state, frame, at, 2)
+            if failed(state) { return noDatagram() }
+            let units = extension[1] + 1
+            let unit = 8
+            if protocol == 51 { units = extension[1] + 2; unit = 4 }
+            need(state, frame, at, units * unit)
+            if failed(state) { return noDatagram() }
+            protocol = extension[0]
+            at += units * unit
+        }
+        if protocol == 44 { raise(state, "fragmented IPv6 is outside ledger scope"); return noDatagram() }
+        if protocol != 17 { return noDatagram() }
+        source = formatAddress(header.slice(8, 24))
+        destination = formatAddress(header.slice(24, 40))
+    } else { raise(state, "invalid captured IP version"); return noDatagram() }
+    let header = need(state, frame, at, 8)
+    if failed(state) { return noDatagram() }
+    let size = unsigned(header, 4, 2, false)
+    if size < 8 || at + size != frame.length { raise(state, "UDP and IP length mismatch"); return noDatagram() }
+    let payload = need(state, frame, at + 8, size - 8)
+    if failed(state) { return noDatagram() }
+    return Datagram { valid: true; source: source; sourcePort: unsigned(header, 0, 2, false); destination: destination; destinationPort: unsigned(header, 2, 2, false); payload: payload }
+}
+
+public record Varint { value: Integer; next: Integer }
+public function varint(state: Failure, raw: Bytes, at: Integer): Varint {
+    let first = need(state, raw, at, 1)[0]
+    if failed(state) { return Varint { value: 0; next: at } }
+    let width = 1 << (first >> 6)
+    let bytes = need(state, raw, at, width)
+    if failed(state) { return Varint { value: 0; next: at } }
+    let value = bytes[0] & 63
+    for index in 1..width { value = value * 256 + bytes[index] }
+    return Varint { value: value; next: at + width }
+}
+
+public record Packet { kind: Text; packet: Bytes; dcid: Bytes; scid: Bytes; long: Boolean; pnOffset: Integer; tokenLength: Integer; tokenSha: Text }
+public function packets(state: Failure, raw: Bytes): List<Packet> {
+    let result: List<Packet> = []
+    let at = 0
+    while at < raw.length && !failed(state) {
+        let start = at
+        let first = need(state, raw, at, 1)[0]
+        if failed(state) { return result }
+        if first & 128 == 0 {
+            result.add(Packet { kind: "short"; packet: raw.slice(at, raw.length); dcid: Bytes(); scid: Bytes(); long: false; pnOffset: 0; tokenLength: 0; tokenSha: "" })
+            return result
+        }
+        let version = unsigned(need(state, raw, at + 1, 4), 0, 4, false)
+        if failed(state) { return result }
+        if version != 1 { raise(state, "non-v1 long packet is outside ledger scope"); return result }
+        at += 5
+        let size = need(state, raw, at, 1)[0]
+        at += 1
+        if failed(state) { return result }
+        if size > 20 { raise(state, "oversized destination CID"); return result }
+        let dcid = need(state, raw, at, size)
+        at += size
+        let sourceSize = need(state, raw, at, 1)[0]
+        at += 1
+        if failed(state) { return result }
+        if sourceSize > 20 { raise(state, "oversized source CID"); return result }
+        let scid = need(state, raw, at, sourceSize)
+        at += sourceSize
+        if failed(state) { return result }
+        let kind = (first >> 4) & 3
+        let tokenLength = 0
+        let tokenSha = ""
+        if kind == 3 { raise(state, "Retry requires separately bound token policy"); return result }
+        if kind == 0 {
+            let length = varint(state, raw, at)
+            if failed(state) { return result }
+            let token = need(state, raw, length.next, length.value)
+            if failed(state) { return result }
+            at = length.next + length.value
+            tokenLength = length.value
+            tokenSha = sha(token)
+        }
+        let length = varint(state, raw, at)
+        if failed(state) { return result }
+        at = length.next
+        let offset = at - start
+        let packet = need(state, raw, start, offset + length.value)
+        if failed(state) { return result }
+        if length.value == 0 { raise(state, "empty protected QUIC packet"); return result }
+        let names = ["initial", "zerortt", "handshake"]
+        result.add(Packet { kind: names[kind]; packet: packet; dcid: dcid; scid: scid; long: true; pnOffset: offset; tokenLength: tokenLength; tokenSha: tokenSha })
+        at = start + packet.length
+    }
+    return result
+}
+
+public function expand(secret: Bytes, label: Text, length: Integer, bits: Integer): Bytes {
+    let full = Bytes("tls13 " + label)
+    let info = bigEndian(length, 2)
+    info.add(full.length)
+    info.addBytes(full)
+    info.add(0)
+    let result = Bytes()
+    let previous = Bytes()
+    let counter = 1
+    while result.length < length {
+        let message = Bytes()
+        message.addBytes(previous)
+        message.addBytes(info)
+        message.add(counter)
+        previous = hmac(bits, secret, message)
+        result.addBytes(previous)
+        counter += 1
+    }
+    return result.slice(0, length)
+}
+public function mask(state: Failure, key: Bytes, sample: Bytes, chachaSuite: Boolean): Bytes {
+    if sample.length != 16 { raise(state, "missing header protection sample"); return Bytes(5) }
+    if chachaSuite { return chacha(key, sample, 5) }
+    return block(key, sample).slice(0, 5)
+}
+
+public record Frames { valid: Boolean; types: List<Integer>; acks: List<List<Integer>>; closing: Boolean }
+function noFrames(): Frames { return Frames { valid: false; types: []; acks: []; closing: false } }
+public function decodedFrames(raw: Bytes): Frames {
+    let state = failure()
+    let at = 0
+    let types: List<Integer> = []
+    let acks: List<List<Integer>> = []
+    let closed = false
+    if raw.length == 0 { return noFrames() }
+    while at < raw.length {
+        let typeStart = at
+        let kind = varint(state, raw, at)
+        if failed(state) { return noFrames() }
+        at = kind.next
+        types.add(kind.value)
+        if at - typeStart != 1 { return noFrames() }
+        if kind.value == 0 || kind.value == 1 { continue }
+        if kind.value == 2 || kind.value == 3 {
+            let largest = varint(state, raw, at)
+            let delay = varint(state, raw, largest.next)
+            let ranges = varint(state, raw, delay.next)
+            let first = varint(state, raw, ranges.next)
+            if failed(state) { return noFrames() }
+            at = first.next
+            if first.value > largest.value || ranges.value > raw.length { return noFrames() }
+            let low = largest.value - first.value
+            acks.add([low, largest.value])
+            for index in 0..ranges.value {
+                let gap = varint(state, raw, at)
+                let width = varint(state, raw, gap.next)
+                if failed(state) { return noFrames() }
+                at = width.next
+                let high = low - gap.value - 2
+                low = high - width.value
+                if low < 0 { return noFrames() }
+                acks.add([low, high])
+            }
+            if kind.value == 3 {
+                for index in 0..3 {
+                    let value = varint(state, raw, at)
+                    if failed(state) { return noFrames() }
+                    at = value.next
+                }
+            }
+        } else if kind.value == 6 {
+            let offset = varint(state, raw, at)
+            let size = varint(state, raw, offset.next)
+            if failed(state) { return noFrames() }
+            at = size.next
+            if offset.value + size.value >= 4611686018427387904 { return noFrames() }
+            need(state, raw, at, size.value)
+            if failed(state) { return noFrames() }
+            at += size.value
+        } else if kind.value == 28 {
+            let code = varint(state, raw, at)
+            let frame = varint(state, raw, code.next)
+            let size = varint(state, raw, frame.next)
+            if failed(state) { return noFrames() }
+            at = size.next
+            need(state, raw, at, size.value)
+            if failed(state) { return noFrames() }
+            at += size.value
+            closed = true
+        } else { return noFrames() }
+    }
+    return Frames { valid: true; types: types; acks: acks; closing: closed }
+}
+
+public record Secret { direction: Text; identity: Text; secret: Bytes }
+public record Keys { secrets: List<Secret>; largestKeys: List<Text>; largestValues: List<Integer>; processed: Map<Text, Boolean> }
+public function keys(state: Failure, logs: List<Bytes>): Keys {
+    let result = Keys { secrets: []; largestKeys: []; largestValues: []; processed: Map<Text, Boolean>() }
+    for log in logs {
+        for byte in log { if byte >= 128 { raise(state, "keylog is not ASCII"); return result } }
+        for line in test.lines(Text(log)) {
+            let trimmed = line
+            if quic.ends(trimmed, "\r") { trimmed = Text(Bytes(trimmed).slice(0, Bytes(trimmed).length - 1)) }
+            if trimmed == "" || quic.starts(trimmed, "#") { continue }
+            let fields = test.words(trimmed)
+            if fields.length == 0 || (fields[0] != "CLIENT_HANDSHAKE_TRAFFIC_SECRET" && fields[0] != "SERVER_HANDSHAKE_TRAFFIC_SECRET") { continue }
+            let direction = "server"
+            if quic.starts(fields[0], "CLIENT") { direction = "client" }
+            if fields.length != 3 { raise(state, "malformed handshake keylog"); return result }
+            if !validHex(fields[1]) || !validHex(fields[2]) { raise(state, "malformed handshake keylog"); return result }
+            let random = hexBytes(fields[1])
+            let secret = hexBytes(fields[2])
+            if random.length != 32 || (secret.length != 32 && secret.length != 48) { raise(state, "unsupported handshake keylog"); return result }
+            let identity = sha(random)
+            let found = false
+            for existing in result.secrets {
+                if existing.direction == direction && existing.identity == identity {
+                    found = true
+                    if !same(existing.secret, secret) { raise(state, "conflicting handshake keylog"); return result }
+                }
+            }
+            if !found { result.secrets.add(Secret { direction: direction; identity: identity; secret: secret }) }
+        }
+    }
+    let client = false
+    for item in result.secrets { if item.direction == "client" { client = true } }
+    if !client { raise(state, "client Handshake secrets absent") }
+    return result
+}
+function validHex(text: Text): Boolean {
+    let raw = Bytes(text)
+    if raw.length % 2 != 0 { return false }
+    for byte in raw { if hexDigit(byte) < 0 { return false } }
+    return true
+}
+function hexBytes(text: Text): Bytes {
+    let raw = Bytes(text)
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        result.add(hexDigit(raw[index]) * 16 + hexDigit(raw[index + 1]))
+        index += 2
+    }
+    return result
+}
+public function hasSecret(keys: Keys, direction: Text, identity: Text): Boolean {
+    for item in keys.secrets { if item.direction == direction && item.identity == identity { return true } }
+    return false
+}
+public record Authentication { valid: Boolean; identity: Text; suite: Text; number: Integer; duplicate: Boolean; frames: Frames }
+function noAuthentication(): Authentication { return Authentication { valid: false; identity: ""; suite: ""; number: 0; duplicate: false; frames: noFrames() } }
+function largestFor(keys: Keys, name: Text): Integer {
+    for index in 0..keys.largestKeys.length { if keys.largestKeys[index] == name { return keys.largestValues[index] } }
+    return -1
+}
+function setLargest(keys: Keys, name: Text, value: Integer) {
+    for index in 0..keys.largestKeys.length { if keys.largestKeys[index] == name { keys.largestValues[index] = value; return } }
+    keys.largestKeys.add(name)
+    keys.largestValues.add(value)
+}
+public function authenticate(state: Failure, keys: Keys, entry: Packet, connection: Text, direction: Text): Authentication {
+    let packet = entry.packet
+    let offset = entry.pnOffset
+    for item in keys.secrets {
+        if item.direction != direction { continue }
+        let suites = ["AES128", "CHACHA20"]
+        if item.secret.length == 48 { suites = ["AES256"] }
+        for suite in suites {
+            let chachaSuite = suite == "CHACHA20"
+            let size = 16
+            let bits = 256
+            if suite != "AES128" { size = 32 }
+            if suite == "AES256" { bits = 384 }
+            let hp = expand(item.secret, "quic hp", size, bits)
+            if offset + 20 > packet.length { continue }
+            let hpMask = mask(state, hp, packet.slice(offset + 4, offset + 20), chachaSuite)
+            if failed(state) { return noAuthentication() }
+            let first = packet[0] ^ (hpMask[0] & 15)
+            let width = (first & 3) + 1
+            if first & 12 != 0 || first & 192 != 192 || (first >> 4) & 3 != 2 { continue }
+            let pn = Bytes()
+            for index in 0..width { pn.add(packet[offset + index] ^ hpMask[index + 1]) }
+            let truncated = unsigned(pn, 0, width, false)
+            let slot = connection + "|" + direction + "|" + item.identity
+            let largest = largestFor(keys, slot)
+            let expected = largest + 1
+            let window = 1 << (8 * width)
+            let half = window / 2
+            let number = (expected & -window) | truncated
+            if number <= expected - half && number + window < 4611686018427387904 { number += window }
+            else if number > expected + half && number >= window { number -= window }
+            let additional = Bytes()
+            additional.add(first)
+            additional.addBytes(packet.slice(1, offset))
+            additional.addBytes(pn)
+            let key = expand(item.secret, "quic key", size, bits)
+            let iv = expand(item.secret, "quic iv", 12, bits)
+            let nonce = iv.slice(0, 12)
+            let counter = bigEndian(number, 8)
+            for index in 0..8 { nonce[4 + index] = nonce[4 + index] ^ counter[index] }
+            if offset + width > packet.length { continue }
+            let opened = open(chachaSuite, key, nonce, additional, packet.slice(offset + width, packet.length))
+            if !opened.valid { continue }
+            let frames = decodedFrames(opened.plaintext)
+            if !frames.valid { continue }
+            setLargest(keys, slot, max(largest, number))
+            let processed = slot + "|" + Text(number)
+            let duplicate = keys.processed.has(processed)
+            keys.processed[processed] = true
+            return Authentication { valid: true; identity: item.identity; suite: suite; number: number; duplicate: duplicate; frames: frames }
+        }
+    }
+    return noAuthentication()
+}
+public function authenticationJSON(value: Authentication): json.Value {
+    let types: List<json.Value> = []
+    for kind in value.frames.types { types = types.appended(data.number(kind)) }
+    let ranges: List<json.Value> = []
+    for pair in value.frames.acks { ranges = ranges.appended(data.array([data.number(pair[0]), data.number(pair[1])])) }
+    return data.object(["key_identifier", "suite", "packet_number", "duplicate", "frame_types", "ack_ranges", "closing"],
+        [data.string(value.identity), data.string(value.suite), data.number(value.number), data.boolean(value.duplicate), data.array(types), data.array(ranges), data.boolean(value.frames.closing)])
+}
+
+public record Connection { name: Text; originalDcid: Text; clientScid: Text; keyIdentifier: Text }
+public record Attribution { clientIds: List<Text>; clientOwners: List<Text>; serverIds: List<Text>; serverOwners: List<Text>; connections: List<Connection> }
+public function attribution(): Attribution { return Attribution { clientIds: []; clientOwners: []; serverIds: []; serverOwners: []; connections: [] } }
+function lookup(ids: List<Text>, owners: List<Text>, id: Text): Text {
+    for index in 0..ids.length { if ids[index] == id { return owners[index] } }
+    return ""
+}
+function bind(state: Failure, ids: List<Text>, owners: List<Text>, id: Text, connection: Text) {
+    if id == "" { raise(state, "zero-length CID attribution is outside ledger scope"); return }
+    let existing = lookup(ids, owners, id)
+    if existing != "" && existing != connection { raise(state, "CID belongs to another connection"); return }
+    if existing == "" { ids.add(id); owners.add(connection) }
+}
+public function connectionIndex(value: Attribution, name: Text): Integer {
+    for index in 0..value.connections.length { if value.connections[index].name == name { return index } }
+    return -1
+}
+public function attribute(state: Failure, value: Attribution, entry: Packet, direction: Text): Text {
+    if entry.kind == "short" {
+        let ids = value.serverIds
+        let owners = value.serverOwners
+        if direction != "client" { ids = value.clientIds; owners = value.clientOwners }
+        let tail = quic.hex(entry.packet.slice(min(1, entry.packet.length), entry.packet.length))
+        let matches: List<Text> = []
+        for index in 0..ids.length {
+            if quic.starts(tail, ids[index]) {
+                let known = false
+                for match in matches { if match == owners[index] { known = true } }
+                if !known { matches.add(owners[index]) }
+            }
+        }
+        if matches.length != 1 { raise(state, "unknown or ambiguous short-header attribution"); return "" }
+        return matches[0]
+    }
+    let dcid = quic.hex(entry.dcid)
+    let scid = quic.hex(entry.scid)
+    if direction == "client" {
+        let connection = lookup(value.clientIds, value.clientOwners, scid)
+        if connection == "" {
+            if entry.kind != "initial" { raise(state, "unknown client connection"); return "" }
+            let identity = Bytes()
+            identity.addBytes(entry.dcid)
+            identity.add(0)
+            identity.addBytes(entry.scid)
+            connection = sha(identity)
+            value.connections.add(Connection { name: connection; originalDcid: dcid; clientScid: scid; keyIdentifier: "" })
+            bind(state, value.clientIds, value.clientOwners, scid, connection)
+            if failed(state) { return "" }
+        }
+        let bound = lookup(value.serverIds, value.serverOwners, dcid)
+        if bound != "" && bound != connection { raise(state, "cross-connection client CID"); return "" }
+        if bound == "" && dcid != value.connections[connectionIndex(value, connection)].originalDcid { raise(state, "client uses an unknown server CID"); return "" }
+        return connection
+    }
+    let connection = lookup(value.clientIds, value.clientOwners, dcid)
+    if connection == "" { raise(state, "unknown server connection"); return "" }
+    bind(state, value.serverIds, value.serverOwners, scid, connection)
+    return connection
+}
+
+public record Route { key: Text; received: Integer; sent: Integer; validated: Boolean; boundary: Integer }
+public record Ledger { policy: Text; routes: List<Route>; rows: List<json.Value>; violations: List<Integer> }
+public function ledger(policy: Text): Ledger { return Ledger { policy: policy; routes: []; rows: []; violations: [] } }
+public function record(value: Ledger, connection: Text, route: List<Text>, direction: Text, size: Integer, authentication: json.Value, captureKeys: List<Text>, captureValues: List<json.Value>) {
+    let key = connection + "|" + quic.joined(route, "|")
+    let index = -1
+    for position in 0..value.routes.length { if value.routes[position].key == key { index = position } }
+    if index < 0 { value.routes.add(Route { key: key; received: 0; sent: 0; validated: false; boundary: -1 }); index = value.routes.length - 1 }
+    let state = value.routes[index]
+    let before = state.validated
+    if direction == "client" {
+        state.received += size
+        if !data.isNull(authentication) { state.validated = true; state.boundary = value.rows.length }
+    } else {
+        state.sent += size
+        if !before && state.sent > 3 * state.received { value.violations.add(value.rows.length) }
+    }
+    let tuple: List<json.Value> = [data.string(route[0]), data.number(Integer(route[1])), data.string(route[2]), data.number(Integer(route[3]))]
+    let keys = ["order", "connection", "tuple", "direction", "udp_payload_bytes", "received", "sent", "budget", "validated_before", "validated_after", "authentication"]
+    let items = [data.number(value.rows.length), data.string(connection), data.array(tuple), data.string(direction), data.number(size), data.number(state.received), data.number(state.sent),
+        data.number(3 * state.received), data.boolean(before), data.boolean(state.validated), authentication]
+    for position in 0..captureKeys.length { keys.add(captureKeys[position]); items = items.appended(captureValues[position]) }
+    value.rows = value.rows.appended(data.object(keys, items))
+}
+function integers(values: List<Integer>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items = items.appended(data.number(value)) }
+    return data.array(items)
+}
+public function result(value: Ledger): json.Value {
+    let boundaries: List<Integer> = []
+    let names: List<Text> = []
+    for route in value.routes {
+        if route.boundary >= 0 { boundaries.add(route.boundary) }
+        let connection = quic.split(route.key, 124)[0]
+        let known = false
+        for name in names { if name == connection { known = true } }
+        if !known { names.add(connection) }
+    }
+    let status = "passed"
+    if value.violations.length > 0 && value.policy == "handshake-only" { status = "failed" }
+    else if value.violations.length > 0 || boundaries.length == 0 { status = "coverage-limited" }
+    let limitation = data.none()
+    if value.policy == "peer-unknown" { limitation = data.string("Unknown peer CID/token validation policy cannot be inferred from PCAP.") }
+    return data.object(["schema_version", "scope", "policy", "status", "violations", "authenticated_boundaries", "connection_count", "rows", "limitation"],
+        [data.number(1), data.string("synthetic accounting or separately checked endpoint-policy receipt; no official claim from direct analyze()"), data.string(value.policy), data.string(status),
+        integers(value.violations), integers(boundaries), data.number(names.length), data.array(value.rows), limitation])
+}
+
+public record Analysis { error: Text; report: json.Value }
+function covered(message: Text): Analysis { return Analysis { error: message; report: data.none() } }
+function pair(first: Integer, second: Integer): json.Value { return data.array([data.number(first), data.number(second)]) }
+public function analyze(captureBytes: Bytes, logs: List<Bytes>, serverAddresses: List<Text>, port: Integer, policy: Text, expectedConnections: Integer): Analysis {
+    let state = failure()
+    let servers: List<Text> = []
+    for address in serverAddresses {
+        let normalized = normalizeAddress(address)
+        if normalized == "" { return covered("invalid server address: " + address) }
+        servers.add(normalized)
+    }
+    let keyring = keys(state, logs)
+    if failed(state) { return covered(state.message[0]) }
+    let owners = attribution()
+    let accounting = ledger(policy)
+    let interface = ""
+    let duplicates = Map<Text, Boolean>()
+    let issued: List<Text> = []
+    let closing: List<Text> = []
+    let uncertain: List<Text> = []
+    let limitations: List<Text> = []
+    let last = Exact { numerator: 0; denominator: 1 }
+    let started = false
+    let routeKeys: List<Text> = []
+    let routeTimes: List<Exact> = []
+    let routeDirections: List<Text> = []
+    let records = capture(state, captureBytes)
+    let parsedState = state.message[0]
+    state.message[0] = ""
+    for index in 0..records.length {
+        let item = records[index]
+        if started && compare(item.exact, last) < 0 { return covered("capture timestamps decrease in file order") }
+        last = item.exact
+        started = true
+        let datagram = udp(state, item.frame, item.linktype)
+        if failed(state) { return covered(state.message[0]) }
+        if !datagram.valid { continue }
+        let direction = ""
+        let route: List<Text> = []
+        let sourceServer = false
+        let destinationServer = false
+        for server in servers {
+            if server == datagram.source { sourceServer = true }
+            if server == datagram.destination { destinationServer = true }
+        }
+        if sourceServer && datagram.sourcePort == port { direction = "server"; route = [datagram.destination, Text(datagram.destinationPort), datagram.source, Text(datagram.sourcePort)] }
+        else if destinationServer && datagram.destinationPort == port { direction = "client"; route = [datagram.source, Text(datagram.sourcePort), datagram.destination, Text(datagram.destinationPort)] }
+        else { continue }
+        let current = Text(item.section) + ":" + Text(item.interface)
+        if interface != "" && current != interface { return covered("multiple capture interfaces can duplicate UDP credits") }
+        interface = current
+        let duplicateKey = current + "|" + Text(item.timestamp[0]) + "|" + Text(item.timestamp[1]) + "|" + sha(item.frame)
+        if duplicates.has(duplicateKey) { return covered("ambiguous exact capture duplicate") }
+        duplicates[duplicateKey] = true
+        let entries = packets(state, datagram.payload)
+        if failed(state) { return covered(state.message[0]) }
+        for entry in entries { if entry.tokenLength > 0 { return covered("Initial token validation policy is unproved") } }
+        let connections: List<Text> = []
+        for entry in entries {
+            let connection = attribute(state, owners, entry, direction)
+            if failed(state) { return covered(state.message[0]) }
+            let known = false
+            for name in connections { if name == connection { known = true } }
+            if !known { connections.add(connection) }
+        }
+        if connections.length != 1 { return covered("coalesced datagram attribution is ambiguous") }
+        let connection = connections[0]
+        let routeKey = connection + "|" + quic.joined(route, "|")
+        let routeIndex = -1
+        for position in 0..routeKeys.length { if routeKeys[position] == routeKey { routeIndex = position } }
+        if routeIndex >= 0 && compare(routeTimes[routeIndex], item.exact) == 0 && routeDirections[routeIndex] != direction {
+            return covered("opposite-direction UDP ordering is ambiguous at declared timestamp resolution")
+        }
+        if routeIndex < 0 { routeKeys.add(routeKey); routeTimes.add(item.exact); routeDirections.add(direction) }
+        else { routeTimes[routeIndex] = item.exact; routeDirections[routeIndex] = direction }
+        let rejected: List<Text> = []
+        let authentication = data.none()
+        for entry in entries {
+            if entry.kind != "handshake" { continue }
+            let found = authenticate(state, keyring, entry, connection, direction)
+            if failed(state) { return covered(state.message[0]) }
+            if !found.valid {
+                if direction == "server" { uncertain.add(connection) }
+                continue
+            }
+            let position = connectionIndex(owners, connection)
+            let bound = owners.connections[position].keyIdentifier
+            if bound != "" && bound != found.identity { return covered("connection changed handshake secret identity") }
+            owners.connections[position].keyIdentifier = found.identity
+            if direction == "server" {
+                let mark = connection + "|" + Text(found.number)
+                let seen = false
+                for value in issued { if value == mark { seen = true } }
+                if !seen { issued.add(mark) }
+                if found.frames.closing { closing.add(connection) }
+            } else {
+                let certain = true
+                for name in uncertain { if name == connection { certain = false } }
+                if found.frames.acks.length > 0 && (!hasSecret(keyring, "server", found.identity) || !certain) { limitations.add("server-handshake-ack-ownership-unproved") }
+                let owns = true
+                for range in found.frames.acks {
+                    let count = 0
+                    for value in issued { if quic.starts(value, connection + "|") { count += 1 } }
+                    if range[1] - range[0] + 1 > count { owns = false }
+                    else { for number in range[0]..(range[1] + 1) { let known = false; for value in issued { if value == connection + "|" + Text(number) { known = true } }; if !known { owns = false } } }
+                }
+                let closed = found.frames.closing
+                for name in closing { if name == connection { closed = true } }
+                if found.duplicate { rejected.add("already-processed-handshake-packet") }
+                else if closed { rejected.add("authenticated-closing-packet") }
+                else if !owns { rejected.add("unknown-handshake-ack-ownership") }
+                else { authentication = authenticationJSON(found) }
+            }
+        }
+        let types: List<Text> = []
+        for entry in entries { types.add(entry.kind) }
+        let captureKeys = ["capture_index", "file_offset", "timestamp", "timestamp_exact", "timestamp_resolution", "timestamp_offset_seconds", "interface", "section", "udp_payload_sha256", "frame_sha256", "packet_types", "boundary_rejections"]
+        let captureValues = [data.number(index), data.number(item.offset), pair(item.timestamp[0], item.timestamp[1]), pair(item.exact.numerator, item.exact.denominator), pair(1, item.resolution),
+            data.number(item.timeOffset), data.number(item.interface), data.number(item.section), data.string(sha(datagram.payload)), data.string(sha(item.frame)), data.strings(types), data.strings(rejected)]
+        record(accounting, connection, route, direction, datagram.payload.length, authentication, captureKeys, captureValues)
+    }
+    if parsedState != "" { return covered(parsedState) }
+    if accounting.rows.length == 0 { return covered("no selected server UDP datagrams") }
+    let report = result(accounting)
+    let unique: List<Text> = []
+    for value in limitations.sorted() { if unique.length == 0 || unique[unique.length - 1] != value { unique.add(value) } }
+    report = data.with(report, "coverage_limitations", data.strings(unique))
+    if unique.length > 0 { report = data.with(report, "status", data.string("coverage-limited")) }
+    if !data.equalsInteger(data.field(report, "connection_count"), expectedConnections) { return covered("unexpected number of attributed connections") }
+    return Analysis { error: ""; report: report }
+}
+
+public record Retained { key: Text; entry: json.Value; content: Bytes }
+public record Retention { root: Text; items: List<Retained>; faults: List<Text> }
+public function retention(root: Text): Retention {
+    let faults: List<Text> = []
+    let value = system.getenv("MINYAR_LEDGER_FAULT")
+    if value != "" { faults = quic.split(value, 44) }
+    return Retention { root: root; items: []; faults: faults }
+}
+function binding(raw: Bytes): json.Value { return data.object(["sha256", "bytes"], [data.string(sha(raw)), data.number(raw.length)]) }
+public function canonicalPath(path: Text): Text {
+    let log = test.scratch()
+    let result = test.run(["/bin/sh", "-c", "if [ -e \"$1\" ]; then realpath -- \"$1\"; else d=$(dirname -- \"$1\") && b=$(basename -- \"$1\") && cd -- \"$d\" 2>/dev/null && printf '%s/%s\\n' \"$(pwd -P)\" \"$b\"; fi", "minyar", path], system.environment(), "", log + "/resolve", 30)
+    test.removeTree(log)
+    if result.status != 0 || test.lines(result.output).length == 0 { return path }
+    return test.lines(result.output)[0]
+}
+public function inputsJSON(value: Retention): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for item in value.items { keys.add(item.key); items = items.appended(item.entry) }
+    return data.object(keys, items)
+}
+public function retain(state: Failure, value: Retention, path: Text): Bytes {
+    let key = canonicalPath(path)
+    for item in value.items { if item.key == key { return item.content } }
+    if files.pathSize(key) < 0 { raise(state, "FileNotFoundError: No such file or directory: '" + key + "'"); return Bytes() }
+    let raw = files.readFile(key)
+    let before = binding(raw)
+    let name = "input-" + quic.after(Text(1000 + value.items.length), "1") + ".bin"
+    let entry = data.object(["sha256", "bytes", "original_before", "retained_path", "copied_exact"], [data.string(sha(raw)), data.number(raw.length), before, data.string(name), data.boolean(false)])
+    let item = Retained { key: key; entry: entry; content: raw }
+    value.items.add(item)
+    writeBytesFile(value.root + "/" + name, raw)
+    if name == "input-001.bin" {
+        for fault in value.faults {
+            if fault == "retained-mutation" { writeBytesFile(value.root + "/" + name, concat([raw, Bytes("x")])) }
+            if fault == "original-mutation" { writeBytesFile(key, concat([raw, Bytes("x")])) }
+        }
+    }
+    let copy = files.readFile(value.root + "/" + name)
+    let after = files.readFile(key)
+    let exact = same(raw, copy) && same(raw, after)
+    item.entry = data.with(data.with(data.with(entry, "retained", binding(copy)), "original_after", binding(after)), "copied_exact", data.boolean(exact))
+    if !exact { raise(state, "CoverageError: input changed during retention: " + key) }
+    return raw
+}
+public function expected(state: Failure, value: Retention, bound: json.Value): Bytes {
+    if !data.isObject(bound) || !data.isText(data.field(bound, "path")) || !data.exactInteger(data.field(bound, "bytes")) { raise(state, "CoverageError: invalid evidence input binding"); return Bytes() }
+    let path = data.field(bound, "path").text
+    if !quic.starts(path, "/") { raise(state, "CoverageError: evidence input path must be absolute"); return Bytes() }
+    let raw = retain(state, value, path)
+    if failed(state) { return raw }
+    if !data.equalsText(data.field(bound, "sha256"), sha(raw)) || data.integer(data.field(bound, "bytes")) != raw.length { raise(state, "CoverageError: evidence input bytes mismatch") }
+    return raw
+}
+public function recheck(value: Retention): List<Text> {
+    let failures: List<Text> = []
+    for item in value.items {
+        let original = files.readFile(item.key)
+        let copy = files.readFile(value.root + "/" + data.field(item.entry, "retained_path").text)
+        let exact = same(item.content, original) && same(item.content, copy)
+        item.entry = data.with(data.with(data.with(item.entry, "original_after", binding(original)), "retained", binding(copy)), "copied_exact", data.boolean(exact))
+        if !exact { failures.add("CoverageError: input changed before finalization: " + item.key) }
+    }
+    return failures
+}
+
+function retainedBuild(state: Failure, value: json.Value, root: Text, store: Retention, epochs: Boolean): Bytes {
+    let name = data.field(value, "retained")
+    if !data.isText(name) || name.text == "" || quic.starts(name.text, "/") || test.contains("/" + name.text + "/", "/../") { raise(state, "CoverageError: invalid retained build path"); return Bytes() }
+    let raw = retain(state, store, root + "/" + name.text)
+    if failed(state) { return raw }
+    let digest = sha(raw)
+    let fields = ["sha256", "source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256", "post_link_sha256"]
+    if !epochs { fields = ["sha256"] }
+    let ok = data.equalsInteger(data.field(value, "bytes"), raw.length)
+    for field in fields { if !data.equalsText(data.field(value, field), digest) { ok = false } }
+    if !ok { raise(state, "CoverageError: build input bytes or before/copy/after binding mismatch") }
+    return raw
+}
+function directoryOf(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = -1
+    for index in 0..raw.length { if raw[index] == 47 { slash = index } }
+    if slash <= 0 { return "/" }
+    return Text(raw.slice(0, slash))
+}
+function nameOf(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = -1
+    for index in 0..raw.length { if raw[index] == 47 { slash = index } }
+    return Text(raw.slice(slash + 1, raw.length))
+}
+public function checkedLinkGraph(state: Failure, build: json.Value, root: Text, store: Retention, canonicalDriver: Text): json.Value {
+    let none = data.none()
+    if !data.equalsInteger(data.field(build, "schema"), 2) || !data.equalsText(data.field(build, "mode"), "native") || !data.equalsText(data.field(build, "optimization"), "2") { raise(state, "CoverageError: reviewed native O2 schema2 build required"); return none }
+    if !data.isTrue(data.field(build, "link_attempted")) || !data.equalsInteger(data.field(build, "link_status"), 0) || !data.equalsInteger(data.field(build, "link_subprocess_status"), 0) || !data.equal(data.field(build, "retention_errors"), data.array([])) {
+        raise(state, "CoverageError: successful retained link required"); return none
+    }
+    if !data.equal(data.field(build, "link_flags"), data.strings(["-O2", "-Wno-override-module"])) || !data.equal(data.field(build, "lto_flags"), data.array([])) || !data.isFalse(data.field(build, "address_sanitizer_enabled")) {
+        raise(state, "CoverageError: unexpected native link flags"); return none
+    }
+    let program = data.field(build, "program_input")
+    let raw = data.field(build, "raw_program_input")
+    if !data.equalsText(data.field(program, "role"), "program") || !data.equalsText(data.field(program, "format"), "llvm") { raise(state, "CoverageError: one generated LLVM program required"); return none }
+    let rawData = retainedBuild(state, raw, root, store, true)
+    let programData = retainedBuild(state, program, root, store, true)
+    if failed(state) { return none }
+    if !same(rawData, programData) || !data.equalsText(data.field(build, "raw_sha256"), sha(rawData)) || !data.equalsText(data.field(build, "linked_program_sha256"), sha(programData)) { raise(state, "CoverageError: native program LLVM identity mismatch"); return none }
+    let inputs = data.field(build, "inputs")
+    if !data.isArray(inputs) || inputs.items.length != 7 { raise(state, "CoverageError: one runtime and six represented provider objects required"); return none }
+    for index in 0..7 {
+        let role = "provider"
+        if index == 0 { role = "runtime" }
+        if !data.equalsText(data.field(inputs.items[index], "role"), role) { raise(state, "CoverageError: one runtime and six represented provider objects required"); return none }
+    }
+    let originals: List<Text> = []
+    let allOriginals = [data.field(program, "original")]
+    for item in inputs.items { allOriginals = allOriginals.appended(data.field(item, "original")) }
+    for value in allOriginals {
+        if !data.isText(value) || !quic.starts(value.text, "/") { raise(state, "CoverageError: ambiguous original build inputs"); return none }
+        for earlier in originals { if earlier == value.text { raise(state, "CoverageError: ambiguous original build inputs"); return none } }
+        originals.add(value.text)
+    }
+    for item in inputs.items {
+        if !data.equalsText(data.field(item, "format"), "native_object") { raise(state, "CoverageError: native runtime/provider object required"); return none }
+        retainedBuild(state, item, root, store, true)
+        if failed(state) { return none }
+    }
+    let tools = data.field(build, "tool_bindings")
+    if !data.isObject(tools) || tools.keys.length != 2 || !data.present(tools, "clang-driver") || !data.present(tools, "clang.bin") { raise(state, "CoverageError: complete retained compiler/tool bindings required"); return none }
+    for index in 0..tools.keys.length {
+        let name = tools.keys[index]
+        let value = tools.items[index]
+        let raw = retainedBuild(state, value, root, store, false)
+        if failed(state) { return none }
+        let digest = sha(raw)
+        let ok = data.equalsText(data.field(data.field(build, "tools"), name), digest)
+        for field in ["source_before_sha256", "retained_sha256", "source_after_sha256"] { if !data.equalsText(data.field(value, field), digest) { ok = false } }
+        if !ok { raise(state, "CoverageError: tool before/copy/after bytes mismatch"); return none }
+        if name == "clang-driver" && (files.pathSize(canonicalDriver) < 0 || digest != sha(files.readFile(canonicalDriver))) { raise(state, "CoverageError: unreviewed canonical link tool"); return none }
+    }
+    let compiler = data.field(build, "compiler_pre_link")
+    let clang = data.field(tools, "clang.bin")
+    if !data.equal(data.field(compiler, "selected_command"), data.field(build, "compiler_selected_command")) || !data.equal(data.field(compiler, "resolved_path"), data.field(clang, "original")) ||
+        !data.equal(data.field(compiler, "sha256"), data.field(clang, "sha256")) {
+        raise(state, "CoverageError: actual compiler command or bytes not bound"); return none
+    }
+    if canonicalPath(data.field(compiler, "selected_command").text) != canonicalPath(data.field(compiler, "resolved_path").text) { raise(state, "CoverageError: selected compiler resolves to different bytes"); return none }
+    let staged = data.field(build, "staged_output")
+    let final = data.field(build, "final_output")
+    for value in [staged, final] {
+        if !data.isText(data.field(value, "path")) || !quic.starts(data.field(value, "path").text, "/") { raise(state, "CoverageError: staged/final build output paths required"); return none }
+    }
+    let stagedPath = data.field(staged, "path").text
+    let finalPath = data.field(final, "path").text
+    if nameOf(stagedPath) != nameOf(finalPath) || directoryOf(directoryOf(stagedPath)) != directoryOf(finalPath) || !quic.starts(nameOf(directoryOf(stagedPath)), ".minyar-link-") || stagedPath == finalPath {
+        raise(state, "CoverageError: unexpected staged output location"); return none
+    }
+    let expected = [data.field(compiler, "selected_command").text]
+    for flag in data.texts(data.field(build, "link_flags")) { expected.add(flag) }
+    expected.add(data.field(program, "original").text)
+    for index in 0..3 { expected.add(originals[index + 1]) }
+    expected.add("-lcrypto")
+    for index in 3..7 { expected.add(originals[index + 1]) }
+    expected.add("-lcrypto")
+    expected.add("-lm")
+    let actual: List<Text> = []
+    for value in expected { actual.add(value) }
+    actual.add("-o")
+    actual.add(stagedPath)
+    if !data.equal(data.field(build, "command"), data.strings(expected)) || !data.equal(data.field(build, "actual_command"), data.strings(actual)) || !data.equalsText(data.field(build, "staged_requested_path"), stagedPath) {
+        raise(state, "CoverageError: complete actual linker argv or staging mismatch"); return none
+    }
+    let finalData = retainedBuild(state, final, root, store, false)
+    let stagedData = retainedBuild(state, staged, root, store, false)
+    if failed(state) { return none }
+    if !same(finalData, stagedData) || !data.equalsText(data.field(build, "binary_sha256"), sha(finalData)) { raise(state, "CoverageError: staged/final output bytes differ"); return none }
+    return data.object(["status", "binary_sha256", "bytes"], [data.string("checked-byte-graph"), data.string(sha(finalData)), data.number(finalData.length)])
+}
+function suffixParts(path: Text, count: Integer): Text {
+    let parts = quic.split(path, 47)
+    if parts.length < count { return "" }
+    let result: List<Text> = []
+    for index in (parts.length - count)..parts.length { result.add(parts[index]) }
+    return quic.joined(result, "/")
+}
+public function checkedFrontendGraph(state: Failure, record: json.Value, sources: json.Value, raw: json.Value, store: Retention): json.Value {
+    let none = data.none()
+    if !data.equalsInteger(data.field(record, "status"), 0) || !data.isFalse(data.field(record, "timed_out")) || !data.equalsInteger(data.field(record, "timeout_seconds"), 120) { raise(state, "CoverageError: exact successful bounded frontend status required"); return none }
+    let server = data.field(data.field(sources, "server"), "path").text
+    let library = data.field(data.field(sources, "quic"), "path").text
+    if suffixParts(server, 4) != "tests/interop/qns/server.min" || suffixParts(library, 2) != "library/quic.min" || directoryOf(directoryOf(directoryOf(directoryOf(server)))) != directoryOf(directoryOf(library)) {
+        raise(state, "CoverageError: reviewed source/library layout required"); return none
+    }
+    let compiler = data.field(record, "compiler")
+    let output = data.field(record, "output")
+    let expectedArgv = data.array([data.field(compiler, "path"), data.string(server), data.field(raw, "original"), data.string("--bounded-owners"), data.string("32"), data.string("--library"), data.string(directoryOf(library))])
+    if !data.equal(data.field(record, "argv"), expectedArgv) || !data.equal(data.field(output, "path"), data.field(raw, "original")) { raise(state, "CoverageError: canonical frontend argv/output mismatch"); return none }
+    let generated = expected(state, store, output)
+    if failed(state) { return none }
+    if !data.equalsText(data.field(raw, "sha256"), sha(generated)) || !data.equalsInteger(data.field(raw, "bytes"), generated.length) { raise(state, "CoverageError: frontend generated output is not actual raw program LLVM"); return none }
+    for stream in ["stdout", "stderr"] {
+        expected(state, store, data.field(record, stream))
+        if failed(state) { return none }
+    }
+    return data.object(["status", "raw_sha256"], [data.string("checked-frontend-graph"), data.string(sha(generated))])
+}
+public function checkedEndpointMode(state: Failure, endpoint: json.Value, run: json.Value, serverAddresses: List<Text>, serverPort: Integer): json.Value {
+    let none = data.none()
+    let configuration = data.field(endpoint, "Config")
+    let command = data.field(configuration, "Cmd")
+    if !data.equalsText(data.field(endpoint, "Path"), "python3") || !data.equal(data.field(endpoint, "Args"), data.strings(["/opt/minyar/endpoint.py"])) ||
+        !data.equal(data.field(configuration, "Entrypoint"), data.strings(["python3", "/opt/minyar/endpoint.py"])) || !(data.isNull(command) || data.equal(command, data.array([]))) {
+        raise(state, "CoverageError: captured endpoint executable command mismatch"); return none
+    }
+    let project = data.field(run, "project").text
+    let networks = data.field(data.field(endpoint, "NetworkSettings"), "Networks")
+    if !data.isObject(networks) || networks.keys.length != 1 || networks.keys[0] != project + "_rightnet" { raise(state, "CoverageError: captured server network membership mismatch"); return none }
+    let network = networks.items[0]
+    let actual: List<Text> = []
+    for field in ["IPAddress", "GlobalIPv6Address"] {
+        let value = data.field(network, field)
+        if data.isText(value) && value.text != "" {
+            let normalized = normalizeAddress(value.text)
+            if normalized == "" { raise(state, "ValueError: invalid captured endpoint address"); return none }
+            actual.add(normalized)
+        }
+    }
+    if actual.length == 0 || !data.equal(data.field(run, "server_addresses"), data.strings(actual)) || quic.joined(serverAddresses, "\n") != quic.joined(actual, "\n") || !data.equalsInteger(data.field(run, "server_port"), 443) || serverPort != 443 {
+        raise(state, "CoverageError: captured endpoint tuple mismatch"); return none
+    }
+    return data.object(["status", "addresses", "port"], [data.string("checked-endpoint-command-and-tuple"), data.strings(actual), data.number(443)])
+}
+
+public function errorParts(error: Text): List<Text> {
+    let at = error.find(": ")
+    if at > 0 {
+        let name = error.slice(0, at)
+        let valid = quic.ends(name, "Error") || quic.ends(name, "Failure")
+        for character in name { if !((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')) { valid = false } }
+        if valid { return [name, error.slice(at + 2, error.length)] }
+    }
+    return ["CoverageError", error]
+}
+public function policyContract(): json.Value {
+    return data.object(["name", "role", "testcase", "early_cid_validation", "retry_validation", "token_validation"],
+        [data.string("minyar-handshake-only-v1"), data.string("server"), data.string("transfer"), data.boolean(false), data.boolean(false), data.boolean(false)])
+}
+function reviewedRoles(): List<Text> { return ["quic", "server", "adapter"] }
+function reviewedDigest(role: Text): Text {
+    if role == "quic" { return "295dbe88c1066312b3748373cf6205af8a7a71d0019a3aa5b03c3be149f49fe4" }
+    if role == "server" { return "5058595f3bc9c0e5ac7d330c6b85b39167cd7e619d714a2f9e437b2130fdeb44" }
+    return "8dd22250a1720ffd7f4120cd3204057ea19d692fdd8d799a0977b60483a417da"
+}
+function lowerHex(text: Text, length: Integer): Boolean {
+    let raw = Bytes(text)
+    if raw.length != length { return false }
+    for byte in raw { if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false } }
+    return true
+}
+public record Request { capture: Text; origin: Text; keylogs: List<Text>; addresses: List<Text>; port: Integer; source: Text; binary: Text; receipt: Text; driver: Text }
+function decoded(state: Failure, raw: Bytes): json.Value {
+    let value = data.decode(raw)
+    if value.kind == json.INVALID { raise(state, "JSONDecodeError: " + value.text) }
+    return value
+}
+public function checkedPolicyReceipt(state: Failure, request: Request, store: Retention): json.Value {
+    let none = data.none()
+    if request.receipt == "" { raise(state, "CoverageError: checked source/build/run/captured-endpoint policy receipt absent"); return none }
+    let receiptBytes = retain(state, store, request.receipt)
+    if failed(state) { return none }
+    let receipt = decoded(state, receiptBytes)
+    if failed(state) { return none }
+    let contract = policyContract()
+    let policy = data.field(receipt, "policy")
+    let typed = data.isObject(policy) && policy.keys.length == contract.keys.length
+    for index in 0..contract.keys.length {
+        let value = data.field(policy, contract.keys[index])
+        if value.kind != contract.items[index].kind || !data.equal(value, contract.items[index]) { typed = false }
+    }
+    if !data.equalsInteger(data.field(receipt, "schema_version"), 1) || !typed { raise(state, "CoverageError: unreviewed endpoint validation policy"); return none }
+    if !data.equalsText(data.field(receipt, "capture_origin"), request.origin) { raise(state, "CoverageError: policy receipt capture origin mismatch"); return none }
+    if !data.equalsText(data.field(receipt, "evidence_kind"), "owned-official-run") { raise(state, "CoverageError: mocked or unknown run receipt cannot prove official endpoint policy"); return none }
+    let sources = data.field(receipt, "sources")
+    for role in reviewedRoles() {
+        if !data.present(sources, role) { raise(state, "CoverageError: endpoint policy source lacks exact review binding"); return none }
+        let raw = expected(state, store, data.field(sources, role))
+        if failed(state) { return none }
+        if sha(raw) != reviewedDigest(role) { raise(state, "CoverageError: endpoint policy source lacks exact review binding"); return none }
+    }
+    if canonicalPath(data.field(data.field(sources, "quic"), "path").text) != canonicalPath(request.source) { raise(state, "CoverageError: policy source path mismatch"); return none }
+    let binary = retain(state, store, request.binary)
+    if failed(state) { return none }
+    let binaryBinding = data.field(receipt, "binary")
+    let boundBinary = Bytes()
+    if data.isText(data.field(binaryBinding, "path")) && canonicalPath(data.field(binaryBinding, "path").text) == canonicalPath(request.binary) { boundBinary = expected(state, store, binaryBinding) }
+    else { raise(state, "CoverageError: policy binary bytes mismatch"); return none }
+    if failed(state) { return none }
+    if !same(boundBinary, binary) { raise(state, "CoverageError: policy binary bytes mismatch"); return none }
+    let buildReceipt = data.field(receipt, "build_receipt")
+    let build = decoded(state, expected(state, store, buildReceipt))
+    if failed(state) { return none }
+    if !data.equalsInteger(data.field(build, "schema"), 2) || !data.equalsInteger(data.field(build, "link_status"), 0) || !data.equal(data.field(build, "retention_errors"), data.array([])) {
+        raise(state, "CoverageError: successful checked schema2 build receipt absent"); return none
+    }
+    let buildRoot = directoryOf(data.field(buildReceipt, "path").text)
+    checkedLinkGraph(state, build, buildRoot, store, request.driver)
+    if failed(state) { return none }
+    let final = data.field(build, "final_output")
+    if !data.equalsText(data.field(final, "sha256"), sha(binary)) || !data.equalsInteger(data.field(final, "bytes"), binary.length) { raise(state, "CoverageError: source build output is not captured server binary"); return none }
+    let retainedFinal = retain(state, store, buildRoot + "/" + data.field(final, "retained").text)
+    if failed(state) { return none }
+    if !same(retainedFinal, binary) { raise(state, "CoverageError: retained link output differs"); return none }
+    let snapshot = decoded(state, expected(state, store, data.field(receipt, "source_build_receipt")))
+    if failed(state) { return none }
+    if !data.equal(data.field(snapshot, "sources"), sources) || !data.equalsText(data.field(snapshot, "server_binary_sha256"), sha(binary)) { raise(state, "CoverageError: source snapshot is not bound to server build"); return none }
+    let compileRecord = data.field(snapshot, "compiler_invocation")
+    let compiler = expected(state, store, data.field(compileRecord, "compiler"))
+    if failed(state) { return none }
+    if sha(compiler) != "df167d371354ccd151801156d803b15d77ade81e973a29f22cd5b39c9c732a7d" || !data.equalsInteger(data.field(compileRecord, "status"), 0) { raise(state, "CoverageError: reviewed successful Minyar compiler invocation absent"); return none }
+    checkedFrontendGraph(state, compileRecord, sources, data.field(build, "raw_program_input"), store)
+    if failed(state) { return none }
+    let rawInput = data.field(build, "raw_program_input")
+    if !data.equal(data.field(snapshot, "raw_program_sha256"), data.field(rawInput, "sha256")) || !data.equal(data.field(snapshot, "raw_program_sha256"), data.field(build, "raw_sha256")) {
+        raise(state, "CoverageError: server source is not bound to actual program LLVM"); return none
+    }
+    for name in ["raw_program_input", "program_input"] {
+        let value = data.field(build, name)
+        let raw = retain(state, store, buildRoot + "/" + data.field(value, "retained").text)
+        if failed(state) { return none }
+        let ok = data.equalsInteger(data.field(value, "bytes"), raw.length)
+        for field in ["sha256", "source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256", "post_link_sha256"] { if !data.equalsText(data.field(value, field), sha(raw)) { ok = false } }
+        if !ok { raise(state, "CoverageError: actual generated program input not checked"); return none }
+    }
+    let run = decoded(state, expected(state, store, data.field(receipt, "run_receipt")))
+    if failed(state) { return none }
+    let inspect = decoded(state, expected(state, store, data.field(run, "endpoint_inspect")))
+    if failed(state) { return none }
+    if !data.isArray(inspect) || inspect.items.length != 1 { raise(state, "CoverageError: exact single captured endpoint inspect absent"); return none }
+    let endpoint = inspect.items[0]
+    let container = data.field(run, "container_id")
+    let image = data.field(run, "image_id")
+    if !data.isText(container) || !lowerHex(container.text, 64) || !data.isText(image) || !quic.starts(image.text, "sha256:") || !lowerHex(quic.after(image.text, "sha256:"), 64) ||
+        !data.equal(data.field(endpoint, "Id"), container) || !data.equal(data.field(endpoint, "Image"), image) {
+        raise(state, "CoverageError: actual endpoint/image identity mismatch"); return none
+    }
+    let project = data.field(run, "project")
+    let nonce = data.field(run, "ownership_nonce")
+    let labels = data.field(data.field(endpoint, "Config"), "Labels")
+    if !data.isText(project) || !quic.starts(project.text, "minyar-qns-") || !lowerHex(quic.after(project.text, "minyar-qns-"), 24) || !data.isText(nonce) || !lowerHex(nonce.text, 64) ||
+        !data.equalsText(data.field(endpoint, "Name"), "/" + project.text + "-server") || !data.equal(data.field(labels, "io.minyar.qns.owner"), nonce) ||
+        !data.equal(data.field(labels, "com.docker.compose.project"), project) || !data.equalsText(data.field(labels, "com.docker.compose.service"), "server") {
+        raise(state, "CoverageError: captured endpoint ownership mismatch"); return none
+    }
+    let role = ""
+    let testcase = ""
+    let roles = 0
+    let testcases = 0
+    for item in data.field(data.field(endpoint, "Config"), "Env").items {
+        let at = item.text.find("=")
+        if at < 0 { continue }
+        let key = item.text.slice(0, at)
+        let value = item.text.slice(at + 1, item.text.length)
+        if key == "ROLE" { roles += 1; role = value }
+        if key == "TESTCASE" { testcases += 1; testcase = value }
+    }
+    if roles > 1 || testcases > 1 { raise(state, "CoverageError: ambiguous endpoint mode"); return none }
+    if roles != 1 || testcases != 1 || role != "server" || testcase != "transfer" { raise(state, "CoverageError: captured endpoint mode mismatch"); return none }
+    let contents = data.field(run, "image_contents")
+    let serverImage = expected(state, store, data.field(contents, "server"))
+    if failed(state) { return none }
+    let adapterImage = expected(state, store, data.field(contents, "adapter"))
+    if failed(state) { return none }
+    if sha(serverImage) != sha(binary) || sha(adapterImage) != reviewedDigest("adapter") { raise(state, "CoverageError: actual image endpoint bytes differ from build/source"); return none }
+    checkedEndpointMode(state, endpoint, run, request.addresses, request.port)
+    if failed(state) { return none }
+    let captureBinding = data.field(run, "capture")
+    let boundCapture = expected(state, store, captureBinding)
+    let selected = retain(state, store, request.capture)
+    if failed(state) { return none }
+    if !same(boundCapture, selected) || canonicalPath(data.field(captureBinding, "path").text) != canonicalPath(request.capture) { raise(state, "CoverageError: run receipt is not bound to selected capture"); return none }
+    if !data.equal(data.field(run, "server_addresses"), data.strings(request.addresses)) || !data.equalsInteger(data.field(run, "server_port"), request.port) { raise(state, "CoverageError: captured endpoint tuple mismatch"); return none }
+    let keylogs = data.field(run, "keylogs")
+    if !data.isArray(keylogs) || keylogs.items.length != request.keylogs.length { raise(state, "CoverageError: captured keylog bindings missing"); return none }
+    for index in 0..request.keylogs.length {
+        let bound = keylogs.items[index]
+        let path = request.keylogs[index]
+        if !data.isText(data.field(bound, "path")) || canonicalPath(data.field(bound, "path").text) != canonicalPath(path) { raise(state, "CoverageError: captured endpoint keylog bytes mismatch"); return none }
+        let boundBytes = expected(state, store, bound)
+        let actual = retain(state, store, path)
+        if failed(state) { return none }
+        if !same(boundBytes, actual) { raise(state, "CoverageError: captured endpoint keylog bytes mismatch"); return none }
+    }
+    return data.object(["status", "policy", "receipt_sha256", "container_id", "image_id"], [data.string("checked-bound-receipt"), contract, data.string(sha(receiptBytes)), container, image])
+}

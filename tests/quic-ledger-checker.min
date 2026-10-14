@@ -1,0 +1,133 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./quic-json.min" as data
+use "./quic-ledger-support.min" as ledger
+use "json" as json
+use "system" as system
+use "files" as files
+
+record State { report: json.Value; primary: Text }
+
+function usage(message: Text) {
+    system.writeStandardError("usage: quic-ledger-checker --capture PATH --capture-origin {synthetic-control,official-server-trace} --keylog PATH --server-address ADDRESS [--server-port PORT] --policy {handshake-only,peer-unknown} [--policy-source PATH] [--policy-binary PATH] [--policy-receipt PATH] --artifacts PATH\nquic-ledger-checker: error: " + message + "\n")
+    exit(2)
+}
+function failed(state: State, error: Text, stage: Text) {
+    let parts = ledger.errorParts(error)
+    if state.primary == "" {
+        state.primary = error
+        state.report = data.with(state.report, "primary_exception", data.object(["type", "message", "stage"], [data.string(parts[0]), data.string(parts[1]), data.string(stage)]))
+    }
+    let target = "evidence_errors"
+    if stage == "finalization" { target = "finalization_errors" }
+    let row = data.object(["type", "message", "stage"], [data.string(parts[0]), data.string(parts[1]), data.string(stage)])
+    state.report = data.with(state.report, target, data.array(data.field(state.report, target).items.appended(row)))
+    state.report = data.with(state.report, "status", data.string("coverage-limited"))
+}
+function store(path: Text, value: Bytes): Boolean {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return false }
+    let written = files.write(file, value, 0, value.length)
+    return files.close(file) == 0 && written == value.length
+}
+
+let request = ledger.Request { capture: ""; origin: ""; keylogs: []; addresses: []; port: 443; source: ""; binary: ""; receipt: ""; driver: "build/tooling/tools/clang-driver" }
+let policy = ""
+let artifacts = ""
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if index + 1 >= argumentCount() { usage("argument " + name + ": expected one argument") }
+    let value = argument(index + 1)
+    if name == "--capture" { request.capture = value }
+    else if name == "--capture-origin" {
+        if value != "synthetic-control" && value != "official-server-trace" { usage("argument --capture-origin: invalid choice: '" + value + "'") }
+        request.origin = value
+    }
+    else if name == "--keylog" { request.keylogs.add(value) }
+    else if name == "--server-address" { request.addresses.add(value) }
+    else if name == "--server-port" { request.port = Integer(value) }
+    else if name == "--policy" {
+        if value != "handshake-only" && value != "peer-unknown" { usage("argument --policy: invalid choice: '" + value + "'") }
+        policy = value
+    }
+    else if name == "--policy-source" { request.source = value }
+    else if name == "--policy-binary" { request.binary = value }
+    else if name == "--policy-receipt" { request.receipt = value }
+    else if name == "--artifacts" { artifacts = value }
+    else if name == "--link-driver" { request.driver = value }
+    else { usage("unrecognized arguments: " + name) }
+    index += 2
+}
+if request.capture == "" || request.origin == "" || request.keylogs.length == 0 || request.addresses.length == 0 || policy == "" || artifacts == "" {
+    usage("the following arguments are required: --capture, --capture-origin, --keylog, --server-address, --policy, --artifacts")
+}
+test.check(quic.starts(artifacts, "/") && files.pathSize(artifacts) < 0, "--artifacts requires a fresh absolute path")
+let scratch = test.scratch()
+test.require(test.run(["mkdir", "-p", "--", artifacts], system.environment(), "", scratch + "/mkdir", 30), "create ledger artifacts")
+test.removeTree(scratch)
+let retention = ledger.retention(artifacts)
+let state = State { report: data.object(["schema_version", "scope", "status", "inputs", "capture_origin", "server_addresses", "server_port", "primary_exception", "evidence_errors", "finalization_errors"],
+    [data.number(1), data.string("capture evidence or synthetic control; endpoint policy requires checked receipt"), data.string("coverage-limited"), data.object([], []), data.string(request.origin),
+    data.strings(request.addresses), data.number(request.port), data.none(), data.array([]), data.array([])]); primary: "" }
+let failure = ledger.failure()
+let before = ledger.Provider { version: ""; path: ""; sha256: ""; bytes: 0; error: "unset" }
+let paths = ["tests/quic-ledger-support.min", request.capture]
+for path in request.keylogs { paths.add(path) }
+for path in [request.source, request.binary, request.receipt] { if path != "" { paths.add(path) } }
+for path in paths {
+    if !ledger.failed(failure) { ledger.retain(failure, retention, path) }
+}
+if !ledger.failed(failure) {
+    before = ledger.provider()
+    if before.error != "" { ledger.raise(failure, before.error) }
+    else {
+        state.report = data.with(state.report, "crypto_provider", ledger.providerJSON(before))
+        if before.path != "" { ledger.expected(failure, retention, data.object(["path", "sha256", "bytes"], [data.string(before.path), data.string(before.sha256), data.number(before.bytes)])) }
+    }
+}
+if !ledger.failed(failure) && policy == "handshake-only" {
+    if request.source == "" || request.binary == "" { ledger.raise(failure, "CoverageError: exact policy source/binary binding absent") }
+    else {
+        let evidence = ledger.checkedPolicyReceipt(failure, request, retention)
+        if !ledger.failed(failure) { state.report = data.with(state.report, "policy_evidence", evidence) }
+    }
+}
+if !ledger.failed(failure) {
+    let logs: List<Bytes> = []
+    for path in request.keylogs { logs.add(ledger.retain(failure, retention, path)) }
+    let captured = ledger.retain(failure, retention, request.capture)
+    if !ledger.failed(failure) {
+        let analysis = ledger.analyze(captured, logs, request.addresses, request.port, policy, 1)
+        if analysis.error != "" { ledger.raise(failure, "CoverageError: " + analysis.error) }
+        else {
+            for position in 0..analysis.report.keys.length { state.report = data.with(state.report, analysis.report.keys[position], analysis.report.items[position]) }
+            let scope = "synthetic control or unknown-peer-policy capture; no Minyar endpoint-policy claim"
+            if request.origin == "official-server-trace" && policy == "handshake-only" { scope = "checked official endpoint trace" }
+            state.report = data.with(state.report, "scope", data.string(scope))
+        }
+    }
+}
+if ledger.failed(failure) { failed(state, failure.message[0], "setup-or-analysis") }
+if before.error == "" {
+    let after = ledger.provider()
+    state.report = data.with(state.report, "crypto_provider_after", ledger.providerJSON(after))
+    if after.error != "" { failed(state, after.error, "provider-after") }
+    else if after.version != before.version || after.path != before.path || after.sha256 != before.sha256 || after.bytes != before.bytes { failed(state, "CoverageError: loaded crypto provider bytes changed", "provider-after") }
+}
+for error in ledger.recheck(retention) { failed(state, error, "input-after") }
+let injected = false
+for value in retention.faults { if value == "finalization" { injected = true } }
+for attempt in 0..2 {
+    state.report = data.with(state.report, "inputs", ledger.inputsJSON(retention))
+    let raw = Bytes(data.pretty(state.report) + "\n")
+    if injected { injected = false; failed(state, "RetentionFailure: secondary finalization failure", "finalization"); continue }
+    if !store(artifacts + "/ledger.json.tmp", raw) || Text(files.readFile(artifacts + "/ledger.json.tmp")) != Text(raw) { failed(state, "CoverageError: durable ledger bytes mismatch", "finalization"); continue }
+    if files.rename(artifacts + "/ledger.json.tmp", artifacts + "/ledger.json") != 0 || Text(files.readFile(artifacts + "/ledger.json")) != Text(raw) { failed(state, "CoverageError: final ledger bytes mismatch", "finalization"); continue }
+    break
+}
+print(data.pretty(data.without(state.report, "rows")))
+let status = data.field(state.report, "status").text
+if status == "passed" { exit(0) }
+if status == "failed" { exit(1) }
+exit(2)
