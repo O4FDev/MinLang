@@ -753,9 +753,8 @@ class BuildWiring(unittest.TestCase):
         begin = source.index(marker)
         end = source.index('\n', source.index(aggregate, begin))
         fragment = source[begin:end + 1]
-        expected = {'build/minyarc', 'tests/generated-llvm-sanitizer.py',
-                    'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
-                    'tools/sanitizer_llvm.py', 'build/tooling/tools/clang-driver'}
+        expected = {'build/minyarc', 'build/tooling/tests/generated-llvm-sanitizer-test',
+                    'tests/generated-llvm-sanitizer.min', 'build/tooling/tools/clang-driver'}
 
         def verify(candidate, sanitizer=None, selected=None, directory='/clang64/bin'):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
@@ -764,8 +763,8 @@ class BuildWiring(unittest.TestCase):
                                  'SANITIZER_LIMITED := sanitizer-limit\n'
                                  'PATH := /retained/native/bin:/usr/bin\n'
                                  'MINYAR_SANITIZER_CLANG := ' + (sanitizer or '') + '\n'
-                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer build/tooling/tools/clang-driver\n'
-                                 'build build/minyarc build/yamux-peer build/tooling/tools/clang-driver:\n')
+                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer build/tooling/tools/clang-driver build/tooling/tests/generated-llvm-sanitizer-test\n'
+                                 'build build/minyarc build/yamux-peer build/tooling/tools/clang-driver build/tooling/tests/generated-llvm-sanitizer-test:\n')
                 environment = dict(os.environ)
                 environment.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
@@ -781,9 +780,9 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('check-generated-llvm-sanitizer', rules.get(gate,set()), gate)
                 self.assertTrue(expected <= rules.get('check-generated-llvm-sanitizer',set()))
                 commands = dry_run_commands(result.stdout)
-                self.assertIn('python3 tests/generated-llvm-sanitizer.py', commands)
+                self.assertIn('./build/tooling/tests/generated-llvm-sanitizer-test', commands)
                 command = next(line for line in commands.splitlines()
-                               if 'python3 tests/generated-llvm-sanitizer.py' in line)
+                               if './build/tooling/tests/generated-llvm-sanitizer-test' in line)
                 fields = shlex.split(command)
                 self.assertIn('MINYAR_TEST_CLANG=' +
                               (selected or sanitizer or 'retained-native-clang'), fields)
@@ -961,8 +960,7 @@ class BuildWiring(unittest.TestCase):
         data=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data,ROOT)
         for name in ('tests/cycle-idle-invalidation.c',
-                     'tests/cycle-private-retirement-v5.json','tests/generated-llvm-sanitizer.py',
-                     'tests/generated-llvm-sanitizer.min'):
+                     'tests/cycle-private-retirement-v5.json','tests/generated-llvm-sanitizer.min'):
             omitted=dict(data,sources=[row for row in data['sources'] if row['path']!=name])
             with self.subTest(source=name),self.assertRaises(ValueError):
                 catalogue.validate(omitted,ROOT)

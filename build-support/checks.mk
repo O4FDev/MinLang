@@ -893,9 +893,11 @@ check-tls-sanitize: check-tls-signing-usage-sanitize
 GENERATED_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
 GENERATED_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call GENERATED_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
 GENERATED_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG))):$(PATH),$(PATH))
-GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-llvm-sanitizer.min tests/llvm_sanitizer.py tests/clang_helpers.py tests/test_evidence.py build/tooling/tools/clang-driver tools/sanitizer_llvm.py tools/toolchain.sh runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+GENERATED_SANITIZER_INPUTS = build/tooling/tests/generated-llvm-sanitizer-test tests/generated-llvm-sanitizer.min build/tooling/tools/clang-driver tools/toolchain.sh runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+build/tooling/tests/generated-llvm-sanitizer-test: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/generated-llvm-sanitizer-test: TOOL_LIBS = $(TOOL_CRYPTO)
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/generated-llvm-sanitizer-test --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer
 
 # Actual UDP blackholes before/mid-session, then independent TCP mTLS/yamux.

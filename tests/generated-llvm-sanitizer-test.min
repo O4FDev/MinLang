@@ -1,0 +1,446 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+constant DRIVER = "build/tooling/tools/clang-driver"
+
+record Observation {
+    directory: Text
+    root: Text
+    clang: Text
+    leaks: Text
+    commands: List<Text>
+    files: List<Text>
+    sources: List<Text>
+    digests: List<Text>
+    sections: List<Text>
+}
+record Outcome { status: Integer; output: Text; errors: Text }
+
+function plain(): List<List<Text>> {
+    let result: List<List<Text>> = []
+    return result
+}
+function digestBytes(data: Bytes): Text { return sha.hex(sha.digest(data)) }
+function digest(path: Text): Text {
+    let data = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot hash " + path)
+    return digestBytes(data)
+}
+function quoted(text: Text): Text {
+    let raw = Bytes(text)
+    let output = Bytes()
+    output.add(34)
+    let digits = Bytes("0123456789abcdef")
+    for byte in raw {
+        if byte == 34 || byte == 92 { output.add(92); output.add(byte) }
+        else if byte == 10 { output.add(92); output.add(110) }
+        else if byte == 13 { output.add(92); output.add(114) }
+        else if byte == 9 { output.add(92); output.add(116) }
+        else if byte < 32 {
+            for item in Bytes("\\u00") { output.add(item) }
+            output.add(digits[byte / 16])
+            output.add(digits[byte % 16])
+        } else { output.add(byte) }
+    }
+    output.add(34)
+    return Text(output)
+}
+function separated(items: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(items[index])
+    }
+    return joinText(pieces)
+}
+function textList(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(quoted(item)) }
+    return "[" + separated(parts, ", ") + "]"
+}
+function serialize(value: json.Value): Text {
+    if value.kind == json.STRING { return quoted(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN { if value.truth { return "true" }; return "false" }
+    if value.kind == json.NUMBER { return value.text }
+    let parts: List<Text> = []
+    if value.kind == json.ARRAY {
+        for item in value.items { parts.add(serialize(item)) }
+        return "[" + separated(parts, ", ") + "]"
+    }
+    for index in 0..value.items.length { parts.add(quoted(value.keys[index]) + ": " + serialize(value.items[index])) }
+    return "{" + separated(parts, ", ") + "}"
+}
+function relative(observation: Observation, path: Text): Text {
+    let prefix = Bytes(observation.root + "/")
+    let raw = Bytes(path)
+    if path.startsWith(observation.root + "/") { return Text(raw.slice(prefix.length, raw.length)) }
+    return path
+}
+function save(observation: Observation) {
+    let commit = system.getenv("MINYAR_SOURCE_COMMIT")
+    let source = "null"
+    if system.lastError() == 0 { source = quoted(commit) }
+    let inputs: List<Text> = []
+    for index in 0..observation.sources.length { inputs.add("    " + quoted(relative(observation, observation.sources[index])) + ": " + quoted(observation.digests[index])) }
+    let sections = ""
+    for section in observation.sections { sections = sections + ",\n  " + section }
+    let text = "{\n  \"schema\": 1,\n  \"commands\": [\n    " + separated(observation.commands, ",\n    ") + "\n  ],\n  \"files\": {" + separated(observation.files, ", ") +
+        "},\n  \"source_commit\": " + source + ",\n  \"source_inputs\": {\n" + separated(inputs, ",\n") + "\n  }" + sections + "\n}\n"
+    writeTextFile(observation.directory + "/manifest.json", text)
+}
+function addFile(observation: Observation, name: Text, value: Text) {
+    observation.files.add(quoted(name) + ": " + quoted(value))
+}
+function section(observation: Observation, name: Text, value: Text) {
+    observation.sections.add(quoted(name) + ": " + value)
+    save(observation)
+}
+function locate(command: Text): Text {
+    let found = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", command], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-which-" + Text(system.processId()), 10)
+    test.require(found, "clang location")
+    let resolved = test.run(["readlink", "-f", "--", test.lines(found.output)[0]], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-resolve-" + Text(system.processId()), 10)
+    test.require(resolved, "clang resolution")
+    return test.lines(resolved.output)[0]
+}
+function sourceInputs(root: Text): List<Text> {
+    let result: List<Text> = []
+    for path in [DRIVER, "tests/generated-llvm-sanitizer.min", "tests/generated-llvm-sanitizer-test.min", "tools/testing.min", "runtime/minyar_runtime.c"] { result.add(root + "/" + path) }
+    let found = test.run(["find", root + "/runtime", "-name", "*.h", "-type", "f"], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-headers-" + Text(system.processId()), 30)
+    test.require(found, "runtime header listing")
+    for path in test.lines(found.output).sorted() { result.add(path) }
+    return result
+}
+function open(directory: Text, root: Text, clang: Text, leaks: Text): Observation {
+    let made = test.run(["mkdir", "-p", "--", directory], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-mkdir-" + Text(system.processId()), 10)
+    test.require(made, "sanitizer artifact directory")
+    test.check(files.list(directory).length == 0, "sanitizer artifact directory already exists: " + directory)
+    let observation = Observation { directory: directory; root: root; clang: clang; leaks: leaks; commands: []; files: []; sources: sourceInputs(root); digests: []; sections: [] }
+    for path in observation.sources { observation.digests.add(digest(path)) }
+    let located = locate(clang)
+    for pair in [["minyarc", root + "/build/minyarc"], ["clang", located]] {
+        test.require(test.run(["cp", "--", pair[1], directory + "/" + pair[0]], system.environment(), "", directory + "/.copy-" + pair[0], 60), "copy " + pair[0])
+        files.remove(directory + "/.copy-" + pair[0])
+        files.remove(directory + "/.copy-" + pair[0] + ".err")
+        addFile(observation, pair[0], digest(pair[1]))
+    }
+    save(observation)
+    return observation
+}
+function environmentFor(observation: Observation, overrides: List<List<Text>>): List<Text> {
+    let names = ["ASAN_OPTIONS", "UBSAN_OPTIONS"]
+    for pair in overrides { names.add(pair[0]) }
+    let result: List<Text> = []
+    for entry in system.environment() {
+        let keep = true
+        for name in names { if entry.startsWith(name + "=") { keep = false } }
+        if keep { result.add(entry) }
+    }
+    result.add("ASAN_OPTIONS=detect_leaks=" + observation.leaks + ":halt_on_error=1")
+    result.add("UBSAN_OPTIONS=halt_on_error=1")
+    for pair in overrides { result.add(pair[0] + "=" + pair[1]) }
+    return result
+}
+function run(observation: Observation, label: Text, command: List<Text>, overrides: List<List<Text>>): Outcome {
+    let started = system.monotonicNanoseconds()
+    let log = observation.directory + "/" + label + ".stdout"
+    let result = test.run(command, environmentFor(observation, overrides), observation.root, log, 180)
+    let seconds = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    test.check(files.rename(log + ".err", observation.directory + "/" + label + ".stderr") == 0, "cannot retain command diagnostics")
+    let stdout = files.readFile(log)
+    let stderr = files.readFile(observation.directory + "/" + label + ".stderr")
+    addFile(observation, label + ".stdout", digestBytes(stdout))
+    addFile(observation, label + ".stderr", digestBytes(stderr))
+    let timedOut = result.status == 124
+    let environment: List<Text> = []
+    for pair in overrides { environment.add(quoted(pair[0]) + ": " + quoted(pair[1])) }
+    let timeout = "false"
+    if timedOut { timeout = "true" }
+    observation.commands.add("{\"label\": " + quoted(label) + ", \"argv\": " + textList(command) + ", \"status\": " + Text(result.status) + ", \"timed_out\": " + timeout +
+        ", \"seconds\": " + Text(seconds) + ", \"environment\": {" + separated(environment, ", ") + "}, \"stdout_sha256\": " + quoted(digestBytes(stdout)) +
+        ", \"stderr_sha256\": " + quoted(digestBytes(stderr)) + "}")
+    save(observation)
+    test.check(!timedOut, label + " timed out")
+    return Outcome { status: result.status; output: Text(stdout); errors: Text(stderr) }
+}
+function success(observation: Observation, label: Text, command: List<Text>, overrides: List<List<Text>>): Outcome {
+    let outcome = run(observation, label, command, overrides)
+    test.check(outcome.status == 0, label + " failed (" + Text(outcome.status) + ")\n" + outcome.errors)
+    return outcome
+}
+function readJson(path: Text): json.Value {
+    let value = json.parseBytes(files.readFile(path), 67108864)
+    test.check(value.kind == json.OBJECT, "invalid link evidence manifest " + path)
+    return value
+}
+function truth(value: json.Value, name: Text): Boolean {
+    let member = json.member(value, name)
+    test.check(member.kind == json.BOOLEAN, "link evidence lacks Boolean " + name)
+    return member.truth
+}
+function sameFile(left: Text, right: Text): Boolean { return digest(left) == digest(right) }
+function mainEntry(text: Text): Integer {
+    let lines = test.lines(text)
+    let count = 0
+    let offset = 0
+    let found = -1
+    for index in 0..lines.length {
+        let line = lines[index]
+        let raw = Bytes(line)
+        if raw.length >= 16 && Text(raw.slice(0, 16)) == "define i32 @main" && raw.length > 16 && raw[16] == 40 {
+            count += 1
+            let braced = raw.length > 0 && raw[raw.length - 1] == 123
+            if braced && index + 1 < lines.length && lines[index + 1] == "entry:" {
+                found = offset + raw.length + 1 + Bytes("entry:").length + 1
+            }
+        }
+        offset += raw.length + 1
+    }
+    test.check(count == 1, "generated program does not contain exactly one main definition")
+    test.check(found >= 0, "generated main entry changed")
+    return found
+}
+
+function unsafeAccess(observation: Observation) {
+    let out = observation.directory
+    let raw = out + "/compiler.raw.ll"
+    success(observation, "compiler", [observation.root + "/build/minyarc", observation.root + "/tests/generated-llvm-sanitizer.min", raw, "--bounded-owners", "32"], plain())
+    let text = readTextFile(raw)
+    let entry = mainEntry(text)
+    let bytes = Bytes(text)
+    let program = Text(bytes.slice(0, entry)) + "  call void @\".minyar.bad(quoted)\"()\n" + Text(bytes.slice(entry, bytes.length))
+    for declaration in ["declare ptr @malloc(i64)", "declare void @free(ptr)"] {
+        if !test.contains(program, declaration) { program = program + "\n" + declaration + "\n" }
+    }
+    program = program + "\ndefine void @\".minyar.bad(quoted)\"() {\nentry:\n  %bad = call ptr @malloc(i64 8)\n  call void @free(ptr %bad)\n  store volatile i8 7, ptr %bad\n  ret void\n}\n"
+    let llvm = out + "/unsafe.raw.ll"
+    writeTextFile(llvm, program)
+    let nativeSource = out + "/runtime.c"
+    writeTextFile(nativeSource, "#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET 32\n#include \"minyar_runtime.c\"\n")
+    let runtime = out + "/runtime.o"
+    let options = "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+    let environment = [["MINYAR_CLANG", observation.clang], ["MINYAR_RUNTIME_FLAGS", options], ["MINYAR_CLANG_FLAGS", options], ["MINYAR_NATIVE_FLAGS", options], ["MINYAR_LINK_ARTIFACTS", out + "/link-inputs"]]
+    success(observation, "runtime-compile", [observation.root + "/" + DRIVER, "compile", "-iquote", observation.root + "/runtime", "-c", nativeSource, "-o", runtime], environment)
+    let names = ["compiler.raw.ll", "unsafe.raw.ll", "runtime.o"]
+    let before: List<Text> = []
+    for name in names { before.add(digest(out + "/" + name)) }
+    let binary = out + "/unsafe"
+    success(observation, "public-link", [observation.root + "/" + DRIVER, "link", observation.root, llvm, runtime, binary, "0"], environment)
+    let result = run(observation, "unsafe-run", [binary], plain())
+    for name in ["compiler.raw.ll", "unsafe.raw.ll", "runtime.o", "unsafe"] { addFile(observation, name, digest(out + "/" + name)) }
+    let after: List<Text> = []
+    for name in names { after.add(digest(out + "/" + name)) }
+    let beforeRows: List<Text> = []
+    let afterRows: List<Text> = []
+    for index in 0..names.length {
+        beforeRows.add(quoted(names[index]) + ": " + quoted(before[index]))
+        afterRows.add(quoted(names[index]) + ": " + quoted(after[index]))
+    }
+    section(observation, "control", "{\"compile_status\": 0, \"link_status\": 0, \"unsafe_status\": " + Text(result.status) + ", \"unsafe_stdout\": " + quoted(result.output) +
+        ", \"expected\": \"AddressSanitizer: heap-use-after-free\", \"input_before\": {" + separated(beforeRows, ", ") + "}, \"input_after\": {" + separated(afterRows, ", ") + "}}")
+    for index in 0..names.length { test.check(before[index] == after[index], "public link changed its inputs: " + names[index]) }
+    test.check(result.status != 0 && test.contains(result.errors, "AddressSanitizer: heap-use-after-free"), "public link driver omitted generated-access instrumentation\n" + result.output + result.errors)
+    test.check(!test.contains(result.output, "42\n"), "unsafe program completed after the freed-byte store")
+    let retained = readJson(out + "/link-inputs/manifest.json")
+    test.check(truth(retained, "address_sanitizer_enabled") && !truth(retained, "runtime_reannotated"), "link evidence lost sanitizer state")
+    test.check(json.string(retained, "raw_sha256") == before[1], "link evidence raw program digest changed")
+    test.check(sameFile(out + "/link-inputs/program.raw.ll", llvm), "retained raw program differs")
+    test.check(sameFile(out + "/link-inputs/runtime.o", runtime), "retained runtime differs")
+    test.check(json.string(retained, "linked_program_sha256") != json.string(retained, "raw_sha256"), "linked program was not instrumented")
+    test.check(json.member(retained, "link_status").kind == json.NUMBER && json.member(retained, "link_status").text == "0", "retained link status changed")
+    test.check(digest(out + "/link-inputs/program.asan.ll") == json.string(retained, "linked_program_sha256"), "retained instrumented program differs")
+    section(observation, "instrumented_access_proof", serialize(retained))
+}
+
+function helperControls(observation: Observation, self: Text) {
+    let variants = [
+        "define void @sanitize_address() {\n  ret void\n}\n",
+        "define void @\"name({escaped\\22})\"(ptr %\"arg(name)\") \"sanitize_address\"=\"value\" {\n  ret void\n}\n",
+        "define void @plain() sanitize_address {\n  ret void\n}\n",
+        "define void @group() #0 {\n  ret void\n}\nattributes #0 = { sanitize_address }\n",
+        "define void @group() #0 {\n  ret void\n}\nattributes #0 = { \"sanitize_address\"=\"text\" }\n",
+        "define void @crlf() {\r\n  ret void\r\n}\r\n",
+        "define void @attr() alignstack(16) {\n  ret void\n}\n",
+        "define void @personality() personality ptr @sanitize_address {\n ret void\n}\n"
+    ]
+    let observed: List<Text> = []
+    for index in 0..variants.length {
+        let raw = variants[index]
+        let transformed = test.instrument(raw)
+        test.check(test.instrument(transformed) == transformed, "canonical annotation is not idempotent: header " + Text(index))
+        writeTextFile(observation.directory + "/header-" + Text(index) + ".raw.ll", raw)
+        writeTextFile(observation.directory + "/header-" + Text(index) + ".asan.ll", transformed)
+        observed.add("{\"index\": " + Text(index) + ", \"raw_sha256\": " + quoted(digestBytes(Bytes(raw))) + ", \"annotated_sha256\": " + quoted(digestBytes(Bytes(transformed))) + "}")
+    }
+    let native = observation.directory + "/native-headers"
+    test.check(files.makeDirectory(native) == 0, "cannot create native header directory")
+    for index in 0..variants.length {
+        let source = native + "/header-" + Text(index) + ".raw.ll"
+        writeTextFile(source, variants[index])
+        let annotated = native + "/header-" + Text(index) + ".asan.ll"
+        success(observation, "native-header-" + Text(index), [observation.root + "/" + DRIVER, "sanitize-llvm", source, annotated], plain())
+        test.check(readTextFile(annotated) == test.instrument(variants[index]), "native annotation differs from the canonical annotation: header " + Text(index))
+        let again = native + "/header-" + Text(index) + ".again.ll"
+        success(observation, "native-header-" + Text(index) + "-again", [observation.root + "/" + DRIVER, "sanitize-llvm", annotated, again], plain())
+        test.check(sameFile(again, annotated), "native annotation is not idempotent: header " + Text(index))
+    }
+    let malformed = ["declare void @only()\n", "define void @bad( {\n", "define void @multiline(\n) {\n}\n", "define void @\"bad() {\n", "define void @bad() #9 {\n}\n", "define void @bad() {\n}\ndefine void @no_body()\n"]
+    for index in 0..malformed.length {
+        let source = native + "/malformed.raw.ll"
+        writeTextFile(source, malformed[index])
+        let canonical = run(observation, "canonical-malformed-" + Text(index), [self, "--instrument", source, native + "/malformed.canonical.ll"], plain())
+        test.check(canonical.status != 0, "malformed function header accepted: " + malformed[index])
+        let result = run(observation, "native-malformed", [observation.root + "/" + DRIVER, "sanitize-llvm", source, native + "/malformed.asan.ll"], plain())
+        test.check(result.status != 0 && Text(Bytes(result.errors).slice(0, min(Bytes(result.errors).length, 22))) == "minyar: generated LLVM", "native annotation accepted a malformed header: " + malformed[index] + "\n" + result.errors)
+    }
+    let flagControls: List<List<Text>> = [[], ["-fsanitize=undefined"], ["-fsanitize=address"], ["-fsanitize=address", "-fno-sanitize=address"], ["-fsanitize=address,undefined", "-fno-sanitize=all"], ["-fno-sanitize=all", "-fsanitize=address"], ["-fsanitize=address", "-fno-sanitize=undefined"]]
+    let expected = [false, false, true, false, false, true, true]
+    let rows: List<Text> = []
+    for index in 0..flagControls.length {
+        test.check(test.addressEnabled(flagControls[index]) == expected[index], "address sanitizer flag selection changed: " + textList(flagControls[index]))
+        let state = "false"
+        if expected[index] { state = "true" }
+        rows.add("[" + textList(flagControls[index]) + ", " + state + "]")
+    }
+    let raw = "declare void @no_definitions()\n"
+    let untouched = observation.directory + "/off-unvalidated.ll"
+    writeTextFile(untouched, raw)
+    let disabled = ["-fsanitize=address", "-fno-sanitize=all"]
+    if test.addressEnabled(disabled) { writeTextFile(untouched, test.instrument(readTextFile(untouched))) }
+    test.check(readTextFile(untouched) == raw, "disabled sanitizer preparation changed or validated the program")
+    section(observation, "header_controls", "[" + separated(observed, ", ") + "]")
+    section(observation, "flag_controls", "[" + separated(rows, ", ") + "]")
+}
+
+function linkControls(observation: Observation) {
+    let out = observation.directory
+    let original = out + "/compiler.raw.ll"
+    let rawBefore = digest(original)
+    let native = out + "/ordinary-runtime.o"
+    let source = out + "/runtime.c"
+    success(observation, "ordinary-runtime-compile", [observation.root + "/" + DRIVER, "compile", "-iquote", observation.root + "/runtime", "-c", source, "-o", native], [["MINYAR_CLANG", observation.clang], ["MINYAR_RUNTIME_FLAGS", "-O1"]])
+    let nativeBefore = digest(native)
+    let labels = ["ordinary", "disabled-address", "disabled-all", "reenabled", "enabled"]
+    let flags = ["-O1", "-O1 -fsanitize=address -fno-sanitize=address", "-O1 -fsanitize=address,undefined -fno-sanitize=all", "-O1 -fno-sanitize=all -fsanitize=address,undefined", "-O1 -fsanitize=address,undefined"]
+    let enabledStates = [false, false, false, true, true]
+    for index in 0..labels.length {
+        let label = labels[index]
+        let binary = out + "/" + label
+        let evidence = out + "/" + label + "-inputs"
+        let environment = [["MINYAR_CLANG", observation.clang], ["MINYAR_CLANG_FLAGS", flags[index]], ["MINYAR_LINK_ARTIFACTS", evidence]]
+        success(observation, label + "-link", [observation.root + "/" + DRIVER, "link", observation.root, original, native, binary, "0"], environment)
+        let ran = success(observation, label + "-run", [binary], plain())
+        test.check(ran.output == "42\n" && ran.errors == "", "linked control output changed: " + label)
+        let manifest = readJson(evidence + "/manifest.json")
+        test.check(truth(manifest, "address_sanitizer_enabled") == enabledStates[index], "link evidence sanitizer state changed: " + label)
+        test.check(!truth(manifest, "runtime_reannotated") && !truth(manifest, "program_ir_cached"), "link evidence reannotated or cached: " + label)
+        test.check(digest(evidence + "/program.raw.ll") == rawBefore, "retained raw program changed: " + label)
+        test.check(digest(evidence + "/runtime.o") == nativeBefore, "retained runtime changed: " + label)
+        if enabledStates[index] { test.check(json.string(manifest, "linked_program_sha256") != json.string(manifest, "raw_sha256"), "enabled link was not instrumented: " + label) }
+        else {
+            test.check(json.string(manifest, "linked_program_sha256") == json.string(manifest, "raw_sha256"), "disabled link was instrumented: " + label)
+            test.check(files.pathSize(evidence + "/program.asan.ll") < 0, "disabled link retained an instrumented program: " + label)
+        }
+        if label == "enabled" {
+            let collision = run(observation, "artifact-collision", [observation.root + "/" + DRIVER, "link", observation.root, original, native, binary, "0"], environment)
+            test.check(collision.status != 0 && test.contains(collision.errors, "File exists"), "link evidence generation was reused")
+        }
+    }
+    test.check(digest(original) == rawBefore && digest(native) == nativeBefore, "link controls changed their inputs")
+    let project = out + "/native-project"
+    test.require(test.run(["mkdir", "-p", "--", project + "/runtime/native"], system.environment(), "", out + "/.native-project", 10), "native project")
+    files.remove(out + "/.native-project")
+    files.remove(out + "/.native-project.err")
+    writeTextFile(project + "/runtime/value.h", "#define VALUE 1\n")
+    writeTextFile(project + "/runtime/native/net.c", "#include \"../value.h\"\nint fixture(void) { return VALUE; }\n")
+    let llvm = out + "/native-cache.raw.ll"
+    writeTextFile(llvm, "; minyar-native-library: net\n" + readTextFile(original))
+    let identities: List<Text> = []
+    let stamps: List<Text> = []
+    for index in 0..3 {
+        if index == 2 { writeTextFile(project + "/runtime/value.h", "#define VALUE 2\n") }
+        let evidence = out + "/cache-" + Text(index) + "-inputs"
+        success(observation, "cache-link-" + Text(index), [observation.root + "/" + DRIVER, "link", project, llvm, native, out + "/cache-" + Text(index), "0"],
+            [["MINYAR_CLANG", observation.clang], ["MINYAR_CLANG_FLAGS", "-O1 -fsanitize=address,undefined"], ["MINYAR_LINK_ARTIFACTS", evidence]])
+        let manifest = readJson(evidence + "/manifest.json")
+        let inputs = json.member(manifest, "inputs")
+        test.check(inputs.kind == json.ARRAY, "link evidence lacks inputs")
+        let object = ""
+        let objectDigest = ""
+        for row in inputs.items {
+            if object == "" && json.string(row, "retained").startsWith("native-") { object = json.string(row, "original"); objectDigest = json.string(row, "sha256") }
+        }
+        test.check(object != "", "link evidence lacks the native bridge object")
+        identities.add(object)
+        let stat = test.run(["stat", "-c", "%Y.%y", "--", object], system.environment(), "", out + "/.stamp-" + Text(index), 10)
+        if stat.status != 0 { stat = test.run(["stat", "-f", "%m.%Fm", "--", object], system.environment(), "", out + "/.stamp-" + Text(index), 10) }
+        test.require(stat, "native bridge timestamp")
+        files.remove(out + "/.stamp-" + Text(index))
+        files.remove(out + "/.stamp-" + Text(index) + ".err")
+        stamps.add(test.lines(stat.output)[0])
+        test.check(digest(object) == objectDigest, "native bridge object digest changed")
+    }
+    test.check(identities[0] == identities[1] && stamps[0] == stamps[1], "program annotation changed the native bridge cache key")
+    test.check(identities[2] != identities[1], "native header change did not change the native bridge cache key")
+    let malformed = out + "/malformed.raw.ll"
+    writeTextFile(malformed, "define void @bad(\n) {\nret void\n}\n")
+    let protectedOutput = out + "/protected-output"
+    writeTextFile(protectedOutput, "prior published executable")
+    let rejected = run(observation, "reject-invalid-header", [observation.root + "/" + DRIVER, "link", observation.root, malformed, native, protectedOutput, "0"],
+        [["MINYAR_CLANG", observation.clang], ["MINYAR_CLANG_FLAGS", "-fsanitize=address"], ["MINYAR_LINK_ARTIFACTS", out + "/invalid-header-inputs"]])
+    test.check(rejected.status != 0 && test.contains(rejected.errors, "sanitizer coverage cannot be assumed"), "invalid header link was not rejected")
+    test.check(readTextFile(protectedOutput) == "prior published executable", "rejected link replaced its published output")
+    let failure = readJson(out + "/invalid-header-inputs/manifest.json")
+    test.check(json.string(failure, "phase") == "program-annotation" && !truth(failure, "link_attempted"), "rejected link evidence phase changed")
+    test.check(sameFile(out + "/invalid-header-inputs/program.raw.ll", malformed), "rejected link retained a different program")
+    for pair in [["-O1 -fsanitize=address,undefined", "object\n"], ["-O1", "llvm\n"]] {
+        let format = success(observation, "runtime-format-" + test.lines(pair[1])[0], [observation.root + "/" + DRIVER, "runtime-format"], [["MINYAR_RUNTIME_FLAGS", pair[0]]])
+        test.check(format.output == pair[1] && format.errors == "", "runtime format selection changed for " + pair[0])
+    }
+    let objects: List<Text> = []
+    for item in identities { objects.add(quoted(item)) }
+    let times: List<Text> = []
+    for item in stamps { times.add(quoted(item)) }
+    section(observation, "native_cache_controls", "{\"objects\": [" + separated(objects, ", ") + "], \"stamps\": [" + separated(times, ", ") + "], \"runtime_sha256\": " + quoted(nativeBefore) + "}")
+}
+
+function main(): Integer {
+    if argumentCount() == 3 && argument(0) == "--instrument" {
+        writeTextFile(argument(2), test.instrument(readTextFile(argument(1))))
+        return 0
+    }
+    let artifacts = ""
+    let index = 0
+    while index < argumentCount() {
+        test.check(argument(index) == "--artifacts" && index + 1 < argumentCount(), "usage: generated-llvm-sanitizer-test --artifacts DIRECTORY")
+        artifacts = argument(index + 1)
+        index += 2
+    }
+    test.check(artifacts != "", "the following arguments are required: --artifacts")
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-root-" + Text(system.processId()), 10)
+    test.require(location, "project location")
+    let root = test.lines(location.output)[0]
+    let platform = test.run(["uname", "-s"], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-sanitizer-platform-" + Text(system.processId()), 10)
+    test.require(platform, "host platform")
+    let leaks = "0"
+    if platform.output == "Linux\n" { leaks = "1" }
+    if !artifacts.startsWith("/") { artifacts = root + "/" + artifacts }
+    let clang = test.setting("MINYAR_TEST_CLANG", test.setting("LLVM_CC", "clang"))
+    let observation = open(artifacts, root, clang, leaks)
+    let self = root + "/build/tooling/tests/generated-llvm-sanitizer-test"
+    unsafeAccess(observation)
+    helperControls(observation, self)
+    linkControls(observation)
+    let mismatches: List<Text> = []
+    for position in 0..observation.sources.length {
+        if digest(observation.sources[position]) != observation.digests[position] { mismatches.add(quoted(relative(observation, observation.sources[position]))) }
+    }
+    section(observation, "source_after_mismatches", "[" + separated(mismatches, ", ") + "]")
+    test.check(mismatches.length == 0, "sources changed during the sanitizer check")
+    section(observation, "complete", "true")
+    print("generated LLVM sanitizer: all controls passed")
+    return 0
+}
