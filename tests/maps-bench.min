@@ -1,0 +1,201 @@
+use "../tools/testing.min" as test
+use "./benchmark-phases.min" as phase
+use "system" as system
+use "files" as files
+
+function pinCPU(): Integer { native "mapsbaseline" }
+record Row { insert: Integer; lookup: Integer; mixed: Integer; remove: Integer; seconds: Float }
+
+function stripTargets(source: Text): Text {
+    let raw = Bytes(source)
+    let output = Bytes()
+    let names = [Bytes("\"target-cpu\"=\""), Bytes("\"target-features\"=\""), Bytes("\"tune-cpu\"=\"")]
+    let index = 0
+    while index < raw.length {
+        let skipped = false
+        for name in names {
+            if skipped || index + name.length > raw.length { continue }
+            let equal = true
+            for offset in 0..name.length { if raw[index + offset] != name[offset] { equal = false; break } }
+            if !equal { continue }
+            let end = index + name.length
+            while end < raw.length && raw[end] != 34 { end += 1 }
+            if end >= raw.length { continue }
+            end += 1
+            if end < raw.length && raw[end] == 32 { end += 1 }
+            index = end
+            skipped = true
+        }
+        if !skipped {
+            output.add(raw[index])
+            index += 1
+        }
+    }
+    return Text(output)
+}
+function run(command: List<Text>, directory: Text, label: Text, seconds: Integer): test.Result {
+    let result = test.run(command, system.environment(), "", directory + "/" + label, seconds)
+    test.require(result, label)
+    return result
+}
+function median(values: List<Integer>): Float {
+    let sorted = values.sorted()
+    let middle = sorted.length / 2
+    if sorted.length % 2 == 1 { return Float(sorted[middle]) }
+    return Float(sorted[middle - 1] + sorted[middle]) / 2.0
+}
+function field(rows: List<Row>, name: Text): List<Integer> {
+    let values: List<Integer> = []
+    for row in rows {
+        if name == "insert" { values.add(row.insert) }
+        else if name == "lookup" { values.add(row.lookup) }
+        else if name == "mixed" { values.add(row.mixed) }
+        else { values.add(row.remove) }
+    }
+    return values
+}
+function separated(items: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(items[index])
+    }
+    return joinText(pieces)
+}
+
+function main(): Integer {
+    let repeats = 7
+    let integerCount = 2000000
+    let textCount = 200000
+    let index = 0
+    while index < argumentCount() {
+        let option = argument(index)
+        test.check(index + 1 < argumentCount(), "missing map benchmark option value")
+        let value = Integer(argument(index + 1))
+        if option == "--repeats" { repeats = value }
+        else if option == "--integer-count" { integerCount = value }
+        else if option == "--text-count" { textCount = value }
+        else { fail("unknown map benchmark option: " + option) }
+        index += 2
+    }
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    let rustc = test.setting("RUSTC", "rustc")
+    let swiftc = test.setting("SWIFTC", "swiftc")
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-maps-bench-root-" + Text(system.processId()), 10)
+    test.require(location, "project location")
+    let root = test.lines(location.output)[0]
+    let output = root + "/build/maps-bench"
+    test.require(test.run(["mkdir", "-p", "--", output], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-maps-bench-mkdir-" + Text(system.processId()), 10), "map benchmark output directory")
+    let logs = output + "/logs"
+    test.check(files.makeDirectory(logs) == 0, "cannot create map benchmark logs")
+    let cpu = pinCPU()
+    test.check(cpu >= 0, "cannot pin map benchmark to one CPU")
+    let versions: List<Text> = []
+    for pair in [["clang", clang], ["rustc", rustc], ["swiftc", swiftc]] {
+        let version = run([pair[1], "--version"], logs, pair[0] + "-version", 60)
+        versions.add(phase.quote(pair[0]) + ": " + phase.quote(stripped(version.output)))
+    }
+    let fixtures = root + "/benchmarks/maps"
+    let hashes: List<Text> = []
+    for name in files.list(fixtures).sorted() { hashes.add(phase.quote(name) + ": " + phase.quote(phase.digest(fixtures + "/" + name))) }
+    let runtime = output + "/runtime.ll"
+    run([clang, "-O2", "-DMINYAR_SYSTEM_HEAP=1", "-S", "-emit-llvm", root + "/runtime/minyar_runtime.c", "-o", runtime], logs, "runtime", 600)
+    writeTextFile(runtime, stripTargets(readTextFile(runtime)))
+    let workloads: List<Text> = []
+    for kind in ["integer", "text"] {
+        let integer = kind == "integer"
+        let count = textCount
+        if integer { count = integerCount }
+        let languages = ["minyar", "rust", "swift"]
+        let extensions = ["min", "rs", "swift"]
+        let keys: List<List<Text>> = []
+        let values: List<List<Text>> = []
+        if integer {
+            keys = [["KEY_TYPE", "KEY_EXPR"], ["KEY_TYPE", "KEY_EXPR", "KEY_INSERT", "KEY_LOOKUP", "KEY_MIX_INSERT"], ["KEY_TYPE", "KEY_EXPR"]]
+            values = [["Integer", "i"], ["i64", "i as i64", "keys[i]", "&queries[k]", "keys[k]"], ["Int", "i"]]
+        } else {
+            keys = [["KEY_TYPE", "KEY_EXPR"], ["KEY_TYPE", "KEY_EXPR", "KEY_INSERT", "KEY_LOOKUP", "KEY_MIX_INSERT"], ["KEY_TYPE", "KEY_EXPR"]]
+            values = [["Text", "\"usr/share/images/κ/\" + Text(i)"], ["String", "format!(\"usr/share/images/κ/{}\", i)", "keys[i].as_str()", "queries[k].as_str()", "keys[k].as_str()"], ["String", "\"usr/share/images/κ/\\(i)\""]]
+        }
+        let binaries: List<Text> = []
+        for position in 0..languages.length {
+            let language = languages[position]
+            let source = test.replace(readTextFile(fixtures + "/operations." + extensions[position]), "COUNT", Text(count))
+            for item in 0..keys[position].length { source = test.replace(source, keys[position][item], values[position][item]) }
+            let stem = output + "/" + kind + "-" + language
+            let path = stem + "." + extensions[position]
+            writeTextFile(path, source)
+            let executable = stem + ".exe"
+            if language == "minyar" {
+                let llvm = stem + ".ll"
+                run([root + "/build/minyarc", path, llvm], logs, kind + "-minyar-compile", 600)
+                run([clang, "-O2", "-flto=thin", "-fuse-ld=lld", "-Wl,--thinlto-jobs=1", "-Wl,--threads=1", "-Wno-override-module", llvm, runtime, fixtures + "/clock.c", "-lm", "-o", executable], logs, kind + "-minyar-link", 600)
+            } else if language == "rust" {
+                run([rustc, "-O", "--crate-name", "mapbench", path, "-o", executable], logs, kind + "-rust-compile", 600)
+            } else {
+                run([swiftc, "-O", path, "-o", executable], logs, kind + "-swift-compile", 600)
+            }
+            binaries.add(executable)
+        }
+        let samples: List<List<Row>> = [[], [], []]
+        let expected = count * (3 * count - 1) / 2
+        for repetition in (-1)..repeats {
+            let shift = max(repetition, 0) % languages.length
+            for step in 0..languages.length {
+                let position = (shift + step) % languages.length
+                let begin = system.monotonicNanoseconds()
+                let result = test.run([binaries[position]], system.environment(), "", logs + "/" + kind + "-" + languages[position] + "-run", 90)
+                let total = Float(system.monotonicNanoseconds() - begin) / 1000000000.0
+                test.require(result, kind + " " + languages[position] + " map benchmark")
+                let numbers: List<Integer> = []
+                for line in test.lines(result.output) { numbers.add(Integer(line)) }
+                test.check(numbers.length == 6 && numbers[4] == expected && numbers[5] == 0, "map benchmark checksum changed: " + languages[position] + "\n" + result.output + result.errorOutput)
+                test.check(result.errorOutput == "", "map benchmark wrote diagnostics: " + result.errorOutput)
+                if repetition >= 0 { samples[position].add(Row { insert: numbers[0]; lookup: numbers[1]; mixed: numbers[2]; remove: numbers[3]; seconds: total }) }
+            }
+        }
+        let operations = ["insert", "lookup", "mixed", "remove"]
+        let medians: List<List<Float>> = []
+        let sampleText: List<Text> = []
+        let medianText: List<Text> = []
+        for position in 0..languages.length {
+            let row: List<Float> = []
+            let parts: List<Text> = []
+            for operation in operations {
+                let value = median(field(samples[position], operation))
+                row.add(value)
+                parts.add(phase.quote(operation) + ": " + Text(value))
+            }
+            medians.add(row)
+            medianText.add(phase.quote(languages[position]) + ": {" + separated(parts, ", ") + "}")
+            let rows: List<Text> = []
+            for sample in samples[position] {
+                rows.add("{\"insert\": " + Text(sample.insert) + ", \"lookup\": " + Text(sample.lookup) + ", \"mixed\": " + Text(sample.mixed) + ", \"remove\": " + Text(sample.remove) + ", \"process_seconds\": " + Text(sample.seconds) + "}")
+            }
+            sampleText.add(phase.quote(languages[position]) + ": [" + separated(rows, ", ") + "]")
+        }
+        let ratios: List<Text> = []
+        for peer in 1..3 {
+            let parts: List<Text> = []
+            for operation in 0..operations.length { parts.add(phase.quote(operations[operation]) + ": " + Text(medians[0][operation] / medians[peer][operation])) }
+            ratios.add(phase.quote(languages[peer]) + ": {" + separated(parts, ", ") + "}")
+        }
+        let summary = "{\"median_ns\": {" + separated(medianText, ", ") + "}, \"minyar_over_peer\": {" + separated(ratios, ", ") + "}}"
+        workloads.add(phase.quote(kind) + ": {\"count\": " + Text(count) + ", \"samples\": {" + separated(sampleText, ", ") + "}, \"median_ns\": {" + separated(medianText, ", ") + "}, \"minyar_over_peer\": {" + separated(ratios, ", ") + "}}")
+        print(kind + " " + summary)
+    }
+    writeTextFile(output + "/results.json", "{\n  \"versions\": {" + separated(versions, ", ") + "},\n  \"affinity\": [" + Text(cpu) + "],\n  \"source_hashes\": {" + separated(hashes, ", ") +
+        "},\n  \"workloads\": {\n    " + separated(workloads, ",\n    ") + "\n  }\n}\n")
+    for name in files.list(logs) { files.remove(logs + "/" + name) }
+    test.check(files.removeDirectory(logs) == 0, "cannot remove map benchmark logs")
+    return 0
+}
+
+function stripped(source: Text): Text {
+    let raw = Bytes(source)
+    let start = 0
+    let end = raw.length
+    while start < end && raw[start] <= 32 { start += 1 }
+    while end > start && raw[end - 1] <= 32 { end -= 1 }
+    return Text(raw.slice(start, end))
+}

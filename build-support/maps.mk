@@ -21,8 +21,11 @@ check check-portable: check-maps
 check-sanitize: check-maps-sanitize
 
 # External affinity/serial execution is the owning Boat job's responsibility.
-bench-maps: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/maps-bench.py
+build/tooling/tests/maps-bench: TOOL_NATIVE = tests/maps-baseline-runtime.c runtime/native/sha256.c
+build/tooling/tests/maps-bench: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/maps-bench: tests/maps-baseline-runtime.c runtime/native/sha256.c
+bench-maps: build/minyarc build/tooling/tests/maps-bench
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-bench
 
 bench-maps-baseline: build/minyarc build/minyarc-baseline build/tooling/tests/maps-baseline
 	$(LIMITED) ./build/tooling/tests/maps-baseline
