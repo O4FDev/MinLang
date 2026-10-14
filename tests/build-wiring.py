@@ -1619,7 +1619,7 @@ class BuildWiring(unittest.TestCase):
                   'tests/interop/qns/owned_adapter.py',
                   'tests/interop/qns/controls-requirements.txt',
                   'scripts/check-quic-official-inputs.py',
-                  'tests/quic-simulator-shutdown.py',
+                  'tests/quic-simulator-shutdown.min',
                   'tests/interop/qns/simulator-shutdown.sh',
                   'tests/quic-qns-endpoint-lifecycle.py',
                   'tests/interop/qns/endpoint.py'}
@@ -1647,7 +1647,8 @@ class BuildWiring(unittest.TestCase):
                 makefile = directory/'probe.mk'
                 makefile.write_text('LIMITED := ordinary-limit\n'
                                     'SANITIZER_LIMITED := sanitizer-limit\n'
-                                    +candidate+'\n.PHONY: build\nbuild:\n\t@echo INPUT build\n')
+                                    +candidate+'\n.PHONY: build\nbuild:\n\t@echo INPUT build\n'
+                                    'build/%:\n\t@echo TOOL $@\n')
                 env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
                            OS=operating_system)
                 env.pop('MAKEFLAGS', None)

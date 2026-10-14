@@ -1,0 +1,90 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "sha256" as sha256
+use "system" as system
+use "files" as files
+
+function quoted(value: Text): Text { return "'" + test.replace(value, "'", "'\\''") + "'" }
+function ready(path: Text): Boolean {
+    if files.pathSize(path) <= 0 { return false }
+    return test.words(readTextFile(path)).length > 0
+}
+function writerPid(path: Text): Integer {
+    if !ready(path) { return 0 }
+    return Integer(test.words(readTextFile(path))[0])
+}
+function release(pid: Integer) {
+    if pid <= 0 || files.pathSize("/proc/" + Text(pid) + "/cmdline") < 0 { return }
+    if test.contains(Text(files.readFile("/proc/" + Text(pid) + "/cmdline")), "--writer") { system.sendSignal(pid, 9) }
+}
+
+function writer(path: Text) {
+    test.check(system.shutdownSignalSocket() >= 0, "cannot install capture writer shutdown handling")
+    writeTextFile(path, Text(system.processId()))
+    while system.drainShutdownSignals() == 0 { quic.pause(10) }
+    quic.pause(200)
+    writeTextFile(path + ".flushed", "capture complete")
+}
+
+function run(source: Text, executable: Text, signal: Integer, name: Text) {
+    let data = files.readFile(source)
+    test.check(files.lastError() == 0, "cannot read simulator shutdown source")
+    let block = Text(data)
+    let marker = block.find("PID=")
+    if marker >= 0 { block = block.slice(marker, block.length) }
+    let root = test.scratch()
+    let command = quoted(executable) + " --writer "
+    writeTextFile(root + "/run.sh", "set -e\n" + command + quoted(root + "/left") + " &\n" + command + quoted(root + "/right") + " &\n" + "PID=$(jobs -p | tr '\\n' ' ')\n" + block)
+    let handle = system.spawn("/usr/bin/setsid", ["setsid", "env", "--default-signal=INT", "/bin/bash", root + "/run.sh"], system.environment(), "")
+    test.check(handle > 0, "cannot start simulator shutdown shell")
+    let shell = system.childProcessId(handle)
+    let limit = system.monotonicNanoseconds() + 30000000000
+    let status = system.poll(handle)
+    while !(ready(root + "/left") && ready(root + "/right")) {
+        if status.state != system.PENDING || system.monotonicNanoseconds() >= limit {
+            if status.state == system.PENDING { system.sendSignal(shell, 9); system.wait(handle) }
+            release(writerPid(root + "/left"))
+            release(writerPid(root + "/right"))
+            fail("capture writers did not become ready")
+        }
+        quic.pause(10)
+        status = system.poll(handle)
+    }
+    let children = [writerPid(root + "/left"), writerPid(root + "/right")]
+    test.check(system.sendSignal(shell, signal) == 0, "cannot signal simulator shutdown shell")
+    limit = system.monotonicNanoseconds() + 30000000000
+    status = system.poll(handle)
+    while status.state == system.PENDING && system.monotonicNanoseconds() < limit {
+        quic.pause(10)
+        status = system.poll(handle)
+    }
+    let flushed = [files.pathSize(root + "/left.flushed") >= 0, files.pathSize(root + "/right.flushed") >= 0]
+    if status.state == system.PENDING {
+        system.sendSignal(shell, 9)
+        status = system.wait(handle)
+        for child in children { release(child) }
+        fail("simulator shutdown shell did not exit")
+    }
+    for child in children { release(child) }
+    let code = status.exitCode
+    if status.state == system.SIGNALED { code = -status.signal }
+    print("{\"signal\": \"" + name + "\", \"shell_status\": " + Text(code) + ", \"flushed_at_shell_exit\": [" + Text(flushed[0]) + ", " + Text(flushed[1]) +
+        "], \"source_sha256\": \"" + sha256.hex(sha256.digest(data)) + "\"}")
+    test.check(code == 128 + signal && flushed[0] && flushed[1], "simulator exited before both capture writers finished")
+    test.removeTree(root)
+}
+
+if argumentCount() == 2 && argument(0) == "--writer" {
+    writer(argument(1))
+    exit(0)
+}
+let script = "tests/interop/qns/simulator-shutdown.sh"
+if argumentCount() == 2 && argument(0) == "--script" { script = argument(1) }
+else { test.check(argumentCount() == 0, "usage: quic-simulator-shutdown [--script PATH]") }
+let work = test.scratch()
+let located = test.run(["readlink", "-f", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/executable", 10)
+test.require(located, "simulator shutdown executable")
+let executable = test.lines(located.output)[0]
+test.removeTree(work)
+run(script, executable, 15, "SIGTERM")
+run(script, executable, 2, "SIGINT")

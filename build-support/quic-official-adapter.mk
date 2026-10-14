@@ -5,7 +5,7 @@ QUIC_OFFICIAL_RUNNER ?= $(abspath build)/quic-interop-runner-740c05a.git
 QUIC_OFFICIAL_PYTHON ?= $(abspath build)/quic-official-controls-venv/bin/python
 QUIC_OFFICIAL_INPUTS = tests/quic-official-adapter.py tests/interop/qns/owned_adapter.py \
     scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt \
-    tests/quic-simulator-shutdown.py tests/interop/qns/simulator-shutdown.sh \
+    tests/quic-simulator-shutdown.min tests/interop/qns/simulator-shutdown.sh \
     tests/quic-qns-endpoint-lifecycle.py tests/interop/qns/endpoint.py
 QUIC_OFFICIAL_RUNNER_BOOTSTRAP = $(if $(filter $(abspath build)/quic-interop-runner-740c05a.git,$(QUIC_OFFICIAL_RUNNER)),build/quic-interop-runner-740c05a.git/.ready.json)
 QUIC_OFFICIAL_PYTHON_BOOTSTRAP = $(if $(filter $(abspath build)/quic-official-controls-venv/bin/python,$(QUIC_OFFICIAL_PYTHON)),build/quic-official-controls-venv/.ready.json)
@@ -19,8 +19,9 @@ build/quic-interop-runner-740c05a.git/.ready.json: | build scripts/check-quic-of
 build/quic-official-controls-venv/.ready.json: | build scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt
 	$(LIMITED) python3 -E scripts/check-quic-official-inputs.py prepare-python --directory "$(abspath build)/quic-official-controls-venv" --requirements "tests/interop/qns/controls-requirements.txt"
 
-check-quic-simulator-shutdown: tests/quic-simulator-shutdown.py tests/interop/qns/simulator-shutdown.sh $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
-	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/quic-simulator-shutdown.py
+build/tooling/tests/quic-simulator-shutdown.ll: tests/quic-test-support.min
+check-quic-simulator-shutdown: build/tooling/tests/quic-simulator-shutdown tests/quic-simulator-shutdown.min tests/interop/qns/simulator-shutdown.sh | build
+	$(LIMITED) ./build/tooling/tests/quic-simulator-shutdown
 
 check-quic-qns-endpoint-lifecycle: tests/quic-qns-endpoint-lifecycle.py tests/interop/qns/endpoint.py $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
 	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/quic-qns-endpoint-lifecycle.py

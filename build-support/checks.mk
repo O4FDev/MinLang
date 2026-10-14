@@ -699,7 +699,7 @@ check-sanitize check-quic-sanitize: check-quic-pto-sanitize
 build/tooling/tests/quic-interop-results.ll build/tooling/tests/quic-interop-controller.ll: tests/quic-interop.min tests/quic-json.min tests/quic-test-support.min
 build/tooling/tests/quic-interop.ll: tests/quic-json.min tests/quic-test-support.min
 QUIC_INTEROP_TOOLS = build/tooling/tests/quic-interop build/tooling/tests/quic-interop-results build/tooling/tests/quic-interop-controller \
-    build/tooling/tests/quic-peer-soak
+    build/tooling/tests/quic-simulator-shutdown build/tooling/tests/quic-peer-soak
 build/tooling/tests/quic-peer-soak.ll: tests/quic-json.min tests/quic-test-support.min
 $(QUIC_INTEROP_TOOLS): TOOL_NATIVE = runtime/native/sha256.c
 $(QUIC_INTEROP_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
