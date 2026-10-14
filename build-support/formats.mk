@@ -6,7 +6,7 @@
 .PHONY: check-formats-pipeline check-formats-pipeline-sanitize
 .PHONY: bench-formats bench-compression bench-sha256 bench-tar
 
-build/tooling/tests/compression-provider build/tooling/tests/compression-codecs build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
+build/tooling/tests/compression-provider build/tooling/tests/compression-codecs build/tooling/tests/format-provider build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
 build/tooling/tests/compression-codecs: TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c runtime/native/sha256.c
 build/tooling/tests/compression-codecs: TOOL_LIBS = -lz -ldl $(TOOL_CRYPTO)
 build/tooling/tests/compression-codecs: tests/compression-codecs-oracle-runtime.c
@@ -51,8 +51,11 @@ check-sha256-sanitize: build/minyarc build/tooling/tests/sha256-test
 check-tar-sanitize: build/minyarc build/tooling/tests/tar-test
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/tar-test --sanitize
 
-check-format-provider:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/format-provider.py
+build/tooling/tests/format-provider: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/format-provider: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/format-provider: tests/sha256-test-native.c
+check-format-provider: build/tooling/tests/format-provider
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/format-provider
 
 check-formats-wiring: build/tooling/tests/formats-wiring
 	$(LIMITED) ./build/tooling/tests/formats-wiring

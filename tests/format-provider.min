@@ -24,6 +24,27 @@ function negative(result: test.Result, first: Text, second: Text) {
     }
     test.check(matched, "format provider rejection lost its ordered diagnostic: " + first + " ... " + second + "\n" + result.output + result.errorOutput)
 }
+function bumpedRelease(source: Text): Text {
+    let lines = test.lines(source)
+    let result: List<Text> = []
+    let changed = false
+    for line in lines {
+        let words = test.words(line)
+        if !changed && words.length >= 3 && words[0] == "#define" && words[1] == "LZ4_VERSION_RELEASE" {
+            result.add("#define LZ4_VERSION_RELEASE " + Text(Integer(words[2]) + 1))
+            changed = true
+        } else { result.add(line) }
+    }
+    test.check(changed, "missing LZ4 release version macro")
+    let pieces: List<Text> = []
+    for line in result { pieces.add(line); pieces.add("\n") }
+    return joinText(pieces)
+}
+function hostName(context: provider.Context): Text {
+    let result = provider.run(context, ["uname", "-s"], 10)
+    test.require(result, "host platform")
+    return test.lines(result.output)[0]
+}
 function copyShaPrefix(context: provider.Context, shared: Boolean): Text {
     let original = provider.info(context, "sha256", true, [], [])
     let path = provider.directory(context) + "/provider space's"
@@ -38,6 +59,7 @@ function copyShaPrefix(context: provider.Context, shared: Boolean): Text {
     }
     let library = json.string(original, "library")
     let suffix = ".so"
+    if hostName(context) == "Darwin" { suffix = ".dylib" }
     if !shared {
         library = provider.parent(library) + "/libcrypto.a"
         if provider.run(context, ["test", "-f", library], 0).status != 0 { print("SKIP OpenSSL development static archive is absent"); return "" }
@@ -79,7 +101,7 @@ function receipts(context: provider.Context, kinds: List<Text>) {
     }
 }
 
-let names = ["test_actual_provider_receipts", "test_bad_prefix_reports_missing_provider", "test_real_prefix_with_space_apostrophe_and_header_refresh", "test_copied_shared_provider_wrong_loaded_image_is_rejected", "test_normal_loader_environment_can_override_rpath", "test_foreign_openssl_secondary_header_is_rejected", "test_foreign_archive_secondary_header_is_rejected", "test_literal_backslash_prefix_has_explicit_diagnostic", "test_non_pie_consumer_flags_identify_shared_image", "test_effective_link_flags_are_used_and_fingerprinted", "test_effective_link_flags_cannot_interpose_secondary_api_image", "test_disabled_sha_compatibility_api_is_rejected"]
+let names = ["test_actual_provider_receipts", "test_bad_prefix_reports_missing_provider", "test_real_prefix_with_space_apostrophe_and_header_refresh", "test_copied_shared_provider_wrong_loaded_image_is_rejected", "test_normal_loader_environment_can_override_rpath", "test_foreign_openssl_secondary_header_is_rejected", "test_foreign_archive_secondary_header_is_rejected", "test_literal_backslash_prefix_has_explicit_diagnostic", "test_non_pie_consumer_flags_identify_shared_image", "test_effective_link_flags_are_used_and_fingerprinted", "test_effective_link_flags_cannot_interpose_secondary_api_image", "test_disabled_sha_compatibility_api_is_rejected", "test_full_static_providers_preserve_archives_and_input_identity", "test_static_provider_rejects_shared_object_disguised_as_archive", "test_static_link_cannot_interpose_matching_version_api", "test_static_provider_still_rejects_header_library_version_mismatch"]
 let clang = test.setting("MINYAR_TEST_CLANG", "clang")
 let kinds: List<Text> = []
 let selectors: List<Text> = []
@@ -97,6 +119,9 @@ while optionIndex < argumentCount() {
 if kinds.length == 0 { kinds = ["sha256", "tararchive"] }
 provider.validate(names, selectors)
 let context = provider.context(clang)
+let system = hostName(context)
+let linux = system == "Linux"
+let darwin = system == "Darwin"
 if provider.selected(names[0], selectors) { receipts(context, kinds) }
 if provider.selected(names[1], selectors) {
     let directory = provider.directory(context)
@@ -119,13 +144,13 @@ if provider.selected(names[2], selectors) {
         test.check(provider.parent(json.string(first, "library")) == prefix + "/lib" && ends(json.string(first, "library"), ".a"), "quoted prefix resolved a different static library")
         test.check(json.member(first, "runtime_library").kind == json.NULL, "copied static provider acquired runtime image")
         let header = prefix + "/include/openssl/sha.h"
-        writeTextFile(header, readTextFile(header) + "\n")
+        writeTextFile(header, readTextFile(header) + "\n/* provider cache input changed */\n")
         let second = provider.info(context, "sha256", true, [], [])
         test.check(json.string(first, "sha256") != json.string(second, "sha256"), "primary provider header change did not refresh fingerprint")
         test.check(!provider.same(provider.strings(first, "cflags"), provider.strings(second, "cflags")), "primary provider header change did not refresh effective C flags")
         test.check(provider.same(provider.strings(first, "libraries"), provider.strings(second, "libraries")), "primary header change altered selected libraries")
         header = prefix + "/include/openssl/opensslconf.h"
-        writeTextFile(header, readTextFile(header) + "\n")
+        writeTextFile(header, readTextFile(header) + "\n/* secondary provider input changed */\n")
         let third = provider.info(context, "sha256", true, [], [])
         test.check(json.string(second, "sha256") != json.string(third, "sha256"), "secondary generated configuration did not refresh fingerprint")
         context.environment = original
@@ -138,7 +163,8 @@ if provider.selected(names[3], selectors) {
     negative(provider.query(context, "sha256", true, [], []), "loaded provider image", "selected library")
     context.environment = original
 }
-if provider.selected(names[4], selectors) {
+if provider.selected(names[4], selectors) && !linux { print("SKIP ELF loader regression") }
+if provider.selected(names[4], selectors) && linux {
     let original = provider.info(context, "sha256", true, [], [])
     let foreign = provider.directory(context) + "/foreign"
     provider.require(context, ["mkdir", "--", foreign], 0)
@@ -187,13 +213,15 @@ if provider.selected(names[7], selectors) {
         context.environment = original
     }
 }
-if provider.selected(names[8], selectors) {
+if provider.selected(names[8], selectors) && !linux { print("SKIP ELF PLT address regression") }
+if provider.selected(names[8], selectors) && linux {
     let info = provider.info(context, "sha256", true, ["-fno-pie"], ["-no-pie"])
     test.check(json.string(info, "runtime_library") == json.string(info, "library"), "non-PIE shared API resolved executable PLT image")
 }
 if provider.selected(names[9], selectors) {
     let base = provider.info(context, "sha256", true, [], [])
     let valid = ["-Wl,--as-needed"]
+    if darwin { valid = ["-Wl,-dead_strip"] }
     let changed = provider.info(context, "sha256", true, [], valid)
     test.check(provider.same(provider.strings(changed, "link_flags"), valid), "effective link flags were not retained")
     test.check(json.string(base, "sha256") != json.string(changed, "sha256"), "effective link flags were not fingerprinted")
@@ -207,10 +235,83 @@ if provider.selected(names[10], selectors) {
     let directory = provider.directory(context)
     let source = directory + "/shadow.c"
     let library = directory + "/libshadow.so"
+    let flags = ["-shared", "-fPIC"]
+    if darwin {
+        library = directory + "/libshadow.dylib"
+        flags = ["-dynamiclib", "-Wl,-install_name," + library]
+    }
     writeTextFile(source, "int SHA256_Final(unsigned char *out, void *state) { return 0; }\n")
-    provider.require(context, [context.clang, "-shared", "-fPIC", source, "-o", library], 30)
+    let command = [context.clang]
+    for flag in flags { command.add(flag) }
+    for item in [source, "-o", library] { command.add(item) }
+    provider.require(context, command, 30)
     negative(provider.query(context, "sha256", true, [], [library]), "loaded provider image", "selected library")
 }
 if provider.selected(names[11], selectors) { provider.rejected(provider.query(context, "sha256", true, ["-DOPENSSL_NO_DEPRECATED"], []), "compile/link probe failed") }
+for index in 12..16 { if provider.selected(names[index], selectors) && !linux { print("SKIP Linux static provider contract") } }
+if provider.selected(names[12], selectors) && linux {
+    let flags = ["-O2", "-pthread", "-static", "-Wno-override-module"]
+    for kind in ["sha256", "tararchive", "lz4"] {
+        let info = provider.info(context, kind, true, flags, [])
+        let again = provider.info(context, kind, true, flags, [])
+        let library = json.string(info, "library")
+        test.check(ends(library, ".a"), "static provider did not select an archive: " + kind)
+        test.check(json.member(info, "runtime_library").kind == json.NULL, "static provider acquired a runtime image: " + kind)
+        test.check(json.string(info, "sha256") == json.string(again, "sha256"), "static provider identity is unstable: " + kind)
+        test.check(provider.same(provider.strings(info, "compile_flags"), flags), "static provider lost its effective flags: " + kind)
+        let inputs = json.member(info, "inputs")
+        test.check(inputs.kind == json.ARRAY, "missing static provider inputs")
+        let archives: List<Text> = []
+        for row in inputs.items {
+            let path = json.string(row, "path")
+            if ends(path, ".a") { archives.add(path) }
+            test.check(json.string(row, "sha256") == digest(path), "static provider input hash changed: " + path)
+        }
+        let libc = false
+        for path in archives { if provider.basename(path) == "libc.a" { libc = true } }
+        test.check(libc, "static provider omitted libc.a from its input identity: " + kind)
+        test.check(provider.contains(archives, library), "static provider omitted its selected archive: " + kind)
+    }
+}
+if provider.selected(names[13], selectors) && linux {
+    let prefix = copyShaPrefix(context, true)
+    test.check(files.rename(prefix + "/lib/libcrypto.so", prefix + "/lib/libcrypto.a") == 0, "cannot disguise shared provider as an archive")
+    let original = context.environment
+    provider.setEnvironment(context, "MINYAR_SHA256_PREFIX", prefix)
+    provider.rejected(provider.query(context, "sha256", true, ["-static"], []), "real static archive")
+    context.environment = original
+}
+if provider.selected(names[14], selectors) && linux {
+    let work = provider.directory(context)
+    let source = work + "/shadow.c"
+    let object = work + "/shadow.o"
+    writeTextFile(source, "#include <archive.h>\nint archive_version_number(void) { return ARCHIVE_VERSION_NUMBER; }\n")
+    provider.require(context, [context.clang, "-O2", "-c", source, "-o", object], 30)
+    let selected = provider.info(context, "tararchive", true, ["-static"], [])
+    let probe = work + "/probe.c"
+    let binary = work + "/probe"
+    writeTextFile(probe, "#include <archive.h>\n#include <archive_entry.h>\n_Static_assert(sizeof(void *) == 8, \"64-bit provider required\");\nint main(void) {\n    struct archive *reader;\n    struct archive_entry *entry;\n    if (archive_version_number() != ARCHIVE_VERSION_NUMBER) return 1;\n    reader = archive_read_new();\n    entry = archive_entry_new();\n    if (!reader || !entry) return 2;\n    archive_entry_free(entry);\n    return archive_read_free(reader) != ARCHIVE_OK;\n}\n")
+    let flags = [object, "-Wl,--allow-multiple-definition"]
+    let command = [context.clang, "-static", probe]
+    for item in flags { command.add(item) }
+    for item in provider.strings(selected, "libraries") { command.add(item) }
+    for item in ["-o", binary] { command.add(item) }
+    provider.require(context, command, 30)
+    provider.require(context, [binary], 30)
+    negative(provider.query(context, "tararchive", true, ["-static"], flags), "static provider API", "selected archive")
+}
+if provider.selected(names[15], selectors) && linux {
+    let original = provider.info(context, "lz4", true, ["-static"], [])
+    let prefix = provider.directory(context) + "/lz4 provider"
+    provider.require(context, ["mkdir", "-p", "--", prefix + "/include", prefix + "/lib"], 0)
+    provider.require(context, ["cp", "-p", "--", json.string(original, "include") + "/lz4.h", prefix + "/include/lz4.h"], 0)
+    provider.require(context, ["cp", "-p", "--", json.string(original, "library"), prefix + "/lib/liblz4.a"], 0)
+    let header = prefix + "/include/lz4.h"
+    writeTextFile(header, bumpedRelease(readTextFile(header)))
+    let environment = context.environment
+    provider.setEnvironment(context, "MINYAR_LZ4_PREFIX", prefix)
+    provider.rejected(provider.query(context, "lz4", true, ["-static"], []), "version/64-bit API probe failed")
+    context.environment = environment
+}
 test.removeTree(context.directory)
 print("format provider: all selected contracts passed")
