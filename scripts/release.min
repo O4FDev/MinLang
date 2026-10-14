@@ -1,0 +1,724 @@
+use "system" as system
+use "files" as files
+use "json" as json
+
+public constant MISSING = 0
+public constant FILE = 1
+public constant DIRECTORY = 2
+public constant LINK = 3
+public constant OTHER = 4
+
+public record Completed { status: Integer; output: Text; errorOutput: Text }
+public record Outcome { kind: Text; message: Text }
+public record Checked { outcome: Outcome; result: Completed }
+public record Thumbprint { outcome: Outcome; value: Text }
+public record Options { entitlements: Text; signedAppOutput: Text; keychain: Text; notaryKeychain: Text }
+public record Hooks { run: Callback<List<Text>, Completed>; replace: Callback<Text, Text, Outcome> }
+record Element { name: Text; text: Text; children: List<Element> }
+record Cursor { source: Bytes; position: Integer; error: Text }
+
+function kindOf(path: Text): Integer { native "releasenative" }
+function realpath(path: Text): Text { native "releasenative" }
+function readLink(path: Text): Text { native "releasenative" }
+function currentDirectory(): Text { native "releasenative" }
+function temporaryDirectory(parent: Text, prefix: Text): Text { native "releasenative" }
+function exclusiveRename(from: Text, to: Text): Integer { native "releasenative" }
+function sha1(data: Bytes): Text { native "releasenative" }
+
+public function succeeded(): Outcome { return Outcome { kind: ""; message: "" } }
+public function ok(outcome: Outcome): Boolean { return outcome.kind == "" }
+function invalid(message: Text): Outcome { return Outcome { kind: "value"; message: message } }
+function existing(message: Text): Outcome { return Outcome { kind: "exists"; message: message } }
+function failure(message: Text): Outcome { return Outcome { kind: "os"; message: message } }
+function errno(code: Integer, path: Text): Outcome {
+    if code == -17 { return existing(files.errorText(code) + ": " + path) }
+    return failure(files.errorText(code) + ": " + path)
+}
+
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function join(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+function slice(source: Text, begin: Integer, end: Integer): Text {
+    let raw = Bytes(source)
+    return Text(raw.slice(begin, end))
+}
+function upper(source: Text): Text {
+    let raw = Bytes(source)
+    let result = Bytes()
+    for byte in raw {
+        if byte >= 97 && byte <= 122 { result.add(byte - 32) } else { result.add(byte) }
+    }
+    return Text(result)
+}
+function lower(source: Text): Text {
+    let raw = Bytes(source)
+    let result = Bytes()
+    for byte in raw {
+        if byte >= 65 && byte <= 90 { result.add(byte + 32) } else { result.add(byte) }
+    }
+    return Text(result)
+}
+function strip(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && (raw[begin] == 32 || (raw[begin] >= 9 && raw[begin] <= 13)) { begin += 1 }
+    while end > begin && (raw[end - 1] == 32 || (raw[end - 1] >= 9 && raw[end - 1] <= 13)) { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function splitLines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 10 || raw[index] == 13 {
+            result.add(Text(raw.slice(start, index)))
+            if raw[index] == 13 && index + 1 < raw.length && raw[index + 1] == 10 { index += 1 }
+            start = index + 1
+        }
+        index += 1
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+function hexDigits(source: Text, count: Integer, upperAllowed: Boolean): Boolean {
+    let raw = Bytes(source)
+    if raw.length != count { return false }
+    for byte in raw {
+        let digit = byte >= 48 && byte <= 57
+        let small = byte >= 97 && byte <= 102
+        let large = upperAllowed && byte >= 65 && byte <= 70
+        if !digit && !small && !large { return false }
+    }
+    return true
+}
+
+public function entryKind(path: Text): Integer {
+    let kind = kindOf(path)
+    if kind < 0 { return OTHER }
+    return kind
+}
+public function name(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    return Text(raw.slice(start, raw.length))
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+public function suffix(path: Text): Text {
+    let raw = Bytes(name(path))
+    let dot = -1
+    for index in 0..raw.length { if raw[index] == 46 { dot = index } }
+    if dot <= 0 || dot == raw.length - 1 { return "" }
+    return Text(raw.slice(dot, raw.length))
+}
+function stem(path: Text): Text {
+    let full = Bytes(name(path))
+    let extension = Bytes(suffix(path))
+    return Text(full.slice(0, full.length - extension.length))
+}
+function depth(path: Text): Integer {
+    return pathParts(path).length
+}
+function pathParts(path: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 {
+            if index > start { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+public function absolute(path: Text): Text {
+    let base = ""
+    if !starts(path, "/") { base = currentDirectory() }
+    let parts: List<Text> = []
+    for part in pathParts(base + "/" + path) { if part != "." { parts.add(part) } }
+    return "/" + join(parts, "/")
+}
+function normalized(path: Text): Text {
+    let parts: List<Text> = []
+    let count = 0
+    for part in pathParts(path) {
+        if part == ".." {
+            if count > 0 { count -= 1 }
+        } else if part != "." {
+            if count < parts.length { parts[count] = part } else { parts.add(part) }
+            count += 1
+        }
+    }
+    let kept: List<Text> = []
+    for index in 0..count { kept.add(parts[index]) }
+    return "/" + join(kept, "/")
+}
+function within(path: Text, root: Text): Boolean {
+    return path == root || starts(path, root + "/")
+}
+function linkTarget(path: Text): Text {
+    let resolved = realpath(path)
+    if resolved != "" { return resolved }
+    let target = readLink(path)
+    if starts(target, "/") { return normalized(target) }
+    return normalized(realpath(parent(path)) + "/" + target)
+}
+function isDirectory(path: Text): Boolean {
+    let resolved = realpath(path)
+    return resolved != "" && entryKind(resolved) == DIRECTORY
+}
+function isFile(path: Text): Boolean {
+    let resolved = realpath(path)
+    return resolved != "" && entryKind(resolved) == FILE
+}
+public function entries(root: Text): List<Text> {
+    let result: List<Text> = []
+    collect(root, result)
+    return result
+}
+function collect(directory: Text, result: List<Text>) {
+    let names = files.list(directory)
+    names.sort()
+    for child in names {
+        let path = directory + "/" + child
+        result.add(path)
+        if entryKind(path) == DIRECTORY { collect(path, result) }
+    }
+}
+function makeDirectories(path: Text): Outcome {
+    if isDirectory(path) { return succeeded() }
+    let up = parent(path)
+    if up != path {
+        let made = makeDirectories(up)
+        if !ok(made) { return made }
+    }
+    let code = files.makeDirectory(path)
+    if code != 0 { return errno(code, path) }
+    return succeeded()
+}
+public function removeTree(path: Text) {
+    let kind = entryKind(path)
+    if kind == MISSING { return }
+    if kind == DIRECTORY {
+        for child in files.list(path) { removeTree(path + "/" + child) }
+        files.removeDirectory(path)
+    } else {
+        files.remove(path)
+    }
+}
+function copyTree(source: Text, destination: Text): Outcome {
+    let result = capture(["cp", "-RPp", "--", source, destination])
+    if result.status != 0 { return failure("cannot copy " + source + ": " + result.errorOutput) }
+    return succeeded()
+}
+function machO(path: Text): Boolean {
+    let file = files.open(path, files.READ)
+    if file < 0 { return false }
+    let head = files.readAt(file, 0, 4)
+    files.close(file)
+    if head.length != 4 { return false }
+    let value = ((head[0] * 256 + head[1]) * 256 + head[2]) * 256 + head[3]
+    for magic in [4277009102, 3472551422, 4277009103, 3489328638, 3405691582, 3199925962, 3405691583, 3216703178] {
+        if value == magic { return true }
+    }
+    return false
+}
+function compareText(left: Text, right: Text): Integer {
+    let a = Bytes(left)
+    let b = Bytes(right)
+    let count = a.length
+    if b.length < count { count = b.length }
+    for index in 0..count {
+        if a[index] != b[index] { return a[index] - b[index] }
+    }
+    return a.length - b.length
+}
+function signingTargets(stage: Text): List<Text> {
+    let targets: List<Text> = []
+    for path in entries(stage) {
+        let kind = entryKind(path)
+        if kind == FILE && machO(path) { targets.add(path) }
+        let extension = suffix(path)
+        if kind == DIRECTORY && (extension == ".framework" || extension == ".xpc" || extension == ".appex" || extension == ".app") { targets.add(path) }
+    }
+    targets.sortBy(function(left: Text, right: Text): Integer {
+        let difference = depth(right) - depth(left)
+        if difference != 0 { return difference }
+        return compareText(left, right)
+    })
+    targets.add(stage)
+    return targets
+}
+function escapingLink(app: Text): Text {
+    for path in entries(app) {
+        if entryKind(path) == LINK && !within(linkTarget(path), app) { return path }
+    }
+    return ""
+}
+
+function capture(command: List<Text>): Completed {
+    let parentDirectory = system.getenv("TMPDIR")
+    if parentDirectory == "" { parentDirectory = "/tmp" }
+    let directory = temporaryDirectory(parentDirectory, "minyar-release-run-")
+    if directory == "" { return Completed { status: 127; output: ""; errorOutput: "cannot create a capture directory" } }
+    let argv = ["sh", "-c", "out=$1; err=$2; shift 2; exec \"$@\" >\"$out\" 2>\"$err\"", "minyar", directory + "/out", directory + "/err"]
+    for item in command { argv.add(item) }
+    let handle = system.spawn("/bin/sh", argv, system.environment(), "")
+    let status = 127
+    if handle > 0 {
+        let waited = system.wait(handle)
+        status = waited.exitCode
+        if waited.state == system.SIGNALED { status = 128 + waited.signal }
+    }
+    let output = Text(files.readFile(directory + "/out"))
+    let errorOutput = Text(files.readFile(directory + "/err"))
+    removeTree(directory)
+    return Completed { status: status; output: output; errorOutput: errorOutput }
+}
+public function systemRunner(): Callback<List<Text>, Completed> {
+    return function(command: List<Text>): Completed { return capture(command) }
+}
+public function systemReplace(): Callback<Text, Text, Outcome> {
+    return function(from: Text, to: Text): Outcome {
+        let code = files.rename(from, to)
+        if code != 0 { return errno(code, to) }
+        return succeeded()
+    }
+}
+public function hooks(): Hooks {
+    return Hooks { run: systemRunner(); replace: systemReplace() }
+}
+public function options(): Options {
+    return Options { entitlements: ""; signedAppOutput: ""; keychain: ""; notaryKeychain: "" }
+}
+
+public function checked(run: Callback<List<Text>, Completed>, command: List<Text>): Checked {
+    let result = run(command)
+    if result.status != 0 {
+        return Checked { outcome: Outcome { kind: "process"; message: "Command '" + join(command, " ") + "' returned non-zero exit status " + Text(result.status) + "." }; result: result }
+    }
+    return Checked { outcome: succeeded(); result: result }
+}
+public function notarize(path: Text, profile: Text, run: Callback<List<Text>, Completed>, keychain: Text): Outcome {
+    let command = ["xcrun", "notarytool", "submit", path, "--keychain-profile", profile, "--wait", "--output-format", "json"]
+    if keychain != "" { command.add("--keychain"); command.add(keychain) }
+    let submitted = checked(run, command)
+    if !ok(submitted.outcome) { return submitted.outcome }
+    let parsed = json.parse(submitted.result.output)
+    let present = false
+    if parsed.kind == json.OBJECT {
+        for key in parsed.keys { if key == "status" { present = true } }
+    }
+    if !present { return invalid("notarytool did not return an explicit notarization status") }
+    let status = json.member(parsed, "status")
+    if status.kind == json.STRING && status.text == "Accepted" { return succeeded() }
+    let shown = status.text
+    if status.kind == json.NULL { shown = "None" }
+    return invalid("notarization was not accepted: " + shown)
+}
+public function publishDirectory(source: Text, destination: Text): Outcome {
+    let code = exclusiveRename(source, destination)
+    if code != 0 { return errno(code, destination) }
+    return succeeded()
+}
+
+function skipMarkup(cursor: Cursor) {
+    let raw = cursor.source
+    while cursor.position < raw.length {
+        let byte = raw[cursor.position]
+        if byte == 32 || byte == 9 || byte == 10 || byte == 13 { cursor.position += 1; continue }
+        if byte == 60 && cursor.position + 1 < raw.length && (raw[cursor.position + 1] == 63 || raw[cursor.position + 1] == 33) {
+            let closing = 62
+            let comment = cursor.position + 3 < raw.length && raw[cursor.position + 2] == 45 && raw[cursor.position + 3] == 45
+            let index = cursor.position + 2
+            while index < raw.length {
+                if raw[index] == closing && (!comment || (raw[index - 1] == 45 && raw[index - 2] == 45)) { break }
+                index += 1
+            }
+            if index >= raw.length { cursor.error = "unterminated markup"; return }
+            cursor.position = index + 1
+            continue
+        }
+        return
+    }
+}
+function decodeEntities(raw: Bytes): Text {
+    let text = Text(raw)
+    let pairs = [["&lt;", "<"], ["&gt;", ">"], ["&quot;", "\""], ["&apos;", "'"], ["&amp;", "&"]]
+    for pair in pairs {
+        let pieces: List<Text> = []
+        let source = Bytes(text)
+        let pattern = Bytes(pair[0])
+        let start = 0
+        let index = 0
+        while index + pattern.length <= source.length {
+            let equal = true
+            for offset in 0..pattern.length { if source[index + offset] != pattern[offset] { equal = false; break } }
+            if equal { pieces.add(Text(source.slice(start, index))); pieces.add(pair[1]); index += pattern.length; start = index } else { index += 1 }
+        }
+        pieces.add(Text(source.slice(start, source.length)))
+        text = joinText(pieces)
+    }
+    return text
+}
+function parseElement(cursor: Cursor, level: Integer): Element {
+    let empty: List<Element> = []
+    let raw = cursor.source
+    if level > 64 || cursor.position >= raw.length || raw[cursor.position] != 60 { cursor.error = "expected an element"; return Element { name: ""; text: ""; children: empty } }
+    let index = cursor.position + 1
+    let begin = index
+    while index < raw.length && raw[index] != 62 && raw[index] != 47 && raw[index] != 32 && raw[index] != 9 && raw[index] != 10 && raw[index] != 13 { index += 1 }
+    let tag = Text(raw.slice(begin, index))
+    while index < raw.length && raw[index] != 62 { index += 1 }
+    if index >= raw.length || tag == "" { cursor.error = "unterminated element"; return Element { name: tag; text: ""; children: empty } }
+    if raw[index - 1] == 47 {
+        cursor.position = index + 1
+        return Element { name: tag; text: ""; children: empty }
+    }
+    cursor.position = index + 1
+    let children: List<Element> = []
+    let content = Bytes()
+    while cursor.error == "" {
+        if cursor.position >= raw.length { cursor.error = "unterminated element " + tag; break }
+        let byte = raw[cursor.position]
+        if byte != 60 { content.add(byte); cursor.position += 1; continue }
+        if cursor.position + 1 < raw.length && raw[cursor.position + 1] == 47 {
+            let end = cursor.position + 2
+            while end < raw.length && raw[end] != 62 { end += 1 }
+            if end >= raw.length || strip(Text(raw.slice(cursor.position + 2, end))) != tag { cursor.error = "mismatched closing element"; break }
+            cursor.position = end + 1
+            return Element { name: tag; text: decodeEntities(content); children: children }
+        }
+        if cursor.position + 1 < raw.length && (raw[cursor.position + 1] == 33 || raw[cursor.position + 1] == 63) { skipMarkup(cursor); continue }
+        children.add(parseElement(cursor, level + 1))
+    }
+    return Element { name: tag; text: ""; children: empty }
+}
+function truthy(value: Element): Integer {
+    if value.name == "true" { return 1 }
+    if value.name == "false" { return 0 }
+    if value.name == "string" || value.name == "data" { if strip(value.text) != "" { return 1 } else { return 0 } }
+    if value.name == "integer" || value.name == "real" {
+        let raw = Bytes(strip(value.text))
+        if raw.length == 0 { return -1 }
+        for byte in raw { if byte >= 49 && byte <= 57 { return 1 } }
+        return 0
+    }
+    if value.name == "array" || value.name == "dict" { if value.children.length > 0 { return 1 } else { return 0 } }
+    if value.name == "date" { return 1 }
+    return -1
+}
+public function getTaskAllow(data: Bytes): Integer {
+    if data.length >= 6 {
+        let prefix = Text(data.slice(0, 6))
+        if prefix == "bplist" { return -1 }
+    }
+    let cursor = Cursor { source: data; position: 0; error: "" }
+    skipMarkup(cursor)
+    if cursor.error != "" { return -1 }
+    let root = parseElement(cursor, 0)
+    if cursor.error != "" { return -1 }
+    skipMarkup(cursor)
+    if cursor.error != "" || cursor.position != data.length || root.name != "plist" || root.children.length != 1 { return -1 }
+    let values = root.children[0]
+    if values.name != "dict" || values.children.length % 2 != 0 { return -1 }
+    let found = 0
+    let index = 0
+    while index < values.children.length {
+        let key = values.children[index]
+        if key.name != "key" { return -1 }
+        let value = truthy(values.children[index + 1])
+        if value < 0 { return -1 }
+        if key.text == "com.apple.security.get-task-allow" { found = value }
+        index += 2
+    }
+    return found
+}
+
+function resolveStrict(path: Text): Text {
+    return realpath(path)
+}
+public function macos(app: Text, output: Text, identity: Text, profile: Text, settings: Options, actions: Hooks): Outcome {
+    if !starts(identity, "Developer ID Application: ") || profile == "" {
+        return invalid("a Developer ID Application identity and notarytool Keychain profile are required")
+    }
+    let appPath = resolveStrict(app)
+    if appPath == "" { return failure("No such file or directory: " + app) }
+    let outputPath = absolute(output)
+    let keychain = ""
+    if settings.keychain != "" {
+        keychain = resolveStrict(settings.keychain)
+        if keychain == "" { return failure("No such file or directory: " + settings.keychain) }
+    }
+    let notaryKeychain = ""
+    if settings.notaryKeychain != "" {
+        notaryKeychain = resolveStrict(settings.notaryKeychain)
+        if notaryKeychain == "" { return failure("No such file or directory: " + settings.notaryKeychain) }
+    }
+    if suffix(appPath) != ".app" || !isDirectory(appPath + "/Contents/MacOS") || suffix(outputPath) != ".dmg" {
+        return invalid("macOS release requires an application bundle and .dmg output")
+    }
+    let retained = ""
+    if settings.signedAppOutput != "" {
+        retained = absolute(settings.signedAppOutput)
+        if suffix(retained) != ".app" { return invalid("signed app output must be a new .app generation") }
+        if entryKind(retained) != MISSING { return existing("signed app output already exists: " + retained) }
+        let made = makeDirectories(parent(retained))
+        if !ok(made) { return made }
+    }
+    let entitlements = ""
+    if settings.entitlements != "" {
+        entitlements = resolveStrict(settings.entitlements)
+        if entitlements == "" { return failure("No such file or directory: " + settings.entitlements) }
+        let allowed = getTaskAllow(files.readFile(entitlements))
+        if allowed < 0 { return invalid("cannot parse the entitlements property list: " + entitlements) }
+        if allowed > 0 { return invalid("development get-task-allow entitlement cannot ship") }
+    }
+    let escape = escapingLink(appPath)
+    if escape != "" { return invalid("bundle symlink escapes the app: " + escape) }
+    let made = makeDirectories(parent(outputPath))
+    if !ok(made) { return made }
+    let temporary = temporaryDirectory(parent(outputPath), ".minyar-release-")
+    if temporary == "" { return failure("cannot create a release staging directory in " + parent(outputPath)) }
+    let appTemporary = temporary
+    if retained != "" {
+        appTemporary = temporaryDirectory(parent(retained), ".minyar-signed-app-")
+        if appTemporary == "" {
+            removeTree(temporary)
+            return failure("cannot create a signed app staging directory in " + parent(retained))
+        }
+    }
+    let result = signAndPublish(appPath, outputPath, identity, profile, keychain, notaryKeychain, entitlements, retained, temporary, appTemporary, actions)
+    if appTemporary != temporary { removeTree(appTemporary) }
+    removeTree(temporary)
+    return result
+}
+function signAndPublish(app: Text, output: Text, identity: Text, profile: Text, keychain: Text, notaryKeychain: Text, entitlements: Text, retained: Text, temporary: Text, appTemporary: Text, actions: Hooks): Outcome {
+    let run = actions.run
+    let replace = actions.replace
+    let stage = appTemporary + "/" + name(app)
+    let copied = copyTree(app, stage)
+    if !ok(copied) { return copied }
+    for target in signingTargets(stage) {
+        let command = ["codesign", "--force", "--sign", identity, "--options", "runtime", "--timestamp"]
+        if keychain != "" { command.add("--keychain"); command.add(keychain) }
+        if entitlements != "" && target == stage { command.add("--entitlements"); command.add(entitlements) }
+        command.add(target)
+        let signed = checked(run, command)
+        if !ok(signed.outcome) { return signed.outcome }
+    }
+    let steps: List<List<Text>> = [["codesign", "--verify", "--deep", "--strict", "--verbose=2", stage]]
+    let archive = temporary + "/notarization.zip"
+    steps.add(["ditto", "-c", "-k", "--keepParent", stage, archive])
+    for step in steps {
+        let done = checked(run, step)
+        if !ok(done.outcome) { return done.outcome }
+    }
+    let notarized = notarize(archive, profile, run, notaryKeychain)
+    if !ok(notarized) { return notarized }
+    let image = temporary + "/" + name(output)
+    for step in [["xcrun", "stapler", "staple", stage], ["xcrun", "stapler", "validate", stage],
+            ["spctl", "--assess", "--type", "execute", "--verbose=2", stage],
+            ["hdiutil", "create", "-volname", stem(app), "-srcfolder", stage, "-format", "UDZO", "-ov", image]] {
+        let done = checked(run, step)
+        if !ok(done.outcome) { return done.outcome }
+    }
+    let command = ["codesign", "--force", "--sign", identity, "--timestamp"]
+    if keychain != "" { command.add("--keychain"); command.add(keychain) }
+    command.add(image)
+    let signed = checked(run, command)
+    if !ok(signed.outcome) { return signed.outcome }
+    let imageNotarized = notarize(image, profile, run, notaryKeychain)
+    if !ok(imageNotarized) { return imageNotarized }
+    for step in [["xcrun", "stapler", "staple", image], ["xcrun", "stapler", "validate", image],
+            ["codesign", "--verify", "--strict", image],
+            ["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", image]] {
+        let done = checked(run, step)
+        if !ok(done.outcome) { return done.outcome }
+    }
+    if retained == "" { return replace(image, output) }
+    let published = publishDirectory(stage, retained)
+    if !ok(published) { return published }
+    let replaced = replace(image, output)
+    if !ok(replaced) { files.rename(retained, stage) }
+    return replaced
+}
+
+public function testOutput(output: Text, extension: Text): Outcome {
+    let path = absolute(output)
+    if !starts(name(path), "TEST-") || lower(suffix(path)) != extension {
+        return invalid("TEST ONLY output must be named TEST-*" + extension)
+    }
+    if entryKind(path) != MISSING { return existing("TEST output already exists: " + path) }
+    return succeeded()
+}
+function testCommonName(subject: Text): Boolean {
+    let prefix = "CN=Minyar TEST ONLY "
+    if !starts(subject, prefix) { return false }
+    let raw = Bytes(subject)
+    return hexDigits(Text(raw.slice(Bytes(prefix).length, raw.length)), 32, false)
+}
+public function testCertificate(certificate: Text, thumbprint: Text, openssl: Text, run: Callback<List<Text>, Completed>): Thumbprint {
+    if !hexDigits(thumbprint, 40, true) { return Thumbprint { outcome: invalid("TEST certificate requires an explicit SHA1 DER thumbprint"); value: "" } }
+    let path = resolveStrict(certificate)
+    if path == "" { return Thumbprint { outcome: failure("No such file or directory: " + certificate); value: "" } }
+    if upper(sha1(files.readFile(path))) != upper(thumbprint) { return Thumbprint { outcome: invalid("TEST certificate thumbprint mismatch"); value: "" } }
+    let named = checked(run, [openssl, "x509", "-inform", "DER", "-in", path, "-noout", "-subject", "-issuer", "-nameopt", "RFC2253"])
+    if !ok(named.outcome) { return Thumbprint { outcome: named.outcome; value: "" } }
+    let names = splitLines(named.result.output)
+    if names.length != 2 || !starts(names[0], "subject=") || !starts(names[1], "issuer=") {
+        return Thumbprint { outcome: invalid("cannot inspect TEST certificate names"); value: "" }
+    }
+    let subject = strip(slice(names[0], 8, Bytes(names[0]).length))
+    let issuer = strip(slice(names[1], 7, Bytes(names[1]).length))
+    if subject != issuer || !testCommonName(subject) {
+        return Thumbprint { outcome: invalid("certificate must be self-signed with a randomized Minyar TEST ONLY CN"); value: "" }
+    }
+    let usage = checked(run, [openssl, "x509", "-inform", "DER", "-in", path, "-noout", "-ext", "extendedKeyUsage"])
+    if !ok(usage.outcome) { return Thumbprint { outcome: usage.outcome; value: "" } }
+    let lines: List<Text> = []
+    for line in splitLines(usage.result.output) { lines.add(strip(line)) }
+    if lines.length != 2 || (lines[0] != "X509v3 Extended Key Usage:" && lines[0] != "X509v3 Extended Key Usage: critical") || lines[1] != "Code Signing" {
+        return Thumbprint { outcome: invalid("TEST certificate must have only the Code Signing extended key usage"); value: "" }
+    }
+    let parentDirectory = system.getenv("TMPDIR")
+    if parentDirectory == "" { parentDirectory = "/tmp" }
+    let directory = temporaryDirectory(parentDirectory, "minyar-test-certificate-")
+    if directory == "" { return Thumbprint { outcome: failure("cannot create a certificate directory"); value: "" } }
+    let pem = directory + "/certificate.pem"
+    let converted = checked(run, [openssl, "x509", "-inform", "DER", "-in", path, "-out", pem])
+    let verified = converted
+    if ok(converted.outcome) { verified = checked(run, [openssl, "verify", "-check_ss_sig", "-purpose", "any", "-CAfile", pem, pem]) }
+    removeTree(directory)
+    if !ok(verified.outcome) { return Thumbprint { outcome: verified.outcome; value: "" } }
+    return Thumbprint { outcome: succeeded(); value: upper(thumbprint) }
+}
+public function verifyTestMacos(app: Text, thumbprint: Text, run: Callback<List<Text>, Completed>): Outcome {
+    return checked(run, ["codesign", "--verify", "--deep", "--strict", "--verbose=2", "-R", "certificate leaf = H\"" + thumbprint + "\"", app]).outcome
+}
+public function testMacos(app: Text, output: Text, certificate: Text, thumbprint: Text, keychain: Text, openssl: Text, run: Callback<List<Text>, Completed>): Outcome {
+    let named = testOutput(output, ".app")
+    if !ok(named) { return named }
+    let target = absolute(output)
+    let pinned = testCertificate(certificate, thumbprint, openssl, run)
+    if !ok(pinned.outcome) { return pinned.outcome }
+    let appPath = resolveStrict(app)
+    if appPath == "" { return failure("No such file or directory: " + app) }
+    let keychainPath = resolveStrict(keychain)
+    if keychainPath == "" { return failure("No such file or directory: " + keychain) }
+    if suffix(appPath) != ".app" || !isDirectory(appPath + "/Contents/MacOS") || !isFile(keychainPath) {
+        return invalid("TEST macOS signing requires an app and explicit provisioned keychain")
+    }
+    if escapingLink(appPath) != "" { return invalid("TEST bundle symlink escapes the app") }
+    let made = makeDirectories(parent(target))
+    if !ok(made) { return made }
+    let directory = temporaryDirectory(parent(target), ".minyar-test-sign-")
+    if directory == "" { return failure("cannot create a TEST signing directory in " + parent(target)) }
+    let result = testSign(appPath, target, pinned.value, keychainPath, directory, run)
+    removeTree(directory)
+    return result
+}
+function testSign(app: Text, output: Text, thumbprint: Text, keychain: Text, directory: Text, run: Callback<List<Text>, Completed>): Outcome {
+    let stage = directory + "/" + name(output)
+    let copied = copyTree(app, stage)
+    if !ok(copied) { return copied }
+    for target in signingTargets(stage) {
+        let signed = checked(run, ["codesign", "--force", "--sign", thumbprint, "--keychain", keychain, "--options", "runtime", "--timestamp=none", target])
+        if !ok(signed.outcome) { return signed.outcome }
+    }
+    let verified = verifyTestMacos(stage, thumbprint, run)
+    if !ok(verified) { return verified }
+    return publishDirectory(stage, output)
+}
+
+function usage(): Integer {
+    system.writeStandardError("usage: release.min {macos,test-macos} ...\n  macos --app APP --output OUTPUT --identity IDENTITY --notary-profile PROFILE [--entitlements FILE] [--signed-app-output APP] [--keychain FILE] [--notary-keychain FILE]\n  test-macos --app APP --output OUTPUT --certificate DER --thumbprint SHA1 --keychain FILE [--openssl OPENSSL]\n")
+    return 2
+}
+function kernel(): Text {
+    let result = capture(["uname", "-s"])
+    return strip(result.output)
+}
+function main(): Integer {
+    if argumentCount() == 0 { return usage() }
+    let mode = argument(0)
+    let allowed: List<Text> = []
+    let required: List<Text> = []
+    if mode == "macos" {
+        allowed = ["--app", "--output", "--identity", "--notary-profile", "--entitlements", "--signed-app-output", "--keychain", "--notary-keychain"]
+        required = ["--app", "--output", "--identity", "--notary-profile"]
+    } else if mode == "test-macos" {
+        allowed = ["--app", "--output", "--certificate", "--thumbprint", "--openssl", "--keychain"]
+        required = ["--app", "--output", "--certificate", "--thumbprint", "--keychain"]
+    } else if mode == "-h" || mode == "--help" {
+        print("usage: release.min [-h] {macos,test-macos} ...\n\nSign and notarize release copies; publish the output only after verification.\n\npositional arguments:\n  {macos,test-macos}\n    test-macos          TEST ONLY self-signed local artifact; never a production release\n\noptions:\n  -h, --help            show this help message and exit")
+        return 0
+    } else {
+        return usage()
+    }
+    let values = Map<Text, Text>()
+    let index = 1
+    while index < argumentCount() {
+        let item = argument(index)
+        let raw = Bytes(item)
+        let equals = -1
+        for position in 0..raw.length { if equals < 0 && raw[position] == 61 { equals = position } }
+        let option = item
+        let value = ""
+        if equals > 0 {
+            option = Text(raw.slice(0, equals))
+            value = Text(raw.slice(equals + 1, raw.length))
+            index += 1
+        } else {
+            if index + 1 >= argumentCount() { return usage() }
+            value = argument(index + 1)
+            index += 2
+        }
+        let known = false
+        for candidate in allowed { if candidate == option { known = true } }
+        if !known { return usage() }
+        values[option] = value
+    }
+    for candidate in required { if !values.has(candidate) { return usage() } }
+    let outcome = succeeded()
+    if kernel() != "Darwin" {
+        outcome = invalid("macOS release signing requires actual macOS")
+    } else if mode == "macos" {
+        let settings = options()
+        if values.has("--entitlements") { settings.entitlements = values["--entitlements"] }
+        if values.has("--signed-app-output") { settings.signedAppOutput = values["--signed-app-output"] }
+        if values.has("--keychain") { settings.keychain = values["--keychain"] }
+        if values.has("--notary-keychain") { settings.notaryKeychain = values["--notary-keychain"] }
+        outcome = macos(values["--app"], values["--output"], values["--identity"], values["--notary-profile"], settings, hooks())
+    } else {
+        let openssl = "openssl"
+        if values.has("--openssl") { openssl = values["--openssl"] }
+        outcome = testMacos(values["--app"], values["--output"], values["--certificate"], values["--thumbprint"], values["--keychain"], openssl, systemRunner())
+    }
+    if !ok(outcome) {
+        system.writeStandardError("release failed: " + outcome.message + "\n")
+        return 1
+    }
+    return 0
+}

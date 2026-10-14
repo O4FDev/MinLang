@@ -1,9 +1,15 @@
 build/tooling/tests/update-policy: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/update-policy: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/update-policy: runtime/native/sha256.c
+RELEASE_TOOLS = build/tooling/scripts/release build/tooling/tests/shipping
+$(RELEASE_TOOLS): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(RELEASE_TOOLS): TOOL_NATIVE = scripts/release-native.c
+$(RELEASE_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
+$(RELEASE_TOOLS): build/testing/cycle-runtime.o scripts/release-native.c
+build/tooling/tests/shipping.ll: scripts/release.min tests/release-support.min
 .PHONY: check-shipping
-check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/shipping.py
+check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy build/tooling/tests/shipping
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/shipping
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/update-manifest.py
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-native
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-policy

@@ -1,0 +1,285 @@
+use "../tools/testing.min" as test
+use "../scripts/release.min" as release
+use "./release-support.min" as support
+use "files" as files
+use "system" as system
+
+record Fixture { root: Text; app: Text; out: Text; calls: List<List<Text>> }
+record Injection { calls: Integer; failure: Integer }
+record Snapshot { inode: Text; files: List<Text> }
+
+constant IDENTITY = "Developer ID Application: Developer (ABC)"
+
+function makeDirectories(path: Text) {
+    test.require(test.run(["mkdir", "-p", "--", path], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-shipping-mkdir-" + Text(system.processId()), 10), "create " + path)
+}
+function machO(): Bytes {
+    let data = Bytes()
+    for byte in [207, 250, 237, 254] { data.add(byte) }
+    data.addBytes(Bytes("executable"))
+    return data
+}
+function setup(): Fixture {
+    let root = test.scratch()
+    let app = root + "/A space.app"
+    makeDirectories(app + "/Contents/MacOS")
+    writeBytesFile(app + "/Contents/MacOS/main", machO())
+    let calls: List<List<Text>> = []
+    return Fixture { root: root; app: app; out: root + "/release.dmg"; calls: calls }
+}
+function finish(fixture: Fixture) {
+    test.removeTree(fixture.root)
+}
+function last(args: List<Text>): Text {
+    return args[args.length - 1]
+}
+function prefix(args: List<Text>, expected: List<Text>): Boolean {
+    if args.length < expected.length { return false }
+    for index in 0..expected.length { if args[index] != expected[index] { return false } }
+    return true
+}
+function respond(args: List<Text>): release.Completed {
+    if prefix(args, ["hdiutil", "create"]) { writeTextFile(last(args), "disk image") }
+    if prefix(args, ["ditto", "-c"]) { writeTextFile(last(args), "zip") }
+    return release.Completed { status: 0; output: "{\"status\": \"Accepted\", \"id\": \"test-request\"}"; errorOutput: "" }
+}
+function tool(fixture: Fixture): Callback<List<Text>, release.Completed> {
+    return function(args: List<Text>): release.Completed {
+        fixture.calls.add(args)
+        return respond(args)
+    }
+}
+function hooks(run: Callback<List<Text>, release.Completed>): release.Hooks {
+    return release.Hooks { run: run; replace: release.systemReplace() }
+}
+function retainedOptions(path: Text): release.Options {
+    let settings = release.options()
+    settings.signedAppOutput = path
+    return settings
+}
+function expectKind(outcome: release.Outcome, kinds: List<Text>, label: Text) {
+    test.check(support.has(kinds, outcome.kind), label + ": expected " + support.join(kinds, " or ") + ", got '" + outcome.kind + "' " + outcome.message)
+}
+function readText(path: Text): Text {
+    return Text(files.readFile(path))
+}
+function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let out = Bytes()
+    for byte in data { out.add(digits[byte >> 4]); out.add(digits[byte & 15]) }
+    return Text(out)
+}
+function inode(path: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "stat -c %i -- \"$1\" 2>/dev/null || stat -f %i -- \"$1\"", "minyar", path], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-shipping-inode-" + Text(system.processId()), 10)
+    test.require(result, "inode of " + path)
+    return test.lines(result.output)[0]
+}
+function fileSnapshot(root: Text): List<Text> {
+    let result: List<Text> = []
+    let skip = Bytes(root).length + 1
+    for path in release.entries(root) {
+        if release.entryKind(path) == release.FILE {
+            let raw = Bytes(path)
+            result.add(Text(raw.slice(skip, raw.length)) + ":" + hex(files.readFile(path)))
+        }
+    }
+    result.sort()
+    return result
+}
+function listing(path: Text): List<Text> {
+    let names = files.list(path)
+    names.sort()
+    return names
+}
+function count(calls: List<List<Text>>, expected: List<Text>): Integer {
+    let total = 0
+    for call in calls { if prefix(call, expected) { total += 1 } }
+    return total
+}
+
+let names = ["test_development_adhoc_or_missing_notary_credentials_cannot_ship", "test_macos_signs_hardened_code_then_notarizes_and_staples_app_and_dmg",
+    "test_every_tool_failure_and_rejected_notarization_preserves_existing_output", "test_retains_exact_signed_stapled_stage_used_for_image",
+    "test_retained_app_refuses_existing_empty_or_occupied_generation", "test_every_tool_failure_leaves_both_publications_untouched",
+    "test_late_generation_collision_does_not_replace_even_an_empty_directory", "test_failed_image_publication_rolls_back_new_app_generation",
+    "test_macos_rejects_development_entitlements_and_escaping_bundle_links"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "Shipping." + name { valid = true } }
+    test.check(valid, "unknown shipping case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "Shipping." + name { return true } }
+    return false
+}
+
+let cases = 0
+if chosen("test_development_adhoc_or_missing_notary_credentials_cannot_ship") {
+    let fixture = setup()
+    for pair in [["-", "profile"], ["Apple Development: Developer (ABC)", "profile"], ["", "profile"], [IDENTITY, ""]] {
+        let outcome = release.macos(fixture.app, fixture.out, pair[0], pair[1], release.options(), hooks(tool(fixture)))
+        expectKind(outcome, ["value"], "credentials " + pair[0] + "/" + pair[1])
+        test.check(!support.exists(fixture.out), "refused credentials created output")
+        test.check(fixture.calls.length == 0, "refused credentials invoked a tool")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_macos_signs_hardened_code_then_notarizes_and_staples_app_and_dmg") {
+    let fixture = setup()
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", release.options(), hooks(tool(fixture))), [""], "hardened release")
+    let signs: List<List<Text>> = []
+    for call in fixture.calls { if prefix(call, ["codesign", "--force"]) { signs.add(call) } }
+    test.check(signs.length >= 3, "expected at least three signing commands")
+    for index in 0..(signs.length - 1) {
+        test.check(support.has(signs[index], "runtime"), "hardened runtime missing: " + support.join(signs[index], " "))
+        test.check(support.has(signs[index], "--timestamp"), "secure timestamp missing: " + support.join(signs[index], " "))
+    }
+    for sign in signs { test.check(!support.has(sign, "--deep"), "deep signing is forbidden") }
+    test.check(count(fixture.calls, ["xcrun", "notarytool", "submit"]) == 2, "app and image notarization")
+    test.check(count(fixture.calls, ["xcrun", "stapler", "staple"]) == 2, "app and image stapling")
+    test.check(readText(fixture.out) == "disk image", "published image")
+    test.check(support.same(files.readFile(fixture.app + "/Contents/MacOS/main"), machO()), "source app must stay unsigned")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_every_tool_failure_and_rejected_notarization_preserves_existing_output") {
+    let fixture = setup()
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", release.options(), hooks(tool(fixture))), [""], "baseline release")
+    let total = fixture.calls.length
+    for failure in 0..total {
+        writeTextFile(fixture.out, "previous release")
+        let injection = Injection { calls: 0; failure: failure }
+        let failing = function(args: List<Text>): release.Completed {
+            injection.calls += 1
+            fixture.calls.add(args)
+            if injection.calls - 1 == injection.failure { return release.Completed { status: 1; output: ""; errorOutput: "" } }
+            return respond(args)
+        }
+        expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", release.options(), hooks(failing)), ["process"], "failure at call " + Text(failure))
+        test.check(readText(fixture.out) == "previous release", "failure at call " + Text(failure) + " replaced the release")
+    }
+    for status in ["\"Rejected\"", "\"In Progress\"", "\"\"", "null"] {
+        let rejecting = function(args: List<Text>): release.Completed {
+            let result = respond(args)
+            if prefix(args, ["xcrun", "notarytool", "submit"]) { result.output = "{\"status\": " + status + "}" }
+            return result
+        }
+        expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", release.options(), hooks(rejecting)), ["value"], "notarization status " + status)
+        test.check(readText(fixture.out) == "previous release", "rejected notarization replaced the release")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_retains_exact_signed_stapled_stage_used_for_image") {
+    let fixture = setup()
+    let retained = fixture.root + "/immutable generation.app"
+    let snapshot = Snapshot { inode: ""; files: [] }
+    let signedTool = function(args: List<Text>): release.Completed {
+        test.check(!support.exists(retained), "published app before all checks")
+        if prefix(args, ["codesign", "--force"]) && release.suffix(last(args)) == ".app" { writeTextFile(last(args) + "/Contents/signed-marker", "exact signature") }
+        if prefix(args, ["xcrun", "stapler", "staple"]) && release.suffix(last(args)) == ".app" { writeTextFile(last(args) + "/Contents/stapled-ticket", "exact ticket") }
+        if prefix(args, ["hdiutil", "create"]) {
+            let stage = ""
+            for index in 0..(args.length - 1) { if args[index] == "-srcfolder" { stage = args[index + 1] } }
+            snapshot.inode = inode(stage)
+            snapshot.files = fileSnapshot(stage)
+        }
+        fixture.calls.add(args)
+        return respond(args)
+    }
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(retained), hooks(signedTool)), [""], "retained release")
+    test.check(inode(retained) == snapshot.inode, "retained app must be the exact imaged stage")
+    test.check(support.join(fileSnapshot(retained), "\n") == support.join(snapshot.files, "\n"), "retained app contents differ from the imaged stage")
+    test.check(readText(retained + "/Contents/signed-marker") == "exact signature", "retained signature")
+    test.check(readText(retained + "/Contents/stapled-ticket") == "exact ticket", "retained ticket")
+    test.check(!support.exists(fixture.app + "/Contents/signed-marker"), "source app was signed")
+    test.check(readText(fixture.out) == "disk image", "published image")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_retained_app_refuses_existing_empty_or_occupied_generation") {
+    let fixture = setup()
+    for contents in [false, true] {
+        let retained = fixture.root + "/existing-" + support.flag(contents) + ".app"
+        test.check(files.makeDirectory(retained) == 0, "existing generation fixture")
+        if contents { writeTextFile(retained + "/owned", "previous app") }
+        writeTextFile(fixture.out, "previous image")
+        expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(retained), hooks(tool(fixture))), ["value", "exists"], "existing generation")
+        test.check(readText(fixture.out) == "previous image", "existing generation replaced the image")
+        test.check(fixture.calls.length == 0, "existing generation invoked a tool")
+        let expected: List<Text> = []
+        if contents { expected.add("owned") }
+        test.check(support.join(listing(retained), ",") == support.join(expected, ","), "existing generation changed")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_every_tool_failure_leaves_both_publications_untouched") {
+    let fixture = setup()
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(fixture.root + "/baseline.app"), hooks(tool(fixture))), [""], "baseline retained release")
+    let total = fixture.calls.length
+    for phase in 0..total {
+        let retained = fixture.root + "/failure-" + Text(phase) + ".app"
+        writeTextFile(fixture.out, "previous image")
+        let injection = Injection { calls: 0; failure: phase }
+        let failing = function(args: List<Text>): release.Completed {
+            test.check(!support.exists(retained), "generation published before every tool succeeded")
+            injection.calls += 1
+            if injection.calls - 1 == injection.failure { return release.Completed { status: 1; output: ""; errorOutput: "" } }
+            fixture.calls.add(args)
+            return respond(args)
+        }
+        expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(retained), hooks(failing)), ["process"], "retained failure at call " + Text(phase))
+        test.check(!support.exists(retained), "failed release left a generation")
+        test.check(readText(fixture.out) == "previous image", "failed release replaced the image")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_late_generation_collision_does_not_replace_even_an_empty_directory") {
+    let fixture = setup()
+    let retained = fixture.root + "/raced.app"
+    writeTextFile(fixture.out, "previous image")
+    let race = function(args: List<Text>): release.Completed {
+        if prefix(args, ["spctl", "--assess", "--type", "open", "--context"]) { test.check(files.makeDirectory(retained) == 0, "raced generation") }
+        fixture.calls.add(args)
+        return respond(args)
+    }
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(retained), hooks(race)), ["exists"], "late collision")
+    test.check(listing(retained).length == 0, "late collision replaced the raced directory")
+    test.check(readText(fixture.out) == "previous image", "late collision replaced the image")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_failed_image_publication_rolls_back_new_app_generation") {
+    let fixture = setup()
+    let retained = fixture.root + "/rollback.app"
+    writeTextFile(fixture.out, "previous image")
+    let denied = release.Hooks { run: tool(fixture); replace: function(from: Text, to: Text): release.Outcome { return release.Outcome { kind: "os"; message: "publication denied" } } }
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", retainedOptions(retained), denied), ["os"], "image publication")
+    test.check(!support.exists(retained), "failed image publication kept the new app generation")
+    test.check(readText(fixture.out) == "previous image", "failed image publication replaced the image")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_macos_rejects_development_entitlements_and_escaping_bundle_links") {
+    let fixture = setup()
+    let entitlements = fixture.root + "/development.plist"
+    writeTextFile(entitlements, "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>")
+    let settings = release.options()
+    settings.entitlements = entitlements
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", settings, hooks(tool(fixture))), ["value"], "development entitlements")
+    let outside = fixture.root + "/external"
+    writeTextFile(outside, "external")
+    let link = fixture.app + "/Contents/escape"
+    test.require(test.run(["ln", "-s", "--", outside, link], system.environment(), "", fixture.root + "/link", 10), "escaping link fixture")
+    test.check(release.entryKind(link) == release.LINK, "escaping-link fixture must be a real symlink")
+    test.check(support.resolve(link, fixture.root + "/resolve-link") == support.resolve(outside, fixture.root + "/resolve-outside"), "escaping link target")
+    expectKind(release.macos(fixture.app, fixture.out, IDENTITY, "profile", release.options(), hooks(tool(fixture))), ["value"], "escaping link")
+    test.check(fixture.calls.length == 0, "refused bundle invoked a tool")
+    test.check(!support.exists(fixture.out), "refused bundle created output")
+    finish(fixture)
+    cases += 1
+}
+print("Shipping: " + Text(cases) + " cases passed")
