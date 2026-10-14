@@ -1,0 +1,290 @@
+use "../tools/testing.min" as test
+use "./evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+constant DIAGNOSTIC = "may use only Integer, Float, Boolean and Character values"
+record Settings { compiler: Text; runtime: Text; root: Text; flags: List<Text>; timeout: Float; recordDirectory: Text; controlDirectory: Text; observations: Text }
+record Compiled { workspace: evidence.Evidence; outcome: evidence.Outcome; llvm: Text }
+record Found { found: Boolean; body: Text }
+
+function quoted(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(evidence.quote(values[index]))
+    }
+    return "[" + joinText(parts) + "]"
+}
+function digest(data: Bytes): Text {
+    let state = sha.new()
+    test.check(sha.update(state, data), "SHA-256 update failed")
+    return sha.hex(sha.finalize(state))
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    return raw.length >= bytes.length && Text(raw.slice(raw.length - bytes.length, raw.length)) == suffix
+}
+function after(source: Text, start: Integer): Text {
+    let raw = Bytes(source)
+    if start >= raw.length { return "" }
+    return Text(raw.slice(start, raw.length))
+}
+function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let same = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { same = false; break } }
+        if same { return index }
+    }
+    return -1
+}
+function allLines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 { result.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+function named(rest: Text, wanted: Text): Integer {
+    if starts(rest, wanted + "(") { return Bytes(wanted).length + 1 }
+    let prefix = "minyar_module_"
+    if !starts(rest, prefix) { return -1 }
+    let raw = Bytes(rest)
+    let index = Bytes(prefix).length
+    let digits = index
+    while index < raw.length && raw[index] >= 48 && raw[index] <= 57 { index += 1 }
+    if index == digits || index >= raw.length || raw[index] != 95 { return -1 }
+    if starts(after(rest, index + 1), wanted + "(") { return index + 1 + Bytes(wanted).length + 1 }
+    return -1
+}
+function parallelBody(text: Text, wanted: Text): Found {
+    let lines = allLines(text)
+    for index in 0..lines.length {
+        let line = lines[index]
+        let define = find(line, "define ", 0)
+        if define < 0 || index + 1 >= lines.length || !ends(line, "{") { continue }
+        let position = define + 7
+        let matched = false
+        while !matched {
+            let marker = find(line, "@.minyar.fn.", position)
+            if marker < 0 { break }
+            let consumed = named(after(line, marker + 12), wanted)
+            if consumed >= 0 {
+                let open = marker + 12 + consumed
+                let close = find(line, ")", open)
+                if close >= 0 && close < Bytes(line).length - 1 { matched = true }
+            }
+            position = marker + 1
+        }
+        if !matched { continue }
+        for ending in (index + 2)..lines.length {
+            if starts(lines[ending], "}") {
+                let body: List<Text> = []
+                for inner in (index + 1)..ending {
+                    if inner > index + 1 { body.add("\n") }
+                    body.add(lines[inner])
+                }
+                return Found { found: true; body: joinText(body) }
+            }
+        }
+    }
+    return Found { found: false; body: "" }
+}
+function makeDirectories(path: Text) {
+    let raw = Bytes(path)
+    for index in 1..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 {
+            let part = Text(raw.slice(0, index))
+            test.check(files.makeDirectory(part) == 0, "cannot create " + part)
+        }
+    }
+}
+function exclusive(path: Text, data: Bytes) {
+    let file = files.open(path, files.WRITE | files.CREATE | files.EXCLUSIVE)
+    test.check(file >= 0, "cannot create exclusive observation " + path + ": " + files.errorText(file))
+    test.check(files.write(file, data, 0, data.length) == data.length, "cannot write " + path)
+    test.check(files.close(file) == 0, "cannot close " + path)
+}
+function fixture(settings: Settings, name: Text): Text {
+    if name == "existing-parallel" { return settings.root + "/tests/parallel/main.min" }
+    if starts(name, "legacy-") { return settings.root + "/tests/parallel/errors/" + after(name, 7) + ".min" }
+    return settings.root + "/tests/parallel-signatures/" + name + ".min"
+}
+function observe(settings: Settings, name: Text, source: Text, compiled: Compiled) {
+    if settings.observations == "" { return }
+    makeDirectories(settings.observations)
+    let directory = settings.observations + "/" + name
+    test.check(files.pathSize(directory) == -2, "observation directory already exists: " + directory)
+    test.check(files.makeDirectory(directory) == 0, "cannot create observation directory " + directory)
+    let names = ["source.min", "stdout", "stderr"]
+    let contents = [readBytesFile(source), compiled.outcome.stdout, compiled.outcome.stderr]
+    if files.pathSize(compiled.llvm) >= 0 {
+        names.add("output.ll")
+        contents.add(readBytesFile(compiled.llvm))
+    }
+    let hashes: List<Text> = []
+    for index in 0..names.length {
+        exclusive(directory + "/" + names[index], contents[index])
+        hashes.add(evidence.quote(names[index]) + ": " + evidence.quote(digest(contents[index])))
+    }
+    let inputs: List<Text> = []
+    for index in 0..compiled.workspace.inputPaths.length {
+        inputs.add(evidence.quote(compiled.workspace.inputPaths[index]) + ": " + evidence.quote(compiled.workspace.inputDigests[index]))
+    }
+    let controls: List<Text> = []
+    for item in compiled.workspace.controls { controls.add(evidence.quote(item.name) + ": " + item.value) }
+    let manifest = "{\n  \"commands\": " + evidence.commandRows(compiled.workspace, "  ") + ",\n  \"controls\": {" + joinWith(controls) +
+        "},\n  \"files\": {" + joinWith(hashes) + "},\n  \"inputs\": {" + joinWith(inputs) + "}\n}\n"
+    exclusive(directory + "/observation.json", Bytes(manifest))
+}
+function joinWith(parts: List<Text>): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+function compileFixture(settings: Settings, name: Text, testName: Text): Compiled {
+    let source = fixture(settings, name)
+    let inputs = [settings.compiler, settings.runtime, settings.root + "/tests/parallel-signatures.min", settings.root + "/tests/evidence-support.min",
+        settings.root + "/build/compiler.min", source]
+    if settings.controlDirectory != "" { inputs.add(settings.controlDirectory + "/" + name + ".ll") }
+    let workspace = evidence.open("regression", inputs)
+    evidence.control(workspace, "test", evidence.quote("ParallelSignatures." + testName))
+    evidence.control(workspace, "link_flags", quoted(settings.flags))
+    evidence.control(workspace, "fixture", evidence.quote(name))
+    let llvm = workspace.path + "/" + name + ".ll"
+    let request = evidence.command([settings.compiler, source, llvm, "--library", settings.root + "/library"], settings.timeout)
+    request.phase = "compile-parallel-signature"
+    let outcome = evidence.run(workspace, request)
+    evidence.control(workspace, "compile_status", Text(outcome.status))
+    let compiled = Compiled { workspace: workspace; outcome: outcome; llvm: llvm }
+    observe(settings, name, source, compiled)
+    return compiled
+}
+function rejectDiagnostic(settings: Settings, name: Text, testName: Text, diagnostic: Text) {
+    let compiled = compileFixture(settings, name, testName)
+    let workspace = compiled.workspace
+    let stderr = Text(compiled.outcome.stderr)
+    evidence.expect(workspace, compiled.outcome.status == 1, name + ": expected status 1, got " + Text(compiled.outcome.status) + "\n" + stderr)
+    evidence.expect(workspace, compiled.outcome.stdout.length == 0, "rejected signature wrote standard output")
+    evidence.expect(workspace, test.contains(stderr, diagnostic), name + ": missing diagnostic " + diagnostic + "\n" + stderr)
+    evidence.expect(workspace, files.pathSize(compiled.llvm) < 0, "rejected signature left LLVM output")
+    evidence.expect(workspace, !test.contains(stderr, "List position"), name + ": diagnostic mentions a List position\n" + stderr)
+    evidence.close(workspace, false)
+}
+function acceptFixture(settings: Settings, name: Text, testName: Text, functions: List<Text>) {
+    let compiled = compileFixture(settings, name, testName)
+    let workspace = compiled.workspace
+    evidence.expect(workspace, compiled.outcome.status == 0, name + ": expected acceptance\n" + Text(compiled.outcome.stderr))
+    evidence.expect(workspace, compiled.outcome.stdout.length == 0, name + ": accepted program wrote standard output")
+    evidence.expect(workspace, compiled.outcome.stderr.length == 0, name + ": accepted program wrote diagnostics\n" + Text(compiled.outcome.stderr))
+    let emitted = readBytesFile(compiled.llvm)
+    evidence.control(workspace, "llvm_sha256", evidence.quote(digest(emitted)))
+    let text = Text(emitted)
+    evidence.expect(workspace, text.length >= 0, name + ": LLVM is not UTF-8")
+    for wanted in functions {
+        let found = parallelBody(text, wanted)
+        evidence.expect(workspace, found.found, "missing parallel function " + wanted)
+        evidence.expect(workspace, !test.contains(found.body, "@minyar_rc_"), name + ": parallel function " + wanted + " uses ownership tracking")
+        evidence.expect(workspace, !test.contains(found.body, "@minyar_stack_"), name + ": parallel function " + wanted + " uses a stack frame")
+    }
+    if settings.recordDirectory != "" {
+        makeDirectories(settings.recordDirectory)
+        let recorded = settings.recordDirectory + "/" + name + ".ll"
+        exclusive(recorded, emitted)
+        evidence.control(workspace, "recorded_ir", evidence.quote(recorded))
+    }
+    if settings.controlDirectory != "" {
+        let control = files.readFile(settings.controlDirectory + "/" + name + ".ll")
+        evidence.expect(workspace, files.lastError() == 0, name + ": missing IR control")
+        let same = control.length == emitted.length
+        if same { for index in 0..emitted.length { if emitted[index] != control[index] { same = false; break } } }
+        evidence.expect(workspace, same, "accepted program LLVM changed: " + name)
+    }
+    evidence.close(workspace, false)
+}
+function underscored(name: Text): Text {
+    let raw = Bytes(name)
+    for index in 0..raw.length { if raw[index] == 45 { raw[index] = 95 } }
+    return Text(raw)
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for value in selectors { if value == "ParallelSignatures" || value == name || value == "ParallelSignatures." + name { return true } }
+    return false
+}
+
+let flags = test.words(test.setting("MINYAR_TEST_LINK_FLAGS", ""))
+let timeout = 10.0
+if flags.length > 0 { timeout = 30.0 }
+let settings = Settings { compiler: evidence.resolve(test.setting("MINYAR_TEST_COMPILER", "build/minyarc")); runtime: evidence.resolve(test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o"));
+    root: evidence.resolve("."); flags: flags; timeout: timeout; recordDirectory: system.getenv("MINYAR_PARALLEL_IR_RECORD");
+    controlDirectory: system.getenv("MINYAR_PARALLEL_IR_CONTROL"); observations: system.getenv("MINYAR_PARALLEL_OBSERVATIONS") }
+test.check(settings.recordDirectory == "" || settings.controlDirectory == "", "record and control modes are mutually exclusive")
+
+let rejections: List<Text> = []
+for kind in ["text", "bytes", "list", "record"] {
+    for suffix in ["", "-entry"] { rejections.add("unused-" + kind + suffix) }
+}
+for name in ["managed-after-scalars", "managed-parameter-65", "managed-implicit-nothing", "parallel-native-bytes", "return-text", "return-bytes", "return-list", "return-record"] { rejections.add(name) }
+let legacy = ["reference", "call", "entry"]
+let legacyDiagnostics = ["parallel function 'bad' " + DIAGNOSTIC, "parallel function 'bad' can only call parallel functions, not 'ordinary'",
+    "parallelEntry needs a parallel function, and 'ordinary' is not one"]
+let acceptances = ["scalar-values", "scalar-native", "ordinary-managed", "ordinary-native", "existing-parallel"]
+let acceptedFunctions: List<List<Text>> = [["scalarInteger", "scalarFloat", "scalarBoolean", "scalarCharacter", "scalarNothing"], ["fence"], [], [], ["square", "next"]]
+
+let known: List<Text> = []
+for name in rejections { known.add("test_reject_" + underscored(name)) }
+for name in legacy { known.add("test_legacy_" + name) }
+for name in acceptances { known.add("test_accept_" + underscored(name)) }
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let value = argument(index)
+    if value == "-v" || value == "--verbose" || value == "-q" || value == "--quiet" { continue }
+    let valid = value == "ParallelSignatures"
+    for name in known { if value == name || value == "ParallelSignatures." + name { valid = true } }
+    test.check(valid, "unknown ParallelSignatures selector: " + value)
+    selectors.add(value)
+}
+
+let ran = 0
+for name in rejections {
+    let testName = "test_reject_" + underscored(name)
+    if selected(selectors, testName) {
+        let culprit = "bad"
+        if name == "parallel-native-bytes" { culprit = "address" }
+        rejectDiagnostic(settings, name, testName, "parallel function '" + culprit + "' " + DIAGNOSTIC)
+        ran += 1
+    }
+}
+for index in 0..legacy.length {
+    let testName = "test_legacy_" + legacy[index]
+    if selected(selectors, testName) {
+        rejectDiagnostic(settings, "legacy-" + legacy[index], testName, legacyDiagnostics[index])
+        ran += 1
+    }
+}
+for index in 0..acceptances.length {
+    let testName = "test_accept_" + underscored(acceptances[index])
+    if selected(selectors, testName) {
+        acceptFixture(settings, acceptances[index], testName, acceptedFunctions[index])
+        ran += 1
+    }
+}
+print("parallel signatures: " + Text(ran) + " tests passed")

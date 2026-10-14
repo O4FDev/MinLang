@@ -986,7 +986,7 @@ class BuildWiring(unittest.TestCase):
                 makefile = Path(folder) / 'probe.mk'
                 artifacts = {'build/' + x for x in ordinary | instrumented} | stage3 | {
                     'build/minyar-runtime.o', 'build', 'build/testing/cycle-runtime.o',
-                    'build/tooling/tests/compiler-behavior'}
+                    'build/tooling/tests/compiler-behavior', 'build/tooling/tests/parallel-signatures'}
                 makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(sorted(artifacts)) +
                                    '\n' + ' '.join(sorted(artifacts)) + ':\n\t@echo ARTIFACT $@\n')
                 env = dict(os.environ)
@@ -1008,13 +1008,13 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn(sanitize, rules.get(gate, set()), gate)
                 for target, frontends in ((native, ordinary), (sanitize, instrumented)):
                     self.assertTrue({'build/' + x for x in frontends} <= rules[target], target)
-                    self.assertTrue(fixtures | {'tests/parallel-signatures.py',
-                                                'tests/regressions.py', 'build/minyar-runtime.o'}
+                    self.assertTrue(fixtures | {'build/tooling/tests/parallel-signatures',
+                                                'build/minyar-runtime.o'}
                                     <= rules[target], target)
                 self.assertTrue(stage3 <= rules[native])
                 self.assertIn('build/tooling/tests/compiler-behavior', rules[native])
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('python3 tests/parallel-signatures.py;'), 2)
+                self.assertEqual(commands.count('./build/tooling/tests/parallel-signatures;'), 2)
                 self.assertIn('for frontend in minyarc minyarc-callbacks minyarc-errors;', commands)
                 self.assertIn('for frontend in minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize;', commands)
                 self.assertEqual(commands.count('MINYAR_TEST_COMPILER="./build/$frontend"'), 2)
@@ -1068,7 +1068,7 @@ class BuildWiring(unittest.TestCase):
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for name in fixtures | {'tests/parallel-signatures.py'}:
+        for name in fixtures:
             self.assertIn(name, catalogue.discover(ROOT))
             with self.subTest(missing_source=name), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[r for r in data['sources'] if r['path'] != name]), ROOT)
