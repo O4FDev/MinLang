@@ -421,7 +421,7 @@ is excluded. The report also runs the same corpus with instrumentation after
 inlining and retains that raw site count and percentage. Both instrumented
 compilers must reproduce the ordinary self-hosted fixed point exactly. The 79%
 gate applies to distinct edges; raw cloned-site coverage is a separate metric.
-`tests/coverage-inlining.py` verifies that one and sixteen calls keep the same
+`tests/coverage-inlining.min` verifies that one and sixteen calls keep the same
 distinct-edge denominator, that both branch arms are measured, and that the raw
 measurement still exposes duplication. This matters because inline bounds checks
 repeat compiler-internal invariant failures at many call sites.
