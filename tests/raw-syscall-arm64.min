@@ -1,0 +1,143 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as support
+use "system" as system
+
+constant DECLARATION = "declare i64 @minyar_machine_syscall(i64, i64, i64, i64, i64, i64, i64)"
+record Execution { pid: Integer; output: Text }
+
+function capture(arguments: List<Text>, work: Text, name: Text): test.Result {
+    return test.run(arguments, system.environment(), "", work + "/" + name, 30)
+}
+function configured(name: Text, fallback: Text): Text {
+    if support.hasEnvironment(system.environment(), name) { return system.getenv(name) }
+    return fallback
+}
+function stop(work: Text, message: Text) {
+    test.removeTree(work)
+    system.writeStandardError(message + "\n")
+    exit(1)
+}
+function lowered(source: Text): Text {
+    let raw = Bytes(source)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] = raw[index] + 32 } }
+    return Text(raw)
+}
+function spaced(values: List<Text>): Text {
+    let pieces: List<Text> = []
+    for value in values {
+        if pieces.length > 0 { pieces.add(" ") }
+        pieces.add(value)
+    }
+    return joinText(pieces)
+}
+function command(work: Text, serial: List<Integer>, root: Text, arguments: List<Text>) {
+    serial[0] += 1
+    let result = test.run(arguments, system.environment(), root, work + "/command-" + Text(serial[0]), 180)
+    test.check(result.status == 0, "command failed (" + Text(result.status) + "): " + spaced(arguments) + "\n" + result.output + result.errorOutput)
+}
+function execute(work: Text, serial: List<Integer>, root: Text, runner: List<Text>, executable: Text, arguments: List<Text>): Execution {
+    serial[0] += 1
+    let log = work + "/command-" + Text(serial[0])
+    let argv = ["/bin/sh", "-c", "printf '%s\\n' \"$$\" >\"$0\"; exec \"$@\"", log + ".pid"]
+    for item in runner { argv.add(item) }
+    argv.add(executable)
+    for item in arguments { argv.add(item) }
+    let result = test.run(argv, system.environment(), root, log, 60)
+    let pid = Integer(readTextFile(log + ".pid").trim())
+    test.check(result.status == 0 && result.errorOutput == "", "(" + Text(result.status) + ", " + result.output + ", " + result.errorOutput + ")")
+    return Execution { pid: pid; output: result.output }
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+
+let work = test.scratch()
+let kernel = capture(["uname", "-s"], work, "kernel")
+test.require(kernel, "identify Arm syscall host")
+if kernel.output.trim() != "Linux" { stop(work, "Arm syscall execution requires Linux") }
+let hardware = capture(["uname", "-m"], work, "machine")
+test.require(hardware, "identify Arm syscall machine")
+let machine = lowered(hardware.output.trim())
+let native = machine == "aarch64" || machine == "arm64"
+let rootResult = capture(["pwd", "-P"], work, "root")
+test.require(rootResult, "resolve Arm syscall root")
+let root = rootResult.output.trim()
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let compiler = test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc")
+let runner: List<Text> = []
+if !native { runner = support.shellWords(configured("MINYAR_ARM64_RUNNER", "qemu-aarch64")) }
+if runner.length > 0 && capture(["/bin/sh", "-c", "command -v -- \"$1\"", "minyar", runner[0]], work, "runner").status != 0 {
+    stop(work, "Arm syscall execution requires qemu-aarch64 or MINYAR_ARM64_RUNNER")
+}
+let crossFlags: List<Text> = []
+if !native { crossFlags.add("--target=aarch64-linux-gnu") }
+let sysroot = system.getenv("MINYAR_ARM64_SYSROOT")
+let toolchain = system.getenv("MINYAR_ARM64_TOOLCHAIN")
+if sysroot != "" { crossFlags.add("--sysroot=" + sysroot) }
+if toolchain != "" { crossFlags.add("--gcc-toolchain=" + toolchain) }
+for flag in support.shellWords(configured("MINYAR_ARM64_FLAGS", "-fuse-ld=lld -Wl,--threads=1 -static")) { crossFlags.add(flag) }
+let serial = [0]
+let source = root + "/tests/fixtures/raw-syscall/linux.min"
+let programs: List<Text> = []
+let libraries = [[root + "/library"], [root + "/library/arch/arm64", root + "/library"]]
+for variant in 0..libraries.length {
+    let llvm = work + "/program-" + Text(variant) + ".ll"
+    let arguments = [compiler, source, llvm]
+    for library in libraries[variant] { arguments.add("--library"); arguments.add(library) }
+    command(work, serial, root, arguments)
+    let text = readTextFile(llvm)
+    let declarations = 0
+    for line in test.lines(text) { if line == DECLARATION { declarations += 1 } }
+    test.check(declarations == 1, "missing/duplicate runtime helper declaration")
+    test.check(test.contains(text, "call i64 @minyar_machine_syscall("), "missing raw syscall helper call")
+    programs.add(llvm)
+}
+let page = 4096
+let initial = Bytes()
+for offset in 0..page { initial.add(0x11) }
+for offset in 0..page { initial.add(0x72) }
+let expected = initial.slice(0, initial.length)
+let marks = Bytes("Z[Crrrrr")
+expected[page] = marks[0]
+expected[page + 1] = marks[1]
+for offset in 0..8 { expected[page + 16 + offset] = marks[offset] }
+for optimization in ["-O0", "-O2"] {
+    let level = Text(Bytes(optimization).slice(1, 3))
+    let runtime = work + "/runtime-" + level + ".o"
+    let build = [clang]
+    for flag in crossFlags { build.add(flag) }
+    for item in [optimization, "-Wno-unused-command-line-argument", "-c", root + "/runtime/minyar_default_runtime.c", "-o", runtime] { build.add(item) }
+    command(work, serial, root, build)
+    let errno = work + "/errno-" + level
+    let errnoLink = [clang]
+    for flag in crossFlags { errnoLink.add(flag) }
+    for item in [optimization, root + "/tests/raw-syscall-native.c", runtime, "-lm", "-o", errno] { errnoLink.add(item) }
+    command(work, serial, root, errnoLink)
+    let errnoResult = execute(work, serial, root, runner, errno, [])
+    test.check(errnoResult.output == "raw syscall preserves libc errno\n", errnoResult.output)
+    let heap = work + "/heap-" + level
+    let heapLink = [clang]
+    for flag in crossFlags { heapLink.add(flag) }
+    for item in [optimization, root + "/tests/system-small-heap.c", "-lm", "-o", heap] { heapLink.add(item) }
+    command(work, serial, root, heapLink)
+    let heapResult = execute(work, serial, root, runner, heap, [])
+    test.check(heapResult.output == "small heap alignment, size boundaries, resizing and page recovery passed\n", heapResult.output)
+    for variant in 0..programs.length {
+        let executable = work + "/program-" + Text(variant) + "-" + level
+        let link = [clang]
+        for flag in crossFlags { link.add(flag) }
+        for item in [optimization, "-Wno-override-module", programs[variant], runtime, "-lm", "-o", executable] { link.add(item) }
+        command(work, serial, root, link)
+        let path = work + "/file-" + Text(variant) + "-" + level
+        writeBytesFile(path, initial)
+        let result = execute(work, serial, root, runner, executable, [path, work + "/missing/file", Text(page), "172", "56", "57", "63", "64", "62", "29", "222", "227", "215"])
+        test.check(result.output == Text(result.pid) + "\n", "(" + Text(result.pid) + ", " + result.output + ")")
+        test.check(sameBytes(readBytesFile(path), expected), "wrong mmap offset or writeback/Bytes payload")
+    }
+}
+test.removeTree(work)
+let execution = "QEMU user execution"
+if native { execution = "native execution" }
+print("Arm64 Linux syscalls and default runtime passed at O0/O2: both machine packages, errno, Bytes, six-argument mmap offsets, writeback, unmap and small heap; " + execution)

@@ -1,0 +1,360 @@
+use "../tools/testing.min" as test
+use "../tools/llvm-sanitizer.min" as sanitizer
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+constant ORIGINAL = "9f805f32a94607708b3a0532d88df509891bd98383eb8e522de2d3b443791c92"
+constant DECLARATION = "declare i64 @minyar_machine_syscall(i64, i64, i64, i64, i64, i64, i64)"
+record Session { root: Text; work: Text; environment: List<Text>; commands: List<Text>; serial: Integer; darwin: Boolean }
+record Execution { pid: Integer; output: Text }
+
+function joined(values: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for value in values {
+        if pieces.length > 0 { pieces.add(separator) }
+        pieces.add(value)
+    }
+    return joinText(pieces)
+}
+function strings(values: List<Text>): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add(json.quote(value)) }
+    return "[" + joined(quoted, ",") + "]"
+}
+function digest(path: Text): Text { return sha.hex(sha.digest(readBytesFile(path))) }
+function position(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let index = start
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+        index += 1
+    }
+    return -1
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function save(session: Session) {
+    writeTextFile(session.work + "/commands.json", "[" + joined(session.commands, ",\n") + "]\n")
+}
+function remember(session: Session, arguments: List<Text>, result: test.Result, pid: Integer): Text {
+    let entry = "{\"argv\":" + strings(arguments) + ",\"status\":" + Text(result.status) + ",\"stdout\":" + json.quote(result.output) + ",\"stderr\":" + json.quote(result.errorOutput)
+    if pid > 0 { entry = entry + ",\"pid\":" + Text(pid) }
+    entry = entry + "}"
+    session.commands.add(entry)
+    save(session)
+    return entry
+}
+function command(session: Session, arguments: List<Text>): test.Result {
+    session.serial += 1
+    let result = test.run(arguments, session.environment, session.root, session.work + "/logs/command-" + Text(session.serial), 120)
+    let entry = remember(session, arguments, result, 0)
+    test.check(result.status == 0, entry)
+    return result
+}
+function execute(session: Session, executable: Text, arguments: List<Text>): Execution {
+    session.serial += 1
+    let log = session.work + "/logs/command-" + Text(session.serial)
+    let argv = ["/bin/sh", "-c", "printf '%s\\n' \"$$\" >\"$0\"; exec \"$@\"", log + ".pid", executable]
+    let shown = [executable]
+    for item in arguments { argv.add(item); shown.add(item) }
+    let result = test.run(argv, session.environment, session.root, log, 30)
+    let pid = 0
+    if files.pathSize(log + ".pid") > 0 { pid = Integer(readTextFile(log + ".pid").trim()) }
+    let entry = remember(session, shown, result, pid)
+    test.check(result.status == 0 && result.errorOutput == "", entry)
+    return Execution { pid: pid; output: result.output }
+}
+function linked(session: Session, arguments: List<Text>): List<Text> {
+    if session.darwin { return arguments }
+    for item in arguments {
+        if item == "-c" || item == "-S" || item == "-E" || item == "-fsyntax-only" || item == "--version" || item == "-v" { return arguments }
+    }
+    let result: List<Text> = []
+    for item in arguments { if item != "-lm" { result.add(item) } }
+    result.add("-lm")
+    return result
+}
+function prepare(path: Text, flags: List<Text>) {
+    if sanitizer.addressEnabled(flags) || sanitizer.threadEnabled(flags) {
+        let source = readTextFile(path)
+        let prepared = sanitizer.program(source, flags)
+        test.check(prepared.error == "", prepared.error)
+        if prepared.text != source { writeTextFile(path, prepared.text) }
+    }
+}
+function compileProgram(session: Session, compiler: Text, source: Text, llvm: Text, libraries: List<Text>) {
+    let arguments = [compiler, source, llvm]
+    for directory in libraries { arguments.add("--library"); arguments.add(directory) }
+    command(session, arguments)
+    let text = readTextFile(llvm)
+    let declarations = 0
+    for line in test.lines(text) { if line == DECLARATION { declarations += 1 } }
+    test.check(declarations == 1, "missing/duplicate runtime helper declaration")
+    test.check(test.contains(text, "call i64 @minyar_machine_syscall(i64 %argument.0"), "missing raw syscall helper call")
+    test.check(test.contains(text, "; minyar-native-library: machine\n"), "missing machine native library marker")
+    test.check(!test.contains(text, "; minyar-native-library: linux"), "unexpected linux native library marker")
+}
+function checkAbi(session: Session, clang: Text) {
+    let probe = session.root + "/tests/raw-syscall-probe.c"
+    let supported = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+    let targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "arm64-apple-darwin",
+        "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "riscv64-unknown-linux-gnu", "x86_64-unknown-linux-gnux32"]
+    for target in targets {
+        for optimization in ["-O0", "-O2"] {
+            let stem = session.work + "/abi-" + target + "-" + Text(Bytes(optimization).slice(1, 3))
+            command(session, [clang, "-target", target, optimization, "-std=c11", "-Wall", "-Wextra", "-Werror", "-S", "-emit-llvm", probe, "-o", stem + ".ll"])
+            command(session, [clang, "-target", target, optimization, "-S", probe, "-o", stem + ".s"])
+            let text = readTextFile(stem + ".ll")
+            if target == supported[0] || target == supported[1] {
+                test.check(test.contains(text, "asm sideeffect"), "missing raw syscall inline assembly for " + target)
+                let registers = ["{x8}", "{x0}", "{x1}", "{x2}", "{x3}", "{x4}", "{x5}", "~{memory}"]
+                let instruction = "svc"
+                if target.startsWith("x86") {
+                    registers = ["{ax}", "{di}", "{si}", "{dx}", "{r10}", "{r8}", "{r9}", "~{rcx}", "~{r11}", "~{memory}"]
+                    instruction = "syscall"
+                }
+                for register in registers { test.check(test.contains(text, register), "missing raw syscall register " + register + " for " + target + "\n" + text) }
+                test.check(test.contains(readTextFile(stem + ".s"), instruction), "missing " + instruction + " instruction for " + target)
+            } else {
+                test.check(!test.contains(text, "asm sideeffect") && test.contains(text, "ret i64 -38"), "unsupported target did not fall back to -38: " + target)
+            }
+        }
+    }
+    let resource = command(session, [clang, "-print-resource-dir"]).output.trim()
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-none-elf", "aarch64-none-elf"] {
+        let llvm = session.work + "/freestanding-probe-" + target + ".ll"
+        command(session, [clang, "-target", target, "-O2", "-ffreestanding", "-S", "-emit-llvm", probe, "-o", llvm])
+        let text = readTextFile(llvm)
+        test.check(test.contains(text, "ret i64 -38") && !test.contains(text, "asm sideeffect"), "freestanding probe did not fall back to -38: " + target)
+    }
+    for target in ["x86_64-none-elf", "aarch64-none-elf"] {
+        let llvm = session.work + "/freestanding-runtime-" + target + ".ll"
+        command(session, [clang, "-target", target, "-O2", "-ffreestanding", "-nostdinc", "-isystem", resource + "/include", "-isystem",
+            session.root + "/runtime/freestanding/include", "-S", "-emit-llvm", session.root + "/runtime/freestanding/runtime.c", "-o", llvm])
+        let text = readTextFile(llvm)
+        let name = "@minyar_machine_syscall("
+        let start = position(text, name, 0)
+        test.check(start >= 0, "freestanding runtime lacks the raw syscall helper: " + target)
+        start += Bytes(name).length
+        let end = position(text, "\n}", start)
+        if end < 0 { end = text.byteLength }
+        let helper = Text(Bytes(text).slice(start, end))
+        test.check(test.contains(helper, "ret i64 -38") && !test.contains(helper, "asm sideeffect"), "freestanding runtime helper did not fall back to -38: " + target)
+    }
+    print("ABI compile proof: Linux x86_64/AArch64 registers; macOS/Windows/x32/unsupported -38; real freestanding runtimes (no cross runtime claim)")
+}
+function capture(arguments: List<Text>, scratch: Text, name: Text): Text {
+    let result = test.run(arguments, system.environment(), "", scratch + "/" + name, 30)
+    test.require(result, name)
+    return result.output.trim()
+}
+function basename(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    return Text(raw.slice(start, raw.length))
+}
+function lowered(source: Text): Text {
+    let raw = Bytes(source)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] = raw[index] + 32 } }
+    return Text(raw)
+}
+function flag(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+function listed(session: Session, scratch: Text, directory: Text, pattern: Text): List<Text> {
+    let found = test.lines(capture(["find", session.root + "/" + directory, "-type", "f", "-name", pattern], scratch, "find"))
+    let result: List<Text> = []
+    for path in found.sorted() { if !basename(path).startsWith("._") { result.add(path) } }
+    return result
+}
+function usage(message: Text) {
+    system.writeStandardError("usage: raw-syscall [--sanitize] [--linux-native] [--abi] [--frontends] [--output OUTPUT]\nraw-syscall: error: " + message + "\n")
+    exit(2)
+}
+
+let sanitize = false
+let linuxNative = false
+let abi = false
+let frontends = false
+let output = ""
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--sanitize" { sanitize = true }
+    else if name == "--linux-native" { linuxNative = true }
+    else if name == "--abi" { abi = true }
+    else if name == "--frontends" { frontends = true }
+    else if name == "--output" {
+        if index + 1 >= argumentCount() { usage("argument --output: expected one argument") }
+        index += 1
+        output = argument(index)
+    }
+    else { usage("unrecognized arguments: " + name) }
+    index += 1
+}
+let scratch = test.scratch()
+let kernel = capture(["uname", "-s"], scratch, "kernel")
+let machine = lowered(capture(["uname", "-m"], scratch, "machine"))
+if machine == "amd64" { machine = "x86_64" }
+if machine == "arm64" { machine = "aarch64" }
+let numbers: List<Text> = []
+if machine == "x86_64" { numbers = ["39", "257", "3", "0", "1", "8", "16", "9", "26", "11"] }
+if machine == "aarch64" { numbers = ["172", "56", "57", "63", "64", "62", "29", "222", "227", "215"] }
+let supported = kernel == "Linux" && numbers.length > 0
+if linuxNative && !supported { usage("--linux-native requires a native Linux LP64 x86_64/AArch64 host") }
+let mode = "native"
+if sanitize { mode = "sanitize" }
+if linuxNative { mode = mode + "-linux-native" }
+if abi { mode = mode + "-abi" }
+if frontends { mode = mode + "-frontends" }
+let root = capture(["pwd", "-P"], scratch, "root")
+if output == "" { output = root + "/build/raw-syscall/" + mode }
+let work = capture(["/bin/sh", "-c", "mkdir -p -- \"$1/logs\" && cd -- \"$1\" && pwd -P", "minyar", output], scratch, "work")
+let platform = capture(["uname", "-s", "-r", "-m"], scratch, "platform")
+let environment: List<Text> = []
+for entry in system.environment() { if !entry.startsWith("ASAN_OPTIONS=") && !entry.startsWith("UBSAN_OPTIONS=") { environment.add(entry) } }
+let leaks = "0"
+if kernel == "Linux" { leaks = "1" }
+environment.add("ASAN_OPTIONS=detect_leaks=" + leaks)
+environment.add("UBSAN_OPTIONS=halt_on_error=1")
+let session = Session { root: root; work: work; environment: environment; commands: []; serial: 0; darwin: kernel == "Darwin" }
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let compiler = test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc")
+if !compiler.startsWith("/") { compiler = root + "/" + compiler }
+let clangPath = capture(["/bin/sh", "-c", "command -v -- \"$1\" || printf '%s\\n' \"$1\"", "minyar", clang], scratch, "clang")
+let tools = [compiler, clangPath]
+let fixtures = root + "/tests/fixtures/raw-syscall"
+let inputs: List<Text> = []
+for name in ["build/compiler.min", "build-support/compiler.mk", "runtime/minyar_runtime.c", "runtime/minyar_default_runtime.c",
+    "runtime/freestanding/runtime.c", "library/machine.min", "library/arch/arm64/machine.min", "tests/raw-syscall.min",
+    "tests/raw-syscall-native.c", "tests/raw-syscall-probe.c", "tools/testing.min", "tools/llvm-sanitizer.min"] { inputs.add(root + "/" + name) }
+let headers: List<Text> = []
+for name in files.list(root + "/runtime") { if name.startsWith("minyar_") && name.endsWith(".h") { headers.add(root + "/runtime/" + name) } }
+for path in headers.sorted() { inputs.add(path) }
+for path in listed(session, scratch, "runtime/freestanding/include", "*.h") { inputs.add(path) }
+for path in listed(session, scratch, "tests/fixtures/raw-syscall", "*.min") { inputs.add(path) }
+test.check(digest(fixtures + "/vmm-1-original.min") == ORIGINAL, "VMM-1 original reproduction changed")
+command(session, [clang, "--version"])
+if abi { checkAbi(session, clang) }
+compileProgram(session, compiler, fixtures + "/vmm-1-original.min", work + "/vmm-1-original.ll", [root + "/library"])
+let flags: List<Text> = []
+if sanitize { flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let program = fixtures + "/fallback.min"
+if supported { program = fixtures + "/linux.min" }
+let page = 0
+let initial = Bytes()
+let expected = Bytes()
+if supported {
+    page = Integer(capture(["getconf", "PAGESIZE"], scratch, "page"))
+    for offset in 0..page { initial.add(0x11) }
+    for offset in 0..page { initial.add(0x72) }
+    expected = initial.slice(0, initial.length)
+    let marks = Bytes("Z[Crrrrr")
+    expected[page] = marks[0]
+    expected[page + 1] = marks[1]
+    for offset in 0..8 { expected[page + 16 + offset] = marks[offset] }
+}
+let libraries = [[root + "/library"], [root + "/library/arch/arm64", root + "/library"]]
+for libraryIndex in 0..libraries.length {
+    let llvm = work + "/program-" + Text(libraryIndex) + ".ll"
+    compileProgram(session, compiler, program, llvm, libraries[libraryIndex])
+    prepare(llvm, flags)
+    for optimization in ["-O0", "-O2"] {
+        let level = Text(Bytes(optimization).slice(1, 3))
+        let runtime = work + "/runtime-" + level + ".o"
+        if libraryIndex == 0 {
+            let build = [clang, optimization]
+            for flag in flags { build.add(flag) }
+            for item in ["-DMINYAR_SYSTEM_HEAP=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtime] { build.add(item) }
+            command(session, linked(session, build))
+            for variant in ["errno", "standard-errno"] {
+                let objectFile = runtime
+                if variant == "standard-errno" {
+                    objectFile = work + "/standard-runtime-" + level + ".o"
+                    let standard = [clang, optimization]
+                    for flag in flags { standard.add(flag) }
+                    for item in ["-c", root + "/runtime/minyar_default_runtime.c", "-o", objectFile] { standard.add(item) }
+                    command(session, linked(session, standard))
+                }
+                let native = work + "/" + variant + "-" + level
+                let link = [clang, optimization]
+                for flag in flags { link.add(flag) }
+                for item in [root + "/tests/raw-syscall-native.c", objectFile, "-o", native] { link.add(item) }
+                command(session, linked(session, link))
+                let result = execute(session, native, [])
+                test.check(result.output == "raw syscall preserves libc errno\n", result.output)
+            }
+        }
+        let executable = work + "/program-" + Text(libraryIndex) + "-" + level
+        let link = [clang, optimization]
+        for flag in flags { link.add(flag) }
+        for item in ["-Wno-override-module", llvm, runtime, "-o", executable] { link.add(item) }
+        command(session, linked(session, link))
+        if supported {
+            let path = work + "/file-" + Text(libraryIndex) + "-" + level + ".bin"
+            writeBytesFile(path, initial)
+            let arguments = [path, work + "/missing/file", Text(page)]
+            for number in numbers { arguments.add(number) }
+            let result = execute(session, executable, arguments)
+            test.check(result.output == Text(result.pid) + "\n", "(" + Text(result.pid) + ", " + json.quote(result.output) + ")")
+            test.check(sameBytes(readBytesFile(path), expected), "wrong mmap offset or writeback/Bytes payload")
+            writeBytesFile(work + "/expected-file.bin", expected)
+        } else {
+            let result = execute(session, executable, [])
+            test.check(result.output == "-38\n5\n", result.output)
+        }
+    }
+}
+if frontends {
+    for name in ["minyarc-modules", "minyarc-callbacks", "minyarc-errors"] {
+        let frontend = root + "/build/" + name
+        tools.add(frontend)
+        let llvm = work + "/" + name + ".ll"
+        compileProgram(session, frontend, program, llvm, [root + "/library"])
+        prepare(llvm, flags)
+        let executable = work + "/" + name
+        let link = [clang, "-O2"]
+        for flag in flags { link.add(flag) }
+        for item in ["-Wno-override-module", llvm, work + "/runtime-O2.o", "-o", executable] { link.add(item) }
+        command(session, linked(session, link))
+        if supported {
+            let path = work + "/" + name + ".bin"
+            writeBytesFile(path, initial)
+            let arguments = [path, work + "/missing/file", Text(page)]
+            for number in numbers { arguments.add(number) }
+            let result = execute(session, executable, arguments)
+            test.check(result.output == Text(result.pid) + "\n" && sameBytes(readBytesFile(path), expected), "(" + json.quote(name) + ", " + json.quote(result.output) + ")")
+        } else {
+            let result = execute(session, executable, [])
+            test.check(result.output == "-38\n5\n", result.output)
+        }
+    }
+}
+let inputEntries: List<Text> = []
+for path in inputs { inputEntries.add(json.quote(Text(Bytes(path).slice(root.byteLength + 1, path.byteLength))) + ":" + json.quote(digest(path))) }
+let toolEntries: List<Text> = []
+for path in tools { toolEntries.add(json.quote(path) + ":" + json.quote(digest(path))) }
+let artifactEntries: List<Text> = []
+for path in test.lines(capture(["find", work, "-type", "f"], scratch, "artifacts")).sorted() {
+    let relative = Text(Bytes(path).slice(work.byteLength + 1, path.byteLength))
+    if relative != "manifest.json" { artifactEntries.add(json.quote(relative) + ":" + json.quote(digest(path))) }
+}
+test.removeScratch(scratch)
+let label = "native"
+if sanitize { label = "ASan+UBSan" }
+writeTextFile(work + "/manifest.json", "{\"platform\":" + json.quote(platform) + ",\"machine\":" + json.quote(machine) + ",\"mode\":" + json.quote(label) +
+    ",\"abi\":" + flag(abi) + ",\"frontends\":" + flag(frontends) + ",\"environment\":{\"ASAN_OPTIONS\":" + json.quote("detect_leaks=" + leaks) +
+    ",\"UBSAN_OPTIONS\":\"halt_on_error=1\"},\"inputs\":{" + joined(inputEntries, ",") + "},\"tools\":{" + joined(toolEntries, ",") + "},\"artifacts\":{" + joined(artifactEntries, ",") + "}}\n")
+let summary = "hosted -38 fallback"
+if supported { summary = "PID/ENOSYS/ENOENT/EBADF/EFAULT/ENOTTY/Bytes/file-offset mmap+writeback+munmap" }
+print("Raw syscall " + machine + " " + label + ": O0/O2, both machine APIs, original repro, errno, " + summary + "; evidence " + work)

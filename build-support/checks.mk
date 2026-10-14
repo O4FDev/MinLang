@@ -915,25 +915,29 @@ check-sanitize: check-transport-udp-fallback-sanitize
 
 .PHONY: check-raw-syscall check-raw-syscall-linux-native check-raw-syscall-sanitize check-raw-syscall-abi check-raw-syscall-frontends
 .PHONY: check-raw-syscall-arm64
-check-raw-syscall-arm64: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall-arm64.py
+build/tooling/tests/raw-syscall-arm64.ll: tests/sha256-support.min
+check-raw-syscall-arm64: build/minyarc build/tooling/tests/raw-syscall-arm64
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall-arm64
 
-check-raw-syscall: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py
+build/tooling/tests/raw-syscall: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/raw-syscall: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/raw-syscall: runtime/native/sha256.c
+check-raw-syscall: build/minyarc build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall
 
 # Explicit: fails on other hosts, so a portability pass cannot stand in for
 # native Linux kernel execution. Cross ABI checks are compile proof only.
-check-raw-syscall-linux-native: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --linux-native
+check-raw-syscall-linux-native: build/minyarc build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --linux-native
 
-check-raw-syscall-sanitize: build/minyarc-sanitize
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) python3 tests/raw-syscall.py --sanitize
+check-raw-syscall-sanitize: build/minyarc-sanitize build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/raw-syscall --sanitize
 
-check-raw-syscall-abi: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --abi
+check-raw-syscall-abi: build/minyarc build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --abi
 
-check-raw-syscall-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --frontends
+check-raw-syscall-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --frontends
 
 check check-portable: check-raw-syscall
 check-sanitize: check-raw-syscall-sanitize
