@@ -32,6 +32,18 @@ def minyar_list(path, function):
     return re.findall(r'"([^"]+)"', body)
 
 
+def formatter_files():
+    text = (ROOT / 'scripts/format.min').read_text()
+    files = re.findall(r'"([^"]+)"', text.split('for file in [', 1)[1].split(']', 1)[0])
+    if 'if fileExists("compiler/stages/c-layout.min") {' in text and (ROOT / 'compiler/stages/c-layout.min').is_file():
+        files += re.findall(r'"([^"]+)"', text.split('for file in [', 2)[2].split(']', 1)[0])
+    return files
+
+
+def formatter_version():
+    return re.search(r'"version (\d+\.\d+\.\d+)"', (ROOT / 'scripts/format.min').read_text())[1]
+
+
 def linux_targets():
     optional = (ROOT / 'tools/linux-matrix.min').read_text().split('for target in [', 1)[1].split(']', 1)[0]
     return minyar_list('scripts/linux-plan.min', 'correctness') + re.findall(r'"([^"]+)"', optional)
@@ -715,12 +727,7 @@ class BuildWiring(unittest.TestCase):
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
         assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
-        format_tree = ast.parse((ROOT/'scripts/format.py').read_text())
-        version = next(ast.literal_eval(node.value) for node in format_tree.body
-                       if isinstance(node, ast.Assign)
-                       and any(isinstance(target, ast.Name) and target.id == 'VERSION'
-                               for target in node.targets))
-        self.assertEqual(version, '23.1.2')
+        self.assertEqual(formatter_version(), '23.1.2')
         catalogue = native_catalogue()
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
@@ -946,8 +953,8 @@ class BuildWiring(unittest.TestCase):
             omitted=dict(data,sources=[row for row in data['sources'] if row['path']!=name])
             with self.subTest(source=name),self.assertRaises(ValueError):
                 catalogue.validate(omitted,ROOT)
-        self.assertIn('tests/cycle-idle-invalidation.c',(ROOT/'scripts/format.py').read_text())
-        self.assertIn('VERSION = "23.1.2"',(ROOT/'scripts/format.py').read_text())
+        self.assertIn('tests/cycle-idle-invalidation.c',formatter_files())
+        self.assertEqual(formatter_version(),'23.1.2')
 
 
     def test_parallel_signature_gates_prepare_every_frontend_and_fixture(self):
@@ -1195,13 +1202,9 @@ class BuildWiring(unittest.TestCase):
             self.assertEqual(targets.count(target), 1)
         assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        format_tree = ast.parse((ROOT / 'scripts/format.py').read_text())
-        version = next(ast.literal_eval(node.value) for node in format_tree.body
-                       if isinstance(node, ast.Assign)
-                       and any(isinstance(x, ast.Name) and x.id == 'VERSION' for x in node.targets))
-        self.assertEqual(version, '23.1.2')
-        # The runner's formatting group installs clang-format==VERSION from scripts/format.py.
+        self.assertEqual(formatter_version(), '23.1.2')
         self.assertIn('--group formatting', workflow)
+        self.assertIn('build/tooling/scripts/format', (ROOT / 'tools/linux-matrix.min').read_text())
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
@@ -1339,9 +1342,8 @@ class BuildWiring(unittest.TestCase):
 
         for target in (native, sanitize):
             self.assertEqual(linux_targets().count(target), 1)
-        formatter = load('registration_formatter', 'scripts/format.py')
         for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c'):
-            self.assertIn(fixture, formatter.FILES)
+            self.assertIn(fixture, formatter_files())
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
