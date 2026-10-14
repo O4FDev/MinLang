@@ -1,0 +1,201 @@
+use "./net-fixtures.min" as fixtures
+use "./peer-edge-lab.min" as lab
+use "./peer-grants.min" as grants
+use "../tools/testing.min" as test
+use "system" as system
+use "json" as json
+
+record Rejection { connection: Text; token: Bytes; exit: Text; expected: Integer }
+
+function counting(rounds: Integer): Bytes {
+    let result = Bytes()
+    for round in 0..rounds { for byte in 0..256 { result.add(byte) } }
+    return result
+}
+function decoded(encoded: Bytes): Bytes {
+    let result = Bytes()
+    let value = 0
+    let bits = 0
+    for symbol in encoded {
+        let digit = -1
+        if symbol >= 65 && symbol <= 90 { digit = symbol - 65 }
+        if symbol >= 97 && symbol <= 122 { digit = symbol - 71 }
+        if symbol >= 48 && symbol <= 57 { digit = symbol + 4 }
+        if symbol == 45 { digit = 62 }
+        if symbol == 95 { digit = 63 }
+        test.check(digit >= 0, "invalid base64url signature")
+        value = ((value << 6) | digit) & 65535
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            result.add((value >> bits) & 255)
+        }
+    }
+    return result
+}
+function corruptSignature(token: Bytes): Bytes {
+    let cut = token.length - 1
+    while cut >= 0 && token[cut] != 46 { cut -= 1 }
+    let signature = decoded(token.slice(cut + 1, token.length))
+    signature[0] = signature[0] ^ 1
+    let result = token.slice(0, cut + 1)
+    result.addBytes(grants.b64(signature))
+    return result
+}
+function signatureControls() {
+    for last in 0..256 {
+        let signature = Bytes()
+        for index in 0..63 { signature.add(index) }
+        signature.add(last)
+        let token = Bytes("e30.e30.")
+        token.addBytes(grants.b64(signature))
+        if last == 0 { test.check(fixtures.ends(Text(token), "AA"), "zero signature tail must end in AA") }
+        let changed = corruptSignature(token)
+        test.check(Text(changed) != Text(token), "wrong-key control left a valid grant unchanged at " + Text(last))
+        let cut = changed.length - 1
+        while changed[cut] != 46 { cut -= 1 }
+        test.check(Text(changed.slice(0, cut)) == "e30.e30", "wrong-key control changed the signing input at " + Text(last))
+        let encoded = changed.slice(cut + 1, changed.length)
+        let value = decoded(encoded)
+        test.check(value.length == signature.length && fixtures.hex(value) != fixtures.hex(signature), "wrong-key signature was not changed at " + Text(last))
+        test.check(Text(grants.b64(value)) == Text(encoded), "wrong-key signature is not canonical base64url at " + Text(last))
+    }
+    print("GREEN wrong-key control changes every decoded signature, including AA tails")
+}
+function weight(state: lab.Lab): Float {
+    let text = lab.waitState(state, 5000)
+    lab.require(state, text != "", "live state missing")
+    return lab.stateNumber(text, "capacity_weight")
+}
+function weightUntil(state: lab.Lab, positive: Boolean) {
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while system.monotonicNanoseconds() < deadline {
+        let current = weight(state)
+        if (positive && current > 0.0) || (!positive && current == 0.0) { return }
+        fixtures.pause("0.02")
+    }
+    lab.require(state, false, "capacity weight did not change")
+}
+function statusOnly(state: lab.Lab, result: json.Value, expected: Integer, label: Text) {
+    let replies = lab.messages(result)
+    lab.require(state, replies.length == 1 && json.string(replies[0], "body") == "status" && Integer(json.member(replies[0], "code").number) == expected && lab.status(result) == "OK",
+        label + " " + json.pretty(result, ""))
+}
+function verify(state: lab.Lab, start: Text, accepted: Boolean) {
+    writeTextFile(state.directory + "/start.json", start)
+    let result = fixtures.run(state.context, [state.device, "--verify-start", state.directory + "/start.json", "exit-a"], 3)
+    lab.require(state, (result.status == 0) == accepted, "independent device verification " + start + "\n" + result.output + result.errorOutput)
+    if accepted { lab.require(state, test.contains(result.output, "REPLAY_REJECTED"), "device accepted replay\n" + result.output) }
+}
+function startText(token: Bytes, connection: Text, target: Text, port: Text, expires: Text): Text {
+    return "{\"dial_grant_bytes\": " + json.quote(Text(token)) + ", \"exit_id\": \"exit-a\", \"conn_id\": " + json.quote(connection) + ", \"target_host\": " + json.quote(target) + ", \"port\": " + port + ", \"expires\": " + expires + "}"
+}
+function exercise(state: lab.Lab, rounds: Integer) {
+    state.context.environment = fixtures.withSetting(state.context.environment, "MINYAR_PEER_DEVICE_HEARTBEAT_MS", "15000")
+    let device = lab.startDevice(state, "device")
+    let gateway = lab.session(state, "gateway")
+    let payload = counting(1024)
+    payload.addBytes(fixtures.unhex("00ff"))
+    payload.addBytes(Bytes("TAIL"))
+    let digest = lab.transfer(state, gateway, "valid-1", payload, "echo.example", 4000)
+    let started = lab.deviceEvent(state, device, "START valid-1 ", 5000)
+    let fields = fixtures.split(started, 32)
+    lab.require(state, fields[fields.length - 1] == digest, "edge changed independently signed token")
+    lab.deviceEvent(state, device, "CLOSED valid-1", 5000)
+    print("GREEN real mTLS grpc-go signed START/status + 262150 binary bytes both directions + request half-close/tail")
+    let now = fixtures.nowSeconds()
+    let rejections = [Rejection { connection: "valid-1"; token: lab.signed(state, "valid-1"); exit: "exit-a"; expected: 1 },
+        Rejection { connection: "wrong-exit"; token: lab.signedClaims(state, "wrong-exit", [["exit_id", grants.quote("exit-b")]]); exit: "exit-a"; expected: 1 },
+        Rejection { connection: "wrong-conn"; token: lab.signed(state, "different"); exit: "exit-a"; expected: 1 },
+        Rejection { connection: "expired"; token: lab.signedClaims(state, "expired", [["iat", Text(now - 40)], ["exp", Text(now - 10)]]); exit: "exit-a"; expected: 1 },
+        Rejection { connection: "wrong-key"; token: corruptSignature(lab.signed(state, "wrong-key")); exit: "exit-a"; expected: 1 },
+        Rejection { connection: "offline"; token: lab.signedClaims(state, "offline", [["exit_id", grants.quote("exit-b")]]); exit: "exit-b"; expected: 2 }]
+    for item in rejections { statusOnly(state, lab.call(state, gateway, item.token, item.exit, item.connection, 3000, 3000), item.expected, item.connection) }
+    statusOnly(state, lab.call(state, gateway, lab.signedClaims(state, "denied", [["target_host", grants.quote("deny.example")]]), "exit-a", "denied", 0, 3000), 3, "denied")
+    let early = lab.call(state, gateway, lab.signedClaims(state, "device-early", [["target_host", grants.quote("early.example")]]), "exit-a", "device-early", 0, 3000)
+    let earlyReplies = lab.messages(early)
+    if earlyReplies.length > 0 {
+        lab.require(state, json.string(earlyReplies[0], "body") == "status" && Integer(json.member(earlyReplies[0], "code").number) != 0, "device DATA before status became an accepted relay " + json.pretty(early, ""))
+    } else {
+        lab.require(state, lab.status(early) != "OK", "device DATA before status completed without status")
+    }
+    let holding = lab.ask(state, gateway, "{\"op\": \"hold\", \"name\": \"cancel-1\", " + lab.openFields(lab.signed(state, "cancel-1"), "exit-a", "cancel-1") + ", \"timeout_ms\": 6000}", 16000)
+    lab.require(state, json.string(holding, "first") == "status" && Integer(json.member(holding, "code").number) == 0, "held stream was not admitted " + json.pretty(holding, ""))
+    let cancelled = lab.ask(state, gateway, "{\"op\": \"cancel\", \"name\": \"cancel-1\"}", 10000)
+    lab.require(state, json.member(cancelled, "found").truth, "held stream missing")
+    lab.deviceEvent(state, device, "CANCELLED cancel-1", 5000)
+    let afterCancel = Bytes("after")
+    afterCancel.add(0)
+    afterCancel.addBytes(Bytes("cancel"))
+    lab.transfer(state, gateway, "after-cancel", afterCancel, "echo.example", 4000)
+    state.health.paused = true
+    lab.heartbeat(state, device)
+    weightUntil(state, false)
+    statusOnly(state, lab.call(state, gateway, lab.signed(state, "paused"), "exit-a", "paused", 0, 3000), 3, "paused")
+    state.health.paused = false
+    lab.heartbeat(state, device)
+    weightUntil(state, true)
+    lab.transfer(state, gateway, "resumed", Bytes("resumed"), "echo.example", 4000)
+    let deadline = lab.call(state, gateway, lab.signedClaims(state, "deadline", [["target_host", grants.quote("delay.example")]]), "exit-a", "deadline", 0, 200)
+    lab.require(state, lab.status(deadline) == "DeadlineExceeded", "late device admission exceeded deadline " + json.pretty(deadline, ""))
+    fixtures.pause("0.9")
+    lab.transfer(state, gateway, "after-deadline", Bytes("deadline survived"), "echo.example", 4000)
+    for index in 0..rounds {
+        let churn = Bytes()
+        for value in [0, 255, index % 251] { churn.add(value) }
+        for shift in [24, 16, 8, 0] { churn.add((index >> shift) & 255) }
+        for repeat in 0..(index % 127) { churn.add(index % 251) }
+        lab.transfer(state, gateway, "churn-" + Text(index), churn, "echo.example", 5000)
+    }
+    lab.deviceEvent(state, device, "HEARTBEAT", 16000)
+    let large = counting(8192)
+    large.addBytes(fixtures.unhex("00ff"))
+    large.addBytes(Bytes("large-tail"))
+    lab.transfer(state, gateway, "after-churn", large, "echo.example", 15000)
+    print("GREEN " + Text(rounds) + " sequential signed RPCs on persistent gateway/device connections and 2 MiB backpressured binary echo")
+    lab.endSession(state, gateway)
+    let untrusted = lab.session(state, "unregistered")
+    let refused = lab.call(state, untrusted, lab.signed(state, "untrusted"), "exit-a", "untrusted", 0, 1000)
+    lab.require(state, lab.status(refused) != "OK", "unregistered mTLS leaf admitted " + json.pretty(refused, ""))
+    lab.endSession(state, untrusted)
+    let issued = fixtures.nowSeconds()
+    let token = lab.signedClaims(state, "device-verify", [["iat", Text(issued)], ["exp", Text(issued + 30)]])
+    let expires = Text(issued + 30)
+    verify(state, startText(token, "device-verify", "echo.example", "443", expires), true)
+    let wrong = [["exit_id", "exit-b"], ["conn_id", "other"], ["target_host", "spoof.example"], ["port", "80"], ["expires", Text(issued + 31)], ["dial_grant_bytes", Text(lab.signed(state, "other"))]]
+    for pair in wrong {
+        let start = startText(token, "device-verify", "echo.example", "443", expires)
+        if pair[0] == "exit_id" { start = test.replace(start, "\"exit_id\": \"exit-a\"", "\"exit_id\": \"exit-b\"") }
+        if pair[0] == "conn_id" { start = startText(token, "other", "echo.example", "443", expires) }
+        if pair[0] == "target_host" { start = startText(token, "device-verify", "spoof.example", "443", expires) }
+        if pair[0] == "port" { start = startText(token, "device-verify", "echo.example", "80", expires) }
+        if pair[0] == "expires" { start = startText(token, "device-verify", "echo.example", "443", pair[1]) }
+        if pair[0] == "dial_grant_bytes" { start = startText(Bytes(pair[1]), "device-verify", "echo.example", "443", expires) }
+        verify(state, start, false)
+    }
+    let late = fixtures.nowSeconds()
+    let expired = lab.signedClaims(state, "device-verify", [["iat", Text(late - 40)], ["exp", Text(late - 10)]])
+    verify(state, startText(expired, "device-verify", "echo.example", "443", Text(late - 10)), false)
+    print("GREEN edge grant/replay/offline/pause/mTLS policy, independent device signature/echo/replay, cancel and deadline recovery")
+}
+
+fixtures.arguments(["--sanitize", "--signature-controls"], ["--binary", "--evidence", "--rounds"])
+if fixtures.flag("--signature-controls") {
+    signatureControls()
+    exit(0)
+}
+let sanitize = fixtures.flag("--sanitize")
+let rounds = fixtures.number(fixtures.option("--rounds", "1024"))
+test.check(rounds >= 1 && rounds <= 4096, "rounds must be 1..4096")
+let context = fixtures.context(sanitize)
+let directory = fixtures.option("--evidence", context.work + "/relay")
+if !fixtures.starts(directory, "/") { directory = context.root + "/" + directory }
+let state = lab.create(context, directory, lab.options(fixtures.option("--binary", ""), sanitize, 90000, 128))
+exercise(state, rounds)
+let values = lab.counts(lab.completed(state, 95000))
+lab.require(state, lab.count(values, "calls_opened") == lab.count(values, "calls_released"), "calls not released " + lab.describe(values))
+lab.require(state, lab.count(values, "retained_relays") == 0, "retained relays " + lab.describe(values))
+lab.require(state, lab.count(values, "relays_retired") >= rounds + 6, "retired relays " + lab.describe(values))
+print("GREEN exact call release and zero retained relay contexts " + lab.describe(values))
+lab.close(state)
+fixtures.finish(context)

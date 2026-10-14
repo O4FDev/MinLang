@@ -1,0 +1,40 @@
+use "./net-fixtures.min" as fixtures
+use "./peer-edge-lab.min" as lab
+use "../tools/testing.min" as test
+use "json" as json
+
+fixtures.arguments(["--sanitize"], ["--binary", "--client-binary", "--evidence"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+let directory = context.work + "/run"
+let evidence = fixtures.option("--evidence", "")
+if evidence != "" {
+    if !fixtures.starts(evidence, "/") { evidence = context.root + "/" + evidence }
+    fixtures.execute(context, ["mkdir", "-p", evidence], 10, "create evidence directory")
+    directory = fixtures.strip(fixtures.execute(context, ["mktemp", "-d", evidence + "/run-XXXXXXXX"], 10, "create run directory").output)
+} else {
+    fixtures.execute(context, ["mkdir", "-p", directory], 10, "create run directory")
+}
+context.environment = fixtures.withSetting(fixtures.withSetting(fixtures.withSetting(lab.environment(context, sanitize), "GOMAXPROCS", "1"), "GOFLAGS", "-p=1"), "MAKEFLAGS", "-j1")
+let client = fixtures.option("--client-binary", directory + "/client")
+if fixtures.option("--client-binary", "") == "" { lab.recorded(context, directory, [context.root + "/minyar", context.root + "/tests/peer-edge-cids.min", "-o", client], 240) }
+let state = lab.create(context, directory + "/lab", lab.options(fixtures.option("--binary", ""), sanitize, 8000, 1))
+let output = ""
+for session in 0..3 {
+    output = lab.recorded(context, directory, [client, fixtures.path(state.certs, "ca", "der"), fixtures.path(state.certs, "device", "der"), fixtures.path(state.certs, "device", "pk8"), Text(state.udpPort)], 10)
+    lab.require(state, output == "GREEN actual mTLS QUIC edge: 128 alternate-ID retirements, replacements and duplicate retirements\n", "client session " + Text(session) + "\n" + output)
+    fixtures.pause("0.25")
+}
+let values = lab.counts(lab.completed(state, 10000))
+lab.require(state, lab.count(values, "allocated") == 3 && lab.count(values, "retry_validated") == 3, "allocated peers " + lab.describe(values))
+lab.require(state, lab.count(values, "active") == 0 && lab.count(values, "peer_slots") == 1, "active peers " + lab.describe(values))
+let inputs: List<Text> = []
+for path in [context.root + "/library/quic.min", context.root + "/library/peeredge.min", context.root + "/tests/peer-edge-cids.min", context.root + "/tests/peer-edge-cids-test.min", client, state.binary] {
+    inputs.add(json.quote(path) + ": " + json.quote(lab.digest(context, path)))
+}
+let counts: List<Text> = []
+for item in values { counts.add(json.quote(item.name) + ": " + json.quote(item.value)) }
+writeTextFile(directory + "/manifest.json", "{\n  \"sanitize\": " + fixtures.truth(sanitize) + ",\n  \"inputs_sha256\": {" + lab.joined(inputs, ", ") + "},\n  \"counts\": {" + lab.joined(counts, ", ") + "}\n}")
+print(fixtures.strip(output) + "; three reused sessions, exact three allocated peers and zero active peers")
+lab.close(state)
+fixtures.finish(context)

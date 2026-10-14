@@ -13,7 +13,7 @@ build/peergrpc-venv/.ready: tests/interop/peergrpc/requirements.txt scripts/chec
 	build/peergrpc-venv/bin/python scripts/check-peer-python.py
 	touch $@
 
-build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum | build
+build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/edge.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum | build
 	cd tests/interop/peergrpc && GOMAXPROCS=2 go build -mod=readonly -trimpath -o "$(abspath $@).tmp" . && "$(abspath $@).tmp" self-test
 	mv -f "$@.tmp" "$@"
 
@@ -58,56 +58,64 @@ check-peer-grpc-retire: build/minyarc build/peergrpc-peer build/tooling/tests/pe
 check-peer-grpc-retire-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-retire-test
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-grpc-retire-test --sanitize
 
-.PHONY: check-peer-edge check-peer-edge-sanitize
-check-peer-edge: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge.py
+PEER_EDGE_TOOLS = peer-edge-test peer-edge-retry-test peer-edge-cids-test peer-edge-cid-stock-test peer-edge-relay-test \
+    peer-edge-relay-lifetime-test peer-edge-pki-test
+$(PEER_EDGE_TOOLS:%=build/tooling/tests/%.ll): tests/peer-edge-lab.min tests/net-fixtures.min tests/net-redis.min tests/peer-grants.min
+build/tooling/tests/peer-edge-relay-lifetime-test.ll: tests/http2-peer.min
+$(PEER_EDGE_TOOLS:%=build/tooling/tests/%): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(PEER_EDGE_TOOLS:%=build/tooling/tests/%): TOOL_NATIVE = runtime/native/net.c
+$(PEER_EDGE_TOOLS:%=build/tooling/tests/%): build/testing/cycle-runtime.o runtime/native/net.c
 
-check-peer-edge-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge.py --sanitize
+.PHONY: check-peer-edge check-peer-edge-sanitize
+check-peer-edge: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-test
+
+check-peer-edge-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-test --sanitize
 
 check: check-http2-churn check-peer-grpc-churn check-peer-grpc-retire check-peer-edge
 check-sanitize: check-http2-churn-sanitize check-peer-grpc-churn-sanitize check-peer-grpc-retire-sanitize check-peer-edge-sanitize
 
 .PHONY: check-peer-edge-retry check-peer-edge-retry-sanitize
-check-peer-edge-retry: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-retry.py
+check-peer-edge-retry: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-retry-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-retry-test
 
-check-peer-edge-retry-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-retry.py --sanitize
+check-peer-edge-retry-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-retry-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-retry-test --sanitize
 
 check: check-peer-edge-retry
 check-sanitize: check-peer-edge-retry-sanitize
 
 # CID routing is an actual Redis-backed mTLS/Retry integration on Linux.
 .PHONY: check-peer-edge-cids check-peer-edge-cids-sanitize
-check-peer-edge-cids: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cids.py --evidence "$(CURDIR)/build/peer-edge-cids-native"
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cid-stock.py --evidence "$(CURDIR)/build/peer-edge-cid-stock-native"
+check-peer-edge-cids: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-cids-test build/tooling/tests/peer-edge-cid-stock-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-cids-test --evidence "$(CURDIR)/build/peer-edge-cids-native"
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-cid-stock-test --evidence "$(CURDIR)/build/peer-edge-cid-stock-native"
 
-check-peer-edge-cids-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cids.py --sanitize --evidence "$(CURDIR)/build/peer-edge-cids-sanitize"
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cid-stock.py --sanitize --evidence "$(CURDIR)/build/peer-edge-cid-stock-sanitize"
+check-peer-edge-cids-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-cids-test build/tooling/tests/peer-edge-cid-stock-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-cids-test --sanitize --evidence "$(CURDIR)/build/peer-edge-cids-sanitize"
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-cid-stock-test --sanitize --evidence "$(CURDIR)/build/peer-edge-cid-stock-sanitize"
 
 check: check-peer-edge-cids
 check-sanitize: check-peer-edge-cids-sanitize
 
 # Signed relay and independently malformed/abrupt gateway lifetime checks are Linux labs.
 .PHONY: check-peer-edge-relay check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime check-peer-edge-relay-lifetime-sanitize
-check-peer-edge-relay: build/minyarc check-peer-grpc-python tests/peer-edge-relay.py tests/peer_edge_support.py | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay.py --evidence "$$artifacts"
+check-peer-edge-relay: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-test --evidence "$$artifacts"
 
-check-peer-edge-relay-sanitize: build/minyarc check-peer-grpc-python tests/peer-edge-relay.py tests/peer_edge_support.py | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay.py --sanitize --evidence "$$artifacts"
+check-peer-edge-relay-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-test --sanitize --evidence "$$artifacts"
 
-check-peer-edge-relay-lifetime: build/minyarc check-peer-grpc-python tests/peer-edge-relay-lifetime.py tests/peer-edge-relay.py tests/peer_edge_support.py | build
+check-peer-edge-relay-lifetime: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-lifetime-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-malformed.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay-lifetime.py --mode malformed --evidence "$$artifacts"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-abrupt.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay-lifetime.py --mode abrupt --evidence "$$artifacts"
+	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-malformed.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --evidence "$$artifacts"; \
+	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-abrupt.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --evidence "$$artifacts"
 
-check-peer-edge-relay-lifetime-sanitize: build/minyarc check-peer-grpc-python tests/peer-edge-relay-lifetime.py tests/peer-edge-relay.py tests/peer_edge_support.py | build
+check-peer-edge-relay-lifetime-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-lifetime-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-malformed.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay-lifetime.py --mode malformed --sanitize --evidence "$$artifacts"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-abrupt.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-relay-lifetime.py --mode abrupt --sanitize --evidence "$$artifacts"
+	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-malformed.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --sanitize --evidence "$$artifacts"; \
+	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-abrupt.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --sanitize --evidence "$$artifacts"
 
 check: check-peer-edge-relay check-peer-edge-relay-lifetime
 check-sanitize: check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime-sanitize
@@ -115,10 +123,10 @@ check-sanitize: check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime-sa
 
 # Real server chain presentation and independently trusted device/gateway CA overlap.
 .PHONY: check-peer-edge-pki check-peer-edge-pki-sanitize
-check-peer-edge-pki: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-pki.py
-check-peer-edge-pki-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-pki.py --sanitize
+check-peer-edge-pki: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-pki-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-pki-test
+check-peer-edge-pki-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-pki-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-pki-test --sanitize
 check: check-peer-edge-pki
 check-sanitize: check-peer-edge-pki-sanitize
 

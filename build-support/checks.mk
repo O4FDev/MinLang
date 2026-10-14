@@ -813,7 +813,7 @@ build/tooling/tests/module-test-driver: build/tooling/tools/clang-driver
 check-module-test-driver: build/minyarc build/minyar-runtime.o build/tooling/tests/module-test-driver build/tooling/tools/clang-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/module-test-driver
 
-check-build-wiring: build/tooling/tests/suite-catalogue build/tooling/tests/cycle-private-retirement build/tooling/tests/cycle-registration build/tooling/tests/net-loop-test build/tooling/tests/net-native-test
+check-build-wiring: build/tooling/tests/suite-catalogue build/tooling/tests/cycle-private-retirement build/tooling/tests/cycle-registration build/tooling/tests/net-loop-test build/tooling/tests/net-native-test build/tooling/tests/peer-edge-relay-test
 	python3 tests/build-wiring.py
 
 check check-portable: check-module-test-driver check-build-wiring

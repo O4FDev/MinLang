@@ -1,0 +1,67 @@
+use "./net-fixtures.min" as fixtures
+use "./peer-edge-lab.min" as lab
+use "./http2-peer.min" as h2
+use "../tools/testing.min" as test
+use "json" as json
+
+record Malformed { path: Text; message: Text }
+
+function exercise(state: lab.Lab, mode: Text): List<lab.Setting> {
+    let device = lab.startDevice(state, "device")
+    let gateway = lab.session(state, "gateway")
+    let before = Bytes("before")
+    before.add(0)
+    before.add(255)
+    lab.transfer(state, gateway, "before-" + mode, before, "echo.example", 4000)
+    if mode == "malformed" {
+        let cases = [Malformed { path: "/PeerEdgeDial/Unknown"; message: "" }, Malformed { path: "/PeerEdgeDial/OpenExitStream"; message: "1a0178" },
+            Malformed { path: "/PeerEdgeDial/OpenExitStream"; message: "0a01ff" }]
+        for index in 0..cases.length {
+            let result = lab.ask(state, gateway, "{\"op\": \"raw\", \"path\": " + json.quote(cases[index].path) + ", \"message\": " + json.quote(cases[index].message) + ", \"timeout_ms\": 3000}", 13000)
+            lab.require(state, lab.status(result) == "Internal", "malformed gRPC call " + Text(index) + " " + json.pretty(result, ""))
+            let marker = Bytes()
+            for value in [0, 255, index] { marker.add(value) }
+            lab.transfer(state, gateway, "after-malformed-" + Text(index), marker, "echo.example", 4000)
+        }
+    } else {
+        let opened = h2.protos(state.context, [h2.openSpec(lab.signed(state, "abrupt-admitted"), "exit-a", "abrupt-admitted")])[0]
+        let abrupt = fixtures.run(state.context, [lab.peerBinary(state), "abrupt", "127.0.0.1:" + Text(state.gatewayPort), fixtures.path(state.certs, "ca", "pem"),
+            fixtures.path(state.certs, "gateway", "pem"), fixtures.path(state.certs, "gateway", "key"), fixtures.hex(opened)], 30)
+        lab.require(state, abrupt.status == 0 && abrupt.output == "ADMITTED\n", "abrupt gateway fixture (" + Text(abrupt.status) + ")\n" + abrupt.output + abrupt.errorOutput)
+        lab.deviceEvent(state, device, "CANCELLED abrupt-admitted", 5000)
+        lab.transfer(state, gateway, "after-abrupt", Bytes("channel survives another gateway reset"), "echo.example", 4000)
+    }
+    lab.endSession(state, gateway)
+    lab.send(state, device, "close")
+    let closed = lab.finishDevice(state, device)
+    lab.require(state, closed.status == 0, "device exit " + Text(closed.status) + "\n" + closed.errorOutput)
+    let lines = lab.completed(state, 20000)
+    let records = 0
+    for line in lines { if fixtures.starts(line, "EDGE_COUNTS ") { records += 1 } }
+    lab.require(state, records == 1, "expected one EDGE_COUNTS line\n" + lab.joined(lines, "\n"))
+    let values = lab.counts(lines)
+    lab.require(state, lab.count(values, "active") == 0 && lab.count(values, "retained_relays") == 0, "retained peers " + lab.describe(values))
+    lab.require(state, lab.count(values, "calls_opened") == lab.count(values, "calls_released"), "calls not released " + lab.describe(values))
+    let minimum = 3
+    if mode == "malformed" { minimum = 7 }
+    lab.require(state, lab.count(values, "calls_opened") >= minimum, "calls not accounted " + lab.describe(values))
+    return values
+}
+
+fixtures.arguments(["--sanitize"], ["--binary", "--evidence", "--mode"])
+let sanitize = fixtures.flag("--sanitize")
+let mode = fixtures.option("--mode", "")
+test.check(mode == "malformed" || mode == "abrupt", "--mode must be malformed or abrupt")
+let context = fixtures.context(sanitize)
+let evidence = fixtures.option("--evidence", "")
+test.check(evidence != "", "--evidence is required")
+if !fixtures.starts(evidence, "/") { evidence = context.root + "/" + evidence }
+let state = lab.create(context, evidence, lab.options(fixtures.option("--binary", ""), sanitize, 12000, 128))
+let values = exercise(state, mode)
+let counts: List<Text> = []
+for item in values { counts.add(json.quote(item.name) + ": " + json.quote(item.value)) }
+let report = "{\"counts\": {" + lab.joined(counts, ", ") + "}, \"mode\": " + json.quote(mode) + ", \"status\": 0}"
+writeTextFile(evidence + "/lifetime-result.json", "{\n  \"status\": 0,\n  \"mode\": " + json.quote(mode) + ",\n  \"counts\": {" + lab.joined(counts, ", ") + "}\n}\n")
+print("GREEN gateway lifetime " + report)
+lab.close(state)
+fixtures.finish(context)

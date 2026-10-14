@@ -1054,13 +1054,13 @@ class BuildWiring(unittest.TestCase):
         source = text[text.index('# Signed relay and independently malformed/abrupt'):]
         native = {'check-peer-edge-relay', 'check-peer-edge-relay-lifetime'}
         sanitize = {name + '-sanitize' for name in native}
+        tools = {'build/tooling/tests/peer-edge-relay-test', 'build/tooling/tests/peer-edge-relay-lifetime-test'}
 
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='minyar relay wiring ') as folder:
                 makefile = Path(folder) / 'probe.mk'
-                makefile.write_text('PEER_GRPC_PYTHON=/selected-pinned/python\n' + fragment +
-                                   '\n.PHONY: build/minyarc build check-peer-grpc-python\n'
-                                   'build/minyarc build check-peer-grpc-python:\n\t@echo ARTIFACT $@\n')
+                stubs = 'build/minyarc build build/peergrpc-peer ' + ' '.join(sorted(tools))
+                makefile.write_text(fragment + '\n.PHONY: ' + stubs + '\n' + stubs + ':\n\t@echo ARTIFACT $@\n')
                 env = dict(os.environ)
                 env.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-np', '-f', str(makefile), *sorted(native | sanitize)],
@@ -1074,12 +1074,12 @@ class BuildWiring(unittest.TestCase):
                 self.assertTrue(native <= rules.get('check', set()))
                 self.assertTrue(sanitize <= rules.get('check-sanitize', set()))
                 for target in native | sanitize:
-                    self.assertIn('check-peer-grpc-python', rules.get(target, set()))
-                    self.assertIn('tests/peer-edge-relay.py', rules.get(target, set()))
-                    if 'lifetime' in target:
-                        self.assertIn('tests/peer-edge-relay-lifetime.py', rules[target])
+                    self.assertIn('build/peergrpc-peer', rules.get(target, set()))
+                    tool = 'build/tooling/tests/peer-edge-relay-lifetime-test' if 'lifetime' in target else 'build/tooling/tests/peer-edge-relay-test'
+                    self.assertIn(tool, rules.get(target, set()))
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('"/selected-pinned/python"'), 6)
+                self.assertEqual(commands.count('./build/tooling/tests/peer-edge-relay-test '), 2)
+                self.assertEqual(commands.count('./build/tooling/tests/peer-edge-relay-lifetime-test '), 4)
                 # Six evidence directories plus one program cache per relay-lifetime recipe.
                 self.assertEqual(commands.count('mktemp -d "'), 8)
                 self.assertEqual(commands.count('MINYAR_TEST_PROGRAM_CACHE='), 2)
@@ -1106,7 +1106,7 @@ class BuildWiring(unittest.TestCase):
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for name in ('tests/peer-edge-relay.py', 'tests/peer-edge-relay-lifetime.py', 'tests/peer-edge-soak.py'):
+        for name in ('tests/peer-edge-soak.py',):
             with self.subTest(missing_source=name), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != name]), ROOT)
 
@@ -1506,12 +1506,15 @@ class BuildWiring(unittest.TestCase):
 
     def test_grpc_gates_verify_external_peers_and_bound_default_builds(self):
         tools = ' '.join('build/tooling/tests/' + name for name in (
-            'http2-test', 'http2-churn-test', 'peer-grpc-test', 'peer-grpc-churn-test', 'peer-grpc-retire-test'))
+            'http2-test', 'http2-churn-test', 'peer-grpc-test', 'peer-grpc-churn-test', 'peer-grpc-retire-test',
+            'peer-edge-test', 'peer-edge-retry-test', 'peer-edge-cids-test', 'peer-edge-cid-stock-test',
+            'peer-edge-relay-test', 'peer-edge-relay-lifetime-test', 'peer-edge-pki-test'))
         with tempfile.TemporaryDirectory(prefix='minyar grpc wiring ') as folder:
             work = Path(folder)
             for name in ('tests/interop/peergrpc/requirements.txt',
                          'scripts/check-peer-python.py', 'tests/interop/peergrpc/main.go',
-                         'tests/interop/peergrpc/go.mod', 'tests/interop/peergrpc/go.sum'):
+                         'tests/interop/peergrpc/edge.go', 'tests/interop/peergrpc/go.mod',
+                         'tests/interop/peergrpc/go.sum', 'runtime/native/net.c'):
                 path = work / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('')
@@ -1522,27 +1525,28 @@ class BuildWiring(unittest.TestCase):
                 'build/minyarc build build/testing/cycle-runtime.o ' + tools + ':\n\t@echo ARTIFACT $@\n')
             for selected in ('build/peergrpc-venv/bin/python', 'preinstalled-python',
                              'preinstalled Python'):
-                for gate in ('check-peer-edge-cids', 'check-peer-edge-cids-sanitize'):
-                    with self.subTest(selected=selected, gate=gate):
-                        env = dict(os.environ)
-                        env.pop('MAKEFLAGS', None)
-                        result = subprocess.run(
-                            ['make', '-n', '-f', str(makefile),
-                             'PEER_GRPC_PYTHON=' + selected, gate],
-                            cwd=work, env=env, text=True, capture_output=True, timeout=10)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertIn('scripts/check-peer-python.py', result.stdout)
-                        self.assertIn('"' + selected + '" scripts/check-peer-python.py', result.stdout)
-                        self.assertIn('"' + selected + '" tests/', result.stdout)
-                        setup = selected == 'build/peergrpc-venv/bin/python'
-                        self.assertEqual('python3 -m venv' in result.stdout, setup)
-                        if setup:
-                            self.assertIn('GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1', result.stdout)
-                            self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL=1', result.stdout)
+                with self.subTest(selected=selected):
+                    env = dict(os.environ)
+                    env.pop('MAKEFLAGS', None)
+                    result = subprocess.run(
+                        ['make', '-n', '-f', str(makefile),
+                         'PEER_GRPC_PYTHON=' + selected, 'check-peer-grpc-python'],
+                        cwd=work, env=env, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('"' + selected + '" scripts/check-peer-python.py', result.stdout)
+                    setup = selected == 'build/peergrpc-venv/bin/python'
+                    self.assertEqual('python3 -m venv' in result.stdout, setup)
+                    if setup:
+                        self.assertIn('GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1', result.stdout)
+                        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL=1', result.stdout)
             for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
                          'check-http2-churn', 'check-http2-churn-sanitize', 'check-peer-grpc-churn',
                          'check-peer-grpc-churn-sanitize', 'check-peer-grpc-retire',
-                         'check-peer-grpc-retire-sanitize'):
+                         'check-peer-grpc-retire-sanitize', 'check-peer-edge', 'check-peer-edge-sanitize',
+                         'check-peer-edge-retry', 'check-peer-edge-retry-sanitize', 'check-peer-edge-cids',
+                         'check-peer-edge-cids-sanitize', 'check-peer-edge-relay', 'check-peer-edge-relay-sanitize',
+                         'check-peer-edge-relay-lifetime', 'check-peer-edge-relay-lifetime-sanitize',
+                         'check-peer-edge-pki', 'check-peer-edge-pki-sanitize'):
                 with self.subTest(gate=gate):
                     env = dict(os.environ)
                     env.pop('MAKEFLAGS', None)
@@ -2345,37 +2349,10 @@ class BuildWiring(unittest.TestCase):
 
 
     def test_relay_wrong_key_changes_decoded_signature_even_with_aa_tail(self):
-        import base64
-        tree = ast.parse((ROOT / 'tests/peer-edge-relay.py').read_text())
-        run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'run')
-        request = next(node.elts[1] for node in ast.walk(run)
-                       if isinstance(node, ast.Tuple) and len(node.elts) == 4
-                       and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == 'wrong-key')
-        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                   and node.name == 'corrupt_signature']
-        namespace = {'base64': base64}
-        exec(compile(ast.Module(body=helpers, type_ignores=[]), '<relay helper>', 'exec'), namespace)
-        expression = compile(ast.Expression(body=request), '<wrong-key request>', 'eval')
-        for last in range(256):
-            signature = bytes(range(63)) + bytes([last])
-            token = b'e30.e30.' + base64.urlsafe_b64encode(signature).rstrip(b'=')
-            if last == 0:
-                self.assertTrue(token.endswith(b'AA'))
-            class Lab:
-                def signed(self, connection):
-                    self.assert_connection = connection
-                    return token
-            lab = Lab()
-            changed = eval(expression, namespace, {'lab': lab})
-            with self.subTest(last_signature_byte=last):
-                self.assertEqual(lab.assert_connection, 'wrong-key')
-                self.assertNotEqual(changed, token, 'wrong-key control left a valid grant unchanged')
-                prefix, encoded = changed.rsplit(b'.', 1)
-                self.assertEqual(prefix, token.rsplit(b'.', 1)[0])
-                decoded = base64.urlsafe_b64decode(encoded + b'==')
-                self.assertEqual(len(decoded), len(signature))
-                self.assertNotEqual(decoded, signature)
-                self.assertEqual(encoded, base64.urlsafe_b64encode(decoded).rstrip(b'='))
+        result = subprocess.run([str(ROOT / 'build/tooling/tests/peer-edge-relay-test'), '--signature-controls'],
+                                cwd=ROOT, text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('GREEN wrong-key control changes every decoded signature, including AA tails', result.stdout)
     def test_network_sanitizers_select_override_and_complete_directory(self):
         import json
         fragment = (ROOT / 'build-support/networking.mk').read_text()

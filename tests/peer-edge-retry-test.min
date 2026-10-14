@@ -1,0 +1,81 @@
+use "./net-fixtures.min" as fixtures
+use "./peer-edge-lab.min" as lab
+use "../tools/testing.min" as test
+use "errors" as errors
+use "net" as net
+
+function word(value: Integer, size: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..size { result.add((value >> ((size - 1 - index) * 8)) & 255) }
+    return result
+}
+function initial(index: Integer, token: Bytes, destination: Bytes): Bytes {
+    let dcid = destination
+    if dcid.length == 0 { dcid = word(index + 1, 8) }
+    let packet = Bytes()
+    packet.add(192)
+    packet.addBytes(word(1, 4))
+    packet.add(dcid.length)
+    packet.addBytes(dcid)
+    packet.add(8)
+    packet.addBytes(Bytes("client01"))
+    if token.length < 64 { packet.add(token.length) } else { packet.addBytes(word(token.length | 16384, 2)) }
+    packet.addBytes(token)
+    let remaining = 1200 - packet.length - 2
+    packet.addBytes(word(remaining | 16384, 2))
+    packet.addBytes(Bytes(remaining))
+    return packet
+}
+function exchange(state: lab.Lab, socket: Integer, packet: Bytes): Bytes {
+    lab.require(state, errors.integerOk(net.sendDatagramTo(socket, "127.0.0.1", state.udpPort, packet)), "send Initial")
+    lab.require(state, net.ready(socket, 1000), "edge did not answer an unknown Initial")
+    let reply = net.receiveDatagram(socket, 1500)
+    lab.require(state, errors.bytesOk(reply), "receive Retry")
+    return errors.bytesValue(reply)
+}
+
+fixtures.arguments(["--sanitize"], ["--binary", "--evidence"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+let directory = fixtures.option("--evidence", context.work + "/retry")
+if !fixtures.starts(directory, "/") { directory = context.root + "/" + directory }
+let setup = lab.options(fixtures.option("--binary", ""), sanitize, 7000, 128)
+setup.quarantine = true
+let state = lab.create(context, directory, setup)
+let socket = net.udp("127.0.0.1", 0)
+lab.require(state, socket >= 0, "bind UDP client")
+let reply = exchange(state, socket, initial(0, Bytes(), Bytes()))
+lab.require(state, (reply[0] & 240) == 240 && lab.number4(reply, 1) == 1, "not a QUIC v1 Retry")
+let at = 5
+let size = reply[at]
+at += 1
+lab.require(state, Text(reply.slice(at, at + size)) == "client01", "Retry destination did not echo the client ID")
+at += size
+size = reply[at]
+at += 1
+let source = reply.slice(at, at + size)
+at += size
+let token = reply.slice(at, reply.length - 16)
+lab.require(state, fixtures.hex(source) != fixtures.hex(word(1, 8)) && fixtures.starts(Text(token.slice(0, 4)), "MQR1"), "Retry source/token shape")
+let cold = lab.rss(state.edge)
+let warmup = 0
+if sanitize { warmup = 1024 }
+for index in 0..warmup { lab.require(state, (exchange(state, socket, initial(index + 100000, Bytes(), Bytes()))[0] & 240) == 240, "warmup Retry") }
+let before = lab.rss(state.edge)
+let count = 4096
+for index in 1..(count + 1) { lab.require(state, (exchange(state, socket, initial(index, Bytes(), Bytes()))[0] & 240) == 240, "flood Retry " + Text(index)) }
+let other = net.udp("127.0.0.1", 0)
+lab.require(state, other >= 0, "bind second UDP client")
+lab.require(state, errors.integerOk(net.sendDatagramTo(other, "127.0.0.1", state.udpPort, initial(0, token, source))), "send bound token")
+lab.require(state, !net.ready(other, 250), "unbound token got response")
+let after = lab.rss(state.edge)
+lab.require(state, after - before < 2048, "retained RSS " + Text(before) + " -> " + Text(after))
+let values = lab.counts(lab.completed(state, 10000))
+lab.require(state, lab.count(values, "allocated") == 0 && lab.count(values, "active") == 0 && lab.count(values, "peer_slots") == 0, "stateless Initials allocated peers " + lab.describe(values))
+lab.require(state, lab.count(values, "retries") == count + 1 + warmup && lab.count(values, "retry_validated") == 0, "retry counters " + lab.describe(values))
+print("GREEN " + Text(count + 1) + " independently encoded unknown Initials, wrong-address token denied; exact zero allocated/active/retained peers; RSS delta=" + Text(after - before) +
+    " KiB; sanitizer_warmup=" + Text(warmup) + " cold_rss=" + Text(cold) + " measured_baseline=" + Text(before))
+net.close(socket)
+net.close(other)
+lab.close(state)
+fixtures.finish(context)

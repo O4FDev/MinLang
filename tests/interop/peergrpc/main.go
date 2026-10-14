@@ -612,6 +612,8 @@ func main() {
 		}
 		churn(os.Args[2])
 	default:
-		fail("unknown command %q", os.Args[1])
+		if !edgeCommand(os.Args[1:]) {
+			fail("unknown command %q", os.Args[1])
+		}
 	}
 }

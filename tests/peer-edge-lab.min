@@ -1,0 +1,517 @@
+use "../tools/testing.min" as test
+use "./net-fixtures.min" as fixtures
+use "./net-redis.min" as redis
+use "./peer-grants.min" as grants
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+
+public record Reader { path: Text; offset: Integer; pending: Bytes }
+public record Device { process: fixtures.Process; fifo: Text; input: Integer; reader: Reader; closed: Boolean; finished: Boolean; events: List<Text> }
+public record Health { inFlight: Integer; maxConcurrent: Integer; paused: Boolean }
+public record Setting { name: Text; value: Text }
+public record Lab {
+    context: fixtures.Context
+    directory: Text
+    binary: Text
+    device: Text
+    certs: fixtures.Authority
+    signer: grants.Signer
+    settings: List<Setting>
+    redis: fixtures.Process
+    redisPort: Integer
+    client: redis.Client
+    connected: Boolean
+    edge: fixtures.Process
+    running: Boolean
+    edgeReader: Reader
+    udpPort: Integer
+    devicePort: Integer
+    gatewayPort: Integer
+    health: Health
+    devices: List<Device>
+    events: List<Text>
+}
+public constant TIMEOUT = "<timeout>"
+public record Options { binary: Text; sanitize: Boolean; duration: Integer; maximum: Integer; quarantine: Boolean; pki: Boolean; intermediate: Boolean }
+
+public function options(binary: Text, sanitize: Boolean, duration: Integer, maximum: Integer): Options {
+    return Options { binary: binary; sanitize: sanitize; duration: duration; maximum: maximum; quarantine: false; pki: false; intermediate: true }
+}
+public function environment(context: fixtures.Context, sanitize: Boolean): List<Text> {
+    let result = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+    result = fixtures.withSetting(fixtures.withSetting(result, "GOMAXPROCS", "1"), "GOFLAGS", "-p=1")
+    if sanitize {
+        result = fixtures.sanitized(result)
+        result = fixtures.withSetting(fixtures.withSetting(result, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1")
+    }
+    return result
+}
+public function direct(context: fixtures.Context, command: List<Text>, input: Text, name: Text): fixtures.Process {
+    let log = fixtures.logPath(context, name)
+    let argv = ["sh", "-c", "log=$1; input=$2; shift 2; exec \"$@\" <\"$input\" >\"$log\" 2>\"$log.err\"", "minyar", log, input]
+    for item in command { argv.add(item) }
+    let handle = system.spawn("/bin/sh", argv, context.environment, "")
+    test.check(handle > 0, "launch " + name)
+    return fixtures.Process { handle: handle; log: log; line: "" }
+}
+public function pid(process: fixtures.Process): Integer { return system.childProcessId(process.handle) }
+public function reader(path: Text): Reader { return Reader { path: path; offset: 0; pending: Bytes() } }
+public function poll(item: Reader): Text {
+    let raw = files.readFile(item.path)
+    if raw.length > item.offset {
+        item.pending.addBytes(raw.slice(item.offset, raw.length))
+        item.offset = raw.length
+    }
+    for index in 0..item.pending.length {
+        if item.pending[index] == 10 {
+            let line = Text(item.pending.slice(0, index))
+            item.pending = item.pending.slice(index + 1, item.pending.length)
+            return fixtures.strip(line) + "\n"
+        }
+    }
+    return ""
+}
+public function nextLine(item: Reader, milliseconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while true {
+        let line = poll(item)
+        if line != "" { return Text(Bytes(line).slice(0, line.byteLength - 1)) }
+        if system.monotonicNanoseconds() >= deadline { return TIMEOUT }
+        fixtures.pause("0.01")
+    }
+    return TIMEOUT
+}
+public function quote(value: Text): Text { return json.quote(value) }
+public function render(settings: List<Setting>): Text {
+    let parts: List<Text> = []
+    for item in settings { parts.add(json.quote(item.name) + ": " + item.value) }
+    return "{" + joined(parts, ", ") + "}"
+}
+public function joined(items: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for item in items {
+        if parts.length > 0 { parts.add(separator) }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+public function replaced(settings: List<Setting>, name: Text, value: Text): List<Setting> {
+    let result: List<Setting> = []
+    for item in settings {
+        if item.name == name { result.add(Setting { name: name; value: value }) } else { result.add(item) }
+    }
+    return result
+}
+public function setting(settings: List<Setting>, name: Text): Text {
+    for item in settings { if item.name == name { return item.value } }
+    return ""
+}
+public function healthText(health: Health): Text {
+    return "{\"in_flight\": " + Text(health.inFlight) + ", \"max_concurrent\": " + Text(health.maxConcurrent) + ", \"paused\": " + fixtures.truth(health.paused) +
+        ", \"policy_hash\": \"" + repeated("a", 64) + "\", \"public_ip\": \"203.0.113.2\", \"asn\": 64500, \"country\": \"GB\"}"
+}
+public function repeated(text: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(text) }
+    return joinText(parts)
+}
+public function digest(context: fixtures.Context, path: Text): Text {
+    return fixtures.split(fixtures.execute(context, ["sha256sum", "--", path], 60, "hash " + path).output, 32)[0]
+}
+function selectPort(context: fixtures.Context): Integer {
+    for attempt in 0..100 {
+        let random = randomBytes(2)
+        let selected = 18000 + ((random[0] << 8) | random[1]) % 10000
+        let tcp = net.listen("127.0.0.1", selected, 1)
+        let udp = net.udp("127.0.0.1", selected)
+        if tcp >= 0 { net.close(tcp) }
+        if udp >= 0 { net.close(udp) }
+        if tcp >= 0 && udp >= 0 { return selected }
+    }
+    test.check(false, "no independent TCP/UDP lab port")
+    return 0
+}
+function startRedis(lab: Lab) {
+    for attempt in 0..20 {
+        let port = redis.reservePort()
+        let process = direct(lab.context, ["redis-server", "--bind", "127.0.0.1", "--port", Text(port), "--save", "", "--appendonly", "no", "--dir", lab.directory], "/dev/null", "redis")
+        let deadline = system.monotonicNanoseconds() + 5000000000
+        let connection = -1
+        while connection < 0 && system.monotonicNanoseconds() < deadline {
+            connection = net.connect("127.0.0.1", port)
+            if connection < 0 { fixtures.pause("0.02") }
+        }
+        if connection >= 0 {
+            let client = redis.Client { connection: connection; buffer: Bytes() }
+            let info = redis.command(client, ["INFO", "server"])
+            if test.contains(Text(info.data), "process_id:" + Text(pid(process)) + "\r\n") {
+                lab.redis = process
+                lab.redisPort = port
+                lab.client = client
+                lab.connected = true
+                return
+            }
+            redis.close(client)
+        }
+        fixtures.stop(process)
+    }
+    test.check(false, "no Redis port owned by this lab")
+}
+public function create(context: fixtures.Context, directory: Text, setup: Options): Lab {
+    fixtures.execute(context, ["mkdir", "-p", directory + "/logs"], 10, "create lab directory")
+    let environment = environment(context, setup.sanitize)
+    if setup.sanitize && setup.quarantine { environment = fixtures.withSetting(environment, "ASAN_OPTIONS", "detect_leaks=1:quarantine_size_mb=1:thread_local_quarantine_size_kb=64") }
+    let labContext = fixtures.Context { root: context.root; work: directory + "/logs"; environment: environment; serial: 0; sanitize: setup.sanitize }
+    let binary = setup.binary
+    if binary == "" {
+        binary = directory + "/edge"
+        fixtures.compileProgram(labContext, "examples/peer-edge.min", binary)
+    }
+    let device = directory + "/device"
+    let shared = context.work + "/peeredge-device"
+    if files.pathSize(shared) <= 0 {
+        test.require(test.run(["go", "build", "-trimpath", "-o", shared, "."], environment, context.root + "/tests/interop/peeredge", fixtures.logPath(labContext, "device-build"), 120), "build independent device")
+    }
+    fixtures.execute(labContext, ["cp", "-p", shared, device], 30, "copy independent device")
+    let certs = fixtures.authority(labContext, directory)
+    fixtures.root(certs, "ca")
+    let deviceLeaf = fixtures.ec("clientAuth")
+    deviceLeaf.san = "URI:hearth://device/device-a"
+    if setup.pki {
+        for name in ["ca-next", "ca-untrusted", "gateway-ca", "gateway-ca-next"] { fixtures.root(certs, name) }
+        let intermediate = fixtures.ec("serverAuth")
+        intermediate.ca = true
+        fixtures.leaf(certs, "intermediate", "ca", intermediate)
+        fixtures.leaf(certs, "server", "intermediate", fixtures.ec("serverAuth"))
+    } else {
+        fixtures.leaf(certs, "server", "ca", fixtures.ec("serverAuth"))
+    }
+    fixtures.leaf(certs, "device", "ca", deviceLeaf)
+    let gatewayIssuer = "ca"
+    if setup.pki { gatewayIssuer = "gateway-ca" }
+    fixtures.leaf(certs, "gateway", gatewayIssuer, fixtures.ec("clientAuth"))
+    fixtures.leaf(certs, "unregistered", "ca", fixtures.ec("clientAuth"))
+    if setup.pki {
+        for pair in [["next", "ca-next", "gateway-ca-next"], ["untrusted", "ca-untrusted", "ca-untrusted"]] {
+            fixtures.leaf(certs, "device-" + pair[0], pair[1], deviceLeaf)
+            fixtures.leaf(certs, "gateway-" + pair[0], pair[2], fixtures.ec("clientAuth"))
+        }
+        fixtures.leaf(certs, "gateway-device-root", "ca", fixtures.ec("clientAuth"))
+        fixtures.leaf(certs, "device-gateway-root", "gateway-ca", deviceLeaf)
+    }
+    let registry = ["{\"role\": \"device\", \"device_id\": \"device-a\", \"exit_id\": \"exit-a\", \"revoked\": false, \"paused\": false, \"quarantined\": false, \"max_concurrent\": 8}\n",
+        "{\"role\": \"gateway\", \"sha256\": " + json.quote(digest(labContext, fixtures.path(certs, "gateway", "der"))) + "}\n"]
+    if setup.pki {
+        for label in ["next", "untrusted", "device-root"] { registry.add("{\"role\": \"gateway\", \"sha256\": " + json.quote(digest(labContext, fixtures.path(certs, "gateway-" + label, "der"))) + "}\n") }
+    }
+    writeTextFile(directory + "/registry.ndjson", joinText(registry))
+    writeBytesFile(directory + "/jwks.json", grants.jwks(grants.goodKey()))
+    let lab = Lab { context: labContext; directory: directory; binary: binary; device: device; certs: certs; signer: grants.signer(labContext); settings: [];
+        redis: fixtures.Process { handle: 0; log: ""; line: "" }; redisPort: 0; client: redis.Client { connection: -1; buffer: Bytes() }; connected: false;
+        edge: fixtures.Process { handle: 0; log: ""; line: "" }; running: false; edgeReader: reader(""); udpPort: 0; devicePort: 0; gatewayPort: 0;
+        health: Health { inFlight: 0; maxConcurrent: 8; paused: false }; devices: []; events: [] }
+    let listen = selectPort(labContext)
+    startRedis(lab)
+    let settings = [Setting { name: "host"; value: "\"127.0.0.1\"" }, Setting { name: "device_port"; value: Text(listen) }, Setting { name: "gateway_port"; value: "0" },
+        Setting { name: "redis_host"; value: "\"127.0.0.1\"" }, Setting { name: "redis_port"; value: Text(lab.redisPort) }, Setting { name: "edge_instance"; value: "\"localhost:0\"" },
+        Setting { name: "edge_region"; value: "\"eu-west\"" }, Setting { name: "max_connections"; value: Text(setup.maximum) },
+        Setting { name: "certificate"; value: json.quote(fixtures.path(certs, "server", "der")) }, Setting { name: "private_key"; value: json.quote(fixtures.path(certs, "server", "pk8")) },
+        Setting { name: "device_roots"; value: json.quote(fixtures.path(certs, "ca", "der")) }, Setting { name: "gateway_roots"; value: json.quote(fixtures.path(certs, "ca", "der")) },
+        Setting { name: "registry"; value: json.quote(directory + "/registry.ndjson") }, Setting { name: "jwks"; value: json.quote(directory + "/jwks.json") }]
+    if setup.pki {
+        let chain = [json.quote(fixtures.path(certs, "server", "der"))]
+        if setup.intermediate { chain.add(json.quote(fixtures.path(certs, "intermediate", "der"))) }
+        settings = replaced(settings, "certificate", "[" + joined(chain, ", ") + "]")
+        settings = replaced(settings, "device_roots", "[" + json.quote(fixtures.path(certs, "ca", "der")) + ", " + json.quote(fixtures.path(certs, "ca-next", "der")) + "]")
+        settings = replaced(settings, "gateway_roots", "[" + json.quote(fixtures.path(certs, "gateway-ca", "der")) + ", " + json.quote(fixtures.path(certs, "gateway-ca-next", "der")) + "]")
+    }
+    lab.settings = settings
+    writeTextFile(directory + "/edge.json", render(settings))
+    lab.edge = direct(labContext, [binary, directory + "/edge.json", Text(setup.duration)], "/dev/null", "edge")
+    lab.running = true
+    lab.edgeReader = reader(lab.edge.log)
+    let ready = nextLine(lab.edgeReader, 15000)
+    require(lab, fixtures.starts(ready, "READY "), "edge did not become ready: " + ready + "\n" + diagnostic(lab))
+    let ports = fixtures.split(ready, 32)
+    lab.udpPort = fixtures.number(ports[1])
+    lab.devicePort = fixtures.number(ports[2])
+    lab.gatewayPort = fixtures.number(ports[3])
+    writeSource(lab)
+    return lab
+}
+function writeSource(lab: Lab) {
+    let context = lab.context
+    let commit = fixtures.value(context.environment, "MINYAR_SOURCE_COMMIT")
+    let origin = "environment"
+    if commit == "" {
+        origin = "git"
+        let found = test.run(["git", "rev-parse", "HEAD"], context.environment, context.root, fixtures.logPath(context, "git"), 30)
+        if found.status == 0 { commit = fixtures.strip(found.output) }
+    }
+    if commit != "" {
+        let valid = Bytes(commit).length == 40
+        for byte in Bytes(commit) { if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { valid = false } }
+        require(lab, valid, "MINYAR_SOURCE_COMMIT must be a full commit SHA")
+    }
+    let listed = fixtures.execute(context, ["sh", "-c", "cd \"$1\" && find library runtime compiler tools -type f \\( -name '*.min' -o -name '*.c' -o -name '*.m' -o -name '*.h' -o -name '*.py' \\) -print0 | sort -z | xargs -0 sha256sum --", "minyar", context.root], 120, "hash sources")
+    let hashes: List<Text> = []
+    for line in test.lines(listed.output) {
+        let parts = fixtures.split(line, 32)
+        hashes.add(json.quote(Text(Bytes(line).slice(66, line.byteLength))) + ": " + json.quote(parts[0]))
+    }
+    let commitValue = "null"
+    let originValue = "\"git-free snapshot\""
+    if commit != "" { commitValue = json.quote(commit); originValue = json.quote(origin) }
+    let asan = fixtures.value(context.environment, "ASAN_OPTIONS")
+    let asanValue = "null"
+    if asan != "" { asanValue = json.quote(asan) }
+    writeTextFile(lab.directory + "/source.json", "{\n  \"commit\": " + commitValue + ",\n  \"commit_source\": " + originValue + ",\n  \"source_sha256\": " + json.quote(digest(context, context.root + "/library/peeredge.min")) +
+        ",\n  \"sources_sha256\": {" + joined(hashes, ", ") + "},\n  \"binary_sha256\": " + json.quote(digest(context, lab.binary)) + ",\n  \"launcher_sha256\": " + json.quote(digest(context, context.root + "/minyar")) +
+        ",\n  \"start\": " + Text(Float(system.wallClockMicroseconds()) / 1000000.0) + ",\n  \"pid\": " + Text(pid(lab.edge)) + ",\n  \"asan_options\": " + asanValue + "\n}\n")
+}
+public function diagnostic(lab: Lab): Text { return Text(files.readFile(lab.edge.log + ".err")) }
+public function require(lab: Lab, condition: Boolean, message: Text) {
+    if condition { return }
+    close(lab)
+    test.check(false, message)
+}
+public function startDevice(lab: Lab, certificate: Text): Device {
+    let index = lab.devices.length
+    let fifo = lab.directory + "/device-" + Text(index) + ".input"
+    fixtures.execute(lab.context, ["mkfifo", fifo], 10, "create device input")
+    let process = direct(lab.context, [lab.device, Text(lab.devicePort), fixtures.path(lab.certs, "ca", "pem"), fixtures.path(lab.certs, certificate, "pem"), fixtures.path(lab.certs, certificate, "key"),
+        "device-a", "exit-a", healthText(lab.health)], fifo, "device")
+    let input = files.open(fifo, files.WRITE)
+    let item = Device { process: process; fifo: fifo; input: input; reader: reader(process.log); closed: false; finished: false; events: [] }
+    lab.devices.add(item)
+    require(lab, input >= 0, "open device input")
+    let ready = nextLine(item.reader, 10000)
+    require(lab, ready == "READY", "device was not ready: " + ready + "\n" + Text(files.readFile(process.log + ".err")))
+    require(lab, waitState(lab, 5000) != "", "device did not reach live state")
+    return item
+}
+public function send(lab: Lab, item: Device, line: Text) {
+    let data = Bytes(line + "\n")
+    require(lab, files.write(item.input, data, 0, data.length) == data.length, "device input write failed")
+}
+public function heartbeat(lab: Lab, item: Device) { send(lab, item, healthText(lab.health)) }
+public function finishDevice(lab: Lab, item: Device): test.Result {
+    if !item.closed {
+        files.close(item.input)
+        item.closed = true
+    }
+    let result = fixtures.settle(item.process, 5000)
+    item.finished = result.status != -1
+    return result
+}
+public function deviceEvent(lab: Lab, item: Device, prefix: Text, milliseconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while system.monotonicNanoseconds() < deadline {
+        let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
+        let line = nextLine(item.reader, max(10, remaining))
+        if line == TIMEOUT { break }
+        item.events.add(line)
+        lab.events.add(line)
+        if fixtures.starts(line, prefix) { return line }
+    }
+    require(lab, false, "device event " + prefix + " not observed")
+    return ""
+}
+public function state(lab: Lab): redis.Reply { return redis.command(lab.client, ["GET", "peer:live:{exit-a}"]) }
+public function waitState(lab: Lab, milliseconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while system.monotonicNanoseconds() < deadline {
+        let reply = state(lab)
+        if reply.kind == redis.BULK { return Text(reply.data) }
+        fixtures.pause("0.02")
+    }
+    return ""
+}
+public function stateNumber(text: Text, name: Text): Float { return json.member(json.parse(text), name).number }
+public function signedClaims(lab: Lab, connection: Text, overrides: List<List<Text>>): Bytes {
+    let now = fixtures.nowSeconds()
+    let claims = grants.put(grants.put(grants.put(grants.put(grants.put(grants.put(grants.put(grants.fields(), "iss", grants.quote("proxy-gateway")), "exit_id", grants.quote("exit-a")),
+        "conn_id", grants.quote(connection)), "target_host", grants.quote("echo.example")), "port", "443"), "iat", Text(now)), "exp", Text(now + 30))
+    for pair in overrides { claims = grants.put(claims, pair[0], pair[1]) }
+    return grants.withClaims(lab.signer, claims)
+}
+public function signed(lab: Lab, connection: Text): Bytes { return signedClaims(lab, connection, []) }
+public function completed(lab: Lab, milliseconds: Integer): List<Text> {
+    let result = fixtures.settle(lab.edge, milliseconds)
+    lab.running = result.status == -1
+    writeTextFile(lab.directory + "/edge.stdout", result.output)
+    require(lab, result.status == 0, "edge exit " + Text(result.status) + "\n" + diagnostic(lab))
+    require(lab, result.errorOutput == "", "edge diagnostics\n" + result.errorOutput)
+    return test.lines(result.output)
+}
+public function counts(lines: List<Text>): List<Setting> {
+    let result: List<Setting> = []
+    for line in lines {
+        if fixtures.starts(line, "EDGE_COUNTS ") {
+            let parts = fixtures.split(line, 32)
+            for index in 1..parts.length {
+                let pair = fixtures.split(parts[index], 61)
+                result.add(Setting { name: pair[0]; value: pair[1] })
+            }
+            return result
+        }
+    }
+    test.check(false, "edge did not report EDGE_COUNTS")
+    return result
+}
+public function count(values: List<Setting>, name: Text): Integer {
+    let text = setting(values, name)
+    test.check(text != "", "missing edge count " + name)
+    return fixtures.number(text)
+}
+public function describe(values: List<Setting>): Text {
+    let parts: List<Text> = []
+    for item in values { parts.add(item.name + "=" + item.value) }
+    return joined(parts, " ")
+}
+public function rss(process: fixtures.Process): Integer {
+    for line in test.lines(Text(files.readFile("/proc/" + Text(pid(process)) + "/status"))) {
+        if fixtures.starts(line, "VmRSS:") { return fixtures.number(test.words(line)[1]) }
+    }
+    test.check(false, "process RSS unavailable")
+    return 0
+}
+public function close(lab: Lab) {
+    for item in lab.devices {
+        if !item.closed {
+            files.close(item.input)
+            item.closed = true
+        }
+        if !item.finished {
+            fixtures.stop(item.process)
+            item.finished = true
+        }
+    }
+    if lab.running {
+        let edgePid = pid(lab.edge)
+        if edgePid > 0 { system.sendSignal(edgePid, 9) }
+        fixtures.collect(lab.edge)
+        lab.running = false
+        let pending: List<Text> = []
+        while true {
+            let line = poll(lab.edgeReader)
+            if line == "" { break }
+            pending.add(line)
+        }
+        if pending.length > 0 { writeTextFile(lab.directory + "/edge.partial.stdout", joinText(pending)) }
+    }
+    for index in 0..lab.devices.length {
+        let item = lab.devices[index]
+        while true {
+            let line = poll(item.reader)
+            if line == "" { break }
+            item.events.add(Text(Bytes(line).slice(0, line.byteLength - 1)))
+        }
+        let quoted: List<Text> = []
+        for line in item.events { quoted.add(json.quote(line)) }
+        writeTextFile(lab.directory + "/device-" + Text(index) + ".events.json", "[" + joined(quoted, ", ") + "]")
+    }
+    lab.devices = []
+    if lab.connected {
+        redis.close(lab.client)
+        lab.connected = false
+        fixtures.stop(lab.redis)
+    }
+}
+public record Session { process: fixtures.Process; connection: Integer; buffer: Bytes }
+public function peerBinary(lab: Lab): Text { return fixtures.valueOr(lab.context.environment, "MINYAR_PEERGRPC", lab.context.root + "/build/peergrpc-peer") }
+public function session(lab: Lab, certificate: Text): Session {
+    let process = fixtures.launch(lab.context, [peerBinary(lab), "session", "localhost:" + Text(lab.gatewayPort), fixtures.path(lab.certs, "ca", "pem"), fixtures.path(lab.certs, certificate, "pem"), fixtures.path(lab.certs, certificate, "key")], 3600)
+    let line = fixtures.firstLine(lab.context, process, 15000)
+    require(lab, fixtures.starts(line, "READY "), "independent gRPC session did not start: " + line + "\n" + Text(files.readFile(process.log + ".err")))
+    let connection = net.connect("127.0.0.1", fixtures.number(fixtures.split(line, 32)[1]))
+    require(lab, connection >= 0, "connect to independent gRPC session")
+    return Session { process: process; connection: connection; buffer: Bytes() }
+}
+public function ask(lab: Lab, item: Session, request: Text, milliseconds: Integer): json.Value {
+    let data = Bytes(request + "\n")
+    let offset = 0
+    while offset < data.length {
+        let written = net.writeRange(item.connection, data, offset, data.length - offset)
+        require(lab, written > 0, "independent gRPC session closed")
+        offset += written
+    }
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while true {
+        for index in 0..item.buffer.length {
+            if item.buffer[index] == 10 {
+                let line = Text(item.buffer.slice(0, index))
+                item.buffer = item.buffer.slice(index + 1, item.buffer.length)
+                return json.parse(line)
+            }
+        }
+        let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
+        require(lab, remaining > 0 && net.ready(item.connection, remaining), "independent gRPC session did not answer " + request)
+        let part = net.receive(item.connection, 1048576)
+        require(lab, part.length > 0, "independent gRPC session ended\n" + Text(files.readFile(item.process.log + ".err")))
+        item.buffer.addBytes(part)
+    }
+    return json.parse("{}")
+}
+public function endSession(lab: Lab, item: Session) {
+    net.close(item.connection)
+    let finished = fixtures.settle(item.process, 10000)
+    if finished.status == -1 { fixtures.stop(item.process) }
+    require(lab, finished.status == 0 && finished.errorOutput == "", "independent gRPC session exit (" + Text(finished.status) + ")\n" + finished.errorOutput)
+}
+public function openFields(token: Bytes, exit: Text, connection: Text): Text {
+    return "\"grant\": " + json.quote(fixtures.hex(token)) + ", \"exit\": " + json.quote(exit) + ", \"conn\": " + json.quote(connection)
+}
+public function call(lab: Lab, item: Session, token: Bytes, exit: Text, connection: Text, hold: Integer, timeout: Integer): json.Value {
+    return ask(lab, item, "{\"op\": \"call\", " + openFields(token, exit, connection) + ", \"hold_ms\": " + Text(hold) + ", \"timeout_ms\": " + Text(timeout) + "}", timeout + 10000)
+}
+public function messages(result: json.Value): List<json.Value> { return json.member(result, "messages").items }
+public function status(result: json.Value): Text { return json.string(result, "status") }
+public function tokenDigest(lab: Lab, token: Bytes): Text {
+    let path = lab.directory + "/logs/token"
+    writeBytesFile(path, token)
+    return digest(lab.context, path)
+}
+public function transfer(lab: Lab, item: Session, connection: Text, payload: Bytes, target: Text, timeout: Integer): Text {
+    let token = signedClaims(lab, connection, [["target_host", grants.quote(target)]])
+    let result = ask(lab, item, "{\"op\": \"transfer\", " + openFields(token, "exit-a", connection) + ", \"payload\": " + json.quote(fixtures.hex(payload)) +
+        ", \"banner\": \"00ff80010d0a\", \"tail\": \"00fe7f00\", \"timeout_ms\": " + Text(timeout) + "}", timeout + 10000)
+    let summary = connection + " " + json.pretty(result, "")
+    require(lab, json.string(result, "error") == "", "transfer failed " + summary)
+    require(lab, json.string(result, "first") == "status" && Integer(json.member(result, "code").number) == 0, "edge did not admit independently signed open " + summary)
+    require(lab, json.member(result, "match").truth && json.string(result, "status") == "OK", "relay bytes or status " + summary)
+    return tokenDigest(lab, token)
+}
+public function number4(data: Bytes, at: Integer): Integer { return (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3] }
+public function base64(data: Bytes): Text {
+    let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    let result = Bytes()
+    let index = 0
+    while index < data.length {
+        let remaining = data.length - index
+        let value = data[index] << 16
+        if remaining > 1 { value = value | (data[index + 1] << 8) }
+        if remaining > 2 { value = value | data[index + 2] }
+        result.add(alphabet[(value >> 18) & 63])
+        result.add(alphabet[(value >> 12) & 63])
+        if remaining > 1 { result.add(alphabet[(value >> 6) & 63]) } else { result.add(61) }
+        if remaining > 2 { result.add(alphabet[value & 63]) } else { result.add(61) }
+        index += 3
+    }
+    return Text(result)
+}
+public function recorded(context: fixtures.Context, directory: Text, command: List<Text>, seconds: Integer): Text {
+    let result = fixtures.run(context, command, seconds)
+    let argv: List<Text> = []
+    for item in command { argv.add(json.quote(item)) }
+    let handle = files.open(directory + "/commands.jsonl", files.WRITE + files.CREATE + files.APPEND)
+    test.check(handle >= 0, "open command record")
+    let line = Bytes("{\"argv\": [" + joined(argv, ", ") + "], \"returncode\": " + Text(result.status) + ", \"stdout_base64\": " + json.quote(base64(Bytes(result.output))) +
+        ", \"stderr_base64\": " + json.quote(base64(Bytes(result.errorOutput))) + "}\n")
+    test.check(files.write(handle, line, 0, line.length) == line.length && files.close(handle) == 0, "write command record")
+    test.check(result.status == 0, "command failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    test.check(result.errorOutput == "", result.errorOutput)
+    return result.output
+}

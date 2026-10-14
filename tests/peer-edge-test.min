@@ -1,0 +1,211 @@
+use "./net-fixtures.min" as fixtures
+use "./net-redis.min" as redis
+use "./peer-edge-lab.min" as lab
+use "./peer-grants.min" as grants
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+
+record Run { context: fixtures.Context; directory: Text; device: Text; certs: fixtures.Authority; devicePort: Integer; health: lab.Health; devices: List<lab.Device>; redis: fixtures.Process; redisPort: Integer; client: redis.Client; edge: fixtures.Process; edgeRunning: Boolean }
+
+function cleanup(run: Run) {
+    for item in run.devices {
+        if !item.closed {
+            files.close(item.input)
+            item.closed = true
+        }
+        if !item.finished {
+            fixtures.stop(item.process)
+            item.finished = true
+        }
+    }
+    run.devices = []
+    if run.edgeRunning {
+        let stopped = fixtures.stop(run.edge)
+        run.edgeRunning = false
+        test.check(!test.contains(stopped.errorOutput, "ERROR: AddressSanitizer") && !test.contains(stopped.errorOutput, "runtime error:"), "edge sanitizer diagnostics\n" + stopped.errorOutput)
+    }
+    if run.client.connection >= 0 {
+        redis.close(run.client)
+        run.client.connection = -1
+    }
+    if run.redis.handle > 0 {
+        fixtures.stop(run.redis)
+        run.redis.handle = 0
+    }
+}
+function require(run: Run, condition: Boolean, message: Text) {
+    if condition { return }
+    cleanup(run)
+    test.check(false, message)
+}
+function connect(run: Run): redis.Client {
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while system.monotonicNanoseconds() < deadline {
+        let connection = net.connect("127.0.0.1", run.redisPort)
+        if connection >= 0 { return redis.Client { connection: connection; buffer: Bytes() } }
+        fixtures.pause("0.02")
+    }
+    require(run, false, "Redis did not accept connections")
+    return redis.Client { connection: -1; buffer: Bytes() }
+}
+function startRedis(run: Run) {
+    run.redis = lab.direct(run.context, ["redis-server", "--bind", "127.0.0.1", "--port", Text(run.redisPort), "--save", "", "--appendonly", "no", "--dir", run.directory], "/dev/null", "redis")
+    run.client = connect(run)
+}
+function stateText(run: Run): Text {
+    let reply = redis.command(run.client, ["GET", "peer:live:{exit-a}"])
+    if reply.kind == redis.BULK { return Text(reply.data) }
+    return ""
+}
+function eventuallyState(run: Run, message: Text): Text {
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while system.monotonicNanoseconds() < deadline {
+        let text = stateText(run)
+        if text != "" { return text }
+        fixtures.pause("0.02")
+    }
+    require(run, false, message)
+    return ""
+}
+function field(text: Text, name: Text): json.Value { return json.member(json.parse(text), name) }
+function weightBecomes(run: Run, expected: Float) {
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while system.monotonicNanoseconds() < deadline {
+        let text = stateText(run)
+        if text != "" && field(text, "capacity_weight").number == expected { return }
+        fixtures.pause("0.02")
+    }
+    require(run, false, "capacity weight did not become " + Text(expected))
+}
+function device(run: Run, certificate: Text): lab.Device {
+    let index = run.devices.length
+    let fifo = run.directory + "/device-" + Text(index) + ".input"
+    fixtures.execute(run.context, ["mkfifo", fifo], 10, "create device input")
+    let process = lab.direct(run.context, [run.device, Text(run.devicePort), fixtures.path(run.certs, "ca", "pem"), fixtures.path(run.certs, certificate, "pem"), fixtures.path(run.certs, certificate, "key"),
+        "device-a", "exit-a", lab.healthText(run.health)], fifo, "device")
+    let input = files.open(fifo, files.WRITE)
+    let item = lab.Device { process: process; fifo: fifo; input: input; reader: lab.reader(process.log); closed: false; finished: false; events: [] }
+    run.devices.add(item)
+    require(run, input >= 0, "open device input")
+    let ready = lab.nextLine(item.reader, 10000)
+    require(run, ready == "READY", "device was not ready: " + ready + "\n" + Text(files.readFile(process.log + ".err")))
+    return item
+}
+function send(run: Run, item: lab.Device, line: Text) {
+    let data = Bytes(line + "\n")
+    require(run, files.write(item.input, data, 0, data.length) == data.length, "device input write failed")
+}
+function integration(context: fixtures.Context, binary: Text) {
+    let directory = context.work + "/integration"
+    fixtures.execute(context, ["mkdir", "-p", directory + "/logs"], 10, "create integration directory")
+    let runContext = fixtures.Context { root: context.root; work: directory + "/logs"; environment: context.environment; serial: 0; sanitize: context.sanitize }
+    test.check(fixtures.run(runContext, ["sh", "-c", "command -v redis-server"], 10).status == 0, "redis-server is required")
+    test.check(fixtures.run(runContext, ["sh", "-c", "command -v go"], 10).status == 0, "Go is required for the independent device")
+    let device = directory + "/independent-device"
+    test.require(test.run(["go", "build", "-trimpath", "-o", device, "."], runContext.environment, context.root + "/tests/interop/peeredge", fixtures.logPath(runContext, "device-build"), 120), "build independent device")
+    let certs = fixtures.authority(runContext, directory)
+    fixtures.root(certs, "ca")
+    fixtures.leaf(certs, "server", "ca", fixtures.ec("serverAuth"))
+    for pair in [["device", "URI:hearth://device/device-a"], ["wrong-device", "URI:hearth://device/device-b"]] {
+        let identity = fixtures.ec("clientAuth")
+        identity.san = pair[1]
+        fixtures.leaf(certs, pair[0], "ca", identity)
+    }
+    fixtures.leaf(certs, "gateway", "ca", fixtures.ec("clientAuth"))
+    writeTextFile(directory + "/registry.ndjson", "{\"role\": \"device\", \"device_id\": \"device-a\", \"exit_id\": \"exit-a\", \"revoked\": false, \"paused\": false, \"quarantined\": false, \"max_concurrent\": 8}\n" +
+        "{\"role\": \"gateway\", \"sha256\": " + json.quote(lab.digest(runContext, fixtures.path(certs, "gateway", "der"))) + "}\n")
+    writeTextFile(directory + "/jwks.json", "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"pop-1\",\"alg\":\"EdDSA\",\"use\":\"sig\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}]}")
+    let run = Run { context: runContext; directory: directory; device: device; certs: certs; devicePort: 0; health: lab.Health { inFlight: 0; maxConcurrent: 99; paused: false }; devices: [];
+        redis: fixtures.Process { handle: 0; log: ""; line: "" }; redisPort: redis.reservePort(); client: redis.Client { connection: -1; buffer: Bytes() };
+        edge: fixtures.Process { handle: 0; log: ""; line: "" }; edgeRunning: false }
+    startRedis(run)
+    let settings = [lab.Setting { name: "host"; value: "\"127.0.0.1\"" }, lab.Setting { name: "device_port"; value: "0" }, lab.Setting { name: "gateway_port"; value: "0" },
+        lab.Setting { name: "redis_host"; value: "\"127.0.0.1\"" }, lab.Setting { name: "redis_port"; value: Text(run.redisPort) }, lab.Setting { name: "edge_instance"; value: "\"localhost:0\"" },
+        lab.Setting { name: "edge_region"; value: "\"eu-west\"" }, lab.Setting { name: "max_connections"; value: "128" },
+        lab.Setting { name: "certificate"; value: json.quote(fixtures.path(certs, "server", "der")) }, lab.Setting { name: "private_key"; value: json.quote(fixtures.path(certs, "server", "pk8")) },
+        lab.Setting { name: "device_roots"; value: json.quote(fixtures.path(certs, "ca", "der")) }, lab.Setting { name: "gateway_roots"; value: json.quote(fixtures.path(certs, "ca", "der")) },
+        lab.Setting { name: "registry"; value: json.quote(directory + "/registry.ndjson") }, lab.Setting { name: "jwks"; value: json.quote(directory + "/jwks.json") }]
+    writeTextFile(directory + "/edge.json", lab.render(settings))
+    run.edge = lab.direct(runContext, [binary, directory + "/edge.json", "10000"], "/dev/null", "edge")
+    run.edgeRunning = true
+    let ready = lab.nextLine(lab.reader(run.edge.log), 10000)
+    require(run, fixtures.starts(ready, "READY "), "edge did not become ready: " + ready)
+    let ports = fixtures.split(ready, 32)
+    let udpPort = fixtures.number(ports[1])
+    run.devicePort = fixtures.number(ports[2])
+    let gatewayPort = fixtures.number(ports[3])
+    require(run, udpPort == run.devicePort && gatewayPort > 0, "edge listener ports " + ready)
+    let first = device(run, "device")
+    let state = eventuallyState(run, "first device did not publish live state")
+    require(run, json.string(json.parse(state), "exit_id") == "exit-a" && json.string(json.parse(state), "edge_instance") == "localhost:" + Text(gatewayPort) && json.string(json.parse(state), "edge_region") == "eu-west", "live route\n" + state)
+    require(run, field(state, "capacity_weight").number == 1.0 && field(state, "in_flight").number == 0.0 && field(state, "max_concurrent").number == 8.0, "live capacity\n" + state)
+    let ttl = redis.command(run.client, ["PTTL", "peer:live:{exit-a}"])
+    require(run, ttl.kind == redis.INTEGER && ttl.integer >= 43000 && ttl.integer <= 45000, "live state TTL " + Text(ttl.integer))
+    let originalEpoch = json.string(json.parse(state), "_epoch")
+    run.health.paused = true
+    send(run, first, lab.healthText(run.health))
+    require(run, lab.nextLine(first.reader, 5000) == "SENT", "paused heartbeat was not sent")
+    weightBecomes(run, 0.0)
+    redis.close(run.client)
+    run.client.connection = -1
+    fixtures.stop(run.redis)
+    run.redis.handle = 0
+    startRedis(run)
+    let reclaimed = eventuallyState(run, "live state was not reclaimed after the Redis outage")
+    require(run, json.string(json.parse(reclaimed), "_epoch") != originalEpoch && field(reclaimed, "capacity_weight").number == 0.0, "reclaimed state\n" + reclaimed)
+    originalEpoch = json.string(json.parse(reclaimed), "_epoch")
+    run.health.paused = false
+    let second = device(run, "device")
+    let replacement = ""
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while replacement == "" && system.monotonicNanoseconds() < deadline {
+        let text = stateText(run)
+        if text != "" && json.string(json.parse(text), "_epoch") != originalEpoch { replacement = text } else { fixtures.pause("0.02") }
+    }
+    require(run, replacement != "" && field(replacement, "capacity_weight").number == 1.0, "replacement owner\n" + replacement)
+    send(run, first, "close")
+    files.close(first.input)
+    first.closed = true
+    first.finished = fixtures.settle(first.process, 5000).status != -1
+    fixtures.pause("0.1")
+    let current = stateText(run)
+    require(run, current != "" && json.string(json.parse(current), "_epoch") == json.string(json.parse(replacement), "_epoch"), "delayed disconnect deleted the replacement owner")
+    send(run, second, "halfclose")
+    require(run, lab.nextLine(second.reader, 5000) == "HALFCLOSED", "half-close was not acknowledged")
+    let absent = false
+    deadline = system.monotonicNanoseconds() + 5000000000
+    while !absent && system.monotonicNanoseconds() < deadline {
+        absent = stateText(run) == ""
+        if !absent { fixtures.pause("0.02") }
+    }
+    require(run, absent, "half-closed device kept live state")
+    device(run, "wrong-device")
+    fixtures.pause("0.2")
+    require(run, stateText(run) == "", "different URI SAN impersonated a registered device")
+    require(run, system.poll(run.edge.handle).state == system.PENDING, "invalid device killed the edge process")
+    let finished = fixtures.settle(run.edge, 12000)
+    run.edgeRunning = finished.status == -1
+    require(run, finished.status == 0, "edge exit " + Text(finished.status) + "\n" + finished.errorOutput)
+    require(run, !test.contains(finished.errorOutput, "ERROR: AddressSanitizer") && !test.contains(finished.errorOutput, "runtime error:"), "edge sanitizer diagnostics\n" + finished.errorOutput)
+    print("Peer edge: actual TLS/yamux mTLS admission, fragmented control, heartbeats, fencing, half-close and identity rejection passed")
+    cleanup(run)
+}
+
+fixtures.arguments(["--sanitize"], [])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+if sanitize { context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1") }
+let binary = context.work + "/peer-edge"
+fixtures.compileProgram(context, "examples/peer-edge.min", binary)
+let invalid = [Bytes("{}"), Bytes("{\"host\":"), fixtures.unhex("ff"), Bytes("[]")]
+for data in invalid {
+    writeBytesFile(context.work + "/invalid.json", data)
+    let result = fixtures.run(context, [binary, context.work + "/invalid.json", "1000"], 5)
+    test.check(result.status == 2 && test.contains(result.output, "invalid edge configuration"), "malformed configuration " + fixtures.hex(data) + " (" + Text(result.status) + ")\n" + result.output)
+}
+print("Peer edge: malformed startup configuration returns a normal failure")
+integration(context, binary)
+fixtures.finish(context)
