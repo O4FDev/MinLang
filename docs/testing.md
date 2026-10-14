@@ -375,7 +375,7 @@ compiler/runtime/module suite, and Windows runs that portable suite under
 UCRT64. The portable gate includes the byte-identical compiler fixed point,
 feature conformance, exact diagnostic snapshots, deterministic grammar fuzzing,
 and graceful compiler/program stack exhaustion. Windows selects the portable
-`peer-regressions.py` suite; the extended peer suites include POSIX-only allocator
+`peer-regressions.min` suite; the extended peer suites include POSIX-only allocator
 and incremental-driver probes and run in the Linux matrix and macOS gate.
 
 The Linux matrix also runs incremental-module correctness natively and with
@@ -690,13 +690,13 @@ These probes use the system heap and bounded reference-count cleanup. Their
 transcript comparison checks native/sanitizer agreement; it is not an independent
 reference scheduler. Failures retain command, source and output evidence.
 
-The peer regression gates execute four suites: `peer-regressions.py`,
-`peer-cpp-java-js.py`, `peer-rust-go-zig.py`, and
-`peer-python-swift-ruby-lua.py`. `check-peer-optimizations` runs executable cases
+The peer regression gates execute four suites: `peer-regressions.min`,
+`peer-cpp-java-js.min`, `peer-rust-go-zig.min`, and
+`peer-python-swift-ruby-lua.min`. `check-peer-optimizations` runs executable cases
 at O0/O2/O3/Os; compile-only cases stay frontend checks. `check-peer-sanitize`
 uses the sanitized compiler and production runtime at O0/O2, and
 `check-peer-ownership` selects the validated lifetime/cleanup cases. The peer
-manifest discovers direct `CompilerTestCase` subclasses in `peer-*.py` so omitting
+manifest discovers every `peer-*.min` suite that calls `peer.begin` so omitting
 an entire suite from its declarations fails validation.
 
 Unicode filename vectors preserve upstream platform guards. Normalization-sensitive
