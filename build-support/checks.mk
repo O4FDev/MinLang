@@ -30,7 +30,7 @@ check-foundation-baseline: build/minyarc build/testing/cycle-runtime.o build/too
 
 check check-portable: check-foundation-baseline
 
-check-memory-contracts: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/recursive-data build/tooling/tests/production-memory
+check-memory-contracts: build/minyarc build/tooling/tests/memory-contracts build/tooling/tests/ownership build/tooling/tests/recursive-data build/tooling/tests/production-memory build/tooling/tests/regressions build/tooling/tests/adversarial
 	$(LIMITED) ./build/tooling/tests/memory-contracts
 
 build/tooling/tests/memory-contracts-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
