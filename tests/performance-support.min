@@ -112,6 +112,87 @@ public function capture(command: List<Text>, log: Text): test.Result {
     if status.error != 0 { code = status.error }
     return test.Result { status: code; output: readTextFile(log); errorOutput: readTextFile(log + ".err") }
 }
+public function timed(command: List<Text>, log: Text, seconds: Integer): Outcome {
+    let stdout = files.open(log, files.WRITE | files.CREATE | files.TRUNCATE)
+    let stderr = files.open(log + ".err", files.WRITE | files.CREATE | files.TRUNCATE)
+    test.check(stdout >= 0 && stderr >= 0, "timed capture files")
+    let savedOut = duplicate(1); let savedErr = duplicate(2)
+    test.check(savedOut >= 0 && savedErr >= 0, "timed capture saved descriptors")
+    let before = usage(); let started = system.monotonicNanoseconds()
+    test.check(duplicateTo(stdout, 1) == 1 && duplicateTo(stderr, 2) == 2, "timed capture descriptors")
+    let handle = system.spawn(command[0], command, system.environment(), "")
+    test.check(duplicateTo(savedOut, 1) == 1 && duplicateTo(savedErr, 2) == 2, "restore timed capture descriptors")
+    let watchdog = 0
+    if handle > 0 {
+        watchdog = system.spawn("/bin/sh", ["sh", "-c", "trap 'kill \"$sleeper\" 2>/dev/null; exit 0' TERM; sleep \"$1\" & sleeper=$!; wait \"$sleeper\"; kill -KILL \"$2\" 2>/dev/null", "minyar", Text(seconds), Text(system.childProcessId(handle))], system.environment(), "")
+    }
+    let status = system.ProcessStatus { state: system.WAIT_ERROR; exitCode: 0; signal: 0; error: handle }
+    if handle > 0 { status = system.wait(handle) }
+    let stopped = system.monotonicNanoseconds(); let after = usage()
+    let timedOut = false
+    if watchdog > 0 {
+        let watched = system.poll(watchdog)
+        if watched.state == system.PENDING { system.sendSignal(system.childProcessId(watchdog), 15); system.wait(watchdog) }
+        else { timedOut = status.state == system.SIGNALED && status.signal == 9 }
+    }
+    test.check(files.close(savedOut) == 0 && files.close(savedErr) == 0 && files.close(stdout) == 0 && files.close(stderr) == 0, "timed descriptor cleanup")
+    test.check(handle <= 0 || watchdog > 0, "timed process watchdog launch failed")
+    if timedOut { return failure(joined(command, " ") + " timed out after " + Text(seconds) + " seconds: " + readTextFile(log + ".err")) }
+    if handle <= 0 { return failure("process launch failed: " + command[0]) }
+    if status.error != 0 || status.state != system.EXITED || status.exitCode != 0 { return failure(joined(command, " ") + " failed:\n" + readTextFile(log + ".err")) }
+    let cpu = data.nullValue()
+    if before.error == 0 && after.error == 0 { cpu = data.decimal(Float(after.userMicroseconds + after.systemMicroseconds - before.userMicroseconds - before.systemMicroseconds) / 1000.0) }
+    return success(data.object(["cpu_ms", "wall_ms"], [cpu, data.decimal(Float(stopped - started) / 1000000.0)]))
+}
+public function executable(name: Text, log: Text): Text {
+    if test.contains(name, "/") { return name }
+    let located = capture(["/bin/sh", "-c", "command -v \"$1\"", "minyar", name], log)
+    test.require(located, "locate " + name)
+    let found = test.lines(located.output)
+    test.check(found.length == 1 && data.starts(found[0], "/"), name + " not found")
+    return found[0]
+}
+public function darwin(log: Text): Boolean {
+    let platform = capture(["/usr/bin/uname", "-s"], log); test.require(platform, "platform name")
+    return test.lines(platform.output)[0] == "Darwin"
+}
+public function replaceFirst(source: Text, needle: Text, replacement: Text): Text {
+    let raw = Bytes(source); let pattern = Bytes(needle)
+    test.check(pattern.length > 0 && pattern.length <= raw.length, "replacement site")
+    for start in 0..(raw.length - pattern.length + 1) {
+        let same = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { same = false; break } }
+        if same { return Text(raw.slice(0, start)) + replacement + Text(raw.slice(start + pattern.length, raw.length)) }
+    }
+    fail("replacement site not found: " + needle)
+    return source
+}
+public record Graph { entry: Text; expected: Text }
+public function generate(directory: Text, shape: Text, count: Integer, functions: Integer, statements: Integer): Graph {
+    test.check(files.makeDirectory(directory) == 0, "graph directory")
+    let values: List<Integer> = []
+    for index in 0..count {
+        let dependencies: List<Integer> = []
+        if shape == "chain" { if index > 0 { dependencies.add(index - 1) } }
+        else if shape == "shared" { let start = index - 2; if start < 0 { start = 0 }; for dependency in start..index { dependencies.add(dependency) } }
+        let pieces: List<Text> = []; let expressions: List<Text> = []; let total = 0
+        for dependency in dependencies { pieces.add("use \"./m" + Text(dependency) + ".min\" as d" + Text(dependency) + "\n"); expressions.add("d" + Text(dependency) + ".value()"); total += values[dependency] }
+        for functionIndex in 0..functions {
+            pieces.add("function helper" + Text(functionIndex) + "(input: Integer): Integer {\n    let result = input\n")
+            for unused in 0..statements { pieces.add("    result = result + 1\n") }
+            pieces.add("    return result\n}\n")
+        }
+        let expression = "1"; if expressions.length > 0 { expression = joined(expressions, " + ") } else { total = 1 }
+        pieces.add("public function value(): Integer {\n    let result = (" + expression + ") % 1000\n")
+        for functionIndex in 0..functions { pieces.add("    result = helper" + Text(functionIndex) + "(result)\n") }
+        pieces.add("    return result\n}\n"); values.add(total % 1000 + functions * statements)
+        writeTextFile(directory + "/m" + Text(index) + ".min", joinText(pieces))
+    }
+    let imports: List<Text> = []; let calls: List<Text> = []; let expected = 0
+    for index in 0..count { if shape == "wide" || index == count - 1 { imports.add("use \"./m" + Text(index) + ".min\" as d" + Text(index) + "\n"); calls.add("d" + Text(index) + ".value()"); expected += values[index] } }
+    writeTextFile(directory + "/main.min", joinText(imports) + "function main() {\n    print(" + joined(calls, " + ") + ")\n}\n")
+    return Graph { entry: directory + "/main.min"; expected: Text(expected) + "\n" }
+}
 public record Backend { fixture: Boolean; mode: Text; role: Text; zeroClock: Text; expectedInput: Text; profileFailureAt: Integer; globalFailureAt: Integer; failureDiagnostic: Text; active: Boolean; calls: List<Integer>; unlinks: List<Integer>; validations: List<Integer>; profileCalls: Integer; profileCounts: List<Integer>; behaviorCalls: Integer; wall: Float; cpu: Float; events: List<Text>; commands: List<json.Value> }
 public function backend(fixture: Boolean): Backend { return Backend { fixture: fixture; mode: ""; role: "current"; zeroClock: ""; expectedInput: ""; profileFailureAt: -1; globalFailureAt: -1; failureDiagnostic: ""; active: false; calls: [0, 0]; unlinks: [0, 0]; validations: [0, 0]; profileCalls: 0; profileCounts: [11, 7, 9, 10, 8]; behaviorCalls: 0; wall: 1.0; cpu: 1.0; events: []; commands: [] } }
 public function compilerLLVM(): Text { return "define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n" }

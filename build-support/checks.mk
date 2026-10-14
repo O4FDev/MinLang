@@ -92,8 +92,12 @@ check check-portable: check-json-parser
 check-sanitize: check-json-parser-sanitize
 
 .PHONY: check-module-performance
-check-module-performance: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/module-performance.py
+build/tooling/tests/module-performance.ll: tests/performance-support.min experiments/memory/study-support.min experiments/memory/measurement-stats.min
+build/tooling/tests/module-performance: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/module-performance: TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/module-performance: build/testing/cycle-runtime.o tests/performance-resources.c
+check-module-performance: build/minyarc build/minyar-runtime.o build/tooling/tests/module-performance
+	$(LIMITED) ./build/tooling/tests/module-performance
 
 check: check-module-performance
 

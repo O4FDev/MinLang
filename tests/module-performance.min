@@ -1,0 +1,177 @@
+use "../tools/testing.min" as test
+use "./performance-support.min" as metrics
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+record Options { compiler: Text; clang: Text; sizes: List<Integer>; shapes: List<Text>; functions: Integer; statements: Integer; repeats: Integer; output: Text }
+function method(): Text {
+    return "Benchmark module chains, wide imports, and shared dependencies.\n\nEach fresh-process compilation includes startup and source-to-LLVM work,\nexcluding Clang and linking. Sources are generated and filesystem caches warmed\nbefore measurement. All samples are retained; medians and adjacent-size scaling\nratios are reported. These cases use the ordinary compiler without a cache."
+}
+function parse(root: Text): Options {
+    let result = Options { compiler: root + "/build/minyarc"; clang: test.setting("MINYAR_TEST_CLANG", test.setting("LLVM_CC", "clang")); sizes: [100, 400]; shapes: ["chain", "wide", "shared"]; functions: 4; statements: 12; repeats: 5; output: root + "/build/module-performance.json" }
+    let index = 0
+    while index < argumentCount() {
+        let option = argument(index)
+        if option == "--sizes" || option == "--shapes" {
+            index += 1
+            let sizes: List<Integer> = []; let shapes: List<Text> = []
+            while index < argumentCount() {
+                let value = argument(index); if data.starts(value, "--") { break }
+                if option == "--sizes" { sizes.add(Integer(value)) } else { shapes.add(value) }
+                index += 1
+            }
+            if option == "--sizes" { test.check(sizes.length > 0, "--sizes requires values"); result.sizes = sizes }
+            else { test.check(shapes.length > 0, "--shapes requires values"); result.shapes = shapes }
+            continue
+        }
+        let name = option; let value = ""; let position = -1; let raw = Bytes(option)
+        for offset in 0..raw.length { if raw[offset] == 61 { position = offset; break } }
+        if position >= 0 { name = Text(raw.slice(0, position)); value = Text(raw.slice(position + 1, raw.length)) }
+        else { index += 1; test.check(index < argumentCount(), "option requires value: " + option); value = argument(index) }
+        if name == "--compiler" { result.compiler = value }
+        else if name == "--clang" { result.clang = value }
+        else if name == "--functions" { result.functions = Integer(value) }
+        else if name == "--statements" { result.statements = Integer(value) }
+        else if name == "--repeats" { result.repeats = Integer(value) }
+        else if name == "--output" { result.output = value }
+        else if name == "--sizes" { result.sizes = [Integer(value)] }
+        else if name == "--shapes" { result.shapes = [value] }
+        else { fail("unknown module performance option " + name) }
+        index += 1
+    }
+    let positive = result.repeats >= 1 && result.functions >= 1 && result.statements >= 1
+    for count in result.sizes { if count < 1 { positive = false } }
+    test.check(positive, "sizes, functions, statements and repeats must be positive")
+    for shape in result.shapes { test.check(shape == "chain" || shape == "wide" || shape == "shared", "invalid graph shape " + shape) }
+    return result
+}
+function definitions(llvm: Text): List<Text> {
+    let names: List<Text> = []
+    for line in test.lines(llvm) {
+        if !data.starts(line, "define ") { continue }
+        let raw = Bytes(line); let at = -1
+        for index in 7..raw.length { if raw[index] == 64 { at = index; break } }
+        if at < 0 { continue }
+        let end = at + 1
+        while end < raw.length && raw[end] > 32 && raw[end] != 40 { end += 1 }
+        if end > at + 1 && end < raw.length && raw[end] == 40 { names.add(Text(raw.slice(at + 1, end))) }
+    }
+    return names
+}
+function unquoted(name: Text): Text {
+    let raw = Bytes(name); let start = 0; let end = raw.length
+    while start < end && raw[start] == 34 { start += 1 }
+    while end > start && raw[end - 1] == 34 { end -= 1 }
+    return Text(raw.slice(start, end))
+}
+function fixed(value: Float): Text {
+    let hundredths = Integer(value * 100.0 + 0.5)
+    let fraction = Text(hundredths % 100); if hundredths % 100 < 10 { fraction = "0" + fraction }
+    return Text(hundredths / 100) + "." + fraction
+}
+function padded(value: Text, width: Integer, right: Boolean): Text {
+    let result = value
+    while Bytes(result).length < width { if right { result = " " + result } else { result = result + " " } }
+    return result
+}
+function save(report: json.Value, output: Text) { files.makeDirectory(data.parent(output)); writeTextFile(output, json.pretty(report, "") + "\n") }
+function measured(command: List<Text>, log: Text): json.Value {
+    let result = metrics.timed(command, log, 30)
+    test.check(result.ok, result.error)
+    return result.value
+}
+function main(): Integer {
+    if argumentCount() == 1 && (argument(0) == "--help" || argument(0) == "-h") {
+        print("module-performance [--compiler PATH] [--clang PATH] [--sizes N ...] [--shapes chain wide shared] [--functions N] [--statements N] [--repeats N] [--output PATH]")
+        return 0
+    }
+    let work = test.scratch()
+    let rootResult = metrics.capture(["/bin/pwd", "-P"], work + "/root"); test.require(rootResult, "module performance root")
+    let root = test.lines(rootResult.output)[0]; let options = parse(root)
+    let darwin = metrics.darwin(work + "/platform")
+    let cpu = metrics.usage().error == 0
+    let platform = metrics.capture(["/usr/bin/uname", "-a"], work + "/uname"); test.require(platform, "benchmark platform")
+    let machine = metrics.capture(["/usr/bin/uname", "-m"], work + "/machine"); test.require(machine, "benchmark machine")
+    let config = data.object(["compiler", "clang", "sizes", "shapes", "functions", "statements", "repeats", "output"], [data.text(options.compiler), data.text(options.clang), data.integerArray(options.sizes), data.strings(options.shapes), data.integer(options.functions), data.integer(options.statements), data.integer(options.repeats), data.text(options.output)])
+    let results: List<json.Value> = []; let scaling: List<json.Value> = []
+    let report = data.object(["platform", "machine", "compiler_sha256", "workspace_source_sha256", "method", "config", "results", "scaling"], [data.text(test.lines(platform.output)[0]), data.text(test.lines(machine.output)[0]), json.member(metrics.fileIdentity(options.compiler, work + "/compiler-identity", darwin), "sha256"), json.member(metrics.fileIdentity(root + "/build/compiler.min", work + "/source-identity", darwin), "sha256"), data.text(method()), config, data.array(results), data.array(scaling)])
+    let compiler = work + "/minyarc"; let runtime = work + "/runtime.o"
+    test.require(metrics.capture(["/bin/cp", options.compiler, compiler], work + "/copy-compiler"), "freeze compiler")
+    test.require(metrics.capture(["/bin/chmod", "755", compiler], work + "/chmod-compiler"), "freeze compiler mode")
+    test.require(metrics.capture(["/bin/cp", root + "/build/minyar-runtime.o", runtime], work + "/copy-runtime"), "freeze runtime")
+    let clang = metrics.executable(options.clang, work + "/clang-path")
+    let serial = 0
+    for shape in options.shapes {
+        for count in options.sizes {
+            let directory = work + "/" + shape + "-" + Text(count)
+            let entry = metrics.generate(directory, shape, count, options.functions, options.statements).entry
+            let original = readTextFile(entry); let library = directory + "/m0.min"; let libraryText = readTextFile(library)
+            let llvm = directory + "/program.ll"
+            serial += 1; measured([compiler, entry, llvm], work + "/compile" + Text(serial))
+            let symbols = definitions(readTextFile(llvm)); let seen = Map<Text, Boolean>(); let defined = 0
+            for name in symbols {
+                test.check(!seen.has(name), shape + " " + Text(count) + " duplicate LLVM definition " + name); seen[name] = true
+                if name == "main" || data.starts(unquoted(name), ".minyar.fn.") { defined += 1 }
+            }
+            test.check(defined == count * (options.functions + 1) + 1, shape + " " + Text(count) + " " + Text(defined) + " source definitions")
+            for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit"] {
+                writeTextFile(entry, original); writeTextFile(library, libraryText)
+                if scenario == "entry-edit" { writeTextFile(entry, test.replace(original, "    print(", "    let edited = 1\n    print(")) }
+                else if scenario == "dependency-edit" { writeTextFile(library, metrics.replaceFirst(libraryText, "result = result + 1", "result = result + 2")) }
+                else if scenario == "interface-edit" { writeTextFile(library, libraryText + "\npublic record Added { value: Integer }\n") }
+                serial += 1; measured([compiler, entry, llvm], work + "/compile" + Text(serial))
+                let samples: List<json.Value> = []
+                for repeat in 0..options.repeats { serial += 1; samples.add(measured([compiler, entry, llvm], work + "/compile" + Text(serial))) }
+                let summary = metrics.summarize(samples); test.check(summary.ok, summary.error)
+                let sourceBytes = 0
+                for name in files.list(directory) { if data.ends(name, ".min") { sourceBytes += files.pathSize(directory + "/" + name) } }
+                let cpuMedian = json.member(summary.value, "cpu_ms"); let wallMedian = json.member(summary.value, "wall_ms")
+                if !cpu { cpuMedian = data.nullValue() }
+                results.add(data.object(["shape", "modules", "scenario", "source_bytes", "llvm_bytes", "samples", "cpu_ms", "wall_ms"], [data.text(shape), data.integer(count), data.text(scenario), data.integer(sourceBytes), data.integer(files.pathSize(llvm)), data.array(samples), cpuMedian, wallMedian]))
+                save(report, options.output)
+                let metric = wallMedian.number; let cpuLabel = "unavailable"
+                if cpu { test.check(cpuMedian.kind == json.NUMBER, "child CPU measurement"); metric = cpuMedian.number; cpuLabel = fixed(cpuMedian.number) }
+                test.check(metric <= 5000.0, shape + "/" + Text(count) + "/" + scenario + ": exceeds 5-second compilation ceiling")
+                print(padded(shape, 6, false) + " " + padded(Text(count), 4, true) + " " + padded(scenario, 15, false) + " CPU " + cpuLabel + " ms, wall " + fixed(wallMedian.number) + " ms")
+            }
+        }
+    }
+    for shape in options.shapes {
+        let graph = metrics.generate(work + "/execute-" + shape, shape, 10, options.functions, options.statements)
+        let directory = data.parent(graph.entry); let llvm = directory + "/main.ll"; let program = directory + "/main.exe"
+        measured([compiler, graph.entry, llvm], directory + "/compile")
+        let link = [clang, "-O0", "-Wno-override-module", llvm, runtime, "-o", program]
+        if !darwin { link.add("-lm") }
+        measured(link, directory + "/link")
+        let execution = test.run([program], system.environment(), "", directory + "/run", 30)
+        test.require(execution, shape + " execution")
+        test.check(execution.output == graph.expected, shape + " output " + execution.output + " expected " + graph.expected)
+    }
+    let key = "wall_ms"; if cpu { key = "cpu_ms" }
+    for shape in options.shapes {
+        let rows: List<json.Value> = []
+        for row in results {
+            if json.string(row, "shape") != shape || json.string(row, "scenario") != "unchanged" { continue }
+            let position = rows.length
+            while position > 0 && data.number(rows[position - 1], "modules") > data.number(row, "modules") { position -= 1 }
+            rows.add(row)
+            let moved = rows.length - 1
+            while moved > position { rows[moved] = rows[moved - 1]; moved -= 1 }
+            rows[position] = row
+        }
+        for index in 1..rows.length {
+            let small = rows[index - 1]; let large = rows[index]
+            let smallTime = json.member(small, key).number; let largeTime = json.member(large, key).number
+            let floor = smallTime; if floor < 1.0 { floor = 1.0 }
+            let ratio = largeTime / floor
+            let sizeRatio = Float(data.number(large, "modules")) / Float(data.number(small, "modules"))
+            scaling.add(data.object(["shape", "small", "large", "size_ratio", "time_ratio"], [data.text(shape), data.integer(data.number(small, "modules")), data.integer(data.number(large, "modules")), data.decimal(sizeRatio), data.decimal(ratio)]))
+            if largeTime >= 50.0 && ratio > 2.0 * sizeRatio { save(report, options.output); fail(shape + ": " + fixed(ratio) + "x time for " + fixed(sizeRatio) + "x modules") }
+        }
+    }
+    save(report, options.output)
+    test.removeTree(work)
+    print(options.output)
+    return 0
+}
