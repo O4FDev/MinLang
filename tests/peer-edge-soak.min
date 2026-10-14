@@ -1,0 +1,231 @@
+// Real authenticated gateway/device relay soak; target and driver are sampled separately.
+use "./peer-edge-lab.min" as lab
+use "./soak-observer.min" as soak
+use "./net-fixtures.min" as fixtures
+use "./net-redis.min" as redis
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+
+record Pool { process: fixtures.Process; control: lab.Session; connections: Integer }
+
+function usage(message: Text) {
+    system.writeStandardError("peer-edge-soak: error: " + message + "\n")
+    exit(2)
+}
+function now(): Float { return Float(system.monotonicNanoseconds()) / 1000000000.0 }
+function append(file: Integer, offset: Integer, text: Text): Integer {
+    let data = Bytes(text + "\n")
+    test.check(files.writeAt(file, data, 0, data.length, offset) == data.length, "append soak evidence")
+    return offset + data.length
+}
+function sampleJson(sample: soak.Sample): Text {
+    if !sample.present { return "{}" }
+    return "{\"cpu_seconds\": " + Text(sample.cpuSeconds) + ", \"rss_kib\": " + soak.number(sample.rssKib) + "}"
+}
+function idleGateways(state: lab.Lab, count: Integer, budget: Integer): Pool {
+    let process = fixtures.launch(state.context, [lab.peerBinary(state), "gateway-pool", "127.0.0.1:" + Text(state.gatewayPort), fixtures.path(state.certs, "ca", "pem"),
+        fixtures.path(state.certs, "gateway", "pem"), fixtures.path(state.certs, "gateway", "key"), Text(count)], 86400)
+    let reader = lab.reader(process.log)
+    let ready = ""
+    while ready == "" {
+        let line = lab.nextLine(reader, budget * 1000)
+        lab.require(state, line != lab.TIMEOUT, "idle gateway setup exceeded its startup budget\n" + Text(files.readFile(process.log + ".err")))
+        if fixtures.starts(line, "CONNECTED ") { print(line) }
+        if fixtures.starts(line, "READY ") { ready = line }
+    }
+    let connection = net.connect("127.0.0.1", Integer(fixtures.split(ready, 32)[1]))
+    lab.require(state, connection >= 0, "connect to idle gateway pool")
+    return Pool { process: process; control: lab.Session { process: process; connection: connection; buffer: Bytes() }; connections: count }
+}
+// Proves every retained TLS/H2 socket remains usable without reconnecting.
+function pingGateways(state: lab.Lab, pool: Pool, round: Integer): Integer {
+    let result = lab.ask(state, pool.control, "{\"op\": \"ping\", \"round\": " + Text(round) + "}", 10000 + pool.connections * 10)
+    lab.require(state, json.string(result, "error") == "", "pooled gateways: " + json.string(result, "error"))
+    return Integer(json.member(result, "acks").number)
+}
+function cancelled(state: lab.Lab, gateway: lab.Session, device: lab.Device, identifier: Text) {
+    let holding = lab.ask(state, gateway, "{\"op\": \"hold\", \"name\": " + json.quote(identifier) + ", " + lab.openFields(lab.signed(state, identifier), "exit-a", identifier) + ", \"timeout_ms\": 6000}", 16000)
+    lab.require(state, json.string(holding, "first") == "status" && Integer(json.member(holding, "code").number) == 0, "held soak stream was not admitted " + json.pretty(holding, ""))
+    let found = lab.ask(state, gateway, "{\"op\": \"cancel\", \"name\": " + json.quote(identifier) + "}", 10000)
+    lab.require(state, json.member(found, "found").truth, "held soak stream missing")
+    lab.deviceEvent(state, device, "CANCELLED " + identifier, 5000)
+}
+function malformedGateway(state: lab.Lab) {
+    let result = fixtures.run(state.context, [lab.peerBinary(state), "malformed-gateway", "127.0.0.1:" + Text(state.gatewayPort), fixtures.path(state.certs, "ca", "pem"),
+        fixtures.path(state.certs, "gateway", "pem"), fixtures.path(state.certs, "gateway", "key")], 30)
+    lab.require(state, result.status == 0 && result.output == "SENT\n", "malformed gateway (" + Text(result.status) + ")\n" + result.errorOutput)
+}
+function payloadFor(ordinal: Integer): Bytes {
+    let repeats = 1
+    if ordinal % 31 == 0 { repeats = 256 }
+    let data = Bytes()
+    for copy in 0..repeats { for byte in 0..256 { data.add(byte) } }
+    for shift in [56, 48, 40, 32, 24, 16, 8, 0] { data.add((ordinal >> shift) & 255) }
+    return data
+}
+function sources(context: fixtures.Context, output: Text) {
+    let script = "cd \"$1\" && find library runtime compiler tools tests -type f \\( -name '*.min' -o -name '*.c' -o -name '*.m' -o -name '*.h' -o -name '*.py' -o -name '*.go' -o -name '*.proto' -o -name '*.mod' -o -name '*.sum' \\) | LC_ALL=C sort | while IFS= read -r path; do sha256sum -- \"$path\"; done"
+    let result = fixtures.execute(context, ["/bin/sh", "-c", script, "minyar", context.root], 600, "hash sources")
+    let entries: List<Text> = []
+    for line in test.lines(result.output) {
+        let words = test.words(line)
+        if words.length >= 2 { entries.add("  " + json.quote(Text(Bytes(line).slice(66, line.byteLength))) + ": " + json.quote(words[0])) }
+    }
+    let text = ""
+    for index in 0..entries.length {
+        if index > 0 { text = text + ",\n" }
+        text = text + entries[index]
+    }
+    writeTextFile(output + "/sources.json", "{\n" + text + "\n}\n")
+}
+
+fixtures.arguments(["--sanitize"], ["--seconds", "--connections", "--output", "--startup-budget"])
+let sanitize = fixtures.flag("--sanitize")
+let seconds = Integer(fixtures.option("--seconds", "7200"))
+let connections = Integer(fixtures.option("--connections", "2048"))
+let output = fixtures.option("--output", "")
+if output == "" { usage("the following arguments are required: --output") }
+soak.requireRemoteLab()
+if seconds < 30 || seconds > 82800 || connections < 1 || connections > 20000 { usage("seconds30..82800;connections1..20000") }
+let required = connections + 512
+system.raiseOpenFileLimit()
+test.check(system.getSoftLimit(system.OPEN_FILES) >= required, "open file limit below " + Text(required))
+let padding = 30
+if seconds >= 7200 { padding = 600 }
+padding = Integer(fixtures.option("--startup-budget", Text(padding)))
+if padding < 30 || padding > 3600 { usage("startup budget must be30..3600 seconds") }
+test.check(files.pathSize(output) < 0, "output directory already exists: " + output)
+let context = fixtures.context(sanitize)
+if !fixtures.starts(output, "/") { output = context.root + "/" + output }
+fixtures.execute(context, ["mkdir", "-p", output], 10, "create output")
+writeTextFile(output + "/failure.json", "{\n  \"failure\": \"soak stopped before completion\",\n  \"finished\": false,\n  \"sample_count\": 0\n}\n")
+let setup = lab.options("", sanitize, (seconds + padding) * 1000, connections + 32)
+setup.quarantine = sanitize
+let state = lab.create(context, output + "/lab", setup)
+state.context.environment = fixtures.withSetting(state.context.environment, "MINYAR_PEER_DEVICE_HEARTBEAT_MS", "15000")
+let device = lab.startDevice(state, "device")
+let setupStarted = now()
+let pool = idleGateways(state, connections, padding)
+let setupSeconds = now() - setupStarted
+lab.require(state, setupSeconds <= Float(padding), "gateway setup exhausted separate startup budget " + Text(setupSeconds))
+print("SETUP {\"seconds\": " + Text(setupSeconds) + ", \"budget\": " + Text(padding) + ", \"connections\": " + Text(connections) + "}")
+let pingRound = 0
+let pingAcks = pingGateways(state, pool, pingRound)
+sources(context, output)
+let gateway = lab.session(state, "gateway")
+let evidence = files.open(output + "/samples.jsonl", files.WRITE | files.CREATE | files.TRUNCATE)
+test.check(evidence >= 0, "create samples")
+let offset = 0
+let summary = soak.summary(5.0)
+if seconds >= 7200 { summary = soak.summary(60.0) }
+let started = now()
+let lastSample = started
+let lastIdleElapsed = -1.0
+let lastIdleCpu = 0.0
+let idleTotal = 0.0
+let idleCount = 0
+let ordinal = 0
+let transactions = 0
+let faults = 0
+let samples = 0
+let edgePid = lab.pid(state.edge)
+let devicePid = lab.pid(device.process)
+while now() - started < Float(seconds) {
+    let elapsed = now() - started
+    // Eight signed RPCs/faults followed by forty seconds of connected idle.
+    let active = Integer(elapsed) % 60 < 20
+    if active {
+        let minute = Integer(elapsed) / 60
+        if minute > pingRound {
+            pingRound = minute
+            pingAcks += pingGateways(state, pool, pingRound)
+        }
+        let identifier = "soak-" + Text(ordinal)
+        ordinal += 1
+        lab.transfer(state, gateway, identifier, payloadFor(ordinal), "echo.example", 10000)
+        transactions += 1
+        if ordinal % 7 == 0 {
+            cancelled(state, gateway, device, "cancel-" + Text(ordinal))
+            faults += 1
+        }
+        if ordinal % 11 == 0 {
+            malformedGateway(state)
+            faults += 1
+        }
+    } else {
+        soak.nap(500)
+    }
+    let current = now()
+    if current - lastSample >= 1.0 {
+        let target = soak.processSample(edgePid)
+        let controller = soak.processSample(system.processId())
+        lab.require(state, system.poll(state.edge.handle).state == system.PENDING, "edge exited during authenticated soak")
+        lab.require(state, system.poll(device.process.handle).state == system.PENDING, "device exited during authenticated soak")
+        // The authoritative live state must survive real 15-second heartbeats.
+        lab.require(state, lab.state(state).kind == redis.BULK, "heartbeat live state expired")
+        let phase = "connected_idle"
+        if active { phase = "active" }
+        let sampled = current - started
+        let row = "{\"connections\": " + Text(connections) + ", \"controller\": " + sampleJson(controller) + ", \"device\": " + sampleJson(soak.processSample(devicePid)) +
+            ", \"elapsed_seconds\": " + Text(sampled) + ", \"faults\": " + Text(faults) + ", \"gateway_ping_acks\": " + Text(pingAcks) + ", \"phase\": " + json.quote(phase) +
+            ", \"target\": " + sampleJson(target) + ", \"transactions\": " + Text(transactions) + "}"
+        if target.present { soak.include(summary, sampled, target.rssKib) }
+        if !active && target.present {
+            if lastIdleElapsed >= 0.0 {
+                idleTotal += (target.cpuSeconds - lastIdleCpu) / (sampled - lastIdleElapsed)
+                idleCount += 1
+            }
+            lastIdleElapsed = sampled
+            lastIdleCpu = target.cpuSeconds
+        } else {
+            lastIdleElapsed = -1.0
+        }
+        offset = append(evidence, offset, row)
+        samples += 1
+        lastSample = current
+        if Integer(elapsed) % 30 == 0 { print("SAMPLE " + row) }
+    }
+    if active { soak.nap(200) }
+}
+pingAcks += pingGateways(state, pool, pingRound + 1)
+let finalPayload = Bytes()
+finalPayload.add(0)
+finalPayload.add(255)
+finalPayload.addBytes(Bytes("healthy after faults"))
+lab.transfer(state, gateway, "final-health", finalPayload, "echo.example", 10000)
+transactions += 1
+files.close(evidence)
+lab.ask(state, pool.control, "{\"op\": \"close\"}", 30000)
+net.close(pool.control.connection)
+fixtures.settle(pool.process, 10000)
+lab.endSession(state, gateway)
+lab.send(state, device, "close")
+lab.require(state, lab.finishDevice(state, device).status == 0, "independent device did not exit cleanly")
+let values = lab.counts(lab.completed(state, (padding + 30) * 1000))
+lab.require(state, lab.count(values, "active") == 0 && lab.count(values, "retained_relays") == 0, "retained peers " + lab.describe(values))
+lab.require(state, lab.count(values, "calls_opened") == lab.count(values, "calls_released"), "calls not released " + lab.describe(values))
+lab.require(state, transactions > 10 && faults > 0, "fault workload did not execute")
+lab.require(state, summary.count > 0, "no independent warm RSS samples")
+lab.require(state, idleCount > 0, "connected idle was never measured")
+let meanIdle = idleTotal / Float(idleCount)
+lab.require(state, meanIdle <= 0.02, "connected idle exceeded 2% of one CPU " + Text(meanIdle))
+if seconds >= 7200 {
+    lab.require(state, summary.high - summary.low <= 16384.0, "RSS span " + soak.summaryJson(summary))
+    lab.require(state, soak.slope(summary) <= 0.2, "RSS slope " + soak.summaryJson(summary))
+}
+let counts: List<Text> = []
+for item in values { counts.add(json.quote(item.name) + ": " + json.quote(item.value)) }
+let summaryFields = soak.summaryJson(summary)
+let report = "{\"status\": 0, \"startup_seconds\": " + Text(setupSeconds) + ", \"startup_budget_seconds\": " + Text(padding) + ", \"seconds_requested\": " + Text(seconds) +
+    ", \"seconds_observed\": " + Text(now() - started) + ", \"connections\": " + Text(connections) + ", \"gateway_ping_acks\": " + Text(pingAcks) + ", \"transactions\": " +
+    Text(transactions) + ", \"faults\": " + Text(faults) + ", \"counts\": {" + lab.joined(counts, ", ") + "}, \"mean_connected_idle_cpu\": " + Text(meanIdle) +
+    ", \"scope\": \"actual certificate-verified mTLS HTTP2 gateway, independent TLS/yamux TCP device fallback, signed-grant relay, cancellation/invalid frames/half-close/binary echo; QUIC is verified separately\"" +
+    ", \"sanitized\": " + Text(sanitize) + ", \"sample_count\": " + Text(samples) + ", " + Text(Bytes(summaryFields).slice(1, Bytes(summaryFields).length - 1)) + "}"
+writeTextFile(output + "/report.json", json.pretty(json.parse(report), "  ") + "\n")
+files.remove(output + "/failure.json")
+print("GREEN " + report)
+lab.close(state)
+fixtures.finish(context)

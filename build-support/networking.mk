@@ -13,11 +13,20 @@ build/tooling/tests/httpserver-front-test.ll build/tooling/benchmarks/httpserver
 build/tooling/tests/http-package-test.ll build/tooling/tests/peer-live-redis-test.ll: tests/net-redis.min
 build/tooling/tests/peer-auth-test.ll build/tooling/tests/peer-wire-flow-test.ll: tests/peer-grants.min
 build/tooling/tests/peer-wire-test.ll build/tooling/tests/redis-protocol-test.ll build/tooling/tests/tls-validity-test.ll: tests/cpython-random.min
+SOAK_TOOLS = soak-observer-test net-soak-driver tls-soak-driver quic-soak peer-edge-soak peer-edge-device-scale
+$(SOAK_TOOLS:%=build/tooling/tests/%.ll): tests/soak-observer.min tests/net-fixtures.min
+build/tooling/tests/soak-observer-test.ll build/tooling/tests/quic-soak.ll: tests/quic-soak-adapter.min
+build/tooling/tests/quic-soak.ll: tests/cpython-random.min
+build/tooling/tests/peer-edge-soak.ll: tests/peer-edge-lab.min tests/net-redis.min tests/peer-grants.min
+build/tooling/tests/peer-edge-device-scale.ll: tests/peer-edge-scale.min tests/net-redis.min
+$(SOAK_TOOLS:%=build/tooling/tests/%): TOOL_NATIVE = tests/soak-observer-native.c runtime/native/net.c
+$(SOAK_TOOLS:%=build/tooling/tests/%): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(SOAK_TOOLS:%=build/tooling/tests/%): build/testing/cycle-runtime.o tests/soak-observer-native.c runtime/native/net.c
 check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
 
-check-net: build/minyarc build/tooling/tests/net-native-test
-	python3 tests/soak-observer-test.py
+check-net: build/minyarc build/tooling/tests/net-native-test build/tooling/tests/soak-observer-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/soak-observer-test
 	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-native-test --mode native --evidence "$$evidence"
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 	@set -eu; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-native-test --mode sanitize --evidence "$$evidence"

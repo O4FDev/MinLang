@@ -1,0 +1,449 @@
+// Remote peer-edge QUIC capacity fixture with independently observed live state.
+// The Rust client uses Quinn/rustls and a distinct URI certificate for every
+// device. A measured connection must be admitted into the real Redis live-state
+// plane and renew its fifteen-second heartbeat. Gateway socket counts cannot
+// satisfy this fixture. Run under the remote host resource supervisor.
+use "./peer-edge-scale.min" as scale
+use "./soak-observer.min" as soak
+use "./net-redis.min" as redis
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+
+record Resp { kind: Integer; integer: Integer; data: Bytes; items: List<Resp>; error: Text }
+record Client { connection: Integer; buffer: Bytes }
+record Options { fixtures: Text; peers: Integer; binary: Text; output: Text; start: Text; seconds: Integer; setup: Integer; host: Text; port: Integer }
+record Point { elapsed: Float; rss: Float; cpu: Float }
+record Run { edge: soak.Child; redisServer: soak.Child; client: Client; connected: Boolean; result: List<Text> }
+
+constant ARRAY = 6
+
+function usage(message: Text) {
+    system.writeStandardError("peer-edge-device-scale: error: " + message + "\n")
+    exit(2)
+}
+function now(): Float { return Float(system.monotonicNanoseconds()) / 1000000000.0 }
+function wallSeconds(): Integer { return system.wallClockMicroseconds() / 1000000 }
+function digest(path: Text): Text {
+    let result = test.run(["sha256sum", "--", path], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-scale-digest-" + Text(system.processId()), 60)
+    test.check(result.status == 0, "hash " + path)
+    return test.words(result.output)[0]
+}
+function append(path: Text, text: Text) {
+    let file = files.open(path, files.WRITE | files.CREATE | files.APPEND)
+    test.check(file >= 0, "open " + path)
+    let data = Bytes(text + "\n")
+    files.write(file, data, 0, data.length)
+    files.close(file)
+}
+
+function fill(client: Client): Boolean {
+    if !net.ready(client.connection, 5000) { return false }
+    let data = net.receive(client.connection, 65536)
+    if data.length == 0 { return false }
+    client.buffer.addBytes(data)
+    return true
+}
+function line(client: Client): Resp {
+    let scanned = 0
+    while true {
+        for index in max(1, scanned)..client.buffer.length {
+            if client.buffer[index - 1] == 13 && client.buffer[index] == 10 {
+                let result = client.buffer.slice(0, index - 1)
+                client.buffer = client.buffer.slice(index + 1, client.buffer.length)
+                return Resp { kind: 0; integer: 0; data: result; items: []; error: "" }
+            }
+        }
+        scanned = client.buffer.length
+        if client.buffer.length > 65537 || !fill(client) { return Resp { kind: 0; integer: 0; data: Bytes(); items: []; error: "truncated RESP line" } }
+    }
+    return Resp { kind: 0; integer: 0; data: Bytes(); items: []; error: "truncated RESP line" }
+}
+function failed(message: Text): Resp { return Resp { kind: 0; integer: 0; data: Bytes(); items: []; error: message } }
+function decimal(raw: Bytes): Integer {
+    let negative = raw.length > 0 && raw[0] == 45
+    let value = 0
+    let start = 0
+    if negative { start = 1 }
+    for index in start..raw.length { value = value * 10 + raw[index] - 48 }
+    if negative { return -value }
+    return value
+}
+// Small independent RESP reader, including SCAN/MGET arrays.
+function readReply(client: Client, depth: Integer): Resp {
+    if depth > 4 { return failed("RESP nesting") }
+    let head = line(client)
+    if head.error != "" { return head }
+    if head.data.length == 0 { return failed("empty RESP line") }
+    let kind = head.data[0]
+    let value = head.data.slice(1, head.data.length)
+    if kind == 43 { return Resp { kind: redis.SIMPLE; integer: 0; data: value; items: []; error: "" } }
+    if kind == 45 { return failed("Redis error: " + Text(value)) }
+    let length = decimal(value)
+    if kind == 58 { return Resp { kind: redis.INTEGER; integer: length; data: Bytes(); items: []; error: "" } }
+    if kind == 36 {
+        if length == -1 { return Resp { kind: redis.NULL; integer: 0; data: Bytes(); items: []; error: "" } }
+        if length < 0 || length > 16777216 { return failed("RESP bulk length") }
+        while client.buffer.length < length + 2 { if !fill(client) { return failed("truncated RESP bulk") } }
+        if client.buffer[length] != 13 || client.buffer[length + 1] != 10 { return failed("truncated RESP bulk") }
+        let data = client.buffer.slice(0, length)
+        client.buffer = client.buffer.slice(length + 2, client.buffer.length)
+        return Resp { kind: redis.BULK; integer: 0; data: data; items: []; error: "" }
+    }
+    if kind == 42 && length >= 0 && length <= 32768 {
+        let items: List<Resp> = []
+        for index in 0..length {
+            let item = readReply(client, depth + 1)
+            if item.error != "" { return item }
+            items.add(item)
+        }
+        return Resp { kind: ARRAY; integer: 0; data: Bytes(); items: items; error: "" }
+    }
+    return failed("unsupported RESP value")
+}
+function command(client: Client, parts: List<Text>): Resp {
+    let encoded: List<Bytes> = []
+    for part in parts { encoded.add(Bytes(part)) }
+    let data = redis.encode(encoded)
+    if net.send(client.connection, data) != data.length { return failed("Redis send failed") }
+    return readReply(client, 0)
+}
+function observe(client: Client, records: List<scale.Observed>): Text {
+    let cursor = "0"
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    while true {
+        let reply = command(client, ["SCAN", cursor, "MATCH", "peer:live:*", "COUNT", "1000"])
+        if reply.error != "" { return reply.error }
+        if reply.kind != ARRAY || reply.items.length != 2 || reply.items[1].kind != ARRAY { return "unexpected SCAN reply" }
+        cursor = Text(reply.items[0].data)
+        let found = reply.items[1].items
+        if found.length > 0 {
+            let request = ["MGET"]
+            for key in found { request.add(Text(key.data)) }
+            let fetched = command(client, request)
+            if fetched.error != "" { return fetched.error }
+            if fetched.kind != ARRAY || fetched.items.length != found.length { return "MGET did not return one value per key" }
+            for index in 0..found.length {
+                if fetched.items[index].kind == redis.NULL { return "live state disappeared during independent observation" }
+                let name = Text(found[index].data)
+                let text = Text(fetched.items[index].data)
+                let known = -1
+                for at in 0..keys.length { if keys[at] == name { known = at } }
+                if known >= 0 {
+                    if json.pretty(json.parse(values[known]), "") != json.pretty(json.parse(text), "") { return "live state changed during duplicate SCAN observation" }
+                } else {
+                    keys.add(name)
+                    values.add(text)
+                }
+            }
+        }
+        if cursor == "0" { break }
+    }
+    for index in 0..keys.length { records.add(scale.Observed { key: keys[index]; state: json.parse(values[index]) }) }
+    return ""
+}
+function validated(client: Client, options: Options, edge: Text, window: scale.Window): scale.Validation {
+    let records: List<scale.Observed> = []
+    let error = observe(client, records)
+    if error != "" { return scale.Validation { error: error; epochs: [] } }
+    return scale.validate(records, options.peers, edge, wallSeconds(), window)
+}
+function sampleJson(sample: soak.Sample): Text {
+    if !sample.present { return "{}" }
+    return "{\"cpu_seconds\": " + Text(sample.cpuSeconds) + ", \"rss_kib\": " + Text(sample.rssKib) + "}"
+}
+function udpQueues(port: Integer): Text {
+    let rows: List<Text> = []
+    for family in ["udp", "udp6"] {
+        let lines = Text(files.readFile("/proc/net/" + family)).split("\n")
+        for index in 1..lines.length {
+            let fields = test.words(lines[index])
+            if fields.length > 12 {
+                let local = fields[1].split(":")
+                let queues = fields[4].split(":")
+                if fromHex(local[local.length - 1]) == port {
+                    rows.add("{\"family\": " + json.quote(family) + ", \"rx_bytes\": " + Text(fromHex(queues[1])) + ", \"drops\": " + fields[fields.length - 1] + "}")
+                }
+            }
+        }
+    }
+    let text = ""
+    for index in 0..rows.length {
+        if index > 0 { text = text + ", " }
+        text = text + rows[index]
+    }
+    return "[" + text + "]"
+}
+function fromHex(text: Text): Integer {
+    let value = 0
+    for symbol in Bytes(text) {
+        let digit = symbol - 48
+        if symbol >= 65 && symbol <= 70 { digit = symbol - 55 }
+        if symbol >= 97 && symbol <= 102 { digit = symbol - 87 }
+        value = value * 16 + digit
+    }
+    return value
+}
+function epochsJson(epochs: List<scale.Epoch>): Text {
+    let text = ""
+    for index in 0..epochs.length {
+        if index > 0 { text = text + ", " }
+        text = text + json.quote(epochs[index].exitId) + ": " + json.quote(epochs[index].epoch)
+    }
+    return "{" + text + "}"
+}
+function waitStart(path: Text, deadline: Float): Text {
+    while files.pathSize(path) < 0 {
+        if now() >= deadline { return "measurement start was not supplied before setup deadline" }
+        soak.nap(200)
+    }
+    let start = json.member(json.parse(Text(files.readFile(path))), "utc_start")
+    if !scale.integral(start) || Integer(start.number) - wallSeconds() < 0 || Integer(start.number) - wallSeconds() > 30 {
+        return "measurement requires one fresh future UTC start within thirty seconds"
+    }
+    while system.wallClockMicroseconds() < Integer(start.number) * 1000000 { soak.nap(min(100, max(0, (Integer(start.number) * 1000000 - system.wallClockMicroseconds()) / 1000))) }
+    return ""
+}
+function edgeLines(options: Options): List<Text> { return Text(files.readFile(options.output + "/edge.stdout")).split("\n") }
+
+function serve(options: Options, run: Run): Text {
+    let directory = options.output
+    let redisPort = redis.reservePort()
+    let config = "{\"host\": " + json.quote(options.host) + ", \"device_port\": " + Text(options.port) + ", \"gateway_port\": 0, \"redis_host\": \"127.0.0.1\", \"redis_port\": " +
+        Text(redisPort) + ", \"edge_instance\": \"localhost:0\", \"edge_region\": \"eu-west\", \"max_connections\": " + Text(options.peers + 16) + ", \"certificate\": " +
+        json.quote(options.fixtures + "/server.der") + ", \"private_key\": " + json.quote(options.fixtures + "/leaf.pk8") + ", \"device_roots\": " + json.quote(options.fixtures + "/root.der") +
+        ", \"gateway_roots\": " + json.quote(options.fixtures + "/root.der") + ", \"registry\": " + json.quote(options.fixtures + "/registry.ndjson") + ", \"jwks\": " +
+        json.quote(options.fixtures + "/jwks.json") + "}"
+    writeTextFile(directory + "/edge.json", config)
+    run.redisServer = soak.launchFiles(["/usr/bin/env", "redis-server", "--bind", "127.0.0.1", "--port", Text(redisPort), "--save", "", "--appendonly", "no", "--dir", directory],
+        system.environment(), "", "")
+    if run.redisServer.processId <= 0 { return "Redis launch failed" }
+    let deadline = now() + Float(options.setup)
+    while !run.connected {
+        let connection = net.connect("127.0.0.1", redisPort)
+        if connection >= 0 {
+            run.client = Client { connection: connection; buffer: Bytes() }
+            run.connected = true
+        } else {
+            if now() > deadline { return "Redis setup" }
+            soak.nap(50)
+        }
+    }
+    let durationMs = (options.setup + options.seconds + 180) * 1000
+    run.edge = soak.launchFiles([options.binary, directory + "/edge.json", Text(durationMs)], system.environment(), directory + "/edge.stdout", directory + "/edge.stderr")
+    if run.edge.processId <= 0 { return "edge launch failed" }
+    let ready = ""
+    while now() < deadline {
+        let lines = edgeLines(options)
+        if lines.length > 1 {
+            ready = lines[0]
+            break
+        }
+        if soak.poll(run.edge) != soak.PENDING { return "edge failed before READY" }
+        soak.nap(100)
+    }
+    if !(ready.startsWith("READY ")) { return "edge listener setup" }
+    let ports = test.words(ready)
+    let udp = Integer(ports[1])
+    let tcp = Integer(ports[2])
+    let gateway = Integer(ports[3])
+    if udp != tcp || udp <= 0 || gateway <= 0 { return "inconsistent peer listeners" }
+    let readyAt = now()
+    files.writeStandardOutput("READY {\"port\": " + Text(udp) + ", \"gateway_port\": " + Text(gateway) + ", \"pid\": " + Text(run.edge.processId) + "}\n")
+    let advertised = "localhost:" + Text(gateway)
+    let epochs: List<scale.Epoch> = []
+    let admitted = false
+    while now() < deadline {
+        if soak.poll(run.edge) != soak.PENDING { return "edge exited before device admission" }
+        let size = command(run.client, ["DBSIZE"])
+        if size.error != "" { return size.error }
+        let admission = "{\"elapsed_seconds\": " + Text(now() - readyAt) + ", \"redis_live_count\": " + Text(size.integer) + ", \"target\": " +
+            sampleJson(soak.processSample(run.edge.processId)) + ", \"udp\": " + udpQueues(udp) + "}"
+        append(directory + "/admission.jsonl", admission)
+        if size.integer == options.peers {
+            let checked = validated(run.client, options, advertised, scale.open())
+            if checked.error != "" { return checked.error }
+            epochs = checked.epochs
+            admitted = true
+            break
+        }
+        soak.nap(500)
+    }
+    if !admitted { return "not every device reached the Redis live-state plane" }
+    run.result.add("\"admitted\": " + Text(epochs.length))
+    writeTextFile(directory + "/admitted.json", json.pretty(json.parse("{\"epochs\": " + epochsJson(epochs) + ", \"edge\": " + json.quote(advertised) + "}"), "  ") + "\n")
+    files.writeStandardOutput("ADMITTED " + Text(epochs.length) + "\n")
+    let started = waitStart(options.start, deadline)
+    if started != "" { return started }
+    let utcStart = Integer(json.member(json.parse(Text(files.readFile(options.start))), "utc_start").number)
+    let measured = now()
+    let lastState = measured
+    let points: List<Point> = []
+    let warmup = 5.0
+    if options.seconds >= 7200 { warmup = 60.0 }
+    while now() - measured < Float(options.seconds) {
+        if soak.poll(run.edge) != soak.PENDING { return "edge exited during device measurement" }
+        let current = now()
+        let target = soak.processSample(run.edge.processId)
+        let row = "{\"elapsed_seconds\": " + Text(current - measured) + ", \"target\": " + sampleJson(target) + ", \"controller\": " + sampleJson(soak.processSample(system.processId())) +
+            ", \"redis\": " + sampleJson(soak.processSample(run.redisServer.processId)) + "}"
+        append(directory + "/samples.jsonl", row)
+        if target.present { points.add(Point { elapsed: current - measured; rss: target.rssKib; cpu: target.cpuSeconds }) }
+        if current - lastState >= 30.0 {
+            let window = scale.fenced(epochs)
+            if current - measured >= 45.0 { window = scale.advancing(epochs, utcStart) }
+            let checked = validated(run.client, options, advertised, window)
+            if checked.error != "" { return checked.error }
+            lastState = current
+        }
+        let remaining = Float(options.seconds) - (now() - measured)
+        soak.nap(Integer(min(1.0, max(0.0, remaining)) * 1000.0))
+    }
+    let closing = validated(run.client, options, advertised, scale.advancing(epochs, utcStart))
+    if closing.error != "" { return closing.error }
+    let warm: List<Point> = []
+    for point in points { if point.elapsed >= warmup { warm.add(point) } }
+    if warm.length < 2 { return "insufficient measured device samples" }
+    let first = warm[0]
+    let last = warm[warm.length - 1]
+    let cpu = (last.cpu - first.cpu) / (last.elapsed - first.elapsed)
+    let low = first.rss
+    let high = first.rss
+    let xmean = 0.0
+    let ymean = 0.0
+    for point in warm {
+        low = min(low, point.rss)
+        high = max(high, point.rss)
+        xmean += point.elapsed
+        ymean += point.rss
+    }
+    xmean = xmean / Float(warm.length)
+    ymean = ymean / Float(warm.length)
+    let numerator = 0.0
+    let denominator = 0.0
+    for point in warm {
+        numerator += (point.elapsed - xmean) * (point.rss - ymean)
+        denominator += (point.elapsed - xmean) * (point.elapsed - xmean)
+    }
+    let slope = numerator / denominator
+    run.result.add("\"seconds_observed\": " + Text(now() - measured))
+    run.result.add("\"mean_connected_cpu\": " + Text(cpu))
+    run.result.add("\"rss_min_kib\": " + Text(low))
+    run.result.add("\"rss_max_kib\": " + Text(high))
+    run.result.add("\"rss_slope_kib_per_second\": " + Text(slope))
+    if cpu > 0.02 { return "connected device CPU exceeded unchanged 2% of one CPU: " + Text(cpu) }
+    if options.seconds >= 7200 && (high - low > 16384.0 || slope > 0.2) { return "device RSS exceeded unchanged span or growth gate" }
+    // The peer fixture holds connections for ten seconds beyond measurement and
+    // staggers teardown. Native shutdown must be normal, with no retained
+    // device/relay state; forced cleanup never establishes a pass.
+    while true {
+        let size = command(run.client, ["DBSIZE"])
+        if size.error != "" { return size.error }
+        if size.integer == 0 { break }
+        if now() - measured > Float(options.seconds + 140) { return "device live state did not retire after peer teardown" }
+        soak.nap(200)
+    }
+    let nativeDeadline = readyAt + Float(durationMs) / 1000.0 + 10.0
+    let status = soak.waitFor(run.edge, Integer(max(1.0, nativeDeadline - now()) * 1000.0))
+    if status == soak.PENDING { return "edge did not exit before its native deadline" }
+    let counts = ""
+    for item in edgeLines(options) { if item.startsWith("EDGE_COUNTS ") && counts == "" { counts = item } }
+    if counts == "" || status != 0 || files.readFile(directory + "/edge.stderr").length != 0 { return "edge did not exit normally with empty stderr and counts" }
+    let fields: List<Text> = []
+    let active = -1
+    let retained = -1
+    let opened = -1
+    let released = -2
+    for part in test.words(counts) {
+        let pair = part.split("=")
+        if pair.length == 2 {
+            fields.add(json.quote(pair[0]) + ": " + json.quote(pair[1]))
+            if pair[0] == "active" { active = Integer(pair[1]) }
+            if pair[0] == "retained_relays" { retained = Integer(pair[1]) }
+            if pair[0] == "calls_opened" { opened = Integer(pair[1]) }
+            if pair[0] == "calls_released" { released = Integer(pair[1]) }
+        }
+    }
+    if active != 0 || retained != 0 || opened != released { return "edge retained peers or relay calls" }
+    let text = ""
+    for index in 0..fields.length {
+        if index > 0 { text = text + ", " }
+        text = text + fields[index]
+    }
+    run.result.add("\"counts\": {" + text + "}")
+    return ""
+}
+
+function value(name: Text, fallback: Text): Text {
+    for index in 0..argumentCount() {
+        if argument(index) == name {
+            if index + 1 >= argumentCount() { usage("argument " + name + ": expected one argument") }
+            return argument(index + 1)
+        }
+    }
+    return fallback
+}
+function stopChild(child: soak.Child) {
+    if child.processId <= 0 || soak.poll(child) != soak.PENDING { return }
+    system.sendSignal(child.processId, 15)
+    if soak.waitFor(child, 5000) == soak.PENDING {
+        system.sendSignal(child.processId, 9)
+        soak.waitFor(child, 5000)
+    }
+}
+
+let index = 0
+let makeFixtures = false
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--make-fixtures" { makeFixtures = true }
+    else if name == "--fixtures" || name == "--peers" || name == "--binary" || name == "--output" || name == "--start-file" || name == "--seconds" ||
+        name == "--setup-seconds" || name == "--host" || name == "--port" { index += 1 }
+    else { usage("unrecognized arguments: " + name) }
+    index += 1
+}
+let options = Options { fixtures: value("--fixtures", ""); peers: Integer(value("--peers", "32")); binary: value("--binary", ""); output: value("--output", "");
+    start: value("--start-file", ""); seconds: Integer(value("--seconds", "7200")); setup: Integer(value("--setup-seconds", "1200")); host: value("--host", "::");
+    port: Integer(value("--port", "24567")) }
+if options.fixtures == "" { usage("the following arguments are required: --fixtures") }
+if !soak.linux() || system.getenv("MINYAR_REMOTE_LOAD") != "1" { usage("remote Linux with MINYAR_REMOTE_LOAD=1 is required") }
+if options.peers < 1 || options.peers > 20000 || options.seconds < 30 || options.seconds > 82800 || options.setup < 30 || options.setup > 1800 || options.port < 1 || options.port > 65535 {
+    usage("invalid bounded remote fixture configuration")
+}
+if makeFixtures {
+    let peer = test.setting("MINYAR_PEERGRPC", "build/peergrpc-peer")
+    let result = test.run([peer, "scale-fixtures", options.fixtures, Text(options.peers)], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-scale-fixtures-" + Text(system.processId()), 3600)
+    test.check(result.status == 0, "scale fixtures failed\n" + result.output + result.errorOutput)
+    exit(0)
+}
+if options.binary == "" || options.output == "" || options.start == "" { usage("server requires binary, output and start-file") }
+test.check(files.pathSize(options.output) < 0, "output directory already exists: " + options.output)
+let made = test.run(["mkdir", "-p", options.output], system.environment(), "", test.setting("TMPDIR", "/tmp") + "/minyar-scale-mkdir-" + Text(system.processId()), 10)
+test.check(made.status == 0, "create output directory")
+let run = Run { edge: soak.Child { processId: 0; output: -1; status: soak.PENDING }; redisServer: soak.Child { processId: 0; output: -1; status: soak.PENDING };
+    client: Client { connection: -1; buffer: Bytes() }; connected: false; result: [] }
+let failure = serve(options, run)
+stopChild(run.edge)
+stopChild(run.redisServer)
+if run.connected { net.close(run.client.connection) }
+let status = "0"
+if failure != "" { status = "\"NONPASS\"" }
+let fields = ["\"status\": " + status, "\"peers\": " + Text(options.peers), "\"role\": \"QUIC devices\"", "\"binary_sha256\": " + json.quote(digest(options.binary)),
+    "\"fixtures_sha256\": " + json.quote(digest(options.fixtures + "/fixtures.json"))]
+for item in run.result { fields.add(item) }
+if failure != "" { fields.add("\"failure\": " + json.quote(failure)) }
+let report = ""
+for at in 0..fields.length {
+    if at > 0 { report = report + ", " }
+    report = report + fields[at]
+}
+report = "{" + report + "}"
+writeTextFile(options.output + "/report.json", json.pretty(json.parse(report), "  ") + "\n")
+if failure != "" {
+    system.writeStandardError(failure + "\n")
+    exit(1)
+}
+files.writeStandardOutput("GREEN " + report + "\n")

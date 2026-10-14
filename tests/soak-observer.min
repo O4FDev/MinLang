@@ -1,0 +1,336 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "net" as net
+
+public constant PENDING = -1000
+public constant LINE = 1
+public constant SAMPLE = 2
+public constant DONE = 3
+public constant FAILED = 4
+public constant TIMEOUT = 5
+public constant INTERRUPTED = 6
+constant LIMIT = 65536
+
+function launchNative(argv: Bytes, envp: Bytes, standard: Text, errors: Text, output: Integer): Integer { native "soakobserver" }
+function reapNative(process: Integer, block: Boolean): Integer { native "soakobserver" }
+function installInterrupts(): Integer { native "soakobserver" }
+function restoreInterrupts(): Integer { native "soakobserver" }
+function takeInterrupt(): Integer { native "soakobserver" }
+public function disposition(signal: Integer): Integer { native "soakobserver" }
+public function setDisposition(signal: Integer, kind: Integer): Integer { native "soakobserver" }
+public function nap(milliseconds: Integer): Integer { native "soakobserver" }
+function clockTicks(): Integer { native "soakobserver" }
+function pageSize(): Integer { native "soakobserver" }
+public function subreaper(value: Integer): Integer { native "soakobserver" }
+function loadAverage(index: Integer): Integer { native "soakobserver" }
+
+public record Child { processId: Integer; output: Integer; status: Integer }
+public record Sample { present: Boolean; missing: Boolean; state: Text; cpu: Boolean; cpuSeconds: Float; rssKib: Float; rssBytes: Integer }
+public record Event { kind: Integer; elapsed: Float; line: Text; sample: Sample; message: Text }
+public record Observer {
+    child: Child
+    reading: Boolean
+    pending: Bytes
+    queued: List<Text>
+    failure: Text
+    started: Integer
+    timeout: Integer
+    period: Integer
+    nextSample: Integer
+    closed: Boolean
+}
+public record Summary { warmup: Float; count: Integer; meanTime: Float; meanRss: Float; covariance: Float; variance: Float; low: Float; high: Float }
+
+function packed(items: List<Text>): Bytes {
+    let result = Bytes()
+    for item in items {
+        result.addBytes(Bytes(item))
+        result.add(0)
+    }
+    return result
+}
+public function linux(): Boolean { return files.pathSize("/proc/self/stat") >= 0 }
+
+// Starts the command in its own session. Its standard output is the only
+// writer of a private loopback stream, so EOF means every holder closed it.
+public function launch(command: List<Text>, environment: List<Text>, errors: Text): Child {
+    let listener = net.listen("127.0.0.1", 0, 1)
+    test.check(listener >= 0, "observer output listener")
+    let writer = net.connect("127.0.0.1", net.localPort(listener))
+    let reader = net.accept(listener)
+    net.close(listener)
+    test.check(writer >= 0 && reader >= 0, "observer output stream")
+    let process = launchNative(packed(command), packed(environment), "", errors, writer)
+    net.close(writer)
+    if process < 0 {
+        net.close(reader)
+        return Child { processId: process; output: -1; status: process }
+    }
+    return Child { processId: process; output: reader; status: PENDING }
+}
+// Starts the command in its own session with standard output and errors in files.
+public function launchFiles(command: List<Text>, environment: List<Text>, output: Text, errors: Text): Child {
+    let process = launchNative(packed(command), packed(environment), output, errors, -1)
+    if process < 0 { return Child { processId: process; output: -1; status: process } }
+    return Child { processId: process; output: -1; status: PENDING }
+}
+public function poll(child: Child): Integer {
+    if child.status == PENDING && child.processId > 0 {
+        let value = reapNative(child.processId, false)
+        if value != PENDING { child.status = value }
+    }
+    return child.status
+}
+public function reapAny(process: Integer): Integer { return reapNative(process, true) }
+public function waitFor(child: Child, milliseconds: Integer): Integer {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while poll(child) == PENDING && system.monotonicNanoseconds() < deadline { nap(5) }
+    return child.status
+}
+public function exists(processId: Integer): Boolean { return system.sendSignal(processId, 0) == 0 }
+public function groupExists(group: Integer): Boolean { return system.sendSignal(-group, 0) == 0 }
+public function stop(child: Child): Boolean {
+    if child.processId <= 0 { return true }
+    system.sendSignal(-child.processId, 9)
+    return waitFor(child, 5000) != PENDING
+}
+public function closeOutput(child: Child) {
+    if child.output >= 0 {
+        net.close(child.output)
+        child.output = -1
+    }
+}
+
+public function absent(): Sample { return Sample { present: false; missing: false; state: ""; cpu: false; cpuSeconds: 0.0; rssKib: 0.0; rssBytes: 0 } }
+public function missing(): Sample { return Sample { present: false; missing: true; state: ""; cpu: false; cpuSeconds: 0.0; rssKib: 0.0; rssBytes: 0 } }
+function digits(raw: Bytes): Integer {
+    if raw.length == 0 { return -1 }
+    let value = 0
+    for byte in raw {
+        if byte < 48 || byte > 57 { return -1 }
+        value = value * 10 + byte - 48
+    }
+    return value
+}
+public function statFields(processId: Integer): List<Text> {
+    let raw = files.readFile("/proc/" + Text(processId) + "/stat")
+    let fields: List<Text> = []
+    let error = files.lastError()
+    if error == -2 || error == -3 { fields.add("") }
+    if error != 0 || raw.length == 0 { return fields }
+    let cut = raw.length - 1
+    while cut >= 0 && raw[cut] != 41 { cut -= 1 }
+    if cut < 0 { return fields }
+    let start = cut + 1
+    for index in (cut + 1)..(raw.length + 1) {
+        let space = index == raw.length
+        if !space { space = raw[index] <= 32 }
+        if space {
+            if start < index { fields.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return fields
+}
+public function processSample(processId: Integer): Sample {
+    if linux() {
+        let fields = statFields(processId)
+        if fields.length == 1 && fields[0] == "" { return missing() }
+        if fields.length < 22 { return absent() }
+        let user = digits(Bytes(fields[11]))
+        let kernel = digits(Bytes(fields[12]))
+        let pages = digits(Bytes(fields[21]))
+        if user < 0 || kernel < 0 || pages < 0 { return absent() }
+        let bytes = pages * pageSize()
+        return Sample { present: true; missing: false; state: fields[0]; cpu: true; cpuSeconds: Float(user + kernel) / Float(clockTicks()); rssKib: Float(bytes / 1024); rssBytes: bytes }
+    }
+    let log = test.setting("TMPDIR", "/tmp") + "/minyar-soak-ps-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    let result = test.run(["/bin/ps", "-o", "rss=", "-p", Text(processId)], system.environment(), "", log, 10)
+    files.remove(log)
+    files.remove(log + ".err")
+    let raw = Bytes(result.output)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    let value = digits(raw.slice(begin, end))
+    if value < 0 { return absent() }
+    return Sample { present: true; missing: false; state: ""; cpu: false; cpuSeconds: 0.0; rssKib: Float(value); rssBytes: value * 1024 }
+}
+public function loadAverages(): List<Float> {
+    let result: List<Float> = []
+    for index in 0..3 { result.add(Float(loadAverage(index)) / 1000000.0) }
+    return result
+}
+
+public function validText(data: Bytes): Boolean {
+    let index = 0
+    while index < data.length {
+        let byte = data[index]
+        let extra = 0
+        let minimum = 0
+        if byte < 128 { extra = 0 }
+        else if byte >= 194 && byte <= 223 { extra = 1; minimum = 128 }
+        else if byte >= 224 && byte <= 239 { extra = 2; minimum = 2048 }
+        else if byte >= 240 && byte <= 244 { extra = 3; minimum = 65536 }
+        else { return false }
+        let value = byte
+        if extra == 1 { value = byte & 31 }
+        if extra == 2 { value = byte & 15 }
+        if extra == 3 { value = byte & 7 }
+        for offset in 1..(extra + 1) {
+            if index + offset >= data.length { return false }
+            let next = data[index + offset]
+            if next < 128 || next > 191 { return false }
+            value = (value << 6) | (next & 63)
+        }
+        if extra > 0 && (value < minimum || value > 1114111 || (value >= 55296 && value <= 57343)) { return false }
+        index += extra + 1
+    }
+    return true
+}
+
+// Observation installs SIGTERM/SIGINT recording handlers and restores the
+// previous dispositions when it closes, including after failures.
+public function observe(child: Child, timeout: Float, period: Float): Observer {
+    test.check(timeout > 0.0 && period > 0.0, "positive observation times required")
+    let now = system.monotonicNanoseconds()
+    let observer = Observer { child: child; reading: child.output >= 0; pending: Bytes(); queued: []; failure: ""; started: now;
+        timeout: Integer(timeout * 1000000000.0); period: Integer(period * 1000000000.0); nextSample: now; closed: false }
+    let installed = installInterrupts()
+    if installed != 0 {
+        stop(child)
+        closeOutput(child)
+        observer.closed = true
+        test.check(false, "cannot install observer interrupt handlers (" + Text(installed) + ")")
+    }
+    return observer
+}
+public function close(observer: Observer): Text {
+    if observer.closed { return "" }
+    observer.closed = true
+    let stopped = stop(observer.child)
+    closeOutput(observer.child)
+    restoreInterrupts()
+    if !stopped { return "observed process did not exit within five seconds of SIGKILL" }
+    return ""
+}
+function elapsed(observer: Observer): Float { return Float(system.monotonicNanoseconds() - observer.started) / 1000000000.0 }
+function event(observer: Observer, kind: Integer, line: Text, sample: Sample, message: Text): Event {
+    return Event { kind: kind; elapsed: elapsed(observer); line: line; sample: sample; message: message }
+}
+function ended(observer: Observer, kind: Integer, message: Text): Event {
+    let cleanup = close(observer)
+    if cleanup != "" {
+        if message != "" { return event(observer, FAILED, "", absent(), message + "; " + cleanup) }
+        return event(observer, FAILED, "", absent(), cleanup)
+    }
+    return event(observer, kind, "", absent(), message)
+}
+function queueLine(observer: Observer, line: Bytes): Boolean {
+    if line.length > LIMIT {
+        observer.failure = "soak output line exceeded 64 KiB"
+        return false
+    }
+    if !validText(line) {
+        observer.failure = "soak output line is not UTF-8"
+        return false
+    }
+    observer.queued.add(Text(line))
+    return true
+}
+function consume(observer: Observer, data: Bytes) {
+    observer.pending.addBytes(data)
+    let start = 0
+    for index in 0..observer.pending.length {
+        if observer.pending[index] == 10 {
+            if !queueLine(observer, observer.pending.slice(start, index)) { return }
+            start = index + 1
+        }
+    }
+    if start > 0 { observer.pending = observer.pending.slice(start, observer.pending.length) }
+    if observer.pending.length > LIMIT { observer.failure = "soak output line exceeded 64 KiB" }
+}
+function dequeue(observer: Observer): Event {
+    let line = observer.queued[0]
+    let rest: List<Text> = []
+    for index in 1..observer.queued.length { rest.add(observer.queued[index]) }
+    observer.queued = rest
+    return event(observer, LINE, line, absent(), "")
+}
+public function next(observer: Observer): Event {
+    if observer.queued.length > 0 { return dequeue(observer) }
+    if observer.failure != "" { return ended(observer, FAILED, observer.failure) }
+    if observer.closed { return event(observer, DONE, "", absent(), "") }
+    while true {
+        let signal = takeInterrupt()
+        if signal > 0 { return ended(observer, INTERRUPTED, "soak observation interrupted by signal " + Text(signal)) }
+        if !observer.reading && poll(observer.child) != PENDING { return ended(observer, DONE, "") }
+        let now = system.monotonicNanoseconds()
+        if now - observer.started >= observer.timeout { return ended(observer, TIMEOUT, "process exceeded the independent soak deadline") }
+        if now >= observer.nextSample {
+            observer.nextSample = now + observer.period
+            return event(observer, SAMPLE, "", processSample(observer.child.processId), "")
+        }
+        let budget = min(observer.period, observer.timeout - (now - observer.started))
+        let milliseconds = (budget + 999999) / 1000000
+        if observer.reading {
+            if net.ready(observer.child.output, milliseconds) {
+                let data = net.receive(observer.child.output, 8192)
+                if data.length == 0 {
+                    observer.reading = false
+                    closeOutput(observer.child)
+                    if observer.pending.length > 0 {
+                        let rest = observer.pending
+                        observer.pending = Bytes()
+                        queueLine(observer, rest)
+                    }
+                } else {
+                    consume(observer, data)
+                }
+                if observer.queued.length > 0 { return dequeue(observer) }
+                if observer.failure != "" { return ended(observer, FAILED, observer.failure) }
+            }
+        } else {
+            nap(milliseconds)
+        }
+    }
+    return event(observer, DONE, "", absent(), "")
+}
+public function terminal(kind: Integer): Boolean { return kind == DONE || kind == FAILED || kind == TIMEOUT || kind == INTERRUPTED }
+
+public function summary(warmup: Float): Summary {
+    return Summary { warmup: warmup; count: 0; meanTime: 0.0; meanRss: 0.0; covariance: 0.0; variance: 0.0; low: 0.0; high: 0.0 }
+}
+// Online centered moments; callers pass one row at a time and retain nothing.
+public function include(summary: Summary, elapsed: Float, rss: Float) {
+    if !(elapsed >= summary.warmup) { return }
+    summary.count += 1
+    let deltaTime = elapsed - summary.meanTime
+    let deltaRss = rss - summary.meanRss
+    summary.meanTime += deltaTime / Float(summary.count)
+    summary.meanRss += deltaRss / Float(summary.count)
+    summary.covariance += deltaTime * (rss - summary.meanRss)
+    summary.variance += deltaTime * (elapsed - summary.meanTime)
+    if summary.count == 1 || rss < summary.low { summary.low = rss }
+    if summary.count == 1 || rss > summary.high { summary.high = rss }
+}
+public function slope(summary: Summary): Float {
+    if summary.variance == 0.0 { return 0.0 }
+    return summary.covariance / summary.variance
+}
+public function number(value: Float): Text {
+    if value == value && value < 1000000000000000.0 && value > -1000000000000000.0 && value == Float(Integer(value)) { return Text(Integer(value)) }
+    return Text(value)
+}
+public function summaryJson(summary: Summary): Text {
+    if summary.count == 0 { return "{\"warm_rss_min_kib\": null, \"warm_rss_max_kib\": null, \"rss_slope_kib_per_second\": null}" }
+    return "{\"warm_rss_min_kib\": " + number(summary.low) + ", \"warm_rss_max_kib\": " + number(summary.high) + ", \"rss_slope_kib_per_second\": " + number(slope(summary)) + "}"
+}
+public function requireRemoteLab() {
+    if !linux() || system.getenv("MINYAR_REMOTE_LAB") != "1" {
+        system.writeStandardError("Run sustained tests on the remote Linux lab with MINYAR_REMOTE_LAB=1\n")
+        exit(1)
+    }
+}

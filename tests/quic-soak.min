@@ -1,0 +1,304 @@
+use "./soak-observer.min" as soak
+use "./quic-soak-adapter.min" as adapter
+use "./net-fixtures.min" as fixtures
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+record Delayed { due: Integer; front: Boolean; data: Bytes; address: Text; port: Integer }
+record Counters { forwarded: Integer; dropped: Integer; delayed: Integer }
+
+function usage(message: Text) {
+    system.writeStandardError("quic-soak: error: " + message + "\n")
+    exit(2)
+}
+function publish(path: Text, counters: Counters) {
+    let data = Bytes(Text(counters.forwarded) + " " + Text(counters.dropped) + " " + Text(counters.delayed) + "\n")
+    let file = files.open(path + ".tmp", files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return }
+    files.write(file, data, 0, data.length)
+    files.close(file)
+    files.rename(path + ".tmp", path)
+}
+function forward(socket: Integer, address: Text, port: Integer, data: Bytes): Boolean { return errors.integerOk(net.sendDatagramTo(socket, address, port, data)) }
+// Seeded loss and fixed-delay reordering between the peer and the server,
+// with the counters published for the observer in another process.
+function proxy(serverPort: Integer, loss: Float, reorder: Float, address: Text, status: Text) {
+    let front = net.udp(address, 0)
+    let back = net.udp("127.0.0.1", 0)
+    test.check(front >= 0 && back >= 0, "bind fault proxy sockets")
+    let shutdown = system.shutdownSignalSocket()
+    let events = errors.integerValue(loop.create())
+    errors.integerValue(loop.watch(events, front, loop.readableInterest(), 1))
+    errors.integerValue(loop.watch(events, back, loop.readableInterest(), 2))
+    errors.integerValue(loop.watch(events, shutdown, loop.readableInterest(), 3))
+    errors.integerValue(loop.timer(events, 100, 100, 4))
+    let counters = Counters { forwarded: 0; dropped: 0; delayed: 0 }
+    publish(status, counters)
+    files.writeStandardOutput("READY " + Text(net.localPort(front)) + "\n")
+    let rng = random.seeded("9002")
+    let pending: List<Delayed> = []
+    let head = 0
+    let client = ""
+    let clientPort = 0
+    while true {
+        let now = net.monotonicMilliseconds()
+        while head < pending.length && pending[head].due <= now {
+            let item = pending[head]
+            head += 1
+            if item.front { forward(front, item.address, item.port, item.data) } else { forward(back, item.address, item.port, item.data) }
+            counters.forwarded += 1
+        }
+        if head > 1024 {
+            let rest: List<Delayed> = []
+            for index in head..pending.length { rest.add(pending[index]) }
+            pending = rest
+            head = 0
+        }
+        let timeout = 1000
+        if head < pending.length { timeout = max(0, min(1000, pending[head].due - now)) }
+        let batch = loop.wait(events, timeout, 16)
+        if errors.isError(loop.batchError(batch)) { continue }
+        for event in loop.events(batch) {
+            if event.token == 3 {
+                system.drainShutdownSignals()
+                publish(status, counters)
+                exit(0)
+            }
+            if event.token == 4 { publish(status, counters) }
+            if event.token == 1 || event.token == 2 {
+                let socket = front
+                if event.token == 2 { socket = back }
+                let received = net.receiveDatagrams(socket, 64, 65535)
+                if net.datagramBatchOk(received) {
+                    for packet in net.datagrams(received) {
+                        let payload = net.datagramData(packet)
+                        let towardsServer = event.token == 1
+                        if towardsServer {
+                            client = net.datagramSource(packet)
+                            clientPort = net.datagramPort(packet)
+                        }
+                        if errors.bytesOk(payload) && (towardsServer || client != "") {
+                            let data = errors.bytesValue(payload)
+                            let address = client
+                            let port = clientPort
+                            if towardsServer {
+                                address = "127.0.0.1"
+                                port = serverPort
+                            }
+                            if random.uniform(rng) < loss { counters.dropped += 1 }
+                            else if random.uniform(rng) < reorder {
+                                counters.delayed += 1
+                                pending.add(Delayed { due: net.monotonicMilliseconds() + 15; front: !towardsServer; data: data; address: address; port: port })
+                            } else {
+                                if towardsServer { forward(back, address, port, data) } else { forward(front, address, port, data) }
+                                counters.forwarded += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function firstLine(path: Text, process: soak.Child, seconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + seconds * 1000000000
+    while system.monotonicNanoseconds() < deadline {
+        let text = Text(files.readFile(path))
+        let lines = text.split("\n")
+        if lines.length > 1 { return lines[0].trim() }
+        if soak.poll(process) != soak.PENDING { return "" }
+        soak.nap(20)
+    }
+    return ""
+}
+function sha256(context: fixtures.Context, path: Text): Text {
+    return fixtures.split(fixtures.execute(context, ["sha256sum", "--", path], 120, "hash " + path).output, 32)[0]
+}
+function joined(items: List<Text>): Text {
+    if items.length == 0 { return "" }
+    let text = items[0]
+    for index in 1..items.length { text = text + ", " + items[index] }
+    return text
+}
+function commaList(items: List<Text>): Text {
+    if items.length == 0 { return "[]" }
+    let text = "[" + json.quote(items[0])
+    for index in 1..items.length { text = text + ", " + json.quote(items[index]) }
+    return text + "]"
+}
+function version(context: fixtures.Context, command: Text): Text {
+    let found = fixtures.run(context, ["/bin/sh", "-c", "command -v \"$1\"", "minyar", command], 10)
+    if found.status != 0 { return "" }
+    let argument = "--version"
+    if command == "openssl" { argument = "version" }
+    let result = fixtures.run(context, [command, argument], 30)
+    if result.status != 0 { return "" }
+    return test.lines(result.output)[0]
+}
+function sourceDigest(context: fixtures.Context): Text {
+    let paths: List<Text> = []
+    for name in files.list(context.root + "/library") {
+        if fixtures.starts(name, "quic") && fixtures.ends(name, ".min") { paths.add("library/" + name) }
+    }
+    paths.add("library/tls.min")
+    paths.add("library/tlsserver.min")
+    paths.add("runtime/native/aes.c")
+    paths.add("runtime/native/tlsverify.c")
+    paths.sort()
+    let combined = Bytes()
+    for path in paths {
+        combined.addBytes(Bytes(path))
+        combined.addBytes(files.readFile(context.root + "/" + path))
+    }
+    writeBytesFile(context.work + "/quic-soak-sources", combined)
+    return sha256(context, context.work + "/quic-soak-sources")
+}
+function stopRole(item: adapter.Role) {
+    if item.present && soak.poll(item.child) == soak.PENDING { soak.stop(item.child) }
+}
+function abort(message: Text) {
+    system.writeStandardError(message + "\n")
+    exit(1)
+}
+
+if argumentCount() == 6 && argument(0) == "--proxy" {
+    proxy(Integer(argument(1)), json.parse(argument(2)).number, json.parse(argument(3)).number, argument(4), argument(5))
+}
+fixtures.arguments(["--sanitize", "--server-only"], ["--binary", "--peer-binary", "--duration", "--peers", "--interval-ms", "--loss", "--reorder", "--report", "--front-address",
+    "--fixtures", "--setup-grace-seconds", "--idle-seconds"])
+let sanitize = fixtures.flag("--sanitize")
+let serverOnly = fixtures.flag("--server-only")
+let binaryOption = fixtures.option("--binary", "")
+let peerOption = fixtures.option("--peer-binary", "")
+let duration = Integer(fixtures.option("--duration", "7200"))
+let peers = Integer(fixtures.option("--peers", "64"))
+let interval = Integer(fixtures.option("--interval-ms", "15000"))
+let loss = json.parse(fixtures.option("--loss", "0.01")).number
+let reorder = json.parse(fixtures.option("--reorder", "0.01")).number
+let reportPath = fixtures.option("--report", "")
+let frontAddress = fixtures.option("--front-address", "127.0.0.1")
+let fixtureOption = fixtures.option("--fixtures", "")
+let grace = Integer(fixtures.option("--setup-grace-seconds", "0"))
+let idle = Integer(fixtures.option("--idle-seconds", "0"))
+if reportPath == "" { usage("the following arguments are required: --report") }
+for binary in [binaryOption, peerOption] { if binary != "" && files.pathSize(binary) < 0 { usage("prebuilt binaries must be files") } }
+let context = fixtures.context(sanitize)
+if !fixtures.starts(reportPath, "/") { reportPath = context.root + "/" + reportPath }
+if fixtureOption != "" && !fixtures.starts(fixtureOption, "/") { fixtureOption = context.root + "/" + fixtureOption }
+if !soak.linux() || system.getenv("MINYAR_REMOTE_LOAD") != "1" { usage("sustained load requires remote Linux execution with MINYAR_REMOTE_LOAD=1") }
+if duration < 1 || peers < 1 || peers > 16384 || interval < 1 || !(loss >= 0.0 && loss < 1.0) || !(reorder >= 0.0 && reorder < 1.0) || grace < 0 || grace > 1800 || idle < 0 || idle > 120 {
+    usage("invalid soak duration, peer count, heartbeat interval or fault rates")
+}
+if serverOnly && fixtureOption == "" { usage("--server-only requires --fixtures") }
+if sanitize {
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let peerBuild: List<Text> = []
+if !serverOnly && peerOption == "" {
+    peerBuild = ["cargo", "build", "--locked", "--manifest-path", context.root + "/tests/interop/quinn/Cargo.toml", "--target-dir", context.root + "/build/interop-quinn", "--bin", "minyar-quinn-interop", "-j1"]
+    let environment = context.environment
+    context.environment = fixtures.withSetting(environment, "CARGO_BUILD_JOBS", "1")
+    fixtures.execute(context, peerBuild, 300, "build Quinn peer")
+    context.environment = environment
+}
+let peerBinary = context.root + "/build/interop-quinn/debug/minyar-quinn-interop"
+if peerOption != "" { peerBinary = peerOption }
+let directory = context.work + "/fixtures"
+if fixtureOption != "" { directory = fixtureOption }
+fixtures.execute(context, ["mkdir", "-p", directory], 10, "create fixtures")
+let certificates = fixtures.authority(context, directory)
+fixtures.root(certificates, "root")
+fixtures.leaf(certificates, "server", "root", fixtures.options())
+fixtures.leaf(certificates, "client", "root", fixtures.usage("clientAuth"))
+let binary = binaryOption
+let compileCommand: List<Text> = []
+if binary == "" {
+    binary = directory + "/soak-server"
+    compileCommand = [context.root + "/minyar", "--library", context.root + "/library", context.root + "/tests/quic-soak-server.min", "-o", binary]
+    fixtures.compileProgram(context, "tests/quic-soak-server.min", binary)
+}
+let teardown = 0
+if idle > 0 { teardown = (peers * 5 + 999) / 1000 }
+let serverCommand = [binary, fixtures.path(certificates, "server", "der"), fixtures.path(certificates, "server", "pk8"), fixtures.path(certificates, "root", "der"),
+    Text((duration + grace + idle + teardown + 15) * 1000), Text(peers + 16)]
+if idle > 0 { serverCommand.add("idle") }
+fixtures.execute(context, ["mkdir", "-p", adapter.sibling(reportPath, "")], 10, "create report directory")
+let roles = context.work + "/roles"
+fixtures.execute(context, ["mkdir", "-p", roles], 10, "create role logs")
+let server = adapter.role(soak.launchFiles(serverCommand, context.environment, roles + "/server.out", roles + "/server.err"), roles + "/server.out", roles + "/server.err")
+test.check(server.child.processId > 0, "launch QUIC soak server")
+let client = adapter.absentRole()
+let proxyStatus = roles + "/proxy.counters"
+let proxyProcess = soak.Child { processId: 0; output: -1; status: soak.PENDING }
+let counters = adapter.Proxy { forwarded: 0; dropped: 0; delayed: 0 }
+let failure = ""
+let ready = firstLine(server.output, server.child, 15)
+if !fixtures.starts(ready, "READY ") { failure = "QUIC server did not become ready: " + ready }
+let peerCommand: List<Text> = []
+if failure == "" {
+    proxyProcess = soak.launchFiles(["/proc/self/exe", "--proxy", fixtures.split(ready, 32)[1], Text(loss), Text(reorder), frontAddress, proxyStatus], context.environment,
+        roles + "/proxy.out", roles + "/proxy.err")
+    let proxyReady = firstLine(roles + "/proxy.out", proxyProcess, 15)
+    if !fixtures.starts(proxyReady, "READY ") { failure = "fault proxy did not become ready: " + proxyReady }
+    else {
+        let front = fixtures.split(proxyReady, 32)[1]
+        if serverOnly {
+            files.writeStandardOutput("READY {\"address\": " + json.quote(frontAddress) + ", \"port\": " + front + ", \"fixtures\": " + json.quote(directory) +
+                ", \"server_pid\": " + Text(server.child.processId) + "}\n")
+        } else {
+            peerCommand = [peerBinary, front, fixtures.path(certificates, "root", "der"), fixtures.path(certificates, "client", "der"), fixtures.path(certificates, "client", "pk8"),
+                Text(duration), Text(peers), Text(interval)]
+            client = adapter.role(soak.launchFiles(peerCommand, fixtures.withSetting(context.environment, "MINYAR_QUINN_IDLE_SECONDS", Text(idle)), roles + "/client.out", roles + "/client.err"),
+                roles + "/client.out", roles + "/client.err")
+        }
+    }
+}
+if failure == "" {
+    let hooks = adapter.realHooks(counters, proxyStatus)
+    let started = Float(system.monotonicNanoseconds()) / 1000000000.0
+    let deadline = started + Float(duration + grace + idle + teardown + 60)
+    let versions: List<Text> = []
+    for command in ["openssl", "clang-23", "rustc", "cargo"] {
+        let found = version(context, command)
+        if found != "" { versions.add(json.quote(command) + ": " + json.quote(found)) }
+    }
+    let host = fixtures.strip(fixtures.execute(context, ["uname", "-n"], 10, "host name").output)
+    let platform = fixtures.strip(fixtures.execute(context, ["uname", "-srm"], 10, "platform").output)
+    let report = adapter.report()
+    adapter.put(report, "host", json.quote(host))
+    adapter.put(report, "platform", json.quote(platform))
+    adapter.put(report, "configuration", "{\"binary\": " + json.quote(binaryOption) + ", \"peer_binary\": " + json.quote(peerOption) + ", \"sanitize\": " + Text(sanitize) +
+        ", \"duration\": " + Text(duration) + ", \"peers\": " + Text(peers) + ", \"interval_ms\": " + Text(interval) + ", \"loss\": " + Text(loss) + ", \"reorder\": " + Text(reorder) +
+        ", \"report\": " + json.quote(reportPath) + ", \"server_only\": " + Text(serverOnly) + ", \"front_address\": " + json.quote(frontAddress) + ", \"fixtures\": " + json.quote(fixtureOption) +
+        ", \"setup_grace_seconds\": " + Text(grace) + ", \"idle_seconds\": " + Text(idle) + "}")
+    adapter.put(report, "versions", "{" + joined(versions) + "}")
+    adapter.put(report, "source_sha256", json.quote(sourceDigest(context)))
+    adapter.put(report, "server_sha256", json.quote(sha256(context, binary)))
+    adapter.put(report, "server_pid", Text(server.child.processId))
+    adapter.put(report, "controller_pid", Text(system.processId()))
+    if client.present { adapter.put(report, "peer_pid", Text(client.child.processId)) } else { adapter.put(report, "peer_pid", "null") }
+    adapter.put(report, "proxy_pid", Text(proxyProcess.processId))
+    adapter.put(report, "controller_role", json.quote("QUIC observer; the seeded fault proxy is a separate process"))
+    adapter.put(report, "command", commaList(serverCommand))
+    if peerCommand.length > 0 { adapter.put(report, "peer_command", commaList(peerCommand)) } else { adapter.put(report, "peer_command", "null") }
+    if compileCommand.length > 0 { adapter.put(report, "compile_command", commaList(compileCommand)) } else { adapter.put(report, "compile_command", "null") }
+    if peerBuild.length > 0 { adapter.put(report, "peer_build_command", commaList(peerBuild)) } else { adapter.put(report, "peer_build_command", "null") }
+    if serverOnly { adapter.put(report, "peer_sha256", "null") } else { adapter.put(report, "peer_sha256", json.quote(sha256(context, peerBinary))) }
+    failure = adapter.observeSamples(server, client, counters, started, deadline, Float(duration), reportPath, report, hooks)
+    if failure == "" { failure = adapter.finishObservations(server, client, counters, reportPath, report, hooks) }
+}
+if proxyProcess.processId > 0 {
+    system.sendSignal(proxyProcess.processId, 15)
+    if soak.waitFor(proxyProcess, 5000) == soak.PENDING { soak.stop(proxyProcess) }
+}
+stopRole(client)
+stopRole(server)
+if failure != "" { abort(failure) }
+fixtures.finish(context)

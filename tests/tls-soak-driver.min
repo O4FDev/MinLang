@@ -1,0 +1,151 @@
+use "./soak-observer.min" as soak
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+function usage(message: Text) {
+    system.writeStandardError("tls-soak-driver: error: " + message + "\n")
+    exit(2)
+}
+function append(file: Integer, offset: Integer, text: Text): Integer {
+    let data = Bytes(text + "\n")
+    test.check(files.writeAt(file, data, 0, data.length, offset) == data.length, "append soak evidence")
+    return offset + data.length
+}
+function commaList(items: List<Text>): Text {
+    let quoted: List<Text> = []
+    for item in items { quoted.add(json.quote(item)) }
+    let text = ""
+    for index in 0..quoted.length {
+        if index > 0 { text = text + ", " }
+        text = text + quoted[index]
+    }
+    return "[" + text + "]"
+}
+function sampleJson(sample: soak.Sample): Text {
+    if !sample.present { return "{}" }
+    return "{\"cpu_seconds\": " + Text(sample.cpuSeconds) + ", \"rss_kib\": " + soak.number(sample.rssKib) + "}"
+}
+function firstLine(path: Text, process: soak.Child, seconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + seconds * 1000000000
+    while system.monotonicNanoseconds() < deadline {
+        let lines = Text(files.readFile(path)).split("\n")
+        if lines.length > 1 { return lines[0].trim() }
+        if soak.poll(process) != soak.PENDING { return "" }
+        soak.nap(20)
+    }
+    return ""
+}
+
+fixtures.arguments(["--sanitize"], ["--seconds", "--connections", "--output", "--binary"])
+let sanitize = fixtures.flag("--sanitize")
+let seconds = Integer(fixtures.option("--seconds", "7200"))
+let connections = Integer(fixtures.option("--connections", "64"))
+let output = fixtures.option("--output", "")
+let prebuilt = fixtures.option("--binary", "")
+if output == "" { usage("the following arguments are required: --output") }
+if prebuilt != "" && files.pathSize(prebuilt) < 0 { usage("prebuilt binary must be a file") }
+soak.requireRemoteLab()
+if seconds < 1 || seconds > 86400 || connections < 1 || connections > 512 { usage("invalid duration or connection count") }
+test.check(files.pathSize(output) < 0, "output directory already exists: " + output)
+let context = fixtures.context(false)
+if !fixtures.starts(output, "/") { output = context.root + "/" + output }
+fixtures.execute(context, ["mkdir", "-p", output], 10, "create output")
+let certificates = fixtures.authority(context, output)
+fixtures.root(certificates, "root")
+fixtures.leaf(certificates, "server", "root", fixtures.options())
+fixtures.leaf(certificates, "client", "root", fixtures.usage("clientAuth"))
+let peer = fixtures.helper(context, "tests/tls-soak-peer.c", "tls-soak-peer", "$(pkg-config --cflags --libs openssl)")
+let status = output + "/server-stats.json"
+let server = soak.launchFiles([peer, "serve", fixtures.path(certificates, "server", "pem"), fixtures.path(certificates, "server", "key"), fixtures.path(certificates, "root", "pem"), status],
+    context.environment, output + "/server.stdout", output + "/server.stderr")
+test.check(server.processId > 0, "launch OpenSSL soak server")
+let ready = firstLine(output + "/server.stdout", server, 15)
+if !fixtures.starts(ready, "READY ") {
+    soak.stop(server)
+    test.check(false, "OpenSSL soak server did not become ready\n" + Text(files.readFile(output + "/server.stderr")))
+}
+let port = fixtures.split(ready, 32)[1]
+let environment = context.environment
+if sanitize {
+    let flags = "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+    for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { environment = fixtures.withSetting(environment, name, flags) }
+    environment = fixtures.withSetting(fixtures.withSetting(environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let program = output + "/client"
+let compileCommand: List<Text> = []
+if prebuilt != "" { program = prebuilt }
+else {
+    compileCommand = [context.root + "/minyar", "--library", context.root + "/library", context.root + "/tests/tls-soak.min", "-o", program]
+    let compiled = test.run(compileCommand, environment, "", output + "/compile", 600)
+    test.check(compiled.status == 0, "compile TLS soak client\n" + compiled.errorOutput)
+}
+let runCommand = [program, port, Text(seconds), Text(connections), fixtures.path(certificates, "root", "der"), fixtures.path(certificates, "client", "der"), fixtures.path(certificates, "client", "pk8")]
+let started = system.wallClockMicroseconds()
+let complete = false
+let failure = ""
+let evidence = files.open(output + "/samples.jsonl", files.WRITE | files.CREATE | files.TRUNCATE)
+test.check(evidence >= 0, "create samples")
+let offset = 0
+let process = soak.launch(runCommand, environment, output + "/stderr.log")
+test.check(process.processId > 0, "launch TLS soak client")
+let observer = soak.observe(process, Float(seconds + 120), 1.0)
+let event = soak.next(observer)
+while !soak.terminal(event.kind) {
+    let stats = fixtures.strip(Text(files.readFile(status)))
+    if stats == "" { stats = "{}" }
+    if event.kind == soak.SAMPLE {
+        let row = sampleJson(event.sample)
+        let fields = "\"elapsed_seconds\": " + Text(event.elapsed)
+        if row != "{}" { fields = fields + ", " + Text(Bytes(row).slice(1, Bytes(row).length - 1)) }
+        offset = append(evidence, offset, "{" + fields + ", \"controller\": " + sampleJson(soak.processSample(system.processId())) + ", \"server\": " + stats + "}")
+    } else {
+        if fixtures.starts(event.line, "complete ") { complete = true }
+        offset = append(evidence, offset, "{\"line\": " + json.quote(event.line) + ", \"elapsed_seconds\": " + Text(event.elapsed) + ", \"server\": " + stats + "}")
+    }
+    event = soak.next(observer)
+}
+if event.kind != soak.DONE { failure = event.message }
+files.close(evidence)
+let exitStatus = soak.waitFor(process, 15000)
+system.sendSignal(server.processId, 15)
+let serverStatus = soak.waitFor(server, 30000)
+if serverStatus == soak.PENDING { soak.stop(server) }
+let serverLines = test.lines(Text(files.readFile(output + "/server.stdout")))
+let shutdown = json.parse("{}")
+if serverLines.length > 1 { shutdown = json.parse(serverLines[serverLines.length - 1]) }
+let serverStats = json.member(shutdown, "stats")
+let unexpected = json.member(shutdown, "unexpected")
+let diagnostics = Text(files.readFile(output + "/stderr.log"))
+let summary = soak.summary(60.0)
+for line in Text(files.readFile(output + "/samples.jsonl")).split("\n") {
+    if line != "" {
+        let row = json.parse(line)
+        let rss = json.member(row, "rss_kib")
+        if rss.kind == json.NUMBER { soak.include(summary, json.member(row, "elapsed_seconds").number, rss.number) }
+    }
+}
+let sanitized = "null"
+if prebuilt == "" { sanitized = Text(sanitize) }
+let compileJson = "null"
+if compileCommand.length > 0 { compileJson = commaList(compileCommand) }
+let summaryFields = soak.summaryJson(summary)
+let failureJson = "null"
+if failure != "" { failureJson = json.quote(failure) }
+let report = "{\"binary_sha256\": " + json.quote(fixtures.split(fixtures.execute(context, ["sha256sum", "--", program], 60, "hash client").output, 32)[0]) +
+    ", \"command\": " + commaList(runCommand) + ", \"compile_command\": " + compileJson + ", \"diagnostics_empty\": " + Text(diagnostics == "") + ", \"status\": " + Text(exitStatus) +
+    ", \"duration_seconds\": " + Text(Float(system.wallClockMicroseconds() - started) / 1000000.0) + ", \"connections\": " + Text(connections) + ", \"sanitized\": " + sanitized +
+    ", \"sanitized_requested\": " + Text(sanitize) + ", \"binary_prebuilt\": " + Text(prebuilt != "") + ", \"controller_pid\": " + Text(system.processId()) +
+    ", \"target_pid\": " + Text(process.processId) + ", \"server_pid\": " + Text(server.processId) + ", \"server_status\": " + Text(serverStatus) +
+    ", \"controller_role\": \"observer; the OpenSSL TLS server is a separate process\", \"server\": " + json.pretty(serverStats, "") +
+    ", \"unexpected_server_errors\": " + json.pretty(unexpected, "") + ", \"retained_server_connections\": " + json.pretty(json.member(shutdown, "retained"), "") +
+    ", \"observer_failure\": " + failureJson + ", \"completed\": " + Text(complete) + ", " + Text(Bytes(summaryFields).slice(1, Bytes(summaryFields).length - 1)) +
+    ", \"scope\": \"Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included\"}"
+writeTextFile(output + "/report.json", json.pretty(json.parse(report), "  ") + "\n")
+print(report)
+test.check(exitStatus == 0 && unexpected.items.length == 0 && failure == "" && diagnostics == "" && serverStatus == 0, "soak failed; inspect evidence")
+test.check(complete, "client did not complete")
+test.check(json.member(serverStats, "responses").number > 0.0, "no authenticated response received")
+fixtures.finish(context)

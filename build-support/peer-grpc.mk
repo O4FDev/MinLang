@@ -1,18 +1,4 @@
 # Pinned independent peers are test-only. Native modules import no Python stack.
-PEER_GRPC_PYTHON ?= build/peergrpc-venv/bin/python
-# An explicitly selected interpreter must have the same pinned native peers.
-# It never builds an unrelated venv with the host's default Python.
-PEER_GRPC_BOOTSTRAP = $(if $(filter build/peergrpc-venv/bin/python,$(PEER_GRPC_PYTHON)),build/peergrpc-venv/.ready)
-.PHONY: check-peer-grpc-python
-check-peer-grpc-python: $(PEER_GRPC_BOOTSTRAP)
-	"$(PEER_GRPC_PYTHON)" scripts/check-peer-python.py
-
-build/peergrpc-venv/.ready: tests/interop/peergrpc/requirements.txt scripts/check-peer-python.py
-	python3 -m venv build/peergrpc-venv
-	GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 build/peergrpc-venv/bin/pip --disable-pip-version-check install -r tests/interop/peergrpc/requirements.txt
-	build/peergrpc-venv/bin/python scripts/check-peer-python.py
-	touch $@
-
 build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/edge.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum | build
 	cd tests/interop/peergrpc && GOMAXPROCS=2 go build -mod=readonly -trimpath -o "$(abspath $@).tmp" . && "$(abspath $@).tmp" self-test
 	mv -f "$@.tmp" "$@"
@@ -131,10 +117,12 @@ check: check-peer-edge-pki
 check-sanitize: check-peer-edge-pki-sanitize
 
 # The independent device peer stays outside default CI and sustained-load runs.
-PEER_EDGE_SCALE_PYTHON ?= python3
 .PHONY: check-peer-edge-device-scale-controls check-peer-edge-device-scale-peer
-check-peer-edge-device-scale-controls:
-	"$(PEER_EDGE_SCALE_PYTHON)" -B tests/peer-edge-device-scale-controls.py
+build/tooling/tests/peer-edge-device-scale-controls-test.ll: tests/peer-edge-scale.min tests/net-fixtures.min tests/cpython-random.min
+build/tooling/tests/peer-edge-device-scale-controls-test: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/peer-edge-device-scale-controls-test: build/testing/cycle-runtime.o
+check-peer-edge-device-scale-controls: build/peergrpc-peer build/tooling/tests/peer-edge-device-scale-controls-test
+	./build/tooling/tests/peer-edge-device-scale-controls-test
 
 check-peer-edge-device-scale-peer:
 	CARGO_BUILD_JOBS=1 cargo test --release --locked --manifest-path tests/interop/quinn/Cargo.toml --bin peer-edge-scale -j1

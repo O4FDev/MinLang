@@ -1,0 +1,134 @@
+use "./soak-observer.min" as soak
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+function usage(message: Text) {
+    system.writeStandardError("net-soak-driver: error: " + message + "\n")
+    exit(2)
+}
+function append(file: Integer, offset: Integer, text: Text): Integer {
+    let data = Bytes(text + "\n")
+    test.check(files.writeAt(file, data, 0, data.length, offset) == data.length, "append soak evidence")
+    return offset + data.length
+}
+function commaList(items: List<Text>): Text {
+    let text = ""
+    for index in 0..items.length {
+        if index > 0 { text = text + ", " }
+        text = text + json.quote(items[index])
+    }
+    return "[" + text + "]"
+}
+function sampleFields(sample: soak.Sample): Text {
+    if !sample.present { return "" }
+    return ", \"cpu_seconds\": " + Text(sample.cpuSeconds) + ", \"rss_kib\": " + soak.number(sample.rssKib)
+}
+function sampleObject(sample: soak.Sample): Text {
+    if !sample.present { return "{}" }
+    return "{\"cpu_seconds\": " + Text(sample.cpuSeconds) + ", \"rss_kib\": " + soak.number(sample.rssKib) + "}"
+}
+function wall(): Text { return Text(Float(system.wallClockMicroseconds()) / 1000000.0) }
+
+fixtures.arguments(["--sanitize"], ["--seconds", "--connections", "--output", "--binary"])
+let sanitize = fixtures.flag("--sanitize")
+let seconds = Integer(fixtures.option("--seconds", "7200"))
+let connections = Integer(fixtures.option("--connections", "4096"))
+let output = fixtures.option("--output", "")
+let prebuilt = fixtures.option("--binary", "")
+if output == "" { usage("the following arguments are required: --output") }
+if prebuilt != "" && files.pathSize(prebuilt) < 0 { usage("prebuilt binary must be a file") }
+soak.requireRemoteLab()
+if seconds < 1 || seconds > 86400 || connections < 1 || connections > 10000 { usage("seconds must be 1..86400 and connections 1..10000") }
+test.check(files.pathSize(output) < 0, "output directory already exists: " + output)
+let context = fixtures.context(false)
+if !fixtures.starts(output, "/") { output = context.root + "/" + output }
+fixtures.execute(context, ["mkdir", "-p", output], 10, "create output")
+let flags = ["-O2"]
+if sanitize { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let executable = output + "/soak"
+if prebuilt != "" { executable = prebuilt }
+let clang = fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang")
+let command = [clang, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-Wall", "-Wextra", "-Werror"]
+for flag in flags { command.add(flag) }
+for item in [context.root + "/tests/net-soak.c", context.root + "/runtime/minyar_runtime.c", "-lm", "-o", executable] { command.add(item) }
+let compileJson = "null"
+if prebuilt == "" {
+    compileJson = commaList(command)
+    fixtures.execute(context, command, 600, "compile network soak")
+}
+let runCommand = [executable, Text(seconds), Text(connections)]
+let environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1")
+let started = system.wallClockMicroseconds()
+let samples = 0
+let lastSample = "null"
+let lastPeer = "null"
+let registrySlots = -1.0
+let complete = false
+let failure = ""
+let evidence = files.open(output + "/samples.jsonl", files.WRITE | files.CREATE | files.TRUNCATE)
+test.check(evidence >= 0, "create samples")
+let offset = 0
+let process = soak.launch(runCommand, environment, output + "/stderr.log")
+test.check(process.processId > 0, "launch network soak")
+let observer = soak.observe(process, Float(seconds + 120), 1.0)
+let event = soak.next(observer)
+while !soak.terminal(event.kind) {
+    if event.kind == soak.SAMPLE {
+        let row = "{\"elapsed_seconds\": " + Text(event.elapsed) + sampleFields(event.sample) + ", \"controller\": " + sampleObject(soak.processSample(system.processId())) +
+            ", \"wall_time\": " + wall() + "}"
+        offset = append(evidence, offset, row)
+        if event.sample.present {
+            samples += 1
+            lastSample = row
+        }
+    } else {
+        let peer = json.parse(event.line)
+        if peer.kind != json.OBJECT {
+            failure = "network soak line is not a JSON object"
+            soak.close(observer)
+            break
+        }
+        let phase = json.string(peer, "phase")
+        if phase == "sample" {
+            lastPeer = event.line
+            registrySlots = json.member(peer, "registry_slots").number
+        }
+        if phase == "complete" { complete = true }
+        offset = append(evidence, offset, "{\"line\": " + json.quote(event.line) + ", \"elapsed_seconds\": " + Text(event.elapsed) + ", \"peer\": " + event.line + ", \"wall_time\": " + wall() + "}")
+    }
+    event = soak.next(observer)
+}
+if failure == "" && event.kind != soak.DONE { failure = event.message }
+files.close(evidence)
+let status = soak.waitFor(process, 15000)
+let diagnostics = Text(files.readFile(output + "/stderr.log"))
+let summary = soak.summary(60.0)
+for line in Text(files.readFile(output + "/samples.jsonl")).split("\n") {
+    if line != "" {
+        let row = json.parse(line)
+        let rss = json.member(row, "rss_kib")
+        if rss.kind == json.NUMBER { soak.include(summary, json.member(row, "elapsed_seconds").number, rss.number) }
+    }
+}
+let sanitized = "null"
+if prebuilt == "" { sanitized = Text(sanitize) }
+let failureJson = "null"
+if failure != "" { failureJson = json.quote(failure) }
+let summaryFields = soak.summaryJson(summary)
+let report = "{\"binary_sha256\": " + json.quote(fixtures.split(fixtures.execute(context, ["sha256sum", "--", executable], 60, "hash soak").output, 32)[0]) +
+    ", \"controller_pid\": " + Text(system.processId()) + ", \"target_pid\": " + Text(process.processId) + ", \"controller_role\": \"native socket observer\"" +
+    ", \"command\": " + commaList(runCommand) + ", \"compile_command\": " + compileJson + ", \"diagnostics_empty\": " + Text(diagnostics == "") +
+    ", \"seconds_requested\": " + Text(seconds) + ", \"connections\": " + Text(connections) + ", \"status\": " + Text(status) + ", \"samples\": " + Text(samples) +
+    ", \"wall_seconds\": " + Text(Float(system.wallClockMicroseconds() - started) / 1000000.0) + ", \"sanitized\": " + sanitized + ", \"sanitized_requested\": " + Text(sanitize) +
+    ", \"binary_prebuilt\": " + Text(prebuilt != "") + ", \"last_sample\": " + lastSample + ", \"last_peer\": " + lastPeer + ", \"observer_failure\": " + failureJson +
+    ", \"completed\": " + Text(complete) + ", " + Text(Bytes(summaryFields).slice(1, Bytes(summaryFields).length - 1)) +
+    ", \"scope\": \"native TCP/UDP/readiness/timers; no TLS or QUIC transport\"}"
+writeTextFile(output + "/report.json", json.pretty(json.parse(report), "  ") + "\n")
+print(report)
+test.check(status == 0 && complete && failure == "" && diagnostics == "", "soak crashed or timed out; inspect evidence")
+test.check(samples > 0, "soak emitted no samples")
+test.check(lastPeer != "null" && registrySlots <= Float(connections + 2), "registry growth")
+fixtures.finish(context)

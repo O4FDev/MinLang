@@ -1,0 +1,707 @@
+use "./soak-observer.min" as soak
+use "./quic-soak-adapter.min" as adapter
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "net" as net
+
+record Row { elapsed: Float; timed: Boolean; rss: Float; measured: Boolean }
+record Pending { data: Bytes }
+record Quiet { child: soak.Child; connection: Integer; output: Text; errors: Text }
+record History { count: Integer; checkpoints: Integer; peak: Float; now: Float; released: Boolean; detail: Integer }
+record Roles { rows: Integer; now: Float; peerReleased: Boolean; serverReleased: Boolean; failures: List<Text> }
+
+function child(command: List<Text>, work: Text, name: Text): soak.Child {
+    let launched = soak.launch(command, system.environment(), work + "/" + name + ".err")
+    test.check(launched.processId > 0, "launch " + name + " (" + Text(launched.processId) + ")")
+    return launched
+}
+function drain(observer: soak.Observer, lines: List<Text>): soak.Event {
+    let event = soak.next(observer)
+    while !soak.terminal(event.kind) {
+        if event.kind == soak.LINE { lines.add(event.line) }
+        event = soak.next(observer)
+    }
+    return event
+}
+function seconds(started: Integer): Float { return Float(system.monotonicNanoseconds() - started) / 1000000000.0 }
+function reaped(process: soak.Child) {
+    if soak.poll(process) == soak.PENDING { soak.stop(process) }
+    soak.closeOutput(process)
+}
+
+function silentPeer(work: Text) {
+    let process = child(["/bin/sleep", "10"], work, "silent")
+    let started = system.monotonicNanoseconds()
+    let end = drain(soak.observe(process, 0.1, 0.02), [])
+    test.check(end.kind == soak.TIMEOUT, "silent peer must reach the independent deadline: " + end.message)
+    test.check(soak.poll(process) != soak.PENDING, "silent peer was not reaped")
+    test.check(seconds(started) < 2.0, "silent peer held the harness")
+    reaped(process)
+}
+function fragmentedLines(work: Text) {
+    let process = child(["/bin/sh", "-c", "printf first; sleep 0.03; printf '\\nsecond'"], work, "fragmented")
+    let lines: List<Text> = []
+    let end = drain(soak.observe(process, 2.0, 0.01), lines)
+    test.check(end.kind == soak.DONE, "fragmented output did not complete: " + end.message)
+    test.check(lines.length == 2 && lines[0] == "first" && lines[1] == "second", "fragmented lines and unterminated EOF: " + Text(lines.length) + " lines")
+    test.check(soak.poll(process) == 0, "fragmented writer status " + Text(process.status))
+}
+function unboundedOutput(work: Text) {
+    let burst = child(["/bin/sh", "-c", "head -c 100000 /dev/zero | tr '\\000' x; sleep 10"], work, "burst")
+    let end = drain(soak.observe(burst, 2.0, 0.02), [])
+    test.check(end.kind == soak.FAILED && end.message == "soak output line exceeded 64 KiB", "unbounded burst was not rejected: " + end.message)
+    test.check(soak.poll(burst) != soak.PENDING, "unbounded writer was not reaped")
+    let endless = child(["/bin/sh", "-c", "tr '\\000' x </dev/zero"], work, "endless")
+    let started = system.monotonicNanoseconds()
+    end = drain(soak.observe(endless, 2.0, 0.02), [])
+    test.check(end.kind == soak.FAILED && end.message == "soak output line exceeded 64 KiB", "endless writer was not rejected: " + end.message)
+    test.check(soak.poll(endless) != soak.PENDING && seconds(started) < 2.0, "endless writer was not bounded and reaped")
+    let invalid = child(["/bin/sh", "-c", "printf 'ok\\n\\377\\n'"], work, "invalid")
+    let lines: List<Text> = []
+    end = drain(soak.observe(invalid, 2.0, 0.02), lines)
+    test.check(lines.length == 1 && lines[0] == "ok" && end.kind == soak.FAILED && end.message == "soak output line is not UTF-8", "invalid UTF-8 line was accepted: " + end.message)
+}
+function heldOutput(work: Text) {
+    let process = child(["/bin/sh", "-c", "sleep 10 &"], work, "held")
+    test.check(soak.waitFor(process, 5000) == 0, "parent with held stdout did not exit")
+    let end = drain(soak.observe(process, 0.15, 0.02), [])
+    test.check(end.kind == soak.TIMEOUT, "descendant-held stdout ended observation early: " + end.message)
+    test.check(soak.poll(process) == 0, "parent status changed")
+}
+function dispositions(): List<Integer> { return [soak.disposition(15), soak.disposition(2)] }
+function same(left: List<Integer>, right: List<Integer>): Boolean { return left[0] == right[0] && left[1] == right[1] }
+function interruptBetweenSamples(work: Text) {
+    for value in [15, 2] {
+        let process = child(["/bin/sleep", "10"], work, "interrupted-" + Text(value))
+        let previous = dispositions()
+        let observer = soak.observe(process, 2.0, 0.01)
+        let first = soak.next(observer)
+        test.check(first.kind == soak.SAMPLE, "observer did not sample before interruption")
+        test.check(system.sendSignal(system.processId(), value) == 0, "raise signal " + Text(value))
+        let end = soak.next(observer)
+        test.check(end.kind == soak.INTERRUPTED && end.message == "soak observation interrupted by signal " + Text(value), "signal " + Text(value) + " did not interrupt: " + end.message)
+        test.check(soak.poll(process) != soak.PENDING, "interrupted child was not reaped")
+        test.check(same(dispositions(), previous), "previous dispositions were not restored after signal " + Text(value))
+        soak.close(observer)
+        reaped(process)
+    }
+}
+function readLine(process: soak.Child, buffer: Pending, milliseconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while system.monotonicNanoseconds() < deadline {
+        for index in 0..buffer.data.length {
+            if buffer.data[index] == 10 {
+                let line = Text(buffer.data.slice(0, index))
+                buffer.data = buffer.data.slice(index + 1, buffer.data.length)
+                return line
+            }
+        }
+        if net.ready(process.output, 50) {
+            let data = net.receive(process.output, 8192)
+            if data.length == 0 { return "" }
+            buffer.data.addBytes(data)
+        }
+    }
+    return ""
+}
+function isolatedChild(work: Text) {
+    let previous = soak.subreaper(1)
+    test.check(previous >= 0, "enable child subreaper")
+    for value in [15, 2] {
+        let errors = work + "/driver-" + Text(value) + ".err"
+        let driver = soak.launch(["/proc/self/exe", "--driver"], system.environment(), errors)
+        test.check(driver.processId > 0, "launch interrupted driver")
+        let buffer = Pending { data: Bytes() }
+        let ready = readLine(driver, buffer, 10000)
+        test.check(ready != "", "observer did not enter before interruption")
+        let target = Integer(json.member(json.parse(ready), "ready").number)
+        let group = soak.statFields(target)
+        test.check(group.length > 2 && group[2] == Text(target), "observed child does not own its process group")
+        let started = system.monotonicNanoseconds()
+        test.check(system.sendSignal(driver.processId, value) == 0, "signal driver")
+        let status = soak.waitFor(driver, 2000)
+        let report = readLine(driver, buffer, 2000)
+        let elapsed = seconds(started)
+        print("{\"signal\": " + Text(value) + ", \"driver_status\": " + Text(status) + ", \"child_exists\": " + Text(soak.exists(target)) +
+            ", \"group_exists\": " + Text(soak.groupExists(target)) + ", \"elapsed_seconds\": " + Text(elapsed) + "}")
+        test.check(status == 17, "driver status " + Text(status) + "\n" + Text(files.readFile(errors)))
+        let result = json.parse(report)
+        test.check(json.string(result, "interruption") == "INTERRUPTED", "driver did not report interruption: " + report)
+        test.check(json.member(result, "child_status").kind == json.NUMBER, "driver child was not reaped: " + report)
+        test.check(json.member(result, "restored").truth, "driver dispositions were not restored: " + report)
+        test.check(files.readFile(errors).length == 0, "driver wrote diagnostics")
+        test.check(elapsed < 2.0, "interruption cleanup exceeded two seconds")
+        test.check(!soak.exists(target) && !soak.groupExists(target), "isolated child survived interruption")
+        soak.closeOutput(driver)
+        if soak.poll(driver) == soak.PENDING { soak.stop(driver) }
+        system.sendSignal(-target, 9)
+        soak.reapAny(target)
+    }
+    test.check(soak.subreaper(previous) == 1, "restore child subreaper")
+}
+function driver() {
+    soak.setDisposition(15, 0)
+    soak.setDisposition(2, 0)
+    let previous = dispositions()
+    let process = soak.launch(["/bin/sleep", "30"], system.environment(), "")
+    test.check(process.processId > 0, "launch driver child")
+    let observer = soak.observe(process, 10.0, 0.01)
+    soak.next(observer)
+    files.writeStandardOutput("{\"ready\": " + Text(process.processId) + "}\n")
+    let end = drain(observer, [])
+    if end.kind != soak.INTERRUPTED {
+        system.writeStandardError("interruption unexpectedly completed\n")
+        exit(1)
+    }
+    let status = "null"
+    if soak.poll(process) != soak.PENDING { status = Text(process.status) }
+    files.writeStandardOutput("{\"interruption\": \"INTERRUPTED\", \"child_status\": " + status + ", \"restored\": " + Text(same(dispositions(), previous)) + "}\n")
+    exit(17)
+}
+function restoredOnSuccessAndFailure(work: Text) {
+    let original = dispositions()
+    soak.setDisposition(15, 1)
+    soak.setDisposition(2, 1)
+    let timeouts = [1.0, 0.05]
+    let expected = [soak.DONE, soak.TIMEOUT]
+    for index in 0..2 {
+        let process = child(["/bin/sleep", "0.2"], work, "sentinel-" + Text(index))
+        let end = drain(soak.observe(process, timeouts[index], 0.01), [])
+        test.check(end.kind == expected[index], "sentinel observation " + Text(index) + " ended with " + Text(end.kind) + ": " + end.message)
+        test.check(soak.disposition(15) == 1 && soak.disposition(2) == 1, "previous handler was not restored after observation " + Text(index))
+        reaped(process)
+    }
+    soak.setDisposition(15, original[0])
+    soak.setDisposition(2, original[1])
+}
+function rssTrend() {
+    let plateau = soak.summary(10.0)
+    let growth = soak.summary(10.0)
+    for n in 0..100 {
+        soak.include(plateau, Float(n), Float(1000 + n % 3))
+        soak.include(growth, Float(n), Float(1000 + n * 100))
+    }
+    test.check(abs(soak.slope(plateau)) < 0.01, "plateau slope " + Text(soak.slope(plateau)))
+    test.check(abs(soak.slope(growth) - 100.0) < 0.00000005, "growth slope " + Text(soak.slope(growth)))
+}
+function row(elapsed: Float, rss: Float): Row { return Row { elapsed: elapsed; timed: true; rss: rss; measured: true } }
+function close(left: Float, right: Float): Boolean {
+    let tolerance = max(0.000000001 * max(abs(left), abs(right)), 0.000000000001)
+    return abs(left - right) <= tolerance
+}
+function streamingReference() {
+    let zero = 0.0
+    let missing = zero / zero
+    let cases: List<List<Row>> = [[], [row(59.0, 999.0)], [row(60.0, 1000.0)], [row(70.0, 1000.0), row(70.0, 1300.0), row(70.0, 1100.0)],
+        [row(59.0, 9000.0), Row { elapsed: 0.0; timed: false; rss: 0.0; measured: false }, row(60.0, 1000.0), row(61.0, 1010.0), row(missing, 9999.0)],
+        [row(100.0, 1300.0), row(61.0, 990.0), row(80.0, 1100.0), row(62.0, 1030.0)]]
+    let large: List<Row> = []
+    for i in 0..3000 { large.add(row(Float((i * 97) % 503 + 60), Float(1000 + (i * 53) % 997))) }
+    cases.add(large)
+    for rows in cases {
+        for warmup in [0.0, 60.0, 75.0, 10000.0] {
+            let warm: List<Row> = []
+            for item in rows {
+                let elapsed = 0.0
+                if item.timed { elapsed = item.elapsed }
+                if elapsed >= warmup && item.measured { warm.add(item) }
+            }
+            let actual = soak.summary(warmup)
+            for item in rows {
+                if item.measured {
+                    let elapsed = 0.0
+                    if item.timed { elapsed = item.elapsed }
+                    soak.include(actual, elapsed, item.rss)
+                }
+            }
+            let label = Text(rows.length) + " rows warmup " + Text(warmup)
+            test.check(actual.count == warm.length, "streaming count " + label)
+            if warm.length == 0 {
+                test.check(soak.summaryJson(actual) == "{\"warm_rss_min_kib\": null, \"warm_rss_max_kib\": null, \"rss_slope_kib_per_second\": null}", "empty summary " + label)
+            } else {
+                let xmean = 0.0
+                let ymean = 0.0
+                let low = warm[0].rss
+                let high = warm[0].rss
+                for item in warm {
+                    xmean += item.elapsed
+                    ymean += item.rss
+                    low = min(low, item.rss)
+                    high = max(high, item.rss)
+                }
+                xmean = xmean / Float(warm.length)
+                ymean = ymean / Float(warm.length)
+                let numerator = 0.0
+                let denominator = 0.0
+                for item in warm {
+                    numerator += (item.elapsed - xmean) * (item.rss - ymean)
+                    denominator += (item.elapsed - xmean) * (item.elapsed - xmean)
+                }
+                let wanted = 0.0
+                if denominator != 0.0 { wanted = numerator / denominator }
+                test.check(actual.low == low && actual.high == high, "streaming bounds " + label)
+                test.check(close(soak.slope(actual), wanted), "streaming slope " + label + ": " + Text(soak.slope(actual)) + " != " + Text(wanted))
+            }
+        }
+    }
+}
+function summaryRows() {
+    let own = system.processId()
+    let base = soak.processSample(own).rssKib
+    let peak = base
+    let count = 16000
+    let result = soak.summary(60.0)
+    let filler = Bytes()
+    for index in 0..2048 { filler.add(120) }
+    for index in 0..count {
+        if index % 128 == 0 { peak = max(peak, soak.processSample(own).rssKib) }
+        let line = Text(index) + ":" + Text(filler)
+        let item = Row { elapsed: Float((index * 97) % 10007 + 60); timed: true; rss: Float(1000 + (index * 53) % 997); measured: line.byteLength > 0 }
+        if item.measured { soak.include(result, item.elapsed, item.rss) }
+    }
+    peak = max(peak, soak.processSample(own).rssKib)
+    files.writeStandardOutput("{\"pid\": " + Text(own) + ", \"rows\": " + Text(count) + ", \"rss_base_kib\": " + soak.number(base) + ", \"peak_rss_kib\": " + soak.number(peak) +
+        ", \"retained_growth_kib\": " + soak.number(peak - base) + ", \"summary\": " + soak.summaryJson(result) + "}\n")
+}
+function boundedSummary(work: Text) {
+    let process = soak.launchFiles(["/proc/self/exe", "--summary-rows"], system.environment(), work + "/summary.out", work + "/summary.err")
+    test.check(process.processId > 0, "launch summary process")
+    let status = soak.waitFor(process, 30000)
+    if status == soak.PENDING { soak.stop(process) }
+    test.check(status == 0, "summary process status " + Text(status) + "\n" + Text(files.readFile(work + "/summary.err")))
+    test.check(files.readFile(work + "/summary.err").length == 0, "summary process wrote diagnostics")
+    let output = Text(files.readFile(work + "/summary.out"))
+    print(test.replace(output, "\n", ""))
+    let result = json.parse(output)
+    let summary = json.member(result, "summary")
+    test.check(json.member(result, "rows").number == 16000.0, "summary rows")
+    test.check(json.member(summary, "warm_rss_min_kib").number == 1000.0 && json.member(summary, "warm_rss_max_kib").number == 1996.0, "summary bounds " + output)
+    let pid = Integer(json.member(result, "pid").number)
+    test.check(!soak.exists(pid) && !soak.groupExists(pid), "summary process remained")
+    test.check(json.member(result, "retained_growth_kib").number <= 16384.0, "summary exceeded unchanged 16 MiB span")
+}
+
+constant MEBIBYTES_24 = 25165824
+function quietChild(port: Integer, status: Integer, burn: Boolean) {
+    let data = Bytes(MEBIBYTES_24)
+    for index in 0..(MEBIBYTES_24 / 4096) { data[index * 4096] = 1 }
+    if burn {
+        while soak.processSample(system.processId()).cpuSeconds < 0.03 { data[0] = (data[0] + 1) & 255 }
+    }
+    let connection = net.connect("127.0.0.1", port)
+    test.check(connection >= 0, "quiet child connect")
+    net.send(connection, Bytes("ready\n"))
+    net.receive(connection, 1)
+    test.check(data.length == MEBIBYTES_24, "quiet child memory")
+    exit(status)
+}
+function quiet(listener: Integer, status: Integer, burn: Boolean, work: Text, name: Text): Quiet {
+    let output = work + "/" + name + ".out"
+    let errors = work + "/" + name + ".err"
+    let mode = "quiet"
+    if burn { mode = "burn" }
+    let process = soak.launchFiles(["/proc/self/exe", "--quiet-child", Text(net.localPort(listener)), Text(status), mode], system.environment(), output, errors)
+    test.check(process.processId > 0, "launch quiet child " + name)
+    test.check(net.ready(listener, 10000), "quiet child " + name + " did not connect")
+    let connection = net.accept(listener)
+    let buffer = Pending { data: Bytes() }
+    let deadline = system.monotonicNanoseconds() + 10000000000
+    while buffer.data.length < 6 && system.monotonicNanoseconds() < deadline {
+        if net.ready(connection, 100) {
+            let data = net.receive(connection, 16)
+            if data.length == 0 { break }
+            buffer.data.addBytes(data)
+        }
+    }
+    test.check(Text(buffer.data) == "ready\n", "quiet child " + name + " was not ready")
+    return Quiet { child: process; connection: connection; output: output; errors: errors }
+}
+function release(item: Quiet) {
+    net.send(item.connection, Bytes("\n"))
+    net.close(item.connection)
+}
+function quietRole(item: Quiet): adapter.Role { return adapter.role(item.child, item.output, item.errors) }
+function realSample(): Callback<Integer, soak.Sample> { return function(processId: Integer): soak.Sample { return soak.processSample(processId) } }
+function hooksWith(measure: Callback<Integer, soak.Sample>): adapter.Hooks {
+    let clock = function(): Float { return Float(system.monotonicNanoseconds()) / 1000000000.0 }
+    let pause = function(seconds: Float): Boolean { return true }
+    let write = function(path: Text, report: adapter.Report): Boolean { return adapter.writeReport(path, report) }
+    let counters = function(): Boolean { return true }
+    return adapter.Hooks { clock: clock; pause: pause; measure: measure; checkpoint: write; refresh: counters }
+}
+function gone(processId: Integer): Boolean { return !soak.exists(processId) && !soak.groupExists(processId) }
+function peerTelemetry(work: Text) {
+    let listener = net.listen("127.0.0.1", 0, 4)
+    let item = quiet(listener, 0, true, work, "telemetry")
+    let hooks = hooksWith(realSample())
+    let observed = adapter.observation(quietRole(item), hooks)
+    test.check(observed.error == "" && observed.status == soak.PENDING, "live peer status " + observed.error)
+    test.check(observed.sample.rssBytes >= MEBIBYTES_24 && observed.sample.cpuSeconds > 0.0, "live peer telemetry rss=" + Text(observed.sample.rssBytes) + " cpu=" + Text(observed.sample.cpuSeconds))
+    test.check(observed.sample.state != "Z" && observed.sample.state != "X" && observed.sample.state != "x", "live peer state " + observed.sample.state)
+    release(item)
+    test.check(soak.waitFor(item.child, 2000) == 0, "telemetry peer exit")
+    test.check(files.readFile(item.output).length == 0 && files.readFile(item.errors).length == 0, "telemetry peer output")
+    let finished = adapter.observation(quietRole(item), hooks)
+    test.check(finished.status == 0 && !finished.sample.present && finished.error == "", "completed peer telemetry")
+    test.check(gone(item.child.processId), "telemetry peer remained")
+    net.close(listener)
+}
+function peerExitRace(work: Text) {
+    let listener = net.listen("127.0.0.1", 0, 4)
+    let item = quiet(listener, 0, false, work, "race")
+    let role = quietRole(item)
+    for failure in [soak.missing(), soak.absent()] {
+        let failing = function(processId: Integer): soak.Sample { return failure }
+        let observed = adapter.observation(role, hooksWith(failing))
+        test.check(observed.error != "", "unexpected live read failure was accepted")
+    }
+    test.check(soak.poll(item.child) == soak.PENDING, "peer ended during failed reads")
+    let racing = function(processId: Integer): soak.Sample {
+        test.check(processId == item.child.processId, "race sampled another process")
+        release(item)
+        test.check(soak.waitFor(item.child, 2000) == 0, "race peer exit")
+        return soak.processSample(processId)
+    }
+    let observed = adapter.observation(role, hooksWith(racing))
+    test.check(observed.error == "" && observed.status == 0 && !observed.sample.present, "exit between poll and sample: " + observed.error)
+    test.check(files.readFile(item.output).length == 0 && files.readFile(item.errors).length == 0, "race peer output")
+    test.check(gone(item.child.processId), "race peer remained")
+    net.close(listener)
+}
+function quicHistory(work: Text, result: Text) {
+    let listener = net.listen("127.0.0.1", 0, 4)
+    let server = quiet(listener, 0, false, work, "history-server")
+    let peer = quiet(listener, 0, false, work, "history-peer")
+    let own = system.processId()
+    let base = soak.processSample(own).rssKib
+    let state = History { count: 0; checkpoints: 0; peak: base; now: 100.0; released: false; detail: 0 }
+    let proxy = adapter.Proxy { forwarded: 0; dropped: 0; delayed: 0 }
+    let filler = Bytes()
+    for index in 0..2048 { filler.add(120) }
+    let measure = function(processId: Integer): soak.Sample {
+        let sample = soak.processSample(processId)
+        if processId == server.child.processId {
+            state.count += 1
+            state.now = 100.0 + Float(state.count) * 10.0
+            proxy.forwarded = state.count * 5
+            proxy.dropped = state.count
+            proxy.delayed = (state.count + 1) / 2
+            let detail = Text(state.count) + ":" + Text(filler)
+            state.detail = detail.byteLength
+        }
+        if processId == own {
+            state.peak = max(state.peak, sample.rssKib)
+            if state.count == 16000 && !state.released {
+                release(server)
+                release(peer)
+                test.check(soak.waitFor(server.child, 2000) == 0 && soak.waitFor(peer.child, 2000) == 0, "history children exit")
+                state.released = true
+            }
+        }
+        return sample
+    }
+    let clock = function(): Float { return state.now }
+    let pause = function(seconds: Float): Boolean { return true }
+    let checkpoint = function(path: Text, report: adapter.Report): Boolean {
+        state.checkpoints += 1
+        return true
+    }
+    let counters = function(): Boolean { return true }
+    let hooks = adapter.Hooks { clock: clock; pause: pause; measure: measure; checkpoint: checkpoint; refresh: counters }
+    let report = adapter.report()
+    adapter.put(report, "samples", "[]")
+    let path = work + "/history/report.json"
+    files.makeDirectory(work + "/history")
+    let observed = adapter.observeSamples(quietRole(server), quietRole(peer), proxy, 0.0, 200000.0, 1.0, path, report, hooks)
+    test.check(observed == "", "history observation: " + observed)
+    let finished = adapter.finishObservations(quietRole(server), quietRole(peer), proxy, path, report, hooks)
+    test.check(finished == "", "history finish: " + finished)
+    writeTextFile(result, "{\"pid\": " + Text(own) + ", \"births\": [" + Text(server.child.processId) + ", " + Text(peer.child.processId) + "], \"rows\": " + Text(state.count) +
+        ", \"checkpoints\": " + Text(state.checkpoints) + ", \"rss_base_kib\": " + soak.number(base) + ", \"peak_rss_kib\": " + soak.number(state.peak) +
+        ", \"retained_growth_kib\": " + soak.number(state.peak - base) + ", \"server_status\": " + adapter.value(report, "server_status") + ", \"client_status\": " +
+        adapter.value(report, "client_status") + ", \"server_stderr\": " + adapter.value(report, "server_stderr") + ", \"client_stderr\": " + adapter.value(report, "client_stderr") +
+        ", \"role_summaries\": " + adapter.value(report, "memory_summary_by_role") + "}\n")
+    net.close(listener)
+}
+function quicLongHistory(work: Text) {
+    let result = work + "/history.json"
+    let process = soak.launchFiles(["/proc/self/exe", "--quic-history", work, result], system.environment(), work + "/history-driver.out", work + "/history-driver.err")
+    test.check(process.processId > 0, "launch QUIC history driver")
+    let status = soak.waitFor(process, 120000)
+    if status == soak.PENDING { soak.stop(process) }
+    test.check(status == 0, "QUIC history driver status " + Text(status) + "\n" + Text(files.readFile(work + "/history-driver.err")))
+    test.check(files.readFile(work + "/history-driver.err").length == 0, "QUIC history driver wrote diagnostics")
+    let text = Text(files.readFile(result))
+    print(text.trim())
+    let value = json.parse(text)
+    test.check(json.member(value, "rows").number == 16000.0, "history rows")
+    test.check(json.member(value, "checkpoints").number == 16001.0, "history checkpoints")
+    test.check(json.member(value, "server_status").number == 0.0 && json.member(value, "client_status").number == 0.0, "history statuses")
+    test.check(json.string(value, "server_stderr") == "" && json.string(value, "client_stderr") == "", "history diagnostics")
+    test.check(gone(process.processId), "history driver remained")
+    for birth in json.member(value, "births").items { test.check(!soak.exists(Integer(birth.number)), "history child remained") }
+    test.check(json.member(value, "retained_growth_kib").number <= 16384.0, "observer exceeded unchanged 16 MiB span")
+    let summaries = json.member(value, "role_summaries")
+    test.check(summaries.keys.length == 3, "history role summaries")
+    for role in ["server", "controller", "peer"] {
+        let summary = json.member(summaries, role)
+        test.check(json.member(summary, "warm_rss_max_kib").number - json.member(summary, "warm_rss_min_kib").number <= 16384.0, role + " span")
+        test.check(json.member(summary, "rss_slope_kib_per_second").number <= 0.2, role + " slope")
+    }
+}
+function reference(rows: List<json.Value>, role: Text): List<Float> {
+    let points: List<Float> = []
+    for row in rows {
+        let selected = row
+        if role != "server" { selected = json.member(row, role) }
+        let elapsed = json.member(row, "elapsed_seconds").number
+        if elapsed >= 60.0 && selected.kind == json.OBJECT {
+            points.add(elapsed)
+            points.add(json.member(selected, "rss_bytes").number / 1024.0)
+        }
+    }
+    return points
+}
+function checkRoles(rows: List<json.Value>, summaries: json.Value, failures: List<Text>) {
+    for role in ["server", "controller", "peer"] {
+        let points = reference(rows, role)
+        let actual = json.member(summaries, role)
+        if points.length == 0 {
+            if json.member(actual, "rss_slope_kib_per_second").kind != json.NULL { failures.add(role + " empty summary") }
+        } else {
+            let count = points.length / 2
+            let x = 0.0
+            let y = 0.0
+            let low = points[1]
+            let high = points[1]
+            for index in 0..count {
+                x += points[index * 2]
+                y += points[index * 2 + 1]
+                low = min(low, points[index * 2 + 1])
+                high = max(high, points[index * 2 + 1])
+            }
+            x = x / Float(count)
+            y = y / Float(count)
+            let numerator = 0.0
+            let denominator = 0.0
+            for index in 0..count {
+                numerator += (points[index * 2] - x) * (points[index * 2 + 1] - y)
+                denominator += (points[index * 2] - x) * (points[index * 2] - x)
+            }
+            let wanted = 0.0
+            if denominator != 0.0 { wanted = numerator / denominator }
+            if json.member(actual, "warm_rss_min_kib").number != low || json.member(actual, "warm_rss_max_kib").number != high { failures.add(role + " bounds") }
+            if !close(json.member(actual, "rss_slope_kib_per_second").number, wanted) { failures.add(role + " slope") }
+            if high - low > 16384.0 { failures.add(role + " span") }
+        }
+    }
+}
+function rolesCase(work: Text, peerExit: Integer, listener: Integer): Text {
+    let name = "roles-" + Text(peerExit + 1)
+    let server = quiet(listener, 0, false, work, name + "-server")
+    let hasPeer = peerExit >= 0
+    let peer = server
+    if hasPeer { peer = quiet(listener, peerExit, false, work, name + "-peer") }
+    let state = Roles { rows: 0; now: 100.0; peerReleased: false; serverReleased: false; failures: [] }
+    let proxy = adapter.Proxy { forwarded: 0; dropped: 0; delayed: 0 }
+    let own = system.processId()
+    let finalRow = 8
+    if peerExit == 7 { finalRow = 3 }
+    let measure = function(processId: Integer): soak.Sample {
+        let sample = soak.processSample(processId)
+        if processId == server.child.processId {
+            state.rows += 1
+            state.now = 100.0 + 10.0 * Float(state.rows)
+            proxy.forwarded = state.rows * 5
+            proxy.dropped = state.rows
+            proxy.delayed = (state.rows + 1) / 2
+        }
+        if processId == own {
+            if hasPeer && state.rows == 3 && !state.peerReleased {
+                release(peer)
+                if soak.waitFor(peer.child, 2000) != peerExit { state.failures.add("peer exit") }
+                state.peerReleased = true
+            }
+            if state.rows == finalRow && !state.serverReleased {
+                release(server)
+                if soak.waitFor(server.child, 2000) != 0 { state.failures.add("server exit") }
+                state.serverReleased = true
+            }
+        }
+        return sample
+    }
+    let clock = function(): Float { return state.now }
+    let pause = function(seconds: Float): Boolean { return true }
+    let write = function(path: Text, report: adapter.Report): Boolean { return adapter.writeReport(path, report) }
+    let counters = function(): Boolean { return true }
+    let hooks = adapter.Hooks { clock: clock; pause: pause; measure: measure; checkpoint: write; refresh: counters }
+    let directory = work + "/" + name
+    files.makeDirectory(directory)
+    let path = directory + "/report.json"
+    let metadata = adapter.report()
+    adapter.put(metadata, "samples", "[]")
+    adapter.put(metadata, "server_pid", Text(server.child.processId))
+    adapter.put(metadata, "controller_pid", Text(own))
+    let peerRole = adapter.absentRole()
+    if hasPeer {
+        peerRole = quietRole(peer)
+        adapter.put(metadata, "peer_pid", Text(peer.child.processId))
+    } else {
+        adapter.put(metadata, "peer_pid", "null")
+    }
+    let observed = adapter.observeSamples(quietRole(server), peerRole, proxy, 0.0, 1000.0, 1.0, path, metadata, hooks)
+    test.check(observed == "", name + " observation: " + observed)
+    let rejected = adapter.finishObservations(quietRole(server), peerRole, proxy, path, metadata, hooks) != ""
+    let report = json.parse(Text(files.readFile(path)))
+    let rows = json.member(report, "samples").items
+    let failures = state.failures
+    if rejected != (peerExit == 7) { failures.add("rejection") }
+    let clientStatus = json.member(report, "client_status")
+    if json.member(report, "server_status").number != 0.0 { failures.add("server status") }
+    if hasPeer { if clientStatus.number != Float(peerExit) { failures.add("client status") } } else { if clientStatus.kind != json.NULL { failures.add("absent client status") } }
+    if json.string(report, "server_stderr") != "" || json.string(report, "client_stderr") != "" { failures.add("stderr") }
+    if rows.length != state.rows || rows.length != finalRow { failures.add("row count " + Text(rows.length)) }
+    let faults = json.member(report, "faults")
+    if json.member(faults, "forwarded").number != Float(rows.length * 5) || json.member(faults, "dropped").number != Float(rows.length) ||
+        json.member(faults, "reordered").number != Float((rows.length + 1) / 2) || faults.keys.length != 3 { failures.add("faults") }
+    for index in 0..rows.length {
+        let row = rows[index]
+        if json.member(row, "elapsed_seconds").number != Float(110 + index * 10) { failures.add("elapsed " + Text(index)) }
+        if json.member(row, "rss_bytes").number < Float(MEBIBYTES_24) || json.member(json.member(row, "controller"), "rss_bytes").number <= 0.0 { failures.add("rss " + Text(index)) }
+        if index > 0 {
+            let wanted = 100.0 * (json.member(row, "cpu_seconds").number - json.member(rows[index - 1], "cpu_seconds").number) / 10.0
+            if json.member(row, "interval_cpu_percent").number != wanted { failures.add("interval cpu " + Text(index)) }
+        }
+        let peerRow = json.member(row, "peer")
+        let peerStatus = json.member(row, "peer_status")
+        if hasPeer && index < 2 {
+            if peerStatus.kind != json.NULL || json.member(peerRow, "rss_bytes").number < Float(MEBIBYTES_24) { failures.add("live peer " + Text(index)) }
+        } else {
+            let statusMatches = peerStatus.kind == json.NULL
+            if hasPeer { statusMatches = peerStatus.kind == json.NUMBER && peerStatus.number == Float(peerExit) }
+            if peerRow.kind != json.NULL || !statusMatches { failures.add("finished peer " + Text(index)) }
+        }
+        if json.member(row, "proxy_forwarded").number != Float((index + 1) * 5) || json.member(row, "proxy_dropped").number != Float(index + 1) { failures.add("proxy " + Text(index)) }
+    }
+    let raw = Text(files.readFile(directory + "/samples.jsonl")).trim().split("\n")
+    if raw.length != rows.length { failures.add("raw rows") }
+    else { for index in 0..rows.length { if json.pretty(json.parse(raw[index]), "") != json.pretty(rows[index], "") { failures.add("raw row " + Text(index)) } } }
+    if json.member(report, "sample_count").number != Float(rows.length) || json.pretty(json.member(report, "last_sample"), "") != json.pretty(rows[rows.length - 1], "") { failures.add("last sample") }
+    checkRoles(rows, json.member(report, "memory_summary_by_role"), failures)
+    test.check(failures.length == 0, name + " failures: " + fixturesJoin(failures))
+    let expected = "null"
+    if hasPeer { expected = Text(peerExit) }
+    return "{\"peer_exit\": " + expected + ", \"rejected\": " + Text(rejected) + ", \"rows\": " + Text(rows.length) + ", \"statuses\": [0, " + expected + "]}"
+}
+function fixturesJoin(items: List<Text>): Text {
+    let text = ""
+    for item in items { text = text + item + "; " }
+    return text
+}
+function quicRoles(work: Text, result: Text) {
+    let listener = net.listen("127.0.0.1", 0, 8)
+    let cases: List<Text> = []
+    for peerExit in [0, 7, -1] { cases.add(rolesCase(work, peerExit, listener)) }
+    net.close(listener)
+    writeTextFile(result, "{\"pid\": " + Text(system.processId()) + ", \"cases\": [" + cases[0] + ", " + cases[1] + ", " + cases[2] + "]}\n")
+}
+function quicRoleCases(work: Text) {
+    let result = work + "/roles.json"
+    let process = soak.launchFiles(["/proc/self/exe", "--quic-roles", work, result], system.environment(), work + "/roles-driver.out", work + "/roles-driver.err")
+    test.check(process.processId > 0, "launch QUIC roles driver")
+    let status = soak.waitFor(process, 120000)
+    if status == soak.PENDING { soak.stop(process) }
+    test.check(status == 0, "QUIC roles driver status " + Text(status) + "\n" + Text(files.readFile(work + "/roles-driver.err")))
+    test.check(files.readFile(work + "/roles-driver.err").length == 0, "QUIC roles driver wrote diagnostics")
+    let text = Text(files.readFile(result)).trim()
+    print(text)
+    let cases = json.member(json.parse(text), "cases")
+    test.check(json.pretty(cases, "") == json.pretty(json.parse("[{\"peer_exit\": 0, \"rejected\": false, \"rows\": 8, \"statuses\": [0, 0]}, {\"peer_exit\": 7, \"rejected\": true, \"rows\": 3, \"statuses\": [0, 7]}, {\"peer_exit\": null, \"rejected\": false, \"rows\": 8, \"statuses\": [0, null]}]"), ""), "QUIC role cases " + text)
+    test.check(gone(process.processId), "roles driver remained")
+}
+
+// The maintained OpenSSL soak peer releases every connection on each close
+// outcome: complete keep-alive, EOF, reset, TLS error, cancellation and an
+// unexpected request. Each case runs its own server, so the identity is one.
+function tlsPeerMembership() {
+    let context = fixtures.context(false)
+    let certificates = fixtures.authority(context, context.work + "/certificates")
+    fixtures.root(certificates, "root")
+    fixtures.leaf(certificates, "server", "root", fixtures.options())
+    fixtures.leaf(certificates, "client", "root", fixtures.usage("clientAuth"))
+    let peer = fixtures.helper(context, "tests/tls-soak-peer.c", "tls-soak-peer", "$(pkg-config --cflags --libs openssl)")
+    let result = fixtures.run(context, [peer, "self-test", fixtures.path(certificates, "server", "pem"), fixtures.path(certificates, "server", "key"), fixtures.path(certificates, "root", "pem"),
+        fixtures.path(certificates, "client", "pem"), fixtures.path(certificates, "client", "key")], 60)
+    print(result.output.trim())
+    test.check(result.status == 0 && result.errorOutput == "", "TLS peer self-test (" + Text(result.status) + ")\n" + result.errorOutput)
+    let cases = json.parse(result.output).items
+    let names = ["normal", "eof", "reset_body", "ssl_body", "cancel_body", "unexpected_body"]
+    test.check(cases.length == names.length, "TLS peer outcome count")
+    for index in 0..cases.length {
+        let item = cases[index]
+        let name = json.string(item, "name")
+        let stats = json.member(item, "stats")
+        test.check(name == names[index], "TLS peer outcome order " + name)
+        test.check(json.member(item, "completed").truth, name + " outcome did not complete")
+        test.check(json.member(stats, "connections").number == 1.0, name + " connections")
+        let unexpected = json.member(item, "unexpected").items
+        if name == "unexpected_body" { test.check(unexpected.length == 1 && unexpected[0].text == "request was not a heartbeat", name + " unexpected diagnostics") }
+        else { test.check(unexpected.length == 0, name + " reported unexpected errors") }
+        if name == "cancel_body" { test.check(json.member(item, "membership_before_cancel").number == 1.0, "cancelled connection was not a member before cancellation") }
+        let writes = json.member(item, "writes").items
+        if name == "normal" {
+            test.check(json.member(item, "reads").number == 7.0 && json.member(item, "received").number == 6.0, "normal keep-alive reads")
+            test.check(json.member(stats, "responses").number == 6.0 && json.member(stats, "closed").number == 1.0 && json.member(stats, "malformed").number == 0.0 &&
+                json.member(stats, "oversized").number == 0.0 && json.member(stats, "slow").number == 0.0, "normal keep-alive stats")
+            test.check(writes.length == 12, "normal fragmented writes")
+            for at in 0..writes.length {
+                let expected = 33.0
+                if at % 2 == 0 { expected = 7.0 }
+                test.check(writes[at].number == expected, "normal response fragment " + Text(at))
+            }
+        } else {
+            test.check(writes.length == 0, name + " wrote a response")
+        }
+        test.check(json.member(item, "retained").number == 0.0 && json.member(item, "workers").number == 0.0, name + " retained a completed connection")
+    }
+    fixtures.finish(context)
+}
+
+if argumentCount() == 1 && argument(0) == "--driver" { driver() }
+if argumentCount() == 1 && argument(0) == "--summary-rows" {
+    summaryRows()
+    exit(0)
+}
+if argumentCount() == 4 && argument(0) == "--quiet-child" { quietChild(Integer(argument(1)), Integer(argument(2)), argument(3) == "burn") }
+if argumentCount() == 3 && argument(0) == "--quic-history" {
+    quicHistory(argument(1), argument(2))
+    exit(0)
+}
+if argumentCount() == 3 && argument(0) == "--quic-roles" {
+    quicRoles(argument(1), argument(2))
+    exit(0)
+}
+test.check(argumentCount() == 0, "usage: soak-observer-test")
+let work = test.scratch()
+silentPeer(work)
+fragmentedLines(work)
+unboundedOutput(work)
+heldOutput(work)
+interruptBetweenSamples(work)
+if soak.linux() { isolatedChild(work) }
+restoredOnSuccessAndFailure(work)
+rssTrend()
+streamingReference()
+if soak.linux() {
+    tlsPeerMembership()
+    boundedSummary(work)
+    peerTelemetry(work)
+    peerExitRace(work)
+    quicLongHistory(work)
+    quicRoleCases(work)
+}
+test.removeTree(work)
+print("soak observer checks passed")

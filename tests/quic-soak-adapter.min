@@ -1,0 +1,236 @@
+use "./soak-observer.min" as soak
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Role { child: soak.Child; output: Text; errors: Text; present: Boolean }
+public record Proxy { forwarded: Integer; dropped: Integer; delayed: Integer }
+public record Entry { key: Text; value: Text }
+public record Report { entries: List<Entry> }
+public record Observation { status: Integer; sample: soak.Sample; error: Text }
+public record Hooks {
+    clock: Callback<Float>
+    pause: Callback<Float, Boolean>
+    measure: Callback<Integer, soak.Sample>
+    checkpoint: Callback<Text, Report, Boolean>
+    refresh: Callback<Boolean>
+}
+function currentTime(hooks: Hooks): Float {
+    let call = hooks.clock
+    return call()
+}
+function rest(hooks: Hooks, seconds: Float) {
+    let call = hooks.pause
+    call(seconds)
+}
+function measured(hooks: Hooks, processId: Integer): soak.Sample {
+    let call = hooks.measure
+    return call(processId)
+}
+function checkpoint(hooks: Hooks, path: Text, report: Report) {
+    let call = hooks.checkpoint
+    call(path, report)
+}
+function refresh(hooks: Hooks) {
+    let call = hooks.refresh
+    call()
+}
+
+public function role(child: soak.Child, output: Text, errors: Text): Role { return Role { child: child; output: output; errors: errors; present: true } }
+public function absentRole(): Role { return Role { child: soak.Child { processId: 0; output: -1; status: soak.PENDING }; output: ""; errors: ""; present: false } }
+public function report(): Report { return Report { entries: [] } }
+public function put(report: Report, key: Text, value: Text) {
+    for entry in report.entries {
+        if entry.key == key {
+            entry.value = value
+            return
+        }
+    }
+    report.entries.add(Entry { key: key; value: value })
+}
+public function value(report: Report, key: Text): Text {
+    for entry in report.entries { if entry.key == key { return entry.value } }
+    return ""
+}
+public function drop(report: Report, key: Text) {
+    let kept: List<Entry> = []
+    for entry in report.entries { if entry.key != key { kept.add(entry) } }
+    report.entries = kept
+}
+public function sibling(path: Text, name: Text): Text {
+    let raw = Bytes(path)
+    let cut = raw.length - 1
+    while cut >= 0 && raw[cut] != 47 { cut -= 1 }
+    if cut < 0 { return name }
+    return Text(raw.slice(0, cut + 1)) + name
+}
+function store(path: Text, text: Text): Boolean {
+    let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return false }
+    let data = Bytes(text)
+    let written = files.write(file, data, 0, data.length)
+    files.close(file)
+    return written == data.length
+}
+// Rebuilds the samples array from the already flushed JSONL rows.
+public function writeReport(path: Text, report: Report): Boolean {
+    let text = "{\n"
+    for entry in report.entries { if entry.key != "samples" { text = text + json.quote(entry.key) + ": " + entry.value + ",\n" } }
+    text = text + "\"samples\": [\n"
+    let rows = Text(files.readFile(sibling(path, "samples.jsonl")))
+    let first = true
+    for line in rows.split("\n") {
+        if line != "" {
+            if !first { text = text + ",\n" }
+            text = text + line
+            first = false
+        }
+    }
+    return store(path, text + "\n]}\n")
+}
+public function sampleJson(sample: soak.Sample): Text {
+    return "\"state\": " + json.quote(sample.state) + ", \"rss_bytes\": " + Text(sample.rssBytes) + ", \"cpu_seconds\": " + Text(sample.cpuSeconds)
+}
+function zombie(state: Text): Boolean { return state == "Z" || state == "X" || state == "x" }
+// A completed peer has no live RSS. A zombie is not a zero-memory sample and
+// an unexpected read failure while the owned peer still runs is an error.
+public function observation(client: Role, hooks: Hooks): Observation {
+    let status = soak.poll(client.child)
+    if status != soak.PENDING { return Observation { status: status; sample: soak.absent(); error: "" } }
+    let sample = measured(hooks, client.child.processId)
+    if !sample.present {
+        if !sample.missing { return Observation { status: soak.PENDING; sample: sample; error: "peer process sample failed while it was running" } }
+        status = soak.poll(client.child)
+        if status == soak.PENDING { return Observation { status: status; sample: sample; error: "peer process sample disappeared while it was running" } }
+        return Observation { status: status; sample: soak.absent(); error: "" }
+    }
+    if zombie(sample.state) { return Observation { status: soak.poll(client.child); sample: soak.absent(); error: "" } }
+    return Observation { status: soak.PENDING; sample: sample; error: "" }
+}
+function statusJson(status: Integer): Text {
+    if status == soak.PENDING { return "null" }
+    return Text(status)
+}
+function running(client: Role): Boolean {
+    let status = soak.poll(client.child)
+    return status == soak.PENDING || status == 0
+}
+public function observeSamples(server: Role, client: Role, proxy: Proxy, started: Float, deadline: Float, duration: Float, reportPath: Text, report: Report, hooks: Hooks): Text {
+    drop(report, "samples")
+    put(report, "sample_count", "0")
+    put(report, "last_sample", "null")
+    let file = files.open(sibling(reportPath, "samples.jsonl"), files.WRITE | files.CREATE | files.TRUNCATE)
+    if file < 0 { return "cannot create QUIC soak samples" }
+    let offset = 0
+    let count = 0
+    let previousCpu = 0.0
+    let previousElapsed = 0.0
+    while soak.poll(server.child) == soak.PENDING && (!client.present || running(client)) {
+        if currentTime(hooks) > deadline {
+            files.close(file)
+            return "QUIC soak exceeded its independent wall-clock deadline"
+        }
+        let sample = measured(hooks, server.child.processId)
+        if !sample.present {
+            files.close(file)
+            return "QUIC server process sample failed"
+        }
+        let elapsed = currentTime(hooks) - started
+        let controller = measured(hooks, system.processId())
+        let peer = Observation { status: soak.PENDING; sample: soak.absent(); error: "" }
+        if client.present { peer = observation(client, hooks) }
+        if peer.error != "" {
+            files.close(file)
+            return peer.error
+        }
+        refresh(hooks)
+        let loads = soak.loadAverages()
+        let row = "{" + sampleJson(sample) + ", \"elapsed_seconds\": " + Text(elapsed) + ", \"controller\": {" + sampleJson(controller) + "}, \"peer_status\": " + statusJson(peer.status)
+        if peer.sample.present { row = row + ", \"peer\": {" + sampleJson(peer.sample) + "}" } else { row = row + ", \"peer\": null" }
+        row = row + ", \"host_load_average\": [" + Text(loads[0]) + ", " + Text(loads[1]) + ", " + Text(loads[2]) + "], \"proxy_forwarded\": " + Text(proxy.forwarded) +
+            ", \"proxy_dropped\": " + Text(proxy.dropped) + ", \"proxy_delayed\": " + Text(proxy.delayed)
+        if count > 0 { row = row + ", \"interval_cpu_percent\": " + Text(100.0 * (sample.cpuSeconds - previousCpu) / (elapsed - previousElapsed)) }
+        row = row + "}"
+        let data = Bytes(row + "\n")
+        if files.writeAt(file, data, 0, data.length, offset) != data.length {
+            files.close(file)
+            return "cannot append QUIC soak sample"
+        }
+        offset += data.length
+        count += 1
+        previousCpu = sample.cpuSeconds
+        previousElapsed = elapsed
+        put(report, "sample_count", Text(count))
+        put(report, "last_sample", row)
+        checkpoint(hooks, reportPath, report)
+        print(row)
+        rest(hooks, min(10.0, duration))
+    }
+    files.close(file)
+    return ""
+}
+function roleSummary(reportPath: Text, name: Text): Text {
+    let summary = soak.summary(60.0)
+    for line in Text(files.readFile(sibling(reportPath, "samples.jsonl"))).split("\n") {
+        if line != "" {
+            let row = json.parse(line)
+            let selected = row
+            if name != "server" { selected = json.member(row, name) }
+            if selected.kind == json.OBJECT { soak.include(summary, json.member(row, "elapsed_seconds").number, json.member(selected, "rss_bytes").number / 1024.0) }
+        }
+    }
+    return soak.summaryJson(summary)
+}
+function settled(item: Role): Integer {
+    let status = soak.waitFor(item.child, 30000)
+    if status == soak.PENDING { soak.stop(item.child) }
+    return status
+}
+public function finishObservations(server: Role, client: Role, proxy: Proxy, reportPath: Text, report: Report, hooks: Hooks): Text {
+    let clientStatus = soak.PENDING
+    let stdout = ""
+    let stderr = ""
+    if client.present {
+        clientStatus = settled(client)
+        if clientStatus == soak.PENDING { return "QUIC peer did not exit within thirty seconds" }
+        stdout = Text(files.readFile(client.output))
+        stderr = Text(files.readFile(client.errors))
+    }
+    let serverStatus = settled(server)
+    if serverStatus == soak.PENDING { return "QUIC server did not exit within thirty seconds" }
+    let serverStdout = Text(files.readFile(server.output))
+    let serverStderr = Text(files.readFile(server.errors))
+    refresh(hooks)
+    put(report, "client_status", statusJson(clientStatus))
+    put(report, "server_status", Text(serverStatus))
+    put(report, "client_stdout", json.quote(stdout))
+    put(report, "client_stderr", json.quote(stderr))
+    put(report, "server_stdout", json.quote(serverStdout))
+    put(report, "server_stderr", json.quote(serverStderr))
+    put(report, "faults", "{\"dropped\": " + Text(proxy.dropped) + ", \"reordered\": " + Text(proxy.delayed) + ", \"forwarded\": " + Text(proxy.forwarded) + "}")
+    put(report, "memory_summary_by_role", "{\"server\": " + roleSummary(reportPath, "server") + ", \"controller\": " + roleSummary(reportPath, "controller") +
+        ", \"peer\": " + roleSummary(reportPath, "peer") + "}")
+    checkpoint(hooks, reportPath, report)
+    if serverStatus != 0 || serverStderr != "" || (client.present && (clientStatus != 0 || stderr != "")) {
+        return "QUIC soak roles failed: {\"server_status\": " + Text(serverStatus) + ", \"client_status\": " + statusJson(clientStatus) + ", \"server_stdout\": " + json.quote(serverStdout) +
+            ", \"server_stderr\": " + json.quote(serverStderr) + ", \"client_stdout\": " + json.quote(stdout) + ", \"client_stderr\": " + json.quote(stderr) + "}"
+    }
+    files.writeStandardOutput(stdout)
+    files.writeStandardOutput(serverStdout)
+    return ""
+}
+public function realHooks(proxy: Proxy, status: Text): Hooks {
+    let clock = function(): Float { return Float(system.monotonicNanoseconds()) / 1000000000.0 }
+    let pause = function(seconds: Float): Boolean { return soak.nap(Integer(seconds * 1000.0)) == 0 }
+    let measure = function(processId: Integer): soak.Sample { return soak.processSample(processId) }
+    let write = function(path: Text, report: Report): Boolean { return writeReport(path, report) }
+    let counters = function(): Boolean {
+        let fields = Text(files.readFile(status)).trim().split(" ")
+        if fields.length != 3 { return false }
+        proxy.forwarded = Integer(fields[0])
+        proxy.dropped = Integer(fields[1])
+        proxy.delayed = Integer(fields[2])
+        return true
+    }
+    return Hooks { clock: clock; pause: pause; measure: measure; checkpoint: write; refresh: counters }
+}

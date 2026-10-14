@@ -444,7 +444,10 @@ type fixtureSummary struct {
 }
 
 func scaleFixtures(directory string, count int) {
-	if err := os.Mkdir(directory, 0o755); err != nil {
+	if _, err := os.Stat(directory); err == nil {
+		fail("fixture directory already exists: %s", directory)
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
 		fail("fixture directory: %v", err)
 	}
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -543,6 +546,160 @@ func scaleFixtures(directory string, count int) {
 	write("fixtures.json", append(encoded, '\n'))
 }
 
+type pooled struct {
+	connection *tls.Conn
+	writer     *bufio.Writer
+	framer     *http2.Framer
+}
+
+func (peer pooled) acknowledge(frame http2.Frame) error {
+	switch typed := frame.(type) {
+	case *http2.SettingsFrame:
+		if !typed.IsAck() {
+			peer.framer.WriteSettingsAck()
+			return peer.writer.Flush()
+		}
+	case *http2.GoAwayFrame:
+		return errors.New("pooled gateway GOAWAY")
+	}
+	return nil
+}
+
+func poolPing(peers []pooled, round int) (int, error) {
+	for index, peer := range peers {
+		var nonce [8]byte
+		binary.BigEndian.PutUint64(nonce[:], uint64(round*len(peers)+index))
+		peer.framer.WritePing(false, nonce)
+		if err := peer.writer.Flush(); err != nil {
+			return 0, err
+		}
+	}
+	for index, peer := range peers {
+		var nonce [8]byte
+		binary.BigEndian.PutUint64(nonce[:], uint64(round*len(peers)+index))
+		peer.connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			frame, err := peer.framer.ReadFrame()
+			if err != nil {
+				return 0, fmt.Errorf("pooled gateway PING deadline: %v", err)
+			}
+			if err := peer.acknowledge(frame); err != nil {
+				return 0, err
+			}
+			if ping, ok := frame.(*http2.PingFrame); ok && ping.IsAck() && ping.Data == nonce {
+				break
+			}
+		}
+	}
+	return len(peers), nil
+}
+
+// Application-ready idle gateways: each completes TLS 1.3, h2 and a real
+// SETTINGS exchange, then answers PING rounds without reconnecting.
+func gatewayPool(address, caPath, certPath, keyPath string, count int) {
+	config := clientTLS(caPath, certPath, keyPath, []string{"h2"}, true)
+	peers := []pooled{}
+	closeAll := func() {
+		for _, peer := range peers {
+			peer.connection.Close()
+		}
+	}
+	for index := 0; index < count; index++ {
+		raw, err := net.DialTimeout("tcp", address, 5*time.Second)
+		if err != nil {
+			closeAll()
+			fail("idle gateway dial: %v", err)
+		}
+		raw.(*net.TCPConn).SetNoDelay(true)
+		connection := tls.Client(raw, config)
+		connection.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := connection.Handshake(); err != nil || connection.ConnectionState().NegotiatedProtocol != "h2" {
+			closeAll()
+			fail("idle gateway handshake: %v", err)
+		}
+		writer := bufio.NewWriter(connection)
+		peer := pooled{connection: connection, writer: writer, framer: http2.NewFramer(writer, connection)}
+		writer.WriteString(http2.ClientPreface)
+		peer.framer.WriteSettings()
+		writer.Flush()
+		for settled := false; !settled; {
+			frame, err := peer.framer.ReadFrame()
+			if err != nil {
+				closeAll()
+				fail("idle gateway closed during SETTINGS: %v", err)
+			}
+			if settings, ok := frame.(*http2.SettingsFrame); ok && !settings.IsAck() {
+				settled = true
+			}
+			if err := peer.acknowledge(frame); err != nil {
+				closeAll()
+				fail("idle gateway SETTINGS: %v", err)
+			}
+		}
+		connection.SetDeadline(time.Time{})
+		peers = append(peers, peer)
+		if (index+1)%256 == 0 {
+			fmt.Println("CONNECTED", index+1)
+		}
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		closeAll()
+		fail("control listener: %v", err)
+	}
+	fmt.Println("READY", listener.Addr().(*net.TCPAddr).Port)
+	control, err := listener.Accept()
+	listener.Close()
+	if err != nil {
+		closeAll()
+		fail("control accept: %v", err)
+	}
+	reader := bufio.NewReader(control)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			closeAll()
+			return
+		}
+		var request struct {
+			Op    string `json:"op"`
+			Round int    `json:"round"`
+		}
+		result := map[string]any{}
+		if err := json.Unmarshal(line, &request); err != nil {
+			result["error"] = err.Error()
+		} else if request.Op == "ping" {
+			acks, err := poolPing(peers, request.Round)
+			result["acks"] = acks
+			if err != nil {
+				result["error"] = err.Error()
+			}
+		} else if request.Op == "close" {
+			closeAll()
+			result["closed"] = len(peers)
+			encoded, _ := json.Marshal(result)
+			control.Write(append(encoded, '\n'))
+			return
+		} else {
+			result["error"] = "unknown pool operation"
+		}
+		encoded, _ := json.Marshal(result)
+		control.Write(append(encoded, '\n'))
+	}
+}
+
+// RST_STREAM on stream zero is a connection error; complete authenticated
+// traffic on other sockets must still work after this peer is retired.
+func malformedGateway(address, caPath, certPath, keyPath string) {
+	connection, err := tls.Dial("tcp", address, clientTLS(caPath, certPath, keyPath, []string{"h2"}, false))
+	if err != nil {
+		fail("malformed gateway dial: %v", err)
+	}
+	connection.Write(append([]byte(http2.ClientPreface), 0, 0, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 8))
+	connection.Close()
+	fmt.Println("SENT")
+}
+
 func edgeCommand(arguments []string) bool {
 	if len(arguments) == 0 {
 		return false
@@ -563,6 +720,20 @@ func edgeCommand(arguments []string) bool {
 			fail("usage: %s ADDRESS CA CERT KEY", arguments[0])
 		}
 		map[string]func(string, string, string, string){"h2-probe": h2Probe, "device-probe": deviceProbe, "chain-probe": chainProbe}[arguments[0]](arguments[1], arguments[2], arguments[3], arguments[4])
+	case "gateway-pool":
+		if len(arguments) != 6 {
+			fail("usage: gateway-pool ADDRESS CA CERT KEY COUNT")
+		}
+		count, err := strconv.Atoi(arguments[5])
+		if err != nil || count < 1 {
+			fail("invalid gateway count")
+		}
+		gatewayPool(arguments[1], arguments[2], arguments[3], arguments[4], count)
+	case "malformed-gateway":
+		if len(arguments) != 5 {
+			fail("usage: malformed-gateway ADDRESS CA CERT KEY")
+		}
+		malformedGateway(arguments[1], arguments[2], arguments[3], arguments[4])
 	case "scale-fixtures":
 		if len(arguments) != 3 {
 			fail("usage: scale-fixtures DIRECTORY COUNT")

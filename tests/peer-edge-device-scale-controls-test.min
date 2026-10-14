@@ -1,0 +1,168 @@
+use "./peer-edge-scale.min" as scale
+use "./net-fixtures.min" as fixtures
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+use "json" as json
+
+record Field { name: Text; value: Text }
+record Row { key: Text; fields: List<Field> }
+
+constant EDGE = "localhost:12345"
+
+function epochFor(index: Integer): Text {
+    let digits = "0123456789abcdef"
+    let value = index + 1
+    let text = ""
+    while value > 0 {
+        text = Text(Bytes(digits).slice(value % 16, value % 16 + 1)) + text
+        value = value / 16
+    }
+    while text.byteLength < 64 { text = "0" + text }
+    return text
+}
+function repeated(symbol: Text, count: Integer): Text {
+    let text = ""
+    for index in 0..count { text = text + symbol }
+    return text
+}
+function rows(count: Integer, now: Integer): List<Row> {
+    let result: List<Row> = []
+    for index in 0..count {
+        let exitId = scale.exitName(index)
+        result.add(Row { key: "peer:live:{" + exitId + "}"; fields: [Field { name: "exit_id"; value: json.quote(exitId) }, Field { name: "edge_instance"; value: json.quote(EDGE) },
+            Field { name: "edge_region"; value: "\"eu-west\"" }, Field { name: "_epoch"; value: json.quote(epochFor(index)) }, Field { name: "capacity_weight"; value: "1" },
+            Field { name: "in_flight"; value: "0" }, Field { name: "max_concurrent"; value: "8" }, Field { name: "paused"; value: "false" },
+            Field { name: "policy_hash"; value: json.quote(repeated("a", 64)) }, Field { name: "public_ip"; value: "\"203.0.113.2\"" }, Field { name: "asn"; value: "64500" },
+            Field { name: "country"; value: "\"GB\"" }, Field { name: "ts"; value: Text(now) }] })
+    }
+    return result
+}
+function render(row: Row): Text {
+    let text = "{"
+    for index in 0..row.fields.length {
+        if index > 0 { text = text + ", " }
+        text = text + json.quote(row.fields[index].name) + ": " + row.fields[index].value
+    }
+    return text + "}"
+}
+function observed(items: List<Row>): List<scale.Observed> {
+    let result: List<scale.Observed> = []
+    for item in items { result.add(scale.Observed { key: item.key; state: json.parse(render(item)) }) }
+    return result
+}
+function changed(row: Row, name: Text, value: Text) { for field in row.fields { if field.name == name { field.value = value } } }
+function without(row: Row, name: Text) {
+    let kept: List<Field> = []
+    for field in row.fields { if field.name != name { kept.add(field) } }
+    row.fields = kept
+}
+function check(items: List<scale.Observed>, count: Integer, window: scale.Window): scale.Validation {
+    return scale.validate(items, count, EDGE, 1000, window)
+}
+function rejected(items: List<scale.Observed>, count: Integer, window: scale.Window, label: Text) {
+    test.check(check(items, count, window).error != "", "accepted " + label)
+}
+
+function distinctDevices() {
+    for count in [1, 7, 32, 101] {
+        let items = observed(rows(count, 1000))
+        let rng = random.seeded("9002")
+        let index = items.length - 1
+        while index > 0 {
+            let other = random.below(rng, index + 1)
+            let held = items[index]
+            items[index] = items[other]
+            items[other] = held
+            index -= 1
+        }
+        let result = check(items, count, scale.open())
+        test.check(result.error == "" && result.epochs.length == count, "distinct devices " + Text(count) + ": " + result.error)
+    }
+}
+function insufficientCounts() {
+    let single = observed(rows(1, 1000))
+    let repeatedRows: List<scale.Observed> = []
+    for index in 0..7 { repeatedRows.add(single[0]) }
+    let gateway: List<scale.Observed> = [scale.Observed { key: "gateway-count"; state: json.parse("{\"connections\": 20000}") }]
+    rejected([], 7, scale.open(), "no devices")
+    rejected(observed(rows(6, 1000)), 7, scale.open(), "six devices")
+    rejected(observed(rows(8, 1000)), 7, scale.open(), "eight devices")
+    rejected(repeatedRows, 7, scale.open(), "one repeated device")
+    rejected(gateway, 7, scale.open(), "gateway count")
+}
+function boundRecords() {
+    let mutations = [["exit_id", "\"exit-other\""], ["edge_instance", "\"other:12345\""], ["edge_region", "\"elsewhere\""], ["_epoch", json.quote(repeated("x", 64))],
+        ["capacity_weight", "0"], ["capacity_weight", "true"], ["in_flight", "true"], ["max_concurrent", "99"], ["paused", "true"], ["policy_hash", json.quote(repeated("b", 64))],
+        ["public_ip", "\"203.0.113.3\""], ["asn", "64501"], ["country", "\"US\""], ["ts", "969"], ["ts", "1001"], ["ts", "true"]]
+    for mutation in mutations {
+        for index in [0, 3, 6] {
+            let items = rows(7, 1000)
+            changed(items[index], mutation[0], mutation[1])
+            rejected(observed(items), 7, scale.open(), mutation[0] + "=" + mutation[1] + " at " + Text(index))
+        }
+    }
+    for field in rows(1, 1000)[0].fields {
+        let items = rows(7, 1000)
+        without(items[3], field.name)
+        rejected(observed(items), 7, scale.open(), "missing " + field.name)
+    }
+}
+function fencedEpochs() {
+    let initial = check(observed(rows(7, 980)), 7, scale.open())
+    test.check(initial.error == "", "initial heartbeat window: " + initial.error)
+    let advanced = check(observed(rows(7, 1000)), 7, scale.advancing(initial.epochs, 995))
+    test.check(advanced.error == "", "advanced heartbeat window: " + advanced.error)
+    for index in 0..7 {
+        let items = rows(7, 1000)
+        changed(items[index], "_epoch", json.quote(repeated("f", 64)))
+        rejected(observed(items), 7, scale.fenced(initial.epochs), "changed owner at " + Text(index))
+        items = rows(7, 1000)
+        changed(items[index], "ts", "990")
+        rejected(observed(items), 7, scale.advancing(initial.epochs, 995), "stale heartbeat at " + Text(index))
+    }
+}
+function unmodifiedInput() {
+    let items = observed(rows(7, 1000))
+    let before: List<Text> = []
+    for item in items { before.add(item.key + json.pretty(item.state, "")) }
+    check(items, 7, scale.open())
+    for index in 0..items.length { test.check(items[index].key + json.pretty(items[index].state, "") == before[index], "validation repaired or mutated input " + Text(index)) }
+}
+function strictIdentities() {
+    let context = fixtures.context(false)
+    let directory = context.work + "/certificates"
+    let peer = fixtures.valueOr(context.environment, "MINYAR_PEERGRPC", context.root + "/build/peergrpc-peer")
+    fixtures.execute(context, [peer, "scale-fixtures", directory, "3"], 120, "generate scale fixtures")
+    let root = directory + "/root.pem"
+    fixtures.openssl(context, ["x509", "-inform", "DER", "-in", directory + "/root.der", "-out", root])
+    let labels = ["server", "gateway", "device-00000", "device-00001", "device-00002"]
+    for label in labels {
+        let purpose = "sslclient"
+        let wrong = "sslserver"
+        if label == "server" {
+            purpose = "sslserver"
+            wrong = "sslclient"
+        }
+        let pem = directory + "/" + label + ".pem"
+        fixtures.openssl(context, ["x509", "-inform", "DER", "-in", directory + "/" + label + ".der", "-out", pem])
+        let command = ["verify", "-x509_strict", "-auth_level", "2", "-trusted_first", "-purpose", purpose, "-CAfile", root]
+        if purpose == "sslserver" {
+            command.add("-verify_hostname")
+            command.add("localhost")
+        }
+        command.add(pem)
+        let accepted = fixtures.opensslResult(context, command)
+        test.check(accepted.status == 0, label + " strict verification\n" + accepted.errorOutput)
+        let mismatched = fixtures.opensslResult(context, ["verify", "-x509_strict", "-auth_level", "2", "-purpose", wrong, "-CAfile", root, pem])
+        test.check(mismatched.status != 0, "wrong-purpose certificate was accepted: " + label)
+    }
+    fixtures.finish(context)
+}
+
+distinctDevices()
+insufficientCounts()
+boundRecords()
+fencedEpochs()
+unmodifiedInput()
+strictIdentities()
+print("peer edge device-scale controls passed")

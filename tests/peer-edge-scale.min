@@ -1,0 +1,72 @@
+use "json" as json
+
+public record Observed { key: Text; state: json.Value }
+public record Epoch { exitId: Text; epoch: Text }
+public record Validation { error: Text; epochs: List<Epoch> }
+public record Window { previous: List<Epoch>; fenced: Boolean; minimum: Integer; advancing: Boolean }
+
+public function open(): Window { return Window { previous: []; fenced: false; minimum: 0; advancing: false } }
+public function fenced(previous: List<Epoch>): Window { return Window { previous: previous; fenced: true; minimum: 0; advancing: false } }
+public function advancing(previous: List<Epoch>, minimum: Integer): Window { return Window { previous: previous; fenced: true; minimum: minimum; advancing: true } }
+public function exitName(index: Integer): Text {
+    let digits = Text(index)
+    while digits.byteLength < 5 { digits = "0" + digits }
+    return "exit-" + digits
+}
+public function integral(value: json.Value): Boolean {
+    if value.kind != json.NUMBER { return false }
+    for symbol in Bytes(value.text) { if symbol == 46 || symbol == 101 || symbol == 69 { return false } }
+    return true
+}
+function epochText(value: json.Value): Boolean {
+    if value.kind != json.STRING || value.text.byteLength != 64 { return false }
+    for symbol in Bytes(value.text) { if !((symbol >= 48 && symbol <= 57) || (symbol >= 97 && symbol <= 102)) { return false } }
+    return true
+}
+function text(state: json.Value, name: Text, expected: Text): Boolean {
+    let value = json.member(state, name)
+    return value.kind == json.STRING && value.text == expected
+}
+function number(state: json.Value, name: Text, expected: Float): Boolean {
+    let value = json.member(state, name)
+    return integral(value) && value.number == expected
+}
+function invalid(message: Text): Validation { return Validation { error: message; epochs: [] } }
+
+// Validates the complete independent Redis observation without repairing it.
+public function validate(records: List<Observed>, count: Integer, edge: Text, now: Integer, window: Window): Validation {
+    let expected = Map<Text, Integer>()
+    for index in 0..count { expected[exitName(index)] = index }
+    let previous = Map<Text, Text>()
+    for item in window.previous { previous[item.exitId] = item.epoch }
+    let seen = Map<Text, Integer>()
+    let epochs: List<Epoch> = []
+    for item in records {
+        let state = item.state
+        if state.kind != json.OBJECT { return invalid("live state must be an object") }
+        let exitValue = json.member(state, "exit_id")
+        let exitId = exitValue.text
+        if exitValue.kind != json.STRING || !expected.has(exitId) || seen.has(exitId) || item.key != "peer:live:{" + exitId + "}" {
+            return invalid("duplicate, unexpected or incorrectly bound device state")
+        }
+        let epoch = json.member(state, "_epoch")
+        if !epochText(epoch) { return invalid("invalid live owner epoch") }
+        if window.fenced && (!previous.has(exitId) || previous[exitId] != epoch.text) { return invalid("live owner changed during the measured window") }
+        let paused = json.member(state, "paused")
+        if !text(state, "edge_instance", edge) || !text(state, "edge_region", "eu-west") || paused.kind != json.BOOLEAN || paused.truth ||
+            !text(state, "policy_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") || !text(state, "public_ip", "203.0.113.2") ||
+            !number(state, "asn", 64500.0) || !text(state, "country", "GB") {
+            return invalid("incorrect trusted live-state fields")
+        }
+        if !number(state, "in_flight", 0.0) || !number(state, "max_concurrent", 8.0) { return invalid("incorrect reported capacity") }
+        let weight = json.member(state, "capacity_weight")
+        if weight.kind != json.NUMBER || weight.number != 1.0 { return invalid("device is not available for routing") }
+        let timestamp = json.member(state, "ts")
+        if !integral(timestamp) || now - Integer(timestamp.number) < 0 || now - Integer(timestamp.number) > 30 { return invalid("missing, future or stale heartbeat timestamp") }
+        if window.advancing && Integer(timestamp.number) < window.minimum { return invalid("heartbeat did not advance during the measured window") }
+        seen[exitId] = 1
+        epochs.add(Epoch { exitId: exitId; epoch: epoch.text })
+    }
+    if epochs.length != count { return invalid("not every requested device is admitted") }
+    return Validation { error: ""; epochs: epochs }
+}

@@ -299,8 +299,8 @@ class BuildWiring(unittest.TestCase):
                 makefile.write_text(
                     'LLVM_CC := retained-clang\nLIMITED := ordinary-limit\n'
                     'SANITIZER_LIMITED := sanitizer-limit\n' + candidate
-                    + '\n.PHONY: build/minyarc build/tooling/tests/net-native-test\n'
-                    'build/minyarc build/tooling/tests/net-native-test:\n\t@echo INPUT $@\n')
+                    + '\n.PHONY: build/minyarc build/tooling/tests/net-native-test build/tooling/tests/soak-observer-test build/testing/cycle-runtime.o\n'
+                    'build/minyarc build/tooling/tests/net-native-test build/tooling/tests/soak-observer-test build/testing/cycle-runtime.o:\n\t@echo INPUT $@\n')
                 env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
                            OS=operating_system)
                 env.pop('MAKEFLAGS', None)
@@ -328,7 +328,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('--evidence "$evidence"', sanitize)
                     self.assertIn(str(ROOT/'build/net-native-sanitize.'),
                                   sanitize.replace('\\', '/'))
-                self.assertEqual(result.stdout.count('python3 tests/soak-observer-test.py'), 1)
+                self.assertEqual(result.stdout.count('ordinary-limit ./build/tooling/tests/soak-observer-test'), 1)
 
         verify(fragment)
         for host, operating_system in (
@@ -1106,9 +1106,6 @@ class BuildWiring(unittest.TestCase):
         catalogue = native_catalogue()
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for name in ('tests/peer-edge-soak.py',):
-            with self.subTest(missing_source=name), self.assertRaises(ValueError):
-                catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != name]), ROOT)
 
 
 
@@ -1511,10 +1508,8 @@ class BuildWiring(unittest.TestCase):
             'peer-edge-relay-test', 'peer-edge-relay-lifetime-test', 'peer-edge-pki-test'))
         with tempfile.TemporaryDirectory(prefix='minyar grpc wiring ') as folder:
             work = Path(folder)
-            for name in ('tests/interop/peergrpc/requirements.txt',
-                         'scripts/check-peer-python.py', 'tests/interop/peergrpc/main.go',
-                         'tests/interop/peergrpc/edge.go', 'tests/interop/peergrpc/go.mod',
-                         'tests/interop/peergrpc/go.sum', 'runtime/native/net.c'):
+            for name in ('tests/interop/peergrpc/main.go', 'tests/interop/peergrpc/edge.go',
+                         'tests/interop/peergrpc/go.mod', 'tests/interop/peergrpc/go.sum', 'runtime/native/net.c'):
                 path = work / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('')
@@ -1523,22 +1518,6 @@ class BuildWiring(unittest.TestCase):
                 'include ' + str(ROOT / 'build-support/peer-grpc.mk').replace(' ', '\\ ') + '\n'
                 '.PHONY: build/minyarc build build/testing/cycle-runtime.o ' + tools + '\n'
                 'build/minyarc build build/testing/cycle-runtime.o ' + tools + ':\n\t@echo ARTIFACT $@\n')
-            for selected in ('build/peergrpc-venv/bin/python', 'preinstalled-python',
-                             'preinstalled Python'):
-                with self.subTest(selected=selected):
-                    env = dict(os.environ)
-                    env.pop('MAKEFLAGS', None)
-                    result = subprocess.run(
-                        ['make', '-n', '-f', str(makefile),
-                         'PEER_GRPC_PYTHON=' + selected, 'check-peer-grpc-python'],
-                        cwd=work, env=env, text=True, capture_output=True, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn('"' + selected + '" scripts/check-peer-python.py', result.stdout)
-                    setup = selected == 'build/peergrpc-venv/bin/python'
-                    self.assertEqual('python3 -m venv' in result.stdout, setup)
-                    if setup:
-                        self.assertIn('GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1', result.stdout)
-                        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL=1', result.stdout)
             for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
                          'check-http2-churn', 'check-http2-churn-sanitize', 'check-peer-grpc-churn',
                          'check-peer-grpc-churn-sanitize', 'check-peer-grpc-retire',
@@ -1558,45 +1537,6 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('GOMAXPROCS=2 go build -mod=readonly -trimpath', result.stdout)
                     self.assertIn('.tmp" self-test', result.stdout)
                     self.assertIn('./build/tooling/tests/', result.stdout)
-
-    def test_successful_empty_pip_cannot_publish_peer_ready_stamp(self):
-        # Windows task termination can return zero to the MSYS parent even
-        # though wheel installation never completed. Verify actual imports
-        # before publishing the cache stamp.
-        with tempfile.TemporaryDirectory(prefix='minyar incomplete peer ') as folder:
-            work = Path(folder)
-            for name in ('tests/interop/peergrpc/requirements.txt',
-                         'scripts/check-peer-python.py'):
-                path = work / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes((ROOT / name).read_bytes())
-            mock = work / 'bin/python3'
-            mock.parent.mkdir()
-            mock.write_text(
-                '#!' + sys.executable + '\nfrom pathlib import Path\n'
-                'root=Path("build/peergrpc-venv/bin"); root.mkdir(parents=True)\n'
-                'pip=root/"pip"; pip.write_text("#!/bin/sh\\n'
-                'echo PIP_JOBS=$GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS\\nexit 0\\n"); pip.chmod(0o755)\n'
-                'python=root/"python"; python.write_text(' +
-                repr('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n') +
-                '); python.chmod(0o755)\n')
-            mock.chmod(0o755)
-            # No interpreter can satisfy this exact pin; the empty installer
-            # must not make that incomplete environment appear ready.
-            requirements = work / 'tests/interop/peergrpc/requirements.txt'
-            requirements.write_text(requirements.read_text().replace('h2==4.3.0', 'h2==0.0.0'))
-            makefile = work / 'probe.mk'
-            makefile.write_text(
-                'include ' + str(ROOT / 'build-support/peer-grpc.mk').replace(' ', '\\ ') + '\n')
-            env = dict(os.environ, PATH=str(mock.parent) + os.pathsep + os.environ['PATH'])
-            env.pop('MAKEFLAGS', None)
-            result = subprocess.run(
-                ['make', '-f', str(makefile), 'build/peergrpc-venv/.ready'],
-                cwd=work, env=env, text=True, capture_output=True, timeout=15)
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('PIP_JOBS=1', result.stdout)
-            self.assertIn('peer Python verification failed:', result.stderr)
-            self.assertFalse((work / 'build/peergrpc-venv/.ready').exists())
 
     def test_quic_official_adapter_requires_all_linux_controls(self):
         import importlib.util
