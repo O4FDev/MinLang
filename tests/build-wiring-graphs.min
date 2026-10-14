@@ -1,0 +1,534 @@
+use "./build-wiring-support.min" as wire
+use "system" as system
+use "files" as files
+use "json" as json
+
+function included(w: wire.Wiring, path: Text): Text { return "include " + wire.replaceAll(wire.absolute(w, path), " ", "\\ ") + "\n" }
+
+public function test_bakeoff_stress_is_mandatory_with_bounded_quick_profiles(w: wire.Wiring) {
+    let directory = wire.folder(w, "minyar bakeoff wiring ")
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, "LLVM_CC := retained-clang\nSANITIZER_LIMITED := sanitizer-limit\n" + included(w, "build-support/managed-graphs.mk") +
+        ".PHONY: build\nbuild:\n\t@:\nbuild/tooling/%:\n\t@echo TOOL $@\n")
+    let result = wire.make(w, ["-rRnp", "-f", makefile, "check-managed-graphs-bakeoff"], wire.environment("", []), "")
+    wire.check(result.status == 0, result.errorOutput)
+    let database = wire.rules(result.output, wire.SPACED)
+    let target = "check-managed-graphs-bakeoff"
+    for gate in ["check", "check-portable", "check-sanitize", "check-managed-graphs-profiles"] { wire.check(wire.has(wire.deps(database, gate), target), gate) }
+    for source in ["tests/managed-graphs-bakeoff.c", "tests/managed-graphs-runtime.c", "build/tooling/tests/managed-graphs-profiles", "runtime/minyar_runtime.c"] {
+        wire.check(wire.has(wire.deps(database, target), source), source)
+    }
+    let selected = wire.linesContaining(wire.dryRunCommands(result.output), "./build/tooling/tests/managed-graphs-profiles")
+    wire.check(selected.length == 1 && selected[0] == "MINYAR_TEST_CLANG=\"retained-clang\" sanitizer-limit ./build/tooling/tests/managed-graphs-profiles --quick --fixture managed-graphs-bakeoff.c",
+        "bakeoff command: " + wire.joined(selected, "\n"))
+}
+
+function observabilityProbe(w: wire.Wiring, candidate: Text, inputs: List<Text>, aggregates: List<Text>): Text {
+    let target = "check-cycle-progress-observability"
+    let c = wire.checks()
+    let directory = wire.folder(w, "idle observability Make rules ")
+    let makefile = directory + "/probe.mk"
+    let fixtures = wire.sorted(wire.union(inputs, ["build"]))
+    wire.write(makefile, "LLVM_CC := retained-clang\nLIMITED := retained-limited\n" + candidate + wire.phonyStubs(fixtures, "\t@echo INPUT $@"))
+    let result = wire.make(w, ["-rRnp", "-f", makefile, target], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.LOOSE)
+    for aggregate in aggregates { wire.ensure(c, wire.has(wire.deps(database, aggregate), target), aggregate) }
+    wire.ensure(c, wire.subset(inputs, wire.deps(database, target)), "observability inputs")
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-progress-observability --evidence") == 1, "gate command count")
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-progress-observability-harness") == 1, "harness command count")
+    wire.ensure(c, wire.contains(commands, "MINYAR_TEST_CLANG=\"retained-clang\""), "clang selection")
+    wire.ensure(c, wire.contains(commands, "retained-limited ./build/tooling/tests/cycle-progress-observability"), "limiter")
+    wire.ensure(c, wire.contains(commands, "--evidence \"$evidence/run\""), "evidence leaf")
+    wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/cycle-progress-observability."), "absolute evidence")
+    for forbidden in ["--sanitize", "--case ", "--nodes ", "--seconds ", "--expect-old-code", "tests/cycle-progress.py"] {
+        wire.ensure(c, !wire.contains(commands, forbidden), "forbidden " + forbidden)
+    }
+    return wire.failure(c)
+}
+public function test_cycle_progress_observability_is_mandatory_without_idle_replay(w: wire.Wiring) {
+    let target = "check-cycle-progress-observability"
+    let aggregates = ["check", "check-portable", "check-sanitize", "check-managed-graphs-profiles", "check-cycle-progress", "check-cycle-progress-sanitize"]
+    let inputs = ["build/tooling/tests/cycle-progress-observability", "build/tooling/tests/cycle-progress-observability-harness", "tests/cycle-progress.c",
+        "tests/fixtures/cycle-progress-before-observability.c.txt"]
+    let source = wire.read(w, "build-support/managed-graphs.mk")
+    let marker = "# Mocked idle observability preserves the historical metric."
+    wire.check(wire.contains(source, marker), "observability marker")
+    let fragment = wire.after(source, wire.find(source, marker, 0))
+    wire.require(w, observabilityProbe(w, fragment, inputs, aggregates), "observability wiring")
+    let aggregateLine = ""
+    for line in wire.lines(fragment) {
+        let colon = wire.find(line, ":", 0)
+        if colon >= 0 && wire.joined(wire.words(wire.cut(line, 0, colon)), " ") == wire.joined(wire.sorted(aggregates), " ") { aggregateLine = line; break }
+    }
+    wire.check(aggregateLine != "", "observability aggregate line")
+    let split = wire.find(aggregateLine, ": ", 0)
+    let names = wire.cut(aggregateLine, 0, split)
+    let dependency = wire.after(aggregateLine, split + 2)
+    for aggregate in wire.sorted(aggregates) {
+        let mutant = wire.replaceFirst(fragment, aggregateLine, wire.joined(wire.without(wire.words(names), aggregate), " ") + ": " + dependency)
+        wire.refuse(w, observabilityProbe(w, mutant, inputs, aggregates), "missing aggregate " + aggregate)
+    }
+    let dependencyLine = wire.lineStarting(fragment, target + ":")
+    for dependencyName in wire.sorted(inputs) {
+        let mutant = wire.replaceFirst(fragment, dependencyLine, wire.replaceFirst(dependencyLine, " " + dependencyName, ""))
+        wire.refuse(w, observabilityProbe(w, mutant, inputs, aggregates), "missing input " + dependencyName)
+    }
+    let olds = ["$(abspath build)/cycle-progress-observability.", "--evidence", "./build/tooling/tests/cycle-progress-observability --evidence"]
+    let news = ["build/cycle-progress-observability.", "--case zero --evidence", "./build/tooling/tests/cycle-progress --evidence"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "mutation applies: " + olds[index])
+        wire.refuse(w, observabilityProbe(w, mutant, inputs, aggregates), "invalid recipe " + olds[index])
+    }
+    wire.check(wire.occurrences(wire.linuxTargets(w), target) == 1, "observability Linux target")
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    let discovered = wire.discover(w)
+    for name in wire.sorted(inputs) { if wire.starts(name, "tests/") { wire.requiredSource(w, catalogue, discovered, name) } }
+    let native = wire.row(catalogue, "tests/cycle-progress-observability-native.c")
+    wire.check(json.member(native, "role").text == "support", "observability native role")
+    wire.check(wire.has(wire.rowTexts(native, "consumers"), "build-support/managed-graphs.mk"), "observability native consumer")
+    let historical = wire.row(catalogue, "tests/fixtures/cycle-progress-before-observability.c.txt")
+    wire.check(json.member(historical, "role").text == "fixture", "historical fixture role")
+    wire.check(wire.joined(wire.rowTexts(historical, "consumers"), ",") == "tests/cycle-progress-observability.min", "historical fixture consumers")
+}
+
+function retirementBlock(fragment: Text, target: Text): List<Integer> {
+    let raw = Bytes(fragment)
+    let start = -1
+    if wire.starts(fragment, target + ":") { start = 0 } else {
+        let found = wire.find(fragment, "\n" + target + ":", 0)
+        if found >= 0 { start = found + 1 }
+    }
+    if start < 0 { return [] }
+    let index = wire.find(fragment, "\n", start)
+    if index < 0 { return [] }
+    index += 1
+    let end = index
+    while end < raw.length && raw[end] == 9 {
+        let next = wire.find(fragment, "\n", end)
+        if next < 0 { end = raw.length } else { end = next + 1 }
+    }
+    if end == index { return [] }
+    return [start, end]
+}
+function retirementProbe(w: wire.Wiring, candidate: Text, pair: List<Text>, inputs: List<Text>): Text {
+    let c = wire.checks()
+    let directory = wire.folder(w, "actual private retirement Make rules ")
+    let probe = directory + "/probe.mk"
+    wire.write(probe, candidate + "\nbuild:\nbuild/tooling/%:\n\t@echo TOOL $@\n")
+    let environment = wire.environment("", [])
+    let result = wire.make(w, ["-rRnp", "-f", probe, "check"], environment, "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.NAMED)
+    for gate in ["check", "check-portable", "check-managed-graphs-profiles"] { wire.ensure(c, wire.subset(pair, wire.deps(database, gate)), gate) }
+    wire.ensure(c, wire.has(wire.deps(database, "check-sanitize"), "check-cycle-private-retirement-sanitize"), "sanitize aggregate")
+    for target in pair { wire.ensure(c, wire.subset(inputs, wire.deps(database, target)), target + " inputs") }
+    let all: List<Text> = []
+    for kind in ["native", "sanitize"] {
+        let target = "check-cycle-private-retirement"
+        if kind == "sanitize" { target = target + "-sanitize" }
+        let recipe = wire.make(w, ["-rRn", "-f", probe, target], environment, "")
+        if recipe.status != 0 { return recipe.errorOutput }
+        let commands = recipe.output
+        all.add(commands)
+        wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 1, target + " command")
+        wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 1, target + " evidence")
+        let sanitized = 0
+        if kind == "sanitize" { sanitized = 1 }
+        wire.ensure(c, wire.count(commands, "--sanitize --evidence") == sanitized, target + " sanitizer")
+        wire.ensure(c, !wire.contains(commands, "--profiles"), target + " profiles")
+        wire.ensure(c, !wire.contains(commands, "--budgets"), target + " budgets")
+        wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/cycle-private-retirement-" + kind), target + " absolute evidence")
+    }
+    let commands = wire.joined(all, "\n")
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 2, "both commands")
+    wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 2, "both evidence")
+    wire.ensure(c, wire.count(commands, "--sanitize --evidence") == 1, "one sanitizer")
+    return wire.failure(c)
+}
+public function test_private_retirement_gates_execute_actual_operation_contract(w: wire.Wiring) {
+    let source = wire.read(w, "build-support/managed-graphs.mk")
+    let marker = "# Every C command takes N OPERATION [ARGS]"
+    wire.check(wire.contains(source, marker), "retirement marker")
+    let fragment = wire.after(source, wire.find(source, marker, 0))
+    let pair = ["check-cycle-private-retirement", "check-cycle-private-retirement-sanitize"]
+    let inputs = ["build/tooling/tests/cycle-private-retirement", "tests/cycle-idle-invalidation.c", "tests/cycle-private-retirement-v5.json", "tests/cycle-additive.c"]
+    wire.require(w, retirementProbe(w, fragment, pair, inputs), "private retirement wiring")
+    for gate in ["check", "check-portable", "check-managed-graphs-profiles", "check-sanitize"] {
+        let line = wire.lineStarting(fragment, gate + ":")
+        wire.check(line != "", "retirement gate line " + gate)
+        for target in wire.words(wire.after(line, wire.find(line, ":", 0) + 1)) {
+            if wire.has(pair, target) {
+                wire.refuse(w, retirementProbe(w, wire.replaceFirst(fragment, line, wire.replaceFirst(line, " " + target, "")), pair, inputs), gate + " without " + target)
+            }
+        }
+    }
+    for dependency in wire.sorted(inputs) {
+        wire.refuse(w, retirementProbe(w, wire.replaceFirst(fragment, dependency + " ", ""), pair, inputs), "missing input " + dependency)
+    }
+    let evidence = "--evidence \"$$evidence/run\""
+    for target in wire.sorted(pair) {
+        let span = retirementBlock(fragment, target)
+        wire.check(span.length == 2, "recipe block " + target)
+        let recipe = wire.cut(fragment, span[0], span[1])
+        wire.check(wire.count(recipe, evidence) == 1, "recipe evidence " + target)
+        for replacement in ["", evidence + " " + evidence] {
+            let broken = wire.cut(fragment, 0, span[0]) + wire.replaceFirst(recipe, evidence, replacement) + wire.after(fragment, span[1])
+            wire.refuse(w, retirementProbe(w, broken, pair, inputs), target + " evidence " + replacement)
+        }
+    }
+    let driver = wire.absolute(w, "build/tooling/tests/cycle-private-retirement")
+    let windows = wire.environment("", ["MINYAR_CYCLE_HOST=Windows"])
+    let ordinary = wire.environment("", [])
+    let heap = wire.run(w, [driver, "--heap-bytes"], ordinary, "", 60)
+    wire.check(heap.output == "4194304\n", "heap bytes " + heap.output)
+    wire.check(plan(w, driver, "system", 1).length == 38, "system plan")
+    wire.check(plan(w, driver, "fixed", 32).length == 36, "fixed plan")
+    wire.check(plan(w, driver, "eager", 32).length == 16, "eager plan")
+    let fixed = plan(w, driver, "fixed", 32)
+    for mode in ["phase", "local-mark", "local-sweep", "full-mark", "full-sweep", "transfer", "drop", "rebuild"] {
+        for recent in ["0", "1"] { wire.check(wire.has(fixed, "32 queued " + mode + " " + recent), "queued " + mode + " " + recent) }
+    }
+    let active = plan(w, driver, "system", 1024)
+    for mode in ["active-local", "active-full"] {
+        for phase in ["1", "2", "3"] { wire.check(wire.has(active, "32 " + mode + " " + phase), mode + " " + phase) }
+    }
+    let system1 = plan(w, driver, "system", 1)
+    for n in ["32", "256", "2048"] { wire.check(wire.has(system1, n + " private assert-local"), "private " + n) }
+    for row in plan(w, driver, "eager", 32) {
+        let second = wire.words(row)[1]
+        wire.check(second != "queued" && second != "certificate" && second != "reuse" && second != "unknown-after-drop", "eager plan row " + row)
+    }
+    let selected = wire.run(w, [driver, "--profile-selection"], windows, "", 60)
+    wire.check(selected.status == 0, selected.errorOutput)
+    wire.check(wire.lines(selected.output)[0] == "profiles system fixed eager", "windows profiles")
+    wire.check(wire.run(w, [driver, "--profile-selection", "lazy"], windows, "", 60).status == 2, "lazy selection")
+    let red = "IDLE label=private n=32 rounds=8 units=1136 epochs=8\nAssertion work <= 16u * rounds + 64u failed\n"
+    wire.check(failureControl(w, driver, -6, "", red, false) == 0, "valid failure control")
+    let statuses = [0, -6, -6, -6, -6]
+    let outputs = ["", "output", "", "", ""]
+    let errors = [red, red, red, wire.replaceAll(red, "1136", "128"), wire.replaceAll(red, "work <= 16u * rounds + 64u", "unrelated assertion")]
+    let timeouts = [false, false, true, false, false]
+    for index in 0..statuses.length {
+        wire.check(failureControl(w, driver, statuses[index], outputs[index], errors[index], timeouts[index]) != 0, "invalid failure control " + Text(index))
+    }
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    for name in ["tests/cycle-idle-invalidation.c", "tests/cycle-private-retirement-v5.json", "tests/generated-llvm-sanitizer.min"] { wire.omissionRejected(w, catalogue, name) }
+    wire.check(wire.has(wire.formatterFiles(w), "tests/cycle-idle-invalidation.c"), "formatter covers idle invalidation")
+    wire.check(wire.formatterVersion(w) == "23.1.2", "formatter version")
+}
+function plan(w: wire.Wiring, driver: Text, profile: Text, budget: Integer): List<Text> {
+    let result = wire.run(w, [driver, "--plan", profile, Text(budget)], wire.environment("", []), "", 60)
+    wire.check(result.status == 0, result.errorOutput)
+    return wire.lines(result.output)
+}
+function failureControl(w: wire.Wiring, driver: Text, status: Integer, stdout: Text, stderr: Text, timedout: Boolean): Integer {
+    let directory = wire.folder(w, "retirement failure control ")
+    writeTextFile(directory + "/stdout", stdout)
+    writeTextFile(directory + "/stderr", stderr)
+    let flag = "false"
+    if timedout { flag = "true" }
+    return wire.run(w, [driver, "--validate-failure-control", Text(status), flag, directory + "/stdout", directory + "/stderr"], wire.environment("", []), "", 60).status
+}
+
+function registrationProbe(w: wire.Wiring, text: Text, native: Text, sanitize: Text): Text {
+    let c = wire.checks()
+    let directory = wire.folder(w, "minyar registration wiring ")
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, text + "\n.PHONY: build/minyarc-errors build/minyarc-errors-sanitize\nbuild/minyarc-errors build/minyarc-errors-sanitize:\n\t@echo ARTIFACT $@\nbuild/tooling/%:\n\t@echo TOOL $@\n")
+    let result = wire.make(w, ["-np", "-f", makefile, native, sanitize], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.SPACED)
+    let both = [native, sanitize]
+    for gate in ["check", "check-portable", "check-managed-graphs-profiles"] { wire.ensure(c, wire.subset(both, wire.deps(database, gate)), gate) }
+    wire.ensure(c, wire.has(wire.deps(database, "check-sanitize"), sanitize), "check-sanitize")
+    let fixtures = ["tests/cycle-registration-exposure.c", "tests/cycle-late-registration.c", "tests/cycle-late-registration.min", "tests/cycle-additive.c",
+        "build/tooling/tests/cycle-registration", "build/tooling/tests/errors-language"]
+    for target in both { wire.ensure(c, wire.subset(fixtures, wire.deps(database, target)), target + " fixtures") }
+    wire.ensure(c, wire.has(wire.deps(database, native), "build/minyarc-errors"), "native frontend")
+    wire.ensure(c, wire.has(wire.deps(database, sanitize), "build/minyarc-errors-sanitize"), "sanitizer frontend")
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-registration --") == 2, "registration commands")
+    wire.ensure(c, wire.count(commands, "--sanitize") == 1, "registration sanitizer")
+    wire.ensure(c, !wire.contains(commands, "--nodes"), "registration nodes")
+    wire.ensure(c, wire.contains(commands, "cycle-registration-exposure-native"), "native evidence")
+    wire.ensure(c, wire.contains(commands, "cycle-registration-exposure-sanitize"), "sanitizer evidence")
+    return wire.failure(c)
+}
+public function test_registration_exposure_has_required_native_and_sanitizer_gates(w: wire.Wiring) {
+    let native = "check-cycle-registration-exposure"
+    let sanitize = native + "-sanitize"
+    let source = wire.read(w, "build-support/managed-graphs.mk")
+    wire.require(w, registrationProbe(w, source, native, sanitize), "registration wiring")
+    for gate in ["check", "check-portable", "check-managed-graphs-profiles", "check-sanitize"] {
+        let line = gate + ": " + native + " " + sanitize + "\n"
+        if gate == "check-sanitize" { line = gate + ": " + sanitize + "\n" }
+        wire.check(wire.count(source, line) == 1, "registration aggregate " + gate)
+        wire.refuse(w, registrationProbe(w, wire.replaceFirst(source, line, ""), native, sanitize), "missing gate " + gate)
+    }
+    let targets = wire.linuxTargets(w)
+    for target in [native, sanitize] { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    let formatted = wire.formatterFiles(w)
+    for fixture in ["tests/cycle-registration-exposure.c", "tests/cycle-late-registration.c"] { wire.check(wire.has(formatted, fixture), "formatter covers " + fixture) }
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    let discovered = wire.discover(w)
+    for fixture in ["tests/cycle-registration-exposure.c", "tests/cycle-late-registration.c", "tests/cycle-late-registration.min"] { wire.requiredSource(w, catalogue, discovered, fixture) }
+    let selector = "test_result_callback_cycles_in_both_payload_slots_are_collected"
+    wire.check(wire.contains(wire.read(w, "tests/cycle-registration.min"), "\"build/tooling/tests/errors-language\", \"ErrorsLanguage." + selector + "\""), "registration selects the Result callback case")
+    wire.check(wire.contains(wire.read(w, "tests/errors-language.min"), "fixtures.selected(\"ErrorsLanguage\", \"" + selector + "\")"), "errors-language declares the Result callback case")
+    let driver = wire.absolute(w, "build/tooling/tests/cycle-registration")
+    let folder = wire.folder(w, "minyar registration driver ")
+    let windows = wire.environment("", ["MINYAR_CYCLE_HOST=Windows"])
+    let selected = wire.run(w, [driver, "--profile-selection"], windows, folder, 60)
+    wire.check(selected.status == 0, selected.errorOutput)
+    let output = wire.lines(selected.output)
+    wire.check(output[0] == "profiles system fixed eager", "registration profiles")
+    wire.check(wire.starts(output[1], "unsupported "), "unsupported profile line")
+    wire.check(json.member(json.parse(wire.after(output[1], 12)), "profile").text == "lazy", "unsupported lazy profile")
+    wire.check(wire.run(w, [driver, "--profile-selection", "lazy"], windows, folder, 60).status == 2, "lazy refused")
+    let unsupported = wire.run(w, [driver, "--profiles", "lazy", "--evidence", "unused"], wire.environment("", ["MINYAR_CYCLE_HOST=MINGW64_NT-10.0"]), folder, 60)
+    wire.check(unsupported.status == 2, unsupported.errorOutput)
+    wire.check(files.pathSize(folder + "/unused") < 0, "refused profile created evidence")
+    let nodes = wire.run(w, [driver, "--evidence", "out", "--nodes", "2048"], wire.environment("", []), folder, 60)
+    wire.check(nodes.status == 2, nodes.errorOutput)
+    wire.check(files.pathSize(folder + "/out") < 0, "node override created evidence")
+}
+
+public function test_registered_growth_is_mandatory_with_native_and_sanitizer_drivers(w: wire.Wiring) {
+    let directory = wire.folder(w, "minyar registry wiring ")
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, included(w, "build-support/managed-graphs.mk"))
+    let result = wire.make(w, ["-np", "-f", makefile, "check-cycle-registry-growth", "check-cycle-registry-growth-sanitize"], wire.environment("", []), "")
+    wire.check(result.status == 0, result.errorOutput)
+    let database = wire.rules(result.output, wire.SPACED)
+    let both = ["check-cycle-registry-growth", "check-cycle-registry-growth-sanitize"]
+    for gate in ["check", "check-portable", "check-managed-graphs-profiles"] { wire.check(wire.subset(both, wire.deps(database, gate)), gate) }
+    wire.check(wire.has(wire.deps(database, "check-sanitize"), "check-cycle-registry-growth-sanitize"), "check-sanitize")
+    for target in both {
+        wire.check(wire.has(wire.deps(database, target), "tests/cycle-registry-growth.c"), target)
+        wire.check(wire.has(wire.deps(database, target), "tests/cycle-additive.c"), target)
+    }
+    let commands = wire.dryRunCommands(result.output)
+    wire.check(wire.count(commands, "./build/tooling/tests/cycle-additive --fixture") == 2, "growth commands")
+    wire.check(wire.count(commands, "--fixture cycle-registry-growth.c") == 2, "growth fixtures")
+    wire.check(wire.count(commands, "--sanitize") == 1, "growth sanitizer")
+    wire.check(wire.contains(commands, "cycle-registry-growth-native"), "native evidence")
+    wire.check(wire.contains(commands, "cycle-registry-growth-sanitize"), "sanitizer evidence")
+}
+
+public function test_managed_graph_launcher_builds_only_supported_incremental_driver(w: wire.Wiring) {
+    let work = wire.folder(w, "minyar build wiring ")
+    wire.environmentStub(w, work)
+    let makefile = work + "/probe.mk"
+    wire.write(makefile, included(w, "build-support/managed-graphs.mk") +
+        ".PHONY: build/minyarc build/minyarc-callbacks build/minyarc-modules build/minyar-module-build\nbuild/minyarc build/minyarc-callbacks build/minyarc-modules build/minyar-module-build:\n\t@echo ARTIFACT $@\n" +
+        ".PHONY: build/tooling/tests/managed-graphs-launcher tests/sha256-test-native.c runtime/native/sha256.c\nbuild/tooling/tests/managed-graphs-launcher tests/sha256-test-native.c runtime/native/sha256.c:\n\t@echo TOOL $@\n")
+    let systems = ["Linux", "Darwin", "Windows_NT", "MINGW64_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"]
+    let values = ["", "", "Windows_NT", "", "", ""]
+    let incremental = [true, true, false, false, false, false]
+    for index in 0..systems.length {
+        let result = wire.make(w, ["-n", "-f", makefile, "OS=" + values[index], "check-managed-graphs-launcher"], wire.environment(work, ["TEST_UNAME=" + systems[index]]), work)
+        wire.check(result.status == 0, result.errorOutput)
+        let artifacts: List<Text> = []
+        for line in wire.lines(result.output) {
+            let at = wire.find(line, "ARTIFACT ", 0)
+            if at >= 0 { artifacts = wire.union(artifacts, [wire.after(line, at + 9)]) }
+        }
+        let expected = ["build/minyarc", "build/minyarc-callbacks"]
+        if incremental[index] { expected = wire.union(expected, ["build/minyarc-modules", "build/minyar-module-build"]) }
+        wire.check(wire.joined(wire.sorted(artifacts), ",") == wire.joined(wire.sorted(expected), ","), systems[index] + " artifacts " + wire.joined(artifacts, ","))
+        wire.check(wire.contains(result.output, "./build/tooling/tests/managed-graphs-launcher"), systems[index] + " launcher command")
+    }
+}
+
+function parallelProbe(w: wire.Wiring, fragment: Text, fixtures: List<Text>): Text {
+    let native = "check-parallel-signatures"
+    let sanitize = native + "-sanitize"
+    let c = wire.checks()
+    let ordinary = ["minyarc", "minyarc-callbacks", "minyarc-errors"]
+    let instrumented = ["minyarc-sanitize", "minyarc-callbacks-sanitize", "minyarc-errors-sanitize"]
+    let stage3 = ["build/compiler-stage3.ll", "build/closure-compiler-stage3.ll", "build/errors-compiler-stage3.ll"]
+    let artifacts: List<Text> = []
+    for name in ordinary { artifacts.add("build/" + name) }
+    for name in instrumented { artifacts.add("build/" + name) }
+    artifacts = wire.union(artifacts, wire.union(stage3, ["build/minyar-runtime.o", "build", "build/testing/cycle-runtime.o", "build/tooling/tests/compiler-behavior", "build/tooling/tests/parallel-signatures"]))
+    let directory = wire.folder(w, "minyar parallel ABI wiring ")
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, fragment + wire.phonyStubs(wire.sorted(artifacts), "\t@echo ARTIFACT $@"))
+    let result = wire.make(w, ["-np", "-f", makefile, native, sanitize], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.SPACED)
+    for gate in ["check", "check-portable", "check-parallel", "check-callbacks", "check-errors-language"] { wire.ensure(c, wire.has(wire.deps(database, gate), native), gate) }
+    for gate in ["check-sanitize", "check-parallel-sanitize", "check-callbacks-sanitize", "check-errors-language-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), sanitize), gate) }
+    for target in [native, sanitize] {
+        let frontends = ordinary
+        if target == sanitize { frontends = instrumented }
+        for name in frontends { wire.ensure(c, wire.has(wire.deps(database, target), "build/" + name), target + " " + name) }
+        wire.ensure(c, wire.subset(wire.union(fixtures, ["build/tooling/tests/parallel-signatures", "build/minyar-runtime.o"]), wire.deps(database, target)), target + " inputs")
+    }
+    wire.ensure(c, wire.subset(stage3, wire.deps(database, native)), "stage3")
+    wire.ensure(c, wire.has(wire.deps(database, native), "build/tooling/tests/compiler-behavior"), "compiler behavior")
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/parallel-signatures;") == 2, "parallel commands")
+    wire.ensure(c, wire.contains(commands, "for frontend in minyarc minyarc-callbacks minyarc-errors;"), "ordinary loop")
+    wire.ensure(c, wire.contains(commands, "for frontend in minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize;"), "sanitizer loop")
+    wire.ensure(c, wire.count(commands, "MINYAR_TEST_COMPILER=\"./build/$frontend\"") == 2, "frontend selection")
+    wire.ensure(c, wire.count(commands, "MINYAR_PARALLEL_OBSERVATIONS=\"$evidence/$frontend\"") == 2, "observations")
+    wire.ensure(c, wire.count(commands, "mktemp -d \"") == 2, "evidence directories")
+    wire.ensure(c, wire.contains(commands, "MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined"), "sanitizer flags")
+    wire.ensure(c, !wire.contains(commands, "MINYAR_PARALLEL_IR_CONTROL="), "IR control")
+    for suffix in ["native", "sanitize"] { wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/parallel-signatures-" + suffix), "evidence " + suffix) }
+    for family in ["compiler", "closure-compiler", "errors-compiler"] { wire.ensure(c, wire.contains(commands, "--ir build/" + family + "-stage3.ll"), family) }
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/compiler-behavior --profile") == 3, "compiler behavior profiles")
+    wire.ensure(c, !wire.contains(commands, "cmp build/"), "no cmp")
+    return wire.failure(c)
+}
+public function test_parallel_signature_gates_prepare_every_frontend_and_fixture(w: wire.Wiring) {
+    let native = "check-parallel-signatures"
+    let sanitize = native + "-sanitize"
+    let source = wire.read(w, "build-support/parallel.mk")
+    let fixtures: List<Text> = []
+    for name in files.list(wire.absolute(w, "tests/parallel-signatures")) { if wire.ends(name, ".min") { fixtures.add("tests/parallel-signatures/" + name) } }
+    fixtures = wire.sorted(fixtures)
+    wire.check(fixtures.length == 20, "parallel fixture count")
+    wire.require(w, parallelProbe(w, source, fixtures), "parallel wiring")
+    for aggregate in ["check check-portable check-parallel check-callbacks check-errors-language: " + native,
+        "check-sanitize check-parallel-sanitize check-callbacks-sanitize check-errors-language-sanitize: " + sanitize] {
+        let split = wire.find(aggregate, ": ", 0)
+        let names = wire.words(wire.cut(aggregate, 0, split))
+        let dependency = wire.after(aggregate, split + 2)
+        for gate in names {
+            wire.refuse(w, parallelProbe(w, wire.replaceFirst(source, aggregate, wire.joined(wire.without(names, gate), " ") + ": " + dependency), fixtures), "missing gate " + gate)
+        }
+    }
+    for declaration in ["PARALLEL_SIGNATURE_FRONTENDS = minyarc minyarc-callbacks minyarc-errors",
+        "PARALLEL_SIGNATURE_SANITIZER_FRONTENDS = minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize"] {
+        let split = wire.find(declaration, " = ", 0)
+        let left = wire.cut(declaration, 0, split)
+        let frontends = wire.words(wire.after(declaration, split + 3))
+        for missing in frontends {
+            wire.refuse(w, parallelProbe(w, wire.replaceFirst(source, declaration, left + " = " + wire.joined(wire.without(frontends, missing), " ")), fixtures), "missing frontend " + missing)
+        }
+    }
+    for fixture in fixtures {
+        let mutant = wire.replaceFirst(source, fixture, "")
+        wire.check(mutant != source, "fixture listed " + fixture)
+        wire.refuse(w, parallelProbe(w, mutant, fixtures), "missing fixture " + fixture)
+    }
+    wire.refuse(w, parallelProbe(w, wire.replaceFirst(source, "$(abspath build)/parallel-signatures-", "build/parallel-signatures-"), fixtures), "relative evidence")
+    wire.refuse(w, parallelProbe(w, wire.replaceFirst(source, "MINYAR_PARALLEL_OBSERVATIONS=", "UNUSED_OBSERVATIONS="), fixtures), "unused observations")
+    let targets = wire.linuxTargets(w)
+    for target in [native, sanitize] { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    let workflow = wire.read(w, ".github/workflows/ci.yml")
+    wire.check(wire.contains(workflow, "check-portable"), "workflow portable")
+    wire.check(wire.contains(workflow, "build/tooling/scripts/check-linux"), "workflow Linux runner")
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    let discovered = wire.discover(w)
+    for name in fixtures { wire.requiredSource(w, catalogue, discovered, name) }
+}
+
+function sanitizerProbe(w: wire.Wiring, candidate: Text, sanitizer: Text, selected: Text, directory: Text, expected: List<Text>): Text {
+    let c = wire.checks()
+    let folder = wire.folder(w, "actual sanitizer Make rules ")
+    let probe = folder + "/probe.mk"
+    wire.write(probe, "LLVM_CC := retained-native-clang\nSANITIZER_LIMITED := sanitizer-limit\nPATH := /retained/native/bin:/usr/bin\nMINYAR_SANITIZER_CLANG := " + sanitizer + "\n" + candidate +
+        "\n.PHONY: build build/minyarc build/yamux-peer build/tooling/tools/clang-driver build/tooling/tests/generated-llvm-sanitizer-test\nbuild build/minyarc build/yamux-peer build/tooling/tools/clang-driver build/tooling/tests/generated-llvm-sanitizer-test:\n")
+    let result = wire.make(w, ["-rRnp", "-f", probe, "check"], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.NAMED)
+    for gate in ["check", "check-portable", "check-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), "check-generated-llvm-sanitizer"), gate) }
+    wire.ensure(c, wire.subset(expected, wire.deps(database, "check-generated-llvm-sanitizer")), "generated sanitizer inputs")
+    let commands = wire.dryRunCommands(result.output)
+    let command = wire.lineContaining(commands, "./build/tooling/tests/generated-llvm-sanitizer-test")
+    if command == "" { return "missing generated sanitizer command" }
+    let fields = wire.shellWords(command)
+    let chosen = selected
+    if chosen == "" { chosen = sanitizer }
+    if chosen == "" { chosen = "retained-native-clang" }
+    wire.ensure(c, wire.has(fields, "MINYAR_TEST_CLANG=" + chosen), "selected clang " + chosen)
+    wire.ensure(c, wire.has(fields, "sanitizer-limit"), "sanitizer limiter")
+    let searches: List<Text> = []
+    for field in fields { if wire.starts(field, "PATH=") { searches.add(wire.after(field, 5)) } }
+    wire.ensure(c, searches.length == 1, "one PATH")
+    if searches.length == 1 {
+        let search = searches[0]
+        if sanitizer != "" {
+            let suffix = ":/retained/native/bin:/usr/bin"
+            wire.ensure(c, wire.ends(search, suffix), "PATH suffix " + search)
+            let prefix = wire.cut(search, 0, wire.size(search) - wire.size(suffix))
+            while wire.ends(prefix, "/") { prefix = wire.cut(prefix, 0, wire.size(prefix) - 1) }
+            wire.ensure(c, prefix == directory, "PATH directory " + prefix)
+        } else { wire.ensure(c, search == "/retained/native/bin:/usr/bin", "ordinary PATH " + search) }
+    }
+    wire.ensure(c, wire.contains(commands, "--artifacts \"$artifacts/run\""), "artifact leaf")
+    wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/generated-llvm-sanitizer-"), "absolute artifacts")
+    return wire.failure(c)
+}
+public function test_generated_llvm_sanitizer_is_mandatory_and_tracks_canonical_helper(w: wire.Wiring) {
+    let source = wire.read(w, "build-support/checks.mk")
+    let marker = "# Real unsafe generated-program accesses must fail"
+    wire.check(wire.contains(source, marker), "generated sanitizer marker")
+    let aggregate = "check check-portable check-sanitize: check-generated-llvm-sanitizer"
+    let begin = wire.find(source, marker, 0)
+    let end = wire.find(source, "\n", wire.find(source, aggregate, begin))
+    let fragment = wire.cut(source, begin, end + 1)
+    let expected = ["build/minyarc", "build/tooling/tests/generated-llvm-sanitizer-test", "tests/generated-llvm-sanitizer.min", "build/tooling/tools/clang-driver"]
+    wire.require(w, sanitizerProbe(w, fragment, "", "", "/clang64/bin", expected), "ordinary sanitizer selection")
+    wire.require(w, sanitizerProbe(w, fragment, "/clang64/bin/clang.exe", "", "/clang64/bin", expected), "MSYS sanitizer selection")
+    wire.require(w, sanitizerProbe(w, fragment, "/opt/LLVM 23/bin/clang.exe", "", "/opt/LLVM 23/bin", expected), "spaced sanitizer selection")
+    wire.require(w, sanitizerProbe(w, fragment, "/opt/LLVM's 23/bin/clang.exe", "", "/opt/LLVM's 23/bin", expected), "quoted sanitizer selection")
+    let host = wire.run(w, ["uname", "-s"], wire.environment("", []), "", 10).output
+    if wire.starts(host, "MSYS") || wire.starts(host, "MINGW") || wire.starts(host, "CYGWIN") {
+        let selected = "/c/MinyarUnify-20261012/LLVM 23/bin/clang.exe"
+        for spelling in [selected, "C:/MinyarUnify-20261012/LLVM 23/bin/clang.exe", "C:\\MinyarUnify-20261012\\LLVM 23\\bin\\clang.exe"] {
+            wire.require(w, sanitizerProbe(w, fragment, spelling, selected, "/c/MinyarUnify-20261012/LLVM 23/bin", expected), "native spelling " + spelling)
+        }
+        let share = "//20.20.20.1/Data/LLVM 23/bin/clang.exe"
+        for spelling in [share, "\\\\20.20.20.1\\Data\\LLVM 23\\bin\\clang.exe"] {
+            wire.require(w, sanitizerProbe(w, fragment, spelling, share, "//20.20.20.1/Data/LLVM 23/bin", expected), "share spelling " + spelling)
+        }
+    }
+    let clangRule = wire.lineStarting(fragment, "GENERATED_SANITIZER_CLANG =")
+    let pathRule = wire.lineStarting(fragment, "GENERATED_SANITIZER_PATH =")
+    let olds = [clangRule, "PATH=\"$(GENERATED_SANITIZER_PATH)\" ", pathRule, pathRule, pathRule]
+    let news = ["GENERATED_SANITIZER_CLANG = $(LLVM_CC)", "", "GENERATED_SANITIZER_PATH = $(PATH)", "GENERATED_SANITIZER_PATH = /wrong/runtime:$(PATH)",
+        "GENERATED_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)"]
+    let sanitizers = ["/clang64/bin/clang.exe", "/clang64/bin/clang.exe", "/clang64/bin/clang.exe", "/clang64/bin/clang.exe", "/opt/LLVM 23/bin/clang.exe"]
+    let directories = ["/clang64/bin", "/clang64/bin", "/clang64/bin", "/clang64/bin", "/opt/LLVM 23/bin"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "dispatch mutation applies " + olds[index])
+        wire.refuse(w, sanitizerProbe(w, mutant, sanitizers[index], "", directories[index], expected), "dispatch " + olds[index])
+    }
+    for gate in ["check", "check-portable", "check-sanitize"] {
+        let names = wire.without(wire.words(wire.cut(aggregate, 0, wire.find(aggregate, ":", 0))), gate)
+        wire.refuse(w, sanitizerProbe(w, wire.replaceFirst(fragment, aggregate, wire.joined(names, " ") + ": check-generated-llvm-sanitizer"), "", "", "/clang64/bin", expected), "missing gate " + gate)
+    }
+    for dependency in wire.sorted(expected) {
+        wire.refuse(w, sanitizerProbe(w, wire.replaceFirst(fragment, dependency + " ", ""), "", "", "/clang64/bin", expected), "missing dependency " + dependency)
+    }
+    let compiler = wire.read(w, "build-support/compiler.mk")
+    let compilerLines = wire.lines(compiler)
+    let matched = 0
+    for index in 0..compilerLines.length {
+        let line = compilerLines[index]
+        let colon = wire.find(line, ":", 0)
+        if !wire.starts(line, "build/") || colon < 0 || !wire.ends(wire.cut(line, 0, colon), "sanitize.ll") { continue }
+        if index + 1 >= compilerLines.length || !wire.starts(compilerLines[index + 1], "\t") { continue }
+        matched += 1
+        wire.check(wire.contains(wire.after(line, colon + 1), "build/tooling/tools/clang-driver"), "sanitized compiler IR depends on clang-driver")
+        wire.check(wire.contains(compilerLines[index + 1], "clang-driver sanitize-llvm"), "sanitized compiler IR uses clang-driver sanitize-llvm")
+    }
+    wire.check(matched == 1, "sanitized compiler IR rules")
+    let driver = wire.read(w, "tools/clang-driver.min")
+    wire.check(wire.contains(driver, "use \"./llvm-sanitizer.min\" as sanitizer"), "clang-driver delegates to the canonical sanitizer helper")
+    wire.check(!wire.contains(driver, "function instrument("), "clang-driver duplicates the sanitizer helper")
+    wire.check(files.pathSize(wire.absolute(w, "tests/llvm_sanitizer.py")) < 0 && files.pathSize(wire.absolute(w, "tools/sanitizer_llvm.py")) < 0, "a second sanitizer helper remains")
+    wire.check(wire.occurrences(wire.linuxTargets(w), "check-generated-llvm-sanitizer") == 1, "generated sanitizer Linux target")
+}

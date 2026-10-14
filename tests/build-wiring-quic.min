@@ -1,0 +1,424 @@
+use "./build-wiring-support.min" as wire
+use "system" as system
+use "files" as files
+use "json" as json
+
+function stubbed(w: wire.Wiring, prefix: Text, fragment: Text, stubs: List<Text>, line: Text): Text {
+    let directory = wire.folder(w, prefix)
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, fragment + wire.phonyStubs(stubs, line))
+    return makefile
+}
+function aggregateMutants(source: Text, line: Text, gates: List<Text>): List<Text> {
+    let split = wire.find(line, ": ", 0)
+    let names = wire.words(wire.cut(line, 0, split))
+    let dependency = wire.after(line, split + 2)
+    let result: List<Text> = []
+    for gate in gates { result.add(wire.replaceFirst(source, line, wire.joined(wire.without(names, gate), " ") + ": " + dependency)) }
+    return result
+}
+
+function ledgerProbe(w: wire.Wiring, fragment: Text, inputs: List<Text>): Text {
+    let target = "check-quic-amplification-ledger"
+    let c = wire.checks()
+    let makefile = stubbed(w, "QUIC ledger Make rules ", fragment, wire.sorted(wire.union(inputs, ["build"])), "\t@echo INPUT $@")
+    let result = wire.make(w, ["-rRnp", "-f", makefile, target], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.LOOSE)
+    for gate in ["check", "check-portable", "check-quic", "check-quic-sanitize", "check-quic-rfc", "check-quic-rfc-sanitize", "check-sanitize"] {
+        wire.ensure(c, wire.has(wire.deps(database, gate), target), gate)
+    }
+    wire.ensure(c, wire.subset(inputs, wire.deps(database, target)), "ledger inputs")
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-amplification-ledger --artifacts") == 1, "ledger command")
+    wire.ensure(c, wire.contains(commands, "--artifacts \"$artifacts/run\""), "artifact leaf")
+    wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/quic-ledger."), "absolute artifacts")
+    for forbidden in ["--case ", "--expect-old-code", "--sanitize"] { wire.ensure(c, !wire.contains(commands, forbidden), forbidden) }
+    return wire.failure(c)
+}
+public function test_quic_ledger_requires_full_offline_controls(w: wire.Wiring) {
+    let source = wire.read(w, "build-support/quic-ledger.mk")
+    let target = "check-quic-amplification-ledger"
+    let inputs = ["tests/quic-amplification-ledger.min", "tests/quic-ledger-support.min", "tests/quic-ledger-checker.min", "tests/quic-ledger-crypto.c",
+        "build/tooling/tests/quic-amplification-ledger", "build/tooling/tests/quic-ledger-checker", "build/tooling/tools/clang-driver"]
+    wire.require(w, ledgerProbe(w, source, inputs), "ledger wiring")
+    let gates = ["check", "check-portable", "check-quic", "check-quic-sanitize", "check-quic-rfc", "check-quic-rfc-sanitize", "check-sanitize"]
+    let line = wire.lineStarting(source, "check check-portable ")
+    let mutants = aggregateMutants(source, line, gates)
+    for index in 0..gates.length { wire.refuse(w, ledgerProbe(w, mutants[index], inputs), "missing gate " + gates[index]) }
+    for dependency in wire.sorted(inputs) {
+        let mutant = wire.replaceFirst(source, dependency, "")
+        wire.check(mutant != source, "ledger input listed " + dependency)
+        wire.refuse(w, ledgerProbe(w, mutant, inputs), "missing input " + dependency)
+    }
+    for pair in [["--artifacts", "--case exact3x --artifacts"], ["$(abspath build)/quic-ledger.", "build/quic-ledger."]] {
+        let mutant = wire.replaceFirst(source, pair[0], pair[1])
+        wire.check(mutant != source, "ledger mutation applies " + pair[0])
+        wire.refuse(w, ledgerProbe(w, mutant, inputs), "invalid recipe " + pair[0])
+    }
+    wire.check(wire.occurrences(wire.linuxTargets(w), target) == 1, "ledger Linux target")
+    let catalogue = wire.catalogue(w)
+    let crypto = wire.row(catalogue, "tests/quic-ledger-crypto.c")
+    wire.check(json.member(crypto, "role").text == "support", "ledger crypto role")
+    wire.check(wire.has(wire.rowTexts(crypto, "consumers"), "build-support/quic-ledger.mk"), "ledger crypto consumer")
+    wire.omissionRejected(w, catalogue, "tests/quic-ledger-crypto.c")
+}
+
+function lifecycleProbe(w: wire.Wiring, fragment: Text, inputs: List<Text>): Text {
+    let helper = "check-quic-protocol-artifacts"
+    let c = wire.checks()
+    let makefile = stubbed(w, "QUIC owned lifecycle rules ", fragment, wire.sorted(wire.union(inputs, ["build"])), "\t@echo INPUT $@")
+    let result = wire.make(w, ["-rRnp", "-f", makefile, helper], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.LOOSE)
+    for gate in ["check-quic-rfc", "check-quic-rfc-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), helper), gate) }
+    wire.ensure(c, wire.subset(inputs, wire.deps(database, helper)), "protocol artifact inputs")
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-protocol-artifacts --artifacts") == 1, "protocol artifact command")
+    wire.ensure(c, wire.contains(commands, "--artifacts \"$artifacts/run\""), "artifact leaf")
+    wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/quic-protocol-artifacts."), "absolute artifacts")
+    wire.ensure(c, !wire.contains(commands, "--expect-old-code"), "old code oracle")
+    wire.ensure(c, !wire.contains(commands, "--case "), "case filter")
+    return wire.failure(c)
+}
+public function test_quic_rfc_requires_owned_lifecycle_controls(w: wire.Wiring) {
+    let source = wire.read(w, "build-support/quic-rfc.mk")
+    let helper = "check-quic-protocol-artifacts"
+    let inputs = ["build/tooling/tests/quic-protocol-artifacts", "build/tooling/tests/quic-qns-local", "build/tooling/tests/quic-vn-probe", "tests/quic-protocol-artifacts.min",
+        "tests/quic-protocol-support.min", "tests/quic-qns-local.min", "tests/quic-vn-probe.min", "tests/interop/qns/endpoint.min"]
+    wire.require(w, lifecycleProbe(w, source, inputs), "owned lifecycle wiring")
+    for gate in ["check-quic-rfc", "check-quic-rfc-sanitize"] {
+        let line = wire.lineStarting(source, gate + ":")
+        wire.refuse(w, lifecycleProbe(w, wire.replaceFirst(source, line, wire.replaceFirst(line, " " + helper, "")), inputs), "missing helper in " + gate)
+    }
+    let line = wire.lineStarting(source, helper + ":")
+    for dependency in wire.sorted(inputs) {
+        wire.refuse(w, lifecycleProbe(w, wire.replaceFirst(source, line, wire.replaceFirst(line, " " + dependency, "")), inputs), "missing input " + dependency)
+    }
+    let olds = ["tests/quic-protocol-artifacts --artifacts", "tests/quic-protocol-artifacts --artifacts", "$(abspath build)/quic-protocol-artifacts."]
+    let news = ["tests/quic-protocol-artifacts --expect-old-code --artifacts", "tests/quic-protocol-artifacts --case healthy-shutdown --artifacts", "build/quic-protocol-artifacts."]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(source, olds[index], news[index])
+        wire.check(mutant != source, "lifecycle mutation applies " + news[index])
+        wire.refuse(w, lifecycleProbe(w, mutant, inputs), "invalid helper " + news[index])
+    }
+}
+
+function rfcProbe(w: wire.Wiring, fragment: Text, frontends: List<Text>, inputs: List<Text>): Text {
+    let native = "check-quic-rfc"
+    let sanitize = "check-quic-rfc-sanitize"
+    let c = wire.checks()
+    let fixtures = wire.sorted(wire.union(wire.union(frontends, inputs), ["build", "build/tooling/tests/quic-protocol-artifacts"]))
+    let makefile = stubbed(w, "QUIC RFC Make rules ", fragment, fixtures, "\t@echo INPUT $@")
+    let result = wire.make(w, ["-rRnp", "-f", makefile, native, sanitize], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.LOOSE)
+    for gate in ["check", "check-portable", "check-quic"] { wire.ensure(c, wire.has(wire.deps(database, gate), native), gate) }
+    for gate in ["check-sanitize", "check-quic-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), sanitize), gate) }
+    for target in [native, sanitize] { wire.ensure(c, wire.subset(wire.union(frontends, inputs), wire.deps(database, target)), target + " inputs") }
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-rfc --optimization") == 2, "RFC commands")
+    wire.ensure(c, wire.count(commands, "--optimization both") == 2, "both optimizations")
+    wire.ensure(c, wire.count(commands, "--sanitize") == 1, "RFC sanitizer")
+    wire.ensure(c, wire.count(commands, "mktemp -d \"") == 3, "artifact directories")
+    wire.ensure(c, wire.count(commands, "--artifacts \"$artifacts/run\"") == 3, "artifact leaves")
+    wire.ensure(c, !wire.contains(commands, "--case "), "case filter")
+    wire.ensure(c, !wire.contains(commands, "--expect-old-code"), "old code oracle")
+    for suffix in ["native", "sanitize"] { wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/quic-rfc-" + suffix), "absolute " + suffix) }
+    return wire.failure(c)
+}
+public function test_quic_rfc_gates_keep_all_drivers_and_public_frontends(w: wire.Wiring) {
+    let source = wire.read(w, "build-support/quic-rfc.mk")
+    let native = "check-quic-rfc"
+    let sanitize = "check-quic-rfc-sanitize"
+    let frontends = ["build/minyarc", "build/minyarc-callbacks", "build/minyarc-errors-request", "build/minyarc-errors"]
+    let inputs = ["minyar", "build/tooling/tools/clang-driver", "tools/llvm-sanitizer.min", "build/tooling/tests/quic-rfc", "tests/quic-rfc.min",
+        "build/tooling/tests/quic-rfc-harness", "tests/quic-rfc-harness.min", "tests/quic-protocol-artifacts.min", "tests/interop/qns/endpoint.min",
+        "library/quic.min", "library/tls.min", "library/tlsserver.min", "build/tooling/tests/quic-migration-cids-test", "tests/quic-migration-cids-test.min",
+        "tests/quic-migration-cids.min", "build/tooling/tests/quic-cipher-policy-test", "tests/quic-cipher-policy-test.min", "tests/quic-cipher-policy.min",
+        "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tests/quic-json.min", "tools/testing.min", "build/tooling/tests/quic-qns-local",
+        "tests/quic-qns-local.min", "build/tooling/tests/quic-vn-probe", "tests/quic-vn-probe.min", "tests/interop/qns/client.min", "tests/interop/qns/server.min"]
+    wire.require(w, rfcProbe(w, source, frontends, inputs), "RFC wiring")
+    for gate in ["check", "check-portable", "check-quic", "check-sanitize", "check-quic-sanitize"] {
+        let aggregate = "check check-portable check-quic: " + native
+        if gate == "check-sanitize" || gate == "check-quic-sanitize" { aggregate = "check-sanitize check-quic-sanitize: " + sanitize }
+        let names = wire.words(wire.cut(aggregate, 0, wire.find(aggregate, ": ", 0)))
+        let dependency = wire.after(aggregate, wire.find(aggregate, ": ", 0) + 2)
+        wire.refuse(w, rfcProbe(w, wire.replaceFirst(source, aggregate, wire.joined(wire.without(names, gate), " ") + ": " + dependency), frontends, inputs), "missing gate " + gate)
+    }
+    for dependency in wire.sorted(wire.union(frontends, inputs)) {
+        let mutant = wire.replaceFirst(source, dependency, "")
+        wire.check(mutant != source, "RFC dependency listed " + dependency)
+        wire.refuse(w, rfcProbe(w, mutant, frontends, inputs), "missing dependency " + dependency)
+    }
+    let olds = ["--optimization both", "--sanitize --artifacts", "--optimization both", "--optimization both", "$(abspath build)/quic-rfc-"]
+    let news = ["--optimization 0", "--artifacts", "--optimization both --case migration-cid", "--optimization both --expect-old-code", "build/quic-rfc-"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(source, olds[index], news[index])
+        wire.check(mutant != source, "RFC mutation applies " + news[index])
+        wire.refuse(w, rfcProbe(w, mutant, frontends, inputs), "invalid recipe " + news[index])
+    }
+    let targets = wire.linuxTargets(w)
+    for target in [native, sanitize] { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    wire.assertQuicGroup(w, ["check-quic", "check-quic-sanitize"])
+    wire.check(wire.formatterVersion(w) == "23.1.2", "formatter version")
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    let nativeSources = ["build/tooling/tests/quic-migration-cids-test", "tests/quic-migration-cids-test.min", "build/tooling/tests/quic-cipher-policy-test",
+        "tests/quic-cipher-policy-test.min", "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "build/tooling/tests/quic-rfc",
+        "tests/quic-rfc.min", "build/tooling/tests/quic-rfc-harness", "tests/quic-rfc-harness.min", "tests/quic-protocol-artifacts.min", "tests/quic-json.min",
+        "build/tooling/tests/quic-qns-local", "tests/quic-qns-local.min", "build/tooling/tests/quic-vn-probe", "tests/quic-vn-probe.min", "tests/interop/qns/endpoint.min"]
+    let excluded = wire.union(nativeSources, ["minyar", "build/tooling/tools/clang-driver", "tools/llvm-sanitizer.min", "library/quic.min", "library/tls.min", "library/tlsserver.min"])
+    let discovered = wire.discover(w)
+    for name in wire.sorted(inputs) { if !wire.has(excluded, name) { wire.requiredSource(w, catalogue, discovered, name) } }
+}
+
+function relayProbe(w: wire.Wiring, fragment: Text, native: List<Text>, sanitize: List<Text>, tools: List<Text>): Text {
+    let c = wire.checks()
+    let stubs = wire.union(["build/minyarc", "build", "build/peergrpc-peer"], wire.sorted(tools))
+    let makefile = stubbed(w, "minyar relay wiring ", fragment, stubs, "\t@echo ARTIFACT $@")
+    let targets = ["make", "-np", "-f", makefile]
+    let command: List<Text> = ["-np", "-f", makefile]
+    for target in wire.sorted(wire.union(native, sanitize)) { command.add(target) }
+    let result = wire.make(w, command, wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.SPACED)
+    wire.ensure(c, wire.subset(native, wire.deps(database, "check")), "check")
+    wire.ensure(c, wire.subset(sanitize, wire.deps(database, "check-sanitize")), "check-sanitize")
+    for target in wire.union(native, sanitize) {
+        wire.ensure(c, wire.has(wire.deps(database, target), "build/peergrpc-peer"), target + " peer")
+        let tool = "build/tooling/tests/peer-edge-relay-test"
+        if wire.contains(target, "lifetime") { tool = "build/tooling/tests/peer-edge-relay-lifetime-test" }
+        wire.ensure(c, wire.has(wire.deps(database, target), tool), target + " tool")
+    }
+    let commands = wire.dryRunCommands(result.output)
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/peer-edge-relay-test ") == 2, "relay commands")
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/peer-edge-relay-lifetime-test ") == 4, "lifetime commands")
+    wire.ensure(c, wire.count(commands, "mktemp -d \"") == 8, "evidence directories")
+    wire.ensure(c, wire.count(commands, "MINYAR_TEST_PROGRAM_CACHE=") == 2, "program caches")
+    wire.ensure(c, wire.count(commands, "--sanitize") == 3, "relay sanitizers")
+    for mode in ["malformed", "abrupt"] { wire.ensure(c, wire.count(commands, "--mode " + mode) == 2, "mode " + mode) }
+    wire.ensure(c, !wire.contains(commands, "--rounds"), "default rounds")
+    wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/peer-edge-relay-"), "absolute evidence")
+    return wire.failure(c)
+}
+public function test_signed_relay_has_pinned_peer_and_all_lifetime_gates(w: wire.Wiring) {
+    let text = wire.read(w, "build-support/peer-grpc.mk")
+    let source = wire.after(text, wire.find(text, "# Signed relay and independently malformed/abrupt", 0))
+    let native = ["check-peer-edge-relay", "check-peer-edge-relay-lifetime"]
+    let sanitize = ["check-peer-edge-relay-sanitize", "check-peer-edge-relay-lifetime-sanitize"]
+    let tools = ["build/tooling/tests/peer-edge-relay-test", "build/tooling/tests/peer-edge-relay-lifetime-test"]
+    wire.require(w, relayProbe(w, source, native, sanitize, tools), "relay wiring")
+    for gate in ["check", "check-sanitize"] {
+        let targets = native
+        if gate == "check-sanitize" { targets = sanitize }
+        for missing in targets {
+            let line = wire.lineStarting(source, gate + ": ")
+            let mutant = wire.replaceFirst(source, line, gate + ": " + wire.joined(wire.without(wire.words(wire.after(line, wire.find(line, ": ", 0) + 2)), missing), " "))
+            wire.refuse(w, relayProbe(w, mutant, native, sanitize, tools), "missing gate " + missing)
+        }
+    }
+    let targets = wire.linuxTargets(w)
+    for target in wire.union(native, sanitize) { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    wire.assertQuicGroup(w, wire.sorted(wire.union(native, sanitize)))
+    wire.catalogueValid(w, wire.catalogue(w))
+}
+
+function scheduledProbe(w: wire.Wiring, fragment: Text, native: Text, sanitize: Text, tool: Text, fixture: Text, prefix: Text, pto: Boolean): Text {
+    let c = wire.checks()
+    let makefile = stubbed(w, prefix, fragment, ["build/minyarc", "build", tool], "\t@echo ARTIFACT $@")
+    let result = wire.make(w, ["-np", "-f", makefile, native, sanitize], wire.environment("", []), "")
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.SPACED)
+    for gate in ["check", "check-portable", "check-quic"] { wire.ensure(c, wire.has(wire.deps(database, gate), native), gate) }
+    for gate in ["check-sanitize", "check-quic-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), sanitize), gate) }
+    for target in [native, sanitize] { wire.ensure(c, wire.subset([tool, fixture, "build/minyarc"], wire.deps(database, target)), target + " inputs") }
+    let commands = wire.dryRunCommands(result.output)
+    let absolute = wire.replaceAll(commands, "\\", "/")
+    if pto {
+        wire.ensure(c, wire.count(commands, "./" + tool + " ") == 3, "PTO commands")
+        for level in ["0", "1", "2"] { wire.ensure(c, wire.count(commands, "--optimization " + level) == 1, "optimization " + level) }
+        wire.ensure(c, wire.count(commands, "--sanitize") == 1, "PTO sanitizer")
+        wire.ensure(c, wire.count(commands, "mktemp -d \"") == 3, "PTO evidence")
+        for suffix in ["native-O0", "native-O2", "sanitize-O1"] { wire.ensure(c, wire.contains(absolute, w.root + "/build/quic-pto-" + suffix), suffix) }
+    } else {
+        wire.ensure(c, wire.count(commands, "./" + tool + " ") == 2, "ACK commands")
+        wire.ensure(c, wire.count(commands, "--optimization both") == 2, "ACK optimizations")
+        wire.ensure(c, wire.count(commands, "--sanitize") == 1, "ACK sanitizer")
+        wire.ensure(c, wire.count(commands, "mktemp -d \"") == 2, "ACK evidence")
+        wire.ensure(c, wire.count(commands, "--artifacts ") == 2, "ACK artifacts")
+        wire.ensure(c, !wire.contains(commands, "--mode "), "ACK modes stay mandatory")
+        for suffix in ["native", "sanitize"] { wire.ensure(c, wire.contains(absolute, w.root + "/build/quic-ack-" + suffix), suffix) }
+    }
+    return wire.failure(c)
+}
+function scheduledGates(w: wire.Wiring, source: Text, native: Text, sanitize: Text, tool: Text, fixture: Text, prefix: Text, pto: Boolean) {
+    for gate in ["check", "check-portable", "check-quic", "check-sanitize", "check-quic-sanitize"] {
+        let aggregate = "check check-portable check-quic: " + native
+        if gate == "check-sanitize" || gate == "check-quic-sanitize" { aggregate = "check-sanitize check-quic-sanitize: " + sanitize }
+        let split = wire.find(aggregate, ": ", 0)
+        let mutant = wire.replaceFirst(source, aggregate, wire.joined(wire.without(wire.words(wire.cut(aggregate, 0, split)), gate), " ") + ": " + wire.after(aggregate, split + 2))
+        wire.refuse(w, scheduledProbe(w, mutant, native, sanitize, tool, fixture, prefix, pto), "missing gate " + gate)
+    }
+}
+public function test_ack_scheduling_has_both_optimizations_and_all_mandatory_gates(w: wire.Wiring) {
+    let text = wire.read(w, "build-support/checks.mk")
+    let begin = wire.find(text, "# ACK scheduling gates", 0)
+    let source = wire.cut(text, begin, wire.find(text, "# Handshake PTO virtual-clock modes", begin))
+    let native = "check-quic-ack"
+    let sanitize = "check-quic-ack-sanitize"
+    let tool = "build/tooling/tests/quic-ack-test"
+    wire.require(w, scheduledProbe(w, source, native, sanitize, tool, "tests/quic-ack.min", "minyar ACK wiring ", false), "ACK wiring")
+    scheduledGates(w, source, native, sanitize, tool, "tests/quic-ack.min", "minyar ACK wiring ", false)
+    let olds = ["--optimization both", "--sanitize --artifacts", "$(abspath build)/quic-ack-", "--optimization both"]
+    let news = ["--optimization 0", "--artifacts", "build/quic-ack-", "--optimization both --mode 0"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(source, olds[index], news[index])
+        wire.check(mutant != source, "ACK mutation applies " + news[index])
+        wire.refuse(w, scheduledProbe(w, mutant, native, sanitize, tool, "tests/quic-ack.min", "minyar ACK wiring ", false), "invalid recipe " + news[index])
+    }
+    let targets = wire.linuxTargets(w)
+    for target in [native, sanitize] { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    wire.assertQuicGroup(w, ["check-quic", "check-quic-sanitize"])
+    let workflow = wire.read(w, ".github/workflows/ci.yml")
+    wire.check(wire.formatterVersion(w) == "23.1.2", "formatter version")
+    wire.check(wire.contains(workflow, "--group formatting"), "formatting group")
+    wire.check(wire.contains(wire.read(w, "tools/linux-matrix.min"), "build/tooling/scripts/format"), "matrix formatter")
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    wire.requiredSource(w, catalogue, wire.discover(w), "tests/quic-ack.min")
+}
+public function test_handshake_pto_has_native_and_sanitizer_gates(w: wire.Wiring) {
+    let text = wire.read(w, "build-support/checks.mk")
+    let begin = wire.find(text, "# Handshake PTO virtual-clock modes", 0)
+    let source = wire.cut(text, begin, wire.find(text, "# Pure controller regression", begin))
+    let native = "check-quic-pto"
+    let sanitize = "check-quic-pto-sanitize"
+    let tool = "build/tooling/tests/quic-pto-test"
+    wire.require(w, scheduledProbe(w, source, native, sanitize, tool, "tests/quic-pto.min", "minyar PTO wiring ", true), "PTO wiring")
+    scheduledGates(w, source, native, sanitize, tool, "tests/quic-pto.min", "minyar PTO wiring ", true)
+    let targets = wire.linuxTargets(w)
+    for target in [native, sanitize] { wire.check(wire.occurrences(targets, target) == 1, target + " Linux target") }
+    wire.assertQuicGroup(w, ["check-quic", "check-quic-sanitize"])
+    let catalogue = wire.catalogue(w)
+    wire.catalogueValid(w, catalogue)
+    wire.requiredSource(w, catalogue, wire.discover(w), "tests/quic-pto.min")
+}
+
+function adapterProbe(w: wire.Wiring, candidate: Text, host: Text, operating: Text, ready: Boolean, inputs: List<Text>, tools: List<Text>, aggregates: List<Text>): Text {
+    let target = "check-quic-official-adapter"
+    let c = wire.checks()
+    let directory = wire.folder(w, "owned adapter Make rules ")
+    for name in wire.union(inputs, ["runtime/native/sha256.c"]) { wire.write(directory + "/" + name, readTextFile(wire.absolute(w, name))) }
+    let marker = directory + "/build/quic-interop-runner-740c05a.git/.ready.json"
+    let marked = "{\"mock_ready_not_verification\":true}\n"
+    if ready { wire.write(marker, marked) }
+    wire.unameStub(w, directory, host)
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, "LIMITED := ordinary-limit\nSANITIZER_LIMITED := sanitizer-limit\n" + candidate + "\n.PHONY: build\nbuild:\n\t@echo INPUT build\nbuild/%:\n\t@echo TOOL $@\n")
+    let result = wire.make(w, ["-rRnp", "-f", makefile, target], wire.environment(directory, ["OS=" + operating]), directory)
+    if result.status != 0 { return result.errorOutput }
+    let database = wire.rules(result.output, wire.LOOSE)
+    let commands = wire.dryRunCommands(result.output)
+    let supported = host == "Linux" && operating != "Windows_NT"
+    for aggregate in aggregates {
+        if supported { wire.ensure(c, wire.has(wire.deps(database, aggregate), target), aggregate) }
+        else { wire.ensure(c, !wire.has(wire.deps(database, aggregate), target), "unsupported host keeps " + aggregate) }
+    }
+    if !supported {
+        wire.ensure(c, wire.contains(commands, "Linux adapter controls required"), "unsupported diagnostic")
+        wire.ensure(c, wire.contains(commands, "exit 2"), "unsupported exit")
+        wire.ensure(c, !wire.contains(commands, "prepare-runner"), "unsupported preparation")
+        wire.ensure(c, !wire.contains(commands, "check-quic-official-inputs controls "), "unsupported controls")
+        wire.ensure(c, wire.deps(database, target).length == 0, "unsupported prerequisites")
+        return wire.failure(c)
+    }
+    wire.ensure(c, wire.subset(inputs, wire.deps(database, target)), "adapter inputs")
+    wire.ensure(c, wire.subset(tools, wire.deps(database, target)), "adapter tools")
+    wire.ensure(c, !wire.contains(commands, "python"), "adapter runs Python")
+    let controls = wire.linesContaining(commands, " ./build/tooling/scripts/check-quic-official-inputs controls ")
+    wire.ensure(c, controls.length == 1, "adapter controls command")
+    if controls.length == 1 {
+        let command = controls[0]
+        wire.ensure(c, wire.contains(command, "ordinary-limit "), "ordinary limiter")
+        wire.ensure(c, !wire.contains(command, "sanitizer-limit"), "sanitizer limiter")
+        wire.ensure(c, wire.contains(command, "--repository \""), "repository argument")
+        wire.ensure(c, wire.contains(command, "--artifacts \"$artifacts/run\""), "artifact leaf")
+        wire.ensure(c, wire.contains(command, "--controls \"" + directory + "/build/tooling/tests/quic-official-adapter\""), "controls binary")
+        wire.ensure(c, wire.contains(command, "--adapter \"" + directory + "/build/tooling/tests/interop/qns/owned-adapter\""), "adapter binary")
+        wire.ensure(c, wire.contains(command, directory + "/build/quic-interop-runner-740c05a.git"), "pinned runner")
+        for forbidden in ["--case ", "--sanitize", "/home/user/", "docker ", "compose ", "--pull ", "--build "] { wire.ensure(c, !wire.contains(command, forbidden), forbidden) }
+    }
+    wire.ensure(c, wire.contains(commands, directory + "/build/quic-official-adapter."), "absolute artifacts")
+    wire.ensure(c, wire.linesContaining(commands, "ordinary-limit ./build/tooling/tests/quic-official-inputs").length == 1, "input checks")
+    wire.ensure(c, wire.contains(candidate, "mktemp -d \"$(abspath build)"), "absolute mktemp")
+    if ready { wire.ensure(c, !wire.contains(commands, "prepare-runner"), "ready runner prepared again") }
+    else { wire.ensure(c, wire.contains(commands, "check-quic-official-inputs prepare-runner"), "runner preparation") }
+    if ready { wire.ensure(c, readTextFile(marker) == marked, "ready marker changed") }
+    return wire.failure(c)
+}
+public function test_quic_official_adapter_requires_all_linux_controls(w: wire.Wiring) {
+    let fragment = wire.read(w, "build-support/quic-official-adapter.mk")
+    let target = "check-quic-official-adapter"
+    let inputs = ["tests/quic-official-adapter.min", "tests/quic-official-support.min", "tests/quic-official-inputs.min", "scripts/check-quic-official-inputs.min",
+        "tests/interop/qns/owned-adapter.min", "tests/interop/qns/owned-adapter.c", "tests/interop/qns/owned-common.min", "tests/interop/qns/owned-process.min",
+        "tests/interop/qns/owned-daemon.min", "tests/interop/qns/owned-derive.min", "tests/quic-json.min", "tests/quic-simulator-shutdown.min",
+        "tests/interop/qns/simulator-shutdown.sh", "tests/quic-qns-endpoint-lifecycle.min", "tests/interop/qns/endpoint.min"]
+    let tools = ["build/tooling/scripts/check-quic-official-inputs", "build/tooling/tests/quic-official-inputs", "build/tooling/tests/quic-official-adapter",
+        "build/tooling/tests/interop/qns/owned-adapter"]
+    let aggregates = ["check", "check-portable", "check-quic", "check-quic-sanitize", "check-quic-rfc", "check-quic-rfc-sanitize", "check-sanitize"]
+    wire.require(w, adapterProbe(w, fragment, "Linux", "", false, inputs, tools, aggregates), "adapter wiring")
+    wire.require(w, adapterProbe(w, fragment, "Linux", "", true, inputs, tools, aggregates), "ready adapter wiring")
+    let hosts = ["Darwin", "Linux", "MSYS_NT-10.0", "MINGW64_NT-10.0", "CYGWIN_NT-10.0"]
+    let systems = ["", "Windows_NT", "", "", ""]
+    for index in 0..hosts.length { wire.require(w, adapterProbe(w, fragment, hosts[index], systems[index], false, inputs, tools, aggregates), "unsupported " + hosts[index]) }
+    let edge = wire.lineStarting(fragment, "check check-portable ")
+    let mutants = aggregateMutants(fragment, edge, aggregates)
+    for index in 0..aggregates.length { wire.refuse(w, adapterProbe(w, mutants[index], "Linux", "", false, inputs, tools, aggregates), "missing gate " + aggregates[index]) }
+    for source in wire.sorted(inputs) {
+        wire.refuse(w, adapterProbe(w, wire.replaceFirst(fragment, source, ""), "Linux", "", false, inputs, tools, aggregates), "missing input " + source)
+    }
+    let olds = ["controls --repository", "$(LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls", "$(LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls",
+        "$(abspath build)/quic-interop-runner-740c05a.git", "$(abspath build)/quic-official-adapter.", "$$artifacts/run", "controls --repository \"$(QUIC_OFFICIAL_RUNNER)\"",
+        " --adapter \"$(abspath build/tooling/tests/interop/qns/owned-adapter)\"", "$(LIMITED) ./build/tooling/tests/quic-official-inputs; ", "check-quic-official-inputs controls"]
+    let news = ["controls --case criteria-no-pull --repository", "./build/tooling/scripts/check-quic-official-inputs controls", "$(SANITIZER_LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls",
+        "/home/user/private-runner", "build/quic-official-adapter.", "$$artifacts", "controls", "", "", "check-quic-official-inputs ignored"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "adapter mutation applies " + olds[index])
+        wire.refuse(w, adapterProbe(w, mutant, "Linux", "", false, inputs, tools, aggregates), "invalid recipe " + olds[index])
+    }
+    wire.check(wire.occurrences(wire.linuxTargets(w), target) == 1, "adapter Linux target")
+    let workflow = wire.read(w, ".github/workflows/ci.yml")
+    wire.check(wire.contains(workflow, "build/linux-evidence/**/build/quic-official-adapter.*"), "Linux adapter evidence upload")
+    wire.check(wire.count(workflow, "            build/quic-official-adapter.*") == 1, "native adapter evidence upload")
+    let driver = wire.read(w, "tests/quic-official-adapter.min")
+    let cases = declared(driver, "CASES")
+    let forwarding = declared(driver, "FORWARD_CASES")
+    wire.check(wire.joined(forwarding, ",") == "raw-forward-incremental,raw-forward-stderr-status,raw-forward-no-duplicate,raw-forward-empty,raw-forward-private-json,raw-forward-backpressure", "forwarding cases")
+    wire.check(cases.length == 113 && wire.union(cases, []).length == 113, "adapter case count")
+    wire.check(wire.subset(forwarding, cases), "forwarding cases are adapter cases")
+    let original: List<Text> = []
+    for name in cases { if !wire.has(forwarding, name) { original.add(name) } }
+    wire.check(original.length == 107 && wire.union(original, []).length == 107, "original adapter cases")
+    wire.check(wire.contains(driver, "    let cases = all\n    if selected.length > 0 { cases = selected }\n"), "adapter runs every case by default")
+    let python: List<Text> = []
+    for name in files.list(wire.absolute(w, "tests/interop/qns")) { if wire.ends(name, ".py") { python.add(name) } }
+    wire.check(python.length == 0, "Python adapter files remain")
+    let catalogue = wire.catalogue(w)
+    let adapter = wire.row(catalogue, "tests/interop/qns/owned-adapter.c")
+    wire.check(json.member(adapter, "role").text == "support", "owned adapter role")
+    wire.check(wire.has(wire.rowTexts(adapter, "consumers"), "build-support/quic-official-adapter.mk"), "owned adapter consumer")
+    wire.omissionRejected(w, catalogue, "tests/interop/qns/owned-adapter.c")
+}
+function declared(driver: Text, name: Text): List<Text> {
+    let start = wire.find(driver, "constant " + name + ": List<Text> = [", 0)
+    wire.check(start >= 0, "missing " + name)
+    let result: List<Text> = []
+    for item in wire.quotedStrings(wire.cut(driver, start, wire.find(driver, "]", start))) {
+        let valid = true
+        for byte in Bytes(item) { if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45) { valid = false } }
+        if valid { result.add(item) }
+    }
+    return result
+}

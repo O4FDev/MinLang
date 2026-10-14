@@ -1,0 +1,594 @@
+use "../tools/testing.min" as test
+use "./build-wiring-support.min" as wire
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Record { input: Text; clang: Text; path: Text; limit: Text; arguments: List<Text> }
+
+function included(w: wire.Wiring, path: Text): Text { return "include " + wire.replaceAll(wire.absolute(w, path), " ", "\\ ") + "\n" }
+function windowsHost(host: Text, operating: Text): Boolean {
+    return operating == "Windows_NT" || wire.starts(host, "MSYS") || wire.starts(host, "MINGW") || wire.starts(host, "CYGWIN")
+}
+function limitsProbe(w: wire.Wiring, candidate: Text, host: Text, operating: Text, target: Text, tool: Text, stubs: List<Text>, base: Text, clang: Boolean, observer: Boolean): Text {
+    let c = wire.checks()
+    let directory = wire.folder(w, "limits Make rules ")
+    wire.unameStub(w, directory, host)
+    let makefile = directory + "/probe.mk"
+    wire.write(makefile, "LLVM_CC := retained-clang\nLIMITED := ordinary-limit\nSANITIZER_LIMITED := sanitizer-limit\n" + candidate + wire.phonyStubs(stubs, "\t@echo INPUT $@"))
+    let result = wire.make(w, ["-rRn", "-f", makefile, target], wire.environment(directory, ["OS=" + operating]), "")
+    if result.status != 0 { return result.errorOutput }
+    let commands = wire.linesContaining(result.output, "./build/tooling/tests/" + tool)
+    let windows = windowsHost(host, operating)
+    let expected = 2
+    if windows { expected = 1 }
+    wire.ensure(c, commands.length == expected, "command count " + Text(commands.length))
+    let native = ""
+    for line in commands { if wire.contains(line, "--mode native") { native = line; break } }
+    if native == "" { return "missing native command" }
+    wire.ensure(c, wire.contains(native, "ordinary-limit ./build/tooling/tests/" + tool + " --mode native"), "native limiter")
+    wire.ensure(c, !wire.contains(native, "sanitizer-limit"), "native sanitizer limiter")
+    if clang { wire.ensure(c, wire.contains(native, "MINYAR_TEST_CLANG=\"retained-clang\""), "native clang") }
+    wire.ensure(c, wire.contains(native, "--evidence \"$evidence\""), "native evidence")
+    wire.ensure(c, wire.contains(wire.replaceAll(native, "\\", "/"), w.root + "/build/" + base + "."), "native absolute evidence")
+    if !windows {
+        let sanitize = ""
+        for line in commands { if wire.contains(line, "--mode sanitize") { sanitize = line; break } }
+        if sanitize == "" { return "missing sanitizer command" }
+        wire.ensure(c, wire.contains(sanitize, "sanitizer-limit ./build/tooling/tests/" + tool + " --mode sanitize"), "sanitizer limiter")
+        wire.ensure(c, !wire.contains(sanitize, "ordinary-limit"), "sanitizer ordinary limiter")
+        if clang { wire.ensure(c, wire.contains(sanitize, "MINYAR_TEST_CLANG=\"retained-clang\""), "sanitizer clang") }
+        wire.ensure(c, wire.contains(sanitize, "--evidence \"$evidence\""), "sanitizer evidence")
+        wire.ensure(c, wire.contains(wire.replaceAll(sanitize, "\\", "/"), w.root + "/build/" + base + "-sanitize."), "sanitizer absolute evidence")
+    }
+    if observer { wire.ensure(c, wire.count(result.output, "ordinary-limit ./build/tooling/tests/soak-observer-test") == 1, "soak observer") }
+    return wire.failure(c)
+}
+function modeProbe(w: wire.Wiring, tool: Text, host: Text, arguments: List<Text>): test.Result {
+    let directory = wire.folder(w, "network mode probe ")
+    wire.unameStub(w, directory, host)
+    let command = [tool, "--print-modes"]
+    for item in arguments { command.add(item) }
+    return wire.run(w, command, wire.environment(directory, []), "", 60)
+}
+function jsonList(text: Text): Text {
+    let value = json.parse(text)
+    if value.kind != json.ARRAY { return "<invalid " + text + ">" }
+    let items: List<Text> = []
+    for item in value.items { items.add(item.text) }
+    return wire.joined(items, ",")
+}
+function modesProbe(w: wire.Wiring, tool: Text, cases: List<List<Text>>): Text {
+    let c = wire.checks()
+    for row in cases {
+        let host = "Linux"
+        if row[0] == "windows" { host = "MSYS_NT-10.0" }
+        let arguments: List<Text> = []
+        if row[1] != "" { arguments = ["--mode", row[1]] }
+        let result = modeProbe(w, tool, host, arguments)
+        wire.ensure(c, result.status == 0, "mode probe " + row[0] + " " + row[1] + ": " + result.errorOutput)
+        if result.status == 0 { wire.ensure(c, jsonList(result.output) == row[2], "modes " + row[0] + " " + row[1] + ": " + result.output) }
+    }
+    let rejected = modeProbe(w, tool, "MSYS_NT-10.0", ["--mode", "sanitize"])
+    wire.ensure(c, rejected.status == 2, "Windows sanitizer mode accepted")
+    return wire.failure(c)
+}
+function modeStub(w: wire.Wiring, table: List<List<Text>>): Text {
+    let directory = wire.folder(w, "loop mode mutants ")
+    let path = directory + "/mode-mutant"
+    let cases: List<Text> = []
+    for row in table {
+        let windows = "0"
+        if row[0] == "windows" { windows = "1" }
+        let items: List<Text> = []
+        for item in wire.words(wire.replaceAll(row[2], ",", " ")) { items.add("\"" + item + "\"") }
+        cases.add("  " + windows + ":" + row[1] + ") printf '%s\\n' '[" + wire.joined(items, ", ") + "]' ;;")
+    }
+    wire.executable(w, path, "#!/bin/sh\nhost=$(uname -s)\ncase \"$host\" in MSYS*|MINGW*|CYGWIN*|Windows*) windows=1 ;; *) windows=0 ;; esac\nmode=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --mode ]; then mode=$2; shift; fi; shift; done\nif [ \"$windows\" = 1 ] && [ \"$mode\" = sanitize ]; then echo 'error: sanitizer mode is unavailable on Windows' >&2; exit 2; fi\ncase \"$windows:$mode\" in\n" + wire.joined(cases, "\n") + "\n  *) exit 3 ;;\nesac\n")
+    return path
+}
+
+public function test_event_loop_native_and_sanitizer_keep_distinct_limits(w: wire.Wiring) {
+    let fragment = wire.read(w, "build-support/networking.mk")
+    let stubs = ["build/minyarc", "build/tooling/tests/net-loop-test"]
+    wire.require(w, limitsProbe(w, fragment, "Linux", "", "check-net-loop", "net-loop-test", stubs, "net-loop", false, false), "event loop Linux")
+    let hosts = ["Darwin", "Linux", "MSYS_NT-10.0", "MINGW64_NT-10.0", "CYGWIN_NT-10.0"]
+    let systems = ["", "Windows_NT", "", "", ""]
+    for index in 0..hosts.length {
+        wire.require(w, limitsProbe(w, fragment, hosts[index], systems[index], "check-net-loop", "net-loop-test", stubs, "net-loop", false, false), "event loop " + hosts[index])
+    }
+    let native = wire.lineContaining(fragment, "tests/net-loop-test --mode native")
+    let sanitize = wire.lineContaining(fragment, "tests/net-loop-test --mode sanitize")
+    let olds = [native, sanitize, native, sanitize, native, sanitize]
+    let news = ["", "", wire.replaceFirst(native, "$(LIMITED)", "$(SANITIZER_LIMITED)"), wire.replaceFirst(sanitize, "$(SANITIZER_LIMITED)", "$(LIMITED)"),
+        wire.replaceFirst(native, " --mode native", ""), wire.replaceFirst(sanitize, " --mode sanitize", "")]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "event loop mutation " + Text(index))
+        wire.refuse(w, limitsProbe(w, mutant, "Linux", "", "check-net-loop", "net-loop-test", stubs, "net-loop", false, false), "event loop mutation " + Text(index))
+    }
+    let table = [["posix", "", "native,sanitize,app-native,app-sanitize"], ["posix", "native", "native,app-native"], ["posix", "sanitize", "sanitize,app-sanitize"],
+        ["windows", "", "native"], ["windows", "native", "native"]]
+    wire.require(w, modesProbe(w, wire.absolute(w, "build/tooling/tests/net-loop-test"), table), "event loop modes")
+    let replacements = ["native", "sanitize", "native,app-native,sanitize,app-sanitize"]
+    let keys = [1, 2, 0]
+    for index in 0..keys.length {
+        let mutant: List<List<Text>> = []
+        for position in 0..table.length {
+            if position == keys[index] { mutant.add([table[position][0], table[position][1], replacements[index]]) } else { mutant.add(table[position]) }
+        }
+        wire.refuse(w, modesProbe(w, modeStub(w, mutant), table), "mode mutant " + Text(index))
+    }
+    let loopSource = wire.read(w, "tests/net-loop-test.min")
+    wire.require(w, boundInputs(loopSource), "event loop evidence inputs")
+    for name in ["tests/net-evidence.min", "runtime/native/net.c"] {
+        let mutant = wire.replaceFirst(loopSource, "\"" + name + "\", ", "")
+        wire.check(mutant != loopSource, "evidence input listed " + name)
+        wire.refuse(w, boundInputs(mutant), "unbound " + name)
+    }
+    wire.require(w, helperRules(w, fragment), "network evidence helper rules")
+    let dependency = ""
+    for line in wire.lines(fragment) { if wire.starts(line, "build/tooling/") && wire.ends(line, ": tests/net-evidence.min") { dependency = line; break } }
+    wire.check(dependency != "", "network evidence helper dependency")
+    wire.refuse(w, helperRules(w, wire.replaceFirst(fragment, dependency, "")), "missing helper dependency")
+}
+function boundInputs(source: Text): Text {
+    let start = wire.find(source, "evidence.create(", 0)
+    if start < 0 { return "missing evidence.create" }
+    let open = wire.find(source, "[", start)
+    let listing = wire.cut(source, open, wire.find(source, "]", start) + 1)
+    let bound = wire.quotedStrings(listing)
+    let c = wire.checks()
+    wire.ensure(c, wire.has(bound, "tests/net-evidence.min"), "net-evidence input")
+    wire.ensure(c, wire.has(bound, "runtime/native/net.c"), "net.c input")
+    return wire.failure(c)
+}
+function helperRules(w: wire.Wiring, candidate: Text): Text {
+    let directory = wire.folder(w, "make rule probe ")
+    wire.write(directory + "/probe.mk", candidate + "\n.PHONY: probe\nprobe:\n")
+    let result = wire.make(w, ["-rRnp", "-f", directory + "/probe.mk", "probe"], wire.environment("", []), "")
+    let database = wire.rules(result.output, wire.PLAIN)
+    let c = wire.checks()
+    for tool in ["net-loop-test", "net-native-test"] { wire.ensure(c, wire.has(wire.deps(database, "build/tooling/tests/" + tool + ".ll"), "tests/net-evidence.min"), tool) }
+    return wire.failure(c)
+}
+
+public function test_network_evidence_preserves_primary_and_finalizes_independently(w: wire.Wiring) {
+    let folder = wire.folder(w, "network evidence controls ")
+    let result = wire.run(w, [wire.absolute(w, "build/tooling/tests/net-native-test"), "--evidence-controls", folder], wire.environment("", []), "", 120)
+    wire.check(result.status == 0, result.output + result.errorOutput)
+    let rows: List<json.Value> = []
+    for line in wire.lines(result.output) { rows.add(json.parse(line)) }
+    let stream = scenario(rows, "stream")
+    wire.check(json.member(stream, "status").text == "37", "stream status")
+    wire.check(wire.starts(json.member(stream, "failure").text, "CalledProcessError"), "stream failure")
+    wire.check(json.member(stream, "finalized").text == json.member(stream, "failure").text, "stream finalized")
+    wire.check(json.member(stream, "stderr").text == "provider stderr", "stream stderr")
+    wire.check(readTextFile(json.member(stream, "directory").text + "/01-provider.stderr") == "provider stderr", "retained provider stderr")
+    let operations = errorOperations(stream)
+    wire.check(wire.has(operations, "stdout write"), "stdout write failure")
+    wire.check(!wire.has(operations, "stderr write"), "stderr write failure")
+    wire.check(wire.occurrences(operations, "manifest write") == 1, "manifest write failure")
+    wire.check(wire.contains(result.errorOutput, "stdout write") && wire.contains(result.errorOutput, "manifest write"), "reported finalization failures")
+    wire.check(json.member(json.member(stream, "records").items[0], "status").text == "37", "stream record status")
+    let binding = scenario(rows, "binding")
+    wire.check(wire.starts(json.member(binding, "failure").text, "RuntimeError"), "binding failure")
+    wire.check(wire.has(errorOperations(binding), "tool binding"), "tool binding")
+    let inputs = scenario(rows, "inputs")
+    wire.check(json.member(inputs, "finalized").text == "network evidence finalization failed", "inputs finalized")
+    wire.check(json.member(json.parse(readTextFile(json.member(inputs, "directory").text + "/manifest.json")), "status").text == "failed", "inputs manifest status")
+    wire.check(wire.has(errorOperations(inputs), "input binding"), "input binding")
+    let scopes: List<json.Value> = []
+    for row in rows { if json.member(row, "scenario").text == "scope" { scopes.add(row) } }
+    let modes: List<Text> = []
+    for row in scopes {
+        let names: List<Text> = []
+        for item in json.member(row, "modes").items { names.add(item.text) }
+        modes.add(wire.joined(names, "+"))
+    }
+    wire.check(wire.joined(modes, ",") == "native,native+sanitize,sanitize", "scope modes " + wire.joined(modes, ","))
+    let expectedScopes = ["ordinary-launcher-path", "ordinary-launcher-path", ""]
+    for index in 0..scopes.length {
+        let row = scopes[index]
+        wire.check(json.member(row, "finalized").text == "", "scope finalized")
+        let manifest = json.parse(readTextFile(json.member(row, "directory").text + "/manifest.json"))
+        let enabled = json.member(manifest, "public_program_sanitizer_enabled_by_suite")
+        wire.check(enabled.kind == json.BOOLEAN && !enabled.truth, "public program sanitizer")
+        let scope = json.member(manifest, "public_program_scope")
+        if expectedScopes[index] == "" { wire.check(scope.kind == json.NULL, "sanitizer-only scope") } else { wire.check(scope.text == expectedScopes[index], "public scope") }
+        wire.check(!wire.has(manifest.keys, "public_program_sanitized"), "public program sanitized key")
+        let windows = json.member(manifest, "windows_sanitizer_enabled_by_suite")
+        wire.check(windows.kind == json.BOOLEAN && !windows.truth, "Windows sanitizer")
+        wire.check(!wire.has(manifest.keys, "windows_sanitizer_capability"), "Windows sanitizer capability key")
+    }
+}
+function scenario(rows: List<json.Value>, name: Text): json.Value {
+    for row in rows { if json.member(row, "scenario").text == name { return row } }
+    fail("missing evidence scenario " + name)
+    return rows[0]
+}
+function errorOperations(row: json.Value): List<Text> {
+    let result: List<Text> = []
+    for item in json.member(row, "errors").items { result.add(json.member(item, "operation").text) }
+    return result
+}
+
+public function test_network_native_and_sanitizer_keep_distinct_limits(w: wire.Wiring) {
+    let fragment = wire.read(w, "build-support/networking.mk")
+    let stubs = ["build/minyarc", "build/tooling/tests/net-native-test", "build/tooling/tests/soak-observer-test", "build/testing/cycle-runtime.o"]
+    wire.require(w, limitsProbe(w, fragment, "Linux", "", "check-net", "net-native-test", stubs, "net-native", true, true), "network Linux")
+    let hosts = ["Darwin", "Linux", "MSYS_NT-10.0", "MINGW64_NT-10.0", "CYGWIN_NT-10.0"]
+    let systems = ["", "Windows_NT", "", "", ""]
+    for index in 0..hosts.length {
+        wire.require(w, limitsProbe(w, fragment, hosts[index], systems[index], "check-net", "net-native-test", stubs, "net-native", true, true), "network " + hosts[index])
+    }
+    let native = wire.lineContaining(fragment, "tests/net-native-test --mode native")
+    let sanitize = wire.lineContaining(fragment, "tests/net-native-test --mode sanitize")
+    let olds = [native, sanitize, sanitize, native, sanitize, native, "$(abspath build)"]
+    let news = ["", "", wire.replaceFirst(sanitize, "$(SANITIZER_LIMITED)", "$(LIMITED)"), wire.replaceFirst(native, "$(LIMITED)", "$(SANITIZER_LIMITED)"),
+        wire.replaceFirst(sanitize, " --mode sanitize", ""), wire.replaceFirst(native, " --mode native", ""), "build"]
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "network mutation " + Text(index))
+        wire.refuse(w, limitsProbe(w, mutant, "Linux", "", "check-net", "net-native-test", stubs, "net-native", true, true), "network mutation " + Text(index))
+    }
+    let tool = wire.absolute(w, "build/tooling/tests/net-native-test")
+    let table = [["posix", "", "native,sanitize"], ["posix", "native", "native"], ["posix", "sanitize", "sanitize"], ["windows", "", "native"], ["windows", "native", "native"]]
+    wire.require(w, modesProbe(w, tool, table), "network modes")
+    let rejected = modeProbe(w, tool, "MSYS_NT-10.0", ["--mode", "sanitize"])
+    wire.check(rejected.status == 2 && wire.contains(rejected.errorOutput, "unavailable on Windows"), "Windows sanitizer refusal")
+}
+
+function stubRecord(lines: List<Text>): Record {
+    let result = Record { input: ""; clang: ""; path: ""; limit: ""; arguments: [] }
+    for line in lines {
+        let split = wire.find(line, "=", 0)
+        if split < 0 { continue }
+        let key = wire.cut(line, 0, split)
+        let value = wire.after(line, split + 1)
+        if key == "input" { result.input = value }
+        if key == "clang" { result.clang = value }
+        if key == "path" { result.path = value }
+        if key == "limit" { result.limit = value }
+        if key == "arg" { result.arguments.add(value) }
+    }
+    return result
+}
+function stubRecords(output: Text): List<Record> {
+    let result: List<Record> = []
+    let current: List<Text> = []
+    for line in wire.lines(output) {
+        if line == "---" { result.add(stubRecord(current)); current = [] } else { current.add(line) }
+    }
+    return result
+}
+function toolStub(w: wire.Wiring, path: Text, key: Text) {
+    wire.executable(w, path, "#!/bin/sh\nprintf 'clang=%s\\npath=%s\\nlimit=%s\\n' \"$" + key + "\" \"$PATH\" \"$NET_PROBE_LIMIT\"\nfor item do printf 'arg=%s\\n' \"$item\"; done\nprintf '%s\\n' '---'\n")
+}
+function converterStub(w: wire.Wiring, binaries: Text) {
+    wire.executable(w, binaries + "/cygpath", "#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = -u ] && [ \"$2\" = \"$PROBE_FROM\" ] || exit 1\nprintf '%s\\n' \"$PROBE_TO\"\n")
+}
+function linkTools(w: wire.Wiring, directory: Text) {
+    let result = wire.run(w, ["/bin/ln", "-s", wire.absolute(w, "tools"), directory + "/tools"], system.environment(), "", 10)
+    wire.check(result.status == 0, "cannot link tools")
+}
+
+function tlsProbe(w: wire.Wiring, directory: Text, candidate: Text, sanitizer: Text, selectedCompiler: Text, selectedDirectory: Text, msys: Boolean, ordinary: Text, basePath: Text): Text {
+    let c = wire.checks()
+    if !wire.contains(candidate, "check-sanitize: check-os-tlsverify-sanitize") { return "missing sanitizer aggregate" }
+    let sanitizerRule = wire.lineStarting(candidate, "check-os-tlsverify-sanitize:")
+    if sanitizerRule == "" { return "missing sanitizer rule" }
+    let probe = directory + "/probe.mk"
+    wire.write(probe, "LLVM_CC := " + ordinary + "\nMINYAR_SANITIZER_CLANG := " + sanitizer + "\nLIMITED :=\nSANITIZER_LIMITED :=\n" + candidate + "\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@:\n")
+    let overrides = ["MINYAR_SANITIZER_CLANG="]
+    if msys { overrides = ["MINYAR_SANITIZER_CLANG=", "MINYAR_TEST_HOST_SYSTEM=MSYS_NT-10.0", "PROBE_FROM=" + sanitizer, "PROBE_TO=" + selectedCompiler] }
+    let environment = wire.unset(wire.environment(directory + "/bin", overrides), "MINYAR_SANITIZER_CLANG")
+    let targets = ["check-os-tlsverify", "check-os-tlsverify-sanitize"]
+    for index in 0..2 {
+        let result = wire.make(w, ["--no-print-directory", "-rR", "-s", "-f", probe, targets[index]], environment, directory)
+        if result.status != 0 { return result.errorOutput }
+        let records = stubRecords(result.output)
+        if records.length != 1 { return "unexpected TLS verifier output " + result.output }
+        let selected = records[0]
+        let expectedCompiler = ordinary
+        let expectedPath = basePath
+        let arguments = ""
+        if index == 1 {
+            expectedCompiler = selectedCompiler
+            if expectedCompiler == "" { expectedCompiler = sanitizer }
+            if expectedCompiler == "" { expectedCompiler = ordinary }
+            arguments = "--sanitize"
+            if sanitizer != "" {
+                let parent = selectedDirectory
+                if parent == "" { parent = wire.parent(sanitizer) }
+                expectedPath = parent + ":" + basePath
+            }
+        }
+        wire.ensure(c, selected.clang == expectedCompiler, targets[index] + " compiler " + selected.clang)
+        wire.ensure(c, wire.joined(selected.arguments, " ") == arguments, targets[index] + " arguments " + wire.joined(selected.arguments, " "))
+        wire.ensure(c, selected.path == expectedPath, targets[index] + " PATH " + selected.path)
+    }
+    if sanitizer != "" { wire.ensure(c, wire.contains(sanitizerRule, "tools/toolchain.sh"), "toolchain prerequisite") }
+    return wire.failure(c)
+}
+public function test_os_tlsverify_sanitizer_selects_override_and_complete_directory(w: wire.Wiring) {
+    let fragment = wire.read(w, "build-support/networking.mk")
+    let directory = wire.folder(w, "os sanitizer dispatch ")
+    wire.makeDirectories(directory + "/bin")
+    linkTools(w, directory)
+    converterStub(w, directory + "/bin")
+    let ordinary = directory + "/ordinary compiler/bin/clang"
+    toolStub(w, directory + "/build/tooling/tests/os-tlsverify-test", "MINYAR_CLANG")
+    let basePath = directory + "/bin:" + system.getenv("PATH")
+    for value in ["", directory + "/sanitizer/bin/clang", directory + "/LLVM 23/bin/clang", directory + "/LLVM's 23/bin/clang"] {
+        wire.require(w, tlsProbe(w, directory, fragment, value, "", "", false, ordinary, basePath), "TLS override " + value)
+    }
+    let natives = ["C:/LLVM 23/bin/clang.exe", "C:\\LLVM's 23\\bin\\clang.exe", "\\\\server\\LLVM 23\\bin\\clang.exe"]
+    let selections = ["/c/LLVM 23/bin/clang.exe", "/c/LLVM's 23/bin/clang.exe", "//server/LLVM 23/bin/clang.exe"]
+    let parents = ["/c/LLVM 23/bin", "/c/LLVM's 23/bin", "//server/LLVM 23/bin"]
+    for index in 0..natives.length {
+        wire.require(w, tlsProbe(w, directory, fragment, natives[index], selections[index], parents[index], true, ordinary, basePath), "MSYS spelling " + natives[index])
+    }
+    let recipe = wire.lineContaining(fragment, "tests/os-tlsverify-test --sanitize")
+    for replacement in [wire.replaceFirst(recipe, "$(OS_TLS_SANITIZER_CLANG)", "$(LLVM_CC)"), wire.replaceFirst(recipe, "PATH=\"$(OS_TLS_SANITIZER_PATH)\" ", "")] {
+        wire.check(replacement != recipe, "TLS recipe mutation applies")
+        wire.refuse(w, tlsProbe(w, directory, wire.replaceFirst(fragment, recipe, replacement), directory + "/LLVM 23/bin/clang", "", "", false, ordinary, basePath), "TLS recipe " + replacement)
+    }
+    let pathRule = wire.lineStarting(fragment, "OS_TLS_SANITIZER_PATH =")
+    for replacement in ["OS_TLS_SANITIZER_PATH = $(PATH)", "OS_TLS_SANITIZER_PATH = /wrong/runtime:$(PATH)", "OS_TLS_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)"] {
+        wire.refuse(w, tlsProbe(w, directory, wire.replaceFirst(fragment, pathRule, replacement), directory + "/LLVM 23/bin/clang", "", "", false, ordinary, basePath), replacement)
+    }
+    let quoteRule = wire.lineStarting(fragment, "OS_TLS_SANITIZER_QUOTE =")
+    let sanitizerRule = wire.lineStarting(fragment, "check-os-tlsverify-sanitize:")
+    for mutant in [wire.replaceFirst(fragment, quoteRule, "OS_TLS_SANITIZER_QUOTE = $(1)"), wire.replaceFirst(fragment, "check-sanitize: check-os-tlsverify-sanitize", ""),
+        wire.replaceFirst(fragment, sanitizerRule, wire.replaceFirst(sanitizerRule, "tools/toolchain.sh", ""))] {
+        wire.refuse(w, tlsProbe(w, directory, mutant, directory + "/LLVM's 23/bin/clang", "", "", false, ordinary, basePath), "TLS dispatch mutant")
+    }
+}
+
+public function test_os_freestanding_provider_inputs_invalidate_object(w: wire.Wiring) {
+    let fragment = wire.read(w, "os/Makefile")
+    let inputs = ["runtime/minyar_freestanding_providers.h", "runtime/minyar_ip_literal.h", "runtime/minyar_native.h", "runtime/native/securecrypto.c",
+        "vendor/monocypher/monocypher.c", "vendor/monocypher/monocypher.h"]
+    wire.require(w, freestandingProbe(w, fragment, inputs), "freestanding invalidation")
+    for name in inputs {
+        wire.check(wire.contains(fragment, "$(ROOT)/" + name), "freestanding input listed " + name)
+        wire.refuse(w, freestandingProbe(w, wire.replaceFirst(fragment, "$(ROOT)/" + name, ""), inputs), "missing freestanding input " + name)
+    }
+}
+function touch(w: wire.Wiring, path: Text, stamp: Text) {
+    let result = wire.run(w, ["touch", "-t", stamp, path], system.environment(), "", 10)
+    wire.check(result.status == 0, "cannot set time on " + path)
+}
+function freestandingProbe(w: wire.Wiring, candidate: Text, inputs: List<Text>): Text {
+    let c = wire.checks()
+    let directory = wire.folder(w, "minyar-os-invalidation-")
+    wire.write(directory + "/os/Makefile", candidate)
+    wire.makeDirectories(directory + "/library")
+    let binaries = directory + "/llvm-bin"
+    wire.executable(w, binaries + "/clang", "#!/bin/sh\nprintf '%s\\n' /unused-resource\n")
+    let bound = ["runtime/freestanding/freestanding.c", "runtime/freestanding/include/stdio.h"]
+    for name in inputs { bound.add(name) }
+    for name in bound {
+        wire.write(directory + "/" + name, "bound input\n")
+        touch(w, directory + "/" + name, "200001010000")
+    }
+    let environment = wire.environment("", [])
+    for architecture in ["x86_64", "arm64"] {
+        let output = directory + "/build/os/" + architecture + "/freestanding.o"
+        wire.write(output, "cached object\n")
+        touch(w, output, "200101010000")
+        let command = ["--no-print-directory", "-q", "-C", directory + "/os", "LLVM_BIN=" + binaries, "ARCH=" + architecture, output]
+        let fresh = wire.make(w, command, environment, "")
+        if fresh.status != 0 && fresh.status != 1 { return fresh.errorOutput }
+        wire.ensure(c, fresh.status == 0, architecture + " unchanged inputs must reuse the object")
+        for name in inputs {
+            touch(w, directory + "/" + name, "200201010000")
+            let stale = wire.make(w, command, environment, "")
+            if stale.status != 0 && stale.status != 1 { return stale.errorOutput }
+            wire.ensure(c, stale.status == 1, architecture + " " + name + " stale provider object")
+            touch(w, directory + "/" + name, "200001010000")
+            let restored = wire.make(w, command, environment, "")
+            if restored.status != 0 && restored.status != 1 { return restored.errorOutput }
+            wire.ensure(c, restored.status == 0, architecture + " " + name + " restored input")
+        }
+    }
+    return wire.failure(c)
+}
+
+public function test_relay_wrong_key_changes_decoded_signature_even_with_aa_tail(w: wire.Wiring) {
+    let result = wire.run(w, [wire.absolute(w, "build/tooling/tests/peer-edge-relay-test"), "--signature-controls"], wire.environment("", []), "", 60)
+    wire.check(result.status == 0, result.output + result.errorOutput)
+    wire.check(wire.contains(result.output, "GREEN wrong-key control changes every decoded signature, including AA tails"), "relay signature control")
+}
+
+function networkProbe(w: wire.Wiring, directory: Text, candidate: Text, sanitizer: Text, selectedCompiler: Text, selectedDirectory: Text, msys: Boolean, ordinary: Text, basePath: Text): Text {
+    let c = wire.checks()
+    let connect = "build/tooling/tests/net-connect-test"
+    let offload = "build/tooling/tests/net-udp-offload-test"
+    let probe = directory + "/probe.mk"
+    wire.write(probe, "LLVM_CC := " + ordinary + "\nMINYAR_SANITIZER_CLANG := " + sanitizer + "\nLIMITED := ordinary-limit\nSANITIZER_LIMITED := sanitizer-limit\n" + candidate +
+        "\n.PHONY: build/minyarc build/minyar-default-runtime.o\nbuild/minyarc build/minyar-default-runtime.o:\n\t@printf 'input=%s\\nclang=%s\\npath=%s\\n---\\n' \"$@\" \"$(LLVM_CC)\" \"$$PATH\"\n")
+    let overrides = ["MINYAR_SANITIZER_CLANG=", "MINYAR_CLANG=", "MINYAR_TEST_CLANG="]
+    if msys { overrides = ["MINYAR_SANITIZER_CLANG=", "MINYAR_CLANG=", "MINYAR_TEST_CLANG=", "MINYAR_TEST_HOST_SYSTEM=MSYS_NT-10.0", "PROBE_FROM=" + sanitizer, "PROBE_TO=" + selectedCompiler] }
+    let environment = wire.environment(directory + "/bin", overrides)
+    for name in ["MINYAR_SANITIZER_CLANG", "MINYAR_CLANG", "MINYAR_TEST_CLANG"] { environment = wire.unset(environment, name) }
+    let targets = ["check-net-connect", "check-net-connect-sanitize", "check-net-udp-offload", "check-net-udp-offload-sanitize"]
+    let scripts = [connect, connect, offload, offload]
+    let argumentLists: List<List<Text>> = [[], ["--sanitize"], ["--evidence", "build/net-udp-offload"], ["--sanitize", "--evidence", "build/net-udp-offload-sanitize"]]
+    let prerequisites = [["build/minyarc"], ["build/minyarc"], ["build/minyarc", "build/minyar-default-runtime.o"], ["build/minyarc", "build/minyar-default-runtime.o"]]
+    for index in 0..targets.length {
+        let target = targets[index]
+        let result = wire.make(w, ["--no-print-directory", "-j1", "-rR", "-s", "-f", probe, target], environment, directory)
+        if result.status != 0 { return target + ": " + result.errorOutput }
+        let records = stubRecords(result.output)
+        if records.length == 0 { return target + ": no tool output" }
+        let selected = records[records.length - 1]
+        let inputs: List<Text> = []
+        for position in 0..(records.length - 1) {
+            let row = records[position]
+            inputs.add(row.input)
+            wire.ensure(c, row.clang == ordinary, target + " prerequisite compiler " + row.clang)
+            wire.ensure(c, row.path == basePath, target + " prerequisite PATH " + row.path)
+        }
+        wire.ensure(c, wire.joined(wire.sorted(inputs), ",") == wire.joined(wire.sorted(prerequisites[index]), ","), target + " prerequisites " + wire.joined(inputs, ","))
+        let sanitize = wire.has(argumentLists[index], "--sanitize")
+        let expectedCompiler = ordinary
+        let expectedPath = basePath
+        if sanitize {
+            expectedCompiler = selectedCompiler
+            if expectedCompiler == "" { expectedCompiler = sanitizer }
+            if expectedCompiler == "" { expectedCompiler = ordinary }
+            if sanitizer != "" { expectedPath = selectedDirectory + ":" + basePath }
+        }
+        wire.ensure(c, selected.clang == expectedCompiler, target + " compiler " + selected.clang)
+        wire.ensure(c, selected.path == expectedPath, target + " PATH " + selected.path)
+        let limit = "ordinary"
+        if sanitize { limit = "sanitizer" }
+        wire.ensure(c, selected.limit == limit, target + " limiter " + selected.limit)
+        wire.ensure(c, wire.joined(selected.arguments, " ") == wire.joined(argumentLists[index], " "), target + " arguments " + wire.joined(selected.arguments, " "))
+        let rule = wire.lineStarting(candidate, target + ":")
+        if sanitizer != "" || !sanitize {
+            let expected = wire.union(prerequisites[index], [scripts[index]])
+            if sanitize { expected = wire.union(expected, ["tools/toolchain.sh"]) }
+            wire.ensure(c, wire.joined(wire.sorted(wire.union(wire.words(wire.after(rule, wire.find(rule, ":", 0) + 1)), [])), ",") == wire.joined(wire.sorted(expected), ","), target + " rule prerequisites")
+        }
+    }
+    return wire.failure(c)
+}
+public function test_network_sanitizers_select_override_and_complete_directory(w: wire.Wiring) {
+    let fragment = wire.read(w, "build-support/networking.mk")
+    let directory = wire.folder(w, "network sanitizer dispatch ")
+    wire.makeDirectories(directory + "/bin")
+    converterStub(w, directory + "/bin")
+    for pair in [["ordinary-limit", "ordinary"], ["sanitizer-limit", "sanitizer"]] {
+        wire.executable(w, directory + "/bin/" + pair[0], "#!/bin/sh\nNET_PROBE_LIMIT=" + pair[1] + " exec \"$@\"\n")
+    }
+    let ordinary = directory + "/ordinary UCRT compiler/bin/clang"
+    linkTools(w, directory)
+    toolStub(w, directory + "/build/tooling/tests/net-connect-test", "MINYAR_CLANG")
+    toolStub(w, directory + "/build/tooling/tests/net-udp-offload-test", "MINYAR_TEST_CLANG")
+    let basePath = directory + "/bin:" + system.getenv("PATH")
+    wire.require(w, networkProbe(w, directory, fragment, "", "", "", false, ordinary, basePath), "network ordinary")
+    let compilers = ["/clang64/bin/clang.exe", "/opt/LLVM 23/bin/clang.exe", "/opt/LLVM's 23/bin/clang.exe"]
+    let parents = ["/clang64/bin", "/opt/LLVM 23/bin", "/opt/LLVM's 23/bin"]
+    for index in 0..compilers.length { wire.require(w, networkProbe(w, directory, fragment, compilers[index], "", parents[index], false, ordinary, basePath), "network " + compilers[index]) }
+    let natives = ["C:/LLVM 23/bin/clang.exe", "C:\\LLVM's 23\\bin\\clang.exe", "\\\\server\\LLVM 23\\bin\\clang.exe"]
+    let selections = ["/c/LLVM 23/bin/clang.exe", "/c/LLVM's 23/bin/clang.exe", "//server/LLVM 23/bin/clang.exe"]
+    let msysParents = ["/c/LLVM 23/bin", "/c/LLVM's 23/bin", "//server/LLVM 23/bin"]
+    for index in 0..natives.length { wire.require(w, networkProbe(w, directory, fragment, natives[index], selections[index], msysParents[index], true, ordinary, basePath), "network MSYS " + natives[index]) }
+    let compiler = "/opt/LLVM 23/bin/clang.exe"
+    let parent = "/opt/LLVM 23/bin"
+    let olds: List<Text> = []
+    let news: List<Text> = []
+    let targets = ["check-net-connect-sanitize", "check-net-udp-offload-sanitize"]
+    let scripts = ["build/tooling/tests/net-connect-test", "build/tooling/tests/net-udp-offload-test"]
+    let keys = ["MINYAR_CLANG", "MINYAR_TEST_CLANG"]
+    for index in 0..targets.length {
+        let recipe = ""
+        for line in wire.lines(fragment) { if wire.contains(line, scripts[index]) && wire.contains(line, "--sanitize") { recipe = line; break } }
+        let rule = wire.lineStarting(fragment, targets[index] + ":")
+        for replacement in [wire.replaceFirst(recipe, "$(NET_SANITIZER_CLANG)", "$(LLVM_CC)"), wire.replaceFirst(recipe, "$(NET_SANITIZER_CLANG)", "/wrong/compiler"),
+            wire.replaceFirst(recipe, keys[index] + "=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) ", ""), wire.replaceFirst(recipe, "PATH=\"$(NET_SANITIZER_PATH)\" ", "")] {
+            olds.add(recipe)
+            news.add(replacement)
+        }
+        olds.add(rule)
+        news.add(wire.replaceFirst(rule, " tools/toolchain.sh", ""))
+    }
+    let clangRule = wire.lineStarting(fragment, "NET_SANITIZER_CLANG =")
+    let pathRule = wire.lineStarting(fragment, "NET_SANITIZER_PATH =")
+    for pair in [[clangRule, "NET_SANITIZER_CLANG = $(LLVM_CC)"], [pathRule, "NET_SANITIZER_PATH = $(PATH)"], [pathRule, "NET_SANITIZER_PATH = /wrong/runtime:$(PATH)"],
+        [pathRule, "NET_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)"], ["NET_SANITIZER_QUOTE =", "NET_SANITIZER_QUOTE = $(1) #"]] {
+        olds.add(pair[0])
+        news.add(pair[1])
+    }
+    for index in 0..olds.length {
+        let mutant = wire.replaceFirst(fragment, olds[index], news[index])
+        wire.check(mutant != fragment, "network dispatch mutation applies " + news[index])
+        wire.refuse(w, networkProbe(w, directory, mutant, compiler, "", parent, false, ordinary, basePath), "network dispatch " + news[index])
+    }
+    for assignment in ["LLVM_CC = $(NET_SANITIZER_CLANG)", "PATH := /wrong/native:$(PATH)"] {
+        wire.refuse(w, networkProbe(w, directory, fragment + "\n" + assignment + "\n", compiler, "", parent, false, ordinary, basePath), "global dispatch " + assignment)
+    }
+}
+
+public function test_native_sanitizers_use_supported_leak_detection(w: wire.Wiring) {
+    let work = wire.folder(w, "minyar sanitizer wiring ")
+    wire.environmentStub(w, work)
+    let makefile = work + "/probe.mk"
+    wire.write(makefile, included(w, "Makefile") + ".PHONY: probe\nprobe:\n\t@echo \"$(NATIVE_SANITIZER_ENV)\"\n")
+    let systems = ["Linux", "Darwin", "Windows", "Linux", "MINGW64_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"]
+    let values = ["", "", "Windows_NT", "Windows_NT", "", "", ""]
+    let leaks = ["1", "0", "0", "0", "0", "0", "0"]
+    for index in 0..systems.length {
+        let result = wire.make(w, ["-n", "-f", makefile, "OS=" + values[index], "-o", "build/minyarc", "probe", "check-tls-validity-sanitize"],
+            wire.environment(work, ["TEST_UNAME=" + systems[index]]), "")
+        wire.check(result.status == 0, result.errorOutput)
+        let expected = "ASAN_OPTIONS=detect_leaks=" + leaks[index] + " UBSAN_OPTIONS=halt_on_error=1"
+        wire.check(wire.count(result.output, expected) == 2, systems[index] + " sanitizer environment\n" + result.output)
+        wire.check(wire.contains(result.output, "build/tooling/tests/tls-validity-test --sanitize"), systems[index] + " TLS validity sanitizer")
+    }
+    let suites = ["tests/calldepth-hooks.min", "tests/calldepth.min", "tests/compression-codecs.min", "tests/files-focused.min", "tests/generated-llvm-sanitizer-test.min",
+        "tests/http2-churn-test.min", "tests/http2-test.min", "tests/httpserver-test.min", "tests/neodb-packages.min", "tests/neodb-review.min"]
+    for suite in suites {
+        let enabling = 0
+        for line in wire.lines(wire.read(w, suite)) {
+            if wire.contains(line, "leaks = \"1\"") || wire.contains(line, "leaks = \"detect_leaks=1\"") {
+                enabling += 1
+                wire.check(wire.contains(line, "== \"Linux"), suite + " enables LeakSanitizer outside Linux: " + line)
+            }
+        }
+        wire.check(enabling > 0, suite + " has no LeakSanitizer policy")
+    }
+}
+
+public function test_peer_driver_gates_prepare_the_request_frontend(w: wire.Wiring) {
+    let work = wire.folder(w, "minyar peer wiring ")
+    let makefile = work + "/probe.mk"
+    let targets = ["build/minyarc", "build/minyarc-modules", "build/minyar-default-runtime.o", "build/minyar-module-build", "build/minyarc-errors-request",
+        "build/minyar-runtime.o", "build/minyarc-sanitize", "build/minyar-runtime-sanitize.o", "build/ownership-runtime.o", "build/tooling/tests/suite-catalogue",
+        "build/testing/cycle-runtime.o", "runtime/native/sha256.c", "build/tooling/tests/peer-manifest", "build/tooling/tools/check-peer-audit",
+        "build/tooling/tests/peer-audit-harness", "build/tooling/tests/peer-go-domains", "build/tooling/tests/peer-zig-domains", "build/tooling/tests/peer-regressions",
+        "build/tooling/tests/peer-cpp-java-js", "build/tooling/tests/peer-rust-go-zig", "build/tooling/tests/peer-python-swift-ruby-lua"]
+    wire.write(makefile, included(w, "build-support/peer-tests.mk") + ".PHONY: " + wire.joined(targets, " ") + "\n" + wire.joined(targets, " ") + ":\n\t@echo ARTIFACT $@\n")
+    for suite in ["tests/peer-rust-go-zig.min", "tests/peer-regressions.min"] {
+        for gate in ["check-peer-regressions", "check-peer-optimizations", "check-peer-sanitize", "check-peer-ownership"] {
+            let result = wire.make(w, ["-n", "-f", makefile, "PEER_SUITES=" + suite, gate], wire.environment("", []), work)
+            wire.check(result.status == 0, result.errorOutput)
+            let artifacts: List<Text> = []
+            for line in wire.lines(result.output) {
+                let at = wire.find(line, "ARTIFACT ", 0)
+                if at >= 0 { artifacts.add(wire.after(line, at + 9)) }
+            }
+            let needsDriver = suite == "tests/peer-rust-go-zig.min" || gate == "check-peer-ownership"
+            wire.check(wire.has(artifacts, "build/minyarc-errors-request") == needsDriver, suite + " " + gate + " request frontend")
+            wire.check(wire.has(artifacts, "build/minyar-module-build") == needsDriver, suite + " " + gate + " module driver")
+        }
+    }
+}
+
+public function test_grpc_gates_verify_external_peers_and_bound_default_builds(w: wire.Wiring) {
+    let tools: List<Text> = []
+    for name in ["http2-test", "http2-churn-test", "peer-grpc-test", "peer-grpc-churn-test", "peer-grpc-retire-test", "peer-edge-test", "peer-edge-retry-test",
+        "peer-edge-cids-test", "peer-edge-cid-stock-test", "peer-edge-relay-test", "peer-edge-relay-lifetime-test", "peer-edge-pki-test"] { tools.add("build/tooling/tests/" + name) }
+    let work = wire.folder(w, "minyar grpc wiring ")
+    for name in ["tests/interop/peergrpc/main.go", "tests/interop/peergrpc/edge.go", "tests/interop/peergrpc/go.mod", "tests/interop/peergrpc/go.sum", "runtime/native/net.c"] {
+        wire.write(work + "/" + name, "")
+    }
+    let makefile = work + "/probe.mk"
+    let stubs = wire.joined(tools, " ")
+    wire.write(makefile, included(w, "build-support/peer-grpc.mk") + ".PHONY: build/minyarc build build/testing/cycle-runtime.o " + stubs + "\nbuild/minyarc build build/testing/cycle-runtime.o " + stubs + ":\n\t@echo ARTIFACT $@\n")
+    for gate in ["check-http2", "check-peer-grpc", "check-peer-grpc-sanitize", "check-http2-churn", "check-http2-churn-sanitize", "check-peer-grpc-churn",
+        "check-peer-grpc-churn-sanitize", "check-peer-grpc-retire", "check-peer-grpc-retire-sanitize", "check-peer-edge", "check-peer-edge-sanitize",
+        "check-peer-edge-retry", "check-peer-edge-retry-sanitize", "check-peer-edge-cids", "check-peer-edge-cids-sanitize", "check-peer-edge-relay",
+        "check-peer-edge-relay-sanitize", "check-peer-edge-relay-lifetime", "check-peer-edge-relay-lifetime-sanitize", "check-peer-edge-pki", "check-peer-edge-pki-sanitize"] {
+        let result = wire.make(w, ["-n", "-f", makefile, gate], wire.environment("", []), work)
+        wire.check(result.status == 0, gate + ": " + result.errorOutput)
+        wire.check(!wire.contains(result.output, "check-peer-python.py"), gate + " Python peer check")
+        wire.check(!wire.contains(result.output, "peergrpc-venv"), gate + " Python peer environment")
+        wire.check(wire.contains(result.output, "GOMAXPROCS=2 go build -mod=readonly -trimpath"), gate + " bounded Go build")
+        wire.check(wire.contains(result.output, ".tmp\" self-test"), gate + " peer self-test")
+        wire.check(wire.contains(result.output, "./build/tooling/tests/"), gate + " native driver")
+    }
+}

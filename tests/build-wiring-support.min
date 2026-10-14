@@ -1,0 +1,485 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Wiring { root: Text; scratch: Text; serial: Integer; ran: Integer }
+public record Checks { failures: List<Text> }
+public record Rules { names: List<Text>; prerequisites: List<List<Text>>; index: Map<Text, Integer> }
+public record Catalogue { data: json.Value; text: Text }
+
+public constant LOOSE = 0
+public constant SPACED = 1
+public constant PLAIN = 2
+public constant NAMED = 3
+
+public function wiring(): Wiring {
+    let probe = test.scratch()
+    let root = test.lines(test.run(["/bin/pwd", "-P"], system.environment(), "", probe + "/root", 10).output)[0]
+    let scratch = test.scratch()
+    let physical = test.lines(test.run(["/bin/pwd", "-P"], system.environment(), scratch, probe + "/scratch", 10).output)[0]
+    test.removeTree(probe)
+    return Wiring { root: root; scratch: physical; serial: 0; ran: 0 }
+}
+public function folder(w: Wiring, prefix: Text): Text {
+    w.serial += 1
+    let path = w.scratch + "/" + prefix + Text(w.serial)
+    test.check(files.makeDirectory(path) == 0, "cannot create " + path)
+    return path
+}
+public function makeDirectories(path: Text) {
+    let raw = Bytes(path)
+    for index in 1..(raw.length + 1) {
+        if index == raw.length || raw[index] == 47 { files.makeDirectory(Text(raw.slice(0, index))) }
+    }
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index > 0 && raw[index] != 47 { index -= 1 }
+    if index <= 0 { return "/" }
+    return Text(raw.slice(0, index))
+}
+public function write(path: Text, contents: Text) {
+    makeDirectories(parent(path))
+    writeTextFile(path, contents)
+}
+public function executable(w: Wiring, path: Text, contents: Text) {
+    write(path, contents)
+    let result = test.run(["/bin/chmod", "755", path], system.environment(), "", logPath(w), 10)
+    test.check(result.status == 0, "cannot chmod " + path)
+}
+public function logPath(w: Wiring): Text {
+    w.serial += 1
+    return w.scratch + "/command" + Text(w.serial)
+}
+public function read(w: Wiring, path: Text): Text { return readTextFile(w.root + "/" + path) }
+
+public function checks(): Checks { return Checks { failures: [] } }
+public function ensure(c: Checks, condition: Boolean, message: Text) { if !condition { c.failures.add(message) } }
+public function failure(c: Checks): Text { return joined(c.failures, "\n") }
+public function passed(c: Checks): Boolean { return c.failures.length == 0 }
+public function require(w: Wiring, problem: Text, label: Text) { test.check(problem == "", label + ":\n" + problem) }
+public function refuse(w: Wiring, problem: Text, label: Text) { test.check(problem != "", "accepted invalid wiring: " + label) }
+public function check(condition: Boolean, message: Text) { test.check(condition, message) }
+
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    return raw.length >= bytes.length && Text(raw.slice(raw.length - bytes.length, raw.length)) == suffix
+}
+public function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || pattern.length > raw.length { return -1 }
+    if pattern.length == 0 { return begin }
+    let first = pattern[0]
+    let index = begin
+    let last = raw.length - pattern.length
+    while index <= last {
+        if raw[index] == first {
+            let equal = true
+            for offset in 1..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+            if equal { return index }
+        }
+        index += 1
+    }
+    return -1
+}
+public function contains(source: Text, needle: Text): Boolean { return find(source, needle, 0) >= 0 }
+public function count(source: Text, needle: Text): Integer {
+    let result = 0
+    let index = find(source, needle, 0)
+    let width = Bytes(needle).length
+    while index >= 0 {
+        result += 1
+        index = find(source, needle, index + width)
+    }
+    return result
+}
+public function cut(source: Text, begin: Integer, end: Integer): Text {
+    let raw = Bytes(source)
+    let first = clamp(begin, 0, raw.length)
+    let last = clamp(end, 0, raw.length)
+    if last <= first { return "" }
+    return Text(raw.slice(first, last))
+}
+public function after(source: Text, begin: Integer): Text { return cut(source, begin, Bytes(source).length) }
+public function size(source: Text): Integer { return Bytes(source).length }
+public function replaceFirst(source: Text, needle: Text, replacement: Text): Text {
+    let index = find(source, needle, 0)
+    if index < 0 { return source }
+    return cut(source, 0, index) + replacement + after(source, index + size(needle))
+}
+public function replaceAll(source: Text, needle: Text, replacement: Text): Text {
+    let parts: List<Text> = []
+    let start = 0
+    let index = find(source, needle, 0)
+    while index >= 0 {
+        parts.add(cut(source, start, index))
+        parts.add(replacement)
+        start = index + size(needle)
+        index = find(source, needle, start)
+    }
+    parts.add(after(source, start))
+    return joinText(parts)
+}
+public function lines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 {
+            let end = index
+            if end > start && raw[end - 1] == 13 { end -= 1 }
+            result.add(Text(raw.slice(start, end)))
+            start = index + 1
+        }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+public function words(source: Text): List<Text> { return test.words(source) }
+public function joined(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+public function has(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+public function occurrences(values: List<Text>, value: Text): Integer {
+    let result = 0
+    for item in values { if item == value { result += 1 } }
+    return result
+}
+public function subset(values: List<Text>, container: List<Text>): Boolean {
+    for value in values { if !has(container, value) { return false } }
+    return true
+}
+public function without(values: List<Text>, removed: Text): List<Text> {
+    let result: List<Text> = []
+    for value in values { if value != removed { result.add(value) } }
+    return result
+}
+public function sorted(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { result.add(value) }
+    result.sort()
+    return result
+}
+public function union(left: List<Text>, right: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in left { if !has(result, value) { result.add(value) } }
+    for value in right { if !has(result, value) { result.add(value) } }
+    return result
+}
+public function lineStarting(source: Text, prefix: Text): Text {
+    for line in lines(source) { if starts(line, prefix) { return line } }
+    return ""
+}
+public function lineContaining(source: Text, needle: Text): Text {
+    for line in lines(source) { if contains(line, needle) { return line } }
+    return ""
+}
+public function linesContaining(source: Text, needle: Text): List<Text> {
+    let result: List<Text> = []
+    for line in lines(source) { if contains(line, needle) { result.add(line) } }
+    return result
+}
+public function quotedStrings(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 34 {
+            let end = index + 1
+            while end < raw.length && raw[end] != 34 { end += 1 }
+            if end >= raw.length { break }
+            if end > index + 1 { result.add(Text(raw.slice(index + 1, end))) }
+            index = end + 1
+        } else { index += 1 }
+    }
+    return result
+}
+
+public function environment(prefix: Text, overrides: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() {
+        let keep = !starts(entry, "MAKEFLAGS=")
+        for item in overrides {
+            let name = cut(item, 0, find(item, "=", 0) + 1)
+            if starts(entry, name) { keep = false }
+        }
+        if prefix != "" && starts(entry, "PATH=") { keep = false }
+        if keep { result.add(entry) }
+    }
+    if prefix != "" { result.add("PATH=" + prefix + ":" + system.getenv("PATH")) }
+    for item in overrides { result.add(item) }
+    return result
+}
+public function unset(entries: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in entries { if !starts(entry, name + "=") { result.add(entry) } }
+    return result
+}
+public function run(w: Wiring, command: List<Text>, environment: List<Text>, cwd: Text, seconds: Integer): test.Result {
+    let directory = cwd
+    if directory == "" { directory = w.root }
+    return test.run(command, environment, directory, logPath(w), seconds)
+}
+public function make(w: Wiring, arguments: List<Text>, environment: List<Text>, cwd: Text): test.Result {
+    let command = ["make"]
+    for item in arguments { command.add(item) }
+    return run(w, command, environment, cwd, 60)
+}
+
+function wordCharacter(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function space(byte: Integer): Boolean { return byte == 32 || byte == 9 || byte == 11 || byte == 12 || byte == 13 }
+function ruleLine(line: Text, mode: Integer): List<Text> {
+    let raw = Bytes(line)
+    let index = 0
+    while index < raw.length && raw[index] != 58 {
+        let byte = raw[index]
+        let allowed = wordCharacter(byte) || byte == 47 || byte == 45
+        if mode != NAMED && byte == 46 { allowed = true }
+        if mode == NAMED && index == 0 { allowed = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) }
+        if !allowed { return [] }
+        index += 1
+    }
+    if index == 0 || index >= raw.length { return [] }
+    let name = Text(raw.slice(0, index))
+    let rest = index + 1
+    if mode == SPACED {
+        if rest >= raw.length || !space(raw[rest]) { return [] }
+        while rest < raw.length && space(raw[rest]) { rest += 1 }
+    } else if mode == LOOSE {
+        while rest < raw.length && space(raw[rest]) { rest += 1 }
+    } else {
+        while rest < raw.length && raw[rest] == 32 { rest += 1 }
+        for position in rest..raw.length {
+            if raw[position] == 35 || (mode == PLAIN && raw[position] == 61) { return [] }
+        }
+    }
+    return [name, Text(raw.slice(rest, raw.length))]
+}
+public function rules(stdout: Text, mode: Integer): Rules {
+    let result = Rules { names: []; prerequisites: []; index: Map<Text, Integer>() }
+    for line in lines(stdout) {
+        let parsed = ruleLine(line, mode)
+        if parsed.length == 0 { continue }
+        let position = -1
+        if result.index.has(parsed[0]) { position = result.index[parsed[0]] } else {
+            position = result.names.length
+            result.index[parsed[0]] = position
+            result.names.add(parsed[0])
+            let empty: List<Text> = []
+            result.prerequisites.add(empty)
+        }
+        let target = result.prerequisites[position]
+        for item in words(parsed[1]) { if !has(target, item) { target.add(item) } }
+    }
+    return result
+}
+public function deps(r: Rules, name: Text): List<Text> {
+    if r.index.has(name) { return r.prerequisites[r.index[name]] }
+    let empty: List<Text> = []
+    return empty
+}
+public function dryRunCommands(stdout: Text): Text {
+    let marker = find(stdout, "# Make data base", 0)
+    let head = stdout
+    if marker >= 0 { head = cut(stdout, 0, marker) }
+    let all: List<Text> = []
+    let raw = Bytes(head)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 { all.add(Text(raw.slice(start, index + 1))); start = index + 1 }
+    }
+    if start < raw.length { all.add(Text(raw.slice(start, raw.length))) }
+    let first = all.length
+    for index in 0..all.length { if starts(all[index], "# GNU Make") { first = index; break } }
+    let end = first
+    while end < all.length && (starts(all[end], "#") || words(all[end]).length == 0) { end += 1 }
+    let kept: List<Text> = []
+    for index in 0..first { kept.add(all[index]) }
+    for index in end..all.length { kept.add(all[index]) }
+    return joinText(kept)
+}
+public function shellWords(command: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(command)
+    let current = Bytes()
+    let active = false
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if byte == 39 {
+            active = true
+            index += 1
+            while index < raw.length && raw[index] != 39 { current.add(raw[index]); index += 1 }
+            index += 1
+        } else if byte == 34 {
+            active = true
+            index += 1
+            while index < raw.length && raw[index] != 34 {
+                if raw[index] == 92 && index + 1 < raw.length && (raw[index + 1] == 34 || raw[index + 1] == 92 || raw[index + 1] == 36 || raw[index + 1] == 96) {
+                    index += 1
+                }
+                current.add(raw[index])
+                index += 1
+            }
+            index += 1
+        } else if byte == 92 && index + 1 < raw.length {
+            active = true
+            current.add(raw[index + 1])
+            index += 2
+        } else if space(byte) || byte == 10 {
+            if active { result.add(Text(current)); current = Bytes(); active = false }
+            index += 1
+        } else {
+            active = true
+            current.add(byte)
+            index += 1
+        }
+    }
+    if active { result.add(Text(current)) }
+    return result
+}
+
+public function minyarList(w: Wiring, path: Text, name: Text): List<Text> {
+    let text = read(w, path)
+    let marker = "public function " + name + "(): List<Text> {"
+    let start = find(text, marker, 0)
+    check(start >= 0, "missing " + name + " in " + path)
+    let body = cut(text, start + size(marker), find(text, "\n}", start))
+    return quotedStrings(body)
+}
+public function linuxTargets(w: Wiring): List<Text> {
+    let matrix = read(w, "tools/linux-matrix.min")
+    let start = find(matrix, "for target in [", 0)
+    check(start >= 0, "linux matrix optional targets")
+    let optional = cut(matrix, start + 15, find(matrix, "]", start))
+    let result = minyarList(w, "scripts/linux-plan.min", "correctness")
+    for item in quotedStrings(optional) { result.add(item) }
+    return result
+}
+public function formatterFiles(w: Wiring): List<Text> {
+    let text = read(w, "scripts/format.min")
+    let first = find(text, "for file in [", 0)
+    let result = quotedStrings(cut(text, first, find(text, "]", first)))
+    if contains(text, "if fileExists(\"compiler/stages/c-layout.min\") {") && files.pathSize(w.root + "/compiler/stages/c-layout.min") >= 0 {
+        let second = find(text, "for file in [", first + 1)
+        for item in quotedStrings(cut(text, second, find(text, "]", second))) { result.add(item) }
+    }
+    return result
+}
+public function formatterVersion(w: Wiring): Text {
+    let text = read(w, "scripts/format.min")
+    let marker = "\"version "
+    let start = find(text, marker, 0)
+    check(start >= 0, "formatter version")
+    let raw = Bytes(text)
+    let index = start + size(marker)
+    let end = index
+    while end < raw.length && ((raw[end] >= 48 && raw[end] <= 57) || raw[end] == 46) { end += 1 }
+    check(end < raw.length && raw[end] == 34, "formatter version syntax")
+    return Text(raw.slice(index, end))
+}
+public function assertQuicGroup(w: Wiring, targets: List<Text>) {
+    let quic = minyarList(w, "scripts/linux-plan.min", "quic")
+    let workflow = read(w, ".github/workflows/ci.yml")
+    check(contains(workflow, "./build/tooling/scripts/check-linux"), "CI does not run the native Linux runner")
+    check(contains(workflow, "--group quic"), "CI does not run the QUIC group")
+    for target in targets { check(has(quic, target), target + " is not in the QUIC group") }
+}
+
+function serialize(value: json.Value): Text {
+    if value.kind == json.STRING { return json.quote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.ARRAY {
+        let parts: List<Text> = []
+        for item in value.items { parts.add(serialize(item)) }
+        return "[" + joined(parts, ",") + "]"
+    }
+    if value.kind == json.OBJECT {
+        let parts: List<Text> = []
+        for index in 0..value.keys.length { parts.add(json.quote(value.keys[index]) + ":" + serialize(value.items[index])) }
+        return "{" + joined(parts, ",") + "}"
+    }
+    return value.text
+}
+public function catalogue(w: Wiring): Catalogue {
+    let text = read(w, "tests/suite-catalogue.json")
+    let data = json.parse(text)
+    check(data.kind == json.OBJECT, "suite catalogue is not an object")
+    return Catalogue { data: data; text: text }
+}
+public function rows(c: Catalogue): List<json.Value> { return json.member(c.data, "sources").items }
+public function row(c: Catalogue, path: Text): json.Value {
+    for item in rows(c) { if json.member(item, "path").text == path { return item } }
+    fail("missing catalogue row " + path)
+    return c.data
+}
+public function rowTexts(item: json.Value, name: Text): List<Text> {
+    let result: List<Text> = []
+    for value in json.member(item, name).items { result.add(value.text) }
+    return result
+}
+public function omitting(c: Catalogue, path: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..c.data.keys.length {
+        let value = c.data.items[index]
+        if c.data.keys[index] == "sources" {
+            let kept: List<Text> = []
+            for item in value.items { if json.member(item, "path").text != path { kept.add(serialize(item)) } }
+            parts.add(json.quote("sources") + ":[" + joined(kept, ",") + "]")
+        } else { parts.add(json.quote(c.data.keys[index]) + ":" + serialize(value)) }
+    }
+    return "{" + joined(parts, ",") + "}"
+}
+public function validate(w: Wiring, text: Text): Integer {
+    let directory = folder(w, "minyar-catalogue-")
+    writeTextFile(directory + "/catalogue.json", text)
+    let result = run(w, [w.root + "/build/tooling/tests/suite-catalogue", "--validate", directory + "/catalogue.json", w.root], system.environment(), "", 60)
+    check(result.status == 0 || result.status == 3, "catalogue validator failed\n" + result.output + result.errorOutput)
+    return result.status
+}
+public function discover(w: Wiring): List<Text> {
+    let result = run(w, [w.root + "/build/tooling/tests/suite-catalogue", "--discover", w.root], system.environment(), "", 60)
+    check(result.status == 0, "catalogue discovery failed\n" + result.errorOutput)
+    return lines(result.output)
+}
+public function catalogueValid(w: Wiring, c: Catalogue) { check(validate(w, c.text) == 0, "suite catalogue does not validate") }
+public function requiredSource(w: Wiring, c: Catalogue, discovered: List<Text>, path: Text) {
+    check(has(discovered, path), "catalogue discovery misses " + path)
+    check(validate(w, omitting(c, path)) == 3, "catalogue accepted omitting " + path)
+}
+public function omissionRejected(w: Wiring, c: Catalogue, path: Text) {
+    check(validate(w, omitting(c, path)) == 3, "catalogue accepted omitting " + path)
+}
+
+public function unameStub(w: Wiring, directory: Text, host: Text) {
+    executable(w, directory + "/uname", "#!/bin/sh\nprintf '%s\\n' '" + replaceAll(host, "'", "'\"'\"'") + "'\n")
+}
+public function environmentStub(w: Wiring, directory: Text) {
+    executable(w, directory + "/uname", "#!/bin/sh\nprintf '%s\\n' \"$TEST_UNAME\"\n")
+}
+public function phonyStubs(names: List<Text>, line: Text): Text {
+    return "\n.PHONY: " + joined(names, " ") + "\n" + joined(names, " ") + ":\n" + line + "\n"
+}
+public function absolute(w: Wiring, path: Text): Text { return w.root + "/" + path }
+public function finish(w: Wiring) {
+    test.removeTree(w.scratch)
+}
