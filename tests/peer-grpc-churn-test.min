@@ -1,0 +1,37 @@
+use "./net-fixtures.min" as fixtures
+use "./http2-peer.min" as h2
+use "../tools/testing.min" as test
+use "json" as json
+
+fixtures.arguments(["--sanitize"], [])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let binary = context.work + "/serve"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/peer-grpc-churn-serve.min", "-o", binary], 240, "compile native gRPC churn fixture")
+let server = fixtures.launch(context, [binary], 3600)
+let line = fixtures.firstLine(context, server, 20000)
+let port = fixtures.number(line)
+let churn = fixtures.run(context, [h2.peer(context), "churn", Text(port)], 3000)
+let served = fixtures.collect(server)
+test.check(churn.status == 0 && churn.errorOutput == "", "independent grpc-go churn client failed (" + Text(churn.status) + ")\n" + churn.output + churn.errorOutput)
+let rows = test.lines(churn.output)
+let summary = json.parse(rows[rows.length - 1])
+test.check(json.member(summary, "summary").truth && Integer(json.member(summary, "failures").number) == 0 && Integer(json.member(summary, "cancelled").number) == 64 && rows.length == 1, "churn transfers or cancellations failed\n" + churn.output)
+test.check(served.status == 0 && served.errorOutput == "", "native churn fixture exit (" + Text(served.status) + ")\n" + served.errorOutput)
+let outputLines = test.lines(served.output)
+test.check(outputLines.length == 2, "native churn fixture output after its port\n" + served.output)
+let counts = fixtures.split(fixtures.strip(outputLines[outputLines.length - 1]), 32)
+test.check(counts.length == 9 && counts[0] == "COUNTS", "counts line " + outputLines[outputLines.length - 1])
+let values: List<Integer> = []
+for index in 1..9 { values.add(fixtures.number(counts[index])) }
+test.check(values[0] == 2113 && values[1] == 2113 && values[2] == 2113, "opened/closed/released " + outputLines[outputLines.length - 1])
+test.check(values[3] >= 1 && values[3] <= 64 && values[4] >= 1 && values[4] <= 64 && values[5] <= 4096, "retained maxima " + outputLines[outputLines.length - 1])
+test.check(values[6] == 0 && values[7] == 0, "final records " + outputLines[outputLines.length - 1])
+print("gRPC churn: 1024 serial + 1024 mixed concurrent + 64 cancellations + fresh RPC on one connection; retained maxima calls=" + Text(values[3]) + " streams=" + Text(values[4]) + " table=" + Text(values[5]) + " bytes; final records=0")
+fixtures.finish(context)

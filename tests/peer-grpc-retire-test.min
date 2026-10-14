@@ -1,0 +1,51 @@
+use "./net-fixtures.min" as fixtures
+use "./http2-peer.min" as h2
+use "../tools/testing.min" as test
+use "files" as files
+use "json" as json
+
+fixtures.arguments(["--sanitize"], [])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let directory = context.work
+let binary = directory + "/probe"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/peer-grpc-retire.min", "-o", binary], 240, "compile gRPC retirement probe")
+writeBytesFile(directory + "/reset", h2.frame(3, 0, 1, h2.word(8)))
+let route = "/PeerEdgeDial/OpenExitStream"
+let opened = h2.envelope(h2.protos(context, [h2.openSpec(Bytes("fixture.jwt.signature"), "exit-a", "conn-1")])[0])
+for mode in ["normal", "early", "deadline", "cancel", "trap"] {
+    let timeout = ""
+    if mode == "deadline" { timeout = "500m" }
+    writeBytesFile(directory + "/initial", h2.send(h2.grpcClient(context, timeout, route), opened, mode == "normal"))
+    files.remove(directory + "/output")
+    let result = fixtures.run(context, [binary, directory + "/initial", directory + "/output", mode, directory + "/reset"], 60)
+    if mode == "trap" {
+        test.check(result.status != 0 && result.status != 124 && test.contains(result.errorOutput, "cannot read absent gRPC closed notification"), "trap (" + Text(result.status) + ")\n" + result.errorOutput)
+        continue
+    }
+    test.check(result.status == 0 && result.output == "RETIRED\n" && result.errorOutput == "", mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    let events = h2.events(context, files.readFile(directory + "/output"), true)
+    if mode == "normal" || mode == "early" {
+        let messages = h2.messages(events)
+        test.check(messages.length >= 2 && h2.code(messages[0]) == 0 && h2.body(messages[0]) == "status" && Text(h2.payload(messages[1])) == "queued forwarding bytes", mode + " drained messages")
+        test.check(h2.trailers(events, "grpc-status", "0"), mode + " trailers")
+        if mode == "early" {
+            let resets: List<json.Value> = []
+            for event in events { if h2.kind(event) == "reset" { resets.add(event) } }
+            test.check(resets.length == 1 && Integer(json.member(resets[0], "code").number) == 0, "complete response before request EOF must use NO_ERROR, not CANCEL")
+        }
+    } else if mode == "deadline" {
+        test.check(h2.count(events, "data") == 0, "deadline forwarded queued data")
+        test.check(h2.trailers(events, "grpc-status", "4"), "deadline trailers")
+    } else {
+        test.check(h2.count(events, "data") == 0, "cancel forwarded queued data")
+    }
+}
+print("gRPC retirement: active/rejected/partial-drain controls, once-only checked normal/cancel/deadline identity, no queued forwarding after cancel/deadline, final records zero passed")
+fixtures.finish(context)

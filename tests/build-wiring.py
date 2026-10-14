@@ -1505,24 +1505,24 @@ class BuildWiring(unittest.TestCase):
 
 
     def test_grpc_gates_verify_external_peers_and_bound_default_builds(self):
+        tools = ' '.join('build/tooling/tests/' + name for name in (
+            'http2-test', 'http2-churn-test', 'peer-grpc-test', 'peer-grpc-churn-test', 'peer-grpc-retire-test'))
         with tempfile.TemporaryDirectory(prefix='minyar grpc wiring ') as folder:
             work = Path(folder)
             for name in ('tests/interop/peergrpc/requirements.txt',
-                         'scripts/check-peer-python.py'):
+                         'scripts/check-peer-python.py', 'tests/interop/peergrpc/main.go',
+                         'tests/interop/peergrpc/go.mod', 'tests/interop/peergrpc/go.sum'):
                 path = work / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('')
             makefile = work / 'probe.mk'
             makefile.write_text(
                 'include ' + str(ROOT / 'build-support/peer-grpc.mk').replace(' ', '\\ ') + '\n'
-                '.PHONY: build/minyarc\n'
-                'build/minyarc:\n\t@echo ARTIFACT $@\n')
+                '.PHONY: build/minyarc build build/testing/cycle-runtime.o ' + tools + '\n'
+                'build/minyarc build build/testing/cycle-runtime.o ' + tools + ':\n\t@echo ARTIFACT $@\n')
             for selected in ('build/peergrpc-venv/bin/python', 'preinstalled-python',
                              'preinstalled Python'):
-                for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
-                             'check-http2-churn', 'check-peer-grpc-churn',
-                             'check-peer-grpc-retire', 'check-peer-edge-cids',
-                             'check-peer-edge-cids-sanitize'):
+                for gate in ('check-peer-edge-cids', 'check-peer-edge-cids-sanitize'):
                     with self.subTest(selected=selected, gate=gate):
                         env = dict(os.environ)
                         env.pop('MAKEFLAGS', None)
@@ -1539,8 +1539,21 @@ class BuildWiring(unittest.TestCase):
                         if setup:
                             self.assertIn('GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1', result.stdout)
                             self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL=1', result.stdout)
-
-
+            for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
+                         'check-http2-churn', 'check-http2-churn-sanitize', 'check-peer-grpc-churn',
+                         'check-peer-grpc-churn-sanitize', 'check-peer-grpc-retire',
+                         'check-peer-grpc-retire-sanitize'):
+                with self.subTest(gate=gate):
+                    env = dict(os.environ)
+                    env.pop('MAKEFLAGS', None)
+                    result = subprocess.run(['make', '-n', '-f', str(makefile), gate],
+                        cwd=work, env=env, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('check-peer-python.py', result.stdout)
+                    self.assertNotIn('peergrpc-venv', result.stdout)
+                    self.assertIn('GOMAXPROCS=2 go build -mod=readonly -trimpath', result.stdout)
+                    self.assertIn('.tmp" self-test', result.stdout)
+                    self.assertIn('./build/tooling/tests/', result.stdout)
 
     def test_successful_empty_pip_cannot_publish_peer_ready_stamp(self):
         # Windows task termination can return zero to the MSYS parent even

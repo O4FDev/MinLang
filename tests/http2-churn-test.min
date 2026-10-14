@@ -1,0 +1,77 @@
+use "./net-fixtures.min" as fixtures
+use "./http2-peer.min" as h2
+use "../tools/testing.min" as test
+use "files" as files
+
+record Probe { context: fixtures.Context; binary: Text }
+record Outcome { output: Text; frames: List<h2.Frame> }
+
+function run(probe: Probe, mode: Text, raw: Bytes): Outcome {
+    let directory = probe.context.work
+    writeBytesFile(directory + "/late", raw)
+    files.remove(directory + "/output")
+    let result = fixtures.run(probe.context, [probe.binary, directory + "/initial", directory + "/late", mode, directory + "/output"], 60)
+    test.check(result.status == 0 && result.errorOutput == "", mode + " (" + Text(result.status) + ")\n" + result.errorOutput)
+    return Outcome { output: result.output; frames: h2.frames(files.readFile(directory + "/output")) }
+}
+function present(outcome: Outcome, stream: Integer, kinds: List<Integer>): Boolean {
+    for item in outcome.frames {
+        if stream >= 0 && item.stream != stream { continue }
+        for kind in kinds { if item.kind == kind { return true } }
+    }
+    return false
+}
+function summary(outcome: Outcome): Text {
+    let parts: List<Text> = []
+    for item in outcome.frames { parts.add("(" + Text(item.kind) + "," + Text(item.stream) + "," + Text(item.body.length) + ")") }
+    return joinText(parts)
+}
+
+fixtures.arguments(["--red", "--sanitize"], ["--library"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let binary = context.work + "/probe"
+let compiler = [context.root + "/minyar"]
+if fixtures.option("--library", "") != "" {
+    compiler.add("--library")
+    compiler.add(fixtures.option("--library", ""))
+}
+for item in [context.root + "/tests/http2-churn.min", "-o", binary] { compiler.add(item) }
+fixtures.execute(context, compiler, 240, "compile HTTP/2 churn probe")
+let probe = Probe { context: context; binary: binary }
+let fields = [h2.field(":method", "POST"), h2.field(":scheme", "https"), h2.field(":authority", "peer.test"), h2.field(":path", "/PeerEdgeDial/OpenExitStream")]
+writeBytesFile(context.work + "/initial", h2.request(context, fields, true))
+let cancelled = run(probe, "cancel", h2.frame(3, 0, 1, h2.word(8)))
+let closed = run(probe, "late", h2.frame(8, 0, 1, h2.word(0)))
+if fixtures.flag("--red") {
+    test.check(present(cancelled, 1, [0]), "RED reset did not forward queued DATA")
+    test.check(present(closed, 1, [3]), "RED late WINDOW_UPDATE did not reset")
+    print("RED: reset forwards queued DATA; late closed WINDOW_UPDATE incorrectly emits RST_STREAM")
+    fixtures.finish(context)
+    exit(0)
+}
+test.check(cancelled.output == "OK\n" && !present(cancelled, 1, [0, 1]), "queued reset forwarded frames " + summary(cancelled))
+test.check(closed.output == "OK\n" && !present(closed, -1, [3]), "late WINDOW_UPDATE reset " + summary(closed))
+let partial = run(probe, "partial", h2.frame(3, 0, 1, h2.word(8)))
+let payload: List<Bytes> = []
+for item in partial.frames { if item.kind == 0 && item.stream == 1 { payload.add(item.body) } }
+test.check(partial.output == "OK\n" && payload.length == 1 && fixtures.hex(payload[0]) == fixtures.hex(h2.counting(64)), "partial frame completion " + summary(partial))
+let dynamic = h2.plus(fields, [h2.field("x-late", "new-dynamic")])
+let lateBlocks = h2.hpack(context, [h2.block(fields), h2.block(dynamic), h2.block(dynamic)])
+let raw = h2.join([h2.frame(8, 0, 1, h2.word(2147483647)), h2.frame(3, 0, 1, h2.word(8)), h2.frame(0, 0, 1, Bytes("late")), h2.frame(1, 4, 1, lateBlocks[1]), h2.frame(1, 5, 3, lateBlocks[2])])
+let late = run(probe, "late", raw)
+test.check(late.output == "OK\nREOPEN new-dynamic\n" && !present(late, -1, [3, 7]), "late frames poisoned the connection\n" + late.output + summary(late))
+let creditBlocks = h2.hpack(context, [h2.block(fields), h2.block(dynamic)])
+let credit = run(probe, "credit", h2.join([h2.frame(3, 0, 1, h2.word(8)), h2.frame(1, 5, 3, creditBlocks[1])]))
+test.check(credit.output == "OK\nREOPEN new-dynamic\n", "credit reopen\n" + credit.output)
+let restored = 0
+for item in credit.frames { if item.kind == 0 && item.stream == 3 { restored += item.body.length } }
+test.check(restored == 40000, "connection credit not restored: " + Text(restored))
+print("HTTP2 churn: queued reset suppression, exact partial-frame completion and minimal late closed frames passed")
+fixtures.finish(context)

@@ -1,0 +1,196 @@
+use "../tools/testing.min" as test
+use "./net-fixtures.min" as fixtures
+use "json" as json
+
+public record Field { name: Text; value: Bytes }
+public record Block { tableSize: Integer; fields: List<Field> }
+public record Frame { kind: Integer; flags: Integer; stream: Integer; body: Bytes }
+
+public function field(name: Text, value: Text): Field { return Field { name: name; value: Bytes(value) } }
+public function block(fields: List<Field>): Block { return Block { tableSize: -1; fields: fields } }
+public function resized(size: Integer, fields: List<Field>): Block { return Block { tableSize: size; fields: fields } }
+public function plus(fields: List<Field>, extra: List<Field>): List<Field> {
+    let result: List<Field> = []
+    for item in fields { result.add(item) }
+    for item in extra { result.add(item) }
+    return result
+}
+public function join(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+public function counting(rounds: Integer): Bytes {
+    let result = Bytes()
+    for round in 0..rounds { for byte in 0..256 { result.add(byte) } }
+    return result
+}
+public function word(value: Integer): Bytes {
+    let result = Bytes()
+    for shift in [24, 16, 8, 0] { result.add((value >> shift) & 255) }
+    return result
+}
+public function frame(kind: Integer, flags: Integer, stream: Integer, body: Bytes): Bytes {
+    let result = Bytes()
+    for shift in [16, 8, 0] { result.add((body.length >> shift) & 255) }
+    result.add(kind)
+    result.add(flags)
+    result.addBytes(word(stream))
+    result.addBytes(body)
+    return result
+}
+public function frames(raw: Bytes): List<Frame> {
+    let result: List<Frame> = []
+    let at = 0
+    while at < raw.length {
+        test.check(raw.length - at >= 9, "truncated frame header")
+        let size = (raw[at] << 16) | (raw[at + 1] << 8) | raw[at + 2]
+        let stream = ((raw[at + 5] & 127) << 24) | (raw[at + 6] << 16) | (raw[at + 7] << 8) | raw[at + 8]
+        test.check(at + 9 + size <= raw.length, "truncated frame body")
+        result.add(Frame { kind: raw[at + 3]; flags: raw[at + 4]; stream: stream; body: raw.slice(at + 9, at + 9 + size) })
+        at += 9 + size
+    }
+    return result
+}
+public function number(body: Bytes, at: Integer): Integer { return (body[at] << 24) | (body[at + 1] << 16) | (body[at + 2] << 8) | body[at + 3] }
+public function preface(): Bytes { return Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") }
+public function settings(pairs: List<List<Integer>>): Bytes {
+    let body = Bytes()
+    for pair in pairs {
+        body.add((pair[0] >> 8) & 255)
+        body.add(pair[0] & 255)
+        body.addBytes(word(pair[1]))
+    }
+    return frame(4, 0, 0, body)
+}
+public function opening(): Bytes {
+    return join([preface(), settings([[1, 4096], [2, 1], [4, 65535], [5, 16384], [8, 0], [3, 100], [6, 65536]])])
+}
+public function data(stream: Integer, payload: Bytes, chunk: Integer, end: Boolean): Bytes {
+    let result = Bytes()
+    let at = 0
+    while at < payload.length || (at == 0 && payload.length == 0) {
+        let stop = at + chunk
+        if stop > payload.length { stop = payload.length }
+        let flags = 0
+        if end && stop == payload.length { flags = 1 }
+        result.addBytes(frame(0, flags, stream, payload.slice(at, stop)))
+        if payload.length == 0 { break }
+        at = stop
+    }
+    return result
+}
+public function peer(context: fixtures.Context): Text { return fixtures.valueOr(context.environment, "MINYAR_PEERGRPC", context.root + "/build/peergrpc-peer") }
+function call(context: fixtures.Context, arguments: List<Text>, seconds: Integer): test.Result {
+    let command = [peer(context)]
+    for item in arguments { command.add(item) }
+    let result = fixtures.run(context, command, seconds)
+    test.check(result.status == 0 && result.errorOutput == "", "independent peer " + arguments[0] + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result
+}
+public function hpack(context: fixtures.Context, blocks: List<Block>): List<Bytes> {
+    let parts: List<Text> = []
+    for item in blocks {
+        let fields: List<Text> = []
+        for entry in item.fields { fields.add("{\"n\": " + json.quote(entry.name) + ", \"x\": " + json.quote(fixtures.hex(entry.value)) + "}") }
+        let size = ""
+        if item.tableSize >= 0 { size = "\"tableSize\": " + Text(item.tableSize) + ", " }
+        parts.add("{" + size + "\"fields\": [" + fixtures.joinWords(commaTerminated(fields)) + "]}")
+    }
+    let path = fixtures.logPath(context, "hpack") + ".json"
+    writeTextFile(path, "[" + fixtures.joinWords(commaTerminated(parts)) + "]")
+    let result: List<Bytes> = []
+    for line in test.lines(call(context, ["hpack", path], 60).output) { result.add(fixtures.unhex(line)) }
+    test.check(result.length == blocks.length, "independent HPACK block count")
+    return result
+}
+public function encoded(context: fixtures.Context, fields: List<Field>): Bytes { return hpack(context, [block(fields)])[0] }
+public function request(context: fixtures.Context, fields: List<Field>, end: Boolean): Bytes {
+    let flags = 4
+    if end { flags = 5 }
+    return join([opening(), frame(1, flags, 1, encoded(context, fields))])
+}
+public function events(context: fixtures.Context, raw: Bytes, grpc: Boolean): List<json.Value> {
+    let path = fixtures.logPath(context, "frames")
+    writeBytesFile(path, raw)
+    let arguments = ["events", path]
+    if grpc { arguments.add("--grpc") }
+    let result: List<json.Value> = []
+    for line in test.lines(call(context, arguments, 60).output) { result.add(json.parse(line)) }
+    return result
+}
+public function kind(event: json.Value): Text { return json.string(event, "event") }
+public function count(events: List<json.Value>, name: Text): Integer {
+    let total = 0
+    for event in events { if kind(event) == name { total += 1 } }
+    return total
+}
+public function streamData(events: List<json.Value>, stream: Integer): Bytes {
+    let result = Bytes()
+    for event in events {
+        if kind(event) == "data" && Integer(json.member(event, "stream").number) == stream { result.addBytes(fixtures.unhex(json.string(event, "data"))) }
+    }
+    return result
+}
+public function hasField(event: json.Value, name: Text, value: Text): Boolean {
+    for pair in json.member(event, "fields").items {
+        if pair.items.length == 2 && pair.items[0].text == name && pair.items[1].text == value { return true }
+    }
+    return false
+}
+public function trailers(events: List<json.Value>, name: Text, value: Text): Boolean {
+    for event in events { if kind(event) == "trailers" && hasField(event, name, value) { return true } }
+    return false
+}
+public function ended(events: List<json.Value>, stream: Integer): Boolean {
+    for event in events {
+        if (kind(event) == "data" || kind(event) == "headers" || kind(event) == "trailers") && Integer(json.member(event, "stream").number) == stream && json.member(event, "end").truth { return true }
+    }
+    return false
+}
+public function commaTerminated(items: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for index in 0..items.length {
+        if index + 1 < items.length { result.add(items[index] + ",") } else { result.add(items[index]) }
+    }
+    return result
+}
+public function envelope(message: Bytes): Bytes {
+    let result = Bytes()
+    result.add(0)
+    result.addBytes(word(message.length))
+    result.addBytes(message)
+    return result
+}
+public function openSpec(grant: Bytes, exit: Text, connection: Text): Text {
+    return "{\"open\": {\"grant\": " + json.quote(fixtures.hex(grant)) + ", \"exit\": " + json.quote(exit) + ", \"conn\": " + json.quote(connection) + "}}"
+}
+public function dataSpec(payload: Bytes): Text { return "{\"data\": " + json.quote(fixtures.hex(payload)) + "}" }
+public function statusSpec(code: Integer, detail: Text): Text { return "{\"status\": {\"code\": " + Text(code) + ", \"detail\": " + json.quote(detail) + "}}" }
+public function protos(context: fixtures.Context, specs: List<Text>): List<Bytes> {
+    let path = fixtures.logPath(context, "protos") + ".json"
+    writeTextFile(path, "[" + fixtures.joinWords(commaTerminated(specs)) + "]")
+    let result: List<Bytes> = []
+    for line in test.lines(call(context, ["proto", "encode", path], 60).output) { result.add(fixtures.unhex(line)) }
+    test.check(result.length == specs.length, "independent protobuf message count")
+    return result
+}
+public function decoded(context: fixtures.Context, raw: Bytes): json.Value { return json.parse(test.lines(call(context, ["proto", "decode", fixtures.hex(raw)], 60).output)[0]) }
+public function messages(events: List<json.Value>): List<json.Value> {
+    let result: List<json.Value> = []
+    for event in events {
+        test.check(kind(event) != "partial", "incomplete gRPC envelope in response")
+        if kind(event) == "message" { result.add(event) }
+    }
+    return result
+}
+public function body(message: json.Value): Text { return json.string(message, "body") }
+public function code(message: json.Value): Integer { return Integer(json.member(message, "code").number) }
+public function payload(message: json.Value): Bytes { return fixtures.unhex(json.string(message, "data")) }
+public record Client { opening: Bytes }
+public function grpcClient(context: fixtures.Context, timeout: Text, route: Text): Client {
+    let fields = [field(":method", "POST"), field(":scheme", "https"), field(":authority", "peer.test"), field(":path", route), field("content-type", "application/grpc"), field("te", "trailers")]
+    if timeout != "" { fields.add(field("grpc-timeout", timeout)) }
+    return Client { opening: request(context, fields, false) }
+}
+public function send(client: Client, message: Bytes, end: Boolean): Bytes { return join([client.opening, data(1, message, 16384, end)]) }

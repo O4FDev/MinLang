@@ -13,40 +13,50 @@ build/peergrpc-venv/.ready: tests/interop/peergrpc/requirements.txt scripts/chec
 	build/peergrpc-venv/bin/python scripts/check-peer-python.py
 	touch $@
 
+build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum | build
+	cd tests/interop/peergrpc && GOMAXPROCS=2 go build -mod=readonly -trimpath -o "$(abspath $@).tmp" . && "$(abspath $@).tmp" self-test
+	mv -f "$@.tmp" "$@"
+
+PEER_GRPC_TOOLS = http2-test http2-churn-test peer-grpc-test peer-grpc-churn-test peer-grpc-retire-test
+$(PEER_GRPC_TOOLS:%=build/tooling/tests/%.ll): tests/http2-peer.min tests/net-fixtures.min
+$(PEER_GRPC_TOOLS:%=build/tooling/tests/%): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(PEER_GRPC_TOOLS:%=build/tooling/tests/%): build/testing/cycle-runtime.o
+build/tooling/tests/http2-test.ll build/tooling/tests/peer-grpc-test.ll: tests/cpython-random.min
+
 .PHONY: check-http2 check-peer-grpc check-peer-grpc-sanitize
-check-http2: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2.py
+check-http2: build/minyarc build/peergrpc-peer build/tooling/tests/http2-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http2-test
 
-check-peer-grpc: build/minyarc check-peer-grpc-python check-http2
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc.py
+check-peer-grpc: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-test check-http2
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-grpc-test
 
-check-peer-grpc-sanitize: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2.py --sanitize
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc.py --sanitize
+check-peer-grpc-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/http2-test build/tooling/tests/peer-grpc-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/http2-test --sanitize
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-grpc-test --sanitize
 
 check check-portable: check-peer-grpc
 check-sanitize: check-peer-grpc-sanitize
 
 .PHONY: check-http2-churn check-http2-churn-sanitize
-check-http2-churn: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2-churn.py
+check-http2-churn: build/minyarc build/peergrpc-peer build/tooling/tests/http2-churn-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http2-churn-test
 
-check-http2-churn-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2-churn.py --sanitize
+check-http2-churn-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/http2-churn-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/http2-churn-test --sanitize
 
 .PHONY: check-peer-grpc-churn check-peer-grpc-churn-sanitize
-check-peer-grpc-churn: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-churn.py
+check-peer-grpc-churn: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-churn-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-grpc-churn-test
 
-check-peer-grpc-churn-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-churn.py --sanitize
+check-peer-grpc-churn-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-churn-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-grpc-churn-test --sanitize
 
 .PHONY: check-peer-grpc-retire check-peer-grpc-retire-sanitize
-check-peer-grpc-retire: build/minyarc check-peer-grpc-python
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-retire.py
+check-peer-grpc-retire: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-retire-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-grpc-retire-test
 
-check-peer-grpc-retire-sanitize: build/minyarc check-peer-grpc-python
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-retire.py --sanitize
+check-peer-grpc-retire-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-retire-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-grpc-retire-test --sanitize
 
 .PHONY: check-peer-edge check-peer-edge-sanitize
 check-peer-edge: build/minyarc check-peer-grpc-python

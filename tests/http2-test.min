@@ -1,0 +1,162 @@
+use "./net-fixtures.min" as fixtures
+use "./http2-peer.min" as h2
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+use "files" as files
+
+record Probe { context: fixtures.Context; binary: Text; directory: Text }
+record Outcome { output: Text; encoded: Bytes }
+record Rejection { raw: Bytes; code: Integer }
+
+function run(probe: Probe, raw: Bytes, mode: Text, piece: Integer): Outcome {
+    writeBytesFile(probe.directory + "/input", raw)
+    files.remove(probe.directory + "/output")
+    let result = fixtures.run(probe.context, [probe.binary, probe.directory + "/input", probe.directory + "/output", mode, Text(piece)], 60)
+    test.check(result.status == 0 && result.errorOutput == "", mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    let encoded = Bytes()
+    if mode != "prefixes" { encoded = files.readFile(probe.directory + "/output") }
+    return Outcome { output: result.output; encoded: encoded }
+}
+function same(left: Outcome, right: Outcome): Boolean { return left.output == right.output && fixtures.hex(left.encoded) == fixtures.hex(right.encoded) }
+function bytesOf(values: List<Integer>): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    return result
+}
+function zeros(count: Integer): Bytes { return Bytes(count) }
+function goaway(encoded: Bytes, code: Integer): Boolean {
+    for item in h2.frames(encoded) { if item.kind == 7 && item.body.length >= 8 && h2.number(item.body, 4) == code { return true } }
+    return false
+}
+
+fixtures.arguments(["--red", "--sanitize"], [])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let binary = context.work + "/probe"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/http2.min", "-o", binary], 240, "compile HTTP/2 probe")
+let probe = Probe { context: context; binary: binary; directory: context.work }
+let fields = [h2.field(":method", "POST"), h2.field(":scheme", "https"), h2.field(":authority", "peer.test"), h2.field(":path", "/hearth.peer.v1.PeerGateway/Dial"),
+    h2.field("content-type", "application/grpc"), h2.field("te", "trailers")]
+let initial = h2.request(context, fields, false)
+let first = run(probe, initial, "", 0)
+if fixtures.flag("--red") {
+    test.check(fixtures.starts(first.output, "ERROR 10"), first.output)
+    print("RED: independent valid HTTP/2 preface and HPACK request rejected by initial stub")
+    fixtures.finish(context)
+    exit(0)
+}
+let lines = ["REQUEST 1\n"]
+for item in fields { lines.add(item.name + " " + Text(item.value) + "\n") }
+let expected = joinText(lines)
+test.check(first.output == expected, "independent request fields\n" + first.output)
+let received = h2.events(context, first.encoded, false)
+test.check(h2.count(received, "settings") > 0, "server SETTINGS not received")
+test.check(h2.count(received, "settings-ack") > 0, "client SETTINGS not acknowledged")
+test.check(run(probe, initial, "prefixes", 0).output == "PREFIXES " + Text(initial.length + 1) + "\n", "initial prefixes")
+let prefixCount = initial.length + 1
+for piece in [1, 7, 9, 31] { test.check(run(probe, initial, "", piece).output == expected, "piece " + Text(piece)) }
+let prefix = h2.join([h2.preface(), h2.frame(4, 0, 0, Bytes())])
+let shared = h2.plus(fields, [h2.field("x-shared", "dynamic-value")])
+let blocks = h2.hpack(context, [h2.block(shared), h2.block(shared), h2.resized(0, fields)])
+let firstBlock = blocks[0]
+let secondBlock = blocks[1]
+test.check(secondBlock.length < firstBlock.length, "dynamic table reference was not shorter")
+let maximum = h2.join([prefix, h2.frame(1, 4, 1, firstBlock), h2.frame(0, 1, 1, h2.counting(64))])
+test.check(run(probe, maximum, "prefixes", 0).output == "PREFIXES " + Text(maximum.length + 1) + "\n", "maximum DATA prefixes")
+prefixCount += maximum.length + 1
+let continued = h2.join([prefix, h2.frame(1, 0, 1, firstBlock.slice(0, 5)), h2.frame(9, 4, 1, firstBlock.slice(5, firstBlock.length)), h2.frame(1, 4, 3, secondBlock)])
+let assembled = run(probe, continued, "", 1).output
+test.check(test.contains(assembled, "REQUEST 1\n") && test.contains(assembled, "REQUEST 3\n") && fixtures.count(assembled, "x-shared dynamic-value\n") == 2, "continuation and dynamic table\n" + assembled)
+test.check(test.contains(run(probe, h2.join([continued, h2.frame(1, 4, 5, blocks[2])]), "", 0).output, "REQUEST 5\n"), "dynamic table resize")
+let rfc = fixtures.unhex("828684418cf1e3c2e5f23a6ba0ab90f4ff")
+test.check(test.contains(run(probe, h2.join([prefix, h2.frame(1, 4, 1, rfc)]), "", 0).output, ":authority www.example.com\n"), "RFC 7541 C.4.1 Huffman vector")
+let visibleBytes = Bytes("!")
+for code in 32..127 { visibleBytes.add(code) }
+visibleBytes.add(33)
+let visible = Text(visibleBytes)
+test.check(test.contains(run(probe, h2.join([prefix, h2.frame(1, 4, 1, h2.encoded(context, h2.plus(fields, [h2.field("x-symbols", visible)])))]), "", 0).output, "x-symbols " + visible + "\n"), "visible Huffman symbols")
+let everySymbol = Bytes()
+for code in 0..256 { everySymbol.add(code) }
+let symbolBlocks = h2.hpack(context, [h2.block(h2.plus(fields, [h2.Field { name: "x-all-symbols"; value: everySymbol }])), h2.block(h2.plus(fields, [h2.field("x-next", "valid-after-rejection")]))])
+let symbols = run(probe, h2.join([prefix, h2.frame(1, 4, 1, symbolBlocks[0]), h2.frame(1, 4, 3, symbolBlocks[1])]), "", 0)
+let resetFirst = false
+for item in h2.frames(symbols.encoded) { if item.kind == 3 && item.body.length == 4 && h2.number(item.body, 0) == 1 { resetFirst = true } }
+test.check(fixtures.starts(symbols.output, "REQUEST 3\n") && test.contains(symbols.output, "valid-after-rejection") && resetFirst, "all-symbol Huffman decoding\n" + symbols.output)
+let settingsPair = Bytes()
+settingsPair.addBytes(bytesOf([0, 4]))
+settingsPair.addBytes(h2.word(2147483648))
+let smallFrame = Bytes()
+smallFrame.addBytes(bytesOf([0, 5]))
+smallFrame.addBytes(h2.word(16383))
+let altered = Bytes("X")
+altered.addBytes(initial.slice(1, initial.length))
+let errors = [Rejection { raw: altered; code: 1 }, Rejection { raw: h2.join([h2.preface(), h2.frame(6, 0, 0, Bytes("12345678"))]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(4, 1, 0, Bytes("x"))]); code: 6 }, Rejection { raw: h2.join([prefix, h2.frame(4, 0, 1, Bytes())]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(4, 0, 0, Bytes("x"))]); code: 6 }, Rejection { raw: h2.join([prefix, h2.frame(4, 0, 0, settingsPair)]); code: 3 },
+    Rejection { raw: h2.join([prefix, h2.frame(4, 0, 0, smallFrame)]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(6, 0, 0, Bytes("x"))]); code: 6 }, Rejection { raw: h2.join([prefix, h2.frame(6, 0, 1, Bytes("12345678"))]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(1, 4, 2, firstBlock)]); code: 1 }, Rejection { raw: h2.join([prefix, h2.frame(1, 4, 0, firstBlock)]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(9, 4, 1, firstBlock)]); code: 1 }, Rejection { raw: h2.join([prefix, h2.frame(1, 0, 1, firstBlock), h2.frame(6, 0, 0, Bytes("12345678"))]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(1, 4, 1, bytesOf([128]))]); code: 9 }, Rejection { raw: h2.join([prefix, h2.frame(1, 4, 1, bytesOf([255, 255, 255, 255, 255, 255]))]); code: 9 },
+    Rejection { raw: h2.join([prefix, h2.frame(1, 4, 1, bytesOf([63, 226, 31]))]); code: 9 },
+    Rejection { raw: h2.join([prefix, h2.frame(1, 4, 1, bytesOf([0, 129, 255, 0]))]); code: 9 },
+    Rejection { raw: h2.join([prefix, h2.frame(1, 4, 1, bytesOf([0, 132, 255, 255, 255, 255, 0]))]); code: 9 },
+    Rejection { raw: h2.join([prefix, h2.frame(0, 0, 1, Bytes("x"))]); code: 1 }, Rejection { raw: h2.join([prefix, h2.frame(3, 0, 1, zeros(4))]); code: 1 },
+    Rejection { raw: h2.join([prefix, h2.frame(8, 0, 0, zeros(4))]); code: 1 }, Rejection { raw: h2.join([prefix, h2.frame(8, 0, 0, Bytes("x"))]); code: 6 },
+    Rejection { raw: h2.join([prefix, h2.frame(5, 0, 2, zeros(4))]); code: 1 },
+    Rejection { raw: h2.join([prefix, bytesOf([0, 64, 1, 0, 0, 0, 0, 0, 1])]); code: 6 }]
+for item in errors {
+    let rejected = run(probe, item.raw, "", 1)
+    let tail = item.raw.slice(max(0, item.raw.length - 32), item.raw.length)
+    test.check(rejected.output == "ERROR 10 " + Text(item.code) + "\n", fixtures.hex(tail) + " expected " + Text(item.code) + " got " + rejected.output)
+    test.check(goaway(rejected.encoded, item.code), fixtures.hex(tail) + " lacks GOAWAY " + Text(item.code))
+}
+let malformed = [h2.plus(fields, [h2.field("Upper", "bad")]), h2.plus(fields, [h2.field("invalid/name", "bad")]), h2.plus(fields, [h2.field("connection", "close")]),
+    h2.plus(fields, [h2.field("te", "gzip")]), h2.plus(fields, [h2.field(":method", "GET")]), h2.plus(fields, [h2.field("x-test", "\r\n")]),
+    h2.plus(fields, [h2.field("x-test", " leading")]), h2.plus(fields, [h2.field("content-length", "1")]),
+    h2.plus(fields, [h2.field("content-length", "0"), h2.field("content-length", "0")]), [h2.field(":method", "POST"), h2.field(":scheme", "https")]]
+for candidate in malformed {
+    let outcome = run(probe, h2.join([prefix, h2.frame(1, 5, 1, h2.encoded(context, candidate))]), "", 0)
+    test.check(outcome.output == "", "malformed request accepted\n" + outcome.output)
+    let reset = false
+    for item in h2.frames(outcome.encoded) { if (item.kind == 3 && item.stream == 1 && item.body.length == 4 && h2.number(item.body, 0) == 1) || item.kind == 7 { reset = true } }
+    test.check(reset, "malformed request was not reset")
+}
+let payload = h2.counting(100)
+let echoInput = h2.join([h2.request(context, fields, false), h2.data(1, payload, 8000, true)])
+let echoed = h2.events(context, run(probe, echoInput, "echo", 7).encoded, false)
+test.check(fixtures.hex(h2.streamData(echoed, 1)) == fixtures.hex(payload), "echoed binary DATA differs")
+test.check(h2.trailers(echoed, "x-final", "done"), "trailers missing")
+test.check(h2.ended(echoed, 1), "response stream did not end")
+test.check(run(probe, prefix, "timer", 0).output == "TIMER OK\n", "timer")
+let bounds = context.work + "/bounds"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/http2-bounds.min", "-o", bounds], 240, "compile HTTP/2 bounds probe")
+writeBytesFile(context.work + "/input", h2.join([h2.opening(), h2.settings([[4, 0]]), h2.frame(1, 4, 1, h2.encoded(context, fields))]))
+writeBytesFile(context.work + "/credits", h2.frame(8, 0, 1, h2.word(65535)))
+let bounded = fixtures.run(context, [bounds, context.work + "/input", context.work + "/credits", context.work + "/output"], 60)
+test.check(bounded.status == 0 && bounded.output == "BOUNDS OK\n" && bounded.errorOutput == "", "bounds (" + Text(bounded.status) + ")\n" + bounded.output + bounded.errorOutput)
+let emitted = Bytes()
+for item in h2.frames(files.readFile(context.work + "/output")) { if item.kind == 0 { emitted.addBytes(item.body) } }
+let budget = h2.counting(255)
+for code in 0..255 { budget.add(code) }
+test.check(fixtures.hex(emitted) == fixtures.hex(budget), "flow-controlled DATA differs")
+let rng = random.seeded("1211256881")
+for index in 0..250 {
+    let raw = initial.slice(0, initial.length)
+    for round in 0..(1 + index % 3) {
+        let at = random.below(rng, raw.length)
+        raw[at] = raw[at] ^ (1 << random.below(rng, 8))
+    }
+    if index % 5 == 0 { raw = raw.slice(0, random.below(rng, raw.length + 1)) }
+    let one = run(probe, raw, "", 1)
+    let whole = run(probe, raw, "", 0)
+    test.check(same(one, whole), "mutation " + Text(index) + " " + fixtures.hex(raw) + "\n" + one.output + "\n" + whole.output)
+}
+print("HTTP/2: " + Text(prefixCount) + " request/maximum-DATA prefixes, RFC7541/all-symbol Huffman, dynamic table/continuations, " + Text(errors.length) + " errors, " + Text(malformed.length) + " header controls, 1MiB/flow retry boundaries, binary response/trailers and 250 seeded mutations passed")
+fixtures.finish(context)

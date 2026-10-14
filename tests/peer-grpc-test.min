@@ -1,0 +1,159 @@
+use "./net-fixtures.min" as fixtures
+use "./http2-peer.min" as h2
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+use "files" as files
+use "json" as json
+
+record Probe { context: fixtures.Context; binary: Text }
+record Outcome { output: Text; errorOutput: Text; status: Integer; encoded: Bytes }
+
+function run(probe: Probe, raw: Bytes, mode: Text, extra: Text, trap: Boolean): Outcome {
+    let directory = probe.context.work
+    writeBytesFile(directory + "/input", raw)
+    files.remove(directory + "/output")
+    let result = fixtures.run(probe.context, [probe.binary, directory + "/input", directory + "/output", mode, extra], 60)
+    if trap {
+        test.check(result.status != 0 && result.status != 124 && test.contains(result.errorOutput, "cannot read rejected gRPC open"), "trap (" + Text(result.status) + ")\n" + result.errorOutput)
+    } else {
+        test.check(result.status == 0 && result.errorOutput == "", mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    }
+    return Outcome { output: result.output; errorOutput: result.errorOutput; status: result.status; encoded: files.readFile(directory + "/output") }
+}
+function fromHex(text: Text): Bytes { return fixtures.unhex(text) }
+function counting(start: Integer, length: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..length { result.add((start + index) % 256) }
+    return result
+}
+
+fixtures.arguments(["--compat-red", "--sanitize"], ["--library"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize {
+    let leaks = "detect_leaks=0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "detect_leaks=1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let binary = context.work + "/probe"
+let source = context.root + "/tests/peer-grpc.min"
+if fixtures.flag("--compat-red") {
+    source = context.work + "/red.min"
+    writeTextFile(source, "use \"peergrpc\" as grpc\nuse \"errors\" as errors\nlet server = grpc.create()\ngrpc.receive(server, readBytesFile(argument(0)))\nlet open = grpc.requests(server, 1000000)\nif grpc.openOk(open) { print(\"OPEN\") } else { print(\"ERROR \" + Text(errors.code(grpc.openError(open)))) }\nwriteBytesFile(argument(1), grpc.takeOutgoing(server, 1048576))\n")
+}
+let compiler = [context.root + "/minyar"]
+if fixtures.option("--library", "") != "" {
+    compiler.add("--library")
+    compiler.add(fixtures.option("--library", ""))
+}
+for item in [source, "-o", binary] { compiler.add(item) }
+fixtures.execute(context, compiler, 240, "compile gRPC probe")
+let probe = Probe { context: context; binary: binary }
+let route = "/PeerEdgeDial/OpenExitStream"
+let plain = h2.grpcClient(context, "", route)
+let bounded = h2.grpcClient(context, "500m", route)
+let grant = Bytes("fixture.jwt.signature")
+let encodedMessages = h2.protos(context, [h2.openSpec(grant, "exit-a", "conn-1"), h2.dataSpec(Bytes("not-open")), h2.statusSpec(0, ""),
+    h2.openSpec(Bytes("x"), "exit-a", ""), h2.openSpec(Bytes("x"), "exit/a", "conn-1"), h2.openSpec(fromHex("ff"), "exit-a", "conn-1"),
+    h2.dataSpec(Bytes("early")), h2.dataSpec(counting(0, 256)), h2.dataSpec(h2.counting(100))])
+let openMessage = h2.envelope(encodedMessages[0])
+let first = run(probe, h2.send(plain, openMessage, false), "", "", false)
+if fixtures.flag("--compat-red") {
+    test.check(first.output == "ERROR 10\n", first.output)
+    print("RED: committed private schema rejects normative PeerEdgeDial OpenExitStream request")
+    fixtures.finish(context)
+    exit(0)
+}
+test.check(first.output == "OPEN 1 exit-a conn-1 1010 fixture.jwt.signature\n", first.output)
+h2.events(context, first.encoded, true)
+let statuses = ["grant_invalid", "exit_offline", "policy_denied", "concurrency_full"]
+for index in 0..statuses.length {
+    let rejected = h2.events(context, run(probe, h2.send(plain, openMessage, false), "reject", statuses[index], false).encoded, true)
+    let replies = h2.messages(rejected)
+    test.check(replies.length == 1 && h2.body(replies[0]) == "status", statuses[index] + " reply shape")
+    test.check(h2.code(replies[0]) == index + 1 && json.string(replies[0], "detail") == "capacity reason", statuses[index] + " status")
+    test.check(h2.trailers(rejected, "grpc-status", "0"), statuses[index] + " trailers")
+}
+for mode in ["timeout", "timeout-wall"] {
+    let timed = run(probe, h2.send(bounded, openMessage, false), mode, "", false)
+    test.check(timed.output == "TIMEOUT OK\n", mode + "\n" + timed.output)
+    test.check(h2.trailers(h2.events(context, timed.encoded, true), "grpc-status", "4"), mode + " trailers")
+}
+let echoData = h2.counting(100)
+let echoMessage = h2.envelope(encodedMessages[8])
+writeBytesFile(context.work + "/followup", h2.data(1, echoMessage, 8000, true))
+let echoed = h2.events(context, run(probe, h2.send(plain, openMessage, false), "echo", context.work + "/followup", false).encoded, true)
+let replies = h2.messages(echoed)
+test.check(replies.length > 0 && h2.body(replies[0]) == "status" && h2.code(replies[0]) == 0, "echo admission status")
+let joined = Bytes()
+for index in 1..replies.length { joined.addBytes(h2.payload(replies[index])) }
+test.check(fixtures.hex(joined) == fixtures.hex(echoData), "echoed data differs")
+let doneTrailers = false
+for event in echoed { if h2.kind(event) == "trailers" && h2.hasField(event, "grpc-status", "0") && h2.hasField(event, "grpc-message", "done %25%0A") { doneTrailers = true } }
+test.check(doneTrailers, "echo trailers")
+test.check(run(probe, h2.send(plain, openMessage, false), "established", "", false).output == "ESTABLISHED OK\n", "established stream cut off by default deadline")
+let earlyData = h2.join([openMessage, h2.envelope(encodedMessages[6])])
+let malformed = [fromHex("0100000000"), fromHex("0000010005"), h2.envelope(encodedMessages[1]), h2.envelope(encodedMessages[2]), h2.envelope(encodedMessages[3]),
+    h2.envelope(encodedMessages[4]), h2.envelope(encodedMessages[5]), earlyData, h2.join([openMessage, openMessage]), h2.join([openMessage, h2.envelope(encodedMessages[2])])]
+for bad in malformed {
+    let outcome = run(probe, h2.send(plain, bad, true), "", "", false)
+    test.check(outcome.output == "ERROR 10\n", fixtures.hex(bad) + "\n" + outcome.output)
+    test.check(h2.trailers(h2.events(context, outcome.encoded, true), "grpc-status", "13"), fixtures.hex(bad) + " trailers")
+}
+let alias = h2.grpcClient(context, "", "/hearth.peer.v1.PeerGateway/Dial")
+test.check(run(probe, h2.send(alias, openMessage, false), "", "", false).output == "ERROR 10\n", "old private route aliased")
+let dataMessage = h2.envelope(encodedMessages[7])
+let prefixCount = 0
+for cut in 1..(dataMessage.length + 1) {
+    test.check(run(probe, h2.send(plain, h2.join([openMessage, dataMessage.slice(0, cut)]), false), "", "", false).output == "ERROR 10\n", "early byte " + Text(cut))
+}
+for cut in 0..(openMessage.length + 1) {
+    let outcome = run(probe, h2.send(plain, openMessage.slice(0, cut), true), "", "", false)
+    if cut == openMessage.length { test.check(fixtures.starts(outcome.output, "OPEN 1 "), "complete open " + outcome.output) } else { test.check(outcome.output == "ERROR 10\n", "open prefix " + Text(cut) + " " + outcome.output) }
+    prefixCount += 1
+}
+for cut in 0..(dataMessage.length + 1) {
+    writeBytesFile(context.work + "/followup", h2.data(1, dataMessage.slice(0, cut), 16384, true))
+    let outcome = run(probe, h2.send(plain, openMessage, false), "echo", context.work + "/followup", false)
+    test.check(fixtures.starts(outcome.output, "OPEN 1 "), "data prefix " + Text(cut) + " " + outcome.output)
+    test.check(test.contains(outcome.output, "READERROR 10\n") == (cut != 0 && cut != dataMessage.length), "data prefix read error " + Text(cut) + " " + outcome.output)
+    prefixCount += 1
+}
+let rng = random.seeded("1196576835")
+for index in 0..150 {
+    let bad = openMessage.slice(0, openMessage.length)
+    for round in 0..(1 + index % 3) {
+        let at = random.below(rng, bad.length)
+        bad[at] = bad[at] ^ (1 << random.below(rng, 8))
+    }
+    let outcome = run(probe, h2.send(plain, bad, true), "", "", false)
+    test.check(fixtures.starts(outcome.output, "OPEN 1 ") || outcome.output == "ERROR 10\n", "mutation " + Text(index) + " " + fixtures.hex(bad) + " " + outcome.output)
+    if fixtures.starts(outcome.output, "OPEN 1 ") {
+        test.check(bad[0] == 0 && h2.number(bad, 1) == bad.length - 5, "accepted malformed envelope " + fixtures.hex(bad))
+        test.check(h2.body(h2.decoded(context, bad.slice(5, bad.length))) == "open", "accepted non-open message " + fixtures.hex(bad))
+    }
+}
+run(probe, Bytes(), "trap", "", true)
+let serving = context.work + "/serve"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/peer-grpc-serve.min", "-o", serving], 240, "compile native gRPC fixture")
+let server = fixtures.launch(context, [serving], 600)
+let port = fixtures.firstLine(context, server, 20000)
+test.check(port != "" && fixtures.split(port, 32).length == 1, "native gRPC fixture did not report a port: " + port)
+let transfers = fixtures.run(context, [h2.peer(context), "transfers", Text(fixtures.number(port))], 120)
+let served = fixtures.collect(server)
+test.check(transfers.status == 0 && transfers.errorOutput == "", "independent grpc-go client failed (" + Text(transfers.status) + ")\n" + transfers.output + transfers.errorOutput)
+let rows = test.lines(transfers.output)
+test.check(rows.length == 5, "independent client results\n" + transfers.output)
+for row in rows {
+    let value = json.parse(row)
+    if json.string(value, "cancel") != "" {
+        test.check(json.string(value, "error") == "" && json.string(value, "first") == "status" && Integer(json.member(value, "code").number) == 0, "cancelled stream was not admitted\n" + row)
+    } else {
+        test.check(json.string(value, "error") == "" && json.string(value, "first") == "status" && Integer(json.member(value, "code").number) == 0, "transfer admission\n" + row)
+        test.check(json.member(value, "match").truth && json.string(value, "status") == "OK", "transfer bytes or status\n" + row)
+    }
+}
+test.check(served.status == 0 && served.errorOutput == "", "native gRPC fixture exit (" + Text(served.status) + ")\n" + served.errorOutput)
+print("gRPC: " + Text(prefixCount) + " prefixes + 150 mutations, normative PeerEdgeDial schema/all nested statuses/details, early coalesced DATA rejection, immutable 500ms/default deadlines and concurrent grpc-go 64KiB binary streams passed")
+fixtures.finish(context)
