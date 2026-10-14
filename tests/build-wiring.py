@@ -861,14 +861,13 @@ class BuildWiring(unittest.TestCase):
         self.assertIn(marker,source)
         fragment = source[source.index(marker):]
         pair = {'check-cycle-private-retirement','check-cycle-private-retirement-sanitize'}
-        inputs = {'tests/cycle-private-retirement.py','tests/cycle-idle-invalidation.c',
-                  'tests/cycle-private-retirement-v5.json','tests/cycle-additive.c',
-                  'tests/cycle-additive.py','tests/test_evidence.py','tools/cycle_runtime.py'}
+        inputs = {'build/tooling/tests/cycle-private-retirement','tests/cycle-idle-invalidation.c',
+                  'tests/cycle-private-retirement-v5.json','tests/cycle-additive.c'}
 
         def verify(candidate):
             with tempfile.TemporaryDirectory(prefix='actual private retirement Make rules ') as folder:
                 probe=Path(folder)/'probe.mk'
-                probe.write_text(candidate+'\nbuild:\n')
+                probe.write_text(candidate+'\nbuild:\nbuild/tooling/%:\n\t@echo TOOL $@\n')
                 result=subprocess.run(['make','-rRnp','-f',str(probe),'check'],
                                       cwd=ROOT,capture_output=True,text=True,timeout=15)
                 self.assertEqual(result.returncode,0,result.stderr)
@@ -888,7 +887,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertEqual(recipe.returncode,0,recipe.stderr)
                     commands=recipe.stdout
                     private_commands[kind]=commands
-                    self.assertEqual(commands.count('python3 tests/cycle-private-retirement.py'),1,target)
+                    self.assertEqual(commands.count('./build/tooling/tests/cycle-private-retirement'),1,target)
                     self.assertEqual(commands.count('--evidence "$evidence/run"'),1,target)
                     self.assertEqual(commands.count('--sanitize --evidence'),int(kind=='sanitize'),target)
                     self.assertNotIn('--profiles',commands)
@@ -896,7 +895,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn((ROOT/'build'/('cycle-private-retirement-'+kind)).as_posix(),
                                   commands.replace('\\','/'))
                 commands='\n'.join(private_commands.values())
-                self.assertEqual(commands.count('python3 tests/cycle-private-retirement.py'),2)
+                self.assertEqual(commands.count('./build/tooling/tests/cycle-private-retirement'),2)
                 self.assertEqual(commands.count('--evidence "$evidence/run"'),2)
                 self.assertEqual(commands.count('--sanitize --evidence'),1)
         verify(fragment)
@@ -918,36 +917,50 @@ class BuildWiring(unittest.TestCase):
                 broken=fragment[:block.start()]+recipe.replace(evidence,replacement,1)+fragment[block.end():]
                 with self.subTest(target=target,evidence=replacement),self.assertRaises(AssertionError):
                     verify(broken)
-        spec=importlib.util.spec_from_file_location('retirement_operation_contract',
-                                                 ROOT/'tests/cycle-private-retirement.py')
-        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
-        self.assertEqual(driver.HEAP_BYTES,4194304)
-        self.assertEqual(len(driver.operation_plan('system',1)),38)
-        self.assertEqual(len(driver.operation_plan('fixed',32)),36)
-        self.assertEqual(len(driver.operation_plan('eager',32)),16)
-        for mode in driver.QUEUED:
+        driver=str(ROOT/'build/tooling/tests/cycle-private-retirement')
+        windows=dict(os.environ,MINYAR_CYCLE_HOST='Windows')
+        def query(*arguments,env=None):
+            return subprocess.run([driver,*arguments],cwd=ROOT,env=env,capture_output=True,text=True,timeout=60)
+        def operation_plan(profile,budget):
+            result=query('--plan',profile,str(budget))
+            self.assertEqual(result.returncode,0,result.stderr)
+            return [line.split(' ') for line in result.stdout.splitlines()]
+        def validate_failure_control(status,stdout,stderr,timedout=False):
+            with tempfile.TemporaryDirectory(prefix='retirement failure control ') as folder:
+                out=Path(folder)/'stdout';err=Path(folder)/'stderr'
+                out.write_bytes(stdout);err.write_bytes(stderr)
+                result=query('--validate-failure-control',str(status),'true' if timedout else 'false',str(out),str(err))
+            if result.returncode==1:raise AssertionError(result.stderr)
+            self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(query('--heap-bytes').stdout,'4194304\n')
+        self.assertEqual(len(operation_plan('system',1)),38)
+        self.assertEqual(len(operation_plan('fixed',32)),36)
+        self.assertEqual(len(operation_plan('eager',32)),16)
+        for mode in ('phase','local-mark','local-sweep','full-mark','full-sweep','transfer','drop','rebuild'):
             for recent in ('0','1'):
-                self.assertIn(['32','queued',mode,recent],driver.operation_plan('fixed',32))
+                self.assertIn(['32','queued',mode,recent],operation_plan('fixed',32))
         for mode in ('active-local','active-full'):
             for phase in ('1','2','3'):
-                self.assertIn(['32',mode,phase],driver.operation_plan('system',1024))
+                self.assertIn(['32',mode,phase],operation_plan('system',1024))
         for n in (32,256,2048):
-            self.assertIn([str(n),'private','assert-local'],driver.operation_plan('system',1))
+            self.assertIn([str(n),'private','assert-local'],operation_plan('system',1))
         self.assertFalse(any(row[1] in ('queued','certificate','reuse','unknown-after-drop')
-                             for row in driver.operation_plan('eager',32)))
-        self.assertEqual(driver.profile_selection(None,True)[0],['system','fixed','eager'])
-        with self.assertRaises(ValueError):driver.profile_selection(['lazy'],True)
+                             for row in operation_plan('eager',32)))
+        selected=query('--profile-selection',env=windows)
+        self.assertEqual(selected.returncode,0,selected.stderr)
+        self.assertEqual(selected.stdout.splitlines()[0],'profiles system fixed eager')
+        self.assertEqual(query('--profile-selection','lazy',env=windows).returncode,2)
         red=b'IDLE label=private n=32 rounds=8 units=1136 epochs=8\nAssertion work <= 16u * rounds + 64u failed\n'
-        driver.validate_failure_control(-6,b'',red)
+        validate_failure_control(-6,b'',red)
         for status,stdout,stderr,timedout in ((0,b'',red,False),(-6,b'output',red,False),
                 (-6,b'',red,True),(-6,b'',red.replace(b'1136',b'128'),False),
                 (-6,b'',red.replace(b'work <= 16u * rounds + 64u',b'unrelated assertion'),False)):
             with self.assertRaises(AssertionError):
-                driver.validate_failure_control(status,stdout,stderr,timedout)
+                validate_failure_control(status,stdout,stderr,timedout)
         catalogue=native_catalogue()
         data=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data,ROOT)
-        for name in ('tests/cycle-private-retirement.py','tests/cycle-idle-invalidation.c',
+        for name in ('tests/cycle-idle-invalidation.c',
                      'tests/cycle-private-retirement-v5.json','tests/generated-llvm-sanitizer.py',
                      'tests/generated-llvm-sanitizer.min'):
             omitted=dict(data,sources=[row for row in data['sources'] if row['path']!=name])
@@ -1294,7 +1307,8 @@ class BuildWiring(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix='minyar registration wiring ') as folder:
                 makefile = Path(folder) / 'probe.mk'
                 makefile.write_text(text + '\n.PHONY: build/minyarc-errors build/minyarc-errors-sanitize\n'
-                                   'build/minyarc-errors build/minyarc-errors-sanitize:\n\t@echo ARTIFACT $@\n')
+                                   'build/minyarc-errors build/minyarc-errors-sanitize:\n\t@echo ARTIFACT $@\n'
+                                   'build/tooling/%:\n\t@echo TOOL $@\n')
                 env = dict(os.environ)
                 env.pop('MAKEFLAGS', None)
                 result = subprocess.run(
@@ -1312,13 +1326,13 @@ class BuildWiring(unittest.TestCase):
                 self.assertIn(sanitize, rules.get('check-sanitize', set()))
                 fixtures = {'tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c',
                             'tests/cycle-late-registration.min', 'tests/cycle-additive.c',
-                            'tests/cycle-registration.py', 'tools/cycle_runtime.py'}
+                            'build/tooling/tests/cycle-registration', 'build/tooling/tests/errors-language'}
                 for target in both:
                     self.assertTrue(fixtures <= rules.get(target, set()), target)
                 self.assertIn('build/minyarc-errors', rules[native])
                 self.assertIn('build/minyarc-errors-sanitize', rules[sanitize])
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('tests/cycle-registration.py'), 2)
+                self.assertEqual(commands.count('./build/tooling/tests/cycle-registration --'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
                 self.assertNotIn('--nodes', commands)
                 self.assertIn('cycle-registration-exposure-native', commands)
@@ -1334,12 +1348,6 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
                 verify(source.replace(line, '', 1))
 
-        def load(name, path):
-            spec = importlib.util.spec_from_file_location(name, ROOT / path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-
         for target in (native, sanitize):
             self.assertEqual(linux_targets().count(target), 1)
         for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c'):
@@ -1348,32 +1356,38 @@ class BuildWiring(unittest.TestCase):
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
         for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c',
-                        'tests/cycle-late-registration.min', 'tests/cycle-registration.py'):
+                        'tests/cycle-late-registration.min'):
             self.assertIn(fixture, catalogue.discover(ROOT))
             with self.subTest(uncatalogued=fixture), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[row for row in data['sources']
                                                        if row['path'] != fixture]), ROOT)
-        driver = load('registration_driver', 'tests/cycle-registration.py')
-        import inspect
-        language = driver.load('registration_inspection_control', 'tests/errors-language.py')
-        self.assertEqual(Path(inspect.getsourcefile(language.ErrorsLanguage)),
-                         ROOT / 'tests/errors-language.py')
-        with patch('clang_helpers.platform.system', return_value='Windows'):
-            profiles, unsupported = driver.profile_selection(None, True)
-            self.assertEqual(profiles, ['system', 'fixed', 'eager'])
-            self.assertEqual(unsupported[0]['profile'], 'lazy')
-            with self.assertRaises(ValueError):
-                driver.profile_selection(['lazy'], True)
-        with patch.object(driver, 'windows_host', return_value=True), \
-                patch.object(sys, 'argv', ['cycle-registration.py', '--profiles', 'lazy',
-                                         '--evidence', 'unused']), \
-                self.assertRaises(SystemExit) as unsupported_exit:
-            driver.main()
-        self.assertEqual(unsupported_exit.exception.code, 2)
-        # These schedules are built into main(void), not runtime graph sizes.
-        self.assertFalse(driver.build_parser().parse_args(['--evidence', 'out']).__dict__.get('nodes'))
-        with self.assertRaises(SystemExit):
-            driver.build_parser().parse_args(['--evidence', 'out', '--nodes', '2048'])
+        selector = 'test_result_callback_cycles_in_both_payload_slots_are_collected'
+        registration = (ROOT / 'tests/cycle-registration.min').read_text()
+        self.assertIn('"build/tooling/tests/errors-language", "ErrorsLanguage.' + selector + '"', registration)
+        self.assertIn('fixtures.selected("ErrorsLanguage", "' + selector + '")',
+                      (ROOT / 'tests/errors-language.min').read_text())
+        driver = str(ROOT / 'build/tooling/tests/cycle-registration')
+        windows = dict(os.environ, MINYAR_CYCLE_HOST='Windows')
+        with tempfile.TemporaryDirectory(prefix='minyar registration driver ') as folder:
+            selected = subprocess.run([driver, '--profile-selection'], cwd=folder, env=windows,
+                                      capture_output=True, text=True, timeout=60)
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            lines = selected.stdout.splitlines()
+            self.assertEqual(lines[0], 'profiles system fixed eager')
+            self.assertEqual(json.loads(lines[1][len('unsupported '):])['profile'], 'lazy')
+            refused = subprocess.run([driver, '--profile-selection', 'lazy'], cwd=folder, env=windows,
+                                     capture_output=True, text=True, timeout=60)
+            self.assertEqual(refused.returncode, 2)
+            unsupported = subprocess.run([driver, '--profiles', 'lazy', '--evidence', 'unused'],
+                                         cwd=folder, env=dict(windows, MINYAR_CYCLE_HOST='MINGW64_NT-10.0'),
+                                         capture_output=True, text=True, timeout=60)
+            self.assertEqual(unsupported.returncode, 2, unsupported.stderr)
+            self.assertFalse((Path(folder) / 'unused').exists())
+            # These schedules are built into main(void), not runtime graph sizes.
+            nodes = subprocess.run([driver, '--evidence', 'out', '--nodes', '2048'], cwd=folder,
+                                   capture_output=True, text=True, timeout=60)
+            self.assertEqual(nodes.returncode, 2, nodes.stderr)
+            self.assertFalse((Path(folder) / 'out').exists())
 
     def test_registered_growth_is_mandatory_with_native_and_sanitizer_drivers(self):
         import re
@@ -1401,7 +1415,7 @@ class BuildWiring(unittest.TestCase):
                 self.assertIn('tests/cycle-registry-growth.c', rules.get(target, set()), target)
                 self.assertIn('tests/cycle-additive.c', rules.get(target, set()), target)
             commands = dry_run_commands(result.stdout)
-            self.assertEqual(commands.count('tests/cycle-additive.py'), 2)
+            self.assertEqual(commands.count('./build/tooling/tests/cycle-additive --fixture'), 2)
             self.assertEqual(commands.count('--fixture cycle-registry-growth.c'), 2)
             self.assertEqual(commands.count('--sanitize'), 1)
             self.assertIn('cycle-registry-growth-native', commands)
