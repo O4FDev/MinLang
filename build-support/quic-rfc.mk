@@ -3,7 +3,7 @@
 QUIC_RFC_FRONTENDS = build/minyarc build/minyarc-callbacks build/minyarc-errors-request build/minyarc-errors
 QUIC_RFC_INPUTS = minyar build/tooling/tools/clang-driver tools/llvm-sanitizer.min \
     build/tooling/tests/quic-rfc tests/quic-rfc.min build/tooling/tests/quic-rfc-harness tests/quic-rfc-harness.min \
-    tests/quic-protocol-artifacts.min tests/interop/qns/endpoint.py library/quic.min library/tls.min library/tlsserver.min \
+    tests/quic-protocol-artifacts.min tests/interop/qns/endpoint.min library/quic.min library/tls.min library/tlsserver.min \
     build/tooling/tests/quic-migration-cids-test tests/quic-migration-cids-test.min tests/quic-migration-cids.min \
     build/tooling/tests/quic-cipher-policy-test tests/quic-cipher-policy-test.min tests/quic-cipher-policy.min \
     tests/quic-protocol-support.min tests/quic-test-support.min tests/quic-json.min tools/testing.min \
@@ -17,7 +17,7 @@ $(QUIC_PROTOCOL_DRIVERS): TOOL_NATIVE = runtime/native/net.c runtime/native/sha2
 $(QUIC_PROTOCOL_DRIVERS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(QUIC_PROTOCOL_DRIVERS): runtime/native/net.c runtime/native/sha256.c
 
-check-quic-protocol-artifacts: build/tooling/tests/quic-protocol-artifacts build/tooling/tests/quic-qns-local build/tooling/tests/quic-vn-probe tests/quic-protocol-artifacts.min tests/quic-protocol-support.min tests/quic-qns-local.min tests/quic-vn-probe.min tests/interop/qns/endpoint.py | build
+check-quic-protocol-artifacts: build/tooling/tests/quic-protocol-artifacts build/tooling/tests/quic-qns-local build/tooling/tests/quic-vn-probe tests/quic-protocol-artifacts.min tests/quic-protocol-support.min tests/quic-qns-local.min tests/quic-vn-probe.min tests/interop/qns/endpoint.min | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-protocol-artifacts.XXXXXXXX"); $(LIMITED) ./build/tooling/tests/quic-protocol-artifacts --artifacts "$$artifacts/run"
 
 check-quic-rfc: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build

@@ -592,7 +592,7 @@ class BuildWiring(unittest.TestCase):
         inputs={'build/tooling/tests/quic-protocol-artifacts','build/tooling/tests/quic-qns-local',
                 'build/tooling/tests/quic-vn-probe','tests/quic-protocol-artifacts.min',
                 'tests/quic-protocol-support.min','tests/quic-qns-local.min','tests/quic-vn-probe.min',
-                'tests/interop/qns/endpoint.py'}
+                'tests/interop/qns/endpoint.min'}
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='QUIC owned lifecycle rules ') as folder:
                 makefile=Path(folder)/'probe.mk'
@@ -647,7 +647,7 @@ class BuildWiring(unittest.TestCase):
                   'build/tooling/tests/quic-rfc', 'tests/quic-rfc.min',
                   'build/tooling/tests/quic-rfc-harness', 'tests/quic-rfc-harness.min',
                   'tests/quic-protocol-artifacts.min',
-                  'tests/interop/qns/endpoint.py', 'library/quic.min', 'library/tls.min',
+                  'tests/interop/qns/endpoint.min', 'library/quic.min', 'library/tls.min',
                   'library/tlsserver.min', 'build/tooling/tests/quic-migration-cids-test',
                   'tests/quic-migration-cids-test.min', 'tests/quic-migration-cids.min',
                   'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
@@ -733,7 +733,7 @@ class BuildWiring(unittest.TestCase):
                   'build/tooling/tests/quic-rfc', 'tests/quic-rfc.min', 'build/tooling/tests/quic-rfc-harness',
                   'tests/quic-rfc-harness.min', 'tests/quic-protocol-artifacts.min', 'tests/quic-json.min',
                   'build/tooling/tests/quic-qns-local', 'tests/quic-qns-local.min',
-                  'build/tooling/tests/quic-vn-probe', 'tests/quic-vn-probe.min'}
+                  'build/tooling/tests/quic-vn-probe', 'tests/quic-vn-probe.min', 'tests/interop/qns/endpoint.min'}
         for name in sorted(inputs - native - {'minyar', 'build/tooling/tools/clang-driver',
                                               'tools/llvm-sanitizer.min', 'library/quic.min',
                                               'library/tls.min', 'library/tlsserver.min'}):
@@ -1621,8 +1621,8 @@ class BuildWiring(unittest.TestCase):
                   'scripts/check-quic-official-inputs.py',
                   'tests/quic-simulator-shutdown.min',
                   'tests/interop/qns/simulator-shutdown.sh',
-                  'tests/quic-qns-endpoint-lifecycle.py',
-                  'tests/interop/qns/endpoint.py'}
+                  'tests/quic-qns-endpoint-lifecycle.min',
+                  'tests/interop/qns/endpoint.min'}
         aggregates = ('check', 'check-portable', 'check-quic', 'check-quic-sanitize',
                       'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-sanitize')
 

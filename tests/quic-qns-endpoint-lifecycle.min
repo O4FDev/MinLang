@@ -1,0 +1,75 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+
+constant IGNORE = "trap '' TERM INT; exec \"$@\""
+
+function mask(status: Text, field: Text): Integer {
+    for line in test.lines(status) {
+        let fields = test.words(line)
+        if fields.length == 2 && fields[0] == field + ":" {
+            let value = 0
+            for byte in Bytes(fields[1]) {
+                let digit = byte - 48
+                if byte >= 97 { digit = byte - 87 }
+                value = value * 16 + digit
+            }
+            return value
+        }
+    }
+    return -1
+}
+function handled(pid: Integer): Boolean {
+    let path = "/proc/" + Text(pid) + "/status"
+    if files.pathSize(path) < 0 { return false }
+    let caught = mask(Text(files.readFile(path)), "SigCgt")
+    return caught >= 0 && caught & 16386 == 16386
+}
+function run(endpoint: Text, work: Text, signal: Integer, name: Text, ignored: Boolean, source: Text) {
+    let environment = quic.setting(quic.setting(system.environment(), "TESTCASE", "handshake"), "ROLE", "server")
+    let handle = system.spawn("/bin/sh", ["sh", "-c", IGNORE, "minyar", endpoint, "--network-ready", work + "/network-ready"], environment, "")
+    test.check(handle > 0, "cannot start endpoint")
+    let pid = system.childProcessId(handle)
+    let limit = system.monotonicNanoseconds() + 3000000000
+    let status = system.poll(handle)
+    while status.state == system.PENDING && !handled(pid) && system.monotonicNanoseconds() < limit {
+        quic.pause(10)
+        status = system.poll(handle)
+    }
+    if status.state != system.PENDING || !handled(pid) {
+        if status.state == system.PENDING { system.sendSignal(pid, 9); system.wait(handle) }
+        fail("endpoint did not reach its readiness wait")
+    }
+    test.check(system.sendSignal(pid, signal) == 0, "cannot signal endpoint")
+    limit = system.monotonicNanoseconds() + 2000000000
+    status = system.poll(handle)
+    while status.state == system.PENDING && system.monotonicNanoseconds() < limit {
+        quic.pause(10)
+        status = system.poll(handle)
+    }
+    let shown = "null"
+    let code = -1
+    if status.state == system.PENDING {
+        system.sendSignal(pid, 9)
+        system.wait(handle)
+    } else if status.state == system.EXITED { code = status.exitCode; shown = Text(code) }
+    else { code = -status.signal; shown = Text(code) }
+    print("{\"signal\": \"" + name + "\", \"observed\": {\"waiting\": true, \"term_ignored\": " + Text(ignored) + "}, \"exit_status\": " + shown + ", \"source_sha256\": \"" + source + "\"}")
+    if code != 128 + signal { fail("endpoint ignored shutdown while awaiting network") }
+}
+
+let source = "tests/interop/qns/endpoint.min"
+if argumentCount() == 2 && argument(0) == "--endpoint" { source = argument(1) }
+else { test.check(argumentCount() == 0, "usage: quic-qns-endpoint-lifecycle [--endpoint SOURCE]") }
+let work = test.scratch()
+let endpoint = quic.program(source, work + "/endpoint", false)
+let probe = test.run(["/bin/sh", "-c", IGNORE, "minyar", "cat", "/proc/self/status"], system.environment(), "", work + "/probe", 10)
+test.require(probe, "ignored-signal probe")
+let ignoredMask = mask(probe.output, "SigIgn")
+let ignored = ignoredMask >= 0 && ignoredMask & 16386 == 16386
+test.check(ignored, "PID 1 signal emulation did not ignore SIGTERM and SIGINT")
+let digest = quic.digest(source, work + "/source")
+run(endpoint, work, 15, "SIGTERM", ignored, digest)
+run(endpoint, work, 2, "SIGINT", ignored, digest)
+test.removeTree(work)

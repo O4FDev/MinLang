@@ -1,0 +1,284 @@
+use "system" as system
+use "files" as files
+use "eventloop" as eventloop
+use "errors" as errors
+
+constant CASES: List<Text> = ["handshake", "transfer", "retry", "resumption", "zerortt", "multiconnect", "rebind-port", "rebind-addr", "chacha20", "keyupdate", "connectionmigration"]
+
+record Loop { handle: Integer; socket: Integer; pending: Integer }
+
+function known(name: Text): Boolean {
+    let cases = CASES
+    for value in cases { if value == name { return true } }
+    return false
+}
+function wait(state: Loop, milliseconds: Integer) {
+    eventloop.wait(state.handle, milliseconds, 4)
+    let signal = system.drainShutdownSignals()
+    if signal != 0 { state.pending = signal }
+}
+function run(command: List<Text>): Integer {
+    let argv = ["sh", "-c", "exec \"$@\" >/dev/null 2>&1", "minyar"]
+    for value in command { argv.add(value) }
+    let handle = system.spawn("/bin/sh", argv, system.environment(), "")
+    if handle <= 0 { return -1 }
+    let status = system.wait(handle)
+    if status.state != system.EXITED { return -1 }
+    return status.exitCode
+}
+function capture(command: List<Text>, scratch: Text): Text {
+    let log = scratch + "/capture-" + Text(system.monotonicNanoseconds())
+    let argv = ["sh", "-c", "out=$1; shift; exec \"$@\" >\"$out\" 2>/dev/null", "minyar", log]
+    for value in command { argv.add(value) }
+    let handle = system.spawn("/bin/sh", argv, system.environment(), "")
+    if handle <= 0 { return "" }
+    let status = system.wait(handle)
+    if status.state != system.EXITED || status.exitCode != 0 { return "" }
+    return Text(files.readFile(log))
+}
+function openssl(arguments: List<Text>): Boolean {
+    let command = ["openssl"]
+    for value in arguments { command.add(value) }
+    return run(command) == 0
+}
+function words(text: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(text)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        let space = index == raw.length
+        if index < raw.length { space = raw[index] <= 32 }
+        if space {
+            if start < index { result.add(Text(raw.slice(start, index))) }
+            start = index + 1
+        }
+    }
+    return result
+}
+function finish(scratch: Text, status: Integer): Integer {
+    if scratch != "" { run(["rm", "-rf", "--", scratch]) }
+    exit(status)
+}
+function hex(raw: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes()
+    for byte in raw { result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+    return Text(result)
+}
+function octet(text: Text): Integer {
+    let raw = Bytes(text)
+    if raw.length == 0 || raw.length > 3 { return -1 }
+    let value = 0
+    for byte in raw { if byte < 48 || byte > 57 { return -1 }; value = value * 10 + byte - 48 }
+    if value > 255 { return -1 }
+    return value
+}
+function packedV4(text: Text): Text {
+    let parts = text.split(".")
+    if parts.length != 4 { return "" }
+    let raw = Bytes()
+    for part in parts {
+        let value = octet(part)
+        if value < 0 { return "" }
+        raw.add(value)
+    }
+    return hex(raw)
+}
+function digit(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    return -1
+}
+function groups(text: Text): List<Integer> {
+    let result: List<Integer> = []
+    if text == "" { return result }
+    for part in text.split(":") {
+        let raw = Bytes(part)
+        if raw.length == 0 || raw.length > 4 { return [-1] }
+        let value = 0
+        for byte in raw { if digit(byte) < 0 { return [-1] }; value = value * 16 + digit(byte) }
+        result.add(value)
+    }
+    return result
+}
+function packedV6(text: Text): Text {
+    let address = text
+    let zone = address.find("%")
+    if zone >= 0 { address = address.slice(0, zone) }
+    let values: List<Integer> = []
+    let marker = address.find("::")
+    if marker >= 0 {
+        let head = groups(address.slice(0, marker))
+        let tail = groups(address.slice(marker + 2, address.length))
+        if head.length + tail.length > 7 { return "" }
+        for value in head { values.add(value) }
+        for index in 0..(8 - head.length - tail.length) { values.add(0) }
+        for value in tail { values.add(value) }
+    } else { values = groups(address) }
+    if values.length != 8 { return "" }
+    let raw = Bytes()
+    for value in values {
+        if value < 0 { return "" }
+        raw.add(value >> 8)
+        raw.add(value & 255)
+    }
+    return hex(raw)
+}
+function resolve(database: Text, host: Text, scratch: Text): Text {
+    let output = capture(["getent", database, host], scratch)
+    for line in output.split("\n") {
+        let fields = line.trim().split(" ")
+        if fields.length > 0 && fields[0] != "" { return fields[0] }
+    }
+    return ""
+}
+function certificates(pem: Text): List<Text> {
+    let result: List<Text> = []
+    let begin = "-----BEGIN CERTIFICATE-----"
+    let end = "-----END CERTIFICATE-----"
+    let rest = pem
+    while true {
+        let start = rest.find(begin)
+        if start < 0 { break }
+        let after = rest.slice(start + begin.length, rest.length)
+        let stop = after.find(end)
+        if stop < 0 { break }
+        result.add(begin + after.slice(0, stop) + end)
+        rest = after.slice(stop + end.length, after.length)
+    }
+    return result
+}
+function validPath(path: Text): Boolean {
+    let raw = Bytes(path)
+    if raw.length < 2 || raw.length > 256 || raw[0] != 47 { return false }
+    for index in 1..raw.length {
+        let byte = raw[index]
+        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45) { return false }
+    }
+    return true
+}
+record Url { valid: Boolean; host: Text; port: Integer; path: Text }
+function lower(text: Text): Text {
+    let raw = Bytes(text)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] = raw[index] + 32 } }
+    return Text(raw)
+}
+function url(text: Text): Url {
+    let invalid = Url { valid: false; host: ""; port: 0; path: "" }
+    if !lower(text).startsWith("https://") || text.find("?") >= 0 || text.find("#") >= 0 { return invalid }
+    let rest = text.slice(8, text.length)
+    let slash = rest.find("/")
+    let netloc = rest
+    let path = ""
+    if slash >= 0 { netloc = rest.slice(0, slash); path = rest.slice(slash, rest.length) }
+    let at = netloc.find("@")
+    if at >= 0 { netloc = netloc.slice(at + 1, netloc.length) }
+    let host = netloc
+    let port = -1
+    if netloc.startsWith("[") {
+        let close = netloc.find("]")
+        if close < 0 { return invalid }
+        host = netloc.slice(1, close)
+        let tail = netloc.slice(close + 1, netloc.length)
+        if tail != "" {
+            if !tail.startsWith(":") { return invalid }
+            port = number(tail.slice(1, tail.length))
+            if port == -2 { return invalid }
+        }
+    } else {
+        let colon = netloc.find(":")
+        if colon >= 0 {
+            host = netloc.slice(0, colon)
+            port = number(netloc.slice(colon + 1, netloc.length))
+            if port == -2 { return invalid }
+        }
+    }
+    return Url { valid: true; host: lower(host); port: port; path: path }
+}
+function number(text: Text): Integer {
+    let raw = Bytes(text)
+    if raw.length == 0 { return -1 }
+    if raw.length > 5 { return -2 }
+    let value = 0
+    for byte in raw { if byte < 48 || byte > 57 { return -2 }; value = value * 10 + byte - 48 }
+    if value > 65535 { return -2 }
+    return value
+}
+
+let ready = "/tmp/network-ready"
+if argumentCount() == 2 && argument(0) == "--network-ready" { ready = argument(1) }
+let testcase = system.getenv("TESTCASE")
+if !known(testcase) { exit(127) }
+let role = system.getenv("ROLE")
+if role == "" && system.lastError() != 0 { exit(1) }
+let socket = system.shutdownSignalSocket()
+if socket < 0 { exit(1) }
+let created = eventloop.create()
+if !errors.integerOk(created) { exit(1) }
+let state = Loop { handle: errors.integerValue(created); socket: socket; pending: 0 }
+if !errors.integerOk(eventloop.watch(state.handle, socket, eventloop.readableInterest(), 1)) { exit(1) }
+while files.pathSize(ready) < 0 {
+    wait(state, 50)
+    if state.pending != 0 { exit(128 + state.pending) }
+}
+if state.pending != 0 { exit(128 + state.pending) }
+let scratch = "/tmp/minyar-qns-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+if files.pathSize(scratch) >= 0 || files.makeDirectory(scratch) != 0 { exit(1) }
+let root = scratch + "/root.der"
+if !openssl(["x509", "-in", "/certs/ca.pem", "-outform", "DER", "-out", root]) { finish(scratch, 1) }
+let log = system.getenv("SSLKEYLOGFILE")
+if log == "" { log = "/logs/keys.log" }
+let parent = log
+let position = -1
+let raw = Bytes(log)
+for index in 0..raw.length { if raw[index] == 47 { position = index } }
+if position > 0 { parent = Text(raw.slice(0, position)) } else { parent = "." }
+if run(["mkdir", "-p", "--", parent]) != 0 { finish(scratch, 1) }
+let command: List<Text> = []
+if role == "server" {
+    let key = scratch + "/key.der"
+    if !openssl(["pkcs8", "-topk8", "-nocrypt", "-in", "/certs/priv.key", "-outform", "DER", "-out", key]) { finish(scratch, 1) }
+    let chain = certificates(Text(files.readFile("/certs/cert.pem")))
+    if chain.length == 0 || chain.length > 16 { finish(scratch, 1) }
+    command = ["/opt/minyar/server", key, root, log, "/www", testcase]
+    for index in 0..chain.length {
+        let source = scratch + "/" + Text(index) + ".pem"
+        let der = scratch + "/" + Text(index) + ".der"
+        writeTextFile(source, chain[index])
+        if !openssl(["x509", "-in", source, "-outform", "DER", "-out", der]) { finish(scratch, 1) }
+        command.add(der)
+    }
+    if testcase == "connectionmigration" {
+        let v4 = packedV4(resolve("ahostsv4", "server4", scratch))
+        let v6 = packedV6(resolve("ahostsv6", "server6", scratch))
+        if v4 == "" || v6 == "" { finish(scratch, 1) }
+        command.add("--preferred-ipv4=" + v4)
+        command.add("--preferred-ipv6=" + v6)
+        command.add("--preferred-port=444")
+    }
+} else {
+    let requests: List<Url> = []
+    for item in words(system.getenv("REQUESTS")) { requests.add(url(item)) }
+    if requests.length == 0 || requests.length > 1999 { finish(scratch, 1) }
+    for item in requests {
+        if !item.valid || item.host != requests[0].host || item.port != requests[0].port || !validPath(item.path) { finish(scratch, 1) }
+    }
+    let port = requests[0].port
+    if port <= 0 { port = 443 }
+    command = ["/opt/minyar/client", root, requests[0].host, Text(port), log, "/downloads", testcase]
+    for item in requests { command.add(item.path.slice(1, item.path.length)) }
+}
+let handle = system.spawn(command[0], command, system.environment(), "")
+if handle <= 0 { finish(scratch, 1) }
+let child = system.childProcessId(handle)
+let status = system.poll(handle)
+if state.pending != 0 && status.state == system.PENDING { system.sendSignal(child, state.pending) }
+while status.state == system.PENDING {
+    state.pending = 0
+    wait(state, 50)
+    status = system.poll(handle)
+    if state.pending != 0 && status.state == system.PENDING { system.sendSignal(child, state.pending) }
+}
+if status.state == system.SIGNALED { finish(scratch, 128 + status.signal) }
+finish(scratch, status.exitCode)

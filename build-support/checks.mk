@@ -707,7 +707,6 @@ $(QUIC_INTEROP_TOOLS): runtime/native/sha256.c
 check-quic-interop-results: build/tooling/tests/quic-interop-results
 	./build/tooling/tests/quic-interop-results
 
-
 check check-portable check-quic check-quic-sanitize: check-quic-interop-results
 
 # Native suite levels are independent children so a parallel runner overlaps them.

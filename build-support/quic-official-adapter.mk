@@ -6,7 +6,7 @@ QUIC_OFFICIAL_PYTHON ?= $(abspath build)/quic-official-controls-venv/bin/python
 QUIC_OFFICIAL_INPUTS = tests/quic-official-adapter.py tests/interop/qns/owned_adapter.py \
     scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt \
     tests/quic-simulator-shutdown.min tests/interop/qns/simulator-shutdown.sh \
-    tests/quic-qns-endpoint-lifecycle.py tests/interop/qns/endpoint.py
+    tests/quic-qns-endpoint-lifecycle.min tests/interop/qns/endpoint.min
 QUIC_OFFICIAL_RUNNER_BOOTSTRAP = $(if $(filter $(abspath build)/quic-interop-runner-740c05a.git,$(QUIC_OFFICIAL_RUNNER)),build/quic-interop-runner-740c05a.git/.ready.json)
 QUIC_OFFICIAL_PYTHON_BOOTSTRAP = $(if $(filter $(abspath build)/quic-official-controls-venv/bin/python,$(QUIC_OFFICIAL_PYTHON)),build/quic-official-controls-venv/.ready.json)
 QUIC_OFFICIAL_HOST := $(if $(filter Windows_NT,$(OS)),unsupported,$(shell uname -s))
@@ -23,8 +23,9 @@ build/tooling/tests/quic-simulator-shutdown.ll: tests/quic-test-support.min
 check-quic-simulator-shutdown: build/tooling/tests/quic-simulator-shutdown tests/quic-simulator-shutdown.min tests/interop/qns/simulator-shutdown.sh | build
 	$(LIMITED) ./build/tooling/tests/quic-simulator-shutdown
 
-check-quic-qns-endpoint-lifecycle: tests/quic-qns-endpoint-lifecycle.py tests/interop/qns/endpoint.py $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
-	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/quic-qns-endpoint-lifecycle.py
+build/tooling/tests/quic-qns-endpoint-lifecycle.ll: tests/quic-test-support.min
+check-quic-qns-endpoint-lifecycle: build/tooling/tests/quic-qns-endpoint-lifecycle build/minyarc tests/quic-qns-endpoint-lifecycle.min tests/interop/qns/endpoint.min | build
+	$(LIMITED) ./build/tooling/tests/quic-qns-endpoint-lifecycle
 
 check-quic-official-adapter: check-quic-simulator-shutdown check-quic-qns-endpoint-lifecycle
 check-quic-official-adapter: $(QUIC_OFFICIAL_INPUTS) $(QUIC_OFFICIAL_RUNNER_BOOTSTRAP) $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
