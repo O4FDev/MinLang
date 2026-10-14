@@ -45,6 +45,12 @@ static long long launch(const char *path, const char **args, size_t argc, const 
     long long handle = minyar_system_spawnNative(&p, a, e, &working, uid, gid, groups, credentials);
     test_release(a); test_release(e); return handle;
 }
+static long long session_launch(const char *path, const char **args, size_t argc, const char *cwd) {
+    MinyarText p = test_text(path), working = test_text(cwd);
+    MinyarBytes *a = pack(args, argc), *e = pack(NULL, 0);
+    long long handle = minyar_system_spawnSessionNative(&p, a, e, &working);
+    test_release(a); test_release(e); return handle;
+}
 static void exited(long long handle, long long exit_code) {
     static unsigned ordinal;
     ordinal++;
@@ -98,6 +104,16 @@ static int child(int argc, char **argv) {
 #else
         assert(fcntl(atoi(argv[2]), F_GETFD) == -1 && errno == EBADF);
         assert(fcntl(atoi(argv[3]), F_GETFD) >= 0);
+#endif
+    } else if (!strcmp(argv[1], "child-session") || !strcmp(argv[1], "child-session-sleep")) {
+#ifndef _WIN32
+        assert(getsid(0) == getpid() && getpgrp() == getpid());
+        if (argc == 3) { char cwd[4096]; test_cwd(cwd, sizeof(cwd)); assert(!strcmp(cwd, argv[2])); }
+        if (!strcmp(argv[1], "child-session-sleep")) sleep(1);
+#endif
+    } else if (!strcmp(argv[1], "child-inherited-session")) {
+#ifndef _WIN32
+        assert(getsid(0) != getpid() && getpgrp() != getpid());
 #endif
     } else if (!strcmp(argv[1], "child-sleep")) {
 #ifdef _WIN32
@@ -208,8 +224,32 @@ static int process_main(int argc, char **argv) {
     exited(launch(argv[0], fd_args, 3, NULL, 0, "", -1, -1, groups, false), 0); CloseHandle(fd);
     simple[1] = "child-exit";
     assert(launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, true) == -ENOTSUP);
+    simple[1] = "child-session";
+    assert(session_launch(argv[0], simple, 2, "") == -ENOTSUP);
     (void)second;
 #else
+    const char *session_args[] = {"custom name", "child-session", argv[2]};
+    exited(session_launch(argv[0], session_args, 2, ""), 0);
+    exited(session_launch(argv[0], session_args, 3, argv[2]), 0);
+    session_args[1] = "child-inherited-session";
+    exited(launch(argv[0], session_args, 2, NULL, 0, "", -1, -1, groups, false), 0);
+    session_args[1] = "child-session-sleep";
+    long long leader = session_launch(argv[0], session_args, 2, "");
+    assert(leader > 0);
+    pid_t leader_pid = (pid_t)minyar_system_childProcessId(leader);
+    assert(leader_pid > 0 && getpgid(leader_pid) == leader_pid && getsid(leader_pid) == leader_pid && getsid(0) != leader_pid);
+    exited(leader, 0);
+    session_args[1] = "child-session";
+    assert(session_launch("/minyar/no-such-executable", session_args, 2, "") == -ENOENT);
+    assert(session_launch(argv[0], session_args, 2, "/minyar/no-such-directory") == -ENOENT);
+    assert(session_launch(argv[0], NULL, 0, "") == -EINVAL);
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+    SystemProcess cloned = {0};
+    char *clone_args[] = {"custom name", "child-session", argv[2], NULL}, *clone_env[] = {NULL};
+    assert(!system_clone_spawn(&cloned, argv[0], clone_args, clone_env, argv[2], -1, -1, NULL, 0, false, true));
+    int cloned_status = 0;
+    assert(waitpid(cloned.pid, &cloned_status, 0) == cloned.pid && WIFEXITED(cloned_status) && WEXITSTATUS(cloned_status) == 0);
+#endif
     uid_t parent_uid = getuid(), parent_euid = geteuid();
     gid_t parent_gid = getgid(), parent_egid = getegid(), parent_groups[SYSTEM_VECTOR_COUNT], after_groups[SYSTEM_VECTOR_COUNT];
     int parent_count = getgroups(SYSTEM_VECTOR_COUNT, parent_groups); assert(parent_count >= 0);

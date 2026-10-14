@@ -184,7 +184,7 @@ typedef struct SystemChild {
     const gid_t *groups;
     size_t group_count;
     long long uid, gid;
-    bool credentials;
+    bool credentials, session;
     uint64_t mask;
     SystemKernelAction defaults;
     volatile int error;
@@ -203,6 +203,10 @@ static SYSTEM_CHILD int system_clone_child(void *pointer) {
             result = system_raw(SYS_rt_sigaction, signal, (long)&child->defaults, 0, 8);
             if (result < 0) goto failed;
         }
+    }
+    if (child->session) {
+        result = system_raw(SYS_setsid, 0, 0, 0, 0);
+        if (result < 0) goto failed;
     }
     if (*child->cwd) {
         result = system_raw(SYS_chdir, (long)child->cwd, 0, 0, 0);
@@ -228,7 +232,7 @@ failed:
     for (;;) system_raw(SYS_exit, 127, 0, 0, 0);
 }
 static int system_clone_spawn(SystemProcess *process, const char *path, char **argv, char **envp,
-                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials) {
+                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials, bool session) {
     long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) return EIO;
     size_t size = 128 * 1024 + (size_t)page;
@@ -236,7 +240,7 @@ static int system_clone_spawn(SystemProcess *process, const char *path, char **a
     if (stack == MAP_FAILED) return errno;
     if (mprotect(stack, (size_t)page, PROT_NONE)) { int error = errno; munmap(stack, size); return error; }
     SystemChild child = {.path=path, .cwd=cwd, .argv=argv, .envp=envp, .groups=groups,
-        .group_count=count, .uid=uid, .gid=gid, .credentials=credentials};
+        .group_count=count, .uid=uid, .gid=gid, .credentials=credentials, .session=session};
     uint64_t all = UINT64_MAX, original;
     /* Include NPTL's reserved signals: pthread_sigmask deliberately leaves them
      * unblocked. The child shares VM/TLS, never dispositions, fds or cwd. */
@@ -285,11 +289,17 @@ static int system_apple_credentials(posix_spawnattr_t *attributes, long long uid
 }
 #endif
 static int system_posix_spawn(SystemProcess *process, const char *path, char **argv, char **envp,
-                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials) {
+                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials, bool session) {
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-    if (credentials) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, true);
+    if (credentials) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, true, session);
+#ifndef POSIX_SPAWN_SETSID
+    if (session) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, true);
+#endif
 #elif !defined(__APPLE__)
     if (credentials) return ENOTSUP;
+#endif
+#ifndef POSIX_SPAWN_SETSID
+    if (session) return ENOTSUP;
 #endif
     posix_spawnattr_t attributes; posix_spawn_file_actions_t actions;
     int error = posix_spawnattr_init(&attributes);
@@ -301,7 +311,11 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
     if (!error) sigdelset(&mask, SIGPIPE);
     if (!error) error = posix_spawnattr_setsigdefault(&attributes, &defaults);
     if (!error) error = posix_spawnattr_setsigmask(&attributes, &mask);
-    if (!error) error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+    short flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+#ifdef POSIX_SPAWN_SETSID
+    if (session) flags |= POSIX_SPAWN_SETSID;
+#endif
+    if (!error) error = posix_spawnattr_setflags(&attributes, flags);
 #ifdef __APPLE__
     if (!error && credentials) error = system_apple_credentials(&attributes, uid, gid, groups, count);
 #else
@@ -330,7 +344,7 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
     if (actions_ready) posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-    if (error == ENOTSUP && *cwd) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false);
+    if (error == ENOTSUP && *cwd) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, session);
 #endif
     return error;
 }
@@ -338,9 +352,9 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
 #include "system_process_windows.h"
 #endif
 
-long long minyar_system_spawnNative(const MinyarText *path, const MinyarBytes *arguments,
+static long long system_spawn(const MinyarText *path, const MinyarBytes *arguments,
     const MinyarBytes *environment, const MinyarText *cwd, long long uid, long long gid,
-    const MinyarBytes *group_bytes, bool credentials) {
+    const MinyarBytes *group_bytes, bool credentials, bool session) {
     system_error = 0;
     if (uid < -1 || gid < -1 || uid >= UINT32_MAX || gid >= UINT32_MAX ||
         (!credentials && (uid != -1 || gid != -1)) || !system_valid_buffer(group_bytes) || group_bytes->byte_length % 8)
@@ -366,7 +380,7 @@ long long minyar_system_spawnNative(const MinyarText *path, const MinyarBytes *a
         system_process_cleanup_installed = true;
     }
 #ifdef _WIN32
-    system_error = credentials ? ENOTSUP : system_windows_spawn(process, executable, &argv, &envp, working);
+    system_error = credentials || session ? ENOTSUP : system_windows_spawn(process, executable, &argv, &envp, working);
 #else
     if (credentials) {
         long maximum = sysconf(_SC_NGROUPS_MAX);
@@ -381,7 +395,7 @@ long long minyar_system_spawnNative(const MinyarText *path, const MinyarBytes *a
             system_error = EINVAL; goto failed;
         }
     }
-    system_error = system_posix_spawn(process, executable, argv.values, envp.values, working, uid, gid, groups, count, credentials);
+    system_error = system_posix_spawn(process, executable, argv.values, envp.values, working, uid, gid, groups, count, credentials, session);
 #endif
 failed:
     free(executable); free(working); system_vector_clear(&argv); system_vector_clear(&envp);
@@ -391,4 +405,16 @@ failed:
     if (system_error) { free(process); return -system_error; }
     process->handle = ++system_process_serial; process->next = system_processes; system_processes = process;
     return process->handle;
+}
+
+long long minyar_system_spawnNative(const MinyarText *path, const MinyarBytes *arguments,
+    const MinyarBytes *environment, const MinyarText *cwd, long long uid, long long gid,
+    const MinyarBytes *group_bytes, bool credentials) {
+    return system_spawn(path, arguments, environment, cwd, uid, gid, group_bytes, credentials, false);
+}
+
+long long minyar_system_spawnSessionNative(const MinyarText *path, const MinyarBytes *arguments,
+    const MinyarBytes *environment, const MinyarText *cwd) {
+    static const MinyarBytes groups = {(const unsigned char *)"", 0, 0, NULL, NULL};
+    return system_spawn(path, arguments, environment, cwd, -1, -1, &groups, false, true);
 }
