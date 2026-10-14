@@ -1,0 +1,391 @@
+use "./update-support.min" as support
+use "files" as files
+use "system" as system
+use "sha256" as sha256
+use "json" as json
+
+constant MAX_BYTES = 134217728
+constant MAX_ENTRIES = 4096
+constant MAX_PATH = 512
+constant KIND_DIRECTORY = 68
+constant KIND_FILE = 70
+
+public record Temporary { path: Text; descriptor: Integer; open: Boolean }
+public record Hooks {
+    pathInfo: Callback<Text, support.Info>
+    descriptorInfo: Callback<Integer, support.Info>
+    attributes: Callback<Text, support.Listing>
+    sync: Callback<Integer, Integer>
+    created: Callback<Temporary, Nothing>
+    remove: Callback<Text, Integer>
+}
+public record Summary { error: Text; format: Integer; entrypoint: Text; entries: Integer; size: Integer; sha256: Text }
+record Entry { relative: Text; kind: Integer; mode: Integer; size: Integer; path: Text; info: support.Info }
+record Scan { root: Text; entrypoint: Text; entries: List<Entry>; folded: Map<Text, Boolean>; hooks: Hooks }
+record Written { error: Text; digest: Text }
+
+public function defaults(): Hooks {
+    return Hooks {
+        pathInfo: function(path: Text): support.Info { return support.linkStatus(path) }
+        descriptorInfo: function(fd: Integer): support.Info { return support.descriptorStatus(fd) }
+        attributes: function(path: Text): support.Listing { return support.attributes(path) }
+        sync: function(fd: Integer): Integer { return support.syncDescriptor(fd) }
+        created: function(temporary: Temporary) { }
+        remove: function(path: Text): Integer { return files.remove(path) }
+    }
+}
+function observe(hooks: Hooks, path: Text): support.Info {
+    let call = hooks.pathInfo
+    return call(path)
+}
+function describeDescriptor(hooks: Hooks, fd: Integer): support.Info {
+    let call = hooks.descriptorInfo
+    return call(fd)
+}
+function listAttributes(hooks: Hooks, path: Text): support.Listing {
+    let call = hooks.attributes
+    return call(path)
+}
+function commit(hooks: Hooks, fd: Integer): Integer {
+    let call = hooks.sync
+    return call(fd)
+}
+function announce(hooks: Hooks, temporary: Temporary) {
+    let call = hooks.created
+    call(temporary)
+}
+function discard(hooks: Hooks, path: Text): Integer {
+    let call = hooks.remove
+    return call(path)
+}
+function failure(message: Text): Summary {
+    return Summary { error: message; format: 1; entrypoint: ""; entries: 0; size: 0; sha256: "" }
+}
+
+function reservedStem(stem: Text): Boolean {
+    for name in ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"] { if stem == name { return true } }
+    let raw = Bytes(stem)
+    if raw.length == 4 && raw[3] >= 48 && raw[3] <= 57 {
+        let head = Text(raw.slice(0, 3))
+        if head == "COM" || head == "LPT" { return true }
+    }
+    return false
+}
+public function safePath(value: Text): Text {
+    let raw = Bytes(value)
+    if raw.length < 1 || raw.length > MAX_PATH { return "bundle path exceeds its limit" }
+    for byte in raw { if byte > 127 { return "bundle v1 requires portable ASCII paths" } }
+    for component in support.split(value, 47) {
+        let part = Bytes(component)
+        if part.length < 1 || part.length > 64 || component == "." || component == ".." || part[0] == 32 ||
+            part[part.length - 1] == 46 || part[part.length - 1] == 32 {
+            return "invalid bundle path component"
+        }
+        for byte in part {
+            let allowed = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+                byte == 46 || byte == 95 || byte == 32 || byte == 45
+            if !allowed { return "bundle paths cannot contain separators, controls or Windows streams" }
+        }
+        let stem = support.split(component, 46)[0]
+        let upper = Bytes(stem)
+        for index in 0..upper.length { if upper[index] >= 97 && upper[index] <= 122 { upper[index] = upper[index] - 32 } }
+        if reservedStem(Text(upper)) { return "reserved Windows bundle filename" }
+    }
+    return ""
+}
+function sameInfo(left: support.Info, right: support.Info): Boolean {
+    return left.device == right.device && left.inode == right.inode && left.mode == right.mode && left.size == right.size &&
+        left.modified == right.modified && left.changed == right.changed
+}
+function sameEntries(left: List<Entry>, right: List<Entry>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length {
+        let a = left[index]
+        let b = right[index]
+        if a.relative != b.relative || a.kind != b.kind || a.mode != b.mode || a.size != b.size || a.path != b.path { return false }
+        if !sameInfo(a.info, b.info) { return false }
+    }
+    return true
+}
+function nativeImage(data: Bytes): Boolean {
+    if data.length >= 2 && data[0] == 77 && data[1] == 90 { return true }
+    if data.length < 4 { return false }
+    let magic = [[127, 69, 76, 70], [254, 237, 250, 206], [206, 250, 237, 254], [254, 237, 250, 207], [207, 250, 237, 254],
+        [202, 254, 186, 190], [190, 186, 254, 202], [202, 254, 186, 191], [191, 186, 254, 202]]
+    for candidate in magic {
+        if data[0] == candidate[0] && data[1] == candidate[1] && data[2] == candidate[2] && data[3] == candidate[3] { return true }
+    }
+    return false
+}
+function inspectAttributes(hooks: Hooks, path: Text): Text {
+    let listing = listAttributes(hooks, path)
+    if listing.error != 0 { return support.describe(listing.error, path) }
+    for name in listing.names {
+        if support.starts(name, "com.apple.cs.") || name == "com.apple.ResourceFork" {
+            return "xattr code signatures/resource forks are unsupported; use regular-file resources"
+        }
+    }
+    return ""
+}
+function scan(state: Scan, directory: Text, prefix: Text): Text {
+    let names = files.list(directory)
+    if files.lastError() != 0 { return support.describe(files.lastError(), directory) }
+    names.sort()
+    for name in names {
+        let path = directory + "/" + name
+        let relative = prefix + name
+        let invalid = safePath(relative)
+        if invalid != "" { return invalid }
+        let fold = support.lower(relative)
+        if state.folded.has(fold) { return "case-insensitive duplicate bundle path" }
+        state.folded[fold] = true
+        let info = observe(state.hooks, path)
+        if info.error != 0 { return support.describe(info.error, path) }
+        if support.kind(info) == support.LINK { return "bundle links and reparse points are not supported" }
+        let refused = inspectAttributes(state.hooks, path)
+        if refused != "" { return refused }
+        if state.entries.length >= MAX_ENTRIES { return "bundle has too many entries" }
+        if support.kind(info) == support.DIRECTORY {
+            state.entries.add(Entry { relative: relative; kind: KIND_DIRECTORY; mode: 0; size: 0; path: path; info: info })
+            let nested = scan(state, path, relative + "/")
+            if nested != "" { return nested }
+        } else if support.kind(info) == support.REGULAR {
+            if info.links != 1 { return "bundle hardlinks are not supported" }
+            if info.size > MAX_BYTES { return "bundle file exceeds size limit" }
+            let mode = 0
+            if relative == state.entrypoint || info.mode & 0o111 != 0 { mode = 1 }
+            state.entries.add(Entry { relative: relative; kind: KIND_FILE; mode: mode; size: info.size; path: path; info: info })
+        } else { return "bundle contains a special file" }
+    }
+    return ""
+}
+function fresh(root: Text, entrypoint: Text, hooks: Hooks): Scan {
+    return Scan { root: root; entrypoint: entrypoint; entries: []; folded: Map<Text, Boolean>(); hooks: hooks }
+}
+function sortEntries(entries: List<Entry>) {
+    entries.sortBy(function(left: Entry, right: Entry): Integer { return support.compare(left.relative, right.relative) })
+}
+function bigEndian(value: Integer, width: Integer): Bytes {
+    let data = Bytes(width)
+    for index in 0..width { data[width - 1 - index] = (value >> (8 * index)) & 255 }
+    return data
+}
+function verifyApp(app: Text): Text {
+    for command in [["codesign", "--verify", "--deep", "--strict", "--verbose=2", app], ["xcrun", "stapler", "validate", app],
+        ["spctl", "--assess", "--type", "execute", "--verbose=2", app]] {
+        let result = support.execute(command, 120)
+        if result.launch != 0 || result.timedOut || result.status != 0 { return support.commandFailure(command, result, 120) }
+    }
+    return ""
+}
+function suffix(path: Text): Text {
+    let raw = Bytes(support.name(path))
+    let dot = raw.length - 1
+    while dot >= 0 && raw[dot] != 46 { dot -= 1 }
+    if dot <= 0 || dot == raw.length - 1 { return "" }
+    return Text(raw.slice(dot, raw.length))
+}
+
+public function prepare(root: Text, output: Text, entrypoint: Text): Summary {
+    return prepareWith(root, output, entrypoint, "", false, defaults())
+}
+public function prepareApp(root: Text, output: Text, entrypoint: Text, notarizedApp: Text): Summary {
+    return prepareWith(root, output, entrypoint, notarizedApp, true, defaults())
+}
+public function prepareWith(root: Text, output: Text, entrypoint: Text, notarizedApp: Text, notarize: Boolean, hooks: Hooks): Summary {
+    let invalid = safePath(entrypoint)
+    if invalid != "" { return failure(invalid) }
+    let base = support.absolute(root)
+    if base.error != 0 { return failure(support.describe(base.error, root)) }
+    let destination = support.absolute(output)
+    if destination.error != 0 { return failure(support.describe(destination.error, output)) }
+    let top = observe(hooks, base.path)
+    if top.error != 0 { return failure(support.describe(top.error, base.path)) }
+    if support.kind(top) == support.LINK || !support.isDirectory(support.status(base.path)) {
+        return failure("bundle root must be a real directory")
+    }
+    let resolved = support.resolve(base.path)
+    if resolved.error != 0 { return failure(support.describe(resolved.error, base.path)) }
+    let tree = resolved.path
+    let target = support.looseResolve(destination.path)
+    if target.error != 0 { return failure(support.describe(target.error, destination.path)) }
+    if support.within(target.path, tree) { return failure("bundle output cannot be inside its input tree") }
+    let rootInfo = observe(hooks, tree)
+    if rootInfo.error != 0 { return failure(support.describe(rootInfo.error, tree)) }
+    let refused = inspectAttributes(hooks, tree)
+    if refused != "" { return failure(refused) }
+    let state = fresh(tree, entrypoint, hooks)
+    let scanned = scan(state, tree, "")
+    if scanned != "" { return failure(scanned) }
+    sortEntries(state.entries)
+    let main: List<Entry> = []
+    for entry in state.entries { if entry.relative == entrypoint && entry.kind == KIND_FILE { main.add(entry) } }
+    if main.length != 1 { return failure("entrypoint is not a regular bundle file") }
+    let image = files.open(main[0].path, files.READ)
+    if image < 0 { return failure(support.describe(image, main[0].path)) }
+    let head = files.readAt(image, 0, 4)
+    let headError = files.lastError()
+    files.close(image)
+    if headError != 0 { return failure(support.describe(headError, main[0].path)) }
+    if !nativeImage(head) { return failure("entrypoint must be a native executable, never an interpreter script") }
+    let app = ""
+    if notarize {
+        if support.platform() != "darwin" { return failure("notarized application verification requires actual macOS") }
+        let invalidApp = safePath(notarizedApp)
+        if invalidApp != "" { return failure(invalidApp) }
+        app = tree + "/" + notarizedApp
+        if !support.isDirectory(support.status(app)) || suffix(app) != ".app" { return failure("expected an application bundle under the input root") }
+        let verified = verifyApp(app)
+        if verified != "" { return failure(verified) }
+    }
+    let entry = Bytes(entrypoint)
+    let expected = 16 + 4 + entry.length + 4
+    for item in state.entries { expected += 14 + Bytes(item.relative).length + item.size }
+    if expected > MAX_BYTES { return failure("bundle exceeds 128 MiB including its index") }
+    let container = support.parent(destination.path)
+    let made = support.makeDirectories(container)
+    if made != 0 { return failure(support.describe(made, container)) }
+    let created = support.temporaryFile(container, ".minyar-bundle-")
+    if created.descriptor < 0 { return failure(support.describe(created.descriptor, container)) }
+    let temporary = Temporary { path: created.path; descriptor: created.descriptor; open: true }
+    announce(hooks, temporary)
+    let written = write(state, rootInfo, temporary, destination.path, container, expected, app)
+    closeTemporary(temporary)
+    let error = written.error
+    if support.exists(temporary.path) {
+        let removed = discard(hooks, temporary.path)
+        if removed != 0 && error == "" { error = support.describe(removed, temporary.path) }
+    }
+    if error != "" { return failure(error) }
+    return Summary { error: ""; format: 1; entrypoint: entrypoint; entries: state.entries.length; size: expected; sha256: written.digest }
+}
+function closeTemporary(temporary: Temporary): Integer {
+    if !temporary.open { return 0 }
+    temporary.open = false
+    return files.close(temporary.descriptor)
+}
+function emit(temporary: Temporary, data: Bytes): Text {
+    let result = files.write(temporary.descriptor, data, 0, data.length)
+    if result < 0 { return support.describe(result, "") }
+    return ""
+}
+function copy(state: Scan, temporary: Temporary, item: Entry): Text {
+    let fd = support.openRead(item.path, true)
+    if fd < 0 { return support.describe(fd, item.path) }
+    let result = copyOpen(state, temporary, item, fd)
+    files.close(fd)
+    return result
+}
+function copyOpen(state: Scan, temporary: Temporary, item: Entry, fd: Integer): Text {
+    let before = describeDescriptor(state.hooks, fd)
+    if before.error != 0 { return support.describe(before.error, "") }
+    if !sameInfo(before, item.info) { return "bundle input changed while preparing output" }
+    let position = 0
+    let remaining = item.size
+    while remaining > 0 {
+        let chunk = files.readAt(fd, position, min(65536, remaining))
+        if files.lastError() != 0 { return support.describe(files.lastError(), "") }
+        if chunk.length == 0 { return "bundle file was truncated" }
+        let failed = emit(temporary, chunk)
+        if failed != "" { return failed }
+        position += chunk.length
+        remaining -= chunk.length
+    }
+    let extra = files.readAt(fd, position, 1)
+    if files.lastError() != 0 { return support.describe(files.lastError(), "") }
+    if extra.length > 0 { return "bundle file changed during copying" }
+    let after = describeDescriptor(state.hooks, fd)
+    if after.error != 0 { return support.describe(after.error, "") }
+    if !sameInfo(after, before) { return "bundle file changed during copying" }
+    return ""
+}
+function write(state: Scan, rootInfo: support.Info, temporary: Temporary, output: Text, container: Text, expected: Integer, app: Text): Written {
+    let entry = Bytes(state.entrypoint)
+    let header = Bytes("MINYAR-BUNDLE-1\n")
+    header.addBytes(bigEndian(entry.length, 4))
+    header.addBytes(entry)
+    header.addBytes(bigEndian(state.entries.length, 4))
+    let failed = emit(temporary, header)
+    if failed != "" { return Written { error: failed; digest: "" } }
+    for item in state.entries {
+        let encoded = Bytes(item.relative)
+        let record = Bytes()
+        record.add(item.kind)
+        record.add(item.mode)
+        record.addBytes(bigEndian(encoded.length, 4))
+        record.addBytes(bigEndian(item.size, 8))
+        record.addBytes(encoded)
+        failed = emit(temporary, record)
+        if failed != "" { return Written { error: failed; digest: "" } }
+        if item.kind == KIND_FILE {
+            failed = copy(state, temporary, item)
+            if failed != "" { return Written { error: failed; digest: "" } }
+        }
+    }
+    let synced = commit(state.hooks, temporary.descriptor)
+    if synced != 0 { return Written { error: support.describe(synced, ""); digest: "" } }
+    let again = fresh(state.root, state.entrypoint, state.hooks)
+    let rescanned = scan(again, state.root, "")
+    if rescanned != "" { return Written { error: rescanned; digest: "" } }
+    sortEntries(again.entries)
+    let current = observe(state.hooks, state.root)
+    if current.error != 0 { return Written { error: support.describe(current.error, state.root); digest: "" } }
+    if !sameInfo(current, rootInfo) || !sameEntries(again.entries, state.entries) {
+        return Written { error: "bundle tree changed while preparing output"; digest: "" }
+    }
+    if app != "" {
+        let verified = verifyApp(app)
+        if verified != "" { return Written { error: verified; digest: "" } }
+    }
+    let reader = files.open(temporary.path, files.READ)
+    if reader < 0 { return Written { error: support.describe(reader, temporary.path); digest: "" } }
+    let digest = sha256.new()
+    let position = 0
+    while true {
+        let chunk = files.readAt(reader, position, 1048576)
+        if files.lastError() != 0 {
+            let code = files.lastError()
+            files.close(reader)
+            return Written { error: support.describe(code, temporary.path); digest: "" }
+        }
+        if chunk.length == 0 { break }
+        sha256.update(digest, chunk)
+        position += chunk.length
+    }
+    files.close(reader)
+    let hex = sha256.hex(sha256.finalize(digest))
+    let size = support.status(temporary.path)
+    if size.error != 0 { return Written { error: support.describe(size.error, temporary.path); digest: "" } }
+    if size.size != expected { return Written { error: "bundle size mismatch"; digest: "" } }
+    let closed = closeTemporary(temporary)
+    if closed != 0 { return Written { error: support.describe(closed, ""); digest: "" } }
+    let moved = files.rename(temporary.path, output)
+    if moved != 0 { return Written { error: support.describeMove(moved, temporary.path, output); digest: "" } }
+    let directory = support.openDirectory(container)
+    if directory < 0 { return Written { error: support.describe(directory, container); digest: "" } }
+    let committed = commit(state.hooks, directory)
+    support.closeDescriptor(directory)
+    if committed != 0 { return Written { error: support.describe(committed, ""); digest: "" } }
+    return Written { error: ""; digest: hex }
+}
+
+public function summaryJson(summary: Summary): Text {
+    return "{\"entries\": " + Text(summary.entries) + ", \"entrypoint\": " + json.quote(summary.entrypoint) + ", \"format\": " +
+        Text(summary.format) + ", \"sha256\": " + json.quote(summary.sha256) + ", \"size\": " + Text(summary.size) + "}"
+}
+
+function main(): Integer {
+    let parser = support.Parser { program: "update-bundle"; description: "Build a local deterministic updater bundle. This does not sign or publish it."; options: [] }
+    for name in ["root", "output", "entrypoint"] { parser.options.add(support.option(name, true, false, "")) }
+    parser.options.add(support.option("notarized-app", false, false, "relative .app path; verify codesign, stapler and Gatekeeper on macOS"))
+    let parsed = support.parse(parser)
+    if parsed >= 0 { return parsed }
+    let summary = prepareWith(support.value(parser, "root"), support.value(parser, "output"), support.value(parser, "entrypoint"),
+        support.value(parser, "notarized-app"), support.given(parser, "notarized-app"), defaults())
+    if summary.error != "" {
+        system.writeStandardError("update bundle preparation failed: " + summary.error + "\n")
+        return 1
+    }
+    print(summaryJson(summary))
+    return 0
+}

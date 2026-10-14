@@ -1,0 +1,420 @@
+use "./update-support.min" as support
+use "files" as files
+use "system" as system
+use "sha256" as sha256
+use "json" as json
+
+public record Signature { error: Text; signature: Bytes; publicKey: Bytes }
+public record Publication { error: Text; plan: Text }
+record Captured { error: Text; output: Bytes }
+
+constant TARGETS: List<Text> = ["macos-arm64", "macos-x86_64", "windows-arm64", "windows-x86_64", "linux-arm64", "linux-x86_64"]
+
+function domain(): Bytes {
+    let value = Bytes("MINYAR-UPDATE-SIGNATURE-V1")
+    value.add(0)
+    return value
+}
+function publicPrefix(): Bytes {
+    let value = Bytes()
+    for byte in [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0] { value.add(byte) }
+    return value
+}
+function signatureFailure(message: Text): Signature {
+    return Signature { error: message; signature: Bytes(); publicKey: Bytes() }
+}
+function publicationFailure(message: Text): Publication {
+    return Publication { error: message; plan: "" }
+}
+
+public function runner(): Callback<List<Text>, support.Execution> {
+    return function(command: List<Text>): support.Execution { return support.execute(command, 0) }
+}
+function capture(run: Callback<List<Text>, support.Execution>, openssl: Text, arguments: List<Text>): Captured {
+    let command = [openssl]
+    for word in arguments { command.add(word) }
+    let result = run(command)
+    if result.launch != 0 || result.status != 0 { return Captured { error: support.commandFailure(command, result, 0); output: Bytes() } }
+    return Captured { error: ""; output: result.output }
+}
+public function signed(data: Bytes, key: Text, openssl: Text, passphraseEnv: Text): Signature {
+    return signedWith(data, key, openssl, passphraseEnv, runner())
+}
+public function signedWith(data: Bytes, key: Text, openssl: Text, passphraseEnv: Text, run: Callback<List<Text>, support.Execution>): Signature {
+    let resolved = support.resolve(key)
+    if resolved.error != 0 { return signatureFailure(support.describe(resolved.error, key)) }
+    let path = resolved.path
+    let password: List<Text> = []
+    if passphraseEnv != "" { password = ["-passin", "env:" + passphraseEnv] }
+    let exported = ["pkey", "-in", path]
+    for word in password { exported.add(word) }
+    for word in ["-pubout", "-outform", "DER"] { exported.add(word) }
+    let der = capture(run, openssl, exported)
+    if der.error != "" { return signatureFailure(der.error) }
+    if der.output.length != 44 || !support.same(der.output.slice(0, 12), publicPrefix()) {
+        return signatureFailure("update signing key must be Ed25519")
+    }
+    let directory = support.temporaryDirectory(support.temporaryRoot(), "minyar-metadata-sign-")
+    if directory.error != 0 { return signatureFailure(support.describe(directory.error, support.temporaryRoot())) }
+    let result = signInDirectory(data, path, openssl, password, der.output, directory.path, run)
+    let removed = support.removeTree(directory.path)
+    if result.error == "" && removed != 0 { return signatureFailure(support.describe(removed, directory.path)) }
+    return result
+}
+function signInDirectory(data: Bytes, key: Text, openssl: Text, password: List<Text>, der: Bytes, directory: Text, run: Callback<List<Text>, support.Execution>): Signature {
+    let source = directory + "/metadata"
+    let signature = directory + "/signature"
+    let publicFile = directory + "/public.der"
+    let message = domain()
+    message.addBytes(data)
+    let written = support.writeFile(source, message)
+    if written != 0 { return signatureFailure(support.describe(written, source)) }
+    written = support.writeFile(publicFile, der)
+    if written != 0 { return signatureFailure(support.describe(written, publicFile)) }
+    let signing = ["pkeyutl", "-sign", "-rawin", "-inkey", key]
+    for word in password { signing.add(word) }
+    for word in ["-in", source] { signing.add(word) }
+    let value = capture(run, openssl, signing)
+    if value.error != "" { return signatureFailure(value.error) }
+    if value.output.length != 64 { return signatureFailure("signer returned an invalid Ed25519 signature size") }
+    written = support.writeFile(signature, value.output)
+    if written != 0 { return signatureFailure(support.describe(written, signature)) }
+    let verified = capture(run, openssl, ["pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", publicFile, "-keyform", "DER",
+        "-in", source, "-sigfile", signature])
+    if verified.error != "" { return signatureFailure(verified.error) }
+    return Signature { error: ""; signature: value.output; publicKey: der.slice(12, der.length) }
+}
+
+function wordCharacter(byte: Integer): Boolean {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 45
+}
+function validApp(app: Text): Boolean {
+    let parts = support.split(app, 46)
+    if parts.length < 2 { return false }
+    for part in parts {
+        let raw = Bytes(part)
+        if raw.length == 0 { return false }
+        for byte in raw { if !wordCharacter(byte) { return false } }
+    }
+    return true
+}
+function validChannel(channel: Text): Boolean {
+    let raw = Bytes(channel)
+    if raw.length < 1 || raw.length > 32 || raw[0] < 97 || raw[0] > 122 { return false }
+    for byte in raw {
+        if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45) { return false }
+    }
+    return true
+}
+function validVersion(version: Text): Boolean {
+    let parts = support.split(version, 46)
+    if parts.length != 3 { return false }
+    for part in parts {
+        let raw = Bytes(part)
+        if raw.length == 0 || raw.length > 10 { return false }
+        if raw[0] == 48 && raw.length > 1 { return false }
+        let value = 0
+        for byte in raw {
+            if byte < 48 || byte > 57 { return false }
+            value = value * 10 + (byte - 48)
+        }
+        if value > 2147483647 { return false }
+    }
+    return true
+}
+function hexDigit(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+}
+function ipv4(raw: Bytes): Boolean {
+    let parts = support.split(Text(raw), 46)
+    if parts.length != 4 { return false }
+    for part in parts {
+        let digits = Bytes(part)
+        if digits.length == 0 || digits.length > 3 { return false }
+        let value = 0
+        for byte in digits {
+            if byte < 48 || byte > 57 { return false }
+            value = value * 10 + (byte - 48)
+        }
+        if value > 255 { return false }
+        if digits.length > 1 && digits[0] == 48 { return false }
+    }
+    return true
+}
+function ipv6(text: Text): Boolean {
+    let raw = Bytes(text)
+    let percent = -1
+    for index in 0..raw.length { if raw[index] == 37 { percent = index; break } }
+    if percent >= 0 {
+        if percent + 1 >= raw.length { return false }
+        for index in (percent + 1)..raw.length { if raw[index] == 37 { return false } }
+        raw = raw.slice(0, percent)
+    }
+    let parts = support.split(Text(raw), 58)
+    if parts.length < 3 { return false }
+    let limit = 8
+    if support.find(parts[parts.length - 1], ".") >= 0 {
+        if !ipv4(Bytes(parts[parts.length - 1])) { return false }
+        parts[parts.length - 1] = "0"
+        parts.add("0")
+    }
+    if parts.length > limit + 1 { return false }
+    let skip = -1
+    for index in 1..(parts.length - 1) {
+        if parts[index] == "" {
+            if skip >= 0 { return false }
+            skip = index
+        }
+    }
+    let prefix = 0
+    let suffix = 0
+    if skip >= 0 {
+        prefix = skip
+        suffix = parts.length - skip - 1
+        if parts[0] == "" {
+            prefix -= 1
+            if prefix != 0 { return false }
+        }
+        if parts[parts.length - 1] == "" {
+            suffix -= 1
+            if suffix != 0 { return false }
+        }
+        if prefix + suffix > limit - 1 { return false }
+    } else {
+        if parts.length != limit { return false }
+        if parts[0] == "" || parts[parts.length - 1] == "" { return false }
+    }
+    for index in 0..parts.length {
+        if index == skip { continue }
+        if skip >= 0 && ((index == 0 && parts[0] == "") || (index == parts.length - 1 && parts[index] == "")) { continue }
+        let group = Bytes(parts[index])
+        if group.length == 0 || group.length > 4 { return false }
+        for byte in group { if !hexDigit(byte) { return false } }
+    }
+    return true
+}
+function bracketedHost(host: Text): Boolean {
+    let raw = Bytes(host)
+    if raw.length > 0 && raw[0] == 118 {
+        let dot = -1
+        for index in 1..raw.length { if raw[index] == 46 { dot = index; break } }
+        if dot < 2 || dot + 1 >= raw.length { return false }
+        for index in 1..dot { if !hexDigit(raw[index]) { return false } }
+        for index in (dot + 1)..raw.length { if raw[index] == 10 { return false } }
+        return true
+    }
+    if ipv4(raw) { return false }
+    return ipv6(host)
+}
+function validOrigin(origin: Text): Boolean {
+    let raw = Bytes(origin)
+    for byte in raw { if byte < 33 || byte > 126 { return false } }
+    if !support.starts(origin, "https://") { return false }
+    let netloc = raw.slice(8, raw.length)
+    for byte in netloc { if byte == 47 || byte == 63 || byte == 35 { return false } }
+    let opening = -1
+    let closing = -1
+    let at = -1
+    for index in 0..netloc.length {
+        if netloc[index] == 91 && opening < 0 { opening = index }
+        if netloc[index] == 93 && closing < 0 { closing = index }
+        if netloc[index] == 64 { at = index }
+    }
+    if (opening >= 0) != (closing >= 0) { return false }
+    if opening >= 0 {
+        if opening > 0 { return false }
+        let bracketed = netloc.slice(opening + 1, netloc.length)
+        let end = 0
+        while end < bracketed.length && bracketed[end] != 93 { end += 1 }
+        if end + 1 < bracketed.length && bracketed[end + 1] != 58 { return false }
+        if !bracketedHost(Text(bracketed.slice(0, end))) { return false }
+    }
+    if at >= 0 { return false }
+    let hostname = Bytes()
+    let port = Bytes()
+    if opening >= 0 {
+        let bracketed = netloc.slice(opening + 1, netloc.length)
+        let end = 0
+        while end < bracketed.length && bracketed[end] != 93 { end += 1 }
+        hostname = bracketed.slice(0, end)
+        let rest = Bytes()
+        if end < bracketed.length { rest = bracketed.slice(end + 1, bracketed.length) }
+        let colon = -1
+        for index in 0..rest.length { if rest[index] == 58 { colon = index; break } }
+        if colon >= 0 { port = rest.slice(colon + 1, rest.length) }
+    } else {
+        let colon = -1
+        for index in 0..netloc.length { if netloc[index] == 58 { colon = index; break } }
+        if colon >= 0 {
+            hostname = netloc.slice(0, colon)
+            port = netloc.slice(colon + 1, netloc.length)
+        } else { hostname = netloc }
+    }
+    if hostname.length == 0 { return false }
+    if port.length > 0 {
+        let value = 0
+        for byte in port {
+            if byte < 48 || byte > 57 { return false }
+            if value <= 65535 { value = value * 10 + (byte - 48) }
+        }
+        if value < 1 || value > 65535 { return false }
+    }
+    if netloc.length > 0 && netloc[netloc.length - 1] == 58 { return false }
+    return true
+}
+function safeName(name: Text): Boolean {
+    let raw = Bytes(name)
+    if raw.length == 0 { return false }
+    for byte in raw {
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 46 || byte == 95 || byte == 45) { return false }
+    }
+    return true
+}
+function leaf(kind: Integer, text: Text): json.Value {
+    return json.Value { kind: kind; text: text; number: 0.0; truth: false; items: []; keys: [] }
+}
+function string(text: Text): json.Value { return leaf(json.STRING, text) }
+function number(value: Integer): json.Value { return leaf(json.NUMBER, Text(value)) }
+function object(keys: List<Text>, items: List<json.Value>): json.Value {
+    return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+}
+function digestFile(path: Text): Captured {
+    let fd = files.open(path, files.READ)
+    if fd < 0 { return Captured { error: support.describe(fd, path); output: Bytes() } }
+    let state = sha256.new()
+    let position = 0
+    while true {
+        let chunk = files.readAt(fd, position, 1048576)
+        if files.lastError() != 0 {
+            let code = files.lastError()
+            files.close(fd)
+            return Captured { error: support.describe(code, path); output: Bytes() }
+        }
+        if chunk.length == 0 { break }
+        sha256.update(state, chunk)
+        position += chunk.length
+    }
+    files.close(fd)
+    return Captured { error: ""; output: sha256.finalize(state) }
+}
+
+public function prepare(artifact: Text, output: Text, app: Text, target: Text, channel: Text, sequence: Integer, version: Text,
+    issued: Integer, expires: Integer, rollout: Integer, origin: Text, sign: Callback<Bytes, Signature>): Publication {
+    let located = support.resolve(artifact)
+    if located.error != 0 { return publicationFailure(support.describe(located.error, artifact)) }
+    let source = located.path
+    let destinationRoot = support.absolute(output)
+    if destinationRoot.error != 0 { return publicationFailure(support.describe(destinationRoot.error, output)) }
+    let root = destinationRoot.path
+    if !validApp(app) { return publicationFailure("invalid app identifier") }
+    let knownTarget = false
+    for candidate in TARGETS { if candidate == target { knownTarget = true } }
+    if !knownTarget { return publicationFailure("invalid target") }
+    if !validChannel(channel) { return publicationFailure("invalid channel") }
+    if !validVersion(version) { return publicationFailure("version must be three canonical numeric components") }
+    if sequence < 1 || sequence > 2147483647 { return publicationFailure("invalid metadata sequence") }
+    if rollout != 1 && rollout != 10 && rollout != 100 { return publicationFailure("rollout must be 1, 10 or 100") }
+    if issued < 0 || expires <= issued || expires - issued > 604800 || expires > 9223372036854775507 {
+        return publicationFailure("invalid metadata expiry; maximum seven days")
+    }
+    if !validOrigin(origin) {
+        return publicationFailure("origin must be an ASCII HTTPS origin with a valid port and no credentials, path, query or fragment")
+    }
+    let filename = support.name(source)
+    if !support.isRegular(support.status(source)) || !safeName(filename) { return publicationFailure("artifact needs a safe filename") }
+    let info = support.status(source)
+    if info.error != 0 { return publicationFailure(support.describe(info.error, source)) }
+    let size = info.size
+    if size < 1 || size > 134217728 { return publicationFailure("artifact size outside 1..128MiB limit") }
+    let hashed = digestFile(source)
+    if hashed.error != "" { return publicationFailure(hashed.error) }
+    let digest = sha256.hex(hashed.output)
+    let asset = "releases/" + digest + "/" + filename
+    let pointer = "channels/" + channel + "/" + target + ".update"
+    let data = Bytes(support.join(["MINYAR-UPDATE-1", app, target, channel, Text(sequence), version, Text(issued), Text(expires), Text(rollout),
+        origin + "/" + asset, digest, Text(size)], "\n") + "\n")
+    let signing = sign(data)
+    if signing.error != "" { return publicationFailure(signing.error) }
+    if signing.signature.length != 64 || signing.publicKey.length != 32 { return publicationFailure("invalid signer output") }
+    if data.length > 4096 { return publicationFailure("metadata exceeds updater limit") }
+    let container = support.parent(root)
+    let made = support.makeDirectories(container)
+    if made != 0 { return publicationFailure(support.describe(made, container)) }
+    let staging = support.temporaryDirectory(container, ".minyar-publication-")
+    if staging.error != 0 { return publicationFailure(support.describe(staging.error, container)) }
+    let result = publish(source, root, staging.path, size, digest, asset, pointer, origin, data, signing)
+    let removed = support.removeTree(staging.path)
+    if result.error == "" && removed != 0 { return publicationFailure(support.describe(removed, staging.path)) }
+    return result
+}
+function publish(source: Text, root: Text, temporary: Text, size: Integer, digest: Text, asset: Text, pointer: Text, origin: Text,
+    data: Bytes, signature: Signature): Publication {
+    let staged = temporary + "/artifact"
+    let contents = files.readFile(source)
+    if files.lastError() != 0 { return publicationFailure(support.describe(files.lastError(), source)) }
+    let written = support.writeFile(staged, contents)
+    if written != 0 { return publicationFailure(support.describe(written, staged)) }
+    let copied = files.readFile(staged)
+    if files.lastError() != 0 { return publicationFailure(support.describe(files.lastError(), staged)) }
+    if support.status(staged).size != size || sha256.hex(sha256.digest(copied)) != digest {
+        return publicationFailure("artifact changed during publication preparation")
+    }
+    let envelope = signature.signature.slice(0, signature.signature.length)
+    envelope.addBytes(data)
+    let plan = object(["schema", "publicOrigin", "objects", "order", "publicKeyHex"], [
+        number(1),
+        string(origin),
+        json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; keys: []; items: [
+            object(["key", "sha256", "size", "httpMetadata"], [string(asset), string(digest), number(size),
+                object(["contentType", "cacheControl"], [string("application/octet-stream"), string("public, max-age=31536000, immutable")])]),
+            object(["key", "sha256", "size", "httpMetadata"], [string(pointer), string(sha256.hex(sha256.digest(envelope))), number(envelope.length),
+                object(["contentType", "cacheControl"], [string("application/vnd.minyar.update"), string("no-store")])])] },
+        string("upload immutable artifact first; replace the single channel envelope last"),
+        string(support.hex(signature.publicKey))])
+    let destination = root + "/" + asset
+    let made = support.makeDirectories(support.parent(destination))
+    if made != 0 { return publicationFailure(support.describe(made, support.parent(destination))) }
+    let moved = files.rename(staged, destination)
+    if moved != 0 { return publicationFailure(support.describeMove(moved, staged, destination)) }
+    let channelFile = root + "/" + pointer
+    made = support.makeDirectories(support.parent(channelFile))
+    if made != 0 { return publicationFailure(support.describe(made, support.parent(channelFile))) }
+    let stagedEnvelope = temporary + "/envelope"
+    written = support.writeFile(stagedEnvelope, envelope)
+    if written != 0 { return publicationFailure(support.describe(written, stagedEnvelope)) }
+    moved = files.rename(stagedEnvelope, channelFile)
+    if moved != 0 { return publicationFailure(support.describeMove(moved, stagedEnvelope, channelFile)) }
+    let text = json.pretty(plan, "") + "\n"
+    let stagedPlan = temporary + "/plan"
+    written = support.writeFile(stagedPlan, Bytes(text))
+    if written != 0 { return publicationFailure(support.describe(written, stagedPlan)) }
+    let planFile = root + "/r2-publish-plan.json"
+    moved = files.rename(stagedPlan, planFile)
+    if moved != 0 { return publicationFailure(support.describeMove(moved, stagedPlan, planFile)) }
+    return Publication { error: ""; plan: text }
+}
+
+function main(): Integer {
+    let parser = support.Parser { program: "update-manifest"; description: "Prepare a signed updater envelope and R2 upload plan locally; never deploy."; options: [] }
+    for name in ["artifact", "output", "app", "target", "channel", "version", "origin", "key"] { parser.options.add(support.option(name, true, false, "")) }
+    for name in ["sequence", "issued", "expires", "rollout"] { parser.options.add(support.option(name, true, true, "")) }
+    let openssl = support.option("openssl", false, false, "")
+    openssl.value = "openssl"
+    parser.options.add(openssl)
+    parser.options.add(support.option("passphrase-env", false, false, ""))
+    let parsed = support.parse(parser)
+    if parsed >= 0 { return parsed }
+    let key = support.value(parser, "key")
+    let program = support.value(parser, "openssl")
+    let passphrase = support.value(parser, "passphrase-env")
+    let result = prepare(support.value(parser, "artifact"), support.value(parser, "output"), support.value(parser, "app"),
+        support.value(parser, "target"), support.value(parser, "channel"), support.integerValue(support.value(parser, "sequence")),
+        support.value(parser, "version"), support.integerValue(support.value(parser, "issued")), support.integerValue(support.value(parser, "expires")),
+        support.integerValue(support.value(parser, "rollout")), support.value(parser, "origin"),
+        function(data: Bytes): Signature { return signed(data, key, program, passphrase) })
+    if result.error != "" {
+        system.writeStandardError("update publication failed: " + result.error + "\n")
+        return 1
+    }
+    return 0
+}

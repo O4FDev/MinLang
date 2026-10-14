@@ -1,0 +1,175 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "./update-launch-support.min" as launch
+use "system" as system
+use "files" as files
+
+record Fixture { folder: Text; digest: Text; hash: Text }
+record Probe { binary: Text; environment: List<Text>; lab: Text; serial: Integer }
+
+function fixture(lab: Text, signer: Text, helper: Bytes, target: Text, label: Text, bundle: Boolean, version: Text, sequence: Integer, resource: Bytes): Fixture {
+    let folder = lab + "/" + label
+    test.check(files.makeDirectory(folder) == 0, "fixture directory " + label)
+    let data = helper
+    if bundle {
+        data = launch.package([launch.entry("D", "App.app", 0, Bytes()), launch.entry("D", "App.app/Contents", 0, Bytes()),
+            launch.entry("F", "App.app/Contents/Info.plist", 0, launch.infoPlist(version)), launch.entry("D", "App.app/Contents/MacOS", 0, Bytes()),
+            launch.entry("F", "App.app/Contents/MacOS/main", 1, helper), launch.entry("D", "App.app/Contents/Resources", 0, Bytes()),
+            launch.entry("F", "App.app/Contents/Resources/message.txt", 0, resource)], "App.app/Contents/MacOS/main")
+    }
+    let digest = launch.digest(data)
+    let metadata = launch.metadata(target, sequence, version, 100, data)
+    let hash = launch.digest(metadata)
+    writeBytesFile(folder + "/metadata", metadata)
+    let signed = test.run([signer, folder + "/metadata"], system.environment(), "", folder + "/signature", 10)
+    test.require(signed, "sign fixture " + label)
+    let receipt = files.readFile(folder + "/signature")
+    test.check(receipt.length == 64, "signer output size")
+    receipt.addBytes(metadata)
+    writeBytesFile(folder + "/receipt", receipt)
+    writeBytesFile(folder + "/artifact", data)
+    writeTextFile(folder + "/state", "MINYAR-UPDATER-STATE-2\n" + Text(sequence) + "\n" + version + "\n" + hash + "\n" + version + "\n" + digest + "\n1800000000\n" + hash + "\n" + Text(sequence) + "\n")
+    return Fixture { folder: folder; digest: digest; hash: hash }
+}
+function invoke(probe: Probe, root: Text, item: Fixture, mode: Text, fault: Text, mutation: Text, expected: Integer): List<Text> {
+    probe.serial += 1
+    let command = ["bash", "-c", "set -o pipefail; \"$@\" | cat", "bash", probe.binary, root, item.folder + "/artifact", item.folder + "/receipt", item.digest, item.hash, item.folder + "/state", mode, fault, mutation]
+    let result = test.run(command, probe.environment, "", probe.lab + "/invoke" + Text(probe.serial), 15)
+    test.check(result.status == expected, mode + " " + fault + " status " + Text(result.status) + " expected " + Text(expected) + "\n" + result.output + result.errorOutput)
+    return test.lines(result.output)
+}
+function only(lines: List<Text>, value: Text): Boolean {
+    return lines.length == 1 && lines[0] == value
+}
+function privateDirectory(path: Text) {
+    support.privateDirectory(path, path + ".mode")
+}
+
+let lab = test.scratch()
+let kernel = support.kernel(lab + "/kernel")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let helperPath = lab + "/owned-helper"
+let signer = lab + "/signer"
+let helperCommand = [clang, "-O2", "tests/update-owned-helper.c"]
+if kernel == "Darwin" { helperCommand.add("-framework"); helperCommand.add("CoreFoundation") }
+helperCommand.add("-o")
+helperCommand.add(helperPath)
+test.require(test.run(helperCommand, system.environment(), "", lab + "/helper.build", 60), "build owned helper")
+test.require(test.run([clang, "-O2", "tests/update-sign.c", "vendor/monocypher/monocypher.c", "vendor/monocypher/monocypher-ed25519.c", "-o", signer], system.environment(), "", lab + "/signer.build", 60), "build signer")
+let target = support.hostTarget(lab)
+let helper = files.readFile(helperPath)
+let raw = fixture(lab, signer, helper, target, "raw", false, "1.1.0", 1, Bytes("signed resource"))
+let old = fixture(lab, signer, helper, target, "old", true, "1.1.0", 1, Bytes("signed resource"))
+let new = fixture(lab, signer, helper, target, "new", true, "1.2.0", 2, Bytes("new signed resource"))
+let user = test.lines(support.output(["id", "-u"], lab + "/uid"))[0]
+let leaks = "detect_leaks=0"
+if kernel == "Linux" { leaks = "detect_leaks=1" }
+for sanitize in [false, true] {
+    let compiler = clang
+    let flags = ["-O2"]
+    let prefix = "normal-"
+    let binary = lab + "/probe"
+    if sanitize {
+        compiler = test.setting("MINYAR_SANITIZER_CLANG", clang)
+        flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+        prefix = "san-"
+        binary = lab + "/probe-sanitize"
+    }
+    let command = [compiler, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_UPDATE_TEST_HOOK=1", "-Wall", "-Wextra", "-Werror"]
+    for flag in flags { command.add(flag) }
+    for path in ["tests/update-launch-native.c", "runtime/native/update.c", "runtime/native/update_monocypher.c", "runtime/native/update_ed25519.c", "runtime/minyar_runtime.c", "-lm", "-o", binary] { command.add(path) }
+    test.require(test.run(command, system.environment(), "", binary + ".build", 90), "build launch probe " + prefix)
+    let probe = Probe { binary: binary; environment: support.environment(["ASAN_OPTIONS=" + leaks]); lab: lab; serial: 0 }
+    if kernel == "Linux" && user != "0" {
+        let root = lab + "/" + prefix + "fork-failure"
+        privateDirectory(root)
+        test.check(only(invoke(probe, root, old, "install", "", "", 0), "ACTIVATED"), "fork fixture activation")
+        let before = files.readFile(root + "/state")
+        let output = invoke(probe, root, old, "fork-failure", "", "", 0)
+        test.check(support.has(output, "FORK-REFUSED-WITHOUT-LEAK") && support.has(output, "ERROR"), "fork refusal\n" + support.join(output, "\n"))
+        test.check(support.same(files.readFile(root + "/state"), before), "fork refusal changed state")
+        test.check(support.has(invoke(probe, root, old, "launch", "", "", 0), "OWNED-HELPER"), "launch after fork refusal")
+    }
+    for mode in ["replace", "write", "extra", "ancestor", "parent", "anchored-parent"] {
+        for bundled in [false, true] {
+            if mode == "extra" && !bundled { continue }
+            let item = raw
+            let label = "False"
+            if bundled { item = old; label = "True" }
+            let root = lab + "/" + prefix + mode + label
+            if mode == "parent" || mode == "anchored-parent" {
+                privateDirectory(root)
+                root = root + "/installation"
+            }
+            privateDirectory(root)
+            test.check(only(invoke(probe, root, item, "install", "", "", 0), "ACTIVATED"), mode + " activation")
+            let mutation = root + "/versions/" + item.digest + ".bin"
+            if bundled {
+                let payload = root + "/versions/" + item.digest + ".bundle/payload"
+                mutation = payload + "/App.app/Contents/Resources/message.txt"
+                if mode == "extra" { mutation = payload + "/extra" }
+            }
+            if mode == "ancestor" { mutation = root }
+            if mode == "parent" || mode == "anchored-parent" {
+                let parts = support.split(root, "/")
+                let kept: List<Text> = []
+                for index in 0..(parts.length - 1) { kept.add(parts[index]) }
+                mutation = support.join(kept, "/")
+            }
+            let output = invoke(probe, root, item, mode, "", mutation, 0)
+            test.check(support.has(output, "ERROR") && !support.has(output, "OWNED-HELPER"), mode + " race " + label + "\n" + support.join(output, "\n"))
+        }
+    }
+    for bundled in [false, true] {
+        let item = raw
+        let label = "False"
+        if bundled { item = old; label = "True" }
+        let root = lab + "/" + prefix + "descriptor" + label
+        privateDirectory(root)
+        test.check(only(invoke(probe, root, item, "install", "", "", 0), "ACTIVATED"), "descriptor activation")
+        let output = invoke(probe, root, item, "descriptor", "", "", 0)
+        test.check(support.has(output, "OWNED-HELPER") && support.has(output, "LEAKED:0"), "descriptor exclusion\n" + support.join(output, "\n"))
+    }
+    for point in ["bundle-entry-written", "bundle-before-replace", "bundle-after-replace", "receipt-after-replace", "state-before-replace", "state-after-replace"] {
+        let root = lab + "/" + prefix + point
+        privateDirectory(root)
+        test.check(only(invoke(probe, root, old, "install", "", "", 0), "ACTIVATED"), point + " activation")
+        invoke(probe, root, new, "install", point, "", 87)
+        let active = old
+        if point == "state-after-replace" { active = new }
+        test.check(support.same(files.readFile(root + "/state"), files.readFile(active.folder + "/state")), point + " state")
+        test.check(support.has(invoke(probe, root, active, "launch", "", "", 0), "OWNED-HELPER"), point + " launch")
+        test.check(only(invoke(probe, root, new, "install", "", "", 0), "ACTIVATED"), point + " recovery")
+        test.check(support.has(invoke(probe, root, new, "launch", "", "", 0), "RESOURCE:new signed resource"), point + " new launch")
+    }
+    let lockRoot = lab + "/" + prefix + "lock"
+    privateDirectory(lockRoot)
+    test.check(only(invoke(probe, lockRoot, old, "install", "", "", 0), "ACTIVATED"), "lock activation")
+    let fifo = lab + "/" + prefix + "hold.fifo"
+    test.require(test.run(["mkfifo", fifo], system.environment(), "", fifo + ".make", 10), "hold fifo")
+    let hold = system.spawn("/bin/sh", ["sh", "-c", "fifo=$1; shift; exec \"$@\" >\"$fifo\"", "minyar", fifo, binary, lockRoot, old.folder + "/artifact", old.folder + "/receipt", old.digest, old.hash, old.folder + "/state", "hold", "", ""], probe.environment, "")
+    test.check(hold > 0, "start lock holder")
+    let locked = test.run(["head", "-n", "1", fifo], system.environment(), "", fifo + ".read", 10)
+    test.require(locked, "read lock holder")
+    test.check(locked.output == "LOCKED\n", "lock holder output " + locked.output)
+    let before = files.readFile(lockRoot + "/state")
+    test.check(invoke(probe, lockRoot, new, "install", "", "", 0)[0] == "ERROR", "second writer must be refused")
+    test.check(support.same(files.readFile(lockRoot + "/state"), before), "second writer changed state")
+    let held = system.wait(hold)
+    test.check(held.state == system.EXITED && held.exitCode == 0, "lock holder status")
+    let actual = lab + "/" + prefix + "real"
+    privateDirectory(actual)
+    let linked = lab + "/" + prefix + "linked"
+    test.require(test.run(["ln", "-s", "--", actual, linked], system.environment(), "", linked + ".make", 10), "linked root")
+    test.check(invoke(probe, linked, old, "install", "", "", 0)[0] == "ERROR", "linked installation root")
+    let alias = lab + "/" + prefix + "alias"
+    test.require(test.run(["ln", "-s", "--", lab, alias], system.environment(), "", alias + ".make", 10), "aliased parent")
+    test.check(invoke(probe, alias + "/" + prefix + "real", old, "install", "", "", 0)[0] == "ERROR", "aliased parent root")
+}
+let evidence = system.getenv("MINYAR_UPDATE_EVIDENCE")
+if evidence != "" {
+    test.require(test.run(["mkdir", "-p", "--", evidence + "/native-launch-fixtures"], system.environment(), "", lab + "/evidence.mkdir", 10), "evidence directory")
+    test.require(test.run(["cp", "-RP", "--", lab + "/.", evidence + "/native-launch-fixtures/"], system.environment(), "", lab + "/evidence.copy", 120), "copy native launch evidence")
+}
+test.removeTree(lab)
+print("Checked OS execution, exclusive writers, every bundle death boundary, deterministic TOCTOU races and cleanup passed")

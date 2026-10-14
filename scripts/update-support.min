@@ -1,0 +1,572 @@
+use "files" as files
+use "system" as system
+
+public constant FILE_TYPE = 0o170000
+public constant DIRECTORY = 0o040000
+public constant REGULAR = 0o100000
+public constant LINK = 0o120000
+public constant FIFO = 0o010000
+
+public record Info { error: Integer; device: Integer; inode: Integer; mode: Integer; size: Integer; modified: Integer; changed: Integer; links: Integer }
+public record Listing { error: Integer; names: List<Text> }
+public record Located { error: Integer; path: Text }
+public record Created { descriptor: Integer; path: Text }
+public record Execution { status: Integer; output: Bytes; errorOutput: Text; timedOut: Boolean; launch: Integer }
+public record Option { name: Text; metavar: Text; required: Boolean; integer: Boolean; help: Text; value: Text; seen: Boolean }
+public record Parser { program: Text; description: Text; options: List<Option> }
+
+function statusNative(path: Text, follow: Boolean): Bytes { native "updatesupport" }
+function descriptorStatusNative(fd: Integer): Bytes { native "updatesupport" }
+function attributesNative(path: Text): Bytes { native "updatesupport" }
+function resolveNative(path: Text): Bytes { native "updatesupport" }
+function temporaryFileNative(directory: Text, prefix: Text): Bytes { native "updatesupport" }
+function temporaryDirectoryNative(directory: Text, prefix: Text): Bytes { native "updatesupport" }
+function currentDirectoryNative(): Bytes { native "updatesupport" }
+public function openRead(path: Text, noFollow: Boolean): Integer { native "updatesupport" }
+public function openDirectory(path: Text): Integer { native "updatesupport" }
+public function createFile(path: Text): Integer { native "updatesupport" }
+public function makeDirectory(path: Text): Integer { native "updatesupport" }
+public function syncDescriptor(fd: Integer): Integer { native "updatesupport" }
+public function closeDescriptor(fd: Integer): Integer { native "updatesupport" }
+public function platform(): Text { native "updatesupport" }
+public function pause(milliseconds: Integer): Integer { native "updatesupport" }
+
+function decodeInfo(raw: Bytes): Info {
+    return Info { error: raw.getInt64(0); device: raw.getInt64(8); inode: raw.getInt64(16); mode: raw.getInt64(24);
+        size: raw.getInt64(32); modified: raw.getInt64(40); changed: raw.getInt64(48); links: raw.getInt64(56) }
+}
+function decodeLocated(raw: Bytes): Located {
+    return Located { error: raw.getInt64(0); path: Text(raw.slice(8, raw.length)) }
+}
+public function linkStatus(path: Text): Info { return decodeInfo(statusNative(path, false)) }
+public function status(path: Text): Info { return decodeInfo(statusNative(path, true)) }
+public function descriptorStatus(fd: Integer): Info { return decodeInfo(descriptorStatusNative(fd)) }
+public function kind(info: Info): Integer { return info.mode & FILE_TYPE }
+public function isDirectory(info: Info): Boolean { return info.error == 0 && kind(info) == DIRECTORY }
+public function isRegular(info: Info): Boolean { return info.error == 0 && kind(info) == REGULAR }
+public function exists(path: Text): Boolean { return status(path).error == 0 }
+public function attributes(path: Text): Listing {
+    let raw = attributesNative(path)
+    let names: List<Text> = []
+    let start = 8
+    for index in 8..raw.length {
+        if raw[index] == 0 {
+            names.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    if start < raw.length { names.add(Text(raw.slice(start, raw.length))) }
+    return Listing { error: raw.getInt64(0); names: names }
+}
+public function resolve(path: Text): Located { return decodeLocated(resolveNative(path)) }
+public function currentDirectory(): Located { return decodeLocated(currentDirectoryNative()) }
+public function temporaryFile(directory: Text, prefix: Text): Created {
+    let raw = temporaryFileNative(directory, prefix)
+    return Created { descriptor: raw.getInt64(0); path: Text(raw.slice(8, raw.length)) }
+}
+public function temporaryDirectory(directory: Text, prefix: Text): Located { return decodeLocated(temporaryDirectoryNative(directory, prefix)) }
+public function temporaryRoot(): Text {
+    for name in ["TMPDIR", "TEMP", "TMP"] {
+        let value = system.getenv(name)
+        if value != "" && isDirectory(status(value)) { return value }
+    }
+    return "/tmp"
+}
+
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+public function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for index in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+    }
+    return -1
+}
+public function split(source: Text, separator: Integer): List<Text> {
+    let raw = Bytes(source)
+    let result: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == separator {
+            result.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+public function join(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+public function lower(source: Text): Text {
+    let raw = Bytes(source)
+    let result = Bytes(raw.length)
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte >= 65 && byte <= 90 { byte += 32 }
+        result[index] = byte
+    }
+    return Text(result)
+}
+public function compare(left: Text, right: Text): Integer {
+    let a = Bytes(left)
+    let b = Bytes(right)
+    let count = min(a.length, b.length)
+    for index in 0..count {
+        if a[index] != b[index] {
+            if a[index] < b[index] { return -1 }
+            return 1
+        }
+    }
+    if a.length < b.length { return -1 }
+    if a.length > b.length { return 1 }
+    return 0
+}
+public function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let out = Bytes()
+    for byte in data {
+        out.add(digits[byte >> 4])
+        out.add(digits[byte & 15])
+    }
+    return Text(out)
+}
+public function pythonText(value: Text): Text {
+    let raw = Bytes(value)
+    let quote = 39
+    let hasSingle = false
+    let hasDouble = false
+    for byte in raw {
+        if byte == 39 { hasSingle = true }
+        if byte == 34 { hasDouble = true }
+    }
+    if hasSingle && !hasDouble { quote = 34 }
+    let out = Bytes()
+    out.add(quote)
+    let digits = Bytes("0123456789abcdef")
+    for byte in raw {
+        if byte == 92 || byte == quote { out.add(92); out.add(byte) }
+        else if byte == 10 { out.addBytes(Bytes("\\n")) }
+        else if byte == 13 { out.addBytes(Bytes("\\r")) }
+        else if byte == 9 { out.addBytes(Bytes("\\t")) }
+        else if byte < 32 || byte == 127 { out.addBytes(Bytes("\\x")); out.add(digits[byte >> 4]); out.add(digits[byte & 15]) }
+        else { out.add(byte) }
+    }
+    out.add(quote)
+    return Text(out)
+}
+public function pythonList(values: List<Text>): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add(pythonText(value)) }
+    return "[" + join(quoted, ", ") + "]"
+}
+public function describe(code: Integer, path: Text): Text {
+    let number = code
+    if number < 0 { number = -number }
+    let message = "[Errno " + Text(number) + "] " + files.errorText(number)
+    if path == "" { return message }
+    return message + ": " + pythonText(path)
+}
+public function describeMove(code: Integer, from: Text, to: Text): Text {
+    return describe(code, from) + " -> " + pythonText(to)
+}
+
+public function normalize(path: Text): Text {
+    let absolutePath = starts(path, "/")
+    let parts: List<Text> = []
+    for part in split(path, 47) {
+        if part != "" && part != "." { parts.add(part) }
+    }
+    if absolutePath { return "/" + join(parts, "/") }
+    if parts.length == 0 { return "." }
+    return join(parts, "/")
+}
+public function absolute(path: Text): Located {
+    if starts(path, "/") { return Located { error: 0; path: normalize(path) } }
+    let current = currentDirectory()
+    if current.error != 0 { return current }
+    let normalized = normalize(path)
+    if normalized == "." { return Located { error: 0; path: current.path } }
+    return Located { error: 0; path: child(current.path, normalized) }
+}
+public function child(directory: Text, name: Text): Text {
+    if ends(directory, "/") { return directory + name }
+    return directory + "/" + name
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    if index < 0 { return "." }
+    if index == 0 { return "/" }
+    return Text(raw.slice(0, index))
+}
+public function name(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return Text(raw.slice(index + 1, raw.length))
+}
+public function looseResolve(path: Text): Located {
+    let full = absolute(path)
+    if full.error != 0 { return full }
+    let resolved = "/"
+    let parts = split(full.path, 47)
+    let missing = false
+    for index in 1..parts.length {
+        let part = parts[index]
+        if part == "" || part == "." { continue }
+        if part == ".." { resolved = parent(resolved); continue }
+        let candidate = child(resolved, part)
+        if missing { resolved = candidate; continue }
+        let info = linkStatus(candidate)
+        if info.error != 0 { missing = true; resolved = candidate; continue }
+        if kind(info) == LINK {
+            let target = resolve(candidate)
+            if target.error != 0 { missing = true; resolved = candidate; continue }
+            resolved = target.path
+        } else { resolved = candidate }
+    }
+    return Located { error: 0; path: resolved }
+}
+public function within(path: Text, root: Text): Boolean {
+    if path == root || root == "/" { return true }
+    return starts(path, root + "/")
+}
+public function makeDirectories(path: Text): Integer {
+    let full = absolute(path)
+    if full.error != 0 { return full.error }
+    let current = ""
+    for part in split(full.path, 47) {
+        if part == "" { continue }
+        current = current + "/" + part
+        let info = status(current)
+        if info.error == 0 {
+            if kind(info) != DIRECTORY { return -17 }
+            continue
+        }
+        let made = makeDirectory(current)
+        if made != 0 && !(made == -17 && isDirectory(status(current))) { return made }
+    }
+    return 0
+}
+public function writeFile(path: Text, data: Bytes): Integer {
+    let fd = createFile(path)
+    if fd < 0 { return fd }
+    let written = files.write(fd, data, 0, data.length)
+    let closed = files.close(fd)
+    if written < 0 { return written }
+    if closed < 0 { return closed }
+    return 0
+}
+public function removeTree(path: Text): Integer {
+    let info = linkStatus(path)
+    if info.error != 0 { return info.error }
+    if kind(info) != DIRECTORY { return files.remove(path) }
+    for entry in files.list(path) {
+        let removed = removeTree(child(path, entry))
+        if removed != 0 && removed != -2 { return removed }
+    }
+    return files.removeDirectory(path)
+}
+
+public function execute(command: List<Text>, seconds: Integer): Execution {
+    let capture = temporaryDirectory(temporaryRoot(), "minyar-command-")
+    if capture.error != 0 { return Execution { status: -1; output: Bytes(); errorOutput: ""; timedOut: false; launch: capture.error } }
+    let out = capture.path + "/stdout"
+    let err = capture.path + "/stderr"
+    let argv = ["sh", "-c", "out=$1; err=$2; shift 2; exec \"$@\" >\"$out\" 2>\"$err\"", "sh", out, err]
+    for word in command { argv.add(word) }
+    let handle = system.spawn("/bin/sh", argv, system.environment(), "")
+    if handle <= 0 {
+        removeTree(capture.path)
+        return Execution { status: -1; output: Bytes(); errorOutput: ""; timedOut: false; launch: handle }
+    }
+    let timedOut = false
+    let state = system.ProcessStatus { state: system.PENDING; exitCode: 0; signal: 0; error: 0 }
+    if seconds <= 0 { state = system.wait(handle) }
+    else {
+        let deadline = system.monotonicNanoseconds() + seconds * 1000000000
+        state = system.poll(handle)
+        while state.error == 0 && state.state == system.PENDING {
+            if system.monotonicNanoseconds() >= deadline {
+                timedOut = true
+                system.sendSignal(system.childProcessId(handle), 9)
+                state = system.wait(handle)
+                break
+            }
+            pause(10)
+            state = system.poll(handle)
+        }
+    }
+    let code = state.exitCode
+    if state.state == system.SIGNALED { code = -state.signal }
+    if state.error != 0 { code = -1 }
+    let output = files.readFile(out)
+    let errorOutput = Text(files.readFile(err))
+    removeTree(capture.path)
+    return Execution { status: code; output: output; errorOutput: errorOutput; timedOut: timedOut; launch: 0 }
+}
+public function commandFailure(command: List<Text>, result: Execution, seconds: Integer): Text {
+    if result.launch != 0 { return describe(result.launch, command[0]) }
+    let shown = "Command '" + pythonList(command) + "'"
+    if result.timedOut { return shown + " timed out after " + Text(seconds) + " seconds" }
+    if result.status == 127 && result.output.length == 0 && find(result.errorOutput, "not found") >= 0 { return describe(-2, command[0]) }
+    if result.status == 126 && result.output.length == 0 { return describe(-13, command[0]) }
+    if result.status < 0 { return shown + " died with signal " + Text(-result.status) + "." }
+    return shown + " returned non-zero exit status " + Text(result.status) + "."
+}
+
+public function option(name: Text, required: Boolean, integer: Boolean, help: Text): Option {
+    let raw = Bytes(name)
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte >= 97 && byte <= 122 { raw[index] = byte - 32 }
+        if byte == 45 { raw[index] = 95 }
+    }
+    return Option { name: name; metavar: Text(raw); required: required; integer: integer; help: help; value: ""; seen: false }
+}
+function spaces(count: Integer): Text {
+    let raw = Bytes(count)
+    for index in 0..count { raw[index] = 32 }
+    return Text(raw)
+}
+function textWidth(): Integer {
+    let columns = parseInteger(system.getenv("COLUMNS"))
+    if columns.error == 0 && integerValue(columns.path) > 0 { return integerValue(columns.path) - 2 }
+    return 78
+}
+function wrapLines(parts: List<Text>, indent: Text, first: Integer, width: Integer): List<Text> {
+    let lines: List<Text> = []
+    let line: List<Text> = []
+    let length = first - 1
+    for part in parts {
+        let size = Bytes(part).length
+        if length + 1 + size > width && line.length > 0 {
+            lines.add(indent + join(line, " "))
+            line = []
+            length = Bytes(indent).length - 1
+        }
+        line.add(part)
+        length += size + 1
+    }
+    if line.length > 0 { lines.add(indent + join(line, " ")) }
+    return lines
+}
+function usage(parser: Parser): Text {
+    let prefix = "usage: "
+    let parts = ["[-h]"]
+    let words = ["[-h]"]
+    for item in parser.options {
+        if item.required {
+            parts.add("--" + item.name + " " + item.metavar)
+            words.add("--" + item.name)
+            words.add(item.metavar)
+        } else {
+            parts.add("[--" + item.name + " " + item.metavar + "]")
+            words.add("[--" + item.name + " " + item.metavar + "]")
+        }
+    }
+    let line = parser.program + " " + join(parts, " ")
+    let width = textWidth()
+    if Bytes(prefix).length + Bytes(line).length <= width { return prefix + line + "\n" }
+    let indent = spaces(Bytes(prefix).length + Bytes(parser.program).length + 1)
+    let all = [parser.program]
+    for word in words { all.add(word) }
+    let lines = wrapLines(all, indent, Bytes(prefix).length, width)
+    lines[0] = Text(Bytes(lines[0]).slice(Bytes(indent).length, Bytes(lines[0]).length))
+    return prefix + join(lines, "\n") + "\n"
+}
+function help(parser: Parser): Text {
+    let width = textWidth()
+    let longest = 10
+    for item in parser.options { longest = max(longest, Bytes("--" + item.name + " " + item.metavar).length) }
+    let position = min(longest + 4, min(24, max(width - 20, 4)))
+    let helpWidth = max(width - position, 11)
+    let parts = [usage(parser), "\n", parser.description, "\n\noptions:\n"]
+    let headers = ["-h, --help"]
+    let texts = ["show this help message and exit"]
+    for item in parser.options {
+        headers.add("--" + item.name + " " + item.metavar)
+        texts.add(item.help)
+    }
+    for index in 0..headers.length {
+        let header = headers[index]
+        if texts[index] == "" { parts.add("  " + header + "\n"); continue }
+        let lines = wrapLines(split(texts[index], 32), "", 0, helpWidth)
+        if Bytes(header).length <= position - 4 {
+            parts.add("  " + header + spaces(position - 4 - Bytes(header).length) + "  " + lines[0] + "\n")
+        } else { parts.add("  " + header + "\n" + spaces(position) + lines[0] + "\n") }
+        for rest in 1..lines.length { parts.add(spaces(position) + lines[rest] + "\n") }
+    }
+    let text = joinText(parts)
+    return Text(Bytes(text).slice(0, Bytes(text).length - 1))
+}
+function reject(parser: Parser, message: Text): Integer {
+    system.writeStandardError(usage(parser) + parser.program + ": error: " + message + "\n")
+    return 2
+}
+function negativeNumber(word: Text): Boolean {
+    let raw = Bytes(word)
+    if raw.length < 2 || raw[0] != 45 { return false }
+    let dot = false
+    let digits = 0
+    for index in 1..raw.length {
+        if raw[index] == 46 && !dot { dot = true; continue }
+        if raw[index] < 48 || raw[index] > 57 { return false }
+        digits += 1
+    }
+    return digits > 0 && (raw[raw.length - 1] != 46)
+}
+function optionLike(word: Text): Boolean {
+    if !starts(word, "-") || word == "-" || negativeNumber(word) { return false }
+    if find(word, " ") >= 0 { return starts(word, "--") && find(word, "=") >= 0 && find(word, "=") < find(word, " ") }
+    return true
+}
+public function parseInteger(word: Text): Located {
+    let raw = Bytes(word)
+    let start = 0
+    let end = raw.length
+    while start < end && (raw[start] == 32 || (raw[start] >= 9 && raw[start] <= 13)) { start += 1 }
+    while end > start && (raw[end - 1] == 32 || (raw[end - 1] >= 9 && raw[end - 1] <= 13)) { end -= 1 }
+    let negative = false
+    if start < end && (raw[start] == 43 || raw[start] == 45) { negative = raw[start] == 45; start += 1 }
+    if start >= end { return Located { error: -22; path: "" } }
+    let value = 0
+    let saturated = false
+    let previousDigit = false
+    for index in start..end {
+        let byte = raw[index]
+        if byte == 95 {
+            if !previousDigit || index + 1 >= end { return Located { error: -22; path: "" } }
+            previousDigit = false
+            continue
+        }
+        if byte < 48 || byte > 57 { return Located { error: -22; path: "" } }
+        previousDigit = true
+        if !saturated {
+            if value > (9223372036854775807 - (byte - 48)) / 10 { saturated = true }
+            else { value = value * 10 + (byte - 48) }
+        }
+    }
+    if !previousDigit { return Located { error: -22; path: "" } }
+    if saturated {
+        if negative { return Located { error: 0; path: "-9223372036854775808" } }
+        return Located { error: 0; path: "9223372036854775807" }
+    }
+    if negative { value = -value }
+    return Located { error: 0; path: Text(value) }
+}
+public function integerValue(word: Text): Integer {
+    let raw = Bytes(word)
+    let negative = raw.length > 0 && raw[0] == 45
+    let value = 0
+    for byte in raw {
+        if byte >= 48 && byte <= 57 {
+            if negative { value = value * 10 - (byte - 48) } else { value = value * 10 + (byte - 48) }
+        }
+    }
+    return value
+}
+public function parse(parser: Parser): Integer {
+    let count = argumentCount()
+    let index = 0
+    let extras: List<Text> = []
+    while index < count {
+        let word = argument(index)
+        index += 1
+        if word == "--" {
+            while index < count { extras.add(argument(index)); index += 1 }
+            break
+        }
+        if word == "-h" {
+            print(help(parser))
+            return 0
+        }
+        if !starts(word, "--") {
+            extras.add(word)
+            continue
+        }
+        let raw = Bytes(word)
+        let equals = -1
+        for position in 2..raw.length { if raw[position] == 61 { equals = position; break } }
+        let key = Text(raw.slice(2, raw.length))
+        let inline = ""
+        if equals >= 0 { key = Text(raw.slice(2, equals)); inline = Text(raw.slice(equals + 1, raw.length)) }
+        let names = ["help"]
+        for item in parser.options { names.add(item.name) }
+        let matches: List<Integer> = []
+        let chosen = -1
+        for position in 0..names.length {
+            if names[position] == key { chosen = position }
+            if starts(names[position], key) { matches.add(position) }
+        }
+        if chosen < 0 && matches.length == 1 { chosen = matches[0] }
+        if chosen < 0 && matches.length > 1 {
+            let spelled: List<Text> = []
+            for position in matches { spelled.add("--" + names[position]) }
+            return reject(parser, "ambiguous option: --" + key + " could match " + join(spelled, ", "))
+        }
+        if chosen < 0 { extras.add(word); continue }
+        if chosen == 0 {
+            if equals >= 0 { return reject(parser, "argument -h/--help: ignored explicit argument " + pythonText(inline)) }
+            print(help(parser))
+            return 0
+        }
+        let selected = parser.options[chosen - 1]
+        let value = inline
+        if equals < 0 {
+            if index >= count || optionLike(argument(index)) {
+                return reject(parser, "argument --" + selected.name + ": expected one argument")
+            }
+            value = argument(index)
+            index += 1
+        }
+        if selected.integer {
+            let parsed = parseInteger(value)
+            if parsed.error != 0 { return reject(parser, "argument --" + selected.name + ": invalid int value: " + pythonText(value)) }
+            value = parsed.path
+        }
+        selected.value = value
+        selected.seen = true
+    }
+    let missing: List<Text> = []
+    for item in parser.options { if item.required && !item.seen { missing.add("--" + item.name) } }
+    if missing.length > 0 { return reject(parser, "the following arguments are required: " + join(missing, ", ")) }
+    if extras.length > 0 { return reject(parser, "unrecognized arguments: " + join(extras, " ")) }
+    return -1
+}
+public function value(parser: Parser, name: Text): Text {
+    for item in parser.options { if item.name == name { return item.value } }
+    return ""
+}
+public function given(parser: Parser, name: Text): Boolean {
+    for item in parser.options { if item.name == name { return item.seen } }
+    return false
+}

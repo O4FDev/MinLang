@@ -1,0 +1,464 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "../scripts/update-bundle.min" as bundle
+use "../scripts/update-support.min" as updates
+use "system" as system
+use "files" as files
+use "sha256" as sha256
+
+record Lab { scratch: Text; logs: Text; lab: Text; root: Text; output: Text; main: Text; serial: Integer }
+record Counter { calls: Integer; changed: Boolean }
+record Opened { items: List<bundle.Temporary> }
+
+let names = ["test_link_fixture_never_accepts_a_copied_file_or_directory", "test_complete_tree_modes_empty_directories_and_deterministic_output",
+    "test_failed_final_tree_check_closes_temporary_before_cleanup", "test_index_must_stay_exact_even_when_directory_metadata_is_unchanged",
+    "test_directory_index_hint_can_change_without_changing_the_bundle", "test_directory_security_attributes_and_identity_still_fail_closed",
+    "test_native_exe_name_and_previously_modified_image_are_valid", "test_windows_path_fd_metadata_relation_keeps_copy_change_detection",
+    "test_regular_copies_are_valid_independent_bundle_resources", "test_ambiguous_names_bad_entrypoints_and_embedded_output_refused",
+    "test_symlinks_hardlinks_and_special_files_fail_without_replacing_output", "test_internal_framework_aliases_are_refused_without_dereferencing",
+    "test_unsupported_attribute_policy_covers_root_directories_and_files"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "Packager." + name { valid = true } }
+    test.check(valid, "unknown update bundle case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "Packager." + name { return true } }
+    return false
+}
+
+function logFile(fixture: Lab): Text {
+    fixture.serial += 1
+    return fixture.logs + "/command" + Text(fixture.serial)
+}
+function shell(fixture: Lab, command: List<Text>, phase: Text) {
+    test.require(test.run(command, system.environment(), "", logFile(fixture), 30), phase)
+}
+function directories(path: Text) {
+    test.check(updates.makeDirectories(path) == 0, "create fixture directory " + path)
+}
+function setUp(): Lab {
+    let scratch = test.scratch()
+    let logs = scratch + "/logs"
+    directories(logs)
+    directories(scratch + "/lab")
+    let lab = support.resolve(scratch + "/lab", logs + "/resolve")
+    let root = lab + "/root"
+    directories(root + "/App.app/Contents/MacOS")
+    let elf = Bytes()
+    elf.add(127)
+    elf.addBytes(Bytes("ELFowned"))
+    writeBytesFile(root + "/App.app/Contents/MacOS/main", elf)
+    directories(root + "/App.app/Contents/Resources")
+    writeBytesFile(root + "/App.app/Contents/Resources/resource with spaces", Bytes("full resource"))
+    directories(root + "/empty")
+    return Lab { scratch: scratch; logs: logs; lab: lab; root: root; output: lab + "/Tolum.pkg"; main: "App.app/Contents/MacOS/main"; serial: 0 }
+}
+function tearDown(fixture: Lab) { test.removeTree(fixture.scratch) }
+
+function symlinker(fixture: Lab): Callback<Text, Text, Nothing> {
+    return function(target: Text, path: Text) { shell(fixture, ["ln", "-s", target, path], "create symlink fixture") }
+}
+function linkFixture(fixture: Lab, path: Text, target: Text, create: Callback<Text, Text, Nothing>): Text {
+    create(target, path)
+    let info = updates.linkStatus(path)
+    if info.error != 0 || updates.kind(info) != updates.LINK { return "fixture must be a real symlink" }
+    let read = test.run(["readlink", path], system.environment(), "", logFile(fixture), 30)
+    if read.status != 0 || test.lines(read.output).length != 1 || test.lines(read.output)[0] != target { return "fixture link target differs" }
+    return ""
+}
+function readlink(fixture: Lab, path: Text): Text {
+    let read = test.run(["readlink", path], system.environment(), "", logFile(fixture), 30)
+    test.require(read, "readlink")
+    return test.lines(read.output)[0]
+}
+function contains(haystack: Bytes, needle: Bytes): Boolean {
+    if needle.length > haystack.length { return false }
+    for start in 0..(haystack.length - needle.length + 1) {
+        let equal = true
+        for index in 0..needle.length { if haystack[start + index] != needle[index] { equal = false; break } }
+        if equal { return true }
+    }
+    return false
+}
+function bigEndian(data: Bytes, at: Integer, width: Integer): Integer {
+    let value = 0
+    for index in 0..width { value = value * 256 + data[at + index] }
+    return value
+}
+function noTemporaries(fixture: Lab, label: Text) {
+    for name in files.list(fixture.lab) { test.check(!support.starts(name, ".minyar-bundle-"), label + ": temporary left behind " + name) }
+}
+function previous(fixture: Lab) { writeBytesFile(fixture.output, Bytes("previous artifact")) }
+function preserved(fixture: Lab, label: Text) {
+    test.check(support.same(readBytesFile(fixture.output), Bytes("previous artifact")), label + ": previous output replaced")
+}
+function succeeded(summary: bundle.Summary, label: Text): bundle.Summary {
+    test.check(summary.error == "", label + " failed: " + summary.error)
+    return summary
+}
+function refused(summary: bundle.Summary, label: Text): Text {
+    test.check(summary.error != "", label + " was accepted")
+    return summary.error
+}
+function replay(info: updates.Info): updates.Info {
+    return updates.Info { error: info.error; device: info.device; inode: info.inode; mode: info.mode; size: info.size; modified: info.modified; changed: info.changed; links: info.links }
+}
+
+let cases = 0
+if chosen("test_link_fixture_never_accepts_a_copied_file_or_directory") {
+    let fixture = setUp()
+    for directory in [false, true] {
+        let source = fixture.lab + "/file"
+        let link = fixture.root + "/copied-file"
+        if directory {
+            source = fixture.lab + "/directory"
+            link = fixture.root + "/copied-directory"
+            directories(source)
+            writeBytesFile(source + "/data", Bytes("original data"))
+        } else { writeBytesFile(source, Bytes("original data")) }
+        let copier = function(target: Text, path: Text) {
+            if directory { shell(fixture, ["cp", "-Rp", target, path], "copy fixture directory") }
+            else { shell(fixture, ["cp", "-p", target, path], "copy fixture file") }
+        }
+        let failure = linkFixture(fixture, link, source, copier)
+        test.check(test.contains(failure, "real symlink"), "copied fixture accepted as a symlink (" + support.flag(directory) + ")")
+        test.check(updates.kind(updates.linkStatus(link)) != updates.LINK, "copied fixture is not a link")
+        let data = link
+        if directory { data = link + "/data" }
+        test.check(support.same(readBytesFile(data), Bytes("original data")), "copied fixture data")
+    }
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_complete_tree_modes_empty_directories_and_deterministic_output") {
+    let fixture = setUp()
+    let first = succeeded(bundle.prepare(fixture.root, fixture.output, fixture.main), "first bundle")
+    let data = readBytesFile(fixture.output)
+    test.check(support.same(data.slice(0, 16), Bytes("MINYAR-BUNDLE-1\n")), "bundle magic")
+    test.check(first.sha256 == sha256.hex(sha256.digest(data)), "summary digest")
+    let again = fixture.lab + "/again.pkg"
+    let second = succeeded(bundle.prepare(fixture.root, again, fixture.main), "second bundle")
+    test.check(bundle.summaryJson(second) == bundle.summaryJson(first), "deterministic summary")
+    test.check(support.same(readBytesFile(again), data), "deterministic bytes")
+    let at = 16
+    let size = bigEndian(data, at, 4)
+    at += 4
+    test.check(Text(data.slice(at, at + size)) == fixture.main, "entrypoint field")
+    at += size
+    let count = bigEndian(data, at, 4)
+    at += 4
+    let paths: List<Text> = []
+    let kinds: List<Integer> = []
+    let modes: List<Integer> = []
+    let contents: List<Bytes> = []
+    for item in 0..count {
+        let kind = data[at]
+        let mode = data[at + 1]
+        let length = bigEndian(data, at + 2, 4)
+        let bytes = bigEndian(data, at + 6, 8)
+        at += 14
+        paths.add(Text(data.slice(at, at + length)))
+        at += length
+        kinds.add(kind)
+        modes.add(mode)
+        contents.add(data.slice(at, at + bytes))
+        at += bytes
+    }
+    test.check(at == data.length, "index covers the whole bundle")
+    let seen = 0
+    for index in 0..paths.length {
+        if paths[index] == "empty" {
+            test.check(kinds[index] == 68 && modes[index] == 0 && contents[index].length == 0, "empty directory entry")
+            seen += 1
+        }
+        if paths[index] == fixture.main {
+            test.check(modes[index] == 1, "entrypoint is executable")
+            seen += 1
+        }
+        if paths[index] == "App.app/Contents/Resources/resource with spaces" {
+            test.check(support.same(contents[index], Bytes("full resource")), "resource contents")
+            seen += 1
+        }
+    }
+    test.check(seen == 3, "bundle index lists the expected entries")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_failed_final_tree_check_closes_temporary_before_cleanup") {
+    let fixture = setUp()
+    previous(fixture)
+    let opened = Opened { items: [] }
+    let hooks = bundle.defaults()
+    hooks.created = function(temporary: bundle.Temporary) { opened.items.add(temporary) }
+    hooks.remove = function(path: Text): Integer {
+        if support.starts(updates.name(path), ".minyar-bundle-") {
+            test.check(opened.items.length > 0, "cleanup must close its temporary first")
+            let current = opened.items[opened.items.length - 1]
+            test.check(!current.open && updates.descriptorStatus(current.descriptor).error == -9, "cleanup must close its temporary first")
+        }
+        return files.remove(path)
+    }
+    hooks.sync = function(fd: Integer): Integer {
+        let result = updates.syncDescriptor(fd)
+        writeBytesFile(fixture.root + "/late unsigned resource", Bytes("not in the index"))
+        return result
+    }
+    let error = refused(bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks), "late tree change")
+    test.check(test.contains(error, "tree changed"), "late tree change error: " + error)
+    preserved(fixture, "late tree change")
+    test.check(opened.items.length == 1 && !opened.items[0].open, "temporary closed")
+    noTemporaries(fixture, "late tree change")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_index_must_stay_exact_even_when_directory_metadata_is_unchanged") {
+    let fixture = setUp()
+    previous(fixture)
+    let original = updates.linkStatus(fixture.root)
+    let state = Counter { calls: 0; changed: false }
+    let hooks = bundle.defaults()
+    hooks.pathInfo = function(path: Text): updates.Info {
+        if path == fixture.root { return replay(original) }
+        return updates.linkStatus(path)
+    }
+    hooks.sync = function(fd: Integer): Integer {
+        let result = updates.syncDescriptor(fd)
+        if !state.changed {
+            writeBytesFile(fixture.root + "/late unsigned resource", Bytes("not in the index"))
+            state.changed = true
+        }
+        return result
+    }
+    let error = refused(bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks), "unchanged root metadata")
+    test.check(test.contains(error, "tree changed"), "unchanged root metadata error: " + error)
+    preserved(fixture, "unchanged root metadata")
+    noTemporaries(fixture, "unchanged root metadata")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_directory_index_hint_can_change_without_changing_the_bundle") {
+    let fixture = setUp()
+    let empty = fixture.root + "/empty"
+    let info = updates.linkStatus(empty)
+    let counter = Counter { calls: 0; changed: false }
+    let hooks = bundle.defaults()
+    hooks.pathInfo = function(path: Text): updates.Info {
+        let current = updates.linkStatus(path)
+        if path == empty {
+            counter.calls += 1
+            return replay(info)
+        }
+        return current
+    }
+    let first = succeeded(bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks), "replayed directory metadata")
+    test.check(counter.calls == 2, "directory metadata observed in the scan and the rescan")
+    let second = succeeded(bundle.prepare(fixture.root, fixture.lab + "/again.pkg", fixture.main), "plain bundle")
+    test.check(bundle.summaryJson(first) == bundle.summaryJson(second), "replayed metadata summary")
+    test.check(support.same(readBytesFile(fixture.output), readBytesFile(fixture.lab + "/again.pkg")), "replayed metadata bytes")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_directory_security_attributes_and_identity_still_fail_closed") {
+    let fixture = setUp()
+    let empty = fixture.root + "/empty"
+    let info = updates.linkStatus(empty)
+    for change in ["mode", "inode"] {
+        let counter = Counter { calls: 0; changed: false }
+        let hooks = bundle.defaults()
+        hooks.pathInfo = function(path: Text): updates.Info {
+            let current = updates.linkStatus(path)
+            if path == empty {
+                counter.calls += 1
+                let values = replay(info)
+                if counter.calls > 1 {
+                    if change == "mode" { values.mode = values.mode ^ 0o200 }
+                    else { values.inode = values.inode + 1 }
+                }
+                return values
+            }
+            return current
+        }
+        previous(fixture)
+        refused(bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks), "directory " + change + " change")
+        preserved(fixture, "directory " + change + " change")
+        noTemporaries(fixture, "directory " + change + " change")
+    }
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_native_exe_name_and_previously_modified_image_are_valid") {
+    let fixture = setUp()
+    let main = fixture.root + "/Tolum.exe"
+    writeBytesFile(main, Bytes("MZunsigned fixture"))
+    updates.pause(20)
+    writeBytesFile(main, Bytes("MZfinal signed image fixture"))
+    let first = succeeded(bundle.prepare(fixture.root, fixture.output, "Tolum.exe"), "exe bundle")
+    test.check(first.entrypoint == "Tolum.exe", "exe entrypoint")
+    test.check(contains(readBytesFile(fixture.output), readBytesFile(main)), "exe image in bundle")
+    let second = succeeded(bundle.prepare(fixture.root, fixture.lab + "/again.pkg", "Tolum.exe"), "second exe bundle")
+    test.check(bundle.summaryJson(first) == bundle.summaryJson(second), "exe summary")
+    test.check(support.same(readBytesFile(fixture.output), readBytesFile(fixture.lab + "/again.pkg")), "exe bytes")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_windows_path_fd_metadata_relation_keeps_copy_change_detection") {
+    let fixture = setUp()
+    let main = fixture.root + "/" + fixture.main
+    let info = updates.linkStatus(main)
+    for difference in [[true, false], [false, true], [true, true]] {
+        for duringCopy in [false, true] {
+            let counter = Counter { calls: 0; changed: false }
+            let hooks = bundle.defaults()
+            hooks.descriptorInfo = function(fd: Integer): updates.Info {
+                let current = updates.descriptorStatus(fd)
+                if current.device == info.device && current.inode == info.inode {
+                    counter.calls += 1
+                    if duringCopy && counter.calls > 1 {
+                        let values = replay(current)
+                        if difference[0] { values.mode = values.mode | 0o111 }
+                        if difference[1] { values.changed = values.changed + 1 }
+                        return values
+                    }
+                }
+                return current
+            }
+            let label = "descriptor mode " + support.flag(difference[0]) + " ctime " + support.flag(difference[1]) + " during copy " + support.flag(duringCopy)
+            previous(fixture)
+            let summary = bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks)
+            if duringCopy {
+                test.check(test.contains(summary.error, "file changed during copying"), label + ": " + summary.error)
+                preserved(fixture, label)
+            } else {
+                succeeded(summary, label)
+                test.check(contains(readBytesFile(fixture.output), readBytesFile(main)), label + ": entrypoint copied")
+            }
+            test.check(counter.calls == 2, label + ": descriptor observed before and after copying")
+            noTemporaries(fixture, label)
+        }
+    }
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_regular_copies_are_valid_independent_bundle_resources") {
+    let fixture = setUp()
+    let outside = fixture.lab + "/outside-resource"
+    writeBytesFile(outside, Bytes("copied resource"))
+    let tree = fixture.lab + "/outside-directory"
+    directories(tree)
+    writeBytesFile(tree + "/data", Bytes("copied directory resource"))
+    let copied = fixture.root + "/copied-resource"
+    shell(fixture, ["cp", "-p", outside, copied], "copy resource")
+    let folder = fixture.root + "/copied-directory"
+    shell(fixture, ["cp", "-Rp", tree, folder], "copy resource directory")
+    let copiedInfo = updates.linkStatus(copied)
+    let outsideInfo = updates.linkStatus(outside)
+    test.check(updates.kind(copiedInfo) == updates.REGULAR, "copied resource is a regular file")
+    test.check(updates.kind(updates.linkStatus(folder)) == updates.DIRECTORY, "copied directory is a directory")
+    test.check(copiedInfo.links == 1, "copied resource has one link")
+    test.check(outsideInfo.device != copiedInfo.device || outsideInfo.inode != copiedInfo.inode, "copied resource has its own identity")
+    let first = succeeded(bundle.prepare(fixture.root, fixture.output, fixture.main), "copied resources")
+    let data = readBytesFile(fixture.output)
+    test.check(contains(data, Bytes("copied resource")), "copied resource bundled")
+    test.check(contains(data, Bytes("copied directory resource")), "copied directory resource bundled")
+    writeBytesFile(outside, Bytes("changed source"))
+    writeBytesFile(tree + "/data", Bytes("changed source"))
+    test.check(support.same(readBytesFile(copied), Bytes("copied resource")), "copy independent of source")
+    test.check(support.same(readBytesFile(folder + "/data"), Bytes("copied directory resource")), "directory copy independent of source")
+    let second = succeeded(bundle.prepare(fixture.root, fixture.lab + "/again.pkg", fixture.main), "copied resources again")
+    test.check(bundle.summaryJson(second) == bundle.summaryJson(first), "copied resources summary")
+    test.check(support.same(readBytesFile(fixture.lab + "/again.pkg"), data), "copied resources bytes")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_ambiguous_names_bad_entrypoints_and_embedded_output_refused") {
+    let fixture = setUp()
+    let entrypoints = ["../escape", "/absolute", "NUL", "missing", "App.app/Contents/Resources/resource with spaces"]
+    let messages = ["invalid bundle path component", "invalid bundle path component", "reserved Windows bundle filename",
+        "entrypoint is not a regular bundle file", "entrypoint must be a native executable, never an interpreter script"]
+    for index in 0..entrypoints.length {
+        let error = refused(bundle.prepare(fixture.root, fixture.output, entrypoints[index]), "entrypoint " + entrypoints[index])
+        test.check(error == messages[index], "entrypoint " + entrypoints[index] + ": " + error)
+    }
+    test.check(!support.exists(fixture.output), "refused entrypoints wrote output")
+    writeBytesFile(fixture.root + "/Case", Bytes("one"))
+    writeBytesFile(fixture.root + "/case", Bytes("two"))
+    let spellings = 0
+    for name in files.list(fixture.root) { if name == "Case" || name == "case" { spellings += 1 } }
+    if spellings == 2 {
+        let error = refused(bundle.prepare(fixture.root, fixture.output, fixture.main), "case-insensitive duplicate")
+        test.check(error == "case-insensitive duplicate bundle path", "case duplicate error: " + error)
+    }
+    let error = refused(bundle.prepare(fixture.root, fixture.root + "/embedded.pkg", fixture.main), "embedded output")
+    test.check(error == "bundle output cannot be inside its input tree", "embedded output error: " + error)
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_symlinks_hardlinks_and_special_files_fail_without_replacing_output") {
+    let fixture = setUp()
+    previous(fixture)
+    let external = fixture.lab + "/outside"
+    writeBytesFile(external, Bytes("external"))
+    let linked = fixture.root + "/escape"
+    test.check(linkFixture(fixture, linked, external, symlinker(fixture)) == "", "fixture must be a real symlink")
+    let error = refused(bundle.prepare(fixture.root, fixture.output, fixture.main), "symlink")
+    test.check(error == "bundle links and reparse points are not supported", "symlink error: " + error)
+    test.check(files.remove(linked) == 0, "remove symlink fixture")
+    shell(fixture, ["ln", external, linked], "create hardlink fixture")
+    let sourceInfo = updates.linkStatus(external)
+    let linkInfo = updates.linkStatus(linked)
+    test.check(sourceInfo.device == linkInfo.device && sourceInfo.inode == linkInfo.inode, "hardlink shares identity")
+    test.check(sourceInfo.links >= 2, "hardlink count")
+    test.check(sourceInfo.links == linkInfo.links, "hardlink counts agree")
+    error = refused(bundle.prepare(fixture.root, fixture.output, fixture.main), "hardlink")
+    test.check(error == "bundle hardlinks are not supported", "hardlink error: " + error)
+    test.check(files.remove(linked) == 0, "remove hardlink fixture")
+    shell(fixture, ["mkfifo", linked], "create FIFO fixture")
+    test.check(updates.kind(updates.linkStatus(linked)) == updates.FIFO, "fixture must be a real FIFO")
+    error = refused(bundle.prepare(fixture.root, fixture.output, fixture.main), "FIFO")
+    test.check(error == "bundle contains a special file", "FIFO error: " + error)
+    test.check(files.remove(linked) == 0, "remove FIFO fixture")
+    test.check(bundle.safePath("NUL.txt") != "", "NUL.txt must be reserved")
+    preserved(fixture, "links and special files")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_internal_framework_aliases_are_refused_without_dereferencing") {
+    let fixture = setUp()
+    let framework = fixture.root + "/App.app/Contents/Frameworks/Foo.framework"
+    directories(framework + "/Versions/A/Resources")
+    writeBytesFile(framework + "/Versions/A/Foo", Bytes("nested signed code"))
+    writeBytesFile(framework + "/Versions/A/Resources/data", Bytes("nested signed resource"))
+    let create = symlinker(fixture)
+    test.check(linkFixture(fixture, framework + "/Versions/Current", "A", create) == "", "fixture must be a real symlink")
+    test.check(linkFixture(fixture, framework + "/Foo", "Versions/Current/Foo", create) == "", "fixture must be a real symlink")
+    test.check(linkFixture(fixture, framework + "/Resources", "Versions/Current/Resources", create) == "", "fixture must be a real symlink")
+    previous(fixture)
+    let error = refused(bundle.prepare(fixture.root, fixture.output, fixture.main), "framework aliases")
+    test.check(test.contains(error, "links"), "framework alias error: " + error)
+    test.check(readlink(fixture, framework + "/Versions/Current") == "A", "framework alias untouched")
+    test.check(support.same(readBytesFile(framework + "/Versions/A/Foo"), Bytes("nested signed code")), "framework code untouched")
+    preserved(fixture, "framework aliases")
+    tearDown(fixture)
+    cases += 1
+}
+if chosen("test_unsupported_attribute_policy_covers_root_directories_and_files") {
+    let fixture = setUp()
+    for node in [fixture.root, fixture.root + "/App.app", fixture.root + "/" + fixture.main] {
+        for attribute in ["com.apple.cs.CodeDirectory", "com.apple.ResourceFork"] {
+            previous(fixture)
+            let hooks = bundle.defaults()
+            hooks.attributes = function(path: Text): updates.Listing {
+                if path == node { return updates.Listing { error: 0; names: [attribute] } }
+                return updates.Listing { error: 0; names: [] }
+            }
+            let error = refused(bundle.prepareWith(fixture.root, fixture.output, fixture.main, "", false, hooks), attribute + " on " + node)
+            test.check(test.contains(error, "unsupported"), attribute + " on " + node + ": " + error)
+            preserved(fixture, attribute + " on " + node)
+        }
+    }
+    tearDown(fixture)
+    cases += 1
+}
+print("Update bundle: " + Text(cases) + " cases passed")

@@ -1,0 +1,408 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "./update-launch-support.min" as launch
+use "../scripts/update-bundle.min" as encoder
+use "system" as system
+use "files" as files
+
+record Lab { root: Text; lab: Text; signer: Text; driver: Text; helper: Text; target: Text; kernel: Text; entries: List<launch.Entry>; serial: Integer }
+record Case { lab: Text; root: Text; metadata: Text; signature: Text; artifact: Text }
+record Installed { lines: List<Text>; digest: Text }
+
+constant MAIN = "App.app/Contents/MacOS/main"
+
+function makeDirectories(path: Text, log: Text) {
+    test.require(test.run(["mkdir", "-p", "--", path], system.environment(), "", log, 10), "create " + path)
+}
+function chmod(mode: Text, path: Text, log: Text) {
+    test.require(test.run(["chmod", mode, path], system.environment(), "", log, 10), "chmod " + path)
+}
+function setupClass(): Lab {
+    let lab = test.scratch()
+    let root = test.lines(support.output(["pwd", "-P"], lab + "/root"))[0]
+    let kernel = support.kernel(lab + "/kernel")
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    let signer = lab + "/signer"
+    let driver = lab + "/driver"
+    let helper = lab + "/owned-helper"
+    test.require(test.run([clang, "-O2", root + "/tests/update-sign.c", root + "/vendor/monocypher/monocypher.c", root + "/vendor/monocypher/monocypher-ed25519.c", "-o", signer], system.environment(), "", lab + "/signer.build", 60), "build update signer")
+    let helperCommand = [clang, "-O2", "-Wall", "-Wextra", "-Werror", root + "/tests/update-owned-helper.c"]
+    if kernel == "Darwin" { helperCommand.add("-framework"); helperCommand.add("CoreFoundation") }
+    helperCommand.add("-o")
+    helperCommand.add(helper)
+    test.require(test.run(helperCommand, system.environment(), "", lab + "/helper.build", 60), "build owned helper")
+    test.require(test.run([root + "/minyar", "--library", root + "/library", root + "/tests/update-launch-driver.min", "-o", driver], support.environment(["LIMITED=", "SANITIZER_LIMITED="]), "", lab + "/driver.build", 180), "build update launch driver")
+    let entries = [
+        launch.entry("D", "App.app", 0, Bytes()), launch.entry("D", "App.app/Contents", 0, Bytes()),
+        launch.entry("F", "App.app/Contents/Info.plist", 0, launch.infoPlist("1.1.0")),
+        launch.entry("D", "App.app/Contents/MacOS", 0, Bytes()),
+        launch.entry("F", MAIN, 1, files.readFile(helper)),
+        launch.entry("D", "App.app/Contents/Resources", 0, Bytes()),
+        launch.entry("F", "App.app/Contents/Resources/message.txt", 0, Bytes("signed resource")),
+        launch.entry("D", "Empty", 0, Bytes())]
+    return Lab { root: root; lab: lab; signer: signer; driver: driver; helper: helper; target: support.hostTarget(lab); kernel: kernel; entries: entries; serial: 0 }
+}
+function teardownClass(lab: Lab) {
+    let evidence = system.getenv("MINYAR_UPDATE_EVIDENCE")
+    if evidence != "" {
+        makeDirectories(evidence + "/launch-fixtures", lab.lab + "/evidence.mkdir")
+        test.require(test.run(["cp", "-RP", "--", lab.lab + "/.", evidence + "/launch-fixtures/"], system.environment(), "", lab.lab + "/evidence.copy", 120), "copy launch evidence")
+    }
+    test.removeTree(lab.lab)
+}
+function setup(lab: Lab): Case {
+    lab.serial += 1
+    let directory = lab.lab + "/case" + Text(lab.serial)
+    test.check(files.makeDirectory(directory) == 0, "case directory")
+    let root = directory + "/installation"
+    support.privateDirectory(root, directory + "/installation.mode")
+    return Case { lab: directory; root: root; metadata: directory + "/metadata"; signature: directory + "/signature"; artifact: directory + "/artifact" }
+}
+function sign(lab: Lab, path: Text): Bytes {
+    lab.serial += 1
+    let log = lab.lab + "/sign" + Text(lab.serial)
+    test.require(test.run([lab.signer, path], system.environment(), "", log, 10), "sign update metadata")
+    let signature = files.readFile(log)
+    test.check(signature.length == 64, "signer output size")
+    return signature
+}
+function install(lab: Lab, item: Case, data: Bytes, version: Text, sequence: Integer, rollout: Integer, device: Text, corrupt: Boolean): Installed {
+    let digest = launch.digest(data)
+    writeBytesFile(item.artifact, data)
+    let metadata = launch.metadata(lab.target, sequence, version, rollout, data)
+    writeBytesFile(item.metadata, metadata)
+    let signature = sign(lab, item.metadata)
+    if corrupt { signature[0] = signature[0] ^ 1 }
+    writeBytesFile(item.signature, signature)
+    if system.getenv("MINYAR_UPDATE_EVIDENCE") != "" {
+        let corpus = lab.lab + "/signed-corpus"
+        test.check(files.makeDirectory(corpus) == 0, "signed corpus")
+        writeBytesFile(corpus + "/" + digest + ".artifact", data)
+        let receipt = files.readFile(item.signature)
+        receipt.addBytes(files.readFile(item.metadata))
+        writeBytesFile(corpus + "/" + launch.digest(receipt) + ".receipt", receipt)
+    }
+    return Installed { lines: driver(lab, item, "install", item.artifact, [], device, 1800000000); digest: digest }
+}
+function installed(lab: Lab, item: Case, data: Bytes): Installed {
+    return install(lab, item, data, "1.1.0", 1, 100, "test-device", false)
+}
+function driver(lab: Lab, item: Case, mode: Text, current: Text, arguments: List<Text>, device: Text, now: Integer): List<Text> {
+    let command = ["bash", "-c", "set -o pipefail; \"$@\" | cat", "bash", lab.driver, mode, item.root, item.metadata, item.signature, current, Text(now), device]
+    for argument in arguments { command.add(argument) }
+    lab.serial += 1
+    let result = test.run(command, system.environment(), "", lab.lab + "/driver" + Text(lab.serial), 15)
+    test.check(result.status == 0, "update launch driver " + mode + " failed (" + Text(result.status) + ")\n" + result.errorOutput)
+    return test.lines(result.output)
+}
+function launched(lab: Lab, item: Case): List<Text> {
+    return driver(lab, item, "launch", "1.0.0", [], "test-device", 1800000000)
+}
+function stateLines(item: Case): List<Text> {
+    return test.lines(readTextFile(item.root + "/state"))
+}
+function pair(lines: List<Text>, first: Text, second: Text): Boolean {
+    return lines.length == 2 && lines[0] == first && lines[1] == second
+}
+function first(lines: List<Text>): Text {
+    test.check(lines.length > 0, "driver produced no output")
+    return lines[0]
+}
+function owned(lines: List<Text>): Boolean {
+    return support.has(lines, "OWNED-HELPER")
+}
+function changed(original: Bytes, offset: Integer, values: Bytes): Bytes {
+    let data = original.slice(0, original.length)
+    for index in 0..values.length { data[offset + index] = values[index] }
+    return data
+}
+function package(lab: Lab): Bytes {
+    return launch.package(lab.entries, MAIN)
+}
+
+let names = ["test_actual_fork_refusal_returns_error_and_preserves_restart_caller", "test_signed_bundle_launch_preserves_arguments_resources_and_handles",
+    "test_raw_owned_binary_launch_and_newer_trusted_floor", "test_newer_unselected_observation_preserves_active_authorization",
+    "test_restart_has_successor_and_errors_remain_recoverable", "test_launch_rechecks_signed_cohort_and_manifest_binding",
+    "test_legacy_generation_requires_fresh_authentication_and_can_migrate", "test_signature_artifact_receipt_and_resource_mutation_fail_closed",
+    "test_signed_hostile_packages_preserve_previous_active_generation", "test_production_encoder_feeds_signed_complete_bundle_activation",
+    "test_signed_binary_index_overflows_truncations_and_invalid_modes_preserve_active", "test_missing_or_extra_payload_file_and_symlink_are_rejected"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "Launch." + name { valid = true } }
+    test.check(valid, "unknown update launch case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "Launch." + name { return true } }
+    return false
+}
+
+let lab = setupClass()
+let cases = 0
+let skipped = 0
+if chosen("test_actual_fork_refusal_returns_error_and_preserves_restart_caller") {
+    let user = test.lines(support.output(["id", "-u"], lab.lab + "/uid"))[0]
+    if lab.kernel != "Linux" || user == "0" {
+        skipped += 1
+    } else {
+        let item = setup(lab)
+        test.check(pair(installed(lab, item, package(lab)).lines, "true", "true"), "bundle install")
+        let before = files.readFile(item.root + "/state")
+        let options: List<Text> = []
+        for value in support.split(system.getenv("ASAN_OPTIONS"), ":") { if value != "" && !support.starts(value, "detect_leaks=") { options.add(value) } }
+        options.add("detect_leaks=0")
+        let probe = support.environment(["ASAN_OPTIONS=" + support.join(options, ":")])
+        for mode in ["launch", "restart"] {
+            lab.serial += 1
+            let result = test.run(["bash", "-c", "ulimit -S -u 0 && exec \"$@\"", "bash", lab.driver, mode, item.root, item.metadata, item.signature, "1.0.0", "1800000000", "test-device"], probe, "", lab.lab + "/fork" + Text(lab.serial), 15)
+            test.check(result.status == 0, "fork refusal " + mode + " status " + Text(result.status) + "\n" + result.errorOutput)
+            test.check(first(test.lines(result.output)) == "false", "fork refusal " + mode + " must report failure")
+            test.check(test.contains(result.output, "cannot fork checked update process"), "fork refusal diagnostic\n" + result.output)
+            test.check(!test.contains(result.output, "OWNED-HELPER"), "fork refusal ran the helper")
+            test.check(support.same(files.readFile(item.root + "/state"), before), "fork refusal changed state")
+        }
+        test.check(owned(launched(lab, item)), "launch after fork refusal")
+        cases += 1
+    }
+}
+if chosen("test_signed_bundle_launch_preserves_arguments_resources_and_handles") {
+    let item = setup(lab)
+    let result = installed(lab, item, package(lab))
+    test.check(pair(result.lines, "true", "true"), "bundle install")
+    let payload = item.root + "/versions/" + result.digest + ".bundle/payload"
+    test.check(readTextFile(payload + "/App.app/Contents/Resources/message.txt") == "signed resource", "installed resource")
+    test.check(support.isDirectory(payload + "/Empty", item.lab + "/empty"), "installed empty directory")
+    let arguments = ["", "space and tabs\t", "quote\"slash\\", "é🦉", "$(echo forbidden);*"]
+    let output = driver(lab, item, "launch", "1.0.0", arguments, "test-device", 1800000000)
+    test.check(owned(output), "bundle launch")
+    test.check(support.has(output, "RESOURCE:signed resource"), "bundle resource")
+    if lab.kernel == "Darwin" { test.check(support.has(output, "NATIVE-BUNDLE-RESOURCE:signed resource"), "native bundle resource") }
+    for value in arguments {
+        let raw = Bytes(value)
+        test.check(support.has(output, Text(raw.length) + ":" + launch.hex(raw)), "argument preserved: " + value)
+    }
+    test.check(support.has(output, "LEAKED:0"), "no inherited handles")
+    test.check(support.has(output, "23"), "helper exit report")
+    test.check(owned(driver(lab, item, "launch", "1.0.0", [], "test-device", 1801000000)), "offline launch after metadata expiry")
+    cases += 1
+}
+if chosen("test_raw_owned_binary_launch_and_newer_trusted_floor") {
+    let item = setup(lab)
+    let helper = files.readFile(lab.helper)
+    let result = installed(lab, item, helper)
+    test.check(pair(result.lines, "true", "true"), "raw install")
+    test.check(owned(launched(lab, item)), "raw launch")
+    test.check(first(driver(lab, item, "launch", "1.2.0", [], "test-device", 1800000000)) == "false", "newer trusted floor")
+    install(lab, item, Bytes("future artifact"), "1.2.0", 2, 100, "test-device", true)
+    test.check(owned(launched(lab, item)), "failed newer release preserved launch")
+    let oldHash = stateLines(item)[7]
+    test.check(pair(install(lab, item, helper, "1.2.0", 3, 100, "test-device", false).lines, "true", "true"), "same artifact newer version")
+    test.check(stateLines(item)[7] != oldHash, "newer authorization hash")
+    test.check(owned(driver(lab, item, "launch", "1.2.0", [], "test-device", 1800000000)), "newer version launch")
+    test.check(support.isFile(item.root + "/versions/" + result.digest + "." + oldHash + ".receipt", item.lab + "/receipt"), "old receipt retained")
+    cases += 1
+}
+if chosen("test_newer_unselected_observation_preserves_active_authorization") {
+    let item = setup(lab)
+    installed(lab, item, package(lab))
+    let future = Bytes("future native artifact")
+    writeBytesFile(item.artifact, Bytes("bad download"))
+    writeBytesFile(item.metadata, launch.metadata(lab.target, 2, "1.2.0", 100, future))
+    writeBytesFile(item.signature, sign(lab, item.metadata))
+    test.check(first(driver(lab, item, "install", item.artifact, [], "test-device", 1800000000)) == "false", "bad download install")
+    test.check(stateLines(item)[2] == "1.2.0", "newer observation recorded")
+    test.check(owned(launched(lab, item)), "active authorization preserved")
+    cases += 1
+}
+if chosen("test_restart_has_successor_and_errors_remain_recoverable") {
+    let item = setup(lab)
+    installed(lab, item, package(lab))
+    let output = driver(lab, item, "restart", "1.0.0", ["successor"], "test-device", 1800000000)
+    test.check(owned(output), "restart successor")
+    test.check(!support.has(output, "true"), "successful restart returned")
+    test.check(first(driver(lab, item, "restart", "9.0.0", [], "test-device", 1800000000)) == "false", "restart older version")
+    test.check(!owned(driver(lab, item, "launch", "1.0.0", [], "test-device", 1799999999)), "launch before issue time")
+    let many: List<Text> = []
+    for index in 0..256 { many.add("x") }
+    test.check(first(driver(lab, item, "launch", "1.0.0", many, "test-device", 1800000000)) == "false", "too many launch arguments")
+    let before = files.readFile(item.root + "/state")
+    let rejected = driver(lab, item, "launch-overlong", "1.0.0", [], "test-device", 1800000000)
+    test.check(first(rejected) == "false", "overlong launch")
+    test.check(support.has(rejected, "launch arguments exceed the size limit"), "overlong diagnostic")
+    test.check(!owned(rejected), "overlong launch ran the helper")
+    test.check(support.same(files.readFile(item.root + "/state"), before), "overlong launch changed state")
+    test.check(owned(launched(lab, item)), "launch after errors")
+    cases += 1
+}
+if chosen("test_launch_rechecks_signed_cohort_and_manifest_binding") {
+    let item = setup(lab)
+    install(lab, item, package(lab), "1.1.0", 1, 100, "test-device", false)
+    let wanted = ""
+    for index in 0..1000 {
+        let candidate = "cohort-" + Text(index)
+        if wanted == "" && launch.cohort(candidate) == 0 { wanted = candidate }
+    }
+    test.check(wanted != "", "cohort zero device")
+    item.root = item.lab + "/cohort-root"
+    support.privateDirectory(item.root, item.lab + "/cohort-root.mode")
+    test.check(pair(install(lab, item, package(lab), "1.1.0", 1, 1, wanted, false).lines, "true", "true"), "cohort install")
+    test.check(owned(driver(lab, item, "launch", "1.0.0", [], wanted, 1800000000)), "cohort launch")
+    let refused = false
+    for index in 0..100 {
+        let candidate = "outsider-" + Text(index)
+        if !refused && launch.cohort(candidate) != 0 {
+            test.check(first(driver(lab, item, "launch", "1.0.0", [], candidate, 1800000000)) == "false", "outsider launch")
+            refused = true
+        }
+    }
+    cases += 1
+}
+if chosen("test_legacy_generation_requires_fresh_authentication_and_can_migrate") {
+    let item = setup(lab)
+    let helper = files.readFile(lab.helper)
+    installed(lab, item, helper)
+    let state = stateLines(item)
+    state[0] = "MINYAR-UPDATER-STATE-1"
+    let parts: List<Text> = []
+    for index in 0..7 { parts.add(state[index]); parts.add("\n") }
+    let legacy = joinText(parts)
+    writeTextFile(item.root + "/state", test.replace(legacy, "\n", "\r\n"))
+    test.check(first(launched(lab, item)) == "false", "CRLF legacy state launch")
+    let refused = installed(lab, item, helper)
+    test.check(first(refused.lines) == "false", "CRLF legacy state install")
+    test.check(support.has(refused.lines, "local update state is corrupt"), "corrupt state diagnostic")
+    writeTextFile(item.root + "/state", legacy)
+    test.check(!test.contains(Text(files.readFile(item.root + "/state")), "\r"), "legacy state must be LF")
+    test.check(first(launched(lab, item)) == "false", "legacy state needs fresh authentication")
+    test.check(pair(installed(lab, item, helper).lines, "true", "true"), "legacy migration install")
+    test.check(stateLines(item)[0] == "MINYAR-UPDATER-STATE-2", "migrated state version")
+    test.check(owned(launched(lab, item)), "migrated launch")
+    cases += 1
+}
+if chosen("test_signature_artifact_receipt_and_resource_mutation_fail_closed") {
+    let item = setup(lab)
+    let original = package(lab)
+    test.check(first(install(lab, item, original, "1.1.0", 1, 100, "test-device", true).lines) == "false", "corrupt signature install")
+    test.check(!support.exists(item.root + "/versions"), "corrupt signature published versions")
+    let result = installed(lab, item, original)
+    let generation = item.root + "/versions/" + result.digest + ".bundle"
+    let active = stateLines(item)[7]
+    let receipt = item.root + "/versions/" + result.digest + "." + active + ".receipt"
+    let before = files.readFile(receipt)
+    let flipped = before.slice(0, before.length)
+    flipped[0] = flipped[0] ^ 1
+    writeBytesFile(receipt, flipped)
+    test.check(first(launched(lab, item)) == "false", "receipt mutation")
+    writeBytesFile(receipt, before)
+    let resource = generation + "/payload/App.app/Contents/Resources/message.txt"
+    chmod("600", resource, item.lab + "/resource.mode")
+    writeTextFile(resource, "changed resource")
+    test.check(first(launched(lab, item)) == "false", "resource mutation")
+    test.check(!owned(launched(lab, item)), "resource mutation launched")
+    cases += 1
+}
+if chosen("test_signed_hostile_packages_preserve_previous_active_generation") {
+    let item = setup(lab)
+    let helper = files.readFile(lab.helper)
+    let active = installed(lab, item, helper).digest
+    let hostile: List<Bytes> = []
+    for path in ["../escape", "/absolute", "A/../../escape", "A\\escape", "A:stream", "NUL", "con.txt", "COM1", "tail.", "tail ", "A//B", "A/./B"] {
+        hostile.add(launch.package([launch.entry("F", path, 1, Bytes("owned"))], path))
+    }
+    hostile.add(Bytes("MINYAR-BUNDLE-2\n"))
+    hostile.add(Bytes("MINYAR-BUNDLE-"))
+    hostile.add(launch.package(lab.entries, "missing"))
+    let extra = package(lab)
+    extra.addBytes(Bytes("extra"))
+    hostile.add(extra)
+    let shorter: List<launch.Entry> = []
+    for index in 0..(lab.entries.length - 1) { shorter.add(lab.entries[index]) }
+    let truncated = launch.package(shorter, MAIN)
+    hostile.add(truncated.slice(0, truncated.length - 1))
+    hostile.add(launch.package([launch.entry("L", "linked", 0, Bytes("elsewhere"))], "linked"))
+    hostile.add(launch.package([launch.entry("F", "Main", 1, helper), launch.entry("F", "main", 1, helper)], "Main"))
+    hostile.add(launch.package([launch.entry("F", "A/file", 1, helper)], "A/file"))
+    hostile.add(launch.package([launch.entry("F", "main", 1, Bytes("#!/bin/sh\nexit 0\n"))], "main"))
+    for index in 0..hostile.length {
+        let result = install(lab, item, hostile[index], "1.2.0", 2 + index, 100, "test-device", false)
+        test.check(first(result.lines) == "false", "hostile package " + Text(index) + " accepted")
+        test.check(stateLines(item)[5] == active, "hostile package " + Text(index) + " changed the active generation")
+        test.check(owned(launched(lab, item)), "hostile package " + Text(index) + " broke launch")
+    }
+    cases += 1
+}
+if chosen("test_production_encoder_feeds_signed_complete_bundle_activation") {
+    let item = setup(lab)
+    let source = item.lab + "/production-tree"
+    test.check(files.makeDirectory(source) == 0, "production tree")
+    for value in lab.entries {
+        let target = source + "/" + value.path
+        if value.kind == "D" { test.check(files.makeDirectory(target) == 0, "production directory " + value.path) } else {
+            writeBytesFile(target, value.data)
+            if value.mode == 1 { chmod("755", target, item.lab + "/mode") } else { chmod("644", target, item.lab + "/mode") }
+        }
+    }
+    let artifact = item.lab + "/production.pkg"
+    let prepared = encoder.prepare(source, artifact, MAIN)
+    test.check(prepared.error == "", "production encoder: " + prepared.error)
+    test.check(pair(installed(lab, item, files.readFile(artifact)).lines, "true", "true"), "production bundle install")
+    test.check(support.has(launched(lab, item), "RESOURCE:signed resource"), "production bundle launch")
+    cases += 1
+}
+if chosen("test_signed_binary_index_overflows_truncations_and_invalid_modes_preserve_active") {
+    let item = setup(lab)
+    let active = installed(lab, item, files.readFile(lab.helper)).digest
+    let original = package(lab)
+    let main = Bytes(MAIN)
+    let countOffset = 16 + 4 + main.length
+    let entryStart = countOffset + 4
+    let variants: List<Bytes> = []
+    for value in [0, 4097, 4294967295] { variants.add(changed(original, countOffset, launch.bigEndian(value, 4))) }
+    variants.add(changed(original, 16, launch.bigEndian(4294967295, 4)))
+    for pairValue in [[entryStart, 76], [entryStart + 1, 1], [entryStart + 1, 2]] {
+        let single = Bytes(1)
+        single[0] = pairValue[1]
+        variants.add(changed(original, pairValue[0], single))
+    }
+    variants.add(changed(original, entryStart + 2, launch.ones(4)))
+    variants.add(changed(original, entryStart + 6, launch.bigEndian(1, 8)))
+    variants.add(changed(original, entryStart + 6, launch.ones(8)))
+    for marker in [0, 10, 13, 255] {
+        let single = Bytes(1)
+        single[0] = marker
+        variants.add(changed(original, entryStart + 14, single))
+    }
+    for length in [7, 15, 16, 19, countOffset, entryStart, entryStart + 13, original.length - 1] { variants.add(original.slice(0, length)) }
+    let reversed: List<launch.Entry> = []
+    let position = lab.entries.length - 1
+    while position >= 0 { reversed.add(lab.entries[position]); position -= 1 }
+    variants.add(launch.package(reversed, MAIN))
+    for index in 0..variants.length {
+        let result = install(lab, item, variants[index], "1.2.0", index + 2, 100, "test-device", false)
+        test.check(first(result.lines) == "false", "binary index variant " + Text(index) + " accepted")
+        test.check(stateLines(item)[5] == active, "binary index variant " + Text(index) + " changed the active generation")
+        test.check(owned(launched(lab, item)), "binary index variant " + Text(index) + " broke launch")
+    }
+    test.check(pair(install(lab, item, original, "1.2.0", variants.length + 2, 100, "test-device", false).lines, "true", "true"), "fresh complete bundle recovers")
+    test.check(support.has(launched(lab, item), "RESOURCE:signed resource"), "recovered bundle launch")
+    cases += 1
+}
+if chosen("test_missing_or_extra_payload_file_and_symlink_are_rejected") {
+    let item = setup(lab)
+    let result = installed(lab, item, package(lab))
+    let resources = item.root + "/versions/" + result.digest + ".bundle/payload/App.app/Contents/Resources"
+    chmod("700", resources, item.lab + "/resources.mode")
+    writeTextFile(resources + "/extra", "unlisted")
+    test.check(first(launched(lab, item)) == "false", "extra payload file")
+    test.check(files.remove(resources + "/extra") == 0, "remove extra payload file")
+    let resource = resources + "/message.txt"
+    test.check(files.remove(resource) == 0, "remove payload resource")
+    test.check(first(launched(lab, item)) == "false", "missing payload file")
+    let external = item.lab + "/outside"
+    writeTextFile(external, "signed resource")
+    test.require(test.run(["ln", "-s", "--", external, resource], system.environment(), "", item.lab + "/link", 10), "payload symlink")
+    test.check(first(launched(lab, item)) == "false", "payload symlink")
+    cases += 1
+}
+teardownClass(lab)
+print("Update launch: " + Text(cases) + " cases passed, " + Text(skipped) + " skipped")

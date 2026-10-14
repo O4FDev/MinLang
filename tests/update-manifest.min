@@ -1,0 +1,199 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "../scripts/update-manifest.min" as manifest
+use "../scripts/update-support.min" as updates
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Calls { data: List<Bytes> }
+
+constant ORIGIN_ERROR = "origin must be an ASCII HTTPS origin with a valid port and no credentials, path, query or fragment"
+
+let names = ["test_real_openssl_signer_matches_rfc8032_public_key_and_domain_binding", "test_stages_content_addressed_artifact_and_uncached_channel_last",
+    "test_malformed_origins_fail_before_signing_or_output", "test_valid_origins_and_rollout_promotions_preserve_signed_fields",
+    "test_invalid_rollout_version_or_expiration_never_invokes_signer_or_publishes"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "Publication." + name { valid = true } }
+    test.check(valid, "unknown update manifest case " + argument(index))
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "Publication." + name { return true } }
+    return false
+}
+function filled(byte: Integer, count: Integer): Bytes {
+    let data = Bytes(count)
+    for index in 0..count { data[index] = byte }
+    return data
+}
+function fromHex(text: Text): Bytes {
+    let raw = Bytes(text)
+    let data = Bytes()
+    let index = 0
+    while index + 1 < raw.length {
+        let high = raw[index]
+        let low = raw[index + 1]
+        if high >= 97 { high = high - 87 } else { high = high - 48 }
+        if low >= 97 { low = low - 87 } else { low = low - 48 }
+        data.add(high * 16 + low)
+        index += 2
+    }
+    return data
+}
+function recording(calls: Calls): Callback<Bytes, manifest.Signature> {
+    return function(data: Bytes): manifest.Signature {
+        calls.data.add(data)
+        return manifest.Signature { error: ""; signature: filled(83, 64); publicKey: filled(80, 32) }
+    }
+}
+function publish(artifact: Text, output: Text, sequence: Integer, version: Text, expires: Integer, rollout: Integer, origin: Text, calls: Calls): manifest.Publication {
+    return manifest.prepare(artifact, output, "org.tolum.peer", "macos-arm64", "stable", sequence, version, 1800000000, expires, rollout, origin, recording(calls))
+}
+function lowered(text: Text): Text { return updates.lower(text) }
+
+let cases = 0
+let skipped = 0
+if chosen("test_real_openssl_signer_matches_rfc8032_public_key_and_domain_binding") {
+    let root = test.scratch()
+    let openssl = system.getenv("MINYAR_TEST_OPENSSL")
+    if system.lastError() != 0 { openssl = support.which("openssl", root + "/which-openssl") }
+    let reason = ""
+    if openssl == "" { reason = "OpenSSL 3 is required for the offline publisher only" }
+    else {
+        let version = test.run([openssl, "version"], system.environment(), "", root + "/openssl-version", 30)
+        test.require(version, "openssl version")
+        if !support.starts(version.output, "OpenSSL 3.") { reason = "OpenSSL 3 is required for the offline publisher only" }
+    }
+    if reason != "" {
+        print("skipped test_real_openssl_signer_matches_rfc8032_public_key_and_domain_binding: " + reason)
+        skipped += 1
+    } else {
+        let seed = fromHex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        let der = fromHex("302e020100300506032b657004220420")
+        der.addBytes(seed)
+        let key = root + "/fixture.der"
+        writeBytesFile(key, der)
+        let value = manifest.signed(Bytes("fixture metadata\n"), key, openssl, "")
+        test.check(value.error == "", "real OpenSSL signer failed: " + value.error)
+        test.check(updates.hex(value.publicKey) == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "RFC 8032 public key: " + updates.hex(value.publicKey))
+        test.check(value.signature.length == 64, "Ed25519 signature size")
+        let pub = root + "/public.der"
+        let encoded = fromHex("302a300506032b6570032100")
+        encoded.addBytes(value.publicKey)
+        writeBytesFile(pub, encoded)
+        let signature = root + "/signature"
+        writeBytesFile(signature, value.signature)
+        let message = root + "/message"
+        writeBytesFile(message, Bytes("fixture metadata\n"))
+        let wrong = test.run([openssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", pub, "-sigfile", signature, "-in", message],
+            system.environment(), "", root + "/wrong-domain", 30)
+        test.check(wrong.status != 0, "signature without the domain prefix must not verify")
+        cases += 1
+    }
+    test.removeTree(root)
+}
+if chosen("test_stages_content_addressed_artifact_and_uncached_channel_last") {
+    let root = test.scratch()
+    let artifact = root + "/agent"
+    let contents = Bytes()
+    contents.add(0)
+    contents.add(255)
+    contents.addBytes(Bytes("fixture"))
+    writeBytesFile(artifact, contents)
+    let output = root + "/static"
+    let calls = Calls { data: [] }
+    let result = publish(artifact, output, 1, "1.1.0", 1800003600, 1, "https://updates.example", calls)
+    test.check(result.error == "", "publication failed: " + result.error)
+    let text = readTextFile(output + "/r2-publish-plan.json")
+    let plan = json.parse(text)
+    test.check(plan.kind == json.OBJECT, "plan must be a JSON object")
+    let objects = json.member(plan, "objects")
+    test.check(objects.kind == json.ARRAY && objects.items.length == 2, "plan has two objects")
+    let asset = objects.items[0]
+    let pointer = objects.items[1]
+    let assetKey = json.string(asset, "key")
+    test.check(test.contains("/" + assetKey, "/releases/"), "asset key is content addressed: " + assetKey)
+    test.check(support.same(readBytesFile(output + "/" + assetKey), readBytesFile(artifact)), "staged artifact bytes")
+    test.check(test.contains(json.string(json.member(asset, "httpMetadata"), "cacheControl"), "immutable"), "asset is immutable")
+    let pointerKey = json.string(pointer, "key")
+    test.check(pointerKey == "channels/stable/macos-arm64.update", "channel pointer key: " + pointerKey)
+    test.check(json.string(json.member(pointer, "httpMetadata"), "cacheControl") == "no-store", "channel pointer is uncached")
+    let envelope = readBytesFile(output + "/" + pointerKey)
+    test.check(envelope.length > 64 && support.same(envelope.slice(0, 64), filled(83, 64)), "envelope starts with the signature")
+    let fields = test.lines(Text(envelope.slice(64, envelope.length)))
+    test.check(fields.length == 12, "envelope has twelve metadata fields")
+    test.check(fields[8] == "1", "rollout field")
+    test.check(fields[9] == "https://updates.example/" + assetKey, "artifact URL field: " + fields[9])
+    test.check(!test.contains(lowered(text), "credential"), "plan must not mention credentials")
+    test.check(calls.data.length == 1, "signer called once")
+    test.removeTree(root)
+    cases += 1
+}
+if chosen("test_malformed_origins_fail_before_signing_or_output") {
+    let origins = ["HTTPS://updates.example", " https://updates.example",
+        "https://updates.example\n", "https://updates.ex\tample",
+        "https://updates.example?", "https://updates.example#",
+        "https://updates.example:", "https://updates.example:invalid",
+        "https://updates.example:0", "https://updates.example:65536",
+        "https://@updates.example", "https://updates.example/path",
+        "https://updates.example?query", "https://updates.example#fragment",
+        "https://[::1]x", "https://x[::1]", "https://[1.2.3.4]", "https://[::1", "https://[1::2::3]"]
+    let root = test.scratch()
+    let artifact = root + "/agent"
+    writeBytesFile(artifact, Bytes("fixture"))
+    for index in 0..origins.length {
+        let calls = Calls { data: [] }
+        let output = root + "/static-" + Text(index)
+        let result = publish(artifact, output, 1, "1.1.0", 1800003600, 1, origins[index], calls)
+        test.check(result.error == ORIGIN_ERROR, "malformed origin " + Text(index) + " was not refused: " + result.error)
+        test.check(calls.data.length == 0, "malformed origin " + Text(index) + " reached the signer")
+        test.check(!support.exists(output), "malformed origin " + Text(index) + " created output")
+    }
+    test.removeTree(root)
+    cases += 1
+}
+if chosen("test_valid_origins_and_rollout_promotions_preserve_signed_fields") {
+    let root = test.scratch()
+    let artifact = root + "/agent"
+    writeBytesFile(artifact, Bytes("fixture"))
+    let origins = ["https://updates.example", "https://UPDATES.example", "https://updates.example:443", "https://updates.example:8443",
+        "https://[::1]:8443", "https://[fe80::1%eth0]"]
+    for index in 0..origins.length {
+        for rollout in [1, 10, 100] {
+            let output = root + "/static-" + Text(index) + "-" + Text(rollout)
+            let calls = Calls { data: [] }
+            let result = publish(artifact, output, rollout, "1.1.0", 1800003600, rollout, origins[index], calls)
+            test.check(result.error == "", "valid origin " + origins[index] + " failed: " + result.error)
+            test.check(calls.data.length == 1, "valid origin signs once")
+            let fields = test.lines(Text(calls.data[0]))
+            test.check(fields[8] == Text(rollout), "signed rollout field")
+            test.check(support.starts(fields[9], origins[index] + "/releases/"), "signed origin field: " + fields[9])
+        }
+    }
+    test.removeTree(root)
+    cases += 1
+}
+if chosen("test_invalid_rollout_version_or_expiration_never_invokes_signer_or_publishes") {
+    let root = test.scratch()
+    let artifact = root + "/agent"
+    writeBytesFile(artifact, Bytes("fixture"))
+    let calls = Calls { data: [] }
+    let versions = ["1.0-beta", "01.1.0", "1.1.0", "1.1.0", "1.1.0"]
+    let rollouts = [1, 1, 2, 100, 10]
+    let expirations = [1800003600, 1800003600, 1800003600, 1801000000, 1800000000]
+    let messages = ["version must be three canonical numeric components", "version must be three canonical numeric components",
+        "rollout must be 1, 10 or 100", "invalid metadata expiry; maximum seven days", "invalid metadata expiry; maximum seven days"]
+    for index in 0..versions.length {
+        let output = root + "/static"
+        let result = publish(artifact, output, 1, versions[index], expirations[index], rollouts[index], "https://updates.example", calls)
+        test.check(result.error == messages[index], "invalid case " + Text(index) + ": " + result.error)
+        test.check(!support.exists(output), "invalid case " + Text(index) + " created output")
+    }
+    test.check(calls.data.length == 0, "invalid metadata reached the signer")
+    test.removeTree(root)
+    cases += 1
+}
+if skipped > 0 { print("Update manifest: " + Text(cases) + " cases passed, " + Text(skipped) + " skipped") }
+else { print("Update manifest: " + Text(cases) + " cases passed") }
