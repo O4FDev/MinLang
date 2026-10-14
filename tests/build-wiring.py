@@ -660,7 +660,7 @@ class BuildWiring(unittest.TestCase):
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='QUIC RFC Make rules ') as folder:
                 makefile = Path(folder) / 'probe.mk'
-                fixtures = sorted(frontends | inputs | {'build'})
+                fixtures = sorted(frontends | inputs | {'build', 'build/tooling/tests/quic-protocol-artifacts'})
                 makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(fixtures)
                                    + '\n' + ' '.join(fixtures)
                                    + ':\n\t@echo INPUT $@\n')
