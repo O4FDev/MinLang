@@ -6,10 +6,13 @@
 .PHONY: check-formats-pipeline check-formats-pipeline-sanitize
 .PHONY: bench-formats bench-compression bench-sha256 bench-tar
 
-build/tooling/tests/compression-provider build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
-check-compression: build/minyarc build/tooling/tests/compression-provider
+build/tooling/tests/compression-provider build/tooling/tests/compression-codecs build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
+build/tooling/tests/compression-codecs: TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c runtime/native/sha256.c
+build/tooling/tests/compression-codecs: TOOL_LIBS = -lz -ldl $(TOOL_CRYPTO)
+build/tooling/tests/compression-codecs: tests/compression-codecs-oracle-runtime.c
+check-compression: build/minyarc build/tooling/tests/compression-provider build/tooling/tests/compression-codecs
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-provider
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-codecs --mode native
 
 build/tooling/tests/sha256-test: TOOL_NATIVE = tests/sha256-test-native.c
 build/tooling/tests/sha256-test: TOOL_LIBS = $(TOOL_CRYPTO)
@@ -39,8 +42,8 @@ FORMATS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolch
 FORMATS_SANITIZER_DIRECTORY = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))))
 FORMATS_SANITIZER_ENV = PATH=$(call FORMATS_SANITIZER_QUOTE,$(if $(FORMATS_SANITIZER_DIRECTORY),$(FORMATS_SANITIZER_DIRECTORY):)$(PATH)) MINYAR_TEST_CLANG=$(call FORMATS_SANITIZER_QUOTE,$(FORMATS_SANITIZER_CLANG)) UBSAN_OPTIONS=halt_on_error=1
 
-check-compression-sanitize: build/minyarc
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/compression-codecs.py --mode sanitize
+check-compression-sanitize: build/minyarc build/tooling/tests/compression-codecs
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/compression-codecs --mode sanitize
 
 check-sha256-sanitize: build/minyarc build/tooling/tests/sha256-test
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/sha256-test --sanitize

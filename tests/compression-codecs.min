@@ -4,6 +4,7 @@ use "./compression-codecs-oracle.min" as oracle
 use "system" as system
 use "files" as files
 use "json" as json
+use "sha256" as sha
 
 record Provider { flags: List<Text>; libraries: List<Text> }
 function query(context: support.Context, kind: Text): test.Result { return test.run(["build/tooling/tools/clang-driver", "codec-provider", kind, "--clang", context.clang], context.environment, "", context.directory + "/provider-" + kind, 180) }
@@ -66,7 +67,7 @@ function providerContracts(context: support.Context, selected: Provider) {
     let header = prefix + "/include/zstd.h"
     writeTextFile(header, releaseMismatch(readTextFile(header)))
     let mismatch = query(context, "zstd")
-    test.check(mismatch.status != 0 && test.contains(mismatch.output + mismatch.errorOutput, "version mismatch"), "mismatched zstd header/archive version was accepted")
+    test.check(mismatch.status != 0 && test.contains(mismatch.output + mismatch.errorOutput, "version equality not established"), "mismatched zstd header/archive version was accepted")
     context.environment = original
     print("matched static provider contracts: ok")
 }
@@ -85,6 +86,54 @@ function nativeLink(context: support.Context, flags: List<Text>, cflags: List<Te
     support.run(context, command)
 }
 function expected(context: support.Context, executable: Text, output: Text) { test.check(support.run(context, [executable]).output == output, "compression fixture output changed: " + executable) }
+function digest(path: Text): Text {
+    let data = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot hash compression evidence input " + path)
+    return sha.hex(sha.digest(data))
+}
+function textList(items: List<Text>): Text {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add(json.quote(items[index]))
+    }
+    return "[" + joinText(pieces) + "]"
+}
+function evidence(context: support.Context, mode: Text, providers: List<Provider>) {
+    let commands: List<Text> = []
+    for command in context.commands { commands.add("  {\"argv\": " + textList(command) + "}") }
+    writeTextFile(context.directory + "/commands.json", "[\n" + joinText(separated(commands)) + "\n]\n")
+    let version = support.run(context, [context.clang, "--version"]).output
+    let sources = [context.compiler]
+    for path in ["library/zstd.min", "library/deflate.min", "runtime/native/zstd.c", "runtime/native/deflate.c", "runtime/native/compression.h", "tools/driver-providers.min", "tools/clang-driver.min", "tests/compression-codecs.min", "tests/compression-codecs-oracle.min", "tests/compression.min", "tests/compression-driver.min", "tests/compression-native.c", "tests/compression-reference.c", "runtime/minyar_runtime.c", "runtime/minyar_native.h", "tools/testing.min"] { sources.add(context.root + "/" + path) }
+    for name in files.list(context.directory).sorted() { if name.endsWith(".ll") { sources.add(context.directory + "/" + name) } }
+    for line in test.lines(support.run(context, ["find", context.root + "/runtime", "-name", "*.h", "-type", "f"]).output).sorted() { sources.add(line) }
+    let located = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", context.clang], context.environment, "", context.directory + "/clang-location", 10)
+    let clang = context.clang
+    if located.status == 0 { clang = test.lines(located.output)[0] }
+    sources.add(test.lines(support.run(context, ["readlink", "-f", "--", clang]).output)[0])
+    let rows: List<Text> = []
+    for selected in providers {
+        let include = ""
+        for index in 0..selected.flags.length { if selected.flags[index] == "-isystem" && index + 1 < selected.flags.length { include = selected.flags[index + 1] } }
+        for name in ["zstd.h", "zstd_errors.h", "zlib.h", "zconf.h"] { if include != "" && files.pathSize(include + "/" + name) >= 0 { sources.add(include + "/" + name) } }
+        for library in selected.libraries { if files.pathSize(library) >= 0 { sources.add(library) } }
+        rows.add("[" + textList(selected.flags) + ", " + textList(selected.libraries) + "]")
+    }
+    let hashes: List<Text> = []
+    for path in sources { hashes.add("    " + json.quote(path) + ": " + json.quote(digest(path))) }
+    let manifest = "{\n  \"mode\": " + json.quote(mode) + ",\n  \"compiler\": " + json.quote(context.compiler) + ",\n  \"clang_version\": " + json.quote(version) +
+        ",\n  \"providers\": [" + joinText(separated(rows)) + "],\n  \"hashes\": {\n" + joinText(separated(hashes)) + "\n  }\n}\n"
+    writeTextFile(context.directory + "/manifest.json", manifest)
+}
+function separated(items: List<Text>): List<Text> {
+    let pieces: List<Text> = []
+    for index in 0..items.length {
+        if index > 0 { pieces.add(",\n") }
+        pieces.add(items[index])
+    }
+    return pieces
+}
 
 let mode = "native"
 let nativeOnly = false
@@ -111,7 +160,12 @@ let context = support.context(scratch, false)
 context.compiler = selectedCompiler
 context.clang = selectedClang
 context.timeout = 180
-context.environment = support.environment(context.environment, "ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1")
+let platform = test.run(["uname", "-s"], context.environment, "", scratch + "/platform", 10)
+test.require(platform, "host platform")
+let darwin = platform.output == "Darwin\n"
+let leaks = "0"
+if platform.output == "Linux\n" { leaks = "1" }
+context.environment = support.environment(context.environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":halt_on_error=1")
 context.environment = support.environment(context.environment, "UBSAN_OPTIONS", "halt_on_error=1")
 if artifacts != "" {
     support.run(context, ["mkdir", "-p", "--", artifacts])
@@ -134,7 +188,10 @@ for chunk in ["4294967295", "7"] {
     nativeLink(context, nativeFlags, cflags, libraries, ["tests/compression-native.c", "runtime/native/zstd.c", "runtime/native/deflate.c"], executable)
     expected(context, executable, "compression-native: ok\n")
     let shared = context.directory + "/oracles-" + chunk + ".so"
-    nativeLink(context, ["-std=c11", "-O2", "-fPIC", "-shared", "-Wall", "-Wextra", "-Werror", "-DMINYAR_COMPRESSION_CHUNK=" + chunk, "-Wl,--exclude-libs,ALL"], cflags, libraries, ["runtime/native/zstd.c", "runtime/native/deflate.c", "tests/compression-reference.c"], shared)
+    if darwin { shared = context.directory + "/oracles-" + chunk + ".dylib" }
+    let sharedFlags = ["-std=c11", "-O2", "-fPIC", "-shared", "-Wall", "-Wextra", "-Werror", "-DMINYAR_COMPRESSION_CHUNK=" + chunk]
+    if leaks == "1" { sharedFlags.add("-Wl,--exclude-libs,ALL") }
+    nativeLink(context, sharedFlags, cflags, libraries, ["runtime/native/zstd.c", "runtime/native/deflate.c", "tests/compression-reference.c"], shared)
     test.check(oracle.open(shared) == 0, "cannot load private independent codec cohort")
     oracle.qualify(chunk)
     if chunk != "7" { test.check(oracle.close() == 0, "cannot close private codec cohort") }
@@ -175,6 +232,7 @@ if !nativeOnly {
         }
     }
     oracle.driver(binaries[1], context.directory, context.environment)
+    evidence(context, mode, [zstd, deflate])
 }
 test.check(oracle.close() == 0, "cannot close final private codec cohort")
 test.removeTree(scratch)
