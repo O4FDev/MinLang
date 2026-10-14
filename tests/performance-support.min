@@ -247,22 +247,16 @@ public function profile(control: Backend, compiler: Text, source: Text, output: 
     }
     return success(best)
 }
-public function fileIdentity(path: Text, log: Text, darwin: Boolean): json.Value {
-    let resolved = capture(["/usr/bin/realpath", path], log + ".path")
-    if resolved.status != 0 { resolved = capture(["/bin/realpath", path], log + ".path") }
-    test.require(resolved, "resolve identity path")
-    let absolute = test.lines(resolved.output)[0]
-    let command = ["/usr/bin/sha256sum", "--", absolute]
-    if darwin { command = ["/usr/bin/shasum", "-a", "256", "--", absolute] }
-    let result = capture(command, log + ".hash"); test.require(result, "artifact identity SHA256")
-    let fields = test.words(result.output); test.check(fields.length > 0 && Bytes(fields[0]).length == 64, "identity digest")
-    return data.object(["path", "sha256"], [data.text(absolute), data.text(fields[0])])
+public function fileIdentity(path: Text, log: Text): json.Value {
+    test.check(files.pathSize(path) >= 0, "missing identity path " + path)
+    let absolute = test.canonical(path, log + ".path")
+    return data.object(["path", "sha256"], [data.text(absolute), data.text(test.sha256(absolute, log + ".hash"))])
 }
 public function configurationEnvironment(): json.Value { return data.object(["SDKROOT", "MACOSX_DEPLOYMENT_TARGET"], [data.text(system.getenv("SDKROOT")), data.text(system.getenv("MACOSX_DEPLOYMENT_TARGET"))]) }
 public record Comparison { root: Text; current: Text; previous: Text; input: Text; runtime: Text; manifest: Text; report: Text; work: Text; runs: Integer; batches: Integer; darwin: Boolean; control: Backend }
 public function identities(context: Comparison): json.Value {
     let values: List<json.Value> = []; let paths = [context.current, context.previous, context.input, context.runtime]
-    for index in 0..paths.length { values.add(fileIdentity(paths[index], context.work + "/identity" + Text(index), context.darwin)) }
+    for index in 0..paths.length { values.add(fileIdentity(paths[index], context.work + "/identity" + Text(index))) }
     return data.object(["current", "previous", "input", "runtime"], values)
 }
 public function recordComparison(context: Comparison): json.Value {
@@ -271,7 +265,7 @@ public function recordComparison(context: Comparison): json.Value {
     test.require(revision, "current compiler ref")
     let previousRef = system.getenv("MINYAR_BUDGET_PREVIOUS_REF")
     test.check(system.lastError() == 0, "previous compiler reference required")
-    let configuration = data.object(["previous_ref", "current_ref", "toolchain", "environment", "clang", "artifacts"], [data.text(previousRef), data.text(test.lines(revision.output)[0]), toolchain, configurationEnvironment(), fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang", context.darwin), identities(context)])
+    let configuration = data.object(["previous_ref", "current_ref", "toolchain", "environment", "clang", "artifacts"], [data.text(previousRef), data.text(test.lines(revision.output)[0]), toolchain, configurationEnvironment(), fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang"), identities(context)])
     files.makeDirectory(data.parent(context.manifest))
     writeTextFile(context.manifest, json.pretty(configuration, "") + "\n")
     return configuration
@@ -281,7 +275,7 @@ function configurationValid(context: Comparison, configuration: json.Value, orig
     let toolchain = json.member(configuration, "toolchain")
     if json.string(toolchain, "llvm_version") != "23.1.2" { return failure("same-input compiler comparison requires LLVM 23.1.2") }
     let actual = json.parse(readTextFile(context.root + "/build/.toolchain.json"))
-    let clang = fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang", context.darwin)
+    let clang = fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang")
     if !equal(actual, toolchain) || !equal(clang, json.member(configuration, "clang")) || !equal(configurationEnvironment(), json.member(configuration, "environment")) { return failure("same-input compiler comparison toolchain changed") }
     return success(configuration)
 }
@@ -371,7 +365,7 @@ public function fixtureComparison(work: Text, runs: Integer, batches: Integer): 
     writeTextFile(context.runtime, "runtime")
     let toolchain = data.object(["llvm_version", "llvm_cc", "flags"], [data.text("23.1.2"), data.object(["path"], [data.text(work + "/clang")]), data.object(["LLVM_FLAGS", "COMPILER_LTO_FLAGS"], [data.text("-O2"), data.text("-flto=thin")])])
     writeTextFile(work + "/build/.toolchain.json", json.pretty(toolchain, ""))
-    let configuration = data.object(["toolchain", "environment", "clang", "artifacts"], [toolchain, configurationEnvironment(), fileIdentity(work + "/clang", work + "/clang-identity", false), identities(context)])
+    let configuration = data.object(["toolchain", "environment", "clang", "artifacts"], [toolchain, configurationEnvironment(), fileIdentity(work + "/clang", work + "/clang-identity"), identities(context)])
     writeTextFile(context.manifest, json.pretty(configuration, ""))
     return context
 }
@@ -394,7 +388,7 @@ public function controlledReport(link: Boolean, cpuAvailable: Boolean, enforce: 
     let artifacts = json.member(report, "artifacts")
     let labels = ["driver", "compiler", "production", "runtime"]
     let filenames = ["minyar-module-build", "minyarc-modules", "minyarc", "minyar-runtime.o"]
-    for index in 0..labels.length { let label = labels[index]; writeTextFile(work + "/" + label, filenames[index]); data.set(artifacts, label, json.member(fileIdentity(work + "/" + label, work + "/artifact-" + label, false), "sha256")) }
+    for index in 0..labels.length { let label = labels[index]; writeTextFile(work + "/" + label, filenames[index]); data.set(artifacts, label, json.member(fileIdentity(work + "/" + label, work + "/artifact-" + label), "sha256")) }
     let cache = work + "/case.cache"; writeTextFile(cache, "cache")
     let entry = "    print(value())\n"; let library = "result = result + 1\n"
     for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit", "cold"] {
