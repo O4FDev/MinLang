@@ -59,32 +59,39 @@ using the variables below; the ARM64 archive is not an Intel installation.
 
 ## Ubuntu 24.04
 
-Install the native build prerequisites and add the LLVM 23 package repository,
-as the Linux CI job does:
+On x86-64 Ubuntu, install the same checksum-pinned LLVM archive used by CI:
 
 ```sh
+test "$(uname -m)" = x86_64
 sudo apt-get update &&
-sudo apt-get install -y build-essential zsh curl ca-certificates gnupg
-minyar_key="$(mktemp)"
-curl --fail --location 'https://apt.llvm.org/llvm-snapshot.gpg.key' -o "$minyar_key" &&
-sudo gpg --batch --yes --dearmor \
-  -o '/usr/share/keyrings/minyar-llvm.gpg' "$minyar_key"
-printf '%s\n' \
-  'deb [signed-by=/usr/share/keyrings/minyar-llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main' |
-  sudo tee '/etc/apt/sources.list.d/minyar-llvm.list'
-sudo apt-get update &&
-sudo apt-get install -y clang-23 llvm-23 lld-23 libclang-rt-23-dev
-export MINYAR_CLANG='/usr/lib/llvm-23/bin/clang'
+sudo apt-get install -y build-essential make zsh curl ca-certificates zstd libxml2 libtinfo6
+minyar_llvm_dir="$HOME/.cache/minyar/toolchains/llvm-23.1.2"
+minyar_download_dir="$(mktemp -d)"
+minyar_archive="$minyar_download_dir/LLVM-23.1.2-Linux-X64.tar.zst"
+curl --fail --location --retry 3 \
+  'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-Linux-X64.tar.zst' \
+  -o "$minyar_archive" &&
+printf '%s  %s\n' \
+  '6382de1c1a210ce5a5cc49d18bc8444d137742e7cbf9b19f4ae602bb1ab52534' \
+  "$minyar_archive" | sha256sum --check
+```
+
+Only after the checksum succeeds, extract into a new directory:
+
+```sh
+mkdir -p "$(dirname "$minyar_llvm_dir")"
+mkdir "$minyar_llvm_dir" &&
+tar --zstd -xf "$minyar_archive" -C "$minyar_llvm_dir" --strip-components=1
+export MINYAR_CLANG="$minyar_llvm_dir/bin/clang"
 export LLVM_CC="$MINYAR_CLANG"
 ./minyar --doctor
 ```
 
-The LLVM repository can advance within its release branch. Installing packages
-named `*-23` alone does not establish the required patch version: `--doctor`
-must report 23.1.2 and pass its link checks. If the repository supplies a different
-patch, use a matching 23.1.2 installation or package snapshot and point both
-variables at it. Other distributions need their equivalent C development,
-Make, zsh, and matching Clang/LLD packages.
+LLVM package repositories can advance within a release branch. Packages named
+`*-23` alone do not establish the required patch version: `--doctor` must report
+23.1.2 and pass its link checks. ARM64 Linux needs a matching native toolchain;
+the X64 archive is not an ARM64 installation. Other distributions need their
+equivalent C development, Make and zsh packages.
 
 ## Compiler selection and verification
 
