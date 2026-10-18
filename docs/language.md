@@ -502,6 +502,44 @@ Construction uses record literals or ordinary named functions, such as
 `bank.open("Ada")`. A dotted declaration always takes a receiver; there is no
 separate type-level method form. This keeps construction explicit and gives
 factory functions the same module visibility rules as other functions.
+## Choices and matching
+
+A choice describes the different forms one value can take. Cases start with a
+capital letter and may carry named, typed payloads:
+
+```minyar
+choice Shape {
+    Circle(radius: Float)
+    Rectangle(width: Float, height: Float)
+    Empty
+}
+
+let shape = Shape.Circle(2.0)
+match shape {
+    Circle(radius) { print(3.14159 * radius * radius) }
+    Rectangle(width, height) { print(width * height) }
+    Empty { print(0.0) }
+}
+```
+
+A constructor may omit its choice name when the case is unambiguous, or when
+an annotation, parameter or return type supplies the choice. Payload-free cases
+are written `Empty` or `Shape.Empty`; empty parentheses are also accepted.
+Use `public choice` to export a choice and its cases. In another module,
+`geometry.Shape.Circle(2.0)` constructs an exported case.
+
+A match evaluates its input once. It must cover every case exactly once, or end
+with `else { ... }` to handle the remaining cases. A missing-case diagnostic
+names the cases still needed. Payload names in an arm are local bindings; `_`
+ignores a payload. Arms may return, break or continue just like other blocks.
+
+Choices currently share the record representation and automatic memory
+management. Each value allocates a tag and slots for all declared payloads;
+inactive slots are empty. This includes choices with no payloads. Payloads can
+hold choices, records, Lists and callbacks, with the same ownership and cycle
+analysis as records. Cases and payload fields are accessed through constructors
+and matching. Generic user choices and nested or literal patterns are not yet
+supported.
 
 ## Recoverable failures
 

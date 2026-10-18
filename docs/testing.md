@@ -38,6 +38,13 @@ lifetime during argument mutation, and literal-condition return analysis.
 It uses ordinary and module-state compilation at O0/O2 with ownership cleanup
 assertions; `check-nitpick-language-sanitize` adds ASan/UBSan.
 
+`make check-choice` checks choice construction, exhaustive statement matches,
+module visibility, binding scope, recursive payloads and the choice gallery.
+Positive programs run at O0/O2 with ownership cleanup assertions; rejection
+fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
+ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed
+with `unknown type 'Shape'`; the focused gate is the passing feature regression.
+
 `make check-language-ergonomics` checks inferred Result constructors,
 expression propagation and error cleanup, no-value success, callable type and
 anonymous-function inference across module boundaries, immutable locals,
