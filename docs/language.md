@@ -284,6 +284,10 @@ surrounding typed List literal. An empty List with no such context still needs
 an annotation. Literal elements are evaluated from left to right; a comma
 separates elements, and a trailing comma is allowed.
 
+In a Result-returning function, a temporary owner protects a List's partially
+built contents when `try` returns an error. Successful construction adds one
+retain/release pair, including for an interpolation's parts List.
+
 A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
 create a record/List ownership cycle activate traced allocation, as described
