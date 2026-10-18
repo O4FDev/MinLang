@@ -1,8 +1,8 @@
 # The core declaration remains ordinary Minyar source; embedding avoids a runtime
 # dependency on the compiler's working directory or a particular library path.
-build/choice-builtins.min: library/maybe.min build-support/choice.mk | build
-	python3 -c 'import json, sys; from pathlib import Path; print("function builtinMaybeSource(): Text { return " + json.dumps(Path(sys.argv[1]).read_text(), ensure_ascii=False) + " }")' "$<" > "$@.tmp"
-	mv "$@.tmp" "$@"
+build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | build
+	awk -f "build-support/choice-prelude.awk" "$<" > "$@.tmp"
+	if test -f "$@" && cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
 
 .PHONY: check-choice-identifiers check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
 
