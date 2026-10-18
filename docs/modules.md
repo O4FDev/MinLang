@@ -47,8 +47,9 @@ declarations belong to separate module namespaces.
 
 ## Packages
 
-Names that do not begin with `./` or `../` are standard library packages,
-bundled with the compiler in [`library/`](../library/):
+Names that do not begin with `./` or `../` are package imports. They resolve
+through the project dependencies and standard library search directories. The
+standard packages are bundled with the compiler in [`library/`](../library/):
 
 ```minyar
 use "graphics" as graphics
@@ -84,7 +85,8 @@ not follow redirects and rejects unsupported transfer encodings explicitly.
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or
 `native "macos"`, and `./minyar` builds and links the needed native code
-automatically. Packages from other sources are not yet supported.
+automatically. The [project CLI](cli.md) supports local source dependencies
+declared in `Minyar.toml`; remote package registries are not yet supported.
 
 The compiler finds packages through `--library DIRECTORY`, which may be given
 more than once (`./minyar` accepts it too, ahead of its standard directories); each directory is searched in order and the first with the

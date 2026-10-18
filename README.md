@@ -4,8 +4,24 @@ A small, statically typed language that compiles to native code through LLVM.
 
 ## Get started
 
-Requires Clang, a C compiler, Make, zsh, and system C development headers.
-The compiler, runtime and link driver build on first use.
+Building from source requires LLVM 23.1.2, a C compiler, Make, zsh, and system
+C development headers. Follow the [toolchain setup](docs/toolchain.md).
+The source checkout builds the compiler, runtime and link driver on first use.
+
+The [project CLI](docs/cli.md), written in Minyar, manages packages, local
+dependencies, builds, tests, and installed executables:
+
+```sh
+make install                  # installs to ~/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+minyar new hello
+cd hello
+minyar run
+minyar test
+minyar build --release
+```
+
+Single-file programs also work directly:
 
 ```sh
 ./minyar examples/hello.min -o hello
@@ -26,7 +42,7 @@ executable, and output paths cannot replace the input source.
 
 `./minyar --help` lists options, `--version` identifies the development sources,
 and `--doctor` checks the native toolchain with a real LLVM/LTO link. See
-native toolchains for platform setup and compiler selection.
+[native toolchains](docs/toolchain.md) for platform setup and compiler selection.
 
 Programs use automatic, system-backed incremental reference counting by default.
 Large ownership graphs are reclaimed in budgeted batches without required

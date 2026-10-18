@@ -1,0 +1,205 @@
+// Project manifests and local dependency resolution, shared by the developer CLI.
+use "./driver-support.min" as host
+use "files" as files
+use "system" as system
+
+public record Manifest { root: Text; name: Text; version: Text; kind: Text; dependencies: List<Text>; paths: List<Text> }
+public record Graph { packages: List<Manifest>; active: List<Text> }
+
+public function validName(name: Text): Boolean {
+    let raw = Bytes(name)
+    if raw.length == 0 || raw.length > 64 { return false }
+    for index in 0..raw.length {
+        let byte = raw[index]
+        let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        if !letter && !(index > 0 && (host.isDigit(byte) || byte == 45)) { return false }
+    }
+    return true
+}
+function versionValid(version: Text): Boolean {
+    let parts = version.split(".")
+    if parts.length != 3 { return false }
+    for part in parts {
+        if part == "" { return false }
+        for byte in Bytes(part) { if !host.isDigit(byte) { return false } }
+    }
+    return true
+}
+function withoutComment(line: Text): Text {
+    let quoted = false
+    let escaped = false
+    let raw = Bytes(line)
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if escaped { escaped = false }
+        else if quoted && byte == 92 { escaped = true }
+        else if byte == 34 { quoted = !quoted }
+        else if !quoted && byte == 35 { return host.textSlice(line, 0, index) }
+    }
+    return line
+}
+function unquote(value: Text, location: Text): Text {
+    let raw = Bytes(value)
+    if raw.length < 2 || raw[0] != 34 || raw[raw.length - 1] != 34 { host.stop(location + ": expected a double-quoted string") }
+    let result = Bytes()
+    let index = 1
+    while index < raw.length - 1 {
+        let byte = raw[index]
+        if byte == 92 {
+            index += 1
+            if index >= raw.length - 1 { host.stop(location + ": unfinished escape") }
+            byte = raw[index]
+            if byte != 34 && byte != 92 { host.stop(location + ": only escaped quotes and backslashes are supported") }
+        } else if byte == 34 || byte < 32 { host.stop(location + ": invalid string") }
+        result.add(byte)
+        index += 1
+    }
+    return Text(result)
+}
+public function read(root: Text): Manifest {
+    let manifest = root + "/Minyar.toml"
+    let result = Manifest { root: root; name: ""; version: ""; kind: ""; dependencies: []; paths: [] }
+    let section = ""
+    let sections: List<Text> = []
+    let keys: List<Text> = []
+    let number = 0
+    for original in host.lines(host.readText(manifest)) {
+        number += 1
+        let location = manifest + ":" + Text(number)
+        let line = host.strip(withoutComment(original))
+        if line == "" { continue }
+        if line.startsWith("[") {
+            if line != "[package]" && line != "[dependencies]" { host.stop(location + ": unknown section " + line) }
+            if host.listed(sections, line) { host.stop(location + ": duplicate section " + line) }
+            sections.add(line)
+            section = line
+            continue
+        }
+        let equal = host.findText(line, "=", 0)
+        if equal < 1 { host.stop(location + ": expected key = value") }
+        let key = host.strip(host.textSlice(line, 0, equal))
+        let value = host.strip(host.textAfter(line, host.textSlice(line, 0, equal + 1)))
+        if host.listed(keys, section + key) { host.stop(location + ": duplicate key " + key) }
+        keys.add(section + key)
+        if section == "[package]" {
+            let parsed = unquote(value, location)
+            if key == "name" { result.name = parsed }
+            else if key == "version" { result.version = parsed }
+            else if key == "kind" {
+                if parsed != "bin" && parsed != "lib" { host.stop(location + ": package.kind must be bin or lib") }
+                result.kind = parsed
+            }
+            else { host.stop(location + ": unknown package key " + key) }
+        } else if section == "[dependencies]" {
+            if !validName(key) { host.stop(location + ": invalid dependency name " + key) }
+            if !value.startsWith("{") || !value.endsWith("}") { host.stop(location + ": local dependencies use { path = \"../package\" }") }
+            let entry = host.strip(host.textSlice(value, 1, value.byteLength - 1))
+            let separator = host.findText(entry, "=", 0)
+            if separator < 0 || host.strip(host.textSlice(entry, 0, separator)) != "path" { host.stop(location + ": expected path = \"../package\"") }
+            let path = unquote(host.strip(host.textSlice(entry, separator + 1, entry.byteLength)), location)
+            if path == "" { host.stop(location + ": dependency path is empty") }
+            result.dependencies.add(key)
+            result.paths.add(path)
+        } else { host.stop(location + ": keys must be inside [package] or [dependencies]") }
+    }
+    if !validName(result.name) { host.stop(manifest + ": package.name must start with a letter or underscore and contain letters, digits, '-' or '_'") }
+    if !versionValid(result.version) { host.stop(manifest + ": package.version must have three numeric components") }
+    return result
+}
+public function find(start: Text): Text {
+    let directory = host.resolveName(start)
+    while true {
+        if host.isFile(directory + "/Minyar.toml") { return directory }
+        let parent = host.parentPath(directory)
+        if parent == directory { host.stop("no Minyar.toml found in this directory or its parents; use minyar init") }
+        directory = parent
+    }
+    return directory
+}
+public function at(path: Text): Text {
+    let resolved = host.resolveName(path)
+    if host.isDirectory(resolved) { resolved += "/Minyar.toml" }
+    if host.baseName(resolved) != "Minyar.toml" || !host.isFile(resolved) { host.stop("manifest not found: " + path) }
+    return host.parentPath(resolved)
+}
+public function library(manifest: Manifest): Text { return manifest.root + "/src/" + manifest.name + ".min" }
+public function isBinary(manifest: Manifest): Boolean {
+    if manifest.kind != "" { return manifest.kind == "bin" }
+    return host.isFile(manifest.root + "/src/main.min")
+}
+public function hasLibrary(manifest: Manifest): Boolean {
+    return !(manifest.name == "main" && isBinary(manifest)) && host.isFile(library(manifest))
+}
+public function entry(manifest: Manifest): Text {
+    let source = library(manifest)
+    if isBinary(manifest) { source = manifest.root + "/src/main.min" }
+    if host.isFile(source) { return source }
+    host.stop("package " + manifest.name + " needs " + source)
+    return ""
+}
+function visit(graph: Graph, root: Text, candidate: Manifest) {
+    if host.listed(graph.active, root) { host.stop("dependency cycle: " + host.joined(graph.active, " -> ") + " -> " + root) }
+    for package in graph.packages { if package.root == root { return } }
+    let package = candidate
+    if root != candidate.root { package = read(root) }
+    for previous in graph.packages {
+        if previous.name == package.name { host.stop("dependency name conflict: " + package.name + " resolves to both " + previous.root + " and " + root) }
+    }
+    graph.packages.add(package)
+    graph.active.add(root)
+    let order = package.dependencies.sorted()
+    for name in order {
+        let index = 0
+        while package.dependencies[index] != name { index += 1 }
+        let path = package.paths[index]
+        if !path.startsWith("/") { path = root + "/" + path }
+        let dependency = read(host.resolveName(path))
+        if dependency.name != name { host.stop("dependency " + name + " has package.name = " + host.jsonText(dependency.name)) }
+        if !hasLibrary(dependency) { host.stop("dependency " + name + " needs a library export at src/" + name + ".min") }
+        visit(graph, dependency.root, candidate)
+    }
+    graph.active.pop()
+}
+public function resolvePackage(package: Manifest): Graph {
+    let graph = Graph { packages: []; active: [] }
+    visit(graph, package.root, package)
+    return graph
+}
+public function resolve(root: Text): Graph { return resolvePackage(read(root)) }
+public function relative(root: Text, path: Text): Text {
+    let from = root.split("/")
+    let to = path.split("/")
+    let common = 0
+    while common < from.length && common < to.length && from[common] == to[common] { common += 1 }
+    let parts: List<Text> = []
+    for index in common..from.length { parts.add("..") }
+    for index in common..to.length { parts.add(to[index]) }
+    if parts.length == 0 { return "." }
+    return host.joined(parts, "/")
+}
+public function atomicWrite(path: Text, content: Text) {
+    let temporary = path + ".tmp-" + Text(system.processId())
+    host.writeBytes(temporary, Bytes(content))
+    let status = files.rename(temporary, path)
+    if status != 0 { files.remove(temporary); host.stop(host.osError(status, path)) }
+}
+public function lock(graph: Graph, locked: Boolean) {
+    let root = graph.packages[0].root
+    let content = "# Generated by minyar. Local sources remain editable.\nversion = 1\n"
+    for package in graph.packages {
+        content += "\n[[package]]\nname = " + host.jsonText(package.name) + "\nversion = " + host.jsonText(package.version) + "\npath = " + host.jsonText(relative(root, package.root)) + "\nmanifest = " + host.jsonText(host.hashFile(package.root + "/Minyar.toml")) + "\n"
+    }
+    let path = root + "/Minyar.lock"
+    if host.isFile(path) && host.readText(path) == content { return }
+    if locked { host.stop("Minyar.lock is missing or out of date; run minyar build without --locked") }
+    atomicWrite(path, content)
+}
+public function render(package: Manifest): Text {
+    let result = "[package]\nname = " + host.jsonText(package.name) + "\nversion = " + host.jsonText(package.version) + "\n"
+    if package.kind != "" { result += "kind = " + host.jsonText(package.kind) + "\n" }
+    result += "\n[dependencies]\n"
+    for index in 0..package.dependencies.length {
+        result += package.dependencies[index] + " = { path = " + host.jsonText(package.paths[index]) + " }\n"
+    }
+    return result
+}

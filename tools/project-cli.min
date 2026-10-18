@@ -1,0 +1,411 @@
+use "process" as processInfo
+use "./project.min" as project
+use "./driver-support.min" as host
+use "system" as system
+use "files" as files
+
+record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; release: Boolean; library: Boolean; locked: Boolean; force: Boolean; incremental: Boolean; positionals: List<Text>; arguments: List<Text> }
+
+function help() {
+    print("Minyar project CLI\n\nUsage: minyar <COMMAND> [OPTIONS]\n\n  new PATH       Create a binary package (--lib for a library)\n  init [PATH]    Initialize a package without overwriting existing files\n  build          Build the current package\n  run            Build and run; pass program arguments after --\n  check          Check the package and integration tests without linking\n  test           Build and run tests/*.min; pass test arguments after --\n  clean          Remove this package's generated target directory\n  add NAME --path PATH   Add a local library dependency\n  remove NAME    Remove a dependency\n  tree           Show the resolved local dependency graph\n  metadata       Print package and dependency metadata as JSON\n  install        Build and install the package binary (--path PATH)\n  uninstall NAME Remove a binary installed by Minyar\n\nOptions:\n  --manifest-path PATH   Minyar.toml or package directory (searches parents by default)\n  --release              Use the release profile (default: debug)\n  --locked               Require an up-to-date Minyar.lock\n  --no-incremental       Disable module compilation caching\n  --name NAME            Package name for new/init\n  --lib                  Create a library with new/init\n  --root DIR             Installation prefix (default: $MINYAR_HOME or ~/.minyar)\n  --force                Replace a binary during install\n  -h, --help             Show this help\n\nExisting file builds remain available: minyar [OPTIONS] FILE.min [-o PROGRAM]\nToolchain diagnostics: minyar --doctor; minyar --version")
+}
+function parse(): Options {
+    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; release: false; library: false; locked: false; force: false; incremental: true; positionals: []; arguments: [] }
+    let seen: List<Text> = []
+    let index = 1
+    while index < processInfo.argumentCount() {
+        let item = processInfo.argument(index)
+        if item == "--" {
+            if options.command != "run" && options.command != "test" { host.stop("-- arguments are supported only for run and test") }
+            index += 1
+            while index < processInfo.argumentCount() { options.arguments.add(processInfo.argument(index)); index += 1 }
+            break
+        }
+        if item == "--help" || item == "-h" { help(); exit(0) }
+        if item.startsWith("-") {
+            if host.listed(seen, item) { host.stop("duplicate option: " + item) }
+            seen.add(item)
+            if item == "--release" { options.release = true }
+            else if item == "--lib" { options.library = true }
+            else if item == "--locked" { options.locked = true }
+            else if item == "--force" { options.force = true }
+            else if item == "--no-incremental" { options.incremental = false }
+            else if item == "--manifest-path" || item == "--path" || item == "--name" || item == "--root" {
+                index += 1
+                if index >= processInfo.argumentCount() || processInfo.argument(index) == "" || processInfo.argument(index).startsWith("--") { host.stop(item + " requires a value") }
+                let value = processInfo.argument(index)
+                if item == "--manifest-path" { options.manifest = value }
+                else if item == "--path" { options.path = value }
+                else if item == "--name" { options.name = value }
+                else { options.root = value }
+            } else { host.stop("unknown option: " + item) }
+        } else { options.positionals.add(item) }
+        index += 1
+    }
+    for option in seen {
+        let allowed = false
+        if option == "--name" || option == "--lib" { allowed = options.command == "new" || options.command == "init" }
+        else if option == "--path" { allowed = options.command == "add" || options.command == "install" }
+        else if option == "--root" { allowed = options.command == "install" || options.command == "uninstall" }
+        else if option == "--force" { allowed = options.command == "install" }
+        else if option == "--manifest-path" { allowed = options.command != "new" && options.command != "init" && options.command != "uninstall" }
+        else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "tree", "metadata", "install"], options.command) }
+        else { allowed = host.listed(["build", "run", "check", "test", "install"], options.command) }
+        if !allowed { host.stop(option + " is not supported by " + options.command) }
+    }
+    return options
+}
+function execute(arguments: List<Text>, directory: Text, environment: List<Text>): Integer {
+    let handle = system.spawn(arguments[0], arguments, environment, directory)
+    if handle < 0 { host.stop(host.osError(handle, arguments[0])) }
+    let status = system.wait(handle)
+    if status.state == system.SIGNALED { return 128 + status.signal }
+    if status.state != system.EXITED { host.stop("cannot wait for " + arguments[0]) }
+    return status.exitCode
+}
+function require(arguments: List<Text>, directory: Text) {
+    let status = execute(arguments, directory, system.environment())
+    if status != 0 { host.leave(status) }
+}
+function exclusive(path: Text, content: Text) {
+    let file = files.open(path, files.WRITE + files.CREATE + files.EXCLUSIVE)
+    if file < 0 { host.stop(host.osError(file, path)) }
+    let data = Bytes(content)
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written < 0 || closed < 0 { host.stop("cannot write " + path) }
+}
+function create(options: Options) {
+    if options.positionals.length > 1 || (options.command == "new" && options.positionals.length != 1) { host.stop("usage: minyar " + options.command + " PATH [--name NAME] [--lib]") }
+    let path = "."
+    if options.positionals.length == 1 { path = options.positionals[0] }
+    let root = host.resolveName(path)
+    if options.command == "new" && host.exists(root) { host.stop("destination already exists: " + root + "; use init for an existing directory") }
+    if host.exists(root + "/Minyar.toml") { host.stop("refusing to overwrite " + root + "/Minyar.toml") }
+    let name = options.name
+    if name == "" { name = host.baseName(root) }
+    if !project.validName(name) { host.stop("invalid package name; use --name with letters, digits, '-' or '_', starting with a letter or underscore") }
+    let source = root + "/src/main.min"
+    if options.library { source = root + "/src/" + name + ".min" }
+    if host.exists(source) { host.stop("refusing to overwrite " + source) }
+    host.makeDirectories(root + "/src")
+    host.makeDirectories(root + "/tests")
+    let kind = "bin"
+    if options.library { kind = "lib" }
+    let manifest = project.Manifest { root: root; name: name; version: "0.1.0"; kind: kind; dependencies: []; paths: [] }
+    exclusive(root + "/Minyar.toml", project.render(manifest))
+    if options.library {
+        exclusive(source, "public function answer(): Integer { return 42 }\n")
+        if !host.exists(root + "/tests/smoke.min") { exclusive(root + "/tests/smoke.min", "use \"" + name + "\" as package\nif package.answer() != 42 { fail(\"expected 42\") }\nprint(\"test passed\")\n") }
+    } else {
+        exclusive(source, "print(\"Hello, world!\")\n")
+        if !host.exists(root + "/tests/smoke.min") { exclusive(root + "/tests/smoke.min", "if 1 + 1 != 2 { fail(\"arithmetic failed\") }\nprint(\"test passed\")\n") }
+    }
+    if !host.exists(root + "/.gitignore") { exclusive(root + "/.gitignore", "/target/\n") }
+    print("Created " + name + " at " + root)
+}
+function target(root: Text, create: Boolean): Text {
+    let path = root + "/target"
+    // Never follow a target-directory symlink for output or recursive deletion.
+    if host.resolveName(path) != path { host.stop("target must be a real directory inside the package: " + path) }
+    let marker = path + "/.minyar-target"
+    if host.exists(path) {
+        if !host.isDirectory(path) || !host.isFile(marker) || host.readText(marker) != "minyar-target-v1\n" { host.stop("refusing to use an unowned target directory: " + path) }
+    } else if create {
+        host.makeDirectories(path)
+        exclusive(marker, "minyar-target-v1\n")
+    }
+    return path
+}
+function outputDirectory(root: Text, relative: Text): Text {
+    let directory = target(root, true) + "/" + relative
+    if host.resolveName(directory) != directory { host.stop("output directories must remain inside target: " + directory) }
+    host.makeDirectories(directory)
+    return directory
+}
+function profile(options: Options): Text {
+    if options.release { return "release" }
+    return "debug"
+}
+function compiler(): Text {
+    let root = system.getenv("MINYAR_PROJECT_DIR")
+    if root == "" { root = host.parentPath(host.parentPath(host.parentPath(host.parentPath(host.selfPath())))) }
+    let launcher = root + "/minyar"
+    if !host.isFile(launcher) { host.stop("cannot locate the Minyar toolchain; set MINYAR_PROJECT_DIR") }
+    return launcher
+}
+function compile(graph: project.Graph, options: Options, source: Text, output: Text, check: Boolean) {
+    let arguments = [compiler()]
+    if check { arguments.add("--check") }
+    else if options.release { arguments.add("--release") }
+    else { arguments.add("--debug") }
+    if options.incremental { arguments.add("--incremental") }
+    // A declared main library must win over unrelated binary entry files in
+    // mixed packages' source directories.
+    for package in graph.packages {
+        if package.name == "main" && project.hasLibrary(package) { arguments.add("--library"); arguments.add(package.root + "/src") }
+    }
+    for package in graph.packages {
+        if package.name != "main" && project.hasLibrary(package) { arguments.add("--library"); arguments.add(package.root + "/src") }
+    }
+    arguments.add(source)
+    if !check { arguments.add("-o"); arguments.add(output) }
+    let environment: List<Text> = []
+    for entry in system.environment() { if !entry.startsWith("MINYAR_MODULE_CACHE=") { environment.add(entry) } }
+    environment.add("MINYAR_MODULE_CACHE=" + graph.packages[0].root + "/target/" + profile(options) + "/.cache")
+    let status = execute(arguments, graph.packages[0].root, environment)
+    if status != 0 { exit(status) }
+}
+function tests(root: Text): List<Text> {
+    let result: List<Text> = []
+    if !host.isDirectory(root + "/tests") { return result }
+    let names = files.list(root + "/tests")
+    if files.lastError() != 0 { host.stop("cannot list integration tests") }
+    names.sort()
+    for name in names { if name.endsWith(".min") && host.isFile(root + "/tests/" + name) { result.add(name) } }
+    return result
+}
+function build(graph: project.Graph, options: Options): Text {
+    let package = graph.packages[0]
+    let directory = outputDirectory(package.root, profile(options))
+    let source = project.entry(package)
+    let output = directory + "/" + package.name
+    if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
+    compile(graph, options, source, output, !project.isBinary(package))
+    print("Finished " + profile(options) + " " + package.name)
+    return output
+}
+function installation(options: Options): Text {
+    let root = options.root
+    if root == "" { root = system.getenv("MINYAR_HOME") }
+    if root == "" {
+        let home = system.getenv("HOME")
+        if home == "" { host.stop("set HOME, MINYAR_HOME, or --root for installation") }
+        root = home + "/.minyar"
+    }
+    return host.resolveName(root) + "/bin"
+}
+constant INSTALL_BINARY = "minyar-installed-v1\n"
+constant INSTALL_SYMBOLS = "minyar-installed-v2\nsymbols = true\n"
+function installationEntry(path: Text): Boolean {
+    let names = files.list(host.parentPath(path))
+    if files.lastError() != 0 { host.stop("cannot list installation directory: " + host.parentPath(path)) }
+    return host.listed(names, host.baseName(path))
+}
+function installationMarker(path: Text): Text {
+    if !installationEntry(path) || !host.isFile(path) || host.resolveName(path) != path { return "" }
+    let content = host.readText(path)
+    if content == INSTALL_BINARY || content == INSTALL_SYMBOLS { return content }
+    return ""
+}
+function checkInstalledSymbols(path: Text) {
+    if !host.isDirectory(path) || host.resolveName(path) != path { host.stop("refusing to use unrelated or symlinked debug symbols: " + path) }
+}
+function installationFailure(status: Integer, path: Text, staging: Text) {
+    // Keep staged previous artifacts available even if a rollback itself fails.
+    host.stop(host.osError(status, path) + "; retained installation staging: " + staging)
+}
+function restoreSymbols(staging: Text, destination: Text, published: Boolean, previous: Boolean) {
+    if published { files.rename(destination, staging + "/symbols") }
+    if previous { files.rename(staging + "/previous.dSYM", destination) }
+}
+function finishInstallation(staging: Text) {
+    require([host.which("rm"), "-rf", "--", staging], "")
+}
+function uninstall(directory: Text, name: Text) {
+    let marker = directory + "/.minyar-installed-" + name
+    if !host.isDirectory(directory) { host.stop("binary was not installed by Minyar: " + name) }
+    let ownership = installationMarker(marker)
+    if ownership == "" { host.stop("binary was not installed by Minyar: " + name) }
+    let destination = directory + "/" + name
+    let symbols = destination + ".dSYM"
+    let removeSymbols = ownership == INSTALL_SYMBOLS && installationEntry(symbols)
+    if removeSymbols { checkInstalledSymbols(symbols) }
+    let staging = host.keptDirectory(directory, ".minyar-uninstall-")
+    if removeSymbols {
+        let status = files.rename(symbols, staging + "/previous.dSYM")
+        if status != 0 { installationFailure(status, symbols, staging) }
+    }
+    let status = files.rename(destination, staging + "/binary")
+    if status != 0 {
+        restoreSymbols(staging, symbols, false, removeSymbols)
+        installationFailure(status, destination, staging)
+    }
+    status = files.rename(marker, staging + "/marker")
+    if status != 0 {
+        files.rename(staging + "/binary", destination)
+        restoreSymbols(staging, symbols, false, removeSymbols)
+        installationFailure(status, marker, staging)
+    }
+    finishInstallation(staging)
+    print("Uninstalled " + name)
+}
+function install(graph: project.Graph, options: Options) {
+    let package = graph.packages[0]
+    if !project.isBinary(package) { host.stop("install requires a binary package with src/main.min") }
+    let binary = build(graph, options)
+    let directory = installation(options)
+    host.makeDirectories(directory)
+    let destination = directory + "/" + package.name
+    let hadBinary = installationEntry(destination)
+    if hadBinary && !options.force { host.stop(destination + " already exists; use --force to replace it") }
+    if hadBinary && (!host.isFile(destination) || host.resolveName(destination) != destination) { host.stop("refusing to replace an unrelated or symlinked binary: " + destination) }
+    let marker = directory + "/.minyar-installed-" + package.name
+    let ownership = installationMarker(marker)
+    if installationEntry(marker) && ownership == "" { host.stop("refusing to replace an unrelated installation marker: " + marker) }
+    let symbols = destination + ".dSYM"
+    let hadSymbols = installationEntry(symbols)
+    if hadSymbols {
+        if ownership != INSTALL_SYMBOLS { host.stop("refusing to replace unowned debug symbols: " + symbols) }
+        checkInstalledSymbols(symbols)
+    }
+    let hasSymbols = !options.release && host.isDirectory(binary + ".dSYM")
+    let staging = host.keptDirectory(directory, ".minyar-install-")
+    let staged = staging + "/binary"
+    host.copyFile(binary, staged)
+    let chmod = host.which("chmod")
+    if chmod == "" { host.stop("chmod is required for installation") }
+    require([chmod, "755", staged], "")
+    let newMarker = INSTALL_BINARY
+    if hasSymbols {
+        require([host.which("cp"), "-RP", binary + ".dSYM", staging + "/symbols"], "")
+        newMarker = INSTALL_SYMBOLS
+    }
+    host.writeBytes(staging + "/marker", Bytes(newMarker))
+    if hadSymbols {
+        let status = files.rename(symbols, staging + "/previous.dSYM")
+        if status != 0 { installationFailure(status, symbols, staging) }
+    }
+    if hasSymbols {
+        let status = files.rename(staging + "/symbols", symbols)
+        if status != 0 {
+            restoreSymbols(staging, symbols, false, hadSymbols)
+            installationFailure(status, symbols, staging)
+        }
+    }
+    if hadBinary {
+        let status = files.rename(destination, staging + "/previous")
+        if status != 0 {
+            restoreSymbols(staging, symbols, hasSymbols, hadSymbols)
+            installationFailure(status, destination, staging)
+        }
+    }
+    let status = files.rename(staged, destination)
+    if status == 0 { status = files.rename(staging + "/marker", marker) }
+    if status != 0 {
+        if hadBinary { files.rename(staging + "/previous", destination) }
+        else { files.remove(destination) }
+        restoreSymbols(staging, symbols, hasSymbols, hadSymbols)
+        installationFailure(status, destination, staging)
+    }
+    finishInstallation(staging)
+    print("Installed " + destination + "\nAdd " + directory + " to PATH.")
+}
+function modify(package: project.Manifest, options: Options) {
+    if options.positionals.length != 1 { host.stop("usage: minyar " + options.command + " NAME" ) }
+    let name = options.positionals[0]
+    let dependencies: List<Text> = []
+    let paths: List<Text> = []
+    let found = false
+    for index in 0..package.dependencies.length {
+        if package.dependencies[index] == name { found = true }
+        else { dependencies.add(package.dependencies[index]); paths.add(package.paths[index]) }
+    }
+    if options.command == "add" {
+        if options.path == "" { host.stop("add requires --path; registry dependencies are not available") }
+        let path = host.resolveName(options.path)
+        let dependency = project.read(path)
+        if name != dependency.name || !project.hasLibrary(dependency) { host.stop("dependency must be a library named " + name) }
+        if path == package.root { host.stop("a package cannot depend on itself") }
+        dependencies.add(name)
+        // Resolve from the invoking cwd, then keep the manifest relocatable.
+        paths.add(project.relative(package.root, path))
+    } else if !found { host.stop("dependency not found: " + name) }
+    package.dependencies = dependencies
+    package.paths = paths
+    project.resolvePackage(package)
+    project.atomicWrite(package.root + "/Minyar.toml", project.render(package))
+    print(options.command + " " + name)
+}
+function metadata(graph: project.Graph) {
+    let packages: List<Text> = []
+    for package in graph.packages {
+        packages.add("{\"name\":" + host.jsonText(package.name) + ",\"version\":" + host.jsonText(package.version) + ",\"manifest_path\":" + host.jsonText(package.root + "/Minyar.toml") + ",\"dependencies\":" + host.jsonList(package.dependencies) + "}")
+    }
+    print("{\"version\":1,\"target_directory\":" + host.jsonText(graph.packages[0].root + "/target") + ",\"packages\":[" + host.joined(packages, ",") + "]}")
+}
+function dispatch() {
+    if processInfo.argumentCount() == 0 { help(); return }
+    if processInfo.argument(0) == "help" { help(); return }
+    let options = parse()
+    if !host.listed(["new", "init", "build", "run", "check", "test", "clean", "add", "remove", "tree", "metadata", "install", "uninstall"], options.command) { host.stop("unknown command: " + options.command) }
+    if options.command == "new" || options.command == "init" { create(options); return }
+    if options.command == "uninstall" {
+        if options.positionals.length != 1 || !project.validName(options.positionals[0]) { host.stop("usage: minyar uninstall NAME [--root DIR]") }
+        let directory = installation(options)
+        let name = options.positionals[0]
+        uninstall(directory, name)
+        return
+    }
+    let root = ""
+    if options.manifest != "" { root = project.at(options.manifest) }
+    else if options.command == "install" && options.path != "" { root = project.at(options.path) }
+    else { root = project.find(".") }
+    let package = project.read(root)
+    if options.command == "add" || options.command == "remove" { modify(package, options); return }
+    if options.command != "test" && options.positionals.length != 0 { host.stop("unexpected positional argument for " + options.command) }
+    if options.command == "test" && options.positionals.length > 1 { host.stop("test accepts at most one filename filter") }
+    if options.command == "clean" {
+        let directory = target(root, false)
+        if host.exists(directory) {
+            let rm = host.which("rm")
+            if rm == "" { host.stop("rm is required for clean") }
+            require([rm, "-rf", "--", directory], "")
+        }
+        print("Cleaned " + package.name)
+        return
+    }
+    let graph = project.resolve(root)
+    project.lock(graph, options.locked)
+    if options.command == "metadata" { metadata(graph); return }
+    if options.command == "tree" {
+        for entry in graph.packages {
+            print(entry.name + " v" + entry.version + " (" + entry.root + ")")
+            for name in entry.dependencies { print("  -> " + name) }
+        }
+        return
+    }
+    if options.command == "install" { install(graph, options); return }
+    if options.command == "build" { build(graph, options); return }
+    if options.command == "run" {
+        if !project.isBinary(package) { host.stop("run requires src/main.min in a binary package") }
+        let output = build(graph, options)
+        let arguments = [output]
+        for item in options.arguments { arguments.add(item) }
+        exit(execute(arguments, root, system.environment()))
+    }
+    let directory = outputDirectory(root, profile(options) + "/tests")
+    compile(graph, options, project.entry(package), "", true)
+    if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
+    let count = 0
+    let failures = 0
+    for name in tests(root) {
+        if options.positionals.length > 0 && !host.hasText(name, options.positionals[0]) { continue }
+        count += 1
+        let output = directory + "/" + host.stemOf(name)
+        compile(graph, options, root + "/tests/" + name, output, options.command == "check")
+        if options.command == "test" {
+            let arguments = [output]
+            for item in options.arguments { arguments.add(item) }
+            let status = execute(arguments, root, system.environment())
+            if status != 0 { failures += 1; system.writeStandardError("FAILED " + name + " (exit " + Text(status) + ")\n") }
+            else { print("ok " + name) }
+        }
+    }
+    if options.command == "test" {
+        print(Text(count - failures) + " passed; " + Text(failures) + " failed")
+        if options.positionals.length > 0 && count == 0 { host.stop("no tests matched the filter") }
+        if failures != 0 { exit(1) }
+    } else { print("Checked " + package.name + " and " + Text(count) + " integration tests") }
+}
+dispatch()

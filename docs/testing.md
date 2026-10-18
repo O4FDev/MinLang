@@ -7,6 +7,16 @@ diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
 targets are recorded in the hardening review.
 
+`make check-project-cli` exercises the public project CLI with real compiler and
+linker invocations: package creation, debug/release builds, parent discovery,
+local transitive dependencies, lockfile checks, tests, literal argument and exit
+code forwarding, install/uninstall, failed-build preservation and safe cleanup.
+It is included in `check` and `check-portable` and requires the pinned LLVM toolchain.
+
+The project CLI gate also covers binary and library packages named `main`,
+legacy manifest inference, relocating sibling dependencies with `--locked`,
+and installation/replacement/removal of owned macOS debug symbols.
+
 `make check-nitpick-language` checks captured-binding assignment diagnostics,
 callback calls through fields, containers and returned expressions, callee
 lifetime during argument mutation, and literal-condition return analysis.

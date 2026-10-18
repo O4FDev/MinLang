@@ -1,0 +1,213 @@
+use "io" as io
+use "process" as processInfo
+// End-to-end user workflows through the public launcher, with real compilation.
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+record Fixture { launcher: Text; work: Text; serial: Integer }
+function invoke(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    fixture.serial += 1
+    let command = [fixture.launcher]
+    for item in arguments { command.add(item) }
+    return test.run(command, system.environment(), directory, fixture.work + "/command-" + Text(fixture.serial), 600)
+}
+function success(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    let result = invoke(fixture, arguments, directory)
+    test.require(result, "project CLI " + arguments[0])
+    return result
+}
+function rejected(fixture: Fixture, arguments: List<Text>, directory: Text, message: Text) {
+    let result = invoke(fixture, arguments, directory)
+    test.check(result.status != 0 && test.contains(result.errorOutput, message), "expected rejection: " + message + "\n" + result.output + result.errorOutput)
+}
+function external(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    fixture.serial += 1
+    return test.run(arguments, system.environment(), directory, fixture.work + "/external-" + Text(fixture.serial), 60)
+}
+let fixture = Fixture { launcher: processInfo.argument(0); work: test.scratch(); serial: 0 }
+let application = fixture.work + "/app with spaces"
+let library = fixture.work + "/geometry"
+let leaf = fixture.work + "/leaf"
+let prefix = fixture.work + "/installation with spaces"
+let darwin = test.contains(external(fixture, ["uname", "-s"], fixture.work).output, "Darwin")
+let helped = success(fixture, ["help"], fixture.work)
+test.check(test.contains(helped.output, "Minyar project CLI"), "project help")
+success(fixture, ["new", application, "--name", "greeting"], fixture.work)
+test.check(io.fileExists(application + "/Minyar.toml") && io.fileExists(application + "/src/main.min"), "binary scaffold")
+test.check(test.contains(io.readTextFile(application + "/Minyar.toml"), "kind = \"bin\""), "binary kind is explicit")
+let mainBinary = fixture.work + "/main"
+success(fixture, ["new", mainBinary], fixture.work)
+test.check(test.contains(success(fixture, ["run"], mainBinary).output, "Hello, world!"), "main is a valid binary package name")
+io.writeTextFile(mainBinary + "/Minyar.toml", "[package]\nname = \"main\"\nversion = \"0.1.0\"\n")
+test.check(test.contains(success(fixture, ["run"], mainBinary).output, "Hello, world!"), "legacy main manifests infer a binary")
+success(fixture, ["install", "--root", prefix], mainBinary)
+success(fixture, ["uninstall", "main", "--root", prefix], fixture.work)
+let portable = fixture.work + "/portable"
+let portableApp = portable + "/consumer"
+let mainLibrary = portable + "/main-library"
+success(fixture, ["new", mainLibrary, "--name", "main", "--lib"], fixture.work)
+test.check(test.contains(io.readTextFile(mainLibrary + "/Minyar.toml"), "kind = \"lib\""), "library kind disambiguates main")
+success(fixture, ["build"], mainLibrary)
+success(fixture, ["test"], mainLibrary)
+test.check(!io.fileExists(mainLibrary + "/target/debug/main"), "main library build validates without making a binary")
+rejected(fixture, ["run"], mainLibrary, "binary package")
+rejected(fixture, ["install", "--root", prefix], mainLibrary, "binary package")
+success(fixture, ["new", portableApp], fixture.work)
+rejected(fixture, ["add", "main", "--path", mainBinary], portableApp, "library named main")
+success(fixture, ["add", "main", "--path", "../../main-library"], portableApp + "/src")
+test.check(test.contains(io.readTextFile(portableApp + "/Minyar.toml"), "path = \"../main-library\""), "nested add records a manifest-relative path")
+let mixed = portable + "/mixed"
+success(fixture, ["new", mixed], fixture.work)
+io.writeTextFile(mixed + "/src/mixed.min", test.sourceModules("public function answer(): Integer { return 3 }\n"))
+success(fixture, ["add", "mixed", "--path", "../../mixed"], portableApp + "/src")
+io.writeTextFile(portableApp + "/src/consumer.min", test.sourceModules("public function answer(): Integer { return 7 }\n"))
+io.writeTextFile(portableApp + "/src/main.min", test.sourceModules("use \"main\" as library\nuse \"consumer\" as own\nuse \"mixed\" as mixed\nprint(library.answer() + own.answer() + mixed.answer())\n"))
+test.check(test.contains(success(fixture, ["run"], portableApp).output, "52"), "main library and mixed package exports remain consumable beside binary entry files")
+let portableLock = io.readTextFile(portableApp + "/Minyar.lock")
+let relocated = fixture.work + "/relocated"
+test.check(files.rename(portable, relocated) == 0, "move sibling packages together")
+let relocatedMetadata = success(fixture, ["metadata", "--locked"], relocated + "/consumer/src")
+test.check(test.contains(relocatedMetadata.output, relocated + "/main-library/Minyar.toml"), "locked metadata resolves moved sibling packages")
+test.check(io.readTextFile(relocated + "/consumer/Minyar.lock") == portableLock, "relocation preserves the lockfile")
+rejected(fixture, ["new", application], fixture.work, "already exists")
+rejected(fixture, ["init"], application, "refusing to overwrite")
+let ran = success(fixture, ["run"], application)
+test.check(test.contains(ran.output, "Hello, world!"), "real compiled binary runs")
+test.check(io.fileExists(application + "/target/debug/greeting"), "debug binary layout")
+test.check(io.fileExists(application + "/Minyar.lock"), "graph lock generated")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("let broken =\n"))
+let broken = invoke(fixture, ["build"], application)
+test.check(broken.status != 0, "invalid source rejects build")
+let preserved = external(fixture, [application + "/target/debug/greeting"], application)
+test.require(preserved, "previous executable survives failed compilation")
+test.check(test.contains(preserved.output, "Hello, world!"), "failed build preserves the prior program")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("print(\"Hello, world!\")\n"))
+success(fixture, ["build", "--release", "--locked"], application)
+test.check(io.fileExists(application + "/target/release/greeting"), "release binary layout")
+let nested = application + "/src"
+success(fixture, ["check", "--locked"], nested)
+let tested = success(fixture, ["test"], nested)
+test.check(test.contains(tested.output, "1 passed; 0 failed"), "generated smoke test runs")
+rejected(fixture, ["test", "missing"], application, "no tests matched")
+rejected(fixture, ["build", "--lib"], application, "not supported")
+rejected(fixture, ["build", "--release", "--release"], application, "duplicate option")
+rejected(fixture, ["build", "--unknown"], application, "unknown option")
+rejected(fixture, ["check", "extra"], application, "unexpected positional")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("print(processInfo.argument(0))\nprint(processInfo.argument(1))\nexit(7)\n"))
+let forwarded = invoke(fixture, ["run", "--", "a b", "$(touch SHOULD_NOT_EXIST); 'quoted'"], nested)
+test.check(forwarded.status == 7 && test.contains(forwarded.output, "a b\n$(touch SHOULD_NOT_EXIST); 'quoted'"), "literal arguments and exit code")
+test.check(!io.fileExists(application + "/SHOULD_NOT_EXIST"), "arguments never enter a shell")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("print(\"working\")\n"))
+io.writeTextFile(application + "/tests/fails.min", test.sourceModules("exit(9)\n"))
+let failedTests = invoke(fixture, ["test"], application)
+test.check(failedTests.status != 0 && test.contains(failedTests.output, "1 passed; 1 failed"), "test failure aggregation continues to later tests")
+success(fixture, ["test", "smoke"], application)
+test.check(files.remove(application + "/tests/fails.min") == 0, "remove failing fixture")
+io.writeTextFile(application + "/tests/arguments.min", test.sourceModules("if processInfo.argumentCount() != 1 || processInfo.argument(0) != \"a b\" { fail(\"test args\") }\n"))
+success(fixture, ["test", "arguments", "--", "a b"], application)
+test.check(files.remove(application + "/tests/arguments.min") == 0, "remove argument fixture")
+success(fixture, ["new", library, "--lib"], fixture.work)
+success(fixture, ["new", leaf, "--lib"], fixture.work)
+success(fixture, ["build"], library)
+success(fixture, ["test"], library)
+rejected(fixture, ["run"], library, "requires src/main.min")
+success(fixture, ["add", "leaf", "--path", leaf], library)
+io.writeTextFile(library + "/src/helper.min", test.sourceModules("public function offset(): Integer { return 1 }\n"))
+io.writeTextFile(library + "/src/geometry.min", test.sourceModules("use \"leaf\" as leaf\nuse \"./helper.min\" as helper\npublic function answer(): Integer { return leaf.answer() + helper.offset() }\n"))
+success(fixture, ["add", "geometry", "--path", library], nested)
+test.check(test.contains(io.readTextFile(application + "/Minyar.toml"), "path = \"../geometry\""), "absolute add arguments also produce relative manifests")
+rejected(fixture, ["build", "--locked"], application, "out of date")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("use \"geometry\" as geometry\nprint(geometry.answer())\n"))
+let dependencyRun = success(fixture, ["run"], application)
+test.check(test.contains(dependencyRun.output, "43"), "transitive dependencies and sibling module imports")
+io.writeTextFile(leaf + "/src/leaf.min", test.sourceModules("public function answer(): Integer { return 50 }\n"))
+let editedDependency = success(fixture, ["run", "--locked"], application)
+test.check(test.contains(editedDependency.output, "51"), "locked local sources remain editable and invalidate cache")
+let metadata = success(fixture, ["metadata", "--locked"], application)
+test.check(test.contains(metadata.output, "\"packages\":[") && test.contains(metadata.output, "\"name\":\"leaf\""), "structured metadata includes transitive graph")
+let tree = success(fixture, ["tree"], application)
+test.check(test.contains(tree.output, "-> geometry") && test.contains(tree.output, "-> leaf"), "dependency edges")
+let originalLeaf = io.readTextFile(leaf + "/Minyar.toml")
+rejected(fixture, ["add", "geometry", "--path", library], leaf, "dependency cycle")
+test.check(io.readTextFile(leaf + "/Minyar.toml") == originalLeaf, "invalid dependency edit preserves the manifest")
+io.writeTextFile(leaf + "/Minyar.toml", originalLeaf + "geometry = { path = \"../geometry\" }\n")
+rejected(fixture, ["tree"], application, "dependency cycle")
+io.writeTextFile(leaf + "/Minyar.toml", originalLeaf)
+let manifest = io.readTextFile(application + "/Minyar.toml")
+io.writeTextFile(application + "/Minyar.toml", manifest + "geometry = { path = \"../geometry\" }\n")
+rejected(fixture, ["metadata"], application, "duplicate key")
+io.writeTextFile(application + "/Minyar.toml", "[package]\nname = \"greeting\"\nversion = \"0.1.0\"\nunknown = \"value\"\n")
+rejected(fixture, ["metadata"], application, "unknown package key")
+io.writeTextFile(application + "/Minyar.toml", manifest)
+rejected(fixture, ["add", "geometry", "--path", leaf], application, "library named geometry")
+success(fixture, ["install", "--release", "--root", prefix], application)
+let installed = external(fixture, [prefix + "/bin/greeting"], application)
+test.require(installed, "installed executable runs")
+test.check(test.contains(installed.output, "51"), "installed executable is the built program")
+rejected(fixture, ["install", "--root", prefix], application, "already exists")
+success(fixture, ["install", "--force", "--root", prefix], application)
+let installedBinary = prefix + "/bin/greeting"
+let installedSymbols = installedBinary + ".dSYM"
+if darwin {
+    test.check(io.fileExists(installedSymbols + "/Contents/Info.plist"), "default debug install carries its dSYM")
+    test.require(external(fixture, ["cmp", application + "/target/debug/greeting.dSYM/Contents/Resources/DWARF/greeting", installedSymbols + "/Contents/Resources/DWARF/greeting"], fixture.work), "installed symbols match the built binary")
+}
+test.require(external(fixture, ["cp", installedBinary, fixture.work + "/installed-before-failure"], fixture.work), "snapshot installed binary")
+if darwin { test.require(external(fixture, ["cp", "-RP", installedSymbols, fixture.work + "/symbols-before-failure"], fixture.work), "snapshot installed symbols") }
+let installedSource = io.readTextFile(application + "/src/main.min")
+io.writeTextFile(application + "/src/main.min", test.sourceModules("let broken =\n"))
+let failedInstall = invoke(fixture, ["install", "--force", "--root", prefix], application)
+test.check(failedInstall.status != 0, "failed build rejects replacement installation")
+test.require(external(fixture, ["cmp", installedBinary, fixture.work + "/installed-before-failure"], fixture.work), "failed install preserves executable")
+if darwin { test.require(external(fixture, ["diff", "-r", installedSymbols, fixture.work + "/symbols-before-failure"], fixture.work), "failed install preserves symbols") }
+io.writeTextFile(application + "/src/main.min", test.sourceModules(installedSource))
+if darwin {
+    test.check(files.rename(installedSymbols, installedSymbols + ".saved") == 0, "retain owned symbol bundle")
+    test.require(external(fixture, ["ln", "-s", installedSymbols + ".saved", installedSymbols], fixture.work), "symlink replacement symbol fixture")
+    rejected(fixture, ["install", "--force", "--release", "--root", prefix], application, "symlinked debug symbols")
+    rejected(fixture, ["uninstall", "greeting", "--root", prefix], fixture.work, "symlinked debug symbols")
+    test.check(io.fileExists(installedSymbols + ".saved/Contents/Info.plist") && io.fileExists(installedBinary), "symlink rejection preserves installation and external bundle")
+    test.check(files.remove(installedSymbols) == 0 && files.rename(installedSymbols + ".saved", installedSymbols) == 0, "restore owned symbols")
+}
+success(fixture, ["install", "--force", "--release", "--root", prefix], application)
+test.check(!io.fileExists(installedSymbols + "/Contents/Info.plist"), "release replacement removes stale installed symbols")
+success(fixture, ["install", "--force", "--root", prefix], application)
+if darwin { test.check(io.fileExists(installedSymbols + "/Contents/Info.plist"), "debug replacement reinstalls matching symbols") }
+success(fixture, ["uninstall", "greeting", "--root", prefix], fixture.work)
+test.check(!io.fileExists(prefix + "/bin/greeting"), "uninstall removes the binary")
+test.check(!io.fileExists(installedSymbols + "/Contents/Info.plist"), "uninstall removes owned debug symbols")
+rejected(fixture, ["uninstall", "greeting", "--root", prefix], fixture.work, "not installed")
+test.check(files.makeDirectory(installedSymbols) == 0, "unowned symbol directory fixture")
+io.writeTextFile(installedSymbols + "/precious", "keep me\n")
+rejected(fixture, ["install", "--root", prefix], application, "unowned debug symbols")
+test.check(io.readTextFile(installedSymbols + "/precious") == "keep me\n", "unowned symbols survive installation rejection")
+test.removeTree(installedSymbols)
+success(fixture, ["remove", "geometry"], application)
+io.writeTextFile(application + "/src/main.min", test.sourceModules("print(\"independent\")\n"))
+success(fixture, ["build", "--manifest-path", application + "/Minyar.toml", "--no-incremental"], fixture.work)
+success(fixture, ["clean"], application)
+test.check(!io.fileExists(application + "/target/debug/greeting") && io.fileExists(application + "/src/main.min"), "clean preserves sources")
+test.check(files.makeDirectory(application + "/target") == 0, "unowned target fixture")
+io.writeTextFile(application + "/target/precious", "keep me\n")
+rejected(fixture, ["clean"], application, "unowned target")
+test.check(io.readTextFile(application + "/target/precious") == "keep me\n", "unowned directory survives")
+rejected(fixture, ["build"], application, "unowned target")
+test.check(files.remove(application + "/target/precious") == 0 && files.removeDirectory(application + "/target") == 0, "remove unowned fixture")
+test.require(external(fixture, ["ln", "-s", library, application + "/target"], application), "symlink target fixture")
+rejected(fixture, ["clean"], application, "real directory")
+rejected(fixture, ["build"], application, "real directory")
+test.check(io.fileExists(library + "/src/geometry.min"), "symlink destination survives")
+test.check(files.remove(application + "/target") == 0, "unlink target fixture")
+let existing = fixture.work + "/existing"
+test.check(files.makeDirectory(existing) == 0 && files.makeDirectory(existing + "/tests") == 0, "init existing directory")
+io.writeTextFile(existing + "/.gitignore", "custom\n")
+io.writeTextFile(existing + "/tests/smoke.min", test.sourceModules("print(\"custom test\")\n"))
+success(fixture, ["init", "--lib", "--name", "existing"], existing)
+test.check(io.readTextFile(existing + "/.gitignore") == "custom\n" && io.readTextFile(existing + "/tests/smoke.min") == "print(\"custom test\")\n", "init preserves user files")
+io.writeTextFile(existing + "/src/main.min", test.sourceModules("print(\"not the library entry\")\n"))
+test.check(test.contains(success(fixture, ["build"], existing).output, "/src/existing.min"), "explicit library kind wins over an unrelated main file")
+io.writeTextFile(existing + "/Minyar.toml", "[package]\nname = \"existing\"\nversion = \"0.1.0\"\nkind = \"plugin\"\n")
+rejected(fixture, ["metadata"], existing, "package.kind must be bin or lib")
+test.removeTree(fixture.work)
+print("project CLI workflows passed")

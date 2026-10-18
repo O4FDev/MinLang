@@ -1,0 +1,61 @@
+use "process" as processInfo
+// Install a self-contained toolchain; the launcher never points at the checkout.
+use "./driver-support.min" as host
+use "files" as files
+use "system" as system
+
+function run(arguments: List<Text>) { host.run(arguments) }
+function copy(source: Text, destination: Text) {
+    host.makeDirectories(host.parentPath(destination))
+    run([host.which("cp"), "-Rp", source, destination])
+}
+let source = ""
+let prefix = ""
+let index = 0
+while index < processInfo.argumentCount() {
+    let option = processInfo.argument(index)
+    if index + 1 >= processInfo.argumentCount() { host.stop(option + " requires a value") }
+    let value = processInfo.argument(index + 1)
+    if option == "--source" && source == "" { source = host.resolveName(value) }
+    else if option == "--prefix" && prefix == "" { prefix = host.resolveName(value) }
+    else { host.stop("usage: install-cli --source TOOLCHAIN --prefix PREFIX") }
+    index += 2
+}
+if source == "" || prefix == "" { host.stop("usage: install-cli --source TOOLCHAIN --prefix PREFIX") }
+let destination = prefix + "/bin/minyar"
+constant MARKER = "# Installed by Minyar; self-contained toolchain\n"
+if host.exists(destination) {
+    if !host.isFile(destination) || !host.hasText(host.readText(destination), MARKER) { host.stop("refusing to replace an unrelated command: " + destination) }
+}
+let required = ["build/minyarc", "build/minyar-module-build", "build/minyar-default-runtime.o", "build/minyar-default-runtime-release.ll", "build/tooling/tools/project-cli", "build/tooling/tools/clang-driver", "build/tooling/tools/install-cli"]
+for path in required { if !host.isFile(source + "/" + path) { host.stop("missing " + path + "; run make install from the checkout") } }
+if !host.isDirectory(source + "/library") { host.stop("missing standard library: " + source) }
+// A distinct directory keeps an upgrade from changing a running compiler.
+let versions = prefix + "/lib/minyar/versions"
+host.makeDirectories(versions)
+let installed = host.temporaryDirectory(versions, "toolchain-")
+for name in ["compiler", "runtime", "library", "tools", "scripts", "bootstrap", "vendor", "build-support"] {
+    copy(source + "/" + name, installed + "/" + name)
+}
+for name in ["Makefile", "minyar", "LICENSE"] { copy(source + "/" + name, installed + "/" + name) }
+for name in [".minyar-distribution", "distribution.arch", "distribution.version", "toolchain"] {
+    if host.exists(source + "/" + name) { copy(source + "/" + name, installed + "/" + name) }
+}
+// Preserve timestamps so first use can reuse the compiled toolchain. Sources
+// remain available for runtime configuration, native packages and later rebuilds.
+for name in [".toolchain.json", "compiler.min", "stage0", "compiler-stage1.ll", "compiler-stage1", "compiler-stage2.ll", "minyar-compiler-runtime.ll", "minyarc", "minyarc-modules", "minyar-module-build", "minyar-runtime.o", "minyar-default-runtime.o", "minyar-default-runtime-release.ll", "minyar-runtime-eager.o", "minyar-runtime-eager-release.ll", "tooling/scripts/macos-app", "tooling/tools/project-cli.ll", "tooling/tools/project-cli", "tooling/tools/clang-driver.ll", "tooling/tools/clang-driver", "tooling/tools/install-cli.ll", "tooling/tools/install-cli"] {
+    let path = source + "/build/" + name
+    if host.isFile(path) { copy(path, installed + "/build/" + name) }
+}
+host.makeDirectories(prefix + "/bin")
+let wrapper = "#!/bin/sh\n" + MARKER + "exec " + host.shellQuote(installed + "/minyar") + " \"$@\"\n"
+let staged = destination + ".tmp-" + Text(system.processId())
+host.writeBytes(staged, Bytes(wrapper))
+run([host.which("chmod"), "755", staged])
+let status = files.rename(staged, destination)
+if status != 0 { files.remove(staged); host.stop(host.osError(status, destination)) }
+// This is now a permanent installation, not a temporary directory.
+// Do not release it: release() removes its directory.
+print("Installed " + destination + "\nToolchain: " + installed)
+let found = host.which("minyar")
+if found == "" || host.resolveName(found) != host.resolveName(destination) { print("Add " + prefix + "/bin to PATH to use minyar.") }

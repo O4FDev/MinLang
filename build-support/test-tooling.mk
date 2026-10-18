@@ -36,6 +36,17 @@ build/tooling/tools/build-test-runtime: TOOL_LIBS =
 build/tooling/tools/clang-driver: build/tooling/tools/clang-driver.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c runtime/minyar_native.h
 	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c -pthread -lm -o $@
 
+build/tooling/tools/project-cli: build/tooling/tools/project-cli.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c runtime/minyar_native.h
+	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c -pthread -lm -o $@
+
+# install.mk is included before these shared objects are defined.
+build/tooling/tools/install-cli: $(MINYAR_TOOL_NATIVE_OBJECTS)
+
+.PHONY: check-project-cli
+check-project-cli: build/tooling/tools/project-cli build/tooling/tests/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	./build/tooling/tests/project-cli "$(CURDIR)/minyar"
+
+check check-portable: check-project-cli
 
 build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/build-test-runtime
 	mkdir -p $(@D)

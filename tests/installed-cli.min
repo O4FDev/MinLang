@@ -1,0 +1,45 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+record Fixture { work: Text; serial: Integer }
+function run(fixture: Fixture, arguments: List<Text>, environment: List<Text>, cwd: Text): test.Result {
+    fixture.serial += 1
+    let result = test.run(arguments, environment, cwd, fixture.work + "/command-" + Text(fixture.serial), 600)
+    test.require(result, "installed CLI workflow")
+    return result
+}
+let source = processInfo.argument(0)
+let fixture = Fixture { work: test.scratch(); serial: 0 }
+let original = fixture.work + "/original installation"
+let prefix = fixture.work + "/standalone installation"
+run(fixture, [source + "/build/tooling/tools/install-cli", "--source", source, "--prefix", original], system.environment(), source)
+let versions = original + "/lib/minyar/versions"
+let names = files.list(versions)
+test.check(names.length == 1, "one self-contained distribution")
+let distribution = versions + "/" + names[0]
+run(fixture, [distribution + "/build/tooling/tools/install-cli", "--source", distribution, "--prefix", prefix], system.environment(), fixture.work)
+// Remove the entire installation used as the source. The second installation
+// must compile and run programs with only its own compiler/library/runtime.
+test.removeTree(original)
+let environment: List<Text> = []
+for entry in system.environment() { if !entry.startsWith("PATH=") { environment.add(entry) } }
+environment.add("PATH=" + prefix + "/bin:" + system.getenv("PATH"))
+run(fixture, ["minyar", "--version"], environment, fixture.work)
+run(fixture, ["minyar", "--doctor"], environment, fixture.work)
+let app = fixture.work + "/hello"
+test.check(files.makeDirectory(app) == 0, "create external project directory")
+run(fixture, ["minyar", "init"], environment, app)
+test.check(io.fileExists(app + "/Minyar.toml") && io.fileExists(app + "/src/main.min"), "bare init scaffolds current directory")
+let result = run(fixture, ["minyar", "run"], environment, app)
+test.check(test.contains(result.output, "Hello, world!"), "bare run builds a native program")
+run(fixture, ["minyar", "test"], environment, app)
+io.writeTextFile(app + "/src/main.min", test.sourceModules("use \"system\" as system\nprint(system.processId() > 0)\n"))
+let native = run(fixture, ["minyar", "run", "--release"], environment, app)
+test.check(test.contains(native.output, "true"), "installed runtime and native provider sources work")
+let wrapper = io.readTextFile(prefix + "/bin/minyar")
+test.check(!test.contains(wrapper, source) && !test.contains(wrapper, original), "installed command has no checkout/source dependency")
+test.removeTree(fixture.work)
+print("Installed CLI: init, run, test and native release builds passed")
