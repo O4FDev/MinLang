@@ -9,12 +9,17 @@ bundles LLVM and the prebuilt Minyar tools. Its installer checks the Apple SDK
 and sets up the command. Release candidates can be built locally or with the
 manual macOS distribution workflow; they are not yet signed public releases.
 
+The [signed installer and toolchain manager](docs/install.md) keep versions
+side by side in `~/.minyar`, with per-project pins and verified updates. The
+release directory can be tested locally; a public release host is not live yet.
+
 Building from source requires LLVM 23.1.2, a C compiler, Make, zsh, and system
 C development headers. Follow the [toolchain setup](docs/toolchain.md).
 The source checkout builds the compiler, runtime and link driver on first use.
 
-The [project CLI](docs/cli.md), written in Minyar, manages packages, local
-dependencies, builds, tests, and installed executables:
+The [project CLI](docs/cli.md), written in Minyar, manages packages,
+[verified Git and local dependencies](docs/packages.md), builds, tests, and
+installed executables:
 
 ```sh
 make install                  # installs to ~/.local/bin
@@ -163,6 +168,8 @@ remain unfinished.
 ## Documentation
 
 - [Language guide](docs/language.md)
+- [Installation and toolchain versions](docs/install.md)
+- [Project CLI](docs/cli.md), [packages](docs/packages.md) and [hosting an index](docs/registry.md)
 - [Modules](docs/modules.md) and [incremental builds](docs/incremental-builds.md)
 - [Minyar OS](os/README.md)
 - [Examples](examples/)
