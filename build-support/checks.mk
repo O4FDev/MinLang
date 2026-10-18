@@ -587,6 +587,8 @@ check-measurement-stats: build/tooling/tests/measurement-stats
 
 check-portable check: check-measurement-stats
 
+build/tooling/tests/self-compile-budget.ll build/tooling/tests/self-compile-budget-harness.ll: tests/performance-support.min
+
 .PHONY: check-budget-harness
 build/tooling/tests/self-compile-budget-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/self-compile-budget-harness: TOOL_NATIVE = tests/performance-resources.c

@@ -394,6 +394,12 @@ and checks that share a fixed port or path never overlap; both lists live in
 `tools/check-runner.min`. Every result row records wall time and CPU seconds,
 and the summary prints a per-group table.
 
+Test tools reuse compiled native support objects, with compiler-generated header
+dependencies and the toolchain stamp invalidating them when inputs change.
+`check-minyar-runner` shares the `check-clang-cache` prerequisite with the full
+gate, so those controls run once. POSIX process controls use release handshakes
+to keep children alive for pending-state and session checks without fixed sleeps.
+
 ## Per-commit platform gates
 
 `.github/workflows/ci.yml` runs on every push and pull request. Linux runs the
