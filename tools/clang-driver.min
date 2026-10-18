@@ -1,6 +1,7 @@
 use "process" as processInfo
 use "./driver-support.min" as host
 use "./llvm-sanitizer.min" as sanitizer
+use "./llvm-debug.min" as debugInfo
 use "./driver-providers.min" as providers
 use "system" as system
 use "files" as files
@@ -626,8 +627,32 @@ function publish(link: Link, command: List<Text>, output: Text, source: Text): B
         host.guard(false)
         return failed(link, "refusing to replace the source file; choose a different -o path: " + destination)
     }
+    let symbols = staged + ".dSYM"
+    let publishedSymbols = destination + ".dSYM"
+    let previousSymbols = staging + "/previous.dSYM"
+    let hasSymbols = host.isDirectory(symbols)
+    let hadSymbols = hasSymbols && host.exists(publishedSymbols)
+    if hasSymbols {
+        if source != "" && host.exists(publishedSymbols) && host.sameFile(publishedSymbols, source) {
+            host.release(staging); host.guard(false)
+            return failed(link, "refusing to replace the source file with debug symbols")
+        }
+        if hadSymbols && files.rename(publishedSymbols, previousSymbols) != 0 {
+            host.release(staging); host.guard(false)
+            return failed(link, "cannot replace debug symbols: " + publishedSymbols)
+        }
+        if files.rename(symbols, publishedSymbols) != 0 {
+            if hadSymbols { files.rename(previousSymbols, publishedSymbols) }
+            host.release(staging); host.guard(false)
+            return failed(link, "cannot publish debug symbols: " + publishedSymbols)
+        }
+    }
     if files.rename(staged, destination) != 0 {
         let message = host.osError(files.lastError(), staged)
+        if hasSymbols {
+            files.rename(publishedSymbols, symbols)
+            if hadSymbols { files.rename(previousSymbols, publishedSymbols) }
+        }
         host.release(staging)
         host.guard(false)
         return failedWith(link, "OSError(" + host.pythonText(message) + ")", message)
@@ -1016,7 +1041,17 @@ function linkCommand(arguments: List<Text>) {
             }
         }
     }
-    linkProgram(clang, linkFlags, lto, llvm, runtime, native, math, output, source)
+    let program = llvm
+    if debug && debugInfo.enabled(linkFlags) {
+        // Add sanitizer attributes before function metadata; the subsequent
+        // sanitizer pass recognizes them and leaves the header ordering intact.
+        let annotated = sanitizer.program(host.readText(llvm), linkFlags)
+        if annotated.error != "" { host.stop(annotated.error) }
+        let directory = host.temporaryDirectory("", "minyar-debug-")
+        program = directory + "/program.ll"
+        host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source)))
+    }
+    linkProgram(clang, linkFlags, lto, program, runtime, native, math, output, source)
 }
 
 function compile(arguments: List<Text>) {

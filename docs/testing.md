@@ -27,6 +27,11 @@ Cases include truncated and malformed responses, split headers, bodyless and
 informational responses, bounded downloads and read deadlines. macOS also runs
 the same bounded API through NSURLSession. The socket fixture requires POSIX.
 
+`make check-debug-info` verifies Minyar DWARF line tables with `llvm-dwarfdump`,
+checks direct and cached builds, sanitizer compatibility and release exclusion,
+and uses LLDB on macOS to resolve imported `.min` source lines after temporary
+link inputs are removed. It also checks dSYM retention and failed-link preservation.
+
 `make check-thread-native-regions` runs Linux mapping, sharing, atomic access,
 ownership and rejection controls. Its real x86 guest test runs when `/dev/kvm`
 is accessible on x86-64; otherwise it reports the missing KVM coverage explicitly.

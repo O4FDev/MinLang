@@ -1,0 +1,74 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+record Fixture { root: Text; work: Text; serial: Integer }
+function run(fixture: Fixture, command: List<Text>, environment: List<Text>): test.Result {
+    fixture.serial += 1
+    return test.run(command, environment, fixture.root, fixture.work + "/command-" + Text(fixture.serial), 120)
+}
+function require(fixture: Fixture, command: List<Text>, environment: List<Text>): test.Result {
+    let result = run(fixture, command, environment)
+    test.require(result, "debug info command")
+    return result
+}
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "toolchain root")
+let root = test.lines(rootResult.output)[0]
+let fixture = Fixture { root: root; work: work; serial: 0 }
+let compiler = test.compiler()
+let clang = support.which(compiler.clang, work + "/clang")
+let toolDirectory = test.lines(require(fixture, ["dirname", clang], system.environment()).output)[0]
+let dwarf = toolDirectory + "/llvm-dwarfdump"
+test.check(io.fileExists(dwarf), "llvm-dwarfdump beside the pinned compiler is required")
+let sources = work + "/debug sources"
+test.check(files.makeDirectory(sources) == 0, "debug source directory")
+let entry = sources + "/entry é.min"
+let library = sources + "/math module.min"
+let binary = work + "/program with spaces"
+io.writeTextFile(library, test.sourceModules("public function answer(value: Integer): Integer {\n    let twice = value * 2\n    return twice + 1\n}\n"))
+io.writeTextFile(entry, test.sourceModules("use \"./math module.min\" as math\nlet value = math.answer(20)\nprint(value)\n"))
+let platform = require(fixture, ["uname", "-s"], system.environment()).output
+let darwin = test.contains(platform, "Darwin")
+let symbols = binary
+if darwin { symbols += ".dSYM" }
+for mode in ["direct", "incremental-cold", "incremental-warm"] {
+    let command = [root + "/minyar", "--debug"]
+    if mode != "direct" { command.add("--incremental") }
+    for item in [entry, "-o", binary] { command.add(item) }
+    let built = require(fixture, command, system.environment())
+    test.check(!test.contains(built.errorOutput, "warning:") && !test.contains(built.errorOutput, "invalid debug"), "debug build must produce valid symbols without warnings\n" + built.errorOutput)
+    let executed = require(fixture, [binary], system.environment())
+    test.check(executed.output == "41\n", "debug compilation preserves behavior")
+    require(fixture, [dwarf, "--verify", symbols], system.environment())
+    let info = require(fixture, [dwarf, "--debug-info", "--debug-line", symbols], system.environment())
+    test.check(test.contains(info.output, "Minyar") && test.contains(info.output, "math module.min") && test.contains(info.output, "entry"), "debug info references original entry and imported Minyar files")
+}
+if darwin {
+    test.check(io.fileExists(symbols + "/Contents/Resources/DWARF/program with spaces"), "dSYM survives atomic binary publication")
+    let lldb = support.which("lldb", work + "/lldb")
+    test.check(lldb != "", "LLDB is required for the macOS debug regression")
+    let lookup = require(fixture, [lldb, "--batch", binary, "-o", "image lookup -v -f 'math module.min' -l 3"], system.environment())
+    test.check(test.contains(lookup.output, "LineEntry:") && test.contains(lookup.output, "math module.min:3"), "LLDB resolves imported source line breakpoints after temporary build files are removed")
+    let uuid = require(fixture, [dwarf, "--uuid", symbols], system.environment()).output
+    let invalid = support.merge(system.environment(), ["MINYAR_CLANG_FLAGS=-O0 -g -Wl,--minyar-invalid-link-option"])
+    let failed = run(fixture, [root + "/minyar", "--debug", entry, "-o", binary], invalid)
+    test.check(failed.status != 0, "failed link control")
+    test.check(require(fixture, [dwarf, "--uuid", symbols], system.environment()).output == uuid, "failed link preserves existing symbols")
+    test.check(require(fixture, [binary], system.environment()).output == "41\n", "failed debug link preserves existing binary")
+}
+let sanitized = work + "/sanitized"
+let sanitizerFlags = support.merge(system.environment(), ["MINYAR_CLANG_FLAGS=-O0 -g -fsanitize=address"])
+let sanitizedBuild = require(fixture, [root + "/minyar", "--debug", entry, "-o", sanitized], sanitizerFlags)
+test.check(!test.contains(sanitizedBuild.errorOutput, "invalid debug"), "debug metadata composes with sanitizer attributes")
+require(fixture, [sanitized], system.environment())
+let release = work + "/release"
+require(fixture, [root + "/minyar", "--release", entry, "-o", release], system.environment())
+let releaseInfo = require(fixture, [dwarf, "--debug-info", release], system.environment())
+test.check(!test.contains(releaseInfo.output, "Minyar"), "release builds do not acquire Minyar debug info")
+test.removeTree(work)
+test.removeTree(compiler.directory)
+print("Minyar debug line tables, symbols, incremental builds and sanitizers: passed")

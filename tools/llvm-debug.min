@@ -1,0 +1,106 @@
+// Source line tables for generated Minyar IR. No temporary LLVM filenames are
+// presented as source files, and this pass never changes release-mode IR.
+use "./driver-support.min" as host
+
+record Origin { line: Integer; column: Integer; file: Text }
+record Metadata { nodes: List<Text>; files: List<Text>; ids: List<Integer> }
+function node(metadata: Metadata, value: Text): Integer {
+    let id = metadata.nodes.length
+    metadata.nodes.add("!" + Text(id) + " = " + value + "\n")
+    return id
+}
+function escaped(value: Text): Text {
+    let result = Bytes()
+    let hex = "0123456789ABCDEF"
+    for byte in Bytes(value) {
+        if byte >= 32 && byte <= 126 && byte != 34 && byte != 92 { result.add(byte) }
+        else { result.addBytes(Bytes("\\" + Text(hex[byte / 16]) + Text(hex[byte % 16]))) }
+    }
+    return Text(result)
+}
+function file(metadata: Metadata, path: Text): Integer {
+    for index in 0..metadata.files.length { if metadata.files[index] == path { return metadata.ids[index] } }
+    let id = node(metadata, "!DIFile(filename: \"" + path + "\", directory: \"" + escaped(host.resolveName(".")) + "\")")
+    metadata.files.add(path)
+    metadata.ids.add(id)
+    return id
+}
+function origin(value: Text, fallback: Text): Origin {
+    let first = host.findText(value, "|", 0)
+    let second = host.findText(value, "|", first + 1)
+    if first < 0 || second < 0 { host.stop("invalid compiler debug origin") }
+    let path = host.textSlice(value, second + 1, value.byteLength)
+    if path == "" { path = fallback }
+    return Origin { line: Integer(host.textSlice(value, 0, first)); column: Integer(host.textSlice(value, first + 1, second)); file: path }
+}
+public function enabled(flags: List<Text>): Boolean {
+    let result = false
+    for flag in flags {
+        if flag == "-g0" { result = false }
+        else if flag == "-g" || flag == "-g1" || flag == "-g2" || flag == "-g3" || flag.startsWith("-gdwarf") || flag == "-gline-tables-only" { result = true }
+    }
+    return result
+}
+public function program(source: Text, path: Text): Text {
+    if host.hasText(source, "!llvm.dbg.cu") { return source }
+    let metadata = Metadata { nodes: []; files: []; ids: [] }
+    let fallback = escaped(host.resolveName(path))
+    let root = file(metadata, fallback)
+    let unit = node(metadata, "distinct !DICompileUnit(language: DW_LANG_C, file: !" + Text(root) + ", producer: \"Minyar\", isOptimized: false, runtimeVersion: 0, emissionKind: LineTablesOnly)")
+    let empty = node(metadata, "!{}")
+    let type = node(metadata, "!DISubroutineType(types: !" + Text(empty) + ")")
+    let dwarf = node(metadata, "!{i32 7, !\"Dwarf Version\", i32 4}")
+    let version = node(metadata, "!{i32 2, !\"Debug Info Version\", i32 3}")
+    let output: List<Text> = []
+    let current = Origin { line: 1; column: 1; file: fallback }
+    let pending = false
+    let scope = -1
+    let subprogram = -1
+    let scopeFile = -1
+    let lastKey = ""
+    let location = -1
+    for original in host.lines(source) {
+        let line = original
+        if line.startsWith("; minyar-debug-function: ") {
+            current = origin(host.textAfter(line, "; minyar-debug-function: "), fallback)
+            pending = true
+        } else if line.startsWith("; minyar-debug-line: ") {
+            current = origin(host.textAfter(line, "; minyar-debug-line: "), fallback)
+        } else if line.startsWith("define ") {
+            scope = -1
+            subprogram = -1
+            if pending {
+                let begin = host.findText(line, "@", 0)
+                let end = host.findText(line, "(", begin)
+                let name = host.textSlice(line, begin + 1, end)
+                if name.startsWith("\"") && name.endsWith("\"") { name = host.textSlice(name, 1, name.byteLength - 1) }
+                scopeFile = file(metadata, current.file)
+                subprogram = node(metadata, "distinct !DISubprogram(name: \"" + name + "\", linkageName: \"" + name + "\", scope: !" + Text(scopeFile) + ", file: !" + Text(scopeFile) + ", line: " + Text(current.line) + ", type: !" + Text(type) + ", scopeLine: " + Text(current.line) + ", spFlags: DISPFlagDefinition, unit: !" + Text(unit) + ")")
+                scope = subprogram
+                let brace = host.findText(line, "{", 0)
+                line = host.textSlice(line, 0, brace) + "!dbg !" + Text(scope) + " " + host.textSlice(line, brace, line.byteLength)
+                lastKey = ""
+            }
+            pending = false
+        } else if line == "}" { scope = -1; subprogram = -1 }
+        else if scope >= 0 && line.startsWith("  ") {
+            let instruction = host.strip(line)
+            let attach = instruction.startsWith("%") || instruction.startsWith("call ") || instruction.startsWith("tail call ") || instruction.startsWith("musttail call ") || instruction.startsWith("ret ") || instruction.startsWith("br ") || instruction.startsWith("store ") || instruction == "unreachable" || instruction == "]"
+            if attach && !host.hasText(line, "!dbg") {
+                let fileId = file(metadata, current.file)
+                let key = Text(current.line) + ":" + Text(current.column) + ":" + Text(fileId)
+                if key != lastKey {
+                    scope = subprogram
+                    if fileId != scopeFile { scope = node(metadata, "!DILexicalBlockFile(scope: !" + Text(subprogram) + ", file: !" + Text(fileId) + ", discriminator: 0)") }
+                    location = node(metadata, "!DILocation(line: " + Text(current.line) + ", column: " + Text(current.column) + ", scope: !" + Text(scope) + ")")
+                    lastKey = key
+                }
+                line += ", !dbg !" + Text(location)
+            }
+        }
+        output.add(line + "\n")
+    }
+    output.add("!llvm.dbg.cu = !{!" + Text(unit) + "}\n!llvm.module.flags = !{!" + Text(dwarf) + ", !" + Text(version) + "}\n")
+    for item in metadata.nodes { output.add(item) }
+    return joinText(output)
+}
