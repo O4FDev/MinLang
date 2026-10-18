@@ -60,6 +60,14 @@ an interactive cold build from starving behind unrelated background indexing
 or backups. Bulk development checks and fuzz campaigns retain their background
 policy; bootstrap invoked by an already throttled parent inherits that context.
 
+The previous-v2 comparison retains the original and measured sources with their
+hashes. When the previous source uses the removed file and argument builtins,
+`prepare-compiler-budget.py` renames those calls and supplies native shims, keeping
+streamed output. It leaves literals and the previous frontend rules intact. Both
+compiler roles receive the identical adapted source, library arguments, runtime,
+and optimization flags. The compatibility report records every renamed API;
+the measured result therefore compares the previous frontend after API adaptation.
+
 ## Known release-build cost
 
 In the September 2026 release-build fixture, the larger incremental runtime IR
