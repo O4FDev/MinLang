@@ -131,3 +131,11 @@ Only the fetch location changes. No global Git configuration is modified.
 `make check-package-git` uses private mirrors and caches to test release ordering,
 tag/commit/branch pins, transitive minimal version selection, real O0/O2 builds,
 offline use, relocation, source tampering and unsafe package rejection.
+
+The [first light gallery project](../examples/gallery/paint/README.md) installs
+the real external `paint` library through this route and renders PNG and SVG.
+Its separate repository includes paths, antialiasing, gradients, TrueType text,
+three reproducible artworks and a local `v0.1.0` tag. Before publication, use the
+documented private mirror. `make check-paint-package MINYAR_PAINT_SOURCE=/path/to/minyar-paint`
+tests the complete offline debug/release workflow without adding the external
+library to Minyar's core or relying on GitHub.
