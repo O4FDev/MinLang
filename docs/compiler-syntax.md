@@ -13,6 +13,13 @@ ordinary and cached-interface compilation; the duplicate discovery scanners
 have been removed. Header type checking and body emission still consume
 tokens, as do some ownership lookahead helpers.
 
+Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
+column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant
+time, including for nested brackets; the old `indexWithoutCalls` scanner has
+been removed. These are lexical facts needed before an index expression is
+checked, rather than semantic call-effect analysis. A closing bracket followed
+by a callback call counts as a call, preserving the existing ownership rule.
+
 ## Representation
 
 `compiler/stages/syntax.min` defines the tree, its builder and source spans.

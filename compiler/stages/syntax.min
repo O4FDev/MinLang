@@ -19,6 +19,7 @@ record SyntaxTree {
     nodes: List<SyntaxNode>
     declarations: List<Integer>
     symbolNodes: List<Integer>
+    callFreeIndexes: List<Boolean>
     sources: SourceMap
     file: Text
     active: Integer
@@ -97,7 +98,8 @@ function newSyntaxTree(sources: SourceMap, file: Text, tokenCount: Integer): Syn
     let nodes: List<SyntaxNode> = []
     let declarations: List<Integer> = []
     let symbolNodes: List<Integer> = []
-    let tree = SyntaxTree { nodes: nodes, declarations: declarations, symbolNodes: symbolNodes, sources: sources, file: file, active: 0, lastValue: -1, topLevel: false }
+    let callFreeIndexes: List<Boolean> = []
+    let tree = SyntaxTree { nodes: nodes, declarations: declarations, symbolNodes: symbolNodes, callFreeIndexes: callFreeIndexes, sources: sources, file: file, active: 0, lastValue: -1, topLevel: false }
     appendSyntaxNode(tree, 0, 0, tokenCount, -1, 5, -1)
     return tree
 }
@@ -211,8 +213,39 @@ function bindSyntaxDeclarations(tree: SyntaxTree, tokens: List<Integer>, texts: 
     }
 }
 
+// Record lexical ownership lookahead once, before the emitting parser needs it.
+// A closing ']' followed by '(' counts as a call, matching callAt's contract.
+function prepareSyntaxIndexes(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>) {
+    let openings: List<Integer> = []
+    let callStarts: List<Integer> = []
+    let depth = 0
+    let calls = 0
+    let position = 0
+    while position < kinds.length {
+        tree.callFreeIndexes.add(false)
+        if position + 1 < kinds.length && callAt(kinds, texts, position) { calls = calls + 1 }
+        if kinds[position] == 4 {
+            if texts[position] == "[" {
+                if depth == openings.length { openings.add(position); callStarts.add(calls) }
+                else { openings[depth] = position; callStarts[depth] = calls }
+                depth = depth + 1
+            }
+            if texts[position] == "]" && depth > 0 {
+                depth = depth - 1
+                tree.callFreeIndexes[openings[depth]] = calls == callStarts[depth]
+            }
+        }
+        position = position + 1
+    }
+}
+
+function syntaxIndexHasNoCalls(tree: SyntaxTree, position: Integer): Boolean {
+    return position >= 0 && position < tree.callFreeIndexes.length && tree.callFreeIndexes[position]
+}
+
 function parseSyntaxDeclarations(kinds: List<Integer>, texts: List<Text>, sources: SourceMap, file: Text, starts: List<Integer>, ends: List<Integer>): SyntaxTree {
     let tree = newSyntaxTree(sources, file, kinds.length - 1)
+    prepareSyntaxIndexes(tree, kinds, texts)
     if starts.length > 0 {
         let scanned = 0
         let declaration = 0
