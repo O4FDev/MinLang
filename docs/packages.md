@@ -114,6 +114,12 @@ Packages never run install/build scripts. Remote dependencies cannot contain
 native C, Objective-C, Swift, assembly or binary implementations, or declare a
 Minyar `native` function. They may import the toolchain's standard modules.
 Remote manifests cannot escape the pinned graph with local path dependencies.
+Relative source imports must stay inside their own content-hashed tree; shared
+files beside `src` are allowed. Module paths use single-line ordinary or raw
+Text literals. Ordinary escapes are decoded before checking the path; absolute
+paths, backslash separators and traversal outside the tree are rejected.
+Multiline Text remains available for data, while package import paths stay on
+one line. These checks also run when verifying an existing cached tree.
 Native integrations remain an explicit application/toolchain responsibility.
 This policy concerns installation and compilation; running an imported Minyar
 program can still perform I/O, including from global initializers.
