@@ -64,7 +64,94 @@ function lineCanEndStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>):
     return result
 }
 
+// Interpolation is ordinary expression syntax after lexing. The synthetic name
+// cannot be written as a source identifier and receives a printable-type check.
+function isInterpolationConversion(name: Text): Boolean {
+    return name == "text interpolation"
+}
+
+function isInterpolationJoin(name: Text): Boolean {
+    return name == "text interpolation join"
+}
+
+function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>) {
+    let position = cursor[0]
+    let line = cursor[1]
+    let lineStart = cursor[2]
+    let tokenLine = line
+    let tokenColumn = position - lineStart + 1
+    let coordinates = tokenLines.coordinates
+    let pieces: List<Text> = []
+    let interpolated = false
+    position = position + 1
+    let chunkStart = position
+    while position < source.length && source[position] != '"' {
+        if source[position] == '\\' && position + 1 < source.length {
+            if chunkStart < position { pieces.add(source.slice(chunkStart, position)) }
+            let escape = source[position + 1]
+            if escape == '(' {
+                if !interpolated {
+                    addToken(tokenKinds, tokenTexts, coordinates, 1, "text interpolation join", tokenLine, tokenColumn)
+                    addToken(tokenKinds, tokenTexts, coordinates, 4, "(", tokenLine, tokenColumn)
+                    addToken(tokenKinds, tokenTexts, coordinates, 4, "[", tokenLine, tokenColumn)
+                    interpolated = true
+                }
+                addToken(tokenKinds, tokenTexts, coordinates, 3, joinText(pieces), tokenLine, tokenColumn)
+                addToken(tokenKinds, tokenTexts, coordinates, 4, ",", line, position - lineStart + 1)
+                addToken(tokenKinds, tokenTexts, coordinates, 1, "text interpolation", line, position - lineStart + 1)
+                addToken(tokenKinds, tokenTexts, coordinates, 4, "(", line, position - lineStart + 2)
+                pieces.clear()
+                cursor[0] = position + 2
+                cursor[1] = line
+                cursor[2] = lineStart
+                tokenizePart(source, tokenKinds, tokenTexts, tokenLines, cursor, true)
+                position = cursor[0]
+                line = cursor[1]
+                lineStart = cursor[2]
+                addToken(tokenKinds, tokenTexts, coordinates, 4, ")", line, position - lineStart)
+                addToken(tokenKinds, tokenTexts, coordinates, 4, ",", line, position - lineStart)
+            } else {
+                if escape == 'n' { pieces.add(Text('\n')) } else {
+                    if escape == 'r' { pieces.add(Text('\r')) } else {
+                        if escape == 't' { pieces.add(Text('\t')) } else { pieces.add(Text(escape)) }
+                    }
+                }
+                if escape == '\n' { line = line + 1; lineStart = position + 2 }
+                position = position + 2
+            }
+            chunkStart = position
+        } else {
+            if source[position] == '\n' { line = line + 1; lineStart = position + 1 }
+            position = position + 1
+        }
+    }
+    if position >= source.length {
+        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
+    }
+    let text = source.slice(chunkStart, position)
+    if pieces.length > 0 { pieces.add(text); text = joinText(pieces) }
+    let features = tokenLines.features
+    if !interpolated {
+        if features / 8 % 2 == 0 && text == "calldepth" && tokenKinds.length > 0 && tokenKinds[tokenKinds.length - 1] == 1 && tokenTexts[tokenTexts.length - 1] == "native" { features = features + 8 }
+        if features / 32 % 2 == 0 && (text == "c" || text == "c_packed") && tokenKinds.length > 2 && tokenTexts[tokenTexts.length - 1] == "native" && tokenTexts[tokenTexts.length - 3] == "record" { features = features + 32 }
+    }
+    addToken(tokenKinds, tokenTexts, coordinates, 3, text, tokenLine, tokenColumn)
+    if interpolated {
+        addToken(tokenKinds, tokenTexts, coordinates, 4, "]", line, position - lineStart + 1)
+        addToken(tokenKinds, tokenTexts, coordinates, 4, ")", line, position - lineStart + 1)
+    }
+    cursor[0] = position + 1
+    cursor[1] = line
+    cursor[2] = lineStart
+    tokenLines.features = features
+}
+
 function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap) {
+    let cursor: List<Integer> = [0, 1, 0]
+    tokenizePart(source, tokenKinds, tokenTexts, tokenLines, cursor, false)
+}
+
+function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, interpolation: Boolean) {
     let firstToken = tokenKinds.length
     let modifiers = false
     let delimiterFrames = Bytes(0)
@@ -72,18 +159,26 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     let features = tokenLines.features
     let callbacks = features % 2 != 0
     let coordinates = tokenLines.coordinates
-    let position = 0
-    let line = 1
-    let lineStart = 0
+    let position = cursor[0]
+    let line = cursor[1]
+    let lineStart = cursor[2]
     let length = source.length
     let roundDepth = 0
+    if interpolation { roundDepth = 1 }
     let squareDepth = 0
-    if length > 0 && source[0] == Character(65279) {
+    if position == 0 && length > 0 && source[0] == Character(65279) {
         position = 1
     }
 
     while position < length {
         let character = source[position]
+        if interpolation && character == ')' && roundDepth == 1 && delimiterDepth == 0 {
+            cursor[0] = position + 1
+            cursor[1] = line
+            cursor[2] = lineStart
+            tokenLines.features = features
+            return
+        }
 
         if character == ' ' || character == '\n' || character == '\r' || character == '\t' {
             if character == '\n' {
@@ -224,70 +319,16 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                             addToken(tokenKinds, tokenTexts, coordinates, numberKind, digits, tokenLine, tokenColumn)
                         } else {
                             if character == '"' {
-                                let tokenLine = line
-                                let tokenColumn = position - lineStart + 1
-                                position = position + 1
-                                let chunkStart = position
-                                while position < length && source[position] != '"' && source[position] != '\\' {
-                                    if source[position] == '\n' {
-                                        line = line + 1
-                                        lineStart = position + 1
-                                    }
-                                    position = position + 1
-                                }
-                                if position >= length {
-                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
-                                }
-                                let text = ""
-                                if position < length && source[position] == '\\' {
-                                    let pieces: List<Text> = []
-                                    while position < length && source[position] != '"' {
-                                        if source[position] == '\\' && position + 1 < length {
-                                            if chunkStart < position {
-                                                pieces.add(source.slice(chunkStart, position))
-                                            }
-                                            let escape = source[position + 1]
-                                            if escape == '\n' {
-                                                line = line + 1
-                                                lineStart = position + 2
-                                            }
-                                            if escape == 'n' {
-                                                pieces.add(Text('\n'))
-                                            } else {
-                                                if escape == 'r' {
-                                                    pieces.add(Text('\r'))
-                                                } else {
-                                                    if escape == 't' {
-                                                        pieces.add(Text('\t'))
-                                                    } else {
-                                                        pieces.add(Text(escape))
-                                                    }
-                                                }
-                                            }
-                                            position = position + 2
-                                            chunkStart = position
-                                        } else {
-                                            if source[position] == '\n' {
-                                                line = line + 1
-                                                lineStart = position + 1
-                                            }
-                                            position = position + 1
-                                        }
-                                    }
-                                    if position >= length {
-                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
-                                    }
-                                    if chunkStart < position {
-                                        pieces.add(source.slice(chunkStart, position))
-                                    }
-                                    text = joinText(pieces)
-                                } else {
-                                    text = source.slice(chunkStart, position)
-                                }
-                                position = position + 1
-                                if features / 8 % 2 == 0 && text == "calldepth" && tokenKinds.length > 0 && tokenKinds[tokenKinds.length - 1] == 1 && tokenTexts[tokenTexts.length - 1] == "native" { features = features + 8 }
-                                if features / 32 % 2 == 0 && (text == "c" || text == "c_packed") && tokenKinds.length > 2 && tokenTexts[tokenTexts.length - 1] == "native" && tokenTexts[tokenTexts.length - 3] == "record" { features = features + 32 }
-                                addToken(tokenKinds, tokenTexts, coordinates, 3, text, tokenLine, tokenColumn)
+                                cursor[0] = position
+                                cursor[1] = line
+                                cursor[2] = lineStart
+                                tokenLines.features = features
+                                tokenizeText(source, tokenKinds, tokenTexts, tokenLines, cursor)
+                                features = tokenLines.features
+                                callbacks = features % 2 != 0
+                                position = cursor[0]
+                                line = cursor[1]
+                                lineStart = cursor[2]
                             } else {
                                 if character > '~' {
                                     fail("line " + Text(line) + ", column " + Text(position - lineStart + 1) + ": names must use ASCII letters, digits, and '_'; found non-ASCII character '" + Text(character) + "'")
@@ -390,6 +431,9 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
         }
     }
 
+    if interpolation {
+        fail("line " + sourceLocation(cursor[1], cursor[0] - cursor[2]) + ": text interpolation is missing its closing ')'")
+    }
     addToken(tokenKinds, tokenTexts, coordinates, 0, "", line, position - lineStart + 1)
     let scan = firstToken
     while modifiers && scan + 1 < tokenKinds.length {

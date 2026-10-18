@@ -1,0 +1,57 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+
+function measureJoin(frontend: fixtures.Frontend, llvm: Text) {
+    let compiler = frontend.compiler
+    let path = compiler.directory + "/join-probe"
+    let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
+    let allocator = "MINYAR_HOT void *data_allocate(size_t size, size_t alignment) {"
+    test.check(test.contains(engine, allocator), "missing measured data allocator")
+    engine = test.replace(engine, allocator, allocator + "\n    if (text_probe_active) { text_probe_buffers++; text_probe_bytes = size; }")
+    let allocation = "    bytes = new_bytes(length);\n    for (index = 0; index < parts->length; index++) {"
+    test.check(test.contains(engine, allocation), "missing measured join allocation")
+    engine = test.replace(engine, allocation, "    text_probe_active = 1; text_probe_buffers = 0;\n    bytes = new_bytes(length);\n    text_probe_active = 0; text_probe_joins++;\n    assert(text_probe_buffers == 1 && text_probe_bytes == (unsigned long long)length + 1);\n    for (index = 0; index < parts->length; index++) {")
+    let counters = "#include <assert.h>\nstatic int text_probe_active, text_probe_buffers, text_probe_joins;\nstatic unsigned long long text_probe_bytes;\n"
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", counters + engine)
+    contract += "\n__attribute__((destructor)) static void measured_join_contract(void) { assert(text_probe_joins == 1); }\n"
+    io.writeTextFile(path + ".c", contract)
+    io.writeTextFile(path + ".ll", llvm)
+    let build = [compiler.clang, "-O2", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".c", "-o", path + ".o"]
+    for flag in compiler.flags { build.add(flag) }
+    test.require(test.run(build, system.environment(), "", path + ".build", 30), "build measured interpolation runtime")
+    for optimization in ["-O0", "-O2"] {
+        let link = [compiler.clang, optimization, "-Wno-override-module", path + ".ll", path + ".o", "-lm", "-o", path + ".exe"]
+        for flag in compiler.flags { link.add(flag) }
+        test.require(test.run(link, system.environment(), "", path + ".link", 30), "link measured interpolation")
+        let observed = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.check(observed.status == 0 && observed.output == "left 42 middle true right\n" && observed.errorOutput == "", "interpolation must allocate one exactly sized output buffer\n" + observed.errorOutput)
+    }
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+fixtures.executes(frontend, io.readTextFile("tests/text/interpolation.min"), io.readTextFile("tests/text/interpolation.stdout"), levels, 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/text.min"), io.readTextFile("examples/gallery/text.stdout"), levels, 0, "", true)
+io.writeTextFile(frontend.compiler.directory + "/greeting.min", "public function greeting(name: Text): Text { return \"Hello, \\(name)!\" }\n")
+fixtures.executes(frontend, "use \"./greeting.min\" as greeting\nprint(greeting.greeting(\"Ada\"))\n", "Hello, Ada!\n", levels, 0, "", true)
+
+for declaration in ["let value = [1]", "record Box { n: Integer }; let value = Box { n: 1 }", "let value = Bytes()", "let value = function() {}"] {
+    fixtures.rejects(frontend, declaration + "\nprint(\"value: \\(value)\")\n", "text interpolation needs Integer, Float, Boolean, Character, or Text; convert this value to Text explicitly", true)
+}
+fixtures.rejects(frontend, "print(\"value: \\(unknown)\")\n", "line 1, column 17: I can't find a value named 'unknown'", true)
+fixtures.rejects(frontend, "print(\"value: \\(1\n", "text interpolation is missing its closing ')'", true)
+fixtures.rejects(frontend, "print(\"value: \\()\")\n", "text interpolation needs", true)
+fixtures.rejects(frontend, "print(\"value: \\(1, 2)\")\n", "text interpolation needs", true)
+
+test.require(fixtures.compile(frontend, "let n = 42\nprint(\"left \\(n) middle \\(true) right\")\n"), "compile single interpolation join")
+let llvm = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+let joins = 0
+for line in test.lines(llvm) { if test.contains(line, " = call ptr @minyar_join_texts(") { joins += 1 } }
+test.check(joins == 1, "interpolation must emit exactly one joinText for all parts")
+test.check(!test.contains(llvm, " = call ptr @minyar_join_text(") && !test.contains(llvm, " = call ptr @minyar_join_text_owned("), "interpolation emitted a concatenation chain")
+measureJoin(frontend, llvm)
+test.removeTree(frontend.compiler.directory)
+print("Text literals: passed")

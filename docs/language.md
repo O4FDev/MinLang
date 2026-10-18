@@ -207,6 +207,25 @@ remain lazy.
 
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
+Text literals can include expressions inside `\(` and `)`:
+
+```minyar
+let name = "Ada"
+print("Hello, \(name)! You have \(20 + 22) messages.")
+print("The answer is \(true), and the star is \('★').")
+```
+
+An expression may produce Integer, Float, Boolean, Character or Text. Calls,
+parentheses and nested text literals work inside an interpolation. Expressions
+run once, from left to right. For records, Lists and Bytes, choose a Text
+representation explicitly before inserting it. `\\(` writes a literal `\(`.
+Other text escapes keep their usual meaning.
+
+One interpolation uses one `joinText` over its literal and converted parts,
+with one exactly sized output byte buffer. The parts List, the Text header,
+and conversions of scalar values have their own allocations; this does not
+promise one allocation for the entire expression.
+
 `List<T>` holds values of type `T`:
 
 ```minyar
