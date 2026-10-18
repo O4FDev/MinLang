@@ -18,7 +18,7 @@ MINIMUM = (14, 0)
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTABLES = [
     "minyarc", "minyarc-modules", "minyar-module-build",
-    "tooling/tools/project-cli", "tooling/tools/clang-driver",
+    "tooling/tools/project-cli", "tooling/tools/registry-cli", "tooling/tools/clang-driver",
     "tooling/tools/install-cli", "tooling/scripts/macos-app",
 ]
 RUNTIMES = [

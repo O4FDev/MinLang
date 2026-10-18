@@ -1,0 +1,55 @@
+use "./driver-support.min" as host
+use "./package-git.min" as git
+use "./project.min" as project
+use "./registry.min" as registry
+use "system" as system
+use "files" as files
+use "json" as json
+
+function environment(): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() { if !entry.startsWith("GIT_") { result.add(entry) } }
+    result.add("GIT_CONFIG_NOSYSTEM=1"); result.add("GIT_CONFIG_GLOBAL=/dev/null"); result.add("GIT_TERMINAL_PROMPT=0")
+    return result
+}
+function command(root: Text, arguments: List<Text>, output: Text, errors: Text): Integer {
+    let executable = host.which("git")
+    if executable == "" { host.stop("Git is required to prepare a package release") }
+    let command = [executable, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", root]
+    return host.spawn(host.extended(command, arguments), environment(), false, output, errors, 60)
+}
+function text(root: Text, arguments: List<Text>, scratch: Text): Text {
+    if command(root, arguments, scratch + "/out", scratch + "/err") != 0 { host.stop("cannot prepare this release: " + host.strip(host.readText(scratch + "/err")) + "; commit the package and tag its version first") }
+    return host.readText(scratch + "/out")
+}
+public function prepare(package: project.Manifest, repository: Text, description: Text): registry.Entry {
+    if !project.hasLibrary(package) { host.stop("publish requires a source library at src/" + package.name + ".min") }
+    let source = git.repository(repository)
+    let temporary = host.temporaryDirectory("", "minyar-publish-")
+    let scratch = host.resolveName(temporary)
+    if host.strip(text(package.root, ["rev-parse", "--show-toplevel"], scratch)) != package.root { host.stop("publish requires the package manifest at the Git repository root") }
+    if text(package.root, ["status", "--porcelain", "--untracked-files=normal"], scratch) != "" { host.stop("package has uncommitted files; commit the release before minyar publish --dry-run") }
+    let commit = host.strip(text(package.root, ["rev-parse", "--verify", "HEAD^{commit}"], scratch))
+    let tagged = host.strip(text(package.root, ["rev-parse", "--verify", "refs/tags/v" + package.version + "^{commit}"], scratch))
+    if commit != tagged { host.stop("v" + package.version + " does not point to HEAD; tag the reviewed release commit first") }
+    let tree = text(package.root, ["ls-tree", "-r", "-l", "-z", commit], scratch)
+    let exported = scratch + "/source"; host.makeDirectories(exported)
+    let count = 0; let size = 0
+    for item in tree.split(Text(Character(0))) {
+        if item == "" { continue }
+        let tab = host.findText(item, "\t", 0)
+        if tab < 0 { host.stop("invalid Git source tree") }
+        let fields = host.words(host.textSlice(item, 0, tab)); let path = host.textSlice(item, tab + 1, item.byteLength)
+        if fields.length != 4 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") || !git.safePath(path) { host.stop("release contains an unsafe source entry: " + path) }
+        count += 1; size += Integer(fields[3])
+        if count > 16384 || size > 134217728 { host.stop("release exceeds the source package limits") }
+        let destination = exported + "/" + path
+        host.makeDirectories(host.parentPath(destination))
+        if host.exists(destination) || host.resolveName(destination) != destination { host.stop("release paths collide on this filesystem: " + path) }
+        if command(package.root, ["cat-file", "blob", fields[2]], destination, scratch + "/err") != 0 { host.stop("cannot read release blob: " + path) }
+    }
+    let checksum = git.treeHash(exported)
+    let result = registry.Entry { name: package.name; repository: source; version: package.version; description: description; commit: commit; checksum: checksum }
+    host.release(temporary)
+    return registry.entry(json.parseUnique(registry.renderEntry(result)))
+}

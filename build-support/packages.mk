@@ -1,10 +1,19 @@
 build/tooling/tests/package-git: TOOL_NATIVE = tools/clang-driver-host.c
+build/tooling/tests/package-git: tools/clang-driver-host.c
+build/tooling/tools/registry-cli: TOOL_NATIVE = tools/clang-driver-host.c runtime/native/net.c
+build/tooling/tools/registry-cli: tools/clang-driver-host.c runtime/native/net.c runtime/minyar_native.h
 
 .PHONY: check-package-git
 check-package-git: build/tooling/tools/project-cli build/tooling/tests/package-git build/tooling/tools/clang-driver build/minyar-module-build
 	./build/tooling/tests/package-git "$(CURDIR)/minyar"
 
-check check-portable: check-package-git
+.PHONY: check-registry
+check-registry: build/tooling/tools/project-cli build/tooling/tools/registry-cli build/tooling/tools/clang-driver build/minyar-module-build
+	python3 tests/registry.py "$(CURDIR)/minyar" "$(CURDIR)/build/tooling/tools/registry-cli" "$(CURDIR)"
+
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+check check-portable: check-package-git check-registry
+endif
 
 .PHONY: check-paint-package
 check-paint-package: build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build

@@ -1,0 +1,92 @@
+use "./driver-support.min" as host
+use "./registry.min" as registry
+use "./package-git.min" as git
+use "json" as json
+use "process" as process
+use "files" as files
+use "system" as system
+use "httpserver" as http
+use "errors" as errors
+
+function atomic(path: Text, content: Text) {
+    let temporary = path + ".tmp-" + Text(system.processId())
+    host.writeBytes(temporary, Bytes(content))
+    if files.rename(temporary, path) != 0 { host.stop("cannot publish registry file: " + path) }
+}
+function build(records: Text, destination: Text) {
+    let entries: List<registry.Entry> = []
+    if host.isFile(destination + "/index.json") { entries = registry.load(destination).entries }
+    let names = files.list(records)
+    if files.lastError() != 0 { host.stop("cannot read release record directory: " + records) }
+    names.sort()
+    let added = 0
+    for name in names {
+        if !name.endsWith(".json") || !host.isFile(records + "/" + name) { continue }
+        let value = json.parseUniqueBytes(host.readBytes(records + "/" + name), 4194304)
+        if value.kind == json.INVALID { host.stop("invalid release record " + name + ": " + value.text) }
+        let entry = registry.entry(value)
+        let found = false
+        for previous in entries {
+            if previous.repository == entry.repository && previous.version == entry.version {
+                if registry.renderEntry(previous) != registry.renderEntry(entry) { host.stop("release metadata is immutable: " + entry.repository + "@" + entry.version) }
+                found = true
+            }
+        }
+        if !found { entries.add(entry); added += 1 }
+    }
+    if entries.length > 10000 { host.stop("registry exceeds the 10000-release limit") }
+    let index = registry.render(entries)
+    if index.byteLength > 4194304 { host.stop("registry index exceeds 4 MiB") }
+    host.makeDirectories(destination)
+    atomic(destination + "/checksums.txt", registry.sums(entries))
+    atomic(destination + "/index.json", index)
+    print("     Added  " + Text(added) + " release records\n     Index  " + destination + "/index.json\n Checksums  " + host.hashBytes(Bytes(registry.sums(entries))))
+}
+function serve(root: Text, port: Integer) {
+    if !host.isFile(root + "/index.json") { host.stop("index.json is missing; run minyar registry build RECORDS PUBLIC first") }
+    registry.load(root)
+    let limits = http.defaults(); limits.maxConnections = 32; limits.maxBodyBytes = 0
+    let server = http.listen("127.0.0.1", port, limits)
+    if !http.ok(server) { host.stop(errors.message(http.serverError(server))) }
+    files.writeStandardOutput("Registry listening at http://127.0.0.1:" + Text(http.port(server)) + "\n")
+    while http.ok(server) {
+        let batch = http.poll(server, -1)
+        if errors.isError(http.batchError(batch)) { break }
+        for request in http.requests(batch) {
+            let status = 404; let body = Bytes("not found\n"); let contentType = "text/plain; charset=utf-8"
+            if request.method != "GET" && request.method != "HEAD" { status = 405; body = Bytes("this registry is read-only\n") }
+            else {
+                let target = request.target.split("?")[0]
+                if target.startsWith("/") { target = host.textAfter(target, "/") }
+                let allowed = target == "index.json" || target == "checksums.txt" || target == "install" || target.startsWith("releases/")
+                if allowed && git.safePath(target) {
+                    let path = root + "/" + target
+                    if host.resolveName(path).startsWith(root + "/") && host.isFile(path) && files.pathSize(path) <= 16777216 {
+                        status = 200; body = host.readBytes(path)
+                        if target.endsWith(".json") { contentType = "application/json" }
+                        else if target.endsWith(".gz") || target.endsWith(".sig") { contentType = "application/octet-stream" }
+                    }
+                }
+            }
+            let response = http.response(status, contentType, body)
+            response.headers.add(http.Header { name: "x-content-type-options"; value: "nosniff" })
+            response.headers.add(http.Header { name: "cache-control"; value: "no-cache" })
+            http.respond(server, request, response)
+        }
+    }
+    http.close(server)
+}
+if process.argumentCount() < 1 { host.stop("usage: minyar registry build RECORDS PUBLIC | serve PUBLIC [PORT]") }
+let command = process.argument(0)
+if command == "build" && process.argumentCount() == 3 { build(host.resolveName(process.argument(1)), host.resolveName(process.argument(2))) }
+else if command == "serve" && (process.argumentCount() == 2 || process.argumentCount() == 3) {
+    let port = 8080
+    if process.argumentCount() == 3 {
+        let value = process.argument(2)
+        if value == "" || value.byteLength > 5 { host.stop("registry port must be 0..65535") }
+        for byte in Bytes(value) { if !host.isDigit(byte) { host.stop("registry port must be 0..65535") } }
+        port = Integer(value)
+        if port > 65535 { host.stop("registry port must be 0..65535") }
+    }
+    serve(host.resolveName(process.argument(1)), port)
+} else { host.stop("usage: minyar registry build RECORDS PUBLIC | serve PUBLIC [PORT]") }

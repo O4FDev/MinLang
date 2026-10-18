@@ -1,0 +1,185 @@
+// A small, immutable-release index. Hosting is ordinary static file serving.
+use "./driver-support.min" as host
+use "./package-git.min" as git
+use "json" as json
+use "system" as system
+use "files" as files
+
+public record Entry { name: Text; repository: Text; version: Text; description: Text; commit: Text; checksum: Text }
+public record Index { entries: List<Entry>; origin: Text }
+function string(value: json.Value, key: Text): Text {
+    let field = json.requireString(value, key)
+    if field.kind == json.INVALID { host.stop("invalid registry metadata: " + field.text) }
+    return field.text
+}
+public function entry(value: json.Value): Entry {
+    let result = Entry { name: string(value, "name"); repository: git.repository(string(value, "repository")); version: string(value, "version"); description: string(value, "description"); commit: string(value, "commit"); checksum: string(value, "checksum") }
+    if !git.semver(result.version) || result.version.startsWith("v") || !git.hexadecimal(result.commit, 40) || !git.hexadecimal(result.checksum, 64) { host.stop("registry entries need a canonical version, full commit and SHA-256 source checksum") }
+    if result.name == "" || result.name.byteLength > 64 || result.description.byteLength > 512 { host.stop("registry name or description exceeds its limit") }
+    let raw = Bytes(result.name)
+    for index in 0..raw.length {
+        let byte = raw[index]
+        let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        if !letter && !(index > 0 && (host.isDigit(byte) || byte == 45)) { host.stop("invalid registry package name") }
+    }
+    for byte in Bytes(result.description) { if byte < 32 || byte == 127 { host.stop("registry descriptions must fit on one line") } }
+    return result
+}
+public function renderEntry(value: Entry): Text {
+    return "{\"name\":" + host.jsonText(value.name) + ",\"repository\":" + host.jsonText(value.repository) + ",\"version\":" + host.jsonText(value.version) + ",\"description\":" + host.jsonText(value.description) + ",\"commit\":" + host.jsonText(value.commit) + ",\"checksum\":" + host.jsonText(value.checksum) + "}"
+}
+function key(value: Entry): Text { return value.repository + "@" + value.version }
+public function ordered(entries: List<Entry>): List<Entry> {
+    let keys: List<Text> = []
+    let positions = Map<Text, Integer>()
+    for index in 0..entries.length { let name = key(entries[index]); keys.add(name); positions[name] = index }
+    keys.sort()
+    let result: List<Entry> = []
+    for name in keys { result.add(entries[positions[name]]) }
+    return result
+}
+public function sums(entries: List<Entry>): Text {
+    let parts: List<Text> = ["minyar-checksums-v1\n"]
+    for value in ordered(entries) { parts.add(value.repository + " " + value.version + " " + value.commit + " " + value.checksum + "\n") }
+    return joinText(parts)
+}
+public function render(entries: List<Entry>): Text {
+    let records: List<Text> = []
+    for value in ordered(entries) { records.add(renderEntry(value)) }
+    return "{\"schema\":1,\"checksum_root\":" + host.jsonText(host.hashBytes(Bytes(sums(entries)))) + ",\"packages\":[" + host.joined(records, ",") + "]}\n"
+}
+public function decode(source: Bytes, origin: Text): Index {
+    let value = json.parseUniqueBytesWithin(source, 4194304, 100000, 32)
+    if value.kind == json.INVALID { host.stop("cannot read registry index: " + value.text) }
+    let schema = json.requireNumber(value, "schema")
+    let packages = json.lookup(value, "packages")
+    if schema.kind != json.NUMBER || schema.number != 1.0 || packages.kind != json.ARRAY { host.stop("unsupported registry index; expected schema 1 and a packages array") }
+    if packages.items.length > 10000 { host.stop("registry exceeds the 10000-release limit") }
+    let entries: List<Entry> = []
+    let keys = Map<Text, Boolean>()
+    for item in packages.items {
+        let parsed = entry(item)
+        if keys.has(key(parsed)) { host.stop("duplicate release in registry: " + key(parsed)) }
+        keys[key(parsed)] = true; entries.add(parsed)
+    }
+    if string(value, "checksum_root") != host.hashBytes(Bytes(sums(entries))) { host.stop("registry checksum root does not match its release records") }
+    return Index { entries: entries; origin: origin }
+}
+function remoteLocation(location: Text): Boolean {
+    if location.startsWith("https://") { return true }
+    if !location.startsWith("http://") { return false }
+    let authority = host.textAfter(location, "http://").split("/")[0]
+    let port = ""
+    if authority.startsWith("127.0.0.1:") { port = host.textAfter(authority, "127.0.0.1:") }
+    else if authority.startsWith("localhost:") { port = host.textAfter(authority, "localhost:") }
+    if port == "" || port.byteLength > 5 { host.stop("HTTP package indexes require a loopback host and numeric port") }
+    for byte in Bytes(port) { if !host.isDigit(byte) { host.stop("HTTP package indexes require a loopback host and numeric port") } }
+    if Integer(port) < 1 || Integer(port) > 65535 { host.stop("HTTP package index port must be 1..65535") }
+    return true
+}
+function fetch(location: Text): Bytes {
+    if remoteLocation(location) {
+        let curl = host.which("curl")
+        if curl == "" { host.stop("curl is required for a remote package index; install curl or use a local index directory") }
+        let url = location
+        if !url.endsWith("/") { url += "/" }
+        url += "index.json"
+        let result = host.capture([curl, "-q", "--fail", "--silent", "--show-error", "--location", "--max-time", "30", "--max-filesize", "4194304", "--proto", "=http,https", "--proto-redir", "=https", "--", url], 35)
+        if result.status != 0 { host.stop("cannot read package index " + url + ": " + host.strip(result.errors)) }
+        return Bytes(result.output)
+    }
+    if host.hasText(location, "://") { host.stop("package indexes require HTTPS (HTTP is allowed only on loopback)") }
+    let path = host.resolveName(location)
+    if host.isDirectory(path) { path += "/index.json" }
+    if files.pathSize(path) > 4194304 { host.stop("registry index exceeds 4 MiB") }
+    return host.readBytes(path)
+}
+public function load(location: Text): Index {
+    return loadWith(location, false)
+}
+public function loadWith(location: Text, offline: Boolean): Index {
+    if location == "" { host.stop("no package index configured; set MINYAR_REGISTRY to an HTTPS URL or local index directory") }
+    let remote = remoteLocation(location)
+    if !remote { return decode(fetch(location), location) }
+    let directory = git.cache() + "/indexes/" + host.hashBytes(Bytes(location))
+    let path = directory + "/index.json"
+    if offline {
+        if !host.isFile(path) { host.stop("package index is not cached; run minyar search once without --offline") }
+        return decode(host.readBytes(path), location)
+    }
+    let source = fetch(location)
+    let index = decode(source, location)
+    if host.isFile(path) {
+        let previous = decode(host.readBytes(path), location)
+        let positions = Map<Text, Integer>()
+        for position in 0..index.entries.length { positions[key(index.entries[position])] = position }
+        for old in previous.entries {
+            if !positions.has(key(old)) { host.stop("registry removed an already witnessed release: " + key(old)) }
+            if renderEntry(old) != renderEntry(index.entries[positions[key(old)]]) { host.stop("registry changed an already witnessed release: " + key(old)) }
+        }
+    }
+    host.makeDirectories(directory)
+    let temporary = path + "." + Text(system.processId())
+    host.writeBytes(temporary, source)
+    if files.rename(temporary, path) != 0 { host.stop("cannot cache the verified package index") }
+    return index
+}
+public function optional(offline: Boolean): Index {
+    let location = system.getenv("MINYAR_REGISTRY")
+    if location == "" { return Index { entries: []; origin: "" } }
+    return loadWith(location, offline)
+}
+public function verify(index: Index, source: git.Source) {
+    if index.origin == "" || !git.semver(source.revision) { return }
+    let version = source.revision
+    if version.startsWith("v") { version = host.textAfter(version, "v") }
+    for value in index.entries {
+        if value.repository == source.repository && value.version == version {
+            if value.commit != source.commit || value.checksum != source.checksum { host.stop("registry checksum mismatch for " + source.repository + "@" + source.revision + "; the index and locked Git source disagree") }
+            return
+        }
+    }
+    host.stop("release is absent from the configured package index: " + source.repository + "@" + source.revision)
+}
+function lowercase(value: Text): Text {
+    let raw = Bytes(value)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] += 32 } }
+    return Text(raw)
+}
+public function search(index: Index, query: Text) {
+    let repositories: List<Text> = []
+    let latestVersions = Map<Text, Integer>()
+    for position in 0..index.entries.length {
+        let value = index.entries[position]
+        if !latestVersions.has(value.repository) { repositories.add(value.repository); latestVersions[value.repository] = position }
+        else if git.compare(value.version, index.entries[latestVersions[value.repository]].version) > 0 { latestVersions[value.repository] = position }
+    }
+    repositories.sort()
+    let count = 0
+    for repository in repositories {
+        let latest = index.entries[latestVersions[repository]]
+        let needle = lowercase(query)
+        if query != "" && !host.hasText(lowercase(latest.name), needle) && !host.hasText(lowercase(latest.repository), needle) && !host.hasText(lowercase(latest.description), needle) { continue }
+        let padding = "  "
+        for space in latest.name.byteLength..20 { padding += " " }
+        print(latest.name + padding + "v" + latest.version + "  " + latest.description)
+        print("  " + latest.repository)
+        count += 1
+    }
+    if count == 0 { print("No packages matched " + host.jsonText(query) + ".") }
+}
+public function info(index: Index, name: Text) {
+    let repository = ""
+    for value in index.entries {
+        if value.name != name && value.repository != name { continue }
+        if repository != "" && repository != value.repository { host.stop("more than one package is named " + name + "; use its full Git repository path with minyar info") }
+        repository = value.repository
+    }
+    let found = false
+    for value in ordered(index.entries) {
+        if value.name != name && value.repository != name { continue }
+        if !found { print(value.name + "  " + value.repository + "\n" + value.description); found = true }
+        print("  v" + value.version + "  " + value.commit + "\n  sha256:" + value.checksum)
+    }
+    if !found { host.stop("package not found: " + name + "; try minyar search " + name) }
+}

@@ -190,5 +190,23 @@ backend. `minyar --help` describes file compilation; `minyar help` describes
 project commands. Repository maintenance still uses Make targets; `minyar test`
 is for user projects, not the compiler repository's full test suite.
 
-Editor/LSP integration, a Minyar source formatter, workspaces and a remote
-package registry are separate tooling work; the CLI does not claim these exist.
+Editor/LSP integration, a Minyar source formatter and workspaces remain separate
+tooling work.
+
+## Package discovery and release records
+
+```sh
+minyar search paint --registry ./public
+minyar info paint --registry https://YOUR-HOST
+minyar publish github.com/O4FDev/paint --dry-run --description "A vector studio."
+minyar registry build ./release-records ./public
+minyar registry serve ./public 8080
+```
+
+`MINYAR_REGISTRY` selects a static package index for discovery and optional Git
+release checksum verification. Remote indexes have a verified local cache for
+`--offline`; previously witnessed releases cannot change or disappear. There is
+no default public registry deployed yet. `publish` emits metadata only and is a
+dry run even without the flag. It requires a clean committed library and a version
+tag at HEAD. See [the registry guide](registry.md) for records, checksums, local
+testing and static hosting.

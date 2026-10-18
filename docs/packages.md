@@ -102,7 +102,9 @@ Downloads use a fresh bare repository with no checkout, inherited Git
 configuration, credential helper or hooks. Files are read directly from Git
 blobs. Git submodules, symlinks, absolute paths, `..` path components, Git
 metadata paths, backslashes, control characters and colon-bearing paths are
-rejected. Packages are limited to 16,384 files and 128 MiB of source data.
+rejected. Packages are limited to 16,384 files, 128 MiB of source data and 4,096
+nested text/interpolation contexts. The native-keyword check follows flat block
+comments and ordinary, raw and multiline text; interpolation contents are code.
 
 Packages never run install/build scripts. Remote dependencies cannot contain
 native C, Objective-C, Swift, assembly or binary implementations, or declare a
