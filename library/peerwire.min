@@ -18,7 +18,10 @@ public record Decoder { private buffer: Bytes; private ended: Boolean; private e
 public record FrameResult { private error: errors.Error; private type: Integer; private id: Integer; private body: Bytes }
 public record MetadataResult { private error: errors.Error; private value: json.Value }
 public record OpenResult { private error: errors.Error; private grant: Bytes; private exit: Text; private connection: Text; private deadline: Integer }
-public record StatusResult { private error: errors.Error; private value: Text }
+public choice StatusResult {
+    AcceptedStatus(value: Text)
+    RejectedStatus(error: errors.Error)
+}
 public record Device { private binding: auth.Binding; private hello: Boolean; private error: errors.Error }
 public record Relay {
     private error: errors.Error; private id: Integer; private exit: Text; private connection: Text
@@ -193,16 +196,25 @@ public function makeHeartbeat(body: Bytes): errors.BytesResult {
 }
 function validStatus(value: Text): Boolean { return value == "ok" || value == "grant_invalid" || value == "exit_offline" || value == "policy_denied" }
 public function parseStatus(frame: FrameResult): StatusResult {
-    if !frameOk(frame) { return StatusResult { error: frameError(frame); value: "" } }
-    if frame.type != STATUS { return StatusResult { error: error(errors.protocolCode(), "expected first relay status"); value: "" } }
-    for byte in frame.body { if byte < 97 || byte > 122 { if byte != 95 { return StatusResult { error: error(errors.protocolCode(), "invalid relay status"); value: "" } } } }
+    if !frameOk(frame) { return RejectedStatus(frameError(frame)) }
+    if frame.type != STATUS { return RejectedStatus(error(errors.protocolCode(), "expected first relay status")) }
+    for byte in frame.body { if byte < 97 || byte > 122 { if byte != 95 { return RejectedStatus(error(errors.protocolCode(), "invalid relay status")) } } }
     let value = Text(frame.body)
-    if !validStatus(value) { return StatusResult { error: error(errors.protocolCode(), "unknown relay status"); value: "" } }
-    return StatusResult { error: errors.none(); value: value }
+    if !validStatus(value) { return RejectedStatus(error(errors.protocolCode(), "unknown relay status")) }
+    return AcceptedStatus(value)
 }
-public function statusOk(value: StatusResult): Boolean { return !errors.isError(value.error) }
-public function statusError(value: StatusResult): errors.Error { return value.error }
-public function statusValue(value: StatusResult): Text { if !statusOk(value) { fail("cannot read a rejected relay status") }; return value.value }
+public function statusOk(value: StatusResult): Boolean {
+    match value { AcceptedStatus(_) { return true } RejectedStatus(_) { return false } }
+}
+public function statusError(value: StatusResult): errors.Error {
+    match value { AcceptedStatus(_) { return errors.none() } RejectedStatus(error) { return error } }
+}
+public function statusValue(value: StatusResult): Text {
+    match value {
+        AcceptedStatus(text) { return text }
+        RejectedStatus(_) { fail("cannot read a rejected relay status") }
+    }
+}
 public function makeStatus(id: Integer, value: Text): errors.BytesResult {
     if !validStatus(value) { return errors.bytesFailure(error(errors.invalidDataCode(), "unknown outgoing relay status")) }
     return encode(STATUS, id, Bytes(value))
@@ -283,7 +295,7 @@ public function receiveRelay(value: Relay, frame: FrameResult): errors.BooleanRe
     if frame.type == STATUS && value.stage == 0 {
         let checked = parseStatus(frame)
         if !statusOk(checked) { return relayFailure(value, "invalid initial relay status") }
-        value.status = checked.value
+        value.status = statusValue(checked)
         if value.status == "ok" { value.stage = 1 } else { value.stage = 2 }
         return errors.boolean(true)
     }

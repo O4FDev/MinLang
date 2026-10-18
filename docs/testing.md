@@ -80,6 +80,11 @@ fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
 ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed
 with `unknown type 'Shape'`; the focused gate is the passing feature regression.
 
+`make check-choice-library` checks the migrated `peerwire.StatusResult` at
+O0/O2 with ownership cleanup and real native providers. It checks both case
+matching and the existing status helpers. `check-choice-library-sanitize` adds
+ASan/UBSan; `check-peer-wire` remains the broader protocol compatibility gate.
+
 `make check-language-ergonomics` checks inferred Result constructors,
 expression propagation and error cleanup, no-value success, callable type and
 anonymous-function inference across module boundaries, immutable locals,

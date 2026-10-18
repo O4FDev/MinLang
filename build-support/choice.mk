@@ -4,10 +4,11 @@ build/choice-builtins.min: library/maybe.min build-support/choice.mk | build
 	python3 -c 'import json, sys; from pathlib import Path; print("function builtinMaybeSource(): Text { return " + json.dumps(Path(sys.argv[1]).read_text(), ensure_ascii=False) + " }")' "$<" > "$@.tmp"
 	mv "$@.tmp" "$@"
 
-.PHONY: check-choice-identifiers check-choice check-choice-sanitize
+.PHONY: check-choice-identifiers check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
 
 check-choice-identifiers: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-identifiers
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-identifiers"
+
 
 
 check-choice: build/minyarc build/minyar-runtime.o build/tooling/tests/choice
@@ -16,5 +17,11 @@ check-choice: build/minyarc build/minyar-runtime.o build/tooling/tests/choice
 check-choice-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice"
 
-check check-portable: check-choice
-check-sanitize: check-choice-sanitize
+check-choice-library: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-library
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-library"
+
+check-choice-library-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-library
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-library"
+
+check check-portable: check-choice check-choice-library
+check-sanitize: check-choice-sanitize check-choice-library-sanitize

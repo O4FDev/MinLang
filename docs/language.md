@@ -619,6 +619,12 @@ import. Local declarations retain their names, including a local case named
 `Some` or a function named `Some`. Qualify a constructor or provide its expected
 type when case names overlap.
 
+The library also exposes choices through existing APIs. For example,
+`peerwire.parseStatus(frame)` returns `peerwire.StatusResult`, with
+`AcceptedStatus(text)` and `RejectedStatus(error)` cases. Existing `statusOk`,
+`statusValue` and `statusError` helpers remain available; matching lets a caller
+handle both outcomes directly.
+
 Choices currently share the record representation and automatic memory
 management. Each value allocates a tag and slots for all declared payloads;
 inactive slots are empty. This includes choices with no payloads. Payloads can
