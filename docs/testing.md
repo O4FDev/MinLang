@@ -608,6 +608,14 @@ escaped into evidence rather than losing the report. The fault-injection harness
 checks candidate selection, stderr rejection, rejecting/empty corpora, retained
 failure evidence, invalid diagnostic encoding and POSIX descendant cleanup.
 
+`make check-text-literals` checks interpolation, multi-line indentation, raw
+delimiters, continuation, exact rejection locations and the text gallery at
+O0/O2 with ownership cleanup assertions. Its runtime probe measures one output
+buffer of exactly the joined byte length plus its terminator; scalar conversion
+and List allocations remain separate. `check-text-literals-sanitize` adds
+compiler/program ASan/UBSan. `check-text-bootstrap` runs the same literal forms
+through stage0 at O0/O2; `check-cold-bootstrap` proves the clean public launcher.
+
 Text storage has structural oracles in `tests/runtime-unit.c`: full and nested
 slices must share a flattened owning root, tiny slices of large sources must
 copy, owned join chains must keep one Text identity with geometric capacity,
