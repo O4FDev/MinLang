@@ -1,16 +1,17 @@
 use "process" as processInfo
 use "./project.min" as project
+use "./package-git.min" as git
 use "./driver-support.min" as host
 use "system" as system
 use "files" as files
 
-record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; release: Boolean; library: Boolean; locked: Boolean; force: Boolean; incremental: Boolean; positionals: List<Text>; arguments: List<Text> }
+record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; release: Boolean; library: Boolean; locked: Boolean; offline: Boolean; force: Boolean; incremental: Boolean; positionals: List<Text>; arguments: List<Text> }
 
 function help() {
-    print("Minyar project CLI\n\nUsage: minyar <COMMAND> [OPTIONS]\n\n  new PATH       Create a binary package (--lib for a library)\n  init [PATH]    Initialize a package without overwriting existing files\n  build          Build the current package\n  run            Build and run; pass program arguments after --\n  check          Check the package and integration tests without linking\n  test           Build and run tests/*.min; pass test arguments after --\n  clean          Remove this package's generated target directory\n  add NAME --path PATH   Add a local library dependency\n  remove NAME    Remove a dependency\n  tree           Show the resolved local dependency graph\n  metadata       Print package and dependency metadata as JSON\n  install        Build and install the package binary (--path PATH)\n  uninstall NAME Remove a binary installed by Minyar\n\nOptions:\n  --manifest-path PATH   Minyar.toml or package directory (searches parents by default)\n  --release              Use the release profile (default: debug)\n  --locked               Require an up-to-date Minyar.lock\n  --no-incremental       Disable module compilation caching\n  --name NAME            Package name for new/init\n  --lib                  Create a library with new/init\n  --root DIR             Installation prefix (default: $MINYAR_HOME or ~/.minyar)\n  --force                Replace a binary during install\n  -h, --help             Show this help\n\nExisting file builds remain available: minyar [OPTIONS] FILE.min [-o PROGRAM]\nToolchain diagnostics: minyar --doctor; minyar --version")
+    print("Minyar project CLI\n\nUsage: minyar <COMMAND> [OPTIONS]\n\n  new PATH       Create a binary package (--lib for a library)\n  init [PATH]    Initialize a package without overwriting existing files\n  build          Build the current package\n  run            Build and run; pass program arguments after --\n  check          Check the package and integration tests without linking\n  test           Build and run tests/*.min; pass test arguments after --\n  clean          Remove this package's generated target directory\n  add HOST/OWNER/REPO[@REV]   Add a verified Git source package\n  add NAME --path PATH   Add a local library dependency\n  remove NAME    Remove a dependency\n  tree           Show the resolved dependency graph\n  metadata       Print package and dependency metadata as JSON\n  install        Build and install the package binary (--path PATH)\n  uninstall NAME Remove a binary installed by Minyar\n\nOptions:\n  --manifest-path PATH   Minyar.toml or package directory (searches parents by default)\n  --release              Use the release profile (default: debug)\n  --locked               Require an up-to-date Minyar.lock\n  --offline              Use cached packages; never download\n  --no-incremental       Disable module compilation caching\n  --name NAME            Package name for new/init\n  --lib                  Create a library with new/init\n  --root DIR             Installation prefix (default: $MINYAR_HOME or ~/.minyar)\n  --force                Replace a binary during install\n  -h, --help             Show this help\n\nExisting file builds remain available: minyar [OPTIONS] FILE.min [-o PROGRAM]\nToolchain diagnostics: minyar --doctor; minyar --version")
 }
 function parse(): Options {
-    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; release: false; library: false; locked: false; force: false; incremental: true; positionals: []; arguments: [] }
+    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; positionals: []; arguments: [] }
     let seen: List<Text> = []
     let index = 1
     while index < processInfo.argumentCount() {
@@ -28,6 +29,7 @@ function parse(): Options {
             if item == "--release" { options.release = true }
             else if item == "--lib" { options.library = true }
             else if item == "--locked" { options.locked = true }
+            else if item == "--offline" { options.offline = true }
             else if item == "--force" { options.force = true }
             else if item == "--no-incremental" { options.incremental = false }
             else if item == "--manifest-path" || item == "--path" || item == "--name" || item == "--root" {
@@ -50,6 +52,7 @@ function parse(): Options {
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--manifest-path" { allowed = options.command != "new" && options.command != "init" && options.command != "uninstall" }
         else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "tree", "metadata", "install"], options.command) }
+        else if option == "--offline" { allowed = host.listed(["build", "run", "check", "test", "tree", "metadata", "install", "add", "remove"], options.command) }
         else { allowed = host.listed(["build", "run", "check", "test", "install"], options.command) }
         if !allowed { host.stop(option + " is not supported by " + options.command) }
     }
@@ -92,7 +95,7 @@ function create(options: Options) {
     host.makeDirectories(root + "/tests")
     let kind = "bin"
     if options.library { kind = "lib" }
-    let manifest = project.Manifest { root: root; name: name; version: "0.1.0"; kind: kind; dependencies: []; paths: [] }
+    let manifest = project.manifest(root, name, "0.1.0", kind)
     exclusive(root + "/Minyar.toml", project.render(manifest))
     if options.library {
         exclusive(source, "public function answer(): Integer { return 42 }\n")
@@ -304,33 +307,59 @@ function install(graph: project.Graph, options: Options) {
 function modify(package: project.Manifest, options: Options) {
     if options.positionals.length != 1 { host.stop("usage: minyar " + options.command + " NAME" ) }
     let name = options.positionals[0]
+    let repository = ""
+    let revision = ""
+    let remoteRoot = ""
+    if options.command == "add" && options.path == "" {
+        let pieces = name.split("@")
+        if pieces.length > 2 { host.stop("usage: minyar add github.com/owner/package[@revision]") }
+        repository = git.repository(pieces[0])
+        revision = "latest"
+        if pieces.length == 2 { revision = pieces[1] }
+        if !git.validRevision(revision) { host.stop("invalid Git revision: " + revision) }
+        let source = git.fetch(repository, revision, "", "", options.offline)
+        let dependency = project.read(source.root)
+        name = dependency.name
+        if !project.hasLibrary(dependency) { host.stop("dependency needs a library export at src/" + name + ".min") }
+        revision = source.revision
+        remoteRoot = source.root
+    }
+    if !project.validName(name) { host.stop("invalid dependency name: " + name) }
     let dependencies: List<Text> = []
     let paths: List<Text> = []
+    let repositories: List<Text> = []
+    let revisions: List<Text> = []
     let found = false
     for index in 0..package.dependencies.length {
         if package.dependencies[index] == name { found = true }
-        else { dependencies.add(package.dependencies[index]); paths.add(package.paths[index]) }
+        else { dependencies.add(package.dependencies[index]); paths.add(package.paths[index]); repositories.add(package.repositories[index]); revisions.add(package.revisions[index]) }
     }
     if options.command == "add" {
-        if options.path == "" { host.stop("add requires --path; registry dependencies are not available") }
-        let path = host.resolveName(options.path)
+        let path = remoteRoot
+        if repository == "" { path = host.resolveName(options.path) }
         let dependency = project.read(path)
         if name != dependency.name || !project.hasLibrary(dependency) { host.stop("dependency must be a library named " + name) }
         if path == package.root { host.stop("a package cannot depend on itself") }
         dependencies.add(name)
         // Resolve from the invoking cwd, then keep the manifest relocatable.
-        paths.add(project.relative(package.root, path))
+        if repository == "" { paths.add(project.relative(package.root, path)) }
+        else { paths.add("") }
+        repositories.add(repository)
+        revisions.add(revision)
     } else if !found { host.stop("dependency not found: " + name) }
     package.dependencies = dependencies
     package.paths = paths
-    project.resolvePackage(package)
+    package.repositories = repositories
+    package.revisions = revisions
+    let graph = project.resolveModified(package, name, options.offline)
     project.atomicWrite(package.root + "/Minyar.toml", project.render(package))
-    print(options.command + " " + name)
+    if repository != "" { project.lock(graph, false); print("     Added  " + name + " " + revision + "\n    Locked  " + Text(graph.packages.length - 1) + " source packages") }
+    else { print(options.command + " " + name) }
 }
 function metadata(graph: project.Graph) {
     let packages: List<Text> = []
     for package in graph.packages {
-        packages.add("{\"name\":" + host.jsonText(package.name) + ",\"version\":" + host.jsonText(package.version) + ",\"manifest_path\":" + host.jsonText(package.root + "/Minyar.toml") + ",\"dependencies\":" + host.jsonList(package.dependencies) + "}")
+        packages.add("{\"name\":" + host.jsonText(package.name) + ",\"version\":" + host.jsonText(package.version) + ",\"manifest_path\":" + host.jsonText(package.root + "/Minyar.toml") + ",\"source\":" + host.jsonText(package.source) + ",\"commit\":" + host.jsonText(package.commit) + ",\"checksum\":" + host.jsonText(package.checksum) + ",\"dependencies\":" + host.jsonList(package.dependencies) + "}")
     }
     print("{\"version\":1,\"target_directory\":" + host.jsonText(graph.packages[0].root + "/target") + ",\"packages\":[" + host.joined(packages, ",") + "]}")
 }
@@ -365,7 +394,7 @@ function dispatch() {
         print("Cleaned " + package.name)
         return
     }
-    let graph = project.resolve(root)
+    let graph = project.resolveWith(root, options.locked, options.offline)
     project.lock(graph, options.locked)
     if options.command == "metadata" { metadata(graph); return }
     if options.command == "tree" {

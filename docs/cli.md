@@ -65,6 +65,7 @@ kind = "bin"
 
 [dependencies]
 geometry = { path = "../geometry" }
+paint = { git = "github.com/O4FDev/paint", rev = "v0.1.0" }
 ```
 
 Only these sections and keys are accepted. Strings are double quoted, supporting
@@ -101,14 +102,26 @@ paths are still accepted; relative paths always resolve from the manifest
 directory. `add` and `remove` rewrite the supported manifest fields and remove
 comments.
 
-`Minyar.lock` records the resolved graph, relative package locations, versions
-and manifest hashes. Commit it with your project. `--locked` rejects a missing or
-stale lockfile. Local source files remain editable; this is a graph lock, not a
-source-content pin. Builds and graph inspection refresh it automatically.
+Add Git packages by their repository path. An omitted revision chooses the latest
+stable semver tag; a tag, branch or commit can be selected explicitly:
 
-There is no hosted registry or remote dependency fetching. Dependencies are local
-Minyar source libraries; native packages continue to use the existing compiler
-and standard-library providers.
+```sh
+minyar add github.com/O4FDev/paint
+minyar add github.com/O4FDev/paint@v0.1.0
+minyar build --locked --offline
+```
+
+`Minyar.lock` records the resolved graph, relative local locations, versions and
+manifest hashes. Git entries also pin an exact commit and SHA-256 source-tree
+checksum. Commit it with your project. `--locked` rejects a missing or stale
+lockfile; `--offline` forbids downloads. Cached Git sources are verified on every
+resolution, including ordinary builds. Local source files remain editable.
+
+Git packages use HTTPS and a shared cache under `$MINYAR_HOME/packages` or
+`~/.minyar/packages`. Compatible semver requirements select the highest requested
+minimum within one major version. Packages cannot run install scripts or supply
+native implementations. See [packages](packages.md) for the complete resolution,
+cache, security and offline testing contract.
 
 ## Builds and tests
 

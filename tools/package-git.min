@@ -1,0 +1,269 @@
+// Fetch source packages without checking out or executing anything from them.
+use "./driver-support.min" as host
+use "files" as files
+use "system" as system
+
+public record Source { repository: Text; revision: Text; commit: Text; checksum: Text; root: Text }
+
+function lowercase(value: Text): Text {
+    let raw = Bytes(value)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { raw[index] += 32 } }
+    return Text(raw)
+}
+
+public function hexadecimal(value: Text, length: Integer): Boolean {
+    if value.byteLength != length { return false }
+    for byte in Bytes(value) { if !host.isDigit(byte) && !(byte >= 97 && byte <= 102) { return false } }
+    return true
+}
+public function repository(value: Text): Text {
+    let result = value
+    if result.startsWith("https://") { result = host.textAfter(result, "https://") }
+    if result.endsWith(".git") { result = host.textSlice(result, 0, result.byteLength - 4) }
+    let parts = result.split("/")
+    if parts.length < 3 || result.byteLength > 512 { host.stop("use a Git package path such as github.com/O4FDev/paint") }
+    for part in parts {
+        if part == "" || part == "." || part == ".." || part.startsWith("-") || part == ".git" { host.stop("unsafe Git package path: " + value) }
+        for byte in Bytes(part) {
+            if !host.isDigit(byte) && !(byte >= 65 && byte <= 90) && !(byte >= 97 && byte <= 122) && byte != 45 && byte != 46 && byte != 95 { host.stop("unsafe Git package path: " + value) }
+        }
+    }
+    if !host.hasText(parts[0], ".") && parts[0] != "localhost" { host.stop("Git package paths must start with a host name") }
+    return result
+}
+public function validRevision(value: Text): Boolean {
+    if value == "" || value.byteLength > 200 || value.startsWith("-") || value.startsWith("/") || value.endsWith("/") || host.hasText(value, "..") || host.hasText(value, "//") || value.endsWith(".lock") { return false }
+    for byte in Bytes(value) {
+        if !host.isDigit(byte) && !(byte >= 65 && byte <= 90) && !(byte >= 97 && byte <= 122) && byte != 45 && byte != 46 && byte != 95 && byte != 47 { return false }
+    }
+    return true
+}
+public function semver(value: Text): Boolean {
+    let version = value
+    if version.startsWith("v") { version = host.textAfter(version, "v") }
+    let parts = version.split(".")
+    if parts.length != 3 { return false }
+    for part in parts {
+        if part == "" || part.byteLength > 9 || (part.byteLength > 1 && part.startsWith("0")) { return false }
+        for byte in Bytes(part) { if !host.isDigit(byte) { return false } }
+    }
+    return true
+}
+function versionParts(value: Text): List<Text> {
+    if value.startsWith("v") { return host.textAfter(value, "v").split(".") }
+    return value.split(".")
+}
+public function compare(left: Text, right: Text): Integer {
+    let a = versionParts(left)
+    let b = versionParts(right)
+    for index in 0..3 {
+        if Integer(a[index]) < Integer(b[index]) { return -1 }
+        if Integer(a[index]) > Integer(b[index]) { return 1 }
+    }
+    return 0
+}
+public function compatible(left: Text, right: Text): Boolean {
+    if !semver(left) || !semver(right) { return left == right }
+    return versionParts(left)[0] == versionParts(right)[0]
+}
+public function cache(): Text {
+    let root = system.getenv("MINYAR_HOME")
+    if root == "" {
+        let home = system.getenv("HOME")
+        if home == "" { host.stop("set HOME or MINYAR_HOME for the package cache") }
+        root = home + "/.minyar"
+    }
+    let path = host.resolveName(root) + "/packages"
+    host.makeDirectories(path + "/sha256")
+    host.makeDirectories(path + "/refs")
+    return host.resolveName(path)
+}
+function gitArguments(directory: Text, arguments: List<Text>): List<Text> {
+    let executable = host.which("git")
+    if executable == "" { host.stop("Git is required to download packages; install Git, then repeat minyar add") }
+    let command = [executable, "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never"]
+    if directory != "" { command.add("--git-dir=" + directory) }
+    for item in arguments { command.add(item) }
+    return command
+}
+function gitEnvironment(): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() { if !entry.startsWith("GIT_") { result.add(entry) } }
+    result.add("GIT_CONFIG_NOSYSTEM=1")
+    result.add("GIT_CONFIG_GLOBAL=/dev/null")
+    result.add("GIT_TERMINAL_PROMPT=0")
+    return result
+}
+function gitTo(directory: Text, arguments: List<Text>, output: Text, errors: Text): Integer {
+    return host.spawn(gitArguments(directory, arguments), gitEnvironment(), false, output, errors, 180)
+}
+function git(directory: Text, arguments: List<Text>, scratch: Text): Text {
+    let status = gitTo(directory, arguments, scratch + "/out", scratch + "/err")
+    if status != 0 { host.stop("Git could not read this package: " + host.strip(host.readText(scratch + "/err"))) }
+    return host.readText(scratch + "/out")
+}
+public function safePath(path: Text): Boolean {
+    if path == "" || path.startsWith("/") || path.byteLength > 1024 { return false }
+    for part in path.split("/") {
+        if part == "" || part == "." || part == ".." || lowercase(part) == ".git" { return false }
+    }
+    for byte in Bytes(path) { if byte < 32 || byte == 127 || byte == 92 || byte == 58 { return false } }
+    return true
+}
+function nativeSource(source: Text): Boolean {
+    // Recognise the keyword outside strings and comments, including raw text.
+    let raw = Bytes(source)
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 34 || raw[index] == 39 {
+            let quote = raw[index]
+            index += 1
+            while index < raw.length {
+                if raw[index] == 92 { index += 2 }
+                else if raw[index] == quote { index += 1; break }
+                else { index += 1 }
+            }
+        } else if index + 1 < raw.length && raw[index] == 47 && raw[index + 1] == 47 {
+            while index < raw.length && raw[index] != 10 { index += 1 }
+        } else if index + 1 < raw.length && raw[index] == 47 && raw[index + 1] == 42 {
+            index += 2
+            let depth = 1
+            while index + 1 < raw.length && depth > 0 {
+                if raw[index] == 47 && raw[index + 1] == 42 { depth += 1; index += 2 }
+                else if raw[index] == 42 && raw[index + 1] == 47 { depth -= 1; index += 2 }
+                else { index += 1 }
+            }
+        } else if host.isWord(raw[index]) {
+            let start = index
+            while index < raw.length && host.isWord(raw[index]) { index += 1 }
+            if Text(raw.slice(start, index)) == "native" { return true }
+        } else { index += 1 }
+    }
+    return false
+}
+function checkSource(path: Text, full: Text) {
+    let suffix = lowercase(host.suffixOf(path))
+    if host.listed([".c", ".h", ".cc", ".cpp", ".m", ".mm", ".o", ".a", ".so", ".dylib", ".dll", ".exe", ".s", ".swift"], suffix) { host.stop("remote packages must contain portable Minyar source; native code is not allowed: " + path) }
+    if suffix == ".min" && nativeSource(host.readText(full)) { host.stop("remote packages cannot declare native implementations: " + path) }
+}
+function treeFiles(root: Text, relative: Text, result: List<Text>) {
+    let directory = root
+    if relative != "" { directory += "/" + relative }
+    if host.resolveName(directory) != directory { host.stop("package cache contains a symlink: " + directory) }
+    let entries = files.list(directory)
+    if files.lastError() != 0 { host.stop("cannot read package cache: " + directory) }
+    entries.sort()
+    for entry in entries {
+        let path = entry
+        if relative != "" { path = relative + "/" + entry }
+        if !safePath(path) || host.resolveName(root + "/" + path) != root + "/" + path { host.stop("unsafe package source path: " + path) }
+        let status = host.fileStatus(root + "/" + path)
+        if status.kind == "d" { treeFiles(root, path, result) }
+        else if status.kind == "f" { result.add(path) }
+        else { host.stop("package sources must be regular files: " + path) }
+        if result.length > 16384 { host.stop("package exceeds the 16384-file limit") }
+    }
+}
+public function treeHash(root: Text): Text {
+    let paths: List<Text> = []
+    treeFiles(root, "", paths)
+    paths.sort()
+    let parts: List<Text> = ["minyar-source-v1\n"]
+    let size = 0
+    for path in paths {
+        size += files.pathSize(root + "/" + path)
+        if size > 134217728 { host.stop("package exceeds the 128 MiB source limit") }
+        checkSource(path, root + "/" + path)
+        parts.add(host.hashFile(root + "/" + path) + " " + host.jsonText(path) + "\n")
+    }
+    return host.hashBytes(Bytes(joinText(parts)))
+}
+function verify(root: Text, checksum: Text) {
+    if treeHash(root) != checksum { host.stop("package checksum mismatch: " + root + "; restore this cache entry from a trusted source before building") }
+}
+function reference(root: Text, repository: Text, revision: Text): Text {
+    return root + "/refs/" + host.hashBytes(Bytes(repository + "\n" + revision))
+}
+public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pinnedHash: Text, offline: Boolean): Source {
+    let source = Source { repository: repository; revision: requested; commit: pinnedCommit; checksum: pinnedHash; root: "" }
+    let store = cache()
+    let ref = reference(store, repository, requested)
+    if source.commit == "" && host.isFile(ref) && (offline || semver(requested) || hexadecimal(requested, 40)) {
+        let fields = host.lines(host.readText(ref))
+        if fields.length == 3 && hexadecimal(fields[0], 40) && hexadecimal(fields[1], 64) && validRevision(fields[2]) {
+            source.commit = fields[0]; source.checksum = fields[1]; source.revision = fields[2]
+        }
+    }
+    if source.commit != "" && (!hexadecimal(source.commit, 40) || !hexadecimal(source.checksum, 64)) { host.stop("invalid package commit or checksum in Minyar.lock") }
+    if source.checksum != "" {
+        source.root = store + "/sha256/" + source.checksum
+        if host.isDirectory(source.root) { verify(source.root, source.checksum); return source }
+    }
+    if offline { host.stop("package is not cached: " + repository + "@" + requested + "; run minyar build once with network access") }
+    system.writeStandardError("  Fetching  " + repository + "@" + requested + "\n")
+    let scratch = host.temporaryDirectory(store, ".fetch-")
+    let bare = scratch + "/repository"
+    git("", ["init", "--bare", "--quiet", "--template=", bare], scratch)
+    let url = "https://" + repository + ".git"
+    let arguments: List<Text> = []
+    let mirror = system.getenv("MINYAR_GIT_MIRROR")
+    if mirror != "" {
+        url = host.resolveName(mirror) + "/" + repository + ".git"
+        arguments.add("-c"); arguments.add("protocol.file.allow=always")
+    }
+    arguments = host.extended(arguments, ["fetch", "--quiet", "--force", "--tags", "--no-recurse-submodules", "--", url, "+refs/heads/*:refs/heads/*"])
+    git(bare, arguments, scratch)
+    let revision = source.revision
+    if revision == "latest" {
+        revision = ""
+        for tag in host.lines(git(bare, ["tag", "--list"], scratch)) {
+            if semver(tag) && (revision == "" || compare(tag, revision) > 0) { revision = tag }
+        }
+        if revision == "" { host.stop(repository + " has no stable semver tag; choose @main or @<commit>") }
+    }
+    if !validRevision(revision) { host.stop("invalid Git revision: " + revision) }
+    let target = source.commit
+    if target == "" {
+        let candidates = ["refs/tags/" + revision, "refs/heads/" + revision]
+        if hexadecimal(revision, 40) || (revision.byteLength >= 7 && hexadecimal(revision, revision.byteLength)) { candidates.add(revision) }
+        for candidate in candidates {
+            if gitTo(bare, ["rev-parse", "--verify", candidate + "^{commit}"], scratch + "/out", scratch + "/err") == 0 { target = host.strip(host.readText(scratch + "/out")); break }
+        }
+        if target == "" { host.stop("revision not found: " + repository + "@" + revision + "; choose an existing tag, branch or commit") }
+    }
+    let listing = git(bare, ["ls-tree", "-r", "-l", "-z", target], scratch)
+    let exported = scratch + "/source"
+    host.makeDirectories(exported)
+    let count = 0
+    let total = 0
+    for item in listing.split(Text(Character(0))) {
+        if item == "" { continue }
+        let tab = host.findText(item, "\t", 0)
+        if tab < 0 { host.stop("invalid Git tree") }
+        let fields = host.words(host.textSlice(item, 0, tab))
+        let path = host.textSlice(item, tab + 1, item.byteLength)
+        if fields.length != 4 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") { host.stop("package symlinks and submodules are not allowed: " + path) }
+        if !safePath(path) { host.stop("unsafe Git package path: " + path) }
+        count += 1
+        total += Integer(fields[3])
+        if count > 16384 || total > 134217728 { host.stop("package exceeds the source size or file limit") }
+        let destination = exported + "/" + path
+        host.makeDirectories(host.parentPath(destination))
+        if host.exists(destination) || host.resolveName(destination) != destination { host.stop("package paths collide on this filesystem: " + path) }
+        if gitTo(bare, ["cat-file", "blob", fields[2]], destination, scratch + "/err") != 0 { host.stop("could not read package source: " + path) }
+    }
+    let checksum = treeHash(exported)
+    if source.checksum != "" && source.checksum != checksum { host.stop("downloaded package checksum does not match Minyar.lock: " + repository) }
+    source.commit = target; source.checksum = checksum; source.revision = revision
+    source.root = store + "/sha256/" + checksum
+    if host.exists(source.root) { verify(source.root, checksum) }
+    else if files.rename(exported, source.root) != 0 {
+        if !host.isDirectory(source.root) { host.stop("could not publish package cache entry") }
+        verify(source.root, checksum)
+    }
+    let temporary = ref + "." + Text(system.processId())
+    host.writeBytes(temporary, Bytes(target + "\n" + checksum + "\n" + revision + "\n"))
+    if files.rename(temporary, ref) != 0 { host.stop("could not write package cache reference") }
+    host.release(scratch)
+    return source
+}

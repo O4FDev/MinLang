@@ -1,10 +1,18 @@
-// Project manifests and local dependency resolution, shared by the developer CLI.
+// Project manifests and reproducible source dependency resolution.
 use "./driver-support.min" as host
+use "./package-git.min" as git
 use "files" as files
 use "system" as system
 
-public record Manifest { root: Text; name: Text; version: Text; kind: Text; dependencies: List<Text>; paths: List<Text> }
+public record Manifest { root: Text; name: Text; version: Text; kind: Text; dependencies: List<Text>; paths: List<Text>; repositories: List<Text>; revisions: List<Text>; source: Text; revision: Text; commit: Text; checksum: Text }
 public record Graph { packages: List<Manifest>; active: List<Text> }
+record Pin { name: Text; repository: Text; revision: Text; commit: Text; checksum: Text }
+record Selection { name: Text; repository: Text; revision: Text }
+record Resolution { pins: List<Pin>; selections: List<Selection>; changed: Boolean; locked: Boolean; offline: Boolean }
+
+public function manifest(root: Text, name: Text, version: Text, kind: Text): Manifest {
+    return Manifest { root: root; name: name; version: version; kind: kind; dependencies: []; paths: []; repositories: []; revisions: []; source: ""; revision: ""; commit: ""; checksum: "" }
+}
 
 public function validName(name: Text): Boolean {
     let raw = Bytes(name)
@@ -56,9 +64,24 @@ function unquote(value: Text, location: Text): Text {
     }
     return Text(result)
 }
+function fields(entry: Text): List<Text> {
+    let result: List<Text> = []
+    let quoted = false
+    let escaped = false
+    let start = 0
+    let raw = Bytes(entry)
+    for index in 0..raw.length {
+        if escaped { escaped = false }
+        else if quoted && raw[index] == 92 { escaped = true }
+        else if raw[index] == 34 { quoted = !quoted }
+        else if !quoted && raw[index] == 44 { result.add(host.strip(Text(raw.slice(start, index)))); start = index + 1 }
+    }
+    result.add(host.strip(Text(raw.slice(start, raw.length))))
+    return result
+}
 public function read(root: Text): Manifest {
+    let result = manifest(root, "", "", "")
     let manifest = root + "/Minyar.toml"
-    let result = Manifest { root: root; name: ""; version: ""; kind: ""; dependencies: []; paths: [] }
     let section = ""
     let sections: List<Text> = []
     let keys: List<Text> = []
@@ -92,14 +115,31 @@ public function read(root: Text): Manifest {
             else { host.stop(location + ": unknown package key " + key) }
         } else if section == "[dependencies]" {
             if !validName(key) { host.stop(location + ": invalid dependency name " + key) }
-            if !value.startsWith("{") || !value.endsWith("}") { host.stop(location + ": local dependencies use { path = \"../package\" }") }
+            if !value.startsWith("{") || !value.endsWith("}") { host.stop(location + ": dependencies use { path = \"../package\" } or { git = \"host/owner/package\", rev = \"v1.0.0\" }") }
             let entry = host.strip(host.textSlice(value, 1, value.byteLength - 1))
-            let separator = host.findText(entry, "=", 0)
-            if separator < 0 || host.strip(host.textSlice(entry, 0, separator)) != "path" { host.stop(location + ": expected path = \"../package\"") }
-            let path = unquote(host.strip(host.textSlice(entry, separator + 1, entry.byteLength)), location)
-            if path == "" { host.stop(location + ": dependency path is empty") }
+            let path = ""
+            let repository = ""
+            let revision = ""
+            let seen: List<Text> = []
+            for field in fields(entry) {
+                let separator = host.findText(field, "=", 0)
+                if separator < 0 { host.stop(location + ": expected dependency key = value") }
+                let fieldName = host.strip(host.textSlice(field, 0, separator))
+                if host.listed(seen, fieldName) { host.stop(location + ": duplicate dependency key " + fieldName) }
+                seen.add(fieldName)
+                let parsed = unquote(host.strip(host.textSlice(field, separator + 1, field.byteLength)), location)
+                if parsed == "" { host.stop(location + ": dependency " + fieldName + " is empty") }
+                if fieldName == "path" { path = parsed }
+                else if fieldName == "git" { repository = git.repository(parsed) }
+                else if fieldName == "rev" { revision = parsed }
+                else { host.stop(location + ": unknown dependency key " + fieldName) }
+            }
+            if (path == "" && repository == "") || (path != "" && (repository != "" || revision != "")) { host.stop(location + ": choose a local path or a Git source with rev") }
+            if repository != "" && !git.validRevision(revision) { host.stop(location + ": Git dependencies need rev = \"v1.0.0\", a branch or a commit") }
             result.dependencies.add(key)
             result.paths.add(path)
+            result.repositories.add(repository)
+            result.revisions.add(revision)
         } else { host.stop(location + ": keys must be inside [package] or [dependencies]") }
     }
     if !validName(result.name) { host.stop(manifest + ": package.name must start with a letter or underscore and contain letters, digits, '-' or '_'") }
@@ -137,13 +177,88 @@ public function entry(manifest: Manifest): Text {
     host.stop("package " + manifest.name + " needs " + source)
     return ""
 }
-function visit(graph: Graph, root: Text, candidate: Manifest) {
+function emptyPin(): Pin { return Pin { name: ""; repository: ""; revision: ""; commit: ""; checksum: "" } }
+function readPins(root: Text, refresh: Text): List<Pin> {
+    let result: List<Pin> = []
+    let path = root + "/Minyar.lock"
+    if !host.isFile(path) { return result }
+    let pin = emptyPin()
+    let keys: List<Text> = []
+    let header = false
+    for original in host.lines(host.readText(path)) {
+        let line = host.strip(withoutComment(original))
+        if line == "" { continue }
+        if !header {
+            if line != "version = 1" && line != "version = 2" { host.stop("unsupported Minyar.lock format; regenerate it with minyar build") }
+            header = true
+            continue
+        }
+        if line == "[[package]]" {
+            if pin.repository != "" && pin.name != refresh { result.add(pin) }
+            pin = emptyPin(); keys = []
+            continue
+        }
+        let separator = host.findText(line, "=", 0)
+        if separator < 0 { host.stop("invalid Minyar.lock entry") }
+        let key = host.strip(host.textSlice(line, 0, separator))
+        if host.listed(keys, key) { host.stop("duplicate Minyar.lock key: " + key) }
+        keys.add(key)
+        let value = unquote(host.strip(host.textSlice(line, separator + 1, line.byteLength)), path)
+        if key == "name" { pin.name = value }
+        else if key == "source" { pin.repository = git.repository(value) }
+        else if key == "rev" { pin.revision = value }
+        else if key == "commit" { pin.commit = value }
+        else if key == "checksum" { pin.checksum = value }
+        else if key != "version" && key != "path" && key != "manifest" { host.stop("unknown Minyar.lock key: " + key) }
+    }
+    if pin.repository != "" && pin.name != refresh { result.add(pin) }
+    for item in result {
+        if !validName(item.name) || !git.validRevision(item.revision) || !git.hexadecimal(item.commit, 40) || !git.hexadecimal(item.checksum, 64) { host.stop("incomplete Git package pin in Minyar.lock") }
+    }
+    return result
+}
+function remote(name: Text, repository: Text, revision: Text, resolution: Resolution): Manifest {
+    let chosen = revision
+    // A compatible lock is the starting build list. New requirements may only
+    // increase it; ordinary builds never float a branch or a release tag.
+    for pin in resolution.pins {
+        if pin.name == name && pin.repository == repository && git.compatible(pin.revision, chosen) {
+            if pin.revision == chosen || (git.semver(chosen) && git.compare(pin.revision, chosen) >= 0) { chosen = pin.revision }
+        }
+    }
+    let selected = false
+    for item in resolution.selections {
+        if item.name != name { continue }
+        selected = true
+        if item.repository != repository { host.stop("dependency name conflict: " + name + " is requested from both " + item.repository + " and " + repository) }
+        if !git.compatible(item.revision, chosen) { host.stop("dependency version conflict: " + name + " needs both " + item.revision + " and " + chosen + "; use one major version or one branch throughout the graph") }
+        if git.semver(chosen) && git.compare(chosen, item.revision) > 0 { item.revision = chosen; resolution.changed = true }
+        chosen = item.revision
+    }
+    if !selected { resolution.selections.add(Selection { name: name; repository: repository; revision: chosen }) }
+    let commit = ""
+    let checksum = ""
+    for pin in resolution.pins {
+        if pin.name == name && pin.repository == repository && pin.revision == chosen { commit = pin.commit; checksum = pin.checksum }
+    }
+    if resolution.locked && commit == "" { host.stop("Minyar.lock is missing or out of date; run minyar build without --locked") }
+    let source = git.fetch(repository, chosen, commit, checksum, resolution.offline)
+    let package = read(source.root)
+    package.source = repository; package.revision = source.revision; package.commit = source.commit; package.checksum = source.checksum
+    if git.semver(source.revision) {
+        if !git.semver(package.version) || git.compare(source.revision, package.version) != 0 { host.stop("Git tag " + source.revision + " disagrees with package.version = " + package.version + " in " + repository) }
+    }
+    return package
+}
+function visit(graph: Graph, package: Manifest, resolution: Resolution) {
+    let root = package.root
     if host.listed(graph.active, root) { host.stop("dependency cycle: " + host.joined(graph.active, " -> ") + " -> " + root) }
     for package in graph.packages { if package.root == root { return } }
-    let package = candidate
-    if root != candidate.root { package = read(root) }
     for previous in graph.packages {
-        if previous.name == package.name { host.stop("dependency name conflict: " + package.name + " resolves to both " + previous.root + " and " + root) }
+        if previous.name == package.name {
+            if previous.source != "" && previous.source == package.source { return }
+            host.stop("dependency name conflict: " + package.name + " resolves to both " + previous.root + " and " + root)
+        }
     }
     graph.packages.add(package)
     graph.active.add(root)
@@ -152,20 +267,35 @@ function visit(graph: Graph, root: Text, candidate: Manifest) {
         let index = 0
         while package.dependencies[index] != name { index += 1 }
         let path = package.paths[index]
-        if !path.startsWith("/") { path = root + "/" + path }
-        let dependency = read(host.resolveName(path))
+        let dependency = manifest("", "", "", "")
+        if package.repositories[index] != "" { dependency = remote(name, package.repositories[index], package.revisions[index], resolution) }
+        else {
+            if package.source != "" { host.stop("Git package " + package.name + " contains a local path dependency; publish every dependency as a Git source") }
+            if !path.startsWith("/") { path = root + "/" + path }
+            dependency = read(host.resolveName(path))
+        }
         if dependency.name != name { host.stop("dependency " + name + " has package.name = " + host.jsonText(dependency.name)) }
         if !hasLibrary(dependency) { host.stop("dependency " + name + " needs a library export at src/" + name + ".min") }
-        visit(graph, dependency.root, candidate)
+        visit(graph, dependency, resolution)
     }
     graph.active.pop()
 }
-public function resolvePackage(package: Manifest): Graph {
-    let graph = Graph { packages: []; active: [] }
-    visit(graph, package.root, package)
-    return graph
+function resolved(package: Manifest, locked: Boolean, offline: Boolean, refresh: Text): Graph {
+    if locked && !host.isFile(package.root + "/Minyar.lock") { host.stop("Minyar.lock is missing or out of date; run minyar build without --locked") }
+    let resolution = Resolution { pins: readPins(package.root, refresh); selections: []; changed: false; locked: locked; offline: offline }
+    for round in 0..128 {
+        resolution.changed = false
+        let graph = Graph { packages: []; active: [] }
+        visit(graph, package, resolution)
+        if !resolution.changed { return graph }
+    }
+    host.stop("dependency selection did not converge after 128 rounds; simplify the version requirements")
+    return Graph { packages: []; active: [] }
 }
+public function resolvePackage(package: Manifest): Graph { return resolved(package, false, false, "") }
+public function resolveModified(package: Manifest, name: Text, offline: Boolean): Graph { return resolved(package, false, offline, name) }
 public function resolve(root: Text): Graph { return resolvePackage(read(root)) }
+public function resolveWith(root: Text, locked: Boolean, offline: Boolean): Graph { return resolved(read(root), locked, offline, "") }
 public function relative(root: Text, path: Text): Text {
     let from = root.split("/")
     let to = path.split("/")
@@ -186,8 +316,12 @@ public function atomicWrite(path: Text, content: Text) {
 public function lock(graph: Graph, locked: Boolean) {
     let root = graph.packages[0].root
     let content = "# Generated by minyar. Local sources remain editable.\nversion = 1\n"
+    for package in graph.packages { if package.source != "" { content = "# Generated by minyar. Git sources are verified with SHA-256.\nversion = 2\n"; break } }
     for package in graph.packages {
-        content += "\n[[package]]\nname = " + host.jsonText(package.name) + "\nversion = " + host.jsonText(package.version) + "\npath = " + host.jsonText(relative(root, package.root)) + "\nmanifest = " + host.jsonText(host.hashFile(package.root + "/Minyar.toml")) + "\n"
+        content += "\n[[package]]\nname = " + host.jsonText(package.name) + "\nversion = " + host.jsonText(package.version) + "\n"
+        if package.source == "" { content += "path = " + host.jsonText(relative(root, package.root)) + "\n" }
+        else { content += "source = " + host.jsonText(package.source) + "\nrev = " + host.jsonText(package.revision) + "\ncommit = " + host.jsonText(package.commit) + "\nchecksum = " + host.jsonText(package.checksum) + "\n" }
+        content += "manifest = " + host.jsonText(host.hashFile(package.root + "/Minyar.toml")) + "\n"
     }
     let path = root + "/Minyar.lock"
     if host.isFile(path) && host.readText(path) == content { return }
@@ -199,7 +333,10 @@ public function render(package: Manifest): Text {
     if package.kind != "" { result += "kind = " + host.jsonText(package.kind) + "\n" }
     result += "\n[dependencies]\n"
     for index in 0..package.dependencies.length {
-        result += package.dependencies[index] + " = { path = " + host.jsonText(package.paths[index]) + " }\n"
+        result += package.dependencies[index] + " = { "
+        if package.repositories[index] == "" { result += "path = " + host.jsonText(package.paths[index]) }
+        else { result += "git = " + host.jsonText(package.repositories[index]) + ", rev = " + host.jsonText(package.revisions[index]) }
+        result += " }\n"
     }
     return result
 }

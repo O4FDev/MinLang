@@ -1,0 +1,143 @@
+// The public github.com install route, entirely against local bare repositories.
+use "../tools/testing.min" as test
+use "../tools/package-git.min" as packages
+use "../tools/driver-support.min" as host
+use "process" as process
+use "system" as system
+use "io" as io
+use "files" as files
+
+record Fixture { launcher: Text; root: Text; environment: List<Text>; serial: Integer }
+function command(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    fixture.serial += 1
+    return test.run(arguments, fixture.environment, directory, fixture.root + "/command-" + Text(fixture.serial), 180)
+}
+function require(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    let result = command(fixture, arguments, directory)
+    test.require(result, host.joined(arguments, " "))
+    return result
+}
+function cli(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
+    return require(fixture, host.extended([fixture.launcher], arguments), directory)
+}
+function rejected(fixture: Fixture, arguments: List<Text>, directory: Text, message: Text) {
+    let result = command(fixture, host.extended([fixture.launcher], arguments), directory)
+    test.check(result.status != 0 && test.contains(result.errorOutput, message), "expected " + message + "\n" + result.output + result.errorOutput)
+}
+function git(fixture: Fixture, directory: Text, arguments: List<Text>): Text {
+    return require(fixture, host.extended(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Minyar tests", "-c", "user.email=minyar@example.invalid", "-C", directory], arguments), fixture.root).output
+}
+function commit(fixture: Fixture, directory: Text, version: Text) {
+    git(fixture, directory, ["add", "."])
+    git(fixture, directory, ["commit", "--quiet", "-m", "feat(package): release " + version])
+    git(fixture, directory, ["tag", "v" + version])
+}
+function makePackage(fixture: Fixture, name: Text, version: Text, source: Text, dependencies: Text): Text {
+    let root = fixture.root + "/sources/" + name
+    host.makeDirectories(root + "/src")
+    io.writeTextFile(root + "/Minyar.toml", "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\nkind = \"lib\"\n\n[dependencies]\n" + dependencies)
+    io.writeTextFile(root + "/src/" + name + ".min", source)
+    git(fixture, root, ["init", "--quiet", "--initial-branch=main"])
+    return root
+}
+function mirror(fixture: Fixture, name: Text, root: Text) {
+    host.makeDirectories(fixture.root + "/mirror/github.com/O4FDev")
+    require(fixture, ["git", "clone", "--bare", "--quiet", "--no-hardlinks", root, fixture.root + "/mirror/github.com/O4FDev/" + name + ".git"], fixture.root)
+}
+function dependency(name: Text, revision: Text): Text { return name + " = { git = \"github.com/O4FDev/" + name + "\", rev = \"" + revision + "\" }\n" }
+let root = test.scratch()
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !entry.startsWith("MINYAR_HOME=") && !entry.startsWith("MINYAR_GIT_MIRROR=") && !entry.startsWith("GIT_") { environment.add(entry) }
+}
+environment.add("MINYAR_HOME=" + root + "/home with spaces")
+environment.add("MINYAR_GIT_MIRROR=" + root + "/mirror")
+environment.add("GIT_CONFIG_NOSYSTEM=1")
+environment.add("GIT_CONFIG_GLOBAL=/dev/null")
+let fixture = Fixture { launcher: process.argument(0); root: root; environment: environment; serial: 0 }
+test.check(packages.semver("v0.10.0") && !packages.semver("v01.0.0") && !packages.semver("v1.0.0-beta"), "canonical stable semver")
+test.check(packages.compare("v0.10.0", "v0.2.0") > 0, "numeric version comparison")
+for path in ["../escape", "/escape", "src/../escape", "src//file", "src/.git/config", "src/.GIT/config", "src\\escape", "src/\nfile", "C:escape"] { test.check(!packages.safePath(path), "reject unsafe source path " + path) }
+test.check(packages.safePath("src/café.min"), "Unicode source paths")
+
+let leaf = makePackage(fixture, "leaf", "0.1.0", "public function answer(): Integer { return 10 }\n", "")
+// Executable files are data. This script must never be run during an install.
+io.writeTextFile(leaf + "/install.sh", "#!/bin/sh\ntouch SHOULD_NOT_EXIST\n")
+require(fixture, ["chmod", "755", leaf + "/install.sh"], root)
+commit(fixture, leaf, "0.1.0")
+io.writeTextFile(leaf + "/Minyar.toml", "[package]\nname = \"leaf\"\nversion = \"0.2.0\"\nkind = \"lib\"\n")
+io.writeTextFile(leaf + "/src/leaf.min", "public function answer(): Integer { return 20 }\n")
+commit(fixture, leaf, "0.2.0")
+io.writeTextFile(leaf + "/Minyar.toml", "[package]\nname = \"leaf\"\nversion = \"0.10.0\"\nkind = \"lib\"\n")
+io.writeTextFile(leaf + "/src/leaf.min", "public function answer(): Integer { return 100 }\n")
+commit(fixture, leaf, "0.10.0")
+git(fixture, leaf, ["tag", "v99.0.0-preview"])
+let head = host.strip(git(fixture, leaf, ["rev-parse", "HEAD"]))
+mirror(fixture, "leaf", leaf)
+let geometry = makePackage(fixture, "geometry", "0.1.0", "use \"leaf\" as leaf\npublic function answer(): Integer { return leaf.answer() }\n", dependency("leaf", "v0.1.0"))
+commit(fixture, geometry, "0.1.0"); mirror(fixture, "geometry", geometry)
+let shapes = makePackage(fixture, "shapes", "0.1.0", "use \"leaf\" as leaf\npublic function answer(): Integer { return leaf.answer() }\n", dependency("leaf", "v0.2.0"))
+commit(fixture, shapes, "0.1.0"); mirror(fixture, "shapes", shapes)
+let application = root + "/application with spaces"
+cli(fixture, ["new", application, "--name", "art"], root)
+cli(fixture, ["add", "github.com/O4FDev/geometry"], application)
+cli(fixture, ["add", "github.com/O4FDev/shapes@v0.1.0"], application + "/src")
+io.writeTextFile(application + "/src/main.min", "use \"geometry\" as geometry\nuse \"shapes\" as shapes\nprint(geometry.answer() + shapes.answer())\n")
+let lock = io.readTextFile(application + "/Minyar.lock")
+test.check(test.contains(lock, "version = 2") && test.contains(lock, "rev = \"v0.2.0\"") && test.contains(lock, "checksum = \""), "lock pins the minimally selected transitive release")
+test.check(!test.contains(lock, "/home with spaces"), "lockfile contains no global cache paths")
+test.check(test.contains(cli(fixture, ["run", "--locked", "--offline"], application).output, "40\n"), "debug diamond graph uses the highest requested minimum")
+test.check(test.contains(cli(fixture, ["run", "--release", "--locked", "--offline"], application).output, "40\n"), "release diamond graph")
+test.check(!io.fileExists(application + "/SHOULD_NOT_EXIST") && !io.fileExists(leaf + "/SHOULD_NOT_EXIST"), "install scripts never run")
+let original = io.readTextFile(application + "/Minyar.toml")
+cli(fixture, ["add", "https://github.com/O4FDev/leaf.git"], application)
+test.check(test.contains(io.readTextFile(application + "/Minyar.toml"), "rev = \"v0.10.0\""), "latest stable tag uses numeric semver ordering")
+let pinned = root + "/pinned"
+cli(fixture, ["new", pinned], root)
+cli(fixture, ["add", "github.com/O4FDev/leaf@" + head], pinned)
+test.check(test.contains(io.readTextFile(pinned + "/Minyar.lock"), "commit = \"" + head + "\""), "explicit commit pin")
+cli(fixture, ["add", "github.com/O4FDev/leaf@main"], pinned)
+cli(fixture, ["tree", "--locked", "--offline"], pinned)
+// Branch and semver requests cannot silently replace each other.
+rejected(fixture, ["add", "github.com/O4FDev/leaf@main"], application, "dependency version conflict")
+test.check(test.contains(io.readTextFile(application + "/Minyar.toml"), "rev = \"v0.10.0\""), "failed resolution preserves manifest")
+// Restore the diamond, including its lock, then remove every remote source.
+io.writeTextFile(application + "/Minyar.toml", original)
+io.writeTextFile(application + "/Minyar.lock", lock)
+test.check(files.rename(root + "/mirror", root + "/mirror-away") == 0, "take the Git host offline")
+cli(fixture, ["run", "--offline", "--locked"], application)
+test.check(io.readTextFile(application + "/Minyar.lock") == lock, "offline locked run preserves lock bytes")
+let moved = root + "/relocated"
+test.check(files.rename(application, moved) == 0, "move project independently of cache")
+cli(fixture, ["metadata", "--locked", "--offline"], moved)
+test.check(io.readTextFile(moved + "/Minyar.lock") == lock, "Git lock remains relocatable")
+// Locate the selected leaf cache by its source, then corrupt a byte.
+let cacheRoot = root + "/home with spaces/packages/sha256"
+let corrupted = ""
+for name in files.list(cacheRoot) {
+    let path = cacheRoot + "/" + name + "/src/leaf.min"
+    if io.fileExists(path) && test.contains(io.readTextFile(path), "return 20") { corrupted = path }
+}
+test.check(corrupted != "", "selected leaf is in content-addressed cache")
+let bytes = io.readTextFile(corrupted)
+io.writeTextFile(corrupted, bytes + "// changed\n")
+rejected(fixture, ["tree", "--locked", "--offline"], moved, "checksum mismatch")
+rejected(fixture, ["tree", "--offline"], moved, "checksum mismatch")
+io.writeTextFile(corrupted, bytes)
+io.writeTextFile(moved + "/Minyar.toml", original + dependency("uncached", "v0.1.0"))
+rejected(fixture, ["tree", "--locked", "--offline"], moved, "out of date")
+rejected(fixture, ["tree", "--offline"], moved, "not cached")
+io.writeTextFile(moved + "/Minyar.toml", original)
+test.check(files.rename(root + "/mirror-away", root + "/mirror") == 0, "restore local host")
+let malicious = makePackage(fixture, "malicious", "0.1.0", "public function answer(): Integer { return 1 }\n", "")
+require(fixture, ["ln", "-s", "../../outside", malicious + "/src/escape"], root)
+commit(fixture, malicious, "0.1.0"); mirror(fixture, "malicious", malicious)
+rejected(fixture, ["add", "github.com/O4FDev/malicious"], moved, "symlinks and submodules")
+let native = makePackage(fixture, "unsafe", "0.1.0", "public function answer(): Integer { native \"surprise\" }\n", "")
+commit(fixture, native, "0.1.0"); mirror(fixture, "unsafe", native)
+rejected(fixture, ["add", "github.com/O4FDev/unsafe"], moved, "cannot declare native")
+let local = makePackage(fixture, "escape", "0.1.0", "public function answer(): Integer { return 1 }\n", "leaf = { path = \"../../outside\" }\n")
+commit(fixture, local, "0.1.0"); mirror(fixture, "escape", local)
+rejected(fixture, ["add", "github.com/O4FDev/escape"], moved, "local path dependency")
+test.check(io.readTextFile(moved + "/Minyar.toml") == original, "all unsafe additions preserve the project")
+print("Git packages: semver, exact commits, MVS, O0/O2, offline locks, relocation, tamper and source policy passed")

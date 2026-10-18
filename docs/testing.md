@@ -22,6 +22,12 @@ The project CLI gate also covers binary and library packages named `main`,
 legacy manifest inference, relocating sibling dependencies with `--locked`,
 and installation/replacement/removal of owned macOS debug symbols.
 
+`make check-package-git` exercises the exact `github.com/...` install route
+against private local bare repositories. It covers stable semver selection,
+tag/branch/commit locks, transitive minimal version selection, O0/O2 execution,
+offline cache use, relocation, checksum failures and unsafe source rejection.
+It never needs network access or changes global Git configuration.
+
 `make check-nitpick-language` checks captured-binding assignment diagnostics,
 callback calls through fields, containers and returned expressions, callee
 lifetime during argument mutation, and literal-condition return analysis.
