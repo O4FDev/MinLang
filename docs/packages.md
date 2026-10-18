@@ -50,6 +50,10 @@ compatibility deliberately.
 Ordinary builds retain exact commits from the lock, even when a branch moves.
 Repeat `add ...@main` to deliberately refresh a branch. Repeat a bare `add` to
 discover the latest release. Locked tags remain immutable in the local cache.
+Discovery is reused throughout the same `add`, including branch pins; it does
+not download the same source again during graph resolution. A discovered stable
+release is also cached under its tag for later offline additions. If a host moves
+an already cached release tag, fresh latest discovery rejects the changed release.
 Local path dependencies remain editable and retain their existing graph-lock
 behavior. `add` and `remove` rewrite supported manifest fields and comments.
 
