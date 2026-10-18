@@ -101,7 +101,9 @@ associate left to right. Thus `1 << 2 + 1` is `1 << (2 + 1)` and
 There is one equality operator: `==`. It never converts either side. Both sides
 must have the same type, and values compare by meaning—`Text` compares its
 contents. `!=` is its direct opposite. Ordered comparisons accept `Integer`,
-`Float` or `Character` operands. Arithmetic accepts `Integer` or `Float`
+`Float`, `Character`, `Boolean`, `Text` or Ordered records. Boolean orders
+`false` before `true`; Text uses the lexicographic order of natural List sorting.
+Arithmetic accepts `Integer` or `Float`
 operands; `+` also joins two `Text` values. These operators never coerce
 Boolean values into numbers. A NaN Float is unequal to everything, itself
 included.
