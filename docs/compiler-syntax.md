@@ -8,9 +8,10 @@ token ranges when those ranges are available.
 
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations
-again. Its body parser still consumes tokens. Migration to tree consumers is
-staged, so declaration discovery and some ownership lookahead helpers still
-scan tokens.
+again. Initial record and constant name collection also walks those nodes in
+ordinary and cached-interface compilation; the duplicate discovery scanners
+have been removed. Header type checking and body emission still consume
+tokens, as do some ownership lookahead helpers.
 
 ## Representation
 
