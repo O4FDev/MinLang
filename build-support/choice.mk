@@ -1,7 +1,14 @@
+# The core declaration remains ordinary Minyar source; embedding avoids a runtime
+# dependency on the compiler's working directory or a particular library path.
+build/choice-builtins.min: library/maybe.min build-support/choice.mk | build
+	python3 -c 'import json, sys; from pathlib import Path; print("function builtinMaybeSource(): Text { return " + json.dumps(Path(sys.argv[1]).read_text(), ensure_ascii=False) + " }")' "$<" > "$@.tmp"
+	mv "$@.tmp" "$@"
+
 .PHONY: check-choice-identifiers check-choice check-choice-sanitize
 
 check-choice-identifiers: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-identifiers
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-identifiers"
+
 
 check-choice: build/minyarc build/minyar-runtime.o build/tooling/tests/choice
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice"

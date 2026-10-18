@@ -1,0 +1,235 @@
+function genericChoiceCases(declaration: GenericDeclaration): List<Text> {
+    let empty: List<Text> = []
+    if declaration.kind != 2 || declaration.names.length == 0 || !resultPrefix(declaration.names[0], "minyar_choice_tag|") { return empty }
+    return declaration.names[0].split("|")
+}
+
+function genericChoiceFields(declaration: GenericDeclaration, name: Text): List<Integer> {
+    let fields: List<Integer> = []
+    let prefix = "minyar_choice_payload|" + name + "|"
+    let field = 1
+    while field < declaration.names.length {
+        if resultPrefix(declaration.names[field], prefix) { fields.add(field) }
+        field = field + 1
+    }
+    return fields
+}
+
+function genericChoiceOwns(scope: GenericScope, name: Text): Boolean {
+    let position = scope.active - 1
+    while position >= 0 {
+        if scope.names[position] == name { return true }
+        position = position - 1
+    }
+    return false
+}
+
+function genericChoiceConstructor(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, expected: Integer, depth: Integer): Integer {
+    let position = cursor[0]
+    let token = stream.texts[position]
+    if stream.kinds[position] != 1 { return -1 }
+    let declaration = genericDeclaration(program, token, 2)
+    if declaration >= 0 && stream.texts[position + 1] == "{" && genericChoiceCases(program.declarations[declaration]).length == 0 { return -1 }
+    let qualified = declaration >= 0 && (stream.texts[position + 1] == "." || genericHeaderFollows(stream.kinds, stream.texts, position, "."))
+    if qualified { qualified = genericChoiceCases(program.declarations[declaration]).length > 0 }
+    if !qualified {
+        if (token == "Ok" || token == "Err") && expected > 0 && program.types[expected].name == "Result" && genericDeclaration(program, "Result", 2) < 0 { return -1 }
+        if token[0] < 'A' || token[0] > 'Z' || isBuiltinName(token) || genericChoiceOwns(scope, token) || genericScopeType(program, scope, token) > 0 || genericDeclaration(program, token, 1) >= 0 { return -1 }
+        declaration = -1
+        if expected > 0 {
+            let contextual = genericDeclaration(program, program.types[expected].name, 2)
+            if contextual >= 0 && findText(genericChoiceCases(program.declarations[contextual]), token) > 0 { declaration = contextual }
+        }
+        if declaration < 0 {
+            let index = 0
+            let builtin = -1
+            while index < program.declarations.length {
+                let candidate = program.declarations[index]
+                if findText(genericChoiceCases(candidate), token) > 0 {
+                    if candidate.name == "Maybe" && tokenPath(program.source.lines, candidate.start) == "library/maybe.min" { builtin = index } else {
+                        if tokenPath(program.source.lines, candidate.start) == tokenPath(stream.lines, position) {
+                            if declaration >= 0 { genericError(stream, position, "ambiguous choice case '" + token + "'; qualify it with its choice type") }
+                            declaration = index
+                        }
+                    }
+                }
+                index = index + 1
+            }
+            if declaration < 0 { declaration = builtin }
+        }
+        if declaration < 0 { return -1 }
+    }
+    let signature = program.declarations[declaration]
+    let bindings = genericBindings(signature)
+    if expected > 0 && program.types[expected].name == signature.name { bindings = program.types[expected].arguments }
+    let name = token
+    cursor[0] = position + 1
+    if stream.texts[cursor[0]] == "<" { bindings = genericArgumentTypes(program, stream, cursor) }
+    if qualified {
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, ".")
+        name = stream.texts[cursor[0]]
+        cursor[0] = cursor[0] + 1
+    }
+    if findText(genericChoiceCases(signature), name) < 1 { genericError(stream, position, "unknown choice case '" + name + "'") }
+    let nameEnd = cursor[0]
+    if bindings.length != signature.variables.length { genericInstantiate(program, stream, position, declaration, bindings) }
+    let fields = genericChoiceFields(signature, name)
+    if fields.length > 0 || stream.texts[cursor[0]] == "(" {
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, "(")
+        let field = 0
+        while field < fields.length {
+            if field > 0 { expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",") }
+            let wanted = genericSubstitute(program, signature.types[fields[field]], signature.variables, bindings, 0)
+            let actual = genericExpression(program, stream, cursor, scope, wanted, 0, depth + 1)
+            genericUnify(program, stream, position, signature.types[fields[field]], actual, signature.variables, bindings, 0)
+            field = field + 1
+        }
+        if fields.length > 0 && stream.texts[cursor[0]] == "," { cursor[0] = cursor[0] + 1 }
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, ")")
+    }
+    let type = genericType(program, signature.name, bindings)
+    let concrete = genericEmitType(program, stream, position, type, 0)
+    stream.replacements[position] = concrete + "." + name
+    stream.ends[position] = nameEnd
+    return type
+}
+
+function genericChoicePayloads(program: GenericProgram, input: Integer, name: Text): List<Integer> {
+    let payloads: List<Integer> = []
+    if input == 0 { return payloads }
+    let shape = program.types[input]
+    if shape.name == "Result" && genericDeclaration(program, shape.name, 2) < 0 {
+        let field = 0
+        if name == "Err" { field = 1 }
+        if shape.arguments.length == 2 { payloads.add(shape.arguments[field]) }
+        return payloads
+    }
+    let record = genericDeclaration(program, shape.name, 2)
+    if record < 0 { return payloads }
+    let declaration = program.declarations[record]
+    let fields = genericChoiceFields(declaration, name)
+    let index = 0
+    while index < fields.length {
+        payloads.add(genericSubstitute(program, declaration.types[fields[index]], declaration.variables, shape.arguments, 0))
+        index = index + 1
+    }
+    return payloads
+}
+
+function genericChoiceMatch(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, expected: Integer, depth: Integer, expression: Boolean): Integer {
+    cursor[0] = cursor[0] + 1
+    let input = genericExpression(program, stream, cursor, scope, 0, 0, depth + 1)
+    expectToken(stream.kinds, stream.texts, stream.lines, cursor, "{")
+    skipTerminators(stream.kinds, cursor)
+    let result = expected
+    while stream.texts[cursor[0]] != "}" {
+        let arm = stream.texts[cursor[0]]
+        cursor[0] = cursor[0] + 1
+        let active = scope.active
+        let payloads = genericChoicePayloads(program, input, arm)
+        if stream.texts[cursor[0]] == "(" {
+            cursor[0] = cursor[0] + 1
+            let field = 0
+            while stream.texts[cursor[0]] != ")" {
+                let payload = 0
+                if field < payloads.length { payload = payloads[field] }
+                genericScopeAdd(scope, stream.texts[cursor[0]], payload)
+                cursor[0] = cursor[0] + 1
+                if stream.texts[cursor[0]] == "," { cursor[0] = cursor[0] + 1 }
+                field = field + 1
+            }
+            cursor[0] = cursor[0] + 1
+        }
+        if expression {
+            expectToken(stream.kinds, stream.texts, stream.lines, cursor, "{")
+            skipTerminators(stream.kinds, cursor)
+            let actual = genericExpression(program, stream, cursor, scope, result, 0, depth + 1)
+            if result == 0 { result = actual }
+            skipTerminators(stream.kinds, cursor)
+            expectToken(stream.kinds, stream.texts, stream.lines, cursor, "}")
+        } else { genericBlock(program, stream, cursor, scope, depth + 1) }
+        scope.active = active
+        skipTerminators(stream.kinds, cursor)
+    }
+    cursor[0] = cursor[0] + 1
+    return result
+}
+
+function genericChoiceMemberCall(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, receiver: Integer, member: Text, depth: Integer): Integer {
+    if receiver == 0 || stream.texts[cursor[0]] != "(" { return -1 }
+    let shape = program.types[receiver]
+    let record = genericDeclaration(program, shape.name, 2)
+    if record >= 0 && findText(program.declarations[record].names, member) >= 0 { return -1 }
+    let parameters: List<Integer> = []
+    let result = genericMemberType(program, receiver, member)
+    let handled = false
+    let method = genericDeclaration(program, methodFunctionName(shape.name, member), 1)
+    if method < 0 { method = genericDeclaration(program, methodFunctionName(shape.name, member + "$private"), 1) }
+    if method >= 0 {
+        let signature = program.declarations[method]
+        if signature.variables.length != 0 { return -1 }
+        let index = 1
+        while index < signature.types.length { parameters.add(signature.types[index]); index = index + 1 }
+        result = signature.result
+        handled = true
+    } else {
+        if (shape.name == "List" || shape.name == "Set") && shape.arguments.length == 1 {
+            if member == "add" || member == "appended" || member == "has" || member == "remove" {
+                parameters.add(shape.arguments[0])
+                if member == "add" { result = genericNamedType(program, "Nothing") }
+                handled = true
+            }
+            if member == "sortBy" || member == "sortedBy" {
+                parameters.add(genericType(program, "Callback", [shape.arguments[0], shape.arguments[0], genericNamedType(program, "Integer")]))
+                if member == "sortBy" { result = genericNamedType(program, "Nothing") }
+                handled = true
+            }
+        }
+        if shape.name == "Map" && shape.arguments.length == 2 && (member == "has" || member == "remove") { parameters.add(shape.arguments[0]); handled = true }
+        if shape.name == "Text" && (member == "find" || member == "split" || member == "startsWith" || member == "endsWith") { parameters.add(genericNamedType(program, "Text")); handled = true }
+    }
+    if !handled { return -1 }
+    cursor[0] = cursor[0] + 1
+    let argument = 0
+    while stream.texts[cursor[0]] != ")" {
+        let wanted = 0
+        if argument < parameters.length { wanted = parameters[argument] }
+        genericExpression(program, stream, cursor, scope, wanted, 0, depth + 1)
+        argument = argument + 1
+        if stream.texts[cursor[0]] != ")" { expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",") }
+    }
+    cursor[0] = cursor[0] + 1
+    return result
+}
+
+function normalizeMaybePrelude(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): ResultTokenSet {
+    let needed = false
+    let defined = false
+    let position = 0
+    while position + 1 < kinds.length {
+        if kinds[position] == 1 && (texts[position] == "Maybe" || texts[position] == "Some" || texts[position] == "None") { needed = true }
+        if kinds[position] == 1 && (texts[position] == "choice" || texts[position] == "record") && texts[position + 1] == "Maybe" { defined = true }
+        position = position + 1
+    }
+    if !needed || defined { return ResultTokenSet { kinds: kinds; texts: texts; lines: lines } }
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    outputLines.features = lines.features
+    if outputLines.features / 256 % 2 == 0 { outputLines.features = outputLines.features + 256 }
+    let declarationKinds: List<Integer> = []
+    let declarationTexts: List<Text> = []
+    let declarationLines = newSourceMap()
+    tokenize(builtinMaybeSource(), declarationKinds, declarationTexts, declarationLines)
+    position = 0
+    while position + 1 < declarationKinds.length {
+        if declarationTexts[position] != "public" { copyModuleToken(outputKinds, outputTexts, outputLines, declarationKinds[position], declarationTexts[position], declarationLines, position, sourcePath(outputLines, "library/maybe.min")) }
+        position = position + 1
+    }
+    position = 0
+    while position < kinds.length {
+        choiceCopy(outputKinds, outputTexts, outputLines, kinds[position], texts[position], lines, position)
+        position = position + 1
+    }
+    return ResultTokenSet { kinds: outputKinds; texts: outputTexts; lines: outputLines }
+}

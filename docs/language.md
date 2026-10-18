@@ -582,9 +582,10 @@ let area = match shape {
 }
 ```
 
-`Maybe<T>` carries either `Some(value)` or `None`. An annotation, parameter or
-return type supplies `T`; explicit constructors such as `Some<Text>("moon")`
-and `None<Text>()` work when no context supplies it:
+`Maybe<T>` carries either `Some(value)` or `None`. A payload can supply `T`,
+as in `Some("moon")`; an annotation, parameter or return type can supply it
+for `None`. Explicit constructors such as `Some<Text>("moon")`, `None<Text>()`
+and `Maybe<Text>.None` also work:
 
 ```minyar
 function first(words: List<Text>): Maybe<Text> {
@@ -598,13 +599,32 @@ let greeting = match first(["hello"]) {
 print(greeting)
 ```
 
+Choices can have type parameters. Construction infers them from payloads or
+context, or accepts explicit types:
+
+```minyar
+choice Tree<Item> {
+    Leaf(value: Item)
+    Branch(children: List<Tree<Item>>)
+    Empty
+}
+let tree: Tree<Text> = Branch([Leaf("moon"), Empty])
+let number = Tree<Integer>.Leaf(42)
+```
+
+Each concrete choice type is compiled separately, using the same
+monomorphisation as generic functions. `Maybe` is an ordinary generic choice
+declared in `library/maybe.min`; its source declaration is available without an
+import. Local declarations retain their names, including a local case named
+`Some` or a function named `Some`. Qualify a constructor or provide its expected
+type when case names overlap.
+
 Choices currently share the record representation and automatic memory
 management. Each value allocates a tag and slots for all declared payloads;
 inactive slots are empty. This includes choices with no payloads. Payloads can
 hold choices, records, Lists and callbacks, with the same ownership and cycle
 analysis as records. Cases and payload fields are accessed through constructors
-and matching. Generic user choices and nested or literal patterns are not yet
-supported.
+and matching. Nested or literal patterns are not yet supported.
 
 ## Maps and Sets
 

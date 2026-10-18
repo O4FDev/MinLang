@@ -1,4 +1,5 @@
-COMPILER_SOURCES = compiler/stages/source.min \
+COMPILER_SOURCES = build/choice-builtins.min \
+	compiler/stages/source.min \
 	compiler/stages/syntax.min \
 	compiler/stages/lexer.min \
 	compiler/stages/symbols.min \
@@ -26,6 +27,7 @@ COMPILER_SOURCES = compiler/stages/source.min \
 	compiler/generic-compiler.min \
 	compiler/errors-compiler.min \
 	compiler/choice-compiler.min \
+	compiler/choice-generic.min \
 	compiler/calldepth-compiler.min \
 	compiler/thread-compiler.min \
 	compiler/compiler.min
