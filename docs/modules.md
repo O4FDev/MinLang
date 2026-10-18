@@ -185,6 +185,15 @@ matching Value on success; read its `text`, `truth` or `number` field as
 appropriate. Duplicate keys use the first match; use `parseUnique` to reject
 duplicates. Existing `member` and `string` remain permissive convenience APIs.
 
+`parseUnique` retains its metadata policy of 64 Ki characters, 4,096 values and
+256 members per object; `parseUniqueBytes` also caps wire bytes at 64 KiB.
+For a larger protocol document, `parseUniqueBytesWithin(bytes, maximumBytes,
+maximumValues, maximumMembers)` takes explicit positive budgets. Values include
+the root and every child; the member budget applies separately to each object.
+UTF-8, Unicode escapes, nesting and decoded duplicate-name checks remain strict.
+The byte limit bounds the wire document; it is not an allocation-byte limit.
+Callers must choose limits appropriate to their protocol.
+
 ## Scalability and rebuilds
 
 Ordinary builds compile the complete reachable source graph. The opt-in
