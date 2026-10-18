@@ -12,6 +12,10 @@ argument lifetime, shared mutation, callable fields and rejection diagnostics.
 It runs the methods gallery and ownership assertions at O0/O2.
 `check-methods-sanitize` repeats these checks with ASan/UBSan.
 
+Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
+(an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
+hang detection; it never changes what a test asserts.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit

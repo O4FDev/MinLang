@@ -1,6 +1,8 @@
 use "io" as io
 use "system" as system
 use "files" as files
+use "text" as text
+use "errors" as errors
 
 public function resolvePath(path: Text): Text { native "testinghost" }
 public function selfPath(): Text { native "testinghost" }
@@ -53,6 +55,15 @@ public function setting(name: Text, fallback: Text): Text {
     if value == "" { return fallback }
     return value
 }
+// MINYAR_TEST_TIMEOUT_SCALE (1-20, default 1) multiplies every process limit for heavily loaded machines.
+public function scaledSeconds(seconds: Integer): Integer {
+    let configured = setting("MINYAR_TEST_TIMEOUT_SCALE", "1")
+    let parsed = text.parseInteger(configured)
+    check(errors.integerOk(parsed), "MINYAR_TEST_TIMEOUT_SCALE must be an integer from 1 to 20")
+    let scale = errors.integerValue(parsed)
+    check(scale >= 1 && scale <= 20, "MINYAR_TEST_TIMEOUT_SCALE must be an integer from 1 to 20")
+    return seconds * scale
+}
 public record Result { status: Integer; output: Text; errorOutput: Text }
 function portableScript(): Text {
     return "log=$1; limit=$2; shift 2; exec 2>\"$log.err\"; monitor=$$; set -m; /usr/bin/env -- \"$@\" >\"$log\" & child=$!; (exec 2>/dev/null; set +m; /bin/sleep \"$limit\" & sleeper=$!; while kill -0 \"$sleeper\" 2>/dev/null && kill -0 \"$monitor\" 2>/dev/null; do /bin/sleep 0.1; done; kill -TERM \"$sleeper\" 2>/dev/null || :; wait \"$sleeper\" 2>/dev/null; printf 'timeout\\n' >\"$log.timeout\"; kill -TERM -- -\"$child\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :) & timer=$!; set +m; exec 2>/dev/null; trap 'kill -TERM -- -\"$child\" -\"$timer\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null; child_status=$?; wait \"$timer\" 2>/dev/null; if [ \"$child_status\" -eq 0 ]; then exit 0; fi; exit 143' TERM INT; wait \"$child\"; status=$?; if [ -f \"$log.timeout\" ]; then wait \"$timer\" 2>/dev/null; status=124; else kill -TERM -- -\"$timer\" 2>/dev/null || :; wait \"$timer\" 2>/dev/null; fi; trap - TERM INT; exit \"$status\""
@@ -61,7 +72,7 @@ public function portableStart(command: List<Text>, environment: List<Text>, cwd:
     check(command.length > 0 && seconds > 0, "invalid process request")
     if files.pathSize(log + ".timeout") >= 0 { check(files.remove(log + ".timeout") == 0, "cannot clear private timeout marker") }
     let script = portableScript()
-    let argv = ["bash", "-c", script, "minyar", log, Text(seconds)]
+    let argv = ["bash", "-c", script, "minyar", log, Text(scaledSeconds(seconds))]
     for item in command { argv.add(item) }
     return system.spawn("/bin/bash", argv, environment, cwd)
 }
@@ -69,7 +80,7 @@ public function start(command: List<Text>, environment: List<Text>, cwd: Text, l
     check(command.length > 0 && seconds > 0, "invalid process request")
     if files.pathSize("/usr/bin/timeout") < 0 { return portableStart(command, environment, cwd, log, seconds) }
     let argv = ["sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", log,
-        "/usr/bin/timeout", "--kill-after=2", Text(seconds), "/usr/bin/env", "--"]
+        "/usr/bin/timeout", "--kill-after=2", Text(scaledSeconds(seconds)), "/usr/bin/env", "--"]
     for item in command { argv.add(item) }
     return system.spawn("/bin/sh", argv, environment, cwd)
 }
