@@ -426,6 +426,29 @@ public function balance(account: Account): Integer {
 Elsewhere, `account.owner` works but `account.balance` and
 `Account { ... }` are compile errors. A field may itself be named `private`.
 
+A method names its record before the function name. Inside it, `self` is the
+receiver, with the same shared mutation semantics as any record argument:
+
+```minyar
+function Account.deposit(amount: Integer) {
+    self.balance += amount
+}
+
+account.deposit(10)
+```
+
+Methods belong to the module that declares their record. Mark a method
+`public` to call it from another module; otherwise it is private to its module.
+The receiver and arguments are evaluated once, from left to right, and the
+receiver stays alive throughout the call. Methods compile to direct function
+calls with an implicit first argument, without dynamic dispatch or vtables.
+Callable fields keep their existing call syntax.
+
+Construction uses record literals or ordinary named functions, such as
+`bank.open("Ada")`. A dotted declaration always takes a receiver; there is no
+separate type-level method form. This keeps construction explicit and gives
+factory functions the same module visibility rules as other functions.
+
 ## Recoverable failures
 
 `Result<T, E>` contains either a successful `T` or an error `E`. `Ok(value)`

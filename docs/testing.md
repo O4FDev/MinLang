@@ -7,6 +7,11 @@ diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
 targets are recorded in the hardening review.
 
+`make check-methods` checks record methods, module visibility, receiver and
+argument lifetime, shared mutation, callable fields and rejection diagnostics.
+It runs the methods gallery and ownership assertions at O0/O2.
+`check-methods-sanitize` repeats these checks with ASan/UBSan.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit

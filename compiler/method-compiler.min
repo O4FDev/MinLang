@@ -1,0 +1,66 @@
+// Methods use ordinary function symbols and an explicit borrowed receiver.
+function methodFunctionName(recordName: Text, member: Text): Text {
+    let suffix = "$" + member
+    if recordName.length > 0 && recordName[0] == '"' {
+        let first = findCharacter(recordName, '|')
+        let position = first + 1
+        while position < recordName.length && recordName[position] != '|' { position = position + 1 }
+        return recordName.slice(0, position) + suffix + recordName.slice(position, recordName.length)
+    }
+    return recordName + suffix
+}
+
+function hasMethodDeclarations(kinds: List<Integer>, texts: List<Text>): Boolean {
+    let position = 0
+    while position + 3 < kinds.length {
+        if texts[position] == "function" && kinds[position + 1] == 1 && texts[position + 2] == "." { return true }
+        position = position + 1
+    }
+    return false
+}
+
+function parseRecordMethod(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, location: Integer, resultType: List<Integer>): Text {
+    let names = context.functionNames
+    let counts = context.functionParameterCounts
+    let fields = context.functionParameterTypes
+    let returns = context.functionReturnTypes
+    let recordName = names[receiverType - 1000]
+    let name = methodFunctionName(recordName, member)
+    let target = findFunction(names, context.symbolKinds, returns, name)
+    if target < 0 {
+        name = methodFunctionName(recordName, member + "$private")
+        target = findFunction(names, context.symbolKinds, returns, name)
+        if target >= 0 {
+            let declaration = 0
+            while declaration + 1 < context.tokenTexts.length && !(context.tokenTexts[declaration] == "function" && context.tokenTexts[declaration + 1] == name) { declaration = declaration + 1 }
+            if tokenPath(context.tokenLines, declaration) != tokenPath(context.tokenLines, location) {
+                fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": method '" + member + "' is private to its module")
+            }
+        }
+    }
+    if target < 0 { fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(recordName) + "' has no method named '" + member + "'") }
+    let values: List<Text> = [receiver]
+    let types: List<Integer> = [receiverType]
+    borrowReference(output, state, receiver, receiverType, counts, fields, returns)
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+    let offset = functionParameterOffset(counts, target)
+    while !tokenIs(context.tokenKinds, context.tokenTexts, state, ")") {
+        if values.length >= counts[target] { fail("method '" + member + "' received too many arguments") }
+        let type: List<Integer> = [fields[offset + values.length]]
+        let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
+        if type[0] != fields[offset + values.length] { fail("an argument passed to method '" + member + "' has the wrong type") }
+        borrowReference(output, state, value, type[0], counts, fields, returns)
+        values.add(value)
+        types.add(type[0])
+        if !tokenIs(context.tokenKinds, context.tokenTexts, state, ")") { expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",") }
+    }
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    if values.length != counts[target] { fail("method '" + member + "' expects " + Text(counts[target] - 1) + " arguments") }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "call", name, threadSignature(returns[target], types)) }
+    context.callTargets.add(target)
+    state[14] = state[14] + 1
+    let value = emitCall(output, textState, state, returns[target], context.functionIRNames[target], values, types)
+    recoveryCheckpoint(output, textState, state)
+    setType(resultType, returns[target])
+    return value
+}
