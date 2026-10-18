@@ -44,7 +44,9 @@ the full 8x range; the typed records also exercise forward type lookup.
 sibling links, contained token ranges, cached origins, Unicode columns and
 full-width source positions at O0/O2. It also checks the file:line:column error
 API, builds 50,000 nested nodes without recursion, and runs the observatory
-gallery and expression fixtures with ownership assertions.
+gallery and expression fixtures with ownership assertions. A signature
+regression replaces parsed header tokens with invalid text and verifies that
+function emission still produces identical LLVM from the typed tree.
 
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,

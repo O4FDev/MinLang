@@ -6,9 +6,11 @@ checker records statement and expression nodes while emitting LLVM; it does
 not run a second expression parser. Declaration nodes reuse the module scan's
 token ranges when those ranges are available.
 
-The emitting parser still consumes tokens. Migration to tree consumers is
-deliberately staged, so declaration discovery and some ownership lookahead
-helpers still scan tokens.
+Function emission consumes declaration nodes, typed parameter children and
+stored body starts. It does not parse signatures or skip other declarations
+again. Its body parser still consumes tokens. Migration to tree consumers is
+staged, so declaration discovery and some ownership lookahead helpers still
+scan tokens.
 
 ## Representation
 
@@ -39,6 +41,8 @@ statement and block nodes use `Nothing`. A function declaration stores its
 return type; parameter children carry the parameter types. Record field and
 parameter nodes span the binding name and refer to their type-table offset.
 Folded negative numeric literals span both the minus and the digits.
+Parameter names come from the shared declaration table through that offset;
+later consumers need not read their header tokens.
 
 `declarations` lists declarations in source order. `symbolNodes[symbol]`
 finds their node without a scan. Internal callback environment symbols map
