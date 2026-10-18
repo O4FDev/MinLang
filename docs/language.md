@@ -481,6 +481,10 @@ Record order is lexicographic in field declaration order. `list.sort()` and
 `list.sorted()` accept Ordered records, as do `<`, `>`, `<=` and `>=`.
 Primitive field order follows natural List sorting, including NaNs last and
 signed zeros equal. Sorting is stable; a sorted copy still shares its records.
+Choices derive these capabilities when all their payload types qualify. Equality
+compares the case and its active payloads; order follows case declaration order,
+then payload declaration order. Hashing and key snapshots also visit only the
+active payloads. Choices can declare instance methods in their own module.
 Derived comparisons examine the finite field shape without allocation or
 dynamic dispatch. Natural record sorting uses the comparator sorting workspace
 described above.
