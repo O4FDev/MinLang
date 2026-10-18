@@ -22,5 +22,28 @@ io.writeTextFile(frontend.compiler.directory + "/secret.min", "public record Sec
 fixtures.executes(frontend, "use \"./secret.min\" as secret\nprint(secret.make(\"Ada\") == secret.make(\"A\" + \"da\"))\nprint(secret.make(\"Ada\") < secret.make(\"Grace\"))\n", "true\ntrue\n", levels, 0, "", true)
 fixtures.executes(frontend, "record Wrapped { result: Result<Text, Text> }\nfunction good(): Wrapped { return Wrapped { result: Ok(\"Ada\") } }\nfunction bad(): Wrapped { return Wrapped { result: Err(\"rain\") } }\nprint(good() == good())\nprint(bad() == bad())\nprint(good() == bad())\nlet values = [bad(), good()]\nvalues.sort()\nmatch values[0].result { Ok(value) { print(value) } Err(error) { print(error) } }\n", "true\ntrue\nfalse\nAda\n", levels, 0, "", true)
 fixtures.rejects(frontend, "record First { value: Integer }\nrecord Second { value: Integer }\nprint(First { value: 1 } == Second { value: 1 })\n", "different types", true)
+io.writeTextFile(frontend.compiler.directory + "/equality.min", "public record Box { value: Integer }\npublic function same(a: Box, b: Box): Boolean { return a == b }\npublic function ordered(values: List<Box>): List<Box> { return values.sorted() }\n")
+let cachedEntry = frontend.compiler.directory + "/cached.min"
+io.writeTextFile(cachedEntry, "use \"./equality.min\" as boxes\nlet a = boxes.Box { value: 2 }\nlet b = boxes.Box { value: 1 }\nprint(boxes.same(a, b))\nprint(a == b)\nprint(boxes.ordered([a, b])[0].value)\nlet values = [a, b]\nvalues.sort()\nprint(values[0].value)\n")
+let prior = frontend.compiler.directory + "/empty.state"
+io.writeTextFile(prior, "")
+for pass in ["cold", "warm"] {
+    let base = frontend.compiler.directory + "/" + pass
+    test.require(test.run([frontend.compiler.executable, cachedEntry, base + ".ll", "--module-state", prior, base + ".state", base + ".stats", "--library", "library"], frontend.environment, "", base + ".compile", 30), "compile derived helpers in cached modules")
+    if pass == "warm" {
+        let stats = io.readTextFile(base + ".stats").trim().split(" ")
+        test.check(stats[0] == "2" && stats[1] == "0" && stats[6] == "true", "derived modules did not reuse their cached bodies")
+    }
+    if test.addressEnabled(frontend.compiler.flags) { io.writeTextFile(base + ".ll", test.instrument(io.readTextFile(base + ".ll"))) }
+    for level in levels {
+        let command = [frontend.compiler.clang, level, "-Wno-override-module", base + ".ll", frontend.compiler.runtime, "-lm", "-o", base + ".exe"]
+        for flag in frontend.compiler.flags { command.add(flag) }
+        test.require(test.run(command, frontend.environment, "", base + ".link", 30), "link derived helpers in cached modules")
+        let result = test.run([base + ".exe"], frontend.environment, "", base + ".run", 30)
+        test.require(result, "execute derived helpers in cached modules")
+        test.check(result.output == "false\nfalse\n1\n1\n" && result.errorOutput == "", "cached derived helper output changed")
+    }
+    prior = base + ".state"
+}
 test.removeTree(frontend.compiler.directory)
 print("Record capabilities: passed")
