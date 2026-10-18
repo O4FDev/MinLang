@@ -1,0 +1,73 @@
+function requireHashableKey(context: CompilerContext, type: Integer, location: Integer, container: Text) {
+    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 { return }
+    if isRecordType(type) { requireRecordCapability(context, type, "Hashable", location); return }
+    if container == "Set" { fail("Set elements must be Hashable: Integer, Text, Character, Boolean, Float, or a finite Hashable record") }
+    fail("Map keys must be Hashable: Integer, Text, Character, Boolean, Float, or a finite Hashable record")
+}
+
+function validateCollectionTypeCapabilities(context: CompilerContext, type: Integer) {
+    while isContainerType(type) {
+        if isSetType(type) { requireHashableKey(context, setElementType(type), 0, "Set") }
+        if isMapType(type) { requireHashableKey(context, mapKeyType(type), 0, "Map") }
+        type = containerValueType(type)
+    }
+}
+
+function hashMapConstructor(context: CompilerContext, key: Integer, references: Boolean, globals: List<Text>, location: Integer): Text {
+    requireHashableKey(context, key, location, "Map")
+    let ownsValues = "0"
+    if references { ownsValues = "1" }
+    if !isRecordType(key) { return "call ptr @minyar_map_new(i64 " + Text(key) + ", i64 " + ownsValues + ")\n" }
+    let hash = derivedRecordFunction(context, key, "hash", globals)
+    let equal = derivedRecordFunction(context, key, "equal", globals)
+    let copy = derivedRecordFunction(context, key, "copy", globals)
+    let declaration = "declare i64 @minyar_hash_slot(i64, i64)\n" + "declare ptr @minyar_map_new_record(i64, i64, ptr, ptr, ptr)\n"
+    if findText(globals, declaration) < 0 { globals.add(declaration) }
+    return "call ptr @minyar_map_new_record(i64 " + Text(key) + ", i64 " + ownsValues + ", ptr " + hash + ", ptr " + equal + ", ptr " + copy + ")\n"
+}
+
+function parseSetConstructor(context: CompilerContext, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let start = state[0]
+    let explicit = context.tokenTexts[start + 1] == "<"
+    let type = resultType[0]
+    if explicit { type = takeType(context.tokenKinds, context.tokenTexts, context.tokenLines, state, context.functionNames, context.symbolKinds) } else { state[0] = start + 1 }
+    if !isSetType(type) { fail("Set() needs a contextual Set<T> type") }
+    requireHashableKey(context, setElementType(type), start, "Set")
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    declareMapRuntime(globals)
+    let constructor = hashMapConstructor(context, setElementType(type), false, globals, start)
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = " + constructor)
+    setType(resultType, type)
+    if explicit { ownResult(output, state, value, resultType) }
+    return value
+}
+
+function parseSetMethod(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, resultType: List<Integer>): Text {
+    declareMapRuntime(globals)
+    if member == "clear" {
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+        output.add("  call void @minyar_map_clear(ptr " + receiver + ")\n")
+        setType(resultType, 5)
+        return ""
+    }
+    if member != "add" && member != "contains" && member != "remove" { fail("this Set has no method named '" + member + "'") }
+    borrowReference(output, state, receiver, receiverType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    let type: List<Integer> = [setElementType(receiverType)]
+    let element = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
+    requireType(context.tokenLines, state, type[0], setElementType(receiverType), "Set element has the wrong type")
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    let slot = valueAsListSlot(output, textState, state, element, type[0])
+    if member == "add" {
+        output.add("  call void @minyar_map_set(ptr " + receiver + ", i64 " + slot + ", i64 1)\n")
+        setType(resultType, 5)
+        return ""
+    }
+    let operation = member
+    if member == "contains" { operation = "has" }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call zeroext i1 @minyar_map_" + operation + "(ptr " + receiver + ", i64 " + slot + ")\n")
+    setType(resultType, 4)
+    return value
+}

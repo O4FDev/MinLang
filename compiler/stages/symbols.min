@@ -260,17 +260,39 @@ function structuralChild(type: Integer): Integer {
 }
 
 function isMapType(type: Integer): Boolean {
-    return type < -8 && (-type % 8) != 0
+    return type < -8 && (-type % 8) != 0 && (-type % 8) != 6
 }
 
-function mapKeyType(type: Integer): Integer { return -type % 8 }
+function isSetType(type: Integer): Boolean { return type < -8 && (-type % 8) == 6 }
+function setElementType(type: Integer): Integer { return structuralChild(type) }
+function makeSetType(element: Integer): Integer { return structuralType(6, element) }
 
-function mapValueType(type: Integer): Integer { return structuralChild(type) }
+function makeMapType(key: Integer, value: Integer): Integer {
+    if !isRecordType(key) { return structuralType(key, value) }
+    if value > 576460752303423487 || value < -576460752303423487 { fail("generic type nesting exceeds the supported limit") }
+    let payload = value * 2
+    if value < 0 { payload = -value * 2 - 1 }
+    if payload < 0 || payload > (1152921504606846975 - key) / 100000 { fail("generic type nesting exceeds the supported limit") }
+    return -((payload * 100000 + key) * 8 + 5)
+}
 
-function isContainerType(type: Integer): Boolean { return isListType(type) || isMapType(type) }
+function mapKeyType(type: Integer): Integer {
+    if (-type % 8) == 5 { return (-type / 8) % 100000 }
+    return -type % 8
+}
+
+function mapValueType(type: Integer): Integer {
+    if (-type % 8) != 5 { return structuralChild(type) }
+    let payload = -type / 8 / 100000
+    if payload % 2 == 0 { return payload / 2 }
+    return -(payload / 2) - 1
+}
+
+function isContainerType(type: Integer): Boolean { return isListType(type) || isMapType(type) || isSetType(type) }
 
 function containerValueType(type: Integer): Integer {
     if isMapType(type) { return mapValueType(type) }
+    if isSetType(type) { return setElementType(type) }
     return listElementType(type)
 }
 
@@ -284,12 +306,13 @@ function takeContainerType(kinds: List<Integer>, texts: List<Text>, lines: Sourc
         if needType {
             if closing != 0 { fail("expected a value type") }
             let name = texts[cursor[0]]
-            if name == "List" || name == "Map" {
+            if name == "List" || name == "Map" || name == "Set" {
                 cursor[0] = cursor[0] + 1
                 expectToken(kinds, texts, lines, cursor, "<")
                 while frames.length < (depth + 1) * 3 { frames.add(0) }
                 frames[depth * 3] = 0
                 if name == "Map" { frames[depth * 3] = 1 }
+                if name == "Set" { frames[depth * 3] = 2 }
                 frames[depth * 3 + 1] = 0
                 depth = depth + 1
             } else {
@@ -299,7 +322,7 @@ function takeContainerType(kinds: List<Integer>, texts: List<Text>, lines: Sourc
         } else {
             let frame = (depth - 1) * 3
             if frames[frame] == 1 && frames[frame + 1] == 0 {
-                if code != 1 && code != 2 && code != 3 && code != 4 && code != 7 {
+                if code != 1 && code != 2 && code != 3 && code != 4 && code != 7 && !isRecordType(code) {
                     fail("Map keys must be Integer, Text, Character, Boolean, or Float")
                 }
                 frames[frame + 2] = code
@@ -314,7 +337,7 @@ function takeContainerType(kinds: List<Integer>, texts: List<Text>, lines: Sourc
                     } else { expectToken(kinds, texts, lines, cursor, ">") }
                 }
                 if frames[frame] == 0 { code = makeListType(code) } else {
-                    code = structuralType(frames[frame + 2], code)
+                    if frames[frame] == 2 { code = makeSetType(code) } else { code = makeMapType(frames[frame + 2], code) }
                 }
                 depth = depth - 1
             }
@@ -330,7 +353,7 @@ function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
         return takeCallbackType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds, false)
     }
     let code = simpleTypeCode(name)
-    if name == "List" || name == "Map" {
+    if name == "List" || name == "Map" || name == "Set" {
         code = takeContainerType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
     } else {
         if code == 0 {

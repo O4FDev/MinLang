@@ -18,6 +18,7 @@ COMPILER_SOURCES = compiler/stages/source.min \
 	compiler/stages/modules.min \
 	compiler/method-compiler.min \
 	compiler/capability-compiler.min \
+	compiler/collection-capabilities.min \
 	compiler/stages/incremental.min \
 	compiler/closure-compiler.min \
 	compiler/callable-types.min \

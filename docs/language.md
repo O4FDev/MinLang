@@ -561,6 +561,37 @@ analysis as records. Cases and payload fields are accessed through constructors
 and matching. Generic user choices and nested or literal patterns are not yet
 supported.
 
+## Maps and Sets
+
+`Map<Key, Value>` accepts Hashable record keys as well as scalar keys. A
+lookup uses structural equality. Insertion stores a snapshot of a record key;
+changing the original record afterwards leaves the stored key intact. Iteration
+also returns snapshots, so changing an iterated record cannot change a Map key.
+Snapshotting copies record fields recursively and shares immutable Text. It
+costs time and space proportional to the record fields copied; internal record
+sharing is not preserved. Scalar keys keep their existing storage and cost.
+Float keys, including Float fields in record keys, reject NaN and treat signed
+zeros as the same key.
+
+`Set<Item>` holds distinct Hashable values:
+
+```minyar
+let names: Set<Text> = Set()
+names.add("Ada")
+names.add("Ada")
+print(names.length)          // 1
+print(names.contains("Ada")) // true
+for name in names { print(name) }
+print(names.remove("Ada"))   // true; false when absent
+names.clear()
+```
+
+`add` returns Nothing. A Set is a shared reference value; aliases observe
+additions and removals. `==` and `!=` compare membership. Iteration visits a
+snapshot in unspecified order, and record elements use the same snapshot rules
+as Map keys. Set storage is a hash table; expected lookup, addition and removal
+take constant time apart from hashing, comparing and copying an element.
+
 ## Generic functions
 
 A function can name the types it works with, using angle brackets after its
@@ -821,6 +852,7 @@ alias and do not reserve every module's function namespace.
 | `Float` |
 | `Integer` |
 | `Map` |
+| `Set` |
 | `Text` |
 | `abs` |
 | `clamp` |

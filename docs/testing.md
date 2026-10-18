@@ -22,6 +22,12 @@ runs the ordered garden gallery, nested and empty records, Float edge cases,
 receiver lifetime and stable sorting at O0/O2 with ownership assertions.
 `check-record-capabilities-sanitize` adds ASan/UBSan.
 
+`make check-record-collections` checks Hashable record Map keys and Set values,
+including structural duplicates, nested snapshots, mutation, table growth,
+deletion, iteration, Float keys and rejected element types. The seed-library
+gallery runs at O0/O2 with ownership assertions. Its sanitizer variant is
+`check-record-collections-sanitize`.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit
