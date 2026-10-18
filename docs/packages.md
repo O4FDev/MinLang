@@ -54,8 +54,11 @@ Discovery is reused throughout the same `add`, including branch pins; it does
 not download the same source again during graph resolution. A discovered stable
 release is also cached under its tag for later offline additions. If a host moves
 an already cached release tag, fresh latest discovery rejects the changed release.
-Local path dependencies remain editable and retain their existing graph-lock
-behavior. `add` and `remove` rewrite supported manifest fields and comments.
+Edits to a Git dependency graph update its lock immediately, including removing
+its final Git source or adding/removing a local wrapper around Git dependencies.
+The result is ready for `--locked --offline`. Local-only path dependencies remain
+editable and retain their existing graph-lock behavior. `add` and `remove`
+rewrite supported manifest fields and comments.
 
 ## Reproduce a build
 
