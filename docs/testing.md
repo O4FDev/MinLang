@@ -70,8 +70,10 @@ lifetime during argument mutation, and literal-condition return analysis.
 It uses ordinary and module-state compilation at O0/O2 with ownership cleanup
 assertions; `check-nitpick-language-sanitize` adds ASan/UBSan.
 
-`make check-choice` checks choice construction, exhaustive statement matches,
-module visibility, binding scope, recursive payloads and the choice gallery.
+`make check-choice` checks choice construction, exhaustive statement and expression
+matches, Maybe, module visibility, binding scope, recursive payloads and the
+choice gallery. Reference-valued matches are exercised after clearing their
+input, including a parenthesized input.
 Positive programs run at O0/O2 with ownership cleanup assertions; rejection
 fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
 ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed

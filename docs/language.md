@@ -571,6 +571,33 @@ with `else { ... }` to handle the remaining cases. A missing-case diagnostic
 names the cases still needed. Payload names in an arm are local bindings; `_`
 ignores a payload. Arms may return, break or continue just like other blocks.
 
+A match can also produce a value. Each arm then contains one expression, and
+all arms must have the same type. This works for choices and `Result`:
+
+```minyar
+let area = match shape {
+    Circle(radius) { 3.14159 * radius * radius }
+    Rectangle(width, height) { width * height }
+    Empty { 0.0 }
+}
+```
+
+`Maybe<T>` carries either `Some(value)` or `None`. An annotation, parameter or
+return type supplies `T`; explicit constructors such as `Some<Text>("moon")`
+and `None<Text>()` work when no context supplies it:
+
+```minyar
+function first(words: List<Text>): Maybe<Text> {
+    if words.length == 0 { return None }
+    return Some(words[0])
+}
+let greeting = match first(["hello"]) {
+    Some(word) { word }
+    None { "silence" }
+}
+print(greeting)
+```
+
 Choices currently share the record representation and automatic memory
 management. Each value allocates a tag and slots for all declared payloads;
 inactive slots are empty. This includes choices with no payloads. Payloads can

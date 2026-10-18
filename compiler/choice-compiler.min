@@ -141,7 +141,9 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     let name = context.tokenTexts[location]
     if context.tokenKinds[location] != 1 { return 0 }
     let record = findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 2)
+    if record >= 0 && context.tokenTexts[location + 1] == "{" && choiceCases(context, 1000 + record).length == 0 { return 0 }
     if record >= 0 && context.tokenTexts[location + 1] == "." && choiceCases(context, 1000 + record).length > 0 { return 1000 + record }
+    if (name == "Ok" || name == "Err") && resultTypeName(expected, context.functionNames) { return 0 }
     if isBuiltinName(name) { return 0 }
     if findLocal(localNames, localLengths, state, name) >= 0 || findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name) >= 0 || findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 3) >= 0 { return 0 }
     if findText(choiceCases(context, expected), name) > 0 { return expected }
@@ -194,6 +196,7 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
             output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(field) + ", i64 " + slot + ")\n")
             index = index + 1
         }
+        if fields.length > 0 && tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
         expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
     }
     setType(resultType, type)
@@ -201,17 +204,50 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
     return value
 }
 
-function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, input: Text, inputType: List<Integer>, location: Integer): Boolean {
+function choiceMatchCases(context: CompilerContext, type: Integer): List<Text> {
+    if resultTypeName(type, context.functionNames) {
+        let cases: List<Text> = ["result", "Err", "Ok"]
+        return cases
+    }
+    return choiceCases(context, type)
+}
+
+function choiceMatchFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
+    if resultTypeName(type, context.functionNames) {
+        let fields: List<Integer> = []
+        let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+        if name == "Err" { fields.add(2) }
+        if name == "Ok" && context.functionParameterTypes[first + 1] != 5 { fields.add(1) }
+        return fields
+    }
+    return choicePayloadFields(context, type, name)
+}
+
+function parseMatchExpression(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let location = state[0]
+    state[0] = state[0] + 1
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    if choiceMatchCases(context, inputType[0]).length == 0 { fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": match needs a Result or choice") }
+    let values: List<Text> = []
+    let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, context.activeReturnType, input, inputType, location, resultType, values)
+    return values[0]
+}
+
+function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, input: Text, inputType: List<Integer>, location: Integer, expressionType: List<Integer>, expressionValue: List<Text>): Boolean {
     let kinds = context.tokenKinds
     let texts = context.tokenTexts
     let lines = context.tokenLines
     let counts = context.functionParameterCounts
     let types = context.functionParameterTypes
     let returns = context.functionReturnTypes
-    let cases = choiceCases(context, inputType[0])
+    let cases = choiceMatchCases(context, inputType[0])
     let seen: List<Integer> = []
     let seenIndex = 0
     while seenIndex < cases.length { seen.add(0); seenIndex = seenIndex + 1 }
+    let expression = expressionType.length > 0
+    let valueId = -1
+    if expression { valueId = nextLocal(state) }
     let outerScope = state[3]
     let owner = nextLocal(state)
     addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
@@ -229,11 +265,15 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         if seenElse { fail(describeLocation(tokenLocation(lines, armLocation)) + ": else must be the last match arm") }
         let fallback = name == "else" && kinds[armLocation] == 1
         let variant = findText(cases, name)
+        if resultTypeName(inputType[0], context.functionNames) {
+            if !fallback && (kinds[armLocation] != 1 || variant < 1) { fail(describeLocation(tokenLocation(lines, armLocation)) + ": expected Ok or Err in result match") }
+            if !fallback && seen[variant] != 0 { fail("duplicate result arm " + name) }
+        }
         if !fallback && (kinds[armLocation] != 1 || variant < 1) { fail(describeLocation(tokenLocation(lines, armLocation)) + ": unknown case '" + name + "' in choice match") }
         if !fallback && seen[variant] != 0 { fail(describeLocation(tokenLocation(lines, armLocation)) + ": duplicate match arm '" + name + "'") }
         state[0] = state[0] + 1
         let fields: List<Integer> = []
-        if fallback { seenElse = true } else { seen[variant] = 1; fields = choicePayloadFields(context, inputType[0], name) }
+        if fallback { seenElse = true } else { seen[variant] = 1; fields = choiceMatchFields(context, inputType[0], name) }
         let bindings: List<Text> = []
         if fields.length > 0 || tokenIs(kinds, texts, state, "(") {
             expectToken(kinds, texts, lines, state, "(")
@@ -277,7 +317,22 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             bindingIds.add(id)
             index = index + 1
         }
-        let terminal = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+        let terminal = false
+        if expression {
+            expectToken(kinds, texts, lines, state, "{")
+            skipTerminators(kinds, state)
+            let armType: List<Integer> = [expressionType[0]]
+            let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, armType)
+            if armType[0] == 5 || armType[0] == 6 { fail(describeLocation(tokenLocation(lines, armLocation)) + ": a match expression arm must produce a value") }
+            if expressionType[0] == 0 { setType(expressionType, armType[0]) }
+            if armType[0] != expressionType[0] { fail(describeLocation(tokenLocation(lines, armLocation)) + ": match expression arms must have the same type") }
+            assignReference(output, state, valueId, value, armType, counts, types, returns)
+            storeLocal(output, valueId, armType[0], value)
+            skipTerminators(kinds, state)
+            expectToken(kinds, texts, lines, state, "}")
+        } else {
+            terminal = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+        }
         if !terminal {
             index = 0
             while index < fields.length {
@@ -304,13 +359,21 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         }
         variant = variant + 1
     }
+    if !seenElse && missing.length > 0 && resultTypeName(inputType[0], context.functionNames) { fail("match must handle both Ok and Err") }
     if !seenElse && missing.length > 0 { fail(describeLocation(tokenLocation(lines, location)) + ": match is missing cases: " + joinText(missing)) }
     if !seenElse { output.add("  unreachable\n") }
     if !allReturn {
         output.add("\n" + endLabel + ":\n")
         textState[0] = endLabel
+        if expression {
+            let value = loadLocal(output, textState, state, valueId, expressionType[0])
+            setType(expressionType, expressionType[0])
+            borrowReference(output, state, value, expressionType[0], counts, types, returns)
+            rootLocal(output, state, valueId, "null", expressionType[0])
+            expressionValue.add(value)
+        }
         rootLocal(output, state, owner, "null", inputType[0])
-        output.add("  call void @minyar_rc_step()\n")
+        if !expression { output.add("  call void @minyar_rc_step()\n") }
     }
     state[3] = outerScope
     return allReturn

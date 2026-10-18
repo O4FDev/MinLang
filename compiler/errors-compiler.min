@@ -26,17 +26,19 @@ function resultClose(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, 
 }
 
 function internResultType(success: Text, error: Text, successes: List<Text>, errors: List<Text>): Text {
+    let prefix = "minyar_result_type_"
+    if error == "" { prefix = "minyar_maybe_type_" }
     let index = 0
     while index < successes.length {
         if successes[index] == success && errors[index] == error {
-            return "minyar_result_type_" + Text(index)
+            return prefix + Text(index)
         }
         index = index + 1
     }
     if index >= 4096 { fail("too many Result instantiations") }
     successes.add(success)
     errors.add(error)
-    return "minyar_result_type_" + Text(index)
+    return prefix + Text(index)
 }
 
 function resultReadType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, successes: List<Text>, errors: List<Text>): Text {
@@ -46,11 +48,14 @@ function resultReadType(kinds: List<Integer>, texts: List<Text>, lines: SourceMa
     }
     let name = texts[cursor[0]]
     cursor[0] = cursor[0] + 1
-    if name != "Result" && name != "List" && name != "Map" && name != "Set" && name != "Callback" { return name }
+    if name != "Result" && name != "Maybe" && name != "List" && name != "Map" && name != "Set" && name != "Callback" { return name }
     expectToken(kinds, texts, lines, cursor, "<")
     cursor[2] = cursor[2] + 1
     let first = resultReadType(kinds, texts, lines, cursor, successes, errors)
     let result = name + "<" + first
+    if name == "Maybe" {
+        result = internResultType(first, "", successes, errors)
+    } else {
     if name == "Result" {
         expectToken(kinds, texts, lines, cursor, ",")
         let second = resultReadType(kinds, texts, lines, cursor, successes, errors)
@@ -67,6 +72,7 @@ function resultReadType(kinds: List<Integer>, texts: List<Text>, lines: SourceMa
             }
         }
         result = result + ">"
+    }
     }
     resultClose(kinds, texts, lines, cursor)
     cursor[2] = cursor[2] - 1
@@ -117,10 +123,10 @@ function normalizeResultTypes(kinds: List<Integer>, texts: List<Text>, lines: So
         }
         let recognized = false
         if kinds[position] == 1 && position + 1 < kinds.length && kinds[position + 1] == 4 && texts[position + 1] == "<" {
-            if token == "Result" {
+            if token == "Result" || token == "Maybe" {
                 recognized = typePositions[position] || resultHeaderFollows(kinds, texts, position, "{")
             } else {
-                if token == "Ok" || token == "Err" {
+                if token == "Ok" || token == "Err" || token == "Some" || token == "None" {
                     recognized = resultHeaderFollows(kinds, texts, position, "(")
                 }
             }
@@ -128,20 +134,31 @@ function normalizeResultTypes(kinds: List<Integer>, texts: List<Text>, lines: So
         if recognized {
             let cursor: List<Integer> = [position, 0, 0]
             let replacement = ""
-            if token == "Result" {
+            let maybeCase = ""
+            if token == "Result" || token == "Maybe" {
                 replacement = resultReadType(kinds, texts, lines, cursor, successes, errors)
             } else {
                 cursor[0] = position + 2
                 let success = resultReadType(kinds, texts, lines, cursor, successes, errors)
-                expectToken(kinds, texts, lines, cursor, ",")
-                let error = resultReadType(kinds, texts, lines, cursor, successes, errors)
-                resultClose(kinds, texts, lines, cursor)
-                let type = internResultType(success, error, successes, errors)
-                let index = type.slice(19, type.length)
-                replacement = "minyar_result_ok_" + index
-                if token == "Err" { replacement = "minyar_result_err_" + index }
+                if token == "Some" || token == "None" {
+                    resultClose(kinds, texts, lines, cursor)
+                    replacement = internResultType(success, "", successes, errors)
+                    maybeCase = token
+                } else {
+                    expectToken(kinds, texts, lines, cursor, ",")
+                    let error = resultReadType(kinds, texts, lines, cursor, successes, errors)
+                    resultClose(kinds, texts, lines, cursor)
+                    let type = internResultType(success, error, successes, errors)
+                    let index = type.slice(19, type.length)
+                    replacement = "minyar_result_ok_" + index
+                    if token == "Err" { replacement = "minyar_result_err_" + index }
+                }
             }
             copyModuleToken(outputKinds, outputTexts, outputLines, 1, replacement, lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            if maybeCase != "" {
+                copyModuleToken(outputKinds, outputTexts, outputLines, 4, ".", lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+                copyModuleToken(outputKinds, outputTexts, outputLines, 1, maybeCase, lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            }
             if cursor[1] != 0 {
                 copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, sourcePath(outputLines, tokenPath(lines, position)))
             }
@@ -157,7 +174,11 @@ function normalizeResultTypes(kinds: List<Integer>, texts: List<Text>, lines: So
     let declarations: List<Text> = []
     position = 0
     while position < successes.length {
-        declarations.add("record minyar_result_type_" + Text(position) + " { ok: Boolean; value: " + successes[position] + "; error: " + errors[position] + " }\n")
+        if errors[position] == "" {
+            declarations.add("choice minyar_maybe_type_" + Text(position) + " { Some(value: " + successes[position] + "); None }\n")
+        } else {
+            declarations.add("record minyar_result_type_" + Text(position) + " { ok: Boolean; value: " + successes[position] + "; error: " + errors[position] + " }\n")
+        }
         position = position + 1
     }
     let resultKinds: List<Integer> = []
@@ -302,83 +323,10 @@ function compileResultMatch(context: CompilerContext, localNames: List<Text>, lo
     state[0] = state[0] + 1
     let inputType: List<Integer> = [0]
     let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
-    if choiceCases(context, inputType[0]).length > 0 {
-        return compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, input, inputType, location)
-    }
-    if !resultTypeName(inputType[0], functionNames) {
+    if choiceMatchCases(context, inputType[0]).length == 0 {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": match needs a Result or choice")
     }
-    let outerScope = state[3]
-    let owner = nextLocal(state)
-    addLocal(localNames, localTypes, localIds, localLengths, state, " result match", inputType[0], owner)
-    assignReference(output, state, owner, input, inputType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-    storeLocal(output, owner, inputType[0], input)
-    let tag = readRecordField(output, textState, state, input, 0, 4)
-    let okLabel = "result.match.ok." + Text(newLabel(state))
-    let errorLabel = "result.match.error." + Text(newLabel(state))
-    let endLabel = "result.match.end." + Text(newLabel(state))
-    output.add(conditionalBranch(tag, okLabel, errorLabel))
-    expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
-    skipTerminators(tokenKinds, state)
-    let seenOk = false
-    let seenError = false
-    let allReturn = true
-    let first = functionParameterOffset(functionParameterCounts, inputType[0] - 1000)
-    while !tokenIs(tokenKinds, tokenTexts, state, "}") {
-        let arm = tokenTexts[state[0]]
-        if tokenKinds[state[0]] != 1 || (arm != "Ok" && arm != "Err") {
-            fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": expected Ok or Err in result match")
-        }
-        let field = 2
-        let label = errorLabel
-        if arm == "Ok" {
-            if seenOk { fail("duplicate result arm Ok") }
-            seenOk = true
-            field = 1
-            label = okLabel
-        } else {
-            if seenError { fail("duplicate result arm Err") }
-            seenError = true
-        }
-        state[0] = state[0] + 1
-        expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
-        let type = functionParameterTypes[first + field]
-        let binding = ""
-        if type != 5 {
-            if tokenKinds[state[0]] != 1 { fail("expected a result payload binding") }
-            binding = tokenTexts[state[0]]
-            state[0] = state[0] + 1
-        }
-        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
-        output.add("\n" + label + ":\n")
-        textState[0] = label
-        let scope = state[3]
-        let id = -1
-        if type != 5 {
-            let payload = readRecordField(output, textState, state, input, field, type)
-            id = nextLocal(state)
-            addLocal(localNames, localTypes, localIds, localLengths, state, binding, type, id)
-            let payloadType: List<Integer> = [type]
-            assignReference(output, state, id, payload, payloadType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-            storeLocal(output, id, type, payload)
-        }
-        let returns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
-        if !returns {
-            if id >= 0 { rootLocal(output, state, id, "null", type) }
-            output.add("  br label %" + endLabel + "\n")
-            allReturn = false
-        }
-        state[3] = scope
-        skipTerminators(tokenKinds, state)
-    }
-    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
-    if !seenOk || !seenError { fail("match must handle both Ok and Err") }
-    if !allReturn {
-        output.add("\n" + endLabel + ":\n")
-        textState[0] = endLabel
-        rootLocal(output, state, owner, "null", inputType[0])
-        output.add("  call void @minyar_rc_step()\n")
-    }
-    state[3] = outerScope
-    return allReturn
+    let expressionType: List<Integer> = []
+    let expressionValue: List<Text> = []
+    return compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, input, inputType, location, expressionType, expressionValue)
 }
