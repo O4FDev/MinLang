@@ -47,13 +47,32 @@ function comparisonCondition(operator: Text, type: Integer): Text {
     return "sge"
 }
 
-function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>, locations: SourceMap, location: Integer): Text {
+function emitBinary(context: CompilerContext, globals: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>, locations: SourceMap, location: Integer): Text {
     if leftType != rightType {
         let hint = ""
         if (leftType == 1 && rightType == 7) || (leftType == 7 && rightType == 1) {
             hint = "; convert one side with Float(value) or Integer(value)"
         }
         fail(describeLocation(tokenLocation(locations, location)) + ": " + "the two sides of '" + operator + "' have different types (" + describeType(leftType) + " and " + describeType(rightType) + ")" + hint)
+    }
+    if isRecordType(leftType) && (operator == "==" || operator == "!=" || operator == "<" || operator == ">" || operator == "<=" || operator == ">=") {
+        let capability = "Equatable"
+        let operation = "equal"
+        if operator != "==" && operator != "!=" { capability = "Ordered"; operation = "compare" }
+        requireRecordCapability(context, leftType, capability, location)
+        let callee = derivedRecordFunction(context, leftType, operation, globals)
+        let value = valueName(textState, newTemporary(state))
+        if operation == "equal" {
+            output.add("  " + value + " = call zeroext i1 " + callee + "(ptr " + left + ", ptr " + right + ")\n")
+            if operator == "!=" { value = emitInstruction(output, textState, state, "xor i1 " + value + ", true") }
+        } else {
+            let declaration = "declare i64 @minyar_compare_slots(i64, i64, i64)\n"
+            if findText(globals, declaration) < 0 { globals.add(declaration) }
+            output.add("  " + value + " = call i64 " + callee + "(ptr " + left + ", ptr " + right + ")\n")
+            value = emitInstruction(output, textState, state, "icmp " + comparisonCondition(operator, 1) + " i64 " + value + ", 0")
+        }
+        setType(resultType, 4)
+        return value
     }
     if (operator == "==" || operator == "!=") && isMapType(leftType) {
         let comparable = mapValueType(leftType)
@@ -401,6 +420,7 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         if resultType.length > 1 {
             leftOwner = resultType[1]
         }
+        if isRecordType(leftType) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
         if isMapType(leftType) {
             let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
             if findText(globals, declaration) < 0 { globals.add(declaration) }
@@ -408,7 +428,7 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         }
         setType(resultType, 0)
         let right = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
-        left = emitBinary(output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
+        left = emitBinary(context, globals, output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
     return left

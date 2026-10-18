@@ -8,25 +8,41 @@ typedef struct {
     MinyarSortComparator comparator;
 } MinyarSortOrder;
 
-static int list_sort_compare(const MinyarSortOrder *order, long long a, long long b) {
-    if (order->comparator) {
-        long long result = order->comparator(order->context, order->snapshot[a], order->snapshot[b]);
-        return (result > 0) - (result < 0);
-    }
-    if (order->kind == 7) {
+long long minyar_compare_slots(long long kind, long long a, long long b) {
+    if (kind == 7) {
         double x, y;
         memcpy(&x, &a, sizeof(x)); memcpy(&y, &b, sizeof(y));
         if (isnan(x)) return !isnan(y);
         if (isnan(y)) return -1;
         return (x > y) - (x < y);
     }
-    if (order->kind == 2) {
+    if (kind == 2) {
+        if (!a || !b) return (a != 0) - (b != 0);
         const MinyarText *x = (const void *)(uintptr_t)a, *y = (const void *)(uintptr_t)b;
         size_t length = (size_t)(x->byte_length < y->byte_length ? x->byte_length : y->byte_length);
         int result = length ? memcmp(x->bytes, y->bytes, length) : 0;
         return result ? result : (x->byte_length > y->byte_length) - (x->byte_length < y->byte_length);
     }
     return (a > b) - (a < b);
+}
+
+_Bool minyar_equal_slots(long long kind, long long a, long long b) {
+    if (kind == 2) return minyar_compare_slots(kind, a, b) == 0;
+    if (kind == 7) {
+        double x, y;
+        memcpy(&x, &a, sizeof(x)); memcpy(&y, &b, sizeof(y));
+        return x == y;
+    }
+    return a == b;
+}
+
+static int list_sort_compare(const MinyarSortOrder *order, long long a, long long b) {
+    if (order->comparator) {
+        long long result = order->comparator(order->context, order->snapshot[a], order->snapshot[b]);
+        return (result > 0) - (result < 0);
+    }
+    long long result = minyar_compare_slots(order->kind, a, b);
+    return (result > 0) - (result < 0);
 }
 
 /* Copy only the left run. Taking its equal element first preserves stability.

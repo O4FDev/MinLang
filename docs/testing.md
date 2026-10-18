@@ -16,6 +16,12 @@ Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.
 
+`make check-record-capabilities` checks structural equality, nominal type
+boundaries, finite-shape rejection and lexicographic ordering of records. It
+runs the ordered garden gallery, nested and empty records, Float edge cases,
+receiver lifetime and stable sorting at O0/O2 with ownership assertions.
+`check-record-capabilities-sanitize` adds ASan/UBSan.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit

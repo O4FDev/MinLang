@@ -454,8 +454,28 @@ Assignments can reach through fields and List positions, as in
 `world.chunks[0].blocks[5] = 1`. Scalar fields can always be assigned. Reference
 field mutation that can create a record/List cycle activates traced allocation;
 Map-related cycles remain restricted. See the
-[runtime memory contract](runtime-memory.md). Record equality is not supported.
+[runtime memory contract](runtime-memory.md).
 The receiver, index and assigned value are evaluated once, in that order.
+
+`Equatable`, `Ordered` and `Hashable` name capabilities of a type. Integer,
+Text, Character, Boolean and Float have these capabilities. A record derives
+them when every field has them and its shape is finite. Lists, Bytes, callbacks,
+native-layout records and recursive record shapes have no derived capability.
+Unsupported operations report the missing capability at compile time.
+
+Record `==` compares fields by meaning, including private fields and nested
+records; `!=` is its opposite. Separately allocated records can be equal.
+Aliasing and mutation retain their reference semantics. Equality does not test
+reference identity, and has no identity shortcut: a record containing NaN is
+unequal even to itself. Derived equality cannot recurse through a cycle.
+
+Record order is lexicographic in field declaration order. `list.sort()` and
+`list.sorted()` accept Ordered records, as do `<`, `>`, `<=` and `>=`.
+Primitive field order follows natural List sorting, including NaNs last and
+signed zeros equal. Sorting is stable; a sorted copy still shares its records.
+Derived comparisons examine the finite field shape without allocation or
+dynamic dispatch. Natural record sorting uses the comparator sorting workspace
+described above.
 
 A field marked `private` can be read, assigned and initialized only by code in
 the module that declares the record. Other modules can still name the record
