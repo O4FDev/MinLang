@@ -757,6 +757,9 @@ can name a record or call another function declared later in the file. Module
 constants and globals are also visible throughout their module. Local bindings
 still become visible where they are declared.
 
+The compiler retains resolved types and source spans for checked declarations,
+statements and expressions. See the [compiler syntax tree](compiler-syntax.md).
+
 `if` chains may continue with `else if`:
 
 ```minyar

@@ -35,6 +35,12 @@ kinds, then runs the constellation gallery at O0/O2 with ownership checks.
 records. Best-of-three CPU ratios must stay below 3x per doubling and 10x over
 the full 8x range; the typed records also exercise forward type lookup.
 
+`make check-syntax-tree` checks resolved node types, precedence, parent and
+sibling links, contained token ranges, cached origins, Unicode columns and
+full-width source positions at O0/O2. It also checks the file:line:column error
+API, builds 50,000 nested nodes without recursion, and runs the observatory
+gallery and expression fixtures with ownership assertions.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit

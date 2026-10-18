@@ -1,3 +1,48 @@
+function prepareSyntaxContext(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>): CompilerContext {
+    let features = tokenLines.features
+    let syntax = parseSyntaxDeclarations(tokenKinds, tokenTexts, tokenLines, tokenLines.inputPath, scannedStarts, scannedEnds)
+    let functionNames: List<Text> = []
+    let symbolKinds: List<Integer> = []
+    let symbolLocations: List<Text> = []
+    let functionReturnTypes: List<Integer> = []
+    let functionParameterCounts: List<Integer> = []
+    let functionParameterNames: List<Text> = []
+    let functionParameterTypes: List<Integer> = []
+    let declarationEnds: List<Integer> = []
+    let topLevelStatements = false
+    if scannedStarts.length > 0 {
+        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
+    } else {
+        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
+    }
+    tokenLines.symbolLookup = buildDeclarationIndex(functionNames, symbolKinds)
+    if (features / 1 % 2) != 0 { prepareCallbackSymbols(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts) }
+    let symbolLookup = tokenLines.symbolLookup
+    if symbolLookup[0] != functionNames.length { symbolLookup = buildDeclarationIndex(functionNames, symbolKinds) }
+    tokenLines.symbolLookup = symbolLookup
+    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
+    let parameterStarts: List<Integer> = []
+    let recordIndex = 0
+    while recordIndex < functionNames.length {
+        parameterStarts.add(0)
+        recordIndex = recordIndex + 1
+    }
+    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
+    appendParameterOffsets(functionParameterCounts, parameterStarts)
+    symbolLookup = buildDeclarationIndex(functionNames, symbolKinds)
+    tokenLines.symbolLookup = symbolLookup
+    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
+    let lookupPosition = 0
+    // Keep the metadata boundary at twice the symbol count for ownership data.
+    while lookupPosition < functionNames.length {
+        functionReturnTypes.add(lookupPosition)
+        lookupPosition = lookupPosition + 1
+    }
+
+    syntax.topLevel = topLevelStatements
+    return newCompilerContext(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, syntax)
+}
+
 function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): List<Text> {
     let features = tokenLines.features
     if features / 256 % 2 != 0 {
@@ -66,44 +111,14 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         }
         scan = scan + 1
     }
-    let functionNames: List<Text> = []
-    let symbolKinds: List<Integer> = []
-    let symbolLocations: List<Text> = []
-    let functionReturnTypes: List<Integer> = []
-    let functionParameterCounts: List<Integer> = []
-    let functionParameterNames: List<Text> = []
-    let functionParameterTypes: List<Integer> = []
-    let declarationEnds: List<Integer> = []
-    let topLevelStatements = false
-    if scannedStarts.length > 0 {
-        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
-    } else {
-        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
-    }
-    tokenLines.symbolLookup = buildDeclarationIndex(functionNames, symbolKinds)
-    if (features / 1 % 2) != 0 { prepareCallbackSymbols(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts) }
+    let context = prepareSyntaxContext(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds)
+    let functionNames = context.functionNames
+    let symbolKinds = context.symbolKinds
+    let functionReturnTypes = context.functionReturnTypes
+    let functionParameterCounts = context.functionParameterCounts
+    let functionParameterTypes = context.functionParameterTypes
     let symbolLookup = tokenLines.symbolLookup
-    if symbolLookup[0] != functionNames.length { symbolLookup = buildDeclarationIndex(functionNames, symbolKinds) }
-    tokenLines.symbolLookup = symbolLookup
-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
-    let parameterStarts: List<Integer> = []
-    let recordIndex = 0
-    while recordIndex < functionNames.length {
-        parameterStarts.add(0)
-        recordIndex = recordIndex + 1
-    }
-    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
-    appendParameterOffsets(functionParameterCounts, parameterStarts)
-    symbolLookup = buildDeclarationIndex(functionNames, symbolKinds)
-    tokenLines.symbolLookup = symbolLookup
-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
-    let lookupPosition = 0
-    // Keep the metadata boundary at twice the symbol count for ownership data.
-    while lookupPosition < functionNames.length {
-        functionReturnTypes.add(lookupPosition)
-        lookupPosition = lookupPosition + 1
-    }
-
+    let topLevelStatements = context.syntax.topLevel
     let output: List<Text> = []
     let globals: List<Text> = []
     let marker = 0
@@ -121,9 +136,8 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     let noStats: List<Integer> = []
     let mainFunction = findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "main", 1)
     if topLevelStatements && mainFunction >= 0 {
-        fail(describeLocation(symbolLocations[mainFunction]) + ": a program cannot combine top-level statements with function main()")
+        fail(describeLocation(tokenLocation(tokenLines, context.syntax.nodes[context.syntax.symbolNodes[mainFunction]].start + 1)) + ": a program cannot combine top-level statements with function main()")
     }
-    let context = newCompilerContext(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes)
     let constantDeclaration = output.length
     let constants = hasModuleConstants(symbolKinds, functionParameterCounts)
     compileModuleConstants(context, output, globals)

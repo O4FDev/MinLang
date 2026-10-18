@@ -1,0 +1,188 @@
+function checkSyntax(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function parsedSyntaxTree(source: Text): SyntaxTree {
+    let kinds: List<Integer> = []
+    let texts: List<Text> = []
+    let locations = newSourceMap()
+    locations.inputPath = "observatory/é🙂.min"
+    tokenize(source, kinds, texts, locations)
+    let features = locations.features
+    let empty: List<Integer> = []
+    if features / 256 % 2 != 0 {
+        let normalized = normalizeGenericTokens(kinds, texts, locations)
+        kinds = normalized.kinds
+        texts = normalized.texts
+        locations = normalized.lines
+        features = locations.features
+    }
+    if features / 64 % 2 != 0 {
+        let normalized = normalizeCallableTypes(kinds, texts, locations)
+        kinds = normalized.kinds
+        texts = normalized.texts
+        locations = normalized.lines
+    }
+    if features / 2 % 2 != 0 {
+        let normalized = normalizeResultTypes(kinds, texts, locations)
+        kinds = normalized.kinds
+        texts = normalized.texts
+        locations = normalized.lines
+    }
+    if features / 4096 % 2 != 0 {
+        let normalized = normalizeChoiceTypes(kinds, texts, locations)
+        kinds = normalized.kinds
+        texts = normalized.texts
+        locations = normalized.lines
+    }
+    if features % 2 != 0 {
+        let normalized = normalizeCallbackTokens(kinds, texts, locations, empty, empty)
+        kinds = normalized.kinds
+        texts = normalized.texts
+        locations = normalized.lines
+    }
+    let context = prepareSyntaxContext(kinds, texts, locations, empty, empty)
+    let output: List<Text> = []
+    let globals: List<Text> = []
+    compileModuleConstants(context, output, globals)
+    compileFunctions(context, output, globals, 0, "", empty)
+    if findFunction(context.functionNames, context.symbolKinds, locations.symbolLookup, "main") < 0 {
+        compileTopLevel(context, output, globals, "", empty)
+    }
+    if features % 2 != 0 { compileClosureBodies(context, output, globals, 0) }
+    return context.syntax
+}
+
+function checkParsedSyntax(tree: SyntaxTree, counts: List<Integer>) {
+    checkSyntax(tree.active == 0, "parser leaves the module active")
+    let visited: List<Boolean> = []
+    let position = 0
+    while position < tree.nodes.length { visited.add(false); position = position + 1 }
+    let pending: List<Integer> = [0]
+    position = 0
+    while position < pending.length {
+        let node = pending[position]
+        position = position + 1
+        checkSyntax(node >= 0 && node < visited.length && !visited[node], "acyclic node identity")
+        visited[node] = true
+        let kind = tree.nodes[node].kind
+        checkSyntax(syntaxKindName(kind) != "unknown", "registered node kind")
+        counts[kind] = counts[kind] + 1
+        checkSyntax(tree.nodes[node].type != 0, "resolved type for " + syntaxKindName(kind))
+        checkSyntax(tree.nodes[node].start >= 0 && tree.nodes[node].end >= tree.nodes[node].start, "half-open node span")
+        let span = syntaxSpan(tree, node)
+        checkSyntax(span.file == "observatory/é🙂.min" && span.line > 0 && span.column > 0, "every node has a source span")
+        let previous = -1
+        let child = tree.nodes[node].firstChild
+        while child >= 0 {
+            checkSyntax(tree.nodes[child].parent == node && tree.nodes[child].previousSibling == previous, "parent and sibling identity")
+            checkSyntax(tree.nodes[child].start >= tree.nodes[node].start && tree.nodes[child].end <= tree.nodes[node].end, "child " + syntaxKindName(tree.nodes[child].kind) + " [" + Text(tree.nodes[child].start) + "," + Text(tree.nodes[child].end) + ") within " + syntaxKindName(kind) + " [" + Text(tree.nodes[node].start) + "," + Text(tree.nodes[node].end) + ")")
+            pending.add(child)
+            previous = child
+            child = tree.nodes[child].nextSibling
+        }
+        checkSyntax(previous == tree.nodes[node].lastChild, "last child identity")
+    }
+    checkSyntax(pending.length == tree.nodes.length, "every node is reachable exactly once")
+}
+
+function main() {
+    if processInfo.argumentCount() > 0 {
+        let errorKinds: List<Integer> = []
+        let errorTexts: List<Text> = []
+        let errorSource = newSourceMap()
+        errorSource.inputPath = "folder/é🙂.min"
+        addToken(errorKinds, errorTexts, errorSource.coordinates, 1, "star", 4294967297, 9)
+        failAtToken(errorSource, 0, "expected a star")
+    }
+    let kinds: List<Integer> = []
+    let texts: List<Text> = []
+    let sources = newSourceMap()
+    tokenize("function sample(): Integer {\n    return 2 + 3 * 4\n}\n", kinds, texts, sources)
+    let empty: List<Integer> = []
+    let tree = parseSyntaxDeclarations(kinds, texts, sources, "observatory/é🙂.min", empty, empty)
+    checkSyntax(tree.declarations.length == 1 && !tree.topLevel, "declaration shape")
+    let declaration = tree.declarations[0]
+    checkSyntax(tree.nodes[declaration].kind == 1 && tree.nodes[declaration].parent == 0, "declaration parent/kind")
+    checkSyntax(describeSpan(syntaxSpan(tree, declaration)) == "observatory/é🙂.min:1:1", "declaration span")
+    tree.active = declaration
+    let statement = beginSyntaxNode(tree, 105, findText(texts, "return"))
+    let two = findText(texts, "2")
+    let three = findText(texts, "3")
+    let four = findText(texts, "4")
+    let left = beginSyntaxNode(tree, 201, two)
+    endSyntaxNode(tree, left, two + 1, 1)
+    let add = wrapSyntaxOperand(tree, 221, findText(texts, "+"))
+    let middle = beginSyntaxNode(tree, 201, three)
+    endSyntaxNode(tree, middle, three + 1, 1)
+    let multiply = wrapSyntaxOperand(tree, 221, findText(texts, "*"))
+    let right = beginSyntaxNode(tree, 201, four)
+    endSyntaxNode(tree, right, four + 1, 1)
+    endSyntaxNode(tree, multiply, four + 1, 1)
+    endSyntaxNode(tree, add, four + 1, 1)
+    endSyntaxNode(tree, statement, four + 1, 5)
+    checkSyntax(tree.active == declaration, "balanced builder")
+    checkSyntax(tree.nodes[statement].firstChild == add && tree.nodes[statement].lastChild == add, "operator replaces operand")
+    checkSyntax(tree.nodes[add].firstChild == left && tree.nodes[add].lastChild == multiply, "add operands")
+    checkSyntax(tree.nodes[left].nextSibling == multiply && tree.nodes[multiply].previousSibling == left, "sibling links")
+    checkSyntax(tree.nodes[multiply].firstChild == middle && tree.nodes[middle].nextSibling == right, "precedence children")
+    checkSyntax(tree.nodes[left].parent == add && tree.nodes[middle].parent == multiply && tree.nodes[right].parent == multiply, "operator parents")
+    checkSyntax(tree.nodes[add].type == 1 && tree.nodes[statement].type == 5, "resolved types")
+    checkSyntax(describeSpan(syntaxSpan(tree, add)) == "observatory/é🙂.min:2:12", "expression span")
+    checkSyntax(tree.nodes[add].start == two && tree.nodes[add].end == four + 1, "half-open token range")
+
+    let cachedKinds: List<Integer> = []
+    let cachedTexts: List<Text> = []
+    let cached = newSourceMap()
+    addToken(cachedKinds, cachedTexts, cached.coordinates, 1, "value", 4294967297, 9223372036854775807)
+    let cachedTree = newSyntaxTree(cached, "cached.min", 1)
+    checkSyntax(describeSpan(syntaxSpan(cachedTree, 0)) == "cached.min:4294967297:9223372036854775807", "full-width source positions")
+    let path = sourcePath(cached, "folder/é🙂.min")
+    setTokenPath(cached, 0, path)
+    setTokenOrigin(cached, 0, "8, column 13")
+    checkSyntax(describeSpan(syntaxSpan(cachedTree, 0)) == "folder/é🙂.min:8:13", "cached origin span")
+    setTokenPath(cached, 0, 0)
+    setTokenOrigin(cached, 0, "other/é🙂.min:12, column 34")
+    checkSyntax(describeSpan(syntaxSpan(cachedTree, 0)) == "other/é🙂.min:12:34", "cached origin supplies its file")
+    let unicodeKinds: List<Integer> = []
+    let unicodeTexts: List<Text> = []
+    let unicodeSource = newSourceMap()
+    tokenize("let line = \"é🙂\"; print(1)\n", unicodeKinds, unicodeTexts, unicodeSource)
+    let one = findText(unicodeTexts, "1")
+    checkSyntax(describeSpan(sourceSpan(unicodeSource, "unicode.min", one, one + 1)) == "unicode.min:1:24", "Unicode scalar columns")
+    let noSource = newSourceMap()
+    let noTree = newSyntaxTree(noSource, "", 0)
+    checkSyntax(describeSpan(syntaxSpan(noTree, 0)) == "<source>:1:1", "synthetic source span")
+    let counts: List<Integer> = []
+    let count = 0
+    while count < 222 { counts.add(0); count = count + 1 }
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("examples/gallery/observatory.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("tests/syntax-tree-cases/expressions.min")), counts)
+    checkSyntax(counts[211] > 0, "brace map literal has a map node")
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("tests/syntax-tree-cases/results.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("tests/syntax-tree-cases/native.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("tests/syntax-tree-cases/declarations.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("examples/gallery/choice.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("examples/gallery/generics.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("examples/gallery/ordered-garden.min")), counts)
+    checkParsedSyntax(parsedSyntaxTree(io.readTextFile("examples/gallery/seed-library.min")), counts)
+    let required: List<Integer> = [1, 2, 3, 4, 5, 6, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 220, 221]
+    count = 0
+    while count < required.length {
+        checkSyntax(counts[required[count]] > 0, "parsed kind coverage: " + syntaxKindName(required[count]))
+        count = count + 1
+    }
+    let deep = newSyntaxTree(noSource, "deep.min", 1)
+    count = 0
+    while count < 50000 {
+        beginSyntaxNode(deep, 100, 0)
+        count = count + 1
+    }
+    count = deep.nodes.length - 1
+    while count > 0 {
+        endSyntaxNode(deep, count, 1, 5)
+        count = count - 1
+    }
+    checkSyntax(deep.active == 0 && deep.nodes.length == 50001, "constant-stack tree construction")
+    print("syntax tree verified")
+}

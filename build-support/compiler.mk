@@ -1,4 +1,5 @@
 COMPILER_SOURCES = compiler/stages/source.min \
+	compiler/stages/syntax.min \
 	compiler/stages/lexer.min \
 	compiler/stages/symbols.min \
 	compiler/stages/declarations.min \

@@ -1,0 +1,370 @@
+// Stable IDs keep links flat and traversals iterative. Node records are
+// cheaper than repeated column-list accesses; see docs/compiler-syntax.md.
+record SyntaxNode {
+    kind: Integer
+    type: Integer
+    start: Integer
+    end: Integer
+    parent: Integer
+    firstChild: Integer
+    lastChild: Integer
+    nextSibling: Integer
+    previousSibling: Integer
+    symbol: Integer
+    body: Integer
+    operator: Integer
+}
+
+record SyntaxTree {
+    nodes: List<SyntaxNode>
+    declarations: List<Integer>
+    symbolNodes: List<Integer>
+    sources: SourceMap
+    file: Text
+    active: Integer
+    lastValue: Integer
+    topLevel: Boolean
+}
+
+record SourceSpan {
+    file: Text
+    line: Integer
+    column: Integer
+    firstToken: Integer
+    afterToken: Integer
+}
+
+record CompilerContext {
+    activeReturnType: Integer
+    tokenKinds: List<Integer>
+    tokenTexts: List<Text>
+    tokenLines: SourceMap
+    syntax: SyntaxTree
+    functionNames: List<Text>
+    symbolKinds: List<Integer>
+    functionReturnTypes: List<Integer>
+    functionParameterCounts: List<Integer>
+    functionParameterNames: List<Text>
+    functionParameterTypes: List<Integer>
+    callTargets: List<Integer>
+    functionIRNames: List<Text>
+    nativeLibraries: List<Text>
+    nativePrototypes: List<Text>
+    cLayouts: List<Integer>
+    cFields: List<Integer>
+}
+
+function newCompilerContext(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, syntax: SyntaxTree): CompilerContext {
+    if tokenLines.symbolLookup.length == 0 { tokenLines.symbolLookup = buildDeclarationIndex(functionNames, symbolKinds) }
+    if tokenLines.symbolLookup[0] != functionNames.length { tokenLines.symbolLookup = buildDeclarationIndex(functionNames, symbolKinds) }
+    bindSyntaxDeclarations(syntax, tokenKinds, tokenTexts, functionNames, symbolKinds, tokenLines.symbolLookup, functionReturnTypes, functionParameterCounts, functionParameterTypes)
+    let callTargets: List<Integer> = []
+    let functionIRNames: List<Text> = []
+    let nativeLibraries: List<Text> = []
+    let nativePrototypes: List<Text> = []
+    let index = 0
+    while index < functionNames.length {
+        let name = functionNames[index]
+        if symbolKinds[index] == 1 && name[0] != '"' { name = ".minyar.fn." + name }
+        functionIRNames.add(name)
+        index = index + 1
+    }
+    let cLayouts: List<Integer> = []
+    let cFields: List<Integer> = []
+    if tokenLines.features / 32 % 2 != 0 { discoverCLayouts(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterTypes, cLayouts, cFields) }
+    let context = CompilerContext { activeReturnType: 0, syntax: syntax, cLayouts: cLayouts, cFields: cFields, nativeLibraries: nativeLibraries, nativePrototypes: nativePrototypes, functionIRNames: functionIRNames, callTargets: callTargets, tokenKinds: tokenKinds, tokenTexts: tokenTexts, tokenLines: tokenLines, functionNames: functionNames, symbolKinds: symbolKinds, functionReturnTypes: functionReturnTypes, functionParameterCounts: functionParameterCounts, functionParameterNames: functionParameterNames, functionParameterTypes: functionParameterTypes }
+    index = 0
+    while index < functionNames.length { validateCollectionTypeCapabilities(context, functionReturnTypes[index]); index = index + 1 }
+    index = 0
+    while index < functionParameterTypes.length { validateCollectionTypeCapabilities(context, functionParameterTypes[index]); index = index + 1 }
+    return context
+}
+
+function appendSyntaxNode(tree: SyntaxTree, kind: Integer, start: Integer, end: Integer, parent: Integer, type: Integer, symbol: Integer): Integer {
+    let node = tree.nodes.length
+    let previous = -1
+    if parent >= 0 { previous = tree.nodes[parent].lastChild }
+    tree.nodes.add(SyntaxNode { kind: kind, type: type, start: start, end: end, parent: parent, firstChild: -1, lastChild: -1, nextSibling: -1, previousSibling: previous, symbol: symbol, body: -1, operator: -1 })
+    if parent >= 0 {
+        if previous < 0 { tree.nodes[parent].firstChild = node }
+        else { tree.nodes[previous].nextSibling = node }
+        tree.nodes[parent].lastChild = node
+    }
+    return node
+}
+
+function newSyntaxTree(sources: SourceMap, file: Text, tokenCount: Integer): SyntaxTree {
+    let nodes: List<SyntaxNode> = []
+    let declarations: List<Integer> = []
+    let symbolNodes: List<Integer> = []
+    let tree = SyntaxTree { nodes: nodes, declarations: declarations, symbolNodes: symbolNodes, sources: sources, file: file, active: 0, lastValue: -1, topLevel: false }
+    appendSyntaxNode(tree, 0, 0, tokenCount, -1, 5, -1)
+    return tree
+}
+
+function beginSyntaxNode(tree: SyntaxTree, kind: Integer, start: Integer): Integer {
+    let node = appendSyntaxNode(tree, kind, start, start, tree.active, 0, -1)
+    tree.active = node
+    return node
+}
+
+function endSyntaxNode(tree: SyntaxTree, node: Integer, end: Integer, type: Integer) {
+    if tree.active != node { fail("unbalanced syntax node") }
+    tree.nodes[node].end = end
+    tree.nodes[node].type = type
+    tree.active = tree.nodes[node].parent
+    tree.lastValue = node
+}
+
+// Replace the last completed operand by an operator node in constant time.
+// The right operand will be parsed as its next child. This preserves the
+// parser's precedence and associativity without parsing expressions again.
+function wrapSyntaxOperand(tree: SyntaxTree, kind: Integer, operator: Integer): Integer {
+    let left = tree.lastValue
+    if left < 0 { fail("missing syntax operand") }
+    let parent = tree.nodes[left].parent
+    if parent != tree.active || tree.nodes[left].nextSibling >= 0 { fail("syntax operand is not the final child") }
+    let previous = tree.nodes[left].previousSibling
+    let node = appendSyntaxNode(tree, kind, tree.nodes[left].start, tree.nodes[left].end, -1, 0, -1)
+    tree.nodes[node].parent = parent
+    tree.nodes[node].previousSibling = previous
+    if previous < 0 { tree.nodes[parent].firstChild = node }
+    else { tree.nodes[previous].nextSibling = node }
+    tree.nodes[parent].lastChild = node
+    tree.nodes[left].parent = node
+    tree.nodes[left].previousSibling = -1
+    tree.nodes[left].nextSibling = -1
+    tree.nodes[node].firstChild = left
+    tree.nodes[node].lastChild = left
+    tree.nodes[node].operator = operator
+    tree.active = node
+    return node
+}
+
+function syntaxDeclarationKind(kinds: List<Integer>, texts: List<Text>, position: Integer): Integer {
+    if kinds[position] != 1 { return 0 }
+    let word = texts[position]
+    if word == "function" { return 1 }
+    if word == "record" { return 2 }
+    if word == "constant" { return 3 }
+    if word == "global" { return 4 }
+    return 0
+}
+
+function addSyntaxDeclaration(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer) {
+    let kind = syntaxDeclarationKind(kinds, texts, start)
+    if kind == 0 { tree.topLevel = true; return }
+    let node = appendSyntaxNode(tree, kind, start, end, 0, 0, -1)
+    if kind == 1 || kind == 2 {
+        let body = start
+        while body < end && !(kinds[body] == 4 && texts[body] == "{") { body = body + 1 }
+        tree.nodes[node].body = body
+    }
+    tree.declarations.add(node)
+}
+
+function bindSyntaxDeclarations(tree: SyntaxTree, tokens: List<Integer>, texts: List<Text>, names: List<Text>, kinds: List<Integer>, lookup: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameterTypes: List<Integer>) {
+    let position = 0
+    while position < names.length { tree.symbolNodes.add(-1); position = position + 1 }
+    position = 0
+    while position < tree.declarations.length {
+        let node = tree.declarations[position]
+        let kind = tree.nodes[node].kind
+        if kind == 4 { kind = 3 }
+        let symbol = findIndexedSymbol(lookup, names, kinds, texts[tree.nodes[node].start + 1], kind)
+        if symbol < 0 { fail("syntax declaration is missing its symbol") }
+        tree.nodes[node].symbol = symbol
+        tree.symbolNodes[symbol] = node
+        tree.nodes[node].type = returns[symbol]
+        if kind == 1 || kind == 2 {
+            let first = functionParameterOffset(counts, symbol)
+            let field = 0
+            let token = tree.nodes[node].start + 2
+            let limit = tree.nodes[node].body
+            let bindingKind = 6
+            if kind == 2 {
+                bindingKind = 5
+                token = tree.nodes[node].body + 1
+                limit = tree.nodes[node].end
+            }
+            while token + 1 < limit {
+                if tokens[token] == 1 && texts[token + 1] == ":" && field < counts[symbol] {
+                    appendSyntaxNode(tree, bindingKind, token, token + 1, node, parameterTypes[first + field], first + field)
+                    field = field + 1
+                }
+                token = token + 1
+            }
+            if field != counts[symbol] { fail("syntax header is missing a binding") }
+        }
+        if kind == 3 {
+            let value = tree.nodes[node].start
+            while value < tree.nodes[node].end && !(tokens[value] == 4 && texts[value] == "=") { value = value + 1 }
+            value = value + 1
+            tree.nodes[node].body = value
+            if counts[symbol] >= 0 {
+                let literal = value
+                if texts[literal] == "-" { literal = literal + 1 }
+                appendSyntaxNode(tree, syntaxPrimaryKind(tokens, texts, literal), value, literal + 1, node, returns[symbol], -1)
+            }
+        }
+        position = position + 1
+    }
+}
+
+function parseSyntaxDeclarations(kinds: List<Integer>, texts: List<Text>, sources: SourceMap, file: Text, starts: List<Integer>, ends: List<Integer>): SyntaxTree {
+    let tree = newSyntaxTree(sources, file, kinds.length - 1)
+    if starts.length > 0 {
+        let scanned = 0
+        let declaration = 0
+        while scanned < starts.length {
+            let start = starts[scanned]
+            if start < 0 { tree.topLevel = true } else {
+                addSyntaxDeclaration(tree, kinds, texts, start, ends[declaration])
+                declaration = declaration + 1
+            }
+            scanned = scanned + 1
+        }
+        return tree
+    }
+    let cursor: List<Integer> = [0]
+    skipTerminators(kinds, cursor)
+    while kinds[cursor[0]] != 0 {
+        let start = cursor[0]
+        let kind = syntaxDeclarationKind(kinds, texts, start)
+        if kind == 1 || kind == 2 { skipDeclaration(kinds, texts, cursor) }
+        else { skipTopLevelStatement(kinds, texts, cursor) }
+        addSyntaxDeclaration(tree, kinds, texts, start, cursor[0])
+        skipTerminators(kinds, cursor)
+    }
+    return tree
+}
+
+function syntaxStatementKind(word: Text): Integer {
+    if word == "if" { return 101 }
+    if word == "while" { return 102 }
+    if word == "for" { return 103 }
+    if word == "let" || word == "constant" { return 104 }
+    if word == "return" { return 105 }
+    if word == "break" { return 106 }
+    if word == "continue" { return 107 }
+    if word == "match" { return 108 }
+    if word == "native" { return 109 }
+    return 110
+}
+
+function syntaxPrimaryKind(kinds: List<Integer>, texts: List<Text>, position: Integer): Integer {
+    let kind = kinds[position]
+    if kind == 2 { return 201 }
+    if kind == 3 { return 202 }
+    if kind == 5 { return 203 }
+    if kind == 7 { return 204 }
+    let word = texts[position]
+    if word == "true" || word == "false" { return 205 }
+    if word == "[" { return 206 }
+    if word == "(" { return 207 }
+    if word == "function" { return 208 }
+    if word == "Map" || word == "{" { return 211 }
+    if word == "Set" { return 215 }
+    if position + 1 < texts.length && texts[position + 1] == "(" { return 209 }
+    if position + 1 < texts.length && texts[position + 1] == "{" { return 210 }
+    return 200
+}
+
+function spanNatural(text: Text, start: Integer, end: Integer): Integer {
+    let value = 0
+    let position = start
+    while position < end {
+        let digit = Integer(text[position]) - 48
+        if digit < 0 || digit > 9 || value > 922337203685477580 || (value == 922337203685477580 && digit > 7) { return 0 }
+        value = value * 10 + digit
+        position = position + 1
+    }
+    return value
+}
+
+function sourceSpan(sources: SourceMap, file: Text, start: Integer, end: Integer): SourceSpan {
+    let line = 1
+    let column = 1
+    if start >= 0 && start * 2 + 1 < sources.coordinates.length {
+        let path = tokenPath(sources, start)
+        line = sources.coordinates[start * 2]
+        if path != "" && line != 0 { file = path }
+        column = sources.coordinates[start * 2 + 1]
+        if line == -1 {
+            let origin = sources.origins[start]
+            let comma = findCharacter(origin, ',')
+            let first = 0
+            let position = 0
+            while position < comma {
+                if origin[position] == ':' { first = position + 1 }
+                position = position + 1
+            }
+            if first > 0 && path == "" { file = origin.slice(0, first - 1) }
+            if comma >= 0 && comma + 9 <= origin.length {
+                line = spanNatural(origin, first, comma)
+                column = spanNatural(origin, comma + 9, origin.length)
+            }
+        }
+    }
+    if file == "" { file = "<source>" }
+    if line < 1 { line = 1 }
+    if column < 1 { column = 1 }
+    return SourceSpan { file: file, line: line, column: column, firstToken: start, afterToken: end }
+}
+
+function syntaxSpan(tree: SyntaxTree, node: Integer): SourceSpan {
+    return sourceSpan(tree.sources, tree.file, tree.nodes[node].start, tree.nodes[node].end)
+}
+
+function describeSpan(span: SourceSpan): Text {
+    return span.file + ":" + Text(span.line) + ":" + Text(span.column)
+}
+
+function failAtSyntax(tree: SyntaxTree, node: Integer, message: Text) {
+    fail(describeSpan(syntaxSpan(tree, node)) + ": " + message)
+}
+
+function failAtToken(sources: SourceMap, position: Integer, message: Text) {
+    fail(describeSpan(sourceSpan(sources, sources.inputPath, position, position + 1)) + ": " + message)
+}
+
+function syntaxKindName(kind: Integer): Text {
+    if kind == 0 { return "module" }
+    if kind == 1 { return "function" }
+    if kind == 2 { return "record" }
+    if kind == 3 { return "constant" }
+    if kind == 4 { return "global" }
+    if kind == 5 { return "field" }
+    if kind == 6 { return "parameter" }
+    if kind == 100 { return "block" }
+    if kind == 101 { return "if" }
+    if kind == 102 { return "while" }
+    if kind == 103 { return "for" }
+    if kind == 104 { return "binding" }
+    if kind == 105 { return "return" }
+    if kind == 106 { return "break" }
+    if kind == 107 { return "continue" }
+    if kind == 108 { return "match" }
+    if kind == 109 { return "native" }
+    if kind == 110 { return "expression statement" }
+    if kind == 111 { return "assignment" }
+    if kind == 200 { return "name" }
+    if kind == 201 { return "integer" }
+    if kind == 202 { return "text" }
+    if kind == 203 { return "character" }
+    if kind == 204 { return "float" }
+    if kind == 205 { return "boolean" }
+    if kind == 206 { return "list" }
+    if kind == 207 { return "group" }
+    if kind == 208 { return "closure" }
+    if kind == 209 { return "call" }
+    if kind == 210 { return "record literal" }
+    if kind == 211 { return "map" }
+    if kind == 212 { return "member" }
+    if kind == 213 { return "index" }
+    if kind == 214 { return "assignment target" }
+    if kind == 215 { return "set" }
+    if kind == 220 { return "unary" }
+    if kind == 221 { return "binary" }
+    return "unknown"
+}
