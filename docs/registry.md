@@ -31,7 +31,8 @@ minyar registry serve ./public 8080
 The builder merges records with an existing index. A published
 `repository@version` record is immutable, and rebuilding identical input is
 deterministic. The server binds loopback only and accepts GET/HEAD. It serves
-`index.json`, `checksums.txt`, `install` and files below `releases/`; traversal and
+`index.json`, `checksums.txt`, `install`, `latest`, `latest.sig` and files below
+`releases/`; traversal and
 symlink escapes fail. It accepts no uploads. Its per-response limit is 16 MiB,
 suited to index development and small installer fixtures. Serve full LLVM
 toolchain archives directly from a static host with appropriate large-file limits.

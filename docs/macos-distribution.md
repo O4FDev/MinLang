@@ -34,6 +34,12 @@ and Apple's SDK.
 
 ## Install a candidate
 
+The [signed bootstrap installer](install.md) can install these same archives
+into `~/.minyar` with version selection and per-project pins. It verifies an
+Ed25519 release signature and archive checksum. The archive installer described
+below remains available for the legacy `~/.local` layout. Both paths require
+the platform qualification and Apple signing gate described below.
+
 Download the matching archive and its checksum from the same trusted release
 channel, verify before extracting, then run the installer:
 

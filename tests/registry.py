@@ -36,7 +36,7 @@ def main():
     launcher, registry_cli, project_root = map(lambda value: Path(value).resolve(), sys.argv[1:4])
     with tempfile.TemporaryDirectory(prefix="minyar registry ") as temporary:
         root = Path(temporary)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k not in ("MINYAR_HOME", "MINYAR_REGISTRY", "MINYAR_GIT_MIRROR")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k not in ("MINYAR_HOME", "MINYAR_REGISTRY", "MINYAR_GIT_MIRROR", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS")}
         env.update(MINYAR_HOME=str(root / "home"), MINYAR_PROJECT_DIR=str(project_root), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
         package = root / "lumen"
         (package / "src").mkdir(parents=True)
@@ -108,6 +108,8 @@ def main():
         run([launcher, "tree", "--locked", "--offline"], env, application, "registry checksum mismatch")
         index_path.write_bytes(initial)
         (public / "install").write_text("# local installer fixture\n")
+        (public / "latest").write_text("0.1.0\n")
+        (public / "latest.sig").write_bytes(b"signature fixture\n")
         outside = root / "not-public"
         outside.write_text("private")
         (public / "releases").mkdir()
@@ -133,6 +135,8 @@ def main():
             assert status == 200 and body == initial and headers["x-content-type-options"] == "nosniff"
             assert request("HEAD", "/checksums.txt")[2] == b""
             assert request("GET", "/install")[0] == 200
+            assert request("GET", "/latest")[2] == b"0.1.0\n"
+            assert request("GET", "/latest.sig")[2] == b"signature fixture\n"
             for path in ("/../not-public", "/releases/escape", "/%2e%2e/not-public", "/.git/config"):
                 assert request("GET", path)[0] == 404, path
             assert request("POST", "/index.json")[0] == 405

@@ -98,7 +98,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix=".minyar-package-", dir=args.output) as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
-        for item in ["minyar", "Makefile", "LICENSE", "compiler", "runtime", "library", "tools", "scripts", "bootstrap", "vendor", "build-support"]:
+        for item in ["minyar", "Makefile", "LICENSE", "compiler", "runtime", "library", "tools", "scripts", "bootstrap", "vendor", "build-support", "install"]:
             copy(ROOT / item, stage / item)
         for item in EXECUTABLES + RUNTIMES:
             copy(ROOT / "build" / item, stage / "build" / item)

@@ -1,5 +1,9 @@
 # Developer CLI
 
+The [signed installer and toolchain manager](install.md) install into
+`~/.minyar`, keep versions side by side and select project versions from
+`minyar-toolchain`. The release host is configurable; no public host is live yet.
+
 The [macOS binary distribution](macos-distribution.md) supplies prebuilt tools
 and bundled LLVM. Run its `sh install.sh`; the source-build prerequisites below
 apply when installing from a checkout. The Apple macOS SDK is required in both
