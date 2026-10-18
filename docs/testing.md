@@ -53,6 +53,16 @@ It runs generated programs at O0/O2 with ownership assertions and verifies that
 Swift experiments cannot be selected as ordinary backends.
 `check-language-ergonomics-sanitize` adds ASan/UBSan to the language cases.
 
+`make check-generics` checks inferred and explicit generic calls, result-context
+inference, recursion, shared module instantiations, and rejection diagnostics.
+Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition
+counts check unboxed scalar calls and diamond-import deduplication. The generics
+gallery is an executable output fixture. `check-generics-sanitize` repeats the
+suite with compiler and generated-program sanitizers.
+`make check-generics-smoke` is the fast landing check for native signatures,
+executable O0/O2 output and a rejection diagnostic. Run the full ownership suite
+before queueing the landing.
+
 `make check-library-contracts` checks JSON control-character round trips and
 strict lookup helpers, then exercises HTTP clients against local socket peers.
 Cases include truncated and malformed responses, split headers, bodyless and

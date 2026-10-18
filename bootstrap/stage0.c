@@ -39,6 +39,24 @@ enum {
 
 typedef int Type;
 
+static void fail_at(int line, int column, const char *format, ...);
+
+static int bootstrap_is_list(Type type) {
+    return (type >= TYPE_LIST_INTEGER && type <= TYPE_LIST_BOOLEAN) || type >= 100000;
+}
+
+static Type bootstrap_list_type(Type element) {
+    if (element >= TYPE_INTEGER && element <= TYPE_BOOLEAN)
+        return TYPE_LIST_INTEGER + element - TYPE_INTEGER;
+    if (element > INT_MAX - 100000)
+        fail_at(1, 1, "bootstrap List nesting exceeds the supported limit");
+    return 100000 + element;
+}
+
+static Type bootstrap_list_element(Type type) {
+    return type >= 100000 ? type - 100000 : TYPE_INTEGER + type - TYPE_LIST_INTEGER;
+}
+
 typedef struct Expression Expression;
 typedef struct Statement Statement;
 typedef struct Function Function;
@@ -483,11 +501,11 @@ static Type parse_type(Parser *parser) {
         advance(parser);
         expect(parser, '<', "'<' followed by the list's element type");
         type = parse_type(parser);
-        if (type < TYPE_INTEGER || type > TYPE_BOOLEAN || type == TYPE_NOTHING)
+        if (type == TYPE_UNKNOWN || type == TYPE_NOTHING)
             fail_at(parser->token.line, parser->token.column,
-                    "lists currently contain Integer, Text, Character, or Boolean values");
+                    "a bootstrap List needs a value element type");
         expect(parser, '>', "a closing '>' after the list's element type");
-        return TYPE_LIST_INTEGER + type - TYPE_INTEGER;
+        return bootstrap_list_type(type);
     } else {
         int record = parser->token.kind == TOKEN_NAME
                          ? find_record(&parser->program, parser->token.text)
@@ -955,6 +973,7 @@ static Program parse_program(char *source) {
 }
 
 static const char *type_name(Type type) {
+    if (type >= 100000) return "a List";
     switch (type) {
     case TYPE_INTEGER:
         return "Integer";
@@ -1038,6 +1057,13 @@ static void require_type(Expression *expression, Type actual, Type expected, con
                 type_name(actual));
 }
 
+static void bootstrap_context(Expression *expression, Type expected) {
+    if (expression->kind != EXPRESSION_LIST || !bootstrap_is_list(expected)) return;
+    expression->type = expected;
+    for (int index = 0; index < arrlen(expression->arguments); index++)
+        bootstrap_context(expression->arguments[index], bootstrap_list_element(expected));
+}
+
 static Type check_expression(Program *program, Function *function, Expression *expression) {
     Type left;
     Type right;
@@ -1074,6 +1100,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
                     fail_at(expression->line, expression->column,
                             "record field '%s' is provided more than once",
                             expression->field_names[index]);
+            bootstrap_context(expression->arguments[index], record->fields[field].type);
             left = check_expression(program, function, expression->arguments[index]);
             if (left != record->fields[field].type)
                 fail_at(expression->line, expression->column,
@@ -1206,6 +1233,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
                     "%s expects %td arguments, but this call provides %td", expression->text,
                     arrlen(expression->function->parameters), arrlen(expression->arguments));
         for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
+            bootstrap_context(expression->arguments[index], expression->function->parameters[index].type);
             left = check_expression(program, function, expression->arguments[index]);
             require_type(expression->arguments[index], left,
                          expression->function->parameters[index].type, "this function argument");
@@ -1252,7 +1280,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
         return expression->type = TYPE_INTEGER;
     case EXPRESSION_MEMBER:
         left = check_expression(program, function, expression->left);
-        if (left >= TYPE_RECORD_START) {
+        if (left >= TYPE_RECORD_START && !bootstrap_is_list(left)) {
             Record *record = &program->records[left - TYPE_RECORD_START];
             for (int field = 0; field < arrlen(record->fields); field++)
                 if (!strcmp(record->fields[field].name, expression->text)) {
@@ -1265,7 +1293,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (left == TYPE_TEXT && strcmp(expression->text, "byteLength") == 0)
             return expression->type = TYPE_INTEGER;
         if ((left == TYPE_TEXT || left == TYPE_BYTES ||
-             (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)) &&
+             bootstrap_is_list(left)) &&
             strcmp(expression->text, "length") == 0)
             return expression->type = TYPE_INTEGER;
         fail_at(expression->line, expression->column, "%s does not have a property named '%s'",
@@ -1279,18 +1307,18 @@ static Type check_expression(Program *program, Function *function, Expression *e
             return expression->type = TYPE_CHARACTER;
         if (left == TYPE_BYTES)
             return expression->type = TYPE_INTEGER;
-        if (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)
-            return expression->type = TYPE_INTEGER + left - TYPE_LIST_INTEGER;
+        if (bootstrap_is_list(left))
+            return expression->type = bootstrap_list_element(left);
         fail_at(expression->line, expression->column, "%s values cannot be accessed by position",
                 type_name(left));
         return TYPE_UNKNOWN;
     case EXPRESSION_LIST:
         if (arrlen(expression->arguments)) {
             left = check_expression(program, function, expression->arguments[0]);
-            if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
+            if (left == TYPE_UNKNOWN || left == TYPE_NOTHING)
                 fail_at(expression->line, expression->column,
-                        "bootstrap List elements must be scalar or Text");
-            Type inferred = TYPE_LIST_INTEGER + left - TYPE_INTEGER;
+                        "bootstrap List elements must be values");
+            Type inferred = bootstrap_list_type(left);
             if (expression->type != TYPE_UNKNOWN && expression->type != inferred)
                 fail_at(expression->line, expression->column,
                         "this List literal has a different element type");
@@ -1353,10 +1381,12 @@ static Type check_expression(Program *program, Function *function, Expression *e
             }
             return expression->type = TYPE_TEXT;
         }
-        if (left < TYPE_LIST_INTEGER || left > TYPE_LIST_BOOLEAN)
+        if (!bootstrap_is_list(left))
             fail_at(expression->line, expression->column, "%s does not provide the '%s' operation",
                     type_name(left), expression->text);
         if (!strcmp(expression->text, "sort") || !strcmp(expression->text, "sorted")) {
+            if (bootstrap_list_element(left) < TYPE_INTEGER || bootstrap_list_element(left) > TYPE_BOOLEAN)
+                fail_at(expression->line, expression->column, "this bootstrap List element type has no natural order");
             if (arrlen(expression->arguments) != 0)
                 fail_at(expression->line, expression->column, "List.%s expects no arguments",
                         expression->text);
@@ -1373,7 +1403,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (arrlen(expression->arguments) != 1)
             fail_at(expression->line, expression->column, "list.add expects exactly one value");
         right = check_expression(program, function, expression->arguments[0]);
-        require_type(expression->arguments[0], right, TYPE_INTEGER + left - TYPE_LIST_INTEGER,
+        require_type(expression->arguments[0], right, bootstrap_list_element(left),
                      "the value added to this list");
         return expression->type = TYPE_NOTHING;
     }
@@ -1409,8 +1439,7 @@ static void check_statements(Program *program, Function *function, Statement *st
         switch (statement->kind) {
         case STATEMENT_LET:
             if (statement->expression->kind == EXPRESSION_LIST &&
-                statement->declared_type >= TYPE_LIST_INTEGER &&
-                statement->declared_type <= TYPE_LIST_BOOLEAN)
+                bootstrap_is_list(statement->declared_type))
                 statement->expression->type = statement->declared_type;
             type = check_expression(program, function, statement->expression);
             if (type == TYPE_NOTHING)
@@ -1436,7 +1465,7 @@ static void check_statements(Program *program, Function *function, Statement *st
             break;
         case STATEMENT_FIELD_ASSIGN: {
             Type target = check_expression(program, function, statement->target);
-            if (statement->target->left->type < TYPE_RECORD_START)
+            if (statement->target->left->type < TYPE_RECORD_START || bootstrap_is_list(statement->target->left->type))
                 fail_at(statement->line, statement->column,
                         "only record fields can receive a new value");
             type = check_expression(program, function, statement->expression);
@@ -1447,8 +1476,7 @@ static void check_statements(Program *program, Function *function, Statement *st
         }
         case STATEMENT_INDEX_ASSIGN: {
             Type target = check_expression(program, function, statement->target);
-            if (statement->target->left->type < TYPE_LIST_INTEGER ||
-                statement->target->left->type > TYPE_LIST_BOOLEAN)
+            if (!bootstrap_is_list(statement->target->left->type))
                 fail_at(statement->line, statement->column,
                         "only List positions can receive a new value");
             type = check_expression(program, function, statement->expression);
@@ -1461,6 +1489,7 @@ static void check_statements(Program *program, Function *function, Statement *st
             check_expression(program, function, statement->expression);
             break;
         case STATEMENT_RETURN:
+            if (statement->expression) bootstrap_context(statement->expression, function->return_type);
             type = statement->expression
                        ? check_expression(program, function, statement->expression)
                        : TYPE_NOTHING;
@@ -1741,7 +1770,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
     case EXPRESSION_MEMBER:
         left = emit_expression(emitter, expression->left);
         temporary = new_temporary(emitter);
-        if (expression->left->type >= TYPE_RECORD_START) {
+        if (expression->left->type >= TYPE_RECORD_START && !bootstrap_is_list(expression->left->type)) {
             int raw = temporary;
             fprintf(output, "  %%value.%d = call i64 @minyar_record_get(ptr %s, i64 %lld)\n", raw,
                     left.name, expression->integer);
@@ -1783,7 +1812,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             if (element == TYPE_INTEGER)
                 return make_value(TYPE_INTEGER, "%%value.%d", raw);
             temporary = new_temporary(emitter);
-            if (element == TYPE_TEXT)
+            if (!strcmp(llvm_type(element), "ptr"))
                 fprintf(output, "  %%value.%d = inttoptr i64 %%value.%d to ptr\n", temporary, raw);
             else
                 fprintf(output, "  %%value.%d = trunc i64 %%value.%d to %s\n", temporary, raw,
@@ -1798,7 +1827,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             if (right.type != TYPE_INTEGER) {
                 temporary = new_temporary(emitter);
                 fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
-                        right.type == TYPE_TEXT ? "ptrtoint" : "zext", llvm_type(right.type),
+                        !strcmp(llvm_type(right.type), "ptr") ? "ptrtoint" : "zext", llvm_type(right.type),
                         right.name);
                 right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
             }
@@ -1878,7 +1907,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         right = emit_expression(emitter, expression->arguments[0]);
         if (right.type != TYPE_INTEGER) {
             temporary = new_temporary(emitter);
-            if (right.type == TYPE_TEXT)
+            if (!strcmp(llvm_type(right.type), "ptr"))
                 fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n", temporary, right.name);
             else
                 fprintf(output, "  %%value.%d = zext %s %s to i64\n", temporary,
@@ -2034,7 +2063,7 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
         value = emit_expression(emitter, statement->expression);
         if (value.type != TYPE_INTEGER) {
             int converted = new_temporary(emitter);
-            if (value.type == TYPE_TEXT)
+            if (!strcmp(llvm_type(value.type), "ptr"))
                 fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n", converted, value.name);
             else
                 fprintf(output, "  %%value.%d = zext %s %s to i64\n", converted,

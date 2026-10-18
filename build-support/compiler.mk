@@ -20,6 +20,7 @@ COMPILER_SOURCES = compiler/stages/source.min \
 	compiler/stages/incremental.min \
 	compiler/closure-compiler.min \
 	compiler/callable-types.min \
+	compiler/generic-compiler.min \
 	compiler/errors-compiler.min \
 	compiler/choice-compiler.min \
 	compiler/calldepth-compiler.min \

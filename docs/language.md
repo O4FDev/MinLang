@@ -541,6 +541,36 @@ analysis as records. Cases and payload fields are accessed through constructors
 and matching. Generic user choices and nested or literal patterns are not yet
 supported.
 
+## Generic functions
+
+A function can name the types it works with, using angle brackets after its
+name. The same type parameter always means the same concrete type in one call:
+
+```minyar
+function firstOr<Item>(values: List<Item>, fallback: Item): Item {
+    if values.length == 0 { return fallback }
+    return values[0]
+}
+
+print(firstOr([20, 22], 0))     // 20
+print(firstOr([], "quiet"))    // quiet
+print(firstOr<Integer>([], 7)) // 7
+```
+
+Arguments normally supply the type parameters. An annotated result can also
+supply them, as in `let values: List<Text> = empty()` for a generic function
+returning `List<Item>`. When neither gives enough information, write the types
+explicitly. Inconsistent arguments are rejected; generics never convert one
+type into another.
+
+Generic functions can call one another or themselves and can be exported from
+modules. The compiler creates one ordinary function for each distinct set of
+concrete types used anywhere in the program. Values keep their usual native
+representation and ownership rules, with no boxing or runtime type dispatch.
+An unused generic body produces no executable code. The compiler checks a body
+with its concrete types when it is used. Builds using generics currently compile
+the whole reachable module graph, including in incremental mode.
+
 ## Recoverable failures
 
 `Result<T, E>` contains either a successful `T` or an error `E`. `Ok(value)`

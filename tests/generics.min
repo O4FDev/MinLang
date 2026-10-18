@@ -1,0 +1,55 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function occurrences(text: Text, needle: Text): Integer {
+    let count = 0
+    let offset = text.find(needle)
+    while offset >= 0 {
+        count += 1
+        text = text.slice(offset + needle.length, text.length)
+        offset = text.find(needle)
+    }
+    return count
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let first = "function firstOr<Item>(values: List<Item>, fallback: Item): Item { if values.length == 0 { return fallback }; return values[0] }\n"
+let identity = "function identity<Item>(value: Item): Item { return value }\n"
+
+fixtures.executes(frontend, first + "print(firstOr([42], 0))\nprint(firstOr([], \"harbour\"))\nprint(firstOr<Integer>([], 7))\nprint(firstOr([1.5], 0.0))\nprint(firstOr(['é'], 'x'))\nprint(firstOr([true], false))\n", "42\nharbour\n7\n1.5\né\ntrue\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "record Boat { name: Text }\nlet boat = identity(Boat { name: \"Willow\" })\nlet names = identity([[boat.name], [\"tide\"]])\nprint(identity(names)[0][0])\nlet packet = identity(Bytes(\"sea\"))\nprint(Text(packet))\n", "Willow\nsea\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "function relay<Item>(value: Item): Item { return identity<Item>(value) }\nfunction again<Item>(value: Item, count: Integer): Item { if count == 0 { return relay(value) }; return again(value, count - 1) }\nprint(again(42, 20))\nprint(again(\"home\", 20))\n", "42\nhome\n", levels, 0, "", true)
+fixtures.executes(frontend, "function empty<Item>(): List<Item> { let values: List<Item> = []; return values }\nlet words: List<Text> = empty()\nwords.add(\"shore\")\nprint(words[0])\n", "shore\n", levels, 0, "", true)
+fixtures.executes(frontend, first + "function collect(): Text { let words = [\"one\", \"two\"]; let answer = firstOr(words, \"none\"); if answer == \"one\" { let words = [3]; print(firstOr(words, 0)) }; return firstOr(words, \"none\") }\nprint(collect())\n", "3\none\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "global WORDS: List<Text> = [\"shore\"]\nfunction read(): Text { return identity(WORDS[0]) }\nfunction local(): Integer { let identity: (Integer) -> Integer = function(value) { return value + 1 }; return identity(41) }\nprint(read())\nprint(local())\n", "shore\n42\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "function checked<Item>(value: Item): Result<Item, Text> { return Ok(identity(value)) }\nmatch checked(42) { Ok(value) { print(identity(value)) } Err(error) { print(identity(error)) } }\nmatch identity(Ok<Integer, Text>(7)) { Ok(value) { print(value) } Err(error) { print(error) } }\n", "42\n7\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "let names: Map<Text, Integer> = { \"shore\": 42 }\nlet shared = identity(names)\nprint(shared[\"shore\"])\n", "42\n", levels, 0, "", true)
+fixtures.executes(frontend, identity + "public function start(): Integer { return 0 }\nlet start = 1\nlet limit = Bytes(2)\nprint(identity(start < limit.length))\nprint(identity(Map<Text, Integer>().length))\n", "true\n0\n", levels, 0, "", true)
+
+io.writeTextFile(frontend.compiler.directory + "/generic.min", test.sourceModules("public record Token { name: Text }\npublic function choose<Item>(left: Item, right: Item, useLeft: Boolean): Item { if useLeft { return left }; return right }\n"))
+io.writeTextFile(frontend.compiler.directory + "/left.min", test.sourceModules("use \"./generic.min\" as common\npublic function value(): Text { return common.choose(\"moon\", \"sun\", true) }\n"))
+io.writeTextFile(frontend.compiler.directory + "/right.min", test.sourceModules("use \"./generic.min\" as common\npublic function value(): Text { return common.choose<Text>(\"moon\", \"sun\", false) }\n"))
+fixtures.executes(frontend, "use \"./generic.min\" as common\nuse \"./left.min\" as left\nuse \"./right.min\" as right\nprint(left.value())\nprint(right.value())\nprint(common.choose<Integer>(20, 22, false))\n", "moon\nsun\n22\n", levels, 0, "", true)
+let llvm = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+test.check(occurrences(llvm, "define ptr @.minyar.fn.minyar_generic_function_") == 1, "diamond imports share one Text specialization")
+test.check(occurrences(llvm, "define i64 @.minyar.fn.minyar_generic_function_") == 1, "Integer specialization has an unboxed signature")
+fixtures.executes(frontend, "use \"./generic.min\" as common\nrecord Box { name: Text }\nprint(common.choose<Box>(Box { name: \"boat\" }, Box { name: \"shore\" }, true).name)\nprint(common.choose<common.Token>(common.Token { name: \"shell\" }, common.Token { name: \"sand\" }, true).name)\nlet next = common.choose<(Integer) -> Integer>(function(value) { return value + 1 }, function(value) { return value - 1 }, true)\nprint(next(41))\n", "boat\nshell\n42\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/generics.min"), "sky: pale blue\nsea: silver\nsky: turning rose\nsea: quiet gold\n", levels, 0, "", true)
+fixtures.rejects(frontend, "function empty<Item>(): List<Item> { return [] }\nlet value = empty()\n", "I can't infer type argument 'Item'", true)
+fixtures.rejects(frontend, first + "print(firstOr<Integer, Text>([1], 2))\n", "expects 1 type argument, but received 2", true)
+fixtures.rejects(frontend, first + "print(firstOr([1]))\n", "expects 2 arguments, but received 1", true)
+fixtures.rejects(frontend, first + "print(firstOr([1], \"two\"))\n", "type argument 'Item' is used inconsistently: Integer and Text", true)
+fixtures.rejects(frontend, identity + "let value = identity([])\n", "I can't infer type argument 'Item'", true)
+fixtures.rejects(frontend, "function wrong<Item>(value: Item): Item { return \"wrong\" }\nprint(wrong(42))\n", "a returned value has the wrong type", true)
+fixtures.rejects(frontend, "function same<Item, Item>(value: Item): Item { return value }\n", "type parameter 'Item' is declared twice", true)
+fixtures.rejects(frontend, "function main<Item>(): Integer { return 0 }\n", "main cannot have type parameters", true)
+fixtures.rejects(frontend, "function print<Item>(value: Item) {}\n", "uses a reserved built-in name", true)
+fixtures.rejects(frontend, "function minyar_generic_function_0<Item>(value: Item): Item { return value }\n", "reserved generic compiler name", true)
+fixtures.executes(frontend, "function same<Item: Equatable>(left: Item, right: Item): Boolean { return left == right }\nprint(same(42, 42))\nprint(same(\"sea\", \"sky\"))\n", "true\nfalse\n", levels, 0, "", true)
+fixtures.rejects(frontend, "function same<Item: Equatable>(left: Item, right: Item): Boolean { return left == right }\nprint(same(Bytes(), Bytes()))\n", "does not satisfy Equatable for type argument 'Item'", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Generics: passed")
