@@ -1,5 +1,6 @@
 use "../tools/testing.min" as test
 use "./frontend-fixtures.min" as fixtures
+use "io" as io
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let levels = ["-O0", "-O2"]
@@ -10,5 +11,32 @@ fixtures.rejects(frontend, "use \"errors\" as errors\nprint(errors.integer(42).v
 fixtures.rejects(frontend, "use \"errors\" as errors\nprint(errors.integer(42).value(1))\n", "method 'value' received too many arguments", true)
 fixtures.executes(frontend, "use \"errors\" as errors\nprint(errors.integerFailure(errors.make(7, 0, \"rain\")).value())\n", "", levels, 1, "Minyar stopped: cannot read the value of a failed IntegerResult\n", false)
 fixtures.executes(frontend, "record Counter { value: Integer }\nfunction Counter.watch(): () -> Integer { return function() { return self.value } }\nlet watch = Counter { value: 42 }.watch()\nprint(watch())\n", "42\n", levels, 0, "", true)
+io.writeTextFile(frontend.compiler.directory + "/box.min", "public record Box { value: Integer }\nfunction Box.base(): Integer { return self.value }\npublic function Box.value(): Integer { return self.base() + 1 }\npublic function Box.read(): Integer { return self.base() + 1 }\n")
+let cachedEntry = frontend.compiler.directory + "/cached.min"
+io.writeTextFile(cachedEntry, "use \"./box.min\" as boxes\nlet box = boxes.Box { value: 41 }\nprint(box.value())\nprint(box.read())\n")
+let prior = frontend.compiler.directory + "/empty.state"
+io.writeTextFile(prior, "")
+for pass in ["cold", "warm"] {
+    let base = frontend.compiler.directory + "/" + pass
+    test.require(test.run([frontend.compiler.executable, cachedEntry, base + ".ll", "--module-state", prior, base + ".state", base + ".stats", "--library", "library"], frontend.environment, "", base + ".compile", 30), "compile public and private methods in cached modules")
+    if pass == "warm" {
+        let stats = io.readTextFile(base + ".stats").trim().split(" ")
+        test.check(stats[0] == "2" && stats[1] == "0" && stats[6] == "true", "method modules did not reuse their cached bodies")
+    }
+    if test.addressEnabled(frontend.compiler.flags) { io.writeTextFile(base + ".ll", test.instrument(io.readTextFile(base + ".ll"))) }
+    for level in levels {
+        let command = [frontend.compiler.clang, level, "-Wno-override-module", base + ".ll", frontend.compiler.runtime, "-lm", "-o", base + ".exe"]
+        for flag in frontend.compiler.flags { command.add(flag) }
+        test.require(test.run(command, frontend.environment, "", base + ".link", 30), "link methods in cached modules")
+        let result = test.run([base + ".exe"], frontend.environment, "", base + ".run", 30)
+        test.require(result, "execute methods in cached modules")
+        test.check(result.output == "42\n42\n" && result.errorOutput == "", "cached method output changed")
+    }
+    prior = base + ".state"
+}
+io.writeTextFile(cachedEntry, "use \"./box.min\" as boxes\nprint(boxes.Box { value: 41 }.base())\n")
+let rejected = test.run([frontend.compiler.executable, cachedEntry, frontend.compiler.directory + "/private.ll", "--module-state", frontend.compiler.directory + "/cold.state", frontend.compiler.directory + "/private.state", frontend.compiler.directory + "/private.stats", "--library", "library"], frontend.environment, "", frontend.compiler.directory + "/private.compile", 30)
+test.check(rejected.status == 1 && test.contains(rejected.errorOutput, "method 'base' is private to its module") && !io.fileExists(frontend.compiler.directory + "/private.ll"), "cached module exposed a private method")
+fixtures.executes(frontend, "record Counter { value: Integer }\nfunction Counter.increment() { self.value += 1 }\nfunction Counter.read(): Integer { return self.value }\nlet counter = Counter { value: 41 }\ncounter.increment()\nprint(counter.read())\nprint(counter.value)\n", "42\n42\n", levels, 0, "", true)
 test.removeTree(frontend.compiler.directory)
 print("Standard library methods: passed")
