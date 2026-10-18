@@ -4,6 +4,20 @@ use "./frontend-fixtures.min" as fixtures
 use "../tools/test-runtime.min" as runtime
 use "system" as system
 
+// Share the ownership oracle across cases, as in nitpick-language.min. The
+// generated programs still run at both O0 and O2 with every cleanup assertion.
+function prepareOwnership(frontend: fixtures.Frontend) {
+    let compiler = frontend.compiler
+    let path = compiler.directory + "/ownership-runtime"
+    let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+    io.writeTextFile(path + ".c", contract)
+    compiler.runtime = path + ".o"
+    let command = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".c", "-o", compiler.runtime]
+    for flag in compiler.flags { command.add(flag) }
+    test.require(test.run(command, system.environment(), "", path + ".build", 120), "build shared text ownership runtime")
+}
+
 function measureJoin(frontend: fixtures.Frontend, llvm: Text) {
     let compiler = frontend.compiler
     let path = compiler.directory + "/join-probe"
@@ -19,7 +33,7 @@ function measureJoin(frontend: fixtures.Frontend, llvm: Text) {
     contract += "\n__attribute__((destructor)) static void measured_join_contract(void) { assert(text_probe_joins == 1); }\n"
     io.writeTextFile(path + ".c", contract)
     io.writeTextFile(path + ".ll", llvm)
-    let build = [compiler.clang, "-O2", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".c", "-o", path + ".o"]
+    let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".c", "-o", path + ".o"]
     for flag in compiler.flags { build.add(flag) }
     test.require(test.run(build, system.environment(), "", path + ".build", 30), "build measured interpolation runtime")
     for optimization in ["-O0", "-O2"] {
@@ -32,11 +46,12 @@ function measureJoin(frontend: fixtures.Frontend, llvm: Text) {
 }
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+prepareOwnership(frontend)
 let levels = ["-O0", "-O2"]
-fixtures.executes(frontend, io.readTextFile("tests/text/interpolation.min"), io.readTextFile("tests/text/interpolation.stdout"), levels, 0, "", true)
-fixtures.executes(frontend, io.readTextFile("examples/gallery/text.min"), io.readTextFile("examples/gallery/text.stdout"), levels, 0, "", true)
+fixtures.executes(frontend, io.readTextFile("tests/text/interpolation.min"), io.readTextFile("tests/text/interpolation.stdout"), levels, 0, "", false)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/text.min"), io.readTextFile("examples/gallery/text.stdout"), levels, 0, "", false)
 io.writeTextFile(frontend.compiler.directory + "/greeting.min", "public function greeting(name: Text): Text { return \"Hello, \\(name)!\" }\n")
-fixtures.executes(frontend, "use \"./greeting.min\" as greeting\nprint(greeting.greeting(\"Ada\"))\n", "Hello, Ada!\n", levels, 0, "", true)
+fixtures.executes(frontend, "use \"./greeting.min\" as greeting\nprint(greeting.greeting(\"Ada\"))\n", "Hello, Ada!\n", levels, 0, "", false)
 
 for declaration in ["let value = [1]", "record Box { n: Integer }; let value = Box { n: 1 }", "let value = Bytes()", "let value = function() {}"] {
     fixtures.rejects(frontend, declaration + "\nprint(\"value: \\(value)\")\n", "text interpolation needs Integer, Float, Boolean, Character, or Text; convert this value to Text explicitly", true)
