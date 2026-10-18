@@ -306,8 +306,12 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
             valid = false;
     }
     CFErrorRef detail = NULL;
-    if (valid)
+    if (valid) {
+        /* Security queries the main bundle on a dispatch worker. Initialize it
+         * here so that lazy Foundation state is owned by the calling thread. */
+        (void)CFBundleGetMainBundle();
         valid = SecTrustEvaluateWithError(trust, &detail);
+    }
     if (detail)
         CFRelease(detail);
     if (trust)
@@ -453,21 +457,23 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
     if (private_key->byte_length <= 0 || private_key->byte_length > MAX_CERT_BYTES ||
         (!reference && !exact_der(private_key->bytes, (size_t)private_key->byte_length)))
         return result;
-    CFDataRef encoded =
-        reference ? NULL : CFDataCreate(NULL, private_key->bytes, private_key->byte_length);
+    /* Import EC PKCS#8 directly: the legacy importer can leak while rejecting
+     * these keys, before the direct import would otherwise be attempted. */
+    SecKeyRef fallback = reference ? NULL : apple_ec_pkcs8(private_key);
+    CFDataRef encoded = reference || fallback
+                            ? NULL
+                            : CFDataCreate(NULL, private_key->bytes, private_key->byte_length);
     SecExternalFormat format = kSecFormatUnknown;
     SecExternalItemType type = kSecItemTypePrivateKey;
     CFArrayRef items = NULL;
     OSStatus status =
         encoded ? SecItemImport(encoded, NULL, &format, &type, 0, NULL, NULL, &items) : errSecParam;
-    SecKeyRef key = reference ? identity_private_key(private_key)
+    SecKeyRef key = reference  ? identity_private_key(private_key)
+                    : fallback ? fallback
                     : status == errSecSuccess && items && CFArrayGetCount(items) == 1 &&
                             CFGetTypeID(CFArrayGetValueAtIndex(items, 0)) == SecKeyGetTypeID()
                         ? (SecKeyRef)CFArrayGetValueAtIndex(items, 0)
                         : NULL;
-    SecKeyRef fallback = key ? NULL : apple_ec_pkcs8(private_key);
-    if (fallback)
-        key = fallback;
     SecKeyAlgorithm algorithm = key ? apple_algorithm(key, scheme) : NULL;
     CFDataRef data = CFDataCreate(NULL, content->bytes, content->byte_length);
     CFDataRef signature =
