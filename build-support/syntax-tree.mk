@@ -1,0 +1,9 @@
+.PHONY: check-declaration-index
+check-declaration-index: build/minyarc build/minyar-runtime.o build/tooling/tests/declaration-index
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/declaration-index
+
+check-portable check: check-declaration-index
+
+.PHONY: check-declaration-cache
+check-declaration-cache: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-module-delta
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/incremental-module-delta

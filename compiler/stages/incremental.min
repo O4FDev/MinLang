@@ -518,6 +518,9 @@ function takeModuleField(fields: List<Text>, cursor: List<Integer>): Text {
 }
 
 function writeModuleTable(names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameters: List<Text>, types: List<Integer>, lookup: List<Integer>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLookup: List<Integer>): Text {
+    // Preserve the on-disk table format for existing local module caches.
+    let persistedLookup = buildSymbolLookup(names, kinds)
+    let persistedDeclarations = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
     let pieces: List<Text> = []
     appendModuleField(pieces, Text(names.length))
     let position = 0
@@ -527,7 +530,7 @@ function writeModuleTable(names: List<Text>, kinds: List<Integer>, returns: List
         appendModuleField(pieces, Text(returns[position]))
         appendModuleField(pieces, Text(counts[position]))
         appendModuleField(pieces, Text(counts[names.length + position]))
-        appendModuleField(pieces, Text(lookup[position]))
+        appendModuleField(pieces, Text(persistedLookup[position]))
         position = position + 1
     }
     appendModuleField(pieces, Text(parameters.length))
@@ -545,7 +548,7 @@ function writeModuleTable(names: List<Text>, kinds: List<Integer>, returns: List
         appendModuleField(pieces, Text(declarationKinds[position]))
         appendModuleField(pieces, Text(declarationPublic[position]))
         appendModuleField(pieces, declarationQualifiedNames[position])
-        appendModuleField(pieces, Text(declarationLookup[position]))
+        appendModuleField(pieces, Text(persistedDeclarations[position]))
         position = position + 1
     }
     return joinText(pieces)
@@ -566,13 +569,12 @@ function readModuleTable(text: Text, names: List<Text>, kinds: List<Integer>, re
         offsets.add(takeModuleNatural(fields, cursor))
         let sorted = takeModuleNatural(fields, cursor)
         if sorted >= total { fail("invalid compiled module type table") }
-        lookup.add(sorted)
         position = position + 1
     }
     position = 0
     while position < total {
         counts.add(offsets[position])
-        returns.add(lookup[position])
+        returns.add(position)
         position = position + 1
     }
     total = takeModuleNatural(fields, cursor)
@@ -594,10 +596,11 @@ function readModuleTable(text: Text, names: List<Text>, kinds: List<Integer>, re
         declarationQualifiedNames.add(takeModuleField(fields, cursor))
         let sorted = takeModuleNatural(fields, cursor)
         if sorted >= total { fail("invalid compiled module type table") }
-        declarationLookup.add(sorted)
         position = position + 1
     }
     if cursor[0] != fields.length { fail("invalid compiled module type table") }
+    appendDeclarationIndex(lookup, names, kinds)
+    appendDeclarationIndex(declarationLookup, declarationQualifiedNames, declarationKinds)
 }
 
 function stableModuleIdentity(path: Text, root: Text): Text {
@@ -739,7 +742,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
         collectModuleDeclarations(module, modulePaths[module], summaryStarts[module], summaryKinds, summaryTexts, summaryLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations, identities)
         module = module + 1
     }
-    declarationLookup = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
+    declarationLookup = buildDeclarationIndex(declarationQualifiedNames, declarationKinds)
     requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames, declarationLocations)
     let tokenKinds: List<Integer> = []
     let tokenTexts: List<Text> = []
@@ -754,7 +757,8 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
     let ends: List<Integer> = []
     let nameLocations: List<Text> = []
     let ignoredTopLevel = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, names, kinds, nameLocations, returns, counts, ends)
-    lookup = buildSymbolLookup(names, kinds)
+    lookup = buildDeclarationIndex(names, kinds)
+    tokenLines.symbolLookup = lookup
     requireUniqueSymbols(lookup, names, kinds, nameLocations)
     let parameterStarts: List<Integer> = []
     let position = 0
@@ -764,11 +768,12 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
     }
     discoverDeclarations(tokenKinds, tokenTexts, tokenLines, names, kinds, nameLocations, returns, lookup, counts, parameters, types, parameterStarts, ends)
     appendParameterOffsets(counts, parameterStarts)
-    lookup = buildSymbolLookup(names, kinds)
+    lookup = buildDeclarationIndex(names, kinds)
+    tokenLines.symbolLookup = lookup
     requireUniqueSymbols(lookup, names, kinds, nameLocations)
     position = 0
-    while position < lookup.length {
-        returns.add(lookup[position])
+    while position < names.length {
+        returns.add(position)
         position = position + 1
     }
         table = writeModuleTable(names, kinds, returns, counts, parameters, types, lookup, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLookup)
@@ -854,6 +859,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
             let localKinds: List<Integer> = []
             let localTexts: List<Text> = []
             let localLines = newSourceMap()
+            localLines.symbolLookup = lookup
             if moduleTokenStarts[module] < 0 {
                 let rawKinds: List<Integer> = []
                 let rawTexts: List<Text> = []

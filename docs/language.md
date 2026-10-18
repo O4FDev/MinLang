@@ -745,6 +745,11 @@ if answer == 42 {
 }
 ```
 
+Module declarations are indexed before function bodies are checked. A function
+can name a record or call another function declared later in the file. Module
+constants and globals are also visible throughout their module. Local bindings
+still become visible where they are declared.
+
 `if` chains may continue with `else if`:
 
 ```minyar

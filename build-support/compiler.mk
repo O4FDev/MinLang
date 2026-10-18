@@ -32,7 +32,7 @@ COMPILER_SOURCES = compiler/stages/source.min \
 build/compiler.min: library/io.min library/process.min $(COMPILER_SOURCES) build-support/compiler.mk | build
 	cat $(COMPILER_SOURCES) > $@.tmp
 	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' $@.tmp
-	mv $@.tmp $@
+	@if cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
 
 build/stage0: bootstrap/stage0.c vendor/stb_ds.h build/.toolchain.json | build
 	"$(CC)" $(CPPFLAGS) $(CFLAGS) $< -o $@

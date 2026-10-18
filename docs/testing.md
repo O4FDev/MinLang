@@ -28,6 +28,13 @@ deletion, iteration, Float keys and rejected element types. The seed-library
 gallery runs at O0/O2 with ownership assertions. Its sanitizer variant is
 `check-record-collections-sanitize`.
 
+`make check-declaration-index` compares hashed declaration lookup with a linear
+oracle, including collisions, Unicode, duplicate names and separate declaration
+kinds, then runs the constellation gallery at O0/O2 with ownership checks.
+`make check-scaling` measures 500, 1,000, 2,000 and 4,000 functions and typed
+records. Best-of-three CPU ratios must stay below 3x per doubling and 10x over
+the full 8x range; the typed records also exercise forward type lookup.
+
 `make check-project-cli` exercises the public project CLI with real compiler and
 linker invocations: package creation, debug/release builds, parent discovery,
 local transitive dependencies, lockfile checks, tests, literal argument and exit

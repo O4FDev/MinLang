@@ -161,81 +161,69 @@ function buildSymbolLookup(symbolNames: List<Text>, symbolKinds: List<Integer>):
     return lookup
 }
 
+// The first slot records the indexed declaration count. Remaining slots form
+// an open-addressed table at at most half load; -1 marks an unused bucket.
+// Symbol IDs never depend on bucket order, including after a cache reload.
+function declarationHash(name: Text, kind: Integer): Integer {
+    let hash = 5381 + kind
+    let position = 0
+    while position < name.length {
+        hash = (hash * 65599 + Integer(name[position])) % 2147483647
+        position = position + 1
+    }
+    return hash
+}
+
+function appendDeclarationIndex(lookup: List<Integer>, names: List<Text>, kinds: List<Integer>) {
+    let capacity = 8
+    while capacity < names.length * 2 { capacity = capacity * 2 }
+    lookup.add(names.length)
+    let position = 0
+    while position < capacity { lookup.add(-1); position = position + 1 }
+    position = 0
+    while position < names.length {
+        let bucket = declarationHash(names[position], kinds[position]) % capacity
+        let symbol = lookup[1 + bucket]
+        while symbol >= 0 && !(kinds[symbol] == kinds[position] && names[symbol] == names[position]) {
+            bucket = (bucket + 1) % capacity
+            symbol = lookup[1 + bucket]
+        }
+        if symbol < 0 { lookup[1 + bucket] = position }
+        position = position + 1
+    }
+}
+
+function buildDeclarationIndex(names: List<Text>, kinds: List<Integer>): List<Integer> {
+    let lookup: List<Integer> = []
+    appendDeclarationIndex(lookup, names, kinds)
+    return lookup
+}
+
+function findIndexedSymbol(lookup: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, name: Text, kind: Integer): Integer {
+    if lookup.length == 0 { return -1 }
+    let capacity = lookup.length - 1
+    let bucket = declarationHash(name, kind) % capacity
+    let symbol = lookup[1 + bucket]
+    while symbol >= 0 {
+        if symbolKinds[symbol] == kind && symbolNames[symbol] == name { return symbol }
+        bucket = (bucket + 1) % capacity
+        symbol = lookup[1 + bucket]
+    }
+    return -1
+}
+
 function requireUniqueSymbols(lookup: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>) {
-    let position = 1
-    while position < lookup.length {
-        let previous = lookup[position - 1]
-        let current = lookup[position]
-        if symbolKinds[previous] == symbolKinds[current] && symbolNames[previous] == symbolNames[current] {
-            let duplicate = current
-            if previous > current { duplicate = previous }
-            fail(describeLocation(symbolLocations[duplicate]) + ": module declares '" + readableDeclarationName(symbolNames[current]) + "' more than once")
+    let position = 0
+    while position < symbolNames.length {
+        if findIndexedSymbol(lookup, symbolNames, symbolKinds, symbolNames[position], symbolKinds[position]) != position {
+            fail(describeLocation(symbolLocations[position]) + ": module declares '" + readableDeclarationName(symbolNames[position]) + "' more than once")
         }
         position = position + 1
     }
 }
 
-function findIndexedSymbol(lookup: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, name: Text, kind: Integer): Integer {
-    let low = 0
-    let high = lookup.length
-    while low < high {
-        let middle = low + (high - low) / 2
-        let symbol = lookup[middle]
-        let order = compareSymbolName(symbolNames[symbol], name)
-        if order == 0 {
-            if symbolKinds[symbol] < kind {
-                order = -1
-            } else {
-                if symbolKinds[symbol] > kind {
-                    order = 1
-                }
-            }
-        }
-        if order < 0 {
-            low = middle + 1
-        } else {
-            high = middle
-        }
-    }
-    if low < lookup.length {
-        let symbol = lookup[low]
-        if symbolKinds[symbol] == kind && symbolNames[symbol] == name {
-            return symbol
-        }
-    }
-    return -1
-}
-
-function findCompiledSymbol(symbolNames: List<Text>, symbolKinds: List<Integer>, symbolReturnTypes: List<Integer>, name: Text, kind: Integer): Integer {
-    let count = symbolNames.length
-    let low = 0
-    let high = count
-    while low < high {
-        let middle = low + (high - low) / 2
-        let symbol = symbolReturnTypes[count + middle]
-        let order = compareSymbolName(symbolNames[symbol], name)
-        if order == 0 {
-            if symbolKinds[symbol] < kind {
-                order = -1
-            } else {
-                if symbolKinds[symbol] > kind {
-                    order = 1
-                }
-            }
-        }
-        if order < 0 {
-            low = middle + 1
-        } else {
-            high = middle
-        }
-    }
-    if low < count {
-        let symbol = symbolReturnTypes[count + low]
-        if symbolKinds[symbol] == kind && symbolNames[symbol] == name {
-            return symbol
-        }
-    }
-    return -1
+function findCompiledSymbol(symbolNames: List<Text>, symbolKinds: List<Integer>, lookup: List<Integer>, name: Text, kind: Integer): Integer {
+    return findIndexedSymbol(lookup, symbolNames, symbolKinds, name, kind)
 }
 
 function structuralType(tag: Integer, child: Integer): Integer {
@@ -357,7 +345,7 @@ function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
         code = takeContainerType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
     } else {
         if code == 0 {
-            let record = findSymbol(symbolNames, symbolKinds, name, 2)
+            let record = findIndexedSymbol(tokenLines.symbolLookup, symbolNames, symbolKinds, name, 2)
             if record < 0 {
                 fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": unknown type '" + name + "'")
             }

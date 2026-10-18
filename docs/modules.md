@@ -199,3 +199,8 @@ Callers must choose limits appropriate to their protocol.
 Ordinary builds compile the complete reachable source graph. The opt-in
 [`--incremental` build mode](incremental-builds.md) reuses checked interfaces and
 LLVM code, skipping unchanged dependency bodies.
+
+Functions, records, constants and globals use a hash index keyed by module,
+declaration name and kind. Type annotations use the same index as expressions.
+The persistent interface table keeps its stable sorted format; loading a cached
+table rebuilds the in-memory hash index without changing declaration identities.
