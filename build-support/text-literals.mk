@@ -1,4 +1,4 @@
-.PHONY: check-text-literals check-text-literals-sanitize
+.PHONY: check-text-literals check-text-literals-sanitize check-text-bootstrap
 
 check-text-literals: build/minyarc build/minyar-runtime.o build/tooling/tests/text-literals
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/text-literals
@@ -8,3 +8,8 @@ check-text-literals-sanitize: build/minyarc-sanitize build/minyar-runtime-saniti
 
 check check-portable: check-text-literals
 check-sanitize: check-text-literals-sanitize
+
+check-text-bootstrap: build/stage0 build/minyar-compiler-runtime.ll build/tooling/tests/text-bootstrap
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/text-bootstrap
+
+check check-portable: check-text-bootstrap

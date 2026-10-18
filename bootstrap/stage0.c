@@ -172,6 +172,8 @@ typedef struct {
     int column;
     int round_depth;
     int square_depth;
+    Token *pending;
+    int pending_index;
 } Lexer;
 
 typedef struct {
@@ -296,11 +298,192 @@ static int escaped_character(Lexer *lexer, int line, int column) {
     }
 }
 
+static Token next_token(Lexer *lexer);
+
+typedef struct {
+    int token;
+    const char *start, *end;
+    int line, column;
+} TextPart;
+
+static Token generated_token(int kind, const char *text, int line, int column) {
+    Token token = {0};
+    token.kind = kind;
+    token.line = line;
+    token.column = column;
+    if (text) {
+        token.text_length = strlen(text);
+        token.text = copy_text(text, token.text_length);
+    }
+    return token;
+}
+
+static int text_delimiter_at(const char *cursor, int multiline, int raw) {
+    if (*cursor != '"') return 0;
+    cursor++;
+    if (multiline) {
+        if (cursor[0] != '"' || cursor[1] != '"') return 0;
+        cursor += 2;
+    }
+    return !raw || *cursor == '#';
+}
+
+static void append_text_part(Token **tokens, TextPart **parts, const char *start,
+                             const char *end, int line, int column) {
+    TextPart part = {(int)arrlen(*tokens), start, end, line, column};
+    arrput(*tokens, generated_token(TOKEN_TEXT, NULL, line, column));
+    arrput(*parts, part);
+}
+
+static void decode_text_part(Token *token, TextPart part, int indentation,
+                             int multiline, int raw) {
+    Lexer decoder = {0};
+    char *text = NULL;
+    decoder.cursor = part.start;
+    decoder.line = part.line;
+    decoder.column = part.column;
+    while (decoder.cursor < part.end) {
+        if (multiline && decoder.column == 1) {
+            const char *whitespace = decoder.cursor;
+            while (whitespace < part.end && (*whitespace == ' ' || *whitespace == '\t')) whitespace++;
+            int blank = !*whitespace || *whitespace == '\n' ||
+                        (*whitespace == '\r' && whitespace[1] == '\n');
+            if (whitespace - decoder.cursor < indentation && !blank)
+                fail_at(decoder.line, 1, "multi-line Text has less indentation than its closing delimiter");
+            for (int removed = 0; removed < indentation && decoder.cursor < whitespace; removed++) take(&decoder);
+        }
+        if (decoder.cursor < part.end) {
+            int c = take(&decoder);
+            if (!raw && c == '\\') {
+                if (multiline && (peek(&decoder) == '\n' ||
+                    (peek(&decoder) == '\r' && decoder.cursor[1] == '\n'))) {
+                    if (peek(&decoder) == '\r') take(&decoder);
+                    take(&decoder);
+                    continue;
+                }
+                c = escaped_character(&decoder, decoder.line, decoder.column - 1);
+            } else if (multiline && c == '\r' && peek(&decoder) == '\n') {
+                take(&decoder);
+                c = '\n';
+            }
+            arrput(text, (char)c);
+        }
+    }
+    token->text_length = (size_t)arrlen(text);
+    token->text = copy_text(text, token->text_length);
+    arrfree(text);
+}
+
+static Token text_token(Lexer *lexer) {
+    int line = lexer->line, column = lexer->column;
+    int raw = peek(lexer) == '#';
+    if (raw) take(lexer);
+    int multiline = lexer->cursor[0] == '"' && lexer->cursor[1] == '"' && lexer->cursor[2] == '"';
+    take(lexer);
+    if (multiline) {
+        take(lexer);
+        take(lexer);
+        if (peek(lexer) == '\r') take(lexer);
+        if (peek(lexer) != '\n')
+            fail_at(line, column, "multi-line Text must begin on a new line after its opening delimiter");
+        take(lexer);
+    }
+    const char *body = lexer->cursor, *start = body;
+    int start_line = lexer->line, start_column = lexer->column;
+    Token *tokens = NULL;
+    TextPart *parts = NULL;
+    int interpolated = 0;
+    while (peek(lexer) && !text_delimiter_at(lexer->cursor, multiline, raw)) {
+        const char *escape_start = lexer->cursor;
+        int escape_line = lexer->line, escape_column = lexer->column;
+        int c = take(lexer);
+        if (!raw && c == '\\') {
+            if (peek(lexer) == '(') {
+                if (!interpolated) {
+                    arrput(tokens, generated_token(TOKEN_NAME, "joinText", line, column));
+                    arrput(tokens, generated_token('(', NULL, line, column));
+                    arrput(tokens, generated_token('[', NULL, line, column));
+                    interpolated = 1;
+                }
+                append_text_part(&tokens, &parts, start, escape_start, start_line, start_column);
+                arrput(tokens, generated_token(',', NULL, escape_line, escape_column));
+                arrput(tokens, generated_token(TOKEN_NAME, "text interpolation", escape_line, escape_column));
+                arrput(tokens, generated_token('(', NULL, escape_line, escape_column + 1));
+                take(lexer);
+                int round_depth = lexer->round_depth, square_depth = lexer->square_depth;
+                lexer->round_depth++;
+                int depth = 1;
+                while (depth) {
+                    Token expression = next_token(lexer);
+                    if (expression.kind == TOKEN_EOF)
+                        fail_at(escape_line, escape_column, "text interpolation is missing its closing ')'");
+                    if (expression.kind == '(') depth++;
+                    if (expression.kind == ')') depth--;
+                    if (depth) arrput(tokens, expression);
+                }
+                lexer->round_depth = round_depth;
+                lexer->square_depth = square_depth;
+                arrput(tokens, generated_token(')', NULL, lexer->line, lexer->column - 1));
+                arrput(tokens, generated_token(',', NULL, lexer->line, lexer->column - 1));
+                start = lexer->cursor;
+                start_line = lexer->line;
+                start_column = lexer->column;
+            } else if (peek(lexer)) {
+                take(lexer);
+            }
+        }
+    }
+    if (!peek(lexer)) {
+        if (raw) fail_at(line, column, "raw Text is missing its closing delimiter");
+        if (multiline) fail_at(line, column, "multi-line Text is missing its closing delimiter");
+        fail_at(line, column, "this text literal is never closed");
+    }
+    const char *end = lexer->cursor;
+    int indentation = 0;
+    if (multiline) {
+        const char *closing_line = lexer->cursor;
+        while (closing_line > body && closing_line[-1] != '\n') closing_line--;
+        const char *scan = closing_line;
+        while (scan < lexer->cursor && (*scan == ' ' || *scan == '\t')) scan++;
+        if (scan != lexer->cursor)
+            fail_at(lexer->line, lexer->column, "the closing delimiter for multi-line Text must be on its own line");
+        indentation = (int)(lexer->cursor - closing_line);
+        end = closing_line;
+        if (end > body) {
+            end--;
+            if (end > body && end[-1] == '\r') end--;
+        }
+    }
+    append_text_part(&tokens, &parts, start, end < start ? start : end, start_line, start_column);
+    for (int index = 0; index < arrlen(parts); index++)
+        decode_text_part(&tokens[parts[index].token], parts[index], indentation, multiline, raw);
+    arrfree(parts);
+    if (!interpolated) {
+        tokens[0].line = line;
+        tokens[0].column = column;
+    } else {
+        arrput(tokens, generated_token(']', NULL, lexer->line, lexer->column));
+        arrput(tokens, generated_token(')', NULL, lexer->line, lexer->column));
+    }
+    take(lexer);
+    if (multiline) { take(lexer); take(lexer); }
+    if (raw) take(lexer);
+    lexer->pending = tokens;
+    lexer->pending_index = 0;
+    return next_token(lexer);
+}
+
 static Token next_token(Lexer *lexer) {
+    if (lexer->pending) {
+        Token token = lexer->pending[lexer->pending_index++];
+        if (lexer->pending_index == arrlen(lexer->pending)) {
+            arrfree(lexer->pending);
+            lexer->pending_index = 0;
+        }
+        return token;
+    }
     Token token = {0};
     const char *start;
-    char *text = NULL;
-
     do {
         skip_horizontal_space_and_comments(lexer);
         if (peek(lexer) != '\n' || (!lexer->round_depth && !lexer->square_depth))
@@ -346,24 +529,8 @@ static Token next_token(Lexer *lexer) {
         return token;
     }
 
-    if (peek(lexer) == '"') {
-        take(lexer);
-        while (peek(lexer) && peek(lexer) != '"') {
-            int c;
-            c = take(lexer);
-            if (c == '\\')
-                c = escaped_character(lexer, token.line, token.column);
-            arrput(text, (char)c);
-        }
-        if (!peek(lexer))
-            fail_at(token.line, token.column, "this text literal is never closed");
-        take(lexer);
-        token.kind = TOKEN_TEXT;
-        token.text_length = (size_t)arrlen(text);
-        token.text = copy_text(text, token.text_length);
-        arrfree(text);
-        return token;
-    }
+    if (peek(lexer) == '"' || (peek(lexer) == '#' && lexer->cursor[1] == '"'))
+        return text_token(lexer);
 
     if (peek(lexer) == '\'') {
         int character;
@@ -1113,6 +1280,17 @@ static Type check_expression(Program *program, Function *function, Expression *e
         return expression->type;
     }
     case EXPRESSION_CALL:
+        if (!strcmp(expression->text, "text interpolation")) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column, "text interpolation needs one printable expression");
+            left = check_expression(program, function, expression->arguments[0]);
+            if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
+                fail_at(expression->arguments[0]->line, expression->arguments[0]->column,
+                        "text interpolation needs Integer, Boolean, Character, or Text; convert this value to Text explicitly");
+            free(expression->text);
+            expression->text = copy_text("Text", 4);
+            return expression->type = TYPE_TEXT;
+        }
         if (strcmp(expression->text, "print") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column, "print expects exactly one value");
