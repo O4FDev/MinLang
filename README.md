@@ -4,6 +4,11 @@ A small, statically typed language that compiles to native code through LLVM.
 
 ## Get started
 
+For macOS 14 and newer, the [binary distribution](docs/macos-distribution.md)
+bundles LLVM and the prebuilt Minyar tools. Its installer checks the Apple SDK
+and sets up the command. Release candidates can be built locally or with the
+manual macOS distribution workflow; they are not yet signed public releases.
+
 Building from source requires LLVM 23.1.2, a C compiler, Make, zsh, and system
 C development headers. Follow the [toolchain setup](docs/toolchain.md).
 The source checkout builds the compiler, runtime and link driver on first use.

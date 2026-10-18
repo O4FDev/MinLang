@@ -1,6 +1,9 @@
 # Native toolchain setup
 
-These are source-build instructions.
+These are **source-build** instructions. The [macOS binary distribution](macos-distribution.md)
+bundles the pinned LLVM compiler, linker, and prebuilt Minyar tools, so users of
+that distribution only need Apple's macOS SDK. Its installer checks the SDK and
+opens Apple's Command Line Tools installer when it is missing.
 
 Minyar's LLVM backend requires **LLVM 23.1.2**, a 64-bit target, Make, zsh,
 and the operating system's C development headers and libraries. Both ordinary
