@@ -1,11 +1,13 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "../tools/test-runtime.min" as runtime
 use "system" as system
 use "files" as files
 function selected(name: Text): Boolean {
-    if argumentCount() == 0 { return true }
-    for index in 0..argumentCount() {
-        if argument(index) == name || argument(index) == "ModuleConstantGraphs." + name { return true }
+    if processInfo.argumentCount() == 0 { return true }
+    for index in 0..processInfo.argumentCount() {
+        if processInfo.argument(index) == name || processInfo.argument(index) == "ModuleConstantGraphs." + name { return true }
     }
     return false
 }
@@ -13,19 +15,19 @@ record Profile { name: Text; defines: Text; systemHeap: Boolean }
 function compile(compiler: test.Compiler, source: Text): Text {
     compiler.serial += 1
     let path = compiler.directory + "/case" + Text(compiler.serial)
-    writeTextFile(path + ".min", source)
+    io.writeTextFile(path + ".min", test.sourceModules(source))
     let input = test.stableInput(source, path + ".min", system.getenv("MINYAR_TEST_INPUT_ROOT"))
     test.require(test.run([compiler.executable, input, path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout), "compile module constant graph")
-    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
     return path + ".ll"
 }
 function execute(compiler: test.Compiler, llvm: Text, expected: Text, engine: Text, profiles: List<Profile>) {
-    let contract = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
     for profile in profiles {
         let harness = compiler.directory + "/" + profile.name + "-runtime.c"
         let object = compiler.directory + "/" + profile.name + "-runtime.o"
         if files.pathSize(object) < 0 {
-            writeTextFile(harness, profile.defines + contract)
+            io.writeTextFile(harness, profile.defines + contract)
             let optimization = "-O2"
             if compiler.flags.length > 0 { optimization = "-O1" }
             let command = [compiler.clang, optimization]
@@ -49,7 +51,7 @@ function execute(compiler: test.Compiler, llvm: Text, expected: Text, engine: Te
 }
 function executesInProfiles(compiler: test.Compiler, source: Text, expected: Text, engine: Text) {
     let llvm = compile(compiler, source)
-    test.check(test.contains(readTextFile(llvm), "; minyar-cycle-runtime: 1\n"), "missing module root cycle-runtime metadata")
+    test.check(test.contains(io.readTextFile(llvm), "; minyar-cycle-runtime: 1\n"), "missing module root cycle-runtime metadata")
     let profiles = [Profile { name: "eager"; defines: ""; systemHeap: false },
         Profile { name: "system-k1"; defines: "#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET 1\n"; systemHeap: false },
         Profile { name: "system-k32"; defines: "#define MINYAR_SYSTEM_HEAP 1\n"; systemHeap: false },
@@ -58,23 +60,23 @@ function executesInProfiles(compiler: test.Compiler, source: Text, expected: Tex
     execute(compiler, llvm, expected, engine, profiles)
 }
 let allowed = ["test_unused_dense_cycle_released_after_scalar_main", "test_constant_receivers_survive_calls_that_replace_nested_owners", "test_cyclic_module_root_released_on_normal_return"]
-for index in 0..argumentCount() {
+for index in 0..processInfo.argumentCount() {
     let valid = false
-    for name in allowed { if argument(index) == name || argument(index) == "ModuleConstantGraphs." + name { valid = true } }
-    test.check(valid, "unknown module graph case " + argument(index))
+    for name in allowed { if processInfo.argument(index) == name || processInfo.argument(index) == "ModuleConstantGraphs." + name { valid = true } }
+    test.check(valid, "unknown module graph case " + processInfo.argument(index))
 }
 let compiler = test.compiler()
-let engine = runtime.cycleSource(readTextFile("runtime/minyar_runtime.c"))
+let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
 if selected("test_unused_dense_cycle_released_after_scalar_main") {
-    for body in ["return 0", "if argumentCount() == 0 { return 0 }; return 1"] {
-        executesInProfiles(compiler, "record Node { children: List<Node> }\nconstant ROOT: Node = make()\nfunction make(): Node {\n    let node = Node { children: [] }\n    for i in 0..256 { node.children.add(node) }\n    return node\n}\nfunction main(): Integer { " + body + " }\n", "", engine)
+    for body in ["return 0", "if processInfo.argumentCount() == 0 { return 0 }; return 1"] {
+        executesInProfiles(compiler, "record Node { children: List<Node> }\nglobal ROOT: Node = make()\nfunction make(): Node {\n    let node = Node { children: [] }\n    for i in 0..256 { node.children.add(node) }\n    return node\n}\nfunction main(): Integer { " + body + " }\n", "", engine)
     }
 }
 if selected("test_constant_receivers_survive_calls_that_replace_nested_owners") {
-    executesInProfiles(compiler, "record Node { children: List<Node>; label: Text }\nconstant ROOT: Node = make()\nfunction make(): Node {\n    let node = Node { children: []; label: \"root\" + \"!\" }\n    node.children.add(Node { children: []; label: \"child\" + \"!\" })\n    node.children.add(node)\n    return node\n}\nfunction replace(): Text {\n    ROOT.children = []\n    return \"changed\" + \"!\"\n}\nROOT.children[0].label = replace()\nprint(ROOT.label)\nROOT.children = [ROOT]\nROOT.children[0] = ROOT\nprint(ROOT.children[0].label)\n", "root!\nroot!\n", engine)
+    executesInProfiles(compiler, "record Node { children: List<Node>; label: Text }\nglobal ROOT: Node = make()\nfunction make(): Node {\n    let node = Node { children: []; label: \"root\" + \"!\" }\n    node.children.add(Node { children: []; label: \"child\" + \"!\" })\n    node.children.add(node)\n    return node\n}\nfunction replace(): Text {\n    ROOT.children = []\n    return \"changed\" + \"!\"\n}\nROOT.children[0].label = replace()\nprint(ROOT.label)\nROOT.children = [ROOT]\nROOT.children[0] = ROOT\nprint(ROOT.children[0].label)\n", "root!\nroot!\n", engine)
 }
 if selected("test_cyclic_module_root_released_on_normal_return") {
-    let llvm = compile(compiler, "record Node { children: List<Node>; label: Text }\nconstant ROOT: Node = make()\nfunction make(): Node {\n    print(\"graph init\")\n    let node = Node { children: []; label: \"root\" + \"!\" }\n    node.children.add(node)\n    return node\n}\nfunction read(): Text { return ROOT.children[0].label }\nprint(read())\nprint(read())\n")
+    let llvm = compile(compiler, "record Node { children: List<Node>; label: Text }\nglobal ROOT: Node = make()\nfunction make(): Node {\n    print(\"graph init\")\n    let node = Node { children: []; label: \"root\" + \"!\" }\n    node.children.add(node)\n    return node\n}\nfunction read(): Text { return ROOT.children[0].label }\nprint(read())\nprint(read())\n")
     execute(compiler, llvm, "graph init\nroot!\nroot!\n", engine, [Profile { name: "default"; defines: ""; systemHeap: true }])
 }
 test.removeTree(compiler.directory)

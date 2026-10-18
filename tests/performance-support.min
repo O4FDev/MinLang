@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "../experiments/memory/measurement-stats.min" as stats
 use "../experiments/memory/study-support.min" as data
@@ -91,7 +92,7 @@ public function resourceBudget(rss: json.Value, instructions: json.Value): Outco
 public function validate(result: test.Result, output: Text, phase: Text): Outcome {
     if result.status != 0 { return failure(phase + " failed with status " + Text(result.status) + ":\n" + result.errorOutput) }
     if files.pathSize(output) < 0 { return failure(phase + " produced no LLVM output") }
-    for line in test.lines(readTextFile(output)) {
+    for line in test.lines(io.readTextFile(output)) {
         if data.starts(line, "define i32 @main(") || data.starts(line, "define fastcc i32 @main(") { return success(data.nullValue()) }
     }
     return failure(phase + " produced invalid compiler LLVM output")
@@ -110,7 +111,7 @@ public function capture(command: List<Text>, log: Text): test.Result {
     let status = system.wait(handle); let code = status.exitCode
     if status.state == system.SIGNALED { code = 128 + status.signal }
     if status.error != 0 { code = status.error }
-    return test.Result { status: code; output: readTextFile(log); errorOutput: readTextFile(log + ".err") }
+    return test.Result { status: code; output: io.readTextFile(log); errorOutput: io.readTextFile(log + ".err") }
 }
 public function timed(command: List<Text>, log: Text, seconds: Integer): Outcome {
     let stdout = files.open(log, files.WRITE | files.CREATE | files.TRUNCATE)
@@ -137,9 +138,9 @@ public function timed(command: List<Text>, log: Text, seconds: Integer): Outcome
     }
     test.check(files.close(savedOut) == 0 && files.close(savedErr) == 0 && files.close(stdout) == 0 && files.close(stderr) == 0, "timed descriptor cleanup")
     test.check(handle <= 0 || watchdog > 0, "timed process watchdog launch failed")
-    if timedOut { return failure(joined(command, " ") + " timed out after " + Text(seconds) + " seconds: " + readTextFile(log + ".err")) }
+    if timedOut { return failure(joined(command, " ") + " timed out after " + Text(seconds) + " seconds: " + io.readTextFile(log + ".err")) }
     if handle <= 0 { return failure("process launch failed: " + command[0]) }
-    if status.error != 0 || status.state != system.EXITED || status.exitCode != 0 { return failure(joined(command, " ") + " failed:\n" + readTextFile(log + ".err")) }
+    if status.error != 0 || status.state != system.EXITED || status.exitCode != 0 { return failure(joined(command, " ") + " failed:\n" + io.readTextFile(log + ".err")) }
     let cpu = data.nullValue()
     if before.error == 0 && after.error == 0 { cpu = data.decimal(Float(after.userMicroseconds + after.systemMicroseconds - before.userMicroseconds - before.systemMicroseconds) / 1000.0) }
     return success(data.object(["cpu_ms", "wall_ms"], [cpu, data.decimal(Float(stopped - started) / 1000000.0)]))
@@ -186,11 +187,11 @@ public function generate(directory: Text, shape: Text, count: Integer, functions
         pieces.add("public function value(): Integer {\n    let result = (" + expression + ") % 1000\n")
         for functionIndex in 0..functions { pieces.add("    result = helper" + Text(functionIndex) + "(result)\n") }
         pieces.add("    return result\n}\n"); values.add(total % 1000 + functions * statements)
-        writeTextFile(directory + "/m" + Text(index) + ".min", joinText(pieces))
+        io.writeTextFile(directory + "/m" + Text(index) + ".min", test.sourceModules(joinText(pieces)))
     }
     let imports: List<Text> = []; let calls: List<Text> = []; let expected = 0
     for index in 0..count { if shape == "wide" || index == count - 1 { imports.add("use \"./m" + Text(index) + ".min\" as d" + Text(index) + "\n"); calls.add("d" + Text(index) + ".value()"); expected += values[index] } }
-    writeTextFile(directory + "/main.min", joinText(imports) + "function main() {\n    print(" + joined(calls, " + ") + ")\n}\n")
+    io.writeTextFile(directory + "/main.min", test.sourceModules(joinText(imports) + "function main() {\n    print(" + joined(calls, " + ") + ")\n}\n"))
     return Graph { entry: directory + "/main.min"; expected: Text(expected) + "\n" }
 }
 public record Backend { fixture: Boolean; mode: Text; role: Text; zeroClock: Text; expectedInput: Text; profileFailureAt: Integer; globalFailureAt: Integer; failureDiagnostic: Text; active: Boolean; calls: List<Integer>; unlinks: List<Integer>; validations: List<Integer>; profileCalls: Integer; profileCounts: List<Integer>; behaviorCalls: Integer; wall: Float; cpu: Float; events: List<Text>; commands: List<json.Value> }
@@ -208,7 +209,7 @@ function functionalCompile(control: Backend, command: List<Text>, name: Text, ou
     } else { control.calls[index] += 1; control.events.add(name); bad = name == control.role && control.calls[index] == 3 && control.mode != "" }
     let mode = control.mode; if mode == "later" { mode = "failure" }
     if (profiled && control.profileFailureAt == control.profileCalls - 1) || (!profiled && control.globalFailureAt == control.commands.length) { bad = true; mode = "failure" }
-    if !bad || mode == "wrong-output" { let content = compilerLLVM(); if bad { content = "wrong compiler output\n" }; writeTextFile(output, content) }
+    if !bad || mode == "wrong-output" { let content = compilerLLVM(); if bad { content = "wrong compiler output\n" }; io.writeTextFile(output, content) }
     let status = 0; if bad && mode == "failure" { status = 1 }
     let diagnostics = ""
     if profiled {
@@ -238,7 +239,7 @@ public function profile(control: Backend, compiler: Text, source: Text, output: 
         clear(output)
         let result = test.Result { status: 0; output: ""; errorOutput: "" }
         if control.fixture { result = functionalCompile(control, [compiler, source, output], "current", output, true) }
-        else { result = capture(["/usr/bin/time", "-l", compiler, source, output], log + Text(index)) }
+        else { result = capture(["/usr/bin/time", "-l", compiler, source, output, "--library", "library"], log + Text(index)) }
         let checked = validate(result, output, "profiled self-compile")
         if !checked.ok { return checked }
         let value = counter(result.errorOutput)
@@ -248,12 +249,9 @@ public function profile(control: Backend, compiler: Text, source: Text, output: 
     return success(best)
 }
 public function fileIdentity(path: Text, log: Text, darwin: Boolean): json.Value {
-    let resolved = capture(["/usr/bin/realpath", path], log + ".path")
-    if resolved.status != 0 { resolved = capture(["/bin/realpath", path], log + ".path") }
-    test.require(resolved, "resolve identity path")
-    let absolute = test.lines(resolved.output)[0]
-    let command = ["/usr/bin/sha256sum", "--", absolute]
-    if darwin { command = ["/usr/bin/shasum", "-a", "256", "--", absolute] }
+    let absolute = test.resolvePath(path)
+    test.check(absolute != "", "resolve identity path: " + path)
+    let command = ["/bin/sh", "-c", "if command -v sha256sum >/dev/null; then exec sha256sum -- \"$1\"; else exec shasum -a 256 -- \"$1\"; fi", "minyar", absolute]
     let result = capture(command, log + ".hash"); test.require(result, "artifact identity SHA256")
     let fields = test.words(result.output); test.check(fields.length > 0 && Bytes(fields[0]).length == 64, "identity digest")
     return data.object(["path", "sha256"], [data.text(absolute), data.text(fields[0])])
@@ -266,21 +264,21 @@ public function identities(context: Comparison): json.Value {
     return data.object(["current", "previous", "input", "runtime"], values)
 }
 public function recordComparison(context: Comparison): json.Value {
-    let toolchain = json.parse(readTextFile(context.root + "/build/.toolchain.json"))
+    let toolchain = json.parse(io.readTextFile(context.root + "/build/.toolchain.json"))
     let revision = capture(["/usr/bin/git", "-C", context.root, "rev-parse", "HEAD"], context.work + "/revision")
     test.require(revision, "current compiler ref")
     let previousRef = system.getenv("MINYAR_BUDGET_PREVIOUS_REF")
     test.check(system.lastError() == 0, "previous compiler reference required")
     let configuration = data.object(["previous_ref", "current_ref", "toolchain", "environment", "clang", "artifacts"], [data.text(previousRef), data.text(test.lines(revision.output)[0]), toolchain, configurationEnvironment(), fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang", context.darwin), identities(context)])
     files.makeDirectory(data.parent(context.manifest))
-    writeTextFile(context.manifest, json.pretty(configuration, "") + "\n")
+    io.writeTextFile(context.manifest, json.pretty(configuration, "") + "\n")
     return configuration
 }
 function configurationValid(context: Comparison, configuration: json.Value, original: json.Value): Outcome {
     if !equal(json.member(configuration, "artifacts"), original) { return failure("same-input compiler comparison identity mismatch") }
     let toolchain = json.member(configuration, "toolchain")
     if json.string(toolchain, "llvm_version") != "23.1.2" { return failure("same-input compiler comparison requires LLVM 23.1.2") }
-    let actual = json.parse(readTextFile(context.root + "/build/.toolchain.json"))
+    let actual = json.parse(io.readTextFile(context.root + "/build/.toolchain.json"))
     let clang = fileIdentity(json.string(json.member(toolchain, "llvm_cc"), "path"), context.work + "/clang", context.darwin)
     if !equal(actual, toolchain) || !equal(clang, json.member(configuration, "clang")) || !equal(configurationEnvironment(), json.member(configuration, "environment")) { return failure("same-input compiler comparison toolchain changed") }
     return success(configuration)
@@ -318,19 +316,19 @@ function measured(context: Comparison, name: Text): Outcome {
 function comparisonFailure(context: Comparison, result: json.Value, message: Text): Outcome {
     data.set(result, "status", data.text("failed")); data.set(result, "error", data.text(message))
     files.makeDirectory(data.parent(context.report))
-    writeTextFile(context.report, json.pretty(result, "") + "\n")
+    io.writeTextFile(context.report, json.pretty(result, "") + "\n")
     return Outcome { ok: false; error: message; value: result }
 }
 public function behavior(context: Comparison, output: Text): Outcome {
     context.control.behaviorCalls += 1
     if context.control.fixture { return success(data.nullValue()) }
-    let executable = test.setting("MINYAR_COMPILER_BEHAVIOR", "build/tests/compiler-behavior")
+    let executable = test.setting("MINYAR_COMPILER_BEHAVIOR", "build/tooling/tests/compiler-behavior")
     let result = test.run([executable, "--ir", output, "--profile", "core"], system.environment(), "", context.work + "/behavior" + Text(context.control.behaviorCalls), 180)
     if result.status != 0 { return failure("self-compiled compiler behavior failed:\n" + result.output + result.errorOutput) }
     return success(data.nullValue())
 }
 public function comparison(context: Comparison): Outcome {
-    let configuration = json.parse(readTextFile(context.manifest)); let original = identities(context)
+    let configuration = json.parse(io.readTextFile(context.manifest)); let original = identities(context)
     let valid = configurationValid(context, configuration, original)
     if !valid.ok { return valid }
     let pairs: List<json.Value> = []
@@ -360,19 +358,19 @@ public function comparison(context: Comparison): Outcome {
     }
     data.set(result, "summaries", summaries)
     let budget = pairedBudget(result); if !budget.ok { return comparisonFailure(context, result, budget.error) }
-    data.set(result, "status", data.text("passed")); files.makeDirectory(data.parent(context.report)); writeTextFile(context.report, json.pretty(result, "") + "\n")
+    data.set(result, "status", data.text("passed")); files.makeDirectory(data.parent(context.report)); io.writeTextFile(context.report, json.pretty(result, "") + "\n")
     return success(result)
 }
 public function fixtureComparison(work: Text, runs: Integer, batches: Integer): Comparison {
     files.makeDirectory(work + "/build")
     let context = Comparison { root: work; current: work + "/current"; previous: work + "/previous"; input: work + "/input"; runtime: work + "/build/minyar-compiler-runtime.ll"; manifest: work + "/configuration.json"; report: work + "/pairs.json"; work: work; runs: runs; batches: batches; darwin: false; control: backend(true) }
     context.control.expectedInput = context.input
-    for name in ["current", "previous", "input", "clang"] { writeTextFile(work + "/" + name, name) }
-    writeTextFile(context.runtime, "runtime")
+    for name in ["current", "previous", "input", "clang"] { io.writeTextFile(work + "/" + name, name) }
+    io.writeTextFile(context.runtime, "runtime")
     let toolchain = data.object(["llvm_version", "llvm_cc", "flags"], [data.text("23.1.2"), data.object(["path"], [data.text(work + "/clang")]), data.object(["LLVM_FLAGS", "COMPILER_LTO_FLAGS"], [data.text("-O2"), data.text("-flto=thin")])])
-    writeTextFile(work + "/build/.toolchain.json", json.pretty(toolchain, ""))
+    io.writeTextFile(work + "/build/.toolchain.json", json.pretty(toolchain, ""))
     let configuration = data.object(["toolchain", "environment", "clang", "artifacts"], [toolchain, configurationEnvironment(), fileIdentity(work + "/clang", work + "/clang-identity", false), identities(context)])
-    writeTextFile(context.manifest, json.pretty(configuration, ""))
+    io.writeTextFile(context.manifest, json.pretty(configuration, ""))
     return context
 }
 public function controlledPhase(label: Text, cpuAvailable: Boolean, inflated: Boolean): json.Value {
@@ -394,24 +392,24 @@ public function controlledReport(link: Boolean, cpuAvailable: Boolean, enforce: 
     let artifacts = json.member(report, "artifacts")
     let labels = ["driver", "compiler", "production", "runtime"]
     let filenames = ["minyar-module-build", "minyarc-modules", "minyarc", "minyar-runtime.o"]
-    for index in 0..labels.length { let label = labels[index]; writeTextFile(work + "/" + label, filenames[index]); data.set(artifacts, label, json.member(fileIdentity(work + "/" + label, work + "/artifact-" + label, false), "sha256")) }
-    let cache = work + "/case.cache"; writeTextFile(cache, "cache")
+    for index in 0..labels.length { let label = labels[index]; io.writeTextFile(work + "/" + label, filenames[index]); data.set(artifacts, label, json.member(fileIdentity(work + "/" + label, work + "/artifact-" + label, false), "sha256")) }
+    let cache = work + "/case.cache"; io.writeTextFile(cache, "cache")
     let entry = "    print(value())\n"; let library = "result = result + 1\n"
     for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit", "cold"] {
         let source = entry; let dependency = library
         if scenario == "entry-edit" { source = test.replace(entry, "    print(", "    let changed = 1\n    print(") }
         if scenario == "dependency-edit" { dependency = test.replace(library, "result = result + 1", "result = result + 2") }
         if scenario == "interface-edit" { dependency += "\npublic record Added { value: Integer }\n" }
-        writeTextFile(work + "/main.min", source); writeTextFile(work + "/m0.min", dependency)
+        io.writeTextFile(work + "/main.min", test.sourceModules(source)); io.writeTextFile(work + "/m0.min", test.sourceModules(dependency))
         let driver: List<json.Value> = []; let production: List<json.Value> = []; let counters: List<Text> = []
         for repeat in 0..3 {
             let order = ["driver", "production"]; if repeat % 2 != 0 { order = ["production", "driver"] }
-            if scenario == "cold" { clear(cache) } else { writeTextFile(cache, "cache") }
+            if scenario == "cold" { clear(cache) } else { io.writeTextFile(cache, "cache") }
             let values = [count + 1, 0, 0, count + 1, 0, 0]
             if files.pathSize(cache) < 0 { values = [0, count + 1, 0, 0, 0, 0] }
-            else if test.contains(readTextFile(work + "/main.min"), "let changed") || test.contains(readTextFile(work + "/m0.min"), "result = result + 2") { values = [count + 1, 1, 0, count, 0, 0] }
+            else if test.contains(io.readTextFile(work + "/main.min"), "let changed") || test.contains(io.readTextFile(work + "/m0.min"), "result = result + 2") { values = [count + 1, 1, 0, count, 0, 0] }
             let counterText: List<Text> = []; for value in values { counterText.add(Text(value)) }
-            writeTextFile(work + "/stats.txt", joined(counterText, " ")); writeTextFile(cache, "cache")
+            io.writeTextFile(work + "/stats.txt", joined(counterText, " ")); io.writeTextFile(cache, "cache")
             for label in order {
                 let frontend = controlledPhase(label, cpuAvailable, inflated); let measurement = frontend
                 if link { let linked = controlledPhase("clang", cpuAvailable, inflated); let combined = combine([frontend, linked]); if !combined.ok { return combined }; measurement = combined.value; data.set(measurement, "frontend_ms", frontend); data.set(measurement, "link_ms", linked) }
@@ -421,7 +419,7 @@ public function controlledReport(link: Boolean, cpuAvailable: Boolean, enforce: 
             if scenario == "entry-edit" || scenario == "dependency-edit" { test.check(values[1] == 1, "one edited cache rebuild") }
             if scenario == "cold" { test.check(values[0] == 0 && values[1] == count + 1, "cold exact cache counters") }
             for file in files.list(work) { test.check(!data.starts(file, "invocation."), "no invocation storage survives") }
-            if repeat > 0 { counters.add(readTextFile(work + "/stats.txt")) }
+            if repeat > 0 { counters.add(io.readTextFile(work + "/stats.txt")) }
         }
         let driverSummary = summarize(driver); let productionSummary = summarize(production)
         if !driverSummary.ok { return driverSummary }; if !productionSummary.ok { return productionSummary }
@@ -433,7 +431,7 @@ public function controlledReport(link: Boolean, cpuAvailable: Boolean, enforce: 
             else if json.member(productionSummary.value, "cpu_ms").number < 20.0 { status = "below-measurement-floor" }
         }
         let row = data.object(["shape", "modules", "scenario", "samples", "counters", "median_ms", "cache_bytes", "result_cache_bytes", "delta_bytes", "cpu_ceiling_status"], [data.text("wide"), data.integer(count), data.text(scenario), data.object(["driver", "production"], [data.array(driver), data.array(production)]), data.strings(counters), data.object(["driver", "production"], [driverSummary.value, productionSummary.value]), data.integer(5), data.integer(files.pathSize(cache)), data.integer(0), data.text(status)])
-        rows.add(row); writeTextFile(work + "/report.json", json.pretty(report, "") + "\n")
+        rows.add(row); io.writeTextFile(work + "/report.json", json.pretty(report, "") + "\n")
         if status == "evaluated" {
             let ceiling = 1.05; if scenario == "cold" { ceiling = 3.5 }; if scenario == "interface-edit" { ceiling = 1.8 }
             if json.member(driverSummary.value, "cpu_ms").number > json.member(productionSummary.value, "cpu_ms").number * ceiling { return Outcome { ok: false; error: "incremental CPU ceiling exceeded"; value: report } }

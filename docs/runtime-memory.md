@@ -8,48 +8,39 @@ The explicit eager profile can perform the entire traversal during a release.
 See [the cleanup contract](bounded-runtime-contract.md) for the work accounting
 and operations outside that budget; it is not a wall-clock deadline.
 
+Native implementations for the `io`, `process`, `random`, and `math` modules
+live in `runtime/minyar_library.h`, separately from core Text, Bytes, and
+numeric operations. They share the runtime compilation unit to preserve each
+ownership profile and the bootstrap/native C ABI; the compiler resolves their
+public APIs through ordinary module declarations.
+
 ## Recursive data and cycle prevention
 
-The following proof describes ordinary untraced allocation. The optional
-managed-graph frontend supports cycle-capable mutation and typed closures.
-Activated type components use a separate traced runtime with exact hidden
-capture edges; they do not use this no-cycles proof. See
-the graph ownership and execution-domain contract.
-The ordinary compiler's cycle checks request that frontend with status 86
-instead of emitting an unsafe edge. Programs that require no such feature
-retain the original LLVM and runtime allocation representation.
+The compiler supports cycle-capable record/List mutation and typed closures.
+It marks the affected type components for traced allocation, and the launcher
+links the required runtime automatically. No separate frontend selection is
+needed. Activated components include exact hidden capture edges; they do not
+use the no-cycles proof below. Programs that require no such feature retain
+ordinary LLVM and runtime allocation representations.
 
 Recursive record types are supported, including recursion through nested Lists
 and mutually recursive records. Trees, persistent chains and shared acyclic
 structures can be built with record constructors and List literals; see
 [`examples/recursive-tree.min`](../examples/recursive-tree.min).
 
-The conservative restriction applies to mutation, not declarations. For a
-mutation of `List<T>`, the compiler asks whether `T` can reach that exact
-`List<T>` type by following record fields and List element types. If so, both
-`.add` and indexed replacement are rejected with:
+For a mutation of `List<T>`, the compiler asks whether `T` can reach that exact
+`List<T>` type through its reference edges. If it can, mutation activates the
+relevant traced component rather than inserting an untracked cyclic edge.
+For `record Node { children: List<Node> }`, construction, indexing, iteration,
+`.add` and indexed replacement are all supported, including self-reference.
+A mutable `List<Integer>` payload remains untraced. Exact nested types matter:
+a `List<List<Node>>` worklist need not itself become cyclic when Node only
+contains `List<Node>` and cannot reach that outer List type.
 
-```text
-this List mutation could create a reference cycle; construct a new List instead
-```
-
-For `record Node { children: List<Node> }`, `List<Node>` therefore supports
-construction, indexing, iteration and sharing, but not `.add` or indexed
-replacement. Even a particular append of a fresh leaf is rejected: proving
-individual mutations safe would require additional ownership analysis. A
-mutable `List<Integer>` payload remains supported. An external `List<Wrapper>`
-where `Wrapper` contains a Node also remains mutable if Node cannot reach
-Wrapper. The check uses exact nested List types: a `List<List<Node>>` worklist
-is mutable when Node only contains `List<Node>` and has no path back to that
-outer List type.
-
-Lists keep their shared reference semantics; nothing is implicitly copied,
-frozen or made weak. A function that performs a forbidden mutation is rejected
-even if a caller would pass an apparently safe argument. Module aliases,
-returned references and helper functions cannot evade the check because every
-mutation is checked using its resolved static type. The iterative traversal
-visits each reachable record once, and proven-safe List types are cached for
-that compilation. Scalar and Text element types need no graph traversal.
+Lists keep shared reference semantics; nothing is implicitly copied, frozen
+or made weak. Analysis uses resolved static types across module aliases,
+returned references and helper functions. Scalar and Text element types need
+no recursive ownership-graph traversal.
 
 The acyclicity argument uses the first possible cycle. A new record or List
 literal is unavailable to the source program until its construction finishes;
@@ -59,39 +50,35 @@ cycle must instead result from inserting a mutable edge: from some List object
 of type `List<T>` to a value of type `T`, or from a record of type `R` to a
 value of a reference field type `F`. The existing return path in the heap would
 imply a type path from `T` back to `List<T>`, or from `F` back to `R`, and the
-checker rejects both. Assigning a reference field whose type can reach its own
-record type fails with:
-
-```text
-assigning this field could create a reference cycle; construct a new record instead
-```
+compiler therefore keeps those edges out of ordinary untraced components by
+activating traced allocation and its mutation barriers. A reference field
+whose type can reach its own record is handled by the same analysis.
 
 Scalar field assignment adds no heap edge and is always permitted. This
 argument includes transitive record fields, nested Lists and aliases.
 
-The non-mutating `list.appended(value)` operation copies into a fresh List and
-is permitted for recursive element types. Because the result does not exist
-while its inputs are evaluated, none of them can already point back to it; the
-first-cycle proof therefore still holds. This supports dynamic bottom-up tree
-construction, at linear cost per append, without weakening the mutation rule.
+The non-mutating `list.appended(value)` operation preserves the input List's
+contents and is also permitted for recursive element types. A fresh result
+cannot already be referenced by its inputs. Eligible consuming assignments
+can reuse uniquely owned storage; an aliased input requires copying.
 
-Arbitrary cycles are unsupported by this ordinary allocation path. Programs
-that need them select the optional graph frontend described below. Integer
-identifiers remain an option without that extension; see
-[`examples/graph.min`](../examples/graph.min). Inferred lifetime regions and
-permissive mutation analysis are not implemented. This proof does not cover
-closure capture edges or raw foreign-pointer mutation. New dynamic types or
-changes to the type encoding must establish their own ownership argument.
+Map mutations that could create reference cycles remain rejected. Integer
+identifiers are an alternative for explicitly managed graph relationships;
+see [`examples/graph.min`](../examples/graph.min). Inferred lifetime regions
+are not implemented. The no-cycles proof does not cover raw foreign-pointer
+mutation; closure capture edges instead participate in the traced component
+analysis below. New dynamic types or changes to the type encoding must
+establish their own ownership argument.
 
 ## Closures, cycles and execution domains
 
-Typed callbacks use `Callback<ArgumentTypes..., ReturnType>` and anonymous
+Typed callbacks use `(ArgumentTypes...) -> ReturnType` and anonymous
 `function(...)[: ReturnType] { ... }` values. Their environments own exact
 capture fields: scalar captures are snapshots and reference captures preserve
 aliases. Captured bindings cannot be rebound; a captured record can hold
 mutable state. Callback calls use the ordinary owned/borrowed convention.
 
-The optional frontend includes environment and callback edges in its type
+The compiler includes environment and callback edges in its type
 analysis. Cycle-capable mutation activates the relevant strongly connected
 type component, with traced allocations, owning-slot barriers and a bounded
 snapshot collector. Unrelated acyclic components remain untraced. A traced
@@ -134,8 +121,9 @@ from frozen `907804b` passed a focused replay with the repaired runtime at O0/O2
 native and ASan/UBSan/LSan, with exact `42/41` output and empty stderr.
 
 Typed `Result<T,E>` values use owned records with only the active payload slot
-initialized and owning. Match and early propagation preserve payload lifetimes
-and run scope cleanup; cycles through either payload follow the same optional
+initialized and owning. `Result<Nothing, E>` has a tag-only success with no
+initialized payload. Match and expression-level early propagation preserve payload lifetimes
+and run scope cleanup; cycles through either payload follow the same
 graph analysis. See the Result language contract
 and the independent review.
 
@@ -320,7 +308,7 @@ because the underlying arena storage remains alive.
 | `make check-cycle-private-retirement` / `-sanitize` | Operation-aware retirement, phase/reuse controls and private locality bounds |
 | `make check-cycle-progress` / `-sanitize` | Live-cohort progress, exact reclamation and the separate strict idle CPU assertion |
 
-The optional graph and callback checks additionally include
+The graph and callback checks additionally include
 `tests/managed-graphs.min`, `tests/managed-graphs-profiles.min`,
 `tests/callbacks.min`, `tests/callback-domains.min` and `tests/cycle-progress.min`.
 Their exact reachability, object/debt and work-budget assertions complement

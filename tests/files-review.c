@@ -70,7 +70,11 @@ static int intercepted_closedir(DIR *d) {
 }
 static int intercepted_datasync(int fd) {
     if (atomic_load(&sync_failure)) { errno = EIO; return -1; }
+#ifdef __APPLE__
+    return fcntl(fd, F_FULLFSYNC);
+#else
     return fdatasync(fd);
+#endif
 }
 static ssize_t intercepted_pwrite(int fd, const void *data, size_t count, off_t position) {
     if (positioned_io) { positioned_calls++; return count ? 1 : 0; }

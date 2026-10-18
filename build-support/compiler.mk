@@ -18,12 +18,13 @@ COMPILER_SOURCES = compiler/stages/source.min \
 	compiler/stages/modules.min \
 	compiler/stages/incremental.min \
 	compiler/closure-compiler.min \
+	compiler/callable-types.min \
 	compiler/errors-compiler.min \
 	compiler/calldepth-compiler.min \
 	compiler/thread-compiler.min \
 	compiler/compiler.min
 
-build/compiler.min: $(COMPILER_SOURCES) build-support/compiler.mk | build
+build/compiler.min: library/io.min library/process.min $(COMPILER_SOURCES) build-support/compiler.mk | build
 	cat $(COMPILER_SOURCES) > $@.tmp
 	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' $@.tmp
 	mv $@.tmp $@
@@ -44,13 +45,13 @@ build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage2.ll: build/compiler.min build/compiler-stage1
-	$(LIMITED) ./build/compiler-stage1 $< $@
+	$(LIMITED) ./build/compiler-stage1 $< $@ --library library
 
 build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage3.ll: build/compiler.min build/minyarc
-	$(LIMITED) ./build/minyarc $< $@
+	$(LIMITED) ./build/minyarc $< $@ --library library
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll
 	cp $< $@
@@ -100,7 +101,7 @@ build/compiler-baseline-control.min: build-support/compiler.mk | build
 	mv $@.tmp $@
 
 build/compiler-baseline-control.ll: build/compiler-baseline-control.min build/minyarc
-	$(LIMITED) ./build/minyarc $< $@
+	$(LIMITED) ./build/minyarc $< $@ --library library
 
 build/minyarc-baseline: build/compiler-baseline-control.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@

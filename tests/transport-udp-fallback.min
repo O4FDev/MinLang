@@ -1,3 +1,6 @@
+use "io" as io
+use "process" as processInfo
+use "random" as secureRandom
 use "transport" as transport
 use "net" as net
 use "errors" as errors
@@ -10,7 +13,7 @@ function udpPhase(connection: transport.Connection, socket: Integer, controlPort
     while net.monotonicMilliseconds() - started < 8000 {
         let now = net.monotonicMilliseconds() - started
         if mid && connection.state == transport.QUIC_READY && !opened {
-            if !errors.bytesOk(transport.peerCertificate(connection)) || Text(errors.bytesValue(transport.peerCertificate(connection))) != Text(serverIdentity) { return -2 }
+            if !errors.bytesOk(transport.peerCertificate(connection)) || !bytesEqual(errors.bytesValue(transport.peerCertificate(connection)), serverIdentity) { return -2 }
             id = errors.integerValue(transport.openStream(connection))
             if id < 0 || !errors.integerOk(transport.write(connection,id,message,true)) { return -2 }
             opened = true
@@ -19,7 +22,7 @@ function udpPhase(connection: transport.Connection, socket: Integer, controlPort
             let arrived = transport.read(connection,id)
             if errors.bytesOk(arrived) { received.addBytes(errors.bytesValue(arrived)) }
             if received.length == message.length {
-                if Text(received) != Text(message) { return -2 }
+                if !bytesEqual(received, message) { return -2 }
                 print("QUIC_ECHO authenticated")
                 let control = net.connect("127.0.0.1",controlPort)
                 if control < 0 || net.send(control,Bytes("B")) != 1 || !net.ready(control,3000) { return -2 }
@@ -54,10 +57,10 @@ function udpPhase(connection: transport.Connection, socket: Integer, controlPort
     print("real UDP fallback timed out"); return -2
 }
 function main(): Integer {
-    let mid=argument(0)=="mid"
-    let udpPort=number(argument(1)); let tcpPort=number(argument(2)); let controlPort=number(argument(3))
-    let identity=readBytesFile(argument(4)); let key=readBytesFile(argument(5)); let root=readBytesFile(argument(6)); let serverIdentity=readBytesFile(argument(7))
-    let connection=transport.client("localhost",randomBytes(80),"minyar-test",[root],[identity],key)
+    let mid=processInfo.argument(0)=="mid"
+    let udpPort=number(processInfo.argument(1)); let tcpPort=number(processInfo.argument(2)); let controlPort=number(processInfo.argument(3))
+    let identity=io.readBytesFile(processInfo.argument(4)); let key=io.readBytesFile(processInfo.argument(5)); let root=io.readBytesFile(processInfo.argument(6)); let serverIdentity=io.readBytesFile(processInfo.argument(7))
+    let connection=transport.client("localhost",secureRandom.bytes(80),"minyar-test",[root],[identity],key)
     if !errors.booleanOk(transport.timeouts(connection,1500,300,1500)) { return 1 }
     let udp=net.udp("127.0.0.1",0)
     if udp<0 || !net.udpConnect(udp,"127.0.0.1",udpPort) { return 2 }
@@ -67,13 +70,13 @@ function main(): Integer {
     if connection.state!=transport.TCP_NEEDED { return 3 }
     let socket=net.connect("127.0.0.1",tcpPort); if socket<0 { return 4 }
     let started=net.monotonicMilliseconds(); let base=connection.now
-    if !errors.booleanOk(transport.startTCP(connection,randomBytes(64),base)) { net.close(socket); return 5 }
+    if !errors.booleanOk(transport.startTCP(connection,secureRandom.bytes(64),base)) { net.close(socket); return 5 }
     let opened=false; let completed=0; let messages: List<Message> = []
     while net.monotonicMilliseconds()-started<12000 {
         let now=base+net.monotonicMilliseconds()-started
         if connection.state==transport.TCP_READY && !opened {
             if !connection.clientTLS.authenticated || connection.clientTLS.resumed || !errors.bytesOk(transport.peerCertificate(connection)) ||
-               Text(errors.bytesValue(transport.peerCertificate(connection)))!=Text(serverIdentity) || connection.mux.streams.length!=0 { return 6 }
+               !bytesEqual(errors.bytesValue(transport.peerCertificate(connection)), serverIdentity) || connection.mux.streams.length!=0 { return 6 }
             if mid && errors.code(errors.integerError(transport.write(connection,retired,Bytes("stale handle"),true)))!=transport.retryRequiredCode() { return 7 }
             opened=true; print("TCP_AUTHENTICATED fresh")
             for index in 0..16 {
@@ -119,4 +122,10 @@ function main(): Integer {
         }
     }
     net.close(socket); print("TCP fallback stream timeout"); return 17
+}
+
+function bytesEqual(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
 }

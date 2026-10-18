@@ -218,19 +218,3 @@ void minyar_check_shift(long long count) {
     if ((unsigned long long)count > 63)
         minyar_stop("a shift count must be between 0 and 63.");
 }
-
-double minyar_tan(double value) {
-    return tan(value);
-}
-double minyar_asin(double value) {
-    return asin(value);
-}
-double minyar_acos(double value) {
-    return acos(value);
-}
-double minyar_atan(double value) {
-    return atan(value);
-}
-double minyar_atan2(double y, double x) {
-    return atan2(y, x);
-}

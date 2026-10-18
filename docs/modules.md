@@ -36,8 +36,12 @@ backslashes in local paths are accepted for Windows interoperability. `.` and
 is compiled once even when reached through different paths.
 
 Imported modules contain declarations only. Executable top-level statements
-belong to the entry file, preventing imports from causing hidden runtime side
-effects. Cycles are rejected before type checking. Functions and records with
+belong to the entry file. Explicit runtime
+[`global` initializers](language.md#constants) run before the entry point,
+including in imported modules, and can perform I/O or fail. Imports therefore
+can have initialization side effects when they declare globals. Literal
+module constants cannot execute initialization code. Import cycles are rejected before type
+checking. Functions and records with
 the same private source name may safely exist in different modules because the
 declarations belong to separate module namespaces.
 
@@ -86,6 +90,41 @@ package wins. A build for another processor or platform can so replace one
 package without copying the rest: Minyar OS's Arm build lists
 `library/arch/arm64`, whose `machine.min` holds the Arm intrinsics, before
 `library`, and its own `os/arch/arm64` before both for its `arch` package.
+
+## Core and standard modules
+
+Text methods (including trimming and splitting), collection operations, byte
+encoding, basic numeric helpers, printing and checked termination are core
+conveniences. File and process services, secure randomness and advanced Float
+mathematics have explicit module APIs:
+
+```minyar
+use "io" as io
+use "process" as process
+use "random" as random
+use "math" as math
+
+let path = process.argument(0)
+let source = io.readTextFile(path)
+io.writeTextFile(path + ".copy", source)
+let nonce = random.bytes(32)
+print(math.sqrt(81.0))
+```
+
+`io.writeTextParts(path, pieces)` streams a `List<Text>`; use
+`io.readBytesFile` and `io.writeBytesFile` for packed Bytes.
+`process.processId`, `process.sleepNanoseconds`, and `io.sync` are pointer-free
+OS operations safe in ordinary functions and managed threads; they replace
+`threadProcessId`, `threadSleepNanoseconds`, and `threadFsync`. File failures stop
+with a diagnostic. The `files` package provides recoverable descriptor APIs
+and explicit durability. These APIs no longer reserve unqualified function
+names: a module may declare its own `sin`, `argument`, or `readTextFile`.
+
+The `pixels` module contains parallel software blending and coverage algorithms.
+It uses the `machine` module's memory operations; rendering policy is ordinary
+library code. Thread-domain, ownership and channel checks remain compiler
+responsibilities. Native-backed module functions use the shared runtime ABI. Streaming text
+parts is ordinary library iteration over private buffered-writer operations.
 
 ## Scalability and rebuilds
 

@@ -1,0 +1,77 @@
+// Lower source callable types to the compiler's existing callable representation.
+// This runs before Result normalization and preserves every token's source origin.
+function callableTypeArrow(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
+    if kinds[start] != 4 || texts[start] != "(" { return -1 }
+    let depth = 1
+    let position = start + 1
+    while kinds[position] != 0 && depth > 0 {
+        if kinds[position] == 4 {
+            if texts[position] == "(" { depth = depth + 1 }
+            if texts[position] == ")" { depth = depth - 1 }
+        }
+        position = position + 1
+    }
+    if depth == 0 && kinds[position] == 4 && texts[position] == "->" { return position }
+    return -1
+}
+
+function appendCallableType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap, depth: Integer) {
+    if depth >= 64 { fail("callable type nesting exceeds 64") }
+    let location = cursor[0]
+    let origin = sourcePath(outputLines, tokenPath(lines, location))
+    let arrow = callableTypeArrow(kinds, texts, location)
+    if arrow >= 0 {
+        copyModuleToken(outputKinds, outputTexts, outputLines, 1, "Callback", lines, location, origin)
+        copyModuleToken(outputKinds, outputTexts, outputLines, 4, "<", lines, location, origin)
+        cursor[0] = cursor[0] + 1
+        while cursor[0] < arrow - 1 {
+            appendCallableType(kinds, texts, lines, cursor, outputKinds, outputTexts, outputLines, depth + 1)
+            copyModuleToken(outputKinds, outputTexts, outputLines, 4, ",", lines, location, origin)
+            if cursor[0] < arrow - 1 { expectToken(kinds, texts, lines, cursor, ",") }
+        }
+        expectToken(kinds, texts, lines, cursor, ")")
+        expectToken(kinds, texts, lines, cursor, "->")
+        appendCallableType(kinds, texts, lines, cursor, outputKinds, outputTexts, outputLines, depth + 1)
+        copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, location, origin)
+        return
+    }
+    if cursor[1] != 0 || kinds[location] != 1 {
+        fail(describeLocation(tokenLocation(lines, location)) + ": expected a callable argument or return type")
+    }
+    copyModuleToken(outputKinds, outputTexts, outputLines, 1, texts[location], lines, location, origin)
+    cursor[0] = cursor[0] + 1
+    if kinds[cursor[0]] == 4 && texts[cursor[0]] == "<" {
+        copyModuleToken(outputKinds, outputTexts, outputLines, 4, "<", lines, location, origin)
+        cursor[0] = cursor[0] + 1
+        appendCallableType(kinds, texts, lines, cursor, outputKinds, outputTexts, outputLines, depth + 1)
+        while cursor[1] == 0 && tokenIs(kinds, texts, cursor, ",") {
+            copyModuleToken(outputKinds, outputTexts, outputLines, 4, ",", lines, location, origin)
+            cursor[0] = cursor[0] + 1
+            appendCallableType(kinds, texts, lines, cursor, outputKinds, outputTexts, outputLines, depth + 1)
+        }
+        resultClose(kinds, texts, lines, cursor)
+        copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, location, origin)
+    }
+}
+
+function normalizeCallableTypes(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): CallbackTokens {
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    outputLines.features = lines.features
+    let cursor: List<Integer> = [0, 0]
+    while cursor[0] < kinds.length {
+        let position = cursor[0]
+        if callableTypeArrow(kinds, texts, position) >= 0 {
+            appendCallableType(kinds, texts, lines, cursor, outputKinds, outputTexts, outputLines, 0)
+            if cursor[1] != 0 {
+                copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+                cursor[1] = 0
+            }
+        } else {
+            copyModuleToken(outputKinds, outputTexts, outputLines, kinds[position], texts[position], lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            cursor[0] = cursor[0] + 1
+        }
+    }
+    return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }
+}

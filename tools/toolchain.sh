@@ -148,11 +148,33 @@ pinned() {
     pinned_path=$_resolved
 }
 
+default_clang() {
+    cached_clang=${HOME-}/.cache/minyar/toolchains/llvm-$llvm_version/bin/clang
+    if [ -n "${MINYAR_BUNDLED_CLANG-}" ]; then printf '%s\n' "$MINYAR_BUNDLED_CLANG"
+    elif [ -n "${HOME-}" ] && [ -x "$cached_clang" ]; then printf '%s\n' "$cached_clang"
+    elif [ "$(host_system)" = Darwin ]; then printf '%s\n' clang
+    else printf '%s\n' clang-23
+    fi
+}
+
+sdkroot() {
+    if [ "${SDKROOT+x}" = x ]; then printf '%s\n' "$SDKROOT"
+    elif [ "$(host_system)" = Darwin ] && find_command xcrun >/dev/null; then
+        xcrun --show-sdk-path 2>/dev/null || :
+    fi
+}
+
+prepare_sdk() {
+    if [ "${SDKROOT+x}" != x ]; then
+        discovered_sdk=$(sdkroot)
+        if [ -n "$discovered_sdk" ]; then SDKROOT=$discovered_sdk; export SDKROOT; fi
+    fi
+}
+
 selected_clang() {
     if [ "${MINYAR_CLANG+x}" = x ]; then selected=$MINYAR_CLANG
     elif [ "${LLVM_CC+x}" = x ]; then selected=$LLVM_CC
-    elif [ "$(host_system)" = Darwin ]; then selected=clang
-    else selected=clang-23
+    else selected=$(default_clang)
     fi
 }
 
@@ -207,8 +229,17 @@ toolchain() {
 }
 
 bootstrap() {
+    prepare_sdk
     project=$1
     shift
+    # Release toolchains are immutable. Never run Make or depend on build-host
+    # paths/timestamps when using a precompiled distribution.
+    if [ -f "$project/.minyar-distribution" ]; then
+        for target in "$@"; do
+            [ -f "$project/$target" ] || fail "release toolchain is missing $target; reinstall Minyar"
+        done
+        return 0
+    fi
     targets=
     for target in "$@"; do
         quote_word "$target"
@@ -255,12 +286,15 @@ bootstrap() {
 }
 
 doctor() {
+    prepare_sdk
     selected_clang
     pinned compiler "$selected"
     clang=$pinned_path
     c_compiler=${CC-$clang}
     missing=
-    for name in make "$c_compiler" zsh; do
+    prerequisites="make zsh"
+    if [ "${MINYAR_PREBUILT-0}" = 1 ]; then prerequisites=; fi
+    for name in $prerequisites "$c_compiler"; do
         find_command "$name" >/dev/null || missing="$missing${missing:+, }$name"
     done
     if [ -n "$missing" ]; then
@@ -279,6 +313,7 @@ doctor() {
         fail "the opaque IR / 64-bit C / LTO probe failed. Install matching Clang and lld (Linux), or Xcode command-line tools (macOS). Check MINYAR_CLANG_FLAGS.
 $(cat "$work/errors")"
     fi
+    "$work/probe" || fail 'the linked toolchain probe could not run on this Mac'
     printf 'Ready: 64-bit C headers, opaque LLVM pointers, and LTO linking verified.\n'
 }
 
@@ -294,7 +329,9 @@ version() {
     LC_ALL=C
     export LC_ALL
     set -- "$project"/compiler/*.min
-    if [ -f "$1" ]; then
+    if [ -f "$project/.minyar-distribution" ]; then
+        printf 'Minyar %s (macOS %s; requires macOS 14+)\n' "$(cat "$project/distribution.version")" "$(cat "$project/distribution.arch")"
+    elif [ -f "$1" ]; then
         identity=$(for source in "$@"; do printf '%s\0' "${source##*/}"; cat "$source"; done | digest)
         printf 'Minyar development (source %.12s)\n' "$identity"
     else
@@ -399,7 +436,7 @@ stamp() {
     target=$1
     previous=
     if [ -f "$target" ]; then previous=$(cat "$target"; printf x); previous=${previous%x}; fi
-    if [ "$(host_system)" = Darwin ]; then default_clang=clang; else default_clang=clang-23; fi
+    default_clang=$(default_clang)
     file_identity CC "${CC-cc}"
     cc_identity=$identity
     llvm_command=${LLVM_CC-$default_clang}
@@ -496,6 +533,8 @@ case $command:$# in
     host-path:1) host_path "$1"; printf '%s\n' "$host_value" ;;
     host-directory:1) host_directory "$1"; printf '%s\n' "$host_value" ;;
     toolchain:0) toolchain ;;
+    default-clang:0) default_clang ;;
+    sdkroot:0) sdkroot ;;
     doctor:0) doctor ;;
     version:1) version "$1" ;;
     bootstrap:*)

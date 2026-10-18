@@ -29,8 +29,10 @@ and `--doctor` checks the native toolchain with a real LLVM/LTO link. See
 native toolchains for platform setup and compiler selection.
 
 Programs use automatic, system-backed incremental reference counting by default.
-Large ownership graphs are reclaimed in budgeted batches, with no tracing
-collector and no required memory-management syntax. The default cleanup budget
+Large ownership graphs are reclaimed in budgeted batches without required
+memory-management syntax. Cycle-capable record and List components automatically
+use a traced runtime; unrelated acyclic components retain reference counting.
+The default cleanup budget
 is 32 work units. Allocator calls, I/O and total operation time remain outside
 that bound; this is not a hard-latency guarantee.
 
@@ -92,11 +94,11 @@ directly in Minyar, and the `http` and `json` packages talk to web services. See
 the macOS guide for APIs, ownership, packaging (including
 `--icon` and `--resources`), and the Swift-to-AppKit ABI investigation.
 
-An experimental native SwiftUI compiler frontend is also available. First build
+An experimental Swift dialect with a native SwiftUI compiler frontend is also available. First build
 the pinned compiler using the native frontend guide, then:
 
 ```sh
-./minyar --backend native --release --app examples/swiftui/main.min -o "build/Minyar Native SwiftUI.app"
+./minyar --experimental-swift --release --app examples/swiftui/main.min -o "build/Minyar Native SwiftUI.app"
 open "build/Minyar Native SwiftUI.app"
 ```
 
@@ -104,7 +106,9 @@ It parses original `.min` files inside a compiler fork and reuses Swift's semant
 analysis, optimizer, and ABI without generating intermediary Swift source or
 adding a Minyar UI runtime. Native acceptance tests cover
 SwiftUI scenes, macros, module imports, and a differential LLVM comparison.
-It is **not full Minyar/Swift parity**. The older `--backend swift` source prototype
+It uses Swift value semantics and is **outside the main Minyar language contract**.
+It is available through an explicit experimental command rather than a backend
+selection. The older `--experimental-swift-source` source prototype
 remains available with the installed Xcode compiler. See the
 SwiftUI compiler guide for tested features, code-generation
 comparison, language differences and the remaining frontend work.
@@ -114,7 +118,7 @@ pass the directory. Components are available automatically across the app;
 optional `.mac.min` files replace shared implementations for macOS:
 
 ```sh
-./minyar --backend native --release examples/native-counter -o "build/Project Counter.app"
+./minyar --experimental-swift --release examples/native-counter -o "build/Project Counter.app"
 open "build/Project Counter.app"
 ```
 
@@ -124,7 +128,7 @@ The native frontend also has an experimental GTK 4/libadwaita target. Build the
 compiler inside Fedora using the Linux desktop guide, then:
 
 ```sh
-./minyar --backend native --release --pkg-config libadwaita-1 \
+./minyar --experimental-swift --release --pkg-config libadwaita-1 \
   examples/native-editor -o build/minyar-editor
 ./build/minyar-editor
 ```

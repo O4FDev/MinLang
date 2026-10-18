@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "../tools/llvm-sanitizer.min" as sanitizer
 use "./quic-test-support.min" as quic
@@ -46,7 +48,7 @@ public function digest(context: Context, path: Text): Text {
 }
 public function digestBytes(context: Context, value: Bytes): Text {
     let path = context.scratch + "/.bytes-" + stamp()
-    writeBytesFile(path, value)
+    io.writeBytesFile(path, value)
     let result = digest(context, path)
     files.remove(path)
     return result
@@ -433,7 +435,7 @@ function failed(value: Text): Boolean { return quic.starts(value, "!") }
 function reason(value: Text): Text { return quic.after(value, "!") }
 
 public function verifyLink(context: Context, directory: Text, binaryPath: Text, sanitize: Boolean, optimization: Text, compilerIdentity: Text): Text {
-    let report = data.decode(readBytesFile(directory + "/manifest.json"))
+    let report = data.decode(io.readBytesFile(directory + "/manifest.json"))
     if !data.isObject(report) { return "final-link schema 2 required" }
     let inventory = artifactInventory(context, directory)
     if inventory.error != "" { return inventory.error }
@@ -453,7 +455,7 @@ public function verifyLink(context: Context, directory: Text, binaryPath: Text, 
     if !data.isText(artifact) || resolved(context, artifact.text) != resolved(context, directory) { return "link artifact directory mismatch" }
     let rawPath = retainedPath(directory, data.string("program.raw.ll"), inventory)
     if rawPath == "" { return "missing or escaped retained file" }
-    let raw = readBytesFile(rawPath)
+    let raw = io.readBytesFile(rawPath)
     let rawHash = hashOf(inventory, "program.raw.ll")
     let rawOriginal = bound(context, directory, data.field(report, "raw_program_input"), true, inventory)
     if failed(rawOriginal) { return reason(rawOriginal) }
@@ -464,7 +466,7 @@ public function verifyLink(context: Context, directory: Text, binaryPath: Text, 
         linkedName = "program.asan.ll"
         let linkedPath = retainedPath(directory, data.string(linkedName), inventory)
         if linkedPath == "" { return "missing or escaped retained file" }
-        linked = readBytesFile(linkedPath)
+        linked = io.readBytesFile(linkedPath)
         let canonical = sanitizer.instrument(Text(raw), "sanitize_address")
         if canonical.error != "" || canonical.text != Text(linked) || Text(linked) == Text(raw) { return "linked program is not canonical ASan annotation" }
     }
@@ -625,12 +627,12 @@ function firstFailure(values: List<Text>): Text {
 }
 
 public function verifyDriverArtifacts(context: Context, directory: Text, kind: Text, parsed: json.Value, declared: List<Text>, binaries: Binaries, sourceNames: List<Text>, sourceHashes: List<Text>, tools: List<Tool>): Text {
-    let manifest = data.decode(readBytesFile(directory + "/manifest.json"))
+    let manifest = data.decode(io.readBytesFile(directory + "/manifest.json"))
     if !data.isObject(manifest) || !data.equalsInteger(data.field(manifest, "schema_version"), 1) || !data.equalsText(data.field(manifest, "status"), "passed") ||
         !data.equal(data.field(manifest, "finalization_errors"), data.array([])) || !data.equal(data.field(manifest, "unhashed_files"), data.array([])) {
         return "author artifact manifest did not pass complete retention"
     }
-    if !data.equal(data.decode(readBytesFile(directory + "/results.json")), parsed) { return "printed author results differ from retained results" }
+    if !data.equal(data.decode(io.readBytesFile(directory + "/results.json")), parsed) { return "printed author results differ from retained results" }
     let cases = declared
     if cases.length == 0 {
         let printed = data.field(parsed, "declared_cases")
@@ -892,7 +894,7 @@ public function boundCopies(context: Context, root: Text, names: List<Text>, tar
     for name in names { sources.add(root + "/" + name); targets.add(target + "/" + name) }
     let before = quic.digests(sources, context.scratch + "/.before-" + stamp())
     let list = context.scratch + "/.copy-" + stamp()
-    writeTextFile(list, quic.joined(names, "\n") + "\n")
+    io.writeTextFile(list, quic.joined(names, "\n") + "\n")
     let copied = shell(context, copier, [root, target, list])
     files.remove(list)
     if copied.status != 0 { return Copies { names: names; rows: []; error: "source copy failed: " + copied.errorOutput } }
@@ -1075,7 +1077,7 @@ function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>
             paths.add(output)
             let checked = verifyLink(context, link, output, sanitize, optimization, compiler)
             if checked != "" { return checked }
-            append(gate.report, "links", data.object(["name", "optimization", "manifest"], [data.string(name), data.string(optimization), data.decode(readBytesFile(link + "/manifest.json"))]))
+            append(gate.report, "links", data.object(["name", "optimization", "manifest"], [data.string(name), data.string(optimization), data.decode(io.readBytesFile(link + "/manifest.json"))]))
         }
         let binaries = Binaries { names: binaryNames(); paths: paths }
         for kind in driverKinds() {
@@ -1104,7 +1106,7 @@ function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>
             let artifacts = verifyDriverArtifacts(context, child, kind, parsed, cases, binaries, before.names, before.hashes, tools)
             if artifacts != "" { return artifacts }
             append(gate.report, "drivers", data.object(["kind", "optimization", "cases", "result", "manifest"],
-                [data.string(kind), data.string(optimization), data.strings(cases), parsed, data.decode(readBytesFile(child + "/manifest.json"))]))
+                [data.string(kind), data.string(optimization), data.strings(cases), parsed, data.decode(io.readBytesFile(child + "/manifest.json"))]))
             print("QUIC RFC O" + optimization + " " + kind + " passed")
         }
     }
@@ -1172,12 +1174,12 @@ public function main(): Integer {
     let sanitize = false
     let directory = ""
     let index = 0
-    while index < argumentCount() {
-        let name = argument(index)
+    while index < processInfo.argumentCount() {
+        let name = processInfo.argument(index)
         if name == "--sanitize" { sanitize = true; index += 1; continue }
-        test.check(index + 1 < argumentCount(), "missing option value: " + name)
-        if name == "--optimization" { test.check(argument(index + 1) == "both", "invalid optimization: " + argument(index + 1)) }
-        else if name == "--artifacts" { directory = argument(index + 1) }
+        test.check(index + 1 < processInfo.argumentCount(), "missing option value: " + name)
+        if name == "--optimization" { test.check(processInfo.argument(index + 1) == "both", "invalid optimization: " + processInfo.argument(index + 1)) }
+        else if name == "--artifacts" { directory = processInfo.argument(index + 1) }
         else { fail("unknown option: " + name) }
         index += 2
     }

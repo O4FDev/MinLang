@@ -45,3 +45,11 @@ check-feature-declarations-incremental-sanitize: build/minyarc-modules-sanitize 
 check check-portable: check-feature-declarations-incremental
 check-sanitize: check-feature-declarations-incremental-sanitize
 endif
+
+.PHONY: check-core-modules check-core-modules-sanitize
+check-core-modules: build/minyarc build/minyar-runtime.o build/tooling/tests/core-modules
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/core-modules
+check-core-modules-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/core-modules
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) ./build/tooling/tests/core-modules
+check check-portable: check-core-modules
+check-sanitize: check-core-modules-sanitize

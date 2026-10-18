@@ -135,6 +135,8 @@ typedef struct {
     Function *functions;
     Expression **text_literals;
     Record *records;
+    char **import_aliases;
+    char **import_packages;
 } Program;
 
 typedef struct {
@@ -554,6 +556,25 @@ static Expression *parse_atom(Parser *parser) {
     if (parser->token.kind == TOKEN_NAME) {
         expression = new_expression(parser, EXPRESSION_NAME);
         expression->text = take_name(parser, "a name");
+        if (parser->token.kind == '.') {
+            for (size_t imported = 0; imported < (size_t)arrlen(parser->program.import_aliases); imported++) {
+                if (strcmp(expression->text, parser->program.import_aliases[imported])) continue;
+                advance(parser);
+                free(expression->text);
+                expression->text = take_name(parser, "an imported function name");
+                const char *package = parser->program.import_packages[imported];
+                int allowed = !strcmp(package, "io") ?
+                    (!strcmp(expression->text, "readTextFile") || !strcmp(expression->text, "writeTextFile") ||
+                     !strcmp(expression->text, "writeTextParts") || !strcmp(expression->text, "fileExists")) :
+                    (!strcmp(expression->text, "argument") || !strcmp(expression->text, "argumentCount"));
+                if (!allowed) fail_at(expression->line, expression->column, "unsupported bootstrap module function");
+                if (!strcmp(expression->text, "writeTextParts")) {
+                    free(expression->text);
+                    expression->text = copy_text("writeTextFile", strlen("writeTextFile"));
+                }
+                break;
+            }
+        }
         int record = find_record(&parser->program, expression->text);
         if (record >= 0 && parser->token.kind == '{') {
             expression->kind = EXPRESSION_RECORD;
@@ -906,6 +927,18 @@ static Program parse_program(char *source) {
     parser.token = next_token(&parser.lexer);
     skip_separators(&parser);
     while (parser.token.kind != TOKEN_EOF) {
+        if (word_is(&parser, "use")) {
+            advance(&parser);
+            if (parser.token.kind != TOKEN_TEXT ||
+                (strcmp(parser.token.text, "io") && strcmp(parser.token.text, "process")))
+                fail_at(parser.token.line, parser.token.column, "bootstrap imports only io and process");
+            arrput(parser.program.import_packages, copy_text(parser.token.text, parser.token.text_length));
+            advance(&parser);
+            expect_word(&parser, "as");
+            arrput(parser.program.import_aliases, take_name(&parser, "a module alias"));
+            skip_separators(&parser);
+            continue;
+        }
         if (word_is(&parser, "record")) {
             parse_record(&parser);
             skip_separators(&parser);

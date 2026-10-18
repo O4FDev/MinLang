@@ -2,40 +2,51 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "${SDKROOT+x}" != x ]; then
+    discovered_sdk=$(sh "$project_dir/tools/toolchain.sh" sdkroot)
+    if [ -n "$discovered_sdk" ]; then SDKROOT=$discovered_sdk; export SDKROOT; fi
+fi
 if [ "${1-}" = land ]; then
     shift
     make -C "$project_dir" build/tooling/tools/land
     cd "$project_dir"
     exec "$project_dir/build/tooling/tools/land" "$@"
 fi
-# The experimental native target has a separate type system and compiler
-# driver. Dispatch before building or linking the portable Minyar runtime.
+# Swift interoperability experiments are a separate dialect, not a backend
+# selection for Minyar. The LLVM compiler defines Minyar's language contract.
+case "${1-}" in
+    --experimental-swift|--experimental-swift-source)
+        native_tool=native-frontend
+        [ "$1" != --experimental-swift-source ] || native_tool=native-swift
+        shift
+        make -s -C "$project_dir" "build/tooling/scripts/$native_tool" >&2
+        MINYAR_PROJECT_DIR=$project_dir
+        export MINYAR_PROJECT_DIR
+        exec "$project_dir/build/tooling/scripts/$native_tool" "$@" ;;
+esac
 if [ "${1-}" = --backend ]; then
-    [ "$#" -ge 2 ] || { echo '--backend requires llvm, swift or native' >&2; exit 2; }
+    [ "$#" -ge 2 ] || { echo '--backend requires llvm' >&2; exit 2; }
     case "$2" in
-        swift|native)
-            [ "$2" = swift ] && native_tool=native-swift || native_tool=native-frontend
-            shift 2
-            make -s -C "$project_dir" "build/tooling/scripts/$native_tool" >&2
-            MINYAR_PROJECT_DIR=$project_dir
-            export MINYAR_PROJECT_DIR
-            exec "$project_dir/build/tooling/scripts/$native_tool" "$@" ;;
+        swift) echo 'The Swift source dialect is experimental; use --experimental-swift-source.' >&2; exit 2 ;;
+        native) echo 'The Swift frontend dialect is experimental; use --experimental-swift.' >&2; exit 2 ;;
         llvm) shift 2 ;;
         *) echo "unknown backend: $2" >&2; exit 2 ;;
     esac
 fi
 usage() {
-    echo "usage: ./minyar [--backend llvm|swift|native] [--app] [--bundle-id ID] [--icon FILE.icns] [--resources DIR] [--check | --debug | --release] [--incremental] [--library DIR] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
-    echo "native SwiftUI options: ./minyar --backend swift --help" >&2
+    echo "usage: ./minyar [--backend llvm] [--app] [--bundle-id ID] [--icon FILE.icns] [--resources DIR] [--check | --debug | --release] [--incremental] [--library DIR] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "Swift dialect experiment: ./minyar --experimental-swift --help" >&2
     exit 2
 }
 case "${1-}" in
     --help|-h)
         cat <<'HELP'
-usage: ./minyar [--backend llvm|swift|native] [--check | --debug | --release] [--incremental] [OPTIONS] FILE.min [-o PROGRAM]
+usage: ./minyar [--backend llvm] [--check | --debug | --release] [--incremental] [OPTIONS] FILE.min [-o PROGRAM]
 
 Build a native program; the compiler and runtime build on first use.
-  --backend BACKEND        llvm (default), swift, or experimental native frontend
+  --backend llvm           Compile the Minyar language (default)
+  --experimental-swift     Separate experimental Swift dialect and native ABI
+  --experimental-swift-source  Older Swift source translation experiment
   --app                    Package a macOS application bundle
   --bundle-id ID           Bundle identifier for --app
   --icon FILE.icns         Application icon for --app
@@ -300,7 +311,7 @@ if [ "$app" -eq 1 ]; then
     set -- --binary "$binary_file" --output "$output_file" --identifier "$bundle_id"
     if [ -n "$icon_file" ]; then set -- "$@" --icon "$icon_file"; fi
     if [ -n "$resources_dir" ]; then set -- "$@" --resources "$resources_dir"; fi
-    make -s -C "$project_dir" build/tooling/scripts/macos-app >&2
+    sh "$project_dir/tools/toolchain.sh" bootstrap "$project_dir" build/tooling/scripts/macos-app
     "$project_dir/build/tooling/scripts/macos-app" "$@"
 fi
 echo "built $output_file"

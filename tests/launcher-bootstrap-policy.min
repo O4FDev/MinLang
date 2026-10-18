@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./release-support.min" as support
 use "system" as system
@@ -9,8 +11,8 @@ record Observation { arguments: List<Text>; cpu: Text; file: Text; priority: Int
 constant POLICY_SOURCE = "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"${POLICY_NO_MEMORY:-}\" = 1 ] && [ \"$argument\" = -m ]; then exit 64; fi\ndone\nprintf '%s\\n' \"$@\" > \"$POLICY_LOG\"\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m|-c) shift 2 ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\nexec \"$@\"\n"
 
 function chosen(name: Text): Boolean {
-    if argumentCount() == 0 { return true }
-    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "BootstrapScheduling." + name { return true } }
+    if processInfo.argumentCount() == 0 { return true }
+    for index in 0..processInfo.argumentCount() { if processInfo.argument(index) == name || processInfo.argument(index) == "BootstrapScheduling." + name { return true } }
     return false
 }
 function setup(root: Text): Fixture {
@@ -18,15 +20,15 @@ function setup(root: Text): Fixture {
     let work = scratch + "/minyar bootstrap policy"
     test.check(files.makeDirectory(work) == 0, "bootstrap policy work")
     let policy = work + "/fake taskpolicy"
-    writeTextFile(policy, POLICY_SOURCE)
+    io.writeTextFile(policy, POLICY_SOURCE)
     let wrappers: List<Text> = []
     for name in ["with-limits.sh", "with-sanitizer-limits.sh"] {
         let wrapper = work + "/" + name
-        writeTextFile(wrapper, test.replace(readTextFile(root + "/scripts/" + name), "/usr/sbin/taskpolicy", "'" + policy + "'"))
+        io.writeTextFile(wrapper, test.replace(io.readTextFile(root + "/scripts/" + name), "/usr/sbin/taskpolicy", "'" + policy + "'"))
         wrappers.add(wrapper)
     }
     let payload = work + "/payload with spaces.sh"
-    writeTextFile(payload, "printf '%s\\n' \"$(ulimit -St)\" \"$(ulimit -Sf)\" \"$(nice)\"\n")
+    io.writeTextFile(payload, "printf '%s\\n' \"$(ulimit -St)\" \"$(ulimit -Sf)\" \"$(ps -o ni= -p $$ | tr -d ' ')\"\n")
     test.require(test.run(["chmod", "755", policy], system.environment(), "", scratch + "/mode", 10), "fake taskpolicy mode")
     let environment: List<Text> = []
     for entry in support.environment(["POLICY_LOG=" + work + "/policy.log"]) {
@@ -40,7 +42,7 @@ function setup(root: Text): Fixture {
     return Fixture { scratch: scratch; work: work; log: work + "/policy.log"; wrappers: wrappers; environment: environment; payload: payload; zsh: zsh; serial: 0 }
 }
 function ownPriority(fixture: Fixture): Integer {
-    return Integer(test.lines(support.output(["nice"], fixture.scratch + "/own-priority"))[0])
+    return Integer(test.lines(support.output(["/bin/sh", "-c", "ps -o ni= -p $$ | tr -d ' '"], fixture.scratch + "/own-priority"))[0])
 }
 function invoke(fixture: Fixture, wrapper: Text, extra: List<Text>): Observation {
     fixture.serial += 1
@@ -48,7 +50,7 @@ function invoke(fixture: Fixture, wrapper: Text, extra: List<Text>): Observation
     test.check(result.status == 0, "bootstrap wrapper failed\n" + result.errorOutput)
     let values = test.lines(result.output)
     test.check(values.length == 3, "bootstrap payload output\n" + result.output)
-    return Observation { arguments: test.lines(readTextFile(fixture.log)); cpu: values[0]; file: values[1]; priority: Integer(values[2]) }
+    return Observation { arguments: test.lines(io.readTextFile(fixture.log)); cpu: values[0]; file: values[1]; priority: Integer(values[2]) }
 }
 function prefix(values: List<Text>, count: Integer): Text {
     let parts: List<Text> = []
@@ -64,10 +66,10 @@ function finish(fixture: Fixture) {
 }
 let names = ["test_bulk_checks_keep_background_policy", "test_interactive_bootstrap_uses_normal_qos_with_the_same_caps", "test_foreground_context_retains_custom_caps",
     "test_context_cannot_raise_an_inherited_hard_cpu_cap", "test_older_taskpolicy_keeps_scheduling_cpu_and_file_limits", "test_public_launcher_scopes_context_to_bootstrap"]
-for index in 0..argumentCount() {
+for index in 0..processInfo.argumentCount() {
     let valid = false
-    for name in names { if argument(index) == name || argument(index) == "BootstrapScheduling." + name { valid = true } }
-    test.check(valid, "unknown bootstrap policy case " + argument(index))
+    for name in names { if processInfo.argument(index) == name || processInfo.argument(index) == "BootstrapScheduling." + name { valid = true } }
+    test.check(valid, "unknown bootstrap policy case " + processInfo.argument(index))
 }
 let rootScratch = test.scratch()
 let root = test.lines(support.output(["pwd", "-P"], rootScratch + "/root"))[0]
@@ -149,13 +151,13 @@ if chosen("test_public_launcher_scopes_context_to_bootstrap") {
     for directory in [project, project + "/tools", project + "/build", project + "/build/tooling", project + "/build/tooling/tools", fakes] { test.check(files.makeDirectory(directory) == 0, "launcher project directories") }
     test.require(test.run(["cp", "-p", root + "/minyar", project + "/minyar"], system.environment(), "", fixture.scratch + "/copy-launcher", 10), "copy public launcher")
     test.require(test.run(["cp", "-p", root + "/tools/toolchain.sh", project + "/tools/toolchain.sh"], system.environment(), "", fixture.scratch + "/copy-toolchain", 10), "copy bootstrap toolchain script")
-    writeTextFile(project + "/build/minyarc", "#!/bin/sh\nprintf '; mock IR\\n' > \"$2\"\n")
+    io.writeTextFile(project + "/build/minyarc", "#!/bin/sh\nprintf '; mock IR\\n' > \"$2\"\n")
     let driver = project + "/build/tooling/tools/clang-driver"
-    writeTextFile(driver, "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\nif [ \"$1\" = link ]; then printf 'fake output' > \"$5\"; fi\n")
-    writeTextFile(fakes + "/make", "#!/bin/sh\nprintf 'build %s\\n' \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\n")
+    io.writeTextFile(driver, "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\nif [ \"$1\" = link ]; then printf 'fake output' > \"$5\"; fi\n")
+    io.writeTextFile(fakes + "/make", "#!/bin/sh\nprintf 'build %s\\n' \"${MINYAR_INTERACTIVE_BOOTSTRAP-none}\" >> \"$POLICY_LOG\"\n")
     test.require(test.run(["chmod", "755", project + "/build/minyarc", driver, fakes + "/make"], system.environment(), "", fixture.scratch + "/fake-modes", 10), "fake launcher tool modes")
     let source = project + "/source with spaces.min"
-    writeTextFile(source, "print(42)\n")
+    io.writeTextFile(source, test.sourceModules("print(42)\n"))
     let environment = support.merge(fixture.environment, ["PATH=" + fakes + ":" + system.getenv("PATH")])
     for options in [["--check"], ["--release", "--memory-profile", "eager"]] {
         if support.exists(fixture.log) { test.check(files.remove(fixture.log) == 0, "clear launcher policy log") }
@@ -165,7 +167,7 @@ if chosen("test_public_launcher_scopes_context_to_bootstrap") {
         fixture.serial += 1
         let result = test.run(command, environment, fixture.work, fixture.scratch + "/launcher" + Text(fixture.serial), 30)
         test.check(result.status == 0, "public launcher failed\n" + result.errorOutput)
-        let rows = test.lines(readTextFile(fixture.log))
+        let rows = test.lines(io.readTextFile(fixture.log))
         test.check(rows.length > 0 && rows[0] == "build 1", "bootstrap must run in the interactive context: " + support.join(rows, "; "))
         for index in 1..rows.length { test.check(support.ends(rows[index], " none"), "bootstrap context must not leak into program linking: " + rows[index]) }
     }

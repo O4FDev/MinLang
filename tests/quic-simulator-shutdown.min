@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./quic-test-support.min" as quic
 use "sha256" as sha256
@@ -7,11 +9,11 @@ use "files" as files
 function quoted(value: Text): Text { return "'" + test.replace(value, "'", "'\\''") + "'" }
 function ready(path: Text): Boolean {
     if files.pathSize(path) <= 0 { return false }
-    return test.words(readTextFile(path)).length > 0
+    return test.words(io.readTextFile(path)).length > 0
 }
 function writerPid(path: Text): Integer {
     if !ready(path) { return 0 }
-    return Integer(test.words(readTextFile(path))[0])
+    return Integer(test.words(io.readTextFile(path))[0])
 }
 function release(pid: Integer) {
     if pid <= 0 || files.pathSize("/proc/" + Text(pid) + "/cmdline") < 0 { return }
@@ -20,10 +22,10 @@ function release(pid: Integer) {
 
 function writer(path: Text) {
     test.check(system.shutdownSignalSocket() >= 0, "cannot install capture writer shutdown handling")
-    writeTextFile(path, Text(system.processId()))
+    io.writeTextFile(path, Text(system.processId()))
     while system.drainShutdownSignals() == 0 { quic.pause(10) }
     quic.pause(200)
-    writeTextFile(path + ".flushed", "capture complete")
+    io.writeTextFile(path + ".flushed", "capture complete")
 }
 
 function run(source: Text, executable: Text, signal: Integer, name: Text) {
@@ -34,13 +36,15 @@ function run(source: Text, executable: Text, signal: Integer, name: Text) {
     if marker >= 0 { block = block.slice(marker, block.length) }
     let root = test.scratch()
     let command = quoted(executable) + " --writer "
-    writeTextFile(root + "/run.sh", "set -e\n" + command + quoted(root + "/left") + " &\n" + command + quoted(root + "/right") + " &\n" + "PID=$(jobs -p | tr '\\n' ' ')\n" + block)
+    test.check(test.contains(block, "\nwait\n"), "simulator shutdown wait marker")
+    block = test.replace(block, "\nwait\n", "\nprintf ready >" + quoted(root + "/trap-ready") + "\nwait\n")
+    io.writeTextFile(root + "/run.sh", "set -e\n" + command + quoted(root + "/left") + " &\n" + command + quoted(root + "/right") + " &\n" + "PID=$(jobs -p | tr '\\n' ' ')\n" + block)
     let handle = system.spawn("/usr/bin/setsid", ["setsid", "env", "--default-signal=INT", "/bin/bash", root + "/run.sh"], system.environment(), "")
     test.check(handle > 0, "cannot start simulator shutdown shell")
     let shell = system.childProcessId(handle)
     let limit = system.monotonicNanoseconds() + 30000000000
     let status = system.poll(handle)
-    while !(ready(root + "/left") && ready(root + "/right")) {
+    while !(ready(root + "/left") && ready(root + "/right") && ready(root + "/trap-ready")) {
         if status.state != system.PENDING || system.monotonicNanoseconds() >= limit {
             if status.state == system.PENDING { system.sendSignal(shell, 9); system.wait(handle) }
             release(writerPid(root + "/left"))
@@ -74,13 +78,13 @@ function run(source: Text, executable: Text, signal: Integer, name: Text) {
     test.removeTree(root)
 }
 
-if argumentCount() == 2 && argument(0) == "--writer" {
-    writer(argument(1))
+if processInfo.argumentCount() == 2 && processInfo.argument(0) == "--writer" {
+    writer(processInfo.argument(1))
     exit(0)
 }
 let script = "tests/interop/qns/simulator-shutdown.sh"
-if argumentCount() == 2 && argument(0) == "--script" { script = argument(1) }
-else { test.check(argumentCount() == 0, "usage: quic-simulator-shutdown [--script PATH]") }
+if processInfo.argumentCount() == 2 && processInfo.argument(0) == "--script" { script = processInfo.argument(1) }
+else { test.check(processInfo.argumentCount() == 0, "usage: quic-simulator-shutdown [--script PATH]") }
 let work = test.scratch()
 let located = test.run(["readlink", "-f", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/executable", 10)
 test.require(located, "simulator shutdown executable")

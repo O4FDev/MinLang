@@ -100,6 +100,7 @@ static void failures_and_files(void) {
     assert(minyar_thread_eventfd_read(event) == 2 && errno == EDOM);
     assert(!close(event));
 }
+#ifdef __x86_64__
 static long long dispatch(long long descriptor, void *input, void *channel) {
     (void)channel;
     minyar_rc_enter(2);
@@ -134,7 +135,14 @@ static long long kicked(long long descriptor, void *run, void *channel) {
 }
 static void real_kvm(void) {
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
-    assert(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == 12);
+    if (kvm < 0) {
+        assert(!getenv("MINYAR_REQUIRE_KVM"));
+        assert(errno == ENOENT || errno == ENODEV || errno == ENXIO || errno == EACCES ||
+               errno == EPERM);
+        printf("native regions real KVM skipped: /dev/kvm unavailable (%s)\n", strerror(errno));
+        return;
+    }
+    assert(ioctl(kvm, KVM_GET_API_VERSION, 0) == 12);
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     assert(vm >= 0);
     RcThreadLeaf *memory = map(4096);
@@ -215,6 +223,7 @@ static void real_kvm(void) {
     puts("native regions real KVM IO dispatch, HLT, stop-preserving CAS and entering/parked kick "
          "passed");
 }
+#endif
 static void fatal_case(const char *name) {
     RcThreadLeaf *region = map(64);
     if (!strcmp(name, "bounds"))
@@ -242,7 +251,12 @@ int main(int count, char **arguments) {
     }
     shared_lifetime();
     failures_and_files();
+#ifdef __x86_64__
     real_kvm();
+#else
+    assert(!getenv("MINYAR_REQUIRE_KVM"));
+    puts("native regions real KVM skipped: x86 guest requires x86-64");
+#endif
     rc_thread_domain_dispose();
     assert(atomic_load(&rc_native_region_maps) == atomic_load(&rc_native_region_unmaps));
     assert(atomic_load(&rc_thread_native_bytes) == 0 &&

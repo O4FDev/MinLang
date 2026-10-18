@@ -1,9 +1,30 @@
 # The Minyar language
 
+The LLVM compiler and runtime define this language contract. Minyar targets
+share its types, reference semantics and failure behavior. The separate
+`--experimental-swift` and `--experimental-swift-source` dialects explore Swift
+interoperability. Their value types and additional syntax are outside this
+contract. An alternative compiler must pass the same language conformance
+tests before it can become a Minyar backend.
+
 ## Bindings and scope
 
 `let` introduces a local value. A name exists from its declaration to the end
 of its lexical block. Assignment changes its value without changing its type.
+
+Inside a block, `constant` creates an immutable binding. Its initializer may
+be any expression and its type can be inferred:
+
+```minyar
+function example(): Integer {
+    constant answer = 20 + 22
+    constant values = [answer]
+    values.add(1)             // the referenced List remains mutable
+    return values[0]
+}
+```
+
+Immutability applies to the binding; it does not freeze a referenced object.
 
 ```minyar
 let attempts = 3
@@ -42,9 +63,10 @@ Integer and Float never mix implicitly; convert with `Float(integer)` or
 or outside the Integer range. `Integer(character)` gives a code point and
 `Character(integer)` accepts any Unicode scalar value.
 
-Math functions take Floats: `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`,
-`atan`, `atan2(y, x)`, `exp`, `log`, `pow(base, exponent)`, `floor`, `ceil`
-and `round` (halves round away from zero). `abs`, `min`, `max` and
+Import `use "math" as math` for Float mathematics: `math.sqrt`, `math.sin`,
+`math.cos`, `math.tan`, `math.asin`, `math.acos`, `math.atan`, `math.atan2(y, x)`,
+`math.exp`, `math.log`, `math.pow(base, exponent)`, `math.floor`, `math.ceil`
+and `math.round` (halves round away from zero). Core `abs`, `min`, `max` and
 `clamp(value, low, high)` accept Integers or Floats of one type.
 
 Integers also support bitwise `&`, `|`, `^`, `~` and the shifts `<<` and `>>`
@@ -70,9 +92,11 @@ if errors.integerOk(result) {
 print("still alive")
 ```
 
-Operators bind in this order, tightest first: `*`, `/`, `%`, `<<`, `>>`, `&`;
-then `+`, `-`, `|`, `^`; then `<`, `>`, `<=`, `>=`; then `==`, `!=`; then `&&`
-and finally `||`. So `value & 1 == 0` tests the lowest bit.
+Operators bind in this order, tightest first: `*`, `/`, `%`; then `+`, `-`;
+then `<<`, `>>`; then `&`; then `^`; then `|`; then `<`, `>`, `<=`, `>=`;
+then `==`, `!=`; then `&&`; and finally `||`. Operators at the same level
+associate left to right. Thus `1 << 2 + 1` is `1 << (2 + 1)` and
+`value & 1 == 0` tests the lowest bit.
 
 There is one equality operator: `==`. It never converts either side. Both sides
 must have the same type, and values compare by meaning—`Text` compares its
@@ -87,7 +111,7 @@ included.
 Function declarations cannot use a [reserved built-in name](#reserved-function-names).
 The compiler identifies the colliding name and suggests a rename.
 
-`constant` declares a named literal value that every function in the module
+At module scope, `constant` declares a literal value that every function in the module
 can use. It is a declaration, like a function or record, and `public` exports
 it from a module:
 
@@ -98,18 +122,20 @@ constant TITLE = "Minyarcraft"
 ```
 
 A literal value may omit its type annotation: an Integer, Float, Text,
-Character or Boolean, optionally negated. Other expressions need an annotation:
+Character or Boolean, optionally negated. A module constant cannot execute
+initialization code. Use an explicit immutable `global` binding for runtime
+initialization. A nonliteral global initializer requires a type annotation:
 
 ```minyar
-constant MODES: List<Integer> = [0o644, 0o755]
-constant CRC_TABLE: List<Integer> = makeTable()
+global MODES: List<Integer> = [0o644, 0o755]
+global CRC_TABLE: List<Integer> = makeTable()
 ```
 
-Annotated nonliteral initializers run once before `main()` or the entry module's
+Global initializers run once before `main()` or the entry module's
 top-level statements, including declarations in imported modules. Repeated and
 diamond imports share the same module table. An initializer may depend on another
-constant; recursively initializing a constant stops with a clear error. Literal
-constants retain their direct substitution behavior.
+global; recursive initialization stops with a clear error. Literal module
+constants are substituted directly and cannot cause initialization side effects.
 
 The binding cannot be reassigned. A List, Bytes or record value retains its usual
 mutable alias semantics; initialize lookup tables once and share them within the
@@ -164,19 +190,20 @@ print(Text(42))        // 42
 including, `end`. Positions count Unicode characters rather than UTF-8 bytes,
 and an invalid range stops with a descriptive bounds error.
 
-Use `argumentCount()` and `argument(position)` for command-line arguments,
-and `readTextFile(path)` and `writeTextFile(path, contents)` for text files.
-`contents` can also be a `List<Text>`: the file then holds what
-`joinText(contents)` would, written piece by piece without building the joined
-Text. A program that produces large output in small pieces, such as the
-compiler, avoids holding the whole file twice.
+Import `use "process" as process` for `process.argumentCount()` and
+`process.argument(position)`, excluding the executable name. Import
+`use "io" as io` for `io.readTextFile(path)` and `io.writeTextFile(path, text)`.
+`io.writeTextParts(path, pieces)` streams a `List<Text>` without allocating its
+concatenation. A program that produces large output in small pieces, such as
+the compiler, avoids holding the whole file twice.
 
-File-backed Text preserves the file's bytes, including malformed UTF-8.
-`text.byteLength` counts those bytes, and `writeTextFile` writes them unchanged.
-Character operations (`length`, indexing, and `slice`) validate the entire
-Text as UTF-8 before returning a result. Malformed input stops the program;
-even an ASCII index or slice cannot bypass an invalid byte elsewhere in the
-same Text.
+Every Text contains valid UTF-8, including values returned by files and native
+libraries. Invalid input is rejected at the conversion boundary.
+`text.byteLength` counts encoded bytes, including embedded zero bytes.
+Keep arbitrary file contents in Bytes. Import `text` and call
+`text.decode(bytes): Result<Text, errors.Error>` for recoverable decoding;
+invalid UTF-8 produces `errors.invalidDataCode()`. Character-offset caches
+remain lazy.
 
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
@@ -205,7 +232,8 @@ separates elements, and a trailing comma is allowed.
 
 A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
-create an ownership cycle are rejected, as described below. Reading or writing
+create a record/List ownership cycle activate traced allocation, as described
+below. Reading or writing
 outside a List's bounds stops with a clear error.
 
 `list.sort()` stably orders its elements in place and returns `Nothing`;
@@ -217,7 +245,7 @@ Equal elements keep their original order. Text sorting does not build its
 lazy character-offset cache.
 
 `list.sortBy(compare)` and `list.sortedBy(compare)` take a
-`Callback<T, T, Integer>`. Its signed three-way result is negative when the
+`(T, T) -> Integer`. Its signed three-way result is negative when the
 first element comes earlier, zero when equal, and positive when later:
 
 ```minyar
@@ -264,45 +292,49 @@ truncates or zero-extends, and `clear()` empties the Bytes while keeping its
 storage. Clearing and shrinking take constant time; growing initializes only the
 newly exposed range, plus any allocation/copy needed for capacity growth.
 Discarded storage is not a secure erase; it remains private and is initialized
-before a later resize or native extension exposes it. `readBytesFile(path)` and `writeBytesFile(path, bytes)` transfer files
+before a later resize or native extension exposes it. `io.readBytesFile(path)` and `io.writeBytesFile(path, bytes)` transfer files
 unchanged. `for byte in bytes` visits each byte as an Integer.
 
-`Bytes(text)` is a Text's UTF-8 encoding and `Text(bytes)` reads Bytes as UTF-8
-text. Like file contents, the bytes are kept exactly; they are validated as
-UTF-8 when a character operation first needs them:
+`Bytes(text)` is a Text's UTF-8 encoding. `Text(bytes)` validates and copies
+UTF-8 immediately; invalid UTF-8 stops at that conversion. Use
+`text.decode(bytes)` for untrusted input that needs recoverable failure:
 
 ```minyar
 let wire = Bytes("héllo")   // 6 bytes
 print(Text(wire).length)     // 5
 ```
 
-`randomBytes(count)` returns Bytes from the platform's cryptographically secure
+Import `use "random" as random`; `random.bytes(count)` returns Bytes from the platform's cryptographically secure
 generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,
 `BCryptGenRandom` on Windows and the processor's `RDRAND` instruction in
 freestanding programs.
 
 ## Memory lifetime
 
-Text, List, and record values are reclaimed automatically through reference
-counting. Expression temporaries are released between statements; locals retain
-their values until reassignment or scope exit. Aliases keep shared values alive.
+Text, List, and record values are reclaimed automatically. Acyclic components
+use reference counting; cycle-capable record and List components use traced
+allocation selected by the compiler and launcher. No extra build option or
+memory-management syntax is required. Expression temporaries are released
+between statements; locals retain their values until reassignment or scope exit.
+Aliases keep shared values alive.
 
-Recursive records and acyclic recursive values are supported. Their structural
-Lists are built with literals rather than later mutation:
+Recursive records support construction, sharing and mutation:
 
 ```minyar
 record Node { value: Integer; children: List<Node> }
 let leaf = Node { value: 1; children: [] }
 let root = Node { value: 2; children: [leaf, leaf] }
 print(root.children[0].value) // 1
+root.children.add(root)      // a cycle; the runtime can reclaim it
 ```
 
-For a mutation of `List<T>`, the compiler rejects `.add` and indexed replacement
-if `T` can lead back to that same `List<T>` type through fields or nested Lists.
-This prevents cycles even through aliases and helper functions. In the example,
-mutating any `List<Node>` is rejected, including an append that would happen to
-be safe. `list.appended(value)` returns a fresh List with the additional value,
-so recursive children can be accumulated safely by reassigning a local:
+The compiler follows reference fields, List elements and callback captures to
+identify components whose mutation could create cycles. Those components have
+additional tracing metadata and collection work; unrelated acyclic components
+retain ordinary reference counting. All aliases still observe mutation.
+
+`list.appended(value)` is an alternative when a separate List is wanted. It
+preserves the original List's contents and shares references to its elements:
 
 ```minyar
 let children: List<Node> = []
@@ -310,19 +342,17 @@ children = children.appended(leaf)
 let root = Node { value: 2; children: children }
 ```
 
-The operation copies the existing elements and is therefore linear in the List
-length; repeated use is quadratic. List literals remain preferable when all
-children are already known. Constructing a new List and reassigning a local
-cannot introduce the first cycle because that new List did not exist while its
-elements were evaluated.
-Unrelated mutable Lists, such as an Integer payload or an external worklist of
-wrappers that Node cannot reach, retain their usual shared behaviour.
+Copying an aliased List is linear in its length; repeated copying can be
+quadratic. The compiler can reuse storage in eligible consuming assignments.
+Use `.add` when shared mutation is intended and List literals when all elements
+are already known.
 
-Arbitrary cyclic graphs require another representation, such as Integer identifiers;
+Cycle support is not universal: Map mutations that could form reference cycles
+are still rejected. Integer identifiers remain useful for explicit graph models;
 see the [graph example](../examples/graph.min). The [recursive tree
 example](../examples/recursive-tree.min) demonstrates recursive construction
-and traversal. The [runtime memory contract](runtime-memory.md) explains the
-mutation rule and its acyclicity argument.
+and traversal. The [runtime memory contract](runtime-memory.md) explains
+traced components, ownership and execution domains.
 
 Freeing a large graph can take time proportional to its size. See
 [runtime profiles](bounded-runtime-contract.md) for incremental cleanup and
@@ -367,9 +397,9 @@ print(player.age) // 37
 ```
 
 Assignments can reach through fields and List positions, as in
-`world.chunks[0].blocks[5] = 1`. Scalar fields can always be assigned. A field
-holding a Text, List or record cannot be assigned if its type could lead back
-to the record's own type, because that could create a reference cycle; see the
+`world.chunks[0].blocks[5] = 1`. Scalar fields can always be assigned. Reference
+field mutation that can create a record/List cycle activates traced allocation;
+Map-related cycles remain restricted. See the
 [runtime memory contract](runtime-memory.md). Record equality is not supported.
 The receiver, index and assigned value are evaluated once, in that order.
 
@@ -396,13 +426,86 @@ public function balance(account: Account): Integer {
 Elsewhere, `account.owner` works but `account.balance` and
 `Account { ... }` are compile errors. A field may itself be named `private`.
 
+## Recoverable failures
+
+`Result<T, E>` contains either a successful `T` or an error `E`. `Ok(value)`
+and `Err(error)` infer their types from an annotated binding, field,
+function parameter or return type:
+
+```minyar
+function firstByte(packet: Bytes): Result<Integer, Text> {
+    if packet.length == 0 { return Err("empty packet") }
+    return Ok(packet[0])
+}
+
+function increment(packet: Bytes): Result<Integer, Text> {
+    return Ok(try firstByte(packet) + 1)
+}
+
+match increment(Bytes("A")) {
+    Ok(value) { print(value) }
+    Err(error) { print(error) }
+}
+```
+
+`try expression` unwraps success and immediately returns an error from the
+enclosing Result-returning function, whose error type must match exactly.
+It works inside expressions, arguments, assignments and returns, and may
+stand alone for a no-value operation. Propagation preserves evaluation order
+and releases the current function's owned locals and temporaries. Programmer
+failures such as bounds errors remain fatal.
+
+Use `Result<Nothing, E>` for an operation with no success payload. Construct
+success with `Ok()` and match it with `Ok() { ... }`. `Nothing` cannot be
+stored or bound as a payload, or used as an error type. A match must handle
+both variants exactly once. An unannotated standalone constructor still
+needs explicit arguments, for example `Ok<Integer, Text>(42)`.
+
+Generic Result is the public error-handling model. The `results` package
+adapts existing low-level networking status records while retaining EOF,
+would-block and truncated-prefix information. Concrete `errors` status
+records remain compatibility and native-ABI interfaces.
+
+## Callbacks
+
+`(ArgumentTypes...) -> ReturnType` describes a callable value; `() -> T`
+has no parameters. An anonymous function supplies its implementation.
+Context supplies omitted parameter and return types:
+
+```minyar
+record Handler { apply: (Integer) -> Integer }
+let offset = 2
+let handler = Handler {
+    apply: function(value) { return value + offset }
+}
+print(handler.apply(40)) // 42
+let callbacks = [handler.apply]
+print(callbacks[0](10))  // 12
+```
+
+Without a contextual callable type, anonymous parameters need annotations and
+an omitted return type means `Nothing`. The earlier
+`Callback<ArgumentTypes..., ReturnType>` spelling remains accepted for source
+compatibility and compiler bootstrapping.
+
+Callback-valued fields, List elements, constants and returned expressions can
+be called directly. The callee is evaluated once before its arguments and kept
+alive throughout the call, even if argument evaluation replaces its original
+field or List slot.
+
+Scalar captures are snapshots; reference captures retain shared objects.
+Captured bindings cannot be rebound, including with compound assignment such
+as `+=`. To maintain captured state, mutate a field of a captured record.
+Callbacks belong to their creator's execution domain; they do not transfer
+managed objects between threads.
+
 ## Parallel functions
 
 A `parallel function` may run on several processors at once. The runtime's
 ownership tracking is single-threaded, so a parallel function stays outside it:
 its parameters, locals and results are `Integer`, `Float`, `Boolean` or
 `Character`, and it calls only other parallel functions, `machine` intrinsics
-and the built-in arithmetic and mathematics. The compiler checks this and
+and scalar functions declared `parallel`, including those in `math`. The compiler checks this and
 compiles the function with no call-depth or ownership frame.
 
 ```minyar
@@ -461,15 +564,18 @@ if score >= 90 {
 `exit(status)` ends the program with an `Integer` process status; reaching the
 end uses zero.
 An explicit `function main()` is also supported. It accepts no declared
-parameters and has an `Integer` return type; use `argument()` to read process
+parameters and has an `Integer` return type; use `process.argument()` from the `process` module to read process
 arguments. A file cannot mix this form with executable top-level statements
 because that would create two entry points. The executable entry `main` cannot
 be called from language code; put shared work in a separate function. An imported
 module function named `main` is an ordinary function and remains callable.
 
 Functions with a value return type must return a value on every reachable path.
-A path ending in `fail(...)`, `exit(...)`, or a literal `while true` loop is
-also terminal. A literal-true loop has no fallthrough path. Functions returning
+A path ending in `fail(...)`, `exit(...)`, or a literal `while true` loop without
+a reachable `break` is also terminal. Literal `true` and `false` conditions
+select the reachable branch for return analysis, though unreachable source is
+still type-checked. For example, `if true { return 1 }` needs no `else`.
+Functions returning
 `Nothing` can use a bare `return`. `Nothing` is a return type, not a value that
 can be stored in bindings, fields, Lists, or parameters.
 
@@ -552,40 +658,18 @@ alias and do not reserve every module's function namespace.
 | `Map` |
 | `Text` |
 | `abs` |
-| `acos` |
-| `argument` |
-| `argumentCount` |
-| `asin` |
-| `atan` |
-| `atan2` |
-| `ceil` |
 | `clamp` |
-| `cos` |
 | `exit` |
-| `exp` |
 | `fail` |
-| `fileExists` |
-| `floor` |
 | `joinText` |
-| `log` |
 | `max` |
 | `min` |
 | `parallelEntry` |
-| `pow` |
 | `print` |
-| `randomBytes` |
-| `readBytesFile` |
-| `readTextFile` |
-| `round` |
-| `sin` |
-| `sqrt` |
-| `tan` |
 | `wrappingAdd` |
 | `wrappingMultiply` |
 | `wrappingSubtract` |
-| `writeBytesFile` |
-| `writeTextFile` |
 
-Generated from the compiler by `python3 tools/reserved-names.py`.
-Run `python3 tools/reserved-names.py --check` after changing built-in names.
+Generated from the compiler by `tools/reserved-names.min`;
+`make check-reserved-names` verifies this list.
 <!-- reserved-names: end -->

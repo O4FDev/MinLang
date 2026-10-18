@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./sha256-support.min" as arguments
 use "./system-test-build.min" as build
@@ -9,15 +11,15 @@ let language = false
 let rootOnly = false
 let prebuilt = false
 let optionIndex = 0
-while optionIndex < argumentCount() {
-    let option = argument(optionIndex)
+while optionIndex < processInfo.argumentCount() {
+    let option = processInfo.argument(optionIndex)
     if option == "--language" { language = true }
     else if option == "--root" { rootOnly = true }
     else if option == "--prebuilt" { prebuilt = true }
     else if option == "--mode" {
-        test.check(optionIndex + 1 < argumentCount(), "missing system process mode")
+        test.check(optionIndex + 1 < processInfo.argumentCount(), "missing system process mode")
         optionIndex += 1
-        mode = argument(optionIndex)
+        mode = processInfo.argument(optionIndex)
     } else { fail("unknown system process option: " + option) }
     optionIndex += 1
 }
@@ -27,23 +29,34 @@ let root = build.root(work)
 let platform = build.platform(work)
 let windows = system.getenv("OS") == "Windows_NT" || test.contains(platform, "MSYS") || test.contains(platform, "MINGW") || test.contains(platform, "CYGWIN") || platform == "Windows"
 test.check(!rootOnly || !windows, "--root requires POSIX")
-test.require(test.run(["chmod", "755", "--", work], system.environment(), root, work + "/directory-mode", 10), "private process fixture directory mode")
+test.require(test.run(["chmod", "755", work], system.environment(), root, work + "/directory-mode", 10), "private process fixture directory mode")
 let name = "process"
 if windows { name += ".exe" }
 let binary = work + "/" + name
 let command = [test.setting("MINYAR_TEST_CLANG", "clang"), "-std=c11", "-Wall", "-Wextra", "-Werror"]
 if mode == "sanitize" { for flag in ["-O1", "-g", "-fsanitize=address,undefined"] { command.add(flag) } }
 else { command.add("-O2") }
+if mode == "sanitize" && platform == "Darwin" {
+    // Empty-environment child controls still need a symbolizer without PATH.
+    let clang = build.commandPath(command[0], work)
+    let slash = 0
+    for index in 0..clang.byteLength { if Bytes(clang)[index] == 47 { slash = index } }
+    let symbolizer = Text(Bytes(clang).slice(0, slash + 1)) + "llvm-symbolizer"
+    test.check(files.pathSize(symbolizer) > 0, "pinned Clang symbolizer is required")
+    let options = work + "/sanitizer-options.c"
+    io.writeTextFile(options, "const char *__asan_default_options(void) { return " + build.quote("external_symbolizer_path=" + symbolizer) + "; }\n")
+    command.add(options)
+}
 for value in [root + "/tests/system-process.c", "-o", binary] { command.add(value) }
 if windows { for flag in ["-lpsapi", "-municode"] { command.add(flag) } }
 else { command.add("-pthread"); if platform != "Darwin" { command.add("-lm") } }
 test.require(test.run(command, system.environment(), root, binary + ".build", 40), "native process fixture build")
 let unicode = work + "/Unicode λ"
 test.check(files.makeDirectory(unicode) == 0, "cannot create Unicode process fixture directory")
-test.require(test.run(["chmod", "755", "--", unicode], system.environment(), root, work + "/unicode-mode", 10), "private Unicode fixture directory mode")
+test.require(test.run(["chmod", "755", unicode], system.environment(), root, work + "/unicode-mode", 10), "private Unicode fixture directory mode")
 let target = unicode + "/" + name
 test.require(test.run(["cp", "-p", "--", binary, target], system.environment(), root, work + "/copy", 10), "Unicode process fixture copy")
-test.require(test.run(["chmod", "755", "--", target], system.environment(), root, work + "/target-mode", 10), "private Unicode process fixture mode")
+test.require(test.run(["chmod", "755", target], system.environment(), root, work + "/target-mode", 10), "private Unicode process fixture mode")
 let environment = arguments.environment(system.environment(), "MINYAR_PARENT_ONLY", "must not inherit")
 environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=0")
 environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")

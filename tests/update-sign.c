@@ -8,7 +8,7 @@
 #include <io.h>
 #endif
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
 #ifdef _WIN32
     /* Signatures are binary; the CRT must never expand LF into CRLF. */
     assert(_setmode(_fileno(stdout), _O_BINARY) != -1);
@@ -27,6 +27,9 @@ int main(int argc, char **argv) {
     unsigned char sk[64], pk[32], signature[64];
     crypto_ed25519_key_pair(sk, pk, seed);
     crypto_ed25519_sign(signature, sk, message, sizeof(domain) + count);
-    assert(fwrite(signature, 1, sizeof(signature), stdout) == sizeof(signature));
+    FILE *output = argc == 3 ? fopen(argv[2], "wb") : stdout;
+    assert(output);
+    assert(fwrite(signature, 1, sizeof(signature), output) == sizeof(signature));
+    if (argc == 3) assert(fclose(output) == 0);
     return 0;
 }

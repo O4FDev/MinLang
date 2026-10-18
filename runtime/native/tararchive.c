@@ -265,8 +265,8 @@ long long minyar_tararchive_openReader(const MinyarBytes *source,long long path,
 }
 static MinyarBytes *owned_blob(Blob data) {
     if (data.n >= SIZE_MAX / 2) minyar_native_stop("these tar bytes are too large");
-    MinyarBytes *out = minyar_native_copy_text(data.p, (long long)data.n);
-    out->character_length = (long long)data.n;
+    MinyarBytes *out = minyar_bytes_new((long long)data.n);
+    if (data.n) memcpy((void *)out->bytes, data.p, data.n);
     return out;
 }
 static void record_take(NativeRecord *record, long long field, void *value) {

@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./evidence-support.min" as evidence
 use "system" as system
@@ -23,7 +25,7 @@ function shell(script: Text, arguments: List<Text>, seconds: Float): evidence.Co
     return evidence.command(command, seconds)
 }
 function manifest(path: Text): json.Value {
-    let value = json.parse(readTextFile(path + "/evidence.json"))
+    let value = json.parse(io.readTextFile(path + "/evidence.json"))
     test.check(value.kind == json.OBJECT, "evidence.json is not a JSON object")
     test.check(json.member(value, "schema_version").text == "1" && json.string(value, "status") == "failed", "evidence.json schema/status")
     test.check(json.string(value, "workspace") == path, "evidence.json workspace")
@@ -85,7 +87,7 @@ function successRemovesWorkspace() {
 }
 function inputsAreDigested(work: Text) {
     let source = work + "/digested.txt"
-    writeTextFile(source, "digest me\n")
+    io.writeTextFile(source, "digest me\n")
     let opened = evidence.open("inputs", [source, work + "/missing.txt"])
     test.check(opened.inputPaths.length == 1 && opened.inputPaths[0] == evidence.resolve(source), "regular input paths are resolved and missing inputs skipped")
     test.check(opened.inputDigests[0] == sha.hex(sha.digest(Bytes("digest me\n"))), "input digest")
@@ -118,7 +120,7 @@ function textNewlines(work: Text) {
     payload.add(0)
     payload.addBytes(Bytes("tail"))
     let source = work + "/newlines.bin"
-    writeBytesFile(source, payload)
+    io.writeBytesFile(source, payload)
     let opened = evidence.open("text-newlines", [])
     let observed = evidence.run(opened, shell("cat \"$1\"; cat \"$1\" >&2", [source], 5.0))
     let expected = "one\ntwo\nthree\n" + Text(Character(0)) + "tail"
@@ -154,7 +156,7 @@ function fileInputOffset(work: Text, replay: Text) {
     payload.add(0)
     payload.add(255)
     payload.addBytes(Bytes("kept tail\n"))
-    writeBytesFile(path, payload)
+    io.writeBytesFile(path, payload)
     let offset = Bytes("ignored prefix").length
     let request = evidence.command(["/bin/cat"], 5.0)
     request.stdin = "file"
@@ -170,7 +172,7 @@ function fileInputOffset(work: Text, replay: Text) {
     test.check(json.member(stdin, "offset").text == Text(offset), "file stdin offset is an integer")
     let replayed = replayCommand(replay, opened.path, "wrong parent input")
     test.check(replayed.status == 0 && same(replayed.stdout, tail) && replayed.stderr.length == 0, "file stdin replay\n" + Text(replayed.stderr))
-    writeTextFile(path, "changed file\n")
+    io.writeTextFile(path, "changed file\n")
     let refused = evidence.replay(opened.path + "/evidence.json", 0)
     test.check(test.contains(refused.error, "Replay input changed"), "changed stdin file was replayed: " + refused.error)
     let cli = replayCommand(replay, opened.path, "")
@@ -208,10 +210,10 @@ function replayRefusesInheritedStdin() {
     let path = opened.path + "/evidence.json"
     let inherited = evidence.replay(path, 0)
     test.check(inherited.error == "Replay stdin requires the original test scenario: inherited", "inherited stdin replay: " + inherited.error)
-    let source = readTextFile(path)
+    let source = io.readTextFile(path)
     let stripped = test.replace(source, "      \"stdin\": {\n        \"mode\": \"inherited\"\n      },\n", "")
     test.check(stripped != source, "stdin record layout")
-    writeTextFile(path, stripped)
+    io.writeTextFile(path, stripped)
     let unrecorded = evidence.replay(path, 0)
     test.check(unrecorded.error == "Replay stdin requires the original test scenario: unrecorded", "unrecorded stdin replay: " + unrecorded.error)
 }
@@ -258,10 +260,10 @@ function referencePriority() {
         let path = original
         if variant != "default" { path = original + "." + variant }
         paths.add(path)
-        writeTextFile(path, variant)
+        io.writeTextFile(path, variant)
     }
-    writeTextFile(original + ".other-os", "wrong system")
-    writeTextFile(original + ".little-endian.small", "wrong byte order")
+    io.writeTextFile(original + ".other-os", "wrong system")
+    io.writeTextFile(original + ".little-endian.small", "wrong byte order")
     for index in 0..variants.length {
         let observed = evidence.referenceOutput(opened, original, "small", "big", "test-os")
         test.check(Text(observed) == variants[index], "reference priority selected " + Text(observed))
@@ -280,7 +282,7 @@ function referencePriority() {
     test.check(json.member(controls, "output_references").items.length == variants.length, "reference controls in evidence.json")
     test.check(json.member(json.member(controls, "output_references").items[0], "size").text == "small", "reference size in evidence.json")
     let defaults = evidence.open("reference-defaults", [])
-    writeTextFile(defaults.path + "/plain.stdout", "plain")
+    io.writeTextFile(defaults.path + "/plain.stdout", "plain")
     test.check(Text(evidence.referenceOutput(defaults, defaults.path + "/plain.stdout", "", "", "")) == "plain", "default reference")
     let record = json.parse(evidence.controlItems(defaults, "output_references")[0])
     test.check(json.member(record, "size").kind == json.NULL && json.string(record, "variant") == "default", "default reference record")
@@ -314,7 +316,7 @@ function failureRetainsBytes(self: Text) {
 }
 function childCheck() {
     let opened = evidence.open("binary", [])
-    writeTextFile(opened.path + "/case.min", "print(42)\n")
+    io.writeTextFile(opened.path + "/case.min", test.sourceModules("print(42)\n"))
     let request = shell("printf '\\377broken' >&2; exit 23", [], 5.0)
     request.check = true
     evidence.run(opened, request)
@@ -323,13 +325,13 @@ function childCheck() {
 function replayChangedArtifact() {
     let opened = evidence.open("reproduction", [])
     let source = opened.path + "/program.sh"
-    writeTextFile(source, "exit 23\n")
+    io.writeTextFile(source, "exit 23\n")
     evidence.run(opened, evidence.command(["/bin/sh", source], 5.0))
     evidence.close(opened, true)
     let path = opened.path + "/evidence.json"
     let first = evidence.replay(path, -1)
     test.check(first.error == "" && first.status == 23, "replayed status " + Text(first.status) + " " + first.error)
-    writeTextFile(source, "exit 0\n")
+    io.writeTextFile(source, "exit 0\n")
     let changed = evidence.replay(path, -1)
     test.check(test.contains(changed.error, "Replay artifact changed"), "changed artifact replayed: " + changed.error)
 }
@@ -340,9 +342,9 @@ function descendantTimeout(self: Text, work: Text) {
     test.check(result.status != 0 && test.contains(diagnostics, "TimeoutExpired"), "descendant timeout did not fail\n" + diagnostics)
     test.check(exists(heartbeat), "descendant did not start")
     let driver = evidence.open("heartbeat", [])
-    let before = readTextFile(heartbeat)
+    let before = io.readTextFile(heartbeat)
     pause(driver, "0.15")
-    test.check(readTextFile(heartbeat) == before, "descendant survived the timeout")
+    test.check(io.readTextFile(heartbeat) == before, "descendant survived the timeout")
     let row = commandRow(manifest(retainedPath(diagnostics)), 0)
     test.check(json.member(row, "timed_out").truth, "descendant timeout record")
     test.check(json.string(row, "stdout_base64") == evidence.base64(Bytes("started\n")), "started output record")
@@ -359,7 +361,7 @@ function executableResolution(work: Text) {
     let directory = work + "/command-directory"
     test.check(files.makeDirectory(directory) == 0, "command directory")
     let probe = directory + "/probe"
-    writeTextFile(probe, "#!/bin/sh\nexit 23\n")
+    io.writeTextFile(probe, "#!/bin/sh\nexit 23\n")
     let opened = evidence.open("relative-executable", [])
     makeExecutable(opened, probe)
     for name in ["./probe", "probe"] {
@@ -378,7 +380,7 @@ function executableResolution(work: Text) {
     test.check(!json.member(row, "empty_environment").truth && json.string(json.member(row, "environment"), "PATH") == ".", "explicit PATH record")
     test.check(json.member(row, "removed_environment").items.length > 0, "removed environment record")
     test.check(evidence.replay(path, 1).status == 23 && evidence.replay(path, 2).status == 23, "executable replay")
-    writeTextFile(probe, "#!/bin/sh\nexit 0\n")
+    io.writeTextFile(probe, "#!/bin/sh\nexit 0\n")
     let changed = evidence.replay(path, 1)
     test.check(test.contains(changed.error, "Replay input changed"), "changed executable replayed: " + changed.error)
 }
@@ -398,7 +400,7 @@ function environmentDelta() {
     test.check(system.getenv("PEER_REMOVED") == "must not survive", "harness parent environment control")
     let opened = evidence.open("environment-delta", [])
     let helper = opened.path + "/peer-helper"
-    writeTextFile(helper, "#!/bin/sh\necho \"helper found\"\n")
+    io.writeTextFile(helper, "#!/bin/sh\necho \"helper found\"\n")
     makeExecutable(opened, helper)
     let environment: List<Text> = []
     for entry in system.environment() { if !test.contains(entry, "PEER_REMOVED=") { environment.add(entry) } }
@@ -447,16 +449,16 @@ function cases(self: Text, replay: Text) {
     print("evidence harness: 18 cases passed")
 }
 
-test.check(argumentCount() >= 1, "usage: evidence-harness SELF REPLAY")
-let mode = argument(0)
+test.check(processInfo.argumentCount() >= 1, "usage: evidence-harness SELF REPLAY")
+let mode = processInfo.argument(0)
 if mode == "--child-stdin" { childStdin() }
 else if mode == "--child-timeout" { childTimeout() }
 else if mode == "--child-reference" { childReference() }
 else if mode == "--child-check" { childCheck() }
-else if mode == "--child-descendant" { childDescendant(argument(1)) }
-else if mode == "--cases" { cases(argument(1), argument(2)) }
+else if mode == "--child-descendant" { childDescendant(processInfo.argument(1)) }
+else if mode == "--cases" { cases(processInfo.argument(1), processInfo.argument(2)) }
 else {
-    test.check(argumentCount() == 2, "usage: evidence-harness SELF REPLAY")
+    test.check(processInfo.argumentCount() == 2, "usage: evidence-harness SELF REPLAY")
     let base = test.scratch()
     let environment: List<Text> = []
     for entry in system.environment() {
@@ -464,7 +466,7 @@ else {
     }
     environment.add("MINYAR_TEST_EVIDENCE=" + base)
     environment.add("PEER_REMOVED=must not survive")
-    let handle = system.spawn(argument(0), [argument(0), "--cases", argument(0), argument(1)], environment, "")
+    let handle = system.spawn(processInfo.argument(0), [processInfo.argument(0), "--cases", processInfo.argument(0), processInfo.argument(1)], environment, "")
     test.check(handle > 0, "cannot start evidence harness cases")
     let status = system.wait(handle)
     removeAll(base)

@@ -1,3 +1,4 @@
+use "io" as io
 use "./peer-support.min" as peer
 use "../tools/testing.min" as test
 use "../tools/peer-audit.min" as audit
@@ -228,7 +229,7 @@ function makeShim(c: peer.Case, folder: Text): Text {
         "shift 3", "[ \"$#\" -gt 0 ] || { echo 'make shim: no targets' >&2; exit 1; }",
         "for target in \"$@\"; do", "case $target in /*) path=$target ;; *) path=$root/$target ;; esac",
         "[ -f \"$path\" ] || { echo \"make shim: missing target $target\" >&2; exit 1; }", "done"]
-    writeTextFile(shim, peer.lines(script))
+    io.writeTextFile(shim, peer.lines(script))
     test.require(test.run(["/bin/chmod", "755", shim], system.environment(), "", c.directory + "/" + folder + "-mode", 10), "make shim permissions")
     return shim
 }
@@ -592,7 +593,7 @@ function test_invalid_utf8_prefix_before_function_is_rejected(c: peer.Case) {
     contents.addBytes(Bytes("function foo(): Boolean { return true }\n"))
     let path = peer.writeBytes(c, "invalid-prefix.min", contents)
     let llvm = peer.path(c, "invalid-prefix.ll")
-    let result = peer.run(c, [c.compiler.executable, path, llvm], "compile", c.compiler.compileTimeout)
+    let result = peer.run(c, [c.compiler.executable, path, llvm, "--library", "library"], "compile", c.compiler.compileTimeout)
     peer.observe(c, result, 1, "", INVALID_UTF8, "invalid UTF-8 prefix")
     peer.expect(c, absent(llvm), "invalid UTF-8 prefix left LLVM output behind")
 }
@@ -657,10 +658,10 @@ function test_bom_and_crlf_file_contents_are_preserved(c: peer.Case) {
     let output = peer.path(c, "rgz-bom-crlf-copy.bin")
     peer.input(c, path)
     let decoded = Text(payload)
-    peer.executesFull(c, "let contents = readTextFile(argument(0))
+    peer.executesFull(c, "let contents = io.readTextFile(processInfo.argument(0))
 print(contents.byteLength); print(contents.length); print(contents)
-writeTextFile(argument(1), contents)
-print(readTextFile(argument(1)))
+io.writeTextFile(processInfo.argument(1), contents)
+print(io.readTextFile(processInfo.argument(1)))
 ", Text(payload.length) + "\n" + Text(decoded.length) + "\n" + peer.repeat(decoded + "\n", 2), 0, "", [path, output],
         [peer.Output { path: output; contents: payload }], c.variants)
 }
@@ -740,6 +741,9 @@ function test_log_integer_generated_boundary_domain(c: peer.Case) {
     peer.put(rejected, "instances_per_configuration", peer.jsonInteger(210))
     peer.put(rejected, "reason", peer.jsonText("Pinned unsigned64 source inputs exceed signed64 Integer; separately rejected cohort with exact input/oracle hashes"))
     peer.put(control, "separately_rejected_cohorts", peer.jsonArray([rejected]))
+    // This exhaustive correctness fixture prints six lines for each of 514,804 inputs.
+    let previous = c.runTimeout
+    c.runTimeout = 180
     peer.executes(c, "function logarithm(base: Integer, value: Integer): Integer {
 let n = value; let exponent = 0
 while n >= base { n = n / base; exponent = exponent + 1 }
@@ -769,6 +773,7 @@ if bits < 63 { maximum = maximum * 2 + 1 }
 bits = bits + 1
 }
 ", joinText(expected))
+    c.runTimeout = previous
 }
 function test_log_integer_generated_specialized_comparison_domains(c: peer.Case) {
     let domain = zigDomain(c)
@@ -1704,7 +1709,7 @@ function acceptsManagedGraph(c: peer.Case, source: Text) {
     let compiled = peer.compile(c, source)
     peer.expect(c, compiled.result.status == 0, "managed graph compilation failed\n" + compiled.result.errorOutput)
     peer.expect(c, !absent(compiled.llvm), "managed graph produced no LLVM")
-    peer.expect(c, peer.contains(readTextFile(compiled.llvm), "; minyar-cycle-runtime: 1\n"), "managed graph LLVM lacks the cycle runtime marker")
+    peer.expect(c, peer.contains(io.readTextFile(compiled.llvm), "; minyar-cycle-runtime: 1\n"), "managed graph LLVM lacks the cycle runtime marker")
 }
 function test_record_list_field_store_order_growth_and_types(c: peer.Case) {
     let source = "record Inner { values: List<Text> }
@@ -1956,7 +1961,7 @@ function test_five_thousand_text_fields_and_accessors_compile(c: peer.Case) {
     requireSuccess(c, compiled.result, "wide record compilation")
     peer.equal(c, compiled.result.output, "", "wide record compiler output")
     peer.expect(c, !absent(compiled.llvm), "wide record compilation produced no LLVM")
-    let emitted = Bytes(readTextFile(compiled.llvm))
+    let emitted = Bytes(io.readTextFile(compiled.llvm))
     let accessors = Map<Text, Boolean>()
     let index = 0
     while index + 10 <= emitted.length {
@@ -1986,15 +1991,15 @@ function test_empty_import_driver_cold_warm_and_declaration_transitions(c: peer.
     let contents = ["", "// no declarations\n", "public function value(): Integer { return 7 }\n", ""]
     for index in 0..stages.length {
         let stage = stages[index]
-        writeTextFile(module, contents[index])
+        io.writeTextFile(module, test.sourceModules(contents[index]))
         let expression = "42"
         let expected = "42\n"
         if stage == "declaration" {
             expression = "empty.value()"
             expected = "7\n"
         }
-        writeTextFile(entry, "use \"./rgz-empty.min\" as empty\nprint(" + expression + ")\n")
-        peer.executes(c, readTextFile(entry), expected)
+        io.writeTextFile(entry, test.sourceModules("use \"./rgz-empty.min\" as empty\nprint(" + expression + ")\n"))
+        peer.executes(c, io.readTextFile(entry), expected)
         for mode in ["direct", "incremental-first", "incremental-warm"] {
             let executable = peer.path(c, "rgz-empty-" + stage + "-" + mode)
             let command = [c.suite.root + "/minyar"]
@@ -2006,7 +2011,7 @@ function test_empty_import_driver_cold_warm_and_declaration_transitions(c: peer.
             peer.observe(c, result, 0, expected, "", "driver program " + stage + " " + mode)
         }
     }
-    writeTextFile(entry, "use \"./rgz-empty.min\" as empty\nprint(empty.value())\n")
+    io.writeTextFile(entry, test.sourceModules("use \"./rgz-empty.min\" as empty\nprint(empty.value())\n"))
     let missing = peer.path(c, "rgz-empty-missing")
     let result = peer.launch(c, [c.suite.root + "/minyar", "--incremental", entry, "-o", missing], "driver-empty-import-removed-declaration", 30, environment, "", "")
     peer.equalInteger(c, result.status, 1, "removed declaration driver status")
@@ -2092,7 +2097,7 @@ function test_full_signed64_constant_and_parameter_matrix(c: peer.Case) {
     }
     peer.equalInteger(c, failures.length, 2310, "signed64 overflow cells")
     peer.equalInteger(c, expected.length, 13821, "signed64 safe cells")
-    source.add("let mode = argument(0)\nif mode == \"success\" {\n")
+    source.add("let mode = processInfo.argument(0)\nif mode == \"success\" {\n")
     for op in 0..masks.length {
         let tag = Text(op)
         source.add("let mask" + tag + " = \"" + masks[op] + "\"\nlet ai" + tag + " = 0\nwhile ai" + tag + " < 33 {\nlet bi" + tag + " = 0\nwhile bi" + tag + " < 33 {\n")
@@ -2100,7 +2105,7 @@ function test_full_signed64_constant_and_parameter_matrix(c: peer.Case) {
         for placement in 0..3 { source.add("print(evaluate(" + tag + ", " + Text(placement) + ", ai" + tag + ", bi" + tag + "))\n") }
         source.add("}\nbi" + tag + " = bi" + tag + " + 1\n}\nai" + tag + " = ai" + tag + " + 1\n}\n")
     }
-    source.add("} else { print(evaluate(index(argument(0)), index(argument(1)), index(argument(2)), index(argument(3)))) }\n")
+    source.add("} else { print(evaluate(index(processInfo.argument(0)), index(processInfo.argument(1)), index(processInfo.argument(2)), index(processInfo.argument(3)))) }\n")
     let base = peer.executesWith(c, joinText(source), peer.lines(expected), 0, "", ["success"])
     let overflowCases: List<json.Value> = []
     for arguments in failures { overflowCases.add(peer.jsonTexts(arguments)) }
@@ -2176,7 +2181,7 @@ function test_truncated_utf8_source_and_invalid_import_paths(c: peer.Case) {
     contents.add(239)
     let malformed = peer.writeBytes(c, "rgz-invalid-utf8.min", contents)
     let output = peer.path(c, "rgz-invalid-utf8.ll")
-    let result = peer.run(c, [c.compiler.executable, malformed, output], "compile-invalid-utf8", c.compiler.compileTimeout)
+    let result = peer.run(c, [c.compiler.executable, malformed, output, "--library", "library"], "compile-invalid-utf8", c.compiler.compileTimeout)
     peer.equalInteger(c, result.status, 1, "truncated UTF-8 compiler status")
     peer.equal(c, result.output, "", "truncated UTF-8 compiler output")
     peer.expect(c, peer.contains(result.errorOutput, "invalid UTF-8"), "truncated UTF-8 diagnostic missing: " + result.errorOutput)
@@ -2185,7 +2190,7 @@ function test_truncated_utf8_source_and_invalid_import_paths(c: peer.Case) {
     let nulSource = "use \"./rgz-valid.min" + peer.character(0) + "suffix\" as valid\nprint(valid.get())\n"
     let names = ["empty", "nul"]
     let sources = ["use \"\" as empty\n", nulSource]
-    let diagnostics = ["Minyar stopped: package module '' is not available yet; local modules begin with './' or '../'\n", "Minyar stopped: a file path cannot contain a zero byte.\n"]
+    let diagnostics = ["Minyar stopped: the file 'library/.min' could not be opened.\n", "Minyar stopped: a file path cannot contain a zero byte.\n"]
     for index in 0..names.length { rejectsExactly(c, sources[index], diagnostics[index], "import path " + names[index]) }
     let shim = makeShim(c, "rgz-driver-tools")
     requireInput(c, shim)
@@ -2304,7 +2309,7 @@ function executesBinaryFileRoundtrip(c: peer.Case, source: Text, expected: Bytes
         let result = peer.run(c, command, "execute", c.runTimeout)
         peer.expect(c, result.status == 0 && peer.bytesEqual(Bytes(result.output), expected) && result.errorOutput == "",
             "binary roundtrip execution differs at " + optimization + ": status " + Text(result.status) + ", " + Text(Bytes(result.output).length) + " stdout bytes, expected " + Text(expected.length))
-        peer.expect(c, !absent(output) && peer.bytesEqual(readBytesFile(output), payload), "binary roundtrip file bytes differ at " + optimization)
+        peer.expect(c, !absent(output) && peer.bytesEqual(io.readBytesFile(output), payload), "binary roundtrip file bytes differ at " + optimization)
     }
 }
 function test_character_conversion_returns_owned_four_byte_text(c: peer.Case) {
@@ -2444,17 +2449,12 @@ function test_file_byte_roundtrips_preserve_valid_and_invalid_utf8(c: peer.Case)
             let path = peer.writeBytes(c, "input.bytes", payload)
             let output = peer.path(c, "output.bytes")
             peer.input(c, path)
-            let body = "print(contents.byteLength); print(contents)
-writeTextFile(argument(1), contents)
-let copied = readTextFile(argument(1)); print(copied == contents); print(copied)
-"
-            let source = "let contents = readTextFile(argument(0))\n" + body
+            let body = "print(contents.length); for byte in contents { print(byte) }\nio.writeBytesFile(processInfo.argument(1), contents)\nlet copied = io.readBytesFile(processInfo.argument(1)); let equal = copied.length == contents.length\nif equal { for index in 0..copied.length { if copied[index] != contents[index] { equal = false } } }\nprint(equal); for byte in copied { print(byte) }\n"
+            let source = "let contents = io.readBytesFile(processInfo.argument(0))\n" + body
             if scope == "local" { source = "function run() {\n" + source + "}\nrun()\n" }
-            let expected = Bytes(Text(payload.length) + "\n")
-            expected.addBytes(payload)
-            expected.addBytes(Bytes("\ntrue\n"))
-            expected.addBytes(payload)
-            expected.add(10)
+            let values: List<Integer> = []
+            for byte in payload { values.add(byte) }
+            let expected = Bytes(Text(payload.length) + "\n" + peer.integers(values) + "true\n" + peer.integers(values))
             executesBinaryFileRoundtrip(c, source, expected, [path, output], output, payload)
         }
     }
@@ -2462,8 +2462,10 @@ let copied = readTextFile(argument(1)); print(copied == contents); print(copied)
 function test_invalid_byte_text_rejects_character_operations_lazily(c: peer.Case) {
     let path = peer.writeBytes(c, "invalid.bytes", invalidPayload())
     peer.input(c, path)
+    // Keep the upstream case identity while checking Minyar's eager boundary.
+    peer.executesWith(c, "let text = io.readTextFile(processInfo.argument(0))\nprint(text.byteLength)\n", "", 1, INVALID_UTF8, [path])
     for operation in ["text.length", "text[0]"] {
-        peer.executesWith(c, "let text = readTextFile(argument(0))\nprint(text.byteLength)\nprint(" + operation + ")\nprint(\"after\")\n", "11\n", 1, INVALID_UTF8, [path])
+        peer.executesWith(c, "let raw = io.readBytesFile(processInfo.argument(0))\nprint(raw.length)\nlet text = Text(raw)\nprint(" + operation + ")\nprint(\"after\")\n", "11\n", 1, INVALID_UTF8, [path])
     }
 }
 function byteValues(value: Text): List<Integer> {
@@ -3039,7 +3041,7 @@ function runUnicodeCases(c: peer.Case, cases: List<UnicodeCase>) {
         for index in 0..cases.length {
             let item = cases[index]
             for position in 0..inputPaths[index].length {
-                peer.expect(c, peer.bytesEqual(readBytesFile(inputPaths[index][position]), inputData[index][position]), "Unicode input changed: " + inputPaths[index][position])
+                peer.expect(c, peer.bytesEqual(io.readBytesFile(inputPaths[index][position]), inputData[index][position]), "Unicode input changed: " + inputPaths[index][position])
             }
             attemptedCount += 1
             peer.put(attempted, optimization, peer.jsonInteger(attemptedCount))

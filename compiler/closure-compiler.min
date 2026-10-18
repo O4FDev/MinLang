@@ -57,7 +57,7 @@ function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Bo
                 }
             }
         }
-        if kinds[position] == 1 && texts[position] == "let" && position + 2 < kinds.length && texts[position + 2] == ":" {
+        if kinds[position] == 1 && (texts[position] == "let" || texts[position] == "constant" || texts[position] == "global") && position + 2 < kinds.length && texts[position + 2] == ":" {
             let cursor = position + 3
             while kinds[cursor] != 0 && kinds[cursor] != 6 && texts[cursor] != "=" {
                 positions[cursor] = true
@@ -194,7 +194,9 @@ function registerCallbackType(types: List<Integer>, names: List<Text>, kinds: Li
     return 1000 + record
 }
 
-function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, parameters: List<Text>, types: List<Integer>): Integer {
+function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, parameters: List<Text>, types: List<Integer>, expected: Integer, deferred: Boolean): Integer {
+    let contextual: List<Integer> = []
+    if isCallbackType(expected, names) { contextual = callbackSignatureTypes(names[expected - 1000]) }
     expectToken(kinds, texts, lines, cursor, "function")
     expectToken(kinds, texts, lines, cursor, "(")
     while !tokenIs(kinds, texts, cursor, ")") {
@@ -203,12 +205,23 @@ function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: Sour
         if findText(parameters, name) >= 0 { fail("duplicate callback parameter '" + name + "'") }
         parameters.add(name)
         cursor[0] = cursor[0] + 1
-        expectToken(kinds, texts, lines, cursor, ":")
-        types.add(takeValueType(kinds, texts, lines, cursor, names, symbols))
+        if tokenIs(kinds, texts, cursor, ":") {
+            cursor[0] = cursor[0] + 1
+            types.add(takeValueType(kinds, texts, lines, cursor, names, symbols))
+        } else {
+            let type = 0
+            if contextual.length > parameters.length { type = contextual[parameters.length - 1] }
+            if type == 0 && !deferred { fail("an untyped callback parameter needs a contextual callable type") }
+            types.add(type)
+        }
         if tokenIs(kinds, texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
     }
     expectToken(kinds, texts, lines, cursor, ")")
     let result = 5
+    if contextual.length > 0 {
+        if parameters.length + 1 != contextual.length { fail("callback parameter count does not match its contextual callable type") }
+        result = contextual[contextual.length - 1]
+    }
     if tokenIs(kinds, texts, cursor, ":") {
         cursor[0] = cursor[0] + 1
         result = takeType(kinds, texts, lines, cursor, names, symbols)
@@ -235,7 +248,7 @@ function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: 
             let cursor: List<Integer> = [position]
             let parameters: List<Text> = []
             let types: List<Integer> = []
-            let signature = takeCallbackHeader(kinds, texts, lines, cursor, names, symbols, parameters, types)
+            let signature = takeCallbackHeader(kinds, texts, lines, cursor, names, symbols, parameters, types, 0, true)
             names.add("#Environment:" + Text(position) + ":" + Text(signature))
             symbols.add(4)
         }
@@ -258,6 +271,18 @@ function callbackEnvironment(names: List<Text>, position: Integer): Integer {
     }
     fail("missing callback environment")
     return -1
+}
+
+function callbackEnvironmentType(name: Text): Integer {
+    let position = name.length - 1
+    while position >= 0 && name[position] != ':' { position = position - 1 }
+    position = position + 1
+    let type = 0
+    while position < name.length {
+        type = type * 10 + findCharacter("0123456789", name[position])
+        position = position + 1
+    }
+    return type
 }
 
 function callbackBodyEnd(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
@@ -303,7 +328,7 @@ function callbackReadsName(kinds: List<Integer>, texts: List<Text>, start: Integ
             depth = depth - 1
             shadow = shadows[depth] == 1
         }
-        if texts[position] == "let" && texts[position + 1] == name {
+        if (texts[position] == "let" || texts[position] == "constant") && texts[position + 1] == name {
             let cursor = position + 2
             while cursor < end && kinds[cursor] != 6 { cursor = cursor + 1 }
             let read = position + 2
@@ -350,8 +375,9 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     let start = state[0]
     let parameters: List<Text> = []
     let types: List<Integer> = []
-    let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, types)
+    let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, types, resultType[0], false)
     let environment = callbackEnvironment(functionNames, start)
+    functionNames[environment] = "#Environment:" + Text(start) + ":" + Text(signature)
     let end = callbackBodyEnd(tokenKinds, tokenTexts, state[0])
     let captured: List<Integer> = []
     let local = 0
@@ -421,7 +447,6 @@ function parseCallbackCall(context: CompilerContext, localNames: List<Text>, loc
     if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "callback call", "unreviewed") }
     let signature = callbackSignatureTypes(functionNames[callbackType - 1000])
     let count = signature.length - 1
-    state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
     output.add("  call void @minyar_callback_check(ptr " + callback + ")\n")
     borrowReference(output, state, callback, callbackType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
@@ -487,7 +512,8 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             let state: List<Integer> = [start, 0, 0, 0, 0, -1, 0, 0, 0, 1, -1, 0, -1, 0, 0, tokenLines.features]
             let parameters: List<Text> = []
             let parameterTypes: List<Integer> = []
-            let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, parameterTypes)
+            let expected = callbackEnvironmentType(functionNames[callbackEnvironment(functionNames, start)])
+            let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, parameterTypes, expected, false)
             let result = parameterTypes[parameters.length]
             let environment = callbackEnvironment(functionNames, start)
             let textState: List<Text> = ["entry", "callback", ""]

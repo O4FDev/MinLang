@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "./compiler-port-support.min" as port
 use "../experiments/memory/study-support.min" as data
@@ -42,9 +43,11 @@ function metadata(context: Context, command: List<Text>, label: Text): Text {
     let result = test.run(command, system.environment(), "", context.path + "/metadata-" + label, 10)
     test.require(result, "test metadata " + label); return result.output
 }
-public function absolute(context: Context, path: Text): Text { return test.lines(metadata(context, ["/usr/bin/realpath", path], "realpath"))[0] }
+public function absolute(context: Context, path: Text): Text {
+    let resolved = test.resolvePath(path); test.check(resolved != "", "test metadata realpath failed: " + path); return resolved
+}
 public function digest(context: Context, path: Text): Text {
-    let words = test.words(metadata(context, ["/usr/bin/sha256sum", "--", path], "sha256"))
+    let words = test.words(metadata(context, ["/bin/sh", "-c", "if command -v sha256sum >/dev/null; then exec sha256sum -- \"$1\"; else exec shasum -a 256 -- \"$1\"; fi", "minyar", path], "sha256"))
     test.check(words.length > 0 && words[0].byteLength == 64, "test artifact SHA256"); return words[0]
 }
 function locate(context: Context, tool: Text): Text {
@@ -53,7 +56,7 @@ function locate(context: Context, tool: Text): Text {
     return absolute(context, test.lines(result.output)[0])
 }
 function executableHash(context: Context, path: Text): Text {
-    let stamp = metadata(context, ["/usr/bin/stat", "-c", "%s %y %i", "--", path], "stat")
+    let stamp = metadata(context, ["/bin/sh", "-c", "stat -L -c '%s %y %i' -- \"$1\" 2>/dev/null || stat -L -f '%z %Fm %i' \"$1\"", "minyar", path], "stat")
     let key = path + "\n" + stamp
     for index in 0..context.cacheKeys.length { if context.cacheKeys[index] == key { return context.cacheHashes[index] } }
     let hash = digest(context, path); context.cacheKeys.add(key); context.cacheHashes.add(hash); data.set(context.tools, path, data.text(hash)); return hash
@@ -68,7 +71,7 @@ public function context(label: Text, name: Text, source: Text): Context {
     test.removeTree(compiler.directory); compiler.directory = path
     let controls = data.object(["test", "link_flags"], [data.text(name), data.strings(compiler.flags)])
     let result = Context { path: path; root: root; compiler: compiler; commands: []; inputs: data.object([], []); controls: controls; tools: data.object([], []); cacheKeys: []; cacheHashes: []; serial: 0; closed: false }
-    for input in [compiler.executable, compiler.runtime, source, "tests/native-evidence.min", "tests/compiler-port-support.min"] {
+    for input in [compiler.executable, compiler.runtime, source, "tests/native-evidence.min", "tests/compiler-port-support.min", "tools/testing.min", "tools/testing-host.c"] {
         if files.pathSize(input) >= 0 { let file = absolute(result, input); data.set(result.inputs, file, data.text(digest(result, file))) }
     }
     return result
@@ -97,7 +100,7 @@ public function close(context: Context, failed: Boolean) {
         }
     }
     let report = data.object(["schema_version", "status", "workspace", "inputs", "files", "tools", "tool_versions", "controls", "commands"], [data.integer(1), data.text("failed"), data.text(context.path), context.inputs, retained, context.tools, versions, context.controls, data.array(context.commands)])
-    writeTextFile(context.path + "/evidence.json", serialize(report) + "\n")
+    io.writeTextFile(context.path + "/evidence.json", serialize(report) + "\n")
     system.writeStandardError("Test failure workspace retained: " + context.path + "\n")
 }
 public function expect(context: Context, condition: Boolean, message: Text) { if !condition { close(context, true); fail(message) } }
@@ -115,7 +118,7 @@ public function run(context: Context, command: List<Text>, phase: Text, timeout:
     for item in command { actual.add(item) }
     let log = context.path + "/command" + Text(context.serial); let start = system.monotonicNanoseconds()
     let result = test.run(actual, system.environment(), context.root, log, timeout)
-    data.set(row, "returncode", data.integer(result.status)); data.set(row, "stdout_base64", data.text(base64(readBytesFile(log)))); data.set(row, "stderr_base64", data.text(base64(readBytesFile(log + ".err"))))
+    data.set(row, "returncode", data.integer(result.status)); data.set(row, "stdout_base64", data.text(base64(io.readBytesFile(log)))); data.set(row, "stderr_base64", data.text(base64(io.readBytesFile(log + ".err"))))
     data.set(row, "elapsed_seconds", data.decimal(Float(system.monotonicNanoseconds() - start) / 1000000000.0))
     if result.status == 124 || result.status == 137 {
         data.set(row, "timed_out", data.boolean(true)); data.set(row, "exception", data.text("TimeoutExpired"))
@@ -125,10 +128,10 @@ public function run(context: Context, command: List<Text>, phase: Text, timeout:
     return result
 }
 public function compile(context: Context, source: Text): test.Result {
-    context.compiler.serial += 1; let path = context.path + "/case" + Text(context.compiler.serial) + ".min"; writeTextFile(path, source)
+    context.compiler.serial += 1; let path = context.path + "/case" + Text(context.compiler.serial) + ".min"; io.writeTextFile(path, test.sourceModules(source))
     let output = context.path + "/case" + Text(context.compiler.serial) + ".ll"
-    let result = run(context, [context.compiler.executable, path, output], "compile", context.compiler.compileTimeout, false)
-    if result.status == 0 && test.addressEnabled(context.compiler.flags) { writeTextFile(output, test.instrument(readTextFile(output))) }
+    let result = run(context, [context.compiler.executable, path, output, "--library", "library"], "compile", context.compiler.compileTimeout, false)
+    if result.status == 0 && test.addressEnabled(context.compiler.flags) { io.writeTextFile(output, test.instrument(io.readTextFile(output))) }
     return result
 }
 public function llvm(context: Context): Text { return context.path + "/case" + Text(context.compiler.serial) + ".ll" }
@@ -147,7 +150,7 @@ public function bytesEqual(left: Bytes, right: Bytes): Boolean { if left.length 
 public function executes(context: Context, source: Text, expected: Text, status: Integer, diagnostics: Text, arguments: List<Text>, outputs: List<FileOutput>): Text {
     let fileRows: List<json.Value> = []
     for index in 0..outputs.length {
-        let output = outputs[index]; let reference = context.path + "/output-oracle" + Text(index); writeBytesFile(reference, output.contents)
+        let output = outputs[index]; let reference = context.path + "/output-oracle" + Text(index); io.writeBytesFile(reference, output.contents)
         fileRows.add(data.object(["path", "bytes", "sha256"], [data.text(output.path), data.integer(output.contents.length), data.text(digest(context, reference))]))
     }
     let oracles = json.member(context.controls, "execution_oracles")
@@ -161,9 +164,9 @@ public function executes(context: Context, source: Text, expected: Text, status:
         let command = [executable]; for argument in arguments { command.add(argument) }
         let observed = run(context, command, "execute", context.compiler.runTimeout, false)
         expect(context, observed.status == status && observed.output == expected && observed.errorOutput == diagnostics, "native output/status/stderr differs at " + optimization + "\n" + observed.output + observed.errorOutput)
-        for output in outputs { expect(context, files.pathSize(output.path) >= 0 && bytesEqual(readBytesFile(output.path), output.contents), "native program file bytes differ: " + output.path) }
+        for output in outputs { expect(context, files.pathSize(output.path) >= 0 && bytesEqual(io.readBytesFile(output.path), output.contents), "native program file bytes differ: " + output.path) }
     }
-    return readTextFile(sourceLLVM)
+    return io.readTextFile(sourceLLVM)
 }
 public function reference(context: Context, path: Text): Text {
     let endian = "little"; let system = "linux"
@@ -173,7 +176,7 @@ public function reference(context: Context, path: Text): Text {
             let resolved = absolute(context, selected); let hash = digest(context, resolved); data.set(context.inputs, resolved, data.text(hash))
             let references = json.member(context.controls, "output_references"); if references.kind == json.NULL { references = data.array([]); data.set(context.controls, "output_references", references) }
             references.items.add(data.object(["default", "selected", "variant", "byte_order", "system", "size", "sha256"], [data.text(absolute(context, path)), data.text(resolved), data.text(variant), data.text(endian), data.text(system), data.nullValue(), data.text(hash)]))
-            return Text(readBytesFile(resolved))
+            return Text(io.readBytesFile(resolved))
         }
     }
     expect(context, false, "No expected-output reference for " + path); return ""

@@ -199,7 +199,7 @@ check: check-temporary-owner-admission
 # Verify that sanitizer coverage exercises the same compiler as the native
 # fixed point, including when a retained build artifact has misleading times.
 check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
-	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll --library library
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
 .PHONY: check-sanitize-core

@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
@@ -42,12 +43,10 @@ public function compile(source: Text, output: Text, environment: List<Text>, sec
     return result
 }
 public function starts(source: Text, prefix: Text): Boolean {
-    let raw = Bytes(source)
-    return raw.length >= prefix.byteLength && Text(raw.slice(0, prefix.byteLength)) == prefix
+    return source.startsWith(prefix)
 }
 public function ends(source: Text, suffix: Text): Boolean {
-    let raw = Bytes(source)
-    return raw.length >= suffix.byteLength && Text(raw.slice(raw.length - suffix.byteLength, raw.length)) == suffix
+    return source.endsWith(suffix)
 }
 public function after(source: Text, prefix: Text): Text {
     let raw = Bytes(source)
@@ -94,12 +93,7 @@ public function fromHex(text: Text): Bytes {
 public function digests(paths: List<Text>, log: Text): List<Text> {
     let result: List<Text> = []
     if paths.length == 0 { return result }
-    let command = ["sha256sum", "--"]
-    for path in paths { command.add(path) }
-    let observed = test.run(command, system.environment(), "", log, 120)
-    test.require(observed, "sha256sum")
-    test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
-    for line in test.lines(observed.output) { result.add(test.words(line)[0]) }
+    for line in test.lines(fileDigests(paths, log)) { result.add(test.words(line)[0]) }
     test.check(result.length == paths.length, "incomplete digest inventory")
     return result
 }
@@ -115,12 +109,20 @@ public function treeDigests(directories: List<Text>, suffixes: List<Text>, log: 
     return observed.output
 }
 public function fileDigests(paths: List<Text>, log: Text): Text {
-    let command = ["sha256sum", "--"]
-    for path in paths { command.add(path) }
-    let observed = test.run(command, system.environment(), "", log, 120)
-    test.require(observed, "sha256sum")
-    test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
-    return observed.output
+    let parts: List<Text> = []
+    let index = 0
+    while index < paths.length {
+        let command = ["sha256sum", "--"]
+        let bytes = 0
+        while index < paths.length && (command.length == 2 || bytes + paths[index].byteLength + 1 <= 32768) {
+            command.add(paths[index]); bytes += paths[index].byteLength + 1; index += 1
+        }
+        let observed = test.run(command, system.environment(), "", log, 120)
+        test.require(observed, "sha256sum")
+        test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
+        parts.add(observed.output)
+    }
+    return joinText(parts)
 }
 public function digestObject(inventory: Text): Text {
     let parts: List<Text> = []
@@ -202,15 +204,15 @@ function configured(value: Text): Text {
 public function leaf(ca: Authority, name: Text, issuer: Text, san: Text, usage: Text) {
     openssl(ca, ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", path(ca, name, "key")])
     openssl(ca, ["req", "-new", "-key", path(ca, name, "key"), "-subj", "/CN=localhost", "-out", path(ca, name, "csr")])
-    writeTextFile(path(ca, name, "index"), "")
+    io.writeTextFile(path(ca, name, "index"), "")
     let serial = Text(ca.serial[0])
     if ca.serial[0] < 16 { serial = "0" + serial }
     test.check(ca.serial[0] < 10, "certificate serial range exhausted")
-    writeTextFile(path(ca, name, "serial"), serial + "\n")
+    io.writeTextFile(path(ca, name, "serial"), serial + "\n")
     ca.serial[0] += 1
     let extensions = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=" + usage + "\n"
     if san != "" { extensions = extensions + "subjectAltName=" + san + "\n" }
-    writeTextFile(path(ca, name, "cnf"), "[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=" + configured(path(ca, name, "index")) +
+    io.writeTextFile(path(ca, name, "cnf"), "[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=" + configured(path(ca, name, "index")) +
         "\nserial=" + configured(path(ca, name, "serial")) + "\nnew_certs_dir=" + configured(ca.directory) +
         "\ncertificate=" + configured(path(ca, issuer, "pem")) + "\nprivate_key=" + configured(path(ca, issuer, "key")) +
         "\ndefault_md=sha256\ndefault_days=2\npolicy=policy\nx509_extensions=extensions\n[policy]\ncommonName=supplied\n[extensions]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n" + extensions)

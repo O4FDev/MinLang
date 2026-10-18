@@ -386,8 +386,11 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
 #include "minyar_collections.h"
 #include "minyar_sort.h"
 
+static void validate_text_bytes(const unsigned char *bytes, long long length);
+
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
+    validate_text_bytes((const unsigned char *)source, (long long)length);
     unsigned char *bytes = new_bytes((long long)length);
     memcpy(bytes, source, length + 1);
     return new_text(bytes, (long long)length, -1);
@@ -396,26 +399,11 @@ static MinyarText *copy_c_text(const char *source) {
 MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
     if (length < 0 || (!source && length != 0))
         minyar_stop("a native Text buffer is invalid.");
+    validate_text_bytes(source, length);
     unsigned char *bytes = new_bytes(length);
     if (length) memcpy(bytes, source, (size_t)length);
     bytes[length] = 0;
     return new_text(bytes, length, -1);
-}
-
-static char *text_as_path(const MinyarText *text) {
-    char *path;
-    if (memchr(text->bytes, 0, (size_t)text->byte_length))
-        minyar_stop("a file path cannot contain a zero byte.");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    path = rc_heap_allocate((size_t)text->byte_length + 1);
-#else
-    path = malloc((size_t)text->byte_length + 1);
-#endif
-    if (!path)
-        out_of_memory();
-    memcpy(path, text->bytes, (size_t)text->byte_length);
-    path[text->byte_length] = 0;
-    return path;
 }
 
 void minyar_print_text(const MinyarText *text) {
@@ -664,6 +652,20 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
     }
     invalid_utf8();
     return 0;
+}
+
+/* Validate at foreign-byte boundaries. Character-offset caches remain lazy. */
+static void validate_text_bytes(const unsigned char *bytes, long long length) {
+    long long position = 0;
+    while (position < length) {
+        if (bytes[position] < 0x80) {
+            position++;
+        } else {
+            long long width;
+            decode_character(bytes + position, length - position, &width);
+            position += width;
+        }
+    }
 }
 
 enum { TEXT_INDEX_STRIDE = 64 };
@@ -1114,165 +1116,6 @@ void minyar_initialize_arguments(int count, char **values) {
 #endif
 }
 
-long long minyar_argument_count(void) {
-    return saved_argument_count > 0 ? saved_argument_count - 1 : 0;
-}
-
-MinyarText *minyar_argument(long long position) {
-    if (position < 0 || position >= minyar_argument_count())
-        minyar_stop("a program argument position was outside the argument list.");
-#ifdef _WIN32
-    const wchar_t *argument = saved_windows_argument_values[position + 1];
-    int length =
-        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1, NULL, 0, NULL, NULL);
-    if (length <= 0)
-        minyar_stop("a program argument contained invalid Unicode.");
-    unsigned char *bytes = new_bytes((long long)length - 1);
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1, (char *)bytes, length,
-                            NULL, NULL) != length)
-        minyar_stop("a program argument could not be converted to UTF-8.");
-    return new_text(bytes, (long long)length - 1, -1);
-#else
-    return copy_c_text(saved_argument_values[position + 1]);
-#endif
-}
-
-static long long text_file_length(FILE *file) {
-    /* Some filesystems allow seeking directories and report a huge offset.
-     * Check readability before treating that offset as an allocation size.
-     * The seek below restores the first byte and clears EOF for empty files. */
-    if (fgetc(file) == EOF && ferror(file))
-        minyar_stop("a requested text file could not be read.");
-#ifdef _WIN32
-    __int64 length;
-    if (_fseeki64(file, 0, SEEK_END) != 0 || (length = _ftelli64(file)) < 0 ||
-        _fseeki64(file, 0, SEEK_SET) != 0)
-#else
-    long length;
-    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
-        fseek(file, 0, SEEK_SET) != 0)
-#endif
-        minyar_stop("a requested text file could not be read.");
-    if ((unsigned long long)length > (unsigned long long)LLONG_MAX ||
-        (unsigned long long)length >= (unsigned long long)SIZE_MAX)
-        minyar_stop("a requested text file is too large.");
-    return (long long)length;
-}
-
-/* Language paths are UTF-8 on every platform. All callers use binary modes. */
-static FILE *open_text_path(const char *path, const char *mode) {
-#ifdef _WIN32
-    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-    if (length <= 0)
-        minyar_stop("a file path contained invalid UTF-8.");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    wchar_t *wide = rc_heap_allocate((size_t)length * sizeof(wchar_t));
-#else
-    wchar_t *wide = malloc((size_t)length * sizeof(wchar_t));
-#endif
-    if (!wide)
-        out_of_memory();
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, length) != length)
-        minyar_stop("a file path could not be converted to UTF-16.");
-    FILE *file = _wfopen(wide, mode[0] == 'w' ? L"wb" : L"rb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(wide);
-#else
-    free(wide);
-#endif
-    return file;
-#else
-    return fopen(path, mode);
-#endif
-}
-
-MinyarText *minyar_read_text_file(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = open_text_path(path, "rb");
-    long long length;
-    unsigned char *bytes;
-    if (!file) {
-        fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-        rc_heap_deallocate(path);
-#else
-        free(path);
-#endif
-        exit(1);
-    }
-    length = text_file_length(file);
-    bytes = new_bytes(length);
-    if (fread(bytes, 1, (size_t)length, file) != (size_t)length)
-        minyar_stop("a requested text file could not be read.");
-    fclose(file);
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    bytes[length] = 0;
-    return new_text(bytes, length, -1);
-}
-
-static FILE *create_text_file(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = open_text_path(path, "wb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    if (!file)
-        minyar_stop("a requested text file could not be created.");
-    return file;
-}
-
-static void finish_text_file(FILE *file, int written) {
-    if (!written || fclose(file) != 0)
-        minyar_stop("a requested text file could not be written.");
-}
-
-void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
-    FILE *file = create_text_file(path_text);
-    finish_text_file(file, fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) ==
-                               (size_t)contents->byte_length);
-}
-
-#ifndef MINYAR_WRITE_PARTS_BUFFER
-#define MINYAR_WRITE_PARTS_BUFFER (256u * 1024u)
-#endif
-
-/* writeTextFile(path, pieces) writes what joinText(pieces) would contain
- * without building it, so a program that emits its output in many small
- * pieces (the compiler emits about 200,000) never holds the whole file twice.
- * Pieces are gathered in a buffer large enough that per-write file system
- * costs stay small; each write call costs tens of thousands of instructions. */
-void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *parts) {
-    FILE *file = create_text_file(path_text);
-    unsigned char *buffer = malloc(MINYAR_WRITE_PARTS_BUFFER);
-    size_t used = 0;
-    int written = 1;
-    if (!buffer)
-        out_of_memory();
-    for (long long index = 0; written && index < parts->length; index++) {
-        const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
-        size_t length = (size_t)part->byte_length;
-        if (length > MINYAR_WRITE_PARTS_BUFFER - used) {
-            written = fwrite(buffer, 1, used, file) == used;
-            used = 0;
-            if (length > MINYAR_WRITE_PARTS_BUFFER) {
-                written = written && fwrite(part->bytes, 1, length, file) == length;
-                continue;
-            }
-        }
-        copy_bytes(buffer + used, part->bytes, length);
-        used += length;
-    }
-    written = written && fwrite(buffer, 1, used, file) == used;
-    free(buffer);
-    finish_text_file(file, written);
-}
-
 #include "minyar_maps.h"
 #include "minyar_numbers.h"
 
@@ -1284,5 +1127,9 @@ void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *part
 #include "minyar_thread_buffers.h"
 #include "minyar_threads.h"
 #include "minyar_native_regions.h"
+#endif
+
+#include "minyar_library.h"
+#if MINYAR_THREADED
 #include "minyar_thread_os.h"
 #endif

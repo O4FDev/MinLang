@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./performance-support.min" as metrics
 use "../experiments/memory/study-support.min" as data
@@ -7,8 +9,8 @@ public record Options { sizes: List<Integer>; shapes: List<Text>; repeats: Integ
 public function options(root: Text, darwin: Boolean): Options {
     let result = Options { sizes: [100, 400]; shapes: ["chain", "wide", "shared"]; repeats: 5; compiler: root + "/build/minyarc-modules"; output: root + "/build/incremental-module-performance.json"; clang: test.setting("MINYAR_TEST_CLANG", test.setting("LLVM_CC", "clang")); link: false; enforce: false; prepare: false; prepared: ""; functional: false; cpuAvailable: true; inflated: false; darwin: darwin }
     let index = 0
-    while index < argumentCount() {
-        let option = argument(index)
+    while index < processInfo.argumentCount() {
+        let option = processInfo.argument(index)
         if option == "--link" { result.link = true }
         else if option == "--enforce" { result.enforce = true }
         else if option == "--prepare-only" { result.prepare = true }
@@ -18,8 +20,8 @@ public function options(root: Text, darwin: Boolean): Options {
         else if option == "--sizes" || option == "--shapes" {
             index += 1
             let sizes: List<Integer> = []; let shapes: List<Text> = []
-            while index < argumentCount() {
-                let value = argument(index); if data.starts(value, "--") { break }
+            while index < processInfo.argumentCount() {
+                let value = processInfo.argument(index); if data.starts(value, "--") { break }
                 if option == "--sizes" { sizes.add(Integer(value)) } else { shapes.add(value) }
                 index += 1
             }
@@ -30,7 +32,7 @@ public function options(root: Text, darwin: Boolean): Options {
             let name = option; let value = ""; let position = -1; let raw = Bytes(option)
             for offset in 0..raw.length { if raw[offset] == 61 { position = offset; break } }
             if position >= 0 { name = Text(raw.slice(0, position)); value = Text(raw.slice(position + 1, raw.length)) }
-            else { index += 1; test.check(index < argumentCount(), "option requires value"); value = argument(index) }
+            else { index += 1; test.check(index < processInfo.argumentCount(), "option requires value"); value = processInfo.argument(index) }
             if name == "--repeats" { result.repeats = Integer(value) }
             else if name == "--compiler" { result.compiler = value }
             else if name == "--output" { result.output = value }
@@ -52,7 +54,7 @@ public function options(root: Text, darwin: Boolean): Options {
 public record Context { options: Options; root: Text; work: Text; report: json.Value; manifest: json.Value; serial: Integer; measuredCalls: Integer }
 function hash(options: Options, path: Text, work: Text): Text { return json.string(metrics.fileIdentity(path, work + "/hash", options.darwin), "sha256") }
 function copy(source: Text, target: Text, work: Text) { test.require(metrics.capture(["/bin/cp", "-p", source, target], work + "/copy"), "freeze measurement artifact") }
-function save(context: Context) { files.makeDirectory(data.parent(context.options.output)); writeTextFile(context.options.output, json.pretty(context.report, "") + "\n") }
+function save(context: Context) { files.makeDirectory(data.parent(context.options.output)); io.writeTextFile(context.options.output, json.pretty(context.report, "") + "\n") }
 function expect(context: Context, condition: Boolean, message: Text) {
     if !condition { data.set(context.report, "status", data.text("failed")); data.set(context.report, "error", data.text(message)); save(context); fail(message) }
 }
@@ -76,12 +78,12 @@ public function prepare(options: Options, root: Text): Text {
     test.check(test.contains(version.output, "clang version 23.1.2"), "LLVM exactly23.1.2 required")
     let linker = "/usr/lib/llvm-23/bin/ld.lld"; let linkerVersion = metrics.capture([linker, "--version"], work + "/linker-version"); test.require(linkerVersion, "LLVM linker version")
     test.check(test.contains(linkerVersion.output, "LLD 23.1.2"), "matching LLVM linker required")
-    let toolchain = json.parse(readTextFile(root + "/build/.toolchain.json"))
+    let toolchain = json.parse(io.readTextFile(root + "/build/.toolchain.json"))
     test.check(json.string(toolchain, "llvm_version") == "23.1.2", "matched compiler toolchain")
     let sourceHashes = data.object([], [])
     for shape in options.shapes { for count in options.sizes { let directory = shape + "-" + Text(count); for name in files.list(work + "/" + directory) { data.set(sourceHashes, directory + "/" + name, data.text(hash(options, work + "/" + directory + "/" + name, work))) } } }
     let manifest = data.object(["config", "artifacts", "source_hashes", "clang_sha256", "clang_version", "linker_sha256", "linker_version", "toolchain", "environment", "workspace_source_sha256"], [configuration(options), identities, sourceHashes, data.text(hash(options, options.clang, work)), data.text(version.output), data.text(hash(options, linker, work)), data.text(linkerVersion.output), toolchain, metrics.configurationEnvironment(), data.text(hash(options, test.setting("MINYAR_TEST_COMPILER_SOURCE", root + "/build/compiler.min"), work))])
-    writeTextFile(work + "/prepared.json", json.pretty(manifest, "") + "\n")
+    io.writeTextFile(work + "/prepared.json", json.pretty(manifest, "") + "\n")
     print(work + "/prepared.json")
     return work
 }
@@ -90,14 +92,14 @@ public function context(options: Options, root: Text): Context {
     let manifest = data.object([], [])
     if options.functional {
         work = test.scratch()
-        for label in ["driver", "compiler", "production", "runtime.o"] { writeTextFile(work + "/" + label, label) }
+        for label in ["driver", "compiler", "production", "runtime.o"] { io.writeTextFile(work + "/" + label, label) }
         for shape in options.shapes { for count in options.sizes { metrics.generate(work + "/" + shape + "-" + Text(count), shape, count, 4, 12) } }
     } else if options.prepared == "" {
         work = test.scratch()
         manifest = data.object(["artifacts"], [freeze(options, root, work)])
         options.clang = metrics.executable(options.clang, work + "/clang-path")
     } else {
-        work = data.parent(options.prepared); manifest = json.parse(readTextFile(options.prepared))
+        work = data.parent(options.prepared); manifest = json.parse(io.readTextFile(options.prepared))
         let frozen = json.member(manifest, "config")
         options.sizes = []; for value in json.member(frozen, "sizes").items { options.sizes.add(Integer(value.text)) }
         options.shapes = []; for value in json.member(frozen, "shapes").items { options.shapes.add(value.text) }
@@ -122,14 +124,14 @@ public function context(options: Options, root: Text): Context {
 function fixtureCommand(context: Context, label: Text, command: List<Text>, count: Integer): test.Result {
     if label == "driver" {
         let cache = command[4]; files.makeDirectory(cache); let cold = files.pathSize(cache + "/case.cache") < 0
-        let entry = readTextFile(command[2]); let library = readTextFile(data.parent(command[2]) + "/m0.min")
+        let entry = io.readTextFile(command[2]); let library = io.readTextFile(data.parent(command[2]) + "/m0.min")
         let edited = test.contains(entry, "let changed") || test.contains(library, "result = result + 2")
         let counters = [count + 1, 0, 0, count + 1, 0, 0]
         if cold { counters = [0, count + 1, 0, 0, 0, 0] } else if edited { counters = [count + 1, 1, 0, count, 0, 0] }
-        writeTextFile(cache + "/case.cache", "cache"); let words: List<Text> = []; for value in counters { words.add(Text(value)) }; writeTextFile(command[5], metrics.joined(words, " "))
-        writeTextFile(command[3], metrics.compilerLLVM())
-    } else if label == "production" { writeTextFile(command[2], metrics.compilerLLVM()) }
-    else { for index in 0..(command.length - 1) { if command[index] == "-o" { writeTextFile(command[index + 1], "functional linked artifact") } } }
+        io.writeTextFile(cache + "/case.cache", "cache"); let words: List<Text> = []; for value in counters { words.add(Text(value)) }; io.writeTextFile(command[5], metrics.joined(words, " "))
+        io.writeTextFile(command[3], metrics.compilerLLVM())
+    } else if label == "production" { io.writeTextFile(command[2], metrics.compilerLLVM()) }
+    else { for index in 0..(command.length - 1) { if command[index] == "-o" { io.writeTextFile(command[index + 1], "functional linked artifact") } } }
     return test.Result { status: 0; output: ""; errorOutput: "" }
 }
 function timed(context: Context, label: Text, command: List<Text>, count: Integer): json.Value {
@@ -148,24 +150,24 @@ public function run(context: Context) {
     for shape in options.shapes {
         for count in options.sizes {
             let directory = context.work + "/" + shape + "-" + Text(count); let entry = directory + "/main.min"; let library = directory + "/m0.min"
-            let original = readTextFile(entry); let libOriginal = readTextFile(library)
+            let original = io.readTextFile(entry); let libOriginal = io.readTextFile(library)
             let cache = directory + "/cache"; let stats = directory + "/stats.txt"
             let driver = [context.work + "/driver", context.work + "/compiler", entry, directory + "/cached.ll", cache, stats]
             let production = [context.work + "/production", entry, directory + "/production.ll"]
             timed(context, "driver", driver, count)
             let cacheFile = ""; for file in files.list(cache) { if data.ends(file, ".cache") { cacheFile = cache + "/" + file; break } }
             expect(context, cacheFile != "", "driver produced a baseline cache")
-            let baseline = readBytesFile(cacheFile)
+            let baseline = io.readBytesFile(cacheFile)
             for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit", "cold"] {
-                writeTextFile(entry, original); writeTextFile(library, libOriginal)
-                if scenario == "entry-edit" { writeTextFile(entry, test.replace(original, "    print(", "    let changed = 1\n    print(")) }
-                if scenario == "dependency-edit" { writeTextFile(library, metrics.replaceFirst(libOriginal, "result = result + 1", "result = result + 2")) }
-                if scenario == "interface-edit" { writeTextFile(library, libOriginal + "\npublic record Added { value: Integer }\n") }
+                io.writeTextFile(entry, test.sourceModules(original)); io.writeTextFile(library, test.sourceModules(libOriginal))
+                if scenario == "entry-edit" { io.writeTextFile(entry, test.sourceModules(test.replace(original, "    print(", "    let changed = 1\n    print("))) }
+                if scenario == "dependency-edit" { io.writeTextFile(library, test.sourceModules(metrics.replaceFirst(libOriginal, "result = result + 1", "result = result + 2"))) }
+                if scenario == "interface-edit" { io.writeTextFile(library, test.sourceModules(libOriginal + "\npublic record Added { value: Integer }\n")) }
                 let productionSamples: List<json.Value> = []; let driverSamples: List<json.Value> = []; let counters: List<Text> = []
                 timed(context, "production", production, count)
                 for repeat in 0..(options.repeats + 1) {
                     metrics.clear(cacheFile + ".delta")
-                    if scenario == "cold" { metrics.clear(cacheFile) } else { writeBytesFile(cacheFile, baseline) }
+                    if scenario == "cold" { metrics.clear(cacheFile) } else { io.writeBytesFile(cacheFile, baseline) }
                     let order = ["driver", "production"]; if repeat % 2 != 0 { order = ["production", "driver"] }
                     for label in order {
                         let command = driver; if label == "production" { command = production }
@@ -182,7 +184,7 @@ public function run(context: Context) {
                         }
                         if repeat > 0 { if label == "driver" { driverSamples.add(measurement) } else { productionSamples.add(measurement) } }
                     }
-                    let words = test.words(readTextFile(stats)); expect(context, words.length >= 6, "complete cache counters")
+                    let words = test.words(io.readTextFile(stats)); expect(context, words.length >= 6, "complete cache counters")
                     if scenario == "unchanged" { let expected = [count + 1, 0, 0, count + 1, 0, 0]; for index in 0..6 { expect(context, Integer(words[index]) == expected[index], "unchanged exact six cache counters") } }
                     if scenario == "entry-edit" || scenario == "dependency-edit" { expect(context, Integer(words[1]) == 1, "edited exact one module compilation") }
                     if scenario == "cold" { expect(context, Integer(words[0]) == 0 && Integer(words[1]) == count + 1, "cold exact all module compilations") }

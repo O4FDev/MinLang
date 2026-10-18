@@ -2,7 +2,11 @@
 CC ?= cc
 CPPFLAGS ?= -isystem vendor
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror
-LLVM_CC ?= $(if $(filter Darwin,$(shell uname -s)),clang,clang-23)
+LLVM_CC ?= $(shell sh tools/toolchain.sh default-clang)
+ifeq ($(shell uname -s),Darwin)
+SDKROOT ?= $(shell sh tools/toolchain.sh sdkroot)
+export SDKROOT
+endif
 ifeq ($(origin CC),default)
 CC = $(LLVM_CC)
 endif

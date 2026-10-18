@@ -20,6 +20,31 @@ static void test_cwd(char *out, size_t capacity) {
 #endif
 }
 
+#ifndef _WIN32
+/* Keep the child alive until the parent has checked its pending state/session.
+ * A FIFO rendezvous does not depend on either process winning a scheduling race. */
+static void gate_create(const char *path) { assert(!mkfifo(path, 0600)); }
+static void gate_wait(const char *path) {
+    alarm(20);
+    int fd;
+    do { fd = open(path, O_RDONLY | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
+    assert(fd >= 0);
+    char release = 0;
+    ssize_t count;
+    do { count = read(fd, &release, 1); } while (count < 0 && errno == EINTR);
+    assert(count == 1 && release == '!');
+    assert(!close(fd));
+}
+static void gate_release(const char *path) {
+    int fd;
+    do { fd = open(path, O_WRONLY | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
+    assert(fd >= 0);
+    ssize_t count;
+    do { count = write(fd, "!", 1); } while (count < 0 && errno == EINTR);
+    assert(count == 1 && !close(fd) && !unlink(path));
+}
+#endif
+
 static void put64(unsigned char *out, uint64_t value) {
     for (unsigned i = 0; i < 8; i++) out[i] = (unsigned char)(value >> (8*i));
 }
@@ -105,23 +130,29 @@ static int child(int argc, char **argv) {
         assert(fcntl(atoi(argv[2]), F_GETFD) == -1 && errno == EBADF);
         assert(fcntl(atoi(argv[3]), F_GETFD) >= 0);
 #endif
-    } else if (!strcmp(argv[1], "child-session") || !strcmp(argv[1], "child-session-sleep")) {
+    } else if (!strcmp(argv[1], "child-session") || !strcmp(argv[1], "child-session-wait")) {
 #ifndef _WIN32
         assert(getsid(0) == getpid() && getpgrp() == getpid());
-        if (argc == 3) { char cwd[4096]; test_cwd(cwd, sizeof(cwd)); assert(!strcmp(cwd, argv[2])); }
-        if (!strcmp(argv[1], "child-session-sleep")) sleep(1);
+        if (!strcmp(argv[1], "child-session-wait")) { assert(argc == 3); gate_wait(argv[2]); }
+        else if (argc == 3) { char cwd[4096]; test_cwd(cwd, sizeof(cwd)); assert(!strcmp(cwd, argv[2])); }
 #endif
     } else if (!strcmp(argv[1], "child-inherited-session")) {
 #ifndef _WIN32
         assert(getsid(0) != getpid() && getpgrp() != getpid());
 #endif
-    } else if (!strcmp(argv[1], "child-sleep")) {
+    } else if (!strcmp(argv[1], "child-wait")) {
 #ifdef _WIN32
         Sleep(1000);
 #else
-        sleep(1);
+        assert(argc == 3); gate_wait(argv[2]);
 #endif
         return 37;
+#ifndef _WIN32
+    } else if (!strcmp(argv[1], "child-gate-create")) {
+        assert(argc == 3); gate_create(argv[2]);
+    } else if (!strcmp(argv[1], "child-gate-release")) {
+        assert(argc == 3); alarm(20); gate_release(argv[2]);
+#endif
     } else if (!strcmp(argv[1], "child-streams")) {
         assert(fputs("child stdout\n", stdout) >= 0);
         MinyarText message = test_text("child stderr λ\n");
@@ -209,11 +240,21 @@ static int process_main(int argc, char **argv) {
     assert(minyar_system_spawnNative(&path, packed, empty, &working, -1, -1, bad_groups, true) == -EINVAL);
     test_release(packed); test_release(empty); test_release(bad_groups);
 
-    simple[1] = "child-sleep";
-    long long handle = launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, false);
+    char gate[4096] = "";
+#ifndef _WIN32
+    int gate_length = snprintf(gate, sizeof(gate), "%s/process-gate-%ld", argv[2], (long)getpid());
+    assert(gate_length > 0 && (size_t)gate_length < sizeof(gate));
+    gate_create(gate);
+#endif
+    const char *wait_args[] = {"custom name", "child-wait", gate};
+    long long handle = launch(argv[0], wait_args, 3, NULL, 0, "", -1, -1, groups, false);
     assert(handle > 0);
     MinyarBytes *pending = minyar_system_waitNative(handle, true);
-    assert(get64(pending, 0) == 0 && get64(pending, 8) == 0); test_release(pending); exited(handle, 37);
+    assert(get64(pending, 0) == 0 && get64(pending, 8) == 0); test_release(pending);
+#ifndef _WIN32
+    gate_release(gate);
+#endif
+    exited(handle, 37);
     const char *fd_args[] = {"custom name", "child-fds", "", ""};
     char first[32], second[32];
 #ifdef _WIN32
@@ -233,11 +274,13 @@ static int process_main(int argc, char **argv) {
     exited(session_launch(argv[0], session_args, 3, argv[2]), 0);
     session_args[1] = "child-inherited-session";
     exited(launch(argv[0], session_args, 2, NULL, 0, "", -1, -1, groups, false), 0);
-    session_args[1] = "child-session-sleep";
-    long long leader = session_launch(argv[0], session_args, 2, "");
+    gate_create(gate);
+    const char *leader_args[] = {"custom name", "child-session-wait", gate};
+    long long leader = session_launch(argv[0], leader_args, 3, "");
     assert(leader > 0);
     pid_t leader_pid = (pid_t)minyar_system_childProcessId(leader);
     assert(leader_pid > 0 && getpgid(leader_pid) == leader_pid && getsid(leader_pid) == leader_pid && getsid(0) != leader_pid);
+    gate_release(gate);
     exited(leader, 0);
     session_args[1] = "child-session";
     assert(session_launch("/minyar/no-such-executable", session_args, 2, "") == -ENOENT);

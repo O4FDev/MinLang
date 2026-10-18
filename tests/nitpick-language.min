@@ -1,0 +1,75 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+use "files" as files
+
+function compileCase(compiler: test.Compiler, source: Text, moduleMode: Boolean): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", test.sourceModules(source))
+    let command = [compiler.executable, path + ".min", path + ".ll"]
+    if moduleMode {
+        for option in ["--module-state", compiler.directory + "/prior.state", path + ".state", path + ".stats"] { command.add(option) }
+    }
+    command.add("--library")
+    command.add("library")
+    return test.run(command, system.environment(), "", path + ".compile", 30)
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text, moduleMode: Boolean) {
+    test.require(compileCase(compiler, source, moduleMode), "compile language regression")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for option in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(option) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 120), "link language regression")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.require(result, "execute language regression")
+        test.check(result.output == expected && result.errorOutput == "", "language regression output\n" + result.output + result.errorOutput)
+    }
+}
+
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text, moduleMode: Boolean) {
+    let result = compileCase(compiler, source, moduleMode)
+    test.check(result.status == 1 && test.contains(result.errorOutput, diagnostic), "language rejection\n" + result.errorOutput)
+    test.check(!test.contains(result.errorOutput, "List position"), "internal compiler bounds fault")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected source published LLVM")
+}
+
+let compiler = test.compiler()
+io.writeTextFile(compiler.directory + "/prior.state", "")
+io.writeTextFile(compiler.directory + "/callbacks-values.min", test.sourceModules(io.readTextFile("tests/nitpick-language/values.min")))
+let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+io.writeTextFile(compiler.directory + "/runtime.c", contract)
+compiler.runtime = compiler.directory + "/runtime.o"
+let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", compiler.directory + "/runtime.c", "-o", compiler.runtime]
+for flag in compiler.flags { build.add(flag) }
+test.require(test.run(build, system.environment(), "", compiler.directory + "/runtime-build", 120), "build ownership-contract runtime")
+
+for moduleMode in [false, true] {
+    executes(compiler, io.readTextFile("tests/nitpick-language/positions.min"), "42\n43\n44\n45\n46\n47\n48\n49\nkept!\n", moduleMode)
+    executes(compiler, io.readTextFile("tests/nitpick-language/mutation.min"), "old:7\nSA\nlist:9\nIB\nnew:1\nindex:2\nreplacement:3\n", moduleMode)
+    executes(compiler, io.readTextFile("tests/nitpick-language/returns.min"), "1\n2\n3\n4\n5\n6\n7\n", moduleMode)
+    for operator in ["+=", "-=", "*=", "/=", "%="] {
+        let source = "let n = 4\nlet callback = function(): Integer { n " + operator + " 2; return n }\nprint(callback())\n"
+        rejects(compiler, source, "captured bindings cannot be reassigned", moduleMode)
+    }
+    for declaration in ["let n = 1.0", "let n = true", "let n = 'x'", "let n = \"text\"", "let n = Bytes()", "let n = [1]", "record Box { value: Integer }; let n = Box { value: 1 }"] {
+        rejects(compiler, declaration + "\nlet callback = function() { n += n }\ncallback()\n", "captured bindings cannot be reassigned", moduleMode)
+    }
+    let located = compileCase(compiler, "let n = 1\nlet callback = function() { n += 1 }\ncallback()\n", moduleMode)
+    test.check(located.status == 1 && test.contains(located.errorOutput, "line 2, column"), "captured compound assignment needs its source location")
+    rejects(compiler, "function f(): Integer { if false { return 1 } }\n", "must return a value on every path", moduleMode)
+    rejects(compiler, "function f(): Integer { while true { while false { break }; break } }\n", "must return a value on every path", moduleMode)
+    rejects(compiler, "function f(): Integer { if true { return 1 } else { return \"wrong\" } }\n", "returned value has the wrong type", moduleMode)
+    rejects(compiler, "function f(): Integer { while true { if false { missing() } } }\n", "function named 'missing'", moduleMode)
+    rejects(compiler, "print(1(2))\n", "only Callback values can be called", moduleMode)
+    rejects(compiler, "record Box { callback: Callback<Integer, Integer> }\nlet box = Box { callback: function(n: Integer): Integer { return n } }\nprint(box.callback(\"wrong\"))\n", "callback argument has the wrong type", moduleMode)
+    rejects(compiler, "use \"./callbacks-values.min\" as values\nvalues.secret().callback()\n", "private", moduleMode)
+}
+test.removeTree(compiler.directory)
+print("Language review regressions: passed")

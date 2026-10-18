@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./release-support.min" as support
 use "./toolchain-files.min" as tf
@@ -9,9 +11,9 @@ record Snapshot { data: Bytes; time: Integer }
 record Clock { failed: Boolean; errorOutput: Text; observed: List<Integer> }
 
 function chosen(group: Text, name: Text): Boolean {
-    if argumentCount() == 0 { return true }
-    for index in 0..argumentCount() {
-        if argument(index) == name || argument(index) == group + "." + name || argument(index) == group { return true }
+    if processInfo.argumentCount() == 0 { return true }
+    for index in 0..processInfo.argumentCount() {
+        if processInfo.argument(index) == name || processInfo.argument(index) == group + "." + name || processInfo.argument(index) == group { return true }
     }
     return false
 }
@@ -27,7 +29,7 @@ function probe(root: Text, stamp: Text, environment: List<Text>, logs: tf.Logs):
 function snapshot(root: Text, stamp: Text, environment: List<Text>, logs: tf.Logs): Snapshot {
     let result = probe(root, stamp, environment, logs)
     test.check(result.status == 0, "toolchain stamp failed (" + Text(result.status) + ")\n" + result.errorOutput)
-    return Snapshot { data: readBytesFile(stamp); time: tf.mtime(stamp) }
+    return Snapshot { data: io.readBytesFile(stamp); time: tf.mtime(stamp) }
 }
 function sameSnapshot(left: Snapshot, right: Snapshot): Boolean {
     return support.same(left.data, right.data) && left.time == right.time
@@ -56,7 +58,7 @@ function thinLto(root: Text, base: Text, logs: tf.Logs) {
     result = probe(root, stamp, environment, logs)
     test.check(result.status != 0, "a replaced mismatched linker must be rejected")
     test.check(test.contains(result.errorOutput, "LLD 23.1.0"), "replaced linker diagnostic\n" + result.errorOutput)
-    test.check(support.same(readBytesFile(stamp), original.data), "a rejected linker replacement must keep the previous stamp")
+    test.check(support.same(io.readBytesFile(stamp), original.data), "a rejected linker replacement must keep the previous stamp")
     tf.remove(linker)
     result = probe(root, stamp, environment, logs)
     test.check(result.status != 0, "a missing linker must be rejected")
@@ -85,7 +87,7 @@ function identityFlags(root: Text, base: Text, logs: tf.Logs) {
     test.check(!support.same(flags.data, changed.data), "changed LLVM_FLAGS must change the stamp")
     tf.append(second, Bytes("\n"))
     test.check(!support.same(snapshot(root, stamp, environment, logs).data, flags.data), "a replaced compiler binary must change the stamp")
-    test.check(json.string(json.member(json.parse(readTextFile(stamp)), "flags"), "LLVM_FLAGS") == "-O3 -g", "stamp records LLVM_FLAGS")
+    test.check(json.string(json.member(json.parse(io.readTextFile(stamp)), "flags"), "LLVM_FLAGS") == "-O3 -g", "stamp records LLVM_FLAGS")
 }
 
 function touchScript(): Text {
@@ -100,7 +102,7 @@ function exercise(root: Text, base: Text, label: Text, timestamps: List<Integer>
     let stamps = work + "/stamps"
     tf.directory(stamps)
     let target = stamps + "/stamp.json"
-    writeTextFile(target, "original")
+    io.writeTextFile(target, "original")
     tf.setModified(target, prior * 1000000000)
     let tools = work + "/tools"
     tf.directory(tools)
@@ -109,10 +111,10 @@ function exercise(root: Text, base: Text, label: Text, timestamps: List<Integer>
     for index in 0..timestamps.length {
         rows.add(Text(timestamps[index]) + "\n")
         let reference = sequence + "." + Text(index)
-        writeTextFile(reference, "")
+        io.writeTextFile(reference, "")
         tf.setModified(reference, timestamps[index])
     }
-    writeTextFile(sequence, joinText(rows))
+    io.writeTextFile(sequence, joinText(rows))
     let log = work + "/clock.log"
     let compiler = work + "/clang"
     tf.executable(compiler, "printf '%s\\n' 'clang version 23.1.2'\n", logs)
@@ -130,7 +132,7 @@ function exercise(root: Text, base: Text, label: Text, timestamps: List<Integer>
     let observed: List<Integer> = []
     let replaced: List<Integer> = []
     if support.exists(log) {
-        for row in test.lines(readTextFile(log)) {
+        for row in test.lines(io.readTextFile(log)) {
             let fields = test.words(row)
             if fields.length == 2 && fields[0] == "touch" { observed.add(tf.digits(fields[1])) }
             if fields.length == 2 && fields[0] == "replace" { replaced.add(tf.nanoseconds(fields[1])) }
@@ -138,15 +140,15 @@ function exercise(root: Text, base: Text, label: Text, timestamps: List<Integer>
     }
     let only = tf.equal(tf.listing(stamps), ["stamp.json"])
     if result.status != 0 {
-        test.check(support.same(readBytesFile(target), Bytes("original")), "a failed stamp publication must keep the previous stamp")
+        test.check(support.same(io.readBytesFile(target), Bytes("original")), "a failed stamp publication must keep the previous stamp")
         test.check(only, "a failed stamp publication must not leave temporaries: " + tf.show(tf.listing(stamps)))
         test.check(replaced.length == 0, "a failed stamp publication must not replace the stamp")
         return Clock { failed: true; errorOutput: result.errorOutput; observed: observed }
     }
     test.check(replaced.length == 1, "the stamp must be replaced exactly once, saw " + Text(replaced.length))
     test.check(replaced[0] / 1000000000 >= max(100, prior) + 1, "the replaced stamp must be newer than both the clock and the prior stamp: " + Text(replaced[0]))
-    test.check(!support.same(readBytesFile(target), Bytes("original")), "the stamp must be replaced")
-    test.check(json.string(json.parse(readTextFile(target)), "llvm_version") == "23.1.2", "the stamp records the LLVM version")
+    test.check(!support.same(io.readBytesFile(target), Bytes("original")), "the stamp must be replaced")
+    test.check(json.string(json.parse(io.readTextFile(target)), "llvm_version") == "23.1.2", "the stamp records the LLVM version")
     test.check(only, "stamp publication must not leave temporaries: " + tf.show(tf.listing(stamps)))
     return Clock { failed: false; errorOutput: result.errorOutput; observed: observed }
 }
@@ -164,13 +166,13 @@ let names = ["test_thin_lto_requires_matching_linker_and_tracks_replacement", "t
     "test_userspace_boundary_does_not_certify_filesystem_boundary", "test_stalled_filesystem_fails_bounded_without_replacing_stamp",
     "test_clock_rollback_still_requires_newer_than_prior_stamp"]
 let groups = ["ToolchainStamp", "ToolchainStamp", "StampFilesystemClock", "StampFilesystemClock", "StampFilesystemClock"]
-for index in 0..argumentCount() {
+for index in 0..processInfo.argumentCount() {
     let valid = false
     for position in 0..names.length {
-        let word = argument(index)
+        let word = processInfo.argument(index)
         if word == names[position] || word == groups[position] + "." + names[position] || word == groups[position] { valid = true }
     }
-    test.check(valid, "unknown toolchain stamp case " + argument(index))
+    test.check(valid, "unknown toolchain stamp case " + processInfo.argument(index))
 }
 let scratch = test.scratch()
 let logs = tf.logs(scratch + "/logs")

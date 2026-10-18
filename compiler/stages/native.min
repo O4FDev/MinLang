@@ -193,6 +193,9 @@ function machineIntrinsic(name: Text): Text {
         let declaration = "  ; minyar-native: machine|declare i64 @minyar_machine_syscall(i64, i64, i64, i64, i64, i64, i64)\n"
         return declaration + "  %value = call i64 @minyar_machine_syscall(i64 %argument.0, i64 %argument.1, i64 %argument.2, i64 %argument.3, i64 %argument.4, i64 %argument.5, i64 %argument.6)\n  ret i64 %value\n"
     }
+    if name == "loadFloat32" {
+        return "  %address = inttoptr i64 %argument.0 to ptr\n  %loaded = load float, ptr %address, align 1\n  %value = fpext float %loaded to double\n  ret double %value\n"
+    }
     let result = machineMemoryIntrinsic(name, "8")
     if result == "" { result = machineMemoryIntrinsic(name, "16") }
     if result == "" { result = machineMemoryIntrinsic(name, "32") }
@@ -247,15 +250,6 @@ function machineIntrinsic(name: Text): Text {
         let address = "  %table = call ptr asm \"leaq " + table + "(%rip), $0\", \"=r\"()\n  %slot = getelementptr i64, ptr %table, i64 %argument.0\n"
         return address + "  %value = " + load + ", ptr %slot, align 8\n  ret i64 %value\n"
     }
-    if name == "blendSpan" {
-        return machineBlendSpan()
-    }
-    if name == "blendMask" {
-        return machineBlendMask()
-    }
-    if name == "coverage" {
-        return machineCoverage()
-    }
     if name == "atomicAdd" {
         return pointer + "  %old = atomicrmw add ptr %address, i64 %argument.1 seq_cst, align 8\n  ret i64 %old\n"
     }
@@ -302,7 +296,7 @@ function machineIntrinsicArm64(name: Text): Text {
     if name == "loadInterruptTable" || name == "interruptHandler" || name == "hypervisorCall" || armPortIntrinsic(name) {
         return "  ; minyar-native: machine|declare void @llvm.trap()\n  call void @llvm.trap()\n  unreachable\n"
     }
-    if name == "syscall" || name == "jump" || name == "callEntry" || name == "atomicAdd" || name == "fence" || name == "address" || name == "copy" || name == "fill8" || name == "fill32" || name == "blendSpan" || name == "blendMask" || name == "coverage" {
+    if name == "syscall" || name == "jump" || name == "callEntry" || name == "atomicAdd" || name == "fence" || name == "address" || name == "copy" || name == "fill8" || name == "fill32" || name == "loadFloat32" {
         return machineIntrinsic(name)
     }
     let memory = machineMemoryIntrinsic(name, "8")
@@ -323,47 +317,6 @@ function armPortIntrinsic(name: Text): Boolean {
 function armTableLoad(table: Text, load: Text): Text {
     let address = "  %table = call ptr asm \"adrp $0, " + table + "\\0A\\09add $0, $0, :lo12:" + table + "\", \"=r\"()\n"
     return address + "  %slot = getelementptr i64, ptr %table, i64 %argument.0\n  %value = " + load + ", ptr %slot, align 8\n  ret i64 %value\n"
-}
-
-function blendPixel(pixel: Text, opacity: Text, colorRedBlue: Text, colorGreen: Text, out: Text): Text {
-    let keep = "  %keep." + out + " = sub i32 256, " + opacity + "\n"
-    let redBlue = "  %rb." + out + " = and i32 " + pixel + ", 16711935\n  %rbk." + out + " = mul i32 %rb." + out + ", %keep." + out + "\n"
-    let redBlueColor = "  %rbc." + out + " = mul i32 " + colorRedBlue + ", " + opacity + "\n  %rbs." + out + " = add i32 %rbk." + out + ", %rbc." + out + "\n"
-    let redBlueOut = "  %rbo." + out + " = lshr i32 %rbs." + out + ", 8\n  %rbm." + out + " = and i32 %rbo." + out + ", 16711935\n"
-    let green = "  %g." + out + " = and i32 " + pixel + ", 65280\n  %gk." + out + " = mul i32 %g." + out + ", %keep." + out + "\n"
-    let greenColor = "  %gc." + out + " = mul i32 " + colorGreen + ", " + opacity + "\n  %gs." + out + " = add i32 %gk." + out + ", %gc." + out + "\n"
-    let greenOut = "  %go." + out + " = lshr i32 %gs." + out + ", 8\n  %gm." + out + " = and i32 %go." + out + ", 65280\n"
-    return keep + redBlue + redBlueColor + redBlueOut + green + greenColor + greenOut + "  %" + out + " = or i32 %rbm." + out + ", %gm." + out + "\n"
-}
-
-function machineBlendSpan(): Text {
-    let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %color = trunc i64 %argument.2 to i32\n  %opacity = trunc i64 %argument.3 to i32\n"
-    let colors = "  %crb = and i32 %color, 16711935\n  %cg = and i32 %color, 65280\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %blend, label %done\n"
-    let loop = "blend:\n  %index = phi i64 [ 0, %entry ], [ %next, %blend ]\n  %slot = getelementptr i32, ptr %base, i64 %index\n  %pixel = load i32, ptr %slot, align 4\n"
-    let tail = "  store i32 %result, ptr %slot, align 4\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.1\n  br i1 %more, label %blend, label %done\ndone:\n  ret void\n"
-    return head + colors + loop + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
-}
-
-function machineBlendMask(): Text {
-    let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %mask = inttoptr i64 %argument.2 to ptr\n  %color = trunc i64 %argument.3 to i32\n"
-    let parameters = "  %scale = trunc i64 %argument.4 to i32\n  %bias = trunc i64 %argument.5 to i32\n  %limit = trunc i64 %argument.6 to i32\n"
-    let colors = "  %crb = and i32 %color, 16711935\n  %cg = and i32 %color, 65280\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %blend, label %done\n"
-    let loop = "blend:\n  %index = phi i64 [ 0, %entry ], [ %next, %blend ]\n  %slot = getelementptr i32, ptr %base, i64 %index\n  %pixel = load i32, ptr %slot, align 4\n"
-    let cover = "  %coverSlot = getelementptr i8, ptr %mask, i64 %index\n  %cover8 = load i8, ptr %coverSlot, align 1\n  %cover = zext i8 %cover8 to i32\n"
-    let opacity = "  %biased = add i32 %cover, %bias\n  %capped = call i32 @llvm.umin.i32(i32 %biased, i32 %limit)\n  %scaled = mul i32 %capped, %scale\n  %raw = lshr i32 %scaled, 8\n  %round = lshr i32 %raw, 7\n  %opacity = add i32 %raw, %round\n"
-    let tail = "  store i32 %result, ptr %slot, align 4\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.1\n  br i1 %more, label %blend, label %done\ndone:\n  ret void\n"
-    let declaration = "  ; minyar-native: machine|declare i32 @llvm.umin.i32(i32, i32)\n"
-    return declaration + head + parameters + colors + loop + cover + opacity + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
-}
-
-function machineCoverage(): Text {
-    let head = "  %source = inttoptr i64 %argument.0 to ptr\n  %target = inttoptr i64 %argument.1 to ptr\n  %any = icmp sgt i64 %argument.2, 0\n  br i1 %any, label %cover, label %done\n"
-    let loop = "cover:\n  %index = phi i64 [ 0, %entry ], [ %next, %cover ]\n  %sum = phi double [ 0.0, %entry ], [ %total, %cover ]\n"
-    let add = "  %slot = getelementptr float, ptr %source, i64 %index\n  %narrow = load float, ptr %slot, align 4\n  %delta = fpext float %narrow to double\n  %total = fadd double %sum, %delta\n"
-    let magnitude = "  %negated = fneg double %total\n  %below = fcmp olt double %total, 0.0\n  %magnitude = select i1 %below, double %negated, double %total\n"
-    let scale = magnitude + "  %over = fcmp ogt double %magnitude, 1.0\n  %capped = select i1 %over, double 1.0, double %magnitude\n  %scaled = fmul double %capped, 255.0\n  %rounded = fadd double %scaled, 0.5\n  %byte = fptoui double %rounded to i8\n"
-    let tail = "  %out = getelementptr i8, ptr %target, i64 %index\n  store i8 %byte, ptr %out, align 1\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.2\n  br i1 %more, label %cover, label %done\ndone:\n  ret void\n"
-    return head + loop + add + scale + tail
 }
 
 function machineMemoryIntrinsic(name: Text, width: Text): Text {

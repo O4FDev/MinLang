@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
@@ -6,13 +7,28 @@ function pause(seconds: Text) {
     test.check(handle > 0 && system.wait(handle).exitCode == 0, "control pause")
 }
 function gone(path: Text, log: Text) {
-    let pid = test.words(readTextFile(path))[0]
+    let pid = test.words(io.readTextFile(path))[0]
     let result = test.run(["/bin/ps", "-p", pid, "-o", "stat="], system.environment(), "", log, 10)
     test.check(result.status != 0 || test.contains(result.output, "Z"), "owned descendant must not remain active: " + result.output)
 }
 let work = test.scratch()
+let symbols = test.scratch()
+test.check(files.makeDirectory(symbols + "/program.dSYM") == 0, "native symbol bundle fixture")
+io.writeTextFile(symbols + "/program.dSYM/symbols", "retained debug data")
+test.removeScratch(symbols)
+test.check(files.pathSize(symbols) < 0, "scratch cleanup includes native symbol bundle directories")
+let self = test.selfPath()
+test.check(self != "" && files.pathSize(self) > 0, "native process executable identity")
+test.require(test.run(["ln", "-s", work, work + "/alias"], system.environment(), "", work + "/symlink", 10), "path alias fixture")
+test.check(test.resolvePath(work + "/alias/missing/../output with spaces") == work + "/output with spaces", "resolve symlink parents and absent output paths")
+test.check(test.resolvePath("") == "" && test.resolvePath(work + Text(Character(0))) == "", "invalid native identity paths are rejected")
+test.check(files.remove(work + "/alias") == 0, "remove path alias")
 let success = test.finish(test.portableStart(["/bin/sh", "-c", "printf 'out\\n'; printf 'err\\n' >&2; exit 7"], system.environment(), "", work + "/success", 10), work + "/success")
 test.check(success.status == 7 && success.output == "out\n" && success.errorOutput == "err\n", "portable supervision preserves exact exit/stdout/stderr")
+for index in 0..100 {
+    let quiet = test.finish(test.portableStart(["/bin/sh", "-c", ":"], system.environment(), "", work + "/quiet", 10), work + "/quiet")
+    test.check(quiet.status == 0 && quiet.output == "" && quiet.errorOutput == "", "timer cancellation preserves empty child streams")
+}
 let aborted = test.run(["/bin/sh", "-c", "printf 'started\\n'; printf 'signal diagnostic\\n' >&2; kill -ABRT $$"], system.environment(), "", work + "/aborted", 10)
 test.check(aborted.status == 134 && aborted.output == "started\n" && test.contains(aborted.errorOutput, "signal diagnostic\n"), "signal termination preserves exit status and partial diagnostics")
 let child = work + "/child.pid"
@@ -30,6 +46,11 @@ let cancellation = test.finish(cancelled, work + "/cancelled")
 test.check(cancellation.status == 143 && test.contains(cancellation.output, "partial\n"), "cancellation forwards signals and reaps owned work")
 test.check(system.monotonicNanoseconds() - started < 4000000000, "cancellation terminates descendants promptly")
 gone(child, work + "/cancelled-children")
+let graceful = test.portableStart(["/bin/sh", "-c", "trap 'exit 0' TERM; printf 'ready\\n'; while :; do :; done"], system.environment(), "", work + "/graceful", 30)
+pause("0.2")
+test.check(system.sendSignal(system.childProcessId(graceful), 15) == 0, "request graceful child shutdown")
+let gracefulStatus = test.finish(graceful, work + "/graceful")
+test.check(gracefulStatus.status == 0 && gracefulStatus.output == "ready\n", "graceful child shutdown preserves its successful status")
 let killed = test.portableStart(command, system.environment(), "", work + "/killed", 30)
 pause("0.2")
 test.check(system.sendSignal(system.childProcessId(killed), 9) == 0, "kill private supervisor")

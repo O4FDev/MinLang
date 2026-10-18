@@ -48,8 +48,7 @@ MinyarBytes *minyar_bytes_new(long long length) {
     return new_text(data, length, length);
 }
 
-/* Text(bytes): the bytes, unchanged, as Text. Like file contents, they are
- * validated as UTF-8 only when a character operation needs them. */
+/* Text(bytes) validates UTF-8 immediately. Use text.decode for recoverable input. */
 MinyarText *minyar_bytes_text(const MinyarBytes *bytes) {
     return minyar_native_copy_text(bytes->bytes, bytes->byte_length);
 }
@@ -59,73 +58,6 @@ MinyarBytes *minyar_text_bytes(const MinyarText *text) {
     MinyarBytes *bytes = minyar_bytes_new(text->byte_length);
     if (text->byte_length)
         memcpy((void *)bytes->bytes, text->bytes, (size_t)text->byte_length);
-    return bytes;
-}
-
-/* randomBytes(count): bytes from the platform's cryptographically secure
- * generator. Freestanding programs supply minyar_platform_random. */
-#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__)
-static void fill_random(unsigned char *out, size_t count) {
-    arc4random_buf(out, count);
-}
-#elif defined(__linux__)
-#include <sys/random.h>
-static void fill_random(unsigned char *out, size_t count) {
-    while (count) {
-        ssize_t got = getrandom(out, count, 0);
-        if (got <= 0)
-            minyar_stop("the system could not provide random bytes.");
-        out += got;
-        count -= (size_t)got;
-    }
-}
-#elif defined(_WIN32)
-#include <bcrypt.h>
-typedef NTSTATUS(WINAPI *MinyarRandomGenerator)(BCRYPT_ALG_HANDLE, PUCHAR, ULONG, ULONG);
-static INIT_ONCE random_once = INIT_ONCE_STATIC_INIT;
-static MinyarRandomGenerator random_generator;
-
-static BOOL CALLBACK initialize_random(PINIT_ONCE once, PVOID parameter, PVOID *context) {
-    (void)once;
-    (void)parameter;
-    (void)context;
-    /* Use the system DLL explicitly. Every runtime profile and direct C client
-     * can use randomBytes without acquiring a new static linker dependency. */
-    HMODULE module = LoadLibraryExW(L"bcrypt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!module)
-        return FALSE;
-    random_generator = (MinyarRandomGenerator)GetProcAddress(module, "BCryptGenRandom");
-    if (!random_generator) {
-        FreeLibrary(module);
-        return FALSE;
-    }
-    /* The process owns this one module reference for the lifetime of the cached
-     * function. InitOnce publishes it safely to concurrent random requests. */
-    return TRUE;
-}
-
-static void fill_random(unsigned char *out, size_t count) {
-    if (!InitOnceExecuteOnce(&random_once, initialize_random, NULL, NULL))
-        minyar_stop("the system could not provide random bytes.");
-    while (count) {
-        ULONG chunk = count > UINT32_MAX ? UINT32_MAX : (ULONG)count;
-        if (random_generator(NULL, out, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-            minyar_stop("the system could not provide random bytes.");
-        out += chunk;
-        count -= chunk;
-    }
-}
-#else
-void minyar_platform_random(unsigned char *out, size_t count);
-static void fill_random(unsigned char *out, size_t count) {
-    minyar_platform_random(out, count);
-}
-#endif
-
-MinyarBytes *minyar_random_bytes(long long count) {
-    MinyarBytes *bytes = minyar_bytes_new(count);
-    if (count)
-        fill_random((unsigned char *)bytes->bytes, (size_t)count);
     return bytes;
 }
 
@@ -327,56 +259,6 @@ void minyar_bytes_append(MinyarBytes *bytes, const MinyarBytes *other) {
     bytes_reserve(bytes, length);
     memmove(bytes_data(bytes) + bytes->byte_length, other->bytes, (size_t)length);
     bytes->byte_length += length;
-}
-
-MinyarBytes *minyar_read_bytes_file(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = open_text_path(path, "rb");
-    if (!file) {
-        fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
-        exit(1);
-    }
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    long long length = text_file_length(file);
-    MinyarBytes *bytes = minyar_bytes_new(length);
-    if (fread(bytes_data(bytes), 1, (size_t)length, file) != (size_t)length)
-        minyar_stop("a requested file could not be read.");
-    fclose(file);
-    return bytes;
-}
-
-void minyar_write_bytes_file(const MinyarText *path_text, const MinyarBytes *contents) {
-    char *path = text_as_path(path_text);
-    FILE *file = open_text_path(path, "wb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    if (!file)
-        minyar_stop("a requested file could not be created.");
-    if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) !=
-            (size_t)contents->byte_length ||
-        fclose(file) != 0)
-        minyar_stop("a requested file could not be written.");
-}
-
-_Bool minyar_file_exists(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = open_text_path(path, "rb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    if (!file)
-        return 0;
-    fclose(file);
-    return 1;
 }
 
 /* Grow Bytes by `count` zeroed bytes and return where they start, for native

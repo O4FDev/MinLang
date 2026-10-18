@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
@@ -12,10 +13,10 @@ test.executes(compiler, "record Signed native \"c\" { value: Int32 }\nlet value 
 test.executes(compiler, "record Packet native \"c\" { bytes: Bytes[3] }\nprint(sizeOf(Packet)); print(alignOf(Packet))\n", "3\n1\n")
 rejection(compiler, "record Packet native \"c\" { bytes: Bytes[length] }\n", "a C-layout byte array needs a constant positive length")
 rejection(compiler, "record Packet native \"c\" { bytes: Bytes[0] }\n", "a C-layout byte array length must be between 1 and 1073741824")
-test.executes(compiler, "function greater(a: Float, b: Float): Boolean { return a > b }\nfunction less(a: Float, b: Float): Boolean { return a < b }\nprint(greater(2.0, 1.0)); print(greater(1.0, 1.0)); print(greater(1.0, 2.0)); print(less(1.0, 2.0))\nlet nan = sqrt(-1.0)\nprint(greater(nan, 0.0)); print(greater(0.0, nan))\n", "true\nfalse\nfalse\ntrue\nfalse\nfalse\n")
+test.executes(compiler, "function greater(a: Float, b: Float): Boolean { return a > b }\nfunction less(a: Float, b: Float): Boolean { return a < b }\nprint(greater(2.0, 1.0)); print(greater(1.0, 1.0)); print(greater(1.0, 2.0)); print(less(1.0, 2.0))\nlet nan = math.sqrt(-1.0)\nprint(greater(nan, 0.0)); print(greater(0.0, nan))\n", "true\nfalse\nfalse\ntrue\nfalse\nfalse\n")
 test.executes(compiler, "function parse(value: Text): Integer { return Integer(value) }\nprint(parse(\"42\")); print(parse(\"-7\"))\n", "42\n-7\n")
-test.executes(compiler, "constant VALUES: List<Integer> = [7]\nfunction item(): Integer { return VALUES[0] }\nfunction main() { print(item()); print(item()) }\n", "7\n7\n")
-let constantIR = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.executes(compiler, "global VALUES: List<Integer> = [7]\nfunction item(): Integer { return VALUES[0] }\nfunction main() { print(item()); print(item()) }\n", "7\n7\n")
+let constantIR = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
 let constantFunction = ""
 let mainCleanup = 0
 for line in test.lines(constantIR) {
@@ -28,19 +29,22 @@ for line in test.lines(constantIR) {
 test.check(mainCleanup == 1, "fallthrough main releases module constants exactly once")
 rejection(compiler, "record OrdinaryComparisonValue { value: Integer }\nlet values: List<Integer> = [2, 1]\nlet comparator = OrdinaryComparisonValue { value: 1 }\nlet ordered = values.sortedBy(comparator)\n", "sortBy and sortedBy require Callback<T, T, Integer>")
 rejection(compiler, "record OrdinaryComparisonValue { value: Integer }\nlet callback = function(value: Integer): Integer { return value }\nlet comparator = OrdinaryComparisonValue { value: 1 }\ncomparator(1, 2)\n", "I can't find a function named 'comparator'")
+test.executes(compiler, "record Floats native \"c\" { narrow: Float32; wide: Float64 }\nlet value = Floats { narrow: 1.25; wide: -3.5 }\nprint(value.narrow); print(value.wide)\nvalue.narrow = 2.5; value.wide = 4.75\nprint(value.narrow); print(value.wide)\n", "1.25\n-3.5\n2.5\n4.75\n")
+test.require(test.compile(compiler, "public parallel function marker(value: Integer): Integer { return value + 1 }\nprint(marker(41))\n"), "public parallel function compiles")
+test.check(test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "; minyar-parallel: minyar_module_0_marker\n"), "public parallel functions retain their scheduling marker")
 let work = compiler.directory
-writeTextFile(work + "/machine.min", "use \"machine\" as machine\nthread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\nfunction main() { nativeThreadSetup(); machine.copy(0, 0, 0); machine.fill8(0, 0, 0); machine.fill32(0, 0, 0) }\n")
+io.writeTextFile(work + "/machine.min", test.sourceModules("use \"machine\" as machine\nthread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\nfunction main() { nativeThreadSetup(); machine.copy(0, 0, 0); machine.fill8(0, 0, 0); machine.fill32(0, 0, 0) }\n"))
 test.require(test.run([compiler.executable, work + "/machine.min", work + "/machine.ll", "--library", "library"], system.environment(), "", work + "/machine.compile", 30), "reviewed main machine buffer signatures compile")
-let machine = readTextFile(work + "/machine.ll")
+let machine = io.readTextFile(work + "/machine.ll")
 for name in ["copy", "fill8", "fill32"] { test.check(test.contains(machine, "minyar_machine_" + name + "8:5(1,1,1)"), "reviewed machine signature is emitted: " + name) }
-writeTextFile(work + "/empty-state", "")
-writeTextFile(work + "/main-only.min", "function main() { print(42) }\n")
+io.writeTextFile(work + "/empty-state", "")
+io.writeTextFile(work + "/main-only.min", test.sourceModules("function main() { print(42) }\n"))
 for mode in ["cold", "warm"] {
     let input = work + "/empty-state"
     if mode == "warm" { input = work + "/main-cold.state" }
     let prefix = work + "/main-" + mode
-    test.require(test.run([compiler.executable, work + "/main-only.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats"], system.environment(), "", prefix + ".compile", 30), "main-only cached module compilation")
-    if test.addressEnabled(compiler.flags) { writeTextFile(prefix + ".ll", test.instrument(readTextFile(prefix + ".ll"))) }
+    test.require(test.run([compiler.executable, work + "/main-only.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats", "--library", "library"], system.environment(), "", prefix + ".compile", 30), "main-only cached module compilation")
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(prefix + ".ll", test.instrument(io.readTextFile(prefix + ".ll"))) }
     for optimization in ["-O0", "-O2"] {
         let command = [compiler.clang, optimization, "-Wno-override-module"]
         for flag in compiler.flags { command.add(flag) }
@@ -50,15 +54,15 @@ for mode in ["cold", "warm"] {
         test.check(result.status == 0 && result.output == "42\n" && result.errorOutput == "", "main-only cached module preserves entry behavior")
     }
 }
-writeTextFile(work + "/entry.min", "public thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\n")
-writeTextFile(work + "/shadow.min", "use \"./entry.min\" as entry\nfunction main() {\nlet worker = 7\nlet bytes = Bytes(1)\nlet frozen = freezeBytes(bytes)\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(entry.worker, 0, frozen, channel)\nprint(joinThread(handle))\n}\n")
+io.writeTextFile(work + "/entry.min", test.sourceModules("public thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\n"))
+io.writeTextFile(work + "/shadow.min", test.sourceModules("use \"./entry.min\" as entry\nfunction main() {\nlet worker = 7\nlet bytes = Bytes(1)\nlet frozen = freezeBytes(bytes)\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(entry.worker, 0, frozen, channel)\nprint(joinThread(handle))\n}\n"))
 let shadow = test.run([compiler.executable, work + "/shadow.min", work + "/shadow.ll", "--library", "library"], system.environment(), "", work + "/shadow-result", 30)
 test.check(shadow.status == 1 && shadow.output == "" && test.contains(shadow.errorOutput, "startThread requires a named thread entry") && files.pathSize(work + "/shadow.ll") < 0, "a readable local binding cannot shadow a qualified thread entry\n" + shadow.output + shadow.errorOutput)
-writeTextFile(work + "/boundary.min", "function echo(value: Text): Text { value = value + \"!\"; return value }\nprint(echo(\"alive\"))\n")
+io.writeTextFile(work + "/boundary.min", test.sourceModules("function echo(value: Text): Text { value = value + \"!\"; return value }\nprint(echo(\"alive\"))\n"))
 for budget in [1, 2] {
     let path = work + "/boundary-" + Text(budget)
-    test.require(test.run([compiler.executable, work + "/boundary.min", path + ".ll", "--bounded-owners", Text(budget)], system.environment(), "", path + ".compile", 30), "ownership boundary compilation")
-    let llvm = readTextFile(path + ".ll")
+    test.require(test.run([compiler.executable, work + "/boundary.min", path + ".ll", "--bounded-owners", Text(budget), "--library", "library"], system.environment(), "", path + ".compile", 30), "ownership boundary compilation")
+    let llvm = io.readTextFile(path + ".ll")
     let stacked = test.contains(llvm, "call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 1)")
     test.check(stacked == (budget == 2), "one owner is admitted exactly below the cleanup budget")
     test.check(test.contains(llvm, "define ptr @.minyar.fn.echo(ptr %argument.0) noinline {") == (budget == 2), "stack ownership retains the noinline frame lifetime boundary")
@@ -66,8 +70,8 @@ for budget in [1, 2] {
         let input = work + "/empty-state"
         if mode == "warm" { input = path + "-cold.state" }
         let prefix = path + "-" + mode
-        test.require(test.run([compiler.executable, work + "/boundary.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats", "--bounded-owners", Text(budget)], system.environment(), "", prefix + ".compile", 30), "cached module ownership boundary compilation")
-        let module = readTextFile(prefix + ".ll")
+        test.require(test.run([compiler.executable, work + "/boundary.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats", "--bounded-owners", Text(budget), "--library", "library"], system.environment(), "", prefix + ".compile", 30), "cached module ownership boundary compilation")
+        let module = io.readTextFile(prefix + ".ll")
         test.check(test.contains(module, "call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 1)") == (budget == 2), "cached module admits one owner exactly below the cleanup budget")
         let header = ""
         let protectedFrame = false
@@ -80,12 +84,12 @@ for budget in [1, 2] {
         }
         test.check(protectedFrame == (budget == 2), "cached module preserves the noinline frame lifetime boundary")
     }
-    writeTextFile(path + ".c", "#include \"minyar_runtime.c\"\n#include \"minyar_stack_frames.h\"\n")
+    io.writeTextFile(path + ".c", "#include \"minyar_runtime.c\"\n#include \"minyar_stack_frames.h\"\n")
     let runtimeCommand = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "-iquote", "runtime"]
     for flag in compiler.flags { runtimeCommand.add(flag) }
     for item in ["-c", path + ".c", "-o", path + ".o"] { runtimeCommand.add(item) }
     test.require(test.run(runtimeCommand, system.environment(), "", path + ".runtime", compiler.linkTimeout), "actual bounded ownership runtime")
-    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(llvm)) }
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
     for optimization in ["-O0", "-O2"] {
         let command = [compiler.clang, optimization, "-Wno-override-module"]
         for flag in compiler.flags { command.add(flag) }
@@ -95,19 +99,19 @@ for budget in [1, 2] {
         test.check(result.status == 0 && result.output == "alive!\n" && result.errorOutput == "", "ownership boundary preserves reference lifetime at " + optimization)
     }
 }
-rejection(compiler, "constant G: Integer = 1\nfunction k() {}\nfunction f() {}\nfunction f() {}\nfunction f() {}\nprint(1)\n", "line 4, column 10: module declares 'f' more than once")
+rejection(compiler, "global G: Integer = 1\nfunction k() {}\nfunction f() {}\nfunction f() {}\nfunction f() {}\nprint(1)\n", "line 4, column 10: module declares 'f' more than once")
 rejection(compiler, "print(\"abc\".size)\n", "this value does not provide a field named 'size'")
 rejection(compiler, "let items = [1, 2]\nprint(items.byteLength)\n", "this value does not provide a field named 'byteLength'")
 test.require(test.compile(compiler, "print(Integer(7.9))\n"), "Float to Integer conversion compiles")
-test.check(!test.contains(readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "only Text conversions declare the Text integer parser")
+test.check(!test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "only Text conversions declare the Text integer parser")
 test.require(test.compile(compiler, "print(Integer(\"42\"))\n"), "Text to Integer conversion compiles")
-test.check(test.contains(readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "Text conversions declare the Text integer parser")
-writeTextFile(work + "/joined.min", "constant VALUES: List<Integer> = [7]\nthread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\nfunction main() {\nlet frozen = freezeBytes(Bytes(8))\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(worker, VALUES[0], frozen, channel)\nprint(joinThread(handle))\n}\n")
+test.check(test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "Text conversions declare the Text integer parser")
+io.writeTextFile(work + "/joined.min", test.sourceModules("global VALUES: List<Integer> = [7]\nthread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\nfunction main() {\nlet frozen = freezeBytes(Bytes(8))\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(worker, VALUES[0], frozen, channel)\nprint(joinThread(handle))\n}\n"))
 test.require(test.run([compiler.executable, work + "/joined.min", work + "/joined.ll", "--library", "library"], system.environment(), "", work + "/joined.compile", 30), "threaded main with module constants compiles")
 let joinedFunction = ""
 let joined = false
 let released = false
-for line in test.lines(readTextFile(work + "/joined.ll")) {
+for line in test.lines(io.readTextFile(work + "/joined.ll")) {
     if test.contains(line, "define ") { joinedFunction = line; joined = false }
     if test.contains(joinedFunction, "@main(") && test.contains(line, "call void @minyar_thread_join_children()") { joined = true }
     if test.contains(joinedFunction, "@main(") && test.contains(line, "call void @.minyar.constants.release()") {
@@ -116,13 +120,13 @@ for line in test.lines(readTextFile(work + "/joined.ll")) {
     }
 }
 test.check(released, "threaded main releases module constants")
-writeTextFile(work + "/quoted.min", "public constant GREETING: Text = \"hi \\\"there\\\"\"\npublic function shout(value: Text): Text { return value + \"!\" }\n")
-writeTextFile(work + "/quoting.min", "use \"./quoted.min\" as quoted\nfunction main() { print(quoted.shout(quoted.GREETING)) }\n")
+io.writeTextFile(work + "/quoted.min", test.sourceModules("public global GREETING: Text = \"hi \\\"there\\\"\"\npublic function shout(value: Text): Text { return value + \"!\" }\n"))
+io.writeTextFile(work + "/quoting.min", test.sourceModules("use \"./quoted.min\" as quoted\nfunction main() { print(quoted.shout(quoted.GREETING)) }\n"))
 for mode in ["cold", "warm"] {
     let input = work + "/empty-state"
     if mode == "warm" { input = work + "/quoting-cold.state" }
     let prefix = work + "/quoting-" + mode
-    test.require(test.run([compiler.executable, work + "/quoting.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats"], system.environment(), "", prefix + ".compile", 30), "cached module interface with quoted Text compiles " + mode)
+    test.require(test.run([compiler.executable, work + "/quoting.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats", "--library", "library"], system.environment(), "", prefix + ".compile", 30), "cached module interface with quoted Text compiles " + mode)
 }
 test.removeTree(work)
 print("mutation boundary coverage: passed")

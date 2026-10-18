@@ -1,10 +1,12 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./memory-research-support.min" as support
 use "system" as system
 use "files" as files
 use "json" as json
 
-constant PROTECTED: List<Text> = ["tests/scaling-test.min", "tests/self-compile-budget.min", "tests/performance-test.min", "tests/performance/runtime.min", "build/performance-baseline.json"]
+global PROTECTED: List<Text> = ["tests/scaling-test.min", "tests/self-compile-budget.min", "tests/performance-test.min", "tests/performance/runtime.min", "build/performance-baseline.json"]
 record Options { root: Text; runner: Text; compiler: Text; runtimeSource: Text; evidence: Text; outcomes: List<Text> }
 record Contract { status: Integer; output: Text; data: json.Value; directory: Text }
 
@@ -75,18 +77,18 @@ function runContracts(options: Options, label: Text, compiler: Text, runtime: Te
     let began = system.monotonicNanoseconds()
     let result = test.run(command, system.environment(), options.root, directory + "/runner.capture", outer)
     if result.status == 124 && system.monotonicNanoseconds() - began >= outer * 1000000000 {
-        writeTextFile(directory + "/runner.log", "timed out after " + Text(outer) + " seconds\n")
+        io.writeTextFile(directory + "/runner.log", "timed out after " + Text(outer) + " seconds\n")
         fail("The runner failed to enforce its child timeout")
     }
-    writeTextFile(directory + "/command.json", support.texts(command) + "\n")
+    io.writeTextFile(directory + "/command.json", support.texts(command) + "\n")
     let output = support.readText(directory + "/runner.capture") + support.readText(directory + "/runner.capture.err")
-    writeTextFile(directory + "/runner.log", output)
+    io.writeTextFile(directory + "/runner.log", output)
     let found = test.run(["find", directory + "/runs", "-name", "results.json", "-type", "f"], system.environment(), "", directory + "/find", 60)
     let manifests: List<Text> = []
     if found.status == 0 { manifests = test.lines(found.output) }
     test.check(manifests.length > 0, "No retained results.json; see " + directory + "/runner.log")
     test.check(manifests.length == 1, "Smoke should retain one unambiguous result manifest")
-    let data = json.parse(readTextFile(manifests[0]))
+    let data = json.parse(io.readTextFile(manifests[0]))
     test.check(data.kind == json.OBJECT, "results.json is not a JSON object")
     let status = json.string(data, "status")
     options.outcomes.add(support.object(["label", "returncode", "manifest", "status"], [json.quote(label), Text(result.status), json.quote(manifests[0]), json.quote(status)]))
@@ -107,7 +109,7 @@ function fakeCompiler(options: Options, label: Text, body: Text): Text {
     let directory = options.evidence + "/inputs"
     support.makeDirectories(directory)
     let executable = directory + "/" + label
-    writeTextFile(executable, "#!/bin/sh\n" + body + "\n")
+    io.writeTextFile(executable, "#!/bin/sh\n" + body + "\n")
     test.require(test.run(["chmod", "755", executable], system.environment(), "", executable + ".chmod", 10), "make fake compiler executable")
     return executable
 }
@@ -119,11 +121,11 @@ let selectors: List<Text> = []
 let names = ["test_real_language_smoke_is_accepted", "test_normal_return_leak_is_rejected", "test_compiler_failure_is_rejected_and_retained", "test_non_utf8_compiler_failure_is_rejected_and_retained", "test_compiler_timeout_is_rejected_and_retained"]
 let family = "MemoryContractsHarnessTests"
 let index = 0
-while index < argumentCount() {
-    let option = argument(index)
+while index < processInfo.argumentCount() {
+    let option = processInfo.argument(index)
     if option == "--runner" || option == "--compiler" || option == "--runtime-source" || option == "--output-dir" {
-        test.check(index + 1 < argumentCount(), "option needs a value: " + option)
-        let value = support.absolute(argument(index + 1), root)
+        test.check(index + 1 < processInfo.argumentCount(), "option needs a value: " + option)
+        let value = support.absolute(processInfo.argument(index + 1), root)
         if option == "--runner" { options.runner = value }
         if option == "--compiler" { options.compiler = value }
         if option == "--runtime-source" { options.runtimeSource = value }
@@ -158,7 +160,7 @@ if selected(selectors, family, "test_normal_return_leak_is_rejected") {
     let copied = options.evidence + "/inputs/leaked-runtime"
     support.makeDirectories(copied)
     test.require(test.run(["sh", "-c", "cp -R -- \"$1\"/. \"$2\"", "minyar", support.parent(options.runtimeSource), copied], system.environment(), "", work + "/copy-runtime", 60), "copy runtime for leak mutant")
-    writeTextFile(copied + "/minyar_runtime.c", readTextFile(copied + "/minyar_runtime.c") + "\n/* Harness mutant: a real allocated object with no owner and no release. */\n#ifndef MINYAR_COMPILER_ARENA\nstatic void *volatile memory_contract_orphan;\n__attribute__((constructor)) static void memory_contract_leak(void) {\n    memory_contract_orphan = rc_allocate_object(64, RC_TEXT);\n}\n#endif\n")
+    io.writeTextFile(copied + "/minyar_runtime.c", io.readTextFile(copied + "/minyar_runtime.c") + "\n/* Harness mutant: a real allocated object with no owner and no release. */\n#ifndef MINYAR_COMPILER_ARENA\nstatic void *volatile memory_contract_orphan;\n__attribute__((constructor)) static void memory_contract_leak(void) {\n    memory_contract_orphan = rc_allocate_object(64, RC_TEXT);\n}\n#endif\n")
     let contract = runContracts(options, "normal-return-leak", "", copied, 60)
     test.check(contract.status != 0, "An orphan allocation escaped the cleanup oracle")
     test.check(json.string(contract.data, "status") == "failed", "leak run was not marked failed")
@@ -204,7 +206,7 @@ if selected(selectors, family, "test_compiler_timeout_is_rejected_and_retained")
     print("test_compiler_timeout_is_rejected_and_retained ... ok")
 }
 let after = protectedState(options)
-writeTextFile(options.evidence + "/harness-results.json", support.object(["cases", "protected_before", "protected_after"], [support.array(options.outcomes), support.texts(before), support.texts(after)]) + "\n")
+io.writeTextFile(options.evidence + "/harness-results.json", support.object(["cases", "protected_before", "protected_after"], [support.array(options.outcomes), support.texts(before), support.texts(after)]) + "\n")
 let unchanged = before.length == after.length
 for position in 0..before.length { if before[position] != after[position] { unchanged = false } }
 test.check(unchanged, "Protected performance files changed during harness tests")

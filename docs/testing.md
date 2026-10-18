@@ -7,6 +7,27 @@ diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
 targets are recorded in the hardening review.
 
+`make check-nitpick-language` checks captured-binding assignment diagnostics,
+callback calls through fields, containers and returned expressions, callee
+lifetime during argument mutation, and literal-condition return analysis.
+It uses ordinary and module-state compilation at O0/O2 with ownership cleanup
+assertions; `check-nitpick-language-sanitize` adds ASan/UBSan.
+
+`make check-language-ergonomics` checks inferred Result constructors,
+expression propagation and error cleanup, no-value success, callable type and
+anonymous-function inference across module boundaries, immutable locals,
+explicit runtime globals, bitwise precedence, and UTF-8 conversion boundaries.
+It runs generated programs at O0/O2 with ownership assertions and verifies that
+Swift experiments cannot be selected as ordinary backends.
+`check-language-ergonomics-sanitize` adds ASan/UBSan to the language cases.
+
+`make check-thread-native-regions` runs Linux mapping, sharing, atomic access,
+ownership and rejection controls. Its real x86 guest test runs when `/dev/kvm`
+is accessible on x86-64; otherwise it reports the missing KVM coverage explicitly.
+Use `MINYAR_REQUIRE_KVM=1 make check-thread-native-regions` to require that coverage.
+The ASan/UBSan and TSan targets follow the same policy and verify that strict
+qualification rejects unavailable KVM. CI grants access to an existing KVM device.
+
 `make check-cold-bootstrap`, also in the portable gate, exercises the public
 incremental launcher from an empty build directory with default development
 limits, toolchain and project paths containing spaces, and explicit LTO flags.

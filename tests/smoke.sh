@@ -109,7 +109,7 @@ status=0
 pass
 
 # 8. Command-line arguments reach the program.
-"$compiler" "$project_dir/tests/runtime/text-and-files.min" "$build_dir/arguments.ll"
+"$compiler" "$project_dir/tests/runtime/text-and-files.min" "$build_dir/arguments.ll" --library "$project_dir/library"
 link "$build_dir/arguments.ll" "$build_dir/arguments"
 output=$("$build_dir/arguments" first "$project_dir/examples/hello.min" "$build_dir/written.txt" | tr '\n' ' ')
 [ "$output" = "6 M 42 3 first true " ] || fail "program arguments and file access" "got: $output"

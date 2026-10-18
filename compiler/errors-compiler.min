@@ -189,6 +189,7 @@ function emitResultValue(output: List<Text>, textState: List<Text>, state: List<
     let field = 2
     if success { tag = "1"; field = 1 }
     output.add("  call void @minyar_record_set(ptr " + value + ", i64 0, i64 " + tag + ")\n")
+    if payloadType[0] == 5 { return value }
     let slot = valueAsListSlot(output, textState, state, payload, payloadType[0])
     let setter = "minyar_record_set"
     if isReferenceType(payloadType[0]) {
@@ -211,10 +212,18 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
     let functionParameterTypes = context.functionParameterTypes
     let location = state[0]
     let name = tokenTexts[location]
-    let success = resultPrefix(name, "minyar_result_ok_")
+    let success = name == "Ok" || resultPrefix(name, "minyar_result_ok_")
     let start = 18
     if success { start = 17 }
-    let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, "minyar_result_type_" + name.slice(start, name.length), 2)
+    let record = -1
+    if name == "Ok" || name == "Err" {
+        if !resultTypeName(resultType[0], functionNames) {
+            fail(describeLocation(tokenLocation(tokenLines, location)) + ": " + name + " needs a contextual Result<T, E> type or explicit type arguments")
+        }
+        record = resultType[0] - 1000
+    } else {
+        record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, "minyar_result_type_" + name.slice(start, name.length), 2)
+    }
     if record < 0 { fail("missing Result type") }
     let offset = functionParameterOffset(functionParameterCounts, record)
     let field = 2
@@ -223,7 +232,10 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
     let payloadType: List<Integer> = [expected]
-    let payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+    let payload = ""
+    if expected != 5 {
+        payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+    }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
     if payloadType[0] != expected {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": result payload has the wrong type")
@@ -245,7 +257,7 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
     }
     state[0] = state[0] + 1
     let inputType: List<Integer> = [0]
-    let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    let input = parseUnary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
     if !resultTypeName(inputType[0], functionNames) {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": try needs a Result")
     }
@@ -274,6 +286,7 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
     output.add("\n" + okLabel + ":\n")
     textState[0] = okLabel
     setType(resultType, functionParameterTypes[first + 1])
+    if resultType[0] == 5 { return "" }
     return readRecordField(output, textState, state, input, 1, resultType[0])
 }
 
@@ -326,23 +339,29 @@ function compileResultMatch(context: CompilerContext, localNames: List<Text>, lo
         }
         state[0] = state[0] + 1
         expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
-        if tokenKinds[state[0]] != 1 { fail("expected a result payload binding") }
-        let binding = tokenTexts[state[0]]
-        state[0] = state[0] + 1
+        let type = functionParameterTypes[first + field]
+        let binding = ""
+        if type != 5 {
+            if tokenKinds[state[0]] != 1 { fail("expected a result payload binding") }
+            binding = tokenTexts[state[0]]
+            state[0] = state[0] + 1
+        }
         expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
         output.add("\n" + label + ":\n")
         textState[0] = label
         let scope = state[3]
-        let type = functionParameterTypes[first + field]
-        let payload = readRecordField(output, textState, state, input, field, type)
-        let id = nextLocal(state)
-        addLocal(localNames, localTypes, localIds, localLengths, state, binding, type, id)
-        let payloadType: List<Integer> = [type]
-        assignReference(output, state, id, payload, payloadType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-        storeLocal(output, id, type, payload)
+        let id = -1
+        if type != 5 {
+            let payload = readRecordField(output, textState, state, input, field, type)
+            id = nextLocal(state)
+            addLocal(localNames, localTypes, localIds, localLengths, state, binding, type, id)
+            let payloadType: List<Integer> = [type]
+            assignReference(output, state, id, payload, payloadType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+            storeLocal(output, id, type, payload)
+        }
         let returns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         if !returns {
-            rootLocal(output, state, id, "null", type)
+            if id >= 0 { rootLocal(output, state, id, "null", type) }
             output.add("  br label %" + endLabel + "\n")
             allReturn = false
         }

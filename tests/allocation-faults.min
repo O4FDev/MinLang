@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
@@ -89,7 +91,7 @@ function execute(campaign: Campaign, executable: Text, label: Text, env: List<Te
     for item in arguments { command.add(item) }
     let result = run(campaign, command, environment(env, ["MINYAR_ALLOCATION_REPORT"], [path]), label)
     test.check(files.pathSize(path) >= 0, "Missing allocation instrumentation: " + label + ": " + result.errorOutput)
-    return Execution { result: result; report: parse(readTextFile(path)) }
+    return Execution { result: result; report: parse(io.readTextFile(path)) }
 }
 function faulted(result: test.Result, report: Report): Boolean {
     return report.fired == 1 && result.status == 1 && result.errorOutput == OOM && report.fatalExit == 1
@@ -161,7 +163,7 @@ function byteSweep(campaign: Campaign, executable: Text, label: Text, env: List<
         } else {
             test.check(result.status == 0 && result.output == expected && result.errorOutput == "", label + " byte budget success failed\n" + result.errorOutput)
             test.check(report.raw == baseline.raw, "Byte-budget success changed allocation/free schedule")
-            if output != "" { test.check(readTextFile(output) == readTextFile(reference), "Byte budget changed emitted LLVM") }
+            if output != "" { test.check(io.readTextFile(output) == io.readTextFile(reference), "Byte budget changed emitted LLVM") }
             successes += 1
         }
     }
@@ -248,7 +250,7 @@ function ordinalSweep(campaign: Campaign, executable: Text, label: Text, env: Li
         let beyond = execute(campaign, executable, label + "-" + counters[index] + "-beyond", environment(env, [variables[index]], [Text(total + 1)]), arguments)
         test.check(beyond.result.status == 0 && beyond.result.output == expected && beyond.result.errorOutput == "", label + " beyond ordinal changed execution\n" + beyond.result.errorOutput)
         test.check(beyond.report.raw == baseline.raw, "Nondeterministic allocation path")
-        if output != "" { test.check(readTextFile(output) == readTextFile(reference), "Instrumented compiler changed emitted LLVM") }
+        if output != "" { test.check(io.readTextFile(output) == io.readTextFile(reference), "Instrumented compiler changed emitted LLVM") }
     }
 }
 
@@ -259,10 +261,10 @@ let scope = "runtime"
 let compilerIr = "build/compiler-stage2.ll"
 let output = "build/allocation-faults.json"
 let position = 0
-while position < argumentCount() {
-    test.check(position + 1 < argumentCount(), "option needs a value: " + argument(position))
-    let option = argument(position)
-    let value = argument(position + 1)
+while position < processInfo.argumentCount() {
+    test.check(position + 1 < processInfo.argumentCount(), "option needs a value: " + processInfo.argument(position))
+    let option = processInfo.argument(position)
+    let value = processInfo.argument(position + 1)
     if option == "--compiler" { compilerPath = value }
     else if option == "--clang" { clang = value }
     else if option == "--mode" { test.check(value == "native" || value == "sanitize" || value == "both", "invalid mode"); mode = value }
@@ -304,7 +306,7 @@ for selected in modes {
             test.check(observed.report.fatalExit == 1 && observed.report.fired == 0, observed.report.raw)
         }
         let compilerLlvm = campaign.work + "/compiler-" + selected + ".ll"
-        writeTextFile(compilerLlvm, instrumented(readTextFile(compilerIr), flags))
+        io.writeTextFile(compilerLlvm, instrumented(io.readTextFile(compilerIr), flags))
         compilerObject = campaign.work + "/compiler-" + selected + ".o"
         build(campaign, withFlags([clang, "-O2", "-g"], flags, ["-Wno-override-module", "-c", compilerLlvm, "-o", compilerObject]), "compiler-" + selected + "-object")
     }
@@ -324,7 +326,7 @@ for selected in modes {
             for entry in 0..compilerNames.length {
                 let label = "compiler-" + compilerNames[entry] + "-" + selected + "-" + profile + "-k" + Text(budget)
                 let path = campaign.work + "/" + label + ".min"
-                writeTextFile(path, compilerSources[entry])
+                io.writeTextFile(path, test.sourceModules(compilerSources[entry]))
                 let llvm = campaign.work + "/" + label + ".ll"
                 let reference = campaign.work + "/" + label + ".reference.ll"
                 let referenced = run(campaign, [campaign.compiler, path, reference], env, label + "-reference")
@@ -333,7 +335,7 @@ for selected in modes {
                 test.check(base.result.status == 0 && base.result.output == "" && base.result.errorOutput == "", "instrumented compiler failed\n" + base.result.errorOutput)
                 test.check(base.report.allocations > 0 && base.report.fired == 0 && base.report.fatalExit == 0, base.report.raw)
                 test.check(base.report.resizes == base.report.moved, base.report.raw)
-                test.check(readTextFile(llvm) == readTextFile(reference), "Instrumented compiler changed emitted LLVM")
+                test.check(io.readTextFile(llvm) == io.readTextFile(reference), "Instrumented compiler changed emitted LLVM")
                 let program = campaign.work + "/" + label + ".program"
                 build(campaign, [clang, "-O2", "-Wno-override-module", llvm, "build/minyar-runtime.o", "-o", program, "-lm"], label + "-program")
                 let executed = run(campaign, [program], env, label + "-execute")
@@ -352,9 +354,9 @@ for selected in modes {
             let path = campaign.work + "/" + label + ".min"
             let llvm = campaign.work + "/" + label + ".ll"
             let executable = campaign.work + "/" + label
-            writeTextFile(path, caseSources[entry])
+            io.writeTextFile(path, test.sourceModules(caseSources[entry]))
             build(campaign, [campaign.compiler, path, llvm], label + "-compile")
-            writeTextFile(llvm, instrumented(readTextFile(llvm), flags))
+            io.writeTextFile(llvm, instrumented(io.readTextFile(llvm), flags))
             build(campaign, withFlags([clang, "-O2", "-g"], flags, ["-Wno-override-module", llvm, runtime, "-o", executable, "-lm"]), label + "-link")
             let base = execute(campaign, executable, label + "-baseline", env, [])
             test.check(base.result.status == 0 && base.result.output == caseOutputs[entry] && base.result.errorOutput == "", label + " baseline failed\n" + base.result.output + base.result.errorOutput)
@@ -403,5 +405,5 @@ for index in 0..configurations.length {
 parts.add("]\n}\n")
 let parent = test.run(["sh", "-c", "mkdir -p -- \"$(dirname -- \"$1\")\"", "minyar", output], system.environment(), "", campaign.work + "/output-parent", 10)
 test.require(parent, "create output parent")
-writeTextFile(output, joinText(parts))
+io.writeTextFile(output, joinText(parts))
 test.removeTree(campaign.work)

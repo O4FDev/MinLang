@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../../tools/testing.min" as test
 use "system" as system
 use "files" as files
@@ -46,8 +48,8 @@ public record Options { measure: Boolean; samples: Integer; count: Integer; outp
 public function options(samples: Integer, count: Integer, study: Text): Options {
     let result = Options { measure: false; samples: samples; count: count; output: ""; cc: "clang"; cxx: "clang++"; linker: "ld.lld"; compiler: test.setting("MINYAR_TEST_COMPILER", "build/minyarc"); timeout: 240; prepareOnly: false; prepared: ""; samplesSet: false; countSet: false }
     let index = 0
-    while index < argumentCount() {
-        let option = argument(index)
+    while index < processInfo.argumentCount() {
+        let option = processInfo.argument(index)
         if option == "--help" || option == "-h" { print(study + " [--measure] [--samples N] [--count N] [--output PATH] [--cc PATH] [--cxx PATH] [--linker PATH] [--compiler PATH] [--timeout SECONDS] [--prepare-only | --run-prepared PATH]"); exit(0) }
         if option == "--measure" { result.measure = true }
         else if option == "--prepare-only" { result.prepareOnly = true }
@@ -55,7 +57,7 @@ public function options(samples: Integer, count: Integer, study: Text): Options 
             let name = option; let value = ""; let equals = -1; let raw = Bytes(option)
             for position in 0..raw.length { if raw[position] == 61 { equals = position; break } }
             if equals >= 0 { name = Text(raw.slice(0, equals)); value = Text(raw.slice(equals + 1, raw.length)) }
-            else { index += 1; test.check(index < argumentCount(), "missing value for " + option); value = argument(index) }
+            else { index += 1; test.check(index < processInfo.argumentCount(), "missing value for " + option); value = processInfo.argument(index) }
             if name == "--samples" { result.samples = Integer(value); result.samplesSet = true }
             else if name == "--count" { result.count = Integer(value); result.countSet = true }
             else if name == "--output" { result.output = value }
@@ -89,7 +91,7 @@ public function save(context: Context) {
     let destination = context.options.output
     if destination == "" { destination = context.work + "/results.json" }
     test.require(test.run(["mkdir", "-p", "--", parent(destination)], system.environment(), "", context.work + "/report-parent", 30), "study report directory")
-    writeTextFile(destination, json.pretty(context.report, "") + "\n")
+    io.writeTextFile(destination, json.pretty(context.report, "") + "\n")
 }
 public function expect(context: Context, condition: Boolean, message: Text) {
     if !condition {
@@ -101,7 +103,7 @@ public function invoke(context: Context, label: Text, command: List<Text>, envir
     let observation = object(["label", "argv", "returncode"], [text(label), strings(command), nullValue()])
     context.commands.add(observation)
     let result = test.run(command, environment, "", context.work + "/" + label + ".stdout", context.options.timeout)
-    writeTextFile(context.work + "/" + label + ".log", result.output + result.errorOutput)
+    io.writeTextFile(context.work + "/" + label + ".log", result.output + result.errorOutput)
     let timedOut = result.status == 124 || result.status == 137
     if timedOut { set(observation, "error", text("timeout")) } else { set(observation, "returncode", integer(result.status)) }
     if result.status != 0 {
@@ -122,7 +124,7 @@ public function begin(options: Options, study: Text, limitations: List<Text>): C
     let root = test.lines(query(temporary, "root", ["pwd", "-P"]))[0]
     if options.prepared != "" {
         let manifestPath = absolute(options.prepared, root)
-        let manifest = json.parse(readTextFile(manifestPath))
+        let manifest = json.parse(io.readTextFile(manifestPath))
         test.check(manifest.kind == json.OBJECT && json.string(manifest, "schema") == "minyar-native-study-v1" && json.string(manifest, "study") == study, "incompatible prepared study")
         let work = parent(manifestPath)
         let measure = json.member(manifest, "measure")
@@ -206,9 +208,9 @@ function stripAttributes(source: Text): Text {
 }
 function nameByte(byte: Integer): Boolean { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 }
 function normalize(context: Context, path: Text, expected: List<Text>) {
-    let before = readTextFile(path)
+    let before = io.readTextFile(path)
     let rawPath = Bytes(path); let beforePath = Text(rawPath.slice(0, rawPath.length - 3)) + ".before-normalization.ll"
-    writeTextFile(beforePath, before)
+    io.writeTextFile(beforePath, before)
     let raw = Bytes(stripAttributes(before)); let prefix = Bytes("@\"\\01"); let symbol = Bytes(".minyar.fn.")
     let cursor = 0; let position = 0; let pieces: List<Text> = []; let aliases: List<Text> = []; let replaced = 0
     while position < raw.length {
@@ -244,7 +246,7 @@ function normalize(context: Context, path: Text, expected: List<Text>) {
         }
     }
     for index in 0..expected.length { expect(context, seen[index] > 0, "missing expected native language symbol " + expected[index]) }
-    writeTextFile(path, normalized)
+    io.writeTextFile(path, normalized)
     let names = expected.sorted()
     context.normalizations.add(object(["before", "after", "before_sha256", "after_sha256", "alias_replacements", "alias_names", "method"], [text(beforePath), text(path), text(hash(context, beforePath)), text(hash(context, path)), integer(replaced), strings(names), text("Remove generic target attributes and canonicalize only C asm language aliases for LLVM LTO resolution.")]))
 }
@@ -261,7 +263,7 @@ public function prepare(context: Context, functions: List<Text>) {
     let options = context.options; let fixture = context.root + "/experiments/memory/" + context.study
     let ir = context.work + "/fixture.ll"
     build(context, "compile-fixture", [options.compiler, fixture + ".min", ir])
-    let source = readTextFile(ir)
+    let source = io.readTextFile(ir)
     if context.study == "checked-scalars" { set(context.report, "generated_llvm_sha256", text(hash(context, ir))) }
     for name in functions {
         if !(context.study == "critical-path" && options.measure && name == "criticalRecords") {
@@ -274,7 +276,7 @@ public function prepare(context: Context, functions: List<Text>) {
         let raw = Bytes(source); let marker = Bytes("@main("); let replacements = 0
         for index in 0..raw.length { if at(raw, marker, index) { replacements += 1 } }
         expect(context, replacements == 1, "critical fixture main rename must occur exactly once")
-        writeTextFile(ir, test.replace(source, "@main(", "@fixtureMain("))
+        io.writeTextFile(ir, test.replace(source, "@main(", "@fixtureMain("))
     }
     let configurations: List<Configuration> = []
     if options.measure {
@@ -290,7 +292,7 @@ public function prepare(context: Context, functions: List<Text>) {
         let flags = [configuration.optimization, "-Wno-override-module"]
         if ends(configuration.name, "sanitize") { for flag in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { flags.add(flag) } }
         let linkIR = ir
-        if ends(configuration.name, "sanitize") { linkIR = context.work + "/" + configuration.name + "-fixture.ll"; writeTextFile(linkIR, test.instrument(readTextFile(ir))) }
+        if ends(configuration.name, "sanitize") { linkIR = context.work + "/" + configuration.name + "-fixture.ll"; io.writeTextFile(linkIR, test.instrument(io.readTextFile(ir))) }
         let defines: List<Text> = []
         if configuration.bounded { defines.add("-DMINYAR_BOUNDED_HEAP=1") }
         if starts(configuration.name, "system") { defines.add("-DMINYAR_SYSTEM_HEAP=1") }
@@ -332,7 +334,7 @@ public function prepare(context: Context, functions: List<Text>) {
 public function finishPreparation(context: Context) {
     set(context.report, "status", text("prepared"))
     let manifest = object(["schema", "study", "measure", "samples", "count", "report", "executables", "binary_sha256", "fixture_sha256", "expected"], [text("minyar-native-study-v1"), text(context.study), boolean(context.options.measure), integer(context.options.samples), integer(context.options.count), context.report, context.executables, context.hashes, text(hash(context, context.work + "/fixture.ll")), context.expected])
-    writeTextFile(context.work + "/prepared.json", json.pretty(manifest, "") + "\n")
+    io.writeTextFile(context.work + "/prepared.json", json.pretty(manifest, "") + "\n")
     save(context); print(context.work + "/prepared.json")
 }
 public function observe(context: Context, name: Text, kind: Text, language: Text, count: Integer, seed: Integer, index: Integer): json.Value {

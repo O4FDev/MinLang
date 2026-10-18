@@ -77,9 +77,12 @@ with allocation size; never-allocated virtual holes are not all poisoned.
 
 ## What happens to a released value
 
-The compiler inserts ownership operations automatically. Immutable record
-fields and restrictions on recursive List mutation prevent ownership cycles.
-The runtime uses no tracing, background collector, or user finalizers. Its
+The compiler inserts ownership operations automatically and keeps ordinary
+allocation acyclic. Cycle-capable record/List components
+instead use the automatically selected traced runtime described in
+[runtime ownership](runtime-memory.md#closures-cycles-and-execution-domains).
+Cleanup runs on the owning thread, without background collection or user
+finalizers. Its
 reference counts are single-threaded: managed objects cannot be shared across
 native threads through this ownership mechanism.
 

@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./release-support.min" as support
 use "./toolchain-files.min" as tf
@@ -11,9 +13,9 @@ record Job { handle: Integer; log: Text; finished: Boolean; status: system.Proce
 record AppCase { label: Text; libraries: List<Text>; marker: Text; managed: Boolean }
 
 function chosen(name: Text): Boolean {
-    if argumentCount() == 0 { return true }
-    for index in 0..argumentCount() {
-        if argument(index) == name || argument(index) == "ToolchainPortability." + name || argument(index) == "ToolchainPortability" { return true }
+    if processInfo.argumentCount() == 0 { return true }
+    for index in 0..processInfo.argumentCount() {
+        if processInfo.argument(index) == name || processInfo.argument(index) == "ToolchainPortability." + name || processInfo.argument(index) == "ToolchainPortability" { return true }
     }
     return false
 }
@@ -53,7 +55,7 @@ function setUp(root: Text, scratch: Text, serial: Integer, logs: tf.Logs): Fixtu
     copyFile(root + "/minyar", project + "/minyar", logs)
     copyTree(root + "/runtime", project + "/runtime", logs)
     copyTree(root + "/tools", project + "/tools", logs)
-    writeTextFile(project + "/Makefile", ".PHONY: build/minyarc build/tooling/tools/clang-driver\nbuild/minyarc build/tooling/tools/clang-driver:\n\t@:\n")
+    io.writeTextFile(project + "/Makefile", ".PHONY: build/minyarc build/tooling/tools/clang-driver\nbuild/minyarc build/tooling/tools/clang-driver:\n\t@:\n")
     tf.directories(build + "/tooling/tools", logs)
     copyFile(root + "/build/tooling/tools/clang-driver", build + "/tooling/tools/clang-driver", logs)
     tf.executable(build + "/minyarc", "if [ -n \"${TEST_GRAPHICS-}\" ]; then printf '; minyar-native-library: graphics\\n' > \"$2\"; else printf '; test IR\\n' > \"$2\"; fi\n", logs)
@@ -72,7 +74,7 @@ function setUp(root: Text, scratch: Text, serial: Integer, logs: tf.Logs): Fixtu
         source: work + "/source file.min"; output: work + "/output program"; env: environment; logs: logs }
     writeClang(f, defaultClang())
     tf.executable(work + "/ld.lld", "printf '%s\\n' 'LLD 23.1.2'\n", logs)
-    writeTextFile(f.source, "print(42)\n")
+    io.writeTextFile(f.source, "print(42)\n")
     return f
 }
 function run(f: Fixture, command: List<Text>, environment: List<Text>, seconds: Integer): test.Result {
@@ -84,7 +86,7 @@ function minyar(f: Fixture, arguments: List<Text>): List<Text> {
     return command
 }
 function launch(f: Fixture, extras: List<Text>): List<List<Text>> {
-    writeTextFile(f.log, "")
+    io.writeTextFile(f.log, "")
     let result = run(f, minyar(f, [f.source, "-o", f.output]), support.merge(f.env, extras), 30)
     test.check(result.status == 0, "launch failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
     return tf.calls(f.log)
@@ -147,7 +149,7 @@ function bootstrap(f: Fixture, environment: List<Text>, targets: List<Text>): Ca
         test.check(!support.exists(log), "rejected bootstrap configuration must not run make")
         return Call { failed: true; errorOutput: result.errorOutput; argv: []; env: [] }
     }
-    let raw = readBytesFile(log)
+    let raw = io.readBytesFile(log)
     let argv: List<Text> = []
     let entries: List<Text> = []
     let start = 0
@@ -219,12 +221,72 @@ function concurrentColdLaunches(f: Fixture) {
         test.check(result.status == 0, "concurrent cold launch failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
     }
 }
+function cachedClangDiscovery(f: Fixture) {
+    let home = f.work + "/home with spaces"
+    let cached = home + "/.cache/minyar/toolchains/llvm-23.1.2/bin/clang"
+    tf.directories(home + "/.cache/minyar/toolchains/llvm-23.1.2/bin", f.logs)
+    tf.executable(cached, fixedVersion(), f.logs)
+    let environment = support.merge(tf.without(f.env, ["CC", "LLVM_CC", "MINYAR_CLANG"]), ["HOME=" + home])
+    let commands = [["sh", f.root + "/tools/toolchain.sh", "toolchain"], [f.root + "/build/tooling/tools/clang-driver", "toolchain"]]
+    for command in commands {
+        let found = tf.run(f.logs, command, environment, f.root, 10)
+        test.require(found, "cached LLVM discovery")
+        test.check(support.resolve(test.lines(found.output)[0], tf.next(f.logs)) == support.resolve(cached, tf.next(f.logs)), "cached LLVM path with spaces")
+        for key in ["LLVM_CC", "MINYAR_CLANG"] {
+            let explicit = tf.run(f.logs, command, support.merge(environment, [key + "=" + f.clang]), f.root, 10)
+            test.require(explicit, "explicit compiler overrides cache")
+            test.check(support.resolve(test.lines(explicit.output)[0], tf.next(f.logs)) == support.resolve(f.clang, tf.next(f.logs)), "explicit " + key + " takes precedence")
+        }
+        let missing = tf.run(f.logs, command, support.merge(environment, ["MINYAR_CLANG=" + home + "/missing"]), f.root, 10)
+        test.check(missing.status != 0, "invalid explicit compiler must not fall back to cache")
+    }
+    let probe = f.work + "/discovery.mk"
+    io.writeTextFile(probe, "print-minyar-clang:\n\t@printf '%s\\n' '$(LLVM_CC)'\n")
+    let make = tf.run(f.logs, ["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", probe, "print-minyar-clang"], environment, f.root, 10)
+    test.require(make, "Make discovers cached LLVM")
+    test.check(test.lines(make.output)[0] == cached, "Make uses the same cached compiler")
+    for platform in ["Darwin", "Linux"] {
+        let name = "clang-23"
+        if platform == "Darwin" { name = "clang" }
+        let fallback = f.bin + "/" + name
+        tf.executable(fallback, fixedVersion(), f.logs)
+        let withoutCache = support.merge(environment, ["HOME=" + home + "/empty", "MINYAR_TEST_HOST_SYSTEM=" + platform])
+        for command in commands {
+            let result = tf.run(f.logs, command, withoutCache, f.root, 10)
+            test.require(result, "uncached platform fallback")
+            test.check(support.resolve(test.lines(result.output)[0], tf.next(f.logs)) == support.resolve(fallback, tf.next(f.logs)), "uncached " + platform + " fallback is preserved")
+        }
+    }
+    tf.executable(cached, "printf '%s\\n' 'clang version 22.1.5'\n", f.logs)
+    for command in commands {
+        let rejected = tf.run(f.logs, command, environment, f.root, 10)
+        test.check(rejected.status != 0 && test.contains(rejected.errorOutput, "unsupported compiler"), "cached compiler still requires the pinned version")
+    }
+}
+function sdkDiscovery(f: Fixture) {
+    let sdk = f.work + "/Xcode SDK with spaces"
+    tf.executable(f.bin + "/xcrun", "printf '%s\\n' " + support.shellQuote(sdk) + "\n", f.logs)
+    let environment = support.merge(tf.without(f.env, ["SDKROOT"]), ["MINYAR_TEST_HOST_SYSTEM=Darwin"])
+    let found = tf.run(f.logs, ["sh", f.root + "/tools/toolchain.sh", "sdkroot"], environment, f.root, 10)
+    test.require(found, "Xcode SDK discovery")
+    test.check(test.lines(found.output)[0] == sdk, "SDK path retains spaces")
+    let explicit = tf.run(f.logs, ["sh", f.root + "/tools/toolchain.sh", "sdkroot"], support.merge(environment, ["SDKROOT=explicit SDK"]), f.root, 10)
+    test.require(explicit, "explicit SDK")
+    test.check(test.lines(explicit.output)[0] == "explicit SDK", "explicit SDKROOT takes precedence")
+    let empty = tf.run(f.logs, ["sh", f.root + "/tools/toolchain.sh", "sdkroot"], support.merge(environment, ["SDKROOT="]), f.root, 10)
+    test.check(empty.status == 0 && empty.output == "\n", "explicit empty SDKROOT is preserved")
+    let log = f.work + "/sdk-environment"
+    tf.executable(f.bin + "/make", "printf '%s\\n' \"$SDKROOT\" > " + support.shellQuote(log) + "\n", f.logs)
+    let bootstrap = tf.run(f.logs, ["sh", f.root + "/tools/toolchain.sh", "bootstrap", f.project, "build/minyarc"], environment, f.root, 10)
+    test.require(bootstrap, "bootstrap exports Xcode SDK")
+    test.check(io.readTextFile(log) == sdk + "\n", "SDK reaches bootstrap children")
+}
 function selectedClangBootstrapsBoth(f: Fixture) {
     f.env = tf.without(f.env, ["CC"])
     tf.executable(f.bin + "/make", "{ for name in CC LLVM_CC; do eval \"present=\\${$name+x}\"; if [ \"$present\" = x ]; then eval \"value=\\$$name\"; printf '%s=%s\\n' \"$name\" \"$value\"; else printf '%s\\n' \"$name\"; fi; done; } > \"$TEST_MAKE_LOG\"\n", f.logs)
     let log = f.work + "/make environment.log"
     launch(f, ["TEST_MAKE_LOG=" + log])
-    let selected = test.lines(readTextFile(log))
+    let selected = test.lines(io.readTextFile(log))
     test.check(tf.equal(selected, ["CC=" + f.clang, "LLVM_CC=" + f.clang]), "bootstrap must select Clang for CC and LLVM_CC: " + tf.show(selected))
 }
 function linuxBootstrapBoundsThreads(f: Fixture) {
@@ -261,25 +323,25 @@ function assumeOldKeepsCompiler(f: Fixture) {
     let compiler = f.project + "/build/compiler-stage2.ll"
     let runtime = f.project + "/build/runtime.o"
     let header = f.project + "/current-runtime.h"
-    writeTextFile(compiler, "verified compiler bytes\n")
-    writeTextFile(f.project + "/current.min", "newer prerequisite\n")
+    io.writeTextFile(compiler, "verified compiler bytes\n")
+    io.writeTextFile(f.project + "/current.min", test.sourceModules("newer prerequisite\n"))
     tf.setModified(compiler, 1000000000)
-    writeTextFile(f.project + "/Makefile", ".PHONY: check\ncheck: build/compiler-stage2.ll build/runtime.o\nbuild/compiler-stage2.ll: current.min\n\tfalse\nbuild/runtime.o: current-runtime.h\n\tcp $< $@\n")
+    io.writeTextFile(f.project + "/Makefile", ".PHONY: check\ncheck: build/compiler-stage2.ll build/runtime.o\nbuild/compiler-stage2.ll: current.min\n\tfalse\nbuild/runtime.o: current-runtime.h\n\tcp $< $@\n")
     for value in ["first current runtime\n", "second current runtime\n"] {
-        writeTextFile(header, value)
+        io.writeTextFile(header, value)
         if support.exists(runtime) { tf.setModified(runtime, 1000000000) }
         let result = run(f, ["sh", f.project + "/tools/toolchain.sh", "bootstrap", f.project, "check"],
             support.merge(f.env, ["MINYAR_MAKE_FLAGS=-j4 -o build/compiler-stage2.ll"]), 30)
         test.check(result.status == 0, "assume-old bootstrap failed (" + Text(result.status) + ")\n" + result.errorOutput)
-        test.check(readTextFile(compiler) == "verified compiler bytes\n", "assume-old must keep the verified compiler")
-        test.check(readTextFile(runtime) == value, "the current runtime must be rebuilt")
+        test.check(io.readTextFile(compiler) == "verified compiler bytes\n", "assume-old must keep the verified compiler")
+        test.check(io.readTextFile(runtime) == value, "the current runtime must be rebuilt")
     }
 }
 function windowsReleaseDiscoversLinker(f: Fixture) {
     let linker = f.work + "/ld.lld.exe"
     tf.executable(linker, ":\n", f.logs)
     let llvm = f.work + "/release.ll"
-    writeTextFile(llvm, "; no native package\n")
+    io.writeTextFile(llvm, "; no native package\n")
     let resolved = support.resolve(linker, tf.next(f.logs))
     let flagCases = ["", "-fuse-ld=/chosen/linker", "--ld-path=/chosen/linker"]
     let expectations: List<List<Text>> = [["-flto=thin", "-fuse-ld=lld", "--ld-path=" + resolved], ["-flto=thin"], ["-flto=thin"]]
@@ -288,7 +350,7 @@ function windowsReleaseDiscoversLinker(f: Fixture) {
             let flags = flagCases[index]
             let expected = expectations[index]
             let label = host + " flags=" + flags
-            writeTextFile(f.log, "")
+            io.writeTextFile(f.log, "")
             let environment = ["MINYAR_TEST_HOST_SYSTEM=" + host]
             if flags != "" { environment.add("MINYAR_CLANG_FLAGS=" + flags) }
             let result = driverLink(f, llvm, f.work + "/runtime.o", environment, "1", f.clang)
@@ -360,39 +422,39 @@ function outputAliases(f: Fixture) {
         if run(f, command, system.environment(), 10).status != 0 { continue }
         if identity != "" && tf.identity(alias) == identity { aliases.add(alias) }
     }
-    let original = readBytesFile(f.source)
+    let original = io.readBytesFile(f.source)
     for alias in aliases {
         let result = run(f, minyar(f, [f.source, "-o", alias]), f.env, 10)
         test.check(result.status == 1, alias + ": aliased output must fail with status 1, saw " + Text(result.status) + "\n" + result.errorOutput)
         test.check(test.contains(result.errorOutput, "replace the source file"), alias + ": alias diagnostic\n" + result.errorOutput)
-        test.check(support.same(readBytesFile(f.source), original), alias + ": the source must be unchanged")
+        test.check(support.same(io.readBytesFile(f.source), original), alias + ": the source must be unchanged")
         test.check(!support.exists(f.log), "source/output collision must be rejected before Clang")
     }
 }
 function failedLinkPreserves(f: Fixture) {
     let previous = "previous complete executable\n"
-    writeTextFile(f.output, previous)
+    io.writeTextFile(f.output, previous)
     writeClang(f, fixedVersion() + tf.outputArgument() + "printf '%s' 'partial output' > \"$target\"\n" + tf.flagged("object", "-c|-emit-llvm") +
         "if [ \"$object\" = 1 ]; then exit 0; fi\nexit 37\n")
     let result = run(f, minyar(f, [f.source, "-o", f.output]), f.env, 10)
     test.check(result.status == 37, "a failed link must report the linker status, saw " + Text(result.status) + "\n" + result.errorOutput)
-    test.check(readTextFile(f.output) == previous, "a failed link must preserve the previous executable")
+    test.check(io.readTextFile(f.output) == previous, "a failed link must preserve the previous executable")
     test.check(staging(f).length == 0, "failed link staging must be removed")
 }
 function implicitExe(f: Fixture) {
     let source = f.work + "/input.exe"
-    writeTextFile(source, "print(42)\n")
+    io.writeTextFile(source, "print(42)\n")
     let destination = f.work + "/input"
     writeClang(f, fixedVersion() + tf.outputArgument() + tf.flagged("object", "-c|-emit-llvm") +
         "if [ \"$object\" = 0 ]; then target=\"$target.exe\"; fi\nprintf '%s' 'compiled output' > \"$target\"\n")
     let result = run(f, minyar(f, [source, "-o", destination]), f.env, 10)
     test.check(result.status == 1, "an implicit .exe must not replace the source, saw " + Text(result.status) + "\n" + result.errorOutput)
     test.check(test.contains(result.errorOutput, "replace the source file"), "implicit .exe diagnostic\n" + result.errorOutput)
-    test.check(readTextFile(source) == "print(42)\n", "the .exe source must be unchanged")
+    test.check(io.readTextFile(source) == "print(42)\n", "the .exe source must be unchanged")
     test.check(staging(f).length == 0, "implicit .exe staging must be removed")
 }
 function successfulLinkPublishes(f: Fixture) {
-    writeTextFile(f.output, "previous executable")
+    io.writeTextFile(f.output, "previous executable")
     let ready = f.work + "/link ready"
     let proceed = f.work + "/link continue"
     writeClang(f, fixedVersion() + tf.outputArgument() + tf.flagged("object", "-c|-emit-llvm") +
@@ -407,13 +469,13 @@ function successfulLinkPublishes(f: Fixture) {
     let deadline = system.monotonicNanoseconds() + 15000000000
     while !support.exists(ready) && alive(job) && system.monotonicNanoseconds() < deadline { tf.pause(10) }
     let reached = support.exists(ready)
-    let before = readTextFile(f.output)
-    writeTextFile(proceed, "")
+    let before = io.readTextFile(f.output)
+    io.writeTextFile(proceed, "")
     let result = settle(job)
     test.check(reached, "linker must reach its publication barrier\n" + result.errorOutput)
     test.check(before == "previous executable", "an incomplete link must not replace the previous executable: " + before)
     test.check(result.status == 0, "publication launch failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
-    test.check(readTextFile(f.output) == "complete executable", "only the complete executable may be published")
+    test.check(io.readTextFile(f.output) == "complete executable", "only the complete executable may be published")
     test.check(staging(f).length == 0, "successful link staging must be removed")
 }
 function doctorMissingClang(f: Fixture) {
@@ -437,11 +499,11 @@ function optimizationDefaults(f: Fixture) {
 }
 function checkModeDoesNotLink(f: Fixture) {
     let destination = f.work + "/source file"
-    writeTextFile(destination, "previous executable")
+    io.writeTextFile(destination, "previous executable")
     let result = run(f, minyar(f, ["--check", f.source]), f.env, 10)
     test.check(result.status == 0, "--check failed\n" + result.errorOutput)
     test.check(test.contains(result.output, "checked "), "--check output\n" + result.output)
-    test.check(readTextFile(destination) == "previous executable", "--check must not replace a program")
+    test.check(io.readTextFile(destination) == "previous executable", "--check must not replace a program")
     test.check(!support.exists(f.log), "language checking must not compile/link native artifacts")
     test.check(tf.listing(f.project + "/build/programs").length == 0, "--check must not leave invocation directories")
 }
@@ -460,13 +522,13 @@ function checkModeRejectsOptions(f: Fixture) {
 }
 function unixLinksMath(f: Fixture) {
     let llvm = f.work + "/program.ll"
-    writeTextFile(llvm, "; no native package\n")
+    io.writeTextFile(llvm, "; no native package\n")
     writeClang(f, fixedVersion() + tf.argumentLogger("TEST_CLANG_LOG") + tf.outputArgument() + "printf '%s' 'complete executable' > \"$target\"\n")
-    writeTextFile(f.log, "")
+    io.writeTextFile(f.log, "")
     let result = driverLink(f, llvm, f.work + "/runtime.o", ["MINYAR_TEST_HOST_SYSTEM=Linux"], "0", f.clang)
     test.check(result.status == 0, "Linux link failed\n" + result.errorOutput)
     test.check(support.has(last(tf.calls(f.log)), "-lm"), "Unix links must include -lm")
-    test.check(readTextFile(f.output) == "complete executable", "Linux link output")
+    test.check(io.readTextFile(f.output) == "complete executable", "Linux link output")
 }
 function variant(labels: List<Text>, values: List<Text>, label: Text): Text {
     for index in 0..labels.length { if labels[index] == label { return values[index] } }
@@ -492,8 +554,8 @@ function appkitCleanup(f: Fixture) {
     for item in cases {
         let content = [item.marker]
         for name in item.libraries { content.add("; minyar-native-library: " + name + "\n") }
-        writeTextFile(llvm, joinText(content))
-        writeTextFile(f.log, "")
+        io.writeTextFile(llvm, joinText(content))
+        io.writeTextFile(f.log, "")
         let result = driverLink(f, llvm, runtime, environment, "0", f.clang)
         test.check(result.status == 0, item.label + ": AppKit link failed\n" + result.errorOutput)
         let calls = tf.calls(f.log)
@@ -528,7 +590,7 @@ function appkitCleanup(f: Fixture) {
     test.check(variant(labels, variants, "ordinary") == variant(labels, variants, "ordinary-warm"), "ordinary AppKit object is reused")
 }
 function quotedFlagsLiteral(f: Fixture) {
-    writeTextFile(f.work + "/expansion-must-not-happen", "")
+    io.writeTextFile(f.work + "/expansion-must-not-happen", "")
     let flags = "-O1 " + support.shellQuote("-DNAME=two words") + " expansion-* " + support.shellQuote("$(touch injected)")
     let args = last(launch(f, ["MINYAR_CLANG_FLAGS=" + flags]))
     for expected in ["-DNAME=two words", "expansion-*", "$(touch injected)"] {
@@ -565,7 +627,7 @@ function graphicsHeaderContents(f: Fixture) {
     let base = ["TEST_GRAPHICS=1"]
     launch(f, base)
     let header = f.project + "/runtime/minyar_native.h"
-    writeTextFile(header, readTextFile(header) + "\n/* changed dependency */\n")
+    io.writeTextFile(header, io.readTextFile(header) + "\n/* changed dependency */\n")
     tf.setModified(header, 1000000000)
     test.check(nativeCalls(launch(f, base)).length == 1, "a changed header with an old timestamp must recompile graphics")
 }
@@ -578,7 +640,7 @@ function executeOnlyClang(f: Fixture) {
     if selected == "" { selected = support.which("cc", tf.next(f.logs)) }
     test.check(selected != "", "a C compiler is required for the execute-only Clang fixture")
     let source = f.work + "/execute-only-clang.c"
-    writeTextFile(source, "#include <stdio.h>\n#include <string.h>\nint main(int count, char **arguments) {\n    for (int index = 1; index < count; index++) {\n" +
+    io.writeTextFile(source, "#include <stdio.h>\n#include <string.h>\nint main(int count, char **arguments) {\n    for (int index = 1; index < count; index++) {\n" +
         "        if (!strcmp(arguments[index], \"--version\")) { puts(\"clang version 23.1.2\"); return 0; }\n    }\n" +
         "    for (int index = 1; index + 1 < count; index++) {\n        if (!strcmp(arguments[index], \"-o\")) {\n" +
         "            FILE *output = fopen(arguments[index + 1], \"w\");\n            if (!output) return 1;\n            fputs(\"; output\\n\", output);\n" +
@@ -588,7 +650,7 @@ function executeOnlyClang(f: Fixture) {
     test.check(built.status == 0, "execute-only Clang fixture failed to build\n" + built.errorOutput)
     test.require(run(f, ["chmod", "111", compiler], system.environment(), 10), "execute-only mode")
     let llvm = f.work + "/graphics.ll"
-    writeTextFile(llvm, "; minyar-native-library: graphics\n")
+    io.writeTextFile(llvm, "; minyar-native-library: graphics\n")
     let result = driverLink(f, llvm, f.work + "/runtime.o", ["MINYAR_TEST_HOST_SYSTEM=Linux"], "0", compiler)
     test.require(run(f, ["chmod", "755", compiler], system.environment(), 10), "restore readable fixture mode")
     test.check(result.status == 0, "execute-only Clang link failed\n" + result.errorOutput)
@@ -602,7 +664,7 @@ function compilerReplacementPreservedMtime(f: Fixture) {
     let accessTime = tf.atime(f.clang)
     let modifyTime = tf.mtime(f.clang)
     let size = files.pathSize(f.clang)
-    writeTextFile(f.clang, test.replace(readTextFile(f.clang), "output", "result"))
+    io.writeTextFile(f.clang, test.replace(io.readTextFile(f.clang), "output", "result"))
     tf.stamp(f.clang, accessTime, modifyTime)
     test.check(files.pathSize(f.clang) == size, "the replacement compiler must keep its size")
     test.check(nativeCalls(launch(f, base)).length == 1, "a replaced compiler with a preserved mtime must recompile graphics")
@@ -630,7 +692,7 @@ function selectBlocks(workflow: Text): List<Text> {
     return blocks
 }
 function macosCiRelease(f: Fixture) {
-    let workflow = readTextFile(f.root + "/.github/workflows/ci.yml")
+    let workflow = io.readTextFile(f.root + "/.github/workflows/ci.yml")
     let blocks = selectBlocks(workflow)
     test.check(blocks.length == 7, "expected seven pinned LLVM selection steps, saw " + Text(blocks.length))
     for block in blocks { test.check(block == blocks[0], "pinned LLVM selection steps must be identical") }
@@ -644,7 +706,7 @@ function macosCiRelease(f: Fixture) {
     tf.executable(stage + "/LLVM-23.1.2-macOS-ARM64/bin/clang", "printf \"%s\\n\" \"clang version 23.1.2\"\n", f.logs)
     let archive = f.work + "/fixture.tar.xz"
     test.require(run(f, ["tar", "-cJf", archive, "-C", stage, "LLVM-23.1.2-macOS-ARM64/bin/clang"], system.environment(), 60), "create the LLVM archive fixture")
-    let archived = readBytesFile(archive)
+    let archived = io.readBytesFile(archive)
     let digest = sha256.hex(sha256.digest(archived))
     let script: List<Text> = []
     for line in test.lines(blocks[0]) { script.add(Text(Bytes(line).slice(10, Bytes(line).length)) + "\n") }
@@ -659,7 +721,7 @@ function macosCiRelease(f: Fixture) {
         let data = Bytes()
         data.addBytes(archived)
         if mode == "corrupt" { data.addBytes(Bytes("changed")) }
-        writeBytesFile(fixture, data)
+        io.writeBytesFile(fixture, data)
         let architecture = "arm64"
         if mode == "wrong-architecture" { architecture = "x86_64" }
         let environment = support.merge(system.environment(), ["PATH=" + f.bin + ":" + system.getenv("PATH"), "RUNNER_TEMP=" + directory,
@@ -670,11 +732,11 @@ function macosCiRelease(f: Fixture) {
             test.check(result.status == 0, "valid LLVM installation failed (" + Text(result.status) + ")\n" + result.errorOutput)
             let printed = test.lines(result.output)
             test.check(printed.length > 0 && printed[printed.length - 1] == selected, "installation must print the selected Clang\n" + result.output)
-            test.check(readTextFile(directory + "/path") == directory + "/minyar-llvm-23.1.2/bin\n", "GITHUB_PATH must hold the private LLVM bin directory")
+            test.check(io.readTextFile(directory + "/path") == directory + "/minyar-llvm-23.1.2/bin\n", "GITHUB_PATH must hold the private LLVM bin directory")
             let expected: List<Text> = []
             for name in ["CC", "LLVM_CC", "MINYAR_CLANG", "MINYAR_TEST_CLANG"] { expected.add(name + "=" + selected) }
             expected.add("SDKROOT=" + directory + "/sdk")
-            let exported = test.lines(readTextFile(directory + "/env"))
+            let exported = test.lines(io.readTextFile(directory + "/env"))
             test.check(tf.equal(exported, expected), "GITHUB_ENV " + tf.show(exported) + " expected " + tf.show(expected))
         } else {
             test.check(result.status != 0, mode + ": installation must fail")
@@ -683,7 +745,7 @@ function macosCiRelease(f: Fixture) {
     }
 }
 
-let names = ["test_concurrent_cold_launches_share_a_complete_bootstrap", "test_selected_clang_bootstraps_both_c_and_llvm",
+let names = ["test_xcode_sdk_discovery_preserves_explicit_overrides", "test_cached_llvm_discovery_preserves_overrides_and_version_checks", "test_concurrent_cold_launches_share_a_complete_bootstrap", "test_selected_clang_bootstraps_both_c_and_llvm",
     "test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths", "test_linux_bootstrap_rejects_old_or_missing_matching_linker",
     "test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged", "test_bootstrap_rejects_malformed_make_options_before_make",
     "test_bootstrap_assume_old_keeps_compiler_and_rebuilds_current_runtime", "test_windows_release_discovers_native_lld_exe_without_changing_explicit_linker",
@@ -698,10 +760,10 @@ let names = ["test_concurrent_cold_launches_share_a_complete_bootstrap", "test_s
     "test_graphics_preserves_project_and_dependency_paths", "test_graphics_cache_tracks_flags_and_compiler_version",
     "test_graphics_cache_tracks_header_contents_even_with_old_timestamp", "test_graphics_cache_does_not_read_entire_compiler",
     "test_graphics_cache_tracks_compiler_replacement_with_preserved_mtime", "test_macos_ci_release_installation_is_private_verified_and_strict"]
-for index in 0..argumentCount() {
-    let valid = argument(index) == "ToolchainPortability"
-    for name in names { if argument(index) == name || argument(index) == "ToolchainPortability." + name { valid = true } }
-    test.check(valid, "unknown toolchain portability case " + argument(index))
+for index in 0..processInfo.argumentCount() {
+    let valid = processInfo.argument(index) == "ToolchainPortability"
+    for name in names { if processInfo.argument(index) == name || processInfo.argument(index) == "ToolchainPortability." + name { valid = true } }
+    test.check(valid, "unknown toolchain portability case " + processInfo.argument(index))
 }
 let scratch = test.scratch()
 let logs = tf.logs(scratch + "/logs")
@@ -710,7 +772,9 @@ let cases = 0
 for name in names {
     if !chosen(name) { continue }
     let f = setUp(root, scratch, cases + 1, logs)
-    if name == "test_concurrent_cold_launches_share_a_complete_bootstrap" { concurrentColdLaunches(f) }
+    if name == "test_xcode_sdk_discovery_preserves_explicit_overrides" { sdkDiscovery(f) }
+    else if name == "test_cached_llvm_discovery_preserves_overrides_and_version_checks" { cachedClangDiscovery(f) }
+    else if name == "test_concurrent_cold_launches_share_a_complete_bootstrap" { concurrentColdLaunches(f) }
     else if name == "test_selected_clang_bootstraps_both_c_and_llvm" { selectedClangBootstrapsBoth(f) }
     else if name == "test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths" { linuxBootstrapBoundsThreads(f) }
     else if name == "test_linux_bootstrap_rejects_old_or_missing_matching_linker" { linuxBootstrapRejectsLinker(f) }

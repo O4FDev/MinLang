@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../../tools/testing.min" as test
 use "../../scripts/native-host.min" as host
 use "system" as system
@@ -62,11 +64,11 @@ function main(): Integer {
     let compilerPath = ""
     let selected: List<Text> = []
     let index = 0
-    while index < argumentCount() {
-        let item = argument(index)
+    while index < processInfo.argumentCount() {
+        let item = processInfo.argument(index)
         if item == "--compiler" {
-            if index + 1 >= argumentCount() { return usage("argument --compiler: expected one argument") }
-            compilerPath = argument(index + 1)
+            if index + 1 >= processInfo.argumentCount() { return usage("argument --compiler: expected one argument") }
+            compilerPath = processInfo.argument(index + 1)
             index += 1
         } else if host.starts(item, "--compiler=") { compilerPath = host.cut(item, 11, host.size(item)) }
         else { selected.add(item) }
@@ -76,15 +78,15 @@ function main(): Integer {
     let compiler = host.absolute(compilerPath)
     if host.systemName() != "linux" || !host.isFile(compiler) { return usage("run on Linux with a built native Minyar compiler") }
     let root = host.currentDirectory()
-    let suite = Suite { root: root; compiler: compiler; launcher: [root + "/minyar", "--backend", "native", "--compiler", compiler]; selected: selected; serial: 0; path: "" }
+    let suite = Suite { root: root; compiler: compiler; launcher: [root + "/minyar", "--experimental-swift", "--compiler", compiler]; selected: selected; serial: 0; path: "" }
 
     if begin(suite, "test_c_sdk_layout_and_signal_callback") {
         let source = suite.path + "/main.min"
-        writeTextFile(source, "use \"LinuxDesktop\"\nlet total: Int32 = 0\nconstant action = g_simple_action_new(\"test\", nil)!\nconstant callback: @convention(c) (OpaquePointer?, OpaquePointer?, UnsafeMutableRawPointer?) -> Void = { _, _, data in\n    data!.assumingMemoryBound(to: Int32.self).pointee += 1\n}\nwithUnsafeMutablePointer(to: &total) { counter in\n    g_signal_connect_data(UnsafeMutableRawPointer(action), \"activate\", unsafeBitCast(callback, to: GCallback.self), counter, nil, GConnectFlags(rawValue: 0))\n    g_action_activate(action, nil)\n}\nprecondition(total == 1)\ng_object_unref(UnsafeMutableRawPointer(action))\nprint(\"\\(gtk_get_major_version()) \\(MemoryLayout<GtkTextIter>.size) \\(MemoryLayout<GtkTextIter>.alignment)\")\n")
+        io.writeTextFile(source, test.sourceModules("use \"LinuxDesktop\"\nlet total: Int32 = 0\nconstant action = g_simple_action_new(\"test\", nil)!\nconstant callback: @convention(c) (OpaquePointer?, OpaquePointer?, UnsafeMutableRawPointer?) -> Void = { _, _, data in\n    data!.assumingMemoryBound(to: Int32.self).pointee += 1\n}\nwithUnsafeMutablePointer(to: &total) { counter in\n    g_signal_connect_data(UnsafeMutableRawPointer(action), \"activate\", unsafeBitCast(callback, to: GCallback.self), counter, nil, GConnectFlags(rawValue: 0))\n    g_action_activate(action, nil)\n}\nprecondition(total == 1)\ng_object_unref(UnsafeMutableRawPointer(action))\nprint(\"\\(gtk_get_major_version()) \\(MemoryLayout<GtkTextIter>.size) \\(MemoryLayout<GtkTextIter>.alignment)\")\n"))
         let output = suite.path + "/abi"
         launch(suite, ["--pkg-config", "libadwaita-1", source, "-o", output], true)
         let control = suite.path + "/abi.c"
-        writeTextFile(control, "#include <gtk/gtk.h>\n#include <stdio.h>\nint main(void) { printf(\"%u %zu %zu\\n\", gtk_get_major_version(), sizeof(GtkTextIter), _Alignof(GtkTextIter)); }\n")
+        io.writeTextFile(control, "#include <gtk/gtk.h>\n#include <stdio.h>\nint main(void) { printf(\"%u %zu %zu\\n\", gtk_get_major_version(), sizeof(GtkTextIter), _Alignof(GtkTextIter)); }\n")
         let flags = host.shellWords(run(suite, ["pkg-config", "--cflags", "--libs", "libadwaita-1"], true).output)
         let binary = suite.path + "/c-control"
         let build = ["clang", control]
@@ -119,15 +121,15 @@ function main(): Integer {
 
     if begin(suite, "test_native_library_c_client") {
         let source = suite.path + "/Library.min"
-        writeTextFile(source, "@_cdecl(\"minyar_answer\") public function answer(value: Int32): Int32 { value * 2 }\n")
+        io.writeTextFile(source, test.sourceModules("@_cdecl(\"minyar_answer\") public function answer(value: Int32): Int32 { value * 2 }\n"))
         let products = suite.path + "/library"
         launch(suite, ["--release", "--library", "--module-name", "MinyarLinux", source, "-o", products], true)
         test.check(host.isFile(products + "/libMinyarLinux.so"), "library binary missing")
-        let interfaceText = readTextFile(products + "/MinyarLinux.swiftinterface")
+        let interfaceText = io.readTextFile(products + "/MinyarLinux.swiftinterface")
         test.check(test.contains(interfaceText, "func answer"), "interface lacks answer")
         test.check(!test.contains(interfaceText, "function answer"), "interface contains Minyar syntax")
         let client = suite.path + "/client.c"
-        writeTextFile(client, "#include <stdint.h>\nextern int32_t minyar_answer(int32_t);\nint main(void) { return minyar_answer(21) == 42 ? 0 : 1; }\n")
+        io.writeTextFile(client, "#include <stdint.h>\nextern int32_t minyar_answer(int32_t);\nint main(void) { return minyar_answer(21) == 42 ? 0 : 1; }\n")
         let output = suite.path + "/client"
         run(suite, ["clang", client, "-L", products, "-lMinyarLinux", "-Wl,-rpath," + products, "-o", output], true)
         run(suite, [output], true)
@@ -137,14 +139,14 @@ function main(): Integer {
     if begin(suite, "test_platform_selection_and_atomic_failure") {
         let project = suite.path + "/app"
         test.check(host.makeDirectories(project) == "", "create project")
-        writeTextFile(project + "/app.min", "@main record App { static function main() { print(platformName()) } }")
-        writeTextFile(project + "/Platform.min", "function platformName(): String { \"fallback\" }")
+        io.writeTextFile(project + "/app.min", test.sourceModules("@main record App { static function main() { print(platformName()) } }"))
+        io.writeTextFile(project + "/Platform.min", test.sourceModules("function platformName(): String { \"fallback\" }"))
         let overrideSource = project + "/Platform.linux.min"
-        writeTextFile(overrideSource, "function platformName(): String { \"linux\" }")
-        writeTextFile(project + "/Platform.mac.min", "THIS MUST NOT REACH THE LINUX COMPILER")
+        io.writeTextFile(overrideSource, test.sourceModules("function platformName(): String { \"linux\" }"))
+        io.writeTextFile(project + "/Platform.mac.min", test.sourceModules("THIS MUST NOT REACH THE LINUX COMPILER"))
         let nested = project + "/another"
         test.check(host.makeDirectories(nested) == "", "create nested app")
-        writeTextFile(nested + "/app.min", "THIS IS A DIFFERENT APP")
+        io.writeTextFile(nested + "/app.min", test.sourceModules("THIS IS A DIFFERENT APP"))
         let output = suite.path + "/program"
         for entry in [project, project + "/app.min"] {
             launch(suite, [entry, "-o", output], true)
@@ -153,7 +155,7 @@ function main(): Integer {
             test.check(header.length >= 4 && header[0] == 127 && header[1] == 69 && header[2] == 76 && header[3] == 70, "program is not an ELF executable")
         }
         let previous = files.readFile(output)
-        writeTextFile(overrideSource, "function platformName(): String { 42 }")
+        io.writeTextFile(overrideSource, test.sourceModules("function platformName(): String { 42 }"))
         let failure = launch(suite, [project, "-o", output], false)
         test.check(test.contains(failure.errorOutput, overrideSource + ":1:"), "diagnostic does not name the override\n" + failure.errorOutput)
         test.check(sameBytes(files.readFile(output), previous), "a failed build replaced the program")

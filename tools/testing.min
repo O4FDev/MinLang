@@ -1,5 +1,9 @@
+use "io" as io
 use "system" as system
 use "files" as files
+
+public function resolvePath(path: Text): Text { native "testinghost" }
+public function selfPath(): Text { native "testinghost" }
 
 public function check(condition: Boolean, message: Text) {
     if !condition { fail(message) }
@@ -51,7 +55,7 @@ public function setting(name: Text, fallback: Text): Text {
 }
 public record Result { status: Integer; output: Text; errorOutput: Text }
 function portableScript(): Text {
-    return "log=$1; limit=$2; shift 2; exec 2>\"$log.err\"; monitor=$$; set -m; /usr/bin/env -- \"$@\" >\"$log\" & child=$!; (set +m; /bin/sleep \"$limit\" & sleeper=$!; while kill -0 \"$sleeper\" 2>/dev/null && kill -0 \"$monitor\" 2>/dev/null; do /bin/sleep 0.1; done; kill -TERM \"$sleeper\" 2>/dev/null || :; wait \"$sleeper\" 2>/dev/null; printf 'timeout\\n' >\"$log.timeout\"; kill -TERM -- -\"$child\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :) & timer=$!; set +m; trap 'kill -TERM -- -\"$child\" -\"$timer\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null; wait \"$timer\" 2>/dev/null; exit 143' TERM INT; wait \"$child\"; status=$?; if [ -f \"$log.timeout\" ]; then wait \"$timer\" 2>/dev/null; status=124; else kill -TERM -- -\"$timer\" 2>/dev/null || :; wait \"$timer\" 2>/dev/null; fi; trap - TERM INT; exit \"$status\""
+    return "log=$1; limit=$2; shift 2; exec 2>\"$log.err\"; monitor=$$; set -m; /usr/bin/env -- \"$@\" >\"$log\" & child=$!; (exec 2>/dev/null; set +m; /bin/sleep \"$limit\" & sleeper=$!; while kill -0 \"$sleeper\" 2>/dev/null && kill -0 \"$monitor\" 2>/dev/null; do /bin/sleep 0.1; done; kill -TERM \"$sleeper\" 2>/dev/null || :; wait \"$sleeper\" 2>/dev/null; printf 'timeout\\n' >\"$log.timeout\"; kill -TERM -- -\"$child\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :) & timer=$!; set +m; exec 2>/dev/null; trap 'kill -TERM -- -\"$child\" -\"$timer\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null; child_status=$?; wait \"$timer\" 2>/dev/null; if [ \"$child_status\" -eq 0 ]; then exit 0; fi; exit 143' TERM INT; wait \"$child\"; status=$?; if [ -f \"$log.timeout\" ]; then wait \"$timer\" 2>/dev/null; status=124; else kill -TERM -- -\"$timer\" 2>/dev/null || :; wait \"$timer\" 2>/dev/null; fi; trap - TERM INT; exit \"$status\""
 }
 public function portableStart(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
     check(command.length > 0 && seconds > 0, "invalid process request")
@@ -88,14 +92,14 @@ public function require(result: Result, phase: Text) {
     check(result.status == 0, phase + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
 }
 public function scratch(): Text {
-    let parent = setting("TMPDIR", "/tmp")
+    let parent = resolvePath(setting("TMPDIR", "/tmp"))
+    check(parent != "", "cannot resolve test scratch parent")
     let path = parent + "/minyar-tests-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
     check(files.makeDirectory(path) == 0, "cannot create test scratch")
     return path
 }
 public function removeScratch(path: Text) {
-    for name in files.list(path) { check(files.remove(path + "/" + name) == 0, "cannot remove scratch file") }
-    check(files.removeDirectory(path) == 0, "cannot remove test scratch")
+    removeTree(path)
 }
 public function addressEnabled(flags: List<Text>): Boolean {
     let enabled = false
@@ -210,14 +214,24 @@ public function stableInput(source: Text, input: Text, root: Text): Text {
     }
     return input
 }
+public function sourceModules(source: Text): Text {
+    let result = source
+    for item in [["io", "io"], ["process", "processInfo"], ["random", "secureRandom"], ["math", "math"], ["pixels", "pixelOps"]] {
+        if contains(source, item[1] + ".") && !contains(source, " as " + item[1]) {
+            result += "\nuse \"" + item[0] + "\" as " + item[1] + "\n"
+        }
+    }
+    return result
+}
 public function compile(test: Compiler, source: Text): Result {
+    source = sourceModules(source)
     test.serial += 1
     let path = test.directory + "/case" + Text(test.serial)
-    writeTextFile(path + ".min", source)
+    io.writeTextFile(path + ".min", source)
     let input = stableInput(source, path + ".min", system.getenv("MINYAR_TEST_INPUT_ROOT"))
-    let result = run([test.executable, input, path + ".ll"], system.environment(), "", path + ".compile", test.compileTimeout)
+    let result = run([test.executable, input, path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", test.compileTimeout)
     if result.status == 0 && addressEnabled(test.flags) {
-        writeTextFile(path + ".ll", instrument(readTextFile(path + ".ll")))
+        io.writeTextFile(path + ".ll", instrument(io.readTextFile(path + ".ll")))
     }
     return result
 }

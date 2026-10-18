@@ -12,6 +12,7 @@ function prepareStatementFrame(frames: List<Integer>, conditions: List<Text>, de
 }
 
 function compileStatementSequence(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, startsBlock: Boolean): Boolean {
+    context.activeReturnType = returnType
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let tokenLines = context.tokenLines
@@ -82,6 +83,8 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                         frames[frame + 3] = elseLabel
                         frames[frame + 4] = endLabel
                         frames[frame + 5] = branchSlot
+                        frames[frame + 7] = state[13]
+                        if condition == "false" { state[13] = 1 }
                         conditions[depth] = condition
                         depth = depth + 1
                         mode = 0
@@ -111,8 +114,10 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                             frames[frame + 1] = referenceEffects
                             frames[frame + 2] = conditionLabel
                             frames[frame + 4] = endLabel
+                            frames[frame + 5] = state[13]
                             frames[frame + 6] = 0
                             if condition == "true" { frames[frame + 6] = 1 }
+                            if condition == "false" { state[13] = 1 }
                             frames[frame + 7] = state[3]
                             addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -1, conditionLabel)
                             depth = depth + 1
@@ -157,11 +162,12 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                             let falseTarget = "if.end." + Text(endLabel)
                             if hasElse { falseTarget = "if.else." + Text(elseLabel) }
                             output[frames[frame + 5]] = conditionalBranch(conditions[depth - 1], "if.then." + Text(thenLabel), falseTarget) + "\nif.then." + Text(thenLabel) + ":\n"
-                            conditions[depth - 1] = ""
+                            state[13] = frames[frame + 7]
                             if hasElse {
                                 frames[frame] = 3
                                 frames[frame + 6] = 0
                                 if returns { frames[frame + 6] = 1 }
+                                if conditions[depth - 1] == "true" { state[13] = 1 }
                                 state[0] = state[0] + 1
                                 output.add("\nif.else.")
                                 output.add(Text(elseLabel))
@@ -171,7 +177,7 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                                 mode = 0
                                 if tokenIs(tokenKinds, tokenTexts, state, "if") { mode = 1 }
                             } else {
-                                returns = false
+                                returns = returns && conditions[depth - 1] == "true"
                             }
                         } else {
                             if kind == 3 {
@@ -180,7 +186,11 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                                     output.add(Text(endLabel))
                                     output.add("\n")
                                 }
-                                returns = returns && frames[frame + 6] != 0
+                                if conditions[depth - 1] == "true" {
+                                    returns = frames[frame + 6] != 0
+                                } else {
+                                    if conditions[depth - 1] != "false" { returns = returns && frames[frame + 6] != 0 }
+                                }
                             } else {
                                 if !returns {
                                     output.add("  call void @minyar_rc_step()\n")
@@ -195,16 +205,20 @@ function compileStatementSequence(context: CompilerContext, localNames: List<Tex
                                 let markerScope = frames[frame + 7]
                                 let canBreak = localTypes[markerScope] == -3
                                 state[3] = markerScope
+                                state[13] = frames[frame + 5]
                                 returns = frames[frame + 6] != 0 && !canBreak
                                 if returns { output.add("  unreachable\n") }
                             }
                         }
                         if statementComplete {
-                            if kind != 4 && !returns {
+                            if kind != 4 {
+                                state[13] = frames[frame + 7]
+                                conditions[depth - 1] = ""
                                 output.add("\nif.end.")
                                 output.add(Text(endLabel))
                                 output.add(":\n")
                                 textState[0] = "if.end." + Text(endLabel)
+                                if returns { output.add("  unreachable\n") }
                             }
                             if !returns && state[7] != referenceEffects { output.add("  call void @minyar_rc_step()\n") }
                             depth = depth - 1

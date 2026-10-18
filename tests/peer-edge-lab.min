@@ -1,3 +1,5 @@
+use "io" as io
+use "random" as secureRandom
 use "../tools/testing.min" as test
 use "./net-fixtures.min" as fixtures
 use "./net-redis.min" as redis
@@ -122,7 +124,7 @@ public function digest(context: fixtures.Context, path: Text): Text {
 }
 function selectPort(context: fixtures.Context): Integer {
     for attempt in 0..100 {
-        let random = randomBytes(2)
+        let random = secureRandom.bytes(2)
         let selected = 18000 + ((random[0] << 8) | random[1]) % 10000
         let tcp = net.listen("127.0.0.1", selected, 1)
         let udp = net.udp("127.0.0.1", selected)
@@ -206,8 +208,8 @@ public function create(context: fixtures.Context, directory: Text, setup: Option
     if setup.pki {
         for label in ["next", "untrusted", "device-root"] { registry.add("{\"role\": \"gateway\", \"sha256\": " + json.quote(digest(labContext, fixtures.path(certs, "gateway-" + label, "der"))) + "}\n") }
     }
-    writeTextFile(directory + "/registry.ndjson", joinText(registry))
-    writeBytesFile(directory + "/jwks.json", grants.jwks(grants.goodKey()))
+    io.writeTextFile(directory + "/registry.ndjson", joinText(registry))
+    io.writeBytesFile(directory + "/jwks.json", grants.jwks(grants.goodKey()))
     let lab = Lab { context: labContext; directory: directory; binary: binary; device: device; certs: certs; signer: grants.signer(labContext); settings: [];
         redis: fixtures.Process { handle: 0; log: ""; line: "" }; redisPort: 0; client: redis.Client { connection: -1; buffer: Bytes() }; connected: false;
         edge: fixtures.Process { handle: 0; log: ""; line: "" }; running: false; edgeReader: reader(""); udpPort: 0; devicePort: 0; gatewayPort: 0;
@@ -228,7 +230,7 @@ public function create(context: fixtures.Context, directory: Text, setup: Option
         settings = replaced(settings, "gateway_roots", "[" + json.quote(fixtures.path(certs, "gateway-ca", "der")) + ", " + json.quote(fixtures.path(certs, "gateway-ca-next", "der")) + "]")
     }
     lab.settings = settings
-    writeTextFile(directory + "/edge.json", render(settings))
+    io.writeTextFile(directory + "/edge.json", render(settings))
     lab.edge = direct(labContext, [binary, directory + "/edge.json", Text(setup.duration)], "/dev/null", "edge")
     lab.running = true
     lab.edgeReader = reader(lab.edge.log)
@@ -267,7 +269,7 @@ function writeSource(lab: Lab) {
     let asan = fixtures.value(context.environment, "ASAN_OPTIONS")
     let asanValue = "null"
     if asan != "" { asanValue = json.quote(asan) }
-    writeTextFile(lab.directory + "/source.json", "{\n  \"commit\": " + commitValue + ",\n  \"commit_source\": " + originValue + ",\n  \"source_sha256\": " + json.quote(digest(context, context.root + "/library/peeredge.min")) +
+    io.writeTextFile(lab.directory + "/source.json", "{\n  \"commit\": " + commitValue + ",\n  \"commit_source\": " + originValue + ",\n  \"source_sha256\": " + json.quote(digest(context, context.root + "/library/peeredge.min")) +
         ",\n  \"sources_sha256\": {" + joined(hashes, ", ") + "},\n  \"binary_sha256\": " + json.quote(digest(context, lab.binary)) + ",\n  \"launcher_sha256\": " + json.quote(digest(context, context.root + "/minyar")) +
         ",\n  \"start\": " + Text(Float(system.wallClockMicroseconds()) / 1000000.0) + ",\n  \"pid\": " + Text(pid(lab.edge)) + ",\n  \"asan_options\": " + asanValue + "\n}\n")
 }
@@ -341,7 +343,7 @@ public function signed(lab: Lab, connection: Text): Bytes { return signedClaims(
 public function completed(lab: Lab, milliseconds: Integer): List<Text> {
     let result = fixtures.settle(lab.edge, milliseconds)
     lab.running = result.status == -1
-    writeTextFile(lab.directory + "/edge.stdout", result.output)
+    io.writeTextFile(lab.directory + "/edge.stdout", result.output)
     require(lab, result.status == 0, "edge exit " + Text(result.status) + "\n" + diagnostic(lab))
     require(lab, result.errorOutput == "", "edge diagnostics\n" + result.errorOutput)
     return test.lines(result.output)
@@ -372,8 +374,17 @@ public function describe(values: List<Setting>): Text {
     return joined(parts, " ")
 }
 public function rss(process: fixtures.Process): Integer {
-    for line in test.lines(Text(files.readFile("/proc/" + Text(pid(process)) + "/status"))) {
-        if fixtures.starts(line, "VmRSS:") { return fixtures.number(test.words(line)[1]) }
+    let status = "/proc/" + Text(pid(process)) + "/status"
+    if io.fileExists(status) {
+        for line in test.lines(Text(files.readFile(status))) {
+            if fixtures.starts(line, "VmRSS:") { return fixtures.number(test.words(line)[1]) }
+        }
+    } else {
+        let measured = test.run(["/bin/ps", "-o", "rss=", "-p", Text(pid(process))], system.environment(), "", process.log + ".rss", 10)
+        test.require(measured, "measure process RSS")
+        let fields = test.words(measured.output)
+        test.check(fields.length == 1 && fixtures.number(fields[0]) > 0, "invalid process RSS: " + measured.output)
+        return fixtures.number(fields[0])
     }
     test.check(false, "process RSS unavailable")
     return 0
@@ -400,7 +411,7 @@ public function close(lab: Lab) {
             if line == "" { break }
             pending.add(line)
         }
-        if pending.length > 0 { writeTextFile(lab.directory + "/edge.partial.stdout", joinText(pending)) }
+        if pending.length > 0 { io.writeTextFile(lab.directory + "/edge.partial.stdout", joinText(pending)) }
     }
     for index in 0..lab.devices.length {
         let item = lab.devices[index]
@@ -411,7 +422,7 @@ public function close(lab: Lab) {
         }
         let quoted: List<Text> = []
         for line in item.events { quoted.add(json.quote(line)) }
-        writeTextFile(lab.directory + "/device-" + Text(index) + ".events.json", "[" + joined(quoted, ", ") + "]")
+        io.writeTextFile(lab.directory + "/device-" + Text(index) + ".events.json", "[" + joined(quoted, ", ") + "]")
     }
     lab.devices = []
     if lab.connected {
@@ -471,7 +482,7 @@ public function messages(result: json.Value): List<json.Value> { return json.mem
 public function status(result: json.Value): Text { return json.string(result, "status") }
 public function tokenDigest(lab: Lab, token: Bytes): Text {
     let path = lab.directory + "/logs/token"
-    writeBytesFile(path, token)
+    io.writeBytesFile(path, token)
     return digest(lab.context, path)
 }
 public function transfer(lab: Lab, item: Session, connection: Text, payload: Bytes, target: Text, timeout: Integer): Text {

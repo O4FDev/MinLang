@@ -27,15 +27,15 @@ static _Atomic size_t rc_native_region_maps, rc_native_region_unmaps;
 void minyar_native_thread_setup(void) {
 }
 
+#ifdef __linux__
 static void rc_native_region_destroy(void *pointer) {
     RcNativeRegion *region = pointer;
-#ifdef __linux__
     if (munmap(region->base, region->length))
         minyar_stop("a native memory region could not be unmapped.");
-#endif
     RC_NATIVE_ACCOUNT(atomic_fetch_add(&rc_native_region_unmaps, 1));
     rc_thread_native_free(region, sizeof(*region));
 }
+#endif
 
 static long long rc_native_region_map(long long length, long long protection, long long flags,
                                       long long descriptor, long long offset, void **output) {

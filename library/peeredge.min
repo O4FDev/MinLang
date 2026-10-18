@@ -1,3 +1,5 @@
+use "io" as io
+use "random" as secureRandom
 // One-owner Hearth edge reactor. Protocol state, scheduling, certificate-to-
 // registry binding and the live capacity plane are implemented in Minyar.
 use "errors" as errors
@@ -57,7 +59,7 @@ function certificatePaths(value: json.Value, name: Text): List<Text> {
 }
 function certificateFiles(paths: List<Text>): List<Bytes> {
     let result: List<Bytes> = []
-    for path in paths { result.add(readBytesFile(path)) }
+    for path in paths { result.add(io.readBytesFile(path)) }
     return result
 }
 function configuration(data: Bytes): Configuration {
@@ -78,7 +80,7 @@ record RegistryEntry { device: Text; exit: Text; revoked: Boolean; paused: Boole
 record Registry { valid: Boolean; entries: List<RegistryEntry>; index: dispatch.Table; exits: dispatch.Table; gateways: List<Text> }
 function identityKey(text: Text): Bytes { return crypto.sha256(Bytes(text)).slice(0,20) }
 function registry(data: Bytes, maximum: Integer): Registry {
-    let result = Registry { valid: false; entries: []; index: dispatch.table(maximum,65536,randomBytes(16)); exits: dispatch.table(maximum,65536,randomBytes(16)); gateways: [] }
+    let result = Registry { valid: false; entries: []; index: dispatch.table(maximum,65536,secureRandom.bytes(16)); exits: dispatch.table(maximum,65536,secureRandom.bytes(16)); gateways: [] }
     if data.length < 1 || data.length > 16777216 { return result }
     let start = 0
     for end in 0..data.length + 1 {
@@ -178,10 +180,10 @@ function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, a
     if mode == 0 && !retry.valid(validated) { return -1 }
     if core.active >= core.config.maximum { if socket >= 0 { net.close(socket) }; return -1 }
     let connection = transport.client("inactive.invalid",Bytes(),"inactive",[],[],Bytes())
-    if mode == 0 { connection = transport.serverQUICAfterRetry(randomBytes(80),"hearth-peer",validated,core.identity,core.key,core.deviceRoots,true) }
-    if mode == 1 { connection = transport.serverTCP(randomBytes(80),"hearth-peer",core.identity,core.key,core.deviceRoots,true,core.now) }
+    if mode == 0 { connection = transport.serverQUICAfterRetry(secureRandom.bytes(80),"hearth-peer",validated,core.identity,core.key,core.deviceRoots,true) }
+    if mode == 1 { connection = transport.serverTCP(secureRandom.bytes(80),"hearth-peer",core.identity,core.key,core.deviceRoots,true,core.now) }
     let gateway = tls.none()
-    if mode == 2 { gateway = tls.server(randomBytes(64),"h2",core.identity,core.key,core.gatewayRoots,true) }
+    if mode == 2 { gateway = tls.server(secureRandom.bytes(64),"h2",core.identity,core.key,core.gatewayRoots,true) }
     let peer = Peer { live: true; queued: false; flags: 0; mode: mode; socket: socket; watch: 0; connection: connection; gateway: gateway; grpc: grpc.create(); releases: []; finalizations: []; decoder: wire.create(); inputs: []
         paths: [address]; routed: original; routedIds: []; routingVersion: -1; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
         control: -1; published: false; publicationPending: false; redisQueued: false; admitted: 0 }
@@ -479,7 +481,7 @@ function controlFrame(core: Core, id: Integer, stream: Integer, frame: wire.Fram
             drop(core,previous)
         }
         if !errors.booleanOk(dispatch.insert(core.exits,key,id)) { drop(core,id); return }
-        peer.bound = true; peer.device = entry.device; peer.exit = entry.exit; peer.epoch = crypto.hex(randomBytes(32)); peer.control = stream; peer.heartbeatAt = core.now
+        peer.bound = true; peer.device = entry.device; peer.exit = entry.exit; peer.epoch = crypto.hex(secureRandom.bytes(32)); peer.control = stream; peer.heartbeatAt = core.now
     } else if wire.kind(frame) == wire.HEARTBEAT && peer.bound && peer.control == stream {
         let at = registryID(core.registry,peer.device)
         if at < 0 || core.registry.entries[at].revoked || core.registry.entries[at].exit != peer.exit { drop(core,id); return }
@@ -641,7 +643,7 @@ function redisOffline(core: Core) {
     if core.redisSocket >= 0 { net.close(core.redisSocket) }
     core.redisSocket = -1; core.redisWatch = 0; core.redisFlags = 0; core.redisConnecting = false; core.redisReconnectAt = core.now + 1000
     redis.abort(core.redisClient,errors.make(errors.closedCode(),0,"Redis connection retired")); core.publications = []; core.publicationAt = 0
-    for peer in core.peers { if peer.live && peer.mode != 2 { peer.published = false; peer.redisQueued = false; peer.publicationPending = peer.bound; if peer.bound { peer.epoch = crypto.hex(randomBytes(32)) } } }
+    for peer in core.peers { if peer.live && peer.mode != 2 { peer.published = false; peer.redisQueued = false; peer.publicationPending = peer.bound; if peer.bound { peer.epoch = crypto.hex(secureRandom.bytes(32)) } } }
 }
 function redisService(core: Core) {
     if core.redisSocket < 0 && core.now >= core.redisReconnectAt {
@@ -705,7 +707,7 @@ function acceptPeers(core: Core, listener: Integer, mode: Integer) {
     for accepted in 0..64 {
         let socket = net.accept(listener); if socket < 0 { break }
         if !errors.booleanOk(net.setNoDelay(socket,true)) { net.close(socket); continue }
-        allocate(core,mode,socket,randomBytes(8),Address { host: ""; port: 0 },core.noRetry)
+        allocate(core,mode,socket,secureRandom.bytes(8),Address { host: ""; port: 0 },core.noRetry)
     }
 }
 function udpInput(core: Core) {
@@ -724,7 +726,7 @@ function udpInput(core: Core) {
                         let address = Address { host: net.datagramSource(packet); port: net.datagramPort(packet) }
                         let canonical = Bytes("[" + address.host + "]:" + Text(address.port))
                         if header.token.length == 0 {
-                            let response = retry.reply(core.retry,data,canonical,randomBytes(8),core.now)
+                            let response = retry.reply(core.retry,data,canonical,secureRandom.bytes(8),core.now)
                             if errors.bytesOk(response) {
                                 net.sendDatagramTo(core.udp,address.host,address.port,errors.bytesValue(response))
                                 core.retryReplies += 1
@@ -767,7 +769,7 @@ function refresh(core: Core) {
         core.replays = retained; core.replayAt = core.now + 1000
     }
     if core.now >= core.registryAt {
-        core.registry = registry(readBytesFile(core.config.registry),core.config.maximum); core.registryAt = core.now + 15000
+        core.registry = registry(io.readBytesFile(core.config.registry),core.config.maximum); core.registryAt = core.now + 15000
         for index in 0..core.peers.length {
             let peer = core.peers[index]
             if peer.live && peer.bound && peer.mode != 2 {
@@ -778,13 +780,13 @@ function refresh(core: Core) {
         }
     }
     if core.now >= core.keysAt {
-        let keys = auth.parseKeys(readBytesFile(core.config.jwks)); if auth.keysOk(keys) { core.keys = keys }; core.keysAt = core.now + 300000
+        let keys = auth.parseKeys(io.readBytesFile(core.config.jwks)); if auth.keysOk(keys) { core.keys = keys }; core.keysAt = core.now + 300000
     }
 }
 public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResult {
     let config = configuration(configBytes)
     if !config.valid || durationMs < 0 || durationMs > 86400000 { return errors.booleanFailure(errors.make(errors.invalidDataCode(),0,"invalid edge configuration")) }
-    let registry = registry(readBytesFile(config.registry),config.maximum); let keys = auth.parseKeys(readBytesFile(config.jwks))
+    let registry = registry(io.readBytesFile(config.registry),config.maximum); let keys = auth.parseKeys(io.readBytesFile(config.jwks))
     if !registry.valid || !auth.keysOk(keys) { return errors.booleanFailure(errors.make(errors.invalidDataCode(),0,"invalid edge registry or signing keys")) }
     let created = callbacks.create(); if !callbacks.ok(created) { return errors.booleanFailure(callbacks.error(created)) }
     let udp = net.udp(config.host,config.devicePort)
@@ -793,11 +795,11 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     if udp < 0 || device < 0 || gateway < 0 { if udp >= 0 { net.close(udp) }; if device >= 0 { net.close(device) }; if gateway >= 0 { net.close(gateway) }; callbacks.close(callbacks.value(created)); return errors.booleanFailure(errors.make(errors.systemCode(),0,"edge listen failed")) }
     if config.instance.length > 2 && config.instance.slice(config.instance.length-2,config.instance.length) == ":0" { config.instance = config.instance.slice(0,config.instance.length-1) + Text(net.localPort(gateway)) }
     let core = Core { config: config; dispatcher: callbacks.value(created); now: 0; started: net.monotonicMilliseconds()
-        identity: certificateFiles(config.certificate); key: readBytesFile(config.key); deviceRoots: certificateFiles(config.deviceRoots); gatewayRoots: certificateFiles(config.gatewayRoots); registry: registry; keys: keys
+        identity: certificateFiles(config.certificate); key: io.readBytesFile(config.key); deviceRoots: certificateFiles(config.deviceRoots); gatewayRoots: certificateFiles(config.gatewayRoots); registry: registry; keys: keys
         udp: udp; deviceListener: device; gatewayListener: gateway; peers: []; free: []; freeCount: 0; active: 0; work: []; workAt: 0
-        relays: []; replays: []; replayIndex: dispatch.table(8192,65536,randomBytes(16)); nextRelay: 1; relaysRetired: 0; callsOpened: 0; callsReleased: 0; maxRelays: 0; replayAt: 1000
-        retry: retry.store(randomBytes(16),10000); noRetry: retry.validateInitial(retry.store(Bytes(),1),Bytes(),Bytes(),0); allocated: 0; retryReplies: 0; retryValidated: 0
-        routing: dispatch.routes(config.maximum,65536,randomBytes(16)); exits: dispatch.table(config.maximum,65536,randomBytes(16)); timers: dispatch.timers(config.maximum)
+        relays: []; replays: []; replayIndex: dispatch.table(8192,65536,secureRandom.bytes(16)); nextRelay: 1; relaysRetired: 0; callsOpened: 0; callsReleased: 0; maxRelays: 0; replayAt: 1000
+        retry: retry.store(secureRandom.bytes(16),10000); noRetry: retry.validateInitial(retry.store(Bytes(),1),Bytes(),Bytes(),0); allocated: 0; retryReplies: 0; retryValidated: 0
+        routing: dispatch.routes(config.maximum,65536,secureRandom.bytes(16)); exits: dispatch.table(config.maximum,65536,secureRandom.bytes(16)); timers: dispatch.timers(config.maximum)
         redisSocket: -1; redisWatch: 0; redisClient: redis.create(); publications: []; publicationAt: 0; redisReconnectAt: 0; redisFlags: 0; redisConnecting: false; redisConnectDeadline: 0; registryAt: 15000; keysAt: 300000 }
     callbacks.watch(core.dispatcher,udp,loop.readableInterest(),0,function(event: loop.Event) { udpInput(core) })
     callbacks.watch(core.dispatcher,device,loop.readableInterest(),0,function(event: loop.Event) { acceptPeers(core,device,1) })

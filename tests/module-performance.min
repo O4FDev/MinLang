@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./performance-support.min" as metrics
 use "../experiments/memory/study-support.min" as data
@@ -11,13 +13,13 @@ function method(): Text {
 function parse(root: Text): Options {
     let result = Options { compiler: root + "/build/minyarc"; clang: test.setting("MINYAR_TEST_CLANG", test.setting("LLVM_CC", "clang")); sizes: [100, 400]; shapes: ["chain", "wide", "shared"]; functions: 4; statements: 12; repeats: 5; output: root + "/build/module-performance.json" }
     let index = 0
-    while index < argumentCount() {
-        let option = argument(index)
+    while index < processInfo.argumentCount() {
+        let option = processInfo.argument(index)
         if option == "--sizes" || option == "--shapes" {
             index += 1
             let sizes: List<Integer> = []; let shapes: List<Text> = []
-            while index < argumentCount() {
-                let value = argument(index); if data.starts(value, "--") { break }
+            while index < processInfo.argumentCount() {
+                let value = processInfo.argument(index); if data.starts(value, "--") { break }
                 if option == "--sizes" { sizes.add(Integer(value)) } else { shapes.add(value) }
                 index += 1
             }
@@ -28,7 +30,7 @@ function parse(root: Text): Options {
         let name = option; let value = ""; let position = -1; let raw = Bytes(option)
         for offset in 0..raw.length { if raw[offset] == 61 { position = offset; break } }
         if position >= 0 { name = Text(raw.slice(0, position)); value = Text(raw.slice(position + 1, raw.length)) }
-        else { index += 1; test.check(index < argumentCount(), "option requires value: " + option); value = argument(index) }
+        else { index += 1; test.check(index < processInfo.argumentCount(), "option requires value: " + option); value = processInfo.argument(index) }
         if name == "--compiler" { result.compiler = value }
         else if name == "--clang" { result.clang = value }
         else if name == "--functions" { result.functions = Integer(value) }
@@ -75,14 +77,14 @@ function padded(value: Text, width: Integer, right: Boolean): Text {
     while Bytes(result).length < width { if right { result = " " + result } else { result = result + " " } }
     return result
 }
-function save(report: json.Value, output: Text) { files.makeDirectory(data.parent(output)); writeTextFile(output, json.pretty(report, "") + "\n") }
+function save(report: json.Value, output: Text) { files.makeDirectory(data.parent(output)); io.writeTextFile(output, json.pretty(report, "") + "\n") }
 function measured(command: List<Text>, log: Text): json.Value {
     let result = metrics.timed(command, log, 30)
     test.check(result.ok, result.error)
     return result.value
 }
 function main(): Integer {
-    if argumentCount() == 1 && (argument(0) == "--help" || argument(0) == "-h") {
+    if processInfo.argumentCount() == 1 && (processInfo.argument(0) == "--help" || processInfo.argument(0) == "-h") {
         print("module-performance [--compiler PATH] [--clang PATH] [--sizes N ...] [--shapes chain wide shared] [--functions N] [--statements N] [--repeats N] [--output PATH]")
         return 0
     }
@@ -106,23 +108,23 @@ function main(): Integer {
         for count in options.sizes {
             let directory = work + "/" + shape + "-" + Text(count)
             let entry = metrics.generate(directory, shape, count, options.functions, options.statements).entry
-            let original = readTextFile(entry); let library = directory + "/m0.min"; let libraryText = readTextFile(library)
+            let original = io.readTextFile(entry); let library = directory + "/m0.min"; let libraryText = io.readTextFile(library)
             let llvm = directory + "/program.ll"
-            serial += 1; measured([compiler, entry, llvm], work + "/compile" + Text(serial))
-            let symbols = definitions(readTextFile(llvm)); let seen = Map<Text, Boolean>(); let defined = 0
+            serial += 1; measured([compiler, entry, llvm, "--library", "library"], work + "/compile" + Text(serial))
+            let symbols = definitions(io.readTextFile(llvm)); let seen = Map<Text, Boolean>(); let defined = 0
             for name in symbols {
                 test.check(!seen.has(name), shape + " " + Text(count) + " duplicate LLVM definition " + name); seen[name] = true
                 if name == "main" || data.starts(unquoted(name), ".minyar.fn.") { defined += 1 }
             }
             test.check(defined == count * (options.functions + 1) + 1, shape + " " + Text(count) + " " + Text(defined) + " source definitions")
             for scenario in ["unchanged", "entry-edit", "dependency-edit", "interface-edit"] {
-                writeTextFile(entry, original); writeTextFile(library, libraryText)
-                if scenario == "entry-edit" { writeTextFile(entry, test.replace(original, "    print(", "    let edited = 1\n    print(")) }
-                else if scenario == "dependency-edit" { writeTextFile(library, metrics.replaceFirst(libraryText, "result = result + 1", "result = result + 2")) }
-                else if scenario == "interface-edit" { writeTextFile(library, libraryText + "\npublic record Added { value: Integer }\n") }
-                serial += 1; measured([compiler, entry, llvm], work + "/compile" + Text(serial))
+                io.writeTextFile(entry, original); io.writeTextFile(library, libraryText)
+                if scenario == "entry-edit" { io.writeTextFile(entry, test.replace(original, "    print(", "    let edited = 1\n    print(")) }
+                else if scenario == "dependency-edit" { io.writeTextFile(library, metrics.replaceFirst(libraryText, "result = result + 1", "result = result + 2")) }
+                else if scenario == "interface-edit" { io.writeTextFile(library, libraryText + "\npublic record Added { value: Integer }\n") }
+                serial += 1; measured([compiler, entry, llvm, "--library", "library"], work + "/compile" + Text(serial))
                 let samples: List<json.Value> = []
-                for repeat in 0..options.repeats { serial += 1; samples.add(measured([compiler, entry, llvm], work + "/compile" + Text(serial))) }
+                for repeat in 0..options.repeats { serial += 1; samples.add(measured([compiler, entry, llvm, "--library", "library"], work + "/compile" + Text(serial))) }
                 let summary = metrics.summarize(samples); test.check(summary.ok, summary.error)
                 let sourceBytes = 0
                 for name in files.list(directory) { if data.ends(name, ".min") { sourceBytes += files.pathSize(directory + "/" + name) } }
@@ -140,7 +142,7 @@ function main(): Integer {
     for shape in options.shapes {
         let graph = metrics.generate(work + "/execute-" + shape, shape, 10, options.functions, options.statements)
         let directory = data.parent(graph.entry); let llvm = directory + "/main.ll"; let program = directory + "/main.exe"
-        measured([compiler, graph.entry, llvm], directory + "/compile")
+        measured([compiler, graph.entry, llvm, "--library", "library"], directory + "/compile")
         let link = [clang, "-O0", "-Wno-override-module", llvm, runtime, "-o", program]
         if !darwin { link.add("-lm") }
         measured(link, directory + "/link")

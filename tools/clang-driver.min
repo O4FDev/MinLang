@@ -1,3 +1,4 @@
+use "process" as processInfo
 use "./driver-support.min" as host
 use "./llvm-sanitizer.min" as sanitizer
 use "./driver-providers.min" as providers
@@ -181,6 +182,12 @@ function runtimeConfiguration(project: Text, runtime: Text, purpose: Text): Text
     let local = host.parentPath(runtime) + "/runtime.c"
     if (file == "runtime.o" || file == "runtime.ll") && host.isFile(local) { return host.readText(local) }
     if file.startsWith("minyar-default-runtime") { return host.readText(project + "/runtime/minyar_default_runtime.c") }
+    if file == "minyar-runtime.o" || file == "minyar-runtime-release.ll" || file == "minyar-runtime-sanitize.o" {
+        if host.setting("PROGRAM_RUNTIME_FLAGS", "-DMINYAR_SYSTEM_HEAP=1") != "-DMINYAR_SYSTEM_HEAP=1" {
+            host.stop("custom program runtime flags require an adjacent runtime.c for " + purpose)
+        }
+        return "#define MINYAR_SYSTEM_HEAP 1\n#include \"minyar_runtime.c\"\n"
+    }
     if file.startsWith("minyar-runtime-eager") { return "#include \"minyar_runtime.c\"\n" }
     host.stop("cannot select " + purpose + " for " + runtime)
     return ""
@@ -229,7 +236,7 @@ function runtimeOptions(clang: Text, release: Text, linkFlags: List<Text>): List
     return options
 }
 
-constant SCALARS: List<Text> = ["", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double", "bool", "uint32_t"]
+global SCALARS: List<Text> = ["", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double", "bool", "uint32_t"]
 record Layout { key: Integer; mode: Integer; size: Integer; alignment: Integer; fields: List<Integer> }
 record Signature { callee: Text; kinds: List<Text> }
 record LayoutState { layouts: List<Layout>; calls: List<Signature>; completed: List<Integer>; active: List<Integer>; pieces: List<Text> }
@@ -551,7 +558,7 @@ function publish(link: Link, command: List<Text>, output: Text, source: Text): B
     let doc = link.doc
     if link.artifacts {
         host.jsonPut(doc, link.root, "actual_command", host.jsonStrings(doc, actual))
-        host.jsonPut(doc, link.root, "staged_requested_path", host.jsonString(doc, host.resolveName(staged)))
+        host.jsonPut(doc, link.root, "staged_requested_path", host.jsonString(doc, staged))
         let selected = host.which(command[0])
         if selected == "" { selected = command[0] }
         let compiler = host.resolveName(selected)
@@ -858,7 +865,7 @@ function linkCommand(arguments: List<Text>) {
         if line.startsWith("; minyar-native-library: ") {
             let library = host.strip(host.textAfter(line, "; minyar-native-library: "))
             if !host.listed(libraries, library) { libraries.add(library) }
-            if library == "callbackruntime" { cycles = true }
+            if library == "callbackruntime" || library == "runtime" { cycles = true }
         }
         if line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" { cycles = true }
         if line == "; minyar-thread-runtime: 1" { threaded = true }
@@ -917,7 +924,7 @@ function linkCommand(arguments: List<Text>) {
             if !isWindows { host.stop("the wincert package requires Windows and its certificate store") }
             native.add(nativeObject(project, clang, base, "wincert.c", nativeFlags))
             for item in ["-lcrypt32", "-lbcrypt", "-lncrypt"] { native.add(item) }
-        } else if library == "machine" || library == "machine_arm64" || library == "callbackruntime" {
+        } else if library == "machine" || library == "machine_arm64" || library == "callbackruntime" || library == "runtime" {
         } else if library == "net" {
             native.add(nativeObject(project, clang, base, "net.c", nativeFlags))
             if isWindows { native.add("-lws2_32") }
@@ -1031,9 +1038,9 @@ function sanitizeFile(arguments: List<Text>) {
 }
 
 let given: List<Text> = []
-for index in 1..max(1, argumentCount()) { given.add(argument(index)) }
+for index in 1..max(1, processInfo.argumentCount()) { given.add(processInfo.argument(index)) }
 let command = ""
-if argumentCount() > 0 { command = argument(0) }
+if processInfo.argumentCount() > 0 { command = processInfo.argument(0) }
 if command == "toolchain" && given.length == 0 { print(host.pinnedLlvm(host.selectedClang())) }
 else if command == "runtime-format" && given.length == 0 { runtimeFormat() }
 else if command == "compile" && given.length >= 2 { compile(given) }

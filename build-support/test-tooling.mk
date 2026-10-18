@@ -1,5 +1,5 @@
-MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) library/system.min library/files.min
-MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c
+MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) $(wildcard library/*.min)
+MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c tools/testing-host.c
 TOOL_RUNTIME = build/minyar-runtime.o
 TOOL_CRYPTO := $(shell pkg-config --cflags --libs libcrypto 2>/dev/null || echo -lcrypto)
 

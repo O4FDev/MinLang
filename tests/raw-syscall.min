@@ -1,3 +1,5 @@
+use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "../tools/llvm-sanitizer.min" as sanitizer
 use "system" as system
@@ -23,7 +25,7 @@ function strings(values: List<Text>): Text {
     for value in values { quoted.add(json.quote(value)) }
     return "[" + joined(quoted, ",") + "]"
 }
-function digest(path: Text): Text { return sha.hex(sha.digest(readBytesFile(path))) }
+function digest(path: Text): Text { return sha.hex(sha.digest(io.readBytesFile(path))) }
 function position(source: Text, needle: Text, start: Integer): Integer {
     let raw = Bytes(source)
     let pattern = Bytes(needle)
@@ -42,7 +44,7 @@ function sameBytes(left: Bytes, right: Bytes): Boolean {
     return true
 }
 function save(session: Session) {
-    writeTextFile(session.work + "/commands.json", "[" + joined(session.commands, ",\n") + "]\n")
+    io.writeTextFile(session.work + "/commands.json", "[" + joined(session.commands, ",\n") + "]\n")
 }
 function remember(session: Session, arguments: List<Text>, result: test.Result, pid: Integer): Text {
     let entry = "{\"argv\":" + strings(arguments) + ",\"status\":" + Text(result.status) + ",\"stdout\":" + json.quote(result.output) + ",\"stderr\":" + json.quote(result.errorOutput)
@@ -67,7 +69,7 @@ function execute(session: Session, executable: Text, arguments: List<Text>): Exe
     for item in arguments { argv.add(item); shown.add(item) }
     let result = test.run(argv, session.environment, session.root, log, 30)
     let pid = 0
-    if files.pathSize(log + ".pid") > 0 { pid = Integer(readTextFile(log + ".pid").trim()) }
+    if files.pathSize(log + ".pid") > 0 { pid = Integer(io.readTextFile(log + ".pid").trim()) }
     let entry = remember(session, shown, result, pid)
     test.check(result.status == 0 && result.errorOutput == "", entry)
     return Execution { pid: pid; output: result.output }
@@ -84,17 +86,17 @@ function linked(session: Session, arguments: List<Text>): List<Text> {
 }
 function prepare(path: Text, flags: List<Text>) {
     if sanitizer.addressEnabled(flags) || sanitizer.threadEnabled(flags) {
-        let source = readTextFile(path)
+        let source = io.readTextFile(path)
         let prepared = sanitizer.program(source, flags)
         test.check(prepared.error == "", prepared.error)
-        if prepared.text != source { writeTextFile(path, prepared.text) }
+        if prepared.text != source { io.writeTextFile(path, prepared.text) }
     }
 }
 function compileProgram(session: Session, compiler: Text, source: Text, llvm: Text, libraries: List<Text>) {
-    let arguments = [compiler, source, llvm]
+    let arguments = [compiler, source, llvm, "--library", "library"]
     for directory in libraries { arguments.add("--library"); arguments.add(directory) }
     command(session, arguments)
-    let text = readTextFile(llvm)
+    let text = io.readTextFile(llvm)
     let declarations = 0
     for line in test.lines(text) { if line == DECLARATION { declarations += 1 } }
     test.check(declarations == 1, "missing/duplicate runtime helper declaration")
@@ -112,7 +114,7 @@ function checkAbi(session: Session, clang: Text) {
             let stem = session.work + "/abi-" + target + "-" + Text(Bytes(optimization).slice(1, 3))
             command(session, [clang, "-target", target, optimization, "-std=c11", "-Wall", "-Wextra", "-Werror", "-S", "-emit-llvm", probe, "-o", stem + ".ll"])
             command(session, [clang, "-target", target, optimization, "-S", probe, "-o", stem + ".s"])
-            let text = readTextFile(stem + ".ll")
+            let text = io.readTextFile(stem + ".ll")
             if target == supported[0] || target == supported[1] {
                 test.check(test.contains(text, "asm sideeffect"), "missing raw syscall inline assembly for " + target)
                 let registers = ["{x8}", "{x0}", "{x1}", "{x2}", "{x3}", "{x4}", "{x5}", "~{memory}"]
@@ -122,7 +124,7 @@ function checkAbi(session: Session, clang: Text) {
                     instruction = "syscall"
                 }
                 for register in registers { test.check(test.contains(text, register), "missing raw syscall register " + register + " for " + target + "\n" + text) }
-                test.check(test.contains(readTextFile(stem + ".s"), instruction), "missing " + instruction + " instruction for " + target)
+                test.check(test.contains(io.readTextFile(stem + ".s"), instruction), "missing " + instruction + " instruction for " + target)
             } else {
                 test.check(!test.contains(text, "asm sideeffect") && test.contains(text, "ret i64 -38"), "unsupported target did not fall back to -38: " + target)
             }
@@ -132,14 +134,14 @@ function checkAbi(session: Session, clang: Text) {
     for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-none-elf", "aarch64-none-elf"] {
         let llvm = session.work + "/freestanding-probe-" + target + ".ll"
         command(session, [clang, "-target", target, "-O2", "-ffreestanding", "-S", "-emit-llvm", probe, "-o", llvm])
-        let text = readTextFile(llvm)
+        let text = io.readTextFile(llvm)
         test.check(test.contains(text, "ret i64 -38") && !test.contains(text, "asm sideeffect"), "freestanding probe did not fall back to -38: " + target)
     }
     for target in ["x86_64-none-elf", "aarch64-none-elf"] {
         let llvm = session.work + "/freestanding-runtime-" + target + ".ll"
         command(session, [clang, "-target", target, "-O2", "-ffreestanding", "-nostdinc", "-isystem", resource + "/include", "-isystem",
             session.root + "/runtime/freestanding/include", "-S", "-emit-llvm", session.root + "/runtime/freestanding/runtime.c", "-o", llvm])
-        let text = readTextFile(llvm)
+        let text = io.readTextFile(llvm)
         let name = "@minyar_machine_syscall("
         let start = position(text, name, 0)
         test.check(start >= 0, "freestanding runtime lacks the raw syscall helper: " + target)
@@ -188,16 +190,16 @@ let abi = false
 let frontends = false
 let output = ""
 let index = 0
-while index < argumentCount() {
-    let name = argument(index)
+while index < processInfo.argumentCount() {
+    let name = processInfo.argument(index)
     if name == "--sanitize" { sanitize = true }
     else if name == "--linux-native" { linuxNative = true }
     else if name == "--abi" { abi = true }
     else if name == "--frontends" { frontends = true }
     else if name == "--output" {
-        if index + 1 >= argumentCount() { usage("argument --output: expected one argument") }
+        if index + 1 >= processInfo.argumentCount() { usage("argument --output: expected one argument") }
         index += 1
-        output = argument(index)
+        output = processInfo.argument(index)
     }
     else { usage("unrecognized arguments: " + name) }
     index += 1
@@ -302,13 +304,13 @@ for libraryIndex in 0..libraries.length {
         command(session, linked(session, link))
         if supported {
             let path = work + "/file-" + Text(libraryIndex) + "-" + level + ".bin"
-            writeBytesFile(path, initial)
+            io.writeBytesFile(path, initial)
             let arguments = [path, work + "/missing/file", Text(page)]
             for number in numbers { arguments.add(number) }
             let result = execute(session, executable, arguments)
             test.check(result.output == Text(result.pid) + "\n", "(" + Text(result.pid) + ", " + json.quote(result.output) + ")")
-            test.check(sameBytes(readBytesFile(path), expected), "wrong mmap offset or writeback/Bytes payload")
-            writeBytesFile(work + "/expected-file.bin", expected)
+            test.check(sameBytes(io.readBytesFile(path), expected), "wrong mmap offset or writeback/Bytes payload")
+            io.writeBytesFile(work + "/expected-file.bin", expected)
         } else {
             let result = execute(session, executable, [])
             test.check(result.output == "-38\n5\n", result.output)
@@ -329,11 +331,11 @@ if frontends {
         command(session, linked(session, link))
         if supported {
             let path = work + "/" + name + ".bin"
-            writeBytesFile(path, initial)
+            io.writeBytesFile(path, initial)
             let arguments = [path, work + "/missing/file", Text(page)]
             for number in numbers { arguments.add(number) }
             let result = execute(session, executable, arguments)
-            test.check(result.output == Text(result.pid) + "\n" && sameBytes(readBytesFile(path), expected), "(" + json.quote(name) + ", " + json.quote(result.output) + ")")
+            test.check(result.output == Text(result.pid) + "\n" && sameBytes(io.readBytesFile(path), expected), "(" + json.quote(name) + ", " + json.quote(result.output) + ")")
         } else {
             let result = execute(session, executable, [])
             test.check(result.output == "-38\n5\n", result.output)
@@ -352,7 +354,7 @@ for path in test.lines(capture(["find", work, "-type", "f"], scratch, "artifacts
 test.removeScratch(scratch)
 let label = "native"
 if sanitize { label = "ASan+UBSan" }
-writeTextFile(work + "/manifest.json", "{\"platform\":" + json.quote(platform) + ",\"machine\":" + json.quote(machine) + ",\"mode\":" + json.quote(label) +
+io.writeTextFile(work + "/manifest.json", "{\"platform\":" + json.quote(platform) + ",\"machine\":" + json.quote(machine) + ",\"mode\":" + json.quote(label) +
     ",\"abi\":" + flag(abi) + ",\"frontends\":" + flag(frontends) + ",\"environment\":{\"ASAN_OPTIONS\":" + json.quote("detect_leaks=" + leaks) +
     ",\"UBSAN_OPTIONS\":\"halt_on_error=1\"},\"inputs\":{" + joined(inputEntries, ",") + "},\"tools\":{" + joined(toolEntries, ",") + "},\"artifacts\":{" + joined(artifactEntries, ",") + "}}\n")
 let summary = "hosted -38 fallback"

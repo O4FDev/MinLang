@@ -1,3 +1,4 @@
+use "io" as io
 use "../tools/testing.min" as test
 use "./net-fixtures.min" as fixtures
 use "system" as system
@@ -8,7 +9,7 @@ public record Evidence { enabled: Boolean; directory: Text; root: Text; records:
 
 function hashed(evidence: Evidence, path: Text, operation: Text): Text {
     let log = evidence.directory + "/.net-evidence-" + Text(system.processId())
-    let result = test.run(["sha256sum", "--", path], system.environment(), "", log, 30)
+    let result = test.run(["/bin/sh", "-c", "if command -v sha256sum >/dev/null; then exec sha256sum -- \"$1\"; else exec shasum -a 256 -- \"$1\"; fi", "minyar", path], system.environment(), "", log, 30)
     files.remove(log)
     files.remove(log + ".err")
     if result.status != 0 {
@@ -149,6 +150,15 @@ function publish(path: Text, text: Text): Text {
     if closed < 0 { return files.errorText(closed) }
     return ""
 }
+function artifacts(evidence: Evidence, directory: Text, prefix: Text, listed: List<Text>) {
+    for name in files.list(directory).sorted() {
+        if fixtures.starts(name, ".") { continue }
+        let path = directory + "/" + name; let relative = prefix + name
+        let kind = test.run(["/bin/test", "-d", path], system.environment(), "", evidence.directory + "/.artifact-kind", 10)
+        if kind.status == 0 { artifacts(evidence, path, relative + "/", listed) }
+        else { listed.add(json.quote(relative) + ": " + quoteOrNull(hashed(evidence, path, "artifact hash: " + relative))) }
+    }
+}
 public function finalize(evidence: Evidence, modes: List<Text>, status: Text, primary: Text): Text {
     let inputs: List<Text> = []
     let after: List<Text> = []
@@ -159,11 +169,8 @@ public function finalize(evidence: Evidence, modes: List<Text>, status: Text, pr
         inputs.add(json.quote(name) + ": " + quoteOrNull(evidence.digests[index]))
         after.add(json.quote(name) + ": " + quoteOrNull(current))
     }
-    let names = files.list(evidence.directory).sorted()
     let listed: List<Text> = []
-    for name in names {
-        if !fixtures.starts(name, ".") { listed.add(json.quote(name) + ": " + quoteOrNull(hashed(evidence, evidence.directory + "/" + name, "artifact hash: " + name))) }
-    }
+    artifacts(evidence, evidence.directory, "", listed)
     let quotedModes: List<Text> = []
     let native = false
     for mode in modes {
@@ -211,15 +218,15 @@ public function controls(parent: Text) {
         ", \"stderr\": " + json.quote(Text(files.readFile(stream + "/01-provider.stderr"))))
     let binding = controlDirectory(parent, "binding")
     let tool = binding + "/owned-tool"
-    writeTextFile(tool, "#!/bin/sh\nprintf changed > \"$0\"\n")
+    io.writeTextFile(tool, "#!/bin/sh\nprintf changed > \"$0\"\n")
     test.require(test.run(["chmod", "755", tool], system.environment(), "", parent + "/chmod", 10), "make owned tool executable")
     let bindingEvidence = bound(binding, binding, [])
     let mutated = run(bindingEvidence, [tool], "binding", system.environment(), "", 30, true, true)
     scenario("binding", bindingEvidence, ", \"status\": " + Text(mutated.status) + ", \"failure\": " + json.quote(mutated.failure))
     let inputs = controlDirectory(parent, "inputs")
-    writeTextFile(inputs + "/owned-source", "original")
+    io.writeTextFile(inputs + "/owned-source", "original")
     let inputEvidence = bound(inputs, inputs, ["owned-source"])
-    writeTextFile(inputs + "/owned-source", "changed")
+    io.writeTextFile(inputs + "/owned-source", "changed")
     scenario("inputs", inputEvidence, ", \"finalized\": " + json.quote(finalize(inputEvidence, ["native"], "passed", "")))
     let index = 0
     for modes in [["native"], ["native", "sanitize"], ["sanitize"]] {

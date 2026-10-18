@@ -16,6 +16,7 @@ typedef struct MinyarText {
 } MinyarText;
 
 MinyarText *minyar_read_text_file(const MinyarText *path);
+MinyarText *minyar_read_bytes_file(const MinyarText *path);
 long long minyar_text_length(MinyarText *text);
 int minyar_text_character_at(MinyarText *text, long long position);
 MinyarText *minyar_text_slice(MinyarText *text, long long first, long long end);
@@ -24,7 +25,7 @@ void minyar_rc_release(void *value);
 
 static MinyarText *load(const char *path) {
     /* The file reader borrows this path header synchronously and returns an
-     * actual owning runtime Text, including when its bytes are malformed. */
+     * actual owning runtime Text after UTF-8 validation. */
     MinyarText path_text = {(const unsigned char *)path, (long long)strlen(path), -1, NULL, NULL};
     MinyarText *text = minyar_read_text_file(&path_text);
     assert(text->character_length == -1 && text->character_offsets == NULL);
@@ -110,12 +111,12 @@ int main(int argc, char **argv) {
         minyar_rc_release(text);
     } else if (strcmp(argv[1], "raw") == 0) {
         assert(argc == 3);
-        MinyarText *text = load(argv[2]);
-        /* Raw ingress is independently observable before any validating
-         * character operation; malformed payloads must return successfully. */
-        bytes(text);
-        assert(text->character_length == -1 && text->character_offsets == NULL);
-        minyar_rc_release(text);
+        MinyarText path = {(const unsigned char *)argv[2], (long long)strlen(argv[2]), -1, NULL, NULL};
+        MinyarText *raw = minyar_read_bytes_file(&path);
+        /* Bytes preserve malformed input without constructing invalid Text. */
+        bytes(raw);
+        assert(raw->character_length >= raw->byte_length && raw->character_offsets == NULL);
+        minyar_rc_release(raw);
     } else if (strcmp(argv[1], "encode") == 0) {
         assert(argc == 3);
         char *end = NULL;
