@@ -226,6 +226,41 @@ with one exactly sized output byte buffer. The parts List, the Text header,
 and conversions of scalar values have their own allocations; this does not
 promise one allocation for the entire expression.
 
+Multi-line Text uses three quotes. Its opening delimiter is followed by a
+newline, and its closing delimiter sits on its own line:
+
+```minyar
+let invitation = """
+    Dear \(name),
+        There is a light in the harbour.
+    Come home when you are ready.
+    """
+```
+
+The newline after the opening delimiter and the newline before the closing
+delimiter are omitted. Each content line loses as many leading spaces or tabs
+as precede the closing delimiter; each space or tab counts as one column.
+A nonblank line needs at least that much indentation. Short blank lines are
+allowed, and additional indentation is preserved. CRLF line endings become LF.
+To retain a final newline, leave an empty line before the closing delimiter.
+Escapes and interpolation work as in ordinary Text. A backslash followed by a
+physical newline continues a line without including that newline; the next
+line still loses the closing delimiter's indentation.
+
+Raw Text surrounds its quotes with `#`. Backslashes, quotes and interpolation
+markers are literal characters; only the matching quote-and-`#` delimiter ends
+the value:
+
+```minyar
+let path = #"C:\Users\Ada\notes.txt"#
+let program = #"""
+    print("Hello, \(name)!")
+    """#
+```
+
+Raw multi-line Text follows the same indentation and newline rules. It does
+not interpret escapes, interpolation or line continuation.
+
 `List<T>` holds values of type `T`:
 
 ```minyar
