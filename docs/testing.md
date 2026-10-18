@@ -21,6 +21,12 @@ It runs generated programs at O0/O2 with ownership assertions and verifies that
 Swift experiments cannot be selected as ordinary backends.
 `check-language-ergonomics-sanitize` adds ASan/UBSan to the language cases.
 
+`make check-library-contracts` checks JSON control-character round trips and
+strict lookup helpers, then exercises HTTP clients against local socket peers.
+Cases include truncated and malformed responses, split headers, bodyless and
+informational responses, bounded downloads and read deadlines. macOS also runs
+the same bounded API through NSURLSession. The socket fixture requires POSIX.
+
 `make check-thread-native-regions` runs Linux mapping, sharing, atomic access,
 ownership and rejection controls. Its real x86 guest test runs when `/dev/kvm`
 is accessible on x86-64; otherwise it reports the missing KVM coverage explicitly.

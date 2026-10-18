@@ -18,6 +18,8 @@ enum { MHWakeSubtype = 0x4D59 };
 @property(nonatomic, strong) NSHTTPURLResponse *response;
 @property(nonatomic, copy) NSString *error;
 @property(nonatomic) BOOL done;
+@property(nonatomic) NSUInteger maximumBytes;
+@property(nonatomic) NSUInteger receivedBytes;
 @property(nonatomic, strong) NSCondition *condition;
 @property(nonatomic, strong) NSURLCredential *clientCredential;
 @property(nonatomic, strong) NSURL *credentialOrigin;
@@ -120,7 +122,24 @@ static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challe
     (void)s;
     MHRequest *r = requestFor(task);
     if (r && [response isKindOfClass:NSHTTPURLResponse.class]) {
-        [r.condition lock]; r.response = (NSHTTPURLResponse *)response; [r.condition unlock];
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        NSUInteger headerBytes = 0;
+        if (r.maximumBytes) {
+            for (NSString *name in http.allHeaderFields) {
+                NSString *value = [http.allHeaderFields[name] description];
+                headerBytes += [name lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
+                    [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 4;
+                if (headerBytes > 32768) {
+                    finish(r, @"HTTP headers exceed 32 KiB");
+                    handler(NSURLSessionResponseCancel); return;
+                }
+            }
+        }
+        [r.condition lock];
+        BOOL done = r.done;
+        if (!done) r.response = http;
+        [r.condition unlock];
+        if (done) { handler(NSURLSessionResponseCancel); return; }
         wake();
     }
     handler(NSURLSessionResponseAllow);
@@ -129,7 +148,17 @@ static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challe
     (void)s;
     MHRequest *r = requestFor(task);
     if (!r) return;
-    [r.condition lock]; [r.unread appendData:data]; [r.condition unlock];
+    [r.condition lock];
+    BOOL exceeded = !r.done && r.maximumBytes && data.length > r.maximumBytes - r.receivedBytes;
+    if (exceeded) {
+        r.done = YES; r.error = @"download exceeds its size limit";
+        [r.unread setLength:0]; [r.condition broadcast];
+    } else if (!r.done) {
+        [r.unread appendData:data];
+        if (r.maximumBytes) r.receivedBytes += data.length;
+    }
+    [r.condition unlock];
+    if (exceeded) [task cancel];
     wake();
 }
 - (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
@@ -187,7 +216,7 @@ static MinyarText *decode(const unsigned char *bytes, size_t length) {
 }
 
 static long long http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
-                            NSURLCredential *credential, BOOL requiresIdentity) { @autoreleasepool {
+                            NSURLCredential *credential, BOOL requiresIdentity, long long maximum, long long timeoutMs) { @autoreleasepool {
     http_owner();
     if (!session) {
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
@@ -201,13 +230,24 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
         requests = [NSMutableDictionary new];
         byTask = [NSMapTable strongToStrongObjectsMapTable];
     }
-    NSString *verb = string(method);
+    NSString *verb = method ? string(method) : @"GET";
     NSCharacterSet *token = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZ"];
     if (!verb.length || [verb rangeOfCharacterFromSet:token.invertedSet].location != NSNotFound)
         minyar_native_stop("http methods are uppercase words such as GET or POST.");
-    NSURL *address = [NSURL URLWithString:string(url)];
-    if (!address || !([address.scheme isEqualToString:@"https"] || [address.scheme isEqualToString:@"http"]) || !address.host.length)
-        minyar_native_stop("http requests need an http:// or https:// URL.");
+    if (nextRequest == LLONG_MAX) minyar_native_stop("http could not allocate a request.");
+    MHRequest *r = [MHRequest new];
+    r.unread = [NSMutableData new]; r.condition = [NSCondition new];
+    r.maximumBytes = (NSUInteger)maximum;
+    long long handle = nextRequest++;
+    requests[@(handle)] = r;
+    NSString *urlText = string(url);
+    NSURL *address = [NSURL URLWithString:urlText];
+    if (!address || !([address.scheme isEqualToString:@"https"] || [address.scheme isEqualToString:@"http"]) ||
+        !address.host.length || address.user || address.password ||
+        [urlText rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location != NSNotFound ||
+        [urlText rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) {
+        finish(r, @"http requests need a valid http:// or https:// URL"); return handle;
+    }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:address];
     request.HTTPMethod = verb;
     request.mainDocumentURL = address;
@@ -219,12 +259,7 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
         NSString *value = [[line substringFromIndex:colon.location + 1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         [request addValue:value forHTTPHeaderField:name];
     }
-    if (body->byte_length) request.HTTPBody = [NSData dataWithBytes:body->bytes length:(NSUInteger)body->byte_length];
-    if (nextRequest == LLONG_MAX) minyar_native_stop("http could not allocate a request.");
-    MHRequest *r = [MHRequest new];
-    r.unread = [NSMutableData new]; r.condition = [NSCondition new];
-    long long handle = nextRequest++;
-    requests[@(handle)] = r;
+    if (body && body->byte_length) request.HTTPBody = [NSData dataWithBytes:body->bytes length:(NSUInteger)body->byte_length];
     if (requiresIdentity && (!credential || ![address.scheme isEqualToString:@"https"] || address.user || address.password)) {
         finish(r,@"an HTTPS request requires an accessible Keychain identity and valid intermediate certificates"); return handle;
     }
@@ -240,16 +275,37 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
     }
     r.task = [(r.identitySession?:session) dataTaskWithRequest:request];
     @synchronized(byTask) { [byTask setObject:r forKey:r.task]; }
+    if (timeoutMs > 0) {
+        __weak MHRequest *weakRequest = r;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, timeoutMs * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            MHRequest *pending = weakRequest;
+            if (!pending) return;
+            [pending.condition lock];
+            BOOL expired = !pending.done;
+            if (expired) {
+                pending.done = YES; pending.error = @"download timed out";
+                [pending.unread setLength:0]; [pending.condition broadcast];
+            }
+            [pending.condition unlock];
+            if (expired) { [pending.task cancel]; wake(); }
+        });
+    }
     [r.task resume];
     return handle;
 } }
 long long minyar_http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body) {
-    return http_begin(method,url,headers,body,nil,NO);
+    return http_begin(method,url,headers,body,nil,NO,0,0);
+}
+long long minyar_http_beginBounded(const MinyarText *url, const MinyarText *headers, long long maximum, long long timeoutMs) {
+    if (maximum < 1 || maximum > 134217728 || timeoutMs < 1 || timeoutMs > 300000)
+        minyar_native_stop("invalid bounded HTTP request limits.");
+    return http_begin(NULL,url,headers,NULL,nil,NO,maximum,timeoutMs);
 }
 long long minyar_http_beginWithIdentity(const MinyarText *method, const MinyarText *url, const MinyarText *headers,
                                       const MinyarText *body, const MinyarBytes *reference, const MinyarBytes *chain) { @autoreleasepool {
     http_owner();
-    return http_begin(method,url,headers,body,http_identity_credential(reference,chain),YES);
+    return http_begin(method,url,headers,body,http_identity_credential(reference,chain),YES,0,0);
 } }
 bool minyar_http_wait(long long handle, double seconds) { @autoreleasepool {
     MHRequest *r = entry(handle);
@@ -296,6 +352,17 @@ MinyarText *minyar_http_headerText(long long handle) { @autoreleasepool {
         [lines addObject:[NSString stringWithFormat:@"%@: %@", name, fields[name]]];
     return owned([lines componentsJoinedByString:@"\n"]);
 } }
+MinyarBytes *minyar_http_readBytes(long long handle) { @autoreleasepool {
+    MHRequest *r = entry(handle);
+    atomic_store(&wakePending, false);
+    [r.condition lock];
+    size_t length = r.unread.length;
+    MinyarBytes *bytes = minyar_bytes_new((long long)length);
+    if (length) memcpy((void *)bytes->bytes, r.unread.bytes, length);
+    [r.unread setLength:0];
+    [r.condition unlock];
+    return bytes;
+} }
 MinyarText *minyar_http_read(long long handle) { @autoreleasepool {
     MHRequest *r = entry(handle);
     atomic_store(&wakePending, false);
@@ -303,7 +370,16 @@ MinyarText *minyar_http_read(long long handle) { @autoreleasepool {
     const unsigned char *bytes = r.unread.bytes;
     // Hold back a character split between chunks until the rest arrives.
     size_t length = r.done ? r.unread.length : completeUTF8(bytes, r.unread.length);
-    MinyarText *text = decode(bytes, length);
+    // Reject invalid bounded response text without constructing invalid Text.
+    // The legacy streaming API keeps its explicit UTF-8 replacement policy.
+    MinyarText *text;
+    if (r.maximumBytes && length &&
+        ![[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding]) {
+        r.error = @"HTTP body is not valid UTF-8";
+        text = owned(@"");
+    } else {
+        text = r.maximumBytes ? minyar_native_copy_text(bytes, (long long)length) : decode(bytes, length);
+    }
     [r.unread replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
     [r.condition unlock];
     return text;

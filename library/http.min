@@ -3,13 +3,13 @@ use "random" as secureRandom
 // Import it with `use "http" as http`.
 //
 // This is the portable `http`. On macOS, ./minyar finds
-// library/platform/macos/http.min first: the same Response, get, post and
-// request, through NSURLSession, plus streamed requests (start, read, ...).
+// library/platform/macos/http.min first: the same Response, get, post, request
+// and bounded downloads, through NSURLSession, plus streaming (start, read, ...).
 // Pass `--library library` to ./minyar to use this one there too.
 //
 //     let response = http.post("http://127.0.0.1:8080/ask", ["Content-Type: application/json"], "{}")
 //     print(response.status)
-//     print(response.body)
+//     match text.decode(response.body) { Ok(body) { print(body) } Err(error) { print("binary body") } }
 //
 // http:// and https:// URLs are supported; https uses the `tls` package, which
 // validates the server certificate against OS roots. Unlike the macOS backend it
@@ -18,12 +18,13 @@ use "random" as secureRandom
 // its own client in os/kernel/net/http.min over its own TCP/IP stack.
 use "net" as net
 use "tls" as tls
+use "text" as text
 
 public record Response {
     status: Integer
     reason: Text
     headers: List<Text>
-    body: Text
+    body: Bytes
     error: Text
 }
 
@@ -36,7 +37,7 @@ record Address {
 }
 
 function failed(message: Text): Response {
-    return Response { status: 0; reason: ""; headers: []; body: ""; error: message }
+    return Response { status: 0; reason: ""; headers: []; body: Bytes(); error: message }
 }
 
 // Keep the URI authority separate from the unbracketed connection host.
@@ -181,10 +182,13 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
     let message = Bytes(joinText(lines))
     message.addBytes(content)
     if address.secure {
-        return secureExchange(connection, address.host, message, limit, deadline)
+        return secureExchange(connection, address.host, method, message, limit, deadline)
     }
-    net.send(connection, message)
-    // The server closes the connection after its response.
+    if net.send(connection, message) != message.length {
+        let message = net.lastError()
+        net.close(connection)
+        return failed("HTTP send failed: " + message)
+    }
     let received = Bytes()
     while true {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
@@ -192,16 +196,23 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
         if limit > 0 { capacity = min(capacity, limit + 32768 - received.length) }
         if capacity < 1 { net.close(connection); return failed("download exceeds its size limit") }
         let chunk = net.receive(connection, capacity)
-        if chunk.length == 0 { break }
+        if chunk.length == 0 {
+            let error = net.lastError()
+            let code = net.lastErrorCode()
+            net.close(connection)
+            if code != 0 { return failed("HTTP receive failed: " + error) }
+            return readResponse(received, method, limit, true, 0, 0)
+        }
         received.addBytes(chunk)
+        let response = readResponse(received, method, limit, false, 0, 0)
+        if response.status >= 0 { net.close(connection); return response }
     }
-    net.close(connection)
-    return boundedResponse(received, limit)
 }
 
-function secureExchange(connection: Integer, host: Text, message: Bytes, limit: Integer, deadline: Integer): Response {
+function secureExchange(connection: Integer, host: Text, method: Text, message: Bytes, limit: Integer, deadline: Integer): Response {
     let session = tls.client(host, secureRandom.bytes(64))
-    net.send(connection, tls.takeOutgoing(session))
+    let hello = tls.takeOutgoing(session)
+    if net.send(connection, hello) != hello.length { net.close(connection); return failed("TLS handshake send failed") }
     let handshakeBytes = 0
     while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("TLS handshake timed out") }
@@ -214,45 +225,45 @@ function secureExchange(connection: Integer, host: Text, message: Bytes, limit: 
         if limit > 0 && handshakeBytes > 1048576 { net.close(connection); return failed("TLS handshake exceeds its size limit") }
         tls.receive(session, chunk)
         let reply = tls.takeOutgoing(session)
-        if reply.length > 0 { net.send(connection, reply) }
+        if reply.length > 0 && net.send(connection, reply) != reply.length { net.close(connection); return failed("TLS handshake send failed") }
     }
     if !tls.established(session) {
         net.close(connection)
         return failed("TLS failed: " + session.error)
     }
     tls.send(session, message)
-    net.send(connection, tls.takeOutgoing(session))
+    let outgoing = tls.takeOutgoing(session)
+    if net.send(connection, outgoing) != outgoing.length { net.close(connection); return failed("TLS request send failed") }
     let received = Bytes()
     while session.state == tls.ESTABLISHED {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
         let chunk = net.receive(connection, 65536)
-        if chunk.length == 0 { tls.endInput(session); break }
+        if chunk.length == 0 {
+            let error = net.lastError()
+            let code = net.lastErrorCode()
+            if code != 0 { net.close(connection); return failed("TLS receive failed: " + error) }
+            tls.endInput(session)
+            break
+        }
         tls.receive(session, chunk)
         received.addBytes(tls.takeIncoming(session))
         if limit > 0 && received.length > limit + 32768 {
             net.close(connection); return failed("download exceeds its size limit")
         }
+        if session.state == tls.FAILED { break }
+        let response = readResponse(received, method, limit, false, 0, 0)
+        if response.status >= 0 { net.close(connection); return response }
     }
     received.addBytes(tls.takeIncoming(session))
     net.close(connection)
     if session.state == tls.FAILED {
         return failed("TLS failed: " + session.error)
     }
-    return boundedResponse(received, limit)
+    return readResponse(received, method, limit, true, 0, 0)
 }
 
-function boundedResponse(data: Bytes, limit: Integer): Response {
-    if limit > 0 {
-        let end = headerEnd(data)
-        if end < 0 || end > 32768 || data.length - end - 4 > limit {
-            return failed("download exceeds its size limit or has invalid headers")
-        }
-    }
-    return read(data)
-}
-
-function headerEnd(data: Bytes): Integer {
-    let index = 0
+function headerEnd(data: Bytes, offset: Integer): Integer {
+    let index = offset
     while index + 3 < data.length {
         if data[index] == 13 && data[index + 1] == 10 && data[index + 2] == 13 && data[index + 3] == 10 {
             return index
@@ -262,12 +273,55 @@ function headerEnd(data: Bytes): Integer {
     return -1
 }
 
-function read(data: Bytes): Response {
-    let end = headerEnd(data)
-    if end < 0 {
-        return failed("the server's response was incomplete")
+function pending(): Response {
+    return Response { status: -1; reason: ""; headers: []; body: Bytes(); error: "" }
+}
+
+function lowerASCII(value: Text): Text {
+    let bytes = Bytes(value)
+    for index in 0..bytes.length {
+        if bytes[index] >= 65 && bytes[index] <= 90 { bytes[index] += 32 }
     }
-    let head = Text(data.slice(0, end))
+    return Text(bytes)
+}
+
+function trimSpace(value: Text): Text {
+    let start = 0
+    let end = value.length
+    while start < end && (value[start] == ' ' || value[start] == '\t') { start += 1 }
+    while end > start && (value[end - 1] == ' ' || value[end - 1] == '\t') { end -= 1 }
+    return value.slice(start, end)
+}
+
+function headerToken(character: Character): Boolean {
+    if character >= 'a' && character <= 'z' { return true }
+    if character >= 'A' && character <= 'Z' { return true }
+    if character >= '0' && character <= '9' { return true }
+    for allowed in "!#$%&'*+-.^_`|~" { if character == allowed { return true } }
+    return false
+}
+
+// A negative status is private parser state: more bytes are needed. Header
+// framing is capped at 32 KiB, including up to 16 informational responses.
+// Only close-delimited and Content-Length bodies are supported; never return
+// transfer-encoded bytes as though they were a decoded application body.
+function readResponse(data: Bytes, method: Text, limit: Integer, ended: Boolean, informational: Integer, offset: Integer): Response {
+    let end = headerEnd(data, offset)
+    if end < 0 {
+        if data.length > 32768 { return failed("HTTP headers exceed 32 KiB") }
+        if ended { return failed("the server's response was incomplete") }
+        return pending()
+    }
+    if end + 4 > 32768 { return failed("HTTP headers exceed 32 KiB") }
+    let raw = data.slice(offset, end)
+    if !text.validUTF8(raw) { return failed("invalid UTF-8 in HTTP headers") }
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte == 13 && (index + 1 >= raw.length || raw[index + 1] != 10) { return failed("invalid HTTP header line ending") }
+        if byte == 10 && (index == 0 || raw[index - 1] != 13) { return failed("invalid HTTP header line ending") }
+        if (byte < 32 && byte != 9 && byte != 10 && byte != 13) || byte == 127 { return failed("invalid control in HTTP headers") }
+    }
+    let head = Text(raw)
     let lines: List<Text> = []
     let start = 0
     for position in 0..head.length {
@@ -279,16 +333,62 @@ function read(data: Bytes): Response {
         }
     }
     lines.add(head.slice(start, head.length))
-    let status = 0
-    let reason = ""
     let first = lines[0]
-    if first.length >= 12 {
-        for character in first.slice(9, 12) {
-            status = status * 10 + Integer(character) - 48
-        }
-        reason = first.slice(min(13, first.length), first.length)
+    if first.length < 12 { return failed("invalid HTTP status line") }
+    if first.slice(0, 9) != "HTTP/1.0 " && first.slice(0, 9) != "HTTP/1.1 " { return failed("invalid HTTP status line") }
+    if first.length > 12 && first[12] != ' ' { return failed("invalid HTTP status line") }
+    let status = 0
+    for character in first.slice(9, 12) {
+        if character < '0' || character > '9' { return failed("invalid HTTP status code") }
+        status = status * 10 + Integer(character) - 48
     }
+    if status < 100 || status > 599 { return failed("invalid HTTP status code") }
+    let reason = first.slice(min(13, first.length), first.length)
     let headers: List<Text> = []
-    for index in 1..lines.length { headers.add(lines[index]) }
-    return Response { status: status; reason: reason; headers: headers; body: Text(data.slice(end + 4, data.length)); error: "" }
+    let length = -1
+    let transfer = false
+    for index in 1..lines.length {
+        let line = lines[index]
+        let colon = -1
+        for position in 0..line.length {
+            if line[position] == ':' { colon = position; break }
+            if !headerToken(line[position]) { return failed("invalid HTTP header name") }
+        }
+        if colon < 1 { return failed("invalid HTTP header") }
+        let name = lowerASCII(line.slice(0, colon))
+        let value = trimSpace(line.slice(colon + 1, line.length))
+        if name == "content-length" {
+            if value == "" { return failed("invalid HTTP Content-Length") }
+            let count = 0
+            for character in value {
+                let digit = Integer(character) - 48
+                if digit < 0 || digit > 9 || count > (9223372036854775807 - digit) / 10 { return failed("invalid HTTP Content-Length") }
+                count = count * 10 + digit
+            }
+            if length >= 0 && length != count { return failed("conflicting HTTP Content-Length headers") }
+            length = count
+        }
+        if name == "transfer-encoding" { transfer = true }
+        headers.add(line)
+    }
+    if status < 200 {
+        if status == 101 { return failed("HTTP protocol upgrades are unsupported") }
+        if informational >= 16 { return failed("too many informational HTTP responses") }
+        return readResponse(data, method, limit, ended, informational + 1, end + 4)
+    }
+    let noBody = method == "HEAD" || status == 204 || status == 304
+    if noBody { return Response { status: status; reason: reason; headers: headers; body: Bytes(); error: "" } }
+    if transfer { return failed("HTTP Transfer-Encoding is unsupported") }
+    let available = data.length - end - 4
+    if status == 205 && (length > 0 || available > 0) { return failed("HTTP 205 responses cannot contain content") }
+    if limit > 0 && (available > limit || length > limit) { return failed("download exceeds its size limit") }
+    if length >= 0 {
+        if available > length { return failed("HTTP body exceeds its Content-Length") }
+        if available < length {
+            if ended { return failed("HTTP body is shorter than its Content-Length") }
+            return pending()
+        }
+    } else if !ended { return pending() }
+    let body = data.slice(end + 4, data.length)
+    return Response { status: status; reason: reason; headers: headers; body: body; error: "" }
 }

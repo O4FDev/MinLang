@@ -1,0 +1,70 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "json" as json
+
+function jsonContracts() {
+    let controls = ""
+    for code in 0..32 { controls = controls + Text(Character(code)) }
+    let source = controls + "\"\\café😀"
+    let quoted = json.quote(source)
+    test.check(json.parse(quoted).text == source, "all JSON controls and Unicode must round-trip")
+    let object = json.parse("{" + quoted + ":" + quoted + "}")
+    test.check(json.member(json.parse(json.pretty(object, "")), source).text == source, "pretty must preserve keys and values")
+    let value = json.parse("{\"null\":null,\"string\":\"\",\"boolean\":false,\"number\":0}")
+    test.check(json.hasMember(value, "null") && !json.hasMember(value, "absent"), "JSON presence")
+    test.check(!json.hasMember(json.parse("[]"), "null"), "presence on non-object")
+    test.check(json.lookup(value, "null").kind == json.NULL, "explicit null lookup")
+    test.check(json.lookup(value, "absent").kind == json.INVALID && json.lookup(json.parse("[]"), "x").kind == json.INVALID, "strict lookup failures")
+    test.check(json.requireString(value, "string").kind == json.STRING, "empty string is successful")
+    test.check(json.requireString(value, "number").kind == json.INVALID && json.requireString(value, "null").kind == json.INVALID, "strict string kind")
+    test.check(json.requireBoolean(value, "boolean").kind == json.BOOLEAN && !json.requireBoolean(value, "boolean").truth, "false is successful")
+    test.check(json.requireNumber(value, "number").kind == json.NUMBER && json.requireNumber(value, "number").number == 0.0, "zero is successful")
+    test.check(json.requireBoolean(value, "string").kind == json.INVALID && json.requireNumber(value, "boolean").kind == json.INVALID, "strict scalar kinds")
+    test.check(json.string(value, "number") == "0" && json.member(value, "absent").kind == json.NULL, "permissive helpers stay compatible")
+    test.check(json.lookup(json.parse("{\"x\":1,\"x\":2}"), "x").number == 1.0, "lookup retains first duplicate policy")
+}
+function compile(context: fixtures.Context, native: Boolean): Text {
+    let binary = context.work + "/portable-client"
+    let command = [context.root + "/minyar"]
+    if native { binary = context.work + "/native-client" }
+    else { command.add("--library"); command.add(context.root + "/library") }
+    for item in [context.root + "/tests/library-contracts-client.min", "-o", binary] { command.add(item) }
+    test.require(fixtures.run(context, command, 600), "compile HTTP contract client")
+    return binary
+}
+function response(context: fixtures.Context, binary: Text, base: Text, path: Text, mode: Text, expected: Text) {
+    let result = fixtures.run(context, [binary, base + path, mode], 10)
+    test.check(result.status == 0 && result.errorOutput == "" && result.output == expected,
+        path + " contract (" + Text(result.status) + ")\n" + result.output + result.errorOutput + "expected\n" + expected)
+}
+jsonContracts()
+let context = fixtures.context(false)
+let helper = fixtures.helper(context, "tests/library-contracts-peer.c", "library-peer", "-pthread")
+let peer = fixtures.launch(context, [helper], 600)
+let base = "http://127.0.0.1:" + Text(fixtures.ready(context, peer))
+let portable = compile(context, false)
+for path in ["/truncated", "/bad-status", "/bad-version", "/bad-utf8", "/bare-lf", "/bad-name", "/bad-length", "/overflow", "/conflicting", "/extra", "/chunked", "/upgrade", "/oversize", "/drip", "/truncated-205", "/content-205"] {
+    response(context, portable, base, path, "bounded", "0\n0\ntrue\n")
+}
+for path in ["/truncated", "/bad-status", "/bad-utf8", "/chunked"] {
+    response(context, portable, base, path, "GET", "0\n0\ntrue\n")
+}
+for path in ["/", "/duplicate", "/informational", "/split", "/keep-open", "/close", "/binary"] {
+    response(context, portable, base, path, "bounded", "200\n2\nfalse\n")
+}
+response(context, portable, base, "/binary", "binary", "200\n255\n0\n")
+for status in [204, 205, 304] { response(context, portable, base, "/" + Text(status), "bounded", Text(status) + "\n0\nfalse\n") }
+response(context, portable, base, "/head", "HEAD", "200\n0\nfalse\n")
+response(context, portable, base, "/", "default", "200\n2\nfalse\n")
+let host = fixtures.run(context, ["uname", "-s"], 10)
+test.require(host, "host platform")
+if host.output == "Darwin\n" {
+    let native = compile(context, true)
+    for path in ["/", "/keep-open", "/close", "/binary", "/chunked"] { response(context, native, base, path, "bounded", "200\n2\nfalse\n") }
+    response(context, native, base, "/binary", "binary", "200\n255\n0\n")
+    for path in ["/oversize", "/drip", "/redirect", "/truncated"] { response(context, native, base, path, "bounded", "0\n0\ntrue\n") }
+    response(context, native, base, "/", "default", "200\n2\nfalse\n")
+}
+fixtures.stop(peer)
+fixtures.finish(context)
+print("JSON and HTTP library contracts passed")

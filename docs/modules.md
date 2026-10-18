@@ -75,9 +75,11 @@ module documents each function. The `macos` package provides native
 AppKit desktop applications and needs no third-party library. On macOS,
 `./minyar` searches [`library/platform/macos`](../library/platform/macos/http.min)
 before `library`, so `use "http"` there gets an `http` with the same
-`Response`, `get`, `post` and `request` that goes through NSURLSession: it
-validates certificates, follows redirects, decodes chunked bodies, and can
-also stream (`start`, `read`, `finished`). The portable one does none of those.
+`Response`, `get`, `post`, `request`, `getBounded` and `getBoundedWithin` APIs
+implemented through NSURLSession. Both backends validate TLS certificates.
+The macOS backend also follows redirects, decodes chunked bodies, and provides
+streaming extensions (`start`, `read`, `finished`). The portable backend does
+not follow redirects and rejects unsupported transfer encodings explicitly.
 `./minyar --library library` picks the portable one on macOS too.
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or
@@ -125,6 +127,60 @@ It uses the `machine` module's memory operations; rendering policy is ordinary
 library code. Thread-domain, ownership and channel checks remain compiler
 responsibilities. Native-backed module functions use the shared runtime ABI. Streaming text
 parts is ordinary library iteration over private buffered-writer operations.
+
+## Bounded HTTP requests
+
+`Response.body` is Bytes in both implementations. HTTP can carry binary data,
+including zero bytes and invalid UTF-8, without decoding or replacement.
+Use `text.decode(response.body)` for recoverable UTF-8 decoding or
+`json.parseBytes(response.body, limit)` for validated JSON. The macOS streaming
+API also offers `readBytes(handle)` for raw chunks; `read(handle)` is explicitly
+text-oriented and replaces malformed sequences.
+
+Both HTTP packages accept `getBounded(url, headers, limit)` and
+`getBoundedWithin(url, headers, limit, timeoutMs)`. The body limit is 1 through
+134,217,728 bytes; the timeout is 1 through 300,000 milliseconds, defaulting
+to 30,000. Failures return a `Response` with status zero, empty body and a
+nonempty `error`; check that field before consuming the response. HTTP error
+statuses such as 404 are still complete responses, so check `status` separately.
+
+The portable backend validates the status line, header bytes and declared
+body length. A truncated Content-Length body or malformed header is an error,
+not a successful partial download. HEAD, no-body statuses and informational
+responses receive their appropriate framing treatment. Protocol switching and
+transfer encodings such as chunked are unsupported by that backend.
+
+The portable timeout bounds reads after connection establishment; DNS and the
+initial blocking connection retain platform timeouts. On macOS, the deadline
+covers the NSURLSession request including redirects, and the body limit applies
+to decoded response bytes. Both cap HTTP header storage at 32 KiB for bounded
+requests. These controls do not promise a universal bound on OS or TLS memory.
+
+## JSON validation
+
+`json.quote` preserves control characters with JSON escapes, including embedded
+zero bytes. `json.pretty` uses the same writer. To distinguish absent keys,
+explicit nulls and type errors, use the strict lookup helpers:
+
+```minyar
+use "json" as json
+let value = json.parse("{\"name\":\"Ada\",\"nickname\":null}")
+print(json.hasMember(value, "nickname")) // true, even though its value is null
+let name = json.requireString(value, "name")
+if name.kind == json.INVALID {
+    print(name.text)                    // a diagnostic
+} else {
+    print(name.text)                    // Ada
+}
+```
+
+`lookup(value, name)` returns the member, or an `INVALID` Value with a diagnostic
+in `text` when the input is not an object or the name is missing. Explicit null
+remains a `NULL` Value. `requireString`, `requireBoolean` and `requireNumber`
+also reject a member of the wrong kind without coercion. They return the
+matching Value on success; read its `text`, `truth` or `number` field as
+appropriate. Duplicate keys use the first match; use `parseUnique` to reject
+duplicates. Existing `member` and `string` remain permissive convenience APIs.
 
 ## Scalability and rebuilds
 
