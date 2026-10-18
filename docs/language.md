@@ -472,6 +472,8 @@ records; `!=` is its opposite. Separately allocated records can be equal.
 Aliasing and mutation retain their reference semantics. Equality does not test
 reference identity, and has no identity shortcut: a record containing NaN is
 unequal even to itself. Derived equality cannot recurse through a cycle.
+Map and Set fields are Equatable when their collection equality is defined.
+These mutable collection fields do not make a record Ordered or Hashable.
 
 Record order is lexicographic in field declaration order. `list.sort()` and
 `list.sorted()` accept Ordered records, as do `<`, `>`, `<=` and `>=`.

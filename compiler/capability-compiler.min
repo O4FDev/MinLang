@@ -35,10 +35,46 @@ function recordCapabilityHasNative(context: CompilerContext, type: Integer): Boo
     return false
 }
 
-function requireRecordCapability(context: CompilerContext, type: Integer, capability: Text, location: Integer) {
+function visitTypeCapability(context: CompilerContext, type: Integer, capability: Text, path: List<Integer>): Boolean {
+    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 { return true }
+    if capability == "Equatable" && isSetType(type) { return visitTypeCapability(context, setElementType(type), "Hashable", path) }
+    if capability == "Equatable" && isMapType(type) {
+        while isMapType(type) {
+            if !visitTypeCapability(context, mapKeyType(type), "Hashable", path) { return false }
+            type = mapValueType(type)
+        }
+        if isSetType(type) { return visitTypeCapability(context, setElementType(type), "Hashable", path) }
+        return type == 1 || type == 2 || type == 3 || type == 4 || type == 7
+    }
+    if !isRecordType(type) || isCallbackType(type, context.functionNames) || isCRecord(context, type) { return false }
+    let index = 0
+    let nested: List<Integer> = []
+    while index < path.length {
+        if path[index] == type { return false }
+        nested.add(path[index])
+        index = index + 1
+    }
+    nested.add(type)
+    let record = type - 1000
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    index = 0
+    while index < context.functionParameterCounts[record] {
+        let field = context.functionParameterTypes[first + index]
+        if field != 5 && !visitTypeCapability(context, field, capability, nested) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+function typeSupportsCapability(context: CompilerContext, type: Integer, capability: Text): Boolean {
+    if capability != "Equatable" && capability != "Ordered" && capability != "Hashable" { return false }
     let path: List<Integer> = []
-    if !capabilityTypeSupported(type, context.functionParameterCounts, context.functionParameterTypes, context.functionNames, path) || recordCapabilityHasNative(context, type) {
-        fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(context.functionNames[type - 1000]) + "' is not " + capability + "; derived capabilities need finite record fields of Integer, Text, Character, Boolean, Float, or another capable record; recursive records, Lists, Bytes, callbacks and native records need an explicit operation")
+    return visitTypeCapability(context, type, capability, path)
+}
+
+function requireRecordCapability(context: CompilerContext, type: Integer, capability: Text, location: Integer) {
+    if !typeSupportsCapability(context, type, capability) {
+        fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(context.functionNames[type - 1000]) + "' is not " + capability + "; every field must be " + capability + " and the record shape must be finite; Lists, Bytes, callbacks, native records and recursive shapes need an explicit operation")
     }
 }
 
@@ -111,6 +147,16 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
                 code.add(")\n")
             } else {
                 if operation == "equal" {
+                    if isMapType(field) || isSetType(field) {
+                        declareMapRuntime(globals)
+                        let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
+                        if findText(globals, declaration) < 0 { globals.add(declaration) }
+                        let valueType = mapValueType(field)
+                        if isSetType(field) { valueType = 4 }
+                        code.add("  %left.pointer." + id + " = inttoptr i64 " + left + " to ptr\n")
+                        code.add("  %right.pointer." + id + " = inttoptr i64 " + right + " to ptr\n")
+                        code.add("  " + value + " = call zeroext i1 @minyar_maps_are_equal(ptr %left.pointer." + id + ", ptr %right.pointer." + id + ", i64 " + Text(valueType) + ")\n")
+                    } else {
                     if field == 2 {
                         let declaration = "declare zeroext i1 @minyar_equal_slots(i64, i64, i64)\n"
                         if findText(globals, declaration) < 0 { globals.add(declaration) }
@@ -121,6 +167,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
                             code.add("  %right.float." + id + " = bitcast i64 " + right + " to double\n")
                             code.add("  " + value + " = fcmp oeq double %left.float." + id + ", %right.float." + id + "\n")
                         } else { code.add("  " + value + " = icmp eq i64 " + left + ", " + right + "\n") }
+                    }
                     }
                 } else {
                     if operation == "compare" {

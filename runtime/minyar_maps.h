@@ -250,6 +250,7 @@ MinyarList *minyar_map_keys(const MinyarRecord *map) {
 
 _Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
                             long long value_type) {
+    if (!left || !right) return left == right;
     if (left->values[MAP_LENGTH] != right->values[MAP_LENGTH] ||
         left->values[MAP_KEY_KIND] != right->values[MAP_KEY_KIND])
         return 0;
