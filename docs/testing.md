@@ -28,6 +28,11 @@ deletion, iteration, Float keys and rejected element types. The seed-library
 gallery runs at O0/O2 with ownership assertions. Its sanitizer variant is
 `check-record-collections-sanitize`.
 
+`make check-method-library` checks the errors and JSON method aliases alongside
+the original functions, private-field access, methods sharing field names,
+callable fields and closures capturing `self`. Its O0/O2 programs assert ownership
+cleanup. `check-method-library-sanitize` adds ASan/UBSan.
+
 `make check-declaration-index` compares hashed declaration lookup with a linear
 oracle, including collisions, Unicode, duplicate names and separate declaration
 kinds, then runs the constellation gallery at O0/O2 with ownership checks.

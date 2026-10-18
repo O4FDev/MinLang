@@ -194,6 +194,21 @@ UTF-8, Unicode escapes, nesting and decoded duplicate-name checks remain strict.
 The byte limit bounds the wire document; it is not an allocation-byte limit.
 Callers must choose limits appropriate to their protocol.
 
+Records can expose the same operations as methods. `errors.IntegerResult` and
+`errors.BooleanResult` offer `ok()`, `value()` and `error()`; an `errors.Error`
+offers `code()`, `nativeCode()`, `message()` and `isError()`. These aliases use
+the original functions and preserve their checks:
+
+```minyar
+use "errors" as errors
+let result = errors.checkedAdd(20, 22)
+if result.ok() { print(result.value()) }
+```
+
+JSON Values offer `hasMember(name)`, `lookup(name)`, `member(name)`,
+`requireString(name)`, `requireBoolean(name)`, `requireNumber(name)` and
+`pretty(indent)`. Existing module functions continue to work.
+
 ## Scalability and rebuilds
 
 Ordinary builds compile the complete reachable source graph. The opt-in

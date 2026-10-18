@@ -520,7 +520,10 @@ Methods belong to the module that declares their record. Mark a method
 The receiver and arguments are evaluated once, from left to right, and the
 receiver stays alive throughout the call. Methods compile to direct function
 calls with an implicit first argument, without dynamic dispatch or vtables.
-Callable fields keep their existing call syntax.
+`value.name` reads a field; `value.name(...)` calls a declared method when
+one has that name. Otherwise it calls the field's callable value. A method and
+a field may share a name, which lets a public method check access to a private
+stored value without exposing the field itself.
 
 Construction uses record literals or ordinary named functions, such as
 `bank.open("Ada")`. A dotted declaration always takes a receiver; there is no
@@ -576,7 +579,7 @@ changing the original record afterwards leaves the stored key intact. Iteration
 also returns snapshots, so changing an iterated record cannot change a Map key.
 Snapshotting copies record fields recursively and shares immutable Text. It
 costs time and space proportional to the record fields copied; internal record
-sharing is not preserved. Scalar keys keep their existing storage and cost.
+sharing is not preserved. Scalar keys keep their existing storage and are not copied.
 Float keys, including Float fields in record keys, reject NaN and treat signed
 zeros as the same key.
 
