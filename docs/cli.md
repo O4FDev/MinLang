@@ -153,13 +153,17 @@ information; local-variable/type inspection is not yet implemented. Release
 builds omit this debug information.
 
 `check` validates the entry point and top-level `tests/*.min` without linking.
-`test` validates the entry point, then compiles and runs each top-level
+`test` validates the entry point, discovers named `test "name" { ... }` blocks
+in source modules and dependencies, then runs those blocks with access to their
+module's private declarations. Ordinary application statements are excluded
+from module test executables. It also compiles and runs each top-level
 `tests/*.min` as an independent executable, in sorted filename order. Keep
-support modules outside that directory, or in subdirectories. Tests report
-failure by exiting nonzero (`fail("message")` is sufficient).
+support modules outside that directory, or in subdirectories. Use `expect(...)`
+inside a test block; standalone tests report failure by exiting nonzero
+(`fail("message")` is sufficient). See the [testing guide](testing.md).
 
 ```sh
-minyar test smoke                 # filename substring filter
+minyar test smoke                 # module-test name or filename substring
 minyar test --release -- --verbose
 minyar build --locked
 minyar clean
@@ -205,8 +209,11 @@ backend. `minyar --help` describes file compilation; `minyar help` describes
 project commands. Repository maintenance still uses Make targets; `minyar test`
 is for user projects, not the compiler repository's full test suite.
 
-Editor/LSP integration, a Minyar source formatter and workspaces remain separate
-tooling work.
+`minyar fmt src tests` formats Minyar source; `--check` reports files needing
+formatting, and `--stdout FILE` previews one file. See the [style guide](style.md)
+for canonical layout and file handling. `minyar lsp --stdio` starts the language
+server for diagnostics, completion, navigation and formatting; the
+[editor guide](editor.md) describes client setup and current navigation limits.
 
 ## Package discovery and release records
 
