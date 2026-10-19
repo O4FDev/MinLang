@@ -140,6 +140,7 @@ struct Statement {
 
 struct Function {
     char *name;
+    char *native_library;
     Parameter *parameters;
     Type return_type;
     int return_was_written;
@@ -1058,7 +1059,38 @@ static Function parse_function(Parser *parser) {
     } else {
         function.return_type = TYPE_NOTHING;
     }
-    function.body = parse_block(parser);
+    expect(parser, '{', "an opening brace");
+    skip_separators(parser);
+    int native_body = 0;
+    if (word_is(parser, "native")) {
+        Lexer lookahead = parser->lexer;
+        lookahead.pending = NULL;
+        lookahead.pending_index = 0;
+        Token following = next_token(&lookahead);
+        native_body = following.kind == TOKEN_TEXT;
+        discard_token(&following);
+        arrfree(lookahead.pending);
+    }
+    if (native_body) {
+        advance(parser);
+        if (parser->token.kind != TOKEN_TEXT || strcmp(parser->token.text, "runtime"))
+            fail_at(parser->token.line, parser->token.column,
+                    "bootstrap native functions use the runtime library");
+        if (!strcmp(function.name, "main"))
+            fail_at(function.line, function.column, "main cannot have a native body");
+        function.native_library = copy_text("runtime", 7);
+        advance(parser);
+        skip_separators(parser);
+        expect(parser, '}', "a closing brace after the native body");
+    } else {
+        while (parser->token.kind != '}') {
+            if (parser->token.kind == TOKEN_EOF)
+                fail_at(parser->token.line, parser->token.column, "this block needs a closing brace");
+            arrput(function.body, parse_statement(parser));
+            skip_separators(parser);
+        }
+        advance(parser);
+    }
     return function;
 }
 
@@ -1716,7 +1748,7 @@ static void check_program(Program *program) {
                       parameter->column);
         }
         check_statements(program, function, function->body, 0);
-        if (function->return_type != TYPE_NOTHING && strcmp(function->name, "main") != 0 &&
+        if (!function->native_library && function->return_type != TYPE_NOTHING && strcmp(function->name, "main") != 0 &&
             (!arrlen(function->body) || !statement_guarantees_return(&arrlast(function->body))))
             fail_at(function->line, function->column, "'%s' promises to return %s on every path",
                     function->name, type_name(function->return_type));
@@ -2442,6 +2474,32 @@ static void emit_program(FILE *output, Program *program) {
 
     for (index = 0; index < (size_t)arrlen(program->functions); index++) {
         Function *function = &program->functions[index];
+        if (function->native_library) {
+            const char *result = function->return_type == TYPE_BOOLEAN ? "zeroext i1" : llvm_type(function->return_type);
+            fprintf(output, "declare %s @minyar_runtime_%s(", result, function->name);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
+                if (parameter_index) fputs(", ", output);
+                Type type = function->parameters[parameter_index].type;
+                fputs(type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), output);
+            }
+            fprintf(output, ")\ndefine %s @.minyar.fn.%s(", llvm_type(function->return_type), function->name);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
+                if (parameter_index) fputs(", ", output);
+                fprintf(output, "%s %%argument.%zu", llvm_type(function->parameters[parameter_index].type), parameter_index);
+            }
+            fputs(") {\nentry:\n  ", output);
+            if (function->return_type != TYPE_NOTHING) fputs("%native.result = ", output);
+            fprintf(output, "call %s @minyar_runtime_%s(", result, function->name);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
+                if (parameter_index) fputs(", ", output);
+                Type type = function->parameters[parameter_index].type;
+                fprintf(output, "%s %%argument.%zu", type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), parameter_index);
+            }
+            fprintf(output, ")\n  ret %s", llvm_type(function->return_type));
+            if (function->return_type != TYPE_NOTHING) fputs(" %native.result", output);
+            fputs("\n}\n\n", output);
+            continue;
+        }
         Type emitted_return =
             strcmp(function->name, "main") == 0 ? TYPE_UNKNOWN : function->return_type;
         emitter.function = function;

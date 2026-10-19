@@ -1,0 +1,7 @@
+.PHONY: check-bootstrap-native
+check-bootstrap-native: build/stage0 build/minyar-compiler-runtime.ll build/tooling/tests/bootstrap-native
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/bootstrap-native
+
+check check-portable: check-bootstrap-native
+
+build/tooling/tests/diagnostics.ll: tests/frontend-fixtures.min
