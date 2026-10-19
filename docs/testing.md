@@ -103,7 +103,9 @@ counts check unboxed scalar calls and diamond-import deduplication. The generics
 gallery is an executable output fixture. Generic record cases cover field inference,
 nested Lists, namespace shadowing, private modules, callback and method composition,
 and per-instantiation traced/scalar allocator selection with escaping records.
-`check-generics-sanitize` repeats both suites with compiler and generated-program
+Literal cases distinguish punctuation/keyword contents from syntax and preserve
+operand inference inside Boolean comparisons and module-keyword local names.
+`check-generics-sanitize` repeats all three suites with compiler and generated-program
 sanitizers.
 `make check-generics-smoke` is the fast landing check for native signatures,
 executable O0/O2 output and a rejection diagnostic. Run the full ownership suite
