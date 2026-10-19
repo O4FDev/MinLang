@@ -5,6 +5,10 @@ single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery
 run at O0/O2 with ownership assertions. Project CLI discovery includes nested
 modules and dependencies and preserves the existing integration-test runner.
+`make check-module-tests-cli` also checks worker settings, ordered captured
+reports and raw binary output. Where `mkfifo` is available, a blocking FIFO
+exchange between a project case and a dependency case proves they overlap;
+the test does not use timing or sleep polling as its concurrency oracle.
 
 `make check-doc-comments` checks lexer-backed documentation, generic and alias
 signatures, fields, choice cases, methods, Unicode locations, BOM/CRLF input

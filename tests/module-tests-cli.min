@@ -2,6 +2,7 @@ use "../tools/testing.min" as test
 use "../tools/driver-support.min" as host
 use "io" as io
 use "system" as system
+use "files" as files
 
 let root = host.resolveName(".")
 let work = test.scratch()
@@ -16,7 +17,7 @@ io.writeTextFile(dependency + "/src/poems.min", "public function answer(): Integ
 io.writeTextFile(application + "/src/main.min", "use \"poems\" as poems\nglobal warm: Integer = announce()\nfunction announce(): Integer { print(\"a module initializer\"); return 1 }\nfunction main(): Integer { fail(\"application must not run\"); return 0 }\ntest \"home light\" { expect(poems.answer() == 42); expect(warm == 1) }\n")
 io.writeTextFile(application + "/src/nested/harbour.min", "function light(): Text { return \"home\" }\ntest \"nested light\" { expect(light() == \"home\") }\n")
 io.writeTextFile(application + "/tests/smoke.min", "print(\"integration light\")\n")
-let launcher = root + "/minyar"
+let launcher = test.setting("MINYAR_TEST_LAUNCHER", root + "/minyar")
 let success = test.run([launcher, "test"], system.environment(), application, work + "/success", 600)
 test.require(success, "discover module and dependency tests")
 for expected in ["home light", "nested light", "dependency light", "integration light", "4 passed; 0 failed"] { test.check(test.contains(success.output, expected), "discovery contains " + expected + "\n" + success.output) }
@@ -28,5 +29,60 @@ let failed = test.run([launcher, "test"], system.environment(), application, wor
 test.check(failed.status == 1, "aggregate test failure exit")
 test.check(test.contains(failed.errorOutput, "expected 3, got 4"), "failure renders both values")
 test.check(test.contains(failed.output, "still shining") && test.contains(failed.output, "4 passed; 1 failed"), "later module and integration tests still run\n" + failed.output + failed.errorOutput)
+let environment: List<Text> = []
+for entry in system.environment() { if !entry.startsWith("MINYAR_TEST_JOBS=") { environment.add(entry) } }
+let serialEnvironment: List<Text> = []
+for entry in environment { serialEnvironment.add(entry) }
+serialEnvironment.add("MINYAR_TEST_JOBS=1")
+let serial = test.run([launcher, "test", "home light"], serialEnvironment, application, work + "/serial", 600)
+test.require(serial, "serial module test override")
+test.check(test.contains(serial.output, "1 passed; 0 failed"), "one-worker result")
+let invalidEnvironment: List<Text> = []
+for entry in environment { invalidEnvironment.add(entry) }
+invalidEnvironment.add("MINYAR_TEST_JOBS=0")
+let invalid = test.run([launcher, "test"], invalidEnvironment, application, work + "/invalid-jobs", 600)
+test.check(invalid.status == 1 && test.contains(invalid.errorOutput, "MINYAR_TEST_JOBS must be an integer from 1 to 64"), "invalid worker count")
+let fifo = host.which("mkfifo")
+if fifo != "" {
+    let pipe = application + "/rendezvous.pipe"
+    test.require(test.run([fifo, pipe], environment, "", work + "/fifo", 30), "create private concurrency rendezvous")
+    let program = #"""
+        use "system" as system
+        function exchange(script: Text): Integer {
+            let arguments = ["sh", "-c", script, "rendezvous", "rendezvous.pipe"]
+            let child = system.spawn("/bin/sh", arguments, system.environment(), "")
+            if child < 0 { return 1 }
+            return system.wait(child).exitCode
+        }
+        test "rendezvous sender" {
+            expect(exchange("printf 'sea\\n' >\"$1\"") == 0)
+            print("sender complete")
+        }
+        test "rendezvous reader" {
+            expect(exchange("IFS= read -r line <\"$1\"; test \"$line\" = sea") == 0)
+            print("reader complete")
+        }
+        """#
+    let sender = program.find("test \"rendezvous sender\"")
+    let reader = program.find("test \"rendezvous reader\"")
+    test.check(sender >= 0 && reader > sender, "rendezvous fixture boundaries")
+    io.writeTextFile(application + "/src/rendezvous.min", program.slice(0, reader))
+    io.writeTextFile(dependency + "/src/rendezvous.min", program.slice(0, sender) + program.slice(reader, program.length))
+    environment.add("MINYAR_TEST_JOBS=2")
+    let concurrent = test.run([launcher, "test", "rendezvous"], environment, application, work + "/concurrent", 600)
+    test.require(concurrent, "two tests complete one blocking FIFO exchange")
+    test.check(test.contains(concurrent.output, "2 passed; 0 failed") && test.contains(concurrent.output, "sender complete") && test.contains(concurrent.output, "reader complete"), "both overlapping cases finished")
+    test.check(concurrent.output.find("✓ rendezvous sender") < concurrent.output.find("✓ rendezvous reader"), "captured case reports preserve source order")
+}
+io.writeTextFile(application + "/src/binary.min", "use \"files\" as files\ntest \"binary output\" { let bytes = Bytes(2); bytes[0] = 255; bytes[1] = 0; expect(files.write(1, bytes, 0, 2) == 2) }\n")
+let binary = test.start([launcher, "test", "binary output"], environment, application, work + "/binary", 600)
+test.check(binary > 0, "start binary-output test")
+let binaryStatus = system.wait(binary)
+test.check(binaryStatus.state == system.EXITED && binaryStatus.exitCode == 0, "binary-output test succeeds")
+let bytes = files.readFile(work + "/binary")
+test.check(files.lastError() == 0, "read captured binary test output")
+let preserved = false
+for index in 0..(bytes.length - 1) { if bytes[index] == 255 && bytes[index + 1] == 0 { preserved = true } }
+test.check(preserved, "captured output preserves invalid UTF-8 and zero bytes")
 test.removeTree(work)
 print("Module test CLI: passed")

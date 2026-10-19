@@ -1,6 +1,7 @@
 use "./project.min" as project
 use "./driver-support.min" as host
 use "system" as system
+use "files" as files
 use "json" as json
 
 public record Report { count: Integer; failures: Integer }
@@ -34,8 +35,83 @@ function execute(arguments: List<Text>, directory: Text): Integer {
     return status.exitCode
 }
 
+record Case { name: Text; source: Text; executable: Text; index: Text }
+record Job { item: Case; handle: Integer; output: Text; errors: Text }
+
+function jobLimit(): Integer {
+    let configured = host.setting("MINYAR_TEST_JOBS", "2")
+    let value = 0
+    let valid = configured.length > 0
+    for character in configured {
+        if character < '0' || character > '9' { valid = false; break }
+        value = value * 10 + Integer(character) - 48
+        if value > 64 { valid = false; break }
+    }
+    if !valid || value < 1 { host.stop("MINYAR_TEST_JOBS must be an integer from 1 to 64") }
+    return value
+}
+
+function copyOutput(path: Text, descriptor: Integer): Boolean {
+    let file = files.open(path, files.READ)
+    if file < 0 { return false }
+    let position = 0
+    let success = true
+    while true {
+        let chunk = files.readAt(file, position, 65536)
+        if files.lastError() != 0 { success = false; break }
+        if chunk.length == 0 { break }
+        if files.write(descriptor, chunk, 0, chunk.length) != chunk.length { success = false; break }
+        position += chunk.length
+    }
+    if files.close(file) != 0 { success = false }
+    return success
+}
+
+function finishJob(job: Job, report: Report) {
+    let waited = system.wait(job.handle)
+    let status = waited.exitCode
+    if waited.state == system.SIGNALED { status = 128 + waited.signal }
+    if waited.state != system.EXITED && waited.state != system.SIGNALED { status = 1 }
+    if status != 0 {
+        report.failures += 1
+        system.writeStandardError("  × " + job.item.name + " · " + job.item.source + " (exit " + Text(status) + ")\n")
+    } else { files.writeStandardOutput("  ✓ " + job.item.name + " · " + job.item.source + "\n") }
+    let output = copyOutput(job.output, 1)
+    let errors = copyOutput(job.errors, 2)
+    if !output || !errors {
+        if status == 0 { report.failures += 1 }
+        system.writeStandardError("    cannot read the test's captured output\n")
+    }
+}
+
+function runCases(cases: List<Case>, root: Text, directory: Text, forwarded: List<Text>, limit: Integer): Report {
+    let report = Report { count: cases.length; failures: 0 }
+    if cases.length == 0 { return report }
+    let shell = host.which("sh")
+    if shell == "" { host.stop("sh is required to capture module test output") }
+    let work = host.temporaryDirectory(directory, ".module-output-")
+    let pending: List<Job> = []
+    let next = 0
+    for index in 0..cases.length {
+        if pending.length - next == limit { finishJob(pending[next], report); next += 1 }
+        let item = cases[index]
+        let output = work + "/case-" + Text(index) + ".stdout"
+        let errors = work + "/case-" + Text(index) + ".stderr"
+        let arguments = [shell, "-c", "output=$1; errors=$2; shift 2; exec \"$@\" >\"$output\" 2>\"$errors\"", "minyar-test", output, errors, item.executable, item.index]
+        for argument in forwarded { arguments.add(argument) }
+        let handle = system.spawn(shell, arguments, system.environment(), root)
+        if handle < 0 {
+            report.failures += 1
+            system.writeStandardError("  × " + item.name + " · " + item.source + " (cannot start test: " + Text(handle) + ")\n")
+        } else { pending.add(Job { item: item; handle: handle; output: output; errors: errors }) }
+    }
+    while next < pending.length { finishJob(pending[next], report); next += 1 }
+    return report
+}
+
 public function run(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, forwarded: List<Text>): Report {
-    let report = Report { count: 0; failures: 0 }
+    let limit = jobLimit()
+    let cases: List<Case> = []
     let serial = 0
     for source in sources(graph) {
         let discover = compilerArguments(graph, compiler)
@@ -59,15 +135,8 @@ public function run(graph: project.Graph, compiler: Text, directory: Text, relea
             if parsed.kind != json.STRING { host.stop("invalid module test name: " + source) }
             let name = parsed.text
             if filter != "" && !host.hasText(source, filter) && !host.hasText(name, filter) { continue }
-            report.count += 1
-            let arguments = [output, index]
-            for argument in forwarded { arguments.add(argument) }
-            let status = execute(arguments, graph.packages[0].root)
-            if status != 0 {
-                report.failures += 1
-                system.writeStandardError("  × " + name + " · " + source + " (exit " + Text(status) + ")\n")
-            } else { print("  ✓ " + name + " · " + source) }
+            cases.add(Case { name: name; source: source; executable: output; index: index })
         }
     }
-    return report
+    return runCases(cases, graph.packages[0].root, directory, forwarded, limit)
 }

@@ -26,6 +26,11 @@ process; a failed test does not prevent the remaining tests from running.
 Existing `tests/*.min` programs run too. A substring filter matches module
 paths, test names and integration-test filenames.
 
+Two module tests can run at once. `MINYAR_TEST_JOBS=1 minyar test` runs them
+serially; the setting accepts 1–64 workers. Each case's captured output is
+reported together, in discovery order. All module test binaries are built
+before their cases begin running.
+
 `expect(condition)` requires a Boolean. A failed expectation includes its
 source expression and file:line:column. A direct comparison also shows the
 right and left values, evaluated once from left to right. Scalars and finite

@@ -72,6 +72,9 @@ members across the resolved project and dependencies. Its substring filter
 matches a module path or an example's declaration name. These results share
 the summary with module tests and `tests/*.min` programs.
 
+Module cases use two workers by default and report captured output in
+discovery order. Set `MINYAR_TEST_JOBS=1` for cases that need serial execution.
+
 The small prose format supports paragraphs, backtick code, headings, lists and
 fenced code. Other code fences are displayed without execution. Raw HTML is
 escaped. See [the living tests gallery](../examples/gallery/living-tests.min)
