@@ -208,3 +208,7 @@ and walks ARM64 compact unwind/DWARF CFI. Linux reads ELF symbols only after a
 failure and uses the platform unwinder. If symbols or unwind information are
 unavailable, the registry supplies an entry location. No C runtime failure is
 caught or converted to recoverable control flow by this reporter.
+
+The JSON contract covers explicit compiler diagnostics and source-read errors.
+Host failures writing LLVM or cache files still use runtime reports. Hosted Linux currently loads libgcc_s for unwinding; this is a fixed
+startup cost, so a strict zero-instruction claim does not apply there.

@@ -1254,7 +1254,7 @@ option describes compiler diagnostics; it does not change a program's arguments.
 Trace names and source locations are static data. There is no call/return
 instrumentation, thread-local trace stack or normal-path allocation. Metadata
 increases binary size, and unwind tables remain available in optimized builds.
-On macOS ARM64 the cold reader adds no loader bindings. Whole-process retired
+On macOS ARM64 the cold reader adds no loader bindings. Hosted Linux uses the system unwinder and adds a `libgcc_s` dependency, with library-loading work at startup. Whole-process retired
 instruction samples vary with startup and allocation; the measured LLVM
 function bodies contain zero additional normal-path instructions.
 
