@@ -5,3 +5,4 @@ build/tooling/tools/format-cli build/tooling/tests/format: build/tooling/%: buil
 .PHONY: check-minyar-format
 check-minyar-format: build/tooling/tools/format-cli build/tooling/tests/format build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/format "$(CURDIR)/build/tooling/tools/format-cli"
+	python3 tests/editor-files.py "$(CURDIR)/build/tooling/tools/format-cli"

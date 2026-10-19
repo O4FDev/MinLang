@@ -21,6 +21,10 @@ static char *editor_path(const MinyarText *text) {
 }
 MinyarText *minyar_editorhost_kind(const MinyarText *text) {
     char *path = editor_path(text);
+    if (path) {
+        size_t length = strlen(path);
+        while (length > 1 && path[length - 1] == '/') path[--length] = 0;
+    }
     struct stat info;
     char kind = '?';
     if (path && !lstat(path, &info)) kind = S_ISREG(info.st_mode) ? 'f' : S_ISDIR(info.st_mode) ? 'd' : 'o';
@@ -66,7 +70,12 @@ long long minyar_editorhost_replace(const MinyarText *text, const MinyarBytes *b
     if (!error && fsync(output)) error = errno;
     if (output >= 0 && close(output) && !error) error = errno;
     struct stat current;
-    if (!error && (lstat(path, &current) || current.st_dev != info.st_dev || current.st_ino != info.st_ino || current.st_size != info.st_size || current.st_mtime != info.st_mtime)) error = EBUSY;
+    if (!error && (lstat(path, &current) || current.st_dev != info.st_dev || current.st_ino != info.st_ino || current.st_size != info.st_size || current.st_mtime != info.st_mtime || current.st_ctime != info.st_ctime)) error = EBUSY;
+#ifdef __APPLE__
+    if (!error && (current.st_mtimespec.tv_nsec != info.st_mtimespec.tv_nsec || current.st_ctimespec.tv_nsec != info.st_ctimespec.tv_nsec)) error = EBUSY;
+#else
+    if (!error && (current.st_mtim.tv_nsec != info.st_mtim.tv_nsec || current.st_ctim.tv_nsec != info.st_ctim.tv_nsec)) error = EBUSY;
+#endif
     if (!error && rename(temporary, path)) error = errno;
     if (error && output >= 0) unlink(temporary);
     free(temporary);

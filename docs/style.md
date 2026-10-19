@@ -37,7 +37,10 @@ including interpolation expressions, raw text and the indentation inside
 multiline text. Changing that indentation could change the value. Existing
 line breaks are retained because Minyar uses them to end statements. Explicit
 semicolons become line breaks wherever newlines can serve as separators;
-inside parentheses and Lists they remain explicit. Existing paragraph breaks
+inside parentheses and Lists they remain explicit. Optional commas between
+record fields become line breaks; argument, List and generic commas remain.
+Match arms occupy separate lines, and `else` stays beside its closing brace
+when no comment intervenes. Existing paragraph breaks
 collapse to one empty line. Files end in one newline. The formatter does not
 sort imports, rename names, rewrite expressions or wrap long literal text.
 
