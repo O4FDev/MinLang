@@ -111,7 +111,8 @@ converting every old failure to this API is a separate migration.
 
 `make check-syntax-tree` verifies resolved types, precedence, sibling and
 parent links, contained ranges, reachability, Unicode and cached locations,
-the error API and 50,000 nested builder nodes. It also checks contextual names,
-quoted keywords and the operator on `try` expressions. The observatory gallery and
+the error API and 50,000 nested builder nodes. It also checks contextual names
+(including ordinary locals named `Map` and `Set`), quoted keywords and the operator
+on `try` expressions. The observatory gallery and
 expression fixtures run at O0/O2 with ownership assertions. The ordinary
 conformance and example corpora separately check emitted LLVM bytes.
