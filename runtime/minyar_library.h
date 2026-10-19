@@ -312,6 +312,82 @@ double minyar_atan2(double y, double x) {
     return atan2(y, x);
 }
 
+/* Recoverable whole-file I/O captures an errno in a private native snapshot.
+ * Neither empty files nor truncated reads are mistaken for successful data.
+ * Legacy entry points below retain their original diagnostics and behavior. */
+#include <errno.h>
+static void release_io_path(char *path) {
+#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+    rc_heap_deallocate(path);
+#else
+    free(path);
+#endif
+}
+
+MinyarRecord *minyar_runtime_readBytesOutcome(const MinyarText *path_text, long long maximum) {
+    MinyarBytes *data = minyar_bytes_new(0);
+    int code = 0;
+    if (maximum < 0 || memchr(path_text->bytes, 0, (size_t)path_text->byte_length)) {
+        code = EINVAL;
+    } else {
+        char *path = text_as_path(path_text);
+        FILE *file = open_text_path(path, "rb");
+        if (!file) code = errno ? errno : EIO;
+        release_io_path(path);
+        if (file) {
+            unsigned char buffer[8192];
+            for (;;) {
+                size_t count = fread(buffer, 1, sizeof(buffer), file);
+                if ((unsigned long long)count > (unsigned long long)(maximum - data->byte_length)) {
+                    code = EFBIG;
+                    break;
+                }
+                if (count) memcpy(minyar_bytes_extend(data, (long long)count), buffer, count);
+                if (count != sizeof(buffer)) {
+                    if (ferror(file)) code = errno ? errno : EIO;
+                    break;
+                }
+            }
+            if (fclose(file) != 0 && !code) code = errno ? errno : EIO;
+        }
+    }
+    MinyarRecord *result = minyar_record_new(2);
+    minyar_record_set_take(result, 0, (long long)(intptr_t)data);
+    minyar_record_set(result, 1, code);
+    return result;
+}
+
+static long long checked_file_write(const MinyarText *path_text, const MinyarBytes *contents,
+                                    const MinyarList *parts) {
+    if (memchr(path_text->bytes, 0, (size_t)path_text->byte_length)) return -EINVAL;
+    char *path = text_as_path(path_text);
+    FILE *file = open_text_path(path, "wb");
+    int code = file ? 0 : (errno ? errno : EIO);
+    release_io_path(path);
+    if (!file) return -code;
+    if (parts) {
+        for (long long index = 0; index < parts->length; index++) {
+            const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
+            if (fwrite(part->bytes, 1, (size_t)part->byte_length, file) != (size_t)part->byte_length) {
+                code = errno ? errno : EIO;
+                break;
+            }
+        }
+    } else if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) != (size_t)contents->byte_length) {
+        code = errno ? errno : EIO;
+    }
+    if (fclose(file) != 0 && !code) code = errno ? errno : EIO;
+    return -code;
+}
+
+long long minyar_runtime_writeBytesStatus(const MinyarText *path, const MinyarBytes *contents) {
+    return checked_file_write(path, contents, NULL);
+}
+long long minyar_runtime_writePartsStatus(const MinyarText *path, const MinyarRecord *contents) {
+    const MinyarList *parts = (const MinyarList *)(intptr_t)minyar_record_get(contents, 0);
+    return checked_file_write(path, NULL, parts);
+}
+
 /* Module-native entry points. */
 MinyarText *minyar_runtime_readTextFile(const MinyarText *path) { return minyar_read_text_file(path); }
 void minyar_runtime_writeTextFile(const MinyarText *path, const MinyarText *text) { minyar_write_text_file(path, text); }

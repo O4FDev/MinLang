@@ -1,0 +1,139 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources = ["runtime/native/files.c", "-pthread"]
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "text" as text
+    use "errors" as errors
+    use "process" as process
+    print(text.integer(" -9223372036854775808 ").unwrapOr(0))
+    print(text.integer("9223372036854775807").unwrapOr(0))
+    print(text.integer("9223372036854775808").isErr())
+    print(text.integer("1.0").isErr())
+    print(text.integer("").isErr())
+    print(text.integerBytes(Bytes("+42")).unwrapOr(0))
+    print(text.parseInteger("42").value())
+    print(text.parseIntegerBytes(Bytes("bad")).ok())
+    print(text.find("é🙂 harbour", "harbour").unwrapOr(-1))
+    print(text.find("é🙂", "").unwrapOr(-1))
+    print(text.find("é🙂", "night").isNone())
+    print(text.characterAt("é🙂", 1).unwrapOr('?'))
+    print(text.characterAt("é🙂", -1).isNone())
+    print(text.characterAt("é🙂", 2).isNone())
+    print(text.slice("é🙂", 1, 2).unwrapOr("none"))
+    print(text.slice("é🙂", 2, 1).isNone())
+    print(process.argumentAt(-1).isNone()); print(process.argumentAt(0).isNone())
+    print(process.sleep(0).isOk()); print(process.sleep(-1).isErr())
+    """#, "-9223372036854775808\n9223372036854775807\ntrue\ntrue\ntrue\n42\n42\nfalse\n3\n0\ntrue\n🙂\ntrue\ntrue\n🙂\ntrue\ntrue\ntrue\ntrue\ntrue\n", levels, 0, "", true)
+
+let ioSource = #"""
+    use "io" as io
+    use "errors" as errors
+    let path = "$WORK/é-light"
+    let zero = Text(Character(0))
+    let binaryText = "é" + zero + "🙂"
+    let invalidPath = "bad" + zero + "path"
+    print(io.writeBytes(path, Bytes()).isOk())
+    print(io.readBytes(path).unwrapOr(Bytes("bad")).length)
+    print(io.readText(path).unwrapOr("bad") == "")
+    print(io.writeText(path, binaryText).isOk())
+    print(io.readText(path).unwrapOr("") == binaryText)
+    print(io.readBytesWithin(path, 7).isOk()); print(io.readBytesWithin(path, 6).isErr())
+    print(io.readBytesWithin(path, -1).isErr())
+    print(io.readBytes("$WORK/absent").isErr())
+    print(io.readBytes("$WORK").isErr())
+    print(io.readBytes(invalidPath).isErr())
+    print(io.writeText(invalidPath, "light").isErr())
+    print(io.writeText("$WORK/absent/child", "light").isErr())
+    let invalid = Bytes(1); invalid[0] = 255
+    print(io.writeBytes(path, invalid).isOk())
+    print(io.readBytes(path).unwrapOr(Bytes())[0])
+    print(io.readText(path).isErr())
+    let data = Bytes(8193)
+    for index in 0..data.length { data[index] = index % 256 }
+    print(io.writeBytes(path, data).isOk())
+    print(io.readBytesWithin(path, 8193).unwrapOr(Bytes()).length)
+    print(io.readBytesWithin(path, 8192).isErr())
+    let pieces: List<Text> = ["é", zero, "🙂"]
+    print(io.writeParts(path, pieces).isOk())
+    print(io.readText(path).unwrapOr("") == binaryText)
+    print(io.readBytesFile(path).length)
+    io.writeTextFile(path, "legacy")
+    print(io.readText(path).unwrapOr("bad"))
+    """#
+fixtures.executes(frontend, test.replace(ioSource, "$WORK", frontend.compiler.directory), "true\n0\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n255\ntrue\ntrue\n8193\ntrue\ntrue\ntrue\n7\nlegacy\n", levels, 0, "", true)
+
+let filesSource = #"""
+    use "files" as files
+    use "errors" as errors
+    function work(): Result<Nothing, errors.Error> {
+        let directory = "$WORK/files"
+        try files.createDirectory(directory)
+        let path = directory + "/light"
+        let file = try files.openFile(path, files.WRITE | files.CREATE | files.TRUNCATE)
+        print(try files.writeBytes(file, Bytes("light"), 0, 5))
+        print(Text(try files.readBytesAt(file, 0, 99)))
+        print(try files.fileSize(file)); print(try files.sizeOfPath(path))
+        try files.resize(file, 2)
+        print((try files.readBytesAt(file, 99, 10)).length)
+        print((try files.entries(directory)).length)
+        try files.closeFile(file)
+        print(files.closeFile(file).isErr())
+        let failed = files.readBytes(path + ".missing")
+        print(files.readBytes(path).isOk())
+        match failed { Ok(data) { print("wrong") } Err(error) { print(error.nativeCode() > 0); print(error.contexts().length) } }
+        print(files.openFile(path + ".missing", files.READ).isErr())
+        print(files.readBytesAt(-1, 0, 1).isErr())
+        print(files.entries(path + ".missing").isErr())
+        print(files.startSyncer(-1).isErr()); print(files.preparationDone(-1).isErr())
+        try files.deleteFile(path)
+        try files.deleteDirectory(directory)
+        return Ok()
+    }
+    match work() { Ok() { print("done") } Err(error) { print(error.describe()); fail("file operation failed") } }
+    """#
+fixtures.executes(frontend, test.replace(filesSource, "$WORK", frontend.compiler.directory), "5\nlight\n5\n5\n0\n1\ntrue\ntrue\ntrue\n1\ntrue\ntrue\ntrue\ntrue\ntrue\ndone\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    use "json" as json
+    use "errors" as errors
+    function config(source: Text): Result<Text, errors.Error> {
+        let value = try json.decode(source) else "decoding the configuration"
+        let port = try value.get("port").andThen(function(item) { return item.asInteger() }) else "reading the port"
+        let name = try value.get("name").andThen(function(item) { return item.asText() }) else "reading the name"
+        let optional = try value.findMember("optional")
+        let missing = try value.findMember("absent")
+        print(optional.isSome()); print(missing.isNone())
+        return Ok("\(name):\(port)")
+    }
+    print(config(#"{"port":9223372036854775807,"name":"harbour","optional":null}"#).unwrapOr("bad"))
+    match config(#"{"port":"dark","name":"harbour"}"#) { Ok(value) { print(value) } Err(error) { print(error.describe()) } }
+    print(json.decode("broken").isErr())
+    print(json.decode(#""\uD800""#).isErr())
+    print(json.decodeUnique(#"{"x":1,"x":2}"#).isErr())
+    print(json.decode(#"{"x":1,"x":2}"#).isOk())
+    let array = json.decode("[1,true,null]").unwrap()
+    print(array.asArray().unwrap().length)
+    print(array.element(-1).isErr()); print(array.element(3).isErr())
+    print(array.element(1).andThen(function(value) { return value.asBoolean() }).unwrapOr(false))
+    print(array.findMember("x").isErr())
+    print(json.decode("1.0").unwrap().asInteger().isErr())
+    print(json.decode("9223372036854775808").unwrap().asInteger().isErr())
+    print(json.decode("1e999").unwrap().asNumber().isErr())
+    print(json.decode("0.5").unwrap().asNumber().unwrapOr(0.0))
+    print(json.parse("broken").kind == json.INVALID)
+    print(json.member(json.parse("{}"), "missing").kind == json.NULL)
+    print(json.decodeUniqueBytesWithin(Bytes("{}"), 2, 1, 1).isOk())
+    print(json.decodeBytes(Bytes("{}"), 1).isErr())
+    let invalid = Bytes(1); invalid[0] = 255
+    print(json.decodeBytes(invalid, 1).isErr())
+    """#, "true\ntrue\nharbour:9223372036854775807\nreading the port\n  expected a JSON integer\ntrue\ntrue\ntrue\ntrue\n3\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n0.5\ntrue\ntrue\ntrue\ntrue\ntrue\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/configuration.min"), "Starlight is listening on 8080.\nOpening the harbour\n  reading the harbour's port\n    expected a JSON integer\nOpening the harbour\n  reading the harbour's name\n    missing JSON member: name\n", levels, 0, "", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Result standard library: passed")

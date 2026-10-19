@@ -953,6 +953,52 @@ For `Result<Nothing, E>`, `map` and `andThen` take a no-argument success
 callback. Mapping to Nothing calls the callback and returns `Ok()`;
 `unwrapOrElse` takes an `(E) -> Nothing`. Maybe payloads must be values.
 
+The standard library offers typed operations alongside deprecated compatibility
+names. An empty success remains a success; failures carry an `errors.Error`.
+
+| Module | Typed operations | Compatibility APIs |
+| --- | --- | --- |
+| `text` | `integer`, `integerBytes` return Result; `find`, `characterAt`, `slice` return Maybe | `parseInteger`, `parseIntegerBytes`, and Text's original methods |
+| `io` | `readText`, `readBytes`, bounded `readTextWithin`/`readBytesWithin`, `writeText`, `writeBytes`, `writeParts`, `flush` | `readTextFile`, `readBytesFile`, `writeTextFile`, `writeBytesFile`, `writeTextParts`, `sync` |
+| `files` | `openFile`, `closeFile`, `readBytes`, `readBytesAt`, `writeBytes`, `writeBytesAt`, `entries`, `fileSize`, `sizeOfPath`, `resize`, `reserve`, `move`, `deleteFile`, `createDirectory`, `deleteDirectory`, `flush`, `flushData`, `flushDirectory` | Original native Integer/Bytes/lastError functions |
+| `process` | `argumentAt` returns Maybe; `sleep` returns Result | `argument`, `sleepNanoseconds` |
+| `json` | `decode`, `decodeBytes`, unique/budgeted decoding, `Value.get`, `findMember`, `element`, `asText`, `asBoolean`, `asInteger`, `asNumber`, `asArray` | `parse`, `lookup`, `require*`, `member`, `string` and their methods |
+
+File and process errors preserve a positive native error code. File reads and
+directory listings capture the native status before another operation can
+replace it. `io` keeps the status in a private native snapshot, without a shared
+last-error channel. An empty file yields `Ok` with empty contents. Bounded reads
+accept a nonnegative byte limit; exceeding it returns an error, including when
+an oversized file begins with a readable prefix. Invalid UTF-8 is an error for
+Text and remains available through Bytes. `writeParts` streams its pieces
+without joining them. Failed writes may have changed the file; use `files`
+and its explicit sync/rename operations when durability is required.
+The read limit counts content bytes; the Bytes buffer may have spare geometric
+capacity. A typed Text read holds its Bytes while validation and conversion
+create the Text copy. Typed operations also allocate their Result and native
+snapshot records. The compatibility functions keep their original allocation
+paths. Importing these generic module declarations currently selects the
+whole-graph compilation fallback described above, including for compatibility
+calls; caching individual generic module bodies remains future work.
+
+`files` also exposes `startSyncer`, `syncerSocket`, `requestSync`, `syncedOffset`,
+`drainSyncer`, `waitForSync`, `switchSyncer`, `stopSyncer` and the corresponding
+`startPreparation`, `preparationSocket`, `preparationDone`, `drainPreparation`,
+`waitForPreparation`, `stopPreparation` operations as Results. Their native
+handle lifetime, completion-socket borrowing and durability contracts stay
+the same. A preparation still in progress is `Ok(false)`.
+
+JSON getters never coerce types. `findMember` returns `Result<Maybe<Value>,
+errors.Error>`: a non-object is an error, an absent member is `Ok(None)`, and
+an explicit JSON null is `Ok(Some(value))` with `value.kind == json.NULL`.
+`get` reports missing members, and `element` reports invalid array positions.
+`asInteger` parses the original signed decimal integer spelling exactly;
+fractional and exponent spellings use `asNumber`, which checks the finite
+Float range. Ordinary typed decoding uses the first duplicate member;
+`decodeUnique` and its bounded Bytes forms reject duplicates and retain their
+documented metadata budgets. The old APIs keep their previous sentinel,
+coercion and Unicode-replacement behavior.
+
 ## Callbacks
 
 `(ArgumentTypes...) -> ReturnType` describes a callable value; `() -> T`

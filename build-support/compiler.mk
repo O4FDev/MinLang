@@ -38,7 +38,9 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/thread-compiler.min \
 	compiler/compiler.min
 
-build/compiler.min: library/io.min library/process.min $(COMPILER_SOURCES) build-support/compiler.mk | build
+COMPILER_LIBRARY_SOURCES = library/io.min library/process.min library/errors.min library/text.min
+
+build/compiler.min: $(COMPILER_LIBRARY_SOURCES) $(COMPILER_SOURCES) build-support/compiler.mk | build
 	cat $(COMPILER_SOURCES) > $@.tmp
 	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' $@.tmp
 	@if cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
@@ -58,13 +60,13 @@ build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll build/tooling/tools/
 build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage2.ll: build/compiler.min build/compiler-stage1 library/io.min library/process.min
+build/compiler-stage2.ll: build/compiler.min build/compiler-stage1 $(COMPILER_LIBRARY_SOURCES)
 	$(LIMITED) ./build/compiler-stage1 $< $@ --library library
 
 build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage3.ll: build/compiler.min build/minyarc library/io.min library/process.min
+build/compiler-stage3.ll: build/compiler.min build/minyarc $(COMPILER_LIBRARY_SOURCES)
 	$(LIMITED) ./build/minyarc $< $@ --library library
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll

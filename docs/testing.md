@@ -138,6 +138,14 @@ mutation, repeated reference payloads and method diagnostics. The optional-light
 gallery and positive programs run at O0/O2 with ownership assertions. Its
 sanitizer variant is `check-result-methods-sanitize`.
 
+`make check-result-library` checks typed text parsing and Unicode positions,
+optional arguments, recoverable whole-file I/O, bounded prefixes, streamed Text
+parts, descriptor APIs and typed JSON access. It distinguishes empty success,
+missing data, explicit null, malformed Unicode and decimal Integer endpoints.
+The configuration gallery and programs run at O0/O2 with ownership assertions;
+`check-result-library-sanitize` adds ASan/UBSan. Compatibility getters and native
+status APIs are also exercised by their existing focused suites.
+
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition

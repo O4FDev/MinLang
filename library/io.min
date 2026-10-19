@@ -1,3 +1,6 @@
+use "errors" as errors
+use "text" as text
+
 // Portable whole-file I/O. Failures stop with a diagnostic; use files for
 // recoverable descriptor operations and durable writes. Text preserves bytes.
 /// Read a whole file as UTF-8 Text. Embedded zero bytes are preserved.
@@ -56,3 +59,51 @@ public function fileExists(path: Text): Boolean { native "runtime" }
 /// This uses `fsync` on POSIX and `_commit` on Windows. `files.sync` provides
 /// stronger durability on macOS.
 public function sync(descriptor: Integer): Integer { native "runtime" }
+
+// Typed whole-file operations. The original *File functions and
+// writeTextParts remain deprecated compatibility APIs with their fatal errors.
+// Native snapshots capture diagnostics before closing the file can replace them.
+record ReadOutcome { private data: Bytes; private code: Integer }
+record TextParts { private pieces: List<Text> }
+function readBytesOutcome(path: Text, maximumBytes: Integer): ReadOutcome { native "runtime" }
+function writeBytesStatus(path: Text, contents: Bytes): Integer { native "runtime" }
+function writePartsStatus(path: Text, contents: TextParts): Integer { native "runtime" }
+
+function ioError(code: Integer, operation: Text, path: Text): errors.Error {
+    return errors.make(errors.systemCode(), code, "could not " + operation + " file: " + path)
+}
+
+public function readBytesWithin(path: Text, maximumBytes: Integer): Result<Bytes, errors.Error> {
+    let outcome = readBytesOutcome(path, maximumBytes)
+    if outcome.code != 0 { return Err(ioError(outcome.code, "read", path)) }
+    return Ok(outcome.data)
+}
+public function readBytes(path: Text): Result<Bytes, errors.Error> {
+    return readBytesWithin(path, 9223372036854775807)
+}
+public function readText(path: Text): Result<Text, errors.Error> {
+    let data = try readBytes(path)
+    return Ok(try text.decode(data) else ("decoding " + path))
+}
+public function readTextWithin(path: Text, maximumBytes: Integer): Result<Text, errors.Error> {
+    let data = try readBytesWithin(path, maximumBytes)
+    return Ok(try text.decode(data) else ("decoding " + path))
+}
+public function writeBytes(path: Text, contents: Bytes): Result<Nothing, errors.Error> {
+    let code = writeBytesStatus(path, contents)
+    if code < 0 { return Err(ioError(-code, "write", path)) }
+    return Ok()
+}
+public function writeText(path: Text, contents: Text): Result<Nothing, errors.Error> {
+    return writeBytes(path, Bytes(contents))
+}
+public function writeParts(path: Text, contents: List<Text>): Result<Nothing, errors.Error> {
+    let code = writePartsStatus(path, TextParts { pieces: contents })
+    if code < 0 { return Err(ioError(-code, "write", path)) }
+    return Ok()
+}
+public function flush(descriptor: Integer): Result<Nothing, errors.Error> {
+    let code = sync(descriptor)
+    if code < 0 { return Err(errors.make(errors.systemCode(), -code, "could not sync the descriptor")) }
+    return Ok()
+}

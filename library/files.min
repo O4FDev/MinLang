@@ -1,3 +1,6 @@
+use "errors" as errors
+use "text" as text
+
 // Durable file I/O: open, append and positioned writes, positioned reads, fdatasync/fsync, atomic rename with a
 // directory sync, and a background syncer for group commit.
 //
@@ -163,3 +166,79 @@ public function prepareWait(handle: Integer, timeoutMs: Integer): Integer { nati
 public function prepareStop(handle: Integer): Integer { native "files" }
 
 public function removeDirectory(path: Text): Integer { native "files" }
+
+// Typed APIs. The native declarations above remain deprecated compatibility
+// interfaces with their exact Integer/lastError contracts. Capture each native
+// status before another operation can replace its diagnostic.
+function nativeFailure(code: Integer, operation: Text): errors.Error {
+    return errors.make(errors.systemCode(), -code, errorText(code)).withContext(operation)
+}
+function countResult(value: Integer, operation: Text): Result<Integer, errors.Error> {
+    if value < 0 { return Err(nativeFailure(value, operation)) }
+    return Ok(value)
+}
+function statusResult(value: Integer, operation: Text): Result<Nothing, errors.Error> {
+    if value < 0 { return Err(nativeFailure(value, operation)) }
+    return Ok()
+}
+public function openFile(path: Text, flags: Integer): Result<Integer, errors.Error> { return countResult(open(path, flags), "opening " + path) }
+public function closeFile(file: Integer): Result<Nothing, errors.Error> { return statusResult(close(file), "closing the file") }
+public function writeBytes(file: Integer, data: Bytes, offset: Integer, length: Integer): Result<Integer, errors.Error> { return countResult(write(file, data, offset, length), "writing the file") }
+public function writeBytesAt(file: Integer, data: Bytes, offset: Integer, length: Integer, position: Integer): Result<Integer, errors.Error> { return countResult(writeAt(file, data, offset, length, position), "writing the file at " + Text(position)) }
+public function readBytesAt(file: Integer, position: Integer, length: Integer): Result<Bytes, errors.Error> {
+    let data = readAt(file, position, length)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "reading the file at " + Text(position))) }
+    return Ok(data)
+}
+public function readBytes(path: Text): Result<Bytes, errors.Error> {
+    let data = readFile(path)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "reading " + path)) }
+    return Ok(data)
+}
+public function appendRead(file: Integer, position: Integer, buffer: Bytes, length: Integer): Result<Integer, errors.Error> { return countResult(readAppend(file, position, buffer, length), "appending bytes from the file") }
+public function fileSize(file: Integer): Result<Integer, errors.Error> { return countResult(size(file), "measuring the file") }
+public function sizeOfPath(path: Text): Result<Integer, errors.Error> { return countResult(pathSize(path), "measuring " + path) }
+public function resize(file: Integer, length: Integer): Result<Nothing, errors.Error> { return statusResult(truncate(file, length), "resizing the file") }
+public function reserve(file: Integer, length: Integer): Result<Nothing, errors.Error> { return statusResult(preallocate(file, length), "reserving file storage") }
+public function move(from: Text, to: Text): Result<Nothing, errors.Error> { return statusResult(rename(from, to), "moving " + from + " to " + to) }
+public function deleteFile(path: Text): Result<Nothing, errors.Error> { return statusResult(remove(path), "removing " + path) }
+public function createDirectory(path: Text): Result<Nothing, errors.Error> { return statusResult(makeDirectory(path), "creating " + path) }
+public function deleteDirectory(path: Text): Result<Nothing, errors.Error> { return statusResult(removeDirectory(path), "removing directory " + path) }
+public function flush(file: Integer): Result<Nothing, errors.Error> { return statusResult(sync(file), "syncing the file") }
+public function flushData(file: Integer): Result<Nothing, errors.Error> { return statusResult(syncData(file), "syncing file data") }
+public function flushDirectory(path: Text): Result<Nothing, errors.Error> { return statusResult(syncDirectory(path), "syncing directory " + path) }
+public function writeOutput(contents: Text): Result<Integer, errors.Error> { return countResult(writeStandardOutput(contents), "writing standard output") }
+public function entries(path: Text): Result<List<Text>, errors.Error> {
+    let raw = listNames(path)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "listing " + path)) }
+    let names: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 0 {
+            names.add(try text.decode(raw.slice(start, index)) else "decoding a directory entry")
+            start = index + 1
+        }
+    }
+    return Ok(names)
+}
+public function startSyncer(file: Integer): Result<Integer, errors.Error> { return countResult(syncerStart(file), "starting the file syncer") }
+public function syncerSocket(handle: Integer): Result<Integer, errors.Error> { return countResult(syncerNotifySocket(handle), "opening the syncer's completion socket") }
+public function requestSync(handle: Integer, upTo: Integer): Result<Nothing, errors.Error> { return statusResult(syncerRequest(handle, upTo), "requesting a file sync") }
+public function syncedOffset(handle: Integer): Result<Integer, errors.Error> { return countResult(syncerSynced(handle), "reading the synced offset") }
+public function drainSyncer(handle: Integer): Result<Integer, errors.Error> { return countResult(syncerDrain(handle), "draining the file syncer") }
+public function waitForSync(handle: Integer, upTo: Integer, timeoutMs: Integer): Result<Integer, errors.Error> { return countResult(syncerWait(handle, upTo, timeoutMs), "waiting for the file syncer") }
+public function switchSyncer(handle: Integer, file: Integer, offset: Integer): Result<Nothing, errors.Error> { return statusResult(syncerSwitch(handle, file, offset), "switching the file syncer") }
+public function stopSyncer(handle: Integer): Result<Nothing, errors.Error> { return statusResult(syncerStop(handle), "stopping the file syncer") }
+public function startPreparation(file: Integer, length: Integer): Result<Integer, errors.Error> { return countResult(prepareStart(file, length), "preparing file storage") }
+public function preparationSocket(handle: Integer): Result<Integer, errors.Error> { return countResult(prepareNotifySocket(handle), "opening the preparation socket") }
+public function preparationDone(handle: Integer): Result<Boolean, errors.Error> {
+    let code = prepareDone(handle)
+    if code < 0 { return Err(nativeFailure(code, "checking file preparation")) }
+    return Ok(code != 0)
+}
+public function drainPreparation(handle: Integer): Result<Integer, errors.Error> { return countResult(prepareDrain(handle), "draining file preparation") }
+public function waitForPreparation(handle: Integer, timeoutMs: Integer): Result<Nothing, errors.Error> { return statusResult(prepareWait(handle, timeoutMs), "waiting for file preparation") }
+public function stopPreparation(handle: Integer): Result<Nothing, errors.Error> { return statusResult(prepareStop(handle), "stopping file preparation") }
