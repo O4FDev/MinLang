@@ -50,13 +50,13 @@ build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll build/tooling/tools/
 build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage2.ll: build/compiler.min build/compiler-stage1
+build/compiler-stage2.ll: build/compiler.min build/compiler-stage1 library/io.min library/process.min
 	$(LIMITED) ./build/compiler-stage1 $< $@ --library library
 
 build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage3.ll: build/compiler.min build/minyarc
+build/compiler-stage3.ll: build/compiler.min build/minyarc library/io.min library/process.min
 	$(LIMITED) ./build/minyarc $< $@ --library library
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll
