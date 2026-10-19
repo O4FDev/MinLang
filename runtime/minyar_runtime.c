@@ -54,6 +54,8 @@
 #define MINYAR_NO_ADDRESS_SANITIZE
 #endif
 
+#include "minyar_traces.h"
+
 typedef struct MinyarText {
     const unsigned char *bytes;
     long long byte_length;
@@ -237,6 +239,7 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_failure_exit(void) {
 
 static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message) {
     fprintf(stderr, "Minyar stopped: %s\n", message);
+    minyar_print_stack_trace();
     minyar_failure_exit();
 }
 
@@ -431,6 +434,7 @@ void minyar_fail(const MinyarText *message) {
     fputs("Minyar stopped: ", stderr);
     fwrite(message->bytes, 1, (size_t)message->byte_length, stderr);
     fputc('\n', stderr);
+    minyar_print_stack_trace();
     minyar_failure_exit();
 }
 

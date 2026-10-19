@@ -328,6 +328,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         emittedReturn = "i32"
     }
     emitDebugOrigin(output, tokenLines, debugOrigin, "function")
+    recordFunctionTrace(context, function, debugOrigin + 1)
     let defineSlot = output.length
     output.add("define ")
     output.add(emittedReturn)
@@ -358,7 +359,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         }
     }
     let definitionTailSlot = output.length
-    output.add(") {\nentry:\n")
+    output.add(") uwtable {\nentry:\n")
     let entrySlot = output.length
     output.add("")
     if name == "main" {
@@ -406,7 +407,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         }
     }
     if state[2] >= 4096 {
-        output[definitionTailSlot] = ") noinline {\nentry:\n"
+        output[definitionTailSlot] = ") noinline uwtable {\nentry:\n"
         if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
             let dispatchTable = "@.dispatch." + Text(bodyStart)
             if textState[2] != "" { dispatchTable = "@\"minyar.literal|" + textState[2] + "|dispatch|" + Text(bodyStart) + "\"" }
@@ -422,16 +423,17 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
             parallelParameter = parallelParameter + 1
         }
         finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences, recoveryEnabled(state))
+        recordRuntimeTrace(context, ".minyar.thread.bridge." + name, traceReadableName(context.traces, name, sourceSpan(tokenLines, tokenLines.inputPath, debugOrigin + 1, debugOrigin + 2)), debugOrigin + 1, false)
     }
     if machineIntrinsic {
         output[entrySlot] = ""
         output[defineSlot] = "define internal "
-        output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
+        output[definitionTailSlot] = ") alwaysinline uwtable {\nentry:\n"
     }
     let stackOwned = stackOwnerLimit > 0 && !depthBoundary && !machineIntrinsic && name != "main" && state[5] == -1 && (!recoveryEnabled(state) || state[14] == 0) && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
     let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
     if stackOwned {
-        output[definitionTailSlot] = ") noinline {\nentry:\n"
+        output[definitionTailSlot] = ") noinline uwtable {\nentry:\n"
         finishStackOwnership(output, entrySlot, state[8])
     } else if smallFrame {
         if !recoveryEnabled(state) && state[14] == 0 {
@@ -522,6 +524,7 @@ function compileModuleConstants(context: CompilerContext, output: List<Text>, gl
         if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
             let name = functionNames[symbol]
             let type = functionReturnTypes[symbol]
+            recordRuntimeTrace(context, constantIRName(name, "load"), "global " + readableDeclarationName(name), -1 - functionParameterCounts[symbol], false)
             let cell = "@" + constantIRName(name, "value")
             let flag = "@" + constantIRName(name, "state")
             globals.add(cell + " = internal global " + llvmType(type) + " zeroinitializer\n")
@@ -531,7 +534,7 @@ function compileModuleConstants(context: CompilerContext, output: List<Text>, gl
             globals.add("; minyar-module-constant: " + escapeLLVMText(name) + "|" + effect + "\n")
             let emittedType = llvmType(type)
             if type == 4 { emittedType = "zeroext " + emittedType }
-            output.add("define internal " + emittedType + " @" + constantIRName(name, "load") + "() {\nentry:\n")
+            output.add("define internal " + emittedType + " @" + constantIRName(name, "load") + "() uwtable {\nentry:\n")
             output.add("  %constant.state = load i8, ptr " + flag + "\n")
             output.add("  %constant.ready = icmp eq i8 %constant.state, 2\n")
             output.add("  br i1 %constant.ready, label %ready, label %check\ncheck:\n")
@@ -578,7 +581,7 @@ function compileModuleConstants(context: CompilerContext, output: List<Text>, gl
         }
         symbol = symbol + 1
     }
-    output.add("define internal void @.minyar.constants.initialize() {\nentry:\n")
+    output.add("define internal void @.minyar.constants.initialize() uwtable {\nentry:\n")
     symbol = 0
     while symbol < symbolKinds.length {
         if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
@@ -589,7 +592,7 @@ function compileModuleConstants(context: CompilerContext, output: List<Text>, gl
         symbol = symbol + 1
     }
     output.add("  ret void\n}\n\n")
-    output.add("define internal void @.minyar.constants.release() {\nentry:\n")
+    output.add("define internal void @.minyar.constants.release() uwtable {\nentry:\n")
     let releasesRoots = false
     symbol = 0
     while symbol < symbolKinds.length {
@@ -625,7 +628,7 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
     let localLengths: List<Integer> = []
 
     output.add("; minyar-debug-function: 1|1|\n")
-    output.add("define i32 @main(i32 %minyar.argument.count, ptr %minyar.argument.values) {\nentry:\n")
+    output.add("define i32 @main(i32 %minyar.argument.count, ptr %minyar.argument.values) uwtable {\nentry:\n")
     let entrySlot = output.length
     output.add("")
     output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
@@ -637,6 +640,7 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
     let unusedInteger: List<Integer> = []
     let poisoned: List<Text> = []
     let job = DiagnosticJob { mode: 1, node: 0, context: context, output: output, globals: globals, state: state, textState: textState, stackOwnerLimit: 0, bodyStats: bodyStats, flags: flags, treeFunctions: unusedInteger, treeKinds: unusedInteger, treeCallStarts: unusedInteger, treeCallEnds: unusedInteger, treeSlots: unusedInteger, localNames: localNames, localTypes: localTypes, localIds: localIds, localLengths: localLengths, poisoned: poisoned }
+    let firstTop = -1
     let terminated = false
     while tokenKinds[state[0]] != 0 {
         if tokenIs(tokenKinds, tokenTexts, state, "record") || tokenIs(tokenKinds, tokenTexts, state, "function") {
@@ -650,6 +654,7 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
             output.add("\n" + textState[0] + ":\n")
             }
             let start = state[0]
+            if firstTop < 0 { firstTop = start }
             let saved: List<Integer> = []
             let index = 0
             while index < state.length { saved.add(state[index]); index = index + 1 }
@@ -669,6 +674,8 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
         }
         skipTerminators(tokenKinds, state)
     }
+    if firstTop < 0 { firstTop = 0 }
+    recordRuntimeTrace(context, "main", "top level", firstTop, true)
     if !terminated {
         if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
         if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }

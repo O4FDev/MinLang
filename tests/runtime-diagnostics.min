@@ -1,0 +1,97 @@
+use "../tools/testing.min" as test
+use "io" as io
+use "system" as system
+use "files" as files
+use "./frontend-fixtures.min" as fixtures
+record Stop { name: Text; body: Text; imports: Text; message: Text; native: Boolean }
+let compiler = test.compiler()
+let stops = [
+    Stop { name: "fail"; body: "fail(\"The harbour has no light.\")"; imports: ""; message: "The harbour has no light."; native: false },
+    Stop { name: "bounds"; body: "let lights = [1]; return lights[2]"; imports: ""; message: "List position 2 is outside its length of 1."; native: false },
+    Stop { name: "overflow"; body: "let light = 9223372036854775807; return light + 1"; imports: ""; message: "this Integer calculation is outside the supported range."; native: false },
+    Stop { name: "division"; body: "let dark = 0; return 1 / dark"; imports: ""; message: "an Integer cannot be divided by zero."; native: false },
+    Stop { name: "map"; body: "let lights: Map<Text, Integer> = {\"harbour\": 1}; return lights[\"lighthouse\"]"; imports: ""; message: "Map key is absent."; native: false },
+    Stop { name: "unwrap"; body: "return errors.integerValue(errors.integerFailure(errors.make(7, 9, \"dark\")))"; imports: "use \"errors\" as errors\n"; message: "cannot read the value of a failed IntegerResult"; native: false },
+    Stop { name: "bytes"; body: "let lights = Bytes(0); return lights[1]"; imports: ""; message: "Bytes position 1 is outside its length of 0."; native: false },
+    Stop { name: "file"; body: "io.readTextFile(\"/minyar-diagnostics-missing-source\"); return 0"; imports: "use \"io\" as io\n"; message: "the file '/minyar-diagnostics-missing-source' could not be opened."; native: false },
+    Stop { name: "native"; body: "return nativeStop()"; imports: "function nativeStop(): Integer { native \"traceprobe\" }\n"; message: "The native harbour has no light."; native: true },
+]
+let sample = "Minyar stopped: a quiet harbour\nMinyar stack trace:\n  at portrait (harbour.min:2:10)\n"
+test.check(test.runtimeDiagnostic(sample) == "Minyar stopped: a quiet harbour\n", "validated stack suffix preserves the complete message")
+for invalid in [sample + "extra stderr\n", test.replace(sample, ":2:10", ":0:10"), test.replace(sample, ":2:10", ":2:no"), test.replace(sample, "  at portrait", "arbitrary") ] {
+    test.check(test.runtimeDiagnostic(invalid) == invalid, "stack projection must reject malformed or extra stderr")
+}
+for item in stops {
+    let source = item.imports + "function darkWindow(): Integer {\n    " + item.body + "\n}\nfunction evening(): Integer {\n    return darkWindow()\n}\nprint(evening())\n"
+    test.require(test.compile(compiler, source), "compile runtime stop " + item.name)
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let levels = ["-O0", "-O2"]
+    if !test.addressEnabled(compiler.flags) { levels.add("LTO") }
+    for level in levels {
+        let command = [compiler.clang]
+        if level == "LTO" { command.add("-O2"); command.add("-flto=thin") } else { command.add(level) }
+        for flag in compiler.flags { command.add(flag) }
+        for part in ["-Wno-override-module", path + ".ll", compiler.runtime] { command.add(part) }
+        if item.native { command.add("tests/diagnostics/runtime-native.c") }
+        for part in ["-lm", "-o", path + ".exe"] { command.add(part) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 60), "link runtime stop " + item.name + " " + level)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 10)
+        let message = "Minyar stopped: " + item.message + "\n"
+        test.check(result.status == 1 && result.output == "", "runtime stop status/stdout " + item.name)
+        test.check(test.runtimeDiagnostic(result.errorOutput) == message && result.errorOutput != message, "runtime message and validated nonempty source trace " + item.name + " " + level + "\n" + result.errorOutput)
+        test.check(test.contains(result.errorOutput, path + ".min:"), "trace keeps original user source " + item.name)
+        test.check(!test.contains(result.errorOutput, ".minyar.fn.") && !test.contains(result.errorOutput, "minyar_module_"), "trace uses readable Minyar names")
+        if item.name == "fail" && level == "-O0" {
+            test.check(result.errorOutput == message + "Minyar stack trace:\n  at darkWindow (" + path + ".min:1:10)\n  at evening (" + path + ".min:4:10)\n  at top level (" + path + ".min:7:1)\n", "independent exact three-frame O0 source oracle")
+        }
+    }
+}
+record NamedTrace { source: Text; name: Text; frames: Integer }
+let named = [
+    NamedTrace { source: "let glow = function(): Integer { fail(\"The harbour has no light.\") }\nprint(glow())\n"; name: "anonymous function"; frames: 0 },
+    NamedTrace { source: "function glow<Item>(value: Item): Integer { fail(\"The harbour has no light.\") }\nprint(glow(1))\n"; name: "glow"; frames: 0 },
+    NamedTrace { source: "record Window { light: Boolean }\nfunction Window.glow(): Integer { fail(\"The harbour has no light.\") }\nlet window = Window { light: false }\nprint(window.glow())\n"; name: "Window.glow"; frames: 0 },
+    NamedTrace { source: "function descend(count: Integer): Integer { if count == 0 { fail(\"The harbour has no light.\") }; return descend(count - 1) + 1 }\nprint(descend(40))\n"; name: "descend"; frames: 12 },
+    NamedTrace { source: "global light: Integer = stop()\nfunction stop(): Integer { fail(\"The harbour has no light.\") }\nprint(light)\n"; name: "global light"; frames: 0 },
+]
+for item in named {
+    test.require(test.compile(compiler, item.source), "compile named trace " + item.name)
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let object = compiler.runtime
+    if item.name == "anonymous function" { object = test.setting("MINYAR_TEST_CALLBACK_RUNTIME", "build/testing/cycle-runtime.o") }
+    let command = [compiler.clang, "-O0", "-Wno-override-module", path + ".ll", object, "-lm", "-o", path + ".exe"]
+    for flag in compiler.flags { command.add(flag) }
+    test.require(test.run(command, system.environment(), "", path + ".link", 60), "link named trace")
+    let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 10)
+    test.check(result.status == 1 && result.output == "" && test.runtimeDiagnostic(result.errorOutput) == "Minyar stopped: The harbour has no light.\n", "named trace preserves complete failure")
+    test.check(test.contains(result.errorOutput, "  at " + item.name + " ("), "readable original name " + item.name + "\n" + result.errorOutput)
+    if item.frames > 0 { test.check(test.lines(result.errorOutput).length == item.frames + 2, "recursion stops at exactly twelve trace frames") }
+}
+let entry = compiler.directory + "/entry.min"
+let shore = compiler.directory + "/shore.min"
+let island = compiler.directory + "/island.min"
+io.writeTextFile(entry, "use \"./shore.min\" as shore\nprint(shore.light())\n")
+io.writeTextFile(shore, "public function light(): Integer { fail(\"The first harbour is dark.\") }\n")
+let driver = test.setting("MINYAR_TEST_MODULE_DRIVER", "./build/minyar-module-build")
+let cacheCommand = [driver, compiler.executable, entry, compiler.directory + "/cached.ll", compiler.directory + "/cache", "--library", "library"]
+for phase in 0..3 {
+    let expected = "The first harbour is dark."
+    let original = shore
+    if phase == 2 {
+        io.writeTextFile(shore, "use \"./island.min\" as island\npublic function light(): Integer { return island.light() }\n")
+        io.writeTextFile(island, "public function light(): Integer { fail(\"The second harbour is dark.\") }\n")
+        expected = "The second harbour is dark."
+        original = island
+    }
+    test.require(test.run(cacheCommand, system.environment(), "", compiler.directory + "/cached-compile", 30), "cold/warm/changed module trace")
+    let executable = compiler.directory + "/cached.exe"
+    test.require(test.run([compiler.clang, "-O0", "-Wno-override-module", compiler.directory + "/cached.ll", compiler.runtime, "-lm", "-o", executable], system.environment(), "", compiler.directory + "/cached-link", 60), "link cached trace")
+    let result = test.run([executable], system.environment(), "", compiler.directory + "/cached-run", 10)
+    test.check(result.status == 1 && result.output == "" && test.runtimeDiagnostic(result.errorOutput) == "Minyar stopped: " + expected + "\n", "cache keeps exact stop message")
+    test.check(test.contains(result.errorOutput, original + ":1:17)"), "cache keeps original imported declaration coordinates\n" + result.errorOutput)
+}
+let gallery = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+fixtures.executes(gallery, io.readTextFile("examples/gallery/way-home.min"), "The old harbour: 2 small reasons to keep coming.\nThe lighthouse: 1 small reason to keep coming.\nThe village: 3 small reasons to keep coming.\nEvery lit window says: there is room for you here.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(gallery.compiler.directory)
+test.removeScratch(compiler.directory)
+print("runtime failures retain messages and source traces at O0, O2 and LTO")

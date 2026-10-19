@@ -16,6 +16,8 @@
 #include <string.h>
 #include <math.h>
 
+void minyar_print_stack_trace(void);
+
 struct MinyarFile { int unused; };
 static FILE serial_file;
 FILE *stdin = &serial_file, *stdout = &serial_file, *stderr = &serial_file;
@@ -98,6 +100,7 @@ _Noreturn void minyar_arm_exception(unsigned long kind, unsigned long syndrome, 
     static const char *const kinds[4] = {"synchronous exception", "interrupt", "fast interrupt", "system error"};
     fprintf(stderr, "\nMinyar stopped: %s (vector %lu) at %#lx, ESR %#lx, FAR %#lx\n",
             kinds[kind & 3], kind, address, syndrome, fault);
+    minyar_print_stack_trace();
     exit(1);
 }
 #endif
@@ -255,6 +258,7 @@ void minyar_platform_random(unsigned char *out, size_t count) {
             __asm__ volatile("rdrand %0; setc %1" : "=r"(value), "=qm"(ok));
         if (!ok) {
             fputs("Minyar stopped: the processor has no working RDRAND.\n", stderr);
+            minyar_print_stack_trace();
             exit(1);
         }
         for (int i = 0; i < 8 && count; i++, count--) {
@@ -271,6 +275,7 @@ extern struct { unsigned long long available; unsigned char bytes[4096]; } minya
 void minyar_platform_random(unsigned char *out, size_t count) {
     if (count > minyar_entropy.available) {
         fputs("Minyar stopped: no entropy is available; give the machine a virtio-rng device.\n", stderr);
+        minyar_print_stack_trace();
         exit(1);
     }
     while (count) {

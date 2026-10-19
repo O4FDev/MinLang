@@ -1,0 +1,149 @@
+function newRuntimeTraces(): RuntimeTraces {
+    let symbols: List<Text> = []
+    let names: List<Text> = []
+    let files: List<Text> = []
+    let lines: List<Integer> = []
+    let columns: List<Integer> = []
+    let entries: List<Integer> = []
+    let sourceFiles: List<Text> = []
+    let sourceTexts: List<Text> = []
+    return RuntimeTraces { symbols: symbols, names: names, files: files, lines: lines, columns: columns, entries: entries, sourceFiles: sourceFiles, sourceTexts: sourceTexts }
+}
+
+function traceReadableName(traces: RuntimeTraces, stored: Text, span: SourceSpan): Text {
+    let name = readableDeclarationName(stored)
+    if name.length >= 16 && name.slice(0, 16) == "minyar_parallel_" { return "parallel loop" }
+    if name.length >= 15 && name.slice(0, 15) == "minyar_closure_" { return "anonymous function" }
+    if !diagnosticGeneratedName(name) && findCharacter(name, '$') < 0 { return name }
+    let source = findText(traces.sourceFiles, span.file)
+    if source < 0 {
+        source = traces.sourceFiles.length
+        traces.sourceFiles.add(span.file)
+        traces.sourceTexts.add(diagnosticSource(span.file))
+    }
+    let line = diagnosticLine(traces.sourceTexts[source], span.line)
+    let first = span.column - 1
+    let after = first
+    while after < line.length && (characterIsLetter(line[after]) || characterIsDigit(line[after]) || line[after] == '_' || line[after] == '.') { after = after + 1 }
+    if after > first {
+        let original = line.slice(first, after)
+        if original != "function" && original != "record" { return original }
+    }
+    if name.length >= 15 && name.slice(0, 15) == "minyar_generic_" { return "generic function" }
+    let parts: List<Text> = []
+    let position = 0
+    let member = false
+    while position < name.length {
+        if name[position] == '$' {
+            if member { return joinText(parts) }
+            parts.add(".")
+            member = true
+        } else { parts.add(Text(name[position])) }
+        position = position + 1
+    }
+    return joinText(parts)
+}
+
+function traceLinkerName(symbol: Text): Text {
+    if symbol.length < 2 || symbol[0] != '"' { return symbol }
+    let pieces: List<Text> = []
+    let index = 1
+    while index < symbol.length - 1 {
+        if symbol[index] == '\\' && index + 2 < symbol.length - 1 && characterIsHexDigit(symbol[index + 1]) && characterIsHexDigit(symbol[index + 2]) {
+            pieces.add(Text(Character(hexDigitValue(symbol[index + 1]) * 16 + hexDigitValue(symbol[index + 2]))))
+            index = index + 3
+        } else { pieces.add(Text(symbol[index])); index = index + 1 }
+    }
+    return joinText(pieces)
+}
+
+function recordRuntimeTrace(context: CompilerContext, symbol: Text, name: Text, position: Integer, entry: Boolean) {
+    let traces = context.traces
+    let span = sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1)
+    traces.symbols.add(traceLinkerName(symbol))
+    traces.names.add(name)
+    traces.files.add(diagnosticDisplay(span.file))
+    traces.lines.add(span.line)
+    traces.columns.add(span.column)
+    if entry { traces.entries.add(1) } else { traces.entries.add(0) }
+}
+
+function recordFunctionTrace(context: CompilerContext, function: Integer, position: Integer) {
+    let name = context.functionNames[function]
+    let span = sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1)
+    let symbol = context.functionIRNames[function]
+    let entry = name == "main"
+    if entry { symbol = "main" }
+    recordRuntimeTrace(context, symbol, traceReadableName(context.traces, name, span), position, entry)
+}
+
+function traceSymbol(prefix: Text, part: Text): Text {
+    return "@\"minyar.trace|" + prefix + "|" + part + "\""
+}
+
+function traceRelative(target: Text, base: Text): Text {
+    return "i32 trunc (i64 sub (i64 ptrtoint (ptr " + target + " to i64), i64 ptrtoint (ptr " + base + " to i64)) to i32)"
+}
+
+// Relative offsets are resolved by the static linker. Function and source
+// metadata never adds a constructor, per-call work or PIE pointer fixups.
+function appendRuntimeTraceTable(context: CompilerContext, output: List<Text>, prefix: Text) {
+    let traces = context.traces
+    let table = traceSymbol(prefix, "rows")
+    let strings = traceSymbol(prefix, "strings")
+    let type = "{ i32, i32, i32, i32, i64, i64 }"
+    let data: List<Text> = []
+    let symbols: List<Integer> = []
+    let names: List<Integer> = []
+    let paths: List<Text> = []
+    let pathOffsets: List<Integer> = []
+    let files: List<Integer> = []
+    let size = 0
+    let zero = "\\00"
+    let index = 0
+    while index < traces.symbols.length {
+        symbols.add(size)
+        data.add(escapeLLVMText(traces.symbols[index]))
+        data.add(zero)
+        size = size + traces.symbols[index].byteLength + 1
+        names.add(size)
+        data.add(escapeLLVMText(traces.names[index]))
+        data.add(zero)
+        size = size + traces.names[index].byteLength + 1
+        let path = findText(paths, traces.files[index])
+        if path < 0 {
+            path = paths.length
+            paths.add(traces.files[index])
+            pathOffsets.add(size)
+            data.add(escapeLLVMText(traces.files[index]))
+            data.add(zero)
+            size = size + traces.files[index].byteLength + 1
+        }
+        files.add(pathOffsets[path])
+        index = index + 1
+    }
+    output.add(strings + " = private unnamed_addr constant [" + Text(size) + " x i8] c\"" + joinText(data) + "\"\n")
+    output.add(table + " = hidden constant [" + Text(traces.symbols.length) + " x " + type + "] [")
+    index = 0
+    while index < traces.symbols.length {
+        if index > 0 { output.add(", ") }
+        let symbol = "getelementptr (i8, ptr " + strings + ", i64 " + Text(symbols[index]) + ")"
+        let name = "getelementptr (i8, ptr " + strings + ", i64 " + Text(names[index]) + ")"
+        let file = "getelementptr (i8, ptr " + strings + ", i64 " + Text(files[index]) + ")"
+        output.add(type + " { " + traceRelative(symbol, table) + ", " + traceRelative(name, table) + ", " + traceRelative(file, table) + ", i32 " + Text(traces.entries[index]) + ", i64 " + Text(traces.lines[index]) + ", i64 " + Text(traces.columns[index]) + " }")
+        index = index + 1
+    }
+    output.add("]\n" + traceSymbol(prefix, "count") + " = hidden constant i64 " + Text(traces.symbols.length) + "\n")
+}
+
+function appendRuntimeTraceRegistry(output: List<Text>, prefixes: List<Text>) {
+    let registry = "@minyar_trace_modules"
+    output.add(registry + " = hidden constant [" + Text(prefixes.length) + " x { i32, i32 }] [")
+    let index = 0
+    while index < prefixes.length {
+        if index > 0 { output.add(", ") }
+        output.add("{ i32, i32 } { " + traceRelative(traceSymbol(prefixes[index], "rows"), registry) + ", " + traceRelative(traceSymbol(prefixes[index], "count"), registry) + " }")
+        index = index + 1
+    }
+    output.add("]\n@minyar_trace_module_count = hidden constant i64 " + Text(prefixes.length) + "\n")
+}

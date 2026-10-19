@@ -996,3 +996,11 @@ and variation selectors. Independent scalar/cell oracles are retained in
 UTF-8 must produce one complete JSON object, status 1 and no LLVM. The ten
 four-language gallery comparisons retain their foreign source and captured
 output without making foreign compilers test prerequisites.
+
+`make check-runtime-diagnostics` keeps failure messages, exit status and stdout
+exact at O0, O2 and LTO, and validates every trace frame's source coordinates.
+An independent O0 golden checks a three-function trace. Native-header stops
+must bind to the runtime reporter; header-only C probes retain a weak no-op
+fallback. Existing semantic oracles use a strict trace-suffix projection;
+malformed frames and unrelated stderr are rejected. Cold counters and LLVM
+body comparisons are measured separately from functional success.

@@ -190,3 +190,21 @@ stops. The first invalid byte is displayed as a replacement character, with
 a best-effort source prefix. Display-cell ranges follow Unicode 14.0 assigned
 wide/full-width and combining categories, plus common emoji sequences. JSON
 positions remain scalar offsets and preserve the original valid source line.
+
+## Runtime trace metadata
+
+`runtime-traces.min` records readable names and original token locations while
+functions, closures and runtime global initializers are emitted. Each cached module
+owns a table of relative string offsets; the final registry is rebuilt from
+its current module graph, even on a cache hit. No function address is retained
+by a row, so unused functions still disappear during LTO. LLVM `uwtable`
+attributes preserve existing unwind descriptions without injected trace calls.
+
+The private runtime ABI uses 32-byte rows (four i32 fields and two i64 source
+coordinates) and an eight-byte module registry row. Offsets are signed i32
+relative to their table and resolved by the static linker. They add no PIE
+pointer fixups. The cold Mach-O reader resolves symbols from loaded __LINKEDIT
+and walks ARM64 compact unwind/DWARF CFI. Linux reads ELF symbols only after a
+failure and uses the platform unwinder. If symbols or unwind information are
+unavailable, the registry supplies an entry location. No C runtime failure is
+caught or converted to recoverable control flow by this reporter.

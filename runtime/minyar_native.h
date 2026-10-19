@@ -43,8 +43,17 @@ static inline unsigned char *minyar_native_bytes_append(MinyarBytes *bytes, long
     return minyar_bytes_extend(bytes, count);
 }
 
+/* Ordinary calls bind to the runtime's strong reporter. The weak no-op keeps
+ * header-only C probes and older runtime objects source compatible. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak, noinline, cold)) void minyar_print_stack_trace(void) {}
+#else
+void minyar_print_stack_trace(void);
+#endif
+
 static inline void minyar_native_stop(const char *message) {
     fprintf(stderr, "Minyar stopped: %s\n", message);
+    minyar_print_stack_trace();
     exit(1);
 }
 

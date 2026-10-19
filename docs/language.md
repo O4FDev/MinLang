@@ -1233,6 +1233,31 @@ Tools can request `--error-format json` from the compiler or standalone
 launcher. It emits one versioned JSON object per error, with the same message,
 source, range, label and help. See the [diagnostic schema](compiler-syntax.md#json-diagnostics).
 
+Runtime stops keep their message and add a short Minyar stack trace:
+
+```text
+Minyar stopped: The harbour has no light.
+Minyar stack trace:
+  at darkWindow (harbour.min:1:10)
+  at evening (harbour.min:4:10)
+  at top level (harbour.min:7:1)
+```
+
+A frame names the function's declaration, or the first top-level statement.
+Optimized code may inline or merge functions and remove tail calls; the trace
+shows the frames that remain. A trace has at most twelve Minyar frames.
+Stripped images and hosts without readable unwind information retain the
+entry location. macOS ARM64 and hosted Linux have full symbol readers; Windows
+and freestanding builds currently use the entry fallback. The error-format
+option describes compiler diagnostics; it does not change a program's arguments.
+
+Trace names and source locations are static data. There is no call/return
+instrumentation, thread-local trace stack or normal-path allocation. Metadata
+increases binary size, and unwind tables remain available in optimized builds.
+On macOS ARM64 the cold reader adds no loader bindings. Whole-process retired
+instruction samples vary with startup and allocation; the measured LLVM
+function bodies contain zero additional normal-path instructions.
+
 `if` chains may continue with `else if`:
 
 ```minyar

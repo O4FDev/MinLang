@@ -103,6 +103,7 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
 #else
         free(path);
 #endif
+        minyar_print_stack_trace();
         exit(1);
     }
     length = text_file_length(file);
@@ -251,6 +252,7 @@ MinyarBytes *minyar_read_bytes_file(const MinyarText *path_text) {
     FILE *file = open_text_path(path, "rb");
     if (!file) {
         fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
+        minyar_print_stack_trace();
         exit(1);
     }
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
