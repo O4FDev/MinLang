@@ -806,6 +806,12 @@ contracts also run in `check-syntax-tree` at O0/O2. `check-bootstrap-native`
 checks the runtime-native bridge used by the compiler, including native Text,
 Boolean and Integer results, void calls and malformed native bodies.
 
+The diagnostics corpus also checks spelling suggestions, ambiguous names,
+private fields/methods/members, block and function scope, missing match cases,
+named record mismatches and argument/return expression spans. The lantern
+gallery runs at O0/O2 with ownership assertions. Spelling distance has separate
+insertion, deletion, transposition, distance and tie oracles in the syntax probe.
+
 `make check-conformance` executes the feature-indexed programs under
 `tests/conformance/` at O0 and O2. Its README maps every section of the language
 specification to primary positive evidence and to negative/boundary suites.

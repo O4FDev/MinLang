@@ -24,7 +24,7 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
         if scopeDepth == 0 && choiceDeclarationAt(kinds, texts, position) {
             let location = position
             let cursor: List<Integer> = [position + 1]
-            if kinds[cursor[0]] != 1 { fail(describeLocation(tokenLocation(lines, cursor[0])) + ": expected a name after choice") }
+            if kinds[cursor[0]] != 1 { failAtToken(lines, cursor[0], "expected a name after choice") }
             let name = texts[cursor[0]]
             cursor[0] = cursor[0] + 1
             let headerStart = cursor[0]
@@ -52,9 +52,9 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
                 let caseLocation = cursor[0]
                 let caseName = texts[caseLocation]
                 if kinds[caseLocation] != 1 || caseName.length == 0 || caseName[0] < 'A' || caseName[0] > 'Z' {
-                    fail(describeLocation(tokenLocation(lines, caseLocation)) + ": a choice case needs a capitalised name")
+                    failAtToken(lines, caseLocation, "a choice case needs a capitalised name")
                 }
-                if findText(cases, caseName) >= 0 { fail(describeLocation(tokenLocation(lines, caseLocation)) + ": duplicate choice case '" + caseName + "'") }
+                if findText(cases, caseName) >= 0 { failAtToken(lines, caseLocation, "duplicate choice case '" + caseName + "'") }
                 cases.add(caseName)
                 marker = marker + "|" + caseName
                 cursor[0] = cursor[0] + 1
@@ -63,9 +63,9 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
                     let payloadNames: List<Text> = []
                     while !tokenIs(kinds, texts, cursor, ")") {
                         let payloadLocation = cursor[0]
-                        if kinds[payloadLocation] != 1 { fail(describeLocation(tokenLocation(lines, payloadLocation)) + ": expected a choice payload name") }
+                        if kinds[payloadLocation] != 1 { failAtToken(lines, payloadLocation, "expected a choice payload name") }
                         let payloadName = texts[payloadLocation]
-                        if findText(payloadNames, payloadName) >= 0 { fail(describeLocation(tokenLocation(lines, payloadLocation)) + ": duplicate choice payload '" + payloadName + "'") }
+                        if findText(payloadNames, payloadName) >= 0 { failAtToken(lines, payloadLocation, "duplicate choice payload '" + payloadName + "'") }
                         payloadNames.add(payloadName)
                         choiceCopy(payloadKinds, payloadTexts, payloadLines, 1, "minyar_choice_payload|" + caseName + "|" + payloadName, lines, payloadLocation)
                         cursor[0] = cursor[0] + 1
@@ -81,7 +81,7 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
                             choiceCopy(payloadKinds, payloadTexts, payloadLines, kinds[cursor[0]], token, lines, cursor[0])
                             cursor[0] = cursor[0] + 1
                         }
-                        if cursor[0] == typeStart { fail(describeLocation(tokenLocation(lines, typeStart)) + ": expected a choice payload type") }
+                        if cursor[0] == typeStart { failAtToken(lines, typeStart, "expected a choice payload type") }
                         choiceCopy(payloadKinds, payloadTexts, payloadLines, 6, ";", lines, payloadLocation)
                         if !tokenIs(kinds, texts, cursor, ")") { expectToken(kinds, texts, lines, cursor, ",") }
                     }
@@ -90,7 +90,7 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
                 if tokenIs(kinds, texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
                 skipTerminators(kinds, cursor)
             }
-            if cases.length == 0 { fail(describeLocation(tokenLocation(lines, location)) + ": a choice needs at least one case") }
+            if cases.length == 0 { failAtToken(lines, location, "a choice needs at least one case") }
             choiceCopy(outputKinds, outputTexts, outputLines, 1, "record", lines, location)
             choiceCopy(outputKinds, outputTexts, outputLines, 1, name, lines, location + 1)
             let header = headerStart
@@ -166,11 +166,12 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     if isBuiltinName(name) { return 0 }
     if findLocal(localNames, localLengths, state, name) >= 0 || findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name) >= 0 || findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 3) >= 0 { return 0 }
     if findText(choiceCases(context, expected), name) > 0 { return expected }
+    if choiceCases(context, expected).length > 0 && name.length > 0 && name[0] >= 'A' && name[0] <= 'Z' { return expected }
     let found = 0
     record = 0
     while record < context.functionNames.length {
         if context.symbolKinds[record] == 2 && findText(choiceCases(context, 1000 + record), name) > 0 && choiceLocalType(context, 1000 + record, location) {
-            if found != 0 { fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": ambiguous choice case '" + name + "'; qualify it with its choice type") }
+            if found != 0 { failAtToken(context.tokenLines, location, "ambiguous choice case '" + name + "'; qualify it with its choice type") }
             found = 1000 + record
         }
         record = record + 1
@@ -184,7 +185,7 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
     let name = context.tokenTexts[state[0]]
     let cases = choiceCases(context, type)
     let tag = findText(cases, name)
-    if tag < 1 { fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": choice '" + readableDeclarationName(context.functionNames[type - 1000]) + "' has no case '" + name + "'") }
+    if tag < 1 { failUnknownChoice(context, state[0], type, name, "choice '" + readableDeclarationName(context.functionNames[type - 1000]) + "' has no case '" + name + "'") }
     state[0] = state[0] + 1
     let fields = choicePayloadFields(context, type, name)
     let record = type - 1000
@@ -203,8 +204,9 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
             let field = fields[index]
             let expected = context.functionParameterTypes[first + field]
             let payloadType: List<Integer> = [expected]
+            let payloadLocation = state[0]
             let payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
-            if payloadType[0] != expected { fail(describeLocation(tokenLocation(context.tokenLines, location)) + ": choice payload has the wrong type") }
+            requireContextType(context, payloadLocation, payloadType[0], expected, "choice payload has the wrong type")
             let slot = valueAsListSlot(output, textState, state, payload, expected)
             let setter = "minyar_record_set"
             if isReferenceType(expected) {
@@ -281,15 +283,15 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     while !tokenIs(kinds, texts, state, "}") {
         let armLocation = state[0]
         let name = texts[armLocation]
-        if seenElse { fail(describeLocation(tokenLocation(lines, armLocation)) + ": else must be the last match arm") }
+        if seenElse { failAtToken(lines, armLocation, "else must be the last match arm") }
         let fallback = name == "else" && kinds[armLocation] == 1
         let variant = findText(cases, name)
         if resultTypeName(inputType[0], context.functionNames) {
-            if !fallback && (kinds[armLocation] != 1 || variant < 1) { fail(describeLocation(tokenLocation(lines, armLocation)) + ": expected Ok or Err in result match") }
-            if !fallback && seen[variant] != 0 { fail("duplicate result arm " + name) }
+            if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "expected Ok or Err in result match") }
+            if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate result arm " + name) }
         }
-        if !fallback && (kinds[armLocation] != 1 || variant < 1) { fail(describeLocation(tokenLocation(lines, armLocation)) + ": unknown case '" + name + "' in choice match") }
-        if !fallback && seen[variant] != 0 { fail(describeLocation(tokenLocation(lines, armLocation)) + ": duplicate match arm '" + name + "'") }
+        if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "unknown case '" + name + "' in choice match") }
+        if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate match arm '" + name + "'") }
         state[0] = state[0] + 1
         let fields: List<Integer> = []
         if fallback { seenElse = true } else { seen[variant] = 1; fields = choiceMatchFields(context, inputType[0], name) }
@@ -299,9 +301,9 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             let index = 0
             while index < fields.length {
                 if index > 0 { expectToken(kinds, texts, lines, state, ",") }
-                if kinds[state[0]] != 1 || texts[state[0]] == "true" || texts[state[0]] == "false" { fail(describeLocation(tokenLocation(lines, state[0])) + ": expected a choice payload binding") }
+                if kinds[state[0]] != 1 || texts[state[0]] == "true" || texts[state[0]] == "false" { failAtToken(lines, state[0], "expected a choice payload binding") }
                 let binding = texts[state[0]]
-                if binding != "_" && findText(bindings, binding) >= 0 { fail(describeLocation(tokenLocation(lines, state[0])) + ": duplicate choice payload binding '" + binding + "'") }
+                if binding != "_" && findText(bindings, binding) >= 0 { failAtToken(lines, state[0], "duplicate choice payload binding '" + binding + "'") }
                 bindings.add(binding)
                 state[0] = state[0] + 1
                 index = index + 1
@@ -378,8 +380,13 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         }
         variant = variant + 1
     }
-    if !seenElse && missing.length > 0 && resultTypeName(inputType[0], context.functionNames) { fail("match must handle both Ok and Err") }
-    if !seenElse && missing.length > 0 { fail(describeLocation(tokenLocation(lines, location)) + ": match is missing cases: " + joinText(missing)) }
+    if !seenElse && missing.length > 0 && resultTypeName(inputType[0], context.functionNames) {
+        let names: List<Text> = []
+        variant = 1
+        while variant < cases.length { if seen[variant] == 0 { names.add(cases[variant]) }; variant = variant + 1 }
+        failAtToken(lines, location, "match must handle both Ok and Err; missing cases: " + diagnosticNameList(names))
+    }
+    if !seenElse && missing.length > 0 { failAtToken(lines, location, "match is missing cases: " + joinText(missing)) }
     if !seenElse { output.add("  unreachable\n") }
     if !allReturn {
         output.add("\n" + endLabel + ":\n")

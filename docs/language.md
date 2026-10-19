@@ -1214,6 +1214,15 @@ error: the value for 'stars' does not match its declared type; expected Integer,
    |     ^^^^^
 ```
 
+When a spelling is close, the compiler suggests a name available at that point.
+This includes values, functions, record fields and methods, types, choice cases
+and public module members. Equally close alternatives get no suggestion.
+Private names from other modules and bindings outside the current scope are
+not candidates.
+Missing match arms name the cases that still need handling. The
+[lantern](../examples/gallery/weather-lantern.min) gallery combines the corrected names
+with choices, methods and interpolation.
+
 `if` chains may continue with `else if`:
 
 ```minyar

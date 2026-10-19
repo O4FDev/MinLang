@@ -1,0 +1,261 @@
+// Restricted edit distance runs only after lookup has failed. Adjacent swapped
+// letters count as one edit. Long names cannot make an error expensive.
+function diagnosticDistance(left: Text, right: Text, limit: Integer): Integer {
+    if left.length > 64 || right.length > 64 || left.length - right.length > limit || right.length - left.length > limit { return limit + 1 }
+    let previous: List<Integer> = []
+    let before: List<Integer> = []
+    let current: List<Integer> = []
+    let column = 0
+    while column <= right.length { previous.add(column); before.add(0); current.add(0); column = column + 1 }
+    let row = 1
+    while row <= left.length {
+        current[0] = row
+        column = 1
+        while column <= right.length {
+            let cost = 1
+            if left[row - 1] == right[column - 1] { cost = 0 }
+            let value = previous[column - 1] + cost
+            if previous[column] + 1 < value { value = previous[column] + 1 }
+            if current[column - 1] + 1 < value { value = current[column - 1] + 1 }
+            if row > 1 && column > 1 && left[row - 1] == right[column - 2] && left[row - 2] == right[column - 1] && before[column - 2] + 1 < value { value = before[column - 2] + 1 }
+            current[column] = value
+            column = column + 1
+        }
+        let spare = before
+        before = previous
+        previous = current
+        current = spare
+        row = row + 1
+    }
+    return previous[right.length]
+}
+
+function diagnosticClosest(wanted: Text, names: List<Text>): Text {
+    let limit = 1
+    if wanted.length >= 5 { limit = 2 }
+    let distance = limit + 1
+    let closest = ""
+    let tied = false
+    let position = 0
+    while position < names.length {
+        let candidate = names[position]
+        let edits = diagnosticDistance(wanted, candidate, limit)
+        if candidate != "" && edits <= limit {
+            if edits < distance { distance = edits; closest = candidate; tied = false }
+            else if edits == distance && candidate != closest { tied = true }
+        }
+        position = position + 1
+    }
+    if tied { return "" }
+    return closest
+}
+
+function diagnosticSuggestion(wanted: Text, names: List<Text>): Text {
+    let closest = diagnosticClosest(wanted, names)
+    if closest == "" { return "" }
+    return "did you mean `\(closest)`?"
+}
+
+function diagnosticNameList(names: List<Text>): Text {
+    let pieces: List<Text> = []
+    let index = 0
+    while index < names.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add("`" + names[index] + "`")
+        index = index + 1
+    }
+    return joinText(pieces)
+}
+
+function diagnosticSameModule(context: CompilerContext, symbol: Integer, position: Integer): Boolean {
+    if symbol >= context.syntax.symbolNodes.length { return false }
+    let node = context.syntax.symbolNodes[symbol]
+    if node < 0 { return false }
+    return syntaxSpan(context.syntax, node).file == sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1).file
+}
+
+function diagnosticDeclarations(context: CompilerContext, position: Integer, kind: Integer): List<Text> {
+    let names: List<Text> = []
+    let symbol = 0
+    while symbol < context.functionNames.length {
+        if context.symbolKinds[symbol] == kind && diagnosticSameModule(context, symbol, position) {
+            let name = readableDeclarationName(context.functionNames[symbol])
+            if !diagnosticGeneratedName(name) && findCharacter(name, '.') < 0 { names.add(name) }
+        }
+        symbol = symbol + 1
+    }
+    return names
+}
+
+function failUnknownValue(context: CompilerContext, names: List<Text>, lengths: List<Integer>, state: List<Integer>, position: Integer, wanted: Text) {
+    let candidates = diagnosticDeclarations(context, position, 3)
+    let local = 0
+    while local < state[3] {
+        if names[local].length > 0 && (characterIsLetter(names[local][0]) || names[local][0] == '_') && findLocal(names, lengths, state, names[local]) == local { candidates.add(names[local]) }
+        local = local + 1
+    }
+    if position + 1 < context.tokenTexts.length && context.tokenTexts[position + 1] == "." {
+        let imports = diagnosticImportNames(context.tokenLines, position)
+        let index = 0
+        while index < imports.length { candidates.add(imports[index]); index = index + 1 }
+    }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "I can't find a value named '" + readableDeclarationName(wanted) + "'", "", diagnosticSuggestion(readableDeclarationName(wanted), candidates))
+}
+
+function failUnknownFunction(context: CompilerContext, position: Integer, wanted: Text) {
+    let candidates = diagnosticDeclarations(context, position, 1)
+    let builtins: List<Text> = ["Bytes", "Character", "Float", "Integer", "Map", "Set", "Text", "abs", "clamp", "exit", "fail", "joinText", "max", "min", "parallelEntry", "print", "wrappingAdd", "wrappingMultiply", "wrappingSubtract"]
+    let index = 0
+    while index < builtins.length { candidates.add(builtins[index]); index = index + 1 }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "I can't find a function named '" + readableDeclarationName(wanted) + "'", "", diagnosticSuggestion(readableDeclarationName(wanted), candidates))
+}
+
+function failUnknownRecord(context: CompilerContext, position: Integer, wanted: Text) {
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "I can't find a record named '" + readableDeclarationName(wanted) + "'", "", diagnosticSuggestion(readableDeclarationName(wanted), diagnosticDeclarations(context, position, 2)))
+}
+
+function failUnknownField(context: CompilerContext, position: Integer, type: Integer, wanted: Text) {
+    let record = type - 1000
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    let candidates: List<Text> = []
+    let payload = ""
+    if choiceCases(context, type).length > 0 { payload = "use match to read this choice's payloads" }
+    if resultTypeName(type, context.functionNames) { payload = "use match or try to read this Result" }
+    let index = 0
+    while index < context.functionParameterCounts[record] {
+        let stored = context.functionParameterNames[first + index]
+        let name = declaredFieldName(stored)
+        if payload == "" && (stored.length == name.length || stored.slice(name.length + 1, stored.length) == tokenPath(context.tokenLines, position)) { candidates.add(name) }
+        index = index + 1
+    }
+    let recordName = readableDeclarationName(context.functionNames[record])
+    let label = recordName + " has no accessible fields"
+    if candidates.length > 0 { label = recordName + " has the fields " + diagnosticNameList(candidates) }
+    if payload != "" { label = payload }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "record '" + recordName + "' has no field named '" + wanted + "'", label, diagnosticSuggestion(wanted, candidates))
+}
+
+function failUnknownType(sources: SourceMap, position: Integer, wanted: Text, tokens: List<Integer>, texts: List<Text>) {
+    let candidates: List<Text> = ["Integer", "Float", "Text", "Boolean", "Character", "Bytes", "Nothing", "List", "Map", "Set", "Result", "Maybe"]
+    let file = sourceSpan(sources, sources.inputPath, position, position + 1).file
+    let index = 0
+    while index + 2 < texts.length {
+        if tokens[index] == 1 && texts[index] == "record" && tokens[index + 1] == 1 && (texts[index + 2] == "{" || texts[index + 2] == "native") && sourceSpan(sources, sources.inputPath, index, index + 1).file == file {
+            let name = readableDeclarationName(texts[index + 1])
+            if !diagnosticGeneratedName(name) { candidates.add(name) }
+        }
+        index = index + 1
+    }
+    failDiagnostic(sourceSpan(sources, sources.inputPath, position, position + 1), "unknown type '" + readableDeclarationName(wanted) + "'", "", diagnosticSuggestion(readableDeclarationName(wanted), candidates))
+}
+
+function diagnosticChoiceNames(context: CompilerContext, type: Integer): List<Text> {
+    if resultTypeName(type, context.functionNames) { return ["Ok", "Err"] }
+    let encoded = choiceCases(context, type)
+    let names: List<Text> = []
+    let index = 1
+    while index < encoded.length { names.add(encoded[index]); index = index + 1 }
+    return names
+}
+
+function failUnknownChoice(context: CompilerContext, position: Integer, type: Integer, wanted: Text, message: Text) {
+    let names = diagnosticChoiceNames(context, type)
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), message, "available cases: " + diagnosticNameList(names), diagnosticSuggestion(wanted, names))
+}
+
+function diagnosticType(context: CompilerContext, type: Integer): Text {
+    if isListType(type) { return "List<" + diagnosticType(context, listElementType(type)) + ">" }
+    if isSetType(type) { return "Set<" + diagnosticType(context, setElementType(type)) + ">" }
+    if isMapType(type) { return "Map<" + diagnosticType(context, mapKeyType(type)) + ", " + diagnosticType(context, mapValueType(type)) + ">" }
+    if isCallbackType(type, context.functionNames) {
+        let signature = callbackSignatureTypes(context.functionNames[type - 1000])
+        let pieces: List<Text> = ["("]
+        let index = 0
+        while index + 1 < signature.length {
+            if index > 0 { pieces.add(", ") }
+            pieces.add(diagnosticType(context, signature[index]))
+            index = index + 1
+        }
+        pieces.add(") -> " + diagnosticType(context, signature[signature.length - 1]))
+        return joinText(pieces)
+    }
+    if resultTypeName(type, context.functionNames) {
+        let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+        return "Result<" + diagnosticType(context, context.functionParameterTypes[first + 1]) + ", " + diagnosticType(context, context.functionParameterTypes[first + 2]) + ">"
+    }
+    if isRecordType(type) {
+        let name = readableDeclarationName(context.functionNames[type - 1000])
+        if diagnosticGeneratedName(name) { return "a record" }
+        return name
+    }
+    return describeType(type)
+}
+
+function diagnosticGeneratedName(name: Text): Boolean {
+    return resultPrefix(name, "minyar_generic_") || resultPrefix(name, "minyar_result_type_") || resultPrefix(name, "#Callback:") || findCharacter(name, '$') >= 0
+}
+
+// Import declarations have already been removed from normalized tokens. Read
+// their names only on this failure path, rather than adding successful-work
+// bookkeeping to every source map and token transformation.
+function diagnosticImportNames(sources: SourceMap, position: Integer): List<Text> {
+    let file = sourceSpan(sources, sources.inputPath, position, position + 1).file
+    let raw = diagnosticSource(file)
+    let kinds: List<Integer> = []
+    let texts: List<Text> = []
+    let locations = newSourceMap()
+    locations.inputPath = file
+    tokenize(raw, kinds, texts, locations)
+    let names: List<Text> = []
+    let index = 0
+    let depth = 0
+    while index + 3 < texts.length {
+        if depth == 0 && kinds[index] == 1 && texts[index] == "use" && kinds[index + 1] == 3 && texts[index + 2] == "as" && kinds[index + 3] == 1 { names.add(texts[index + 3]) }
+        if kinds[index] == 4 && texts[index] == "{" { depth = depth + 1 }
+        if kinds[index] == 4 && texts[index] == "}" { depth = depth - 1 }
+        index = index + 1
+    }
+    return names
+}
+
+function requireContextType(context: CompilerContext, position: Integer, actual: Integer, expected: Integer, message: Text) {
+    if actual != expected {
+        failAtToken(context.tokenLines, position, message + "; expected " + diagnosticType(context, expected) + ", found " + diagnosticType(context, actual))
+    }
+}
+
+function diagnosticArgumentLocation(context: CompilerContext, argument: Integer, fallback: Integer): Integer {
+    let child = context.syntax.nodes[context.syntax.active].firstChild
+    let index = 0
+    while child >= 0 && index < argument { child = context.syntax.nodes[child].nextSibling; index = index + 1 }
+    if child >= 0 { return context.syntax.nodes[child].start }
+    return fallback
+}
+
+function failUnknownMethod(context: CompilerContext, position: Integer, type: Integer, wanted: Text) {
+    let recordName = context.functionNames[type - 1000]
+    let candidates: List<Text> = []
+    let symbol = 0
+    while symbol < context.functionNames.length {
+        let name = context.functionNames[symbol]
+        let dollar = findCharacter(name, '$')
+        if context.symbolKinds[symbol] == 1 && dollar >= 0 {
+            let end = dollar + 1
+            while end < name.length && name[end] != '$' && name[end] != '|' && name[end] != '"' { end = end + 1 }
+            let member = name.slice(dollar + 1, end)
+            if name == methodFunctionName(recordName, member) || (name == methodFunctionName(recordName, member + "$private") && diagnosticSameModule(context, symbol, position)) { candidates.add(member) }
+        }
+        symbol = symbol + 1
+    }
+    let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+    let field = 0
+    while field < context.functionParameterCounts[type - 1000] {
+        let stored = context.functionParameterNames[first + field]
+        let name = declaredFieldName(stored)
+        if isCallbackType(context.functionParameterTypes[first + field], context.functionNames) && (stored.length == name.length || stored.slice(name.length + 1, stored.length) == tokenPath(context.tokenLines, position)) { candidates.add(name) }
+        field = field + 1
+    }
+    let label = ""
+    if candidates.length > 0 { label = "available methods: " + diagnosticNameList(candidates) }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "record '" + readableDeclarationName(recordName) + "' has no method named '" + wanted + "'", label, diagnosticSuggestion(wanted, candidates))
+}
