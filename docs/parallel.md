@@ -74,8 +74,8 @@ desktop glow against those existing packed routines at O0/O2 with ownership
 checks. Coverage is a sequential prefix scan, not an independent pixel loop.
 Safe BGR0 rendering visits four byte slots per pixel, with checked scalar
 arithmetic; it can cost more CPU than the raw packed routines. The desktop
-glow confines dispatch to the damaged rows and columns, retaining each row's
-stride and padding. The Mandelbrot scaling measurements do not imply packed
+glow restricts dispatch to damaged rows and clips writes by column, retaining
+each row's stride and padding. The Mandelbrot scaling measurements do not imply packed
 SIMD throughput for byte operations.
 
 Run `./minyar --release examples/gallery/parallel.min -o /tmp/garden`, then
