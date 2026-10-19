@@ -17,3 +17,7 @@ check-minyar-tooling-ownership: build/tooling/tests/editor-verification build/mi
 
 check-minyar-tooling-sanitize: build/tooling/tests/editor-verification build/minyarc
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/editor-verification --sanitize
+
+.PHONY: check-minyar-editor
+check-minyar-editor:
+	npm --prefix editors/vscode test

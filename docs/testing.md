@@ -901,3 +901,8 @@ Failures retain their source and protocol transcript. `check-minyar-tooling-owne
 repeats the formatter, index and complete server protocol checks at O0/O2 with
 normal-return ownership assertions; `check-minyar-tooling-sanitize` adds ASan
 and UBSan to the generated LLVM, runtime and native editor services.
+
+After `npm ci --ignore-scripts` in `editors/vscode`, `make check-minyar-editor`
+checks the grammar through the real TextMate/Oniguruma engines and exercises
+client command arguments, serialized restarts and shutdown. It does not require
+VS Code or claim an Extension Development Host qualification.
