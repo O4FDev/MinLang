@@ -88,8 +88,9 @@ let location = describeSpan(span) // file:line:column
 
 `SourceSpan` contains `file`, `line`, `column`, `firstToken` and `afterToken`.
 Lines and columns retain the full Integer width. Columns count Unicode scalar
-values, matching the lexer. Cached legacy origins are decoded on demand, and
-per-token module paths take precedence over the entry file.
+values, matching the lexer. Cached legacy origins are decoded on demand and
+retain filename punctuation. Per-token module paths take precedence over the
+entry file.
 
 `SourceMap.inputPath` supplies the file for an ordinary entry module. It is
 separate from the existing debug-origin path representation, so recording the
