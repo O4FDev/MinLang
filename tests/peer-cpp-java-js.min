@@ -3,6 +3,7 @@ use "system" as system
 use "files" as files
 use "json" as json
 use "./cpython-random.min" as random
+use "../tools/testing.min" as test
 
 record Fatal { label: Text; body: Text; stdout: Text; stderr: Text }
 function fatalBranches(c: peer.Case, definitions: List<Text>, cases: List<Fatal>) {
@@ -4029,9 +4030,22 @@ function test_mongolian_vowel_separator_is_comment_text_not_token_whitespace(c: 
     peer.expect(c, files.pathSize(compiled.llvm) < 0, "rejected separator left LLVM output")
     peer.executes(c, "// " + separator + "\nlet /* " + separator + " */ foo = 1\nprint(foo)\n", "1\n")
 }
-function cjjCRejectsBoundary(c: peer.Case, source: Text, line: Integer, column: Integer, message: Text) {
+function cjjCRejectsBoundary(c: peer.Case, source: Text, line: Integer, column: Integer, message: Text, recovered: List<Text>) {
     let compiled = peer.compile(c, source)
-    peer.observe(c, compiled.result, 1, "", "Minyar stopped: line " + Text(line) + ", column " + Text(column) + ": " + message + "\n", "statement boundary")
+    let output = compiled.result.errorOutput
+    peer.expect(c, compiled.result.status == 1 && compiled.result.output == "" && peer.validCompilerDiagnostics(output), "statement boundary rejection\n" + output)
+    // Recovery reports later invalid statements too; retain an exact oracle
+    // for every message and position instead of ignoring the additional errors.
+    let expected = ["Minyar stopped: line " + Text(line) + ", column " + Text(column) + ": " + message + "\n"]
+    for diagnostic in recovered { expected.add("Minyar stopped: " + diagnostic + "\n") }
+    let blocks = output.split("\nerror: ")
+    peer.equalInteger(c, blocks.length, expected.length, "statement boundary diagnostic count")
+    for index in 0..blocks.length {
+        let block = blocks[index]
+        if index > 0 { block = "error: " + block }
+        if index + 1 < blocks.length { block += "\n" }
+        peer.equal(c, test.diagnosticSummary(block, false), expected[index], "statement boundary diagnostic " + Text(index))
+    }
     peer.expect(c, files.pathSize(compiled.llvm) < 0, "rejected boundary left LLVM output")
 }
 function test_operator_continuations_keep_exact_operands_and_statement_boundaries(c: peer.Case) {
@@ -4047,13 +4061,15 @@ function test_operator_continuations_keep_exact_operands_and_statement_boundarie
         source.add("let x" + n + " =\ny" + n + " " + operators[index] + "\nz" + n + "\nprint(x" + n + ")")
         source.add("print(y" + n + " " + operators[index] + "\nz" + n + ")")
         peer.extend(expected, [results[index], results[index]])
-        cjjCRejectsBoundary(c, "let y = " + Text(lefts[index]) + "; let z = " + Text(rights[index]) + "\nlet\nx\n=\ny\n" + operators[index] + "\nz\n", 2, 4, "expected a name after let")
+        let recovered = ["line 3, column 1: I can't find a value named 'x'", "line 4, column 1: expected an expression, found '='"]
+        if operators[index] != "-" { recovered.add("line 6, column 1: expected an expression, found '" + operators[index] + "'") }
+        cjjCRejectsBoundary(c, "let y = " + Text(lefts[index]) + "; let z = " + Text(rights[index]) + "\nlet\nx\n=\ny\n" + operators[index] + "\nz\n", 2, 4, "expected a name after let", recovered)
         source.add("print(y" + n + "\n" + operators[index] + "\nz" + n + ")")
         expected.add(results[index])
     }
     source.add("let last =\n1\nprint(last)")
     expected.add("1")
-    cjjCRejectsBoundary(c, "let\nx\n=\n1\nprint(x)\n", 1, 4, "expected a name after let")
+    cjjCRejectsBoundary(c, "let\nx\n=\n1\nprint(x)\n", 1, 4, "expected a name after let", ["line 2, column 1: I can't find a value named 'x'", "line 3, column 1: expected an expression, found '='", "line 5, column 7: I can't find a value named 'x'"])
     peer.executes(c, peer.joined(source, "\n"), peer.joined(expected, "\n") + "\n")
 }
 function test_multiline_multiplicative_chains_keep_left_association(c: peer.Case) {

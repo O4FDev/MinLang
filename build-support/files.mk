@@ -1,5 +1,7 @@
 .PHONY: check-files check-files-sanitize
 FILES_TEST_SOURCES = tests/files-focused.min tests/files-test-path.h tests/files-ranges.c tests/files-prepare.c tests/files-eventloop.min runtime/native/files.c library/files.min
+# Sparse offset controls write beyond 4 GiB; allow 8 GiB logical file sizes here.
+check-files check-files-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 16777216
 check-files: build/minyarc $(FILES_TEST_SOURCES) build/tooling/tests/files-focused
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/files-focused
 

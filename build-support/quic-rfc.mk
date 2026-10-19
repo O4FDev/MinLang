@@ -20,6 +20,8 @@ $(QUIC_PROTOCOL_DRIVERS): runtime/native/net.c runtime/native/sha256.c
 check-quic-protocol-artifacts: build/tooling/tests/quic-protocol-artifacts build/tooling/tests/quic-qns-local build/tooling/tests/quic-vn-probe tests/quic-protocol-artifacts.min tests/quic-protocol-support.min tests/quic-qns-local.min tests/quic-vn-probe.min tests/interop/qns/endpoint.min | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-protocol-artifacts.XXXXXXXX"); $(LIMITED) ./build/tooling/tests/quic-protocol-artifacts --artifacts "$$artifacts/run"
 
+# Link provenance retains Clang itself; permit files up to 512 MiB here.
+check-quic-rfc check-quic-rfc-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-quic-rfc: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	./build/tooling/tests/quic-rfc-harness
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization both --artifacts "$$artifacts/run"

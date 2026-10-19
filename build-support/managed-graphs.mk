@@ -149,6 +149,8 @@ CYCLE_PRIVATE_RETIREMENT_INPUTS = build/tooling/tests/cycle-private-retirement t
 build/tooling/tests/cycle-private-retirement: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
 build/tooling/tests/cycle-private-retirement: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/cycle-private-retirement: tests/evidence-support-native.c runtime/native/sha256.c
+# Evidence retains Clang itself; permit files up to 512 MiB for these checks.
+check-cycle-private-retirement check-cycle-private-retirement-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --evidence "$$evidence/run"

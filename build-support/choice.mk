@@ -1,8 +1,10 @@
 # The core declaration remains ordinary Minyar source; embedding avoids a runtime
 # dependency on the compiler's working directory or a particular library path.
 build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | build
-	awk -f "build-support/choice-prelude.awk" "$<" > "$@.tmp"
-	if test -f "$@" && cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
+	@set -e; temporary=$$(mktemp "$@.tmp.XXXXXXXX"); \
+	trap 'rm -f "$$temporary"' 0; \
+	awk -f "build-support/choice-prelude.awk" "$<" > "$$temporary"; \
+	if ! test -f "$@" || ! cmp -s "$$temporary" "$@"; then mv "$$temporary" "$@"; fi
 
 .PHONY: check-choice-identifiers check-choice-smoke check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
 

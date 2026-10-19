@@ -780,6 +780,8 @@ check check-portable: check-redis-protocol check-redis-pipeline
 check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
 
 .PHONY: check-native-cache
+# Link receipts retain Clang itself; permit files up to 512 MiB here.
+check-native-cache: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-native-cache: build/tooling/tools/clang-driver build/tooling/tests/native-object-cache
 	$(LIMITED) ./build/tooling/tests/native-object-cache
 
@@ -921,6 +923,8 @@ GENERATED_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolc
 GENERATED_SANITIZER_INPUTS = build/tooling/tests/generated-llvm-sanitizer-test tests/generated-llvm-sanitizer.min build/tooling/tools/clang-driver tools/toolchain.sh runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 build/tooling/tests/generated-llvm-sanitizer-test: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/generated-llvm-sanitizer-test: TOOL_LIBS = $(TOOL_CRYPTO)
+# Evidence retains Clang itself; permit files up to 512 MiB for this check.
+check-generated-llvm-sanitizer: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/generated-llvm-sanitizer-test --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer
