@@ -113,12 +113,14 @@ code safe to execute. Review changes to both the manifest and the lock.
 ## Source policy
 
 Downloads use a fresh bare repository with no checkout, inherited Git
-configuration, credential helper or hooks. Files are read directly from Git
-blobs. Git submodules, symlinks, absolute paths, `..` path components, Git
-metadata paths, backslashes, control characters and colon-bearing paths are
-rejected. Packages are limited to 16,384 files, 128 MiB of source data and 4,096
-nested text/interpolation contexts. The source check follows UTF-8 BOM handling, flat block
-comments and ordinary, raw and multiline text; interpolation contents are code.
+configuration, credential helper or hooks. Git runs with a private home directory;
+it cannot consult your `.netrc` or launch your password helper. Files are read
+directly from Git blobs. Git submodules, symlinks, absolute paths, `..` path
+components, Git metadata paths, backslashes, control characters and colon-bearing
+paths are rejected. Packages are limited to 16,384 files, 128 MiB of source data
+and 4,096 nested text/interpolation contexts. The source check follows UTF-8 BOM
+handling, flat block comments and ordinary, raw and multiline text;
+interpolation contents are code.
 
 Packages never run install/build scripts. Remote dependencies cannot contain
 native C, Objective-C, Swift, assembly or binary implementations, or declare a

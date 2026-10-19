@@ -2,6 +2,7 @@
 """Offline package/index integration and the real Minyar loopback HTTP server."""
 import hashlib
 import http.client
+import http.server
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 if not __debug__:
     raise SystemExit("registry checks require Python assertions; remove -O")
@@ -32,6 +34,55 @@ def sums(entries):
 def write_index(path, value):
     value["checksum_root"] = hashlib.sha256(sums(value["packages"]).encode()).hexdigest()
     path.write_text(json.dumps(value))
+
+
+def check_credential_isolation(launcher, env, root, application):
+    authorizations = []
+
+    class Denied(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            authorizations.append(self.headers.get("Authorization"))
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="private fixture"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *arguments):
+            pass
+
+    private_home = root / "user home with credentials"
+    private_home.mkdir()
+    netrc = private_home / ".netrc"
+    netrc.write_text("machine 127.0.0.1 login fixture password fake-test-password\n")
+    netrc.chmod(0o600)
+    asked = root / "askpass-ran"
+    askpass = root / "askpass"
+    askpass.write_text("#!/bin/sh\ntouch " + shlex.quote(str(asked)) + "\nprintf 'fixture\\n'\n")
+    askpass.chmod(0o755)
+    manifest = (application / "Minyar.toml").read_bytes()
+    lock = (application / "Minyar.lock").read_bytes()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Denied)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    problems = []
+    try:
+        for authority in ("127.0.0.1", "localhost"):
+            authorizations.clear()
+            asked.unlink(missing_ok=True)
+            isolated = {k: v for k, v in env.items() if k not in ("MINYAR_GIT_MIRROR", "MINYAR_REGISTRY") and not k.lower().endswith("_proxy")}
+            isolated.update(HOME=str(private_home), SSH_ASKPASS=str(askpass), NO_PROXY="*", MINYAR_TEST_AUTH_URL=f"http://{authority}:{server.server_port}/noauth.git")
+            run([launcher, "add", "github.com/Fixtures/noauth"], isolated, application, "Git could not read this package")
+            assert authorizations, "the private Git HTTP fixture must receive a request"
+            if any(authorizations):
+                problems.append("Git consulted the invoking user's .netrc")
+            if asked.exists():
+                problems.append("Git executed the invoking user's password helper")
+            assert (application / "Minyar.toml").read_bytes() == manifest and (application / "Minyar.lock").read_bytes() == lock
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+    assert not problems, "; ".join(problems)
 
 
 def main():
@@ -73,7 +124,9 @@ def main():
 import json, os, sys
 with open(os.environ['MINYAR_TEST_GIT_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
-os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT'], *sys.argv[1:]])
+# The authentication fixture uses real Git HTTP entirely on loopback.
+arguments = [os.environ['MINYAR_TEST_AUTH_URL'] if value == 'https://github.com/Fixtures/noauth.git' else value for value in sys.argv[1:]]
+os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT'], *arguments])
 """)
         wrapper.chmod(0o755)
         env.update(PATH=str(wrappers) + os.pathsep + env.get("PATH", "/usr/bin:/bin"), MINYAR_TEST_GIT_LOG=str(git_log), MINYAR_TEST_REAL_GIT=real_git)
@@ -187,7 +240,8 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
             server.terminate()
             server.wait(timeout=10)
         assert "lumen" in run([launcher, "search", "--registry", url, "--offline"], env, root)
-        print("Registry: dry runs, immutable records, sums, Git verification, search/info, HTTP, offline witness and path policy passed")
+        check_credential_isolation(launcher, env, root, application)
+        print("Registry: dry runs, batched raw blobs, immutable sums, Git verification, discovery, HTTP, offline witness, paths and credential isolation passed")
 
 
 if __name__ == "__main__":
