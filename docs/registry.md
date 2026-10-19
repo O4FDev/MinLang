@@ -58,6 +58,8 @@ minyar build --locked --offline
 changing the environment. A local public directory also works. HTTP is allowed
 only for loopback testing. Search folds ASCII case and searches names, repository
 paths and descriptions; it displays the highest stable version of each repository.
+`info` lists that repository's releases in numeric order, newest first. A previous
+package name still resolves its complete history after a rename.
 
 When `MINYAR_REGISTRY` is configured, Git release commits and content hashes must
 match its records. Branch/commit selectors still use the project's exact lock and

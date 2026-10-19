@@ -168,6 +168,14 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
         assert "lumen" in run([launcher, "search", "light", "--registry", public], env, root)
         assert record["checksum"] in run([launcher, "info", "lumen", "--registry", public], env, root)
         run([launcher, "info", "absent", "--registry", public], env, root, "package not found")
+        history = [record, dict(record, version="0.2.0"), dict(record, name="new-lumen", version="0.10.0"), dict(record, name="new-lumen", version="1.0.0")]
+        write_index(index_path, dict(index, packages=history))
+        information = run([launcher, "info", "lumen", "--registry", public], env, root)
+        assert information == run([launcher, "info", record["repository"], "--registry", public], env, root), "a historical name resolves the complete repository history"
+        versions = [line.split()[0] for line in information.splitlines() if line.startswith("  v")]
+        assert versions == ["v1.0.0", "v0.10.0", "v0.2.0", "v0.1.0"], "info shows numeric release order, newest first"
+        assert information.startswith("new-lumen  ")
+        assert "v1.0.0" in run([launcher, "search", "new-lumen", "--registry", public], env, root)
         ambiguous = dict(record, repository="github.com/Another/lumen")
         write_index(index_path, dict(index, packages=[record, ambiguous]))
         run([launcher, "info", "lumen", "--registry", public], env, root, "more than one package")
