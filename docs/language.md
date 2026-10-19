@@ -44,6 +44,30 @@ their test syntax. The low-level `--test-mode` compiler/launcher option builds
 a module's test executable; run it with `--list`, a zero-based case index, or
 no argument to run its cases in order.
 
+## Documentation beside the code
+
+Write `///` immediately above a declaration to describe it. Consecutive lines
+form one comment; an empty `///` line begins a new paragraph. A blank source
+line separates the comment from the declaration. Fields and choice cases can
+have their own comments too:
+
+```minyar
+/// A named light beside the water.
+public record Lantern {
+    /// The place someone will look for.
+    name: Text
+    /// The light we have to give.
+    light: Integer
+}
+```
+
+`minyar --doc-json FILE.min` prints versioned JSON containing public
+declarations, original signatures, comments, members and file:line:column
+spans. Private declarations and private fields are excluded. Generic
+parameters, constraints, choices, methods and type aliases keep their source
+spelling. This reads syntax; use `minyar check` to check a project's types.
+Documentation emits no runtime code or literals.
+
 ## Bindings and scope
 
 `let` introduces a local value. A name exists from its declaration to the end

@@ -1,0 +1,105 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "system" as system
+use "json" as json
+
+let compiler = test.compiler()
+compiler.executable = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let path = compiler.directory + "/docs é🙂.min"
+let source = #"""
+    /// A pair of things.
+    ///
+    /// Keep the order.
+    public record Pair<First, Second> {
+        /// A nested collection.
+        samples: List<List<First>>
+        /// The first thing.
+        first: First
+        /// Keep this secret.
+        private second: Second
+    }
+    /// The widest name.
+    public type Words = Pair<Text, Integer>
+    /// Turn the page.
+    public choice Page<Item> {
+        /// There is something to read.
+        Written(text: Item)
+        /// A quiet page.
+        Blank
+    }
+    /// Pick the best.
+    public function best<Item: Ordered>(values: List<Item>, fallback: Item): Item {
+        return fallback
+    }
+    /// A lantern.
+    public record Lantern { light: Integer }
+    /// Share a little light.
+    public function Lantern.share(friends: Integer): Integer { return self.light / friends }
+    /// Not a function's documentation.
+    constant fake = """
+        /// Also not documentation.
+        """
+    public function bare(): Integer { return 42 }
+    /// This comment is detached.
+
+    public function detached() {}
+    /// The answer stays still.
+    public constant answer = 42
+    /// The tide can move.
+    public global tide: Integer = 1
+    test "metadata test" { expect(true) }
+    """#
+io.writeTextFile(path, source)
+let result = test.run([compiler.executable, path, path + ".json", "--doc-json", "--library", "library"], system.environment(), "", compiler.directory + "/metadata", 30)
+test.require(result, "compiler documentation metadata")
+let document = json.parse(io.readTextFile(path + ".json"))
+test.check(document.kind == json.OBJECT && document.member("version").number == 1.0, "versioned documentation JSON")
+test.check(json.string(document, "file") == path, "UTF-8 source filename")
+let declarations = document.member("declarations").items
+test.check(declarations.length == 10, "all and only public declarations")
+test.check(json.string(declarations[0], "documentation") == "A pair of things.\n\nKeep the order.", "consecutive documentation paragraphs")
+test.check(json.string(declarations[0], "signature") == "public record Pair<First, Second>", "generic source spelling")
+test.check(declarations[0].member("span").member("line").number == 4.0 && declarations[0].member("span").member("column").number == 8.0, "declaration source span")
+let fields = declarations[0].member("members").items
+test.check(fields.length == 2 && json.string(fields[0], "signature") == "samples: List<List<First>>", "nested generic field and private-field exclusion")
+test.check(json.string(fields[1], "documentation") == "The first thing.", "field documentation")
+test.check(json.string(declarations[1], "signature") == "public type Words = Pair<Text, Integer>", "alias signature ends before the next declaration")
+test.check(json.string(declarations[2], "kind") == "choice" && declarations[2].member("members").items.length == 2, "generic choice cases")
+test.check(json.string(declarations[2].member("members").items[1], "documentation") == "A quiet page.", "case documentation")
+test.check(json.string(declarations[3], "signature") == "public function best<Item: Ordered>(values: List<Item>, fallback: Item): Item", "generic constraints in signatures")
+test.check(json.string(declarations[5], "name") == "Lantern.share", "method signature")
+test.check(json.string(declarations[6], "documentation") == "" && json.string(declarations[7], "documentation") == "", "quoted and detached comments do not attach")
+test.check(json.string(declarations[8], "signature") == "public constant answer = 42" && json.string(declarations[8], "documentation") == "The answer stays still.", "constant source metadata")
+test.check(json.string(declarations[9], "signature") == "public global tide: Integer = 1" && json.string(declarations[9], "documentation") == "The tide can move.", "global source metadata")
+test.check(document.member("tests").items.length == 1 && json.string(document.member("tests").items[0], "name") == "metadata test", "named test source metadata")
+io.writeTextFile(path, Text(Character(65279)) + "/// A leading light.\r\npublic type Words = List<Text>\r\n/// Twice as bright.\r\npublic parallel function double(value: Integer): Integer { return value * 2 }\r\n")
+let modifiers = test.run([compiler.executable, path, path + ".modifiers", "--doc-json"], system.environment(), "", compiler.directory + "/modifiers", 30)
+test.require(modifiers, "BOM and CRLF documentation")
+let modified = json.parse(io.readTextFile(path + ".modifiers")).member("declarations").items
+test.check(modified.length == 2 && json.string(modified[0], "documentation") == "A leading light.", "BOM and CRLF comment capture")
+test.check(json.string(modified[1], "signature") == "public parallel function double(value: Integer): Integer" && json.string(modified[1], "documentation") == "Twice as bright.", "alias scanning preserves the next declaration's modifier and comment")
+io.writeTextFile(path, "public test \"private\" {}\n")
+let rejection = test.run([compiler.executable, path, path + ".rejected", "--doc-json"], system.environment(), "", compiler.directory + "/rejected", 30)
+test.check(rejection.status == 1 && test.contains(rejection.errorOutput, "tests belong to their own module"), "public test metadata rejection")
+let core = io.readTextFile(test.setting("MINYAR_TEST_SOURCE", "build/compiler.min"))
+let main = core.find("\nfunction main(")
+test.check(main >= 0, "compiler source entry point changed")
+test.require(test.compile(compiler, core.slice(0, main) + "\n" + io.readTextFile("tests/documentation-probe.min")), "compile documentation tree probe")
+let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+for optimization in ["-O0", "-O2"] {
+    let executable = compiler.directory + "/documentation-tree"
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", compiler.directory + "/link", 120), "link documentation tree " + optimization)
+    let run = test.run([executable], system.environment(), "", compiler.directory + "/tree", 30)
+    test.require(run, "execute documentation tree " + optimization)
+    test.check(run.output == "documentation tree verified\n" && run.errorOutput == "", "typed documentation and unchanged runtime oracle")
+}
+test.removeTree(compiler.directory)
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+fixtures.executes(frontend, io.readTextFile("examples/gallery/living-tests.min"), "The harbour: 42 lights for you, 42 for me.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Documentation comments, source metadata, typed nodes and ownership passed at O0/O2")

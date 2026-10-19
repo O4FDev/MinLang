@@ -1,0 +1,175 @@
+// Documentation follows token origins through module and type normalization.
+function setTokenDocumentation(locations: SourceMap, token: Integer, documentation: Text) {
+    let values = locations.documentation
+    while values.length <= token { values.add("") }
+    values[token] = documentation
+}
+
+function attachDocumentation(kinds: List<Integer>, texts: List<Text>, locations: SourceMap, first: Integer, lines: List<Integer>, comments: List<Text>) {
+    let comment = 0
+    let token = first
+    while comment < lines.length {
+        let pieces: List<Text> = [comments[comment]]
+        let lastLine = lines[comment]
+        comment = comment + 1
+        while comment < lines.length && lines[comment] == lastLine + 1 {
+            pieces.add("\n")
+            pieces.add(comments[comment])
+            lastLine = lines[comment]
+            comment = comment + 1
+        }
+        while token < kinds.length && locations.coordinates[token * 2] <= lastLine { token = token + 1 }
+        if token < kinds.length && locations.coordinates[token * 2] == lastLine + 1 {
+            let documentation = joinText(pieces)
+            let target = token
+            while target < kinds.length && (texts[target] == "public" || texts[target] == "private" || (kinds[target] == 6 && (texts[target] == "parallel" || texts[target] == "thread"))) {
+                setTokenDocumentation(locations, target, documentation)
+                target = target + 1
+            }
+            if target < kinds.length && kinds[target] == 1 { setTokenDocumentation(locations, target, documentation) }
+        }
+    }
+}
+
+function documentationTrim(value: Text): Text {
+    let first = 0
+    let after = value.length
+    while first < after && characterIsWhitespace(value[first]) { first = first + 1 }
+    while after > first && characterIsWhitespace(value[after - 1]) { after = after - 1 }
+    return value.slice(first, after)
+}
+
+function documentationKind(kinds: List<Integer>, texts: List<Text>, token: Integer): Integer {
+    if kinds[token] != 1 { return 0 }
+    let word = texts[token]
+    if word == "function" { return 1 }
+    if word == "record" { return 2 }
+    if word == "constant" { return 3 }
+    if word == "global" { return 4 }
+    if choiceDeclarationAt(kinds, texts, token) { return 7 }
+    if isTypeAliasAt(kinds, texts, token) { return 8 }
+    if testBlockAt(kinds, texts, token) { return 9 }
+    return 0
+}
+
+function documentationName(kinds: List<Integer>, texts: List<Text>, token: Integer): Text {
+    let name = texts[token + 1]
+    if texts[token] == "function" && texts[token + 2] == "." { name = name + "." + texts[token + 3] }
+    return name
+}
+
+function documentationSpan(tree: SyntaxTree, node: Integer): Text {
+    let span = syntaxSpan(tree, node)
+    return "{\"file\":" + compilerJSONText(span.file) + ",\"line\":" + Text(span.line) + ",\"column\":" + Text(span.column) + "}"
+}
+
+function documentationMembers(source: Text, offsets: List<Integer>, kinds: List<Integer>, texts: List<Text>, tree: SyntaxTree, parent: Integer): Text {
+    let node = tree.nodes[parent]
+    let output: List<Text> = []
+    let position = node.body + 1
+    let isChoice = node.kind == 7
+    while position < node.end - 1 {
+        while position < node.end - 1 && (kinds[position] == 6 || (kinds[position] == 4 && texts[position] == ",")) { position = position + 1 }
+        if position < node.end - 1 {
+            let first = position
+            let hidden = false
+            if !isChoice && texts[position] == "private" && kinds[position + 1] == 1 { hidden = true; position = position + 1 }
+            let name = position
+            position = position + 1
+            if isChoice {
+                if texts[position] == "(" { position = testClosing(kinds, texts, tree.sources, position) + 1 }
+            } else {
+                let cursor: List<Integer> = [position, 0]
+                expectToken(kinds, texts, tree.sources, cursor, ":")
+                skipAliasType(kinds, texts, tree.sources, cursor, 0)
+                if cursor[1] != 0 { failAtToken(tree.sources, cursor[0] - 1, "this field type has an extra closing >") }
+                position = cursor[0]
+            }
+            if !hidden {
+                let child = appendSyntaxNode(tree, 5, name, position, parent, 0, -1)
+                let signature = documentationTrim(source.slice(documentationOffset(offsets, tree.sources, first), documentationOffset(offsets, tree.sources, position - 1) + texts[position - 1].length))
+                if output.length > 0 { output.add(",") }
+                output.add("{\"name\":" + compilerJSONText(texts[name]) + ",\"signature\":" + compilerJSONText(signature) + ",\"documentation\":" + compilerJSONText(tree.nodes[child].documentation) + ",\"span\":" + documentationSpan(tree, child) + "}")
+            }
+        }
+    }
+    return "[" + joinText(output) + "]"
+}
+
+function documentModule(path: Text): Text {
+    let source = io.readTextFile(path)
+    let offsets = documentationLineOffsets(source)
+    let kinds: List<Integer> = []
+    let texts: List<Text> = []
+    let locations = newSourceMap()
+    locations.inputPath = path
+    tokenize(source, kinds, texts, locations)
+    let tree = newSyntaxTree(locations, path, kinds.length - 1)
+    let declarations: List<Text> = []
+    let tests: List<Text> = []
+    let cursor: List<Integer> = [0]
+    while kinds[cursor[0]] != 0 {
+        while kinds[cursor[0]] == 6 && texts[cursor[0]] != "parallel" && texts[cursor[0]] != "thread" { cursor[0] = cursor[0] + 1 }
+        if kinds[cursor[0]] != 0 {
+            let first = cursor[0]
+            let keyword = first
+            let exported = false
+            while texts[keyword] == "public" || (kinds[keyword] == 6 && (texts[keyword] == "parallel" || texts[keyword] == "thread")) {
+                if texts[keyword] == "public" { exported = true }
+                keyword = keyword + 1
+            }
+            let kind = documentationKind(kinds, texts, keyword)
+            if kind == 1 || kind == 2 || kind == 7 || kind == 9 { cursor[0] = keyword; skipDeclaration(kinds, texts, cursor) }
+            else if kind == 8 {
+                cursor[0] = keyword
+                skipTypeAliasDeclaration(kinds, texts, locations, cursor)
+                while cursor[0] > keyword && kinds[cursor[0] - 1] == 6 && (texts[cursor[0] - 1] == "parallel" || texts[cursor[0] - 1] == "thread") { cursor[0] = cursor[0] - 1 }
+            }
+            else { skipTopLevelStatement(kinds, texts, cursor) }
+            if kind > 0 {
+                let node = appendSyntaxNode(tree, kind, keyword, cursor[0], 0, 0, -1)
+                tree.declarations.add(node)
+                let body = keyword
+                while body < cursor[0] && !(kinds[body] == 4 && texts[body] == "{") { body = body + 1 }
+                tree.nodes[node].body = body
+                if kind == 9 {
+                    if exported { failAtToken(locations, keyword, "tests belong to their own module and cannot be public") }
+                    if tests.length > 0 { tests.add(",") }
+                    tests.add("{\"name\":" + compilerJSONText(texts[keyword + 1]) + ",\"span\":" + documentationSpan(tree, node) + "}")
+                } else if exported {
+                    let after = body
+                    if kind == 3 || kind == 4 {
+                        after = keyword
+                        while after < cursor[0] && kinds[after] != 6 { after = after + 1 }
+                    }
+                    let afterOffset = documentationOffset(offsets, locations, after)
+                    if kind == 8 {
+                        after = cursor[0]
+                        while after > keyword && kinds[after - 1] == 6 { after = after - 1 }
+                        afterOffset = documentationOffset(offsets, locations, after - 1) + texts[after - 1].length
+                    }
+                    let signature = documentationTrim(source.slice(documentationOffset(offsets, locations, first), afterOffset))
+                    let members = "[]"
+                    if kind == 2 || kind == 7 { members = documentationMembers(source, offsets, kinds, texts, tree, node) }
+                    if declarations.length > 0 { declarations.add(",") }
+                    declarations.add("{\"name\":" + compilerJSONText(documentationName(kinds, texts, keyword)) + ",\"kind\":" + compilerJSONText(texts[keyword]) + ",\"signature\":" + compilerJSONText(signature) + ",\"documentation\":" + compilerJSONText(tree.nodes[node].documentation) + ",\"span\":" + documentationSpan(tree, node) + ",\"members\":" + members + "}")
+                }
+            } else if exported { failAtToken(locations, keyword, "public must describe a declaration") }
+        }
+    }
+    return "{\"version\":1,\"file\":" + compilerJSONText(path) + ",\"declarations\":[" + joinText(declarations) + "],\"tests\":[" + joinText(tests) + "]}\n"
+}
+
+function documentationLineOffsets(source: Text): List<Integer> {
+    let offsets: List<Integer> = [0]
+    let position = 0
+    while position < source.length {
+        if source[position] == '\n' { offsets.add(position + 1) }
+        position = position + 1
+    }
+    return offsets
+}
+
+function documentationOffset(offsets: List<Integer>, locations: SourceMap, token: Integer): Integer {
+    return offsets[locations.coordinates[token * 2] - 1] + locations.coordinates[token * 2 + 1] - 1
+}

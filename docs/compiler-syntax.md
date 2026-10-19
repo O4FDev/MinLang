@@ -28,8 +28,8 @@ declared before another record uses it as a field.
 
 Nodes have stable Integer IDs into `tree.nodes`, a `List<SyntaxNode>`. Each
 node stores its kind, resolved type, half-open token range, parent, first/last
-child, previous/next sibling, symbol, body start and operator token. Links are
-Integer IDs, keeping the managed object graph flat and teardown iterative.
+child, previous/next sibling, symbol, body start, operator token and documentation.
+Links are Integer IDs, keeping the managed object graph flat and teardown iterative.
 
 Record lists are supported by the bootstrap compiler. A construction and
 sibling-traversal comparison over 100,000 nodes at O2 used 132.3 million retired
@@ -65,6 +65,8 @@ overnight charter and are separate from lexer and type codes:
 
 - 0: module.
 - 1–6: function, record, constant, global, field and parameter.
+- 7–9: choice, type alias and test in raw documentation trees. Typed compilation
+  continues to describe normalized declarations with the existing kinds.
 - 100–111: block, conditional, loop, binding, return, jump, match, native body,
   expression statement and assignment.
 - 200–221: names, literals, collections, groups, closures, calls, record
@@ -75,6 +77,28 @@ To add a kind, extend that catalogue and its structural probe. Call
 resolved type and cursor after the node. These helpers check balanced
 parentage. Use `wrapSyntaxOperand` for postfix or binary operations so the
 existing receiver or left operand remains a typed child.
+
+## Documentation metadata
+
+The lexer captures actual leading `///` comments, so quoted or interpolated
+text cannot become documentation. Consecutive comment lines attach to the
+immediately following declaration or binding; a blank source line detaches
+them. `SourceMap.documentation` is a sparse-prefix token column, preserved by
+`copyModuleToken`. `appendSyntaxNode` copies its text to the node's
+`documentation` field. The module root does not inherit a declaration's comment.
+
+`--doc-json` builds a raw source tree instead of normalizing generics, choices
+and methods. Its version 1 JSON contains public declarations with `name`, `kind`,
+`signature`, `documentation`, `span` and `members`, plus a separate `tests`
+array with names and spans. Signatures retain the original source spelling;
+members include public record fields and choice cases. Private fields are
+excluded. Source offsets are indexed once, and field boundaries follow the
+type grammar rather than relying on newline tokens after generic brackets.
+
+This mode reloads original source and bypasses incremental interface caches.
+Cached interfaces remain a compilation representation, not a documentation
+archive. The metadata mode emits no executable program and does not replace
+type checking. Ordinary compilation emits identical LLVM with `///` and `//`.
 
 ## Source spans and diagnostics
 
