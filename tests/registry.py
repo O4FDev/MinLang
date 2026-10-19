@@ -103,6 +103,8 @@ def main():
         (package / "raw/quote' $(touch SHOULD_NOT_EXIST) `echo data` ☀.dat").write_bytes(b"no trailing newline")
         (package / ".gitattributes").write_text("raw/* export-ignore filter=never-run\nsubstitution.dat export-subst\n")
         (package / "substitution.dat").write_text("$Format:%H$\n")
+        historical = package / "history.dat"
+        historical.write_bytes(hashlib.shake_256(b"Minyar historical blob fixture").digest(1048576))
 
         def git(*arguments):
             return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Minyar tests", "-c", "user.email=tests@example.invalid", "-C", package, *arguments], env, root)
@@ -110,26 +112,47 @@ def main():
         git("init", "--quiet", "--initial-branch=main")
         git("add", ".")
         git("commit", "--quiet", "-m", "feat(package): add a registry fixture")
-        git("tag", "v0.1.0")
+        historical_blob = git("rev-parse", "HEAD:history.dat").strip()
+        historical_commit = git("rev-parse", "HEAD").strip()
+        historical.unlink()
+        git("add", "--all")
+        git("commit", "--quiet", "-m", "chore(package): remove historical fixture data")
+        git("tag", "-a", "v0.1.0", "-m", "Fixture release")
+        release_tag = git("rev-parse", "refs/tags/v0.1.0").strip()
         head = git("rev-parse", "HEAD").strip()
         git("config", "filter.never-run.smudge", "touch " + shlex.quote(str(root / "filter-ran")) + "; cat")
         real_git = shutil.which("git", path=env.get("PATH"))
         assert real_git
         git_log = root / "git-calls.jsonl"
         git_log.write_text("")
+        history_log = root / "git-history.jsonl"
+        history_log.write_text("")
         wrappers = root / "bin"
         wrappers.mkdir()
         wrapper = wrappers / "git"
         wrapper.write_text(f"""#!{sys.executable}
-import json, os, sys
+import json, os, subprocess, sys
 with open(os.environ['MINYAR_TEST_GIT_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
 # The authentication fixture uses real Git HTTP entirely on loopback.
 arguments = [os.environ['MINYAR_TEST_AUTH_URL'] if value == 'https://github.com/Fixtures/noauth.git' else value for value in sys.argv[1:]]
+if 'fetch' in arguments and '--depth=1' in arguments and os.environ.get('MINYAR_TEST_REJECT_SHALLOW'):
+    with open(os.environ['MINYAR_TEST_REJECT_SHALLOW'], 'w') as marker:
+        marker.write('shallow fetch unavailable')
+    sys.exit(1)
+if 'fetch' in arguments and os.environ.get('MINYAR_TEST_RACE_MIRROR'):
+    subprocess.run([os.environ['MINYAR_TEST_REAL_GIT'], '--git-dir=' + os.environ['MINYAR_TEST_RACE_MIRROR'], 'update-ref', 'refs/tags/v0.1.0', os.environ['MINYAR_TEST_RACE_COMMIT']], check=True, timeout=10)
+    with open(os.environ['MINYAR_TEST_RACE_MARKER'], 'w') as marker:
+        marker.write('tag moved after discovery')
+if arguments[-2:] == ['cat-file', '--batch'] and any(value.startswith('--git-dir=') and '/.fetch-' in value for value in arguments):
+    probe = subprocess.run([os.environ['MINYAR_TEST_REAL_GIT'], *arguments[:-2], 'cat-file', '-e', os.environ['MINYAR_TEST_HISTORY_BLOB']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    with open(os.environ['MINYAR_TEST_HISTORY_LOG'], 'a') as log:
+        log.write(json.dumps({{'historical_object': probe.returncode == 0}}) + '\\n')
 os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT'], *arguments])
 """)
         wrapper.chmod(0o755)
         env.update(PATH=str(wrappers) + os.pathsep + env.get("PATH", "/usr/bin:/bin"), MINYAR_TEST_GIT_LOG=str(git_log), MINYAR_TEST_REAL_GIT=real_git)
+        env.update(MINYAR_TEST_HISTORY_BLOB=historical_blob, MINYAR_TEST_HISTORY_LOG=str(history_log))
 
         def blob_calls():
             return [json.loads(line) for line in git_log.read_text().splitlines() if '"cat-file"' in line]
@@ -196,8 +219,27 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
         run([launcher, "add", "github.com/O4FDev/lumen"], env, application)
         fetched = blob_calls()[before_fetch:]
         assert len(fetched) == 1 and fetched[0][-2:] == ["cat-file", "--batch"], "a Git install reads every blob in one batch"
+        assert [json.loads(line) for line in history_log.read_text().splitlines()] == [{"historical_object": False}], "stable release installs do not fetch deleted historical data"
         assert not (root / "SHOULD_NOT_EXIST").exists() and not (package / "SHOULD_NOT_EXIST").exists() and not (application / "SHOULD_NOT_EXIST").exists()
         assert not (root / "filter-ran").exists(), "exports never execute Git filters"
+        fallback = root / "fallback consumer"
+        fallback_marker = root / "shallow-unavailable"
+        fallback_env = dict(env, MINYAR_HOME=str(root / "fallback home"), MINYAR_TEST_REJECT_SHALLOW=str(fallback_marker))
+        run([launcher, "new", fallback, "--name", "fallback"], fallback_env, root)
+        run([launcher, "add", "github.com/O4FDev/lumen"], fallback_env, fallback)
+        fallback_metadata = json.loads(run([launcher, "metadata", "--locked", "--offline"], fallback_env, fallback))
+        assert fallback_marker.exists() and fallback_metadata["packages"][1]["checksum"] == record["checksum"], "hosts without shallow fetch still produce the same verified source"
+        assert json.loads(history_log.read_text().splitlines()[-1])["historical_object"]
+        raced = root / "raced consumer"
+        race_marker = root / "tag-raced"
+        race_env = dict(env, MINYAR_HOME=str(root / "race home"), MINYAR_REGISTRY="", MINYAR_TEST_RACE_MIRROR=str(mirror), MINYAR_TEST_RACE_COMMIT=historical_commit, MINYAR_TEST_RACE_MARKER=str(race_marker))
+        run([launcher, "new", raced, "--name", "raced"], race_env, root)
+        race_manifest = (raced / "Minyar.toml").read_bytes()
+        try:
+            run([launcher, "add", "github.com/O4FDev/lumen"], race_env, raced, "release changed during download")
+            assert race_marker.exists() and (raced / "Minyar.toml").read_bytes() == race_manifest and not (raced / "Minyar.lock").exists()
+        finally:
+            run([real_git, "--git-dir=" + str(mirror), "update-ref", "refs/tags/v0.1.0", release_tag], env, root)
         (application / "src/main.min").write_text('use "lumen" as lumen\nprint(lumen.answer())\n')
         assert "42\n" in run([launcher, "run", "--locked", "--offline"], env, application)
         index["packages"] = [altered]

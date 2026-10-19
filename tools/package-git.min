@@ -373,21 +373,42 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
         url = host.resolveName(mirror) + "/" + repository + ".git"
         arguments.add("-c"); arguments.add("protocol.file.allow=always")
     }
+    let revision = source.revision
+    let discovered = ""
     let wanted = source.commit
     if wanted == "" && hexadecimal(requested, 40) { wanted = requested }
+    if revision == "latest" && wanted == "" {
+        revision = ""
+        let remote = git(bare, host.extended(arguments, ["ls-remote", "--tags", "--refs", "--", url]), scratch)
+        for line in host.lines(remote) {
+            let fields = host.words(line)
+            if fields.length != 2 || !fields[1].startsWith("refs/tags/") { continue }
+            let tag = host.textAfter(fields[1], "refs/tags/")
+            if semver(tag) && (revision == "" || compare(tag, revision) > 0) { revision = tag; discovered = fields[0] }
+        }
+        if revision == "" { host.stop(repository + " has no stable semver tag; choose @main or @<commit>") }
+        if !hexadecimal(discovered, 40) { host.stop("package tags must use 40-character Git IDs") }
+    }
     let fetched = false
     if wanted != "" {
         let exact = host.extended(arguments, ["fetch", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, wanted])
         if gitTo(bare, exact, scratch + "/out", scratch + "/err") == 0 {
             fetched = gitTo(bare, ["cat-file", "-e", wanted + "^{commit}"], scratch + "/out", scratch + "/err") == 0
         }
+    } else if semver(revision) {
+        let reference = "refs/tags/" + revision
+        let release = host.extended(arguments, ["fetch", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, "+" + reference + ":" + reference])
+        fetched = gitTo(bare, release, scratch + "/out", scratch + "/err") == 0
     }
     if !fetched {
         let fallback = host.extended(arguments, ["fetch", "--quiet", "--force", "--tags", "--no-recurse-submodules"])
         if host.isFile(bare + "/shallow") { fallback.add("--unshallow") }
         git(bare, host.extended(fallback, ["--", url, "+refs/heads/*:refs/heads/*"]), scratch)
     }
-    let revision = source.revision
+    if discovered != "" {
+        let status = gitTo(bare, ["rev-parse", "--verify", "refs/tags/" + revision], scratch + "/out", scratch + "/err")
+        if status != 0 || host.strip(host.readText(scratch + "/out")) != discovered { host.stop("Git release changed during download: " + repository + "@" + revision + "; repeat minyar add after reviewing the repository") }
+    }
     if revision == "latest" {
         revision = ""
         for tag in host.lines(git(bare, ["tag", "--list"], scratch)) {

@@ -28,6 +28,10 @@ minyar add github.com/O4FDev/paint@COMMIT   # full SHA or unambiguous prefix
 transport commands, prerelease version ranges and repository subdirectories are
 not supported. Public HTTPS repositories are the initial transport contract.
 If there are no stable tags, choose a branch or commit explicitly.
+Latest discovery lists remote tags first, then downloads only the chosen
+release's current tree with a shallow fetch. Annotated tags work too. Deleted
+historical files stay on the host; hosts without shallow fetch retain the full
+history fallback. A tag that moves between discovery and download is rejected.
 Full 40-character commit IDs always name objects, even if a repository creates a
 tag with the same name. Unambiguous object prefixes also take precedence over
 similarly named refs. Locked exact IDs must match their recorded commits. A
