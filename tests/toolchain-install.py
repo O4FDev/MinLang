@@ -42,7 +42,7 @@ def archive(root, installer, version, *, broken=False, unsafe=None):
     (stage / "install").mkdir(parents=True)
     shutil.copyfile(installer / "install.sh", stage / "install/install.sh")
     shutil.copyfile(installer / "manager.sh", stage / "install/manager.sh")
-    (stage / "minyar").write_text("#!/bin/sh\n" + ("exit 9\n" if broken else f"printf 'Minyar {version}\\n'\n"))
+    (stage / "minyar").write_text("#!/bin/sh\n" + ("printf 'install the platform C SDK\\n' >&2\nexit 9\n" if broken else f"printf 'Minyar {version}\\n'\n"))
     (stage / "minyar").chmod(0o755)
     (stage / "distribution.version").write_text(version + "\n")
     (stage / "distribution.arch").write_text(architecture + "\n")
@@ -192,7 +192,8 @@ def main():
             prepare("3.1.0", unsafe="link")
             run(["sh", generated, "--version", "3.1.0"], environment=dict(environment, MINYAR_HOME=str(rejected_home)), expected="unsupported links")
             prepare("4.0.0", broken=True)
-            run([command, "toolchain", "install", "4.0.0"], environment=environment, expected="could not start")
+            startup_error = run([command, "toolchain", "install", "4.0.0"], environment=environment, expected="could not start")
+            assert "install the platform C SDK" in startup_error
             assert not (home / "toolchains/4.0.0").exists()
             assert "Minyar 1.0.0" in run([command, "--version"], environment=environment)
             assert not (home / ".install-lock").exists()

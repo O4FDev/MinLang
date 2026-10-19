@@ -158,7 +158,10 @@ else
     [ -x "$staged/minyar" ] || die 'the toolchain launcher is not executable'
     if [ -f "$staged/distribution.version" ]; then [ "$(cat -- "$staged/distribution.version")" = "$version" ] || die 'archive version metadata disagrees with its name'; fi
     if [ -f "$staged/distribution.arch" ]; then [ "$(cat -- "$staged/distribution.arch")" = "$architecture" ] || die 'archive architecture metadata disagrees with its name'; fi
-    "$staged/minyar" --version > "$temporary/version.log" 2>&1 || die 'the verified toolchain could not start; the previous installation is unchanged'
+    if ! "$staged/minyar" --version > "$temporary/version.log" 2>&1; then
+        sed -n '1,12p' "$temporary/version.log" >&2
+        die 'the verified toolchain could not start; the previous installation is unchanged'
+    fi
     printf '%s\n' "$version" > "$staged/.minyar-toolchain"
     printf '%s\n' "$expected" > "$staged/.minyar-archive-sha256"
     mv -- "$staged" "$destination"
