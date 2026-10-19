@@ -4,10 +4,11 @@ The [signed installer and toolchain manager](install.md) install into
 `~/.minyar`, keep versions side by side and select project versions from
 `minyar-toolchain`. The release host is configurable; no public host is live yet.
 
-The [macOS binary distribution](macos-distribution.md) supplies prebuilt tools
-and bundled LLVM. Run its `sh install.sh`; the source-build prerequisites below
-apply when installing from a checkout. The Apple macOS SDK is required in both
-cases and is checked by the binary installer.
+The [macOS](macos-distribution.md) and [Linux](linux-distribution.md) binary
+distributions supply prebuilt tools and bundled LLVM. They run without Python,
+Make, zsh or another LLVM installation. The platform's C SDK remains required:
+Apple's SDK on macOS, or the documented development files and runtime libraries
+on Linux. The source-build prerequisites below apply to checkout installations.
 
 The project CLI is written in `tools/project-cli.min` and `tools/project.min`.
 The `minyar` shell launcher bootstraps it using the existing self-hosted compiler.
@@ -17,7 +18,7 @@ support into `$HOME/.local/lib/minyar`. The installed command works independentl
 of the source checkout. Use `make install PREFIX=/another/prefix` for a different
 location; its `bin` directory must be on `PATH`. Re-running the installer publishes
 a new toolchain without modifying the previous installation's files.
-The toolchain currently requires LLVM **23.1.2**, Make, zsh and system C headers;
+Source installations require LLVM **23.1.2**, Make, zsh and system C headers;
 follow the [toolchain setup](toolchain.md), then select the pinned Clang with
 `MINYAR_CLANG` and `LLVM_CC`. `minyar --doctor`
 checks the installation. Project commands currently require macOS or Linux.

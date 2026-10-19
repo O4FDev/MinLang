@@ -143,5 +143,7 @@ This target generates temporary keys and a loopback artifact server, exercises
 the actual `curl ... | sh` flow, installs two fixture toolchains, tests project
 pins and updates, and rejects changed signatures/checksums, unsafe archives,
 unrelated commands and failed startup. It makes no global installation or
-network request outside loopback. The fixture verifies the installation contract;
-full macOS binary qualification remains the separate distribution gate.
+network request outside loopback. The fixture verifies the installation contract.
+Qualify real archives with the separate [macOS](macos-distribution.md) and
+[Linux](linux-distribution.md) distribution checks, including a fresh supported
+system with no existing LLVM installation.
