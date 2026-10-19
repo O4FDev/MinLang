@@ -882,3 +882,12 @@ Unicode filename vectors preserve upstream platform guards. Normalization-sensit
 vectors excluded on macOS remain unresolved until tested on an applicable host.
 Output files are removed before each optimization run and their bytes are checked
 immediately afterward, preventing stale outputs from hiding missing writes.
+
+`make check-minyar-format` checks golden Minyar layouts, idempotence, preserved
+comment/literal tokens and command behavior. Every conformance program retains
+identical executable LLVM after debug-line/debug-function comments and token-indexed
+Text/List literal names are canonicalized, and executes against exact output at O0/O2.
+Controls require changed literal bytes and instructions to fail that comparison.
+The formatter's runnable lantern gallery has its own exact-output fixture.
+See [style](style.md) for the precise scope of this proof. The older
+`check-format` target continues to check C formatting.

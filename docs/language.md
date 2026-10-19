@@ -1159,3 +1159,10 @@ alias and do not reserve every module's function namespace.
 Generated from the compiler by `tools/reserved-names.min`;
 `make check-reserved-names` verifies this list.
 <!-- reserved-names: end -->
+
+## Formatting source
+
+`minyar fmt` lays out source with four-space blocks and consistent spacing.
+Comments and literal spelling stay intact. Use `minyar fmt --check` to check
+the style without writing files, or `--stdout FILE.min` to preview one file.
+See [Minyar style](style.md) for examples and the preservation checks.

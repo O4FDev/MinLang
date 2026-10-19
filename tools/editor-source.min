@@ -1,0 +1,121 @@
+// A lossless source view shared by the formatter and editor index. Offsets are
+// UTF-8 bytes; literal and comment text is never decoded or reconstructed.
+public record Token { text: Text; kind: Integer; start: Integer; end: Integer; line: Integer; column: Integer }
+public record Source { tokens: List<Token>; error: Text; errorStart: Integer }
+
+public function word(byte: Integer): Boolean {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte >= 128
+}
+public function digit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+function at(data: Bytes, index: Integer, value: Text): Boolean {
+    if index + value.length > data.length { return false }
+    for offset in 0..value.length { if data[index + offset] != Integer(value[offset]) { return false } }
+    return true
+}
+
+// Skip nested strings inside interpolation, including nested interpolation.
+// A depth bound makes unfinished or adversarial editor buffers safe to inspect.
+function quoted(data: Bytes, start: Integer, depth: Integer): Integer {
+    if depth > 128 { return -1 }
+    let raw = data[start] == 35
+    let quote = start
+    if raw { quote += 1 }
+    let character = data[quote] == 39
+    let triple = !character && at(data, quote, "\"\"\"")
+    let width = 1
+    if triple { width = 3 }
+    let index = quote + width
+    while index < data.length {
+        let closing = data[index] == data[quote]
+        if triple { closing = at(data, index, "\"\"\"") }
+        if closing && (!raw || (index + width < data.length && data[index + width] == 35)) {
+            let end = index + width
+            if raw { end += 1 }
+            return end
+        }
+        if !raw && data[index] == 92 {
+            if !character && index + 1 < data.length && data[index + 1] == 40 {
+                index = interpolation(data, index + 2, depth + 1)
+                if index < 0 { return -1 }
+            } else { index += 2 }
+        } else { index += 1 }
+    }
+    return -1
+}
+function interpolation(data: Bytes, start: Integer, depth: Integer): Integer {
+    let index = start
+    let round = 1
+    while index < data.length {
+        if data[index] == 34 || data[index] == 39 || at(data, index, "#\"") {
+            index = quoted(data, index, depth)
+            if index < 0 { return -1 }
+        } else if at(data, index, "//") {
+            while index < data.length && data[index] != 10 { index += 1 }
+        } else if at(data, index, "/*") {
+            index += 2
+            while index < data.length && !at(data, index, "*/") { index += 1 }
+            if index == data.length { return -1 }
+            index += 2
+        } else {
+            if data[index] == 40 { round += 1 }
+            if data[index] == 41 { round -= 1; if round == 0 { return index + 1 } }
+            index += 1
+        }
+    }
+    return -1
+}
+
+public function scan(text: Text): Source {
+    let data = Bytes(text)
+    let source = Source { tokens: []; error: ""; errorStart: 0 }
+    let index = 0
+    let line = 0
+    let column = 0
+    if data.length >= 3 && data[0] == 239 && data[1] == 187 && data[2] == 191 { index = 3 }
+    while index < data.length {
+        let byte = data[index]
+        if byte == 32 || byte == 9 || byte == 13 { index += 1; column += 1; continue }
+        let start = index
+        let tokenLine = line
+        let tokenColumn = column
+        let kind = 4
+        if byte == 10 { kind = 6; index += 1 }
+        else if at(data, index, "//") {
+            kind = 5
+            while index < data.length && data[index] != 10 { index += 1 }
+        } else if at(data, index, "/*") {
+            kind = 5; index += 2
+            while index < data.length && !at(data, index, "*/") { index += 1 }
+            if index == data.length { source.error = "block comment is missing its closing */"; source.errorStart = start; return source }
+            index += 2
+        } else if byte == 34 || byte == 39 || at(data, index, "#\"") {
+            kind = 3; index = quoted(data, start, 0)
+            if index < 0 { source.error = "literal is missing its closing delimiter"; source.errorStart = start; return source }
+        } else if word(byte) {
+            kind = 1; index += 1
+            while index < data.length && (word(data[index]) || digit(data[index])) { index += 1 }
+        } else if digit(byte) {
+            kind = 2; index += 1
+            while index < data.length {
+                let next = data[index]
+                if word(next) || digit(next) { index += 1 }
+                else if next == 46 && index + 1 < data.length && digit(data[index + 1]) { index += 1 }
+                else if (next == 43 || next == 45) && (data[index - 1] == 101 || data[index - 1] == 69) { index += 1 }
+                else { break }
+            }
+        } else {
+            index += 1
+            if index < data.length {
+                let pair = Text(data.slice(start, index + 1))
+                if pair == ".." || pair == "->" || pair == "==" || pair == "!=" || pair == "<=" || pair == ">=" || pair == "&&" || pair == "||" || pair == "+=" || pair == "-=" || pair == "*=" || pair == "/=" || pair == "%=" || pair == "<<" || pair == ">>" { index += 1 }
+            }
+        }
+        source.tokens.add(Token { text: Text(data.slice(start, index)); kind: kind; start: start; end: index; line: tokenLine; column: tokenColumn })
+        for position in start..index {
+            let value = data[position]
+            if value == 10 { line += 1; column = 0 }
+            else if value < 128 || value >= 192 { column += 1 }
+        }
+    }
+    return source
+}

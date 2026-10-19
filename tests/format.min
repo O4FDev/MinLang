@@ -1,0 +1,108 @@
+use "../tools/format.min" as format
+use "../tools/editor-source.min" as source
+use "../tools/format-proof.min" as proof
+use "../tools/editor-host.min" as editorHost
+use "../tools/testing.min" as test
+use "../tools/driver-support.min" as host
+use "io" as io
+use "files" as files
+use "process" as process
+use "system" as system
+
+let work = test.scratch()
+let formatter = process.argument(0)
+let cases = files.list("tests/format")
+cases.sort()
+let checked = 0
+for name in cases {
+    if !name.endsWith(".before") { continue }
+    let before = io.readTextFile("tests/format/" + name)
+    let expected = io.readTextFile("tests/format/" + name.slice(0, name.length - 7) + ".after")
+    let actual = format.formatted(before)
+    test.check(actual == expected, "formatter golden: " + name + "\nEXPECTED\n" + expected + "ACTUAL\n" + actual)
+    test.check(format.formatted(actual) == actual, "formatter is not idempotent: " + name)
+    let original = source.scan(before)
+    let formatted = source.scan(actual)
+    let a: List<Text> = []
+    let b: List<Text> = []
+    for token in original.tokens { if token.kind != 6 && token.text != ";" { a.add(token.text) } }
+    for token in formatted.tokens { if token.kind != 6 && token.text != ";" { b.add(token.text) } }
+    test.check(host.jsonList(a) == host.jsonList(b), "formatter changed source tokens: " + name)
+    checked += 1
+}
+test.check(checked >= 3, "formatter golden corpus is incomplete")
+
+// Check exact executable IR after the explicitly documented source-position
+// comments and text-label IDs are canonicalized. No instruction is omitted.
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let runtime = test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o")
+let control = "@.text.data.12 = private constant [2 x i8] c\"A\\00\"\n@.text.12 = private constant ptr @.text.data.12\n; minyar-debug-line: 1|1|\n  %v = add i64 1, 2\n"
+let moved = host.replaceText(host.replaceText(control, ".12", ".88"), "1|1|", "9|8|")
+test.check(proof.canonicalLLVM(control) == proof.canonicalLLVM(moved), "LLVM canonicalization rejected position-only changes")
+test.check(proof.canonicalLLVM(control) != proof.canonicalLLVM(host.replaceText(control, "A\\00", "B\\00")), "LLVM proof hid changed literal bytes")
+test.check(proof.canonicalLLVM(control) != proof.canonicalLLVM(host.replaceText(control, "add i64 1, 2", "sub i64 1, 2")), "LLVM proof hid changed instructions")
+let quotedId = host.replaceText(control, "A\\00", "@.text.12\\00")
+test.check(host.hasText(proof.canonicalLLVM(quotedId), "c\"@.text.12\\00\""), "LLVM proof rewrote text inside a literal")
+let corpus = files.list("tests/conformance")
+let proofs = 0
+for name in corpus {
+    let path = "tests/conformance/" + name + "/program.min"
+    if files.pathSize(path) < 0 { continue }
+    let before = io.readTextFile(path)
+    let after = format.formatted(before)
+    let copy = work + "/program.min"
+    io.writeTextFile(copy, before)
+    test.require(test.run([compiler, copy, work + "/before.ll", "--library", "library"], system.environment(), "", work + "/before", 30), name + " original LLVM")
+    io.writeTextFile(copy, after)
+    test.require(test.run([compiler, copy, work + "/after.ll", "--library", "library"], system.environment(), "", work + "/after", 30), name + " formatted LLVM")
+    test.check(proof.canonicalLLVM(io.readTextFile(work + "/before.ll")) == proof.canonicalLLVM(io.readTextFile(work + "/after.ll")), "formatter changed executable LLVM: " + name)
+    test.check(format.formatted(after) == after, "conformance idempotence: " + name)
+    let expected = io.readTextFile("tests/conformance/" + name + "/expected.stdout")
+    for optimization in ["-O0", "-O2"] {
+        test.require(test.run([clang, optimization, "-Wno-override-module", work + "/after.ll", runtime, "-lm", "-o", work + "/program"], system.environment(), "", work + "/link", 30), name + " formatted link")
+        let execution = test.run([work + "/program"], system.environment(), "", work + "/run", 10)
+        test.check(execution.status == 0 && execution.output == expected && execution.errorOutput == "", name + " formatted output: " + execution.output + execution.errorOutput)
+    }
+    proofs += 1
+}
+test.check(proofs >= 11, "LLVM identity corpus is incomplete")
+let gallery = io.readTextFile("examples/gallery/lantern.min")
+test.check(format.formatted(io.readTextFile("examples/gallery/lantern.before")) == gallery, "formatter gallery differs from the canonical file")
+test.require(test.run([compiler, "examples/gallery/lantern.min", work + "/gallery.ll", "--library", "library"], system.environment(), "", work + "/gallery-compile", 30), "gallery compile")
+for optimization in ["-O0", "-O2"] {
+    test.require(test.run([clang, optimization, "-Wno-override-module", work + "/gallery.ll", runtime, "-lm", "-o", work + "/gallery"], system.environment(), "", work + "/gallery-link", 30), "gallery link")
+    let execution = test.run([work + "/gallery"], system.environment(), "", work + "/gallery-run", 10)
+    test.check(execution.status == 0 && execution.output == io.readTextFile("examples/gallery/lantern.stdout") && execution.errorOutput == "", "gallery output")
+}
+for name in ["layout", "syntax", "literals"] {
+    let copy = work + "/feature.min"
+    io.writeTextFile(copy, io.readTextFile("tests/format/" + name + ".before"))
+    test.require(test.run([compiler, copy, work + "/feature-before.ll", "--library", "library"], system.environment(), "", work + "/feature-before", 30), name + " original feature")
+    io.writeTextFile(copy, io.readTextFile("tests/format/" + name + ".after"))
+    test.require(test.run([compiler, copy, work + "/feature-after.ll", "--library", "library"], system.environment(), "", work + "/feature-after", 30), name + " formatted feature")
+    test.check(proof.canonicalLLVM(io.readTextFile(work + "/feature-before.ll")) == proof.canonicalLLVM(io.readTextFile(work + "/feature-after.ll")), name + " feature LLVM changed")
+    for optimization in ["-O0", "-O2"] {
+        test.require(test.run([clang, optimization, "-Wno-override-module", work + "/feature-after.ll", runtime, "-lm", "-o", work + "/feature"], system.environment(), "", work + "/feature-link", 30), name + " feature link")
+        let execution = test.run([work + "/feature"], system.environment(), "", work + "/feature-run", 10)
+        test.check(execution.status == 0 && execution.output == io.readTextFile("tests/format/" + name + ".stdout") && execution.errorOutput == "", name + " feature output: " + execution.output + execution.errorOutput)
+    }
+}
+let file = work + "/beautiful.min"
+io.writeTextFile(file, "print( 42 )\n")
+let result = test.run([formatter, "--check", file], system.environment(), "", work + "/check", 10)
+test.check(result.status == 1 && io.readTextFile(file) == "print( 42 )\n", "--check must not write")
+test.require(test.run([formatter, file], system.environment(), "", work + "/write", 10), "formatter write")
+test.check(io.readTextFile(file) == "print(42)\n", "formatter did not write canonical output")
+test.require(test.run([formatter, "--check", file], system.environment(), "", work + "/clean", 10), "canonical --check")
+io.writeTextFile(file, "print(\"unfinished)\n")
+result = test.run([formatter, file], system.environment(), "", work + "/invalid", 10)
+test.check(result.status != 0 && io.readTextFile(file) == "print(\"unfinished)\n", "invalid source must remain untouched")
+test.check(editorHost.replace(file, Bytes("stale"), Bytes("replacement")) != 0 && io.readTextFile(file) == "print(\"unfinished)\n", "atomic formatter overwrote changed source")
+test.check(files.makeDirectory(work + "/empty") == 0, "empty formatter directory")
+test.require(test.run([formatter, work + "/empty"], system.environment(), work, work + "/empty-check", 10), "empty directory must not fall back to the working directory")
+test.check(format.formatted("print(42) // comment\rprint(0)\n") == "print(42) // comment\rprint(0)\n", "a bare CR must not end a line comment")
+test.check(format.formatted("let value = call(\n  1,\n2\n)\n") == format.formatted(format.formatted("let value = call(\n  1,\n2\n)\n")), "wrapped call idempotence")
+test.removeScratch(work)
+host.cleanup()
+print("\(checked) formatter goldens and \(proofs) executable LLVM identity proofs passed at O0/O2")

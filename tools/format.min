@@ -1,0 +1,147 @@
+use "./editor-source.min" as source
+use "./driver-support.min" as host
+use "./editor-host.min" as native
+use "files" as files
+use "process" as process
+use "system" as system
+
+record Layout { pieces: List<Text>; depth: Integer; line: Boolean; previous: Text; blank: Boolean }
+function newline(layout: Layout) {
+    if !layout.line { layout.pieces.add("\n"); layout.line = true }
+    layout.previous = ""
+}
+function emit(layout: Layout, value: Text, space: Boolean) {
+    if layout.line {
+        for unused in 0..layout.depth { layout.pieces.add("    ") }
+        layout.line = false
+    } else if space { layout.pieces.add(" ") }
+    layout.pieces.add(value)
+    layout.previous = value
+}
+function tight(value: Text): Boolean { return value == "." || value == ".." || value == "(" || value == "[" || value == "!" || value == "~" }
+function uppercase(value: Text): Boolean { return value.length > 0 && value[0] >= 'A' && value[0] <= 'Z' }
+function generic(tokens: List<source.Token>, index: Integer): Boolean {
+    if tokens[index].text != "<" || index == 0 || index + 1 >= tokens.length { return false }
+    if tokens[index - 1].kind != 1 { return false }
+    return uppercase(tokens[index - 1].text) || uppercase(tokens[index + 1].text)
+}
+
+public function formatted(text: Text): Text {
+    let parsed = source.scan(text)
+    if parsed.error != "" { host.stop("cannot format: " + parsed.error) }
+    let tokens = parsed.tokens
+    let layout = Layout { pieces: []; depth: 0; line: true; previous: ""; blank: false }
+    let round = 0
+    let square = 0
+    let frames: List<Integer> = []
+    let angles = 0
+    let pendingLines = 0
+    for index in 0..tokens.length {
+        let token = tokens[index]
+        let value = token.text
+        if token.kind == 6 { pendingLines += 1; continue }
+        let previous = layout.previous
+        if pendingLines > 0 {
+            newline(layout)
+            if pendingLines > 1 && layout.pieces.length > 0 && value != "}" && !layout.blank { layout.pieces.add("\n"); layout.blank = true }
+        }
+        pendingLines = 0
+        if value == "}" {
+            newline(layout)
+            if layout.depth > 0 { layout.depth -= 1 }
+            emit(layout, "}", false)
+            if frames.length >= 2 { square = frames.pop(); round = frames.pop() }
+        } else if value == "{" {
+            emit(layout, "{", true)
+            layout.depth += 1
+            frames.add(round); frames.add(square); round = 0; square = 0
+            newline(layout)
+        } else if value == ";" {
+            // Explicit separators inside call/List expressions cannot be replaced
+            // by newlines: the language deliberately ignores those newlines.
+            if round > 0 || square > 0 { emit(layout, ";", false) }
+            else { newline(layout) }
+        } else {
+            let space = true
+            if previous == "" || tight(previous) || value == ")" || value == "]" || value == "," || value == ":" || value == "." || value == ".." { space = false }
+            if value == "(" || value == "[" { space = previous == "if" || previous == "while" || previous == "match" || previous == "return" || previous == "=" || previous == ":" || previous == "," || previous == "in" }
+            if generic(tokens, index) { space = false; angles += 1 }
+            if previous == "<" && angles > 0 { space = false }
+            if (value == ">" || value == ">>") && angles > 0 {
+                space = false
+                angles -= 1
+                if value == ">>" && angles > 0 { angles -= 1 }
+            }
+            if token.kind == 5 {
+                space = !layout.line
+                emit(layout, value, space)
+                if value.startsWith("//") { newline(layout) }
+            } else {
+                emit(layout, value, space)
+                if value == "(" { round += 1 }
+                if value == ")" && round > 0 { round -= 1 }
+                if value == "[" { square += 1 }
+                if value == "]" && square > 0 { square -= 1 }
+            }
+        }
+        layout.blank = false
+    }
+    newline(layout)
+    return joinText(layout.pieces)
+}
+
+function collect(path: Text, found: List<Text>) {
+    let kind = native.kind(path)
+    // Do not follow symlinks while recursively formatting a directory.
+    if kind == "f" { if path.endsWith(".min") { found.add(path) }; return }
+    if kind != "d" { host.stop("not a source file or directory: " + path) }
+    let names = files.list(path)
+    if files.lastError() != 0 { host.stop("cannot list " + path) }
+    names.sort()
+    for name in names {
+        if name.startsWith(".") || name == "build" || name == "target" || name == "vendor" || name == "node_modules" { continue }
+        let child = path + "/" + name
+        let childKind = native.kind(child)
+        if childKind == "d" || childKind == "f" { collect(child, found) }
+    }
+}
+public function run(first: Integer) {
+    let check = false
+    let stdout = false
+    let paths: List<Text> = []
+    let positional = false
+    let supplied = false
+    for index in first..process.argumentCount() {
+        let item = process.argument(index)
+        if !positional && item == "--" { positional = true }
+        else if !positional && item == "--check" { check = true }
+        else if !positional && item == "--stdout" { stdout = true }
+        else if !positional && (item == "--help" || item == "-h") { print("usage: minyar fmt [--check | --stdout] [FILE.min | DIRECTORY ...]"); return }
+        else if !positional && item.startsWith("-") { host.stop("unknown fmt option: " + item) }
+        else { supplied = true; collect(item, paths) }
+    }
+    if check && stdout { host.stop("choose --check or --stdout") }
+    if !supplied { collect(".", paths) }
+    paths = host.sortedUnique(paths)
+    if stdout && paths.length != 1 { host.stop("--stdout requires exactly one source file") }
+    let changed = 0
+    for path in paths {
+        let original = host.readText(path)
+        let result = formatted(original)
+        if stdout { if files.writeStandardOutput(result) < 0 { host.stop("cannot write formatted source to stdout") } }
+        else if result != original {
+            changed += 1
+            if check { print(path) }
+            else {
+                let status = native.replace(path, Bytes(original), Bytes(result))
+                if status != 0 { host.stop(host.osError(status, path)) }
+            }
+        }
+    }
+    if !stdout {
+        let action = "formatted"
+        if check { action = "need formatting" }
+        system.writeStandardError("\(changed) of \(paths.length) Minyar files \(action)\n")
+    }
+    if check && changed > 0 { exit(1) }
+}
