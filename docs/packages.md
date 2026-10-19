@@ -169,3 +169,9 @@ three reproducible artworks and a local `v0.1.0` tag. Before publication, use th
 documented private mirror. `make check-paint-package MINYAR_PAINT_SOURCE=/path/to/minyar-paint`
 tests the complete offline debug/release workflow without adding the external
 library to Minyar's core or relying on GitHub.
+
+The [observatory](../examples/gallery/observatory/README.md) composes choices,
+generic functions, record methods and interpolated Text with that package.
+Its TrueType lettering and vector geometry produce identical checked pixels
+and SVG paths in both profiles. The font is an explicit runtime input, selected
+by the caller; the example's source lock pins the drawing library.

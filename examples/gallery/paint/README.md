@@ -18,10 +18,10 @@ Before publication, provide a private bare mirror without changing global Git
 configuration:
 
 ```sh
-mkdir -p /tmp/minyar-mirror/github.com/O4FDev
-git clone --bare /Users/luke/Projects/minyar-paint \
-  /tmp/minyar-mirror/github.com/O4FDev/paint.git
-MINYAR_GIT_MIRROR=/tmp/minyar-mirror minyar add github.com/O4FDev/paint@v0.1.0
+mkdir -p "/tmp/minyar-mirror/github.com/O4FDev"
+git clone --bare "/Users/luke/Projects/minyar-paint" \
+  "/tmp/minyar-mirror/github.com/O4FDev/paint.git"
+MINYAR_GIT_MIRROR="/tmp/minyar-mirror" minyar add github.com/O4FDev/paint@v0.1.0
 minyar run --locked --offline
 ```
 
@@ -31,8 +31,12 @@ The program writes `first-light.png` and `first-light.svg`, then prints:
 first light · paint v0.1.0 · 640 × 480
 ```
 
-From the Minyar checkout, `make check-paint-package MINYAR_PAINT_SOURCE=/path/to/minyar-paint`
+The [observatory](../observatory/README.md) adds TrueType lettering, choices,
+generics, methods and interpolated Text to a larger picture.
+
+From the Minyar checkout, `make check-paint-package MINYAR_PAINT_SOURCE="/path/to/minyar-paint"`
 checks this real external package, deletes the mirror before rendering, and
-verifies fresh PNG/SVG output at debug and release optimization. This explicit
+verifies exact PNG pixels and SVG output for both pictures at debug and release
+optimization. This explicit
 integration target requires the separate repository and is not part of CI's
 self-contained package fixtures.
