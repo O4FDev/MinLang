@@ -4,7 +4,7 @@
  * to LLVM without making assumptions about a conditional C function. */
 MINYAR_COLD MINYAR_NORETURN void minyar_fail_integer_overflow(void) {
     fputs("Minyar stopped: this Integer calculation is outside the supported range.\n", stderr);
-    exit(1);
+    minyar_failure_exit();
 }
 
 void minyar_check_integer_overflow(_Bool overflowed) {
@@ -16,7 +16,7 @@ static MINYAR_COLD MINYAR_NORETURN void integer_division_stop(const char *messag
     fputs("Minyar stopped: ", stderr);
     fputs(message, stderr);
     fputc('\n', stderr);
-    exit(1);
+    minyar_failure_exit();
 }
 
 MINYAR_COLD MINYAR_NORETURN void minyar_fail_integer_division(long long right) {
