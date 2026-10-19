@@ -665,7 +665,7 @@ take constant time apart from hashing, comparing and copying an element.
 Float elements and Float fields follow the same NaN and signed-zero rules as
 Map keys.
 
-## Generic functions
+## Generic functions and records
 
 A function can name the types it works with, using angle brackets after its
 name. The same type parameter always means the same concrete type in one call:
@@ -694,6 +694,29 @@ representation and ownership rules, with no boxing or runtime type dispatch.
 An unused generic body produces no executable code. The compiler checks a body
 with its concrete types when it is used. Builds using generics currently compile
 the whole reachable module graph, including in incremental mode.
+
+A record can also name its field types:
+
+```minyar
+record Pair<First, Second> {
+    first: First
+    second: Second
+}
+
+let tide = Pair { first: "dawn"; second: 1.2 }
+let readings: List<Pair<Text, Float>> = [tide]
+print(readings[0].first) // dawn
+```
+
+A literal infers its type arguments from its fields and any surrounding type.
+Explicit construction, such as `Pair<Text, Float> { first: "noon"; second: 2.7 }`,
+works too. Fields, nested records and Lists keep their concrete types. A repeated
+type parameter requires matching field types.
+
+Each instantiation has ordinary record reference semantics. Its concrete field
+types determine ownership and cycle analysis. When mutation can create a cycle,
+that instantiation uses traced allocation. Type parameters belong to their
+own declaration, even when a module has a record with the same name.
 
 ## Recoverable failures
 

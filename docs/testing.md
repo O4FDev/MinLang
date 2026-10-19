@@ -100,8 +100,11 @@ Swift experiments cannot be selected as ordinary backends.
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition
 counts check unboxed scalar calls and diamond-import deduplication. The generics
-gallery is an executable output fixture. `check-generics-sanitize` repeats the
-suite with compiler and generated-program sanitizers.
+gallery is an executable output fixture. Generic record cases cover field inference,
+nested Lists, namespace shadowing, private modules, callback and method composition,
+and per-instantiation traced/scalar allocator selection with escaping records.
+`check-generics-sanitize` repeats both suites with compiler and generated-program
+sanitizers.
 `make check-generics-smoke` is the fast landing check for native signatures,
 executable O0/O2 output and a rejection diagnostic. Run the full ownership suite
 before queueing the landing.

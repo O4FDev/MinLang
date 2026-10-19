@@ -1,0 +1,35 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let pair = "record Pair<First, Second> { first: First; second: Second }\n"
+fixtures.executes(frontend, pair + "let entry = Pair { second: 42; first: \"harbour\" }\nlet entries: List<Pair<Text, Integer>> = [entry, Pair { first: \"tide\"; second: 7 }]\nprint(entries[0].first)\nprint(entries[1].second)\nlet explicit = Pair<Text, Integer> { first: \"moon\"; second: 9 }\nprint(explicit.first)\n", "harbour\n7\nmoon\n", levels, 0, "", true)
+fixtures.executes(frontend, pair + "function flip<First, Second>(pair: Pair<First, Second>): Pair<Second, First> { return Pair { first: pair.second; second: pair.first } }\nlet reflected = flip(Pair { first: \"water\"; second: 42 })\nprint(reflected.first)\nprint(reflected.second)\n", "42\nwater\n", levels, 0, "", true)
+fixtures.executes(frontend, pair + "record Parcel<Item> { contents: Item; copies: List<Item> }\nlet parcel = Parcel { contents: Pair { first: \"shell\"; second: [42] }; copies: [] }\nparcel.copies.add(parcel.contents)\nprint(parcel.copies[0].first)\nprint(parcel.contents.second[0])\n", "shell\n42\n", levels, 0, "", true)
+fixtures.executes(frontend, "record Node<Item> { value: Item; children: List<Node<Item>> }\nlet leaf = Node { value: \"leaf\"; children: [] }\nlet root = Node { value: \"root\"; children: [leaf, leaf] }\nroot.children.add(root)\nprint(root.children[0].value)\nprint(root.children[2].value)\nlet numbers = Node { value: 42; children: [] }\nnumbers.children.add(numbers)\nprint(numbers.children[0].value)\n", "leaf\nroot\n42\n", levels, 0, "", true)
+fixtures.executes(frontend, pair + "let original = Pair { first: Bytes(\"sea\"); second: [\"blue\"] }\nlet alias = original\nalias.first = Bytes(\"sky\")\nalias.second[0] = \"rose\"\nprint(Text(original.first))\nprint(original.second[0])\n", "sky\nrose\n", levels, 0, "", true)
+fixtures.executes(frontend, "record Link<Item> { value: Item }\nrecord Branch { links: List<Link<Branch>> }\nfunction keep<Item>(value: Item): Item { return value }\nlet links: List<Link<Branch>> = []\nlet branch = Branch { links: links }\nlinks.add(Link { value: branch })\nlet scalar = keep(Link { value: 42 })\nprint(branch.links[0].value.links.length)\nprint(scalar.value)\n", "1\n42\n", levels, 0, "", true)
+let cycleLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+test.check(test.contains(cycleLLVM, "@minyar_record_new_traced("), "cycle-capable generic instantiation uses tracing")
+// Escaping scalar records use the existing scalar reference-count allocator.
+test.check(test.contains(cycleLLVM, "@minyar_record_new_scalar(i64 1)"), "scalar generic instantiation keeps scalar allocation")
+io.writeTextFile(frontend.compiler.directory + "/pairs.min", "public record Pair<First, Second> { first: First; second: Second }\npublic record Secret<Item> { private value: Item }\npublic function hide<Item>(value: Item): Secret<Item> { return Secret { value: value } }\npublic function reveal<Item>(secret: Secret<Item>): Item { return secret.value }\n")
+fixtures.executes(frontend, "use \"./pairs.min\" as pairs\nlet entry: pairs.Pair<Text, Integer> = pairs.Pair { first: \"harbour\"; second: 42 }\nprint(entry.first)\nprint(entry.second)\nprint(pairs.reveal(pairs.hide(\"pearl\")))\n", "harbour\n42\npearl\n", levels, 0, "", true)
+fixtures.rejects(frontend, "use \"./pairs.min\" as pairs\nlet secret = pairs.Secret<Integer> { value: 42 }\n", "has private fields, so only its own module can create one", true)
+fixtures.rejects(frontend, "use \"./pairs.min\" as pairs\nprint(pairs.hide(42).value)\n", "is private to its module", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/generic-records.min"), "dawn: 1.2 m\nnoon: 2.7 m\ndusk: 1.4 m\n", levels, 0, "", true)
+fixtures.rejects(frontend, "record Same<Item> { left: Item; right: Item }\nlet value = Same { left: 1; right: \"two\" }\n", "type argument 'Item' is used inconsistently", true)
+fixtures.rejects(frontend, pair + "let value: Pair<Text> = Pair { first: \"one\"; second: 2 }\n", "expects 2 type arguments, but received 1", true)
+fixtures.rejects(frontend, "record Empty<Item> { values: List<Item> }\nlet value = Empty { values: [] }\n", "I can't infer type argument 'Item'", true)
+fixtures.rejects(frontend, pair + "let value = Pair { first: 1; second: 2 }\nvalue.first = \"wrong\"\n", "record field 'first' needs Integer, not Text", true)
+fixtures.executes(frontend, pair + "function echo<Item>(value: Item): Item { return value }\nfunction relay<Item>(value: Item): Item { let pairs: List<Pair<Item, Item>> = []; pairs.add(Pair { first: value; second: value }); return echo<Item>(pairs[0].first) }\nprint(relay(42))\n", "42\n", levels, 0, "", true)
+fixtures.executes(frontend, "function choose<Item>(left: Item, right: Item): Item { return right }\nrecord Same<Item> { left: Item; right: Item }\nlet values = choose([], [42])\nlet pair = Same { left: []; right: [7] }\nprint(values[0])\nprint(pair.left.length)\nprint(pair.right[0])\n", "42\n0\n7\n", levels, 0, "", true)
+io.writeTextFile(frontend.compiler.directory + "/shadow.min", "public record Item { value: Text }\npublic record Ordered { value: Text }\npublic record Envelope<Item> { value: Item }\npublic function identity<Item>(value: Item): Item { return value }\npublic function ordered<Item: Ordered>(value: Item): Item { return value }\npublic function envelope<Item>(value: Item): Envelope<Item> { return Envelope { value: value } }\npublic function real(): Item { return Item { value: \"pearl\" } }\n")
+fixtures.executes(frontend, "use \"./shadow.min\" as shared\nprint(shared.identity(42))\nprint(shared.ordered(7))\nprint(shared.envelope(22).value)\nprint(shared.real().value)\nprint(shared.Ordered { value: \"rank\" }.value)\n", "42\n7\n22\npearl\nrank\n", levels, 0, "", true)
+fixtures.executes(frontend, "record Vessel { name: Text }\nfunction Vessel.label(): Text { return self.name }\nfunction identity<Item>(value: Item): Item { return value }\nlet vessel = Vessel { name: \"Willow\" }\nprint(identity(vessel.label()))\n", "Willow\n", levels, 0, "", true)
+fixtures.executes(frontend, "record Reader { apply: (List<Integer>) -> Integer }\nfunction empty<Item>(): List<Item> { return [] }\nlet reader = Reader { apply: function(values) { return values.length } }\nprint(reader.apply(empty()))\n", "0\n", levels, 0, "", true)
+fixtures.executes(frontend, pair + "function always<Item>(value: Item): () -> Item { return function() { return value } }\nlet read = always(Pair { first: \"moon\"; second: 42 })\nprint(read().first)\n", "moon\n", levels, 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Generic records: passed")

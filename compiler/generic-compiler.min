@@ -170,6 +170,24 @@ function genericSubstitute(program: GenericProgram, type: Integer, variables: Li
     return genericType(program, shape.name, arguments)
 }
 
+function genericMergeBinding(program: GenericProgram, stream: GenericStream, position: Integer, left: Integer, right: Integer, variable: Text, depth: Integer): Integer {
+    if left == 0 { return right }
+    if right == 0 || left == right { return left }
+    if depth >= 64 { genericError(stream, position, "generic inference nesting exceeds 64") }
+    let first = program.types[left]
+    let second = program.types[right]
+    if first.name != second.name || first.arguments.length != second.arguments.length {
+        genericError(stream, position, "type argument '" + variable + "' is used inconsistently: " + first.spelling + " and " + second.spelling)
+    }
+    let arguments: List<Integer> = []
+    let child = 0
+    while child < first.arguments.length {
+        arguments.add(genericMergeBinding(program, stream, position, first.arguments[child], second.arguments[child], variable, depth + 1))
+        child = child + 1
+    }
+    return genericType(program, first.name, arguments)
+}
+
 function genericUnify(program: GenericProgram, stream: GenericStream, position: Integer, pattern: Integer, actual: Integer, variables: List<Text>, bindings: List<Integer>, depth: Integer) {
     if pattern == 0 || actual == 0 { return }
     if depth >= 64 { genericError(stream, position, "generic inference nesting exceeds 64") }
@@ -178,9 +196,7 @@ function genericUnify(program: GenericProgram, stream: GenericStream, position: 
     let variable = findText(variables, wanted.name)
     if variable >= 0 && wanted.arguments.length == 0 {
         if bindings[variable] == 0 { bindings[variable] = actual; return }
-        if bindings[variable] != actual {
-            genericError(stream, position, "type argument '" + variables[variable] + "' is used inconsistently: " + program.types[bindings[variable]].spelling + " and " + received.spelling)
-        }
+        bindings[variable] = genericMergeBinding(program, stream, position, bindings[variable], actual, variables[variable], 0)
         return
     }
     if wanted.name != received.name || wanted.arguments.length != received.arguments.length { return }
@@ -246,6 +262,7 @@ function genericInstantiate(program: GenericProgram, stream: GenericStream, posi
     if program.instances.length >= 4096 { genericError(stream, position, "generic expansion exceeds 4096 instantiations; check for a recursive call that changes its type arguments") }
     let name = "minyar_generic_function_" + Text(program.instances.length)
     if template.kind == 2 { name = "minyar_generic_record_" + Text(program.instances.length) }
+    name = name + "_" + readableDeclarationName(template.name)
     let index = program.instances.length
     program.instances.add(GenericInstance { declaration: declaration; arguments: arguments; name: name })
     genericIndexPut(program.instanceIndex, key, index)
@@ -366,7 +383,7 @@ function genericHeaderFollows(kinds: List<Integer>, texts: List<Text>, start: In
     while position + 1 < kinds.length && kinds[position] != 0 && kinds[position] != 6 {
         let token = texts[position]
         if kinds[position] == 4 {
-            if token == "<" { depth = depth + 1 } else {
+            if token == "<" { depth = depth + 1; if depth > 64 { return false } } else {
                 if token == ">" { depth = depth - 1 } else {
                     if token == ">>" { depth = depth - 2 } else {
                         if token != "," && token != "." && token != "(" && token != ")" && token != "->" { return false }
@@ -510,6 +527,16 @@ function genericMemberType(program: GenericProgram, type: Integer, member: Text)
         let declaration = program.declarations[record]
         let field = findText(declaration.names, member)
         if field >= 0 { return genericSubstitute(program, declaration.types[field], declaration.variables, shape.arguments, 0) }
+        let method = genericDeclaration(program, methodFunctionName(shape.name, member), 1)
+        if method < 0 { method = genericDeclaration(program, methodFunctionName(shape.name, member + "$private"), 1) }
+        if method >= 0 {
+            let signature = program.declarations[method]
+            let arguments: List<Integer> = []
+            let parameter = 1
+            while parameter < signature.types.length { arguments.add(signature.types[parameter]); parameter = parameter + 1 }
+            arguments.add(signature.result)
+            return genericType(program, "Callback", arguments)
+        }
     }
     if member == "slice" || member == "appended" || member == "sorted" || member == "sortedBy" || member == "trim" { return type }
     if member == "split" { return genericType(program, "List", [genericNamedType(program, "Text")]) }
@@ -602,18 +629,18 @@ function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: 
                 }
             }
         } else {
-            let signature: List<Integer> = []
-            if type > 0 && program.types[type].name == "Callback" { signature = program.types[type].arguments }
+            let callSignature: List<Integer> = []
+            if type > 0 && program.types[type].name == "Callback" { callSignature = program.types[type].arguments }
             let argument = 0
             while stream.texts[cursor[0]] != ")" {
                 let wanted = 0
-                if argument + 1 < signature.length { wanted = signature[argument] }
+                if argument + 1 < callSignature.length { wanted = callSignature[argument] }
                 genericExpression(program, stream, cursor, scope, wanted, 0, depth + 1)
-                argument = argument + 1
                 if stream.texts[cursor[0]] != ")" { expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",") }
+                argument = argument + 1
             }
             cursor[0] = cursor[0] + 1
-            if signature.length > 0 { type = signature[signature.length - 1] }
+            if callSignature.length > 0 { type = callSignature[callSignature.length - 1] }
         }
         }
     }
@@ -898,7 +925,7 @@ function genericInstanceStream(program: GenericProgram, instance: GenericInstanc
             position = declaration.parametersStart
         } else {
             let token = source.texts[position]
-            if source.kinds[position] == 4 && token == "<" && position > declaration.start && (angleDepth > 0 || genericDeclaration(program, source.texts[position - 1], 1) >= 0 || genericDeclaration(program, source.texts[position - 1], 2) >= 0 || source.texts[position - 1] == "Ok" || source.texts[position - 1] == "Err") { angleDepth = angleDepth + 1 }
+            if source.kinds[position] == 4 && token == "<" && position > declaration.start && (typePositions[position] || angleDepth > 0 || genericHeaderFollows(source.kinds, source.texts, position - 1, "(") || genericHeaderFollows(source.kinds, source.texts, position - 1, "{")) { angleDepth = angleDepth + 1 }
             let variable = findText(declaration.variables, token)
             let substitute = variable >= 0 && source.kinds[position] == 1 && (typePositions[position] || angleDepth > 0) && source.texts[position + 1] != ":" && source.texts[position - 1] != "."
             if substitute {
@@ -907,7 +934,7 @@ function genericInstanceStream(program: GenericProgram, instance: GenericInstanc
                 copyModuleToken(kinds, texts, lines, source.kinds[position], token, source.lines, position, sourcePath(lines, tokenPath(source.lines, position)))
             }
             if token == ">" && angleDepth > 0 { angleDepth = angleDepth - 1 }
-            if token == ">>" && angleDepth > 0 { angleDepth = angleDepth - 2 }
+            if token == ">>" && angleDepth > 0 { angleDepth = angleDepth - 2; if angleDepth < 0 { angleDepth = 0 } }
             position = position + 1
         }
     }
@@ -929,7 +956,7 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
         if texts[start] == "function" || texts[start] == "record" {
             skipDeclaration(kinds, texts, cursor)
             let declaration = genericCollectDeclaration(program, source, start, cursor[0])
-            if resultPrefix(readableDeclarationName(declaration.name), "minyar_generic_") { genericError(source, start + 1, "reserved generic compiler name") }
+            if resultPrefix(declaration.name, "minyar_generic_") || resultPrefix(readableDeclarationName(declaration.name), "minyar_generic_") { genericError(source, start + 1, "reserved generic compiler name") }
             if declaration.kind == 1 && isBuiltinName(readableDeclarationName(declaration.name)) { genericError(source, start + 1, "function '" + readableDeclarationName(declaration.name) + "' uses a reserved built-in name; rename this function") }
             if declaration.name == "main" && declaration.variables.length > 0 { genericError(source, start + 1, "main cannot have type parameters") }
             let key = Text(declaration.kind) + ":" + declaration.name
