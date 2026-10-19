@@ -72,13 +72,16 @@ assertions; `check-nitpick-language-sanitize` adds ASan/UBSan.
 
 `make check-choice` checks choice construction, exhaustive statement and expression
 matches, generic choices, Maybe, module visibility, binding scope, recursive
-payloads and the
-choice gallery. Reference-valued matches are exercised after clearing their
+payloads and the choice gallery. Reference-valued matches are exercised after clearing their
 input, including a parenthesized input.
 Positive programs run at O0/O2 with ownership cleanup assertions; rejection
 fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
 ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed
 with `unknown type 'Shape'`; the focused gate is the passing feature regression.
+
+`make check-choice-smoke` runs a quick construction, expression, generic,
+module and rejection subset against the built traced runtime for landing checks.
+The full `check-choice` target adds ownership cleanup contracts.
 
 `make check-choice-library` checks the migrated `peerwire.StatusResult` at
 O0/O2 with ownership cleanup and real native providers. It checks both case

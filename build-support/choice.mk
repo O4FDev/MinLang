@@ -4,11 +4,14 @@ build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | 
 	awk -f "build-support/choice-prelude.awk" "$<" > "$@.tmp"
 	if test -f "$@" && cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
 
-.PHONY: check-choice-identifiers check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
+.PHONY: check-choice-identifiers check-choice-smoke check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
 
 check-choice-identifiers: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-identifiers
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-identifiers"
 
+
+check-choice-smoke: build/minyarc build/minyar-runtime.o build/testing/cycle-runtime.o build/tooling/tests/choice-smoke
+	MINYAR_TEST_RUNTIME="./build/testing/cycle-runtime.o" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-smoke"
 
 
 check-choice: build/minyarc build/minyar-runtime.o build/tooling/tests/choice
