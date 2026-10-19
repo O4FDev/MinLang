@@ -32,3 +32,27 @@ def lsp_roundtrip(command, project, environment):
         remaining = body[length:]
     assert isinstance(replies[1]["result"]["capabilities"], dict)
     assert replies[2]["result"] is None
+
+
+def project_diagnostics(command, project, environment):
+    source = project / "src/main.min"
+    original = source.read_bytes()
+    fields = {"version", "severity", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"}
+    try:
+        source.write_text('let count: Integer = "not an integer"\n')
+        for route in ("build", "check", "run", "test", "install"):
+            options = ["--root", str(project / "target/diagnostic-install")] if route == "install" else []
+            result = subprocess.run([str(command), route, "--error-format", "json", *options],
+                                    cwd=project, env=environment, text=True, capture_output=True, timeout=120)
+            assert result.returncode != 0, (route, result.stdout, result.stderr)
+            diagnostics = [json.loads(line) for line in result.stderr.splitlines() if line]
+            assert diagnostics, (route, result.stderr)
+            for diagnostic in diagnostics:
+                assert set(diagnostic) == fields and diagnostic["version"] == 1
+                assert diagnostic["severity"] == "error" and diagnostic["message"]
+                assert diagnostic["file"].endswith("src/main.min")
+                assert diagnostic["line"] == 1 and diagnostic["column"] >= 1
+                assert diagnostic["endLine"] >= diagnostic["line"] and isinstance(diagnostic["help"], list)
+                assert "not an integer" in diagnostic["sourceLine"]
+    finally:
+        source.write_bytes(original)

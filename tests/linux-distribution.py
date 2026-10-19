@@ -14,7 +14,7 @@ import sys
 import tarfile
 import tempfile
 import threading
-from distribution_probes import lsp_roundtrip
+from distribution_probes import lsp_roundtrip, project_diagnostics
 
 if not __debug__:
     raise SystemExit("distribution checks require Python assertions; remove -O")
@@ -124,6 +124,8 @@ def main():
             for options in ([], ["--release"]):
                 assert "Hello, world!" in run(command, "run", *options, cwd=project)
                 run(command, "test", *options, cwd=project)
+            if "--error-format" in (distribution / "minyar").read_text():
+                project_diagnostics(command, project, environment)
             if (distribution / "tools/module-tests.min").is_file():
                 module = project / "src/invariant.min"
                 module.write_text('function answer(): Integer { return 42 }\nprint("application statement must stay excluded")\ntest "archive invariant" {\n    expect(answer() == 42)\n    print("archive module test passed")\n}\n')
