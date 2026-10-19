@@ -1,6 +1,49 @@
-// Software operations on owned 0x00RRGGBB pixel buffers. Keep owners alive
-// and pointers valid for count elements. These functions may run in parallel.
+// Software operations on owned BGR0 byte buffers: blue, green, red, then zero.
+// The address-based functions below remain available for device memory.
 use "machine" as machine
+
+// Each byte is independent, including the unused high byte of a packed pixel.
+public parallel function blendedByte(pixel: Integer, color: Integer, opacity: Integer, component: Integer): Integer {
+    if component == 3 { return 0 }
+    let channel = (color >> (component * 8)) & 255
+    return (pixel * (256 - opacity) + channel * opacity) >> 8
+}
+
+function checkBuffer(buffer: Bytes) {
+    if buffer.length % 4 != 0 { fail("a pixel buffer needs four bytes per pixel") }
+}
+
+// Opacity is 0..256. Owners and bounds stay checked throughout the job.
+public function blendBytes(buffer: Bytes, color: Integer, opacity: Integer) {
+    checkBuffer(buffer)
+    if opacity < 0 || opacity > 256 { fail("pixel opacity must be from 0 to 256") }
+    parallel for index in 0..buffer.length {
+        buffer[index] = blendedByte(buffer[index], color, opacity, index % 4)
+    }
+}
+
+// The mask has one byte per pixel. It must be separate from the output.
+public function maskBytes(buffer: Bytes, mask: Bytes, color: Integer, scale: Integer, bias: Integer, limit: Integer) {
+    checkBuffer(buffer)
+    if mask.length < buffer.length / 4 { fail("a pixel mask needs one byte per pixel") }
+    if scale < 0 || scale > 256 || bias < 0 || limit < 0 || limit > 255 { fail("a pixel mask needs scale 0 to 256, nonnegative bias and limit 0 to 255") }
+    parallel for index in 0..buffer.length {
+        let cover = min(mask[index / 4] + bias, limit)
+        let raw = cover * scale >> 8
+        buffer[index] = blendedByte(buffer[index], color, raw + (raw >> 7), index % 4)
+    }
+}
+
+// A coverage scan depends on the preceding area, so this one stays sequential.
+public function coverageBytes(areas: List<Float>): Bytes {
+    let result = Bytes(areas.length)
+    let sum = 0.0
+    for index in 0..areas.length {
+        sum += areas[index]
+        result[index] = Integer(min(abs(sum), 1.0) * 255.0 + 0.5)
+    }
+    return result
+}
 
 parallel function blended(pixel: Integer, color: Integer, opacity: Integer): Integer {
     let keep = wrappingSubtract(256, opacity)

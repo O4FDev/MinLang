@@ -1023,7 +1023,7 @@ capture at most 64 values. Scalar captures are snapshots; the caller keeps buffe
 owners alive, and worker code performs no ownership operations.
 Parallel builds currently check the whole module graph,
 including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
-draws a tide of small lights into separate byte slots.
+draws a Julia garden into separate slots, with a woven Unicode preview or a PNG.
 
 Add `reduce name` to sum into one mutable Integer or Float binding:
 
@@ -1043,6 +1043,13 @@ iterations per chunk, independent of the number of threads; it can differ from
 a sequential left-to-right sum. An empty range preserves the original value.
 Partial storage costs one word per chunk and uses the configured allocator.
 Reductions are not yet available in recoverable execution.
+
+`pixels.blendBytes` and `pixels.maskBytes` work on owned BGR0 byte buffers:
+blue, green, red and an unused zero byte for each pixel. Both use checked
+parallel slots. Mask bytes are immutable during the job and need separate
+storage. `pixels.coverageBytes` accepts a List of signed Float areas; its
+running sum stays sequential because each value depends on its predecessor.
+The address-based pixel routines remain available for device memory.
 
 ## Parallel functions
 

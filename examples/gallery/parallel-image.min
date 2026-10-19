@@ -1,0 +1,60 @@
+// A small, dependency-free PNG writer for the parallel garden. The scanlines
+// are disjoint byte slots; the checksum and uncompressed stream stay on owner.
+function bigEndian(output: Bytes, value: Integer) {
+    for shift in [24, 16, 8, 0] { output.add((value >> shift) & 255) }
+}
+
+function chunk(output: Bytes, name: Text, data: Bytes) {
+    bigEndian(output, data.length)
+    let payload = Bytes(name)
+    payload.addBytes(data)
+    output.addBytes(payload)
+    let crc = 0xFFFFFFFF
+    for byte in payload {
+        crc = crc ^ byte
+        for bit in 0..8 {
+            if (crc & 1) == 1 { crc = (crc >> 1) ^ 0xEDB88320 }
+            else { crc = crc >> 1 }
+        }
+    }
+    bigEndian(output, crc ^ 0xFFFFFFFF)
+}
+
+public function png(pixels: Bytes, width: Integer, height: Integer): Bytes {
+    if width <= 0 || height <= 0 || pixels.length != width * height * 4 { fail("the PNG needs its complete pixel rectangle") }
+    let stride = width * 3 + 1
+    let scanlines = Bytes(stride * height)
+    parallel for index in 0..scanlines.length {
+        let column = index % stride
+        if column == 0 { scanlines[index] = 0 }
+        else {
+            let pixel = index / stride * width + (column - 1) / 3
+            scanlines[index] = pixels[pixel * 4 + 2 - (column - 1) % 3]
+        }
+    }
+    let stream = Bytes()
+    stream.add(0x78); stream.add(0x01)
+    let first = 0
+    while first < scanlines.length {
+        let after = min(first + 65535, scanlines.length)
+        let count = after - first
+        if after == scanlines.length { stream.add(1) } else { stream.add(0) }
+        stream.addUInt16(count)
+        stream.addUInt16(65535 - count)
+        stream.addBytes(scanlines.slice(first, after))
+        first = after
+    }
+    let a = 1
+    let b = 0
+    for byte in scanlines { a = (a + byte) % 65521; b = (b + a) % 65521 }
+    bigEndian(stream, (b << 16) | a)
+    let output = Bytes()
+    for byte in [137, 80, 78, 71, 13, 10, 26, 10] { output.add(byte) }
+    let header = Bytes()
+    bigEndian(header, width); bigEndian(header, height)
+    for byte in [8, 2, 0, 0, 0] { header.add(byte) }
+    chunk(output, "IHDR", header)
+    chunk(output, "IDAT", stream)
+    chunk(output, "IEND", Bytes())
+    return output
+}

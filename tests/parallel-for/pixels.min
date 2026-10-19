@@ -1,0 +1,76 @@
+use "pixels" as pixels
+use "machine" as machine
+use "../../os/shared/graphics/glow.min" as glow
+
+function same(actual: Bytes, expected: Bytes) {
+    if actual.length != expected.length { fail("the pixel length changed") }
+    for index in 0..actual.length {
+        if actual[index] != expected[index] { fail("typed pixels differ at byte " + Text(index)) }
+    }
+}
+
+let buffer = Bytes(10003 * 4)
+for index in 0..buffer.length { buffer[index] = index * 31 % 256 }
+let expected = buffer.slice(0, buffer.length)
+pixels.blendBytes(buffer, 0x4691F7, 147)
+pixels.blendSpan(machine.address(expected), 10003, 0x4691F7, 147)
+same(buffer, expected)
+let mask = Bytes(10003)
+for index in 0..mask.length { mask[index] = index * 73 % 256 }
+pixels.maskBytes(buffer, mask, 0xF7AC46, 199, 19, 236)
+pixels.blendMask(machine.address(expected), 10003, machine.address(mask), 0xF7AC46, 199, 19, 236)
+same(buffer, expected)
+let areas: List<Float> = []
+let packed = Bytes()
+for index in 0..10003 {
+    let value = Float(index % 5 - 2) / 8.0
+    areas.add(value); packed.addFloat32(value)
+}
+let cover = pixels.coverageBytes(areas)
+let original = Bytes(areas.length)
+pixels.coverage(machine.address(packed), machine.address(original), areas.length)
+same(cover, original)
+
+// The previous three-band desktop loop is the oracle. In a narrow canvas the
+// left and right bands overlap, so both blends must remain in their old order.
+function oldGlow(buffer: Bytes, width: Integer, height: Integer, stride: Integer, first: Integer, top: Integer, last: Integer, bottom: Integer, table: Bytes, level: Integer) {
+    let reach = table.length / 2
+    let address = machine.address(buffer)
+    let mask = machine.address(table)
+    for row in top..bottom {
+        let dy = min(row, height - 1 - row)
+        let ay = 0
+        if dy < reach { ay = table[dy] }
+        let at = address + row * stride
+        let leftEnd = min(last, reach)
+        if first < leftEnd { pixels.blendMask(at + first * 4, leftEnd - first, mask + first, 0x4691F7, level, ay, 236) }
+        let middleStart = max(first, reach)
+        let middleEnd = min(last, width - reach)
+        if ay > 0 && middleEnd > middleStart {
+            let alpha = min(ay, 236) * level >> 8
+            pixels.blendSpan(at + middleStart * 4, middleEnd - middleStart, 0x4691F7, alpha + (alpha >> 7))
+        }
+        let rightStart = max(first, width - reach)
+        if rightStart < last { pixels.blendMask(at + rightStart * 4, last - rightStart, mask + reach + rightStart - (width - reach), 0x4691F7, level, ay, 236) }
+    }
+}
+
+let table = Bytes()
+for value in [107, 83, 39, 7, 7, 39, 83, 107] { table.add(value) }
+for width in [3, 9, 769] {
+    for height in [7, 33] {
+        for level in [0, 1, 147, 256] {
+            let stride = width * 4 + 12
+            let actual = Bytes(stride * height + 8)
+            for index in 0..actual.length { actual[index] = index * 19 % 256 }
+            let before = actual.slice(0, actual.length)
+            glow.draw(actual, width, height, stride, 1, 1, width - 1, height - 1, table, 0x4691F7, level)
+            oldGlow(before, width, height, stride, 1, 1, width - 1, height - 1, table, level)
+            same(actual, before)
+        }
+    }
+}
+pixels.blendBytes(Bytes(), 0, 256)
+pixels.maskBytes(Bytes(), Bytes(), 0, 256, 0, 255)
+same(pixels.coverageBytes([]), Bytes())
+print("typed pixels: blend, mask, coverage and clipped desktop glow match packed oracles")

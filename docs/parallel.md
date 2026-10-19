@@ -37,7 +37,9 @@ The setup hook and device memory remain trusted machine operations, outside
 the safe loop body.
 
 `tests/parallel-for/boot.min` boots the real ARM64 processor scheduler, fills
-5,003 owned slots, and checks Integer and Float reductions. Build it with
+5,003 owned slots, and checks Integer and Float reductions. It also checks
+typed pixel blending, masks and the clipped desktop glow against checksum
+`315453`. Build it with
 `make -C os ARCH=arm64 KERNEL_SOURCE=/absolute/path/to/tests/parallel-for/boot.min`
 and boot its kernel with QEMU's `virt,gic-version=3`, 1 GiB RAM, and one or four
 processors. Both runs must print `SAFE PARALLEL OK 623386` with the processor
@@ -60,3 +62,19 @@ independent scheduler oracle under ThreadSanitizer. `check-parallel-backend`
 exercises the bare dispatcher and reductions through four joined processor-entry
 threads; its `-tsan` target checks that boundary under ThreadSanitizer.
 Correctness and timing are separate evidence.
+
+The desktop's glow now draws owned canvases through checked byte slots, with
+immutable opacity-table reads. Clipping, row padding and overlapping edge
+bands preserve the previous packed-pixel result. Device-backed canvases retain
+the raw adapter. The typed pixel tests compare blends, masks, coverage and
+desktop glow against those existing packed routines at O0/O2 with ownership
+checks. Coverage is a sequential prefix scan, not an independent pixel loop.
+
+Run `./minyar --release examples/gallery/parallel.min -o /tmp/garden`, then
+`/tmp/garden /tmp/garden.png`, for the 1200×800 Julia garden. Without arguments
+it prints a woven Unicode preview. Orbits, palette lookup, pixel blending and
+PNG scanline conversion use safe parallel slots. The PNG writer stores its
+scanlines without compression and checksums them on the owner thread; this
+keeps the gallery independent of graphics libraries. A two-by-two PNG is
+compared byte-for-byte with an independently constructed fixture, including
+chunk CRCs and the stream checksum.
