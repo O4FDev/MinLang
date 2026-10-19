@@ -38,9 +38,17 @@ def write_index(path, value):
 
 def check_credential_isolation(launcher, env, root, application):
     authorizations = []
+    requests = []
 
     class Denied(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            requests.append(self.path)
+            if self.path.startswith("/redirect.git/"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}" + self.path.replace("/redirect.git/", "/redirected.git/", 1))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             authorizations.append(self.headers.get("Authorization"))
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="private fixture"')
@@ -78,6 +86,13 @@ def check_credential_isolation(launcher, env, root, application):
             if asked.exists():
                 problems.append("Git executed the invoking user's password helper")
             assert (application / "Minyar.toml").read_bytes() == manifest and (application / "Minyar.lock").read_bytes() == lock
+        requests.clear()
+        isolated["MINYAR_TEST_AUTH_URL"] = f"http://127.0.0.1:{server.server_port}/redirect.git"
+        run([launcher, "add", "github.com/Fixtures/noauth"], isolated, application, "Git could not read this package")
+        assert any(path.startswith("/redirect.git/") for path in requests)
+        if any(path.startswith("/redirected.git/") for path in requests):
+            problems.append("Git followed a redirect instead of requiring a canonical HTTPS path")
+        assert (application / "Minyar.toml").read_bytes() == manifest and (application / "Minyar.lock").read_bytes() == lock
     finally:
         server.shutdown()
         server.server_close()

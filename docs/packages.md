@@ -27,6 +27,8 @@ minyar add github.com/O4FDev/paint@COMMIT   # full SHA or unambiguous prefix
 `https://` and a trailing `.git` are optional. SSH, credentials in URLs, custom
 transport commands, prerelease version ranges and repository subdirectories are
 not supported. Public HTTPS repositories are the initial transport contract.
+Use the repository's canonical HTTPS path. Git redirects are rejected so a
+redirect cannot downgrade that transport to plain HTTP.
 If there are no stable tags, choose a branch or commit explicitly.
 Latest discovery lists remote tags first, then downloads only the chosen
 release's current tree with a shallow fetch. Annotated tags work too. Deleted
@@ -166,7 +168,7 @@ The [first light gallery project](../examples/gallery/paint/README.md) installs
 the real external `paint` library through this route and renders PNG and SVG.
 Its separate repository includes paths, antialiasing, gradients, TrueType text,
 three reproducible artworks and a local `v0.1.0` tag. Before publication, use the
-documented private mirror. `make check-paint-package MINYAR_PAINT_SOURCE=/path/to/minyar-paint`
+documented private mirror. `make check-paint-package MINYAR_PAINT_SOURCE="/path/to/minyar-paint"`
 tests the complete offline debug/release workflow without adding the external
 library to Minyar's core or relying on GitHub.
 
