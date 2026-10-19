@@ -96,6 +96,14 @@ It runs generated programs at O0/O2 with ownership assertions and verifies that
 Swift experiments cannot be selected as ordinary backends.
 `check-language-ergonomics-sanitize` adds ASan/UBSan to the language cases.
 
+`make check-result-context` checks persistent error context, original codes and
+messages, unusual Unicode/zero-byte messages, detached context Lists, lazy
+`try ... else` evaluation, custom error types, generic calls and no-value
+propagation. The results gallery and positive fixtures run at O0/O2 with
+ownership cleanup assertions; rejection fixtures check the method protocol and
+context type. `check-result-context-sanitize` adds ASan/UBSan. Before support,
+the gallery was rejected with `unexpected 'else'; start the next statement on a new line`.
+
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition

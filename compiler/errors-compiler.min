@@ -277,8 +277,37 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
     let errorLabel = "result.try.error." + Text(newLabel(state))
     output.add(conditionalBranch(tag, okLabel, errorLabel))
     output.add("\n" + errorLabel + ":\n")
+    textState[0] = errorLabel
     let error = readRecordField(output, textState, state, input, 2, errorType)
     let errorPayload: List<Integer> = [errorType]
+    // A context expression belongs to the failing branch, so its side effects
+    // and temporary owners are absent on success. The public method is a
+    // normal direct call; custom error records can implement the same protocol.
+    if tokenIs(context.tokenKinds, context.tokenTexts, state, "else") {
+        let contextLocation = state[0]
+        state[0] = state[0] + 1
+        let method = -1
+        if isRecordType(errorType) {
+            method = findFunction(functionNames, context.symbolKinds, tokenLines.symbolLookup, methodFunctionName(functionNames[errorType - 1000], "withContext"))
+        }
+        if method < 0 { fail(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context needs an error type with a public withContext(Text) method returning the same error type") }
+        let parameters = functionParameterOffset(functionParameterCounts, method)
+        if functionParameterCounts[method] != 2 || functionParameterTypes[parameters] != errorType || functionParameterTypes[parameters + 1] != 2 || functionReturnTypes[method] != errorType {
+            fail(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context needs an error type with a public withContext(Text) method returning the same error type")
+        }
+        borrowReference(output, state, error, errorType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+        let contextType: List<Integer> = [2]
+        let message = parseUnary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, contextType)
+        if contextType[0] != 2 { fail(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context must be Text") }
+        let values: List<Text> = [error, message]
+        let types: List<Integer> = [errorType, 2]
+        if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "call", functionNames[method], threadSignature(errorType, types)) }
+        context.callTargets.add(method)
+        state[14] = state[14] + 1
+        error = emitCall(output, textState, state, errorType, context.functionIRNames[method], values, types)
+        recoveryCheckpoint(output, textState, state)
+        ownResult(output, state, error, errorPayload)
+    }
     let returned = emitResultValue(output, textState, state, error, errorPayload, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
     output.add("  call void @minyar_rc_leave()\n")
     output.add("  call void @minyar_stack_leave()\n")

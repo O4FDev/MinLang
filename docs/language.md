@@ -803,6 +803,27 @@ stand alone for a no-value operation. Propagation preserves evaluation order
 and releases the current function's owned locals and temporaries. Programmer
 failures such as bounds errors remain fatal.
 
+Add context with `try operation() else "reading the configuration"`. The
+context is evaluated only when the operation fails, then passed to the error's
+public `withContext(Text)` method, which must return the same error type.
+An `errors.Error` provides this method. The original error and its aliases
+stay unchanged, including its code, native code and `message()`. `contexts()`
+returns a fresh List from the outermost operation to the innermost;
+`describe()` prints those layers followed by the original message, indented
+two spaces at each layer. Adding context copies its stored context Text;
+its cost grows with the total context length. Plain `try` adds no context.
+
+```minyar
+function port(source: Text): Result<Integer, errors.Error> {
+    return Ok(try readPort(source) else "reading the port")
+}
+```
+
+Both the operation and context use unary-expression precedence. Parenthesize
+a compound context, such as `else ("reading " + path)`. The surrounding
+expression continues to use the successful value. Ordinary `if ... else`
+and existing identifiers keep their meaning.
+
 Use `Result<Nothing, E>` for an operation with no success payload. Construct
 success with `Ok()` and match it with `Ok() { ... }`. `Nothing` cannot be
 stored or bound as a payload, or used as an error type. A match must handle

@@ -1,0 +1,85 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "errors" as errors
+    let original = errors.make(6, 17, "expected an integer")
+    let inner = original.withContext("reading the port")
+    let outer = inner.withContext("loading the lantern")
+    print(outer.describe())
+    print(original.message())
+    print(inner.contexts().length)
+    print(outer.code()); print(outer.nativeCode())
+    let messages = outer.contexts()
+    messages[0] = "changed copy"
+    print(outer.contexts()[0])
+    print(original == errors.make(6, 17, "expected an integer"))
+    print(outer == inner)
+    let unusual = original.withContext("é🙂\n\0:")
+    print(unusual.contexts()[0] == "é🙂\n\0:")
+    print(errors.none().withContext("unused").isError())
+    let kept = original.withContext("").withContext("outer")
+    print(kept.contexts().length)
+    print(kept.contexts()[1] == "")
+    for index in 0..1000 {
+        let temporary = original.withContext(Text(index)).withContext("loop")
+        if temporary.contexts().length != 2 { fail("lost a context layer") }
+    }
+
+    """#, "loading the lantern\n  reading the port\n    expected an integer\nexpected an integer\n1\n6\n17\nloading the lantern\ntrue\nfalse\ntrue\nfalse\n2\ntrue\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    use "errors" as errors
+    function read(good: Boolean): Result<Text, errors.Error> {
+        if good { return Ok("light") }
+        return Err(errors.make(6, 9, "missing wick"))
+    }
+    function context(): Text { print("context evaluated"); return "lighting the lantern" }
+    function light(good: Boolean): Result<Text, errors.Error> {
+        let protected = [Bytes(64), Bytes(32)]
+        return Ok("a " + (try read(good) else context()))
+    }
+    match light(true) { Ok(value) { print(value) } Err(error) { print(error.describe()) } }
+    match light(false) { Ok(value) { print(value) } Err(error) { print(error.describe()); print(error.nativeCode()) } }
+    function save(): Result<Nothing, errors.Error> { return Err(errors.make(7, 2, "closed")) }
+    function run(): Result<Integer, errors.Error> { try save() else "saving the light"; return Ok(42) }
+    match run() { Ok(value) { print(value) } Err(error) { print(error.describe()) } }
+    function identity<Item>(value: Item): Item { return value }
+    function genericRun(good: Boolean): Result<Text, errors.Error> {
+        return Ok(identity(try read(good) else "reading through a generic call"))
+    }
+    match genericRun(true) { Ok(value) { print(value) } Err(error) { print(error.describe()) } }
+    match genericRun(false) { Ok(value) { print(value) } Err(error) { print(error.describe()) } }
+
+    """#, "a light\ncontext evaluated\nlighting the lantern\n  missing wick\n9\nsaving the light\n  closed\nlight\nreading through a generic call\n  missing wick\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Problem { message: Text }
+    public function Problem.withContext(context: Text): Problem {
+        return Problem { message: context + ": " + self.message }
+    }
+    function read(): Result<Nothing, Problem> { return Err(Problem { message: "dark" }) }
+    function run(): Result<Integer, Problem> { try read() else "lantern"; return Ok(1) }
+    match run() { Ok(value) { print(value) } Err(problem) { print(problem.message) } }
+    """#, "lantern: dark\n", levels, 0, "", true)
+
+fixtures.rejects(frontend, #"""
+    function read(): Result<Integer, Text> { return Err("bad") }
+    function run(): Result<Integer, Text> { return Ok(try read() else "reading") }
+    print(0)
+    """#, "try context needs an error type with a public withContext(Text) method returning the same error type", true)
+fixtures.rejects(frontend, #"""
+    use "errors" as errors
+    function read(): Result<Integer, errors.Error> { return Ok(1) }
+    function run(): Result<Integer, errors.Error> { return Ok(try read() else 42) }
+    print(0)
+    """#, "try context must be Text", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/results.min"), "The lantern is listening on 8080.\nLighting the harbour\n  reading the lantern's port\n    expected a signed decimal ASCII integer\nLighting the harbour\n  reading the lantern's port\n    choose a port from 1 to 65535\n", levels, 0, "", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Result context: passed")
