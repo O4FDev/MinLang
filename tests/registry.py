@@ -136,6 +136,11 @@ def main():
         release_tag = git("rev-parse", "refs/tags/v0.1.0").strip()
         head = git("rev-parse", "HEAD").strip()
         git("config", "filter.never-run.smudge", "touch " + shlex.quote(str(root / "filter-ran")) + "; cat")
+        git("config", "filter.never-run.clean", "touch " + shlex.quote(str(root / "filter-ran")) + "; cat")
+        probe = package / "raw/0000.dat"
+        original_stat = probe.stat()
+        os.utime(probe, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 2000000000))
+        original_index = (package / ".git/index").read_bytes()
         real_git = shutil.which("git", path=env.get("PATH"))
         assert real_git
         git_log = root / "git-calls.jsonl"
@@ -174,9 +179,13 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
 
         arguments = [launcher, "publish", "github.com/O4FDev/lumen", "--description", "Light, in a small library."]
         record_text = run(arguments, env, package)
+        assert not (root / "filter-ran").exists(), "publish executed a configured Git clean filter"
+        assert (package / ".git/index").read_bytes() == original_index, "dry runs preserve the Git index"
         calls = blob_calls()
         assert len(calls) == 1 and calls[0][-2:] == ["cat-file", "--batch"], f"publish must read all 1000+ blobs in one Git batch, got {len(calls)} processes"
         assert record_text == run([*arguments, "--dry-run"], env, package)
+        assert not (root / "filter-ran").exists() and (package / ".git/index").read_bytes() == original_index
+        git("config", "--unset", "filter.never-run.clean")
         record = json.loads(record_text)
         assert record["commit"] == head and record["version"] == "0.1.0"
         names = [name for name in git("ls-tree", "-r", "-z", "--name-only", "HEAD").split("\0") if name]

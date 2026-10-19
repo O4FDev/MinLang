@@ -7,12 +7,25 @@ use "json" as json
 function command(root: Text, arguments: List<Text>, output: Text, errors: Text): Integer {
     let executable = host.which("git")
     if executable == "" { host.stop("Git is required to prepare a package release") }
-    let command = [executable, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", root]
+    let command = [executable, "--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", root]
     return host.spawn(host.extended(command, arguments), git.gitEnvironment(host.parentPath(errors)), false, output, errors, 60)
 }
 function text(root: Text, arguments: List<Text>, scratch: Text): Text {
     if command(root, arguments, scratch + "/out", scratch + "/err") != 0 { host.stop("cannot prepare this release: " + host.strip(host.readText(scratch + "/err")) + "; commit the package and tag its version first") }
     return host.readText(scratch + "/out")
+}
+function cleanStatus(root: Text, scratch: Text): Text {
+    let status = command(root, ["config", "--includes", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process|required)$"], scratch + "/out", scratch + "/err")
+    if status != 0 && status != 1 { host.stop("cannot read this repository's Git filter settings; review its configuration before minyar publish") }
+    let arguments: List<Text> = []
+    for key in host.readText(scratch + "/out").split(Text(Character(0))) {
+        if key == "" { continue }
+        arguments.add("-c")
+        let value = ""
+        if key.endsWith(".required") { value = "false" }
+        arguments.add(key + "=" + value)
+    }
+    return text(root, host.extended(arguments, ["status", "--porcelain", "--untracked-files=normal"]), scratch)
 }
 public function prepare(package: project.Manifest, repository: Text, description: Text): registry.Entry {
     if !project.hasLibrary(package) { host.stop("publish requires a source library at src/" + package.name + ".min") }
@@ -20,7 +33,7 @@ public function prepare(package: project.Manifest, repository: Text, description
     let temporary = host.temporaryDirectory("", "minyar-publish-")
     let scratch = host.resolveName(temporary)
     if host.strip(text(package.root, ["rev-parse", "--show-toplevel"], scratch)) != package.root { host.stop("publish requires the package manifest at the Git repository root") }
-    if text(package.root, ["status", "--porcelain", "--untracked-files=normal"], scratch) != "" { host.stop("package has uncommitted files; commit the release before minyar publish --dry-run") }
+    if cleanStatus(package.root, scratch) != "" { host.stop("package has uncommitted files; commit the release before minyar publish --dry-run") }
     let commit = host.strip(text(package.root, ["rev-parse", "--verify", "HEAD^{commit}"], scratch))
     let tagged = host.strip(text(package.root, ["rev-parse", "--verify", "refs/tags/v" + package.version + "^{commit}"], scratch))
     if commit != tagged { host.stop("v" + package.version + " does not point to HEAD; tag the reviewed release commit first") }

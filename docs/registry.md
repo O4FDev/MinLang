@@ -21,6 +21,8 @@ minyar publish github.com/O4FDev/paint --dry-run \
 omitted. It requires a clean Git tree, a library export and a version tag at HEAD.
 It reads committed blobs, applies the source security policy and emits metadata.
 It does not upload, create a repository, change remotes or execute package code.
+Git clean, smudge and process filters are disabled during the working-tree
+check, and the Git index remains unchanged.
 Keep redirected output outside the package so it does not make the tree dirty.
 
 ```sh
