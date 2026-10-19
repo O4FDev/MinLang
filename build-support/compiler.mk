@@ -15,6 +15,7 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/stages/assignment.min \
 	compiler/stages/native.min \
 	compiler/stages/effects.min \
+	compiler/parallel-compiler.min \
 	compiler/stages/functions.min \
 	compiler/stages/pipeline.min \
 	compiler/stages/modules.min \

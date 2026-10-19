@@ -868,6 +868,34 @@ as `+=`. To maintain captured state, mutate a field of a captured record.
 Callbacks belong to their creator's execution domain; they do not transfer
 managed objects between threads.
 
+## Parallel ranges
+
+`parallel for` gives each iteration its own slot in an existing `Bytes` or a
+List of Integers, Floats, Booleans or Characters:
+
+```minyar
+let squares = [0, 0, 0, 0]
+parallel for index in 0..squares.length {
+    squares[index] = index * index
+}
+```
+
+Bounds are evaluated once. Empty and descending ranges do no work. The index
+cannot be changed, and every shared write must use that index directly. Scalar
+locals belong to one iteration; outer scalar bindings cannot be reassigned.
+Buffer reads currently use the same index or `.length`, so aliases remain safe.
+Buffers keep their existing length, bounds checks and shared reference semantics.
+Managed values cannot be created, passed to functions, resized or returned by an
+iteration. Calls must be to pure `parallel function`s, including their callees;
+raw machine operations and native effects are rejected. `continue` skips one
+iteration; `break` is allowed only inside a nested ordinary loop.
+
+The first implementation executes these checked ranges sequentially. The
+contract allows a later backend to distribute iterations without changing the
+program's meaning. Parallel builds currently check the whole module graph,
+including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
+draws a tide of small lights into separate byte slots.
+
 ## Parallel functions
 
 A `parallel function` may run on several processors at once. The runtime's
