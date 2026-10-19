@@ -1,5 +1,10 @@
 # Vendored dependencies
 
+`vendor/SHA256SUMS` records every vendored source and license byte. The PR
+security gate checks these local fingerprints; the upstream commits below are
+the provenance references reviewers should use when deliberately updating a
+vendor file and its fingerprint together.
+
 - `stb_ds.h` 0.67 provides growable arrays and hash tables. It is copied from
   `nothings/stb` at commit `2c980bb59875b0d32144a71867fbdebb2f77cd20`.
 - `STB-LICENSE` contains its public-domain/MIT dual license.

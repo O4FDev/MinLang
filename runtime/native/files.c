@@ -167,7 +167,7 @@ long long minyar_files_writeStandardOutput(const MinyarText *text) {
     return files_write_all(1, text, 0, text->byte_length, -1);
 }
 
-/* Read up to length bytes at position into fresh Bytes (shorter at end of file). */
+/* Read up to length bytes into an existing buffer (shorter at end of file). */
 long long minyar_files_readAppend(long long fd, long long position, MinyarBytes *buffer, long long length) {
     if (!files_valid_fd(fd)) { files_last_error = -EBADF; return -EBADF; }
     if (!buffer || position < 0 || length < 0) { files_last_error = -EINVAL; return -EINVAL; }
@@ -178,12 +178,12 @@ long long minyar_files_readAppend(long long fd, long long position, MinyarBytes 
         return -EOVERFLOW;
     }
     long long before = buffer->byte_length;
-    unsigned char *p = minyar_native_bytes_append(buffer, length);
+    unsigned char chunk_buffer[65536];
     long long done = 0;
     while (done < length) {
         size_t chunk = (size_t)(length - done);
-        if (chunk > (1u << 30)) chunk = 1u << 30;
-        ssize_t n = pread((int)fd, p + done, chunk, (off_t)(position + done));
+        if (chunk > sizeof(chunk_buffer)) chunk = sizeof(chunk_buffer);
+        ssize_t n = pread((int)fd, chunk_buffer, chunk, (off_t)(position + done));
         if (n < 0) {
             if (errno == EINTR) continue;
             int e = -errno;
@@ -192,9 +192,9 @@ long long minyar_files_readAppend(long long fd, long long position, MinyarBytes 
             return e;
         }
         if (n == 0) break;
+        memcpy(minyar_native_bytes_append(buffer, n), chunk_buffer, (size_t)n);
         done += n;
     }
-    buffer->byte_length = before + done;
     files_last_error = 0;
     return done;
 }
@@ -418,7 +418,29 @@ long long minyar_files_syncDirectory(const MinyarText *path) {
     return r;
 }
 
-/* NUL-delimited entry names represent every legal POSIX filename. */
+/* Text-facing directory APIs report invalid UTF-8 names as -EILSEQ. */
+static bool files_valid_utf8(const unsigned char *bytes, size_t length) {
+    for (size_t i = 0; i < length;) {
+        unsigned char first = bytes[i];
+        if (first < 0x80) { i++; continue; }
+        size_t width;
+        if (first >= 0xc2 && first <= 0xdf) width = 2;
+        else if (first >= 0xe0 && first <= 0xef) width = 3;
+        else if (first >= 0xf0 && first <= 0xf4) width = 4;
+        else return false;
+        if (width > length - i) return false;
+        unsigned char second = bytes[i + 1];
+        if ((second & 0xc0) != 0x80 ||
+            (first == 0xe0 && second < 0xa0) || (first == 0xed && second >= 0xa0) ||
+            (first == 0xf0 && second < 0x90) || (first == 0xf4 && second >= 0x90))
+            return false;
+        for (size_t j = 2; j < width; j++)
+            if ((bytes[i + j] & 0xc0) != 0x80) return false;
+        i += width;
+    }
+    return true;
+}
+
 MinyarBytes *minyar_files_listNames(const MinyarText *path) {
     char p[PATH_MAX];
     int rc = files_path(path, p);
@@ -434,6 +456,7 @@ MinyarBytes *minyar_files_listNames(const MinyarText *path) {
         if (!e) { error = errno; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         size_t n = strlen(e->d_name);
+        if (!files_valid_utf8((const unsigned char *)e->d_name, n)) { error = EILSEQ; break; }
         unsigned char *dst = minyar_native_bytes_append(out, (long long)n + 1);
         memcpy(dst, e->d_name, n);
         dst[n] = 0;

@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <string.h>
 #include "../minyar_native.h"
 #include "apple_identity.h"
 
@@ -125,6 +126,13 @@ static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challe
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         NSUInteger headerBytes = 0;
         if (r.maximumBytes) {
+            long long expected = response.expectedContentLength;
+            NSString *method = task.currentRequest.HTTPMethod ?: task.originalRequest.HTTPMethod;
+            BOOL bodyless = [method isEqualToString:@"HEAD"] || http.statusCode == 204 || http.statusCode == 304;
+            if (!bodyless && expected > 0 && (unsigned long long)expected > (unsigned long long)r.maximumBytes) {
+                finish(r, @"download exceeds its size limit");
+                handler(NSURLSessionResponseCancel); return;
+            }
             for (NSString *name in http.allHeaderFields) {
                 NSString *value = [http.allHeaderFields[name] description];
                 headerBytes += [name lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
@@ -215,6 +223,31 @@ static MinyarText *decode(const unsigned char *bytes, size_t length) {
     return minyar_native_copy_text(out.bytes, (long long)out.length);
 }
 
+static BOOL http_token(NSString *value) {
+    if (!value.length) return NO;
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    const unsigned char *bytes = data.bytes;
+    for (NSUInteger i = 0; i < data.length; i++) {
+        unsigned char c = bytes[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            strchr("!#$%&'*+-.^_`|~", c)) continue;
+        return NO;
+    }
+    return YES;
+}
+static BOOL http_field_value(NSString *value) {
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar c = [value characterAtIndex:i];
+        if ((c < 32 && c != 9) || c == 127) return NO;
+    }
+    return YES;
+}
+static BOOL http_reserved_header(NSString *name) {
+    NSString *lower = name.lowercaseString;
+    return [lower isEqualToString:@"host"] || [lower isEqualToString:@"connection"] ||
+        [lower isEqualToString:@"content-length"] || [lower isEqualToString:@"transfer-encoding"];
+}
+
 static long long http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
                             NSURLCredential *credential, BOOL requiresIdentity, long long maximum, long long timeoutMs) { @autoreleasepool {
     http_owner();
@@ -230,16 +263,14 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
         requests = [NSMutableDictionary new];
         byTask = [NSMapTable strongToStrongObjectsMapTable];
     }
-    NSString *verb = method ? string(method) : @"GET";
-    NSCharacterSet *token = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZ"];
-    if (!verb.length || [verb rangeOfCharacterFromSet:token.invertedSet].location != NSNotFound)
-        minyar_native_stop("http methods are uppercase words such as GET or POST.");
     if (nextRequest == LLONG_MAX) minyar_native_stop("http could not allocate a request.");
     MHRequest *r = [MHRequest new];
     r.unread = [NSMutableData new]; r.condition = [NSCondition new];
     r.maximumBytes = (NSUInteger)maximum;
     long long handle = nextRequest++;
     requests[@(handle)] = r;
+    NSString *verb = method ? string(method) : @"GET";
+    if (!http_token(verb)) { finish(r, @"invalid HTTP request method"); return handle; }
     NSString *urlText = string(url);
     NSURL *address = [NSURL URLWithString:urlText];
     if (!address || !([address.scheme isEqualToString:@"https"] || [address.scheme isEqualToString:@"http"]) ||
@@ -254,9 +285,13 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
     for (NSString *line in [string(headers) componentsSeparatedByString:@"\n"]) {
         if (!line.length) continue;
         NSRange colon = [line rangeOfString:@":"];
-        if (colon.location == NSNotFound || colon.location == 0) minyar_native_stop("http headers are written \"Name: value\".");
+        if (colon.location == NSNotFound || colon.location == 0) { finish(r, @"invalid HTTP request header"); return handle; }
         NSString *name = [line substringToIndex:colon.location];
-        NSString *value = [[line substringFromIndex:colon.location + 1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        NSString *rawValue = [line substringFromIndex:colon.location + 1];
+        if (!http_token(name) || !http_field_value(rawValue) || http_reserved_header(name)) {
+            finish(r, @"invalid or client-managed HTTP request header"); return handle;
+        }
+        NSString *value = [rawValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         [request addValue:value forHTTPHeaderField:name];
     }
     if (body && body->byte_length) request.HTTPBody = [NSData dataWithBytes:body->bytes length:(NSUInteger)body->byte_length];
@@ -297,10 +332,11 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
 long long minyar_http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body) {
     return http_begin(method,url,headers,body,nil,NO,0,0);
 }
-long long minyar_http_beginBounded(const MinyarText *url, const MinyarText *headers, long long maximum, long long timeoutMs) {
+long long minyar_http_beginBounded(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
+                                  long long maximum, long long timeoutMs) {
     if (maximum < 1 || maximum > 134217728 || timeoutMs < 1 || timeoutMs > 300000)
         minyar_native_stop("invalid bounded HTTP request limits.");
-    return http_begin(NULL,url,headers,NULL,nil,NO,maximum,timeoutMs);
+    return http_begin(method,url,headers,body,nil,NO,maximum,timeoutMs);
 }
 long long minyar_http_beginWithIdentity(const MinyarText *method, const MinyarText *url, const MinyarText *headers,
                                       const MinyarText *body, const MinyarBytes *reference, const MinyarBytes *chain) { @autoreleasepool {

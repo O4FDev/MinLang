@@ -20,6 +20,22 @@ function unknownDevice(state: lab.Lab, certificate: Text) {
     let outcome = probe(state, "device-probe", state.devicePort, certificate)
     lab.require(state, fixtures.starts(outcome, "REJECTED "), "untrusted device " + certificate + " was not rejected: " + outcome)
 }
+function refreshedGateways(state: lab.Lab) {
+    let removed = lab.session(state, "gateway")
+    let retained = lab.session(state, "gateway-next")
+    let beforeRemoved = lab.call(state, removed, lab.signed(state, "refresh-before-removed"), "exit-a", "refresh-before-removed", 0, 1000)
+    let beforeRetained = lab.call(state, retained, lab.signed(state, "refresh-before-retained"), "exit-a", "refresh-before-retained", 0, 1000)
+    lab.require(state, lab.status(beforeRemoved) == "OK" && lab.status(beforeRetained) == "OK", "gateway refresh precondition failed")
+    io.writeTextFile(state.directory + "/registry.ndjson", "{\"role\": \"device\", \"device_id\": \"device-a\", \"exit_id\": \"exit-a\", \"revoked\": false, \"paused\": false, \"quarantined\": false, \"max_concurrent\": 8}\n" +
+        "{\"role\": \"gateway\", \"sha256\": " + json.quote(lab.digest(state.context, fixtures.path(state.certs, "gateway-next", "der"))) + "}\n")
+    fixtures.pause("16")
+    let afterRemoved = lab.call(state, removed, lab.signed(state, "refresh-after-removed"), "exit-a", "refresh-after-removed", 0, 1000)
+    let afterRetained = lab.call(state, retained, lab.signed(state, "refresh-after-retained"), "exit-a", "refresh-after-retained", 0, 1000)
+    lab.require(state, lab.status(afterRemoved) != "OK", "removed gateway fingerprint survived registry refresh: " + json.pretty(afterRemoved, ""))
+    lab.require(state, lab.status(afterRetained) == "OK", "retained gateway fingerprint was disconnected: " + json.pretty(afterRetained, ""))
+    lab.endSession(state, removed)
+    lab.endSession(state, retained)
+}
 function malformedConfiguration(state: lab.Lab): Integer {
     let cases = 0
     let long = "\"" + lab.repeated("x", 4096) + "\""
@@ -55,13 +71,14 @@ function absentEventually(state: lab.Lab) {
     lab.require(state, false, "device live state remained after close")
 }
 function complete(context: fixtures.Context, directory: Text, binary: Text, sanitize: Boolean): Text {
-    let setup = lab.options(binary, sanitize, 15000, 8)
+    let setup = lab.options(binary, sanitize, 30000, 8)
     setup.pki = true
     let state = lab.create(context, directory, setup)
     let cases = malformedConfiguration(state)
     for certificate in ["gateway", "gateway-next"] { gateway(state, certificate, true) }
     gateway(state, "gateway-untrusted", false)
     gateway(state, "gateway-device-root", false)
+    refreshedGateways(state)
     for certificate in ["device", "device-next"] {
         let device = lab.startDevice(state, certificate)
         let text = lab.waitState(state, 5000)
@@ -78,7 +95,7 @@ function complete(context: fixtures.Context, directory: Text, binary: Text, sani
     lab.require(state, lab.diagnostic(state) == "", lab.diagnostic(state))
     let values = lab.counts(lab.completed(state, 20000))
     lab.require(state, lab.count(values, "active") == 0 && lab.count(values, "retained_relays") == 0, "retained peers " + lab.describe(values))
-    print("GREEN peer edge PKI: intermediate server chain, distinct old/new device and gateway roots, omitted/cross-role root rejection, " + Text(cases) + " malformed path-array controls")
+    print("GREEN peer edge PKI: intermediate server chain, distinct old/new device and gateway roots, registry-refresh gateway revocation with retained gateway continuity, omitted/cross-role root rejection, " + Text(cases) + " malformed path-array controls")
     let built = state.binary
     lab.close(state)
     return built

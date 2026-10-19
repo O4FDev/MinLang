@@ -1,0 +1,166 @@
+// Pure, bounded HTTP/1 response parser. The kernel and hosted regressions use
+// the same parser so malformed server bytes cannot reach a fatal Text or
+// checked Integer conversion in the freestanding guest.
+use "text" as textTools
+
+public constant WAITING = 0
+public constant DONE = 1
+public constant FAILED = 2
+public constant MAX_HEADER = 32768
+public constant MAX_BODY = 1048576
+// 32 KiB header + 1 MiB body + the four-byte header terminator.
+public constant MAX_RESPONSE = 1081348
+constant MAX_CHUNKS = 1024
+
+public record Response {
+    state: Integer
+    status: Integer
+    reason: Text
+    headers: List<Text>
+    body: Bytes
+    error: Text
+}
+
+function waiting(): Response {
+    return Response { state: WAITING; status: 0; reason: ""; headers: []; body: Bytes(); error: "" }
+}
+
+function failure(message: Text): Response {
+    return Response { state: FAILED; status: 0; reason: ""; headers: []; body: Bytes(); error: message }
+}
+
+function headerEnd(data: Bytes): Integer {
+    let index = 0
+    while index + 3 < data.length {
+        if data[index] == 13 && data[index + 1] == 10 && data[index + 2] == 13 && data[index + 3] == 10 { return index }
+        index += 1
+    }
+    return -1
+}
+
+function lowerText(value: Text): Text {
+    let parts: List<Text> = []
+    for character in value {
+        if character >= 'A' && character <= 'Z' { parts.add(Text(Character(Integer(character) + 32))) }
+        else { parts.add(Text(character)) }
+    }
+    return joinText(parts)
+}
+
+function decimalLength(value: Text): Integer {
+    if value.length == 0 { return -1 }
+    let result = 0
+    for character in value {
+        if character < '0' || character > '9' { return -1 }
+        let digit = Integer(character) - 48
+        if result > (MAX_BODY - digit) / 10 { return -1 }
+        result = result * 10 + digit
+    }
+    return result
+}
+
+function chunks(data: Bytes, start: Integer, status: Integer, reason: Text, headers: List<Text>): Response {
+    let body = Bytes()
+    let at = start
+    let count = 0
+    while true {
+        count += 1
+        if count > MAX_CHUNKS { return failure("too many HTTP chunks") }
+        let size = 0
+        let digits = 0
+        while at < data.length && data[at] != 13 {
+            let byte = data[at]
+            let value = -1
+            if byte >= 48 && byte <= 57 { value = byte - 48 }
+            if byte >= 97 && byte <= 102 { value = byte - 87 }
+            if byte >= 65 && byte <= 70 { value = byte - 55 }
+            if value < 0 { return failure("invalid HTTP chunk size") }
+            if size > (MAX_BODY - value) / 16 { return failure("the HTTP chunk is too large") }
+            size = size * 16 + value
+            digits += 1
+            at += 1
+        }
+        if at + 1 >= data.length { return waiting() }
+        if digits == 0 || data[at + 1] != 10 { return failure("invalid HTTP chunk line") }
+        at += 2
+        if size == 0 {
+            if at + 1 >= data.length { return waiting() }
+            if data[at] != 13 || data[at + 1] != 10 { return failure("unsupported HTTP chunk trailer") }
+            return Response { state: DONE; status: status; reason: reason; headers: headers; body: body; error: "" }
+        }
+        if size > MAX_BODY - body.length { return failure("the HTTP response body is too large") }
+        if at + size + 2 > data.length { return waiting() }
+        if data[at + size] != 13 || data[at + size + 1] != 10 { return failure("invalid HTTP chunk terminator") }
+        body.addBytes(data.slice(at, at + size))
+        at += size + 2
+    }
+}
+
+// WAITING means only that more bytes or a close signal are required.
+// FAILED contains a recoverable diagnostic; no unchecked conversion occurs.
+public function parse(data: Bytes, closed: Boolean): Response {
+    if data.length > MAX_RESPONSE { return failure("the HTTP response is too large") }
+    let end = headerEnd(data)
+    if end < 0 {
+        if data.length > MAX_HEADER { return failure("the HTTP response header is too large") }
+        return waiting()
+    }
+    if end > MAX_HEADER { return failure("the HTTP response header is too large") }
+    let rawHead = data.slice(0, end)
+    if !textTools.validUTF8(rawHead) { return failure("the HTTP response header is not UTF-8") }
+    let head = Text(rawHead)
+    let lines: List<Text> = []
+    let start = 0
+    for position in 0..head.length {
+        if head[position] == '\n' {
+            let stop = position
+            if stop > start && head[stop - 1] == '\r' { stop -= 1 }
+            lines.add(head.slice(start, stop))
+            start = position + 1
+        }
+    }
+    lines.add(head.slice(start, head.length))
+    let statusLine = lines[0]
+    if statusLine.length < 12 || !(statusLine.startsWith("HTTP/1.0") || statusLine.startsWith("HTTP/1.1")) ||
+       statusLine[8] != ' ' || statusLine[9] < '0' || statusLine[9] > '9' ||
+       statusLine[10] < '0' || statusLine[10] > '9' || statusLine[11] < '0' || statusLine[11] > '9' {
+        return failure("the HTTP response status is invalid")
+    }
+    let status = (Integer(statusLine[9]) - 48) * 100 + (Integer(statusLine[10]) - 48) * 10 + Integer(statusLine[11]) - 48
+    let reason = statusLine.slice(min(13, statusLine.length), statusLine.length)
+    let headers: List<Text> = []
+    let length = ""
+    let encoding = ""
+    for index in 1..lines.length {
+        let line = lines[index]
+        for character in line {
+            if Integer(character) < 32 && character != '\t' { return failure("the HTTP response header is invalid") }
+        }
+        let colon = line.find(":")
+        if colon <= 0 { return failure("the HTTP response header is invalid") }
+        let name = lowerText(line.slice(0, colon))
+        let value = line.slice(colon + 1, line.length).trim()
+        if name == "content-length" {
+            if length != "" || value == "" { return failure("invalid or duplicate HTTP Content-Length") }
+            length = value
+        }
+        if name == "transfer-encoding" {
+            if encoding != "" || value == "" { return failure("invalid or duplicate HTTP Transfer-Encoding") }
+            encoding = lowerText(value)
+        }
+        headers.add(line)
+    }
+    if length != "" && encoding != "" { return failure("conflicting HTTP response framing") }
+    let bodyStart = end + 4
+    if length != "" {
+        let expected = decimalLength(length)
+        if expected < 0 { return failure("invalid or oversized HTTP Content-Length") }
+        if data.length - bodyStart < expected { return waiting() }
+        return Response { state: DONE; status: status; reason: reason; headers: headers; body: data.slice(bodyStart, bodyStart + expected); error: "" }
+    }
+    if encoding == "chunked" { return chunks(data, bodyStart, status, reason, headers) }
+    if encoding != "" { return failure("unsupported HTTP Transfer-Encoding") }
+    if !closed { return waiting() }
+    if data.length - bodyStart > MAX_BODY { return failure("the HTTP response body is too large") }
+    return Response { state: DONE; status: status; reason: reason; headers: headers; body: data.slice(bodyStart, data.length); error: "" }
+}

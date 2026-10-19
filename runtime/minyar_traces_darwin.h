@@ -134,7 +134,7 @@ static MINYAR_COLD int minyar_cfi_process(MinyarCFIReader *reader, MinyarCFIRule
             case 5: reg = minyar_cfi_uleb(reader); value = minyar_cfi_uleb(reader); minyar_cfi_rule(rules, reg, 1, (int64_t)value * data_alignment); break;
             case 6: reg = minyar_cfi_uleb(reader); if (reg == 29) { rules->fp_kind = initial->fp_kind; rules->fp_offset = initial->fp_offset; } if (reg == 30) { rules->lr_kind = initial->lr_kind; rules->lr_offset = initial->lr_offset; } break;
             case 7: case 8: reg = minyar_cfi_uleb(reader); minyar_cfi_rule(rules, reg, code == 7 ? 2 : 0, 0); break;
-            case 9: reg = minyar_cfi_uleb(reader); value = minyar_cfi_uleb(reader); if (reg == 29 || reg == 30) return 0; break;
+            case 9: reg = minyar_cfi_uleb(reader); (void)minyar_cfi_uleb(reader); if (reg == 29 || reg == 30) return 0; break;
             case 10: {
                 if (depth == 16) return 0;
                 MinyarCFIRules saved; minyar_cfi_copy(&saved, rules);

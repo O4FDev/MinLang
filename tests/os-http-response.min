@@ -1,0 +1,52 @@
+use "../os/kernel/net/httpresponse.min" as response
+use "json" as json
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+
+let fixed = response.parse(Bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"), false)
+check(fixed.state == response.DONE && fixed.status == 200 && Text(fixed.body) == "hello", "bounded Content-Length response")
+
+let chunked = response.parse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), false)
+check(chunked.state == response.DONE && Text(chunked.body) == "Wikipedia", "bounded chunked response")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"), false).state == response.WAITING, "incomplete zero chunk waits")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n"), false).state == response.FAILED, "decimal length overflow is recoverable")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n\r\n"), false).state == response.FAILED, "body length above cap is rejected")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"), false).state == response.FAILED, "conflicting framing is rejected")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"), false).state == response.FAILED, "duplicate length is rejected")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8000000000000000\r\n"), false).state == response.FAILED, "hex length overflow is recoverable")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naXX"), false).state == response.FAILED, "chunk terminator is required")
+check(response.parse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"), false).state == response.FAILED, "unsupported framing is rejected")
+check(response.parse(Bytes("HTTP/1.1 X00 OK\r\n\r\n"), true).state == response.FAILED, "invalid status is rejected")
+
+let invalidHeader = Bytes("HTTP/1.1 200 OK\r\nX-Test: ")
+invalidHeader.add(255)
+invalidHeader.addBytes(Bytes("\r\n\r\n"))
+check(response.parse(invalidHeader, true).state == response.FAILED, "invalid UTF-8 header is recoverable")
+
+let invalidBody = Bytes("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+invalidBody.add(255)
+let bodyResponse = response.parse(invalidBody, false)
+check(bodyResponse.state == response.DONE && json.parseBytes(bodyResponse.body, response.MAX_BODY).kind == json.INVALID,
+    "body JSON validator rejects invalid UTF-8 without conversion")
+
+let longHeader = Bytes("HTTP/1.1 200 OK\r\nX-Test: ")
+for index in 0..response.MAX_HEADER { longHeader.add(97) }
+check(response.parse(longHeader, false).state == response.FAILED, "unterminated header has a cap")
+
+let closeBody = response.parse(Bytes("HTTP/1.0 200 OK\r\n\r\nhello"), true)
+check(closeBody.state == response.DONE && Text(closeBody.body) == "hello", "close-delimited response")
+
+// The parser must return a state for arbitrary short input, never stop the
+// process through a checked Bytes or Integer operation.
+let seed = 0x31415926
+for caseIndex in 0..500 {
+    let random = Bytes()
+    for byteIndex in 0..(caseIndex % 67) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        random.add(seed & 255)
+    }
+    let result = response.parse(random, caseIndex % 2 == 0)
+    check(result.state == response.WAITING || result.state == response.DONE || result.state == response.FAILED,
+        "arbitrary response bytes have a defined result")
+}
+print("OS HTTP response parser passed")

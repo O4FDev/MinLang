@@ -1,0 +1,224 @@
+// Pure validation for the small freestanding network stack. Keeping wire
+// parsing independent of devices and interrupts makes hostile inputs testable
+// with the hosted runtime as well as safe for the kernel to consume.
+
+public constant MAX_ARP_ENTRIES = 64
+public constant MAX_CONNECTION_INCOMING = 1114112
+public constant TERMINAL_CONNECTION_RETENTION = 30000
+
+constant ETHERNET_IPV4 = 0x0800
+constant ETHERNET_ARP = 0x0806
+
+function get16(data: Bytes, offset: Integer): Integer {
+    return (data[offset] << 8) | data[offset + 1]
+}
+
+function get32(data: Bytes, offset: Integer): Integer {
+    return (get16(data, offset) << 16) | get16(data, offset + 2)
+}
+
+public record Udp {
+    valid: Boolean
+    sourcePort: Integer
+    destinationPort: Integer
+    payload: Bytes
+}
+
+public function udp(packet: Bytes): Udp {
+    if packet.length < 8 {
+        return Udp { valid: false; sourcePort: 0; destinationPort: 0; payload: Bytes() }
+    }
+    let length = get16(packet, 4)
+    if length < 8 || length > packet.length {
+        return Udp { valid: false; sourcePort: 0; destinationPort: 0; payload: Bytes() }
+    }
+    return Udp {
+        valid: true
+        sourcePort: get16(packet, 0)
+        destinationPort: get16(packet, 2)
+        payload: packet.slice(8, length)
+    }
+}
+
+public record Dhcp {
+    valid: Boolean
+    offered: Integer
+    kind: Integer
+    mask: Integer
+    router: Integer
+    dns: Integer
+    server: Integer
+}
+
+function invalidDhcp(): Dhcp {
+    return Dhcp { valid: false; offered: 0; kind: 0; mask: 0; router: 0; dns: 0; server: 0 }
+}
+
+public function dhcp(message: Bytes, transaction: Integer): Dhcp {
+    if message.length < 241 || get32(message, 4) != transaction || get32(message, 236) != 0x63825363 {
+        return invalidDhcp()
+    }
+    let result = Dhcp {
+        valid: false; offered: get32(message, 16); kind: 0; mask: 0xFFFFFF00
+        router: 0; dns: 0; server: 0
+    }
+    let at = 240
+    while at < message.length {
+        let option = message[at]
+        if option == 255 {
+            result.valid = true
+            return result
+        }
+        if option == 0 {
+            at += 1
+        } else {
+            if at + 1 >= message.length { return invalidDhcp() }
+            let length = message[at + 1]
+            let value = at + 2
+            if length > message.length - value { return invalidDhcp() }
+            if option == 53 {
+                if length != 1 { return invalidDhcp() }
+                result.kind = message[value]
+            }
+            if option == 1 && length >= 4 { result.mask = get32(message, value) }
+            if option == 3 && length >= 4 { result.router = get32(message, value) }
+            if option == 6 && length >= 4 { result.dns = get32(message, value) }
+            if option == 54 && length >= 4 { result.server = get32(message, value) }
+            at = value + length
+        }
+    }
+    return invalidDhcp()
+}
+
+function skipDnsName(message: Bytes, start: Integer): Integer {
+    let at = start
+    while true {
+        if at >= message.length { return -1 }
+        let length = message[at]
+        if length == 0 { return at + 1 }
+        if (length & 0xC0) == 0xC0 {
+            if at + 1 >= message.length { return -1 }
+            let pointer = ((length & 0x3F) << 8) | message[at + 1]
+            if pointer >= message.length { return -1 }
+            return at + 2
+        }
+        if (length & 0xC0) != 0 || length > message.length - at - 1 { return -1 }
+        at += length + 1
+    }
+    return -1
+}
+
+public record Dns {
+    valid: Boolean
+    id: Integer
+    address: Integer
+}
+
+function invalidDns(): Dns {
+    return Dns { valid: false; id: 0; address: 0 }
+}
+
+public function dns(message: Bytes): Dns {
+    if message.length < 12 || get16(message, 4) != 1 || (get16(message, 2) & 0x800F) != 0x8000 {
+        return invalidDns()
+    }
+    let result = Dns { valid: false; id: get16(message, 0); address: 0 }
+    let at = skipDnsName(message, 12)
+    if at < 0 || at > message.length - 4 { return invalidDns() }
+    at += 4
+    let answers = get16(message, 6)
+    for answer in 0..answers {
+        at = skipDnsName(message, at)
+        if at < 0 || at > message.length - 10 { return invalidDns() }
+        let kind = get16(message, at)
+        let class = get16(message, at + 2)
+        let length = get16(message, at + 8)
+        let value = at + 10
+        if length > message.length - value { return invalidDns() }
+        if kind == 1 && class == 1 && length == 4 && result.address == 0 {
+            result.address = get32(message, value)
+        }
+        at = value + length
+    }
+    result.valid = true
+    return result
+}
+
+public record Arp {
+    valid: Boolean
+    operation: Integer
+    senderMac: Bytes
+    senderIp: Integer
+    targetIp: Integer
+}
+
+function invalidArp(): Arp {
+    return Arp { valid: false; operation: 0; senderMac: Bytes(); senderIp: 0; targetIp: 0 }
+}
+
+public function arp(frame: Bytes, localIp: Integer, configured: Boolean): Arp {
+    if !configured || frame.length < 42 || get16(frame, 12) != ETHERNET_ARP || get16(frame, 14) != 1 ||
+       get16(frame, 16) != ETHERNET_IPV4 || frame[18] != 6 || frame[19] != 4 {
+        return invalidArp()
+    }
+    let operation = get16(frame, 20)
+    let senderIp = get32(frame, 28)
+    let targetIp = get32(frame, 38)
+    if (operation != 1 && operation != 2) || senderIp == 0 || targetIp != localIp {
+        return invalidArp()
+    }
+    return Arp {
+        valid: true; operation: operation; senderMac: frame.slice(22, 28)
+        senderIp: senderIp; targetIp: targetIp
+    }
+}
+
+public function rememberArp(addresses: List<Integer>, macs: List<Bytes>, address: Integer, mac: Bytes, maximum: Integer): Boolean {
+    if maximum <= 0 || addresses.length != macs.length || mac.length != 6 { return false }
+    for index in 0..addresses.length {
+        if addresses[index] == address {
+            macs[index] = mac
+            return true
+        }
+    }
+    if addresses.length < maximum {
+        addresses.add(address)
+        macs.add(mac)
+        return true
+    }
+    for index in 1..addresses.length {
+        addresses[index - 1] = addresses[index]
+        macs[index - 1] = macs[index]
+    }
+    addresses[addresses.length - 1] = address
+    macs[macs.length - 1] = mac
+    return true
+}
+
+public function incomingFits(current: Integer, added: Integer): Boolean {
+    return current >= 0 && added >= 0 && current <= MAX_CONNECTION_INCOMING && added <= MAX_CONNECTION_INCOMING - current
+}
+
+public function retainConnection(terminal: Boolean, opened: Integer, now: Integer): Boolean {
+    return !terminal || now - opened < TERMINAL_CONNECTION_RETENTION
+}
+
+// Pure TCP acceptance checks shared by the hardware-bound receiver and hosted
+// regressions. Sequence arithmetic is modulo 2^32; live sends are bounded well
+// below half that space, so a wrapped distance outside the send range is stale.
+public function tcpAcknowledgesSyn(sendUnacked: Integer, acknowledgment: Integer, hasAcknowledgment: Boolean): Boolean {
+    return hasAcknowledgment && acknowledgment == ((sendUnacked + 1) & 0xFFFFFFFF)
+}
+
+public function tcpSequenceAccepted(receiveNext: Integer, sequence: Integer): Boolean {
+    return sequence == receiveNext
+}
+
+public function tcpAcknowledgmentAccepted(receiveNext: Integer, sequence: Integer, sendUnacked: Integer,
+                                          sent: Integer, finSent: Boolean, acknowledgment: Integer): Boolean {
+    if !tcpSequenceAccepted(receiveNext, sequence) { return false }
+    let advanced = (acknowledgment - sendUnacked) & 0xFFFFFFFF
+    let finExtra = 0
+    if finSent { finExtra = 1 }
+    return advanced > 0 && advanced <= sent + finExtra
+}

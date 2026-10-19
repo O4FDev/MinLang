@@ -159,7 +159,7 @@ void minyar_list_add_take(MinyarList *list, long long value) {
         list->values[list->length++] = value;
         return;
     }
-    kind = list_store_kind(list, value, kind);
+    list_store_kind(list, value, kind);
 #endif
     list->values[list->length++] = value;
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)

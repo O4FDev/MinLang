@@ -17,6 +17,12 @@ use "json" as json
 constant IDLE = 0
 constant MOVING = 1
 constant ATACAMA = 2
+constant MAX_JSON_VALUES = 16384
+constant MAX_JSON_MEMBERS = 2048
+
+function responseJSON(body: Bytes): json.Value {
+    return json.parseUniqueBytesWithin(body, http.MAX_BODY, MAX_JSON_VALUES, MAX_JSON_MEMBERS)
+}
 
 public record Settings {
     host: Text
@@ -506,7 +512,7 @@ function atacama(application: state.App, agent: Agent, network: stack.Network) {
     }
     let status = http.poll(network, request)
     if agent.phase == 2 && status >= http.DONE {
-        let found = json.parse(http.decode(request.body, 0, request.body.length))
+        let found = responseJSON(request.body)
         let pages = json.member(found, "pages")
         if status == http.FAILED || pages.kind != json.ARRAY || pages.items.length == 0 {
             let reason = "found nothing"
@@ -531,7 +537,7 @@ function atacama(application: state.App, agent: Agent, network: stack.Network) {
         return
     }
     if agent.phase == 3 && status >= http.DONE {
-        let article = json.parse(http.decode(request.body, 0, request.body.length))
+        let article = responseJSON(request.body)
         if status == http.FAILED || json.string(article, "extract") == "" {
             nextStep(application, agent, "Could not open " + agent.answer, "Asking Atacama")
             askAtacama(application, agent, network)
@@ -591,14 +597,17 @@ function answerAtacama(application: state.App, agent: Agent, network: stack.Netw
     }
     if status != http.DONE { return }
     let seconds = Float(request.finished - request.started) / 1000.0
-    let body = http.decode(request.body, 0, request.body.length)
     removeLast(application)
     if request.status == 429 && agent.attempts < 4 {
         // Atacama answers one question at a time; try again.
         askAtacama(application, agent, network)
         return
     }
-    let parsed = json.parse(body)
+    let parsed = responseJSON(request.body)
+    if parsed.kind == json.INVALID {
+        failAtacama(application, agent, "Atacama returned invalid JSON")
+        return
+    }
     let current = application.panel
     current.response = "HTTP " + Text(request.status) + " " + request.reason + " in " + Text(Integer(seconds * 1000.0)) + " ms · " + json.pretty(parsed, "")
     if current.articleTitle == "" {
@@ -729,8 +738,18 @@ function pollHealth(application: state.App, agent: Agent, network: stack.Network
     let request = agent.requests[0]
     let status = http.poll(network, request)
     if status == http.DONE {
-        let parsed = json.parse(http.decode(request.body, 0, request.body.length))
+        let parsed = responseJSON(request.body)
+        if parsed.kind == json.INVALID {
+            agent.health = "not reachable (invalid JSON)"
+            agent.requests = []
+            return
+        }
         let parameters = json.member(parsed, "parameters")
+        if parameters.kind != json.NUMBER || !(parameters.number >= 0.0 && parameters.number <= 1000000000000.0) {
+            agent.health = "not reachable (invalid parameter count)"
+            agent.requests = []
+            return
+        }
         let millions = Integer(parameters.number / 100000.0)
         agent.health = json.string(parsed, "checkpoint") + " · " + Text(millions / 10) + "." + Text(millions % 10) + "M parameters"
         agent.requests = []

@@ -36,6 +36,7 @@ _Static_assert(_Alignof(max_align_t) <= 16,
 static RcSystemPage *rc_system_available[RC_SYSTEM_SIZE_CLASSES];
 
 static inline void rc_system_unlink(RcSystemPage *page) {
+    if (!page->link) abort(); /* An unlinked page must never be removed twice. */
     *page->link = page->next;
     if (page->next) page->next->link = page->link;
     page->link = NULL;

@@ -38,8 +38,11 @@ function waitWhileBusy(channel: Channel): Integer {
 // Read `count` sectors (at most 256) starting at `sector` onto the end of `into`.
 public function read(sector: Integer, count: Integer, into: Bytes) {
     if count <= 0 { return }
+    if count > 256 || sector < 0 || sector > 0x0FFFFFFF - (count - 1) {
+        fail("ATA read is outside the 28-bit address or 256-sector command limit")
+    }
     let channel = primary()
-    waitWhileBusy(channel)
+    if (waitWhileBusy(channel) & BUSY) != 0 { fail("ATA controller stayed busy before reading") }
     device.out8(channel.drive, 0xE0 | ((sector >> 24) & 0x0F))
     device.out8(channel.sectorCount, count & 0xFF)
     device.out8(channel.lbaLow, sector & 0xFF)
@@ -52,8 +55,13 @@ public function read(sector: Integer, count: Integer, into: Bytes) {
         // The status register is valid 400 ns after the command.
         for settle in 0..4 { device.in8(channel.alternateStatus) }
         let status = waitWhileBusy(channel)
-        while (status & (READY_FOR_DATA | ERROR)) == 0 {
+        let spins = 0
+        while (status & (READY_FOR_DATA | ERROR)) == 0 && spins < 10000000 {
             status = device.in8(channel.command)
+            spins += 1
+        }
+        if (status & BUSY) != 0 || (status & (READY_FOR_DATA | ERROR)) == 0 {
+            fail("ATA controller timed out reading sector " + Text(sector + index))
         }
         if (status & ERROR) != 0 {
             fail("the disk reported an error reading sector " + Text(sector + index))
@@ -64,6 +72,9 @@ public function read(sector: Integer, count: Integer, into: Bytes) {
 
 // Read any number of sectors, 128 at a time.
 public function readMany(sector: Integer, count: Integer): Bytes {
+    if count > 0 && (sector < 0 || sector > 0x0FFFFFFF || count - 1 > 0x0FFFFFFF - sector) {
+        fail("ATA read is outside the 28-bit address limit")
+    }
     let result = Bytes()
     let done = 0
     while done < count {

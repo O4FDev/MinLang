@@ -42,13 +42,43 @@ int main(int argc, char **argv) {
     char path[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-ranges-XXXXXX");
     int fd = mkstemp(path); assert(fd >= 0); unlink(path);
     assert(write(fd, "abcdef", 6) == 6);
-    if (!strcmp(argv[1], "huge")) expect(fd, 2, 1LL<<40, "cdef", 0);
+    if (!strcmp(argv[1], "huge")) {
+        expect(fd, 2, 1LL<<40, "cdef", 0);
+        MinyarBytes *b = minyar_bytes_new(2); memcpy((void *)b->bytes, "xy", 2);
+        assert(minyar_files_readAppend(fd, 2, b, 1LL<<40) == 4);
+        assert(!minyar_files_lastError() && b->byte_length == 6 && !memcmp(b->bytes, "xycdef", 6));
+        minyar_rc_release(b);
+    }
     else if (!strcmp(argv[1], "invalid")) {
         expect(-1, 0, 1, "", -EBADF); expect((long long)INT_MAX+1, 0, 0, "", -EBADF);
+        assert(files_valid_utf8((const unsigned char *)"plain", 5));
+        assert(files_valid_utf8((const unsigned char *)"\xc3\xa9\xe2\x82\xac\xf0\x9f\x8c\x8d", 9));
+        assert(!files_valid_utf8((const unsigned char *)"\xff", 1));
+        assert(!files_valid_utf8((const unsigned char *)"\xc0\xaf", 2));
+        assert(!files_valid_utf8((const unsigned char *)"\xed\xa0\x80", 3));
+        assert(!files_valid_utf8((const unsigned char *)"\xf4\x90\x80\x80", 4));
+        assert(!files_valid_utf8((const unsigned char *)"\xe2\x82", 2));
+#ifdef __linux__
+        char directory[PATH_MAX]; files_test_path(directory,sizeof(directory),"minyar-invalid-names-XXXXXX");
+        assert(mkdtemp(directory));
+        char entry[PATH_MAX]; size_t prefix = strlen(directory);
+        assert(prefix + 3 < sizeof(entry));
+        memcpy(entry, directory, prefix); entry[prefix] = '/'; entry[prefix+1] = (char)0xff; entry[prefix+2] = 0;
+        int bad = open(entry, O_WRONLY | O_CREAT | O_EXCL, 0600); assert(bad >= 0); close(bad);
+        MinyarText dirtext = {(const unsigned char *)directory, (long long)prefix, 0, NULL, NULL};
+        MinyarBytes *names = minyar_files_listNames(&dirtext);
+        assert(names->byte_length == 0 && minyar_files_lastError() == -EILSEQ);
+        minyar_rc_release(names); assert(!unlink(entry) && !rmdir(directory));
+#endif
         close(fd); expect(fd, 0, 0, "", -EBADF); expect(fd, 0, 1LL<<40, "", -EBADF); return 0;
     } else if (!strcmp(argv[1], "pseudo")) {
         assert(!ftruncate(fd, 0)); pseudo = 1;
         expect(fd, 0, 1LL<<40, "pseudo-data", 0); assert(calls >= 7);
+        MinyarBytes *b = minyar_bytes_new(2); memcpy((void *)b->bytes, "xy", 2);
+        calls = 0;
+        assert(minyar_files_readAppend(fd, 0, b, 1LL<<40) == 11);
+        assert(!minyar_files_lastError() && b->byte_length == 13 && !memcmp(b->bytes, "xypseudo-data", 13));
+        minyar_rc_release(b);
     } else if (!strcmp(argv[1], "large")) {
         long long offset = (1LL<<32)+123;
         assert(pwrite(fd, "large", 5, (off_t)offset) == 5);
@@ -60,9 +90,19 @@ int main(int argc, char **argv) {
         expect(fd, LLONG_MAX-1, 3, "", -EOVERFLOW);
         expect(fd, 0, -1, "", -EINVAL);
         expect(fd, 0, LLONG_MAX, "", -EOVERFLOW);
+        MinyarBytes *b = minyar_bytes_new(2); memcpy((void *)b->bytes, "xy", 2);
+        long long capacity = b->character_length;
+        assert(minyar_files_readAppend(fd, 6, b, 1LL<<40) == 0);
+        assert(!minyar_files_lastError() && b->byte_length == 2 && b->character_length == capacity);
+        assert(!memcmp(b->bytes, "xy", 2)); minyar_rc_release(b);
     } else if (!strcmp(argv[1], "partial-error")) {
         pseudo = partial_failure = 1;
         expect(fd, 0, 64, "", -EIO);
+        MinyarBytes *b = minyar_bytes_new(2); memcpy((void *)b->bytes, "xy", 2);
+        calls = 0;
+        assert(minyar_files_readAppend(fd, 0, b, 64) == -EIO);
+        assert(minyar_files_lastError() == -EIO && b->byte_length == 2 && !memcmp(b->bytes, "xy", 2));
+        minyar_rc_release(b);
         pseudo = 0; expect(fd, 0, 6, "abcdef", 0);
     } else if (!strcmp(argv[1], "read-file")) {
         char pathname[PATH_MAX]; files_test_path(pathname,sizeof(pathname),"minyar-ranges-path-XXXXXX");

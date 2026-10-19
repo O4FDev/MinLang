@@ -1,5 +1,6 @@
 use "system" as system
 use "files" as files
+use "text" as textCodec
 
 function hostNameNative(): Text { native "driverhost" }
 public function hostMachine(): Text { native "driverhost" }
@@ -12,6 +13,7 @@ public function makeDirectory(path: Text): Integer { native "driverhost" }
 public function guard(enabled: Boolean): Integer { native "driverhost" }
 public function pendingSignal(): Integer { native "driverhost" }
 function execute(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer): Integer { native "driverhost" }
+function executeBoundedErrors(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer, errorLimit: Integer): Integer { native "driverhost" }
 public function hashBytes(data: Bytes): Text { native "driverhost" }
 function hashFileNative(path: Text): Text { native "driverhost" }
 public function errorText(code: Integer): Text { native "driverhost" }
@@ -31,9 +33,30 @@ public function hostName(): Text {
     return selected
 }
 public function cleanup() { cleanupTemporaries() }
+function terminalControl(code: Integer): Boolean {
+    return code < 32 || (code >= 127 && code <= 159) || code == 1564 || code == 8206 || code == 8207 || code == 8232 || code == 8233 || (code >= 8234 && code <= 8238) || (code >= 8294 && code <= 8297)
+}
+public function terminalText(text: Text): Text {
+    let pieces: List<Text> = []
+    let hex = "0123456789abcdef"
+    let start = 0
+    let position = 0
+    while position < text.length {
+        let character = text[position]
+        let code = Integer(character)
+        if terminalControl(code) {
+            if start < position { pieces.add(text.slice(start, position)) }
+            pieces.add("\\u{" + Text(hex[code / 4096]) + Text(hex[code / 256 % 16]) + Text(hex[code / 16 % 16]) + Text(hex[code % 16]) + "}")
+            start = position + 1
+        }
+        position += 1
+    }
+    if start < position { pieces.add(text.slice(start, position)) }
+    return joinText(pieces)
+}
 public function stop(message: Text) {
     cleanup()
-    system.writeStandardError("minyar: " + message + "\n")
+    system.writeStandardError("minyar: " + terminalText(message) + "\n")
     exit(1)
 }
 public function leave(status: Integer) {
@@ -504,6 +527,67 @@ public function capture(command: List<Text>, seconds: Integer): Captured {
     let directory = captureDirectory()
     let status = spawn(command, [], true, directory + "/stdout", directory + "/stderr", seconds)
     return Captured { status: status; output: readText(directory + "/stdout"); errors: readText(directory + "/stderr") }
+}
+function structuredDiagnostics(command: List<Text>): Boolean {
+    let next = false
+    for argument in command {
+        let format = ""
+        if next { format = argument; next = false }
+        if argument == "-fdiagnostics-format" { next = true }
+        else if argument.startsWith("-fdiagnostics-format=") { format = textAfter(argument, "-fdiagnostics-format=") }
+        if format == "json" || format == "sarif" || format == "sarif-stable" { return true }
+    }
+    return false
+}
+function capturedDiagnostic(path: Text): Bytes {
+    let size = files.pathSize(path)
+    if size < 0 { stop(osError(size, path)) }
+    let length = min(size, 1048576)
+    let file = files.open(path, files.READ)
+    if file < 0 { stop(osError(file, path)) }
+    let data = files.readAt(file, 0, length)
+    let readError = files.lastError()
+    let closeError = files.close(file)
+    if readError < 0 { stop(osError(readError, path)) }
+    if closeError < 0 { stop(osError(closeError, path)) }
+    if size > length { data.addBytes(Bytes("\n[diagnostic truncated after 1048576 bytes]")) }
+    return data
+}
+function terminalDiagnostic(data: Bytes): Text {
+    if textCodec.validUTF8(data) { return terminalText(Text(data)) }
+    let escaped = Bytes()
+    let hex = Bytes("0123456789abcdef")
+    for byte in data {
+        if byte >= 32 && byte <= 126 { escaped.add(byte) }
+        else {
+            escaped.addBytes(Bytes("\\x"))
+            escaped.add(hex[byte / 16])
+            escaped.add(hex[byte % 16])
+        }
+    }
+    return Text(escaped)
+}
+public function spawnWithTerminalDiagnostics(command: List<Text>): Integer {
+    if structuredDiagnostics(command) { return spawn(command, [], true, "", "", 0) }
+    let directory = captureDirectory()
+    let errors = directory + "/terminal-stderr"
+    let environment: List<Text> = []
+    let status = executeBoundedErrors(vector(command), vector(environment), true, "", errors, 0, 1048577)
+    if status < 0 && status > TIMED_OUT { stop(osError(status, command[0])) }
+    let diagnostic = capturedDiagnostic(errors)
+    if diagnostic.length > 0 {
+        let framed = diagnostic
+        let newline = framed[framed.length - 1] == 10
+        if newline { framed = framed.slice(0, framed.length - 1) }
+        system.writeStandardError(terminalDiagnostic(framed))
+        if newline { system.writeStandardError("\n") }
+    }
+    return status
+}
+public function runWithTerminalDiagnostics(command: List<Text>) {
+    let status = spawnWithTerminalDiagnostics(command)
+    if status <= INTERRUPTED { leave(128 + INTERRUPTED - status) }
+    if status != 0 { leave(status) }
 }
 public function captureOutput(command: List<Text>, seconds: Integer): Text {
     let result = capture(command, seconds)

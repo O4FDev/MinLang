@@ -33,6 +33,8 @@ record Cursor {
     position: Integer
     error: Text
     strict: Boolean
+    remainingValues: Integer
+    maximumMembers: Integer
 }
 
 function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
@@ -57,7 +59,11 @@ public function parse(source: Text): Value {
 }
 
 function parseText(source: Text, strict: Boolean): Value {
-    let cursor = Cursor { text: source; position: 0; error: ""; strict: strict }
+    return parseTextWithin(source, strict, -1, -1)
+}
+
+function parseTextWithin(source: Text, strict: Boolean, maximumValues: Integer, maximumMembers: Integer): Value {
+    let cursor = Cursor { text: source; position: 0; error: ""; strict: strict; remainingValues: maximumValues; maximumMembers: maximumMembers }
     let value = parseValue(cursor, 0)
     skipSpace(cursor)
     if cursor.error == "" && cursor.position != source.length {
@@ -113,24 +119,13 @@ function validUTF8(source: Bytes): Boolean {
     return true
 }
 
-record UniqueCheck {
-    remaining: Integer
-    members: Integer
-    error: Text
-}
-
 // Bounded authentication metadata: duplicate decoded names are ambiguous.
 // Limits are 64 Ki characters, 4096 values and 256 members per object.
 // parse() keeps its ordinary JSON duplicate-name policy.
 /// Read JSON while rejecting duplicate object member names, including nested objects.
 public function parseUnique(source: Text): Value {
     if source.length > 65536 { return leaf(INVALID, "JSON metadata limit exceeded", 0.0, false) }
-    let value = parseText(source, true)
-    if value.kind == INVALID { return value }
-    let check = UniqueCheck { remaining: 4096; members: 256; error: "" }
-    uniqueNames(value, check)
-    if check.error != "" { return leaf(INVALID, check.error, 0.0, false) }
-    return value
+    return parseTextWithin(source, true, 4096, 256)
 }
 
 // Network metadata validates bytes before Text conversion, decoded names and
@@ -151,30 +146,7 @@ public function parseUniqueBytesWithin(source: Bytes, maximumBytes: Integer, max
     if maximumBytes <= 0 || maximumValues <= 0 || maximumMembers <= 0 { return leaf(INVALID, "invalid JSON metadata limits", 0.0, false) }
     if source.length > maximumBytes { return leaf(INVALID, "JSON metadata byte limit exceeded", 0.0, false) }
     if !validUTF8(source) { return leaf(INVALID, "invalid JSON UTF-8", 0.0, false) }
-    let value = parseText(Text(source), true)
-    if value.kind == INVALID { return value }
-    let check = UniqueCheck { remaining: maximumValues; members: maximumMembers; error: "" }
-    uniqueNames(value, check)
-    if check.error != "" { return leaf(INVALID, check.error, 0.0, false) }
-    return value
-}
-
-function uniqueNames(value: Value, check: UniqueCheck) {
-    if check.error != "" { return }
-    check.remaining -= 1
-    if check.remaining < 0 { check.error = "JSON metadata value limit exceeded"; return }
-    if value.kind == OBJECT {
-        if value.keys.length > check.members { check.error = "JSON metadata member limit exceeded"; return }
-        for index in 0..value.keys.length {
-            for earlier in 0..index {
-                if value.keys[earlier] == value.keys[index] {
-                    check.error = "duplicate JSON member"
-                    return
-                }
-            }
-        }
-    }
-    for child in value.items { uniqueNames(child, check) }
+    return parseTextWithin(Text(source), true, maximumValues, maximumMembers)
 }
 
 function skipSpace(cursor: Cursor) {
@@ -193,6 +165,14 @@ function failure(cursor: Cursor, message: Text): Value {
     return leaf(INVALID, cursor.error, 0.0, false)
 }
 
+// Policy failures keep the existing stable diagnostics without a source
+// position. They stop parsing before another bounded node is allocated.
+function policyFailure(cursor: Cursor, message: Text): Value {
+    if cursor.error == "" { cursor.error = message }
+    cursor.position = cursor.text.length
+    return leaf(INVALID, cursor.error, 0.0, false)
+}
+
 function literal(cursor: Cursor, word: Text): Boolean {
     let end = cursor.position + word.length
     if end > cursor.text.length || cursor.text.slice(cursor.position, end) != word { return false }
@@ -201,6 +181,8 @@ function literal(cursor: Cursor, word: Text): Boolean {
 }
 
 function parseValue(cursor: Cursor, depth: Integer): Value {
+    if cursor.remainingValues == 0 { return policyFailure(cursor, "JSON metadata value limit exceeded") }
+    if cursor.remainingValues > 0 { cursor.remainingValues -= 1 }
     skipSpace(cursor)
     if depth > 64 { return failure(cursor, "nesting too deep") }
     if cursor.position >= cursor.text.length { return failure(cursor, "unexpected end") }
@@ -214,6 +196,18 @@ function parseValue(cursor: Cursor, depth: Integer): Value {
     return parseNumber(cursor)
 }
 
+function parsedObject(cursor: Cursor, keys: List<Text>, items: List<Value>): Value {
+    if cursor.strict && keys.length > 1 {
+        let ordered: List<Text> = []
+        for key in keys { ordered.add(key) }
+        ordered.sort()
+        for index in 1..ordered.length {
+            if ordered[index - 1] == ordered[index] { return policyFailure(cursor, "duplicate JSON member") }
+        }
+    }
+    return Value { kind: OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+}
+
 function parseObject(cursor: Cursor, depth: Integer): Value {
     cursor.position += 1
     let keys: List<Text> = []
@@ -221,9 +215,10 @@ function parseObject(cursor: Cursor, depth: Integer): Value {
     skipSpace(cursor)
     if cursor.position < cursor.text.length && cursor.text[cursor.position] == '}' {
         cursor.position += 1
-        return Value { kind: OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+        return parsedObject(cursor, keys, items)
     }
     while cursor.error == "" {
+        if cursor.maximumMembers >= 0 && keys.length >= cursor.maximumMembers { return policyFailure(cursor, "JSON metadata member limit exceeded") }
         skipSpace(cursor)
         if cursor.position >= cursor.text.length || cursor.text[cursor.position] != '"' {
             return failure(cursor, "expected a member name")
@@ -240,7 +235,7 @@ function parseObject(cursor: Cursor, depth: Integer): Value {
         let c = cursor.text[cursor.position]
         cursor.position += 1
         if c == '}' {
-            return Value { kind: OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+            return parsedObject(cursor, keys, items)
         }
         if c != ',' { return failure(cursor, "expected ',' or '}'") }
     }
@@ -416,6 +411,7 @@ function parseNumber(cursor: Cursor): Value {
     }
     if digits == 0 { return failure(cursor, "unexpected character") }
     if negative { value = -value }
+    if value != value || value - value != 0.0 { return failure(cursor, "number is not finite") }
     return leaf(NUMBER, text.slice(start, cursor.position), value, false)
 }
 

@@ -115,6 +115,12 @@ function registryID(registry: Registry, device: Text): Integer {
     if index >= 0 && registry.entries[index].device == device { return index }
     return -1
 }
+function trustedGateway(registry: Registry, certificate: Bytes): Boolean {
+    if !registry.valid || certificate.length < 1 { return false }
+    let fingerprint = crypto.hex(crypto.sha256(certificate))
+    for expected in registry.gateways { if expected == fingerprint { return true } }
+    return false
+}
 record Address { host: Text; port: Integer }
 record InputStream { id: Integer; decoder: wire.Decoder; held: wire.FrameResult; blocked: Boolean; ended: Boolean }
 record Peer {
@@ -606,9 +612,7 @@ function peerTick(core: Core, id: Integer) {
             }
         }
         if peer.gateway.state == tls.ESTABLISHED && !peer.bound {
-            let fingerprint = crypto.hex(crypto.sha256(peer.gateway.peerCertificate)); let trusted = false
-            for expected in core.registry.gateways { if expected == fingerprint { trusted = true } }
-            if !peer.gateway.authenticated || !peer.gateway.requireClient || !trusted { drop(core,id); return }
+            if !peer.gateway.authenticated || !peer.gateway.requireClient || !trustedGateway(core.registry,peer.gateway.peerCertificate) { drop(core,id); return }
             peer.bound = true; peer.heartbeatAt = core.now
         }
         if peer.gateway.state == tls.FAILED || peer.gateway.state == tls.CLOSED { drop(core,id); return }
@@ -772,10 +776,14 @@ function refresh(core: Core) {
         core.registry = registry(io.readBytesFile(core.config.registry),core.config.maximum); core.registryAt = core.now + 15000
         for index in 0..core.peers.length {
             let peer = core.peers[index]
-            if peer.live && peer.bound && peer.mode != 2 {
-                let at = registryID(core.registry,peer.device)
-                if at < 0 || core.registry.entries[at].revoked || core.registry.entries[at].exit != peer.exit { drop(core,index) }
-                else { peer.publicationPending = live.ok(peer.health); mark(core,index) }
+            if peer.live && peer.bound {
+                if peer.mode == 2 {
+                    if !trustedGateway(core.registry,peer.gateway.peerCertificate) { drop(core,index) }
+                } else {
+                    let at = registryID(core.registry,peer.device)
+                    if at < 0 || core.registry.entries[at].revoked || core.registry.entries[at].exit != peer.exit { drop(core,index) }
+                    else { peer.publicationPending = live.ok(peer.health); mark(core,index) }
+                }
             }
         }
     }

@@ -1,0 +1,43 @@
+name: Security static analysis
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-static-analysis:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify vendored source fingerprints
+        run: shasum -a 256 -c vendor/SHA256SUMS
+      - name: Select pinned LLVM 23.1.2
+        run: |
+          test "$(uname -m)" = arm64
+          archive="$RUNNER_TEMP/LLVM-23.1.2-macOS-ARM64.tar.xz"
+          llvm_prefix="$RUNNER_TEMP/minyar-llvm-23.1.2"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-macOS-ARM64.tar.xz -o "$archive"
+          printf '%s  %s\n' d7c26fc6177e42842e2d1ffaad31aec057c56a924392b1a23d830abe2c5d53b1 "$archive" | shasum -a 256 --check
+          mkdir -p "$llvm_prefix"
+          tar -xJf "$archive" -C "$llvm_prefix" --strip-components=1
+          for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=$llvm_prefix/bin/clang" >> "$GITHUB_ENV"; done
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Analyze native security boundaries
+        run: sh scripts/security-static-analysis.sh
+      - name: Compile both freestanding OS variants
+        run: make -j1 LIMITED= SANITIZER_LIMITED= check-security-os
+      - name: Exercise the OS response parser with hostile input
+        run: make -j1 LIMITED= SANITIZER_LIMITED= check-security-os-http check-security-os-http-sanitize
+      - name: Exercise the OS packet parser with hostile input
+        run: make -j1 LIMITED= SANITIZER_LIMITED= check-os-net-stack check-os-net-stack-sanitize

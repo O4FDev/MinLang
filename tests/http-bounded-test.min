@@ -19,17 +19,21 @@ function requests(peer: Peer): List<Text> {
     peer.seen = lines.length - 1
     return result
 }
-function compile(context: fixtures.Context, source: Text, name: Text, label: Text): Text {
+function compiled(context: fixtures.Context, source: Text, name: Text, label: Text, portable: Boolean): Text {
     let path = context.work + "/" + name + ".min"
     io.writeTextFile(path, test.sourceModules(source))
     let binary = context.work + "/" + name
     let environment = fixtures.withSetting(fixtures.withSetting(context.environment, "LIMITED", ""), "SANITIZER_LIMITED", "")
     let artifacts = fixtures.value(environment, "MINYAR_LINK_ARTIFACTS")
     if artifacts != "" { environment = fixtures.withSetting(environment, "MINYAR_LINK_ARTIFACTS", artifacts + "/" + label) }
-    let result = test.run([context.root + "/minyar", "--library", context.root + "/library", path, "-o", binary], environment, "", fixtures.logPath(context, "compile"), 600)
+    let command = [context.root + "/minyar"]
+    if portable { command.add("--library"); command.add(context.root + "/library") }
+    command.add(path); command.add("-o"); command.add(binary)
+    let result = test.run(command, environment, "", fixtures.logPath(context, "compile"), 600)
     test.check(result.status == 0, "compile " + name + "\n" + result.output + result.errorOutput)
     return binary
 }
+function compile(context: fixtures.Context, source: Text, name: Text, label: Text): Text { return compiled(context, source, name, label, true) }
 function request(context: fixtures.Context, binary: Text, arguments: List<Text>): Text {
     let command = [binary]
     for item in arguments { command.add(item) }
@@ -39,36 +43,58 @@ function request(context: fixtures.Context, binary: Text, arguments: List<Text>)
 }
 
 let family = ["BoundedHTTP", "HTTPAuthority"]
-let names = ["test_small_response_succeeds_and_over_limit_response_is_recoverable", "test_numeric_literal_classification_uses_strict_ip_syntax",
-    "test_literal_hosts_preserve_wire_authority_and_request_target", "test_malformed_authorities_are_recoverable_and_send_no_request"]
+let names = ["test_small_response_succeeds_and_over_limit_response_is_recoverable", "test_request_method_headers_and_framing_fields_are_validated_before_connect",
+    "test_numeric_literal_classification_uses_strict_ip_syntax", "test_literal_hosts_preserve_wire_authority_and_request_target", "test_malformed_authorities_are_recoverable_and_send_no_request"]
 let selectors: List<Text> = []
+let sanitize = false
 for index in 0..processInfo.argumentCount() {
     let item = processInfo.argument(index)
+    if item == "--sanitize" { sanitize = true; continue }
     if item == "-v" || item == "--verbose" || item == "-q" || item == "--quiet" { continue }
     let known = item == family[0] || item == family[1]
     for position in 0..names.length {
         let owner = family[0]
-        if position > 0 { owner = family[1] }
+        if position > 1 { owner = family[1] }
         if item == names[position] || item == owner + "." + names[position] { known = true }
     }
     test.check(known, "unknown selector: " + item)
     selectors.add(item)
 }
-let context = fixtures.context(false)
+let context = fixtures.context(sanitize)
 let peerBinary = fixtures.helper(context, "tests/http-peer.c", "http-peer", "")
 if fixtures.selected(selectors, family[0], names[0]) {
     let peer = start(context, peerBinary, "4")
-    let binary = compile(context, "use \"http\" as http\nlet base = \"http://127.0.0.1:" + Text(peer.port) + "\"\nlet small = http.getBounded(base + \"/small\", [], 4)\nprint(small.status); print(Text(small.body))\nlet huge = http.getBounded(base + \"/huge\", [], 32)\nprint(huge.status); print(huge.body.length); print(huge.error != \"\")\nlet drip = http.getBoundedWithin(base + \"/drip\", [], 4, 60)\nprint(drip.status); print(drip.error != \"\")\nprint(\"still alive\")\n", "test", "bounded")
+    let binary = compile(context, "use \"http\" as http\nlet base = \"http://127.0.0.1:" + Text(peer.port) + "\"\nlet small = http.getBounded(base + \"/small\", [], 4)\nprint(small.status); print(Text(small.body))\nlet head = http.requestBoundedWithin(\"HEAD\", base + \"/small\", [], \"\", 1, 500)\nprint(head.status); print(head.body.length); print(head.error != \"\")\nlet huge = http.getBounded(base + \"/huge\", [], 32)\nprint(huge.status); print(huge.body.length); print(huge.error != \"\")\nlet ordinary = http.get(base + \"/huge\", [])\nprint(ordinary.status); print(ordinary.body.length); print(ordinary.error != \"\")\nlet drip = http.getBoundedWithin(base + \"/drip\", [], 4, 60)\nprint(drip.status); print(drip.error != \"\")\nlet posted = http.requestBoundedWithin(\"POST\", base + \"/small\", [\"X-Test: a:b\"], \"body\", 4, 500)\nprint(posted.status); print(Text(posted.body)); print(posted.error != \"\")\nprint(\"still alive\")\n", "test", "bounded")
     let result = fixtures.run(context, [binary], 10)
-    test.check(result.status == 0 && result.output == "200\ngood\n0\n0\ntrue\n0\ntrue\nstill alive\n" && result.errorOutput == "", "bounded HTTP (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    test.check(result.status == 0 && result.output == "200\ngood\n200\n0\nfalse\n0\n0\ntrue\n0\n0\ntrue\n0\ntrue\n200\ngood\nfalse\nstill alive\n" && result.errorOutput == "", "bounded HTTP (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Darwin" {
+        let serverBinary = compiled(context, io.readTextFile(context.root + "/tests/httpserver.min"), "macos-bodyless-server", "macos-bodyless-server", false)
+        let server = fixtures.launch(context, [serverBinary], 120)
+        let serverPort = fixtures.number(fixtures.firstLine(context, server, 5000))
+        let platform = compiled(context, "use \"http\" as http\nlet head = http.requestBoundedWithin(\"HEAD\", \"http://127.0.0.1:" + Text(peer.port) + "/small\", [], \"\", 1, 500)\nprint(head.status); print(head.body.length); print(head.error != \"\")\nlet base = \"http://127.0.0.1:" + Text(serverPort) + "\"\nlet notModified = http.getBoundedWithin(base + \"/304\", [], 1, 500)\nprint(notModified.status); print(notModified.body.length); print(notModified.error != \"\")\nlet quit = http.getBoundedWithin(base + \"/quit\", [], 1, 500)\nprint(quit.status)\n", "macos-bodyless", "macos-bodyless", false)
+        let bodyless = fixtures.run(context, [platform], 10)
+        test.check(bodyless.status == 0 && bodyless.output == "200\n0\nfalse\n304\n0\nfalse\n200\n" && bodyless.errorOutput == "", "bounded macOS bodyless responses (" + Text(bodyless.status) + ")\n" + bodyless.output + bodyless.errorOutput)
+        let serverResult = fixtures.collect(server)
+        test.check(serverResult.status == 0 && serverResult.errorOutput == "", "macOS bodyless server (" + Text(serverResult.status) + ")\n" + serverResult.output + serverResult.errorOutput)
+    }
     fixtures.stop(peer.process)
 }
-let authority = fixtures.selected(selectors, family[1], names[1]) || fixtures.selected(selectors, family[1], names[2]) || fixtures.selected(selectors, family[1], names[3])
+if fixtures.selected(selectors, family[0], names[1]) {
+    let peer = start(context, peerBinary, "4")
+    let binary = compile(context, "use \"http\" as http\nfunction result(response: http.Response) { print(Text(response.status) + \" \" + Text(response.error != \"\")) }\nlet base = \"http://127.0.0.1:" + Text(peer.port) + "/small\"\nlet lines = Text(Character(13)) + Text(Character(10))\nresult(http.request(\"GET\" + lines + \"X-Injected: yes\", base, [], \"\"))\nresult(http.request(\"GET\", base, [\"X-Test: safe\" + lines + \"X-Injected: yes\"], \"\"))\nresult(http.request(\"GET\", base, [\"Bad Name: value\"], \"\"))\nresult(http.request(\"GET\", base, [\"Missing\"], \"\"))\nresult(http.request(\"GET\", base, [\"Host: attacker.invalid\"], \"\"))\nresult(http.request(\"GET\", base, [\"connection: keep-alive\"], \"\"))\nresult(http.request(\"GET\", base, [\"Content-Length: 0\"], \"\"))\nresult(http.request(\"GET\", base, [\"Transfer-Encoding: chunked\"], \"\"))\nlet valid = http.request(\"M-SEARCH\", base, [\"X-Test: a:b é\"], \"\")\nprint(Text(valid.status) + \" \" + Text(valid.body))\n", "request-validation", "request-validation")
+    let result = fixtures.run(context, [binary], 10)
+    let expected = "0 true\n0 true\n0 true\n0 true\n0 true\n0 true\n0 true\n0 true\n200 good\n"
+    test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "request validation (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    let seen = requests(peer)
+    test.check(seen.length == 1 && seen[0] == "REQUEST /small 127.0.0.1:" + Text(peer.port), "invalid request reached server: " + joinText(seen))
+    fixtures.stop(peer.process)
+}
+let authority = fixtures.selected(selectors, family[1], names[2]) || fixtures.selected(selectors, family[1], names[3]) || fixtures.selected(selectors, family[1], names[4])
 if authority {
     let ipv4 = start(context, peerBinary, "4")
     let ipv6 = start(context, peerBinary, "6")
     let binary = compile(context, "use \"http\" as http\nuse \"net\" as net\nif processInfo.argumentCount() == 2 {\nlet address = processInfo.argument(0)\nif processInfo.argument(1) == \"nul\" { let bytes = Bytes(address); bytes.add(0); bytes.addBytes(Bytes(\"suffix\")); address = Text(bytes) }\nprint(net.ipVersion(address))\n} else {\nlet response = http.getBoundedWithin(processInfo.argument(0), [], 4, 500)\nprint(response.status); print(Text(response.body))\nprint(response.error != \"\"); print(\"still alive\")\n}\n", "authority", "authority")
-    if fixtures.selected(selectors, family[1], names[1]) {
+    if fixtures.selected(selectors, family[1], names[2]) {
         let long = Bytes()
         for index in 0..256 { long.add(49) }
         let cases = [Literal { address: "127.0.0.1"; expected: "4\n" }, Literal { address: "::1"; expected: "6\n" }, Literal { address: "0:0:0:0:0:0:0:1"; expected: "6\n" },
@@ -80,7 +106,7 @@ if authority {
         for address in ["127.0.0.1", "::1"] { test.check(request(context, binary, [address, "nul"]) == "0\n", "embedded NUL " + address) }
     }
     let peers = [ipv4, ipv6]
-    if fixtures.selected(selectors, family[1], names[2]) {
+    if fixtures.selected(selectors, family[1], names[3]) {
         let cases = [Authority { peer: 0; host: "127.0.0.1"; suffix: "/small"; target: "/small" }, Authority { peer: 0; host: "localhost"; suffix: "/small"; target: "/small" },
             Authority { peer: 0; host: "[::ffff:127.0.0.1]"; suffix: "/small"; target: "/small" },
             Authority { peer: 0; host: "127.0.0.1"; suffix: "/encoded%3Apart?key=value%3Apart"; target: "/encoded%3Apart?key=value%3Apart" },
@@ -102,7 +128,7 @@ if authority {
             test.check(seen.length == 1 && seen[0] == "REQUEST " + item.target + " " + host, url + " observed " + joinText(seen))
         }
     }
-    if fixtures.selected(selectors, family[1], names[3]) {
+    if fixtures.selected(selectors, family[1], names[4]) {
         requests(ipv4)
         requests(ipv6)
         let port = Text(ipv6.port)

@@ -1,0 +1,160 @@
+use "../os/kernel/net/wire.min" as wire
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail("OS network parser regression: " + message) }
+}
+
+function put16(data: Bytes, at: Integer, value: Integer) {
+    data[at] = (value >> 8) & 255
+    data[at + 1] = value & 255
+}
+
+function put32(data: Bytes, at: Integer, value: Integer) {
+    put16(data, at, (value >> 16) & 0xFFFF)
+    put16(data, at + 2, value & 0xFFFF)
+}
+
+let udp = Bytes(8)
+put16(udp, 0, 67)
+put16(udp, 2, 68)
+put16(udp, 4, 0)
+check(!wire.udp(udp).valid, "zero UDP length accepted")
+put16(udp, 4, 7)
+check(!wire.udp(udp).valid, "short UDP length accepted")
+put16(udp, 4, 9)
+check(!wire.udp(udp).valid, "UDP length beyond packet accepted")
+put16(udp, 4, 8)
+let emptyUdp = wire.udp(udp)
+check(emptyUdp.valid && emptyUdp.sourcePort == 67 && emptyUdp.destinationPort == 68 && emptyUdp.payload.length == 0,
+      "valid empty UDP datagram rejected")
+
+let transaction = 0x4D494E59
+let truncatedDhcp = Bytes(244)
+put32(truncatedDhcp, 4, transaction)
+put32(truncatedDhcp, 236, 0x63825363)
+truncatedDhcp[240] = 1
+truncatedDhcp[241] = 4
+check(!wire.dhcp(truncatedDhcp, transaction).valid, "truncated DHCP address option accepted")
+let missingKind = Bytes(244)
+put32(missingKind, 4, transaction)
+put32(missingKind, 236, 0x63825363)
+missingKind[240] = 0
+missingKind[241] = 0
+missingKind[242] = 53
+missingKind[243] = 0
+check(!wire.dhcp(missingKind, transaction).valid, "empty DHCP message-kind option accepted")
+let validDhcp = Bytes(250)
+put32(validDhcp, 4, transaction)
+put32(validDhcp, 16, 0x0A00020F)
+put32(validDhcp, 236, 0x63825363)
+validDhcp[240] = 53
+validDhcp[241] = 1
+validDhcp[242] = 2
+validDhcp[243] = 1
+validDhcp[244] = 4
+put32(validDhcp, 245, 0xFFFFFF00)
+validDhcp[249] = 255
+let offer = wire.dhcp(validDhcp, transaction)
+check(offer.valid && offer.kind == 2 && offer.offered == 0x0A00020F && offer.mask == 0xFFFFFF00,
+      "valid DHCP offer rejected")
+
+let hostileDns = Bytes(29)
+put16(hostileDns, 0, 7)
+put16(hostileDns, 2, 0x8180)
+put16(hostileDns, 4, 1)
+put16(hostileDns, 6, 1)
+hostileDns[12] = 0
+put16(hostileDns, 13, 1)
+put16(hostileDns, 15, 1)
+hostileDns[17] = 127
+check(!wire.dns(hostileDns).valid, "oversized DNS answer label accepted")
+let truncatedDns = Bytes(31)
+put16(truncatedDns, 0, 8)
+put16(truncatedDns, 2, 0x8180)
+put16(truncatedDns, 4, 1)
+put16(truncatedDns, 6, 1)
+truncatedDns[12] = 0
+put16(truncatedDns, 13, 1)
+put16(truncatedDns, 15, 1)
+truncatedDns[17] = 0xC0
+truncatedDns[18] = 0x0C
+put16(truncatedDns, 19, 1)
+put16(truncatedDns, 21, 1)
+put16(truncatedDns, 27, 4)
+check(!wire.dns(truncatedDns).valid, "truncated DNS A record accepted")
+let validDns = Bytes(33)
+put16(validDns, 0, 9)
+put16(validDns, 2, 0x8180)
+put16(validDns, 4, 1)
+put16(validDns, 6, 1)
+validDns[12] = 0
+put16(validDns, 13, 1)
+put16(validDns, 15, 1)
+validDns[17] = 0xC0
+validDns[18] = 0x0C
+put16(validDns, 19, 1)
+put16(validDns, 21, 1)
+put16(validDns, 27, 4)
+put32(validDns, 29, 0x01020304)
+let answer = wire.dns(validDns)
+check(answer.valid && answer.id == 9 && answer.address == 0x01020304, "valid DNS A answer rejected")
+
+let localIp = 0x0A00020F
+let arp = Bytes(42)
+put16(arp, 12, 0x0806)
+put16(arp, 14, 1)
+put16(arp, 16, 0x0800)
+arp[18] = 6
+arp[19] = 4
+put16(arp, 20, 2)
+for index in 0..6 { arp[22 + index] = index + 1 }
+put32(arp, 28, 0x0A000202)
+put32(arp, 38, localIp)
+let reply = wire.arp(arp, localIp, true)
+check(reply.valid && reply.senderIp == 0x0A000202 && reply.senderMac.length == 6, "valid targeted ARP reply rejected")
+check(!wire.arp(arp, localIp, false).valid, "ARP cached before configuration")
+put32(arp, 38, localIp + 1)
+check(!wire.arp(arp, localIp, true).valid, "irrelevant ARP target accepted")
+
+let addresses: List<Integer> = []
+let macs: List<Bytes> = []
+for index in 0..80 {
+    let mac = Bytes(6)
+    mac[5] = index
+    check(wire.rememberArp(addresses, macs, index + 1, mac, wire.MAX_ARP_ENTRIES), "ARP cache update failed")
+}
+check(addresses.length == wire.MAX_ARP_ENTRIES && macs.length == wire.MAX_ARP_ENTRIES,
+      "ARP cache exceeded its entry limit")
+check(addresses[0] == 17 && addresses[addresses.length - 1] == 80, "ARP cache did not evict oldest entries")
+let replacement = Bytes(6)
+replacement[0] = 99
+check(wire.rememberArp(addresses, macs, 42, replacement, wire.MAX_ARP_ENTRIES), "known ARP entry update failed")
+let updated = false
+for index in 0..addresses.length {
+    if addresses[index] == 42 { updated = macs[index][0] == 99 }
+}
+check(updated && addresses.length == wire.MAX_ARP_ENTRIES, "known ARP entry update changed cache size")
+
+check(wire.incomingFits(0, wire.MAX_CONNECTION_INCOMING), "connection cap rejected exact maximum")
+check(wire.incomingFits(wire.MAX_CONNECTION_INCOMING - 1400, 1400), "connection cap rejected fitting segment")
+check(!wire.incomingFits(wire.MAX_CONNECTION_INCOMING - 1399, 1400), "connection cap accepted oversized segment")
+check(!wire.incomingFits(wire.MAX_CONNECTION_INCOMING, 1), "connection cap accepted byte beyond maximum")
+check(wire.retainConnection(true, 1000, 30999), "terminal connection removed before retention elapsed")
+check(!wire.retainConnection(true, 1000, 31000), "expired terminal connection was retained")
+check(wire.retainConnection(false, 1000, 31000), "live connection was removed by terminal cleanup")
+
+check(!wire.tcpAcknowledgesSyn(100, 101, false), "SYN reset without ACK accepted")
+check(!wire.tcpAcknowledgesSyn(100, 100, true), "SYN reset with stale ACK accepted")
+check(wire.tcpAcknowledgesSyn(100, 101, true), "SYN reset acknowledging the SYN rejected")
+check(wire.tcpAcknowledgesSyn(0xFFFFFFFF, 0, true), "wrapped SYN acknowledgement rejected")
+check(wire.tcpSequenceAccepted(700, 700), "exact established sequence rejected")
+check(!wire.tcpSequenceAccepted(700, 699), "stale established sequence accepted")
+check(!wire.tcpSequenceAccepted(700, 701), "future established sequence accepted")
+check(!wire.tcpAcknowledgmentAccepted(700, 699, 400, 20, false, 410), "out-of-sequence ACK advanced send state")
+check(wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, false, 410), "in-sequence ACK rejected")
+check(!wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, false, 399), "stale ACK accepted")
+check(!wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, false, 421), "ACK beyond sent data accepted")
+check(wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, true, 421), "FIN acknowledgement rejected")
+check(wire.tcpAcknowledgmentAccepted(700, 700, 0xFFFFFFF8, 16, false, 4), "wrapped in-range ACK rejected")
+
+print("OS network parsers: malformed UDP, DHCP, DNS, bounded ARP, TCP sequence, receive and terminal cleanup controls passed")

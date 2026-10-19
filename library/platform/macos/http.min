@@ -8,7 +8,8 @@ use "json" as json
 // replaces the portable library/http.min there. Both provide Response, get,
 // post, request and bounded downloads. Both validate TLS certificates and answer
 // unsupported URLs with a failed Response. This backend also streams, follows
-// redirects and decodes chunked bodies. Ordinary requests use a 60-second timeout.
+// redirects and decodes chunked bodies. Ordinary buffered requests have a 30-second
+// absolute deadline and a 128 MiB decoded-body limit.
 //
 //     let response = http.get("https://example.com/", ["Accept: text/html"])
 //     print(response.status)
@@ -53,6 +54,8 @@ public function postText(url: Text, headers: List<Text>, body: Text): Result<Rep
 public function send(method: Text, url: Text, headers: List<Text>, body: Text): Result<Reply, errors.Error> { return typedResponse(request(method, url, headers, body)) }
 public function fetchBounded(url: Text, headers: List<Text>, limit: Integer): Result<Reply, errors.Error> { return typedResponse(getBounded(url, headers, limit)) }
 public function fetchWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(getBoundedWithin(url, headers, limit, timeoutMs)) }
+public function sendBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Result<Reply, errors.Error> { return typedResponse(requestBounded(method, url, headers, body, limit)) }
+public function sendWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(requestBoundedWithin(method, url, headers, body, limit, timeoutMs)) }
 public function Reply.text(): Result<Text, errors.Error> { return textTools.decode(self.body) }
 public function Reply.json(): Result<json.Value, errors.Error> { return json.decodeBytes(self.body, 134217728) }
 
@@ -65,12 +68,7 @@ public function post(url: Text, headers: List<Text>, body: Text): Response {
 }
 
 public function request(method: Text, url: Text, headers: List<Text>, body: Text): Response {
-    // Like the portable backend, an unsupported URL is a failed response.
-    if !supported(url) {
-        return Response { status: 0; reason: ""; headers: []; body: Bytes(); error: "only http:// and https:// URLs are supported: " + url }
-    }
-    let handle = start(method, url, headers, body)
-    return collect(handle)
+    return requestBoundedWithin(method, url, headers, body, 134217728, 30000)
 }
 
 function failed(message: Text): Response {
@@ -84,13 +82,31 @@ public function getBounded(url: Text, headers: List<Text>, limit: Integer): Resp
     return getBoundedWithin(url, headers, limit, 30000)
 }
 
+public function postBounded(url: Text, headers: List<Text>, body: Text, limit: Integer): Response {
+    return requestBounded("POST", url, headers, body, limit)
+}
+
+public function requestBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Response {
+    return requestBoundedWithin(method, url, headers, body, limit, 30000)
+}
+
 public function getBoundedWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Response {
+    return requestBoundedWithin("GET", url, headers, "", limit, timeoutMs)
+}
+
+public function postBoundedWithin(url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
+    return requestBoundedWithin("POST", url, headers, body, limit, timeoutMs)
+}
+
+public function requestBoundedWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
     if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
     if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
     if !supported(url) { return failed("only http:// and https:// URLs are supported: " + url) }
+    let framingError = requestFramingError(method, headers)
+    if framingError != "" { return failed(framingError) }
     let lines: List<Text> = []
     for header in headers { lines.add(header); lines.add("\n") }
-    let handle = beginBounded(url, joinText(lines), limit, timeoutMs)
+    let handle = beginBounded(method, url, joinText(lines), body, limit, timeoutMs)
     let response = collect(handle)
     if response.error != "" { return failed(response.error) }
     return response
@@ -121,8 +137,45 @@ function supported(url: Text): Boolean {
     return length > 0 && url[length] != '/'
 }
 
+function lowerASCII(value: Text): Text {
+    let bytes = Bytes(value)
+    for index in 0..bytes.length { if bytes[index] >= 65 && bytes[index] <= 90 { bytes[index] += 32 } }
+    return Text(bytes)
+}
+
+function tokenCharacter(character: Character): Boolean {
+    if character >= 'a' && character <= 'z' { return true }
+    if character >= 'A' && character <= 'Z' { return true }
+    if character >= '0' && character <= '9' { return true }
+    for allowed in "!#$%&'*+-.^_`|~" { if character == allowed { return true } }
+    return false
+}
+
+function requestFramingError(method: Text, headers: List<Text>): Text {
+    if method.length < 1 { return "invalid HTTP request method" }
+    for character in method { if !tokenCharacter(character) { return "invalid HTTP request method" } }
+    for header in headers {
+        let colon = -1
+        for position in 0..header.length {
+            if header[position] == ':' { colon = position; break }
+            if !tokenCharacter(header[position]) { return "invalid HTTP request header name" }
+        }
+        if colon < 1 { return "invalid HTTP request header" }
+        let name = lowerASCII(header.slice(0, colon))
+        if name == "host" || name == "connection" || name == "content-length" || name == "transfer-encoding" {
+            return "HTTP framing header is managed by the client: " + name
+        }
+        for position in (colon + 1)..header.length {
+            let value = Integer(header[position])
+            if (value < 32 && value != 9) || value == 127 { return "invalid control in HTTP request header" }
+        }
+    }
+    return ""
+}
+
 // Start a request in the background and return its handle.
 public function start(method: Text, url: Text, headers: List<Text>, body: Text): Integer {
+    if requestFramingError(method, headers) != "" { return begin("", url, "", "") }
     let lines: List<Text> = []
     for header in headers {
         lines.add(header)
@@ -136,6 +189,7 @@ public function start(method: Text, url: Text, headers: List<Text>, body: Text):
 // The credential is scoped to this HTTPS origin and its own NSURLSession.
 // An inaccessible identity becomes a completed request with error(handle).
 public function startWithIdentity(method: Text, url: Text, headers: List<Text>, body: Text, signer: Bytes, intermediates: List<Bytes>): Integer {
+    if requestFramingError(method, headers) != "" { return beginWithIdentity("", url, "", "", Bytes(), Bytes()) }
     let lines: List<Text> = []
     for header in headers { lines.add(header); lines.add("\n") }
     let total = 4
@@ -160,7 +214,7 @@ public function startWithIdentity(method: Text, url: Text, headers: List<Text>, 
 function begin(method: Text, url: Text, headers: Text, body: Text): Integer {
     native "http"
 }
-function beginBounded(url: Text, headers: Text, limit: Integer, timeoutMs: Integer): Integer {
+function beginBounded(method: Text, url: Text, headers: Text, body: Text, limit: Integer, timeoutMs: Integer): Integer {
     native "http"
 }
 function beginWithIdentity(method: Text, url: Text, headers: Text, body: Text, signer: Bytes, intermediates: Bytes): Integer {

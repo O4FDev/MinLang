@@ -322,22 +322,61 @@ static long long host_finish(int status) {
     return WEXITSTATUS(status);
 }
 
-long long minyar_driverhost_execute(const MinyarBytes *arguments, const MinyarBytes *environment,
-                                    bool inherit, const MinyarText *output, const MinyarText *errors,
-                                    long long timeout) {
+static int host_write_capture(int file, const unsigned char *data, size_t length) {
+    while (length) {
+        ssize_t written = write(file, data, length);
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0) return errno;
+        if (!written) return EIO;
+        data += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static int host_raise_pipe_descriptors(int descriptors[2]) {
+    for (int index = 0; index < 2; index++) {
+        if (descriptors[index] >= 3) continue;
+        int raised = fcntl(descriptors[index], F_DUPFD_CLOEXEC, 3);
+        if (raised < 0) return errno;
+        close(descriptors[index]);
+        descriptors[index] = raised;
+    }
+    return 0;
+}
+
+static long long host_execute(const MinyarBytes *arguments, const MinyarBytes *environment,
+                              bool inherit, const MinyarText *output, const MinyarText *errors,
+                              long long timeout, long long error_limit) {
     char **argv = host_vector(arguments);
     char **envp = inherit ? NULL : host_vector(environment);
     char *out = output->byte_length ? host_cstring(output) : NULL;
     char *err = errors->byte_length ? host_cstring(errors) : NULL;
+    int error_pipe[2] = {-1, -1};
+    int error_file = -1;
     long long result;
-    if (!argv || !argv[0] || (!inherit && !envp) || (output->byte_length && !out) || (errors->byte_length && !err)) {
+    if (!argv || !argv[0] || (!inherit && !envp) || (output->byte_length && !out) ||
+        (errors->byte_length && !err) || error_limit < 0 || (error_limit && (!err || timeout))) {
         result = -EINVAL;
         goto done;
+    }
+    if (error_limit) {
+        if (pipe(error_pipe)) { result = -errno; goto done; }
+        int descriptor_error = host_raise_pipe_descriptors(error_pipe);
+        if (descriptor_error) { result = -descriptor_error; goto done; }
+        error_file = open(err, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (error_file < 0) { result = -errno; goto done; }
     }
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     if (out) posix_spawn_file_actions_addopen(&actions, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (err) posix_spawn_file_actions_addopen(&actions, 2, err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (error_limit) {
+        posix_spawn_file_actions_addclose(&actions, error_pipe[0]);
+        if (error_pipe[1] != 2) {
+            posix_spawn_file_actions_adddup2(&actions, error_pipe[1], 2);
+            posix_spawn_file_actions_addclose(&actions, error_pipe[1]);
+        }
+    } else if (err) posix_spawn_file_actions_addopen(&actions, 2, err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 #ifdef __APPLE__
     char **current = *_NSGetEnviron();
 #else
@@ -346,8 +385,41 @@ long long minyar_driverhost_execute(const MinyarBytes *arguments, const MinyarBy
     pid_t child;
     int failed = posix_spawnp(&child, argv[0], &actions, NULL, argv, inherit ? current : envp);
     posix_spawn_file_actions_destroy(&actions);
+    if (error_pipe[1] >= 0) { close(error_pipe[1]); error_pipe[1] = -1; }
     if (failed) {
         result = -failed;
+        goto done;
+    }
+    if (error_limit) {
+        unsigned char buffer[65536];
+        long long captured = 0;
+        int capture_error = 0;
+        for (;;) {
+            ssize_t count = read(error_pipe[0], buffer, sizeof buffer);
+            if (count < 0 && errno == EINTR) {
+                if (host_guarded && host_signal) { kill(child, SIGKILL); break; }
+                continue;
+            }
+            if (count < 0) { capture_error = errno; break; }
+            if (!count) break;
+            size_t keep = (size_t)count;
+            if (captured >= error_limit) keep = 0;
+            else if ((long long)keep > error_limit - captured) keep = (size_t)(error_limit - captured);
+            if (keep && !capture_error) capture_error = host_write_capture(error_file, buffer, keep);
+            captured += (long long)keep;
+        }
+        close(error_pipe[0]); error_pipe[0] = -1;
+        close(error_file); error_file = -1;
+        int status;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+            if (waited < 0 && errno == EINTR && host_guarded && host_signal) kill(child, SIGKILL);
+        } while (waited < 0 && errno == EINTR);
+        if (waited < 0) result = -errno;
+        else if (host_guarded && host_signal) result = -(200000 + (long long)host_signal);
+        else if (capture_error) result = -capture_error;
+        else result = host_finish(status);
         goto done;
     }
     struct timespec start;
@@ -384,11 +456,26 @@ long long minyar_driverhost_execute(const MinyarBytes *arguments, const MinyarBy
         }
     }
 done:
+    if (error_pipe[0] >= 0) close(error_pipe[0]);
+    if (error_pipe[1] >= 0) close(error_pipe[1]);
+    if (error_file >= 0) close(error_file);
     host_free_vector(argv);
     host_free_vector(envp);
     free(out);
     free(err);
     return result;
+}
+
+long long minyar_driverhost_execute(const MinyarBytes *arguments, const MinyarBytes *environment,
+                                    bool inherit, const MinyarText *output, const MinyarText *errors,
+                                    long long timeout) {
+    return host_execute(arguments, environment, inherit, output, errors, timeout, 0);
+}
+
+long long minyar_driverhost_executeBoundedErrors(const MinyarBytes *arguments, const MinyarBytes *environment,
+                                                 bool inherit, const MinyarText *output, const MinyarText *errors,
+                                                 long long timeout, long long error_limit) {
+    return host_execute(arguments, environment, inherit, output, errors, timeout, error_limit);
 }
 
 typedef struct {

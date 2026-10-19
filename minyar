@@ -131,6 +131,47 @@ positive_decimal() {
     normalized_decimal=${normalized_decimal#"${normalized_decimal%%[!0]*}"}
     [ -n "$normalized_decimal" ]
 }
+terminal_text() {
+    printf '%s' "$1" | LC_ALL=C od -An -v -t u1 | LC_ALL=C awk '
+function continuation(byte) { return byte >= 128 && byte <= 191 }
+function unsafe(code) {
+    return code < 32 || (code >= 127 && code <= 159) || code == 1564 || code == 8206 || code == 8207 || code == 8232 || code == 8233 || (code >= 8234 && code <= 8238) || (code >= 8294 && code <= 8297)
+}
+{
+    for (field = 1; field <= NF; field += 1) { count += 1; bytes[count] = $field }
+}
+END {
+    position = 1
+    while (position <= count) {
+        first = bytes[position] + 0
+        width = 0
+        code = -1
+        if (first < 128) { width = 1; code = first }
+        else if (first >= 194 && first <= 223 && position + 1 <= count && continuation(bytes[position + 1] + 0)) {
+            width = 2
+            code = (first - 192) * 64 + (bytes[position + 1] + 0) - 128
+        } else if (first >= 224 && first <= 239 && position + 2 <= count && continuation(bytes[position + 1] + 0) && continuation(bytes[position + 2] + 0)) {
+            second = bytes[position + 1] + 0
+            if ((first != 224 || second >= 160) && (first != 237 || second <= 159)) {
+                width = 3
+                code = (first - 224) * 4096 + (second - 128) * 64 + (bytes[position + 2] + 0) - 128
+            }
+        } else if (first >= 240 && first <= 244 && position + 3 <= count && continuation(bytes[position + 1] + 0) && continuation(bytes[position + 2] + 0) && continuation(bytes[position + 3] + 0)) {
+            second = bytes[position + 1] + 0
+            if ((first != 240 || second >= 144) && (first != 244 || second <= 143)) {
+                width = 4
+                code = (first - 240) * 262144 + (second - 128) * 4096 + ((bytes[position + 2] + 0) - 128) * 64 + (bytes[position + 3] + 0) - 128
+            }
+        }
+        if (code < 0) { printf "\\x%02x", first; position += 1 }
+        else {
+            if (unsafe(code)) { printf "\\u{%04x}", code }
+            else { for (offset = 0; offset < width; offset += 1) { printf "%c", bytes[position + offset] + 0 } }
+            position += width
+        }
+    }
+}'
+}
 
 release=0
 debug=0
@@ -188,7 +229,9 @@ $2"; shift 2 ;;
             native_file=${2#*=}
             case "$native_name" in ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) usage ;; esac
             [ -f "$native_file" ] && [ -r "$native_file" ] || {
-                echo "minyar: cannot read native input: $native_file" >&2
+                printf 'minyar: cannot read native input: ' >&2
+                terminal_text "$native_file" >&2
+                printf '\n' >&2
                 exit 1
             }
             native_inputs="$native_inputs
@@ -231,11 +274,15 @@ if [ "$#" -gt 0 ]; then
     output_file=$2
 fi
 [ -f "$source_file" ] && [ -r "$source_file" ] || {
-    echo "minyar: cannot read source file: $source_file" >&2
+    printf 'minyar: cannot read source file: ' >&2
+    terminal_text "$source_file" >&2
+    printf '\n' >&2
     exit 1
 }
 if [ "$check_only" -eq 0 ] && [ "$source_file" -ef "$output_file" ]; then
-    echo "minyar: refusing to replace the source file; choose a different -o path: $output_file" >&2
+    printf 'minyar: refusing to replace the source file; choose a different -o path: ' >&2
+    terminal_text "$output_file" >&2
+    printf '\n' >&2
     exit 1
 fi
 
@@ -328,7 +375,9 @@ cat "$primary_stderr" >&2
 if [ "$compiler_status" -ne 0 ]; then exit "$compiler_status"; fi
 if [ "$list_tests" -eq 1 ] || [ "$doc_json" -eq 1 ]; then cat "$llvm_file"; exit 0; fi
 if [ "$check_only" -eq 1 ]; then
-    echo "checked $source_file"
+    printf 'checked '
+    terminal_text "$source_file"
+    printf '\n'
     exit 0
 fi
 
@@ -388,4 +437,6 @@ if [ "$app" -eq 1 ]; then
     sh "$project_dir/tools/toolchain.sh" bootstrap "$project_dir" build/tooling/scripts/macos-app
     "$project_dir/build/tooling/scripts/macos-app" "$@"
 fi
-echo "built $output_file"
+printf 'built '
+terminal_text "$output_file"
+printf '\n'

@@ -46,6 +46,8 @@ public function postText(url: Text, headers: List<Text>, body: Text): Result<Rep
 public function send(method: Text, url: Text, headers: List<Text>, body: Text): Result<Reply, errors.Error> { return typedResponse(request(method, url, headers, body)) }
 public function fetchBounded(url: Text, headers: List<Text>, limit: Integer): Result<Reply, errors.Error> { return typedResponse(getBounded(url, headers, limit)) }
 public function fetchWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(getBoundedWithin(url, headers, limit, timeoutMs)) }
+public function sendBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Result<Reply, errors.Error> { return typedResponse(requestBounded(method, url, headers, body, limit)) }
+public function sendWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(requestBoundedWithin(method, url, headers, body, limit, timeoutMs)) }
 public function Reply.text(): Result<Text, errors.Error> { return text.decode(self.body) }
 public function Reply.json(): Result<json.Value, errors.Error> { return json.decodeBytes(self.body, 134217728) }
 
@@ -157,22 +159,38 @@ public function post(url: Text, headers: List<Text>, body: Text): Response {
 }
 
 public function request(method: Text, url: Text, headers: List<Text>, body: Text): Response {
-    return exchange(method, url, headers, body, 0, 0)
+    return requestBoundedWithin(method, url, headers, body, 134217728, 30000)
 }
 
-// Portable bounded download: certificate verification remains enabled. Reads
+// Portable bounded requests: certificate verification remains enabled. Reads
 // allocate at most limit + 32KiB HTTP framing, plus one bounded TLS record.
 // This backend does not follow redirects or decode transfer/content encodings.
 public function getBounded(url: Text, headers: List<Text>, limit: Integer): Response {
     return getBoundedWithin(url, headers, limit, 30000)
 }
 
+public function postBounded(url: Text, headers: List<Text>, body: Text, limit: Integer): Response {
+    return requestBounded("POST", url, headers, body, limit)
+}
+
+public function requestBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Response {
+    return requestBoundedWithin(method, url, headers, body, limit, 30000)
+}
+
 // One absolute read deadline prevents a slow peer resetting a timeout forever.
 // Name resolution and initial blocking connect still use platform timeouts.
 public function getBoundedWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Response {
+    return requestBoundedWithin("GET", url, headers, "", limit, timeoutMs)
+}
+
+public function postBoundedWithin(url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
+    return requestBoundedWithin("POST", url, headers, body, limit, timeoutMs)
+}
+
+public function requestBoundedWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
     if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
     if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
-    return exchange("GET", url, headers, "", limit, timeoutMs)
+    return exchange(method, url, headers, body, limit, timeoutMs)
 }
 
 function ready(connection: Integer, deadline: Integer): Boolean {
@@ -180,7 +198,31 @@ function ready(connection: Integer, deadline: Integer): Boolean {
     return remaining > 0 && net.ready(connection, remaining)
 }
 
+function requestFramingError(method: Text, headers: List<Text>): Text {
+    if method.length < 1 { return "invalid HTTP request method" }
+    for character in method { if !headerToken(character) { return "invalid HTTP request method" } }
+    for header in headers {
+        let colon = -1
+        for position in 0..header.length {
+            if header[position] == ':' { colon = position; break }
+            if !headerToken(header[position]) { return "invalid HTTP request header name" }
+        }
+        if colon < 1 { return "invalid HTTP request header" }
+        let name = lowerASCII(header.slice(0, colon))
+        if name == "host" || name == "connection" || name == "content-length" || name == "transfer-encoding" {
+            return "HTTP framing header is managed by the client: " + name
+        }
+        for position in (colon + 1)..header.length {
+            let value = Integer(header[position])
+            if (value < 32 && value != 9) || value == 127 { return "invalid control in HTTP request header" }
+        }
+    }
+    return ""
+}
+
 function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
+    let framingError = requestFramingError(method, headers)
+    if framingError != "" { return failed(framingError) }
     let address = parse(url)
     if address.host == "" {
         return failed("invalid http:// or https:// URL: " + url)

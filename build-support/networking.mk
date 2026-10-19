@@ -1,6 +1,6 @@
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
-.PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize
+.PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize check-os-net-stack check-os-net-stack-sanitize
 NET_FIXTURE_TOOLS = http-package-test http-bounded-test httpserver-test httpserver-front-test net-native-test net-loop-test \
     net-udp-offload-test os-tlsverify-test peer-auth-mutants-test peer-auth-device-test peer-auth-test peer-wire-flow-test \
     peer-live-redis-test peer-live-test peer-wire-test redis-pipeline-test redis-protocol-test securecrypto-test \
@@ -22,6 +22,15 @@ build/tooling/tests/peer-edge-device-scale.ll: tests/peer-edge-scale.min tests/n
 $(SOAK_TOOLS:%=build/tooling/tests/%): TOOL_NATIVE = tests/soak-observer-native.c runtime/native/net.c
 $(SOAK_TOOLS:%=build/tooling/tests/%): TOOL_RUNTIME = build/testing/cycle-runtime.o
 $(SOAK_TOOLS:%=build/tooling/tests/%): build/testing/cycle-runtime.o tests/soak-observer-native.c runtime/native/net.c
+
+build/tooling/tests/os-net-stack.ll: os/kernel/net/wire.min
+check-os-net-stack: build/minyarc build/tooling/tests/os-net-stack
+	$(LIMITED) ./build/tooling/tests/os-net-stack
+
+check-os-net-stack-sanitize: build/tooling/tests/os-net-stack.ll build/minyar-runtime-sanitize.o
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) "$<" "build/minyar-runtime-sanitize.o" -lm -o "build/os-net-stack-test-sanitize"
+	$(SANITIZER_LIMITED) ./build/os-net-stack-test-sanitize
+
 check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
 

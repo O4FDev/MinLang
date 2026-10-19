@@ -8,7 +8,8 @@ use "crypto" as crypto
 use "errors" as errors
 use "quicwire" as wire
 use "quiccrypto" as protection
-public record Store { private key: Bytes; private lifetime: Integer; private issued: Integer }
+record Retired { key: Bytes; until: Integer }
+public record Store { private key: Bytes; private previous: List<Retired>; private lifetime: Integer; private issued: Integer; private latest: Integer; private issuanceLimit: Integer }
 public record Opened { private valid: Boolean; private version: Integer; private original: Bytes; private source: Bytes }
 record Cursor { data: Bytes; at: Integer; bad: Boolean }
 function empty(): Opened { return Opened { valid: false; version: 0; original: Bytes(); source: Bytes() } }
@@ -23,8 +24,17 @@ function number(cursor: Cursor): Integer {
 function add(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
 function field(data: Bytes,value: Bytes) { add(data,value.length);data.addBytes(value) }
 public function store(key: Bytes,lifetimeMilliseconds: Integer): Store {
-    let retained=Bytes();if key.length==16 && lifetimeMilliseconds>=1 && lifetimeMilliseconds<=120000 { retained=key.slice(0,key.length) }
-    return Store { key: retained; lifetime: lifetimeMilliseconds; issued: 0 }
+    return storeWithIssuanceLimit(key,lifetimeMilliseconds,1 << 23)
+}
+// A configurable limit keeps rotation testable without issuing millions of packets.
+public function storeWithIssuanceLimit(key: Bytes,lifetimeMilliseconds: Integer,issuanceLimit: Integer): Store {
+    let retained=Bytes();if key.length==16 && lifetimeMilliseconds>=1 && lifetimeMilliseconds<=120000 && issuanceLimit>=1 && issuanceLimit<=(1 << 23) { retained=key.slice(0,key.length) }
+    return Store { key: retained; previous: []; lifetime: lifetimeMilliseconds; issued: 0; latest: -1; issuanceLimit: issuanceLimit }
+}
+function retainPrevious(store: Store,now: Integer) {
+    let retained: List<Retired> = []
+    for item in store.previous { if item.until >= now { retained.add(item) } }
+    store.previous=retained
 }
 public function valid(value: Opened): Boolean { return value.valid }
 public function version(value: Opened): Integer { return value.version }
@@ -32,25 +42,37 @@ public function original(value: Opened): Bytes { return value.original.slice(0,v
 public function source(value: Opened): Bytes { return value.source.slice(0,value.source.length) }
 public function reply(store: Store,initial: Bytes,address: Bytes,source: Bytes,now: Integer): errors.BytesResult {
     let header=wire.header(initial,0,8)
-    if store.key.length != 16 || store.issued >= (1 << 23) || now<0 || now>wire.MAX_VARINT || address.length<1 || address.length>256 || initial.length<1200 || !header.valid || header.kind != wire.INITIAL || header.token.length>0 || source.length<1 || source.length>20 || crypto.constantTimeEqual(source,header.destination) {
+    if store.key.length != 16 || now<0 || now>wire.MAX_VARINT || address.length<1 || address.length>256 || initial.length<1200 || !header.valid || header.kind != wire.INITIAL || header.token.length>0 || source.length<1 || source.length>20 || crypto.constantTimeEqual(source,header.destination) {
         return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid stateless Retry request"))
+    }
+    retainPrevious(store,now)
+    if store.issued >= store.issuanceLimit {
+        store.previous.add(Retired { key: store.key; until: store.latest+store.lifetime })
+        store.key=secureRandom.bytes(16);store.issued=0;store.latest=-1
+        if store.key.length != 16 { return errors.bytesFailure(errors.make(errors.unavailableCode(),0,"Retry token provider failed")) }
     }
     let body=Bytes();add(body,header.version);add(body,now);field(body,address);field(body,header.destination);field(body,source);field(body,header.source)
     let nonce=secureRandom.bytes(12);let token=Bytes("MQR1");token.addBytes(nonce)
     let ciphertext=aes.encrypt(store.key,nonce,Bytes("MQR1"),body)
     if ciphertext.length != body.length+16 { return errors.bytesFailure(errors.make(errors.unavailableCode(),0,"Retry token provider failed")) }
-    token.addBytes(ciphertext);store.issued+=1
+    token.addBytes(ciphertext);store.issued+=1;store.latest=max(store.latest,now)
     return protection.retryPacket(header.version,header.source,source,token,header.destination)
 }
-public function validate(store: Store,token: Bytes,address: Bytes,destination: Bytes,client: Bytes,now: Integer): Opened {
-    if store.key.length != 16 || now<0 || token.length<32 || token.length>512 || address.length<1 || address.length>256 || destination.length<1 || destination.length>20 || client.length>20 || !crypto.constantTimeEqual(token.slice(0,4),Bytes("MQR1")) { return empty() }
-    let plaintext=aes.decrypt(store.key,token.slice(4,16),Bytes("MQR1"),token.slice(16,token.length))
+function open(store: Store,key: Bytes,token: Bytes,address: Bytes,destination: Bytes,client: Bytes,now: Integer): Opened {
+    let plaintext=aes.decrypt(key,token.slice(4,16),Bytes("MQR1"),token.slice(16,token.length))
     if plaintext.length<1 || plaintext[0] != 1 { return empty() }
     let cursor=Cursor { data: plaintext.slice(1,plaintext.length); at: 0; bad: false }
     let version=number(cursor);let issued=number(cursor)
     let boundAddress=take(cursor,number(cursor));let original=take(cursor,number(cursor));let source=take(cursor,number(cursor));let boundClient=take(cursor,number(cursor))
     if cursor.bad || cursor.at != cursor.data.length || (version != 1 && version != protection.VERSION_2) || issued>now || now-issued>store.lifetime || original.length<1 || original.length>20 || !crypto.constantTimeEqual(boundAddress,address) || !crypto.constantTimeEqual(source,destination) || !crypto.constantTimeEqual(boundClient,client) { return empty() }
     return Opened { valid: true; version: version; original: original; source: source }
+}
+public function validate(store: Store,token: Bytes,address: Bytes,destination: Bytes,client: Bytes,now: Integer): Opened {
+    if store.key.length != 16 || now<0 || token.length<32 || token.length>512 || address.length<1 || address.length>256 || destination.length<1 || destination.length>20 || client.length>20 || !crypto.constantTimeEqual(token.slice(0,4),Bytes("MQR1")) { return empty() }
+    retainPrevious(store,now)
+    let opened=open(store,store.key,token,address,destination,client,now)
+    for item in store.previous { if !opened.valid { opened=open(store,item.key,token,address,destination,client,now) } }
+    return opened
 }
 public function validateInitial(store: Store,initial: Bytes,address: Bytes,now: Integer): Opened {
     let header=wire.header(initial,0,8)

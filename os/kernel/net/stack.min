@@ -4,7 +4,9 @@
 // Everything runs from `poll`, called once per frame: it drains received
 // frames, answers ARP and pings, advances DHCP, and retransmits TCP data
 // that has not been acknowledged.
+use "random" as secureRandom
 use "./e1000.min" as e1000
+use "./wire.min" as wire
 use "../../shared/interrupts.min" as interrupts
 
 public constant CLOSED = 0
@@ -156,12 +158,13 @@ function note(network: Network, line: Text) {
 // ----- Start -----
 
 public function create(adapter: e1000.Adapter): Network {
+    let portSeed = secureRandom.bytes(2)
     let network = Network {
         adapter: adapter; ip: 0; mask: 0; gateway: 0; dns: 0; configured: false
         dhcpState: 0; dhcpTransaction: 0x4D494E59; dhcpServer: 0; dhcpOffer: 0; dhcpSent: -100000; dhcpTries: 0
         started: interrupts.milliseconds()
         arpAddresses: []; arpMacs: []; arpAsked: []; waitingFor: []; waiting: []
-        connections: []; nextConnection: 1; nextPort: 49152 + interrupts.milliseconds() % 4000
+        connections: []; nextConnection: 1; nextPort: 49152 + get16(portSeed, 0) % 15849
         dnsNames: []; dnsIds: []; dnsAnswers: []; pings: 0; log: []
     }
     return network
@@ -232,27 +235,18 @@ function lookupMac(network: Network, ip: Integer): Integer {
 }
 
 function handleArp(network: Network, frame: Bytes) {
-    if frame.length < 42 { return }
-    let operation = get16(frame, 20)
-    let senderMac = frame.slice(22, 28)
-    let senderIp = get32(frame, 28)
-    let targetIp = get32(frame, 38)
-    let known = lookupMac(network, senderIp)
-    if known >= 0 {
-        network.arpMacs[known] = senderMac
-    } else {
-        network.arpAddresses.add(senderIp)
-        network.arpMacs.add(senderMac)
-    }
-    if operation == 1 && network.configured && targetIp == network.ip {
-        sendFrame(network, senderMac, ETHERNET_ARP, arpPacket(network, 2, senderMac, senderIp))
+    let parsed = wire.arp(frame, network.ip, network.configured)
+    if !parsed.valid { return }
+    if !wire.rememberArp(network.arpAddresses, network.arpMacs, parsed.senderIp, parsed.senderMac, wire.MAX_ARP_ENTRIES) { return }
+    if parsed.operation == 1 {
+        sendFrame(network, parsed.senderMac, ETHERNET_ARP, arpPacket(network, 2, parsed.senderMac, parsed.senderIp))
     }
     // Send anything that was waiting for this address.
     let stillFor: List<Integer> = []
     let still: List<Bytes> = []
     for index in 0..network.waiting.length {
-        if network.waitingFor[index] == senderIp {
-            sendFrame(network, senderMac, ETHERNET_IPV4, network.waiting[index])
+        if network.waitingFor[index] == parsed.senderIp {
+            sendFrame(network, parsed.senderMac, ETHERNET_IPV4, network.waiting[index])
         } else {
             stillFor.add(network.waitingFor[index])
             still.add(network.waiting[index])
@@ -350,11 +344,10 @@ function sendUdp(network: Network, destination: Integer, sourcePort: Integer, de
 }
 
 function handleUdp(network: Network, source: Integer, packet: Bytes) {
-    if packet.length < 8 { return }
-    let destinationPort = get16(packet, 2)
-    let payload = packet.slice(8, min(get16(packet, 4), packet.length))
-    if destinationPort == 68 { handleDhcp(network, payload) }
-    if destinationPort == 5353 { handleDns(network, payload) }
+    let datagram = wire.udp(packet)
+    if !datagram.valid { return }
+    if datagram.sourcePort == 67 && datagram.destinationPort == 68 { handleDhcp(network, datagram.payload) }
+    if source == network.dns && datagram.sourcePort == 53 && datagram.destinationPort == 5353 { handleDns(network, datagram.payload) }
 }
 
 function dhcpMessage(network: Network, kind: Integer): Bytes {
@@ -391,44 +384,23 @@ function dhcpMessage(network: Network, kind: Integer): Bytes {
 }
 
 function handleDhcp(network: Network, message: Bytes) {
-    if message.length < 244 || get32(message, 4) != network.dhcpTransaction { return }
-    let offered = get32(message, 16)
-    let kind = 0
-    let mask = 0xFFFFFF00
-    let router = 0
-    let dns = 0
-    let server = 0
-    let at = 240
-    while at + 1 < message.length && message[at] != 255 {
-        let option = message[at]
-        if option == 0 {
-            at += 1
-        } else {
-            let length = message[at + 1]
-            let value = at + 2
-            if option == 53 { kind = message[value] }
-            if option == 1 && length >= 4 { mask = get32(message, value) }
-            if option == 3 && length >= 4 { router = get32(message, value) }
-            if option == 6 && length >= 4 { dns = get32(message, value) }
-            if option == 54 && length >= 4 { server = get32(message, value) }
-            at = value + length
-        }
-    }
-    if kind == 2 && network.dhcpState == 1 {
-        network.dhcpOffer = offered
-        network.dhcpServer = server
+    let parsed = wire.dhcp(message, network.dhcpTransaction)
+    if !parsed.valid { return }
+    if parsed.kind == 2 && network.dhcpState == 1 {
+        network.dhcpOffer = parsed.offered
+        network.dhcpServer = parsed.server
         network.dhcpState = 2
-        note(network, "DHCP offer " + ipText(offered) + " from " + ipText(server))
+        note(network, "DHCP offer " + ipText(parsed.offered) + " from " + ipText(parsed.server))
         sendUdp(network, 0xFFFFFFFF, 68, 67, dhcpMessage(network, 3))
     }
-    if kind == 5 && network.dhcpState == 2 {
-        network.ip = offered
-        network.mask = mask
-        network.gateway = router
-        network.dns = dns
+    if parsed.kind == 5 && network.dhcpState == 2 {
+        network.ip = parsed.offered
+        network.mask = parsed.mask
+        network.gateway = parsed.router
+        network.dns = parsed.dns
         network.configured = true
         network.dhcpState = 3
-        note(network, "DHCP lease " + ipText(offered) + ", gateway " + ipText(router) + ", DNS " + ipText(dns))
+        note(network, "DHCP lease " + ipText(parsed.offered) + ", gateway " + ipText(parsed.router) + ", DNS " + ipText(parsed.dns))
     }
 }
 
@@ -473,38 +445,11 @@ public function resolved(network: Network, name: Text): Integer {
 }
 
 function handleDns(network: Network, message: Bytes) {
-    if message.length < 12 { return }
-    let id = get16(message, 0)
-    let answers = get16(message, 6)
-    let at = 12
-    // Skip the question.
-    while at < message.length && message[at] != 0 {
-        if (message[at] & 0xC0) == 0xC0 {
-            at += 1
-            break
-        }
-        at += message[at] + 1
-    }
-    at += 5
-    let address = 0
-    for answer in 0..answers {
-        if at + 12 > message.length { break }
-        if (message[at] & 0xC0) == 0xC0 {
-            at += 2
-        } else {
-            while at < message.length && message[at] != 0 { at += message[at] + 1 }
-            at += 1
-        }
-        let type = get16(message, at)
-        let length = get16(message, at + 8)
-        if type == 1 && length == 4 && address == 0 {
-            address = get32(message, at + 10)
-        }
-        at += 10 + length
-    }
+    let parsed = wire.dns(message)
+    if !parsed.valid { return }
     for index in 0..network.dnsIds.length {
-        if network.dnsIds[index] == id {
-            network.dnsAnswers[index] = address
+        if network.dnsIds[index] == parsed.id {
+            network.dnsAnswers[index] = parsed.address
         }
     }
 }
@@ -546,9 +491,10 @@ public function placeholder(): Connection {
 
 // Open a connection. Poll the returned connection's state.
 public function connect(network: Network, ip: Integer, port: Integer): Connection {
+    let sequenceSeed = secureRandom.bytes(4)
     let connection = Connection {
         id: network.nextConnection; state: CONNECTING; remoteIp: ip; remotePort: port; localPort: network.nextPort
-        sendUnacked: (interrupts.milliseconds() * 2654435761) & 0x7FFFFFFF; receiveNext: 0
+        sendUnacked: get32(sequenceSeed, 0); receiveNext: 0
         outgoing: Bytes(); sent: 0; peerWindow: 8192; incoming: Bytes(); lastSend: 0; retries: 0
         finReceived: false; finQueued: false; finSent: false; error: ""; opened: interrupts.milliseconds()
     }
@@ -612,21 +558,27 @@ function handleTcp(network: Network, source: Integer, segment: Bytes) {
     let sequence = get32(segment, 4)
     let acknowledgment = get32(segment, 8)
     let offset = (segment[12] >> 4) * 4
+    if offset < 20 || offset > segment.length { return }
     let flags = segment[13]
     let window = get16(segment, 14)
     let index = findConnection(network, source, sourcePort, destinationPort)
     if index < 0 { return }
     let connection = network.connections[index]
-    if (flags & TCP_RST) != 0 {
-        if connection.state != FINISHED {
-            connection.state = FAILED
-            connection.error = "the server reset the connection"
-        }
-        return
-    }
-    connection.peerWindow = max(window, 1)
+    if connection.state == FINISHED || connection.state == FAILED { return }
+    // During the handshake a reset is valid only when its ACK acknowledges our
+    // SYN. Otherwise an off-path packet could reset a connection after finding
+    // only its address and port tuple.
     if connection.state == CONNECTING {
-        if (flags & TCP_SYN) != 0 && (flags & TCP_ACK) != 0 && acknowledgment == ((connection.sendUnacked + 1) & 0xFFFFFFFF) {
+        let hasAcknowledgment = (flags & TCP_ACK) != 0
+        if (flags & TCP_RST) != 0 {
+            if wire.tcpAcknowledgesSyn(connection.sendUnacked, acknowledgment, hasAcknowledgment) {
+                connection.state = FAILED
+                connection.error = "the server reset the connection"
+            }
+            return
+        }
+        if (flags & TCP_SYN) != 0 && wire.tcpAcknowledgesSyn(connection.sendUnacked, acknowledgment, hasAcknowledgment) {
+            connection.peerWindow = max(window, 1)
             connection.sendUnacked = acknowledgment
             connection.receiveNext = (sequence + 1) & 0xFFFFFFFF
             connection.state = OPEN
@@ -636,25 +588,43 @@ function handleTcp(network: Network, source: Integer, segment: Bytes) {
         }
         return
     }
-    if (flags & TCP_ACK) != 0 {
-        let advanced = (acknowledgment - connection.sendUnacked) & 0xFFFFFFFF
-        let finExtra = 0
-        if connection.finSent { finExtra = 1 }
-        if advanced > 0 && advanced <= connection.sent + finExtra {
-            let dataAcknowledged = min(advanced, connection.sent)
-            connection.outgoing = connection.outgoing.slice(dataAcknowledged, connection.outgoing.length)
-            connection.sent -= dataAcknowledged
-            connection.sendUnacked = acknowledgment
-            connection.retries = 0
-        }
-    }
     let payload = segment.slice(min(offset, segment.length), segment.length)
+    // This stack accepts data only at receiveNext, so state-changing control
+    // fields must meet the same sequence check. A duplicate/out-of-order data
+    // segment still gets the duplicate ACK that the previous receiver sent.
+    if !wire.tcpSequenceAccepted(connection.receiveNext, sequence) {
+        if (flags & TCP_RST) == 0 && (payload.length > 0 || (flags & TCP_FIN) != 0) {
+            sendSegment(network, connection, TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
+        }
+        return
+    }
+    if (flags & TCP_RST) != 0 {
+        connection.state = FAILED
+        connection.error = "the server reset the connection"
+        return
+    }
+    connection.peerWindow = max(window, 1)
+    if (flags & TCP_ACK) != 0 && wire.tcpAcknowledgmentAccepted(connection.receiveNext, sequence,
+                                                               connection.sendUnacked, connection.sent,
+                                                               connection.finSent, acknowledgment) {
+        let advanced = (acknowledgment - connection.sendUnacked) & 0xFFFFFFFF
+        let dataAcknowledged = min(advanced, connection.sent)
+        connection.outgoing = connection.outgoing.slice(dataAcknowledged, connection.outgoing.length)
+        connection.sent -= dataAcknowledged
+        connection.sendUnacked = acknowledgment
+        connection.retries = 0
+    }
     let reply = false
     if payload.length > 0 {
-        if sequence == connection.receiveNext {
-            connection.incoming.addBytes(payload)
-            connection.receiveNext = (connection.receiveNext + payload.length) & 0xFFFFFFFF
+        if !wire.incomingFits(connection.incoming.length, payload.length) {
+            sendSegment(network, connection, TCP_RST | TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
+            connection.incoming = Bytes()
+            connection.state = FAILED
+            connection.error = "the connection receive buffer exceeded its size limit"
+            return
         }
+        connection.incoming.addBytes(payload)
+        connection.receiveNext = (connection.receiveNext + payload.length) & 0xFFFFFFFF
         reply = true
     }
     if (flags & TCP_FIN) != 0 && ((sequence + payload.length) & 0xFFFFFFFF) == connection.receiveNext {
@@ -741,7 +711,8 @@ public function poll(network: Network) {
     // Forget finished connections nobody is holding.
     let live: List<Connection> = []
     for connection in network.connections {
-        if (connection.state != FINISHED && connection.state != FAILED) || now - connection.opened < 30000 {
+        let terminal = connection.state == FINISHED || connection.state == FAILED
+        if wire.retainConnection(terminal, connection.opened, now) {
             live.add(connection)
         }
     }

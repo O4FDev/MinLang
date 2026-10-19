@@ -8,7 +8,7 @@ use "files" as files
 record Fixture { scratch: Text; work: Text; project: Text; wrapper: Text; environment: List<Text>; arguments: List<Text>; incremental: Boolean; serial: Integer }
 record Job { handle: Integer; identity: Text; value: Integer; output: Text; log: Text }
 
-constant WRAPPER_SOURCE = "#!/bin/sh\nreal=$LAUNCHER_TEST_REAL_CLANG\nif [ $# -eq 1 ] && { [ \"$1\" = --version ] || [ \"$1\" = -print-prog-name=ld.lld ]; }; then exec \"$real\" \"$@\"; fi\nwork=$LAUNCHER_TEST_WORK\nidentity=$LAUNCHER_TEST_ID\nmode=${LAUNCHER_TEST_MODE:-}\nruntime=0\nsource=\nfor argument in \"$@\"; do\n  case \"$argument\" in -c|-emit-llvm) runtime=1 ;; esac\n  case \"$argument\" in *.c) [ -n \"$source\" ] || source=$argument ;; esac\ndone\nif [ $runtime -eq 1 ]; then\n  printf '%s\\n' \"$@\" > \"$work/$identity-runtime.args\"\n  cp -- \"$source\" \"$work/$identity-runtime.c\"\n  exec \"$real\" \"$@\"\nfi\nprintf '%s\\n' \"$@\" > \"$work/$identity.args.tmp\"\nmv -- \"$work/$identity.args.tmp\" \"$work/$identity.args\"\nif [ \"$mode\" = barrier ]; then\n  count=0\n  while [ ! -e \"$work/first.args\" ] || [ ! -e \"$work/second.args\" ]; do\n    count=$((count + 1))\n    if [ $count -gt 6000 ]; then echo 'link barrier timed out: both compilers must complete' >&2; exit 1; fi\n    sleep 0.005\n  done\nfi\nif [ \"$mode\" = failure ]; then exit 37; fi\nif [ \"$mode\" = signal ]; then kill -TERM \"$PPID\"; exit 0; fi\nexec \"$real\" \"$@\"\n"
+constant WRAPPER_SOURCE = "#!/bin/sh\nreal=$LAUNCHER_TEST_REAL_CLANG\nif [ $# -eq 1 ] && { [ \"$1\" = --version ] || [ \"$1\" = -print-prog-name=ld.lld ]; }; then exec \"$real\" \"$@\"; fi\nwork=$LAUNCHER_TEST_WORK\nidentity=$LAUNCHER_TEST_ID\nmode=${LAUNCHER_TEST_MODE:-}\nruntime=0\nsource=\nfor argument in \"$@\"; do\n  case \"$argument\" in -c|-emit-llvm) runtime=1 ;; esac\n  case \"$argument\" in *.c) [ -n \"$source\" ] || source=$argument ;; esac\ndone\nif [ \"$mode\" = diagnostic-flood ]; then\n  dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\000' x >&2\n  exit 19\nfi\nif [ \"$mode\" = diagnostic-invalid ]; then\n  printf '\\377\\033invalid UTF-8\\n' >&2\n  exit 20\nfi\nif [ $runtime -eq 1 ]; then\n  printf '%s\\n' \"$@\" > \"$work/$identity-runtime.args\"\n  cp -- \"$source\" \"$work/$identity-runtime.c\"\n  exec \"$real\" \"$@\"\nfi\nprintf '%s\\n' \"$@\" > \"$work/$identity.args.tmp\"\nmv -- \"$work/$identity.args.tmp\" \"$work/$identity.args\"\nif [ \"$mode\" = barrier ]; then\n  count=0\n  while [ ! -e \"$work/first.args\" ] || [ ! -e \"$work/second.args\" ]; do\n    count=$((count + 1))\n    if [ $count -gt 6000 ]; then echo 'link barrier timed out: both compilers must complete' >&2; exit 1; fi\n    sleep 0.005\n  done\nfi\nif [ \"$mode\" = failure ]; then exit 37; fi\nif [ \"$mode\" = signal ]; then kill -TERM \"$PPID\"; exit 0; fi\nexec \"$real\" \"$@\"\n"
 
 function chosen(name: Text): Boolean {
     let selected = false
@@ -146,7 +146,7 @@ function concurrent(root: Text, release: Boolean) {
 }
 let names = ["test_same_basename_concurrent_development_builds", "test_same_basename_concurrent_release_builds", "test_clang_path_with_spaces_and_custom_flags",
     "test_compiler_failure_cleans_intermediates", "test_nonrequest_probe_failures_preserve_primary_diagnostic", "test_linker_failure_and_signal_clean_intermediates",
-    "test_check_mode_validates_real_modules_without_native_dependencies"]
+    "test_terminal_paths_are_escaped_without_changing_filesystem_arguments", "test_check_mode_validates_real_modules_without_native_dependencies"]
 for index in 0..processInfo.argumentCount() {
     let valid = processInfo.argument(index) == "--incremental"
     for name in names { if processInfo.argument(index) == name || processInfo.argument(index) == "LauncherIsolation." + name || processInfo.argument(index) == "IncrementalLauncher." + name { valid = true } }
@@ -210,6 +210,65 @@ if chosen("test_linker_failure_and_signal_clean_intermediates") {
         test.check(!support.exists(outputPath(fixture, mode)), mode + " produced output")
         assertClean(fixture)
     }
+    test.removeTree(fixture.scratch)
+    cases += 1
+}
+if chosen("test_terminal_paths_are_escaped_without_changing_filesystem_arguments") {
+    let fixture = setup(root)
+    let controls = "A" + Text(Character(1)) + "B" + Text(Character(27)) + "C" + Text(Character(133)) + "D" + Text(Character(8238)) + "E"
+    let visible = "A\\u{0001}B\\u{001b}C\\u{0085}D\\u{202e}E"
+    let missing = fixture.work + "/missing-" + controls + ".min"
+    let missingResult = launch(fixture, [fixture.project + "/minyar", missing], [], "terminal-missing")
+    test.check(missingResult.status == 1 && missingResult.output == "" && missingResult.errorOutput == "minyar: cannot read source file: " + fixture.work + "/missing-" + visible + ".min\n", "missing source path is escaped byte-for-byte")
+    let source = fixture.work + "/source-" + controls + ".min"
+    io.writeTextFile(source, test.sourceModules("print(42)\n"))
+    let nativeResult = launch(fixture, [fixture.project + "/minyar", "--native-source", "bridge=" + missing, source], [], "terminal-native")
+    test.check(nativeResult.status == 1 && nativeResult.output == "" && nativeResult.errorOutput == "minyar: cannot read native input: " + fixture.work + "/missing-" + visible + ".min\n", "missing native input path is escaped byte-for-byte")
+    let aliasResult = launch(fixture, [fixture.project + "/minyar", source, "-o", source], [], "terminal-alias")
+    test.check(aliasResult.status == 1 && aliasResult.output == "" && aliasResult.errorOutput == "minyar: refusing to replace the source file; choose a different -o path: " + fixture.work + "/source-" + visible + ".min\n", "source alias output path is escaped byte-for-byte")
+    let nativeObject = fixture.work + "/native-" + controls + ".o"
+    io.writeTextFile(nativeObject, "")
+    let collisionArguments = [fixture.project + "/minyar"]
+    for argument in fixture.arguments { collisionArguments.add(argument) }
+    for argument in ["--native-object", "bridge=" + nativeObject, source, "-o", nativeObject] { collisionArguments.add(argument) }
+    let collision = launch(fixture, collisionArguments, ["LAUNCHER_TEST_ID=terminal-collision"], "terminal-collision")
+    test.check(collision.status == 1 && collision.output == "" && collision.errorOutput == "minyar: refusing to replace a native input; choose a different -o path: " + fixture.work + "/native-" + visible + ".o\n", "native input collision path is escaped byte-for-byte")
+    let package = fixture.work + "/bridge.min"
+    let nativeMain = fixture.work + "/native-main.min"
+    let nativeSource = fixture.work + "/native-" + controls + ".c"
+    io.writeTextFile(package, test.sourceModules("public function value(): Integer { native \"bridge\" }\n"))
+    io.writeTextFile(nativeMain, test.sourceModules("use \"bridge\" as bridge\nprint(bridge.value())\n"))
+    io.writeTextFile(nativeSource, "long long minyar_bridge_value( {\n")
+    let nativeArguments = [fixture.project + "/minyar"]
+    for argument in fixture.arguments { nativeArguments.add(argument) }
+    for argument in ["--library", fixture.work, "--native-source", "bridge=" + nativeSource, nativeMain, "-o", fixture.work + "/native-output"] { nativeArguments.add(argument) }
+    let nativeFailure = launch(fixture, nativeArguments, ["LAUNCHER_TEST_ID=terminal-native-failure"], "terminal-native-failure")
+    let rawTerminalControl = false
+    for index in 0..nativeFailure.errorOutput.length {
+        let code = Integer(nativeFailure.errorOutput[index])
+        let control = code < 32 || (code >= 127 && code <= 159) || code == 1564 || code == 8206 || code == 8207 || code == 8232 || code == 8233 || (code >= 8234 && code <= 8238) || (code >= 8294 && code <= 8297)
+        if control && !(code == 10 && index + 1 == nativeFailure.errorOutput.length) { rawTerminalControl = true }
+    }
+    test.check(nativeFailure.status != 0 && test.contains(nativeFailure.errorOutput, fixture.work + "/native-" + visible + ".c") && !rawTerminalControl, "native compiler diagnostic escapes C0, C1, and bidi controls\n" + nativeFailure.errorOutput)
+    let direct = fixture.project + "/build/tooling/tools/clang-driver"
+    let flood = launch(fixture, [direct, "compile", "-c", nativeSource, "-o", fixture.work + "/flood.o"], ["LAUNCHER_TEST_ID=terminal-flood", "LAUNCHER_TEST_MODE=diagnostic-flood"], "terminal-flood")
+    test.check(flood.status == 19 && Bytes(flood.errorOutput).length < 1048700 && test.contains(flood.errorOutput, "[diagnostic truncated after 1048576 bytes]"), "native diagnostic capture stays bounded and reports truncation")
+    let invalid = launch(fixture, [direct, "compile", "-c", nativeSource, "-o", fixture.work + "/invalid.o"], ["LAUNCHER_TEST_ID=terminal-invalid", "LAUNCHER_TEST_MODE=diagnostic-invalid"], "terminal-invalid")
+    test.check(invalid.status == 20 && invalid.errorOutput == "\\xff\\x1binvalid UTF-8\n", "invalid UTF-8 diagnostic bytes are preserved as visible escapes")
+    let checkArguments = [fixture.project + "/minyar"]
+    for argument in fixture.arguments { checkArguments.add(argument) }
+    checkArguments.add("--check")
+    checkArguments.add(source)
+    let checked = launch(fixture, checkArguments, ["LAUNCHER_TEST_ID=terminal-check"], "terminal-check")
+    test.check(checked.status == 0 && checked.errorOutput == "" && checked.output == "checked " + fixture.work + "/source-" + visible + ".min\n", "check summary escapes the path while compiling the original path")
+    let output = fixture.work + "/output-" + controls
+    let buildArguments = [fixture.project + "/minyar"]
+    for argument in fixture.arguments { buildArguments.add(argument) }
+    for argument in [source, "-o", output] { buildArguments.add(argument) }
+    let built = launch(fixture, buildArguments, ["LAUNCHER_TEST_ID=terminal-build"], "terminal-build")
+    test.check(built.status == 0 && built.errorOutput == "" && built.output == "built " + fixture.work + "/output-" + visible + "\n", "build summary escapes the path while writing the original path")
+    test.check(programOutput(fixture, output) == "42\n", "terminal-safe output did not change the filesystem path")
+    assertClean(fixture)
     test.removeTree(fixture.scratch)
     cases += 1
 }
