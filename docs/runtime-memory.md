@@ -103,9 +103,12 @@ frames. The owner thread evaluates bounds and snapshots scalar captures once,
 then keeps its existing owners alive until every worker acknowledges completion.
 Same-index aliases are safe. Arbitrary indexed reads require a buffer that no
 iteration writes. The compiler compares potentially aliased input/output roots
-before dispatch and rejects a shared object; distinct scalar buffers own
-separate backing storage. This guard is needed only for matching buffer types
-and a nonempty range. Each buffer pair is checked once, on the owner thread.
+before dispatch. Lists compare object identity. Bytes compare backing ranges,
+including C-layout views with different headers: shifted overlapping views
+cannot be written together or read while another view writes. Direct-index
+aliases with the same backing start remain safe. Adjacent disjoint views are
+allowed. Guards are needed only for matching buffer types and a nonempty
+range. Each buffer pair is checked once, on the owner thread.
 
 Hosted jobs use a persistent pthread pool with one queue per worker and chunk
 stealing. Storage is bounded by 64 workers plus each thread's native stack and

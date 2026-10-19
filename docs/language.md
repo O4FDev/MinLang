@@ -1006,6 +1006,10 @@ scalar buffers may be read at any checked index. When an input could alias an
 output, the compiler inserts a check before dispatch; an alias stops with a
 clear error asking for a separate input buffer. Empty ranges do no work and
 need no alias check.
+Bytes views from C-layout records are checked by backing range, including
+pairs of outputs. Views starting at the same byte may share direct-index
+access; shifted overlapping views need separate storage or a copy. Disjoint
+views of one owner can still run together.
 Buffers keep their existing length, bounds checks and shared reference semantics.
 Managed values cannot be created, passed to functions, resized or returned by an
 iteration. Calls must be to pure `parallel function`s, including their callees;

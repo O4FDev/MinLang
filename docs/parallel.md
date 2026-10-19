@@ -4,7 +4,11 @@
 scalar buffers keep their owners on the calling thread. Each iteration writes
 only its own index, while scalar captures are snapshots. The compiler rejects
 reference escape, resizing, changed indices, shared scalar mutation and callees
-that can reach raw machine or native effects. Same-index aliases remain safe.
+that can reach raw machine or native effects. Same-index aliases remain safe
+when their storage begins at the same byte. Bytes guards compare backing
+ranges, so C-layout views with distinct headers cannot hide shifted overlaps.
+Read/write pairs and pairs of outputs are checked before dispatch; adjacent
+views remain usable.
 The [language guide](language.md#parallel-ranges) describes the supported syntax.
 
 On macOS and Linux, persistent pthread workers claim chunks of 128 indices

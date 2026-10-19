@@ -10,6 +10,23 @@ void minyar_parallel_no_alias(const void *input, const void *output,
         minyar_stop("a parallel input read at another index aliases a buffer written by parallel for; use a separate input buffer.");
 }
 
+void minyar_parallel_bytes_no_overlap(const MinyarText *left, const MinyarText *right,
+                                      long long first, long long after, long long same_index) {
+    if (first >= after) return;
+    uintptr_t a = (uintptr_t)left->bytes, b = (uintptr_t)right->bytes;
+    if (same_index && a == b) return;
+    if (left->byte_length <= 0 || right->byte_length <= 0) return;
+    /* Differences avoid wrapping an end pointer, including for trusted native
+     * address views. Ordinary Bytes copies have independent backing storage. */
+    int overlaps = a <= b ? b - a < (uint64_t)left->byte_length
+                          : a - b < (uint64_t)right->byte_length;
+    if (overlaps) {
+        if (same_index)
+            minyar_stop("parallel for buffers overlap at different indices; use separate Bytes storage or copy a view before writing.");
+        minyar_stop("a parallel input read at another index aliases a buffer written by parallel for; use a separate input buffer.");
+    }
+}
+
 #define MINYAR_PARALLEL_LIMIT 64
 #define MINYAR_PARALLEL_GRAIN 128
 

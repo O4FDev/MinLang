@@ -170,19 +170,23 @@ function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: 
     let written = parallelWrittenBuffers(context, firstNode, body, captures, types)
     let result: List<Integer> = []
     let seen: List<Text> = []
+    let byteNames: List<Text> = []
+    let offIndex: List<Text> = []
     let node = firstNode
     while node < context.syntax.nodes.length {
         let access = context.syntax.nodes[node]
-        if access.start >= body && access.kind == 213 {
+        if access.start >= body && (access.kind == 213 || access.kind == 214) {
             let name = context.tokenTexts[access.start]
             let read = findText(captures, name)
-            if read >= 0 && !parallelDirectIndex(context, access.start, access.end, name, index) {
+            if read >= 0 && types[read] == 8 && findText(byteNames, name) < 0 { byteNames.add(name) }
+            if read >= 0 && access.kind == 213 && !parallelDirectIndex(context, access.start, access.end, name, index) {
+                if findText(offIndex, name) < 0 { offIndex.add(name) }
                 let output = 0
                 while output < written.length {
                     let write = findText(captures, written[output])
-                    if types[read] == types[write] {
+                    if types[read] != 8 && types[read] == types[write] {
                         let pair = Text(read) + "/" + Text(write)
-                        if findText(seen, pair) < 0 { seen.add(pair); result.add(read); result.add(write) }
+                        if findText(seen, pair) < 0 { seen.add(pair); result.add(read); result.add(write); result.add(0) }
                     }
                     output = output + 1
                 }
@@ -190,23 +194,45 @@ function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: 
         }
         node = node + 1
     }
+    // C-layout fields can expose distinct Bytes headers over overlapping
+    // storage. Direct-index reads and two outputs need this check too.
+    let left = 0
+    while left < byteNames.length {
+        let right = left + 1
+        while right < byteNames.length {
+            let a = byteNames[left]
+            let b = byteNames[right]
+            if findText(written, a) >= 0 || findText(written, b) >= 0 {
+                let kind = 2
+                if findText(offIndex, a) >= 0 || findText(offIndex, b) >= 0 { kind = 1 }
+                result.add(findText(captures, a)); result.add(findText(captures, b)); result.add(kind)
+            }
+            right = right + 1
+        }
+        left = left + 1
+    }
     return result
 }
 
 function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guards: List<Integer>, parts: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
     if guards.length == 0 { return }
-    let declaration = "declare void @minyar_parallel_no_alias(ptr, ptr, i64, i64)\n"
-    if findText(globals, declaration) < 0 { globals.add(declaration) }
     let first = loadLocal(output, textState, state, parts[1], 1)
     let after = loadLocal(output, textState, state, parts[2], 1)
     let pair = 0
     while pair < guards.length {
         let read = guards[pair]
         let write = guards[pair + 1]
+        let kind = guards[pair + 2]
         let input = loadLocal(output, textState, state, ids[read], types[read])
         let target = loadLocal(output, textState, state, ids[write], types[write])
-        output.add("  call void @minyar_parallel_no_alias(ptr " + input + ", ptr " + target + ", i64 " + first + ", i64 " + after + ")\n")
-        pair = pair + 2
+        let callee = "minyar_parallel_no_alias"
+        let parameters = "ptr, ptr, i64, i64"
+        let extra = ""
+        if kind != 0 { callee = "minyar_parallel_bytes_no_overlap"; parameters += ", i64"; extra = ", i64 " + Text(kind - 1) }
+        let declaration = "declare void @" + callee + "(" + parameters + ")\n"
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        output.add("  call void @" + callee + "(ptr " + input + ", ptr " + target + ", i64 " + first + ", i64 " + after + extra + ")\n")
+        pair = pair + 3
     }
 }
 

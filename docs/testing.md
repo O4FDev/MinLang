@@ -228,7 +228,11 @@ and runtime C are both instrumented in their sanitizer variants.
 `make check-parallel-for` runs safe range programs and the parallel gallery at
 O0/O2 with exact output and ownership cleanup assertions. Race rejections cover
 shared scalars, changed indices, overlapping slots, managed values, escaping
-aliases and transitively unsafe machine calls. `check-parallel-for-sanitize`
+aliases and transitively unsafe machine calls. C-layout Byte views cover
+shifted read/write and write/write overlaps, identical-start aliases and
+adjacent disjoint views, including empty jobs. Warm module state is reused
+before an imported pure function is changed to perform a raw write.
+`check-parallel-for-sanitize`
 instruments both generated LLVM and the ownership runtime with ASan/UBSan.
 The hosted cases cover readonly parameter captures of every scalar kind, actual
 multi-chunk jobs, aliases, repeated dispatch, bounds evaluated once, and terminal
