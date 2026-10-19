@@ -350,7 +350,30 @@ sys.exit(1 if found else 0)
         errors = client.diagnostics(path.as_uri(), 1)
         assert errors and "not valid UTF-8" in errors[0]["message"], errors
         client.close()
-    print("LSP NDJSON handoff, multiple errors, scalar/UTF-16 spans and failed compiler controls passed")
+        compiler.write_text('''#!/usr/bin/env python3
+import pathlib, sys
+if "--error-format" in sys.argv:
+    print("error: usage: compiler SOURCE OUTPUT", file=sys.stderr)
+    sys.exit(1)
+source = pathlib.Path(sys.argv[1]).read_text()
+if "missing" in source:
+    position = source.index("missing")
+    line = source.count("\\n", 0, position) + 1
+    column = position - source.rfind("\\n", 0, position)
+    print("error: unknown value missing", file=sys.stderr)
+    print(f"  --> {sys.argv[1]}:{line}:{column}", file=sys.stderr)
+    sys.exit(1)
+pathlib.Path(sys.argv[2]).write_text("")
+''')
+        client = Client([server, "--compiler", str(compiler)])
+        client.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+        client.send("textDocument/didOpen", {"textDocument": {"uri": path.as_uri(), "version": 1, "text": source}})
+        errors = client.diagnostics(path.as_uri(), 1)
+        assert errors and errors[0]["range"]["start"] == point(source, "missing"), errors
+        client.send("textDocument/didChange", {"textDocument": {"uri": path.as_uri(), "version": 2}, "contentChanges": [{"text": "print(42)\n"}]})
+        assert client.diagnostics(path.as_uri(), 2) == []
+        client.close()
+    print("LSP NDJSON/legacy handoff, multiple errors, scalar/UTF-16 spans and failed compiler controls passed")
 
 
 if __name__ == "__main__":
