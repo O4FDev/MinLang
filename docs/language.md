@@ -1201,6 +1201,19 @@ still become visible where they are declared.
 The compiler retains resolved types and source spans for checked declarations,
 statements and expressions. See the [compiler syntax tree](compiler-syntax.md).
 
+Compiler diagnostics identify the source file, line and column. Common syntax,
+type and field errors also show the source line and underline the relevant
+token. Columns count Unicode scalar values, starting at one. Type mismatches
+show the expected and actual types where those are known:
+
+```text
+error: the value for 'stars' does not match its declared type; expected Integer, found Text
+  --> sky.min:1:5
+   |
+ 1 | let stars: Integer = "many"
+   |     ^^^^^
+```
+
 `if` chains may continue with `else if`:
 
 ```minyar

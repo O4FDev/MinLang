@@ -1146,6 +1146,7 @@ void minyar_initialize_arguments(int count, char **values) {
 #endif
 
 #include "minyar_library.h"
+#include "minyar_diagnostics.h"
 #if MINYAR_THREADED
 #include "minyar_thread_os.h"
 #endif

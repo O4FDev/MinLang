@@ -800,6 +800,12 @@ Adding a rejecting fixture without its golden file fails the suite. The lexer
 accepts a leading UTF-8 byte-order mark and gives an exact line and column for
 unsupported non-ASCII identifier characters.
 
+Every golden includes its source filename, line, column, source excerpt and
+token underline. The renderer's CRLF, tab, control-character and help-note
+contracts also run in `check-syntax-tree` at O0/O2. `check-bootstrap-native`
+checks the runtime-native bridge used by the compiler, including native Text,
+Boolean and Integer results, void calls and malformed native bodies.
+
 `make check-conformance` executes the feature-indexed programs under
 `tests/conformance/` at O0 and O2. Its README maps every section of the language
 specification to primary positive evidence and to negative/boundary suites.

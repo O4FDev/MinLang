@@ -86,7 +86,7 @@ function textDelimiterAt(source: Text, position: Integer, multiline: Boolean, ra
 
 // Decode only literal source ranges, so escaped newlines and expression source
 // are never mistaken for the indentation of a physical content line.
-function decodeTextPart(source: Text, start: Integer, end: Integer, line: Integer, lineStart: Integer, indentation: Integer, multiline: Boolean, raw: Boolean): Text {
+function decodeTextPart(source: Text, sources: SourceMap, start: Integer, end: Integer, line: Integer, lineStart: Integer, indentation: Integer, multiline: Boolean, raw: Boolean): Text {
     let pieces: List<Text> = []
     let position = start
     let chunkStart = start
@@ -96,7 +96,7 @@ function decodeTextPart(source: Text, start: Integer, end: Integer, line: Intege
             while whitespace < end && (source[whitespace] == ' ' || source[whitespace] == '\t') { whitespace = whitespace + 1 }
             let blank = whitespace >= source.length || source[whitespace] == '\n' || (source[whitespace] == '\r' && whitespace + 1 < source.length && source[whitespace + 1] == '\n')
             if whitespace - position < indentation && !blank {
-                fail("line " + sourceLocation(line, 1) + ": multi-line Text has less indentation than its closing delimiter")
+                failAtSource(sources, source, line, 1, "multi-line Text has less indentation than its closing delimiter")
             }
             let removed = indentation
             if whitespace - position < removed { removed = whitespace - position }
@@ -153,7 +153,7 @@ function addTextPart(tokenKinds: List<Integer>, tokenTexts: List<Text>, coordina
     addToken(tokenKinds, tokenTexts, coordinates, 3, "", line, start - lineStart + 1)
 }
 
-function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, coordinates: List<Integer>, cursor: Bytes, documentationLines: List<Integer>, documentationTexts: List<Text>) {
+function tokenizeText(source: Text, sources: SourceMap, tokenKinds: List<Integer>, tokenTexts: List<Text>, coordinates: List<Integer>, cursor: Bytes, documentationLines: List<Integer>, documentationTexts: List<Text>) {
     let position = cursor.getInt64(0)
     let line = cursor.getInt64(8)
     let lineStart = cursor.getInt64(16)
@@ -169,7 +169,7 @@ function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
         position = position + 2
         if position < source.length && source[position] == '\r' { position = position + 1 }
         if position >= source.length || source[position] != '\n' {
-            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": multi-line Text must begin on a new line after its opening delimiter")
+            failAtSource(sources, source, tokenLine, tokenColumn, "multi-line Text must begin on a new line after its opening delimiter")
         }
         position = position + 1
         line = line + 1
@@ -196,7 +196,7 @@ function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                 cursor.setInt64(0, position + 2)
                 cursor.setInt64(8, line)
                 cursor.setInt64(16, lineStart)
-                tokenizePart(source, tokenKinds, tokenTexts, coordinates, cursor, true, documentationLines, documentationTexts)
+                tokenizePart(source, sources, tokenKinds, tokenTexts, coordinates, cursor, true, documentationLines, documentationTexts)
                 position = cursor.getInt64(0)
                 line = cursor.getInt64(8)
                 lineStart = cursor.getInt64(16)
@@ -215,16 +215,16 @@ function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
         }
     }
     if position >= source.length {
-        if raw { fail("line " + sourceLocation(tokenLine, tokenColumn) + ": raw Text is missing its closing delimiter") }
-        if multiline { fail("line " + sourceLocation(tokenLine, tokenColumn) + ": multi-line Text is missing its closing delimiter") }
-        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
+        if raw { failAtSource(sources, source, tokenLine, tokenColumn, "raw Text is missing its closing delimiter") }
+        if multiline { failAtSource(sources, source, tokenLine, tokenColumn, "multi-line Text is missing its closing delimiter") }
+        failAtSource(sources, source, tokenLine, tokenColumn, "Text literal is missing its closing quote")
     }
     let contentEnd = position
     let indentation = 0
     if multiline {
         let scan = lineStart
         while scan < position && (source[scan] == ' ' || source[scan] == '\t') { scan = scan + 1 }
-        if scan != position { fail("line " + sourceLocation(line, position - lineStart + 1) + ": the closing delimiter for multi-line Text must be on its own line") }
+        if scan != position { failAtSource(sources, source, line, position - lineStart + 1, "the closing delimiter for multi-line Text must be on its own line") }
         indentation = position - lineStart
         contentEnd = lineStart
         if contentEnd > bodyStart {
@@ -237,7 +237,7 @@ function tokenizeText(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
     addTextPart(tokenKinds, tokenTexts, coordinates, parts, chunkStart, finalEnd, chunkLine, chunkLineStart)
     let part = 0
     while part < parts.length {
-        tokenTexts[parts.getInt64(part)] = decodeTextPart(source, parts.getInt64(part + 8), parts.getInt64(part + 16), parts.getInt64(part + 24), parts.getInt64(part + 32), indentation, multiline, raw)
+        tokenTexts[parts.getInt64(part)] = decodeTextPart(source, sources, parts.getInt64(part + 8), parts.getInt64(part + 16), parts.getInt64(part + 24), parts.getInt64(part + 32), indentation, multiline, raw)
         part = part + 40
     }
     // Noninterpolated literals retain their opening-delimiter location.
@@ -273,7 +273,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     let firstToken = tokenKinds.length
     let documentationLines: List<Integer> = []
     let documentationTexts: List<Text> = []
-    tokenizePart(source, tokenKinds, tokenTexts, coordinates, cursor, false, documentationLines, documentationTexts)
+    tokenizePart(source, tokenLines, tokenKinds, tokenTexts, coordinates, cursor, false, documentationLines, documentationTexts)
     attachDocumentation(tokenKinds, tokenTexts, tokenLines, firstToken, documentationLines, documentationTexts)
     let features = cursor.getInt64(24)
     if tokenLines.features / 4096 % 2 == 0 && features / 4096 % 2 != 0 {
@@ -292,7 +292,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     tokenLines.features = features
 }
 
-function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, coordinates: List<Integer>, cursor: Bytes, interpolation: Boolean, documentationLines: List<Integer>, documentationTexts: List<Text>) {
+function tokenizePart(source: Text, sources: SourceMap, tokenKinds: List<Integer>, tokenTexts: List<Text>, coordinates: List<Integer>, cursor: Bytes, interpolation: Boolean, documentationLines: List<Integer>, documentationTexts: List<Text>) {
     let firstToken = tokenKinds.length
     let modifiers = false
     let aliases = false
@@ -367,7 +367,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                         position = position + 1
                     }
                     if position + 1 >= length {
-                        fail("line " + sourceLocation(commentLine, commentColumn) + ": block comment is missing its closing */")
+                        failAtSource(sources, source, commentLine, commentColumn, "block comment is missing its closing */")
                     }
                     position = position + 2
                 } else {
@@ -413,7 +413,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                             if octal {
                                 position = position + 1
                                 if position >= length || source[position] < '0' || source[position] > '7' {
-                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": an octal Integer literal needs only digits 0 through 7 after 0o")
+                                    failAtSource(sources, source, tokenLine, tokenColumn, "an octal Integer literal needs only digits 0 through 7 after 0o")
                                 }
                                 hexValue = 0
                                 while position < length && source[position] >= '0' && source[position] <= '7' {
@@ -422,14 +422,14 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                         if hexValue == 1152921504606846976 && digit == 0 && (position + 1 == length || source[position + 1] < '0' || source[position + 1] > '7') {
                                             hexMinimum = true
                                         } else {
-                                            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Integer literal is outside the supported range")
+                                            failAtSource(sources, source, tokenLine, tokenColumn, "Integer literal is outside the supported range")
                                         }
                                     }
                                     if !hexMinimum { hexValue = hexValue * 8 + digit }
                                     position = position + 1
                                 }
                                 if position < length && (characterIsLetter(source[position]) || characterIsDigit(source[position]) || source[position] == '_') {
-                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": an octal Integer literal needs only digits 0 through 7 after 0o")
+                                    failAtSource(sources, source, tokenLine, tokenColumn, "an octal Integer literal needs only digits 0 through 7 after 0o")
                                 }
                             }
                             if character == '0' && position == start + 1 && position + 1 < length && source[position] == 'x' && characterIsHexDigit(source[position + 1]) {
@@ -441,7 +441,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                         if hexValue == 576460752303423488 && digit == 0 && (position + 1 == length || !characterIsHexDigit(source[position + 1])) {
                                             hexMinimum = true
                                         } else {
-                                            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Integer literal is outside the supported range")
+                                            failAtSource(sources, source, tokenLine, tokenColumn, "Integer literal is outside the supported range")
                                         }
                                     }
                                     if !hexMinimum { hexValue = hexValue * 16 + digit }
@@ -449,8 +449,8 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                 }
                             }
                             if hexValue >= 0 && position + 1 < length && source[position] == '.' && characterIsDigit(source[position + 1]) {
-                                if octal { fail("line " + sourceLocation(tokenLine, tokenColumn) + ": octal literals are Integers and cannot have a decimal point") }
-                                fail("line " + sourceLocation(tokenLine, tokenColumn) + ": hexadecimal literals are Integers and cannot have a decimal point")
+                                if octal { failAtSource(sources, source, tokenLine, tokenColumn, "octal literals are Integers and cannot have a decimal point") }
+                                failAtSource(sources, source, tokenLine, tokenColumn, "hexadecimal literals are Integers and cannot have a decimal point")
                             }
                             if numberKind == 2 && position + 1 < length && source[position] == '.' && characterIsDigit(source[position + 1]) {
                                 numberKind = 7
@@ -464,7 +464,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                         position = position + 1
                                     }
                                     if position >= length || !characterIsDigit(source[position]) {
-                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": a Float exponent needs digits, as in 1.5e3")
+                                        failAtSource(sources, source, tokenLine, tokenColumn, "a Float exponent needs digits, as in 1.5e3")
                                     }
                                     while position < length && characterIsDigit(source[position]) {
                                         position = position + 1
@@ -473,7 +473,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                             }
                             let digits = source.slice(start, position)
                             if numberKind == 2 && hexValue < 0 && character == '0' && position > start + 1 {
-                                fail("line " + sourceLocation(tokenLine, tokenColumn) + ": decimal Integer literals cannot have a leading zero; use 0o for octal")
+                                failAtSource(sources, source, tokenLine, tokenColumn, "decimal Integer literals cannot have a leading zero; use 0o for octal")
                             }
                             if hexValue >= 0 {
                                 if hexMinimum { digits = "9223372036854775808" } else { digits = Text(hexValue) }
@@ -502,7 +502,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                     cursor.setInt64(8, line)
                                     cursor.setInt64(16, lineStart)
                                     cursor.setInt64(24, features)
-                                    tokenizeText(source, tokenKinds, tokenTexts, coordinates, cursor, documentationLines, documentationTexts)
+                                    tokenizeText(source, sources, tokenKinds, tokenTexts, coordinates, cursor, documentationLines, documentationTexts)
                                     features = cursor.getInt64(24)
                                     callbacks = features % 2 != 0
                                     position = cursor.getInt64(0)
@@ -511,20 +511,20 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                 }
                             } else {
                                 if character > '~' {
-                                    fail("line " + Text(line) + ", column " + Text(position - lineStart + 1) + ": names must use ASCII letters, digits, and '_'; found non-ASCII character '" + Text(character) + "'")
+                                    failAtSource(sources, source, line, position - lineStart + 1, "names must use ASCII letters, digits, and '_'; found non-ASCII character '" + Text(character) + "'")
                                 }
                                 if character == '\'' {
                                     let tokenLine = line
                                     let tokenColumn = position - lineStart + 1
                                     position = position + 1
                                     if position >= length {
-                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal is missing its value and closing quote")
+                                        failAtSource(sources, source, tokenLine, tokenColumn, "Character literal is missing its value and closing quote")
                                     }
                                     let value = source[position]
                                     if value == '\\' {
                                         position = position + 1
                                         if position >= length {
-                                            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal has an unfinished escape")
+                                            failAtSource(sources, source, tokenLine, tokenColumn, "Character literal has an unfinished escape")
                                         }
                                         let escape = source[position]
                                         if escape == 'n' {
@@ -547,7 +547,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
                                     }
                                     position = position + 1
                                     if position >= length || source[position] != '\'' {
-                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal must contain exactly one character and a closing quote")
+                                        failAtSource(sources, source, tokenLine, tokenColumn, "Character literal must contain exactly one character and a closing quote")
                                     }
                                     position = position + 1
                                     addToken(tokenKinds, tokenTexts, coordinates, 5, Text(value), tokenLine, tokenColumn)
@@ -613,7 +613,7 @@ function tokenizePart(source: Text, tokenKinds: List<Integer>, tokenTexts: List<
     }
 
     if interpolation {
-        fail("line " + sourceLocation(cursor.getInt64(8), cursor.getInt64(0) - cursor.getInt64(16)) + ": text interpolation is missing its closing ')'")
+        failAtSource(sources, source, cursor.getInt64(8), cursor.getInt64(0) - cursor.getInt64(16), "text interpolation is missing its closing ')'")
     }
     addToken(tokenKinds, tokenTexts, coordinates, 0, "", line, position - lineStart + 1)
     let scan = firstToken
@@ -693,7 +693,7 @@ function tokenIs(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: List
 
 function expectToken(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, expected: Text) {
     if !tokenIs(tokenKinds, tokenTexts, cursor, expected) {
-        fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": expected '" + expected + "', found '" + tokenTexts[cursor[0]] + "'")
+        failAtToken(tokenLines, cursor[0], "expected '" + expected + "', found '" + tokenTexts[cursor[0]] + "'")
     }
     cursor[0] = cursor[0] + 1
 }
@@ -709,7 +709,7 @@ function finishStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         skipTerminators(tokenKinds, cursor)
     } else {
         if tokenKinds[cursor[0]] != 0 && !tokenIs(tokenKinds, tokenTexts, cursor, "}") {
-            fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": unexpected '" + tokenTexts[cursor[0]] + "'; start the next statement on a new line")
+            failAtToken(tokenLines, cursor[0], "unexpected '" + tokenTexts[cursor[0]] + "'; start the next statement on a new line")
         }
     }
 }

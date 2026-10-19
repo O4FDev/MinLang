@@ -134,8 +134,15 @@ failAtToken(context.tokenLines, position, "expected a value")
 ```
 
 `sourceSpan(map, file, first, after)` also serves diagnostics that have a token
-range but no node. Existing diagnostic text keeps its established formatter;
-converting every old failure to this API is a separate migration.
+range but no node. `compiler/stages/diagnostics.min` renders these spans with
+the original source line and a token underline. `failDiagnostic` also accepts
+an underline label and a help note. Cached declaration origins use the same
+span decoder. Lexical failures retain the current module's filename.
+
+Source reads and formatting happen only on failure. An unavailable source
+file keeps its location and message. Tabs display as four spaces, CRLF source
+lines lose their carriage return, and terminal control characters are escaped.
+Older checks are being moved to these helpers without changing their meaning.
 
 ## Checks
 

@@ -1,0 +1,115 @@
+// Formatting and source reads happen only when a diagnostic is reported.
+function diagnosticWrite(text: Text) { native "runtime" }
+function diagnosticSource(path: Text): Text { native "runtime" }
+
+function diagnosticRepeat(text: Text, count: Integer): Text {
+    let pieces: List<Text> = []
+    let index = 0
+    while index < count { pieces.add(text); index = index + 1 }
+    return joinText(pieces)
+}
+
+function diagnosticLine(source: Text, wanted: Integer): Text {
+    let line = 1
+    let start = 0
+    let position = 0
+    while position < source.length {
+        if source[position] == '\n' {
+            if line == wanted {
+                let end = position
+                if end > start && source[end - 1] == '\r' { end = end - 1 }
+                return source.slice(start, end)
+            }
+            line = line + 1
+            start = position + 1
+        }
+        position = position + 1
+    }
+    if line == wanted { return source.slice(start, position) }
+    return ""
+}
+
+// Columns are Unicode scalars, just as in the lexer. Tabs expand to four
+// spaces in both the excerpt and underline. Control bytes cannot affect a TTY.
+function diagnosticDisplay(text: Text): Text {
+    let pieces: List<Text> = []
+    let position = 0
+    while position < text.length {
+        let character = text[position]
+        if character == '\t' { pieces.add("    ") }
+        else if Integer(character) < 32 || Integer(character) == 127 { pieces.add("�") }
+        else { pieces.add(Text(character)) }
+        position = position + 1
+    }
+    return joinText(pieces)
+}
+
+function diagnosticTokenWidth(line: Text, column: Integer): Integer {
+    let start = column - 1
+    if start < 0 || start >= line.length { return 1 }
+    let character = line[start]
+    let end = start + 1
+    if characterIsLetter(character) || characterIsDigit(character) || character == '_' {
+        while end < line.length && (characterIsLetter(line[end]) || characterIsDigit(line[end]) || line[end] == '_') { end = end + 1 }
+    } else if character == '"' || character == '\'' {
+        while end < line.length && line[end] != character {
+            if line[end] == '\\' && end + 1 < line.length { end = end + 1 }
+            end = end + 1
+        }
+        if end < line.length { end = end + 1 }
+    } else if end < line.length {
+        let pair = line.slice(start, end + 1)
+        if pair == "==" || pair == "!=" || pair == "<=" || pair == ">=" || pair == "&&" || pair == "||" || pair == "<<" || pair == ">>" || pair == ".." || pair == "->" || pair == "+=" || pair == "-=" || pair == "*=" || pair == "/=" || pair == "%=" { end = end + 1 }
+    }
+    return end - start
+}
+
+function renderDiagnostic(span: SourceSpan, source: Text, message: Text, label: Text, help: Text): Text {
+    let line = diagnosticLine(source, span.line)
+    let number = Text(span.line)
+    let margin = diagnosticRepeat(" ", number.length + 2)
+    let pieces: List<Text> = ["error: " + message + "\n", "  --> " + describeSpan(span) + "\n"]
+    if source != "" {
+        let start = span.column - 1
+        if start > line.length { start = line.length }
+        let width = diagnosticTokenWidth(line, span.column)
+        let before = diagnosticDisplay(line.slice(0, start))
+        let under = "^"
+        if start < line.length {
+            let end = start + width
+            if end > line.length { end = line.length }
+            under = diagnosticRepeat("^", diagnosticDisplay(line.slice(start, end)).length)
+        }
+        pieces.add(margin + "|\n")
+        pieces.add(" " + number + " | " + diagnosticDisplay(line) + "\n")
+        pieces.add(margin + "| " + diagnosticRepeat(" ", before.length) + under)
+        if label != "" { pieces.add(" " + label) }
+        pieces.add("\n")
+    }
+    if help != "" { pieces.add(margin + "= help: " + help + "\n") }
+    return joinText(pieces)
+}
+
+function failDiagnostic(span: SourceSpan, message: Text, label: Text, help: Text) {
+    diagnosticWrite(renderDiagnostic(span, diagnosticSource(span.file), message, label, help))
+    exit(1)
+}
+
+// Cached declaration interfaces retain legacy origins. Decode them only on
+// failure, using the same full-width span decoder as ordinary syntax nodes.
+function failAtLocation(file: Text, location: Text, message: Text) {
+    let sources = newSourceMap()
+    sources.coordinates.add(-1)
+    sources.coordinates.add(0)
+    sources.origins.add(location)
+    failDiagnostic(sourceSpan(sources, file, 0, 1), message, "", "")
+}
+
+function failAtSource(sources: SourceMap, source: Text, line: Integer, column: Integer, message: Text) {
+    let file = sources.diagnosticPath
+    if file == "" { file = sources.inputPath }
+    if file == "" { file = "<source>" }
+    let span = SourceSpan { file: file, line: line, column: column, firstToken: -1, afterToken: -1 }
+    diagnosticWrite(renderDiagnostic(span, source, message, "", ""))
+    exit(1)
+}
