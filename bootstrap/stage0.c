@@ -1073,12 +1073,12 @@ static Function parse_function(Parser *parser) {
     }
     if (native_body) {
         advance(parser);
-        if (parser->token.kind != TOKEN_TEXT || strcmp(parser->token.text, "runtime"))
+        if (parser->token.kind != TOKEN_TEXT || (strcmp(parser->token.text, "runtime") && strcmp(parser->token.text, "diagnostics")))
             fail_at(parser->token.line, parser->token.column,
                     "bootstrap native functions use the runtime library");
         if (!strcmp(function.name, "main"))
             fail_at(function.line, function.column, "main cannot have a native body");
-        function.native_library = copy_text("runtime", 7);
+        function.native_library = copy_text(parser->token.text, strlen(parser->token.text));
         advance(parser);
         skip_separators(parser);
         expect(parser, '}', "a closing brace after the native body");
@@ -1746,6 +1746,16 @@ static void check_program(Program *program) {
             Parameter *parameter = &function->parameters[parameter_index];
             add_local(function, parameter->name, parameter->type, parameter->line,
                       parameter->column);
+        }
+        if (function->native_library && !strcmp(function->native_library, "diagnostics")) {
+            Function *callback = find_function(program, "diagnosticCompileJob");
+            if (strcmp(function->name, "diagnosticRun") || function->return_type != TYPE_BOOLEAN ||
+                arrlen(function->parameters) != 1 || function->parameters[0].type < TYPE_RECORD_START ||
+                bootstrap_is_list(function->parameters[0].type) || !callback ||
+                callback->return_type != TYPE_NOTHING || arrlen(callback->parameters) != 1 ||
+                callback->parameters[0].type != function->parameters[0].type)
+                fail_at(function->line, function->column,
+                        "compiler diagnostics require diagnosticRun(Job): Boolean and diagnosticCompileJob(Job)");
         }
         check_statements(program, function, function->body, 0);
         if (!function->native_library && function->return_type != TYPE_NOTHING && strcmp(function->name, "main") != 0 &&
@@ -2474,6 +2484,13 @@ static void emit_program(FILE *output, Program *program) {
 
     for (index = 0; index < (size_t)arrlen(program->functions); index++) {
         Function *function = &program->functions[index];
+        if (function->native_library && !strcmp(function->native_library, "diagnostics")) {
+            fputs("declare zeroext i1 @minyar_compiler_try(ptr, ptr)\n"
+                  "define i1 @.minyar.fn.diagnosticRun(ptr %argument.0) {\nentry:\n"
+                  "  %native.result = call zeroext i1 @minyar_compiler_try(ptr @.minyar.fn.diagnosticCompileJob, ptr %argument.0)\n"
+                  "  ret i1 %native.result\n}\n\n", output);
+            continue;
+        }
         if (function->native_library) {
             const char *result = function->return_type == TYPE_BOOLEAN ? "zeroext i1" : llvm_type(function->return_type);
             fprintf(output, "declare %s @minyar_runtime_%s(", result, function->name);

@@ -2,6 +2,7 @@ use "io" as io
 use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
+use "./frontend-fixtures.min" as fixtures
 
 let compiler = test.compiler()
 let stage0 = test.setting("MINYAR_TEST_STAGE0", "./build/stage0")
@@ -14,8 +15,8 @@ for optimization in ["-O0", "-O2"] {
     let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
     test.check(result.status == 0 && result.output == "a light in the harbour · ★\ntrue\n-9223372036854775808\n★\n42\n42\n" && result.errorOutput == "", "bootstrap native ABI " + optimization)
 }
-let rejected = ["function main(): Integer { native \"runtime\" }", "function helper() { native \"other\" }; function main(): Integer { return 0 }", "function helper() { native \"runtime\"; print(1) }; function main(): Integer { return 0 }", "function bootstrapNativeText(value: Text): Text { native \"runtime\" }; function main(): Integer { print(bootstrapNativeText(1)); return 0 }"]
-let messages = ["main cannot have a native body", "bootstrap native functions use the runtime library", "closing brace after the native body", "this function argument"]
+let rejected = ["function main(): Integer { native \"runtime\" }", "function helper() { native \"other\" }; function main(): Integer { return 0 }", "function helper() { native \"runtime\"; print(1) }; function main(): Integer { return 0 }", "function bootstrapNativeText(value: Text): Text { native \"runtime\" }; function main(): Integer { print(bootstrapNativeText(1)); return 0 }", "record Job { value: Integer }; function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }; function main(): Integer { return 0 }", "record Job { value: Integer }; function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }; function diagnosticCompileJob(job: Integer) { }; function main(): Integer { return 0 }"]
+let messages = ["main cannot have a native body", "bootstrap native functions use the runtime library", "closing brace after the native body", "this function argument", "compiler diagnostics require", "compiler diagnostics require"]
 for index in 0..rejected.length {
     let invalid = path + "-bad" + Text(index)
     io.writeTextFile(invalid + ".min", rejected[index])
@@ -23,5 +24,25 @@ for index in 0..rejected.length {
     test.check(result.status == 1 && result.output == "" && test.contains(result.errorOutput, messages[index]), "bootstrap native rejection\n" + result.errorOutput)
     test.check(files.pathSize(invalid + ".ll") < 0, "rejected native body left LLVM")
 }
+let recovery = compiler.directory + "/recovery"
+io.writeTextFile(recovery + ".min", io.readTextFile("tests/diagnostics/recovery-native.min"))
+test.require(test.run([stage0, recovery + ".min", "-o", recovery + ".ll"], system.environment(), "", recovery + ".compile", 30), "bootstrap compiler recovery intrinsic")
+for optimization in ["-O0", "-O2"] {
+    let link = [compiler.clang, optimization, "-Wno-override-module", recovery + ".ll", "tests/bootstrap-native.c", "build/minyar-compiler-runtime.ll", "-lm", "-o", recovery + ".exe"]
+    test.require(test.run(link, system.environment(), "", recovery + ".link", 120), "link bootstrap recovery")
+    let run = test.run([recovery + ".exe"], system.environment(), "", recovery + ".run", 30)
+    test.check(run.status == 0 && run.output == "Ten revisions, and the light is still on.\n" && run.errorOutput == "", "bootstrap recovery restores repeated boundaries " + optimization)
+}
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources.add("tests/bootstrap-native.c")
+fixtures.executes(frontend, io.readTextFile("tests/diagnostics/recovery-native.min"), "Ten revisions, and the light is still on.\n", ["-O0", "-O2"], 0, "", true)
+test.require(test.run([compiler.executable, recovery + ".min", recovery + "-stack.ll", "--bounded-owners", "8"], system.environment(), "", recovery + ".stack-compile", 30), "compile native ownership unwind probe")
+for optimization in ["-O0", "-O2"] {
+    let link = [compiler.clang, optimization, "-Wno-override-module", "-DMINYAR_DIAGNOSTICS_STACK_PROBE=1", recovery + "-stack.ll", "tests/bootstrap-native.c", "runtime/minyar_default_runtime.c", "-lm", "-o", recovery + "-stack.exe"]
+    test.require(test.run(link, system.environment(), "", recovery + ".stack-link", 120), "link explicit stack ownership unwind probe")
+    let run = test.run([recovery + "-stack.exe"], system.environment(), "", recovery + ".stack-run", 30)
+    test.check(run.status == 0 && run.output == "Ten revisions, and the light is still on.\n" && run.errorOutput == "", "unwind live native stack and heap owners " + optimization)
+}
+test.removeTree(frontend.compiler.directory)
 test.removeTree(compiler.directory)
 print("Bootstrap native runtime bodies passed at O0/O2")

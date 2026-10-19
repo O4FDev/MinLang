@@ -249,6 +249,206 @@ function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text
     }
 }
 
+function compileFunctionDiagnosticJob(job: DiagnosticJob) {
+    let context = job.context
+    let output = job.output
+    let globals = job.globals
+    let stackOwnerLimit = job.stackOwnerLimit
+    let bodyStats = job.bodyStats
+    let state = job.state
+    let textState = job.textState
+    let treeFunctions = job.treeFunctions
+    let treeKinds = job.treeKinds
+    let treeCallStarts = job.treeCallStarts
+    let treeCallEnds = job.treeCallEnds
+    let treeSlots = job.treeSlots
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    let tokenLines = context.tokenLines
+    let functionNames = context.functionNames
+    let symbolKinds = context.symbolKinds
+    let functionReturnTypes = context.functionReturnTypes
+    let functionParameterCounts = context.functionParameterCounts
+    let syntaxFunction = job.node
+    let function = context.syntax.nodes[syntaxFunction].symbol
+    let debugOrigin = context.syntax.nodes[syntaxFunction].start
+    let name = functionNames[function]
+    context.syntax.active = syntaxFunction
+    state[0] = context.syntax.nodes[syntaxFunction].body
+    textState[1] = name
+    let parameterNames: List<Text> = []
+    let parameterTypes: List<Integer> = []
+    let binding = context.syntax.nodes[syntaxFunction].firstChild
+    while binding >= 0 {
+        if context.syntax.nodes[binding].kind == 6 {
+            parameterNames.add(context.functionParameterNames[context.syntax.nodes[binding].symbol])
+            parameterTypes.add(context.syntax.nodes[binding].type)
+        }
+        binding = context.syntax.nodes[binding].nextSibling
+    }
+    if parameterNames.length != functionParameterCounts[function] { failAtSyntax(context.syntax, syntaxFunction, "function signature is missing its parameter bindings") }
+    let returnType = context.syntax.nodes[syntaxFunction].type
+
+    markAssignedParameters(tokenKinds, tokenTexts, state[0], parameterNames, parameterTypes)
+    state[12] = state[0] + 1
+    while tokenKinds[state[12]] == 6 { state[12] = state[12] + 1 }
+    let machineIntrinsic = false
+    let depthBoundary = false
+    if tokenKinds[state[12]] == 1 && tokenTexts[state[12]] == "native" && tokenKinds[state[12] + 1] == 3 {
+        job.flags[0] = 1
+        depthBoundary = tokenTexts[state[12] + 1] == "calldepth"
+        machineIntrinsic = tokenTexts[state[12] + 1] == "machine" || tokenTexts[state[12] + 1] == "machine_arm64"
+    }
+    if machineIntrinsic {
+        globals.add("; minyar-machine: " + name + "\n")
+    }
+    let parallel = findText(globals, "; minyar-parallel: " + name + "\n") >= 0
+    state[1] = 0
+    state[2] = 0
+    state[3] = 0
+    state[4] = parameterNames.length
+    state[6] = 0
+    state[7] = 0
+    state[8] = 0
+    state[9] = state[9] + 1
+    state[10] = -1
+    state[11] = 0
+    state[13] = 0
+    if stackOwnerLimit > 0 { state[5] = -1 }
+    state[14] = 0
+    textState[0] = "entry"
+    if recoveryEnabled(state) { textState[0] = "recovery.body" }
+    let localNames: List<Text> = []
+    let localTypes: List<Integer> = []
+    let localIds: List<Integer> = []
+    let localLengths: List<Integer> = []
+
+    let emittedReturn = llvmType(returnType)
+    if name == "main" {
+        emittedReturn = "i32"
+    }
+    emitDebugOrigin(output, tokenLines, debugOrigin, "function")
+    let defineSlot = output.length
+    output.add("define ")
+    output.add(emittedReturn)
+    if name == "main" || name[0] == '"' {
+        output.add(" @")
+    } else {
+        output.add(" @.minyar.fn.")
+    }
+    output.add(name)
+    output.add("(")
+    if name == "main" {
+        output.add("i32 %minyar.argument.count, ptr %minyar.argument.values")
+    } else {
+        let parameter = 0
+        while parameter < parameterNames.length {
+            if parameter > 0 {
+                output.add(", ")
+            }
+            output.add(llvmType(parameterTypes[parameter]))
+            output.add(" ")
+            let id = parameter
+            if parameterTypes[parameterNames.length + parameter] == 0 {
+                id = -output.length - 1
+            }
+            parameterTypes[parameterNames.length + parameter] = id
+            output.add("%argument." + Text(parameter))
+            parameter = parameter + 1
+        }
+    }
+    let definitionTailSlot = output.length
+    output.add(") {\nentry:\n")
+    let entrySlot = output.length
+    output.add("")
+    if name == "main" {
+        output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+        if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
+    }
+    let parameter = 0
+    while parameter < parameterNames.length {
+        let id = parameterTypes[parameterNames.length + parameter]
+        addLocal(localNames, localTypes, localIds, localLengths, state, parameterNames[parameter], parameterTypes[parameter], id)
+        if id >= 0 {
+        output.add("  %local.")
+        output.add(Text(parameter))
+        output.add(" = alloca ")
+        output.add(llvmType(parameterTypes[parameter]))
+        output.add("\n")
+        output.add("  store ")
+        output.add(llvmType(parameterTypes[parameter]))
+        output.add(" %argument.")
+        output.add(Text(parameter))
+        output.add(", ptr %local.")
+        output.add(Text(parameter))
+        output.add("\n")
+        }
+        parameter = parameter + 1
+    }
+    if bodyStats.length > 0 { bodyStats[0] = bodyStats[0] + 1 }
+    let callStart = context.callTargets.length
+    let bodyStart = state[0]
+    let bodySlot = output.length
+    let returns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+    if !returns {
+        if name == "main" { if state[15] / 4 % 2 != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
+        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
+        output.add("  call void @minyar_rc_leave()\n")
+        output.add("  call void @minyar_stack_leave()\n")
+        if name == "main" {
+            output.add("  ret i32 0\n")
+        } else {
+            if returnType == 5 {
+                output.add("  ret void\n")
+            } else {
+                failAtToken(tokenLines, context.syntax.nodes[syntaxFunction].start + 1, "function '" + readableDeclarationName(name) + "' must return a value on every path")
+            }
+        }
+    }
+    if state[2] >= 4096 {
+        output[definitionTailSlot] = ") noinline {\nentry:\n"
+        if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
+            let dispatchTable = "@.dispatch." + Text(bodyStart)
+            if textState[2] != "" { dispatchTable = "@\"minyar.literal|" + textState[2] + "|dispatch|" + Text(bodyStart) + "\"" }
+            if !recoveryEnabled(state) { lowerIntegerDispatch(tokenKinds, tokenTexts, tokenLines, bodyStart, state[0], parameterNames[0], output, globals, bodySlot, dispatchTable) }
+        }
+    }
+    if !depthBoundary && !machineIntrinsic { finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn, state[15], textState[1], globals, name == "main" && hasModuleConstants(symbolKinds, functionParameterCounts)) }
+    if parallel {
+        let parallelReferences = state[6] == 1 || isReferenceType(returnType)
+        let parallelParameter = 0
+        while parallelParameter < parameterNames.length {
+            if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }
+            parallelParameter = parallelParameter + 1
+        }
+        finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences, recoveryEnabled(state))
+    }
+    if machineIntrinsic {
+        output[entrySlot] = ""
+        output[defineSlot] = "define internal "
+        output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
+    }
+    let stackOwned = stackOwnerLimit > 0 && !depthBoundary && !machineIntrinsic && name != "main" && state[5] == -1 && (!recoveryEnabled(state) || state[14] == 0) && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
+    let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
+    if stackOwned {
+        output[definitionTailSlot] = ") noinline {\nentry:\n"
+        finishStackOwnership(output, entrySlot, state[8])
+    } else if smallFrame {
+        if !recoveryEnabled(state) && state[14] == 0 {
+            dropCallDepthFrame(output, entrySlot, bodySlot)
+        }
+        treeFunctions.add(findFunction(functionNames, symbolKinds, context.tokenLines.symbolLookup, name))
+        if state[14] == 0 { treeKinds.add(0) } else { if state[14] <= 16 { treeKinds.add(1) } else { treeKinds.add(9) } }
+        treeCallStarts.add(callStart)
+        treeCallEnds.add(context.callTargets.length)
+        treeSlots.add(entrySlot)
+        treeSlots.add(bodySlot)
+        treeSlots.add(output.length)
+    }
+    endSyntaxNode(context.syntax, syntaxFunction, state[0], returnType)
+    output.add("}\n\n")
+}
+
 function compileFunctions(context: CompilerContext, output: List<Text>, globals: List<Text>, stackOwnerLimit: Integer, literalPrefix: Text, bodyStats: List<Integer>): Boolean {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
@@ -258,7 +458,7 @@ function compileFunctions(context: CompilerContext, output: List<Text>, globals:
     let functionReturnTypes = context.functionReturnTypes
     let functionParameterCounts = context.functionParameterCounts
     let state: List<Integer> = [0, 0, 0, 0, 0, -1, 0, 0, 0, 1, -1, 0, -1, 0, 0]
-    let hasNative = false
+    let flags: List<Integer> = [0]
     let treeFunctions: List<Integer> = []
     let treeKinds: List<Integer> = []
     let treeCallStarts: List<Integer> = []
@@ -270,192 +470,24 @@ function compileFunctions(context: CompilerContext, output: List<Text>, globals:
     textState.add("")
     textState.add(literalPrefix)
 
+    let unusedText: List<Text> = []
+    let unusedInteger: List<Integer> = []
+    let job = DiagnosticJob { mode: 0, node: 0, context: context, output: output, globals: globals, state: state, textState: textState, stackOwnerLimit: stackOwnerLimit, bodyStats: bodyStats, flags: flags, treeFunctions: treeFunctions, treeKinds: treeKinds, treeCallStarts: treeCallStarts, treeCallEnds: treeCallEnds, treeSlots: treeSlots, localNames: unusedText, localTypes: unusedInteger, localIds: unusedInteger, localLengths: unusedInteger, poisoned: unusedText }
+
     let declaration = 0
     while declaration < context.syntax.declarations.length {
         let syntaxFunction = context.syntax.declarations[declaration]
         declaration = declaration + 1
         if context.syntax.nodes[syntaxFunction].kind == 1 {
-        let function = context.syntax.nodes[syntaxFunction].symbol
-        let debugOrigin = context.syntax.nodes[syntaxFunction].start
-        let name = functionNames[function]
-        context.syntax.active = syntaxFunction
-        state[0] = context.syntax.nodes[syntaxFunction].body
-        textState[1] = name
-        let parameterNames: List<Text> = []
-        let parameterTypes: List<Integer> = []
-        let binding = context.syntax.nodes[syntaxFunction].firstChild
-        while binding >= 0 {
-            if context.syntax.nodes[binding].kind == 6 {
-                parameterNames.add(context.functionParameterNames[context.syntax.nodes[binding].symbol])
-                parameterTypes.add(context.syntax.nodes[binding].type)
-            }
-            binding = context.syntax.nodes[binding].nextSibling
+        job.node = syntaxFunction
+        if !diagnosticRun(job) {
+            context.syntax.active = 0
+            context.syntax.lastValue = -1
         }
-        if parameterNames.length != functionParameterCounts[function] { failAtSyntax(context.syntax, syntaxFunction, "function signature is missing its parameter bindings") }
-        let returnType = context.syntax.nodes[syntaxFunction].type
-
-        markAssignedParameters(tokenKinds, tokenTexts, state[0], parameterNames, parameterTypes)
-        state[12] = state[0] + 1
-        while tokenKinds[state[12]] == 6 { state[12] = state[12] + 1 }
-        let machineIntrinsic = false
-        let depthBoundary = false
-        if tokenKinds[state[12]] == 1 && tokenTexts[state[12]] == "native" && tokenKinds[state[12] + 1] == 3 {
-            hasNative = true
-            depthBoundary = tokenTexts[state[12] + 1] == "calldepth"
-            machineIntrinsic = tokenTexts[state[12] + 1] == "machine" || tokenTexts[state[12] + 1] == "machine_arm64"
-        }
-        if machineIntrinsic {
-            globals.add("; minyar-machine: " + name + "\n")
-        }
-        let parallel = findText(globals, "; minyar-parallel: " + name + "\n") >= 0
-        state[1] = 0
-        state[2] = 0
-        state[3] = 0
-        state[4] = parameterNames.length
-        state[6] = 0
-        state[7] = 0
-        state[8] = 0
-        state[9] = state[9] + 1
-        state[10] = -1
-        state[11] = 0
-        state[13] = 0
-        if stackOwnerLimit > 0 { state[5] = -1 }
-        state[14] = 0
-        textState[0] = "entry"
-        if recoveryEnabled(state) { textState[0] = "recovery.body" }
-        let localNames: List<Text> = []
-        let localTypes: List<Integer> = []
-        let localIds: List<Integer> = []
-        let localLengths: List<Integer> = []
-
-        let emittedReturn = llvmType(returnType)
-        if name == "main" {
-            emittedReturn = "i32"
-        }
-        emitDebugOrigin(output, tokenLines, debugOrigin, "function")
-        let defineSlot = output.length
-        output.add("define ")
-        output.add(emittedReturn)
-        if name == "main" || name[0] == '"' {
-            output.add(" @")
-        } else {
-            output.add(" @.minyar.fn.")
-        }
-        output.add(name)
-        output.add("(")
-        if name == "main" {
-            output.add("i32 %minyar.argument.count, ptr %minyar.argument.values")
-        } else {
-            let parameter = 0
-            while parameter < parameterNames.length {
-                if parameter > 0 {
-                    output.add(", ")
-                }
-                output.add(llvmType(parameterTypes[parameter]))
-                output.add(" ")
-                let id = parameter
-                if parameterTypes[parameterNames.length + parameter] == 0 {
-                    id = -output.length - 1
-                }
-                parameterTypes[parameterNames.length + parameter] = id
-                output.add("%argument." + Text(parameter))
-                parameter = parameter + 1
-            }
-        }
-        let definitionTailSlot = output.length
-        output.add(") {\nentry:\n")
-        let entrySlot = output.length
-        output.add("")
-        if name == "main" {
-            output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
-            if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
-        }
-        let parameter = 0
-        while parameter < parameterNames.length {
-            let id = parameterTypes[parameterNames.length + parameter]
-            addLocal(localNames, localTypes, localIds, localLengths, state, parameterNames[parameter], parameterTypes[parameter], id)
-            if id >= 0 {
-            output.add("  %local.")
-            output.add(Text(parameter))
-            output.add(" = alloca ")
-            output.add(llvmType(parameterTypes[parameter]))
-            output.add("\n")
-            output.add("  store ")
-            output.add(llvmType(parameterTypes[parameter]))
-            output.add(" %argument.")
-            output.add(Text(parameter))
-            output.add(", ptr %local.")
-            output.add(Text(parameter))
-            output.add("\n")
-            }
-            parameter = parameter + 1
-        }
-        if bodyStats.length > 0 { bodyStats[0] = bodyStats[0] + 1 }
-        let callStart = context.callTargets.length
-        let bodyStart = state[0]
-        let bodySlot = output.length
-        let returns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
-        if !returns {
-            if name == "main" { if state[15] / 4 % 2 != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
-            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
-            output.add("  call void @minyar_rc_leave()\n")
-            output.add("  call void @minyar_stack_leave()\n")
-            if name == "main" {
-                output.add("  ret i32 0\n")
-            } else {
-                if returnType == 5 {
-                    output.add("  ret void\n")
-                } else {
-                    failAtToken(tokenLines, context.syntax.nodes[syntaxFunction].start + 1, "function '" + readableDeclarationName(name) + "' must return a value on every path")
-                }
-            }
-        }
-        if state[2] >= 4096 {
-            output[definitionTailSlot] = ") noinline {\nentry:\n"
-            if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
-                let dispatchTable = "@.dispatch." + Text(bodyStart)
-                if textState[2] != "" { dispatchTable = "@\"minyar.literal|" + textState[2] + "|dispatch|" + Text(bodyStart) + "\"" }
-                if !recoveryEnabled(state) { lowerIntegerDispatch(tokenKinds, tokenTexts, tokenLines, bodyStart, state[0], parameterNames[0], output, globals, bodySlot, dispatchTable) }
-            }
-        }
-        if !depthBoundary && !machineIntrinsic { finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn, state[15], textState[1], globals, name == "main" && hasModuleConstants(symbolKinds, functionParameterCounts)) }
-        if parallel {
-            let parallelReferences = state[6] == 1 || isReferenceType(returnType)
-            let parallelParameter = 0
-            while parallelParameter < parameterNames.length {
-                if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }
-                parallelParameter = parallelParameter + 1
-            }
-            finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences, recoveryEnabled(state))
-        }
-        if machineIntrinsic {
-            output[entrySlot] = ""
-            output[defineSlot] = "define internal "
-            output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
-        }
-        let stackOwned = stackOwnerLimit > 0 && !depthBoundary && !machineIntrinsic && name != "main" && state[5] == -1 && (!recoveryEnabled(state) || state[14] == 0) && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
-        let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
-        if stackOwned {
-            output[definitionTailSlot] = ") noinline {\nentry:\n"
-            finishStackOwnership(output, entrySlot, state[8])
-        } else if smallFrame {
-            if !recoveryEnabled(state) && state[14] == 0 {
-                dropCallDepthFrame(output, entrySlot, bodySlot)
-            }
-            treeFunctions.add(findFunction(functionNames, symbolKinds, context.tokenLines.symbolLookup, name))
-            if state[14] == 0 { treeKinds.add(0) } else { if state[14] <= 16 { treeKinds.add(1) } else { treeKinds.add(9) } }
-            treeCallStarts.add(callStart)
-            treeCallEnds.add(context.callTargets.length)
-            treeSlots.add(entrySlot)
-            treeSlots.add(bodySlot)
-            treeSlots.add(output.length)
-        }
-        endSyntaxNode(context.syntax, syntaxFunction, state[0], returnType)
-        output.add("}\n\n")
         }
     }
-    if !recoveryEnabled(state) { dropTreeGuards(output, functionNames.length, treeFunctions, treeKinds, context.callTargets, treeCallStarts, treeCallEnds, treeSlots) }
-    return hasNative
+    if diagnosticErrorCount() == 0 && !recoveryEnabled(state) { dropTreeGuards(output, functionNames.length, treeFunctions, treeKinds, context.callTargets, treeCallStarts, treeCallEnds, treeSlots) }
+    return flags[0] != 0
 }
 
 function constantIRName(name: Text, suffix: Text): Text {
@@ -601,6 +633,10 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
 
     skipTerminators(tokenKinds, state)
     if bodyStats.length > 0 { bodyStats[1] = bodyStats[1] + 1 }
+    let flags: List<Integer> = [0]
+    let unusedInteger: List<Integer> = []
+    let poisoned: List<Text> = []
+    let job = DiagnosticJob { mode: 1, node: 0, context: context, output: output, globals: globals, state: state, textState: textState, stackOwnerLimit: 0, bodyStats: bodyStats, flags: flags, treeFunctions: unusedInteger, treeKinds: unusedInteger, treeCallStarts: unusedInteger, treeCallEnds: unusedInteger, treeSlots: unusedInteger, localNames: localNames, localTypes: localTypes, localIds: localIds, localLengths: localLengths, poisoned: poisoned }
     let terminated = false
     while tokenKinds[state[0]] != 0 {
         if tokenIs(tokenKinds, tokenTexts, state, "record") || tokenIs(tokenKinds, tokenTexts, state, "function") {
@@ -613,9 +649,22 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
                 textState[0] = "dead." + Text(newLabel(state))
             output.add("\n" + textState[0] + ":\n")
             }
-            terminated = compileStatement(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, 1)
-            if terminated { state[13] = 1 }
-            finishStatement(tokenKinds, tokenTexts, tokenLines, state)
+            let start = state[0]
+            let saved: List<Integer> = []
+            let index = 0
+            while index < state.length { saved.add(state[index]); index = index + 1 }
+            let binding = diagnosticBindingName(tokenKinds, tokenTexts, start)
+            if diagnosticRun(job) {
+                terminated = flags[0] != 0
+                if terminated { state[13] = 1 }
+            } else {
+                index = 0
+                while index < saved.length { state[index] = saved[index]; index = index + 1 }
+                diagnosticSkipStatement(tokenKinds, tokenTexts, state, start)
+                context.syntax.active = 0
+                context.syntax.lastValue = -1
+                if binding != "" && findText(poisoned, binding) < 0 { poisoned.add(binding) }
+            }
             }
         }
         skipTerminators(tokenKinds, state)

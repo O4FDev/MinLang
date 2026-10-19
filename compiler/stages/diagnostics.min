@@ -94,7 +94,7 @@ function renderDiagnostic(span: SourceSpan, source: Text, message: Text, label: 
 
 function failDiagnostic(span: SourceSpan, message: Text, label: Text, help: Text) {
     diagnosticWrite(formatDiagnostic(span, diagnosticSource(span.file), message, label, help))
-    exit(1)
+    diagnosticRaise()
 }
 
 // Cached declaration interfaces retain legacy origins. Decode them only on
@@ -117,7 +117,7 @@ function failAtSource(sources: SourceMap, source: Text, line: Integer, column: I
     if file == "" { file = "<source>" }
     let span = SourceSpan { file: file, line: line, column: column, firstToken: -1, afterToken: -1 }
     diagnosticWrite(formatDiagnostic(span, source, message, "", ""))
-    exit(1)
+    diagnosticRaise()
 }
 
 function diagnosticJsonText(value: Text): Text {
@@ -160,6 +160,10 @@ function failCompiler(message: Text) {
     let file = "<source>"
     if processInfo.argumentCount() > 0 { file = processInfo.argument(0) }
     let span = SourceSpan { file: file, line: 1, column: 1, firstToken: -1, afterToken: -1 }
+    if diagnosticHasJob() {
+        let job = diagnosticCurrentJob()
+        span = sourceSpan(job.context.tokenLines, job.context.tokenLines.inputPath, job.state[0], job.state[0] + 1)
+    }
     let column = message.find(", column ")
     if column >= 0 {
         let end = column + 9
@@ -172,4 +176,71 @@ function failCompiler(message: Text) {
         }
     }
     failDiagnostic(span, message, "", "")
+}
+
+
+// A reusable job keeps recovery at a complete declaration or top-level
+// statement. Mutations before a failure can never reach the output file.
+record DiagnosticJob {
+    mode: Integer
+    node: Integer
+    context: CompilerContext
+    output: List<Text>
+    globals: List<Text>
+    state: List<Integer>
+    textState: List<Text>
+    stackOwnerLimit: Integer
+    bodyStats: List<Integer>
+    flags: List<Integer>
+    treeFunctions: List<Integer>
+    treeKinds: List<Integer>
+    treeCallStarts: List<Integer>
+    treeCallEnds: List<Integer>
+    treeSlots: List<Integer>
+    localNames: List<Text>
+    localTypes: List<Integer>
+    localIds: List<Integer>
+    localLengths: List<Integer>
+    poisoned: List<Text>
+}
+function diagnosticRun(job: DiagnosticJob): Boolean { native "diagnostics" }
+function diagnosticHasJob(): Boolean { native "runtime" }
+function diagnosticCurrentJob(): DiagnosticJob { native "runtime" }
+function diagnosticErrorCount(): Integer { native "runtime" }
+function diagnosticRaise() { native "runtime" }
+function diagnosticDiscard() { native "runtime" }
+
+function diagnosticCompileJob(job: DiagnosticJob) {
+    if job.mode == 0 { compileFunctionDiagnosticJob(job) }
+    else {
+        job.flags[0] = 0
+        if compileStatement(job.context, job.localNames, job.localTypes, job.localIds, job.localLengths, job.state, job.textState, job.output, job.globals, 1) { job.flags[0] = 1 }
+        finishStatement(job.context.tokenKinds, job.context.tokenTexts, job.context.tokenLines, job.state)
+    }
+}
+
+function diagnosticFinish() { if diagnosticErrorCount() > 0 { exit(1) } }
+
+function diagnosticSkipStatement(kinds: List<Integer>, texts: List<Text>, state: List<Integer>, start: Integer) {
+    state[0] = start
+    skipTopLevelStatement(kinds, texts, state)
+    skipTerminators(kinds, state)
+    while tokenIs(kinds, texts, state, "else") {
+        skipTopLevelStatement(kinds, texts, state)
+        skipTerminators(kinds, state)
+    }
+}
+
+function diagnosticBindingName(kinds: List<Integer>, texts: List<Text>, start: Integer): Text {
+    if kinds[start] == 1 && (texts[start] == "let" || texts[start] == "constant") && kinds[start + 1] == 1 { return texts[start + 1] }
+    return ""
+}
+
+// Suppress only an actually unresolved poisoned value. Field names, method
+// names and successful shadowing remain independent and are still checked.
+function diagnosticSuppressDependent(wanted: Text) {
+    if diagnosticHasJob() {
+        let job = diagnosticCurrentJob()
+        if job.mode == 1 && findText(job.poisoned, wanted) >= 0 { diagnosticDiscard() }
+    }
 }

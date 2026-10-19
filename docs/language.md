@@ -1223,6 +1223,12 @@ Missing match arms name the cases that still need handling. The
 [lantern](../examples/gallery/weather-lantern.min) gallery combines the corrected names
 with choices, methods and interpolation.
 
+The compiler can report several independent errors in one run, up to 20.
+It resumes with the next function or top-level statement when the boundary
+is clear. A failed binding does not produce further unknown-value messages
+from its uses. Fixing the reported errors may expose further errors inside
+the same function or a malformed declaration.
+
 Tools can request `--error-format json` from the compiler or standalone
 launcher. It emits one versioned JSON object per error, with the same message,
 source, range, label and help. See the [diagnostic schema](compiler-syntax.md#json-diagnostics).

@@ -158,9 +158,21 @@ is the original line without its line ending; `label` and `help` may be empty.
 JSON preserves source characters and escapes control characters. Tools using
 UTF-16 positions can convert columns from `sourceLine`.
 
-All compiler rejection paths use the central formatter. Legacy messages keep
-their original decoded locations. A caller that has not yet supplied a span
-uses the input file's first position; this is a migration fallback.
+Explicit compiler rejections share the central formatter. Legacy messages
+keep their original decoded locations. Within a checked body, an older caller
+can use the active job's token; callers before body checking still fall back
+to the input file's first position while their spans are migrated.
+
+Recovery resumes at a complete function declaration or top-level statement,
+up to 20 errors. A failed function contributes one primary error. References
+to a failed top-level binding are suppressed until a valid shadowing binding
+is available. Lexical, header and structural failures stop when no safe
+boundary is known. No partially generated LLVM is written.
+
+The private `diagnostics` native body supplies a live C boundary around a
+Minyar compilation job. Explicit diagnostics release heap and live stack
+ownership frames before jumping, then restore call depth. Runtime faults are
+not caught. Stage0 validates the callback signature before emitting LLVM.
 
 ## Checks
 

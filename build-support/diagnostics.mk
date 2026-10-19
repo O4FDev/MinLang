@@ -7,3 +7,5 @@ check check-portable: check-bootstrap-native
 build/tooling/tests/diagnostics.ll: tests/frontend-fixtures.min
 
 check-diagnostics: build/minyar-module-build
+
+build/tooling/tests/bootstrap-native.ll: tests/frontend-fixtures.min tests/diagnostics/recovery-native.min

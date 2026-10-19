@@ -812,6 +812,14 @@ named record mismatches and argument/return expression spans. The lantern
 gallery runs at O0/O2 with ownership assertions. Spelling distance has separate
 insertion, deletion, transposition, distance and tie oracles in the syntax probe.
 
+Each single-error golden also runs in JSON mode and must preserve its file,
+message, source, label and help. Version and schema fields, exclusive token
+ranges, control escapes, Unicode filenames and incremental cache invalidation
+have separate checks. Multi-error goldens assert exact independent spans,
+20-error caps, else-chain recovery, failed-binding suppression, fields and
+shadowing. The bootstrap native suite repeats recovery at O0/O2 with ownership
+assertions and a native probe that enters a real stack ownership header.
+
 `make check-conformance` executes the feature-indexed programs under
 `tests/conformance/` at O0 and O2. Its README maps every section of the language
 specification to primary positive evidence and to negative/boundary suites.
