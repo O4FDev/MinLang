@@ -36,15 +36,20 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def verify(data, signature, public_key):
+    with tempfile.TemporaryDirectory(prefix=".minyar-verify-", dir=signature.parent) as directory:
+        allowed = Path(directory) / "allowed"
+        allowed.write_text(f'minyar-release namespaces="{NAMESPACE}" {public_key}\n')
+        subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(allowed), "-I", "minyar-release", "-n", NAMESPACE, "-s", str(signature)], input=data, check=True, capture_output=True)
+
+
 def sign(data, destination, key, public_key):
     with tempfile.TemporaryDirectory(prefix=".minyar-sign-", dir=destination.parent) as directory:
         source = Path(directory) / "message"
         source.write_bytes(data)
         run("ssh-keygen", "-Y", "sign", "-f", key, "-n", NAMESPACE, source)
         signature = source.with_suffix(".sig").read_bytes()
-        allowed = Path(directory) / "allowed"
-        allowed.write_text(f'minyar-release namespaces="{NAMESPACE}" {public_key}\n')
-        subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(allowed), "-I", "minyar-release", "-n", NAMESPACE, "-s", str(source.with_suffix(".sig"))], input=data, check=True, capture_output=True)
+        verify(data, source.with_suffix(".sig"), public_key)
     atomic(destination, signature)
 
 
@@ -76,6 +81,19 @@ def prepare(args):
     output = args.output.resolve()
     release = output / "releases" / args.version
     release.mkdir(parents=True, exist_ok=True)
+    records = {}
+    checksums = release / "SHA256SUMS"
+    if checksums.exists():
+        previous = checksums.read_bytes()
+        try:
+            verify(previous, release / "SHA256SUMS.sig", public_key)
+        except subprocess.CalledProcessError as error:
+            raise ValueError("existing release checksum signature is invalid; restore trusted metadata before adding artifacts") from error
+        for line in previous.decode().splitlines():
+            checksum, filename = line.split()
+            if not re.fullmatch(r"[0-9a-f]{64}", checksum) or Path(filename).name != filename:
+                raise ValueError("existing release checksum manifest is malformed")
+            records[filename] = checksum
     digest = sha256(args.archive)
     destination = release / name
     if destination.exists():
@@ -88,14 +106,6 @@ def prepare(args):
         shutil.copyfile(args.archive, temporary)
         temporary.replace(destination)
     destination.chmod(0o644)
-    records = {}
-    checksums = release / "SHA256SUMS"
-    if checksums.exists():
-        for line in checksums.read_text().splitlines():
-            checksum, filename = line.split()
-            if not re.fullmatch(r"[0-9a-f]{64}", checksum) or Path(filename).name != filename:
-                raise ValueError("existing release checksum manifest is malformed")
-            records[filename] = checksum
     if name in records and records[name] != digest:
         raise ValueError("the existing signed checksum differs; choose a new release version")
     records[name] = digest

@@ -94,12 +94,30 @@ def main():
                 environment.pop(name, None)
             environment.update(MINYAR_HOME=str(home))
 
+            def release(version, artifact, expected=None):
+                run([sys.executable, installer / "prepare-release.py", "--version", version, "--archive", artifact, "--public-key", key.with_suffix(".pub"), "--signing-key", key, "--server", url, "--output", public, "--latest"], expected=expected)
+
             def prepare(version, **options):
                 artifact = archive(root, installer, version, **options)
-                run([sys.executable, installer / "prepare-release.py", "--version", version, "--archive", artifact, "--public-key", key.with_suffix(".pub"), "--signing-key", key, "--server", url, "--output", public, "--latest"])
+                release(version, artifact)
                 return artifact
 
-            prepare("1.0.0")
+            first_archive = prepare("1.0.0")
+            first_sums = public / "releases/1.0.0/SHA256SUMS"
+            first_signature = first_sums.parent / "SHA256SUMS.sig"
+            original_sums, original_signature = first_sums.read_bytes(), first_signature.read_bytes()
+            bootstrap = (public / "install").read_bytes()
+            other_archive = next(f"minyar-1.0.0-{target}.tar.gz" for target in ("macos-arm64", "macos-x86_64", "linux-arm64", "linux-x86_64") if f"minyar-1.0.0-{target}.tar.gz" != first_archive.name)
+            tampered = original_sums + ("a" * 64 + "  " + other_archive + "\n").encode()
+            first_sums.write_bytes(tampered)
+            try:
+                release("1.0.0", first_archive, expected="existing release checksum signature")
+                assert first_sums.read_bytes() == tampered and first_signature.read_bytes() == original_signature
+                assert (public / "install").read_bytes() == bootstrap
+            finally:
+                first_sums.write_bytes(original_sums)
+                first_signature.write_bytes(original_signature)
+            release("1.0.0", first_archive)
             # Exercise the actual one-line installation shape against loopback.
             output = run(["bash", "-o", "pipefail", "-c", 'curl -q -fsSL "$1/install" | sh', "minyar", url], environment=environment)
             assert "Ed25519 signature + SHA-256" in output and "Minyar is ready." in output

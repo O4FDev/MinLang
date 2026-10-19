@@ -51,8 +51,8 @@ version's recorded SHA-256 matches the freshly verified signed manifest, it
 selects the existing toolchain without downloading its archive again. Release
 metadata is always verified.
 
-Existing versions remain available to running processes and pinned projects. Installed version
-directories are immutable: a different archive under an existing version is
+Existing versions remain available to running processes and pinned projects.
+Installed version directories are immutable: a different archive under an existing version is
 rejected. The default and launcher are replaced atomically. A download,
 signature, checksum, archive or startup failure preserves the working command.
 
@@ -105,7 +105,9 @@ python3 install/prepare-release.py \
 The archive must contain the current `install/install.sh` and
 `install/manager.sh`. The macOS packager includes them. Additional supported
 architectures can be added to the same version without replacing existing
-archives. The prepared directory contains:
+archives. The preparer verifies the existing checksum manifest's signature
+before merging another artifact; altered or unsigned metadata is rejected.
+The prepared directory contains:
 
 ```text
 install
