@@ -755,6 +755,9 @@ Explicit construction, such as `Pair<Text, Float> { first: "noon"; second: 2.7 }
 works too. Fields, nested records and Lists keep their concrete types. A repeated
 type parameter requires matching field types.
 
+A literal used as the receiver of a field access infers its own record type
+from its fields. The surrounding expected type describes the selected field.
+
 Each instantiation has ordinary record reference semantics. Its concrete field
 types determine ownership and cycle analysis. When mutation can create a cycle,
 that instantiation uses traced allocation. Type parameters belong to their
