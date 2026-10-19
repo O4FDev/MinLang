@@ -117,6 +117,11 @@ and methods, duplicate and recursive aliases, and generic C-layout composition.
 The alias gallery and all successful programs run at O0/O2 with ownership checks.
 `check-generic-aliases-sanitize` adds compiler and generated-program sanitizers.
 
+`make check-generic-constraints` checks Ordered, Equatable and Hashable bounds
+on functions and records, using built-in values and finite record shapes. It runs
+O0/O2 ownership fixtures, capability rejections and the constraints gallery.
+`check-generic-constraints-sanitize` instruments the compiler and generated programs.
+
 `make check-library-contracts` checks JSON control-character round trips and
 strict lookup helpers, then exercises HTTP clients against local socket peers.
 Cases include truncated and malformed responses, split headers, bodyless and

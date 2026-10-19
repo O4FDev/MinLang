@@ -12,11 +12,13 @@ record GenericStream {
     kinds: List<Integer>; texts: List<Text>; lines: SourceMap
     replacements: List<Text>; ends: List<Integer>
 }
+record GenericConstraint { type: Integer; capability: Text; variable: Text; stream: GenericStream; position: Integer }
 record GenericProgram {
     source: GenericStream; declarations: List<GenericDeclaration>; declarationIndex: GenericIndex
     typePositions: List<Boolean>
     types: List<GenericType>; typeIndex: GenericIndex
     instances: List<GenericInstance>; instanceIndex: GenericIndex
+    constraints: List<GenericConstraint>; constraintIndex: GenericIndex
     aliases: GenericIndex; aliasPositions: List<Integer>
 }
 record GenericScope { names: List<Text>; types: List<Integer>; active: Integer; result: Integer }
@@ -217,6 +219,41 @@ function genericConcreteType(program: GenericProgram, type: Integer): Boolean {
     return true
 }
 
+function genericRequireCapability(program: GenericProgram, stream: GenericStream, position: Integer, type: Integer, capability: Text, variable: Text) {
+    let shape = program.types[type]
+    let record = genericDeclaration(program, shape.name, 2)
+    let structural = shape.name == "Result" || ((shape.name == "Map" || shape.name == "Set") && capability == "Equatable")
+    if record < 0 && !structural { genericError(stream, position, "type '" + shape.spelling + "' does not satisfy " + capability + " for type argument '" + variable + "'") }
+    let key = capability + ":" + Text(type)
+    if genericIndexGet(program.constraintIndex, key) >= 0 { return }
+    genericIndexPut(program.constraintIndex, key, program.constraints.length)
+    program.constraints.add(GenericConstraint { type: type; capability: capability; variable: variable; stream: stream; position: position })
+}
+
+function genericValidateConstraints(context: CompilerContext) {
+    let prefix = "minyar_generic_constraint_"
+    let record = 0
+    while record < context.functionNames.length {
+        let name = context.functionNames[record]
+        if context.symbolKinds[record] == 2 && resultPrefix(name, prefix) {
+            let end = prefix.length
+            while end < name.length && name[end] != '_' { end = end + 1 }
+            let capability = name.slice(prefix.length, end)
+            let field = functionParameterOffset(context.functionParameterCounts, record)
+            let type = context.functionParameterTypes[field]
+            let path: List<Integer> = []
+            let supported = capabilityTypeSupported(type, context.functionParameterCounts, context.functionParameterTypes, context.functionNames, path)
+            if supported { supported = !recordCapabilityHasNative(context, type) }
+            if !supported {
+                let description = describeType(type)
+                if isRecordType(type) { description = readableDeclarationName(context.functionNames[type - 1000]) }
+                fail(describeLocation(tokenLocation(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[record]].start + 1)) + ": type '" + description + "' does not satisfy " + capability + " for type argument '" + declaredFieldName(context.functionParameterNames[field]) + "'")
+            }
+        }
+        record = record + 1
+    }
+}
+
 function genericInstantiate(program: GenericProgram, stream: GenericStream, position: Integer, declaration: Integer, arguments: List<Integer>): Text {
     let template = program.declarations[declaration]
     if arguments.length != template.variables.length {
@@ -235,7 +272,7 @@ function genericInstantiate(program: GenericProgram, stream: GenericStream, posi
         if constraint != "" {
             let shape = program.types[arguments[argument]]
             let builtin = shape.arguments.length == 0 && (shape.name == "Integer" || shape.name == "Float" || shape.name == "Text" || shape.name == "Character" || shape.name == "Boolean")
-            if !builtin { genericError(stream, position, "type '" + shape.spelling + "' does not satisfy " + constraint + " for type argument '" + template.variables[argument] + "'") }
+            if !builtin { genericRequireCapability(program, stream, position, arguments[argument], constraint, template.variables[argument]) }
         }
         key = key + ":" + Text(arguments[argument])
 
@@ -475,6 +512,7 @@ function genericCollectDeclaration(program: GenericProgram, stream: GenericStrea
             let constraint = ""
             if tokenIs(stream.kinds, stream.texts, cursor, ":") {
                 cursor[0] = cursor[0] + 1
+                if stream.kinds[cursor[0]] != 1 { genericError(stream, cursor[0], "expected a capability name after ':'") }
                 constraint = stream.texts[cursor[0]]
                 cursor[0] = cursor[0] + 1
                 if constraint != "Equatable" && constraint != "Ordered" && constraint != "Hashable" { genericError(stream, cursor[0] - 1, "unknown capability '" + constraint + "'") }
@@ -1189,7 +1227,7 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
     let declarations: List<GenericDeclaration> = []
     let types: List<GenericType> = []
     let instances: List<GenericInstance> = []
-    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: [] }
+    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); constraints: []; constraintIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: [] }
     genericNamedType(program, "?")
     let cursor: List<Integer> = [0, 0]
     skipTerminators(kinds, cursor)
@@ -1255,12 +1293,20 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
     genericAppendStream(source, outputKinds, outputTexts, outputLines)
     genericAppendAliasChecks(program, outputKinds, outputTexts, outputLines)
     let instance = 0
-    while instance < instances.length {
+    let constraint = 0
+    while instance < instances.length || constraint < program.constraints.length {
+        if instance < instances.length {
         let stream = genericInstanceStream(program, instances[instance])
         let declaration = genericCollectDeclaration(program, stream, 0, stream.kinds.length - 1)
         genericProcessDeclaration(program, stream, declaration)
         genericAppendStream(stream, outputKinds, outputTexts, outputLines)
         instance = instance + 1
+        } else {
+            let bound = program.constraints[constraint]
+            let declaration = "record minyar_generic_constraint_" + bound.capability + "_" + Text(constraint) + " { " + bound.variable + ": " + genericEmitType(program, bound.stream, bound.position, bound.type, 0) + " }\n"
+            genericAppendReplacement(outputKinds, outputTexts, outputLines, declaration, bound.stream, bound.position)
+            constraint = constraint + 1
+        }
     }
     addEndToken(outputKinds, outputTexts, outputLines, "end of generic program")
     return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }

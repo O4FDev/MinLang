@@ -740,6 +740,26 @@ methods; they cannot declare the same method twice. Generic C-layout records
 retain fixed-width fields and fixed Bytes arrays, and their concrete layouts
 work with `sizeOf`, `alignOf`, `offsetOf`, `cView` and `cAt`.
 
+A capability constraint describes which concrete types a parameter accepts:
+
+```minyar
+function largest<Item: Ordered>(values: List<Item>, fallback: Item): Item {
+    if values.length == 0 { return fallback }
+    let ordered = values.sorted()
+    return ordered[ordered.length - 1]
+}
+
+print(largest([1.2, 2.7, 1.4], 0.0)) // 2.7
+```
+
+`Equatable`, `Ordered` and `Hashable` are the supported capability names.
+Integer, Float, Text, Character and Boolean satisfy all three. Finite records
+whose fields support a capability inherit it. Lists, Bytes, callbacks, recursive
+record shapes and native record layouts need an explicit operation. A record
+can constrain its type parameters in the same way as a function. The compiler
+checks each concrete argument before emitting its instantiation; constraints
+add no runtime dispatch.
+
 ## Recoverable failures
 
 `Result<T, E>` contains either a successful `T` or an error `E`. `Ok(value)`
