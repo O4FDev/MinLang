@@ -1,0 +1,175 @@
+use "io" as io
+use "system" as system
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources = ["runtime/native/net.c", "runtime/native/workers.c", "runtime/native/securecrypto.c", "runtime/native/update_monocypher.c", "runtime/native/aes.c", "runtime/native/tlsverify.c", "-pthread"]
+let host = test.run(["uname", "-s"], frontend.environment, "", frontend.compiler.directory + "/host", 10)
+test.require(host, "identify network provider")
+if host.output == "Darwin\n" {
+    for flag in ["-framework", "Security", "-framework", "CoreFoundation"] { frontend.sources.add(flag) }
+} else { frontend.sources.add("-lcrypto") }
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "net" as net
+    use "errors" as errors
+    function datagram(connection: Integer): Result<Bytes, net.ReadFailure> {
+        return Ok(try net.receiveDatagramBytes(connection, 4) else "reading a datagram")
+    }
+    function exercise(): Result<Nothing, errors.Error> {
+        print(net.addressFamily("127.0.0.1").unwrapOr(0))
+        print(net.addressFamily("::1").unwrapOr(0)); print(net.addressFamily("moon").isNone())
+        print(net.openConnection("127.0.0.1", -1).isErr())
+        print(net.beginConnection("not-an-ip", 80).isErr())
+        print(net.noDelay(-1, true).isErr()); print(net.setNonBlocking(-1, true).isErr())
+        let receiver = try net.openDatagram("127.0.0.1", 0)
+        let sender = try net.openDatagram("127.0.0.1", 0)
+        let port = try net.portOf(receiver)
+        match net.receiveDatagramBytes(receiver, 8) { Ok(data) { print("wrong") } Err(failure) { print(failure.isWouldBlock()) } }
+        try net.connectDatagram(sender, "127.0.0.1", port)
+        print(try net.writeBytes(sender, Bytes()))
+        if !net.ready(receiver, 1000) { fail("empty datagram was not delivered") }
+        match net.receiveDatagramBytes(receiver, 8) { Ok(data) { print(data.length) } Err(failure) { fail(failure.error().describe()) } }
+        try net.writeBytes(sender, Bytes("abcdefghij"))
+        if !net.ready(receiver, 1000) { fail("datagram was not delivered") }
+        match datagram(receiver) {
+            Ok(data) { print("wrong") }
+            Err(failure) { print(failure.error().code() == errors.truncatedCode()); print(Text(failure.prefix())); print(failure.error().contexts()[0]) }
+        }
+        print(try net.sendPackets(sender, [Bytes("one"), Bytes("two")]))
+        if !net.ready(receiver, 1000) { fail("batch was not delivered") }
+        match net.receivePackets(receiver, 4, 8) {
+            Ok(packets) { print(packets.length); print(packets[0].data().unwrapOr(Bytes()).length) }
+            Err(failure) { fail(failure.error().describe()) }
+        }
+        net.close(receiver); net.close(sender)
+        let listener = try net.listenOn("127.0.0.1", 0, 8)
+        match net.acceptConnection(listener) { Ok(handle) { print("wrong") } Err(error) { print(errors.isWouldBlock(error)) } }
+        let connection = try net.openConnection("127.0.0.1", try net.portOf(listener))
+        if !(try net.waitReady(listener, 1000)) { fail("connection was not delivered") }
+        let accepted = try net.acceptConnection(listener)
+        net.close(connection)
+        if !net.ready(accepted, 1000) { fail("EOF was not delivered") }
+        match net.readBytes(accepted, 8) { Ok(data) { print(data.isNone()) } Err(failure) { fail(failure.error().describe()) } }
+        net.close(accepted); net.close(listener)
+        return Ok()
+    }
+    match exercise() { Ok() { print("done") } Err(error) { fail(error.describe()) } }
+    """#, "4\n6\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n0\n0\ntrue\nabcd\nreading a datagram\n2\n2\n3\ntrue\ntrue\ndone\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    use "tls" as tls
+    use "errors" as errors
+    print(tls.open("", Bytes()).isErr())
+    let session = tls.open("localhost", Bytes(64)).unwrap()
+    print(session.failure().isNone())
+    match session.read() { Ok(value) { print("wrong") } Err(error) { print(errors.isWouldBlock(error)) } }
+    print(session.cipherSuites([0x1301]).isOk())
+    print(session.cipherSuites([]).isErr())
+    let invalid = Bytes(5); invalid[0] = 22
+    print(session.receive(invalid).isErr())
+    print(session.failure().unwrap().code() == errors.protocolCode())
+    session.incoming = Bytes("safe")
+    print(session.read().unwrap().unwrapOr(Bytes()).length)
+    print(session.read().isErr())
+    let closed = tls.none()
+    print(closed.read().unwrap().isNone())
+    print(closed.receive(Bytes()).isErr()); print(closed.send(Bytes()).isErr())
+    print(closed.finishInput().isOk())
+    let unfinished = tls.open("localhost", Bytes(64)).unwrap()
+    print(unfinished.send(Bytes("early")).isErr())
+    print(tls.client("", Bytes()).state == tls.FAILED)
+    """#, "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n4\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n", levels, 0, "", true)
+
+let client = #"""
+    use "workers" as workers
+    use "net" as net
+    use "HTTP_MODULE" as http
+    use "text" as text
+    use "errors" as errors
+    function server(mode: Text): Result<Nothing, errors.Error> {
+        if mode == "echo" {
+            let message = try workers.readRequest()
+            match message { Some(data) { try workers.replyMessage(data) } None { } }
+            return Ok()
+        }
+        let listener = try net.listenOn("127.0.0.1", 0, 8)
+        try net.setNonBlocking(listener, false)
+        try workers.replyMessage(Bytes(Text(try net.portOf(listener))))
+        let connection = try net.acceptConnection(listener)
+        try net.setNonBlocking(connection, false)
+        match net.readBytes(connection, 8192) { Ok(data) { } Err(failure) { net.close(connection); net.close(listener); return Err(failure.error()) } }
+        let body = Bytes("ok")
+        let status = "200 OK"
+        if mode == "missing" { status = "404 Not Found"; body = Bytes("missing") }
+        if mode == "json" { body = Bytes(#"{"port":42}"#) }
+        if mode == "binary" { body = Bytes(2); body[0] = 255; body[1] = 0 }
+        if mode == "oversize" { body = Bytes("too much light") }
+        let declared = body.length
+        if mode == "truncated" { declared += 4 }
+        let response = Bytes("HTTP/1.1 \(status)\r\nContent-Length: \(declared)\r\nConnection: close\r\n\r\n")
+        response.addBytes(body)
+        let written = try net.writeBytes(connection, response)
+        net.close(connection); net.close(listener)
+        if written != response.length { return Err(errors.make(7, 0, "short peer write")) }
+        return Ok()
+    }
+    function request(mode: Text): Result<http.Reply, errors.Error> {
+        let worker = try workers.startSelf(mode)
+        let address = try worker.receive(-1)
+        let port = try text.integer(Text(address.unwrapOr(Bytes())))
+        let limit = 64
+        if mode == "oversize" { limit = 8 }
+        let response = http.fetchWithin("http://127.0.0.1:\(port)/", [], limit, 1000)
+        let closed = worker.close()
+        try closed
+        return response
+    }
+    function parent(): Result<Nothing, errors.Error> {
+        print(workers.currentMode().isNone())
+        print(workers.readRequest().isErr()); print(workers.replyMessage(Bytes()).isErr())
+        print(workers.start("/this-worker-does-not-exist", "echo").isErr())
+        let echo = try workers.startSelf("echo")
+        print(try echo.send(Bytes()))
+        let message = try echo.receive(-1)
+        print(message.isSome()); print(message.unwrapOr(Bytes("bad")).length)
+        try echo.close()
+        let good = try request("ok")
+        print(good.status); print(try good.text())
+        let missing = try request("missing")
+        print(missing.status); print(try missing.text())
+        let binary = try request("binary")
+        print(binary.body[0]); print(binary.body[1]); print(binary.text().isErr())
+        let document = try (try request("json")).json()
+        print(try document.get("port").andThen(function(value) { return value.asInteger() }))
+        print(request("truncated").isErr()); print(request("oversize").isErr())
+        print(http.fetch("ftp://example.invalid/", []).isErr())
+        print(http.fetchWithin("http://127.0.0.1/", [], 0, 1).isErr())
+        print(http.get("ftp://example.invalid/", []).status)
+        return Ok()
+    }
+    if workers.isWorker() {
+        match server(workers.currentMode().unwrapOr("")) { Ok() { } Err(error) { fail(error.describe()) } }
+    } else {
+        match parent() { Ok() { print("done") } Err(error) { fail(error.describe()) } }
+    }
+    """#
+let expected = "true\ntrue\ntrue\ntrue\n0\ntrue\n0\n200\nok\n404\nmissing\n255\n0\ntrue\n42\ntrue\ntrue\ntrue\ntrue\n0\ndone\n"
+fixtures.executes(frontend, test.replace(client, "HTTP_MODULE", "http"), expected, levels, 0, "", true)
+
+if host.output == "Darwin\n" {
+    let object = frontend.compiler.directory + "/http.o"
+    let command = [frontend.compiler.clang, "-O1", "-fobjc-arc", "-c", "runtime/native/http.m", "-o", object]
+    for flag in frontend.compiler.flags { command.add(flag) }
+    test.require(test.run(command, frontend.environment, "", object + ".build", 120), "build native HTTP provider")
+    for flag in [object, "-framework", "Foundation", "-framework", "AppKit"] { frontend.sources.add(flag) }
+    io.writeTextFile(frontend.compiler.directory + "/native-http.min", io.readTextFile("library/platform/macos/http.min"))
+    fixtures.executes(frontend, test.replace(client, "HTTP_MODULE", "./native-http.min"), expected, levels, 0, "", true)
+}
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/replies.min"), "At St Ives, the air is 14 degrees.\nreading the temperature\n  expected a JSON integer\n", levels, 0, "", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Result networking: passed")

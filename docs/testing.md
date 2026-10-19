@@ -146,6 +146,16 @@ The configuration gallery and programs run at O0/O2 with ownership assertions;
 `check-result-library-sanitize` adds ASan/UBSan. Compatibility getters and native
 status APIs are also exercised by their existing focused suites.
 
+`make check-result-network` exercises typed sockets, TLS, workers and HTTP at
+O0/O2 with the ownership oracle. Loopback peers cover nonblocking accept,
+would-block, empty datagrams, truncation prefixes, batches and stream EOF.
+Worker framing retains empty messages. Local HTTP peers check complete 200
+and 404 responses, binary bodies, JSON, truncation and body limits, using
+both portable and native macOS providers where available. No Internet access
+or sleep polling is needed. The replies gallery has checked output.
+`check-result-network-sanitize` instruments the compiler, runtime, native
+providers and generated programs with ASan/UBSan.
+
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition

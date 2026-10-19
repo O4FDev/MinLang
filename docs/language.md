@@ -963,6 +963,10 @@ names. An empty success remains a success; failures carry an `errors.Error`.
 | `files` | `openFile`, `closeFile`, `readBytes`, `readBytesAt`, `writeBytes`, `writeBytesAt`, `entries`, `fileSize`, `sizeOfPath`, `resize`, `reserve`, `move`, `deleteFile`, `createDirectory`, `deleteDirectory`, `flush`, `flushData`, `flushDirectory` | Original native Integer/Bytes/lastError functions |
 | `process` | `argumentAt` returns Maybe; `sleep` returns Result | `argument`, `sleepNanoseconds` |
 | `json` | `decode`, `decodeBytes`, unique/budgeted decoding, `Value.get`, `findMember`, `element`, `asText`, `asBoolean`, `asInteger`, `asNumber`, `asArray` | `parse`, `lookup`, `require*`, `member`, `string` and their methods |
+| `http` | `fetch`, `fetchBounded`, `fetchWithin`, `postText`, `send` return `Result<Reply, errors.Error>`; `Reply.text`, `Reply.json` decode the body | `get`, `getBounded`, `getBoundedWithin`, `post`, `request`, `Response` |
+| `net` | `openConnection`, `beginConnection`, `finishConnection`, `listenOn`, `acceptConnection`, `openDatagram`, `portOf`, `waitReady`, `closeConnection`, `readBytes`, `writeBytes`, `receivePackets`; `addressFamily` returns Maybe | Original native handles, sentinel counts and status records |
+| `workers` | `start`, `startSelf`, `currentMode`, `readRequest`, `replyMessage`; `Worker.send`, `receive`, `close` | `spawn`, `spawnSelf`, `mode`, `readMessage`, `reply`, `send`, `receive`, `close` |
+| `tls` | `open`, `openWithTrust`, `openWithIdentity`, `openWithProtocol`, `openQUIC`; `Session.receive`, `send`, `read`, `finishInput`, `close`, `failure`, `cipherSuites` | Original factories, state-machine functions and Session fields |
 
 File and process errors preserve a positive native error code. File reads and
 directory listings capture the native status before another operation can
@@ -998,6 +1002,42 @@ Float range. Ordinary typed decoding uses the first duplicate member;
 `decodeUnique` and its bounded Bytes forms reject duplicates and retain their
 documented metadata budgets. The old APIs keep their previous sentinel,
 coercion and Unicode-replacement behavior.
+
+An HTTP Reply is complete: status 404 is an `Ok` reply, while transport,
+protocol, timeout and body-limit failures are `Err`. The portable and native
+macOS modules expose the same typed API. `Reply.text()` validates UTF-8;
+`Reply.json()` decodes with a 128 MiB byte limit. These conveniences retain
+the existing whole-response buffering and request limits. Reply shares its
+headers and Bytes with the underlying response; decoding may allocate a Text
+copy or a JSON tree. The compatibility Response keeps its five-field native
+layout, including status zero and error text on failure.
+
+`net.readBytes` returns `Ok(Some(bytes))` for stream data and `Ok(None)` for
+EOF. Would-block is an error with `errors.wouldBlockCode()`. A datagram uses
+`receiveDatagramBytes`: an empty datagram is `Ok(Bytes())`. A truncated read
+returns a `ReadFailure`, whose `error()` and `prefix()` preserve both the
+diagnostic and readable bytes. `receivePackets` and `DatagramOffload.receive`
+use `BatchFailure` to retain packets received before an error. Both failure
+types support `withContext` and `describe`, including contextual `try`.
+`Datagram.data()` checks each packet's status. The offload handle also has
+typed `port`, `ready`, `watch`, `sendTo` and `close` methods.
+
+Socket adapters preserve handle ownership, partial write counts and the
+native API's serialization requirements. Handle/status operations capture
+the legacy last-error channel immediately; concurrent calls sharing that
+channel still require the same external coordination. `waitReady` returns
+`Ok(false)` on a timeout. `readBytesInto` appends to the supplied buffer and
+requires a positive limit. The original operations retain their contracts.
+
+Worker messages distinguish `Some(Bytes())` from EOF `None`; a timeout is a
+would-block error. `currentMode` returns None outside a worker, and
+`readRequest`/`replyMessage` return an error there. TLS methods operate on the
+existing caller-driven state machine and never open sockets. `Session.read`
+drains authenticated plaintext before reporting a later sticky failure;
+closed input yields None, and pending input is a would-block error. Managed
+Result/Maybe wrappers allocate containers and share their reference payloads.
+The runnable `examples/gallery/replies.min` reads a weather station's reply
+without a network dependency.
 
 ## Callbacks
 
