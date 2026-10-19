@@ -1,0 +1,246 @@
+use "./project.min" as project
+use "./module-tests.min" as moduleTests
+use "./driver-support.min" as host
+use "./documentation-markup.min" as markup
+use "./documentation-style.min" as style
+use "json" as json
+use "io" as io
+use "files" as files
+
+record Module { path: Text; name: Text; api: json.Value }
+
+function label(graph: project.Graph, source: Text): Text {
+    for package in graph.packages {
+        let prefix = package.root + "/src/"
+        if source.startsWith(prefix) {
+            let name = host.stemOf(source.slice(prefix.length, source.length))
+            if name == package.name { return name }
+            return package.name + " / " + name
+        }
+    }
+    for package in graph.packages {
+        let prefix = package.root + "/"
+        if source.startsWith(prefix) { return host.stemOf(source.slice(prefix.length, source.length)) }
+    }
+    return host.stemOf(host.baseName(source))
+}
+
+function compilerArguments(graph: project.Graph, compiler: Text, library: Text): List<Text> {
+    let command = moduleTests.compilerArguments(graph, compiler)
+    if library != "" { command.add("--library"); command.add(library) }
+    return command
+}
+
+function metadata(graph: project.Graph, compiler: Text, sources: List<Text>, library: Text): List<Module> {
+    let result: List<Module> = []
+    for source in sources {
+        let command = compilerArguments(graph, compiler, library)
+        for item in ["--doc-json", source] { command.add(item) }
+        let run = host.capture(command, 120)
+        if run.status != 0 { host.stop("cannot read documentation: " + source + "\n" + run.errors) }
+        let api = json.parse(run.output)
+        if api.kind != json.OBJECT || api.member("declarations").kind != json.ARRAY { host.stop("the compiler returned invalid documentation for " + source) }
+        result.add(Module { path: source; name: label(graph, source); api: api })
+    }
+    return result
+}
+
+function relativePath(directory: Text, source: Text): Text {
+    let from = host.resolveName(directory).split("/")
+    let to = host.resolveName(source).split("/")
+    let common = 0
+    while common < from.length && common < to.length && from[common] == to[common] { common += 1 }
+    let pieces: List<Text> = []
+    for index in common..from.length { if from[index] != "" { pieces.add("..") } }
+    for index in common..to.length { pieces.add(to[index]) }
+    let result = host.joined(pieces, "/")
+    if !result.startsWith(".") { result = "./" + result }
+    return result
+}
+
+function capturedIn(command: List<Text>, directory: Text, seconds: Integer): host.Captured {
+    let shell = host.which("sh")
+    if shell == "" { host.stop("sh is required to run documentation examples") }
+    let arguments = [shell, "-c", "cd -- \"$1\" && shift && exec \"$@\"", "minyar-doc", directory]
+    for item in command { arguments.add(item) }
+    return host.capture(arguments, seconds)
+}
+
+function verifyExample(graph: project.Graph, compiler: Text, source: Text, example: markup.Example, directory: Text, serial: Integer, release: Boolean, library: Text): Text {
+    let work = directory + "/example-" + Text(serial)
+    host.makeDirectories(work)
+    let path = work + "/example.min"
+    let program = "use " + host.jsonText(relativePath(work, source)) + " as api\n" + example.source + "\n"
+    io.writeTextFile(path, program)
+    let command = compilerArguments(graph, compiler, library)
+    if release { command.add("--release") } else { command.add("--debug") }
+    for item in [path, "-o", work + "/example"] { command.add(item) }
+    let built = host.capture(command, 600)
+    if built.status != 0 { return "the example does not compile\n" + built.errors }
+    let run = capturedIn([work + "/example"], work, 120)
+    if run.status != 0 { return "the example exited with status " + Text(run.status) + "\n" + run.errors }
+    if run.errors != "" { return "the example wrote unexpected diagnostics\n" + run.errors }
+    if run.output != example.output { return "the example output did not match\n  expected " + host.jsonText(example.output) + "\n       got " + host.jsonText(run.output) }
+    let discover = compilerArguments(graph, compiler, library)
+    for item in ["--list-tests", path] { discover.add(item) }
+    let listing = host.capture(discover, 120)
+    if listing.status != 0 { return "cannot discover the example's module tests\n" + listing.errors }
+    if listing.output != "" {
+        command = compilerArguments(graph, compiler, library)
+        command.add("--test-mode")
+        if release { command.add("--release") } else { command.add("--debug") }
+        for item in [path, "-o", work + "/tests"] { command.add(item) }
+        built = host.capture(command, 600)
+        if built.status != 0 { return "the example's module tests do not compile\n" + built.errors }
+        run = capturedIn([work + "/tests"], work, 120)
+        if run.status != 0 || run.errors != "" { return "the example's module tests failed\n" + run.errors }
+    }
+    return ""
+}
+
+function examplesFor(declaration: json.Value, location: Text): List<markup.Example> {
+    let result = markup.examples(json.string(declaration, "documentation"), location)
+    for member in declaration.member("members").items {
+        for example in markup.examples(json.string(member, "documentation"), location + "." + json.string(member, "name")) { result.add(example) }
+    }
+    return result
+}
+
+function verify(modules: List<Module>, graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, report: Boolean, library: Text): moduleTests.Report {
+    let result = moduleTests.Report { count: 0; failures: 0 }
+    for module in modules {
+        for declaration in module.api.member("declarations").items {
+            let name = json.string(declaration, "name")
+            let location = module.path + ":" + json.string(declaration.member("span"), "line") + " · " + name
+            let examples = examplesFor(declaration, location)
+            for index in 0..examples.length {
+                let title = name + " · example " + Text(index + 1)
+                if filter != "" && !host.hasText(module.path, filter) && !host.hasText(title, filter) { continue }
+                result.count += 1
+                let failure = verifyExample(graph, compiler, module.path, examples[index], directory, result.count, release, library)
+                if failure != "" {
+                    result.failures += 1
+                    if report { print("  × " + title + " · " + location + "\n" + failure) }
+                    else { host.stop(location + "\n" + failure) }
+                } else if report { print("  ✓ " + title + " · " + module.path) }
+            }
+        }
+    }
+    return result
+}
+
+function mark(): Text {
+    return "<svg viewBox=\"0 0 32 32\" fill=\"none\" aria-hidden=\"true\"><path d=\"M4 25V8l12 12L28 8v17M10 25v-9m12 9v-9\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>"
+}
+
+function plural(count: Integer, word: Text): Text {
+    if count == 1 { return word }
+    return word + "s"
+}
+
+function anchor(value: Text): Text {
+    let parts: List<Text> = ["api-"]
+    let hex = "0123456789abcdef"
+    for byte in Bytes(value) {
+        if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 { parts.add(Text(Character(byte))) }
+        else { parts.add("_" + Text(hex[byte / 16]) + Text(hex[byte % 16])) }
+    }
+    return joinText(parts)
+}
+
+function renderDeclaration(declaration: json.Value, module: Module, id: Text): Text {
+    let name = json.string(declaration, "name")
+    let kind = json.string(declaration, "kind")
+    let signature = json.string(declaration, "signature")
+    let documentation = json.string(declaration, "documentation")
+    let span = declaration.member("span")
+    let location = host.baseName(module.path) + ":" + json.string(span, "line")
+    let search = module.name + " " + name + " " + kind + " " + signature + " " + documentation
+    for member in declaration.member("members").items { search += " " + json.string(member, "name") + " " + json.string(member, "signature") + " " + json.string(member, "documentation") }
+    let parts = ["<article class=\"api\" id=\"" + id + "\" data-search=\"" + markup.escape(search) + "\"><div class=\"api-heading\"><span class=\"kind " + markup.escape(kind) + "\">" + markup.escape(kind) + "</span><h3>" + markup.escape(name) + " <a class=\"permalink\" aria-label=\"Link to " + markup.escape(name) + "\" href=\"#" + id + "\">#</a></h3><span class=\"location\">" + markup.escape(location) + "</span></div><pre class=\"signature\"><code>" + markup.code(signature) + "</code></pre>"]
+    if documentation != "" { parts.add(markup.blocks(documentation, location)) }
+    else { parts.add("<p class=\"undocumented\">Documentation is waiting to be written.</p>") }
+    let members = declaration.member("members").items
+    if members.length > 0 {
+        parts.add("<div class=\"members\">")
+        for member in members {
+            parts.add("<div class=\"member\"><p class=\"member-title\">" + markup.code(json.string(member, "signature")) + "</p>")
+            let content = json.string(member, "documentation")
+            if content != "" { parts.add(markup.blocks(content, location)) }
+            parts.add("</div>")
+        }
+        parts.add("</div>")
+    }
+    parts.add("</article>")
+    return joinText(parts)
+}
+
+function render(modules: List<Module>, graph: project.Graph, examples: Integer): Text {
+    let count = 0
+    let visible = 0
+    for module in modules { count += module.api.member("declarations").items.length; if module.api.member("declarations").items.length > 0 { visible += 1 } }
+    let package = graph.packages[0]
+    let moduleWord = "modules"
+    if visible == 1 { moduleWord = "module" }
+    let title = package.name
+    let version = "Version " + markup.escape(package.version)
+    if package.version == "" { version = "Source reference" }
+    let parts = ["<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"description\" content=\"" + markup.escape(title) + " — Minyar API documentation with verified examples.\"><title>" + markup.escape(title) + " · Minyar documentation</title><style>" + style.styles() + "</style></head><body><a class=\"skip\" href=\"#content\">Skip to documentation</a><div class=\"shell\"><aside class=\"rail\"><a class=\"brand\" href=\"#content\">" + mark() + "Minyar<small>Reference</small></a><div class=\"package\"><strong>" + markup.escape(title) + "</strong>" + version + "</div><div class=\"search\"><svg viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><circle cx=\"7\" cy=\"7\" r=\"4.5\" stroke=\"currentColor\"/><path d=\"m10.5 10.5 3 3\" stroke=\"currentColor\" stroke-linecap=\"round\"/></svg><input id=\"search\" type=\"search\" aria-label=\"Search the public API\" placeholder=\"Search the API\" autocomplete=\"off\"><kbd>/</kbd></div><nav aria-label=\"Modules\"><p class=\"nav-title\">Modules</p><ul>"]
+    for index in 0..modules.length {
+        let module = modules[index]
+        if module.api.member("declarations").items.length > 0 { parts.add("<li><a href=\"#module-" + Text(index) + "\"><span class=\"dot\"></span>" + markup.escape(module.name) + "</a></li>") }
+    }
+    parts.add("</ul></nav><div class=\"rail-foot\"><span>Words worth reading.</span>Written beside the code.<br>Examples checked before publication.</div></aside><main id=\"content\"><header class=\"hero\"><p class=\"eyebrow\">The public interface</p><h1>" + markup.escape(title) + ".<br>A little clarity.</h1><p class=\"lede\">Names, ideas, and small working examples.<br>Everything you need to make something lovely.</p><div class=\"stats\"><span><strong>" + Text(visible) + "</strong> " + moduleWord + "</span><span><strong>" + Text(count) + "</strong> " + plural(count, "declaration") + "</span><span class=\"verified\"><strong>" + Text(examples) + "</strong> verified " + plural(examples, "example") + "</span></div></header><p class=\"search-status\" id=\"search-status\" aria-live=\"polite\" hidden></p><p id=\"no-results\" class=\"no-results\" hidden>No declarations match those words.</p>")
+    for index in 0..modules.length {
+        let module = modules[index]
+        let declarations = module.api.member("declarations").items
+        if declarations.length == 0 { continue }
+        parts.add("<section class=\"module\" id=\"module-" + Text(index) + "\" aria-labelledby=\"title-" + Text(index) + "\"><div class=\"module-head\"><h2 id=\"title-" + Text(index) + "\">" + markup.escape(module.name) + "</h2><span class=\"count\">" + Text(declarations.length) + " " + plural(declarations.length, "declaration") + "</span><span class=\"path\">" + markup.escape(host.baseName(module.path)) + "</span></div>")
+        for item in 0..declarations.length { parts.add(renderDeclaration(declarations[item], module, anchor(module.name + "." + json.string(declarations[item], "name")))) }
+        parts.add("</section>")
+    }
+    parts.add("<footer class=\"page-foot\"><span>Made with Minyar · Works offline · <a href=\"api.json\">API metadata</a></span><em>Keep the code close to the story.</em></footer></main></div><script>" + style.script() + "</script></body></html>")
+    return joinText(parts)
+}
+
+function buildConfigured(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, sources: List<Text>, library: Text) {
+    host.makeDirectories(directory)
+    let modules = metadata(graph, compiler, sources, library)
+    let work = host.temporaryDirectory(directory, ".documentation-")
+    let examples = verify(modules, graph, compiler, work, release, "", false, library)
+    let html = render(modules, graph, examples.count)
+    io.writeTextFile(work + "/index.html", html)
+    let metadata: List<Text> = []
+    for module in modules { metadata.add(module.api.pretty("")) }
+    io.writeTextFile(work + "/api.json", "{\"version\":1,\"modules\":[" + host.joined(metadata, ",") + "]}\n")
+    if files.rename(work + "/api.json", directory + "/api.json") != 0 { host.stop("cannot publish API metadata") }
+    if files.rename(work + "/index.html", directory + "/index.html") != 0 { host.stop("cannot publish documentation") }
+    host.cleanup()
+    print("Documented " + graph.packages[0].name + " · " + Text(examples.count) + " verified " + plural(examples.count, "example") + "\n" + directory + "/index.html")
+}
+
+public function build(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, sources: List<Text>) {
+    buildConfigured(graph, compiler, directory, release, sources, "")
+}
+
+public function testExamples(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text): moduleTests.Report {
+    let modules = metadata(graph, compiler, moduleTests.sources(graph), "")
+    let work = host.temporaryDirectory(directory, ".doc-tests-")
+    let result = verify(modules, graph, compiler, work, release, filter, true, "")
+    host.cleanup()
+    return result
+}
+
+public function fromDirectory(compiler: Text, input: Text, directory: Text, release: Boolean) {
+    if !host.isDirectory(input) { host.stop("documentation needs a source directory: " + input) }
+    input = host.resolveName(input)
+    let paths: List<Text> = []
+    host.walk(input, "", paths)
+    let sources: List<Text> = []
+    for path in paths { if path.endsWith(".min") { sources.add(input + "/" + path) } }
+    let name = host.baseName(input)
+    if name == "library" { name = "The Minyar library" }
+    let package = project.manifest(input, name, "", "lib")
+    let graph = project.Graph { packages: [package]; active: [] }
+    buildConfigured(graph, compiler, directory, release, sources, input)
+}

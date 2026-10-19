@@ -1,0 +1,156 @@
+use "./driver-support.min" as host
+
+public record Example { source: Text; output: Text; line: Integer }
+
+public function escape(value: Text): Text {
+    let parts: List<Text> = []
+    for character in value {
+        if character == '&' { parts.add("&amp;") }
+        else if character == '<' { parts.add("&lt;") }
+        else if character == '>' { parts.add("&gt;") }
+        else if character == '"' { parts.add("&quot;") }
+        else if character == '\'' { parts.add("&#39;") }
+        else { parts.add(Text(character)) }
+    }
+    return joinText(parts)
+}
+
+public function inline(value: Text): Text {
+    let parts: List<Text> = []
+    let first = 0
+    let position = 0
+    while position < value.length {
+        if value[position] == '`' {
+            let closing = position + 1
+            while closing < value.length && value[closing] != '`' { closing += 1 }
+            if closing < value.length {
+                parts.add(escape(value.slice(first, position)))
+                parts.add("<code>" + escape(value.slice(position + 1, closing)) + "</code>")
+                position = closing + 1
+                first = position
+            } else { position += 1 }
+        } else { position += 1 }
+    }
+    parts.add(escape(value.slice(first, value.length)))
+    return joinText(parts)
+}
+
+function letter(character: Character): Boolean {
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '_'
+}
+
+public function code(source: Text): Text {
+    let parts: List<Text> = []
+    let position = 0
+    while position < source.length {
+        let first = position
+        let character = source[position]
+        if character == '"' || character == '\'' {
+            position += 1
+            while position < source.length && source[position] != character {
+                if source[position] == '\\' { position += 1 }
+                position += 1
+            }
+            if position < source.length { position += 1 }
+            parts.add(escape(source.slice(first, min(position, source.length))))
+        } else if letter(character) {
+            position += 1
+            while position < source.length && (letter(source[position]) || (source[position] >= '0' && source[position] <= '9')) { position += 1 }
+            let word = source.slice(first, position)
+            if host.listed(["public", "private", "record", "function", "let", "constant", "global", "choice", "match", "test", "expect", "return", "use", "as", "if", "else", "try", "for", "in", "parallel", "type"], word) { parts.add("<span class=\"keyword\">" + word + "</span>") }
+            else if character >= 'A' && character <= 'Z' { parts.add("<span class=\"type\">" + word + "</span>") }
+            else { parts.add(word) }
+        } else {
+            parts.add(escape(Text(character)))
+            position += 1
+        }
+    }
+    return joinText(parts)
+}
+
+function closeFence(lines: List<Text>, first: Integer, location: Text): Integer {
+    let position = first + 1
+    while position < lines.length && host.strip(lines[position]) != "```" { position += 1 }
+    if position == lines.length { host.stop(location + ": a documentation code fence needs its closing ```") }
+    return position
+}
+
+function linesBetween(lines: List<Text>, first: Integer, after: Integer): Text {
+    let parts: List<Text> = []
+    for index in first..after { parts.add(lines[index]) }
+    return host.joined(parts, "\n")
+}
+
+public function examples(documentation: Text, location: Text): List<Example> {
+    let result: List<Example> = []
+    let lines = host.lines(documentation)
+    let position = 0
+    while position < lines.length {
+        let line = host.strip(lines[position])
+        if line.startsWith("```") {
+            let closing = closeFence(lines, position, location)
+            if line == "```minyar" {
+                let source = linesBetween(lines, position + 1, closing)
+                let first = position
+                position = closing + 1
+                while position < lines.length && host.strip(lines[position]) == "" { position += 1 }
+                let expected = ""
+                if position < lines.length && host.strip(lines[position]) == "```output" {
+                    let after = closeFence(lines, position, location)
+                    expected = linesBetween(lines, position + 1, after)
+                    if after > position + 1 { expected += "\n" }
+                    position = after + 1
+                }
+                result.add(Example { source: source; output: expected; line: first + 1 })
+            } else { position = closing + 1 }
+        } else { position += 1 }
+    }
+    return result
+}
+
+public function verified(): Text { return "<span class=\"verified\"><svg viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"m3 8 3 3 7-7\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>Verified</span>" }
+
+public function blocks(documentation: Text, location: Text): Text {
+    let lines = host.lines(documentation)
+    let parts: List<Text> = []
+    let position = 0
+    let paragraph: List<Text> = []
+    let listed = false
+    while position <= lines.length {
+        let line = ""
+        if position < lines.length { line = host.strip(lines[position]) }
+        let special = line == "" || line.startsWith("```") || line.startsWith("#") || line.startsWith("- ")
+        if special && paragraph.length > 0 { parts.add("<p>" + inline(host.joined(paragraph, " ")) + "</p>"); paragraph.clear() }
+        if listed && !line.startsWith("- ") { parts.add("</ul>"); listed = false }
+        if position == lines.length { break }
+        if line.startsWith("```") {
+            let closing = closeFence(lines, position, location)
+            let source = linesBetween(lines, position + 1, closing)
+            let minyar = line == "```minyar"
+            if minyar {
+                parts.add("<div class=\"example\"><div class=\"example-head\"><span>Example</span>" + verified() + "</div><pre><code>" + code(source) + "</code></pre>")
+                position = closing + 1
+                while position < lines.length && host.strip(lines[position]) == "" { position += 1 }
+                let output = ""
+                if position < lines.length && host.strip(lines[position]) == "```output" {
+                    let after = closeFence(lines, position, location)
+                    output = linesBetween(lines, position + 1, after)
+                    position = after + 1
+                }
+                parts.add("<pre class=\"output\"><span class=\"output-label\">Output</span>")
+                if output == "" { parts.add("<span class=\"empty\">No output</span>") } else { parts.add(escape(output)) }
+                parts.add("</pre></div>")
+            } else { parts.add("<div class=\"example\"><pre><code>" + escape(source) + "</code></pre></div>"); position = closing + 1 }
+        } else if line.startsWith("#") {
+            let start = 0
+            while start < line.length && (line[start] == '#' || line[start] == ' ') { start += 1 }
+            parts.add("<h4>" + inline(line.slice(start, line.length)) + "</h4>")
+            position += 1
+        } else if line.startsWith("- ") {
+            if !listed { parts.add("<ul>"); listed = true }
+            parts.add("<li>" + inline(line.slice(2, line.length)) + "</li>")
+            position += 1
+        } else { if line != "" { paragraph.add(line) }; position += 1 }
+    }
+    return "<div class=\"prose\">" + joinText(parts) + "</div>"
+}

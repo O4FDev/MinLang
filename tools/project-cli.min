@@ -4,6 +4,7 @@ use "./package-git.min" as git
 use "./registry.min" as registry
 use "./registry-publish.min" as publish
 use "./module-tests.min" as moduleTests
+use "./documentation.min" as documentation
 use "./driver-support.min" as host
 use "system" as system
 use "files" as files
@@ -22,7 +23,8 @@ function help() {
       build                       Build the current project
       run                         Build and run; pass arguments after --
       check                       Check source and tests without linking
-      test                        Run module tests and tests/*.min
+      test                        Run module, documentation and integration tests
+      doc                         Build the API reference and verify examples
       clean                       Remove generated files from target
 
     Packages
@@ -103,15 +105,15 @@ function parse(): Options {
     for option in seen {
         let allowed = false
         if option == "--name" || option == "--lib" { allowed = options.command == "new" || options.command == "init" }
-        else if option == "--path" { allowed = options.command == "add" || options.command == "install" }
+        else if option == "--path" { allowed = options.command == "add" || options.command == "install" || options.command == "doc" }
         else if option == "--root" { allowed = options.command == "install" || options.command == "uninstall" }
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--dry-run" || option == "--description" { allowed = options.command == "publish" }
         else if option == "--registry" { allowed = options.command == "search" || options.command == "info" }
         else if option == "--manifest-path" { allowed = options.command != "new" && options.command != "init" && options.command != "uninstall" && options.command != "search" && options.command != "info" }
-        else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "tree", "metadata", "install"], options.command) }
-        else if option == "--offline" { allowed = host.listed(["build", "run", "check", "test", "tree", "metadata", "install", "add", "remove", "search", "info"], options.command) }
-        else { allowed = host.listed(["build", "run", "check", "test", "install"], options.command) }
+        else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "doc", "tree", "metadata", "install"], options.command) }
+        else if option == "--offline" { allowed = host.listed(["build", "run", "check", "test", "doc", "tree", "metadata", "install", "add", "remove", "search", "info"], options.command) }
+        else { allowed = host.listed(["build", "run", "check", "test", "doc", "install"], options.command) }
         if !allowed { host.stop(option + " is not supported by " + options.command) }
     }
     return options
@@ -457,7 +459,7 @@ function dispatch() {
     if processInfo.argumentCount() == 0 { help(); return }
     if processInfo.argument(0) == "help" { help(); return }
     let options = parse()
-    if !host.listed(["new", "init", "build", "run", "check", "test", "clean", "add", "remove", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
+    if !host.listed(["new", "init", "build", "run", "check", "test", "doc", "clean", "add", "remove", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
     if options.command == "search" || options.command == "info" {
         let location = options.registry
         if location == "" { location = system.getenv("MINYAR_REGISTRY") }
@@ -474,6 +476,11 @@ function dispatch() {
         return
     }
     if options.command == "new" || options.command == "init" { create(options); return }
+    if options.command == "doc" && options.path != "" {
+        if options.positionals.length != 0 || options.manifest != "" || options.locked { host.stop("usage: minyar doc --path DIRECTORY [--release] [--offline]") }
+        documentation.fromDirectory(compiler(), options.path, outputDirectory(host.resolveName("."), "doc"), options.release)
+        return
+    }
     if options.command == "uninstall" {
         if options.positionals.length != 1 || !project.validName(options.positionals[0]) { host.stop("usage: minyar uninstall NAME [--root DIR]") }
         let directory = installation(options)
@@ -518,6 +525,13 @@ function dispatch() {
     }
     if options.command == "install" { install(graph, options); return }
     if options.command == "build" { build(graph, options); return }
+    if options.command == "doc" {
+        let directory = outputDirectory(root, "doc")
+        compile(graph, options, project.entry(package), "", true)
+        if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
+        documentation.build(graph, compiler(), directory, options.release, moduleTests.sources(graph))
+        return
+    }
     if options.command == "run" {
         if !project.isBinary(package) { host.stop("run requires src/main.min in a binary package") }
         let output = build(graph, options)
@@ -536,6 +550,9 @@ function dispatch() {
         let report = moduleTests.run(graph, compiler(), directory, options.release, filter, options.arguments)
         count += report.count
         failures += report.failures
+        let examples = documentation.testExamples(graph, compiler(), directory, options.release, filter)
+        count += examples.count
+        failures += examples.failures
     }
     for name in tests(root) {
         if options.positionals.length > 0 && !host.hasText(name, options.positionals[0]) { continue }

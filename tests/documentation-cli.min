@@ -1,0 +1,58 @@
+use "../tools/testing.min" as test
+use "../tools/driver-support.min" as host
+use "../tools/documentation-markup.min" as markup
+use "io" as io
+use "json" as json
+use "system" as system
+
+test.check(markup.escape("<&\"'>") == "&lt;&amp;&quot;&#39;&gt;", "all HTML-sensitive characters are escaped")
+let fenced = markup.examples("```minyar\nprint(42)\n```\n\n```output\n42\n```", "a field")
+test.check(fenced.length == 1 && fenced[0].source == "print(42)" && fenced[0].output == "42\n", "fences preserve exact expected output")
+test.check(markup.examples("```text\nnot Minyar\n```", "ordinary fence").length == 0, "ordinary fences are not executed")
+let prose = markup.blocks("# The moon\n\nA `small` light.\n\n- sea\n- sky\n\n<script>alert(1)</script>", "prose")
+for expected in ["<h4>The moon</h4>", "<code>small</code>", "<ul><li>sea</li><li>sky</li></ul>", "&lt;script&gt;"] { test.check(test.contains(prose, expected), "prose rendering " + expected) }
+let root = host.resolveName(".")
+let work = test.scratch()
+let application = work + "/harbour with spaces"
+let dependency = work + "/poems"
+host.makeDirectories(application + "/src/nested")
+host.makeDirectories(dependency + "/src")
+io.writeTextFile(application + "/Minyar.toml", "[package]\nname = \"harbour\"\nversion = \"1.2.3\"\nkind = \"lib\"\n[dependencies]\npoems = { path = \"../poems\" }\n")
+io.writeTextFile(dependency + "/Minyar.toml", "[package]\nname = \"poems\"\nversion = \"0.1.0\"\nkind = \"lib\"\n")
+io.writeTextFile(dependency + "/src/poems.min", "/// A little sea air.\npublic function sea(): Text { return \"sea\" }\n")
+let source = io.readTextFile(test.setting("MINYAR_TEST_DOCUMENTATION_SOURCE", "tests/documentation-cases/harbour.min"))
+io.writeTextFile(application + "/src/harbour.min", source)
+io.writeTextFile(application + "/src/nested/quiet.min", "/// A quiet corner.\npublic type Words = List<Text>\n")
+let launcher = test.setting("MINYAR_TEST_LAUNCHER", root + "/minyar")
+let documented = test.run([launcher, "doc"], system.environment(), application, work + "/doc", 600)
+test.require(documented, "generate project documentation")
+test.check(test.contains(documented.output, "3 verified examples"), "every fenced example was checked")
+let output = application + "/target/doc"
+let html = io.readTextFile(output + "/index.html")
+let api = io.readTextFile(output + "/api.json")
+for expected in ["harbour", "Version 1.2.3", "firstOr", "Journey", "Lantern.share", "A quiet corner.", "poems", "aria-live=\"polite\"", "data-search=", "Works offline", "&lt;script&gt;", "api-harbour_2eLantern_2eshare"] {
+    test.check(test.contains(html, expected), "site includes " + expected)
+}
+test.check(!test.contains(html, "<script>alert") && !test.contains(html, "http://") && !test.contains(html, "https://"), "escaped documentation and no remote assets")
+let metadata = json.parse(api)
+test.check(metadata.kind == json.OBJECT && metadata.member("modules").items.length == 3, "project, nested module and dependency metadata")
+let examples = test.run([launcher, "test", "welcome"], system.environment(), application, work + "/examples", 600)
+test.require(examples, "run documentation example through minyar test")
+test.check(test.contains(examples.output, "1 passed; 0 failed") && test.contains(examples.output, "welcome · example 1"), "doctest filter and summary")
+let wrong = test.replace(source, "/// 42\n", "/// 43\n")
+io.writeTextFile(application + "/src/harbour.min", wrong)
+let failed = test.run([launcher, "doc"], system.environment(), application, work + "/failed", 600)
+test.check(failed.status == 1 && test.contains(failed.errorOutput, "the example output did not match") && test.contains(failed.errorOutput, "expected") && test.contains(failed.errorOutput, "got"), "wrong expected output blocks publication")
+test.check(io.readTextFile(output + "/index.html") == html && io.readTextFile(output + "/api.json") == api, "failed verification preserves the previous site and metadata")
+io.writeTextFile(application + "/src/harbour.min", source)
+let directory = work + "/standalone sources"
+host.makeDirectories(directory)
+io.writeTextFile(directory + "/light.min", "/// A light.\n///\n/// ```minyar\n/// test \"the light\" { expect(api.answer() == 42) }\n/// ```\npublic function answer(): Integer { return 42 }\n")
+let standalone = test.run([launcher, "doc", "--path", directory, "--release"], system.environment(), work, work + "/standalone", 600)
+test.require(standalone, "standalone release documentation with an expectation example")
+test.check(test.contains(standalone.output, "1 verified example") && test.contains(io.readTextFile(work + "/target/doc/index.html"), "Source reference"), "standalone directory does not require a manifest")
+io.writeTextFile(directory + "/light.min", "/// A light.\n///\n/// ```minyar\n/// test \"the light\" { expect(api.answer() == 43) }\n/// ```\npublic function answer(): Integer { return 42 }\n")
+let badExpectation = test.run([launcher, "doc", "--path", directory], system.environment(), work, work + "/bad-expectation", 600)
+test.check(badExpectation.status == 1 && test.contains(badExpectation.errorOutput, "the example's module tests failed") && test.contains(badExpectation.errorOutput, "expected 43, got 42"), "documentation executes in-module expectation blocks")
+test.removeTree(work)
+print("Verified documentation CLI: passed")

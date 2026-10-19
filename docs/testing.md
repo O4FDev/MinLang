@@ -12,6 +12,12 @@ and private-member exclusion. Its syntax-tree probe runs at O0/O2, checks token
 copying and verifies identical LLVM with ordinary comments. The documented
 gallery also runs at O0/O2 with ownership assertions.
 
+`make check-documentation` exercises the public CLI: project/dependency and
+nested module documentation, escaped prose, source signatures, stable links,
+doctest filtering and aggregation, standalone release examples and expectation
+failures. A wrong output must leave both previous site files byte-identical.
+Documentation examples run in private temporary working directories.
+
 Use `make check-portable` for the cross-platform compiler/runtime gate and
 `make check` for the broader local suite, including absolute performance
 budgets. `make check-examples` runs the executable examples and rejecting

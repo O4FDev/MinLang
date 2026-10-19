@@ -68,6 +68,15 @@ parameters, constraints, choices, methods and type aliases keep their source
 spelling. This reads syntax; use `minyar check` to check a project's types.
 Documentation emits no runtime code or literals.
 
+`minyar doc` builds an offline API reference at `target/doc/index.html`, with
+original signatures, rendered comments and local search. Every fenced
+`minyar` example is compiled and run before publication; a following `output`
+fence gives its exact standard output. The documented module is imported as
+`api`. Examples can contain `test` blocks and run with `minyar test` too.
+A failed example preserves the previous documentation. A source directory
+without a manifest can use `minyar doc --path library`.
+See [documentation beside the code](documentation.md) for the full format.
+
 ## Bindings and scope
 
 `let` introduces a local value. A name exists from its declaration to the end
