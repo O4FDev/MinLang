@@ -18,6 +18,12 @@ doctest filtering and aggregation, standalone release examples and expectation
 failures. A wrong output must leave both previous site files byte-identical.
 Documentation examples run in private temporary working directories.
 
+`make check-library-documentation` verifies every documented example across
+the whole standard library and gallery at debug/O0 and release/O2, including
+Error contexts, Maybe, generic choices, aliases and methods. It also checks
+that every source module appears in the generated metadata. The living-tests
+gallery's ordinary program and in-module tests retain O0/O2 ownership checks.
+
 Use `make check-portable` for the cross-platform compiler/runtime gate and
 `make check` for the broader local suite, including absolute performance
 budgets. `make check-examples` runs the executable examples and rejecting

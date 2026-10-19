@@ -84,3 +84,7 @@ for code, tests and documentation in one place.
 and `members`. Named test spans are recorded separately in `tests`. This mode
 always reloads original source and emits no program or runtime code. It is a
 syntax metadata interface; use `minyar check` to check a project's types.
+
+`make check-library-documentation` rebuilds the standard-library and gallery
+references in both profiles and verifies all their examples. To browse the
+library locally, run `minyar doc --path library` and open `target/doc/index.html`.
