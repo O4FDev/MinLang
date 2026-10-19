@@ -27,12 +27,25 @@ args = sys.argv[1:]
 with open(os.environ['MINYAR_FIXTURE_ARGUMENTS'], 'a') as output:
     output.write(json.dumps(args) + '\\n')
 mode = os.environ['MINYAR_FIXTURE_COMPILER_MODE']
+example = any(item.endswith('/example.min') for item in args)
+documentation = mode.startswith('doc-')
+if '--doc-json' in args and mode != 'doc-metadata':
+    declarations = [{'name': 'probe', 'members': [], 'span': {'line': '1'}, 'documentation': os.environ['MINYAR_FIXTURE_DOCUMENTATION']}] if documentation else []
+    print(json.dumps({'declarations': declarations}))
+    sys.exit(0)
 if mode != 'entry':
     if '--list-tests' in args:
-        if mode == 'module-build':
+        if mode == 'module-build' or (example and mode == 'doc-module-build'):
             print('0\\t"an embedded test"')
             sys.exit(0)
-        if mode == 'legacy': sys.exit(0)
+        if mode == 'legacy' or (documentation and not (example and mode == 'doc-discovery')): sys.exit(0)
+    elif example and documentation:
+        if mode in ('doc-discovery', 'doc-module-build') and '--test-mode' not in args:
+            output = Path(args[args.index('-o') + 1])
+            output.write_text('#!/bin/sh\\nexit 0\\n'); output.chmod(0o755)
+            sys.exit(0)
+    elif '--doc-json' in args:
+        pass
     elif '--test-mode' not in args and not any('/tests/' in item for item in args):
         sys.exit(0)
 if '--error-format' in args and args[args.index('--error-format') + 1] == 'json':
@@ -47,7 +60,8 @@ sys.exit(7)
                   "line": 1, "column": 1, "endLine": 1, "endColumn": 6, "sourceLine": 'print("ready")', "label": "fixture", "help": []}
     encoded = json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")) + "\n"
     environment = dict(os.environ, MINYAR_PROJECT_DIR=str(compiler), MINYAR_HOME=str(root / "home"),
-                       MINYAR_FIXTURE_ARGUMENTS=str(arguments), MINYAR_FIXTURE_DIAGNOSTIC=encoded)
+                       MINYAR_FIXTURE_ARGUMENTS=str(arguments), MINYAR_FIXTURE_DIAGNOSTIC=encoded,
+                       MINYAR_FIXTURE_DOCUMENTATION='```minyar\nprint("example")\n```\n')
 
     def invoke(command, *options, mode="entry"):
         arguments.unlink(missing_ok=True)
@@ -61,12 +75,13 @@ sys.exit(7)
             result, calls = invoke(command, "--error-format", "json", *profile)
             assert result.returncode == 7 and result.stderr == encoded, (command, profile, result.stdout, result.stderr)
             assert len(calls) == 1 and calls[0][calls[0].index("--error-format") + 1] == "json", calls
-    for mode in ("module-discovery", "module-build", "legacy"):
+    for mode in ("module-discovery", "module-build", "legacy", "doc-metadata", "doc-build", "doc-discovery", "doc-module-build"):
         if mode == "legacy":
             (project / "tests/failure.min").write_text('print("legacy")\n')
-        result, calls = invoke("test", "--error-format", "json", mode=mode)
-        assert result.returncode == 7 and result.stderr == encoded, (mode, result.stdout, result.stderr)
-        assert len(calls) >= 2 and all(call[call.index("--error-format") + 1] == "json" for call in calls), calls
+        for profile in ([], ["--release"]):
+            result, calls = invoke("test", "--error-format", "json", *profile, mode=mode)
+            assert result.returncode == 7 and result.stderr == encoded, (mode, profile, result.stdout, result.stderr)
+            assert len(calls) >= 2 and all(call[call.index("--error-format") + 1] == "json" for call in calls), calls
         (project / "tests/failure.min").unlink(missing_ok=True)
     for options, message in [(["--error-format"], "requires a value"), (["--error-format", "xml"], "text or json"),
                              (["--error-format", "json", "--error-format", "text"], "duplicate option")]:
@@ -78,4 +93,8 @@ sys.exit(7)
     assert result.returncode == 7 and result.stderr == "text compiler fixture failure\n"
     result, calls = invoke("check")
     assert result.returncode == 7 and result.stderr == "text compiler fixture failure\n" and "--error-format" not in calls[0]
-print("Project diagnostics: all compile routes, module discovery/build, legacy tests, exact JSON stderr/status and option validation passed")
+    for mode in ("doc-metadata", "doc-build", "doc-discovery", "doc-module-build"):
+        result, calls = invoke("test", mode=mode)
+        assert result.returncode != 0 and "text compiler fixture failure" in result.stdout + result.stderr, (mode, result)
+        assert all("--error-format" not in call for call in calls), calls
+print("Project diagnostics: all compile routes, module/documentation phases, legacy tests, exact JSON stderr/status and option validation passed")

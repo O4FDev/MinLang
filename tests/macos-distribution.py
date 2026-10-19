@@ -62,7 +62,7 @@ def main():
         run(command, "test", cwd=project)
         run(command, "run", "--release", cwd=project)
         if "--error-format" in (distribution / "minyar").read_text():
-            project_diagnostics(command, project, env)
+            project_diagnostics(command, project, env, documentation=(distribution / "tools/documentation.min").is_file())
         if (distribution / "tools/module-tests.min").is_file():
             module = project / "src/invariant.min"
             module.write_text('function answer(): Integer { return 42 }\nprint("application statement must stay excluded")\ntest "archive invariant" {\n    expect(answer() == 42)\n    print("archive module test passed")\n}\n')

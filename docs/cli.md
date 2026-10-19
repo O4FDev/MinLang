@@ -141,8 +141,9 @@ consumers compile reachable library modules into their own executables.
 
 `--error-format json` selects compiler diagnostics as JSON lines on standard
 error for `build`, `run`, `check`, `test` and `install`. This includes discovery
-and compilation of embedded module tests. Each compiler diagnostic is preserved
-with its original exit status. Use `--error-format text` for the human-readable
+and compilation of embedded module tests and documentation examples. Each
+compiler diagnostic is preserved with its original exit status. Use
+`--error-format text` for the human-readable
 renderer. Argument, manifest and runtime messages use their command's normal
 format.
 

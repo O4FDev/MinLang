@@ -6,6 +6,7 @@ use "./documentation-style.min" as style
 use "json" as json
 use "io" as io
 use "files" as files
+use "system" as system
 
 record Module { path: Text; name: Text; api: json.Value }
 
@@ -25,18 +26,24 @@ function label(graph: project.Graph, source: Text): Text {
     return host.stemOf(host.baseName(source))
 }
 
-function compilerArguments(graph: project.Graph, compiler: Text, library: Text): List<Text> {
+function compilerArguments(graph: project.Graph, compiler: Text, library: Text, errorFormat: Text): List<Text> {
     let command = moduleTests.compilerArguments(graph, compiler)
     if library != "" { command.add("--library"); command.add(library) }
+    if errorFormat != "" { command.add("--error-format"); command.add(errorFormat) }
     return command
 }
 
-function metadata(graph: project.Graph, compiler: Text, sources: List<Text>, library: Text): List<Module> {
+function compilerFailure(result: host.Captured, errorFormat: Text) {
+    if result.status != 0 && errorFormat == "json" { host.cleanup(); system.writeStandardError(result.errors); exit(result.status) }
+}
+
+function metadata(graph: project.Graph, compiler: Text, sources: List<Text>, library: Text, errorFormat: Text): List<Module> {
     let result: List<Module> = []
     for source in sources {
-        let command = compilerArguments(graph, compiler, library)
+        let command = compilerArguments(graph, compiler, library, errorFormat)
         for item in ["--doc-json", source] { command.add(item) }
         let run = host.capture(command, 120)
+        compilerFailure(run, errorFormat)
         if run.status != 0 { host.stop("cannot read documentation: " + source + "\n" + run.errors) }
         let api = json.parse(run.output)
         if api.kind != json.OBJECT || api.member("declarations").kind != json.ARRAY { host.stop("the compiler returned invalid documentation for " + source) }
@@ -66,31 +73,34 @@ function capturedIn(command: List<Text>, directory: Text, seconds: Integer): hos
     return host.capture(arguments, seconds)
 }
 
-function verifyExample(graph: project.Graph, compiler: Text, source: Text, example: markup.Example, directory: Text, serial: Integer, release: Boolean, library: Text): Text {
+function verifyExample(graph: project.Graph, compiler: Text, source: Text, example: markup.Example, directory: Text, serial: Integer, release: Boolean, library: Text, errorFormat: Text): Text {
     let work = directory + "/example-" + Text(serial)
     host.makeDirectories(work)
     let path = work + "/example.min"
     let program = "use " + host.jsonText(relativePath(work, source)) + " as api\n" + example.source + "\n"
     io.writeTextFile(path, program)
-    let command = compilerArguments(graph, compiler, library)
+    let command = compilerArguments(graph, compiler, library, errorFormat)
     if release { command.add("--release") } else { command.add("--debug") }
     for item in [path, "-o", work + "/example"] { command.add(item) }
     let built = host.capture(command, 600)
+    compilerFailure(built, errorFormat)
     if built.status != 0 { return "the example does not compile\n" + built.errors }
     let run = capturedIn([work + "/example"], work, 120)
     if run.status != 0 { return "the example exited with status " + Text(run.status) + "\n" + run.errors }
     if run.errors != "" { return "the example wrote unexpected diagnostics\n" + run.errors }
     if run.output != example.output { return "the example output did not match\n  expected " + host.jsonText(example.output) + "\n       got " + host.jsonText(run.output) }
-    let discover = compilerArguments(graph, compiler, library)
+    let discover = compilerArguments(graph, compiler, library, errorFormat)
     for item in ["--list-tests", path] { discover.add(item) }
     let listing = host.capture(discover, 120)
+    compilerFailure(listing, errorFormat)
     if listing.status != 0 { return "cannot discover the example's module tests\n" + listing.errors }
     if listing.output != "" {
-        command = compilerArguments(graph, compiler, library)
+        command = compilerArguments(graph, compiler, library, errorFormat)
         command.add("--test-mode")
         if release { command.add("--release") } else { command.add("--debug") }
         for item in [path, "-o", work + "/tests"] { command.add(item) }
         built = host.capture(command, 600)
+        compilerFailure(built, errorFormat)
         if built.status != 0 { return "the example's module tests do not compile\n" + built.errors }
         run = capturedIn([work + "/tests"], work, 120)
         if run.status != 0 || run.errors != "" { return "the example's module tests failed\n" + run.errors }
@@ -106,7 +116,7 @@ function examplesFor(declaration: json.Value, location: Text): List<markup.Examp
     return result
 }
 
-function verify(modules: List<Module>, graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, report: Boolean, library: Text): moduleTests.Report {
+function verify(modules: List<Module>, graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, report: Boolean, library: Text, errorFormat: Text): moduleTests.Report {
     let result = moduleTests.Report { count: 0; failures: 0 }
     for module in modules {
         for declaration in module.api.member("declarations").items {
@@ -117,7 +127,7 @@ function verify(modules: List<Module>, graph: project.Graph, compiler: Text, dir
                 let title = name + " · example " + Text(index + 1)
                 if filter != "" && !host.hasText(module.path, filter) && !host.hasText(title, filter) { continue }
                 result.count += 1
-                let failure = verifyExample(graph, compiler, module.path, examples[index], directory, result.count, release, library)
+                let failure = verifyExample(graph, compiler, module.path, examples[index], directory, result.count, release, library, errorFormat)
                 if failure != "" {
                     result.failures += 1
                     if report { print("  × " + title + " · " + location + "\n" + failure) }
@@ -205,9 +215,9 @@ function render(modules: List<Module>, graph: project.Graph, examples: Integer):
 
 function buildConfigured(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, sources: List<Text>, library: Text) {
     host.makeDirectories(directory)
-    let modules = metadata(graph, compiler, sources, library)
+    let modules = metadata(graph, compiler, sources, library, "")
     let work = host.temporaryDirectory(directory, ".documentation-")
-    let examples = verify(modules, graph, compiler, work, release, "", false, library)
+    let examples = verify(modules, graph, compiler, work, release, "", false, library, "")
     let html = render(modules, graph, examples.count)
     io.writeTextFile(work + "/index.html", html)
     let metadata: List<Text> = []
@@ -224,9 +234,13 @@ public function build(graph: project.Graph, compiler: Text, directory: Text, rel
 }
 
 public function testExamples(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text): moduleTests.Report {
-    let modules = metadata(graph, compiler, moduleTests.sources(graph), "")
+    return testExamplesWithFormat(graph, compiler, directory, release, filter, "")
+}
+
+public function testExamplesWithFormat(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, errorFormat: Text): moduleTests.Report {
+    let modules = metadata(graph, compiler, moduleTests.sources(graph), "", errorFormat)
     let work = host.temporaryDirectory(directory, ".doc-tests-")
-    let result = verify(modules, graph, compiler, work, release, filter, true, "")
+    let result = verify(modules, graph, compiler, work, release, filter, true, "", errorFormat)
     host.cleanup()
     return result
 }

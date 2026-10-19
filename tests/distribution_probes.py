@@ -34,7 +34,7 @@ def lsp_roundtrip(command, project, environment):
     assert replies[2]["result"] is None
 
 
-def project_diagnostics(command, project, environment):
+def project_diagnostics(command, project, environment, documentation=False):
     source = project / "src/main.min"
     original = source.read_bytes()
     fields = {"version", "severity", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"}
@@ -56,7 +56,8 @@ def project_diagnostics(command, project, environment):
 
     embedded = project / "src/diagnostic-invariant.min"
     legacy = project / "tests/diagnostic-failure.min"
-    assert not embedded.exists() and not legacy.exists()
+    documented = project / "src/diagnostic-doc.min"
+    assert not embedded.exists() and not legacy.exists() and not documented.exists()
     try:
         source.write_text('let count: Integer = "not an integer"\n')
         for profile in ([], ["--release"]):
@@ -72,7 +73,12 @@ def project_diagnostics(command, project, environment):
             legacy.write_text('let count: Integer = "not an integer"\n')
             reject("test", "tests/diagnostic-failure.min", "not an integer", profile)
             legacy.unlink()
+            if documentation:
+                documented.write_text('/// ```minyar\n/// let count: Integer = "not an integer"\n/// ```\npublic function sample(): Integer { return 42 }\n')
+                reject("test", "/example.min", "not an integer", profile)
+                documented.unlink()
     finally:
         source.write_bytes(original)
         embedded.unlink(missing_ok=True)
         legacy.unlink(missing_ok=True)
+        documented.unlink(missing_ok=True)
