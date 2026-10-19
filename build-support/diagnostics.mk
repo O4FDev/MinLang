@@ -5,3 +5,5 @@ check-bootstrap-native: build/stage0 build/minyar-compiler-runtime.ll build/tool
 check check-portable: check-bootstrap-native
 
 build/tooling/tests/diagnostics.ll: tests/frontend-fixtures.min
+
+check-diagnostics: build/minyar-module-build

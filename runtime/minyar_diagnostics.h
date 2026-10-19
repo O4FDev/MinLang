@@ -24,3 +24,9 @@ MinyarText *minyar_runtime_diagnosticSource(const MinyarText *path_text) {
     validate_text_bytes(bytes, length);
     return new_text(bytes, length, -1);
 }
+
+/* Compiler options live in this process only. Normal programs never query
+ * them; JSON selection adds no generated program instructions. */
+static _Bool minyar_diagnostic_json;
+void minyar_runtime_diagnosticSetJSON(_Bool enabled) { minyar_diagnostic_json = enabled; }
+_Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }

@@ -305,7 +305,7 @@ static void ensure_directory(const char *path) {
 enum { MAX_LIBRARIES = 8 };
 static int compiler_run(const char *compiler, const char *entry, const char *output, int input_fd,
                         const char *state, const char *stats, const char *error, const char *budget,
-                        char *const *libraries, size_t library_count) {
+                        char *const *libraries, size_t library_count, const char *error_format) {
     if (lseek(input_fd, 0, SEEK_SET) < 0)
         stop("cache seek");
     pid_t child = fork();
@@ -322,7 +322,7 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
             _exit(126);
         char path[64];
         snprintf(path, sizeof path, "/dev/fd/%d", input_fd);
-        char *args[10 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
+        char *args[12 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
                                               "--module-state", path,          (char *)state,
                                               (char *)stats};
         size_t argc = 7;
@@ -333,6 +333,10 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
         for (size_t i = 0; i < library_count; i++) {
             args[argc++] = "--library";
             args[argc++] = libraries[i];
+        }
+        if (error_format) {
+            args[argc++] = "--error-format";
+            args[argc++] = (char *)error_format;
         }
         args[argc] = NULL;
         execv(compiler, args);
@@ -493,7 +497,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--checksum-self-test"))
         return 0;
     int positional = argc;
-    const char *budget = NULL, *library_options[MAX_LIBRARIES];
+    const char *budget = NULL, *error_format = NULL, *library_options[MAX_LIBRARIES];
     size_t library_count = 0;
     unsigned owner_limit = 0;
     while (positional >= 7) {
@@ -507,13 +511,16 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(option, "--library") && library_count < MAX_LIBRARIES)
             library_options[library_count++] = value;
+        else if (!strcmp(option, "--error-format") && !error_format &&
+                 (!strcmp(value, "text") || !strcmp(value, "json")))
+            error_format = value;
         else
             break;
         positional -= 2;
     }
     if ((positional != 5 && positional != 6) || (positional == 6 && !strncmp(argv[5], "--", 2))) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET] [--library DIRECTORY]...\n",
+              "BUDGET] [--library DIRECTORY]... [--error-format text|json]\n",
               stderr);
         return 2;
     }
@@ -624,10 +631,10 @@ int main(int argc, char **argv) {
         input_fd = plan_fd;
     }
     int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
-                              libraries, library_count);
+                              libraries, library_count, error_format);
     if (result && cache_valid)
         result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
-                              libraries, library_count);
+                              libraries, library_count, error_format);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;

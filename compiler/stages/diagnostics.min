@@ -1,6 +1,8 @@
 // Formatting and source reads happen only when a diagnostic is reported.
 function diagnosticWrite(text: Text) { native "runtime" }
 function diagnosticSource(path: Text): Text { native "runtime" }
+function diagnosticSetJSON(enabled: Boolean) { native "runtime" }
+function diagnosticJSON(): Boolean { native "runtime" }
 
 function diagnosticRepeat(text: Text, count: Integer): Text {
     let pieces: List<Text> = []
@@ -91,7 +93,7 @@ function renderDiagnostic(span: SourceSpan, source: Text, message: Text, label: 
 }
 
 function failDiagnostic(span: SourceSpan, message: Text, label: Text, help: Text) {
-    diagnosticWrite(renderDiagnostic(span, diagnosticSource(span.file), message, label, help))
+    diagnosticWrite(formatDiagnostic(span, diagnosticSource(span.file), message, label, help))
     exit(1)
 }
 
@@ -114,6 +116,60 @@ function failAtSource(sources: SourceMap, source: Text, line: Integer, column: I
     if file == "" { file = sources.inputPath }
     if file == "" { file = "<source>" }
     let span = SourceSpan { file: file, line: line, column: column, firstToken: -1, afterToken: -1 }
-    diagnosticWrite(renderDiagnostic(span, source, message, "", ""))
+    diagnosticWrite(formatDiagnostic(span, source, message, "", ""))
     exit(1)
+}
+
+function diagnosticJsonText(value: Text): Text {
+    let pieces: List<Text> = ["\""]
+    let hex = "0123456789abcdef"
+    let index = 0
+    while index < value.length {
+        let character = value[index]
+        let code = Integer(character)
+        if character == '"' { pieces.add("\\\"") }
+        else if character == '\\' { pieces.add("\\\\") }
+        else if character == '\n' { pieces.add("\\n") }
+        else if character == '\r' { pieces.add("\\r") }
+        else if character == '\t' { pieces.add("\\t") }
+        else if code < 32 { pieces.add("\\u00" + Text(hex[code / 16]) + Text(hex[code % 16])) }
+        else { pieces.add(Text(character)) }
+        index = index + 1
+    }
+    pieces.add("\"")
+    return joinText(pieces)
+}
+
+function renderJSONDiagnostic(span: SourceSpan, source: Text, message: Text, label: Text, help: Text): Text {
+    let line = diagnosticLine(source, span.line)
+    let end = span.column + diagnosticTokenWidth(line, span.column)
+    if span.column > line.length { end = span.column }
+    let notes = "[]"
+    if help != "" { notes = "[" + diagnosticJsonText(help) + "]" }
+    return "{\"version\":1,\"severity\":\"error\",\"message\":" + diagnosticJsonText(message) + ",\"file\":" + diagnosticJsonText(span.file) + ",\"line\":" + Text(span.line) + ",\"column\":" + Text(span.column) + ",\"endLine\":" + Text(span.line) + ",\"endColumn\":" + Text(end) + ",\"sourceLine\":" + diagnosticJsonText(line) + ",\"label\":" + diagnosticJsonText(label) + ",\"help\":" + notes + "}\n"
+}
+
+function formatDiagnostic(span: SourceSpan, source: Text, message: Text, label: Text, help: Text): Text {
+    if diagnosticJSON() { return renderJSONDiagnostic(span, source, message, label, help) }
+    return renderDiagnostic(span, source, message, label, help)
+}
+
+// Old callers still carry their original location inside the message. Decode
+// that location here while callers move to explicit spans.
+function failCompiler(message: Text) {
+    let file = "<source>"
+    if processInfo.argumentCount() > 0 { file = processInfo.argument(0) }
+    let span = SourceSpan { file: file, line: 1, column: 1, firstToken: -1, afterToken: -1 }
+    let column = message.find(", column ")
+    if column >= 0 {
+        let end = column + 9
+        while end < message.length && characterIsDigit(message[end]) { end = end + 1 }
+        if end + 1 < message.length && message[end] == ':' && message[end + 1] == ' ' {
+            let start = 0
+            if message.length >= 5 && message.slice(0, 5) == "line " { start = 5 }
+            span = spanAtLocation(file, message.slice(start, end))
+            message = message.slice(end + 2, message.length)
+        }
+    }
+    failDiagnostic(span, message, "", "")
 }

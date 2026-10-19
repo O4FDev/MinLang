@@ -144,6 +144,24 @@ file keeps its location and message. Tabs display as four spaces, CRLF source
 lines lose their carriage return, and terminal control characters are escaped.
 Older checks are being moved to these helpers without changing their meaning.
 
+## JSON diagnostics
+
+`--error-format json` writes one JSON object per error to standard error,
+with no diagnostic output on success. Exit status remains 1 for rejected input.
+The standalone launcher and incremental module driver forward this option.
+
+Schema version 1 always includes `version` (1), `severity` ("error"),
+`message`, `file`, `line`, `column`, `endLine`, `endColumn`, `sourceLine`,
+`label`, and `help` (an array of strings). Positions are 1-based Unicode scalar
+columns, with an exclusive end. An empty range marks end of input. `sourceLine`
+is the original line without its line ending; `label` and `help` may be empty.
+JSON preserves source characters and escapes control characters. Tools using
+UTF-16 positions can convert columns from `sourceLine`.
+
+All compiler rejection paths use the central formatter. Legacy messages keep
+their original decoded locations. A caller that has not yet supplied a span
+uses the input file's first position; this is a migration fallback.
+
 ## Checks
 
 `make check-syntax-tree` verifies resolved types, precedence, sibling and

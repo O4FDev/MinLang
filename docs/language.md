@@ -1223,6 +1223,10 @@ Missing match arms name the cases that still need handling. The
 [lantern](../examples/gallery/weather-lantern.min) gallery combines the corrected names
 with choices, methods and interpolation.
 
+Tools can request `--error-format json` from the compiler or standalone
+launcher. It emits one versioned JSON object per error, with the same message,
+source, range, label and help. See the [diagnostic schema](compiler-syntax.md#json-diagnostics).
+
 `if` chains may continue with `else if`:
 
 ```minyar

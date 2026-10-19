@@ -2,6 +2,7 @@ use "../tools/testing.min" as test
 use "system" as system
 use "files" as files
 use "io" as io
+use "json" as json
 use "./frontend-fixtures.min" as fixtures
 let work = test.scratch()
 let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
@@ -14,6 +15,9 @@ test.check(!test.sameDiagnostic(sample, "Minyar stopped: line 2, column 9: unkno
 test.check(!test.sameDiagnostic(sample, "Minyar stopped: line 2, column 8: another value\n"), "projection must preserve exact messages")
 test.check(!test.sameDiagnostic(sample + "unexpected stderr\n", "Minyar stopped: line 2, column 8: unknown value\n"), "projection must reject extra stderr")
 test.check(!test.sameDiagnostic(sample + sample, "Minyar stopped: line 2, column 8: unknown value\n"), "projection must reject extra diagnostics")
+test.check(test.sameDiagnostic(sample, "Minyar stopped: unknown value\n"), "message-only legacy expectations retain their full message")
+test.check(!test.sameDiagnostic(sample, "Minyar stopped: another value\n"), "message-only projection rejects changed messages")
+test.check(!test.sameDiagnostic(sample + "unexpected stderr\n", "Minyar stopped: unknown value\n"), "message-only projection rejects extra stderr")
 let checked = 0
 for suite in 0..sources.length {
     let names = files.list(sources[suite])
@@ -36,11 +40,67 @@ for suite in 0..sources.length {
             test.check(result.output == "", source + ": unexpected compiler stdout")
             test.check(result.errorOutput == expected, source + ": diagnostic drift\nexpected\n" + expected + "actual\n" + result.errorOutput)
             test.check(files.pathSize(output) < 0, source + ": rejected input left LLVM")
+            let machine = test.run([compiler, source, output, "--error-format", "json", "--library", "library"], system.environment(), "", work + "/json", 10)
+            test.check(machine.status == 1 && machine.output == "", source + ": JSON rejection status/stdout")
+            test.check(test.lines(machine.errorOutput).length == 1, source + ": one JSON object per error")
+            let diagnostic = json.parse(machine.errorOutput)
+            test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 11, source + ": complete stable schema")
+            for key in ["version", "severity", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"] { test.check(json.member(diagnostic, key).kind != json.INVALID, source + ": missing JSON field " + key) }
+            let origin = rows[1].slice(7 + source.length, rows[1].length)
+            let separator = origin.find(":")
+            let line = Integer(origin.slice(0, separator))
+            let column = Integer(origin.slice(separator + 1, origin.length))
+            test.check(json.member(diagnostic, "version").number == 1.0 && json.member(diagnostic, "severity").text == "error", source + ": schema version and severity")
+            test.check(json.member(diagnostic, "message").text == rows[0].slice(7, rows[0].length), source + ": JSON/text message parity")
+            test.check(json.member(diagnostic, "file").text == source && json.member(diagnostic, "line").number == Float(line) && json.member(diagnostic, "column").number == Float(column), source + ": JSON/text exact origin parity")
+            test.check(json.member(diagnostic, "endLine").number == Float(line) && json.member(diagnostic, "endColumn").number >= Float(column), source + ": half-open JSON range")
+            let sourceLines = test.lines(io.readTextFile(source))
+            let sourceLine = ""
+            if line <= sourceLines.length { sourceLine = sourceLines[line - 1] }
+            test.check(json.member(diagnostic, "sourceLine").text == sourceLine, source + ": unmodified source line")
+            let after = rows[4].find("^")
+            while after < rows[4].length && rows[4][after] == '^' { after += 1 }
+            let label = ""
+            if after < rows[4].length { label = rows[4].slice(after + 1, rows[4].length) }
+            test.check(json.member(diagnostic, "label").text == label, source + ": JSON/text label parity")
+            let notes = json.member(diagnostic, "help")
+            let help = ""
+            if rows.length > 5 { let start = rows[5].find("= help: "); if start >= 0 { help = rows[5].slice(start + 8, rows[5].length) } }
+            test.check(notes.kind == json.ARRAY, source + ": help is an array")
+            if help == "" { test.check(notes.items.length == 0, source + ": empty help array") }
+            else { test.check(notes.items.length == 1 && notes.items[0].text == help, source + ": JSON/text help parity") }
+            test.check(files.pathSize(output) < 0, source + ": JSON rejection left LLVM")
             checked += 1
         }
     }
 }
 test.check(checked > 0, "diagnostic suites are empty")
+let special = work + "/é\"🙂.min"
+io.writeTextFile(special, "print(missing)\n")
+let escaped = test.run([compiler, special, work + "/escaped.ll", "--error-format", "json"], system.environment(), "", work + "/escaped", 10)
+let escapedValue = json.parse(escaped.errorOutput)
+test.check(escaped.status == 1 && escaped.output == "" && json.member(escapedValue, "file").text == special, "JSON filename escaping and Unicode")
+test.check(json.member(escapedValue, "column").number == 7.0 && json.member(escapedValue, "endColumn").number == 14.0, "JSON token range counts Unicode scalars with an exclusive end")
+let success = test.run([compiler, "examples/gallery/weather-lantern.min", work + "/success.ll", "--error-format", "json", "--library", "library"], system.environment(), "", work + "/success", 10)
+test.check(success.status == 0 && success.output == "" && success.errorOutput == "", "JSON success emits no diagnostics")
+let textMode = test.run([compiler, "tests/diagnostics/cases/suggest-type.min", work + "/text.ll", "--error-format", "text"], system.environment(), "", work + "/text", 10)
+test.check(textMode.status == 1 && textMode.errorOutput == io.readTextFile("tests/diagnostics/expected/cases/suggest-type.stderr"), "explicit text format retains exact diagnostics")
+let driver = test.setting("MINYAR_TEST_MODULE_DRIVER", "./build/minyar-module-build")
+let entry = work + "/entry.min"
+let module = work + "/harbour.min"
+io.writeTextFile(entry, "use \"./harbour.min\" as harbour\nprint(harbour.light())\n")
+io.writeTextFile(module, "public function light(): Integer { return 1 }\n")
+let cacheCommand = [driver, compiler, entry, work + "/module.ll", work + "/cache", "--error-format", "json", "--library", "library"]
+let seeded = test.run(cacheCommand, system.environment(), "", work + "/seed", 20)
+test.check(seeded.status == 0 && seeded.output == "" && seeded.errorOutput == "", "JSON incremental success and cache seed")
+let broken = "public function light(): Integer { return \"warm\" }\n"
+io.writeTextFile(module, broken)
+let invalidated = test.run(cacheCommand, system.environment(), "", work + "/invalidate", 20)
+let imported = json.parse(invalidated.errorOutput)
+test.check(invalidated.status == 1 && invalidated.output == "", "JSON incremental warm-cache rejection")
+test.check(json.member(imported, "file").text == module && json.member(imported, "line").number == 1.0 && json.member(imported, "column").number == Float(broken.find("\"") + 1), "JSON incremental original imported token")
+test.check(json.member(imported, "message").text == "a returned value has the wrong type; expected Integer, found Text", "JSON incremental same original message")
+test.check(test.lines(invalidated.errorOutput).length == 1, "cache retry emits one diagnostic")
 test.removeScratch(work)
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 fixtures.executes(frontend, io.readTextFile("examples/gallery/diagnostics.min"), "The harbour: a light to come home to.\nThe lighthouse: the stars have the night to themselves.\n", ["-O0", "-O2"], 0, "", true)
