@@ -76,7 +76,7 @@ for suite in 0..sources.length {
         }
     }
 }
-test.check(checked > 0, "diagnostic suites are empty")
+test.check(checked >= 100, "at least one hundred complete compiler error goldens are required")
 let recoveryCases = json.parse(io.readTextFile("tests/diagnostics/recovery.json"))
 for item in recoveryCases.items {
     let name = json.member(item, "name").text
@@ -98,6 +98,33 @@ for item in recoveryCases.items {
         test.check(json.member(diagnostic, "message").text == messages[index].text, "independent recovery messages without cascades " + name)
     }
     test.check(files.pathSize(output) < 0, "recovery never emits partial LLVM")
+}
+// These scalar ranges and terminal cell counts are independent of the
+// formatter and complete goldens, including joined and combining characters.
+for item in json.parse(io.readTextFile("tests/diagnostics/display.json")).items {
+    let name = json.member(item, "name").text
+    let source = "tests/diagnostics/cases/" + name + ".min"
+    let result = test.run([compiler, source, work + "/display.ll", "--error-format", "json"], system.environment(), "", work + "/display", 10)
+    let diagnostic = json.parse(result.errorOutput)
+    test.check(result.status == 1 && json.member(diagnostic, "line").number == json.member(item, "line").number && json.member(diagnostic, "column").number == json.member(item, "column").number && json.member(diagnostic, "endColumn").number == json.member(item, "endColumn").number, "independent Unicode/token scalar range " + name)
+    let rows = test.lines(io.readTextFile("tests/diagnostics/expected/cases/" + name + ".stderr"))
+    test.check(Float(rows[4].find("^")) == json.member(item, "terminalCellsBefore").number + 5.0, "independent terminal-cell underline " + name)
+}
+// Foreign-byte and filesystem failures still use the same stable schema.
+let invalidSource = work + "/invalid-utf8.min"
+let invalidBytes = Bytes("// é🙂\nprint(")
+invalidBytes.add(255)
+io.writeBytesFile(invalidSource, invalidBytes)
+for input in [invalidSource, work + "/missing.min", work] {
+    let result = test.run([compiler, input, work + "/io.ll", "--error-format", "json"], system.environment(), "", work + "/io-failure", 10)
+    let rows = test.lines(result.errorOutput)
+    test.check(result.status == 1 && result.output == "" && rows.length == 1, "one structured source-read failure")
+    let diagnostic = json.parse(rows[0])
+    test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 11 && json.member(diagnostic, "file").text == input, "source-read failure keeps original path and schema")
+    if input == invalidSource {
+        test.check(json.member(diagnostic, "message").text == "Text contained invalid UTF-8." && json.member(diagnostic, "line").number == 2.0 && json.member(diagnostic, "column").number == 7.0, "first invalid UTF-8 byte has a Unicode scalar source location")
+    }
+    test.check(files.pathSize(work + "/io.ll") < 0, "source-read failure emits no LLVM")
 }
 let special = work + "/é\"🙂.min"
 io.writeTextFile(special, "print(missing)\n")

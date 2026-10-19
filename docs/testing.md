@@ -796,7 +796,7 @@ rollback, natively and under ASan/UBSan.
 
 `make check-diagnostics` compares complete stderr bytes for every file in
 `tests/errors/`, `tests/fuzz-regressions/`, and `tests/diagnostics/cases/`.
-Adding a rejecting fixture without its golden file fails the suite. The lexer
+The suite requires at least one hundred single-error goldens. Adding a rejecting fixture without its golden file fails the suite. The lexer
 accepts a leading UTF-8 byte-order mark and gives an exact line and column for
 unsupported non-ASCII identifier characters.
 
@@ -988,3 +988,11 @@ After `npm ci --ignore-scripts` in `editors/vscode`, `make check-minyar-editor`
 checks the grammar through the real TextMate/Oniguruma engines and exercises
 client command arguments, serialized restarts and shutdown. It does not require
 VS Code or claim an Extension Development Host qualification.
+
+Diagnostic presentation also covers full decimal/raw/multiline tokens and
+terminal cells for CJK, combining marks, skin modifiers, joined emoji, flags
+and variation selectors. Independent scalar/cell oracles are retained in
+`tests/diagnostics/display.json`. Missing sources, directories and invalid
+UTF-8 must produce one complete JSON object, status 1 and no LLVM. The ten
+four-language gallery comparisons retain their foreign source and captured
+output without making foreign compilers test prerequisites.

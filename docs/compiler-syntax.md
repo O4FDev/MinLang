@@ -139,7 +139,7 @@ the original source line and a token underline. `failDiagnostic` also accepts
 an underline label and a help note. Cached declaration origins use the same
 span decoder. Lexical failures retain the current module's filename.
 
-Source reads and formatting happen only on failure. An unavailable source
+Diagnostic source rereads and formatting happen only on failure. An unavailable source
 file keeps its location and message. Tabs display as four spaces, CRLF source
 lines lose their carriage return, and terminal control characters are escaped.
 Older checks are being moved to these helpers without changing their meaning.
@@ -183,3 +183,10 @@ the error API and 50,000 nested builder nodes. It also checks contextual names
 on `try` expressions. The observatory gallery and
 expression fixtures run at O0/O2 with ownership assertions. The ordinary
 conformance and example corpora separately check emitted LLVM bytes.
+
+Compiler input reading also uses the diagnostic boundary: missing files,
+directories and invalid UTF-8 become structured errors instead of raw runtime
+stops. The first invalid byte is displayed as a replacement character, with
+a best-effort source prefix. Display-cell ranges follow Unicode 14.0 assigned
+wide/full-width and combining categories, plus common emoji sequences. JSON
+positions remain scalar offsets and preserve the original valid source line.

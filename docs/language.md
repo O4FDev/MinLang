@@ -1201,7 +1201,7 @@ still become visible where they are declared.
 The compiler retains resolved types and source spans for checked declarations,
 statements and expressions. See the [compiler syntax tree](compiler-syntax.md).
 
-Compiler diagnostics identify the source file, line and column. Common syntax,
+Compiler diagnostics identify the source file, line and column. Source-read failures, including invalid UTF-8, use the same text or JSON format. Common syntax,
 type and field errors also show the source line and underline the relevant
 token. Columns count Unicode scalar values, starting at one. Type mismatches
 show the expected and actual types where those are known:
@@ -1358,6 +1358,11 @@ alias and do not reserve every module's function namespace.
 Generated from the compiler by `tools/reserved-names.min`;
 `make check-reserved-names` verifies this list.
 <!-- reserved-names: end -->
+
+The [error gallery](../examples/gallery/errors.md) places ten real Minyar
+errors beside the same mistakes in Rust, Swift and TypeScript. Underlines
+account for wide characters, combining marks and common joined emoji; source
+coordinates remain Unicode scalars. Terminal fonts may choose different widths.
 
 ## Formatting source
 
