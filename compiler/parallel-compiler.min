@@ -86,30 +86,25 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     let index = context.tokenTexts[start + 2]
     let captures: List<Text> = []
     let types: List<Integer> = []
+    let ids: List<Integer> = []
+    let firstLocal = state[4]
     let local = 0
     while local < state[3] {
         // Only the visible binding matters when an enclosing scope shadows it.
         if findLocal(localNames, localLengths, state, localNames[local]) == local {
             captures.add(localNames[local])
             types.add(localTypes[local])
+            ids.add(localIds[local])
         }
         local = local + 1
     }
-    let cursor = start + 4
-    while context.tokenKinds[cursor] != 0 && context.tokenTexts[cursor] != "{" { cursor = cursor + 1 }
-    let body = cursor
-    let range = false
-    cursor = start + 4
-    while cursor < body {
-        if context.tokenTexts[cursor] == ".." { range = true }
-        cursor = cursor + 1
-    }
-    if !range { parallelRace(context, start, "use an Integer range such as 0..count") }
     let firstNode = context.syntax.nodes.length
-    let firstCall = context.callTargets.length
-    let firstOutput = output.length
+    let parts: List<Integer> = [0, 0, 0, 0, 0, 0]
+    let blocks: List<Text> = []
     state[0] = start + 1
-    compileFor(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+    compileForParts(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, parts, blocks)
+    if parts[3] >= 0 { parallelRace(context, start, "use an Integer range such as 0..count") }
+    let body = parts[5]
     checkParallelBody(context, firstNode, body, index, captures, types)
     // Bounds execute on the owner thread. Only body calls need the effect proof.
     let node = firstNode
@@ -119,7 +114,7 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
         }
         node = node + 1
     }
-    let call = firstCall
+    let call = parts[4]
     while call < context.callTargets.length {
         let target = context.callTargets[call]
         if target < 0 { parallelRace(context, start, "indirect calls and runtime globals cannot be shared between iterations") }
@@ -128,9 +123,14 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
         call = call + 1
     }
     let pieces: List<Text> = []
-    let piece = firstOutput
+    let piece = parts[0]
     while piece < output.length { pieces.add(output[piece]); piece = piece + 1 }
     checkParallelRuntime(context, joinText(pieces), start)
+    // Recovery continuations belong to the owner's execution domain. Their
+    // checked loops retain the sequential backend for now.
+    if !recoveryEnabled(state) {
+        outlineParallelFor(context, captures, types, ids, firstLocal, start, body, parts, blocks[0], state, textState, output, globals)
+    }
 }
 
 function parallelLoopRuntime(callee: Text): Boolean {

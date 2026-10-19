@@ -17,14 +17,34 @@ function compileCase(compiler: test.Compiler, source: Text): test.Result {
     return test.run(command, system.environment(), "", path + ".compile", 30)
 }
 
+function checkWorkerIsolation(llvm: Text) {
+    let worker = false
+    let entry = false
+    let count = 0
+    for line in test.lines(llvm) {
+        if test.contains(line, "define internal ") && test.contains(line, "@.minyar.parallel.") { worker = true; count += 1 }
+        if line == "entry:" { entry = true }
+        else { if line.endsWith(":") { entry = false } }
+        if worker {
+            test.check(!test.contains(line, "@minyar_rc_") && !test.contains(line, "@minyar_stack_"), "a scalar worker touched owner-thread machinery")
+        }
+        if test.contains(line, "%parallel.environment.") && test.contains(line, " = alloca ") {
+            test.check(entry, "a repeated dispatch would grow the native stack")
+        }
+        if line == "}" { worker = false; entry = false }
+    }
+    test.check(count > 0, "a hosted parallel test did not emit a worker")
+}
+
 function executes(compiler: test.Compiler, source: Text, expected: Text) {
     test.require(compileCase(compiler, source), "compile safe parallel loop")
     let path = compiler.directory + "/case" + Text(compiler.serial)
+    checkWorkerIsolation(io.readTextFile(path + ".ll"))
     if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
     for optimization in ["-O0", "-O2"] {
         let command = [compiler.clang, optimization, "-Wno-override-module"]
         for flag in compiler.flags { command.add(flag) }
-        for option in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(option) }
+        for option in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"] { command.add(option) }
         test.require(test.run(command, system.environment(), "", path + ".link", 120), "link safe parallel loop")
         let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
         test.require(result, "execute safe parallel loop")
@@ -37,6 +57,21 @@ function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
     test.check(result.status == 1 && test.contains(result.errorOutput, diagnostic), "parallel rejection\n" + result.errorOutput)
     test.check(!test.contains(result.errorOutput, "List position"), "internal compiler bounds fault")
     test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected parallel loop published LLVM")
+}
+
+function traps(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    test.require(compileCase(compiler, source), "compile checked parallel failure")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for option in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"] { command.add(option) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 120), "link checked parallel failure")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.check(result.status == 1 && test.contains(result.errorOutput, diagnostic), "parallel failure must terminate without deadlock\n" + result.errorOutput)
+        test.check(!test.contains(result.errorOutput, "Sanitizer") && !test.contains(result.errorOutput, "runtime error:"), "parallel failure must preserve checked memory access")
+    }
 }
 
 let compiler = test.compiler()
@@ -53,6 +88,10 @@ executes(compiler, io.readTextFile("tests/parallel-for/slots.min"), "0\n0.0\nfal
 executes(compiler, "let values = [0, 0, 0, 0]\nparallel for index in 0..4 { if index == 2 { continue }; let total = 0; for part in 0..index { total += part }; values[index] = total }\nfor value in values { print(value) }\n", "0\n0\n0\n3\n")
 executes(compiler, "use \"math\" as math\nlet letters = ['a', 'a', 'a']\nlet samples = [0.0, 0.0, 0.0]\nparallel for index in 0..3 { letters[index] = Character(65 + index); samples[index] = math.sqrt(Float(index * index)) }\nfor letter in letters { print(letter) }\nfor sample in samples { print(sample) }\n", "A\nB\nC\n0.0\n1.0\n2.0\n")
 executes(compiler, io.readTextFile("examples/gallery/parallel.min"), io.readTextFile("tests/parallel-for/gallery.out"))
+executes(compiler, io.readTextFile("tests/parallel-for/threaded.min"), "25365210\n10071\n19999\n")
+executes(compiler, "function bound(calls: List<Integer>, value: Integer): Integer { calls[0] += 1; return value }\nlet calls = [0]\nlet output = [0, 0, 0, 0]\nparallel for index in bound(calls, 1)..bound(calls, 4) { output[index] = index }\nprint(calls[0]); print(output[3])\n", "2\n3\n")
+traps(compiler, "let output = [0]\nparallel for index in 0..10003 { output[index] = index }\n", "List position")
+traps(compiler, "let output = Bytes(10003)\nparallel for index in 0..10003 { output[index] = 256 }\n", "does not fit")
 let setup = "let output = [0, 0, 0, 0]\nlet total = 0\n"
 for body in ["output[0] = index", "output[index + 1] = index", "total += index", "total = index", "index = 0", "index += 1"] {
     rejects(compiler, setup + "parallel for index in 0..4 { " + body + " }\n", "parallel for:")

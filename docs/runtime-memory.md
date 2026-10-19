@@ -94,6 +94,23 @@ messages, with a separate heap, caches and ownership frames in each process.
 It does not transfer managed pointers or implement shared managed threads.
 The scalar-only parallel ABI also excludes managed arguments and results.
 
+`parallel for` borrows scalar buffer storage for one synchronous job. The
+compiler proves that each iteration writes only its unchanged index, prohibits
+resizing and reference escape, and checks callees transitively for raw/native
+effects. Buffer headers stay fixed; worker code reads their lengths and accesses
+scalar slots without retaining, releasing, allocating or entering ownership
+frames. The owner thread evaluates bounds and snapshots scalar captures once,
+then keeps its existing owners alive until every worker acknowledges completion.
+Aliases are safe because permitted accesses use the same index.
+
+Hosted jobs use a persistent pthread pool with one queue per worker and chunk
+stealing. Storage is bounded by 64 workers plus each thread's native stack and
+the caller's capture words; the pool allocates no managed objects. Pool creation
+is lazy. A terminal worker failure exits the process directly after reporting
+the checked error, because unwinding through pool shutdown would wait on the
+failing job. Normal exits stop and join the pool. Windows and freestanding builds
+currently execute the same checked jobs sequentially.
+
 `eventcallbacks.dispatch(dispatcher, timeoutMs, maximum)` runs callbacks on
 that owner thread. Its private wait policy first services exactly the selected
 cleanup budget. Ordinary retirement debt requests an immediate readiness poll.

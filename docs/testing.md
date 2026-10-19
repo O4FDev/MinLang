@@ -230,6 +230,14 @@ O0/O2 with exact output and ownership cleanup assertions. Race rejections cover
 shared scalars, changed indices, overlapping slots, managed values, escaping
 aliases and transitively unsafe machine calls. `check-parallel-for-sanitize`
 instruments both generated LLVM and the ownership runtime with ASan/UBSan.
+The hosted cases cover readonly parameter captures of every scalar kind, actual
+multi-chunk jobs, aliases, repeated dispatch, bounds evaluated once, and terminal
+worker failures without deadlock. `check-parallel-pool` independently checks
+exactly-once scheduling, concurrent callers, joins and signed range endpoints;
+`check-parallel-pool-tsan` runs that oracle under ThreadSanitizer. The scaling
+workload is `benchmarks/parallel.min`; run its optimized executable through
+`/usr/bin/time -l` with `MINYAR_PARALLEL_THREADS=1`, then 2, 4, 8 and 10, retaining
+each checksum and complete timing output. Timing is separate from correctness.
 
 ## Memory contracts
 

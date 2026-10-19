@@ -220,8 +220,17 @@ enum { LARGE_LIST_CAPACITY = 2048 };
 enum { LARGE_LIST_CAPACITY = 4096 };
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+static _Thread_local int minyar_parallel_active;
+#endif
+
 static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message) {
     fprintf(stderr, "Minyar stopped: %s\n", message);
+#if defined(__APPLE__) || defined(__linux__)
+    /* A terminal failure cannot wait for the job whose caller is awaiting
+     * this worker. Fatal paths do not promise ownership unwinding. */
+    if (minyar_parallel_active) _Exit(1);
+#endif
     exit(1);
 }
 
@@ -1120,6 +1129,7 @@ void minyar_initialize_arguments(int count, char **values) {
 #include "minyar_numbers.h"
 
 #include "minyar_bytes.h"
+#include "minyar_parallel.h"
 #include "minyar_c_layout.h"
 
 #if MINYAR_THREADED

@@ -1008,9 +1008,15 @@ iteration. Calls must be to pure `parallel function`s, including their callees;
 raw machine operations and native effects are rejected. `continue` skips one
 iteration; `break` is allowed only inside a nested ordinary loop.
 
-The first implementation executes these checked ranges sequentially. The
-contract allows a later backend to distribute iterations without changing the
-program's meaning. Parallel builds currently check the whole module graph,
+On macOS and Linux, a persistent thread pool distributes fixed chunks of 128
+indices. Idle workers steal chunks from other workers; the calling thread also
+works, and returns only after every worker has finished. Set
+`MINYAR_PARALLEL_THREADS` to 1–64 to choose the total number of participating
+threads; the default is the online processor count, capped at 64. Other targets
+and recoverable execution currently use the sequential backend. Each loop can
+capture at most 64 values. Scalar captures are snapshots; the caller keeps buffer
+owners alive, and worker code performs no ownership operations.
+Parallel builds currently check the whole module graph,
 including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
 draws a tide of small lights into separate byte slots.
 

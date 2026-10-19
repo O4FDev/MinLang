@@ -1,0 +1,125 @@
+function parallelCaptureUsed(context: CompilerContext, first: Integer, after: Integer, name: Text): Boolean {
+    let token = first
+    while token < after {
+        if context.tokenKinds[token] == 1 && context.tokenTexts[token] == name && context.tokenTexts[token - 1] != "." && context.tokenTexts[token + 1] != ":" { return true }
+        token = token + 1
+    }
+    return false
+}
+
+function parallelCaptureCast(output: List<Text>, value: Text, raw: Text, type: Integer) {
+    let cast = "add i64 " + raw + ", 0"
+    if type == 7 { cast = "bitcast i64 " + raw + " to double" }
+    if type == 4 { cast = "trunc i64 " + raw + " to i1" }
+    if type == 3 { cast = "trunc i64 " + raw + " to i32" }
+    if isReferenceType(type) { cast = "inttoptr i64 " + raw + " to ptr" }
+    output.add("  " + value + " = " + cast + "\n")
+}
+
+function parallelWorkerBody(text: Text): Text {
+    let result: List<Text> = []
+    let first = 0
+    let cursor = 0
+    while cursor < text.length {
+        if text[cursor] == '\n' {
+            let line = text.slice(first, cursor + 1)
+            // The type/effect proof rules out owned producers and reference
+            // locals. Remaining ownership calls only protect caller borrows;
+            // the synchronous dispatch already keeps their owners alive.
+            if recoveryTextPosition(line, "@minyar_rc_") < 0 { result.add(line) }
+            first = cursor + 1
+        }
+        cursor = cursor + 1
+    }
+    result.add(text.slice(first, text.length))
+    return joinText(result)
+}
+
+function outlineParallelFor(context: CompilerContext, captures: List<Text>, types: List<Integer>, ids: List<Integer>, firstLocal: Integer, start: Integer, body: Integer, parts: List<Integer>, parentBlock: Text, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+    let used: List<Integer> = []
+    let index = context.tokenTexts[start + 2]
+    let capture = 0
+    while capture < captures.length {
+        if captures[capture] != index && parallelCaptureUsed(context, body, state[0], captures[capture]) {
+            if !parallelScalar(types[capture]) && !parallelBuffer(types[capture]) { parallelRace(context, body, "only scalars and scalar buffers can be captured") }
+            used.add(capture)
+        }
+        capture = capture + 1
+    }
+    if used.length > 64 { parallelRace(context, start, "this loop captures more than 64 values; split the work into smaller loops") }
+    let workerName = "@.minyar.parallel." + Text(start)
+    let worker: List<Text> = []
+    worker.add("define internal void " + workerName + "(i64 %parallel.first, i64 %parallel.after, ptr %parallel.environment) {\nentry:\n")
+    let local = firstLocal
+    while local < state[4] {
+        worker.add("  %local." + Text(local) + " = alloca i64\n")
+        local = local + 1
+    }
+    let position = 0
+    while position < used.length {
+        capture = used[position]
+        let id = ids[capture]
+        let type = types[capture]
+        let number = Text(position)
+        if id >= 0 { worker.add("  %local." + Text(id) + " = alloca i64\n") }
+        worker.add("  %parallel.slot." + number + " = getelementptr i64, ptr %parallel.environment, i64 " + number + "\n")
+        let raw = "%parallel.raw." + number
+        worker.add("  " + raw + " = load i64, ptr %parallel.slot." + number + "\n")
+        let value = "%parallel.capture." + number
+        if id < 0 { value = output[-id - 1] }
+        if value.length > 0 && value[0] == '%' {
+            parallelCaptureCast(worker, value, raw, type)
+            if id >= 0 { storeLocal(worker, id, type, value) }
+        }
+        position = position + 1
+    }
+    storeLocal(worker, parts[1], 1, "%parallel.first")
+    storeLocal(worker, parts[2], 1, "%parallel.after")
+    let loop: List<Text> = []
+    let piece = parts[0]
+    while piece < output.length {
+        loop.add(output[piece])
+        output[piece] = ""
+        piece = piece + 1
+    }
+    worker.add(parallelWorkerBody(joinText(loop)))
+    worker.add("  ret void\n}\n\n")
+    globals.add(joinText(worker))
+    let declaration = "declare void @minyar_parallel_run(ptr, i64, i64, ptr)\n"
+    if findText(globals, declaration) < 0 { globals.add(declaration) }
+    let marker = "; minyar-data-parallel-runtime: 1\n"
+    if findText(globals, marker) < 0 { globals.add(marker) }
+    textState[0] = parentBlock
+    let environment = "null"
+    if used.length > 0 {
+        environment = "%parallel.environment." + Text(newLabel(state))
+        // finishFunctionEntry moves this to the entry block, so an enclosing
+        // serial loop cannot grow the native stack on each dispatch.
+        output.add("  " + environment + " = alloca [" + Text(used.length) + " x i64], align 8\n")
+        position = 0
+        while position < used.length {
+            capture = used[position]
+            let value = loadLocal(output, textState, state, ids[capture], types[capture])
+            let raw = valueAsListSlot(output, textState, state, value, types[capture])
+            let slot = emitInstruction(output, textState, state, "getelementptr i64, ptr " + environment + ", i64 " + Text(position))
+            output.add("  store i64 " + raw + ", ptr " + slot + "\n")
+            position = position + 1
+        }
+    }
+    let first = loadLocal(output, textState, state, parts[1], 1)
+    let after = loadLocal(output, textState, state, parts[2], 1)
+    output.add("  call void @minyar_parallel_run(ptr " + workerName + ", i64 " + first + ", i64 " + after + ", ptr " + environment + ")\n")
+}
+
+function hoistParallelStorage(output: List<Text>, slot: Integer, entry: List<Text>) {
+    let prefix = "  %parallel.environment."
+    let piece = slot + 1
+    while piece < output.length {
+        let text = output[piece]
+        if text.length > prefix.length && text.slice(0, prefix.length) == prefix && recoveryTextPosition(text, " = alloca [") >= 0 {
+            entry.add(text)
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
