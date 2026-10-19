@@ -1,0 +1,216 @@
+// Result/Maybe methods specialize ordinary Minyar functions. The normal
+// expression and ownership checkers still evaluate and protect every argument.
+function hasResultMethodCalls(kinds: List<Integer>, texts: List<Text>): Boolean {
+    let position = 0
+    while position + 2 < kinds.length {
+        if texts[position] == "." && kinds[position + 1] == 1 && texts[position + 2] == "(" {
+            let name = texts[position + 1]
+            if name == "map" || name == "mapError" || name == "andThen" || name == "orElse" || name == "unwrapOr" || name == "unwrapOrElse" || name == "isOk" || name == "isErr" || name == "isSome" || name == "isNone" || name == "unwrap" || name == "expect" || name == "filter" || name == "okOr" || name == "okOrElse" { return true }
+        }
+        position = position + 1
+    }
+    return false
+}
+
+function genericInferredReturn(program: GenericProgram, expected: Integer, actual: Integer, depth: Integer): Integer {
+    if expected == 0 { return actual }
+    if actual == 0 || depth >= 64 { return expected }
+    let wanted = program.types[expected]
+    let received = program.types[actual]
+    if wanted.name != received.name || wanted.arguments.length != received.arguments.length {
+        if !genericConcreteType(program, expected) { return actual }
+        return expected
+    }
+    let arguments: List<Integer> = []
+    let position = 0
+    while position < wanted.arguments.length {
+        arguments.add(genericInferredReturn(program, wanted.arguments[position], received.arguments[position], depth + 1))
+        position = position + 1
+    }
+    return genericType(program, wanted.name, arguments)
+}
+
+function resultMethodCases(maybe: Boolean, unit: Boolean, success: Text, failure: Text): Text {
+    let pattern = "Ok(value)"
+    let failed = "Err(error)"
+    if maybe { pattern = "Some(value)"; failed = "None" }
+    if unit { pattern = "Ok()" }
+    return " { match source { " + pattern + " { " + success + " } " + failed + " { " + failure + " } } }\n"
+}
+
+// Resolved module names are identifier tokens, even when their internal names
+// contain quotes. Preserve them structurally rather than lexing type spellings.
+function appendResultMethodType(program: GenericProgram, stream: GenericStream, position: Integer, type: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, depth: Integer) {
+    if depth >= 64 { genericError(stream, position, "Result/Maybe method type nesting exceeds 64") }
+    let shape = program.types[type]
+    let declaration = genericDeclaration(program, shape.name, 2)
+    let name = shape.name
+    let arguments = shape.arguments
+    if declaration >= 0 && program.declarations[declaration].variables.length > 0 {
+        name = genericInstantiate(program, stream, position, declaration, arguments)
+        let empty: List<Integer> = []
+        arguments = empty
+    }
+    let origin = sourcePath(lines, tokenPath(stream.lines, position))
+    copyModuleToken(kinds, texts, lines, 1, name, stream.lines, position, origin)
+    if name == "Result" && lines.features / 2 % 2 == 0 { lines.features = lines.features + 2 }
+    if name == "Callback" && lines.features / 1 % 2 == 0 { lines.features = lines.features + 1 }
+    if arguments.length > 0 {
+        copyModuleToken(kinds, texts, lines, 4, "<", stream.lines, position, origin)
+        let index = 0
+        while index < arguments.length {
+            if index > 0 { copyModuleToken(kinds, texts, lines, 4, ",", stream.lines, position, origin) }
+            appendResultMethodType(program, stream, position, arguments[index], kinds, texts, lines, depth + 1)
+            index = index + 1
+        }
+        copyModuleToken(kinds, texts, lines, 4, ">", stream.lines, position, origin)
+    }
+}
+
+function genericResultMethod(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, receiver: Integer, start: Integer, expected: Integer, depth: Integer): Integer {
+    if receiver == 0 || !tokenIs(stream.kinds, stream.texts, cursor, ".") { return -1 }
+    let shape = program.types[receiver]
+    let maybe = shape.name == "Maybe" && shape.arguments.length == 1
+    if !maybe && !(shape.name == "Result" && shape.arguments.length == 2) { return -1 }
+    if !genericConcreteType(program, receiver) { genericError(stream, cursor[0], "Result/Maybe methods need a complete receiver type; add an annotation or explicit constructor types") }
+    if maybe {
+        let declaration = genericDeclaration(program, shape.name, 2)
+        if declaration < 0 || tokenPath(program.source.lines, program.declarations[declaration].start) != "library/maybe.min" { return -1 }
+    }
+    let dot = cursor[0]
+    let member = stream.texts[dot + 1]
+    if stream.texts[dot + 2] != "(" { return -1 }
+    let predicate = member == "isOk" || member == "isErr"
+    if maybe { predicate = member == "isSome" || member == "isNone" }
+    let supported = predicate || member == "map" || member == "andThen" || member == "orElse" || member == "unwrapOr" || member == "unwrapOrElse" || member == "unwrap" || member == "expect"
+    if maybe { supported = supported || member == "filter" || member == "okOr" || member == "okOrElse" } else { supported = supported || member == "mapError" }
+    if !supported { return -1 }
+    let value = shape.arguments[0]
+    let failure = 0
+    if !maybe { failure = shape.arguments[1] }
+    let unit = program.types[value].name == "Nothing"
+    if unit && member == "unwrapOr" { genericError(stream, dot + 1, "unwrapOr needs a success value; use unwrapOrElse for Result<Nothing, E>") }
+    let mapped = 0
+    if expected > 0 {
+        let wanted = program.types[expected]
+        if wanted.name == shape.name && wanted.arguments.length == shape.arguments.length {
+            mapped = wanted.arguments[0]
+            if member == "mapError" || member == "orElse" { if !maybe { mapped = wanted.arguments[1] } }
+        }
+        if (member == "okOr" || member == "okOrElse") && wanted.name == "Result" && wanted.arguments.length == 2 { mapped = wanted.arguments[1] }
+    }
+    let argumentType = 0
+    let parameter = ""
+    let success = "return value"
+    if unit { success = "return" }
+    let error = "fail(\"cannot unwrap Err\")"
+    if maybe { error = "fail(\"cannot unwrap None\")" }
+    let result = value
+    cursor[0] = dot + 3
+    let noArgument = predicate || member == "unwrap"
+    if !noArgument {
+        let wanted = 0
+        if member == "unwrapOr" { wanted = value }
+        if member == "expect" { wanted = genericNamedType(program, "Text") }
+        if member == "okOr" { wanted = mapped }
+        let callback = member != "unwrapOr" && member != "expect" && member != "okOr"
+        if callback {
+            let parameters: List<Integer> = []
+            let returns = mapped
+            if member == "map" || member == "andThen" || member == "filter" { if !unit { parameters.add(value) } } else {
+                if !maybe { parameters.add(failure) }
+            }
+            if member == "andThen" { returns = genericType(program, shape.name, [mapped]); if !maybe { returns = genericType(program, "Result", [mapped, failure]) } }
+            if member == "orElse" { returns = receiver; if !maybe { returns = genericType(program, "Result", [value, mapped]) } }
+            if member == "filter" { returns = genericNamedType(program, "Boolean") }
+            if member == "unwrapOrElse" { returns = value }
+            parameters.add(returns)
+            wanted = genericType(program, "Callback", parameters)
+        }
+        argumentType = genericExpression(program, stream, cursor, scope, wanted, 0, depth + 1)
+        if callback {
+            if argumentType == 0 || program.types[argumentType].name != "Callback" { genericError(stream, dot + 1, member + " needs a callable argument") }
+            let signature = program.types[argumentType].arguments
+            mapped = signature[signature.length - 1]
+            if !genericConcreteType(program, argumentType) { genericError(stream, dot + 1, "cannot infer the callback type for " + member + "; annotate its return type") }
+        } else {
+            if member == "okOr" { mapped = argumentType }
+        }
+        parameter = ", argument: ResultMethodArgument"
+    }
+    expectToken(stream.kinds, stream.texts, stream.lines, cursor, ")")
+    let ok = "Ok(value)"
+    let err = "Err(error)"
+    let call = "argument(value)"
+    if unit { ok = "Ok()"; call = "argument()" }
+    if maybe { ok = "Some(value)"; err = "None" }
+    if predicate {
+        result = genericNamedType(program, "Boolean")
+        success = "return true"; error = "return false"
+        if member == "isErr" || member == "isNone" { success = "return false"; error = "return true" }
+    }
+    if member == "unwrapOr" { error = "return argument" }
+    if member == "expect" { error = "fail(argument)" }
+    if member == "unwrapOrElse" { error = "return argument(error)"; if maybe { error = "return argument()" }; if unit { error = "argument(error); return" } }
+    if member == "map" {
+        result = genericType(program, shape.name, [mapped])
+        if !maybe { result = genericType(program, "Result", [mapped, failure]) }
+        let constructor = "Ok"
+        if maybe { constructor = "Some" }
+        success = "return " + constructor + "(" + call + ")"
+        if program.types[mapped].name == "Nothing" {
+            if maybe { genericError(stream, dot + 1, "Maybe.map needs a callback that returns a value") }
+            success = call + "; return Ok()"
+        }
+        error = "return " + err
+    }
+    if member == "mapError" { result = genericType(program, "Result", [value, mapped]); success = "return " + ok; error = "return Err(argument(error))" }
+    if member == "andThen" || member == "orElse" {
+        if program.types[mapped].name != shape.name { genericError(stream, dot + 1, member + " needs a callback returning " + shape.name) }
+        result = mapped
+        if member == "andThen" { success = "return " + call; error = "return " + err } else {
+            success = "return " + ok; error = "return argument(error)"; if maybe { error = "return argument()" }
+        }
+    }
+    if member == "filter" { result = receiver; success = "if argument(value) { return source }; return None"; error = "return None" }
+    if member == "okOr" || member == "okOrElse" {
+        result = genericType(program, "Result", [value, mapped]); success = "return Ok(value)"; error = "return Err(argument)"
+        if member == "okOrElse" { error = "return Err(argument())" }
+    }
+    let key = member + ":" + Text(receiver) + ":" + Text(argumentType) + ":" + Text(result)
+    let helper = genericIndexGet(program.methodIndex, key)
+    if helper < 0 {
+        helper = program.methodStreams.length
+        genericIndexPut(program.methodIndex, key, helper)
+        let name = "minyar_core_method_" + Text(helper)
+        let source = "function " + name + "(source: ResultMethodReceiver" + parameter + "): ResultMethodReturn" + resultMethodCases(maybe, unit, success, error)
+        let rawKinds: List<Integer> = []
+        let rawTexts: List<Text> = []
+        let rawLines = newSourceMap()
+        tokenize(source, rawKinds, rawTexts, rawLines)
+        let kinds: List<Integer> = []
+        let texts: List<Text> = []
+        let lines = newSourceMap()
+        lines.inputPath = "<" + shape.name + "." + member + ">"
+        lines.features = stream.lines.features
+        let position = 0
+        while position < rawKinds.length {
+            let type = -1
+            if rawKinds[position] == 1 {
+                if rawTexts[position] == "ResultMethodReceiver" { type = receiver }
+                if rawTexts[position] == "ResultMethodArgument" { type = argumentType }
+                if rawTexts[position] == "ResultMethodReturn" { type = result }
+            }
+            if type >= 0 { appendResultMethodType(program, stream, dot, type, kinds, texts, lines, 0) } else {
+                copyModuleToken(kinds, texts, lines, rawKinds[position], rawTexts[position], rawLines, position, sourcePath(lines, lines.inputPath))
+            }
+            position = position + 1
+        }
+        program.methodStreams.add(newGenericStream(kinds, texts, lines))
+    }
+    stream.prefixes[start] = "minyar_core_method_" + Text(helper) + "(" + stream.prefixes[start]
+    stream.replacements[dot] = ","
+    if noArgument { stream.replacements[dot] = "" }
+    stream.ends[dot] = dot + 3
+    return result
+}

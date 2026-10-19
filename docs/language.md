@@ -872,6 +872,41 @@ adapts existing low-level networking status records while retaining EOF,
 would-block and truncated-prefix information. Concrete `errors` status
 records remain compatibility and native-ABI interfaces.
 
+Result and Maybe have methods for the small decisions around a match:
+
+```minyar
+let count: Result<Integer, Text> = Ok(21)
+print(count.map(function(value) { return Text(value * 2) }).unwrapOr("unknown"))
+let name: Maybe<Text> = None
+print(name.unwrapOr("traveller"))
+```
+
+`isOk()` and `isErr()` inspect a Result; `isSome()` and `isNone()` inspect a
+Maybe. `unwrapOr(fallback)` returns the successful value or the already
+evaluated fallback. `unwrapOrElse(callback)` computes a fallback only on
+failure, passing a Result's error; its Maybe callback takes no arguments.
+`map(callback)` changes a success value, `mapError(callback)` changes a
+Result error, and `andThen(callback)` chains an operation returning the same
+container. A chained Result preserves the error type. `orElse(callback)`
+recovers on failure; a Result passes its error and may change the error type,
+while a Maybe calls its no-argument callback. Success skips these recovery
+callbacks. `Maybe.filter(predicate)` keeps a value only when the predicate
+holds; `okOr(error)` and `okOrElse(callback)` turn absence into a Result error.
+
+Callbacks infer parameter and return types from the value and their bodies.
+They are evaluated once as ordinary arguments and called only for their
+matching case. Receiver and argument lifetimes follow ordinary function calls.
+The compiler specializes small Minyar match functions for these methods;
+there is no dynamic dispatch. Mapping allocates a new Result or Maybe, with
+the same representation described above. Inspecting or unwrapping does not
+allocate a new container. Captured callbacks may allocate their environment.
+
+`unwrap()` returns success and stops on failure; `expect(message)` uses the
+supplied failure message. Prefer a match or fallback for recoverable input.
+For `Result<Nothing, E>`, `map` and `andThen` take a no-argument success
+callback. Mapping to Nothing calls the callback and returns `Ok()`;
+`unwrapOrElse` takes an `(E) -> Nothing`. Maybe payloads must be values.
+
 ## Callbacks
 
 `(ArgumentTypes...) -> ReturnType` describes a callable value; `() -> T`

@@ -10,7 +10,7 @@ record GenericDeclaration {
 record GenericInstance { declaration: Integer; arguments: List<Integer>; name: Text }
 record GenericStream {
     kinds: List<Integer>; texts: List<Text>; lines: SourceMap
-    replacements: List<Text>; ends: List<Integer>
+    replacements: List<Text>; ends: List<Integer>; prefixes: List<Text>
 }
 record GenericConstraint { type: Integer; capability: Text; variable: Text; stream: GenericStream; position: Integer }
 record GenericProgram {
@@ -20,6 +20,7 @@ record GenericProgram {
     instances: List<GenericInstance>; instanceIndex: GenericIndex
     constraints: List<GenericConstraint>; constraintIndex: GenericIndex
     aliases: GenericIndex; aliasPositions: List<Integer>
+    methodStreams: List<GenericStream>; methodIndex: GenericIndex
 }
 record GenericScope { names: List<Text>; types: List<Integer>; active: Integer; result: Integer }
 
@@ -57,12 +58,13 @@ function genericIndexPut(index: GenericIndex, key: Text, value: Integer) {
 function newGenericStream(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): GenericStream {
     let replacements: List<Text> = []
     let ends: List<Integer> = []
+    let prefixes: List<Text> = []
     let position = 0
     let loopEnd4 = kinds.length
-    while position < loopEnd4 { replacements.add(""); ends.add(0)
+    while position < loopEnd4 { replacements.add(""); ends.add(0); prefixes.add("")
         position = position + 1
     }
-    return GenericStream { kinds: kinds; texts: texts; lines: lines; replacements: replacements; ends: ends }
+    return GenericStream { kinds: kinds; texts: texts; lines: lines; replacements: replacements; ends: ends; prefixes: prefixes }
 }
 
 function genericType(program: GenericProgram, name: Text, arguments: List<Integer>): Integer {
@@ -831,8 +833,10 @@ function genericResultConstructor(program: GenericProgram, stream: GenericStream
     return genericType(program, "Result", inferred)
 }
 
-function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, type: Integer, depth: Integer): Integer {
+function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, type: Integer, start: Integer, contextual: Integer, depth: Integer): Integer {
     while tokenIs(stream.kinds, stream.texts, cursor, ".") || tokenIs(stream.kinds, stream.texts, cursor, "[") || tokenIs(stream.kinds, stream.texts, cursor, "(") {
+        let resultMethod = genericResultMethod(program, stream, cursor, scope, type, start, contextual, depth)
+        if resultMethod >= 0 { type = resultMethod } else {
         let token = stream.texts[cursor[0]]
         cursor[0] = cursor[0] + 1
         if token == "." {
@@ -869,6 +873,7 @@ function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: 
             if callSignature.length > 0 { type = callSignature[callSignature.length - 1] }
         }
         }
+        }
     }
     return type
 }
@@ -885,7 +890,7 @@ function genericPrimary(program: GenericProgram, stream: GenericStream, cursor: 
         if kind == 3 { name = "Text" }
         if kind == 5 { name = "Character" }
         if kind == 7 { name = "Float" }
-        return genericPostfix(program, stream, cursor, scope, genericNamedType(program, name), depth)
+        return genericPostfix(program, stream, cursor, scope, genericNamedType(program, name), position, expected, depth)
     }
     if token == "Set" && (stream.texts[position + 1] == "<" || stream.texts[position + 1] == "(") {
         if stream.texts[position + 1] == "<" { type = genericReadAnnotation(program, stream, cursor) } else {
@@ -894,22 +899,22 @@ function genericPrimary(program: GenericProgram, stream: GenericStream, cursor: 
         }
         expectToken(stream.kinds, stream.texts, stream.lines, cursor, "(")
         expectToken(stream.kinds, stream.texts, stream.lines, cursor, ")")
-        return genericPostfix(program, stream, cursor, scope, type, depth)
+        return genericPostfix(program, stream, cursor, scope, type, position, expected, depth)
     }
     if kind == 1 && token == "match" {
         type = genericChoiceMatch(program, stream, cursor, scope, expected, depth + 1, true)
-        return genericPostfix(program, stream, cursor, scope, type, depth)
+        return genericPostfix(program, stream, cursor, scope, type, position, expected, depth)
     }
     let choiceType = genericChoiceConstructor(program, stream, cursor, scope, expected, depth + 1)
-    if choiceType >= 0 { return genericPostfix(program, stream, cursor, scope, choiceType, depth) }
+    if choiceType >= 0 { return genericPostfix(program, stream, cursor, scope, choiceType, position, expected, depth) }
 
     if token == "{" || (token == "Map" && (stream.texts[position + 1] == "<" || stream.texts[position + 1] == "(" || stream.texts[position + 1] == "{")) {
         type = genericMap(program, stream, cursor, scope, expected, depth + 1)
-        return genericPostfix(program, stream, cursor, scope, type, depth)
+        return genericPostfix(program, stream, cursor, scope, type, position, expected, depth)
     }
     if (token == "Ok" || token == "Err") && genericDeclaration(program, token, 1) < 0 && genericScopeType(program, scope, token) == 0 && (stream.texts[position + 1] == "(" || stream.texts[position + 1] == "<") {
         type = genericResultConstructor(program, stream, cursor, scope, expected, depth + 1)
-        return genericPostfix(program, stream, cursor, scope, type, depth)
+        return genericPostfix(program, stream, cursor, scope, type, position, expected, depth)
     }
     if token == "-" || token == "!" || token == "~" || token == "try" {
         cursor[0] = cursor[0] + 1
@@ -963,6 +968,7 @@ function genericPrimary(program: GenericProgram, stream: GenericStream, cursor: 
         if contextual.length > 0 { closure.result = contextual[contextual.length - 1] }
         if tokenIs(stream.kinds, stream.texts, cursor, ":") { cursor[0] = cursor[0] + 1; closure.result = genericReadAnnotation(program, stream, cursor) }
         genericBlock(program, stream, cursor, closure, depth + 1)
+        if closure.result == 0 { closure.result = genericNamedType(program, "Nothing") }
         arguments.add(closure.result)
         type = genericType(program, "Callback", arguments)
     } else {
@@ -984,7 +990,7 @@ function genericPrimary(program: GenericProgram, stream: GenericStream, cursor: 
     }
     }
     }
-    return genericPostfix(program, stream, cursor, scope, type, depth)
+    return genericPostfix(program, stream, cursor, scope, type, position, expected, depth)
 }
 
 function genericPrecedence(token: Text): Integer {
@@ -1106,7 +1112,10 @@ function genericStatement(program: GenericProgram, stream: GenericStream, cursor
     }
     if token == "return" {
         cursor[0] = cursor[0] + 1
-        if stream.kinds[cursor[0]] != 6 && !tokenIs(stream.kinds, stream.texts, cursor, "}") { genericExpression(program, stream, cursor, scope, scope.result, 0, depth + 1) }
+        if stream.kinds[cursor[0]] != 6 && !tokenIs(stream.kinds, stream.texts, cursor, "}") {
+            let actual = genericExpression(program, stream, cursor, scope, scope.result, 0, depth + 1)
+            scope.result = genericInferredReturn(program, scope.result, actual, 0)
+        }
         return
     }
     if token == "{" { genericBlock(program, stream, cursor, scope, depth + 1); return }
@@ -1174,6 +1183,7 @@ function genericAppendReplacement(outputKinds: List<Integer>, outputTexts: List<
 function genericAppendStream(stream: GenericStream, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap) {
     let position = 0
     while stream.kinds[position] != 0 {
+        if stream.prefixes[position] != "" { genericAppendReplacement(outputKinds, outputTexts, outputLines, stream.prefixes[position], stream, position) }
         if stream.ends[position] > position {
             if stream.replacements[position] != "" { genericAppendReplacement(outputKinds, outputTexts, outputLines, stream.replacements[position], stream, position) }
             position = stream.ends[position]
@@ -1231,7 +1241,8 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
     let declarations: List<GenericDeclaration> = []
     let types: List<GenericType> = []
     let instances: List<GenericInstance> = []
-    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); constraints: []; constraintIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: [] }
+    let methodStreams: List<GenericStream> = []
+    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); constraints: []; constraintIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: []; methodStreams: methodStreams; methodIndex: newGenericIndex() }
     genericNamedType(program, "?")
     let cursor: List<Integer> = [0, 0]
     skipTerminators(kinds, cursor)
@@ -1244,6 +1255,7 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
             skipDeclaration(kinds, texts, cursor)
             let declaration = genericCollectDeclaration(program, source, start, cursor[0])
             if resultPrefix(declaration.name, "minyar_generic_") || resultPrefix(readableDeclarationName(declaration.name), "minyar_generic_") { genericError(source, start + 1, "reserved generic compiler name") }
+            if resultPrefix(readableDeclarationName(declaration.name), "minyar_core_method_") { genericError(source, start + 1, "reserved Result/Maybe method compiler name") }
             if declaration.kind == 1 && isBuiltinName(readableDeclarationName(declaration.name)) { genericError(source, start + 1, "function '" + readableDeclarationName(declaration.name) + "' uses a reserved built-in name; rename this function") }
             if declaration.name == "main" && declaration.variables.length > 0 { genericError(source, start + 1, "main cannot have type parameters") }
             let key = Text(declaration.kind) + ":" + declaration.name
@@ -1311,6 +1323,11 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
             genericAppendReplacement(outputKinds, outputTexts, outputLines, declaration, bound.stream, bound.position)
             constraint = constraint + 1
         }
+    }
+    let method = 0
+    while method < methodStreams.length {
+        genericAppendStream(methodStreams[method], outputKinds, outputTexts, outputLines)
+        method = method + 1
     }
     addEndToken(outputKinds, outputTexts, outputLines, "end of generic program")
     return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }

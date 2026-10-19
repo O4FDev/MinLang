@@ -110,6 +110,12 @@ ownership cleanup assertions; rejection fixtures check the method protocol and
 context type. `check-result-context-sanitize` adds ASan/UBSan. Before support,
 the gallery was rejected with `unexpected 'else'; start the next statement on a new line`.
 
+`make check-result-methods` checks Result/Maybe predicates, type-changing maps,
+chaining, lazy recovery, no-value success, alias lifetimes during argument
+mutation, repeated reference payloads and method diagnostics. The optional-light
+gallery and positive programs run at O0/O2 with ownership assertions. Its
+sanitizer variant is `check-result-methods-sanitize`.
+
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition

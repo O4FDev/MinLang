@@ -1,0 +1,119 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "errors" as errors
+    function read(): Result<Text, errors.Error> { return Err(errors.make(6, 17, "dark")) }
+    print(read().unwrapOrElse(function(error) { return error.withContext("reading").describe() }))
+    let item: Maybe<errors.Error> = Some(errors.make(7, 9, "kept"))
+    print(item.map(function(error) { return error.nativeCode() }).unwrapOr(0))
+    """#, "reading\n  dark\n9\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    let yes: Result<Integer, Text> = Ok(42)
+    let no: Result<Integer, Text> = Err("dark")
+    print(yes.isOk()); print(yes.isErr()); print(no.isOk()); print(no.isErr())
+    print(yes.unwrapOr(7)); print(no.unwrapOr(7))
+    print(yes.unwrapOrElse(function(error) { print("wrong"); return 8 }))
+    print(no.unwrapOrElse(function(error) { print(error); return 8 }))
+    let unit: Result<Nothing, Text> = Ok()
+    print(unit.isOk()); print(unit.isErr()); unit.unwrap()
+    let failed: Result<Nothing, Text> = Err("empty")
+    failed.unwrapOrElse(function(error) { print(error) })
+    print(yes.unwrap()); print(yes.expect("expected a light"))
+    """#, "true\nfalse\nfalse\ntrue\n42\n7\n42\ndark\n8\ntrue\nfalse\nempty\n42\n42\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Counter { calls: Integer }
+    let counter = Counter { calls: 0 }
+    let yes: Result<Integer, Text> = Ok(40)
+    let no: Result<Integer, Text> = Err("dark")
+    let transformed = yes.map(function(value) { counter.calls += 1; return "light \(value + 2)" })
+    print(transformed.unwrapOr("none"))
+    print(no.map(function(value) { counter.calls += 100; return Text(value) }).unwrapOr("night"))
+    let failures = no.mapError(function(error) { counter.calls += 1; return error.length })
+    match failures { Ok(value) { print(value) } Err(error) { print(error) } }
+    print(yes.mapError(function(error) { counter.calls += 100; return error.length }).unwrapOr(0))
+    let chained = yes.andThen(function(value): Result<Text, Text> { counter.calls += 1; return Ok(Text(value + 2)) })
+    print(chained.unwrapOr("none"))
+    print(no.andThen(function(value): Result<Text, Text> { counter.calls += 100; return Ok(Text(value)) }).unwrapOr("night"))
+    let recovered = no.orElse(function(error): Result<Integer, Integer> { counter.calls += 1; return Ok(error.length) })
+    print(recovered.unwrapOr(0))
+    print(yes.orElse(function(error): Result<Integer, Integer> { counter.calls += 100; return Err(error.length) }).unwrapOr(0))
+    print(counter.calls)
+    let unit: Result<Nothing, Text> = Ok()
+    print(unit.map(function() { return "saved" }).unwrapOr("none"))
+    yes.map(function(value) { print(value) }).unwrap()
+    let values: List<Result<Text, Text>> = [transformed, chained]
+    print(values[0].map(function(value) { return Bytes(value) }).unwrapOr(Bytes()).length)
+    """#, "light 42\nnight\n4\n40\n42\nnight\n4\n40\n4\nsaved\n40\n8\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Box { result: Result<Text, Text> }
+    let box = Box { result: Ok("kept") }
+    function change(box: Box): (Text) -> Text {
+        box.result = Err("replaced")
+        return function(value) { return value + "!" }
+    }
+    print(box.result.map(change(box)).unwrapOr("lost"))
+    print(box.result.isErr())
+    for index in 0..1000 {
+        let source: Result<Bytes, Text> = Ok(Bytes("a"))
+        let mapped = source.map(function(bytes) { return [bytes, bytes] })
+        if mapped.unwrapOr([])[1].length != 1 { fail("lost a mapped reference") }
+        if source.unwrapOr(Bytes()).length != 1 { fail("changed the source") }
+    }
+    """#, "kept!\ntrue\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    let some: Maybe<Text> = Some("light")
+    let none: Maybe<Text> = None
+    print(some.isSome()); print(some.isNone()); print(none.isSome()); print(none.isNone())
+    print(some.unwrapOr("night")); print(none.unwrapOr("night"))
+    print(some.map(function(value) { return value.length }).unwrapOr(0))
+    print(none.map(function(value) { print("wrong"); return value.length }).unwrapOr(0))
+    print(some.filter(function(value) { return value.length > 3 }).isSome())
+    print(some.filter(function(value) { return value.length > 9 }).isNone())
+    print(none.orElse(function(): Maybe<Text> { return Some("stars") }).unwrap())
+    print(some.orElse(function(): Maybe<Text> { print("wrong"); return None }).unwrap())
+    print(none.unwrapOrElse(function() { return "moon" }))
+    print(some.andThen(function(value): Maybe<Integer> { return Some(value.length) }).unwrapOr(0))
+    print(none.andThen(function(value): Maybe<Integer> { print("wrong"); return None }).isNone())
+    print(some.okOr("missing").unwrapOr("night"))
+    print(none.okOrElse(function() { return "missing" }).mapError(function(error) { print(error); return 6 }).isErr())
+    """#, "true\nfalse\nfalse\ntrue\nlight\nnight\n5\n0\ntrue\ntrue\nstars\nlight\nmoon\n5\ntrue\nlight\nmissing\ntrue\n", levels, 0, "", true)
+
+fixtures.rejects(frontend, #"""
+    let value: Result<Integer, Text> = Ok(1)
+    value.map(42)
+    """#, "map needs a callable argument", true)
+fixtures.rejects(frontend, #"""
+    let value: Maybe<Integer> = Some(1)
+    value.map(function(number) { print(number) })
+    """#, "Maybe.map needs a callback that returns a value", true)
+fixtures.rejects(frontend, #"""
+    let value: Result<Nothing, Text> = Ok()
+    value.unwrapOr(1)
+    """#, "unwrapOr needs a success value", true)
+fixtures.rejects(frontend, #"""
+    let value: Result<Integer, Text> = Ok(1)
+    value.andThen(function(number) { return number })
+    """#, "andThen needs a callback returning Result", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/optional-light.min"), "Welcome home, Ada.\nThere is a light for every traveller.\nThe lighthouse is awake.\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    let failed: Result<Integer, Text> = Err("dark")
+    failed.unwrap()
+    """#, "", levels, 1, "Minyar stopped: cannot unwrap Err\n", false)
+fixtures.executes(frontend, #"""
+    let absent: Maybe<Text> = None
+    absent.expect("expected a light")
+    """#, "", levels, 1, "Minyar stopped: expected a light\n", false)
+
+test.removeTree(frontend.compiler.directory)
+print("Result and Maybe methods: passed")
