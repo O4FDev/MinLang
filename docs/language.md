@@ -524,6 +524,9 @@ separate type-level method form. This keeps construction explicit and gives
 factory functions the same module visibility rules as other functions.
 ## Choices and matching
 
+Declare choices at module scope. The word `choice` remains an ordinary name
+elsewhere, including fields, parameters and loop bindings.
+
 A choice describes the different forms one value can take. Cases start with a
 capital letter and may carry named, typed payloads:
 

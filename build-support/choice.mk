@@ -1,4 +1,7 @@
-.PHONY: check-choice check-choice-sanitize
+.PHONY: check-choice-identifiers check-choice check-choice-sanitize
+
+check-choice-identifiers: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-identifiers
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-identifiers"
 
 check-choice: build/minyarc build/minyar-runtime.o build/tooling/tests/choice
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice"
