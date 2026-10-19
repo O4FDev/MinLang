@@ -26,6 +26,7 @@ CLANG := $(LLVM_BIN)/clang
 LLD := $(firstword $(wildcard $(LLVM_BIN)/ld.lld $(shell brew --prefix lld 2>/dev/null)/bin/ld.lld) ld.lld)
 OBJCOPY := $(LLVM_BIN)/llvm-objcopy
 MINYARC := $(ROOT)/build/minyarc
+KERNEL_SOURCE ?= $(ROOT)/os/kernel/main.min
 MKIMAGE := $(ROOT)/build/os/mkimage
 comma := ,
 
@@ -126,8 +127,8 @@ $(OUT)/freestanding.o: $(ROOT)/runtime/freestanding/freestanding.c $(wildcard $(
 # ----- Minyar programs -----
 
 .PRECIOUS: $(OUT)/%.ll
-$(OUT)/kernel.ll: $(SOURCES) $(MINYARC) | $(OUT)
-	$(MINYARC) $(ROOT)/os/kernel/main.min $@ $(PACKAGES) --bounded-owners 32 --freestanding
+$(OUT)/kernel.ll: $(KERNEL_SOURCE) $(SOURCES) $(MINYARC) | $(OUT)
+	"$(MINYARC)" "$(KERNEL_SOURCE)" "$@" $(PACKAGES) --bounded-owners 32 --freestanding
 
 $(OUT)/loader.ll: $(SOURCES) $(MINYARC) | $(OUT)
 	$(MINYARC) $(ROOT)/os/arch/x86_64/loader/main.min $@ $(PACKAGES) --bounded-owners 32 --freestanding

@@ -43,6 +43,11 @@ new parent with a later ID. Traverse the child and sibling links instead.
 the parser's precedence and associativity. Construction and traversal need
 no recursive walk of the tree.
 
+A safe `parallel for` reuses loop kind 103. Its body is checked using typed
+name, index and assignment-target children before outlining worker LLVM.
+For a reduction, the loop's operator token is `reduce` and its symbol is the
+existing mutable accumulator binding. No extra syntax kind or type tag is used.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its

@@ -1,4 +1,4 @@
-.PHONY: check-parallel-for check-parallel-for-sanitize check-parallel-pool check-parallel-pool-tsan
+.PHONY: check-parallel-for check-parallel-for-sanitize check-parallel-pool check-parallel-pool-tsan check-parallel-backend check-parallel-backend-tsan
 
 ifneq ($(OS),Windows_NT)
 build/parallel-pool: tests/parallel-pool.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
@@ -15,9 +15,21 @@ check-parallel-pool-tsan: build/parallel-pool-tsan
 	MINYAR_PARALLEL_THREADS=1 ./build/parallel-pool-tsan
 	MINYAR_PARALLEL_THREADS=4 ./build/parallel-pool-tsan
 
-check-parallel-for: check-parallel-pool
+build/parallel-backend: tests/parallel-backend.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	"$(LLVM_CC)" $(CPPFLAGS) $(CFLAGS) -pthread $< -lm -o $@
+
+check-parallel-backend: build/parallel-backend
+	$(LIMITED) ./build/parallel-backend
+
+build/parallel-backend-tsan: tests/parallel-backend.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	"$(LLVM_CC)" -std=c11 -O1 -g -fsanitize=thread -pthread $< -lm -o $@
+
+check-parallel-backend-tsan: build/parallel-backend-tsan
+	./build/parallel-backend-tsan
+
+check-parallel-for: check-parallel-pool check-parallel-backend
 else
-check-parallel-pool check-parallel-pool-tsan:
+check-parallel-pool check-parallel-pool-tsan check-parallel-backend check-parallel-backend-tsan:
 	@echo "The pthread pool checks require macOS or Linux." >&2
 	@exit 1
 endif

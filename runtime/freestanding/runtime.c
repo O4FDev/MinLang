@@ -1,5 +1,6 @@
 /* The standard runtime configuration for `--freestanding` programs, built
  * against the small C library in this directory instead of the host's. */
+#define MINYAR_FREESTANDING 1
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_POLL_BUDGET 32
 _Static_assert(sizeof(void *) == 8, "configured memory profiles require a 64-bit target");

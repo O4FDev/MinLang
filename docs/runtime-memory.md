@@ -112,8 +112,12 @@ stealing. Storage is bounded by 64 workers plus each thread's native stack and
 the caller's capture words; the pool allocates no managed objects. Pool creation
 is lazy. A terminal worker failure exits the process directly after reporting
 the checked error, because unwinding through pool shutdown would wait on the
-failing job. Normal exits stop and join the pool. Windows and freestanding builds
-currently execute the same checked jobs sequentially.
+failing job. Normal exits stop and join the pool. Windows executes the same
+checked chunks sequentially. Freestanding builds use the installed processor-entry
+scheduler, or run sequentially before it is installed. The native scheduler
+must join before returning so no worker outlives its borrowed environment.
+Reduction scratch storage is allocated and freed by the owner, with one scalar
+word per chunk; workers write unique words and the owner merges after joining.
 
 `eventcallbacks.dispatch(dispatcher, timeoutMs, maximum)` runs callbacks on
 that owner thread. Its private wait policy first services exactly the selected

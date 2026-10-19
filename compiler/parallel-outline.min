@@ -41,9 +41,11 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
     emitParallelAliasGuards(types, ids, guards, parts, state, textState, output, globals)
     let used: List<Integer> = []
     let index = context.tokenTexts[start + 2]
+    let reduction = ""
+    if parts[8] >= 0 { reduction = context.tokenTexts[parts[8]] }
     let capture = 0
     while capture < captures.length {
-        if captures[capture] != index && parallelCaptureUsed(context, body, state[0], captures[capture]) {
+        if captures[capture] != index && captures[capture] != reduction && parallelCaptureUsed(context, body, state[0], captures[capture]) {
             if !parallelScalar(types[capture]) && !parallelBuffer(types[capture]) { parallelRace(context, body, "only scalars and scalar buffers can be captured") }
             used.add(capture)
         }
@@ -52,7 +54,10 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
     if used.length > 64 { parallelRace(context, start, "this loop captures more than 64 values; split the work into smaller loops") }
     let workerName = "@.minyar.parallel." + Text(start)
     let worker: List<Text> = []
-    worker.add("define internal void " + workerName + "(i64 %parallel.first, i64 %parallel.after, ptr %parallel.environment) {\nentry:\n")
+    let returned = "void"
+    if parts[6] >= 0 { returned = "i64" }
+    worker.add("define internal " + returned + " " + workerName + "(i64 %parallel.first, i64 %parallel.after, ptr %parallel.environment) {\nentry:\n")
+    if parts[6] >= 0 { worker.add("  %local." + Text(parts[6]) + " = alloca i64\n") }
     let local = firstLocal
     while local < state[4] {
         worker.add("  %local." + Text(local) + " = alloca i64\n")
@@ -78,6 +83,11 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
     }
     storeLocal(worker, parts[1], 1, "%parallel.first")
     storeLocal(worker, parts[2], 1, "%parallel.after")
+    if parts[6] >= 0 {
+        let zero = "0"
+        if parts[7] == 7 { zero = "0.0" }
+        storeLocal(worker, parts[6], parts[7], zero)
+    }
     let loop: List<Text> = []
     let piece = parts[0]
     while piece < loopEnd {
@@ -86,9 +96,14 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
         piece = piece + 1
     }
     worker.add(parallelWorkerBody(joinText(loop)))
-    worker.add("  ret void\n}\n\n")
+    if parts[6] >= 0 {
+        let value = loadLocal(worker, textState, state, parts[6], parts[7])
+        let raw = valueAsListSlot(worker, textState, state, value, parts[7])
+        worker.add("  ret i64 " + raw + "\n}\n\n")
+    } else { worker.add("  ret void\n}\n\n") }
     globals.add(joinText(worker))
     let declaration = "declare void @minyar_parallel_run(ptr, i64, i64, ptr)\n"
+    if parts[6] >= 0 { declaration = "declare i64 @minyar_parallel_reduce(ptr, i64, i64, ptr, i64, i64)\n" }
     if findText(globals, declaration) < 0 { globals.add(declaration) }
     let marker = "; minyar-data-parallel-runtime: 1\n"
     if findText(globals, marker) < 0 { globals.add(marker) }
@@ -111,7 +126,15 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
     }
     let first = loadLocal(output, textState, state, parts[1], 1)
     let after = loadLocal(output, textState, state, parts[2], 1)
-    output.add("  call void @minyar_parallel_run(ptr " + workerName + ", i64 " + first + ", i64 " + after + ", ptr " + environment + ")\n")
+    if parts[6] >= 0 {
+        let initial = loadLocal(output, textState, state, parts[6], parts[7])
+        let bits = valueAsListSlot(output, textState, state, initial, parts[7])
+        let raw = emitInstruction(output, textState, state, "call i64 @minyar_parallel_reduce(ptr " + workerName + ", i64 " + first + ", i64 " + after + ", ptr " + environment + ", i64 " + Text(parts[7]) + ", i64 " + bits + ")")
+        let value = slotAsValue(output, textState, state, raw, parts[7])
+        storeLocal(output, parts[6], parts[7], value)
+    } else {
+        output.add("  call void @minyar_parallel_run(ptr " + workerName + ", i64 " + first + ", i64 " + after + ", ptr " + environment + ")\n")
+    }
 }
 
 function hoistParallelStorage(output: List<Text>, slot: Integer, entry: List<Text>) {

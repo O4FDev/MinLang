@@ -23,6 +23,8 @@ static void parallel_chunk(MinyarParallelEntry entry, void *environment,
           (long long)((uint64_t)first + offset + count), environment);
 }
 
+#include "minyar_parallel_backend.h"
+
 static void parallel_serial(MinyarParallelEntry entry, long long first,
                             long long after, void *environment) {
     uint64_t distance = (uint64_t)after - (uint64_t)first;
@@ -152,6 +154,7 @@ static void parallel_initialize(void) {
 void minyar_parallel_run(MinyarParallelEntry entry, long long first,
                          long long after, void *environment) {
     if (first >= after) return;
+    if (parallel_backend_run(entry, first, after, environment)) return;
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(MINYAR_FREESTANDING)
     pthread_once(&parallel_once, parallel_initialize);
     MinyarParallelPool *pool = &parallel_pool;
@@ -190,4 +193,55 @@ void minyar_parallel_run(MinyarParallelEntry entry, long long first,
 #else
     parallel_serial(entry, first, after, environment);
 #endif
+}
+
+typedef long long (*MinyarParallelReduceEntry)(long long, long long, void *);
+typedef struct {
+    MinyarParallelReduceEntry entry;
+    void *environment;
+    long long first;
+    long long *partials;
+} MinyarParallelReduction;
+
+static void parallel_reduce_chunk(long long first, long long after, void *environment) {
+    MinyarParallelReduction *job = environment;
+    uint64_t chunk = ((uint64_t)first - (uint64_t)job->first) / MINYAR_PARALLEL_GRAIN;
+    job->partials[chunk] = job->entry(first, after, job->environment);
+}
+
+long long minyar_parallel_reduce(MinyarParallelReduceEntry entry, long long first,
+                                 long long after, void *environment, long long type,
+                                 long long initial) {
+    if (first >= after) return initial;
+    uint64_t distance = (uint64_t)after - (uint64_t)first;
+    uint64_t chunks = distance / MINYAR_PARALLEL_GRAIN +
+                      (distance % MINYAR_PARALLEL_GRAIN != 0);
+    if (chunks > SIZE_MAX / sizeof(long long)) out_of_memory();
+    /* The owner allocates and frees this profile-accounted raw buffer.
+     * Each worker writes only the scalar word for its unique chunk. */
+    long long *partials = data_allocate((size_t)chunks * sizeof(*partials), sizeof(*partials));
+    MinyarParallelReduction job = { entry, environment, first, partials };
+    minyar_parallel_run(parallel_reduce_chunk, first, after, &job);
+    long long result = initial;
+    if (type == 1) {
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk) {
+            long long value = partials[chunk];
+            if ((value > 0 && result > LLONG_MAX - value) ||
+                (value < 0 && result < LLONG_MIN - value)) minyar_fail_integer_overflow();
+            result += value;
+        }
+    } else {
+        double sum;
+        memcpy(&sum, &initial, sizeof(sum));
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk) {
+            double value;
+            memcpy(&value, &partials[chunk], sizeof(value));
+            sum += value;
+        }
+        memcpy(&result, &sum, sizeof(result));
+    }
+#ifndef MINYAR_COMPILER_ARENA
+    rc_free_data(partials);
+#endif
+    return result;
 }

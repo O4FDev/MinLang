@@ -17,6 +17,7 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/stages/effects.min \
 	compiler/parallel-compiler.min \
 	compiler/parallel-outline.min \
+	compiler/parallel-reductions.min \
 	compiler/stages/functions.min \
 	compiler/stages/pipeline.min \
 	compiler/stages/modules.min \

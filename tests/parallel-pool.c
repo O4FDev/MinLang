@@ -42,6 +42,13 @@ static void *independent_owner(void *argument) {
     return NULL;
 }
 
+static long long sum_indices(long long first, long long after, void *argument) {
+    (void)argument;
+    long long sum = 0;
+    for (long long index = first; index < after; ++index) sum += index;
+    return sum;
+}
+
 int main(void) {
     owner = pthread_self();
     for (int round = 0; round < 100; ++round) {
@@ -61,6 +68,9 @@ int main(void) {
     int requested = atoi(getenv("MINYAR_PARALLEL_THREADS"));
     assert(parallel_pool.count == (size_t)requested);
     assert(atomic_load(&foreign) == (requested > 1));
+    assert(minyar_parallel_reduce(sum_indices, 0, 5003, NULL, 1, 5) == 12512508);
+    assert(minyar_parallel_reduce(sum_indices, -1000, 1001, NULL, 1, 42) == 42);
+    assert(minyar_parallel_reduce(sum_indices, 4, 1, NULL, 1, 42) == 42);
     pthread_t callers[3];
     for (int index = 0; index < 3; ++index) assert(pthread_create(&callers[index], NULL, independent_owner, NULL) == 0);
     for (int index = 0; index < 3; ++index) assert(pthread_join(callers[index], NULL) == 0);

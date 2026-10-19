@@ -1016,13 +1016,33 @@ On macOS and Linux, a persistent thread pool distributes fixed chunks of 128
 indices. Idle workers steal chunks from other workers; the calling thread also
 works, and returns only after every worker has finished. Set
 `MINYAR_PARALLEL_THREADS` to 1–64 to choose the total number of participating
-threads; the default is the online processor count, capped at 64. Other targets
-and recoverable execution currently use the sequential backend. Each loop can
+threads; the default is the online processor count, capped at 64. Freestanding
+OS builds use the processor-entry scheduler after the processors are started.
+Other targets and recoverable execution use the sequential backend. Each loop can
 capture at most 64 values. Scalar captures are snapshots; the caller keeps buffer
 owners alive, and worker code performs no ownership operations.
 Parallel builds currently check the whole module graph,
 including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
 draws a tide of small lights into separate byte slots.
+
+Add `reduce name` to sum into one mutable Integer or Float binding:
+
+```minyar
+let total = 0
+parallel for index in 0..values.length reduce total {
+    total += values[index]
+}
+```
+
+Each chunk starts a private accumulator at zero. The body may update it with
+`+=`, but cannot otherwise read it or reassign it. Contributions may be
+conditional, and ordinary disjoint output writes can accompany them. After
+the workers finish, partial sums are combined in chunk order with the original
+binding. Integer additions remain checked. Float grouping is fixed at 128
+iterations per chunk, independent of the number of threads; it can differ from
+a sequential left-to-right sum. An empty range preserves the original value.
+Partial storage costs one word per chunk and uses the configured allocator.
+Reductions are not yet available in recoverable execution.
 
 ## Parallel functions
 
