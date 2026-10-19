@@ -115,15 +115,17 @@ configuration, credential helper or hooks. Files are read directly from Git
 blobs. Git submodules, symlinks, absolute paths, `..` path components, Git
 metadata paths, backslashes, control characters and colon-bearing paths are
 rejected. Packages are limited to 16,384 files, 128 MiB of source data and 4,096
-nested text/interpolation contexts. The native-keyword check follows flat block
+nested text/interpolation contexts. The source check follows UTF-8 BOM handling, flat block
 comments and ordinary, raw and multiline text; interpolation contents are code.
 
 Packages never run install/build scripts. Remote dependencies cannot contain
 native C, Objective-C, Swift, assembly or binary implementations, or declare a
 Minyar `native` function. They may import the toolchain's standard modules.
 Remote manifests cannot escape the pinned graph with local path dependencies.
-Relative source imports must stay inside their own content-hashed tree; shared
-files beside `src` are allowed. Module paths use single-line ordinary or raw
+Relative source imports must name `.min` files inside their own content-hashed
+tree; shared files beside `src` are allowed. This ensures every compiled source
+receives the native-declaration check. Data files remain available for file I/O.
+Module paths use single-line ordinary or raw
 Text literals. Ordinary escapes are decoded before checking the path; absolute
 paths, backslash separators and traversal outside the tree are rejected.
 Multiline Text remains available for data, while package import paths stay on
