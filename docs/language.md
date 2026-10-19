@@ -1001,7 +1001,11 @@ parallel for index in 0..squares.length {
 Bounds are evaluated once. Empty and descending ranges do no work. The index
 cannot be changed, and every shared write must use that index directly. Scalar
 locals belong to one iteration; outer scalar bindings cannot be reassigned.
-Buffer reads currently use the same index or `.length`, so aliases remain safe.
+An output buffer may be read at the same index or through `.length`. Other
+scalar buffers may be read at any checked index. When an input could alias an
+output, the compiler inserts a check before dispatch; an alias stops with a
+clear error asking for a separate input buffer. Empty ranges do no work and
+need no alias check.
 Buffers keep their existing length, bounds checks and shared reference semantics.
 Managed values cannot be created, passed to functions, resized or returned by an
 iteration. Calls must be to pure `parallel function`s, including their callees;

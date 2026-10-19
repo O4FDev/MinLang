@@ -4,6 +4,12 @@
 
 typedef void (*MinyarParallelEntry)(long long, long long, void *);
 
+void minyar_parallel_no_alias(const void *input, const void *output,
+                              long long first, long long after) {
+    if (first < after && input == output)
+        minyar_stop("a parallel input read at another index aliases a buffer written by parallel for; use a separate input buffer.");
+}
+
 #define MINYAR_PARALLEL_LIMIT 64
 #define MINYAR_PARALLEL_GRAIN 128
 

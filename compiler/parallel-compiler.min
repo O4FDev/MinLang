@@ -24,6 +24,7 @@ function parallelDirectIndex(context: CompilerContext, first: Integer, after: In
 function checkParallelBody(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>) {
     let nodes = context.syntax.nodes
     let texts = context.tokenTexts
+    let written = parallelWrittenBuffers(context, firstNode, body, captures, types)
     let node = firstNode
     while node < nodes.length {
         let kind = nodes[node].kind
@@ -67,13 +68,15 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
                 let parent = nodes[node].parent
                 if allowed && parent >= 0 {
                     if nodes[parent].kind == 213 {
-                        allowed = parallelDirectIndex(context, nodes[parent].start, nodes[parent].end, name, index)
+                        if !parallelDirectIndex(context, nodes[parent].start, nodes[parent].end, name, index) && findText(written, name) >= 0 {
+                            parallelRace(context, start, "cannot read shared '" + name + "' at another index while writing it; use " + name + "[" + index + "] or a separate input buffer")
+                        }
                     } else {
                         allowed = nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 1] == "." && texts[start + 2] == "length"
                     }
                 } else { allowed = false }
                 if !allowed {
-                    parallelRace(context, start, "shared values may only be scalar buffers read at [" + index + "] or through .length; managed values cannot escape or be changed")
+                    parallelRace(context, start, "shared values may only be scalar buffers read by index or through .length; managed values cannot escape or be changed")
                 }
             }
         }
@@ -106,6 +109,7 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     if parts[3] >= 0 { parallelRace(context, start, "use an Integer range such as 0..count") }
     let body = parts[5]
     checkParallelBody(context, firstNode, body, index, captures, types)
+    let guards = parallelReadGuards(context, firstNode, body, index, captures, types)
     // Bounds execute on the owner thread. Only body calls need the effect proof.
     let node = firstNode
     while node < context.syntax.nodes.length {
@@ -129,7 +133,75 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     // Recovery continuations belong to the owner's execution domain. Their
     // checked loops retain the sequential backend for now.
     if !recoveryEnabled(state) {
-        outlineParallelFor(context, captures, types, ids, firstLocal, start, body, parts, blocks[0], state, textState, output, globals)
+        outlineParallelFor(context, captures, types, ids, firstLocal, start, body, parts, guards, blocks[0], state, textState, output, globals)
+    } else {
+        let firstGuard = output.length
+        emitParallelAliasGuards(types, ids, guards, parts, state, textState, output, globals)
+        let before: List<Text> = []
+        let guard = firstGuard
+        while guard < output.length { before.add(output[guard]); output[guard] = ""; guard = guard + 1 }
+        output[parts[0]] = joinText(before) + output[parts[0]]
+    }
+}
+
+function parallelWrittenBuffers(context: CompilerContext, firstNode: Integer, body: Integer, captures: List<Text>, types: List<Integer>): List<Text> {
+    let result: List<Text> = []
+    let node = firstNode
+    while node < context.syntax.nodes.length {
+        let target = context.syntax.nodes[node]
+        if target.start >= body && target.kind == 214 {
+            let name = context.tokenTexts[target.start]
+            let capture = findText(captures, name)
+            if capture >= 0 {
+                if parallelBuffer(types[capture]) && findText(result, name) < 0 { result.add(name) }
+            }
+        }
+        node = node + 1
+    }
+    return result
+}
+
+function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>): List<Integer> {
+    let written = parallelWrittenBuffers(context, firstNode, body, captures, types)
+    let result: List<Integer> = []
+    let seen: List<Text> = []
+    let node = firstNode
+    while node < context.syntax.nodes.length {
+        let access = context.syntax.nodes[node]
+        if access.start >= body && access.kind == 213 {
+            let name = context.tokenTexts[access.start]
+            let read = findText(captures, name)
+            if read >= 0 && !parallelDirectIndex(context, access.start, access.end, name, index) {
+                let output = 0
+                while output < written.length {
+                    let write = findText(captures, written[output])
+                    if types[read] == types[write] {
+                        let pair = Text(read) + "/" + Text(write)
+                        if findText(seen, pair) < 0 { seen.add(pair); result.add(read); result.add(write) }
+                    }
+                    output = output + 1
+                }
+            }
+        }
+        node = node + 1
+    }
+    return result
+}
+
+function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guards: List<Integer>, parts: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+    if guards.length == 0 { return }
+    let declaration = "declare void @minyar_parallel_no_alias(ptr, ptr, i64, i64)\n"
+    if findText(globals, declaration) < 0 { globals.add(declaration) }
+    let first = loadLocal(output, textState, state, parts[1], 1)
+    let after = loadLocal(output, textState, state, parts[2], 1)
+    let pair = 0
+    while pair < guards.length {
+        let read = guards[pair]
+        let write = guards[pair + 1]
+        let input = loadLocal(output, textState, state, ids[read], types[read])
+        let target = loadLocal(output, textState, state, ids[write], types[write])
+        output.add("  call void @minyar_parallel_no_alias(ptr " + input + ", ptr " + target + ", i64 " + first + ", i64 " + after + ")\n")
+        pair = pair + 2
     }
 }
 
