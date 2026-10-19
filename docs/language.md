@@ -724,6 +724,11 @@ returning `List<Item>`. When neither gives enough information, write the types
 explicitly. Inconsistent arguments are rejected; generics never convert one
 type into another.
 
+The expected result type applies to the call's value. In
+`let count: Integer = identity(record).count`, the argument determines the
+record type; the Integer annotation describes the field. Method calls,
+indexing and calls through returned callbacks follow the same rule.
+
 Generic functions can call one another or themselves and can be exported from
 modules. The compiler creates one ordinary function for each distinct set of
 concrete types used anywhere in the program. Values keep their usual native
