@@ -317,3 +317,126 @@ function offloadReadyResult(receiver: Integer, milliseconds: Integer): Bytes { n
 function offloadWatchResult(loop: Integer, receiver: Integer, interest: Integer, token: Integer): Bytes { native "net" }
 function offloadSendToResult(receiver: Integer, source: Text, port: Integer, data: Bytes, segmentSize: Integer): Bytes { native "net" }
 function offloadCloseResult(receiver: Integer): Bytes { native "net" }
+
+// Typed companions to the deprecated native/status-record APIs above.
+// Would-block remains an error with its own code. Stream EOF is None; an
+// empty UDP datagram is successful Bytes. Truncation retains its readable prefix.
+public record ReadFailure { private diagnostic: errors.Error; private readablePrefix: Bytes }
+public function ReadFailure.error(): errors.Error { return self.diagnostic }
+public function ReadFailure.prefix(): Bytes { return self.readablePrefix }
+public function ReadFailure.isWouldBlock(): Boolean { return errors.isWouldBlock(self.diagnostic) }
+public function ReadFailure.withContext(context: Text): ReadFailure { return ReadFailure { diagnostic: self.diagnostic.withContext(context); readablePrefix: self.readablePrefix } }
+public function ReadFailure.describe(): Text { return self.diagnostic.describe() }
+
+function typedInteger(result: errors.IntegerResult): Result<Integer, errors.Error> {
+    if errors.integerOk(result) { return Ok(errors.integerValue(result)) }
+    return Err(errors.integerError(result))
+}
+function typedBoolean(result: errors.BooleanResult): Result<Boolean, errors.Error> {
+    if errors.booleanOk(result) { return Ok(errors.booleanValue(result)) }
+    return Err(errors.booleanError(result))
+}
+function typedStatus(result: errors.BooleanResult): Result<Nothing, errors.Error> {
+    if errors.booleanOk(result) { return Ok() }
+    return Err(errors.booleanError(result))
+}
+function socketError(operation: Text): errors.Error {
+    let code = lastErrorCode()
+    let message = lastError()
+    let category = errors.systemCode()
+    if code == -11 || code == -35 || code == -10035 { category = errors.wouldBlockCode() }
+    return errors.make(category, -code, message).withContext(operation)
+}
+function socketHandle(value: Integer, operation: Text): Result<Integer, errors.Error> {
+    if value < 0 { return Err(socketError(operation)) }
+    return Ok(value)
+}
+function readFailure(result: errors.BytesResult): ReadFailure {
+    let prefix = Bytes()
+    if errors.bytesStatus(result) == errors.truncatedStatus() { prefix = errors.bytesValue(result) }
+    return ReadFailure { diagnostic: errors.bytesError(result); readablePrefix: prefix }
+}
+function typedDatagram(result: errors.BytesResult): Result<Bytes, ReadFailure> {
+    if errors.bytesStatus(result) == errors.successStatus() { return Ok(errors.bytesValue(result)) }
+    if errors.bytesStatus(result) == errors.endOfStreamStatus() {
+        return Err(ReadFailure { diagnostic: errors.make(errors.closedCode(), 0, "datagram input ended"); readablePrefix: Bytes() })
+    }
+    return Err(readFailure(result))
+}
+public function openConnection(host: Text, port: Integer): Result<Integer, errors.Error> { return socketHandle(connect(host, port), "connecting to " + host) }
+public function beginConnection(address: Text, port: Integer): Result<Integer, errors.Error> { return typedInteger(connectStart(address, port)) }
+public function finishConnection(connection: Integer): Result<Boolean, errors.Error> { return typedBoolean(connectFinish(connection)) }
+public function listenOn(host: Text, port: Integer, backlog: Integer): Result<Integer, errors.Error> { return socketHandle(listen(host, port, backlog), "listening on " + host) }
+public function acceptConnection(listener: Integer): Result<Integer, errors.Error> { return socketHandle(accept(listener), "accepting a connection") }
+public function openDatagram(host: Text, port: Integer): Result<Integer, errors.Error> { return socketHandle(udp(host, port), "opening a datagram socket") }
+public function portOf(connection: Integer): Result<Integer, errors.Error> { return socketHandle(localPort(connection), "reading the socket's port") }
+public function setNonBlocking(connection: Integer, enabled: Boolean): Result<Nothing, errors.Error> {
+    if !nonBlocking(connection, enabled) { return Err(socketError("configuring non-blocking I/O")) }
+    return Ok()
+}
+public function waitReady(connection: Integer, milliseconds: Integer): Result<Boolean, errors.Error> {
+    let result = ready(connection, milliseconds)
+    if lastErrorCode() != 0 { return Err(socketError("waiting for socket readiness")) }
+    return Ok(result)
+}
+public function closeConnection(connection: Integer): Result<Nothing, errors.Error> {
+    close(connection)
+    if lastErrorCode() != 0 { return Err(socketError("closing the socket")) }
+    return Ok()
+}
+public function noDelay(connection: Integer, enabled: Boolean): Result<Nothing, errors.Error> { return typedStatus(setNoDelay(connection, enabled)) }
+public function connectDatagram(connection: Integer, host: Text, port: Integer): Result<Nothing, errors.Error> {
+    if !udpConnect(connection, host, port) { return Err(socketError("connecting a datagram socket")) }
+    return Ok()
+}
+public function addressFamily(address: Text): Maybe<Integer> {
+    let version = ipVersion(address)
+    if version == 0 { return None }
+    return Some(version)
+}
+public function readBytes(connection: Integer, limit: Integer): Result<Maybe<Bytes>, ReadFailure> {
+    let result = read(connection, limit)
+    let status = errors.bytesStatus(result)
+    if status == errors.successStatus() { return Ok(Some(errors.bytesValue(result))) }
+    if status == errors.endOfStreamStatus() { return Ok(None) }
+    return Err(readFailure(result))
+}
+public function receiveDatagramBytes(connection: Integer, limit: Integer): Result<Bytes, ReadFailure> { return typedDatagram(receiveDatagram(connection, limit)) }
+public function writeBytes(connection: Integer, data: Bytes): Result<Integer, errors.Error> { return typedInteger(write(connection, data)) }
+public function writeBytesRange(connection: Integer, data: Bytes, offset: Integer, length: Integer): Result<Integer, errors.Error> { return socketHandle(writeRange(connection, data, offset, length), "writing a socket range") }
+public function readBytesInto(connection: Integer, buffer: Bytes, limit: Integer): Result<Maybe<Integer>, errors.Error> {
+    if limit < 1 { return Err(errors.make(errors.invalidDataCode(), 0, "socket read limit must be positive")) }
+    let count = readInto(connection, buffer, limit)
+    if count < 0 { return Err(socketError("reading into a byte buffer")) }
+    if count == 0 { return Ok(None) }
+    return Ok(Some(count))
+}
+public function sendPackets(connection: Integer, packets: List<Bytes>): Result<Integer, errors.Error> { return typedInteger(sendDatagrams(connection, packets)) }
+public function sendPacketTo(connection: Integer, source: Text, port: Integer, data: Bytes): Result<Integer, errors.Error> { return typedInteger(sendDatagramTo(connection, source, port, data)) }
+public function sendSegments(connection: Integer, data: Bytes, segmentSize: Integer): Result<Integer, errors.Error> { return typedInteger(sendDatagramsOffload(connection, data, segmentSize)) }
+public function sendSegmentsTo(connection: Integer, source: Text, port: Integer, data: Bytes, segmentSize: Integer): Result<Integer, errors.Error> { return typedInteger(sendDatagramsOffloadTo(connection, source, port, data, segmentSize)) }
+
+public record BatchFailure { private diagnostic: errors.Error; private readablePrefix: List<Datagram> }
+public function BatchFailure.error(): errors.Error { return self.diagnostic }
+public function BatchFailure.prefix(): List<Datagram> { return self.readablePrefix }
+public function BatchFailure.withContext(context: Text): BatchFailure { return BatchFailure { diagnostic: self.diagnostic.withContext(context); readablePrefix: self.readablePrefix } }
+public function BatchFailure.describe(): Text { return self.diagnostic.describe() }
+public function Datagram.data(): Result<Bytes, ReadFailure> { return typedDatagram(self.data) }
+public function Datagram.source(): Text { return self.source }
+public function Datagram.port(): Integer { return self.port }
+function typedBatch(batch: DatagramBatch): Result<List<Datagram>, BatchFailure> {
+    if datagramBatchOk(batch) { return Ok(datagrams(batch)) }
+    return Err(BatchFailure { diagnostic: datagramBatchError(batch); readablePrefix: datagramBatchPrefix(batch) })
+}
+public function receivePackets(connection: Integer, maximum: Integer, limit: Integer): Result<List<Datagram>, BatchFailure> { return typedBatch(receiveDatagrams(connection, maximum, limit)) }
+public function openDatagramOffload(host: Text, port: Integer): Result<DatagramOffload, errors.Error> {
+    let result = datagramOffload(host, port)
+    if datagramOffloadOk(result) { return Ok(result) }
+    return Err(datagramOffloadError(result))
+}
+public function DatagramOffload.port(): Result<Integer, errors.Error> { return typedInteger(datagramOffloadPort(self)) }
+public function DatagramOffload.ready(milliseconds: Integer): Result<Boolean, errors.Error> { return typedBoolean(readyDatagramOffload(self, milliseconds)) }
+public function DatagramOffload.watch(loop: Integer, interest: Integer, token: Integer): Result<Integer, errors.Error> { return typedInteger(watchDatagramOffload(self, loop, interest, token)) }
+public function DatagramOffload.close(): Result<Nothing, errors.Error> { return typedStatus(closeDatagramOffload(self)) }
+public function DatagramOffload.sendTo(source: Text, port: Integer, data: Bytes, segmentSize: Integer): Result<Integer, errors.Error> { return typedInteger(sendDatagramOffloadTo(self, source, port, data, segmentSize)) }
+public function DatagramOffload.receive(maximum: Integer, limit: Integer): Result<List<Datagram>, BatchFailure> { return typedBatch(receiveDatagramsOffload(self, maximum, limit)) }
