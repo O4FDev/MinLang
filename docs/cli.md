@@ -138,6 +138,13 @@ enables whole-program optimization. Outputs go to `target/debug` or
 directory; use `--no-incremental` to disable it. Library builds validate source;
 consumers compile reachable library modules into their own executables.
 
+`--error-format json` selects compiler diagnostics as JSON lines on standard
+error for `build`, `run`, `check`, `test` and `install`. This includes discovery
+and compilation of embedded module tests. Each compiler diagnostic is preserved
+with its original exit status. Use `--error-format text` for the human-readable
+renderer. Argument, manifest and runtime messages use their command's normal
+format.
+
 Debug builds include Minyar source line tables for breakpoints, stepping and
 backtraces, including imported modules. On macOS the matching `.dSYM` bundle is
 kept beside each executable. This currently supplies function and source-line
