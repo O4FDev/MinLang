@@ -1,0 +1,50 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "io" as io
+use "process" as process
+use "system" as system
+
+let work = test.scratch()
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let sanitize = process.argumentCount() == 1 && process.argument(0) == "--sanitize"
+let flags: List<Text> = []
+if sanitize {
+    flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
+}
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+io.writeTextFile(work + "/runtime.c", contract)
+let build = [clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", work + "/runtime.c", "-o", work + "/runtime.o"]
+for flag in flags {
+    build.add(flag)
+}
+test.require(test.run(build, system.environment(), "", work + "/runtime-build", 60), "editor ownership runtime")
+io.writeTextFile(work + "/gallery.min", io.readTextFile("examples/gallery/lantern.before"))
+for name in ["tools/format-cli.min", "tools/lsp-cli.min", "tests/editor-index.min"] {
+    test.require(test.run([compiler, name, work + "/program.ll", "--library", "library"], system.environment(), "", work + "/compile", 60), name + " compile")
+    if sanitize {
+        io.writeTextFile(work + "/program.ll", test.instrument(io.readTextFile(work + "/program.ll")))
+    }
+    for optimization in ["-O0", "-O2"] {
+        let command = [clang, optimization, "-Wno-override-module", "-iquote", "runtime", work + "/program.ll", work + "/runtime.o", "runtime/native/system.c", "runtime/native/files.c", "tools/testing-host.c", "tools/clang-driver-host.c", "tools/editor-host.c", "-pthread", "-lm", "-o", work + "/program"]
+        for flag in flags {
+            command.add(flag)
+        }
+        test.require(test.run(command, system.environment(), "", work + "/link", 60), name + " " + optimization + " editor link")
+        if name == "tools/lsp-cli.min" {
+            test.require(test.run(["python3", "tests/editor-lsp.py", work + "/program", compiler], system.environment(), "", work + "/protocol", 120), "LSP with ownership checks " + optimization)
+        } else {
+            let arguments = [work + "/program"]
+            let expected = "editor source index, scopes, recovery, UTF-16 and URI checks passed\n"
+            if name == "tools/format-cli.min" {
+                arguments.add("--stdout")
+                arguments.add(work + "/gallery.min")
+                expected = io.readTextFile("examples/gallery/lantern.min")
+            }
+            let result = test.run(arguments, system.environment(), "", work + "/run", 30)
+            test.check(result.status == 0 && result.output == expected && result.errorOutput == "", name + " ownership output\n" + result.output + result.errorOutput)
+        }
+    }
+}
+test.removeScratch(work)
+print("editor tooling passed O0/O2 ownership checks (sanitizers: \(sanitize))")

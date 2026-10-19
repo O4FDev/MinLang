@@ -1,0 +1,370 @@
+use "./editor-source.min" as source
+use "./driver-support.min" as host
+use "json" as json
+
+public record Symbol {
+    name: Text
+    detail: Text
+    type: Text
+    documentation: Text
+    kind: Integer
+    start: Integer
+    end: Integer
+    scopeStart: Integer
+    scopeEnd: Integer
+    container: Text
+    exported: Boolean
+}
+public record Import {
+    name: Text
+    path: Text
+    start: Integer
+    end: Integer
+}
+public record Index {
+    tokens: List<source.Token>
+    symbols: List<Symbol>
+    imports: List<Import>
+    error: Text
+    errorStart: Integer
+}
+
+function spelling(tokens: List<source.Token>, first: Integer, after: Integer): Text {
+    let parts: List<Text> = []
+    let previous = ""
+    for index in first..after {
+        let value = tokens[index].text
+        if parts.length > 0 && value != "." && previous != "." && value != "," && value != ":" && value != ")" && value != "]" && value != ">" && value != ">>" && value != "<" && previous != "<" && previous != "(" && previous != "[" && value != "(" {
+            parts.add(" ")
+        }
+        parts.add(value)
+        previous = value
+    }
+    return joinText(parts)
+}
+function annotation(tokens: List<source.Token>, first: Integer, after: Integer): Text {
+    let end = first
+    let angle = 0
+    let round = 0
+    while end < after {
+        let value = tokens[end].text
+        if angle == 0 && round == 0 &&(value == "," || value == ";" || value == "=" || value == "{" || value == "}" || value == ")") {
+            break
+        }
+        if end > first && angle == 0 && round == 0 && tokens[end].line > tokens[end - 1].line {
+            break
+        }
+        if value == "<" {
+            angle += 1
+        }
+        if value == ">" && angle > 0 {
+            angle -= 1
+        }
+        if value == ">>" && angle > 0 {
+            angle = max(0, angle - 2)
+        }
+        if value == "(" {
+            round += 1
+        }
+        if value == ")" && round > 0 {
+            round -= 1
+        }
+        end += 1
+    }
+    return spelling(tokens, first, end)
+}
+function inferred(tokens: List<source.Token>, first: Integer): Text {
+    if first >= tokens.length {
+        return ""
+    }
+    let token = tokens[first]
+    if token.kind == 3 {
+        if token.text.startsWith("'") {
+            return "Character"
+        }
+        return "Text"
+    }
+    if token.kind == 2 {
+        if token.text.startsWith("0x") || token.text.startsWith("0o") {
+            return "Integer"
+        }
+        if host.hasText(token.text, ".") || host.hasText(token.text, "e") || host.hasText(token.text, "E") {
+            return "Float"
+        }
+        return "Integer"
+    }
+    if token.text == "true" || token.text == "false" {
+        return "Boolean"
+    }
+    if token.text == "-" {
+        return inferred(tokens, first + 1)
+    }
+    if token.text == "[" {
+        let element = inferred(tokens, first + 1)
+        if element != "" {
+            return "List<" + element + ">"
+        }
+        return "List"
+    }
+    if token.kind == 1 && first + 3 < tokens.length && tokens[first + 1].text == "." && tokens[first + 2].kind == 1 &&(tokens[first + 3].text == "(" || tokens[first + 3].text == "{") {
+        return token.text + "." + tokens[first + 2].text
+    }
+    if token.kind == 1 && first + 1 < tokens.length &&(tokens[first + 1].text == "{" || tokens[first + 1].text == "(") {
+        return token.text
+    }
+    return ""
+}
+function add(index: Index, token: source.Token, detail: Text, type: Text, documentation: Text, kind: Integer, after: Integer, scopeStart: Integer, scopeEnd: Integer, container: Text, exported: Boolean) {
+    index.symbols.add(Symbol {
+        name: token.text
+        detail: detail
+        type: type
+        documentation: documentation
+        kind: kind
+        start: token.start
+        end: after
+        scopeStart: scopeStart
+        scopeEnd: scopeEnd
+        container: container
+        exported: exported
+    })
+}
+
+public function build(text: Text): Index {
+    let scanned = source.scan(text)
+    let result = Index {
+        tokens: []
+        symbols: []
+        imports: []
+        error: scanned.error
+        errorStart: scanned.errorStart
+    }
+    let docs: List<Text> = []
+    let pending: List<Text> = []
+    let lastDocLine = - 2
+    for token in scanned.tokens {
+        if token.kind == 5 {
+            if token.text.startsWith("///") {
+                if token.line > lastDocLine + 1 {
+                    pending.clear()
+                }
+                pending.add(host.strip(token.text.slice(3, token.text.length)))
+                lastDocLine = token.line
+            } else {
+                pending.clear()
+            }
+        } else if token.kind != 6 {
+            if token.line > lastDocLine + 1 {
+                pending.clear()
+            }
+            result.tokens.add(token)
+            docs.add(host.joined(pending, "\n"))
+            if token.text != "public" && token.text != "parallel" {
+                pending.clear()
+            }
+        }
+    }
+    let tokens = result.tokens
+    let pairs: List<Integer> = []
+    let parents: List<Integer> = []
+    let stack: List<Integer> = []
+    for index in 0..tokens.length {
+        pairs.add(tokens.length)
+        let parent = - 1
+        if stack.length > 0 {
+            parent = stack[stack.length - 1]
+        }
+        parents.add(parent)
+        let value = tokens[index].text
+        if value == "{" || value == "(" || value == "[" {
+            stack.add(index)
+        }
+        else if value == "}" || value == ")" || value == "]" {
+            if stack.length > 0 {
+                let opening = stack.pop()
+                let expected = "}"
+                if tokens[opening].text == "(" {
+                    expected = ")"
+                }
+                if tokens[opening].text == "[" {
+                    expected = "]"
+                }
+                if value == expected {
+                    pairs[opening] = index
+                    pairs[index] = opening
+                }
+                else if result.error == "" {
+                    result.error = "this closing bracket does not match its opening bracket"
+                    result.errorStart = tokens[index].start
+                }
+            } else if result.error == "" {
+                result.error = "this closing bracket has no opening bracket"
+                result.errorStart = tokens[index].start
+            }
+        }
+    }
+    if stack.length > 0 && result.error == "" {
+        result.error = "this opening bracket needs a closing bracket"
+        result.errorStart = tokens[stack[stack.length - 1]].start
+    }
+    let recordBodies: List<Integer> = []
+    let recordNames: List<Text> = []
+    let choiceBodies: List<Integer> = []
+    let choiceNames: List<Text> = []
+    for index in 0..tokens.length {
+        let token = tokens[index]
+        let value = token.text
+        let exported = index > 0 && tokens[index - 1].text == "public"
+        if value == "use" && parents[index] == - 1 && index + 3 < tokens.length && tokens[index + 1].kind == 3 && tokens[index + 2].text == "as" && tokens[index + 3].kind == 1 {
+            let literal = json.parse(tokens[index + 1].text)
+            if literal.kind == json.STRING {
+                result.imports.add(Import {
+                    name: tokens[index + 3].text
+                    path: literal.text
+                    start: tokens[index + 1].start
+                    end: tokens[index + 1].end
+                })
+                add(result, tokens[index + 3], "use " + tokens[index + 1].text + " as " + tokens[index + 3].text, "module", "", 2, tokens[index + 3].end, 0, text.byteLength, "", false)
+            }
+        }
+        if (value == "record" || value == "choice") && parents[index] == - 1 && index + 2 < tokens.length && tokens[index + 1].kind == 1 {
+            let body = index + 2
+            while body < tokens.length && tokens[body].text != "{" && tokens[body].text != "=" && tokens[body].line <= tokens[index + 1].line + 10 {
+                body += 1
+            }
+            if body < tokens.length && tokens[body].text == "{" {
+                let end = text.byteLength
+                if pairs[body] < tokens.length {
+                    end = tokens[pairs[body]].end
+                }
+                add(result, tokens[index + 1], spelling(tokens, index, body), tokens[index + 1].text, docs[index], 23, end, 0, text.byteLength, "", exported)
+                recordBodies.add(body)
+                recordNames.add(tokens[index + 1].text)
+                if value == "choice" {
+                    choiceBodies.add(body)
+                    choiceNames.add(tokens[index + 1].text)
+                }
+            }
+        }
+        if value == "type" && parents[index] == - 1 && index + 2 < tokens.length && tokens[index + 1].kind == 1 && tokens[index + 2].text == "=" {
+            let type = annotation(tokens, index + 3, tokens.length)
+            add(result, tokens[index + 1], "type " + tokens[index + 1].text + " = " + type, type, docs[index], 26, tokens[index + 1].end, 0, text.byteLength, "", exported)
+        }
+        if value == "function" && index + 1 < tokens.length && tokens[index + 1].kind == 1 {
+            let name = index + 1
+            let container = ""
+            if name + 2 < tokens.length && tokens[name + 1].text == "." {
+                container = tokens[name].text
+                name += 2
+            }
+            let round = name + 1
+            while round < tokens.length && tokens[round].text != "(" && tokens[round].text != "{" && tokens[round].line <= token.line + 10 {
+                round += 1
+            }
+            if round >= tokens.length || tokens[round].text != "(" || pairs[round] >= tokens.length {
+                continue
+            }
+            let close = pairs[round]
+            let body = close + 1
+            while body < tokens.length && tokens[body].text != "{" && tokens[body].line <= tokens[close].line + 10 {
+                body += 1
+            }
+            let end = text.byteLength
+            let begin = tokens[close].end
+            if body < tokens.length && tokens[body].text == "{" {
+                begin = tokens[body].start
+                if pairs[body] < tokens.length {
+                    end = tokens[pairs[body]].end
+                }
+            }
+            let type = "Nothing"
+            if close + 1 < tokens.length && tokens[close + 1].text == ":" {
+                type = annotation(tokens, close + 2, tokens.length)
+            }
+            let kind = 12
+            if container != "" {
+                kind = 6
+            }
+            add(result, tokens[name], spelling(tokens, index, min(body, tokens.length)), type, docs[index], kind, end, 0, text.byteLength, container, exported)
+            for parameter in (round + 1)..close {
+                if parents[parameter] == round && parameter + 1 < close && tokens[parameter].kind == 1 && tokens[parameter + 1].text == ":" {
+                    let parameterType = annotation(tokens, parameter + 2, close)
+                    add(result, tokens[parameter], tokens[parameter].text + ": " + parameterType, parameterType, "", 13, tokens[parameter].end, tokens[round].start, end, "", false)
+                }
+            }
+            if container != "" {
+                add(result, tokens[name], "self: " + container, container, "", 13, tokens[name].end, begin, end, "@self", false)
+                result.symbols[result.symbols.length - 1].name = "self"
+            }
+        }
+        if (value == "let" || value == "constant" || value == "global") && index + 1 < tokens.length && tokens[index + 1].kind == 1 {
+            let name = index + 1
+            let type = ""
+            if name + 1 < tokens.length && tokens[name + 1].text == ":" {
+                type = annotation(tokens, name + 2, tokens.length)
+            }
+            else if name + 1 < tokens.length && tokens[name + 1].text == "=" {
+                type = inferred(tokens, name + 2)
+            }
+            let scopeStart = 0
+            let scopeEnd = text.byteLength
+            let parent = parents[index]
+            while parent >= 0 && tokens[parent].text != "{" {
+                parent = parents[parent]
+            }
+            if parent >= 0 {
+                scopeStart = token.start
+                if pairs[parent] < tokens.length {
+                    scopeEnd = tokens[pairs[parent]].end
+                }
+            }
+            let detail = value + " " + tokens[name].text
+            if type != "" {
+                detail += ": " + type
+            }
+            let kind = 13
+            if value == "constant" {
+                kind = 14
+            }
+            add(result, tokens[name], detail, type, docs[index], kind, tokens[name].end, scopeStart, scopeEnd, "", exported)
+        }
+    }
+    for index in 0..tokens.length {
+        let token = tokens[index]
+        let parent = parents[index]
+        if token.kind != 1 {
+            continue
+        }
+        for position in 0..recordBodies.length {
+            if parent == recordBodies[position] && index + 1 < tokens.length && tokens[index + 1].text == ":" {
+                let type = annotation(tokens, index + 2, tokens.length)
+                add(result, token, token.text + ": " + type, type, docs[index], 8, token.end, 0, text.byteLength, recordNames[position], true)
+                if index > 0 && tokens[index - 1].text == "private" {
+                    result.symbols[result.symbols.length - 1].exported = false
+                }
+            }
+        }
+        for position in 0..choiceBodies.length {
+            if parent == choiceBodies[position] {
+                add(result, token, choiceNames[position] + "." + token.text, choiceNames[position], docs[index], 22, token.end, 0, text.byteLength, choiceNames[position], true)
+            }
+        }
+    }
+    return result
+}
+
+public function visible(symbol: Symbol, offset: Integer): Boolean {
+    return offset >= symbol.scopeStart && offset <= symbol.scopeEnd
+}
+public function find(index: Index, name: Text, offset: Integer, container: Text): Integer {
+    let found = - 1
+    let scope = - 1
+    for position in 0..index.symbols.length {
+        let symbol = index.symbols[position]
+        if symbol.name == name && symbol.container == container && visible(symbol, offset) && symbol.scopeStart >= scope {
+            found = position
+            scope = symbol.scopeStart
+        }
+    }
+    return found
+}

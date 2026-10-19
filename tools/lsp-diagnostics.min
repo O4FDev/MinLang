@@ -1,0 +1,192 @@
+use "./lsp-workspace.min" as workspace
+use "./lsp-protocol.min" as protocol
+use "./driver-support.min" as host
+use "json" as json
+use "system" as system
+use "text" as textCodec
+
+function execute(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer): Integer {
+    native "driverhost"
+}
+function vector(items: List<Text>): Bytes {
+    let encoded = Bytes(8)
+    encoded.setInt64(0, items.length)
+    for item in items {
+        let bytes = Bytes(item)
+        encoded.addInt64(bytes.length)
+        encoded.addBytes(bytes)
+    }
+    return encoded
+}
+public function capture(state: workspace.Workspace, arguments: List<Text>): host.Captured {
+    if state.temporary == "" {
+        state.temporary = host.resolveName(host.temporaryDirectory("", "minyar-lsp-"))
+    }
+    let output = state.temporary + "/stdout"
+    let errors = state.temporary + "/stderr"
+    host.writeBytes(output, Bytes())
+    host.writeBytes(errors, Bytes())
+    let status = execute(vector(arguments), vector(system.environment()), true, output, errors, 30000)
+    let outputBytes = host.readBytes(output)
+    let errorBytes = host.readBytes(errors)
+    let outputText = ""
+    let errorText = "The compiler returned a diagnostic that is not valid UTF-8."
+    if textCodec.validUTF8(outputBytes) {
+        outputText = Text(outputBytes)
+    }
+    if textCodec.validUTF8(errorBytes) {
+        errorText = Text(errorBytes)
+    }
+    return host.Captured {
+        status: status
+        output: outputText
+        errors: errorText
+    }
+}
+function compile(state: workspace.Workspace, snapshot: workspace.Snapshot, json: Boolean): host.Captured {
+    let arguments = [state.compiler, snapshot.root, state.temporary + "/checked.ll"]
+    if json {
+        arguments.add("--error-format")
+        arguments.add("json")
+    }
+    for library in state.libraries {
+        arguments.add("--library")
+        arguments.add(library)
+    }
+    return capture(state, arguments)
+}
+function diagnostic(text: Text, first: Integer, after: Integer, message: Text, severity: Integer): Text {
+    return "{\"range\":" + protocol.range(text, first, after) + ",\"severity\":\(severity),\"source\":\"minyar\",\"message\":" + json.quote(message) + "}"
+}
+function digitsAfter(text: Text, prefix: Text, fallback: Integer): Integer {
+    let found = host.findText(text, prefix, 0)
+    if found < 0 {
+        return fallback
+    }
+    let data = Bytes(text)
+    let position = found + prefix.byteLength
+    let value = 0
+    let count = 0
+    while position < data.length && host.isDigit(data[position]) && count < 9 {
+        value = value * 10 + data[position] - 48
+        position += 1
+        count += 1
+    }
+    if count == 0 {
+        return fallback
+    }
+    return value
+}
+public function publish(uri: Text, version: Integer, items: List<Text>) {
+    protocol.notify("textDocument/publishDiagnostics", "{\"uri\":" + json.quote(uri) + ",\"version\":\(version),\"diagnostics\":[" + host.joined(items, ",") + "]}")
+}
+public function check(state: workspace.Workspace, root: Integer) {
+    let current = state.documents[root]
+    if current.syntax.error != "" {
+        let first = min(current.syntax.errorStart, current.text.byteLength)
+        publish(current.uri, current.version, [diagnostic(current.text, first, first, current.syntax.error, 1)])
+        return
+    }
+    let snapshot = workspace.snapshot(state, root)
+    if state.graphTruncated {
+        publish(current.uri, current.version, [diagnostic(current.text, 0, 0, "The editor can check up to 512 reachable source files at once.", 2)])
+        return
+    }
+    let sourceErrors = false
+    for item in snapshot.documents {
+        if state.documents[item].syntax.error != "" {
+            sourceErrors = true
+        }
+    }
+    if sourceErrors {
+        for item in snapshot.documents {
+            let document = state.documents[item]
+            let items: List<Text> = []
+            if document.syntax.error != "" {
+                let first = min(document.syntax.errorStart, document.text.byteLength)
+                items.add(diagnostic(document.text, first, first, document.syntax.error, 1))
+            }
+            publish(document.uri, document.version, items)
+        }
+        return
+    }
+    let result = compile(state, snapshot, state.jsonDiagnostics >= 0)
+    if state.jsonDiagnostics == 0 {
+        if result.status != 0 &&(host.hasText(result.errors, "usage: compiler") ||(host.hasText(result.errors, "--error-format") && host.hasText(result.errors, "unknown"))) {
+            state.jsonDiagnostics = - 1
+            result = compile(state, snapshot, false)
+        } else {
+            state.jsonDiagnostics = 1
+        }
+    }
+    let collected: List<List<Text>> = []
+    for unused in snapshot.documents {
+        let items: List<Text> = []
+        collected.add(items)
+    }
+    let count = 0
+    if state.jsonDiagnostics > 0 {
+        for line in host.lines(result.errors) {
+            let item = json.parse(line)
+            if item.kind != json.OBJECT || json.member(item, "message").kind != json.STRING {
+                continue
+            }
+            let target = workspace.snapshotDocument(state, snapshot, json.string(item, "file"), root)
+            let document = state.documents[target]
+            let first = workspace.originalPosition(snapshot, target, protocol.number(item, "line", 1), protocol.number(item, "column", 1))
+            let after = workspace.originalPosition(snapshot, target, protocol.number(item, "endLine", protocol.number(item, "line", 1)), protocol.number(item, "endColumn", protocol.number(item, "column", 1)))
+            let message = json.string(item, "message")
+            let label = json.string(item, "label")
+            if label != "" {
+                message += "\n" + label
+            }
+            let help = json.member(item, "help")
+            if help.kind == json.ARRAY {
+                for hint in help.items {
+                    if hint.kind == json.STRING {
+                        message += "\nhelp: " + hint.text
+                    }
+                }
+            }
+            let severity = 1
+            if json.string(item, "severity") == "warning" {
+                severity = 2
+            }
+            for position in 0..snapshot.documents.length {
+                if snapshot.documents[position] == target {
+                    collected[position].add(diagnostic(document.text, first, max(first, after), message, severity))
+                }
+            }
+            count += 1
+        }
+    }
+    if result.status != 0 && count == 0 {
+        let message = host.strip(result.errors)
+        let line = digitsAfter(message, "line ", 1)
+        let column = digitsAfter(message, "column ", 1)
+        let target = 0
+        for position in 0..snapshot.paths.length {
+            if host.hasText(message, snapshot.paths[position] + ":") {
+                target = position
+                line = digitsAfter(message, snapshot.paths[position] + ":", line)
+                break
+            }
+        }
+        if result.status == host.TIMED_OUT {
+            message = "The compiler took longer than 30 seconds to check this document."
+        }
+        else if message == "" {
+            message = "The compiler could not check this document (exit \(result.status))."
+        }
+        for position in 0..snapshot.paths.length {
+            message = host.replaceText(message, snapshot.paths[position], state.documents[snapshot.documents[position]].path)
+        }
+        let document = state.documents[snapshot.documents[target]]
+        let first = workspace.originalPosition(snapshot, snapshot.documents[target], line, column)
+        collected[target].add(diagnostic(document.text, first, first, message, 1))
+    }
+    for position in 0..snapshot.documents.length {
+        let document = state.documents[snapshot.documents[position]]
+        publish(document.uri, document.version, collected[position])
+    }
+}

@@ -1,0 +1,323 @@
+use "./lsp-workspace.min" as workspace
+use "./lsp-protocol.min" as protocol
+use "./editor-index.min" as index
+use "./driver-support.min" as host
+use "./format.min" as format
+use "json" as json
+
+record Target {
+    document: Integer
+    symbol: Integer
+}
+function absent(): Target {
+    return Target {
+        document: - 1
+        symbol: - 1
+    }
+}
+function target(document: Integer, symbol: Integer): Target {
+    return Target {
+        document: document
+        symbol: symbol
+    }
+}
+function tokenAt(document: workspace.Document, offset: Integer): Integer {
+    let tokens = document.syntax.tokens
+    for position in 0..tokens.length {
+        let token = tokens[position]
+        if token.kind == 1 && offset >= token.start && offset < token.end {
+            return position
+        }
+    }
+    for position in 0..tokens.length {
+        if tokens[position].kind == 1 && tokens[position].end == offset {
+            return position
+        }
+    }
+    return - 1
+}
+function typeTarget(state: workspace.Workspace, document: Integer, type: Text): Target {
+    let name = type
+    let angle = host.findText(name, "<", 0)
+    if angle >= 0 {
+        name = host.textSlice(name, 0, angle)
+    }
+    let parts = name.split(".")
+    if parts.length == 2 {
+        let imported = workspace.imported(state, state.documents[document], parts[0])
+        if imported >= 0 {
+            return target(imported, index.find(state.documents[imported].syntax, parts[1], 0, ""))
+        }
+    }
+    return target(document, index.find(state.documents[document].syntax, name, 0, ""))
+}
+function memberTarget(state: workspace.Workspace, document: Integer, receiver: Target, name: Text): Target {
+    if receiver.symbol < 0 || receiver.document < 0 {
+        return absent()
+    }
+    let symbol = state.documents[receiver.document].syntax.symbols[receiver.symbol]
+    let owner = concreteType(state, receiver.document, symbol.type, 0)
+    let container = symbol.type
+    if owner.symbol >= 0 {
+        let declaration = state.documents[owner.document].syntax.symbols[owner.symbol]
+        container = declaration.name
+    } else {
+        owner = target(receiver.document, - 1)
+    }
+    let found = index.find(state.documents[owner.document].syntax, name, 0, container)
+    if found < 0 {
+        return absent()
+    }
+    if owner.document != document && !state.documents[owner.document].syntax.symbols[found].exported {
+        return absent()
+    }
+    return target(owner.document, found)
+}
+function concreteType(state: workspace.Workspace, document: Integer, type: Text, depth: Integer): Target {
+    if depth > 16 {
+        return target(document, - 1)
+    }
+    let found = typeTarget(state, document, type)
+    if found.symbol >= 0 {
+        let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+        if symbol.kind == 12 || symbol.kind == 6 || symbol.kind == 26 {
+            return concreteType(state, found.document, symbol.type, depth + 1)
+        }
+    }
+    return found
+}
+function displayedType(state: workspace.Workspace, document: Integer, type: Text): Text {
+    let found = typeTarget(state, document, type)
+    if found.symbol >= 0 {
+        let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+        if symbol.kind == 12 || symbol.kind == 6 {
+            let prefix = ""
+            let components = type.split(".")
+            if components.length == 2 && !host.listed(["Integer", "Float", "Boolean", "Text", "Character", "Bytes", "Nothing"], symbol.type) && !host.hasText(symbol.type, ".") {
+                prefix = components[0] + "."
+            }
+            return prefix + symbol.type
+        }
+    }
+    return type
+}
+function resolve(state: workspace.Workspace, document: Integer, token: Integer, depth: Integer): Target {
+    if token < 0 || depth > 32 {
+        return absent()
+    }
+    let current = state.documents[document]
+    let tokens = current.syntax.tokens
+    let name = tokens[token].text
+    for position in 0..current.syntax.symbols.length {
+        let symbol = current.syntax.symbols[position]
+        if symbol.start == tokens[token].start && symbol.name == name {
+            return target(document, position)
+        }
+    }
+    if token >= 2 && tokens[token - 1].text == "." {
+        let imported = workspace.imported(state, current, tokens[token - 2].text)
+        if imported >= 0 {
+            let found = index.find(state.documents[imported].syntax, name, 0, "")
+            if found >= 0 && state.documents[imported].syntax.symbols[found].exported {
+                return target(imported, found)
+            }
+            return absent()
+        }
+        return memberTarget(state, document, resolve(state, document, token - 2, depth + 1), name)
+    }
+    let found = index.find(current.syntax, name, tokens[token].start, "")
+    if found < 0 && name == "self" {
+        found = index.find(current.syntax, name, tokens[token].start, "@self")
+    }
+    if found >= 0 {
+        return target(document, found)
+    }
+    return absent()
+}
+function selection(document: workspace.Document, symbol: index.Symbol): Text {
+    return protocol.range(document.text, symbol.start, symbol.start + symbol.name.byteLength)
+}
+public function hover(state: workspace.Workspace, document: Integer, offset: Integer): Text {
+    let token = tokenAt(state.documents[document], offset)
+    let found = resolve(state, document, token, 0)
+    if found.symbol < 0 {
+        return "null"
+    }
+    let owner = state.documents[found.document]
+    let symbol = owner.syntax.symbols[found.symbol]
+    let detail = symbol.detail
+    if symbol.kind == 13 || symbol.kind == 14 {
+        detail = host.replaceText(detail, ": " + symbol.type, ": " + displayedType(state, found.document, symbol.type))
+    }
+    let text = "```minyar\n" + detail + "\n```"
+    if symbol.documentation != "" {
+        text += "\n\n" + symbol.documentation
+    }
+    return "{\"contents\":{\"kind\":\"markdown\",\"value\":" + json.quote(text) + "},\"range\":" + protocol.range(state.documents[document].text, state.documents[document].syntax.tokens[token].start, state.documents[document].syntax.tokens[token].end) + "}"
+}
+public function definition(state: workspace.Workspace, document: Integer, offset: Integer): Text {
+    let current = state.documents[document]
+    let token = tokenAt(current, offset)
+    if token >= 0 {
+        let imported = workspace.imported(state, current, current.syntax.tokens[token].text)
+        if imported >= 0 {
+            return "{\"uri\":" + json.quote(state.documents[imported].uri) + ",\"range\":" + protocol.range(state.documents[imported].text, 0, 0) + "}"
+        }
+    }
+    let found = resolve(state, document, token, 0)
+    if found.symbol < 0 {
+        return "null"
+    }
+    let owner = state.documents[found.document]
+    return "{\"uri\":" + json.quote(owner.uri) + ",\"range\":" + selection(owner, owner.syntax.symbols[found.symbol]) + "}"
+}
+function completionKind(kind: Integer): Integer {
+    if kind == 12 {
+        return 3
+    }
+    if kind == 6 {
+        return 2
+    }
+    if kind == 8 {
+        return 5
+    }
+    if kind == 23 {
+        return 22
+    }
+    if kind == 22 {
+        return 20
+    }
+    if kind == 2 {
+        return 9
+    }
+    if kind == 14 {
+        return 21
+    }
+    return 6
+}
+function completionItem(symbol: index.Symbol): Text {
+    return "{\"label\":" + json.quote(symbol.name) + ",\"kind\":\(completionKind(symbol.kind)),\"detail\":" + json.quote(symbol.detail) + ",\"documentation\":{\"kind\":\"markdown\",\"value\":" + json.quote(symbol.documentation) + "}}"
+}
+public function completion(state: workspace.Workspace, document: Integer, offset: Integer): Text {
+    let current = state.documents[document]
+    let tokens = current.syntax.tokens
+    let dot = - 1
+    for token in 0..tokens.length {
+        if tokens[token].text == "." && tokens[token].end <= offset {
+            if token + 1 == tokens.length || tokens[token + 1].start >= offset ||(tokens[token + 1].kind == 1 && tokens[token + 1].start <= offset && tokens[token + 1].end >= offset) {
+                dot = token
+            }
+        }
+    }
+    let items: List<Text> = []
+    let names: List<Text> = []
+    let owner = document
+    let container = ""
+    let module = false
+    if dot > 0 {
+        owner = workspace.imported(state, current, tokens[dot - 1].text)
+        module = owner >= 0
+        if owner < 0 {
+            let receiver = resolve(state, document, dot - 1, 0)
+            if receiver.symbol < 0 {
+                return "[]"
+            }
+            let symbol = state.documents[receiver.document].syntax.symbols[receiver.symbol]
+            let type = concreteType(state, receiver.document, symbol.type, 0)
+            owner = receiver.document
+            container = displayedType(state, receiver.document, symbol.type)
+            if type.symbol >= 0 {
+                let declaration = state.documents[type.document].syntax.symbols[type.symbol]
+                owner = type.document
+                container = declaration.name
+            }
+        }
+    }
+    if owner < 0 {
+        return "[]"
+    }
+    for symbol in state.documents[owner].syntax.symbols {
+        if symbol.container == "@self" {
+            continue
+        }
+        if dot >= 0 {
+            if symbol.container != container {
+                continue
+            }
+            if module && symbol.scopeStart != 0 {
+                continue
+            }
+            if owner != document && !symbol.exported {
+                continue
+            }
+        } else {
+            if symbol.container != "" && symbol.kind != 22 {
+                continue
+            }
+            if !index.visible(symbol, offset) {
+                continue
+            }
+        }
+        if host.listed(names, symbol.name) {
+            continue
+        }
+        names.add(symbol.name)
+        items.add(completionItem(symbol))
+    }
+    if dot < 0 {
+        for name in ["let", "constant", "function", "record", "choice", "match", "if", "else", "for", "while", "return", "use", "public", "try", "Integer", "Float", "Boolean", "Text", "Character", "Nothing", "List", "Map", "Set", "Result", "Maybe", "print", "joinText"] {
+            if !host.listed(names, name) {
+                items.add("{\"label\":" + json.quote(name) + ",\"kind\":14}")
+            }
+        }
+    } else if !module {
+        let builtins: List<Text> = []
+        if container == "Text" {
+            builtins = ["length", "byteLength", "slice", "trim", "find", "split", "startsWith", "endsWith"]
+        }
+        else if container == "Bytes" {
+            builtins = ["length", "add", "slice", "resize", "clear", "addBytes", "getInt64", "setInt64", "getFloat32", "setFloat32"]
+        }
+        else if container == "List" || container.startsWith("List<") {
+            builtins = ["length", "add", "appended", "pop", "slice", "truncate", "clear", "sort", "sorted", "sortBy", "sortedBy"]
+        }
+        else if container.startsWith("Map<") {
+            builtins = ["length", "has", "remove", "clear"]
+        }
+        else if container.startsWith("Set<") {
+            builtins = ["length", "add", "contains", "remove", "clear"]
+        }
+        for name in builtins {
+            if !host.listed(names, name) {
+                items.add("{\"label\":" + json.quote(name) + ",\"kind\":2}")
+            }
+        }
+    }
+    return "[" + host.joined(items, ",") + "]"
+}
+public function symbols(state: workspace.Workspace, document: Integer): Text {
+    let current = state.documents[document]
+    let items: List<Text> = []
+    for symbol in current.syntax.symbols {
+        if symbol.scopeStart != 0 || symbol.container == "@self" {
+            continue
+        }
+        let name = symbol.name
+        if symbol.container != "" {
+            name = symbol.container + "." + name
+        }
+        items.add("{\"name\":" + json.quote(name) + ",\"detail\":" + json.quote(symbol.detail) + ",\"kind\":\(symbol.kind),\"range\":" + protocol.range(current.text, symbol.start, symbol.end) + ",\"selectionRange\":" + selection(current, symbol) + "}")
+    }
+    return "[" + host.joined(items, ",") + "]"
+}
+public function formatting(state: workspace.Workspace, document: Integer): Text {
+    let current = state.documents[document]
+    if current.syntax.error != "" {
+        return "[]"
+    }
+    let formatted = format.formatted(current.text)
+    if formatted == current.text {
+        return "[]"
+    }
+    return "[{\"range\":" + protocol.range(current.text, 0, current.text.byteLength) + ",\"newText\":" + json.quote(formatted) + "}]"
+}

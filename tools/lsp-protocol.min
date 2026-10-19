@@ -1,0 +1,222 @@
+use "./driver-support.min" as host
+use "files" as files
+use "json" as json
+
+public function number(value: json.Value, name: Text, fallback: Integer): Integer {
+    let item = json.member(value, name)
+    if item.kind != json.NUMBER || item.number < - 2147483648.0 || item.number > 2147483647.0 {
+        return fallback
+    }
+    let integer = Integer(item.number)
+    if Float(integer) != item.number {
+        return fallback
+    }
+    return integer
+}
+public function raw(value: json.Value): Text {
+    return json.pretty(value, "")
+}
+public function send(message: Text) {
+    let wire = "Content-Length: \(message.byteLength)\r\n\r\n" + message
+    if files.writeStandardOutput(wire) < 0 {
+        host.leave(1)
+    }
+}
+public function reply(id: json.Value, result: Text) {
+    send("{\"jsonrpc\":\"2.0\",\"id\":" + raw(id) + ",\"result\":" + result + "}")
+}
+public function error(id: json.Value, code: Integer, message: Text) {
+    send("{\"jsonrpc\":\"2.0\",\"id\":" + raw(id) + ",\"error\":{\"code\":\(code),\"message\":" + json.quote(message) + "}}")
+}
+public function notify(method: Text, params: Text) {
+    send("{\"jsonrpc\":\"2.0\",\"method\":" + json.quote(method) + ",\"params\":" + params + "}")
+}
+function hex(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 {
+        return byte - 48
+    }
+    if byte >= 65 && byte <= 70 {
+        return byte - 55
+    }
+    if byte >= 97 && byte <= 102 {
+        return byte - 87
+    }
+    return - 1
+}
+public function path(uri: Text): Text {
+    let prefix = "file://"
+    if !uri.startsWith(prefix) {
+        return ""
+    }
+    let encoded = Bytes(uri)
+    let start = 7
+    if uri.startsWith("file://localhost/") {
+        start = 16
+    }
+    if start >= encoded.length || encoded[start] != 47 {
+        return ""
+    }
+    let result = Bytes()
+    let index = start
+    while index < encoded.length {
+        let byte = encoded[index]
+        if byte == 63 || byte == 35 {
+            return ""
+        }
+        if byte == 37 {
+            if index + 2 >= encoded.length {
+                return ""
+            }
+            let high = hex(encoded[index + 1])
+            let low = hex(encoded[index + 2])
+            if high < 0 || low < 0 {
+                return ""
+            }
+            byte = high * 16 + low
+            index += 2
+        }
+        if byte == 0 {
+            return ""
+        }
+        result.add(byte)
+        index += 1
+    }
+    // Reuse the JSON decoder's UTF-8 validation before converting URI bytes.
+    let escaped = Bytes("\"")
+    for byte in result {
+        if byte == 34 || byte == 92 {
+            escaped.add(92)
+        }
+        if byte < 32 {
+            return ""
+        }
+        escaped.add(byte)
+    }
+    escaped.add(34)
+    let decoded = json.parseBytes(escaped, 1048576)
+    if decoded.kind != json.STRING {
+        return ""
+    }
+    return decoded.text
+}
+public function uri(path: Text): Text {
+    let parts: List<Text> = ["file://"]
+    let digits = "0123456789ABCDEF"
+    for byte in Bytes(path) {
+        if (byte >= 65 && byte <= 90) ||(byte >= 97 && byte <= 122) ||(byte >= 48 && byte <= 57) || byte == 47 || byte == 45 || byte == 46 || byte == 95 || byte == 126 || byte == 58 {
+            parts.add(Text(Character(byte)))
+        }
+        else {
+            parts.add("%" + Text(digits[byte / 16]) + Text(digits[byte % 16]))
+        }
+    }
+    return joinText(parts)
+}
+function width(byte: Integer): Integer {
+    if byte < 128 {
+        return 1
+    }
+    if byte < 224 {
+        return 2
+    }
+    if byte < 240 {
+        return 3
+    }
+    return 4
+}
+// LSP defaults to UTF-16 positions. Never split a surrogate pair or UTF-8 scalar.
+public function offset(text: Text, line: Integer, character: Integer): Integer {
+    if line < 0 || character < 0 {
+        return - 1
+    }
+    let bytes = Bytes(text)
+    let index = 0
+    let currentLine = 0
+    while currentLine < line && index < bytes.length {
+        if bytes[index] == 13 {
+            currentLine += 1
+            index += 1
+            if index < bytes.length && bytes[index] == 10 {
+                index += 1
+            }
+        }
+        else {
+            if bytes[index] == 10 {
+                currentLine += 1
+            }
+            index += 1
+        }
+    }
+    if currentLine != line {
+        return - 1
+    }
+    let units = 0
+    while index < bytes.length && bytes[index] != 10 && bytes[index] != 13 && units < character {
+        let count = width(bytes[index])
+        units += 1
+        if count == 4 {
+            units += 1
+        }
+        if units > character {
+            return - 1
+        }
+        index += count
+    }
+    if units != character {
+        return - 1
+    }
+    return index
+}
+public function position(text: Text, offset: Integer): Text {
+    let data = Bytes(text)
+    let line = 0
+    let character = 0
+    let index = 0
+    while index < min(offset, data.length) {
+        let count = width(data[index])
+        if data[index] == 13 {
+            line += 1
+            character = 0
+            if index + 1 < min(offset, data.length) && data[index + 1] == 10 {
+                index += 1
+            }
+        }
+        else if data[index] == 10 {
+            line += 1
+            character = 0
+        }
+        else {
+            character += 1
+            if count == 4 {
+                character += 1
+            }
+        }
+        index += count
+    }
+    return "{\"line\":\(line),\"character\":\(character)}"
+}
+public function range(text: Text, first: Integer, after: Integer): Text {
+    return "{\"start\":" + position(text, first) + ",\"end\":" + position(text, after) + "}"
+}
+public function at(text: Text, position: json.Value): Integer {
+    return offset(text, number(position, "line", - 1), number(position, "character", - 1))
+}
+public function scalarOffset(text: Text, line: Integer, column: Integer): Integer {
+    let bytes = Bytes(text)
+    // Compiler coordinates count LF lines and Unicode scalars; bare CR is
+    // whitespace in Minyar even though an editor displays it as a line break.
+    let start = 0
+    let currentLine = 1
+    while start < bytes.length && currentLine < line {
+        if bytes[start] == 10 {
+            currentLine += 1
+        }
+        start += 1
+    }
+    let remaining = max(0, column - 1)
+    while start < bytes.length && bytes[start] != 10 && remaining > 0 {
+        start += width(bytes[start])
+        remaining -= 1
+    }
+    return start
+}

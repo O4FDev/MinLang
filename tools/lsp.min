@@ -1,0 +1,312 @@
+use "./lsp-workspace.min" as workspace
+use "./lsp-protocol.min" as protocol
+use "./lsp-diagnostics.min" as diagnostics
+use "./lsp-features.min" as features
+use "./editor-host.min" as native
+use "./driver-support.min" as host
+use "files" as files
+use "json" as json
+use "process" as process
+use "system" as system
+
+function toolchain(): Text {
+    let selected = system.getenv("MINYAR_PROJECT_DIR")
+    if selected != "" {
+        return selected
+    }
+    return host.parentPath(host.parentPath(host.parentPath(host.parentPath(host.selfPath()))))
+}
+function addLibrary(state: workspace.Workspace, directory: Text) {
+    if host.listed(state.libraries, directory) {
+        return
+    }
+    let standard = state.libraries.pop()
+    state.libraries.add(directory)
+    state.libraries.add(standard)
+}
+function initialize(state: workspace.Workspace, params: json.Value) {
+    let root = protocol.path(json.string(params, "rootUri"))
+    if root == "" {
+        let folders = json.member(params, "workspaceFolders")
+        if folders.kind == json.ARRAY && folders.items.length > 0 {
+            root = protocol.path(json.string(folders.items[0], "uri"))
+        }
+    }
+    if root != "" {
+        state.root = host.resolveName(root)
+    }
+    let options = json.member(params, "initializationOptions")
+    let paths = json.member(options, "libraryPaths")
+    if paths.kind == json.ARRAY {
+        for path in paths.items {
+            if path.kind == json.STRING {
+                let resolved = path.text
+                if !resolved.startsWith("/") {
+                    resolved = state.root + "/" + resolved
+                }
+                addLibrary(state, host.resolveName(resolved))
+            }
+        }
+    }
+    // Existing lockfiles expose editable local libraries. The package manager
+    // supplies verified Git cache locations without network access or writes.
+    let lock = state.root + "/Minyar.lock"
+    if host.isFile(lock) {
+        for original in host.lines(host.readText(lock)) {
+            let line = host.strip(original)
+            if !line.startsWith("path = ") {
+                continue
+            }
+            let path = json.parse(host.textSlice(line, 7, line.byteLength))
+            if path.kind == json.STRING {
+                let resolved = path.text
+                if !resolved.startsWith("/") {
+                    resolved = state.root + "/" + resolved
+                }
+                addLibrary(state, host.resolveName(resolved + "/src"))
+            }
+        }
+        let cli = toolchain() + "/build/tooling/tools/project-cli"
+        if host.executable(cli) && host.isFile(state.root + "/Minyar.toml") {
+            let result = diagnostics.capture(state, [cli, "metadata", "--locked", "--offline", "--manifest-path", state.root])
+            if result.status == 0 {
+                let packages = json.member(json.parse(result.output), "packages")
+                if packages.kind == json.ARRAY {
+                    for package in packages.items {
+                        let manifest = json.string(package, "manifest_path")
+                        if manifest != "" {
+                            addLibrary(state, host.resolveName(host.parentPath(manifest) + "/src"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+function changed(state: workspace.Workspace, params: json.Value) {
+    let reference = json.member(params, "textDocument")
+    let uri = json.string(reference, "uri")
+    let found = workspace.loadDocument(state, uri)
+    if found < 0 || !state.documents[found].open {
+        return
+    }
+    let current = state.documents[found]
+    let version = protocol.number(reference, "version", - 1)
+    if version <= current.version {
+        return
+    }
+    let changes = json.member(params, "contentChanges")
+    if changes.kind != json.ARRAY || changes.items.length == 0 {
+        return
+    }
+    let text = current.text
+    for change in changes.items {
+        let replacement = json.member(change, "text")
+        if replacement.kind != json.STRING {
+            return
+        }
+        let range = json.member(change, "range")
+        if range.kind == json.NULL {
+            text = replacement.text
+        }
+        else {
+            let first = protocol.at(text, json.member(range, "start"))
+            let after = protocol.at(text, json.member(range, "end"))
+            if first < 0 || after < first {
+                return
+            }
+            text = host.textSlice(text, 0, first) + replacement.text + host.textSlice(text, after, text.byteLength)
+        }
+    }
+    if workspace.update(state, uri, text, version) >= 0 {
+        diagnostics.check(state, found)
+        // An unsaved imported module may change the validity of another open
+        // document. Check its root too, against the same current buffer graph.
+        for document in 0..state.documents.length {
+            if document != found && state.documents[document].open {
+                diagnostics.check(state, document)
+            }
+        }
+    }
+}
+public function run(first: Integer) {
+    system.ignoreBrokenPipes()
+    let root = toolchain()
+    let compiler = root + "/build/minyarc"
+    let libraries: List<Text> = []
+    let position = first
+    while position < process.argumentCount() {
+        let argument = process.argument(position)
+        if argument == "--help" || argument == "-h" {
+            system.writeStandardError("usage: minyar lsp [--stdio] [--compiler PATH] [--library DIRECTORY ...]\n")
+            return
+        }
+        if argument == "--stdio" {
+            position += 1
+            continue
+        }
+        if (argument == "--compiler" || argument == "--library") && position + 1 < process.argumentCount() {
+            position += 1
+            if argument == "--compiler" {
+                compiler = host.resolveName(process.argument(position))
+            }
+            else {
+                libraries.add(host.resolveName(process.argument(position)))
+            }
+        } else {
+            host.stop("unknown lsp option: " + argument)
+        }
+        position += 1
+    }
+    if host.hostName() == "Darwin" && host.isDirectory(root + "/library/platform/macos") {
+        libraries.add(root + "/library/platform/macos")
+    }
+    libraries.add(root + "/library")
+    let state = workspace.create(host.resolveName("."), compiler, libraries)
+    let initialized = false
+    let shutdown = false
+    while true {
+        let frame = native.readFrame()
+        if frame.length == 0 {
+            host.cleanup()
+            if native.frameError() != 0 {
+                system.writeStandardError("minyar lsp: invalid or truncated message frame\n")
+                exit(1)
+            }
+            if !shutdown {
+                exit(1)
+            }
+            return
+        }
+        let request = json.parseUniqueBytesWithin(frame, 16777216, 200000, 100000)
+        if request.kind == json.INVALID {
+            protocol.error(json.parse("null"), - 32700, "The message is not valid JSON.")
+            continue
+        }
+        let id = json.member(request, "id")
+        let isRequest = json.hasMember(request, "id")
+        let method = json.member(request, "method")
+        let validId = id.kind == json.STRING
+        if id.kind == json.NUMBER && id.number >= - 2147483648.0 && id.number <= 2147483647.0 {
+            validId = Float(Integer(id.number)) == id.number
+        }
+        if request.kind != json.OBJECT || json.string(request, "jsonrpc") != "2.0" || method.kind != json.STRING ||(isRequest && !validId) {
+            protocol.error(json.parse("null"), - 32600, "Expected a JSON-RPC 2.0 request or notification.")
+            continue
+        }
+        let params = json.member(request, "params")
+        if method.text == "exit" {
+            host.cleanup()
+            if shutdown {
+                return
+            }
+            exit(1)
+        }
+        if method.text == "initialize" && isRequest {
+            if initialized {
+                protocol.error(id, - 32600, "The server is already initialized.")
+                continue
+            }
+            initialize(state, params)
+            initialized = true
+            protocol.reply(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":2,\"save\":{\"includeText\":false}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"documentSymbolProvider\":true,\"documentFormattingProvider\":true},\"serverInfo\":{\"name\":\"Minyar\",\"version\":\"0.1.0\"}}")
+            continue
+        }
+        if !initialized {
+            if isRequest {
+                protocol.error(id, - 32002, "Initialize the language server first.")
+            }
+            continue
+        }
+        if shutdown {
+            if isRequest {
+                protocol.error(id, - 32600, "The language server has shut down.")
+            }
+            continue
+        }
+        if method.text == "shutdown" && isRequest {
+            shutdown = true
+            protocol.reply(id, "null")
+            continue
+        }
+        if method.text == "textDocument/didOpen" && !isRequest {
+            let item = json.member(params, "textDocument")
+            let text = json.member(item, "text")
+            if text.kind == json.STRING {
+                let found = workspace.update(state, json.string(item, "uri"), text.text, protocol.number(item, "version", 0))
+                if found >= 0 {
+                    diagnostics.check(state, found)
+                    for document in 0..state.documents.length {
+                        if document != found && state.documents[document].open {
+                            diagnostics.check(state, document)
+                        }
+                    }
+                }
+            }
+            continue
+        }
+        if method.text == "textDocument/didChange" && !isRequest {
+            changed(state, params)
+            continue
+        }
+        if method.text == "textDocument/didClose" && !isRequest {
+            let item = json.member(params, "textDocument")
+            let found = workspace.loadDocument(state, json.string(item, "uri"))
+            if found >= 0 {
+                let document = state.documents[found]
+                document.open = false
+                diagnostics.publish(document.uri, document.version, [])
+                workspace.loadDocument(state, document.uri)
+                for dependent in 0..state.documents.length {
+                    if state.documents[dependent].open {
+                        diagnostics.check(state, dependent)
+                    }
+                }
+            }
+            continue
+        }
+        if method.text == "textDocument/didSave" && !isRequest {
+            let found = workspace.loadDocument(state, json.string(json.member(params, "textDocument"), "uri"))
+            if found >= 0 {
+                diagnostics.check(state, found)
+            }
+            continue
+        }
+        if !isRequest {
+            continue
+        }
+        if !host.listed(["textDocument/documentSymbol", "textDocument/formatting", "textDocument/hover", "textDocument/definition", "textDocument/completion"], method.text) {
+            protocol.error(id, - 32601, "This method is not supported.")
+            continue
+        }
+        let document = workspace.loadDocument(state, json.string(json.member(params, "textDocument"), "uri"))
+        if document < 0 {
+            protocol.error(id, - 32602, "This request needs a readable file document.")
+            continue
+        }
+        let offset = protocol.at(state.documents[document].text, json.member(params, "position"))
+        if method.text == "textDocument/documentSymbol" {
+            protocol.reply(id, features.symbols(state, document))
+        }
+        else if method.text == "textDocument/formatting" {
+            protocol.reply(id, features.formatting(state, document))
+        }
+        else if method.text == "textDocument/hover" || method.text == "textDocument/definition" || method.text == "textDocument/completion" {
+            if offset < 0 {
+                protocol.error(id, - 32602, "The position is outside this document.")
+                continue
+            }
+            if method.text == "textDocument/hover" {
+                protocol.reply(id, features.hover(state, document, offset))
+            }
+            else if method.text == "textDocument/definition" {
+                protocol.reply(id, features.definition(state, document, offset))
+            }
+            else {
+                protocol.reply(id, features.completion(state, document, offset))
+            }
+        } else {
+            protocol.error(id, - 32601, "This method is not supported.")
+        }
+    }
+}

@@ -1,0 +1,43 @@
+use "../tools/editor-index.min" as index
+use "../tools/lsp-protocol.min" as protocol
+use "../tools/editor-source.min" as source
+use "../tools/testing.min" as test
+use "json" as json
+
+let code = "/// The home light.\npublic record Lamp { light: Integer; private secret: Text }\nfunction Lamp.glow(amount: Integer) { let hidden = 0xFE; self.light += amount }\nlet name: Text = \"moon\"\nfunction other() { let name: Integer = 42; print(name) }\nprint(name)\n"
+let syntax = index.build(code)
+test.check(syntax.error == "", "valid editor source was rejected")
+let lamp = index.find(syntax, "Lamp", 0, "")
+test.check(lamp >= 0 && syntax.symbols[lamp].documentation == "The home light." && syntax.symbols[lamp].exported, "record docs and visibility")
+let field = index.find(syntax, "light", 0, "Lamp")
+let privateField = index.find(syntax, "secret", 0, "Lamp")
+test.check(field >= 0 && syntax.symbols[field].type == "Integer" && syntax.symbols[field].exported, "field type")
+test.check(privateField >= 0 && !syntax.symbols[privateField].exported, "private fields stay private")
+let method = index.find(syntax, "glow", 0, "Lamp")
+test.check(method >= 0 && syntax.symbols[method].kind == 6, "method index")
+let global = index.find(syntax, "name", code.byteLength - 3, "")
+test.check(global >= 0 && syntax.symbols[global].type == "Text", "a closed scope leaked its local name")
+let hidden = index.find(syntax, "hidden", code.byteLength - 3, "")
+test.check(hidden < 0, "a method local leaked into module completion")
+for symbol in syntax.symbols {
+    if symbol.name == "hidden" {
+        test.check(symbol.type == "Integer", "hexadecimal inference must stay Integer")
+    }
+}
+test.check(index.build("let choice = 1\nlet type = 2\nrecord Context { choice: Integer; type: Integer }\n").symbols.length == 5, "contextual names became declarations")
+test.check(index.build("print(\"unfinished\n").error != "", "unfinished string recovery")
+test.check(index.build("print([1, 2)\n").error != "", "mismatched bracket recovery")
+let nested = source.scan("print(\"outer \\(name + \"nested \\(Integer(2))\")\")\n")
+test.check(nested.error == "" && nested.tokens.length == 5, "nested interpolation must remain one lossless literal")
+
+let text = "a🌙é\r\nb\rc\n"
+test.check(protocol.offset(text, 0, 1) == 1 && protocol.offset(text, 0, 3) == 5 && protocol.offset(text, 0, 2) == - 1, "UTF-16 surrogate boundaries")
+test.check(protocol.offset(text, 1, 0) == 9 && protocol.offset(text, 2, 0) == 11 && protocol.offset(text, 3, 0) == 13, "editor line endings")
+for offset in [0, 1, 5, 7, 9, 10, 11, 12, 13] {
+    test.check(protocol.at(text, json.parse(protocol.position(text, offset))) == offset, "position round trip at \(offset)")
+}
+test.check(protocol.scalarOffset(text, 1, 3) == 5 && protocol.scalarOffset(text, 2, 3) == 11, "compiler scalar coordinates")
+let path = "/tmp/Minyar café #星?.min"
+test.check(protocol.path(protocol.uri(path)) == path, "file URI round trip")
+test.check(protocol.path("https://example.invalid/a.min") == "" && protocol.path("file:///tmp/%00.min") == "" && protocol.path("file:///tmp/%ff.min") == "", "invalid URI rejection")
+print("editor source index, scopes, recovery, UTF-16 and URI checks passed")

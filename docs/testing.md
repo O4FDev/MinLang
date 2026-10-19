@@ -891,3 +891,13 @@ Controls require changed literal bytes and instructions to fail that comparison.
 The formatter's runnable lantern gallery has its own exact-output fixture.
 See [style](style.md) for the precise scope of this proof. The older
 `check-format` target continues to check C formatting.
+
+`make check-minyar-lsp` exercises the source index, UTF-16 and file URI mapping,
+then speaks real JSON-RPC over stdio to check incremental edits, live compiler
+diagnostics, navigation, completion, symbols and formatting. Cases include
+unsaved imported buffers, private members, configured packages, malformed
+frames/JSON/UTF-8, a missing compiler and the NDJSON diagnostic schema.
+Failures retain their source and protocol transcript. `check-minyar-tooling-ownership`
+repeats the formatter, index and complete server protocol checks at O0/O2 with
+normal-return ownership assertions; `check-minyar-tooling-sanitize` adds ASan
+and UBSan to the generated LLVM, runtime and native editor services.

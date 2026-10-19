@@ -1166,3 +1166,7 @@ Generated from the compiler by `tools/reserved-names.min`;
 Comments and literal spelling stay intact. Use `minyar fmt --check` to check
 the style without writing files, or `--stdout FILE.min` to preview one file.
 See [Minyar style](style.md) for examples and the preservation checks.
+
+`minyar lsp --stdio` provides live compiler diagnostics, hover documentation,
+definitions, completion, symbols and formatting to an editor. See
+[editor tooling](editor.md) for setup and the current navigation capabilities.

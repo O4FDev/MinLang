@@ -1,0 +1,279 @@
+use "./editor-index.min" as index
+use "./driver-support.min" as host
+use "./lsp-protocol.min" as protocol
+use "files" as files
+use "json" as json
+use "text" as textCodec
+
+public record Document {
+    uri: Text
+    path: Text
+    text: Text
+    version: Integer
+    open: Boolean
+    syntax: index.Index
+}
+public record Workspace {
+    root: Text
+    compiler: Text
+    libraries: List<Text>
+    documents: List<Document>
+    temporary: Text
+    jsonDiagnostics: Integer
+    graphTruncated: Boolean
+}
+
+public function create(root: Text, compiler: Text, libraries: List<Text>): Workspace {
+    return Workspace {
+        root: root
+        compiler: compiler
+        libraries: libraries
+        documents: []
+        temporary: ""
+        jsonDiagnostics: 0
+        graphTruncated: false
+    }
+}
+public function find(workspace: Workspace, path: Text): Integer {
+    for position in 0..workspace.documents.length {
+        if workspace.documents[position].path == path {
+            return position
+        }
+    }
+    return - 1
+}
+public function loadDocument(workspace: Workspace, uri: Text): Integer {
+    let path = protocol.path(uri)
+    if path == "" {
+        return - 1
+    }
+    path = host.resolveName(path)
+    let existing = find(workspace, path)
+    if existing >= 0 && workspace.documents[existing].open {
+        return existing
+    }
+    let loaded = host.load(path)
+    if loaded.error != 0 {
+        return - 1
+    }
+    let text = ""
+    let valid = textCodec.validUTF8(loaded.data)
+    if valid {
+        text = Text(loaded.data)
+    }
+    let syntax = index.build(text)
+    if !valid {
+        syntax.error = "This source file is not valid UTF-8."
+    }
+    if existing >= 0 {
+        workspace.documents[existing].text = text
+        workspace.documents[existing].syntax = syntax
+        return existing
+    }
+    workspace.documents.add(Document {
+        uri: protocol.uri(path)
+        path: path
+        text: text
+        version: 0
+        open: false
+        syntax: syntax
+    })
+    return workspace.documents.length - 1
+}
+public function update(workspace: Workspace, uri: Text, text: Text, version: Integer): Integer {
+    let path = protocol.path(uri)
+    if path == "" {
+        return - 1
+    }
+    path = host.resolveName(path)
+    let found = find(workspace, path)
+    if found >= 0 {
+        let old = workspace.documents[found]
+        if old.open && version <= old.version {
+            return - 1
+        }
+        old.uri = uri
+        old.text = text
+        old.version = version
+        old.open = true
+        old.syntax = index.build(text)
+        return found
+    }
+    workspace.documents.add(Document {
+        uri: uri
+        path: path
+        text: text
+        version: version
+        open: true
+        syntax: index.build(text)
+    })
+    return workspace.documents.length - 1
+}
+public function resolve(workspace: Workspace, document: Document, imported: index.Import): Text {
+    let name = imported.path
+    if name.startsWith(".") || name.startsWith("/") {
+        let path = name
+        if !name.startsWith("/") {
+            path = host.parentPath(document.path) + "/" + name
+        }
+        if host.isFile(path) {
+            return host.resolveName(path)
+        }
+        if host.isFile(path + ".min") {
+            return host.resolveName(path + ".min")
+        }
+        return ""
+    }
+    let directories = [workspace.root + "/src"]
+    for library in workspace.libraries {
+        directories.add(library)
+    }
+    for directory in directories {
+        let path = directory + "/" + name + ".min"
+        if host.isFile(path) {
+            return host.resolveName(path)
+        }
+        path = directory + "/" + name + "/" + name + ".min"
+        if host.isFile(path) {
+            return host.resolveName(path)
+        }
+    }
+    return ""
+}
+public function imported(workspace: Workspace, document: Document, name: Text): Integer {
+    for imported in document.syntax.imports {
+        if imported.name != name {
+            continue
+        }
+        let path = resolve(workspace, document, imported)
+        if path != "" {
+            return loadDocument(workspace, protocol.uri(path))
+        }
+    }
+    return - 1
+}
+
+// Load only the import graph, using every open buffer's current contents.
+// Diagnostics compile a private rewritten graph; user files are never changed.
+function graph(workspace: Workspace, document: Integer, found: List<Integer>) {
+    for existing in found {
+        if existing == document {
+            return
+        }
+    }
+    if found.length >= 512 {
+        workspace.graphTruncated = true
+        return
+    }
+    found.add(document)
+    let current = workspace.documents[document]
+    for imported in current.syntax.imports {
+        let path = resolve(workspace, current, imported)
+        if path == "" {
+            continue
+        }
+        let child = loadDocument(workspace, protocol.uri(path))
+        if child >= 0 {
+            graph(workspace, child, found)
+        }
+    }
+}
+public record Rewrite {
+    first: Integer
+    after: Integer
+    originalFirst: Integer
+    originalAfter: Integer
+}
+public record Snapshot {
+    root: Text
+    documents: List<Integer>
+    paths: List<Text>
+    sources: List<Text>
+    rewrites: List<List<Rewrite>>
+}
+public function snapshot(workspace: Workspace, root: Integer): Snapshot {
+    if workspace.temporary == "" {
+        workspace.temporary = host.resolveName(host.temporaryDirectory("", "minyar-lsp-"))
+    }
+    let found: List<Integer> = []
+    workspace.graphTruncated = false
+    graph(workspace, root, found)
+    let paths: List<Text> = []
+    let sources: List<Text> = []
+    let rewrites: List<List<Rewrite>> = []
+    for item in found {
+        paths.add(workspace.temporary + "/document-\(item).min")
+    }
+    for position in 0..found.length {
+        let current = workspace.documents[found[position]]
+        let pieces: List<Text> = []
+        let mappings: List<Rewrite> = []
+        let length = 0
+        let start = 0
+        for imported in current.syntax.imports {
+            let resolved = resolve(workspace, current, imported)
+            let replacement = ""
+            for child in 0..found.length {
+                if workspace.documents[found[child]].path == resolved {
+                    replacement = "./" + host.baseName(paths[child])
+                }
+            }
+            if replacement == "" {
+                continue
+            }
+            let prefix = host.textSlice(current.text, start, imported.start)
+            pieces.add(prefix)
+            length += prefix.byteLength
+            let literal = json.quote(replacement)
+            mappings.add(Rewrite {
+                first: length
+                after: length + literal.byteLength
+                originalFirst: imported.start
+                originalAfter: imported.end
+            })
+            pieces.add(literal)
+            length += literal.byteLength
+            start = imported.end
+        }
+        pieces.add(host.textSlice(current.text, start, current.text.byteLength))
+        let snapshotText = joinText(pieces)
+        sources.add(snapshotText)
+        rewrites.add(mappings)
+        host.writeBytes(paths[position], Bytes(snapshotText))
+    }
+    return Snapshot {
+        root: paths[0]
+        documents: found
+        paths: paths
+        sources: sources
+        rewrites: rewrites
+    }
+}
+public function originalPosition(snapshot: Snapshot, document: Integer, line: Integer, column: Integer): Integer {
+    for position in 0..snapshot.documents.length {
+        if snapshot.documents[position] != document {
+            continue
+        }
+        let offset = protocol.scalarOffset(snapshot.sources[position], line, column)
+        let delta = 0
+        for rewrite in snapshot.rewrites[position] {
+            if offset < rewrite.first {
+                return offset + delta
+            }
+            if offset < rewrite.after {
+                return rewrite.originalFirst
+            }
+            delta = rewrite.originalAfter - rewrite.after
+        }
+        return offset + delta
+    }
+    return 0
+}
+public function snapshotDocument(workspace: Workspace, snapshot: Snapshot, path: Text, fallback: Integer): Integer {
+    for position in 0..snapshot.paths.length {
+        if snapshot.paths[position] == path || host.resolveName(snapshot.paths[position]) == host.resolveName(path) {
+            return snapshot.documents[position]
+        }
+    }
+    return fallback
+}
