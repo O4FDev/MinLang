@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 LLVM_VERSION = "23.1.2"
 EXECUTABLES = [
     "minyarc", "minyarc-modules", "minyar-module-build",
-    "tooling/tools/project-cli", "tooling/tools/registry-cli",
-    "tooling/tools/clang-driver", "tooling/tools/install-cli",
+    "tooling/tools/clang-driver",
+    *("tooling/tools/" + source.stem for source in sorted((ROOT / "tools").glob("*-cli.min"))),
 ]
 RUNTIMES = [
     "minyar-default-runtime.o", "minyar-default-runtime-release.ll",

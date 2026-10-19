@@ -18,8 +18,8 @@ MINIMUM = (14, 0)
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTABLES = [
     "minyarc", "minyarc-modules", "minyar-module-build",
-    "tooling/tools/project-cli", "tooling/tools/registry-cli", "tooling/tools/clang-driver",
-    "tooling/tools/install-cli", "tooling/scripts/macos-app",
+    "tooling/tools/clang-driver", "tooling/scripts/macos-app",
+    *("tooling/tools/" + source.stem for source in sorted((ROOT / "tools").glob("*-cli.min"))),
 ]
 RUNTIMES = [
     "minyar-default-runtime.o", "minyar-default-runtime-release.ll",

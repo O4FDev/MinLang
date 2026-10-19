@@ -19,6 +19,8 @@ def main():
     for path, expected in metadata["files"].items():
         actual = hashlib.sha256((distribution / path).read_bytes()).hexdigest()
         assert actual == expected, f"release file checksum mismatch: {path}"
+    for frontend in (distribution / "tools").glob("*-cli.min"):
+        assert (distribution / "build/tooling/tools" / frontend.stem).is_file(), f"release is missing {frontend.stem}"
     print("Release manifest verified", flush=True)
     with tempfile.TemporaryDirectory(prefix="minyar clean install '") as temporary:
         work = Path(temporary)
@@ -56,6 +58,15 @@ def main():
         assert "Hello, world!" in run(command, "run", cwd=project)
         run(command, "test", cwd=project)
         run(command, "run", "--release", cwd=project)
+        if (distribution / "tools/format-cli.min").is_file():
+            source = project / "src/main.min"
+            source.write_text('function greet(){print("Hello, world!")}\ngreet()\n')
+            expected = 'function greet() {\n    print("Hello, world!")\n}\ngreet()\n'
+            assert run(command, "fmt", "--stdout", source) == expected
+            run(command, "fmt", source)
+            assert source.read_text() == expected
+            run(command, "fmt", "--check", source)
+            assert "Hello, world!" in run(command, "run", cwd=project)
         print("Fresh-home installation and debug/release project workflows passed", flush=True)
         assert (project / "target/debug/hello.dSYM").is_dir(), "debug symbols must survive staging cleanup"
         (project / "src/main.min").write_text('use "system" as system\nprint(system.processId() > 0)\n')

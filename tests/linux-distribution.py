@@ -41,6 +41,8 @@ def main():
     assert metadata["platform"] == "linux" and metadata["llvm"] == "23.1.2"
     for path, expected in metadata["files"].items():
         assert hashlib.sha256((distribution / path).read_bytes()).hexdigest() == expected, f"release checksum mismatch: {path}"
+    for frontend in (distribution / "tools").glob("*-cli.min"):
+        assert (distribution / "build/tooling/tools" / frontend.stem).is_file(), f"release is missing {frontend.stem}"
     print("Release file manifest verified", flush=True)
     checkout = Path(__file__).resolve().parent.parent
     before = {str(path.relative_to(distribution)): path.stat().st_mtime_ns for path in distribution.rglob("*")}
@@ -112,6 +114,15 @@ def main():
             for options in ([], ["--release"]):
                 assert "Hello, world!" in run(command, "run", *options, cwd=project)
                 run(command, "test", *options, cwd=project)
+            if (distribution / "tools/format-cli.min").is_file():
+                source = project / "src/main.min"
+                source.write_text('function greet(){print("Hello, world!")}\ngreet()\n')
+                expected = 'function greet() {\n    print("Hello, world!")\n}\ngreet()\n'
+                assert run(command, "fmt", "--stdout", source) == expected
+                run(command, "fmt", source)
+                assert source.read_text() == expected
+                run(command, "fmt", "--check", source)
+                assert "Hello, world!" in run(command, "run", cwd=project)
             (project / "src/main.min").write_text('use "system" as system\nprint(system.processId() > 0)\n')
             for options in ([], ["--release"]):
                 assert "true" in run(command, "run", *options, cwd=project)
