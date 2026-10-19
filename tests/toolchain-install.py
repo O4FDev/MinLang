@@ -103,6 +103,14 @@ def main():
                 return artifact
 
             first_archive = prepare("1.0.0")
+            unavailable_signer = root / "unavailable signer"
+            unavailable_signer.mkdir()
+            (unavailable_signer / "ssh-keygen").write_text("#!/bin/sh\nprintf 'No user exists for this uid\\n' >&2\nexit 1\n")
+            (unavailable_signer / "ssh-keygen").chmod(0o755)
+            signer_home = root / "signer failure"
+            signer_environment = dict(environment, MINYAR_HOME=str(signer_home), PATH=str(unavailable_signer) + os.pathsep + environment.get("PATH", os.defpath))
+            signer_error = run(["sh", public / "install", "--version", "1.0.0"], environment=signer_environment, expected="OpenSSH could not validate")
+            assert "No user exists for this uid" in signer_error and not signer_home.exists()
             first_sums = public / "releases/1.0.0/SHA256SUMS"
             first_signature = first_sums.parent / "SHA256SUMS.sig"
             original_sums, original_signature = first_sums.read_bytes(), first_signature.read_bytes()

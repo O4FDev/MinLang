@@ -83,7 +83,10 @@ if [ "${key#@}" != "$key" ]; then
 fi
 case "$key" in 'ssh-ed25519 '*) ;; *) die 'the release signing key must be an Ed25519 OpenSSH public key' ;; esac
 printf '%s\n' "$key" > "$temporary/release-key.pub"
-ssh-keygen -l -f "$temporary/release-key.pub" >/dev/null 2>&1 || die 'invalid release signing key'
+if ! ssh-keygen -l -f "$temporary/release-key.pub" > "$temporary/key-check.log" 2>&1; then
+    sed -n '1,8p' "$temporary/key-check.log" >&2
+    die 'OpenSSH could not validate the release signing key; nothing was installed'
+fi
 printf 'minyar-release namespaces="toolchain@minyar" %s\n' "$key" > "$temporary/allowed-signers"
 download() {
     curl -q --fail --silent --show-error --location --connect-timeout 15 --max-time 600 --max-filesize "$3" --proto '=http,https' --proto-redir '=https' --output "$2" -- "$1" || die "download failed: $1; check the release host and repeat this command"
