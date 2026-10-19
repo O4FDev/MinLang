@@ -754,11 +754,25 @@ print(largest([1.2, 2.7, 1.4], 0.0)) // 2.7
 
 `Equatable`, `Ordered` and `Hashable` are the supported capability names.
 Integer, Float, Text, Character and Boolean satisfy all three. Finite records
-whose fields support a capability inherit it. Lists, Bytes, callbacks, recursive
-record shapes and native record layouts need an explicit operation. A record
+whose fields support a capability inherit it. Maps and Sets support Equatable
+where their ordinary equality is defined, including as record fields; they do not
+derive Ordered or Hashable. Lists, Bytes, callbacks, recursive record shapes and
+native record layouts need an explicit operation. A record
 can constrain its type parameters in the same way as a function. The compiler
 checks each concrete argument before emitting its instantiation; constraints
 add no runtime dispatch.
+
+The errors library also shares one value/error record across its checked APIs.
+`errors.ValueResult<Item>` stores a value with an `errors.Error`. Create one with
+`errors.success(value)` or `errors.failure(fallback, error)`, and use `errors.ok`,
+`errors.value` and `errors.error` to inspect it. Reading a failed value stops the
+program; the fallback fills its storage and is not a recovery value.
+
+`errors.IntegerResult` and `errors.BooleanResult` are transparent aliases for
+`ValueResult<Integer>` and `ValueResult<Boolean>`. Their established factories,
+accessors and failure messages remain available. They keep the same two-field
+native layout. `BytesResult` retains its separate EOF, truncation and would-block
+statuses.
 
 ## Recoverable failures
 

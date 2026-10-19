@@ -35,3 +35,13 @@ check-generic-constraints-sanitize: build/minyarc-sanitize build/minyar-runtime-
 
 check check-portable: check-generic-constraints
 check-sanitize: check-generic-constraints-sanitize
+
+.PHONY: check-generic-results check-generic-results-sanitize
+check-generic-results: build/minyarc build/minyar-runtime.o build/tooling/tests/generic-results
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generic-results
+
+check-generic-results-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/generic-results
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/generic-results
+
+check check-portable: check-generic-results
+check-sanitize: check-generic-results-sanitize

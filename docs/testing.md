@@ -122,6 +122,12 @@ on functions and records, using built-in values and finite record shapes. It run
 O0/O2 ownership fixtures, capability rejections and the constraints gallery.
 `check-generic-constraints-sanitize` instruments the compiler and generated programs.
 
+`make check-generic-results` checks shared generic value/error storage and the
+IntegerResult/BooleanResult compatibility APIs at O0/O2 with ownership assertions.
+It preserves exact fatal messages and private fields and checks the results gallery.
+`check-generic-results-sanitize` adds compiler and generated-program sanitizers.
+Existing `check-errors-values` and `check-checked-results` cover the legacy APIs.
+
 `make check-library-contracts` checks JSON control-character round trips and
 strict lookup helpers, then exercises HTTP clients against local socket peers.
 Cases include truncated and malformed responses, split headers, bodyless and
