@@ -1,0 +1,317 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+record Fixture { work: Text; root: Text; script: Text; environment: List<Text>; serial: Integer }
+record Invocation { result: test.Result; capture: Text }
+
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !entry.startsWith(name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+function environment(): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() {
+        if !entry.startsWith("GIT_") && !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("MAKELEVEL=") { result.add(entry) }
+    }
+    result.add("GIT_CONFIG_NOSYSTEM=1")
+    result.add("GIT_CONFIG_GLOBAL=/dev/null")
+    result.add("LLVM_CC=snapshot-fixture-clang")
+    return result
+}
+function run(fixture: Fixture, command: List<Text>, env: List<Text>): test.Result {
+    fixture.serial += 1
+    return test.run(command, env, fixture.root, fixture.work + "/command-" + Text(fixture.serial), 60)
+}
+function success(fixture: Fixture, command: List<Text>, env: List<Text>, phase: Text): test.Result {
+    let result = run(fixture, command, env)
+    test.require(result, phase)
+    return result
+}
+function git(fixture: Fixture, arguments: List<Text>, env: List<Text>): test.Result {
+    let command = ["git"]
+    for argument in arguments { command.add(argument) }
+    return success(fixture, command, env, "snapshot fixture Git " + arguments[0])
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function paths(data: Bytes): List<Text> {
+    let result: List<Text> = []
+    let start = 0
+    for index in 0..data.length {
+        if data[index] == 0 {
+            result.add(Text(data.slice(start, index)))
+            start = index + 1
+        }
+    }
+    test.check(start == data.length, "changed path list must end with NUL")
+    return result
+}
+function samePaths(actual: List<Text>, expected: List<Text>) {
+    test.check(actual.length == expected.length, "changed path count")
+    for name in expected {
+        let count = 0
+        for item in actual { if item == name { count += 1 } }
+        test.check(count == 1, "changed path preserved exactly: " + name)
+    }
+}
+function fakeChecker(): Text {
+    return "#!/bin/sh\nset -eu\nroot=; previous=; changes=; rules=; plan=0\n" +
+        "while [ \"$#\" -gt 0 ]; do\ncase $1 in\n--root) root=$2; shift 2;;\n--previous) previous=$2; shift 2;;\n--changes) changes=$2; shift 2;;\n--rules) rules=$2; shift 2;;\n--plan) plan=1; shift;;\n*) exit 90;;\nesac\ndone\n" +
+        "[ \"${GIT_DIR+x}${GIT_COMMON_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_PREFIX+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}\" = '' ] || { echo 'Git variables leaked into private checker' >&2; exit 91; }\n" +
+        "[ \"${MAKEFLAGS+x}${MFLAGS+x}${MAKELEVEL+x}\" = '' ] || { echo 'Make variables leaked into private checker' >&2; exit 92; }\n" +
+        "[ \"$root\" = \"$MINYAR_SNAPSHOT_REPOSITORY/.git/minyar-commit-check/source\" ]\n[ \"$previous\" = \"$MINYAR_SNAPSHOT_REPOSITORY/.git/minyar-commit-check/previous\" ]\n" +
+        "if [ -f \"$root/build-support/commit-checks.mk\" ]; then [ \"$rules\" = \"$root/build-support/commit-checks.mk\" ]; else [ \"$rules\" = \"$MINYAR_SNAPSHOT_REPOSITORY/build-support/commit-checks.mk\" ]; fi\n[ -d \"$root/.git\" ] && [ -d \"$previous/.git\" ]\n" +
+        "record=$MINYAR_SNAPSHOT_RECORD\nprintf '%s' \"$root\" >\"$record/root\"\nprintf '%s' \"$previous\" >\"$record/previous-root\"\nprintf '%s' \"$plan\" >\"$record/plan\"\nprintf '%s' \"$0\" >\"$record/checker\"\n" +
+        "git -C \"$root\" rev-parse --show-toplevel >\"$record/git-root\"\ncat \"$root/payload.txt\" >\"$record/staged-payload\"\ncat \"$changes\" >\"$record/changes\"\ncat \"$rules\" >\"$record/rules\"\n" +
+        "if [ -f \"$previous/payload.txt\" ]; then cat \"$previous/payload.txt\" >\"$record/previous-payload\"; printf yes >\"$record/previous-present\"; else : >\"$record/previous-payload\"; printf no >\"$record/previous-present\"; fi\n" +
+        "mkdir -p \"$root/build\"\nif [ -f \"$root/build/cache-sentinel\" ]; then printf yes >\"$record/reused\"; else printf cached >\"$root/build/cache-sentinel\"; printf no >\"$record/reused\"; fi\n" +
+        "case ${MINYAR_SNAPSHOT_ACTION-} in\nfail) exit 37;;\nmutate) printf concurrent >\"$MINYAR_SNAPSHOT_REPOSITORY/concurrent.txt\"; git -C \"$MINYAR_SNAPSHOT_REPOSITORY\" add -- concurrent.txt;;\nesac\nprintf 'snapshot fixture: checked\\n'\n"
+}
+function fixture(work: Text, script: Text, committed: Boolean): Fixture {
+    test.check(files.makeDirectory(work) == 0, "snapshot fixture workspace")
+    let root = work + "/repository with spaces"
+    test.check(files.makeDirectory(root) == 0, "snapshot fixture repository")
+    let env = setting(environment(), "MINYAR_SNAPSHOT_REPOSITORY", root)
+    let value = Fixture { work: work; root: root; script: root + "/tools/check-commit.sh"; environment: env; serial: 0 }
+    test.check(files.makeDirectory(root + "/tools") == 0 && files.makeDirectory(root + "/build-support") == 0, "snapshot fixture tools")
+    io.writeTextFile(value.script, io.readTextFile(script))
+    io.writeTextFile(root + "/tools/fake-checker.sh", fakeChecker())
+    io.writeTextFile(root + "/Makefile", "build/tooling/tools/check-commit: tools/fake-checker.sh\n\t@mkdir -p build/tooling/tools\n\t@cp tools/fake-checker.sh $@\n\t@chmod 755 $@\n")
+    io.writeTextFile(root + "/.gitignore", "build/\n")
+    io.writeTextFile(root + "/build-support/commit-checks.mk", "fixture rules\n")
+    io.writeTextFile(root + "/payload.txt", "HEAD payload\n")
+    io.writeTextFile(root + "/stable.txt", "stable content\n")
+    io.writeTextFile(root + "/rename old.txt", "rename content\n")
+    io.writeTextFile(root + "/deleted file.txt", "deleted content\n")
+    git(value, ["init", "-q"], env)
+    git(value, ["config", "user.name", "Snapshot Fixture"], env)
+    git(value, ["config", "user.email", "snapshot-fixture@example.invalid"], env)
+    git(value, ["config", "commit.gpgsign", "false"], env)
+    git(value, ["config", "core.autocrlf", "false"], env)
+    git(value, ["add", "--", "."], env)
+    if committed { git(value, ["commit", "-qm", "initial fixture"], env) }
+    return value
+}
+function invoke(fixture: Fixture, env: List<Text>, plan: Boolean): Invocation {
+    fixture.serial += 1
+    let capture = fixture.work + "/observed-" + Text(fixture.serial)
+    test.check(files.makeDirectory(capture) == 0, "snapshot checker observation directory")
+    let command = ["/bin/sh", fixture.script]
+    if plan { command.add("--plan") }
+    let result = run(fixture, command, setting(env, "MINYAR_SNAPSHOT_RECORD", capture))
+    return Invocation { result: result; capture: capture }
+}
+function noLock(fixture: Fixture) {
+    test.check(!io.fileExists(fixture.root + "/.git/minyar-commit-check/lock"), "snapshot lock released")
+}
+function equalTime(fixture: Fixture, left: Text, right: Text) {
+    success(fixture, ["/bin/sh", "-c", "test ! \"$1\" -nt \"$2\" && test ! \"$2\" -nt \"$1\"", "minyar", left, right], fixture.environment, "cached file modification time preserved")
+}
+
+test.check(processInfo.argumentCount() <= 2, "expected optional CHECK_COMMIT_SCRIPT INSTALL_CHECK_HOOK_SCRIPT")
+let script = test.resolvePath("tools/check-commit.sh")
+if processInfo.argumentCount() >= 1 { script = test.resolvePath(processInfo.argument(0)) }
+test.check(script != "" && files.pathSize(script) > 0, "commit snapshot shell script")
+let installer = test.resolvePath("tools/install-check-hook.sh")
+if processInfo.argumentCount() == 2 { installer = test.resolvePath(processInfo.argument(1)) }
+test.check(installer != "" && files.pathSize(installer) > 0, "commit hook installer shell script")
+let work = test.scratch()
+let repository = fixture(work + "/committed", script, true)
+let root = repository.root
+let cache = root + "/.git/minyar-commit-check"
+let renamed = "renamed piece\nwith spaces.txt"
+let added = "new module\nwith spaces.min"
+io.writeTextFile(root + "/payload.txt", "staged payload\n")
+io.writeTextFile(root + "/" + added, "new staged content\n")
+git(repository, ["mv", "--", "rename old.txt", renamed], repository.environment)
+git(repository, ["rm", "--", "deleted file.txt"], repository.environment)
+git(repository, ["add", "--", "payload.txt", added], repository.environment)
+io.writeTextFile(root + "/payload.txt", "unstaged payload\n")
+io.writeTextFile(root + "/local untracked.txt", "untracked content\n")
+io.writeTextFile(root + "/build-support/commit-checks.mk", "unstaged main rules\n")
+let originalHead = git(repository, ["rev-parse", "HEAD"], repository.environment).output
+let stagedTree = git(repository, ["write-tree"], repository.environment).output
+let originalIndex = io.readBytesFile(root + "/.git/index")
+let originalEntries = git(repository, ["ls-files", "--stage", "-z"], repository.environment).output
+
+let planned = invoke(repository, repository.environment, true)
+test.require(planned.result, "staged snapshot plan")
+test.check(io.readTextFile(planned.capture + "/plan") == "1", "--plan forwarded to checker")
+test.check(io.readTextFile(planned.capture + "/staged-payload") == "staged payload\n", "staged source excludes unstaged edits")
+test.check(io.readTextFile(planned.capture + "/previous-payload") == "HEAD payload\n", "previous source is HEAD")
+test.check(io.readTextFile(planned.capture + "/rules") == "fixture rules\n", "staged rules exclude unstaged checkout changes")
+test.check(io.readTextFile(planned.capture + "/checker") == root + "/build/tooling/tools/check-commit", "missing staged planner uses main bootstrap checker")
+test.check(io.readTextFile(planned.capture + "/git-root").trim() == cache + "/source", "checker Git commands use private staged repository")
+samePaths(paths(io.readBytesFile(planned.capture + "/changes")), ["payload.txt", "deleted file.txt", "rename old.txt", renamed, added])
+test.check(!io.fileExists(cache + "/source/deleted file.txt") && io.readTextFile(cache + "/previous/deleted file.txt") == "deleted content\n", "deletion differs between staged and previous snapshots")
+test.check(!io.fileExists(cache + "/source/rename old.txt") && io.readTextFile(cache + "/source/" + renamed) == "rename content\n", "renamed path retained literally")
+test.check(io.readTextFile(cache + "/previous/rename old.txt") == "rename content\n" && !io.fileExists(cache + "/previous/" + renamed), "previous snapshot retains rename source")
+test.check(io.readTextFile(cache + "/source/" + added) == "new staged content\n" && !io.fileExists(cache + "/previous/" + added), "new filename with newline retained")
+test.check(!io.fileExists(cache + "/source/local untracked.txt"), "untracked checkout files excluded")
+test.check(same(io.readBytesFile(root + "/.git/index"), originalIndex), "original index bytes preserved")
+test.check(git(repository, ["ls-files", "--stage", "-z"], repository.environment).output == originalEntries, "original index entries preserved")
+test.check(git(repository, ["rev-parse", "HEAD"], repository.environment).output == originalHead, "original HEAD preserved")
+test.check(io.readTextFile(root + "/payload.txt") == "unstaged payload\n" && io.readTextFile(root + "/local untracked.txt") == "untracked content\n", "original worktree edits preserved")
+noLock(repository)
+
+let stamp = repository.work + "/old-time"
+success(repository, ["touch", "-t", "200101010101", cache + "/source/build/cache-sentinel", stamp], repository.environment, "cache timestamp fixtures")
+let stableStamp = repository.work + "/stable-before"
+success(repository, ["cp", "-p", cache + "/source/stable.txt", stableStamp], repository.environment, "unchanged source timestamp fixture")
+let checkerStamp = repository.work + "/checker-before"
+success(repository, ["cp", "-p", root + "/build/tooling/tools/check-commit", checkerStamp], repository.environment, "checker timestamp fixture")
+let cached = invoke(repository, repository.environment, false)
+test.require(cached.result, "cached staged snapshot")
+test.check(io.readTextFile(cached.capture + "/plan") == "0", "ordinary invocation executes checker")
+test.check(io.readTextFile(cached.capture + "/reused") == "yes" && io.readTextFile(cache + "/source/build/cache-sentinel") == "cached", "private build artifacts reused")
+equalTime(repository, cache + "/source/stable.txt", stableStamp)
+equalTime(repository, cache + "/source/build/cache-sentinel", stamp)
+equalTime(repository, root + "/build/tooling/tools/check-commit", checkerStamp)
+test.check(same(io.readBytesFile(root + "/.git/index"), originalIndex), "cache reuse preserves original index")
+
+io.writeTextFile(cache + "/source/stable.txt", "private source corruption\n")
+io.writeTextFile(cache + "/source/payload.txt", "private stale payload\n")
+let restored = invoke(repository, repository.environment, false)
+test.require(restored.result, "reset cached private source modifications")
+test.check(io.readTextFile(cache + "/source/stable.txt") == "stable content\n" && io.readTextFile(restored.capture + "/staged-payload") == "staged payload\n", "private tracked modifications reset to staged source")
+test.check(io.readTextFile(restored.capture + "/reused") == "yes", "source reset retains private build artifacts")
+equalTime(repository, cache + "/source/build/cache-sentinel", stamp)
+test.check(io.readTextFile(root + "/payload.txt") == "unstaged payload\n" && same(io.readBytesFile(root + "/.git/index"), originalIndex), "private source reset preserves original worktree and index")
+
+let alternate = repository.work + "/alternate index"
+io.writeBytesFile(alternate, originalIndex)
+let alternateEnvironment = setting(repository.environment, "GIT_INDEX_FILE", alternate)
+io.writeTextFile(root + "/payload.txt", "alternate staged payload\n")
+git(repository, ["add", "--", "payload.txt"], alternateEnvironment)
+git(repository, ["write-tree"], alternateEnvironment)
+let alternateIndex = io.readBytesFile(alternate)
+io.writeTextFile(root + "/payload.txt", "unstaged payload\n")
+for name in ["GIT_DIR", "GIT_COMMON_DIR"] { alternateEnvironment = setting(alternateEnvironment, name, root + "/.git") }
+alternateEnvironment = setting(alternateEnvironment, "GIT_WORK_TREE", root)
+alternateEnvironment = setting(alternateEnvironment, "GIT_PREFIX", "outer-prefix/")
+alternateEnvironment = setting(alternateEnvironment, "GIT_OBJECT_DIRECTORY", root + "/.git/objects")
+alternateEnvironment = setting(alternateEnvironment, "GIT_ALTERNATE_OBJECT_DIRECTORIES", root + "/.git/objects")
+alternateEnvironment = setting(alternateEnvironment, "MAKEFLAGS", "--no-print-directory")
+alternateEnvironment = setting(alternateEnvironment, "MFLAGS", "-s")
+alternateEnvironment = setting(alternateEnvironment, "MAKELEVEL", "2")
+let alternateResult = invoke(repository, alternateEnvironment, true)
+test.require(alternateResult.result, "alternate active Git index")
+test.check(io.readTextFile(alternateResult.capture + "/staged-payload") == "alternate staged payload\n", "alternate index selects staged contents")
+test.check(io.readTextFile(alternateResult.capture + "/git-root").trim() == cache + "/source", "inherited Git variables cannot redirect checker Git commands")
+test.check(same(io.readBytesFile(alternate), alternateIndex) && same(io.readBytesFile(root + "/.git/index"), originalIndex), "active alternate and ordinary indexes preserved")
+test.check(io.readTextFile(root + "/payload.txt") == "unstaged payload\n", "alternate-index check preserves worktree")
+test.check(git(repository, ["write-tree"], repository.environment).output == stagedTree, "ordinary staged tree survives alternate-index check")
+noLock(repository)
+
+let failed = invoke(repository, setting(repository.environment, "MINYAR_SNAPSHOT_ACTION", "fail"), false)
+test.check(failed.result.status == 37, "checker failure exit code propagates")
+noLock(repository)
+test.check(same(io.readBytesFile(root + "/.git/index"), originalIndex), "checker failure preserves original index")
+let recovered = invoke(repository, repository.environment, false)
+test.require(recovered.result, "lock can be acquired after checker failure")
+noLock(repository)
+test.check(files.makeDirectory(cache + "/lock") == 0, "competing lock fixture")
+let locked = invoke(repository, repository.environment, false)
+test.check(locked.result.status != 0 && test.contains(locked.result.errorOutput, "Another commit check owns"), "competing snapshot check rejected")
+test.check(io.fileExists(cache + "/lock"), "rejected checker does not remove another owner's lock")
+test.check(files.removeDirectory(cache + "/lock") == 0, "release competing lock fixture")
+
+let mutated = invoke(repository, setting(repository.environment, "MINYAR_SNAPSHOT_ACTION", "mutate"), false)
+test.check(mutated.result.status != 0 && test.contains(mutated.result.errorOutput, "staged tree changed during its checks"), "concurrent index mutation invalidates successful checker result")
+test.check(!io.fileExists(cache + "/source/concurrent.txt"), "checker ran against original captured staged tree")
+test.check(io.readTextFile(root + "/concurrent.txt") == "concurrent", "concurrent worktree change is retained")
+let currentPaths = paths(Bytes(git(repository, ["diff", "--cached", "--name-only", "--no-renames", "-z"], repository.environment).output))
+samePaths(currentPaths, ["payload.txt", "deleted file.txt", "rename old.txt", renamed, added, "concurrent.txt"])
+noLock(repository)
+let refreshed = invoke(repository, repository.environment, false)
+test.require(refreshed.result, "check can rerun after concurrent index mutation")
+test.check(io.readTextFile(cache + "/source/concurrent.txt") == "concurrent", "next snapshot includes newly staged contents")
+
+let staged = fixture(work + "/staged-planner", script, true)
+let stagedCache = staged.root + "/.git/minyar-commit-check"
+io.writeTextFile(staged.root + "/tools/check-commit.min", "staged planner marker\n")
+io.writeTextFile(staged.root + "/build-support/commit-checks.mk", "staged planner rules\n")
+git(staged, ["add", "--", "tools/check-commit.min", "build-support/commit-checks.mk"], staged.environment)
+io.writeTextFile(staged.root + "/tools/fake-checker.sh", "#!/bin/sh\nexit 88\n")
+io.writeTextFile(staged.root + "/build-support/commit-checks.mk", "unstaged planner rules\n")
+let stagedResult = invoke(staged, staged.environment, true)
+test.require(stagedResult.result, "staged planner ignores unstaged checker changes")
+test.check(io.readTextFile(stagedResult.capture + "/checker") == stagedCache + "/source/build/tooling/tools/check-commit", "planner builds and runs from staged source")
+test.check(!io.fileExists(staged.root + "/build/tooling/tools/check-commit"), "staged planner avoids building main checkout checker")
+test.check(io.readTextFile(stagedResult.capture + "/rules") == "staged planner rules\n", "staged planner uses staged rules")
+test.check(io.readTextFile(staged.root + "/tools/fake-checker.sh") == "#!/bin/sh\nexit 88\n" && io.readTextFile(staged.root + "/build-support/commit-checks.mk") == "unstaged planner rules\n", "staged planner preserves unstaged checker and rules")
+noLock(staged)
+
+git(staged, ["commit", "-qm", "add staged planner fixture"], staged.environment)
+io.writeTextFile(staged.root + "/build-support/commit-checks.mk", "staged planner rules\n")
+git(staged, ["rm", "--", "tools/check-commit.min", "build-support/commit-checks.mk"], staged.environment)
+test.check(files.makeDirectory(staged.root + "/build-support") == 0, "recreate bootstrap rules fixture directory after deletion")
+io.writeTextFile(staged.root + "/build-support/commit-checks.mk", "bootstrap fallback rules\n")
+let deletedPlanner = invoke(staged, staged.environment, false)
+test.require(deletedPlanner.result, "deleted planner uses previous source")
+test.check(io.readTextFile(deletedPlanner.capture + "/checker") == stagedCache + "/previous/build/tooling/tools/check-commit", "planner deletion selects previous clone rather than stale staged artifact")
+test.check(io.readTextFile(deletedPlanner.capture + "/rules") == "bootstrap fallback rules\n", "missing staged rules use main bootstrap fallback")
+test.check(!io.fileExists(stagedCache + "/source/tools/check-commit.min") && !io.fileExists(stagedCache + "/source/build-support/commit-checks.mk"), "staged snapshot retains workflow deletions")
+test.check(!io.fileExists(staged.root + "/build/tooling/tools/check-commit"), "previous planner avoids unstaged main checker")
+noLock(staged)
+
+let unborn = fixture(work + "/unborn", script, false)
+git(unborn, ["write-tree"], unborn.environment)
+let unbornIndex = io.readBytesFile(unborn.root + "/.git/index")
+let first = invoke(unborn, unborn.environment, true)
+test.require(first.result, "unborn HEAD staged snapshot")
+test.check(io.readTextFile(first.capture + "/previous-present") == "no", "unborn HEAD uses empty previous source")
+test.check(io.readTextFile(first.capture + "/staged-payload") == "HEAD payload\n", "unborn staged source preserved")
+test.check(same(io.readBytesFile(unborn.root + "/.git/index"), unbornIndex), "unborn index preserved")
+noLock(unborn)
+
+let hooks = fixture(work + "/hook-installer", script, true)
+test.check(files.makeDirectory(hooks.root + "/.githooks") == 0, "managed hooks directory fixture")
+let managedHook = hooks.root + "/.githooks/pre-commit"
+let managedContent = "#!/bin/sh\nexit 0\n"
+io.writeTextFile(managedHook, managedContent)
+success(hooks, ["chmod", "644", managedHook], hooks.environment, "managed hook starts nonexecutable")
+git(hooks, ["config", "--local", "core.hooksPath", "custom hooks with spaces"], hooks.environment)
+let configuredHooks = run(hooks, ["/bin/sh", installer], hooks.environment)
+test.check(configuredHooks.status != 0 && test.contains(configuredHooks.errorOutput, "Existing core.hooksPath"), "installer refuses another configured hooks directory")
+test.check(git(hooks, ["config", "--get", "core.hooksPath"], hooks.environment).output.trim() == "custom hooks with spaces", "installer preserves configured hooks directory")
+git(hooks, ["config", "--unset", "core.hooksPath"], hooks.environment)
+
+let defaultCommit = hooks.root + "/.git/hooks/pre-commit"
+let existingContent = "#!/bin/sh\nprintf 'existing hook\\n'\n"
+io.writeTextFile(defaultCommit, existingContent)
+let existingCommit = run(hooks, ["/bin/sh", installer], hooks.environment)
+test.check(existingCommit.status != 0 && test.contains(existingCommit.errorOutput, "Existing pre-commit hook"), "installer refuses an existing default pre-commit hook")
+test.check(io.readTextFile(defaultCommit) == existingContent, "existing pre-commit hook preserved")
+let absentAfterCommit = run(hooks, ["git", "config", "--get", "core.hooksPath"], hooks.environment)
+test.check(absentAfterCommit.status == 1 && absentAfterCommit.output == "", "pre-commit refusal leaves hooksPath unset")
+test.check(files.remove(defaultCommit) == 0, "remove default pre-commit fixture")
+
+let defaultPush = hooks.root + "/.git/hooks/pre-push"
+io.writeTextFile(defaultPush, existingContent)
+success(hooks, ["chmod", "755", defaultPush], hooks.environment, "active default pre-push hook fixture")
+let existingPush = run(hooks, ["/bin/sh", installer], hooks.environment)
+test.check(existingPush.status != 0 && test.contains(existingPush.errorOutput, "Active hook"), "installer refuses to disable another active default hook")
+test.check(io.readTextFile(defaultPush) == existingContent, "active default pre-push hook preserved")
+let absentAfterPush = run(hooks, ["git", "config", "--get", "core.hooksPath"], hooks.environment)
+test.check(absentAfterPush.status == 1 && absentAfterPush.output == "", "active-hook refusal leaves hooksPath unset")
+success(hooks, ["/bin/sh", "-c", "test ! -x \"$1\"", "minyar", managedHook], hooks.environment, "rejected installations preserve managed hook mode")
+test.check(files.remove(defaultPush) == 0, "remove default pre-push fixture")
+
+success(hooks, ["/bin/sh", installer], hooks.environment, "install staged commit hook")
+test.check(git(hooks, ["config", "--get", "core.hooksPath"], hooks.environment).output.trim() == ".githooks", "installer enables repository hooks directory")
+success(hooks, ["/bin/sh", "-c", "test -x \"$1\"", "minyar", managedHook], hooks.environment, "installer makes managed pre-commit executable")
+test.check(io.readTextFile(managedHook) == managedContent, "installation preserves managed hook content")
+success(hooks, ["/bin/sh", installer], hooks.environment, "repeated hook installation")
+test.check(git(hooks, ["config", "--get", "core.hooksPath"], hooks.environment).output.trim() == ".githooks", "repeated installation preserves configured repository hooks")
+
+test.removeTree(work)
+print("Commit snapshot: staged isolation, literal paths, cache reuse, index races and hook installation passed")

@@ -1,0 +1,166 @@
+use "io" as io
+use "files" as files
+use "../tools/testing.min" as test
+use "../tools/check-selection.min" as selection
+
+function member(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function write(root: Text, path: Text, source: Text) {
+    let parts = path.split("/")
+    let directory = root
+    for index in 0..(parts.length - 1) {
+        directory += "/" + parts[index]
+        test.check(files.makeDirectory(directory) == 0, "create selector fixture directory")
+    }
+    io.writeTextFile(root + "/" + path, source)
+}
+function fixture(work: Text, name: Text): Text {
+    let root = work + "/" + name
+    test.check(files.makeDirectory(root) == 0 && files.makeDirectory(root + "/library") == 0, "create selector fixture")
+    return root
+}
+function core(plan: selection.ChangePlan) {
+    let count = 0
+    for target in plan.targets { if target == "check-commit-core" { count += 1 } }
+    test.check(count == 1, "selector always retains exactly one core gate")
+}
+function broad(plan: selection.ChangePlan, message: Text) {
+    core(plan)
+    test.check(plan.broad && member(plan.targets, "check-portable"), message)
+}
+function reason(plan: selection.ChangePlan, needle: Text): Boolean {
+    for value in plan.reasons { if test.contains(value, needle) { return true } }
+    return false
+}
+function available(): List<Text> {
+    return ["check-commit-core", "check-portable", "check-core-modules", "check-native-bytes", "check-raw-syscall",
+        "check-text-basics", "check-text-basics-models", "check-collections-integration", "check-json-parser", "check-modules", "check-library-contracts",
+        "check-http", "check-shipping", "check-net", "check-net-connect", "check-net-additions", "check-net-udp-offload", "check-net-loop",
+        "check-httpserver", "check-httpserver-front", "check-peer-auth", "check-peer-auth-mutants", "check-tar", "check-formats-pipeline",
+        "check-check-selection", "check-commit-snapshot"]
+}
+
+let work = test.scratch()
+let root = fixture(work, "current")
+write(root, "library/math.min", "public function value(): Integer { return 1 }\n")
+write(root, "library/json.min", "use \"math\" as math\n")
+write(root, "library/text.min", "use \"./json.min\" as json\n")
+let checks = available()
+let plan = selection.select(root, "", ["library/math.min"], checks)
+core(plan)
+test.check(!plan.broad && plan.modules.length == 3, "transitive reverse library dependencies stay focused")
+test.check(member(plan.modules, "math") && member(plan.modules, "json") && member(plan.modules, "text"), "transitive module closure")
+for target in ["check-core-modules", "check-json-parser", "check-text-basics", "check-text-basics-models", "check-collections-integration"] {
+    test.check(member(plan.targets, target), "select complete existing check: " + target)
+}
+
+// Both platform and architecture overrides contribute edges to logical names.
+write(root, "library/http.min", "use \"text\" as text\n")
+write(root, "library/platform/macos/http.min", "use \"json\" as json\n")
+write(root, "library/update.min", "use \"http\" as http\n")
+write(root, "library/machine.min", "")
+write(root, "library/arch/arm64/machine.min", "use \"json\" as json\n")
+write(root, "library/device.min", "use \"machine\" as machine\n")
+plan = selection.select(root, "", ["library/json.min"], checks)
+core(plan)
+test.check(!plan.broad && member(plan.modules, "http") && member(plan.modules, "update"), "platform variants retain reverse dependencies")
+test.check(member(plan.modules, "machine") && member(plan.modules, "device"), "architecture variants retain reverse dependencies")
+
+let old = fixture(work, "previous")
+write(old, "library/json.min", "")
+write(old, "library/text.min", "use \"json\" as json\n")
+let removed = fixture(work, "removed-import")
+write(removed, "library/json.min", "")
+write(removed, "library/text.min", "")
+plan = selection.select(removed, old, ["library/json.min"], checks)
+core(plan)
+test.check(!plan.broad && member(plan.modules, "text"), "previous import edges survive staged removal")
+test.check(files.remove(removed + "/library/json.min") == 0, "delete staged module fixture")
+plan = selection.select(removed, old, ["library/json.min", "library/text.min"], checks)
+core(plan)
+test.check(!plan.broad && member(plan.modules, "json") && member(plan.modules, "text"), "deleted modules retain old ownership and import graph")
+write(removed, "library/math.min", "")
+broad(selection.select(removed, old, ["library/math.min"], checks), "new known-name modules require reviewed coverage")
+
+let lexical = fixture(work, "lexical")
+write(lexical, "library/math.min", "")
+write(lexical, "library/json.min", "// use \"missing\" as missing\n/* use \"alsoMissing\" as missing */\nconstant SAMPLE = \"use \\\"notImported\\\" as text\"\nconstant LETTER = 'u'\nuse /* permitted comment */ \"math\" as math\n")
+plan = selection.select(lexical, "", ["library/math.min"], checks)
+core(plan)
+test.check(!plan.broad && plan.modules.length == 2, "quoted and commented fake imports create no edges")
+write(lexical, "library/json.min", "use \"math\" as native\nfunction value(): Integer { return native.value() }\nfunction identity(native: Integer): Integer { return native }\n")
+plan = selection.select(lexical, "", ["library/math.min"], checks)
+test.check(!plan.broad && member(plan.modules, "json"), "native aliases and parameters are ordinary identifiers")
+write(lexical, "library/json.min", "use math as math\n")
+broad(selection.select(lexical, "", ["library/math.min"], checks), "unsupported real imports fail broad")
+write(lexical, "library/json.min", "use \"../outside.min\" as outside\n")
+broad(selection.select(lexical, "", ["library/math.min"], checks), "external relative import fails broad")
+write(lexical, "library/json.min", "/* unterminated\n")
+broad(selection.select(lexical, "", ["library/math.min"], checks), "unterminated comments fail broad")
+
+let native = fixture(work, "native")
+write(native, "library/net.min", "function socket(): Integer { native \"net\" }\n")
+write(native, "library/eventloop.min", "function wait(): Integer { native \"net\" }\n")
+write(native, "library/httpserver.min", "use \"eventloop\" as loop\n")
+write(native, "library/update.min", "function verify(): Boolean { native \"update\" }\n")
+write(native, "library/peerauth.min", "function verify(): Boolean { native \"update\" }\n")
+write(native, "library/tar.min", "function read(): Integer { native \"tararchive\" }\n")
+plan = selection.select(native, "", ["runtime/native/net.c"], checks)
+core(plan)
+test.check(!plan.broad && member(plan.modules, "net") && member(plan.modules, "eventloop") && member(plan.modules, "httpserver"), "native net ownership includes eventloop and dependents")
+plan = selection.select(native, "", ["runtime/native/net_loop.h"], checks)
+test.check(!plan.broad && member(plan.modules, "eventloop"), "owned native header retains namespace consumers")
+plan = selection.select(native, "", ["runtime/native/update.c"], checks)
+test.check(!plan.broad && member(plan.modules, "update") && member(plan.modules, "peerauth"), "native update ownership includes peerauth")
+plan = selection.select(native, "", ["runtime/native/tararchive.c"], checks)
+test.check(!plan.broad && member(plan.modules, "tar") && member(plan.targets, "check-tar"), "native provider names need not match library names")
+broad(selection.select(native, "", ["runtime/native/unowned.h"], checks), "unowned native header fails broad")
+broad(selection.select(native, "", ["runtime/native/unowned.c"], checks), "undeclared native namespace fails broad")
+
+write(root, "library/future.min", "")
+broad(selection.select(root, "", ["library/future.min"], checks), "unknown module cannot select an empty gate")
+broad(selection.select(root, "", ["library/deleted-unknown.min"], checks), "unknown deleted module fails broad")
+broad(selection.select(root, "", ["tests/arbitrary-fixture.c"], checks), "unmapped test fixtures fail broad")
+broad(selection.select(root, "", ["tools/testing.min", "Makefile", ".github/workflows/ci.yml"], checks), "shared harness build and CI changes fail broad")
+for path in ["tools/check-commit.min", "tools/check-commit.sh", "tools/check-selection.min", "tools/install-check-hook.sh",
+    "build-support/commit-checks.mk", ".githooks/pre-commit", "tests/check-selection.min", "tests/commit-snapshot.min"] {
+    plan = selection.select(root, "", [path], checks)
+    core(plan)
+    test.check(!plan.broad && plan.targets.length == 3 && member(plan.targets, "check-check-selection") && member(plan.targets, "check-commit-snapshot"), "explicit local workflow ownership: " + path)
+}
+plan = selection.select(root, "", ["library/text.min", "tools/check-selection.min", "tests/commit-snapshot.min"], checks)
+core(plan)
+test.check(!plan.broad && member(plan.targets, "check-text-basics") && member(plan.targets, "check-check-selection") && member(plan.targets, "check-commit-snapshot"), "mixed module and workflow changes retain both check sets")
+broad(selection.select(root, "", ["tools/check-commit.min"], ["check-commit-core", "check-portable", "check-check-selection"]), "missing workflow snapshot check fails broad")
+broad(selection.select(root, "", ["tests/check-selection.min"], ["check-commit-core", "check-portable", "check-commit-snapshot"]), "missing workflow selector check fails broad")
+broad(selection.select(root, "", ["tools/unknown-helper.min"], checks), "unknown tooling retains broad fallback")
+broad(selection.select(root, "", ["tests/unknown-test.min"], checks), "unknown test programs retain broad fallback")
+broad(selection.select(root, "", ["../outside.min"], checks), "unsupported changed paths fail broad")
+plan = selection.select(root, "", ["docs/testing.md", "README.md"], checks)
+core(plan)
+test.check(!plan.broad && plan.targets.length == 1 && plan.modules.length == 0, "documentation keeps fixed core only")
+plan = selection.select(root, "", ["compiler/stages/lexer.min", "bootstrap/stage0.c", "runtime/minyar_runtime.c"], checks)
+core(plan)
+test.check(!plan.broad && plan.targets.length == 1 && reason(plan, "deep matrices deferred to push"), "compiler runtime feedback is explicitly bounded locally")
+plan = selection.select(root, "", [], checks)
+core(plan)
+test.check(!plan.broad && plan.targets.length == 1, "empty change lists still run core")
+broad(selection.select(root, "", ["library/text.min"], ["check-commit-core", "check-portable"]), "missing focused check availability fails broad")
+plan = selection.select(root, "", ["README.md"], [])
+broad(plan, "missing core still retains required gates and fails broad")
+test.check(reason(plan, "required check unavailable: check-commit-core") && reason(plan, "required check unavailable: check-portable"), "missing mandatory targets produce actionable diagnostics")
+
+// A marker for every current logical name prevents additions from silently
+// becoming uncovered; platform/shared modules may deliberately broaden.
+let names = ["aes", "calldepth", "crypto", "deflate", "desktop", "device", "erofs", "errors", "eventcallbacks", "eventloop", "files", "graphics", "http", "http2", "httpserver", "io", "json", "keychain", "machine", "macos", "math", "net", "peerauth", "peeredge", "peergrpc", "peerlive", "peerwire", "pixels", "process", "quic", "quiccrypto", "quicdispatch", "quicinteropio", "quicrecovery", "quicretry", "quicstream", "quicwire", "random", "redis", "resp2", "results", "schannel", "securecrypto", "sha256", "system", "tar", "text", "tls", "tlsserver", "tlstickets", "tlsverify", "transport", "update", "wincert", "windows", "winnotify", "workers", "yamux", "zstd"]
+let inventory = fixture(work, "inventory")
+for name in names { write(inventory, "library/" + name + ".min", "") }
+for name in names {
+    plan = selection.select(inventory, "", ["library/" + name + ".min"], checks)
+    core(plan)
+    test.check(!reason(plan, "no reviewed check mapping"), "current logical module has explicit coverage: " + name)
+}
+test.removeTree(work)
+print("change selection: dependency, native ownership, fallback and core controls passed")

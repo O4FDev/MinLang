@@ -1,0 +1,108 @@
+use "io" as io
+use "process" as processInfo
+use "system" as system
+use "files" as files
+use "json" as json
+use "text" as text
+use "errors" as errors
+use "./testing.min" as test
+use "./check-runner.min" as runner
+use "./check-selection.min" as selection
+
+function quoted(values: List<Text>): Text {
+    let result = "["
+    for index in 0..values.length {
+        if index > 0 { result += ", " }
+        result += json.quote(values[index])
+    }
+    return result + "]"
+}
+function changedPaths(path: Text): List<Text> {
+    let raw = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot read staged change list")
+    let result: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 0 {
+            test.check(index > start, "empty staged path")
+            result.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+    }
+    test.check(start == raw.length, "staged change list must be NUL terminated")
+    return result
+}
+
+let root = ""
+let previous = ""
+let changes = ""
+let rulesFile = ""
+let jobs = 2
+let dryRun = false
+let index = 0
+while index < processInfo.argumentCount() {
+    let option = processInfo.argument(index)
+    if option == "--plan" { dryRun = true; index += 1; continue }
+    test.check(index + 1 < processInfo.argumentCount(), "commit check option requires a value: " + option)
+    let value = processInfo.argument(index + 1)
+    if option == "--root" { root = value }
+    else if option == "--previous" { previous = value }
+    else if option == "--changes" { changes = value }
+    else if option == "--rules" { rulesFile = value }
+    else if option == "--jobs" {
+        let parsed = text.parseInteger(value)
+        test.check(errors.integerOk(parsed), "invalid commit check job count")
+        jobs = errors.integerValue(parsed)
+    } else { fail("unknown commit check option: " + option) }
+    index += 2
+}
+test.check(root != "" && changes != "" && rulesFile != "", "commit checks require --root, --changes and --rules")
+let changed = changedPaths(changes)
+let plan = runner.plan(jobs, 1800, 0)
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("MAKELEVEL=") { environment.add(entry) }
+}
+let make = ["make", "-j1"]
+// A commit predating this workflow can still use its existing core checks.
+if files.pathSize(root + "/build-support/commit-checks.mk") < 0 {
+    make.add("-f"); make.add("Makefile"); make.add("-f"); make.add(rulesFile)
+}
+let main = runner.addVariant(plan, "", root, environment, make)
+let available: List<Text> = []
+for rule in plan.variants[main].rules { if rule.phony { available.add(rule.name) } }
+let selected = selection.select(root, previous, changed, available)
+// addCheck also verifies that fallback targets exist and are phony.
+for target in selected.targets { runner.addCheck(plan, main, target) }
+let description = "{\"targets\": " + quoted(selected.targets) + ", \"modules\": " + quoted(selected.modules) +
+    ", \"reasons\": " + quoted(selected.reasons) + ", \"broad\": " + Text(selected.broad) + "}"
+if dryRun {
+    print(description)
+    test.removeTree(plan.scratch)
+    exit(0)
+}
+let output = root + "/build/commit-checks"
+test.check(files.makeDirectory(output) == 0, "cannot create commit check results directory")
+let retained = output + "/run-" + Text(system.monotonicNanoseconds())
+test.require(test.run(["mv", "--", plan.scratch, retained], environment, root, output + "/move-run", 10), "retain commit check logs")
+plan.scratch = retained
+io.writeTextFile(retained + "/selection.json", description + "\n")
+print("Commit checks: " + quoted(selected.targets) + "; " + Text(selected.modules.length) + " affected modules")
+if selected.broad { print("Using portable checks: " + quoted(selected.reasons)) }
+print("Logs: " + retained)
+let started = system.monotonicNanoseconds()
+let passed = runner.run(plan)
+let elapsed = (system.monotonicNanoseconds() - started) / 1000000
+let rows: List<Text> = []
+for check in plan.checks {
+    rows.add("{\"target\": " + json.quote(check.label) + ", \"passed\": " + Text(check.state == 2) +
+        ", \"wall_ms\": " + Text(check.wall) + ", \"log\": " + json.quote(check.log) + "}")
+}
+let checks = "["
+for row in 0..rows.length { if row > 0 { checks += ", " }; checks += rows[row] }
+checks += "]"
+io.writeTextFile(retained + "/results.json", "{\"passed\": " + Text(passed) + ", \"wall_ms\": " + Text(elapsed) + ", \"checks\": " + checks + "}\n")
+let outcome = "failed"
+if passed { outcome = "passed" }
+print("Commit checks " + outcome + " in " + Text(elapsed) + " ms")
+if !passed { exit(1) }

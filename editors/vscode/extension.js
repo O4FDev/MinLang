@@ -29,6 +29,14 @@ async function activate(context) {
         pending = pending.then(restart, restart);
         return pending;
     };
+    // Package paths are discovered during LSP initialization. Refresh after
+    // init/add/remove, including projects created after the editor was opened.
+    const dependencies = vscode.workspace.createFileSystemWatcher('**/{Minyar.toml,Minyar.lock}');
+    const refreshDependencies = () => enqueue().catch(error => vscode.window.showErrorMessage(`Minyar: ${error.message}`));
+    context.subscriptions.push(dependencies,
+        dependencies.onDidCreate(refreshDependencies),
+        dependencies.onDidChange(refreshDependencies),
+        dependencies.onDidDelete(refreshDependencies));
     context.subscriptions.push(vscode.commands.registerCommand('minyar.restartServer', enqueue));
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration('minyar')) {

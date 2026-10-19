@@ -55,7 +55,8 @@ error; unknown notifications are ignored. Rename, workspace symbols and
 tree-sitter integration are future work. The server does not claim complete
 implementation of every optional LSP 3.17 feature.
 
-The [VS Code extension skeleton](../editors/vscode/README.md) includes highlighting,
-language configuration and a stdio client. Any other LSP client can launch the
+The [Cursor and VS Code extension](../editors/vscode/README.md) includes highlighting,
+language configuration, a stdio client and local VSIX installation instructions.
+Any other LSP client can launch the
 same server. `make check-minyar-lsp` runs source-index/position tests and a real
 stdio client that exercises diagnostics, UTF-16 edits and navigation.

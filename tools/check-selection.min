@@ -1,0 +1,331 @@
+use "files" as files
+
+// Local feedback is deliberately bounded. Full push-time evidence remains
+// mandatory; these mappings select complete existing checks, never test cases.
+public record ChangePlan { targets: List<Text>; modules: List<Text>; reasons: List<Text>; broad: Boolean }
+record Token { kind: Integer; value: Text }
+record Tokens { items: List<Token>; valid: Boolean }
+record Module { name: Text; path: Text; imports: List<Text>; providers: List<Text> }
+record Graph { entries: List<Module>; problems: List<Text> }
+
+function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function add(values: List<Text>, value: Text) { if !member(values, value) { values.add(value) } }
+function broaden(plan: ChangePlan, reason: Text) {
+    plan.broad = true
+    add(plan.reasons, reason)
+}
+function letter(byte: Integer): Boolean {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function word(byte: Integer): Boolean { return letter(byte) || (byte >= 48 && byte <= 57) }
+function identifier(value: Text): Boolean {
+    let raw = Bytes(value)
+    if raw.length == 0 || !letter(raw[0]) { return false }
+    for byte in raw { if !word(byte) { return false } }
+    return true
+}
+function canonical(path: Text): Boolean {
+    if path == "" || path.startsWith("/") { return false }
+    for byte in Bytes(path) { if byte == 92 || byte == 0 { return false } }
+    for part in path.split("/") { if part == "" || part == "." || part == ".." { return false } }
+    return true
+}
+function join(parts: List<Text>): Text {
+    let result = ""
+    for part in parts {
+        if result != "" { result += "/" }
+        result += part
+    }
+    return result
+}
+function parent(path: Text): Text {
+    let parts = path.split("/")
+    if parts.length > 0 { parts.pop() }
+    return join(parts)
+}
+function stem(path: Text): Text {
+    let parts = path.split("/")
+    let raw = Bytes(parts[parts.length - 1])
+    let end = raw.length
+    for index in 0..raw.length { if raw[index] == 46 { end = index; break } }
+    return Text(raw.slice(0, end))
+}
+
+// Strings and character literals remain single tokens, so text containing
+// apparent imports or native declarations cannot create dependency edges.
+function tokenize(source: Text): Tokens {
+    let raw = Bytes(source)
+    let result = Tokens { items: []; valid: true }
+    let at = 0
+    while at < raw.length {
+        let byte = raw[at]
+        if byte <= 32 { at += 1; continue }
+        if byte == 47 && at + 1 < raw.length && raw[at + 1] == 47 {
+            at += 2
+            while at < raw.length && raw[at] != 10 { at += 1 }
+            continue
+        }
+        if byte == 47 && at + 1 < raw.length && raw[at + 1] == 42 {
+            at += 2
+            while at + 1 < raw.length && !(raw[at] == 42 && raw[at + 1] == 47) { at += 1 }
+            if at + 1 >= raw.length { result.valid = false; return result }
+            at += 2
+            continue
+        }
+        if byte == 34 || byte == 39 {
+            let quote = byte
+            at += 1
+            let start = at
+            let escaped = false
+            while at < raw.length && raw[at] != quote {
+                if raw[at] == 92 { escaped = true; at += 1 }
+                at += 1
+            }
+            if at >= raw.length { result.valid = false; return result }
+            let kind = 2
+            if escaped || quote == 39 { kind = 3 }
+            result.items.add(Token { kind: kind; value: Text(raw.slice(start, at)) })
+            at += 1
+            continue
+        }
+        if letter(byte) {
+            let start = at
+            at += 1
+            while at < raw.length && word(raw[at]) { at += 1 }
+            result.items.add(Token { kind: 1; value: Text(raw.slice(start, at)) })
+            continue
+        }
+        result.items.add(Token { kind: 0; value: Text(raw.slice(at, at + 1)) })
+        at += 1
+    }
+    return result
+}
+function readModule(root: Text, path: Text, graph: Graph) {
+    let contents = files.readFile(root + "/" + path)
+    if files.lastError() != 0 { add(graph.problems, "cannot read module " + path); return }
+    let tokens = tokenize(Text(contents))
+    if !tokens.valid { add(graph.problems, "unsupported module syntax in " + path); return }
+    let entry = Module { name: stem(path); path: path; imports: []; providers: [] }
+    let at = 0
+    while at < tokens.items.length {
+        let token = tokens.items[at]
+        if token.kind == 1 && token.value == "use" {
+            if at + 3 >= tokens.items.length {
+                add(graph.problems, "unsupported import in " + path); return
+            }
+            let name = tokens.items[at + 1]
+            let alias = tokens.items[at + 2]
+            let binding = tokens.items[at + 3]
+            if name.kind != 2 || alias.kind != 1 || alias.value != "as" || binding.kind != 1 {
+                add(graph.problems, "unsupported import in " + path); return
+            }
+            add(entry.imports, name.value)
+            at += 4
+            continue
+        }
+        if token.kind == 1 && token.value == "native" {
+            // `native` also names aliases and parameters in maintained code.
+            if at + 1 < tokens.items.length && tokens.items[at + 1].kind == 2 {
+                add(entry.providers, tokens.items[at + 1].value)
+            } else if (at + 1 < tokens.items.length && tokens.items[at + 1].kind == 3) || (at > 0 && tokens.items[at - 1].value == "{") {
+                add(graph.problems, "unsupported native declaration in " + path); return
+            }
+        }
+        at += 1
+    }
+    graph.entries.add(entry)
+}
+function collect(root: Text, path: Text, depth: Integer, graph: Graph) {
+    if depth > 12 { add(graph.problems, "library directory nesting is unsupported: " + path); return }
+    let names = files.list(root + "/" + path)
+    let error = files.lastError()
+    if error == -20 { return }
+    if error != 0 { add(graph.problems, "cannot inspect library directory " + path); return }
+    names.sort()
+    for name in names {
+        let next = path + "/" + name
+        if next.endsWith(".min") { readModule(root, next, graph) }
+        else { collect(root, next, depth + 1, graph) }
+    }
+}
+function knownName(graph: Graph, name: Text): Boolean {
+    for entry in graph.entries { if entry.name == name { return true } }
+    return false
+}
+function knownPath(graph: Graph, path: Text): Boolean {
+    for entry in graph.entries { if entry.path == path { return true } }
+    return false
+}
+function resolve(graph: Graph, entry: Module, imported: Text): Text {
+    if identifier(imported) {
+        if knownName(graph, imported) { return imported }
+        return ""
+    }
+    if !imported.startsWith("./") && !imported.startsWith("../") { return "" }
+    let parts = parent(entry.path).split("/")
+    for part in imported.split("/") {
+        if part == "" || part == "." { continue }
+        if part == ".." {
+            if parts.length == 0 { return "" }
+            parts.pop()
+        } else { parts.add(part) }
+    }
+    let path = join(parts)
+    if !path.endsWith(".min") { path += ".min" }
+    if !path.startsWith("library/") || !canonical(path) { return "" }
+    if knownPath(graph, path) { return stem(path) }
+    return ""
+}
+function resolveGraph(graph: Graph) {
+    for entry in graph.entries {
+        let imports: List<Text> = []
+        for imported in entry.imports {
+            let name = resolve(graph, entry, imported)
+            if name == "" { add(graph.problems, "unresolved import " + imported + " in " + entry.path) }
+            else { add(imports, name) }
+        }
+        entry.imports = imports
+    }
+}
+
+// Each current logical module has an explicit mapping or a deliberate broad
+// marker. New modules must acquire reviewed coverage before narrowing is safe.
+function targets(name: Text): List<Text> {
+    if name == "io" || name == "math" || name == "random" || name == "process" { return ["check-core-modules"] }
+    if name == "machine" || name == "device" || name == "pixels" { return ["check-core-modules", "check-native-bytes", "check-raw-syscall"] }
+    if name == "text" { return ["check-text-basics", "check-text-basics-models", "check-collections-integration"] }
+    if name == "json" { return ["check-json-parser", "check-modules", "check-library-contracts"] }
+    if name == "errors" { return ["check-errors-values", "check-errors-language", "check-errors-review", "check-checked-results"] }
+    if name == "results" { return ["check-errors-values", "check-checked-results"] }
+    if name == "calldepth" { return ["check-calldepth", "check-calldepth-launcher", "check-calldepth-reporting", "check-calldepth-hooks"] }
+    if name == "workers" { return ["check-isolated-workers", "check-thread-runtime"] }
+    if name == "eventcallbacks" { return ["check-callbacks", "check-callback-domains", "check-net-loop"] }
+    if name == "eventloop" { return ["check-net-loop", "check-net-udp-offload"] }
+    if name == "net" { return ["check-net", "check-net-connect", "check-net-additions", "check-net-udp-offload"] }
+    if name == "files" || name == "system" { return ["check-portable"] }
+    if name == "crypto" || name == "securecrypto" || name == "aes" { return ["check-modules", "check-tls", "check-package-native-inputs"] }
+    if name == "tls" || name == "tlsserver" || name == "tlstickets" || name == "tlsverify" { return ["check-tls", "check-os-tlsverify"] }
+    if name == "http" { return ["check-http", "check-library-contracts", "check-shipping"] }
+    if name == "httpserver" { return ["check-httpserver", "check-httpserver-front", "check-library-contracts"] }
+    if name == "http2" { return ["check-http2", "check-http2-churn"] }
+    if name == "peergrpc" { return ["check-peer-grpc", "check-peer-grpc-churn", "check-peer-grpc-retire"] }
+    if name == "peerauth" { return ["check-peer-auth", "check-peer-auth-mutants"] }
+    if name == "peerwire" { return ["check-peer-wire"] }
+    if name == "peerlive" { return ["check-peer-live", "check-peer-live-redis"] }
+    if name == "peeredge" { return ["check-peer-edge", "check-peer-edge-relay", "check-peer-edge-relay-lifetime", "check-peer-edge-retry", "check-peer-edge-cids"] }
+    if name == "resp2" || name == "redis" { return ["check-redis-protocol", "check-redis-pipeline"] }
+    if name == "transport" { return ["check-transport-cancel", "check-transport-go", "check-transport-udp-fallback"] }
+    if name == "yamux" { return ["check-yamux-churn"] }
+    if name == "quic" || name == "quiccrypto" || name == "quicdispatch" || name == "quicrecovery" || name == "quicretry" || name == "quicstream" || name == "quicwire" {
+        return ["check-quic", "check-quic-ack", "check-quic-pto", "check-quic-rfc", "check-quic-amplification-ledger"]
+    }
+    if name == "quicinteropio" { return ["check-quic-interop-results", "check-quic-rfc"] }
+    if name == "sha256" { return ["check-sha256", "check-format-provider", "check-formats-pipeline"] }
+    if name == "tar" { return ["check-tar", "check-formats-pipeline"] }
+    if name == "zstd" || name == "deflate" { return ["check-compression", "check-formats-pipeline"] }
+    if name == "erofs" { return ["check-erofs", "check-erofs-layers"] }
+    if name == "update" { return ["check-shipping"] }
+    if name == "desktop" || name == "graphics" || name == "keychain" || name == "macos" || name == "schannel" || name == "wincert" || name == "windows" || name == "winnotify" { return ["check-portable"] }
+    return []
+}
+function nativeNamespaces(path: Text): List<Text> {
+    if path.startsWith("vendor/monocypher/") { return ["securecrypto", "update"] }
+    if parent(path) != "runtime/native" { return [] }
+    let name = stem(path)
+    if name == "update_ed25519" || name == "update_bundle" { return ["update"] }
+    if name == "update_monocypher" { return ["securecrypto", "update"] }
+    if name == "net_loop" || name == "net_datagrams" { return ["net"] }
+    if name == "system_process" || name == "system_windows" { return ["system"] }
+    if name == "apple_identity" || name == "windows_identity" { return ["tlsverify", "schannel", "wincert", "keychain"] }
+    if path.endsWith(".c") || path.endsWith(".m") { return [name] }
+    return []
+}
+function documentation(path: Text): Boolean {
+    return path.startsWith("docs/") || path == "README.md" || path == "AGENTS.md" || path == "LICENSE" || path == "LICENSE.md" || path == ".gitignore"
+}
+function bounded(path: Text): Boolean {
+    return path.startsWith("compiler/") || path.startsWith("bootstrap/") || (path.startsWith("runtime/") && !path.startsWith("runtime/native/"))
+}
+function workflow(path: Text): Boolean {
+    // These exact files are owned by the selector, staged-snapshot and hook
+    // installer regression checks. Other shared tooling remains conservative.
+    return member(["tools/check-commit.min", "tools/check-commit.sh", "tools/check-selection.min", "tools/install-check-hook.sh",
+        "build-support/commit-checks.mk", ".githooks/pre-commit", "tests/check-selection.min", "tests/commit-snapshot.min"], path)
+}
+function request(plan: ChangePlan, target: Text, available: List<Text>, reason: Text) {
+    if target == "check-portable" { broaden(plan, reason); return }
+    if !member(available, target) { broaden(plan, "required check unavailable: " + target + " (" + reason + ")"); return }
+    add(plan.targets, target)
+}
+
+public function select(root: Text, previousRoot: Text, changed: List<Text>, available: List<Text>): ChangePlan {
+    let plan = ChangePlan { targets: ["check-commit-core"]; modules: []; reasons: ["core local feedback; full evidence runs on push"]; broad: false }
+    if !member(available, "check-commit-core") { broaden(plan, "required check unavailable: check-commit-core") }
+    let needsGraph = false
+    for path in changed {
+        if !canonical(path) { broaden(plan, "unsupported changed path: " + path); continue }
+        if documentation(path) { continue }
+        if bounded(path) { add(plan.reasons, "bounded compiler/runtime feedback for " + path + "; deep matrices deferred to push"); continue }
+        if workflow(path) {
+            request(plan, "check-check-selection", available, "local workflow ownership: " + path)
+            request(plan, "check-commit-snapshot", available, "local workflow ownership: " + path)
+            add(plan.reasons, "selector, snapshot and hook regression coverage: " + path)
+            continue
+        }
+        if path.startsWith("library/") || path.startsWith("runtime/native/") || path.startsWith("vendor/monocypher/") { needsGraph = true; continue }
+        broaden(plan, "shared or unmapped source requires portable feedback: " + path)
+    }
+    if needsGraph {
+        let graph = Graph { entries: []; problems: [] }
+        collect(root, "library", 0, graph)
+        if previousRoot != "" && previousRoot != root { collect(previousRoot, "library", 0, graph) }
+        resolveGraph(graph)
+        for problem in graph.problems { broaden(plan, problem) }
+        for path in changed {
+            if !canonical(path) { continue }
+            if path.startsWith("library/") {
+                if !path.endsWith(".min") || !knownPath(graph, path) { broaden(plan, "unmapped library source: " + path); continue }
+                let name = stem(path)
+                add(plan.modules, name)
+                if previousRoot != "" && files.pathSize(root + "/" + path) >= 0 && files.pathSize(previousRoot + "/" + path) < 0 { broaden(plan, "new library source requires reviewed coverage: " + path) }
+                add(plan.reasons, "changed module: " + name)
+            } else if path.startsWith("runtime/native/") || path.startsWith("vendor/monocypher/") {
+                let providers = nativeNamespaces(path)
+                if providers.length == 0 { broaden(plan, "unmapped native source: " + path); continue }
+                let found = false
+                for entry in graph.entries {
+                    for provider in providers {
+                        if member(entry.providers, provider) { add(plan.modules, entry.name); found = true }
+                    }
+                }
+                if !found { broaden(plan, "native source has no declared module owner: " + path) }
+                else { add(plan.reasons, "native module ownership: " + path) }
+            }
+        }
+        let at = 0
+        while at < plan.modules.length {
+            let dependency = plan.modules[at]
+            for entry in graph.entries {
+                if member(entry.imports, dependency) && !member(plan.modules, entry.name) {
+                    add(plan.modules, entry.name)
+                    add(plan.reasons, entry.name + " depends on " + dependency)
+                }
+            }
+            at += 1
+        }
+        plan.modules.sort()
+        for name in plan.modules {
+            let checks = targets(name)
+            if checks.length == 0 { broaden(plan, "module has no reviewed check mapping: " + name) }
+            for target in checks { request(plan, target, available, "module " + name + " requires broad portable feedback") }
+        }
+    }
+    if plan.broad {
+        plan.targets = ["check-commit-core", "check-portable"]
+        if !member(available, "check-portable") { add(plan.reasons, "required check unavailable: check-portable") }
+    }
+    return plan
+}
