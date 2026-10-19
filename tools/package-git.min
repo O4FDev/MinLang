@@ -279,12 +279,13 @@ function remember(store: Text, requested: Text, source: Source) {
     }
 }
 public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pinnedHash: Text, offline: Boolean): Source {
+    if hexadecimal(requested, 40) && pinnedCommit != "" && pinnedCommit != requested { host.stop("exact Git commit " + requested + " disagrees with Minyar.lock; review the lock, then repeat minyar add " + repository + "@" + requested) }
     let source = Source { repository: repository; revision: requested; commit: pinnedCommit; checksum: pinnedHash; root: "" }
     let store = cache()
     let ref = reference(store, repository, requested)
     if source.commit == "" && host.isFile(ref) && (offline || semver(requested) || hexadecimal(requested, 40)) {
         let fields = host.lines(host.readText(ref))
-        if fields.length == 3 && hexadecimal(fields[0], 40) && hexadecimal(fields[1], 64) && validRevision(fields[2]) {
+        if fields.length == 3 && hexadecimal(fields[0], 40) && hexadecimal(fields[1], 64) && validRevision(fields[2]) && (requested == "latest" || fields[2] == requested) && (!hexadecimal(requested, 40) || fields[0] == requested) {
             source.commit = fields[0]; source.checksum = fields[1]; source.revision = fields[2]
         }
     }
@@ -305,8 +306,20 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
         url = host.resolveName(mirror) + "/" + repository + ".git"
         arguments.add("-c"); arguments.add("protocol.file.allow=always")
     }
-    arguments = host.extended(arguments, ["fetch", "--quiet", "--force", "--tags", "--no-recurse-submodules", "--", url, "+refs/heads/*:refs/heads/*"])
-    git(bare, arguments, scratch)
+    let wanted = source.commit
+    if wanted == "" && hexadecimal(requested, 40) { wanted = requested }
+    let fetched = false
+    if wanted != "" {
+        let exact = host.extended(arguments, ["fetch", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, wanted])
+        if gitTo(bare, exact, scratch + "/out", scratch + "/err") == 0 {
+            fetched = gitTo(bare, ["cat-file", "-e", wanted + "^{commit}"], scratch + "/out", scratch + "/err") == 0
+        }
+    }
+    if !fetched {
+        let fallback = host.extended(arguments, ["fetch", "--quiet", "--force", "--tags", "--no-recurse-submodules"])
+        if host.isFile(bare + "/shallow") { fallback.add("--unshallow") }
+        git(bare, host.extended(fallback, ["--", url, "+refs/heads/*:refs/heads/*"]), scratch)
+    }
     let revision = source.revision
     if revision == "latest" {
         revision = ""
@@ -319,12 +332,18 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
     let target = source.commit
     if target == "" {
         let candidates = ["refs/tags/" + revision, "refs/heads/" + revision]
-        if hexadecimal(revision, 40) || (revision.byteLength >= 7 && hexadecimal(revision, revision.byteLength)) { candidates.add(revision) }
+        if revision.byteLength >= 7 && hexadecimal(revision, revision.byteLength) {
+            let objects = host.lines(git(bare, ["rev-parse", "--disambiguate=" + revision], scratch))
+            if objects.length > 1 { host.stop("ambiguous Git commit prefix: " + repository + "@" + revision + "; use the full 40-character commit ID") }
+            if objects.length == 1 { candidates = [objects[0]] }
+            else if hexadecimal(revision, 40) { candidates = [] }
+        }
         for candidate in candidates {
             if gitTo(bare, ["rev-parse", "--verify", candidate + "^{commit}"], scratch + "/out", scratch + "/err") == 0 { target = host.strip(host.readText(scratch + "/out")); break }
         }
         if target == "" { host.stop("revision not found: " + repository + "@" + revision + "; choose an existing tag, branch or commit") }
     }
+    if hexadecimal(revision, 40) && target != revision { host.stop("the requested Git object is not a commit ID: " + revision + "; use its full commit ID") }
     let listing = git(bare, ["ls-tree", "-r", "-l", "-z", target], scratch)
     let exported = scratch + "/source"
     host.makeDirectories(exported)

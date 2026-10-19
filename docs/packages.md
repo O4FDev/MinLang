@@ -28,6 +28,11 @@ minyar add github.com/O4FDev/paint@COMMIT   # full SHA or unambiguous prefix
 transport commands, prerelease version ranges and repository subdirectories are
 not supported. Public HTTPS repositories are the initial transport contract.
 If there are no stable tags, choose a branch or commit explicitly.
+Full 40-character commit IDs always name objects, even if a repository creates a
+tag with the same name. Unambiguous object prefixes also take precedence over
+similarly named refs. Locked exact IDs must match their recorded commits. A
+missing pinned commit is fetched directly when the host permits it; ordinary
+advertised-history fetching remains a fallback for hosts that restrict SHA wants.
 
 `add` writes a source declaration and pins the resolved graph:
 
