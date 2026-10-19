@@ -38,21 +38,41 @@ def project_diagnostics(command, project, environment):
     source = project / "src/main.min"
     original = source.read_bytes()
     fields = {"version", "severity", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"}
+
+    def reject(route, expected_source, expected_text, profile):
+        options = ["--root", str(project / "target/diagnostic-install")] if route == "install" else []
+        result = subprocess.run([str(command), route, "--error-format", "json", *profile, *options],
+                                cwd=project, env=environment, text=True, capture_output=True, timeout=120)
+        assert result.returncode != 0, (route, profile, result.stdout, result.stderr)
+        diagnostics = [json.loads(line) for line in result.stderr.splitlines() if line]
+        assert diagnostics, (route, profile, result.stderr)
+        for diagnostic in diagnostics:
+            assert set(diagnostic) == fields and diagnostic["version"] == 1
+            assert diagnostic["severity"] == "error" and diagnostic["message"]
+            assert diagnostic["file"].endswith(expected_source)
+            assert diagnostic["line"] >= 1 and diagnostic["column"] >= 1
+            assert diagnostic["endLine"] >= diagnostic["line"] and isinstance(diagnostic["help"], list)
+            assert expected_text in diagnostic["sourceLine"]
+
+    embedded = project / "src/diagnostic-invariant.min"
+    legacy = project / "tests/diagnostic-failure.min"
+    assert not embedded.exists() and not legacy.exists()
     try:
         source.write_text('let count: Integer = "not an integer"\n')
-        for route in ("build", "check", "run", "test", "install"):
-            options = ["--root", str(project / "target/diagnostic-install")] if route == "install" else []
-            result = subprocess.run([str(command), route, "--error-format", "json", *options],
-                                    cwd=project, env=environment, text=True, capture_output=True, timeout=120)
-            assert result.returncode != 0, (route, result.stdout, result.stderr)
-            diagnostics = [json.loads(line) for line in result.stderr.splitlines() if line]
-            assert diagnostics, (route, result.stderr)
-            for diagnostic in diagnostics:
-                assert set(diagnostic) == fields and diagnostic["version"] == 1
-                assert diagnostic["severity"] == "error" and diagnostic["message"]
-                assert diagnostic["file"].endswith("src/main.min")
-                assert diagnostic["line"] == 1 and diagnostic["column"] >= 1
-                assert diagnostic["endLine"] >= diagnostic["line"] and isinstance(diagnostic["help"], list)
-                assert "not an integer" in diagnostic["sourceLine"]
+        for profile in ([], ["--release"]):
+            for route in ("build", "check", "run", "test", "install"):
+                reject(route, "src/main.min", "not an integer", profile)
+        source.write_bytes(original)
+        for profile in ([], ["--release"]):
+            embedded.write_text('test "unfinished\n')
+            reject("test", "src/diagnostic-invariant.min", "unfinished", profile)
+            embedded.write_text('test "invalid embedded" {\n    let count: Integer = "not an integer"\n    expect(count == 1)\n}\n')
+            reject("test", "src/diagnostic-invariant.min", "not an integer", profile)
+            embedded.unlink()
+            legacy.write_text('let count: Integer = "not an integer"\n')
+            reject("test", "tests/diagnostic-failure.min", "not an integer", profile)
+            legacy.unlink()
     finally:
         source.write_bytes(original)
+        embedded.unlink(missing_ok=True)
+        legacy.unlink(missing_ok=True)
