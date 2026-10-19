@@ -609,6 +609,8 @@ additions and removals. `==` and `!=` compare membership. Iteration visits a
 snapshot in unspecified order, and record elements use the same snapshot rules
 as Map keys. Set storage is a hash table; expected lookup, addition and removal
 take constant time apart from hashing, comparing and copying an element.
+Float elements and Float fields follow the same NaN and signed-zero rules as
+Map keys.
 
 ## Generic functions
 

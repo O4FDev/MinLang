@@ -25,7 +25,7 @@ static long long map_canonical_key(long long kind, long long key) {
         if ((bits & UINT64_C(0x7fffffffffffffff)) == 0) return 0;
         if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
             (bits & UINT64_C(0x000fffffffffffff)))
-            minyar_stop("NaN cannot be used as a Map key.");
+            minyar_stop("NaN cannot be used as a Map key or Set element.");
     }
     return key;
 }
