@@ -12,7 +12,10 @@ from separate queues and steal unfinished chunks. The caller also works, then
 waits for every worker to acknowledge completion. Worker LLVM contains no
 ownership or call-depth operations. Capture storage is allocated once per
 lexical loop in the caller's entry block, so repeated dispatch has fixed stack
-cost. The pool has no managed allocations or per-job heap allocation for
+cost. Checked byte accesses inline the buffer's pointer/length prefix and
+validate positions and byte values before loading or storing; invalid accesses
+use the ordinary runtime diagnostic. C layout assertions protect that prefix.
+The pool has no managed allocations or per-job heap allocation for
 ordinary loops. A reduction uses one profile-accounted scratch word per chunk,
 allocated and freed by the owner. Workers produce private partial sums, and
 deterministic chunk-order combination happens after the join. Integer additions
@@ -69,6 +72,11 @@ bands preserve the previous packed-pixel result. Device-backed canvases retain
 the raw adapter. The typed pixel tests compare blends, masks, coverage and
 desktop glow against those existing packed routines at O0/O2 with ownership
 checks. Coverage is a sequential prefix scan, not an independent pixel loop.
+Safe BGR0 rendering visits four byte slots per pixel, with checked scalar
+arithmetic; it can cost more CPU than the raw packed routines. The desktop
+glow confines dispatch to the damaged rows and columns, retaining each row's
+stride and padding. The Mandelbrot scaling measurements do not imply packed
+SIMD throughput for byte operations.
 
 Run `./minyar --release examples/gallery/parallel.min -o /tmp/garden`, then
 `/tmp/garden /tmp/garden.png`, for the 1200×800 Julia garden. Without arguments

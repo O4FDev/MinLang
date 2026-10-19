@@ -16,6 +16,70 @@ function parallelCaptureCast(output: List<Text>, value: Text, raw: Text, type: I
     output.add("  " + value + " = " + cast + "\n")
 }
 
+function parallelByteCalls(text: Text): Text {
+    let result: List<Text> = []
+    let first = 0
+    let cursor = 0
+    let prefix = "@minyar_bytes_"
+    while cursor + prefix.length < text.length {
+        if text.slice(cursor, cursor + prefix.length) == prefix {
+            let after = cursor + prefix.length
+            while after < text.length && text[after] != '(' && text[after] != ' ' { after = after + 1 }
+            let name = text.slice(cursor + prefix.length, after)
+            if name == "get" || name == "set" || name == "length" {
+                result.add(text.slice(first, cursor))
+                result.add("@.minyar.bytes.parallel." + name)
+                first = after
+            }
+            cursor = after
+        } else { cursor = cursor + 1 }
+    }
+    result.add(text.slice(first, text.length))
+    return joinText(result)
+}
+
+function parallelByteHelpers(): Text {
+    return "define internal i64 @.minyar.bytes.parallel.length(ptr %bytes) alwaysinline {
+entry:
+  %length.pointer = getelementptr { ptr, i64 }, ptr %bytes, i32 0, i32 1
+  %length = load i64, ptr %length.pointer
+  ret i64 %length
+}
+define internal i64 @.minyar.bytes.parallel.get(ptr %bytes, i64 %position) alwaysinline {
+entry:
+  %length = call i64 @.minyar.bytes.parallel.length(ptr %bytes)
+  %valid = icmp ult i64 %position, %length
+  br i1 %valid, label %good, label %bad
+good:
+  %data = load ptr, ptr %bytes
+  %slot = getelementptr i8, ptr %data, i64 %position
+  %byte = load i8, ptr %slot
+  %value = zext i8 %byte to i64
+  ret i64 %value
+bad:
+  %fallback = call i64 @minyar_bytes_get(ptr %bytes, i64 %position)
+  ret i64 %fallback
+}
+define internal void @.minyar.bytes.parallel.set(ptr %bytes, i64 %position, i64 %value) alwaysinline {
+entry:
+  %length = call i64 @.minyar.bytes.parallel.length(ptr %bytes)
+  %position.valid = icmp ult i64 %position, %length
+  %value.valid = icmp ult i64 %value, 256
+  %valid = and i1 %position.valid, %value.valid
+  br i1 %valid, label %good, label %bad
+good:
+  %data = load ptr, ptr %bytes
+  %slot = getelementptr i8, ptr %data, i64 %position
+  %byte = trunc i64 %value to i8
+  store i8 %byte, ptr %slot
+  ret void
+bad:
+  call void @minyar_bytes_set(ptr %bytes, i64 %position, i64 %value)
+  ret void
+}
+"
+}
+
 function parallelWorkerBody(text: Text): Text {
     let result: List<Text> = []
     let first = 0
@@ -32,10 +96,12 @@ function parallelWorkerBody(text: Text): Text {
         cursor = cursor + 1
     }
     result.add(text.slice(first, text.length))
-    return joinText(result)
+    return parallelByteCalls(joinText(result))
 }
 
 function outlineParallelFor(context: CompilerContext, captures: List<Text>, types: List<Integer>, ids: List<Integer>, firstLocal: Integer, start: Integer, body: Integer, parts: List<Integer>, guards: List<Integer>, parentBlock: Text, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+    let bytesMarker = "; minyar-data-parallel-bytes: 1\n"
+    if findText(globals, bytesMarker) < 0 { globals.add(bytesMarker); globals.add(parallelByteHelpers()) }
     let loopEnd = output.length
     textState[0] = parentBlock
     emitParallelAliasGuards(types, ids, guards, parts, state, textState, output, globals)
