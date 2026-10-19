@@ -1,5 +1,11 @@
 # Testing strategy
 
+`make check-module-tests` checks contextual in-module tests, private access,
+single evaluation, source/value failure reports, rejection diagnostics and
+ordinary-build exclusion. Successful fixtures and the living-tests gallery
+run at O0/O2 with ownership assertions. Project CLI discovery includes nested
+modules and dependencies and preserves the existing integration-test runner.
+
 Use `make check-portable` for the cross-platform compiler/runtime gate and
 `make check` for the broader local suite, including absolute performance
 budgets. `make check-examples` runs the executable examples and rejecting

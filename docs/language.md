@@ -7,6 +7,43 @@ interoperability. Their value types and additional syntax are outside this
 contract. An alternative compiler must pass the same language conformance
 tests before it can become a Minyar backend.
 
+## Tests beside the code
+
+A module can keep named tests beside its declarations. Tests can use private
+functions and fields in their own module:
+
+```minyar
+function double(value: Integer): Integer { return value * 2 }
+
+test "two small numbers make something whole" {
+    expect(double(21) == 42)
+}
+```
+
+`minyar test` discovers tests in every `src` directory in the resolved project
+and its dependencies, including nested modules. Each test runs in a separate
+process; a failed test does not prevent the remaining tests from running.
+Existing `tests/*.min` programs run too. A substring filter matches module
+paths, test names and integration-test filenames.
+
+`expect(condition)` requires a Boolean. A failed expectation includes its
+source expression and file:line:column. A direct comparison also shows the
+right and left values, evaluated once from left to right. Scalars and finite
+records render their values; collection fields show their type. Compound
+Boolean conditions keep ordinary short-circuit evaluation.
+
+Discovery reads source without running module initializers or linking modules
+which contain no tests. The low-level `--list-tests` option prints each case
+index followed by a tab and its JSON-quoted name.
+
+Tests are omitted from ordinary builds, including their literals and runtime
+features. Their bodies are checked when testing. Module initializers run in
+each test process; the application entry point and executable top-level
+statements do not. `test` and `expect` remain ordinary identifiers outside
+their test syntax. The low-level `--test-mode` compiler/launcher option builds
+a module's test executable; run it with `--list`, a zero-based case index, or
+no argument to run its cases in order.
+
 ## Bindings and scope
 
 `let` introduces a local value. A name exists from its declaration to the end

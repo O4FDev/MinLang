@@ -29,6 +29,7 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/errors-compiler.min \
 	compiler/choice-compiler.min \
 	compiler/choice-generic.min \
+	compiler/test-compiler.min \
 	compiler/calldepth-compiler.min \
 	compiler/thread-compiler.min \
 	compiler/compiler.min

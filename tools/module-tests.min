@@ -1,0 +1,73 @@
+use "./project.min" as project
+use "./driver-support.min" as host
+use "system" as system
+use "json" as json
+
+public record Report { count: Integer; failures: Integer }
+
+public function sources(graph: project.Graph): List<Text> {
+    let result: List<Text> = []
+    for package in graph.packages {
+        let directory = package.root + "/src"
+        if !host.isDirectory(directory) { continue }
+        let paths: List<Text> = []
+        host.walk(directory, "", paths)
+        for path in paths { if path.endsWith(".min") { result.add(directory + "/" + path) } }
+    }
+    return result
+}
+
+public function compilerArguments(graph: project.Graph, compiler: Text): List<Text> {
+    let arguments = [compiler]
+    for package in graph.packages {
+        if project.hasLibrary(package) { arguments.add("--library"); arguments.add(package.root + "/src") }
+    }
+    return arguments
+}
+
+function execute(arguments: List<Text>, directory: Text): Integer {
+    let child = system.spawn(arguments[0], arguments, system.environment(), directory)
+    if child < 0 { host.stop("cannot start test: " + arguments[0]) }
+    let status = system.wait(child)
+    if status.state == system.SIGNALED { return 128 + status.signal }
+    if status.state != system.EXITED { host.stop("cannot wait for test: " + arguments[0]) }
+    return status.exitCode
+}
+
+public function run(graph: project.Graph, compiler: Text, directory: Text, release: Boolean, filter: Text, forwarded: List<Text>): Report {
+    let report = Report { count: 0; failures: 0 }
+    let serial = 0
+    for source in sources(graph) {
+        let discover = compilerArguments(graph, compiler)
+        discover.add("--list-tests")
+        discover.add(source)
+        let listing = host.capture(discover, 120)
+        if listing.status != 0 { host.stop("cannot discover module tests: " + source + "\n" + listing.errors) }
+        if listing.output == "" { continue }
+        let output = directory + "/module-" + Text(serial)
+        serial += 1
+        let command = compilerArguments(graph, compiler)
+        command.add("--test-mode")
+        if release { command.add("--release") } else { command.add("--debug") }
+        for item in [source, "-o", output] { command.add(item) }
+        if execute(command, graph.packages[0].root) != 0 { host.stop("cannot build module tests: " + source) }
+        for row in host.lines(listing.output) {
+            let tab = row.find("\t")
+            if tab < 0 { host.stop("invalid module test listing: " + source + "\n" + row) }
+            let index = row.slice(0, tab)
+            let parsed = json.parse(row.slice(tab + 1, row.length))
+            if parsed.kind != json.STRING { host.stop("invalid module test name: " + source) }
+            let name = parsed.text
+            if filter != "" && !host.hasText(source, filter) && !host.hasText(name, filter) { continue }
+            report.count += 1
+            let arguments = [output, index]
+            for argument in forwarded { arguments.add(argument) }
+            let status = execute(arguments, graph.packages[0].root)
+            if status != 0 {
+                report.failures += 1
+                system.writeStandardError("  × " + name + " · " + source + " (exit " + Text(status) + ")\n")
+            } else { print("  ✓ " + name + " · " + source) }
+        }
+    }
+    return report
+}

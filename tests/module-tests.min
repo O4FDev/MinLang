@@ -1,0 +1,100 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "system" as system
+use "../tools/driver-support.min" as host
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let compiler = frontend.compiler
+let levels = ["-O0", "-O2"]
+let environment = system.environment()
+let wrapper = compiler.directory + "/test-compiler"
+io.writeTextFile(wrapper, "#!/bin/sh\nexec " + host.shellQuote(compiler.executable) + " \"$@\" --test-mode --bounded-owners 32\n")
+test.require(test.run(["chmod", "+x", wrapper], environment, "", compiler.directory + "/chmod", 10), "test compiler wrapper")
+compiler.executable = wrapper
+
+fixtures.executes(frontend, #"""
+    record Light { name: Text; strength: Integer }
+    type Words = List<Text>
+    global visits: List<Integer> = [0]
+    function next(): Integer { visits[0] += 1; return visits[0] }
+    function privateLight(): Light { return Light { name: "held"; strength: 42 } }
+    test "private declarations and single evaluation" {
+        expect(((next() == 1)))
+        expect(visits[0] == 1)
+        expect(privateLight() == Light { name: "held"; strength: 42 })
+        let words: Words = ["hello", "harbour"]
+        expect(words[1] == "harbour")
+        expect(true || next() > 100)
+        expect(visits[0] == 1)
+        print("lit")
+    }
+    function main() { fail("the application entry must not run") }
+    """#, "lit\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/living-tests.min"), "", levels, 0, "", true)
+fixtures.executes(frontend, #"""
+    test "ordinary names retain their scopes" {
+        let test = 42
+        if true {
+            let expect = function(value: Integer): Integer { return value }
+            print(expect(test))
+        }
+        expect(test == 42)
+    }
+    """#, "42\n", levels, 0, "", true)
+fixtures.executes(frontend, "function expect(value: Integer): Integer { return value }\ntest \"a user function wins\" { print(expect(42)) }\n", "42\n", levels, 0, "", true)
+fixtures.executes(frontend, #"""
+    test "callback and loop parameters stay ordinary names" {
+        let invoke: (() -> Integer) -> Integer = function(expect) { return expect() }
+        print(invoke(function(): Integer { return 42 }))
+        let callbacks: List<(Integer) -> Integer> = [function(value) { return value }]
+        for expect in callbacks { print(expect(42)) }
+        expect(true)
+    }
+    """#, "42\n42\n", levels, 0, "", true)
+fixtures.rejects(frontend, "test \"bad condition\" { expect(42) }\n", "expect needs a Boolean condition", true)
+fixtures.rejects(frontend, "test \"same\" {}\ntest \"same\" {}\n", "already has a test with that name", true)
+fixtures.rejects(frontend, "test \"\" {}\n", "a test needs a nonempty name", true)
+fixtures.rejects(frontend, "test \"open\" { expect(true)\n", "missing its closing delimiter", true)
+
+// The diagnostic contains actual values, the exact source expression and its
+// location; both optimization levels must agree on the complete report.
+test.require(fixtures.compile(frontend, "test \"values\" { expect((2 + 2 == 3)) }\n"), "compile failing expectation")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+for level in levels {
+    test.require(test.run([compiler.clang, level, "-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"], environment, "", path + ".link", 30), "link failure report")
+    let result = test.run([path + ".exe"], environment, "", path + ".run", 10)
+    test.check(result.status == 1 && result.output == "", "failed expectation exits")
+    test.check(test.contains(result.errorOutput, path + ".min:1:17: expectation failed\n  expect((2 + 2 == 3))\n  expected 3, got 4"), "source and comparison values\n" + result.errorOutput)
+}
+
+for source in [
+    "record Light { name: Text; strength: Integer }\ntest \"record values\" { expect(Light { name: \"a\"; strength: 1 } == Light { name: \"b\"; strength: 2 }) }\n",
+    "choice Sky { Night; Day(name: Text) }\ntest \"choice values\" { expect(Sky.Night == Sky.Day(\"dawn\")) }\n"
+] {
+    test.require(fixtures.compile(frontend, source), "compile structural failure report")
+    let structural = compiler.directory + "/case" + Text(compiler.serial)
+    for level in levels {
+        test.require(test.run([compiler.clang, level, "-Wno-override-module", structural + ".ll", compiler.runtime, "-lm", "-o", structural + ".exe"], environment, "", structural + ".link", 30), "link structural failure report")
+        let result = test.run([structural + ".exe"], environment, "", structural + ".run", 10)
+        test.check(result.status == 1, "structural failure exits")
+        let expected = "expected Day(\"dawn\"), got Night"
+        if source.startsWith("record") { expected = "expected Light { name: \"b\", strength: 2 }, got Light { name: \"a\", strength: 1 }" }
+        test.check(test.contains(result.errorOutput, expected), "structural values\n" + result.errorOutput)
+    }
+}
+
+compiler.executable = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+fixtures.executes(frontend, #"""
+    function test(value: Integer): Integer { return value }
+    function expect(value: Integer): Integer { return value }
+    test "excluded" { deliberatelyUnknown(); expect(unknown == 0); print("unreachable literal"); startThread(unknown) }
+    print(test(expect(42)))
+    """#, "42\n", levels, 0, "", true)
+let ordinary = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(!test.contains(ordinary, "unreachable literal") && !test.contains(ordinary, "test expectation") && !test.contains(ordinary, "minyar-thread-runtime"), "ordinary builds contain no test code, literals or runtime features")
+fixtures.executes(frontend, io.readTextFile("examples/gallery/living-tests.min"), "The harbour: 42 lights for you, 42 for me.\n", levels, 0, "", true)
+test.removeTree(compiler.directory)
+print("Module tests: passed")
