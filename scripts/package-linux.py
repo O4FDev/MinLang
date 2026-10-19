@@ -31,7 +31,9 @@ def run(*arguments, **options):
 
 
 def output(*arguments, **options):
-    return run(*arguments, text=True, capture_output=True, **options).stdout
+    environment = dict(options.pop("env", os.environ))
+    environment["LC_ALL"] = "C"
+    return run(*arguments, text=True, capture_output=True, env=environment, **options).stdout
 
 
 def copy(source, target):
