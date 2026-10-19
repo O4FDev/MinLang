@@ -58,6 +58,14 @@ def main():
         assert "Hello, world!" in run(command, "run", cwd=project)
         run(command, "test", cwd=project)
         run(command, "run", "--release", cwd=project)
+        if (distribution / "tools/module-tests.min").is_file():
+            module = project / "src/invariant.min"
+            module.write_text('function answer(): Integer { return 42 }\nprint("application statement must stay excluded")\ntest "archive invariant" {\n    expect(answer() == 42)\n    print("archive module test passed")\n}\n')
+            for options in ([], ["--release"]):
+                report = run(command, "test", *options, cwd=project)
+                assert "archive module test passed" in report and "archive invariant" in report
+                assert "application statement must stay excluded" not in report
+            module.unlink()
         if (distribution / "tools/format-cli.min").is_file():
             source = project / "src/main.min"
             source.write_text('function greet(){print("Hello, world!")}\ngreet()\n')
