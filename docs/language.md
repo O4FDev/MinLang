@@ -938,6 +938,8 @@ recovers on failure; a Result passes its error and may change the error type,
 while a Maybe calls its no-argument callback. Success skips these recovery
 callbacks. `Maybe.filter(predicate)` keeps a value only when the predicate
 holds; `okOr(error)` and `okOrElse(callback)` turn absence into a Result error.
+The same methods work when Maybe is explicitly imported as `maybe.Maybe<T>`;
+maps and recovery preserve that choice type's module identity.
 
 Callbacks infer parameter and return types from the value and their bodies.
 They are evaluated once as ordinary arguments and called only for their
