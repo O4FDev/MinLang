@@ -5,6 +5,7 @@ each block. Opening braces share the declaration or condition's line; closing
 braces align with it. Fields and statements occupy their own lines. A single
 space surrounds binary operators and follows a colon or comma. Calls, member
 access, ranges and generic type arguments stay together.
+Unary minus stays with its operand, as in `-1` or `-balance`.
 
 Before:
 
