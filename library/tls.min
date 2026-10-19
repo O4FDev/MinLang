@@ -16,6 +16,7 @@ use "tlsverify" as trust
 use "aes" as aes
 use "tlstickets" as tickets
 use "net" as net
+use "errors" as errors
 
 public constant STARTING = 0
 public constant HELLO_SENT = 1
@@ -1000,4 +1001,65 @@ public function takeIncoming(session: Session): Bytes {
 
 public function established(session: Session): Boolean {
     return session.state == ESTABLISHED
+}
+
+// Typed state-machine operations. Legacy functions and public Session fields
+// retain their compatibility contracts. Input/output still belongs to the
+// caller's transport; these operations never open a socket.
+function sessionError(session: Session): errors.Error {
+    return errors.make(errors.protocolCode(), 0, session.error).withContext("TLS for " + session.host)
+}
+function sessionResult(session: Session): Result<Session, errors.Error> {
+    if session.state == FAILED { return Err(sessionError(session)) }
+    return Ok(session)
+}
+function sessionStatus(session: Session): Result<Nothing, errors.Error> {
+    if session.state == FAILED { return Err(sessionError(session)) }
+    return Ok()
+}
+public function open(host: Text, entropy: Bytes): Result<Session, errors.Error> { return sessionResult(client(host, entropy)) }
+public function openWithTrust(host: Text, entropy: Bytes, roots: List<Bytes>): Result<Session, errors.Error> { return sessionResult(clientWithTrust(host, entropy, roots)) }
+public function openWithIdentity(host: Text, entropy: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes): Result<Session, errors.Error> { return sessionResult(clientWithIdentity(host, entropy, roots, certificates, privateKey)) }
+public function openWithProtocol(host: Text, entropy: Bytes, protocol: Text, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes): Result<Session, errors.Error> { return sessionResult(clientWithProtocol(host, entropy, protocol, roots, certificates, privateKey)) }
+public function openQUIC(host: Text, entropy: Bytes, protocol: Text, parameters: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes): Result<Session, errors.Error> { return sessionResult(quicClient(host, entropy, protocol, parameters, roots, certificates, privateKey)) }
+public function Session.failure(): Maybe<errors.Error> {
+    if self.state == FAILED { return Some(sessionError(self)) }
+    return None
+}
+public function Session.receive(data: Bytes): Result<Nothing, errors.Error> {
+    if self.state == CLOSED { return Err(errors.make(errors.closedCode(), 0, "TLS input is closed")) }
+    receive(self, data)
+    return sessionStatus(self)
+}
+public function Session.receiveHandshakeBytes(data: Bytes, level: Integer): Result<Nothing, errors.Error> {
+    if self.state == CLOSED { return Err(errors.make(errors.closedCode(), 0, "TLS input is closed")) }
+    receiveHandshake(self, data, level)
+    return sessionStatus(self)
+}
+public function Session.send(data: Bytes): Result<Nothing, errors.Error> {
+    if self.state == CLOSED { return Err(errors.make(errors.closedCode(), 0, "TLS output is closed")) }
+    send(self, data)
+    return sessionStatus(self)
+}
+public function Session.finishInput(): Result<Nothing, errors.Error> {
+    endInput(self)
+    return sessionStatus(self)
+}
+public function Session.read(): Result<Maybe<Bytes>, errors.Error> {
+    // Authenticated plaintext from earlier records remains readable before a
+    // sticky later error. The next read reports that error, never false EOF.
+    if self.incoming.length > 0 { return Ok(Some(takeIncoming(self))) }
+    if self.state == FAILED { return Err(sessionError(self)) }
+    if self.state == CLOSED { return Ok(None) }
+    return Err(errors.make(errors.wouldBlockCode(), 0, "TLS plaintext is not ready"))
+}
+public function Session.close(): Result<Nothing, errors.Error> {
+    if self.state == FAILED { return Err(sessionError(self)) }
+    if self.state != ESTABLISHED && self.state != CLOSED { return Err(errors.make(errors.invalidDataCode(), 0, "the TLS handshake is not established")) }
+    close(self)
+    return Ok()
+}
+public function Session.cipherSuites(suites: List<Integer>): Result<Nothing, errors.Error> {
+    if !setCipherSuites(self, suites) { return Err(errors.make(errors.invalidDataCode(), 0, "invalid TLS cipher suites or handshake already started")) }
+    return Ok()
 }
