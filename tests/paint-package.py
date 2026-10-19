@@ -80,7 +80,7 @@ def main():
         run("git", "clone", "--bare", "--quiet", source, mirror)
         cases = [
             (example, "first-light", (640, 480), "first light · paint v0.1.0 · 640 × 480\n", "f436298955968f62d255f17bc22a4436f71dd72845caa0f31f20e8078eae8fe5", "6cf6af106897acf40c714e207f7e36d0c77aa0a93da8bb2152c6134b2b906230"),
-            (example.parent / "observatory", "observatory", (960, 720), "observatory · paint v0.1.0 · 960 × 720\n", "d310571a2e48ebb81780ef3e0ea4793b9771c157cbeab5f4325c56584b6872b5", "54d8713541479ce50a22ceea030b1e09401da5c0a2493ad82d28375fd2162689"),
+            (example.parent / "observatory", "observatory", (960, 720), "observatory · paint v0.1.0 · 960 × 720\n", "2a8715d7201cafde48898551192fa41f950903c8f269acc268df0841cfe88042", "fbbff2dc0ba3041f79500d64e4e6688996dc66aa69cd986c98b1da40ea2dc174"),
         ]
         projects = []
         for folder, name, dimensions, message, pixel_hash, svg_hash in cases:

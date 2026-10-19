@@ -5,7 +5,8 @@
 An external package becomes a little studio. `paint` draws the same paths into
 an antialiased PNG and an editable SVG. The consumer combines a choice of
 atmosphere, a record method, a generic ink selector and interpolated Text.
-TrueType outlines supply the lettering.
+TrueType outlines supply the lettering. Fixed Bézier controls describe the
+orbits and keep their coordinates identical across platform math libraries.
 
 After `paint` is published:
 
