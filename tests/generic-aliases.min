@@ -1,0 +1,37 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+fixtures.executes(frontend, "record Box<Item> { value: Item }\ntype Named = Counter\ntype Counter = Box<Count>\ntype Count = Integer\ntype Words = List<Text>\nfunction identity<Item>(value: Item): Item { return value }\nlet value: Named = Named { value: 42 }\nlet other: Box<Integer> = value\nlet words: Words = [\"sea\"]\nprint(other.value)\nprint(identity(words)[0])\nprint(identity<Count>(7))\n", "42\nsea\n7\n", levels, 0, "", true)
+fixtures.executes(frontend, "type Item = Text\ntype Reader = (List<Integer>) -> Integer\ntype Outcome = Result<Text, Integer>\nfunction identity<Item>(value: Item): Item { return value }\nlet read: Reader = function(values) { return values.length }\nlet result: Outcome = Ok(identity(\"pearl\"))\nprint(read([1, 2]))\nprint(identity(42))\nmatch result { Ok(value) { print(value) }; Err(error) { print(error) } }\n", "2\n42\npearl\n", levels, 0, "", true)
+fixtures.executes(frontend, "record Vessel { name: Text }\ntype Boat = Vessel\nfunction Boat.label(): Text { return self.name }\ntype Fleet = List<Boat>\nlet fleet: Fleet = [Boat { name: \"Willow\" }]\nprint(fleet[0].label())\n", "Willow\n", levels, 0, "", true)
+io.writeTextFile(frontend.compiler.directory + "/aliases.min", "public record Box<Item> { value: Item }\npublic record Secret<Item> { private value: Item }\npublic type Words = List<Text>\npublic type Counter = Box<Integer>\npublic type Treasure = Secret<Text>\ntype Hidden = Integer\npublic function Counter.label(): Text { return Text(self.value) }\nfunction Counter.hidden(): Integer { return self.value }\npublic function counter(value: Integer): Counter { return Counter { value: value } }\npublic function treasure(): Treasure { return Treasure { value: \"pearl\" } }\n")
+fixtures.executes(frontend, "use \"./aliases.min\" as shared\ntype Local = shared.Counter\nlet count: Local = shared.counter(42)\nlet other = shared.Counter { value: 7 }\nlet words: shared.Words = [\"sea\"]\nprint(count.value)\nprint(other.value)\nprint(words[0])\nprint(count.label())\n", "42\n7\nsea\n42\n", levels, 0, "", true)
+fixtures.rejects(frontend, "use \"./aliases.min\" as shared\nlet hidden: shared.Hidden = 42\n", "is private to its module", true)
+fixtures.rejects(frontend, "use \"./aliases.min\" as shared\nlet forged = shared.Treasure { value: \"pearl\" }\n", "has private fields, so only its own module can create one", true)
+fixtures.rejects(frontend, "use \"./aliases.min\" as shared\nprint(shared.treasure().value)\n", "is private to its module", true)
+fixtures.rejects(frontend, "type Loop = List<Loop>\n", "check for a recursive alias", true)
+fixtures.rejects(frontend, "type First = Second\ntype Second = List<First>\n", "check for a recursive alias", true)
+fixtures.rejects(frontend, "type Invalid = Missing\n", "unknown type 'Missing'", true)
+fixtures.rejects(frontend, "record Box<Item> { value: Item }\ntype Invalid = Box\n", "expects 1 type argument, but received 0", true)
+fixtures.rejects(frontend, "type Text = Integer\n", "cannot replace built-in type 'Text'", true)
+fixtures.rejects(frontend, "type Name = Integer\nrecord Name { value: Integer }\n", "more than once", true)
+fixtures.rejects(frontend, "type Count = Integer Float\n", "a type alias needs one complete type", true)
+fixtures.rejects(frontend, "type Count = Integer\nlet value: Count<Integer> = 42\n", "type alias 'Count' does not take type arguments", true)
+fixtures.rejects(frontend, "use \"./aliases.min\" as shared\ntype Boat = shared.Counter\nfunction Boat.label(): Integer { return self.value }\n", "methods must be declared in the module that declares their record", true)
+fixtures.executes(frontend, "record Packet native \"c\" { tag: UInt8; data: Bytes[4] }\ntype Header = Packet\nrecord Count<Item> native \"c\" { value: Item; tag: UInt16 }\nfunction identity<Item>(value: Item): Item { return value }\nlet packet = Header { tag: 42; data: Bytes(\"sea!\") }\nprint(identity(packet.tag))\nprint(Text(identity(packet.data)))\nprint(sizeOf(Header))\nlet number = Count { value: 7; tag: 2 }\nprint(identity(number.value))\nprint(sizeOf(Count<Integer>))\n", "42\nsea!\n5\n7\n16\n", levels, 0, "", true)
+fixtures.rejects(frontend, "use \"./aliases.min\" as shared\nprint(shared.counter(42).hidden())\n", "is private to its module", true)
+fixtures.rejects(frontend, "record Box<Item> { value: Item }\ntype First = Box<Integer>\ntype Second = Box<Integer>\nfunction First.label(): Integer { return self.value }\nfunction Second.label(): Integer { return self.value }\n", "the same record method is declared more than once through type aliases", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/generic-aliases.min"), "a little garden\nmarigold: 12 seeds\ncornflower: 8 seeds\nsweet pea: 6 seeds\n", levels, 0, "", true)
+fixtures.executes(frontend, "use \"./aliases.min\" as shared\nfunction identity<Item>(value: Item): Item { return value }\ntype Count = Integer\nlet type = 40\ntype += 2\nprint(identity(type))\nfor type in [7] { print(type) }\n", "42\n7\n", levels, 0, "", true)
+let cache = frontend.compiler.directory + "/alias-cache"
+let entry = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".min"
+io.writeTextFile(cache + ".empty", "")
+test.require(test.run([frontend.compiler.executable, entry, cache + ".cold.ll", "--module-state", cache + ".empty", cache + ".state", cache + ".cold.stats", "--library", "library"], frontend.environment, "", cache + ".cold", frontend.compiler.compileTimeout), "compile aliases through cold module state")
+test.require(test.run([frontend.compiler.executable, entry, cache + ".warm.ll", "--module-state", cache + ".state", cache + ".next", cache + ".warm.stats", "--library", "library"], frontend.environment, "", cache + ".warm", frontend.compiler.compileTimeout), "compile aliases through warm module state")
+test.check(io.readTextFile(cache + ".cold.ll") == io.readTextFile(cache + ".warm.ll"), "alias module-state output is stable")
+test.check(io.readTextFile(cache + ".state") == "", "aliases use the documented whole-graph fallback")
+test.removeTree(frontend.compiler.directory)
+print("Generic aliases: passed")

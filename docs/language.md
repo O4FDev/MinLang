@@ -718,6 +718,28 @@ types determine ownership and cycle analysis. When mutation can create a cycle,
 that instantiation uses traced allocation. Type parameters belong to their
 own declaration, even when a module has a record with the same name.
 
+A type alias gives an existing concrete type a familiar name:
+
+```minyar
+type Tide = Pair<Text, Float>
+type TideTable = List<Tide>
+
+let readings: TideTable = [Tide { first: "dawn"; second: 1.2 }]
+```
+
+Aliases are transparent: `Tide` and `Pair<Text, Float>` are the same type, with
+the same fields, ownership and layout. They can name primitive, record, collection,
+callable and Result types, refer to later aliases, and be exported with `public`.
+A recursive chain is rejected. An alias is a type name; construction uses the
+usual record literal or the original type's functions. Type parameters still
+belong to their own declaration and can shadow an alias.
+
+A method declared through a concrete record alias belongs to its underlying
+record, and must be declared in that record's module. Equivalent aliases share
+methods; they cannot declare the same method twice. Generic C-layout records
+retain fixed-width fields and fixed Bytes arrays, and their concrete layouts
+work with `sizeOf`, `alignOf`, `offsetOf`, `cView` and `cAt`.
+
 ## Recoverable failures
 
 `Result<T, E>` contains either a successful `T` or an error `E`. `Ok(value)`

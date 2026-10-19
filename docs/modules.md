@@ -219,3 +219,11 @@ Functions, records, constants and globals use a hash index keyed by module,
 declaration name and kind. Type annotations use the same index as expressions.
 The persistent interface table keeps its stable sorted format; loading a cached
 table rebuilds the in-memory hash index without changing declaration identities.
+
+## Type aliases
+
+Type aliases use the type namespace and follow the same public/private rules as
+records. For example, `public type Reading = Pair<Text, Float>` exports a concrete
+name for that type. An importer can write `measurements.Reading` in annotations
+and record literals. An alias preserves the original record's private fields and
+method ownership; exporting an alias does not export private access.

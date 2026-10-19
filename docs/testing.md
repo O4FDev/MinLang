@@ -111,6 +111,12 @@ sanitizers.
 executable O0/O2 output and a rejection diagnostic. Run the full ownership suite
 before queueing the landing.
 
+`make check-generic-aliases` checks transparent aliases across modules,
+forward references, primitive/collection/callable/Result targets, private fields
+and methods, duplicate and recursive aliases, and generic C-layout composition.
+The alias gallery and all successful programs run at O0/O2 with ownership checks.
+`check-generic-aliases-sanitize` adds compiler and generated-program sanitizers.
+
 `make check-library-contracts` checks JSON control-character round trips and
 strict lookup helpers, then exercises HTTP clients against local socket peers.
 Cases include truncated and malformed responses, split headers, bodyless and
