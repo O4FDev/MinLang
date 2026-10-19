@@ -102,7 +102,9 @@ MinyarRecord *minyar_map_new_record(long long key_kind, long long value_referenc
                                     MinyarRecordHash hash, MinyarRecordEqual equal,
                                     MinyarRecordCopy copy) {
     if (key_kind < 1000 || !hash || !equal || !copy) minyar_stop("invalid record Map key callbacks.");
-    MinyarRecord *map = map_create(key_kind, value_references, MAP_RECORD_FIELDS);
+    /* Compiler record ids can shift while dependency bodies remain cached.
+     * Callbacks carry the statically checked layout; storage needs one record kind. */
+    MinyarRecord *map = map_create(1000, value_references, MAP_RECORD_FIELDS);
     minyar_record_set(map, MAP_HASH_CALLBACK, (long long)(uintptr_t)hash);
     minyar_record_set(map, MAP_EQUAL_CALLBACK, (long long)(uintptr_t)equal);
     minyar_record_set(map, MAP_COPY_CALLBACK, (long long)(uintptr_t)copy);
