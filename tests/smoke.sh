@@ -59,9 +59,12 @@ status=0
 [ "$status" -eq 1 ] || fail "type error should exit with status 1" "status: $status"
 first_error=$(sed -n '1p' "$build_dir/invalid.err")
 case "$first_error" in
-    "Minyar stopped: "*) ;;
-    *) fail "diagnostics must begin with 'Minyar stopped:'" "got: $first_error" ;;
+    "error: "*) ;;
+    *) fail "compiler diagnostics must begin with 'error:'" "got: $first_error" ;;
 esac
+grep -Fq -- "  --> $project_dir/tests/errors/type-mismatch.min:2:9" "$build_dir/invalid.err" || fail "type error source position"
+grep -Fq -- ' 2 |     let answer: Text = 42' "$build_dir/invalid.err" || fail "type error source excerpt"
+grep -Fq -- '   |         ^^^^^^' "$build_dir/invalid.err" || fail "type error token underline"
 grep -q "the value for 'answer' does not match its declared type" "$build_dir/invalid.err" || fail "type error text" "$(cat "$build_dir/invalid.err")"
 [ ! -e "$build_dir/invalid.ll" ] || fail "output file was written for an invalid program"
 pass
