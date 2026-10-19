@@ -156,6 +156,10 @@ both portable and native macOS providers where available. No Internet access
 or sleep polling is needed. The replies gallery has checked output.
 `check-result-network-sanitize` instruments the compiler, runtime, native
 providers and generated programs with ASan/UBSan.
+Unchanged C providers are built once per suite, at O2 normally and O1 with
+sanitizers, matching the ownership runtime. Vendored Monocypher uses O0 with
+sanitizers to avoid excessive compiler optimization time. Minyar programs
+run at O0/O2; their assertions and subprocess deadlines stay the same.
 
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
