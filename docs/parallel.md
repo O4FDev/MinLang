@@ -46,7 +46,8 @@ the safe loop body.
 `tests/parallel-for/boot.min` boots the real ARM64 processor scheduler, fills
 5,003 owned slots, and checks Integer and Float reductions. It also checks
 typed pixel blending, masks and the clipped desktop glow against checksum
-`315453`. Build it with
+`315453`, then identical-start and adjacent C-layout views against checksum
+`31405`. Build it with
 `make -C os ARCH=arm64 KERNEL_SOURCE=/absolute/path/to/tests/parallel-for/boot.min`
 and boot its kernel with QEMU's `virt,gic-version=3`, 1 GiB RAM, and one or four
 processors. Both runs must print `SAFE PARALLEL OK 623386` with the processor
