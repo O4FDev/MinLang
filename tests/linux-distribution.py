@@ -79,6 +79,13 @@ def main():
         (contract / "distribution.libc").write_text("invalid\n")
         assert "requires glibc" in run("sh", distribution / "tools/linux-platform.sh", contract, expected=1)
         print("CPU and glibc startup diagnostics passed", flush=True)
+        legacy = work / "legacy prefix"
+        run(distribution / "build/tooling/tools/install-cli", "--source", distribution, "--prefix", legacy)
+        legacy_command = legacy / "bin/minyar"
+        assert "(Linux " in run(legacy_command, "--version")
+        assert "Ready:" in run(legacy_command, "--doctor")
+        if (distribution / "tools/format-cli.min").is_file():
+            assert "usage: minyar fmt" in run(legacy_command, "fmt", "--help")
         public = work / "public"
         public.mkdir()
         artifact = args.archive.resolve() if args.archive else work / (distribution.name + ".tar.gz")
