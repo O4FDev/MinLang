@@ -46,8 +46,12 @@ minyar toolchain current
 ```
 
 Installing another toolchain preserves the current default. `self update`
-verifies the signed `latest` selection and installs/selects it. Existing versions
-remain available to running processes and pinned projects. Installed version
+verifies the signed `latest` selection and installs/selects it. When that
+version's recorded SHA-256 matches the freshly verified signed manifest, it
+selects the existing toolchain without downloading its archive again. Release
+metadata is always verified.
+
+Existing versions remain available to running processes and pinned projects. Installed version
 directories are immutable: a different archive under an existing version is
 rejected. The default and launcher are replaced atomically. A download,
 signature, checksum, archive or startup failure preserves the working command.

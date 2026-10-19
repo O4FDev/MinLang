@@ -100,22 +100,37 @@ if [ "$version" = latest ]; then
 fi
 artifact="minyar-$version-$operating_system-$architecture"
 archive="$artifact.tar.gz"
-say "  Fetching  Minyar $version · $operating_system-$architecture"
+say "  Checking  Minyar $version · $operating_system-$architecture"
 download "$server/releases/$version/SHA256SUMS" "$temporary/SHA256SUMS" 1048576
 download "$server/releases/$version/SHA256SUMS.sig" "$temporary/SHA256SUMS.sig" 65536
 verify_signature "$temporary/SHA256SUMS"
 expected=$(awk -v name="$archive" '$2 == name { found++; value=$1 } END { if (found != 1) exit 1; print value }' "$temporary/SHA256SUMS") || die "no signed artifact exists for $operating_system-$architecture at $version"
 case "$expected" in *[!0-9a-f]*|'') die 'invalid SHA-256 in the signed release manifest' ;; esac
 [ "${#expected}" -eq 64 ] || die 'invalid SHA-256 length in the signed release manifest'
-download "$server/releases/$version/$archive" "$temporary/$archive" 2147483648
-if [ "$hash_command" = sha256sum ]; then actual=$(sha256sum "$temporary/$archive"); else actual=$(shasum -a 256 "$temporary/$archive"); fi
-actual=${actual%% *}
-[ "$actual" = "$expected" ] || die 'archive checksum mismatch; nothing was installed'
-say '  Verified  Ed25519 signature + SHA-256'
-tar -tzf "$temporary/$archive" > "$temporary/paths" || die 'cannot read the toolchain archive'
-awk -v root="$artifact" '{ path=$0; if (path !~ /^[A-Za-z0-9_.\/+@-]+$/ || path ~ /(^|\/)\.\.(\/|$)/ || (path != root && path != root "/" && index(path,root "/") != 1)) bad=1 } END { exit bad }' "$temporary/paths" || die 'archive contains unsafe paths'
-tar -tvzf "$temporary/$archive" > "$temporary/entries" || die 'cannot inspect the toolchain archive'
-awk '{ kind=substr($0,1,1); if (kind != "-" && kind != "d" && kind != "l") bad=1; if (kind == "l" && ($(NF-1) != "->" || $NF !~ /^[A-Za-z0-9_.\/+@-]+$/ || $NF ~ /^\// || $NF ~ /(^|\/)\.\.(\/|$)/)) bad=1 } END { exit bad }' "$temporary/entries" || die 'archive contains unsupported links or special files'
+reuse=0
+available=$minyar_home/toolchains/$version
+if [ -f "$minyar_home/.minyar-home" ] && [ ! -L "$minyar_home/.minyar-home" ] &&
+    [ "$(cat -- "$minyar_home/.minyar-home")" = minyar-home-v1 ] &&
+    [ ! -L "$minyar_home/toolchains" ] && [ -d "$available" ] && [ ! -L "$available" ] &&
+    [ -x "$available/minyar" ] && [ ! -L "$available/minyar" ] &&
+    [ -f "$available/.minyar-toolchain" ] && [ ! -L "$available/.minyar-toolchain" ] &&
+    [ "$(cat -- "$available/.minyar-toolchain")" = "$version" ] &&
+    [ -f "$available/.minyar-archive-sha256" ] && [ ! -L "$available/.minyar-archive-sha256" ] &&
+    [ "$(cat -- "$available/.minyar-archive-sha256")" = "$expected" ]; then reuse=1; fi
+if [ "$reuse" -eq 1 ]; then
+    say '   Current  signed release matches the installed archive'
+else
+    say "  Fetching  $archive"
+    download "$server/releases/$version/$archive" "$temporary/$archive" 2147483648
+    if [ "$hash_command" = sha256sum ]; then actual=$(sha256sum "$temporary/$archive"); else actual=$(shasum -a 256 "$temporary/$archive"); fi
+    actual=${actual%% *}
+    [ "$actual" = "$expected" ] || die 'archive checksum mismatch; nothing was installed'
+    say '  Verified  Ed25519 signature + SHA-256'
+    tar -tzf "$temporary/$archive" > "$temporary/paths" || die 'cannot read the toolchain archive'
+    awk -v root="$artifact" '{ path=$0; if (path !~ /^[A-Za-z0-9_.\/+@-]+$/ || path ~ /(^|\/)\.\.(\/|$)/ || (path != root && path != root "/" && index(path,root "/") != 1)) bad=1 } END { exit bad }' "$temporary/paths" || die 'archive contains unsafe paths'
+    tar -tvzf "$temporary/$archive" > "$temporary/entries" || die 'cannot inspect the toolchain archive'
+    awk '{ kind=substr($0,1,1); if (kind != "-" && kind != "d" && kind != "l") bad=1; if (kind == "l" && ($(NF-1) != "->" || $NF !~ /^[A-Za-z0-9_.\/+@-]+$/ || $NF ~ /^\// || $NF ~ /(^|\/)\.\.(\/|$)/)) bad=1 } END { exit bad }' "$temporary/entries" || die 'archive contains unsupported links or special files'
+fi
 mkdir -p -- "$minyar_home"
 minyar_home=$(CDPATH= cd -- "$minyar_home" && pwd -P)
 if [ -e "$minyar_home/.minyar-home" ] || [ -L "$minyar_home/.minyar-home" ]; then

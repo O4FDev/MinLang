@@ -132,7 +132,19 @@ def main():
             pin.write_text("../../escape\n")
             run([command, "--version"], environment=environment, directory=project, expected="must contain one toolchain version")
             pin.write_text("1.0.0\n")
-            run([command, "self", "update"], environment=environment, directory=project)
+            installed_archive = next((public / "releases/2.0.0").glob("*.tar.gz"))
+            unavailable_archive = installed_archive.with_suffix(".unavailable")
+            installed_archive.rename(unavailable_archive)
+            archive_record = home / "toolchains/2.0.0/.minyar-archive-sha256"
+            recorded_hash = archive_record.read_text()
+            try:
+                output = run([command, "self", "update"], environment=environment, directory=project)
+                assert "signed release matches the installed archive" in output
+                archive_record.write_text("0" * 64 + "\n")
+                run([command, "self", "update"], environment=environment, directory=project, expected="download failed")
+            finally:
+                archive_record.write_text(recorded_hash)
+                unavailable_archive.rename(installed_archive)
             assert (home / "default").read_text() == "2.0.0\n"
             assert "Minyar 1.0.0" in run([command, "--version"], environment=environment, directory=project)
             run([command, "toolchain", "default", "1.0.0"], environment=environment)
@@ -147,6 +159,8 @@ def main():
             rejected_home = root / "bad-signature"
             run(["sh", generated, "--version", "2.0.0"], environment=dict(environment, MINYAR_HOME=str(rejected_home)), expected="signature verification failed")
             assert not rejected_home.exists()
+            run([command, "self", "update"], environment=environment, expected="signature verification failed")
+            assert (home / "default").read_text() == "1.0.0\n"
             checksum.write_bytes(original)
             artifact = next((public / "releases/2.0.0").glob("*.tar.gz"))
             content = artifact.read_bytes()
