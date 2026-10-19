@@ -102,6 +102,64 @@ function git(directory: Text, arguments: List<Text>, scratch: Text): Text {
     if status != 0 { host.stop("Git could not read this package: " + host.strip(host.readText(scratch + "/err"))) }
     return host.readText(scratch + "/out")
 }
+record GitBlob { path: Text; objectID: Text; size: Integer }
+public function exportTree(directory: Text, commit: Text, scratch: Text): Text {
+    let listing = git(directory, ["ls-tree", "-r", "-l", "-z", commit], scratch)
+    let blobs: List<GitBlob> = []
+    let requests: List<Text> = []
+    let total = 0; let batchSize = 0
+    for item in listing.split(Text(Character(0))) {
+        if item == "" { continue }
+        let tab = host.findText(item, "\t", 0)
+        if tab < 0 { host.stop("invalid Git tree") }
+        let fields = host.words(host.textSlice(item, 0, tab))
+        let path = host.textSlice(item, tab + 1, item.byteLength)
+        if fields.length != 4 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") { host.stop("package symlinks and submodules are not allowed: " + host.jsonText(path)) }
+        if !safePath(path) { host.stop("unsafe Git package path: " + host.jsonText(path)) }
+        if !hexadecimal(fields[2], 40) { host.stop("package objects must use 40-character Git IDs") }
+        let size = Integer(fields[3])
+        if size < 0 { host.stop("invalid Git blob size") }
+        total += size
+        if blobs.length >= 16384 || total > 134217728 { host.stop("package exceeds the source size or file limit") }
+        blobs.add(GitBlob { path: path; objectID: fields[2]; size: size })
+        requests.add(fields[2] + "\n")
+        batchSize += (fields[2] + " blob " + Text(size)).byteLength + size + 2
+    }
+    let exported = scratch + "/source"
+    host.makeDirectories(exported)
+    if blobs.length == 0 { return exported }
+    let input = scratch + "/blob-requests"
+    let output = scratch + "/blob-output"
+    host.writeBytes(input, Bytes(joinText(requests)))
+    // Only this fixed script is shell code. Paths and Git arguments stay in argv.
+    // cat-file reads raw objects, without attributes, filters or text conversion.
+    let command = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar-git-blobs", input]
+    for argument in gitArguments(directory, ["cat-file", "--batch"]) { command.add(argument) }
+    if host.spawn(command, gitEnvironment(), false, output, scratch + "/err", 180) != 0 { host.stop("could not read package blobs: " + host.strip(host.readText(scratch + "/err"))) }
+    if files.pathSize(output) != batchSize { host.stop("Git blob batch has an unexpected size") }
+    let file = files.open(output, files.READ)
+    if file < 0 { host.stop("cannot open the Git blob batch") }
+    let position = 0
+    for blob in blobs {
+        let header = files.readAt(file, position, 128)
+        let end = 0
+        while end < header.length && header[end] != 10 { end += 1 }
+        if end == header.length || Text(header.slice(0, end)) != blob.objectID + " blob " + Text(blob.size) { host.stop("Git blob batch does not match its source tree") }
+        position += end + 1
+        let data = files.readAt(file, position, blob.size)
+        if data.length != blob.size { host.stop("Git blob batch ended before its source file") }
+        position += blob.size
+        let separator = files.readAt(file, position, 1)
+        if separator.length != 1 || separator[0] != 10 { host.stop("Git blob batch is missing its separator") }
+        position += 1
+        let destination = exported + "/" + blob.path
+        host.makeDirectories(host.parentPath(destination))
+        if host.exists(destination) || host.resolveName(destination) != destination { host.stop("package paths collide on this filesystem: " + host.jsonText(blob.path)) }
+        host.writeBytes(destination, data)
+    }
+    if files.close(file) != 0 || position != batchSize { host.stop("could not finish reading the Git blob batch") }
+    return exported
+}
 public function safePath(path: Text): Boolean {
     if path == "" || path.startsWith("/") || path.byteLength > 1024 { return false }
     for part in path.split("/") {
@@ -346,27 +404,7 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
         if target == "" { host.stop("revision not found: " + repository + "@" + revision + "; choose an existing tag, branch or commit") }
     }
     if hexadecimal(revision, 40) && target != revision { host.stop("the requested Git object is not a commit ID: " + revision + "; use its full commit ID") }
-    let listing = git(bare, ["ls-tree", "-r", "-l", "-z", target], scratch)
-    let exported = scratch + "/source"
-    host.makeDirectories(exported)
-    let count = 0
-    let total = 0
-    for item in listing.split(Text(Character(0))) {
-        if item == "" { continue }
-        let tab = host.findText(item, "\t", 0)
-        if tab < 0 { host.stop("invalid Git tree") }
-        let fields = host.words(host.textSlice(item, 0, tab))
-        let path = host.textSlice(item, tab + 1, item.byteLength)
-        if fields.length != 4 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") { host.stop("package symlinks and submodules are not allowed: " + path) }
-        if !safePath(path) { host.stop("unsafe Git package path: " + path) }
-        count += 1
-        total += Integer(fields[3])
-        if count > 16384 || total > 134217728 { host.stop("package exceeds the source size or file limit") }
-        let destination = exported + "/" + path
-        host.makeDirectories(host.parentPath(destination))
-        if host.exists(destination) || host.resolveName(destination) != destination { host.stop("package paths collide on this filesystem: " + path) }
-        if gitTo(bare, ["cat-file", "blob", fields[2]], destination, scratch + "/err") != 0 { host.stop("could not read package source: " + path) }
-    }
+    let exported = exportTree(bare, target, scratch)
     let checksum = treeHash(exported)
     if source.checksum != "" && source.checksum != checksum { host.stop("downloaded package checksum does not match Minyar.lock: " + repository) }
     source.commit = target; source.checksum = checksum; source.revision = revision

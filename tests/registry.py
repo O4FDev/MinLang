@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ def write_index(path, value):
 
 def main():
     launcher, registry_cli, project_root = map(lambda value: Path(value).resolve(), sys.argv[1:4])
-    with tempfile.TemporaryDirectory(prefix="minyar registry ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="minyar registry ' ") as temporary:
         root = Path(temporary)
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k not in ("MINYAR_HOME", "MINYAR_REGISTRY", "MINYAR_GIT_MIRROR", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS")}
         env.update(MINYAR_HOME=str(root / "home"), MINYAR_PROJECT_DIR=str(project_root), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
@@ -43,6 +45,13 @@ def main():
         (package / "Minyar.toml").write_text('[package]\nname = "lumen"\nversion = "0.1.0"\nkind = "lib"\n')
         (package / "src/lumen.min").write_text("public function answer(): Integer { return 42 }\n")
         (package / ".gitignore").write_text("/target/\n")
+        (package / "raw").mkdir()
+        for number in range(1000):
+            (package / f"raw/{number:04}.dat").write_bytes(bytes([0, 255, number % 256]) + b"\nraw Git bytes\r\n")
+        (package / "raw/empty.dat").write_bytes(b"")
+        (package / "raw/quote' $(touch SHOULD_NOT_EXIST) `echo data` ☀.dat").write_bytes(b"no trailing newline")
+        (package / ".gitattributes").write_text("raw/* export-ignore filter=never-run\nsubstitution.dat export-subst\n")
+        (package / "substitution.dat").write_text("$Format:%H$\n")
 
         def git(*arguments):
             return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Minyar tests", "-c", "user.email=tests@example.invalid", "-C", package, *arguments], env, root)
@@ -52,12 +61,34 @@ def main():
         git("commit", "--quiet", "-m", "feat(package): add a registry fixture")
         git("tag", "v0.1.0")
         head = git("rev-parse", "HEAD").strip()
+        git("config", "filter.never-run.smudge", "touch " + shlex.quote(str(root / "filter-ran")) + "; cat")
+        real_git = shutil.which("git", path=env.get("PATH"))
+        assert real_git
+        git_log = root / "git-calls.jsonl"
+        git_log.write_text("")
+        wrappers = root / "bin"
+        wrappers.mkdir()
+        wrapper = wrappers / "git"
+        wrapper.write_text(f"""#!{sys.executable}
+import json, os, sys
+with open(os.environ['MINYAR_TEST_GIT_LOG'], 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT'], *sys.argv[1:]])
+""")
+        wrapper.chmod(0o755)
+        env.update(PATH=str(wrappers) + os.pathsep + env.get("PATH", "/usr/bin:/bin"), MINYAR_TEST_GIT_LOG=str(git_log), MINYAR_TEST_REAL_GIT=real_git)
+
+        def blob_calls():
+            return [json.loads(line) for line in git_log.read_text().splitlines() if '"cat-file"' in line]
+
         arguments = [launcher, "publish", "github.com/O4FDev/lumen", "--description", "Light, in a small library."]
         record_text = run(arguments, env, package)
+        calls = blob_calls()
+        assert len(calls) == 1 and calls[0][-2:] == ["cat-file", "--batch"], f"publish must read all 1000+ blobs in one Git batch, got {len(calls)} processes"
         assert record_text == run([*arguments, "--dry-run"], env, package)
         record = json.loads(record_text)
         assert record["commit"] == head and record["version"] == "0.1.0"
-        names = git("ls-tree", "-r", "--name-only", "HEAD").splitlines()
+        names = [name for name in git("ls-tree", "-r", "-z", "--name-only", "HEAD").split("\0") if name]
         material = "minyar-source-v1\n" + "".join(hashlib.sha256((package / name).read_bytes()).hexdigest() + " " + json.dumps(name, ensure_ascii=False, separators=(",", ":")) + "\n" for name in sorted(names))
         assert record["checksum"] == hashlib.sha256(material.encode()).hexdigest()
         assert git("rev-parse", "HEAD").strip() == head and git("status", "--porcelain") == ""
@@ -100,7 +131,12 @@ def main():
         env.update(MINYAR_GIT_MIRROR=str(root / "mirror"), MINYAR_REGISTRY=str(public))
         application = root / "consumer"
         run([launcher, "new", application], env, root)
+        before_fetch = len(blob_calls())
         run([launcher, "add", "github.com/O4FDev/lumen"], env, application)
+        fetched = blob_calls()[before_fetch:]
+        assert len(fetched) == 1 and fetched[0][-2:] == ["cat-file", "--batch"], "a Git install reads every blob in one batch"
+        assert not (root / "SHOULD_NOT_EXIST").exists() and not (package / "SHOULD_NOT_EXIST").exists() and not (application / "SHOULD_NOT_EXIST").exists()
+        assert not (root / "filter-ran").exists(), "exports never execute Git filters"
         (application / "src/main.min").write_text('use "lumen" as lumen\nprint(lumen.answer())\n')
         assert "42\n" in run([launcher, "run", "--locked", "--offline"], env, application)
         index["packages"] = [altered]

@@ -100,7 +100,9 @@ record per regular file, sorted lexicographically by UTF-8 path bytes:
 preserves Unicode. File contents and path names participate; timestamps, empty
 directories and executable permission bits do not. Downloaded files are source
 data and are never made executable. Every blob is included, including docs and
-tests; Git attributes do not alter exports. Cache references are hints, while a
+tests; Git attributes do not alter exports. Downloads and dry-run release
+preparation share one raw-blob exporter, reading all files in a single Git batch
+and writing one file at a time. Cache references are hints, while a
 committed lock is the project's trust record. Concurrent downloads stage in
 private directories and publish only complete verified trees.
 
