@@ -330,7 +330,13 @@ version() {
     export LC_ALL
     set -- "$project"/compiler/*.min
     if [ -f "$project/.minyar-distribution" ]; then
-        printf 'Minyar %s (macOS %s; requires macOS 14+)\n' "$(cat "$project/distribution.version")" "$(cat "$project/distribution.arch")"
+        distribution_platform=macos
+        if [ -f "$project/distribution.platform" ]; then distribution_platform=$(cat "$project/distribution.platform"); fi
+        if [ "$distribution_platform" = linux ]; then
+            printf 'Minyar %s (Linux %s; requires glibc %s+)\n' "$(cat "$project/distribution.version")" "$(cat "$project/distribution.arch")" "$(cat "$project/distribution.libc")"
+        else
+            printf 'Minyar %s (macOS %s; requires macOS 14+)\n' "$(cat "$project/distribution.version")" "$(cat "$project/distribution.arch")"
+        fi
     elif [ -f "$1" ]; then
         identity=$(for source in "$@"; do printf '%s\0' "${source##*/}"; cat "$source"; done | digest)
         printf 'Minyar development (source %.12s)\n' "$identity"
