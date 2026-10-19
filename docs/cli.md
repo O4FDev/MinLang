@@ -178,6 +178,9 @@ The installation prefix defaults to `$MINYAR_HOME` or `$HOME/.minyar`. Executabl
 go in its `bin` directory; add that directory to `PATH`. Existing binaries require
 `--force` to replace. `uninstall` only removes binaries marked as installed by
 Minyar. Installing a library is rejected.
+A package named `minyar` cannot replace or uninstall an installed toolchain's
+launcher, even with `--force` or a stale package marker. Choose a separate
+`--root` for that package; use `minyar self update` to update a managed toolchain.
 
 Installation defaults to the debug profile, like `build`. On macOS it installs
 the matching `.dSYM` beside the executable and records ownership of that bundle.

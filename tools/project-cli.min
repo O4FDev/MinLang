@@ -258,6 +258,21 @@ function installationMarker(path: Text): Text {
     if content == INSTALL_BINARY || content == INSTALL_SYMBOLS { return content }
     return ""
 }
+function protectToolchainLauncher(path: Text, name: Text) {
+    if name != "minyar" || !host.isFile(path) || host.resolveName(path) != path { return }
+    let file = files.open(path, files.READ)
+    if file < 0 { host.stop("cannot inspect the installed command: " + path) }
+    let data = files.readAt(file, 0, 96)
+    let error = files.lastError()
+    let closed = files.close(file)
+    if error != 0 || closed != 0 { host.stop("cannot inspect the installed command: " + path) }
+    for marker in ["#!/bin/sh\n# Managed by Minyar toolchains (v1)\n", "#!/bin/sh\n# Installed by Minyar; self-contained toolchain\n"] {
+        let prefix = Bytes(marker)
+        let matches = data.length >= prefix.length
+        if matches { for index in 0..prefix.length { if data[index] != prefix[index] { matches = false; break } } }
+        if matches { host.stop("this is Minyar's toolchain launcher: " + path + "; use minyar self update, or choose another --root for this package") }
+    }
+}
 function checkInstalledSymbols(path: Text) {
     if !host.isDirectory(path) || host.resolveName(path) != path { host.stop("refusing to use unrelated or symlinked debug symbols: " + path) }
 }
@@ -278,6 +293,7 @@ function uninstall(directory: Text, name: Text) {
     let ownership = installationMarker(marker)
     if ownership == "" { host.stop("binary was not installed by Minyar: " + name) }
     let destination = directory + "/" + name
+    protectToolchainLauncher(destination, name)
     let symbols = destination + ".dSYM"
     let removeSymbols = ownership == INSTALL_SYMBOLS && installationEntry(symbols)
     if removeSymbols { checkInstalledSymbols(symbols) }
@@ -303,13 +319,13 @@ function uninstall(directory: Text, name: Text) {
 function install(graph: project.Graph, options: Options) {
     let package = graph.packages[0]
     if !project.isBinary(package) { host.stop("install requires a binary package with src/main.min") }
-    let binary = build(graph, options)
     let directory = installation(options)
     host.makeDirectories(directory)
     let destination = directory + "/" + package.name
     let hadBinary = installationEntry(destination)
-    if hadBinary && !options.force { host.stop(destination + " already exists; use --force to replace it") }
     if hadBinary && (!host.isFile(destination) || host.resolveName(destination) != destination) { host.stop("refusing to replace an unrelated or symlinked binary: " + destination) }
+    if hadBinary { protectToolchainLauncher(destination, package.name) }
+    if hadBinary && !options.force { host.stop(destination + " already exists; use --force to replace it") }
     let marker = directory + "/.minyar-installed-" + package.name
     let ownership = installationMarker(marker)
     if installationEntry(marker) && ownership == "" { host.stop("refusing to replace an unrelated installation marker: " + marker) }
@@ -319,6 +335,7 @@ function install(graph: project.Graph, options: Options) {
         if ownership != INSTALL_SYMBOLS { host.stop("refusing to replace unowned debug symbols: " + symbols) }
         checkInstalledSymbols(symbols)
     }
+    let binary = build(graph, options)
     let hasSymbols = !options.release && host.isDirectory(binary + ".dSYM")
     let staging = host.keptDirectory(directory, ".minyar-install-")
     let staged = staging + "/binary"
