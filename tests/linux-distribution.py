@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+from distribution_probes import lsp_roundtrip
 
 if not __debug__:
     raise SystemExit("distribution checks require Python assertions; remove -O")
@@ -118,6 +119,8 @@ def main():
                     hidden_library.rename(library)
             project = work / "hello project"
             run(command, "new", project, "--name", "hello")
+            if (distribution / "tools/lsp-cli.min").is_file():
+                lsp_roundtrip(command, project, environment)
             for options in ([], ["--release"]):
                 assert "Hello, world!" in run(command, "run", *options, cwd=project)
                 run(command, "test", *options, cwd=project)

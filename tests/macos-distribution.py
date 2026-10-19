@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from distribution_probes import lsp_roundtrip
 
 
 def main():
@@ -55,6 +56,8 @@ def main():
         run(command, "--doctor")
         run(command, "new", work / "hello")
         project = work / "hello"
+        if (distribution / "tools/lsp-cli.min").is_file():
+            lsp_roundtrip(command, project, env)
         assert "Hello, world!" in run(command, "run", cwd=project)
         run(command, "test", cwd=project)
         run(command, "run", "--release", cwd=project)
