@@ -31,9 +31,11 @@ signatures do not replace Apple's code signing or notarization.
 The installer uses POSIX shell, curl, tar, awk, an SHA-256 utility and OpenSSH
 `ssh-keygen` with SSH signature verification. It does not require Python, Make
 or an existing Minyar installation. Git is needed when downloading Git packages.
-Linux artifact names and detection are supported; Linux release archives still
-need their own build and platform qualification. A filename alone does not make
-a binary portable across libc versions.
+Linux archives bundle LLVM and require glibc 2.39+ and the documented OS runtime
+libraries and C development files. Ubuntu 24.04 ARM64 is the initial qualified
+environment; see [Linux distributions](linux-distribution.md) for prerequisites,
+native builds and fresh-system qualification. Musl/Alpine and other runtime
+library versions need separate artifacts and testing.
 
 ## Keep versions together
 
@@ -103,7 +105,8 @@ python3 install/prepare-release.py \
 ```
 
 The archive must contain the current `install/install.sh` and
-`install/manager.sh`. The macOS packager includes them. Additional supported
+`install/manager.sh`. Both native packagers include them. Use `make package-linux`
+with a native LLVM prefix on a qualified Linux build host. Additional supported
 architectures can be added to the same version without replacing existing
 archives. The preparer verifies the existing checksum manifest's signature
 before merging another artifact; altered or unsigned metadata is rejected.
