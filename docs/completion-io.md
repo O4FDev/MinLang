@@ -146,6 +146,9 @@ Checks remain separate:
 - `make check-completionio-sanitize`: ASan/UBSan/LSan host controls and
   managed ownership fixtures, using the repository's sanitizer configuration.
 
+The [neo-db integration](completion-io-neodb.md) uses these typed queues with
+unmodified production WAL and snapshot code in a separate strict kernel proof.
+
 Primary references: [io_uring overview](https://github.com/axboe/liburing/blob/master/man/io_uring.7),
 [setup](https://github.com/axboe/liburing/blob/master/man/io_uring_setup.2),
 [restrictions and registration](https://github.com/axboe/liburing/blob/master/man/io_uring_register.2),

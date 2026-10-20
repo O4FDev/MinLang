@@ -1203,3 +1203,11 @@ controls run portably; `check-completionio-sanitize` adds ASan/UBSan.
 and drained syncs, including the managed ABI and gallery. Unsupported kernels
 fail this separate proof target. See [completion I/O](completion-io.md) for
 resource and durability limits.
+
+`make check-completionio-neodb-kernel` runs the pinned production neo-db WAL
+and snapshot modules through a real typed completion-queue facade. It checks
+batches, 64 segment rotations, completion acknowledgements, descriptor lifetime,
+CRC recovery and snapshot publication at O0/O2 with ownership assertions.
+`check-completionio-neodb-sanitize` adds compiler/runtime/generated ASan/UBSan
+and a real-kernel C probe with leak detection. Both strict Linux targets are
+separate from portable checks; see [the integration contract](completion-io-neodb.md).
