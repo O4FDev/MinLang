@@ -232,12 +232,20 @@ both endpoints of traced ownership operations use the physical payload type.
 The launcher selects scope ownership for `--memory-profile eager`, including
 incremental module builds and release builds. The direct compiler exposes the
 same lowering as `--scope-owners`. It replaces local-frame lookups with explicit
-retain, store and release operations. Each remaining expression producer receives an initialized-null stack
+retain, store and release operations. Each remaining expression producer uses an initialized-null stack
 cell. A control-flow walk places its release at the first statement cleanup or
 return on every reachable path, including both sides of a conditional and loop
 exits. Cleanup visits only cells that can be live there. A producer that could
-repeat before cleanup, or a function needing more than 256 cells, keeps the
-ordinary frame representation.
+repeat before cleanup, or a function needing more than 256 cells before
+coalescing or cell reuse, keeps the ordinary frame representation.
+
+Temporary producers share a cell only when their inclusive visited-line ranges
+are disjoint. Ranges include every reachable line through each first cleanup,
+including backward branches and cleanup paths that skip the producer. Local
+owner cells remain distinct. Reuse preserves every retain, store, ordered
+normal release and poll; it reduces stack storage and null initialization.
+Diagnostic unwind still releases each live root once, without promising an
+order among independent roots.
 
 A plain temporary borrow immediately retained into a local or returned value
 shares that lasting owner's count. This requires adjacent emitted operations;

@@ -183,6 +183,7 @@ names.add("test_allocating_text_read_borrows_keep_parent_owners")
 names.add("test_choice_composition_cycle_scope_owners")
 names.add("test_choice_container_niche_scope_owners")
 names.add("test_choice_scalar_niche_scope_owners")
+names.add("test_temporary_cells_reuse_only_disjoint_cfg_ranges")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -969,6 +970,199 @@ if fixtures.selected("ScopeOwnership", "test_choice_scalar_niche_scope_owners") 
     }
     test.check(test.contains(llvm, "zext i1 ") && test.contains(llvm, " to i64") && test.contains(llvm, " to i1"), "Boolean payload projection must retain i1")
     test.check(!test.contains(llvm, " = inttoptr i64 ") && !test.contains(llvm, " = ptrtoint ptr "), "scalar niche benchmark used pointer conversions")
+}
+
+if fixtures.selected("ScopeOwnership", "test_temporary_cells_reuse_only_disjoint_cfg_ranges") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Graph { edges: List<Graph> }",
+        "function sequential(value: Text): Integer { print(value + \"!\"); print(value + \"?\"); return 0 }",
+        "function branchLoop(box: Box, left: Boolean): Integer {",
+        "let alias = box.text",
+        "if left { print(alias + \"L\") } else { print(alias + \"R\") }",
+        "let index = 0",
+        "while index < 4 {",
+        "index += 1",
+        "if index == 2 { continue }",
+        "print(alias + Text(index))",
+        "if index == 3 { break }",
+        "}",
+        "box.text = \"changed\"",
+        "print(alias)",
+        "return index",
+        "}",
+        "function observeGraph(edges: List<Graph>): Integer { return edges.length }",
+        "function graphReads(value: Graph): Integer {",
+        "let edges = value.edges",
+        "print(edges.length)",
+        "print(observeGraph(value.edges))",
+        "return edges.length",
+        "}",
+        "let original = \"root\" + \".\"",
+        "let alias = original",
+        "print(sequential(original))",
+        "print(alias)",
+        "let box = Box { text: \"branch\" + \"!\" }",
+        "print(branchLoop(box, true))",
+        "print(box.text)",
+        "box.text = \"else\" + \"!\"",
+        "print(branchLoop(box, false))",
+        "print(box.text)",
+        "let graph = Graph { edges: [] }",
+        "graph.edges.add(graph)",
+        "print(graphReads(graph))"
+    ]), "root.!\nroot.?\n0\nroot.\nbranch!L\nbranch!1\nbranch!3\nbranch!\n3\nchanged\nelse!R\nelse!1\nelse!3\nelse!\n3\nchanged\n1\n1\n1\n", environment, ordinary, cycle)
+    for name in ["sequential", "branchLoop", "graphReads"] { checkLowered(llvm, name) }
+    let sequential = body(llvm, "sequential")
+    test.check(test.contains(sequential, "%rc.scope.cells = alloca [1 x ptr]"), "two disjoint statement results must reuse one temporary cell")
+    test.check(sequential.split("call void @minyar_rc_scope_release_v1(").length == 3, "both sequential result drops must remain after coloring")
+    test.check(sequential.split("call void @minyar_rc_scope_poll_v1()").length == 3, "both sequential statement polls must remain after coloring")
+    test.check(body(llvm, "graphReads").split("call void @minyar_rc_retain_traced(").length == 4, "traced temporary/local acquisitions must all keep their barriers")
+
+    executes(compiler, program([
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function touch(value: Text): Integer { return value.length }",
+        "function discard(value: Text): Integer { diagnosticDiscard(); return value.length }",
+        "function diagnosticCompileJob(job: Job) {",
+        "touch(job.text + \" first\")",
+        "if job.mode == 0 { discard(job.text + \" early\") }",
+        "touch(job.text + \" second\")",
+        "if job.mode == 1 { discard(job.text + \" late\") }",
+        "if job.mode == 2 {",
+        "let child = Job { text: \"child\" + \"!\"; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "diagnosticDiscard()",
+        "}",
+        "}",
+        "let saved = Job { text: \"safe\" + \"!\"; mode: 3 }",
+        "for index in 0..3 { print(diagnosticRun(Job { text: \"lost\" + Text(index); mode: index })) }",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ]), "false\nfalse\nfalse\nfalse\ntrue\nsafe!\n", environment, ordinary, cycle)
+
+    // Run the real CFG walk and emitter on ownership IR whose expected
+    // intervals are independent of current source expression lowering.
+    let patterns: List<Text> = []
+    let patternNames = ["cellSequential", "cellBranches", "cellShared", "cellBackward", "cellLoop", "cellPhantom", "cellGap"]
+    let expectedCells = [2, 1, 2, 2, 1, 2, 1]
+    let expectedDrops = [4, 2, 2, 2, 2, 2, 2]
+    let expectedPolls = [2, 2, 1, 2, 2, 1, 4]
+    patterns.add(program([
+        "define void @.minyar.fn.cellSequential(ptr %held, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 1)",
+        "  call void @minyar_rc_local(i64 0, ptr %held)",
+        "  call void @minyar_rc_borrow(ptr %a)", "  call void @observe(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_borrow_traced(ptr %b)", "  call void @observe(ptr %b)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellBranches(i1 %left, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br i1 %left, label %yes, label %no",
+        "yes:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()", "  br label %done",
+        "no:", "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %done",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellShared(i1 %left, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_keep(ptr %a)",
+        "  br i1 %left, label %yes, label %no",
+        "yes:", "  call void @minyar_rc_keep(ptr %b)", "  br label %join",
+        "no:", "  call void @observe(ptr %a)", "  br label %join",
+        "join:", "  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellBackward(ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br label %first",
+        "back:", "  call void @observe(ptr %b)", "  br label %finish",
+        "first:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()", "  br label %second",
+        "second:", "  call void @minyar_rc_keep(ptr %b)", "  br label %back",
+        "finish:", "  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellLoop(i1 %stop, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br label %loop",
+        "loop:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  br i1 %stop, label %done, label %again",
+        "again:", "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %loop",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellPhantom(i1 %stop, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_keep(ptr %a)", "  br label %frontier",
+        "frontier:", "  call void @minyar_rc_step()", "  br i1 %stop, label %done, label %again",
+        "again:", "  call void @minyar_rc_keep(ptr %b)", "  br label %frontier",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellGap(ptr %box, ptr %other, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)",
+        "  %raw = call i64 @minyar_record_get(ptr %box, i64 0)", "  %projected = inttoptr i64 %raw to ptr",
+        "  call void @minyar_rc_borrow(ptr %projected)",
+        "  %same = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %projected)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_borrow_traced(ptr %b)", "  call void @observe(ptr %b)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    let wideLines = ["define void @.minyar.fn.cellWide() {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+    for index in 0..257 {
+        wideLines.add("  call void @minyar_rc_keep(ptr null)")
+        wideLines.add("  call void @minyar_rc_step()")
+    }
+    for line in ["  call void @minyar_rc_leave()", "  ret void", "}"] { wideLines.add(line) }
+    let wide = program(wideLines)
+    patterns.add(wide)
+    let repeated = program([
+        "define void @.minyar.fn.cellRepeated(ptr %a) {", "entry:", "  call void @minyar_rc_enter(i64 0)", "  br label %spin",
+        "spin:", "  call void @minyar_rc_keep(ptr %a)", "  br label %spin", "}"
+    ])
+    patterns.add(repeated)
+    let rejected = program([
+        "define void @.minyar.fn.cellRejected(ptr %a, ptr %b, ptr %c) {", "entry:", "  call void @minyar_rc_enter(i64 0)",
+        "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %spin",
+        "spin:", "  call void @minyar_rc_keep(ptr %c)", "  br label %spin", "}"
+    ])
+    patterns.add(rejected)
+    let input = compiler.directory + "/cell-patterns.ll"
+    let output = compiler.directory + "/cell-lowered.ll"
+    io.writeTextFile(input, joinText(patterns))
+    let symbols = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = symbols.slice(symbols.find("function declarationHash("), symbols.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program([
+        "function failCompiler(message: Text) { fail(message) }",
+        "let touching = scopeBody([\"  call void @minyar_rc_enter(i64 0)\", \"  call void @minyar_rc_keep(ptr %a)\", \"  call void @minyar_rc_step()\", \"  call void @minyar_rc_keep(ptr %b)\", \"  call void @minyar_rc_step()\"])",
+        "if !scopeCleanupPaths(touching) { fail(\"touching range fixture rejected\") }",
+        "touching.firsts[1] = touching.lasts[0]",
+        "if scopeReuseCells(touching) != 2 { fail(\"equal inclusive endpoints must not share a color\") }",
+        "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))",
+        "print(\"cell patterns passed\")"
+    ])
+    executes(compiler, harness, "cell patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    for index in 0..patternNames.length {
+        let emitted = body(lowered, patternNames[index])
+        test.check(test.contains(emitted, "%rc.scope.cells = alloca [" + Text(expectedCells[index]) + " x ptr]"), "CFG interval cell count " + patternNames[index])
+        test.check(emitted.split("call void @minyar_rc_scope_release_v1(").length == expectedDrops[index] + 1, "every original logical drop must survive " + patternNames[index])
+        test.check(emitted.split("call void @minyar_rc_scope_poll_v1()").length == expectedPolls[index] + 1, "every original poll must survive " + patternNames[index])
+    }
+    let mixed = body(lowered, "cellSequential")
+    for name in ["%a", "%b"] { test.check(test.contains(mixed, "store ptr " + name + ", ptr %rc.scope.slot.1"), "temporary color must be offset beyond unchanged local owners") }
+    test.check(test.contains(mixed, "store ptr %held, ptr %rc.scope.slot.0"), "local owner must never be colored with temporaries")
+    test.check(mixed.split("call void @minyar_rc_retain(ptr ").length == 3 && mixed.split("call void @minyar_rc_retain_traced(ptr ").length == 2, "coloring must preserve plain and traced acquisitions")
+    for name in ["cellShared", "cellPhantom"] {
+        let releases: List<Text> = []
+        for line in test.lines(body(lowered, name)) { if test.contains(line, "call void @minyar_rc_scope_release_v1(") { releases.add(line) } }
+        test.check(releases.length == 2, "shared frontier must keep two distinct releases")
+        test.check(releases[0].slice(releases[0].length - 3, releases[0].length) == ".1)" && releases[1].slice(releases[1].length - 3, releases[1].length) == ".0)", "shared/phantom cleanup order must remain reverse logical producer order")
+    }
+    test.check(test.contains(body(lowered, "cellGap"), "call void @minyar_rc_retain_traced(ptr %b)"), "post-coalescer producer gaps must keep traced barriers")
+    test.check(test.contains(body(lowered, "cellGap"), "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_v1("), "post-coalescer op13 return must keep service")
+    test.check(body(lowered, "cellWide") == body(wide, "cellWide"), "257 raw disjoint producers must retain original fallback despite fitting one color")
+    test.check(body(lowered, "cellRepeated") == body(repeated, "cellRepeated"), "a producer repeated before cleanup must retain original fallback")
+    test.check(body(lowered, "cellRejected") == body(rejected, "cellRejected"), "late CFG failure must restore the complete original colorable prefix")
 }
 
 test.removeTree(compiler.directory)

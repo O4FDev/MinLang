@@ -1,7 +1,7 @@
 // This optional final lowering runs after owner transfers and cycle fixups.
-// Each temporary has one initialized-null cell. Walk its control-flow paths
-// to the first cleanup on each path, so branches never lose a condition owner
-// and unrelated temporaries are not scanned at every statement.
+// Walk each temporary's control-flow paths through the first cleanup, so
+// branches never lose a condition owner. Disjoint inclusive visited ranges
+// may share an initialized-null cell; local owners keep distinct cells.
 record ScopeOwnershipBody {
     lines: List<Text>
     operations: List<Integer>
@@ -10,6 +10,8 @@ record ScopeOwnershipBody {
     targets: List<List<Integer>>
     cleanups: List<List<Integer>>
     producers: List<Integer>
+    firsts: List<Integer>
+    lasts: List<Integer>
     owners: Integer
     entry: Integer
 }
@@ -39,7 +41,7 @@ function scopeOperation(line: Text): Integer {
 }
 
 function scopeBody(lines: List<Text>): ScopeOwnershipBody {
-    let body = ScopeOwnershipBody { lines: lines; operations: []; slots: []; values: []; targets: []; cleanups: []; producers: []; owners: 0; entry: -1 }
+    let body = ScopeOwnershipBody { lines: lines; operations: []; slots: []; values: []; targets: []; cleanups: []; producers: []; firsts: []; lasts: []; owners: 0; entry: -1 }
     let labels: List<Text> = []
     let labelKinds: List<Integer> = []
     let labelLines: List<Integer> = []
@@ -288,6 +290,8 @@ function scopeCleanupPaths(body: ScopeOwnershipBody): Boolean {
     let temporary = 0
     while temporary < body.producers.length {
         let producer = body.producers[temporary]
+        let first = producer
+        let last = producer
         let pending: List<Integer> = [producer + 1]
         let cursor = 0
         while cursor < pending.length {
@@ -297,6 +301,8 @@ function scopeCleanupPaths(body: ScopeOwnershipBody): Boolean {
             while line < body.lines.length && !done {
                 if visited[line] == temporary { done = true } else {
                     visited[line] = temporary
+                    if line < first { first = line }
+                    if line > last { last = line }
                     let operation = body.operations[line]
                     if line == producer { return false }
                     if operation == 2 || operation == 3 || operation == 13 {
@@ -316,9 +322,38 @@ function scopeCleanupPaths(body: ScopeOwnershipBody): Boolean {
                 }
             }
         }
+        body.firsts.add(first)
+        body.lasts.add(last)
         temporary = temporary + 1
     }
     return true
+}
+
+function scopeReuseCells(body: ScopeOwnershipBody): Integer {
+    let ends: List<Integer> = []
+    let colors: List<Integer> = []
+    let temporary = 0
+    while temporary < body.producers.length {
+        let color = 0
+        // Include cleanup lines in the range: a cleanup reached without this
+        // producer must never clear another live temporary's shared cell.
+        while color < ends.length && ends[color] >= body.firsts[temporary] { color = color + 1 }
+        if color == ends.length { ends.add(body.lasts[temporary]) } else { ends[color] = body.lasts[temporary] }
+        colors.add(color)
+        body.slots[body.producers[temporary]] = color
+        temporary = temporary + 1
+    }
+    let line = 0
+    while line < body.cleanups.length {
+        let cleanup = 0
+        while cleanup < body.cleanups[line].length {
+            let original = body.cleanups[line][cleanup] - body.owners
+            body.cleanups[line][cleanup] = body.owners + colors[original]
+            cleanup = cleanup + 1
+        }
+        line = line + 1
+    }
+    return ends.length
 }
 
 function scopeCell(slot: Integer): Text {
@@ -346,6 +381,7 @@ function lowerScopeBody(lines: List<Text>): Text {
         while index < lines.length { original.add(lines[index] + "\n"); index = index + 1 }
         return joinText(original)
     }
+    count = body.owners + scopeReuseCells(body)
     let output: List<Text> = []
     let index = 0
     while index < lines.length {
