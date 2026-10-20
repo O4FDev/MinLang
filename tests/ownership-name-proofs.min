@@ -1,0 +1,121 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing name-proof function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function checkMoves(emitted: Text, name: Text, expected: Integer) {
+    let moves = count(emitted, "call void @minyar_rc_local_move_owner(") + count(emitted, "call void @minyar_rc_scope_move_v1(")
+    test.check(moves == expected, name + ": only genuine local names can transfer an owner")
+}
+
+function checkReturnedOwner(emitted: Text, name: Text) {
+    let returns = 0
+    for line in test.lines(emitted) {
+        let prefix = "  ret ptr "
+        if line.length > prefix.length && line.slice(0, prefix.length) == prefix {
+            let value = line.slice(prefix.length, line.length)
+            test.check(value[0] == '%', name + ": match result must have an SSA return operand")
+            test.check(test.contains(emitted, "call void @minyar_rc_retain(ptr " + value + ")"), name + ": retain the actual returned match result")
+            returns += 1
+        }
+    }
+    test.check(returns == 1, name + ": inspect exactly one direct reference return")
+}
+
+function checkConsumer(emitted: Text, name: Text, ordinary: Text, consuming: Text, copies: Integer, takes: Integer) {
+    test.check(count(emitted, "call ptr @" + ordinary + "(") == copies, name + ": ordinary consumer calls")
+    test.check(count(emitted, "call ptr @" + consuming + "(") == takes, name + ": consuming receiver calls")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    // Negative conversions allocate Text outside the immortal numeric cache.
+    function bareMatch(failed: Boolean): Text {
+        let match = Text(-900000000000001)
+        let input = Ok<Text, Text>(Text(-900000000000002))
+        if failed { input = Err<Text, Text>(Text(-900000000000003)) }
+        return match input { Ok(value) { value } Err(error) { error } }
+    }
+    function groupedMatch(failed: Boolean): Text {
+        let match = Text(-900000000000001)
+        let input = Ok<Text, Text>(Text(-900000000000002))
+        if failed { input = Err<Text, Text>(Text(-900000000000003)) }
+        return (((match input { Ok(value) { value } Err(error) { error } })))
+    }
+    function matchText(failed: Boolean): Text {
+        let match = Text(-900000000000001)
+        let input = Ok<Text, Text>(Text(-900000000000002))
+        if failed { input = Err<Text, Text>(Text(-900000000000003)) }
+        return (((match input { Ok(value) { value } Err(error) { error } })) + "!")
+    }
+    function matchList(failed: Boolean): List<Integer> {
+        let match = [-1]
+        let input = Ok<List<Integer>, List<Integer>>([20])
+        if failed { input = Err<List<Integer>, List<Integer>>([30]) }
+        return (((match input { Ok(value) { value } Err(error) { error } }))).appended(99)
+    }
+    function genuineReturn(): Text {
+        let value = Text(-900000000000004)
+        return (((value)))
+    }
+    function genuineText(): Text {
+        let value = Text(-900000000000005)
+        return ((((value)) + "!"))
+    }
+    function genuineList(): List<Integer> {
+        let values = [40]
+        return ((((values)).appended(41)))
+    }
+
+    print(bareMatch(false)); print(bareMatch(true))
+    print(groupedMatch(false)); print(groupedMatch(true))
+    print(matchText(false)); print(matchText(true))
+    let good = matchList(false)
+    print(good[0]); print(good[1])
+    let failed = matchList(true)
+    print(failed[0]); print(failed[1])
+    print(genuineReturn())
+    print(genuineText())
+    let genuine = genuineList()
+    print(genuine[0]); print(genuine[1])
+    """#
+
+test.require(fixtures.compile(frontend, source), "compile ownership name-proof IR")
+let ir = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+for name in ["bareMatch", "groupedMatch", "matchText", "matchList"] { checkMoves(body(ir, name), name, 0) }
+for name in ["bareMatch", "groupedMatch"] { checkReturnedOwner(body(ir, name), name) }
+checkConsumer(body(ir, "matchText"), "matchText", "minyar_join_text", "minyar_join_text_take_left", 1, 0)
+checkConsumer(body(ir, "matchList"), "matchList", "minyar_list_appended", "minyar_list_appended_take", 1, 0)
+for name in ["genuineReturn", "genuineText", "genuineList"] { checkMoves(body(ir, name), name, 1) }
+checkConsumer(body(ir, "genuineText"), "genuineText", "minyar_join_text", "minyar_join_text_take_left", 0, 1)
+checkConsumer(body(ir, "genuineList"), "genuineList", "minyar_list_appended", "minyar_list_appended_take", 0, 1)
+fixtures.executes(frontend, source, "-900000000000002\n-900000000000003\n-900000000000002\n-900000000000003\n-900000000000002!\n-900000000000003!\n20\n99\n30\n99\n-900000000000004\n-900000000000005!\n40\n41\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Ownership name proofs: passed")

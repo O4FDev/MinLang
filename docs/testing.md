@@ -1180,6 +1180,12 @@ Fields, indexes, calls and readonly borrowed parameters keep their existing
 return paths. The sanitized run checks both the compiler and generated programs,
 with the ownership runtime asserting complete cleanup at normal exit.
 
+`make check-ownership-name-proofs` runs match expressions alongside unrelated
+locals named `match`, including grouped returns and Text/List terminal receivers.
+It checks the actual returned SSA owner, ordinary consumer fallbacks, genuine
+grouped-name positives and exact O0/O2 cleanup under native and sanitized
+compilers with both legacy and explicit scoped ownership.
+
 `make check-terminal-return-reuse` checks terminal Text joins and List appends
 with typed local receivers. It covers aliases, side effects during argument
 evaluation, same-source reads, grouped expressions, borrowed parameters and

@@ -54,9 +54,9 @@ ordinary and cached-interface compilation; the duplicate discovery scanners
 have been removed. Header type checking and body emission still consume
 tokens, as do some ownership lookahead helpers.
 
-Reference returns inspect the completed typed expression. A direct local name,
-optionally wrapped in grouping nodes, is a last use on that return path and can
-transfer its local owner. A complete return of a Text join or List `appended`
+Reference returns inspect the completed typed expression. A direct local name
+must be a one-token leaf, optionally wrapped in grouping nodes. It is a last use
+on that return path and can transfer its local owner. A complete return of a Text join or List `appended`
 can also consume a named local left operand or receiver, after all arguments
 have run. Other member, index and call receivers keep their existing rules.
 These proofs need no future-token scan and do not assume heap uniqueness.
