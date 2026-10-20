@@ -534,6 +534,12 @@ Discarded storage is not a secure erase; it remains private and is initialized
 before a later resize or native extension exposes it. `io.readBytesFile(path)` and `io.writeBytesFile(path, bytes)` transfer files
 unchanged. `for byte in bytes` visits each byte as an Integer.
 
+Byte indexing, indexed replacement and `.length` use checked inline helpers,
+including when the runtime is linked as a separate native object. Invalid
+positions and byte values keep the runtime's bounds and range errors. Aliases
+and C-layout views retain their shared storage semantics; a mutating call can
+change the length or storage before the access completes.
+
 `Bytes(text)` is a Text's UTF-8 encoding. `Text(bytes)` validates and copies
 UTF-8 immediately; invalid UTF-8 stops at that conversion. Use
 `text.decode(bytes)` for untrusted input that needs recoverable failure:

@@ -208,3 +208,50 @@ System-allocation LTO List work still has a measured 1.02% CPU gap and more
 retired instructions. Its disassembly identifies memory-effect/alias information
 as remaining work; faster default CPU measurements do not establish lower
 instruction counts. Preserve this distinction when reporting results.
+
+## Checked collection access
+
+Ordinary Bytes indexing, indexed replacement and length use inline LLVM
+helpers even when the runtime is a separate native object. Bytes and List
+helpers expose their nonnegative length and form checked element addresses
+within the backing allocation. These facts do not freeze storage or imply
+that two collections are disjoint. Resizing and other calls retain their
+ordinary memory effects; invalid accesses still use the runtime diagnostic.
+
+`make check-bytes-access check-list-access` checks the raw helpers and optimized
+loops: a proven traversal removes redundant bounds and index-overflow checks
+while retaining checked accumulation. The suites also exercise errors, shared
+mutation and ownership at O0/O2. Their `-sanitize` counterparts instrument the
+compiler and generated memory accesses.
+
+`experiments/codegen/byte-access-study.py` compares two frozen compilers with
+checked C on byte sum, byte copy and Integer List sum. It retains seven
+alternating samples after warmup, validates complete storage and ownership,
+and reports kernel CPU/wall separately from optional whole-process `perf`
+counters. Allocation, warmup, validation and teardown are outside kernel timing.
+There is no timing acceptance threshold.
+
+The October 20 Linux x86_64 campaign uses 65,536 elements and 4,096 kernel calls
+per sample, LLVM 23.1.2, identical sources and a shared default-runtime object.
+With separate O2 objects, median Minyar kernel CPU changes as follows:
+
+| Kernel | Before | After | After / checked C |
+| --- | ---: | ---: | ---: |
+| Byte sum | 435.99 ms | 63.34 ms | 1.170 |
+| Byte copy | 660.51 ms | 96.63 ms | 1.061 |
+| Integer List sum | 91.21 ms | 55.37 ms | 1.029 |
+
+With matching ThinLTO, byte sum/copy remain near their existing C controls
+(after/C 1.028 and 0.956); List sum falls from 87.82 to 54.62 ms (after/C 0.973).
+An initial helper-only variant regressed ThinLTO. Retained ablations identify
+the missing nonnegative length fact; the final IR regression checks its effect.
+[Raw observations, identities and ablations](../experiments/codegen/collection-access-first.json)
+include the unfavorable intermediate measurements. Shared-host timing and these
+three small kernels do not establish complete-parser or codec performance.
+
+`experiments/codegen/safelibs-study.py` measures the maintained zlib/PNG/JPEG
+fixtures through their existing checked APIs. It uses balanced same-process
+baseline/candidate/native batches, retains every order and CPU/wall sample,
+and verifies exact baseline/candidate output and live-object cleanup. Those
+timings include the existing Python wrapper, copies, allocations and guards;
+they must not be substituted for a native decoder-throughput measurement.

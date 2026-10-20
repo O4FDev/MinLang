@@ -59,7 +59,14 @@ for line in test.lines(llvm) {
     }
 }
 test.check(helpers.length == 3, "expected exactly three internal List helpers")
-for body in helpers { test.check(!test.contains(body, "unreachable"), "checked List helper lost fallback") }
+for body in helpers {
+    test.check(!test.contains(body, "unreachable"), "checked List helper lost fallback")
+    test.check(test.contains(body, "!range !{i64 0, i64 -9223372036854775808}"), "List length lost its nonnegative range fact")
+    test.check(test.contains(body, "getelementptr inbounds { ptr, i64, i64 }, ptr %list"), "List header lost its allocation fact")
+    if !test.contains(body, "@.minyar.list.length(") {
+        test.check(test.contains(body, "getelementptr inbounds i64, ptr %values, i64 %position"), "checked List slot lost its allocation fact")
+    }
+}
 test.check(!test.contains(llvm, "noalias"), "List IR incorrectly claims noalias")
 if processInfo.argumentCount() == 0 {
 test.executes(compiler, "let integers = [0]\nintegers[0] = -9223372036854775808\nprint(integers[0])\nlet floats = [1.0]\nfloats[0] = -0.0\nprint(floats[0])\nfloats[0] = 2.5\nfloats[0] *= 4.0\nprint(floats[0])\nlet booleans = [false]\nbooleans[0] = true\nprint(booleans[0])\nlet characters = ['a']\ncharacters[0] = '🙂'\nprint(characters[0])\n", "-9223372036854775808\n-0.0\n10.0\ntrue\n🙂\n")
@@ -78,6 +85,24 @@ test.executes(compiler, "function replace(values: List<Text>): Text {\nvalues[0]
 let main = after(generated(compiler), "define i32 @main(")
 test.check(!test.contains(main, "call void @.minyar.list.set.scalar.checked("), "reference assignment uses scalar setter")
 test.check(test.contains(main, "call void @minyar_list_set_take("), "reference assignment lost ownership transfer")
+test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { optimize.add(flag) }
+for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
+test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize List loop IR")
+let active = false
+let additions = 0
+let functions = 0
+for line in test.lines(io.readTextFile(path + ".optimized.ll")) {
+    if startsWith(line, "define ") && test.contains(line, " @.minyar.fn.sum(") { active = true; functions += 1 }
+    if active {
+        test.check(!test.contains(line, "@minyar_list_get("), "proven List loop retained its redundant bounds fallback")
+        if test.contains(line, "call ") && test.contains(line, "@llvm.sadd.with.overflow.i64(") { additions += 1 }
+        if line == "}" { active = false }
+    }
+}
+test.check(functions == 1 && additions == 1, "List loop must check its sum and eliminate the proven index overflow check")
 }
 test.removeTree(compiler.directory)
 print("list access: passed")
