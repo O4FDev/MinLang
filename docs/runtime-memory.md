@@ -265,6 +265,17 @@ allocation and lazy index work preserve the argument's existing parent owner
 and invoke no user callbacks. A consuming text join qualifies only for its
 borrowed right operand; its left input still needs the transferred owner.
 
+A projected reference packed only for the immediately following retaining
+record/List publication can likewise share the destination's real count. The
+lowering audits the pointer, raw getter value and packed value throughout the
+function; the packed value must occur once in the actual new-value operand.
+Record replacement requires a literal nontaking flag. Generic List setters and
+appenders qualify under the frontend's checked reference-element typing, which
+scalar pointer-bit storage cannot satisfy. List growth preserves existing
+source edges across allocation before publishing the new retained edge. Taking
+publishers, traced borrows, intervening effects and later SSA uses retain their
+temporary owners. The publisher's retain/barrier and cleanup polls remain.
+
 A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
 release these roots before jumping back to their native recovery boundary;
 normal returns clear cells explicitly and unlink the header. Neither the header

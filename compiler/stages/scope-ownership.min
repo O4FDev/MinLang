@@ -124,6 +124,141 @@ function scopeSSAName(value: Text): Boolean {
     return true
 }
 
+function scopePublisherUsesPacked(line: Text, packed: Text): Boolean {
+    let prefix = "  call void @minyar_record_replace("
+    let count = 4
+    let position = 2
+    let replacing = true
+    if scopeStarts(line, "  call void @minyar_record_set_reference(") {
+        prefix = "  call void @minyar_record_set_reference("
+        count = 3
+        replacing = false
+    }
+    if scopeStarts(line, "  call void @minyar_list_set(") {
+        prefix = "  call void @minyar_list_set("
+        count = 3
+        replacing = false
+    }
+    if scopeStarts(line, "  call void @minyar_list_add(") {
+        prefix = "  call void @minyar_list_add("
+        count = 2
+        position = 1
+        replacing = false
+    }
+    if !scopeStarts(line, prefix) || line[line.length - 1] != ')' { return false }
+    let arguments = line.slice(prefix.length, line.length - 1)
+    let parts: List<Text> = []
+    let start = 0
+    let cursor = 0
+    let depth = 0
+    while cursor < arguments.length {
+        let character = arguments[cursor]
+        if character == '(' { depth = depth + 1 }
+        if character == ')' { depth = depth - 1; if depth < 0 { return false } }
+        if character == ',' && depth == 0 {
+            if cursor + 1 >= arguments.length || arguments[cursor + 1] != ' ' { return false }
+            parts.add(arguments.slice(start, cursor))
+            start = cursor + 2
+        }
+        cursor = cursor + 1
+    }
+    if depth != 0 { return false }
+    parts.add(arguments.slice(start, arguments.length))
+    if parts.length != count || !scopeStarts(parts[0], "ptr ") { return false }
+    cursor = 1
+    while cursor < parts.length {
+        if !scopeStarts(parts[cursor], "i64 ") { return false }
+        cursor = cursor + 1
+    }
+    if replacing && parts[3] != "i64 0" { return false }
+    return parts[position] == "i64 " + packed
+}
+
+// Canonical reference publication retains the new edge before replacing an
+// old edge. List growth may allocate first, but preserves every source edge
+// while its independent parent owner stays live. Generic List C APIs do not
+// universally retain: this matcher relies on the frontend's checked reference
+// element types and pointer packing, and never removes the publisher's count.
+function scopeCoalescePublishedBorrows(body: ScopeOwnershipBody) {
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let borrows: List<Integer> = []
+    let valid: List<Boolean> = []
+    let uses: List<Integer> = []
+    let index = 2
+    while index + 2 < body.lines.length {
+        if body.operations[index] == 5 {
+            let value = body.values[index]
+            let prefix = "  " + value + " = inttoptr i64 "
+            let definition = body.lines[index - 1]
+            if scopeSSAName(value) && scopeStarts(definition, prefix) && definition.slice(definition.length - 7, definition.length) == " to ptr" {
+                let raw = definition.slice(prefix.length, definition.length - 7)
+                let packing = body.lines[index + 1]
+                let assignment = packing.find(" = ")
+                if assignment > 2 && scopeStarts(packing, "  %") {
+                    let packed = packing.slice(2, assignment)
+                    let exact = packing == "  " + packed + " = ptrtoint ptr " + value + " to i64"
+                    let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
+                    if exact && projected && scopeSSAName(raw) && scopeSSAName(packed) && scopePublisherUsesPacked(body.lines[index + 2], packed) {
+                        names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length)); names.add(packed.slice(1, packed.length))
+                        kinds.add(1); kinds.add(1); kinds.add(1)
+                        borrows.add(index)
+                        valid.add(true)
+                        uses.add(0)
+                    }
+                }
+            }
+        }
+        index = index + 1
+    }
+    if names.length == 0 { return }
+    let lookup = buildDeclarationIndex(names, kinds)
+    index = 0
+    while index < names.length {
+        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 3] = false }
+        index = index + 1
+    }
+    index = 0
+    while index < body.lines.length {
+        let parts = body.lines[index].split("%")
+        let part = 1
+        while part < parts.length {
+            let text = parts[part]
+            let after = 0
+            while after < text.length && scopeSSACharacter(text[after]) { after = after + 1 }
+            if after == 0 { return }
+            let symbol = findIndexedSymbol(lookup, names, kinds, text.slice(0, after), 1)
+            if symbol >= 0 {
+                let candidate = symbol / 3
+                let borrow = borrows[candidate]
+                if symbol % 3 == 0 {
+                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
+                } else if symbol % 3 == 1 {
+                    if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
+                } else {
+                    if index != borrow + 1 && index != borrow + 2 { valid[candidate] = false }
+                    if index == borrow + 2 { uses[candidate] = uses[candidate] + 1 }
+                }
+            }
+            part = part + 1
+        }
+        index = index + 1
+    }
+    let removed = false
+    index = 0
+    while index < borrows.length {
+        if valid[index] && uses[index] == 1 { body.operations[borrows[index]] = 12; removed = true }
+        index = index + 1
+    }
+    if removed {
+        index = 0
+        while index < body.operations.length {
+            if body.operations[index] == 2 { body.operations[index] = 13 }
+            index = index + 1
+        }
+    }
+}
+
 // These runtime helpers preserve the projected operand's owning parent path.
 // Allocation may service dead work, but cannot consume that live owner. The
 // taking join only qualifies on its borrowed right operand. Audit the raw i64
@@ -248,6 +383,7 @@ function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
 // temporary count. Keep the local/return retain, including its overflow check.
 // No call or control-flow edge can occur before that retaining consumer.
 function scopeCoalesceBorrows(body: ScopeOwnershipBody) {
+    scopeCoalescePublishedBorrows(body)
     scopeCoalesceReadBorrows(body)
     let index = 0
     while index + 3 < body.lines.length {
