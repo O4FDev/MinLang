@@ -34,6 +34,15 @@ Checks reuse the working tree's warm build and retain the existing commit-check
 logs and JSON results. `make check-changed-inputs` tests Git/input handling
 without compiling the language; `make check-check-selection` tests the policy.
 
+`make check-foundations-proofs` selects the Lean version pinned by
+`proofs/lean-toolchain`, builds the ownership and effect semantics, checks the
+required soundness theorem signatures, and audits every project declaration for
+unapproved axioms, `sorry`, unsafe definitions and partial definitions. Its
+negative trust controls must be rejected for the expected reason. The target
+also runs accepted and rejected ownership, DMA and interrupt traces through the
+executable semantics and retains command output, traces and source hashes under
+`build/foundations-proof-evidence`.
+
 For a smaller deterministic fuzz loop, use `make check-fuzz-expressions`,
 `check-fuzz-language`, `check-fuzz-semantic`, `check-fuzz-hostile`,
 `check-fuzz-regressions`, `check-fuzz-seeds` or `check-fuzz-modules`. Each runs
