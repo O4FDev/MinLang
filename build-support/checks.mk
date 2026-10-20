@@ -252,7 +252,7 @@ check-stress: build/minyarc build/minyar-runtime.o build/tooling/tests/fuzz
 check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-sanitize check-ownership check-examples
 
 .PHONY: check-examples
-check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior
+check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior tests/diagnostics/expected/errors/malformed-expression.stderr tests/diagnostics/expected/errors/top-level-malformed-expression.stderr
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 	test "$$(./build/hello)" = "hello from LLVM-backed Minyar"
 	test "$$(./build/language-tour | tr '\n' ' ')" = "The answer is 42 3 2 1 "
@@ -296,9 +296,9 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	! ./build/minyarc tests/errors/top-level-statement.min build/invalid.ll 2> build/top-level-return-error.txt
 	grep -q "use exit(status) to finish a top-level program" build/top-level-return-error.txt
 	! ./build/minyarc tests/errors/malformed-expression.min build/invalid.ll 2> build/expression-error.txt
-	grep -q "line 2, column 16: expected an expression, found ')'" build/expression-error.txt
+	cmp tests/diagnostics/expected/errors/malformed-expression.stderr build/expression-error.txt
 	! ./build/minyarc tests/errors/top-level-malformed-expression.min build/invalid.ll 2> build/top-level-expression-error.txt
-	grep -q "line 1, column 12: expected an expression, found ')'" build/top-level-expression-error.txt
+	cmp tests/diagnostics/expected/errors/top-level-malformed-expression.stderr build/top-level-expression-error.txt
 	! ./build/minyarc tests/errors/duplicate-function.min build/invalid.ll 2> build/duplicate-function-error.txt
 	grep -q "module declares 'duplicate' more than once" build/duplicate-function-error.txt
 	! ./build/minyarc tests/errors/duplicate-record.min build/invalid.ll 2> build/duplicate-record-error.txt
