@@ -30,6 +30,11 @@ values are also opaque. Scalarized records are reconstructed as values from
 their existing field operands. Closures describe their parameters and captured
 values; parallel workers describe their captures, loop bindings and locals.
 
+Records and choices with more than 64 descriptor fields, or a choice tag table
+larger than 512 bytes, are opaque. This prevents a wide declaration's metadata
+from being repeated across every function that uses it. Executable layouts and
+the supported number of source fields are unchanged.
+
 ## Optional value formatters
 
 The scripts in `tools/debugger` add bounded previews of Text, Bytes, typed
