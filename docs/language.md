@@ -139,6 +139,10 @@ print(Float(7) / 2.0)  // 3.5
 print(Integer(-7.9))   // -7
 ```
 
+Exact integral Floats strictly inside ±2^53 format directly as decimal digits
+followed by `.0`, without calling the C formatting or parsing libraries.
+Zero retains its sign. Other finite values keep the shortest-roundtrip rule.
+
 Integer and Float never mix implicitly; convert with `Float(integer)` or
 `Integer(float)`. `Integer` truncates toward zero and stops if the Float is NaN
 or outside the Integer range. `Integer(character)` gives a code point and
@@ -361,12 +365,20 @@ These operations preserve embedded zero bytes and control characters; they do
 not strip marks or apply compatibility normalization. Ordinary `==`, ordering,
 hashing, `length` and indexing retain their exact-content and scalar contracts.
 
+`unicode.uppercased(value)` and `unicode.lowercased(value)` apply full default
+Unicode casing for display, including multi-character expansions (`ß` to `SS`)
+and Greek final sigma. They use the original input for context and preserve
+its scalar order. They do not implicitly normalize. Default casing is
+locale-independent; Turkish, Azerbaijani and Lithuanian tailoring is not applied.
+Use `caseFold` when making comparison keys rather than comparing lowercase text.
+
 The Unicode provider is linked when the `unicode` module is imported.
 Counting scans once and allocates no boundary storage. Boundary lists scan
 twice and allocate one temporary byte per scalar plus their Integer List;
 splitting also creates Text slices and may build the scalar-offset cache.
-Normalization and folding allocate native temporary buffers and copy their
+Normalization, folding and display casing allocate native temporary buffers and copy their
 output into managed Text. Folding first allocates a decomposed intermediate.
+Casing uses two linear passes with a checked, exactly sized output buffer.
 Native scratch storage uses the system allocator rather than the selected
 Minyar heap profile. Unicode tables add read-only program data when linked.
 

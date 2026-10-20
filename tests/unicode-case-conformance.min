@@ -1,0 +1,146 @@
+// Parse the published source files independently of the generated native tables.
+use "unicode" as text
+use "io" as io
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function hexadecimal(word: Text): Integer {
+    check(word != "", "empty Unicode corpus hexadecimal value")
+    let value = 0
+    for character in word {
+        let digit = Integer(character) - 48
+        if character >= 'A' && character <= 'F' { digit = Integer(character) - 55 }
+        check(digit >= 0 && digit < 16, "invalid Unicode corpus hexadecimal digit")
+        value = value * 16 + digit
+    }
+    check(value <= 0x10FFFF && (value < 0xD800 || value > 0xDFFF), "invalid Unicode corpus scalar")
+    return value
+}
+
+function scalars(field: Text): Text {
+    let pieces: List<Text> = []
+    for word in field.trim().split(" ") {
+        if word != "" { pieces.add(Text(Character(hexadecimal(word)))) }
+    }
+    return joinText(pieces)
+}
+
+record SpecialMappings { upper: Map<Integer, Text>; lower: Map<Integer, Text>; count: Integer }
+
+function specialMappings(): SpecialMappings {
+    let upper: Map<Integer, Text> = Map()
+    let lower: Map<Integer, Text> = Map()
+    let count = 0
+    let conditional = 0
+    let corpus = io.readTextFile("tests/fixtures/unicode-18.0.0/SpecialCasing.txt")
+    check(corpus.startsWith("# SpecialCasing-18.0.0.txt\n"), "special-casing corpus version changed")
+    for raw in corpus.split("\n") {
+        let line = raw.split("#")[0].trim()
+        if line == "" { continue }
+        let fields = line.split(";")
+        check(fields.length >= 5, "incomplete special-casing vector")
+        if fields[4].trim() != "" { conditional += 1; continue }
+        let scalar = hexadecimal(fields[0].trim())
+        check(!upper.has(scalar), "duplicate unconditional special-casing source")
+        upper[scalar] = scalars(fields[3])
+        lower[scalar] = scalars(fields[1])
+        let source = Text(Character(scalar))
+        check(text.uppercased(source) == upper[scalar], "special uppercase U+" + fields[0])
+        check(text.lowercased(source) == lower[scalar], "special lowercase U+" + fields[0])
+        count += 1
+    }
+    check(count == 104 && conditional == 16, "special-casing corpus is incomplete")
+    return SpecialMappings { upper: upper; lower: lower; count: count }
+}
+
+function scalarMappings(special: SpecialMappings): Integer {
+    let count = 0
+    let skipped = 0
+    let simpleUpper = 0
+    let simpleLower = 0
+    let changedUpper = 0
+    let changedLower = 0
+    let expandedUpper = 0
+    let expandedLower = 0
+    let specialSources = 0
+    for raw in io.readTextFile("tests/fixtures/unicode-18.0.0/UnicodeData.txt").split("\n") {
+        if raw == "" { continue }
+        let fields = raw.split(";")
+        check(fields.length == 15, "incomplete UnicodeData vector")
+        // Surrogates are not scalars; range markers are not literal entries.
+        if fields[2] == "Cs" || fields[1].endsWith(", First>") || fields[1].endsWith(", Last>") { skipped += 1; continue }
+        let scalar = hexadecimal(fields[0])
+        let source = Text(Character(scalar))
+        let expectedUpper = source
+        let expectedLower = source
+        if fields[12] != "" { expectedUpper = scalars(fields[12]); simpleUpper += 1 }
+        if fields[13] != "" { expectedLower = scalars(fields[13]); simpleLower += 1 }
+        if special.upper.has(scalar) {
+            expectedUpper = special.upper[scalar]
+            expectedLower = special.lower[scalar]
+            specialSources += 1
+        }
+        check(text.uppercased(source) == expectedUpper, "UnicodeData uppercase U+" + fields[0])
+        check(text.lowercased(source) == expectedLower, "UnicodeData lowercase U+" + fields[0])
+        if expectedLower != source { special.lower[scalar] = expectedLower }
+        if expectedUpper != source { changedUpper += 1 }
+        if expectedLower != source { changedLower += 1 }
+        if expectedUpper.length > 1 { expandedUpper += 1 }
+        if expectedLower.length > 1 { expandedLower += 1 }
+        count += 1
+    }
+    check(count == 41297 && skipped == 44, "UnicodeData corpus is incomplete")
+    check(simpleUpper == 1525 && simpleLower == 1508, "simple casing counts changed")
+    check(changedUpper == 1601 && changedLower == 1508, "full casing counts changed")
+    check(expandedUpper == 103 && expandedLower == 1, "full casing expansion counts changed")
+    check(specialSources == special.count, "special-casing sources are missing from UnicodeData")
+    return count
+}
+
+// Raw property membership sets exercise every range endpoint and its neighbors
+// independently of the generated native range tables and binary search.
+function propertyContexts(special: SpecialMappings) {
+    let cased: Set<Integer> = Set()
+    let ignored: Set<Integer> = Set()
+    let probes: Set<Integer> = Set()
+    let corpus = io.readTextFile("tests/fixtures/unicode-18.0.0/DerivedCoreProperties.txt")
+    check(corpus.startsWith("# DerivedCoreProperties-18.0.0.txt\n"), "casing properties version changed")
+    for raw in corpus.split("\n") {
+        let line = raw.split("#")[0].trim()
+        if line == "" { continue }
+        let fields = line.split(";")
+        let property = fields[1].trim()
+        if property != "Cased" && property != "Case_Ignorable" { continue }
+        let bounds = fields[0].trim().split("..")
+        let first = hexadecimal(bounds[0])
+        let last = hexadecimal(bounds[bounds.length - 1])
+        for scalar in first..(last + 1) {
+            if property == "Cased" { cased.add(scalar) } else { ignored.add(scalar) }
+        }
+        for scalar in [first - 1, first, last, last + 1] {
+            if scalar >= 0 && scalar <= 0x10FFFF && (scalar < 0xD800 || scalar > 0xDFFF) { probes.add(scalar) }
+        }
+    }
+    check(cased.length == 4797 && ignored.length == 2890, "casing property membership counts changed")
+    for scalar in probes {
+        let source = Text(Character(scalar))
+        let mapped = source
+        if special.lower.has(scalar) { mapped = special.lower[scalar] }
+        let preceding = "σ"
+        if cased.contains(scalar) && !ignored.contains(scalar) { preceding = "ς" }
+        check(text.lowercased(source + "Σ") == mapped + preceding, "preceding property context " + Text(scalar))
+        let following = "ς"
+        if cased.contains(scalar) && !ignored.contains(scalar) { following = "σ" }
+        let finalMapped = mapped
+        if scalar == 0x3A3 { finalMapped = "ς" }
+        check(text.lowercased("AΣ" + source) == "a" + following + finalMapped, "following property context " + Text(scalar))
+    }
+}
+
+check(text.unicodeVersion() == "18.0.0", "Unicode data version changed")
+let special = specialMappings()
+let count = scalarMappings(special)
+propertyContexts(special)
+print("Unicode 18 full casing: " + Text(count) + " scalar, " + Text(special.count) + " unconditional special mappings passed")

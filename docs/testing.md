@@ -223,6 +223,18 @@ column invariants and canonical-fold consistency; folding checks idempotence.
 Both targets are in the portable gate. `check-unicode-text-sanitize` repeats
 the focused cases and full corpora with ASan/UBSan, including the native provider.
 
+`make check-unicode-case` checks full default uppercase and lowercase mappings
+against 41,297 UnicodeData scalar rows and all 104 unconditional SpecialCasing
+rows, at O0/O2. Focused ownership cases cover expansions, original-order casing,
+embedded zero bytes and Greek final sigma, including overlapping Cased and
+Case_Ignorable properties. `check-unicode-case-sanitize` repeats these checks
+with ASan/UBSan. `check-unicode-case-data` regenerates the compact mapping and
+property tables from the pinned sources and rejects stale generated contents.
+
+`check-runtime-numeric` also requires zero `snprintf` and `strtod` calls when
+formatting the 2,001 exact Float integers from −1,000 through 1,000. Its bounded
+buffer probes include the integral fast path near ±2^53, signed zero and specials.
+
 `make check-result-network` exercises typed sockets, TLS, workers and HTTP at
 O0/O2 with the ownership oracle. Loopback peers cover nonblocking accept,
 would-block, empty datagrams, truncation prefixes, batches and stream EOF.

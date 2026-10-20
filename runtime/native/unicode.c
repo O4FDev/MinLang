@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <limits.h>
 #define UTF8PROC_STATIC
-#include "../../vendor/utf8proc/utf8proc.c"
+#include "../../vendor/utf8proc/utf8proc.h"
+#include "unicode_case_data.h"
 
 static utf8proc_ssize_t unicode_length(const MinyarText *source) {
     if (source->byte_length < 0 || (uint64_t)source->byte_length > PTRDIFF_MAX)
@@ -86,3 +87,90 @@ MinyarText *minyar_unicode_caseFold(const MinyarText *source) {
     utf8proc_free(output);
     return result;
 }
+
+static bool unicode_case_property(uint32_t scalar, const UnicodeCaseRange *ranges, size_t count) {
+    size_t first = 0, after = count;
+    while (first < after) {
+        size_t middle = first + (after - first) / 2;
+        if (scalar < ranges[middle].first) after = middle;
+        else if (scalar > ranges[middle].last) first = middle + 1;
+        else return true;
+    }
+    return false;
+}
+
+#define UNICODE_CASE_PROPERTY(scalar, name) \
+    unicode_case_property((uint32_t)(scalar), unicode_##name##_ranges, \
+                          sizeof(unicode_##name##_ranges) / sizeof(unicode_##name##_ranges[0]))
+
+static const UnicodeCaseMapping *unicode_case_mapping(uint32_t scalar) {
+    size_t first = 0, after = sizeof(unicode_case_mappings) / sizeof(unicode_case_mappings[0]);
+    while (first < after) {
+        size_t middle = first + (after - first) / 2;
+        if (scalar < unicode_case_mappings[middle].scalar) after = middle;
+        else if (scalar > unicode_case_mappings[middle].scalar) first = middle + 1;
+        else return &unicode_case_mappings[middle];
+    }
+    return NULL;
+}
+
+static bool unicode_following_cased(const MinyarText *source, utf8proc_ssize_t position) {
+    while (position < unicode_length(source)) {
+        utf8proc_int32_t scalar = unicode_next(source, &position);
+        // Case_Ignorable takes precedence: U+0345 also has the Cased property.
+        if (!UNICODE_CASE_PROPERTY(scalar, case_ignorable))
+            return UNICODE_CASE_PROPERTY(scalar, cased);
+    }
+    return false;
+}
+
+/* Preserve the original scalar order: display casing does not normalize.
+ * Only sigma needs lookahead. Its ignorable run ends before the next sigma,
+ * so the lookahead runs do not overlap and each pass remains linear. */
+static size_t unicode_case_pass(const MinyarText *source, bool upper, unsigned char *output) {
+    utf8proc_ssize_t position = 0, length = unicode_length(source);
+    size_t used = 0;
+    bool preceding_cased = false;
+    while (position < length) {
+        utf8proc_int32_t scalar = unicode_next(source, &position);
+        const UnicodeCaseMapping *special = unicode_case_mapping((uint32_t)scalar);
+        uint32_t simple;
+        const uint32_t *mapping;
+        size_t count = 1;
+        if (!upper && scalar == 0x3A3 && preceding_cased && !unicode_following_cased(source, position)) {
+            simple = 0x3C2;
+            mapping = &simple;
+        } else if (special) {
+            mapping = upper ? special->upper : special->lower;
+            count = upper ? special->upper_count : special->lower_count;
+        } else {
+            simple = (uint32_t)(upper ? utf8proc_toupper(scalar) : utf8proc_tolower(scalar));
+            mapping = &simple;
+        }
+        for (size_t index = 0; index < count; index++) {
+            unsigned char bytes[4];
+            size_t width = (size_t)utf8proc_encode_char((utf8proc_int32_t)mapping[index], bytes);
+            if (width == 0 || used > (size_t)PTRDIFF_MAX - width)
+                minyar_native_stop("the cased Text is too large.");
+            if (output) memcpy(output + used, bytes, width);
+            used += width;
+        }
+        if (!upper && !UNICODE_CASE_PROPERTY(scalar, case_ignorable))
+            preceding_cased = UNICODE_CASE_PROPERTY(scalar, cased);
+    }
+    return used;
+}
+
+static MinyarText *unicode_case(const MinyarText *source, bool upper) {
+    size_t length = unicode_case_pass(source, upper, NULL);
+    unsigned char *output = malloc(length + 1);
+    if (!output) minyar_native_stop("there is not enough memory for cased Text.");
+    unicode_case_pass(source, upper, output);
+    MinyarText *result = minyar_native_copy_text(output, (long long)length);
+    free(output);
+    return result;
+}
+
+MinyarText *minyar_unicode_uppercased(const MinyarText *source) { return unicode_case(source, true); }
+MinyarText *minyar_unicode_lowercased(const MinyarText *source) { return unicode_case(source, false); }
+#undef UNICODE_CASE_PROPERTY
