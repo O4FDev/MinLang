@@ -69,6 +69,10 @@ function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List
         "  (void)scope_return_before; assert(0);",
         "#endif",
         "  return 1;",
+        "}",
+        "long long minyar_runtime_scopeCompareProgress(_Bool value) {",
+        "  assert(value);",
+        "  return minyar_runtime_scopeBorrowProgress(NULL);",
         "}"
     ])
     let path = compiler.directory + "/" + name
@@ -112,6 +116,8 @@ function executes(compiler: test.Compiler, source: Text, expected: Text, environ
 let names = ["test_direct_owners_and_borrowed_parameter_moves", "test_condition_owners_on_both_branches", "test_loop_false_exit_break_continue_and_nested_loops", "test_early_return_and_try_cleanup", "test_aliases_survive_later_argument_mutation", "test_escaping_closure_and_cycle_owners", "test_repeated_and_nested_diagnostic_unwind", "test_large_function_keeps_legacy_fallback", "test_scope_modes_and_private_symbols", "test_mixed_scoped_and_legacy_diagnostic_unwind", "test_module_state_replay_lowers_cached_owners", "test_recoverable_call_depth_cleans_scope_owners", "test_large_cycle_drains_at_final_scope"]
 names.add("test_eager_launcher_selects_scope_owners")
 names.add("test_plain_borrows_share_local_and_return_owners")
+names.add("test_comparison_borrows_have_no_later_uses")
+names.add("test_comparison_borrow_ssa_boundaries")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -633,6 +639,156 @@ if fixtures.selected("ScopeOwnership", "test_plain_borrows_share_local_and_retur
         let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
         test.check(observed.status == 73 && test.contains(observed.errorOutput, "scope return did not service pending cycles"), "missing return poll must fail the pending-cycle oracle " + optimization + "\n" + observed.output + observed.errorOutput)
     }
+}
+
+if fixtures.selected("ScopeOwnership", "test_comparison_borrows_have_no_later_uses") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "function matches(box: Box): Boolean { return \"seed!\" == box.text }",
+        "function matchesLeft(box: Box): Boolean { return box.text == \"seed!\" }",
+        "function listMatches(values: List<Text>): Boolean { return \"seed!\" == values[0] }",
+        "function alternate(box: Box, take: Boolean): Boolean {",
+        "if take { return \"seed!\" == box.text }",
+        "return false",
+        "}",
+        "function mixed(box: Box, early: Boolean): Text {",
+        "if early { if \"seed!\" == box.text { return box.text } }",
+        "return box.text",
+        "}",
+        "function replacedAfter(box: Box): Boolean {",
+        "let same = \"seed!\" == box.text",
+        "box.text = \"changed\"",
+        "return same",
+        "}",
+        "function replace(box: Box): Text { box.text = \"changed\"; return \"seed!\" }",
+        "function separated(box: Box): Boolean { return box.text == replace(box) }",
+        "function repeated(box: Box): Integer {",
+        "let count = 0",
+        "for index in 0..4 {",
+        "if \"seed!\" == box.text { count += 1; continue }",
+        "if index == 3 { break }",
+        "}",
+        "return count",
+        "}",
+        "let box = Box { text: \"seed\" + \"!\" }",
+        "print(matches(box))",
+        "print(matchesLeft(box))",
+        "print(listMatches([box.text]))",
+        "print(alternate(box, true))",
+        "print(alternate(box, false))",
+        "print(mixed(box, true))",
+        "print(mixed(box, false))",
+        "print(repeated(box))",
+        "print(replacedAfter(box))",
+        "print(box.text)",
+        "box.text = \"seed\" + \"!\"",
+        "print(separated(box))",
+        "print(box.text)"
+    ]), "true\ntrue\ntrue\ntrue\nfalse\nseed!\nseed!\n4\ntrue\nchanged\ntrue\nchanged\n", environment, ordinary, cycle)
+    for name in ["matches", "matchesLeft", "listMatches", "alternate", "replacedAfter", "repeated"] {
+        checkLowered(llvm, name)
+        let emitted = body(llvm, name)
+        test.check(test.contains(emitted, "%rc.scope.cells = alloca [0 x ptr]"), "comparison-only projection must not acquire a temporary owner in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "comparison-only projection must omit its redundant retain in " + name)
+        test.check(test.contains(emitted, "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_v1("), "comparison return must service pending work in " + name)
+    }
+    let exitPoll = "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_v1("
+    test.check(body(llvm, "alternate").split(exitPoll).length == 3, "both exits must poll, including the path that skips comparison")
+    let mixed = body(llvm, "mixed")
+    test.check(test.contains(mixed, "%rc.scope.cells = alloca [0 x ptr]"), "comparison and borrowed-return coalescing must combine without temporary cells")
+    test.check(mixed.split("call void @minyar_rc_retain(").length == 3 && mixed.split(exitPoll).length == 3, "both mixed reference returns must retain their result and poll")
+    test.check(test.contains(body(llvm, "separated"), "call void @minyar_rc_retain("), "mutating later argument must keep the earlier comparison operand alive")
+    let progress = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Link { edges: List<Link> }",
+        "function scopeArmBorrow(box: Box): Box { native \"runtime\" }",
+        "function scopeCompareProgress(value: Boolean): Integer { native \"runtime\" }",
+        "function compared(box: Box): Boolean { return \"service!\" == box.text }",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "let box = Box { text: \"service\" + \"!\" }",
+        "print(scopeCompareProgress(compared(scopeArmBorrow(box))))",
+        "print(box.text)"
+    ]), "1\nservice!\n", environment, ordinary, cycle)
+    let progressBody = body(progress, "compared")
+    test.check(test.contains(progressBody, "%rc.scope.cells = alloca [0 x ptr]"), "comparison pending-work probe must use no temporary cells")
+    let parts = progress.split(progressBody)
+    test.check(parts.length == 2, "comparison mutation must identify exactly one body")
+    let withoutPoll = joinText(progressBody.split("  call void @minyar_rc_scope_poll_v1()\n"))
+    test.check(withoutPoll != progressBody, "comparison mutation must remove its return poll")
+    let mutant = parts[0] + withoutPoll + parts[1]
+    if test.addressEnabled(compiler.flags) { mutant = test.instrument(mutant) }
+    let path = compiler.directory + "/missing-comparison-poll"
+    io.writeTextFile(path + ".ll", mutant)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", cycle, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link comparison pending-work mutation " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.check(observed.status == 73 && test.contains(observed.errorOutput, "scope return did not service pending cycles"), "missing comparison poll must fail the pending-cycle oracle " + optimization + "\n" + observed.output + observed.errorOutput)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") {
+    // Execute the real lowering and symbol index on deliberately varied LLVM.
+    // These patterns exercise lifetime forms the current emitter never emits.
+    let patterns: List<Text> = []
+    let expectedCells = [0, 0, 1, 1, 1, 1, 1, 1, 0]
+    for index in 0..expectedCells.length {
+        let lines = ["define zeroext i1 @.minyar.fn.probe" + Text(index) + "(ptr %box, ptr %other) {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+        if index == 8 { lines.add("  %value.10 = select i1 true, ptr %other, ptr %box") }
+        let getter = "@minyar_record_get"
+        if index == 1 { getter = "@.minyar.list.get.checked" }
+        lines.add("  %raw = call i64 " + getter + "(ptr %box, i64 0)")
+        lines.add("  %value.1 = inttoptr i64 %raw to ptr")
+        let borrow = "borrow"
+        if index == 7 { borrow = "borrow_traced" }
+        lines.add("  call void @minyar_rc_" + borrow + "(ptr %value.1)")
+        if index == 4 { lines.add("  call void @mutate(ptr %box)") }
+        if index == 6 { lines.add("  %equal = call zeroext i1 @other() ; = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %value.1)") }
+        else {
+            let other = "%other"
+            if index == 1 { other = "%value.1" }
+            lines.add("  %equal = call zeroext i1 @minyar_texts_are_equal(ptr " + other + ", ptr %value.1)")
+        }
+        if index == 2 { lines.add("  call void @observe(ptr %value.1)") }
+        if index == 3 {
+            lines.add("  %later = inttoptr i64 %raw to ptr")
+            lines.add("  call void @observe(ptr %later)")
+        }
+        if index == 5 { lines.add("  call void @observe(ptr %\"value.1\")") }
+        if index == 8 { lines.add("  call void @observe(ptr %value.10)") }
+        for line in ["  call void @minyar_rc_leave()", "  ret i1 %equal", "}"] { lines.add(line) }
+        patterns.add(program(lines))
+    }
+    let wide = test.replace(patterns[0], "@.minyar.fn.probe0(", "@.minyar.fn.wide(")
+    wide = test.replace(wide, "@minyar_rc_enter(i64 0)", "@minyar_rc_enter(i64 257)")
+    patterns.add(wide)
+    let looping = test.replace(patterns[0], "@.minyar.fn.probe0(", "@.minyar.fn.looping(")
+    looping = test.replace(looping, "  call void @minyar_rc_leave()\n  ret i1 %equal", "  call void @minyar_rc_keep(ptr null)\n  br label %entry")
+    patterns.add(looping)
+    let input = compiler.directory + "/comparison-patterns.ll"
+    let output = compiler.directory + "/comparison-lowered.ll"
+    io.writeTextFile(input, joinText(patterns))
+    let symbols = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = symbols.slice(symbols.find("function declarationHash("), symbols.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program([
+        "function failCompiler(message: Text) { fail(message) }",
+        "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))",
+        "print(\"patterns passed\")"
+    ])
+    executes(compiler, harness, "patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    for index in 0..expectedCells.length {
+        let emitted = body(lowered, "probe" + Text(index))
+        test.check(test.contains(emitted, "%rc.scope.cells = alloca [" + Text(expectedCells[index]) + " x ptr]"), "comparison SSA boundary mismatch " + Text(index))
+        if index == 7 { test.check(test.contains(emitted, "@minyar_rc_retain_traced("), "traced comparison must keep its barrier") }
+    }
+    test.check(body(lowered, "wide") == body(wide, "wide"), "raw cell cap must preserve the complete original body")
+    test.check(body(lowered, "looping") == body(looping, "looping"), "failed CFG proof after coalescing must preserve the complete original body")
 }
 
 test.removeTree(compiler.directory)

@@ -108,17 +108,140 @@ function scopeBody(lines: List<Text>): ScopeOwnershipBody {
     return body
 }
 
+function scopeSSACharacter(value: Character): Boolean {
+    return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '.' || value == '$' || value == '-'
+}
+
+function scopeSSAName(value: Text): Boolean {
+    if value.length < 2 || value[0] != '%' { return false }
+    let index = 1
+    while index < value.length {
+        if !scopeSSACharacter(value[index]) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+// Text equality only reads its operands. A freshly projected plain pointer
+// used by that next call alone needs no temporary owner. Audit the raw i64
+// too: another inttoptr could otherwise hide a later use of the same value.
+function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let borrows: List<Integer> = []
+    let valid: List<Boolean> = []
+    let consumed: List<Boolean> = []
+    let index = 2
+    while index + 1 < body.lines.length {
+        if body.operations[index] == 5 {
+            let value = body.values[index]
+            let prefix = "  " + value + " = inttoptr i64 "
+            let definition = body.lines[index - 1]
+            if scopeSSAName(value) && scopeStarts(definition, prefix) && definition.slice(definition.length - 7, definition.length) == " to ptr" {
+                let raw = definition.slice(prefix.length, definition.length - 7)
+                let consumer = body.lines[index + 1]
+                let assignment = consumer.find(" = ")
+                let equality = false
+                if assignment > 2 && scopeStarts(consumer, "  %") {
+                    let call = " = call zeroext i1 @minyar_texts_are_equal("
+                    if scopeSSAName(consumer.slice(2, assignment)) && scopeStarts(consumer.slice(assignment, consumer.length), call) && consumer[consumer.length - 1] == ')' {
+                        // Literal Text operands contain a getelementptr
+                        // constant expression with its own commas.
+                        let arguments = consumer.slice(assignment + call.length, consumer.length - 1)
+                        let cursor = 0
+                        let depth = 0
+                        let separator = -1
+                        let supported = true
+                        while cursor < arguments.length {
+                            let character = arguments[cursor]
+                            if character == '(' { depth = depth + 1 }
+                            if character == ')' { depth = depth - 1; if depth < 0 { supported = false } }
+                            if character == ',' && depth == 0 {
+                                if separator >= 0 { supported = false }
+                                separator = cursor
+                            }
+                            cursor = cursor + 1
+                        }
+                        if supported && depth == 0 && separator > 0 && separator + 2 < arguments.length && arguments[separator + 1] == ' ' {
+                            equality = arguments.slice(0, separator) == "ptr " + value || arguments.slice(separator + 2, arguments.length) == "ptr " + value
+                        }
+                    }
+                }
+                let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
+                if equality && scopeSSAName(raw) && projected {
+                    names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length))
+                    kinds.add(1); kinds.add(1)
+                    borrows.add(index)
+                    valid.add(true)
+                    consumed.add(false)
+                }
+            }
+        }
+        index = index + 1
+    }
+    if names.length == 0 { return }
+    let lookup = buildDeclarationIndex(names, kinds)
+    index = 0
+    while index < names.length {
+        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 2] = false }
+        index = index + 1
+    }
+    index = 0
+    while index < body.lines.length {
+        let parts = body.lines[index].split("%")
+        let part = 1
+        while part < parts.length {
+            let text = parts[part]
+            let after = 0
+            while after < text.length && scopeSSACharacter(text[after]) { after = after + 1 }
+            // Quoted or unsupported local identifiers require a different
+            // parser. Conservatively keep every comparison borrow here.
+            if after == 0 { return }
+            let symbol = findIndexedSymbol(lookup, names, kinds, text.slice(0, after), 1)
+            if symbol >= 0 {
+                let candidate = symbol / 2
+                let borrow = borrows[candidate]
+                if symbol % 2 == 0 {
+                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
+                    if index == borrow + 1 { consumed[candidate] = true }
+                } else if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
+            }
+            part = part + 1
+        }
+        index = index + 1
+    }
+    let removed = false
+    index = 0
+    while index < borrows.length {
+        if valid[index] && consumed[index] {
+            body.operations[borrows[index]] = 12
+            removed = true
+        }
+        index = index + 1
+    }
+    if removed {
+        // A removed borrow might have been the only release at a return.
+        // Keep a service point on every exit, including branch/loop exits.
+        index = 0
+        while index < body.operations.length {
+            if body.operations[index] == 2 { body.operations[index] = 13 }
+            index = index + 1
+        }
+    }
+}
+
 // A plain borrow immediately followed by a lasting owner needs no separate
 // temporary count. Keep the local/return retain, including its overflow check.
 // No call or control-flow edge can occur before that retaining consumer.
 function scopeCoalesceBorrows(body: ScopeOwnershipBody) {
+    scopeCoalesceReadBorrows(body)
     let index = 0
     while index + 3 < body.lines.length {
         if body.operations[index] == 5 {
             let value = body.values[index]
             let local = body.operations[index + 1] == 6 && body.values[index + 1] == value
             local = local && scopeStarts(body.lines[index + 2], "  store ptr " + value + ", ptr %local.") && body.operations[index + 3] == 3
-            let returned = body.lines[index + 1] == "  call void @minyar_rc_retain(ptr " + value + ")" && body.operations[index + 2] == 2
+            let returned = body.lines[index + 1] == "  call void @minyar_rc_retain(ptr " + value + ")" && (body.operations[index + 2] == 2 || body.operations[index + 2] == 13)
             let result = index + 3
             if body.lines[result] == "  call void @minyar_stack_leave()" { result = result + 1 }
             returned = returned && result < body.lines.length && body.lines[result] == "  ret ptr " + value

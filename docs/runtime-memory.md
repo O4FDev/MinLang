@@ -220,6 +220,13 @@ intervening calls, branches and traced borrows keep their temporary owners.
 Local cleanup polls remain, and a coalesced return explicitly services pending
 work before unlinking its scope.
 
+A projected Text used only by the immediately following text equality call
+needs no temporary count. This requires a plain borrow from the generated
+record or checked List getter. The lowering audits every use of both the
+pointer and its raw field value; another use, an intervening call or an
+unsupported local identifier keeps the owner. Traced borrows keep their
+barriers. Statement and return service points remain present.
+
 A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
 release these roots before jumping back to their native recovery boundary;
 normal returns clear cells explicitly and unlink the header. Neither the header
