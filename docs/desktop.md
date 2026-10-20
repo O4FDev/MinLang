@@ -30,8 +30,9 @@ app.dispose(window)
 
 All AppKit operations run on the main thread. Initialize once before opening
 a window. This renderer supports one active window at a time because it owns
-the application's native event queue. Closing a window or quitting makes `nextEvent` return false; `dispose`
-releases its native controls and may safely be called again.
+the application's native event queue. Closing a window or quitting makes
+`nextEvent` return false; `dispose` releases its native controls and may safely
+be called again.
 
 `label`, `heading`, `button`, `input`, `toggle`, `row` and `column` compose into
 a `ui.View`. Controls have nonempty, unique keys, at most 256 UTF-8 bytes each.
@@ -44,8 +45,8 @@ changing the existing native content.
 
 `app.update` preserves controls when kinds, keys, ordered child structure and
 spacing stay the same. An input whose text is unchanged keeps its keyboard
-focus and selection. It sets changed text
-and checkbox values in place; application state remains in your own records.
+focus and selection. It sets changed text and checkbox values in place;
+application state remains in your own records.
 Changing structure or spacing rebuilds all content and ends the previous
 control handles. Padding changes on containers update in place. This first
 renderer does not yet reconcile moved controls across structural changes.
@@ -107,5 +108,5 @@ debug/release project packaging, resources, signatures and failed-signing rollba
 `make check-ui-macos` needs a logged-in Mac desktop session. It drives actual
 AppKit target/action and text delegates at debug/release, checks Unicode,
 200 updates retaining control handles, structural rebuilds, closure and the
-Harbour gallery. Existing `check-macos` covers the lower-level native bridge
+Harbour gallery and its signed native app bundle. Existing `check-macos` covers the lower-level native bridge
 and atomic packager failure paths.

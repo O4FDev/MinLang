@@ -1,6 +1,7 @@
 APPLICATION_SOURCES = tools/application-cli.min scripts/macos-app.min scripts/native-host.min
 build/tooling/tools/application-cli.ll: $(APPLICATION_SOURCES)
 build/tooling/tools/application-cli: TOOL_NATIVE = tools/clang-driver-host.c
+build/tooling/tools/application-cli: tools/clang-driver-host.c runtime/minyar_native.h
 
 .PHONY: check-application-cli check-ui-source check-ui-macos
 check-application-cli: build/tooling/tools/application-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build build/tooling/scripts/macos-app build/tooling/tests/macos-packaging
