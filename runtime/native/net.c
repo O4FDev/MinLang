@@ -263,7 +263,7 @@ long long minyar_net_accept(long long listener) {
     return (long long)result;
 }
 long long minyar_net_localPort(long long connection) {
-    struct sockaddr_storage address;
+    struct sockaddr_storage address = {0};
     socklen_t length = sizeof(address);
     last_error[0] = 0;
     if (!valid_socket(connection)) {
