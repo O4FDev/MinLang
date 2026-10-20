@@ -99,6 +99,11 @@ OSDEV_ARCH ?= arm64
 check-osdev-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/fields-kernel.min --expect "OSDEV FIELDS PASS" --timeout 30
 
+# A real kernel failure prints a call chain that tools/osdev.py symbolizes.
+.PHONY: check-osdev-panic-qemu
+check-osdev-panic-qemu: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-panic.py
+
 .PHONY: check-osdev-callback-qemu
 check-osdev-callback-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/callback-kernel.min --expect "OSDEV CALLBACK PASS" --timeout 30

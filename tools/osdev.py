@@ -256,7 +256,119 @@ def run(args):
         if log == artifact.resolve() or (log.exists() and log.samefile(artifact)):
             raise WorkflowError("serial log must not overwrite the kernel or disk image")
     log.parent.mkdir(parents=True, exist_ok=True)
-    return boot(args, qemu, log)
+    status = boot(args, qemu, log)
+    elf = args.root / "build/os" / args.arch / "kernel.elf"
+    if log.is_file() and elf.is_file():
+        report_minyar_trace(log.read_text(errors="replace"), elf)
+    return status
+
+
+def trace_return_addresses(text):
+    """Return addresses a freestanding kernel printed under "Minyar stack trace:"."""
+    traces, current = [], None
+    for line in text.splitlines():
+        if line.strip() == "Minyar stack trace:":
+            current = []
+            traces.append(current)
+        elif current is not None:
+            match = re.fullmatch(r"\s+at (0x[0-9a-fA-F]+)\s*", line)
+            if match:
+                current.append(int(match.group(1), 16))
+            elif not line.startswith("  at "):
+                current = None
+    return traces
+
+
+# runtime/minyar_traces.h MinyarTraceRow: five i32 offsets/flags, padding,
+# then i64 line and column.
+TRACE_ROW_BYTES = 40
+
+
+def elf_trace_functions(elf):
+    """Map kernel function addresses to Minyar names through the ELF symbol
+    table and the compiler's runtime trace rows; no DWARF or runtime cost."""
+    data = Path(elf).read_bytes()
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise WorkflowError(f"{elf} is not a little-endian ELF64 kernel")
+    number = lambda offset, size: int.from_bytes(data[offset:offset + size], "little")
+    signed = lambda offset, size: int.from_bytes(data[offset:offset + size], "little", signed=True)
+    sections = []
+    table, entry_size, count = number(0x28, 8), number(0x3A, 2), number(0x3C, 2)
+    for index in range(count):
+        base = table + index * entry_size
+        sections.append(dict(type=number(base + 4, 4), address=number(base + 16, 8), offset=number(base + 24, 8),
+                             size=number(base + 32, 8), link=number(base + 40, 4)))
+
+    def at(address, size):
+        for section in sections:
+            if section["type"] != 8 and section["address"] <= address and address + size <= section["address"] + section["size"]:
+                start = section["offset"] + address - section["address"]
+                return data[start:start + size]
+        return None
+
+    def text(address):
+        for section in sections:
+            if section["type"] != 8 and section["address"] <= address < section["address"] + section["size"]:
+                start = section["offset"] + address - section["address"]
+                return data[start:data.index(b"\0", start)].decode(errors="replace")
+        return None
+
+    functions, objects = [], {}
+    for section in (item for item in sections if item["type"] == 2):
+        strings = sections[section["link"]]
+        for base in range(section["offset"], section["offset"] + section["size"], 24):
+            start = strings["offset"] + number(base, 4)
+            name = data[start:data.index(b"\0", start)].decode(errors="replace")
+            kind, value, size = number(base + 4, 1) & 15, number(base + 8, 8), number(base + 16, 8)
+            if kind == 2 and size:
+                functions.append((value, size, name))
+            elif name.startswith("minyar.trace|"):
+                objects[name] = value
+    rows = {}
+    for name, address in objects.items():
+        if not name.endswith("|rows") or name[:-5] + "|count" not in objects:
+            continue
+        total = at(objects[name[:-5] + "|count"], 8)
+        for index in range(int.from_bytes(total or b"", "little")):
+            row = at(address + index * TRACE_ROW_BYTES, TRACE_ROW_BYTES)
+            if row is None:
+                break
+            relative = lambda field: address + int.from_bytes(row[field:field + 4], "little", signed=True)
+            symbol, readable, path = text(relative(0)), text(relative(4)), text(relative(8))
+            if symbol:
+                rows[symbol] = (readable, path, int.from_bytes(row[24:32], "little", signed=True),
+                                int.from_bytes(row[32:40], "little", signed=True))
+    return sorted(functions), rows
+
+
+def symbolize_minyar_trace(addresses, functions, rows):
+    frames = []
+    for address in addresses:
+        # A return address follows its call; look up the call instruction.
+        target = address - 1
+        for start, size, name in functions:
+            if start <= target < start + size:
+                row = rows.get(name) or rows.get(name.split(".llvm.")[0])
+                if row:
+                    frames.append("  at %s (%s:%d:%d)" % row)
+                break
+    return frames
+
+
+def report_minyar_trace(text, elf):
+    traces = [trace for trace in trace_return_addresses(text) if trace]
+    if not traces:
+        return
+    try:
+        functions, rows = elf_trace_functions(elf)
+    except (OSError, ValueError, WorkflowError) as error:
+        print(f"osdev: cannot symbolize the Minyar stack trace: {error}", file=sys.stderr)
+        return
+    for trace in traces:
+        frames = symbolize_minyar_trace(trace, functions, rows)
+        print(f"osdev: Minyar stack trace, symbolized with {elf}:", file=sys.stderr)
+        for frame in frames or ["  (no Minyar function owns these return addresses)"]:
+            print(frame, file=sys.stderr)
 
 
 def instruction_addresses(text):
@@ -267,8 +379,18 @@ def instruction_addresses(text):
 
 def symbolize(args):
     addresses = args.addresses[:]
+    traced = False
     if args.log:
-        addresses += instruction_addresses(Path(args.log).read_text(errors="replace"))
+        text = Path(args.log).read_text(errors="replace")
+        addresses += instruction_addresses(text)
+        traced = any(trace_return_addresses(text))
+        elf = Path(args.elf).resolve() if args.elf else args.root / "build/os" / args.arch / "kernel.elf"
+        if traced and not args.dry_run:
+            if not elf.is_file():
+                raise WorkflowError(f"missing ELF {elf}; preserve the exact kernel from the failing run")
+            report_minyar_trace(text, elf)
+        if traced and not addresses:
+            return 0
     normalized = []
     for address in addresses:
         if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{1,16}", address):

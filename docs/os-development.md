@@ -179,8 +179,41 @@ symbolizer command, and symbolization has a 15-second deadline by default.
 Keep the exact ELF from the failing run. A rebuilt kernel can assign different
 addresses to functions. The current optimized OS build does not emit full source
 debug information: symbol names can resolve, while source locations and inlined
-frames may appear as `??`. This workflow does not reconstruct a stack or add
-compiler debug metadata. It resolves the instruction addresses the guest reports.
+frames may appear as `??`. The fault path resolves only the instruction
+addresses the guest reports; Minyar failures also print their call chain, as
+below.
+
+### Kernel failure call chains
+
+When kernel code stops, through `fail`, a failed check or a runtime range
+error, the guest prints `Minyar stopped:` with the message, then
+`Minyar stack trace:` and one return address per frame, innermost first:
+
+```text
+Minyar stopped: OSDEV PANIC EXPECTED
+Minyar stack trace:
+  at 0x1003bd
+  at 0x100375
+  at 0x100565
+  at main (os/tests/panic-kernel.min:9:10)
+```
+
+`run` and `test` then map those addresses to Minyar functions using the kernel
+ELF, and `symbolize --log` does the same for a saved log:
+
+```text
+osdev: Minyar stack trace, symbolized with build/os/x86_64/kernel.elf:
+  at descend (os/tests/panic-kernel.min:4:10)
+  at main (os/tests/panic-kernel.min:9:10)
+```
+
+Each frame names its function and the line where that function is declared, as
+hosted traces do. The kernel needs no symbol table or unwinder for this:
+freestanding builds keep frame pointers, and the runtime follows that chain
+only when it fails. Keeping frame pointers costs one register in every kernel
+function. Functions that link-time optimization inlines have no frame of their
+own, so they don't appear. Runtime helpers have no Minyar name and are left
+out. `make check-osdev-panic-qemu` checks the chain on x86-64 and Arm64.
 
 For a deliberate Arm fault with a real instruction address, build and run the
 expected-failure fixture, then symbolize its log before rebuilding the kernel:
