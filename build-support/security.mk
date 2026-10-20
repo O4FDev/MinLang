@@ -8,6 +8,7 @@ check-security-static:
 check-security-os: build/minyarc
 	$(MAKE) -C os "$(CURDIR)/build/os/x86_64/kernel.ll" "$(CURDIR)/build/os/x86_64/loader.ll"
 	$(MAKE) -C os ARCH=arm64 "$(CURDIR)/build/os/arm64/kernel.ll"
+	MINYAR_CLANG="$(LLVM_CC)" sh scripts/security-freestanding-math.sh
 
 # Exercise the pure OS response parser with hostile bytes in a hosted process.
 check-security-os-http: build/tooling/tests/os-http-response.ll build/minyar-runtime.o

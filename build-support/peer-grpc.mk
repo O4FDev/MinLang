@@ -11,10 +11,10 @@ build/tooling/tests/http2-test.ll build/tooling/tests/peer-grpc-test.ll: tests/c
 
 .PHONY: check-http2 check-peer-grpc check-peer-grpc-sanitize
 check-http2: build/minyarc build/peergrpc-peer build/tooling/tests/http2-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http2-test
+	MINYAR_MAX_MEMORY_MIB=2048 GOMAXPROCS=2 MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http2-test
 
 check-peer-grpc: build/minyarc build/peergrpc-peer build/tooling/tests/peer-grpc-test check-http2
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-grpc-test
+	MINYAR_MAX_MEMORY_MIB=2048 GOMAXPROCS=2 MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-grpc-test
 
 check-peer-grpc-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/http2-test build/tooling/tests/peer-grpc-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/http2-test --sanitize
