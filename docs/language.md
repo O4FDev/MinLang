@@ -1793,6 +1793,16 @@ native calls, indirect calls, recursion and loops reject. Ordinary functions
 keep their ordinary behavior. This context proof is separate from hardware
 entry, register preservation and a physical stack bound.
 
+A rejection names the path from the handler to the unsafe operation:
+
+```text
+error: interrupt context handles(42): linkChanged -> waitForLink -> sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep, take a lock or allocate
+```
+
+The check costs nothing at run time. Programs without interrupt handlers compile
+to the same LLVM IR as before, and a handler that only signals a flag compiles
+to one release store.
+
 `signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
 `takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.
 These operations use release/acquire ordering. A flag carries no event count,
@@ -1815,7 +1825,13 @@ print(dma.load8(completed, 0)) // 104
 dma.dispose(completed)
 ```
 
-Moving a Cpu or Pending binding makes its previous binding unavailable.
+Moving a Cpu or Pending binding makes its previous binding unavailable. Touching
+a buffer after handing it to the device is a compile error that says so:
+
+```text
+error: DMA ownership: 'buffer' was handed to the device by submit on line 5; the device owns it now, so the CPU cannot read or write it until reclaim returns the completed buffer
+```
+
 `load8`, `store8` and `copyOut` borrow Cpu; `ready` borrows Pending.
 `submit`, `reclaim`, `dispose` and `retire` consume their capability. Ordinary
 helpers consume affine arguments; only compiler-owned native primitives have

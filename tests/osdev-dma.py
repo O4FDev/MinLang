@@ -1020,6 +1020,34 @@ class Gate:
                     self.check("compile", case.name, False, "blocked by failed valid control")
                 else:
                     self.reject(case, "compile")
+        self.message_group()
+
+    # Diagnostics must explain the ownership rule: name the binding and the
+    # line whose operation took it away, and say what to do instead.
+    MESSAGES = (
+        ("message-device-owned",
+         'use "dma" as dma\nuse "dma_model" as model\nlet queue = model.modelQueue()\n'
+         'let buffer = dma.allocate(64, 64)\nlet pending = dma.submit(queue, buffer, 64)\n'
+         'let header = dma.load8(buffer, 0)\ndma.retire(pending)\n',
+         "'buffer' was handed to the device by submit on line 5; the device owns it now", "case.min:6:24"),
+        ("message-double-dispose",
+         'use "dma" as dma\nlet buffer = dma.allocate(64, 64)\ndma.dispose(buffer)\ndma.dispose(buffer)\n',
+         "'buffer' was already disposed on line 3", "case.min:4:13"),
+        ("message-in-flight-exit",
+         'use "dma" as dma\nuse "dma_model" as model\nfunction startRead(queue: dma.Queue) {\n'
+         '    let buffer = dma.allocate(64, 64)\n    let pending = dma.submit(queue, buffer, 64)\n}\n'
+         'startRead(model.modelQueue())\n',
+         "'pending' is still in flight (Pending) here; reclaim it to wait for the device, retire it", "case.min:3:"),
+    )
+
+    def message_group(self):
+        for name, source, message, location in self.MESSAGES:
+            if not self.selected(name):
+                continue
+            llvm, status, stdout, stderr, broken = self.compile("reject-" + name, source)
+            success = (not broken and status == 1 and not stdout and message in stderr and location in stderr
+                       and not llvm.exists())
+            self.check("compile", name, success, f"status={status}\n{stdout}{stderr}")
 
     def execute_language(self, name, group):
         llvm = self.positive_compile(name, group)

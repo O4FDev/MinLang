@@ -64,6 +64,7 @@ class Case:
     normal_helper: str | None = None
     ordinary_signals: tuple = ()
     host_output: str | None = None
+    message: str | None = None
 
 
 def root(body="signalInterrupt(0)", vector="@VECTOR@", name="irqProof"):
@@ -214,6 +215,19 @@ def matrix():
         source = root(shadow)
         cases.append(Case("local-shadow-cannot-bypass-effects-" + name, "compatibility", source, False,
                           ("indirect", "callback", "managed", "alloc"), control=ordinary(source)))
+    # Exact plain-English reasons for representative real-bug classes.
+    messages = {
+        "sleep-helper": "sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep",
+        "serialization-lock-helper": "calls native code (library 'sync') that the compiler cannot prove interrupt-safe",
+        "loop-built-lock-direct": "loops are not allowed in interrupt context: a wait or spin loop can block forever",
+        "format-allocation-helper": "uses managed Text: managed values allocate and change reference counts",
+        "float-state-direct": "uses Float, whose floating-point state interrupt entry does not save",
+    }
+    for case in cases:
+        if case.name in messages:
+            case.message = messages[case.name]
+    if any(not any(case.name == name for case in cases) for name in messages):
+        raise Failure("message expectation names an unknown case")
     return cases
 
 
@@ -635,6 +649,8 @@ class Runner:
             raise Failure(case.name + ": missing expected diagnostic family\n" + errors)
         if any(name.lower() not in lower for name in case.chain):
             raise Failure(case.name + ": missing transitive root-to-effect chain\n" + errors)
+        if case.message and case.message not in errors:
+            raise Failure(case.name + ": diagnostic must explain the rule: " + case.message + "\n" + errors)
         return None
 
     def assembly(self, case, target, ir, roots):

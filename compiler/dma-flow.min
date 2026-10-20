@@ -25,6 +25,7 @@ record DmaFlowFrame {
     phases: List<Integer>
     types: List<Integer>
     sites: List<Integer>
+    moves: List<Integer>
 }
 
 function dmaFlowReject(context: CompilerContext, node: Integer, message: Text) {
@@ -187,16 +188,62 @@ function dmaFlowName(frame: DmaFlowFrame, node: Integer, state: List<Integer>): 
     if phase == 0 || frame.phases[slot] != phase || frame.types[slot] != syntax.type {
         dmaFlowReject(context, node, "capability phase does not match its resolved binding")
     }
-    if state[slot] != phase { dmaFlowReject(context, node, "binding is unavailable, out of scope or already moved") }
+    if state[slot] != phase {
+        let moved = frame.moves[slot]
+        if state[slot] == 0 && moved >= 0 { dmaFlowReject(context, node, dmaFlowMovedReason(frame, slot, moved)) }
+        dmaFlowReject(context, node, "binding is unavailable, out of scope or already moved")
+    }
     dmaFlowUse(frame, node)
     return slot
+}
+
+// Name the binding and the operation that moved it, so the error explains
+// the ownership rule instead of only reporting that a name is unavailable.
+function dmaFlowSlotName(frame: DmaFlowFrame, slot: Integer): Text {
+    let context = frame.program.context
+    let site = frame.sites[slot]
+    let position = context.syntax.nodes[site].start
+    if context.syntax.nodes[site].kind == 104 { position = position + 1 }
+    if position >= 0 && position < context.tokenTexts.length && context.tokenKinds[position] == 1 { return "'" + context.tokenTexts[position] + "'" }
+    return "this capability"
+}
+
+function dmaFlowLine(context: CompilerContext, node: Integer): Text {
+    let position = context.syntax.nodes[node].start
+    if position < 0 || position * 2 >= context.tokenLines.coordinates.length { return "an earlier line" }
+    return "line " + Text(context.tokenLines.coordinates[position * 2])
+}
+
+function dmaFlowMovedReason(frame: DmaFlowFrame, slot: Integer, moved: Integer): Text {
+    let context = frame.program.context
+    let name = dmaFlowSlotName(frame, slot)
+    let line = dmaFlowLine(context, moved)
+    let callee = dmaFlowFact(context.dma.callees, moved)
+    if context.syntax.nodes[moved].kind == 209 && callee >= 0 && callee < context.functionNames.length {
+        let operation = readableDeclarationName(context.functionNames[callee])
+        if frame.program.primitives[callee] > 0 {
+            if operation == "submit" { return name + " was handed to the device by submit on " + line + "; the device owns it now, so the CPU cannot read or write it until reclaim returns the completed buffer" }
+            if operation == "dispose" { return name + " was already disposed on " + line + "; a disposed buffer cannot be used or disposed again" }
+            if operation == "retire" { return name + " was retired on " + line + "; a retired request never returns its buffer to the CPU" }
+            if operation == "reclaim" { return name + " was consumed by reclaim on " + line + "; use the Cpu buffer that reclaim returned" }
+        }
+        return name + " was moved into " + operation + " on " + line + "; a consumed CPU/Pending capability cannot be used again"
+    }
+    return name + " was moved to another binding on " + line + "; use that binding instead"
+}
+
+function dmaFlowLiveReason(frame: DmaFlowFrame, slot: Integer, fallback: Text): Text {
+    if slot < 0 || slot >= frame.sites.length { return fallback }
+    let name = dmaFlowSlotName(frame, slot)
+    if frame.phases[slot] == 2 { return name + " is still in flight (Pending) here; reclaim it to wait for the device, retire it, or return it to the caller (live capability left behind)" }
+    return name + " still owns its CPU buffer here; dispose it, submit it, or return it to the caller (live capability left behind)"
 }
 
 function dmaFlowEmpty(frame: DmaFlowFrame, state: List<Integer>, node: Integer) {
     let index = 0
     while index < state.length {
         let phase = state[index]
-        if phase == 1 || phase == 2 { dmaFlowReject(frame.program.context, node, "normal exit must transfer, dispose or retire every live CPU/Pending capability") }
+        if phase == 1 || phase == 2 { dmaFlowReject(frame.program.context, node, dmaFlowLiveReason(frame, index, "normal exit must transfer, dispose or retire every live CPU/Pending capability")) }
         index = index + 1
     }
 }
@@ -205,7 +252,7 @@ function dmaFlowClose(frame: DmaFlowFrame, state: List<Integer>, locals: List<In
     let index = 0
     while index < locals.length {
         let slot = locals[index]
-        if state[slot] == 1 || state[slot] == 2 { dmaFlowReject(frame.program.context, node, "scope exit leaves a live capability; transfer, dispose or retire it explicitly") }
+        if state[slot] == 1 || state[slot] == 2 { dmaFlowReject(frame.program.context, node, dmaFlowLiveReason(frame, slot, "scope exit leaves a live capability; transfer, dispose or retire it explicitly")) }
         state[slot] = -1
         index = index + 1
     }
@@ -261,7 +308,7 @@ function dmaFlowCall(frame: DmaFlowFrame, node: Integer, state: List<Integer>, b
         if state[affine] != expectedPhase { dmaFlowReject(context, node, "an argument moved the capability before the call boundary") }
         if borrowOnly && consumes { dmaFlowReject(context, node, "conditions and short-circuit operands may only borrow capabilities") }
         if rule == 0 { dmaFlowDefinition(context, callee, node) }
-        if consumes { state[affine] = 0 }
+        if consumes { state[affine] = 0; frame.moves[affine] = node }
     }
     if result > 0 {
         if rule == 0 { dmaFlowDefinition(context, callee, node) }
@@ -280,6 +327,7 @@ function dmaFlowExpression(frame: DmaFlowFrame, node: Integer, state: List<Integ
         if !bound || borrowOnly { dmaFlowReject(context, node, "affine values cannot be discarded, copied or used outside a direct move/borrow") }
         let slot = dmaFlowName(frame, node, state)
         state[slot] = 0
+        frame.moves[slot] = node
         return phase
     }
     let kind = syntax.kind
@@ -464,7 +512,7 @@ function dmaFlowCheckFunction(program: DmaFlowProgram, root: Integer) {
         body = context.syntax.nodes[root].firstChild
         while body >= 0 && context.syntax.nodes[body].kind == 6 { body = context.syntax.nodes[body].nextSibling }
     }
-    let frame = DmaFlowFrame { program: program, root: root, symbol: symbol, returned: returned, ids: [], phases: [], types: [], sites: [] }
+    let frame = DmaFlowFrame { program: program, root: root, symbol: symbol, returned: returned, ids: [], phases: [], types: [], sites: [], moves: [] }
     let state: List<Integer> = []
     let node = 0
     while node < context.syntax.nodes.length {
@@ -480,7 +528,7 @@ function dmaFlowCheckFunction(program: DmaFlowProgram, root: Integer) {
                 if id < 0 || dmaFlowFind(frame.ids, id) >= 0 { dmaFlowReject(context, node, "binding needs one distinct resolved logical local ID") }
                 frame.ids.add(id)
                 let phase = dmaFlowPhase(context, type)
-                frame.phases.add(phase); frame.types.add(type); frame.sites.add(node)
+                frame.phases.add(phase); frame.types.add(type); frame.sites.add(node); frame.moves.add(-1)
                 let initial = -1
                 if syntax.kind == 6 { initial = phase }
                 state.add(initial)

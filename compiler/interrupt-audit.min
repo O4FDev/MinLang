@@ -476,6 +476,31 @@ function interruptAuditRootUses(audit: InterruptAuditState) {
     }
 }
 
+// Plain-English reasons; each names why the operation is unsafe in a handler.
+function interruptAuditNodeReason(context: CompilerContext, kind: Integer, start: Integer): Text {
+    if kind == 102 || kind == 103 { return "loops are not allowed in interrupt context: a wait or spin loop can block forever, and loop bounds are not proved yet" }
+    if kind == 109 {
+        let library = ""
+        if start >= 0 && start + 1 < context.tokenTexts.length { library = context.tokenTexts[start + 1] }
+        return "calls native code (library '" + library + "') that the compiler cannot prove interrupt-safe; it may block, sleep, take a lock or allocate"
+    }
+    if kind == 208 { return "creates a callback, which allocates and calls indirectly" }
+    if kind == 202 || kind == 206 || kind == 210 || kind == 211 || kind == 215 { return "builds a " + syntaxKindName(kind) + " value, which allocates managed memory" }
+    if kind == 106 || kind == 107 { return syntaxKindName(kind) + " needs a loop, and loops are not allowed in interrupt context" }
+    return syntaxKindName(kind) + " is not supported in interrupt context yet"
+}
+
+function interruptAuditTypeReason(context: CompilerContext, type: Integer): Text {
+    if type == 7 { return "uses Float, whose floating-point state interrupt entry does not save" }
+    let name = describeType(type)
+    if isRecordType(type) {
+        let index = recordTypeIndex(type)
+        if index >= 0 && index < context.functionNames.length { name = readableDeclarationName(context.functionNames[index]) }
+        if dmaKind(context, type) > 0 { return "uses the DMA handle " + name + "; DMA ownership belongs to the serialized boot CPU, never to interrupt context" }
+    }
+    return "uses managed " + name + ": managed values allocate and change reference counts, which is unsafe in interrupt context"
+}
+
 function interruptAuditTyped(audit: InterruptAuditState, symbol: Integer) {
     let context = audit.context
     if symbol < 0 || symbol >= context.syntax.symbolNodes.length || context.symbolKinds[symbol] != 1 { interruptAuditReject(audit, "missing resolved source function") }
@@ -497,8 +522,8 @@ function interruptAuditTyped(audit: InterruptAuditState, symbol: Integer) {
         audit.site = node.start
         let kind = node.kind
         let allowed = kind == 1 || kind == 6 || kind == 100 || kind == 101 || kind == 104 || kind == 105 || kind == 110 || kind == 111 || kind == 200 || kind == 201 || kind == 203 || kind == 205 || kind == 207 || kind == 209 || kind == 214 || kind == 220 || kind == 221
-        if !allowed { interruptAuditReject(audit, "forbidden source node " + Text(kind) + " (loop, native, managed, closure or unknown operation)") }
-        if interruptAuditSourceWidth(node.type) < 0 { interruptAuditReject(audit, "managed, Float or unproved source value") }
+        if !allowed { interruptAuditReject(audit, interruptAuditNodeReason(context, kind, node.start)) }
+        if interruptAuditSourceWidth(node.type) < 0 { interruptAuditReject(audit, interruptAuditTypeReason(context, node.type)) }
         if kind == 200 && node.symbol >= 0 {
             if node.symbol >= context.syntax.symbolNodes.length { interruptAuditReject(audit, "unresolved source value") }
             let source = context.syntax.symbolNodes[node.symbol]
