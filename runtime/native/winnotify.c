@@ -400,17 +400,20 @@ static HRESULT prune_pending(unsigned *remaining) {
 // A callback must match both app identity and the persisted notification allowlist.
 // Consumption and queue insertion share a lock, so duplicates and close races cannot dispatch.
 static HRESULT activate_notice(const wchar_t *app, const wchar_t *argument, ULONG inputs) {
-    if (!app || !argument || inputs || wcsnlen(app, 129) >= 129 || wcsnlen(argument, 99) >= 99)
+    enum { TOKEN_LENGTH = 32, ACTION_LENGTH = 64, ARGUMENT_CAPACITY = TOKEN_LENGTH + 1 + ACTION_LENGTH + 1 };
+    if (!app || !argument || inputs || wcsnlen(app, 129) >= 129)
         return E_INVALIDARG;
-    if (wcslen(argument) < 34 || argument[32] != ':')
+    size_t argument_length = wcsnlen(argument, ARGUMENT_CAPACITY);
+    if (argument_length < TOKEN_LENGTH + 2 || argument_length >= ARGUMENT_CAPACITY ||
+        argument[TOKEN_LENGTH] != ':')
         return E_INVALIDARG;
-    wchar_t token[33], action[65];
-    memcpy(token, argument, 32 * sizeof(wchar_t));
-    token[32] = 0;
-    wcscpy(action, argument + 33);
+    wchar_t token[TOKEN_LENGTH + 1];
+    memcpy(token, argument, TOKEN_LENGTH * sizeof(wchar_t));
+    token[TOKEN_LENGTH] = 0;
+    const wchar_t *action = argument + TOKEN_LENGTH + 1;
     if (!valid_token(token))
         return E_INVALIDARG;
-    if (!identifier(action, 64))
+    if (!identifier(action, ACTION_LENGTH))
         return E_INVALIDARG;
     AcquireSRWLockExclusive(&notify_lock);
     HRESULT hr = initialized && !wcscmp(app, app_id) ? S_OK : E_ACCESSDENIED;

@@ -263,7 +263,7 @@ long long minyar_net_accept(long long listener) {
     return (long long)result;
 }
 long long minyar_net_localPort(long long connection) {
-    struct sockaddr_storage address;
+    struct sockaddr_storage address = {0};
     socklen_t length = sizeof(address);
     last_error[0] = 0;
     if (!valid_socket(connection)) {
@@ -274,9 +274,9 @@ long long minyar_net_localPort(long long connection) {
         remember_code("localPort", socket_error());
         return -1;
     }
-    if (address.ss_family == AF_INET)
+    if (address.ss_family == AF_INET && length >= sizeof(struct sockaddr_in))
         return ntohs(((struct sockaddr_in *)&address)->sin_port);
-    if (address.ss_family == AF_INET6)
+    if (address.ss_family == AF_INET6 && length >= sizeof(struct sockaddr_in6))
         return ntohs(((struct sockaddr_in6 *)&address)->sin6_port);
     remember_code("localPort", BAD_ARGUMENT);
     return -1;

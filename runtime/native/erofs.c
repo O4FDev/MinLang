@@ -47,7 +47,7 @@ typedef struct {
     EInode *hash[65536];
     ENode *root;
     int source_fd, output_fd;
-    uint64_t maximum, position;
+    uint64_t maximum, position, scan_bytes;
     int compression;
     int level;
     size_t lz4_hint;
@@ -57,6 +57,10 @@ typedef struct {
 } EWriter;
 
 static uint64_t e_align(uint64_t n, uint64_t a) { return (n + a - 1) & ~(a - 1); }
+static int e_scan_charge(EWriter *w, uint64_t size) {
+    if (size > w->maximum || w->scan_bytes > w->maximum - size) return EFBIG;
+    w->scan_bytes += size; return 0;
+}
 static void e16(unsigned char *p, uint16_t n) { p[0] = n; p[1] = n >> 8; }
 static void e32(unsigned char *p, uint32_t n) { e16(p, n); e16(p + 2, n >> 16); }
 static void e64(unsigned char *p, uint64_t n) { e32(p, n); e32(p + 4, n >> 32); }
@@ -141,7 +145,10 @@ static int e_scan(EWriter *w, ENode *node, int parent_fd, const char *relative, 
             }
         }
     }
-    int error = e_grow((void **)&w->inodes, &w->capacity, w->count + 1, sizeof(*w->inodes));
+    size_t source_size = strlen(relative) + 1;
+    int error = e_scan_charge(w, sizeof(EInode) + source_size + 2 * sizeof(EInode *));
+    if (error) return error;
+    error = e_grow((void **)&w->inodes, &w->capacity, w->count + 1, sizeof(*w->inodes));
     if (error) return error;
     EInode *i = calloc(1, sizeof(*i));
     if (!i) return ENOMEM;
@@ -154,8 +161,10 @@ static int e_scan(EWriter *w, ENode *node, int parent_fd, const char *relative, 
     if (asprintf(&path, "/proc/self/fd/%d/%s", parent_fd, node->parent ? node->name : ".") < 0) return ENOMEM;
     error = e_attrs(i, path); free(path);
     if (error) return error;
+    if (i->attrs_size && (error = e_scan_charge(w, (uint64_t)i->attrs_size * 2))) return error;
     if (S_ISLNK(st.st_mode)) {
         if (st.st_size < 0 || st.st_size > 65535) return EOVERFLOW;
+        if ((error = e_scan_charge(w, (uint64_t)st.st_size + 1))) return error;
         i->link = malloc((size_t)st.st_size + 1);
         if (!i->link) return ENOMEM;
         ssize_t n = readlinkat(parent_fd, node->name, i->link, (size_t)st.st_size + 1);
@@ -173,6 +182,9 @@ static int e_scan(EWriter *w, ENode *node, int parent_fd, const char *relative, 
         errno = 0; entry = readdir(dir);
         if (!entry) { if (errno) error = errno; break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        size_t name_size = strlen(entry->d_name) + 1;
+        error = e_scan_charge(w, sizeof(ENode) + name_size + 2 * sizeof(ENode *));
+        if (error) break;
         error = e_grow((void **)&node->children, &node->capacity, node->count + 1, sizeof(*node->children));
         if (error) break;
         ENode *child = calloc(1, sizeof(*child));
@@ -284,10 +296,15 @@ static int e_compress(EWriter *w, EInode *i) {
     int error = fstat(fd, &st) ? errno : 0;
     if (!error && !i->virtual_data && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
     uint64_t total_clusters = e_align(i->size, 4096) / 4096;
-    unsigned char *map = calloc(1, (size_t)(16 + total_clusters * 8));
-    unsigned char *compact = calloc(1, (size_t)i->map_size);
-    unsigned char *input = malloc(1048576), *encoded = malloc(65536), *output = malloc(65536);
-    if (!map || !compact || !input || !encoded || !output) error = ENOMEM;
+    uint64_t map_size = 0;
+    if (!error && (total_clusters > (w->maximum - 16) / 8 ||
+            i->map_size > w->maximum - (map_size = 16 + total_clusters * 8))) error = EFBIG;
+    unsigned char *map = error ? NULL : calloc(1, (size_t)map_size);
+    unsigned char *compact = error ? NULL : calloc(1, (size_t)i->map_size);
+    unsigned char *input = error ? NULL : malloc(1048576);
+    unsigned char *encoded = error ? NULL : malloc(65536);
+    unsigned char *output = error ? NULL : malloc(65536);
+    if (!error && (!map || !compact || !input || !encoded || !output)) error = ENOMEM;
     if (!error && w->compression == 1 && (ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_compressionLevel, w->level)) || ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_windowLog, 19)))) error = EINVAL;
     if (!error) { e16(map + 4, 7); map[6] = w->compression == 1 ? 3 : 0; }
     uint64_t at = 0, first_block = w->position / 4096;
@@ -420,9 +437,15 @@ static int e_image(EWriter *w) {
             uint64_t clusters = e_align(i->size, 4096) / 4096;
             i->map_size = 8 + e_align(clusters, 2) * 4 - e_compact_middle(i, clusters) * 2;
         }
-        metadata = e_align(metadata + (i->map_size ? e_align(64 + i->attrs_size, 8) + i->map_size : 64 + i->attrs_size), 32);
+        uint64_t record = i->map_size ? e_align(64 + i->attrs_size, 8) + i->map_size : 64 + i->attrs_size;
+        if (record > w->maximum || metadata > w->maximum - record) { error = EFBIG; break; }
+        metadata = e_align(metadata + record, 32);
+        if (metadata > w->maximum) { error = EFBIG; break; }
     }
-    uint64_t position = 4096 + e_align(metadata, 4096);
+    if (error) return error;
+    uint64_t aligned_metadata = e_align(metadata, 4096);
+    if (aligned_metadata > w->maximum - 4096) return EFBIG;
+    uint64_t position = 4096 + aligned_metadata;
     for (size_t n = 0; !error && n < w->count; ++n) {
         EInode *i = w->inodes[n];
         if (position / 4096 >= UINT32_MAX || (!i->map_size && (i->size > w->maximum || position > w->maximum - i->size))) { error = EFBIG; break; }
@@ -491,7 +514,11 @@ static int e_directory_image(const char *source, const char *destination, long l
     w->maximum = (uint64_t)maximum; w->compression = (int)compression; w->level = (int)level; w->root = calloc(1, sizeof(*w->root));
     int error = w->root ? 0 : ENOMEM;
     if (compression == 1) { w->codec = ZSTD_createCCtx(); if (!w->codec) error = ENOMEM; }
-    if (!error) { w->root->name = strdup(""); if (!w->root->name) error = ENOMEM; }
+    if (!error) {
+        w->root->name = strdup("");
+        if (!w->root->name) error = ENOMEM;
+        else w->scan_bytes = sizeof(*w->root) + 1;
+    }
     if (!error) error = e_scan(w, w->root, w->source_fd, "", 0);
     char *temporary = NULL;
     w->output_fd = -1;

@@ -64,7 +64,7 @@ typedef struct WorkerProcess {
     int input, output;
     uint32_t generation;
     unsigned char *queue, *message;
-    size_t queue_length, queue_sent, message_received;
+    size_t queue_length, queue_sent, queue_capacity, message_received;
     uint32_t message_length;
     unsigned char header[4];
     unsigned header_received;
@@ -289,7 +289,7 @@ static int worker_flush(WorkerProcess *worker) {
     }
     free(worker->queue);
     worker->queue = NULL;
-    worker->queue_length = worker->queue_sent = 0;
+    worker->queue_length = worker->queue_sent = worker->queue_capacity = 0;
     return 0;
 }
 MinyarBytes *minyar_workers_sendNative(long long handle, const MinyarBytes *message) {
@@ -306,18 +306,26 @@ MinyarBytes *minyar_workers_sendNative(long long handle, const MinyarBytes *mess
     size_t frame = (size_t)message->byte_length + 4;
     if (pending > WORK_MAX_QUEUE - frame)
         return worker_scalar(WORK_BLOCK, EAGAIN, 0);
-    unsigned char *queue = malloc(pending + frame);
-    if (!queue)
-        return worker_scalar(WORK_FAILURE, ENOMEM, 0);
-    if (pending)
-        memcpy(queue, worker->queue + worker->queue_sent, pending);
-    worker_put32(queue + pending, (uint32_t)message->byte_length);
+    if (worker->queue_capacity - worker->queue_length < frame && worker->queue_sent) {
+        memmove(worker->queue, worker->queue + worker->queue_sent, pending);
+        worker->queue_length = pending;
+        worker->queue_sent = 0;
+    }
+    if (worker->queue_capacity - worker->queue_length < frame) {
+        size_t capacity = worker->queue_capacity ? worker->queue_capacity : 4096;
+        while (capacity < pending + frame)
+            capacity = capacity > WORK_MAX_QUEUE / 2 ? WORK_MAX_QUEUE : capacity * 2;
+        unsigned char *queue = realloc(worker->queue, capacity);
+        if (!queue)
+            return worker_scalar(WORK_FAILURE, ENOMEM, 0);
+        worker->queue = queue;
+        worker->queue_capacity = capacity;
+    }
+    worker_put32(worker->queue + worker->queue_length, (uint32_t)message->byte_length);
     if (message->byte_length)
-        memcpy(queue + pending + 4, message->bytes, (size_t)message->byte_length);
-    free(worker->queue);
-    worker->queue = queue;
-    worker->queue_sent = 0;
-    worker->queue_length = pending + frame;
+        memcpy(worker->queue + worker->queue_length + 4, message->bytes,
+               (size_t)message->byte_length);
+    worker->queue_length += frame;
     int code = worker_flush(worker);
     return worker_scalar(code ? WORK_FAILURE : WORK_OK, code, message->byte_length);
 }

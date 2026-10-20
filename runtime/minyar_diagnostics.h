@@ -90,6 +90,7 @@ _Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
  * fatal. Unwind ownership while callback stack storage is still live. */
+#ifndef MINYAR_FREESTANDING
 #include <setjmp.h>
 typedef struct MinyarDiagnosticBoundary {
     jmp_buf *jump;
@@ -166,6 +167,7 @@ MINYAR_NORETURN void minyar_runtime_diagnosticRaise(void) {
     minyar_diagnostic_jump(1);
 }
 MINYAR_NORETURN void minyar_runtime_diagnosticDiscard(void) { minyar_diagnostic_jump(2); }
+#endif
 
 /* Terminal cell ranges generated from Unicode 16.0.0 categories Mn/Me
  * and assigned East_Asian_Width W/F. Source coordinates remain scalars. */
