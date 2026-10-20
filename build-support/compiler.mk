@@ -8,6 +8,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/lexer.min \
 	compiler/stages/symbols.min \
 	compiler/stages/declarations.min \
+	compiler/stages/typed-byte-helpers.min \
 	compiler/stages/runtime-abi.min \
 	compiler/stages/types.min $(wildcard compiler/stages/c-layout.min) \
 	compiler/stages/ownership.min \
