@@ -190,6 +190,19 @@ both endpoints of traced ownership operations use the physical payload type.
   token: registration and the matching retain/drop are omitted. Borrowed values
   never carry this token, and the optimization does not imply heap uniqueness.
 - `minyar_rc_keep` adopts other produced references into the current expression.
+- A field path such as `shelf.label.parts` needs no count when its root is a
+  readonly parameter, a capture or a `constant` binding, and no compiled code
+  assigns any field on the path. The root keeps its record alive for the whole
+  scope that can name it, and an unassigned field keeps its value, so the path
+  stays valid as long as the root. A `let` initialized by such a path starts
+  without an owner, like a parameter, and an expression reading one takes no
+  temporary owner. Returning, storing or consuming the binding creates its own
+  count first; a consumer never treats the borrowed value as unique. Whole
+  programs see every assignment. A module compiled on its own cannot see later
+  modules, so it trusts only `private` fields. Cycle-capable types keep their
+  traced owners. A function whose only reference work was such a borrow needs
+  no ownership frame, and so has no cleanup service point, like a scalar-only
+  function.
 - `minyar_rc_borrow` retains a borrowed field/element as an expression owner
   when its lifetime may extend across a later call or mutation.
 - A chain of field reads borrows intermediate receivers without count changes.
@@ -420,6 +433,15 @@ The eager profile frees leaves directly and processes reference containers with
 an iterative queue, avoiding recursive C-stack destruction while still allowing
 a graph-sized release. Its queue/frame buffers can retain their high-water
 capacity. Incremental profiles bound cached ownership-frame bytes separately.
+
+Single-threaded eager and system profiles serve allocations up to 1008 bytes
+from a small-object heap: 4 KiB pages divided into 64, 128, 256, 512 or
+1024-byte slots, each with a 16-byte slot header. A page returns to the system
+allocator once its last slot is freed. Larger allocations, threaded runtimes
+and AddressSanitizer builds use the system allocator directly. Eager objects
+die as soon as their last owner releases them, so this heap reuses a dying
+token's slot for the next one without libc bookkeeping; it cut the eager
+compiler self-compile by 15% of its retired instructions.
 The integer-to-Text cache has at most 32,768 entries; Text literals and ASCII
 Character texts live for the process lifetime.
 
