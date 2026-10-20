@@ -3,6 +3,14 @@ use "../tools/testing.min" as test
 use "./sha256-support.min" as arguments
 use "system" as system
 
+function modelCommand(command: List<Text>, sanitized: Boolean): List<Text> {
+    if !sanitized { return command }
+    // Only the ASan child restores its soft address-space limit to the inherited hard maximum.
+    let result = ["zsh", "-c", "ulimit -S -v hard || exit $?; exec \"$@\"", "minyar-bounded-sanitizer"]
+    for argument in command { result.add(argument) }
+    return result
+}
+
 let clang = test.setting("CLANG", "clang")
 test.check(processInfo.argumentCount() == 0 || processInfo.argumentCount() == 2, "bounded configuration controls accept only --clang PATH")
 if processInfo.argumentCount() == 2 { test.check(processInfo.argument(0) == "--clang", "unknown bounded configuration option"); clang = processInfo.argument(1) }
@@ -22,18 +30,18 @@ for budget in [1, 32, 1024] {
         let frameCommand = command.slice(0, command.length)
         for item in [root + "/tests/bounded-runtime.c", "-o", executable, "-lm"] { command.add(item) }
         test.require(test.run(command, environment, root, executable + ".build", 60), "bounded runtime build")
-        let checked = test.run([executable], environment, root, executable + ".models", 120)
+        let checked = test.run(modelCommand([executable], sanitized), environment, root, executable + ".models", 120)
         test.check(checked.status == 0, "bounded models/capacity recovery failed\n" + checked.output + checked.errorOutput)
         let frames = work + "/frames-" + Text(budget) + "-" + Text(index)
         for item in [root + "/tests/bounded-frame-retirement.c", "-o", frames, "-lm"] { frameCommand.add(item) }
         test.require(test.run(frameCommand, environment, root, frames + ".build", 60), "bounded frame retirement build")
-        let retired = test.run([frames], environment, root, frames + ".models", 120)
+        let retired = test.run(modelCommand([frames], sanitized), environment, root, frames + ".models", 120)
         test.check(retired.status == 0, "bounded frame models failed\n" + retired.output + retired.errorOutput)
-        let exhausted = test.run([executable, "oom"], environment, root, executable + ".oom", 30)
+        let exhausted = test.run(modelCommand([executable, "oom"], sanitized), environment, root, executable + ".oom", 30)
         test.check(exhausted.status != 0, "oversized allocation unexpectedly succeeded")
         test.check(test.contains(exhausted.errorOutput, "bounded heap is exhausted"), "bounded heap exhaustion diagnostic changed\n" + exhausted.errorOutput)
         if sanitized {
-            let stale = test.run([executable, "stale"], environment, root, executable + ".stale", 30)
+            let stale = test.run(modelCommand([executable, "stale"], sanitized), environment, root, executable + ".stale", 30)
             test.check(stale.status != 0, "stale pool read unexpectedly survived ASan")
             test.check(test.contains(stale.errorOutput, "AddressSanitizer") && test.contains(stale.errorOutput, "use-after-poison"), "stale pool poison diagnostic changed\n" + stale.errorOutput)
         }
