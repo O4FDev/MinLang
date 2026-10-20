@@ -85,6 +85,7 @@ check check-portable: check-choice check-choice-library check-choice-layout chec
 check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize check-choice-enums-sanitize check-choice-text-niche-sanitize check-choice-container-niche-sanitize
 
 .PHONY: check-choice-type-codec check-choice-type-codec-sanitize
+build/tooling/tests/choice-type-codec.ll: tests/choice-runtime-codec.c
 check-choice-type-codec: build/minyarc build/minyar-runtime.o build/compiler.min build/tooling/tests/choice-type-codec
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-type-codec"
 

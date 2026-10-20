@@ -45,13 +45,24 @@ function buildRuntimeWithBudget(compiler: test.Compiler, cycle: Boolean, environ
     let name = "scope-eager"
     if cycle { engine = runtime.cycleSource(engine); name = "scope-cycle" }
     let source = "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + engine
+    if budget == 0 {
+    source += "\n#if defined(MINYAR_BOUNDED_RC) || defined(MINYAR_COMPILER_ARENA)\n#error Scope ownership cleanup oracle requires eager reference counting.\n#endif\n"
+    }
     if budget > 0 {
         name += "-k" + Text(budget)
         source = "#define MINYAR_BOUNDED_RC 1\n#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET " + Text(budget) + "\n" + source
     }
     source += "\n#include <assert.h>\nstatic void scope_drain_bounded(void) {\n#ifdef MINYAR_BOUNDED_RC\n  size_t steps = 0;\n  while (rc_pending_count) {\n    minyar_rc_poll(MINYAR_RC_POLL_BUDGET);\n    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);\n    assert(++steps < 100000);\n  }\n#endif\n}\n"
-    source += "__attribute__((destructor)) static void check_scope_cleanup(void) {\n  scope_drain_bounded();\n"
+    source += "__attribute__((destructor)) static void check_scope_cleanup(void) {\n"
+    if budget > 0 { source += "  scope_drain_bounded();\n" }
     source += "  assert(rc_scopes == NULL);\n  assert(rc_frames == NULL);\n  assert(rc_pending_count == 0);\n"
+    if cycle && budget == 0 {
+        source += "  assert(rc_cycle_pending == 0);\n  assert(rc_cycle_phase == RC_CYCLE_IDLE);\n"
+        source += "  assert(rc_cycle_inside == 0);\n  assert(rc_cycle_shading == 0);\n"
+        source += "  assert(rc_cycle_gray_head == NULL && rc_cycle_gray_tail == NULL);\n  assert(rc_cycle_active == NULL);\n"
+        source += "  assert(rc_cycle_cohort == NULL && rc_cycle_cursor == NULL && rc_cycle_last == NULL);\n"
+        source += "  assert(rc_cycle_head == NULL && rc_cycle_tail == NULL);\n  assert(rc_cycle_known_head == NULL && rc_cycle_known_tail == NULL);\n"
+    }
     source += "  assert(rc_object_count == 0);\n  assert(rc_immortal_object_count == 0);\n  assert(rc_bytes == 0);\n}\n"
     source += program([
         "static size_t scope_return_before;",
@@ -169,6 +180,9 @@ names.add("test_plain_borrows_share_local_and_return_owners")
 names.add("test_comparison_borrows_have_no_later_uses")
 names.add("test_comparison_borrow_ssa_boundaries")
 names.add("test_allocating_text_read_borrows_keep_parent_owners")
+names.add("test_choice_composition_cycle_scope_owners")
+names.add("test_choice_container_niche_scope_owners")
+names.add("test_choice_scalar_niche_scope_owners")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -908,6 +922,53 @@ if fixtures.selected("ScopeOwnership", "test_allocating_text_read_borrows_keep_p
         // unrelated live language graph during the native cleanup assertion.
         executes(compiler, source, "1\n", environment, boundedOrdinary, boundedCycle)
     }
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_composition_cycle_scope_owners") {
+    let source = io.readTextFile("tests/choice-composition-cycle.min")
+    let expected = io.readTextFile("tests/choice-composition-cycle.expected")
+    let llvm = executes(compiler, source, expected, environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "choice composition must select the cycle engine")
+    checkLowered(llvm, "propagateTone")
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_container_niche_scope_owners") {
+    let source = io.readTextFile("tests/choice-container-niche.min") + "\n" + program([
+        "function scopedChoiceListCycle(): Integer {",
+        "let links: List<Chain> = []",
+        "let chain: Chain = Link(links)",
+        "links.add(chain)",
+        "let saved = chain",
+        "chain = End",
+        "links.add(End)",
+        "links[1] = saved",
+        "return chainLength(saved)",
+        "}",
+        "print(scopedChoiceListCycle())"
+    ])
+    let expected = io.readTextFile("tests/choice-container-niche.expected") + "2\n"
+    let llvm = executes(compiler, source, expected, environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "choice container fixture must select the cycle engine")
+    checkLowered(llvm, "viewBytes")
+    checkLowered(llvm, "scopedChoiceListCycle")
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_scalar_niche_scope_owners") {
+    let source = io.readTextFile("tests/choice-scalar-niche-bench.min")
+    let llvm = executes(compiler, source, "19999\n250000\n", environment, ordinary, cycle)
+    for name in ["choiceScalarBool", "choiceScalarEnum"] {
+        test.check(test.contains(llvm, "i64 @.minyar.fn." + name + "(i64 %argument.0)"), "scalar niche choice ABI must remain i64: " + name)
+    }
+    for line in test.lines(llvm) {
+        if test.contains(line, "call ") {
+            test.check(!test.contains(line, "@minyar_rc_"), "scalar niche benchmark emitted an ownership call: " + line)
+            for operation in ["@minyar_record_new(", "@minyar_record_get(", "@minyar_record_set("] {
+                test.check(!test.contains(line, operation), "scalar niche benchmark emitted record traffic: " + line)
+            }
+        }
+    }
+    test.check(test.contains(llvm, "zext i1 ") && test.contains(llvm, " to i64") && test.contains(llvm, " to i1"), "Boolean payload projection must retain i1")
+    test.check(!test.contains(llvm, " = inttoptr i64 ") && !test.contains(llvm, " = ptrtoint ptr "), "scalar niche benchmark used pointer conversions")
 }
 
 test.removeTree(compiler.directory)
