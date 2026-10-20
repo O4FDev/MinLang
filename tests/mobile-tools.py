@@ -72,6 +72,12 @@ class MobileTools(unittest.TestCase):
             with self.subTest(target=target, text=text), self.assertRaises(mobile.MobileError):
                 mobile.inspect_ir(text, target)
 
+    def test_feature_markers_inside_text_are_ordinary_text(self):
+        for marker in ("; minyar-thread-runtime: 1", "; minyar-machine: syscall",
+                       "; minyar-c-layout: 1|8|8", "; minyar-c-value: example"):
+            literal = f'@message = private constant [{len(marker) + 1} x i8] c"{marker}\\00"\n'
+            self.assertEqual(mobile.inspect_ir(ENTRY + literal, "android-arm64"), set())
+
     def test_archive_metadata_cannot_truncate_source_or_unrelated_file(self):
         output = self.directory / "library.a"
         sidecar = output.with_suffix(".a.json")

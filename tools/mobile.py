@@ -141,11 +141,11 @@ def inspect_ir(llvm: str, target: str) -> set[str]:
     unsupported = libraries - allowed
     if unsupported:
         raise MobileError("native libraries need a mobile provider: " + ", ".join(sorted(unsupported)))
-    if "; minyar-thread-runtime: 1" in llvm:
+    if re.search(r"^; minyar-thread-runtime: 1$", llvm, re.MULTILINE):
         raise MobileError("managed thread entries are not yet supported by the mobile host")
-    if "; minyar-machine: " in llvm:
+    if re.search(r"^; minyar-machine: ", llvm, re.MULTILINE):
         raise MobileError("raw machine intrinsics are not supported by the mobile host")
-    if "; minyar-c-layout: " in llvm or "; minyar-c-value: " in llvm:
+    if re.search(r"^; minyar-c-(?:layout|value): ", llvm, re.MULTILINE):
         raise MobileError("C-layout adapters are not yet supported by the mobile builder")
     if target.startswith("ios-") and "mobileios" not in libraries:
         raise MobileError("a UIKit application must call mobile.run or ui-ios.run")
