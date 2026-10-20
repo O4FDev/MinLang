@@ -242,6 +242,9 @@ prevent replacement, even when a more precise analysis could prove them safe.
 Records with reference fields and immediately projected constructor expressions
 currently keep the managed representation.
 
+The binding's local ID is reserved before checking its initializer, without
+adding the name to scope early. A match expression can allocate its own locals
+without changing which binding owns the captured field metadata.
 Each initializer is evaluated once in source order. The generated field reads
 use the captured scalar values, so a replaced object needs no allocation,
 reference count or cleanup. Unused records still evaluate their initializers.
