@@ -124,7 +124,7 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
 
     def diagnostic(source, code, expected_help=None, has_excerpt=True,
                    expected_message=None, expected_span=None, expected_source_lines=None,
-                   diagnostic_file=None):
+                   diagnostic_file=None, exact_output=False):
         global checked
         origin = source if diagnostic_file is None else diagnostic_file
         checked += 1
@@ -171,6 +171,27 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
                 "caret starts at the offending token", source, human.stderr)
             assert len(underline.group()) == value["endColumn"] - value["column"], (
                 "entire offending token is underlined", source, human.stderr)
+        if exact_output:
+            assert expected_message is not None and expected_help is not None
+            assert expected_span is not None and expected_source_lines is not None
+            line, column, end_line, end_column = expected_span
+            source_line = expected_source_lines[line - 1]
+            expected_json = {
+                "version": 1, "severity": "error", "code": code, "message": expected_message,
+                "file": str(origin), "line": line, "column": column,
+                "endLine": end_line, "endColumn": end_column, "sourceLine": source_line,
+                "label": "", "help": [expected_help],
+            }
+            assert value == expected_json, ("complete independent JSON diagnostic", source, value, expected_json)
+            margin = " " * (len(str(line)) + 2)
+            expected_text = (
+                f"error: {expected_message}\n  --> {origin}:{line}:{column}\n"
+                f"{margin}|\n {line} | {source_line}\n"
+                f"{margin}| " + " " * (column - 1) + "^" * (end_column - column) + "\n"
+                f"{margin}= help: {expected_help}\n"
+                f"{margin}= explain: minyar explain {code}\n"
+            )
+            assert human.stderr == expected_text, ("complete independent text diagnostic", source, human.stderr, expected_text)
         return value
 
     # Existing rejections prove code identities across unrelated front-end
@@ -404,6 +425,335 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
                     "let shine = function(value: Integer): Integer {\n" +
                     "    let inner = function(value: Integer): Integer { return value }\n" +
                     "    return inner(value)\n}\nprint(shine(3))\n")
+
+    # Follow-on to errors-more-families.patch: saved argument starts retain the
+    # original first-token ranges, even when argument parsing advances state.
+    position_flag = "function flag(): Boolean { return false }\n"
+    position_problem = 'record Problem { message: Text }\nlet bad = Problem { message: "bad" }\n'
+    list_position_message = "List.slice positions must be Integers; expected Integer, found Boolean"
+    truncate_position_message = "List.truncate positions must be Integers; expected Integer, found Boolean"
+    text_position_message = "Text.slice positions must be Integers; expected Integer, found Boolean"
+    list_position_repair = "use Integer positions, such as values.slice(0, values.length)"
+    truncate_position_repair = "use an Integer length, such as values.truncate(0)"
+    text_position_repair = "use Integer positions, such as text.slice(0, text.length)"
+    for name, source, message, repair, span in (
+        ("truncate-direct", "let values = [1]\nvalues.truncate(true)\n",
+         truncate_position_message, truncate_position_repair, (2, 17, 2, 21)),
+        ("list-start-direct", "let values = [1]\nvalues.slice(false, 1)\n",
+         list_position_message, list_position_repair, (2, 14, 2, 19)),
+        ("list-end-direct", "let values = [1]\nvalues.slice(0, false)\n",
+         list_position_message, list_position_repair, (2, 17, 2, 22)),
+        ("text-start-direct", 'print("harbour".slice(false, 1))\n',
+         text_position_message, text_position_repair, (1, 23, 1, 28)),
+        ("text-end-direct", 'print("harbour".slice(0, false))\n',
+         text_position_message, text_position_repair, (1, 26, 1, 31)),
+        ("truncate-call", position_flag + "let values = [1]\nvalues.truncate(flag())\n",
+         truncate_position_message, truncate_position_repair, (3, 17, 3, 21)),
+        ("list-start-call", position_flag + "let values = [1]\nvalues.slice(flag(), 1)\n",
+         list_position_message, list_position_repair, (3, 14, 3, 18)),
+        ("list-end-call", position_flag + "let values = [1]\nvalues.slice(0, flag())\n",
+         list_position_message, list_position_repair, (3, 17, 3, 21)),
+        ("text-start-call", position_flag + 'print("harbour".slice(flag(), 1))\n',
+         text_position_message, text_position_repair, (2, 23, 2, 27)),
+        ("text-end-call", position_flag + 'print("harbour".slice(0, flag()))\n',
+         text_position_message, text_position_repair, (2, 26, 2, 30)),
+        ("list-start-multiline", "let values = [1]\nvalues.slice(\n    false,\n    1\n)\n",
+         list_position_message, list_position_repair, (3, 5, 3, 10)),
+        ("text-end-multiline", 'print("harbour".slice(\n    0,\n    false\n))\n',
+         text_position_message, text_position_repair, (3, 5, 3, 10)),
+        ("text-both-invalid", 'print("harbour".slice(false, true))\n',
+         text_position_message, text_position_repair, (1, 23, 1, 28)),
+        ("list-start-before-later-name", "let values = [1]\nvalues.slice(false, missing)\n",
+         list_position_message, list_position_repair, (2, 14, 2, 19)),
+        ("text-record-name", position_problem + 'print("harbour".slice(bad, 1))\n',
+         "Text.slice positions must be Integers; expected Integer, found Problem",
+         text_position_repair, (3, 23, 3, 26)),
+        ("text-list-type", 'print("harbour".slice(0, [1]))\n',
+         "Text.slice positions must be Integers; expected Integer, found List<Integer>",
+         text_position_repair, (1, 26, 1, 27)),
+        ("truncate-record-name", position_problem + "let values = [1]\nvalues.truncate(bad)\n",
+         "List.truncate positions must be Integers; expected Integer, found Problem",
+         truncate_position_repair, (4, 17, 4, 20)),
+    ):
+        path = root / f"position-anchor-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0410", expected_message=message, expected_help=repair,
+                   expected_span=span, expected_source_lines=source.splitlines())
+
+    # Text keeps its existing parse/closing-token priority before type checks.
+    for name, source, code, message, span in (
+        ("text-later-name-before-type", 'print("harbour".slice(false, missing))\n', "E0301",
+         "I can't find a value named 'missing'", (1, 30, 1, 37)),
+        ("text-close-before-type", 'print("harbour".slice(false, 1, 2))\n', "E0202",
+         "expected ')', found ','", (1, 31, 1, 32)),
+    ):
+        path = root / f"position-anchor-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, code, expected_message=message, expected_span=span,
+                   expected_source_lines=source.splitlines())
+
+    compile_program("position-anchor-valid-nested",
+                    "function start(): Integer { return 0 }\n"
+                    "function finish(): Integer { return 1 }\n"
+                    "let values = [1, 2]\nlet middle = values.slice(start(), finish())\n"
+                    'values.truncate(finish())\nprint("harbour".slice(start(), finish()))\n')
+
+    # Existing-suite seeds exercise exact emitting templates in their existing
+    # families. These are classification/repair tests, not new span policies.
+    generic_repair = "use the same type for every value bound to this type parameter"
+    constant_repair = "change the initializer or the constant's declared type so they agree"
+    for name, source, code, message, repair in (
+        ("list-slice-start", "let values = [1]\nvalues.slice(false, 1)\n", "E0410",
+         "List.slice positions must be Integers; expected Integer, found Boolean",
+         "use Integer positions, such as values.slice(0, values.length)"),
+        ("list-slice-end", "let values = [1]\nvalues.slice(0, false)\n", "E0410",
+         "List.slice positions must be Integers; expected Integer, found Boolean",
+         "use Integer positions, such as values.slice(0, values.length)"),
+        ("list-truncate", "let values = [1]\nvalues.truncate(true)\n", "E0410",
+         "List.truncate positions must be Integers; expected Integer, found Boolean",
+         "use an Integer length, such as values.truncate(0)"),
+        ("text-slice-start", 'print("harbour".slice(false, 1))\n', "E0410",
+         "Text.slice positions must be Integers; expected Integer, found Boolean", "use Integer positions, such as text.slice(0, text.length)"),
+        ("text-slice-end", 'print("harbour".slice(0, false))\n', "E0410",
+         "Text.slice positions must be Integers; expected Integer, found Boolean", "use Integer positions, such as text.slice(0, text.length)"),
+        ("generic-call", "function choose<Item>(left: Item, right: Item): Item { return left }\n"
+         'print(choose(1, "two"))\n', "E0401",
+         "type argument 'Item' is used inconsistently: Integer and Text", generic_repair),
+        ("generic-record", "record Same<Item> { left: Item; right: Item }\n"
+         'let value = Same { left: 1; right: "two" }\n', "E0401",
+         "type argument 'Item' is used inconsistently: Integer and Text", generic_repair),
+        ("constant-type", 'constant COUNT: Integer = "many"\n', "E0401",
+         "the value for constant 'COUNT' is Text, not Integer", constant_repair),
+        ("global-literal-type", "global TABLE: List<Integer> = 1\n", "E0401",
+         "the value for constant 'TABLE' is Integer, not List<Integer>", constant_repair),
+        ("duplicate-parameter", "function same<Item, Item>(value: Item): Item { return value }\n", "E0501",
+         "type parameter 'Item' is declared twice",
+         "give each type parameter a distinct name, or remove the repeated parameter"),
+        ("duplicate-alias", "type Reading = Integer\ntype Reading = Text\n", "E0501",
+         "module declares type 'Reading' more than once",
+         "use one declaration for this type name, or rename one of the declarations"),
+        ("duplicate-named-test", 'test "same" {}\ntest "same" {}\n', "E0501",
+         "this module already has a test with that name",
+         "give each test in this module a different name, or remove the repeated test"),
+    ):
+        path = root / f"family-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, code, expected_message=message, expected_help=repair,
+                   expected_source_lines=source.splitlines())
+
+    private_module = root / "family-private.min"
+    private_module.write_text(
+        "public record Secret { private hiddenLight: Integer }\n"
+        "public type Treasure = Secret\n"
+        "public function create(): Secret { return Secret { hiddenLight: 42 } }\n", encoding="utf-8")
+    for construction in ("Secret", "Treasure"):
+        source = ('use "./family-private.min" as vault\n'
+                  f"let forged = vault.{construction} {{}}\n")
+        path = root / f"family-private-{construction}.min"
+        path.write_text(source, encoding="utf-8")
+        value = diagnostic(path, "E0307",
+                           expected_help="call a public factory function from the module that declares this record",
+                           expected_source_lines=source.splitlines())
+        assert value["message"].startswith("record '") and value["message"].endswith(
+            "' has private fields, so only its own module can create one"), value
+        assert "hiddenLight" not in value["message"] and all(
+            "hiddenLight" not in note for note in value["help"]), value
+    compile_program("family-public-factory", 'use "./family-private.min" as vault\nlet value = vault.create()\n')
+
+    # Message-template words inside ordinary names or paths must not take
+    # precedence over the compiler's actual unknown-name/source-read problem.
+    for name, source, code in (
+        ("unknown-generic-words", "print(type_argument_Item_is_used_inconsistently)\n", "E0301"),
+        ("unknown-private-words", "print(has_private_fields)\n", "E0301"),
+        ("unknown-duplicate-words", "module_declares_type()\n", "E0302"),
+    ):
+        path = root / f"family-collision-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, code, expected_source_lines=source.splitlines())
+    for name in ("record 'Secret' has private fields, so only its own module can create one.min",
+                 "type argument 'Item' is used inconsistently: Integer and Text.min"):
+        diagnostic(root / name, "E0101", has_excerpt=False)
+
+    compile_program("family-valid-ranges", "let values = [1, 2]\nlet middle = values.slice(0, 1)\n"
+                    'values.truncate(1)\nprint("harbour".slice(0, 3))\n')
+    compile_program("family-valid-generic-alias-shadow", "type Item = Text\n"
+                    "function identity<Item>(value: Item): Item { return value }\n"
+                    "constant COUNT: Integer = 3\nprint(identity(COUNT))\n")
+    compile_program("family-distinct-named-tests", 'test "dawn" {}\ntest "night" {}\n')
+
+    # The five try diagnostics retain their semantic priority and primary
+    # prefixes. All ranges below are counted from these literal source strings.
+    enclosing_repair = "use try inside a function returning Result, or handle this Result with match"
+    operand_repair = "pass a Result value to try; use an ordinary value directly without try"
+    payload_repair = "handle the Result with match and convert its error to the enclosing error type"
+    protocol_primary = "try context needs an error type with a public withContext(Text) method returning the same error type"
+    protocol_repair = "provide a public withContext(Text) method returning the same error type, or handle the Result with match"
+    context_repair = 'use a Text expression after else, such as "reading the configuration"'
+    for name, source, primary, repair, span in (
+        ("top-level", "// leading source\n\nlet value = try Ok<Integer, Text>(1)\n",
+         "try requires a Result-returning function", enclosing_repair, (3, 13, 3, 16)),
+        ("enclosing-integer", "function bad(): Integer {\n    let value = try 42\n    return 0\n}\n",
+         "try requires a Result-returning function; found Integer", enclosing_repair, (2, 17, 2, 20)),
+        ("enclosing-nothing", "function bad() {\n    try Ok<Integer, Text>(1)\n}\n",
+         "try requires a Result-returning function; found Nothing", enclosing_repair, (2, 5, 2, 8)),
+        ("integer-operand", "function bad(): Result<Integer, Text> {\n    let value = try 42\n    return Ok(value)\n}\n",
+         "try needs a Result; found Integer", operand_repair, (2, 21, 2, 23)),
+        ("parenthesized-operand", "function bad(): Result<Integer, Text> {\n    let value = try (42)\n    return Ok(value)\n}\n",
+         "try needs a Result; found Integer", operand_repair, (2, 21, 2, 22)),
+        ("call-operand", "function read(): Integer { return 1 }\nfunction bad(): Result<Integer, Text> {\n"
+         "    let value = try read()\n    return Ok(value)\n}\n",
+         "try needs a Result; found Integer", operand_repair, (3, 21, 3, 25)),
+        ("error-payload", "function bad(): Result<Integer, Integer> {\n"
+         '    let value = try Err<Integer, Text>("bad")\n    return Ok(value)\n}\n',
+         "try error type must match the enclosing Result error type; expected Integer, found Text",
+         payload_repair, (2, 17, 2, 20)),
+    ):
+        path = root / f"try-types-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0401", expected_message=primary, expected_help=repair,
+                   expected_span=span, expected_source_lines=source.splitlines(), exact_output=True)
+
+    for name, context_expression in (("missing-protocol", '"reading"'),
+                                     ("protocol-before-context-type", "42")):
+        source = ('function read(): Result<Integer, Text> { return Err("bad") }\n'
+                  "function bad(): Result<Integer, Text> {\n"
+                  f"    let value = try read() else {context_expression}\n"
+                  "    return Ok(value)\n}\n")
+        path = root / f"try-types-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0401", expected_message=protocol_primary + "; found Text",
+                   expected_help=protocol_repair, expected_span=(3, 28, 3, 32),
+                   expected_source_lines=source.splitlines(), exact_output=True)
+
+    problem = "record Problem { message: Text }\n"
+    reader = 'function read(): Result<Integer, Problem> { return Err(Problem { message: "bad" }) }\n'
+    wrapper = ('function bad(): Result<Integer, Problem> {\n'
+               '    let value = try read() else "reading"\n    return Ok(value)\n}\n')
+    source = problem + reader + wrapper
+    path = root / "try-types-record-without-protocol.min"
+    path.write_text(source, encoding="utf-8")
+    diagnostic(path, "E0401", expected_message=protocol_primary + "; found Problem",
+               expected_help=protocol_repair, expected_span=(4, 28, 4, 32),
+               expected_source_lines=source.splitlines(), exact_output=True)
+
+    for name, method, found in (
+        ("wrong-protocol-parameter", "public function Problem.withContext(context: Integer): Problem { return self }\n",
+         "(Integer) -> Problem"),
+        ("wrong-protocol-result", "public function Problem.withContext(context: Text): Text { return context }\n",
+         "(Text) -> Text"),
+        ("missing-protocol-parameter", "public function Problem.withContext(): Problem { return self }\n",
+         "() -> Problem"),
+        ("extra-protocol-parameter", "public function Problem.withContext(context: Text, count: Integer): Problem { return self }\n",
+         "(Text, Integer) -> Problem"),
+    ):
+        source = problem + method + reader + wrapper
+        path = root / f"try-types-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0401", expected_message=protocol_primary + "; expected (Text) -> Problem, found " + found,
+                   expected_help=protocol_repair, expected_span=(5, 28, 5, 32),
+                   expected_source_lines=source.splitlines(), exact_output=True)
+
+    method = "public function Problem.withContext(context: Text): Problem { return self }\n"
+    for name, expression, found, span in (
+        ("integer-context", "42", "Integer", (5, 33, 5, 35)),
+        ("list-context", "[1]", "List<Integer>", (5, 33, 5, 34)),
+        ("nested-context", "number()", "Integer", (6, 33, 6, 39)),
+    ):
+        number = "function number(): Integer { return 42 }\n" if name == "nested-context" else ""
+        source = (problem + method + reader + number + "function bad(): Result<Integer, Problem> {\n"
+                  f"    let value = try read() else {expression}\n    return Ok(value)\n}}\n")
+        path = root / f"try-types-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0401", expected_message="try context must be Text; expected Text, found " + found,
+                   expected_help=context_repair, expected_span=span,
+                   expected_source_lines=source.splitlines(), exact_output=True)
+
+    compile_program("try-types-valid-propagation",
+                    'function read(good: Boolean): Result<Integer, Text> { if good { return Ok(3) }; return Err("dark") }\n'
+                    "function outer(good: Boolean): Result<Integer, Text> { let value = try read(good); return Ok(value + 1) }\n"
+                    'match outer(true) { Ok(value) { print(value) } Err(error) { print(error) } }\n'
+                    'match outer(false) { Ok(value) { print(value) } Err(error) { print(error) } }\n')
+    compile_program("try-types-valid-context", problem +
+                    'public function Problem.withContext(context: Text): Problem { return Problem { message: context + ": " + self.message } }\n' +
+                    'function read(good: Boolean): Result<Integer, Problem> { if good { return Ok(1) }; return Err(Problem { message: "dark" }) }\n' +
+                    'function context(): Text { print("context evaluated"); return "reading" }\n' +
+                    'function outer(good: Boolean): Result<Integer, Problem> { let value = try read(good) else context(); return Ok(value) }\n' +
+                    'match outer(true) { Ok(value) { print(value) } Err(error) { print(error.message) } }\n' +
+                    'match outer(false) { Ok(value) { print(value) } Err(error) { print(error.message) } }\n')
+
+    # Same spelling does not make records from different modules identical.
+    # Seed: ResultReview.test_review_same_record_spelling_in_distinct_modules_is_not_same_error.
+    identity_left = root / "identity-left.min"
+    identity_right = root / "identity-right.min"
+    identity_left.write_text(
+        'public record Failure { text: Text }\n'
+        'public function failRead(): Result<Integer, Failure> {\n'
+        '    return Err<Integer, Failure>(Failure { text: "left" })\n'
+        '}\n', encoding="utf-8")
+    identity_right.write_text('public record Failure { text: Text }\n', encoding="utf-8")
+    identity_source = (
+        'use "./identity-left.min" as left\n'
+        'use "./identity-right.min" as right\n'
+        'function wrong(): Result<Integer, right.Failure> {\n'
+        '    let n = try left.failRead()\n'
+        '    return Ok<Integer, right.Failure>(n)\n'
+        '}\n')
+    identity_path = root / "same-name-result-error.min"
+    identity_path.write_text(identity_source, encoding="utf-8")
+    identity_primary = (
+        "try error type must match the enclosing Result error type; "
+        "expected Failure, found Failure (these are different types)")
+    identity_diagnostic = diagnostic(
+        identity_path, "E0401",
+        expected_help="handle the Result with match and convert its error to the enclosing error type",
+        expected_message=identity_primary, expected_span=(4, 13, 4, 16),
+        expected_source_lines=identity_source.splitlines())
+    # The location header/file field may name a temporary test source; the
+    # primary must never expose snapshot filenames or declaration origins.
+    assert identity_diagnostic["label"] == "", identity_diagnostic
+    for leaked in ("/tmp/", "/private/tmp/", "minyar-lsp-", "document-",
+                   str(identity_left), str(identity_right),
+                   "identity-left.min", "identity-right.min",
+                   "minyar_module_", "minyar_generic_", "minyar_result_type_", ".minyar.fn."):
+        assert leaked not in identity_diagnostic["message"], ("nominal identity primary leaked implementation data", leaked, identity_diagnostic)
+
+    # The method exists, but its return record belongs to the other module.
+    # Both signatures pretty-print identically; signature validation must
+    # still precede the also-invalid Integer context expression after else.
+    identity_protocol_left = root / "identity-protocol-left.min"
+    identity_protocol_left.write_text(
+        'use "./identity-right.min" as right\n'
+        'public record Failure { text: Text }\n'
+        'public function Failure.withContext(message: Text): right.Failure {\n'
+        '    return right.Failure { text: self.text + message }\n'
+        '}\n'
+        'public function failRead(): Result<Integer, Failure> {\n'
+        '    return Err<Integer, Failure>(Failure { text: "left" })\n'
+        '}\n', encoding="utf-8")
+    identity_protocol_source = (
+        'use "./identity-protocol-left.min" as left\n'
+        'use "./identity-right.min" as right\n'
+        'function wrong(): Result<Integer, left.Failure> {\n'
+        '    let n = try left.failRead() else 42\n'
+        '    return Ok<Integer, left.Failure>(n)\n'
+        '}\n')
+    identity_protocol_path = root / "same-name-context-return.min"
+    identity_protocol_path.write_text(identity_protocol_source, encoding="utf-8")
+    identity_protocol_primary = (
+        "try context needs an error type with a public withContext(Text) method returning the same error type; "
+        "expected (Text) -> Failure, found (Text) -> Failure (these are different types)")
+    identity_protocol_diagnostic = diagnostic(
+        identity_protocol_path, "E0401",
+        expected_help="provide a public withContext(Text) method returning the same error type, or handle the Result with match",
+        expected_message=identity_protocol_primary, expected_span=(4, 33, 4, 37),
+        expected_source_lines=identity_protocol_source.splitlines())
+    assert identity_protocol_diagnostic["label"] == "", identity_protocol_diagnostic
+    for leaked in ("/tmp/", "/private/tmp/", "minyar-lsp-", "document-",
+                   str(identity_protocol_left), str(identity_right),
+                   "identity-protocol-left.min", "identity-right.min",
+                   "minyar_module_", "minyar_generic_", "minyar_result_type_", ".minyar.fn."):
+        assert leaked not in identity_protocol_diagnostic["message"], ("protocol identity primary leaked implementation data", leaked, identity_protocol_diagnostic)
+
 
     missing = root / "missing source.min"
     diagnostic(missing, "E0101", has_excerpt=False)
