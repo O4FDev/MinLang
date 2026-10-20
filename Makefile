@@ -17,7 +17,10 @@ COMPILER_RUNTIME_FLAGS ?= -DMINYAR_COMPILER_ARENA
 COMPILER_LTO_CACHE_DIR ?= build/thinlto-cache
 COMPILER_LTO_CACHE_POLICY ?= cache_size=10%:cache_size_bytes=1g:cache_size_files=10000:prune_after=168h:prune_interval=0s
 TOOLCHAIN_QUOTE = '$(subst ','"'"',$(1))'
-COMPILER_LTO_FLAGS ?= $(if $(filter Linux,$(shell uname -s)),$(shell LLVM_CC=$(call TOOLCHAIN_QUOTE,$(LLVM_CC)) LLVM_FLAGS=$(call TOOLCHAIN_QUOTE,$(LLVM_FLAGS)) COMPILER_LTO_CACHE_DIR=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_DIR)) COMPILER_LTO_CACHE_POLICY=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_POLICY)) sh tools/toolchain.sh compiler-lto-flags),-flto=thin)
+# Make exports this value even for clean. Keep ThinLTO enabled on discovery
+# failure so the mandatory toolchain stamp rejects the bad linker before any
+# build; an empty shell result would silently bypass that validation.
+COMPILER_LTO_FLAGS ?= $(if $(filter Linux,$(shell uname -s)),$(shell LLVM_CC=$(call TOOLCHAIN_QUOTE,$(LLVM_CC)) LLVM_FLAGS=$(call TOOLCHAIN_QUOTE,$(LLVM_FLAGS)) COMPILER_LTO_CACHE_DIR=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_DIR)) COMPILER_LTO_CACHE_POLICY=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_POLICY)) sh tools/toolchain.sh compiler-lto-flags || printf '%s\n' '-flto=thin'),-flto=thin)
 PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = $(wildcard runtime/minyar_*.h) build/.toolchain.json
