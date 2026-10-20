@@ -74,5 +74,12 @@ check-choice-text-niche: build/minyarc build/minyar-runtime.o build/tooling/test
 check-choice-text-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-text-niche-check
 	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-text-niche-check"
 
-check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation check-choice-enums check-choice-text-niche
-check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize check-choice-enums-sanitize check-choice-text-niche-sanitize
+.PHONY: check-choice-container-niche check-choice-container-niche-sanitize
+check-choice-container-niche: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-container-niche-check
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-container-niche-check"
+
+check-choice-container-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-container-niche-check
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-container-niche-check"
+
+check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation check-choice-enums check-choice-text-niche check-choice-container-niche
+check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize check-choice-enums-sanitize check-choice-text-niche-sanitize check-choice-container-niche-sanitize

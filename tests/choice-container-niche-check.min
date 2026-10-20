@@ -1,0 +1,97 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function link(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text) {
+    let compiler = frontend.compiler
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for argument in ["-Wno-override-module", path + ".ll", object, "-lm", "-o", path + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", path + ".link", 60), "link container niche fixture " + level)
+        let result = test.run([path + ".exe"], frontend.environment, "", path + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == diagnostic, "container niche fixture " + level + "\n" + result.output + result.errorOutput)
+    }
+}
+
+function allocations(frontend: fixtures.Frontend, payload: Text, initial: Text, baseline: Boolean) {
+    let compiler = frontend.compiler
+    let source = "function sample(value: " + payload + ", index: Integer): Maybe<" + payload + "> { if index % 2 == 0 { return Some(value) }; return None }\nlet payload: " + payload + " = " + initial + "\nlet values: List<Maybe<" + payload + ">> = []\nfor index in 0..10000 { values.add(sample(payload, index)) }\nlet total = 0\nfor value in values { total += match value { Some(item) { item.length } None { 0 } } }\nprint(total)\n"
+    test.require(fixtures.compile(frontend, source), "compile " + payload + " choice allocation benchmark")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let llvm = io.readTextFile(path + ".ll")
+    if !baseline {
+        test.check(test.contains(llvm, "ret ptr null") && test.contains(llvm, "icmp eq ptr"), "container choice must project header/null: " + payload)
+        test.check(!test.contains(llvm, "call ptr @minyar_record_new"), "container choice benchmark allocated a wrapper: " + payload)
+    }
+    io.writeTextFile(path + ".ll", test.replace(llvm, "@minyar_record_new", "@choice_container_new"))
+    let contract = test.replace(io.readTextFile("tests/choice-container-niche-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+    io.writeTextFile(path + "-runtime.c", contract)
+    let command = [compiler.clang, "-O1"]
+    for flag in compiler.flags { command.add(flag) }
+    for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+    test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 60), "compile exact container choice counter runtime")
+    let counts = "0 records, 0 slots"
+    if baseline { counts = "10000 records, 20000 slots" }
+    link(frontend, path, path + "-runtime.o", "5000\n", "choice container: " + counts + ", 0 live objects, 0 live bytes\n")
+    print(payload + ": 10,000 alternating values, " + counts + ", zero residual objects/bytes")
+}
+
+function state(frontend: fixtures.Frontend, entry: Text, output: Text, prior: Text, next: Text) {
+    let stats = output + ".stats"
+    test.require(test.run([frontend.compiler.executable, entry, output + ".ll", "--module-state", prior, next, stats, "--library", "library"], frontend.environment, "", output + ".compile", 60), "compile imported container choice state")
+    let fields = test.words(io.readTextFile(stats))
+    test.check(fields.length >= 7 && fields[0] == "0" && fields[6] == "false", "container choices must preserve whole-program fallback\n" + io.readTextFile(stats))
+    test.check(io.readTextFile(next) == "", "container fallback persisted unsupported module artifacts")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let baseline = test.setting("MINYAR_CHOICE_CONTAINER_BASELINE", "")
+if baseline != "" { compiler.executable = baseline }
+allocations(frontend, "Bytes", "Bytes(\"x\")", baseline != "")
+if baseline == "" {
+    fixtures.executes(frontend, io.readTextFile("tests/choice-container-niche.min"), io.readTextFile("tests/choice-container-niche.expected"), ["-O0", "-O2"], 0, "", true)
+    for payload in ["Bytes", "List<Integer>", "List<Text>"] {
+        for operation in ["==", "!=", "<"] {
+            let capability = "Equatable"
+            if operation == "<" { capability = "Ordered" }
+            fixtures.rejects(frontend, "let first: Maybe<" + payload + "> = None\nlet second: Maybe<" + payload + "> = None\nprint(first " + operation + " second)\n", "not " + capability, true)
+        }
+        fixtures.rejects(frontend, "let values: List<Maybe<" + payload + ">> = [None]\nvalues.sort()\n", "not Ordered", true)
+        fixtures.rejects(frontend, "let keys: Map<Maybe<" + payload + ">, Integer> = Map()\n", "not Hashable", true)
+        fixtures.rejects(frontend, "let keys: Set<Maybe<" + payload + ">> = Set()\n", "not Hashable", true)
+        fixtures.rejects(frontend, "record Key { value: Maybe<" + payload + "> }\nlet first = Key { value: None }\nprint(first == first)\n", "not Equatable", true)
+        fixtures.rejects(frontend, "record Key { value: Maybe<" + payload + "> }\nlet keys: Map<Key, Integer> = Map()\n", "not Hashable", true)
+    }
+
+    let leaf = compiler.directory + "/optional.min"
+    let entry = compiler.directory + "/main.min"
+    let exported = "public choice Buffer { Empty; Data(value: Bytes) }\npublic type Optional = Maybe<Bytes>\npublic function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }\npublic function optional(): Optional { return wrap(Bytes(\"module\")) }\npublic function empty(): Buffer { return Data(Bytes()) }\npublic function length(value: Buffer): Integer { return match value { Empty { -1 } Data(item) { item.length } } }\n"
+    io.writeTextFile(leaf, exported)
+    io.writeTextFile(entry, "use \"./optional.min\" as optional\nlet value: optional.Optional = optional.optional()\nprint(value.unwrap().length)\nprint(optional.length(optional.empty()))\nprint(optional.wrap(Bytes(\"x\")).unwrap().length)\n")
+    let empty = compiler.directory + "/empty.state"
+    let prior = compiler.directory + "/prior.state"
+    let next = compiler.directory + "/next.state"
+    io.writeTextFile(empty, "")
+    state(frontend, entry, compiler.directory + "/cold", empty, prior)
+    state(frontend, entry, compiler.directory + "/warm", prior, next)
+    let cold = io.readTextFile(compiler.directory + "/cold.ll")
+    test.check(io.readTextFile(compiler.directory + "/warm.ll") == cold, "warm container fallback changed ABI")
+    test.require(test.run([compiler.executable, entry, compiler.directory + "/direct.ll", "--library", "library"], frontend.environment, "", compiler.directory + "/direct.compile", 60), "compile direct imported container choices")
+    test.check(io.readTextFile(compiler.directory + "/direct.ll") == cold, "container fallback differs from direct compilation")
+    io.writeTextFile(leaf, test.replace(exported, "\"module\"", "\"edited!\""))
+    state(frontend, entry, compiler.directory + "/edited", prior, next)
+    state(frontend, entry, compiler.directory + "/fresh", empty, prior)
+    test.check(io.readTextFile(compiler.directory + "/edited.ll") == io.readTextFile(compiler.directory + "/fresh.ll"), "producer edit retained stale container ABI")
+    for mode in ["cold", "warm", "edited"] {
+        let path = compiler.directory + "/" + mode
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+        let expected = "6\n0\n1\n"
+        if mode == "edited" { expected = "7\n0\n1\n" }
+        link(frontend, path, compiler.runtime, expected, "")
+    }
+}
+test.removeTree(compiler.directory)
+print("Choice container niche: passed")
