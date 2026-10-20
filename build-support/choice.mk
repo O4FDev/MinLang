@@ -1,3 +1,6 @@
+check check-portable: check-patterns
+check-sanitize: check-patterns-sanitize
+
 # The core declaration remains ordinary Minyar source; embedding avoids a runtime
 # dependency on the compiler's working directory or a particular library path.
 build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | build
@@ -50,5 +53,12 @@ check-choice-niche: build/minyarc build/minyar-runtime.o build/tooling/tests/cho
 check-choice-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-niche-check
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-niche-check"
 
-check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-patterns
-check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-patterns-sanitize
+.PHONY: check-choice-propagation check-choice-propagation-sanitize
+check-choice-propagation: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-propagation-check
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-propagation-check"
+
+check-choice-propagation-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-propagation-check
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-propagation-check"
+
+check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation
+check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize

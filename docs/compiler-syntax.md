@@ -241,6 +241,22 @@ a best-effort source prefix. Display-cell ranges follow Unicode 14.0 assigned
 wide/full-width and combining categories, plus common emoji sequences. JSON
 positions remain scalar offsets and preserve the original valid source line.
 
+## Choice storage metadata
+
+Choice declarations retain every logical payload field for type checking and
+cycle reachability. `choiceLayoutKind(context, type)` identifies an ordinary
+type (0), integer choice (1), tagged union (2), or nullable record choice (3).
+`choiceStorageCount` reports slots owned by the choice itself; nullable choices
+own no slots. `choiceStorageField` maps a union's logical field to its physical
+slot. Debug readers must inspect the layout kind before using an offset.
+
+For nullable choices, `choiceNicheType` identifies the underlying record and
+`choiceNicheTag` gives the non-null case's zero-based tag. The empty case has
+the other tag. `readChoiceMatchTag` and `readChoiceMatchPayload` generate the
+representation-specific projections, shared by matches and test diagnostics.
+Cycle analysis retains the logical graph and projects nullable aliases only
+when selecting the runtime ownership entry points.
+
 ## Runtime trace metadata
 
 `runtime-traces.min` records readable names and original token locations while

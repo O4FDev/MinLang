@@ -211,6 +211,13 @@ allocate only the 5,000 present records, using 5,000 slots. The former wrapper
 layout allocated 15,000 records and 25,000 slots for the same workload.
 `check-choice-niche-sanitize` adds ASan/UBSan.
 
+`make check-choice-propagation` checks partial choice cleanup when a payload's
+`try` returns early. It covers scalar and mixed reference payloads, borrowed and
+owned arguments, assignment, return, List storage and lazy error context at
+O0/O2 with exact ownership cleanup. A construction root stays alive on failure;
+the completed value receives a separate transferable owner on success.
+`check-choice-propagation-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.
