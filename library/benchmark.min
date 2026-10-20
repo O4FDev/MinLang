@@ -1,0 +1,144 @@
+use "system" as system
+use "process" as processInfo
+use "files" as files
+
+// Batch timings include callback and loop overhead. Nothing is subtracted and
+// no samples are discarded. Benchmark bodies must make their work observable.
+public record Options { samples: Integer; warmup: Integer; targetNanoseconds: Integer; maxIterations: Integer; error: Text }
+public record Statistics { median: Float; mad: Float; p95: Float; minimum: Float; maximum: Float }
+public record Measurement { iterations: Integer; calibrationNanoseconds: Integer; warmup: Integer; targetNanoseconds: Integer; batchNanoseconds: List<Integer>; samples: List<Float>; statistics: Statistics }
+
+public function defaults(): Options {
+    return Options { samples: 15; warmup: 3; targetNanoseconds: 5000000; maxIterations: 1000000; error: "" }
+}
+
+function natural(source: Text, maximum: Integer): Integer {
+    if source.length == 0 { return -1 }
+    let value = 0
+    for character in source {
+        if character < '0' || character > '9' { return -1 }
+        let digit = Integer(character) - 48
+        if value > (maximum - digit) / 10 { return -1 }
+        value = value * 10 + digit
+        if value > maximum { return -1 }
+    }
+    return value
+}
+
+/// Read bounded measurement controls. An invalid request sets `error`.
+public function options(arguments: List<Text>): Options {
+    let result = defaults()
+    let seen: List<Text> = []
+    let index = 0
+    while index < arguments.length {
+        let name = arguments[index]
+        if name != "--samples" && name != "--warmup" && name != "--target-ms" && name != "--max-iterations" {
+            result.error = "unknown benchmark option: " + name; return result
+        }
+        for previous in seen { if previous == name { result.error = "repeated benchmark option: " + name; return result } }
+        seen.add(name)
+        if index + 1 == arguments.length { result.error = name + " needs a value"; return result }
+        let minimum = 1
+        let maximum = 100
+        if name == "--samples" { minimum = 3 }
+        if name == "--warmup" { minimum = 0 }
+        if name == "--max-iterations" { maximum = 1000000 }
+        let value = natural(arguments[index + 1], maximum)
+        if value < minimum { result.error = name + " must be an integer from " + Text(minimum) + " to " + Text(maximum); return result }
+        if name == "--samples" { result.samples = value }
+        if name == "--warmup" { result.warmup = value }
+        if name == "--target-ms" { result.targetNanoseconds = value * 1000000 }
+        if name == "--max-iterations" { result.maxIterations = value }
+        index += 2
+    }
+    return result
+}
+
+function median(ordered: List<Float>): Float {
+    let middle = ordered.length / 2
+    if ordered.length % 2 == 1 { return ordered[middle] }
+    return ordered[middle - 1] + (ordered[middle] - ordered[middle - 1]) / 2.0
+}
+
+/// Median, unscaled median absolute deviation, and nearest-rank p95 in ns/op.
+/// Input samples are preserved in their original order.
+public function summarize(samples: List<Float>): Statistics {
+    if samples.length == 0 { fail("benchmark statistics need at least one sample") }
+    for sample in samples {
+        if !(sample >= 0.0 && sample <= 9223372036854775807.0) { fail("benchmark samples must be finite nonnegative nanoseconds") }
+    }
+    let ordered = samples.sorted()
+    let center = median(ordered)
+    let deviations: List<Float> = []
+    for sample in samples { deviations.add(abs(sample - center)) }
+    deviations.sort()
+    let rank = (samples.length * 95 + 99) / 100 - 1
+    return Statistics { median: center; mad: median(deviations); p95: ordered[rank]; minimum: ordered[0]; maximum: ordered[ordered.length - 1] }
+}
+
+function batch(body: () -> Nothing, iterations: Integer): Integer {
+    let before = system.monotonicNanoseconds()
+    for index in 0..iterations { body() }
+    let after = system.monotonicNanoseconds()
+    if before < 0 || after < before { fail("benchmark monotonic clock failed") }
+    return after - before
+}
+
+/// Calibrate by doubling batches, warm up, then keep every measured batch.
+/// Calls are sequential in one process; setup and process launch are untimed.
+public function measure(body: () -> Nothing, configuration: Options): Measurement {
+    if configuration.error != "" || configuration.samples < 3 || configuration.samples > 100 || configuration.warmup < 0 || configuration.warmup > 100 || configuration.targetNanoseconds < 1000000 || configuration.targetNanoseconds > 100000000 || configuration.maxIterations < 1 || configuration.maxIterations > 1000000 {
+        fail("invalid benchmark measurement options")
+    }
+    let iterations = 1
+    let calibration = 0
+    while true {
+        calibration = batch(body, iterations)
+        if calibration >= configuration.targetNanoseconds || iterations == configuration.maxIterations { break }
+        iterations = min(iterations * 2, configuration.maxIterations)
+    }
+    for index in 0..configuration.warmup { batch(body, iterations) }
+    let batches: List<Integer> = []
+    let samples: List<Float> = []
+    for index in 0..configuration.samples {
+        let elapsed = batch(body, iterations)
+        batches.add(elapsed)
+        samples.add(Float(elapsed) / Float(iterations))
+    }
+    return Measurement { iterations: iterations; calibrationNanoseconds: calibration; warmup: configuration.warmup; targetNanoseconds: configuration.targetNanoseconds; batchNanoseconds: batches; samples: samples; statistics: summarize(samples) }
+}
+
+/// Machine report retains integer batch durations as well as ns/op samples.
+/// Exact durations and the iteration count can independently recover statistics.
+public function report(measurement: Measurement): Text {
+    let statistics = measurement.statistics
+    let output = "{\"schema\":1,\"clock\":\"monotonic\",\"unit\":\"ns/op\",\"iterations\":" + Text(measurement.iterations) + ",\"calibration_ns\":" + Text(measurement.calibrationNanoseconds) + ",\"warmup\":" + Text(measurement.warmup) + ",\"target_ns\":" + Text(measurement.targetNanoseconds) + ",\"median\":" + Text(statistics.median) + ",\"mad\":" + Text(statistics.mad) + ",\"p95\":" + Text(statistics.p95) + ",\"minimum\":" + Text(statistics.minimum) + ",\"maximum\":" + Text(statistics.maximum) + ",\"samples\":["
+    for index in 0..measurement.samples.length {
+        if index > 0 { output += "," }
+        output += Text(measurement.samples[index])
+    }
+    output += "],\"batch_ns\":["
+    for index in 0..measurement.batchNanoseconds.length {
+        if index > 0 { output += "," }
+        output += Text(measurement.batchNanoseconds[index])
+    }
+    return output + "]}"
+}
+
+/// Compiler benchmark entry: argument 0 selects the case, argument 1 names the
+/// private report file; remaining arguments are measurement controls.
+public function run(body: () -> Nothing): Integer {
+    if processInfo.argumentCount() < 2 { system.writeStandardError("minyar bench: missing benchmark report path\n"); return 1 }
+    let arguments: List<Text> = []
+    for index in 2..processInfo.argumentCount() { arguments.add(processInfo.argument(index)) }
+    let configuration = options(arguments)
+    if configuration.error != "" { system.writeStandardError("minyar bench: " + configuration.error + "\n"); return 1 }
+    let measurement = measure(body, configuration)
+    let descriptor = files.open(processInfo.argument(1), files.WRITE | files.CREATE | files.EXCLUSIVE)
+    if descriptor < 0 { system.writeStandardError("minyar bench: cannot create benchmark report\n"); return 1 }
+    let bytes = Bytes(report(measurement) + "\n")
+    let written = files.write(descriptor, bytes, 0, bytes.length)
+    let closed = files.close(descriptor)
+    if written != bytes.length || closed != 0 { system.writeStandardError("minyar bench: cannot write benchmark report\n"); return 1 }
+    return 0
+}

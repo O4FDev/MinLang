@@ -199,7 +199,14 @@ class BudgetTests(unittest.TestCase):
     def stop_guardian(self, ready):
         fd = self.guardian_pidfd(ready)
         signal.pidfd_send_signal(fd, signal.SIGSTOP)
-        state = Path(f"/proc/{self.guardian_pid}/stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+        # SIGSTOP is delivered asynchronously and the guardian is not our child, so
+        # waitid cannot observe the stop; read /proc until it shows T or the deadline passes.
+        deadline = time.monotonic() + 5
+        while True:
+            state = Path(f"/proc/{self.guardian_pid}/stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+            if state == b"T" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.001)
         self.assertEqual(state, b"T", "stopped-guardian precondition was not established")
         return fd
 

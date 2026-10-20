@@ -60,6 +60,80 @@ their test syntax. The low-level `--test-mode` compiler/launcher option builds
 a module's test executable; run it with `--list`, a zero-based case index, or
 no argument to run its cases in order.
 
+Keep a property inside a test to check many generated inputs:
+
+```minyar
+use "property" as samples
+
+test "a sorted list keeps its length" {
+    property "sorting" for values in samples.lists(samples.integers(-100, 100), 30) {
+        expect(values.sorted().length == values.length)
+    }
+}
+```
+
+The generator is evaluated once. Each input runs the body from the beginning;
+the first false `expect` stops that input. A failure tries smaller inputs and
+reports the original value, the reduced value, the seed and the case number.
+Set `MINYAR_PROPERTY_SEED` to 0–2147483646 and `MINYAR_PROPERTY_CASES` to
+1–100000 to replay or extend a run; the defaults are 1 and 100. Every property
+starts its own deterministic sequence. Important boundaries come before random
+cases, so a small case count may check only those boundaries.
+
+The `property` module supplies inclusive Integer intervals (including signed
+64-bit endpoints), Booleans, Unicode Text and Lists. `texts(maximumLength)` and
+`lists(elementGenerator, maximumLength)` include empty values and accept lengths
+up to 10000. Text lengths count Unicode scalars. A public `Generator<Item>`
+record also permits custom sampling, shrinking, rendering and deep copying;
+`property.run` returns an `Outcome` without stopping the process.
+
+Shrinking attempts at most 1000 candidates. It finds a value for which the
+supplied shrinker cannot find a smaller failure within that budget; it does not
+promise the smallest possible counterexample. Generated mutable inputs are
+deeply copied before each check. Other observable state must remain unchanged
+between checks, and custom generator callbacks must terminate. A runtime stop
+such as `fail`, overflow or a bounds error stops the test immediately and cannot
+be shrunk. Keep expectations in the property body; callbacks can return Boolean
+results for the body to check. Use `expect` rather than `return` in the property.
+Use a factory call, a variable or a parenthesized record for its generator.
+
+Benchmarks also live beside declarations:
+
+```minyar
+global values: List<Integer> = [21, 3, 8, 1, 13, 5]
+
+bench "sort a small harvest" {
+    let ordered = values.sorted()
+    if ordered[0] != 1 { fail("the harvest was lost") }
+}
+```
+
+`minyar bench [FILTER]` discovers project and dependency benchmarks and compiles
+them in the release profile. Each case runs sequentially in a separate process;
+its module initialization and process startup are outside the timed interval.
+The runner calibrates a batch, warms it up, then reports median nanoseconds per
+operation, median absolute deviation and nearest-rank p95. It keeps every raw
+sample and subtracts no estimated overhead. Statistics, including p95, describe
+the distribution of per-batch averages. One operation is one complete body
+call, including its callback and loop overhead. Give the body runtime-dependent
+inputs and check its results so optimization cannot discard its work.
+
+Controls follow `--`: `--samples N` (3–100, default 15), `--warmup N`
+(0–100, default 3), `--target-ms N` (1–100, default 5), and
+`--max-iterations N` (1–1000000, default 1000000).
+`minyar bench -- --json` emits machine-readable results, exact integer batch
+durations, derived samples and build
+settings; benchmark output is forwarded to standard error. Measurements describe
+the current machine and load, rather than a portable performance guarantee.
+
+`bench` and `property` are contextual names. Benchmark bodies are excluded from
+ordinary and test builds; tests are excluded from benchmark builds. The
+low-level `--list-benchmarks` prints an index and JSON-quoted name per line.
+`--benchmark-mode` builds a benchmark executable accepting a case index, a
+private report path and measurement controls. The
+[seed laws gallery](../examples/gallery/seed-laws.min) checks sorting, signed
+decimal parsing and Unicode Text round trips.
+
 ## Documentation beside the code
 
 Write `///` immediately above a declaration to describe it. Consecutive lines

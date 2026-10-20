@@ -1,0 +1,86 @@
+use "../../tools/testing.min" as test
+use "../../tools/driver-support.min" as host
+use "io" as io
+use "system" as system
+use "json" as json
+use "benchmark" as benchmark
+use "../../tools/benchmarks.min" as benchmarkTools
+
+let fractions = [1.0 / 3.0, 2.0 / 3.0, 4.0 / 3.0]
+let fixed = benchmark.Measurement { iterations: 3; calibrationNanoseconds: 0; warmup: 0; targetNanoseconds: 1000000; batchNanoseconds: [1, 2, 4]; samples: fractions; statistics: benchmark.summarize(fractions) }
+let fixedOptions = benchmark.options(["--samples", "3", "--warmup", "0", "--target-ms", "1", "--max-iterations", "3"])
+let fixedReport = benchmark.report(fixed)
+test.check(benchmarkTools.validMeasurement(json.parse(fixedReport), fixedOptions), "exact reconstruction accepts repeating-fraction samples")
+for change in [
+    ["\"mad\":" + Text(fixed.statistics.mad), "\"mad\":0.0"],
+    ["\"samples\":[" + Text(fractions[0]), "\"samples\":[0.0"],
+    ["\"batch_ns\":[1,2,4]", "\"batch_ns\":[1.0,2,4]"],
+    ["\"batch_ns\":[1,2,4]", "\"batch_ns\":[9007199254740992,2,4]"],
+    ["\"batch_ns\":[1,2,4]", "\"batch_ns\":[1,2]"],
+    ["\"iterations\":3", "\"iterations\":3.0"]
+] {
+    let corrupted = test.replace(fixedReport, change[0], change[1])
+    test.check(corrupted != fixedReport && !benchmarkTools.validMeasurement(json.parse(corrupted), fixedOptions), "report corruption or noncanonical integer is rejected without tolerance")
+}
+
+let root = host.resolveName(".")
+let launcher = test.setting("MINYAR_TEST_LAUNCHER", root + "/minyar")
+let work = test.scratch()
+let application = work + "/app with spaces"
+let dependency = work + "/poems"
+host.makeDirectories(application + "/src/nested")
+host.makeDirectories(dependency + "/src")
+io.writeTextFile(application + "/Minyar.toml", "[package]\nname = \"lantern\"\nversion = \"0.1.0\"\nkind = \"bin\"\n[dependencies]\npoems = { path = \"../poems\" }\n")
+io.writeTextFile(dependency + "/Minyar.toml", "[package]\nname = \"poems\"\nversion = \"0.1.0\"\nkind = \"lib\"\n")
+io.writeTextFile(dependency + "/src/poems.min", "public function answer(): Integer { return 42 }\nbench \"dependency light\" { print(answer()) }\n")
+io.writeTextFile(application + "/src/main.min", "use \"poems\" as poems\nglobal warm: Integer = 42\nfunction main(): Integer { fail(\"application must not run\"); return 0 }\ntest \"test must not run\" { fail(\"benchmarks do not run tests\") }\nbench \"home light\" { if warm != poems.answer() { fail(\"module initialization\") }; print(warm) }\n")
+io.writeTextFile(application + "/src/nested/harbour.min", "function light(): Text { return \"home\" }\nbench \"nested light\" { print(light()) }\n")
+let controls = ["--samples", "3", "--warmup", "0", "--target-ms", "1", "--max-iterations", "1"]
+let command = [launcher, "bench", "--", "--json"]
+for argument in controls { command.add(argument) }
+let success = test.run(command, system.environment(), application, work + "/success", 600)
+test.require(success, "discover module and dependency benchmarks")
+let document = json.parse(success.output)
+test.check(document.kind == json.OBJECT && json.member(document, "count").number == 3.0 && json.member(document, "failures").number == 0.0, "three benchmarks and clean aggregate JSON\n" + success.output + success.errorOutput)
+let entries = json.member(document, "benchmarks")
+test.check(entries.kind == json.ARRAY && entries.items.length == 3, "three machine benchmark records")
+test.check(json.member(document, "clang_flags").kind == json.ARRAY && json.member(document, "runtime_flags").kind == json.ARRAY && json.member(document, "release_lto").truth, "compiler optimization and runtime flags are recorded")
+let names: List<Text> = []
+for entry in entries.items {
+    names.add(json.member(entry, "name").text)
+    let measurement = json.member(entry, "measurement")
+    test.check(json.member(measurement, "samples").items.length == 3 && json.member(measurement, "iterations").number == 1.0 && json.member(measurement, "unit").text == "ns/op", "measurements retain controls and raw samples")
+    test.check(json.member(measurement, "calibration_ns").kind == json.NUMBER, "iteration-cap calibration remains visible")
+    test.check(json.member(measurement, "batch_ns").items.length == 3, "raw integer clock durations accompany every sample")
+    test.check(json.member(measurement, "median").number >= 0.0 && json.member(measurement, "p95").number >= json.member(measurement, "median").number, "nonnegative monotonic measurements")
+}
+for name in ["home light", "nested light", "dependency light"] { test.check(host.listed(names, name), "benchmark discovery contains " + name) }
+test.check(test.contains(success.output, "--release") && test.contains(success.errorOutput, "home"), "optimization metadata and separate body output")
+let filteredCommand = [launcher, "bench", "nested light", "--"]
+for argument in controls { filteredCommand.add(argument) }
+let filtered = test.run(filteredCommand, system.environment(), application, work + "/filter", 600)
+test.require(filtered, "filter benchmark name")
+test.check(test.contains(filtered.output, "1 benchmarks measured; 0 failed") && test.contains(filtered.output, "MAD") && test.contains(filtered.output, "p95") && !test.contains(filtered.output, "dependency light"), "stable human statistics and benchmark filter")
+let empty = test.run([launcher, "bench", "no such benchmark", "--", "--json"], system.environment(), application, work + "/empty", 600)
+test.check(empty.status == 1 && test.contains(empty.errorOutput, "no benchmarks matched the filter"), "empty benchmark filter reports the mistake")
+test.check(json.member(json.parse(empty.output), "count").number == 0.0, "empty filter retains an empty machine report")
+let invalid = test.run([launcher, "bench", "--", "--samples", "999999999999999999999999"], system.environment(), application, work + "/invalid", 30)
+test.check(invalid.status == 1 && test.contains(invalid.errorOutput, "--samples must be an integer from 3 to 100"), "invalid measurement controls fail plainly")
+let misplaced = test.run([launcher, "bench", "--", "--samples", "--json", "3"], system.environment(), application, work + "/misplaced", 30)
+test.check(misplaced.status == 1 && test.contains(misplaced.errorOutput, "--samples must be an integer"), "JSON flag cannot replace a measurement option's value")
+io.writeTextFile(application + "/src/nested/harbour.min", "bench \"failed light\" { fail(\"intentional benchmark failure\") }\nbench \"after the failure\" { print(\"still shining\") }\n")
+let failed = test.run(command, system.environment(), application, work + "/failure", 600)
+test.check(failed.status == 1, "aggregate benchmark failure exits one")
+let failure = json.parse(failed.output)
+test.check(failure.kind == json.OBJECT && json.member(failure, "count").number == 4.0 && json.member(failure, "failures").number == 1.0, "failure aggregate includes every case")
+test.check(test.contains(failed.errorOutput, "intentional benchmark failure") && test.contains(failed.errorOutput, "still shining"), "failing body diagnostics and subsequent benchmarks survive")
+let standard = work + "/standard-library"
+host.makeDirectories(standard + "/src")
+io.writeTextFile(standard + "/Minyar.toml", "[package]\nname = \"standard\"\nversion = \"0.1.0\"\nkind = \"lib\"\n")
+io.writeTextFile(standard + "/src/standard.min", io.readTextFile(root + "/benchmarks/standard-library/src/standard-library.min"))
+let library = test.run(command, system.environment(), standard, work + "/standard", 600)
+test.require(library, "benchmark standard library sorting, Unicode search and JSON parsing")
+let libraryReport = json.parse(library.output)
+test.check(json.member(libraryReport, "count").number == 3.0 && json.member(libraryReport, "failures").number == 0.0, "all standard-library benchmarks verify their work")
+test.removeTree(work)
+print("Benchmark CLI: passed")

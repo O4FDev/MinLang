@@ -57,6 +57,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/constant-tables.min \
 	compiler/contract-compiler.min \
 	compiler/test-compiler.min \
+	compiler/property-compiler.min \
 	compiler/documentation-compiler.min \
 	compiler/calldepth-compiler.min \
 	compiler/thread-compiler.min \

@@ -1,0 +1,157 @@
+// Exercise property cases through the public launcher and private local projects.
+use "../tools/testing.min" as test
+use "../tools/driver-support.min" as host
+use "io" as io
+use "system" as system
+use "files" as files
+
+record PropertyCLI { launcher: Text; application: Text; work: Text; serial: Integer }
+
+function invoke(fixture: PropertyCLI, arguments: List<Text>, environment: List<Text>): test.Result {
+    fixture.serial += 1
+    let command = [fixture.launcher]
+    for argument in arguments { command.add(argument) }
+    return test.run(command, environment, fixture.application, fixture.work + "/command-" + Text(fixture.serial), 600)
+}
+
+function configured(base: List<Text>, seed: Text, cases: Text): List<Text> {
+    let environment: List<Text> = []
+    for entry in base { environment.add(entry) }
+    environment.add("MINYAR_PROPERTY_SEED=" + seed)
+    environment.add("MINYAR_PROPERTY_CASES=" + cases)
+    return environment
+}
+
+function generatedRows(output: Text): List<Text> {
+    let rows: List<Text> = []
+    for row in host.lines(output) { if row.startsWith("generated ") { rows.add(row) } }
+    return rows
+}
+
+let root = host.resolveName(".")
+let work = test.scratch()
+let application = work + "/app with spaces"
+let dependency = work + "/poems"
+let fixture = PropertyCLI {
+    launcher: test.setting("MINYAR_TEST_LAUNCHER", root + "/minyar")
+    application: application
+    work: work
+    serial: 0
+}
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !entry.startsWith("MINYAR_PROPERTY_SEED=") && !entry.startsWith("MINYAR_PROPERTY_CASES=") && !entry.startsWith("MINYAR_TEST_JOBS=") { environment.add(entry) }
+}
+environment.add("MINYAR_TEST_JOBS=1")
+host.makeDirectories(application + "/src/nested")
+host.makeDirectories(application + "/tests")
+host.makeDirectories(dependency + "/src")
+io.writeTextFile(application + "/Minyar.toml", "[package]\nname = \"lantern\"\nversion = \"0.1.0\"\nkind = \"bin\"\n[dependencies]\npoems = { path = \"../poems\" }\n")
+io.writeTextFile(dependency + "/Minyar.toml", "[package]\nname = \"poems\"\nversion = \"0.1.0\"\nkind = \"lib\"\n")
+io.writeTextFile(dependency + "/src/poems.min", #"""
+    use "property" as samples
+    public function twice(value: Integer): Integer { return value + value }
+    test "dependency property" {
+        property "bounded dependency values" for value in samples.integers(0, 42) {
+            expect(value >= 0 && value <= 42)
+        }
+    }
+    """#)
+io.writeTextFile(application + "/src/main.min", #"""
+    use "poems" as poems
+    use "property" as samples
+    function main() { fail("testing must not run the application") }
+    test "home property" {
+        property "doubling" for value in samples.integers(-100, 100) {
+            expect(poems.twice(value) == value + value)
+        }
+    }
+    """#)
+io.writeTextFile(application + "/src/nested/harbour.min", #"""
+    use "property" as samples
+    test "nested property" {
+        property "text lengths" for value in samples.texts(8) {
+            expect(value.length <= 8)
+        }
+    }
+    """#)
+io.writeTextFile(application + "/tests/smoke.min", "print(\"integration property neighbour\")\n")
+let discovery = invoke(fixture, ["test"], environment)
+test.require(discovery, "discover project, nested and dependency properties")
+for expected in ["home property", "nested property", "dependency property", "integration property neighbour", "4 passed; 0 failed"] {
+    test.check(test.contains(discovery.output, expected), "property discovery contains " + expected + "\n" + discovery.output)
+}
+
+// Keep later launcher invocations focused on a single module with several cases.
+test.check(files.remove(application + "/src/nested/harbour.min") == 0, "remove completed nested discovery fixture")
+io.writeTextFile(dependency + "/src/poems.min", "public function twice(value: Integer): Integer { return value + value }\n")
+io.writeTextFile(application + "/src/main.min", #"""
+    use "property" as samples
+    function main() { print("ordinary lantern") }
+    test "generated replay" {
+        property "sampled stream" for value in samples.integers(-100, 100) {
+            print("generated " + Text(value))
+            expect(value >= -100 && value <= 100)
+        }
+    }
+    test "shrinking threshold" {
+        property "less than ten" for value in samples.integers(-100, 100) {
+            expect(value < 10)
+        }
+    }
+    test "after a property failure" {
+        property "boolean identity" for value in samples.booleans() { expect(value == value) }
+        print("property after failure completed")
+    }
+    """#)
+
+let seeded = configured(environment, "7", "8")
+let first = invoke(fixture, ["test", "generated replay"], seeded)
+test.require(first, "run a configured generated stream")
+let firstRows = generatedRows(first.output)
+test.check(firstRows.length == 8 && test.contains(first.output, "1 passed; 0 failed"), "configured case count and property-name filter")
+let replay = invoke(fixture, ["test", "generated replay"], seeded)
+test.require(replay, "replay a property seed")
+test.check(joinText(firstRows) == joinText(generatedRows(replay.output)), "same seed replays every generated value")
+let release = invoke(fixture, ["test", "--release", "generated replay"], seeded)
+test.require(release, "run properties in release mode")
+test.check(joinText(firstRows) == joinText(generatedRows(release.output)), "debug and release preserve the generated stream")
+let changed = invoke(fixture, ["test", "generated replay"], configured(environment, "99", "8"))
+test.require(changed, "run another property seed")
+test.check(joinText(firstRows) != joinText(generatedRows(changed.output)), "changing the seed changes random cases after fixed boundaries")
+let limited = invoke(fixture, ["test", "generated replay"], configured(environment, "7", "2"))
+test.require(limited, "limit generated case count")
+let limitedRows = generatedRows(limited.output)
+test.check(limitedRows.length == 2 && limitedRows[0] == "generated 0" && limitedRows[1] == "generated -100", "case limit stops before the third boundary")
+
+let failed = invoke(fixture, ["test"], seeded)
+test.check(failed.status == 1, "a failing property fails the public test command")
+for expected in ["property less than ten", "\n  original: 100\n  shrunk: 10\n", "\n  seed: 7\n  case: 3\n", "replay: MINYAR_PROPERTY_SEED=7 MINYAR_PROPERTY_CASES=3"] {
+    test.check(test.contains(failed.errorOutput, expected), "shrunk counterexample reports " + expected + "\n" + failed.errorOutput)
+}
+test.check(test.contains(failed.output, "property after failure completed") && test.contains(failed.output, "integration property neighbour") && test.contains(failed.output, "3 passed; 1 failed"), "failure aggregation still runs later module and integration tests\n" + failed.output + failed.errorOutput)
+let repeatedFailure = invoke(fixture, ["test", "shrinking threshold"], configured(environment, "7", "3"))
+test.check(repeatedFailure.status == 1 && test.contains(repeatedFailure.errorOutput, "\n  original: 100\n  shrunk: 10\n") && test.contains(repeatedFailure.errorOutput, "\n  seed: 7\n  case: 3\n"), "the printed replay settings reproduce the smallest failure")
+
+let invalidSeed = invoke(fixture, ["test", "generated replay"], configured(environment, "not-a-number", "8"))
+test.check(invalidSeed.status == 1 && test.contains(invalidSeed.errorOutput, "MINYAR_PROPERTY_SEED must be an integer between 0 and 2147483646"), "invalid seed setting is diagnosed through the launcher\n" + invalidSeed.errorOutput)
+let invalidCases = invoke(fixture, ["test", "generated replay"], configured(environment, "7", "0"))
+test.check(invalidCases.status == 1 && test.contains(invalidCases.errorOutput, "MINYAR_PROPERTY_CASES must be an integer between 1 and 100000"), "invalid case-count setting is diagnosed through the launcher\n" + invalidCases.errorOutput)
+
+// Invalid test-only code must disappear before ordinary name and type checking.
+io.writeTextFile(application + "/src/main.min", #"""
+    function main() { print("ordinary lantern") }
+    test "excluded property" {
+        property "excluded invalid generator" for value in missingGenerator() {
+            expect(unknownValue)
+            fail("test-only property literal")
+        }
+    }
+    """#)
+let built = invoke(fixture, ["build"], configured(environment, "invalid", "0"))
+test.require(built, "ordinary build excludes property code and settings")
+let ordinary = test.run([application + "/target/debug/lantern"], environment, application, work + "/ordinary", 30)
+test.require(ordinary, "run the ordinary application after property exclusion")
+test.check(ordinary.output == "ordinary lantern\n" && ordinary.errorOutput == "", "ordinary executable contains only its application behaviour")
+test.removeTree(work)
+print("Property test CLI: passed")

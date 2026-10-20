@@ -46,6 +46,14 @@ POLICIES = {
         "A test beside its function", "test-mode",
         "This example needs minyar test or --test-mode. Ordinary playground Run omits test blocks, so an empty run would not exercise the expectation.",
     ),
+    "76db5beca515": contextual(
+        "A shrinking property beside its test", "test-mode",
+        "This example requires minyar test or --test-mode. Ordinary playground Run omits the test body, and the property module is not in the browser library bundle.",
+    ),
+    "10679a1935b1": contextual(
+        "A benchmark beside declarations", "unsupported-host",
+        "This example requires minyar bench or --benchmark-mode and its measurement runner. Ordinary playground Run omits benchmark bodies and does not provide that runner, so it cannot measure this example.",
+    ),
     "a90d7ae76d0f": standalone(
         "Documentation on a record", "",
         "Only a record and documentation comments are declared; there are no print calls or executable statements.",
@@ -162,6 +170,10 @@ POLICIES = {
         "Nested patterns with a guard", "",
         "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
         reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
+    ),
+    "6d1c815fa137": contextual(
+        "A keyboard interrupt handler", "unsupported-host",
+        "This handler imports machine and reads an x86 keyboard port. It requires a matching freestanding kernel target; the hosted WASI playground provides neither interrupt entry points nor privileged port I/O.",
     ),
     "a8d60c1082b7": standalone(
         "Compile-time hardware register fields", "15\nfalse\n",

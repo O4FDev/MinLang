@@ -72,6 +72,26 @@ O0/O2 outputs and LLVM storage assertions prove direct read-only arrays without
 List/Bytes allocation or module initialization. Its sanitizer target checks the
 same ownership-sensitive temporary-index fixtures under ASan/UBSan/LSan.
 
+`make check-property-generators` checks deterministic boundary/random generation,
+full signed Integer endpoints, shrinking, deep copies of nested Lists, Unicode
+and zero-byte Text, exact replay and bounded custom cyclic shrinkers.
+`make check-property-tests` runs contextual property syntax and the seed-laws
+gallery at O0/O2 with ownership assertions, rejection diagnostics and
+ordinary-build exclusion. `make check-property-tests-cli` exercises project and
+dependency discovery, seeded replay, settings validation and failure aggregation
+through the public launcher. A failed `expect` can be shrunk; a fatal runtime
+stop cannot. See [property cases](language.md#tests-beside-the-code).
+
+`make check-benchmarks` verifies sample statistics, control bounds, calibration,
+warmup and measurement reporting at O0/O2. `make check-benchmarks-cli` exercises
+release-mode discovery, filtering, failure handling and JSON output through the
+public launcher, including standard-library sorting, Text and JSON workloads.
+Statistics retain every sample: median, unscaled median absolute deviation and
+nearest-rank p95 across batch-average nanoseconds per complete body call. JSON
+reports preserve integer batch durations; exact reconstruction checks include
+repeating fractions and corrupt/noncanonical report rejection. These tests check the
+measurement protocol without asserting wall-clock performance thresholds.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery

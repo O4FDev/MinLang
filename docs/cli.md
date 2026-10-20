@@ -147,7 +147,7 @@ directory; use `--no-incremental` to disable it. Library builds validate source;
 consumers compile reachable library modules into their own executables.
 
 `--error-format json` selects compiler diagnostics as JSON lines on standard
-error for `build`, `run`, `check`, `test` and `install`. This includes discovery
+error for `build`, `run`, `check`, `test`, `bench` and `install`. This includes discovery
 and compilation of embedded module tests and documentation examples. Each
 compiler diagnostic is preserved with its original exit status. Use
 `--error-format text` for the human-readable
@@ -186,6 +186,28 @@ and tests run from the package root with inherited standard input/output and
 environment. `run` propagates the program exit code; test failures are aggregated
 and return nonzero. Compiler failures stop the command immediately. A test filter
 matching no files is an error; an empty unfiltered test suite is permitted.
+
+Property cases inside tests use deterministic generated inputs and report
+replay settings on failure:
+
+```sh
+MINYAR_PROPERTY_SEED=42 MINYAR_PROPERTY_CASES=1000 minyar test
+minyar bench                      # release builds; project and dependencies
+minyar bench sorting -- --samples 25 --warmup 5
+minyar bench -- --json             # raw samples and median/MAD/p95 in ns/op
+```
+
+`bench` discovers contextual `bench "name" { ... }` blocks in source modules;
+its optional substring filter matches a module path or case name. Each case
+runs sequentially in its own process. Calibration and warmup precede measured
+batches; process startup and module initialization are untimed. JSON retains
+integer batch durations and the derived ns/op samples; p95 describes those
+batch-average samples. Controls follow
+`--`; benchmark stdout and stderr are forwarded to stderr so JSON stdout remains
+machine-readable. Builds always use the release profile. Reports also record
+the effective compiler, runtime and native flags. See
+[tests and benchmarks beside the code](language.md#tests-beside-the-code) for
+control bounds, copying/shrinking contracts and measurement costs.
 
 `clean` only removes a generated `target` directory bearing Minyar's ownership
 marker. Symlinked targets and existing unowned directories are rejected.

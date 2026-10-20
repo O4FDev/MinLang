@@ -1,0 +1,181 @@
+use "./project.min" as project
+use "./driver-support.min" as host
+use "./module-tests.min" as moduleTests
+use "benchmark" as benchmark
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Report { count: Integer; failures: Integer }
+record Case { name: Text; source: Text; executable: Text; index: Text }
+
+function copyOutput(path: Text): Boolean {
+    let descriptor = files.open(path, files.READ)
+    if descriptor < 0 { return false }
+    let position = 0
+    let success = true
+    while true {
+        let bytes = files.readAt(descriptor, position, 65536)
+        if files.lastError() != 0 { success = false; break }
+        if bytes.length == 0 { break }
+        if files.write(2, bytes, 0, bytes.length) != bytes.length { success = false; break }
+        position += bytes.length
+    }
+    if files.close(descriptor) != 0 { success = false }
+    return success
+}
+
+function canonicalInteger(value: json.Value, maximum: Integer): Integer {
+    if value.kind != json.NUMBER || !(value.number >= 0.0 && value.number <= Float(maximum)) { return -1 }
+    let integer = Integer(value.number)
+    if value.text != Text(integer) { return -1 }
+    return integer
+}
+
+function readSamples(value: json.Value): List<Float> {
+    let samples: List<Float> = []
+    let member = json.member(value, "samples")
+    if member.kind != json.ARRAY || member.items.length < 3 || member.items.length > 100 { return samples }
+    let iterations = canonicalInteger(json.member(value, "iterations"), 1000000)
+    let batches = json.member(value, "batch_ns")
+    if iterations < 1 || batches.kind != json.ARRAY || batches.items.length != member.items.length { return [] }
+    for index in 0..member.items.length {
+        let elapsed = canonicalInteger(batches.items[index], 9007199254740991)
+        if elapsed < 0 { return [] }
+        let sample = Float(elapsed) / Float(iterations)
+        let item = member.items[index]
+        if item.kind != json.NUMBER || item.text != Text(sample) { return [] }
+        samples.add(sample)
+    }
+    return samples
+}
+
+// JSON's decimal accumulator need not recover the original binary Float.
+// Reconstruct from exact integer durations, then compare canonical spellings;
+// every sample and summary is checked without a floating-point tolerance.
+public function validMeasurement(value: json.Value, configuration: benchmark.Options): Boolean {
+    if value.kind != json.OBJECT || canonicalInteger(json.member(value, "schema"), 1) != 1 || json.member(value, "clock").text != "monotonic" || json.member(value, "unit").text != "ns/op" { return false }
+    let iterations = canonicalInteger(json.member(value, "iterations"), configuration.maxIterations)
+    if iterations < 1 { return false }
+    let calibration = canonicalInteger(json.member(value, "calibration_ns"), 9007199254740991)
+    if calibration < 0 || (iterations < configuration.maxIterations && calibration < configuration.targetNanoseconds) { return false }
+    let warmup = canonicalInteger(json.member(value, "warmup"), 100)
+    let target = canonicalInteger(json.member(value, "target_ns"), 100000000)
+    if warmup != configuration.warmup || target != configuration.targetNanoseconds { return false }
+    let samples = readSamples(value)
+    if samples.length != configuration.samples { return false }
+    let statistics = benchmark.summarize(samples)
+    for name in ["median", "mad", "p95", "minimum", "maximum"] {
+        let member = json.member(value, name)
+        if member.kind != json.NUMBER || !(member.number >= 0.0 && member.number <= 9223372036854775807.0) { return false }
+    }
+    return json.member(value, "median").text == Text(statistics.median) && json.member(value, "mad").text == Text(statistics.mad) && json.member(value, "p95").text == Text(statistics.p95) && json.member(value, "minimum").text == Text(statistics.minimum) && json.member(value, "maximum").text == Text(statistics.maximum)
+}
+
+/// Discover module benchmarks, build optimized executables, and run each case
+/// sequentially. Measurement controls follow `minyar bench --`; `--json` emits
+/// an aggregate document with raw samples and compilation mode.
+public function run(graph: project.Graph, compiler: Text, directory: Text, filter: Text, forwarded: List<Text>, errorFormat: Text): Report {
+    let controls: List<Text> = []
+    let machine = false
+    let argumentIndex = 0
+    while argumentIndex < forwarded.length {
+        let argument = forwarded[argumentIndex]
+        argumentIndex += 1
+        if argument == "--json" {
+            if machine { host.stop("repeated benchmark option: --json") }
+            machine = true
+        } else {
+            controls.add(argument)
+            if argumentIndex < forwarded.length { controls.add(forwarded[argumentIndex]); argumentIndex += 1 }
+        }
+    }
+    let configuration = benchmark.options(controls)
+    if configuration.error != "" { host.stop(configuration.error) }
+    let clangFlags = host.flags("MINYAR_CLANG_FLAGS", "-O2 -Wno-override-module")
+    let runtimeFlags = host.flags("MINYAR_RUNTIME_FLAGS", "-O2 -Wno-override-module")
+    let nativeFlags = host.flags("MINYAR_NATIVE_FLAGS", host.shellJoin(clangFlags))
+    let cases: List<Case> = []
+    let serial = 0
+    let sourcePaths = moduleTests.sources(graph).sorted()
+    for source in sourcePaths {
+        let discover = moduleTests.compilerArguments(graph, compiler)
+        if errorFormat != "" { discover.add("--error-format"); discover.add(errorFormat) }
+        discover.add("--list-benchmarks"); discover.add(source)
+        let listing = host.capture(discover, 120)
+        if listing.status != 0 {
+            if errorFormat == "json" { system.writeStandardError(listing.errors); if listing.status > 0 { host.leave(listing.status) }; host.leave(1) }
+            host.stop("cannot discover benchmarks: " + source + "\n" + listing.errors)
+        }
+        let selected: List<Case> = []
+        let executable = directory + "/benchmark-" + Text(serial)
+        serial += 1
+        for row in host.lines(listing.output) {
+            let tab = row.find("\t")
+            if tab < 1 { host.stop("invalid benchmark listing: " + source) }
+            let index = row.slice(0, tab)
+            for character in index { if character < '0' || character > '9' { host.stop("invalid benchmark index: " + source) } }
+            let name = json.parse(row.slice(tab + 1, row.length))
+            if name.kind != json.STRING { host.stop("invalid benchmark name: " + source) }
+            if filter != "" && !host.hasText(source, filter) && !host.hasText(name.text, filter) { continue }
+            selected.add(Case { name: name.text; source: source; executable: executable; index: index })
+        }
+        if selected.length == 0 { continue }
+        let command = moduleTests.compilerArguments(graph, compiler)
+        if errorFormat != "" { command.add("--error-format"); command.add(errorFormat) }
+        for item in ["--benchmark-mode", "--release", source, "-o", executable] { command.add(item) }
+        let built = host.capture(command, 120)
+        if built.status != 0 {
+            system.writeStandardError(built.errors)
+            if errorFormat == "json" { if built.status > 0 { host.leave(built.status) }; host.leave(1) }
+            host.stop("cannot build benchmarks: " + source)
+        }
+        for item in selected { cases.add(item) }
+    }
+    let report = Report { count: cases.length; failures: 0 }
+    let records: List<Text> = []
+    let work = host.temporaryDirectory(directory, ".benchmark-output-")
+    let shell = host.which("sh")
+    if shell == "" { host.stop("sh is required to run benchmarks") }
+    if !machine { files.writeStandardOutput("Benchmarks · --release · " + host.terminalText(host.shellJoin(clangFlags)) + " · monotonic ns/op · median, MAD, p95\n") }
+    for index in 0..cases.length {
+        let item = cases[index]
+        let path = work + "/case-" + Text(index)
+        let command = [shell, "-c", "root=$1; output=$2; errors=$3; shift 3; cd \"$root\" && exec \"$@\" >\"$output\" 2>\"$errors\"", "minyar-bench", graph.packages[0].root, path + ".stdout", path + ".stderr", item.executable, item.index, path + ".json"]
+        for argument in controls { command.add(argument) }
+        let executed = host.capture(command, 120)
+        let problem = ""
+        let raw = ""
+        let value = json.parse("")
+        if executed.status == host.TIMED_OUT { problem = "timed out after 120 seconds" }
+        else if executed.status != 0 { problem = "exit " + Text(executed.status) }
+        else if files.pathSize(path + ".json") < 0 || files.pathSize(path + ".json") > 65536 { problem = "missing or oversized measurement report" }
+        else {
+            raw = host.strip(host.readText(path + ".json"))
+            value = json.parse(raw)
+            if !validMeasurement(value, configuration) { problem = "invalid measurement report" }
+        }
+        let outputCopied = copyOutput(path + ".stdout")
+        let errorsCopied = copyOutput(path + ".stderr")
+        if !outputCopied || !errorsCopied {
+            if problem == "" { problem = "cannot read benchmark output" }
+        }
+        let entry = "{\"name\":" + json.quote(item.name) + ",\"source\":" + json.quote(item.source)
+        if problem != "" {
+            report.failures += 1
+            system.writeStandardError("  × " + host.terminalText(item.name) + " · " + host.terminalText(item.source) + " (" + problem + ")\n" + executed.errors)
+            entry += ",\"error\":" + json.quote(problem) + "}"
+        } else {
+            let statistics = benchmark.summarize(readSamples(value))
+            let calibration = ""
+            if json.member(value, "calibration_ns").number < Float(configuration.targetNanoseconds) { calibration = " · iteration cap below timing target" }
+            if !machine { files.writeStandardOutput("  " + host.terminalText(item.name) + " · " + Text(statistics.median) + " ns/op · MAD " + Text(statistics.mad) + " · p95 " + Text(statistics.p95) + " · " + Text(configuration.samples) + " samples × " + json.member(value, "iterations").text + calibration + " · " + host.terminalText(item.source) + "\n") }
+            entry += ",\"measurement\":" + raw + "}"
+        }
+        records.add(entry)
+    }
+    if machine {
+        files.writeStandardOutput("{\"schema\":1,\"compiler\":" + json.quote(compiler) + ",\"compiler_flags\":[\"--benchmark-mode\",\"--release\"],\"clang_flags\":" + host.jsonList(clangFlags) + ",\"runtime_flags\":" + host.jsonList(runtimeFlags) + ",\"native_flags\":" + host.jsonList(nativeFlags) + ",\"release_lto\":true,\"count\":" + Text(report.count) + ",\"failures\":" + Text(report.failures) + ",\"benchmarks\":[" + host.joined(records, ",") + "]}\n")
+    } else { files.writeStandardOutput(Text(report.count - report.failures) + " benchmarks measured; " + Text(report.failures) + " failed\n") }
+    return report
+}

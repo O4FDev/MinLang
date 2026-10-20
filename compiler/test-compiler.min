@@ -4,6 +4,10 @@ function testBlockAt(kinds: List<Integer>, texts: List<Text>, position: Integer)
     return position + 2 < kinds.length && kinds[position] == 1 && texts[position] == "test" && kinds[position + 1] == 3
 }
 
+function benchmarkBlockAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return position + 2 < kinds.length && kinds[position] == 1 && texts[position] == "bench" && kinds[position + 1] == 3
+}
+
 function testSourceOffset(source: Text, lines: SourceMap, token: Integer): Integer {
     let wanted = lines.coordinates[token * 2]
     let position = 0
@@ -103,9 +107,13 @@ function testCallbackShadowsExpectation(kinds: List<Integer>, texts: List<Text>,
 }
 
 function testBody(source: Text, path: Text, sourceKinds: List<Integer>, sourceTexts: List<Text>, sourceLines: SourceMap, first: Integer, after: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap) {
+    testBodyMode(source, path, sourceKinds, sourceTexts, sourceLines, first, after, kinds, texts, lines, false, false)
+}
+
+function testBodyMode(source: Text, path: Text, sourceKinds: List<Integer>, sourceTexts: List<Text>, sourceLines: SourceMap, first: Integer, after: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, propertyCheck: Boolean, initialShadow: Boolean) {
     // A user binding wins over the contextual assertion name. Module functions
     // and locals retain their ordinary meaning inside a test too.
-    let shadowed = false
+    let shadowed = initialShadow
     let scan = 0
     let depth = 0
     while scan + 1 < sourceKinds.length {
@@ -115,72 +123,114 @@ function testBody(source: Text, path: Text, sourceKinds: List<Integer>, sourceTe
         scan = scan + 1
     }
     let shadows: List<Boolean> = []
-    let parameterShadow = -1
+    let parameterShadows: List<Integer> = []
+    let matchShadows: List<Integer> = []
+    let callbackAfter = -1
     depth = 0
     let position = first
     while position < after {
         // Assertion lowering precedes closure checking and capture discovery.
         // Keep a callback parameter's value name intact throughout its body.
-        if sourceKinds[position] == 1 && sourceTexts[position] == "function" && position + 1 < after && sourceTexts[position + 1] == "(" {
+        if sourceKinds[position] == 1 && sourceTexts[position] == "function" && position + 1 < after && sourceTexts[position + 1] == "(" && !(position > first && sourceTexts[position - 1] == ".") {
             let closing = testClosing(sourceKinds, sourceTexts, sourceLines, position + 1)
+            if position >= callbackAfter {
+                let opening = closing + 1
+                while opening < after && !(sourceKinds[opening] == 4 && sourceTexts[opening] == "{") { opening = opening + 1 }
+                if opening < after { callbackAfter = testClosing(sourceKinds, sourceTexts, sourceLines, opening) + 1 }
+            }
             if testCallbackShadowsExpectation(sourceKinds, sourceTexts, position + 2, closing) {
                 let opening = closing + 1
                 while opening < after && !(sourceKinds[opening] == 4 && sourceTexts[opening] == "{") { opening = opening + 1 }
-                parameterShadow = opening
+                parameterShadows.add(opening)
             }
+        }
+        if sourceKinds[position] == 1 && sourceTexts[position] == "for" && position + 1 < after && sourceTexts[position + 1] == "expect" {
+            parameterShadows.add(propertyBodyOpening(sourceKinds, sourceTexts, position + 2, after))
+        }
+        if sourceKinds[position] == 1 && sourceTexts[position] == "match" && position + 1 < after && sourceTexts[position + 1] != "." && sourceTexts[position + 1] != ":" && sourceTexts[position + 1] != "=" && !(position > first && (sourceTexts[position - 1] == "." || sourceTexts[position - 1] == "let" || sourceTexts[position - 1] == "function" || sourceTexts[position - 1] == "for")) {
+            propertyMatchShadows(sourceKinds, sourceTexts, sourceLines, position, after, matchShadows)
         }
         if sourceKinds[position] == 4 && sourceTexts[position] == "{" {
             if depth < shadows.length { shadows[depth] = shadowed } else { shadows.add(shadowed) }
             depth = depth + 1
-            if position == parameterShadow { shadowed = true; parameterShadow = -1 }
+            let shadow = 0
+            while shadow < parameterShadows.length {
+                if position == parameterShadows[shadow] { shadowed = true }
+                shadow = shadow + 1
+            }
         }
         if sourceKinds[position] == 4 && sourceTexts[position] == "}" && depth > 0 { depth = depth - 1; shadowed = shadows[depth] }
         if sourceKinds[position] == 1 && (sourceTexts[position] == "let" || sourceTexts[position] == "constant") && position + 1 < after && sourceTexts[position + 1] == "expect" { shadowed = true }
-        if !shadowed && sourceKinds[position] == 1 && sourceTexts[position] == "expect" && position + 1 < after && sourceTexts[position + 1] == "(" && !(position > first && sourceTexts[position - 1] == ".") {
+        if propertyCheck && position >= callbackAfter && sourceKinds[position] == 1 && sourceTexts[position] == "return" && !(position > first && sourceTexts[position - 1] == ".") && !(position + 1 < after && sourceTexts[position + 1] == ":") {
+            failAtToken(sourceLines, position, "a property uses expect instead of return")
+        }
+        let expectationShadowed = shadowed || propertyMatchShadowed(position, matchShadows)
+        if propertyCaseAt(sourceKinds, sourceTexts, position) {
+            if propertyCheck { failAtToken(sourceLines, position, "put each property directly inside its test, rather than inside another property") }
+            if position < callbackAfter { failAtToken(sourceLines, position, "put a property in the test body, outside callbacks") }
+            position = propertyCase(source, path, sourceKinds, sourceTexts, sourceLines, position, after, kinds, texts, lines, expectationShadowed)
+        } else if !expectationShadowed && sourceKinds[position] == 1 && sourceTexts[position] == "expect" && position + 1 < after && sourceTexts[position + 1] == "(" && !(position > first && sourceTexts[position - 1] == ".") {
             let closing = testClosing(sourceKinds, sourceTexts, sourceLines, position + 1)
-            let expressionFirst = position + 2
-            let expressionAfter = closing
-            while expressionFirst < expressionAfter && sourceKinds[expressionFirst] == 4 && sourceTexts[expressionFirst] == "(" && testClosing(sourceKinds, sourceTexts, sourceLines, expressionFirst) == expressionAfter - 1 {
-                expressionFirst = expressionFirst + 1
-                expressionAfter = expressionAfter - 1
+            if propertyCheck {
+                if position < callbackAfter { failAtToken(sourceLines, position, "keep a property's expectations in its own body; check a callback's Boolean result there") }
+                propertyTokens("if !(", kinds, texts, lines, sourceLines, position)
+                testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position + 2, closing)
+                propertyTokens(") { return false }\n", kinds, texts, lines, sourceLines, position)
+                position = closing + 1
+            } else {
+                let expressionFirst = position + 2
+                let expressionAfter = closing
+                while expressionFirst < expressionAfter && sourceKinds[expressionFirst] == 4 && sourceTexts[expressionFirst] == "(" && testClosing(sourceKinds, sourceTexts, sourceLines, expressionFirst) == expressionAfter - 1 {
+                    expressionFirst = expressionFirst + 1
+                    expressionAfter = expressionAfter - 1
+                }
+                let comparison = testComparison(sourceKinds, sourceTexts, expressionFirst, expressionAfter)
+                let name = "test expectation"
+                if comparison >= 0 { name = name + " " + sourceTexts[comparison] }
+                testSynthetic(kinds, texts, lines, 1, name, sourceLines, position)
+                testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position + 1, position + 2)
+                if comparison >= 0 {
+                    testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, expressionFirst, comparison)
+                    testSynthetic(kinds, texts, lines, 4, ",", sourceLines, comparison)
+                    testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, comparison + 1, expressionAfter)
+                } else { testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position + 2, closing) }
+                testSynthetic(kinds, texts, lines, 4, ",", sourceLines, position)
+                let expression = source.slice(testSourceOffset(source, sourceLines, position + 2), testSourceOffset(source, sourceLines, closing))
+                let location = path + ":" + Text(sourceLines.coordinates[position * 2]) + ":" + Text(sourceLines.coordinates[position * 2 + 1])
+                testSynthetic(kinds, texts, lines, 3, location + ": expectation failed\n  expect(" + expression + ")", sourceLines, position)
+                testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, closing, closing + 1)
+                position = closing + 1
             }
-            let comparison = testComparison(sourceKinds, sourceTexts, expressionFirst, expressionAfter)
-            let name = "test expectation"
-            if comparison >= 0 { name = name + " " + sourceTexts[comparison] }
-            testSynthetic(kinds, texts, lines, 1, name, sourceLines, position)
-            testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position + 1, position + 2)
-            if comparison >= 0 {
-                testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, expressionFirst, comparison)
-                testSynthetic(kinds, texts, lines, 4, ",", sourceLines, comparison)
-                testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, comparison + 1, expressionAfter)
-            } else { testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position + 2, closing) }
-            testSynthetic(kinds, texts, lines, 4, ",", sourceLines, position)
-            let expression = source.slice(testSourceOffset(source, sourceLines, position + 2), testSourceOffset(source, sourceLines, closing))
-            let location = path + ":" + Text(sourceLines.coordinates[position * 2]) + ":" + Text(sourceLines.coordinates[position * 2 + 1])
-            testSynthetic(kinds, texts, lines, 3, location + ": expectation failed\n  expect(" + expression + ")", sourceLines, position)
-            testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, closing, closing + 1)
-            position = closing + 1
         } else {
+            if propertyCheck && position == after - 1 { propertyTokens("\nreturn true\n", kinds, texts, lines, sourceLines, position) }
             testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, position, position + 1)
             position = position + 1
         }
     }
 }
 
-function scanModuleTests(rawKinds: List<Integer>, rawTexts: List<Text>, rawLines: SourceMap, names: List<Text>, starts: List<Integer>, ends: List<Integer>) {
+function scanModuleCases(rawKinds: List<Integer>, rawTexts: List<Text>, rawLines: SourceMap, names: List<Text>, starts: List<Integer>, ends: List<Integer>, caseKinds: List<Integer>) {
     let position = 0
     let cursor: List<Integer> = [0]
     while rawKinds[position] != 0 {
-        if testBlockAt(rawKinds, rawTexts, position) {
+        if testBlockAt(rawKinds, rawTexts, position) || benchmarkBlockAt(rawKinds, rawTexts, position) {
+            let caseKind = 1
+            let noun = "test"
+            if benchmarkBlockAt(rawKinds, rawTexts, position) { caseKind = 2; noun = "benchmark" }
             let opening = position + 2
             while rawKinds[opening] == 6 { opening = opening + 1 }
-            if rawKinds[opening] != 4 || rawTexts[opening] != "{" { failAtToken(rawLines, opening, "a named test needs a body in braces") }
+            if rawKinds[opening] != 4 || rawTexts[opening] != "{" { failAtToken(rawLines, opening, "a named " + noun + " needs a body in braces") }
             let closing = testClosing(rawKinds, rawTexts, rawLines, opening)
-            if findText(names, rawTexts[position + 1]) >= 0 { failAtToken(rawLines, position + 1, "this module already has a test with that name") }
-            if rawTexts[position + 1] == "" { failAtToken(rawLines, position + 1, "a test needs a nonempty name") }
+            let previous = 0
+            while previous < names.length {
+                if caseKinds[previous] == caseKind && names[previous] == rawTexts[position + 1] { failAtToken(rawLines, position + 1, "this module already has a " + noun + " with that name") }
+                previous = previous + 1
+            }
+            if rawTexts[position + 1] == "" { failAtToken(rawLines, position + 1, "a " + noun + " needs a nonempty name") }
             names.add(rawTexts[position + 1])
             starts.add(position)
             ends.add(closing + 1)
+            caseKinds.add(caseKind)
             position = closing + 1
         } else {
             cursor[0] = position
@@ -199,6 +249,10 @@ function scanModuleTests(rawKinds: List<Integer>, rawTexts: List<Text>, rawLines
 }
 
 function moduleTestListing(path: Text): Text {
+    return moduleCaseListing(path, 1)
+}
+
+function moduleCaseListing(path: Text, mode: Integer): Text {
     let kinds: List<Integer> = []
     let texts: List<Text> = []
     let lines = newSourceMap()
@@ -207,11 +261,13 @@ function moduleTestListing(path: Text): Text {
     let names: List<Text> = []
     let starts: List<Integer> = []
     let ends: List<Integer> = []
-    scanModuleTests(kinds, texts, lines, names, starts, ends)
+    let caseKinds: List<Integer> = []
+    scanModuleCases(kinds, texts, lines, names, starts, ends, caseKinds)
     let output: List<Text> = []
     let index = 0
+    let selected = 0
     while index < names.length {
-        output.add(Text(index) + "\t" + compilerJSONText(names[index]) + "\n")
+        if caseKinds[index] == mode { output.add(Text(selected) + "\t" + compilerJSONText(names[index]) + "\n"); selected = selected + 1 }
         index = index + 1
     }
     return joinText(output)
@@ -238,6 +294,12 @@ function compilerJSONText(value: Text): Text {
 }
 
 function tokenizeModule(source: Text, path: Text, testing: Boolean, kinds: List<Integer>, texts: List<Text>, lines: SourceMap) {
+    let mode = 0
+    if testing { mode = 1 }
+    tokenizeModuleMode(source, path, mode, kinds, texts, lines)
+}
+
+function tokenizeModuleMode(source: Text, path: Text, mode: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap) {
     let rawKinds: List<Integer> = []
     let rawTexts: List<Text> = []
     let rawLines = newSourceMap()
@@ -250,10 +312,36 @@ function tokenizeModule(source: Text, path: Text, testing: Boolean, kinds: List<
     let names: List<Text> = []
     let starts: List<Integer> = []
     let ends: List<Integer> = []
-    scanModuleTests(rawKinds, rawTexts, rawLines, names, starts, ends)
+    let caseKinds: List<Integer> = []
+    scanModuleCases(rawKinds, rawTexts, rawLines, names, starts, ends, caseKinds)
+    if mode > 0 {
+        let excluded = false
+        let index = 0
+        while index < caseKinds.length { if caseKinds[index] != mode { excluded = true }; index = index + 1 }
+        if excluded {
+            let pieces: List<Text> = []
+            let start = 0
+            index = 0
+            while index < starts.length {
+                if caseKinds[index] != mode {
+                    let first = testSourceOffset(source, rawLines, starts[index])
+                    let after = testSourceOffset(source, rawLines, ends[index] - 1) + 1
+                    pieces.add(source.slice(start, first))
+                    let blank: List<Text> = []
+                    while first < after { if source[first] == '\n' { blank.add("\n") } else { blank.add(" ") }; first = first + 1 }
+                    pieces.add(joinText(blank))
+                    start = after
+                }
+                index = index + 1
+            }
+            pieces.add(source.slice(start, source.length))
+            tokenizeModuleMode(joinText(pieces), path, mode, kinds, texts, lines)
+            return
+        }
+    }
     let position = 0
     let cursor: List<Integer> = [0]
-    if !testing {
+    if mode == 0 {
         if names.length == 0 { testCopy(kinds, texts, lines, rawKinds, rawTexts, rawLines, 0, rawKinds.length); lines.features = testMergedFeatures(lines.features, rawLines.features); return }
         // Relex the retained source, so excluded tests cannot enable runtime
         // features, leave literal constants, or affect ownership analysis.
@@ -283,17 +371,21 @@ function tokenizeModule(source: Text, path: Text, testing: Boolean, kinds: List<
         return
     }
     lines.features = testMergedFeatures(lines.features, rawLines.features)
+    if mode == 1 && moduleHasProperties(rawKinds, rawTexts, starts, ends) { propertyTokens("use \"property\" as minyar_property_module\n", kinds, texts, lines, rawLines, 0) }
+    if mode == 2 { propertyTokens("use \"benchmark\" as minyar_benchmark_module\n", kinds, texts, lines, rawLines, 0) }
     position = 0
     let index = 0
     while rawKinds[position] != 0 {
         if index < starts.length && position == starts[index] {
             let opening = position + 2
             while rawKinds[opening] == 6 { opening = opening + 1 }
-            testSynthetic(kinds, texts, lines, 1, "function", rawLines, position)
-            testSynthetic(kinds, texts, lines, 1, "minyar$test$" + Text(index), rawLines, position + 1)
-            testSynthetic(kinds, texts, lines, 4, "(", rawLines, position)
-            testSynthetic(kinds, texts, lines, 4, ")", rawLines, position)
-            testBody(source, path, rawKinds, rawTexts, rawLines, opening, ends[index], kinds, texts, lines)
+            if caseKinds[index] == mode {
+                testSynthetic(kinds, texts, lines, 1, "function", rawLines, position)
+                testSynthetic(kinds, texts, lines, 1, "minyar$test$" + Text(index), rawLines, position + 1)
+                testSynthetic(kinds, texts, lines, 4, "(", rawLines, position)
+                testSynthetic(kinds, texts, lines, 4, ")", rawLines, position)
+                testBody(source, path, rawKinds, rawTexts, rawLines, opening, ends[index], kinds, texts, lines)
+            }
             position = ends[index]
             index = index + 1
         } else {
@@ -314,11 +406,21 @@ function tokenizeModule(source: Text, path: Text, testing: Boolean, kinds: List<
     }
     let runner: List<Text> = ["\nuse \"process\" as minyar_test_process\nfunction main() {\nlet selected = \"\"\nif minyar_test_process.argumentCount() > 0 { selected = minyar_test_process.argument(0) }\nif selected == \"--list\" {\n"]
     index = 0
-    while index < names.length { runner.add("print(" + testQuoted(Text(index) + "\t" + names[index]) + ")\n"); index = index + 1 }
+    let selected = 0
+    while index < names.length {
+        if caseKinds[index] == mode { runner.add("print(" + testQuoted(Text(selected) + "\t" + names[index]) + ")\n"); selected = selected + 1 }
+        index = index + 1
+    }
     runner.add("} else {\n")
     index = 0
+    selected = 0
     while index < names.length {
-        runner.add("if selected == \"\" || selected == " + testQuoted(Text(index)) + " { minyar_test_case_" + Text(index) + "() }\n")
+        if caseKinds[index] == mode {
+            let invocation = "minyar_test_case_" + Text(index) + "()"
+            if mode == 2 { invocation = "exit(minyar_benchmark_module.run(function() { " + invocation + " }))" }
+            runner.add("if selected == \"\" || selected == " + testQuoted(Text(selected)) + " { " + invocation + " }\n")
+            selected = selected + 1
+        }
         index = index + 1
     }
     runner.add("}\n}\n")
@@ -326,11 +428,13 @@ function tokenizeModule(source: Text, path: Text, testing: Boolean, kinds: List<
     let runnerTexts: List<Text> = []
     let runnerLines = newSourceMap()
     tokenize(joinText(runner), runnerKinds, runnerTexts, runnerLines)
+    lines.features = testMergedFeatures(lines.features, runnerLines.features)
     index = 0
     while index < runnerKinds.length {
         let word = runnerTexts[index]
         if runnerKinds[index] == 1 && resultPrefix(word, "minyar_test_case_") { word = "minyar$test$" + word.slice(17, word.length) }
         if runnerKinds[index] == 1 && word == "minyar_test_process" { word = "minyar$test$process" }
+        if runnerKinds[index] == 1 && word == "minyar_benchmark_module" { word = "minyar$benchmark" }
         testSynthetic(kinds, texts, lines, runnerKinds[index], word, rawLines, position)
         index = index + 1
     }
