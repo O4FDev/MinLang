@@ -206,6 +206,12 @@ remain present, and the final cycle drain waits for both kinds of ownership root
 Reference arguments still borrow their callers; consuming an unowned parameter
 first creates the consumer's count.
 
+Eager scope releases inline the count decrement for shared untraced values
+when no destruction or collector work is pending; immortal values return
+without a write. Last owners, traced values and pending work use the ordinary
+release path. Incremental profiles keep their ordinary release and service
+accounting. Null cells do not request an unlimited cycle drain.
+
 This mode is explicit and cannot be combined with `--bounded-owners`. The launcher
 continues to select the ordinary bounded lowering. Linking scope output against
 an incremental runtime preserves ownership but performs a separately budgeted

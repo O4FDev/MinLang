@@ -99,9 +99,16 @@ per-cell release sequence has the different cleanup contract documented in
 [runtime memory](runtime-memory.md#scope-ownership-lowering); it is not the
 launcher's default bounded lowering.
 
-Arena measured 1,188,040,017 instructions with scope lowering. Eager remains
-3.1365 times arena, so the 1.2-times target is not met. These current-source
-Linux counts cannot be compared directly to earlier ARM compiler campaigns.
+Arena measured 1,188,040,017 instructions with scope lowering. A subsequent
+inline eager release path reduced the same scope compiler from 3,726,245,042
+to 2,873,927,153 median instructions, another 22.87%. Its matching arena measured
+1,188,040,249: eager remains 2.4191 times arena, so the 1.2-times target is not
+met. An unmodified runtime rebuilt through the prototype's exact path differed
+from the saved eager control by only 144 instructions. All 32 follow-up outputs
+matched the same frozen LLVM. The counters and runtime/header identities are in
+[`frames-inline-release.json`](../experiments/memory/frames-inline-release.json).
+These current-source Linux counts cannot be compared directly to earlier ARM
+compiler campaigns.
 All 48 executions, including warmups and legacy controls, produced exactly the
 frozen original compiler's LLVM bytes. Source, LLVM, runtime and executable
 hashes, every observation and the complete flags are retained in

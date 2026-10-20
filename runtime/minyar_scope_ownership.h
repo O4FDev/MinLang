@@ -49,7 +49,25 @@ MINYAR_INLINE_ENTRY void minyar_rc_scope_move_v1(void *slot, void *value) {
 
 /* A null scope cell is not the native client's explicit drain request. */
 MINYAR_INLINE_ENTRY void minyar_rc_scope_release_v1(void *value) {
-    if (value) minyar_rc_release(value);
+    if (!value) return;
+#ifndef MINYAR_BOUNDED_RC
+    RcObject *object = (RcObject *)value - 1;
+    size_t ownership = object->ownership;
+#ifdef MINYAR_CYCLE_LOCAL_PROOFS
+    if (rc_cycle_pending || rc_traced(object)) {
+        minyar_rc_release(value);
+        return;
+    }
+#endif
+    if (!rc_pending_count) {
+        if (ownership < 8) return;
+        if (ownership >= 16) {
+            object->ownership = ownership - 8;
+            return;
+        }
+    }
+#endif
+    minyar_rc_release(value);
 }
 
 static void rc_scope_unwind(MinyarRcScope *boundary) {
