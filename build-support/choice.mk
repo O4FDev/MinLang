@@ -83,3 +83,13 @@ check-choice-container-niche-sanitize: build/minyarc-sanitize build/minyar-runti
 
 check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation check-choice-enums check-choice-text-niche check-choice-container-niche
 check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize check-choice-enums-sanitize check-choice-text-niche-sanitize check-choice-container-niche-sanitize
+
+.PHONY: check-choice-type-codec check-choice-type-codec-sanitize
+check-choice-type-codec: build/minyarc build/minyar-runtime.o build/compiler.min build/tooling/tests/choice-type-codec
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-type-codec"
+
+check-choice-type-codec-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/compiler.min build/tooling/tests/choice-type-codec
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-type-codec"
+
+check check-portable: check-choice-type-codec
+check-sanitize: check-choice-type-codec-sanitize

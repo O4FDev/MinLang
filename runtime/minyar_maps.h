@@ -259,11 +259,11 @@ static long long map_record_enum_value(long long type) {
     long long payload = -type / 8;
     if (payload % 2) return 0;
     long long child = payload / 2;
-    if (child < 19 || (child >= 1000000000 && child < 1000099000)) return 0;
+    if (child < 32 || (child >= 1000000000 && child < 1000099000)) return 0;
     long long remainder = child % 100000;
-    if (remainder < 19 || remainder > 999) return 0;
+    if (remainder < 32 || remainder > 999) return 0;
     if (child >= 1000100000) child -= 100000;
-    long long pair = (child / 100000 * 981 + remainder - 19) * 5 + index;
+    long long pair = (child / 100000 * 968 + remainder - 32) * 5 + index;
     if (pair >= 9801000000) return 0;
     return 1000000000 + pair % 99000;
 }

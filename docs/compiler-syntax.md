@@ -116,16 +116,17 @@ zigzag value using radix 99. Only enum-key Maps compact enum value types into
 the nominal identity. Their runtime Map/Set key kind is Integer.
 
 Record-key Maps with a direct enum value use otherwise invalid positive child
-residues 19..999 modulo 100000 under Map tags 1, 2, 3, 4 and 7. The encoder skips
-the enum-ID bucket; `recordEnumMapPair` reverses this escape. The runtime's nested
+residues 32..999 modulo 100000 under Map tags 1, 2, 3, 4 and 7, leaving scalar
+codes 19..31 and Lists of those scalar types available. Each bucket contains
+968 escape children. The encoder skips the enum-ID bucket; `recordEnumMapPair` reverses this escape. The runtime's nested
 Map equality decoder mirrors it. Every two-level record-key Map ending in an
 enum fits within signed i64 for all supported nominal indexes. Type encoding
 still has a finite nesting limit: extreme enum-containing wrapper chains may
 reach it earlier than their former record-valued representation. Ordinary List
 type encodings remain compact through 64 layers.
 
-Cached interfaces use `minyar-module-interface-v8` and deltas use
-`minyar-module-delta-v6`, so earlier pointer-ABI artifacts are rebuilt.
+Cached interfaces use `minyar-module-interface-v9` and deltas use
+`minyar-module-delta-v7`, so earlier record/enum escape codecs and pointer-ABI artifacts are rebuilt.
 Choice-bearing module graphs retain whole-program compilation, including when
 restored logical choice metadata is the only evidence in a warm state.
 
