@@ -123,8 +123,10 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
     checked = 0
 
     def diagnostic(source, code, expected_help=None, has_excerpt=True,
-                   expected_message=None, expected_span=None, expected_source_lines=None):
+                   expected_message=None, expected_span=None, expected_source_lines=None,
+                   diagnostic_file=None):
         global checked
+        origin = source if diagnostic_file is None else diagnostic_file
         checked += 1
         output = root / f"rejected-{checked}.ll"
         command = [str(compiler), str(source), str(output), "--library", str(repository / "library")]
@@ -141,10 +143,10 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         assert value["message"] == human.stderr.splitlines()[0][7:], (source, value, human.stderr)
         if expected_message is not None:
             assert value["message"] == expected_message, ("exact primary message", source, value)
-        assert value["file"] == str(source), (source, value)
+        assert value["file"] == str(origin), (source, origin, value)
         assert value["line"] >= 1 and value["column"] >= 1, (source, value)
         assert value["endLine"] == value["line"] and value["endColumn"] >= value["column"], (source, value)
-        assert f"  --> {source}:{value['line']}:{value['column']}\n" in human.stderr, (source, value, human.stderr)
+        assert f"  --> {origin}:{value['line']}:{value['column']}\n" in human.stderr, (source, origin, value, human.stderr)
         hints = re.findall(r"(?m)^ += help: (.+)$", human.stderr)
         assert hints and value["help"] == hints, ("same nonempty actionable help", source, value, human.stderr)
         if expected_help is not None:
@@ -353,6 +355,55 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         path = root / f"choice-unclosed-{case}.min"
         path.write_text(choice + f"let weather = {constructor}", encoding="utf-8")
         diagnostic(path, "E0202")
+
+    # These positions are independently counted from the original programs.
+    # Prefix comments contain Unicode; LF/CRLF must retain the same scalar spans.
+    prefix = "// a quiet sky: é🙂\n\n"
+    body_message = "a declaration is missing its '{ ... }' body"
+    close_message = "a declaration is missing its closing '}'"
+    body_repair = "add { ... } after this declaration's header"
+    close_repair = "add '}' to close the body that starts here"
+    for name, source, message, repair, span in (
+        ("function-body", prefix + "function shine(): Integer", body_message, body_repair, (3, 1, 3, 9)),
+        ("record-body", prefix + "record Window", body_message, body_repair, (3, 1, 3, 7)),
+        ("function-close", prefix + "function shine(): Integer {\n    return 3\n",
+         close_message, close_repair, (3, 27, 3, 28)),
+        ("record-close", prefix + "record Window {\n    light: Integer\n",
+         close_message, close_repair, (3, 15, 3, 16)),
+        ("callback-body", prefix + "let shine = function(): Integer",
+         "callback is missing its body", body_repair, (3, 13, 3, 21)),
+        ("callback-close", prefix + "let shine = function(): Integer {\n    return 3\n",
+         "callback body is missing its closing brace", close_repair, (3, 33, 3, 34)),
+    ):
+        for ending, separator in (("lf", "\n"), ("crlf", "\r\n")):
+            path = root / f"delimiter-{name}-{ending}.min"
+            path.write_bytes(source.replace("\n", separator).encode("utf-8"))
+            diagnostic(path, "E0202", expected_message=message, expected_help=repair,
+                       expected_span=span, expected_source_lines=source.splitlines())
+
+    imported = root / "broken-module.min"
+    importer = root / "delimiter-importer.min"
+    importer.write_text('use "./broken-module.min" as broken\nprint(1)\n', encoding="utf-8")
+    for name, source, message, repair, span in (
+        ("body", prefix + "public function shine(): Integer", body_message, body_repair, (3, 8, 3, 16)),
+        ("close", prefix + "public function shine(): Integer {\n    return 3\n",
+         close_message, close_repair, (3, 34, 3, 35)),
+    ):
+        for ending, separator in (("lf", "\n"), ("crlf", "\r\n")):
+            imported.write_bytes(source.replace("\n", separator).encode("utf-8"))
+            diagnostic(importer, "E0202", expected_message=message, expected_help=repair,
+                       expected_span=span, expected_source_lines=source.splitlines(),
+                       diagnostic_file=imported)
+
+    compile_program("delimiter-valid-declarations", prefix +
+                    "record Window {\n    light: Integer\n}\n" +
+                    "function shine(): Integer {\n    return 3\n}\nprint(shine())\n")
+    compile_program("delimiter-valid-callback", prefix +
+                    "let shine = function(): Integer {\n    return 3\n}\nprint(shine())\n")
+    compile_program("delimiter-valid-nested-callback", prefix +
+                    "let shine = function(value: Integer): Integer {\n" +
+                    "    let inner = function(value: Integer): Integer { return value }\n" +
+                    "    return inner(value)\n}\nprint(shine(3))\n")
 
     missing = root / "missing source.min"
     diagnostic(missing, "E0101", has_excerpt=False)
