@@ -145,7 +145,7 @@ $(OUT)/kernel.ll: $(KERNEL_SOURCE) $(SOURCES) $(MINYARC) | $(OUT)
 	"$(MINYARC)" "$(KERNEL_SOURCE)" "$@" $(PACKAGES) --bounded-owners 32 --freestanding --kernel-target "$(ARCH)"
 
 $(OUT)/loader.ll: $(SOURCES) $(MINYARC) | $(OUT)
-	$(MINYARC) $(ROOT)/os/arch/x86_64/loader/main.min $@ $(PACKAGES) --bounded-owners 32 --freestanding
+	"$(MINYARC)" "$(ROOT)/os/arch/x86_64/loader/main.min" "$@" $(PACKAGES) --bounded-owners 32 --freestanding --kernel-target "$(ARCH)"
 
 $(OUT)/%-program.o: $(OUT)/%.ll
 	$(CLANG) $(IRFLAGS) -c $< -o $@

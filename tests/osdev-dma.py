@@ -50,9 +50,12 @@ class Positive:
     imports: bool = True
     options: tuple = ()
     link_flags: tuple = ()
+    custom_source: str | None = None
 
     @property
     def source(self):
+        if self.custom_source is not None:
+            return self.custom_source
         return program(self.body, self.declarations, self.imports)
 
 
@@ -65,6 +68,16 @@ function prepare(cpu: dma.Cpu): dma.Cpu {
 IDENTITY = 'function identity<Item>(value: Item): Item { return value }\n'
 USER_LOAD = '''
 function load8(cpu: dma.Cpu): Integer {
+    let answer = dma.load8(cpu, 0)
+    dma.dispose(cpu)
+    return answer
+}
+'''
+DMA_METER_METHOD = '''
+record Meter { value: Integer }
+function Meter.read(): Integer {
+    let cpu = dma.allocate(16, 16)
+    dma.store8(cpu, 0, self.value)
     let answer = dma.load8(cpu, 0)
     dma.dispose(cpu)
     return answer
@@ -385,6 +398,29 @@ check(output[0] == 0 && output[3] == 3, "pure parallel range")
 let cpu = dma.allocate(16, 16)
 dma.dispose(cpu)
 ''', link_flags=("-pthread",)),
+    Positive("test-expect-ordinary-record-equality", "", execute=False, options=("--test-mode",),
+             custom_source=IMPORTS + '''
+record TestKey { value: Integer }
+test "ordinary records" {
+    let left = TestKey { value: 7 }
+    let right = TestKey { value: 7 }
+    expect(left == right)
+}
+'''),
+    Positive("ordinary-method-dma", '''
+let meter = Meter { value: 37 }
+check(meter.read() == 37, "ordinary record method can own local DMA")
+''', DMA_METER_METHOD),
+    Positive("dma-main-scalar-method-callback", '''
+let meter = Meter { value: 37 }
+let callback: () -> Integer = function() { return meter.read() }
+check(callback() == 37, "ordinary record capture and scalar method remain valid")
+let cpu = dma.allocate(16, 16)
+dma.dispose(cpu)
+''', '''
+record Meter { value: Integer }
+function Meter.read(): Integer { return self.value }
+'''),
 )
 POSITIVE_BY_NAME = {case.name: case for case in POSITIVES}
 
@@ -401,9 +437,12 @@ class Negative:
     categories: tuple = ("dma", "affine")
     extra_controls: tuple = ()
     context_categories: tuple = ()
+    custom_source: str | None = None
 
     @property
     def source(self):
+        if self.custom_source is not None:
+            return self.custom_source
         return program(self.body, self.declarations)
 
 
@@ -570,6 +609,19 @@ parallel for index in 0..output.length {
 }
 ''', "ordinary-for-model-queue", ("parallel", "managed", "native", "serial", "ownership"),
              extra_controls=("dma-main-scalar-parallel-for",), context_categories=("parallel",)),
+    Negative("test-expect-queue-equality", "", "test-expect-ordinary-record-equality", ("opaque",),
+             options=("--test-mode",), categories=("dma",), custom_source=IMPORTS + '''
+test "opaque queues" {
+    let queue = model.modelQueue()
+    expect(queue == queue)
+}
+'''),
+    Negative("callback-method-allocate", '''
+let meter = Meter { value: 37 }
+let callback: () -> Integer = function() { return meter.read() }
+check(callback() == 37, "scalar record method reaches DMA from callback")
+''', "ordinary-method-dma", ("callback", "closure", "context", "serial", "ownership"),
+             DMA_METER_METHOD, extra_controls=("dma-main-scalar-method-callback",)),
 )
 
 
