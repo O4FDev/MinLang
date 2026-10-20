@@ -22,5 +22,5 @@ check-osdev-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/fields-kernel.min --expect "OSDEV FIELDS PASS" --timeout 30
 
 .PHONY: check-osdev-freestanding
-check-osdev-freestanding: build/.toolchain.json
+check-osdev-freestanding: build/.toolchain.json build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-freestanding.py
