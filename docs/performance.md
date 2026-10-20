@@ -301,7 +301,8 @@ include matching `llvm-profdata`, LLD and the compiler-rt profile archive.
 
 Each invocation creates a fresh directory below `build/compiler-pgo`. It retains
 the baseline, instrumented trainer, profile-use compiler, raw and merged profiles,
-input hashes, exact commands, reference LLVM, all samples and `results.json`.
+frozen input copies and hashes, tool hashes, exact commands, reference LLVM,
+all samples and `results.json`.
 The JSON summary gives the candidate path. `make check-compiler-pgo` runs the
 same correctness checks with three retained pairs instead of the default 31.
 These targets are explicit experiments, outside the portable gate by default.

@@ -141,11 +141,20 @@ source_paths = [
     if path.suffix in ['.min', '.c', '.h']
 ]
 frozen_paths = sorted(set(
-    inputs + ['build/compiler.min', 'build/compiler-stage3.ll', 'build/minyar-runtime.o',
+    inputs + ['build/compiler.min', 'build/compiler-stage3.ll', 'build/minyar-runtime.o', 'build/minyarc',
               'bootstrap/stage0.c', 'Makefile', 'tools/toolchain.sh', str(Path(__file__).resolve())]
     + source_paths + [str(path) for path in Path('build-support').glob('*.mk')]
 ))
 frozen_hashes = {p: digest(p) for p in frozen_paths}
+tool_hashes = {str(path): digest(path) for path in [cc, profdata, linker]}
+archive_directory = work / 'inputs'
+archive_directory.mkdir()
+archived_inputs = {}
+for source in inputs + ['build/compiler.min', 'build/compiler-stage3.ll', 'build/minyar-runtime.o']:
+    destination = archive_directory / Path(source).name
+    shutil.copyfile(source, destination)
+    assert digest(destination) == frozen_hashes[source], ('input copy changed', source)
+    archived_inputs[source] = dict(path=str(destination), sha256=digest(destination))
 base = work / 'baseline'
 train = work / 'instrumented'
 candidate = work / 'pgo'
@@ -256,6 +265,8 @@ for source in benchmarks:
         ratios = [pairs['pgo'][i] / pairs['baseline'][i] for i in range(args.samples)]
         summary[source][field] = dict(medians=medians, median_ratio=statistics.median(ratios), ratio_range=[min(ratios),max(ratios)])
 assert {p: digest(p) for p in frozen_paths} == frozen_hashes, 'inputs changed during experiment'
+assert {p: digest(p) for p in tool_hashes} == tool_hashes, 'LLVM tools changed during experiment'
+assert all(digest(item['path']) == item['sha256'] for item in archived_inputs.values()), 'archived input changed'
 assert digest(profile) == profile_hash and {str(p):digest(p) for p in profile_dir.glob('*.profraw')} == raw_hashes, 'profile changed during holdout validation/timing'
 assert {p:digest(p) for p in generated_hashes} == generated_hashes, 'generated holdouts changed'
 report = dict(
@@ -269,6 +280,8 @@ report = dict(
     generated_source_sha256=generated_hashes,
     profile_nonzero_records=positive,
     tool_versions=versions,
+    tool_sha256=tool_hashes,
+    archived_inputs=archived_inputs,
     tool_paths={name: dict(invocation=str(path), identity=str(Path(path).resolve()))
                 for name, path in [('clang', cc), ('profdata', profdata), ('lld', linker)]},
     frozen_sha256=frozen_hashes,
