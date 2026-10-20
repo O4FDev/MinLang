@@ -10,6 +10,13 @@ function pack(values: List<Text>): Text {
     return joinText(pieces)
 }
 
+function hasIdentitySignature(code: Text, name: Text, physical: Text): Boolean {
+    for line in test.lines(code) {
+        if line.startsWith("define " + physical + " @") && (test.contains(line, ".fn." + name + "(") || test.contains(line, "_" + name + "(")) && test.contains(line, "(" + physical + " %argument.0)") { return true }
+    }
+    return false
+}
+
 function linkAndRun(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text, status: Integer, partial: Boolean) {
     let compiler = frontend.compiler
     for level in ["-O0", "-O2"] {
@@ -36,7 +43,7 @@ let llvm = io.readTextFile(path + ".ll")
 for name in ["choiceScalarBool", "choiceScalarEnum"] {
     test.check(test.contains(llvm, "i64 @.minyar.fn." + name + "(i64 %argument.0)"), "finite payload choice ABI must be i64: " + name)
 }
-for operation in ["call ptr @minyar_record_new", "call i64 @minyar_record_get", "call void @minyar_record_set", "call void @minyar_rc_retain", "call void @minyar_rc_borrow", "call void @minyar_rc_local", "call void @minyar_rc_keep", "call void @minyar_rc_release"] {
+for operation in ["call ptr @minyar_record_new", "call i64 @minyar_record_get", "call void @minyar_record_set", "call void @minyar_rc_", "call void @minyar_rc_retain", "call void @minyar_rc_borrow", "call void @minyar_rc_local", "call void @minyar_rc_keep", "call void @minyar_rc_release"] {
     test.check(!test.contains(llvm, operation), "scalar niche constructor/match emitted managed traffic: " + operation)
 }
 test.check(test.contains(llvm, "zext i1 ") && test.contains(llvm, " to i64") && test.contains(llvm, " to i1"), "Boolean payload projection must retain i1")
@@ -54,11 +61,11 @@ linkAndRun(frontend, path, path + "-runtime.o", "19999\n250000\n", "choice enums
 frontend.helpers = "\nlong long minyar_choice_scalar_echo(long long value) { assert(value >= 0 && value <= 2); return value; }\nlong long minyar_choice_scalar_missing(void) { return 2; }\nlong long minyar_choice_scalar_headerFlag(void *value) { const long long *fields = value; assert(fields[0] == 1 && fields[1] == 0 && fields[2] == 2); return fields[0]; }\n"
 fixtures.executes(frontend, io.readTextFile("tests/choice-scalar-niche-values.min"), io.readTextFile("tests/choice-scalar-niche-values.expected"), levels, 0, "", true)
 let composition = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
-test.check(test.contains(composition, "i64 @.minyar.fn.forwardIdentity(i64 %argument.0)"), "forward enum payload layout must precede signatures")
-test.check(test.contains(composition, "ptr @.minyar.fn.boxedInner(ptr %argument.0)") && test.contains(composition, "ptr @.minyar.fn.loneIdentity(ptr %argument.0)") && test.contains(composition, "ptr @.minyar.fn.recursiveIdentity(ptr %argument.0)"), "nested, single-case and recursive wrappers must stay boxed")
+test.check(hasIdentitySignature(composition, "forwardIdentity", "i64"), "forward enum payload layout must precede signatures")
+test.check(hasIdentitySignature(composition, "boxedInner", "ptr") && hasIdentitySignature(composition, "loneIdentity", "ptr") && hasIdentitySignature(composition, "recursiveIdentity", "ptr"), "nested, single-case and recursive wrappers must stay boxed")
 test.check(test.contains(composition, "declare i64 @minyar_choice_scalar_echo(i64)") && test.contains(composition, "declare i64 @minyar_choice_scalar_missing()"), "native Maybe<Boolean> must use encoded i64 ABI")
-test.check(test.contains(composition, "ptr @.minyar.fn.integerOptional(ptr %argument.0)") && test.contains(composition, "ptr @.minyar.fn.floatOptional(ptr %argument.0)"), "Integer and Float optionals must stay boxed")
-test.check(test.contains(composition, "ptr @.minyar.fn.threeIdentity(ptr %argument.0)") && test.contains(composition, "ptr @.minyar.fn.twoIdentity(ptr %argument.0)"), "three-case and two-payload choices must stay boxed")
+test.check(hasIdentitySignature(composition, "integerOptional", "ptr") && hasIdentitySignature(composition, "floatOptional", "ptr"), "Integer and Float optionals must stay boxed")
+test.check(hasIdentitySignature(composition, "threeIdentity", "ptr") && hasIdentitySignature(composition, "twoIdentity", "ptr"), "three-case and two-payload choices must stay boxed")
 test.check(test.contains(composition, "zext i32 ") && test.contains(composition, " to i32"), "Character payload projection must retain i32")
 let scalarCallback = false
 for line in test.lines(composition) {
@@ -66,6 +73,10 @@ for line in test.lines(composition) {
 }
 test.check(scalarCallback, "scalar niche callback must use i64 parameters/results")
 fixtures.executes(frontend, io.readTextFile("examples/gallery/scalar-choices.min"), io.readTextFile("examples/gallery/scalar-choices.expected"), levels, 0, "", true)
+
+// Keep concrete Maybe alias coverage separate from the inherited ambiguity
+// between its facade and unqualified constructors of another instantiation.
+fixtures.executes(frontend, "choice Phase { Low; High }\ntype Current = Maybe<Phase>\nfunction aliasIdentity(value: Current): Current { return value }\nlet present: Current = Maybe<Phase>.Some(Phase.High)\nlet missing: Current = Maybe<Phase>.None\nprint(match aliasIdentity(present) { Some(phase) { phase == Phase.High } None { false } })\nprint(present != missing)\n", "true\ntrue\n", levels, 0, "", true)
 
 // C-value ABI metadata must agree with direct native i64 and C field storage.
 test.require(fixtures.compile(frontend, "record Header native \"c\" { flag: Maybe<Boolean> }\nfunction convert(value: Maybe<Boolean>, header: Header): Maybe<Boolean> { native \"choice_scalar\" value }\n"), "compile scalar niche C-value ABI metadata")
@@ -115,7 +126,7 @@ for previous in [empty, prior, codecPrior, next] {
 
 // Failure rendering must project the payload, not print the raw niche code.
 let failed = compiler.directory + "/failed"
-io.writeTextFile(failed + ".min", "test \"scalar rendering\" { let value: Maybe<Boolean> = Some(false); expect(value == None<Boolean>()) }\n")
+io.writeTextFile(failed + ".min", "test \"scalar rendering\" { let value: Maybe<Boolean> = Some(false); let missing: Maybe<Boolean> = None; expect(value == missing) }\n")
 test.require(test.run([compiler.executable, failed + ".min", failed + ".ll", "--test-mode", "--library", "library"], frontend.environment, "", failed + ".compile", 60), "compile failing scalar test rendering")
 if test.addressEnabled(compiler.flags) { io.writeTextFile(failed + ".ll", test.instrument(io.readTextFile(failed + ".ll"))) }
 linkAndRun(frontend, failed, compiler.runtime, "", "expected None, got Some(false)", 1, true)
