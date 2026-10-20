@@ -1,0 +1,174 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources = ["runtime/native/unicode.c"]
+let levels = ["-O0", "-O2"]
+test.require(fixtures.compile(frontend, "use \"text\" as text\nprint(text.validUTF8(Bytes(\"sea\")))\n"), "ordinary Text stays independent of Unicode tables")
+let ordinaryIR = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+test.check(!test.contains(ordinaryIR, "@minyar_unicode_") && !test.contains(ordinaryIR, "; minyar-native-library: unicode"), "ordinary Text pulled in the Unicode provider")
+let checks = #"""
+    use "unicode" as text
+    function verify(condition: Boolean, message: Text) {
+        if !condition { fail(message) }
+    }
+    function scalars(values: List<Integer>): Text {
+        let parts: List<Text> = []
+        for value in values { parts.add(Text(Character(value))) }
+        return joinText(parts)
+    }
+
+    """#
+
+// Explicit scalar offsets are independent of both UTF-8 byte offsets and the
+// implementation's segmentation. Cluster slices must preserve the input bytes.
+fixtures.executes(frontend, checks + #"""
+    function boundaries(name: Text, source: Text, expected: List<Integer>, clusters: List<Text>) {
+        let positions = text.graphemeBoundaries(source)
+        verify(positions.length == expected.length, name + ": boundary count")
+        for index in 0..expected.length {
+            verify(positions[index] == expected[index], name + ": boundary " + Text(index))
+        }
+        verify(positions[0] == 0 && positions[positions.length - 1] == source.length, name + ": scalar endpoints")
+        let pieces = text.graphemes(source)
+        verify(pieces.length == clusters.length, name + ": cluster count")
+        verify(text.graphemeCount(source) == clusters.length, name + ": graphemeCount")
+        for index in 0..clusters.length {
+            verify(pieces[index] == clusters[index], name + ": cluster " + Text(index))
+            verify(pieces[index] == source.slice(expected[index], expected[index + 1]), name + ": scalar slice")
+        }
+        verify(joinText(pieces) == source, name + ": byte-exact reconstruction")
+    }
+    verify(text.unicodeVersion() == "18.0.0", "pinned Unicode version")
+    boundaries("empty", "", [0], [])
+    boundaries("ASCII", "sea", [0, 1, 2, 3], ["s", "e", "a"])
+    boundaries("multibyte scalars", "é🙂", [0, 1, 2], ["é", "🙂"])
+    verify("é🙂".length == 2 && "é🙂".byteLength == 6, "Text lengths stay scalar and byte based")
+    verify(Integer("é🙂"[1]) == 0x1F642, "indexing still yields a scalar")
+    let accent = scalars([0x65, 0x301])
+    boundaries("combining acute", accent + "x", [0, 2, 3], [accent, "x"])
+    let leading = scalars([0x301, 0x308])
+    boundaries("leading combining marks", leading + "a", [0, 2, 3], [leading, "a"])
+    boundaries("CRLF and controls", "a\r\nb\n\rc", [0, 1, 3, 4, 5, 6, 7], ["a", "\r\n", "b", "\n", "\r", "c"])
+    let zero = scalars([0])
+    let acute = scalars([0x301])
+    boundaries("embedded NUL", "a" + zero + acute + "b", [0, 1, 2, 3, 4], ["a", zero, acute, "b"])
+    let family = "👩‍👩‍👧‍👦"
+    boundaries("ZWJ family", "x" + family + "y", [0, 1, 8, 9], ["x", family, "y"])
+    boundaries("skin modifier", "👍🏽", [0, 2], ["👍🏽"])
+    boundaries("modifier and ZWJ", "👩🏽‍🚀!", [0, 4, 5], ["👩🏽‍🚀", "!"])
+    boundaries("regional indicator parity", "🇬🇧🇺🇳🇨", [0, 2, 4, 5], ["🇬🇧", "🇺🇳", "🇨"])
+    let hangul = scalars([0x1100, 0x1161, 0x11A8])
+    let next = scalars([0x1102, 0x1161])
+    boundaries("Hangul jamo", hangul + next, [0, 3, 5], [hangul, next])
+    boundaries("Hangul LVT plus T", "각" + scalars([0x11A8]), [0, 2], ["각" + scalars([0x11A8])])
+    let conjunct = scalars([0x915, 0x94D, 0x937])
+    boundaries("Indic conjunct", conjunct, [0, 3], [conjunct])
+    let linker = scalars([0x94D, 0x915])
+    boundaries("Unicode 18 leading Indic linker", linker, [0, 2], [linker])
+    let spacing = scalars([0x915, 0x93E])
+    boundaries("spacing mark", spacing, [0, 2], [spacing])
+    let prepend = scalars([0x600]) + "a"
+    boundaries("prepend", prepend, [0, 2], [prepend])
+    let keycap = scalars([0x31, 0xFE0F, 0x20E3])
+    boundaries("keycap", keycap, [0, 3], [keycap])
+    let joined = "a" + scalars([0x200D])
+    boundaries("non-emoji ZWJ", joined + "b", [0, 2, 3], [joined, "b"])
+    print("Grapheme boundaries: passed")
+
+    """#, "Grapheme boundaries: passed\n", levels, 0, "", true)
+
+fixtures.executes(frontend, checks + #"""
+    verify(text.normalized("") == "", "empty NFC")
+    let decomposed = "Caf" + scalars([0x65, 0x301])
+    verify(decomposed != "Café", "ordinary equality remains byte exact")
+    verify(text.normalized(decomposed) == "Café", "canonical composition")
+    verify(text.canonicallyEqual(decomposed, "Café"), "canonical comparison")
+    verify(!text.canonicallyEqual("Café", "café"), "canonical comparison preserves case")
+    verify(!text.canonicallyEqual("résumé", "resume"), "canonical comparison preserves accents")
+    verify(text.canonicallyEqual("", "") && !text.canonicallyEqual("", "a"), "empty canonical comparison")
+    let unordered = "q" + scalars([0x315, 0x300])
+    let ordered = "q" + scalars([0x300, 0x315])
+    verify(text.normalized(unordered) == ordered, "canonical mark reordering")
+    verify(text.normalized(scalars([0x41, 0x30A, 0x301])) == "Ǻ", "recursive composition")
+    let blocked = scalars([0x41, 0x305, 0x301])
+    verify(text.normalized(blocked) == blocked, "equal combining class blocks composition")
+    verify(text.normalized(scalars([0x344])) == scalars([0x308, 0x301]), "composition exclusion")
+    verify(text.normalized(scalars([0x1100, 0x1161, 0x11A8])) == "각", "algorithmic Hangul composition")
+    verify(text.normalized("Å") == "Å", "canonical Angstrom decomposition")
+    verify(text.normalized("Ａﬃ") == "Ａﬃ", "NFC preserves compatibility distinctions")
+    let zero = scalars([0])
+    let nulSource = scalars([0x65, 0x301, 0, 0x41, 0x30A])
+    verify(text.normalized(nulSource) == "é" + zero + "Å", "NFC continues after NUL")
+    for source in ["", decomposed, unordered, blocked, nulSource, "각", "👩🏽‍🚀"] {
+        let once = text.normalized(source)
+        verify(text.normalized(once) == once, "NFC is idempotent")
+    }
+    let distinct: Set<Text> = Set()
+    distinct.add("Café")
+    distinct.add(decomposed)
+    verify(distinct.length == 2, "Text collection keys stay byte exact")
+
+    verify(text.caseFold("") == "", "empty case fold")
+    verify(text.caseFold("Straße ẞ") == "strasse ss", "sharp-s full folding")
+    verify(text.caseFold("Σςσ") == "σσσ", "sigma folding is context independent")
+    verify(text.caseFold("İIıi") == scalars([0x69, 0x307, 0x69, 0x131, 0x69]), "locale-neutral dotted and dotless I")
+    verify(text.caseFold("Kſﬃ") == "ksffi", "full folding expansions")
+    verify(text.caseFold("CAFE" + scalars([0x301])) == "café", "fold output is NFC")
+    verify(text.caseFold(scalars([0x53, 0x307, 0x323])) == scalars([0x1E69]), "fold reorders and composes marks")
+    verify(text.caseFold("A" + zero + "ẞ") == "a" + zero + "ss", "fold continues after NUL")
+    let greekMarks = scalars([0x61, 0x345, 0x300])
+    let reorderedGreekMarks = scalars([0x61, 0x300, 0x345])
+    verify(text.caseFold(greekMarks) == scalars([0xE0, 0x3B9]), "decompose before folding Greek marks")
+    verify(text.caselessEqual(greekMarks, reorderedGreekMarks), "canonical caseless combining order")
+    verify(text.caselessEqual("Straße", "STRASSE"), "caseless sharp-s comparison")
+    verify(text.caselessEqual(decomposed, "CAFÉ"), "caseless canonical comparison")
+    verify(text.caselessEqual("İ", scalars([0x69, 0x307])), "default dotted-I mapping")
+    verify(!text.caselessEqual("I", "ı") && !text.caselessEqual("İ", "i"), "fold has no Turkish tailoring")
+    verify(text.caselessEqual("ﬃ", "FFI"), "caseless full expansion")
+    verify(!text.canonicallyEqual("ﬃ", "ffi"), "canonical comparison has no compatibility folding")
+    verify(!text.caselessEqual("résumé", "RESUME"), "case folding preserves accents")
+    verify(text.caselessEqual("", "") && !text.caselessEqual("", "a"), "empty caseless comparison")
+    verify(decomposed.length == 5 && decomposed != "Café", "Unicode helpers preserve original Text")
+    print("Unicode normalization and folding: passed")
+
+    """#, "Unicode normalization and folding: passed\n", levels, 0, "", true)
+
+// Results outlive freshly allocated inputs, survive List mutation, and are
+// repeatedly released through the exact frontend ownership-contract runtime.
+fixtures.executes(frontend, checks + #"""
+    function freshPieces(): List<Text> {
+        let source = joinText(["e", scalars([0x301]), "👩🏽‍🚀", scalars([0])])
+        return text.graphemes(source)
+    }
+    function freshBoundaries(): List<Integer> {
+        return text.graphemeBoundaries(joinText(["e", scalars([0x301]), "👩🏽‍🚀", scalars([0])]))
+    }
+    function freshNormalized(): Text {
+        return text.normalized(joinText(["A", scalars([0x30A])]))
+    }
+    function freshFolded(): Text {
+        return text.caseFold(joinText(["Stra", "ße"]))
+    }
+    let accent = scalars([0x65, 0x301])
+    for iteration in 0..128 {
+        let pieces = freshPieces()
+        verify(pieces.length == 3 && pieces[1] == "👩🏽‍🚀" && pieces[2] == scalars([0]), "escaped cluster lifetime")
+        let first = pieces[0]
+        pieces[0] = "changed"
+        pieces = []
+        verify(first == accent, "cluster survives replacement and List release")
+        let positions = freshBoundaries()
+        verify(positions.length == 4 && positions[0] == 0 && positions[1] == 2 && positions[2] == 6 && positions[3] == 7, "escaped scalar boundaries")
+        positions[1] = 999
+        verify(freshBoundaries()[1] == 2, "boundary results are independent Lists")
+        verify(freshNormalized() == "Å" && freshFolded() == "strasse", "escaped transformed Text lifetime")
+    }
+    print("Unicode ownership: passed")
+
+    """#, "Unicode ownership: passed\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/unicode-text.min"), "Names on the same door:\n  Café · 4 characters\n  👩🏽‍🚀 · 1 character\n  🇬🇧 · 1 character\nA family stays together: 👩‍👩‍👧‍👦\nTwo ways to write Café, one welcome: true\nStraße and STRASSE meet here: true\n", levels, 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Unicode Text: passed O0/O2 graphemes, NFC, full folding and ownership")

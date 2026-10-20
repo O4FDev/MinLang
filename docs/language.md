@@ -326,6 +326,47 @@ Keep arbitrary file contents in Bytes. Import `text` and call
 invalid UTF-8 produces `errors.invalidDataCode()`. Character-offset caches
 remain lazy.
 
+Import `unicode` when a character should mean a whole visible cluster:
+
+```minyar
+use "unicode" as unicode
+print("é".length)                       // 2 scalar values
+print(unicode.graphemeCount("é"))          // 1 grapheme cluster
+for piece in unicode.graphemes("👩🏽‍🚀🌙") { print(piece) }
+print(unicode.canonicallyEqual("é", "é"))  // true
+print(unicode.caselessEqual("Straße", "STRASSE")) // true
+```
+
+`unicode.graphemeBoundaries(value)` returns scalar offsets, including zero and
+the end, suitable for `value.slice`. Empty Text has the single boundary `[0]`
+and no graphemes. Segmentation follows Unicode 18.0.0 extended grapheme
+clusters, including combining marks, joined emoji, flag pairs, Indic conjuncts
+and CRLF. `unicode.unicodeVersion()` reports the pinned Unicode data version.
+A grapheme cluster is a text boundary, not a promise about a font's display width.
+
+`unicode.normalized(value)` returns canonical composition (NFC).
+`unicode.canonicallyEqual(left, right)` compares these canonical spellings.
+`unicode.caseFold(value)` creates a canonical, locale-independent comparison key
+using full default case folding; `unicode.caselessEqual` compares those keys.
+Folding handles expansions such as `ß` to `ss` and preserves accents.
+It decomposes before folding and composes afterward, so canonically equivalent
+spellings keep the same key. It is not a display-oriented lowercase operation.
+These operations preserve embedded zero bytes and control characters; they do
+not strip marks or apply compatibility normalization. Ordinary `==`, ordering,
+hashing, `length` and indexing retain their exact-content and scalar contracts.
+
+The Unicode provider is linked when the `unicode` module is imported.
+Counting scans once and allocates no boundary storage. Boundary lists scan
+twice and allocate one temporary byte per scalar plus their Integer List;
+splitting also creates Text slices and may build the scalar-offset cache.
+Normalization and folding allocate native temporary buffers and copy their
+output into managed Text. Folding first allocates a decomposed intermediate.
+Native scratch storage uses the system allocator rather than the selected
+Minyar heap profile. Unicode tables add read-only program data when linked.
+
+Canonical reordering can take quadratic time on adversarial runs of combining
+marks. Normalize complete keys after concatenating their parts.
+
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
 Text literals can include expressions inside `\(` and `)`:

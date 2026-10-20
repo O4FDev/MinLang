@@ -23,3 +23,11 @@ Upstream: <https://github.com/nothings/stb>
   The [Cure53 audit](https://monocypher.org/quality-assurance/audit) assessed
   version 3.1.1 in June 2020; it is not an audit of Minyar or version 4.0.3.
   Version 4.0.3 includes a subsequent upstream signing timing leak fix.
+
+- `utf8proc/` contains unmodified utf8proc 2.12.0 with Unicode 18.0.0 data,
+  from <https://github.com/JuliaStrings/utf8proc/tree/v2.12.0>, tag commit
+  `79cdd5ab40c79afa559f689ffc13b76812dee1ac`.
+  `utf8proc/LICENSE.md` includes the MIT license and Unicode data license.
+  The optional `unicode` native provider supplies grapheme segmentation, NFC
+  normalization and full default case folding. Ordinary Text operations do
+  not link this provider. Its native-object cache includes every vendored byte.

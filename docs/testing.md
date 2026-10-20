@@ -187,6 +187,15 @@ The configuration gallery and programs run at O0/O2 with ownership assertions;
 `check-result-library-sanitize` adds ASan/UBSan. Compatibility getters and native
 status APIs are also exercised by their existing focused suites.
 
+`make check-unicode-text` checks explicit grapheme boundaries, NFC, canonical
+comparison and full default case folding at O0/O2 with ownership assertions,
+including the Unicode text gallery. `make check-unicode-conformance` checks
+all 853 grapheme, 20,171 normalization and 1,606 full default case-fold vectors
+from the pinned Unicode 18.0.0 files at O0/O2. Normalization checks all five NFC
+column invariants and canonical-fold consistency; folding checks idempotence.
+Both targets are in the portable gate. `check-unicode-text-sanitize` repeats
+the focused cases and full corpora with ASan/UBSan, including the native provider.
+
 `make check-result-network` exercises typed sockets, TLS, workers and HTTP at
 O0/O2 with the ownership oracle. Loopback peers cover nonblocking accept,
 would-block, empty datagrams, truncation prefixes, batches and stream EOF.
