@@ -8,6 +8,7 @@ unset TAR_OPTIONS
 embedded_key='@MINYAR_RELEASE_KEY@'
 embedded_server='@MINYAR_DIST_URL@'
 version=latest
+automatic=1
 server=${MINYAR_DIST_URL:-$embedded_server}
 minyar_home=${MINYAR_HOME:-${HOME:?HOME must be set}/.minyar}
 set_default=1
@@ -30,11 +31,57 @@ valid_version() {
     case "$1" in ''|*[!0-9A-Za-z.+-]*|*..*) return 1 ;; esac
     awk -v version="$1" 'BEGIN { exit !(version ~ /^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$/) }'
 }
+version_less_than() {
+    LC_ALL=C awk -v left="$1" -v right="$2" '
+        function number_compare(a, b, aa, bb) {
+            aa = a; bb = b
+            sub(/^0+/, "", aa); sub(/^0+/, "", bb)
+            if (aa == "") aa = "0"
+            if (bb == "") bb = "0"
+            if (length(aa) != length(bb)) return length(aa) < length(bb) ? -1 : 1
+            if (aa == bb) return 0
+            return ("x" aa < "x" bb) ? -1 : 1
+        }
+        function identifier_compare(a, b, a_number, b_number) {
+            a_number = a ~ /^[0-9]+$/
+            b_number = b ~ /^[0-9]+$/
+            if (a_number && b_number) return number_compare(a, b)
+            if (a_number != b_number) return a_number ? -1 : 1
+            if (a == b) return 0
+            return ("x" a < "x" b) ? -1 : 1
+        }
+        function version_compare(a, b, a_core, b_core, a_pre, b_pre, a_count, b_count, count, i, result) {
+            sub(/\+.*/, "", a); sub(/\+.*/, "", b)
+            a_core = a; b_core = b
+            sub(/-.*/, "", a_core); sub(/-.*/, "", b_core)
+            split(a_core, left_core, "."); split(b_core, right_core, ".")
+            for (i = 1; i <= 3; i++) {
+                result = number_compare(left_core[i], right_core[i])
+                if (result != 0) return result
+            }
+            a_pre = index(a, "-") ? substr(a, index(a, "-") + 1) : ""
+            b_pre = index(b, "-") ? substr(b, index(b, "-") + 1) : ""
+            if (a_pre == "" || b_pre == "") {
+                if (a_pre == b_pre) return 0
+                return a_pre == "" ? 1 : -1
+            }
+            a_count = split(a_pre, left_pre, "."); b_count = split(b_pre, right_pre, ".")
+            count = a_count < b_count ? a_count : b_count
+            for (i = 1; i <= count; i++) {
+                result = identifier_compare(left_pre[i], right_pre[i])
+                if (result != 0) return result
+            }
+            if (a_count == b_count) return 0
+            return a_count < b_count ? -1 : 1
+        }
+        BEGIN { exit version_compare(left, right) < 0 ? 0 : 1 }
+    '
+}
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version|--server|--home)
             [ "$#" -ge 2 ] || die "$1 requires a value"
-            case "$1" in --version) version=$2 ;; --server) server=$2 ;; --home) minyar_home=$2 ;; esac
+            case "$1" in --version) version=$2; automatic=0 ;; --server) server=$2 ;; --home) minyar_home=$2 ;; esac
             shift 2 ;;
         --no-default) set_default=0; shift ;;
         --help|-h)
@@ -139,7 +186,7 @@ minyar_home=$(CDPATH= cd -- "$minyar_home" && pwd -P)
 if [ -e "$minyar_home/.minyar-home" ] || [ -L "$minyar_home/.minyar-home" ]; then
     [ ! -L "$minyar_home/.minyar-home" ] && [ "$(cat -- "$minyar_home/.minyar-home")" = minyar-home-v1 ] || die 'refusing to use an unrelated installation marker'
 else
-    for name in manager.sh toolchains default release-key.pub server; do [ ! -e "$minyar_home/$name" ] && [ ! -L "$minyar_home/$name" ] || die "refusing to replace an unrelated $minyar_home/$name"; done
+    for name in manager.sh toolchains default update-floor release-key.pub server; do [ ! -e "$minyar_home/$name" ] && [ ! -L "$minyar_home/$name" ] || die "refusing to replace an unrelated $minyar_home/$name"; done
 fi
 if [ -e "$minyar_home/bin/minyar" ] || [ -L "$minyar_home/bin/minyar" ]; then
     [ ! -L "$minyar_home/bin/minyar" ] && [ -f "$minyar_home/bin/minyar" ] && grep -Fqx '# Managed by Minyar toolchains (v1)' "$minyar_home/bin/minyar" || die "refusing to replace an unrelated command: $minyar_home/bin/minyar"
@@ -148,7 +195,19 @@ if [ -f "$minyar_home/release-key.pub" ]; then [ "$(cat -- "$minyar_home/release
 mkdir -- "$minyar_home/.install-lock" 2>/dev/null || die 'another toolchain installation is running; repeat this command when it finishes'
 lock=$minyar_home/.install-lock
 mkdir -p -- "$minyar_home/toolchains" "$minyar_home/bin"
-for name in toolchains bin manager.sh default release-key.pub server; do [ ! -L "$minyar_home/$name" ] || die "installation entries cannot be symlinks: $name"; done
+for name in toolchains bin manager.sh default update-floor release-key.pub server; do [ ! -L "$minyar_home/$name" ] || die "installation entries cannot be symlinks: $name"; done
+floor=
+if [ -e "$minyar_home/update-floor" ]; then
+    [ -f "$minyar_home/update-floor" ] || die 'the automatic update floor must be a regular file'
+    floor=$(cat -- "$minyar_home/update-floor")
+    valid_version "$floor" || die 'the automatic update floor contains an invalid version'
+elif [ -f "$minyar_home/default" ]; then
+    floor=$(cat -- "$minyar_home/default")
+    valid_version "$floor" || die 'the default toolchain contains an invalid version'
+fi
+if [ "$automatic" -eq 1 ] && [ -n "$floor" ] && version_less_than "$version" "$floor"; then
+    die "signed release $version is older than accepted update floor $floor; use 'minyar toolchain install $version' and 'minyar toolchain default $version' for an intentional downgrade"
+fi
 destination=$minyar_home/toolchains/$version
 if [ -e "$destination" ] || [ -L "$destination" ]; then
     [ ! -L "$destination" ] && [ -f "$destination/.minyar-toolchain" ] && [ "$(cat -- "$destination/.minyar-toolchain")" = "$version" ] || die "refusing to replace an unrelated toolchain: $destination"
@@ -175,7 +234,11 @@ chmod 755 "$minyar_home/.manager-$$"
 mv -f -- "$minyar_home/.manager-$$" "$minyar_home/manager.sh"
 printf '%s\n' "$key" > "$minyar_home/.key-$$"; mv -f -- "$minyar_home/.key-$$" "$minyar_home/release-key.pub"
 printf '%s\n' "$server" > "$minyar_home/.server-$$"; mv -f -- "$minyar_home/.server-$$" "$minyar_home/server"
-if [ "$set_default" -eq 1 ] || [ ! -f "$minyar_home/default" ]; then printf '%s\n' "$version" > "$minyar_home/.default-$$"; mv -f -- "$minyar_home/.default-$$" "$minyar_home/default"; fi
+if [ "$set_default" -eq 1 ] || [ ! -f "$minyar_home/default" ]; then
+    if [ -z "$floor" ] || version_less_than "$floor" "$version"; then floor=$version; fi
+    printf '%s\n' "$floor" > "$minyar_home/.update-floor-$$"; mv -f -- "$minyar_home/.update-floor-$$" "$minyar_home/update-floor"
+    printf '%s\n' "$version" > "$minyar_home/.default-$$"; mv -f -- "$minyar_home/.default-$$" "$minyar_home/default"
+fi
 cat > "$minyar_home/bin/.minyar-$$" <<'SHIM'
 #!/bin/sh
 # Managed by Minyar toolchains (v1)

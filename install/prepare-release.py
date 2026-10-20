@@ -95,6 +95,8 @@ def prepare(args):
                 raise ValueError("existing release checksum manifest is malformed")
             records[filename] = checksum
     digest = sha256(args.archive)
+    if name in records and records[name] != digest:
+        raise ValueError("the existing signed checksum differs; choose a new release version")
     destination = release / name
     if destination.exists():
         previous = sha256(destination)
@@ -106,8 +108,6 @@ def prepare(args):
         shutil.copyfile(args.archive, temporary)
         temporary.replace(destination)
     destination.chmod(0o644)
-    if name in records and records[name] != digest:
-        raise ValueError("the existing signed checksum differs; choose a new release version")
     records[name] = digest
     content = "".join(f"{checksum}  {filename}\n" for filename, checksum in sorted(records.items())).encode()
     sign(content, release / "SHA256SUMS.sig", args.signing_key, public_key)
