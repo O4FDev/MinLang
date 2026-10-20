@@ -24,7 +24,7 @@ repository = Path(__file__).resolve().parents[1]
 # message, help note or example must not renumber an existing error family.
 CODES = (
     "E0001",
-    "E0101", "E0102", "E0103", "E0104",
+    "E0101", "E0102", "E0103", "E0104", "E0105",
     "E0201", "E0202", "E0203", "E0204", "E0205", "E0206",
     "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307",
     "E0401", "E0402", "E0403", "E0404", "E0405", "E0406", "E0407",
@@ -248,6 +248,7 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         ("hex-decimal-point", "print(0xFF.5)\n", "E0104"),
         ("float-missing-exponent", "print(1.5e)\n", "E0104"),
         ("float-overflow", "print(1.0e999)\n", "E0104"),
+        ("bidi-comment", "print(1) // \u202e\n", "E0105"),
         ("and-left-type", "print(1 && true)\n", "E0406"),
         ("and-right-type", "print(true && 1)\n", "E0406"),
         ("or-left-type", "print(1 || false)\n", "E0406"),
