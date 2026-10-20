@@ -1772,6 +1772,19 @@ e1000 driver uses `sizeOf` and `offsetOf` on its 16-byte descriptors, so strides
 and offsets come from the declared layout. Those queries are compile-time values;
 they do not create a record. Packed layouts describe storage and do not make
 ordinary record field accesses into volatile MMIO operations.
+
+A DMA address has its own type, `device.DeviceAddress`. Only
+`device.deviceAddress(memory, offset)` makes one, and descriptor fields take it
+through `device.storeAddress`; `addressLow` and `addressHigh` split it for base
+registers. Storing a CPU pointer, an offset or another Integer where the device
+expects a DMA address is a compile error:
+
+```text
+error: an argument passed to storeAddress has the wrong type; expected DeviceAddress, found Integer
+```
+
+A DeviceAddress is a small managed record, so make them while setting up rings.
+The e1000 driver does, and its per-packet path stores none.
 See [kernel development](os-development.md) for hosted driver tests, bounded
 QEMU tests, GDB and symbolized panic addresses.
 

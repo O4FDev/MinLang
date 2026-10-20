@@ -196,6 +196,15 @@ The first command must fail: the fixture reads an unmapped address. The second
 resolves the fault PC to the retained `faultingRead` function in the matching ELF.
 It is a postmortem symbol check, separate from the successful e1000 guest.
 
+The e1000 driver also runs on the host against a deterministic device model
+(`make check-osdev-devices`): the production driver, PCI scanner and
+`device.Memory` code with only the machine and architecture modules replaced.
+A seeded fault campaign lets a `simulation.World` choose delayed, reordered and
+duplicate completions, missed and spurious interrupts, and errored or oversized
+multi-descriptor receive frames. Each seed replays the same transcript, so a
+failure names a seed you can rerun. It found the driver delivering malformed
+frames, including the tail of an oversized frame (Linux CVE-2009-4536).
+
 The e1000 driver uses explicit full `machine.fence()` barriers before enabling
 the initial receive ring, after observing DMA completion, and before publishing
 a tail to the device. These order normal RAM and device registers; volatile
