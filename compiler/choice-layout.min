@@ -1,6 +1,8 @@
-// A two-case choice with one non-null managed record payload has a spare null
-// pointer. Keep its logical fields intact: ownership analysis still sees them.
+// A two-case choice with one non-null managed payload has a spare null pointer.
+// Eligible payloads are Text or ordinary managed records; keep logical fields.
 // Layout kinds: 0 ordinary type, 1 integer choice, 2 tagged union, 3 null niche.
+// For kind 3, choiceNicheType returns the payload type (including Text = 2),
+// not necessarily a record. choiceStorageCount counts only choice-owned slots.
 function choiceLayoutKind(context: CompilerContext, type: Integer): Integer {
     if isEnumType(type) { return 1 }
     if choiceCases(context, type).length == 0 { return 0 }
@@ -16,6 +18,7 @@ function choiceNicheType(context: CompilerContext, type: Integer): Integer {
     if cases.length != 3 { return 0 }
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let payload = context.functionParameterTypes[first + 1]
+    if payload == 2 { return payload }
     if !isRecordType(payload) || isEnumType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
     // A nested optional may already use null, so Some(None) needs its own tag.
     if choiceCases(context, payload).length > 0 { return 0 }
@@ -78,7 +81,8 @@ function parseNicheChoice(context: CompilerContext, localNames: List<Text>, loca
 
 function derivedNicheChoice(context: CompilerContext, type: Integer, operation: Text, globals: List<Text>, name: Text): Text {
     let payload = choiceNicheType(context, type)
-    let child = derivedRecordFunction(context, payload, operation, globals)
+    let child = ""
+    if payload != 2 { child = derivedRecordFunction(context, payload, operation, globals) }
     let resultType = "i64"
     if operation == "equal" { resultType = "zeroext i1" }
     if operation == "copy" { resultType = "ptr" }
@@ -97,8 +101,28 @@ function derivedNicheChoice(context: CompilerContext, type: Integer, operation: 
         code = code + "  br i1 %left.absent, label %absent, label %present\nabsent:\n"
         if operation == "copy" { code = code + "  ret ptr null\n" } else { code = code + "  ret i64 0\n" }
     }
-    code = code + "present:\n  %result = call " + resultType + " " + child + "(ptr %left"
-    if binary { code = code + ", ptr %right" }
+    code = code + "present:\n"
+    if payload == 2 {
+        if operation == "copy" {
+            // Text is immutable. A key snapshot returns one owned alias,
+            // just as a Text field in a derived record copy does.
+            code = code + "  call void @minyar_rc_retain(ptr %left)\n  ret ptr %left\n}\n"
+            globals.add(code)
+            return name
+        }
+        child = "@minyar_hash_slot"
+        let declaration = "declare i64 @minyar_hash_slot(i64, i64)\n"
+        if operation == "equal" { child = "@minyar_equal_slots"; declaration = "declare zeroext i1 @minyar_equal_slots(i64, i64, i64)\n" }
+        if operation == "compare" { child = "@minyar_compare_slots"; declaration = "declare i64 @minyar_compare_slots(i64, i64, i64)\n" }
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        code = code + "  %left.slot = ptrtoint ptr %left to i64\n"
+        if binary { code = code + "  %right.slot = ptrtoint ptr %right to i64\n" }
+        code = code + "  %result = call " + resultType + " " + child + "(i64 2, i64 %left.slot"
+        if binary { code = code + ", i64 %right.slot" }
+    } else {
+        code = code + "  %result = call " + resultType + " " + child + "(ptr %left"
+        if binary { code = code + ", ptr %right" }
+    }
     code = code + ")\n"
     if operation == "equal" { code = code + "  ret i1 %result\n}\n" } else { code = code + "  ret " + resultType + " %result\n}\n" }
     globals.add(code)

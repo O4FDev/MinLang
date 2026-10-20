@@ -156,13 +156,19 @@ graph analysis. See the Result language contract
 and the independent review.
 
 Choices share their payload slots across cases and track only the active
-reference fields. A two-case choice with one ordinary managed record payload
-uses that record pointer directly, reserving null for the empty case. This
-includes `Maybe<Record>` and adds no wrapper object or reference-count edge.
+reference fields. A two-case choice with one Text or ordinary managed record
+payload uses that payload pointer directly, reserving null for the empty case.
+This includes `Maybe<Text>` and `Maybe<Record>` and adds no wrapper object or
+reference-count edge. Empty Text headers are non-null. Text key snapshots
+retain the immutable payload and return one owned result; record payloads
+keep their existing deep snapshot copy.
 The compiler keeps the full logical field graph for cycle analysis and projects
 nullable aliases to their payload type when choosing traced ownership calls.
 Choice, callback and C-layout payloads retain an explicit tag; in particular,
 an optional containing another optional must preserve `Some(None)`.
+Physical layout kind 3 denotes this nullable payload contract, with zero
+choice-owned storage slots. Its niche type may be Text (type 2) or an ordinary
+managed record; consumers must classify the payload before reading its layout.
 
 ## Compiler/runtime ownership contract
 

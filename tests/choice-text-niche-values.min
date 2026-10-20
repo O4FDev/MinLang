@@ -1,0 +1,141 @@
+use "text" as text
+use "process" as processInfo
+use "maybe" as maybe
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+function words(value: Maybe<Text>): Text { return match value { Some(item) { item } None { "absent" } } }
+function fresh(value: Text): Maybe<Text> { return Some(value + "!") }
+function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }
+function identity<Item>(value: Item): Item { return value }
+function remember(value: Maybe<Text>): () -> Maybe<Text> { return function() { return value } }
+choice Message { Silent; Spoken(value: Text) }
+record Box { value: Maybe<Text>; next: Maybe<Box> }
+record Key { value: Maybe<Text>; number: Integer }
+record DeepKey { key: Key; title: Text }
+choice Pair { Empty; Both(first: Text, second: Text) }
+function replace(box: Box): (Text) -> Text {
+    box.value = None
+    return function(value) { return value + " mapped" }
+}
+
+let empty = Some("" + "")
+let absent: Maybe<Text> = None
+check(empty != absent && empty.isSome() && absent.isNone(), "empty Text is present")
+check(empty.unwrap().length == 0, "empty Text contents")
+let unicode = "海" + "🌙"
+check(Some(unicode) == Some("海🌙"), "Text equality uses contents")
+check(unicode.length == 2, "lazy Unicode index does not change hashing")
+let zero = Bytes("a_b")
+zero[1] = 0
+let embedded = Text(zero)
+check(Some(embedded) != None && Some(embedded).unwrap().length == 3, "zero-byte Text is present")
+check(Some(embedded) == Some(Text(zero)), "zero-byte Text equality")
+let zeroKeys: Map<Maybe<Text>, Integer> = Map()
+zeroKeys[Some(embedded)] = 9
+check(zeroKeys[Some(Text(zero))] == 9, "zero-byte Text hashing")
+
+let input = "borrowed" + " value"
+let held = wrap(input)
+input = "rebound"
+check(words(held) == "borrowed value", "borrowed constructor retains")
+let owned = identity(fresh("owned"))
+check(words(owned) == "owned!", "owned result forwarding")
+let callback = remember(fresh("captured"))
+check(words(callback()) == "captured!", "callback captures Text choice")
+let changing = fresh("before")
+match changing {
+    Some(value) { changing = fresh("after"); check(value == "before!", "match holds replaced payload") }
+    None { fail("missing before") }
+}
+check(words(changing) == "after!", "match replacement")
+let values: List<Maybe<Text>> = [held, None, fresh("stored")]
+held = None
+let saved = match values[2] { Some(value) { value } None { "lost" } }
+values[2] = None
+check(saved == "stored!" && words(values[0]) == "borrowed value", "List owns payloads")
+let box = Box { value: fresh("record"); next: None }
+let read: () -> Maybe<Text> = function() { return box.value }
+let prior = read()
+box.value = None
+check(read().isNone() && words(prior) == "record!", "callback reads mutable record")
+box.value = fresh("argument")
+check(box.value.map(replace(box)).unwrap() == "argument! mapped" && box.value.isNone(), "callback argument evaluation retains receiver")
+box.next = Some(box)
+box.value = fresh("cycle leaf")
+check(words(box.value) == "cycle leaf!", "Text leaf in traced record")
+
+let outer: Maybe<Maybe<Text>> = None
+let inner: Maybe<Maybe<Text>> = Some(None<Text>())
+let nested: Maybe<Maybe<Text>> = Some(Some("" + ""))
+check(outer != inner && inner != nested && outer != nested, "nested Maybe keeps outer tag")
+let nestedKeys: Map<Maybe<Maybe<Text>>, Integer> = Map()
+nestedKeys[outer] = 1; nestedKeys[inner] = 2; nestedKeys[nested] = 3
+check(nestedKeys.length == 3 && nestedKeys[Some(None<Text>())] == 2, "nested keys distinguish Some(None)")
+check(nestedKeys[Some(Some(""))] == 3, "nested Text snapshot")
+
+let silent: Message = Silent
+let spoken = Spoken("" + "")
+check(silent != spoken && silent < spoken && spoken > silent, "reversed case order")
+check(Some("a") < None<Text>() && Some("a") < Some("b"), "Maybe order")
+let sorted: List<Maybe<Text>> = [None, Some("z"), Some(""), Some("a")]
+sorted.sort()
+check(words(sorted[0]) == "" && words(sorted[1]) == "a" && words(sorted[2]) == "z" && sorted[3].isNone(), "Text choice sort")
+let messages: List<Message> = [Spoken("z"), Silent, Spoken("a")]
+messages.sort()
+check(messages[0] == Silent && messages[1] == Spoken("a"), "reversed choice sort")
+let messageKeys: Map<Message, Integer> = Map()
+messageKeys[Silent] = 1; messageKeys[Spoken("a" + "")] = 2
+check(messageKeys[Spoken("a")] == 2 && messageKeys[Silent] == 1, "reversed choice hash and copy")
+let keys: Map<Maybe<Text>, Integer> = Map()
+let source = "original" + " key"
+keys[Some(source)] = 42; keys[None] = 7; keys[Some("")] = 8
+source = "changed"
+check(keys[Some("original key")] == 42 && keys[None] == 7 && keys[Some("" + "")] == 8, "immutable key snapshot owns Text")
+let snapshots: List<Maybe<Text>> = []
+for key in keys { snapshots.add(key) }
+check(keys.remove(Some("original key")), "remove Text key")
+let found = false
+for key in snapshots { if key == Some("original key") { found = true } }
+check(found, "iterated Text key outlives Map entry")
+let seen: Set<Maybe<Text>> = Set()
+seen.add(Some(unicode)); seen.add(None); seen.add(empty); seen.add(Some("海🌙"))
+check(seen.length == 3 && seen.contains(Some("海" + "🌙")) && seen.contains(None), "Text choice Set")
+let backing = "prefix" + unicode + "suffix"
+let view = backing.slice(6, 8)
+let viewKeys: Map<Maybe<Text>, Integer> = Map()
+viewKeys[Some(view)] = 12
+backing = "rebound"; view = "rebound"
+check(viewKeys[Some("海🌙")] == 12, "Text slice key retains immutable contents")
+let original = DeepKey { key: Key { value: fresh("deep"); number: 4 }; title: "title" + "!" }
+let deep: Map<DeepKey, Integer> = Map()
+deep[original] = 55
+original.key.value = None; original.key.number = 5; original.title = "changed"
+let probe = DeepKey { key: Key { value: Some("deep!"); number: 4 }; title: "title!" }
+check(deep[probe] == 55, "record snapshot copies record and retains immutable Text")
+for key in deep { key.key.value = None; key.title = "snapshot changed" }
+check(deep[probe] == 55, "iterated deep key remains independent")
+
+function decode(good: Boolean): Result<Text, Text> { if good { return Ok("decoded" + "!") }; return Err("failed" + "!") }
+function store(box: Box, good: Boolean): Result<Maybe<Text>, Text> { box.value = Some(try decode(good)); return Ok(box.value) }
+function pair(good: Boolean): Result<Pair, Text> { return Ok(Both("partial" + "!", try decode(good))) }
+check(store(box, true).unwrap().unwrap() == "decoded!", "try constructs Text niche")
+check(store(box, false).isErr() && words(box.value) == "decoded!", "failed try preserves destination")
+check(pair(true).isOk() && pair(false).isErr(), "partial tagged constructor cleans up")
+check(owned.map(function(value) { return value + "?" }).unwrap() == "owned!?", "Maybe map Text to Text")
+check(owned.filter(function(value) { return value.length > 0 }).unwrap() == "owned!", "Maybe filter")
+check(owned.andThen(function(value): Maybe<Text> { return Some(value + ".") }).unwrap() == "owned!.", "Maybe andThen")
+check(absent.orElse(function(): Maybe<Text> { return Some("recovered" + "!") }).unwrap() == "recovered!", "Maybe recovery")
+check(owned.okOr("error").map(function(value) { return value + "." }).unwrap() == "owned!.", "Result map")
+check(decode(false).orElse(function(error): Result<Text, Text> { return Ok(error + " recovered") }).unwrap() == "failed! recovered", "Result recovery")
+let explicit: maybe.Maybe<Text> = maybe.Maybe<Text>.Some("explicit" + "!")
+check(explicit.unwrap() == "explicit!" && maybe.Maybe<Text>.None.isNone(), "qualified Maybe Text ABI")
+
+check(text.slice("海🌙", 1, 2).unwrap() == "🌙", "library Unicode slice")
+check(text.slice("海🌙", 1, 1).isSome() && text.slice("海🌙", 1, 1).unwrap() == "", "library empty slice is present")
+check(text.slice("海🌙", -1, 1).isNone(), "library invalid slice is absent")
+check(processInfo.argumentAt(-1).isNone() && processInfo.argumentAt(processInfo.argumentCount()).isNone(), "argumentAt bounds")
+if processInfo.argumentCount() > 0 {
+    check(processInfo.argumentAt(0).isSome() && processInfo.argumentAt(0).unwrap() == "", "present empty process argument")
+    check(processInfo.argumentAt(1).unwrap() == "海🌙", "Unicode process argument")
+}
+print("Text niche values: passed")
