@@ -109,6 +109,7 @@ check check-portable: check-choice-runtime-profiles
 check-sanitize: check-choice-runtime-profiles-sanitize
 
 build/tooling/tests/choice-scalar-niche-check.ll: tests/choice-iteration-values.min tests/choice-iteration-values.expected tests/choice-iteration-values-reversed.min tests/choice-iteration-values-reversed.expected
+build/tooling/tests/choice-scalar-niche-check.ll: tests/choice-pattern-layout-values.min tests/choice-pattern-layout-values.expected tests/choice-pattern-layout-values-reversed.min tests/choice-pattern-layout-values-reversed.expected
 
 .PHONY: check-choice-scalar-niche check-choice-scalar-niche-sanitize
 check-choice-scalar-niche: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-scalar-niche-check
