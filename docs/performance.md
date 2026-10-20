@@ -260,7 +260,12 @@ on the frozen safelibs fixtures it halved zlib decode time (8.10 to 4.21 ms)
 and cut PNG by 27% (13.00 to 9.51 ms). Bytes and List
 helpers expose their nonnegative length and form checked element addresses
 within the backing allocation. These facts do not freeze storage or imply
-that two collections are disjoint. Resizing and other calls retain their
+that two collections are disjoint. A failed check calls the runtime, which
+reports the error and never returns, so the helper's slow path ends in
+`unreachable`. The reporting call then lies outside every loop, and LLVM can
+keep a collection's length and storage pointer in registers across
+iterations; on the frozen safelibs fixtures this cut JPEG decode from 32.59 to
+21.19 ms and PNG from 9.17 to 7.58 ms. Resizing and other calls retain their
 ordinary memory effects; invalid accesses still use the runtime diagnostic.
 
 `make check-bytes-access check-list-access` checks the raw helpers and optimized
