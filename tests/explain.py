@@ -248,7 +248,6 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         ("hex-decimal-point", "print(0xFF.5)\n", "E0104"),
         ("float-missing-exponent", "print(1.5e)\n", "E0104"),
         ("float-overflow", "print(1.0e999)\n", "E0104"),
-        ("bidi-comment", "print(1) // \u202e\n", "E0105"),
         ("and-left-type", "print(1 && true)\n", "E0406"),
         ("and-right-type", "print(true && 1)\n", "E0406"),
         ("or-left-type", "print(1 || false)\n", "E0406"),
@@ -273,6 +272,12 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         path = root / f"followup-{name}.min"
         path.write_text(source, encoding="utf-8")
         diagnostic(path, code, expected_source_lines=source.splitlines())
+
+    # The text excerpt escapes the rejected control, so only JSON keeps the raw line.
+    bidi = root / "followup-bidi-comment.min"
+    bidi.write_text("print(1) // \u202e\n", encoding="utf-8")
+    value = diagnostic(bidi, "E0105")
+    assert (value["line"], value["column"]) == (1, 13) and value["sourceLine"] == "print(1) // \u202e", value
 
     # Logical type failures use the offending operand's first token. Compound
     # operands retain the single-token presentation, on their first source line.
