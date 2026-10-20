@@ -112,6 +112,11 @@ check-osdev-assembly-qemu: build/minyarc build/minyar-runtime.o
 check-osdev-irq-qemu: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-irq.py
 
+# A recorded Arm64 run replays byte for byte, interrupt timing included.
+.PHONY: check-osdev-replay-qemu
+check-osdev-replay-qemu: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-replay.py
+
 # A real kernel failure prints a call chain that tools/osdev.py symbolizes.
 .PHONY: check-osdev-panic-qemu
 check-osdev-panic-qemu: build/minyarc

@@ -108,23 +108,42 @@ def qemu_command(args):
     name = "qemu-system-aarch64" if args.arch == "arm64" else "qemu-system-x86_64"
     local = args.root / "build/qemu/bin" / name
     executable = args.qemu or (str(local) if local.is_file() else name)
-    command = [executable, "-m", "1G", "-smp", "4", "-accel", "tcg", "-cpu", "max",
+    replay = getattr(args, "record", None) or getattr(args, "replay", None)
+    # Record/replay needs one deterministic instruction counter: one CPU,
+    # single-threaded TCG, a virtual clock, and every input passing through QEMU's
+    # replay log (disk via blkreplay, network via filter-replay, seeded entropy).
+    command = [executable, "-m", "1G", "-smp", "1" if replay else "4",
+               "-accel", "tcg,thread=single" if replay else "tcg", "-cpu", "max",
                "-display", args.display, "-serial", "stdio", "-monitor", "none",
                "-no-reboot", "-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
+    if replay:
+        mode = "record" if getattr(args, "record", None) else "replay"
+        log = str(Path(replay).resolve()).replace(",", ",,")
+        command += ["-icount", f"shift=auto,rr={mode},rrfile={log}", "-object", "filter-replay,id=replay,netdev=net0",
+                    "-seed", "1"]
     if args.rtc_base:
         command += ["-rtc", f"base={args.rtc_base},clock=vm"]
+    elif replay:
+        command += ["-rtc", "clock=vm"]
     # QEMU key/value options use doubled commas for literal path commas.
     image = str(output / "minyar-os.img").replace(",", ",,")
     if args.arch == "x86_64":
-        command += ["-vga", "std", "-drive", f"file={image},format=raw,if=ide,snapshot=on",
-                    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+        command += ["-vga", "std", "-drive", f"file={image},format=raw,if=ide,snapshot=on"]
+        command += ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
     else:
-        command += ["-M", "virt,gic-version=3", "-kernel", str(output / "kernel.elf"),
-                    "-device", "bochs-display", "-drive", f"if=none,id=disk,file={image},format=raw,snapshot=on",
-                    "-device", "virtio-blk-pci,drive=disk,disable-legacy=on",
+        command += ["-M", "virt,gic-version=3", "-kernel", str(output / "kernel.elf"), "-device", "bochs-display"]
+        if replay:
+            command += ["-drive", f"if=none,id=disk-direct,file={image},format=raw,snapshot=on",
+                        "-drive", "driver=blkreplay,if=none,image=disk-direct,id=disk"]
+        else:
+            command += ["-drive", f"if=none,id=disk,file={image},format=raw,snapshot=on"]
+        command += ["-device", "virtio-blk-pci,drive=disk,disable-legacy=on",
                     "-device", "virtio-keyboard-pci,disable-legacy=on",
-                    "-device", "virtio-tablet-pci,disable-legacy=on",
-                    "-device", "virtio-rng-pci,disable-legacy=on"]
+                    "-device", "virtio-tablet-pci,disable-legacy=on"]
+        if replay:
+            command += ["-object", "rng-builtin,id=entropy", "-device", "virtio-rng-pci,rng=entropy,disable-legacy=on"]
+        else:
+            command += ["-device", "virtio-rng-pci,disable-legacy=on"]
     if args.action == "debug":
         command += ["-S", "-gdb", f"tcp:127.0.0.1:{args.gdb_port}"]
     return command
@@ -195,6 +214,10 @@ def boot(args, command, log):
 def run(args):
     if args.action == "test" and (not args.expect or "\n" in args.expect or "\r" in args.expect):
         raise WorkflowError("test requires --expect with one nonempty exact serial line")
+    if (getattr(args, "record", None) or getattr(args, "replay", None)) and args.arch != "arm64":
+        # x86 boots through a polled ATA loader; under QEMU's blkreplay its reads
+        # time out, and without blkreplay a replay diverges.
+        raise WorkflowError("record/replay currently supports --arch arm64 only")
     if args.no_build and args.kernel_source:
         raise WorkflowError("--kernel-source requires a build; remove --no-build")
     if not (args.root / "os/Makefile").is_file():
@@ -438,6 +461,9 @@ def main(argv=None):
             part.add_argument("--qemu", help="QEMU executable (one path, not shell syntax)")
             part.add_argument("--display", default="none", help="QEMU display backend, e.g. cocoa or gtk; default none")
             part.add_argument("--rtc-base", type=rtc_datetime, help="initial QEMU calendar YYYY-MM-DDTHH:MM:SS, advancing on virtual time")
+            journal = part.add_mutually_exclusive_group()
+            journal.add_argument("--record", type=Path, help="record a deterministic replay log of this run (arm64, one CPU)")
+            journal.add_argument("--replay", type=Path, help="replay a recorded run exactly; with debug, GDB can step backwards")
             if action == "test":
                 part.add_argument("--expect", required=True, help="nonempty exact guest serial line required for success")
             if action == "debug":

@@ -211,6 +211,24 @@ rearms the timer and sends the EOI as before. For IDs 16 to 1019 it also calls t
 compiled `minyar_irq_dispatch`, after saving x5 to x30, ELR and SPSR. The same
 test boots the Arm64 kernel, whose handler uses `handles(arch.TIMER)`.
 
+### Recording and replaying a run
+
+On Arm64, `--record FILE` makes `run`, `test` or `debug` write a replay log. A
+later `--replay FILE` repeats that run exactly, instruction for instruction,
+including when each interrupt arrived:
+
+```sh
+python3 tools/osdev.py test --arch arm64 --expect 'OSDEV IRQ PASS' --record build/irq.replay
+python3 tools/osdev.py debug --arch arm64 --replay build/irq.replay
+```
+
+Replaying under `debug` lets a GDB with reverse execution step backwards from a
+failure. Recording uses one CPU, single-threaded TCG, a virtual clock, disk
+reads through QEMU's `blkreplay`, the network through `filter-replay`, and
+seeded entropy. x86-64 is refused for now: its boot loader polls the ATA disk,
+and under `blkreplay` those reads time out. `make check-osdev-replay-qemu`
+checks that a replay of the IRQ kernel reproduces its serial log byte for byte.
+
 ### Kernel failure call chains
 
 When kernel code stops, through `fail`, a failed check or a runtime range
