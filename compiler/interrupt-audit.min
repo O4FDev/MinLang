@@ -68,6 +68,7 @@ record InterruptAuditState {
     current: Integer
     site: Integer
     pending: Boolean
+    values: Boolean
 }
 
 // Fixed-width MMIO, x86 port I/O and fences are compiler-owned machine
@@ -497,6 +498,123 @@ function interruptAuditPending(audit: InterruptAuditState) {
     }
 }
 
+function interruptAuditValueGEP(audit: InterruptAuditState, cursor: List<Integer>) {
+    interruptAuditExpect(audit, cursor, "getelementptr")
+    if interruptAuditPeek(audit.tokens, cursor) == "inbounds" { cursor[0] = cursor[0] + 1 }
+    interruptAuditExpect(audit, cursor, "[")
+    interruptAuditExpect(audit, cursor, "256")
+    interruptAuditExpect(audit, cursor, "x")
+    interruptAuditExpect(audit, cursor, "i64")
+    interruptAuditExpect(audit, cursor, "]")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "ptr")
+    interruptAuditExpect(audit, cursor, "@.minyar.irq.values")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "i64")
+    interruptAuditExpect(audit, cursor, "0")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "i64")
+    if interruptAuditSmall(interruptAuditPeek(audit.tokens, cursor), 256) < 0 { interruptAuditReject(audit, "interrupt value slot must be a literal in 0..255") }
+    cursor[0] = cursor[0] + 1
+    interruptAuditEnd(audit, cursor)
+}
+
+// Ordinary code publishes with an i64 release store; anyone reads with an
+// acquire load. Nothing else may touch the compiler-private value table.
+function interruptAuditValueOperation(audit: InterruptAuditState, first: Integer, end: Integer, pointer: Text) {
+    let cursor: List<Integer> = [first, end]
+    let tokens = audit.tokens
+    if first + 1 < end && tokens[first + 1] == "=" {
+        cursor[0] = first + 2
+        interruptAuditExpect(audit, cursor, "load")
+        interruptAuditExpect(audit, cursor, "atomic")
+        interruptAuditExpect(audit, cursor, "i64")
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditExpect(audit, cursor, "ptr")
+        interruptAuditExpect(audit, cursor, pointer)
+        interruptAuditExpect(audit, cursor, "acquire")
+    } else {
+        interruptAuditExpect(audit, cursor, "store")
+        interruptAuditExpect(audit, cursor, "atomic")
+        interruptAuditExpect(audit, cursor, "i64")
+        cursor[0] = cursor[0] + 1
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditExpect(audit, cursor, "ptr")
+        interruptAuditExpect(audit, cursor, pointer)
+        interruptAuditExpect(audit, cursor, "release")
+    }
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "align")
+    interruptAuditExpect(audit, cursor, "8")
+    interruptAuditEnd(audit, cursor)
+}
+
+function interruptAuditValues(audit: InterruptAuditState) {
+    let tokens = audit.tokens
+    let declarations = 0
+    let pointers: List<Text> = []
+    let owners: List<Integer> = []
+    let starts: List<Integer> = []
+    let first = 0
+    while first < tokens.length {
+        let end = interruptAuditLineEnd(tokens, first)
+        let index = first
+        while index < end {
+            if interruptAuditIdentifier(tokens[index], '@') == ".minyar.irq.values" {
+                let definition = interruptAuditContaining(audit, index)
+                let cursor: List<Integer> = [first, end]
+                if definition < 0 {
+                    interruptAuditExpect(audit, cursor, "@.minyar.irq.values")
+                    interruptAuditExpect(audit, cursor, "=")
+                    let linkage = interruptAuditPeek(tokens, cursor)
+                    if linkage != "internal" && linkage != "private" { interruptAuditReject(audit, "interrupt value storage must be compiler private") }
+                    cursor[0] = cursor[0] + 1
+                    interruptAuditExpect(audit, cursor, "global")
+                    interruptAuditExpect(audit, cursor, "[")
+                    interruptAuditExpect(audit, cursor, "256")
+                    interruptAuditExpect(audit, cursor, "x")
+                    interruptAuditExpect(audit, cursor, "i64")
+                    interruptAuditExpect(audit, cursor, "]")
+                    interruptAuditExpect(audit, cursor, "zeroinitializer")
+                    interruptAuditExpect(audit, cursor, ",")
+                    interruptAuditExpect(audit, cursor, "align")
+                    interruptAuditExpect(audit, cursor, "8")
+                    interruptAuditEnd(audit, cursor)
+                    declarations = declarations + 1
+                } else {
+                    let pointer = interruptAuditPeek(tokens, cursor)
+                    if pointer.length < 2 || pointer[0] != '%' || pointer[1] == '"' { interruptAuditReject(audit, "interrupt value address must be a private SSA slot") }
+                    cursor[0] = cursor[0] + 1
+                    interruptAuditExpect(audit, cursor, "=")
+                    interruptAuditValueGEP(audit, cursor)
+                    pointers.add(pointer); owners.add(definition); starts.add(first)
+                }
+            }
+            index = index + 1
+        }
+        first = end + 1
+    }
+    if declarations > 1 || (pointers.length > 0 && declarations != 1) { interruptAuditReject(audit, "missing or duplicate private interrupt value storage") }
+    audit.values = declarations == 1
+    let pointer = 0
+    while pointer < pointers.length {
+        let definition = audit.definitions[owners[pointer]]
+        first = definition.body
+        while first < definition.after - 1 {
+            let end = interruptAuditLineEnd(tokens, first)
+            let used = false
+            let index = first
+            while index < end {
+                if interruptAuditIdentifier(tokens[index], '%') == interruptAuditIdentifier(pointers[pointer], '%') { used = true }
+                index = index + 1
+            }
+            if used && first != starts[pointer] { interruptAuditValueOperation(audit, first, end, pointers[pointer]) }
+            first = end + 1
+        }
+        pointer = pointer + 1
+    }
+}
+
 function interruptAuditRootUses(audit: InterruptAuditState) {
     let root = 0
     while root < audit.roots.length {
@@ -734,9 +852,22 @@ function interruptAuditInstruction(audit: InterruptAuditState, frame: InterruptA
             if pointerAt >= end { interruptAuditReject(audit, "malformed pending store") }
             let pointer = tokens[pointerAt]
             let slot = findText(frame.names, pointer)
+            if slot >= 0 && frame.widths[slot] == -3 { interruptAuditReject(audit, "an interrupt handler may read interrupt values but not set them") }
             if slot < 0 || frame.widths[slot] != -2 || !audit.pending { interruptAuditReject(audit, "atomic store is not a proved pending slot") }
             interruptAuditPendingOperation(audit, first, end, pointer, false)
             frame.uses.add(InterruptAuditUse { name: pointer, width: -2, block: frame.block, step: frame.step, predecessor: "" })
+            frame.code.add(interruptAuditRender(tokens, first, end, "", ""))
+            return
+        }
+        if opcode == "load" && interruptAuditPeek(tokens, cursor) == "atomic" {
+            let pointerAt = cursor[0] + 4
+            if assigned == "" || pointerAt >= end { interruptAuditReject(audit, "malformed interrupt value load") }
+            let pointer = tokens[pointerAt]
+            let slot = findText(frame.names, pointer)
+            if slot < 0 || frame.widths[slot] != -3 || !audit.values { interruptAuditReject(audit, "atomic load is not a proved interrupt value") }
+            interruptAuditValueOperation(audit, first, end, pointer)
+            frame.uses.add(InterruptAuditUse { name: pointer, width: -3, block: frame.block, step: frame.step, predecessor: "" })
+            interruptAuditDefine(audit, frame, assigned, 64, 0)
             frame.code.add(interruptAuditRender(tokens, first, end, "", ""))
             return
         }
@@ -754,10 +885,19 @@ function interruptAuditInstruction(audit: InterruptAuditState, frame: InterruptA
         interruptAuditAlign(audit, cursor, width)
     } else {
     if opcode == "getelementptr" {
-        if !audit.pending { interruptAuditReject(audit, "unproved pending storage") }
+        let element = cursor[0] + 3
+        if interruptAuditPeek(tokens, cursor) == "inbounds" { element = element + 1 }
         cursor[0] = cursor[0] - 1
-        interruptAuditGEP(audit, cursor)
-        width = -2; result = true
+        if element < end && tokens[element] == "i64" {
+            if !audit.values { interruptAuditReject(audit, "unproved interrupt value storage") }
+            interruptAuditValueGEP(audit, cursor)
+            width = -3
+        } else {
+            if !audit.pending { interruptAuditReject(audit, "unproved pending storage") }
+            interruptAuditGEP(audit, cursor)
+            width = -2
+        }
+        result = true
     } else {
     if opcode == "add" || opcode == "sub" || opcode == "mul" || opcode == "and" || opcode == "or" || opcode == "xor" || opcode == "shl" || opcode == "lshr" || opcode == "ashr" {
         width = interruptAuditType(audit, cursor)
@@ -1154,7 +1294,7 @@ function interruptAuditAndClone(context: CompilerContext, output: List<Text>, gl
     while index < context.functionNames.length { definitionOf.add(-1); owners.add(-1); parents.add(-1); index = index + 1 }
     // Pipeline has already appended/deduplicated globals. Do not append the
     // producer's globals list again and accidentally accept duplicate storage.
-    let audit = InterruptAuditState { context: context, tokens: interruptAuditTokens(joinText(output)), definitions: definitions, definitionOf: definitionOf, roots: roots, vectors: vectors, origins: origins, owners: owners, parents: parents, current: -1, site: -1, pending: false }
+    let audit = InterruptAuditState { context: context, tokens: interruptAuditTokens(joinText(output)), definitions: definitions, definitionOf: definitionOf, roots: roots, vectors: vectors, origins: origins, owners: owners, parents: parents, current: -1, site: -1, pending: false, values: false }
     let queue: List<Integer> = []
     index = 0
     while index < roots.length {
@@ -1172,6 +1312,7 @@ function interruptAuditAndClone(context: CompilerContext, output: List<Text>, gl
     interruptAuditIndex(audit, false)
     interruptAuditRootUses(audit)
     interruptAuditPending(audit)
+    interruptAuditValues(audit)
     let from: List<Integer> = []
     let targets: List<Integer> = []
     index = 0

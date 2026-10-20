@@ -1844,6 +1844,13 @@ interrupt function keyboard(vector: Integer) handles(33) {
 }
 ```
 
+A handler cannot read ordinary globals, so ordinary code shares the Integers it
+needs, such as a device's register base, through a second compiler-owned table:
+`setInterruptValue(slot, value)` publishes with release ordering (ordinary code
+only, before enabling the interrupt) and `interruptValue(slot)` reads with
+acquire ordering anywhere. Slots are literal or module-constant Integers in
+0..255; the table never allocates.
+
 `signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
 `takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.
 These operations use release/acquire ordering. A flag carries no event count,

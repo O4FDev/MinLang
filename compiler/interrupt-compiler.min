@@ -82,11 +82,17 @@ function collectInterruptBindings(context: CompilerContext, roots: List<Integer>
     }
 }
 
-function isInterruptSignalBuiltin(name: Text): Boolean { return name == "signalInterrupt" || name == "takeInterrupt" }
+function isInterruptSignalBuiltin(name: Text): Boolean {
+    return name == "signalInterrupt" || name == "takeInterrupt" || name == "setInterruptValue" || name == "interruptValue"
+}
 
 function interruptPendingDeclaration(): Text { return "@.minyar.irq.pending = internal global [256 x i8] zeroinitializer, align 1\n" }
 
-function parseInterruptSignalBuiltin(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+// Integers ordinary code shares with handlers, such as a device's register
+// base: written with release before the interrupt is enabled, read with acquire.
+function interruptValuesDeclaration(): Text { return "@.minyar.irq.values = internal global [256 x i64] zeroinitializer, align 8\n" }
+
+function parseInterruptSignalBuiltin(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let kinds = context.tokenKinds
     let texts = context.tokenTexts
     let lines = context.tokenLines
@@ -100,6 +106,28 @@ function parseInterruptSignalBuiltin(context: CompilerContext, localNames: List<
         failAtToken(lines, state[0], "interrupt signal slots require a module constant or literal, not a local value")
     }
     let slot = takeDeclarationInteger(context, state, "interrupt signal slots")
+    if name == "setInterruptValue" || name == "interruptValue" {
+        if slot < 0 || slot > 255 { failAtToken(lines, location, "interrupt value slots must be from 0 through 255") }
+        let values = interruptValuesDeclaration()
+        if findText(globals, values) < 0 { globals.add(values) }
+        let operand = ""
+        if name == "setInterruptValue" {
+            expectToken(kinds, texts, lines, state, ",")
+            let valueLocation = state[0]
+            let valueType: List<Integer> = [1]
+            operand = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+            if valueType[0] != 1 { failAtToken(lines, valueLocation, "setInterruptValue needs an Integer value") }
+        }
+        expectToken(kinds, texts, lines, state, ")")
+        let cell = emitInstruction(output, textState, state, "getelementptr [256 x i64], ptr @.minyar.irq.values, i64 0, i64 " + Text(slot))
+        if name == "setInterruptValue" {
+            setType(resultType, 5)
+            output.add("  store atomic i64 " + operand + ", ptr " + cell + " release, align 8\n")
+            return ""
+        }
+        setType(resultType, 1)
+        return emitInstruction(output, textState, state, "load atomic i64, ptr " + cell + " acquire, align 8")
+    }
     expectToken(kinds, texts, lines, state, ")")
     if slot < 0 || slot > 255 { failAtToken(lines, location, "interrupt signal slots must be from 0 through 255") }
     let declaration = interruptPendingDeclaration()
