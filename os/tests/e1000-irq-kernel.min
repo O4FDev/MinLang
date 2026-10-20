@@ -1,0 +1,78 @@
+// The e1000 receive interrupt, handled by a checked Minyar interrupt function.
+// Ordinary code shares the adapter's register base through an interrupt value,
+// unmasks the card's line and asks QEMU's network for 10.0.2.2's address. The
+// handler reads the interrupt cause register, which also acknowledges the
+// card, and signals ordinary code, which then receives the actual ARP reply.
+use "arch" as arch
+use "machine" as machine
+use "device" as device
+use "../shared/pci.min" as pci
+use "../kernel/net/e1000.min" as e1000
+
+constant REGISTERS = 0
+constant RECEIVED = 1
+// QEMU's PC firmware routes the e1000 in slot 3 to legacy line 11 (vector 43).
+constant LINE = 11
+constant INTERRUPT_CAUSE = 0x00C0
+constant INTERRUPT_MASK_SET = 0x00D0
+constant RECEIVE_TIMER = 0x80
+
+interrupt function networkInterrupt(vector: Integer) handles(43) {
+    let cause = machine.read32(wrappingAdd(interruptValue(REGISTERS), INTERRUPT_CAUSE))
+    if (cause & RECEIVE_TIMER) != 0 { signalInterrupt(RECEIVED) }
+}
+
+function arpRequest(mac: Bytes): Bytes {
+    let frame = Bytes(60)
+    for index in 0..6 { frame[index] = 255; frame[6 + index] = mac[index]; frame[22 + index] = mac[index] }
+    frame[12] = 0x08; frame[13] = 0x06
+    frame[14] = 0; frame[15] = 1; frame[16] = 0x08; frame[17] = 0; frame[18] = 6; frame[19] = 4
+    frame[20] = 0; frame[21] = 1
+    let sender = [10, 0, 2, 15]
+    let target = [10, 0, 2, 2]
+    for index in 0..4 { frame[28 + index] = sender[index]; frame[38 + index] = target[index] }
+    return frame
+}
+
+function isReplyFromGateway(frame: Bytes): Boolean {
+    return frame.length >= 42 && frame[12] == 0x08 && frame[13] == 0x06 && frame[20] == 0 && frame[21] == 2 &&
+        frame[28] == 10 && frame[29] == 0 && frame[30] == 2 && frame[31] == 2
+}
+
+function main(): Integer {
+    print("OSDEV E1000 IRQ START")
+    let devices = pci.scan()
+    let index = pci.find(devices, 0x8086, 0x100E)
+    if index < 0 { fail("no e1000 adapter") }
+    let line = pci.read32(devices[index], 0x3C) & 0xFF
+    if line != LINE { fail("the e1000 interrupt line is " + Text(line) + ", not " + Text(LINE)) }
+    let adapter = e1000.start(devices)
+    setInterruptValue(REGISTERS, device.base(adapter.registers))
+    let interrupts = arch.startInterrupts()
+    // Unmask line 11 on the secondary 8259 (its bit 3), keeping the others.
+    let secondaryData = device.port8(0xA1)
+    device.out8(secondaryData, device.in8(secondaryData) & ~8)
+    device.writeAt32(adapter.registers, INTERRUPT_MASK_SET, RECEIVE_TIMER)
+    if !e1000.send(adapter, arpRequest(adapter.mac)) { fail("could not send the ARP request") }
+    let waits = 0
+    let signalled = false
+    while !signalled && waits < 2000 {
+        machine.waitForInterrupt()
+        signalled = takeInterrupt(RECEIVED)
+        waits += 1
+    }
+    if !signalled { fail("the receive interrupt never reached ordinary code") }
+    let answered = false
+    let polls = 0
+    while !answered && polls < 64 {
+        let frame = e1000.receive(adapter)
+        if frame.length > 0 && isReplyFromGateway(frame) { answered = true }
+        polls += 1
+    }
+    machine.disableInterrupts()
+    if !answered { fail("no ARP reply arrived with the interrupt") }
+    if machine.interruptCount(43) < 1 { fail("the entry did not count the e1000 interrupt") }
+    print("e1000 receive interrupt after " + Text(waits) + " waits")
+    print("OSDEV E1000 IRQ PASS")
+    return 0
+}

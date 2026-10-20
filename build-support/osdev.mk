@@ -133,6 +133,11 @@ check-osdev-dma-virtio-qemu: build/minyarc
 	python3 tools/osdev.py test --arch arm64 --zero-entropy --kernel-source os/tests/dma-virtio-kernel.min --expect "OSDEV AFFINE VIRTIO RNG PASS" --timeout 60
 	python3 tools/osdev.py test --arch arm64 --zero-entropy --kernel-source os/tests/dma-ring-kernel.min --expect "OSDEV DMA RING PASS" --timeout 60
 
+.PHONY: check-osdev-e1000-irq-qemu
+# x86_64 only: QEMU's PC firmware routes the e1000 to legacy line 11.
+check-osdev-e1000-irq-qemu: build/minyarc
+	python3 tools/osdev.py test --arch x86_64 --kernel-source os/tests/e1000-irq-kernel.min --expect "OSDEV E1000 IRQ PASS" --timeout 60
+
 .PHONY: check-osdev-callback-qemu
 check-osdev-callback-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/callback-kernel.min --expect "OSDEV CALLBACK PASS" --timeout 30
