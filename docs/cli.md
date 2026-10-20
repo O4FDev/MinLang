@@ -58,6 +58,13 @@ entry file, and preserve existing `.gitignore` and smoke tests. A binary uses
 `src/main.min`; a library named `geometry` uses `src/geometry.min`. Package names
 start with a letter or underscore and contain letters, digits, `_` or `-`.
 
+Compiler errors show a source excerpt, a caret, a repair note, and an error
+code. `minyar explain E0401` explains a type mismatch with an example;
+`minyar explain --list` lists the available codes. These commands work in any
+directory, use the installed compiler's own catalogue, and need no network.
+Tools requesting `--error-format json` receive the same code in the `code`
+field and the same repair note in `help`.
+
 ## Manifest and dependencies
 
 `Minyar.toml` uses this deliberately small TOML subset:

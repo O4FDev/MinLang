@@ -819,7 +819,9 @@ accepts a leading UTF-8 byte-order mark and gives an exact line and column for
 unsupported non-ASCII identifier characters.
 
 Every golden includes its source filename, line, column, source excerpt and
-token underline. The renderer's CRLF, tab, control-character and help-note
+token underline, a repair note, and a `minyar explain` code. Recorded errors
+must have a specific family rather than the general E0001 fallback.
+The renderer's CRLF, tab, control-character and help-note
 contracts also run in `check-syntax-tree` at O0/O2. `check-bootstrap-native`
 checks the runtime-native bridge used by the compiler, including native Text,
 Boolean and Integer results, void calls and malformed native bodies.
@@ -831,12 +833,18 @@ gallery runs at O0/O2 with ownership assertions. Spelling distance has separate
 insertion, deletion, transposition, distance and tie oracles in the syntax probe.
 
 Each single-error golden also runs in JSON mode and must preserve its file,
-message, source, label and help. Version and schema fields, exclusive token
+code, message, source, label and help. Version and schema fields, exclusive token
 ranges, control escapes, Unicode filenames and incremental cache invalidation
 have separate checks. Multi-error goldens assert exact independent spans,
 20-error caps, else-chain recovery, failed-binding suppression, fields and
 shadowing. The bootstrap native suite repeats recovery at O0/O2 with ownership
 assertions and a native probe that enters a real stack ownership header.
+
+`make check-explain` checks all 35 published codes through the compiler and
+the public launcher from outside a project. It compiles the explanation
+examples, checks exact usage and unknown-code errors, and verifies code/help
+parity for independent rejection cases, including malformed numbers, choice
+payload counts, empty interpolation, and source-read failures.
 
 `make check-conformance` executes the feature-indexed programs under
 `tests/conformance/` at O0 and O2. Its README maps every section of the language

@@ -151,12 +151,22 @@ with no diagnostic output on success. Exit status remains 1 for rejected input.
 The standalone launcher and incremental module driver forward this option.
 
 Schema version 1 always includes `version` (1), `severity` ("error"),
-`message`, `file`, `line`, `column`, `endLine`, `endColumn`, `sourceLine`,
+`code` (such as "E0401"), `message`, `file`, `line`, `column`, `endLine`, `endColumn`, `sourceLine`,
 `label`, and `help` (an array of strings). Positions are 1-based Unicode scalar
 columns, with an exclusive end. An empty range marks end of input. `sourceLine`
-is the original line without its line ending; `label` and `help` may be empty.
+is the original line without its line ending; `label` may be empty.
 JSON preserves source characters and escapes control characters. Tools using
 UTF-16 positions can convert columns from `sourceLine`.
+
+`code` is an additive version-1 field. Consumers should accept unknown fields.
+Every compiler diagnostic has a repair note; a specific spelling suggestion
+takes precedence over the advice for its family. Human output ends with
+`= explain: minyar explain CODE`. The same compiler embeds the catalogue used
+by `minyar explain CODE` and `minyar explain --list`, so installed explanations
+match the toolchain without reading a project or downloading documentation.
+The catalogue maps legacy message families to stable codes; E0001 covers checks
+that do not yet have a dedicated family. All recorded error goldens require a
+specific code. New message families should receive a code and a tested example.
 
 Explicit compiler rejections share the central formatter. Legacy messages
 keep their original decoded locations. Within a checked body, an older caller

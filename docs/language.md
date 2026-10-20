@@ -1212,7 +1212,15 @@ error: the value for 'stars' does not match its declared type; expected Integer,
    |
  1 | let stars: Integer = "many"
    |     ^^^^^
+   = help: change this value to the expected type, or change the declaration if it should accept the found type
+   = explain: minyar explain E0401
 ```
+
+Each error includes a repair note and an error code. Run `minyar explain E0401`
+for a longer explanation with a valid example, or `minyar explain --list` to
+browse the error families. Explanations work outside a project and need no
+network access. Codes describe the problem rather than the particular name or
+type in the message, so they remain useful when the wording changes.
 
 When a spelling is close, the compiler suggests a name available at that point.
 This includes values, functions, record fields and methods, types, choice cases

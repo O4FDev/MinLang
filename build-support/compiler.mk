@@ -1,6 +1,7 @@
 COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/stages/source.min \
 	compiler/stages/syntax.min \
+	compiler/stages/diagnostic-catalog.min \
 	compiler/stages/diagnostics.min \
 	compiler/stages/suggestions.min \
 	compiler/stages/runtime-traces.min \
