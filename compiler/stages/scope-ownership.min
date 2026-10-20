@@ -122,8 +122,9 @@ function scopeSSAName(value: Text): Boolean {
     return true
 }
 
-// Text equality only reads its operands. A freshly projected plain pointer
-// used by that next call alone needs no temporary owner. Audit the raw i64
+// These runtime helpers preserve the projected operand's owning parent path.
+// Allocation may service dead work, but cannot consume that live owner. The
+// taking join only qualifies on its borrowed right operand. Audit the raw i64
 // too: another inttoptr could otherwise hide a later use of the same value.
 function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
     let names: List<Text> = []
@@ -141,9 +142,17 @@ function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
                 let raw = definition.slice(prefix.length, definition.length - 7)
                 let consumer = body.lines[index + 1]
                 let assignment = consumer.find(" = ")
-                let equality = false
+                let read = false
                 if assignment > 2 && scopeStarts(consumer, "  %") {
                     let call = " = call zeroext i1 @minyar_texts_are_equal("
+                    let taking = false
+                    let rhs = consumer.slice(assignment, consumer.length)
+                    if scopeStarts(rhs, " = call ptr @minyar_join_text(") { call = " = call ptr @minyar_join_text(" }
+                    if scopeStarts(rhs, " = call ptr @minyar_join_text_take_left(") {
+                        call = " = call ptr @minyar_join_text_take_left("
+                        taking = true
+                    }
+                    if scopeStarts(rhs, " = call i64 @minyar_text_find(") { call = " = call i64 @minyar_text_find(" }
                     if scopeSSAName(consumer.slice(2, assignment)) && scopeStarts(consumer.slice(assignment, consumer.length), call) && consumer[consumer.length - 1] == ')' {
                         // Literal Text operands contain a getelementptr
                         // constant expression with its own commas.
@@ -163,12 +172,15 @@ function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
                             cursor = cursor + 1
                         }
                         if supported && depth == 0 && separator > 0 && separator + 2 < arguments.length && arguments[separator + 1] == ' ' {
-                            equality = arguments.slice(0, separator) == "ptr " + value || arguments.slice(separator + 2, arguments.length) == "ptr " + value
+                            let left = arguments.slice(0, separator) == "ptr " + value
+                            let right = arguments.slice(separator + 2, arguments.length) == "ptr " + value
+                            read = left || right
+                            if taking { read = right && !left }
                         }
                     }
                 }
                 let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
-                if equality && scopeSSAName(raw) && projected {
+                if read && scopeSSAName(raw) && projected {
                     names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length))
                     kinds.add(1); kinds.add(1)
                     borrows.add(index)

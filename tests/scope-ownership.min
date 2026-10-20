@@ -37,11 +37,20 @@ function checkLowered(llvm: Text, name: Text) {
 }
 
 function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List<Text>): Text {
+    return buildRuntimeWithBudget(compiler, cycle, environment, 0)
+}
+
+function buildRuntimeWithBudget(compiler: test.Compiler, cycle: Boolean, environment: List<Text>, budget: Integer): Text {
     let engine = io.readTextFile("runtime/minyar_runtime.c")
     let name = "scope-eager"
     if cycle { engine = runtime.cycleSource(engine); name = "scope-cycle" }
     let source = "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + engine
-    source += "\n#include <assert.h>\n__attribute__((destructor)) static void check_scope_cleanup(void) {\n"
+    if budget > 0 {
+        name += "-k" + Text(budget)
+        source = "#define MINYAR_BOUNDED_RC 1\n#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET " + Text(budget) + "\n" + source
+    }
+    source += "\n#include <assert.h>\nstatic void scope_drain_bounded(void) {\n#ifdef MINYAR_BOUNDED_RC\n  size_t steps = 0;\n  while (rc_pending_count) {\n    minyar_rc_poll(MINYAR_RC_POLL_BUDGET);\n    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);\n    assert(++steps < 100000);\n  }\n#endif\n}\n"
+    source += "__attribute__((destructor)) static void check_scope_cleanup(void) {\n  scope_drain_bounded();\n"
     source += "  assert(rc_scopes == NULL);\n  assert(rc_frames == NULL);\n  assert(rc_pending_count == 0);\n"
     source += "  assert(rc_object_count == 0);\n  assert(rc_immortal_object_count == 0);\n  assert(rc_bytes == 0);\n}\n"
     source += program([
@@ -51,6 +60,7 @@ function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List
         "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
         "  MinyarRecord *ring = minyar_record_new_traced(512);",
         "  minyar_record_set_reference_traced(ring, 0, (long long)(uintptr_t)ring);",
+        "  minyar_record_set_reference_traced(ring, 1, minyar_record_get(box, 0));",
         "  rc_drop(ring);",
         "  assert(rc_cycle_pending);",
         "  scope_return_before = rc_cycle_units;",
@@ -73,6 +83,46 @@ function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List
         "long long minyar_runtime_scopeCompareProgress(_Bool value) {",
         "  assert(value);",
         "  return minyar_runtime_scopeBorrowProgress(NULL);",
+        "}",
+        "long long minyar_runtime_scopeJoinAllocation() {",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "  for (int taking = 0; taking < 2; taking++) {",
+        "    MinyarText *text = minyar_native_copy_text((const unsigned char *)\"seed\", 4);",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "    MinyarRecord *parent = minyar_record_new_traced(2);",
+        "    minyar_record_set_reference_traced(parent, 0, (long long)(uintptr_t)text);",
+        "    minyar_record_set_reference_traced(parent, 1, (long long)(uintptr_t)parent);",
+        "#else",
+        "    MinyarRecord *parent = minyar_record_new(1);",
+        "    minyar_record_set_reference(parent, 0, (long long)(uintptr_t)text);",
+        "#endif",
+        "    minyar_rc_release(text);",
+        "    void *owners[1] = { parent };",
+        "    MinyarRcScope scope;",
+        "    minyar_rc_scope_enter_v1(&scope, owners, 1);",
+        "    MinyarRecord *pending = minyar_record_new(512);",
+        "    minyar_record_set_reference(pending, 0, (long long)(uintptr_t)text);",
+        "    rc_drop(pending);",
+        "    assert(rc_pending_count > 0);",
+        "    text = (MinyarText *)(uintptr_t)minyar_record_get(parent, 0);",
+        "    if (taking) minyar_rc_retain(text); /* Transferred LEFT, no RIGHT retain. */",
+        "    MinyarText *joined = taking ? minyar_join_text_take_left(text, text) : minyar_join_text(text, text);",
+        "    assert(joined->byte_length == 8 && !memcmp(joined->bytes, \"seedseed\", 8));",
+        "    assert(text->byte_length == 4 && !memcmp(text->bytes, \"seed\", 4));",
+        "    assert((MinyarText *)(uintptr_t)minyar_record_get(parent, 0) == text);",
+        "    assert(rc_bounded_cursor > 0 && rc_bounded_cursor <= (size_t)(taking ? 3 : 2) * MINYAR_RC_POLL_BUDGET);",
+        "    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);",
+        "    minyar_rc_release(joined);",
+        "    owners[0] = NULL;",
+        "    minyar_rc_scope_release_v1(parent);",
+        "    minyar_rc_scope_leave_v1(&scope);",
+        "    scope_drain_bounded();",
+        "    assert(rc_object_count == 0 && rc_bytes == 0 && rc_pending_count == 0);",
+        "  }",
+        "#else",
+        "  assert(0);",
+        "#endif",
+        "  return 1;",
         "}"
     ])
     let path = compiler.directory + "/" + name
@@ -118,6 +168,7 @@ names.add("test_eager_launcher_selects_scope_owners")
 names.add("test_plain_borrows_share_local_and_return_owners")
 names.add("test_comparison_borrows_have_no_later_uses")
 names.add("test_comparison_borrow_ssa_boundaries")
+names.add("test_allocating_text_read_borrows_keep_parent_owners")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -735,9 +786,12 @@ if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") 
     // Execute the real lowering and symbol index on deliberately varied LLVM.
     // These patterns exercise lifetime forms the current emitter never emits.
     let patterns: List<Text> = []
-    let expectedCells = [0, 0, 1, 1, 1, 1, 1, 1, 0]
+    let expectedCells = [0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0]
     for index in 0..expectedCells.length {
-        let lines = ["define zeroext i1 @.minyar.fn.probe" + Text(index) + "(ptr %box, ptr %other) {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+        let resultType = "i1"
+        if index >= 9 { resultType = "ptr" }
+        if index == 14 { resultType = "i64" }
+        let lines = ["define " + resultType + " @.minyar.fn.probe" + Text(index) + "(ptr %box, ptr %other) {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
         if index == 8 { lines.add("  %value.10 = select i1 true, ptr %other, ptr %box") }
         let getter = "@minyar_record_get"
         if index == 1 { getter = "@.minyar.list.get.checked" }
@@ -747,7 +801,16 @@ if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") 
         if index == 7 { borrow = "borrow_traced" }
         lines.add("  call void @minyar_rc_" + borrow + "(ptr %value.1)")
         if index == 4 { lines.add("  call void @mutate(ptr %box)") }
-        if index == 6 { lines.add("  %equal = call zeroext i1 @other() ; = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %value.1)") }
+        if index >= 9 {
+            let helper = "ptr @minyar_join_text"
+            if index >= 11 && index <= 13 { helper = "ptr @minyar_join_text_take_left" }
+            if index == 14 { helper = "i64 @minyar_text_find" }
+            let left = "%other"
+            let right = "%value.1"
+            if index == 9 || index == 12 || index == 14 { left = "%value.1"; right = "%other" }
+            if index == 13 { left = "%value.1" }
+            lines.add("  %equal = call " + helper + "(ptr " + left + ", ptr " + right + ")")
+        } else if index == 6 { lines.add("  %equal = call zeroext i1 @other() ; = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %value.1)") }
         else {
             let other = "%other"
             if index == 1 { other = "%value.1" }
@@ -760,7 +823,7 @@ if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") 
         }
         if index == 5 { lines.add("  call void @observe(ptr %\"value.1\")") }
         if index == 8 { lines.add("  call void @observe(ptr %value.10)") }
-        for line in ["  call void @minyar_rc_leave()", "  ret i1 %equal", "}"] { lines.add(line) }
+        for line in ["  call void @minyar_rc_leave()", "  ret " + resultType + " %equal", "}"] { lines.add(line) }
         patterns.add(program(lines))
     }
     let wide = test.replace(patterns[0], "@.minyar.fn.probe0(", "@.minyar.fn.wide(")
@@ -789,6 +852,62 @@ if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") 
     }
     test.check(body(lowered, "wide") == body(wide, "wide"), "raw cell cap must preserve the complete original body")
     test.check(body(lowered, "looping") == body(looping, "looping"), "failed CFG proof after coalescing must preserve the complete original body")
+}
+
+if fixtures.selected("ScopeOwnership", "test_allocating_text_read_borrows_keep_parent_owners") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "function selected(box: Box): Text { return box.text }",
+        "function joinedLeft(box: Box): Text { return box.text + \"!\" }",
+        "function joinedRight(box: Box): Text { return \"[\" + box.text }",
+        "function joinedTake(box: Box): Text { return (\"prefix\" + \"!\") + box.text }",
+        "function aliasJoined(box: Box): Text { return selected(box) + box.text }",
+        "function searched(values: List<Text>): Integer { return values[0].find(\"l\") }",
+        "function replace(box: Box): Text { box.text = \"changed\"; return \"seed!\" }",
+        "function separated(box: Box): Text { return box.text + replace(box) }",
+        "let box = Box { text: \"seed\" + \"!\" }",
+        "print(joinedLeft(box))",
+        "print(joinedRight(box))",
+        "print(joinedTake(box))",
+        "print(aliasJoined(box))",
+        "print(box.text)",
+        "print(searched([\"h\" + \"éllo\"]))",
+        "print(separated(box))",
+        "print(box.text)"
+    ]), "seed!!\n[seed!\nprefix!seed!\nseed!seed!\nseed!\n2\nseed!seed!\nchanged\n", environment, ordinary, cycle)
+    for name in ["joinedLeft", "joinedRight", "joinedTake", "aliasJoined", "searched"] {
+        let emitted = body(llvm, name)
+        checkLowered(llvm, name)
+        test.check(test.contains(emitted, "%rc.scope.cells = alloca [0 x ptr]"), "single-use text helper operand must borrow its parent owner in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "single-use text helper operand must omit its redundant retain in " + name)
+    }
+    for name in ["joinedTake", "aliasJoined"] { test.check(test.contains(body(llvm, name), "call ptr @minyar_join_text_take_left("), "borrowed-right fixture must really consume its independent left result") }
+    test.check(test.contains(body(llvm, "separated"), "call void @minyar_rc_retain("), "mutating later join argument must preserve the earlier borrowed text")
+    executes(compiler, program([
+        "record Graph { text: Text; edges: List<Graph> }",
+        "function scopeArmBorrow(value: Graph): Graph { native \"runtime\" }",
+        "function scopeBorrowProgress(value: Text): Integer { native \"runtime\" }",
+        "function joined(value: Graph): Text { return value.text + \"!\" }",
+        "let graph = Graph { text: \"cycle\" + \"!\"; edges: [] }",
+        "graph.edges.add(graph)",
+        "print(scopeBorrowProgress(joined(scopeArmBorrow(graph))))",
+        "print(graph.text)"
+    ]), "1\ncycle!\n", environment, ordinary, cycle)
+    for budget in [1, 32] {
+        let boundedOrdinary = buildRuntimeWithBudget(compiler, false, environment, budget)
+        let boundedCycle = buildRuntimeWithBudget(compiler, true, environment, budget)
+        let source = "function scopeJoinAllocation(): Integer { native \"runtime\" }\nprint(scopeJoinAllocation())\n"
+        executes(compiler, source, "1\n", environment, boundedOrdinary, boundedCycle)
+        source = program([
+            "record Graph { edges: List<Graph> }",
+            "function scopeJoinAllocation(): Integer { native \"runtime\" }",
+            "function cycleType(value: Graph): Integer { return value.edges.length }",
+            "print(scopeJoinAllocation())"
+        ])
+        // The unused function selects the cycle engine without allocating an
+        // unrelated live language graph during the native cleanup assertion.
+        executes(compiler, source, "1\n", environment, boundedOrdinary, boundedCycle)
+    }
 }
 
 test.removeTree(compiler.directory)

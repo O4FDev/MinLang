@@ -227,6 +227,11 @@ pointer and its raw field value; another use, an intervening call or an
 unsupported local identifier keeps the owner. Traced borrows keep their
 barriers. Statement and return service points remain present.
 
+The same lifetime proof covers ordinary text joins and text search: their
+allocation and lazy index work preserve the argument's existing parent owner
+and invoke no user callbacks. A consuming text join qualifies only for its
+borrowed right operand; its left input still needs the transferred owner.
+
 A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
 release these roots before jumping back to their native recovery boundary;
 normal returns clear cells explicitly and unlink the header. Neither the header
