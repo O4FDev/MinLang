@@ -160,6 +160,36 @@ let three = dma.reclaim(third, 1)
 check(dma.load8(three, 0) == 19, "third generation payload")
 dma.dispose(three)
 '''),
+    Positive("model-ring-out-of-order", '''
+let ring = model.modelRing(3)
+let a = dma.allocate(8, 8)
+let b = dma.allocate(8, 8)
+let c = dma.allocate(8, 8)
+let pa = dma.submit(ring, a, 8)
+let pb = dma.submit(ring, b, 8)
+let pc = dma.submit(ring, c, 8)
+check(model.modelDeliverNewest(ring, Bytes("ccc")), "the newest request completes first")
+check(!dma.ready(pa), "an older request is still the device's")
+check(!dma.ready(pb), "the middle request is still the device's")
+let cc = dma.reclaim(pc, 0)
+check(dma.load8(cc, 0) == 99, "the newest payload")
+check(model.modelDeliver(ring, Bytes("aaa")), "then the oldest")
+let ca = dma.reclaim(pa, 0)
+check(dma.load8(ca, 0) == 97, "the oldest payload")
+let d = dma.allocate(8, 8)
+let pd = dma.submit(ring, d, 8)
+check(!dma.ready(pd), "a reused slot starts empty")
+check(model.modelDeliver(ring, Bytes("bbb")), "the middle request")
+let cb = dma.reclaim(pb, 0)
+check(dma.load8(cb, 0) == 98, "the middle payload")
+check(model.modelDeliver(ring, Bytes("ddd")), "the reused slot")
+let cd = dma.reclaim(pd, 0)
+check(dma.load8(cd, 0) == 100, "the reused-slot payload")
+dma.dispose(ca)
+dma.dispose(cb)
+dma.dispose(cc)
+dma.dispose(cd)
+'''),
     Positive("model-delivery-guards", '''
 let queue = model.modelQueue()
 let payload = Bytes(4)
@@ -1211,7 +1241,7 @@ def main():
             elif group == "control":
                 gate.control_group()
             elif group == "runtime":
-                for name in ("model-roundtrip", "model-zero-completion", "model-repeated-generations", "model-delivery-guards"):
+                for name in ("model-roundtrip", "model-zero-completion", "model-repeated-generations", "model-delivery-guards", "model-ring-out-of-order"):
                     if gate.selected(name):
                         gate.execute_language(name, group)
                 gate.c_group(False)

@@ -230,6 +230,16 @@ def matrix():
                        ("enable-interrupts", "machine.enableInterrupts()"), ("pause-spin", "machine.pause()")):
         cases.append(Case("device-" + name, "effect", device + root(call), False, ("native", "machine", "block"),
                           control=ordinary(device + root(call))))
+    # Ordinary code shares an Integer (a device's register base) with handlers.
+    shared = 'use "machine" as machine\nconstant BASE = 3\n'
+    cases.append(Case("interrupt-value-device-base", "positive", shared + root(
+        "let base = interruptValue(BASE); let status = machine.read32(base); if (status & 1) != 0 { signalInterrupt(0) }") +
+        "setInterruptValue(BASE, 268435456)\nlet seen = interruptValue(BASE)\n"))
+    cases.append(Case("interrupt-value-set-in-handler", "flags", root("setInterruptValue(1, vector)"), False,
+                      ("interrupt value", "read", "set")))
+    for slot in ("256", "-1", "vector"):
+        cases.append(Case("interrupt-value-slot-" + slot, "flags", root("let value = interruptValue(" + slot + ")"), False,
+                          ("constant", "slot", "range", "Integer")))
     # Exact plain-English reasons for representative real-bug classes.
     messages = {
         "sleep-helper": "sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep",
@@ -371,14 +381,29 @@ def direct_calls(words):
     return calls
 
 
+VALUES = ".minyar.irq.values"
+
+
 def flag_operations(words, strict=False):
     addresses, stores, takes, global_uses = {}, [], [], set()
+    values = {}
     for position, token in enumerate(words):
         if token != "getelementptr":
             continue
         cursor = position + 1
         if words[cursor:cursor + 1] == ["inbounds"]:
             cursor += 1
+        if (words[cursor:cursor + 7] == ["[", "256", "x", "i64", "]", ",", "ptr"] and cursor + 13 < len(words) and
+                words[cursor + 7].startswith("@") and identifier(words[cursor + 7]) == VALUES):
+            # The shared Integer table: static slot, SSA address.
+            if words[cursor + 8:cursor + 13] != [",", "i64", "0", ",", "i64"] or not re.fullmatch(r"[0-9]+", words[cursor + 13]) \
+                    or not 0 <= int(words[cursor + 13]) <= 255:
+                raise Failure("interrupt value address is not a static slot0..255")
+            if position < 2 or words[position - 1] != "=" or not words[position - 2].startswith("%"):
+                raise Failure("interrupt value address must be an SSA value")
+            values[identifier(words[position - 2])] = int(words[cursor + 13])
+            global_uses.add(cursor + 7)
+            continue
         expected = ["[", "256", "x", "i8", "]", ",", "ptr"]
         if words[cursor:cursor + 7] != expected or cursor + 13 >= len(words):
             if strict:
@@ -400,6 +425,19 @@ def flag_operations(words, strict=False):
         addresses[identifier(words[position - 2])] = int(literal)
         global_uses.add(global_position)
     for position, token in enumerate(words):
+        if token == "store" and words[position + 1:position + 3] == ["atomic", "i64"]:
+            if strict:
+                raise Failure("an IRQ graph sets an interrupt value")
+            pointer = words[position + 5] if position + 5 < len(words) else ""
+            if words[position + 4:position + 5] != ["ptr"] or identifier(pointer) not in values or \
+                    words[position + 6:position + 10] != ["release", ",", "align", "8"]:
+                raise Failure("interrupt value store is not an aligned release to a static slot")
+            continue
+        if token == "load" and words[position + 1:position + 2] == ["atomic"]:
+            if words[position + 2:position + 5] != ["i64", ",", "ptr"] or identifier(words[position + 5]) not in values or \
+                    words[position + 6:position + 10] != ["acquire", ",", "align", "8"]:
+                raise Failure("interrupt value load is not an aligned acquire from a static slot")
+            continue
         if token == "store" and words[position + 1:position + 2] == ["atomic"]:
             expected = ["store", "atomic", "i8", "1", ",", "ptr"]
             if words[position:position + 6] != expected or words[position + 7:position + 11] != ["release", ",", "align", "1"]:

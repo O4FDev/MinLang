@@ -1844,6 +1844,13 @@ interrupt function keyboard(vector: Integer) handles(33) {
 }
 ```
 
+A handler cannot read ordinary globals, so ordinary code shares the Integers it
+needs, such as a device's register base, through a second compiler-owned table:
+`setInterruptValue(slot, value)` publishes with release ordering (ordinary code
+only, before enabling the interrupt) and `interruptValue(slot)` reads with
+acquire ordering anywhere. Slots are literal or module-constant Integers in
+0..255; the table never allocates.
+
 `signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
 `takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.
 These operations use release/acquire ordering. A flag carries no event count,
@@ -1920,6 +1927,13 @@ or captured forms. Opaque handles have no automatic record equality or hashing.
 Loops, match, closures and recoverable control flow inside a function that
 holds these capabilities reject; build callbacks in a separate helper.
 Use this registry from one serialized boot CPU, outside interrupt context.
+
+`model.modelRing(slots)` gives a queue with up to 64 requests in flight, each
+with its own Pending; `modelDeliverNewest` completes them out of order. Each
+reclaim is checked against its own slot and generation, so a completion for one
+buffer never returns another to the CPU. The virtio bridge works the same way on real
+hardware: up to 64 buffers in flight, each descriptor's id checked against an
+outstanding request (`make check-osdev-dma-virtio-qemu`).
 
 These opaque handles allocate ordinary managed records. A separately rooted
 runtime registry owns backing storage and checks capability epochs. Readiness

@@ -6,7 +6,7 @@ nonblocking connects and fresh TCP sockets; hits run while misses wait. No
 serving-project source is modified. `cache.min` is the fixture-only index/hash
 LRU adapted from its read-only front_ev.min, without a Map dependency.
 
-The axum comparator uses axum 0.8.6 and Tokio 1.47.1 with a current-thread
+The axum comparator uses axum 0.8.9 and Tokio 1.54.0 with a current-thread
 runtime, fresh asynchronous upstream sockets, TCP_NODELAY on both directions,
 the same 5 s upstream deadline and 4 MiB body/16 KiB header bounds. Cargo.lock
 pins transitive crates. It uses a hash index and linked LRU entries, preserving

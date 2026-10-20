@@ -11,7 +11,7 @@ enum {
     MINYAR_DMA_COMPLETED, MINYAR_DMA_RETIRED
 };
 enum { MINYAR_DMA_MODEL = 1, MINYAR_DMA_VIRTIO = 2 };
-enum { MINYAR_DMA_MAX_SPINS = 1000000 };
+enum { MINYAR_DMA_MAX_SPINS = 1000000, MINYAR_DMA_MAX_SLOTS = 64 };
 
 typedef struct MinyarDmaQueue MinyarDmaQueue;
 typedef struct MinyarDmaAllocation {
@@ -23,6 +23,7 @@ typedef struct MinyarDmaAllocation {
     size_t capacity, accessible, submitted, completed;
     MinyarDmaQueue *queue;
     uint64_t generation;
+    unsigned slot;
 } MinyarDmaAllocation;
 
 typedef struct {
@@ -33,12 +34,14 @@ typedef struct {
 struct MinyarDmaQueue {
     MinyarDmaQueue *next;
     uint64_t id, incarnation, epoch, device, generation;
-    unsigned kind, failed, used_once;
-    MinyarDmaAllocation *active;
-    MinyarDmaCompletion completion;
+    unsigned kind, failed, slot_count;
+    /* One outstanding request per slot; each slot has its own completion. */
+    MinyarDmaAllocation *active[MINYAR_DMA_MAX_SLOTS];
+    MinyarDmaCompletion completion[MINYAR_DMA_MAX_SLOTS];
     MinyarRecord *ring_owner;
     uintptr_t descriptors, available, used, notify;
-    uint16_t size, index, used_start;
+    /* Virtio: available entries published and used entries consumed so far. */
+    uint16_t size, index, offered, used_seen;
 };
 
 static MinyarDmaAllocation *minyar_dma_allocations;
@@ -223,6 +226,7 @@ static MinyarDmaQueue *minyar_dma_new_queue(unsigned kind) {
     queue->device = id;
     queue->incarnation = queue->epoch = 1;
     queue->kind = kind;
+    queue->slot_count = 1;
     queue->next = minyar_dma_queues;
     minyar_dma_queues = queue;
     return queue;
@@ -230,6 +234,15 @@ static MinyarDmaQueue *minyar_dma_new_queue(unsigned kind) {
 
 MinyarRecord *minyar_dma_model_modelQueue(void) {
     MinyarDmaQueue *queue = minyar_dma_new_queue(MINYAR_DMA_MODEL);
+    return minyar_dma_handle(queue->id, queue->incarnation, queue->epoch);
+}
+
+/* A model ring: up to `slots` requests in flight at once, completed in any order. */
+MinyarRecord *minyar_dma_model_modelRing(long long slots) {
+    if (slots < 1 || slots > MINYAR_DMA_MAX_SLOTS)
+        minyar_stop("DMA model ring needs 1 to 64 slots.");
+    MinyarDmaQueue *queue = minyar_dma_new_queue(MINYAR_DMA_MODEL);
+    queue->slot_count = (unsigned)slots;
     return minyar_dma_handle(queue->id, queue->incarnation, queue->epoch);
 }
 
@@ -294,6 +307,7 @@ MinyarRecord *minyar_dma_unsafeVirtioQueue(MinyarRecord *owner, long long descri
     queue->descriptors = descriptors; queue->available = available;
     queue->used = used; queue->notify = notify;
     queue->size = (uint16_t)queue_size; queue->index = (uint16_t)queue_index;
+    queue->slot_count = queue_size < MINYAR_DMA_MAX_SLOTS ? (unsigned)queue_size : MINYAR_DMA_MAX_SLOTS;
     return minyar_dma_handle(queue->id, queue->incarnation, queue->epoch);
 #else
     (void)owner; (void)descriptor_cpu; (void)available_cpu; (void)used_cpu; (void)notify_cpu;
@@ -306,14 +320,16 @@ MinyarRecord *minyar_dma_submit(const MinyarRecord *queue_handle, const MinyarRe
                                long long length) {
     MinyarDmaQueue *queue = minyar_dma_queue(queue_handle);
     MinyarDmaAllocation *entry = minyar_dma_allocation(cpu, 1u << MINYAR_DMA_CPU);
-    if (queue->failed || queue->active || (queue->kind == MINYAR_DMA_VIRTIO && queue->used_once))
-        minyar_stop("DMA queue is busy, quarantined, or its one-shot slot was already used.");
+    unsigned slot = queue->slot_count;
+    for (unsigned index = 0; index < queue->slot_count; index++)
+        if (!queue->active[index]) { slot = index; break; }
+    if (queue->failed || slot == queue->slot_count)
+        minyar_stop("DMA queue is busy or quarantined.");
     if (length <= 0 || (uint64_t)length > entry->capacity || (uint64_t)length > UINT32_MAX)
         minyar_stop("DMA submitted length exceeds its fresh allocation capacity.");
     if (queue->kind == MINYAR_DMA_VIRTIO &&
-        (*(volatile uint16_t *)(queue->available + 2) != 0 ||
-         *(volatile uint16_t *)(queue->used + 2) != 0))
-        minyar_stop("DMA virtio slot is not in its fresh queue epoch.");
+        *(volatile uint16_t *)(queue->available + 2) != queue->offered)
+        minyar_stop("DMA virtio available ring was changed outside the checked bridge.");
     uint64_t epoch = minyar_dma_transition_epoch(entry);
     uint64_t generation = minyar_dma_next(queue->generation);
     /* All allocations precede publication; a failed handle allocation cannot
@@ -326,19 +342,22 @@ MinyarRecord *minyar_dma_submit(const MinyarRecord *queue_handle, const MinyarRe
     entry->completed = 0;
     entry->queue = queue;
     entry->generation = queue->generation = generation;
-    queue->active = entry;
-    queue->completion.sequence = 0;
+    entry->slot = slot;
+    queue->active[slot] = entry;
+    queue->completion[slot].sequence = 0;
     if (queue->kind == MINYAR_DMA_VIRTIO) {
-        queue->used_once = 1;
+        /* Descriptor `slot` names this buffer; its id comes back in the used ring. */
+        uintptr_t descriptor = queue->descriptors + (uintptr_t)slot * 16;
         entry->hardware_pinned = 1;
-        *(volatile uint64_t *)(queue->descriptors) = (uint64_t)(uintptr_t)entry->base;
-        *(volatile uint32_t *)(queue->descriptors + 8) = (uint32_t)length;
-        *(volatile uint16_t *)(queue->descriptors + 12) = 2; /* device WRITE, no chain */
-        *(volatile uint16_t *)(queue->descriptors + 14) = 0;
+        *(volatile uint64_t *)(descriptor) = (uint64_t)(uintptr_t)entry->base;
+        *(volatile uint32_t *)(descriptor + 8) = (uint32_t)length;
+        *(volatile uint16_t *)(descriptor + 12) = 2; /* device WRITE, no chain */
+        *(volatile uint16_t *)(descriptor + 14) = 0;
         *(volatile uint16_t *)(queue->available) = 1; /* polling: NO_INTERRUPT */
-        *(volatile uint16_t *)(queue->available + 4) = 0; /* sole fresh head */
+        *(volatile uint16_t *)(queue->available + 4 + (size_t)(queue->offered % queue->size) * 2) = (uint16_t)slot;
         minyar_dma_fence();
-        *(volatile uint16_t *)(queue->available + 2) = 1;
+        queue->offered = (uint16_t)(queue->offered + 1);
+        *(volatile uint16_t *)(queue->available + 2) = queue->offered;
         minyar_dma_fence();
         *(volatile uint16_t *)(queue->notify) = queue->index;
     } else if (queue->kind == MINYAR_DMA_MODEL) {
@@ -349,44 +368,74 @@ MinyarRecord *minyar_dma_submit(const MinyarRecord *queue_handle, const MinyarRe
     return pending;
 }
 
-_Bool minyar_dma_model_modelDeliver(const MinyarRecord *queue_handle, const MinyarBytes *data) {
+/* The oldest (or newest) request the model has not completed yet. */
+static MinyarDmaAllocation *minyar_dma_model_waiting(MinyarDmaQueue *queue, int newest) {
+    MinyarDmaAllocation *chosen = NULL;
+    for (unsigned slot = 0; slot < queue->slot_count; slot++) {
+        MinyarDmaAllocation *entry = queue->active[slot];
+        if (!entry || entry->state != MINYAR_DMA_PENDING || queue->completion[slot].sequence) continue;
+        if (!chosen || (newest ? entry->generation > chosen->generation : entry->generation < chosen->generation))
+            chosen = entry;
+    }
+    return chosen;
+}
+
+static _Bool minyar_dma_model_complete(const MinyarRecord *queue_handle, const MinyarBytes *data, int newest) {
     MinyarDmaQueue *queue = minyar_dma_queue(queue_handle);
     if (queue->kind != MINYAR_DMA_MODEL)
         minyar_stop("DMA model delivery cannot operate a hardware queue.");
-    MinyarDmaAllocation *entry = queue->active;
     if (!data || data->byte_length < 0) minyar_stop("DMA model needs valid Bytes.");
-    if (queue->failed || !entry || entry->state != MINYAR_DMA_PENDING ||
-        queue->completion.sequence != 0 || (uint64_t)data->byte_length > entry->submitted)
+    MinyarDmaAllocation *entry = queue->failed ? NULL : minyar_dma_model_waiting(queue, newest);
+    if (!entry || (uint64_t)data->byte_length > entry->submitted)
         return 0;
-    if (entry->queue != queue || entry->generation != queue->generation)
+    if (entry->queue != queue || entry->slot >= queue->slot_count || queue->active[entry->slot] != entry)
         minyar_dma_bad_completion(entry, "DMA model outstanding request identity is invalid.");
+    MinyarDmaCompletion *completion = &queue->completion[entry->slot];
     if (data->byte_length) memcpy(entry->base, data->bytes, (size_t)data->byte_length);
-    queue->completion.device = queue->device;
-    queue->completion.queue = queue->id;
-    queue->completion.slot = 0;
-    queue->completion.generation = entry->generation;
-    queue->completion.length = (uint64_t)data->byte_length;
-    queue->completion.queue_epoch = queue->epoch;
+    completion->device = queue->device;
+    completion->queue = queue->id;
+    completion->slot = entry->slot;
+    completion->generation = entry->generation;
+    completion->length = (uint64_t)data->byte_length;
+    completion->queue_epoch = queue->epoch;
     minyar_dma_fence();
-    queue->completion.sequence = entry->generation;
+    completion->sequence = entry->generation;
     return 1;
+}
+
+_Bool minyar_dma_model_modelDeliver(const MinyarRecord *queue_handle, const MinyarBytes *data) {
+    return minyar_dma_model_complete(queue_handle, data, 0);
+}
+
+_Bool minyar_dma_model_modelDeliverNewest(const MinyarRecord *queue_handle, const MinyarBytes *data) {
+    return minyar_dma_model_complete(queue_handle, data, 1);
 }
 
 void minyar_dma_model_modelCorrupt(const MinyarRecord *queue_handle, long long kind, long long value) {
     MinyarDmaQueue *queue = minyar_dma_queue(queue_handle);
     if (queue->kind != MINYAR_DMA_MODEL)
         minyar_stop("DMA model faults cannot operate a hardware queue.");
-    if (!queue->active || queue->active->state != MINYAR_DMA_PENDING ||
-        !queue->completion.sequence || queue->failed)
+    /* The most recently delivered request that has not been acquired yet. */
+    MinyarDmaCompletion *completion = NULL;
+    uint64_t latest = 0;
+    for (unsigned slot = 0; slot < queue->slot_count; slot++) {
+        MinyarDmaAllocation *entry = queue->active[slot];
+        if (entry && entry->state == MINYAR_DMA_PENDING && queue->completion[slot].sequence &&
+            entry->generation > latest) {
+            latest = entry->generation;
+            completion = &queue->completion[slot];
+        }
+    }
+    if (!completion || queue->failed)
         minyar_stop("DMA model faults require delivery before completion acquisition.");
     uint64_t bits = (uint64_t)value;
-    if (kind == 0) queue->completion.device = bits;
-    else if (kind == 1) queue->completion.queue = bits;
-    else if (kind == 2) queue->completion.slot = bits;
-    else if (kind == 3) queue->completion.generation = bits;
-    else if (kind == 4) queue->completion.length = bits;
-    else if (kind == 5) queue->completion.queue_epoch = bits;
-    else if (kind == 6) queue->completion.sequence = bits;
+    if (kind == 0) completion->device = bits;
+    else if (kind == 1) completion->queue = bits;
+    else if (kind == 2) completion->slot = bits;
+    else if (kind == 3) completion->generation = bits;
+    else if (kind == 4) completion->length = bits;
+    else if (kind == 5) completion->queue_epoch = bits;
+    else if (kind == 6) completion->sequence = bits;
     else minyar_stop("DMA model fault kind is outside 0..6.");
     minyar_dma_fence();
 }
@@ -395,35 +444,47 @@ _Bool minyar_dma_ready(const MinyarRecord *pending) {
     MinyarDmaAllocation *entry = minyar_dma_allocation(pending,
         (1u << MINYAR_DMA_PENDING) | (1u << MINYAR_DMA_COMPLETED));
     MinyarDmaQueue *queue = entry->queue;
-    if (!queue || queue->failed || queue->active != entry || entry->generation != queue->generation)
+    if (!queue || queue->failed || entry->slot >= queue->slot_count || queue->active[entry->slot] != entry ||
+        !entry->generation || entry->generation > queue->generation)
         minyar_dma_bad_completion(entry, "DMA pending request has no matching outstanding queue slot.");
     if (entry->state == MINYAR_DMA_COMPLETED) return 1; /* private acquired witness */
-    uint64_t length;
-    if (queue->kind == MINYAR_DMA_MODEL) {
-        uint64_t sequence = queue->completion.sequence;
-        if (!sequence) return 0;
-        minyar_dma_fence();
-        if (sequence != entry->generation || queue->completion.device != queue->device ||
-            queue->completion.queue != queue->id || queue->completion.slot != 0 ||
-            queue->completion.generation != entry->generation ||
-            queue->completion.queue_epoch != queue->epoch)
-            minyar_dma_bad_completion(entry, "DMA completion device/queue/slot/generation witness is invalid.");
-        length = queue->completion.length;
-    } else if (queue->kind == MINYAR_DMA_VIRTIO) {
+    if (queue->kind == MINYAR_DMA_VIRTIO) {
+        /* Drain new used entries into per-slot completions. An entry for a slot
+         * with nothing outstanding, or completed twice, quarantines the queue. */
         uint16_t index = *(volatile uint16_t *)(queue->used + 2);
-        uint16_t delta = (uint16_t)(index - queue->used_start);
-        if (!delta) return 0;
-        if (delta != 1)
-            minyar_dma_bad_completion(entry, "DMA virtio used-index delta exceeds its one outstanding request.");
-        minyar_dma_fence();
-        if (*(volatile uint32_t *)(queue->used + 4) != 0)
-            minyar_dma_bad_completion(entry, "DMA virtio completed a different descriptor head.");
-        length = *(volatile uint32_t *)(queue->used + 8);
-        /* Wire format has no generation cookie. This sole slot is never reused;
-         * queue/slot/generation association relies on the fresh compliant device. */
-    } else {
+        if ((uint16_t)(index - queue->used_seen) > (uint16_t)queue->slot_count)
+            minyar_dma_bad_completion(entry, "DMA virtio used index ran past the requests in flight.");
+        while (queue->used_seen != index) {
+            minyar_dma_fence();
+            uintptr_t at = queue->used + 4 + (uintptr_t)(queue->used_seen % queue->size) * 8;
+            uint32_t id = *(volatile uint32_t *)(at);
+            uint32_t written = *(volatile uint32_t *)(at + 4);
+            MinyarDmaAllocation *owner = id < queue->slot_count ? queue->active[id] : NULL;
+            if (!owner || owner->state != MINYAR_DMA_PENDING || queue->completion[id].sequence)
+                minyar_dma_bad_completion(entry, "DMA virtio completed a descriptor with no outstanding request.");
+            MinyarDmaCompletion *completion = &queue->completion[id];
+            completion->device = queue->device;
+            completion->queue = queue->id;
+            completion->slot = id;
+            completion->generation = owner->generation;
+            completion->length = written;
+            completion->queue_epoch = queue->epoch;
+            completion->sequence = owner->generation;
+            queue->used_seen = (uint16_t)(queue->used_seen + 1);
+        }
+    } else if (queue->kind != MINYAR_DMA_MODEL) {
         minyar_dma_bad_completion(entry, "DMA completion backend is unknown.");
     }
+    MinyarDmaCompletion *completion = &queue->completion[entry->slot];
+    uint64_t sequence = completion->sequence;
+    if (!sequence) return 0;
+    minyar_dma_fence();
+    if (sequence != entry->generation || completion->device != queue->device ||
+        completion->queue != queue->id || completion->slot != entry->slot ||
+        completion->generation != entry->generation ||
+        completion->queue_epoch != queue->epoch)
+        minyar_dma_bad_completion(entry, "DMA completion device/queue/slot/generation witness is invalid.");
+    uint64_t length = completion->length;
     if (length > entry->submitted || length > entry->capacity)
         minyar_dma_bad_completion(entry, "DMA completion length exceeds the submitted capacity.");
     /* Coherent profile only. This orders payload access; it is not cache sync. */
@@ -452,7 +513,7 @@ MinyarRecord *minyar_dma_reclaim(const MinyarRecord *pending, long long max_spin
     entry->capability_epoch = epoch;
     entry->state = MINYAR_DMA_CPU;
     entry->accessible = entry->completed;
-    entry->queue->active = NULL;
+    entry->queue->active[entry->slot] = NULL;
     entry->queue = NULL;
     return cpu;
 }
