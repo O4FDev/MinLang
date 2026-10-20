@@ -14,6 +14,17 @@ function debugTypeText(value: Text): Text {
     return joinText(pieces)
 }
 
+// Descriptor keys name types structurally. Raw compiler IDs depend on symbol
+// numbering, which differs between clean and cached module compilations, so
+// they would make otherwise identical LLVM text differ.
+function debugTypeKey(context: CompilerContext, type: Integer): Text {
+    if isListType(type) { return "List(" + debugTypeKey(context, listElementType(type)) + ")" }
+    if isSetType(type) { return "Set(" + debugTypeKey(context, setElementType(type)) + ")" }
+    if isMapType(type) { return "Map(" + debugTypeKey(context, mapKeyType(type)) + "," + debugTypeKey(context, mapValueType(type)) + ")" }
+    if isRecordType(type) { return "Record(" + debugTypeText(context.functionNames[recordTypeIndex(type)]) + ")" }
+    return Text(type)
+}
+
 function debugTypeQueue(context: CompilerContext, types: List<Integer>, type: Integer) {
     let index = 0
     while index < context.debugTypes.length {
@@ -29,12 +40,12 @@ function debugTypeQueue(context: CompilerContext, types: List<Integer>, type: In
 }
 
 // Schema:
-// type: id|kind|escaped source name|object bits|kind-specific fields
-// basic fields: DW_ATE encoding; list: child ID; map: key ID|value ID|slots;
+// type: key|kind|escaped source name|object bits|kind-specific fields
+// basic fields: DW_ATE encoding; list: child key; map: key key|value key|slots;
 // record: slot count; enum: none (its cases follow). Text/Bytes describe their
 // common 32-byte prefix.
-// field: owner ID|child ID|escaped raw field name|bit offset
-// case: owner ID|zero-based tag|escaped case name
+// field: owner key|child key|escaped raw field name|bit offset
+// case: owner key|zero-based tag|escaped case name
 // opaque: zero object bits, followed by the reason the layout is unavailable.
 // All non-basic, non-enum types are pointer values. Object bits never include RcObject.
 // managed-v1 describes ordinary inline record/map storage. An arena link driver
@@ -50,7 +61,7 @@ function emitDebugType(context: CompilerContext, output: List<Text>, type: Integ
         position = position + 1
         context.debugTypes.add(current)
         let name = debugTypeText(diagnosticType(context, current))
-        let head = "; minyar-debug-type: " + Text(current) + "|"
+        let head = "; minyar-debug-type: " + debugTypeKey(context, current) + "|"
         if current == 1 || current == 3 || current == 4 || current == 7 {
             let bits = 64
             let encoding = "DW_ATE_signed"
@@ -64,7 +75,7 @@ function emitDebugType(context: CompilerContext, output: List<Text>, type: Integ
             output.add(head + "bytes|" + name + "|256\n")
         } else if isListType(current) {
             let child = listElementType(current)
-            output.add(head + "list|" + name + "|192|" + Text(child) + "\n")
+            output.add(head + "list|" + name + "|192|" + debugTypeKey(context, child) + "\n")
             debugTypeQueue(context, types, child)
         } else if isMapType(current) || isSetType(current) {
             let key = 1
@@ -72,7 +83,7 @@ function emitDebugType(context: CompilerContext, output: List<Text>, type: Integ
             if isSetType(current) { key = setElementType(current) } else { key = mapKeyType(current); value = mapValueType(current) }
             let slots = 6
             if isRecordType(key) { slots = 9 }
-            output.add(head + "map|" + name + "|" + Text(64 + slots * 64) + "|" + Text(key) + "|" + Text(value) + "|" + Text(slots) + "\n")
+            output.add(head + "map|" + name + "|" + Text(64 + slots * 64) + "|" + debugTypeKey(context, key) + "|" + debugTypeKey(context, value) + "|" + Text(slots) + "\n")
             debugTypeQueue(context, types, key)
             debugTypeQueue(context, types, value)
         } else if isRecordType(current) {
@@ -85,7 +96,7 @@ function emitDebugType(context: CompilerContext, output: List<Text>, type: Integ
                 let cases = choiceCases(context, current)
                 let variant = 1
                 while variant < cases.length {
-                    output.add("; minyar-debug-case: " + Text(current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
+                    output.add("; minyar-debug-case: " + debugTypeKey(context, current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
                     variant = variant + 1
                 }
             } else if layout == 3 || layout == 4 {
@@ -115,14 +126,14 @@ function emitDebugType(context: CompilerContext, output: List<Text>, type: Integ
                         let fieldName = declaredFieldName(context.functionParameterNames[first + field])
                         let slot = field
                         if layout == 2 { slot = choiceStorageField(context, current, field) }
-                        output.add("; minyar-debug-field: " + Text(current) + "|" + Text(child) + "|" + debugTypeText(fieldName) + "|" + Text(64 + slot * 64) + "\n")
+                        output.add("; minyar-debug-field: " + debugTypeKey(context, current) + "|" + debugTypeKey(context, child) + "|" + debugTypeText(fieldName) + "|" + Text(64 + slot * 64) + "\n")
                         debugTypeQueue(context, types, child)
                         field = field + 1
                     }
                     let cases = choiceCases(context, current)
                     let variant = 1
                     while variant < cases.length {
-                        output.add("; minyar-debug-case: " + Text(current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
+                        output.add("; minyar-debug-case: " + debugTypeKey(context, current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
                         variant = variant + 1
                     }
                 }
@@ -145,7 +156,7 @@ function emitDebugScalarBinding(context: CompilerContext, output: List<Text>, po
     let record = type - 1000
     let count = context.functionParameterCounts[record]
     let first = functionParameterOffset(context.functionParameterCounts, record)
-    output.add("; minyar-debug-local: aggregate|i64 " + Text(count) + "|ptr|" + debugTypeText(diagnosticType(context, type)) + "|" + debugTypeText(name) + "|0|" + Text(type) + "\n")
+    output.add("; minyar-debug-local: aggregate|i64 " + Text(count) + "|ptr|" + debugTypeText(diagnosticType(context, type)) + "|" + debugTypeText(name) + "|0|" + debugTypeKey(context, type) + "\n")
     let field = 0
     while field < count {
         let child = context.functionParameterTypes[first + field]
