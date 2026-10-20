@@ -1,6 +1,6 @@
 # 11. Saving a garden note
 
-[Previous](10-errors.md) · [Contents](README.md)
+[Previous](10-errors.md) · [Contents](README.md) · [Next](12-arguments.md)
 
 A program can keep a note in a file and read it back later. Writing or reading
 can fail, so both operations return a `Result`, like the functions in

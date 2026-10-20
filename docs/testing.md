@@ -69,7 +69,11 @@ its complete book source. Chapter 10's four rejected sources and four repairs
 also pass through public check/run with exact diagnostics and output, followed
 by the documented explanation command. The file chapter checks actual saved
 bytes, handled bounded-read failure, nonempty-to-empty replacement and fresh
-release creation at the project root. Both targets belong to `check-portable`.
+release creation at the project root. Chapter 12 keeps one source unchanged
+while checking six argument vectors through public run and direct release:
+absent, spaced, empty, flag-shaped, extra arguments and a second separator.
+Each requires exact output, zero status and empty stderr, preserving literal
+empty arguments. Both targets belong to `check-portable`.
 
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including

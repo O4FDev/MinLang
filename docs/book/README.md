@@ -2,8 +2,8 @@
 
 A program is a set of instructions you can save, change and run again. This
 short book starts with one instruction and builds a community garden planner.
-Then we split it into files, repair mistakes and save data. You need no
-programming vocabulary before you begin.
+Then we split it into files, repair mistakes, save data and supply input
+without editing the source. You need no programming vocabulary before you begin.
 
 ```minyar
 print("There is room for you here.")
@@ -32,6 +32,7 @@ Read in order:
 9. [More than one file](09-modules.md): share a module and test its private code.
 10. [Reading an error and making one repair](10-errors.md): use a message to fix a mistake.
 11. [Saving a garden note](11-files.md): write and read text, handling a failure.
+12. [Give a program its input](12-arguments.md): pass text when a program starts.
 
 After trying the garden validation and error-repair exercises, compare your
 changes with the [worked answers](answers.md).
@@ -70,4 +71,7 @@ explains their prerequisites. `make check-book-cli` follows the garden and
 multi-file harvest projects through the public launcher and their release
 executables. It also checks chapter 10's errors, repairs and explanation
 command. The note walkthrough verifies printed results and actual saved bytes,
-including the empty-note exercise and release execution.
+including the empty-note exercise and release execution. The argument walkthrough
+keeps its source unchanged while checking absent, spaced, empty and flag-shaped
+input, extra arguments and a second separator through public run and direct
+release execution.
