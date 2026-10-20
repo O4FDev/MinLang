@@ -166,7 +166,7 @@ def publish_app(staged: Path, output: Path) -> None:
         shutil.rmtree(backup)
 
 
-def build(args: argparse.Namespace) -> Path:
+def build(args: argparse.Namespace, *, ios_provider: Path | None = None) -> Path:
     validate(args)
     tools = apple_tools(args) if args.target.startswith("ios-") else android_tools(args)
     if not args.no_bootstrap:
@@ -187,10 +187,10 @@ def build(args: argparse.Namespace) -> Path:
         libraries = inspect_ir(llvm, args.target)
         runtime = directory / "runtime.c"
         runtime.write_text('#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET 32\n'
-                           f'#include "{engine.as_posix()}"\n#include "minyar_stack_frames.h"\n')
+                           '#include "cycle-runtime.c"\n#include "minyar_stack_frames.h"\n')
         optimization = "-O0" if args.debug else "-O2"
         flags = [tools["clang"], *tools["flags"], optimization, "-g", "-Wno-override-module"]
-        includes = ["-iquote", str(ROOT / "runtime")]
+        includes = ["-iquote", str(engine.parent), "-iquote", str(ROOT / "runtime")]
         objects = []
         for source, name, extra in [(ir, "program.o", []), (runtime, "runtime.o", ["-std=c11", *includes])]:
             output = directory / name
@@ -203,8 +203,10 @@ def build(args: argparse.Namespace) -> Path:
                     "runtime_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
                     "native_libraries": sorted(libraries)}
         if args.target.startswith("ios-"):
+            provider = (ios_provider or ROOT / "runtime" / "native" / "mobileios.m").resolve()
+            metadata["native_source_sha256"] = hashlib.sha256(provider.read_bytes()).hexdigest()
             native = directory / "mobileios.o"
-            run([*flags, *includes, "-fobjc-arc", "-c", str(ROOT / "runtime" / "native" / "mobileios.m"), "-o", str(native)])
+            run([*flags, *includes, "-fobjc-arc", "-c", str(provider), "-o", str(native)])
             staged = directory / "application.app"
             staged.mkdir()
             executable = staged / "MinyarApplication"

@@ -156,6 +156,14 @@ check-mobile-android` builds both Android archives and links the actual JNI
 adapter with no undefined symbols, verifies ELF architectures and checks that
 the generated `main` is hidden. It does not execute an Android device.
 
+`make check-mobile-ios-smoke-build` builds a test-only app using the real
+UIKit adapter and the real hello model. On an already booted iOS Simulator,
+`MINYAR_SIMULATOR_UDID=... make check-mobile-ios-simulator` installs and runs it.
+The app checks launch, button action, Unicode editing, switch changes, native
+control reuse, selection preservation/clamping and basic layout, then exits.
+This explicit target never boots a Simulator and is excluded from automatic
+gates. It retains stdout/stderr in `build/mobile-tests/ios-smoke`.
+
 All target objects are rebuilt in an isolated staging directory. A host
 runtime object is never linked into a mobile target. Successful build records
 include target triple, SDK, compiler, source/IR/runtime hashes and native

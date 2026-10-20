@@ -1,4 +1,4 @@
-.PHONY: check-mobile check-mobile-tools check-mobile-bridge check-mobile-gallery check-mobile-sanitize check-mobile-ios check-mobile-ios-provider check-mobile-android
+.PHONY: check-mobile check-mobile-tools check-mobile-bridge check-mobile-gallery check-mobile-sanitize check-mobile-ios check-mobile-ios-provider check-mobile-ios-smoke-build check-mobile-ios-simulator check-mobile-android
 
 check-mobile-tools:
 	python3 tests/mobile-tools.py
@@ -23,13 +23,20 @@ check-mobile-android: build/minyarc build/testing/cycle-runtime.c
 # This target never boots a Simulator or installs an application.
 ifeq ($(shell uname -s),Darwin)
 check-mobile-ios-provider:
-	"$(LLVM_CC)" -target arm64-apple-ios16.0-simulator -isysroot "$$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -fsyntax-only runtime/native/mobileios.m
+	"$(LLVM_CC)" -target arm64-apple-ios16.0-simulator -isysroot "$$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -fsyntax-only runtime/native/mobileios.m tests/mobile-ios.m
 	"$(LLVM_CC)" -target arm64-apple-ios16.0 -isysroot "$$(xcrun --sdk iphoneos --show-sdk-path)" -fobjc-arc -fsyntax-only runtime/native/mobileios.m
 
 check-mobile-ios: build/minyarc build/testing/cycle-runtime.c
 	python3 tools/mobile.py examples/mobile-hello/main.min --target ios-simulator --no-bootstrap
 	python3 tools/mobile.py examples/mobile-hello/main.min --target ios-device --no-bootstrap
+
+check-mobile-ios-smoke-build: build/minyarc build/testing/cycle-runtime.c
+	python3 tests/check-mobile-ios.py
+
+# Requires an already booted Simulator. Never include this in an automatic gate.
+check-mobile-ios-simulator: build/minyarc build/testing/cycle-runtime.c
+	python3 tests/check-mobile-ios.py --run
 else
-check-mobile-ios check-mobile-ios-provider:
+check-mobile-ios check-mobile-ios-provider check-mobile-ios-smoke-build check-mobile-ios-simulator:
 	@echo 'SKIP check-mobile-ios: Xcode SDKs require macOS'
 endif
