@@ -230,6 +230,20 @@ static void rc_drop(void *value) {
     if (text_backing) rc_drop(text_backing);
 }
 
+/* Most children of a dying container keep other owners. Decrement those
+ * without a call; only a last owner enters the general drop. */
+static inline void rc_drop_child(void *value) {
+    if (!value) return;
+    RcObject *object = (RcObject *)value - 1;
+    size_t ownership = object->ownership;
+    if (ownership < 8) return;
+    if (ownership >= 16) {
+        object->ownership = ownership - 8;
+        return;
+    }
+    rc_drop(value);
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
@@ -242,14 +256,14 @@ static void rc_release_slow(void *value) {
         if (kind == RC_REFERENCES) {
             MinyarList *list = (MinyarList *)(object + 1);
             for (long long i = 0; i < list->length; i++)
-                rc_drop((void *)(uintptr_t)list->values[i]);
+                rc_drop_child((void *)(uintptr_t)list->values[i]);
             rc_free_data(list->values);
             RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
         } else {
             MinyarRecord *record = (MinyarRecord *)(object + 1);
             unsigned char *references = (unsigned char *)(record->values + record->length);
             for (long long i = 0; i < record->length; i++)
-                if (references[i]) rc_drop((void *)(uintptr_t)record->values[i]);
+                if (references[i]) rc_drop_child((void *)(uintptr_t)record->values[i]);
             RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*record)
                                    + (size_t)record->length * (sizeof(long long) + 1));
         }
