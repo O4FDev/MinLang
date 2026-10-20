@@ -76,20 +76,35 @@ long long minyar_choice_mark_armMark(MinyarRecord *parent) {
     assert(node->values[0] == 431 && node->values[1] == (long long)(uintptr_t)mark_target);
     return 1;
 }
-long long minyar_choice_mark_assertSaved(void *saved) {
-    assert(mark_mode == 1 && saved == mark_target);
+static size_t mark_pre_cleanup_checks;
+static void mark_assert_root(void) {
+    assert(mark_mode == 1);
     mark_window();
-    assert(mark_list(saved)->marked != 0 && mark_refs(saved) > mark_list(saved)->incoming);
+    assert(mark_list(mark_target)->marked != 0 && mark_refs(mark_target) > mark_list(mark_target)->incoming);
     assert(mark_record(mark_parent)->marked == 1);
+}
+/* The generated assignment has acquired/stored its owner when it reaches
+ * this boundary. Observe before a temporary's drop barrier can shade it.
+ * This wrapper adds no owner and delegates cleanup to the original runtime. */
+void minyar_choice_mark_step(void) {
+    if (mark_mode == 1 && mark_pre_cleanup_checks == 0) {
+        mark_assert_root();
+        ++mark_pre_cleanup_checks;
+    }
+    minyar_rc_step();
+}
+long long minyar_choice_mark_assertSaved(void) {
+    assert(mark_pre_cleanup_checks == 1);
+    mark_assert_root();
     ++mark_checks;
     return 1;
 }
-long long minyar_choice_mark_assertRemoved(MinyarRecord *parent, void *saved) {
-    assert(mark_mode == 1 && parent == mark_parent && saved == mark_target);
+long long minyar_choice_mark_assertRemoved(void) {
+    assert(mark_mode == 1);
     mark_window();
-    RcCycle *target = mark_list(saved);
-    assert(parent->values[1] == 0 && target->incoming + 1 == mark_incoming);
-    assert(target->marked != 0 && mark_refs(saved) > target->incoming);
+    RcCycle *target = mark_list(mark_target);
+    assert(mark_parent->values[1] == 0 && target->incoming + 1 == mark_incoming);
+    assert(target->marked != 0 && mark_refs(mark_target) > target->incoming);
     ++mark_checks;
     return 1;
 }
@@ -99,11 +114,11 @@ long long minyar_choice_mark_armChain(void *chain) {
     assert(mark_target->length == 0);
     return 1;
 }
-long long minyar_choice_mark_assertChain(void *chain) {
-    assert(mark_mode == 2 && chain == mark_target);
+long long minyar_choice_mark_assertChain(void) {
+    assert(mark_mode == 2);
     mark_window();
-    assert(mark_target->length == 1 && mark_target->values[0] == (long long)(uintptr_t)chain);
-    assert(mark_list(chain)->incoming == mark_incoming + 1);
+    assert(mark_target->length == 1 && mark_target->values[0] == (long long)(uintptr_t)mark_target);
+    assert(mark_list(mark_target)->incoming == mark_incoming + 1);
     ++mark_checks;
     return 1;
 }
@@ -115,12 +130,12 @@ long long minyar_choice_mark_armNode(MinyarRecord *node) {
     assert(mark_target->length == 1 && mark_target->values[0] == (long long)(uintptr_t)node);
     return 1;
 }
-long long minyar_choice_mark_assertNode(MinyarRecord *node, void *saved) {
-    assert(mark_mode == 3 && node == mark_parent && saved == mark_target);
+long long minyar_choice_mark_assertNode(void) {
+    assert(mark_mode == 3);
     mark_window();
-    RcCycle *target = mark_list(saved);
-    assert(node->values[0] == 0 && target->incoming + 1 == mark_incoming);
-    assert(mark_refs(saved) > target->incoming);
+    RcCycle *target = mark_list(mark_target);
+    assert(mark_parent->values[0] == 0 && target->incoming + 1 == mark_incoming);
+    assert(mark_refs(mark_target) > target->incoming);
     ++mark_checks;
     return 1;
 }
@@ -136,7 +151,7 @@ long long minyar_choice_mark_finishMark(void) {
     return 1;
 }
 __attribute__((destructor)) static void check_container_mark_contract(void) {
-    assert(!mark_carrier && !mark_target && !mark_parent && mark_mode == 0 && mark_checks == 4);
+    assert(!mark_carrier && !mark_target && !mark_parent && mark_mode == 0 && mark_checks == 4 && mark_pre_cleanup_checks == 1);
     assert(rc_frames == NULL);
     mark_drain();
     assert(rc_object_count == 0 && rc_bytes == 0 && rc_immortal_object_count == 0);

@@ -30,9 +30,37 @@ function barrierControl(frontend: fixtures.Frontend, path: Text) {
         for argument in ["-Wno-override-module", path + ".ll", path + "-runtime.o", "-lm", "-o", path + ".exe"] { command.add(argument) }
         test.require(test.run(command, frontend.environment, "", path + ".control-link", 60), "link missing-barrier control " + level)
         let result = test.run([path + ".exe"], frontend.environment, "", path + ".control-run", 30)
-        test.check(result.status != 0 && result.output == "" && test.contains(result.errorOutput, "mark_list(saved)->marked != 0"), "missing optional-root barrier escaped the unmarked-target oracle " + level + "\n" + result.errorOutput)
+        test.check(result.status != 0 && result.output == "" && test.contains(result.errorOutput, "mark_list(mark_target)->marked != 0"), "missing optional-root barrier escaped the unmarked-target oracle " + level + "\n" + result.errorOutput)
     }
     io.writeTextFile(path + ".ll", original)
+}
+
+function markProof(frontend: fixtures.Frontend) {
+    let compiler = frontend.compiler
+    test.require(fixtures.compile(frontend, io.readTextFile("tests/choice-container-niche-mark.min")), "compile no-argument MARK observers")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let llvm = io.readTextFile(path + ".ll")
+    for observer in ["assertSaved", "assertRemoved", "assertChain", "assertNode"] {
+        test.check(test.contains(llvm, "declare i64 @minyar_choice_mark_" + observer + "()"), "MARK observer must take no reference arguments: " + observer)
+    }
+    let arm = llvm.find("call i64 @.minyar.fn.armMark(")
+    let saved = llvm.find("call i64 @.minyar.fn.assertSaved()")
+    test.check(arm >= 0 && saved > arm, "missing source assignment MARK window")
+    let window = llvm.slice(arm, saved)
+    let store = window.find("store ptr ")
+    let cleanup = window.find("call void @minyar_rc_step()")
+    test.check(store > 0 && cleanup > store && test.contains(window, "call i64 @minyar_record_get("), "MARK boundary must follow the actual source field assignment")
+    llvm = test.replace(llvm, "call void @minyar_rc_step()", "call void @minyar_choice_mark_step()")
+    io.writeTextFile(path + ".ll", llvm + "\ndeclare void @minyar_choice_mark_step()\n")
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+    io.writeTextFile(path + "-runtime.c", contract + frontend.helpers)
+    let command = [compiler.clang, "-O1"]
+    for flag in compiler.flags { command.add(flag) }
+    for flag in frontend.runtimeFlags { command.add(flag) }
+    for argument in ["-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+    test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 60), "compile no-argument MARK observation runtime")
+    link(frontend, path, path + "-runtime.o", "Container MARK: optional root, List self-edge and nullable Node removal passed\n", "")
+    barrierControl(frontend, path)
 }
 
 function allocations(frontend: fixtures.Frontend, payload: Text, initial: Text, baseline: Boolean) {
@@ -77,8 +105,7 @@ if baseline == "" {
     fixtures.executes(frontend, io.readTextFile("tests/choice-container-niche.min"), io.readTextFile("tests/choice-container-niche.expected"), ["-O0", "-O2"], 0, "", true)
     frontend.runtimeFlags = ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_SYSTEM_SMALL_HEAP=0", "-DMINYAR_RC_POLL_BUDGET=1", "-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0"]
     frontend.helpers = io.readTextFile("tests/choice-container-niche-mark-runtime.c")
-    fixtures.executes(frontend, io.readTextFile("tests/choice-container-niche-mark.min"), "Container MARK: optional root, List self-edge and nullable Node removal passed\n", ["-O0", "-O2"], 0, "", true)
-    barrierControl(frontend, compiler.directory + "/case" + Text(compiler.serial))
+    markProof(frontend)
     frontend.runtimeFlags = []
     frontend.helpers = ""
     fixtures.executes(frontend, #"""
