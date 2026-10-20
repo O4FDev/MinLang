@@ -292,6 +292,9 @@ check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-modul
 		PeerRustGoZig.test_unicode_single_scalar_decoder_keeps_all_numeric_boundaries \
 		PeerRustGoZig.test_unicode_validators_preserve_all_shared_valid_inputs
 
+# The deep syntax O0 ASan fixture emits a 146631048-byte object; allow 512 MiB per file.
+check-peer-ownership-python-swift-ruby-lua check-peer-sanitize-python-swift-ruby-lua: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
+
 check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/tests/peer-python-swift-ruby-lua
 	$(PEER_OWNERSHIP_RUN) ./build/tooling/tests/peer-python-swift-ruby-lua \
 		PeerPythonSwiftRubyLua.test_three_hundred_positional_parameters_and_values \
