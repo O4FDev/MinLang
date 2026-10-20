@@ -600,6 +600,37 @@ print(count + typed)
                 assert query("prepareRename", "record Lamp", text=unsafe, offset=7)["result"] is None
                 rejected_type = query("rename", "record Lamp", text=unsafe, offset=7, extra={"newName": "Lantern"})
                 assert rejected_type["error"]["code"] == -32602, rejected_type
+
+        # These programs are valid. Type/value namespaces, generic parameters
+        # and shadowed callback factories must not become incorrect edits.
+        for version, (ambiguous, needle, name) in enumerate((
+            ('record Lamp { light: Integer }\nlet Lamp = 2\nlet lamp: Lamp = Lamp { light: 40 }\nprint(lamp.light + Lamp)\n', "Lamp =", "amount"),
+            ('function count<Item>(value: Item): Integer { let Item = 2; let again: Item = value; return Item }\nprint(count(40))\n', "Item =", "amount"),
+            ('record A { light: Integer }\nrecord B { light: Integer }\nfunction source(): A { return A { light: 1 } }\nfunction read(source: () -> B): Integer { let value = source(); return value.light }\nprint(0)\n', "light:", "power"),
+            ('record Lamp { light: Integer }\nfunction Lamp(): Integer { return 2 }\nlet lamp = Lamp { light: 1 }\nprint(lamp.light + Lamp())\n', "Lamp()", "make"),
+            ('record A { light: Integer }\nrecord B { light: Integer }\nfunction A.other(): B { return B { light: 2 } }\nlet value = A { light: 1 }.other()\nprint(value.light)\n', "light:", "power"),
+        ), start=20):
+            client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": ambiguous}]})
+            diagnostics = client.diagnostics(uri, version)
+            assert diagnostics == [], (ambiguous, diagnostics)
+            rejected = query("rename", needle, text=ambiguous, extra={"newName": name})
+            assert rejected["error"]["code"] == -32602, (ambiguous, rejected)
+
+        sequential = "let value = 1\nprint(value)\nlet value = 2\nprint(value)\n"
+        client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": 30}, "contentChanges": [{"text": sequential}]})
+        assert client.diagnostics(uri, 30) == []
+        for occurrence, name in enumerate(("first", "second")):
+            position = point(sequential, "let value", occurrence=occurrence, offset=4)
+            params = {"textDocument": {"uri": uri}, "position": position, "context": {"includeDeclaration": True}, "newName": name}
+            refs = client.request("textDocument/references", params)["result"]
+            assert [ref["range"]["start"]["line"] for ref in refs] == [occurrence * 2, occurrence * 2 + 1], refs
+            edits = client.request("textDocument/rename", params)["result"]["documentChanges"][0]["edits"]
+            assert len(edits) == 2, edits
+            renamed_source = apply_edits(sequential, edits)
+            path.write_text(renamed_source)
+            checked = subprocess.run([compiler, str(path), str(root / "sequential.ll")], capture_output=True, timeout=30)
+            assert checked.returncode == 0, checked.stderr.decode()
+            path.write_text(source)
         client.close()
 
         # Clients without documentChanges support receive the baseline changes

@@ -52,6 +52,8 @@ is the authority on language validity. The source index supports incomplete
 buffers, while semantic navigation currently follows declarations, annotations,
 direct literals, factory return types and dotted names. It does not yet resolve
 every generic instantiation or arbitrary receiver expression into a checked type.
+For a complex initializer with operators or chained calls, an explicit type
+annotation helps the editor navigate the resulting value.
 
 References search project `.min` files, open buffers and their reachable imports.
 Hidden directories, `build`, `target`, `node_modules` and `vendor` are excluded
@@ -61,9 +63,10 @@ truncated search. Closed sources are reread and open sources use their current
 buffer contents. Edits carry buffer versions when the client supports versioned
 workspace edits. The server returns edits for the editor to apply.
 
-Rename checks overlapping declarations and name capture. Names shared by local
-values and types, functions or import aliases are declined because their uses
-can belong to different compiler namespaces. It accepts ASCII
+Rename checks overlapping declarations and name capture. Names shared across
+value, type, function or import namespaces are declined because the index cannot
+distinguish every use. Shadowed callback factories likewise do not supply an
+inferred receiver type. It accepts ASCII
 identifier names and declines unsupported bindings, choice cases, interpolated
 references and unresolved expressions that could make an edit incomplete.
 References currently omit interpolation bodies. These restrictions preserve a

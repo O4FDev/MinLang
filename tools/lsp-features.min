@@ -36,6 +36,19 @@ function tokenAt(document: workspace.Document, offset: Integer): Integer {
     }
     return - 1
 }
+function namespaceTarget(state: workspace.Workspace, document: Integer, name: Text): Target {
+    let found = - 1
+    for position in 0..state.documents[document].syntax.symbols.length {
+        let symbol = state.documents[document].syntax.symbols[position]
+        if symbol.name == name && symbol.container == "" && symbol.scopeStart == 0 {
+            if found >= 0 {
+                return absent()
+            }
+            found = position
+        }
+    }
+    return target(document, found)
+}
 function typeTarget(state: workspace.Workspace, document: Integer, type: Text): Target {
     let name = type
     let angle = host.findText(name, "<", 0)
@@ -46,24 +59,37 @@ function typeTarget(state: workspace.Workspace, document: Integer, type: Text): 
     if parts.length == 2 {
         let imported = workspace.imported(state, state.documents[document], parts[0])
         if imported >= 0 {
-            return target(imported, index.find(state.documents[imported].syntax, parts[1], 0, ""))
+            return namespaceTarget(state, imported, parts[1])
         }
     }
-    return target(document, index.find(state.documents[document].syntax, name, 0, ""))
+    return namespaceTarget(state, document, name)
 }
 function memberTarget(state: workspace.Workspace, document: Integer, receiver: Target, name: Text): Target {
     if receiver.symbol < 0 || receiver.document < 0 {
         return absent()
     }
     let symbol = state.documents[receiver.document].syntax.symbols[receiver.symbol]
-    let owner = concreteType(state, receiver.document, symbol.type, 0)
-    let container = symbol.type
-    if owner.symbol >= 0 {
-        let declaration = state.documents[owner.document].syntax.symbols[owner.symbol]
-        container = declaration.name
-    } else {
-        owner = target(receiver.document, - 1)
+    // Inferred factory names must resolve in the binding's lexical scope.
+    // A callback parameter can shadow a global factory with another result
+    // type; following the global return type would navigate or rename wrongly.
+    if symbol.kind == 13 || symbol.kind == 14 {
+        let components = symbol.type.split(".")
+        if components.length > 0 {
+            let lexical = index.find(state.documents[receiver.document].syntax, components[0], symbol.start, "")
+            let global = index.find(state.documents[receiver.document].syntax, components[0], 0, "")
+            if lexical >= 0 && lexical != global {
+                let declaration = state.documents[receiver.document].syntax.symbols[lexical]
+                if declaration.kind == 13 || declaration.kind == 14 {
+                    return absent()
+                }
+            }
+        }
     }
+    let owner = concreteType(state, receiver.document, symbol.type, 0)
+    if owner.symbol < 0 || state.documents[owner.document].syntax.symbols[owner.symbol].kind != 23 {
+        return absent()
+    }
+    let container = state.documents[owner.document].syntax.symbols[owner.symbol].name
     let found = index.find(state.documents[owner.document].syntax, name, 0, container)
     if found < 0 {
         return absent()
@@ -441,11 +467,7 @@ function unsupportedBinding(state: workspace.Workspace, document: Integer, found
     let current = state.documents[document]
     let tokens = current.syntax.tokens
     let symbol = state.documents[found.document].syntax.symbols[found.symbol]
-    let local = localTarget(state, found)
     for token in 0..tokens.length {
-        if local && !index.visible(symbol, tokens[token].start) {
-            continue
-        }
         let value = tokens[token]
         if value.kind == 3 && !value.text.startsWith("#") && host.hasText(value.text, "\\(") && (containsName(value.text, symbol.name) || containsName(value.text, newName)) {
             return true
@@ -561,8 +583,8 @@ function renameIssue(state: workspace.Workspace, documents: List<Integer>, found
                     continue
                 }
                 for binding in current.syntax.symbols {
-                    if binding.name == symbol.name && binding.container == "" && binding.scopeStart > 0 && (binding.kind == 13 || binding.kind == 14) {
-                        return "This name is shared by a declaration and a local value; their uses need compiler-resolved metadata before renaming."
+                    if binding.name == symbol.name && binding.container == "" && binding.start != declaration.start && (binding.kind == 2 || binding.kind == 12 || binding.kind == 13 || binding.kind == 14 || binding.kind == 23 || binding.kind == 26) {
+                        return "This name is shared across compiler namespaces; its uses need compiler-resolved metadata before renaming."
                     }
                 }
             }

@@ -12,6 +12,7 @@ public record Symbol {
     end: Integer
     scopeStart: Integer
     scopeEnd: Integer
+    visibleFrom: Integer
     container: Text
     exported: Boolean
 }
@@ -162,6 +163,47 @@ function inferred(tokens: List<source.Token>, first: Integer): Text {
     }
     return ""
 }
+// The first token's type describes a binding only when its complete initializer
+// is one atom. A constructor followed by a method or an operator can have an
+// entirely different type; leave it unknown instead of guessing for navigation.
+function atomicInitializer(text: Text, tokens: List<source.Token>, pairs: List<Integer>, first: Integer): Boolean {
+    if first >= tokens.length {
+        return false
+    }
+    let end = first
+    if tokens[end].text == "-" {
+        end += 1
+        if end >= tokens.length || tokens[end].kind != 2 {
+            return false
+        }
+    }
+    if tokens[end].kind == 1 && tokens[end].text != "true" && tokens[end].text != "false" {
+        end += 1
+        if end + 1 < tokens.length && tokens[end].text == "." && tokens[end + 1].kind == 1 {
+            end += 2
+        }
+        if end >= tokens.length || (tokens[end].text != "(" && tokens[end].text != "{") {
+            return false
+        }
+    }
+    if tokens[end].text == "(" || tokens[end].text == "{" || tokens[end].text == "[" {
+        if pairs[end] >= tokens.length {
+            return false
+        }
+        end = pairs[end]
+    }
+    end += 1
+    if end == tokens.length || tokens[end].text == ";" || tokens[end].text == "}" {
+        return true
+    }
+    let gap = source.scan(host.textSlice(text, tokens[end - 1].end, tokens[end].start))
+    for token in gap.tokens {
+        if token.kind == 6 {
+            return true
+        }
+    }
+    return false
+}
 function add(index: Index, token: source.Token, detail: Text, type: Text, documentation: Text, kind: Integer, after: Integer, scopeStart: Integer, scopeEnd: Integer, container: Text, exported: Boolean) {
     index.symbols.add(Symbol {
         name: token.text
@@ -173,6 +215,7 @@ function add(index: Index, token: source.Token, detail: Text, type: Text, docume
         end: after
         scopeStart: scopeStart
         scopeEnd: scopeEnd
+        visibleFrom: scopeStart
         container: container
         exported: exported
     })
@@ -349,7 +392,7 @@ public function build(text: Text): Index {
             if name + 1 < tokens.length && tokens[name + 1].text == ":" {
                 type = annotation(tokens, name + 2, tokens.length)
             }
-            else if name + 1 < tokens.length && tokens[name + 1].text == "=" {
+            else if name + 1 < tokens.length && tokens[name + 1].text == "=" && atomicInitializer(text, tokens, pairs, name + 2) {
                 type = inferred(tokens, name + 2)
             }
             let scopeStart = 0
@@ -373,6 +416,9 @@ public function build(text: Text): Index {
                 kind = 14
             }
             add(result, tokens[name], detail, type, docs[index], kind, tokens[name].end, scopeStart, scopeEnd, "", exported)
+            if value == "let" || scopeStart > 0 {
+                result.symbols[result.symbols.length - 1].visibleFrom = tokens[name].end
+            }
         }
     }
     for index in 0..tokens.length {
@@ -400,7 +446,7 @@ public function build(text: Text): Index {
 }
 
 public function visible(symbol: Symbol, offset: Integer): Boolean {
-    return offset >= symbol.scopeStart && offset <= symbol.scopeEnd
+    return offset >= symbol.visibleFrom && offset <= symbol.scopeEnd
 }
 public function find(index: Index, name: Text, offset: Integer, container: Text): Integer {
     let found = - 1
