@@ -1,0 +1,60 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+record Profile { name: Text; flags: List<Text>; kind: Integer; budget: Integer }
+
+function requirements(profile: Profile): Text {
+    let checks = "\n#ifdef MINYAR_COMPILER_ARENA\n#error Choice ownership profiles must not use the compiler arena\n#endif\n#ifndef MINYAR_RC_TESTING\n#error Choice ownership profiles require exact live-object accounting\n#endif\n#ifndef MINYAR_MAP_CYCLE_RUNTIME\n#error Choice ownership profiles require the traced cycle runtime\n#endif\n"
+    checks += "#if MINYAR_INTEGER_TEXT_CACHE_LIMIT != 0\n#error Exact choice profile cleanup requires disabled Integer Text caching\n#endif\n#ifndef MINYAR_MEMORY_CONTRACT_CUSTOM_CLEANUP\n#error Exact choice profiles must replace generic cleanup\n#endif\n"
+    if profile.kind == 0 {
+        return checks + "#ifdef MINYAR_BOUNDED_RC\n#error The eager profile must not select bounded cleanup\n#endif\n#if defined(MINYAR_SYSTEM_HEAP) || defined(MINYAR_BOUNDED_HEAP) || defined(MINYAR_LAZY_HEAP)\n#error The eager profile must use ordinary allocation\n#endif\n"
+    }
+    checks += "#ifndef MINYAR_BOUNDED_RC\n#error The selected allocator profile requires bounded cleanup\n#endif\n#if MINYAR_RC_POLL_BUDGET != " + Text(profile.budget) + "\n#error The cleanup budget differs from the requested profile\n#endif\n"
+    if profile.kind == 1 {
+        checks += "#ifndef MINYAR_SYSTEM_HEAP\n#error The system profile requires system backing\n#endif\n#if defined(MINYAR_BOUNDED_HEAP) || defined(MINYAR_LAZY_HEAP)\n#error The system profile must not select a pool\n#endif\n"
+        if profile.budget == 1 { checks += "#if MINYAR_SYSTEM_SMALL_HEAP != 0\n#error The plain-system profile must bypass the small heap\n#endif\n" }
+    } else {
+        checks += "#ifndef MINYAR_BOUNDED_HEAP\n#error The pool profile requires bounded backing\n#endif\n#ifdef MINYAR_SYSTEM_HEAP\n#error The pool profile must not select system backing\n#endif\n#if MINYAR_BOUNDED_HEAP_BYTES != 1048576\n#error The pool capacity differs from the requested one MiB\n#endif\n"
+        if profile.kind == 3 { checks += "#ifndef MINYAR_LAZY_HEAP\n#error The lazy profile requires mmap backing\n#endif\n" }
+        else { checks += "#ifdef MINYAR_LAZY_HEAP\n#error The fixed profile must not select lazy backing\n#endif\n" }
+    }
+    return checks
+}
+
+let profiles = [
+    // Nonempty flags prevent executes from injecting its default system heap.
+    Profile { name: "eager"; flags: ["-DMINYAR_RC_POLL_BUDGET=32"]; kind: 0; budget: 32 },
+    Profile { name: "system-k32"; flags: ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=32"]; kind: 1; budget: 32 },
+    Profile { name: "system-k1"; flags: ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_SYSTEM_SMALL_HEAP=0", "-DMINYAR_RC_POLL_BUDGET=1"]; kind: 1; budget: 1 },
+    Profile { name: "fixed-k1"; flags: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_BOUNDED_HEAP_BYTES=1048576", "-DMINYAR_RC_POLL_BUDGET=1"]; kind: 2; budget: 1 },
+    Profile { name: "fixed-k1024"; flags: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_BOUNDED_HEAP_BYTES=1048576", "-DMINYAR_RC_POLL_BUDGET=1024"]; kind: 2; budget: 1024 },
+    Profile { name: "lazy-k32"; flags: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_LAZY_HEAP=1", "-DMINYAR_BOUNDED_HEAP_BYTES=1048576", "-DMINYAR_RC_POLL_BUDGET=32"]; kind: 3; budget: 32 }
+]
+let names: List<Text> = []
+for profile in profiles { names.add(profile.name) }
+fixtures.validate("ChoiceRuntimeProfiles", names)
+let programs = ["choice-composition-cycle", "choice-container-niche"]
+let cleanup = "\n__attribute__((destructor)) static void exact_choice_profile_cleanup(void) {\nassert(rc_frames == NULL);\nsize_t polls = 0;\n#ifdef MINYAR_BOUNDED_RC\nwhile (rc_pending_count || rc_cycle_pending) { assert(++polls < 1000000); assert(minyar_rc_poll(MINYAR_RC_POLL_BUDGET) > 0); }\n#else\nwhile (rc_cycle_pending) { assert(++polls < 1000000); rc_cycle_eager_service(1); }\n#endif\nassert(rc_pending_count == 0 && rc_cycle_pending == 0);\nassert(rc_immortal_object_count == 0 && rc_object_count == 0 && rc_bytes == 0);\n}\n"
+let executed = 0
+for profile in profiles {
+    if fixtures.selected("ChoiceRuntimeProfiles", profile.name) {
+        for program in programs {
+            let source = io.readTextFile("tests/" + program + ".min")
+            let expected = io.readTextFile("tests/" + program + ".expected")
+            test.check(source != "" && expected != "", "choice runtime profile fixtures must not be empty")
+            let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+            for flag in profile.flags { frontend.runtimeFlags.add(flag) }
+            frontend.runtimeFlags.add("-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0")
+            // The exact bounded check below replaces the generic destructor.
+            frontend.runtimeFlags.add("-DMINYAR_MEMORY_CONTRACT_CUSTOM_CLEANUP=1")
+            frontend.helpers = requirements(profile) + cleanup
+            fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+            test.removeTree(frontend.compiler.directory)
+            executed += 1
+        }
+        print(profile.name + ": O0/O2 exact cleanup passed")
+    }
+}
+test.check(profiles.length == 6 && programs.length == 2 && executed > 0, "choice runtime profile domain")
+print("Choice runtime profiles: " + Text(executed) + " fixture/profile pairs passed")

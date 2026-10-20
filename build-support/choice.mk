@@ -93,3 +93,16 @@ check-choice-type-codec-sanitize: build/minyarc-sanitize build/minyar-runtime-sa
 
 check check-portable: check-choice-type-codec
 check-sanitize: check-choice-type-codec-sanitize
+
+.PHONY: check-choice-runtime-profiles check-choice-runtime-profiles-sanitize
+CHOICE_RUNTIME_PROFILE_CASES = eager system-k32 system-k1 fixed-k1 fixed-k1024 $(if $(filter Windows_NT,$(OS)),,lazy-k32)
+build/tooling/tests/choice-runtime-profiles.ll: tests/choice-composition-cycle.min tests/choice-composition-cycle.expected tests/choice-container-niche.min tests/choice-container-niche.expected tests/frontend-fixtures.min tests/memory-contracts-runtime.c
+
+check-choice-runtime-profiles: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-runtime-profiles
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-runtime-profiles" $(CHOICE_RUNTIME_PROFILE_CASES)
+
+check-choice-runtime-profiles-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-runtime-profiles
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-runtime-profiles" $(CHOICE_RUNTIME_PROFILE_CASES)
+
+check check-portable: check-choice-runtime-profiles
+check-sanitize: check-choice-runtime-profiles-sanitize

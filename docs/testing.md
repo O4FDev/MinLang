@@ -221,6 +221,33 @@ allocate only the 5,000 present records, using 5,000 slots. The former wrapper
 layout allocated 15,000 records and 25,000 slots for the same workload.
 `check-choice-niche-sanitize` adds ASan/UBSan.
 
+`make check-choice-text-niche` checks nullable Text choices, immutable key
+snapshots, Unicode, empty values, callbacks, native Text adapters and module
+fallback. `check-choice-container-niche` checks nullable Bytes and Lists,
+mutable aliases, C-layout byte-view lifetimes and container capability
+rejections. Each 10,000-value benchmark removes 10,000 choice wrapper records
+and 20,000 slots. Three observed plain-system K1 collector MARK windows check
+physical List self-edges, optional roots and edge replacement; a missing-barrier
+control must fail before temporary cleanup can mask it. Both targets have
+ASan/UBSan counterparts ending in `-sanitize`.
+
+`make check-choice-runtime-profiles` runs the combined choice-cycle and
+container fixtures at O0/O2 across eager, system K32, plain-system K1,
+fixed 1 MiB K1/K1024 and POSIX lazy 1 MiB K32 runtimes. Each profile rejects
+incorrect allocator flags. Integer Text caching is disabled only in these
+test programs; after bounded cleanup, every program must have zero owners,
+objects and bytes. `check-choice-runtime-profiles-sanitize` repeats the matrix
+with compiler, generated LLVM and runtime ASan/UBSan instrumentation.
+On Windows these maintained targets select the five supported profiles;
+an explicitly requested lazy profile still rejects as unsupported.
+
+`make check-choice-type-codec` checks 4,720 real compiler-helper cases per
+optimization at O0/O2, including reserved scalar codes 19..31, 64 List layers,
+ordinary encoding compatibility, nominal boundaries, all five Map escape tags
+and exact signed-i64 limits. Its `-sanitize` counterpart instruments the
+compiler and generated probe. Enum tests separately exercise the runtime Map
+decoder through nested equality and mutation.
+
 `make check-choice-propagation` checks partial choice cleanup when a payload's
 `try` returns early. It covers scalar and mixed reference payloads, borrowed and
 owned arguments, assignment, return, List storage and lazy error context at
