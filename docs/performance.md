@@ -266,6 +266,14 @@ instruction counts. Preserve this distinction when reporting results.
 
 ## Checked collection access
 
+A `for` loop over a List or Bytes reads the length through the same inline
+helper on every iteration, so the loop header makes no runtime call. The loop
+holds its own count on the List, so when the body makes no calls and assigns
+only plain local names, nothing can remove an element and the loop name borrows
+each element instead of retaining and releasing it. Summing two fields over a
+1,000-element `List<Point>` 100,000 times fell from 0.29 to 0.08 seconds
+(checked C with pointers to heap structs: 0.04).
+
 Ordinary Bytes indexing, indexed replacement, length and single-byte `add`
 use inline LLVM helpers even when the runtime is a separate native object. An
 append takes the inline path only when the value is a byte and the storage
