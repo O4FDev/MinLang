@@ -536,6 +536,9 @@ gallery at O0/O2 with ownership assertions. It checks automatic completion of
 unobserved tasks, copied messages, cancellation, whole-scope deadlines, body and
 worker failures, closed aliases and malformed replies. The sanitizer companion
 instruments generated LLVM, the ownership runtime and both native providers.
+Typed scope values cover scalars, records, Bytes and nested collections. Native
+PID handshakes prove blocked children are reaped on body errors, propagated
+errors and cancellation before program shutdown can hide a lifetime leak.
 
 `make check-parallel-for` runs safe range programs and the parallel gallery at
 O0/O2 with exact output and ownership cleanup assertions. Race rejections cover

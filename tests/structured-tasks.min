@@ -21,9 +21,12 @@ for index in 0..providers.length {
 frontend.helpers = #"""
     #include <errno.h>
     #include <fcntl.h>
+    #include <poll.h>
     #include <signal.h>
+    #include <stdint.h>
     #include <stdio.h>
     #include <sys/stat.h>
+    #include <time.h>
     #include <unistd.h>
     static int structured_keeper = -1;
     static long long structured_token;
@@ -60,6 +63,49 @@ frontend.helpers = #"""
         do { written = write(structured_keeper, &value, 1); } while (written < 0 && errno == EINTR);
         return written == 1;
     }
+    _Bool minyar_structured_test_reportPid(long long token, long long pid) {
+        if (pid <= 0) return 0;
+        char path[96]; structured_path(path, sizeof(path), token);
+        int descriptor;
+        do { descriptor = open(path, O_WRONLY | O_NONBLOCK); } while (descriptor < 0 && errno == EINTR);
+        if (descriptor < 0) return 0;
+        int64_t packet = (int64_t)pid;
+        ssize_t written;
+        do { written = write(descriptor, &packet, sizeof(packet)); } while (written < 0 && errno == EINTR);
+        close(descriptor);
+        return written == (ssize_t)sizeof(packet);
+    }
+    static long long structured_milliseconds(void) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+        return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    }
+    long long minyar_structured_test_takePid(long long token) {
+        if (structured_keeper < 0 || structured_token != token) return -EINVAL;
+        long long began = structured_milliseconds();
+        if (began < 0) return -errno;
+        long long deadline = began + 5000;
+        int64_t packet = 0;
+        size_t received = 0;
+        while (received < sizeof(packet)) {
+            long long now = structured_milliseconds();
+            if (now < 0) return -errno;
+            long long remaining = deadline - now;
+            if (remaining <= 0) return -ETIMEDOUT;
+            struct pollfd ready = {structured_keeper, POLLIN, 0};
+            int status = poll(&ready, 1, (int)remaining);
+            if (status < 0 && errno == EINTR) continue;
+            if (status < 0) return -errno;
+            if (status == 0) return -ETIMEDOUT;
+            if (!(ready.revents & POLLIN)) return -EIO;
+            ssize_t count = read(structured_keeper, (unsigned char *)&packet + received, sizeof(packet) - received);
+            if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            if (count < 0) return -errno;
+            if (count == 0) return -EIO;
+            received += (size_t)count;
+        }
+        return packet > 0 ? (long long)packet : -EINVAL;
+    }
     void minyar_structured_test_removeToken(long long token) {
         if (structured_keeper >= 0 && structured_token == token) {
             close(structured_keeper); structured_keeper = -1;
@@ -81,6 +127,8 @@ let source = #"""
     function createToken(token: Integer): Boolean { native "structured_test" }
     function waitToken(token: Integer): Integer { native "structured_test" }
     function releaseToken(token: Integer): Boolean { native "structured_test" }
+    function reportPid(token: Integer, pid: Integer): Boolean { native "structured_test" }
+    function takePid(token: Integer): Integer { native "structured_test" }
     function removeToken(token: Integer) { native "structured_test" }
     function processAlive(pid: Integer): Boolean { native "structured_test" }
     function require(condition: Boolean, message: Text): Result<Nothing, errors.Error> {
@@ -104,6 +152,18 @@ let source = #"""
         if mode == "eof" { return Ok() }
         if mode == "malformed" { try workers.replyMessage(Bytes("not a task envelope")); return Ok() }
         if mode == "stall" { try workers.readRequest(); try workers.readRequest(); return Ok() }
+        if mode == "pid-stall" {
+            let request = try workers.readRequest()
+            match request {
+                Some(data) {
+                    try require(data.length == 8, "PID task request must contain one Integer")
+                    try require(reportPid(data.getInt64(0), processInfo.processId()), "report blocked worker PID")
+                }
+                None { return Err(errors.make(errors.protocolCode(), 0, "PID task received no request")) }
+            }
+            try workers.readRequest()
+            return Ok()
+        }
         if mode == "bytes" {
             return tasks.serve(tasks.channel(tasks.bytes(), tasks.bytes()), function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) })
         }
@@ -133,6 +193,112 @@ let source = #"""
         })
     }
     function bodyFailure(): Result<Nothing, errors.Error> { return Err(errors.make(78, 4, "body failed")) }
+    function typedScopeValues(): Result<Nothing, errors.Error> {
+        // Existing unit callbacks keep their inferred return type.
+        tasks.together(-1, function(scope) { return Ok() }).unwrap()
+        let integer = try tasks.together(10000, function(scope: tasks.Scope): Result<Integer, errors.Error> {
+            let task = try tasks.start(scope, "integer", integerChannel(), 21)
+            return tasks.response(task)
+        })
+        try require(integer == 42, "typed scope Integer result")
+
+        let words = try tasks.together(10000, function(scope: tasks.Scope): Result<List<Text>, errors.Error> {
+            let task = try tasks.start(scope, "parcel", tasks.channel(parcels(), parcels()), Parcel { number: 6; label: "moon" })
+            let reply = try tasks.response(task)
+            let result = [reply.label, "second"]
+            return Ok(result)
+        })
+        try require(words.length == 2 && words[0] == "moon arrived", "typed scope List retained its contents")
+        words.add("third"); words[0] = "kept"
+        try require(words.length == 3 && words[0] == "kept" && words[2] == "third", "typed scope List remained mutable")
+
+        let parcel = try tasks.together(10000, function(scope: tasks.Scope): Result<Parcel, errors.Error> {
+            let task = try tasks.start(scope, "parcel", tasks.channel(parcels(), parcels()), Parcel { number: 7; label: "tide" })
+            return tasks.response(task)
+        })
+        try require(parcel.number == 8 && parcel.label == "tide arrived", "typed scope managed record result")
+        parcel.label = "kept ashore"
+        try require(parcel.label == "kept ashore", "typed scope record remained mutable")
+
+        let bytes = try tasks.together(10000, function(scope: tasks.Scope): Result<Bytes, errors.Error> {
+            let task = try tasks.start(scope, "bytes", tasks.channel(tasks.bytes(), tasks.bytes()), Bytes("saved"))
+            return tasks.response(task)
+        })
+        bytes[0] = 83
+        try require(Text(bytes) == "Saved", "typed scope Bytes survived decoder cleanup")
+
+        let nested = try tasks.together(10000, function(outer: tasks.Scope): Result<List<Bytes>, errors.Error> {
+            let inner = try tasks.together(-1, function(scope: tasks.Scope): Result<Bytes, errors.Error> {
+                let task = try tasks.start(scope, "bytes", tasks.channel(tasks.bytes(), tasks.bytes()), Bytes("nested"))
+                return tasks.response(task)
+            })
+            return Ok([inner, Bytes("home")])
+        })
+        try require(nested.length == 2 && Text(nested[0]) == "nested" && Text(nested[1]) == "home", "nested typed scope results")
+        let inner = nested[0]
+        inner[0] = 78
+        try require(Text(nested[0]) == "Nested", "nested managed result remained usable")
+
+        let ended = try tasks.together(-1, function(scope: tasks.Scope): Result<tasks.Scope, errors.Error> { return Ok(scope) })
+        try require(tasks.cancel(ended).isErr(), "returned Scope extended its lifetime")
+        let completed = try tasks.together(10000, function(scope: tasks.Scope): Result<tasks.Task<Integer>, errors.Error> {
+            let task = try tasks.start(scope, "integer", integerChannel(), 21)
+            return Ok(task)
+        })
+        match tasks.response(completed) {
+            Err(error) { try require(error.code() == errors.closedCode(), "returned Task expiry code") }
+            Ok(value) { return Err(errors.make(99, 0, "returned Task revived a closed scope")) }
+        }
+
+        let produced = [false]
+        let discarded = tasks.together(10000, function(scope: tasks.Scope): Result<List<Parcel>, errors.Error> {
+            try tasks.start(scope, "fail", integerChannel(), 0)
+            let values = [Parcel { number: 1; label: "discarded" }, Parcel { number: 2; label: "too" }]
+            produced[0] = true
+            return Ok(values)
+        })
+        try require(produced[0], "typed body did not produce its success value")
+        match discarded {
+            Err(error) { try require(error.code() == 77 && error.nativeCode() == 9, "unobserved task did not replace body success") }
+            Ok(value) { return Err(errors.make(99, 0, "managed body success hid an unobserved failure")) }
+        }
+
+        let failed = tasks.together(-1, function(scope: tasks.Scope): Result<Integer, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            try bodyFailure()
+            return Ok(42)
+        })
+        match failed {
+            Err(error) { try require(error.code() == 78 && error.message() == "body failed", "typed body error was replaced") }
+            Ok(value) { return Err(errors.make(99, 0, "typed body error became success")) }
+        }
+        let emptyFailure = tasks.together(-1, function(scope: tasks.Scope): Result<List<Bytes>, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            return Err(errors.none())
+        })
+        match emptyFailure {
+            Err(error) { try require(error.code() == errors.invalidDataCode(), "typed body empty error normalization") }
+            Ok(value) { return Err(errors.make(99, 0, "typed body empty error became success")) }
+        }
+
+        let cancelled = tasks.together(-1, function(scope: tasks.Scope): Result<Bytes, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            try tasks.cancel(scope)
+            return Ok(Bytes("discarded after cancellation"))
+        })
+        match cancelled {
+            Err(error) { try require(error.code() == errors.cancelledCode(), "typed cancellation code") }
+            Ok(value) { return Err(errors.make(99, 0, "managed success hid cancellation")) }
+        }
+        let expired = tasks.together(0, function(scope: tasks.Scope): Result<List<Text>, errors.Error> {
+            return Ok(["discarded after deadline"])
+        })
+        match expired {
+            Err(error) { try require(error.code() == errors.timedOutCode(), "typed deadline code") }
+            Ok(value) { return Err(errors.make(99, 0, "managed success hid expired deadline")) }
+        }
+        return Ok()
+    }
     function verify(): Result<Nothing, errors.Error> {
         try require(tasks.supported(), "structured tasks are unavailable")
         let standalone = try workers.startSelf("stall")
@@ -224,27 +390,43 @@ let source = #"""
         try require(observedFailure.isErr(), "caught task failure was lost at scope exit")
         print("task failures cancel siblings")
 
+        let exitPids = [0, 0, 0]
+        try require(createToken(token), "create body-error PID rendezvous")
         let early = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
-            try tasks.start(scope, "stall", integerChannel(), 0)
+            try tasks.start(scope, "pid-stall", integerChannel(), token)
+            exitPids[0] = takePid(token)
+            try require(exitPids[0] > 0, "body-error worker did not report its PID")
             return Err(errors.make(78, 4, "body failed"))
         })
+        removeToken(token)
+        try require(exitPids[0] > 0 && !processAlive(exitPids[0]), "body error did not reap its blocked worker")
+        try require(createToken(token), "create try-error PID rendezvous")
         let propagated = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
-            try tasks.start(scope, "stall", integerChannel(), 0)
+            try tasks.start(scope, "pid-stall", integerChannel(), token)
+            exitPids[1] = takePid(token)
+            try require(exitPids[1] > 0, "try-error worker did not report its PID")
             try bodyFailure()
             return Ok()
         })
+        removeToken(token)
+        try require(exitPids[1] > 0 && !processAlive(exitPids[1]), "try error did not reap its blocked worker")
         for result in [early, propagated] {
             match result { Err(error) { try require(error.code() == 78 && error.message() == "body failed", "body failure was replaced") } Ok() { return Err(errors.make(99, 0, "body failure was lost")) } }
         }
         print("early return and try cleanup")
 
+        try require(createToken(token), "create cancellation PID rendezvous")
         let cancelled = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
-            let task = try tasks.start(scope, "stall", integerChannel(), 0)
+            let task = try tasks.start(scope, "pid-stall", integerChannel(), token)
+            exitPids[2] = takePid(token)
+            try require(exitPids[2] > 0, "cancelled worker did not report its PID")
             try tasks.cancel(scope); try tasks.cancel(scope)
             try require(tasks.response(task).isErr(), "cancelled task replied")
             try require(tasks.start(scope, "integer", integerChannel(), 1).isErr(), "cancelled scope started work")
             return Ok()
         })
+        removeToken(token)
+        try require(exitPids[2] > 0 && !processAlive(exitPids[2]), "cancellation did not reap its blocked worker")
         match cancelled { Err(error) { try require(error.code() == errors.cancelledCode(), "cancellation code") } Ok() { return Err(errors.make(99, 0, "cancelled scope succeeded")) } }
         print("idempotent cancellation")
 
@@ -373,6 +555,8 @@ let source = #"""
         })
         try require(tasks.serve(integerChannel(), function(value: Integer): Result<Integer, errors.Error> { return Ok(value) }).isErr(), "coordinator served a task")
         print("worker boundaries")
+        try typedScopeValues()
+        print("typed scope results")
         return Ok()
     }
     if workers.isWorker() {
@@ -382,7 +566,7 @@ let source = #"""
     }
     """#
 
-let expected = "typed replies, copied payloads and reaped workers\nout of order completion\none reply decode\nunobserved joins and expired aliases\ntask failures cancel siblings\nearly return and try cleanup\nidempotent cancellation\nvalidated shared deadlines\nnested cancellation\nEOF and malformed replies\ncodec errors stay recoverable\nworker boundaries\ndone\n"
+let expected = "typed replies, copied payloads and reaped workers\nout of order completion\none reply decode\nunobserved joins and expired aliases\ntask failures cancel siblings\nearly return and try cleanup\nidempotent cancellation\nvalidated shared deadlines\nnested cancellation\nEOF and malformed replies\ncodec errors stay recoverable\nworker boundaries\ntyped scope results\ndone\n"
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
 
 fixtures.rejects(frontend, #"""

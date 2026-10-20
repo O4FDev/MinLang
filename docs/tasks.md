@@ -17,15 +17,23 @@ if workers.isWorker() {
         return Ok("Welcome home, " + name + ".")
     }).unwrap()
 } else {
-    tasks.together(5000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+    let messages = tasks.together(5000, function(scope: tasks.Scope): Result<List<Text>, errors.Error> {
         let ada = try tasks.start(scope, "greet", greetings, "Ada")
         let grace = try tasks.start(scope, "greet", greetings, "Grace")
-        print(try tasks.response(ada))
-        print(try tasks.response(grace))
-        return Ok()
+        let first = try tasks.response(ada)
+        let second = try tasks.response(grace)
+        return Ok([first, second])
     }).unwrap()
+    for message in messages { print(message) }
 }
 ```
+
+`together` returns the callback's typed value after joining the children and
+finishing cleanup. Lists, records and Bytes keep their ordinary ownership and
+remain usable after the scope closes. Callbacks returning `Result<Nothing,
+errors.Error>` still finish with `Ok()`. Any body error, unobserved task error,
+cancellation or deadline failure replaces the callback's successful value;
+producing a value does not end the scope early.
 
 Each task re-executes the current program with the existing worker entry
 arguments. `workers.mode()` distinguishes different handlers. `tasks.serve`

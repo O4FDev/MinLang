@@ -1316,6 +1316,8 @@ managed objects between threads.
 The ordinary callback starts typed tasks with `tasks.start` and reads replies
 with `tasks.response`. Returning waits for unobserved replies; errors,
 cancellation and deadlines close and reap every child before the scope returns.
+The callback may return a typed value, delivered after all children finish;
+Lists, records and Bytes keep their ordinary ownership outside the scope.
 Task and Scope aliases cannot be used after the callback ends. Managed values
 stay on their creating domain, and workers receive copied messages in separate
 heaps. There is no function colouring or shared managed mutation.
