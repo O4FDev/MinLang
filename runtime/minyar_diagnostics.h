@@ -153,6 +153,8 @@ static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
 #endif
     minyar_call_depth = boundary->depth;
     minyar_depth_limit = boundary->limit;
+    /* An omitted empty scope has no header for the unwind walk to leave. */
+    minyar_rc_scope_leave_empty_v1();
     longjmp(*boundary->jump, reason);
 }
 

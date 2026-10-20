@@ -5,6 +5,7 @@ void minyar_rc_scope_enter_v1(void *header, void *values, long long count) {
     (void)header; (void)values; (void)count;
 }
 void minyar_rc_scope_leave_v1(void *header) { (void)header; }
+void minyar_rc_scope_leave_empty_v1(void) {}
 void minyar_rc_scope_move_v1(void *slot, void *value) { (void)slot; (void)value; }
 void minyar_rc_scope_poll_v1(void) {}
 void minyar_rc_scope_release_v1(void *value) { (void)value; }
@@ -22,6 +23,14 @@ void minyar_rc_scope_poll_v1(void) {
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #elif defined(MINYAR_CYCLE_LOCAL_PROOFS)
     rc_cycle_eager_service(32);
+#endif
+}
+
+/* No roots need registration. Preserve terminal eager cycle service without
+ * turning an empty scope into the native client's public NULL drain. */
+void minyar_rc_scope_leave_empty_v1(void) {
+#if defined(MINYAR_CYCLE_LOCAL_PROOFS) && !defined(MINYAR_BOUNDED_RC)
+    if (!rc_scopes && !rc_frames) rc_cycle_eager_service(SIZE_MAX);
 #endif
 }
 

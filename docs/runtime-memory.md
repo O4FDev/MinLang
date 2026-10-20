@@ -276,13 +276,24 @@ source edges across allocation before publishing the new retained edge. Taking
 publishers, traced borrows, intervening effects and later SSA uses retain their
 temporary owners. The publisher's retain/barrier and cleanup polls remain.
 
-A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
+A nonempty scope uses a 24-byte stack header to link cells for diagnostics. Diagnostics
 release these roots before jumping back to their native recovery boundary;
 normal returns clear cells explicitly and unlink the header. Neither the header
 nor its cells enter a heap queue or cache. Traced retains and cycle service points
 remain present, and the final cycle drain waits for both kinds of ownership root.
 Reference arguments still borrow their callers; consuming an unowned parameter
 first creates the consumer's count.
+
+A function with zero final owner/temporary cells omits its header and entry
+registration. It keeps every poll, return retain and publication, and uses an
+empty-leave terminal check. After restoring both ownership chains and call
+depth, diagnostic recovery performs the same check before jumping: eager cycle
+work finishes when both registered chains are empty. A nonempty child can now
+finish dead cycles while its empty parent remains active; native/caller/return
+counts still protect live values. Collection and native-resource finalization
+can occur earlier, without promising an identical service trace. Empty leave
+adds no work in arena, ordinary non-cycle or bounded runtimes and does not call
+public release with NULL. Previously generated nonempty scope ABIs remain.
 
 Eager scope releases inline the count decrement for shared untraced values
 when no destruction or collector work is pending; immortal values return
