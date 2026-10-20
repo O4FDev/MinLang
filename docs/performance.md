@@ -149,6 +149,18 @@ remain continuous and unscaled. The campaign uses fresh matching controls and
 one shared output filename. Complete observations and identities are in
 [`frames-runtime-borrows.json`](../experiments/memory/frames-runtime-borrows.json).
 
+Reusing temporary cells with disjoint complete CFG ranges reduced eager
+instructions from 2,367,901,958 to 2,360,820,360, a further 0.2991%. Matching
+arena counts were 1,188,611,561 and 1,188,646,852, a 0.00297% increase; candidate
+eager reaches 1.9861 times arena. Both same-source 726-function modules have
+zero legacy calls/fallbacks. Physical cells, slot GEPs and entry null stores each
+fall from 4,027 to 2,594, with the largest scope falling from 153 to 96 cells.
+Every logical RC call count remains identical, including retains, releases and
+polls. All 32 outputs match the frozen original LLVM and all counters remain
+continuous and unscaled. These fresh matching controls share one output
+filename. Full observations and identities are in
+[`frames-cell-reuse.json`](../experiments/memory/frames-cell-reuse.json).
+
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
 attaches to a stopped child, enables at exec, excludes the Python parent and
