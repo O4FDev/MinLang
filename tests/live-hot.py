@@ -112,6 +112,34 @@ def check(launcher, release):
             watch.close()
 
 
+def check_exited_program(launcher, release):
+    with tempfile.TemporaryDirectory(prefix="minyar-hot-exit-") as temporary:
+        project = Path(temporary)
+        (project / "src").mkdir()
+        (project / "Minyar.toml").write_text(
+            '[package]\nname = "hot-exit"\nversion = "0.1.0"\nkind = "bin"\n', encoding="utf-8"
+        )
+        source = project / "src/main.min"
+        before = ('use "system" as system\nrecord State { count: Integer }\n'
+                  'global STATE: State = State { count: 1 }\n'
+                  'print("FINITE first " + Text(system.processId()))\n')
+        publish(source, before)
+        watch = begin(launcher, project, project / "unused-fifo", release)
+        try:
+            first = watch.wait(re.compile(rb"FINITE first ([0-9]+)\n"))
+            watch.pids.add(int(first.group(1)))
+            watch.wait(b"Program exited", "stderr")
+            errors = len(watch.output["stderr"])
+            publish(source, before.replace("Integer", "Float").replace("count: 1", "count: 1.0").replace("first", "second"))
+            second = watch.wait(re.compile(rb"FINITE second ([0-9]+)\n"), since=first.end())
+            watch.pids.add(int(second.group(1)))
+            assert first.group(1) != second.group(1), watch.diagnostics()
+            watch.wait(b"Program exited", "stderr", errors)
+            watch.stop()
+        finally:
+            watch.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -132,8 +160,10 @@ def main():
             assert result.stdout == "2\n41\n42\n7\n9\n3\n", result
     if args.profile != "release":
         check(launcher, False)
+        check_exited_program(launcher, False)
     if args.profile != "debug":
         check(launcher, True)
+        check_exited_program(launcher, True)
 
 
 if __name__ == "__main__":
