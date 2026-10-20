@@ -1928,6 +1928,11 @@ Loops, match, closures and recoverable control flow inside a function that
 holds these capabilities reject; build callbacks in a separate helper.
 Use this registry from one serialized boot CPU, outside interrupt context.
 
+`model.modelRing(slots)` gives a queue with up to 64 requests in flight, each
+with its own Pending; `modelDeliverNewest` completes them out of order. Each
+reclaim is checked against its own slot and generation, so a completion for one
+buffer never returns another to the CPU.
+
 These opaque handles allocate ordinary managed records. A separately rooted
 runtime registry owns backing storage and checks capability epochs. Readiness
 validates the actual private queue completion before reclaim can return Cpu;
