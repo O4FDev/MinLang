@@ -60,11 +60,20 @@ check-osdev-dma-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
 build/testing/cycle-runtime-sanitize.o: build/testing/cycle-runtime.c $(wildcard runtime/minyar_*.h)
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
+# Seeded-mistake study: the same driver mistakes applied to Minyar and C, each
+# classified by the first stage that notices. Needs QEMU; not in check-portable.
+.PHONY: check-osdev-seeds check-osdev-seeds-host
+check-osdev-seeds: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-seeds.py
+
+check-osdev-seeds-host: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-seeds.py --no-qemu
+
 .PHONY: check-osdev-allocator
 check-osdev-allocator: build/.toolchain.json
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-allocator.py
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host
 check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator
 
 # Optional real hardware-emulation proof, separate from portable fake-tool tests.
