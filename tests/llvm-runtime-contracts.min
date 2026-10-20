@@ -1,0 +1,169 @@
+use "io" as io
+use "system" as system
+use "../tools/testing.min" as test
+
+function declaration(llvm: Text, name: Text): Text {
+    for line in test.lines(llvm) {
+        if line.startsWith("declare ") && test.contains(line, "@" + name + "(") { return line }
+    }
+    fail("missing runtime declaration: " + name)
+}
+function callCount(llvm: Text, name: Text): Integer {
+    let count = 0
+    for line in test.lines(llvm) {
+        if test.contains(line, "call ") && test.contains(line, "@" + name + "(") { count += 1 }
+    }
+    return count
+}
+function optimized(compiler: test.Compiler, source: Text, label: Text): Text {
+    let path = compiler.directory + "/" + label
+    io.writeTextFile(path + ".ll", source)
+    test.require(test.run([compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm", path + ".ll", "-o", path + ".opt.ll"], system.environment(), "", path + ".opt", compiler.linkTimeout), "optimize " + label)
+    return io.readTextFile(path + ".opt.ll")
+}
+function executesIR(compiler: test.Compiler, source: Text, label: Text) {
+    let path = compiler.directory + "/" + label
+    if test.addressEnabled(compiler.flags) {
+        source = test.replace(source, "define i32 @main() {", "define i32 @main() sanitize_address {")
+    }
+    io.writeTextFile(path + ".ll", source)
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link " + label)
+        let ran = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.require(ran, label + " " + level)
+        test.check(ran.output == "" && ran.errorOutput == "", label + " unexpected output\n" + ran.output + ran.errorOutput)
+    }
+}
+
+let compiler = test.compiler()
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
+io.writeTextFile(compiler.directory + "/runtime.c", contract)
+compiler.runtime = compiler.directory + "/runtime.o"
+let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime"]
+for flag in compiler.flags { build.add(flag) }
+for item in ["-c", compiler.directory + "/runtime.c", "-o", compiler.runtime] { build.add(item) }
+test.require(test.run(build, system.environment(), "", compiler.directory + "/runtime", 120), "build runtime declaration ownership oracle")
+
+// Cover every small equality load width, its memcmp path, UTF-8 and empty
+// headers. Ordinary mutation through aliases must still change lengths.
+test.executes(compiler, #"""
+function grow(bytes: Bytes, values: List<Integer>) { bytes.add(65); values.add(42) }
+let checks = 0
+for length in [0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 63] {
+    let left = Bytes(length)
+    let right = Bytes(length)
+    for index in 0..length { left[index] = 97; right[index] = 97 }
+    let first = Text(left)
+    let same = Text(right)
+    if first == same && first.byteLength == length { checks += 1 }
+    if length > 0 {
+        right[length - 1] = 98
+        if first != Text(right) { checks += 1 }
+    }
+}
+print(checks)
+let unicode = "é🌙"
+print(unicode.byteLength); print(unicode == Text(Bytes(unicode)))
+let bytes = Bytes(0)
+let values: List<Integer> = []
+print(bytes.length); print(values.length)
+grow(bytes, values)
+print(bytes.length); print(values.length)
+"""#, "21\n6\ntrue\n0\n0\n1\n1\n")
+let llvm = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+let parameter = "ptr nonnull captures(none) dereferenceable(16)"
+let effects = " nofree nosync nounwind willreturn "
+for name in ["minyar_text_byte_length", "minyar_bytes_length", "minyar_list_length", "minyar_texts_are_equal"] {
+    let equal = name == "minyar_texts_are_equal"
+    let result = "i64"
+    let arguments = "ptr %p"
+    let parameters = parameter
+    let memory = "memory(argmem: read)"
+    let combine = "  %result = add i64 %a, %b\n"
+    if equal {
+        result = "zeroext i1"; arguments = "ptr %p, ptr %q"
+        parameters += ", " + parameter; memory = "memory(read)"
+        combine = "  %x = zext i1 %a to i64\n  %y = zext i1 %b to i64\n  %result = add i64 %x, %y\n"
+    }
+    let actual = declaration(llvm, name)
+    test.check(actual == "declare " + result + " @" + name + "(" + parameters + ")" + effects + memory, name + " declaration contract changed\n" + actual)
+    let body = "define i64 @probe(" + arguments + ") {\n  %a = call " + result + " @" + name + "(" + arguments + ")\n  %b = call " + result + " @" + name + "(" + arguments + ")\n" + combine + "  ret i64 %result\n}\n"
+    test.check(callCount(optimized(compiler, actual + "\n" + body, name + "-pure"), name) == 1, name + " should merge identical reads")
+    let unknown = "declare " + result + " @" + name + "(ptr"
+    if equal { unknown += ", ptr" }
+    unknown += ")\n"
+    test.check(callCount(optimized(compiler, unknown + body, name + "-unknown"), name) == 2, name + " negative control must retain both unknown calls")
+    if !equal {
+        let mutation = actual + #"""
+
+@storage = global [8 x i64] zeroinitializer
+@header = global { ptr, i64, i64, ptr, ptr } { ptr @storage, i64 0, i64 CAPACITY, ptr null, ptr null }
+define i32 @main() {
+  %before = call i64 @FUNCTION(ptr @header)
+  %length = getelementptr i8, ptr @header, i64 8
+  store i64 7, ptr %length
+  %after = call i64 @FUNCTION(ptr @header)
+  %first = icmp eq i64 %before, 0
+  %second = icmp eq i64 %after, 7
+  %good = and i1 %first, %second
+  %failed = xor i1 %good, true
+  %status = zext i1 %failed to i32
+  ret i32 %status
+}
+"""#
+        mutation = test.replace(mutation, "FUNCTION", name)
+        let capacity = "7"
+        if name == "minyar_text_byte_length" { capacity = "-1" }
+        mutation = test.replace(mutation, "CAPACITY", capacity)
+        test.check(callCount(optimized(compiler, mutation, name + "-mutation"), name) == 2, name + " must observe header mutation")
+        executesIR(compiler, mutation, name + "-mutation-run")
+    }
+}
+
+// Backing memory is reached by a loaded pointer, so equality needs the broader
+// memory(read). An argmem-only contract incorrectly permits CSE across this store.
+let mutation = declaration(llvm, "minyar_texts_are_equal") + #"""
+
+@data = global [1 x i8] c"a"
+@other = global [1 x i8] c"a"
+@left = global { ptr, i64, i64, ptr, ptr } { ptr @data, i64 1, i64 1, ptr null, ptr null }
+@right = global { ptr, i64, i64, ptr, ptr } { ptr @other, i64 1, i64 1, ptr null, ptr null }
+define i32 @main() {
+  %before = call zeroext i1 @minyar_texts_are_equal(ptr @left, ptr @right)
+  store i8 98, ptr @data
+  %after = call zeroext i1 @minyar_texts_are_equal(ptr @left, ptr @right)
+  %changed = xor i1 %before, %after
+  %failed = xor i1 %changed, true
+  %status = zext i1 %failed to i32
+  ret i32 %status
+}
+"""#
+test.check(callCount(optimized(compiler, mutation, "equality-mutation"), "minyar_texts_are_equal") == 2, "Text equality must observe backing mutation")
+executesIR(compiler, mutation, "equality-mutation-run")
+test.check(declaration(llvm, "minyar_fail") == "declare void @minyar_fail(ptr) cold noreturn", "fail must remain an effectful terminal path")
+test.check(declaration(llvm, "minyar_exit") == "declare void @minyar_exit(i64) noreturn", "exit must remain an effectful terminal path")
+let bootstrap = io.readTextFile("bootstrap/stage0.c")
+for name in ["minyar_text_byte_length", "minyar_bytes_length", "minyar_list_length", "minyar_texts_are_equal", "minyar_fail", "minyar_exit"] {
+    test.check(test.contains(bootstrap, "\"" + declaration(llvm, name) + "\\n\""), name + " must retain the same stage0 declaration")
+}
+for source in ["fail(\"declaration failure\")\n", "print(42)\nexit(7)\n"] {
+    test.require(test.compile(compiler, source), "compile terminal declaration fixture")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link terminal declaration fixture")
+        let ran = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        if source.startsWith("fail") {
+            test.check(ran.status == 1 && ran.output == "" && test.runtimeDiagnostic(ran.errorOutput) == "Minyar stopped: declaration failure\n", "fail diagnostic or status changed\n" + ran.output + ran.errorOutput)
+        } else {
+            test.check(ran.status == 7 && ran.output == "42\n" && ran.errorOutput == "", "exit output or status changed\n" + ran.output + ran.errorOutput)
+        }
+    }
+}
+test.removeTree(compiler.directory)
+print("LLVM runtime contracts: passed")
