@@ -252,6 +252,21 @@ The compiler owns one private zeroed 256-byte pending array. Contextual
 Slots are literal or module-constant Integers in 0..255. Repeated signals
 coalesce. These flags carry no event count or DMA ownership permission.
 
+Opaque native record tags `dma_cpu`, `dma_pending` and `dma_queue` keep the
+ordinary managed-record pointer ABI. One canonical empty declaration per tag
+identifies its resolved source type; these are not Integer/address primitives.
+Record construction and unclassified native boundaries reject. Compiler-owned
+`dma`/`dma_model` native lowering validates the complete signature before assigning
+a borrow or consume rule; user names alone grant no borrowing permission.
+
+`CompilerContext.dma` records declaration kinds, resolved call symbols and source
+binding identities separately from LLVM owner slots. Parameters keep logical
+ordinals even when immutable parameter lowering substitutes negative LLVM IDs.
+The effects stage checks typed source ownership before the IRQ audit. Its first
+flow subset admits straight-line statements, if/else and returns with exact
+continuing-state joins, normal-exit discharge and an acyclic consuming call graph.
+Managed handle reclamation never substitutes for payload ownership/completion.
+
 ## Node kinds
 
 `syntaxKindName` is the central catalogue. The ranges are registered in the

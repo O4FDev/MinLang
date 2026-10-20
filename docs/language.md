@@ -1758,6 +1758,72 @@ ordinary record field accesses into volatile MMIO operations.
 See [kernel development](os-development.md) for hosted driver tests, bounded
 QEMU tests, GDB and symbolized panic addresses.
 
+## Interrupt contexts and DMA ownership
+
+A contextual handler declaration binds a scalar function to one interrupt vector:
+
+```minyar
+interrupt function clockTick(vector: Integer) handles(32) {
+    signalInterrupt(0)
+}
+```
+
+Compile this context with `--freestanding --kernel-target x86_64` or `arm64`.
+PIC vectors 32..47 and GIC IDs 16..1019 are accepted respectively. A handler
+takes one Integer and returns Nothing. Its complete direct call graph must use
+scalar, acyclic code: allocation, managed values, Float, blocking, locks,
+native calls, indirect calls, recursion and loops reject. Ordinary functions
+keep their ordinary behavior. This context proof is separate from hardware
+entry, register preservation and a physical stack bound.
+
+`signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
+`takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.
+These operations use release/acquire ordering. A flag carries no event count,
+payload access or DMA completion permission. Existing user callables with these
+names retain normal lookup precedence.
+
+The `dma` module separates CPU access from a device-owned pending request:
+
+```minyar
+use "dma" as dma
+use "dma/model" as model
+
+let queue = model.modelQueue()
+let cpu = dma.allocate(16, 16)
+dma.store8(cpu, 0, 7)
+let pending = dma.submit(queue, cpu, 16)
+let delivered = model.modelDeliver(queue, Bytes("hello"))
+let completed = dma.reclaim(pending, 0)
+print(dma.load8(completed, 0)) // 104
+dma.dispose(completed)
+```
+
+Moving a Cpu or Pending binding makes its previous binding unavailable.
+`load8`, `store8` and `copyOut` borrow Cpu; `ready` borrows Pending.
+`submit`, `reclaim`, `dispose` and `retire` consume their capability. Ordinary
+helpers consume affine arguments; only compiler-owned native primitives have
+the borrowing rules above. `copyOut` returns independent Bytes. A reclaimed Cpu
+exposes only the completed prefix, including zero bytes for an empty completion.
+
+The first flow subset supports straight-line code, if/else, concrete direct
+helpers and normal returns. Continuing branches must agree on ownership; every
+normal exit must transfer, dispose or retire each live capability. Cpu/Pending
+cannot escape through records, containers, choices, Results, callbacks or globals.
+Queue aliases may be passed directly, but Queue also cannot enter these aggregate
+or captured forms. Opaque handles have no automatic record equality or hashing.
+Loops, match and recoverable control flow with these capabilities reject.
+Use this registry from one serialized boot CPU, outside interrupt context.
+
+These opaque handles allocate ordinary managed records. A separately rooted
+runtime registry owns backing storage and checks capability epochs. Readiness
+validates the actual private queue completion before reclaim can return Cpu;
+a caller's Boolean or interrupt flag cannot authorize it. Bounded reclaim stops
+on timeout and quarantines storage. Retirement also pins storage; it does not
+cancel DMA or provide safe reset. The deterministic model tests this protocol.
+Hardware adapters additionally require coherent identity mappings and an actual
+retained queue owner. Raw native/machine escapes, IOMMU isolation, noncoherent
+cache maintenance and safe device reset are outside this guarantee.
+
 ## Programs and entry points
 
 Executable statements may be written directly at the top level. They run from

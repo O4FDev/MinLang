@@ -226,6 +226,15 @@ adds ASan/UBSan. These hosted checks execute no port instructions. The optional
 fixed-clock QEMU run in [kernel development](os-development.md) checks the x86
 adapter and guest exit separately.
 
+`make check-osdev-interrupts` checks ordinary positive controls before adapted
+interrupt-context rejection cases, inspects actual scalar clone call graphs,
+and executes ordinary coalescing flags at O0/O2. Its sanitizer variant selects
+the instrumented compiler/runtime. Parser controls accept equivalent LLVM
+whitespace and escaped symbol identities. `check-osdev-interrupt-assembly`
+requires real entry bridges and checks a separate cross-target assembly subset;
+missing bridges fail explicitly. Actual interrupt register/stack preservation
+requires finite guest tests and is not inferred from the context or host checks.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

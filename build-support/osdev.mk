@@ -37,8 +37,21 @@ check-osdev-rtc-sanitize: build/.toolchain.json build/minyarc-sanitize
 
 check-osdev-host: check-osdev-fields check-security-os-http
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc
-check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize
+.PHONY: check-osdev-interrupts check-osdev-interrupts-sanitize check-osdev-interrupt-assembly
+check-osdev-interrupts: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-interrupts.py --phase ir
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-interrupts.py --phase host-flags
+
+check-osdev-interrupts-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-interrupts.py --phase ir --sanitized-compiler
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) python3 tests/osdev-interrupts.py --phase host-flags --sanitized-compiler
+
+# Requires the subsequent hardware entry-ABI implementation; absence fails closed.
+check-osdev-interrupt-assembly: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-interrupts.py --phase assembly --case signal-zero
+
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts
+check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize
 
 # Optional real hardware-emulation proof, separate from portable fake-tool tests.
 .PHONY: check-osdev-qemu

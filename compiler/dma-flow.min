@@ -1,0 +1,601 @@
+// Source-level ownership, independent of RC owner-slot lowering. CPU/Pending
+// remain managed handles; payload completion/coherency belongs to the runtime.
+// The first control-flow subset is straight-line code, if/else and returns.
+record DmaFlowProgram {
+    context: CompilerContext
+    owners: List<Integer>
+    closures: List<Boolean>
+    selected: List<Boolean>
+    primitives: List<Integer>
+    used: List<Integer>
+    callers: List<Integer>
+    callees: List<Integer>
+}
+
+record DmaFlowFrame {
+    program: DmaFlowProgram
+    root: Integer
+    symbol: Integer
+    returned: Integer
+    ids: List<Integer>
+    phases: List<Integer>
+    types: List<Integer>
+    sites: List<Integer>
+}
+
+function dmaFlowReject(context: CompilerContext, node: Integer, message: Text) {
+    if node < 0 || node >= context.syntax.nodes.length { node = 0 }
+    failAtSyntax(context.syntax, node, "DMA ownership: " + message)
+}
+
+function dmaFlowPhase(context: CompilerContext, type: Integer): Integer {
+    let kind = dmaKind(context, type)
+    if kind == 1 || kind == 2 { return kind }
+    return 0
+}
+
+function dmaFlowFact(values: List<Integer>, node: Integer): Integer {
+    if node < 0 || node >= values.length { return -1 }
+    return values[node]
+}
+
+function dmaFlowFind(values: List<Integer>, value: Integer): Integer {
+    let index = 0
+    while index < values.length {
+        if values[index] == value { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+function dmaFlowCopy(values: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    for value in values { result.add(value) }
+    return result
+}
+
+function dmaFlowReplace(target: List<Integer>, values: List<Integer>) {
+    target.clear()
+    for value in values { target.add(value) }
+}
+
+// Follow actual type metadata, with a visited worklist for recursive records.
+// No opaque phase is derived from a numeric type or a source declaration name.
+function dmaFlowContains(context: CompilerContext, type: Integer): Boolean {
+    let queue: List<Integer> = [type]
+    let seen: List<Integer> = []
+    let cursor = 0
+    while cursor < queue.length {
+        let current = queue[cursor]
+        cursor = cursor + 1
+        if dmaFlowFind(seen, current) < 0 {
+            seen.add(current)
+            let opaque = dmaKind(context, current)
+            if opaque > 0 { return true }
+            if opaque == 0 {
+                if isListType(current) { queue.add(listElementType(current)) }
+                else {
+                    if isMapType(current) { queue.add(mapKeyType(current)); queue.add(mapValueType(current)) }
+                    else {
+                        if isSetType(current) { queue.add(setElementType(current)) }
+                        else {
+                            if isCallbackType(current, context.functionNames) {
+                                for child in callbackSignatureTypes(context.functionNames[current - 1000]) { queue.add(child) }
+                            } else {
+                                if isRecordType(current) {
+                                    let symbol = -1
+                                    let candidate = 0
+                                    while candidate < context.functionNames.length {
+                                        if context.symbolKinds[candidate] == 2 && context.functionReturnTypes[candidate] == current { symbol = candidate }
+                                        candidate = candidate + 1
+                                    }
+                                    if symbol < 0 { dmaFlowReject(context, 0, "record type lacks resolved field metadata") }
+                                    let offset = functionParameterOffset(context.functionParameterCounts, symbol)
+                                    let field = 0
+                                    while field < context.functionParameterCounts[symbol] {
+                                        queue.add(context.functionParameterTypes[offset + field])
+                                        field = field + 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+function dmaFlowType(context: CompilerContext, node: Integer, type: Integer, direct: Boolean) {
+    if dmaFlowContains(context, type) && (!direct || dmaKind(context, type) == 0) {
+        dmaFlowReject(context, node, "opaque DMA handles cannot be contained in records, containers, choices, Results, callbacks or globals")
+    }
+}
+
+function dmaFlowDefinition(context: CompilerContext, symbol: Integer, site: Integer): Integer {
+    if symbol < 0 || symbol >= context.functionNames.length || context.symbolKinds[symbol] != 1 {
+        dmaFlowReject(context, site, "a consuming call needs a resolved ordinary function")
+    }
+    let node = dmaFlowFact(context.syntax.symbolNodes, symbol)
+    if node < 0 || node >= context.syntax.nodes.length { dmaFlowReject(context, site, "a consuming helper needs its complete typed source body") }
+    let declaration = context.syntax.nodes[node]
+    if declaration.kind != 1 || declaration.symbol != symbol || declaration.body < 0 || declaration.end <= declaration.body {
+        dmaFlowReject(context, site, "a consuming helper needs its complete typed source body")
+    }
+    let body = -1
+    let child = declaration.firstChild
+    while child >= 0 {
+        if context.syntax.nodes[child].kind == 100 {
+            if body >= 0 { dmaFlowReject(context, node, "function has ambiguous typed body blocks") }
+            body = child
+        } else {
+            if context.syntax.nodes[child].kind != 6 { dmaFlowReject(context, child, "function body structure is unsupported") }
+        }
+        child = context.syntax.nodes[child].nextSibling
+    }
+    if body < 0 { dmaFlowReject(context, node, "a consuming helper needs its complete typed source body") }
+    return node
+}
+
+function dmaFlowDepth(frame: DmaFlowFrame, node: Integer, depth: Integer) {
+    if depth >= 256 { dmaFlowReject(frame.program.context, node, "structured syntax nesting exceeds the supported depth of 256") }
+}
+
+function dmaFlowUse(frame: DmaFlowFrame, node: Integer) {
+    frame.program.used[node] = frame.program.used[node] + 1
+    if frame.program.used[node] != 1 { dmaFlowReject(frame.program.context, node, "syntax value has more than one ownership interpretation") }
+}
+
+function dmaFlowSlot(frame: DmaFlowFrame, node: Integer): Integer {
+    let context = frame.program.context
+    if frame.program.owners[node] != frame.root || frame.program.closures[node] {
+        dmaFlowReject(context, node, "capability is captured or outside its resolved function")
+    }
+    let id = dmaFlowFact(context.dma.bindings, node)
+    let slot = dmaFlowFind(frame.ids, id)
+    if id < 0 || slot < 0 { dmaFlowReject(context, node, "capability needs a resolved logical local binding") }
+    return slot
+}
+
+function dmaFlowName(frame: DmaFlowFrame, node: Integer, state: List<Integer>): Integer {
+    let context = frame.program.context
+    let syntax = context.syntax.nodes[node]
+    if syntax.kind != 200 || syntax.firstChild >= 0 { dmaFlowReject(context, node, "affine operands must be bare uncaptured local names") }
+    let slot = dmaFlowSlot(frame, node)
+    let phase = dmaFlowPhase(context, syntax.type)
+    if phase == 0 || frame.phases[slot] != phase || frame.types[slot] != syntax.type {
+        dmaFlowReject(context, node, "capability phase does not match its resolved binding")
+    }
+    if state[slot] != phase { dmaFlowReject(context, node, "binding is unavailable, out of scope or already moved") }
+    dmaFlowUse(frame, node)
+    return slot
+}
+
+function dmaFlowEmpty(frame: DmaFlowFrame, state: List<Integer>, node: Integer) {
+    for phase in state {
+        if phase == 1 || phase == 2 { dmaFlowReject(frame.program.context, node, "normal exit must transfer, dispose or retire every live CPU/Pending capability") }
+    }
+}
+
+function dmaFlowClose(frame: DmaFlowFrame, state: List<Integer>, locals: List<Integer>, node: Integer) {
+    for slot in locals {
+        if state[slot] == 1 || state[slot] == 2 { dmaFlowReject(frame.program.context, node, "scope exit leaves a live capability; transfer, dispose or retire it explicitly") }
+        state[slot] = -1
+    }
+}
+
+// Argument evaluation precedes the ownership transition at the call boundary.
+// A later scalar argument may borrow the capability, but cannot move it away
+// before this call consumes/borrows it. Nested affine temporaries never qualify.
+function dmaFlowCall(frame: DmaFlowFrame, node: Integer, state: List<Integer>, borrowOnly: Boolean, bound: Boolean, depth: Integer): Integer {
+    let program = frame.program
+    let context = program.context
+    let syntax = context.syntax.nodes[node]
+    let result = dmaFlowPhase(context, syntax.type)
+    let callee = dmaFlowFact(context.dma.callees, node)
+    let resolved = callee >= 0 && callee < context.functionNames.length && context.symbolKinds[callee] == 1
+    let rule = 0
+    let count = -1
+    let offset = 0
+    if resolved {
+        rule = program.primitives[callee]
+        count = context.functionParameterCounts[callee]
+        offset = functionParameterOffset(context.functionParameterCounts, callee)
+    }
+    if result > 0 && (!bound || borrowOnly || !resolved) {
+        dmaFlowReject(context, node, "affine call results must bind directly through a resolved call")
+    }
+    let affine = -1
+    let expectedPhase = 0
+    let argument = syntax.firstChild
+    let index = 0
+    while argument >= 0 {
+        let phase = dmaFlowPhase(context, context.syntax.nodes[argument].type)
+        if phase > 0 {
+            if !resolved || index >= count || phase != dmaFlowPhase(context, context.functionParameterTypes[offset + index]) {
+                dmaFlowReject(context, argument, "affine argument has no resolved consuming or trusted borrow signature")
+            }
+            if affine >= 0 { dmaFlowReject(context, node, "calls may have at most one affine argument") }
+            affine = dmaFlowName(frame, argument, state)
+            expectedPhase = phase
+        } else {
+            dmaFlowExpression(frame, argument, state, borrowOnly, false, depth + 1)
+            if resolved && index < count && dmaFlowPhase(context, context.functionParameterTypes[offset + index]) > 0 {
+                dmaFlowReject(context, argument, "affine argument must be a bare local name")
+            }
+        }
+        index = index + 1
+        argument = context.syntax.nodes[argument].nextSibling
+    }
+    if resolved && index != count { dmaFlowReject(context, node, "resolved call argument provenance is incomplete") }
+    let consumes = affine >= 0
+    if rule == 2 || rule == 3 || rule == 4 || rule == 7 { consumes = false }
+    if affine >= 0 {
+        if state[affine] != expectedPhase { dmaFlowReject(context, node, "an argument moved the capability before the call boundary") }
+        if borrowOnly && consumes { dmaFlowReject(context, node, "conditions and short-circuit operands may only borrow capabilities") }
+        if rule == 0 { dmaFlowDefinition(context, callee, node) }
+        if consumes { state[affine] = 0 }
+    }
+    if result > 0 {
+        if rule == 0 { dmaFlowDefinition(context, callee, node) }
+        dmaFlowUse(frame, node)
+    }
+    return result
+}
+
+function dmaFlowExpression(frame: DmaFlowFrame, node: Integer, state: List<Integer>, borrowOnly: Boolean, bound: Boolean, depth: Integer): Integer {
+    dmaFlowDepth(frame, node, depth)
+    let context = frame.program.context
+    let syntax = context.syntax.nodes[node]
+    let phase = dmaFlowPhase(context, syntax.type)
+    if syntax.kind == 209 { return dmaFlowCall(frame, node, state, borrowOnly, bound, depth) }
+    if phase > 0 {
+        if !bound || borrowOnly { dmaFlowReject(context, node, "affine values cannot be discarded, copied or used outside a direct move/borrow") }
+        let slot = dmaFlowName(frame, node, state)
+        state[slot] = 0
+        return phase
+    }
+    let kind = syntax.kind
+    let ordinary = kind == 200 || kind == 201 || kind == 202 || kind == 203 || kind == 204 || kind == 205 || kind == 206 || kind == 207 || kind == 210 || kind == 211 || kind == 212 || kind == 213 || kind == 214 || kind == 215 || kind == 220 || kind == 221
+    if !ordinary { dmaFlowReject(context, node, "unsupported expression in an affine-using function") }
+    let conditional = borrowOnly
+    if kind == 221 {
+        if syntax.operator < 0 || syntax.operator >= context.tokenTexts.length { dmaFlowReject(context, node, "binary operation lacks typed operator provenance") }
+        let operation = context.tokenTexts[syntax.operator]
+        if operation == "&&" || operation == "||" { conditional = true }
+    }
+    let child = syntax.firstChild
+    while child >= 0 {
+        dmaFlowExpression(frame, child, state, conditional, false, depth + 1)
+        child = context.syntax.nodes[child].nextSibling
+    }
+    return 0
+}
+
+function dmaFlowStatement(frame: DmaFlowFrame, node: Integer, state: List<Integer>, locals: List<Integer>, depth: Integer): Boolean {
+    dmaFlowDepth(frame, node, depth)
+    let context = frame.program.context
+    let syntax = context.syntax.nodes[node]
+    let kind = syntax.kind
+    if kind == 100 { return dmaFlowSequence(frame, node, state, depth + 1) }
+    if kind == 101 {
+        let condition = syntax.firstChild
+        if condition < 0 { dmaFlowReject(context, node, "if is missing a typed condition") }
+        dmaFlowExpression(frame, condition, state, true, false, depth + 1)
+        let left = context.syntax.nodes[condition].nextSibling
+        if left < 0 { dmaFlowReject(context, node, "if is missing its branch body") }
+        let right = context.syntax.nodes[left].nextSibling
+        if right >= 0 && context.syntax.nodes[right].nextSibling >= 0 { dmaFlowReject(context, node, "if has unsupported extra branches") }
+        let leftState = dmaFlowCopy(state)
+        let rightState = dmaFlowCopy(state)
+        let leftLocals: List<Integer> = []
+        let rightLocals: List<Integer> = []
+        let leftContinues = dmaFlowStatement(frame, left, leftState, leftLocals, depth + 1)
+        dmaFlowClose(frame, leftState, leftLocals, left)
+        let rightContinues = true
+        if right >= 0 {
+            rightContinues = dmaFlowStatement(frame, right, rightState, rightLocals, depth + 1)
+            dmaFlowClose(frame, rightState, rightLocals, right)
+        }
+        if leftContinues && rightContinues {
+            let slot = 0
+            while slot < state.length {
+                if leftState[slot] != rightState[slot] { dmaFlowReject(context, node, "continuing branches disagree on capability ownership") }
+                slot = slot + 1
+            }
+        }
+        if leftContinues { dmaFlowReplace(state, leftState) }
+        else {
+            if rightContinues { dmaFlowReplace(state, rightState) }
+            else { dmaFlowReplace(state, leftState) }
+        }
+        return leftContinues || rightContinues
+    }
+    if kind == 104 {
+        let value = syntax.firstChild
+        if value < 0 || context.syntax.nodes[value].nextSibling >= 0 { dmaFlowReject(context, node, "binding needs exactly one typed initializer") }
+        let slot = dmaFlowSlot(frame, node)
+        if state[slot] != -1 { dmaFlowReject(context, node, "logical binding was declared twice") }
+        let phase = dmaFlowExpression(frame, value, state, false, true, depth + 1)
+        if phase != frame.phases[slot] || context.syntax.nodes[value].type != frame.types[slot] { dmaFlowReject(context, node, "binding initializer phase is inconsistent") }
+        state[slot] = phase
+        locals.add(slot)
+        return true
+    }
+    if kind == 111 {
+        let target = syntax.firstChild
+        if target < 0 || context.syntax.nodes[target].kind != 214 { dmaFlowReject(context, node, "assignment target lacks typed provenance") }
+        let value = context.syntax.nodes[target].nextSibling
+        if value < 0 || context.syntax.nodes[value].nextSibling >= 0 { dmaFlowReject(context, node, "assignment needs exactly one typed RHS") }
+        let phase = dmaFlowPhase(context, context.syntax.nodes[target].type)
+        if phase > 0 {
+            if context.syntax.nodes[target].firstChild >= 0 || syntax.operator < 0 || syntax.operator >= context.tokenTexts.length || context.tokenTexts[syntax.operator] != "=" {
+                dmaFlowReject(context, target, "affine assignment must target a bare local binding")
+            }
+            let slot = dmaFlowSlot(frame, target)
+            if state[slot] == -1 || frame.phases[slot] != phase || frame.types[slot] != context.syntax.nodes[target].type {
+                dmaFlowReject(context, target, "assignment destination is out of scope or has the wrong phase")
+            }
+            let result = dmaFlowExpression(frame, value, state, false, true, depth + 1)
+            if result != phase || context.syntax.nodes[value].type != frame.types[slot] { dmaFlowReject(context, value, "assignment changes capability type") }
+            if state[slot] != 0 { dmaFlowReject(context, target, "assignment would overwrite a live ownership obligation") }
+            state[slot] = phase
+            dmaFlowUse(frame, target)
+        } else {
+            dmaFlowExpression(frame, target, state, false, false, depth + 1)
+            dmaFlowExpression(frame, value, state, false, false, depth + 1)
+        }
+        return true
+    }
+    if kind == 105 {
+        let value = syntax.firstChild
+        if frame.returned > 0 {
+            if value < 0 || context.syntax.nodes[value].kind != 200 || context.syntax.nodes[value].nextSibling >= 0 { dmaFlowReject(context, node, "affine returns must transfer one bare local name") }
+            let phase = dmaFlowExpression(frame, value, state, false, true, depth + 1)
+            if phase != frame.returned { dmaFlowReject(context, value, "returned capability has the wrong phase") }
+        } else {
+            if value >= 0 {
+                if context.syntax.nodes[value].nextSibling >= 0 { dmaFlowReject(context, node, "return has unsupported extra values") }
+                dmaFlowExpression(frame, value, state, false, false, depth + 1)
+            }
+        }
+        dmaFlowEmpty(frame, state, node)
+        return false
+    }
+    if kind == 110 {
+        let child = syntax.firstChild
+        while child >= 0 {
+            dmaFlowExpression(frame, child, state, false, false, depth + 1)
+            child = context.syntax.nodes[child].nextSibling
+        }
+        return true
+    }
+    dmaFlowReject(context, node, "unsupported statement in an affine-using function")
+    return false
+}
+
+function dmaFlowSequence(frame: DmaFlowFrame, node: Integer, state: List<Integer>, depth: Integer): Boolean {
+    dmaFlowDepth(frame, node, depth)
+    let context = frame.program.context
+    let locals: List<Integer> = []
+    let continues = true
+    let child = context.syntax.nodes[node].firstChild
+    while child >= 0 {
+        let kind = context.syntax.nodes[child].kind
+        let declaration = node == 0 && kind >= 1 && kind <= 9
+        if !declaration {
+            // Even after a return, validate every remaining source statement.
+            // This detached state can never turn a terminated path live again.
+            let next = dmaFlowStatement(frame, child, state, locals, depth + 1)
+            continues = continues && next
+        }
+        child = context.syntax.nodes[child].nextSibling
+    }
+    dmaFlowClose(frame, state, locals, node)
+    return continues
+}
+
+function dmaFlowCheckFunction(program: DmaFlowProgram, root: Integer) {
+    let context = program.context
+    let symbol = -1
+    let returned = 0
+    let body = root
+    if root != 0 {
+        symbol = context.syntax.nodes[root].symbol
+        dmaFlowDefinition(context, symbol, root)
+        returned = dmaFlowPhase(context, context.functionReturnTypes[symbol])
+        body = context.syntax.nodes[root].firstChild
+        while body >= 0 && context.syntax.nodes[body].kind == 6 { body = context.syntax.nodes[body].nextSibling }
+    }
+    let frame = DmaFlowFrame { program: program, root: root, symbol: symbol, returned: returned, ids: [], phases: [], types: [], sites: [] }
+    let state: List<Integer> = []
+    let node = 0
+    while node < context.syntax.nodes.length {
+        if program.owners[node] == root {
+            let syntax = context.syntax.nodes[node]
+            if syntax.kind == 6 || syntax.kind == 104 {
+                let type = syntax.type
+                if syntax.kind == 104 {
+                    if syntax.firstChild < 0 { dmaFlowReject(context, node, "binding has no typed initializer") }
+                    type = context.syntax.nodes[syntax.firstChild].type
+                }
+                let id = dmaFlowFact(context.dma.bindings, node)
+                if id < 0 || dmaFlowFind(frame.ids, id) >= 0 { dmaFlowReject(context, node, "binding needs one distinct resolved logical local ID") }
+                frame.ids.add(id)
+                let phase = dmaFlowPhase(context, type)
+                frame.phases.add(phase); frame.types.add(type); frame.sites.add(node)
+                let initial = -1
+                if syntax.kind == 6 { initial = phase }
+                state.add(initial)
+            }
+        }
+        node = node + 1
+    }
+    dmaFlowSequence(frame, body, state, 0)
+    dmaFlowEmpty(frame, state, root)
+}
+
+function dmaFlowDAG(program: DmaFlowProgram) {
+    let context = program.context
+    let root = 0
+    while root < context.functionNames.length {
+        let definition = dmaFlowFact(context.syntax.symbolNodes, root)
+        if definition >= 0 && definition < program.selected.length && program.selected[definition] && program.primitives[root] == 0 {
+            // Scalar-only bridges must not hide a cycle back into a consuming
+            // helper. Each symbol is visited once per root, bounded by the AST.
+            let queue: List<Integer> = [root]
+            let cursor = 0
+            while cursor < queue.length {
+                let caller = queue[cursor]
+                cursor = cursor + 1
+                let edge = 0
+                while edge < program.callers.length {
+                    if program.callers[edge] == caller {
+                        let callee = program.callees[edge]
+                        if callee == root { dmaFlowReject(context, definition, "recursive consuming-helper call graphs are unsupported") }
+                        if dmaFlowFind(queue, callee) < 0 { queue.add(callee) }
+                    }
+                    edge = edge + 1
+                }
+            }
+        }
+        root = root + 1
+    }
+}
+
+function checkDmaOwnership(context: CompilerContext) {
+    if context.dma.kinds.length == 0 { return }
+    // These kind-6 tokens are resolved contextual declaration modifiers, not
+    // ordinary identifiers. Feature 16 alone also includes IRQ declarations.
+    let token = 0
+    while token < context.tokenKinds.length {
+        if context.tokenKinds[token] == 6 && (context.tokenTexts[token] == "thread" || context.tokenTexts[token] == "parallel") {
+            failAtToken(context.tokenLines, token, "DMA ownership: serialized boot-CPU DMA cannot be combined with thread or parallel execution declarations")
+        }
+        token = token + 1
+    }
+    let count = context.syntax.nodes.length
+    if count == 0 || context.syntax.nodes[0].kind != 0 { dmaFlowReject(context, 0, "module syntax is missing") }
+    let program = DmaFlowProgram { context: context, owners: [], closures: [], selected: [], primitives: [], used: [], callers: [], callees: [] }
+    let seen: List<Boolean> = []
+    let node = 0
+    while node < count {
+        program.owners.add(-1); program.closures.add(false); program.selected.add(false); program.used.add(0); seen.add(false)
+        node = node + 1
+    }
+    let symbol = 0
+    while symbol < context.functionNames.length {
+        program.primitives.add(dmaPrimitive(context, symbol))
+        let site = dmaFlowFact(context.syntax.symbolNodes, symbol)
+        let type = context.functionReturnTypes[symbol]
+        let direct = context.symbolKinds[symbol] == 1 || (symbol < context.dma.kinds.length && context.dma.kinds[symbol] > 0)
+        dmaFlowType(context, site, type, direct)
+        if !direct && dmaFlowPhase(context, type) > 0 { dmaFlowReject(context, site, "CPU/Pending cannot be stored in module constants or globals") }
+        if context.symbolKinds[symbol] == 4 && isCallbackType(1000 + symbol, context.functionNames) {
+            for child in callbackSignatureTypes(context.functionNames[symbol]) { dmaFlowType(context, site, child, false) }
+        }
+        let offset = functionParameterOffset(context.functionParameterCounts, symbol)
+        let parameter = 0
+        let affine = 0
+        while parameter < context.functionParameterCounts[symbol] {
+            let child = context.functionParameterTypes[offset + parameter]
+            dmaFlowType(context, site, child, context.symbolKinds[symbol] == 1)
+            if dmaFlowPhase(context, child) > 0 { affine = affine + 1 }
+            parameter = parameter + 1
+        }
+        if context.symbolKinds[symbol] == 1 && affine > 1 { dmaFlowReject(context, site, "ordinary functions may have at most one affine parameter") }
+        symbol = symbol + 1
+    }
+    let queue: List<Integer> = [0]
+    seen[0] = true; program.owners[0] = 0
+    let cursor = 0
+    while cursor < queue.length {
+        node = queue[cursor]
+        cursor = cursor + 1
+        let syntax = context.syntax.nodes[node]
+        let owner = program.owners[node]
+        if syntax.kind == 1 {
+            owner = node; program.owners[node] = node
+            if syntax.symbol < 0 || syntax.symbol >= context.functionNames.length || context.symbolKinds[syntax.symbol] != 1 || dmaFlowFact(context.syntax.symbolNodes, syntax.symbol) != node {
+                dmaFlowReject(context, node, "function has no unique resolved declaration identity")
+            }
+        }
+        let closure = program.closures[node] || syntax.kind == 208
+        program.closures[node] = closure
+        if syntax.kind == 103 && parallelForAt(context.tokenKinds, context.tokenTexts, syntax.start) {
+            dmaFlowReject(context, node, "serialized boot-CPU DMA cannot be combined with parallel ranges")
+        }
+        if syntax.kind == 209 && owner > 0 && !closure && program.primitives[context.syntax.nodes[owner].symbol] == 0 {
+            let callee = dmaFlowFact(context.dma.callees, node)
+            if callee >= 0 && callee < context.functionNames.length && context.symbolKinds[callee] == 1 && program.primitives[callee] == 0 {
+                program.callers.add(context.syntax.nodes[owner].symbol)
+                program.callees.add(callee)
+            }
+        }
+        dmaFlowType(context, node, syntax.type, true)
+        if syntax.kind == 221 && syntax.operator >= 0 && syntax.operator < context.tokenTexts.length {
+            let operation = context.tokenTexts[syntax.operator]
+            if operation == "==" || operation == "!=" || operation == "<" || operation == "<=" || operation == ">" || operation == ">=" {
+                let operand = syntax.firstChild
+                while operand >= 0 {
+                    if dmaKind(context, context.syntax.nodes[operand].type) > 0 { dmaFlowReject(context, node, "opaque DMA handles have no automatic record equality, ordering or hashing") }
+                    operand = context.syntax.nodes[operand].nextSibling
+                }
+            }
+        }
+        let phase = dmaFlowPhase(context, syntax.type)
+        if dmaKind(context, syntax.type) > 0 && (closure || syntax.kind == 3 || syntax.kind == 4 || syntax.kind == 5) {
+            dmaFlowReject(context, node, "opaque DMA handles cannot be captured or stored in globals or aggregate fields")
+        }
+        if phase > 0 {
+            if closure { dmaFlowReject(context, node, "CPU/Pending cannot be captured or enter callback bodies") }
+            if syntax.kind == 3 || syntax.kind == 4 || syntax.kind == 5 { dmaFlowReject(context, node, "CPU/Pending cannot be stored in globals or aggregate fields") }
+            if syntax.kind != 2 { program.selected[owner] = true }
+        }
+        if syntax.kind == 210 && dmaKind(context, syntax.type) > 0 { dmaFlowReject(context, node, "opaque DMA handles cannot be constructed as records") }
+        let previous = -1
+        let child = syntax.firstChild
+        while child >= 0 {
+            if child >= count || seen[child] { dmaFlowReject(context, node, "syntax has a duplicate/cyclic child") }
+            if context.syntax.nodes[child].parent != node || context.syntax.nodes[child].previousSibling != previous { dmaFlowReject(context, child, "syntax binding ancestry is inconsistent") }
+            seen[child] = true
+            program.owners[child] = owner; program.closures[child] = closure
+            queue.add(child)
+            previous = child
+            child = context.syntax.nodes[child].nextSibling
+        }
+        if syntax.lastChild != previous { dmaFlowReject(context, node, "syntax child boundary is inconsistent") }
+    }
+    node = 0
+    while node < count {
+        if !seen[node] { dmaFlowReject(context, node, "typed syntax has an untracked/orphan node") }
+        let owner = program.owners[node]
+        let trusted = owner > 0 && program.primitives[context.syntax.nodes[owner].symbol] > 0
+        if program.selected[owner] && !trusted {
+            if context.tokenLines.features / 8 % 2 != 0 { dmaFlowReject(context, node, "recoverable call-depth mode requires unsupported exceptional ownership edges") }
+            let syntax = context.syntax.nodes[node]
+            let kind = syntax.kind
+            if kind == 102 || kind == 103 || kind == 106 || kind == 107 || kind == 108 || kind == 109 || kind == 208 {
+                dmaFlowReject(context, node, "loops, match, native, captures and jumps are unsupported with affine capabilities")
+            }
+            if kind == 220 && syntax.operator >= 0 && syntax.operator < context.tokenTexts.length && context.tokenTexts[syntax.operator] == "try" { dmaFlowReject(context, node, "try needs exceptional ownership edges") }
+        }
+        node = node + 1
+    }
+    node = 0
+    while node < count {
+        if program.selected[node] && (node == 0 || program.primitives[context.syntax.nodes[node].symbol] == 0) { dmaFlowCheckFunction(program, node) }
+        node = node + 1
+    }
+    dmaFlowDAG(program)
+    node = 0
+    while node < count {
+        let owner = program.owners[node]
+        let trusted = owner > 0 && program.primitives[context.syntax.nodes[owner].symbol] > 0
+        if !trusted && context.syntax.nodes[node].kind >= 200 && dmaFlowPhase(context, context.syntax.nodes[node].type) > 0 && program.used[node] != 1 {
+            dmaFlowReject(context, node, "affine expression was discarded, captured, contained or left outside checked ownership flow")
+        }
+        node = node + 1
+    }
+}

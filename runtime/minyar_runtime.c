@@ -1169,6 +1169,7 @@ void minyar_initialize_arguments(int count, char **values) {
 #include "minyar_numbers.h"
 
 #include "minyar_bytes.h"
+#include "minyar_dma.h"
 #include "minyar_parallel.h"
 #include "minyar_c_layout.h"
 

@@ -1,0 +1,191 @@
+// Opaque handles retain the ordinary managed-record ABI. Affine source flow
+// and a separately rooted runtime registry establish payload ownership.
+function dmaMarkerKind(tag: Text): Integer {
+    if tag == "dma_cpu" { return 1 }
+    if tag == "dma_pending" { return 2 }
+    if tag == "dma_queue" { return 3 }
+    return 0
+}
+
+function newDmaCompilerFacts(): DmaCompilerFacts {
+    return DmaCompilerFacts { kinds: []; bindings: []; callees: []; lexical: []; rules: [] }
+}
+
+function discoverDmaDeclarations(context: CompilerContext) {
+    let present = false
+    for node in context.syntax.declarations {
+        let declaration = context.syntax.nodes[node]
+        let start = declaration.start
+        if declaration.kind == 2 && context.tokenTexts[start + 2] == "native" && dmaMarkerKind(context.tokenTexts[start + 3]) > 0 { present = true }
+    }
+    if !present { return }
+    let index = 0
+    while index < context.functionNames.length { context.dma.kinds.add(0); context.dma.rules.add(-1); index = index + 1 }
+    let seen: List<Integer> = [0, 0, 0, 0]
+    for node in context.syntax.declarations {
+        let declaration = context.syntax.nodes[node]
+        let start = declaration.start
+        if declaration.kind == 2 && context.tokenTexts[start + 2] == "native" {
+            let kind = dmaMarkerKind(context.tokenTexts[start + 3])
+            if kind > 0 {
+                if seen[kind] != 0 { failAtToken(context.tokenLines, start, "a DMA handle kind needs one canonical declaration") }
+                seen[kind] = 1
+                if declaration.symbol < 0 || declaration.symbol >= context.dma.kinds.length { failCompiler("internal DMA declaration identity is missing") }
+                if context.functionParameterCounts[declaration.symbol] != 0 { failAtToken(context.tokenLines, start, "opaque DMA handle declarations must have no fields") }
+                context.dma.kinds[declaration.symbol] = kind
+                context.registerLiteralTokens.add(start + 3)
+            }
+        }
+    }
+}
+
+function dmaKind(context: CompilerContext, type: Integer): Integer {
+    if context.dma.kinds.length == 0 || !isRecordType(type) { return 0 }
+    // Declaration identity survives nominal-type namespace changes. Never
+    // infer a declaration index from an opaque or encoded scalar type.
+    let symbol = 0
+    while symbol < context.dma.kinds.length {
+        if context.dma.kinds[symbol] > 0 && context.functionReturnTypes[symbol] == type { return context.dma.kinds[symbol] }
+        symbol = symbol + 1
+    }
+    return 0
+}
+
+function dmaSetFact(values: List<Integer>, node: Integer, value: Integer) {
+    if node < 0 { failCompiler("internal DMA syntax identity is missing") }
+    while values.length <= node { values.add(-1) }
+    values[node] = value
+}
+
+function dmaStartFunction(context: CompilerContext) {
+    if context.dma.kinds.length > 0 { context.dma.lexical.clear() }
+}
+
+function dmaBindLocal(context: CompilerContext, node: Integer, lexical: Integer, logical: Integer) {
+    if context.dma.kinds.length == 0 { return }
+    if lexical < 0 || logical < 0 { failCompiler("internal DMA logical binding is invalid") }
+    while context.dma.lexical.length <= lexical { context.dma.lexical.add(-1) }
+    context.dma.lexical[lexical] = logical
+    dmaSetFact(context.dma.bindings, node, logical)
+}
+
+function dmaReadLocal(context: CompilerContext, node: Integer, lexical: Integer) {
+    if context.dma.kinds.length == 0 { return }
+    let logical = -1
+    if lexical >= 0 && lexical < context.dma.lexical.length { logical = context.dma.lexical[lexical] }
+    dmaSetFact(context.dma.bindings, node, logical)
+}
+
+function dmaRecordCall(context: CompilerContext, node: Integer, symbol: Integer) {
+    if context.dma.kinds.length > 0 { dmaSetFact(context.dma.callees, node, symbol) }
+}
+
+function dmaSignatureType(context: CompilerContext, type: Integer, expected: Integer): Boolean {
+    if expected == -4 { return isRecordType(type) && dmaKind(context, type) == 0 }
+    if expected < 0 { return dmaKind(context, type) == 0 - expected }
+    return type == expected
+}
+
+function dmaSignature(context: CompilerContext, symbol: Integer, parameters: List<Integer>, returns: Integer): Boolean {
+    if context.functionParameterCounts[symbol] != parameters.length || !dmaSignatureType(context, context.functionReturnTypes[symbol], returns) { return false }
+    let offset = functionParameterOffset(context.functionParameterCounts, symbol)
+    let parameter = 0
+    while parameter < parameters.length {
+        if !dmaSignatureType(context, context.functionParameterTypes[offset + parameter], parameters[parameter]) { return false }
+        parameter = parameter + 1
+    }
+    return true
+}
+
+function dmaNativeProvider(context: CompilerContext, symbol: Integer): Text {
+    if symbol < 0 || symbol >= context.syntax.symbolNodes.length || context.symbolKinds[symbol] != 1 { return "" }
+    let node = context.syntax.symbolNodes[symbol]
+    if node < 0 || context.syntax.nodes[node].body < 0 { return "" }
+    let cursor: List<Integer> = [context.syntax.nodes[node].body + 1]
+    skipTerminators(context.tokenKinds, cursor)
+    if context.tokenTexts[cursor[0]] != "native" || context.tokenKinds[cursor[0] + 1] != 3 { return "" }
+    let library = context.tokenTexts[cursor[0] + 1]
+    cursor[0] = cursor[0] + 2
+    skipTerminators(context.tokenKinds, cursor)
+    if context.tokenTexts[cursor[0]] != "}" || cursor[0] + 1 != context.syntax.nodes[node].end { return "" }
+    return library
+}
+
+// A primitive is a resolved exact native body, exact signature and an actual
+// compiler-owned runtime lowering. An ordinary same-named helper has no rule.
+function dmaPrimitive(context: CompilerContext, symbol: Integer): Integer {
+    if context.dma.kinds.length == 0 || symbol < 0 || symbol >= context.functionNames.length { return 0 }
+    while context.dma.rules.length <= symbol { context.dma.rules.add(-1) }
+    if context.dma.rules[symbol] >= 0 { return context.dma.rules[symbol] }
+    let provider = dmaNativeProvider(context, symbol)
+    if provider != "dma" && provider != "dma_model" { context.dma.rules[symbol] = 0; return 0 }
+    let name = readableDeclarationName(context.functionNames[symbol])
+    let kind = 0
+    let valid = false
+    if provider == "dma" {
+        if name == "allocate" { kind = 1; valid = dmaSignature(context, symbol, [1, 1], -1) }
+        if name == "load8" { kind = 2; valid = dmaSignature(context, symbol, [-1, 1], 1) }
+        if name == "store8" { kind = 3; valid = dmaSignature(context, symbol, [-1, 1, 1], 5) }
+        if name == "copyOut" { kind = 4; valid = dmaSignature(context, symbol, [-1, 1, 1], 8) }
+        if name == "dispose" { kind = 5; valid = dmaSignature(context, symbol, [-1], 5) }
+        if name == "submit" { kind = 6; valid = dmaSignature(context, symbol, [-3, -1, 1], -2) }
+        if name == "ready" { kind = 7; valid = dmaSignature(context, symbol, [-2], 4) }
+        if name == "reclaim" { kind = 8; valid = dmaSignature(context, symbol, [-2, 1], -1) }
+        if name == "retire" { kind = 9; valid = dmaSignature(context, symbol, [-2], 5) }
+        if name == "unsafeVirtioQueue" {
+            kind = 20
+            valid = dmaSignature(context, symbol, [-4, 1, 1, 1, 1, 1, 1], -3)
+            if compilerKernelTarget() == 0 { failAtToken(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[symbol]].start, "unsafeVirtioQueue requires an explicit freestanding kernel target") }
+        }
+    } else {
+        if name == "modelQueue" { kind = 10; valid = dmaSignature(context, symbol, [], -3) }
+        if name == "modelDeliver" { kind = 11; valid = dmaSignature(context, symbol, [-3, 8], 4) }
+        if name == "modelCorrupt" { kind = 12; valid = dmaSignature(context, symbol, [-3, 1, 1], 5) }
+    }
+    if kind == 0 || !valid { failAtToken(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[symbol]].start, "DMA primitives need the exact declared CPU, Pending, Queue and scalar signature") }
+    context.dma.rules[symbol] = kind
+    return kind
+}
+
+function dmaRejectNativeEscape(context: CompilerContext, symbol: Integer, location: Integer) {
+    if context.dma.kinds.length == 0 { return }
+    let opaque = dmaKind(context, context.functionReturnTypes[symbol]) > 0
+    let first = functionParameterOffset(context.functionParameterCounts, symbol)
+    let index = 0
+    while index < context.functionParameterCounts[symbol] {
+        if dmaKind(context, context.functionParameterTypes[first + index]) > 0 { opaque = true }
+        index = index + 1
+    }
+    if opaque { failAtToken(context.tokenLines, location, "opaque DMA handles cannot cross an unclassified native boundary") }
+}
+
+function compileDmaNative(context: CompilerContext, symbol: Integer, library: Text, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer) {
+    let kind = dmaPrimitive(context, symbol)
+    if kind == 0 { failCompiler("internal DMA primitive has no verified lowering") }
+    let name = readableDeclarationName(context.functionNames[symbol])
+    let callee = "minyar_dma_" + name
+    if library == "dma_model" { callee = "minyar_dma_model_" + name }
+    let signature = ""
+    let arguments = ""
+    let parameter = 0
+    let first = functionParameterOffset(context.functionParameterCounts, symbol)
+    while parameter < context.functionParameterCounts[symbol] {
+        if parameter > 0 { signature = signature + ", "; arguments = arguments + ", " }
+        let type = nativeType(context.functionParameterTypes[first + parameter])
+        signature = signature + type
+        arguments = arguments + type + " %argument." + Text(parameter)
+        parameter = parameter + 1
+    }
+    let result = llvmType(returnType)
+    if returnType == 4 { result = "zeroext i1" }
+    let prototype = "declare " + result + " @" + callee + "(" + signature + ")"
+    context.nativeLibraries.add("runtime")
+    context.nativePrototypes.add(prototype)
+    output.add("  ; minyar-native: runtime|" + prototype + "\n")
+    let destination = ""
+    if returnType != 5 { destination = "%native.result = " }
+    output.add("  " + destination + "call " + result + " @" + callee + "(" + arguments + ")\n")
+    recoveryNativeCheckpoint(output, textState, state, returnType)
+    output.add("  call void @minyar_rc_leave()\n  call void @minyar_stack_leave()\n")
+    if returnType == 5 { output.add("  ret void\n") } else { output.add("  ret " + llvmType(returnType) + " %native.result\n") }
+}
