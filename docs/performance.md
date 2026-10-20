@@ -115,14 +115,27 @@ hashes, every observation and the complete flags are retained in
 
 Adjacent plain-borrow coalescing then reduced eager instructions from
 2,873,927,000 to 2,655,982,553, a further 7.58%. Matching arena counts were
-1,188,040,852 and 1,188,040,574. Eager is now 2.2356 times arena; the 1.2-times
-target remains unmet. Both same-source 722-function scope modules have no
+1,188,040,852 and 1,188,040,574, giving 2.2356 times arena. Both same-source
+722-function scope modules have no
 legacy frame calls or fallbacks. Coalescing removes 532 temporary cells,
 retains and releases while preserving lasting owners and adding 15 return
 polls. All 32 executions match the same frozen original LLVM, with continuous,
 unscaled counters. This campaign uses one fresh output filename for all four
 executables. Counts, every observation and input/runtime/executable identities
 are in [`frames-borrow-coalescing.json`](../experiments/memory/frames-borrow-coalescing.json).
+
+Removing a plain projected Text borrow used only by the next equality call
+reduced eager instructions from 2,655,982,210 to 2,367,788,224, another 10.85%.
+The fresh matching arena counts were 1,188,040,675 and 1,188,611,354, a 0.048%
+increase. Eager now reaches 1.9921 times arena; the 1.2-times target remains
+unmet. Both same-source 725-function modules have no legacy frame calls or
+fallbacks. The pass removes 520 temporary cells and retains, and 869 cleanup
+releases, while preserving service with 364 affected-function return polls.
+All 32 executions reproduce the frozen original LLVM with continuous unscaled
+counters. The new campaign output filename is shared by all four executables;
+the reported reduction compares only its fresh matching controls. Complete
+observations and identities are in
+[`frames-compare-borrows.json`](../experiments/memory/frames-compare-borrows.json).
 
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
