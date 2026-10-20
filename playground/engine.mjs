@@ -7,6 +7,7 @@ const decoder = new TextDecoder();
 export const SOURCE_LIMIT = 64 * 1024;
 export const OUTPUT_LIMIT = 64 * 1024;
 export const FILE_LIMIT = 16 * 1024 * 1024;
+export const PATH_LIMIT = 4096;
 
 // WASI files live in JavaScript arrays, outside WebAssembly's memory cap.
 // Guard growth before allocation, including sparse writes and preallocation.
@@ -42,6 +43,23 @@ export function limitFilesystem(wasi) {
       const result = original(...args);
       if (name === 'path_open' && result === 0) guard(wasi.fds.at(-1));
       return result;
+    };
+  }
+  // File names are retained host strings too. Check byte lengths before the
+  // shim decodes a path, including names installed by rename/link operations.
+  const pathLengths = {
+    path_open: [3], path_create_directory: [2], path_link: [3, 6],
+    path_rename: [2, 5], path_filestat_get: [3], path_filestat_set_times: [3],
+    path_readlink: [2], path_remove_directory: [2], path_unlink_file: [2],
+    path_symlink: [1, 4],
+  };
+  for (const [name, lengths] of Object.entries(pathLengths)) {
+    const original = wasi.wasiImport[name];
+    wasi.wasiImport[name] = (...args) => {
+      if (lengths.some(index => !Number.isInteger(args[index]) || args[index] < 0 || args[index] > PATH_LIMIT)) {
+        throw new Error('Virtual file paths must fit within 4 KiB.');
+      }
+      return original(...args);
     };
   }
 }

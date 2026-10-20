@@ -70,8 +70,9 @@ or network is exposed to a program. The bundled portable modules are
 The frontend has a 512 MiB linear-memory ceiling and programs have a 256 MiB
 ceiling. Source and captured output are each limited to 64 KiB. Virtual-file
 growth is capped at 16 MiB per execution, with at most 256 open/create/link
-operations. File growth is checked before JavaScript allocation, including
-sparse writes. Cold loading has a two-minute limit; execution has a
+operations, with paths limited to 4 KiB before UTF-8 decoding. File growth
+is checked before JavaScript allocation, including sparse writes. Preparation
+and compilation have a two-minute limit; execution has a
 ten-second limit. Stop and timeouts discard the worker and its state.
 
 The initial toolchain is large: about 107 MB uncompressed. Its two main LLVM

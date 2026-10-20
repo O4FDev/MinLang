@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createEngine, parseDiagnostics, SOURCE_LIMIT, FILE_LIMIT, limitFilesystem } from '../build/playground/engine.mjs';
+import { createEngine, parseDiagnostics, SOURCE_LIMIT, FILE_LIMIT, PATH_LIMIT, limitFilesystem } from '../build/playground/engine.mjs';
 import { WASI, File, OpenFile } from '../build/playground/vendor/wasi/dist/index.js';
 import { tour } from '../playground/tour.mjs';
 import { normalizeLLVM } from '../tools/wasm-target.mjs';
@@ -57,6 +57,7 @@ await assert.rejects(engine.request('anything', ''), /Unknown playground request
 await assert.rejects(engine.request('run', 'for index in 0..10000 { print("many lines of output") }\n'), /Output reached/);
 await assert.rejects(engine.request('run', 'use "io" as io\nlet chunk = Text(Bytes(1048576))\nfor index in 0..20 { io.writeTextFile(Text(index), chunk) }\n'), /Virtual files reached/);
 await assert.rejects(engine.request('run', 'use "io" as io\nfor index in 0..257 { io.writeTextFile(Text(index), "") }\n'), /256-operation limit/);
+await assert.rejects(engine.request('run', 'use "io" as io\nlet name = "a"\nfor index in 0..13 { name += name }\nio.writeTextFile(name, "")\n'), /4 KiB/);
 await run('recovery after resource limits', 'print("ready again")\n', 'ready again\n');
 await run('virtual files reset', 'use "io" as io\nprint(io.fileExists("hello.txt"))\nio.writeTextFile("hello.txt", "kept only here")\n', 'false\n');
 await run('cached program files reset', 'use "io" as io\nprint(io.fileExists("hello.txt"))\nio.writeTextFile("hello.txt", "kept only here")\n', 'false\n');
@@ -73,6 +74,16 @@ for (const operation of ['fd_pwrite', 'fd_allocate', 'fd_filestat_set_size']) {
     : operation === 'fd_allocate' ? descriptor[operation](BigInt(FILE_LIMIT), 1n)
     : descriptor[operation](BigInt(FILE_LIMIT) + 1n), /Virtual files reached/);
   assert.equal(file.data.length, 0, `${operation} allocated before quota rejection`);
+}
+// Reject metadata growth before UTF-8 decoding, even if no memory is present.
+for (const [operation, lengths] of Object.entries({ path_open: [3], path_create_directory: [2], path_link: [3, 6], path_rename: [2, 5] })) {
+  for (const index of lengths) {
+    const wasi = new WASI([], [], [], { debug: false });
+    limitFilesystem(wasi);
+    const args = Array(9).fill(0);
+    args[index] = PATH_LIMIT + 1;
+    assert.throws(() => wasi.wasiImport[operation](...args), /4 KiB/);
+  }
 }
 assert.throws(() => parseDiagnostics('not JSON'), /could not finish/);
 assert.equal(sourceByteLength('🌙'), 4);
