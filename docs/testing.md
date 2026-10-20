@@ -1331,6 +1331,19 @@ reassignment, reference fields, captures and C layouts keep their managed paths;
 checked arithmetic keeps its existing failure behavior. LLVM checks require
 entry-only storage and O2 promotion for the pure fixture.
 
+`make check-last-use-sinks` checks final owned-local arguments to List insertion
+and indexed replacement under native and sanitized O0/O2, with both legacy and
+explicit scoped ownership. The fixtures exercise persistent aliases, cycles,
+branch exits, loop-local freshness, shadowing, later rebinding and implicit
+field/index/compound assignment reads. Borrowed parameters, captures, recovery
+and native bodies retain their ordinary paths; exact runtime cleanup remains
+required. LLVM checks distinguish the move fragment from the traced callee.
+
+`make check-last-use-sinks-mutation` rebuilds two compiler mutants that omit
+implicit assignment receiver reads or loop freshness. Controls must complete
+with exact output; each mutant must trigger an ASan heap-use-after-free at
+O0/O2 with both legacy and scoped owners, using the eager cleanup runtime.
+
 Diagnostic locations are captured at token start. The byte-exact corpus covers
 lexer, parser, type, encoding, and whole-program failures; every current golden
 diagnostic asserts both line and column, including duplicate declarations and

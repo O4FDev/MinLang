@@ -90,6 +90,20 @@ entry-block i64 slots and fresh loads at each field read. An explicit metadata
 tag distinguishes these representations. The existing whole-object escape
 guards, constructor order and proof-attempt budget also apply to writable fields.
 
+Last-use container arguments use a function-local `LocalMoveAnalysis`. Resolved
+local reads update a binding-ID table in evaluation order. Field/index assignment
+receivers and compound-assignment current values count as reads even when the
+written field is scalar. A completed function may transfer a lexical local into
+an existing consuming List insertion or replacement only if that argument is
+its final recorded read. The declaration and sink must share their nearest loop;
+an outer binding cannot be consumed again on a loop backedge. Parameters and
+implicit iterator bindings stay borrowed. Simple later reassignment is allowed.
+Each candidate reserves a separate fragment before the callee, preserving cycle
+fixup indexes. Analysis is capped at 4,096 binding IDs, 8,192 sites, 65,536 ancestor
+steps and 256 ancestors per lookup. Exhausted traversal/site budgets, recovery,
+callback/thread-enabled jobs, native bodies and top-level code keep their prior
+lowering. Ordinary named-function arguments retain their borrowed ABI.
+
 Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
 column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant
 time, including for nested brackets; the old `indexWithoutCalls` scanner has

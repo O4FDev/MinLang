@@ -104,6 +104,100 @@ function directOwnershipName(context: CompilerContext, node: Integer): Boolean {
     return expression.kind == 200 && expression.firstChild < 0 && expression.end == expression.start + 1 && context.tokenKinds[expression.start] == 1
 }
 
+function beginLocalMoves(context: CompilerContext, state: List<Integer>) {
+    let analysis = context.localMoves
+    analysis.enabled = !recoveryEnabled(state) && state[15] % 2 == 0 && state[15] / 4 % 2 == 0
+    analysis.budget = 65536
+    analysis.reads.clear()
+    analysis.loops.clear()
+    analysis.sites.clear()
+    analysis.values.clear()
+}
+
+function localMoveStorage(analysis: LocalMoveAnalysis, id: Integer): Boolean {
+    if !analysis.enabled || id < 0 || id >= 4096 { return false }
+    while analysis.reads.length <= id { analysis.reads.add(-1); analysis.loops.add(-2) }
+    return true
+}
+
+// Reads are recorded in evaluation order, not syntax-node allocation order.
+// Assignment receivers also call this: their final field type may be scalar.
+function noteLocalRead(context: CompilerContext, id: Integer, node: Integer) {
+    let analysis = context.localMoves
+    if !analysis.enabled || id < 0 || id >= analysis.loops.length { return }
+    if analysis.loops[id] < -1 { return }
+    context.syntax.nodes[node].symbol = id
+    analysis.reads[id] = node
+}
+
+function localMoveLoop(context: CompilerContext, node: Integer): Integer {
+    let analysis = context.localMoves
+    let depth = 0
+    while node >= 0 {
+        if analysis.budget <= 0 || depth >= 256 { analysis.enabled = false; return -2 }
+        analysis.budget = analysis.budget - 1
+        let kind = context.syntax.nodes[node].kind
+        if kind == 102 || kind == 103 { return node }
+        node = context.syntax.nodes[node].parent
+        depth = depth + 1
+    }
+    return -1
+}
+
+function noteMoveBinding(context: CompilerContext, id: Integer, type: Integer) {
+    if !isReferenceType(type) { return }
+    let analysis = context.localMoves
+    if !localMoveStorage(analysis, id) { return }
+    analysis.loops[id] = localMoveLoop(context, context.syntax.active)
+}
+
+// Reserve a separate fragment immediately before the actual runtime call.
+// Cycle fixups must continue to point at the callee, never at this move.
+function reserveLocalTake(context: CompilerContext, state: List<Integer>, output: List<Text>, value: Text, root: Integer) {
+    let analysis = context.localMoves
+    if !analysis.enabled { return }
+    let node = ungroupOwnershipNode(context.syntax, root)
+    if !directOwnershipName(context, node) { return }
+    let expression = context.syntax.nodes[node]
+    if !isReferenceType(expression.type) { return }
+    let id = expression.symbol
+    if id < 0 || id >= analysis.reads.length { return }
+    if analysis.reads[id] != node || analysis.loops[id] < -1 || scalarRecordValues(state, id) >= 0 { return }
+    let loop = localMoveLoop(context, node)
+    if !analysis.enabled || loop != analysis.loops[id] { return }
+    if analysis.values.length >= 8192 { analysis.enabled = false; return }
+    analysis.sites.add(id)
+    analysis.sites.add(node)
+    analysis.sites.add(output.length)
+    analysis.values.add(value)
+    output.add("")
+}
+
+function finishLocalMoves(context: CompilerContext, state: List<Integer>, output: List<Text>) {
+    let analysis = context.localMoves
+    if !analysis.enabled { return }
+    let site = 0
+    while site < analysis.values.length {
+        let first = site * 3
+        let id = analysis.sites[first]
+        let node = analysis.sites[first + 1]
+        let move = analysis.sites[first + 2]
+        if analysis.reads[id] == node {
+            let callee = output[move + 1]
+            let consuming = ""
+            if callee == "  call void @minyar_list_add(ptr " { consuming = "  call void @minyar_list_add_take(ptr " }
+            if callee == "  call void @minyar_list_set(ptr " { consuming = "  call void @minyar_list_set_take(ptr " }
+            if consuming != "" {
+                output[move] = "  call void @minyar_rc_local_move_owner(i64 " + Text(ownershipSlot(state, id)) + ", ptr " + analysis.values[site] + ")\n"
+                output[move + 1] = consuming
+                state[6] = 1
+            }
+        }
+        site = site + 1
+    }
+    analysis.enabled = false
+}
+
 // Keep only the most recent consumer site. A complete expression root emits after
 // its arguments, so exact node identity suffices; inner/stale sites cannot match.
 function noteTerminalReuse(context: CompilerContext, node: Integer, transferPiece: Integer, calleePiece: Integer, receiver: Text) {

@@ -1,0 +1,123 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+record Mutation { name: Text; before: Text; after: Text; program: Text; expected: Text }
+
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let source = io.readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+// ownership-runtime.o is the sanitized eager runtime with complete cleanup
+// assertions. SYSTEM_HEAP would defer destruction and weaken these mutants.
+let runtime = test.setting("MINYAR_TEST_MUTATION_RUNTIME", "build/ownership-runtime.o")
+test.check(system.setResourceLimit(system.CORE_SIZE, 0, 0) == 0, "disable last-use mutation crash cores")
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) }
+}
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=0")
+
+let mutations: List<Mutation> = [
+    Mutation {
+        name: "assignment-root"
+        before: "noteLocalRead(context, localIds[local], syntaxTarget)"
+        after: ""
+        program: #"""
+            record Pair { x: Integer; y: Integer }
+            function work() {
+                let sink: List<Pair> = []
+                let value = Pair { x: 1; y: 2 }
+                sink.add(value)
+                sink.clear()
+                value.x = 9
+                print("assignment safe")
+            }
+            work()
+            """#
+        expected: "assignment safe\n"
+    },
+    Mutation {
+        name: "outer-loop-owner"
+        before: "if !analysis.enabled || loop != analysis.loops[id] { return }"
+        after: "if !analysis.enabled { return }"
+        program: #"""
+            record Pair { x: Integer; y: Integer }
+            function work() {
+                let sink: List<Pair> = []
+                let value = Pair { x: 1; y: 2 }
+                let index = 0
+                while index < 3 {
+                    sink.add(value)
+                    sink.clear()
+                    index += 1
+                }
+                print("loop safe")
+            }
+            work()
+            """#
+        expected: "loop safe\n"
+    }
+]
+
+let work = test.scratch()
+let compilers = [compiler]
+for mutation in mutations {
+    test.check(count(source, mutation.before) == 1, mutation.name + ": mutation site changed")
+    let path = work + "/" + mutation.name
+    io.writeTextFile(path + ".min", test.sourceModules(test.replace(source, mutation.before, mutation.after)))
+    test.require(test.run([compiler, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compiler-build", 120), mutation.name + " compiler build")
+    test.require(test.run([clang, "-O1", "-DMINYAR_COMPILER_ARENA", "-Wno-override-module", path + ".ll", "runtime/minyar_runtime.c", "-lm", "-o", path], system.environment(), "", path + ".compiler-link", 120), mutation.name + " compiler link")
+    compilers.add(path)
+}
+
+for index in 0..mutations.length {
+    let mutation = mutations[index]
+    for mode in ["control", mutation.name] {
+        let candidate = compilers[0]
+        if mode != "control" { candidate = compilers[index + 1] }
+        for lowering in ["legacy", "scope"] {
+            let label = mutation.name + "/" + mode + "/" + lowering
+            let path = work + "/" + mutation.name + "-" + mode + "-" + lowering
+            io.writeTextFile(path + ".min", test.sourceModules(mutation.program))
+            let command = [candidate, path + ".min", path + ".ll", "--library", "library"]
+            if lowering == "scope" { command.add("--scope-owners") }
+            test.require(test.run(command, system.environment(), "", path + ".compile", 120), label + " program compile")
+            io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll")))
+            for optimization in ["-O0", "-O2"] {
+                let executable = path + optimization + ".exe"
+                test.require(test.run([clang, optimization, "-fsanitize=address,undefined", "-Wno-override-module", path + ".ll", runtime, "-lm", "-o", executable], system.environment(), "", path + optimization + ".link", 120), label + " program link " + optimization)
+                let result = test.run([executable], environment, "", path + optimization + ".run", 120)
+                if mode == "control" {
+                    test.check(result.status == 0 && result.output == mutation.expected && result.errorOutput == "", "last-use viable control " + label + " " + optimization + "\n" + result.output + result.errorOutput)
+                } else {
+                    test.check(result.status != 0 && test.contains(result.errorOutput, "ERROR: AddressSanitizer: heap-use-after-free"), "last-use intended heap-use-after-free " + label + " " + optimization + "\n" + result.output + result.errorOutput)
+                }
+            }
+        }
+    }
+    print(mutation.name + ": intended heap-use-after-free detected at O0/O2 with legacy/scoped owners")
+}
+test.removeTree(work)
+print("Both last-use sink compiler mutants detected")
