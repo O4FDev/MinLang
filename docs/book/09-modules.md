@@ -114,3 +114,5 @@ restore the original calculation afterwards.
 You can now divide a program by responsibility without duplicating its
 calculation. For larger projects, the [module guide](../modules.md) explains
 packages, and the [CLI guide](../cli.md) explains dependency declarations.
+
+Next, practice [reading an error and making one repair](10-errors.md).

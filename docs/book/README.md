@@ -1,8 +1,9 @@
 # Minyar for people who have never programmed
 
 A program is a set of instructions you can save, change and run again. This
-short book starts with one instruction and ends with a program that plans a
-community garden. You need no programming vocabulary before you begin.
+short book starts with one instruction and builds a community garden planner.
+Then we split it into files, repair mistakes and save data. You need no
+programming vocabulary before you begin.
 
 ```minyar
 print("There is room for you here.")
@@ -29,9 +30,11 @@ Read in order:
 7. [When something is missing or fails](07-results.md): handle both outcomes.
 8. [A small program of your own](08-garden.md): bring the pieces together.
 9. [More than one file](09-modules.md): share a module and test its private code.
+10. [Reading an error and making one repair](10-errors.md): use a message to fix a mistake.
+11. [Saving a garden note](11-files.md): write and read text, handling a failure.
 
-After trying chapter 8's validation exercise, compare it with a
-[worked answer that checks the garden plan](answers.md).
+After trying the garden validation and error-repair exercises, compare your
+changes with the [worked answers](answers.md).
 
 Take breaks. Run each example, change one thing and predict what will happen.
 Understanding a small program is more useful than rushing through a large one.
@@ -44,18 +47,27 @@ The [language guide](../language.md) is the detailed reference.
 ## How the examples stay honest
 
 `make check-book` reads these pages and the three transition guides directly.
-It compiles every Minyar box and checks successful completion, exact printed
-output and empty standard error at O0 and O2. It also builds and runs embedded
-tests. Each example has its own temporary directory. No handwritten duplicate
-of a book program stands in for the page you read.
-For project pages, the checker assembles the labeled files before compiling
-each one, so imports and private module tests are checked too.
+For successful programs, it checks completion, exact printed output and empty
+standard error at O0 and O2. It also builds and runs embedded tests. Each
+example has its own temporary directory. No handwritten duplicate of a book
+program stands in for the page you read.
 
-Every program box must have an explicit `output` box, including an empty one
-for a program that prints nothing. The checker rejects missing, orphaned and
-unclosed fences. Shell boxes describe commands to enter in a terminal; the
-[first-program walkthrough](01-first-program.md) explains their prerequisites.
-`make check-book-cli` follows those project commands through the public
-launcher and runs the final garden executable in the release profile.
-It also creates the multi-file harvest project directly from chapter 9,
-checks its imported function and tests, and runs its release executable.
+Project pages label each file on its first source line with `// file:`. The
+checker assembles all labeled files before compiling each one, so imports
+and private module tests are checked too. A file-looking comment later in a
+program remains ordinary source; only its first line can declare a file.
+
+Every successful program box has an explicit `output` box, including an empty
+one for a program that prints nothing. Chapter 10's deliberately broken boxes
+use `minyar-reject` followed by `diagnostic`. The checker requires compiler
+status 1, empty standard output, the exact whole error message and no LLVM
+output. Only the temporary source location is shortened to `program.min`.
+These sources are checked in ordinary mode because test mode omits application
+instructions. Missing, orphaned, mistagged and unclosed fences are rejected.
+
+Shell boxes describe terminal commands; the [first-program walkthrough](01-first-program.md)
+explains their prerequisites. `make check-book-cli` follows the garden and
+multi-file harvest projects through the public launcher and their release
+executables. It also checks chapter 10's errors, repairs and explanation
+command. The note walkthrough verifies printed results and actual saved bytes,
+including the empty-note exercise and release execution.

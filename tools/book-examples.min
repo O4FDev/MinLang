@@ -1,6 +1,6 @@
 use "files" as files
 
-public record Example { source: Text; output: Text; line: Integer; path: Text }
+public record Example { source: Text; output: Text; line: Integer; path: Text; rejected: Boolean }
 public record Parsed { examples: List<Example>; error: Text }
 
 function whitespace(character: Character): Boolean {
@@ -96,7 +96,12 @@ function markerLike(line: Text): Boolean {
     if (value[0] != 'f' && value[0] != 'F') || (value[1] != 'i' && value[1] != 'I') ||
         (value[2] != 'l' && value[2] != 'L') || (value[3] != 'e' && value[3] != 'E') { return false }
     if value.length == 4 { return true }
-    return value[4] == ':' || value[4] == '=' || whitespace(value[4])
+    if value[4] == ':' || value[4] == '=' { return true }
+    if !whitespace(value[4]) { return false }
+    let tail = stripped(value.slice(4, value.length))
+    if !tail.endsWith(".min") { return false }
+    for character in tail { if whitespace(character) { return false } }
+    return true
 }
 
 public function parse(source: Text): Parsed {
@@ -109,23 +114,26 @@ public function parse(source: Text): Parsed {
         // Reject unsupported spellings instead of silently losing an example.
         if line.find("```") >= 0 || line.find("~~~") >= 0 {
             if line == "```output" { return invalid(position, "orphan output fence") }
-            if line != "```minyar" && !displayFence(line) { return invalid(position, "unsupported or indented code fence") }
+            if line == "```diagnostic" { return invalid(position, "orphan diagnostic fence") }
+            if line != "```minyar" && line != "```minyar-reject" && !displayFence(line) { return invalid(position, "unsupported or indented code fence") }
             let after = closing(lines, position)
             if after == -1 { return invalid(position, "unclosed code fence") }
             if after == -2 { return invalid(position, "malformed closing code fence") }
-            if line != "```minyar" { position = after + 1; continue }
+            if line != "```minyar" && line != "```minyar-reject" { position = after + 1; continue }
+            let rejected = line == "```minyar-reject"
             let first = position
             let program = content(lines, position + 1, after)
             if stripped(program) == "" { return invalid(first, "empty Minyar program") }
             let path = ""
-            for index in (first + 1)..after {
-                if markerLike(lines[index]) {
-                    if index != first + 1 { return invalid(index, "file marker must be the first source line") }
-                    if !lines[index].startsWith("// file: ") { return invalid(index, "malformed file marker; use // file: src/main.min") }
-                    path = lines[index].slice(9, lines[index].length)
-                    if !safePath(path) { return invalid(index, "file marker needs a safe canonical relative .min path") }
-                    if stripped(content(lines, index + 1, after)) == "" { return invalid(first, "empty Minyar program after file marker") }
-                }
+            // Only the first source line can declare metadata. The body is
+            // Minyar: comments and raw Text must not be parsed as file headers.
+            let header = first + 1
+            if markerLike(lines[header]) {
+                if rejected { return invalid(header, "rejection examples cannot have file markers") }
+                if !lines[header].startsWith("// file: ") { return invalid(header, "malformed file marker; use // file: src/main.min") }
+                path = lines[header].slice(9, lines[header].length)
+                if !safePath(path) { return invalid(header, "file marker needs a safe canonical relative .min path") }
+                if stripped(content(lines, header + 1, after)) == "" { return invalid(first, "empty Minyar program after file marker") }
             }
             if result.examples.length > 0 {
                 if (path == "") != (result.examples[0].path == "") { return invalid(first, "cannot mix project files and standalone programs on one page") }
@@ -137,12 +145,17 @@ public function parse(source: Text): Parsed {
             }
             position = after + 1
             while position < lines.length && stripped(lines[position]) == "" { position += 1 }
-            if position == lines.length { return invalid(first, "Minyar program needs an immediately following output fence") }
-            if lines[position] != "```output" { return invalid(position, "Minyar program needs an immediately following output fence") }
+            let oracleTag = "output"
+            if rejected { oracleTag = "diagnostic" }
+            let needsOracle = "Minyar program needs an immediately following " + oracleTag + " fence"
+            if position == lines.length { return invalid(first, needsOracle) }
+            if lines[position] != "```" + oracleTag { return invalid(position, needsOracle) }
             after = closing(lines, position)
-            if after == -1 { return invalid(position, "unclosed output fence") }
-            if after == -2 { return invalid(position, "malformed closing output fence") }
-            result.examples.add(Example { source: program; output: content(lines, position + 1, after); line: first + 2; path: path })
+            if after == -1 { return invalid(position, "unclosed " + oracleTag + " fence") }
+            if after == -2 { return invalid(position, "malformed closing " + oracleTag + " fence") }
+            let oracle = content(lines, position + 1, after)
+            if rejected && stripped(oracle) == "" { return invalid(position, "rejection example needs a nonempty diagnostic oracle") }
+            result.examples.add(Example { source: program; output: oracle; line: first + 2; path: path; rejected: rejected })
             position = after + 1
         } else { position += 1 }
     }
@@ -159,6 +172,7 @@ public function writeFiles(examples: List<Example>, directory: Text) {
     if examples.length == 0 { fail("book project has no files") }
     let paths: Map<Text, Boolean> = Map<Text, Boolean>()
     for example in examples {
+        if example.rejected { fail("rejection examples cannot be project files") }
         if !safePath(example.path) { fail("book project needs safe canonical relative .min paths") }
         let key = pathKey(example.path)
         if paths.has(key) { fail("duplicate book project file: " + example.path) }

@@ -39,29 +39,37 @@ failures. A wrong output must leave both previous site files byte-identical.
 Documentation examples run in private temporary working directories.
 
 `make check-book` reads every Markdown page under `docs/book` and the Rust,
-C++ and Swift transition guides. Each Minyar fence must have an explicit,
-immediately following output fence. Ordinary examples are complete programs;
-project pages label every source file with a leading `// file: relative.min`
-comment. The checker assembles all files from one page in each example's
-private directory before compilation. It rejects mixed standalone/project
-pages, unsafe paths, duplicate or ASCII-case-aliasing filenames and malformed
-markers. The suite rejects
-malformed or mistagged fences, checks parser rejection controls, and executes
-every program at O0/O2 against exact stdout, zero exit status and empty stderr.
-It also compiles each example in test mode and executes embedded tests at both
-optimization levels. Examples run in independent temporary directories. The
-target belongs to `check-portable`; `./build/tooling/tests/book --self-check`
-runs only the parser controls after building the harness.
+C++ and Swift transition guides. Successful `minyar` fences need explicit,
+immediately following `output` fences. Ordinary examples are complete programs;
+project pages label every source file on its first source line with
+`// file: relative.min`. Later file-looking comments remain source. The
+checker assembles all page files in each example's private directory before
+compilation. It rejects mixed standalone/project pages, unsafe paths, duplicate
+or ASCII-case-aliasing filenames, malformed markers and malformed fences.
+Successful programs run in ordinary and test modes at O0/O2, checking exact
+ordinary stdout, zero status and empty stderr, plus embedded tests.
 
-`make check-book-cli` follows the book's first-program and garden walkthroughs
-through the public launcher: project creation, running, checking, embedded-test
-discovery, release building and execution of the documented output path. It
-reads both programs from the published pages and checks the release output
-exactly. An intentionally wrong garden expectation must fail with status 1
-and a failed-test report. The runnable garden gallery must match the book's
-complete source. Both book targets belong to `check-portable`.
-The multi-file harvest walkthrough also proves public/private access and test
-discovery in an imported module, using source taken directly from chapter 9.
+Intentional `minyar-reject` sources need immediately following nonempty
+`diagnostic` fences. These standalone programs compile once in ordinary mode:
+test mode omits application statements. The checker requires status exactly 1,
+empty stdout, no LLVM file and exact full human stderr after shortening only
+actual-source location fields to `program.min`. Parser and rejection-result
+controls reject wrong statuses, output, paths, spacing and emitted LLVM.
+Both kinds run with bounded compiler deadlines; successful programs also have
+bounded link and execution deadlines. `./build/tooling/tests/book --self-check`
+runs only parser, materialization and rejection-result controls after building
+the harness. The target belongs to `check-portable`.
+
+`make check-book-cli` follows the first-program, garden and multi-file harvest
+walkthroughs through the public launcher: project creation, checking, running,
+embedded-test discovery, release builds and exact executable output. Private
+module access and deliberately wrong expectations must fail precisely; restoring
+the private helper recovers every test. The runnable garden gallery must match
+its complete book source. Chapter 10's four rejected sources and four repairs
+also pass through public check/run with exact diagnostics and output, followed
+by the documented explanation command. The file chapter checks actual saved
+bytes, handled bounded-read failure, nonempty-to-empty replacement and fresh
+release creation at the project root. Both targets belong to `check-portable`.
 
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including

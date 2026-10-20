@@ -7,6 +7,58 @@ use "process" as arguments
 
 record Page { path: Text; examples: List<book.Example> }
 
+// Normalize only actual-source location fields at the start of a line. The
+// same pathname in a source excerpt, error message or help remains exact.
+function sourceLocation(stderr: Text, source: Text): Boolean {
+    let prefix = "  --> " + source + ":"
+    return stderr.startsWith(prefix) || stderr.find("\n" + prefix) >= 0
+}
+function normalizeLocations(stderr: Text, source: Text): Text {
+    let prefix = "  --> " + source + ":"
+    let normalized = test.replace(stderr, "\n" + prefix, "\n  --> program.min:")
+    if normalized.startsWith(prefix) { normalized = "  --> program.min:" + normalized.slice(prefix.length, normalized.length) }
+    return normalized
+}
+function rejectionMatches(result: test.Result, source: Text, diagnostic: Text, llvmPresent: Boolean): Boolean {
+    return result.status == 1 && result.output == "" && result.errorOutput != "" && diagnostic != "" &&
+        sourceLocation(result.errorOutput, source) && !sourceLocation(result.errorOutput, "program.min") &&
+        normalizeLocations(result.errorOutput, source) == diagnostic && !llvmPresent
+}
+function rejectionControls(): Integer {
+    let source = "/private/book-control/program.min"
+    let diagnostic = "error: example failure\n  --> program.min:1:3\n  |\n1 | wrong()\n  |   ^ expected a value\n"
+    let actual = test.replace(diagnostic, "program.min", source)
+    let correct = test.Result { status: 1; output: ""; errorOutput: actual }
+    test.check(rejectionMatches(correct, source, diagnostic, false), "exact compiler rejection normalizes only the private source location")
+    let literal = "  = help: preserve literal " + source + "\n"
+    let withLiteral = test.Result { status: 1; output: ""; errorOutput: actual + literal }
+    test.check(rejectionMatches(withLiteral, source, diagnostic + literal, false), "source pathname outside a location must remain unchanged")
+    let wrong: List<test.Result> = [
+        test.Result { status: 0; output: ""; errorOutput: actual },
+        test.Result { status: 2; output: ""; errorOutput: actual },
+        test.Result { status: 124; output: ""; errorOutput: actual },
+        test.Result { status: 137; output: ""; errorOutput: actual },
+        test.Result { status: 1; output: "unexpected stdout\n"; errorOutput: actual },
+        test.Result { status: 1; output: ""; errorOutput: "" },
+        test.Result { status: 1; output: ""; errorOutput: actual + "extra diagnostic\n" },
+        test.Result { status: 1; output: ""; errorOutput: test.replace(actual, source, "/different/program.min") },
+        test.Result { status: 1; output: ""; errorOutput: diagnostic },
+        test.Result { status: 1; output: ""; errorOutput: test.replace(actual, source, source + "-copy") }
+    ]
+    for result in wrong {
+        test.check(!rejectionMatches(result, source, diagnostic, false), "rejection oracle accepted wrong status/output/diagnostic")
+    }
+    test.check(!rejectionMatches(correct, source, diagnostic, true), "compiler rejection must not emit LLVM")
+    test.check(!rejectionMatches(correct, source, "", false), "compiler rejection must have an expected diagnostic")
+    test.check(!rejectionMatches(correct, source, test.replace(diagnostic, "expected a value", "expected  a value"), false), "rejection oracle must preserve diagnostic spacing")
+    let outside = test.Result { status: 1; output: ""; errorOutput: diagnostic + "  = help: " + source + "\n" }
+    test.check(!rejectionMatches(outside, source, diagnostic + "  = help: program.min\n", false), "pathname outside a location cannot establish source origin")
+    test.check(!rejectionMatches(withLiteral, source, diagnostic + test.replace(literal, source, "program.min"), false), "normalization must not rewrite pathname literals in help")
+    let mixed = test.Result { status: 1; output: ""; errorOutput: actual + diagnostic }
+    test.check(!rejectionMatches(mixed, source, diagnostic + diagnostic, false), "every diagnostic location must originate from actual compiler stderr, not a pre-normalized block")
+    return wrong.length + 6
+}
+
 function parserControls(): Integer {
     let example = "```minyar\nprint(\"Héllo, sea.\")\n```\n\n```output\nHéllo, sea. \n\n```\n"
     let quiet = "```minyar\nlet answer = 42\n```\n```output\n```\n"
@@ -17,6 +69,25 @@ function parserControls(): Integer {
     test.check(parsed.examples[1].output == "" && parsed.examples[0].path == "" && parsed.examples[1].path == "", "standalone programs have no file path and explicit empty output means zero bytes")
     let windows = book.parse(test.replace(quiet, "\n", "\r\n"))
     test.check(windows.error == "" && windows.examples[0].source == "let answer = 42\n" && windows.examples[0].output == "", "CRLF documentation has the same source and output")
+    test.check(!parsed.examples[0].rejected && !parsed.examples[1].rejected, "ordinary examples retain successful-source behavior")
+    let failureSource = "let total: Integer = \"many\"\n"
+    let diagnostic = "error: example failure\n  --> program.min:1:22\n  |\n1 | let total: Integer = \"many\"\n  |                      ^ expected Integer\n"
+    let rejecting = "```minyar-reject\n" + failureSource + "```\n```diagnostic\n" + diagnostic + "```\n"
+    let failure = book.parse(rejecting)
+    test.check(failure.error == "" && failure.examples.length == 1 && failure.examples[0].rejected && failure.examples[0].path == "" &&
+        failure.examples[0].source == failureSource && failure.examples[0].output == diagnostic && failure.examples[0].line == 2,
+        "rejection source and full human diagnostic are preserved byte for byte")
+    let failureWindows = book.parse(test.replace(rejecting, "\n", "\r\n"))
+    test.check(failureWindows.error == "" && failureWindows.examples[0].source == failureSource && failureWindows.examples[0].output == diagnostic,
+        "CRLF rejection pairs preserve normalized source and diagnostic bytes")
+    let repairing = book.parse(rejecting + quiet)
+    test.check(repairing.error == "" && repairing.examples.length == 2 && repairing.examples[0].rejected && !repairing.examples[1].rejected,
+        "a rejection and its successful repair can share a standalone page")
+    for program in ["// file operations can fail\nprint(42)\n", "print(42)\n// file: src/main.min\n", "\n// file: src/main.min\nprint(42)\n", "let words = \"\"\"\n// file: src/main.min\n\"\"\"\nprint(words)\n", "let words = #\"\"\"\n// file: src/main.min\n\"\"\"#\nprint(words)\n"] {
+        let prose = book.parse("```minyar\n" + program + "```\n```output\n42\n```\n")
+        test.check(prose.error == "" && prose.examples[0].path == "" && prose.examples[0].source == program,
+            "only the first source line can declare file metadata; prose comments and raw Text remain source")
+    }
     let module = "// file: src/garden.min\npublic function name(): Text { return \"Héllo, sea.\" }\n"
     let main = "// file: src/main.min\nuse \"./garden.min\" as garden\nprint(garden.name())\n"
     let projectPage = "# Files\n\n```minyar\n" + module + "```\n```output\n```\n\n```minyar\n" + main + "```\n```output\nHéllo, sea.\n```\n"
@@ -85,10 +156,24 @@ function parserControls(): Integer {
     }
     invalidCases.add([marked + quiet, "cannot mix project files"])
     invalidCases.add([quiet + marked, "cannot mix project files"])
-    invalidCases.add([test.replace(marked, "// file: src/main.min\nprint(42)", "print(42)\n// file: src/main.min"), "first source line"])
-    invalidCases.add([test.replace(marked, "// file: src/main.min\nprint(42)", "\n// file: src/main.min\nprint(42)"), "first source line"])
     invalidCases.add([test.replace(marked, "print(42)\n", ""), "empty Minyar"])
     invalidCases.add(["```minyar\n// file: src/main.min\nprint(42)\n```\n", "immediately following output"])
+    invalidCases.add(["```diagnostic\nerror: orphan\n```\n", "orphan diagnostic"])
+    invalidCases.add([test.replace(rejecting, "```minyar-reject", "```minyar-reject skip"), "unsupported"])
+    invalidCases.add([test.replace(rejecting, "```diagnostic", "```output"), "immediately following diagnostic"])
+    invalidCases.add([test.replace(quiet, "```output", "```diagnostic"), "immediately following output"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n", "immediately following diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\nSome prose\n```diagnostic\nerror: wrong\n```\n", "immediately following diagnostic"])
+    invalidCases.add(["```minyar-reject\n```\n```diagnostic\nerror: wrong\n```\n", "empty Minyar"])
+    invalidCases.add([test.replace(rejecting, diagnostic, ""), "nonempty diagnostic"])
+    invalidCases.add([test.replace(rejecting, diagnostic, " \t\n"), "nonempty diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n```diagnostic\nerror: wrong\n", "unclosed diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n```diagnostic\nerror: wrong\n ````\n", "malformed closing diagnostic"])
+    invalidCases.add([test.replace(rejecting, failureSource, "// file: src/main.min\n" + failureSource), "cannot have file markers"])
+    invalidCases.add([test.replace(rejecting, failureSource, "//file: src/main.min\n" + failureSource), "cannot have file markers"])
+    invalidCases.add([marked + rejecting, "cannot mix project files"])
+    invalidCases.add([rejecting + marked, "cannot mix project files"])
+    invalidCases.add([marked + test.replace(marked, "// file: src/main.min\nprint(42)", "print(42)\n// file: src/main.min"), "cannot mix project files"])
     for candidate in invalidCases {
         let rejected = book.parse(candidate[0])
         test.check(test.contains(rejected.error, candidate[1]), "parser accepted or misreported invalid documentation: " + candidate[0] + "\n" + rejected.error)
@@ -129,6 +214,17 @@ function verify(compiler: test.Compiler, page: Page, example: book.Example, loca
         book.writeFiles(page.examples, work)
         source = work + "/" + example.path
     }
+    if example.rejected {
+        // Ordinary mode is deliberate: test mode omits application statements.
+        let llvm = work + "/rejected.ll"
+        test.check(files.pathSize(llvm) < 0, "rejection LLVM output already exists")
+        let command = [compiler.executable, source, llvm, "--library", "library"]
+        let built = test.run(command, system.environment(), "", work + "/rejected-compile", compiler.compileTimeout)
+        test.check(rejectionMatches(built, source, example.output, files.pathSize(llvm) >= 0),
+            location + " rejection differs (status " + Text(built.status) + ")\nexpected diagnostic:\n" + example.output +
+            "received stdout:\n" + built.output + "received stderr:\n" + normalizeLocations(built.errorOutput, source))
+        return
+    }
     for mode in ["program", "tests"] {
         let llvm = work + "/" + mode + ".ll"
         let command = [compiler.executable, source, llvm, "--library", "library"]
@@ -157,8 +253,9 @@ function verify(compiler: test.Compiler, page: Page, example: book.Example, loca
 }
 
 let rejected = parserControls()
+let rejectedResults = rejectionControls()
 if arguments.argumentCount() == 1 && arguments.argument(0) == "--self-check" {
-    print("Book parser: " + Text(rejected) + " invalid controls rejected; output and discovery controls passed")
+    print("Book parser: " + Text(rejected) + " invalid controls rejected; " + Text(rejectedResults) + " invalid compiler results rejected; source, diagnostic and project controls passed")
     exit(0)
 }
 test.check(arguments.argumentCount() == 0, "usage: book [--self-check]")
@@ -185,11 +282,16 @@ for path in paths {
 let compiler = test.compiler()
 if compiler.flags.length == 0 { compiler.compileTimeout = 15 }
 let checked = 0
+let successful = 0
+let compilerRejections = 0
 for page in pages {
     for example in page.examples {
         checked += 1
+        if example.rejected { compilerRejections += 1 } else { successful += 1 }
         verify(compiler, page, example, page.path + ":" + Text(example.line), checked)
     }
 }
 test.removeTree(compiler.directory)
-print(Text(checked) + " book examples across " + Text(paths.length) + " pages passed at O0/O2, including embedded tests; " + Text(rejected) + " invalid parser controls rejected")
+print(Text(successful) + " successful book source examples (" + Text(successful * 4) + " native executions at O0/O2, including embedded tests) and " +
+    Text(compilerRejections) + " compiler rejection examples across " + Text(paths.length) + " pages passed; " + Text(rejected) + " invalid parser controls and " +
+    Text(rejectedResults) + " invalid compiler results rejected")

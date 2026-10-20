@@ -1,8 +1,12 @@
-# A worked answer: checking the garden plan
+# Worked answers
 
-[Contents](README.md) · [The garden exercise](08-garden.md#make-it-yours)
+[Contents](README.md)
 
-Try the last exercise before reading this answer. There are several reasonable
+## Chapter 8: checking the garden plan
+
+[The garden exercise](08-garden.md#make-it-yours)
+
+Try chapter 8's validation exercise before reading this answer. There are several reasonable
 ways to arrange it. This version keeps the calculation separate from printing,
 so tests can check the answer without reading messages from the screen.
 
@@ -73,3 +77,38 @@ This solution still assumes totals fit in an Integer. Checking negative values
 does not prevent overflow if enormous positive counts are added. Handling that
 separate problem would use the recoverable checked arithmetic described in
 the [language guide](../language.md#numbers-and-comparisons).
+
+## Chapter 10: when the condition is false
+
+In the condition exercise, change the first number from `1` to `0`. The
+comparison is now false, so the printing block is skipped:
+
+```minyar
+if 0 > 0 { print("light") }
+```
+```output
+```
+
+The empty output box means this program prints nothing, including no blank
+line. It still finishes normally. We changed the question's answer without
+introducing another type error: `0 > 0` is a Boolean expression, just as
+`1 > 0` was.
+
+## Chapter 10: taking the Rain path
+
+Keep both match arms from the repaired program. Change only the case passed
+on its final line:
+
+```minyar
+choice Weather { Clear; Rain }
+function warmth(weather: Weather): Integer {
+    match weather { Clear { return 1 } Rain { return 0 } }
+}
+print(warmth(Weather.Rain))
+```
+```output
+0
+```
+
+`Weather.Rain` selects the Rain arm, which returns `0`. Both arms are still
+needed: the same function can also be called with `Weather.Clear`.
