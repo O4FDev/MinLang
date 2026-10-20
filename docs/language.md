@@ -1911,7 +1911,10 @@ still become visible where they are declared.
 The compiler retains resolved types and source spans for checked declarations,
 statements and expressions. See the [compiler syntax tree](compiler-syntax.md).
 
-Compiler diagnostics identify the source file, line and column. Source-read failures, including invalid UTF-8, use the same text or JSON format. Common syntax,
+Compiler diagnostics identify the source file, line and column. Source-read
+failures, including invalid UTF-8, use the same text or JSON format. Allocation
+failures remain fatal runtime reports, including when reading source files.
+Common syntax,
 type and field errors also show the source line and underline the relevant
 token. Columns count Unicode scalar values, starting at one. Type mismatches
 show the expected and actual types where those are known:
