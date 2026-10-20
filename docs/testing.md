@@ -307,26 +307,34 @@ fallback plus stale scalar schemas. O0/O2 cleanup requires zero remaining
 objects and bytes. The scalar-key follow-up requires the scalar-choice
 predecessor; this Set checkpoint does not implement scalar lowering.
 `check-choice-set-niche-sanitize` instruments the compiler, generated LLVM and
-runtime with ASan/UBSan. These Set targets are prepared source and have not yet
-been compiled or run.
+runtime with ASan/UBSan. Both targets check 18 generated-program executions,
+23 strict rejections and five boxed-layout controls.
 
 The Set allocation fixture preallocates one payload before constructing 10,000
 alternating `Some(payload)`/`None` values. It asserts zero generated wrapper
 records/slots. `MINYAR_CHOICE_SET_BASELINE=/path/to/saved-pre-set-compiler`
 runs only the counter fixture and requires the previous 10,000 records/20,000
-slots. Save that genuine compiler before rebuilding. Runtime Set headers,
-bucket Lists and storage are outside this wrapper counter; it makes no claim
-of zero collection allocations. Prior-compiler replay is also unexecuted.
+slots. The retained qualified pre-Set compiler passes that old-count mode and
+fails the default new-layout assertion before any native header call. Save
+that genuine compiler before rebuilding. Runtime Set headers, bucket Lists
+and storage are outside this wrapper counter; it makes no claim of zero
+collection allocations.
 
-`make check-choice-runtime-profiles` runs the combined choice-cycle and
-container fixtures at O0/O2 across eager, system K32, plain-system K1,
+`make check-choice-runtime-profiles` runs the choice-cycle, container, Set and
+native Set ownership fixtures at O0/O2 across eager, system K32, plain-system K1,
 fixed 1 MiB K1/K1024 and POSIX lazy 1 MiB K32 runtimes. Each profile rejects
 incorrect allocator flags. Integer Text caching is disabled only in these
 test programs; after bounded cleanup, every program must have zero owners,
 objects and bytes. `check-choice-runtime-profiles-sanitize` repeats the matrix
 with compiler, generated LLVM and runtime ASan/UBSan instrumentation.
+The four fixtures produce 24 fixture/profile pairs per target, 48 O0/O2 runs;
+native and sanitizer targets together produce 96 runs on POSIX. The Set native
+helper is included only for its ownership fixture. A single shared bounded
+cleanup destructor checks all four fixtures; cyclic Owner field mutation is
+covered without claiming an observed active MARK phase.
 On Windows these maintained targets select the five supported profiles;
-an explicitly requested lazy profile still rejects as unsupported.
+the two targets produce 80 runs in total. An explicitly requested lazy profile
+still rejects as unsupported.
 
 `make check-choice-type-codec` checks 4,720 real compiler-helper cases per
 optimization at O0/O2, including reserved scalar codes 19..31, 64 List layers,

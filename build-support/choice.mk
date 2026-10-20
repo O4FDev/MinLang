@@ -98,6 +98,7 @@ check-sanitize: check-choice-type-codec-sanitize
 .PHONY: check-choice-runtime-profiles check-choice-runtime-profiles-sanitize
 CHOICE_RUNTIME_PROFILE_CASES = eager system-k32 system-k1 fixed-k1 fixed-k1024 $(if $(filter Windows_NT,$(OS)),,lazy-k32)
 build/tooling/tests/choice-runtime-profiles.ll: tests/choice-composition-cycle.min tests/choice-composition-cycle.expected tests/choice-container-niche.min tests/choice-container-niche.expected tests/frontend-fixtures.min tests/memory-contracts-runtime.c
+build/tooling/tests/choice-runtime-profiles.ll: tests/choice-set-niche.min tests/choice-set-niche.expected tests/choice-set-niche-ownership.min tests/choice-set-niche-ownership.expected tests/choice-set-niche-native.c
 
 check-choice-runtime-profiles: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-runtime-profiles
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-runtime-profiles" $(CHOICE_RUNTIME_PROFILE_CASES)

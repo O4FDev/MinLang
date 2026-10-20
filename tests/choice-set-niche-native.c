@@ -40,6 +40,8 @@ _Bool minyar_choice_set_nativeSame(MinyarRecord *left, MinyarRecord *right) {
     return left == right;
 }
 
+/* The profile runner supplies its one shared bounded destructor instead. */
+#ifndef MINYAR_CHOICE_SET_PROFILE_CLEANUP
 __attribute__((destructor)) static void choice_set_exact_cleanup(void) {
     if (contract_explicit_exit) return;
     assert(rc_frames == NULL);
@@ -58,3 +60,4 @@ __attribute__((destructor)) static void choice_set_exact_cleanup(void) {
     assert(rc_pending_count == 0 && rc_cycle_pending == 0);
     assert(rc_immortal_object_count == 0 && rc_object_count == 0 && rc_bytes == 0);
 }
+#endif
