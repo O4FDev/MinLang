@@ -16,4 +16,3 @@ check-ui-source: build/minyarc
 	$(LIMITED) ./build/minyarc "examples/gallery/desktop.min" "build/harbour-gallery.ll" --library library
 
 check check-portable: check-application-cli check-ui-source
-

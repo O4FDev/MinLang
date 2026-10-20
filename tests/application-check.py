@@ -26,10 +26,24 @@ def run(arguments, *, cwd=ROOT, status=0, environment=None, timeout=180):
     return result
 
 
+def snapshot(bundle):
+    result = {}
+    for path in [bundle, *bundle.rglob("*")]:
+        if path.is_symlink():
+            contents = ("link", os.readlink(path))
+        elif path.is_file():
+            contents = ("file", path.read_bytes())
+        else:
+            contents = ("directory", None)
+        result[str(path.relative_to(bundle))] = (path.lstat().st_mode, contents)
+    return result
+
+
 def check_cli():
     tool = ROOT / "build/tooling/tools/application-cli"
     result = run([tool, "--help"])
     assert "minyar app" in result.stdout and "--sign IDENTITY" in result.stdout
+    assert "app " in run([ROOT / "build/tooling/tools/project-cli", "help"]).stdout
     for options, message in [
         (["--unknown"], "unknown app option"),
         (["--release", "--release"], "duplicate option"),
@@ -62,16 +76,22 @@ def check_cli():
         assert (bundle / "Contents/Resources/note.txt").read_text(encoding="utf-8") == "a resource é"
         assert run([bundle / "Contents/MacOS/application"]).stdout == "A bundled light 🙂\n"
         run(["/usr/bin/codesign", "--verify", "--strict", bundle])
-        before = {str(path.relative_to(bundle)): path.read_bytes() for path in bundle.rglob("*") if path.is_file()}
+        before = snapshot(bundle)
         failed = run([launcher, "app", "--sign", "Minyar deliberately missing test certificate"], cwd=project, status=1, timeout=600)
         assert "application packaging failed" in failed.stderr
-        after = {str(path.relative_to(bundle)): path.read_bytes() for path in bundle.rglob("*") if path.is_file()}
-        assert before == after, "failed signing changed the previous app"
+        assert before == snapshot(bundle), "failed signing changed the previous app"
+        (project / "src/main.min").write_text("print(appBuildMustFailHere)\n", encoding="utf-8")
+        failed = run([launcher, "app"], cwd=project, status=1, timeout=600)
+        assert "appBuildMustFailHere" in failed.stderr
+        assert before == snapshot(bundle), "failed compilation changed the previous app"
+        run(["/usr/bin/codesign", "--verify", "--strict", bundle])
+        assert run([bundle / "Contents/MacOS/application"]).stdout == "A bundled light 🙂\n"
+        (project / "src/main.min").write_text('print("A bundled light 🙂")\n', encoding="utf-8")
         run([launcher, "app", "--manifest-path", project / "Minyar.toml", "--release", "--bundle-id", "org.minyar.release", "--sign", "-"], timeout=600)
         release = project / "target/release/little_light.app"
         assert plistlib.loads((release / "Contents/Info.plist").read_bytes())["CFBundleIdentifier"] == "org.minyar.release"
         run(["/usr/bin/codesign", "--verify", "--strict", release])
-        print("Project app builds, debug/release, resources, Unicode paths, signatures and signing rollback verified")
+        print("Project app builds, debug/release, resources, Unicode paths, signatures and build/signing rollback verified")
 
 
 def check_ui(clang):
