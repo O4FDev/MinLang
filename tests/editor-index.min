@@ -30,6 +30,57 @@ test.check(index.build("print([1, 2)\n").error != "", "mismatched bracket recove
 let nested = source.scan("print(\"outer \\(name + \"nested \\(Integer(2))\")\")\n")
 test.check(nested.error == "" && nested.tokens.length == 5, "nested interpolation must remain one lossless literal")
 
+let contractCode = "record Box { value: Integer }\nfunction accept(predicate: () -> Boolean): Boolean { return predicate() }\nfunction guarded(value: Integer): Integer requires(accept(function(): Boolean { return value >= 0 })) ensures(result >= 0) { return value }\nfunction after() {}\n"
+let contractIndex = index.build(contractCode)
+let guarded = index.find(contractIndex, "guarded", 0, "")
+test.check(contractIndex.error == "" && guarded >= 0 && contractIndex.symbols[guarded].type == "Integer", "contract clauses entered the function return annotation")
+test.check(contractIndex.symbols[guarded].end == contractCode.find("\nfunction after"), "callback predicate brace became the function body")
+test.check(contractIndex.symbols[guarded].detail.find("requires(") >= 0 && contractIndex.symbols[guarded].detail.find("ensures(") >= 0, "contract header detail was truncated")
+test.check(index.find(contractIndex, "value", contractCode.find("{ return value }"), "") >= 0, "callback predicate truncated the parameter scope")
+test.check(index.find(contractIndex, "value", contractCode.find("function after"), "") < 0, "contract parameter escaped the function body")
+
+let literalCode = "record Box { value: Integer }\nfunction boxed(value: Integer): Box requires(Box { value: 1 }.value > 0) { return Box { value: value } }\nfunction afterLiteral() {}\n"
+let literalIndex = index.build(literalCode)
+let boxed = index.find(literalIndex, "boxed", 0, "")
+test.check(boxed >= 0 && literalIndex.symbols[boxed].type == "Box", "contracted record return type was lost")
+test.check(literalIndex.symbols[boxed].end == literalCode.find("\nfunction afterLiteral"), "record predicate brace became the function body")
+test.check(index.find(literalIndex, "value", literalCode.find("return Box"), "") >= 0, "record predicate truncated the parameter scope")
+
+let clauseIndex = index.build("function pre(): Integer requires(true) { return 1 }\nfunction post(): Integer ensures(result > 0) { return 1 }\nfunction steady(): Integer invariant(true) { return 1 }\nrecord requires { value: Integer }\nfunction identity(value: requires): requires ensures(true) { return value }\nfunction requires(value: Integer): Integer { return value }\nfunction ensures(value: Integer): Integer { return value }\nfunction invariant(value: Integer): Integer { return value }\n")
+for name in ["pre", "post", "steady", "requires", "ensures", "invariant"] {
+    let found = index.find(clauseIndex, name, 0, "")
+    test.check(found >= 0 && clauseIndex.symbols[found].type == "Integer", "contextual contract function return type for " + name)
+}
+let identity = index.find(clauseIndex, "identity", 0, "")
+test.check(identity >= 0 && clauseIndex.symbols[identity].type == "requires", "an ordinary contract identifier became a clause")
+
+let longCode = "function longHeader(value: Integer): Integer\n"
+for clause in 0..14 {
+    longCode += "requires(value >= 0)\n"
+}
+longCode += "ensures(result >= 0)\n{ return value }\nfunction afterLong() {}\n"
+let longIndex = index.build(longCode)
+let longHeader = index.find(longIndex, "longHeader", 0, "")
+test.check(longHeader >= 0 && longIndex.symbols[longHeader].end == longCode.find("\nfunction afterLong"), "long contract header did not find its body")
+test.check(index.find(longIndex, "value", longCode.find("{ return value }"), "") >= 0, "long contract header lost the parameter scope")
+test.check(index.find(longIndex, "value", longCode.find("function afterLong"), "") < 0, "long contract header leaked its parameter")
+
+let methodCode = "record Lamp { light: Integer }\nfunction Lamp.glow(amount: Integer) requires(amount <= self.light) invariant(self.light >= 0) { self.light += amount }\nfunction afterMethod() {}\n"
+let methodIndex = index.build(methodCode)
+let headerSelf = index.find(methodIndex, "self", methodCode.find("self.light)"), "@self")
+test.check(headerSelf >= 0 && methodIndex.symbols[headerSelf].type == "Lamp", "method self is missing from contract predicates")
+test.check(index.find(methodIndex, "self", methodCode.find("self.light +="), "@self") >= 0, "method self is missing from the body")
+test.check(index.find(methodIndex, "self", methodCode.find("function afterMethod"), "@self") < 0, "method self escaped the contracted method")
+
+for declaration in ["function later(): Integer { return 42 }", "public function later(): Integer { return 42 }"] {
+    let recoveryCode = "function pending(value: Integer): Integer\n" + declaration + "\n"
+    let recoveryIndex = index.build(recoveryCode)
+    let pending = index.find(recoveryIndex, "pending", 0, "")
+    let later = index.find(recoveryIndex, "later", 0, "")
+    test.check(pending >= 0 && later >= 0 && recoveryIndex.symbols[pending].end < recoveryIndex.symbols[later].start, "unfinished header consumed a later declaration body")
+    test.check(index.find(recoveryIndex, "value", recoveryCode.find("return 42"), "") < 0, "unfinished header leaked its parameter into a later function")
+}
+
 let text = "a🌙é\r\nb\rc\n"
 test.check(protocol.offset(text, 0, 1) == 1 && protocol.offset(text, 0, 3) == 5 && protocol.offset(text, 0, 2) == - 1, "UTF-16 surrogate boundaries")
 test.check(protocol.offset(text, 1, 0) == 9 && protocol.offset(text, 2, 0) == 11 && protocol.offset(text, 3, 0) == 13, "editor line endings")

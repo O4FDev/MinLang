@@ -42,13 +42,61 @@ function spelling(tokens: List<source.Token>, first: Integer, after: Integer): T
     }
     return joinText(parts)
 }
+function contractClause(tokens: List<source.Token>, position: Integer, after: Integer): Boolean {
+    if position + 1 >= after || tokens[position].kind != 1 || tokens[position + 1].text != "(" {
+        return false
+    }
+    let value = tokens[position].text
+    return value == "requires" || value == "ensures" || value == "invariant"
+}
+function declarationBoundary(tokens: List<source.Token>, position: Integer): Boolean {
+    if position == 0 || tokens[position].line <= tokens[position - 1].line {
+        return false
+    }
+    let next = position
+    while next < tokens.length &&(tokens[next].text == "public" || tokens[next].text == "parallel" || tokens[next].text == "native") {
+        next += 1
+    }
+    if next + 1 >= tokens.length {
+        return false
+    }
+    let value = tokens[next].text
+    if value == "function" || value == "record" || value == "choice" || value == "capability" || value == "conform" {
+        return tokens[next + 1].kind == 1
+    }
+    if value == "use" || value == "test" || value == "bench" {
+        return tokens[next + 1].kind == 3
+    }
+    if (value == "type" || value == "let" || value == "constant" || value == "global") && next + 2 < tokens.length && tokens[next + 1].kind == 1 {
+        return tokens[next + 2].text == "=" || tokens[next + 2].text == ":" || tokens[next + 2].text == "<"
+    }
+    return false
+}
+function bodyOpening(tokens: List<source.Token>, pairs: List<Integer>, first: Integer): Integer {
+    let position = first
+    while position < tokens.length {
+        let value = tokens[position].text
+        if value == "{" || value == "=" || declarationBoundary(tokens, position) {
+            return position
+        }
+        if value == "(" || value == "[" {
+            if pairs[position] >= tokens.length {
+                return tokens.length
+            }
+            position = pairs[position] + 1
+        } else {
+            position += 1
+        }
+    }
+    return tokens.length
+}
 function annotation(tokens: List<source.Token>, first: Integer, after: Integer): Text {
     let end = first
     let angle = 0
     let round = 0
     while end < after {
         let value = tokens[end].text
-        if angle == 0 && round == 0 &&(value == "," || value == ";" || value == "=" || value == "{" || value == "}" || value == ")") {
+        if angle == 0 && round == 0 &&(value == "," || value == ";" || value == "=" || value == "{" || value == "}" || value == ")" || contractClause(tokens, end, after)) {
             break
         }
         if end > first && angle == 0 && round == 0 && tokens[end].line > tokens[end - 1].line {
@@ -228,10 +276,7 @@ public function build(text: Text): Index {
             }
         }
         if (value == "record" || value == "choice") && parents[index] == - 1 && index + 2 < tokens.length && tokens[index + 1].kind == 1 {
-            let body = index + 2
-            while body < tokens.length && tokens[body].text != "{" && tokens[body].text != "=" && tokens[body].line <= tokens[index + 1].line + 10 {
-                body += 1
-            }
+            let body = bodyOpening(tokens, pairs, index + 2)
             if body < tokens.length && tokens[body].text == "{" {
                 let end = text.byteLength
                 if pairs[body] < tokens.length {
@@ -258,28 +303,29 @@ public function build(text: Text): Index {
                 name += 2
             }
             let round = name + 1
-            while round < tokens.length && tokens[round].text != "(" && tokens[round].text != "{" && tokens[round].line <= token.line + 10 {
+            while round < tokens.length && tokens[round].text != "(" && tokens[round].text != "{" {
+                if declarationBoundary(tokens, round) {
+                    break
+                }
                 round += 1
             }
             if round >= tokens.length || tokens[round].text != "(" || pairs[round] >= tokens.length {
                 continue
             }
             let close = pairs[round]
-            let body = close + 1
-            while body < tokens.length && tokens[body].text != "{" && tokens[body].line <= tokens[close].line + 10 {
-                body += 1
-            }
+            let body = bodyOpening(tokens, pairs, close + 1)
             let end = text.byteLength
             let begin = tokens[close].end
-            if body < tokens.length && tokens[body].text == "{" {
-                begin = tokens[body].start
-                if pairs[body] < tokens.length {
+            if body < tokens.length {
+                if tokens[body].text == "{" && pairs[body] < tokens.length {
                     end = tokens[pairs[body]].end
+                } else if tokens[body].text != "{" {
+                    end = tokens[body - 1].end
                 }
             }
             let type = "Nothing"
             if close + 1 < tokens.length && tokens[close + 1].text == ":" {
-                type = annotation(tokens, close + 2, tokens.length)
+                type = annotation(tokens, close + 2, body)
             }
             let kind = 12
             if container != "" {
