@@ -156,22 +156,29 @@ graph analysis. See the Result language contract
 and the independent review.
 
 Choices share their payload slots across cases and track only the active
-reference fields. A two-case choice with one Text, Bytes or ordinary managed record
+reference fields. A two-case choice with one Text, Bytes, List or ordinary managed record
 payload uses that payload pointer directly, reserving null for the empty case.
-This includes `Maybe<Text>` and `Maybe<Record>` and adds no wrapper object or
-reference-count edge. Empty Text headers are non-null. Text key snapshots
+This includes `Maybe<Text>`, `Maybe<Bytes>`, `Maybe<List<Item>>` and `Maybe<Record>`
+and adds no wrapper object or reference-count edge. Empty Text headers are
+non-null. Text key snapshots
 retain the immutable payload and return one owned result; record payloads
 keep their existing deep snapshot copy. Bytes optionals retain the mutable
 header without copying its contents. Empty headers are non-null; C-layout
 Bytes views retain their existing backing-owner edge. Bytes remain ineligible
 for implicit key snapshots or derived equality, ordering and hashing.
+List optionals also retain their mutable header without copying elements.
+Scalar-element and reference-element Lists keep their element kinds and
+allocation metadata. A nullable choice/List cycle can become one physical List
+self-edge; its tracing metadata still identifies a List, rather than a record.
 The compiler keeps the full logical field graph for cycle analysis and projects
 nullable aliases to their payload type when choosing traced ownership calls.
 Choice, callback and C-layout payloads retain an explicit tag; in particular,
 an optional containing another optional must preserve `Some(None)`.
 Physical layout kind 3 denotes this nullable payload contract, with zero
-choice-owned storage slots. Its niche type may be Text (type 2), Bytes (type 8) or an ordinary
-managed record; consumers must classify the payload before reading its layout.
+choice-owned storage slots. Its niche type may be Text (type 2), Bytes (type 8),
+a structural List type or an ordinary managed record; consumers must classify
+the payload before reading its layout. Logical SCC metadata is preserved, and
+both endpoints of traced ownership operations use the physical payload type.
 
 ## Compiler/runtime ownership contract
 

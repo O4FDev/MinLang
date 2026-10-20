@@ -885,7 +885,7 @@ tracking stored separately. Payloads can hold choices, records, Lists and
 callbacks, with the same ownership and cycle analysis as records. Cases and
 payload fields are accessed through constructors and matching. Patterns inspect only the active case and its payloads.
 
-A two-case choice with one Text, Bytes or ordinary record payload uses a nullable pointer.
+A two-case choice with one Text, Bytes, List or ordinary record payload uses a nullable pointer.
 For example, `Maybe<Reading>` stores the `Reading` pointer for `Some(reading)`
 and null for `None`, with no wrapper allocation. The record keeps its usual
 shared ownership. `Maybe<Text>` likewise stores Text directly; even an empty
@@ -903,6 +903,12 @@ Unwrapping shares the mutable Bytes value, including retained C-layout views.
 This representation does not add equality, ordering, hashing or Map-key/Set
 support for Bytes. Native functions returning such a choice must return the
 Bytes header or null, rather than an old choice wrapper or an interior address.
+`Maybe<List<Item>>` likewise stores the List header or null, including for an
+empty List. Unwrapping keeps the same mutable List and its element ownership.
+Reference-element Lists retain their usual cycle tracing; even a choice/List
+cycle that becomes a physical List self-edge is collected as a List. Lists
+gain no implicit equality, ordering, hashing or Map-key/Set support. Native
+functions returning these choices must return the List header or null.
 
 ## Maps and Sets
 

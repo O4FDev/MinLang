@@ -15,6 +15,26 @@ function link(frontend: fixtures.Frontend, path: Text, object: Text, expected: T
     }
 }
 
+function barrierControl(frontend: fixtures.Frontend, path: Text) {
+    let compiler = frontend.compiler
+    let original = io.readTextFile(path + ".ll")
+    let mutant = original
+    for operation in ["retain", "borrow", "local"] {
+        mutant = test.replace(mutant, "call void @minyar_rc_" + operation + "_traced(", "call void @minyar_rc_" + operation + "(")
+    }
+    test.check(mutant != original, "MARK control found no traced ownership operations")
+    io.writeTextFile(path + ".ll", mutant)
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for argument in ["-Wno-override-module", path + ".ll", path + "-runtime.o", "-lm", "-o", path + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", path + ".control-link", 60), "link missing-barrier control " + level)
+        let result = test.run([path + ".exe"], frontend.environment, "", path + ".control-run", 30)
+        test.check(result.status != 0 && result.output == "" && test.contains(result.errorOutput, "mark_list(saved)->marked != 0"), "missing optional-root barrier escaped the unmarked-target oracle " + level + "\n" + result.errorOutput)
+    }
+    io.writeTextFile(path + ".ll", original)
+}
+
 function allocations(frontend: fixtures.Frontend, payload: Text, initial: Text, baseline: Boolean) {
     let compiler = frontend.compiler
     let source = "function sample(value: " + payload + ", index: Integer): Maybe<" + payload + "> { if index % 2 == 0 { return Some(value) }; return None }\nlet payload: " + payload + " = " + initial + "\nlet values: List<Maybe<" + payload + ">> = []\nfor index in 0..10000 { values.add(sample(payload, index)) }\nlet total = 0\nfor value in values { total += match value { Some(item) { item.length } None { 0 } } }\nprint(total)\n"
@@ -51,8 +71,41 @@ let compiler = frontend.compiler
 let baseline = test.setting("MINYAR_CHOICE_CONTAINER_BASELINE", "")
 if baseline != "" { compiler.executable = baseline }
 allocations(frontend, "Bytes", "Bytes(\"x\")", baseline != "")
+allocations(frontend, "List<Integer>", "[1]", baseline != "")
+allocations(frontend, "List<Text>", "[\"x\"]", baseline != "")
 if baseline == "" {
     fixtures.executes(frontend, io.readTextFile("tests/choice-container-niche.min"), io.readTextFile("tests/choice-container-niche.expected"), ["-O0", "-O2"], 0, "", true)
+    frontend.runtimeFlags = ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_SYSTEM_SMALL_HEAP=0", "-DMINYAR_RC_POLL_BUDGET=1", "-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0"]
+    frontend.helpers = io.readTextFile("tests/choice-container-niche-mark-runtime.c")
+    fixtures.executes(frontend, io.readTextFile("tests/choice-container-niche-mark.min"), "Container MARK: optional root, List self-edge and nullable Node removal passed\n", ["-O0", "-O2"], 0, "", true)
+    barrierControl(frontend, compiler.directory + "/case" + Text(compiler.serial))
+    frontend.runtimeFlags = []
+    frontend.helpers = ""
+    fixtures.executes(frontend, #"""
+        use "maybe" as maybe
+        record Item { children: List<Item> }
+        function capture(value: Maybe<List<Item>>): () -> Maybe<List<Item>> { return function() { return value } }
+        if true {
+            let children: List<Item> = []
+            let item = Item { children: children }
+            children.add(item)
+            let read = capture(Some(children))
+            children = []; item = Item { children: [] }
+            let kept = read().unwrap()
+            print(kept.length)
+            kept[0].children = []
+            print(read().unwrap().length)
+        }
+        let value: maybe.Maybe<List<Integer>> = maybe.Maybe<List<Integer>>.Some([1])
+        let mapped = value.map(function(values) { return values })
+        let mappedValues = mapped.unwrap()
+        mappedValues[0] = 7
+        print(value.unwrap()[0])
+        print(value.filter(function(values) { return values.length == 1 }).isSome())
+        print(value.andThen(function(values): maybe.Maybe<List<Integer>> { return maybe.Maybe<List<Integer>>.Some(values) }).unwrap()[0])
+        let bytes: maybe.Maybe<Bytes> = maybe.Maybe<Bytes>.Some(Bytes())
+        print(bytes.isSome()); print(bytes.unwrap().length)
+        """#, "1\n1\n7\ntrue\n7\ntrue\n0\n", ["-O0", "-O2"], 0, "", true)
     for payload in ["Bytes", "List<Integer>", "List<Text>"] {
         for operation in ["==", "!=", "<"] {
             let capability = "Equatable"
@@ -68,9 +121,9 @@ if baseline == "" {
 
     let leaf = compiler.directory + "/optional.min"
     let entry = compiler.directory + "/main.min"
-    let exported = "public choice Buffer { Empty; Data(value: Bytes) }\npublic type Optional = Maybe<Bytes>\npublic function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }\npublic function optional(): Optional { return wrap(Bytes(\"module\")) }\npublic function empty(): Buffer { return Data(Bytes()) }\npublic function length(value: Buffer): Integer { return match value { Empty { -1 } Data(item) { item.length } } }\n"
+    let exported = "public choice Buffer { Empty; Data(value: Bytes) }\npublic type Optional = Maybe<Bytes>\npublic function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }\npublic function optional(): Optional { return wrap(Bytes(\"module\")) }\npublic function numbers(): Maybe<List<Integer>> { return wrap([42]) }\npublic function names(): Maybe<List<Text>> { return wrap([\"tree\"]) }\npublic function empty(): Buffer { return Data(Bytes()) }\npublic function length(value: Buffer): Integer { return match value { Empty { -1 } Data(item) { item.length } } }\n"
     io.writeTextFile(leaf, exported)
-    io.writeTextFile(entry, "use \"./optional.min\" as optional\nlet value: optional.Optional = optional.optional()\nprint(value.unwrap().length)\nprint(optional.length(optional.empty()))\nprint(optional.wrap(Bytes(\"x\")).unwrap().length)\n")
+    io.writeTextFile(entry, "use \"./optional.min\" as optional\nlet value: optional.Optional = optional.optional()\nprint(value.unwrap().length)\nprint(optional.length(optional.empty()))\nprint(optional.wrap(Bytes(\"x\")).unwrap().length)\nprint(optional.numbers().unwrap()[0])\nprint(optional.names().unwrap()[0])\n")
     let empty = compiler.directory + "/empty.state"
     let prior = compiler.directory + "/prior.state"
     let next = compiler.directory + "/next.state"
@@ -88,8 +141,8 @@ if baseline == "" {
     for mode in ["cold", "warm", "edited"] {
         let path = compiler.directory + "/" + mode
         if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
-        let expected = "6\n0\n1\n"
-        if mode == "edited" { expected = "7\n0\n1\n" }
+        let expected = "6\n0\n1\n42\ntree\n"
+        if mode == "edited" { expected = "7\n0\n1\n42\ntree\n" }
         link(frontend, path, compiler.runtime, expected, "")
     }
 }
