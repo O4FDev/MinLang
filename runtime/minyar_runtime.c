@@ -285,7 +285,12 @@ MINYAR_COLD MINYAR_NORETURN void minyar_constant_initialization_fail(void) {
 }
 
 static MINYAR_COLD MINYAR_NORETURN void out_of_memory(void) {
-    minyar_stop("the computer ran out of memory.");
+    fprintf(stderr, "Minyar stopped: the computer ran out of memory.\n");
+    /* Symbol lookup can allocate on hosted targets. An exhausted allocator
+     * must not recurse through that path or fire a deterministic failpoint
+     * more than once; static entry metadata needs no allocation. */
+    minyar_print_entry_trace();
+    minyar_failure_exit();
 }
 
 #include "minyar_scope_types.h"

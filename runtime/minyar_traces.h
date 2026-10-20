@@ -77,6 +77,39 @@ static void minyar_trace_return_addresses(int (*print)(FILE *, const char *, ...
 }
 #endif
 
+static MINYAR_COLD void minyar_print_trace(const MinyarTrace *trace, int include_return_addresses) {
+    if (!trace->count) return;
+    /* Keep the reporter on the runtime's existing fprintf binding. A local
+     * volatile target prevents libcall rewriting into new startup imports. */
+    int (*volatile print)(FILE *, const char *, ...) = fprintf;
+    print(stderr, "Minyar stack trace:\n");
+#ifdef MINYAR_TRACE_RETURN_ADDRESSES
+    if (include_return_addresses) minyar_trace_return_addresses(print);
+#else
+    (void)include_return_addresses;
+#endif
+    for (unsigned index = 0; index < trace->count; index++) {
+        const MinyarTraceRow *row = trace->rows[index];
+        uintptr_t base = trace->bases[index];
+        print(stderr, "  at %s (%s:%lld:%lld)\n",
+              (const char *)(base + (uintptr_t)row->name),
+              (const char *)(base + (uintptr_t)row->file),
+              (long long)row->line, (long long)row->column);
+        const char *source = (const char *)(base + (uintptr_t)row->source);
+        if (*source) print(stderr, "    | %s\n", source);
+    }
+}
+
+static MINYAR_COLD void minyar_print_entry_trace(void) {
+    if (!minyar_trace_module_count) return;
+    MinyarTrace trace;
+    trace.count = 0;
+    uintptr_t base = 0;
+    const MinyarTraceRow *entry = minyar_trace_find(0, &base, 1);
+    if (entry) { trace.rows[0] = entry; trace.bases[0] = base; trace.count = 1; }
+    minyar_print_trace(&trace, 0);
+}
+
 __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(void) {
     if (!minyar_trace_module_count) return;
     MinyarTrace trace;
@@ -91,24 +124,7 @@ __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(
         const MinyarTraceRow *entry = minyar_trace_find(0, &base, 1);
         if (entry) { trace.rows[0] = entry; trace.bases[0] = base; trace.count = 1; }
     }
-    if (!trace.count) return;
-    /* Keep the reporter on the runtime's existing fprintf binding. A local
-     * volatile target prevents libcall rewriting into new startup imports. */
-    int (*volatile print)(FILE *, const char *, ...) = fprintf;
-    print(stderr, "Minyar stack trace:\n");
-#ifdef MINYAR_TRACE_RETURN_ADDRESSES
-    minyar_trace_return_addresses(print);
-#endif
-    for (unsigned index = 0; index < trace.count; index++) {
-        const MinyarTraceRow *row = trace.rows[index];
-        uintptr_t base = trace.bases[index];
-        print(stderr, "  at %s (%s:%lld:%lld)\n",
-              (const char *)(base + (uintptr_t)row->name),
-              (const char *)(base + (uintptr_t)row->file),
-              (long long)row->line, (long long)row->column);
-        const char *source = (const char *)(base + (uintptr_t)row->source);
-        if (*source) print(stderr, "    | %s\n", source);
-    }
+    minyar_print_trace(&trace, 1);
 }
 
 #endif
