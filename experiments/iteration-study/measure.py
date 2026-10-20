@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,8 +19,10 @@ if sys.platform != "linux":
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--build", action="store_true", help="Build once on this remote box before measuring")
+parser.add_argument("--scope-owners", action="store_true", help="Compile this study with scope ownership lowering")
+parser.add_argument("--output", type=Path, metavar="DIR", help="Artifact directory (default: build/iteration-study, or build/iteration-study-scope with --scope-owners)")
 args = parser.parse_args()
-out = Path("build/iteration-study")
+out = args.output if args.output is not None else Path("build/iteration-study-scope" if args.scope_owners else "build/iteration-study")
 out.mkdir(parents=True, exist_ok=True)
 source = Path("experiments/iteration-study/scalar.min")
 shutil.copyfile(source, out / "source.min")
@@ -39,20 +42,33 @@ def run(command, stem, *, required=True, timeout=120):
     return result
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 if args.build:
     run(["make", "-j8", "build/minyarc", "build/minyar-runtime.o"], "build", timeout=600)
 if not Path("build/minyarc").is_file() or not Path("build/minyar-runtime.o").is_file():
     raise SystemExit("Build artifacts are absent; rerun through bx with --build.")
 
+compiler_sha256 = sha256_file(Path("build/minyarc"))
+source_sha256 = sha256_file(source)
 clang = run(["sh", "tools/toolchain.sh", "default-clang"], "compiler-path").stdout.strip()
 version = run([clang, "--version"], "clang-version").stdout.strip()
-run(["./build/minyarc", source, out / "scalar.raw.ll", "--library", "library"], "compile")
+compile_command = ["./build/minyarc", source, out / "scalar.raw.ll", "--library", "library"]
+if args.scope_owners:
+    compile_command.append("--scope-owners")
+run(compile_command, "compile")
 run([clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", out / "scalar.raw.ll", "-o", out / "scalar.O2.ll"], "optimize")
 run([clang, "-O2", "-S", "-Wno-override-module", out / "scalar.raw.ll", "-o", out / "scalar.O2.s"], "assembly")
 run([clang, "-O2", "-Wno-override-module", out / "scalar.raw.ll", "build/minyar-runtime.o", "-lm", "-o", out / "scalar"], "link")
 runs = []
 for number, arguments in enumerate([[], ["a", "b", "c"]]):
-    result = run([out / "scalar", *arguments], "run-" + str(number))
+    result = run([(out / "scalar").resolve(), *arguments], "run-" + str(number))
     lines = result.stdout.splitlines()
     if len(lines) != 2 or lines[0] != lines[1]:
         raise SystemExit("Fused/handwritten output differs: " + repr(result.stdout))
@@ -168,6 +184,11 @@ summary = {
     "cwd": os.getcwd(),
     "clang": version,
     "fixture": str(source),
+    "ownership_mode": "scope-owners" if args.scope_owners else "legacy",
+    "output": str(out),
+    "compiler": "./build/minyarc",
+    "compiler_sha256": compiler_sha256,
+    "source_sha256": source_sha256,
     "runs": runs,
     "perf_probe": perf_result,
     "raw": extract(out / "scalar.raw.ll", "raw"),
@@ -177,6 +198,7 @@ summary = {
         "Natural-loop sets include conditional blocks, so one call site need not run for every item.",
         "The full program prints both variants; no whole-process performance comparison is claimed.",
         "The existing runtime object is linked separately; no LTO elimination of opaque runtime calls is assumed.",
+        "The ownership mode records the requested lowering; conservative function fallbacks may retain legacy ownership calls.",
     ],
 }
 (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

@@ -92,20 +92,27 @@ the user-record protocol and its diagnostics.
 
 The reproducible study in `experiments/iteration-study` compares a dynamic List
 pipeline with a handwritten loop using the same named transforms. It invokes
-`build/minyarc` directly with its legacy ownership lowering; the public eager
-launcher now selects scope ownership, whose code counts are separate. On Linux
-x86_64 with Clang 23.1.2, both optimized loop bodies contained 31 static LLVM
+`build/minyarc` directly, with separate legacy and `--scope-owners` runs. On Linux
+x86_64 with Clang 23.1.2, both optimized loop bodies in each mode contained 31 static LLVM
 instructions and the same five direct call sites: checked multiplication,
-checked addition, List access fallback, List length and ownership step. Neither
+checked addition, List access fallback, List length and ownership cleanup. The
+last call is `minyar_rc_step` in legacy mode and a scope poll in scope mode. Neither
 loop contained an indirect call. The two dynamic inputs produced matching
 results, 3104 and 3300. This measures emitted code, not execution speed or
 retired instructions; hardware counters were unavailable on that box.
+
+Matching loops do not imply matching whole-function work. In scope mode, the
+fused fold helper contained 74 static instructions versus 58 in the handwritten
+function, plus a 33-instruction setup wrapper with two recipe allocations.
 
 Run `python3 experiments/iteration-study/measure.py --build` on an idle Linux
 Boat box through `bx`. It retains source, commands, raw/optimized LLVM, assembly
 and a machine-readable report under `build/iteration-study`. It also reports
 fixed setup separately: this two-stage pipeline creates two recipe records
 outside its consuming loop.
+Add `--scope-owners` for the public eager launcher's lowering; its default output
+is `build/iteration-study-scope`. Use `--output DIR` to retain separate runs.
+Each report records the compiler and source hashes.
 
 Recipes and range values are ordinary reference records. Building a recipe
 allocates one small source-holding record per stage, once; a user `iterator()`
