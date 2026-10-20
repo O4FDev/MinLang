@@ -1,4 +1,6 @@
 .PHONY: check-sequences check-sequences-sanitize
+build/tooling/tests/sequences.ll: tests/frontend-fixtures.min
+
 check-sequences: build/minyarc build/minyar-runtime.o build/tooling/tests/sequences
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/sequences
 

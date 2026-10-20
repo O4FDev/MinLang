@@ -1,4 +1,6 @@
 .PHONY: check-iteration check-iteration-sanitize
+build/tooling/tests/iteration.ll: tests/frontend-fixtures.min
+
 check-iteration: build/minyarc build/minyar-runtime.o build/tooling/tests/iteration
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/iteration
 
