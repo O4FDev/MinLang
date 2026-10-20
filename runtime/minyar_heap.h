@@ -1,7 +1,7 @@
 /* Backing allocator for bounded reference-count traversal. System calls have
  * no execution-time or reservation guarantee. The optional pool preserves its
  * fixed-capacity bookkeeping contract. Neither backend changes object headers. */
-#ifdef MINYAR_SYSTEM_HEAP
+#if defined(MINYAR_SYSTEM_HEAP) || defined(MINYAR_EAGER_SYSTEM_HEAP)
 #ifndef MINYAR_SYSTEM_SMALL_HEAP
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)

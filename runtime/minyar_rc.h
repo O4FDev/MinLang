@@ -108,12 +108,14 @@ static inline size_t rc_service_pending(size_t budget) {
 #endif
     return 0;
 }
+#else
+/* Eager release frees objects as they die, so most allocations are short
+ * lived. The size-class heap serves them without libc bookkeeping. */
+#define MINYAR_EAGER_SYSTEM_HEAP 1
+#include "minyar_heap.h"
+#endif
 #define RC_ALLOCATE(size) rc_heap_allocate(size)
 #define RC_DEALLOCATE(pointer) rc_heap_deallocate(pointer)
-#else
-#define RC_ALLOCATE(size) malloc(size)
-#define RC_DEALLOCATE(pointer) free(pointer)
-#endif
 
 static void *rc_allocate_object(size_t size, unsigned kind) {
 #ifdef MINYAR_BOUNDED_RC
@@ -157,12 +159,7 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
 #ifdef MINYAR_RC_TESTING
     size_t previous_size = data->size;
 #endif
-#ifdef MINYAR_BOUNDED_RC
     data = rc_heap_resize(data, sizeof(*data) + data->size, sizeof(*data) + size);
-#else
-    data = realloc(data, sizeof(*data) + size);
-#endif
-    if (!data) out_of_memory();
     RC_ACCOUNT(rc_bytes -= previous_size);
     data->size = size;
     RC_ACCOUNT(rc_bytes += size);
@@ -228,7 +225,7 @@ static void rc_drop(void *value) {
         return;
     }
     RC_ACCOUNT(rc_object_count--);
-    free(object);
+    RC_DEALLOCATE(object);
     /* Views point directly at an owning root, never at another view. */
     if (text_backing) rc_drop(text_backing);
 }
@@ -257,7 +254,7 @@ static void rc_release_slow(void *value) {
                                    + (size_t)record->length * (sizeof(long long) + 1));
         }
         RC_ACCOUNT(rc_object_count--);
-        free(object);
+        RC_DEALLOCATE(object);
     }
 }
 
