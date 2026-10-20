@@ -257,6 +257,35 @@ print(sizeOf(c.LayoutClash)); print(alignOf(c.LayoutClash)); print(offsetOf(c.La
             result = self.import_header(header, prefix, selection, success=False)
             assert result.stderr and "Traceback" not in result.stderr, result.stderr
             assert all(prefix.with_suffix(suffix).read_bytes() == before for suffix, before in sentinels.items())
+        enum_pointer_header = self.directory / "enum pointer typedefs.h"
+        enum_pointer_header.write_text("""
+enum PointerTag { PointerZero };
+typedef enum PointerTag *EnumPointer;
+EnumPointer enum_pointer(EnumPointer value);
+typedef const enum PointerTag *ConstEnumPointer;
+typedef EnumPointer IndirectPointer;
+typedef enum PointerTag (*EnumCallback)(void);
+EnumCallback enum_callback(EnumCallback value);
+""")
+        for name in ("EnumPointer", "enum_pointer", "ConstEnumPointer", "IndirectPointer", "EnumCallback", "enum_callback"):
+            result = self.import_header(enum_pointer_header, prefix, [name], success=False)
+            assert result.stderr and "Traceback" not in result.stderr, (name, result.stderr)
+            assert all(prefix.with_suffix(suffix).read_bytes() == before for suffix, before in sentinels.items()), name
+        qualified_header = self.directory / "qualified typedefs.h"
+        qualified_header.write_text("""
+enum E { Zero };
+typedef volatile enum E VE;
+typedef struct { VE value; } VolatileHolder;
+typedef _Atomic(enum E) AtomicEnum;
+typedef struct { AtomicEnum value; } AtomicHolder;
+typedef struct PlainStruct { int value; } PlainStruct;
+typedef const volatile PlainStruct ConstVolatileStruct;
+typedef struct { ConstVolatileStruct value; } ConstVolatileHolder;
+""")
+        for name in ("VE", "VolatileHolder", "AtomicEnum", "AtomicHolder", "ConstVolatileStruct", "ConstVolatileHolder"):
+            result = self.import_header(qualified_header, prefix, [name], success=False)
+            assert result.stderr and "Traceback" not in result.stderr, (name, result.stderr)
+            assert all(prefix.with_suffix(suffix).read_bytes() == before for suffix, before in sentinels.items()), name
         missing = self.directory / "missing"
         self.import_header(FIXTURES / "fixtures.h", missing, ["lantern_missing"], success=False)
         assert not any(missing.with_suffix(suffix).exists() for suffix in OUTPUT_SUFFIXES)

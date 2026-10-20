@@ -163,6 +163,12 @@ class Importer:
                         self.nodes[child["name"]] = child
         for name, node in self.nodes.items():
             if node.get("kind") == "TypedefDecl":
+                # A PointerType/FunctionProtoType also contains its pointee's
+                # EnumType/RecordType. Only direct value aliases can register
+                # here; otherwise type() must inspect the canonical wrapper.
+                spellings = " ".join(node.get("type", {}).values())
+                if any(character in spellings for character in "*()[]") or re.search(r"\b(volatile|_Atomic|__attribute__)\b", spellings):
+                    continue
                 for child in walk(node):
                     if child.get("kind") == "RecordType":
                         key = child.get("decl", {}).get("id")
