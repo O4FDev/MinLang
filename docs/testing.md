@@ -230,7 +230,9 @@ Composition fixtures combine scalar enums, nullable payloads and tagged unions
 through snapshots, callbacks and parallel calls. Recursive records combine
 enum fields with nullable links and List cycles; `Maybe<Enum>` distinguishes
 the empty case from an enum's zero tag. C-layout enum fields retain scalar
-storage. Every composition case runs with the same exact cleanup oracle.
+storage. Maybe/Result mapping and `try` propagation also transfer scalar enum
+payloads, including skipped callbacks on empty/error cases. Every composition
+case runs with the same exact cleanup oracle.
 `check-choice-propagation-sanitize` adds ASan/UBSan.
 
 `make check-choice-smoke` runs a quick construction, expression, generic,
