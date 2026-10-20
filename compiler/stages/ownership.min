@@ -206,6 +206,40 @@ function ownershipSlot(state: List<Integer>, id: Integer): Integer {
     return state[entry + 1]
 }
 
+// Token scans cannot see every way an expression runs user code: capability
+// operators such as == on Equatable records, Map key callbacks and record
+// iteration have no call token. Codegen records each user call target, and a
+// Map operation may call key callbacks, so either one counts.
+function ranUserCode(context: CompilerContext, output: List<Text>, start: Integer, calls: Integer): Boolean {
+    if context.callTargets.length != calls { return true }
+    let index = start
+    while index < output.length {
+        if output[index].find("@minyar_map_") >= 0 { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// A provisional temporary count reserved an empty piece before code that might
+// replace its value's container. Fill it if that code ran user code after all.
+function settleBorrow(context: CompilerContext, output: List<Text>, state: List<Integer>, piece: Integer, value: Text, type: Integer, calls: Integer) {
+    if !ranUserCode(context, output, piece, calls) || !isReferenceType(type) { return }
+    state[6] = 1
+    state[7] = state[7] + 1
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, type, 0)
+    output[piece] = "  call void @minyar_rc_borrow(ptr " + value + ")\n"
+}
+
+// The same for a provisional local owner, as rootLocal would have emitted it.
+function rootLocalAt(context: CompilerContext, output: List<Text>, state: List<Integer>, piece: Integer, id: Integer, value: Text, type: Integer) {
+    if !isReferenceType(type) { return }
+    let owner = ownershipSlot(state, id)
+    if owner < 0 { return }
+    state[6] = 1
+    output[piece] = "  call void @minyar_rc_local(i64 " + Text(owner) + ", ptr " + value + ")\n"
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, type, 0)
+}
+
 // A local that never received an owner slot in this function holds nothing to release.
 function hasOwnershipSlot(state: List<Integer>, id: Integer): Boolean {
     let entry = 16 + id * 2

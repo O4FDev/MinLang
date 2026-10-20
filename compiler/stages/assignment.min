@@ -8,10 +8,12 @@ function isAssignmentOperator(token: Text): Boolean {
     return token == "=" || token == "+=" || token == "-=" || token == "*=" || token == "/=" || token == "%="
 }
 
-// When a loop body makes no calls and assigns only plain local names, nothing
-// in it can change the collection it walks. Unless the body reassigns the
-// source name itself, whoever owns that source keeps every element alive.
-function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, source: Text): Boolean {
+// When a loop body makes no call tokens and assigns only plain local names,
+// other than the loop name and the source name, it can change the collection
+// it walks only through user code without a call token (capability operators,
+// Map key callbacks, record iteration). The loop lowering reserves both owners
+// and fills them if compiling the body ran such code.
+function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, source: Text, loopName: Text): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "{" { return false }
     let cursor = position + 1
     let depth = 0
@@ -32,7 +34,7 @@ function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>
                 } else {
                     let previous = tokenKinds[cursor - 2]
                     let boundary = previous == 6 || (previous == 4 && (tokenTexts[cursor - 2] == "{" || tokenTexts[cursor - 2] == "}"))
-                    if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source { return false }
+                    if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source || tokenTexts[cursor - 1] == loopName { return false }
                 }
             }
         }
@@ -348,9 +350,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     receiver = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
                 }
                 receiverType = fieldType
-                let unshared = tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])
-                if receiverType == 8 && bytesAccessWithoutCalls(tokenKinds, tokenTexts, state[0]) { unshared = true }
-                if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !unshared {
+                if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
                     borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                 }
             }
@@ -533,7 +533,9 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     // A plain variable source already owns the collection for the whole loop.
     let sourceName = ""
     if tokenKinds[sourceLocation] == 1 && sourceLocation + 1 == state[0] && sequenceStages.length == 0 && !isMapType(sourceType[0]) && !isSetType(sourceType[0]) { sourceName = tokenTexts[sourceLocation] }
-    let walkKept = sequenceStages.length == 0 && parts.length == 0 && loopBodyKeepsElements(tokenKinds, tokenTexts, state[0], sourceName)
+    let walkKept = sequenceStages.length == 0 && parts.length == 0 && loopBodyKeepsElements(tokenKinds, tokenTexts, state[0], sourceName, name)
+    let collectionPiece = -1
+    let elementPiece = -1
     if parts.length > 0 && sequenceStages.length > 0 { failAtToken(tokenLines, sourceLocation, "parallel for needs an Integer range; use an ordinary for for a lazy sequence") }
     if isMapType(sourceType[0]) || isSetType(sourceType[0]) {
         let keyType = mapKeyType(sourceType[0])
@@ -587,7 +589,12 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
         }
         collection = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
-        if !walkKept || sourceName == "" { assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
+        if walkKept && sourceName != "" {
+            collectionPiece = output.length
+            output.add("")
+        } else {
+            assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+        }
         storeLocal(output, collection, sourceType[0], source)
         storeLocal(output, counter, 1, "0")
     }
@@ -645,12 +652,23 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     output.add("; minyar-debug-scope: begin\n")
     let variable = nextLocal(state)
     addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
-    if !(walkKept && collection >= 0 && isListType(sourceType[0])) { assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
+    if walkKept && collection >= 0 && isListType(sourceType[0]) {
+        elementPiece = output.length
+        output.add("")
+    } else {
+        assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    }
     storeLocal(output, variable, elementType, element)
     emitDebugBinding(context, output, nameLocation, name, elementType, "ptr %local." + Text(variable), 0, true)
     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
     if parts.length > 0 { parts[4] = context.callTargets.length; parts[5] = state[0] }
+    let callsBefore = context.callTargets.length
+    let bodyStart = output.length
     let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+    if (collectionPiece >= 0 || elementPiece >= 0) && ranUserCode(context, output, bodyStart, callsBefore) {
+        if collectionPiece >= 0 { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
+        if elementPiece >= 0 { rootLocalAt(context, output, state, elementPiece, variable, element, elementType) }
+    }
     output.add("; minyar-debug-scope: end\n")
     if !bodyReturns {
         output.add("  br label %for.step." + Text(stepLabel) + "\n")
