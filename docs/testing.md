@@ -60,6 +60,15 @@ diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
 targets are recorded in the hardening review.
 
+`make check-mobile` checks mobile target selection, output protection, the
+hello app's real model gallery, and callbacks with Unicode events and complete
+ownership cleanup at O0/O2. `check-mobile-sanitize` adds ASan/UBSan.
+`check-mobile-ios` cross-compiles and links both UIKit SDK targets without
+booting a Simulator. With an installed `ANDROID_NDK_HOME`,
+`check-mobile-android` builds both NDK archives and checks real JNI shared
+links and ELF architecture/visibility. See [mobile apps](mobile.md) for the
+separate device-execution and signing requirements.
+
 `make check-methods` checks record methods, module visibility, receiver and
 argument lifetime, shared mutation, callable fields and rejection diagnostics.
 It runs the methods gallery and ownership assertions at O0/O2.

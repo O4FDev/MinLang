@@ -7,6 +7,12 @@ interoperability. Their value types and additional syntax are outside this
 contract. An alternative compiler must pass the same language conformance
 tests before it can become a Minyar backend.
 
+Ordinary Minyar also runs inside a native mobile application. The
+[mobile guide](mobile.md) describes UIKit over the shared `ui.View` model,
+iOS device and Simulator targets, and Android NDK core-code embedding. These
+use ordinary functions, records and native calls; no separate mobile dialect
+is needed.
+
 ## Tests beside the code
 
 A module can keep named tests beside its declarations. Tests can use private
