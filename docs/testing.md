@@ -154,6 +154,12 @@ booting a Simulator. With an installed `ANDROID_NDK_HOME`,
 `check-mobile-android` builds both NDK archives and checks real JNI shared
 links and ELF architecture/visibility. See [mobile apps](mobile.md) for the
 separate device-execution and signing requirements.
+Portable mobile checks also cover Android's copied native event/snapshot
+transport. The explicit `check-mobile-android-host` and
+`check-mobile-android-host-sanitize` targets run the actual JNI provider and
+Minyar model on a desktop JVM worker with exact ownership cleanup.
+`ANDROID_JAR=... make check-mobile-android-java` compiles the real Activity
+against an installed Android API. These checks do not execute Android's UI.
 
 `make check-methods` checks record methods, module visibility, receiver and
 argument lifetime, shared mutation, callable fields and rejection diagnostics.

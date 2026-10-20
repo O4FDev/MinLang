@@ -9,9 +9,9 @@ tests before it can become a Minyar backend.
 
 Ordinary Minyar also runs inside a native mobile application. The
 [mobile guide](mobile.md) describes UIKit over the shared `ui.View` model,
-iOS device and Simulator targets, and Android NDK core-code embedding. These
-use ordinary functions, records and native calls; no separate mobile dialect
-is needed.
+iOS device and Simulator targets, and Android NDK embedding with a shared-view
+Activity renderer. These use ordinary functions, records and native calls;
+no separate mobile dialect is needed.
 
 ## Tests beside the code
 

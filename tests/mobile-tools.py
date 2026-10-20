@@ -68,7 +68,10 @@ class MobileTools(unittest.TestCase):
         ios = ENTRY + "; minyar-native-library: mobileios\n"
         self.assertEqual(mobile.inspect_ir(ios, "ios-simulator"), {"mobileios"})
         self.assertEqual(mobile.inspect_ir(ENTRY, "android-arm64"), set())
+        android = ENTRY + "; minyar-native-library: mobileandroid\n"
+        self.assertEqual(mobile.inspect_ir(android, "android-arm64"), {"mobileandroid"})
         for target, text in (("ios-simulator", ENTRY), ("android-arm64", ios),
+                             ("ios-simulator", android),
                              ("android-arm64", ENTRY + "; minyar-native-library: macos\n"),
                              ("android-arm64", ENTRY + "; minyar-thread-runtime: 1\n"),
                              ("android-arm64", ENTRY + "; minyar-machine: syscall\n"),

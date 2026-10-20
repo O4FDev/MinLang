@@ -138,6 +138,8 @@ def inspect_ir(llvm: str, target: str) -> set[str]:
     allowed = {"runtime", "callbackruntime"}
     if target.startswith("ios-"):
         allowed.add("mobileios")
+    else:
+        allowed.add("mobileandroid")
     unsupported = libraries - allowed
     if unsupported:
         raise MobileError("native libraries need a mobile provider: " + ", ".join(sorted(unsupported)))
@@ -225,6 +227,13 @@ def build(args: argparse.Namespace, *, ios_provider: Path | None = None) -> Path
                     "ir_sha256": hashlib.sha256(ir.read_bytes()).hexdigest(),
                     "runtime_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
                     "native_libraries": sorted(libraries)}
+        if "mobileandroid" in libraries:
+            # JNI lives in the final Android shared library, outside this core
+            # archive, so its public entries survive archive symbol hiding.
+            provider_sources = ["runtime/native/mobileandroid.c", "runtime/native/mobile-android-transport.h",
+                                "runtime/native/mobile-callback.h", "runtime/minyar_native.h"]
+            metadata["required_provider_sources"] = {
+                path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in provider_sources}
         if args.target.startswith("ios-"):
             provider = (ios_provider or ROOT / "runtime" / "native" / "mobileios.m").resolve()
             metadata["native_source_sha256"] = hashlib.sha256(provider.read_bytes()).hexdigest()

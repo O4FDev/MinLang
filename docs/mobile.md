@@ -134,12 +134,61 @@ pointer as a Java-owned value. Android source traces currently fall back to
 the Minyar entry location because the runtime's Linux symbol reader inspects
 the executable rather than the JNI shared library.
 
-Android support here is core-code embedding. It does not include an Android
-renderer for `ui.View`, a Gradle project generator, or emulator qualification.
-Native package providers other than the core runtime are rejected; UIKit's
-`mobileios` provider is accepted only for iOS. Managed thread entries, raw
-machine intrinsics and C-layout adapters are rejected by this builder until
-their target-specific support is implemented.
+## Shared views on Android
+
+[`ui-android`](../library/ui-android.min) renders the same `ui.View` descriptions
+as UIKit and AppKit. The [Android UI example](../examples/mobile-hello/android/ui.min)
+uses the hello application's existing Minyar model. Build a matching core archive:
+
+```sh
+python3 tools/mobile.py examples/mobile-hello/android/ui.min --target android-arm64 -o build/mobile/android-arm64/libminyar-ui.a
+```
+
+In an Android Studio Java Views application with namespace/application ID
+`org.minyar.hello` and minimum SDK 28:
+
+1. Copy `MinyarActivity.java` and `MinyarSnapshot.java` from the Android sample
+   into the Java package. Use `ui/AndroidManifest.xml` as the launcher manifest;
+   remove the old Activity launcher entry.
+2. Point `externalNativeBuild.cmake.path` at the sample's `ui/CMakeLists.txt`.
+   Pass `-DMINYAR_ROOT=/absolute/path/to/Minyar-Lang` and
+   `-DMINYAR_ARCHIVE=/absolute/path/to/libminyar-ui.a`. Select the matching
+   `abiFilters` entry, as with the scalar sample above.
+3. Build/install through Android Studio. Keep the Minyar checkout at the version
+   used to build the archive; its build record hashes the required JNI provider
+   source and headers. The CMake project compiles that provider directly and
+   hides the imported core archive's symbols.
+
+`ui-android.run(title, view, update)` receives an `android.Event` with the same
+`kind`, `key`, `text` and `checked` fields as `mobile.Event`. The Activity creates
+one Java worker thread that enters ordinary Minyar startup. `android.run` blocks
+on that worker, keeping its callback and model alive. Only the worker accesses
+managed values or services ownership cleanup. Android's UI thread renders copied
+descriptions and submits copied standard UTF-8 byte arrays through JNI. JNI
+Modified UTF-8 and managed pointers never cross this boundary.
+
+The worker lives for the process lifetime. Stopping/recreating the Activity
+detaches its binding without stopping the model. A new Activity attaches to the
+latest snapshot; an old binding cannot submit new events or detach its successor.
+Already admitted events remain ordered across detachment. A queued event whose
+control identity has disappeared is acknowledged without dispatching to another
+control. Inputs/toggles keep newer admitted edits while an older snapshot is in
+flight. Compatible controls keep their native instances; input replacement
+preserves clamped UTF-16 selection and defers changes during IME composition.
+
+Android snapshots have the shared 1024-node/64-level bounds plus a 1 MiB encoded
+frame limit, 16 KiB UTF-8 per text value and 256 bytes per key. The native event
+queue holds at most 64 events and 256 KiB of payload. Admission never waits for
+capacity: a rejected edit/action displays a message asking the user to retry.
+Snapshots may coalesce; admitted events do not. Slow callbacks delay rendering
+and can fill the queue. No repeating UI polling timer runs while idle.
+
+The source and host tests provide an Android renderer, not device qualification.
+Actual Android layout, input methods and lifecycle behavior still need a device
+or emulator run. No Gradle project generator is supplied. Core runtime and the
+platform's own UI provider are the supported native packages; `mobileios` belongs
+to iOS and `mobileandroid` to Android. Managed thread entries, raw machine
+intrinsics and C-layout adapters remain unsupported by this builder.
 
 ## Verification
 
@@ -149,12 +198,24 @@ the real Minyar callback bridge at O0/O2 with eager and system ownership.
 ASan/UBSan, with exact Unicode events, captured-state updates, copied native
 snapshots and final ownership assertions. The native fixture supplies a fake
 host; these portable checks do not prove UIKit layout or device execution.
+Portable mobile checks also exercise Android's production copied transport at
+O0/O2; the sanitizer target checks its native allocations and cleanup.
 
 `make check-mobile-ios` cross-compiles and links the actual hello application
 with both Xcode SDKs. It never boots a Simulator. `ANDROID_NDK_HOME=... make
 check-mobile-android` builds both Android archives and links the actual JNI
 adapter with no undefined symbols, verifies ELF architectures and checks that
-the generated `main` is hidden. It does not execute an Android device.
+the generated `main` is hidden. Both the scalar and shared-view providers are
+linked for both Android ABIs. It does not execute an Android device.
+
+With a JDK, `make check-mobile-android-host` runs the production JNI provider and
+actual hello model on a Java-created worker in a desktop JVM, at O0/O2 for eager
+and system ownership. The test checks Unicode copies, model events, rebinding,
+one-shot startup and complete worker-domain ownership cleanup. The explicit
+`check-mobile-android-host-sanitize` target adds ASan/UBSan on Linux x86_64.
+`ANDROID_JAR=/path/to/android.jar make check-mobile-android-java` checks the wire
+decoder and compiles the actual Activity against the installed Android API.
+These checks do not substitute for running Android's UI.
 
 `make check-mobile-ios-smoke-build` builds a test-only app using the real
 UIKit adapter and the real hello model. On an already booted iOS Simulator,
@@ -162,7 +223,9 @@ UIKit adapter and the real hello model. On an already booted iOS Simulator,
 The app checks launch, button action, Unicode editing, switch changes, native
 control reuse, selection preservation/clamping and basic layout, then exits.
 This explicit target never boots a Simulator and is excluded from automatic
-gates. It retains stdout/stderr in `build/mobile-tests/ios-smoke`.
+gates. It retains current-attempt install/launch stdout, stderr, commands and
+terminal status/timeout metadata in `build/mobile-tests/ios-smoke`, including
+failed installation and partial output from a timed-out launch.
 
 All target objects are rebuilt in an isolated staging directory. A host
 runtime object is never linked into a mobile target. Successful build records

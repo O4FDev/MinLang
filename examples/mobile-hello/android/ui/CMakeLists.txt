@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.22)
+project(minyar_ui C)
+if(NOT DEFINED MINYAR_ARCHIVE OR NOT EXISTS "${MINYAR_ARCHIVE}")
+    message(FATAL_ERROR "Set MINYAR_ARCHIVE to the matching Minyar UI archive")
+endif()
+if(NOT DEFINED MINYAR_ROOT OR NOT EXISTS "${MINYAR_ROOT}/runtime/native/mobileandroid.c")
+    message(FATAL_ERROR "Set MINYAR_ROOT to the Minyar source checkout used to build the archive")
+endif()
+add_library(minyar_core STATIC IMPORTED)
+set_target_properties(minyar_core PROPERTIES IMPORTED_LOCATION "${MINYAR_ARCHIVE}")
+# JNI provider is compiled directly, outside the hidden core archive. Only its
+# explicit JNI entry points belong to the application's dynamic interface.
+add_library(minyar_ui SHARED "${MINYAR_ROOT}/runtime/native/mobileandroid.c")
+set_target_properties(minyar_ui PROPERTIES C_VISIBILITY_PRESET hidden)
+target_compile_features(minyar_ui PRIVATE c_std_11)
+target_link_libraries(minyar_ui PRIVATE minyar_core m)
+target_link_options(minyar_ui PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,defs" "-Wl,-z,max-page-size=16384")
