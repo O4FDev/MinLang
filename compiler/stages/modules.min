@@ -282,15 +282,30 @@ function findModuleDeclaration(declarationOwners: List<Integer>, declarationName
     return found
 }
 
-function findIndexedModuleDeclaration(declarationLookup: List<Integer>, declarationQualifiedNames: List<Text>, declarationKinds: List<Integer>, owner: Integer, name: Text, kind: Integer, identities: List<Text>): Integer {
-    return findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, qualifiedDeclarationName(owner, name, identities), kind)
+record ModuleDeclarationIndex { names: List<Text>; kinds: List<Integer>; slots: List<Integer> }
+
+function buildModuleDeclarationIndex(owners: List<Integer>, names: List<Text>, kinds: List<Integer>): ModuleDeclarationIndex {
+    let identities: List<Integer> = []
+    let position = 0
+    while position < names.length {
+        // Cache naturals are smaller still; keep composite hashing within Integer.
+        if owners[position] < 0 || owners[position] > 2147483647 || kinds[position] < 1 || kinds[position] > 3 { failCompiler("invalid compiled module type table") }
+        identities.add(owners[position] * 4 + kinds[position])
+        position = position + 1
+    }
+    return ModuleDeclarationIndex { names: names; kinds: identities; slots: buildDeclarationIndex(names, identities) }
 }
 
-function requireUniqueModuleDeclarations(declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
+function findIndexedModuleDeclaration(index: ModuleDeclarationIndex, owner: Integer, name: Text, kind: Integer): Integer {
+    if owner < 0 || owner > 2147483647 || kind < 1 || kind > 3 { return -1 }
+    return findIndexedSymbol(index.slots, index.names, index.kinds, name, owner * 4 + kind)
+}
+
+function requireUniqueModuleDeclarations(index: ModuleDeclarationIndex, declarationLocations: List<Text>) {
     let position = 0
-    while position < declarationNames.length {
-        if findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, declarationQualifiedNames[position], declarationKinds[position]) != position {
-            failAtLocation("", declarationLocations[position], "module declares '" + declarationNames[position] + "' more than once")
+    while position < index.names.length {
+        if findIndexedSymbol(index.slots, index.names, index.kinds, index.names[position], index.kinds[position]) != position {
+            failAtLocation("", declarationLocations[position], "module declares '" + index.names[position] + "' more than once")
         }
         position = position + 1
     }
@@ -345,7 +360,7 @@ function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart
     }
 }
 
-function importedDeclarationName(module: Integer, alias: Text, name: Text, kind: Integer, modulePath: Text, tokenLines: SourceMap, location: Integer, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, identities: List<Text>): Text {
+function importedDeclarationName(module: Integer, alias: Text, name: Text, kind: Integer, modulePath: Text, tokenLines: SourceMap, location: Integer, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: ModuleDeclarationIndex, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, identities: List<Text>): Text {
     let imported = findModuleImport(importOwners, importAliases, module, alias)
     if imported < 0 {
         let candidates: List<Text> = []
@@ -356,7 +371,7 @@ function importedDeclarationName(module: Integer, alias: Text, name: Text, kind:
         }
         failDiagnostic(spanAtLocation(modulePath, tokenLocation(tokenLines, location)), "I can't find an imported module named '" + alias + "'", "", diagnosticSuggestion(alias, candidates))
     }
-    let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], name, kind, identities)
+    let declaration = findIndexedModuleDeclaration(declarationLookup, importTargets[imported], name, kind)
     if declaration < 0 {
         let declarationKind = "record"
         if kind == 1 {
@@ -379,7 +394,7 @@ function importedDeclarationName(module: Integer, alias: Text, name: Text, kind:
     return declarationQualifiedNames[declaration]
 }
 
-function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap, identities: List<Text>) {
+function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: ModuleDeclarationIndex, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap, identities: List<Text>) {
     outputLines.features = tokenLines.features
     let origin = sourcePath(outputLines, modulePath)
     let position = tokenStart
@@ -424,11 +439,11 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                 if declarationMode == 0 && scopeDepth == 0 && capabilityDeclarationAt(tokenKinds, tokenTexts, position) { declarationMode = 3 }
                 if declarationMode == 0 && token == "function" && tokenTexts[position + 2] == "." {
                     let recordName = tokenTexts[position + 1]
-                    let record = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, recordName, 2, identities)
+                    let record = findIndexedModuleDeclaration(declarationLookup, module, recordName, 2)
                     if record < 0 { failCompiler(describeLocation(modulePath + ":" + tokenLocation(tokenLines, position)) + ": methods must be declared in the module that declares their record") }
                     let member = tokenTexts[position + 3]
                     if tokenKinds[position + 3] != 1 || tokenTexts[position + 4] != "(" { failCompiler("a method declaration uses function Record.method(parameters)") }
-                    let method = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, methodFunctionName(recordName, member), 1, identities)
+                    let method = findIndexedModuleDeclaration(declarationLookup, module, methodFunctionName(recordName, member), 1)
                     let qualified = declarationQualifiedNames[method]
                     if declarationPublic[method] == 0 { qualified = methodFunctionName(declarationQualifiedNames[record], member + "$private") }
                     copyModuleToken(outputKinds, outputTexts, outputLines, 1, "function", tokenLines, position, origin)
@@ -490,16 +505,16 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                     let imported = findModuleImport(importOwners, importAliases, module, token)
                     if imported >= 0 {
                         let wantedKind = 2
-                        if position + 3 < tokenKinds.length && tokenTexts[position + 3] == "<" && genericHeaderFollows(tokenKinds, tokenTexts, position + 2, "(") && findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 1, identities) >= 0 {
+                        if position + 3 < tokenKinds.length && tokenTexts[position + 3] == "<" && genericHeaderFollows(tokenKinds, tokenTexts, position + 2, "(") && findIndexedModuleDeclaration(declarationLookup, importTargets[imported], tokenTexts[position + 2], 1) >= 0 {
                             wantedKind = 1
                         }
                         if (position + 3 < tokenKinds.length && tokenTexts[position + 3] == "(") || (position >= 2 && (tokenTexts[position - 2] == "startThread" || tokenTexts[position - 2] == "startThreadResult") && tokenTexts[position - 1] == "(") || sequenceNamedArgumentAt(tokenKinds, tokenTexts, position) {
                             wantedKind = 1
-                            let importedFunction = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 1, identities)
-                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3, identities)
+                            let importedFunction = findIndexedModuleDeclaration(declarationLookup, importTargets[imported], tokenTexts[position + 2], 1)
+                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, importTargets[imported], tokenTexts[position + 2], 3)
                             if importedFunction < 0 && importedConstant >= 0 { wantedKind = 3 }
                         } else {
-                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3, identities)
+                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, importTargets[imported], tokenTexts[position + 2], 3)
                             if !typeMode && importedConstant >= 0 {
                                 wantedKind = 3
                             }
@@ -512,7 +527,7 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                             typeMode = false
                         }
                     } else {
-                        let localChoice = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 2, identities)
+                        let localChoice = findIndexedModuleDeclaration(declarationLookup, module, token, 2)
                         if localChoice >= 0 { rewritten = declarationQualifiedNames[localChoice] }
                         else {
                             let localValue = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3, identities)
@@ -534,8 +549,8 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                             declarationKind = 1
                         }
                         if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "<" && (typeMode || genericHeaderFollows(tokenKinds, tokenTexts, position, "(") || genericHeaderFollows(tokenKinds, tokenTexts, position, "{") || genericHeaderFollows(tokenKinds, tokenTexts, position, ".")) {
-                            if findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 1, identities) >= 0 { declarationKind = 1 } else {
-                                if findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 2, identities) >= 0 { declarationKind = 2 }
+                            if findIndexedModuleDeclaration(declarationLookup, module, token, 1) >= 0 { declarationKind = 1 } else {
+                                if findIndexedModuleDeclaration(declarationLookup, module, token, 2) >= 0 { declarationKind = 2 }
                             }
                             if declarationKind > 0 { if !typeMode { genericDepth = 0 }; typeMode = true }
                         }
@@ -559,21 +574,21 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                             declarationKind = 3
                         }
                         if declarationKind == 2 && !typeMode && !(position > 0 && (tokenTexts[position - 1] == "record" || (scopeDepth == 0 && choiceDeclarationAt(tokenKinds, tokenTexts, position - 1)))) {
-                            let blockConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3, identities)
+                            let blockConstant = findIndexedModuleDeclaration(declarationLookup, module, token, 3)
                             if blockConstant >= 0 {
                                 declarationKind = 3
                             }
                         }
                         if declarationKind == 1 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "(" {
-                            let functionDeclaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 1, identities)
-                            let constantDeclaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3, identities)
+                            let functionDeclaration = findIndexedModuleDeclaration(declarationLookup, module, token, 1)
+                            let constantDeclaration = findIndexedModuleDeclaration(declarationLookup, module, token, 3)
                             if functionDeclaration < 0 && constantDeclaration >= 0 { declarationKind = 3 }
                         }
                         if (position >= typeVariableStart && position < typeVariableEnd && (tokenTexts[position - 1] == "<" || tokenTexts[position - 1] == ",")) || (declarationKind == 2 && findText(typeVariables, token) >= 0) { declarationKind = 0 }
                         if builtinCapability(token) && ((position >= typeVariableStart && position < typeVariableEnd && tokenTexts[position - 1] == ":") || position == conformanceCapability) { declarationKind = 0 }
                         if declarationMode == 3 && ((position > 0 && tokenTexts[position - 1] == "function") || token == "Self") { declarationKind = 0 }
                         if declarationKind > 0 {
-                            let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind, identities)
+                            let declaration = findIndexedModuleDeclaration(declarationLookup, module, token, declarationKind)
                             if declaration >= 0 {
                                 rewritten = declarationQualifiedNames[declaration]
                             }
@@ -671,8 +686,8 @@ function compileEntryConfigured(path: Text, stackOwnerLimit: Integer, library: T
         collectModuleDeclarations(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations, identities)
         module = module + 1
     }
-    let declarationLookup = buildDeclarationIndex(declarationQualifiedNames, declarationKinds)
-    requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames, declarationLocations)
+    let declarationLookup = buildModuleDeclarationIndex(declarationOwners, declarationNames, declarationKinds)
+    requireUniqueModuleDeclarations(declarationLookup, declarationLocations)
 
     let tokenKinds: List<Integer> = []
     let tokenTexts: List<Text> = []

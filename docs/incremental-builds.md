@@ -60,6 +60,11 @@ nor invalidation rules. `make check-incremental-module-index` checks the lookup
 against a linear oracle, including collisions, Unicode, duplicate keys and
 incomplete rows, at O0 and O2.
 
+The checked declaration table rebuilds its lookup index from module owners,
+original names and declaration kinds. Qualified names remain in the saved table
+for code identity. Reloading that table preserves both its encoding and the
+original declaration IDs.
+
 ## Identity and publication
 
 Artifacts belong to one canonical entry path, one exact compiler binary and

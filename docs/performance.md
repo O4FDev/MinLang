@@ -20,6 +20,13 @@ statements, locals and modules. Declaration lookup uses a hash index; there
 is no separate allowance for known superlinear declaration lookup.
 `check-declaration-index` compares it with an independent linear oracle.
 
+Module declaration lookup hashes the module owner, original name and declaration
+kind directly. It does not allocate a qualified name for each lookup; emitted
+names and declaration IDs stay unchanged. `check-module-declaration-index`
+compares this index with a linear oracle and verifies cached table reloads at
+O0 and O2. Generic specialization cache hits also reuse the concrete-type and
+capability checks already performed for that instance.
+
 ## Local baselines
 
 ```sh
