@@ -1,0 +1,42 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+fixtures.validate("PatternDispatch", ["order", "ownership", "shape"])
+if fixtures.selected("PatternDispatch", "order") {
+    fixtures.executes(frontend, io.readTextFile("tests/pattern-dispatch-order.min"), "ordered dispatch passed\n", levels, 0, "", true)
+}
+if fixtures.selected("PatternDispatch", "ownership") {
+    fixtures.executes(frontend, io.readTextFile("tests/patterns/ownership.min"), "kept\nkept\nkept\nfrom guard\nafter false guard\nreturned\ncaptured\nresult kept\nclean\n", levels, 0, "", true)
+}
+if fixtures.selected("PatternDispatch", "shape") {
+    let source = #"""
+        choice Route { North(value: Integer); East(value: Integer); South(value: Integer); West(value: Integer) }
+        function route(value: Route): Integer {
+            return match value {
+                North(number) { number + 1 }
+                East(number) { number + 2 }
+                South(number) { number + 3 }
+                West(number) { number + 4 }
+            }
+        }
+        print(route(North(41)))
+        print(route(West(38)))
+        """#
+    fixtures.executes(frontend, source, "42\n42\n", levels, 0, "", true)
+    let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll"
+    let body = ""
+    let active = false
+    for line in test.lines(io.readTextFile(path)) {
+        if test.contains(line, "define i64 @") && (test.contains(line, ".fn.route(") || test.contains(line, "_route(")) { active = true }
+        if active { body += line + "\n" }
+        if line == "}" { active = false }
+    }
+    test.check(test.contains(body, "switch i64 "), "choice dispatch needs an actual raw LLVM switch")
+    test.check(!test.contains(body, "icmp eq i64"), "disjoint constructor dispatch repeated tag equality tests")
+    test.check(!test.contains(body, "@minyar_record_new"), "dispatch allocated a record")
+}
+test.removeTree(frontend.compiler.directory)
+print("Pattern dispatch: passed")
