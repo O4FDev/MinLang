@@ -44,12 +44,13 @@ if processInfo.argumentCount() == 1 {
 
 // This selector compiles once and checks raw IR only, so the previous compiler
 // can demonstrate the missing-helper failure without linking or executing code.
-test.require(test.compile(compiler, "let bytes = Bytes(4)\nbytes[0] = 255\nbytes[3] += 7\nprint(bytes[0])\nprint(bytes.length)\nlet total = 0\nfor byte in bytes { total += byte }\nprint(total)\n"), "compile inline Bytes accesses")
+test.require(test.compile(compiler, "let bytes = Bytes(4)\nbytes[0] = 255\nbytes[3] += 7\nprint(bytes[0])\nprint(bytes.length)\nlet total = 0\nfor byte in bytes { total += byte }\nprint(total)\nbytes.add(9)\n"), "compile inline Bytes accesses")
 let llvm = io.readTextFile(casePath(compiler) + ".ll")
 let length = functionBody(llvm, ".minyar.bytes.length")
 let getter = functionBody(llvm, ".minyar.bytes.get.checked")
 let setter = functionBody(llvm, ".minyar.bytes.set.checked")
-for body in [length, getter, setter] {
+let adder = functionBody(llvm, ".minyar.bytes.add.checked")
+for body in [length, getter, setter, adder] {
     test.check(test.contains(body, "alwaysinline"), "Bytes helper must inline without runtime LTO")
     test.check(!test.contains(body, "unreachable"), "Bytes helper lost its checked runtime fallback")
 }
@@ -64,11 +65,16 @@ for expected in ["%get.valid = icmp ult i64 %position, %length", "%byte = load i
 for expected in ["%position.valid = icmp ult i64 %position, %length", "%value.valid = icmp ult i64 %value, 256", "%byte = trunc i64 %value to i8", "store i8 %byte, ptr %slot", "call void @minyar_bytes_set(ptr %bytes, i64 %position, i64 %value)\n  ret void"] {
     test.check(test.contains(setter, expected), "missing checked Bytes setter IR: " + expected)
 }
+// Appends take the inline path only within capacity; a view's negative
+// capacity, growth and invalid values all keep the runtime's exact behavior.
+for expected in ["%capacity.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %bytes, i32 0, i32 2", "%room = icmp slt i64 %length, %capacity", "%value.valid = icmp ult i64 %value, 256", "%slot = getelementptr inbounds i8, ptr %data, i64 %length", "store i8 %byte, ptr %slot", "%next = add nuw nsw i64 %length, 1", "store i64 %next, ptr %length.pointer", "call void @minyar_bytes_add(ptr %bytes, i64 %value)\n  ret void"] {
+    test.check(test.contains(adder, expected), "missing checked Bytes append IR: " + expected)
+}
 let main = functionBody(llvm, "main")
-for call in ["call i64 @.minyar.bytes.get.checked(", "call void @.minyar.bytes.set.checked(", "call i64 @.minyar.bytes.length("] {
+for call in ["call i64 @.minyar.bytes.get.checked(", "call void @.minyar.bytes.set.checked(", "call i64 @.minyar.bytes.length(", "call void @.minyar.bytes.add.checked("] {
     test.check(test.contains(main, call), "Bytes expression did not use inline helper: " + call)
 }
-for call in ["call i64 @minyar_bytes_get(", "call void @minyar_bytes_set(", "call i64 @minyar_bytes_length("] {
+for call in ["call i64 @minyar_bytes_get(", "call void @minyar_bytes_set(", "call i64 @minyar_bytes_length(", "call void @minyar_bytes_add("] {
     test.check(!test.contains(main, call), "ordinary Bytes access still calls runtime directly: " + call)
 }
 
@@ -125,6 +131,14 @@ if !irOnly {
     let view = retained()
     print(view[2])
     """#, "77\n88\n4\n4\n66\n4\n99\n")
+
+    // Appends grow through repeated doublings and keep aliases in step.
+    test.executes(compiler, "let bytes = Bytes(0)\nlet alias = bytes\nlet index = 0\nwhile index < 1000 { bytes.add(index % 256); index += 1 }\nprint(alias.length)\nprint(alias[0]); print(alias[255]); print(alias[256]); print(alias[999])\nbytes.resize(2)\nbytes.add(255)\nprint(alias.length); print(alias[2])\n", "1000\n0\n255\n0\n231\n3\n255\n")
+    for value in [-9223372036854775808, -1, 256, 9223372036854775807] {
+        traps(compiler, "let bytes = Bytes(0)\nbytes.add(" + Text(value) + ")\n", Text(value) + " does not fit in a byte (0 to 255).")
+        traps(compiler, "let bytes = Bytes(0)\nbytes.add(1)\nbytes.add(" + Text(value) + ")\n", Text(value) + " does not fit in a byte (0 to 255).")
+    }
+    traps(compiler, "record Window native \"c_packed\" { data: Bytes[4] }\nlet backing = Bytes(8)\nlet view = cBytes(cView(Window, backing, 2))\nview.add(1)\n", "Bytes storage with C-layout views cannot grow.")
 
     for size in [0, 2] {
         for position in [-9223372036854775808, -1, size, 9223372036854775807] {

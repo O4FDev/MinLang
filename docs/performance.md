@@ -247,8 +247,10 @@ instruction counts. Preserve this distinction when reporting results.
 
 ## Checked collection access
 
-Ordinary Bytes indexing, indexed replacement and length use inline LLVM
-helpers even when the runtime is a separate native object. Bytes and List
+Ordinary Bytes indexing, indexed replacement, length and single-byte `add`
+use inline LLVM helpers even when the runtime is a separate native object. An
+append takes the inline path only when the value is a byte and the storage
+already has room; growth, C-layout views and invalid values call the runtime. Bytes and List
 helpers expose their nonnegative length and form checked element addresses
 within the backing allocation. These facts do not freeze storage or imply
 that two collections are disjoint. Resizing and other calls retain their
