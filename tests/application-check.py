@@ -44,6 +44,7 @@ def check_cli():
     result = run([tool, "--help"])
     assert "minyar app" in result.stdout and "--sign IDENTITY" in result.stdout
     assert "app " in run([ROOT / "build/tooling/tools/project-cli", "help"]).stdout
+    run([ROOT / "build/tooling/tools/project-cli", "metadata", "--manifest-path", ROOT / "examples/harbour", "--locked", "--offline"])
     for options, message in [
         (["--unknown"], "unknown app option"),
         (["--release", "--release"], "duplicate option"),
@@ -112,8 +113,8 @@ def check_ui(clang):
         run([ROOT / "minyar", ROOT / "examples/gallery/desktop.min", "-o", binary], timeout=600)
         assert run([binary, "--smoke"]).stdout == "Minyar → AppKit 🙂\n42 lights; native editor retained\n"
         project = Path(directory) / "harbour-project"
-        shutil.copytree(ROOT / "examples/harbour", project, ignore=shutil.ignore_patterns("target", "Minyar.lock"))
-        run([ROOT / "minyar", "app", "--manifest-path", project], timeout=600)
+        shutil.copytree(ROOT / "examples/harbour", project, ignore=shutil.ignore_patterns("target"))
+        run([ROOT / "minyar", "app", "--manifest-path", project, "--locked", "--offline"], timeout=600)
         bundle = project / "target/debug/harbour.app"
         executable = bundle / "Contents/MacOS/application"
         assert run([executable, "--smoke"]).stdout == "Minyar → AppKit 🙂\n42 lights; native editor retained\n"
