@@ -493,6 +493,11 @@ provides seeded completion ordering, virtual time, disk and network faults,
 durable file/name models and replayable decisions. It performs no host I/O.
 See [deterministic simulation](simulation.md) for its contracts and costs.
 
+Import `pages` for fixed-size byte images, bounded named regions and typed
+little-endian fields. Invalid ranges return Results, and copied input/output
+buffers keep page bounds stable across aliases. See [checked pages](pages.md)
+for the runtime checks and allocation costs.
+
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically. Acyclic components

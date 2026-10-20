@@ -1,0 +1,180 @@
+use "errors" as errors
+
+/// Fixed pages are bounded allocations, not native structs or compile-time arrays.
+public constant maximumBytes = 16777216
+
+/// Shared, fixed-size storage. Import and export always copy its Bytes.
+public record Page {
+    private storage: Bytes
+    private name: Text
+}
+
+/// A named part of a Page. Aliases share writes, but cannot resize storage.
+public record Region {
+    private page: Page
+    private start: Integer
+    private length: Integer
+    private name: Text
+}
+
+/// A shared, forward-only partition of a Region. Failed takes do not advance.
+public record Cursor {
+    private region: Region
+    private position: Integer
+}
+
+function invalid(message: Text, context: Text): errors.Error {
+    return errors.make(errors.invalidDataCode(), 0, message).withContext(context)
+}
+
+function validSize(size: Integer, name: Text): Result<Boolean, errors.Error> {
+    if size <= 0 || size > maximumBytes {
+        return Err<Boolean, errors.Error>(invalid("page size must be from 1 to " + Text(maximumBytes) + " bytes; got " + Text(size), name))
+    }
+    return Ok<Boolean, errors.Error>(true)
+}
+
+/// Allocate a zero-filled page, from 1 byte through maximumBytes.
+public function create(size: Integer, name: Text): Result<Page, errors.Error> {
+    let checked = try validSize(size, name)
+    return Ok<Page, errors.Error>(Page { storage: Bytes(size); name: name })
+}
+
+/// Require an exact image size and snapshot the caller's mutable Bytes.
+public function fromBytes(data: Bytes, size: Integer, name: Text): Result<Page, errors.Error> {
+    let checked = try validSize(size, name)
+    if data.length != size {
+        let code = errors.invalidDataCode()
+        if data.length < size { code = errors.truncatedCode() }
+        return Err<Page, errors.Error>(errors.make(code, 0, "expected " + Text(size) + " bytes; got " + Text(data.length)).withContext(name))
+    }
+    let storage = data.slice(0, size)
+    return Ok<Page, errors.Error>(Page { storage: storage; name: name })
+}
+
+public function Page.size(): Integer { return self.storage.length }
+/// Return an independent, resizable copy of the complete image.
+public function Page.bytes(): Bytes { return self.storage.slice(0, self.storage.length) }
+
+function range(size: Integer, offset: Integer, length: Integer, context: Text): Result<Boolean, errors.Error> {
+    if offset < 0 || length < 0 {
+        return Err<Boolean, errors.Error>(invalid("offset and length must be nonnegative; got " + Text(offset) + ", " + Text(length), context))
+    }
+    // Subtraction after the offset check avoids offset+length overflow.
+    if offset > size || length > size - offset {
+        return Err<Boolean, errors.Error>(errors.make(errors.truncatedCode(), 0,
+            "range at " + Text(offset) + " with " + Text(length) + " bytes exceeds region of " + Text(size) + " bytes").withContext(context))
+    }
+    return Ok<Boolean, errors.Error>(true)
+}
+
+/// Explicit regions may overlap. Use a Cursor to allocate disjoint fields.
+public function Page.region(offset: Integer, length: Integer, name: Text): Result<Region, errors.Error> {
+    let context = self.name + "/" + name
+    let checked = try range(self.storage.length, offset, length, context)
+    return Ok<Region, errors.Error>(Region { page: self; start: offset; length: length; name: context })
+}
+
+/// Offsets are relative to this Region, never to the whole page.
+public function Region.region(offset: Integer, length: Integer, name: Text): Result<Region, errors.Error> {
+    let context = self.name + "/" + name
+    let checked = try range(self.length, offset, length, context)
+    return Ok<Region, errors.Error>(Region { page: self.page; start: self.start + offset; length: length; name: context })
+}
+
+public function Region.size(): Integer { return self.length }
+/// Return a copy, never the backing buffer.
+public function Region.bytes(): Bytes { return self.page.storage.slice(self.start, self.start + self.length) }
+
+/// Replace exactly this region. Rejection leaves all bytes unchanged.
+public function Region.write(data: Bytes): Result<Boolean, errors.Error> {
+    if data.length != self.length {
+        return Err<Boolean, errors.Error>(invalid("replacement must contain exactly " + Text(self.length) + " bytes; got " + Text(data.length), self.name))
+    }
+    for index in 0..self.length { self.page.storage[self.start + index] = data[index] }
+    return Ok<Boolean, errors.Error>(true)
+}
+
+public function Region.cursor(): Cursor { return Cursor { region: self; position: 0 } }
+public function Cursor.remaining(): Integer { return self.region.length - self.position }
+public function Cursor.position(): Integer { return self.position }
+
+/// Claim the next field; no nonempty claims from this cursor overlap.
+/// Cursor aliases share their position. A new cursor starts a separate partition.
+public function Cursor.take(length: Integer, name: Text): Result<Region, errors.Error> {
+    let field = try self.region.region(self.position, length, name)
+    self.position += length
+    return Ok<Region, errors.Error>(field)
+}
+
+function width(field: Region, expected: Integer): Result<Boolean, errors.Error> {
+    if field.length != expected {
+        return Err<Boolean, errors.Error>(invalid("typed field requires exactly " + Text(expected) + " bytes; got " + Text(field.length), field.name))
+    }
+    return Ok<Boolean, errors.Error>(true)
+}
+
+function integerField(field: Region, expected: Integer, value: Integer, minimum: Integer, maximum: Integer): Result<Boolean, errors.Error> {
+    let checked = try width(field, expected)
+    if value < minimum || value > maximum {
+        return Err<Boolean, errors.Error>(errors.make(errors.overflowCode(), 0,
+            "value " + Text(value) + " is outside " + Text(minimum) + " to " + Text(maximum)).withContext(field.name))
+    }
+    return Ok<Boolean, errors.Error>(true)
+}
+
+public function Region.readUInt8(): Result<Integer, errors.Error> {
+    let checked = try width(self, 1)
+    return Ok<Integer, errors.Error>(self.page.storage[self.start])
+}
+public function Region.writeUInt8(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try integerField(self, 1, value, 0, 255)
+    self.page.storage[self.start] = value
+    return Ok<Boolean, errors.Error>(true)
+}
+public function Region.readInt16LE(): Result<Integer, errors.Error> {
+    let checked = try width(self, 2)
+    return Ok<Integer, errors.Error>(self.page.storage.getInt16(self.start))
+}
+public function Region.writeInt16LE(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try integerField(self, 2, value, -32768, 32767)
+    self.page.storage.setInt16(self.start, value)
+    return Ok<Boolean, errors.Error>(true)
+}
+public function Region.readUInt16LE(): Result<Integer, errors.Error> {
+    let checked = try width(self, 2)
+    return Ok<Integer, errors.Error>(self.page.storage.getUInt16(self.start))
+}
+public function Region.writeUInt16LE(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try integerField(self, 2, value, 0, 65535)
+    self.page.storage.setUInt16(self.start, value)
+    return Ok<Boolean, errors.Error>(true)
+}
+public function Region.readInt32LE(): Result<Integer, errors.Error> {
+    let checked = try width(self, 4)
+    return Ok<Integer, errors.Error>(self.page.storage.getInt32(self.start))
+}
+public function Region.writeInt32LE(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try integerField(self, 4, value, -2147483648, 2147483647)
+    self.page.storage.setInt32(self.start, value)
+    return Ok<Boolean, errors.Error>(true)
+}
+public function Region.readUInt32LE(): Result<Integer, errors.Error> {
+    let checked = try width(self, 4)
+    return Ok<Integer, errors.Error>(self.page.storage.getUInt32(self.start))
+}
+public function Region.writeUInt32LE(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try integerField(self, 4, value, 0, 4294967295)
+    self.page.storage.setUInt32(self.start, value)
+    return Ok<Boolean, errors.Error>(true)
+}
+/// Signed 64-bit Integer, including both endpoints. No unsigned-64 coercion.
+public function Region.readInt64LE(): Result<Integer, errors.Error> {
+    let checked = try width(self, 8)
+    return Ok<Integer, errors.Error>(self.page.storage.getInt64(self.start))
+}
+public function Region.writeInt64LE(value: Integer): Result<Boolean, errors.Error> {
+    let checked = try width(self, 8)
+    self.page.storage.setInt64(self.start, value)
+    return Ok<Boolean, errors.Error>(true)
+}

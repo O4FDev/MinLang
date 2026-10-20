@@ -1,0 +1,128 @@
+use "pages" as pages
+use "errors" as errors
+
+// One 120-byte page: a 64-byte header, 8 payload bytes, two 24-byte entries.
+// Inspired by neo-db's snapshot shape; this small ledger has no CRC or I/O.
+constant PAGE_BYTES = 120
+constant MAGIC = 0x313052454744454C // "LEDGER01", little-endian
+record Ledger { lsn: Integer; rows: List<Bytes> }
+
+function malformed(message: Text): errors.Error {
+    return errors.make(errors.invalidDataCode(), 0, message).withContext("ledger layout")
+}
+function put64(cursor: pages.Cursor, name: Text, value: Integer): Result<Boolean, errors.Error> {
+    let field = try cursor.take(8, name)
+    return field.writeInt64LE(value)
+}
+function put32(cursor: pages.Cursor, name: Text, value: Integer): Result<Boolean, errors.Error> {
+    let field = try cursor.take(4, name)
+    return field.writeUInt32LE(value)
+}
+function get64(cursor: pages.Cursor, name: Text): Result<Integer, errors.Error> {
+    let field = try cursor.take(8, name)
+    return field.readInt64LE()
+}
+function get32(cursor: pages.Cursor, name: Text): Result<Integer, errors.Error> {
+    let field = try cursor.take(4, name)
+    return field.readUInt32LE()
+}
+
+function encode(): Result<pages.Page, errors.Error> {
+    let page = try pages.create(PAGE_BYTES, "ledger")
+    let header = try page.region(0, 64, "header")
+    let cursor = header.cursor()
+    let written = try put64(cursor, "magic", MAGIC)
+    written = try put32(cursor, "version", 1)
+    written = try put32(cursor, "flags", 0)
+    written = try put64(cursor, "lsn", 42)
+    written = try put64(cursor, "payload bytes", 8)
+    written = try put32(cursor, "reserved", 0)
+    written = try put32(cursor, "entry count", 2)
+    written = try put64(cursor, "created micros", 0)
+    written = try put64(cursor, "directory offset", 72)
+    written = try put64(cursor, "reserved tail", 0)
+    let payload = try page.region(64, 8, "payload")
+    written = try payload.write(Bytes("AdaGrace"))
+    let directory = try page.region(72, 48, "directory")
+    let entries = directory.cursor()
+    let offset = 64
+    for length in [3, 5] {
+        let entry = try entries.take(24, "entry")
+        let fields = entry.cursor()
+        written = try put64(fields, "offset", offset)
+        written = try put64(fields, "length", length)
+        written = try put32(fields, "reserved", 0)
+        written = try put32(fields, "reserved tail", 0)
+        offset += length
+    }
+    return Ok<pages.Page, errors.Error>(page)
+}
+
+function decode(image: Bytes): Result<Ledger, errors.Error> {
+    let page = try pages.fromBytes(image, PAGE_BYTES, "ledger image")
+    let header = try page.region(0, 64, "header")
+    let cursor = header.cursor()
+    let magic = try get64(cursor, "magic")
+    let version = try get32(cursor, "version")
+    let flags = try get32(cursor, "flags")
+    let lsn = try get64(cursor, "lsn")
+    let length = try get64(cursor, "payload bytes")
+    let reserved = try get32(cursor, "reserved")
+    let count = try get32(cursor, "entry count")
+    let created = try get64(cursor, "created micros")
+    let directoryOffset = try get64(cursor, "directory offset")
+    let tail = try get64(cursor, "reserved tail")
+    if magic != MAGIC || version != 1 {
+        return Err<Ledger, errors.Error>(malformed("unknown magic or version"))
+    }
+    if flags != 0 || reserved != 0 || tail != 0 || lsn < 0 || created < 0 {
+        return Err<Ledger, errors.Error>(malformed("nonzero reserved field or negative metadata"))
+    }
+    // Bound length before adding it. Never sum untrusted offset+length.
+    let payload = try page.region(64, length, "payload")
+    if directoryOffset != 64 + payload.size() {
+        return Err<Ledger, errors.Error>(malformed("directory must immediately follow payload"))
+    }
+    let directory = try page.region(directoryOffset, page.size() - directoryOffset, "directory")
+    // Divide before multiplying an untrusted count.
+    if count != directory.size() / 24 || directory.size() % 24 != 0 {
+        return Err<Ledger, errors.Error>(malformed("entry count does not fill the directory"))
+    }
+    let entries = directory.cursor()
+    let chunks = payload.cursor()
+    let rows: List<Bytes> = []
+    for index in 0..count {
+        let entry = try entries.take(24, "entry " + Text(index))
+        let fields = entry.cursor()
+        let offset = try get64(fields, "offset")
+        let chunkLength = try get64(fields, "length")
+        let entryReserved = try get32(fields, "reserved")
+        let entryTail = try get32(fields, "reserved tail")
+        if offset != 64 + chunks.position() || entryReserved != 0 || entryTail != 0 {
+            return Err<Ledger, errors.Error>(malformed("directory entries must tile payload in order with zero reserved fields"))
+        }
+        let chunk = try chunks.take(chunkLength, "row " + Text(index))
+        rows.add(chunk.bytes())
+    }
+    if chunks.remaining() != 0 {
+        return Err<Ledger, errors.Error>(malformed("directory leaves unclaimed payload bytes"))
+    }
+    return Ok<Ledger, errors.Error>(Ledger { lsn: lsn; rows: rows })
+}
+
+function roundTrip(): Result<Ledger, errors.Error> {
+    let page = try encode()
+    return decode(page.bytes())
+}
+function show() {
+    match roundTrip() {
+        Ok(ledger) {
+            print("Ledger " + Text(ledger.lsn))
+            for row in ledger.rows { print("  " + Text(row)) }
+        }
+        Err(error) { fail(error.describe()) }
+    }
+}
+
+// gallery entry
+show()

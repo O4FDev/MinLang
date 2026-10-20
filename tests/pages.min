@@ -1,0 +1,228 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let levels = ["-O0", "-O2"]
+fixtures.validate("pages", ["aliases", "bounds", "integers", "layout", "privacy", "gallery"])
+let prelude = #"""
+    use "pages" as pages
+    use "errors" as errors
+    function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+    function rejected<Item>(result: Result<Item, errors.Error>, code: Integer) {
+        match result {
+            Ok(value) { fail("expected recoverable rejection") }
+            Err(error) {
+                check(error.code() == code, "stable error code")
+                check(error.nativeCode() == 0 && error.message().length > 0, "meaningful error")
+                check(error.contexts().length > 0, "named layout context")
+            }
+        }
+    }
+
+    """#
+
+if fixtures.selected("pages", "aliases") {
+    fixtures.executes(frontend, prelude + #"""
+        function retained(): pages.Region {
+            let external = Bytes("abcdefgh")
+            let page = pages.fromBytes(external, 8, "owned").unwrap()
+            external[0] = 90
+            external.resize(0)
+            external.resize(100)
+            check(Text(page.bytes()) == "abcdefgh", "import snapshots external storage")
+            let whole = page.region(0, 8, "whole").unwrap()
+            let cursor = whole.cursor()
+            let sharedCursor = cursor
+            let first = cursor.take(4, "first").unwrap()
+            let second = sharedCursor.take(4, "second").unwrap()
+            check(cursor.remaining() == 0 && sharedCursor.position() == 8, "cursor aliases share position")
+            check(first.write(Bytes("ABCD")).unwrap(), "region write")
+            check(second.write(Bytes("EFGH")).unwrap(), "disjoint claim")
+            let alias = page
+            let overlap = alias.region(1, 2, "intentional alias").unwrap()
+            check(overlap.write(Bytes("xy")).unwrap(), "explicit alias writes")
+            check(Text(first.bytes()) == "AxyD", "regions retain shared page mutation")
+            let copy = page.bytes()
+            copy[0] = 0; copy.resize(0); copy.add(1)
+            let part = first.bytes()
+            part[0] = 0; part.resize(80)
+            check(page.size() == 8 && Text(whole.bytes()) == "AxyDEFGH", "exports cannot mutate or resize backing page")
+            return first
+        }
+        let field = retained()
+        check(Text(field.bytes()) == "AxyD", "region outlives page and cursor locals")
+        for index in 0..40 {
+            let page = pages.create(8, "temporary").unwrap()
+            let region = page.region(0, 8, "value").unwrap()
+            check(region.writeInt64LE(index).unwrap(), "loop write")
+            check(region.readInt64LE().unwrap() == index, "loop read")
+        }
+        print("aliases: passed")
+        """#, "aliases: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("pages", "bounds") {
+    fixtures.executes(frontend, prelude + #"""
+        let maximum = 9223372036854775807
+        for size in [-1, 0, 16777217, maximum] {
+            rejected(pages.create(size, "size"), errors.invalidDataCode())
+            rejected(pages.fromBytes(Bytes(), size, "size"), errors.invalidDataCode())
+        }
+        rejected(pages.fromBytes(Bytes(7), 8, "short image"), errors.truncatedCode())
+        rejected(pages.fromBytes(Bytes(9), 8, "long image"), errors.invalidDataCode())
+        let page = pages.create(8, "page").unwrap()
+        check(pages.create(1, "smallest").unwrap().size() == 1, "minimum page size")
+        let largest = pages.create(pages.maximumBytes, "largest").unwrap()
+        check(largest.size() == pages.maximumBytes, "maximum page size")
+        rejected(page.region(-1, 1, "negative offset"), errors.invalidDataCode())
+        rejected(page.region(0, -1, "negative length"), errors.invalidDataCode())
+        rejected(page.region(maximum, maximum, "overflowing sum"), errors.truncatedCode())
+        rejected(page.region(1, maximum, "huge length"), errors.truncatedCode())
+        rejected(page.region(7, 2, "past page"), errors.truncatedCode())
+        rejected(page.region(9, 0, "past empty"), errors.truncatedCode())
+        check(page.region(8, 0, "end").unwrap().size() == 0, "empty end boundary")
+        let field = page.region(2, 4, "field").unwrap()
+        rejected(field.region(3, 2, "cross field"), errors.truncatedCode())
+        rejected(field.region(maximum, 1, "huge field offset"), errors.truncatedCode())
+        rejected(field.readInt64LE(), errors.invalidDataCode())
+        rejected(field.readUInt16LE(), errors.invalidDataCode())
+        rejected(field.writeInt64LE(1), errors.invalidDataCode())
+        rejected(field.write(Bytes(3)), errors.invalidDataCode())
+        rejected(field.write(Bytes(5)), errors.invalidDataCode())
+        check(field.writeUInt32LE(0x04030201).unwrap(), "last fitting field")
+        let bytes = page.bytes()
+        check(bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 1 && bytes[5] == 4 && bytes[6] == 0 && bytes[7] == 0, "neighbor sentinels untouched")
+        let cursor = field.cursor()
+        let first = cursor.take(3, "first").unwrap()
+        rejected(cursor.take(2, "would overlap next field"), errors.truncatedCode())
+        rejected(cursor.take(-1, "negative"), errors.invalidDataCode())
+        rejected(cursor.take(maximum, "overflow"), errors.truncatedCode())
+        check(cursor.position() == 3 && cursor.remaining() == 1, "failed claims preserve position")
+        let last = cursor.take(1, "last").unwrap()
+        check(first.write(Bytes("abc")).unwrap() && last.writeUInt8(100).unwrap(), "nonoverlapping fields")
+        check(Text(field.bytes()) == "abcd", "sequential partition")
+        rejected(cursor.take(1, "exhausted"), errors.truncatedCode())
+        check(cursor.take(0, "empty end").unwrap().size() == 0, "empty claim at boundary")
+        match field.region(3, 2, "crossing") {
+            Ok(value) { fail("expected named rejection") }
+            Err(error) { check(error.contexts()[0] == "page/field/crossing", "complete field path") }
+        }
+        print("bounds: passed")
+        """#, "bounds: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("pages", "integers") {
+    fixtures.executes(frontend, prelude + #"""
+        let page = pages.create(9, "unaligned").unwrap()
+        let byte = page.region(1, 1, "byte").unwrap()
+        let word = page.region(1, 2, "word").unwrap()
+        let doubleWord = page.region(1, 4, "double word").unwrap()
+        let quad = page.region(1, 8, "quad").unwrap()
+        for value in [0, 255] { check(byte.writeUInt8(value).unwrap() && byte.readUInt8().unwrap() == value, "UInt8 endpoints") }
+        for value in [-32768, 32767] { check(word.writeInt16LE(value).unwrap() && word.readInt16LE().unwrap() == value, "Int16 endpoints") }
+        for value in [0, 65535] { check(word.writeUInt16LE(value).unwrap() && word.readUInt16LE().unwrap() == value, "UInt16 endpoints") }
+        for value in [-2147483648, 2147483647] { check(doubleWord.writeInt32LE(value).unwrap() && doubleWord.readInt32LE().unwrap() == value, "Int32 endpoints") }
+        for value in [0, 4294967295] { check(doubleWord.writeUInt32LE(value).unwrap() && doubleWord.readUInt32LE().unwrap() == value, "UInt32 endpoints") }
+        for value in [-9223372036854775808, 9223372036854775807] { check(quad.writeInt64LE(value).unwrap() && quad.readInt64LE().unwrap() == value, "Int64 endpoints") }
+        check(quad.writeInt64LE(0x0807060504030201).unwrap(), "known LE bytes")
+        let bytes = page.bytes()
+        for index in 0..9 { check(bytes[index] == index, "literal byte-order oracle") }
+        for value in [-1, 256] { rejected(byte.writeUInt8(value), errors.overflowCode()) }
+        for value in [-32769, 32768] { rejected(word.writeInt16LE(value), errors.overflowCode()) }
+        for value in [-1, 65536] { rejected(word.writeUInt16LE(value), errors.overflowCode()) }
+        for value in [-2147483649, 2147483648] { rejected(doubleWord.writeInt32LE(value), errors.overflowCode()) }
+        for value in [-1, 4294967296] { rejected(doubleWord.writeUInt32LE(value), errors.overflowCode()) }
+        let after = page.bytes()
+        for index in 0..9 { check(after[index] == index, "rejected writes leave all bytes unchanged") }
+        // An independent literal input proves signed decoding, including sign extension.
+        let input = Bytes(8)
+        for index in 0..8 { input[index] = 255 }
+        let negative = pages.fromBytes(input, 8, "negative").unwrap()
+        check(negative.region(0, 2, "i16").unwrap().readInt16LE().unwrap() == -1, "signed16 decoding")
+        check(negative.region(0, 4, "i32").unwrap().readInt32LE().unwrap() == -1, "signed32 decoding")
+        check(negative.region(0, 8, "i64").unwrap().readInt64LE().unwrap() == -1, "signed64 decoding")
+        print("integers: passed")
+        """#, "integers: passed\n", levels, 0, "", true)
+}
+
+let gallery = io.readTextFile("examples/gallery/page-ledger.min")
+if fixtures.selected("pages", "layout") {
+    let definitions = test.replace(gallery, "// gallery entry\nshow()", "")
+    fixtures.executes(frontend, definitions + #"""
+        function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+        function rejectImage(image: Bytes) {
+            match decode(image) {
+                Ok(value) { fail("malformed ledger accepted") }
+                Err(error) { check(error.contexts().length > 0, "malformed field context") }
+            }
+        }
+        let image = encode().unwrap().bytes()
+        let ledger = decode(image).unwrap()
+        check(ledger.lsn == 42 && ledger.rows.length == 2, "decoded header and directory")
+        check(Text(ledger.rows[0]) == "Ada" && Text(ledger.rows[1]) == "Grace", "decoded payloads")
+        // Literal byte oracle, independent from decode's typed readers.
+        check(Text(image.slice(0, 8)) == "LEDGER01" && image[8] == 1 && image[16] == 42, "literal header bytes")
+        check(image[24] == 8 && image[36] == 2 && image[48] == 72, "literal header offsets")
+        check(image[72] == 64 && image[80] == 3 && image[96] == 67 && image[104] == 5, "literal directory offsets")
+        for length in 0..120 { rejectImage(image.slice(0, length)) }
+        let longer = image.slice(0, 120); longer.add(0); rejectImage(longer)
+        for offset in [0, 8, 12, 32, 56, 88, 92, 112, 116] {
+            let changed = image.slice(0, 120)
+            changed[offset] = 255
+            rejectImage(changed)
+        }
+        for value in [-1, 57, 9223372036854775807] {
+            let changed = image.slice(0, 120)
+            changed.setInt64(24, value)
+            rejectImage(changed)
+        }
+        for value in [-1, 71, 73, 121, 9223372036854775807] {
+            let changed = image.slice(0, 120)
+            changed.setInt64(48, value)
+            rejectImage(changed)
+        }
+        for value in [0, 1, 3, 4294967295] {
+            let changed = image.slice(0, 120)
+            changed.setUInt32(36, value)
+            rejectImage(changed)
+        }
+        for value in [-1, 63, 65, 9223372036854775807] {
+            let changed = image.slice(0, 120)
+            changed.setInt64(72, value)
+            rejectImage(changed)
+        }
+        for value in [64, 66, 68, 9223372036854775807] {
+            let changed = image.slice(0, 120)
+            changed.setInt64(96, value)
+            rejectImage(changed)
+        }
+        for value in [-1, 9, 9223372036854775807] {
+            let changed = image.slice(0, 120)
+            changed.setInt64(80, value)
+            rejectImage(changed)
+        }
+        let unclaimed = image.slice(0, 120); unclaimed.setInt64(104, 4); rejectImage(unclaimed)
+        let negativeLsn = image.slice(0, 120); negativeLsn.setInt64(16, -1); rejectImage(negativeLsn)
+        let negativeTime = image.slice(0, 120); negativeTime.setInt64(40, -1); rejectImage(negativeTime)
+        ledger.rows[0].resize(0)
+        check(Text(decode(image).unwrap().rows[0]) == "Ada", "decoded rows are independent copies")
+        print("layout: passed")
+        """#, "layout: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("pages", "privacy") {
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet page = pages.Page { storage: Bytes(4); name: \"forged\" }\n", "has private fields, so only its own module can create one", true)
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet region = pages.Region { page: pages.create(4, \"p\").unwrap(); start: 0; length: 4; name: \"forged\" }\n", "has private fields, so only its own module can create one", true)
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet region = pages.create(4, \"p\").unwrap().region(0, 4, \"r\").unwrap()\nlet cursor = pages.Cursor { region: region; position: -1 }\n", "has private fields, so only its own module can create one", true)
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet page = pages.create(4, \"p\").unwrap()\nprint(page.storage)\n", "is private to its module", true)
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet region = pages.create(4, \"p\").unwrap().region(0, 4, \"r\").unwrap()\nprint(region.page)\n", "is private to its module", true)
+    fixtures.rejects(frontend, "use \"pages\" as pages\nlet cursor = pages.create(4, \"p\").unwrap().region(0, 4, \"r\").unwrap().cursor()\ncursor.position = -1\n", "is private to its module", true)
+}
+
+if fixtures.selected("pages", "gallery") {
+    fixtures.executes(frontend, gallery, "Ledger 42\n  Ada\n  Grace\n", levels, 0, "", true)
+}
+test.removeTree(frontend.compiler.directory)
+print("Checked pages: O0/O2, ownership, layout and privacy passed")

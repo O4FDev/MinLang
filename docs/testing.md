@@ -1099,3 +1099,10 @@ corruptions and WAL-before-snapshot publication. It runs at O0/O2 with ownership
 checks and exact failure controls; `check-simulation-manifests-sanitize` adds
 ASan/UBSan. The [manifest contract](simulation-manifests.md) states the prefix
 overlay model and the engine/filesystem behavior outside this proof.
+
+`make check-pages` checks fixed page sizes, copied import/export, shared region
+and cursor aliases, integer/width boundaries, private storage, and a checked
+header/payload/directory gallery at O0/O2 with ownership assertions. The decoder
+rejects every truncated prefix and malformed ranges without overflowing offset
+arithmetic. `check-pages-sanitize` adds ASan/UBSan. See [pages](pages.md) for the
+explicit checks, copies and Result construction costs.
