@@ -205,6 +205,15 @@ multi-descriptor receive frames. Each seed replays the same transcript, so a
 failure names a seed you can rerun. It found the driver delivering malformed
 frames, including the tail of an oversized frame (Linux CVE-2009-4536).
 
+The virtio block driver gets the same treatment (`make check-osdev-virtio`): the
+production `os/shared/virtio` transport, block driver and PCI scanner run
+against a modeled virtio 1.x PCI disk. Its World delays completions and injects
+spurious completions for chains the driver did not offer, short completions and
+I/O errors. Every seed must read the disk image exactly or stop the driver; it
+found the driver returning bytes the device never wrote (it trusted any used
+entry and ignored the written length, the class Linux fixed by validating used
+ids and lengths for untrusted hosts). The driver now checks both.
+
 The e1000 driver uses explicit full `machine.fence()` barriers before enabling
 the initial receive ring, after observing DMA completion, and before publishing
 a tail to the device. These order normal RAM and device registers; volatile

@@ -74,8 +74,12 @@ check-osdev-seeds-host: build/minyarc build/minyar-runtime.o
 check-osdev-allocator: build/.toolchain.json
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-allocator.py
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign check-osdev-virtio
 check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator check-osdev-devices-sanitize
+
+.PHONY: check-osdev-virtio
+check-osdev-virtio: build/minyarc build/minyar-runtime.o build/tooling/tests/osdev-virtio
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/osdev-virtio
 
 .PHONY: check-osdev-rtc-campaign
 build/tooling/tests/osdev-rtc-campaign: TOOL_RUNTIME = build/testing/cycle-runtime.o

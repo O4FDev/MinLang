@@ -1,0 +1,318 @@
+// A deterministic virtio-blk device (virtio 1.x over PCI) for the production
+// os/shared/virtio drivers. A simulation.World decides when each request
+// completes and which device fault it suffers. Only Bytes the driver owns are
+// dereferenced; the one native call obtains such a Bytes address.
+use "../../../library/machine.min" as raw
+use "simulation" as simulation
+
+public constant MMIO_BASE = 0x20000000
+constant MMIO_BYTES = 0x4000
+constant NOTIFY = 0x1000
+constant CONFIGURATION = 0x2000
+constant QUEUE_SIZE = 4
+public constant CAPACITY = 4096
+
+// Fault classes the World may inject into a completion.
+public constant DELAY = 1
+public constant SPURIOUS = 2
+public constant SHORT = 4
+public constant ERROR = 8
+
+record Region { owner: Bytes; base: Integer }
+record Request { head: Integer; due: Integer; fault: Integer }
+
+record State {
+    regions: List<Region>
+    config: Bytes
+    barSizing: Boolean
+    status: Integer
+    featureSelect: Integer
+    driverSelect: Integer
+    driverFeatures: List<Integer>
+    queueSelect: Integer
+    queueSize: Integer
+    queueEnabled: Boolean
+    descriptors: Integer
+    available: Integer
+    used: Integer
+    seen: Integer
+    usedIndex: Integer
+    pending: List<Request>
+    world: simulation.World
+    faults: Integer
+    clock: Integer
+    log: List<Text>
+    completed: Integer
+}
+
+function newState(seed: Integer, faults: Integer): State {
+    let config = Bytes(256)
+    config.setUInt32(0x00, 0x10421AF4)
+    config.setUInt32(0x04, 0x00100000)
+    config.setUInt32(0x08, 0x01800000)
+    config.setUInt32(0x10, MMIO_BASE)
+    config[0x34] = 0x40
+    capability(config, 0x40, 0x50, 1, 0, 0x38)
+    capability(config, 0x50, 0x68, 2, NOTIFY, 4)
+    config.setUInt32(0x60, 4)
+    capability(config, 0x68, 0, 4, CONFIGURATION, 8)
+    let regions: List<Region> = []
+    let pending: List<Request> = []
+    let log: List<Text> = []
+    return State {
+        regions: regions; config: config; barSizing: false; status: 0; featureSelect: 0; driverSelect: 0
+        driverFeatures: [0, 0]; queueSelect: 0; queueSize: QUEUE_SIZE; queueEnabled: false
+        descriptors: 0; available: 0; used: 0; seen: 0; usedIndex: 0; pending: pending
+        world: simulation.create(seed); faults: faults; clock: 0; log: log; completed: 0
+    }
+}
+
+function capability(config: Bytes, at: Integer, next: Integer, kind: Integer, offset: Integer, length: Integer) {
+    config[at] = 0x09
+    config[at + 1] = next
+    config[at + 2] = 16
+    config[at + 3] = kind
+    config[at + 4] = 0
+    config.setUInt32(at + 8, offset)
+    config.setUInt32(at + 12, length)
+}
+
+global MODEL: State = newState(1, 0)
+
+public function reset(seed: Integer, faults: Integer) {
+    let fresh = newState(seed, faults)
+    let state = MODEL
+    state.regions = fresh.regions; state.config = fresh.config; state.barSizing = false; state.status = 0
+    state.featureSelect = 0; state.driverSelect = 0; state.driverFeatures = fresh.driverFeatures
+    state.queueSelect = 0; state.queueSize = QUEUE_SIZE; state.queueEnabled = false
+    state.descriptors = 0; state.available = 0; state.used = 0; state.seen = 0; state.usedIndex = 0
+    state.pending = fresh.pending; state.world = fresh.world; state.faults = faults; state.clock = 0
+    state.log = fresh.log; state.completed = 0
+}
+
+public function choose(options: Integer): Integer { let state = MODEL; return simulation.choose(state.world, options) }
+public function faultLog(): Text { let state = MODEL; return joinText(state.log) }
+public function completedCount(): Integer { let state = MODEL; return state.completed }
+
+// The disk image: every byte is a function of its sector and offset.
+public function diskByte(sector: Integer, offset: Integer): Integer {
+    return (sector * 31 + offset * 7 + 11) & 255
+}
+
+function regionIndex(state: State, address: Integer, count: Integer): Integer {
+    if address <= 0 || count < 0 { fail("model: invalid owned address/range") }
+    for index in 0..state.regions.length {
+        let region = state.regions[index]
+        if raw.address(region.owner) != region.base { fail("model: registered Bytes moved") }
+        if address >= region.base && address - region.base <= region.owner.length - count { return index }
+    }
+    fail("model: unknown host address; raw memory was not dereferenced")
+    return -1
+}
+
+public function address(bytes: Bytes): Integer {
+    let state = MODEL
+    if bytes.length == 0 { fail("model: address of empty Bytes is not registered") }
+    let base = raw.address(bytes)
+    for region in state.regions { if region.base == base { return base } }
+    state.regions.add(Region { owner: bytes; base: base })
+    return base
+}
+
+function getWord(bytes: Bytes, offset: Integer, width: Integer): Integer {
+    let result = 0
+    for byte in 0..width { result = result | (bytes[offset + byte] << (byte * 8)) }
+    return result
+}
+
+function setWord(bytes: Bytes, offset: Integer, width: Integer, value: Integer) {
+    for byte in 0..width { bytes[offset + byte] = (value >> (byte * 8)) & 255 }
+}
+
+function memoryRead(state: State, address: Integer, width: Integer): Integer {
+    let region = state.regions[regionIndex(state, address, width)]
+    return getWord(region.owner, address - region.base, width)
+}
+
+function memoryWrite(state: State, address: Integer, width: Integer, value: Integer) {
+    let region = state.regions[regionIndex(state, address, width)]
+    setWord(region.owner, address - region.base, width, value)
+}
+
+function mmio(address: Integer): Boolean { return address >= MMIO_BASE && address < MMIO_BASE + MMIO_BYTES }
+
+public function read(address: Integer, width: Integer): Integer {
+    let state = MODEL
+    if !mmio(address) { return memoryRead(state, address, width) }
+    let offset = address - MMIO_BASE
+    if offset == 0x04 && width == 4 {
+        if state.featureSelect == 1 { return 1 }
+        return 0
+    }
+    if offset == 0x12 && width == 2 { return 1 }
+    if offset == 0x14 && width == 1 { return state.status }
+    if offset == 0x18 && width == 2 {
+        if state.queueSelect == 0 { return state.queueSize }
+        return 0
+    }
+    if offset == 0x1C && width == 2 { if state.queueEnabled { return 1 } else { return 0 } }
+    if offset == 0x1E && width == 2 { return 0 }
+    if offset == CONFIGURATION && width == 4 { return CAPACITY }
+    if offset == CONFIGURATION + 4 && width == 4 { return 0 }
+    fail("model: unsupported virtio register read at " + Text(offset) + " width " + Text(width))
+    return 0
+}
+
+public function write(address: Integer, width: Integer, value: Integer) {
+    let state = MODEL
+    if !mmio(address) { memoryWrite(state, address, width, value); return }
+    let offset = address - MMIO_BASE
+    if offset == 0x00 && width == 4 { state.featureSelect = value; return }
+    if offset == 0x08 && width == 4 { state.driverSelect = value; return }
+    if offset == 0x0C && width == 4 { if state.driverSelect == 0 || state.driverSelect == 1 { state.driverFeatures[state.driverSelect] = value }; return }
+    if offset == 0x14 && width == 1 {
+        if value == 0 { state.status = 0; state.queueEnabled = false; return }
+        state.status = value
+        if (value & 8) != 0 && state.driverFeatures[1] != 1 { state.status = value & ~8 }
+        return
+    }
+    if offset == 0x16 && width == 2 { state.queueSelect = value; return }
+    if offset == 0x18 && width == 2 {
+        if value < 1 || value > QUEUE_SIZE { fail("model: invalid virtio queue size") }
+        state.queueSize = value
+        return
+    }
+    if (offset == 0x20 || offset == 0x24 || offset == 0x28 || offset == 0x2C || offset == 0x30 || offset == 0x34) && width == 4 {
+        let high = (offset & 4) != 0
+        if offset < 0x28 { state.descriptors = merge(state.descriptors, value, high) }
+        else if offset < 0x30 { state.available = merge(state.available, value, high) }
+        else { state.used = merge(state.used, value, high) }
+        return
+    }
+    if offset == 0x1C && width == 2 { state.queueEnabled = value == 1; return }
+    if offset == NOTIFY && width == 2 {
+        if value != 0 || !state.queueEnabled || (state.status & 4) == 0 { fail("model: notify for a queue that is not live") }
+        kick(state)
+        return
+    }
+    fail("model: unsupported virtio register write at " + Text(offset) + " width " + Text(width))
+}
+
+function merge(old: Integer, value: Integer, high: Boolean): Integer {
+    if high { return (old & 0xFFFFFFFF) | (value << 32) }
+    return (old & ~0xFFFFFFFF) | (value & 0xFFFFFFFF)
+}
+
+// The driver offered chains: take them, decide each one's fate.
+function kick(state: State) {
+    let offered = memoryRead(state, state.available + 2, 2)
+    while state.seen != offered {
+        let head = memoryRead(state, state.available + 4 + (state.seen % state.queueSize) * 2, 2)
+        state.seen = (state.seen + 1) & 0xFFFF
+        let fault = 0
+        let roll = simulation.choose(state.world, 10)
+        if roll == 7 && (state.faults & SPURIOUS) != 0 { fault = SPURIOUS }
+        if roll == 8 && (state.faults & SHORT) != 0 { fault = SHORT }
+        if roll == 9 && (state.faults & ERROR) != 0 { fault = ERROR }
+        let delay = 0
+        if (state.faults & DELAY) != 0 { delay = simulation.choose(state.world, 20) }
+        if fault == SPURIOUS {
+            // A completion for a chain the driver did not offer, before the real one.
+            publish(state, (head + 1) % state.queueSize, 0)
+            state.log.add("spurious-completion\n")
+        }
+        state.pending.add(Request { head: head; due: state.clock + delay; fault: fault })
+    }
+    serve(state)
+}
+
+public function pause() {
+    let state = MODEL
+    state.clock += 1
+    if state.clock > 100000 { fail("model: driver polled forever") }
+    serve(state)
+}
+
+public function fence() {}
+
+function serve(state: State) {
+    let waiting: List<Request> = []
+    for request in state.pending {
+        if request.due <= state.clock { complete(state, request) } else { waiting.add(request) }
+    }
+    state.pending = waiting
+}
+
+function publish(state: State, head: Integer, length: Integer) {
+    let at = state.used + 4 + (state.usedIndex % state.queueSize) * 8
+    memoryWrite(state, at, 4, head)
+    memoryWrite(state, at + 4, 4, length)
+    state.usedIndex = (state.usedIndex + 1) & 0xFFFF
+    memoryWrite(state, state.used + 2, 2, state.usedIndex)
+}
+
+function descriptor(state: State, index: Integer, field: Integer, width: Integer): Integer {
+    if index < 0 || index >= state.queueSize { fail("model: descriptor index outside the queue") }
+    return memoryRead(state, state.descriptors + index * 16 + field, width)
+}
+
+// A read request is header -> data (device writes) -> status (device writes).
+function complete(state: State, request: Request) {
+    let header = request.head
+    if (descriptor(state, header, 12, 2) & 1) == 0 { fail("model: request header has no data descriptor") }
+    let data = descriptor(state, header, 14, 2)
+    let headerAddress = descriptor(state, header, 0, 8)
+    let kind = memoryRead(state, headerAddress, 4)
+    let sector = memoryRead(state, headerAddress + 8, 8)
+    if kind != 0 { fail("model: only read requests are modeled") }
+    let flags = descriptor(state, data, 12, 2)
+    if (flags & 3) != 3 { fail("model: data descriptor must be device-writable and chained") }
+    let status = descriptor(state, data, 14, 2)
+    let dataAddress = descriptor(state, data, 0, 8)
+    let count = descriptor(state, data, 8, 4)
+    if count <= 0 || count % 512 != 0 || sector < 0 || sector + count / 512 > CAPACITY { fail("model: read outside the disk") }
+    if (descriptor(state, status, 12, 2) & 2) == 0 || descriptor(state, status, 8, 4) != 1 { fail("model: status descriptor must be one writable byte") }
+    let written = count
+    if request.fault == SHORT {
+        written = 512 * simulation.choose(state.world, count / 512)
+        state.log.add("short-completion " + Text(written) + "/" + Text(count) + "\n")
+    }
+    for index in 0..written { memoryWrite(state, dataAddress + index, 1, diskByte(sector + index / 512, index % 512)) }
+    let result = 0
+    if request.fault == ERROR { result = 1; state.log.add("io-error\n") }
+    memoryWrite(state, descriptor(state, status, 0, 8), 1, result)
+    publish(state, header, written + 1)
+    state.completed += 1
+}
+
+public function copy(destination: Integer, source: Integer, count: Integer) {
+    let state = MODEL
+    for index in 0..count { memoryWrite(state, destination + index, 1, memoryRead(state, source + index, 1)) }
+}
+
+public function fill(address: Integer, count: Integer, value: Integer) {
+    let state = MODEL
+    for index in 0..count { memoryWrite(state, address + index, 1, value) }
+}
+
+public function pciRead(bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    let state = MODEL
+    // Configuration mechanisms read whole aligned dwords; pci.read8/16 pick bytes.
+    if offset < 0 || offset > 255 { fail("model: invalid PCI config access") }
+    let aligned = offset & 0xFC
+    if bus != 0 || slot != 4 || function != 0 { return 0xFFFFFFFF }
+    if aligned == 0x10 && state.barSizing { return (~(MMIO_BYTES - 1)) & 0xFFFFFFFF }
+    return state.config.getUInt32(aligned)
+}
+
+public function pciWrite(bus: Integer, slot: Integer, function: Integer, offset: Integer, value: Integer) {
+    let state = MODEL
+    if bus != 0 || slot != 4 || function != 0 { fail("model: write to absent PCI function") }
+    if offset == 0x04 { state.config.setUInt32(0x04, (value & 0xFFFF) | 0x00100000); return }
+    if offset == 0x10 {
+        state.barSizing = value == 0xFFFFFFFF
+        if !state.barSizing && value != MMIO_BASE { fail("model: unsupported BAR relocation") }
+        return
+    }
+    fail("model: unsupported PCI config write at " + Text(offset))
+}
