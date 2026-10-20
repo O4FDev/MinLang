@@ -86,9 +86,10 @@ class Importer:
         self.header = Path(options.header).resolve(strict=True)
         if not self.header.is_file():
             raise ImportFailure("the header must be a regular file")
-        if any(c in str(self.header) for c in '\\"\n\r'):
+        include_path = self.header.as_posix()
+        if any(c in include_path for c in '\\"\n\r'):
             raise ImportFailure("the header path cannot contain quotes, backslashes or line breaks")
-        self.include = f'#include "{self.header}"\n'
+        self.include = f'#include "{include_path}"\n'
         self.temporary = tempfile.TemporaryDirectory(prefix="minyar-import-c-")
         self.directory = Path(self.temporary.name)
         self.nodes = {}

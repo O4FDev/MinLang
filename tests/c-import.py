@@ -73,7 +73,7 @@ class Suite:
         source_path = self.directory / f"case-{self.serial}.min"
         llvm = source_path.with_suffix(".ll")
         # Keep generated imports relative, including when the directory contains quotes/spaces.
-        relative = os.path.relpath(prefix.with_suffix(".min"), source_path.parent)
+        relative = Path(os.path.relpath(prefix.with_suffix(".min"), source_path.parent)).as_posix()
         source_path.write_text(f'use "./{relative}" as c\n' + source)
         checked([self.compiler, source_path, llvm, "--library", ROOT / "library"])
         self.executes_llvm(source_path, llvm, expected, prefix=prefix, runtime=runtime,
