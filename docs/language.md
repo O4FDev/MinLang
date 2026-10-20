@@ -1490,7 +1490,12 @@ an explicit JSON null is `Ok(Some(value))` with `value.kind == json.NULL`.
 `get` reports missing members, and `element` reports invalid array positions.
 `asInteger` parses the original signed decimal integer spelling exactly;
 fractional and exponent spellings use `asNumber`, which checks the finite
-Float range. Ordinary typed decoding uses the first duplicate member;
+Float range. Decimal conversion rounds once to the nearest Float, choosing the
+even significand at a tie. It preserves signed zero and permits finite
+underflow; a result that rounds to infinity is rejected. A zero such as
+`0e9999` stays finite. The original decimal spelling remains available for
+exact Integer conversion. See [JSON numbers](json-numbers.md) for costs and checks.
+Ordinary typed decoding uses the first duplicate member;
 `decodeUnique` and its bounded Bytes forms reject duplicates and retain their
 documented metadata budgets. The old APIs keep their previous sentinel,
 coercion and Unicode-replacement behavior.

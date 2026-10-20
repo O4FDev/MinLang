@@ -1592,3 +1592,13 @@ keeps a terminating zero and copies at most capacity minus one bytes. Its
 136 length/capacity cases include empty input, embedded zero bytes, exact fits,
 truncation and unchanged destination guards. `check-native-bytes-sanitize`
 repeats these checks and the existing Bytes model with ASan/UBSan.
+
+`make check-json-numbers` compares exact decoded bits against 708 independent
+rational oracles. The native helper runs at O0/O2 in four rounding modes;
+ten JSON entry points, both number getters and the numbers gallery run at
+O0/O2 with ownership cleanup checks. Cases include halfway ties, subnormal
+and normal boundaries, overflow, signed zero, long suffixes and compensating
+exponents. Corrupt expected bits must fail both native and public-API probes.
+The sanitizer target adds ASan/UBSan to C and ASan to emitted LLVM. The helper
+also compiles to freestanding x86-64/ARM64 LLVM and objects, without claiming
+a linked kernel or execution there. See [JSON numbers](json-numbers.md).

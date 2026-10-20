@@ -1,0 +1,74 @@
+use "io" as io
+use "json" as json
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let corpus = test.setting("MINYAR_JSON_NUMBER_CASES", "")
+let count = test.setting("MINYAR_JSON_NUMBER_COUNT", "")
+test.check(corpus != "" && count != "", "JSON number oracle data is required")
+let source = #"""
+    use "json" as json
+    use "errors" as errors
+    use "io" as io
+    function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+    function bits(value: Float): Integer {
+        let raw = Bytes(8)
+        raw.setFloat64(0, value)
+        return raw.getInt64(0)
+    }
+    function finite(expected: Integer): Boolean { return (expected & 0x7ff0000000000000) != 0x7ff0000000000000 }
+    function value(actual: json.Value, source: Text, expected: Integer) {
+        if !finite(expected) {
+            check(actual.kind == json.INVALID && actual.text.find("number is not finite") == 0, "overflowing JSON number was accepted")
+            return
+        }
+        check(actual.kind == json.NUMBER, "finite JSON number was rejected: " + source)
+        check(actual.text == source, "JSON number spelling changed")
+        check(bits(actual.number) == expected, "wrong JSON number bits: " + source)
+        check(bits(actual.asNumber().unwrap()) == expected, "wrong number method")
+        check(bits(json.asNumber(actual).unwrap()) == expected, "wrong number function")
+    }
+    function result(actual: Result<json.Value, errors.Error>, source: Text, expected: Integer) {
+        if finite(expected) { value(actual.unwrap(), source, expected) }
+        else {
+            match actual {
+                Ok(number) { fail("overflowing JSON Result was accepted") }
+                Err(error) { check(error.code() == errors.invalidDataCode(), "wrong numeric error kind") }
+            }
+        }
+    }
+    let data = io.readBytesFile($CORPUS)
+    let position = 0
+    let count = 0
+    while position < data.length {
+        check(data.length - position >= 12, "truncated JSON number framing")
+        let expected = data.getInt64(position)
+        let length = data.getUInt32(position + 8)
+        position += 12
+        check(length <= data.length - position, "invalid JSON number framing")
+        let bytes = data.slice(position, position + length)
+        let source = Text(bytes)
+        position += length
+        value(json.parse(source), source, expected)
+        value(json.parseBytes(bytes, length), source, expected)
+        value(json.parseUnique(source), source, expected)
+        value(json.parseUniqueBytes(bytes, length), source, expected)
+        value(json.parseUniqueBytesWithin(bytes, length, 1, 1), source, expected)
+        result(json.decode(source), source, expected)
+        result(json.decodeBytes(bytes, length), source, expected)
+        result(json.decodeUnique(source), source, expected)
+        result(json.decodeUniqueBytes(bytes, length), source, expected)
+        result(json.decodeUniqueBytesWithin(bytes, length, 1, 1), source, expected)
+        count += 1
+    }
+    for source in ["", "-", "+1", "01", "1.", ".1", "1e", "1e+", "NaN", "Infinity", "1e999x", "0e999x", "1,2", "0x1"] {
+        check(json.decode(source).isErr(), "invalid number spelling was accepted")
+    }
+    print(Text(count) + " JSON number cases passed")
+    """#
+source = test.replace(source, "$CORPUS", json.quote(corpus))
+fixtures.executes(frontend, source, count + " JSON number cases passed\n", ["-O0", "-O2"], 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/numbers.min"), "a tide: 0.29\na spark: 5.0e-324\na silence: -0.0\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("JSON number APIs and gallery: O0/O2 with ownership checks passed")

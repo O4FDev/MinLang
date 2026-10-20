@@ -235,3 +235,5 @@ void minyar_check_shift(long long count) {
     if ((unsigned long long)count > 63)
         minyar_stop("a shift count must be between 0 and 63.");
 }
+
+#include "minyar_decimal.h"
