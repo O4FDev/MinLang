@@ -360,7 +360,8 @@ class Importer:
             raise ImportFailure(f"'{name}': duplicate parameter names")
         c_signature = result.c + " (*)(" + (", ".join(kind.c for _, kind in parameters) or "void") + ")"
         self.assertions.append(f'_Static_assert(__builtin_types_compatible_p(__typeof__(&{name}), {c_signature}), "C function signature changed: {name}");')
-        raw = "minyarImport" + name
+        needs_checks = any((kind.language == "Integer" and kind.size < 8) or (kind.floating and kind.size == 4) for _, kind in parameters)
+        raw = "minyarImport" + name if needs_checks else name
         language_parameters = ", ".join(f"{parameter}: {kind.language}" for parameter, kind in parameters)
         has_record = result.record or any(kind.record for _, kind in parameters)
         suffix = " value" if has_record else ""
@@ -375,7 +376,11 @@ class Importer:
         call = raw + "(" + ", ".join(parameter for parameter, _ in parameters) + ")"
         public.append("    " + ("return " if result.language != "Nothing" else "") + call)
         public.append("}")
-        self.min_declarations.append(f'function {raw}({language_parameters}): {result.language} {{ native "{self.options.library}"{suffix} }}\n' + "\n".join(public))
+        declaration = f'function {raw}({language_parameters}): {result.language} {{ native "{self.options.library}"{suffix} }}'
+        if needs_checks:
+            self.min_declarations.append(declaration + "\n" + "\n".join(public))
+        else:
+            self.min_declarations.append("public " + declaration)
         c_parameters = ", ".join(f"{kind.abi} minyar_argument_{index}" for index, (_, kind) in enumerate(parameters)) or "void"
         values = []
         for index, (_, kind) in enumerate(parameters):

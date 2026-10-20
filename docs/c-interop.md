@@ -95,6 +95,8 @@ dynamic signature interpretation or runtime layout discovery. Narrow integer
 and float parameters have range checks; same-width scalar adapters only need
 ordinary C conversions. Cross-language inlining depends on the final LTO
 configuration. This first importer does not promise that all wrappers disappear.
+Functions whose parameters need no narrowing checks are public native
+declarations, without an additional Minyar forwarding function.
 
 C-layout records use managed backing storage. Returning a record allocates
 and copies that value; this is the existing aggregate ABI's cost. Constants
