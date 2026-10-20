@@ -171,6 +171,10 @@ POLICIES = {
         "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
         reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
     ),
+    "6d1c815fa137": contextual(
+        "A keyboard interrupt handler", "unsupported-host",
+        "This handler imports machine and reads an x86 keyboard port. It requires a matching freestanding kernel target; the hosted WASI playground provides neither interrupt entry points nor privileged port I/O.",
+    ),
     "a8d60c1082b7": standalone(
         "Compile-time hardware register fields", "15\nfalse\n",
         "The threshold payload is 15 and the enabled bit does not overlap it. A ten-bit distance cannot hold 1024, so fieldFits returns false. These compile-time layouts use scalar shifts and masks without a native module.",
