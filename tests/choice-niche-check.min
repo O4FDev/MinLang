@@ -1,0 +1,37 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let levels = ["-O0", "-O2"]
+fixtures.executes(frontend, io.readTextFile("tests/choice-niche.min"), io.readTextFile("tests/choice-niche.expected"), levels, 0, "", true)
+
+let source = "record Reading { number: Integer }\nfunction sample(index: Integer): Maybe<Reading> { if index % 2 == 0 { return Some(Reading { number: index }) }; return None }\nlet sum = 0\nfor index in 0..10000 { sum += match sample(index) { Some(value) { value.number } None { 0 } } }\nprint(sum)\n"
+test.require(fixtures.compile(frontend, source), "compile nullable choice allocation benchmark")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+test.check(!test.contains(llvm, "@minyar_record_new(i64 2)") && !test.contains(llvm, "@minyar_record_new_scalar(i64 2)"), "optional record still allocates a wrapper")
+test.check(test.contains(llvm, "ret ptr null") && test.contains(llvm, "icmp eq ptr"), "optional record must use null and pointer tests")
+llvm = test.replace(llvm, "@minyar_record_new_scalar", "@choice_niche_new_scalar")
+llvm = test.replace(llvm, "@minyar_record_new(", "@choice_niche_new(")
+io.writeTextFile(path + ".ll", llvm)
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+contract += "\nstatic long long choice_niche_allocations, choice_niche_slots;\nMinyarRecord *choice_niche_new(long long fields) { ++choice_niche_allocations; choice_niche_slots += fields; return minyar_record_new(fields); }\nMinyarRecord *choice_niche_new_scalar(long long fields) { ++choice_niche_allocations; choice_niche_slots += fields; return minyar_record_new_scalar(fields); }\n__attribute__((destructor)) static void choice_niche_report(void) { fprintf(stderr, \"choice niche: %lld records, %lld slots\\n\", choice_niche_allocations, choice_niche_slots); }\n"
+io.writeTextFile(path + "-runtime.c", contract)
+let command = [compiler.clang, "-O2"]
+for flag in compiler.flags { command.add(flag) }
+for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 30), "compile nullable choice counter runtime")
+for level in levels {
+    let link = [compiler.clang, level]
+    for flag in compiler.flags { link.add(flag) }
+    for argument in ["-Wno-override-module", path + ".ll", path + "-runtime.o", "-lm", "-o", path + ".exe"] { link.add(argument) }
+    test.require(test.run(link, frontend.environment, "", path + ".link", 30), "link nullable choice benchmark " + level)
+    let result = test.run([path + ".exe"], frontend.environment, "", path + ".run", 30)
+    test.check(result.status == 0 && result.output == "24995000\n", "nullable choice benchmark result " + level + "\n" + result.errorOutput)
+    test.check(result.errorOutput == "choice niche: 5000 records, 5000 slots\n", "nullable choice benchmark allocations " + level + "\n" + result.errorOutput)
+}
+test.removeTree(compiler.directory)
+print("Choice niche: passed; 10,000 optionals allocate no wrappers")

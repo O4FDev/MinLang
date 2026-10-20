@@ -155,6 +155,15 @@ and run scope cleanup; cycles through either payload follow the same
 graph analysis. See the Result language contract
 and the independent review.
 
+Choices share their payload slots across cases and track only the active
+reference fields. A two-case choice with one ordinary managed record payload
+uses that record pointer directly, reserving null for the empty case. This
+includes `Maybe<Record>` and adds no wrapper object or reference-count edge.
+The compiler keeps the full logical field graph for cycle analysis and projects
+nullable aliases to their payload type when choosing traced ownership calls.
+Choice, callback and C-layout payloads retain an explicit tag; in particular,
+an optional containing another optional must preserve `Some(None)`.
+
 ## Compiler/runtime ownership contract
 
 - Managed constructors and ordinary functions returning references produce one owned

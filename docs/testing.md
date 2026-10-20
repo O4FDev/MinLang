@@ -204,6 +204,13 @@ calls: 16,000 values reserve 48,000 eight-byte slots, compared with 528,000 in
 the former expanded layout. LLVM assertions independently require three slots
 per value. `check-choice-layout-sanitize` adds ASan/UBSan.
 
+`make check-choice-niche` checks nullable record choices, borrowed and owned
+payloads, nested optionals, reversed case order, snapshots, alias lifetimes and
+cycles. Its O0/O2 constructor counter requires 10,000 optional readings to
+allocate only the 5,000 present records, using 5,000 slots. The former wrapper
+layout allocated 15,000 records and 25,000 slots for the same workload.
+`check-choice-niche-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

@@ -696,9 +696,9 @@ int main(int argc, char **argv) {
                 errno = EPROTO;
                 stop("invalid compiler state");
             }
-            if (equals(schema, "minyar-module-delta-v4"))
+            if (equals(schema, "minyar-module-delta-v5"))
                 publish_cache(delta, compiler_hex, entry, fresh);
-            else if (equals(schema, "minyar-module-interface-v6"))
+            else if (equals(schema, "minyar-module-interface-v7"))
                 publish_cache(cache, compiler_hex, entry, fresh);
             else {
                 errno = EPROTO;

@@ -879,6 +879,15 @@ choices, records, Lists and callbacks, with the same ownership and cycle analysi
 as records. Cases and payload fields are accessed through constructors and
 matching. Patterns inspect only the active case and its payloads.
 
+A two-case choice with one ordinary record payload uses a nullable pointer.
+For example, `Maybe<Reading>` stores the `Reading` pointer for `Some(reading)`
+and null for `None`, with no wrapper allocation. The record keeps its usual
+shared ownership. This also applies to a user-declared choice with the same
+shape, preserving its case order. Choice, callback and C-layout payloads keep
+the tagged union, so nested values such as `Some(None)` remain distinct from
+`None`. Native functions returning an ordinary managed record must return a
+valid, non-null record.
+
 ## Maps and Sets
 
 `Map<Key, Value>` accepts Hashable record keys as well as scalar keys. A

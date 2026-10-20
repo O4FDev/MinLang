@@ -1,0 +1,94 @@
+// A two-case choice with one non-null managed record payload has a spare null
+// pointer. Keep its logical fields intact: ownership analysis still sees them.
+function choiceNicheType(context: CompilerContext, type: Integer): Integer {
+    if !isRecordType(type) { return 0 }
+    let record = type - 1000
+    if context.functionParameterCounts[record] != 2 { return 0 }
+    let cases = choiceCases(context, type)
+    if cases.length != 3 { return 0 }
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    let payload = context.functionParameterTypes[first + 1]
+    if !isRecordType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
+    // A nested optional may already use null, so Some(None) needs its own tag.
+    if choiceCases(context, payload).length > 0 { return 0 }
+    return payload
+}
+
+function choiceNicheTag(context: CompilerContext, type: Integer): Integer {
+    let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+    let parts = context.functionParameterNames[first + 1].split("|")
+    return findText(choiceCases(context, type), parts[1]) - 1
+}
+
+function choiceOwnershipType(context: CompilerContext, type: Integer): Integer {
+    let payload = choiceNicheType(context, type)
+    if payload != 0 { return payload }
+    return type
+}
+
+function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer): Text {
+    if choiceNicheType(context, type) == 0 { return readRecordField(output, textState, state, value, 0, 1) }
+    let present = choiceNicheTag(context, type)
+    let absent = emitInstruction(output, textState, state, "icmp eq ptr " + value + ", null")
+    return emitInstruction(output, textState, state, "select i1 " + absent + ", i64 " + Text(1 - present) + ", i64 " + Text(present))
+}
+
+function readChoiceMatchPayload(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer, field: Integer, payload: Integer): Text {
+    if choiceNicheType(context, type) != 0 { return value }
+    return readRecordField(output, textState, state, value, choiceStorageField(context, type, field), payload)
+}
+
+function parseNicheChoice(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer, present: Boolean): Text {
+    let value = "null"
+    let payloadType: List<Integer> = [choiceNicheType(context, type)]
+    if present || tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+        if present {
+            let location = state[0]
+            value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+            requireContextType(context, location, payloadType[0], choiceNicheType(context, type), "choice payload has the wrong type")
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
+        }
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    }
+    setType(resultType, type)
+    if present {
+        if payloadType.length > 1 && payloadType[1] >= 0 { markOwner(resultType, payloadType[1]) } else {
+            // Constructors return an owned value. A borrowed payload needs its
+            // own count before the parser registers that constructor result.
+            noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, payloadType[0], 0)
+            output.add("  call void @minyar_rc_retain(ptr " + value + ")\n")
+            ownResult(output, state, value, resultType)
+        }
+    }
+    return value
+}
+
+function derivedNicheChoice(context: CompilerContext, type: Integer, operation: Text, globals: List<Text>, name: Text): Text {
+    let payload = choiceNicheType(context, type)
+    let child = derivedRecordFunction(context, payload, operation, globals)
+    let resultType = "i64"
+    if operation == "equal" { resultType = "zeroext i1" }
+    if operation == "copy" { resultType = "ptr" }
+    let binary = operation == "equal" || operation == "compare"
+    let code = "define internal " + resultType + " " + name + "(ptr %left"
+    if binary { code = code + ", ptr %right" }
+    code = code + ") {\nentry:\n  %left.absent = icmp eq ptr %left, null\n"
+    if binary {
+        code = code + "  %right.absent = icmp eq ptr %right, null\n  %either.absent = or i1 %left.absent, %right.absent\n  br i1 %either.absent, label %absent, label %present\nabsent:\n"
+        if operation == "equal" { code = code + "  %both.absent = and i1 %left.absent, %right.absent\n  ret i1 %both.absent\n" } else {
+            code = code + "  %left.zero = zext i1 %left.absent to i64\n  %right.zero = zext i1 %right.absent to i64\n"
+            if choiceNicheTag(context, type) == 0 { code = code + "  %order = sub i64 %left.zero, %right.zero\n" } else { code = code + "  %order = sub i64 %right.zero, %left.zero\n" }
+            code = code + "  ret i64 %order\n"
+        }
+    } else {
+        code = code + "  br i1 %left.absent, label %absent, label %present\nabsent:\n"
+        if operation == "copy" { code = code + "  ret ptr null\n" } else { code = code + "  ret i64 0\n" }
+    }
+    code = code + "present:\n  %result = call " + resultType + " " + child + "(ptr %left"
+    if binary { code = code + ", ptr %right" }
+    code = code + ")\n"
+    if operation == "equal" { code = code + "  ret i1 %result\n}\n" } else { code = code + "  ret " + resultType + " %result\n}\n" }
+    globals.add(code)
+    return name
+}
