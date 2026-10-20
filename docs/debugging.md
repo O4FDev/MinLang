@@ -26,8 +26,9 @@ optimization, may be unavailable.
 The default managed runtime supplies the layouts described below. Arena builds
 currently keep record and Map types opaque because their storage differs;
 Text, Bytes and List prefixes are shared. Native C-layout records and callable
-values are also opaque. Scalarized records are reconstructed as values from
-their existing field operands. Closures describe their parameters and captured
+values are also opaque. Scalarized records are reconstructed from their existing
+field values or stack slots, exposing source fields without a runtime header.
+Closures describe their parameters and captured
 values; parallel workers describe their captures, loop bindings and locals.
 
 Records and choices with more than 64 descriptor fields, or a choice tag table

@@ -201,6 +201,7 @@ if io.fileExists(lldb) { verifyStepping(fixture, lldb, stepping, emptyStepping, 
 if gdb != "" && !darwin { verifyStepping(fixture, gdb, stepping, emptyStepping, false) }
 record SourceCase { name: Text; output: Text; pause: Integer; variables: Text; expected: List<Text> }
 let cases = [SourceCase { name: "closures"; output: "40\n42\n"; pause: 4; variables: ""; expected: ["base = 40", "step = 2", "answer = 42"] }, SourceCase { name: "parallel"; output: "40\n41\nfalse\n"; pause: 5; variables: ""; expected: ["base = 40", "index = 0", "bright = true"] }, SourceCase { name: "shadow"; output: "1\n2\n"; pause: 5; variables: "value"; expected: ["value = 2"] }, SourceCase { name: "unit-result"; output: "Clear\n"; pause: 0; variables: ""; expected: [] }]
+cases.add(SourceCase { name: "mutable"; output: "42\n2.5\ntrue\nZ\n7\n"; pause: 8; variables: "value"; expected: ["number = 42", "fraction = 2.5", "flag = true"] })
 for item in cases {
     let source = "tests/debugger/" + item.name + ".min"
     let binary = work + "/" + item.name
@@ -213,8 +214,27 @@ for item in cases {
     run(fixture, [dwarf, "--verify", symbols])
     if item.pause > 0 && lldb != "" {
         let command = [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "settings set target.env-vars MINYAR_PARALLEL_THREADS=1", "-o", "breakpoint set -f " + item.name + ".min -l " + Text(item.pause), "-o", "run", "-o", "frame variable " + item.variables]
+        if item.name == "mutable" {
+            for part in ["-o", "frame variable -f decimal value.letter", "-o", "script print('MINYAR-MUTABLE-END')", "-o", "script print('MINYAR-POINTER-BEGIN')", "-o", "frame variable -P 2 -D 5 input", "-o", "script print('MINYAR-POINTER-END')"] { command.add(part) }
+        }
         let inspected = run(fixture, command)
         for value in item.expected { test.check(test.contains(frameOutput(inspected.output), value), "LLDB " + item.name + " retains " + value + "\n" + inspected.output + inspected.errorOutput) }
+        if item.name == "mutable" {
+            test.check(test.contains(frameOutput(inspected.output), "value.letter = 90"), "LLDB reads the mutated Character slot\n" + inspected.output)
+            let virtual = steppingSection(inspected.output, "(lldb) frame variable value", "MINYAR-MUTABLE-END")
+            test.check(!test.contains(virtual, "minyar_record_length"), "virtual scalar records have no synthetic runtime header\n" + inspected.output)
+            let pointer = steppingSection(inspected.output, "MINYAR-POINTER-BEGIN", "MINYAR-POINTER-END")
+            test.check(test.contains(pointer, "minyar_record_length = 4") && test.contains(pointer, "number = 7"), "same-type real pointer retains its runtime layout\n" + inspected.output)
+        }
+    }
+    if item.name == "mutable" && gdb != "" && !darwin {
+        let inspected = run(fixture, [gdb, "--batch", binary, "-ex", "set auto-load python-scripts off", "-ex", "break mutable.min:8", "-ex", "run", "-ex", "echo MINYAR-MUTABLE-BEGIN\\n", "-ex", "print value", "-ex", "print /d value.letter", "-ex", "echo MINYAR-MUTABLE-END\\n", "-ex", "echo MINYAR-POINTER-BEGIN\\n", "-ex", "print *input", "-ex", "echo MINYAR-POINTER-END\\n"])
+        let actual = steppingSection(inspected.output, "MINYAR-MUTABLE-BEGIN", "MINYAR-MUTABLE-END")
+        for value in item.expected { test.check(test.contains(actual, value), "GDB mutable record retains " + value + "\n" + inspected.output + inspected.errorOutput) }
+        test.check(test.contains(actual, "= 90"), "GDB reads the mutated Character slot\n" + inspected.output)
+        test.check(!test.contains(actual, "minyar_record_length"), "GDB virtual scalar records have no synthetic runtime header\n" + inspected.output)
+        let pointer = steppingSection(inspected.output, "MINYAR-POINTER-BEGIN", "MINYAR-POINTER-END")
+        test.check(test.contains(pointer, "minyar_record_length = 4") && test.contains(pointer, "number = 7"), "GDB same-type real pointer retains its runtime layout\n" + inspected.output)
     }
 }
 // The launcher overrides arena-looking flags. A custom runtime can select arena
