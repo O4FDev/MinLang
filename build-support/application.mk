@@ -3,10 +3,11 @@ build/tooling/tools/application-cli.ll: $(APPLICATION_SOURCES)
 build/tooling/tools/application-cli: TOOL_NATIVE = tools/clang-driver-host.c
 
 .PHONY: check-application-cli check-ui-source check-ui-macos
-check-application-cli: build/tooling/tools/application-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build build/tooling/scripts/macos-app
+check-application-cli: build/tooling/tools/application-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build build/tooling/scripts/macos-app build/tooling/tests/macos-packaging
 	python3 "tests/application-check.py" cli
+	$(LIMITED) ./build/tooling/tests/macos-packaging "$(CURDIR)/build/tooling/scripts/macos-app"
 
-check-ui-macos: build/minyarc build/minyar-default-runtime.o build/tooling/tools/clang-driver
+check-ui-macos: check-application-cli build/minyarc build/minyar-default-runtime.o build/tooling/tools/clang-driver
 	python3 "tests/application-check.py" ui --clang "$(LLVM_CC)"
 
 check-ui-source: build/minyarc
