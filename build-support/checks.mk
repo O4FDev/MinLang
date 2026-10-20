@@ -26,6 +26,12 @@ check-last-use-returns: build/minyarc build/minyarc-sanitize build/tooling/tests
 	$(LIMITED) ./build/tooling/tests/last-use-returns
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/last-use-returns
 
+.PHONY: check-stable-field-borrows
+check check-portable: check-stable-field-borrows
+check-stable-field-borrows: build/minyarc build/minyarc-sanitize build/tooling/tests/stable-field-borrows
+	$(LIMITED) ./build/tooling/tests/stable-field-borrows
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stable-field-borrows
+
 .PHONY: check-terminal-return-reuse
 check: check-terminal-return-reuse
 check-terminal-return-reuse: build/minyarc build/minyarc-sanitize build/tooling/tests/terminal-return-reuse

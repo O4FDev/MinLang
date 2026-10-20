@@ -8,6 +8,16 @@ function isAssignmentOperator(token: Text): Boolean {
     return token == "=" || token == "+=" || token == "-=" || token == "*=" || token == "/=" || token == "%="
 }
 
+// Decide from this assignment's statement prefix, rather than carrying a
+// declaration flag across arbitrary identifiers named `let` in expressions.
+function loopAssignmentDeclaresLocal(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+    let start = position - 1
+    while start > 0 && tokenKinds[start - 1] != 6 && !(tokenKinds[start - 1] == 4 && (tokenTexts[start - 1] == "{" || tokenTexts[start - 1] == "}")) {
+        start = start - 1
+    }
+    return tokenKinds[start] == 1 && tokenTexts[start] == "let"
+}
+
 // When a loop body makes no call tokens and assigns only plain local names,
 // other than the loop name and the source name, it can change the collection
 // it walks only through user code without a call token (capability operators,
@@ -17,25 +27,19 @@ function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>
     if tokenKinds[position] != 4 || tokenTexts[position] != "{" { return false }
     let cursor = position + 1
     let depth = 0
-    let declaring = false
     while tokenKinds[cursor] != 0 {
         if callAt(tokenKinds, tokenTexts, cursor) { return false }
         let text = tokenTexts[cursor]
-        if tokenKinds[cursor] == 1 && text == "let" { declaring = true }
         if tokenKinds[cursor] == 4 {
             if text == "{" || text == "(" || text == "[" { depth = depth + 1 }
             if text == "}" || text == ")" || text == "]" {
                 if depth == 0 { return true }
                 depth = depth - 1
             }
-            if isAssignmentOperator(text) {
-                if declaring {
-                    declaring = false
-                } else {
-                    let previous = tokenKinds[cursor - 2]
-                    let boundary = previous == 6 || (previous == 4 && (tokenTexts[cursor - 2] == "{" || tokenTexts[cursor - 2] == "}"))
-                    if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source || tokenTexts[cursor - 1] == loopName { return false }
-                }
+            if isAssignmentOperator(text) && !loopAssignmentDeclaresLocal(tokenKinds, tokenTexts, cursor) {
+                let previous = tokenKinds[cursor - 2]
+                let boundary = previous == 6 || (previous == 4 && (tokenTexts[cursor - 2] == "{" || tokenTexts[cursor - 2] == "}"))
+                if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source || tokenTexts[cursor - 1] == loopName { return false }
             }
         }
         cursor = cursor + 1
@@ -247,6 +251,10 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
         return
     }
     let done = false
+    let deferredPiece = -1
+    let deferredValue = ""
+    let deferredType = 0
+    let deferredCalls = 0
     while !done {
         if tokenTexts[state[0]] == "." {
             let member = tokenTexts[state[0] + 1]
@@ -292,6 +300,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     let rightType: List<Integer> = [2]
                     let right = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
                     if rightType[0] == 2 {
+                        if deferredPiece >= 0 { settleBorrow(context, output, state, deferredPiece, deferredValue, deferredType, deferredCalls) }
                         output.add("  call void @minyar_record_append_text(ptr ")
                         output.add(receiver)
                         output.add(", i64 ")
@@ -352,6 +361,12 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                 receiverType = fieldType
                 if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
                     borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                } else {
+                    deferredPiece = output.length
+                    output.add("")
+                    deferredValue = receiver
+                    deferredType = receiverType
+                    deferredCalls = context.callTargets.length
                 }
             }
         } else {
@@ -452,6 +467,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
             }
         }
     }
+    if deferredPiece >= 0 { settleBorrow(context, output, state, deferredPiece, deferredValue, deferredType, deferredCalls) }
 }
 
 function emitBytesRead(output: List<Text>, textState: List<Text>, state: List<Integer>, bytes: Text, position: Text): Text {

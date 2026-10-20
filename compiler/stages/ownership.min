@@ -128,7 +128,8 @@ function takeTerminalReuse(context: CompilerContext, localNames: List<Text>, loc
         return
     }
     let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[receiver].start])
-    if local < 0 || localIds[local] < 0 {
+    // A binding that never owned a value has no count to give the consumer.
+    if local < 0 || localIds[local] < 0 || !ownershipSlotAllocated(state, localIds[local]) {
         terminalOwnershipRemark(context, node, "retain", "the receiver has no transferable local owner; this proof preserves its ownership")
         return
     }
@@ -222,7 +223,7 @@ function takeReturnedLocal(context: CompilerContext, localNames: List<Text>, loc
     if !directOwnershipName(context, node) { return false }
     if !isReferenceType(tree.nodes[node].type) { return false }
     let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[node].start])
-    if local < 0 || localIds[local] < 0 { return false }
+    if local < 0 || localIds[local] < 0 || !ownershipSlotAllocated(state, localIds[local]) { return false }
     state[6] = 1
     output.add("  call void @minyar_rc_local_move_owner(i64 ")
     output.add(Text(ownershipSlot(state, localIds[local])))
@@ -341,7 +342,116 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
     context.mutableScalarRecord = writable
 }
 
+function ownershipSlotAllocated(state: List<Integer>, id: Integer): Boolean {
+    let entry = 16 + id * 2
+    return entry + 1 < state.length && state[entry] == state[9]
+}
+
+function plainRecordType(context: CompilerContext, type: Integer): Boolean {
+    if !isRecordType(type) || isScalarChoiceType(type) || isCRecord(context, type) { return false }
+    let record = recordTypeIndex(type)
+    let counts = context.functionParameterCounts
+    return counts[record] == 0 || !resultPrefix(context.functionParameterNames[functionParameterOffset(counts, record)], "minyar_choice_tag|")
+}
+
+// A type outside every reference cycle never becomes traced, so its values
+// need no collector shading when a binding borrows them.
+function untracedBorrowType(context: CompilerContext, type: Integer): Boolean {
+    let known = 0
+    while known < context.untracedTypes.length {
+        if context.untracedTypes[known] == type { return context.untracedResults[known] }
+        known = known + 1
+    }
+    let result = true
+    let base = type
+    while isContainerType(base) { base = containerValueType(base) }
+    if isRecordType(base) && !isScalarChoiceType(base) {
+        let counts = context.functionParameterCounts
+        let fields = context.functionParameterTypes
+        if !plainRecordType(context, base) { result = false } else {
+            if isContainerType(type) { result = !cycleTypeReaches(containerValueType(type), type, counts, fields) } else {
+                let record = recordTypeIndex(type)
+                let first = functionParameterOffset(counts, record)
+                let field = 0
+                while field < counts[record] && result {
+                    if cycleTypeReaches(fields[first + field], type, counts, fields) { result = false }
+                    field = field + 1
+                }
+            }
+        }
+    }
+    context.untracedTypes.add(type)
+    context.untracedResults.add(result)
+    return result
+}
+
+function blockAssignsName(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, name: Text): Boolean {
+    let position = start
+    let depth = 0
+    while tokenKinds[position] != 0 {
+        if tokenKinds[position] == 4 {
+            if tokenTexts[position] == "{" { depth = depth + 1 }
+            if tokenTexts[position] == "}" {
+                if depth == 0 { return false }
+                depth = depth - 1
+            }
+        }
+        if tokenKinds[position] == 1 && tokenKinds[position + 1] == 4 && isAssignmentOperator(tokenTexts[position + 1]) && tokenTexts[position] == name && (position == 0 || tokenTexts[position - 1] != ".") { return true }
+        position = position + 1
+    }
+    return false
+}
+
+// A readonly parameter, a capture, a constant or a never-reassigned record
+// binding keeps its object alive for the whole scope that can name it.
+function stableBorrowRoot(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, name: Text): Boolean {
+    if recoveryEnabled(state) { return false }
+    let local = findLocal(localNames, localLengths, state, name)
+    return local >= 0 && (localIds[local] < 0 || localLengths[local] < 0)
+}
+
+// A field is stable when no compiled token assigns a field of that name, so a
+// living record keeps the same value there. Module builds see one module, so
+// they trust only private fields.
+function stableRecordField(context: CompilerContext, type: Integer, name: Text): Boolean {
+    if !plainRecordType(context, type) { return false }
+    let field = findRecordField(context.functionParameterCounts, context.functionParameterNames, type, name)
+    if field < 0 { return false }
+    if context.privateFieldsOnly && context.functionParameterNames[field].find(" ") < 0 { return false }
+    let native = 0
+    while native < context.nativeMutableTypes.length {
+        if cycleTypeReaches(context.nativeMutableTypes[native], type, context.functionParameterCounts, context.functionParameterTypes) { return false }
+        native = native + 1
+    }
+    return findIndexedSymbol(context.assignedFieldLookup, context.assignedFieldNames, context.assignedFieldKinds, name, 1) < 0
+}
+
+// A binding initialized by a stable field path can borrow its value, like a
+// parameter: nothing can replace a field on that path while its root lives.
+// Later consumers of the binding create their own count first, as they do for
+// parameters.
+function stableFieldBorrow(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, resultType: List<Integer>): Boolean {
+    if !isReferenceType(resultType[0]) { return false }
+    if resultType.length > 1 && resultType[1] >= 0 { return false }
+    if end - start < 3 || (end - start) % 2 == 0 { return false }
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    if tokenKinds[start] != 1 || !stableBorrowRoot(context, localNames, localIds, localLengths, state, tokenTexts[start]) { return false }
+    let type = localTypes[findLocal(localNames, localLengths, state, tokenTexts[start])]
+    let position = start + 1
+    while position < end {
+        if tokenKinds[position] != 4 || tokenTexts[position] != "." || tokenKinds[position + 1] != 1 { return false }
+        let name = tokenTexts[position + 1]
+        if !stableRecordField(context, type, name) { return false }
+        type = context.functionParameterTypes[findRecordField(context.functionParameterCounts, context.functionParameterNames, type, name)]
+        position = position + 2
+    }
+    return type == resultType[0] && untracedBorrowType(context, type)
+}
+
 function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
+    // Clearing a binding that never owned a value has nothing to release.
+    if value == "null" && !ownershipSlotAllocated(state, id) { return }
     if isReferenceType(type) {
         let owner = ownershipSlot(state, id)
         if owner < 0 { return }
