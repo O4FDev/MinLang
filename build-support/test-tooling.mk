@@ -22,6 +22,13 @@ build/tooling/%.ll: %.min $(MINYAR_TOOL_SOURCES) build/minyarc-modules
 	mkdir -p $(@D)
 	$(LIMITED) ./build/minyarc-modules $< $@ --library library
 
+# Imported test helpers must invalidate LLVM, not only relink an old harness.
+MINYAR_NATIVE_EVIDENCE_SOURCES = tests/native-evidence.min tests/compiler-port-support.min \
+	tests/sha256-support.min experiments/memory/study-support.min
+build/tooling/tests/codegen.ll build/tooling/tests/native-evidence-harness.ll \
+build/tooling/tests/regressions.ll: $(MINYAR_NATIVE_EVIDENCE_SOURCES)
+build/tooling/tests/regressions.ll: tests/semantic-oracle.min
+
 build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS)
 	$(LLVM_CC) $(LLVM_FLAGS) $< $(TOOL_RUNTIME) $(MINYAR_TOOL_NATIVE_OBJECTS) $(TOOL_NATIVE) -pthread -lm $(TOOL_LIBS) -o $@
 
