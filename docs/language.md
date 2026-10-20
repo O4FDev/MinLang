@@ -286,11 +286,14 @@ Import `sequence` for lazy `sequence.range(first, after)` values. Iterable value
 also support `.map(functionName)`, `.filter(functionName)` and
 `.fold(initial, functionName)` with named functions. Generic transforms infer
 concrete type arguments from the items and fold seed, retaining direct calls and
-ordinary generic constraints. Stored recipes do no transform work until traversed. Map/filter chains fuse into one loop with
-direct calls, and fold combines items from left to right. Recipes allocate one
-small record per stage when created, with no intermediate Lists or per-item
-protocol wrappers. See [lazy iteration](iteration.md) for examples, costs and
-the generated LLVM shape.
+ordinary generic constraints. Stored recipes do no transform work until
+traversed. Map/filter chains fuse into one loop with direct calls, and fold
+combines items from left to right. Eligible named chains used directly as an
+ordinary `for` source remove their recipe setup. Stored recipes and chains passed
+to `fold` keep one small record per stage; declined source forms retain the same
+setup. Traversal has no intermediate Lists or per-item protocol wrappers.
+Source records and cursors keep their own costs. See [lazy iteration](iteration.md)
+for examples, setup limits and the generated LLVM shape.
 
 Conditions accept only `Boolean`.
 

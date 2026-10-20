@@ -1,6 +1,7 @@
 use "../tools/testing.min" as test
 use "./frontend-fixtures.min" as fixtures
 use "io" as io
+use "files" as immediateFiles
 
 function functionSymbol(llvm: Text, name: Text): Text {
     let found = ""
@@ -67,6 +68,64 @@ function optimizer(frontend: fixtures.Frontend): Text {
     let found = test.run(command, frontend.environment, "", frontend.compiler.directory + "/optimizer-tool", 10)
     test.check(found.status == 0 && found.output != "", "Required LLVM optimizer unavailable; set MINYAR_LLVM_BIN")
     return test.lines(found.output)[0]
+}
+
+function immediateSetupCalls(body: Text): Integer {
+    let count = 0
+    for line in test.lines(body) {
+        if test.contains(line, "call ") && test.contains(line, "minyar_sequence_") && test.contains(line, "_make") { count += 1 }
+    }
+    return count
+}
+
+// Discover the real identifier from a witness module, rather than guessing
+// factory slot 0. Only compiler-internal regression fixtures use this name.
+function immediateWitnessFactory(llvm: Text): Text {
+    let found = ""
+    let prefix = "minyar_sequence_map_"
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") {
+            let start = line.find(prefix)
+            if start >= 0 {
+                let end = start + prefix.length
+                let first = end
+                while end < line.length && test.contains("0123456789", line.slice(end, end + 1)) { end += 1 }
+                if end > first && end + 5 <= line.length && line.slice(end, end + 5) == "_make" {
+                    let name = line.slice(start, end + 5)
+                    test.check(found == "", "immediate witness must define exactly one map factory")
+                    found = name
+                }
+            }
+        }
+    }
+    test.check(found != "", "immediate witness did not expose its real map factory")
+    // Also validate the actual declaration through the module-aware matcher.
+    test.check(functionSymbol(llvm, found) != "", "immediate witness factory definition unavailable")
+    return found
+}
+
+// Alternating passing filters/maps keep the item type Integer while testing
+// composition and the combined 64-stage cap. Every stage counts both items.
+function immediateBoundarySource(stored: Integer, immediate: Integer): Text {
+    let source: List<Text> = [#"""
+        global CALLS: List<Integer> = [0]
+        function same(value: Integer): Integer { CALLS[0] += 1; return value }
+        function keep(value: Integer): Boolean { CALLS[0] += 1; return true }
+        public function boundary(): Integer {
+            let stage0 = [1, 2]
+        """# + "\n"]
+    for stage in 0..stored {
+        let method = ".map(same)"
+        if stage % 2 == 1 { method = ".filter(keep)" }
+        source.add("let stage" + Text(stage + 1) + " = stage" + Text(stage) + method + "\n")
+    }
+    let chain = "stage" + Text(stored)
+    for stage in stored..(stored + immediate) {
+        if stage % 2 == 1 { chain += ".filter(keep)" }
+        else { chain += ".map(same)" }
+    }
+    source.add("let total = 0\nfor value in " + chain + " { total += value }\nreturn total\n}\nprint(boundary()); print(CALLS[0])\n")
+    return joinText(source)
 }
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
@@ -622,6 +681,389 @@ fixtures.rejects(frontend, arithmetic + "let value = [1].fold(\"wrong\", add)\n"
 fixtures.rejects(frontend, arithmetic + "let recipe = [1].map(double, double)\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
 fixtures.rejects(frontend, "function word(value: Integer): Text { return Text(value) }\nfunction even(value: Integer): Boolean { return value % 2 == 0 }\nlet recipe = [1].map(word).filter(even)\n", "sequence filter function must take one Text argument", true)
 fixtures.rejects(frontend, arithmetic + "let callback: (Integer, Integer) -> Integer = function(total, value) { return total + value }\nlet value = [1].fold(0, callback)\n", "sequence fold needs a named function; closures and callback values are not supported yet", true)
+
+let immediateExecutions = 0
+let immediateRejections = 0
+frontend.helpers = ""
+frontend.sources = []
+
+// I01: compare whole-body immediate elimination with stored and grouped
+// controls. Parameter source avoids attributing source allocation to recipes.
+fixtures.executes(frontend, #"""
+    function double(value: Integer): Integer { return value * 2 }
+    function even(value: Integer): Boolean { return value % 2 == 0 }
+    public function immediateConsumer(values: List<Integer>): Integer {
+        let total = 0
+        for value in values.map(double).filter(even) { total += value }
+        return total
+    }
+    public function storedConsumer(values: List<Integer>): Integer {
+        let recipe = values.map(double).filter(even)
+        let total = 0
+        for value in recipe { total += value }
+        return total
+    }
+    public function groupedConsumer(values: List<Integer>): Integer {
+        let total = 0
+        for value in (values.map(double).filter(even)) { total += value }
+        return total
+    }
+    print(immediateConsumer([])); print(immediateConsumer([1])); print(immediateConsumer([1, 2, 3, 4]))
+    print(storedConsumer([])); print(storedConsumer([1])); print(storedConsumer([1, 2, 3, 4]))
+    print(groupedConsumer([])); print(groupedConsumer([1])); print(groupedConsumer([1, 2, 3, 4]))
+    """#, "0\n2\n20\n0\n2\n20\n0\n2\n20\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediatePath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateLLVM = io.readTextFile(immediatePath + ".ll")
+let immediateBody = functionBody(immediateLLVM, functionSymbol(immediateLLVM, "immediateConsumer"))
+let storedBody = functionBody(immediateLLVM, functionSymbol(immediateLLVM, "storedConsumer"))
+let groupedBody = functionBody(immediateLLVM, functionSymbol(immediateLLVM, "groupedConsumer"))
+test.check(immediateSetupCalls(immediateBody) == 0, "whole immediate consumer must not call recipe factories")
+test.check(noMaterialization(immediateBody), "whole immediate consumer including preheader must not allocate recipes or materialize intermediate collections")
+test.check(occurrences(immediateBody, "\nfor.condition.") == 1, "immediate chain must have one traversal")
+test.check(test.contains(immediateBody, "call i64 " + functionSymbol(immediateLLVM, "double") + "("), "immediate map must call original scalar transform")
+test.check(test.contains(immediateBody, "call zeroext i1 " + functionSymbol(immediateLLVM, "even") + "("), "immediate filter must call original Boolean predicate")
+test.check(!test.contains(immediateBody, "_apply") && !test.contains(immediateBody, "@minyar_callback_") && !test.contains(immediateBody, "call i64 %") && !test.contains(immediateBody, "call zeroext i1 %") && !test.contains(immediateBody, "call ptr %"), "immediate traversal must retain direct named dispatch")
+test.check(immediateSetupCalls(storedBody) == 2, "stored control must retain both fixed recipe constructions")
+test.check(immediateSetupCalls(groupedBody) == 2, "grouped source must preserve ordinary fallback in this slice")
+test.check(occurrences(storedBody, "\nfor.condition.") == 1 && occurrences(groupedBody, "\nfor.condition.") == 1, "controls must remain fused single traversals")
+test.check(immediateSetupCalls("  call ptr @.minyar.fn.minyar_sequence_map_77_make(ptr %source)\n") == 1, "setup-call oracle must reject a retained factory")
+test.check(!noMaterialization("  call ptr @minyar_record_new(i64 1)\n"), "whole-body oracle must reject a recipe record allocation")
+test.require(test.run([optimizer(frontend), "-passes=verify", "-disable-output", immediatePath + ".ll"], frontend.environment, "", immediatePath + ".immediate-verify", 30), "verify whole-body immediate sequence LLVM")
+
+// I02: source once, order, break, empty and all-rejected inputs.
+fixtures.executes(frontend, #"""
+    global CALLS: List<Integer> = [0, 0, 0]
+    global TRACE: List<Text> = [""]
+    function source(): List<Integer> { CALLS[0] += 1; TRACE[0] += "S"; return [1, 2, 3, 4] }
+    function double(value: Integer): Integer { CALLS[1] += 1; TRACE[0] += "M" + Text(value); return value * 2 }
+    function aboveFour(value: Integer): Boolean { CALLS[2] += 1; TRACE[0] += "K" + Text(value); return value > 4 }
+    function never(value: Integer): Boolean { CALLS[2] += 1; return false }
+    for value in source().map(double).filter(aboveFour) { print(value); break }
+    print(TRACE[0]); print(CALLS[0]); print(CALLS[1]); print(CALLS[2])
+    let empty: List<Integer> = []
+    for value in empty.map(double).filter(aboveFour) { fail("empty immediate source produced an item") }
+    for value in [1, 2].map(double).filter(never) { fail("all-rejected immediate source produced an item") }
+    print(CALLS[1]); print(CALLS[2])
+    """#, "6\nSM1K2M2K4M3K6\n1\n3\n3\n5\n5\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I03: managed type change, mixed acceptance, and rejected owner reset before
+// a later local assignment, repeated enough to expose stale temporary owners.
+fixtures.executes(frontend, #"""
+    record Label { text: Text; bytes: Bytes }
+    function render(value: Integer): Text { return "word" + Text(value) }
+    function label(word: Text): Label { return Label { text: word; bytes: Bytes(word) } }
+    function pair(label: Label): List<Label> { return [label, label] }
+    function keep(values: List<Label>): Boolean { return values[0].text != "word2" }
+    function never(word: Text): Boolean { return false }
+    let kept: List<List<Label>> = []
+    for repetition in 0..100 {
+        for word in [1, 2, 3].map(render).filter(never) { fail("rejected immediate reference escaped") }
+        let afterReject = [Bytes(128), Bytes(64)]
+        for values in [1, 2, 3].map(render).map(label).map(pair).filter(keep) {
+            let scratch = Bytes(64)
+            kept.add(values)
+            if values[0].text == "word1" { continue }
+        }
+    }
+    for index in 0..100 { let scratch = [Bytes(256), Bytes(128)] }
+    print(kept.length); print(kept[0][0].text); print(Text(kept[kept.length - 1][1].bytes))
+    """#, "200\nword1\nword3\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I04: replacing the source slot inside a transform must not invalidate its
+// reference input or the returned Text; accepted and rejected paths both run.
+fixtures.executes(frontend, #"""
+    record Box { text: Text }
+    global VALUES: List<List<Box>> = [[]]
+    function replace(box: Box): Text {
+        VALUES[0][0] = Box { text: "replacement" }
+        let churn = [Bytes(128), Bytes(64)]
+        return box.text
+    }
+    function keep(word: Text): Boolean { return word == "old!" }
+    let kept: List<Text> = []
+    for repetition in 0..100 {
+        VALUES[0] = [Box { text: "reject" + "!" }]
+        for word in VALUES[0].map(replace).filter(keep) { fail("wrong replaced item accepted") }
+        let afterReject = Bytes(128)
+        VALUES[0] = [Box { text: "old" + "!" }]
+        for word in VALUES[0].map(replace).filter(keep) { kept.add(word) }
+    }
+    print(kept.length); print(kept[0]); print(kept[kept.length - 1]); print(VALUES[0][0].text)
+    """#, "100\nold!\nold!\nreplacement\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I05: root the original source when its user binding is rebound. A fresh
+// unbound managed source exercises exact parser-owner transfer separately.
+fixtures.executes(frontend, #"""
+    function source(): List<Text> { return ["first" + "!", "second" + "!"] }
+    function same(word: Text): Text { return word }
+    function nonempty(word: Text): Boolean { return word.length > 0 }
+    let values = source()
+    for word in values.map(same) { values = ["new"]; print(word) }
+    for word in source().map(same).filter(nonempty) { print(word) }
+    print(values[0])
+    """#, "first!\nsecond!\nfirst!\nsecond!\nnew\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I06: fresh managed protocol current values plus continue, break, and return.
+fixtures.executes(frontend, #"""
+    record Words { count: Integer; calls: List<Integer> }
+    record Cursor { position: Integer; count: Integer; calls: List<Integer> }
+    global TRANSFORMS: List<Integer> = [0, 0]
+    function Words.iterator(): Cursor { self.calls[0] += 1; return Cursor { position: 0; count: self.count; calls: self.calls } }
+    function Cursor.advance(): Boolean { self.calls[1] += 1; self.position += 1; return self.position <= self.count }
+    function Cursor.current(): Text { self.calls[2] += 1; return "word" + Text(self.position) }
+    function tag(word: Text): Text { TRANSFORMS[0] += 1; return word + "!" }
+    function keep(word: Text): Boolean { TRANSFORMS[1] += 1; return word != "word2!" }
+    function first(calls: List<Integer>): Text {
+        let protected = Bytes(128)
+        for word in Words { count: 4; calls: calls }.map(tag).filter(keep) { return word }
+        return "missing"
+    }
+    let calls = [0, 0, 0]
+    let kept: List<Text> = []
+    for word in Words { count: 4; calls: calls }.map(tag).filter(keep) {
+        kept.add(word)
+        if word == "word1!" { continue }
+        break
+    }
+    print(kept.length); print(kept[0]); print(kept[1])
+    print(calls[0]); print(calls[1]); print(calls[2]); print(TRANSFORMS[0]); print(TRANSFORMS[1])
+    for index in 0..3 { calls[index] = 0 }
+    TRANSFORMS[0] = 0; TRANSFORMS[1] = 0
+    let returned = first(calls)
+    for index in 0..100 { let scratch = [Bytes(256), Bytes(128)] }
+    print(returned)
+    print(calls[0]); print(calls[1]); print(calls[2]); print(TRANSFORMS[0]); print(TRANSFORMS[1])
+    """#, "2\nword1!\nword3!\n1\n3\n3\n3\n3\nword1!\n1\n1\n1\n1\n1\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I07: both base and transform recovery retain ordinary checkpoints and clean
+// partial managed state. No exact frame-budget assumption is needed.
+fixtures.executes(frontend, #"""
+    use "calldepth" as depth
+    use "errors" as errors
+    global CALLS: List<Integer> = [0]
+    function deepList(): List<Integer> { return deepList() }
+    function deepText(): Text { return deepText() }
+    function same(value: Integer): Integer { return value }
+    function explode(value: Integer): Text {
+        CALLS[0] += 1
+        let protected = [Bytes(128), Bytes(64)]
+        return deepText()
+    }
+    let base = depth.run(64, function(): Integer {
+        for value in deepList().map(same) { return value }
+        return 0
+    })
+    print(errors.integerOk(base))
+    for repetition in 0..20 {
+        let attempt = depth.run(64, function(): Integer {
+            for word in [1, 2].map(explode) { CALLS[0] += 100 }
+            return 0
+        })
+        if errors.integerOk(attempt) { fail("immediate transform lost recovery") }
+    }
+    print(CALLS[0])
+    let fresh = depth.run(128, function(): Integer {
+        let total = 0
+        for value in [20, 22].map(same) { total += value }
+        return total
+    })
+    print(errors.integerValue(fresh)); print("still alive")
+    """#, "false\n20\n42\nstill alive\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I08: stored inner Integer->Text stage executes before immediate outer stages;
+// exactly its own one setup call remains in the whole consumer.
+fixtures.executes(frontend, #"""
+    global TRACE: List<Text> = [""]
+    function render(value: Integer): Text { TRACE[0] += "W" + Text(value); return Text(value) }
+    function decorate(word: Text): Text { TRACE[0] += "D" + word; return word + "!" }
+    function keep(word: Text): Boolean { TRACE[0] += "K" + word; return word != "2!" }
+    public function mixed(values: List<Integer>): Text {
+        let stored = values.map(render)
+        let result = ""
+        for word in stored.map(decorate).filter(keep) { result += word }
+        return result
+    }
+    print(mixed([1, 2, 3])); print(TRACE[0])
+    """#, "1!3!\nW1D1K1!W2D2K2!W3D3K3!\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediateMixedPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateMixedLLVM = io.readTextFile(immediateMixedPath + ".ll")
+let immediateMixedBody = functionBody(immediateMixedLLVM, functionSymbol(immediateMixedLLVM, "mixed"))
+test.check(immediateSetupCalls(immediateMixedBody) == 1, "stored-inner/immediate-outer consumer must retain only the stored factory")
+test.check(occurrences(immediateMixedBody, "\nfor.condition.") == 1, "mixed chain must use one traversal")
+
+// I09: custom map method remains ordinary and runs once; parentheses also
+// preserve the fallback path around an ordinary custom-source call.
+fixtures.executes(frontend, #"""
+    record Garden { values: List<Integer> }
+    global CALLS: List<Integer> = [0, 0, 0]
+    function Garden.map(amount: Integer): List<Integer> { CALLS[0] += 1; return self.values.appended(amount) }
+    function double(value: Integer): Integer { CALLS[1] += 1; return value * 2 }
+    function even(value: Integer): Boolean { CALLS[2] += 1; return value % 2 == 0 }
+    let garden = Garden { values: [1, 2] }
+    for value in garden.map(3).filter(even) { print(value) }
+    for value in (garden.map(4).map(double)) { print(value) }
+    print(CALLS[0]); print(CALLS[1]); print(CALLS[2])
+    """#, "2\n2\n4\n8\n2\n3\n3\n", levels, 0, "", true)
+immediateExecutions += 1
+
+// I10: 64 directly nested immediate stages; no stored construction remains.
+fixtures.executes(frontend, immediateBoundarySource(0, 64), "3\n128\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediateCapPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateCapLLVM = io.readTextFile(immediateCapPath + ".ll")
+let immediateCapBody = functionBody(immediateCapLLVM, functionSymbol(immediateCapLLVM, "boundary"))
+test.check(immediateSetupCalls(immediateCapBody) == 0, "64 immediate stages must eliminate all their setup calls")
+test.check(occurrences(immediateCapBody, "\nfor.condition.") == 1, "64 immediate stages must share one traversal")
+
+// I11: 63 stored stages + one immediate stage = combined accepted limit 64.
+fixtures.executes(frontend, immediateBoundarySource(63, 1), "3\n128\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediateCombinedPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateCombinedLLVM = io.readTextFile(immediateCombinedPath + ".ll")
+let immediateCombinedBody = functionBody(immediateCombinedLLVM, functionSymbol(immediateCombinedLLVM, "boundary"))
+test.check(immediateSetupCalls(immediateCombinedBody) == 63, "combined limit must retain only its 63 stored setup calls")
+
+// One discovery-only compilation. Same witness prefix is retained unchanged
+// in the following internal fixtures so generated declaration identity remains
+// stable; validate it again in the successful compilation's emitted module.
+let immediateWitness = "function same(value: Integer): Integer { return value }\nlet witness = [1].map(same)\n"
+test.require(fixtures.compile(frontend, immediateWitness), "discover immediate internal factory regression target")
+let immediateWitnessPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateFactory = immediateWitnessFactory(io.readTextFile(immediateWitnessPath + ".ll"))
+
+// I12: compiler-internal regression. Empty FIRST match arm needs the deepest
+// factory parameter context, even though all wrapper calls are removed.
+// Local callback shadowing of that actual identifier must decline optimization.
+let immediateContext = test.replace(#"""
+    public function contextual(input: Maybe<Integer>): Integer {
+        let total = 0
+        for value in FACTORY_TOKEN(match input {
+            None { [] }
+            Some(number) { [number] }
+        }) { total += value }
+        return total
+    }
+    public function shadowed(): Integer {
+        let FACTORY_TOKEN: Callback<List<Integer>, List<Integer>> = function(values: List<Integer>): List<Integer> {
+            return values.appended(9)
+        }
+        let total = 0
+        for value in FACTORY_TOKEN([1]) { total += value }
+        return total
+    }
+    print(contextual(None)); print(contextual(Some(7))); print(shadowed())
+    """#, "FACTORY_TOKEN", immediateFactory)
+fixtures.executes(frontend, immediateWitness + immediateContext, "0\n7\n10\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediateContextPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateContextLLVM = io.readTextFile(immediateContextPath + ".ll")
+test.check(immediateWitnessFactory(immediateContextLLVM) == immediateFactory, "internal context fixture changed its discovered factory identity")
+let immediateContextBody = functionBody(immediateContextLLVM, functionSymbol(immediateContextLLVM, "contextual"))
+let immediateShadowBody = functionBody(immediateContextLLVM, functionSymbol(immediateContextLLVM, "shadowed"))
+test.check(immediateSetupCalls(immediateContextBody) == 0 && test.contains(immediateContextBody, "; minyar-sequence: immediate named recipe setup removed"), "context regression must exercise removed setup rather than ordinary fallback")
+test.check(!test.contains(immediateShadowBody, "; minyar-sequence: immediate named recipe setup removed") && test.contains(immediateShadowBody, "@minyar_callback_check"), "local callback shadow must preserve ordinary callback dispatch")
+
+// R01/R02: immediate and combined caps must reject the 65th stage with no LLVM.
+fixtures.rejects(frontend, immediateBoundarySource(0, 65), "a lazy sequence supports at most 64 map and filter stages", true)
+immediateRejections += 1
+fixtures.rejects(frontend, immediateBoundarySource(64, 1), "a lazy sequence supports at most 64 map and filter stages", true)
+immediateRejections += 1
+
+// R03: deliberate compiler-internal bad argument, same eventual Integer item
+// type but wrong source type. Erasure must preserve the trusted factory's type.
+fixtures.rejects(frontend, immediateWitness + "let wrong: Set<Integer> = Set()\nwrong.add(1)\nfor value in " + immediateFactory + "(wrong) { print(value) }\n", "an argument passed to " + immediateFactory + " has the wrong type", true)
+immediateRejections += 1
+
+// R04: a multi-argument call must fall back before any destructive parse.
+fixtures.rejects(frontend, immediateWitness + "for value in " + immediateFactory + "([1], [2]) { print(value) }\n", immediateFactory + " expects 1 argument, but received 2", true)
+immediateRejections += 1
+
+// R05: parallel header must retain current lazy-sequence rejection.
+fixtures.rejects(frontend, "function same(value: Integer): Integer { return value }\nparallel for value in [1, 2].map(same) {}\n", "parallel for needs an Integer range", true)
+immediateRejections += 1
+
+// R06: preserve effect checking through direct transform calls in a threaded
+// feature context. Local managed work is not itself asserted unsafe.
+fixtures.rejects(frontend, #"""
+    use "machine" as machine
+    function unsafe(value: Integer): Integer { return machine.address(Bytes(value)) }
+    thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer {
+        let total = 0
+        for value in [seed].map(unsafe) { total += value }
+        return total
+    }
+    function main() {
+        let bytes = Bytes(8)
+        let frozen = freezeBytes(bytes)
+        let channel = bytesChannel(4096, 8)
+        let workerHandle = startThread(worker, 7, frozen, channel)
+        print(joinThread(workerHandle))
+    }
+    """#, "unsafe thread effect", true)
+immediateRejections += 1
+
+// R07: truncated internal factory call must retain ordinary source diagnostics;
+// the optimization recognizer must not fail with a test-only delimiter error.
+let immediateTruncated = fixtures.compile(frontend, immediateWitness + "for value in " + immediateFactory + "([1, 2]\n")
+test.check(immediateTruncated.status == 1 && immediateTruncated.output == "" && immediateTruncated.errorOutput != "", "incomplete internal sequence call must fail with a diagnostic")
+// Using the fixture reject helper here would compile this prefix twice.
+test.check(!test.contains(immediateTruncated.errorOutput, "this test") && !test.contains(immediateTruncated.errorOutput, "List position") && !test.contains(immediateTruncated.errorOutput, "record position") && !test.contains(immediateTruncated.errorOutput, "AddressSanitizer") && !test.contains(immediateTruncated.errorOutput, "runtime error:") && !test.contains(immediateTruncated.errorOutput, "Segmentation fault"), "incomplete sequence source must not expose internal probe diagnostics")
+test.check(immediateFiles.pathSize(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll") < 0, "incomplete sequence source emitted LLVM")
+immediateRejections += 1
+
+// I13: a public dynamic-List consumer uses qualified imported named transforms.
+// Construction of its argument Lists is outside the inspected consumer body.
+// Unique transform names permit exact call-line assertions without extending
+// functionSymbol's existing root-module matcher.
+io.writeTextFile(frontend.compiler.directory + "/immediate-extra-qualified-transforms.min", test.sourceModules(#"""
+    public function immediateExtraImportedTriple(value: Integer): Integer { return value * 3 }
+    public function immediateExtraImportedAtLeastNine(value: Integer): Boolean { return value >= 9 }
+    """#))
+fixtures.executes(frontend, #"""
+    use "./immediate-extra-qualified-transforms.min" as immediateExtraQualified
+    public function immediateExtraQualifiedConsumer(values: List<Integer>): Integer {
+        let total = 0
+        for value in values.map(immediateExtraQualified.immediateExtraImportedTriple).filter(immediateExtraQualified.immediateExtraImportedAtLeastNine) {
+            total += value
+        }
+        return total
+    }
+    print(immediateExtraQualifiedConsumer([]))
+    print(immediateExtraQualifiedConsumer([1]))
+    print(immediateExtraQualifiedConsumer([1, 2, 3, 4]))
+    """#, "0\n0\n21\n", levels, 0, "", true)
+immediateExecutions += 1
+let immediateExtraQualifiedPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let immediateExtraQualifiedLLVM = io.readTextFile(immediateExtraQualifiedPath + ".ll")
+let immediateExtraQualifiedBody = functionBody(immediateExtraQualifiedLLVM, functionSymbol(immediateExtraQualifiedLLVM, "immediateExtraQualifiedConsumer"))
+test.check(immediateSetupCalls(immediateExtraQualifiedBody) == 0, "qualified imported immediate transforms must eliminate all consumer factory calls")
+test.check(noMaterialization(immediateExtraQualifiedBody), "whole qualified imported immediate consumer including preheader must not allocate recipes or intermediate collections")
+test.check(test.contains(immediateExtraQualifiedBody, "; minyar-sequence: immediate named recipe setup removed"), "qualified imported transforms must exercise immediate setup removal")
+test.check(occurrences(immediateExtraQualifiedBody, "\nfor.condition.") == 1, "qualified imported immediate transforms must share one traversal")
+let immediateExtraImportedMapCalls = 0
+let immediateExtraImportedFilterCalls = 0
+for line in test.lines(immediateExtraQualifiedBody) {
+    if test.contains(line, "call i64 @") && test.contains(line, "immediateExtraImportedTriple") { immediateExtraImportedMapCalls += 1 }
+    if test.contains(line, "call zeroext i1 @") && test.contains(line, "immediateExtraImportedAtLeastNine") { immediateExtraImportedFilterCalls += 1 }
+}
+test.check(immediateExtraImportedMapCalls == 1 && immediateExtraImportedFilterCalls == 1, "qualified imported immediate stages must call each original concrete transform directly once in the static loop")
+test.check(!test.contains(immediateExtraQualifiedBody, "_apply") && !test.contains(immediateExtraQualifiedBody, "@minyar_callback_") && !test.contains(immediateExtraQualifiedBody, "call i64 %") && !test.contains(immediateExtraQualifiedBody, "call zeroext i1 %") && !test.contains(immediateExtraQualifiedBody, "call ptr %"), "qualified imported immediate traversal must retain direct named dispatch")
+
+// R08: the real discovered one-argument factory with no arguments must decline
+// preflight before emission and preserve the ordinary typed arity diagnostic.
+// This specifically retains the corrected `closing <= cursor + 2` boundary.
+fixtures.rejects(frontend, immediateWitness + "for value in " + immediateFactory + "() { print(value) }\n", immediateFactory + " expects 1 argument, but received 0", true)
+immediateRejections += 1
+
+test.check(immediateExecutions == 13 && immediateRejections == 8, "immediate sequence prototype fixture inventory")
 
 fixtures.executes(frontend, io.readTextFile("examples/gallery/sequences.min"), "The town settles into evening.\nThere is a light in window 1.\nThere is a light in window 3.\nThere is a light in window 5.\nThere is a light in window 7.\n", levels, 0, "", true)
 test.removeTree(frontend.compiler.directory)

@@ -160,8 +160,12 @@ early exits, type-changing maps, rejected managed items, reuse, Integer limits
 and the 64-stage boundary. Generic named transforms cover inferred item/seed
 types, bounds, instantiated bodies, aliases, imports and specialization reuse.
 IR assertions prove one loop with direct unboxed transforms and no intermediate
-List or callback dispatch; the LLVM verifier checks the emitted module. The
-check retains `build/sequences-evidence.ll`, `build/sequences-loop.ll` and their
+List or callback dispatch; the LLVM verifier checks the emitted module.
+Whole-function checks compare directly consumed named `for` chains with stored
+and parenthesized controls: immediate wrappers disappear while the controls
+retain setup. Cases cover mixed stored/immediate order, combined 64/65-stage
+limits, source replacement, contextual argument checks and recovery. The check
+retains `build/sequences-evidence.ll`, `build/sequences-loop.ll` and their
 `sequences-generic-*` counterparts.
 `check-sequences-sanitize` adds ASan/UBSan.
 

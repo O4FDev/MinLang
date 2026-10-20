@@ -60,8 +60,9 @@ these bounds do not add a conformance object or dynamic dispatch.
 
 ## What the compiler emits
 
-The consuming `for` or `fold` unwraps its recipe once and emits one loop. Map
-functions and filter predicates appear as concrete calls in that loop. A false
+The consuming `for` or `fold` emits one loop. Stored recipes are unwrapped once;
+eligible named chains used directly as a `for` source skip their recipe setup.
+Map functions and filter predicates appear as concrete calls in that loop. A false
 filter branches to the loop's step block, skipping all later stages and the
 body. There is no intermediate List, callback record or dynamic dispatch.
 
@@ -108,15 +109,41 @@ function, plus a 33-instruction setup wrapper with two recipe allocations.
 Run `python3 experiments/iteration-study/measure.py --build` on an idle Linux
 Boat box through `bx`. It retains source, commands, raw/optimized LLVM, assembly
 and a machine-readable report under `build/iteration-study`. It also reports
-fixed setup separately: this two-stage pipeline creates two recipe records
-outside its consuming loop.
+fixed setup separately: this study consumes its two-stage pipeline with `fold`,
+which still creates two recipe records outside its consuming loop.
 Add `--scope-owners` for the public eager launcher's lowering; its default output
 is `build/iteration-study-scope`. Use `--output DIR` to retain separate runs.
 Each report records the compiler and source hashes.
 
-Recipes and range values are ordinary reference records. Building a recipe
-allocates one small source-holding record per stage, once; a user `iterator()`
-may allocate one cursor per traversal. These fixed setup costs are not erased
-by this implementation. Map/filter traversal adds no per-item allocation of
-its own. A transform that returns new Text, records or Lists still pays for
-those values, exactly as an ordinary call does.
+The separate `scalar-immediate.min` fixture consumes the same named chain
+directly in `for`. An isolated before/after comparison with LLVM 23.1.2 removed
+both setup record allocation sites. Its optimized static counts were:
+
+| Ownership mode | Whole function before | Whole function after | Handwritten | Loop after / handwritten |
+| --- | ---: | ---: | ---: | ---: |
+| Legacy | 64 | 46 | 46 | 31 / 31 |
+| Scope owners | 99 | 58 | 58 | 31 / 31 |
+
+Both inputs still produced 3104 and 3300. These are static LLVM instruction
+counts, not elapsed time or retired instructions. The privileged counter probe
+was unavailable for the box's kernel; the instruction runner stopped before
+compiling its separate benchmark. No speed result is claimed.
+
+To retain this fixture separately, pass `--fixture
+experiments/iteration-study/scalar-immediate.min --output DIR` to `measure.py`,
+then run `python3 experiments/iteration-study/audit-immediate.py DIR
+--expect-setup-records 0`. The audit includes the whole consumer and actually
+called factory bodies, while ignoring unused emitted factory definitions.
+Use distinct before/after and ownership-mode output directories. The separate
+`experiments/iteration-instructions` runner retains the bounded counter protocol.
+
+Stored map/filter recipes allocate one small source-holding record per stage.
+A named chain used directly as the whole source of an eligible ordinary `for`
+removes its immediate factory calls and recipe records. Stored inner recipes
+keep their setup. Chains passed to `fold`, parenthesized or unsupported source
+forms, and compilations using threads retain ordinary recipe construction.
+
+Range/source records and a user `iterator()`'s cursor keep their own allocation
+costs. Map/filter traversal adds no per-item allocation of its own. A transform
+that returns new Text, records or Lists still pays for those values, exactly as
+an ordinary call does.
