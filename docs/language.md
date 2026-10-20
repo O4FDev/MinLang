@@ -1582,3 +1582,11 @@ See [Minyar style](style.md) for examples and the preservation checks.
 `minyar lsp --stdio` provides live compiler diagnostics, hover documentation,
 definitions, completion, symbols and formatting to an editor. See
 [editor tooling](editor.md) for setup and the current navigation capabilities.
+
+`minyar run --watch` rebuilds a project after source edits. Add `--hot` to replace
+function implementations while the process and its values stay alive. Keep state
+in ordinary records, Lists and globals; pass it to the functions you are editing.
+The [lanterns gallery](../examples/gallery/lanterns.min) follows this shape.
+Changes to types, declarations or initialization require a fresh run. See
+[live programming](cli.md#live-programming) for the reload boundary and its
+development-time costs.

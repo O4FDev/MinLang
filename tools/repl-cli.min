@@ -1,0 +1,408 @@
+// Persistent native REPL. Only accepted declarations are cumulative; each
+// top-level action runs once inside the host process, with shared managed roots.
+use "./driver-support.min" as host
+use "./editor-source.min" as editor
+use "./live-transform.min" as live
+use "process" as process
+use "system" as system
+use "files" as files
+
+function readLine(): Text { native "replhost" }
+function isTerminal(): Boolean { native "replhost" }
+function evaluate(path: Text, entry: Text): Integer { native "replhost" }
+
+record Binding { name: Text; cell: Text; type: Text; declaration: Text }
+record Function { name: Text; source: Text }
+record Session { directory: Text; root: Text; compiler: Text; clang: Text; identity: Text; generation: Integer; release: Boolean; bindings: List<Binding>; functions: List<Function>; imports: List<Text>; roots: List<Text> }
+record Rewritten { text: Text; error: Text }
+record Prepared { declarations: Text; action: Text; bindings: List<Binding>; functions: List<Function>; imports: List<Text>; expression: Boolean; error: Text }
+record NativeImage { llvm: Text; roots: List<Text>; error: Text }
+
+function diagnostic(message: Text) { system.writeStandardError("[repl] " + message + "\n") }
+// Rehash bytes rather than trusting timestamps: an imported record can remain
+// alive in a cell while a new image is compiled. Platform modules count too.
+function toolchainIdentity(root: Text, compiler: Text): Text {
+    let executable = host.load(compiler)
+    if executable.error != 0 || !host.isDirectory(root + "/library") { return "" }
+    let pieces = ["repl-toolchain-v1\n", host.hashBytes(executable.data), "\n"]
+    let directories = [root + "/library"]
+    let visited: List<Text> = []
+    let paths: List<Text> = []
+    let index = 0
+    while index < directories.length {
+        if directories.length > 16384 || paths.length > 100000 { return "" }
+        let directory = directories[index]
+        let status = host.fileStatus(directory)
+        if status.kind != "d" { return "" }
+        let key = status.device + ":" + status.inode
+        index += 1
+        if host.listed(visited, key) { continue }
+        visited.add(key)
+        let names = files.list(directory)
+        if files.lastError() != 0 { return "" }
+        for name in names.sorted() {
+            let path = directory + "/" + name
+            let kind = host.fileStatus(path).kind
+            if kind == "d" { directories.add(path) }
+            else if name.endsWith(".min") {
+                if kind != "f" { return "" }
+                paths.add(path)
+            }
+        }
+    }
+    for path in paths.sorted() {
+        let loaded = host.load(path)
+        if loaded.error != 0 { return "" }
+        pieces.add(Text(path.byteLength) + ":" + path + "\n")
+        pieces.add(host.hashBytes(loaded.data) + "\n")
+    }
+    return host.hashBytes(Bytes(joinText(pieces)))
+}
+function toolchainUnchanged(session: Session): Boolean {
+    let current = toolchainIdentity(session.root, session.compiler)
+    if current == "" || current != session.identity {
+        diagnostic("the compiler or bundled library changed; restart minyar repl before evaluating more code")
+        return false
+    }
+    return true
+}
+function bundledImport(root: Text, literal: Text): Boolean {
+    let raw = Bytes(literal)
+    if raw.length < 3 || raw[0] != 34 || raw[raw.length - 1] != 34 { return false }
+    for index in 1..(raw.length - 1) {
+        let byte = raw[index]
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 45) { return false }
+    }
+    let name = Text(raw.slice(1, raw.length - 1))
+    if host.isFile(root + "/library/" + name + ".min") { return true }
+    return host.hostName() == "Darwin" && host.isFile(root + "/library/platform/macos/" + name + ".min")
+}
+function help() {
+    print("""
+    Minyar native REPL
+    Type an expression, print(value), a let binding, an assignment, or a function.
+    Values and mutations persist; earlier statements are never replayed.
+    Literal Integer, Float, Boolean, Character and Text bindings infer their type.
+    Other initializers need an annotation: let values: List<Integer> = [1, 2]
+    Functions may be replaced. Braces, parentheses and brackets support multiline input.
+    Imports use quoted bundled package names, such as use "text" as text; paths,
+    raw strings and interpolation are rejected. Compiler and library bytes are frozen
+    for this session; changing them requires a restart. Records, globals, callbacks and threads
+    are not supported in this session. Avoid local bindings that shadow session values;
+    use explicit print arguments rather than interpolation of session values.
+    Compile errors leave accepted declarations and values available.
+    Runtime failures and exit() end the session. Code images remain loaded until exit.
+    :help   Show this help
+    :quit   End the session (EOF also exits)
+    :reset  Restart minyar repl for an empty session
+    Options: --release compiles each submission with O2 (default O0).
+    """)
+}
+function tokens(text: Text): List<editor.Token> {
+    let result: List<editor.Token> = []
+    for token in editor.scan(text).tokens { if token.kind != 5 && token.kind != 6 { result.add(token) } }
+    return result
+}
+function bindingNamed(bindings: List<Binding>, name: Text): Integer {
+    for index in 0..bindings.length { if bindings[index].name == name { return index } }
+    return -1
+}
+function rewrite(text: Text, bindings: List<Binding>): Rewritten {
+    let parsed = editor.scan(text)
+    if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
+    let significant = tokens(text)
+    let shadows: List<Text> = []
+    let header = significant.length > 0 && significant[0].text == "function"
+    if significant.length > 1 && significant[0].text == "public" && significant[1].text == "function" { header = true }
+    for index in 0..significant.length {
+        let token = significant[index]
+        if token.kind == 4 && token.text == "{" { header = false }
+        if header && index + 1 < significant.length && significant[index + 1].text == ":" { shadows.add(token.text) }
+        if (token.text == "let" || token.text == "constant" || token.text == "for") && index + 1 < significant.length {
+            if bindingNamed(bindings, significant[index + 1].text) >= 0 {
+                return Rewritten { text: ""; error: "a local binding cannot shadow session value '" + significant[index + 1].text + "' yet" }
+            }
+        }
+    }
+    let parts: List<Text> = []
+    let start = 0
+    for index in 0..significant.length {
+        let token = significant[index]
+        let binding = bindingNamed(bindings, token.text)
+        let member = index > 0 && significant[index - 1].text == "."
+        let label = index + 1 < significant.length && significant[index + 1].text == ":"
+        if token.kind == 1 && binding >= 0 && !member && !label && !host.listed(shadows, token.text) {
+            parts.add(host.textSlice(text, start, token.start))
+            parts.add(bindings[binding].cell + "[0]")
+            start = token.end
+        }
+    }
+    parts.add(host.textSlice(text, start, text.byteLength))
+    return Rewritten { text: joinText(parts); error: "" }
+}
+function inferred(expression: Text): Text {
+    let values = tokens(expression)
+    let index = 0
+    if values.length == 2 && values[0].text == "-" { index = 1 }
+    else if values.length != 1 { return "" }
+    let token = values[index]
+    if token.kind == 2 {
+        if !token.text.startsWith("0x") && !token.text.startsWith("0o") && (host.hasText(token.text, ".") || host.hasText(token.text, "e") || host.hasText(token.text, "E")) { return "Float" }
+        return "Integer"
+    }
+    if index != 0 { return "" }
+    if token.kind == 3 { if token.text.startsWith("'") { return "Character" }; return "Text" }
+    if token.text == "true" || token.text == "false" { return "Boolean" }
+    return ""
+}
+function prepare(session: Session, text: Text): Prepared {
+    let prepared = Prepared { declarations: ""; action: ""; bindings: []; functions: []; imports: []; expression: false; error: "" }
+    for binding in session.bindings { prepared.bindings.add(binding) }
+    for function in session.functions { prepared.functions.add(function) }
+    for item in session.imports { prepared.imports.add(item) }
+    let significant = tokens(text)
+    if significant.length == 0 { return prepared }
+    for token in significant {
+        if token.kind == 1 && token.text.startsWith("_repl_") { prepared.error = "names beginning with _repl_ are reserved for session storage"; return prepared }
+    }
+    let first = 0
+    if significant[0].text == "public" && significant.length > 1 { first = 1 }
+    let kind = significant[first].text
+    if kind == "parallel" && significant.length > first + 1 && significant[first + 1].text == "function" {
+        prepared.error = "parallel function declarations require a standalone program"
+        return prepared
+    }
+    if host.listed(["record", "choice", "type", "capability", "conform", "global", "constant", "test"], kind) {
+        prepared.error = "this REPL accepts let bindings, functions and actions; layouts and module declarations require a source file"
+        return prepared
+    }
+    if kind == "use" {
+        if significant.length != 4 || significant[1].kind != 3 || significant[2].text != "as" || significant[3].kind != 1 {
+            prepared.error = "submit one import at a time: use \"text\" as text"; return prepared
+        }
+        if !bundledImport(session.root, significant[1].text) {
+            prepared.error = "imports require an ordinary quoted bundled package name; paths, raw strings, interpolation and missing packages are not supported"
+            return prepared
+        }
+        if bindingNamed(prepared.bindings, significant[3].text) >= 0 {
+            prepared.error = "a session value already uses this import alias"; return prepared
+        }
+        if !host.listed(prepared.imports, text) { prepared.imports.add(text) }
+    } else if kind == "function" {
+        if significant.length <= first + 2 || significant[first + 1].kind != 1 || significant[first + 2].text != "(" || significant[first + 1].text == "main" {
+            prepared.error = "submit a named function with parameters; main is reserved for the session"; return prepared
+        }
+        let name = significant[first + 1].text
+        if bindingNamed(prepared.bindings, name) >= 0 { prepared.error = "a session value already uses the name '" + name + "'"; return prepared }
+        let depth = 0
+        let opened = false
+        let finished = false
+        for token in significant {
+            if finished && token.text != ";" { prepared.error = "submit one function declaration at a time"; return prepared }
+            if token.kind != 3 {
+                if token.text == "{" { depth += 1; opened = true }
+                if token.text == "}" { depth -= 1; if opened && depth == 0 { finished = true } }
+            }
+        }
+        let replaced = false
+        for index in 0..prepared.functions.length {
+            if prepared.functions[index].name == name { prepared.functions[index] = Function { name: name; source: text }; replaced = true }
+        }
+        if !replaced { prepared.functions.add(Function { name: name; source: text }) }
+    } else if kind == "let" {
+        if first != 0 || significant.length < 4 || significant[1].kind != 1 { prepared.error = "expected let NAME = value or let NAME: Type = value"; return prepared }
+        let name = significant[1].text
+        if bindingNamed(prepared.bindings, name) >= 0 { prepared.error = "session value '" + name + "' already exists; assign to it without let"; return prepared }
+        for function in prepared.functions { if function.name == name { prepared.error = "a function already uses the name '" + name + "'"; return prepared } }
+        let equal = 2
+        while equal < significant.length && significant[equal].text != "=" { equal += 1 }
+        if equal >= significant.length || equal + 1 >= significant.length || (equal > 2 && significant[2].text != ":") {
+            prepared.error = "a binding needs = followed by an initializer"; return prepared
+        }
+        let round = 0
+        for token in significant {
+            if token.kind != 3 {
+                if token.text == "(" || token.text == "[" || token.text == "{" { round += 1 }
+                if token.text == ")" || token.text == "]" || token.text == "}" { round -= 1 }
+                if token.text == ";" && round == 0 { prepared.error = "submit a binding separately from other statements"; return prepared }
+            }
+        }
+        let initializer = host.strip(host.textSlice(text, significant[equal].end, significant[significant.length - 1].end))
+        let type = ""
+        if equal > 2 { type = host.strip(host.textSlice(text, significant[2].end, significant[equal].start)) }
+        else { type = inferred(initializer) }
+        if type == "" { prepared.error = "this initializer needs a type: let " + name + ": Type = value"; return prepared }
+        let rewritten = rewrite(initializer, session.bindings)
+        if rewritten.error != "" { prepared.error = rewritten.error; return prepared }
+        let cell = "_repl_cell_" + Text(prepared.bindings.length)
+        prepared.bindings.add(Binding { name: name; cell: cell; type: type; declaration: "global " + cell + ": List<" + type + "> = [(" + rewritten.text + ")]\n" })
+    } else {
+        let rewritten = rewrite(text, prepared.bindings)
+        if rewritten.error != "" { prepared.error = rewritten.error; return prepared }
+        prepared.action = rewritten.text
+        prepared.expression = !host.listed(["print", "if", "while", "for", "return", "break", "continue", "exit", "fail"], kind)
+        for token in significant { if host.listed(["=", "+=", "-=", "*=", "/=", "%="], token.text) { prepared.expression = false } }
+    }
+    let declarations: List<Text> = []
+    for item in prepared.imports { declarations.add(item + "\n") }
+    for binding in prepared.bindings { declarations.add(binding.declaration) }
+    for function in prepared.functions {
+        let rewritten = rewrite(function.source, prepared.bindings)
+        if rewritten.error != "" { prepared.error = rewritten.error; return prepared }
+        declarations.add(rewritten.text + "\n")
+    }
+    prepared.declarations = joinText(declarations)
+    return prepared
+}
+function incomplete(text: Text): Boolean {
+    let parsed = editor.scan(text)
+    if parsed.error != "" { return true }
+    let stack: List<Text> = []
+    for token in parsed.tokens {
+        if token.kind != 4 { continue }
+        if token.text == "(" || token.text == "[" || token.text == "{" { stack.add(token.text) }
+        if token.text == ")" || token.text == "]" || token.text == "}" {
+            if stack.length == 0 { return false }
+            let opening = stack[stack.length - 1]
+            if (token.text == ")" && opening != "(") || (token.text == "]" && opening != "[") || (token.text == "}" && opening != "{") { return false }
+            stack.pop()
+        }
+    }
+    return stack.length != 0
+}
+function renameEntry(text: Text, entry: Text): Text {
+    let data = Bytes(text)
+    let pieces: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < data.length {
+        if data[index] == 59 { while index < data.length && data[index] != 10 { index += 1 }; continue }
+        if data[index] == 34 {
+            index += 1
+            while index < data.length { if data[index] == 92 { index += 2 } else if data[index] == 34 { index += 1; break } else { index += 1 } }
+            continue
+        }
+        if data[index] == 64 && index + 5 <= data.length && Text(data.slice(index, index + 5)) == "@main" {
+            let end = index + 5
+            if end == data.length || !(editor.word(data[end]) || editor.digit(data[end]) || data[end] == 46 || data[end] == 36 || data[end] == 45) {
+                pieces.add(Text(data.slice(start, index))); pieces.add("@" + entry); start = end; index = end; continue
+            }
+        }
+        index += 1
+    }
+    pieces.add(Text(data.slice(start, data.length)))
+    return joinText(pieces)
+}
+function nativeImage(raw: Text, session: Session, entry: Text): NativeImage {
+    let roots: List<Text> = []
+    for root in session.roots { roots.add(root) }
+    if host.hasText(raw, "; minyar-callback-runtime: 1") || host.hasText(raw, "; minyar-sort-callback-runtime: 1") || host.hasText(raw, "; minyar-cycle-runtime: 1") {
+        return NativeImage { llvm: ""; roots: roots; error: "callbacks and cyclic/managed-thread runtimes require a standalone program" }
+    }
+    let kept: List<Text> = []
+    for line in host.lines(raw) {
+        if !host.strip(line).startsWith("call void @.minyar.constants.release()") && !host.strip(line).startsWith("call void @minyar_initialize_arguments(") { kept.add(line + "\n") }
+    }
+    let transformed = live.transform(joinText(kept), session.generation, true)
+    if transformed.error != "" { return NativeImage { llvm: ""; roots: roots; error: transformed.error } }
+    let output: List<Text> = []
+    for line in host.lines(transformed.llvm) {
+        let changed = line
+        if line.startsWith("@\"minyar.constant|") {
+            let equal = host.findText(line, " = global ", 0)
+            if equal >= 0 {
+                let name = host.textSlice(line, 0, equal)
+                if host.listed(session.roots, name) {
+                    let words = host.words(host.textSlice(line, equal + 10, line.byteLength))
+                    if words.length != 2 { return NativeImage { llvm: ""; roots: roots; error: "unsupported persistent global cell" } }
+                    changed = name + " = external global " + words[0]
+                } else { roots.add(name) }
+            }
+        }
+        output.add(changed + "\n")
+    }
+    return NativeImage { llvm: renameEntry(joinText(output), entry); roots: roots; error: "" }
+}
+function compile(session: Session, prepared: Prepared, wrapped: Boolean, llvm: Text, errors: Text): Integer {
+    let action = host.strip(prepared.action)
+    if wrapped {
+        let significant = tokens(action)
+        if significant.length > 0 { action = host.textSlice(action, 0, significant[significant.length - 1].end) }
+        action = "print(" + action + ")"
+    }
+    // Keep module qualification stable before the first user import or public
+    // function: the compiler must never switch the names of persistent cells.
+    host.writeBytes(session.directory + "/session.min", Bytes("use \"process\" as _repl_process\n" + prepared.declarations + "\n" + action + "\n"))
+    let command = [session.compiler, session.directory + "/session.min", llvm, "--bounded-owners", "32", "--library", session.root + "/library"]
+    if host.hostName() == "Darwin" { command.add("--library"); command.add(session.root + "/library/platform/macos") }
+    return host.spawn(command, [], true, session.directory + "/compiler.stdout", errors, 180)
+}
+function submit(session: Session, text: Text) {
+    let prepared = prepare(session, text)
+    if prepared.error != "" { diagnostic(prepared.error); return }
+    if prepared.declarations == "" && prepared.action == "" { return }
+    session.generation += 1
+    let prefix = session.directory + "/generation-" + Text(session.generation)
+    let errors = prefix + ".errors"
+    if !toolchainUnchanged(session) { return }
+    let status = compile(session, prepared, prepared.expression, prefix + ".raw.ll", errors)
+    if status != 0 && prepared.expression {
+        if !toolchainUnchanged(session) { return }
+        status = compile(session, prepared, false, prefix + ".raw.ll", errors)
+    }
+    if status != 0 { system.writeStandardError(host.readText(errors)); return }
+    let entry = "minyar.repl.entry." + Text(session.generation)
+    let image = nativeImage(host.readText(prefix + ".raw.ll"), session, entry)
+    if image.error != "" { diagnostic(image.error); return }
+    host.writeBytes(prefix + ".ll", Bytes(image.llvm))
+    let command = [session.clang, "-shared", "-fPIC", "-Wno-override-module"]
+    if session.release { command.add("-O2") } else { command.add("-O0") }
+    if host.hostName() == "Darwin" { command.add("-Wl,-undefined,dynamic_lookup") }
+    for item in [prefix + ".ll", "-o", prefix + ".so"] { command.add(item) }
+    status = host.spawn(command, [], true, session.directory + "/link.stdout", errors, 180)
+    if status != 0 { system.writeStandardError(host.readText(errors)); return }
+    if !toolchainUnchanged(session) { return }
+    if evaluate(prefix + ".so", entry) != 0 { return }
+    session.bindings = prepared.bindings
+    session.functions = prepared.functions
+    session.imports = prepared.imports
+    session.roots = image.roots
+}
+function runSession() {
+    let release = false
+    for index in 0..process.argumentCount() {
+        let argument = process.argument(index)
+        if argument == "--help" || argument == "-h" { help(); return }
+        if argument == "--release" { release = true }
+        else { host.stop("unknown repl option: " + argument) }
+    }
+    let root = system.getenv("MINYAR_PROJECT_DIR")
+    if root == "" { host.stop("cannot locate the REPL toolchain") }
+    let compiler = root + "/build/minyarc"
+    let identity = toolchainIdentity(root, compiler)
+    if identity == "" { host.stop("cannot freeze the compiler and bundled library for this REPL session") }
+    let session = Session { directory: host.temporaryDirectory("", "minyar-repl-"); root: root; compiler: compiler; clang: host.pinnedLlvm(host.selectedClang()); identity: identity; generation: 0; release: release; bindings: []; functions: []; imports: []; roots: [] }
+    let terminal = isTerminal()
+    if terminal { print("Minyar native REPL. Type :help for help; :quit to finish.") }
+    let pending = ""
+    while true {
+        if terminal { if pending == "" { system.writeStandardError("> ") } else { system.writeStandardError("... ") } }
+        let line = readLine()
+        if line == "" { if pending != "" { diagnostic("input ended before the submission was complete") }; break }
+        let stripped = host.strip(line)
+        if pending == "" && stripped.startsWith(":") {
+            if stripped == ":quit" { break }
+            if stripped == ":help" { help() }
+            else if stripped == ":reset" { diagnostic("restart minyar repl to reset native code and managed state") }
+            else { diagnostic("unknown command; type :help") }
+            continue
+        }
+        pending += line
+        if pending.byteLength > 1024 * 1024 { diagnostic("submission exceeds 1 MiB"); pending = ""; continue }
+        if incomplete(pending) { continue }
+        if tokens(pending).length > 0 { submit(session, pending) }
+        pending = ""
+    }
+    host.cleanup()
+}
+runSession()

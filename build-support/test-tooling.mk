@@ -36,8 +36,8 @@ build/tooling/tools/build-test-runtime: TOOL_LIBS =
 build/tooling/tools/clang-driver: build/tooling/tools/clang-driver.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c runtime/minyar_native.h
 	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c -pthread -lm -o $@
 
-build/tooling/tools/project-cli: build/tooling/tools/project-cli.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c runtime/minyar_native.h
-	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c -pthread -lm -o $@
+build/tooling/tools/project-cli: build/tooling/tools/project-cli.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/live-watch-host.c runtime/minyar_native.h
+	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/live-watch-host.c -pthread -lm -o $@
 
 # install.mk is included before these shared objects are defined.
 build/tooling/tools/install-cli: $(MINYAR_TOOL_NATIVE_OBJECTS)

@@ -111,3 +111,11 @@ The incremental driver has been tested on macOS ARM64 and through ownership
 policy/cache-edit checks on Linux ARM64 and x86-64. The Linux runs used a local
 VM, with x86-64 instruction translation; they establish selected correctness,
 not native deployment performance. Windows is unsupported.
+
+Project `run --watch` reuses the same incremental frontend cache. With `--hot`,
+the initial executable exports its state and runtime, and later builds compile
+generation-specific shared code images. An atomic function-table publication
+makes a complete successful image visible at a later function call. This still
+invokes Clang on each edited image; it is not function-level native object
+caching. See [live programming](cli.md#live-programming) for ABI restrictions
+and the memory cost of retaining successful generations.

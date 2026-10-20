@@ -240,3 +240,61 @@ no default public registry deployed yet. `publish` emits metadata only and is a
 dry run even without the flag. It requires a clean committed library and a version
 tag at HEAD. See [the registry guide](registry.md) for records, checksums, local
 testing and static hosting.
+
+## Live programming
+
+`minyar run --watch` rebuilds after source or manifest edits, including local
+dependencies. A successful build replaces the running program. An invalid edit
+prints its diagnostics and keeps the previous program alive. Arguments after
+`--` reach each run unchanged. Interrupting the watcher stops its program and
+descendants. Watching uses filesystem notifications on Linux and macOS; generated
+`target`, `build` and `.git` directories are excluded.
+
+```sh
+minyar run --watch -- first-argument
+minyar run --watch --hot
+```
+
+Add `--hot` to preserve the running process, its module globals and heap values.
+Later calls to ordinary functions and methods use the new implementation. An
+active call finishes with the code it entered; initialization and `main` keep
+running in their original version. A blocked program observes updates when it
+next calls a function. The lanterns gallery shows state passed through ordinary
+functions; no special declaration syntax is needed.
+
+Hot reload accepts function-body edits only. Function signatures, records,
+constants, globals, imports, native bodies, manifests and initialization must stay
+unchanged. Incompatible edits are rejected; stop and run again to accept them.
+Managed threads and parallel loops currently require ordinary watch mode.
+
+Hot mode adds an indirect dispatch to function calls and checks for a published
+update at most every 25 milliseconds. Debug uses O0 and release uses O2 without
+whole-program LTO. Successful code generations remain resident because old
+frames, closures and literal values may still refer to them; memory therefore
+grows with edits until the session ends. This development mode does not add a
+runtime cost to ordinary builds. Native debugger/trace metadata for replacement
+generations is not yet registered.
+
+`minyar repl` opens a persistent native session. Enter an expression to see its
+value, a `let` binding to keep a value, or a function declaration to define or
+replace a function. Mutations persist, and successful earlier actions and
+initializers are never replayed. Braces, parentheses and brackets support
+multiline input. Compile errors leave the previous declarations and values
+available. `:help` describes the session; `:quit` or end of input closes it.
+
+```minyar
+let evenings = 1
+evenings += 1
+function light(): Text { return Text(evenings) + " lights" }
+light()
+```
+
+Literal bindings infer their type. Other initializers need an annotation, such
+as `let names: List<Text> = ["Ada", "Lin"]`. The first REPL slice supports
+bindings, named functions and actions. Type declarations, callbacks, managed
+threads, local bindings that shadow session values, and interpolation of session
+values require a source file. Native imports are limited to providers present
+in the REPL host. A runtime failure or `exit()` ends the session. `:reset` asks
+you to restart it so native code and managed state are both cleared.
+Use `--release` for O2 submissions; the default is O0. Accepted code images and
+their persistent roots stay resident until the session exits.

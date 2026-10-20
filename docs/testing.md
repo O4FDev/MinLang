@@ -15,6 +15,17 @@ reports and raw binary output. Where `mkfifo` is available, a blocking FIFO
 exchange between a project case and a dependency case proves they overlap;
 the test does not use timing or sleep polling as its concurrency oracle.
 
+`make check-live-programming` exercises real project watch sessions at O0/O2:
+atomic saves, nested modules, external local dependencies, manifest graph changes,
+literal arguments, failed-build survival/recovery, and shutdown of descendant
+process groups. Output readiness and FIFO handshakes establish ordering.
+`make check-live-transform` executes LLVM forwarding at O0/O2 and checks source
+and image ABI guards. `make check-live-hot` checks the same PID and heap roots
+across function updates and rejected edits, and reports edit-to-observation time.
+`make check-minyar-repl` runs exact O0/O2 transcripts proving persistent mutations,
+function replacement, one-time effects and initializers, Text/List lifetimes,
+multiline input, and recovery after rejected declarations and expressions.
+
 `make check-doc-comments` checks lexer-backed documentation, generic and alias
 signatures, fields, choice cases, methods, Unicode locations, BOM/CRLF input
 and private-member exclusion. Its syntax-tree probe runs at O0/O2, checks token
