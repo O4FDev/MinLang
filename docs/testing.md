@@ -58,6 +58,13 @@ argument lifetime, shared mutation, callable fields and rejection diagnostics.
 It runs the methods gallery and ownership assertions at O0/O2.
 `check-methods-sanitize` repeats these checks with ASan/UBSan.
 
+`make check-iteration` checks user-record iteration through `iterator`, `advance`
+and `current`, including independent cursors, control flow, managed items, generic
+item inference, module visibility and rejected protocol signatures. Programs and
+the iteration gallery run at O0/O2 with ownership assertions. LLVM checks retain
+the direct method calls and ordinary loop branches. `check-iteration-sanitize`
+adds compiler and generated-program ASan/UBSan instrumentation.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

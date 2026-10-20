@@ -48,6 +48,11 @@ name, index and assignment-target children before outlining worker LLVM.
 For a reduction, the loop's operator token is `reduce` and its symbol is the
 existing mutable accumulator binding. No extra syntax kind or type tag is used.
 
+User-record `for` loops also use kind 103. Their source remains a typed child;
+the checker resolves the concrete `iterator`, `advance` and `current` symbols
+and records their call dependencies before emitting ordinary loop blocks.
+There is no new syntax kind, type tag or runtime iteration ABI.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its

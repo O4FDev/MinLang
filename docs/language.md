@@ -237,6 +237,41 @@ is a fresh binding for each iteration, so assigning to it does not change which
 value comes next. A List loop rereads the List's length on every iteration.
 `break` leaves the innermost loop and `continue` starts its next iteration.
 
+A record can be iterable too. Its `iterator()` method returns a record cursor.
+The cursor's `advance(): Boolean` moves to the next item and says whether one
+exists; `current()` returns that item. All three methods take no arguments:
+
+```minyar
+record Countdown { start: Integer }
+record CountdownCursor { remaining: Integer }
+
+function Countdown.iterator(): CountdownCursor {
+    return CountdownCursor { remaining: self.start }
+}
+function CountdownCursor.advance(): Boolean {
+    if self.remaining <= 0 { return false }
+    self.remaining -= 1
+    return true
+}
+function CountdownCursor.current(): Integer { return self.remaining }
+
+for number in Countdown { start: 3 } { print(number) } // 2, 1, 0
+```
+
+The loop evaluates its source and calls `iterator()` once. Before each turn,
+it calls `advance()` and, only when that returns true, `current()`. An empty
+cursor never calls `current()`. Assigning the loop variable does not change
+the cursor. A fresh cursor makes nested and repeated traversals independent;
+a method that returns `self` deliberately shares progress with its aliases.
+Methods used outside their module must be public.
+
+Iteration checks this method shape structurally. It uses ordinary direct calls
+and a branch loop, with no dispatch table, intermediate List or per-item wrapper.
+The source and cursor keep their ordinary record allocation and ownership costs;
+allocations inside user methods remain their own costs. `current()` can return
+any value type, including a record or a List, but cannot return `Nothing`.
+`parallel for` continues to require an Integer range.
+
 Conditions accept only `Boolean`.
 
 ## Types and built-in operations
