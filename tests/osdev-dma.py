@@ -372,14 +372,19 @@ function ordinaryRoot(first: Integer, second: Integer) {
     let value = ordinaryMiddle(first, second)
 }
 '''),
+    # A function holding affine capabilities rejects closures, so the scalar
+    # callback graph is built by a helper beside the DMA-holding main body.
     Positive("dma-main-scalar-callback-chain", '''
-let callback: (Integer) -> Integer = function(value) { return scalarMiddle(value) }
-check(callback(37) == 37, "scalar callback helper graph")
+check(scalarCallback(37) == 37, "scalar callback helper graph")
 let cpu = dma.allocate(16, 16)
 dma.dispose(cpu)
 ''', '''
 function scalarLeaf(value: Integer): Integer { return value }
 function scalarMiddle(value: Integer): Integer { return scalarLeaf(value) }
+function scalarCallback(argument: Integer): Integer {
+    let callback: (Integer) -> Integer = function(value) { return scalarMiddle(value) }
+    return callback(argument)
+}
 '''),
     Positive("ordinary-for-model-queue", '''
 let output = [0, 0, 0, 0]
@@ -412,14 +417,17 @@ let meter = Meter { value: 37 }
 check(meter.read() == 37, "ordinary record method can own local DMA")
 ''', DMA_METER_METHOD),
     Positive("dma-main-scalar-method-callback", '''
-let meter = Meter { value: 37 }
-let callback: () -> Integer = function() { return meter.read() }
-check(callback() == 37, "ordinary record capture and scalar method remain valid")
+check(meterCallback() == 37, "ordinary record capture and scalar method remain valid")
 let cpu = dma.allocate(16, 16)
 dma.dispose(cpu)
 ''', '''
 record Meter { value: Integer }
 function Meter.read(): Integer { return self.value }
+function meterCallback(): Integer {
+    let meter = Meter { value: 37 }
+    let callback: () -> Integer = function() { return meter.read() }
+    return callback()
+}
 '''),
 )
 POSITIVE_BY_NAME = {case.name: case for case in POSITIVES}
@@ -895,6 +903,9 @@ class Gate:
         self.compiler = self.tool("MINYAR_TEST_COMPILER", str(ROOT / "build/minyarc"))
         self.clang = self.tool("MINYAR_TEST_CLANG", "clang")
         self.runtime = Path(os.environ.get("MINYAR_TEST_RUNTIME", str(ROOT / "build/minyar-runtime.o"))).resolve()
+        # Programs whose LLVM carries a callback/cycle marker need the cycle
+        # runtime, the same full-line contract tools/clang-driver.min applies.
+        self.callback_runtime = Path(os.environ.get("MINYAR_TEST_CALLBACK_RUNTIME", str(ROOT / "build/testing/cycle-runtime.o"))).resolve()
         self.runtime_source = Path(os.environ.get("MINYAR_TEST_RUNTIME_SOURCE", str(ROOT / "runtime/minyar_runtime.c"))).resolve()
         self.library = Path(os.environ.get("MINYAR_TEST_DMA_LIBRARY", str(ROOT / "library"))).resolve()
         self.flags = shlex.split(os.environ.get("MINYAR_TEST_LINK_FLAGS", ""))
@@ -1014,13 +1025,17 @@ class Gate:
         llvm = self.positive_compile(name, group)
         if llvm is None:
             return
-        if not self.runtime.is_file():
-            raise ValueError(f"MINYAR_TEST_RUNTIME: missing actual runtime object: {self.runtime}")
+        runtime = self.runtime
+        lines = llvm.read_text(encoding="utf-8").splitlines()
+        if "; minyar-cycle-runtime: 1" in lines or "; minyar-callback-runtime: 1" in lines:
+            runtime = self.callback_runtime
+        if not runtime.is_file():
+            raise ValueError(f"MINYAR_TEST_RUNTIME/MINYAR_TEST_CALLBACK_RUNTIME: missing actual runtime object: {runtime}")
         for level in LEVELS:
             label = name + "/" + level[1:]
             executable = llvm.parent / ("case-" + level[1:])
             command = [self.clang, level, "-Wno-override-module", *self.flags, *POSITIVE_BY_NAME[name].link_flags,
-                       str(llvm), str(self.runtime), "-lm", "-o", str(executable)]
+                       str(llvm), str(runtime), "-lm", "-o", str(executable)]
             status, stdout, stderr, broken = self.invoke(label + "/link", command)
             if not self.check(group, label + "/link", not broken and status == 0,
                               f"status={status}\n{stdout}{stderr}"):
@@ -1106,6 +1121,9 @@ class Gate:
         self.artifacts["prior_valid_llvm_sha256"] = digest(llvm)
         case = next(case for case in NEGATIVES if case.name == "double-dispose")
         (directory / "rejected-source.min").write_text(case.source, encoding="utf-8")
+        # The compiler never deletes earlier outputs; remove the retained valid
+        # LLVM so the rejection proves the DMA check runs before any output.
+        llvm.unlink()
         self.reject(case, "artifacts", directory)
 
     def result(self, started):

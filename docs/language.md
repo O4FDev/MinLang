@@ -1811,7 +1811,8 @@ normal exit must transfer, dispose or retire each live capability. Cpu/Pending
 cannot escape through records, containers, choices, Results, callbacks or globals.
 Queue aliases may be passed directly, but Queue also cannot enter these aggregate
 or captured forms. Opaque handles have no automatic record equality or hashing.
-Loops, match and recoverable control flow with these capabilities reject.
+Loops, match, closures and recoverable control flow inside a function that
+holds these capabilities reject; build callbacks in a separate helper.
 Use this registry from one serialized boot CPU, outside interrupt context.
 
 These opaque handles allocate ordinary managed records. A separately rooted

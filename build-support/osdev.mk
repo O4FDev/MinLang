@@ -51,11 +51,14 @@ check-osdev-interrupt-assembly: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-interrupts.py --phase assembly --case signal-zero
 
 .PHONY: check-osdev-dma check-osdev-dma-sanitize
-check-osdev-dma: build/minyarc build/minyar-runtime.o
+check-osdev-dma: build/minyarc build/minyar-runtime.o build/testing/cycle-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_RUNTIME_CFLAGS="$(PROGRAM_RUNTIME_FLAGS)" $(LIMITED) python3 tests/osdev-dma.py --group compile --group control --group runtime --group artifacts
 
-check-osdev-dma-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_RUNTIME_CFLAGS="$(PROGRAM_RUNTIME_FLAGS)" MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) python3 tests/osdev-dma.py --group compile --group control --group sanitizer --group artifacts
+check-osdev-dma-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/testing/cycle-runtime-sanitize.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_CALLBACK_RUNTIME=build/testing/cycle-runtime-sanitize.o MINYAR_TEST_RUNTIME_CFLAGS="$(PROGRAM_RUNTIME_FLAGS)" MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) python3 tests/osdev-dma.py --group compile --group control --group sanitizer --group artifacts
+
+build/testing/cycle-runtime-sanitize.o: build/testing/cycle-runtime.c $(wildcard runtime/minyar_*.h)
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
 .PHONY: check-osdev-allocator
 check-osdev-allocator: build/.toolchain.json
