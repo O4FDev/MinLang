@@ -1,0 +1,68 @@
+use "net" as net
+use "httpserver" as http
+use "errors" as errors
+
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+function readClosed(socket: Integer): Bytes {
+    let output = Bytes()
+    while true {
+        let data = net.receive(socket, 8192)
+        if data.length == 0 { break }
+        output.addBytes(data)
+        require(output.length < 16384, "drain produced unbounded output")
+    }
+    net.close(socket)
+    return output
+}
+function main(): Integer {
+    let limits = http.defaults()
+    limits.maxConnections = 3; limits.ioBudget = 64
+    let server = http.listen("127.0.0.1", 0, limits)
+    require(http.ok(server), "drain listen failed")
+    let port = http.port(server)
+    let first = net.connect("127.0.0.1", port)
+    let second = net.connect("127.0.0.1", port)
+    let idle = net.connect("127.0.0.1", port)
+    require(first >= 0 && second >= 0 && idle >= 0, "drain clients failed")
+    net.send(first, Bytes("GET /first HTTP/1.1\r\nhost: localhost\r\n\r\n"))
+    net.send(second, Bytes("GET /second HTTP/1.1\r\nhost: localhost\r\n\r\n"))
+    let ready: List<http.Request> = []
+    // These waits consume concrete accept/read readiness, never sleep-poll.
+    for turn in 0..8 {
+        let batch = http.poll(server, 5000)
+        require(!errors.isError(http.batchError(batch)), "drain poll failed")
+        for request in http.requests(batch) { ready.add(request) }
+        if ready.length == 2 { break }
+    }
+    require(ready.length == 2 && http.connectionCount(server) == 3, "drain did not dispatch two requests")
+    let body = Bytes(4096)
+    for at in 0..body.length { body[at] = 65 + at % 26 }
+    require(http.respond(server, ready[0], http.response(200, "application/octet-stream", body)), "initial write rejected")
+    require(http.connectionCount(server) == 3, "initial write was not partial")
+    http.drain(server); http.drain(server)
+    require(http.port(server) == -1 && http.connectionCount(server) == 2, "drain kept listener or idle reader")
+    require(net.connect("127.0.0.1", port) < 0, "drain accepted a new connection")
+    require(http.requestActive(server, ready[1]), "drain invalidated admitted request")
+    require(http.respond(server, ready[1], http.response(200, "text/plain", Bytes("last"))), "admitted response rejected")
+    for turn in 0..128 {
+        if http.connectionCount(server) == 0 { break }
+        let batch = http.poll(server, 5000)
+        require(http.requests(batch).length == 0 && !errors.isError(http.batchError(batch)), "drain dispatched new work")
+    }
+    require(http.connectionCount(server) == 0, "drain did not finish writers")
+    let firstReply = readClosed(first)
+    let secondReply = readClosed(second)
+    // Request arrival order is independent of socket order.
+    let large = firstReply
+    let small = secondReply
+    if ready[0].target == "/second" { large = secondReply; small = firstReply }
+    require(large.length > body.length, "partial response was truncated")
+    let suffix = large.slice(large.length - body.length, large.length)
+    for at in 0..body.length { require(suffix[at] == body[at], "partial response bytes changed") }
+    require(Text(small).find("connection: close\r\n") >= 0 && Text(small).find("\r\n\r\nlast") >= 0, "late response did not close")
+    require(readClosed(idle).length == 0, "idle reader received a response")
+    require(net.connect("127.0.0.1", port) < 0, "slot cleanup reactivated listener")
+    http.close(server); http.drain(server); http.close(server)
+    print("HTTP server drain preserves admitted work and closes ingress")
+    return 0
+}

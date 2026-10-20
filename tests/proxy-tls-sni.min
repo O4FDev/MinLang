@@ -1,0 +1,80 @@
+// Exercise the unauthenticated SNI parser without certificate/key generation.
+// A valid name must reach the deliberately missing-version failure afterwards.
+use "tlsserver" as tls
+
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+function add16(data: Bytes, value: Integer) { data.add((value >> 8) & 255); data.add(value & 255) }
+function add24(data: Bytes, value: Integer) { data.add((value >> 16) & 255); add16(data, value) }
+function repeated(byte: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { result.add(byte) }
+    return result
+}
+function joined(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+function hello(name: Bytes, present: Boolean): Bytes {
+    let body = Bytes(); add16(body, 0x0303); body.addBytes(Bytes(32)); body.add(0)
+    add16(body, 2); add16(body, 0x1301); body.add(1); body.add(0)
+    let extensions = Bytes()
+    if present {
+        add16(extensions, 0); add16(extensions, name.length + 5)
+        add16(extensions, name.length + 3); extensions.add(0)
+        add16(extensions, name.length); extensions.addBytes(name)
+    }
+    add16(body, extensions.length); body.addBytes(extensions)
+    let result = Bytes(); result.add(1); add24(result, body.length); result.addBytes(body)
+    return result
+}
+function probe(name: Bytes, present: Boolean, accepted: Boolean, fragmented: Boolean, quic: Boolean) {
+    let input = hello(name, present)
+    let session = tls.server(Bytes(64), "h2", [Bytes("unused-certificate")], Bytes("unused-key"), [], false)
+    if quic { session = tls.quicServer(Bytes(64), "h2", Bytes(), [Bytes("unused-certificate")], Bytes("unused-key"), [], false) }
+    else {
+        let record = Bytes(); record.add(22); add16(record, 0x0303); add16(record, input.length); record.addBytes(input)
+        input = record
+    }
+    if fragmented {
+        for byte in input {
+            let piece = Bytes(); piece.add(byte)
+            if quic { tls.receiveHandshake(session, piece, tls.INITIAL_KEYS) } else { tls.receive(session, piece) }
+        }
+    } else {
+        if quic { tls.receiveHandshake(session, input, tls.INITIAL_KEYS) } else { tls.receive(session, input) }
+    }
+    require(session.state == tls.FAILED && !session.authenticated, "SNI parser did not fail locally")
+    if accepted {
+        require(session.error == "unsupported TLS version, ALPN, key share or QUIC parameters", "valid SNI did not reach later validation")
+        if present { require(session.serverName == Text(name), "valid SNI changed") }
+        else { require(session.serverName == "", "absent SNI changed") }
+    } else {
+        let expected = "invalid TLS server name"
+        if name.length == 0 || name.length > 253 { expected = "malformed server name" }
+        require(session.error == expected && session.serverName == "", "hostile SNI was not rejected before Text construction")
+    }
+    require(tls.takeOutgoing(session).length == 0 && tls.takeInitial(session).length == 0 &&
+        tls.takeHandshake(session).length == 0 && tls.takeIncoming(session).length == 0 &&
+        session.privateKey.length == 0, "rejected SNI retained output or secrets")
+}
+function check(name: Bytes, accepted: Boolean) {
+    for mode in 0..4 { probe(name, true, accepted, mode % 2 == 1, mode >= 2) }
+}
+let label = repeated(97, 63)
+let maximum = joined([label, Bytes("."), label, Bytes("."), label, Bytes("."), repeated(98, 61)])
+for name in [Bytes("localhost"), Bytes("LoCaLhOsT"), Bytes("a"), Bytes("1host.example"), Bytes("a-b.example"),
+        Bytes("xn--caf-dma.example"), Bytes("123.456.example"), joined([label, Bytes(".example")]), maximum] { check(name, true) }
+for name in [Bytes(), Bytes("."), Bytes(".example"), Bytes("example."), Bytes("a..example"), Bytes("-a.example"), Bytes("a-.example"),
+        Bytes("a_b.example"), Bytes("*.example"), Bytes("a b.example"), Bytes("a/b.example"), Bytes("a:443"), Bytes("127.0.0.1"),
+        Bytes("255.255.255.255"), Bytes("::1"), Bytes("[::1]"), Bytes("caf\u{e9}.example"), repeated(97, 64),
+        joined([maximum, Bytes("a")])] { check(name, false) }
+// Every possible octet is attacker-controlled. Only DNS punctuation/letters
+// and digits may survive; all malformed UTF-8 must remain a session error.
+for byte in 0..256 {
+    let name = Bytes("a"); name.add(byte); name.addBytes(Bytes("b.example"))
+    let accepted = byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 || byte == 45 || byte == 46
+    check(name, accepted)
+}
+for mode in 0..4 { probe(Bytes(), false, true, mode % 2 == 1, mode >= 2) }
+print("TLS SNI: bounded DNS names and all 256 octets pass TCP/QUIC fragmented-input controls")

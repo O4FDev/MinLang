@@ -271,6 +271,16 @@ sanitizers, matching the ownership runtime. Vendored Monocypher uses O0 with
 sanitizers to avoid excessive compiler optimization time. Minyar programs
 run at O0/O2; their assertions and subprocess deadlines stay the same.
 
+`make check-proxy-http-drain` checks HTTP/1 shutdown at O0/O2: a partial
+writer and an already dispatched request finish, idle readers close, the
+listener refuses new connections and releasing slots cannot reactivate it.
+`check-proxy-http-drain-sanitize` adds ASan/UBSan. These are dependencies of
+the existing HTTP server checks. `check-proxy-tls-sni` checks valid and invalid
+DNS names, every inserted byte value and absent SNI through TCP/QUIC whole
+and fragmented ClientHello inputs at O0/O2; its sanitizer variant is
+`check-proxy-tls-sni-sanitize`. Both run through the TLS server check targets.
+See [proxy networking](proxy-networking.md) for the API and ingress rules.
+
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
 Programs run at O0/O2 with the ownership oracle. LLVM signatures and definition
