@@ -1,3 +1,10 @@
+# Keep the protocol definitions as ordinary Minyar source, embedded at build time.
+build/capability-builtins.min: compiler/builtin-capabilities.min build-support/capability-prelude.awk | build
+	@set -e; temporary=$$(mktemp "$@.tmp.XXXXXXXX"); \
+	trap 'rm -f "$$temporary"' 0; \
+	awk -f "build-support/capability-prelude.awk" "$<" > "$$temporary"; \
+	if ! test -f "$@" || ! cmp -s "$$temporary" "$@"; then mv "$$temporary" "$@"; fi
+
 .PHONY: check-user-capabilities check-user-capabilities-sanitize
 
 check-user-capabilities: build/minyarc build/minyar-runtime.o build/tooling/tests/user-capabilities

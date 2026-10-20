@@ -1,0 +1,215 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function callsMethod(llvm: Text, name: Text): Boolean {
+    let symbol = ""
+    for line in test.lines(llvm) {
+        if test.contains(line, "define ") && test.contains(line, name) {
+            symbol = line.slice(line.find("@"), line.find("("))
+        }
+    }
+    if symbol == "" { return false }
+    for line in test.lines(llvm) {
+        if test.contains(line, "call ") && test.contains(line, symbol + "(") { return true }
+    }
+    return false
+}
+
+function methodHasRecoveryEntry(llvm: Text, name: Text): Boolean {
+    let active = false
+    for line in test.lines(llvm) {
+        if test.contains(line, "define ") { active = test.contains(line, name) }
+        if active && test.contains(line, "call i32 @minyar_recovery_enter()") { return true }
+        if line == "}" { active = false }
+    }
+    return false
+}
+
+function methodHasEffectEdge(llvm: Text, name: Text): Boolean {
+    for line in test.lines(llvm) {
+        if test.contains(line, "; minyar-thread-effect: ") && test.contains(line, "4:call") && test.contains(line, name) { return true }
+    }
+    return false
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let same = "function same<Item: Equatable>(left: Item, right: Item): Boolean { return left == right }\n"
+let orderedFirst = "function first<Item: Ordered>(values: List<Item>): Item { return values.sorted()[0] }\n"
+let keepHashable = "function keep<Item: Hashable>(value: Item): Item { return value }\n"
+let distinct = "function distinct<Item: Hashable>(values: List<Item>): Integer { let keys: Set<Item> = Set(); for value in values { keys.add(value) }; return keys.length }\n"
+let equality = "record Key { identity: Integer; note: Text }\nfunction Key.equal(other: Key): Boolean { return self.identity == other.identity }\nconform Key to Equatable\n"
+let ordered = "record Entry { rank: Integer; name: Text }\nfunction Entry.compare(other: Entry): Integer { if self.rank > other.rank { return -7 }; if self.rank < other.rank { return 9 }; return 0 }\nconform Entry to Ordered\n"
+let keyShape = "record Key { identity: Integer; note: Text }\n"
+let keyEquality = "function Key.equal(other: Key): Boolean { return self.identity == other.identity }\n"
+let keyHash = "function Key.hash(): Integer { return self.identity % 4 }\n"
+let hashable = keyShape + keyEquality + keyHash + "conform Key to Hashable\n"
+
+// Custom equality gives stored notes no part in a key's meaning.
+fixtures.executes(frontend, equality + same + "let first = Key { identity: 7; note: \"sea\" }\nlet second = Key { identity: 7; note: \"sky\" }\nlet third = Key { identity: 8; note: \"sea\" }\nprint(first == second)\nprint(first != second)\nprint(first == third)\nprint(first != third)\nprint(same(first, second))\n", "true\nfalse\nfalse\ntrue\ntrue\n", levels, 0, "", true)
+
+// Ordering uses the sign of compare, derives equal, and keeps equal items stable.
+fixtures.executes(frontend, ordered + orderedFirst + same + "let low = Entry { rank: 1; name: \"low\" }\nlet early = Entry { rank: 3; name: \"early\" }\nlet middle = Entry { rank: 2; name: \"middle\" }\nlet late = Entry { rank: 3; name: \"late\" }\nprint(early < low)\nprint(early <= late)\nprint(low > early)\nprint(late >= early)\nprint(early == late)\nprint(early != late)\nprint(same(early, late))\nlet entries = [low, early, middle, late]\nlet alias = entries\nlet copy = entries.sorted()\nfor entry in copy { print(entry.name) }\nprint(entries[0].name)\nentries.sort()\nprint(alias[0].name)\nprint(first([low, early]).name)\n", "true\ntrue\ntrue\ntrue\ntrue\nfalse\ntrue\nearly\nlate\nmiddle\nlow\nlow\nearly\nearly\n", levels, 0, "", true)
+
+// An explicit equal method supplies both Equatable and the Ordered requirement.
+fixtures.executes(frontend, equality + "function Key.compare(other: Key): Integer { if self.identity < other.identity { return -1 }; if self.identity > other.identity { return 1 }; return 0 }\nconform Key to Ordered\n" + same + orderedFirst + "let left = Key { identity: 7; note: \"sea\" }\nlet right = Key { identity: 7; note: \"sky\" }\nprint(same(left, right))\nprint(left <= right)\nprint(first([Key { identity: 8; note: \"eight\" }, left]).identity)\n", "true\ntrue\n7\n", levels, 0, "", true)
+
+// Collections call the custom equal/hash pair and preserve independent key snapshots.
+fixtures.executes(frontend, hashable + "let original = Key { identity: 7; note: \"seed\" }\nlet entries: Map<Key, Text> = Map()\nentries[original] = \"first\"\nentries[Key { identity: 7; note: \"different\" }] = \"updated\"\nentries[Key { identity: 11; note: \"same hash\" }] = \"collision\"\nprint(entries.length)\nprint(entries[Key { identity: 7; note: \"query\" }])\nlet keys: Set<Key> = Set()\nkeys.add(original)\nkeys.add(Key { identity: 7; note: \"different\" })\nkeys.add(Key { identity: 11; note: \"same hash\" })\nprint(keys.length)\noriginal.identity = 8\noriginal.note = \"changed\"\nprint(entries.has(original))\nprint(keys.contains(original))\nprint(entries.has(Key { identity: 7; note: \"query\" }))\nprint(keys.contains(Key { identity: 7; note: \"query\" }))\nfor key in entries { key.identity = 99; key.note = \"changed\" }\nfor key in keys { key.identity = 99; key.note = \"changed\" }\nprint(entries[Key { identity: 7; note: \"query\" }])\nprint(keys.contains(Key { identity: 7; note: \"query\" }))\nprint(entries.remove(Key { identity: 11; note: \"query\" }))\nprint(keys.remove(Key { identity: 11; note: \"query\" }))\nprint(entries.length)\nprint(keys.length)\nlet expected: Map<Key, Text> = {Key { identity: 7; note: \"another\" }: \"updated\"}\nlet expectedKeys: Set<Key> = Set()\nexpectedKeys.add(Key { identity: 7; note: \"another\" })\nprint(entries == expected)\nprint(keys == expectedKeys)\n", "2\nupdated\n2\nfalse\nfalse\ntrue\ntrue\nupdated\ntrue\ntrue\ntrue\n1\n1\ntrue\ntrue\n", levels, 0, "", true)
+let collectionLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+test.check(callsMethod(collectionLLVM, "Key$equal"), "collection helpers call custom key equality directly")
+test.check(callsMethod(collectionLLVM, "Key$hash"), "collection helpers call custom key hashing directly")
+
+// Structural outer records compose with custom equality, hashing and deep snapshots.
+fixtures.executes(frontend, hashable + "record Envelope { key: Key; edition: Integer }\nlet first = Envelope { key: Key { identity: 7; note: \"sea\" }; edition: 1 }\nlet second = Envelope { key: Key { identity: 7; note: \"sky\" }; edition: 1 }\nprint(first == second)\nlet entries: Map<Envelope, Text> = Map()\nentries[first] = \"home\"\nentries[second] = \"garden\"\nprint(entries.length)\nfirst.key.identity = 8\nprint(entries.has(first))\nprint(entries[second])\nlet keys: Set<Envelope> = Set()\nkeys.add(second)\nkeys.add(Envelope { key: Key { identity: 7; note: \"shore\" }; edition: 1 })\nprint(keys.length)\nfor snapshot in entries { snapshot.key.identity = 9 }\nprint(entries[second])\n", "true\n1\nfalse\ngarden\n1\ngarden\n", levels, 0, "", true)
+
+// Structural outer comparisons use a nested record's custom ordering and equality.
+fixtures.executes(frontend, ordered + "record Envelope { entry: Entry; edition: Integer }\nlet first = Envelope { entry: Entry { rank: 3; name: \"early\" }; edition: 1 }\nlet same = Envelope { entry: Entry { rank: 3; name: \"late\" }; edition: 1 }\nlet last = Envelope { entry: Entry { rank: 1; name: \"low\" }; edition: 1 }\nprint(first == same)\nprint(first < last)\nprint([last, first].sorted()[0].entry.name)\n", "true\ntrue\nearly\n", levels, 0, "", true)
+
+// A custom Hashable bound does not promise that a collection can snapshot its shape.
+let listKey = "record Key { identity: Integer; values: List<Integer> }\n" + keyEquality + keyHash + "conform Key to Hashable\n"
+fixtures.executes(frontend, listKey + keepHashable + same + "let first = Key { identity: 42; values: [1, 2] }\nlet second = Key { identity: 42; values: [3] }\nprint(keep(first).identity)\nprint(same(first, second))\n", "42\ntrue\n", levels, 0, "", true)
+
+// Scalar bounds retain their existing equality, order and hash behavior.
+for item in [["[1, 2, 1]", "1"], ["[1.25, 2.5, 1.25]", "1.25"], ["[\"sea\", \"sky\", \"sea\"]", "sea"], ["['a', 'é', 'a']", "a"], ["[false, true, false]", "false"]] {
+    fixtures.executes(frontend, same + orderedFirst + distinct + "let values = " + item[0] + "\nprint(same(values[0], values[2]))\nprint(first(values))\nprint(distinct(values))\n", "true\n" + item[1] + "\n2\n", levels, 0, "", true)
+}
+
+// Legacy type names coexist with unqualified built-in bounds on the single-file path.
+let identity = "function identity<Item>(value: Item): Item { return value }\n"
+fixtures.executes(frontend, "record Ordered { value: Integer }\nrecord Equatable { value: Integer }\nrecord Hashable { value: Integer }\n" + identity + same + orderedFirst + keepHashable + "let ordered: Ordered = identity(Ordered { value: 42 })\nlet equatable: Equatable = identity(Equatable { value: 7 })\nlet hashable: Hashable = identity(Hashable { value: 8 })\nprint(ordered.value)\nprint(equatable.value)\nprint(hashable.value)\nprint(same<Equatable>(equatable, Equatable { value: 7 }))\nprint(first<Ordered>([ordered, Ordered { value: 1 }]).value)\nprint(keep<Hashable>(hashable).value)\n", "42\n7\n8\ntrue\n1\n8\n", levels, 0, "", true)
+fixtures.executes(frontend, "type Ordered = Integer\ntype Equatable = Text\ntype Hashable = Boolean\n" + identity + same + orderedFirst + keepHashable + "let ordered: Ordered = identity(42)\nlet equatable: Equatable = identity(\"sea\")\nlet hashable: Hashable = identity(true)\nprint(ordered)\nprint(equatable)\nprint(hashable)\nprint(same<Equatable>(equatable, \"sea\"))\nprint(first<Ordered>([ordered, 1]))\nprint(keep<Hashable>(hashable))\n", "42\nsea\ntrue\ntrue\n1\ntrue\n", levels, 0, "", true)
+
+// Finite records still derive all three built-in capabilities without a declaration.
+fixtures.executes(frontend, same + orderedFirst + distinct + "record Stamp { rank: Integer; name: Text }\nlet early = Stamp { rank: 1; name: \"sea\" }\nlet late = Stamp { rank: 2; name: \"sky\" }\nprint(same(early, Stamp { rank: 1; name: \"sea\" }))\nprint(first([late, early]).name)\nprint(distinct([early, late, early]))\n", "true\nsea\n2\n", levels, 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/capability-order.min"), "When the evening comes:\nthe garden window\nthe hill window\nthe harbour window\nEach light has its own time.\n", levels, 0, "", true)
+
+// Hidden operator calls consume the recoverable budget and stop later statements.
+let recoveryImports = "use \"calldepth\" as depth\nuse \"errors\" as errors\n"
+let recursiveOperators = recoveryImports + "record Key { identity: Integer }\nrecord Wrapper { key: Key }\nchoice Message { Item(key: Key); Quiet }\nrecord State { later: Integer }\nfunction Key.equal(other: Key): Boolean { return self == other }\nfunction Key.compare(other: Key): Integer { if self < other { return -1 }; return 0 }\nconform Key to Ordered\nlet a = Key { identity: 1 }\nlet b = Key { identity: 2 }\nlet left = Wrapper { key: a }\nlet right = Wrapper { key: b }\nlet choiceLeft = Message.Item(a)\nlet choiceRight = Message.Item(b)\nlet state = State { later: 0 }\n"
+let operatorIndex = 0
+for expression in ["a == b", "a != b", "a < b", "a <= b", "a > b", "a >= b", "left == right", "left < right", "choiceLeft == choiceRight", "choiceLeft < choiceRight"] {
+    let result = "result" + Text(operatorIndex)
+    recursiveOperators += "let " + result + " = depth.run(16, function(): Integer { let value = " + expression + "; state.later += 1; return 1 })\nif errors.integerOk(" + result + ") { fail(\"recursive comparison did not recover\") }\n"
+    operatorIndex += 1
+}
+recursiveOperators += "if state.later != 0 { fail(\"comparison ran a later statement after recovery\") }\nlet good = depth.run(2, function(): Integer { if Message.Quiet == Message.Quiet { return 42 }; return 0 })\nprint(errors.integerValue(good))\nprint(\"operator recovery stopped later effects\")\n"
+fixtures.executes(frontend, recursiveOperators, "42\noperator recovery stopped later effects\n", levels, 0, "", true)
+let operatorLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+for method in ["Key$equal", "Key$compare"] {
+    test.check(methodHasRecoveryEntry(operatorLLVM, method), "recursive custom comparison retains its recovery entry")
+}
+test.require(fixtures.compile(frontend, recursiveOperators + "\nfunction effectProbe(value: Thread) {}\n"), "compile custom comparison thread effect metadata")
+let operatorEffects = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+for method in ["Key$equal", "Key$compare"] {
+    test.check(methodHasEffectEdge(operatorEffects, method), "custom comparison retains its thread effect call edge")
+}
+
+// Every collection operation checks recovery before publishing a mutation or result.
+let collectionRecoveryShape = recoveryImports + "record Key { identity: Integer }\nrecord Cell { value: Integer }\nrecord State { later: Integer }\nglobal armed: List<Boolean> = [false]\n"
+let collectionRecoverySetup = "conform Key to Hashable\nrecord Ledger { entries: Map<Key, Integer> }\nrecord Roll { keys: Set<Key> }\nfunction verify(entries: Map<Key, Cell>, counts: Map<Key, Integer>, keys: Set<Key>, state: State) {\nif state.later != 0 || entries.length != 2 || counts.length != 2 || keys.length != 2 { fail(\"failed collection operation changed its state\") }\nif entries[Key { identity: 1 }].value != 42 || entries[Key { identity: 2 }].value != 7 || counts[Key { identity: 1 }] != 42 || counts[Key { identity: 2 }] != 7 || !keys.contains(Key { identity: 1 }) || !keys.contains(Key { identity: 2 }) { fail(\"failed collection operation changed its contents\") }\n}\nlet entries: Map<Key, Cell> = Map()\nentries[Key { identity: 1 }] = Cell { value: 42 }\nentries[Key { identity: 2 }] = Cell { value: 7 }\nlet counts: Map<Key, Integer> = Map()\ncounts[Key { identity: 1 }] = 42\ncounts[Key { identity: 2 }] = 7\nlet keys: Set<Key> = Set()\nkeys.add(Key { identity: 1 })\nkeys.add(Key { identity: 2 })\nlet otherCounts: Map<Key, Integer> = Map()\notherCounts[Key { identity: 1 }] = 42\notherCounts[Key { identity: 2 }] = 7\nlet otherKeys: Set<Key> = Set()\notherKeys.add(Key { identity: 1 })\notherKeys.add(Key { identity: 2 })\nlet ledger = Ledger { entries: counts }\nlet otherLedger = Ledger { entries: otherCounts }\nlet roll = Roll { keys: keys }\nlet otherRoll = Roll { keys: otherKeys }\nlet state = State { later: 0 }\nlet flag = armed\n"
+let recoveryOperations = [
+    "entries[Key { identity: 1 }] = Cell { value: 99 }",
+    "entries[Key { identity: 3 }] = Cell { value: 99 }",
+    "let cell = entries[Key { identity: 1 }]",
+    "let present = entries.has(Key { identity: 1 })",
+    "let removed = entries.remove(Key { identity: 1 })",
+    "counts[Key { identity: 1 }] += 1",
+    "entries[Key { identity: 1 }].value = 99",
+    "entries[Key { identity: 1 }].value += 1",
+    "let literal: Map<Key, Cell> = {Key { identity: 1 }: Cell { value: 99 }, Key { identity: 2 }: Cell { value: 7 }}",
+    "keys.add(Key { identity: 1 })",
+    "keys.add(Key { identity: 3 })",
+    "let present = keys.contains(Key { identity: 1 })",
+    "let removed = keys.remove(Key { identity: 1 })",
+    "let equal = ledger == otherLedger",
+    "let equal = roll == otherRoll"
+]
+for operationKind in ["hash", "equal"] {
+    let methods = "function Key.equal(other: Key): Boolean { return self.identity == other.identity }\nfunction Key.hash(): Integer { let flag = armed; if flag[0] { return self.hash() }; return 0 }\n"
+    if operationKind == "equal" {
+        methods = "function Key.equal(other: Key): Boolean { let flag = armed; if flag[0] { return self == other }; return self.identity == other.identity }\nfunction Key.hash(): Integer { return 0 }\n"
+    }
+    let source = collectionRecoveryShape + methods + collectionRecoverySetup
+    let operationIndex = 0
+    for operation in recoveryOperations {
+        let nestedEquality = operation == "let equal = ledger == otherLedger" || operation == "let equal = roll == otherRoll"
+        if operationKind == "hash" && nestedEquality { continue }
+        let result = "result" + Text(operationIndex)
+        source += "flag[0] = true\nlet " + result + " = depth.run(16, function(): Integer { " + operation + "; state.later += 1; return 1 })\nflag[0] = false\nif errors.integerOk(" + result + ") { fail(\"recursive " + operationKind + " collection operation " + Text(operationIndex) + " did not recover\") }\nverify(entries, counts, keys, state)\n"
+        operationIndex += 1
+    }
+    source += "if !(ledger == otherLedger) || !(roll == otherRoll) { fail(\"nested collection equality stayed guarded after recovery\") }\ncounts[Key { identity: 1 }] += 1\nif counts[Key { identity: 1 }] != 43 || !keys.remove(Key { identity: 2 }) { fail(\"collection stayed guarded after recovery\") }\nprint(\"" + operationKind + " recovery kept collections\")\n"
+    fixtures.executes(frontend, source, operationKind + " recovery kept collections\n", levels, 0, "", true)
+    let llvm = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+    test.check(methodHasRecoveryEntry(llvm, "Key$" + operationKind), "recursive custom collection method retains its recovery entry")
+    test.require(fixtures.compile(frontend, source + "\nfunction effectProbe(value: Thread) {}\n"), "compile custom collection thread effect metadata")
+    let effects = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+    test.check(methodHasEffectEdge(effects, "Key$" + operationKind), "custom collection method retains its thread effect call edge")
+}
+
+// A failed comparator cannot publish even a partially completed stable sort.
+let sortingRecovery = recoveryImports + "record Entry { rank: Integer; name: Text }\nrecord State { later: Integer }\nglobal compareCalls: List<Integer> = [0]\nglobal compareArmed: List<Boolean> = [true]\nfunction Entry.compare(other: Entry): Integer { let calls = compareCalls; let flag = compareArmed; calls[0] += 1; if flag[0] && calls[0] >= 2 { return self.compare(other) }; if self.rank < other.rank { return -1 }; if self.rank > other.rank { return 1 }; return 0 }\nconform Entry to Ordered\nfunction unchanged(values: List<Entry>, state: State) { if state.later != 0 || values[0].name != \"three\" || values[1].name != \"first one\" || values[2].name != \"two\" || values[3].name != \"second one\" { fail(\"failed sort changed its list or ran a later statement\") } }\nlet values = [Entry { rank: 3; name: \"three\" }, Entry { rank: 1; name: \"first one\" }, Entry { rank: 2; name: \"two\" }, Entry { rank: 1; name: \"second one\" }]\nlet alias = values\nlet state = State { later: 0 }\nlet calls = compareCalls\nlet failedSort = depth.run(16, function(): Integer { values.sort(); state.later += 1; return 1 })\nif errors.integerOk(failedSort) || calls[0] < 2 { fail(\"in-place comparator did not recover after a completed comparison\") }\nunchanged(values, state)\nunchanged(alias, state)\ncalls[0] = 0\nlet failedCopy = depth.run(16, function(): Integer { let copy = values.sorted(); state.later += 1; return copy.length })\nif errors.integerOk(failedCopy) || calls[0] < 2 { fail(\"copying comparator did not recover after a completed comparison\") }\nunchanged(values, state)\nlet flag = compareArmed\nflag[0] = false\nvalues.sort()\nfor value in values { print(value.name) }\n"
+fixtures.executes(frontend, sortingRecovery, "first one\nsecond one\ntwo\nthree\n", levels, 0, "", true)
+
+// Reentrant mutation of the same Map fails before clear, set or remove can act.
+let guardedMap = "record Key { identity: Integer }\nglobal held: List<Map<Key, Integer>> = []\nglobal armed: List<Boolean> = [false]\n"
+let guardedSetup = "conform Key to Hashable\nlet entries: Map<Key, Integer> = Map()\nentries[Key { identity: 1 }] = 42\nlet maps = held\nmaps.add(entries)\nlet flag = armed\nflag[0] = true\nlet present = entries.has(Key { identity: 1 })\nprint(\"a later statement must not run\")\n"
+for operationKind in ["hash", "equal"] {
+    for mutation in ["entries.clear()", "entries[Key { identity: 2 }] = 99", "let removed = entries.remove(Key { identity: 1 })"] {
+        let body = "let flag = armed; if flag[0] { let maps = held; let entries = maps[0]; " + mutation + " }; "
+        let methods = "function Key.equal(other: Key): Boolean { return self.identity == other.identity }\nfunction Key.hash(): Integer { " + body + "return 0 }\n"
+        if operationKind == "equal" {
+            methods = "function Key.equal(other: Key): Boolean { " + body + "return self.identity == other.identity }\nfunction Key.hash(): Integer { return 0 }\n"
+        }
+        fixtures.executes(frontend, guardedMap + methods + guardedSetup, "", levels, 1, "Minyar stopped: a Map cannot be mutated from its hash or equality method.\n", false)
+    }
+}
+
+// Map equality protects the bucket arrays of both distinct operands.
+let guardedEqualitySetup = "conform Key to Hashable\nlet left: Map<Key, Integer> = Map()\nlet right: Map<Key, Integer> = Map()\nleft[Key { identity: 1 }] = 42\nright[Key { identity: 1 }] = 42\nlet maps = held\nmaps.add(left)\nmaps.add(right)\nlet flag = armed\nflag[0] = true\nlet equal = left == right\nprint(\"a later statement must not run\")\n"
+for operand in [0, 1] {
+    let methods = "function Key.equal(other: Key): Boolean { let flag = armed; if flag[0] { let maps = held; let target = maps[" + Text(operand) + "]; target.clear() }; return self.identity == other.identity }\nfunction Key.hash(): Integer { return 0 }\n"
+    fixtures.executes(frontend, guardedMap + methods + guardedEqualitySetup, "", levels, 1, "Minyar stopped: a Map cannot be mutated from its hash or equality method.\n", false)
+}
+
+// An equality override removes incompatible implicit ordering and hashing.
+fixtures.rejects(frontend, equality + keepHashable + "let value = keep(Key { identity: 7; note: \"sea\" })\n", "does not satisfy Hashable", true)
+fixtures.rejects(frontend, equality + orderedFirst + "let value = first([Key { identity: 7; note: \"sea\" }])\n", "does not satisfy Ordered", true)
+fixtures.rejects(frontend, equality + "let value = Key { identity: 7; note: \"sea\" }\nprint(value < value)\n", "is not Ordered", true)
+fixtures.rejects(frontend, equality + "let values = [Key { identity: 7; note: \"sea\" }]\nvalues.sort()\n", "is not Ordered", true)
+fixtures.rejects(frontend, equality + "let keys: Map<Key, Integer> = Map()\n", "is not Hashable", true)
+fixtures.rejects(frontend, equality + "let keys: Set<Key> = Set()\n", "is not Hashable", true)
+fixtures.rejects(frontend, equality + "record Envelope { key: Key }\n" + keepHashable + "let value = keep(Envelope { key: Key { identity: 7; note: \"sea\" } })\n", "does not satisfy Hashable", true)
+fixtures.rejects(frontend, ordered + keepHashable + "let value = keep(Entry { rank: 7; name: \"sea\" })\n", "does not satisfy Hashable", true)
+fixtures.rejects(frontend, ordered + "let keys: Map<Entry, Integer> = Map()\n", "is not Hashable", true)
+fixtures.rejects(frontend, ordered + "let keys: Set<Entry> = Set()\n", "is not Hashable", true)
+
+// Explicit custom hashing still needs a finite, independently copied key shape.
+for shape in ["record Key { identity: Integer; values: List<Integer> }\n", "record Key { identity: Integer; value: Bytes }\n", "record Key { identity: Integer; read: () -> Integer }\n", "record Key { identity: Integer; children: List<Key> }\n", "record Key native \"c\" { identity: Integer }\n"] {
+    let source = shape + keyEquality + keyHash + "conform Key to Hashable\n"
+    fixtures.rejects(frontend, source + "let keys: Map<Key, Integer> = Map()\n", "finite snapshot", true)
+    fixtures.rejects(frontend, source + "let keys: Set<Key> = Set()\n", "finite snapshot", true)
+}
+
+// Each built-in checks its required methods and concrete signatures.
+fixtures.rejects(frontend, keyShape + "conform Key to Equatable\n", "missing method 'equal'", true)
+fixtures.rejects(frontend, keyShape + "conform Key to Ordered\n", "missing method 'compare'", true)
+fixtures.rejects(frontend, keyShape + "conform Key to Hashable\n", "missing method 'equal'", true)
+fixtures.rejects(frontend, keyShape + keyEquality + "conform Key to Hashable\n", "missing method 'hash'", true)
+fixtures.rejects(frontend, keyShape + keyHash + "conform Key to Hashable\n", "missing method 'equal'", true)
+fixtures.rejects(frontend, keyShape + "function Key.equal(other: Key): Integer { return 1 }\nconform Key to Equatable\n", "wrong type", true)
+fixtures.rejects(frontend, keyShape + "function Key.equal(other: Integer): Boolean { return true }\nconform Key to Equatable\n", "wrong type", true)
+fixtures.rejects(frontend, keyShape + "function Key.compare(other: Key): Text { return \"equal\" }\nconform Key to Ordered\n", "wrong type", true)
+fixtures.rejects(frontend, keyShape + "function Key.compare(other: Integer): Integer { return 0 }\nconform Key to Ordered\n", "wrong type", true)
+fixtures.rejects(frontend, keyShape + keyEquality + "function Key.hash(): Text { return \"hash\" }\nconform Key to Hashable\n", "wrong type", true)
+fixtures.rejects(frontend, keyShape + keyEquality + "function Key.hash(value: Integer): Integer { return value }\nconform Key to Hashable\n", "wrong type", true)
+let allMethods = keyShape + keyEquality + keyHash + "function Key.compare(other: Key): Integer { if self.identity < other.identity { return -1 }; if self.identity > other.identity { return 1 }; return 0 }\n"
+for capability in ["Equatable", "Ordered", "Hashable"] {
+    fixtures.rejects(frontend, allMethods + "conform Key to " + capability + "\nconform Key to " + capability + "\n", "more than once", true)
+}
+fixtures.rejects(frontend, allMethods + "type Alias = Key\nconform Key to Hashable\nconform Alias to Hashable\n", "more than once", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Built-in capabilities: passed")

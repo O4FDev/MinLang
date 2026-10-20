@@ -1088,7 +1088,7 @@ means the conforming record, including inside a collection or callable type.
 Aliases retain their underlying record's conformance. A concrete generic record
 can conform through an alias or a type such as `Box<Integer>`.
 
-Capability names share the type namespace. Export one with `public capability`
+User-defined capability names share the type namespace. Export one with `public capability`
 and refer to an imported one with its module alias, such as `labels.Named`.
 Implement an imported capability's required methods with `public function` so
 its defaults can call them. Defaults retain access to helpers in their original
@@ -1101,8 +1101,45 @@ alone do not establish conformance. The compiler specializes defaults as ordinar
 record methods and generic functions as ordinary concrete functions. There is no
 boxing, witness table or runtime method dispatch.
 
-`Equatable`, `Ordered`, `Hashable`, `Iterable` and `Iterator` are built-in
-capability names; a user capability cannot reuse them.
+The three built-in capabilities use ordinary declarations in
+`compiler/builtin-capabilities.min`:
+
+| Capability | Required methods | Default |
+| --- | --- | --- |
+| `Equatable` | `equal(other: Self): Boolean` | none |
+| `Ordered` | `compare(other: Self): Integer` | `equal` tests whether `compare` returns zero |
+| `Hashable` | `equal(other: Self): Boolean`, `hash(): Integer` | none |
+
+A record can opt into them with the same `conform` declaration. `==` and `!=`
+use its `equal` method; ordering and natural sorting use the sign of `compare`.
+`Ordered` and `Hashable` also satisfy `Equatable`. Custom operations compose
+through nested records, choices, generic bounds and record collection keys.
+An explicit record method overrides the default equality supplied by `Ordered`.
+
+Equal keys must return equal hashes and keep their meaning while stored. After
+a custom equality or order is declared, the compiler requires an explicit
+`Hashable` conformance instead of deriving an incompatible field-wise hash.
+Custom equality also requires an explicit `Ordered` conformance for ordering.
+Map and Set record keys still need a finite snapshot shape: Lists, Bytes,
+callbacks, native records and recursive fields cannot be copied as keys, even
+when the record supplies custom hashing. A generic Hashable bound by itself
+does not require a key snapshot.
+
+Record collection keys use the existing hash/equality callback path. The runtime
+checks mutation during those callbacks; changing the same Map from its hash or
+equality method stops with a clear error. Sorting stages its permutation before
+committing it. Cooperative call-depth failure stops custom comparisons and
+lookups before committing collection changes. Capability calls themselves
+remain direct calls with concrete arguments and no runtime trait representation.
+
+The built-in names keep their capability meaning in an unqualified bound.
+Existing ordinary record and alias names such as `Ordered` continue to work in
+type annotations, constructors and explicit type arguments.
+
+`Iterable` and `Iterator` are also built-in, structural capability names; a
+user capability cannot reuse any built-in name.
+
+Implicit scalar and structural conformances remain available.
 Integer, Float, Text, Character and Boolean satisfy the three comparison
 capabilities. Finite records
 whose fields support a capability inherit it. Maps and Sets support Equatable

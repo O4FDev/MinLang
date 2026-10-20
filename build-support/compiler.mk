@@ -1,4 +1,4 @@
-COMPILER_SOURCES = build/choice-builtins.min \
+COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/source.min \
 	compiler/stages/syntax.min \
 	compiler/stages/diagnostic-catalog.min \

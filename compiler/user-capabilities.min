@@ -44,7 +44,7 @@ function genericCollectCapability(program: GenericProgram, cursor: List<Integer>
     let start = cursor[0]
     let name = stream.texts[start + 1]
     let readable = readableDeclarationName(name)
-    if reservedCapability(readable) { genericError(stream, start + 1, "a capability cannot replace built-in capability '" + readable + "'") }
+    if reservedCapability(readable) && (name != readable || tokenPath(stream.lines, start) != "<built-in capabilities>") { genericError(stream, start + 1, "a capability cannot replace built-in capability '" + readable + "'") }
     if simpleTypeCode(readable) != 0 { genericError(stream, start + 1, "a capability needs its own type name") }
     if genericIndexGet(program.capabilityIndex, name) >= 0 { genericError(stream, start + 1, "capability '" + readable + "' is declared more than once") }
     let methods: List<GenericDeclaration> = []
@@ -137,7 +137,7 @@ function genericCapabilityType(program: GenericProgram, type: Integer, receiver:
     return genericCanonicalType(program, program.source, 0, substituted, empty, 0)
 }
 
-function genericDefaultMethod(program: GenericProgram, requirement: GenericDeclaration, receiver: Integer, name: Text): GenericStream {
+function genericDefaultMethod(program: GenericProgram, requirement: GenericDeclaration, receiver: Integer, name: Text, originPosition: Integer): GenericStream {
     let source = program.source
     let kinds: List<Integer> = []
     let texts: List<Text> = []
@@ -160,6 +160,18 @@ function genericDefaultMethod(program: GenericProgram, requirement: GenericDecla
         position = position + 1
     }
     addEndToken(kinds, texts, lines, "end of capability default")
+    if originPosition >= 0 {
+        let remappedKinds: List<Integer> = []
+        let remappedTexts: List<Text> = []
+        let remappedLines = newSourceMap()
+        remappedLines.features = lines.features
+        let token = 0
+        while token < kinds.length {
+            copyModuleToken(remappedKinds, remappedTexts, remappedLines, kinds[token], texts[token], source.lines, originPosition, sourcePath(remappedLines, tokenPath(source.lines, originPosition)))
+            token = token + 1
+        }
+        return newGenericStream(remappedKinds, remappedTexts, remappedLines)
+    }
     return newGenericStream(kinds, texts, lines)
 }
 
@@ -209,7 +221,9 @@ function genericPrepareConformances(program: GenericProgram) {
             if requirement.body >= 0 {
                 if supplied >= 0 && supplied != capability { genericError(source, conformance.start, "conflicting defaults for method '" + requirement.name + "'; declare the record method explicitly") }
                 if implementation < 0 {
-                    let stream = genericDefaultMethod(program, requirement, type, name)
+                    let originPosition = -1
+                    if builtinCapability(conformance.capability) { originPosition = conformance.start }
+                    let stream = genericDefaultMethod(program, requirement, type, name, originPosition)
                     let declaration = genericCollectDeclaration(program, stream, 0, stream.kinds.length - 1)
                     let parameter = 0
                     while parameter < declaration.types.length {
@@ -240,7 +254,7 @@ function genericPrepareConformances(program: GenericProgram) {
             let implementation = genericConformanceMethod(program, receiverName, requirement.name)
             if implementation < 0 { genericError(source, conformance.start, "type '" + readableDeclarationName(program.types[type].name) + "' is missing method '" + requirement.name + "' for " + readableDeclarationName(conformance.capability)) }
             let signature = program.declarations[implementation]
-            if signature.name == methodFunctionName(receiverName, requirement.name + "$private") && tokenPath(source.lines, program.capabilities[capability].start) != tokenPath(source.lines, conformance.start) { genericError(source, conformance.start, "method '" + requirement.name + "' must be public to implement an imported capability") }
+            if !builtinCapability(conformance.capability) && signature.name == methodFunctionName(receiverName, requirement.name + "$private") && tokenPath(source.lines, program.capabilities[capability].start) != tokenPath(source.lines, conformance.start) { genericError(source, conformance.start, "method '" + requirement.name + "' must be public to implement an imported capability") }
             if signature.variables.length != 0 || signature.types.length != requirement.types.length || signature.result != genericCapabilityType(program, requirement.result, type) { genericError(source, conformance.start, "method '" + requirement.name + "' has the wrong type for " + readableDeclarationName(conformance.capability)) }
             let parameter = 0
             while parameter < signature.types.length {
@@ -257,6 +271,47 @@ function genericPrepareConformances(program: GenericProgram) {
         let stream = program.methodStreams[index]
         let declaration = genericCollectDeclaration(program, stream, 0, stream.kinds.length - 1)
         genericProcessDeclaration(program, stream, declaration)
+        index = index + 1
+    }
+}
+
+function capabilityPrelude(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): CallbackTokens {
+    let coreKinds: List<Integer> = []
+    let coreTexts: List<Text> = []
+    let coreLines = newSourceMap()
+    coreLines.inputPath = "<built-in capabilities>"
+    tokenize(builtinCapabilitySource(), coreKinds, coreTexts, coreLines)
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    outputLines.features = lines.features
+    let position = 0
+    while position + 1 < coreKinds.length {
+        copyModuleToken(outputKinds, outputTexts, outputLines, coreKinds[position], coreTexts[position], coreLines, position, sourcePath(outputLines, coreLines.inputPath))
+        position = position + 1
+    }
+    position = 0
+    while position < kinds.length {
+        copyModuleToken(outputKinds, outputTexts, outputLines, kinds[position], texts[position], lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+        position = position + 1
+    }
+    return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }
+}
+
+function genericAppendCapabilityMarkers(program: GenericProgram, kinds: List<Integer>, texts: List<Text>, lines: SourceMap) {
+    let source = program.source
+    let index = 0
+    while index < program.conformances.length {
+        let conformance = program.conformances[index]
+        if builtinCapability(conformance.capability) {
+            let receiver = genericEmitType(program, source, conformance.start, conformance.type, 0)
+            let origin = sourcePath(lines, tokenPath(source.lines, conformance.start))
+            copyModuleToken(kinds, texts, lines, 1, "record", source.lines, conformance.start, origin)
+            copyModuleToken(kinds, texts, lines, 1, methodFunctionName(receiver, "conforms$" + conformance.capability), source.lines, conformance.start, origin)
+            copyModuleToken(kinds, texts, lines, 4, "{", source.lines, conformance.start, origin)
+            copyModuleToken(kinds, texts, lines, 4, "}", source.lines, conformance.start, origin)
+            copyModuleToken(kinds, texts, lines, 6, "end of conformance", source.lines, conformance.start, origin)
+        }
         index = index + 1
     }
 }

@@ -38,7 +38,9 @@ _Bool minyar_equal_slots(long long kind, long long a, long long b) {
 
 static int list_sort_compare(const MinyarSortOrder *order, long long a, long long b) {
     if (order->comparator) {
+        if (minyar_recovery_pending()) return 0;
         long long result = order->comparator(order->context, order->snapshot[a], order->snapshot[b]);
+        if (minyar_recovery_pending()) return 0;
         return (result > 0) - (result < 0);
     }
     long long result = minyar_compare_slots(order->kind, a, b);
@@ -49,15 +51,19 @@ static int list_sort_compare(const MinyarSortOrder *order, long long a, long lon
  * A shared ceil(n/2)-slot buffer suffices at every recursion depth. */
 static void list_sort_merge(long long *values, size_t count, long long *scratch,
                             const MinyarSortOrder *order) {
-    if (count < 2) return;
+    if (count < 2 || (order->comparator && minyar_recovery_pending())) return;
     size_t left_count = count / 2, right_count = count - left_count;
     list_sort_merge(values, left_count, scratch, order);
+    if (order->comparator && minyar_recovery_pending()) return;
     list_sort_merge(values + left_count, right_count, scratch, order);
-    if (list_sort_compare(order, values[left_count - 1], values[left_count]) <= 0) return;
+    int comparison = list_sort_compare(order, values[left_count - 1], values[left_count]);
+    if ((order->comparator && minyar_recovery_pending()) || comparison <= 0) return;
     memcpy(scratch, values, left_count * sizeof(*scratch));
     size_t left = 0, right = left_count, output = 0;
     while (left < left_count && right < count) {
-        if (list_sort_compare(order, scratch[left], values[right]) <= 0)
+        comparison = list_sort_compare(order, scratch[left], values[right]);
+        if (order->comparator && minyar_recovery_pending()) return;
+        if (comparison <= 0)
             values[output++] = scratch[left++];
         else
             values[output++] = values[right++];
@@ -104,6 +110,7 @@ static MinyarList *list_sort_new(const MinyarList *source, long long references)
 }
 
 void minyar_list_sort(MinyarList *list, long long kind) {
+    if (minyar_recovery_pending()) return;
     if (kind != 1 && kind != 2 && kind != 3 && kind != 4 && kind != 7)
         minyar_stop("this List element type has no natural order.");
     size_t count = list_sort_count(list);
@@ -115,6 +122,7 @@ void minyar_list_sort(MinyarList *list, long long kind) {
 }
 
 MinyarList *minyar_list_sorted(MinyarList *list, long long kind, long long references) {
+    if (minyar_recovery_pending()) return NULL;
     SORT_RETAIN(list);
     size_t count = list_sort_count(list);
     MinyarList *result = list_sort_new(list, references);
@@ -127,6 +135,7 @@ MinyarList *minyar_list_sorted(MinyarList *list, long long kind, long long refer
 
 static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortComparator comparator,
                                 long long references, int copying) {
+    if (minyar_recovery_pending()) return copying ? NULL : list;
     SORT_RETAIN(list);
     SORT_RETAIN(context);
     size_t count = list_sort_count(list), half = count / 2 + count % 2;
@@ -140,12 +149,15 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
         indices[i] = (long long)i;
         if (references) SORT_RETAIN((void *)(uintptr_t)snapshot[i]);
     }
+    MinyarList *result = copying ? NULL : list;
     MinyarSortOrder order = {0, snapshot, context, comparator};
     list_sort_merge(indices, count, scratch, &order);
+    /* A failed comparator may leave a partial permutation. Release its rooted
+     * snapshot without committing that permutation or allocating a result. */
+    if (minyar_recovery_pending()) goto done;
     if (list->length != (long long)count ||
         (count && memcmp(list->values, snapshot, count * sizeof(*snapshot))))
         minyar_stop("the List was mutated during its sort comparator.");
-    MinyarList *result = list;
     if (copying) {
         result = list_sort_new(list, references);
         list_reserve(result, (long long)count);
@@ -153,6 +165,7 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
     } else {
         for (size_t i = 0; i < count; i++) SORT_SET(list, (long long)i, snapshot[indices[i]]);
     }
+done:
     for (size_t i = 0; references && i < count; i++) minyar_rc_release((void *)(uintptr_t)snapshot[i]);
     free(storage);
     minyar_rc_release(context);

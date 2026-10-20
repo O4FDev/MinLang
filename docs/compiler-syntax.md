@@ -12,7 +12,13 @@ resolves aliases before comparing methods; defaults become ordinary concrete
 method declarations with an explicit receiver. Copied tokens preserve their
 capability module's source spans. Capability declarations and conformance
 statements emit no runtime representation. Raw documentation trees use kind 10
-for capabilities and ordinary function nodes for their method signatures.
+for capabilities and ordinary function nodes for their method signatures. The
+compiler embeds the ordinary built-in capability declarations at bootstrap time.
+Explicit built-in conformances add empty compiler-only record symbols keyed by
+the receiver and capability; they allocate no values and emit no runtime tables.
+Derived operation wrappers call the checked concrete methods. Call-effect and
+cooperative-recovery hooks run at each actual operator or collection use, even
+when an operation wrapper was already emitted for another function.
 
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations

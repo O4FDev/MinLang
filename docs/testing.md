@@ -466,6 +466,13 @@ at O0/O2 with ownership cleanup assertions. Rejections cover missing and wrongly
 typed methods, unknown capabilities, duplicates and missing conformances.
 `check-user-capabilities-sanitize` instruments compiler and generated programs.
 
+`make check-builtin-capabilities` checks explicit Equatable, Ordered and Hashable
+methods through operators, stable sorting, nested records, generic bounds and
+Map/Set snapshots. It verifies direct LLVM calls, matching hash/equality semantics,
+implicit derivation boundaries and finite snapshot rejection. Successful programs
+and the ordering gallery run at O0/O2 with ownership assertions.
+`check-builtin-capabilities-sanitize` instruments compiler and generated programs.
+
 `make check-generic-results` checks shared generic value/error storage and the
 IntegerResult/BooleanResult compatibility APIs at O0/O2 with ownership assertions.
 It preserves exact fatal messages and private fields and checks the results gallery.

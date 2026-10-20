@@ -35,8 +35,89 @@ function recordCapabilityHasNative(context: CompilerContext, type: Integer): Boo
     return false
 }
 
+function explicitRecordCapability(context: CompilerContext, type: Integer, capability: Text): Boolean {
+    if context.tokenLines.features / 256 % 2 == 0 || !isRecordType(type) || isCallbackType(type, context.functionNames) { return false }
+    let name = methodFunctionName(context.functionNames[type - 1000], "conforms$" + capability)
+    return findIndexedSymbol(context.tokenLines.symbolLookup, context.functionNames, context.symbolKinds, name, 2) >= 0
+}
+
+function explicitRecordEquality(context: CompilerContext, type: Integer): Boolean {
+    return explicitRecordCapability(context, type, "Equatable") || explicitRecordCapability(context, type, "Ordered") || explicitRecordCapability(context, type, "Hashable")
+}
+
+function recordCapabilityTarget(context: CompilerContext, type: Integer, operation: Text): Integer {
+    let supported = false
+    if operation == "equal" { supported = explicitRecordEquality(context, type) }
+    if operation == "compare" { supported = explicitRecordCapability(context, type, "Ordered") }
+    if operation == "hash" { supported = explicitRecordCapability(context, type, "Hashable") }
+    if !supported { return -1 }
+    let receiver = context.functionNames[type - 1000]
+    let target = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, methodFunctionName(receiver, operation))
+    if target < 0 { target = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, methodFunctionName(receiver, operation + "$private")) }
+    return target
+}
+
+function collectCapabilityTargets(context: CompilerContext, type: Integer, operation: Text, visited: List<Integer>, targets: List<Integer>) {
+    let seen = 0
+    while seen < visited.length { if visited[seen] == type { return }; seen = seen + 1 }
+    visited.add(type)
+    let target = recordCapabilityTarget(context, type, operation)
+    if target >= 0 { targets.add(target); return }
+    if isRecordType(type) && !isCallbackType(type, context.functionNames) && !isCRecord(context, type) {
+        let record = type - 1000
+        let offset = functionParameterOffset(context.functionParameterCounts, record)
+        let field = 0
+        while field < context.functionParameterCounts[record] {
+            collectCapabilityTargets(context, context.functionParameterTypes[offset + field], operation, visited, targets)
+            field = field + 1
+        }
+    }
+    if operation == "equal" && (isMapType(type) || isSetType(type)) {
+        let key = mapKeyType(type)
+        if isSetType(type) { key = setElementType(type) }
+        collectCapabilityTargets(context, key, "equal", visited, targets)
+        if isMapType(type) { collectCapabilityTargets(context, mapValueType(type), "equal", visited, targets) }
+    }
+}
+
+function capabilityTargets(context: CompilerContext, type: Integer, operation: Text): List<Integer> {
+    let visited: List<Integer> = []
+    let targets: List<Integer> = []
+    collectCapabilityTargets(context, type, operation, visited, targets)
+    return targets
+}
+
+function noteCapabilityCalls(context: CompilerContext, type: Integer, operation: Text, state: List<Integer>, textState: List<Text>, output: List<Text>): Boolean {
+    if context.tokenLines.features / 256 % 2 == 0 { return false }
+    let targets = capabilityTargets(context, type, operation)
+    let index = 0
+    while index < targets.length {
+        let target = targets[index]
+        context.callTargets.add(target)
+        state[14] = state[14] + 1
+        if state[15] / 4 % 2 != 0 {
+            let types: List<Integer> = []
+            let offset = functionParameterOffset(context.functionParameterCounts, target)
+            let parameter = 0
+            while parameter < context.functionParameterCounts[target] { types.add(context.functionParameterTypes[offset + parameter]); parameter = parameter + 1 }
+            threadNote(output, textState[1], "call", context.functionNames[target], threadSignature(context.functionReturnTypes[target], types))
+        }
+        index = index + 1
+    }
+    return targets.length > 0
+}
+
+function noteHashableCalls(context: CompilerContext, type: Integer, state: List<Integer>, textState: List<Text>, output: List<Text>): Boolean {
+    let hash = noteCapabilityCalls(context, type, "hash", state, textState, output)
+    let equal = noteCapabilityCalls(context, type, "equal", state, textState, output)
+    return hash || equal
+}
+
 function visitTypeCapability(context: CompilerContext, type: Integer, capability: Text, path: List<Integer>): Boolean {
     if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || isScalarChoiceType(type) { return true }
+    if explicitRecordCapability(context, type, capability) || (capability == "Equatable" && explicitRecordEquality(context, type)) { return true }
+    // A custom equality cannot inherit a field-wise hash or a different order.
+    if (capability == "Hashable" || capability == "Ordered") && explicitRecordEquality(context, type) { return false }
     if capability == "Equatable" && isSetType(type) { return visitTypeCapability(context, setElementType(type), "Hashable", path) }
     if capability == "Equatable" && isMapType(type) {
         while isMapType(type) {
@@ -75,6 +156,7 @@ function typeSupportsCapability(context: CompilerContext, type: Integer, capabil
 
 function requireRecordCapability(context: CompilerContext, type: Integer, capability: Text, location: Integer) {
     if !typeSupportsCapability(context, type, capability) {
+        if explicitRecordEquality(context, type) && (capability == "Hashable" || capability == "Ordered") { failAtToken(context.tokenLines, location, "record '" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "' is not " + capability + "; its custom equality needs an explicit " + capability + " conformance") }
         failCompiler(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "' is not " + capability + "; every field must be " + capability + " and the record shape must be finite; Lists, Bytes, callbacks, native records and recursive shapes need an explicit operation")
     }
 }
@@ -128,6 +210,14 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
         if operation == "copy" { code.add("  ret ptr null\n") } else { code.add("  ret i64 0\n") }
     }
     code.add("present:\n")
+    let target = recordCapabilityTarget(context, type, operation)
+    if target >= 0 {
+        code.add("  %custom = call " + resultType + " @" + context.functionIRNames[target] + "(ptr %left")
+        if operation == "equal" || operation == "compare" { code.add(", ptr %right") }
+        code.add(")\n  ret " + llvmType(context.functionReturnTypes[target]) + " %custom\n}\n")
+        globals.add(joinText(code))
+        return name
+    }
     let counts = context.functionParameterCounts
     let fields = context.functionParameterTypes
     let record = recordTypeIndex(type)
@@ -154,6 +244,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
         let right = "%right." + id
         let value = "%field." + id
         let previous = result
+        let fieldBlock = "choice.active." + id
         let payload = cases.length > 0 && position > 0
         if payload {
             let parts = context.functionParameterNames[first + position].split("|")
@@ -216,6 +307,13 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
                     if operation == "hash" { code.add("  " + value + " = call i64 @minyar_hash_slot(i64 " + Text(kind) + ", i64 " + left + ")\n") }
                 }
             }
+            if context.tokenLines.features / 8 % 2 != 0 && capabilityTargets(context, field, operation).length > 0 {
+                code.add("  %pending." + id + " = call i32 @minyar_recovery_pending()\n  %failed." + id + " = icmp ne i32 %pending." + id + ", 0\n  br i1 %failed." + id + ", label %capability.unwind." + id + ", label %capability.ready." + id + "\ncapability.unwind." + id + ":\n")
+                if operation == "equal" { code.add("  ret i1 false\n") } else { code.add("  ret i64 0\n") }
+                code.add("capability.ready." + id + ":\n")
+                fieldBlock = "capability.ready." + id
+                if !payload { block = fieldBlock }
+            }
             if operation == "equal" { code.add("  %result." + id + " = and i1 " + result + ", " + value + "\n") }
             if operation == "compare" {
                 code.add("  %undecided." + id + " = icmp eq i64 " + result + ", 0\n")
@@ -232,7 +330,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
             if operation != "copy" {
                 let phiType = "i64"
                 if operation == "equal" { phiType = "i1" }
-                code.add("  %choice.result." + id + " = phi " + phiType + " [ " + previous + ", %" + block + " ], [ " + result + ", %choice.active." + id + " ]\n")
+                code.add("  %choice.result." + id + " = phi " + phiType + " [ " + previous + ", %" + block + " ], [ " + result + ", %" + fieldBlock + " ]\n")
                 result = "%choice.result." + id
             }
             block = "choice.next." + id
