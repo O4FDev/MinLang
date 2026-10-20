@@ -1,0 +1,451 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "../tools/driver-support.min" as host
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(") || (name == "main" && test.contains(line, "@main("))) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing sink function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function compiled(frontend: fixtures.Frontend, source: Text): Text {
+    test.require(fixtures.compile(frontend, source), "compile last-use sink IR")
+    return io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+}
+
+function moveCount(emitted: Text): Integer {
+    return count(emitted, "call void @minyar_rc_local_move_owner(") + count(emitted, "call void @minyar_rc_scope_move_v1(")
+}
+
+function checkSink(ir: Text, name: Text, moves: Integer, operation: Text, borrowed: Integer, taken: Integer, traced: Boolean) {
+    let emitted = body(ir, name)
+    let suffix = ""
+    if traced { suffix = "_traced" }
+    test.check(moveCount(emitted) == moves, name + ": local owner moves")
+    test.check(count(emitted, "call void @minyar_list_" + operation + suffix + "(") == borrowed, name + ": retaining sinks")
+    test.check(count(emitted, "call void @minyar_list_" + operation + "_take" + suffix + "(") == taken, name + ": consuming sinks")
+    test.check(!test.contains(emitted, "@minyar_rc_local_move_owner_traced("), name + ": cycle fixup must trace the sink, not its move")
+    if traced { test.check(!test.contains(emitted, "call void @minyar_list_" + operation + "_take("), name + ": cycle sink must stay traced") }
+}
+
+function checkOrder(ir: Text, name: Text, helper: Text, result: Text, operation: Text) {
+    let emitted = body(ir, name)
+    let evaluated = emitted.find("call " + result + " @.minyar.fn." + helper + "(")
+    if evaluated < 0 { evaluated = emitted.find("call " + result + " @.minyar.fn.minyar_module_0_" + helper + "(") }
+    let moved = emitted.find("call void @minyar_rc_local_move_owner(")
+    if moved < 0 { moved = emitted.find("call void @minyar_rc_scope_move_v1(") }
+    let sink = emitted.find("call void @minyar_list_" + operation + "_take(")
+    test.check(evaluated >= 0 && moved > evaluated && sink > moved, name + ": evaluate receiver/index and arguments before transferring the value")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    record Pair { x: Integer; y: Integer }
+    record Label { text: Text }
+    record Node { value: Integer; children: List<Node> }
+
+    function addText() {
+        let sink: List<Text> = []
+        let value = Text(-71)
+        sink.add((((value))))
+        print(sink[0])
+    }
+    function addList() {
+        let sink: List<List<Integer>> = []
+        let value = [10]
+        let alias = value
+        sink.add(value)
+        sink.clear()
+        alias.add(11)
+        print(alias.length)
+    }
+    function addBytes() {
+        let sink: List<Bytes> = []
+        let value = Bytes("sea")
+        sink.add(value)
+        print(Text(sink[0]))
+    }
+    function addRecord() {
+        let sink: List<Pair> = []
+        let value = Pair { x: 3; y: 4 }
+        value.x += 1
+        sink.add(value)
+        print(sink[0].x + sink[0].y)
+    }
+    function setText() {
+        let sink = [Text(-10)]
+        let value = Text(-20)
+        sink[0] = (((value)))
+        print(sink[0])
+    }
+    function setAlias() {
+        let sink = [Pair { x: 21; y: 22 }]
+        let value = sink[0]
+        let observer = value
+        sink[0] = value
+        sink.clear()
+        print(observer.x)
+    }
+    function branch(flag: Boolean) {
+        let sink: List<Text> = []
+        let value = Text(-30)
+        if flag { sink.add(value); print(sink[0]); return }
+        sink.add(value)
+        print(sink[0])
+    }
+    function earlyReturn(flag: Boolean) {
+        let sink: List<Text> = []
+        let value = Text(-31)
+        if flag { print("early"); return }
+        sink.add(value)
+        print(sink[0])
+    }
+    function whileFresh() {
+        let sink: List<List<Integer>> = []
+        let index = 0
+        while index < 3 {
+            let value = [index]
+            value.add(index + 1)
+            sink.add(value)
+            index += 1
+        }
+        print(sink.length)
+        print(sink[2][0])
+    }
+    function forFresh() {
+        let sink: List<Bytes> = []
+        for index in 0..3 {
+            let value = Bytes("x")
+            value[0] = 65 + index
+            sink.add(value)
+        }
+        print(Text(sink[0]) + Text(sink[1]) + Text(sink[2]))
+    }
+    function outsideLoop() {
+        let sink: List<Text> = []
+        let value = Text(-40)
+        for index in 0..2 { sink.add(value); print(sink[0]); sink.clear() }
+    }
+    function nestedLoop() {
+        let sink: List<Text> = []
+        let index = 0
+        while index < 2 {
+            let value = Text(-41)
+            for inner in 0..2 { sink.add(value); print(sink[0]); sink.clear() }
+            index += 1
+        }
+    }
+    function iteratorBinding() {
+        let source = [Text(-42)]
+        let sink: List<Text> = []
+        for value in source { sink.add(value); print(sink[0]); sink.clear() }
+    }
+    function rebindAfterMove() {
+        let sink: List<Text> = []
+        let value = Text(-50)
+        sink.add(value)
+        value = Text(-51)
+        print(sink[0])
+    }
+    function laterField() {
+        let sink: List<Pair> = []
+        let value = Pair { x: 1; y: 2 }
+        sink.add(value)
+        sink.clear()
+        value.x = 90
+        print("field")
+    }
+    function laterIndex() {
+        let sink: List<List<Integer>> = []
+        let value = [1]
+        sink.add(value)
+        sink.clear()
+        value[0] = 90
+        print("index")
+    }
+    function laterCompound() {
+        let sink: List<Text> = []
+        let value = Text(-900000000000060)
+        sink.add(value)
+        sink.clear()
+        value += " suffix"
+        print("compound")
+    }
+    function laterFieldCompound() {
+        let sink: List<Label> = []
+        let value = Label { text: Text(-900000000000061) }
+        sink.add(value)
+        sink.clear()
+        value.text += " suffix"
+        print("field compound")
+    }
+    function laterIndexCompound() {
+        let sink: List<List<Text>> = []
+        let value = [Text(-900000000000062)]
+        sink.add(value)
+        sink.clear()
+        value[0] += " suffix"
+        print("index compound")
+    }
+    function shadow() {
+        let sink: List<Text> = []
+        let value = Text(-61)
+        if true { let value = Text(-62); sink.add(value) }
+        sink.add(value)
+        print(sink[0]); print(sink[1])
+    }
+    function matchInitializer() {
+        let sink: List<Text> = []
+        let value = match Ok<Integer, Text>(1) { Ok(number) { Text(-70) } Err(error) { Text(-71) } }
+        let other = Text(-72)
+        sink.add(value)
+        sink.add(other)
+        print(sink[0]); print(sink[1])
+    }
+    function matchDecoy() {
+        let sink: List<Text> = []
+        let match = Text(-73)
+        sink.add((match Ok<Text, Text>(Text(-74)) { Ok(value) { value } Err(error) { error } }))
+        print(sink[0])
+    }
+    function position(value: Text, sink: List<Text>): Integer {
+        print(value)
+        sink[0] = Text(-11)
+        return 0
+    }
+    function orderedSet() {
+        let sink = [Text(-12)]
+        let value = Text(-13)
+        sink[position(value, sink)] = (((value)))
+        print(sink[0])
+    }
+    function target(sink: List<Text>, value: Text): List<Text> { print(value); return sink }
+    function orderedAdd() {
+        let sink: List<Text> = []
+        let value = Text(-14)
+        target(sink, value).add(value)
+        print(sink[0])
+    }
+    function propagated(input: Result<Integer, Text>): Result<Integer, Text> {
+        let sink: List<Text> = []
+        let value = Text(-80)
+        let number = try input
+        sink.add(value)
+        print(sink[0])
+        return Ok<Integer, Text>(number)
+    }
+    function cycleAdd() {
+        let children: List<Node> = []
+        let node = Node { value: 81; children: children }
+        children.add(node)
+        print(children[0].value)
+        children.clear()
+        print(children.length)
+    }
+    function cycleSet() {
+        let children = [Node { value: 0; children: [] }]
+        let node = Node { value: 82; children: children }
+        children[0] = node
+        print(children[0].value)
+        children.clear()
+        print(children.length)
+    }
+    function freshAdd() {
+        let sink: List<Text> = []
+        sink.add(Text(-90))
+        print(sink[0])
+    }
+    function freshSet() {
+        let sink = [Text(-91)]
+        sink[0] = Text(-92)
+        print(sink[0])
+    }
+    function fieldFallback() {
+        let sink: List<Text> = []
+        let value = Label { text: Text(-93) }
+        sink.add(value.text)
+        print(sink[0])
+    }
+    function indexFallback() {
+        let sink: List<Text> = []
+        let values = [Text(-94)]
+        sink.add(values[0])
+        print(sink[0])
+    }
+    function borrowed(value: Text) {
+        let sink: List<Text> = []
+        sink.add(value)
+        print(sink[0])
+    }
+    function writableParameter(value: Text, replace: Boolean) {
+        let sink: List<Text> = []
+        if replace { value = Text(-95) }
+        sink.add(value)
+        print(sink[0])
+    }
+
+    addText(); addList(); addBytes(); addRecord(); setText(); setAlias()
+    branch(true); branch(false); earlyReturn(true); earlyReturn(false)
+    whileFresh(); forFresh(); outsideLoop(); nestedLoop(); iteratorBinding()
+    rebindAfterMove(); laterField(); laterIndex(); laterCompound()
+    laterFieldCompound(); laterIndexCompound(); shadow(); matchInitializer(); matchDecoy()
+    orderedSet(); orderedAdd()
+    match propagated(Ok<Integer, Text>(7)) { Ok(value) { print(value) } Err(error) { print(error) } }
+    match propagated(Err<Integer, Text>("stopped")) { Ok(value) { print(value) } Err(error) { print(error) } }
+    cycleAdd(); cycleSet(); freshAdd(); freshSet(); fieldFallback(); indexFallback()
+    borrowed(Text(-96)); writableParameter(Text(-97), false); writableParameter(Text(-97), true)
+    let topSink: List<Text> = []
+    let topValue = Text(-98)
+    topSink.add(topValue)
+    print(topSink[0])
+    """#
+let expected = "-71\n2\nsea\n8\n-20\n21\n-30\n-30\nearly\n-31\n3\n2\nABC\n-40\n-40\n-41\n-41\n-41\n-41\n-42\n-50\nfield\nindex\ncompound\nfield compound\nindex compound\n-62\n-61\n-70\n-72\n-74\n-13\n-13\n-14\n-14\n-80\n7\nstopped\n81\n0\n82\n0\n-90\n-92\n-93\n-94\n-96\n-97\n-95\n-98\n"
+
+// Only three reference sink sites: scalar padding reaches the binding-ID cap.
+// sink=0, early=1, padding=2..4094, below=4095, above=4096.
+let boundaryParts = ["function idBoundary() {\nlet sink: List<Text> = []\nlet early = Text(-110)\nsink.add(early)\n"]
+for index in 0..4093 { boundaryParts.add("let padding" + Text(index) + " = 0\n") }
+boundaryParts.add("let below = Text(-111)\nsink.add(below)\nlet above = Text(-112)\nsink.add(above)\nprint(sink[0]); print(sink[1]); print(sink[2])\n}\n")
+for depth in [120, 130] {
+    boundaryParts.add("function depth" + Text(depth) + "() {\nlet sink: List<Text> = []\n")
+    if depth == 130 { boundaryParts.add("let before = Text(-120)\nsink.add(before)\n") }
+    for index in 0..depth { boundaryParts.add("if true {\n") }
+    let payload = -119
+    if depth == 130 { payload = -121 }
+    boundaryParts.add("let value = Text(" + Text(payload) + ")\nsink.add(value)\n")
+    for index in 0..depth { boundaryParts.add("}\n") }
+    if depth == 130 {
+        boundaryParts.add("let after = Text(-122)\nsink.add(after)\nprint(sink[0]); print(sink[1]); print(sink[2])\n")
+    } else { boundaryParts.add("print(sink[0])\n") }
+    boundaryParts.add("}\n")
+}
+boundaryParts.add("function afterBudget() {\nlet sink: List<Text> = []\nlet value = Text(-123)\nsink.add(value)\nprint(sink[0])\n}\nidBoundary(); depth120(); depth130(); afterBudget()\n")
+let boundaries = joinText(boundaryParts)
+let boundaryExpected = "-110\n-111\n-112\n-119\n-120\n-121\n-122\n-123\n"
+
+let callbacks = #"""
+    function captured() {
+        let sink: List<Text> = []
+        let value = Text(-100)
+        let read: () -> Text = function(): Text { return value }
+        sink.add(value)
+        print(read())
+    }
+    function callbackProgram() {
+        let sink: List<Text> = []
+        let value = Text(-101)
+        sink.add(value)
+        print(sink[0])
+    }
+    captured(); callbackProgram()
+    """#
+let threads = #"""
+    thread function dormant(seed: Integer, input: FrozenBytes, queue: BytesChannel): Integer { return seed }
+    function threadProgram() {
+        let sink: List<Text> = []
+        let value = Text(-102)
+        sink.add(value)
+        print(sink[0])
+    }
+    threadProgram()
+    """#
+let recovery = #"""
+    use "calldepth" as depth
+    function recovered() {
+        let sink: List<Text> = []
+        let value = Text(-103)
+        sink.add(value)
+        print(sink[0])
+    }
+    recovered(); print(depth.remaining())
+    """#
+let nativeSource = #"""
+    function nativeProbe(value: Text): Integer { native "sink_fixture" }
+    function nativeArgument() {
+        let value = Text(-104)
+        print(nativeProbe(value))
+    }
+    nativeArgument()
+    """#
+let gallery = io.readTextFile("examples/gallery/last-use-sinks.min")
+test.check(gallery.length > 0, "missing last-use sinks gallery")
+let originalCompiler = frontend.compiler.executable
+let wrapper = frontend.compiler.directory + "/scope-compiler"
+io.writeTextFile(wrapper, "#!/bin/sh\nexec " + host.shellQuote(originalCompiler) + " \"$@\" --scope-owners\n")
+test.require(test.run(["chmod", "+x", wrapper], frontend.environment, "", wrapper + ".mode", 10), "scope compiler wrapper mode")
+for scoped in [false, true] {
+    frontend.compiler.executable = originalCompiler
+    if scoped { frontend.compiler.executable = wrapper }
+    let ir = compiled(frontend, source)
+    if scoped { test.check(test.contains(ir, "call void @minyar_rc_scope_enter_v1("), "scope pass must actually lower fixture ownership") }
+    for name in ["addText", "addBytes", "addRecord", "earlyReturn", "rebindAfterMove", "orderedAdd", "propagated"] { checkSink(ir, name, 1, "add", 0, 1, false) }
+    for name in ["addList", "whileFresh"] { checkSink(ir, name, 1, "add", 2, 1, false) }
+    checkSink(ir, "forFresh", 1, "add", 0, 1, false)
+    checkSink(ir, "branch", 1, "add", 1, 1, false)
+    for name in ["setText", "setAlias", "orderedSet"] { checkSink(ir, name, 1, "set", 0, 1, false) }
+    for name in ["outsideLoop", "nestedLoop", "laterField", "laterCompound", "laterFieldCompound", "fieldFallback", "borrowed", "writableParameter", "matchDecoy"] { checkSink(ir, name, 0, "add", 1, 0, false) }
+    checkSink(ir, "laterIndex", 0, "add", 2, 0, false)
+    for name in ["iteratorBinding", "laterIndexCompound", "indexFallback"] { checkSink(ir, name, 0, "add", 1, 1, false) }
+    for name in ["shadow", "matchInitializer"] { checkSink(ir, name, 2, "add", 0, 2, false) }
+    checkSink(ir, "cycleAdd", 1, "add", 0, 1, true)
+    checkSink(ir, "cycleSet", 1, "set", 0, 1, true)
+    checkSink(ir, "freshAdd", 0, "add", 0, 1, false)
+    checkSink(ir, "freshSet", 0, "set", 0, 1, false)
+    checkSink(ir, "main", 0, "add", 1, 0, false)
+    checkOrder(ir, "orderedSet", "position", "i64", "set")
+    checkOrder(ir, "orderedAdd", "target", "ptr", "add")
+    fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+
+    let boundaryIR = compiled(frontend, boundaries)
+    checkSink(boundaryIR, "idBoundary", 2, "add", 1, 2, false)
+    let highLocals = body(boundaryIR, "idBoundary")
+    for id in [4095, 4096] { test.check(test.contains(highLocals, "%local." + Text(id) + " = alloca "), "exercise the actual local ID " + Text(id)) }
+    checkSink(boundaryIR, "depth120", 1, "add", 0, 1, false)
+    checkSink(boundaryIR, "depth130", 0, "add", 3, 0, false)
+    checkSink(boundaryIR, "afterBudget", 1, "add", 0, 1, false)
+    fixtures.executes(frontend, boundaries, boundaryExpected, ["-O0", "-O2"], 0, "", true)
+
+    let callbackIR = compiled(frontend, callbacks)
+    for name in ["captured", "callbackProgram"] { checkSink(callbackIR, name, 0, "add", 1, 0, false) }
+    fixtures.executes(frontend, callbacks, "-100\n-101\n", ["-O0", "-O2"], 0, "", true)
+    let threadIR = compiled(frontend, threads)
+    test.check(test.contains(threadIR, "minyar-thread-runtime: 1"), "thread exclusion must activate thread mode")
+    checkSink(threadIR, "threadProgram", 0, "add", 1, 0, false)
+    fixtures.executes(frontend, threads, "-102\n", ["-O0", "-O2"], 0, "", true)
+    let recoveryIR = compiled(frontend, recovery)
+    test.check(test.contains(recoveryIR, "@minyar_recovery_enter("), "recovery exclusion must activate recovery")
+    checkSink(recoveryIR, "recovered", 0, "add", 1, 0, false)
+    fixtures.executes(frontend, recovery, "-103\n-1\n", ["-O0", "-O2"], 0, "", true)
+    frontend.helpers = "\nlong long minyar_sink_fixture_nativeProbe(const void *value) { return value != NULL; }\n"
+    let nativeIR = compiled(frontend, nativeSource)
+    for name in ["nativeProbe", "nativeArgument"] { checkSink(nativeIR, name, 0, "add", 0, 0, false) }
+    fixtures.executes(frontend, nativeSource, "1\n", ["-O0", "-O2"], 0, "", true)
+    frontend.helpers = ""
+    checkSink(compiled(frontend, gallery), "gather", 3, "add", 0, 3, false)
+    fixtures.executes(frontend, gallery, "A shell for the windowsill.\nA feather for the book.\nA little light to carry home.\n", ["-O0", "-O2"], 0, "", true)
+}
+test.removeTree(frontend.compiler.directory)
+print("Last-use sinks: passed")
