@@ -777,6 +777,20 @@ escaped into evidence rather than losing the report. The fault-injection harness
 checks candidate selection, stderr rejection, rejecting/empty corpora, retained
 failure evidence, invalid diagnostic encoding and POSIX descendant cleanup.
 
+`make check-differential-fuzz` adds a broader compiler matrix. Its Python oracle
+generates valid self-checking programs with arithmetic, control flow, aliased
+records and Lists, Bytes, escaping callbacks and choice payloads, then runs each
+program through stage2 and stage3 with eager and arena runtimes at O0 and O2.
+The first mismatch is reduced by deleting independent case functions and
+shrinking operation counts while preserving a stable per-check failure identity.
+`make check-differential-fuzz-regressions` replays the checked-in minimized-spec
+corpus across the same matrix. Exact sources, replay specifications and command
+evidence are retained; output is capped at 16 MiB and every process group has a
+finite deadline. `make check-fuzz` runs the generator's independent fault-
+injection harness without paying for the compiler matrix. See
+[differential compiler fuzzing](differential-fuzz.md) for replay and campaign
+controls.
+
 `make check-text-literals` checks interpolation, multi-line indentation, raw
 delimiters, continuation, exact rejection locations and the text gallery at
 O0/O2 with ownership cleanup assertions. Its runtime probe measures one output
