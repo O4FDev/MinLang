@@ -1,0 +1,196 @@
+function patternShortName(name: Text): Text {
+    let readable = readableDeclarationName(name)
+    let first = 0
+    let position = 0
+    while position < readable.length {
+        if readable[position] == '.' { first = position + 1 }
+        position = position + 1
+    }
+    return readable.slice(first, readable.length)
+}
+
+function matchProductType(context: CompilerContext, type: Integer): Boolean {
+    if !isRecordType(type) { return false }
+    return context.symbolKinds[type - 1000] == 2 && choiceMatchCases(context, type).length == 0
+}
+
+function matchPatternCases(context: CompilerContext, type: Integer): List<Text> {
+    if matchProductType(context, type) { return ["product", readableDeclarationName(context.functionNames[type - 1000])] }
+    return choiceMatchCases(context, type)
+}
+
+function matchPatternFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
+    if !matchProductType(context, type) { return choiceMatchFields(context, type, name) }
+    let fields: List<Integer> = []
+    let field = 0
+    while field < context.functionParameterCounts[type - 1000] { fields.add(field); field = field + 1 }
+    return fields
+}
+
+function installPatternBindings(context: CompilerContext, nodes: List<MatchPattern>, bindingNodes: List<Integer>, values: List<Text>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>) {
+    let index = 0
+    while index < bindingNodes.length {
+        let pattern = nodes[bindingNodes[index]]
+        let id = nextLocal(state)
+        addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
+        let type: List<Integer> = [pattern.type]
+        assignReference(output, state, id, values[index], type, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+        storeLocal(output, id, pattern.type, values[index])
+        index = index + 1
+    }
+}
+
+// The caller's block owns these locals. A loop marker precedes the bindings,
+// making ordinary block exit, break and continue use the same cleanup boundary.
+function parsePatternCondition(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, scopes: List<Integer>, loop: Integer): Text {
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    if !tokenIs(context.tokenKinds, context.tokenTexts, state, "is") { setType(resultType, inputType[0]); return input }
+    let location = state[0]
+    if inputType[0] == 5 || inputType[0] == 6 { failAtToken(context.tokenLines, location, "Nothing cannot be matched or stored in a binding") }
+    state[0] = state[0] + 1
+    if loop >= 0 {
+        scopes[1] = state[3]
+        addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -1, loop)
+    }
+    scopes[0] = state[3]
+    let owner = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " pattern input", inputType[0], owner)
+    assignReference(output, state, owner, input, inputType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, owner, inputType[0], input)
+    let nodes: List<MatchPattern> = []
+    let names: List<Text> = []
+    let node = parseMatchPattern(context, state, inputType[0], nodes, names, 0)
+    let failure = "pattern.condition.false." + Text(newLabel(state))
+    let end = "pattern.condition.end." + Text(newLabel(state))
+    let bindingNodes: List<Integer> = []
+    let values: List<Text> = []
+    emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, values)
+    installPatternBindings(context, nodes, bindingNodes, values, localNames, localTypes, localIds, localLengths, state, output)
+    rootLocal(output, state, owner, "null", inputType[0])
+    let success = textState[0]
+    output.add("  br label %" + end + "\n\n" + failure + ":\n")
+    rootLocal(output, state, owner, "null", inputType[0])
+    let total = matchPatternIrrefutable(context, nodes, node)
+    if total { output.add("  unreachable\n") } else { output.add("  br label %" + end + "\n") }
+    output.add("\n" + end + ":\n")
+    textState[0] = end
+    setType(resultType, 4)
+    if total { return "true" }
+    return emitInstruction(output, textState, state, "phi i1 [ true, %" + success + " ], [ false, %" + failure + " ]")
+}
+
+function preparePatternScope(scopes: List<Integer>, depth: Integer, first: Integer) {
+    while scopes.length <= depth { scopes.add(-1) }
+    scopes[depth] = first
+}
+
+function letPatternAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return tokenIs(kinds, texts, [position], "let") && kinds[position + 1] == 1 && kinds[position + 2] == 4 && texts[position + 2] == "("
+}
+
+function patternBindingEquals(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, start: Integer): Integer {
+    let position = start
+    let depth = 0
+    while kinds[position] != 0 {
+        if kinds[position] == 4 {
+            let token = texts[position]
+            if token == "(" { depth = depth + 1 }
+            if token == ")" { depth = depth - 1 }
+            if token == "=" && depth == 0 { return position }
+            if token == "{" || token == "}" || depth < 0 { failAtToken(lines, position, "expected '=' after a let pattern") }
+        }
+        if kinds[position] == 6 && depth == 0 { failAtToken(lines, position, "expected '=' after a let pattern") }
+        position = position + 1
+    }
+    failAtToken(lines, position, "expected '=' after a let pattern")
+    return position
+}
+
+function compileLetPattern(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+    let start = state[0] + 1
+    let equals = patternBindingEquals(context.tokenKinds, context.tokenTexts, context.tokenLines, start)
+    state[0] = equals + 1
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    let after = state[0]
+    if inputType[0] == 5 || inputType[0] == 6 { failAtToken(context.tokenLines, start, "Nothing cannot be matched or stored in a binding") }
+    let owner = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " let pattern input", inputType[0], owner)
+    assignReference(output, state, owner, input, inputType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, owner, inputType[0], input)
+    state[0] = start
+    let nodes: List<MatchPattern> = []
+    let names: List<Text> = []
+    let node = parseMatchPattern(context, state, inputType[0], nodes, names, 0)
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "=")
+    let rows: List<PatternRow> = [PatternRow { values: [node] }]
+    let types: List<Integer> = [inputType[0]]
+    let fuel: List<Integer> = [100000]
+    let missing = missingMatchPatterns(context, nodes, rows, types, fuel, start)
+    if missing.missing { failAtToken(context.tokenLines, start, "let pattern can miss " + missing.values[0] + "; use if value is Pattern or match to handle the other values") }
+    state[0] = after
+    let failure = "pattern.let.invalid." + Text(newLabel(state))
+    let end = "pattern.let.end." + Text(newLabel(state))
+    let bindingNodes: List<Integer> = []
+    let values: List<Text> = []
+    emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, values)
+    installPatternBindings(context, nodes, bindingNodes, values, localNames, localTypes, localIds, localLengths, state, output)
+    rootLocal(output, state, owner, "null", inputType[0])
+    output.add("  br label %" + end + "\n\n" + failure + ":\n  unreachable\n\n" + end + ":\n")
+    textState[0] = end
+}
+
+function genericPatternLet(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, depth: Integer) {
+    let start = cursor[0] + 1
+    let equals = patternBindingEquals(stream.kinds, stream.texts, stream.lines, start)
+    cursor[0] = equals + 1
+    let type = genericExpression(program, stream, cursor, scope, 0, 0, depth + 1)
+    let after = cursor[0]
+    cursor[0] = start
+    genericMatchPattern(program, stream, cursor, scope, type, 0)
+    expectToken(stream.kinds, stream.texts, stream.lines, cursor, "=")
+    cursor[0] = after
+}
+
+function genericPatternConditionAt(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope): Boolean {
+    let start = cursor[0]
+    let position = start
+    let nested = 0
+    let matches = 0
+    let recordBrace = -1
+    let operand = true
+    while stream.kinds[position] != 0 {
+        let token = stream.texts[position]
+        if stream.kinds[position] == 6 && nested == 0 { return false }
+        if nested == 0 && stream.kinds[position] == 1 {
+            let member = position > start && stream.kinds[position - 1] == 4 && stream.texts[position - 1] == "."
+            if token == "is" && !operand && !member && matches == 0 { return true }
+            if token == "match" && operand && !member { matches = matches + 1; operand = true } else {
+                if genericDeclaration(program, token, 2) >= 0 && (stream.texts[position + 1] == "{" || genericHeaderFollows(stream.kinds, stream.texts, position, "{")) {
+                    recordBrace = position + 1
+                    while stream.kinds[recordBrace] != 0 && stream.texts[recordBrace] != "{" { recordBrace = recordBrace + 1 }
+                }
+                operand = token == "try"
+            }
+        }
+        if stream.kinds[position] == 4 {
+            if token == "{" && nested == 0 {
+                if position != recordBrace && matches == 0 && !operand { return false }
+                if position != recordBrace && matches > 0 { matches = matches - 1 }
+            }
+            if token == "(" || token == "[" || token == "{" { nested = nested + 1 }
+            if token == ")" || token == "]" || token == "}" {
+                nested = nested - 1
+                if nested < 0 { return false }
+                if nested == 0 { operand = false }
+            } else {
+                if nested == 0 { operand = true }
+            }
+        } else {
+            if nested == 0 && stream.kinds[position] != 1 { operand = false }
+        }
+        position = position + 1
+    }
+    return false
+}

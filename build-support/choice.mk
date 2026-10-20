@@ -13,6 +13,14 @@ build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | 
 
 .PHONY: check-patterns check-patterns-sanitize
 
+.PHONY: check-pattern-bindings check-pattern-bindings-sanitize
+
+check-pattern-bindings: build/minyarc build/minyar-runtime.o build/tooling/tests/pattern-bindings
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/pattern-bindings"
+
+check-pattern-bindings-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/pattern-bindings
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/pattern-bindings"
+
 check-patterns: build/minyarc build/minyar-runtime.o build/tooling/tests/patterns
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/patterns"
 
@@ -133,3 +141,6 @@ check-choice-set-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-san
 
 check check-portable: check-choice-set-niche
 check-sanitize: check-choice-set-niche-sanitize
+
+check check-portable: check-pattern-bindings
+check-sanitize: check-pattern-bindings-sanitize

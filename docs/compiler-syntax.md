@@ -139,6 +139,14 @@ example from the uncovered row. This analysis emits no runtime coverage code.
 Patterns are limited to 128 nesting levels; coverage has a bounded work budget
 and requests an `else` arm if that budget is exhausted.
 
+Contextual `if`/`while` checks and `let` destructuring use the same pattern tree
+and coverage checker through `compiler/pattern-bindings.min`. Ordinary records
+are single-constructor products with positional fields and normal private-field
+checks. A conditional owns its input until all tests finish, then installs its
+binding roots. The enclosing body owns those roots, including on loop jumps.
+`let` resolves its right side before its pattern names and rejects a missing
+coverage witness. Existing statement syntax kinds remain unchanged.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its

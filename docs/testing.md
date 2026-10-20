@@ -383,6 +383,14 @@ payloads, including skipped callbacks on empty/error cases. Every composition
 case runs with the same exact cleanup oracle.
 `check-choice-propagation-sanitize` adds ASan/UBSan.
 
+`make check-pattern-bindings` checks contextual `if ... is` and `while ... is`,
+record and single-case-choice destructuring, generic products, private fields,
+binding scope and irrefutable `let` diagnostics. Every positive program runs at
+O0/O2 with exact allocation and ownership-debt checks, including loop jumps,
+input replacement and escaping closures. The letters gallery is included.
+`check-pattern-bindings-sanitize` adds compiler, generated-code and runtime
+ASan/UBSan checks.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

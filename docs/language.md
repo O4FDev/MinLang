@@ -938,6 +938,43 @@ alive if a guard or arm replaces the original input, and can be returned or
 captured by a closure. Names are scoped to one arm and cannot repeat within its
 pattern. `where` remains an ordinary identifier outside the guard position.
 
+For one case, write `if value is Pattern` or `while value is Pattern`:
+
+```minyar
+if shape is Circle(radius) {
+    print(3.14159 * radius * radius)
+}
+
+while letters.next() is Some(letter) {
+    print(letter)
+}
+```
+
+Each check evaluates its input once. A loop checks again before every iteration.
+Bindings belong to the successful body; an `else` branch cannot use them.
+They keep their values alive if the body replaces the original input. `is`
+remains an ordinary name elsewhere, including `if is { ... }` for a Boolean
+binding named `is`.
+
+Record patterns list fields in declaration order. Use a `let` pattern when it
+must always succeed:
+
+```minyar
+record Pair { first: Integer; second: Text }
+let pair = Pair { first: 42; second: "days" }
+let Pair(number, unit) = pair
+print(number)
+print(unit)
+```
+
+Patterns can nest records, choices and literals. A `let` evaluates its right
+side before introducing its names. It rejects patterns that can fail, such as
+`let Some(value) = optional`, and shows an example value they miss. Use `if ... is`
+or `match` for those cases. A single-case choice can be destructured with `let`
+when its payload patterns also cover every value. Private record fields keep
+their ordinary access rules; `_` can ignore them. Native C-layout records do
+not yet support record patterns.
+
 A match can also produce a value. Each arm then contains one expression, and
 all arms must have the same type. This works for choices and `Result`:
 
