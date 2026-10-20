@@ -79,6 +79,15 @@ the checker resolves the concrete `iterator`, `advance` and `current` symbols
 and records their call dependencies before emitting ordinary loop blocks.
 There is no new syntax kind, type tag or runtime iteration ABI.
 
+Match patterns use a separate flat `MatchPattern` tree in `compiler/patterns.min`.
+Constructor tests branch before loading payloads; bindings acquire ownership only
+after the whole pattern succeeds. A false guard clears those binding roots before
+trying the next arm. Coverage specializes a matrix of unguarded patterns by
+constructor, preserving relationships between payloads and rebuilding a missing
+example from the uncovered row. This analysis emits no runtime coverage code.
+Patterns are limited to 128 nesting levels; coverage has a bounded work budget
+and requests an `else` arm if that budget is exhausted.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its

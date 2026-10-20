@@ -168,6 +168,12 @@ fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
 ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed
 with `unknown type 'Shape'`; the focused gate is the passing feature regression.
 
+`make check-patterns` runs nested choice/Result/Maybe patterns, scalar literals,
+Boolean product coverage, contextual `where` guards and the lantern gallery at
+O0/O2 with ownership cleanup assertions. It checks nested bindings after input
+mutation, failed guard cleanup, escaping closures, pattern type errors, binding
+scope, and missing-case example values. `check-patterns-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

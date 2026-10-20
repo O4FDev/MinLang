@@ -271,12 +271,20 @@ function choiceMatchFields(context: CompilerContext, type: Integer, name: Text):
     return choicePayloadFields(context, type, name)
 }
 
+function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, input: Text, type: Integer): Text {
+    return readRecordField(output, textState, state, input, 0, 1)
+}
+
+function readChoiceMatchPayload(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, input: Text, choiceType: Integer, field: Integer, type: Integer): Text {
+    return readRecordField(output, textState, state, input, field, type)
+}
+
 function parseMatchExpression(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let location = state[0]
     state[0] = state[0] + 1
     let inputType: List<Integer> = [0]
     let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
-    if choiceMatchCases(context, inputType[0]).length == 0 { failCompiler(describeLocation(tokenLocation(context.tokenLines, location)) + ": match needs a Result or choice") }
+    if !matchInputType(context, inputType[0]) { failAtToken(context.tokenLines, location, "match needs a choice, Result or scalar value") }
     let values: List<Text> = []
     let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, context.activeReturnType, input, inputType, location, resultType, values)
     return values[0]
@@ -301,7 +309,8 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
     assignReference(output, state, owner, input, inputType, counts, types, returns)
     storeLocal(output, owner, inputType[0], input)
-    let tag = readRecordField(output, textState, state, input, 0, 1)
+    let nodes: List<MatchPattern> = []
+    let rows: List<PatternRow> = []
     let endLabel = "choice.match.end." + Text(newLabel(state))
     let allReturn = true
     let seenElse = false
@@ -312,58 +321,52 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         let name = texts[armLocation]
         if seenElse { failAtToken(lines, armLocation, "else must be the last match arm") }
         let fallback = name == "else" && kinds[armLocation] == 1
-        let variant = findText(cases, name)
-        if resultTypeName(inputType[0], context.functionNames) {
-            if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "expected Ok or Err in result match") }
-            if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate result arm " + name) }
+        let variant = -1
+        if kinds[armLocation] == 1 { variant = findText(cases, name) }
+        if !fallback && variant > 0 && seen[variant] != 0 {
+            if resultTypeName(inputType[0], context.functionNames) { failAtToken(lines, armLocation, "duplicate result arm " + name) }
+            failAtToken(lines, armLocation, "duplicate match arm '" + name + "'")
         }
-        if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "unknown case '" + name + "' in choice match") }
-        if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate match arm '" + name + "'") }
-        state[0] = state[0] + 1
-        let fields: List<Integer> = []
-        if fallback { seenElse = true } else { seen[variant] = 1; fields = choiceMatchFields(context, inputType[0], name) }
         let bindings: List<Text> = []
-        if fields.length > 0 || tokenIs(kinds, texts, state, "(") {
-            expectToken(kinds, texts, lines, state, "(")
-            let index = 0
-            while index < fields.length {
-                if index > 0 { expectToken(kinds, texts, lines, state, ",") }
-                if kinds[state[0]] != 1 || texts[state[0]] == "true" || texts[state[0]] == "false" { failAtToken(lines, state[0], "expected a choice payload binding") }
-                let binding = texts[state[0]]
-                if binding != "_" && findText(bindings, binding) >= 0 { failAtToken(lines, state[0], "duplicate choice payload binding '" + binding + "'") }
-                bindings.add(binding)
-                state[0] = state[0] + 1
-                index = index + 1
-            }
-            expectToken(kinds, texts, lines, state, ")")
-        }
-        let armLabel = "choice.match.arm." + Text(newLabel(state))
+        let node = -1
+        if fallback {
+            state[0] = state[0] + 1
+            let children: List<Integer> = []
+            node = nodes.length
+            nodes.add(MatchPattern { kind: 0; type: inputType[0]; location: armLocation; after: state[0]; name: "_"; children: children })
+            seenElse = true
+        } else { node = parseMatchPattern(context, state, inputType[0], nodes, bindings, 0) }
         let nextLabel = "choice.match.next." + Text(newLabel(state))
-        if fallback { output.add("  br label %" + armLabel + "\n") } else {
-            let condition = valueName(textState, newTemporary(state))
-            output.add("  " + condition + " = icmp eq i64 " + tag + ", " + Text(variant - 1) + "\n")
-            output.add(conditionalBranch(condition, armLabel, nextLabel))
-        }
-        output.add("\n" + armLabel + ":\n")
-        textState[0] = armLabel
+        let guardFailure = "choice.match.guard." + Text(newLabel(state))
         let scope = state[3]
+        let bindingNodes: List<Integer> = []
+        let bindingValues: List<Text> = []
         let bindingIds: List<Integer> = []
-        let first = functionParameterOffset(counts, inputType[0] - 1000)
+        emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, nextLabel, bindingNodes, bindingValues)
         let index = 0
-        while index < fields.length {
-            let field = fields[index]
-            let type = types[first + field]
-            let id = -1
-            if bindings[index] != "_" {
-                let payload = readRecordField(output, textState, state, input, field, type)
-                id = nextLocal(state)
-                addLocal(localNames, localTypes, localIds, localLengths, state, bindings[index], type, id)
-                let payloadType: List<Integer> = [type]
-                assignReference(output, state, id, payload, payloadType, counts, types, returns)
-                storeLocal(output, id, type, payload)
-            }
+        while index < bindingNodes.length {
+            let pattern = nodes[bindingNodes[index]]
+            let id = nextLocal(state)
+            addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
+            let payloadType: List<Integer> = [pattern.type]
+            assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
+            storeLocal(output, id, pattern.type, bindingValues[index])
             bindingIds.add(id)
             index = index + 1
+        }
+        let guarded = kinds[state[0]] == 1 && texts[state[0]] == "where"
+        if fallback && guarded { failAtToken(lines, state[0], "an else arm cannot have a guard; use a binding or _ pattern") }
+        if guarded {
+            let guardLocation = state[0]
+            state[0] = state[0] + 1
+            let guardType: List<Integer> = [4]
+            let condition = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, guardType)
+            if guardType[0] != 4 { failAtToken(lines, guardLocation, "match guard must be Boolean") }
+            matchPatternBranch(output, textState, state, condition, guardFailure)
+        } else {
+            let values: List<Integer> = [node]
+            rows.add(PatternRow { values: values })
+            if variant > 0 && matchPatternTotalCase(context, nodes, node) { seen[variant] = 1 }
         }
         let terminal = false
         if expression {
@@ -383,38 +386,52 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         }
         if !terminal {
             index = 0
-            while index < fields.length {
-                if bindingIds[index] >= 0 { rootLocal(output, state, bindingIds[index], "null", types[first + fields[index]]) }
+            while index < bindingIds.length {
+                rootLocal(output, state, bindingIds[index], "null", nodes[bindingNodes[index]].type)
                 index = index + 1
             }
             output.add("  br label %" + endLabel + "\n")
             allReturn = false
         }
         state[3] = scope
-        if !fallback {
-            output.add("\n" + nextLabel + ":\n")
-            textState[0] = nextLabel
+        if guarded {
+            output.add("\n" + guardFailure + ":\n")
+            index = 0
+            while index < bindingIds.length {
+                rootLocal(output, state, bindingIds[index], "null", nodes[bindingNodes[index]].type)
+                index = index + 1
+            }
+            output.add("  br label %" + nextLabel + "\n")
         }
+        output.add("\n" + nextLabel + ":\n")
+        textState[0] = nextLabel
         skipTerminators(kinds, state)
     }
     expectToken(kinds, texts, lines, state, "}")
-    let missing: List<Text> = []
-    let variant = 1
-    while variant < cases.length {
-        if seen[variant] == 0 {
-            if missing.length > 0 { missing.add(", ") }
-            missing.add(cases[variant])
+    if !seenElse {
+        let inputTypes: List<Integer> = [inputType[0]]
+        let fuel: List<Integer> = [100000]
+        let witness = missingMatchPatterns(context, nodes, rows, inputTypes, fuel, location)
+        if witness.missing {
+            let missing: List<Text> = []
+            let names: List<Text> = []
+            let variant = 1
+            while variant < cases.length {
+                if missingMatchCase(context, nodes, rows, inputType[0], cases[variant], fuel, location) {
+                    if missing.length > 0 { missing.add(", ") }
+                    missing.add(cases[variant])
+                    names.add(cases[variant])
+                }
+                variant = variant + 1
+            }
+            let detail = "; for example: " + witness.values[0]
+            if resultTypeName(inputType[0], context.functionNames) { failAtToken(lines, location, "match must handle both Ok and Err; missing cases: " + diagnosticNameList(names) + detail) }
+            let description = joinText(missing)
+            if description == "" { description = witness.values[0] }
+            failAtToken(lines, location, "match is missing cases: " + description + detail)
         }
-        variant = variant + 1
     }
-    if !seenElse && missing.length > 0 && resultTypeName(inputType[0], context.functionNames) {
-        let names: List<Text> = []
-        variant = 1
-        while variant < cases.length { if seen[variant] == 0 { names.add(cases[variant]) }; variant = variant + 1 }
-        failAtToken(lines, location, "match must handle both Ok and Err; missing cases: " + diagnosticNameList(names))
-    }
-    if !seenElse && missing.length > 0 { failAtToken(lines, location, "match is missing cases: " + joinText(missing)) }
-    if !seenElse { output.add("  unreachable\n") }
+    output.add("  unreachable\n")
     if !allReturn {
         output.add("\n" + endLabel + ":\n")
         textState[0] = endLabel

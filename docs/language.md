@@ -760,10 +760,42 @@ are written `Empty` or `Shape.Empty`; empty parentheses are also accepted.
 Use `public choice` to export a choice and its cases. In another module,
 `geometry.Shape.Circle(2.0)` constructs an exported case.
 
-A match evaluates its input once. It must cover every case exactly once, or end
-with `else { ... }` to handle the remaining cases. A missing-case diagnostic
-names the cases still needed. Payload names in an arm are local bindings; `_`
-ignores a payload. Arms may return, break or continue just like other blocks.
+A match evaluates its input once and tries its arms in order. It must cover
+every possible value, or end with `else { ... }` to handle the rest. A missing-case
+diagnostic shows an example value that still needs handling. Payload names in
+an arm are local bindings; `_` ignores a value. Arms may return, break or continue
+just like other blocks. An `_` in a diagnostic example stands for any value of
+that payload type.
+
+Patterns can nest choice and Result cases, and match Integer, Float, Boolean,
+Character and Text literals. A binding or `_` matches any value of its expected
+type. Case names resolve from the value being matched, including nested payloads.
+Add `where` and a Boolean expression to accept a pattern only when its guard is
+true:
+
+```minyar
+function describe(value: Maybe<Maybe<Integer>>): Text {
+    return match value {
+        Some(Some(0)) { "nothing yet" }
+        Some(Some(number)) where number > 0 { "a little light" }
+        Some(Some(_)) { "below the horizon" }
+        Some(None) { "an empty lantern" }
+        None { "no lantern" }
+    }
+}
+```
+
+A guard runs only after its pattern matches. It can use the arm's bindings;
+if it returns false, matching continues with the next arm. Guarded arms do not
+prove coverage, even when the guard is `true`. Without an `else` or wildcard,
+Boolean patterns must cover both `true` and `false`; numeric and text literals
+need a binding or wildcard for the remaining values. Scalar values can also be
+matched directly: `match count { 0 { "none" } _ { "some" } }`.
+
+Nested bindings have the same ownership as ordinary arm bindings. They remain
+alive if a guard or arm replaces the original input, and can be returned or
+captured by a closure. Names are scoped to one arm and cannot repeat within its
+pattern. `where` remains an ordinary identifier outside the guard position.
 
 A match can also produce a value. Each arm then contains one expression, and
 all arms must have the same type. This works for choices and `Result`:
@@ -824,7 +856,7 @@ management. Each value allocates a tag and slots for all declared payloads;
 inactive slots are empty. This includes choices with no payloads. Payloads can
 hold choices, records, Lists and callbacks, with the same ownership and cycle
 analysis as records. Cases and payload fields are accessed through constructors
-and matching. Nested or literal patterns are not yet supported.
+and matching. Patterns inspect only the active case and its payloads.
 
 ## Maps and Sets
 

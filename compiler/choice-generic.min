@@ -61,7 +61,17 @@ function genericChoiceConstructor(program: GenericProgram, stream: GenericStream
     }
     let signature = program.declarations[declaration]
     let bindings = genericBindings(signature)
-    if expected > 0 && program.types[expected].name == signature.name { bindings = program.types[expected].arguments }
+    if expected > 0 && program.types[expected].name == signature.name {
+        // Interned type shapes are immutable. Inference fills unknown arguments
+        // in this constructor's own bindings, never in the surrounding shape.
+        let contextual: List<Integer> = []
+        let argument = 0
+        while argument < program.types[expected].arguments.length {
+            contextual.add(program.types[expected].arguments[argument])
+            argument = argument + 1
+        }
+        bindings = contextual
+    }
     let name = token
     cursor[0] = position + 1
     if tokenIs(stream.kinds, stream.texts, cursor, "<") { bindings = genericArgumentTypes(program, stream, cursor) }
@@ -116,6 +126,44 @@ function genericChoicePayloads(program: GenericProgram, input: Integer, name: Te
     return payloads
 }
 
+function genericMatchPattern(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, input: Integer, depth: Integer) {
+    if depth > 128 { genericError(stream, cursor[0], "this pattern is too deeply nested; split it into another match") }
+    let position = cursor[0]
+    let name = stream.texts[position]
+    let kind = stream.kinds[position]
+    if kind == 0 || (kind == 4 && name != "-") { genericError(stream, position, "expected a choice payload binding or pattern") }
+    if kind == 4 && name == "-" {
+        if stream.kinds[position + 1] != 2 && stream.kinds[position + 1] != 7 { genericError(stream, position, "expected a numeric literal after '-' in a pattern") }
+        cursor[0] = cursor[0] + 1
+    }
+    cursor[0] = cursor[0] + 1
+    let constructor = false
+    if input > 0 && kind == 1 {
+        let shape = program.types[input]
+        let declaration = genericDeclaration(program, shape.name, 2)
+        if declaration >= 0 { constructor = findText(genericChoiceCases(program.declarations[declaration]), name) > 0 }
+        if shape.name == "Result" && declaration < 0 { constructor = name == "Ok" || name == "Err" }
+    }
+    let payloads = genericChoicePayloads(program, input, name)
+    let count = payloads.length
+    if constructor && name == "Ok" && count > 0 && program.types[payloads[0]].name == "Nothing" { count = 0 }
+    let needsPayload = constructor && count > 0
+    if needsPayload || tokenIs(stream.kinds, stream.texts, cursor, "(") {
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, "(")
+        let field = 0
+        while (constructor && field < count) || (!constructor && !tokenIs(stream.kinds, stream.texts, cursor, ")")) {
+            if field > 0 { expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",") }
+            let payload = 0
+            if field < payloads.length { payload = payloads[field] }
+            genericMatchPattern(program, stream, cursor, scope, payload, depth + 1)
+            field = field + 1
+        }
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, ")")
+    } else {
+        if kind == 1 && !constructor && name != "_" && (name != "else" || depth > 0) && name != "true" && name != "false" { genericScopeAdd(scope, name, input) }
+    }
+}
+
 function genericChoiceMatch(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, expected: Integer, depth: Integer, expression: Boolean): Integer {
     cursor[0] = cursor[0] + 1
     let input = genericExpression(program, stream, cursor, scope, 0, 0, depth + 1)
@@ -123,22 +171,11 @@ function genericChoiceMatch(program: GenericProgram, stream: GenericStream, curs
     skipTerminators(stream.kinds, cursor)
     let result = expected
     while !tokenIs(stream.kinds, stream.texts, cursor, "}") {
-        let arm = stream.texts[cursor[0]]
-        cursor[0] = cursor[0] + 1
         let active = scope.active
-        let payloads = genericChoicePayloads(program, input, arm)
-        if tokenIs(stream.kinds, stream.texts, cursor, "(") {
+        genericMatchPattern(program, stream, cursor, scope, input, 0)
+        if stream.kinds[cursor[0]] == 1 && stream.texts[cursor[0]] == "where" {
             cursor[0] = cursor[0] + 1
-            let field = 0
-            while !tokenIs(stream.kinds, stream.texts, cursor, ")") {
-                let payload = 0
-                if field < payloads.length { payload = payloads[field] }
-                genericScopeAdd(scope, stream.texts[cursor[0]], payload)
-                cursor[0] = cursor[0] + 1
-                if tokenIs(stream.kinds, stream.texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
-                field = field + 1
-            }
-            cursor[0] = cursor[0] + 1
+            genericExpression(program, stream, cursor, scope, genericNamedType(program, "Boolean"), 0, depth + 1)
         }
         if expression {
             expectToken(stream.kinds, stream.texts, stream.lines, cursor, "{")

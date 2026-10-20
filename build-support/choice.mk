@@ -8,6 +8,14 @@ build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | 
 
 .PHONY: check-choice-identifiers check-choice-smoke check-choice check-choice-sanitize check-choice-library check-choice-library-sanitize
 
+.PHONY: check-patterns check-patterns-sanitize
+
+check-patterns: build/minyarc build/minyar-runtime.o build/tooling/tests/patterns
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/patterns"
+
+check-patterns-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/patterns
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/patterns"
+
 check-choice-identifiers: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-identifiers
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-identifiers"
 
@@ -28,5 +36,5 @@ check-choice-library: build/minyarc build/minyar-runtime.o build/tooling/tests/c
 check-choice-library-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-library
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-library"
 
-check check-portable: check-choice check-choice-library
-check-sanitize: check-choice-sanitize check-choice-library-sanitize
+check check-portable: check-choice check-choice-library check-patterns
+check-sanitize: check-choice-sanitize check-choice-library-sanitize check-patterns-sanitize
