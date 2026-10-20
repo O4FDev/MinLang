@@ -1,5 +1,10 @@
 # Testing strategy
 
+Python harnesses use the standard library. CI selects CPython 3.15.0 from
+`.python-version` through the pinned `actions/setup-python` action; no pip
+packages are needed. Use the same interpreter when reproducing Python
+harness failures. Packager minimum versions remain documented separately.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery
