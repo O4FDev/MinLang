@@ -5,9 +5,11 @@ check-security-static:
 	MINYAR_CLANG="$(LLVM_CC)" sh scripts/security-static-analysis.sh
 
 # Compile each freestanding entry point on PRs after OS parser edits.
+# ROOT is passed so os/Makefile names its outputs from the same root spelling as these goals;
+# its own $(abspath ..) can differ from $(CURDIR) when the checkout is reached through a symlink or bind mount.
 check-security-os: build/minyarc
-	$(MAKE) -C os "$(CURDIR)/build/os/x86_64/kernel.ll" "$(CURDIR)/build/os/x86_64/loader.ll"
-	$(MAKE) -C os ARCH=arm64 "$(CURDIR)/build/os/arm64/kernel.ll"
+	$(MAKE) -C os ROOT="$(CURDIR)" "$(CURDIR)/build/os/x86_64/kernel.ll" "$(CURDIR)/build/os/x86_64/loader.ll"
+	$(MAKE) -C os ROOT="$(CURDIR)" ARCH=arm64 "$(CURDIR)/build/os/arm64/kernel.ll"
 	MINYAR_CLANG="$(LLVM_CC)" sh scripts/security-freestanding-math.sh
 
 # Exercise the pure OS response parser with hostile bytes in a hosted process.
