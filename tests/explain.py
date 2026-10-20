@@ -755,6 +755,125 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         assert leaked not in identity_protocol_diagnostic["message"], ("protocol identity primary leaked implementation data", leaked, identity_protocol_diagnostic)
 
 
+    # Numeric count errors remain at the call name. Type errors identify the
+    # first mismatching argument through existing syntax children, on failure.
+    for name, source, code, primary, span in (
+        ("bytes-type", "Bytes(true)\n", "E0401",
+         "Bytes expects one Integer or Text argument; found Boolean", (1, 7, 1, 11)),
+        ("float-type", 'Float("3")\n', "E0401",
+         "Float expects one Integer or Float argument; found Text", (1, 7, 1, 10)),
+        ("integer-type", "Integer(true)\n", "E0401",
+         "Integer expects one Integer, Float, Character, or Text argument; found Boolean", (1, 9, 1, 13)),
+        ("character-type", 'Character("A")\n', "E0401",
+         "Character expects one Integer argument; found Text", (1, 11, 1, 14)),
+        ("abs-type", 'abs("x")\n', "E0401",
+         "abs expects one Integer or Float argument; found Text", (1, 5, 1, 8)),
+        ("min-first-type", "min(true, 1)\n", "E0401",
+         "min expects 2 Integer or 2 Float arguments; found Boolean", (1, 5, 1, 9)),
+        ("min-later-type", 'min(1, "x")\n', "E0401",
+         "min expects 2 Integer arguments; found Text", (1, 8, 1, 11)),
+        ("min-float-selected", "min(1.0, 2)\n", "E0401",
+         "min expects 2 Float arguments; found Integer", (1, 10, 1, 11)),
+        ("min-integer-selected", "min(1, 2.0)\n", "E0401",
+         "min expects 2 Integer arguments; found Float", (1, 8, 1, 11)),
+        ("max-type", "max(1.0, true)\n", "E0401",
+         "max expects 2 Float arguments; found Boolean", (1, 10, 1, 14)),
+        ("max-first-type", 'max("x", true)\n', "E0401",
+         "max expects 2 Integer or 2 Float arguments; found Text", (1, 5, 1, 8)),
+        ("clamp-type", 'clamp(1, 0, "x")\n', "E0401",
+         "clamp expects 3 Integer arguments; found Text", (1, 13, 1, 16)),
+        ("clamp-float-selected", "clamp(1.0, 0.0, true)\n", "E0401",
+         "clamp expects 3 Float arguments; found Boolean", (1, 17, 1, 21)),
+        ("clamp-first-type", "clamp(true, 0, 1)\n", "E0401",
+         "clamp expects 3 Integer or 3 Float arguments; found Boolean", (1, 7, 1, 11)),
+        ("clamp-first-mismatch", 'clamp(1, true, "x")\n', "E0401",
+         "clamp expects 3 Integer arguments; found Boolean", (1, 10, 1, 14)),
+        ("wrapping-add-type", "wrappingAdd(1, true)\n", "E0401",
+         "wrappingAdd expects 2 Integer arguments; found Boolean", (1, 16, 1, 20)),
+        ("wrapping-subtract-type", "wrappingSubtract(true, 1)\n", "E0401",
+         "wrappingSubtract expects 2 Integer arguments; found Boolean", (1, 18, 1, 22)),
+        ("wrapping-multiply-type", 'wrappingMultiply(1, "x")\n', "E0401",
+         "wrappingMultiply expects 2 Integer arguments; found Text", (1, 21, 1, 24)),
+        ("grouped-argument", "min(1, (true))\n", "E0401",
+         "min expects 2 Integer arguments; found Boolean", (1, 8, 1, 9)),
+        ("nested-argument", "max(1, abs(2.5))\n", "E0401",
+         "max expects 2 Integer arguments; found Float", (1, 8, 1, 11)),
+        ("nested-wrapping", "wrappingAdd(1, Float(2))\n", "E0401",
+         "wrappingAdd expects 2 Integer arguments; found Float", (1, 16, 1, 21)),
+        ("record-argument", "record Lantern { light: Integer }\nFloat(Lantern { light: 3 })\n", "E0401",
+         "Float expects one Integer or Float argument; found Lantern", (2, 7, 2, 14)),
+        ("list-argument", "Character([1])\n", "E0401",
+         "Character expects one Integer argument; found List<Integer>", (1, 11, 1, 12)),
+        ("multiline-argument", 'clamp(\n    1,\n    0,\n    "x"\n)\n', "E0401",
+         "clamp expects 3 Integer arguments; found Text", (4, 5, 4, 8)),
+        ("bytes-count-before-type", "Bytes(true, false)\n", "E0404",
+         "Bytes expects 1 argument, but received 2", (1, 1, 1, 6)),
+        ("float-count-before-type", "Float(true, false)\n", "E0404",
+         "Float expects 1 argument, but received 2", (1, 1, 1, 6)),
+        ("integer-count-before-type", "Integer(true, false)\n", "E0404",
+         "Integer expects 1 argument, but received 2", (1, 1, 1, 8)),
+        ("character-count-before-type", 'Character("A", "B")\n', "E0404",
+         "Character expects 1 argument, but received 2", (1, 1, 1, 10)),
+        ("abs-count-before-type", "abs(true, false)\n", "E0404",
+         "abs expects 1 argument, but received 2", (1, 1, 1, 4)),
+        ("min-count-before-type", "min(true)\n", "E0404",
+         "min expects 2 arguments, but received 1", (1, 1, 1, 4)),
+        ("max-count-before-type", "max(true, false, true)\n", "E0404",
+         "max expects 2 arguments, but received 3", (1, 1, 1, 4)),
+        ("clamp-count-before-type", "clamp(true, false)\n", "E0404",
+         "clamp expects 3 arguments, but received 2", (1, 1, 1, 6)),
+        ("wrapping-add-count-before-type", "wrappingAdd(true)\n", "E0404",
+         "wrappingAdd expects 2 arguments, but received 1", (1, 1, 1, 12)),
+        ("wrapping-subtract-count-before-type", "wrappingSubtract(true, false, 0)\n", "E0404",
+         "wrappingSubtract expects 2 arguments, but received 3", (1, 1, 1, 17)),
+        ("wrapping-multiply-empty", "wrappingMultiply()\n", "E0404",
+         "wrappingMultiply expects 2 arguments, but received 0", (1, 1, 1, 17)),
+        ("integer-empty", "Integer()\n", "E0404",
+         "Integer expects 1 argument, but received 0", (1, 1, 1, 8)),
+        ("min-empty", "min()\n", "E0404",
+         "min expects 2 arguments, but received 0", (1, 1, 1, 4)),
+    ):
+        path = root / f"numeric-builtin-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        help_text = ("change this value to the expected type, or change the declaration if it should accept the found type"
+                     if code == "E0401" else
+                     "pass one value for each parameter in the function's declaration, in the same order")
+        value = diagnostic(path, code, expected_help=help_text, expected_message=primary,
+                           expected_span=span, expected_source_lines=source.splitlines())
+        assert value["label"] == "", ("numeric builtin has no secondary label", path, value)
+
+    # Argument parsing remains ahead of builtin arity/type validation.
+    unresolved = root / "numeric-builtin-parse-before-count.min"
+    unresolved.write_text("min(missing)\n", encoding="utf-8")
+    diagnostic(unresolved, "E0301", expected_message="I can't find a value named 'missing'",
+               expected_span=(1, 5, 1, 12), expected_source_lines=["min(missing)"])
+
+    compile_program("numeric-builtin-overloads", """print(Bytes().length)
+print(Bytes(3).length)
+print(Bytes("é").length)
+print(Float(7))
+print(Float(1.5))
+print(Integer(7))
+print(Integer('A'))
+print(Integer("42"))
+print(Integer(-7.9))
+print(Character(65))
+print(abs(-4))
+print(abs(-4.5))
+print(min(3, -2))
+print(min(3.0, -2.0))
+print(max(3, -2))
+print(max(1.5, 2.5))
+print(clamp(15, 0, 10))
+print(clamp(1.5, 0.0, 1.0))
+print(wrappingAdd(9223372036854775807, 1))
+print(wrappingSubtract(-9223372036854775808, 1))
+print(wrappingMultiply(-9223372036854775808, -1))
+print(wrappingAdd(1, 2,))
+print(min(1.0, 2.0,))
+""")
+
+
     missing = root / "missing source.min"
     diagnostic(missing, "E0101", has_excerpt=False)
     diagnostic(root / "invalid UTF-8.min", "E0101", has_excerpt=False)
