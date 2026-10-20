@@ -137,6 +137,18 @@ the reported reduction compares only its fresh matching controls. Complete
 observations and identities are in
 [`frames-compare-borrows.json`](../experiments/memory/frames-compare-borrows.json).
 
+Extending the same lifetime proof to allocating Text join/search helpers showed
+no self-compile instruction gain. Its eager median was 2,367,902,557 versus
+2,367,788,397 for the fresh same-source control, a 0.00482% increase. Matching
+arena medians were 1,188,611,457 and 1,188,611,839, respectively; candidate eager
+is 1.9922 times arena. The pass removes 66 static cells/retains and 67 releases
+and preserves service with 48 additional exit polls, but static counts do not
+establish a performance improvement. Both 725-function modules have zero legacy
+calls/fallbacks; all 32 outputs match the frozen original LLVM and all counters
+remain continuous and unscaled. The campaign uses fresh matching controls and
+one shared output filename. Complete observations and identities are in
+[`frames-runtime-borrows.json`](../experiments/memory/frames-runtime-borrows.json).
+
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
 attaches to a stopped child, enables at exec, excludes the Python parent and
