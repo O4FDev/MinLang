@@ -1,0 +1,183 @@
+// Seeded MC146818 campaign: the production RTC reader (os/shared/rtc.min)
+// against a simulated clock whose update cycle, NMI-like stalls and garbage
+// register reads during an update are chosen by a simulation.World. Every
+// accepted calendar must be one coherent second that existed while the read
+// ran. A deliberately naive reader (one pass, no update-in-progress protocol,
+// the bug class Linux fixed in mc146818_avoid_UIP) must be caught, so the
+// campaign is shown to have teeth.
+use "../tools/testing.min" as test
+use "../os/shared/rtc.min" as rtc
+use "simulation" as simulation
+
+constant SECOND = 1000000
+// The chip raises update-in-progress 244 us before the second boundary and
+// its registers are undefined for the 1984 us update cycle that follows.
+constant WARNING = 244
+constant UPDATING = 1984
+
+record Moment { year: Integer; month: Integer; day: Integer; hour: Integer; minute: Integer; second: Integer }
+
+record Clock {
+    world: simulation.World
+    now: Integer
+    moments: List<Moment>
+    binary: Boolean
+    fullDay: Boolean
+    stalls: Integer
+    garbage: Integer
+}
+
+function leap(year: Integer): Boolean { return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) }
+
+function monthDays(year: Integer, month: Integer): Integer {
+    if month == 2 { if leap(year) { return 29 } else { return 28 } }
+    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
+    return 31
+}
+
+function tick(moment: Moment): Moment {
+    let next = Moment { year: moment.year; month: moment.month; day: moment.day; hour: moment.hour; minute: moment.minute; second: moment.second + 1 }
+    if next.second == 60 { next.second = 0; next.minute += 1 }
+    if next.minute == 60 { next.minute = 0; next.hour += 1 }
+    if next.hour == 24 { next.hour = 0; next.day += 1 }
+    if next.day > monthDays(next.year, next.month) { next.day = 1; next.month += 1 }
+    if next.month == 13 { next.month = 1; next.year += 1 }
+    return next
+}
+
+function momentAt(clock: Clock, time: Integer): Moment {
+    let index = time / SECOND
+    while clock.moments.length <= index { clock.moments.add(tick(clock.moments[clock.moments.length - 1])) }
+    return clock.moments[index]
+}
+
+function encode(clock: Clock, value: Integer): Integer {
+    if clock.binary { return value }
+    return (value / 10) * 16 + value % 10
+}
+
+function hourByte(clock: Clock, hour: Integer): Integer {
+    if clock.fullDay { return encode(clock, hour) }
+    let display = hour % 12
+    if display == 0 { display = 12 }
+    let byte = encode(clock, display)
+    if hour >= 12 { byte = byte | 128 }
+    return byte
+}
+
+// One register read. Time always moves; sometimes a long stall (an NMI, SMI
+// or a descheduled vCPU) lands between two reads.
+function readRegister(clock: Clock, index: Integer): Integer {
+    if simulation.choose(clock.world, 24) == 0 {
+        clock.now += SECOND / 5 + simulation.choose(clock.world, SECOND * 2)
+        clock.stalls += 1
+    } else {
+        clock.now += 1 + simulation.choose(clock.world, 400)
+    }
+    let phase = clock.now % SECOND
+    let warning = phase >= SECOND - WARNING || phase < UPDATING
+    if index == 10 {
+        if warning { return 128 | 0x26 }
+        return 0x26
+    }
+    if index == 11 {
+        let mode = 0
+        if clock.binary { mode = mode | 4 }
+        if clock.fullDay { mode = mode | 2 }
+        return mode
+    }
+    if phase < UPDATING {
+        clock.garbage += 1
+        return simulation.choose(clock.world, 256)
+    }
+    let moment = momentAt(clock, clock.now)
+    if index == 0 { return encode(clock, moment.second) }
+    if index == 2 { return encode(clock, moment.minute) }
+    if index == 4 { return hourByte(clock, moment.hour) }
+    if index == 7 { return encode(clock, moment.day) }
+    if index == 8 { return encode(clock, moment.month) }
+    if index == 9 { return encode(clock, moment.year - 2000) }
+    fail("simulated RTC has no register " + Text(index))
+    return 0
+}
+
+function same(calendar: rtc.Calendar, moment: Moment): Boolean {
+    return calendar.year == moment.year && calendar.month == moment.month && calendar.day == moment.day &&
+        calendar.hour == moment.hour && calendar.minute == moment.minute && calendar.second == moment.second
+}
+
+// Boundaries where a torn read is most visible: minute, hour, day, month,
+// year and leap-day rollovers.
+function start(world: simulation.World): Moment {
+    let choice = simulation.choose(world, 5)
+    if choice == 0 { return Moment { year: 2026; month: 12; day: 31; hour: 23; minute: 59; second: 58 } }
+    if choice == 1 { return Moment { year: 2028; month: 2; day: 28; hour: 23; minute: 59; second: 59 } }
+    if choice == 2 { return Moment { year: 2026; month: 10; day: 20; hour: 11; minute: 59; second: 57 } }
+    if choice == 3 { return Moment { year: 2099; month: 6; day: 30; hour: 12; minute: 59; second: 59 } }
+    return Moment { year: 2026; month: 3; day: 1; hour: 9; minute: simulation.choose(world, 60); second: simulation.choose(world, 60) }
+}
+
+// The naive reader: one pass over the registers with no update-in-progress
+// protocol and no recheck. It compiles and usually works.
+function naiveRead(register: Callback<Integer, Integer>): Result<rtc.Calendar, Text> {
+    let second = register(0)
+    let minute = register(2)
+    let hour = register(4)
+    let day = register(7)
+    let month = register(8)
+    let year = register(9)
+    return rtc.decode(register(11), year, month, day, hour, minute, second)
+}
+
+// One seeded read. Returns "" when the result is coherent, else a reason.
+function trial(seed: Integer, naive: Boolean, digest: List<Integer>): Text {
+    let world = simulation.create(seed)
+    let first = start(world)
+    let clock = Clock { world: world; now: simulation.choose(world, SECOND); moments: [first]; binary: simulation.choose(world, 2) == 1; fullDay: simulation.choose(world, 4) != 0; stalls: 0; garbage: 0 }
+    let reader: Callback<Integer, Integer> = function(index: Integer): Integer { return readRegister(clock, index) }
+    let before = clock.now
+    let result: Result<rtc.Calendar, Text> = Err("no read")
+    if naive { result = naiveRead(reader) } else { result = rtc.read(reader, 1000) }
+    let after = clock.now
+    for line in simulation.transcript(world) { digest[0] = wrappingAdd(wrappingMultiply(digest[0], 1099511628211), line.length) }
+    digest[1] += clock.stalls
+    digest[2] += clock.garbage
+    let reason = "accepted a calendar that never existed during the read"
+    match result {
+        Ok(calendar) {
+            let second = before / SECOND
+            while second <= after / SECOND {
+                if same(calendar, momentAt(clock, second * SECOND)) { reason = "" }
+                second += 1
+            }
+        }
+        Err(message) {
+            reason = "reader failed: " + message
+        }
+    }
+    return reason
+}
+
+let seeds = 20000
+let first: List<Integer> = [0, 0, 0]
+for seed in 1..seeds + 1 {
+    let reason = trial(seed, false, first)
+    test.check(reason == "", "RTC campaign seed " + Text(seed) + ": " + reason)
+}
+test.check(first[1] > 0 && first[2] > 0, "RTC campaign never stalled or never read during an update")
+let again: List<Integer> = [0, 0, 0]
+for seed in 1..seeds + 1 { trial(seed, false, again) }
+test.check(first[0] == again[0] && first[1] == again[1] && first[2] == again[2], "RTC campaign must replay identically from its seeds")
+let caught = 0
+let torn = 0
+let firstTorn = 0
+for seed in 1..seeds + 1 {
+    let reason = trial(seed, true, [0, 0, 0])
+    if reason != "" { caught += 1 }
+    if reason.startsWith("accepted") {
+        torn += 1
+        if firstTorn == 0 { firstTorn = seed }
+    }
+}
+test.check(torn > 0, "the campaign must catch the naive one-pass reader accepting a torn calendar")
+print("RTC campaign: production reader coherent on " + Text(seeds) + " seeds (" + Text(first[1]) + " stalls, " + Text(first[2]) + " garbage update-cycle reads), replay identical; naive reader wrong on " + Text(caught) + " seeds, " + Text(torn) + " of them silently torn (first: seed " + Text(firstTorn) + ")")
