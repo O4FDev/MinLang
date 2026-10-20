@@ -19,7 +19,9 @@ def main():
     parser.add_argument("--android-api", action="store_true", help="also compile actual Activity against ANDROID_JAR")
     parser.add_argument("--sanitize", action="store_true")
     args = parser.parse_args()
-    evidence = ROOT / "build/mobile-tests" / ("android-host-sanitize" if args.sanitize else "android-host")
+    # Independent runner invocations can overlap. Each stage owns its class
+    # files, binaries and transcripts, including javac's non-atomic outputs.
+    evidence = ROOT / "build/mobile-tests" / ("android-host-sanitize" if args.sanitize else "android-host") / args.stage
     evidence.mkdir(parents=True, exist_ok=True)
     clang = os.environ.get("MINYAR_TEST_CLANG")
     if not clang:
