@@ -1,0 +1,141 @@
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let source = #"""
+    use "handles" as h
+    function check(ok: Boolean, message: Text) { if !ok { fail(message) } }
+    let first = h.create<Integer>()
+    let second = h.create<Integer>()
+    let old = h.insert(first, 10)
+    let alias = old
+    let foreign = h.insert(second, 20)
+    check(!h.contains(first, foreign) && !h.contains(second, old), "pool domain")
+    check(h.get(second, old).isNone() && h.remove(second, old).isNone(), "wrong domain lookup/removal")
+    check(!h.replace(second, old, 30) && h.get(second, foreign).unwrap() == 20, "wrong domain replacement")
+    check(h.remove(first, old).unwrap() == 10, "remove value")
+    let fresh = h.insert(first, 40)
+    check(h.slotCount(first) == 1 && h.count(first) == 1, "reuse slot")
+    check(!h.contains(first, alias) && h.get(first, alias).isNone(), "stale alias")
+    check(h.remove(first, alias).isNone() && !h.replace(first, alias, 90), "stale mutation")
+    check(h.get(first, fresh).unwrap() == 40, "replacement survives stale access")
+    check(h.replace(first, fresh, 41) && h.get(first, fresh).unwrap() == 41, "live replacement")
+    h.clear(first)
+    h.clear(first)
+    check(h.count(first) == 0 && !h.contains(first, fresh), "clear invalidates")
+    let afterClear = h.insert(first, 50)
+    check(h.slotCount(first) == 1 && h.get(first, afterClear).unwrap() == 50, "clear retains generation")
+
+    // Exhaustion has a deliberately small bound, not a wrapped counter oracle.
+    let bounded = h.withGenerationLimit<Integer>(3)
+    let history: List<h.Handle<Integer>> = []
+    for index in 0..12 {
+        let current = h.insert(bounded, index)
+        for stale in history { check(!h.contains(bounded, stale), "retired identity revived") }
+        history.add(current)
+        check(h.remove(bounded, current).unwrap() == index, "bounded removal")
+        check(h.slotCount(bounded) == index / 3 + 1, "exhausted slot must retire")
+    }
+    let single = h.withGenerationLimit<Integer>(1)
+    for index in 0..5 { h.insert(single, index) }
+    h.clear(single)
+    h.clear(single)
+    h.insert(single, 99)
+    check(h.slotCount(single) == 6 && h.count(single) == 1, "clear retires exhausted slots once")
+
+    record Note { text: Text }
+    let notes = h.create<Note>()
+    let note = Note { text: "before" }
+    let key = h.insert(notes, note)
+    let borrowed = h.get(notes, key).unwrap()
+    borrowed.text = "after"
+    check(h.get(notes, key).unwrap().text == "after", "payload alias semantics")
+    h.remove(notes, key)
+    h.clear(notes)
+    check(borrowed.text == "after", "returned payload owns its lifetime")
+    let temporary = h.insert(notes, Note { text: "only the lookup keeps this alive" })
+    let kept = h.get(notes, temporary).unwrap()
+    h.clear(notes)
+    let removedKey = h.insert(notes, Note { text: "only removal keeps this alive" })
+    let removed = h.remove(notes, removedKey).unwrap()
+    h.insert(notes, Note { text: "replacement" })
+    h.clear(notes)
+    check(kept.text == "only the lookup keeps this alive", "get result lifetime")
+    check(removed.text == "only removal keeps this alive", "remove result lifetime")
+    let nested = h.create<Maybe<Integer>>()
+    let empty = h.insert(nested, None<Integer>())
+    check(h.contains(nested, empty) && h.get(nested, empty).unwrap().isNone(), "empty payload is present")
+    h.remove(nested, empty)
+    check(h.get(nested, empty).isNone(), "removed empty payload is absent")
+
+    // Independent history model exercises varied insert/remove/clear/replace order.
+    let pool = h.withGenerationLimit<Integer>(7)
+    let keys: List<h.Handle<Integer>> = []
+    let alive: List<Boolean> = []
+    let values: List<Integer> = []
+    let random = 73
+    for step in 0..2000 {
+        random = random * 48271 % 2147483647
+        let action = random % 9
+        if action < 3 || keys.length == 0 {
+            keys.add(h.insert(pool, step)); alive.add(true); values.add(step)
+        } else if action == 8 {
+            h.clear(pool)
+            for index in 0..alive.length { alive[index] = false }
+        } else {
+            let index = random % keys.length
+            if action < 6 {
+                let removed = h.remove(pool, keys[index])
+                check(removed.isSome() == alive[index], "history remove presence")
+                if alive[index] { check(removed.unwrap() == values[index], "history removed value") }
+                alive[index] = false
+            } else {
+                check(h.replace(pool, keys[index], step) == alive[index], "history replacement")
+                if alive[index] { values[index] = step }
+            }
+        }
+        if step % 31 == 0 {
+            let count = 0
+            for index in 0..keys.length {
+                check(h.contains(pool, keys[index]) == alive[index], "history identity")
+                let found = h.get(pool, keys[index])
+                check(found.isSome() == alive[index], "history lookup")
+                if alive[index] { check(found.unwrap() == values[index], "history value"); count += 1 }
+            }
+            check(h.count(pool) == count, "history count")
+        }
+    }
+    print("generational handles passed")
+    """#
+fixtures.executes(frontend, source, "generational handles passed\n", levels, 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/handles.min"), "The old window has closed.\nEvening stars\n", levels, 0, "", true)
+// Same-module probes reach actual Integer boundaries without public backdoors.
+let implementation = io.readTextFile("library/handles.min")
+fixtures.executes(frontend, implementation + #"""
+    let pool = create<Integer>()
+    let old = insert(pool, 7)
+    pool.slots[0].generation = 9223372036854775807
+    let last = Handle<Integer> { domain: pool.domain; slot: 0; generation: 9223372036854775807 }
+    if remove(pool, last).unwrap() != 7 { fail("last generation removal") }
+    let next = insert(pool, 8)
+    if slotCount(pool) != 2 || contains(pool, old) || contains(pool, last) || get(pool, next).unwrap() != 8 { fail("generation wrapped") }
+    print("maximum generation retired")
+    """#, "maximum generation retired\n", levels, 0, "", true)
+fixtures.executes(frontend, implementation + "\ndomains.next = 9223372036854775806\nlet last = create<Integer>()\nlet exhausted = create<Integer>()\n", "", levels, 1, "Minyar stopped: handles: pool identities are exhausted\n", false)
+for limit in ["0", "-1"] {
+    fixtures.executes(frontend, "use \"handles\" as h\nlet pool = h.withGenerationLimit<Integer>(" + limit + ")\n", "", levels, 1, "Minyar stopped: handles: the generation limit must be positive\n", false)
+}
+let prelude = "use \"handles\" as h\nlet pool = h.create<Integer>()\nlet key = h.insert(pool, 1)\n"
+for field in ["domain", "slot", "generation"] {
+    fixtures.rejects(frontend, prelude + "print(key." + field + ")\n", "private", true)
+    fixtures.rejects(frontend, prelude + "key." + field + " = 1\n", "private", true)
+}
+fixtures.rejects(frontend, prelude + "pool.slots.clear()\n", "private", true)
+fixtures.rejects(frontend, prelude + "let other = h.create<Text>()\nh.get(other, key)\n", "type", true)
+fixtures.rejects(frontend, "use \"handles\" as h\nlet forged = h.Handle<Integer> { domain: 1; slot: 0; generation: 1 }\n", "private", true)
+fixtures.rejects(frontend, "use \"handles\" as h\nlet forged = h.Pool<Integer> { domain: 1; slots: []; available: -1; live: 0; limit: 3 }\n", "private", true)
+fixtures.rejects(frontend, "use \"handles\" as h\nthread function worker(seed: Integer, input: FrozenBytes, queue: BytesChannel): Integer { let pool = h.create<Integer>(); return h.count(pool) }\n", "unsafe thread effect in 'withGenerationLimit': constant", true)
+test.removeTree(frontend.compiler.directory)
+print("generational handle checks: passed")
