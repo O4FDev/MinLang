@@ -90,7 +90,8 @@ make prepare-playground-tests
 make check-playground
 ```
 
-`check-wasm` executes real O0/O2 WASI programs, checks cycle cleanup and
+`check-wasm` executes real O0/O2 WASI programs, including every unmodified
+fixture in the native language conformance index, checks cycle cleanup and
 failed-output preservation, runs every tour through the wasm frontend and
 browser LLVM backend, compares native/wasm frontend LLVM, and checks
 diagnostic recovery and resource limits. `check-playground` also drives

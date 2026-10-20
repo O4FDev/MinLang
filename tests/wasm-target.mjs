@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { WASI } from 'node:wasi';
 import { normalizeLLVM } from '../tools/wasm-target.mjs';
@@ -9,7 +9,7 @@ if (process.argv[2] === '--run') {
   const file = path.resolve(process.argv[3]);
   const wasi = new WASI({ version: 'preview1', returnOnExit: true,
     args: ['minyar', ...process.argv.slice(4)], env: {},
-    preopens: { '/sandbox': path.dirname(file) } });
+    preopens: { '.': path.dirname(file), '/sandbox': path.dirname(file) } });
   const module = await WebAssembly.compile(readFileSync(file));
   const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
   process.exitCode = wasi.start(instance);
@@ -111,6 +111,16 @@ if (process.argv[2] === '--run') {
     print("cycles released")
     `, 'cycles released\nWASI ownership: no live managed objects\n'],
   ];
+
+  // Run the same feature-indexed sources and independent stdout oracles as
+  // the native language gate, without rewriting their programs or expected data.
+  mkdirSync(`${directory}/build`, { recursive: true });
+  for (const entry of readdirSync('tests/conformance', { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const fixture = `tests/conformance/${entry.name}`;
+    cases.push([`conformance-${entry.name}`, readFileSync(`${fixture}/program.min`, 'utf8'),
+      readFileSync(`${fixture}/expected.stdout`, 'utf8')]);
+  }
 
   const ownershipRuntime = `${directory}/ownership-runtime.o`;
   const instrumented = command(clang, ['--target=wasm32-wasip1', `--sysroot=${sysroot}`,

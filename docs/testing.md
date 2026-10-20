@@ -167,7 +167,8 @@ It runs the methods gallery and ownership assertions at O0/O2.
 `check-methods-sanitize` repeats these checks with ASan/UBSan.
 
 `make check-wasm` builds the real wasm32-WASI target and static playground.
-It executes O0/O2 target fixtures with cycle ownership assertions, every
+It executes O0/O2 target fixtures and the unmodified native conformance
+corpus with cycle ownership assertions, every
 guided example through the wasm frontend and browser LLVM backend, native
 frontend LLVM parity, JSON diagnostic recovery and resource limits.
 `make prepare-playground-tests check-playground` adds Chromium editor, worker,
