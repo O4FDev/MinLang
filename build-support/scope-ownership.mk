@@ -1,6 +1,6 @@
 .PHONY: check-scope-ownership check-scope-ownership-sanitize check-scope-fixed-point
 
-build/tooling/tests/scope-ownership: tests/frontend-fixtures.min tools/test-runtime.min
+build/tooling/tests/scope-ownership.ll: tests/frontend-fixtures.min tools/test-runtime.min
 build/tooling/tests/scope-ownership.ll: tests/choice-composition-cycle.min tests/choice-composition-cycle.expected tests/choice-container-niche.min tests/choice-container-niche.expected
 build/tooling/tests/scope-ownership.ll: tests/choice-scalar-niche-bench.min
 
