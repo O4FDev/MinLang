@@ -409,7 +409,7 @@ build/tooling/tests/incremental-modules.ll: tests/thread-port-support.min tests/
 build/tooling/tests/incremental-modules: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/incremental-modules: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/incremental-modules: runtime/native/sha256.c
-build/tooling/tests/incremental-module-driver.ll: tests/thread-port-support.min tests/cycle-port-support.min
+build/tooling/tests/incremental-module-driver.ll: tests/thread-port-support.min tests/cycle-port-support.min tests/sha256-support.min
 build/tooling/tests/incremental-module-driver: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/incremental-module-driver: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/incremental-module-driver: runtime/native/sha256.c

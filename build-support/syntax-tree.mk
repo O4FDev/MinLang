@@ -4,6 +4,14 @@ check-declaration-index: build/minyarc build/minyar-runtime.o build/tooling/test
 
 check-portable check: check-declaration-index
 
+.PHONY: check-incremental-module-index
+check-incremental-module-index: build/minyarc build/minyar-runtime.o build/tooling/tests/incremental-module-index
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/incremental-module-index
+
+build/tooling/tests/incremental-module-index.ll: tests/incremental-module-index-probe.min
+
+check-portable check: check-incremental-module-index
+
 .PHONY: check-declaration-cache
 check-declaration-cache: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-module-delta
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/incremental-module-delta

@@ -84,13 +84,40 @@ function readModuleFields(source: Text): List<Text> {
     return fields
 }
 
-function priorModule(prior: List<Text>, path: Text, role: Text): Integer {
-    let position = 3
+function moduleRowHash(path: Text, role: Text): Integer {
+    return declarationHash(path, declarationHash(role, 0))
+}
+
+function buildModuleIndex(prior: List<Text>): List<Integer> {
+    let capacity = 8
+    while capacity < ((prior.length - 3) / 10) * 2 { capacity = capacity * 2 }
+    let lookup: List<Integer> = []
+    let position = 0
+    while position < capacity { lookup.add(-1); position = position + 1 }
+    position = 3
     while position + 9 < prior.length {
-        if prior[position] == path && prior[position + 1] == role {
-            return position
+        let bucket = moduleRowHash(prior[position], prior[position + 1]) % capacity
+        let saved = lookup[bucket]
+        while saved >= 0 && !(prior[saved] == prior[position] && prior[saved + 1] == prior[position + 1]) {
+            bucket = (bucket + 1) % capacity
+            saved = lookup[bucket]
         }
+        // Keep the first complete row, matching the former linear lookup.
+        if saved < 0 { lookup[bucket] = position }
         position = position + 10
+    }
+    return lookup
+}
+
+function priorModule(prior: List<Text>, lookup: List<Integer>, path: Text, role: Text): Integer {
+    let capacity = lookup.length
+    if capacity == 0 { return -1 }
+    let bucket = moduleRowHash(path, role) % capacity
+    let saved = lookup[bucket]
+    while saved >= 0 {
+        if prior[saved] == path && prior[saved + 1] == role { return saved }
+        bucket = (bucket + 1) % capacity
+        saved = lookup[bucket]
     }
     return -1
 }
@@ -117,14 +144,16 @@ function overlayModuleFields(base: List<Text>, source: Text, baseIdentity: Text)
         position = position + 1 }
     let graph = decodeModuleFields(delta[2])
     if graph.length % 2 != 0 { failCompiler("invalid module delta graph") }
+    let replacementLookup = buildModuleIndex(replacements)
+    let baseLookup = buildModuleIndex(base)
     position = 0
     while position < graph.length {
         let role = "library"
         if position == 0 { role = "entry" }
-        let saved = priorModule(replacements, graph[position], role)
+        let saved = priorModule(replacements, replacementLookup, graph[position], role)
         let selected = replacements
         if saved < 0 { selected = base
-            saved = priorModule(base, graph[position], role) }
+            saved = priorModule(base, baseLookup, graph[position], role) }
         if saved < 0 { failCompiler("missing module delta row") }
         let column = 0
         while column < 10 { rows.add(selected[saved + column])
@@ -150,10 +179,11 @@ function writeModuleUpdate(path: Text, next: List<Text>, base: List<Text>, baseI
     delta.add(baseIdentity)
     delta.add(next[1])
     if next[1] == base[1] { delta.add("") } else { delta.add(next[2]) }
+    let baseLookup = buildModuleIndex(base)
     let position = 3
     let changed = 0
     while position < next.length {
-        let saved = priorModule(base, next[position], next[position + 1])
+        let saved = priorModule(base, baseLookup, next[position], next[position + 1])
         let different = saved < 0
         let column = 0
         while column < 10 && !different {
@@ -335,7 +365,7 @@ function moduleInterfaceContext(module: Integer, importHeads: List<Integer>, imp
     return joinText(pieces)
 }
 
-function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, modulePaths: List<Text>, moduleSources: List<Text>, moduleStates: List<Integer>, modulePublic: List<Integer>, moduleTokenStarts: List<Integer>, allTokenKinds: List<Integer>, allTokenTexts: List<Text>, allTokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationStarts: List<Integer>, declarationEnds: List<Integer>, prior: List<Text>, summaries: List<Text>, topLevels: List<Integer>, cacheRows: List<Integer>, lexerStats: List<Integer>, moduleImports: List<Text>, moduleOrigins: List<Text>): Integer {
+function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, modulePaths: List<Text>, moduleSources: List<Text>, moduleStates: List<Integer>, modulePublic: List<Integer>, moduleTokenStarts: List<Integer>, allTokenKinds: List<Integer>, allTokenTexts: List<Text>, allTokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationStarts: List<Integer>, declarationEnds: List<Integer>, prior: List<Text>, priorLookup: List<Integer>, summaries: List<Text>, topLevels: List<Integer>, cacheRows: List<Integer>, lexerStats: List<Integer>, moduleImports: List<Text>, moduleOrigins: List<Text>): Integer {
     let canonicalPath = normalizePath(path)
     let existing = findText(modulePaths, canonicalPath)
     if existing >= 0 {
@@ -362,7 +392,7 @@ function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, module
     moduleSources.add(source)
     let role = "library"
     if isEntry { role = "entry" }
-    let cached = priorModule(prior, canonicalPath, role)
+    let cached = priorModule(prior, priorLookup, canonicalPath, role)
     cacheRows.add(cached)
     summaries.add("")
     topLevels.add(0)
@@ -392,7 +422,7 @@ function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, module
             if !(specifier.length >= 2 && specifier[0] == '.' && (pathCharacterIsSeparator(specifier[1]) || specifier[1] == '.')) {
                 lexerStats[2] = 1
             }
-            let target = loadInterfaceModule(library, targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+            let target = loadInterfaceModule(library, targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, priorLookup, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
             importOwners.add(module)
             importAliases.add(alias)
             importTargets.add(target)
@@ -453,7 +483,7 @@ function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, module
             if !(specifier.length >= 2 && specifier[0] == '.' && (pathCharacterIsSeparator(specifier[1]) || specifier[1] == '.')) {
                 lexerStats[2] = 1
             }
-            let target = loadInterfaceModule(library, targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+            let target = loadInterfaceModule(library, targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, priorLookup, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
             importOwners.add(module)
             importAliases.add(alias)
             importTargets.add(target)
@@ -665,6 +695,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
             prior = overlayModuleFields(base, io.readTextFile(plan[2]), baseIdentity)
         }
     }
+    let priorLookup = buildModuleIndex(prior)
     let modulePaths: List<Text> = []
     let moduleSources: List<Text> = []
     let moduleStates: List<Integer> = []
@@ -685,7 +716,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
     let moduleImports: List<Text> = []
     let moduleOrigins: List<Text> = []
     let lexerStats: List<Integer> = [0, 0, 0]
-    let entry = loadInterfaceModule(library, path, true, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+    let entry = loadInterfaceModule(library, path, true, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, priorLookup, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
     if lexerStats[2] == 1 {
         let code = joinText(compileEntryWithLibrary(path, stackOwnerLimit, library))
         io.writeTextFile(outputState, "")

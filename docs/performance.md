@@ -14,10 +14,17 @@ and generated programs, and compares workloads at different sizes. Measurements
 are written to `build/performance.json`. `check-scaling` covers large declaration
 sets, late-bound calls, and module graphs.
 
+The harness is `tests/performance-test.min`. For four times the input, its
+limits are 5.5 times the CPU time for functions and records, and 7.0 for
+statements, locals and modules. Declaration lookup uses a hash index; there
+is no separate allowance for known superlinear declaration lookup.
+`check-declaration-index` compares it with an independent linear oracle.
+
 ## Local baselines
 
 ```sh
-python3 tests/performance.py --save-baseline
+make build/tooling/tests/performance-test build/tooling/tests/compiler-behavior build/compiler-stage3.ll
+./build/tooling/tests/performance-test --save-baseline
 ```
 
 This saves `build/performance-baseline.json`. Later runs fail when measurements
@@ -26,12 +33,16 @@ build configuration.
 
 ## Absolute compiler budget
 
-`check-budget` enforces fixed ceilings on self-compilation wall time, CPU time,
-peak memory, and retired instructions. The ceilings in
-[`tests/self-compile-budget.py`](../tests/self-compile-budget.py) remain
-75 million instructions, 10 MiB, 22 ms CPU, and 25 ms wall time. They were
-calibrated against an earlier, smaller compiler on an Apple M-series laptop.
-They are regression targets, not a statement that the current branch passes.
+`check-budget` enforces 75 million retired instructions and 17 MiB peak memory,
+plus matched previous/current wall and CPU comparisons over three batches of
+100 alternating pairs. The paired median must be at most 1.01 and the upper
+95% confidence bound at most 1.05. These limits are defined in
+[`tests/performance-support.min`](../tests/performance-support.min).
+Real resource qualification requires the owner macOS CI and matched inputs;
+Linux can run `./build/tooling/tests/self-compile-budget --functional`.
+The separate `check-performance` self-compile limits are 20 seconds wall,
+2 seconds CPU and 64 MiB. These remain regression targets, not a statement
+that the current, larger compiler passes.
 
 The October hardening review reconstructs the starting compiler and runtime
 instead of comparing against old documentation. That branch already exceeded
@@ -40,13 +51,14 @@ formatting, lexer reads reuse known characters, and direct buffer writes remove
 trivial wrappers. Cold stack-bound initialization and checked LLVM success paths
 reduce runtime work while retaining the error and ownership contracts.
 
-The latest 50-sample compiler campaign measures 72.347 million median retired
+The earlier 50-sample compiler campaign measured 72.347 million median retired
 instructions and 9.281 MiB maximum RSS. On each compiler's own source, CPU falls
 from 17.733 ms to 7.275 ms; identical-original-source results are recorded
 separately. The independent 3×100-run budget gate also passes: 9.16 ms wall p90, 7.65 ms
 CPU p90, 9.3 MiB maximum RSS, and 71.88 million instructions. Its original
 ceilings and batch method are unchanged. See the
-hardening report for current evidence.
+hardening report for that fixture's evidence; these are not measurements of
+the current full compiler.
 
 The budget test runs outside the development limiter because background
 priority changes absolute timings. It takes the 90th percentile across batches;
@@ -219,7 +231,7 @@ for cache behavior and platform limits.
 
 ## Comparing generated code with C++
 
-`experiments/memory/critical-path-study.py` checks arithmetic, indexed List work,
+`experiments/memory/critical-path-study.min` checks arithmetic, indexed List work,
 and record access against independent Python results and equivalent checked C++.
 Use `--measure --count 5000000 --samples 31 --output results.json` for a local
 comparison after correctness passes. Keep the machine idle during measurement.
