@@ -56,5 +56,8 @@ system or a cancellation-safety guarantee.
 The [transaction gallery](../examples/gallery/protocol-completion.min) connects
 the witness to a concrete balance update and rollback decision.
 
-Protocol ownership errors use `E0801`; `minyar explain E0801` describes the
-rules and shows a complete commit-or-rollback example.
+Dedicated `Protocol ownership:` diagnostics use `E0801`; `minyar explain E0801`
+describes the rules and shows a complete commit-or-rollback example. Mixed DMA
+and completion proofs use `Affine ownership:` diagnostics with the existing
+generic code. Earlier thread, parallel and type checks keep their own diagnostic
+families.
