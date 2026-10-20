@@ -360,6 +360,64 @@ int main(void) {
     ordinary_cases();
 #ifdef MINYAR_CYCLE_LOCAL_PROOFS
     cycle_cases();
+    /* The activation bit remains set after every traced graph is reclaimed.
+     * Repeat nonleaf/Text-view arrivals in the optimized four-queue runtime. */
+    assert(rc_cycle_present == 1);
+    ordinary_cases();
+
+    /* Independent first-competitor oracle: source0 is a frame, source1 a
+     * chunk. Vary the arrival's owner index and its kind. A nonleaf's next
+     * unit visits field0; a Text view's root needs a separate finalization.
+     * Neither permits the next owner visit before that object unit. */
+    for (unsigned source = 0; source < 2; source++) {
+        for (unsigned kind = 5; kind <= 6; kind++) {
+            for (unsigned position = 0; position < 3; position++) {
+                begin_case();
+                assert(rc_cycle_present == 1 && !rc_cycle_pending);
+                Tasks tasks = {0};
+                if (source == 0) frame_task(&tasks, 3, 0);
+                else chunk_task(&tasks, 3, 0);
+                size_t slot = 2 - position;
+                void *previous = source == 0 ?
+                    rc_bounded_local_value(tasks.first_frame, slot) :
+                    tasks.first_chunk->values[slot];
+                rc_drop(previous);
+                void *incoming = owner(kind);
+                RcObject *target = kind == 5 ? (RcObject *)incoming - 1 :
+                    (RcObject *)((MinyarText *)incoming)->backing - 1;
+                if (source == 0)
+                    tasks.first_frame->locals[slot] = (void *)((uintptr_t)incoming | 1);
+                else tasks.first_chunk->values[slot] = incoming;
+                assert(!rc_pending_count);
+                publish(tasks);
+                rc_bounded_next_queue = source == 0 ? 1 : 2;
+                char label[96];
+                snprintf(label, sizeof(label), "activated-source-%u-kind-%u-position-%u",
+                         source, kind, position);
+                for (unsigned index = 0; index < position; index++) {
+                    poll_recorded(label, 1);
+                    assert(!rc_bounded_active && !rc_bounded_head && !rc_bounded_recent_head);
+                }
+                size_t work = minyar_rc_poll(2);
+                snapshot(label, 2, work);
+                assert(work == (MINYAR_RC_POLL_BUDGET == 1 ? 1u : 2u));
+                /* A distinct owner remains untouched even with budget left. */
+                assert((source == 0 ? tasks.first_frame->local_count :
+                        tasks.first_chunk->count) == 2 - position);
+                if (work == 1) {
+                    assert(rc_bounded_recent_head == target && rc_pending_count == 2);
+                } else if (kind == 5) {
+                    assert(rc_bounded_active == target && rc_bounded_cursor == 1);
+                    assert(rc_pending_count == 2);
+                } else {
+                    assert(!rc_bounded_active && !rc_bounded_head && !rc_bounded_recent_head);
+                    assert(rc_pending_count == 1);
+                }
+                drain(label);
+                finish_case(label);
+            }
+        }
+    }
 #endif
     recover();
     puts("owner queue scheduler transcript complete");

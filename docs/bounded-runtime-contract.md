@@ -138,9 +138,12 @@ Assignment anchors the new reference before releasing the old one.
 A borrowed temporary is retained before following the same limits as a keep.
 
 **K is not a per-expression limit.** A source expression can invoke several of
-these operations. Nor does the table bound all work inside a call: frame entry
-still clears its local array and may resize it, while the written-slot index
-adds one machine word per capacity slot. Record initialization, Text processing,
+these operations. Nor does the table bound all work inside a call: heap-frame
+storage growth clears its complete new value extent and may resize it. Fully
+retired cached frames already have NULL value slots, cleared at their existing
+owner visits, so reuse skips another entry clear. Explicit stack entry still
+initializes its supplied array. The written-slot index adds one machine word
+per capacity slot. Record initialization, Text processing,
 List growth and copying, I/O, system allocation, page faults, and scheduling
 fall outside the cleanup budget. An application deadline requires bounds on
 all operations along its critical path and validation on the target system.

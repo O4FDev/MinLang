@@ -1,10 +1,17 @@
 /* Physical reuse and exact cleanup work, not a timing or RSS benchmark.
- * The runner renames only the poll definition to install the counter below. */
+ * The runner instruments only copied poll and backing-allocation definitions. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
 #define MINYAR_RC_TESTING 1
 #define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0
+#include <stddef.h>
+#ifdef MINYAR_SYSTEM_HEAP
+/* Declared before the included engine so its copied allocator can record
+ * cumulative events. Live allocation counts cannot detect alloc/free churn.
+ * Match numeric-domain isolation even if this fixture gains real workers. */
+static _Thread_local size_t observed_heap_allocation_events;
+#endif
 #include MINYAR_RUNTIME_SOURCE
 #include <assert.h>
 
@@ -26,10 +33,14 @@ static void drain(void) {
 }
 static size_t allocation_counter(void) {
 #ifdef MINYAR_SYSTEM_HEAP
-    return rc_heap_allocation_count;
+    return observed_heap_allocation_events;
 #else
     return minyar_pool_allocation_count;
 #endif
+}
+static void assert_allocation_events(size_t expected) {
+    size_t actual = allocation_counter();
+    assert(actual == expected && "temporary-owner allocation-event oracle");
 }
 static size_t frame_charge(RcFrame *frame) {
     size_t bytes = rc_heap_charge(frame, sizeof(*frame));
@@ -121,7 +132,7 @@ static void exact_retirement_and_reuse(void) {
     account_cache();
     size_t allocations = allocation_counter();
     minyar_rc_borrow(shared);
-    assert(allocation_counter() == allocations + !admitted);
+    assert_allocation_events(allocations + !admitted);
     assert(!rc_bounded_cached_chunk && !rc_bounded_cached_frame_bytes);
     if (admitted) assert(rc_frames->temporary_head == first);
     assert(rc_frames->temporary_head->count == 1 && rc_frames->temporary_head->next == NULL);
@@ -143,7 +154,7 @@ static void keep_service(void) {
     size_t allocations = allocation_counter();
     minyar_rc_borrow(shared);
     assert(observed_calls == 2 && observed_work == 2 * MINYAR_RC_POLL_BUDGET);
-    assert(allocation_counter() == allocations + (cached == NULL));
+    assert_allocation_events(allocations + (cached == NULL));
     if (cached) assert(rc_frames->temporary_tail == cached);
     observed_calls = observed_work = 0;
     minyar_rc_borrow(shared);

@@ -338,9 +338,16 @@ void minyar_rc_enter(long long locals) {
             out_of_memory();
         frame->locals = values;
         frame->local_capacity = count;
+#ifdef MINYAR_BOUNDED_RC
+        /* Retired cached slots are NULL. Growth can discard storage or move
+         * old index words into this value region, so clear its whole extent. */
+        memset(frame->locals, 0, count * sizeof(*frame->locals));
+#endif
     }
+#ifndef MINYAR_BOUNDED_RC
     if (count)
         memset(frame->locals, 0, count * sizeof(*frame->locals));
+#endif
     frame->local_count = count;
     frame->temporary_count = 0;
 #ifdef MINYAR_BOUNDED_RC

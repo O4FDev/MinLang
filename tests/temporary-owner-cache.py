@@ -4,6 +4,8 @@
 Default-cap cells cover ordinary/cycle, system/fixed/lazy, K1/2/7/32/1024, O0/O2,
 native/ASan+UBSan. Additional cap boundaries run at K1/O2/native. Numeric-domain
 and deliberately broken cache/service implementations provide separate checks.
+Only copied runtime headers receive cumulative system allocator instrumentation;
+mutants must compile and fail at their specifically expected runtime assertion.
 """
 
 import argparse
@@ -60,6 +62,8 @@ class Runner:
             "scope": "deterministic cache storage, work units and ownership; no performance claim",
             "source": str(self.source), "source_sha256": digest(self.source),
             "fixture_sha256": digest(ROOT / "tests/temporary-owner-cache.c"),
+            "runner_sha256": digest(Path(__file__)),
+            "allocation_event_probe": "one exact copied rc_heap_allocate event hook for system; existing cumulative pool counter for fixed/lazy; production headers unchanged",
             "runtime_sha256": {str(path.relative_to(self.headers)): digest(path)
                                for path in sorted(self.headers.rglob("*"))
                                if path.is_file() and path.suffix in (".h", ".c")},
@@ -76,6 +80,12 @@ class Runner:
             return self.engines[key]
         directory = self.output / (kind + "-" + variant) / "runtime"
         shutil.copytree(self.headers, directory)
+        heap = directory / "minyar_heap.h"
+        source = heap.read_text()
+        before = "    RC_ACCOUNT(rc_heap_allocation_count++);\n"
+        if source.count(before) != 1:
+            raise ValueError("system allocator event probe requires exactly one rc_heap_allocate increment")
+        heap.write_text(source.replace(before, before + "    observed_heap_allocation_events++;\n"))
         for name in ("minyar_bounded_rc.h", "minyar_cycle_bounded_rc.h"):
             path = directory / name
             source = path.read_text()
@@ -90,6 +100,19 @@ class Runner:
             if source.count(before) != 1:
                 raise ValueError("cache allocation mutant lost its insertion point")
             path.write_text(source.replace(before, "if (1) return rc_heap_allocate(sizeof(*chunk));"))
+        elif variant == "mutant-churn":
+            path = directory / "minyar_owner_cache.h"
+            source = path.read_text()
+            before = ("    rc_bounded_cached_chunk = NULL;\n"
+                      "    rc_bounded_cached_frame_bytes -= rc_heap_charge(chunk, sizeof(*chunk));\n"
+                      "    return chunk;")
+            if source.count(before) != 1:
+                raise ValueError("cache churn mutant lost its exact hit path")
+            replacement = ("    rc_bounded_cached_chunk = NULL;\n"
+                           "    rc_bounded_cached_frame_bytes -= rc_heap_charge(chunk, sizeof(*chunk));\n"
+                           "    rc_heap_deallocate(chunk); /* Net live allocations can remain identical. */\n"
+                           "    return rc_heap_allocate(sizeof(*chunk));")
+            path.write_text(source.replace(before, replacement))
         elif variant == "mutant-pre-service":
             for name in ("minyar_rc.h", "minyar_cycle_rc.h"):
                 path = directory / name
@@ -151,15 +174,21 @@ class Runner:
         argv += [str(ROOT / "tests/temporary-owner-cache.c"), "-o", str(executable), "-lm"]
         self.command(argv, directory / "compile", self.args.compile_timeout)
         mutant = variant != "candidate"
-        status, stdout, _ = self.command([str(executable)], directory / "run", self.args.run_timeout,
-                                         success=not mutant)
+        status, stdout, stderr = self.command([str(executable)], directory / "run", self.args.run_timeout,
+                                              success=not mutant)
         row = {"runtime": kind, "profile": profile, "budget": budget, "optimization": optimization,
                "mode": mode, "cap": capacity, "variant": variant, "threaded": threaded,
-               "exit": status, "stdout_sha256": digest(stdout)}
+               "exit": status, "stdout_sha256": digest(stdout), "stderr_sha256": digest(stderr)}
+        if mutant:
+            marker = ("observed_calls == 2 && observed_work == 2 * MINYAR_RC_POLL_BUDGET"
+                      if variant == "mutant-pre-service" else "temporary-owner allocation-event oracle")
+            row.update({"expected_assertion": marker,
+                        "mutant_detected": status != 0 and marker in stderr.read_text(errors="replace")})
         self.rows.append(row)
         self.save()
-        if mutant and not status:
-            raise RuntimeError("cache oracle accepted " + variant + " in " + kind)
+        if mutant and not row["mutant_detected"]:
+            raise RuntimeError("cache mutant did not fail at its expected runtime assertion: " +
+                               variant + " in " + kind + "; see " + str(stderr))
         if threaded and not mutant:
             status, _, stderr = self.command([str(executable), "residual"], directory / "residual",
                                              self.args.run_timeout, success=False)
@@ -201,7 +230,7 @@ def main():
                 continue
             runner.run(kind, profile, int(budget), optimization, mode, cap)
         for kind in args.runtimes:
-            for variant in ("mutant-no-reuse", "mutant-pre-service"):
+            for variant in ("mutant-no-reuse", "mutant-pre-service", "mutant-churn"):
                 runner.run(kind, "system", 1, "O2", "native", "default", variant=variant)
             if "system" in args.profiles:
                 for mode in args.modes:

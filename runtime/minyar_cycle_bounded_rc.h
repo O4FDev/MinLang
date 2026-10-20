@@ -323,7 +323,11 @@ static void rc_bounded_object_unit(void) {
 static void rc_bounded_frame_unit(void) {
     RcFrame *frame = rc_bounded_frame_head;
     if (frame->local_count) {
-        rc_drop(rc_bounded_pending_local_value(frame, --frame->local_count));
+        size_t index = rc_bounded_local_indices(frame)[--frame->local_count];
+        void *value = rc_bounded_local_value(frame, index);
+        /* A completed frame is already initialized for its next activation. */
+        frame->locals[index] = NULL;
+        rc_drop(value);
         return;
     }
     rc_bounded_frame_head = frame->previous;

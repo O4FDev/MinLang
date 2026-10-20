@@ -324,6 +324,7 @@ MinyarList *minyar_map_keys(const MinyarRecord *map) {
     if (map_key_references(map->values[MAP_KEY_KIND]))
         minyar_list_references(result);
     list_reserve(result, map->values[MAP_LENGTH]);
+    if (!map->values[MAP_LENGTH]) return result;
     MinyarList *hashes = map_array(map, MAP_HASHES), *keys = map_array(map, MAP_KEYS);
     for (long long bucket = 0; bucket < hashes->length; bucket++)
         if (hashes->values[bucket]) {
@@ -365,6 +366,7 @@ _Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
     MinyarMapReadGuard guard;
     map_read_begin(&guard, left, right);
     int result = 0;
+    if (!left->values[MAP_LENGTH]) { result = 1; goto done; }
     MinyarList *hashes = map_array(left, MAP_HASHES), *keys = map_array(left, MAP_KEYS);
     MinyarList *values = map_array(left, MAP_VALUES), *other_values = map_array(right, MAP_VALUES);
     for (long long bucket = 0; bucket < hashes->length; bucket++) {

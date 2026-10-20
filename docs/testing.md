@@ -1074,6 +1074,26 @@ scheduler, including partial/zero budgets, queue competition and cycle phases.
 Both run at O0/O2 with system, fixed and lazy heaps and budgets 1, 2, 7, 32 and
 1024. Their `-sanitize` variants add ASan/UBSan. Reuse/service and
 scheduler-stop/work-charge mutants must fail after successful compilation.
+The cache oracle counts cumulative system allocation events in a copied header;
+a free-and-reallocate churn mutant must fail its specific allocation assertion.
+Activated-cycle batching also checks newly arriving ordinary objects and Text
+view roots before another owner can be visited.
+
+`make check-frame-initialization` reconstructs the old frame behavior using four
+exact, fail-closed source inversions. Independent per-slot/count models compare
+release order, K work, debt and queues, and require every fully retired capacity
+slot to be NULL. Cases cover sparse/dense/shrunken/moved owners, pool discard
+growth and an actual collected cycle activating the four-queue path. The old
+runtime must fail the stronger physical invariant. `-sanitize` adds ASan/UBSan
+and the full activated-cycle matrix. Recovery, stack and eager paths retain their
+separate existing ownership gates.
+
+`make check-empty-map-traversal` compares the optimized Map with its scan-only
+reference across ordinary/cycle, incremental/eager/arena, O0/O2 profiles. It
+checks empty result kinds, exact guard retain/release service, callbacks,
+recovery, nested values and full allocator recovery. Mutants skipping result
+classification or the equality guard must fail specific assertions. Its
+`-sanitize` variant adds ASan/UBSan with leak detection.
 Native checks belong to `check-portable`; sanitizer checks belong to
 `check-ownership` and `check-sanitize`. All logs and failed artifacts are retained.
 
