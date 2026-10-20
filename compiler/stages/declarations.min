@@ -99,6 +99,66 @@ function discoverSyntaxSymbols(tree: SyntaxTree, tokenTexts: List<Text>, tokenLi
     }
 }
 
+// Register every nominal symbol first, then freeze finite scalar layouts before
+// callback signatures or takeType can capture an ID. Only payload-free enum
+// domains seed this pass: nested scalar niches deliberately remain boxed.
+function discoverScalarChoiceTypes(tree: SyntaxTree, texts: List<Text>, lines: SourceMap, names: List<Text>, kinds: List<Integer>, returns: List<Integer>) {
+    let domains: List<Integer> = []
+    let payloads: List<Integer> = []
+    let index = 0
+    while index < names.length {
+        domains.add(-1)
+        payloads.add(-1)
+        index = index + 1
+    }
+    let declaration = 0
+    while declaration < tree.declarations.length {
+        let node = tree.declarations[declaration]
+        if tree.nodes[node].kind == 2 {
+            let symbol = findIndexedSymbol(lines.symbolLookup, names, kinds, texts[tree.nodes[node].start + 1], 2)
+            let token = tree.nodes[node].body + 1
+            let fields = 0
+            let marker = ""
+            let payload = -1
+            while token < tree.nodes[node].end {
+                if texts[token] == ":" { fields = fields + 1 }
+                if resultPrefix(texts[token], "minyar_choice_tag|") { marker = texts[token] }
+                if resultPrefix(texts[token], "minyar_choice_payload|") { payload = token }
+                token = token + 1
+            }
+            if marker != "" {
+                let cases = marker.split("|")
+                if fields == 1 { domains[symbol] = cases.length - 2 }
+                if fields == 2 && cases.length == 3 && payload >= 0 {
+                    let parts = texts[payload].split("|")
+                    // A concrete scalar payload is one normalized type token.
+                    if parts.length == 3 && findText(cases, parts[1]) > 0 && texts[payload + 1] == ":" && (texts[payload + 3] == ";" || texts[payload + 3] == "}") {
+                        payloads[symbol] = payload + 2
+                    }
+                }
+            }
+        }
+        declaration = declaration + 1
+    }
+    index = 0
+    while index < names.length {
+        if payloads[index] >= 0 {
+            let name = texts[payloads[index]]
+            let primitive = simpleTypeCode(name)
+            let finite = primitive == 4 || primitive == 3
+            if primitive == 0 {
+                let payload = findIndexedSymbol(lines.symbolLookup, names, kinds, name, 2)
+                if payload >= 0 { finite = domains[payload] >= 0 }
+            }
+            if finite {
+                returns[index] = 1000000000 + index
+                lines.nominalTypes[index] = returns[index]
+            }
+        }
+        index = index + 1
+    }
+}
+
 function takeConstant(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLookup: List<Integer>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>) {
     let runtime = tokenIs(tokenKinds, tokenTexts, cursor, "global")
     cursor[0] = cursor[0] + 1

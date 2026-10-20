@@ -125,8 +125,25 @@ still has a finite nesting limit: extreme enum-containing wrapper chains may
 reach it earlier than their former record-valued representation. Ordinary List
 type encodings remain compact through 64 layers.
 
-Cached interfaces use `minyar-module-interface-v9` and deltas use
-`minyar-module-delta-v7`, so earlier record/enum escape codecs and pointer-ABI artifacts are rebuilt.
+Finite scalar payload niches share the same nominal i64 namespace and Map
+codecs. `isScalarChoiceType` describes physical layout; the legacy `isEnumType`
+query remains an alias for that physical predicate. Use context-aware
+`isPureEnumChoice` for payload-free semantics. `choiceLayoutKind` returns 4 for
+a scalar payload niche (storage count 0), alongside 1 for pure enums, 2 for
+tagged unions and 3 for nullable record niches. Logical payload fields remain
+available; `readChoiceMatchTag` and `readChoiceMatchPayload` project logical
+values rather than exposing encoded codes as case ordinals.
+
+`discoverScalarChoiceTypes` runs after all nominal registrations and declaration
+index construction, before callbacks or signatures capture numeric IDs. It
+updates return IDs and SourceMap nominal IDs together. A linear token scan
+collects immutable pure-enum domains; indexed payload lookups then recognize
+Boolean, Character and payload-free enum payloads regardless of declaration
+order. Nested scalar niches and recursive choices stay boxed in this slice.
+No repeated graph rescans or late pointer-to-i64 reclassification occur.
+
+Cached interfaces use `minyar-module-interface-v10` and deltas use
+`minyar-module-delta-v8`, so earlier record/enum escape codecs and pointer-ABI artifacts are rebuilt.
 Choice-bearing module graphs retain whole-program compilation, including when
 restored logical choice metadata is the only evidence in a warm state.
 

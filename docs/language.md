@@ -877,7 +877,26 @@ an Integer or a different choice cannot stand in for one. Methods, generic
 constraints and derived equality, ordering and hashing work as usual. Lists,
 records, callbacks, Maps and Sets store these cases directly as scalar values.
 
-Choices with payloads share record ownership and automatic memory management.
+A two-case choice with exactly one Boolean, Character or payload-free choice
+payload also stores one eight-byte integer, without a wrapper or reference
+counting. This includes `Maybe<Boolean>`, `Maybe<Character>` and `Maybe<Signal>`
+when every Signal case has no payload. Case order is preserved. With the payload
+case first, present values keep their scalar code and the empty case uses the
+next code; with the empty case first, empty uses zero and present codes increase
+by one. Boolean codes are false = 0 and true = 1. Character codes are Unicode
+scalar values, retaining the existing rejection of surrogates and out-of-range
+values. Enum payload codes retain declaration order.
+
+Native parameters and results for these choices use i64, including callback
+signatures and C-layout fields. A native producer of `Maybe<Boolean>` must
+return an encoded i64 (Some(false) = 0, Some(true) = 1, None = 2), rather than
+a managed wrapper pointer; a pointer to such a value points to i64 storage.
+Native producers must maintain the encoded domain and the existing Character
+validity contract. Nested wrappers such as `Maybe<Maybe<Boolean>>` retain a
+tagged outer wrapper, so `Some(None)` remains distinct from `None`.
+Integer and Float payloads retain tagged storage.
+
+Tagged choices share record ownership and automatic memory management.
 A value stores a tag and a union large enough for its largest case: different
 cases share the same payload slots. Only the active case's reference payloads
 are retained and traced. A payload occupies one eight-byte slot, with reference
@@ -892,8 +911,8 @@ shared ownership. `Maybe<Text>` likewise stores Text directly; even an empty
 Text has a non-null header, so `Some("")` remains distinct from `None`.
 Text equality, ordering and hashing use contents, and key snapshots retain
 the immutable Text. This also applies to a user-declared choice with the same
-shape, preserving its case order. Choice, callback and C-layout payloads keep
-the tagged union, so nested values such as `Some(None)` remain distinct from
+shape, preserving its case order. Nested payload-bearing choices, callbacks
+and C-layout payloads keep the tagged union, so values such as `Some(None)` remain distinct from
 `None`. Native functions returning an ordinary managed record must return a
 valid, non-null record. Native functions returning an eligible choice return
 the nullable payload pointer, rather than a tagged wrapper; a present Text
@@ -1157,8 +1176,8 @@ Callbacks infer parameter and return types from the value and their bodies.
 They are evaluated once as ordinary arguments and called only for their
 matching case. Receiver and argument lifetimes follow ordinary function calls.
 The compiler specializes small Minyar match functions for these methods;
-there is no dynamic dispatch. Mapping allocates a new Result or Maybe, with
-the same representation described above. Inspecting or unwrapping does not
+there is no dynamic dispatch. Mapping constructs a new Result or Maybe, with
+the storage cost described above. Inspecting or unwrapping does not
 allocate a new container. Captured callbacks may allocate their environment.
 
 `unwrap()` returns success and stops on failure; `expect(message)` uses the

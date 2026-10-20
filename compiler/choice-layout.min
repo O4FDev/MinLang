@@ -1,18 +1,41 @@
 // A two-case choice with one non-null managed payload has a spare null pointer.
 // Eligible payloads are Text, Bytes, Lists or ordinary managed records.
 // Keep the full logical field graph, including nullable List SCC endpoints.
-// Layout kinds: 0 ordinary type, 1 integer choice, 2 tagged union, 3 null niche.
+// Layout kinds: 0 ordinary, 1 pure enum, 2 tagged, 3 null niche, 4 scalar niche.
 // For kind 3, choiceNicheType returns the payload type (including structural Lists),
 // not necessarily a record. choiceStorageCount counts only choice-owned slots.
 function choiceLayoutKind(context: CompilerContext, type: Integer): Integer {
-    if isEnumType(type) { return 1 }
+    if isPureEnumChoice(context, type) { return 1 }
+    if isScalarChoiceType(type) { return 4 }
     if choiceCases(context, type).length == 0 { return 0 }
     if choiceNicheType(context, type) != 0 { return 3 }
     return 2
 }
 
+// The physical ID alone cannot distinguish a pure enum from a payload niche.
+function isPureEnumChoice(context: CompilerContext, type: Integer): Boolean {
+    return isScalarChoiceType(type) && context.functionParameterCounts[recordTypeIndex(type)] == 1
+}
+
+function choiceScalarPayloadType(context: CompilerContext, type: Integer): Integer {
+    if !isScalarChoiceType(type) || isPureEnumChoice(context, type) { return 0 }
+    return context.functionParameterTypes[functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type)) + 1]
+}
+
+function choiceScalarPayloadMax(context: CompilerContext, type: Integer): Integer {
+    let payload = choiceScalarPayloadType(context, type)
+    if payload == 4 { return 1 }
+    if payload == 3 { return 1114111 }
+    return choiceCases(context, payload).length - 2
+}
+
+function choiceScalarEmptyCode(context: CompilerContext, type: Integer): Integer {
+    if choiceNicheTag(context, type) == 1 { return 0 }
+    return choiceScalarPayloadMax(context, type) + 1
+}
+
 function choiceNicheType(context: CompilerContext, type: Integer): Integer {
-    if !isRecordType(type) || isEnumType(type) { return 0 }
+    if !isRecordType(type) || isScalarChoiceType(type) { return 0 }
     let record = recordTypeIndex(type)
     if context.functionParameterCounts[record] != 2 { return 0 }
     let cases = choiceCases(context, type)
@@ -20,7 +43,7 @@ function choiceNicheType(context: CompilerContext, type: Integer): Integer {
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let payload = context.functionParameterTypes[first + 1]
     if payload == 2 || payload == 8 || isListType(payload) { return payload }
-    if !isRecordType(payload) || isEnumType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
+    if !isRecordType(payload) || isScalarChoiceType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
     // A nested optional may already use null, so Some(None) needs its own tag.
     if choiceCases(context, payload).length > 0 { return 0 }
     return payload
@@ -39,7 +62,12 @@ function choiceOwnershipType(context: CompilerContext, type: Integer): Integer {
 }
 
 function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer): Text {
-    if isEnumType(type) { return value }
+    if isPureEnumChoice(context, type) { return value }
+    if isScalarChoiceType(type) {
+        let present = choiceNicheTag(context, type)
+        let absent = emitInstruction(output, textState, state, "icmp eq i64 " + value + ", " + Text(choiceScalarEmptyCode(context, type)))
+        return emitInstruction(output, textState, state, "select i1 " + absent + ", i64 " + Text(1 - present) + ", i64 " + Text(present))
+    }
     if choiceNicheType(context, type) == 0 { return readRecordField(output, textState, state, value, 0, 1) }
     let present = choiceNicheTag(context, type)
     let absent = emitInstruction(output, textState, state, "icmp eq ptr " + value + ", null")
@@ -47,8 +75,35 @@ function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textSt
 }
 
 function readChoiceMatchPayload(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer, field: Integer, payload: Integer): Text {
+    if isScalarChoiceType(type) {
+        let raw = value
+        if choiceNicheTag(context, type) == 1 { raw = emitInstruction(output, textState, state, "sub i64 " + value + ", 1") }
+        return slotAsValue(output, textState, state, raw, payload)
+    }
     if choiceNicheType(context, type) != 0 { return value }
     return readRecordField(output, textState, state, value, choiceStorageField(context, type, field), payload)
+}
+
+// Codes preserve declaration order, then payload order. Boolean/Character
+// convert through the ordinary slot helpers; pure-enum payloads are already i64.
+function parseScalarNicheChoice(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer, present: Boolean): Text {
+    let expected = choiceScalarPayloadType(context, type)
+    let value = Text(choiceScalarEmptyCode(context, type))
+    if present || tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+        if present {
+            let payloadType: List<Integer> = [expected]
+            let location = state[0]
+            let payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+            requireContextType(context, location, payloadType[0], expected, "choice payload has the wrong type")
+            value = valueAsListSlot(output, textState, state, payload, expected)
+            if choiceNicheTag(context, type) == 1 { value = emitInstruction(output, textState, state, "add i64 " + value + ", 1") }
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
+        }
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    }
+    setType(resultType, type)
+    return value
 }
 
 function parseNicheChoice(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer, present: Boolean): Text {
