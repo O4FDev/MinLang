@@ -316,6 +316,15 @@ to this experimental sequence. It is not a replacement for that bounded contract
 
 ## Scalar record replacement
 
+Direct reconstruction such as `point = Point { x: point.y; y: point.x }` can
+consume the old local's owner after every initializer has run. For ordinary
+records with at most sixteen primitive fields, the runtime reuses storage only
+when its shape matches and it has one owner. Shared records allocate a fresh
+object and release the transferred owner once; arena mode also allocates. The
+helper preserves the removed allocation's bounded cleanup service. Fields are
+stored only after all old-value reads and calls finish. This first proof excludes
+reference fields, choices, C layouts, callbacks and recovery-enabled jobs.
+
 The compiler can eliminate a directly constructed local record whose fields
 are all Integer, Float, Boolean or Character values. Its conservative lexical proof
 requires every later use of that binding in its scope to be a direct field

@@ -1,0 +1,331 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing reconstruction function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function compiled(frontend: fixtures.Frontend, source: Text): Text {
+    test.require(fixtures.compile(frontend, source), "compile reconstruction IR")
+    return io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+}
+
+function checkReuse(ir: Text, name: Text, helpers: Integer, moves: Integer, allocations: Integer) {
+    let emitted = body(ir, name)
+    test.check(count(emitted, "call ptr @minyar_record_reuse_scalar_take(") == helpers, name + ": reconstruction helper calls")
+    test.check(count(emitted, "call void @minyar_rc_local_move_owner(") + count(emitted, "call void @minyar_rc_scope_move_v1(") == moves, name + ": local owner transfers")
+    test.check(count(emitted, "call ptr @minyar_record_new_scalar(") == allocations, name + ": ordinary scalar allocations")
+}
+
+function beforeMove(ir: Text, name: Text): Text {
+    let emitted = body(ir, name)
+    let moved = emitted.find("call void @minyar_rc_local_move_owner(")
+    if moved < 0 { moved = emitted.find("call void @minyar_rc_scope_move_v1(") }
+    let reused = emitted.find("call ptr @minyar_record_reuse_scalar_take(")
+    test.check(moved >= 0 && reused > moved, name + ": transfer the old owner immediately before reuse")
+    return emitted.slice(0, moved)
+}
+
+function checkStores(ir: Text, name: Text, initial: Integer, replacement: Integer) {
+    let emitted = body(ir, name)
+    let prefix = beforeMove(ir, name)
+    let reused = emitted.find("call ptr @minyar_record_reuse_scalar_take(")
+    test.check(count(prefix, "call void @minyar_record_set_scalar(") == initial, name + ": replacement stores must follow every initializer")
+    test.check(count(emitted.slice(reused, emitted.length), "call void @minyar_record_set_scalar(") == replacement, name + ": write every replacement field after reuse")
+}
+
+function checkEffects(ir: Text, name: Text, callee: Text, expected: Integer) {
+    let prefix = beforeMove(ir, name)
+    let calls = count(prefix, "@.minyar.fn." + callee + "(") + count(prefix, "@.minyar.fn.minyar_module_0_" + callee + "(")
+    test.check(calls == expected, name + ": RHS effects must finish before owner transfer")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    record Pair { x: Integer; y: Integer }
+    record Scalars { number: Integer; fraction: Float; flag: Boolean; letter: Character }
+    record Wrapper { value: Pair }
+    record Mixed { number: Integer; label: Text }
+
+    function swap() {
+        let p = Pair { x: 1; y: 2 }
+        p = Pair { x: p.y; y: p.x }
+        print(p.x); print(p.y)
+    }
+    function duplicate() {
+        let p = Pair { x: 3; y: 4 }
+        p = (Pair { x: p.x; y: p.x })
+        print(p.x); print(p.y)
+    }
+    function kinds() {
+        let p = Scalars { number: 5; fraction: 1.25; flag: true; letter: 'é' }
+        p = Scalars { letter: 'λ'; flag: !p.flag; fraction: p.fraction * 2.0; number: p.number + 1 }
+        print(p.number); print(p.fraction); print(p.flag); print(p.letter)
+    }
+    function note(label: Text, value: Integer): Integer { print(label); return value }
+    function effects() {
+        let p = Pair { x: 10; y: 20 }
+        p = Pair { y: note("y", p.x); x: note("x", p.y) }
+        print(p.x); print(p.y)
+    }
+    function mutate(p: Pair): Integer {
+        print(p.x)
+        p.x = 70; p.y = 80
+        return 99
+    }
+    function mutating() {
+        let p = Pair { x: 1; y: 2 }
+        let alias = p
+        p = Pair { y: mutate(p); x: p.y }
+        print(p.x); print(p.y)
+        print(alias.x); print(alias.y)
+    }
+    function show(p: Pair) { print(p.x); print(p.y) }
+    function aliased(saved: List<Pair>) {
+        let p = Pair { x: 5; y: 6 }
+        saved.add(p)
+        p = Pair { x: p.y; y: p.x }
+        print(p.x); print(p.y)
+        show(saved[0])
+        p.x = 99
+        print(saved[0].x)
+    }
+    function parameter(p: Pair, replace: Boolean) {
+        if replace { p = Pair { x: 30; y: 40 } }
+        p = Pair { x: p.y; y: p.x }
+        print(p.x); print(p.y)
+    }
+    function inspect(p: Pair): Integer { return p.x + p.y }
+    function readonly(p: Pair) {
+        let q = Pair { x: p.y; y: p.x }
+        print(inspect(q)); print(p.x)
+    }
+    function factory(seed: Integer): Pair {
+        let p = Pair { x: seed; y: seed + 1 }
+        p = ((Pair { x: p.y; y: p.x }))
+        return p
+    }
+    function loop(limit: Integer): Pair {
+        let p = Pair { x: 1; y: 2 }
+        for index in 0..limit { p = Pair { x: p.y; y: p.x } }
+        return p
+    }
+    function branch(flag: Boolean): Pair {
+        let p = Pair { x: 3; y: 4 }
+        if flag { p = Pair { x: p.y; y: p.x } }
+        else { p = Pair { x: p.x + 1; y: p.y + 2 } }
+        return p
+    }
+    function stored(values: List<Pair>) {
+        let p = Pair { x: 1; y: 2 }
+        p = Pair { x: p.y; y: p.x }
+        values.add(p)
+        show(values[0])
+    }
+    function differentTarget() {
+        let p = Pair { x: 1; y: 2 }
+        print(inspect(p))
+        let q = Pair { x: 3; y: 4 }
+        q = Pair { x: p.x; y: p.y }
+        print(p.x); print(q.x)
+        p.x = 9
+        print(q.x); print(p.x)
+    }
+    function nested() {
+        let p = Pair { x: 1; y: 2 }
+        p = Pair { x: Pair { x: p.y; y: p.x }.x; y: p.x }
+        print(p.x); print(p.y)
+    }
+    function projected() {
+        let p = Pair { x: 1; y: 2 }
+        p = Wrapper { value: Pair { x: p.y; y: p.x } }.value
+        print(p.x); print(p.y)
+    }
+    function identity(p: Pair): Pair { return p }
+    function called() {
+        let p = Pair { x: 1; y: 2 }
+        p = identity(Pair { x: p.y; y: p.x })
+        print(p.x); print(p.y)
+    }
+    function nonlocal() {
+        let holder = Wrapper { value: Pair { x: 1; y: 2 } }
+        holder.value = Pair { x: holder.value.y; y: holder.value.x }
+        show(holder.value)
+        let values = [Pair { x: 3; y: 4 }]
+        values[0] = Pair { x: values[0].y; y: values[0].x }
+        show(values[0])
+    }
+    function reference() {
+        let p = Mixed { number: 1; label: "old" + "!" }
+        p = Mixed { number: p.number + 1; label: p.label }
+        print(p.number); print(p.label)
+    }
+    function propagated(p: Pair, result: Result<Integer, Text>): Result<Pair, Text> {
+        p = Pair { x: p.y; y: try result }
+        return Ok<Pair, Text>(p)
+    }
+
+    swap()
+    duplicate()
+    kinds()
+    effects()
+    mutating()
+    let saved: List<Pair> = []
+    aliased(saved)
+    let caller = Pair { x: 7; y: 8 }
+    parameter(caller, false)
+    show(caller)
+    parameter(caller, true)
+    show(caller)
+    readonly(caller)
+    show(factory(10))
+    show(loop(0))
+    show(loop(3))
+    show(branch(true))
+    show(branch(false))
+    let output: List<Pair> = []
+    stored(output)
+    differentTarget()
+    nested()
+    projected()
+    called()
+    nonlocal()
+    reference()
+    let success = propagated(caller, Ok<Integer, Text>(99))
+    match success { Ok(p) { show(p) } Err(error) { fail(error) } }
+    show(caller)
+    let failed = propagated(caller, Err<Integer, Text>("no" + "!"))
+    match failed { Ok(p) { fail("propagation accepted a failure") } Err(error) { print(error) } }
+    show(caller)
+    """#
+let expected = [
+    "2\n1\n", "3\n3\n", "6\n2.5\nfalse\nλ\n", "y\nx\n20\n10\n",
+    "1\n80\n99\n70\n80\n", "6\n5\n5\n6\n5\n",
+    "8\n7\n7\n8\n40\n30\n7\n8\n", "15\n7\n", "11\n10\n",
+    "1\n2\n2\n1\n", "4\n3\n4\n6\n", "2\n1\n", "3\n1\n1\n1\n9\n",
+    "2\n1\n", "2\n1\n", "2\n1\n", "2\n1\n4\n3\n", "2\nold!\n",
+    "8\n99\n7\n8\nno!\n7\n8\n",
+]
+for width in [16, 17] {
+    let fields: List<Text> = []
+    let initial: List<Text> = []
+    let replacement: List<Text> = []
+    for index in 0..width {
+        fields.add("f" + Text(index) + ": Integer; ")
+        initial.add("f" + Text(index) + ": " + Text(index) + "; ")
+        replacement.add("f" + Text(index) + ": p.f" + Text(width - index - 1) + "; ")
+    }
+    let suffix = Text(width)
+    source += "\nrecord Wide" + suffix + " { " + joinText(fields) + "}\nfunction wide" + suffix + "() {\nlet p = Wide" + suffix + " { " + joinText(initial) + "}\np = Wide" + suffix + " { " + joinText(replacement) + "}\nprint(p.f0)\nprint(p.f" + Text(width - 1) + ")\n}\nwide" + suffix + "()\n"
+    expected.add(Text(width - 1) + "\n0\n")
+}
+
+let ir = compiled(frontend, source)
+for name in ["swap", "duplicate", "kinds", "effects", "mutating", "aliased", "stored"] { checkReuse(ir, name, 1, 1, 1) }
+for name in ["factory", "loop"] { checkReuse(ir, name, 1, 2, 1) }
+checkReuse(ir, "branch", 2, 3, 1)
+checkReuse(ir, "parameter", 2, 2, 0)
+checkReuse(ir, "readonly", 0, 0, 1)
+checkReuse(ir, "differentTarget", 1, 1, 2)
+checkReuse(ir, "nested", 1, 1, 2)
+for name in ["projected", "called"] { checkReuse(ir, name, 0, 0, 2) }
+checkReuse(ir, "nonlocal", 0, 0, 4)
+checkReuse(ir, "reference", 0, 0, 0)
+checkReuse(ir, "propagated", 1, 1, 0)
+checkReuse(ir, "wide16", 1, 1, 1)
+checkReuse(ir, "wide17", 0, 0, 2)
+for name in ["swap", "duplicate", "effects", "mutating"] { checkStores(ir, name, 2, 2) }
+for name in ["swap", "duplicate"] { test.check(count(beforeMove(ir, name), "call i64 @minyar_record_get(") == 2, name + ": read both old fields before reuse") }
+checkStores(ir, "kinds", 4, 4)
+let converted = beforeMove(ir, "kinds")
+for operation in [" = bitcast double ", " = zext i1 ", " = zext i32 "] {
+    test.check(count(converted, operation) == 2, "convert every scalar initializer before moving the old owner: " + operation)
+}
+checkEffects(ir, "effects", "note", 2)
+checkEffects(ir, "mutating", "mutate", 1)
+checkStores(ir, "propagated", 0, 2)
+checkStores(ir, "wide16", 16, 16)
+fixtures.executes(frontend, source, joinText(expected), ["-O0", "-O2"], 0, "", true)
+
+let callback = #"""
+    record Listener { value: Integer; read: () -> Integer }
+    function callbackFields() {
+        let p = Listener { value: 1; read: function(): Integer { return 7 } }
+        p = Listener { value: p.value + 1; read: p.read }
+        print(p.value); print(p.read())
+    }
+    callbackFields()
+    """#
+checkReuse(compiled(frontend, callback), "callbackFields", 0, 0, 0)
+fixtures.executes(frontend, callback, "2\n7\n", ["-O0", "-O2"], 0, "", true)
+
+let choices = #"""
+    choice Tile { Dot(value: Integer); Bar(left: Integer, right: Integer) }
+    function choiceFields() {
+        let p: Tile = Dot(1)
+        p = Bar(2, 3)
+        match p { Dot(value) { print(value) } Bar(left, right) { print(left + right) } }
+    }
+    choiceFields()
+    """#
+checkReuse(compiled(frontend, choices), "choiceFields", 0, 0, 0)
+fixtures.executes(frontend, choices, "5\n", ["-O0", "-O2"], 0, "", true)
+
+let nativeLayout = #"""
+    record Point native "c" { x: Int64; y: Int64 }
+    function nativeFields() {
+        let p = Point { x: 1; y: 2 }
+        p = Point { x: p.y; y: p.x }
+        print(p.x); print(p.y)
+    }
+    nativeFields()
+    """#
+checkReuse(compiled(frontend, nativeLayout), "nativeFields", 0, 0, 0)
+fixtures.executes(frontend, nativeLayout, "2\n1\n", ["-O0", "-O2"], 0, "", true)
+
+let recovery = #"""
+    use "calldepth" as depth
+    record Pair { x: Integer; y: Integer }
+    function recovered() {
+        let p = Pair { x: 1; y: 2 }
+        p = Pair { x: p.y; y: p.x }
+        print(p.x); print(p.y)
+    }
+    recovered()
+    print(depth.remaining())
+    """#
+let recoveryIR = compiled(frontend, recovery)
+test.check(test.contains(recoveryIR, "@minyar_recovery_enter("), "reconstruction recovery control must activate recovery lowering")
+checkReuse(recoveryIR, "recovered", 0, 0, 2)
+fixtures.executes(frontend, recovery, "2\n1\n-1\n", ["-O0", "-O2"], 0, "", true)
+
+let gallery = io.readTextFile("examples/gallery/record-reconstruction-reuse.min")
+test.check(gallery.length > 0, "missing reconstruction gallery")
+fixtures.executes(frontend, gallery, "12 steps, 4 small treasures.\n15 steps, 5 small treasures.\nThe sea keeps the rest.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Record reconstruction reuse: passed")

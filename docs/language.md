@@ -708,6 +708,11 @@ copying behavior. Parentheses do not change this rule.
 The same applies when replacing the local itself, such as
 `values = (values).appended(values[0])`: the index is read before storage reuse.
 
+Reconstructing a scalar record into its local can also reuse uniquely owned
+storage. Every field initializer runs before any old field is replaced, so
+`point = Point { x: point.y; y: point.x }` still swaps the two values. Other
+aliases keep observing the previous record.
+
 Recursive records support construction, sharing and mutation:
 
 ```minyar

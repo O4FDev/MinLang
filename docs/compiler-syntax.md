@@ -74,6 +74,16 @@ its callee fragment selects the existing uniqueness-checked runtime operation.
 Cycle fixups retain their original fragment indexes. Metadata uses constant
 space; proof traversal visits only the root's and receiver's grouping nodes.
 
+Primitive heap-record reconstruction uses a separate `RecordReuseSite`. The
+completed assignment root must be a constructor of the target's nominal type,
+with at most sixteen Integer, Float, Boolean or Character fields. The site
+records stable allocation/owner and setter fragment ranges. All initializers
+evaluate before a late local-owner move and uniqueness-checked reuse helper;
+the allocation owner and field stores move after that helper. This preserves
+swaps, calls that mutate the old record and early Result propagation. Nested
+constructors, C layouts, choices, callback-enabled jobs and recovery keep their
+previous lowering. The sixteen-field limit bounds deferred metadata and copying.
+
 Scalar-record escape analysis remains a budgeted lexical proof. Readonly
 candidates keep captured SSA fields; candidates with direct field writes use
 entry-block i64 slots and fresh loads at each field read. An explicit metadata

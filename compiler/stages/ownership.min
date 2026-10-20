@@ -110,6 +110,69 @@ function takeTerminalReuse(context: CompilerContext, localNames: List<Text>, loc
     site.node = -1
 }
 
+function prepareRecordReuse(context: CompilerContext, state: List<Integer>, target: Integer, type: Integer) {
+    let site = context.recordReuse
+    site.target = -1
+    site.node = -1
+    if recoveryEnabled(state) || state[15] / 1 % 2 != 0 { return }
+    if target < 0 || !isRecordType(type) || !isReferenceType(type) { return }
+    if scalarRecordValues(state, target) >= 0 { return }
+    if state[15] / 32 % 2 != 0 && isCRecord(context, type) { return }
+    if state[15] / 4096 % 2 != 0 && choiceCases(context, type).length > 0 { return }
+    let record = type - 1000
+    let count = context.functionParameterCounts[record]
+    if count > 16 { return }
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    let field = 0
+    while field < count {
+        let kind = context.functionParameterTypes[first + field]
+        if kind != 1 && kind != 3 && kind != 4 && kind != 7 { return }
+        field = field + 1
+    }
+    site.target = target
+    site.type = type
+    site.statement = context.syntax.active
+}
+
+function recordReuseCandidate(context: CompilerContext, node: Integer, type: Integer): Boolean {
+    let site = context.recordReuse
+    if site.target < 0 || site.type != type { return false }
+    let tree = context.syntax
+    let parent = tree.nodes[node].parent
+    while parent >= 0 && tree.nodes[parent].kind == 207 { parent = tree.nodes[parent].parent }
+    return parent == site.statement
+}
+
+function takeRecordReconstruction(context: CompilerContext, state: List<Integer>, textState: List<Text>, output: List<Text>, target: Integer, resultType: List<Integer>) {
+    let site = context.recordReuse
+    if recoveryEnabled(state) || site.target != target || site.node < 0 { return }
+    let tree = context.syntax
+    let node = ungroupOwnershipNode(tree, tree.nodes[tree.active].lastChild)
+    if node != site.node || tree.nodes[node].kind != 210 || resultType[0] != site.type { return }
+    if resultType.length < 2 || resultType[1] != site.owner { return }
+    if output[site.owner] != "  call void @minyar_rc_keep(ptr " || output[site.owner + 1] != site.value { return }
+    let previous = valueName(textState, newTemporary(state))
+    output[site.latePiece] = "  " + previous + " = load ptr, ptr %local." + Text(target) + "\n  call void @minyar_rc_local_move_owner(i64 " + Text(ownershipSlot(state, target)) + ", ptr " + previous + ")\n  " + site.value + " = call ptr @minyar_record_reuse_scalar_take(ptr " + previous + ", i64 " + Text(site.fields) + ")\n"
+    // Initializers already captured every scalar value. Neither allocation nor
+    // a field store may precede those reads, calls or early propagation paths.
+    let piece = site.allocationStart
+    while piece < site.allocationEnd { output[piece] = ""; piece = piece + 1 }
+    state[7] = state[7] - 1
+    markOwner(resultType, keepReference(output, state, site.value, site.type))
+    let stored = 0
+    while stored < site.stores.length {
+        let fieldPiece = site.stores[stored]
+        while fieldPiece < site.stores[stored + 1] {
+            output.add(output[fieldPiece])
+            output[fieldPiece] = ""
+            fieldPiece = fieldPiece + 1
+        }
+        stored = stored + 2
+    }
+    site.target = -1
+    site.node = -1
+}
+
 // A direct local return is the binding's last use on this control-flow path.
 // Inspect the checked expression, so fields, calls and operators cannot be
 // mistaken for a return of their receiver. Shared heap values remain shared.

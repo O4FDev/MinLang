@@ -1193,6 +1193,14 @@ native/sanitized complete cleanup. Other-local destinations, inner consumers
 and compound assignment retain their existing ownership paths; older lexical
 chain optimizations remain covered.
 
+`make check-record-reconstruction-reuse` checks complete primitive-record
+reconstruction at O0/O2 with native and sanitized compiler/generated programs.
+It preserves swaps, source-order calls, mutations before replacement, alias
+fallbacks, borrowed parameters and early Result propagation. LLVM assertions
+place the owner move/helper and every field store after all initializers;
+separate fixtures retain reference, choice, C-layout, callback, recovery and
+seventeen-field fallbacks. The sixteen-field boundary is tested explicitly.
+
 `make check-mutable-scalar-records` checks direct scalar field updates without
 managed record calls. Integer, Float, Boolean and Character storage, compound
 updates, branch merges, loop initialization and match-expression initializers
