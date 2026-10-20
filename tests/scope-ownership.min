@@ -758,7 +758,7 @@ if fixtures.selected("ScopeOwnership", "test_plain_borrows_share_local_and_retur
         "print(tracedAlias(node).length)"
     ]), "1\n", environment, ordinary, cycle)
     let tracedBody = body(traced, "tracedAlias")
-    test.check(test.contains(tracedBody, "%rc.scope.cells = alloca [2 x ptr]"), "traced projection must retain both local and temporary cells")
+    test.check(test.contains(tracedBody, "%rc.scope.cells = alloca [1 x ptr]"), "traced projection must transfer its shaded count into the local cell")
     test.check(test.contains(tracedBody, "call void @minyar_rc_retain_traced("), "traced projection must keep its retain barrier")
     let progress = executes(compiler, program([
         "record Box { text: Text }",
@@ -985,8 +985,10 @@ if fixtures.selected("ScopeOwnership", "test_allocating_text_read_borrows_keep_p
         let emitted = body(llvm, name)
         checkLowered(llvm, name)
         checkEmptyScope(emitted, "single-use text helper operand must borrow its parent owner in " + name)
-        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "single-use text helper operand must omit its redundant retain in " + name)
     }
+    let joinedLeft = body(llvm, "joinedLeft")
+    test.check(test.contains(joinedLeft, "call void @minyar_rc_retain(") && test.contains(joinedLeft, "call ptr @minyar_join_text_take_left("), "consuming left helper must take the protecting field count")
+    for name in ["joinedRight", "joinedTake", "aliasJoined", "searched"] { test.check(!test.contains(body(llvm, name), "call void @minyar_rc_retain("), "non-consuming helper operand must omit its redundant retain in " + name) }
     for name in ["joinedTake", "aliasJoined"] { test.check(test.contains(body(llvm, name), "call ptr @minyar_join_text_take_left("), "borrowed-right fixture must really consume its independent left result") }
     test.check(test.contains(body(llvm, "separated"), "call void @minyar_rc_retain("), "mutating later join argument must preserve the earlier borrowed text")
     executes(compiler, program([
@@ -1110,7 +1112,7 @@ if fixtures.selected("ScopeOwnership", "test_temporary_cells_reuse_only_disjoint
     test.check(test.contains(sequential, "%rc.scope.cells = alloca [1 x ptr]"), "two disjoint statement results must reuse one temporary cell")
     test.check(sequential.split("call void @minyar_rc_scope_release_v1(").length == 3, "both sequential result drops must remain after coloring")
     test.check(sequential.split("call void @minyar_rc_scope_poll_v1()").length == 3, "both sequential statement polls must remain after coloring")
-    test.check(body(llvm, "graphReads").split("call void @minyar_rc_retain_traced(").length == 4, "traced temporary/local acquisitions must all keep their barriers")
+    test.check(body(llvm, "graphReads").split("call void @minyar_rc_retain_traced(").length == 3, "traced local acquisition must reuse its protecting barrier")
 
     executes(compiler, program([
         "record Job { text: Text; mode: Integer }",
@@ -1329,18 +1331,17 @@ if fixtures.selected("ScopeOwnership", "test_projected_borrows_publish_one_lasti
         checkLowered(llvm, name)
         let emitted = body(llvm, name)
         checkEmptyScope(emitted, "publisher-only projection must need no temporary cell in " + name)
-        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "publisher must keep its own retain instead of a caller temporary retain in " + name)
+        test.check(test.contains(emitted, "call void @minyar_rc_retain("), "publisher must take the protecting count without a second retain in " + name)
         test.check(!test.contains(emitted, "call void @minyar_rc_scope_release_v1("), "publisher-only projection must omit only its redundant temporary drop in " + name)
     }
     test.check(test.contains(replaced, "call void @minyar_record_replace(") && test.contains(replaced, ", i64 0)"), "record publisher and literal retaining flag must remain")
-    test.check(body(llvm, "buildPair").split("call void @minyar_record_set_reference(").length == 3, "both constructor field publishers must remain")
-    test.check(!test.contains(body(llvm, "buildPair"), "call void @minyar_rc_retain("), "constructor field borrows must defer to both real publisher retains")
-    test.check(body(llvm, "replaceList").split("call void @minyar_list_set(").length == 2, "reference List replacement must remain")
-    for name in ["appendText", "growSelf", "publishBranch"] { test.check(body(llvm, name).split("call void @minyar_list_add(").length == 2, "reference List publisher must remain in " + name) }
-    let exitPoll = "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_empty_v1()"
-    test.check(body(llvm, "publishBranch").split(exitPoll).length == 3, "both publisher-affected exits must poll, including the bypassed branch")
+    test.check(body(llvm, "buildPair").split("call void @minyar_record_set_take(").length == 3, "both constructor fields must take their protecting counts")
+    test.check(body(llvm, "buildPair").split("call void @minyar_rc_retain(").length == 3, "both constructor field borrows must become publisher counts")
+    test.check(body(llvm, "replaceList").split("call void @minyar_list_set_take(").length == 2, "reference List replacement must take its protecting count")
+    for name in ["appendText", "growSelf", "publishBranch"] { test.check(body(llvm, name).split("call void @minyar_list_add_take(").length == 2, "reference List publisher must take its protecting count in " + name) }
+    test.check(body(llvm, "publishBranch").split("call void @minyar_rc_scope_leave_empty_v1()").length == 3, "both publisher exits must leave their empty scopes")
     test.check(test.contains(body(llvm, "delayed"), "call void @minyar_rc_retain("), "mutating later RHS evaluation must preserve the earlier argument owner")
-    test.check(test.contains(body(llvm, "publishTraced"), "call void @minyar_rc_retain_traced(") && test.contains(body(llvm, "publishTraced"), "call void @minyar_list_add_traced("), "traced projection and publisher barriers must remain")
+    test.check(test.contains(body(llvm, "publishTraced"), "call void @minyar_rc_retain_traced(") && test.contains(body(llvm, "publishTraced"), "call void @minyar_list_add_take_traced("), "traced projection must transfer its shaded count to the publisher")
     test.check(test.contains(body(llvm, "scalarControl"), "@.minyar.list.set.scalar.checked("), "scalar destinations must keep their scalar frontend path")
 
     // Exact symbol/position/SSA controls; generic List C calls here represent

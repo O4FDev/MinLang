@@ -66,6 +66,32 @@ function takeResult(output: List<Text>, state: List<Integer>, value: Text, resul
     return false
 }
 
+// Direct returns still provide the bounded runtime's cleanup poll. A
+// protecting borrow records that progress point, so leave it in the frame and
+// publish a separate return count.
+function takeReturnedResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>): Boolean {
+    if isReferenceType(resultType[0]) && resultType.length > 1 {
+        let owner = resultType[1]
+        if owner >= 0 && owner < output.length {
+            if output[owner] == "  call void @minyar_rc_borrow(ptr " { return false }
+            if output[owner] == "  call void @minyar_rc_borrow(ptr " + value + ")\n" { return false }
+        }
+    }
+    return takeResult(output, state, value, resultType)
+}
+
+// A Result propagation or another expression-level early return can leave
+// before a later consumer. Counts produced before that branch must remain in
+// the temporary frame so the failing path releases them.
+function ownerCrossesReturn(output: List<Text>, owner: Integer): Boolean {
+    let piece = owner + 1
+    while piece < output.length {
+        if output[piece].find("  ret ") >= 0 { return true }
+        piece = piece + 1
+    }
+    return false
+}
+
 function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Boolean {
     if recoveryEnabled(state) { return false }
     if owner == -1 { return false }
@@ -79,10 +105,24 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
         output[owner + 1] = ""
         return true
     }
+    if ownerCrossesReturn(output, owner) { return false }
     if output[owner] == "  call void @minyar_rc_keep(ptr " && output[owner + 1] == value {
         output[owner] = ""
         output[owner + 1] = ""
         output[owner + 2] = ""
+        state[7] = state[7] - 1
+        return true
+    }
+    // A protecting borrow already retained the value for this expression.
+    // Give that count to the consumer instead of keeping it as a temporary.
+    if output[owner] == "  call void @minyar_rc_borrow(ptr " && output[owner + 1] == value {
+        output[owner] = "  call void @minyar_rc_retain(ptr "
+        state[7] = state[7] - 1
+        return true
+    }
+    let borrow = "  call void @minyar_rc_borrow(ptr " + value + ")\n"
+    if output[owner] == borrow {
+        output[owner] = "  call void @minyar_rc_retain(ptr " + value + ")\n"
         state[7] = state[7] - 1
         return true
     }
