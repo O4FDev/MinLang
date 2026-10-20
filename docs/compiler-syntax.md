@@ -232,10 +232,16 @@ scalar IR and never create a runtime record, field-name literal or initializer.
 
 Contextual `assembly for TARGET "text" [inputs(EXPRESSION in REGISTER, ...)]
 changes(...)` is an ordinary statement (compiler/assembly-compiler.min). It is
-recognized only by that token shape and lowers to one `call void asm sideeffect`
-with fixed-register input constraints and explicit clobbers. Every `$` in the
-template is doubled, because the form has no operand references. It adds no
-syntax kind, keyword, feature bit or runtime ABI.
+recognized only by that token shape and lowers to one `call ... asm sideeffect`.
+Each input uses a discarded fixed-register early-clobber output and a tied
+input constraint, allowing the assembly to overwrite that register without
+changing the Minyar value. The call returns void with no inputs, the register's
+integer type with one input, or a struct of those types with multiple inputs.
+Physical register aliases cannot hold separate inputs; explicit changes to an
+input's register family need no additional clobber. Arm64 x29/w29 are reserved
+for the kernel frame pointer. Other changes become explicit clobbers. Every
+`$` in the template is doubled, because the form has no operand references.
+It adds no syntax kind, keyword, feature bit or runtime ABI.
 
 Interrupt contexts use contextual `interrupt function` and header
 `handles(vector)`, with the existing modifier feature bit 16. An explicit

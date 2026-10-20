@@ -1863,15 +1863,22 @@ function writeSerial(character: Integer) {
 
 The text is passed to the target's assembler as written. `inputs(...)` binds
 Integer values to named general registers (`al` to `rax` and `r8` to `r15` on
-x86-64, `w0`/`x0` to `x30` on Arm64). Each value must fit its register's
-unsigned width, checked like a register field. `changes(...)` is required. It
-lists what the instructions change besides their inputs: `memory`, `flags`,
-named registers, or `nothing`. The compiler cannot check that list against the
-instructions, so it is the author's promise.
+x86-64, `w0`/`x0` through `w30`/`x30` on Arm64, excluding the frame pointer
+`w29`/`x29`). Each value must fit its register's unsigned width, checked like a
+register field. The instructions may overwrite input registers; the original
+Minyar values remain unchanged. Two inputs cannot name overlapping registers,
+such as `al` and `rax`, or `w0` and `x0`.
+
+`changes(...)` is required. It lists what the instructions change besides
+their inputs: `memory`, `flags`, named registers, or `nothing`. Listing an
+input register or its alias again is allowed and adds no further change.
+The compiler cannot check that list against the instructions, so it is the
+author's promise.
 
 The statement compiles only in a kernel build for its own target. It has no
-outputs, costs exactly its instructions, and is a native effect, so interrupt
-handlers reject it. `assembly` is contextual: it starts this statement only
+outputs. Input range checks, register setup and preserving live values may
+add scalar instructions; the assembly itself allocates nothing. It is a native
+effect, so interrupt handlers reject it. `assembly` is contextual: it starts this statement only
 when followed by `for`, a target name and text. Other names called `assembly`
 keep working.
 

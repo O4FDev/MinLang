@@ -3,6 +3,7 @@
 
 Positive programs must lower to exactly the expected LLVM inline-assembly call;
 rejections must name the problem; `assembly` stays an ordinary name elsewhere.
+Cross-target objects and a host input-mutation regression run at O0 and O2.
 The QEMU guest writes a serial line through `outb` written in Minyar assembly.
 """
 
@@ -25,14 +26,20 @@ POSITIVES = [
      r'call void asm sideeffect "pause", ""\(\)'),
     ("x86_64", 'function send(value: Integer, port: Integer) {\n    assembly for x86_64 "outb %al, %dx" inputs(value in al, port in dx) changes(memory)\n}\n'
      'function main(): Integer {\n    send(65, 0x3F8)\n    return 0\n}\n',
-     r'call void asm sideeffect "outb %al, %dx", "\{al\},\{dx\},~\{memory\}"\(i8 %[\w.]+, i16 %[\w.]+\)'),
+     r'call \{ i8, i16 \} asm sideeffect "outb %al, %dx", "=&\{al\},=&\{dx\},0,1,~\{memory\}"\(i8 %[\w.]+, i16 %[\w.]+\)'),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "movq $1, %rax" changes(rax, flags)\n    return 0\n}\n',
      r'call void asm sideeffect "movq \$\$1, %rax", "~\{rax\},~\{flags\},~\{dirflag\},~\{fpsr\}"\(\)'),
     ("arm64", 'function main(): Integer {\n    assembly for arm64 "isb" changes(memory)\n    return 0\n}\n',
      r'call void asm sideeffect "isb", "~\{memory\}"\(\)'),
     ("arm64", 'function store(address: Integer, value: Integer) {\n    assembly for arm64 "strb w1, [x0]" inputs(address in x0, value in w1) changes(memory)\n}\n'
      'function main(): Integer {\n    store(0x09000000, 65)\n    return 0\n}\n',
-     r'call void asm sideeffect "strb w1, \[x0\]", "\{x0\},\{w1\},~\{memory\}"\(i64 %[\w.]+, i32 %[\w.]+\)'),
+     r'call \{ i64, i32 \} asm sideeffect "strb w1, \[x0\]", "=&\{x0\},=&\{w1\},0,1,~\{memory\}"\(i64 %[\w.]+, i32 %[\w.]+\)'),
+    ("x86_64", 'function keep(value: Integer): Integer {\n    assembly for x86_64 "xorq %rax, %rax" inputs(value in rax) changes(eax, flags)\n    return value\n}\n'
+     'function main(): Integer { return 0 }\n',
+     r'call i64 asm sideeffect "xorq %rax, %rax", "=&\{rax\},0,~\{flags\},~\{dirflag\},~\{fpsr\}"\(i64 %[\w.]+\)'),
+    ("arm64", 'function keep(value: Integer): Integer {\n    assembly for arm64 "mov x0, #0" inputs(value in x0) changes(w0)\n    return value\n}\n'
+     'function main(): Integer { return 0 }\n',
+     r'call i64 asm sideeffect "mov x0, #0", "=&\{x0\},0"\(i64 %[\w.]+\)'),
 ]
 
 REJECTIONS = [
@@ -41,6 +48,13 @@ REJECTIONS = [
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "outb %al, %dx" inputs(1 in xmm0) changes(nothing)\n    return 0\n}\n', "is not a general register"),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "outb %al, %dx" inputs(256 in al, 1 in dx) changes(nothing)\n    return 0\n}\n', "outside its unsigned 8-bit range"),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" inputs(1 in al, 2 in al) changes(nothing)\n    return 0\n}\n', "already holds an input"),
+    ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" inputs(1 in al, 2 in rax) changes(nothing)\n    return 0\n}\n', "already holds an input"),
+    ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" inputs(1 in r8d, 2 in r8) changes(nothing)\n    return 0\n}\n', "already holds an input"),
+    ("arm64", 'function main(): Integer {\n    assembly for arm64 "nop" inputs(1 in w0, 2 in x0) changes(nothing)\n    return 0\n}\n', "already holds an input"),
+    ("arm64", 'function main(): Integer {\n    assembly for arm64 "nop" inputs(1 in x29) changes(nothing)\n    return 0\n}\n', "not a general register"),
+    ("arm64", 'function main(): Integer {\n    assembly for arm64 "nop" inputs(1 in w29) changes(nothing)\n    return 0\n}\n', "not a general register"),
+    ("arm64", 'function main(): Integer {\n    assembly for arm64 "nop" changes(x29)\n    return 0\n}\n', "not memory, flags or a general register"),
+    ("arm64", 'function main(): Integer {\n    assembly for arm64 "nop" changes(w29)\n    return 0\n}\n', "not memory, flags or a general register"),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" inputs("one" in al) changes(nothing)\n    return 0\n}\n', "Integer values"),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" changes(nothing, memory)\n    return 0\n}\n', "cannot list anything else"),
     ("x86_64", 'function main(): Integer {\n    assembly for x86_64 "nop" changes(memory, memory)\n    return 0\n}\n', "listed twice"),
@@ -50,6 +64,9 @@ REJECTIONS = [
 ]
 
 ORDINARY = 'let assembly = 40\nfunction assemble(assembly: Integer): Integer { return assembly + 2 }\nprint(assemble(assembly))\n'
+MUTABLE_INPUT = ('function keep(value: Integer): Integer {\n'
+                 '    assembly for x86_64 "xorq %rax, %rax" inputs(value in rax) changes(flags)\n'
+                 '    return value\n}\nfunction main(): Integer { return 0 }\n')
 
 
 def run(command, timeout=120, cwd=None):
@@ -65,6 +82,43 @@ def compile_case(compiler, scratch, name, target, source):
     options = [*KERNEL, target] if target else []
     result = run([compiler, path, output, "--library", ROOT / "library", *options])
     return result, output
+
+
+def check_mutable_input(args, scratch, failures):
+    result, output = compile_case(args.compiler, scratch, "mutable-input", "x86_64", MUTABLE_INPUT)
+    if result.returncode != 0:
+        failures.append("mutable input does not compile: " + result.stderr[-1000:])
+        return
+    text = output.read_text()
+    functions = re.findall(r'^define i64 @([^\s(]+)\(i64 %argument\.0\)[^\n]*\{\n(.*?)^\}', text, re.M | re.S)
+    symbols = [symbol for symbol, body in functions if '"xorq %rax, %rax"' in body]
+    if len(symbols) != 1:
+        failures.append("cannot identify the emitted mutable-input function")
+        return
+    # A separate C translation unit keeps the runtime argument unknown to the
+    # Minyar function's optimizer. Its return must preserve the live value even
+    # though the assembly overwrites the ABI's return register.
+    output.write_text(text.replace("@main(", "@minyar_assembly_fixture_main("))
+    symbol = symbols[0].strip('"').replace("\\", "\\\\").replace('"', '\\"')
+    driver = scratch / "mutable-input-driver.c"
+    driver.write_text('#include <stdint.h>\n'
+                      'extern int64_t keep(int64_t) __asm__("' + symbol + '");\n'
+                      'int main(void) {\n'
+                      '    volatile int64_t values[] = {0, 1, -1, INT64_MAX, INT64_MIN, INT64_C(0x123456789abcdef)};\n'
+                      '    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {\n'
+                      '        int64_t value = values[i];\n'
+                      '        if (keep(value) != value) return 1;\n'
+                      '    }\n    return 0;\n}\n')
+    for optimization in ("-O0", "-O2"):
+        program = scratch / ("mutable-input" + optimization)
+        linked = run([args.clang, optimization, "-Wno-override-module", output, driver, args.runtime,
+                      "-lm", "-pthread", "-o", program])
+        if linked.returncode != 0:
+            failures.append(f"mutable input {optimization} does not link: {linked.stderr[-1000:]}")
+            continue
+        ran = run([program])
+        if ran.returncode != 0 or ran.stdout or ran.stderr:
+            failures.append(f"mutable input {optimization} changed a live Minyar value: status {ran.returncode}\n{ran.stderr[-1000:]}")
 
 
 def main():
@@ -85,10 +139,11 @@ def main():
             failures.append(f"positive {index} ({target}): {result.stderr.strip()[:300]}\nexpected /{pattern}/")
             continue
         triple = "x86_64-unknown-none-elf" if target == "x86_64" else "aarch64-unknown-none-elf"
-        assembled = run([args.clang, "--target=" + triple, "-O2", "-c", "-x", "ir", "-Wno-override-module", output,
-                         "-o", scratch / f"positive-{index}.o"])
-        if assembled.returncode != 0:
-            failures.append(f"positive {index} ({target}) does not assemble: {assembled.stderr.strip()[:300]}")
+        for optimization in ("-O0", "-O2"):
+            assembled = run([args.clang, "--target=" + triple, optimization, "-c", "-x", "ir", "-Wno-override-module", output,
+                             "-o", scratch / f"positive-{index}{optimization}.o"])
+            if assembled.returncode != 0:
+                failures.append(f"positive {index} ({target}, {optimization}) does not assemble: {assembled.stderr.strip()[:300]}")
     for index, (target, source, message) in enumerate(REJECTIONS):
         result, output = compile_case(args.compiler, scratch, f"reject-{index}", target, source)
         if result.returncode == 0 or message not in result.stderr or not re.search(r"\.min:\d+:\d+", result.stderr):
@@ -102,7 +157,8 @@ def main():
             failures.append("an ordinary name 'assembly' must keep working")
     else:
         failures.append("an ordinary name 'assembly' must keep working: " + result.stderr.strip()[:300])
-    print(f"assembly: {len(POSITIVES)} lowerings, {len(REJECTIONS)} rejections and ordinary names checked", flush=True)
+    check_mutable_input(args, scratch, failures)
+    print(f"assembly: {len(POSITIVES)} lowerings, {len(REJECTIONS)} rejections, ordinary names and O0/O2 input mutation checked", flush=True)
     if not args.no_qemu and not failures:
         llvm = Path(shutil.which(args.clang) or args.clang).resolve().parent
         mkimage = ROOT / "build/os/mkimage"

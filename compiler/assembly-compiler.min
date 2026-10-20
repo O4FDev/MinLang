@@ -43,6 +43,7 @@ function assemblyRegisterWidth(target: Integer, name: Text): Integer {
         }
         return 0
     }
+    if name == "x29" || name == "w29" { return 0 }
     let index = 0
     while index <= 30 {
         if name == "x" + Text(index) { return 64 }
@@ -50,6 +51,38 @@ function assemblyRegisterWidth(target: Integer, name: Text): Integer {
         index = index + 1
     }
     return 0
+}
+
+// Canonical physical register identity, after width validation.
+function assemblyRegisterIdentity(target: Integer, name: Text): Text {
+    if target == 1 {
+        let families: List<Text> = ["a", "b", "c", "d"]
+        let index = 0
+        while index < families.length {
+            let family = families[index]
+            if name == family + "l" || name == family + "x" || name == "e" + family + "x" || name == "r" + family + "x" { return "r" + family + "x" }
+            index = index + 1
+        }
+        let pointers: List<Text> = ["si", "di"]
+        index = 0
+        while index < pointers.length {
+            let pointer = pointers[index]
+            if name == pointer || name == "e" + pointer || name == "r" + pointer { return "r" + pointer }
+            index = index + 1
+        }
+        index = 8
+        while index <= 15 {
+            if name == "r" + Text(index) || name == "r" + Text(index) + "d" { return "r" + Text(index) }
+            index = index + 1
+        }
+    } else {
+        let index = 0
+        while index <= 30 {
+            if name == "x" + Text(index) || name == "w" + Text(index) { return "x" + Text(index) }
+            index = index + 1
+        }
+    }
+    return name
 }
 
 function assemblyJoin(values: List<Text>, separator: Text): Text {
@@ -92,6 +125,7 @@ function compileAssemblyStatement(context: CompilerContext, localNames: List<Tex
     state[0] = location + 4
     let constraints: List<Text> = []
     let operands: List<Text> = []
+    let resultTypes: List<Text> = []
     let used: List<Text> = []
     if tokenIs(kinds, texts, state, "inputs") && texts[state[0] + 1] == "(" {
         state[0] = state[0] + 2
@@ -106,13 +140,17 @@ function compileAssemblyStatement(context: CompilerContext, localNames: List<Tex
             let width = 0
             if kinds[state[0]] == 1 { width = assemblyRegisterWidth(target, register) }
             if width == 0 { failAtToken(lines, state[0], "'" + register + "' is not a general register assembly can name on " + selected) }
-            if findText(used, register) >= 0 { failAtToken(lines, state[0], "register '" + register + "' already holds an input") }
-            used.add(register)
+            let identity = assemblyRegisterIdentity(target, register)
+            if findText(used, identity) >= 0 { failAtToken(lines, state[0], "register '" + register + "' already holds an input") }
+            used.add(identity)
             state[0] = state[0] + 1
             registerRequireFits(output, textState, state, lines, valueLocation, value, width, "this assembly input")
             let operand = value
             if width < 64 { operand = emitInstruction(output, textState, state, "trunc i64 " + value + " to i" + Text(width)) }
-            constraints.add("{" + register + "}")
+            // Inputs may be changed by the instructions. Tied early-clobber
+            // outputs tell LLVM to preserve the original Minyar SSA values.
+            constraints.add("=&{" + register + "}")
+            resultTypes.add("i" + Text(width))
             operands.add("i" + Text(width) + " " + operand)
         }
         expectToken(kinds, texts, lines, state, ")")
@@ -140,7 +178,7 @@ function compileAssemblyStatement(context: CompilerContext, localNames: List<Tex
             }
             if clobber == "" {
                 if assemblyRegisterWidth(target, word) == 0 { failAtToken(lines, state[0], "'" + word + "' is not memory, flags or a general register on " + selected) }
-                clobber = "~{" + word + "}"
+                clobber = "~{" + assemblyRegisterIdentity(target, word) + "}"
             }
             if findText(changes, clobber) >= 0 { failAtToken(lines, state[0], "'" + word + "' is listed twice") }
             changes.add(clobber)
@@ -149,10 +187,24 @@ function compileAssemblyStatement(context: CompilerContext, localNames: List<Tex
     }
     expectToken(kinds, texts, lines, state, ")")
     if changes.length == 0 && !nothing { failAtToken(lines, location, "write changes(nothing) when the instructions change nothing else") }
+    let input = 0
+    while input < used.length {
+        constraints.add(Text(input))
+        input = input + 1
+    }
     let change = 0
     while change < changes.length {
-        constraints.add(changes[change])
+        let redundant = false
+        input = 0
+        while input < used.length {
+            if changes[change] == "~{" + used[input] + "}" { redundant = true }
+            input = input + 1
+        }
+        if !redundant { constraints.add(changes[change]) }
         change = change + 1
     }
-    output.add("  call void asm sideeffect \"" + template + "\", \"" + assemblyJoin(constraints, ",") + "\"(" + assemblyJoin(operands, ", ") + ")\n")
+    let resultType = "void"
+    if resultTypes.length == 1 { resultType = resultTypes[0] }
+    if resultTypes.length > 1 { resultType = "{ " + assemblyJoin(resultTypes, ", ") + " }" }
+    output.add("  call " + resultType + " asm sideeffect \"" + template + "\", \"" + assemblyJoin(constraints, ",") + "\"(" + assemblyJoin(operands, ", ") + ")\n")
 }
