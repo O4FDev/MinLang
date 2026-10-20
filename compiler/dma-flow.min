@@ -10,6 +10,10 @@ record DmaFlowProgram {
     used: List<Integer>
     callers: List<Integer>
     callees: List<Integer>
+    actors: List<Integer>
+    concurrent: List<Integer>
+    dmaActors: List<Integer>
+    inLoops: List<Boolean>
 }
 
 record DmaFlowFrame {
@@ -50,13 +54,21 @@ function dmaFlowFind(values: List<Integer>, value: Integer): Integer {
 
 function dmaFlowCopy(values: List<Integer>): List<Integer> {
     let result: List<Integer> = []
-    for value in values { result.add(value) }
+    let index = 0
+    while index < values.length {
+        result.add(values[index])
+        index = index + 1
+    }
     return result
 }
 
 function dmaFlowReplace(target: List<Integer>, values: List<Integer>) {
     target.clear()
-    for value in values { target.add(value) }
+    let index = 0
+    while index < values.length {
+        target.add(values[index])
+        index = index + 1
+    }
 }
 
 // Follow actual type metadata, with a visited worklist for recursive records.
@@ -80,7 +92,12 @@ function dmaFlowContains(context: CompilerContext, type: Integer): Boolean {
                         if isSetType(current) { queue.add(setElementType(current)) }
                         else {
                             if isCallbackType(current, context.functionNames) {
-                                for child in callbackSignatureTypes(context.functionNames[current - 1000]) { queue.add(child) }
+                                let signature = callbackSignatureTypes(context.functionNames[current - 1000])
+                                let component = 0
+                                while component < signature.length {
+                                    queue.add(signature[component])
+                                    component = component + 1
+                                }
                             } else {
                                 if isRecordType(current) {
                                     let symbol = -1
@@ -173,15 +190,21 @@ function dmaFlowName(frame: DmaFlowFrame, node: Integer, state: List<Integer>): 
 }
 
 function dmaFlowEmpty(frame: DmaFlowFrame, state: List<Integer>, node: Integer) {
-    for phase in state {
+    let index = 0
+    while index < state.length {
+        let phase = state[index]
         if phase == 1 || phase == 2 { dmaFlowReject(frame.program.context, node, "normal exit must transfer, dispose or retire every live CPU/Pending capability") }
+        index = index + 1
     }
 }
 
 function dmaFlowClose(frame: DmaFlowFrame, state: List<Integer>, locals: List<Integer>, node: Integer) {
-    for slot in locals {
+    let index = 0
+    while index < locals.length {
+        let slot = locals[index]
         if state[slot] == 1 || state[slot] == 2 { dmaFlowReject(frame.program.context, node, "scope exit leaves a live capability; transfer, dispose or retire it explicitly") }
         state[slot] = -1
+        index = index + 1
     }
 }
 
@@ -273,12 +296,42 @@ function dmaFlowExpression(frame: DmaFlowFrame, node: Integer, state: List<Integ
     return 0
 }
 
+function dmaFlowScalarLoop(frame: DmaFlowFrame, node: Integer, state: List<Integer>) {
+    let context = frame.program.context
+    let index = 0
+    while index < state.length {
+        let phase = state[index]
+        if phase == 1 || phase == 2 { dmaFlowReject(context, node, "loops cannot hold a live CPU/Pending capability") }
+        index = index + 1
+    }
+    // The ordinary compiler owns scalar loop control flow. Check every typed
+    // descendant, including conditions, nested loops and dead-looking returns,
+    // before leaving the outer ownership state unchanged.
+    let queue: List<Integer> = [node]
+    let cursor = 0
+    while cursor < queue.length {
+        let current = queue[cursor]
+        cursor = cursor + 1
+        let syntax = context.syntax.nodes[current]
+        if dmaFlowPhase(context, syntax.type) > 0 { dmaFlowReject(context, current, "loops cannot create, use, consume or return affine values") }
+        let child = syntax.firstChild
+        while child >= 0 {
+            queue.add(child)
+            child = context.syntax.nodes[child].nextSibling
+        }
+    }
+}
+
 function dmaFlowStatement(frame: DmaFlowFrame, node: Integer, state: List<Integer>, locals: List<Integer>, depth: Integer): Boolean {
     dmaFlowDepth(frame, node, depth)
     let context = frame.program.context
     let syntax = context.syntax.nodes[node]
     let kind = syntax.kind
     if kind == 100 { return dmaFlowSequence(frame, node, state, depth + 1) }
+    if kind == 102 || kind == 103 {
+        dmaFlowScalarLoop(frame, node, state)
+        return true
+    }
     if kind == 101 {
         let condition = syntax.firstChild
         if condition < 0 { dmaFlowReject(context, node, "if is missing a typed condition") }
@@ -412,7 +465,7 @@ function dmaFlowCheckFunction(program: DmaFlowProgram, root: Integer) {
     let state: List<Integer> = []
     let node = 0
     while node < context.syntax.nodes.length {
-        if program.owners[node] == root {
+        if program.owners[node] == root && !program.inLoops[node] {
             let syntax = context.syntax.nodes[node]
             if syntax.kind == 6 || syntax.kind == 104 {
                 let type = syntax.type
@@ -464,24 +517,50 @@ function dmaFlowDAG(program: DmaFlowProgram) {
     }
 }
 
+function dmaFlowConcurrentHeader(context: CompilerContext, node: Integer): Boolean {
+    let start = context.syntax.nodes[node].start
+    if start < 0 || start >= context.tokenKinds.length || context.tokenTexts[start] != "function" { return false }
+    let modifier = start - 1
+    if modifier >= 0 && context.tokenTexts[modifier] == "public" { modifier = modifier - 1 }
+    // Kind 6 identifies an actual normalized contextual declaration modifier;
+    // ordinary same-named functions/locals and feature16 IRQs are unrelated.
+    return modifier >= 0 && context.tokenKinds[modifier] == 6 && (context.tokenTexts[modifier] == "thread" || context.tokenTexts[modifier] == "parallel")
+}
+
+function dmaFlowConcurrent(program: DmaFlowProgram) {
+    let context = program.context
+    let rootIndex = 0
+    while rootIndex < program.concurrent.length {
+        let root = program.concurrent[rootIndex]
+        let queue: List<Integer> = [root]
+        let cursor = 0
+        while cursor < queue.length {
+            let actor = queue[cursor]
+            cursor = cursor + 1
+            if dmaFlowFind(program.dmaActors, actor) >= 0 || (actor < program.primitives.length && program.primitives[actor] > 0) {
+                let site = root - context.functionNames.length
+                if root < context.functionNames.length { site = dmaFlowFact(context.syntax.symbolNodes, root) }
+                dmaFlowReject(context, site, "serialized boot-CPU DMA cannot be reached from thread, parallel or callback execution")
+            }
+            let edge = 0
+            while edge < program.callers.length {
+                if program.callers[edge] == actor && dmaFlowFind(queue, program.callees[edge]) < 0 { queue.add(program.callees[edge]) }
+                edge = edge + 1
+            }
+        }
+        rootIndex = rootIndex + 1
+    }
+}
+
 function checkDmaOwnership(context: CompilerContext) {
     if context.dma.kinds.length == 0 { return }
-    // These kind-6 tokens are resolved contextual declaration modifiers, not
-    // ordinary identifiers. Feature 16 alone also includes IRQ declarations.
-    let token = 0
-    while token < context.tokenKinds.length {
-        if context.tokenKinds[token] == 6 && (context.tokenTexts[token] == "thread" || context.tokenTexts[token] == "parallel") {
-            failAtToken(context.tokenLines, token, "DMA ownership: serialized boot-CPU DMA cannot be combined with thread or parallel execution declarations")
-        }
-        token = token + 1
-    }
     let count = context.syntax.nodes.length
     if count == 0 || context.syntax.nodes[0].kind != 0 { dmaFlowReject(context, 0, "module syntax is missing") }
-    let program = DmaFlowProgram { context: context, owners: [], closures: [], selected: [], primitives: [], used: [], callers: [], callees: [] }
+    let program = DmaFlowProgram { context: context, owners: [], closures: [], selected: [], primitives: [], used: [], callers: [], callees: [], actors: [], concurrent: [], dmaActors: [], inLoops: [] }
     let seen: List<Boolean> = []
     let node = 0
     while node < count {
-        program.owners.add(-1); program.closures.add(false); program.selected.add(false); program.used.add(0); seen.add(false)
+        program.owners.add(-1); program.closures.add(false); program.selected.add(false); program.used.add(0); program.actors.add(-1); program.inLoops.add(false); seen.add(false)
         node = node + 1
     }
     let symbol = 0
@@ -493,7 +572,12 @@ function checkDmaOwnership(context: CompilerContext) {
         dmaFlowType(context, site, type, direct)
         if !direct && dmaFlowPhase(context, type) > 0 { dmaFlowReject(context, site, "CPU/Pending cannot be stored in module constants or globals") }
         if context.symbolKinds[symbol] == 4 && isCallbackType(1000 + symbol, context.functionNames) {
-            for child in callbackSignatureTypes(context.functionNames[symbol]) { dmaFlowType(context, site, child, false) }
+            let signature = callbackSignatureTypes(context.functionNames[symbol])
+            let component = 0
+            while component < signature.length {
+                dmaFlowType(context, site, signature[component], false)
+                component = component + 1
+            }
         }
         let offset = functionParameterOffset(context.functionParameterCounts, symbol)
         let parameter = 0
@@ -515,21 +599,43 @@ function checkDmaOwnership(context: CompilerContext) {
         cursor = cursor + 1
         let syntax = context.syntax.nodes[node]
         let owner = program.owners[node]
+        let actor = program.actors[node]
         if syntax.kind == 1 {
             owner = node; program.owners[node] = node
             if syntax.symbol < 0 || syntax.symbol >= context.functionNames.length || context.symbolKinds[syntax.symbol] != 1 || dmaFlowFact(context.syntax.symbolNodes, syntax.symbol) != node {
                 dmaFlowReject(context, node, "function has no unique resolved declaration identity")
             }
+            actor = syntax.symbol
+            if dmaFlowConcurrentHeader(context, node) { program.concurrent.add(actor) }
         }
         let closure = program.closures[node] || syntax.kind == 208
         program.closures[node] = closure
-        if syntax.kind == 103 && parallelForAt(context.tokenKinds, context.tokenTexts, syntax.start) {
-            dmaFlowReject(context, node, "serialized boot-CPU DMA cannot be combined with parallel ranges")
+        let inLoop = program.inLoops[node] || syntax.kind == 102 || syntax.kind == 103
+        program.inLoops[node] = inLoop
+        if syntax.kind == 208 {
+            if syntax.symbol < 0 || syntax.symbol >= context.functionNames.length || context.symbolKinds[syntax.symbol] != 4 || dmaFlowFact(context.syntax.symbolNodes, syntax.symbol) != node {
+                dmaFlowReject(context, node, "callback execution needs its resolved Environment identity")
+            }
+            actor = syntax.symbol
+            program.concurrent.add(actor)
         }
-        if syntax.kind == 209 && owner > 0 && !closure && program.primitives[context.syntax.nodes[owner].symbol] == 0 {
+        if syntax.kind == 100 && syntax.parent >= 0 {
+            let parent = context.syntax.nodes[syntax.parent]
+            if parent.kind == 103 && parallelForAt(context.tokenKinds, context.tokenTexts, parent.start) {
+                // Range bounds execute on the owner; only this actual body is
+                // a parallel execution root. Synthetic IDs follow real symbols.
+                actor = context.functionNames.length + syntax.parent
+                program.concurrent.add(actor)
+            }
+        }
+        program.actors[node] = actor
+        if dmaKind(context, syntax.type) > 0 && syntax.kind != 2 && actor >= 0 && dmaFlowFind(program.dmaActors, actor) < 0 { program.dmaActors.add(actor) }
+        if (syntax.kind == 209 || syntax.kind == 212) && actor >= 0 && (actor >= program.primitives.length || program.primitives[actor] == 0) {
             let callee = dmaFlowFact(context.dma.callees, node)
-            if callee >= 0 && callee < context.functionNames.length && context.symbolKinds[callee] == 1 && program.primitives[callee] == 0 {
-                program.callers.add(context.syntax.nodes[owner].symbol)
+            // Field access has no callee fact. Resolved scalar record methods
+            // are real direct edges even though their syntax kind is member212.
+            if callee >= 0 && callee < context.functionNames.length && context.symbolKinds[callee] == 1 {
+                program.callers.add(actor)
                 program.callees.add(callee)
             }
         }
@@ -560,13 +666,14 @@ function checkDmaOwnership(context: CompilerContext) {
             if child >= count || seen[child] { dmaFlowReject(context, node, "syntax has a duplicate/cyclic child") }
             if context.syntax.nodes[child].parent != node || context.syntax.nodes[child].previousSibling != previous { dmaFlowReject(context, child, "syntax binding ancestry is inconsistent") }
             seen[child] = true
-            program.owners[child] = owner; program.closures[child] = closure
+            program.owners[child] = owner; program.closures[child] = closure; program.actors[child] = actor; program.inLoops[child] = inLoop
             queue.add(child)
             previous = child
             child = context.syntax.nodes[child].nextSibling
         }
         if syntax.lastChild != previous { dmaFlowReject(context, node, "syntax child boundary is inconsistent") }
     }
+    dmaFlowConcurrent(program)
     node = 0
     while node < count {
         if !seen[node] { dmaFlowReject(context, node, "typed syntax has an untracked/orphan node") }
@@ -576,10 +683,12 @@ function checkDmaOwnership(context: CompilerContext) {
             if context.tokenLines.features / 8 % 2 != 0 { dmaFlowReject(context, node, "recoverable call-depth mode requires unsupported exceptional ownership edges") }
             let syntax = context.syntax.nodes[node]
             let kind = syntax.kind
-            if kind == 102 || kind == 103 || kind == 106 || kind == 107 || kind == 108 || kind == 109 || kind == 208 {
-                dmaFlowReject(context, node, "loops, match, native, captures and jumps are unsupported with affine capabilities")
+            if !program.inLoops[node] {
+                if kind == 106 || kind == 107 || kind == 108 || kind == 109 || kind == 208 {
+                    dmaFlowReject(context, node, "match, native, captures and jumps are unsupported with affine capabilities")
+                }
+                if kind == 220 && syntax.operator >= 0 && syntax.operator < context.tokenTexts.length && context.tokenTexts[syntax.operator] == "try" { dmaFlowReject(context, node, "try needs exceptional ownership edges") }
             }
-            if kind == 220 && syntax.operator >= 0 && syntax.operator < context.tokenTexts.length && context.tokenTexts[syntax.operator] == "try" { dmaFlowReject(context, node, "try needs exceptional ownership edges") }
         }
         node = node + 1
     }

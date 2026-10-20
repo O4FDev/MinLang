@@ -13,6 +13,7 @@
 // poll the used ring.
 use "machine" as machine
 use "device" as device
+use "dma" as dma
 use "../pci.min" as pci
 
 public constant BLOCK = 2
@@ -108,6 +109,7 @@ public function open(card: pci.Device): Device {
     while device.readAt8(common, 0x14) != 0 && spins < 1000000 {
         spins += 1
     }
+    if device.readAt8(common, 0x14) != 0 { fail("virtio device did not finish resetting") }
     device.writeAt8(common, 0x14, ACKNOWLEDGE | DRIVER)
     // Feature bit 32, VERSION_1, is the only one used.
     device.writeAt32(common, 0x00, 1)
@@ -215,4 +217,65 @@ public function complete(queue: Queue, head: Integer) {
             fail("a virtio device did not answer")
         }
     }
+}
+record EntropyDmaState { attempted: Boolean }
+global entropyDmaState: EntropyDmaState = EntropyDmaState { attempted: false }
+
+// Private trusted bridge: exact rule20 signature/provider, ordinary actual
+// Queue owner. Do not publish this Integer-address factory in library/dma.min.
+function unsafeVirtioQueue(owner: Queue, descriptors: Integer, available: Integer,
+                          used: Integer, notify: Integer, size: Integer,
+                          index: Integer): dma.Queue { native "dma" }
+
+function entropyDmaQueue(card: pci.Device): dma.Queue {
+    let state = entropyDmaState
+    if state.attempted { fail("checked virtio-rng is one-shot for this VM; reset/retry is unsupported") }
+    state.attempted = true
+    if card.vendor != 0x1AF4 || card.device != 0x1044 {
+        fail("checked entropy DMA needs a modern virtio-rng PCI device")
+    }
+    let opened = open(card)
+    let status = device.readAt8(opened.common, 0x14)
+    if (status & 15) != 11 || (status & 0xC0) != 0 {
+        fail("virtio-rng features were not accepted in the fresh initialization epoch")
+    }
+    device.writeAt16(opened.common, 0x16, 0)
+    if device.readAt16(opened.common, 0x1C) != 0 {
+        fail("virtio-rng queue zero is already enabled")
+    }
+    let requests = openQueue(opened, 0, 1)
+    if requests.size != 1 || device.readAt16(opened.common, 0x1C) != 1 {
+        fail("virtio-rng could not enable its one-shot queue")
+    }
+    // openQueue selected this exact queue. Recompute its exact notify register
+    // from the private transport state instead of exposing Register16.address.
+    let notify = opened.notifyBase + device.readAt16(opened.common, 0x1E) * opened.notifyMultiplier
+    let checked = unsafeVirtioQueue(requests,
+        device.addressOf(requests.descriptors, 0), device.addressOf(requests.available, 0),
+        device.addressOf(requests.used, 0), notify, requests.size, requests.index)
+    // Runtime already retains requests and its real ring owners. No head has
+    // been offered. Finish queue setup before the device can process requests.
+    machine.fence()
+    ready(opened)
+    status = device.readAt8(opened.common, 0x14)
+    if (status & 15) != 15 || (status & 0xC0) != 0 {
+        fail("virtio-rng did not enter DRIVER_OK")
+    }
+    return checked
+}
+
+// One real device-written byte. The poison makes the deterministic guest proof
+// distinguish unchanged CPU storage from actual device writes. It is overwritten
+// by the device; it is never substituted for entropy or used as a fallback.
+public function readOneEntropyByte(devices: List<pci.Device>): Integer {
+    let cards = find(devices, ENTROPY)
+    if cards.length == 0 { fail("the one-shot entropy read needs virtio-rng PCI") }
+    let queue = entropyDmaQueue(cards[0])
+    let cpu = dma.allocate(1, 64)
+    dma.store8(cpu, 0, 0xA5)
+    let pending = dma.submit(queue, cpu, 1)
+    let completed = dma.reclaim(pending, 1000000)
+    let value = dma.load8(completed, 0)
+    dma.dispose(completed)
+    return value
 }

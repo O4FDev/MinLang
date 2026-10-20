@@ -235,6 +235,16 @@ requires real entry bridges and checks a separate cross-target assembly subset;
 missing bridges fail explicitly. Actual interrupt register/stack preservation
 requires finite guest tests and is not inferred from the context or host checks.
 
+`make check-osdev-dma` pairs affine ownership rejections with valid controls,
+executes actual MODEL completion/byte behavior and deliberately bypasses the
+source checker with C stale-capability and malformed-completion controls.
+`check-osdev-dma-sanitize` instruments the whole included runtime and verifies
+its sanitizer controls before testing retired ring/payload storage. This coherent
+C fixture is separate from real hardware DMA. `check-osdev-allocator` isolates
+the actual freestanding allocator in a fixed hosted heap and checks overflow,
+size-class boundaries and failure preservation at O0/O2 with UBSan. Guest startup,
+linker heap bounds and actual Virtio completion require their own finite guests.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

@@ -142,7 +142,7 @@ $(OUT)/freestanding.o: $(ROOT)/runtime/freestanding/freestanding.c $(wildcard $(
 
 .PRECIOUS: $(OUT)/%.ll $(OUT)/%-runtime.c
 $(OUT)/kernel.ll: $(KERNEL_SOURCE) $(SOURCES) $(MINYARC) | $(OUT)
-	"$(MINYARC)" "$(KERNEL_SOURCE)" "$@" $(PACKAGES) --bounded-owners 32 --freestanding
+	"$(MINYARC)" "$(KERNEL_SOURCE)" "$@" $(PACKAGES) --bounded-owners 32 --freestanding --kernel-target "$(ARCH)"
 
 $(OUT)/loader.ll: $(SOURCES) $(MINYARC) | $(OUT)
 	$(MINYARC) $(ROOT)/os/arch/x86_64/loader/main.min $@ $(PACKAGES) --bounded-owners 32 --freestanding

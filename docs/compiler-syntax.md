@@ -266,6 +266,8 @@ The effects stage checks typed source ownership before the IRQ audit. Its first
 flow subset admits straight-line statements, if/else and returns with exact
 continuing-state joins, normal-exit discharge and an acyclic consuming call graph.
 Managed handle reclamation never substitutes for payload ownership/completion.
+Resolved direct-call effects exclude DMA from thread/parallel roots, parallel
+range bodies and callbacks. Unrelated imported parallel helpers remain valid.
 
 ## Node kinds
 

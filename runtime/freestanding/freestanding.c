@@ -191,10 +191,14 @@ static unsigned char *heap_next;
 static size_t heap_used;
 
 static int class_for(size_t bytes) {
+    if (bytes > (size_t)-1 - HEADER) return CLASSES;
     size_t total = bytes + HEADER;
     int size_class = 5;
-    while (((size_t)1 << size_class) < total) size_class++;
-    return size_class;
+    while (size_class < CLASSES && size_class < (int)(sizeof(size_t) * 8)) {
+        if (((size_t)1 << size_class) >= total) return size_class;
+        size_class++;
+    }
+    return CLASSES;
 }
 
 void *malloc(size_t bytes) {
