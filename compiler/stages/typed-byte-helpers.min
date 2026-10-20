@@ -1,90 +1,131 @@
-// Checked inline 32-bit Bytes accesses. Bytes length shares the common
+// Checked inline typed Bytes accesses. Bytes length shares the common
 // helper's nonnegative range metadata. Typed access stays little-endian and
 // accepts unaligned C-layout views. A failed check calls the runtime accessor,
 // which reports the error and never returns.
-function appendTypedBytePosition(output: List<Text>) {
+function appendTypedBytePosition(output: List<Text>, width: Integer) {
     output.add("entry:
   %length = call i64 @.minyar.bytes.length(ptr %bytes)
-  %last.start = sub i64 %length, 4
+  %last.start = sub i64 %length, " + Text(width) + "
   %nonnegative = icmp sge i64 %position, 0
   %fits = icmp sle i64 %position, %last.start
   %position.valid = and i1 %nonnegative, %fits
 ")
 }
 
-function appendTypedByteGetter(output: List<Text>, signed: Boolean) {
-    let kind = "uint32"
-    let extension = "zext"
-    if signed { kind = "int32"; extension = "sext" }
-    output.add("define internal i64 @.minyar.bytes.get." + kind + ".checked(ptr %bytes, i64 %position) alwaysinline {\n")
-    appendTypedBytePosition(output)
+// Kinds: int16, uint16, int32, uint32, int64, float32, float64.
+function typedByteWidth(kind: Text): Integer {
+    if kind == "int16" || kind == "uint16" { return 2 }
+    if kind == "int64" || kind == "float64" { return 8 }
+    return 4
+}
+
+function typedByteFloat(kind: Text): Boolean {
+    return kind == "float32" || kind == "float64"
+}
+
+function appendTypedByteGetter(output: List<Text>, kind: Text) {
+    let width = typedByteWidth(kind)
+    let word = "i" + Text(width * 8)
+    let result = "i64"
+    if typedByteFloat(kind) { result = "double" }
+    output.add("define internal " + result + " @.minyar.bytes.get." + kind + ".checked(ptr %bytes, i64 %position) alwaysinline {\n")
+    appendTypedBytePosition(output, width)
     output.add("  br i1 %position.valid, label %good, label %bad
 good:
   %data = load ptr, ptr %bytes
   %slot.0 = getelementptr inbounds i8, ptr %data, i64 %position
 ")
     let byte = 0
-    while byte < 4 {
+    while byte < width {
         let number = Text(byte)
         if byte > 0 {
             output.add("  %slot." + number + " = getelementptr inbounds i8, ptr %slot.0, i64 " + number + "\n")
         }
         output.add("  %byte." + number + " = load i8, ptr %slot." + number + ", align 1\n")
-        output.add("  %part." + number + " = zext i8 %byte." + number + " to i32\n")
+        output.add("  %part." + number + " = zext i8 %byte." + number + " to " + word + "\n")
         if byte > 0 {
-            output.add("  %shift." + number + " = shl i32 %part." + number + ", " + Text(byte * 8) + "\n")
+            output.add("  %shift." + number + " = shl " + word + " %part." + number + ", " + Text(byte * 8) + "\n")
             let previous = "%part.0"
             if byte > 1 { previous = "%word." + Text(byte - 1) }
-            output.add("  %word." + number + " = or i32 " + previous + ", %shift." + number + "\n")
+            output.add("  %word." + number + " = or " + word + " " + previous + ", %shift." + number + "\n")
         }
         byte = byte + 1
     }
-    output.add("  %result = " + extension + " i32 %word.3 to i64\n  ret i64 %result\nbad:\n")
-    output.add("  call i64 @minyar_bytes_get_" + kind + "(ptr %bytes, i64 %position)\n")
+    let assembled = "%word." + Text(width - 1)
+    if kind == "int16" || kind == "int32" {
+        output.add("  %result = sext " + word + " " + assembled + " to i64\n  ret i64 %result\n")
+    } else if kind == "uint16" || kind == "uint32" {
+        output.add("  %result = zext " + word + " " + assembled + " to i64\n  ret i64 %result\n")
+    } else if kind == "float32" {
+        output.add("  %single = bitcast i32 " + assembled + " to float\n  %result = fpext float %single to double\n  ret double %result\n")
+    } else if kind == "float64" {
+        output.add("  %result = bitcast i64 " + assembled + " to double\n  ret double %result\n")
+    } else {
+        output.add("  ret i64 " + assembled + "\n")
+    }
+    output.add("bad:\n")
+    output.add("  call " + result + " @minyar_bytes_get_" + kind + "(ptr %bytes, i64 %position)\n")
     output.add("  unreachable\n}\n")
 }
 
-function appendTypedByteSetter(output: List<Text>, signed: Boolean) {
-    let kind = "uint32"
-    if signed { kind = "int32" }
-    output.add("define internal void @.minyar.bytes.set." + kind + ".checked(ptr %bytes, i64 %position, i64 %value) alwaysinline {\n")
-    appendTypedBytePosition(output)
-    output.add("  %narrow = trunc i64 %value to i32\n")
-    if signed {
-        output.add("  %roundtrip = sext i32 %narrow to i64
+function appendTypedByteSetter(output: List<Text>, kind: Text) {
+    let width = typedByteWidth(kind)
+    let word = "i" + Text(width * 8)
+    let input = "i64"
+    if typedByteFloat(kind) { input = "double" }
+    output.add("define internal void @.minyar.bytes.set." + kind + ".checked(ptr %bytes, i64 %position, " + input + " %value) alwaysinline {\n")
+    appendTypedBytePosition(output, width)
+    let valid = "%position.valid"
+    if kind == "int16" || kind == "int32" {
+        output.add("  %narrow = trunc i64 %value to " + word + "\n")
+        output.add("  %roundtrip = sext " + word + " %narrow to i64
   %value.valid = icmp eq i64 %value, %roundtrip
 ")
+        valid = "%valid"
+    } else if kind == "uint16" || kind == "uint32" {
+        output.add("  %narrow = trunc i64 %value to " + word + "\n")
+        let limit = "65536"
+        if kind == "uint32" { limit = "4294967296" }
+        output.add("  %value.valid = icmp ult i64 %value, " + limit + "\n")
+        valid = "%valid"
+    } else if kind == "float32" {
+        output.add("  %single = fptrunc double %value to float\n  %narrow = bitcast float %single to i32\n")
+    } else if kind == "float64" {
+        output.add("  %narrow = bitcast double %value to i64\n")
     } else {
-        output.add("  %value.valid = icmp ult i64 %value, 4294967296\n")
+        output.add("  %narrow = add i64 %value, 0\n")
     }
-    output.add("  %valid = and i1 %position.valid, %value.valid
-  br i1 %valid, label %good, label %bad
+    if valid == "%valid" { output.add("  %valid = and i1 %position.valid, %value.valid\n") }
+    output.add("  br i1 " + valid + ", label %good, label %bad
 good:
   %data = load ptr, ptr %bytes
   %slot.0 = getelementptr inbounds i8, ptr %data, i64 %position
 ")
     let byte = 0
-    while byte < 4 {
+    while byte < width {
         let number = Text(byte)
-        let word = "%narrow"
+        let part = "%narrow"
         if byte > 0 {
             output.add("  %slot." + number + " = getelementptr inbounds i8, ptr %slot.0, i64 " + number + "\n")
-            output.add("  %shift." + number + " = lshr i32 %narrow, " + Text(byte * 8) + "\n")
-            word = "%shift." + number
+            output.add("  %shift." + number + " = lshr " + word + " %narrow, " + Text(byte * 8) + "\n")
+            part = "%shift." + number
         }
-        output.add("  %byte." + number + " = trunc i32 " + word + " to i8\n")
+        output.add("  %byte." + number + " = trunc " + word + " " + part + " to i8\n")
         output.add("  store i8 %byte." + number + ", ptr %slot." + number + ", align 1\n")
         byte = byte + 1
     }
     output.add("  ret void\nbad:\n")
-    output.add("  call void @minyar_bytes_set_" + kind + "(ptr %bytes, i64 %position, i64 %value)\n")
+    output.add("  call void @minyar_bytes_set_" + kind + "(ptr %bytes, i64 %position, " + input + " %value)\n")
     output.add("  unreachable\n}\n")
 }
 
 function appendTypedByteHelpers(output: List<Text>) {
-    output.add("\n; Checked inline 32-bit Bytes accesses; four explicit little-endian bytes.\n")
-    appendTypedByteGetter(output, true)
-    appendTypedByteGetter(output, false)
-    appendTypedByteSetter(output, true)
-    appendTypedByteSetter(output, false)
+    output.add("\n; Checked inline typed Bytes accesses; explicit little-endian bytes.\n")
+    let kinds: List<Text> = ["int16", "uint16", "int32", "uint32", "int64", "float32", "float64"]
+    let index = 0
+    while index < kinds.length {
+        appendTypedByteGetter(output, kinds[index])
+        appendTypedByteSetter(output, kinds[index])
+        index = index + 1
+    }
 }

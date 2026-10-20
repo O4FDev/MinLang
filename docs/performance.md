@@ -280,11 +280,12 @@ Ordinary Bytes indexing, indexed replacement, length and single-byte `add`
 use inline LLVM helpers even when the runtime is a separate native object. An
 append takes the inline path only when the value is a byte and the storage
 already has room; growth, C-layout views and invalid values call the runtime.
-`getInt32`, `getUInt32`, `setInt32` and `setUInt32` are inline too: they check
-the whole four-byte range and the value's range first, then load or store four
-explicit little-endian bytes, so unaligned C-layout views behave the same.
-`make check-typed-byte-access` compares them against literal byte patterns at
-every offset, with sentinel bytes around each store.
+The typed accessors (`getInt16` through `setFloat64`) are inline too: they
+check the whole two-, four- or eight-byte range and the value's range first,
+then load or store explicit little-endian bytes, so unaligned C-layout views
+behave the same. Float32 stores round with an ordinary conversion and Float64
+keeps every bit. `make check-typed-byte-access` compares each width against
+literal byte patterns at several offsets, with sentinel bytes around each store.
 A Bytes method that only reads or updates its own storage, such as
 `holder.bytes.add(value)` or `holder.bytes.setInt32(0, value)`, takes no
 temporary count on a field or element receiver when its arguments make no

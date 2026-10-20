@@ -94,6 +94,25 @@ for kind in ["int32", "uint32"] {
     test.check(test.contains(main, "@minyar_bytes_add_" + kind + "("), "growing typed Bytes add lost its runtime path")
 }
 
+// The same generator covers every other fixed width: 2 and 8 bytes, signed,
+// unsigned and IEEE binary32/binary64 bit patterns.
+test.require(test.compile(compiler, "let bytes = Bytes(16)\nbytes.setInt16(0, -2)\nbytes.setUInt16(2, 65535)\nbytes.setInt64(4, -3)\nbytes.setFloat32(12, 1.5)\nprint(bytes.getInt16(0))\nprint(bytes.getUInt16(2))\nprint(bytes.getInt64(4))\nprint(bytes.getFloat32(12))\nbytes.setFloat64(0, 2.5)\nprint(bytes.getFloat64(0))\n"), "compile every typed Bytes width")
+let widths = io.readTextFile(typedByteCasePath(compiler) + ".ll")
+let widthMain = typedByteFunction(widths, "main")
+for kind in ["int16", "uint16", "int64", "float32", "float64"] {
+    for verb in ["get", "set"] {
+        let helper = typedByteFunction(widths, ".minyar.bytes." + verb + "." + kind + ".checked")
+        test.check(test.contains(helper, "alwaysinline") && test.contains(helper, "@minyar_bytes_" + verb + "_" + kind + "(ptr %bytes, i64 %position") && test.contains(helper, "\n  unreachable\n}"), "typed Bytes helper lost its runtime diagnostic: " + verb + kind)
+        test.check(test.contains(widthMain, "@.minyar.bytes." + verb + "." + kind + ".checked(") && !test.contains(widthMain, "@minyar_bytes_" + verb + "_" + kind + "("), "typed Bytes call did not select its helper: " + verb + kind)
+    }
+}
+for pair in [["int16", "%last.start = sub i64 %length, 2"], ["int16", "%result = sext i16 %word.1 to i64"], ["uint16", "%result = zext i16 %word.1 to i64"], ["int64", "%last.start = sub i64 %length, 8"], ["int64", "ret i64 %word.7"], ["float32", "%single = bitcast i32 %word.3 to float"], ["float32", "%result = fpext float %single to double"], ["float64", "%result = bitcast i64 %word.7 to double"]] {
+    test.check(test.contains(typedByteFunction(widths, ".minyar.bytes.get." + pair[0] + ".checked"), pair[1]), "typed Bytes getter IR: " + pair[1])
+}
+for pair in [["int16", "%roundtrip = sext i16 %narrow to i64"], ["uint16", "%value.valid = icmp ult i64 %value, 65536"], ["float32", "%single = fptrunc double %value to float"], ["float64", "%narrow = bitcast double %value to i64"], ["int64", "store i8 %byte.7, ptr %slot.7, align 1"]] {
+    test.check(test.contains(typedByteFunction(widths, ".minyar.bytes.set." + pair[0] + ".checked"), pair[1]), "typed Bytes setter IR: " + pair[1])
+}
+
 if !irOnly {
     let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
     io.writeTextFile(compiler.directory + "/runtime.c", contract)
@@ -212,6 +231,52 @@ if !irOnly {
         test.rejects(compiler, "let input = Bytes(8)\nlet output = Bytes(8)\nparallel for index in 0..2 { output[index] = input.get" + kind + "(index) }\n", "parallel for:")
         test.rejects(compiler, "let output = Bytes(8)\nparallel for index in 0..2 { output.set" + kind + "(index, 1) }\n", "parallel for:")
     }
+
+    // Literal octets: getters read them and setters must write exactly them,
+    // leaving every neighbouring sentinel byte untouched.
+    test.executes(compiler, #"""
+    function require(condition: Boolean) { if !condition { fail("typed Bytes width pattern or sentinel mismatch") } }
+    function filled(): Bytes { let bytes = Bytes(16); for index in 0..16 { bytes[index] = 165 }; return bytes }
+    function filledWith(offset: Integer, octets: List<Integer>): Bytes { let bytes = filled(); for index in 0..octets.length { bytes[offset + index] = octets[index] }; return bytes }
+    function exactly(bytes: Bytes, offset: Integer, octets: List<Integer>) {
+        for index in 0..16 {
+            let expected = 165
+            if index >= offset && index < offset + octets.length { expected = octets[index - offset] }
+            require(bytes[index] == expected)
+        }
+    }
+    for offset in [0, 1, 3, 7, 8] {
+        if offset + 2 <= 16 {
+            require(filledWith(offset, [2, 1]).getInt16(offset) == 258)
+            require(filledWith(offset, [0, 128]).getInt16(offset) == -32768)
+            require(filledWith(offset, [0, 128]).getUInt16(offset) == 32768)
+            require(filledWith(offset, [255, 255]).getInt16(offset) == -1)
+            require(filledWith(offset, [255, 255]).getUInt16(offset) == 65535)
+            let signed = filled(); signed.setInt16(offset, -2); exactly(signed, offset, [254, 255])
+            let unsigned = filled(); unsigned.setUInt16(offset, 513); exactly(unsigned, offset, [1, 2])
+            let top = filled(); top.setInt16(offset, -32768); exactly(top, offset, [0, 128])
+        }
+        require(filledWith(offset, [8, 7, 6, 5, 4, 3, 2, 1]).getInt64(offset) == 72623859790382856)
+        require(filledWith(offset, [0, 0, 0, 0, 0, 0, 0, 128]).getInt64(offset) == -9223372036854775808)
+        require(filledWith(offset, [255, 255, 255, 255, 255, 255, 255, 255]).getInt64(offset) == -1)
+        let wide = filled(); wide.setInt64(offset, 72623859790382856); exactly(wide, offset, [8, 7, 6, 5, 4, 3, 2, 1])
+        let lowest = filled(); lowest.setInt64(offset, -9223372036854775808); exactly(lowest, offset, [0, 0, 0, 0, 0, 0, 0, 128])
+        require(filledWith(offset, [0, 0, 0, 0, 0, 0, 240, 63]).getFloat64(offset) == 1.0)
+        let double = filled(); double.setFloat64(offset, 2.5); exactly(double, offset, [0, 0, 0, 0, 0, 0, 4, 64])
+        let negative = filled(); negative.setFloat64(offset, -0.0); exactly(negative, offset, [0, 0, 0, 0, 0, 0, 0, 128])
+        require(filledWith(offset, [0, 0, 192, 63]).getFloat32(offset) == 1.5)
+        let single = filled(); single.setFloat32(offset, 0.1); exactly(single, offset, [205, 204, 204, 61])
+        require(single.getFloat32(offset) == 0.10000000149011612)
+    }
+    print("typed byte widths: passed")
+    """#, "typed byte widths: passed\n")
+    typedByteTrap(compiler, "let bytes = Bytes(1)\nprint(bytes.getInt16(0))\n", "a 2-byte value at position 0 does not fit in Bytes of length 1.")
+    typedByteTrap(compiler, "let bytes = Bytes(9)\nbytes.setInt64(2, 0)\n", "a 8-byte value at position 2 does not fit in Bytes of length 9.")
+    typedByteTrap(compiler, "let bytes = Bytes(7)\nprint(bytes.getFloat64(0))\n", "a 8-byte value at position 0 does not fit in Bytes of length 7.")
+    typedByteTrap(compiler, "let bytes = Bytes(4)\nbytes.setFloat32(-1, 1.0)\n", "a 4-byte value at position -1 does not fit in Bytes of length 4.")
+    for value in [-32769, 32768] { typedByteTrap(compiler, "let bytes = Bytes(2)\nbytes.setInt16(0, " + Text(value) + ")\n", Text(value) + " does not fit in a signed 16-bit Integer.") }
+    for value in [-1, 65536] { typedByteTrap(compiler, "let bytes = Bytes(2)\nbytes.setUInt16(0, " + Text(value) + ")\n", Text(value) + " does not fit in an unsigned 16-bit Integer.") }
+    typedByteTrap(compiler, "let bytes = Bytes(2)\nbytes.setUInt16(1, 70000)\n", "a 2-byte value at position 1 does not fit in Bytes of length 2.")
 
     test.executes(compiler, "function pair(bytes: Bytes, position: Integer): Integer { bytes.setInt32(position, -1); return bytes.getUInt32(position) }\nlet bytes = Bytes(8)\nprint(pair(bytes, 1))\n", "4294967295\n")
     let path = typedByteCasePath(compiler)
