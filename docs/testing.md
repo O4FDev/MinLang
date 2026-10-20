@@ -1119,9 +1119,10 @@ failure evidence, invalid diagnostic encoding and POSIX descendant cleanup.
 
 `make check-differential-fuzz` adds a broader compiler matrix. Its Python oracle
 generates valid self-checking programs with arithmetic, control flow, aliased
-records and Lists, Map and Set key snapshots, managed collection values, Bytes,
-escaping callbacks and choice payloads, then runs each program through stage2
-and stage3 with eager and arena runtimes at O0 and O2.
+records and Lists, Map and Set key snapshots, managed collection values, generic
+scalar/reference specialization, Result/Maybe propagation, Bytes, escaping
+callbacks and choice payloads, then runs each program through stage2 and stage3
+with eager and arena runtimes at O0 and O2.
 The first mismatch is reduced by deleting independent case functions and
 shrinking operation counts while preserving a stable per-check failure identity.
 `make check-differential-fuzz-regressions` replays the checked-in minimized-spec

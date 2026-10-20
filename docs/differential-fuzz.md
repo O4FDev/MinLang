@@ -4,11 +4,13 @@
 then generates eight reproducible, valid programs. Each combines random checked
 and wrapping Integer expressions, bounded loop control and short circuits,
 shared records and Lists, Map and Set key snapshots with aliased managed values,
+generic scalar and reference specialization, Result and Maybe payload lifetimes,
 Bytes, captured callbacks, and choices whose reference payloads outlive their
 input slot. The collection cases mutate record keys after insertion and keep
-List values across replacement, removal and clear operations. A Python model
-computes every observation without invoking Minyar. Each program checks those
-values itself, and the runner independently checks its complete output.
+List values across replacement, removal and clear operations. Generic cases
+make early Result propagation observable through a side-effect trace. A Python
+model computes every observation without invoking Minyar. Each program checks
+those values itself, and the runner independently checks its complete output.
 
 Each program runs in eight configurations: the stage2 and stage3 compilers,
 eager reference counting and the process-lifetime arena, and Clang O0 and O2.

@@ -92,8 +92,8 @@ class IntegerOracleTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def test_every_family_is_deterministic_and_has_observable_checks(self):
         self.assertEqual(set(fuzz.FAMILIES),
-                         {"arithmetic", "control", "aliases", "maps", "bytes", "callbacks",
-                          "choices"})
+                         {"arithmetic", "control", "aliases", "maps", "generics", "bytes",
+                          "callbacks", "choices"})
         global_state = random.getstate()
         for family in fuzz.FAMILIES:
             for size in (1, 12):
@@ -440,6 +440,701 @@ class GenerationTests(unittest.TestCase):
         large_checks = checks(large)
         self.assertTrue(small_checks)
         self.assertEqual(small_checks, {label: large_checks[label] for label in small_checks})
+
+    def test_generic_generation_is_a_size_stable_prefix(self):
+        seed = 0x20261020
+        large = fuzz.generate_case(fuzz.Case("generics", seed, 18))
+        for size in (1, 2, 5, 6, 7, 12):
+            with self.subTest(size=size):
+                small = fuzz.generate_case(fuzz.Case("generics", seed, size))
+                self.assertEqual(small.body, large.body[:len(small.body)])
+                self.assertEqual(small.expected, large.expected[:len(small.expected)])
+        rendered, _ = fuzz.render([fuzz.Case("generics", seed, 1)])
+        self.assertIn("record FuzzGenericBox<Item> { value: Item }", rendered)
+        self.assertIn("function fuzzGenericIdentity<Item>(value: Item): Item", rendered)
+        self.assertIn("function fuzzGenericPropagate(", rendered)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GenericsReference:
+    kind: str
+    identity: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _GenericsVariant:
+    name: str
+    payload: object = None
+
+
+class _GenericsSyntax:
+    """Parse only the expression/statement vocabulary emitted by this family."""
+
+    token = re.compile(r'\s+|"(?:[^"\\]|\\.)*"|-?\d+|[A-Za-z_][A-Za-z_0-9]*|'
+                       r'\+=|[{}\[\](),.:;=+<>]')
+
+    def __init__(self, source):
+        self.tokens = []
+        position = 0
+        while position < len(source):
+            matched = self.token.match(source, position)
+            if matched is None:
+                raise ValueError(f"unknown syntax at {source[position:]!r}")
+            if not matched.group().isspace():
+                self.tokens.append(matched.group())
+            position = matched.end()
+        self.position = 0
+
+    def peek(self):
+        return self.tokens[self.position] if self.position < len(self.tokens) else None
+
+    def take(self, expected=None):
+        value = self.peek()
+        if value is None or (expected is not None and value != expected):
+            raise ValueError(f"expected {expected!r}, found {value!r}")
+        self.position += 1
+        return value
+
+    def identifier(self):
+        value = self.take()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", value) is None:
+            raise ValueError(f"expected identifier, found {value!r}")
+        return value
+
+    def type_name(self):
+        name = self.identifier()
+        arities = {"Integer": 0, "Boolean": 0, "Text": 0, "FuzzCell": 0,
+                   "List": 1, "Maybe": 1, "Result": 2, "FuzzGenericBox": 1}
+        if name not in arities:
+            raise ValueError(f"unknown type {name}")
+        parameters = []
+        if self.peek() == "<":
+            self.take("<")
+            parameters.append(self.type_name())
+            while self.peek() == ",":
+                self.take(",")
+                parameters.append(self.type_name())
+            self.take(">")
+        if len(parameters) != arities[name]:
+            raise ValueError(f"wrong type arity for {name}")
+        return name, tuple(parameters)
+
+    def sequence(self, ending):
+        values = []
+        if self.peek() != ending:
+            values.append(self.expression())
+            while self.peek() == ",":
+                self.take(",")
+                values.append(self.expression())
+        self.take(ending)
+        return values
+
+    def expression(self):
+        node = self.postfix()
+        while self.peek() == "+":
+            self.take("+")
+            node = ("add", node, self.postfix())
+        return node
+
+    def postfix(self):
+        node = self.atom()
+        while self.peek() in ("(", "[", "."):
+            operator = self.take()
+            if operator == "(":
+                node = ("call", node, self.sequence(")"))
+            elif operator == "[":
+                index = self.expression()
+                self.take("]")
+                node = ("index", node, index)
+            else:
+                node = ("field", node, self.identifier())
+        return node
+
+    def atom(self):
+        value = self.take()
+        if value == "(":
+            node = self.expression()
+            self.take(")")
+            return node
+        if value == "[":
+            return ("list", self.sequence("]"))
+        if value == "match":
+            subject = self.expression()
+            self.take("{")
+            arms = {}
+            while self.peek() != "}":
+                tag = self.identifier()
+                if tag not in ("Some", "None", "Ok", "Err") or tag in arms:
+                    raise ValueError(f"unknown or duplicate match arm {tag}")
+                binding = None
+                if self.peek() == "(":
+                    self.take("(")
+                    binding = self.identifier()
+                    self.take(")")
+                if (tag == "None") != (binding is None):
+                    raise ValueError(f"wrong match binding for {tag}")
+                self.take("{")
+                branch = self.expression()
+                self.take("}")
+                arms[tag] = (binding, branch)
+            self.take("}")
+            if set(arms) not in ({"Some", "None"}, {"Ok", "Err"}):
+                raise ValueError("match must cover one supported choice")
+            return ("match", subject, arms)
+        if value in ("FuzzCell", "FuzzGenericBox") and self.peek() == "{":
+            self.take("{")
+            fields = {}
+            while self.peek() != "}":
+                name = self.identifier()
+                if name in fields:
+                    raise ValueError(f"duplicate record field {name}")
+                self.take(":")
+                fields[name] = self.expression()
+                if self.peek() != ";":
+                    break
+                self.take(";")
+            self.take("}")
+            return ("record", value, fields)
+        if value.startswith('"'):
+            return ("literal", json.loads(value))
+        if re.fullmatch(r"-?\d+", value):
+            return ("literal", int(value))
+        if value in ("true", "false"):
+            return ("literal", value == "true")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", value):
+            return ("name", value)
+        raise ValueError(f"unknown expression token {value!r}")
+
+    def statement(self):
+        if self.peek() == "let":
+            self.take("let")
+            name = self.identifier()
+            annotation = None
+            if self.peek() == ":":
+                self.take(":")
+                annotation = self.type_name()
+            self.take("=")
+            node = ("let", name, annotation, self.expression())
+        else:
+            expression = self.expression()
+            if self.peek() in ("=", "+="):
+                operator = self.take()
+                node = ("assign", expression, operator, self.expression())
+            else:
+                node = ("expression", expression)
+        if self.peek() is not None:
+            raise ValueError(f"unconsumed statement tokens: {self.tokens[self.position:]}")
+        return node
+
+
+class _GenericsReplay:
+    """Independent semantics: identities live in a heap, never copied with roots."""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.bindings = {}
+        self.annotations = {}
+        self.heap = {}
+        self.observed = []
+        self.specializations = set()
+        self.propagation_paths = []
+
+    def allocate(self, kind, value):
+        reference = _GenericsReference(kind, len(self.heap))
+        self.heap[reference.identity] = value
+        return reference
+
+    def object(self, reference, kind):
+        if not isinstance(reference, _GenericsReference) or reference.kind != kind:
+            raise ValueError(f"expected {kind} reference, found {reference!r}")
+        return self.heap[reference.identity]
+
+    def field(self, reference, name):
+        if name == "length":
+            return len(self.object(reference, "List"))
+        if (not isinstance(reference, _GenericsReference) or
+                reference.kind not in ("FuzzCell", "FuzzGenericBox")):
+            raise ValueError("field access needs a supported record")
+        record = self.object(reference, reference.kind)
+        if name not in record:
+            raise ValueError(f"unknown record field {name}")
+        return record[name]
+
+    def validate_annotation(self, value, annotation):
+        name, parameters = annotation
+
+        def mismatch():
+            raise ValueError(f"annotation mismatch: expected {annotation!r}, found {value!r}")
+
+        primitive = {"Integer": int, "Boolean": bool, "Text": str}
+        if name in primitive:
+            if type(value) is not primitive[name]:
+                mismatch()
+            return
+        if name in ("List", "FuzzCell", "FuzzGenericBox"):
+            if not isinstance(value, _GenericsReference) or value.kind != name:
+                mismatch()
+            contents = self.object(value, name)
+            if name == "List":
+                for item in contents:
+                    self.validate_annotation(item, parameters[0])
+            elif name == "FuzzCell":
+                if set(contents) != {"number", "text", "values"}:
+                    mismatch()
+                for field, field_type in (
+                        ("number", ("Integer", ())), ("text", ("Text", ())),
+                        ("values", ("List", (("Integer", ()),)))):
+                    self.validate_annotation(contents[field], field_type)
+            else:
+                if set(contents) != {"value"}:
+                    mismatch()
+                self.validate_annotation(contents["value"], parameters[0])
+            return
+        if not isinstance(value, _GenericsVariant):
+            mismatch()
+        if name == "Maybe":
+            if value.name == "None" and value.payload is None:
+                return
+            if value.name != "Some":
+                mismatch()
+            self.validate_annotation(value.payload, parameters[0])
+            return
+        if name == "Result":
+            if value.name not in ("Ok", "Err"):
+                mismatch()
+            self.validate_annotation(value.payload, parameters[0 if value.name == "Ok" else 1])
+            return
+        raise ValueError(f"unknown annotation type {name}")
+
+    @staticmethod
+    def kind(value):
+        if type(value) is bool:
+            return "Boolean"
+        if type(value) is int:
+            return "Integer"
+        if type(value) is str:
+            return "Text"
+        if isinstance(value, _GenericsReference):
+            return value.kind
+        if isinstance(value, _GenericsVariant):
+            return value.name
+        raise ValueError(f"unknown modeled value {value!r}")
+
+    def propagate(self, input_value, state):
+        record = self.object(state, "FuzzCell")
+        record["number"] += 1
+        self.object(record["values"], "List").append(1)
+        if not isinstance(input_value, _GenericsVariant):
+            raise ValueError("propagation needs a Maybe")
+        if input_value.name == "None":
+            self.propagation_paths.append("None")
+            answer = self.allocate("List", ["none!"])
+        elif input_value.name == "Some":
+            outcome = input_value.payload
+            if not isinstance(outcome, _GenericsVariant):
+                raise ValueError("Some needs a Result payload")
+            if outcome.name == "Err":
+                self.propagation_paths.append("Err")
+                return outcome
+            if outcome.name != "Ok":
+                raise ValueError("Some needs Ok or Err")
+            self.propagation_paths.append("Ok")
+            self.object(outcome.payload, "List")
+            answer = outcome.payload
+        else:
+            raise ValueError("propagation needs Some or None")
+        record["number"] += 10
+        return _GenericsVariant("Ok", answer)
+
+    def evaluate(self, node, scope=None):
+        scope = self.bindings if scope is None else scope
+        operation = node[0]
+        if operation == "literal":
+            return node[1]
+        if operation == "name":
+            if node[1] == "None":
+                return _GenericsVariant("None")
+            if node[1] not in scope:
+                raise ValueError(f"unknown binding {node[1]}")
+            return scope[node[1]]
+        if operation == "list":
+            return self.allocate("List", [self.evaluate(item, scope) for item in node[1]])
+        if operation == "record":
+            name = node[1]
+            fields = {field: self.evaluate(value, scope) for field, value in node[2].items()}
+            if name == "FuzzGenericBox" and set(fields) != {"value"}:
+                raise ValueError("unknown FuzzGenericBox constructor shape")
+            reference = self.allocate(name, fields)
+            if name == "FuzzCell":
+                self.validate_annotation(reference, ("FuzzCell", ()))
+            return reference
+        if operation == "add":
+            left, right = self.evaluate(node[1], scope), self.evaluate(node[2], scope)
+            if type(left) is not str or type(right) is not str:
+                raise ValueError("only emitted Text concatenation is supported")
+            return left + right
+        if operation == "index":
+            sequence = self.object(self.evaluate(node[1], scope), "List")
+            index = self.evaluate(node[2], scope)
+            if type(index) is not int or not 0 <= index < len(sequence):
+                raise ValueError(f"invalid modeled List index {index!r}")
+            return sequence[index]
+        if operation == "field":
+            return self.field(self.evaluate(node[1], scope), node[2])
+        if operation == "match":
+            choice = self.evaluate(node[1], scope)
+            if not isinstance(choice, _GenericsVariant) or choice.name not in node[2]:
+                raise ValueError("match subject does not fit its arms")
+            name, branch = node[2][choice.name]
+            local = dict(scope)
+            if name is not None:
+                local[name] = choice.payload
+            return self.evaluate(branch, local)
+        if operation == "call":
+            if node[1][0] != "name":
+                raise ValueError("unknown indirect or method call")
+            name = node[1][1]
+            arguments = [self.evaluate(item, scope) for item in node[2]]
+            if name in ("Some", "Ok", "Err") and len(arguments) == 1:
+                return _GenericsVariant(name, arguments[0])
+            if name in ("fuzzGenericIdentity", "fuzzGenericBoxed", "fuzzGenericChecked"):
+                if len(arguments) != 1:
+                    raise ValueError(f"wrong helper arity for {name}")
+                self.specializations.add((name, self.kind(arguments[0])))
+                return (_GenericsVariant("Ok", arguments[0]) if name == "fuzzGenericChecked"
+                        else arguments[0])
+            if name == "fuzzGenericPropagate" and len(arguments) == 2:
+                return self.propagate(*arguments)
+            raise ValueError(f"unknown function or arity: {name}")
+        raise ValueError(f"unknown expression operation {operation}")
+
+    def location(self, node):
+        if node[0] == "name" and node[1] in self.bindings:
+            return self.bindings, node[1]
+        if node[0] == "index":
+            sequence = self.object(self.evaluate(node[1]), "List")
+            index = self.evaluate(node[2])
+            if type(index) is not int or not 0 <= index < len(sequence):
+                raise ValueError("invalid assignment index")
+            return sequence, index
+        if node[0] == "field":
+            reference = self.evaluate(node[1])
+            if (not isinstance(reference, _GenericsReference) or
+                    reference.kind not in ("FuzzCell", "FuzzGenericBox")):
+                raise ValueError("field assignment needs a supported record")
+            record = self.object(reference, reference.kind)
+            if node[2] not in record:
+                raise ValueError(f"unknown assignment field {node[2]}")
+            return record, node[2]
+        raise ValueError("unknown assignment target")
+
+    def execute(self, lines):
+        for index, line in enumerate(lines):
+            try:
+                statement = _GenericsSyntax(line).statement()
+                if statement[0] == "let":
+                    if statement[1] in self.bindings:
+                        raise ValueError(f"duplicate binding {statement[1]}")
+                    value = self.evaluate(statement[3])
+                    if statement[2] is not None:
+                        self.validate_annotation(value, statement[2])
+                        self.annotations[statement[1]] = statement[2]
+                    self.bindings[statement[1]] = value
+                    continue
+                if statement[0] == "assign":
+                    container, position = self.location(statement[1])
+                    value = self.evaluate(statement[3])
+                    if statement[2] == "+=":
+                        if type(container[position]) is not int or type(value) is not int:
+                            raise ValueError("+= needs Integer values")
+                        value += container[position]
+                    container[position] = value
+                    for name, annotation in self.annotations.items():
+                        self.validate_annotation(self.bindings[name], annotation)
+                    continue
+                node = statement[1]
+                if (node[0] != "call" or node[1][0] != "name" or
+                        node[1][1] not in ("checkInteger", "checkText", "checkBoolean") or
+                        len(node[2]) != 3):
+                    raise ValueError("unknown statement: expected declaration, assignment or check")
+                term, expected_node, label_node = node[2]
+                if expected_node[0] != "literal" or label_node[0] != "literal":
+                    raise ValueError("check oracle and label must be literals")
+                actual, expected, label = self.evaluate(term), expected_node[1], label_node[1]
+                kind = node[1][1][5:]
+                if self.kind(actual) != kind or self.kind(expected) != kind:
+                    raise AssertionError(f"check kind mismatch: {line}")
+                if actual != expected:
+                    raise AssertionError(f"oracle mismatch: {actual!r} != {expected!r}: {line}")
+                wanted = f"generics:{self.seed}:{len(self.observed)}"
+                if label != wanted:
+                    raise AssertionError(f"check label mismatch: {label!r} != {wanted!r}")
+                displayed = ("true" if actual else "false") if type(actual) is bool else str(actual)
+                self.observed.append(f"{label}={displayed}")
+            except (ValueError, AssertionError) as error:
+                raise type(error)(f"generics body line {index}: {error}") from error
+        return self.observed.copy()
+
+
+class GenericsReplayTests(unittest.TestCase):
+    def test_replay_retains_and_validates_recursive_annotation_trees(self):
+        body = [
+            "let integer: Integer = 7",
+            "let flag: Boolean = false",
+            'let text: Text = "ok"',
+            'let cell: FuzzCell = FuzzCell { number: 1; text: "cell"; values: [2] }',
+            'let words: List<Text> = ["kept"]',
+            "let rows: List<List<Text>> = [words, []]",
+            "let optional: Maybe<List<Text>> = Some(words)",
+            "let absent: Maybe<List<Text>> = None",
+            "let good: Result<Maybe<List<Text>>, FuzzCell> = Ok(optional)",
+            "let bad: Result<Integer, List<Boolean>> = Err([true, false])",
+            "let boxed: FuzzGenericBox<Maybe<List<Text>>> = "
+            "FuzzGenericBox { value: Some(words) }",
+            "let scalarBox: FuzzGenericBox<Integer> = FuzzGenericBox { value: integer }",
+            "let cellsBox: FuzzGenericBox<List<FuzzCell>> = FuzzGenericBox { value: [cell] }",
+            "let resultBox: Result<FuzzGenericBox<Maybe<List<Text>>>, Text> = Ok(boxed)",
+            "optional = None",
+            "checkText(match boxed.value { Some(value) { value[0] } None { "
+            '"invalid" } }, "kept", "generics:0:0")',
+            'checkInteger(scalarBox.value, 7, "generics:0:1")',
+            'checkInteger(cellsBox.value[0].number, 1, "generics:0:2")',
+            'checkBoolean(flag, false, "generics:0:3")',
+        ]
+        replay = _GenericsReplay(0)
+        self.assertEqual(replay.execute(body), ["generics:0:0=kept", "generics:0:1=7",
+                                               "generics:0:2=1", "generics:0:3=false"])
+        list_text = ("List", (("Text", ()),))
+        maybe_list = ("Maybe", (list_text,))
+        self.assertEqual(replay.annotations["boxed"], ("FuzzGenericBox", (maybe_list,)))
+        self.assertEqual(replay.annotations["good"], ("Result", (maybe_list, ("FuzzCell", ()))))
+        self.assertEqual(replay.annotations["rows"], ("List", (list_text,)))
+
+    def test_replay_rejects_corrupt_known_type_annotations_and_payloads(self):
+        fixtures = [
+            ["let value: Text = 1"],
+            ["let value: Integer = true"],
+            ["let value: Boolean = 1"],
+            ["let value: Text = false"],
+            ['let value: FuzzCell = ["x"]'],
+            ["let value: List<Text> = [1]"],
+            ["let value: List<Integer> = [true]"],
+            ['let value: List<List<Text>> = [["x"], [2]]'],
+            ["let value: Maybe<Text> = Some(1)"],
+            ['let value: Maybe<Text> = Ok("x")'],
+            ['let value: Result<Integer, Text> = Ok("wrong")'],
+            ["let value: Result<Integer, Text> = Err(1)"],
+            ["let value: Result<Integer, Text> = None"],
+            ["let value: Result<Maybe<List<Text>>, Text> = Ok(Some([1]))"],
+            ["let value: Result<Text, List<Boolean>> = Err([1])"],
+            ['let value: FuzzGenericBox<Integer> = FuzzGenericBox { value: "x" }'],
+            ["let value: FuzzGenericBox<List<FuzzCell>> = FuzzGenericBox { value: [1] }"],
+            ['let value: List<Text> = FuzzGenericBox { value: ["x"] }'],
+            'let value: FuzzGenericBox<Text> = FuzzCell { number: 1; text: "x"; values: [] }',
+            'let value: FuzzCell = FuzzCell { number: 1; text: "x"; values: ["bad"] }',
+            ['let value: Text = "x"', "value = 1"],
+            ['let words: List<Text> = ["x"]', "words[0] = 1"],
+            ['let cell: FuzzCell = FuzzCell { number: 1; text: "x"; values: [] }',
+             "cell.text = 1"],
+            ['let words: List<Text> = ["x"]', "let alias = words", "alias[0] = 1"],
+            ['let cell: FuzzCell = FuzzCell { number: 1; text: "x"; values: [] }',
+             "let alias = cell", "alias.text = 1"],
+            ['let box: FuzzGenericBox<Text> = FuzzGenericBox { value: "x" }',
+             "let alias = box", "alias.value = 1"],
+        ]
+        for fixture in fixtures:
+            body = [fixture] if isinstance(fixture, str) else fixture
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    _GenericsReplay(0).execute(body)
+
+    def test_generated_alias_operation_writes_distinct_roots_with_nonzero_delta(self):
+        for seed in (0, 0xC0DE, 0x20261020):
+            for size in (5, 6, 12, 18):
+                with self.subTest(seed=seed, size=size):
+                    block = fuzz.generate_case(fuzz.Case("generics", seed, size))
+                    operations = 0
+                    for index, line in enumerate(block.body):
+                        assignment = re.fullmatch(
+                            r"lists\[(\d+)\] = fuzzGenericBoxed\(lists\[(\d+)\]\)", line)
+                        if assignment is None:
+                            continue
+                        destination, source = map(int, assignment.groups())
+                        self.assertNotEqual(destination, source)
+                        self.assertEqual(block.body[index + 1],
+                                         f"cells[{destination}] = fuzzGenericIdentity(cells[{source}])")
+                        mutation = re.fullmatch(
+                            rf"cells\[{destination}\]\.number \+= (-?\d+)", block.body[index + 3])
+                        self.assertIsNotNone(mutation)
+                        self.assertNotEqual(int(mutation.group(1)), 0)
+                        operations += 1
+                    self.assertEqual(operations, len(range(4, size, 6)))
+
+    def test_generated_generics_oracles_match_independent_source_replay(self):
+        for seed in (0, 0xC0DE, 0x20261020):
+            for size in (1, 2, 5, 6, 7, 12, 18):
+                with self.subTest(seed=seed, size=size):
+                    case = fuzz.Case("generics", seed, size)
+                    block = fuzz.generate_case(case)
+                    replay = _GenericsReplay(seed)
+                    observed = replay.execute(block.body)
+                    self.assertEqual(observed, block.expected)
+                    _, transcript = fuzz.render([case])
+                    self.assertEqual(("\n".join(observed) + "\n").encode("utf-8"), transcript)
+                    self.assertEqual(set(replay.propagation_paths), {"Ok", "Err", "None"})
+                    self.assertTrue({("fuzzGenericBoxed", kind) for kind in
+                                     ("Integer", "Text", "List", "FuzzCell")}
+                                    <= replay.specializations)
+                    self.assertGreaterEqual(len(observed), 20)
+                    indexed_trace_checks = []
+                    for line in block.body:
+                        checkpoint = re.fullmatch(
+                            r'checkInteger\(trace\.values\[(\d+)\], 1, '
+                            r'"generics:' + str(seed) + r':\d+"\)', line)
+                        if checkpoint:
+                            indexed_trace_checks.append(int(checkpoint.group(1)))
+                    self.assertEqual(indexed_trace_checks,
+                                     list(range(len(replay.propagation_paths))))
+                    if size == 18:
+                        for name in ("scalar0", "savedList1", "savedText2", "savedCell3",
+                                     "propagated5", "savedList7", "savedCell9", "propagated17"):
+                            self.assertIn(name, replay.bindings)
+
+    def test_replay_checks_each_trace_append_and_rejects_a_wrong_indexed_value(self):
+        lines = [
+            'let trace = FuzzCell { number: 0; text: "trace"; values: [] }',
+            "let absent: Maybe<Result<List<Text>, Text>> = None",
+        ]
+        for index in range(4):
+            lines.append(f"let result{index} = fuzzGenericPropagate(absent, trace)")
+            lines.append(f'checkInteger(trace.values[{index}], 1, "generics:0:{index}")')
+        replay = _GenericsReplay(0)
+        self.assertEqual(replay.execute(lines), [f"generics:0:{index}=1" for index in range(4)])
+        self.assertEqual(replay.propagation_paths, ["None"] * 4)
+        corrupted = lines.copy()
+        index = next(index for index, line in enumerate(corrupted)
+                     if line.startswith("checkInteger(trace.values[2]"))
+        corrupted[index] = corrupted[index].replace("], 1,", "], 2,")
+        with self.assertRaisesRegex(AssertionError, "oracle mismatch"):
+            _GenericsReplay(0).execute(corrupted)
+
+    def test_hand_replay_preserves_aliases_escaped_payloads_and_scalar_snapshots(self):
+        lines = [
+            'let words = ["old" + "!"]',
+            "let same = fuzzGenericBoxed(words)",
+            "let outcome: Result<List<Text>, Text> = fuzzGenericChecked(words)",
+            'let saved = match outcome { Ok(value) { value } Err(error) { ["invalid"] } }',
+            'outcome = Err("discarded")',
+            'words = ["replacement"]',
+            'saved[0] = "kept"',
+            'checkText(same[0], "kept", "generics:0:0")',
+            'checkText(words[0], "replacement", "generics:0:1")',
+            'let cell = FuzzCell { number: 7; text: "record!"; values: [] }',
+            "let optional: Maybe<FuzzCell> = Some(fuzzGenericBoxed(cell))",
+            "let record = match optional { Some(value) { value } "
+            'None { FuzzCell { number: 0; text: "invalid"; values: [] } } }',
+            "optional = None",
+            'cell = FuzzCell { number: 11; text: "replacement"; values: [] }',
+            "record.number += 2",
+            'checkInteger(record.number, 9, "generics:0:2")',
+            'checkInteger(cell.number, 11, "generics:0:3")',
+            "let text = fuzzGenericBoxed(record.text)",
+            'record.text = "new text"',
+            'checkText(text, "record!", "generics:0:4")',
+            "let maybeText: Maybe<Text> = Some(text)",
+            'let savedText = match maybeText { Some(value) { value } None { "invalid" } }',
+            "maybeText = None",
+            'checkText(savedText, "record!", "generics:0:5")',
+            "let primitive = fuzzGenericBoxed(7)",
+            "let primitiveAlias = primitive",
+            "primitive = 11",
+            'checkInteger(primitiveAlias, 7, "generics:0:6")',
+            "same = fuzzGenericBoxed(same)",
+            'same[0] = "self"',
+            'checkText(saved[0], "self", "generics:0:7")',
+        ]
+        replay = _GenericsReplay(0)
+        self.assertEqual(replay.execute(lines), [
+            "generics:0:0=kept", "generics:0:1=replacement", "generics:0:2=9",
+            "generics:0:3=11", "generics:0:4=record!", "generics:0:5=record!",
+            "generics:0:6=7", "generics:0:7=self"])
+        self.assertEqual(replay.bindings["same"], replay.bindings["saved"])
+        self.assertNotEqual(replay.bindings["words"], replay.bindings["saved"])
+        self.assertNotEqual(replay.bindings["cell"], replay.bindings["record"])
+        self.assertEqual(replay.bindings["optional"], _GenericsVariant("None"))
+
+    def test_hand_replay_models_try_paths_and_fresh_none_payloads(self):
+        lines = [
+            'let trace = FuzzCell { number: 0; text: "trace"; values: [] }',
+            'let payload = ["shared"]',
+            "let input: Maybe<Result<List<Text>, Text>> = Some(Ok(payload))",
+            "let good = fuzzGenericPropagate(input, trace)",
+            "input = None",
+            'payload[0] = "changed"',
+            "checkText(match good { Ok(value) { value[0] } Err(error) { error } }, "
+            '"changed", "generics:0:0")',
+            'checkInteger(trace.number, 11, "generics:0:1")',
+            'input = Some(Err("stop" + "!"))',
+            "let bad = fuzzGenericPropagate(input, trace)",
+            "input = None",
+            "checkBoolean(match bad { Ok(value) { true } Err(error) { false } }, "
+            'false, "generics:0:2")',
+            "checkText(match bad { Ok(value) { value[0] } Err(error) { error } }, "
+            '"stop!", "generics:0:3")',
+            'checkInteger(trace.number, 12, "generics:0:4")',
+            "let empty = fuzzGenericPropagate(input, trace)",
+            "let first = match empty { Ok(value) { value } "
+            'Err(error) { ["invalid"] } }',
+            'checkInteger(trace.number, 23, "generics:0:5")',
+            'checkInteger(trace.values.length, 3, "generics:0:6")',
+            "let another = fuzzGenericPropagate(None, trace)",
+            'first[0] = "altered"',
+            "checkText(match another { Ok(value) { value[0] } Err(error) { error } }, "
+            '"none!", "generics:0:7")',
+            'checkInteger(trace.number, 34, "generics:0:8")',
+            'checkInteger(trace.values.length, 4, "generics:0:9")',
+            'checkInteger(trace.values[0], 1, "generics:0:10")',
+        ]
+        replay = _GenericsReplay(0)
+        self.assertEqual(replay.execute(lines), [
+            "generics:0:0=changed", "generics:0:1=11", "generics:0:2=false",
+            "generics:0:3=stop!", "generics:0:4=12", "generics:0:5=23",
+            "generics:0:6=3", "generics:0:7=none!", "generics:0:8=34",
+            "generics:0:9=4", "generics:0:10=1"])
+        self.assertEqual(replay.propagation_paths, ["Ok", "Err", "None", "None"])
+
+    def test_replay_rejects_unknown_lines_functions_and_fields(self):
+        fixtures = [
+            ["print(1)"],
+            ["let value = unknown(1)"],
+            ["let value = 1 trailing"],
+            ["while true {}"],
+            ['let cell = FuzzCell { number: 1; text: "x"; values: [] }',
+             "cell.unknown = 2"],
+            ["let value = 1", "let value = 2"],
+            ["let value: Unknown = 1"],
+        ]
+        for body in fixtures:
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    _GenericsReplay(0).execute(body)
+
+    def test_replay_rejects_corrupted_expected_values_and_labels(self):
+        block = fuzz.generate_case(fuzz.Case("generics", 0, 6))
+        index = next(index for index, line in enumerate(block.body)
+                     if line.startswith("checkInteger("))
+        original = block.body[index]
+        parsed = re.fullmatch(r'(checkInteger\(.*), (-?\d+), ("[^"]+")\)', original)
+        self.assertIsNotNone(parsed)
+        corrupted = block.body.copy()
+        corrupted[index] = f"{parsed.group(1)}, {int(parsed.group(2)) + 1}, {parsed.group(3)})"
+        with self.assertRaisesRegex(AssertionError, "oracle mismatch"):
+            _GenericsReplay(0).execute(corrupted)
+        corrupted = block.body.copy()
+        corrupted[index] = original.replace('"generics:0:0"', '"generics:0:99"')
+        self.assertNotEqual(corrupted[index], original)
+        with self.assertRaisesRegex(AssertionError, "label mismatch"):
+            _GenericsReplay(0).execute(corrupted)
 
 
 class FingerprintTests(unittest.TestCase):

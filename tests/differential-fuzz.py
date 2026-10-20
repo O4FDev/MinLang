@@ -23,7 +23,8 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = -(1 << 63)
 MAXIMUM = (1 << 63) - 1
-FAMILIES = ("arithmetic", "control", "aliases", "maps", "bytes", "callbacks", "choices")
+FAMILIES = ("arithmetic", "control", "aliases", "maps", "generics", "bytes", "callbacks",
+            "choices")
 
 
 def signed(value: int) -> int:
@@ -276,6 +277,198 @@ def generate_case(case: Case) -> Block:
                 check(f"names.contains({key_term(frozen)})", True)
             check("table.length", len(mapped))
             check("namesAlias.length", len(members))
+    elif case.family == "generics":
+        def runtime_text(value: str) -> str:
+            middle = max(1, len(value) // 2)
+            return f"{literal(value[:middle])} + {literal(value[middle:])}"
+
+        numbers = [first, second, rng.randint(-1000, 1000), rng.randint(-1000, 1000)]
+        stems = ("A", "café", "λ", "🌙")
+        tokens = [f"{stem}-{index}-{rng.randrange(1000)}!"
+                  for index, stem in enumerate(stems)]
+        lists = [[token] for token in tokens]
+        cells = [{"number": number * 10, "text": f"cell-{tokens[index]}", "values": [index]}
+                 for index, number in enumerate(numbers)]
+        trace = {"number": 0, "values": []}
+        lines.append("let numbers = [" + ", ".join(str(value) for value in numbers) + "]")
+        lines.append("let lists: List<List<Text>> = [" +
+                     ", ".join(f"[{runtime_text(token)}]" for token in tokens) + "]")
+        lines.append("let cells: List<FuzzCell> = [" + ", ".join(
+            f"FuzzCell {{ number: {cell['number']}; text: {runtime_text(cell['text'])}; "
+            f"values: [{index}] }}" for index, cell in enumerate(cells)) + "]")
+        lines.append('let trace = FuzzCell { number: 0; text: "trace"; values: [] }')
+
+        check("fuzzGenericBoxed(fuzzGenericIdentity(numbers[0]))", numbers[0])
+        check("fuzzGenericBoxed(lists[0][0])", lists[0][0])
+        check("fuzzGenericBoxed(lists[1])[0]", lists[1][0])
+        check("fuzzGenericBoxed(cells[1]).number", cells[1]["number"])
+        lines.append("let scalarResult: Result<Integer, Text> = fuzzGenericChecked(numbers[0])")
+        check("match scalarResult { Ok(value) { true } Err(error) { false } }", True)
+        check("match scalarResult { Ok(value) { value } Err(error) { 0 } }", numbers[0])
+        lines.append("let textResult: Result<Text, Text> = fuzzGenericChecked(lists[0][0])")
+        check("match textResult { Ok(value) { true } Err(error) { false } }", True)
+        check('match textResult { Ok(value) { value } Err(error) { "invalid" } }', lists[0][0])
+
+        lines.extend((
+            "let goodInput: Maybe<Result<List<Text>, Text>> = Some(Ok(lists[2]))",
+            "let goodResult = fuzzGenericPropagate(goodInput, trace)",
+            "goodInput = None",
+        ))
+        trace["number"] += 11
+        trace["values"].append(1)
+        check("match goodResult { Ok(value) { true } Err(error) { false } }", True)
+        check('match goodResult { Ok(value) { value[0] } Err(error) { error } }', lists[2][0])
+        check("trace.number", trace["number"])
+        check("trace.values[0]", 1)
+        lines.extend((
+            f"let badInput: Maybe<Result<List<Text>, Text>> = Some(Err({runtime_text('stop!')}))",
+            "let badResult = fuzzGenericPropagate(badInput, trace)",
+            "badInput = None",
+        ))
+        trace["number"] += 1
+        trace["values"].append(1)
+        check("match badResult { Ok(value) { true } Err(error) { false } }", False)
+        check('match badResult { Ok(value) { value[0] } Err(error) { error } }', "stop!")
+        check("trace.number", trace["number"])
+        check("trace.values[1]", 1)
+        lines.extend((
+            "let noneInput: Maybe<Result<List<Text>, Text>> = None",
+            "let noneResult = fuzzGenericPropagate(noneInput, trace)",
+        ))
+        trace["number"] += 11
+        trace["values"].append(1)
+        check("match noneResult { Ok(value) { true } Err(error) { false } }", True)
+        check('match noneResult { Ok(value) { value[0] } Err(error) { error } }', "none!")
+        check("trace.number", trace["number"])
+        check("trace.values[2]", 1)
+        check("trace.values.length", len(trace["values"]))
+
+        for step in range(size):
+            position = rng.randrange(4)
+            other = rng.randrange(4)
+            replacement_number = rng.randint(-1000, 1000)
+            stem = stems[rng.randrange(4)]
+            suffix = rng.randrange(1000)
+            delta = rng.randint(-9, 9)
+            variant = rng.randrange(3)
+            token = f"{stem}-{step}-{suffix}"
+            operation = step % 6
+            if operation == 4:
+                if other == position:
+                    other = (position + 1) % 4
+                if delta == 0:
+                    delta = 1
+            if operation == 0:
+                saved_number = numbers[position]
+                saved_text = lists[other][0]
+                lines.extend((
+                    f"let scalar{step} = fuzzGenericBoxed(numbers[{position}])",
+                    f"let text{step} = fuzzGenericIdentity(lists[{other}][0])",
+                    f"numbers[{position}] = {replacement_number}",
+                    f"lists[{other}][0] = {runtime_text(token)}",
+                ))
+                numbers[position] = replacement_number
+                lists[other][0] = token
+                check(f"scalar{step}", saved_number)
+                check(f"text{step}", saved_text)
+            elif operation == 1:
+                saved_list = lists[position]
+                root_text = f"{token}-root"
+                saved_text = f"{token}-saved"
+                lines.extend((
+                    f"let outcome{step}: Result<List<Text>, Text> = "
+                    f"fuzzGenericChecked(fuzzGenericBoxed(lists[{position}]))",
+                ))
+                check(f"match outcome{step} {{ Ok(value) {{ true }} Err(error) {{ false }} }}", True)
+                lines.extend((
+                    f"let savedList{step} = match outcome{step} {{ Ok(value) {{ value }} "
+                    f"Err(error) {{ [\"invalid\"] }} }}",
+                    f"outcome{step} = Err({runtime_text(token)})",
+                    f"lists[{position}] = [{runtime_text(root_text)}]",
+                    f"savedList{step}[0] = {runtime_text(saved_text)}",
+                ))
+                lists[position] = [root_text]
+                saved_list[0] = saved_text
+                check(f"savedList{step}[0]", saved_text)
+                check(f"lists[{position}][0]", root_text)
+            elif operation == 2:
+                saved_text = lists[position][0]
+                lines.extend((
+                    f"let optional{step}: Maybe<Text> = "
+                    f"Some(fuzzGenericBoxed(lists[{position}][0]))",
+                ))
+                check(f"match optional{step} {{ Some(value) {{ true }} None {{ false }} }}", True)
+                lines.extend((
+                    f"let savedText{step} = match optional{step} {{ Some(value) {{ value }} "
+                    f"None {{ \"invalid\" }} }}",
+                    f"optional{step} = None",
+                    f"lists[{position}][0] = {runtime_text(token)}",
+                ))
+                lists[position][0] = token
+                check(f"savedText{step}", saved_text)
+                check(f"lists[{position}][0]", token)
+            elif operation == 3:
+                saved_cell = cells[position]
+                replacement = {"number": replacement_number, "text": token,
+                               "values": [position]}
+                lines.extend((
+                    f"let optional{step}: Maybe<FuzzCell> = "
+                    f"Some(fuzzGenericBoxed(cells[{position}]))",
+                ))
+                check(f"match optional{step} {{ Some(value) {{ true }} None {{ false }} }}", True)
+                lines.extend((
+                    f"let savedCell{step} = match optional{step} {{ Some(value) {{ value }} None {{ "
+                    f"FuzzCell {{ number: 0; text: \"invalid\"; values: [] }} }} }}",
+                    f"optional{step} = None",
+                    f"cells[{position}] = FuzzCell {{ number: {replacement_number}; "
+                    f"text: {runtime_text(token)}; values: [{position}] }}",
+                    f"savedCell{step}.number += {delta}",
+                ))
+                cells[position] = replacement
+                saved_cell["number"] += delta
+                check(f"savedCell{step}.number", saved_cell["number"])
+                check(f"savedCell{step}.text", saved_cell["text"])
+                check(f"cells[{position}].number", replacement_number)
+            elif operation == 4:
+                lines.extend((
+                    f"lists[{other}] = fuzzGenericBoxed(lists[{position}])",
+                    f"cells[{other}] = fuzzGenericIdentity(cells[{position}])",
+                    f"lists[{other}][0] = {runtime_text(token)}",
+                    f"cells[{other}].number += {delta}",
+                ))
+                lists[other] = lists[position]
+                cells[other] = cells[position]
+                lists[other][0] = token
+                cells[other]["number"] += delta
+                for index in range(4):
+                    check(f"lists[{index}][0]", lists[index][0])
+                    check(f"cells[{index}].number", cells[index]["number"])
+            else:
+                lines.append(f"let input{step}: Maybe<Result<List<Text>, Text>> = None")
+                if variant == 1:
+                    lines.append(f"input{step} = Some(Ok(fuzzGenericBoxed(lists[{position}])))")
+                    result_ok = True
+                    result_value = lists[position][0]
+                elif variant == 2:
+                    lines.append(f"input{step} = Some(Err({runtime_text(token)}))")
+                    result_ok = False
+                    result_value = token
+                else:
+                    result_ok = True
+                    result_value = "none!"
+                lines.extend((
+                    f"let propagated{step} = fuzzGenericPropagate(input{step}, trace)",
+                    f"input{step} = None",
+                ))
+                trace["number"] += 1 if not result_ok else 11
+                trace["values"].append(1)
+                check(f"match propagated{step} {{ Ok(value) {{ true }} Err(error) {{ false }} }}",
+                      result_ok)
+                check(f"match propagated{step} {{ Ok(value) {{ value[0] }} "
+                      f"Err(error) {{ error }} }}", result_value)
+                check("trace.number", trace["number"])
+                check(f"trace.values[{len(trace['values']) - 1}]", 1)
+                check("trace.values.length", len(trace["values"]))
     elif case.family == "bytes":
         count = rng.randint(1, size + 1)
         values = [rng.randrange(256) for _ in range(count)]
@@ -335,9 +528,26 @@ def generate_case(case: Case) -> Block:
 PRELUDE = '''// Generated by tests/differential-fuzz.py. Integers are checked against a Python oracle.
 record FuzzCell { number: Integer; text: Text; values: List<Integer> }
 record FuzzKey { label: Text; number: Integer }
+record FuzzGenericBox<Item> { value: Item }
 choice FuzzChoice { Full(payload: FuzzCell); Empty }
 function mark(state: FuzzCell): Boolean { state.number += 1; return true }
 function fuzzReset(table: Map<Text, Text>): Text { table.clear(); return "after" + "!" }
+function fuzzGenericIdentity<Item>(value: Item): Item { return value }
+function fuzzGenericBoxed<Item>(value: Item): Item {
+    let box = FuzzGenericBox { value: value }
+    return box.value
+}
+function fuzzGenericChecked<Item>(value: Item): Result<Item, Text> {
+    return Ok(fuzzGenericIdentity(value))
+}
+function fuzzGenericPropagate(input: Maybe<Result<List<Text>, Text>>, state: FuzzCell): Result<List<Text>, Text> {
+    let protected: FuzzGenericBox<List<Text>> = FuzzGenericBox { value: ["guard" + "!"] }
+    state.number += 1
+    state.values.add(protected.value.length)
+    let answer = match input { Some(outcome) { try outcome } None { ["none" + "!"] } }
+    state.number += 10
+    return Ok(fuzzGenericBoxed(answer))
+}
 function choiceValue(value: FuzzChoice): Integer {
     match value { Full(payload) { return payload.number } Empty { return -1 } }
 }
