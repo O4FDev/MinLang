@@ -879,15 +879,24 @@ function largest<Item: Ordered>(values: List<Item>, fallback: Item): Item {
 print(largest([1.2, 2.7, 1.4], 0.0)) // 2.7
 ```
 
-`Equatable`, `Ordered` and `Hashable` are the supported capability names.
-Integer, Float, Text, Character and Boolean satisfy all three. Finite records
+`Equatable`, `Ordered`, `Hashable`, `Iterable` and `Iterator` are supported
+capability names.
+Integer, Float, Text, Character and Boolean satisfy the three comparison
+capabilities. Finite records
 whose fields support a capability inherit it. Maps and Sets support Equatable
 where their ordinary equality is defined, including as record fields; they do not
-derive Ordered or Hashable. Lists, Bytes, callbacks, recursive record shapes and
-native record layouts need an explicit operation. A record
+derive Ordered or Hashable. Comparison of Lists, Bytes, callbacks, recursive
+record shapes and native record layouts needs an explicit operation. A record
 can constrain its type parameters in the same way as a function. The compiler
 checks each concrete argument before emitting its instantiation; constraints
 add no runtime dispatch.
+
+`Iterable` accepts the built-in collections, lazy recipes and records with the
+iteration method shape described above. `Iterator` accepts a record cursor with
+`advance(): Boolean` and a value-returning `current()`. Their concrete cursor and
+item types are inferred; no conformance declaration or runtime dispatch is needed.
+For example, `function total<Source: Iterable>(source: Source): Integer` can sum
+the Integer items of a List, a lazy range or a user sequence with one body.
 
 The errors library also shares one value/error record across its checked APIs.
 `errors.ValueResult<Item>` stores a value with an `errors.Error`. Create one with

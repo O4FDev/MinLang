@@ -1,0 +1,225 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let executions = 0
+let rejections = 0
+let iterableMarker = "function marker<Source: Iterable>(source: Source): Integer { return 42 }\n"
+let iteratorMarker = "function marker<Cursor: Iterator>(cursor: Cursor): Integer { return 42 }\n"
+let count = #"""
+    function count<Source: Iterable>(source: Source): Integer {
+        let count = 0
+        for value in source { count += 1 }
+        return count
+    }
+
+    """#
+let total = #"""
+    function total<Source: Iterable>(source: Source): Integer {
+        let total = 0
+        for value in source { total += value }
+        return total
+    }
+
+    """#
+let span = #"""
+    record Span { first: Integer; after: Integer }
+    record SpanCursor { position: Integer; after: Integer }
+    function Span.iterator(): SpanCursor { return SpanCursor { position: self.first - 1; after: self.after } }
+    function SpanCursor.advance(): Boolean { self.position += 1; return self.position < self.after }
+    function SpanCursor.current(): Integer { return self.position }
+
+    """#
+
+fixtures.executes(frontend, span + total + iterableMarker + #"""
+    function cursorMarker<Cursor: Iterator>(cursor: Cursor): Integer { return 42 }
+    function cursorTotal<Cursor: Iterator>(cursor: Cursor): Integer {
+        let total = 0
+        while cursor.advance() { total += cursor.current() }
+        return total
+    }
+    print(total(Span { first: 1; after: 4 }))
+    print(total(Span { first: 0; after: 0 }))
+    print(marker(Span { first: 1; after: 4 }))
+    print(cursorMarker(Span { first: 1; after: 4 }.iterator()))
+    print(cursorTotal(Span { first: 1; after: 4 }.iterator()))
+    """#, "6\n0\n42\n42\n6\n", levels, 0, "", true)
+executions += 1
+
+fixtures.executes(frontend, count + iterableMarker + #"""
+    let numbers = [1, 2, 3]
+    let text = "é🙂"
+    let bytes = Bytes("tide")
+    let names: Map<Text, Integer> = { "sea": 1, "sky": 2 }
+    let values: Set<Integer> = Set()
+    values.add(1); values.add(2); values.add(3)
+    print(count(numbers)); print(count(text)); print(count(bytes)); print(count(names)); print(count(values))
+    print(marker(numbers)); print(marker(text)); print(marker(bytes)); print(marker(names)); print(marker(values))
+    """#, "3\n2\n4\n2\n3\n42\n42\n42\n42\n42\n", levels, 0, "", true)
+executions += 1
+
+fixtures.executes(frontend, total + iterableMarker + #"""
+    use "sequence" as sequence
+    function double(value: Integer): Integer { return value * 2 }
+    function even(value: Integer): Boolean { return value % 2 == 0 }
+    function cursorMarker<Cursor: Iterator>(cursor: Cursor): Integer { return 42 }
+    let range = sequence.range(1, 6)
+    let recipe = range.map(double).filter(even)
+    print(total(range)); print(total(recipe)); print(total(recipe.map(double)))
+    print(marker(range)); print(marker(recipe)); print(cursorMarker(range.iterator()))
+    """#, "15\n30\n60\n42\n42\n42\n", levels, 0, "", true)
+executions += 1
+
+fixtures.executes(frontend, #"""
+    record Words { values: List<Text> }
+    record WordCursor { values: List<Text>; position: Integer }
+    function Words.iterator(): WordCursor { return WordCursor { values: self.values; position: -1 } }
+    function WordCursor.advance(): Boolean { self.position += 1; return self.position < self.values.length }
+    function WordCursor.current(): Text { return self.values[self.position] }
+    function firstOr<Source: Iterable, Item>(source: Source, fallback: Item): Item {
+        for value in source { return value }
+        return fallback
+    }
+    function cursorFirstOr<Cursor: Iterator, Item>(cursor: Cursor, fallback: Item): Item {
+        if cursor.advance() { return cursor.current() }
+        return fallback
+    }
+    let source = Words { values: ["kept", "alive"] }
+    let kept = firstOr(source, "missing")
+    source.values.clear()
+    for index in 0..100 { let scratch = [Bytes(128), Bytes(64)] }
+    print(kept)
+    print(firstOr(Words { values: [] }, "quiet"))
+    print(cursorFirstOr(Words { values: ["light"] }.iterator(), "dark"))
+    record Label { text: Text }
+    function label(value: Integer): Label { return Label { text: "light \(value)" } }
+    let home = firstOr([Label { text: "home" }], Label { text: "missing" })
+    let mapped = firstOr([1, 2].map(label), Label { text: "missing" })
+    print(home.text); print(mapped.text)
+    """#, "kept\nquiet\nlight\nhome\nlight 1\n", levels, 0, "", true)
+executions += 1
+
+fixtures.executes(frontend, span + count + #"""
+    record Walk<Source: Iterable> { source: Source }
+    record Progress<Cursor: Iterator> { cursor: Cursor }
+    function marker<Cursor: Iterator>(cursor: Cursor): Integer { return 42 }
+    let walk = Walk { source: [1, 2, 3] }
+    let progress = Progress { cursor: Span { first: 1; after: 4 }.iterator() }
+    print(count(walk.source)); print(marker(progress.cursor))
+    """#, "3\n42\n", levels, 0, "", true)
+executions += 1
+
+// These marker bodies do not iterate, so rejection must come from the bound.
+for value in ["42", "true", "1.5", "'a'"] {
+    fixtures.rejects(frontend, iterableMarker + "print(marker(" + value + "))\n", "does not satisfy Iterable", true)
+    rejections += 1
+}
+for value in ["[1]", "Bytes()", "\"light\"", "42", "true", "1.5"] {
+    fixtures.rejects(frontend, iteratorMarker + "print(marker(" + value + "))\n", "does not satisfy Iterator", true)
+    rejections += 1
+}
+fixtures.rejects(frontend, iterableMarker + "record Source { value: Integer }\nprint(marker(Source { value: 1 }))\n", "does not satisfy Iterable", true)
+rejections += 1
+
+let malformedSources = [
+    #"""
+        record Source {}
+        function Source.iterator(value: Integer): Source { return self }
+        function Source.advance(): Boolean { return false }
+        function Source.current(): Integer { return 0 }
+        """#,
+    #"""
+        record Source {}
+        function Source.iterator(): Integer { return 0 }
+        """#,
+    #"""
+        record Source {}
+        function Source.iterator(): List<Integer> { return [1] }
+        """#,
+    #"""
+        record Source {}
+        function Source.iterator() {}
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        function Cursor.advance(): Boolean { return false }
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        function Cursor.advance(value: Integer): Boolean { return false }
+        function Cursor.current(): Integer { return 0 }
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        function Cursor.advance(): Integer { return 0 }
+        function Cursor.current(): Integer { return 0 }
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        function Cursor.advance(): Boolean { return false }
+        function Cursor.current(value: Integer): Integer { return value }
+        """#,
+    #"""
+        record Source {}
+        record Cursor {}
+        function Source.iterator(): Cursor { return Cursor {} }
+        function Cursor.advance(): Boolean { return false }
+        function Cursor.current() {}
+        """#
+]
+for declarations in malformedSources {
+    fixtures.rejects(frontend, iterableMarker + declarations + "\nprint(marker(Source {}))\n", "does not satisfy Iterable", true)
+    rejections += 1
+}
+fixtures.rejects(frontend, iterableMarker + "record Source { iterator: Integer }\nprint(marker(Source { iterator: 0 }))\n", "does not satisfy Iterable", true)
+rejections += 1
+
+let malformedCursors = [
+    "record Cursor {}\n",
+    "record Cursor {}\nfunction Cursor.current(): Integer { return 0 }\n",
+    "record Cursor {}\nfunction Cursor.advance(): Boolean { return false }\n",
+    "record Cursor {}\nfunction Cursor.advance(value: Integer): Boolean { return false }\nfunction Cursor.current(): Integer { return 0 }\n",
+    "record Cursor {}\nfunction Cursor.advance(): Integer { return 0 }\nfunction Cursor.current(): Integer { return 0 }\n",
+    "record Cursor {}\nfunction Cursor.advance(): Boolean { return false }\nfunction Cursor.current(value: Integer): Integer { return value }\n",
+    "record Cursor {}\nfunction Cursor.advance(): Boolean { return false }\nfunction Cursor.current() {}\n"
+]
+for declarations in malformedCursors {
+    fixtures.rejects(frontend, iteratorMarker + declarations + "print(marker(Cursor {}))\n", "does not satisfy Iterator", true)
+    rejections += 1
+}
+fixtures.rejects(frontend, iteratorMarker + "record Cursor { advance: Boolean; current: Integer }\nprint(marker(Cursor { advance: false; current: 0 }))\n", "does not satisfy Iterator", true)
+rejections += 1
+fixtures.rejects(frontend, "record Walk<Source: Iterable> { source: Source }\nlet value = Walk { source: 42 }\n", "does not satisfy Iterable", true)
+rejections += 1
+fixtures.rejects(frontend, "record Progress<Cursor: Iterator> { cursor: Cursor }\nlet value = Progress { cursor: [1] }\n", "does not satisfy Iterator", true)
+rejections += 1
+
+// A structural capability must not expose an ordinary private method body.
+io.writeTextFile(frontend.compiler.directory + "/private-cursor.min", test.sourceModules(#"""
+    public record Source {}
+    public record Cursor {}
+    public function Source.iterator(): Cursor { return Cursor {} }
+    public function Cursor.advance(): Boolean { return false }
+    function Cursor.current(): Integer { return 42 }
+    """#))
+fixtures.rejects(frontend, "use \"./private-cursor.min\" as hidden\nlet cursor = hidden.Source {}.iterator()\nprint(cursor.current())\n", "method 'current' is private to its module", true)
+rejections += 1
+
+test.check(executions == 5 && rejections == 33, "iteration capability fixture inventory changed")
+test.removeTree(frontend.compiler.directory)
+print("Iteration capabilities: 5 execution fixtures and 33 rejection fixtures passed")

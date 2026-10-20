@@ -46,6 +46,12 @@ its contents. A later traversal observes later mutations. Reusing a recipe
 starts a new traversal; a user iterator that deliberately shares its cursor
 also shares progress.
 
+Generic functions can state the same structural contract with
+`function total<Source: Iterable>(source: Source): Integer`. A record cursor
+with `advance(): Boolean` and a value-returning `current()` satisfies `Iterator`.
+The compiler checks the concrete method signatures and infers cursor/item types;
+these bounds do not add a conformance object or dynamic dispatch.
+
 ## What the compiler emits
 
 The consuming `for` or `fold` unwraps its recipe once and emits one loop. Map

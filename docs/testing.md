@@ -65,6 +65,13 @@ the iteration gallery run at O0/O2 with ownership assertions. LLVM checks retain
 the direct method calls and ordinary loop branches. `check-iteration-sanitize`
 adds compiler and generated-program ASan/UBSan instrumentation.
 
+`make check-iteration-capabilities` checks structural `Iterable` and `Iterator`
+bounds on generic functions over collections, recipes and user cursors. It
+includes constraints on otherwise unused type arguments, so scalar types and
+malformed cursors cannot pass through a primitive fast path. Successful programs
+run at O0/O2 with ownership assertions; `check-iteration-capabilities-sanitize`
+adds ASan/UBSan.
+
 `make check-sequences` checks stored lazy map/filter recipes and left-to-right
 folds over collections, ranges and user iterators. O0/O2 ownership cases cover
 early exits, type-changing maps, rejected managed items, reuse and Integer limits.
