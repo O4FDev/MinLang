@@ -971,9 +971,7 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
 
 #include "minyar_text.h"
 
-static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
-    char buffer[32];
-    char *end = buffer + sizeof(buffer);
+static char *write_integer_digits(long long integer, char *end) {
     char *cursor = end;
     unsigned long long magnitude =
         integer < 0 ? 0 - (unsigned long long)integer : (unsigned long long)integer;
@@ -983,6 +981,13 @@ static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
     } while (magnitude);
     if (integer < 0)
         *--cursor = '-';
+    return cursor;
+}
+
+static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
+    char buffer[32];
+    char *end = buffer + sizeof(buffer);
+    char *cursor = write_integer_digits(integer, end);
     {
         long long length = end - cursor;
         unsigned char *bytes = new_bytes(length);

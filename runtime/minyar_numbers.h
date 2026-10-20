@@ -80,20 +80,35 @@ static _Bool adjacent_float_decimal(char *scientific, double value, int directio
     return 1;
 }
 
+static size_t float_copy_spelling(char *out, size_t capacity, const char *text, size_t length) {
+    if (capacity) {
+        size_t copied = length < capacity ? length : capacity - 1;
+        if (copied) memcpy(out, text, copied);
+        out[copied] = 0;
+    }
+    return length;
+}
+
 static size_t format_float(double value, char *out, size_t capacity) {
     if (isnan(value))
-        return (size_t)snprintf(out, capacity, "NaN");
+        return float_copy_spelling(out, capacity, "NaN", 3);
     if (isinf(value))
-        return (size_t)snprintf(out, capacity, value < 0 ? "-Infinity" : "Infinity");
+        return float_copy_spelling(out, capacity, value < 0 ? "-Infinity" : "Infinity", value < 0 ? 9 : 8);
     if (value == 0)
-        return (size_t)snprintf(out, capacity, signbit(value) ? "-0.0" : "0.0");
+        return float_copy_spelling(out, capacity, signbit(value) ? "-0.0" : "0.0", signbit(value) ? 4 : 3);
     /* Every integer strictly inside +/-2^53 is exact and its decimal integer
      * spelling already has the fewest significant digits. All are within our
      * plain-notation range; avoid scientific formatting and reparsing. */
     if (value > -9007199254740992.0 && value < 9007199254740992.0) {
         long long integer = (long long)value;
-        if ((double)integer == value)
-            return (size_t)snprintf(out, capacity, "%lld.0", integer);
+        if ((double)integer == value) {
+            char buffer[32];
+            char *end = buffer + sizeof(buffer);
+            end[-2] = '.';
+            end[-1] = '0';
+            char *first = write_integer_digits(integer, end - 2);
+            return float_copy_spelling(out, capacity, first, (size_t)(end - first));
+        }
     }
     uint64_t encoding;
     memcpy(&encoding, &value, sizeof(encoding));
