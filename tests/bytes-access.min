@@ -132,6 +132,29 @@ if !irOnly {
     print(view[2])
     """#, "77\n88\n4\n4\n66\n4\n99\n")
 
+    // A projected Bytes receiver needs no temporary count when its arguments
+    // make no calls; a call that can replace the field keeps the old owner alive.
+    test.executes(compiler, #"""
+    record Holder { bytes: Bytes; count: Integer }
+    function fill(holder: Holder) { let index = 0; while index < holder.count { holder.bytes.add(index + holder.bytes.length); holder.bytes.setInt32(0, index); index += 1 } }
+    function replace(holder: Holder): Integer { holder.bytes = Bytes(0); return 7 }
+    function mixed(holder: Holder) { holder.bytes.add(replace(holder)) }
+    let holder = Holder { bytes: Bytes(4); count: 6 }
+    fill(holder)
+    print(holder.bytes.length); print(holder.bytes.getInt32(0)); print(holder.bytes[5])
+    mixed(holder)
+    print(holder.bytes.length)
+    holder.bytes.add(1)
+    let alias = holder.bytes
+    mixed(holder)
+    print(alias.length); print(alias[1]); print(holder.bytes.length)
+    """#, "10\n5\n6\n0\n2\n7\n0\n")
+    let borrowed = io.readTextFile(casePath(compiler) + ".ll")
+    let fill = functionBody(borrowed, ".minyar.fn.fill")
+    test.check(!test.contains(fill, "@minyar_rc_borrow(") && !test.contains(fill, "@minyar_rc_keep("), "call-free Bytes updates kept a temporary owner")
+    test.check(test.contains(fill, "call void @.minyar.bytes.add.checked("), "Bytes field append must stay inline")
+    test.check(test.contains(functionBody(borrowed, ".minyar.fn.mixed"), "call void @minyar_rc_borrow("), "a Bytes update whose argument calls a function must keep its receiver owner")
+
     // Appends grow through repeated doublings and keep aliases in step.
     test.executes(compiler, "let bytes = Bytes(0)\nlet alias = bytes\nlet index = 0\nwhile index < 1000 { bytes.add(index % 256); index += 1 }\nprint(alias.length)\nprint(alias[0]); print(alias[255]); print(alias[256]); print(alias[999])\nbytes.resize(2)\nbytes.add(255)\nprint(alias.length); print(alias[2])\n", "1000\n0\n255\n0\n231\n3\n255\n")
     for value in [-9223372036854775808, -1, 256, 9223372036854775807] {

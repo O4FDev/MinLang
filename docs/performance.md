@@ -250,7 +250,14 @@ instruction counts. Preserve this distinction when reporting results.
 Ordinary Bytes indexing, indexed replacement, length and single-byte `add`
 use inline LLVM helpers even when the runtime is a separate native object. An
 append takes the inline path only when the value is a byte and the storage
-already has room; growth, C-layout views and invalid values call the runtime. Bytes and List
+already has room; growth, C-layout views and invalid values call the runtime.
+A Bytes method that only reads or updates its own storage, such as
+`holder.bytes.add(value)` or `holder.bytes.setInt32(0, value)`, takes no
+temporary count on a field or element receiver when its arguments make no
+calls: nothing can replace that field before the method returns. Removing that
+count and its cleanup point lets LLVM keep the surrounding loop in registers;
+on the frozen safelibs fixtures it halved zlib decode time (8.10 to 4.21 ms)
+and cut PNG by 27% (13.00 to 9.51 ms). Bytes and List
 helpers expose their nonnegative length and form checked element addresses
 within the backing allocation. These facts do not freeze storage or imply
 that two collections are disjoint. Resizing and other calls retain their
