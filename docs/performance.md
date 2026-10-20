@@ -260,6 +260,28 @@ while retaining checked accumulation. The suites also exercise errors, shared
 mutation and ownership at O0/O2. Their `-sanitize` counterparts instrument the
 compiler and generated memory accesses.
 
+Record field reads and scalar field writes use the same pattern. Every runtime
+profile, including the compiler's arena, stores a record as its field count
+followed by its fields, so the helper loads the count, checks the constant
+field index against it and reads or writes the slot directly. A failed check
+calls the runtime's diagnostic. Reference fields keep their ownership-aware
+runtime setters. `make check-record-access` checks the helper IR, its inlining at
+O2 and the arena layout.
+
+On the frozen safelibs fixtures (Linux x86_64, LLVM 23.1.2, separate O2 codec
+and runtime objects, median of three pinned samples), inline record access
+reduced decode time by 22–35%:
+
+| Fixture | Bounded frames before → after | Scope owners before → after |
+| --- | ---: | ---: |
+| zlib, 1 MiB | 15.61 → 12.25 ms | 12.80 → 8.29 ms |
+| PNG, 512×512 | 23.69 → 18.37 ms | 19.39 → 13.27 ms |
+| JPEG, 512×512 | 56.28 → 38.93 ms | 51.43 → 35.26 ms |
+
+The left column is the direct compiler's default ownership lowering, which
+those products used; the right is `--scope-owners` with the eager runtime.
+Both remain 18–37 times slower than the system zlib, libpng and libjpeg-turbo.
+
 `experiments/codegen/byte-access-study.py` compares two frozen compilers with
 checked C on byte sum, byte copy and Integer List sum. It retains seven
 alternating samples after warmup, validates complete storage and ownership,

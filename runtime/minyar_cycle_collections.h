@@ -385,11 +385,10 @@ MinyarRecord *record_allocate(long long field_count, int references) {
         minyar_stop("this record has too many fields.");
 #ifdef MINYAR_COMPILER_ARENA
     (void)references;
-    record = minyar_list_new();
-    if (field_count > 0) {
-        record->values = list_allocate(field_count, (size_t)field_count * sizeof(*record->values));
-        memset(record->values, 0, (size_t)field_count * sizeof(*record->values));
-    }
+    if ((unsigned long long)field_count > (SIZE_MAX - sizeof(*record)) / sizeof(*record->values))
+        out_of_memory();
+    record = object_allocate(sizeof(*record) + (size_t)field_count * sizeof(*record->values), 2);
+    memset(record->values, 0, (size_t)field_count * sizeof(*record->values));
 #else
     size_t field_size = sizeof(long long) + (references ? 1 : 0);
     if ((unsigned long long)field_count >
@@ -402,9 +401,6 @@ MinyarRecord *record_allocate(long long field_count, int references) {
     memset(record->values, 0, (size_t)field_count * field_size);
 #endif
     record->length = field_count;
-#ifdef MINYAR_COMPILER_ARENA
-    record->capacity = field_count;
-#endif
     return record;
 }
 

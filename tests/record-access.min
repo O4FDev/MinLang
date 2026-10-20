@@ -1,0 +1,72 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+
+function startsWith(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    return Text(raw.slice(0, pattern.length)) == prefix
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let matches = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { matches += 1 }
+    }
+    return matches
+}
+function link(compiler: test.Compiler, path: Text, runtime: Text, optimization: Text, output: Text): Text {
+    let command = [compiler.clang, optimization, "-Wno-override-module"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in [path + ".ll", runtime, "-lm", "-o", output] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", output + ".link", compiler.linkTimeout), "link record program")
+    let result = test.run([output], system.environment(), "", output + ".run", compiler.runTimeout)
+    test.require(result, "run record program")
+    test.check(result.errorOutput == "", "unexpected record diagnostics\n" + result.errorOutput)
+    return result.output
+}
+
+let compiler = test.compiler()
+let source = "record Point { x: Integer; y: Float; flag: Boolean; mark: Character; name: Text }\nrecord Holder { point: Point; count: Integer }\nfunction sum(points: List<Point>): Integer {\nlet total = 0\nlet index = 0\nwhile index < points.length { total += points[index].x; index += 1 }\nreturn total\n}\nlet point = Point { x: 3; y: 1.5; flag: true; mark: 'é'; name: \"corner\" }\npoint.x = point.x + 4\npoint.y = point.y * 2.0\npoint.flag = !point.flag\npoint.mark = '🙂'\nprint(point.x)\nprint(point.y)\nprint(point.flag)\nprint(point.mark)\nprint(point.name)\nlet holder = Holder { point: point; count: 2 }\nholder.count += holder.point.x\nholder.point.x = -9223372036854775808\nprint(holder.point.x)\nprint(holder.count)\nprint(sum([Point { x: 1; y: 0.0; flag: false; mark: 'a'; name: \"a\" }, Point { x: 41; y: 0.0; flag: false; mark: 'b'; name: \"b\" }]))\n"
+let expected = "7\n3.0\nfalse\n🙂\ncorner\n-9223372036854775808\n9\n42\n"
+test.executes(compiler, source, expected)
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+
+// The helpers keep the runtime's exact checked fallback and its layout facts.
+for expected in ["define internal i64 @.minyar.record.get.checked(ptr %record, i64 %field) alwaysinline", "define internal void @.minyar.record.set.scalar.checked(ptr %record, i64 %field, i64 %value) alwaysinline", "%length = load i64, ptr %record, !range !{i64 0, i64 -9223372036854775808}", "%values = getelementptr inbounds i8, ptr %record, i64 8", "%slot = getelementptr inbounds i64, ptr %values, i64 %field", "%fallback = call i64 @minyar_record_get(ptr %record, i64 %field)\n  ret i64 %fallback", "call void @minyar_record_set_scalar(ptr %record, i64 %field, i64 %value)\n  ret void"] {
+    test.check(test.contains(llvm, expected), "missing checked record helper IR: " + expected)
+}
+test.check(!test.contains(llvm, "noalias"), "record IR incorrectly claims noalias")
+
+// Program field reads and scalar writes use the inline helpers with constant fields.
+let program = test.withoutRuntimeHelpers(llvm)
+test.check(!test.contains(program, "call i64 @minyar_record_get("), "record field read called the runtime getter")
+test.check(!test.contains(program, "call void @minyar_record_set_scalar("), "scalar field write called the runtime setter")
+test.check(test.contains(program, "call i64 @.minyar.record.get.checked(ptr ") && test.contains(program, ", i64 4)"), "record reads must name constant fields")
+test.check(count(program, "call void @.minyar.record.set.scalar.checked(ptr ") >= 4, "scalar record writes must use the inline setter")
+test.check(test.contains(program, "call void @minyar_record_set_take(") || test.contains(program, "call void @minyar_record_set_reference("), "reference fields keep their ownership-aware setters")
+
+// Optimized code inlines every field access.
+let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { optimize.add(flag) }
+for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
+test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize record IR")
+let optimized = io.readTextFile(path + ".optimized.ll")
+test.check(!test.contains(optimized, "call i64 @.minyar.record.get.checked(") && !test.contains(optimized, "call void @.minyar.record.set.scalar.checked("), "record helpers must inline")
+
+// The compiler's arena runtime shares the record layout the helpers read.
+let arena = path + "-arena.o"
+let build = [compiler.clang, "-O1", "-DMINYAR_COMPILER_ARENA", "-c", "runtime/minyar_runtime.c", "-o", arena]
+for flag in compiler.flags { build.add(flag) }
+test.require(test.run(build, system.environment(), "", arena + ".build", compiler.linkTimeout), "compile arena runtime")
+for optimization in ["-O0", "-O2"] {
+    test.check(link(compiler, path, arena, optimization, path + "-arena" + optimization + ".exe") == expected, "arena record layout output " + optimization)
+}
+test.removeTree(compiler.directory)
+print("record access: passed")

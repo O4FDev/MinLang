@@ -517,6 +517,13 @@ check-compiler-hardening: build/minyarc build/minyarc-modules build/minyar-runti
 check-compiler-hardening-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/compiler-hardening
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compiler-hardening
 
+.PHONY: check-record-access check-record-access-sanitize
+check-record-access: build/minyarc build/minyar-runtime.o build/tooling/tests/record-access
+	$(LIMITED) ./build/tooling/tests/record-access
+
+check-record-access-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/record-access
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/record-access
+
 .PHONY: check-list-access check-list-access-sanitize
 check-list-access: build/minyarc build/minyar-runtime.o build/tooling/tests/list-access
 	$(LIMITED) ./build/tooling/tests/list-access
@@ -559,10 +566,10 @@ check-sanitize: check-checked-scalars-sanitize
 check-incremental-language-hardening: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-language-hardening
 	$(LIMITED) ./build/tooling/tests/incremental-language-hardening
 
-check-portable: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
+check-portable: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access check-record-access
 check-incremental-modules: check-incremental-language-hardening check-module-driver-options
-check-sanitize: check-runtime-bytes-sanitize check-runtime-traps-sanitize check-compiler-hardening-sanitize check-list-access-sanitize
-check: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
+check-sanitize: check-runtime-bytes-sanitize check-runtime-traps-sanitize check-compiler-hardening-sanitize check-list-access-sanitize check-record-access-sanitize
+check: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access check-record-access
 
 .PHONY: check-format format
 check-format: build/tooling/scripts/format
