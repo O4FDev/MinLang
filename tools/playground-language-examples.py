@@ -46,6 +46,14 @@ POLICIES = {
         "A test beside its function", "test-mode",
         "This example needs minyar test or --test-mode. Ordinary playground Run omits test blocks, so an empty run would not exercise the expectation.",
     ),
+    "76db5beca515": contextual(
+        "A shrinking property beside its test", "test-mode",
+        "This example requires minyar test or --test-mode. Ordinary playground Run omits the test body, and the property module is not in the browser library bundle.",
+    ),
+    "10679a1935b1": contextual(
+        "A benchmark beside declarations", "unsupported-host",
+        "This example requires minyar bench or --benchmark-mode and its measurement runner. Ordinary playground Run omits benchmark bodies and does not provide that runner, so it cannot measure this example.",
+    ),
     "a90d7ae76d0f": standalone(
         "Documentation on a record", "",
         "Only a record and documentation comments are declared; there are no print calls or executable statements.",
