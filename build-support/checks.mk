@@ -363,7 +363,7 @@ check-compiler-slice-cache: build/tooling/tests/compiler-slice-cache
 	$(LIMITED) ./build/tooling/tests/compiler-slice-cache
 
 check-compact-ownership: build/minyarc build/minyarc-sanitize build/ownership-runtime.o build/minyar-compiler-runtime.ll build/tooling/tests/compact-ownership
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compact-ownership
 	MINYAR_TEST_CLANG="$(LLVM_CC)" ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
 
 .PHONY: check-text-view-budget
