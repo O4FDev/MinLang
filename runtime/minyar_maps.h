@@ -250,6 +250,24 @@ MinyarList *minyar_map_keys(const MinyarRecord *map) {
     return result;
 }
 
+/* Decode the compiler's reserved positive-child Map<Record, Enum> escape. */
+static long long map_record_enum_value(long long type) {
+    long long tag = -type % 8;
+    long long index = tag - 1;
+    if (tag == 7) index = 4;
+    else if (tag < 1 || tag > 4) return 0;
+    long long payload = -type / 8;
+    if (payload % 2) return 0;
+    long long child = payload / 2;
+    if (child < 19 || (child >= 1000000000 && child < 1000099000)) return 0;
+    long long remainder = child % 100000;
+    if (remainder < 19 || remainder > 999) return 0;
+    if (child >= 1000100000) child -= 100000;
+    long long pair = (child / 100000 * 981 + remainder - 19) * 5 + index;
+    if (pair >= 9801000000) return 0;
+    return 1000000000 + pair % 99000;
+}
+
 _Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
                             long long value_type) {
     if (!left || !right) return left == right;
@@ -271,8 +289,19 @@ _Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
             if (!(x == y)) return 0;
         } else if (value_type < -8 && (-value_type % 8) != 0) {
             long long payload = -value_type / 8;
-            if ((-value_type % 8) == 5) payload /= 100000;
+            int enum_key = 0;
+            if ((-value_type % 8) == 5) {
+                enum_key = payload % 100000 < 1000;
+                payload /= 100000;
+                if (enum_key) payload /= 99;
+            }
             long long child = payload % 2 ? -(payload / 2) - 1 : payload / 2;
+            if (enum_key) {
+                if (child >= 19 && child < 99019) child = 1000000000 + child - 19;
+                else if (child >= 99019) child -= 99000;
+            }
+            long long enum_value = map_record_enum_value(value_type);
+            if (enum_value) child = enum_value;
             if ((-value_type % 8) == 6) child = 4;
             if (!minyar_maps_are_equal((const MinyarRecord *)(uintptr_t)a,
                                       (const MinyarRecord *)(uintptr_t)b, child)) return 0;

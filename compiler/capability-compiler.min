@@ -1,9 +1,9 @@
 // The three capabilities are derived for scalar values and finite record shapes.
 // Lists, Bytes, callbacks and recursive shapes have no implicit structural meaning.
 function capabilityTypeSupported(type: Integer, counts: List<Integer>, fields: List<Integer>, names: List<Text>, path: List<Integer>): Boolean {
-    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 { return true }
+    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || isEnumType(type) { return true }
     if !isRecordType(type) || isCallbackType(type, names) { return false }
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let position = 0
     while position < path.length {
         if path[position] == type { return false }
@@ -23,9 +23,9 @@ function capabilityTypeSupported(type: Integer, counts: List<Integer>, fields: L
 }
 
 function recordCapabilityHasNative(context: CompilerContext, type: Integer): Boolean {
-    if !isRecordType(type) { return false }
+    if !isRecordType(type) || isEnumType(type) { return false }
     if isCRecord(context, type) { return true }
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let position = 0
     while position < context.functionParameterCounts[record] {
@@ -36,7 +36,7 @@ function recordCapabilityHasNative(context: CompilerContext, type: Integer): Boo
 }
 
 function visitTypeCapability(context: CompilerContext, type: Integer, capability: Text, path: List<Integer>): Boolean {
-    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 { return true }
+    if type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || isEnumType(type) { return true }
     if capability == "Equatable" && isSetType(type) { return visitTypeCapability(context, setElementType(type), "Hashable", path) }
     if capability == "Equatable" && isMapType(type) {
         while isMapType(type) {
@@ -44,7 +44,7 @@ function visitTypeCapability(context: CompilerContext, type: Integer, capability
             type = mapValueType(type)
         }
         if isSetType(type) { return visitTypeCapability(context, setElementType(type), "Hashable", path) }
-        return type == 1 || type == 2 || type == 3 || type == 4 || type == 7
+        return type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || isEnumType(type)
     }
     if !isRecordType(type) || isCallbackType(type, context.functionNames) || isCRecord(context, type) { return false }
     let index = 0
@@ -55,7 +55,7 @@ function visitTypeCapability(context: CompilerContext, type: Integer, capability
         index = index + 1
     }
     nested.add(type)
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     index = 0
     while index < context.functionParameterCounts[record] {
@@ -75,7 +75,7 @@ function typeSupportsCapability(context: CompilerContext, type: Integer, capabil
 
 function requireRecordCapability(context: CompilerContext, type: Integer, capability: Text, location: Integer) {
     if !typeSupportsCapability(context, type, capability) {
-        failCompiler(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(context.functionNames[type - 1000]) + "' is not " + capability + "; every field must be " + capability + " and the record shape must be finite; Lists, Bytes, callbacks, native records and recursive shapes need an explicit operation")
+        failCompiler(describeLocation(tokenLocation(context.tokenLines, location)) + ": record '" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "' is not " + capability + "; every field must be " + capability + " and the record shape must be finite; Lists, Bytes, callbacks, native records and recursive shapes need an explicit operation")
     }
 }
 
@@ -83,11 +83,32 @@ function derivedRecordName(context: CompilerContext, type: Integer, operation: T
     return "@\".minyar.derived." + operation + "|" + Text(type) + "|" + escapeLLVMText(tokenPath(context.tokenLines, 0)) + "\""
 }
 
+function derivedEnumFunction(name: Text, operation: Text, globals: List<Text>): Text {
+    let resultType = "i64"
+    if operation == "equal" { resultType = "zeroext i1" }
+    let code = "define internal " + resultType + " " + name + "(i64 %left"
+    if operation == "equal" || operation == "compare" { code = code + ", i64 %right" }
+    code = code + ") {\nentry:\n"
+    if operation == "equal" { code = code + "  %equal = icmp eq i64 %left, %right\n  ret i1 %equal\n" }
+    if operation == "compare" {
+        code = code + "  %greater = icmp sgt i64 %left, %right\n  %less = icmp slt i64 %left, %right\n  %positive = zext i1 %greater to i64\n  %negative = zext i1 %less to i64\n  %order = sub i64 %positive, %negative\n  ret i64 %order\n"
+    }
+    if operation == "hash" {
+        let declaration = "declare i64 @minyar_hash_slot(i64, i64)\n"
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        code = code + "  %hash = call i64 @minyar_hash_slot(i64 1, i64 %left)\n  ret i64 %hash\n"
+    }
+    if operation == "copy" { code = code + "  ret i64 %left\n" }
+    globals.add(code + "}\n")
+    return name
+}
+
 function derivedRecordFunction(context: CompilerContext, type: Integer, operation: Text, globals: List<Text>): Text {
     let name = derivedRecordName(context, type, operation)
     let marker = "; derived record " + name + "\n"
     if findText(globals, marker) >= 0 { return name }
     globals.add(marker)
+    if isEnumType(type) { return derivedEnumFunction(name, operation, globals) }
     if choiceNicheType(context, type) != 0 { return derivedNicheChoice(context, type, operation, globals, name) }
     let resultType = "zeroext i1"
     if operation == "compare" || operation == "hash" { resultType = "i64" }
@@ -109,7 +130,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
     code.add("present:\n")
     let counts = context.functionParameterCounts
     let fields = context.functionParameterTypes
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(counts, record)
     let result = "true"
     if operation == "compare" { result = "0" }
@@ -125,6 +146,8 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
     let position = 0
     while position < counts[record] {
         let field = fields[first + position]
+        let kind = field
+        if isEnumType(kind) { kind = 1 }
         let id = Text(position)
         let slot = Text(choiceStorageField(context, type, position))
         let left = "%left." + id
@@ -141,7 +164,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
         code.add("  " + left + " = call i64 @minyar_record_get(ptr %left, i64 " + slot + ")\n")
         if operation == "equal" || operation == "compare" { code.add("  " + right + " = call i64 @minyar_record_get(ptr %right, i64 " + slot + ")\n") }
         if operation == "copy" {
-            if isRecordType(field) {
+            if isRecordType(field) && !isEnumType(field) {
                 let child = derivedRecordFunction(context, field, operation, globals)
                 code.add("  %pointer." + id + " = inttoptr i64 " + left + " to ptr\n")
                 code.add("  " + value + " = call ptr " + child + "(ptr %pointer." + id + ")\n")
@@ -153,7 +176,7 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
                 code.add("  call void @" + setter + "(ptr %copy, i64 " + slot + ", i64 " + left + ")\n")
             }
         } else {
-            if isRecordType(field) {
+            if isRecordType(field) && !isEnumType(field) {
                 let child = derivedRecordFunction(context, field, operation, globals)
                 code.add("  %left.pointer." + id + " = inttoptr i64 " + left + " to ptr\n")
                 if operation != "hash" { code.add("  %right.pointer." + id + " = inttoptr i64 " + right + " to ptr\n") }
@@ -188,9 +211,9 @@ function derivedRecordFunction(context: CompilerContext, type: Integer, operatio
                     if operation == "compare" {
                         if position == 0 && field == 4 && resultTypeName(type, context.functionNames) {
                             code.add("  " + value + " = call i64 @minyar_compare_slots(i64 4, i64 " + right + ", i64 " + left + ")\n")
-                        } else { code.add("  " + value + " = call i64 @minyar_compare_slots(i64 " + Text(field) + ", i64 " + left + ", i64 " + right + ")\n") }
+                        } else { code.add("  " + value + " = call i64 @minyar_compare_slots(i64 " + Text(kind) + ", i64 " + left + ", i64 " + right + ")\n") }
                     }
-                    if operation == "hash" { code.add("  " + value + " = call i64 @minyar_hash_slot(i64 " + Text(field) + ", i64 " + left + ")\n") }
+                    if operation == "hash" { code.add("  " + value + " = call i64 @minyar_hash_slot(i64 " + Text(kind) + ", i64 " + left + ")\n") }
                 }
             }
             if operation == "equal" { code.add("  %result." + id + " = and i1 " + result + ", " + value + "\n") }
@@ -239,6 +262,7 @@ function derivedRecordSort(context: CompilerContext, type: Integer, globals: Lis
     if findText(globals, declaration) < 0 { globals.add(declaration) }
     let thunk = derivedRecordName(context, type, "sort")
     let code = "define internal i64 " + thunk + "(ptr %unused, i64 %a, i64 %b) {\nentry:\n  %left = inttoptr i64 %a to ptr\n  %right = inttoptr i64 %b to ptr\n  %result = call i64 " + compare + "(ptr %left, ptr %right)\n  ret i64 %result\n}\n"
+    if isEnumType(type) { code = "define internal i64 " + thunk + "(ptr %unused, i64 %a, i64 %b) {\nentry:\n  %result = call i64 " + compare + "(i64 %a, i64 %b)\n  ret i64 %result\n}\n" }
     if findText(globals, code) < 0 { globals.add(code) }
     return thunk
 }

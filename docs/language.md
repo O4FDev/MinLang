@@ -870,14 +870,20 @@ The library also exposes choices through existing APIs. For example,
 `statusValue` and `statusError` helpers remain available; matching lets a caller
 handle both outcomes directly.
 
-Choices share record ownership and automatic memory management. A value stores
-a tag and a union large enough for its largest case: different cases share the
-same payload slots. Only the active case's reference payloads are retained and
-traced. A payload occupies one eight-byte slot, with reference tracking stored
-separately. Choices with no payloads still allocate a tag. Payloads can hold
-choices, records, Lists and callbacks, with the same ownership and cycle analysis
-as records. Cases and payload fields are accessed through constructors and
-matching. Patterns inspect only the active case and its payloads.
+A choice whose cases all have no payloads stores its case as one eight-byte
+integer. Constructing, passing, returning and matching these values allocate
+nothing and need no reference counting. They remain distinct named types:
+an Integer or a different choice cannot stand in for one. Methods, generic
+constraints and derived equality, ordering and hashing work as usual. Lists,
+records, callbacks, Maps and Sets store these cases directly as scalar values.
+
+Choices with payloads share record ownership and automatic memory management.
+A value stores a tag and a union large enough for its largest case: different
+cases share the same payload slots. Only the active case's reference payloads
+are retained and traced. A payload occupies one eight-byte slot, with reference
+tracking stored separately. Payloads can hold choices, records, Lists and
+callbacks, with the same ownership and cycle analysis as records. Cases and
+payload fields are accessed through constructors and matching. Patterns inspect only the active case and its payloads.
 
 A two-case choice with one ordinary record payload uses a nullable pointer.
 For example, `Maybe<Reading>` stores the `Reading` pointer for `Some(reading)`

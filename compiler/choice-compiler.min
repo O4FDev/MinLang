@@ -123,7 +123,7 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
 function choiceCases(context: CompilerContext, type: Integer): List<Text> {
     let empty: List<Text> = []
     if !isRecordType(type) { return empty }
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     if context.functionParameterCounts[record] == 0 { return empty }
     let marker = context.functionParameterNames[functionParameterOffset(context.functionParameterCounts, record)]
     if !resultPrefix(marker, "minyar_choice_tag|") { return empty }
@@ -132,7 +132,7 @@ function choiceCases(context: CompilerContext, type: Integer): List<Text> {
 
 function choicePayloadFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
     let fields: List<Integer> = []
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let prefix = "minyar_choice_payload|" + name + "|"
     let field = 1
@@ -147,7 +147,7 @@ function choicePayloadFields(context: CompilerContext, type: Integer, name: Text
 // Physical payload slots overlap: each case starts immediately after the tag.
 function choiceStorageField(context: CompilerContext, type: Integer, field: Integer): Integer {
     if field == 0 || choiceCases(context, type).length == 0 { return field }
-    let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+    let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
     let parts = context.functionParameterNames[first + field].split("|")
     let prefix = "minyar_choice_payload|" + parts[1] + "|"
     let start = field
@@ -156,10 +156,10 @@ function choiceStorageField(context: CompilerContext, type: Integer, field: Inte
 }
 
 function choiceStorageCount(context: CompilerContext, type: Integer): Integer {
-    if choiceNicheType(context, type) != 0 { return 0 }
+    if isEnumType(type) || choiceNicheType(context, type) != 0 { return 0 }
     let count = 1
     let field = 1
-    while field < context.functionParameterCounts[type - 1000] {
+    while field < context.functionParameterCounts[recordTypeIndex(type)] {
         let slot = choiceStorageField(context, type, field)
         if slot + 1 > count { count = slot + 1 }
         field = field + 1
@@ -169,7 +169,7 @@ function choiceStorageCount(context: CompilerContext, type: Integer): Integer {
 
 function choiceLocalType(context: CompilerContext, type: Integer, location: Integer): Boolean {
     let position = 0
-    let name = context.functionNames[type - 1000]
+    let name = context.functionNames[recordTypeIndex(type)]
     while position + 1 < context.tokenKinds.length {
         if context.tokenKinds[position] == 1 && context.tokenTexts[position] == "record" && context.tokenTexts[position + 1] == name {
             return tokenPath(context.tokenLines, position) == tokenPath(context.tokenLines, location)
@@ -184,8 +184,8 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     let name = context.tokenTexts[location]
     if context.tokenKinds[location] != 1 { return 0 }
     let record = findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 2)
-    if record >= 0 && context.tokenTexts[location + 1] == "{" && choiceCases(context, 1000 + record).length == 0 { return 0 }
-    if record >= 0 && context.tokenTexts[location + 1] == "." && choiceCases(context, 1000 + record).length > 0 { return 1000 + record }
+    if record >= 0 && context.tokenTexts[location + 1] == "{" && choiceCases(context, typeForSymbol(context, record)).length == 0 { return 0 }
+    if record >= 0 && context.tokenTexts[location + 1] == "." && choiceCases(context, typeForSymbol(context, record)).length > 0 { return typeForSymbol(context, record) }
     if (name == "Ok" || name == "Err") && resultTypeName(expected, context.functionNames) { return 0 }
     if isBuiltinName(name) { return 0 }
     if findLocal(localNames, localLengths, state, name) >= 0 || findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name) >= 0 || findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 3) >= 0 { return 0 }
@@ -194,9 +194,9 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     let found = 0
     record = 0
     while record < context.functionNames.length {
-        if context.symbolKinds[record] == 2 && findText(choiceCases(context, 1000 + record), name) > 0 && choiceLocalType(context, 1000 + record, location) {
+        if context.symbolKinds[record] == 2 && findText(choiceCases(context, typeForSymbol(context, record)), name) > 0 && choiceLocalType(context, typeForSymbol(context, record), location) {
             if found != 0 { failAtToken(context.tokenLines, location, "ambiguous choice case '" + name + "'; qualify it with its choice type") }
-            found = 1000 + record
+            found = typeForSymbol(context, record)
         }
         record = record + 1
     }
@@ -231,11 +231,19 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
     let name = context.tokenTexts[state[0]]
     let cases = choiceCases(context, type)
     let tag = findText(cases, name)
-    if tag < 1 { failUnknownChoice(context, state[0], type, name, "choice '" + readableDeclarationName(context.functionNames[type - 1000]) + "' has no case '" + name + "'") }
+    if tag < 1 { failUnknownChoice(context, state[0], type, name, "choice '" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "' has no case '" + name + "'") }
     state[0] = state[0] + 1
     let fields = choicePayloadFields(context, type, name)
+    if isEnumType(type) {
+        if tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+            state[0] = state[0] + 1
+            expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+        }
+        setType(resultType, type)
+        return Text(tag - 1)
+    }
     if choiceNicheType(context, type) != 0 { return parseNicheChoice(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, type, fields.length > 0) }
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let value = valueName(textState, newTemporary(state))
     noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, 0)
@@ -294,7 +302,7 @@ function choiceMatchCases(context: CompilerContext, type: Integer): List<Text> {
 function choiceMatchFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
     if resultTypeName(type, context.functionNames) {
         let fields: List<Integer> = []
-        let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+        let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
         if name == "Err" { fields.add(2) }
         if name == "Ok" && context.functionParameterTypes[first + 1] != 5 { fields.add(1) }
         return fields

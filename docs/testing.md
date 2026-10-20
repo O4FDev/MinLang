@@ -204,6 +204,16 @@ calls: 16,000 values reserve 48,000 eight-byte slots, compared with 528,000 in
 the former expanded layout. LLVM assertions independently require three slots
 per value. `check-choice-layout-sanitize` adds ASan/UBSan.
 
+`make check-choice-enums` requires 16,000 payload-free choice values to allocate
+zero records, with zero live objects or bytes. LLVM assertions require `i64`
+parameters, returns and callback slots without reference-count traffic. Further
+O0/O2 cases cover nominal type rejection, generics, methods, native calls,
+parallel buffers, collections and module boundaries. Capacity controls cover
+ordinary nested Lists, three-level record-key Maps and nested Maps ending in
+an enum. The latter exercise all five reserved-child tags and the skipped
+enum-ID bucket, including the independent runtime equality decoder.
+`check-choice-enums-sanitize` adds ASan/UBSan.
+
 `make check-choice-niche` checks nullable record choices, borrowed and owned
 payloads, nested optionals, reversed case order, snapshots, alias lifetimes and
 cycles. Its O0/O2 constructor counter requires 10,000 optional readings to
@@ -216,6 +226,11 @@ layout allocated 15,000 records and 25,000 slots for the same workload.
 owned arguments, assignment, return, List storage and lazy error context at
 O0/O2 with exact ownership cleanup. A construction root stays alive on failure;
 the completed value receives a separate transferable owner on success.
+Composition fixtures combine scalar enums, nullable payloads and tagged unions
+through snapshots, callbacks and parallel calls. Recursive records combine
+enum fields with nullable links and List cycles; `Maybe<Enum>` distinguishes
+the empty case from an enum's zero tag. C-layout enum fields retain scalar
+storage. Every composition case runs with the same exact cleanup oracle.
 `check-choice-propagation-sanitize` adds ASan/UBSan.
 
 `make check-choice-smoke` runs a quick construction, expression, generic,

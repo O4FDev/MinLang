@@ -236,7 +236,7 @@ function structuralType(tag: Integer, child: Integer): Integer {
 }
 
 function makeListType(child: Integer): Integer {
-    if child < 0 { return structuralType(0, child) }
+    if child < 0 || child >= 999900000 { return structuralType(0, child) }
     if child > 9223372036854675807 { failCompiler("generic type nesting exceeds the supported limit") }
     return 100000 + child
 }
@@ -255,25 +255,88 @@ function isSetType(type: Integer): Boolean { return type < -8 && (-type % 8) == 
 function setElementType(type: Integer): Integer { return structuralChild(type) }
 function makeSetType(element: Integer): Integer { return structuralType(6, element) }
 
+// Enum-key Maps have their own child namespace. Compact nominal enum children
+// so nested enum Maps fit, without changing any ordinary record-key encoding.
+function enumMapChild(type: Integer): Integer {
+    if isEnumType(type) { return 19 + recordTypeIndex(type) }
+    if type >= 19 { return type + 99000 }
+    return type
+}
+
+function enumMapValue(child: Integer): Integer {
+    if child >= 19 && child < 99019 { return 1000000000 + child - 19 }
+    if child >= 99019 { return child - 99000 }
+    return child
+}
+
+// Positive child residues 19..999 are unused by ordinary types. These five
+// Map tags encode record-key/enum-value pairs without enlarging other Maps.
+function recordEnumMapPair(type: Integer): Integer {
+    let tag = -type % 8
+    let index = tag - 1
+    if tag == 7 { index = 4 } else { if tag < 1 || tag > 4 { return -1 } }
+    let child = structuralChild(type)
+    if child < 19 || isEnumType(child) { return -1 }
+    let remainder = child % 100000
+    if remainder < 19 || remainder > 999 { return -1 }
+    if child >= 1000100000 { child = child - 100000 }
+    let pair = (child / 100000 * 981 + remainder - 19) * 5 + index
+    if pair >= 9801000000 { return -1 }
+    return pair
+}
+
 function makeMapType(key: Integer, value: Integer): Integer {
+    if isRecordType(key) && !isEnumType(key) && isEnumType(value) {
+        let pair = recordTypeIndex(key) * 99000 + recordTypeIndex(value)
+        let tag = pair % 5 + 1
+        if tag == 5 { tag = 7 }
+        let rank = pair / 5
+        let child = rank / 981 * 100000 + 19 + rank % 981
+        // Enum nominal IDs occupy one otherwise unused child bucket.
+        if child >= 1000000000 { child = child + 100000 }
+        return structuralType(tag, child)
+    }
     if !isRecordType(key) { return structuralType(key, value) }
-    if value > 576460752303423487 || value < -576460752303423487 { failCompiler("generic type nesting exceeds the supported limit") }
-    let payload = value * 2
-    if value < 0 { payload = -value * 2 - 1 }
-    if payload < 0 || payload > (1152921504606846975 - key) / 100000 { failCompiler("generic type nesting exceeds the supported limit") }
-    return -((payload * 100000 + key) * 8 + 5)
+    let packedKey = key
+    let child = value
+    if isEnumType(key) { child = enumMapChild(value); packedKey = recordTypeIndex(key) % 1000 }
+    if child > 576460752303423487 || child < -576460752303423487 { failCompiler("generic type nesting exceeds the supported limit") }
+    let payload = child * 2
+    if child < 0 { payload = -child * 2 - 1 }
+    let limit = (1152921504606846975 - packedKey) / 100000
+    if isEnumType(key) {
+        let high = recordTypeIndex(key) / 1000
+        if payload < 0 || payload > (limit - high) / 99 { failCompiler("generic type nesting exceeds the supported limit") }
+        payload = payload * 99 + high
+    }
+    if payload < 0 || payload > limit { failCompiler("generic type nesting exceeds the supported limit") }
+    return -((payload * 100000 + packedKey) * 8 + 5)
 }
 
 function mapKeyType(type: Integer): Integer {
-    if (-type % 8) == 5 { return (-type / 8) % 100000 }
+    let pair = recordEnumMapPair(type)
+    if pair >= 0 { return 1000 + pair / 99000 }
+    if (-type % 8) == 5 {
+        let packed = -type / 8
+        let key = packed % 100000
+        if key < 1000 { return 1000000000 + (packed / 100000 % 99) * 1000 + key }
+        return key
+    }
     return -type % 8
 }
 
 function mapValueType(type: Integer): Integer {
+    let pair = recordEnumMapPair(type)
+    if pair >= 0 { return 1000000000 + pair % 99000 }
     if (-type % 8) != 5 { return structuralChild(type) }
-    let payload = -type / 8 / 100000
-    if payload % 2 == 0 { return payload / 2 }
-    return -(payload / 2) - 1
+    let packed = -type / 8
+    let payload = packed / 100000
+    let enumeration = packed % 100000 < 1000
+    if enumeration { payload = payload / 99 }
+    let child = payload / 2
+    if payload % 2 != 0 { child = -child - 1 }
+    if enumeration { return enumMapValue(child) }
+    return child
 }
 
 function isContainerType(type: Integer): Boolean { return isListType(type) || isMapType(type) || isSetType(type) }
@@ -335,6 +398,27 @@ function takeContainerType(kinds: List<Integer>, texts: List<Text>, lines: Sourc
     return code
 }
 
+function nominalTypeForSymbol(lines: SourceMap, index: Integer): Integer {
+    if index < 0 || index >= 99000 { failCompiler("nominal type index exceeds the supported limit") }
+    if index < lines.nominalTypes.length && lines.nominalTypes[index] != 0 { return lines.nominalTypes[index] }
+    return 1000 + index
+}
+
+function attachNominalTypes(lines: SourceMap, kinds: List<Integer>, returns: List<Integer>) {
+    let types: List<Integer> = []
+    let index = 0
+    while index < kinds.length {
+        let type = 0
+        if kinds[index] == 2 {
+            if index >= 99000 { failCompiler("nominal type index exceeds the supported limit") }
+            type = returns[index]
+        }
+        types.add(type)
+        index = index + 1
+    }
+    lines.nominalTypes = types
+}
+
 function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>): Integer {
     let name = tokenTexts[cursor[0]]
     if name == "Callback" && tokenTexts[cursor[0] + 1] == "<" {
@@ -349,7 +433,7 @@ function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
             if record < 0 {
                 failUnknownType(tokenLines, cursor[0], name, tokenKinds, tokenTexts)
             }
-            code = 1000 + record
+            code = nominalTypeForSymbol(tokenLines, record)
         }
         cursor[0] = cursor[0] + 1
     }

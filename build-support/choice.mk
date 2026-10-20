@@ -60,5 +60,12 @@ check-choice-propagation: build/minyarc build/minyar-runtime.o build/tooling/tes
 check-choice-propagation-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-propagation-check
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-propagation-check"
 
-check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation
-check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize
+.PHONY: check-choice-enums check-choice-enums-sanitize
+check-choice-enums: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-enums
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-enums"
+
+check-choice-enums-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-enums
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-enums"
+
+check check-portable: check-choice check-choice-library check-choice-layout check-choice-niche check-choice-propagation check-choice-enums
+check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-choice-niche-sanitize check-choice-propagation-sanitize check-choice-enums-sanitize

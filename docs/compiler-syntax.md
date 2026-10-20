@@ -97,6 +97,36 @@ Folded negative numeric literals span both the minus and the digits.
 Parameter names come from the shared declaration table through that offset;
 later consumers need not read their header tokens.
 
+Payload-free choices retain nominal identity while using LLVM `i64` values.
+Their type codes are `1000000000 + symbol index`; ordinary records use
+`1000 + symbol index`. `recordTypeIndex` recovers either symbol index, and
+`typeForSymbol` reads the nominal representation discovered from the normalized
+choice declaration before signatures are checked. Both namespaces require a
+symbol index below 99000. Semantic record checks include these choices, while
+reference ownership checks exclude them. Constructors emit the case tag;
+matching and derived capabilities operate on that integer directly.
+
+Lists of these choices use the negative structural List encoding, keeping the
+positive List namespace below the nominal choice base. Ordinary containers
+without enums retain their existing encodings and nesting capacity. Scalar choice
+keys use its otherwise unused low-key codes 0..999: the symbol index is split
+into a low remainder and a high quotient, with the quotient packed beside the
+zigzag value using radix 99. Only enum-key Maps compact enum value types into
+19..99018 and shift other positive children above that range; decoding restores
+the nominal identity. Their runtime Map/Set key kind is Integer.
+
+Record-key Maps with a direct enum value use otherwise invalid positive child
+residues 19..999 modulo 100000 under Map tags 1, 2, 3, 4 and 7. The encoder skips
+the enum-ID bucket; `recordEnumMapPair` reverses this escape. The runtime's nested
+Map equality decoder mirrors it. Every two-level record-key Map ending in an
+enum fits within signed i64 for all supported nominal indexes. Type encoding
+still has a finite nesting limit: extreme enum-containing wrapper chains may
+reach it earlier than their former record-valued representation. Ordinary List
+type encodings remain compact through 64 layers.
+
+Cached interfaces use `minyar-module-interface-v8` and deltas use
+`minyar-module-delta-v6`, so earlier pointer-ABI artifacts are rebuilt.
+
 `declarations` lists declarations in source order. `symbolNodes[symbol]`
 finds their node without a scan. Internal callback environment symbols map
 to their closure expression; synthetic symbols without a source declaration
@@ -246,8 +276,8 @@ positions remain scalar offsets and preserve the original valid source line.
 Choice declarations retain every logical payload field for type checking and
 cycle reachability. `choiceLayoutKind(context, type)` identifies an ordinary
 type (0), integer choice (1), tagged union (2), or nullable record choice (3).
-`choiceStorageCount` reports slots owned by the choice itself; nullable choices
-own no slots. `choiceStorageField` maps a union's logical field to its physical
+`choiceStorageCount` reports slots owned by the choice itself; integer and
+nullable choices own no slots. `choiceStorageField` maps a union's logical field to its physical
 slot. Debug readers must inspect the layout kind before using an offset.
 
 For nullable choices, `choiceNicheType` identifies the underlying record and
