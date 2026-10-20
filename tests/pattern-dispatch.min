@@ -4,12 +4,50 @@ use "io" as io
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let levels = ["-O0", "-O2"]
-fixtures.validate("PatternDispatch", ["order", "ownership", "shape"])
+fixtures.validate("PatternDispatch", ["order", "ownership", "shape", "tree", "bounded", "matrix", "products"])
 if fixtures.selected("PatternDispatch", "order") {
     fixtures.executes(frontend, io.readTextFile("tests/pattern-dispatch-order.min"), "ordered dispatch passed\n", levels, 0, "", true)
 }
 if fixtures.selected("PatternDispatch", "ownership") {
     fixtures.executes(frontend, io.readTextFile("tests/patterns/ownership.min"), "kept\nkept\nkept\nfrom guard\nafter false guard\nreturned\ncaptured\nresult kept\nclean\n", levels, 0, "", true)
+}
+if fixtures.selected("PatternDispatch", "matrix") {
+    fixtures.executes(frontend, io.readTextFile("tests/pattern-dispatch-matrix.min"), "matrix dispatch passed\n", levels, 0, "", true)
+}
+if fixtures.selected("PatternDispatch", "products") {
+    fixtures.executes(frontend, io.readTextFile("tests/pattern-dispatch-products.min"), "product dispatch passed\n", levels, 0, "", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Integer> }
+        choice Packet { Wrapped(cell: Cell); Empty }
+        let packet = Wrapped(Cell { value: Some(1) })
+        match packet { Wrapped(Cell(Some(_))) {} Empty {} }
+        """#, "match is missing cases:", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Integer> }
+        choice Packet { Wrapped(cell: Cell); Empty }
+        match Wrapped(Cell { value: Some(1) }) { Wrapped(Cell(Some("wrong"))) {} _ {} }
+        """#, "pattern has the wrong type", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Integer>; other: Text }
+        choice Packet { Wrapped(cell: Cell); Empty }
+        match Wrapped(Cell { value: Some(1); other: "two" }) { Wrapped(Cell(Some(value), value)) {} _ {} }
+        """#, "duplicate pattern binding", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Integer> }
+        record Other { value: Maybe<Integer> }
+        choice Packet { Wrapped(cell: Cell); Empty }
+        match Wrapped(Cell { value: Some(1) }) { Wrapped(Other(Some(_))) {} _ {} }
+        """#, "unknown case", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Integer> }
+        let Cell(Some(value)) = Cell { value: Some(1) }
+        """#, "let pattern can miss", true)
+    fixtures.rejects(frontend, #"""
+        record Cell { value: Maybe<Text> }
+        choice Packet { Wrapped(cell: Cell); Empty }
+        match Wrapped(Cell { value: Some("word") }) { Wrapped(Cell(Some(word))) where false {} _ {} }
+        print(word)
+        """#, "I can't find a value named 'word'", true)
 }
 if fixtures.selected("PatternDispatch", "shape") {
     let source = #"""
@@ -37,6 +75,54 @@ if fixtures.selected("PatternDispatch", "shape") {
     test.check(test.contains(body, "switch i64 "), "choice dispatch needs an actual raw LLVM switch")
     test.check(!test.contains(body, "icmp eq i64"), "disjoint constructor dispatch repeated tag equality tests")
     test.check(!test.contains(body, "@minyar_record_new"), "dispatch allocated a record")
+}
+if fixtures.selected("PatternDispatch", "tree") {
+    let source = #"""
+        function route(value: Maybe<Maybe<Maybe<Integer>>>): Integer {
+            return match value {
+                Some(Some(Some(number))) { number }
+                Some(Some(None)) { -1 }
+                Some(None) { -2 }
+                None { -3 }
+            }
+        }
+        print(route(Some(Some(Some(42)))))
+        print(route(Some(Some(None<Integer>()))))
+        print(route(Some(None<Maybe<Integer>>())))
+        print(route(None<Maybe<Maybe<Integer>>>()))
+        """#
+    fixtures.executes(frontend, source, "42\n-1\n-2\n-3\n", levels, 0, "", true)
+    let body = ""
+    let active = false
+    let switches = 0
+    for line in test.lines(io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")) {
+        if test.contains(line, "define i64 @") && (test.contains(line, ".fn.route(") || test.contains(line, "_route(")) { active = true }
+        if active {
+            body += line + "\n"
+            if test.contains(line, "switch i64 ") { switches += 1 }
+        }
+        if line == "}" { active = false }
+    }
+    test.check(switches == 3, "nested choice discriminants were not shared")
+    test.check(!test.contains(body, "icmp eq i64"), "nested constructor equality chain remains")
+}
+if fixtures.selected("PatternDispatch", "bounded") {
+    let source = "choice Bit { A; B }\nchoice Wide { Value("
+    for index in 0..16 { if index > 0 { source += "," }; source += "field" + Text(index) + ": Bit" }
+    source += ") }\nrecord Trace { guards: Integer }\nfunction reject(trace: Trace): Boolean { trace.guards += 1; return false }\nfunction route(value: Wide, trace: Trace): Integer { return match value {\n"
+    for arm in 0..130 {
+        source += "Value("
+        for index in 0..16 { if index > 0 { source += "," }; source += "A" }
+        source += ") where reject(trace) { -1 }\n"
+    }
+    source += "_ { trace.guards } } }\nlet trace = Trace { guards: 0 }\nprint(route(Value("
+    for index in 0..16 { if index > 0 { source += "," }; source += "A" }
+    source += "),trace))\ntrace.guards = 0\nprint(route(Value("
+    for index in 0..16 { if index > 0 { source += "," }; if index == 15 { source += "B" } else { source += "A" } }
+    source += "),trace))\n"
+    fixtures.executes(frontend, source, "130\n0\n", levels, 0, "", true)
+    let ir = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+    test.check(test.contains(ir, "choice.dispatch.linear."), "bounded tree fallback was not exercised")
 }
 test.removeTree(frontend.compiler.directory)
 print("Pattern dispatch: passed")

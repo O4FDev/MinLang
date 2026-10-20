@@ -33,20 +33,21 @@ if phase not in ("before", "after"):
     raise SystemExit("phase must be before or after")
 if hasattr(os, "sched_getaffinity"):
     os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
-root = Path("build/pattern-dispatch-benchmark")
+root = Path(os.environ.get("PATTERN_DISPATCH_OUTPUT", "build/pattern-dispatch-benchmark"))
 destination = root / phase
 destination.mkdir(parents=True, exist_ok=False)
-fixture = Path("tests/pattern-dispatch-benchmark.min")
+fixture = Path(os.environ.get("PATTERN_DISPATCH_FIXTURE", "tests/pattern-dispatch-benchmark.min"))
+compiler = os.environ.get("PATTERN_DISPATCH_COMPILER", "./build/minyarc")
 clang = os.environ.get("LLVM_CC") or run(["sh", "tools/toolchain.sh", "default-clang"]).strip()
 runtime = root / "runtime.o"
 system = root / "system.o"
 if phase == "before":
     shutil.copy2("build/minyar-runtime.o", runtime)
-    shutil.copy2("build/minyarc", root / "minyarc-before")
+    shutil.copy2(compiler, root / "minyarc-before")
     run([clang, "-O2", "-c", "runtime/native/system.c", "-o", str(system)])
 shutil.copy2(fixture, destination / "fixture.min")
 ir = destination / "dispatch.ll"
-compile_command = ["./build/minyarc", str(fixture), str(ir), "--library", "library"]
+compile_command = [compiler, str(fixture), str(ir), "--library", "library"]
 run(compile_command)
 rounds = int(os.environ.get("PATTERN_DISPATCH_ROUNDS", "4096"))
 seed = 1729
@@ -66,7 +67,11 @@ for folder in ("compiler", "runtime", "bootstrap", "library", "build-support"):
     for path in sorted(Path(folder).rglob("*")):
         if path.is_file():
             report["source_hashes"][str(path)] = digest(path)
-for path in (fixture, Path(__file__), Path("build/minyarc"),
+provenance = os.environ.get("PATTERN_DISPATCH_SOURCE_REPORT")
+if provenance:
+    shutil.copy2(provenance, destination / "compiler-source-report.json")
+    report["compiler_source_report_sha256"] = digest(provenance)
+for path in (fixture, Path(__file__), Path(compiler),
              Path("build/compiler.min"), runtime, system, ir):
     report["source_hashes"][str(path)] = digest(path)
 if phase == "after":

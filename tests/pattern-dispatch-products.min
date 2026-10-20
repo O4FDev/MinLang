@@ -1,0 +1,62 @@
+record Cell { value: Maybe<Maybe<Integer>>; label: Text }
+record Parcel { cell: Cell; fallback: Maybe<Text> }
+record Trace { inputs: Integer; guards: Integer }
+choice Packet { Wrapped(cell: Cell); Empty }
+
+function observed(trace: Trace, value: Packet): Packet { trace.inputs += 1; return value }
+function replace(cell: Cell, trace: Trace): Boolean {
+    trace.guards += 1
+    cell.value = Some(None<Integer>())
+    cell.label = "after"
+    return false
+}
+function unexpected(trace: Trace): Boolean { trace.guards += 100; return true }
+function choose(packet: Packet, alias: Cell, trace: Trace): Text {
+    return match observed(trace, packet) {
+        Wrapped(Cell(Some(Some(0)), before)) where replace(alias, trace) { before }
+        Empty where unexpected(trace) { "wrong case" }
+        Wrapped(Cell(Some(None), label)) { label }
+        Wrapped(Cell(Some(Some(number)), label)) { label + Text(number) }
+        Wrapped(Cell(None, _)) { "none" }
+        Empty { "empty" }
+    }
+}
+function unpack(parcel: Parcel): Text {
+    return match parcel {
+        Parcel(Cell(Some(Some(0)), _), Some("zero")) { "zero" }
+        Parcel(Cell(Some(None), label), _) { label }
+        Parcel(Cell(None, _), Some(fallback)) { fallback }
+        Parcel(Cell(Some(Some(number)), _), _) { Text(number) }
+        _ { "other" }
+    }
+}
+
+for round in 0..100 {
+    let cell = Cell { value: Some(Some(0)); label: "before" }
+    let trace = Trace { inputs: 0; guards: 0 }
+    if choose(Wrapped(cell), cell, trace) != "after" { fail("product guard reused a stale choice projection") }
+    if trace.inputs != 1 || trace.guards != 1 { fail("product input or guard order") }
+    let captured: () -> Text = match Wrapped(cell) {
+        Wrapped(Cell(Some(None), label)) { function() { return label } }
+        _ { function() { return "lost" } }
+    }
+    cell.label = "later"
+    cell.value = None
+    if captured() != "after" { fail("product binding did not survive mutation") }
+    if choose(Wrapped(cell), cell, trace) != "none" { fail("product None fallback") }
+    if trace.inputs != 2 || trace.guards != 1 { fail("incompatible product guard ran") }
+}
+
+let zero = Parcel { cell: Cell { value: Some(Some(0)); label: "label" }; fallback: Some("zero") }
+let missing = Parcel { cell: Cell { value: Some(None<Integer>()); label: "nested" }; fallback: None<Text>() }
+let absent = Parcel { cell: Cell { value: None<Maybe<Integer>>(); label: "label" }; fallback: Some("fallback") }
+let number = Parcel { cell: Cell { value: Some(Some(42)); label: "label" }; fallback: None<Text>() }
+if unpack(zero) != "zero" || unpack(missing) != "nested" || unpack(absent) != "fallback" || unpack(number) != "42" { fail("record root enclosing choices") }
+if zero is Parcel(Cell(Some(Some(value)), _), Some(word)) {
+    if value != 0 || word != "zero" { fail("record conditional bindings") }
+} else { fail("record conditional rejected") }
+let Parcel(cell, fallback) = number
+if cell is Cell(Some(Some(value)), _) {
+    if value != 42 { fail("record destructuring binding") }
+} else { fail("destructured choice rejected") }
+print("product dispatch passed")

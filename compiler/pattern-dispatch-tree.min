@@ -1,0 +1,192 @@
+// Only constructor constraints move into this tree. Literal tests, guards,
+// bindings and unknown pattern kinds retain their original checked emitter.
+record PatternDispatchProjection { parent: Integer; ownerType: Integer; field: Integer; type: Integer; key: Text }
+record PatternDispatchRequirement { projection: Integer; tag: Integer }
+record PatternDispatchRow { requirements: List<PatternDispatchRequirement> }
+record PatternDispatchTree { projections: List<PatternDispatchProjection>; rows: List<PatternDispatchRow>; input: Text; tag: Text; fuel: Integer }
+
+function collectPatternDispatchRequirements(context: CompilerContext, nodes: List<MatchPattern>, node: Integer, projection: Integer, tree: PatternDispatchTree, requirements: List<PatternDispatchRequirement>) {
+    let pattern = nodes[node]
+    if pattern.kind != 1 { return }
+    let cases = choiceMatchCases(context, pattern.type)
+    requirements.add(PatternDispatchRequirement { projection: projection; tag: findText(cases, pattern.name) - 1 })
+    let fields = choiceMatchFields(context, pattern.type, pattern.name)
+    let index = 0
+    while index < fields.length {
+        let child = pattern.children[index]
+        if nodes[child].kind == 1 {
+            let key = tree.projections[projection].key + "/" + pattern.name + ":" + Text(fields[index])
+            let next = -1
+            let position = 0
+            while position < tree.projections.length {
+                if tree.projections[position].key == key { next = position }
+                position = position + 1
+            }
+            if next < 0 {
+                next = tree.projections.length
+                tree.projections.add(PatternDispatchProjection { parent: projection; ownerType: pattern.type; field: fields[index]; type: nodes[child].type; key: key })
+            }
+            collectPatternDispatchRequirements(context, nodes, child, next, tree, requirements)
+        }
+        index = index + 1
+    }
+}
+
+function emitDispatchedPattern(context: CompilerContext, nodes: List<MatchPattern>, node: Integer, input: Text, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, failure: Text, bindingNodes: List<Integer>, bindingValues: List<Text>) {
+    let pattern = nodes[node]
+    if pattern.kind != 1 {
+        emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, bindingValues)
+        return
+    }
+    let fields = choiceMatchFields(context, pattern.type, pattern.name)
+    let index = 0
+    while index < fields.length {
+        let child = pattern.children[index]
+        if nodes[child].kind != 0 || nodes[child].name != "_" {
+            let value = readChoiceMatchPayload(context, output, textState, state, input, pattern.type, fields[index], nodes[child].type)
+            emitDispatchedPattern(context, nodes, child, value, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, bindingValues)
+        }
+        index = index + 1
+    }
+}
+
+function copyPatternDispatchFacts(values: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    let index = 0
+    while index < values.length { result.add(values[index]); index = index + 1 }
+    return result
+}
+
+function copyPatternDispatchValues(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    let index = 0
+    while index < values.length { result.add(values[index]); index = index + 1 }
+    return result
+}
+
+function compatiblePatternDispatchRow(row: PatternDispatchRow, projection: Integer, tag: Integer): Boolean {
+    let index = 0
+    while index < row.requirements.length {
+        let requirement = row.requirements[index]
+        if requirement.projection == projection && requirement.tag != tag { return false }
+        index = index + 1
+    }
+    return true
+}
+
+function patternDispatchProjectionValue(context: CompilerContext, tree: PatternDispatchTree, projection: Integer, values: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>): Text {
+    if values[projection] != "" { return values[projection] }
+    let field = tree.projections[projection]
+    let parent = patternDispatchProjectionValue(context, tree, field.parent, values, output, textState, state)
+    let value = readChoiceMatchPayload(context, output, textState, state, parent, field.ownerType, field.field, field.type)
+    values[projection] = value
+    return value
+}
+
+// Expansion is bounded. The fallback checks the same requirements sequentially;
+// it changes code shape rather than accepted programs or ordering semantics.
+function emitLinearPatternDispatchTree(context: CompilerContext, tree: PatternDispatchTree, dispatch: PatternDispatch, candidates: List<Integer>, facts: List<Integer>, values: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, missing: Text): Text {
+    let label = "choice.dispatch.linear." + Text(newLabel(state))
+    output.add("\n" + label + ":\n")
+    textState[0] = label
+    let row = 0
+    while row < candidates.length {
+        let requirements = tree.rows[candidates[row]].requirements
+        let projected = copyPatternDispatchValues(values)
+        let failure = "choice.dispatch.linear.next." + Text(newLabel(state))
+        let tested = false
+        let index = 0
+        while index < requirements.length {
+            let requirement = requirements[index]
+            if facts[requirement.projection] < 0 {
+                let input = patternDispatchProjectionValue(context, tree, requirement.projection, projected, output, textState, state)
+                let tag = tree.tag
+                if requirement.projection != 0 { tag = readChoiceMatchTag(context, output, textState, state, input, tree.projections[requirement.projection].type) }
+                let condition = emitInstruction(output, textState, state, "icmp eq i64 " + tag + ", " + Text(requirement.tag))
+                matchPatternBranch(output, textState, state, condition, failure)
+                tested = true
+            }
+            index = index + 1
+        }
+        output.add("  br label %" + dispatch.labels[candidates[row]] + "\n")
+        if !tested { return label }
+        output.add("\n" + failure + ":\n")
+        textState[0] = failure
+        row = row + 1
+    }
+    output.add("  br label %" + missing + "\n")
+    return label
+}
+
+function emitPatternDispatchTree(context: CompilerContext, tree: PatternDispatchTree, dispatch: PatternDispatch, candidates: List<Integer>, facts: List<Integer>, values: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, missing: Text): Text {
+    if candidates.length == 0 { return missing }
+    let requirements = tree.rows[candidates[0]].requirements
+    let projection = -1
+    let index = 0
+    while index < requirements.length && projection < 0 {
+        if facts[requirements[index].projection] < 0 { projection = requirements[index].projection }
+        index = index + 1
+    }
+    if projection < 0 { return dispatch.labels[candidates[0]] }
+    if tree.fuel <= 0 { return emitLinearPatternDispatchTree(context, tree, dispatch, candidates, facts, values, output, textState, state, missing) }
+    tree.fuel = tree.fuel - 1
+    let label = "choice.dispatch.tree." + Text(newLabel(state))
+    output.add("\n" + label + ":\n")
+    textState[0] = label
+    let input = patternDispatchProjectionValue(context, tree, projection, values, output, textState, state)
+    let tag = tree.tag
+    if projection != 0 { tag = readChoiceMatchTag(context, output, textState, state, input, tree.projections[projection].type) }
+    let slot = output.length
+    output.add("")
+    let cases = choiceMatchCases(context, tree.projections[projection].type)
+    let code = "  switch i64 " + tag + ", label %" + missing + " [\n"
+    let variant = 0
+    while variant + 1 < cases.length {
+        let specialized: List<Integer> = []
+        index = 0
+        while index < candidates.length {
+            if compatiblePatternDispatchRow(tree.rows[candidates[index]], projection, variant) { specialized.add(candidates[index]) }
+            index = index + 1
+        }
+        let nextFacts = copyPatternDispatchFacts(facts)
+        nextFacts[projection] = variant
+        let target = emitPatternDispatchTree(context, tree, dispatch, specialized, nextFacts, copyPatternDispatchValues(values), output, textState, state, missing)
+        code = code + "    i64 " + Text(variant) + ", label %" + target + "\n"
+        variant = variant + 1
+    }
+    output[slot] = code + "  ]\n"
+    return label
+}
+
+function finishPatternDispatchTree(dispatch: PatternDispatch, context: CompilerContext, nodes: List<MatchPattern>, input: Text, output: List<Text>, textState: List<Text>, state: List<Integer>) {
+    let missing = "choice.dispatch.missing." + Text(newLabel(state))
+    let projections: List<PatternDispatchProjection> = [PatternDispatchProjection { parent: -1; ownerType: 0; field: -1; type: nodes[dispatch.arms[0]].type; key: "root" }]
+    let tree = PatternDispatchTree { projections: projections; rows: []; input: input; tag: dispatch.tag; fuel: 2048 }
+    let arm = 0
+    while arm < dispatch.arms.length {
+        let requirements: List<PatternDispatchRequirement> = []
+        collectPatternDispatchRequirements(context, nodes, dispatch.arms[arm], 0, tree, requirements)
+        tree.rows.add(PatternDispatchRow { requirements: requirements })
+        arm = arm + 1
+    }
+    let index = 0
+    while index < dispatch.slots.length {
+        let facts: List<Integer> = []
+        let values: List<Text> = []
+        let projection = 0
+        while projection < tree.projections.length { facts.add(-1); values.add(""); projection = projection + 1 }
+        facts[0] = dispatch.knownTags[index]
+        values[0] = input
+        let candidates: List<Integer> = []
+        arm = dispatch.starts[index]
+        while arm < dispatch.arms.length {
+            if facts[0] < 0 || compatiblePatternDispatchRow(tree.rows[arm], 0, facts[0]) { candidates.add(arm) }
+            arm = arm + 1
+        }
+        let target = emitPatternDispatchTree(context, tree, dispatch, candidates, facts, values, output, textState, state, missing)
+        output[dispatch.slots[index]] = "  br label %" + target + "\n"
+        index = index + 1
+    }
+    output.add("\n" + missing + ":\n")
+    textState[0] = missing
+}

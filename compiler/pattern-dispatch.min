@@ -23,34 +23,33 @@ function newPatternDispatch(context: CompilerContext, cases: List<Text>, type: I
 }
 
 function emitPatternDispatchArm(dispatch: PatternDispatch, context: CompilerContext, nodes: List<MatchPattern>, node: Integer, input: Text, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, failure: Text, bindingNodes: List<Integer>, bindingValues: List<Text>) {
-    let pattern = nodes[node]
     if dispatch.tag != "" {
         let label = "choice.dispatch.arm." + Text(newLabel(state))
         dispatch.arms.add(node)
         dispatch.labels.add(label)
         output.add("\n" + label + ":\n")
         textState[0] = label
-        if pattern.kind == 1 {
-            // The dispatch edge already established this constructor. Payload
-            // tests still run in their original order and through layout APIs.
-            let fields = choiceMatchFields(context, pattern.type, pattern.name)
-            let field = 0
-            while field < fields.length {
-                let child = pattern.children[field]
-                if nodes[child].kind != 0 || nodes[child].name != "_" {
-                    let value = readChoiceMatchPayload(context, output, textState, state, input, pattern.type, fields[field], nodes[child].type)
-                    emitMatchPattern(context, nodes, child, value, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, bindingValues)
-                }
-                field = field + 1
-            }
-            return
-        }
+        emitDispatchedPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, bindingValues)
+        return
     }
     emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, bindingValues)
 }
 
-function continuePatternDispatch(dispatch: PatternDispatch, nodes: List<MatchPattern>, node: Integer, output: List<Text>) {
+function patternDispatchResidual(nodes: List<MatchPattern>, node: Integer): Boolean {
+    let pattern = nodes[node]
+    if pattern.kind == 0 { return false }
+    if pattern.kind != 1 { return true }
+    let index = 0
+    while index < pattern.children.length {
+        if patternDispatchResidual(nodes, pattern.children[index]) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+function continuePatternDispatch(dispatch: PatternDispatch, nodes: List<MatchPattern>, node: Integer, guarded: Boolean, output: List<Text>) {
     if dispatch.tag == "" { return }
+    if !guarded && !patternDispatchResidual(nodes, node) { output.add("  unreachable\n"); return }
     let known = -1
     if nodes[node].kind == 1 { known = findText(dispatch.cases, nodes[node].name) - 1 }
     dispatch.slots.add(output.length)
@@ -59,41 +58,8 @@ function continuePatternDispatch(dispatch: PatternDispatch, nodes: List<MatchPat
     output.add("")
 }
 
-function patternDispatchTarget(dispatch: PatternDispatch, nodes: List<MatchPattern>, start: Integer, tag: Integer, missing: Text): Text {
-    let index = start
-    while index < dispatch.arms.length {
-        let pattern = nodes[dispatch.arms[index]]
-        if pattern.kind != 1 { return dispatch.labels[index] }
-        if tag >= 0 && pattern.name == dispatch.cases[tag + 1] { return dispatch.labels[index] }
-        index = index + 1
-    }
-    return missing
-}
-
-function finishPatternDispatch(dispatch: PatternDispatch, nodes: List<MatchPattern>, output: List<Text>, textState: List<Text>, state: List<Integer>) {
+function finishPatternDispatch(dispatch: PatternDispatch, context: CompilerContext, nodes: List<MatchPattern>, input: Text, output: List<Text>, textState: List<Text>, state: List<Integer>) {
     if dispatch.tag == "" { return }
-    let missing = "choice.dispatch.missing." + Text(newLabel(state))
-    let index = 0
-    while index < dispatch.slots.length {
-        let start = dispatch.starts[index]
-        let known = dispatch.knownTags[index]
-        let fallback = patternDispatchTarget(dispatch, nodes, start, known, missing)
-        let code = "  br label %" + fallback + "\n"
-        if known < 0 {
-            let entries: List<Text> = []
-            let tag = 0
-            while tag + 1 < dispatch.cases.length {
-                let target = patternDispatchTarget(dispatch, nodes, start, tag, missing)
-                if target != fallback { entries.add("    i64 " + Text(tag) + ", label %" + target + "\n") }
-                tag = tag + 1
-            }
-            if entries.length > 0 {
-                code = "  switch i64 " + dispatch.tag + ", label %" + fallback + " [\n" + joinText(entries) + "  ]\n"
-            }
-        }
-        output[dispatch.slots[index]] = code
-        index = index + 1
-    }
-    output.add("\n" + missing + ":\n")
-    textState[0] = missing
+    if dispatch.arms.length == 0 { return }
+    finishPatternDispatchTree(dispatch, context, nodes, input, output, textState, state)
 }
