@@ -259,7 +259,9 @@ every offset, with sentinel bytes around each store.
 A Bytes method that only reads or updates its own storage, such as
 `holder.bytes.add(value)` or `holder.bytes.setInt32(0, value)`, takes no
 temporary count on a field or element receiver when its arguments make no
-calls: nothing can replace that field before the method returns. Removing that
+calls: nothing can replace that field before the method returns. The same
+holds for `add` on a List whose element type cannot form a cycle, since an
+append retains its argument and releases nothing. Removing that
 count and its cleanup point lets LLVM keep the surrounding loop in registers;
 on the frozen safelibs fixtures it halved zlib decode time (8.10 to 4.21 ms)
 and cut PNG by 27% (13.00 to 9.51 ms). Bytes and List
