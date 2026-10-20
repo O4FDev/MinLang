@@ -75,6 +75,8 @@ check-sanitize: check-peer-edge-retry-sanitize
 
 # CID routing is an actual Redis-backed mTLS/Retry integration on Linux.
 .PHONY: check-peer-edge-cids check-peer-edge-cids-sanitize
+# Stock CID link receipts retain Clang itself; permit files up to 512 MiB here.
+check-peer-edge-cids check-peer-edge-cids-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-peer-edge-cids: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-cids-test build/tooling/tests/peer-edge-cid-stock-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-cids-test --evidence "$(CURDIR)/build/peer-edge-cids-native"
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-cid-stock-test --evidence "$(CURDIR)/build/peer-edge-cid-stock-native"
