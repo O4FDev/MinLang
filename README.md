@@ -13,7 +13,7 @@ The [signed installer and toolchain manager](docs/install.md) keep versions
 side by side in `~/.minyar`, with per-project pins and verified updates. The
 release directory can be tested locally; a public release host is not live yet.
 
-Building from source requires LLVM 23.1.2, a C compiler, Make, zsh, and system
+Building from source requires LLVM 23.1.3, a C compiler, Make, zsh, and system
 C development headers. Follow the [toolchain setup](docs/toolchain.md).
 The source checkout builds the compiler, runtime and link driver on first use.
 

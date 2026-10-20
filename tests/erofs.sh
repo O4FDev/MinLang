@@ -3,7 +3,7 @@ test "$(uname -s)" = Linux
 clang=${MINYAR_TEST_CLANG:-clang-23}
 fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}
 images='plain lz4'
-"$clang" --version | head -1 | grep -F '23.1.2'
+"$clang" --version | head -1 | grep -F '23.1.3'
 mkdir -p build
 work=$(mktemp -d "$PWD/build/erofs-check.XXXXXXXX")
 fallback=''

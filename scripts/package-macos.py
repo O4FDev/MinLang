@@ -13,7 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 
-LLVM_VERSION = "23.1.2"
+LLVM_VERSION = "23.1.3"
 MINIMUM = (14, 0)
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTABLES = [
@@ -60,7 +60,7 @@ def copy(source, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--llvm", required=True, type=Path, help="native LLVM 23.1.2 prefix (clang, lld, dsymutil, lib/clang)")
+    parser.add_argument("--llvm", required=True, type=Path, help="native LLVM 23.1.3 prefix (clang, lld, dsymutil, lib/clang)")
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build/releases")
     parser.add_argument("--no-build", action="store_true", help="audit and package already built release artifacts")
