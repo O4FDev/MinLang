@@ -131,7 +131,7 @@ function warmth(weather: Weather): Integer {
 print(warmth(Weather.Clear))
 ```
 ```diagnostic
-error: match is missing cases: Rain; for example: Rain
+error: match is missing cases: Rain
   --> program.min:3:5
    |
  3 |     match weather { Clear { return 1 } }
