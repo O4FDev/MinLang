@@ -365,6 +365,14 @@ The configuration gallery and programs run at O0/O2 with ownership assertions;
 `check-result-library-sanitize` adds ASan/UBSan. Compatibility getters and native
 status APIs are also exercised by their existing focused suites.
 
+`make check-utf8-validation` compares the public `text.validUTF8` function
+against an independent native scalar-accumulation RFC 3629 oracle at O0/O2.
+It covers every zero-, one- and two-byte buffer, every valid Unicode scalar,
+ASCII block boundaries, malformed and truncated sequences, longer mutations,
+input preservation and representative recoverable decoding. The sanitizer
+variant is `check-utf8-validation-sanitize`; it annotates generated LLVM for
+ASan and instruments the native oracle and runtime with ASan/UBSan.
+
 `make check-unicode-text` checks explicit grapheme boundaries, NFC, canonical
 comparison and full default case folding at O0/O2 with ownership assertions,
 including the Unicode text gallery. `make check-unicode-conformance` checks
