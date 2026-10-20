@@ -93,6 +93,11 @@ Release builds omit Minyar debug metadata. Source stepping and frame inspection
 are most useful in the default debug profile; optimized builds can move or
 remove source-level values.
 
+Full-debug ARM64 links use LLVM's SelectionDAG instruction selector: the pinned
+GlobalISel path loses SSA Boolean locations at O0. This can change debug machine
+code and compilation time. It adds no Minyar LLVM instructions, storage or value
+uses. Line-only and release builds keep their usual selector.
+
 ## Formatter checks
 
 `python3 "tools/debugger/test_formatters.py"` checks corruption bounds, Unicode
