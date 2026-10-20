@@ -100,7 +100,7 @@ report hardware-counter availability and complete source/command identities.
 ## Retained screening result
 
 The first implementation reloaded every object/collector readiness pointer
-after every owner unit. Three retained same-LLVM Linux/LLVM23.1.2 self-compile
+after every owner unit. Three retained same-LLVM Linux/LLVM 23.1.2 self-compile
 samples found default median 15,229,435,422 instructions in the unmodified
 runtime versus 15,617,632,057 with batching: a **2.55% regression**. Eager control
 medians were 4,518,151,437 and 4,518,151,534. Every output matched. This version
@@ -114,12 +114,29 @@ The pending-count version also regressed the ordinary runtime: medians
 4,528,094,690 and 4,528,095,105. All outputs matched. Both ordinary scheduler
 changes are removed.
 
-The same pending-count version in the four-queue cycle runtime reduced the
-20-realm JS creation probe from approximately 173.977M to 163.880M user
-instructions (three retained samples, exact output). The revised candidate
-therefore enables batching **only after a traced allocation activates the
-four-queue scheduler**. The ordinary runtime and the three-queue instantiation
-of the cycle runtime retain their generic dispatch. This restriction is
-recorded before implementation; its complete correctness and seven-sample
-measurements remain required. A separate one-chunk cache experiment is described
-in [temporary-cache.md](temporary-cache.md).
+The broader pending-count version reduced an instrumented 20-realm JS probe
+from approximately 173.977M to 163.880M instructions (three retained samples,
+exact output). That screen justified testing a restriction to the activated
+four-queue scheduler; it is not a shipping JS speedup claim. The ordinary
+runtime and the three-queue cycle instantiation retain generic dispatch.
+
+Final shipping JS ablations find no measurable benefit from the restricted
+batching path in create-probe: baseline 169,402,727; cycle-only 169,402,737;
+cache-only 167,404,883; combined 167,404,976 instructions. Its 1.179% improvement
+comes from chunk reuse, described in [temporary-cache.md](temporary-cache.md).
+
+A separate public-API microstudy deliberately activates the four-queue path
+by constructing, releasing and collecting a genuine traced self-cycle. On
+200,000 eight-owner frames, seven retained samples plus warmup give
+615,178,543→506,578,747 instructions for local owners (-17.653%) and
+535,578,177→432,178,329 for temporary owners (-19.306%). Inactive controls
+are unchanged. All 64 executions have identical checksums; separate
+same-object instrumented links prove full ownership/backing recovery.
+Shipping links disable testing accounting and share one workload object.
+This supports retaining the restricted path, without inferring a product gain.
+
+The full differential matrix compares every work/queue/owner/cycle prefix
+against generic dispatch over system/fixed/lazy heaps, K1/2/7/32/1024, O0/O2,
+native and ASan/UBSan. Activated ordinary object and Text-root arrivals are
+included; stop/charge mutants must fail. Final application measurements and
+their limitations are recorded in [results.md](results.md).
