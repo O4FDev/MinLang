@@ -158,6 +158,11 @@ POLICIES = {
         "A choice of shapes", "12.56636\n",
         "Circle(2.0) selects only the Circle arm. Multiplication by 2.0 twice scales the binary64 literal 3.14159 by four; the documented shortest-roundtrip Float spelling is 12.56636.",
     ),
+    "68ad48206f04": standalone(
+        "Nested patterns with a guard", "",
+        "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
+        reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
+    ),
     "c0407a26360b": contextual(
         "A match that produces a value", "fragment",
         "The Shape choice, its cases and the shape binding are supplied by the previous example, not by this block.",
