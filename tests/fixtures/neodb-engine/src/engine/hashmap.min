@@ -1,0 +1,144 @@
+// Int64 -> Int64 hash map: linear probing over Bytes, backward-shift deletion (no tombstones).
+// Key 0 is reserved internally (stored keys are k+1 shifted); callers may use any key except Integer max.
+use "./values.min" as v
+
+public record IntMap {
+    keys: Bytes      // 8 bytes per slot; 0 = empty, else key + 1
+    vals: Bytes
+    mask: Integer
+    count: Integer
+}
+
+public function newIntMap(capacity: Integer): IntMap {
+    let n = 16
+    while n < capacity * 2 { n = n * 2 }
+    return IntMap { keys: Bytes(n * 8); vals: Bytes(n * 8); mask: n - 1; count: 0 }
+}
+
+function slotOf(m: IntMap, key: Integer): Integer {
+    return v.hashInt(key) & m.mask
+}
+
+// Returns the value, or `missing` when absent.
+public function get(m: IntMap, key: Integer, missing: Integer): Integer {
+    let k = key + 1
+    let i = slotOf(m, key)
+    while true {
+        let s = m.keys.getInt64(i * 8)
+        if s == 0 { return missing }
+        if s == k { return m.vals.getInt64(i * 8) }
+        i = (i + 1) & m.mask
+    }
+}
+
+public function contains(m: IntMap, key: Integer): Boolean {
+    let k = key + 1
+    let i = slotOf(m, key)
+    while true {
+        let s = m.keys.getInt64(i * 8)
+        if s == 0 { return false }
+        if s == k { return true }
+        i = (i + 1) & m.mask
+    }
+}
+
+public function put(m: IntMap, key: Integer, value: Integer) {
+    if (m.count + 1) * 4 > (m.mask + 1) * 3 { grow(m) }
+    let k = key + 1
+    let i = slotOf(m, key)
+    while true {
+        let s = m.keys.getInt64(i * 8)
+        if s == 0 {
+            m.keys.setInt64(i * 8, k)
+            m.vals.setInt64(i * 8, value)
+            m.count += 1
+            return
+        }
+        if s == k {
+            m.vals.setInt64(i * 8, value)
+            return
+        }
+        i = (i + 1) & m.mask
+    }
+}
+
+function grow(m: IntMap) {
+    let oldKeys = m.keys
+    let oldVals = m.vals
+    let n = (m.mask + 1) * 2
+    m.keys = Bytes(n * 8)
+    m.vals = Bytes(n * 8)
+    m.mask = n - 1
+    m.count = 0
+    let i = 0
+    let total = oldKeys.length / 8
+    while i < total {
+        let s = oldKeys.getInt64(i * 8)
+        if s != 0 { put(m, s - 1, oldVals.getInt64(i * 8)) }
+        i += 1
+    }
+}
+
+public function remove(m: IntMap, key: Integer): Boolean {
+    let k = key + 1
+    let i = slotOf(m, key)
+    while true {
+        let s = m.keys.getInt64(i * 8)
+        if s == 0 { return false }
+        if s == k { break }
+        i = (i + 1) & m.mask
+    }
+    // backward shift
+    let j = i
+    while true {
+        j = (j + 1) & m.mask
+        let s = m.keys.getInt64(j * 8)
+        if s == 0 { break }
+        let home = v.hashInt(s - 1) & m.mask
+        // move s to i if home is not in (i, j]
+        let between = false
+        if i <= j {
+            between = home > i && home <= j
+        } else {
+            between = home > i || home <= j
+        }
+        if !between {
+            m.keys.setInt64(i * 8, s)
+            m.vals.setInt64(i * 8, m.vals.getInt64(j * 8))
+            i = j
+        }
+    }
+    m.keys.setInt64(i * 8, 0)
+    m.count -= 1
+    return true
+}
+
+public function clear(m: IntMap) {
+    if m.count == 0 { return }
+    let n = m.mask + 1
+    if n > 1024 {
+        m.keys = Bytes(128 * 8)
+        m.vals = Bytes(128 * 8)
+        m.mask = 127
+    } else {
+        let i = 0
+        while i < n {
+            m.keys.setInt64(i * 8, 0)
+            i += 1
+        }
+    }
+    m.count = 0
+}
+
+// Iteration: slot index API. Returns next occupied slot >= from, or -1.
+public function nextSlot(m: IntMap, from: Integer): Integer {
+    let i = from
+    let n = m.mask + 1
+    while i < n {
+        if m.keys.getInt64(i * 8) != 0 { return i }
+        i += 1
+    }
+    return -1
+}
+public function slotKey(m: IntMap, slot: Integer): Integer { return m.keys.getInt64(slot * 8) - 1 }
+public function slotValue(m: IntMap, slot: Integer): Integer { return m.vals.getInt64(slot * 8) }

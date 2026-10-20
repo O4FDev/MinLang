@@ -1,0 +1,277 @@
+// Data file: <dataDir>/data.db, a page-aligned blob store for table and index images (format v3, ADR-010).
+//
+// Checkpoints write changed pieces of tables into FREE space only (never over a piece a durable manifest
+// references), fdatasync the file, then publish a new manifest (snap-<lsn>.db) that points at them. Space freed by
+// a manifest becomes reusable once that manifest is durable and verified (the caller releases it). After a crash
+// the allocator is rebuilt from the extents the surviving manifest(s) reference; everything else is free.
+//
+// Offsets and lengths are bytes; every extent starts on a PAGE boundary and is rounded up to whole pages.
+// I/O failures are fatal (fail), like the WAL.
+use "../../lib/dbio.min" as dbio
+use "./util.min" as util
+
+public constant PAGE = 4096
+
+public record DataFile {
+    private path: Text
+    private fd: Integer             // -1 until first used
+    private size: Integer           // file size in bytes (as far as we know)
+    private freeOff: Bytes          // i64 per free extent, sorted by offset
+    private freeLen: Bytes          // i64 per free extent
+    private hw: Integer             // high-water mark: allocations beyond it extend the file
+    private ready: Boolean          // allocator initialised
+    private syncer: Integer         // background fdatasync thread while a checkpoint waits for durability (0 none)
+    private syncReq: Integer        // sequence number requested from the syncer
+}
+
+public function open(dataDir: Text): DataFile {
+    return DataFile {
+        path: dataDir + "/data.db"; fd: -1; size: 0; freeOff: Bytes(); freeLen: Bytes(); hw: 0; ready: false
+        syncer: 0; syncReq: 0
+    }
+}
+
+public function exists(d: DataFile): Boolean { return d.fd >= 0 || dbio.pathSize(d.path) >= 0 }
+
+function ensureOpen(d: DataFile): Integer {
+    if d.fd >= 0 { return d.fd }
+    let fd = dbio.open(d.path, dbio.OPEN_WRITE | dbio.OPEN_CREATE)
+    if fd < 0 { util.storageFail("open " + d.path, fd) }
+    let size = dbio.fileSize(fd)
+    if size < 0 { util.storageFail("stat " + d.path, size) }
+    d.fd = fd
+    d.size = size
+    return fd
+}
+
+// Descriptor for positioned reads (opens the file on first use).
+public function fd(d: DataFile): Integer { return ensureOpen(d) }
+public function fileSize(d: DataFile): Integer {
+    ensureOpen(d)
+    return d.size
+}
+public function highWater(d: DataFile): Integer { return d.hw }
+public function isReady(d: DataFile): Boolean { return d.ready }
+
+function pages(len: Integer): Integer { return (len + PAGE - 1) / PAGE * PAGE }
+
+// used: extents referenced by every manifest that may still be read (offsets + lengths, any order).
+public function initAllocator(d: DataFile, usedOff: Bytes, usedLen: Bytes) {
+    let n = usedOff.length / 8
+    // sort extents by offset (insertion sort on an index array is fine: a few thousand extents)
+    let idx: List<Integer> = []
+    for i in 0..n { idx.add(i) }
+    sortByKey(idx, usedOff)
+    d.freeOff = Bytes()
+    d.freeLen = Bytes()
+    let at = 0
+    for i in idx {
+        let o = usedOff.getInt64(i * 8)
+        let l = pages(usedLen.getInt64(i * 8))
+        if o > at {
+            d.freeOff.addInt64(at)
+            d.freeLen.addInt64(o - at)
+        }
+        if o + l > at { at = o + l }
+    }
+    d.hw = at
+    d.ready = true
+}
+
+function sortByKey(idx: List<Integer>, key: Bytes) {
+    // bottom-up merge sort of idx by key[idx[i]]
+    let n = idx.length
+    if n < 2 { return }
+    let src = idx
+    let width = 1
+    while width < n {
+        let dst: List<Integer> = []
+        let lo = 0
+        while lo < n {
+            let mid = min(lo + width, n)
+            let hi = min(lo + 2 * width, n)
+            let i = lo
+            let j = mid
+            while i < mid && j < hi {
+                if key.getInt64(src[i] * 8) <= key.getInt64(src[j] * 8) {
+                    dst.add(src[i])
+                    i += 1
+                } else {
+                    dst.add(src[j])
+                    j += 1
+                }
+            }
+            while i < mid {
+                dst.add(src[i])
+                i += 1
+            }
+            while j < hi {
+                dst.add(src[j])
+                j += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width = width * 2
+    }
+    for i in 0..n { idx[i] = src[i] }
+}
+
+// Page-aligned space for len bytes: first fit among free extents, else at the high-water mark.
+public function alloc(d: DataFile, len: Integer): Integer {
+    if !d.ready { fail("storage: data file allocator not initialised") }
+    let need = pages(max(len, 1))
+    let n = d.freeOff.length / 8
+    let i = 0
+    while i < n {
+        let l = d.freeLen.getInt64(i * 8)
+        if l >= need {
+            let o = d.freeOff.getInt64(i * 8)
+            if l == need {
+                removeAt(d.freeOff, i)
+                removeAt(d.freeLen, i)
+            } else {
+                d.freeOff.setInt64(i * 8, o + need)
+                d.freeLen.setInt64(i * 8, l - need)
+            }
+            return o
+        }
+        i += 1
+    }
+    let o = d.hw
+    d.hw = o + need
+    return o
+}
+
+// Returns an extent to the free list (call only once no durable manifest references it).
+public function release(d: DataFile, off: Integer, len: Integer) {
+    if !d.ready || len <= 0 { return }
+    let l = pages(len)
+    let n = d.freeOff.length / 8
+    // position: first free extent with offset > off
+    let i = 0
+    while i < n && d.freeOff.getInt64(i * 8) < off { i += 1 }
+    insertAt(d.freeOff, i, off)
+    insertAt(d.freeLen, i, l)
+    n += 1
+    // merge with the next extent
+    if i + 1 < n && off + l == d.freeOff.getInt64((i + 1) * 8) {
+        d.freeLen.setInt64(i * 8, l + d.freeLen.getInt64((i + 1) * 8))
+        removeAt(d.freeOff, i + 1)
+        removeAt(d.freeLen, i + 1)
+        n -= 1
+    }
+    // merge with the previous extent
+    if i > 0 && d.freeOff.getInt64((i - 1) * 8) + d.freeLen.getInt64((i - 1) * 8) == off {
+        d.freeLen.setInt64((i - 1) * 8, d.freeLen.getInt64((i - 1) * 8) + d.freeLen.getInt64(i * 8))
+        removeAt(d.freeOff, i)
+        removeAt(d.freeLen, i)
+        n -= 1
+    }
+    // a free extent that reaches the high-water mark lowers it
+    if n > 0 && d.freeOff.getInt64((n - 1) * 8) + d.freeLen.getInt64((n - 1) * 8) >= d.hw {
+        d.hw = d.freeOff.getInt64((n - 1) * 8)
+        removeAt(d.freeOff, n - 1)
+        removeAt(d.freeLen, n - 1)
+    }
+}
+
+function insertAt(b: Bytes, i: Integer, x: Integer) {
+    let n = b.length / 8
+    b.addInt64(0)
+    let j = n
+    while j > i {
+        b.setInt64(j * 8, b.getInt64((j - 1) * 8))
+        j -= 1
+    }
+    b.setInt64(i * 8, x)
+}
+
+function removeAt(b: Bytes, i: Integer) {
+    let n = b.length / 8
+    let j = i
+    while j + 1 < n {
+        b.setInt64(j * 8, b.getInt64((j + 1) * 8))
+        j += 1
+    }
+    b.resize((n - 1) * 8)
+}
+
+public function freeBytes(d: DataFile): Integer {
+    let total = 0
+    let n = d.freeOff.length / 8
+    for i in 0..n { total += d.freeLen.getInt64(i * 8) }
+    return total
+}
+
+public function write(d: DataFile, off: Integer, data: Bytes, from: Integer, len: Integer) {
+    let fd = ensureOpen(d)
+    let n = dbio.pwrite(fd, data, from, len, off)
+    if n < 0 { util.storageFail("write " + d.path, n) }
+    if off + len > d.size { d.size = off + len }
+}
+
+// Appends file bytes [off, off + len) to buf; fails on I/O errors and short reads.
+public function readAppend(d: DataFile, off: Integer, buf: Bytes, len: Integer) {
+    let fd = ensureOpen(d)
+    let n = dbio.preadAppend(fd, off, buf, len)
+    if n < 0 { util.storageFail("read " + d.path, n) }
+    if n != len {
+        fail("storage: short read of " + d.path + " at " + Text(off) + " (" + Text(n) + " of " + Text(len) +
+             " bytes): the data file is truncated")
+    }
+}
+
+// Blocking fdatasync (used at close and by synchronous checkpoints).
+public function sync(d: DataFile) {
+    if d.fd < 0 { return }
+    let rc = dbio.fdatasync(d.fd)
+    if rc < 0 { util.storageFail("fdatasync " + d.path, rc) }
+}
+
+// Background fdatasync: start(), then poll synced() from later slices of work.
+public function syncStart(d: DataFile) {
+    let fd = ensureOpen(d)
+    if d.syncer == 0 {
+        let h = dbio.syncerStart(fd)
+        if h < 0 { util.storageFail("start data syncer", h) }
+        d.syncer = h
+    }
+    d.syncReq += 1
+    let rc = dbio.syncerRequest(d.syncer, d.syncReq)
+    if rc < 0 { util.storageFail("data syncer request", rc) }
+}
+
+public function synced(d: DataFile): Boolean {
+    if d.syncer == 0 { return true }
+    let err = dbio.syncerError(d.syncer)
+    if err != 0 { util.storageFail("fdatasync " + d.path, err) }
+    return dbio.syncerSyncedOffset(d.syncer) >= d.syncReq
+}
+
+public function syncStop(d: DataFile) {
+    if d.syncer != 0 {
+        let rc = dbio.syncerStop(d.syncer)
+        d.syncer = 0
+        if rc < 0 { util.storageFail("fdatasync " + d.path, rc) }
+    }
+}
+
+// Shrink the file to the high-water mark once enough of its tail is free (no durability needed: space past the
+// high-water mark is unreferenced).
+public function trimTail(d: DataFile) {
+    if d.fd < 0 || !d.ready { return }
+    if d.size > d.hw + 8 * 1048576 || (d.size > d.hw && d.hw == 0) {
+        let rc = dbio.ftruncate(d.fd, d.hw)
+        if rc < 0 { util.storageFail("ftruncate " + d.path, rc) }
+        d.size = d.hw
+    }
+}
+
+public function close(d: DataFile) {
+    syncStop(d)
+    if d.fd >= 0 {
+        dbio.close(d.fd)
+        d.fd = -1
+    }
+}

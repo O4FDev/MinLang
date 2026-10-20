@@ -1,0 +1,2300 @@
+// Arbitrary-precision NUMERIC (Postgres numeric.c semantics) for values that do not fit the engine's scaled
+// Int64 fast path: more than 18 digits, scale above 18, NaN and +/-Infinity.
+// A Num is base-10000 digits (most significant first, no leading/trailing zero digits), the weight of the first
+// digit, the display scale, and a sign. Operations are pure (inputs are never modified). Result scales follow
+// Postgres (select_div_scale, sqrt/ln/exp/power rules); intermediate results are exact or correctly rounded.
+// Errors are reported through NErr (callers turn them into SQLSTATEs); the process never stops on bad input.
+
+use "math" as math
+public constant NBASE = 10000
+public constant NPOS = 0
+public constant NNEG = 1
+public constant NNAN = 2
+public constant NPINF = 3
+public constant NNINF = 4
+public constant MIN_SIG_DIGITS = 16
+public constant MAX_DISPLAY_SCALE = 1000
+public constant MAX_RESULT_SCALE = 2000
+public constant DSCALE_MAX = 16383
+public constant WEIGHT_MAX = 32767
+// work limits (digits of NBASE) that keep hostile inputs bounded in time and memory
+public constant MAX_WORK_DIGITS = 40000
+
+public record Num {
+    sign: Integer
+    weight: Integer
+    dscale: Integer
+    digits: List<Integer>
+}
+
+public record NErr {
+    err: Boolean
+    code: Text
+    msg: Text
+}
+
+public function newErr(): NErr {
+    return NErr { err: false; code: ""; msg: "" }
+}
+
+public function setErr(e: NErr, code: Text, msg: Text) {
+    if e.err { return }
+    e.err = true
+    e.code = code
+    e.msg = msg
+}
+
+record BDiv {
+    q: List<Integer>
+    r: List<Integer>
+}
+
+// ---------------------------------------------------------------- constructors
+
+public function zero(dscale: Integer): Num {
+    return Num { sign: NPOS; weight: 0; dscale: dscale; digits: [] }
+}
+
+public function nan(): Num {
+    return Num { sign: NNAN; weight: 0; dscale: 0; digits: [] }
+}
+
+public function pinf(): Num {
+    return Num { sign: NPINF; weight: 0; dscale: 0; digits: [] }
+}
+
+public function ninf(): Num {
+    return Num { sign: NNINF; weight: 0; dscale: 0; digits: [] }
+}
+
+public function one(): Num {
+    return Num { sign: NPOS; weight: 0; dscale: 0; digits: [1] }
+}
+
+public function isSpecial(x: Num): Boolean { return x.sign >= NNAN }
+public function isNaN(x: Num): Boolean { return x.sign == NNAN }
+public function isInf(x: Num): Boolean { return x.sign == NPINF || x.sign == NNINF }
+public function isZero(x: Num): Boolean { return x.sign < NNAN && x.digits.length == 0 }
+
+// -1, 0, 1 (NaN -> 0; infinities -> +/-1)
+public function signOf(x: Num): Integer {
+    if x.sign == NNAN { return 0 }
+    if x.sign == NPINF { return 1 }
+    if x.sign == NNINF { return -1 }
+    if x.digits.length == 0 { return 0 }
+    if x.sign == NNEG { return -1 }
+    return 1
+}
+
+// Build a Num from digits d[lo, hi) whose first digit has weight `weight`; strips zero digits.
+function build(sign: Integer, weight: Integer, dscale: Integer, d: List<Integer>, lo: Integer, hi: Integer): Num {
+    let w = weight
+    let a = lo
+    let b = hi
+    while a < b && d[a] == 0 {
+        a += 1
+        w -= 1
+    }
+    while b > a && d[b - 1] == 0 { b -= 1 }
+    if a >= b { return zero(dscale) }
+    let out: List<Integer> = []
+    let i = a
+    while i < b {
+        out.add(d[i])
+        i += 1
+    }
+    return Num { sign: sign; weight: w; dscale: dscale; digits: out }
+}
+
+// Strip leading/trailing zero digits (values built from external input).
+public function normalized(x: Num): Num {
+    if isSpecial(x) { return x }
+    return build(x.sign, x.weight, x.dscale, x.digits, 0, x.digits.length)
+}
+
+public function fromInt(v: Integer): Num {
+    if v == 0 { return zero(0) }
+    let neg = v < 0
+    let d: List<Integer> = []
+    // collect least significant first, working on the negative side (no overflow at INT64_MIN)
+    let x = v
+    if x > 0 { x = -x }
+    while x != 0 {
+        d.add(-(x % NBASE))
+        x = x / NBASE
+    }
+    let r: List<Integer> = []
+    let i = d.length - 1
+    while i >= 0 {
+        r.add(d[i])
+        i -= 1
+    }
+    let s = NPOS
+    if neg { s = NNEG }
+    return build(s, r.length - 1, 0, r, 0, r.length)
+}
+
+// Unscaled Int64 with a decimal scale (the engine's fast representation).
+public function fromScaledInt(v: Integer, scale: Integer): Num {
+    let x = fromInt(v)
+    if scale <= 0 {
+        if x.digits.length == 0 { return zero(0) }
+        let m = mulPow10Num(x, -scale)
+        m.dscale = 0
+        return m
+    }
+    // value = v * 10^-scale: shift the digits right by `scale` decimal places
+    let r = shiftDec(x, -scale)
+    r.dscale = scale
+    return r
+}
+
+// x * 10^k (k may be negative); exact. dscale is kept.
+function shiftDec(x: Num, k: Integer): Num {
+    if x.digits.length == 0 || k == 0 { return Num { sign: x.sign; weight: x.weight; dscale: x.dscale; digits: x.digits } }
+    // move by whole NBASE digits plus a small multiplier
+    let whole = k / 4
+    let rem = k % 4
+    if rem < 0 {
+        rem += 4
+        whole -= 1
+    }
+    let m = 1
+    let i = 0
+    while i < rem {
+        m = m * 10
+        i += 1
+    }
+    let prod = bmulSmall(x.digits, m)
+    // prod (integer digits) has weight x.weight + (prod.length - x.digits.length) relative to x's first digit
+    let w = x.weight + (prod.length - x.digits.length) + whole
+    return build(x.sign, w, x.dscale, prod, 0, prod.length)
+}
+
+function mulPow10Num(x: Num, k: Integer): Num {
+    return shiftDec(x, k)
+}
+
+// ---------------------------------------------------------------- big naturals (base 10000, msd first)
+
+function bnorm(a: List<Integer>): List<Integer> {
+    let i = 0
+    while i < a.length && a[i] == 0 { i += 1 }
+    if i == 0 { return a }
+    let r: List<Integer> = []
+    while i < a.length {
+        r.add(a[i])
+        i += 1
+    }
+    return r
+}
+
+function bcmp(a: List<Integer>, b: List<Integer>): Integer {
+    if a.length != b.length {
+        if a.length < b.length { return -1 }
+        return 1
+    }
+    let i = 0
+    while i < a.length {
+        if a[i] != b[i] {
+            if a[i] < b[i] { return -1 }
+            return 1
+        }
+        i += 1
+    }
+    return 0
+}
+
+function badd(a: List<Integer>, b: List<Integer>): List<Integer> {
+    let n = a.length
+    if b.length > n { n = b.length }
+    let tmp: List<Integer> = []
+    let i = 0
+    while i <= n {
+        tmp.add(0)
+        i += 1
+    }
+    let carry = 0
+    let ia = a.length - 1
+    let ib = b.length - 1
+    let k = n
+    while k >= 1 {
+        let s = carry
+        if ia >= 0 { s += a[ia] }
+        if ib >= 0 { s += b[ib] }
+        if s >= NBASE {
+            tmp[k] = s - NBASE
+            carry = 1
+        } else {
+            tmp[k] = s
+            carry = 0
+        }
+        ia -= 1
+        ib -= 1
+        k -= 1
+    }
+    tmp[0] = carry
+    return bnorm(tmp)
+}
+
+// a - b with a >= b
+function bsub(a: List<Integer>, b: List<Integer>): List<Integer> {
+    let tmp: List<Integer> = []
+    let i = 0
+    while i < a.length {
+        tmp.add(0)
+        i += 1
+    }
+    let borrow = 0
+    let ia = a.length - 1
+    let ib = b.length - 1
+    while ia >= 0 {
+        let s = a[ia] - borrow
+        if ib >= 0 { s -= b[ib] }
+        if s < 0 {
+            tmp[ia] = s + NBASE
+            borrow = 1
+        } else {
+            tmp[ia] = s
+            borrow = 0
+        }
+        ia -= 1
+        ib -= 1
+    }
+    return bnorm(tmp)
+}
+
+// a * m, 0 <= m <= 1e9
+function bmulSmall(a: List<Integer>, m: Integer): List<Integer> {
+    if m == 0 || a.length == 0 {
+        let z: List<Integer> = []
+        return z
+    }
+    if m == 1 { return a }
+    let rev: List<Integer> = []
+    let carry = 0
+    let i = a.length - 1
+    while i >= 0 {
+        let p = a[i] * m + carry
+        rev.add(p % NBASE)
+        carry = p / NBASE
+        i -= 1
+    }
+    while carry > 0 {
+        rev.add(carry % NBASE)
+        carry = carry / NBASE
+    }
+    let r: List<Integer> = []
+    i = rev.length - 1
+    while i >= 0 {
+        r.add(rev[i])
+        i -= 1
+    }
+    return bnorm(r)
+}
+
+function bmul(a: List<Integer>, b: List<Integer>): List<Integer> {
+    if a.length == 0 || b.length == 0 {
+        let z: List<Integer> = []
+        return z
+    }
+    if a.length == 1 { return bmulSmall(b, a[0]) }
+    if b.length == 1 { return bmulSmall(a, b[0]) }
+    let n = a.length + b.length
+    let acc: List<Integer> = []
+    let i = 0
+    while i < n {
+        acc.add(0)
+        i += 1
+    }
+    // acc[i + j + 1] += a[i] * b[j]; normalise every 1000 rows to keep accumulators far from overflow
+    i = a.length - 1
+    let rows = 0
+    while i >= 0 {
+        let ai = a[i]
+        if ai != 0 {
+            let j = b.length - 1
+            while j >= 0 {
+                acc[i + j + 1] = acc[i + j + 1] + ai * b[j]
+                j -= 1
+            }
+        }
+        rows += 1
+        if rows >= 1000 {
+            carryNorm(acc)
+            rows = 0
+        }
+        i -= 1
+    }
+    carryNorm(acc)
+    return bnorm(acc)
+}
+
+function carryNorm(acc: List<Integer>) {
+    let carry = 0
+    let k = acc.length - 1
+    while k >= 0 {
+        let s = acc[k] + carry
+        acc[k] = s % NBASE
+        carry = s / NBASE
+        k -= 1
+    }
+}
+
+// floor(a / m), remainder in out[0]; 1 <= m <= 1e9
+function bdivSmall(a: List<Integer>, m: Integer, remOut: List<Integer>): List<Integer> {
+    let q: List<Integer> = []
+    let r = 0
+    let i = 0
+    while i < a.length {
+        let cur = r * NBASE + a[i]
+        q.add(cur / m)
+        r = cur % m
+        i += 1
+    }
+    remOut[0] = r
+    return bnorm(q)
+}
+
+function bshift(a: List<Integer>, k: Integer): List<Integer> {
+    // a * NBASE^k, k >= 0
+    if a.length == 0 || k <= 0 { return a }
+    let r: List<Integer> = []
+    for x in a { r.add(x) }
+    let i = 0
+    while i < k {
+        r.add(0)
+        i += 1
+    }
+    return r
+}
+
+// Knuth algorithm D; b non-empty.
+function bdivmod(u: List<Integer>, v: List<Integer>): BDiv {
+    if bcmp(u, v) < 0 {
+        let z: List<Integer> = []
+        return BDiv { q: z; r: u }
+    }
+    if v.length == 1 {
+        let rem: List<Integer> = [0]
+        let q = bdivSmall(u, v[0], rem)
+        let r: List<Integer> = []
+        if rem[0] != 0 { r.add(rem[0]) }
+        return BDiv { q: q; r: r }
+    }
+    let d = NBASE / (v[0] + 1)
+    let un: List<Integer> = [0]
+    let us = bmulSmall(u, d)
+    // keep un at length u.length + 1
+    let pad = u.length - us.length
+    let i = 0
+    while i < pad {
+        un.add(0)
+        i += 1
+    }
+    for x in us { un.add(x) }
+    let vn = bmulSmall(v, d)
+    let n = vn.length
+    let m = un.length - n
+    let q: List<Integer> = []
+    i = 0
+    while i < m {
+        q.add(0)
+        i += 1
+    }
+    let v0 = vn[0]
+    let v1 = vn[1]
+    let j = 0
+    while j < m {
+        let num = un[j] * NBASE + un[j + 1]
+        let qhat = num / v0
+        let rhat = num % v0
+        while true {
+            if qhat >= NBASE || qhat * v1 > rhat * NBASE + un[j + 2] {
+                qhat -= 1
+                rhat += v0
+                if rhat < NBASE { continue }
+            }
+            break
+        }
+        if qhat > 0 {
+            let borrow = 0
+            let carry = 0
+            let k = n - 1
+            while k >= 0 {
+                let prod = qhat * vn[k] + carry
+                carry = prod / NBASE
+                let t = un[j + 1 + k] - (prod - carry * NBASE) - borrow
+                if t < 0 {
+                    t += NBASE
+                    borrow = 1
+                } else {
+                    borrow = 0
+                }
+                un[j + 1 + k] = t
+                k -= 1
+            }
+            let top = un[j] - carry - borrow
+            if top < 0 {
+                qhat -= 1
+                let c2 = 0
+                k = n - 1
+                while k >= 0 {
+                    let s = un[j + 1 + k] + vn[k] + c2
+                    if s >= NBASE {
+                        s -= NBASE
+                        c2 = 1
+                    } else {
+                        c2 = 0
+                    }
+                    un[j + 1 + k] = s
+                    k -= 1
+                }
+                top = 0
+            }
+            un[j] = top
+        }
+        q[j] = qhat
+        j += 1
+    }
+    let r: List<Integer> = []
+    i = m
+    while i < un.length {
+        r.add(un[i])
+        i += 1
+    }
+    let rem: List<Integer> = [0]
+    let rr = bdivSmall(bnorm(r), d, rem)
+    return BDiv { q: bnorm(q), r: rr }
+}
+
+// floor(sqrt(n))
+function bisqrt(n: List<Integer>): List<Integer> {
+    if n.length == 0 { return n }
+    // initial overestimate from the leading digits in floating point
+    let lead = Float(n[0])
+    let k = 1
+    if n.length > 1 {
+        lead = lead * 10000.0 + Float(n[1])
+        k = 2
+    }
+    if n.length > 2 {
+        lead = lead * 10000.0 + Float(n[2])
+        k = 3
+    }
+    // n ~ lead * NBASE^(len - k)
+    let e = n.length - k
+    let x: List<Integer> = []
+    if e % 2 == 0 {
+        let s = math.sqrt(lead) + 1.0
+        x = bshift(fromFloatInt(s), e / 2)
+    } else {
+        let s = math.sqrt(lead * 10000.0) + 1.0
+        x = bshift(fromFloatInt(s), (e - 1) / 2)
+    }
+    x = badd(x, [1])
+    // one Newton step from any positive start lands at or above isqrt(n); then it decreases to it
+    let rm0: List<Integer> = [0]
+    x = bdivSmall(badd(x, bdivmod(n, x).q), 2, rm0)
+    if x.length == 0 { x = [1] }
+    let iter = 0
+    while iter < 200 {
+        let dv = bdivmod(n, x)
+        let s = badd(x, dv.q)
+        let rem: List<Integer> = [0]
+        let y = bdivSmall(s, 2, rem)
+        if bcmp(y, x) >= 0 { break }
+        x = y
+        iter += 1
+    }
+    // fix up: ensure x*x <= n < (x+1)^2
+    while bcmp(bmul(x, x), n) > 0 { x = bsub(x, [1]) }
+    while true {
+        let x1 = badd(x, [1])
+        if bcmp(bmul(x1, x1), n) <= 0 {
+            x = x1
+        } else {
+            break
+        }
+    }
+    return x
+}
+
+// Positive integral Float (< 2^63) -> big natural
+function fromFloatInt(f: Float): List<Integer> {
+    let r: List<Integer> = []
+    if f < 1.0 { return r }
+    let v = 0
+    if f >= 9.0e18 { v = 9000000000000000000 } else { v = Integer(f) }
+    let rev: List<Integer> = []
+    while v > 0 {
+        rev.add(v % NBASE)
+        v = v / NBASE
+    }
+    let i = rev.length - 1
+    while i >= 0 {
+        r.add(rev[i])
+        i -= 1
+    }
+    return r
+}
+
+// ---------------------------------------------------------------- scaled view: |x| = digits * NBASE^-s4
+
+function s4Of(x: Num): Integer {
+    return x.digits.length - 1 - x.weight
+}
+
+function fromNat(neg: Boolean, nat: List<Integer>, s4: Integer, dscale: Integer): Num {
+    let s = NPOS
+    if neg { s = NNEG }
+    if nat.length == 0 { return zero(dscale) }
+    return build(s, nat.length - 1 - s4, dscale, nat, 0, nat.length)
+}
+
+// nat aligned to scale s4 (s4 >= own scale): append zero digits
+function natAt(x: Num, s4: Integer): List<Integer> {
+    return bshift(x.digits, s4 - s4Of(x))
+}
+
+// ---------------------------------------------------------------- comparisons
+
+public function cmpAbs(a: Num, b: Num): Integer {
+    if a.digits.length == 0 {
+        if b.digits.length == 0 { return 0 }
+        return -1
+    }
+    if b.digits.length == 0 { return 1 }
+    if a.weight != b.weight {
+        if a.weight < b.weight { return -1 }
+        return 1
+    }
+    let i = 0
+    while i < a.digits.length && i < b.digits.length {
+        if a.digits[i] != b.digits[i] {
+            if a.digits[i] < b.digits[i] { return -1 }
+            return 1
+        }
+        i += 1
+    }
+    if a.digits.length == b.digits.length { return 0 }
+    if a.digits.length < b.digits.length { return -1 }
+    return 1
+}
+
+// Total order of Postgres: -Inf < finite < +Inf < NaN; NaN = NaN.
+public function cmp(a: Num, b: Num): Integer {
+    let ra = rank(a)
+    let rb = rank(b)
+    if ra != rb {
+        if ra < rb { return -1 }
+        return 1
+    }
+    if ra != 1 { return 0 }
+    let sa = signOf(a)
+    let sb = signOf(b)
+    if sa != sb {
+        if sa < sb { return -1 }
+        return 1
+    }
+    let c = cmpAbs(a, b)
+    if sa < 0 { return -c }
+    return c
+}
+
+function rank(x: Num): Integer {
+    if x.sign == NNINF { return 0 }
+    if x.sign == NPINF { return 2 }
+    if x.sign == NNAN { return 3 }
+    return 1
+}
+
+// ---------------------------------------------------------------- arithmetic (finite)
+
+function maxI(a: Integer, b: Integer): Integer {
+    if a > b { return a }
+    return b
+}
+
+function minI(a: Integer, b: Integer): Integer {
+    if a < b { return a }
+    return b
+}
+
+function addFinite(a: Num, b: Num, negateB: Boolean): Num {
+    let ds = maxI(a.dscale, b.dscale)
+    let bneg = b.sign == NNEG
+    if negateB { bneg = !bneg }
+    if b.digits.length == 0 { return Num { sign: a.sign; weight: a.weight; dscale: ds; digits: a.digits } }
+    if a.digits.length == 0 {
+        let s = NPOS
+        if bneg { s = NNEG }
+        return Num { sign: s; weight: b.weight; dscale: ds; digits: b.digits }
+    }
+    let s4 = maxI(s4Of(a), s4Of(b))
+    let na = natAt(a, s4)
+    let nb = natAt(b, s4)
+    let aneg = a.sign == NNEG
+    if aneg == bneg { return fromNat(aneg, badd(na, nb), s4, ds) }
+    let c = bcmp(na, nb)
+    if c == 0 { return zero(ds) }
+    if c > 0 { return fromNat(aneg, bsub(na, nb), s4, ds) }
+    return fromNat(bneg, bsub(nb, na), s4, ds)
+}
+
+public function add(a: Num, b: Num): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if a.sign == NPINF {
+            if b.sign == NNINF { return nan() }
+            return pinf()
+        }
+        if a.sign == NNINF {
+            if b.sign == NPINF { return nan() }
+            return ninf()
+        }
+        if b.sign == NPINF { return pinf() }
+        return ninf()
+    }
+    return addFinite(a, b, false)
+}
+
+public function sub(a: Num, b: Num): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if a.sign == NPINF {
+            if b.sign == NPINF { return nan() }
+            return pinf()
+        }
+        if a.sign == NNINF {
+            if b.sign == NNINF { return nan() }
+            return ninf()
+        }
+        if b.sign == NPINF { return ninf() }
+        return pinf()
+    }
+    return addFinite(a, b, true)
+}
+
+// exact product (dscale = sum of dscales)
+function mulExact(a: Num, b: Num): Num {
+    let ds = a.dscale + b.dscale
+    if a.digits.length == 0 || b.digits.length == 0 { return zero(ds) }
+    let prod = bmul(a.digits, b.digits)
+    let neg = (a.sign == NNEG) != (b.sign == NNEG)
+    return fromNat(neg, prod, s4Of(a) + s4Of(b), ds)
+}
+
+// product rounded to rscale
+public function mulScale(a: Num, b: Num, rscale: Integer): Num {
+    let p = mulExact(a, b)
+    return roundTo(p, rscale)
+}
+
+public function mul(a: Num, b: Num): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if isInf(a) {
+            let s = signOf(b)
+            if s == 0 { return nan() }
+            if (s > 0) == (a.sign == NPINF) { return pinf() }
+            return ninf()
+        }
+        let s = signOf(a)
+        if s == 0 { return nan() }
+        if (s > 0) == (b.sign == NPINF) { return pinf() }
+        return ninf()
+    }
+    return mulExact(a, b)
+}
+
+// Quotient a / b (b != 0, finite), truncated (round=false) or rounded half away from zero to rscale.
+public function divScale(a: Num, b: Num, rscale: Integer, round: Boolean): Num {
+    if a.digits.length == 0 { return zero(maxI(rscale, 0)) }
+    // NBASE fractional digits: enough for rscale + 1 exact decimal digits
+    let k = (rscale + 1 + 3) / 4 + 1
+    if rscale + 1 + 3 < 0 { k = -((-(rscale + 1 + 3)) / 4) }
+    let e = s4Of(b) - s4Of(a) + k
+    let q: List<Integer> = []
+    if e >= 0 {
+        q = bdivmod(bshift(a.digits, e), b.digits).q
+    } else {
+        q = bdivmod(a.digits, bshift(b.digits, -e)).q
+    }
+    let neg = (a.sign == NNEG) != (b.sign == NNEG)
+    let r = fromNat(neg, q, k, rscale)
+    if round { return roundTo(r, rscale) }
+    return truncTo(r, rscale)
+}
+
+// Postgres select_div_scale.
+public function selectDivScale(a: Num, b: Num): Integer {
+    let w1 = 0
+    let f1 = 0
+    if a.digits.length > 0 {
+        w1 = a.weight
+        f1 = a.digits[0]
+    }
+    let w2 = 0
+    let f2 = 0
+    if b.digits.length > 0 {
+        w2 = b.weight
+        f2 = b.digits[0]
+    }
+    let qweight = w1 - w2
+    if f1 <= f2 { qweight -= 1 }
+    let rscale = MIN_SIG_DIGITS - qweight * 4
+    rscale = maxI(rscale, a.dscale)
+    rscale = maxI(rscale, b.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    return rscale
+}
+
+public function div(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if isInf(a) {
+            if isSpecial(b) { return nan() }
+            let s = signOf(b)
+            if s == 0 {
+                setErr(e, "22012", "division by zero")
+                return nan()
+            }
+            if (s > 0) == (a.sign == NPINF) { return pinf() }
+            return ninf()
+        }
+        return zero(0)
+    }
+    if b.digits.length == 0 {
+        setErr(e, "22012", "division by zero")
+        return nan()
+    }
+    if tooBig(a, b, e) { return nan() }
+    return divScale(a, b, selectDivScale(a, b), true)
+}
+
+// div(a, b): truncated integer quotient
+public function divTrunc(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if isInf(a) {
+            if isSpecial(b) { return nan() }
+            let s = signOf(b)
+            if s == 0 {
+                setErr(e, "22012", "division by zero")
+                return nan()
+            }
+            if (s > 0) == (a.sign == NPINF) { return pinf() }
+            return ninf()
+        }
+        return zero(0)
+    }
+    if b.digits.length == 0 {
+        setErr(e, "22012", "division by zero")
+        return nan()
+    }
+    if tooBig(a, b, e) { return nan() }
+    return divScale(a, b, 0, false)
+}
+
+public function mod(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) || isNaN(b) { return nan() }
+        if isInf(a) {
+            if signOf(b) == 0 {
+                setErr(e, "22012", "division by zero")
+                return nan()
+            }
+            return nan()
+        }
+        return a
+    }
+    if b.digits.length == 0 {
+        setErr(e, "22012", "division by zero")
+        return nan()
+    }
+    if tooBig(a, b, e) { return nan() }
+    let q = divScale(a, b, 0, false)
+    let p = mulScale(b, q, b.dscale)
+    return addFinite(a, p, true)
+}
+
+// Refuse divisions whose quotient would need an absurd number of digits (bounded work for hostile input).
+function tooBig(a: Num, b: Num, e: NErr): Boolean {
+    let span = (a.weight - b.weight) + a.digits.length + b.digits.length
+    if span > MAX_WORK_DIGITS {
+        setErr(e, "54000", "numeric value too large to compute")
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- rounding
+
+public function roundTo(x: Num, rscale: Integer): Num {
+    if isSpecial(x) { return x }
+    let d = x.digits
+    let di = (x.weight + 1) * 4 + rscale
+    if di < 0 { return zero(rscale) }
+    let ndig = (di + 3) / 4
+    let dr = di % 4
+    if !(ndig < d.length || (ndig == d.length && dr > 0)) {
+        return Num { sign: x.sign; weight: x.weight; dscale: rscale; digits: d }
+    }
+    // working copy with one spare leading digit for the carry
+    let w: List<Integer> = [0]
+    let i = 0
+    while i < ndig && i < d.length {
+        w.add(d[i])
+        i += 1
+    }
+    while w.length < ndig + 1 { w.add(0) }
+    let carry = 0
+    let pos = ndig
+    if dr == 0 {
+        if ndig < d.length && d[ndig] >= 5000 { carry = 1 }
+    } else {
+        let pw = 1000
+        if dr == 2 { pw = 100 }
+        if dr == 3 { pw = 10 }
+        let extra = w[ndig] % pw
+        w[ndig] = w[ndig] - extra
+        if extra >= pw / 2 {
+            let s = w[ndig] + pw
+            if s >= NBASE {
+                w[ndig] = s - NBASE
+                carry = 1
+            } else {
+                w[ndig] = s
+            }
+        }
+        pos = ndig - 1
+    }
+    while carry > 0 && pos >= 0 {
+        let s = w[pos] + carry
+        if s >= NBASE {
+            w[pos] = s - NBASE
+            carry = 1
+        } else {
+            w[pos] = s
+            carry = 0
+        }
+        pos -= 1
+    }
+    return build(x.sign, x.weight + 1, rscale, w, 0, w.length)
+}
+
+public function truncTo(x: Num, rscale: Integer): Num {
+    if isSpecial(x) { return x }
+    let d = x.digits
+    let di = (x.weight + 1) * 4 + rscale
+    if di <= 0 { return zero(rscale) }
+    let ndig = (di + 3) / 4
+    if ndig > d.length { return Num { sign: x.sign; weight: x.weight; dscale: rscale; digits: d } }
+    let w: List<Integer> = []
+    let i = 0
+    while i < ndig {
+        w.add(d[i])
+        i += 1
+    }
+    let dr = di % 4
+    if dr > 0 {
+        let pw = 1000
+        if dr == 2 { pw = 100 }
+        if dr == 3 { pw = 10 }
+        w[ndig - 1] = w[ndig - 1] - w[ndig - 1] % pw
+    }
+    return build(x.sign, x.weight, rscale, w, 0, w.length)
+}
+
+// round(x, s) / trunc(x, s) SQL functions (Postgres 17 scale limits; negative output dscale shown as 0)
+public function roundSql(x: Num, s: Integer, truncate: Boolean, e: NErr): Num {
+    if isSpecial(x) { return x }
+    let sc = s
+    let lo = -(WEIGHT_MAX + 1) * 4 - 1
+    if sc < lo { sc = lo }
+    if sc > DSCALE_MAX { sc = DSCALE_MAX }
+    let r = x
+    if truncate { r = truncTo(x, sc) } else { r = roundTo(x, sc) }
+    if sc < 0 { r.dscale = 0 }
+    checkRange(r, e)
+    return r
+}
+
+public function floorNum(x: Num): Num {
+    if isSpecial(x) { return x }
+    let t = truncTo(x, 0)
+    if x.sign == NNEG && cmp(x, t) != 0 { return addFinite(t, one(), true) }
+    return t
+}
+
+public function ceilNum(x: Num): Num {
+    if isSpecial(x) { return x }
+    let t = truncTo(x, 0)
+    if x.sign == NPOS && cmp(x, t) != 0 { return addFinite(t, one(), false) }
+    return t
+}
+
+public function negate(x: Num): Num {
+    if x.sign == NNAN { return x }
+    if x.sign == NPINF { return ninf() }
+    if x.sign == NNINF { return pinf() }
+    if x.digits.length == 0 { return x }
+    let s = NNEG
+    if x.sign == NNEG { s = NPOS }
+    return Num { sign: s; weight: x.weight; dscale: x.dscale; digits: x.digits }
+}
+
+public function absNum(x: Num): Num {
+    if x.sign == NNINF { return pinf() }
+    if x.sign == NNEG { return Num { sign: NPOS; weight: x.weight; dscale: x.dscale; digits: x.digits } }
+    return x
+}
+
+// sign(x) as numeric (-1, 0, 1; NaN stays NaN)
+public function signNum(x: Num): Num {
+    if x.sign == NNAN { return x }
+    let s = signOf(x)
+    if s == 0 { return zero(0) }
+    if s > 0 { return one() }
+    return negate(one())
+}
+
+// value must fit the storage format (weight in int16, dscale <= 16383)
+public function checkRange(x: Num, e: NErr): Boolean {
+    if isSpecial(x) { return true }
+    if (x.digits.length > 0 && x.weight > WEIGHT_MAX) || x.dscale > DSCALE_MAX {
+        setErr(e, "22003", "value overflows numeric format")
+        return false
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- text I/O
+
+function isSpaceC(c: Integer): Boolean {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+function lowerC(c: Integer): Integer {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+function matchCI(b: Bytes, at: Integer, end: Integer, lit: Text): Boolean {
+    let lb = Bytes(lit)
+    if end - at < lb.length { return false }
+    let i = 0
+    while i < lb.length {
+        if lowerC(b[at + i]) != lb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function isDigitC(c: Integer): Boolean { return c >= 48 && c <= 57 }
+
+function hexVal(c: Integer): Integer {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+// numeric_in. status: 0 ok, 1 syntax error, 2 out of range ("value overflows numeric format").
+public function parse(b: Bytes, o: Integer, l: Integer, status: List<Integer>): Num {
+    status[0] = 0
+    let i = o
+    let end = o + l
+    while i < end && isSpaceC(b[i]) { i += 1 }
+    let numstart = i
+    let neg = false
+    if i < end && b[i] == 43 {
+        i += 1
+    } else if i < end && b[i] == 45 {
+        neg = true
+        i += 1
+    }
+    if i >= end || (!isDigitC(b[i]) && b[i] != 46) {
+        let res = nan()
+        let after = i
+        if matchCI(b, numstart, end, "nan") {
+            after = numstart + 3
+        } else if matchCI(b, i, end, "infinity") {
+            if neg { res = ninf() } else { res = pinf() }
+            after = i + 8
+        } else if matchCI(b, i, end, "inf") {
+            if neg { res = ninf() } else { res = pinf() }
+            after = i + 3
+        } else {
+            status[0] = 1
+            return nan()
+        }
+        while after < end {
+            if !isSpaceC(b[after]) {
+                status[0] = 1
+                return nan()
+            }
+            after += 1
+        }
+        return res
+    }
+    // non-decimal integers: 0x / 0o / 0b
+    if b[i] == 48 && i + 1 < end {
+        let x = lowerC(b[i + 1])
+        let base = 0
+        if x == 120 { base = 16 }
+        if x == 111 { base = 8 }
+        if x == 98 { base = 2 }
+        if base > 0 { return parseNonDecimal(b, i + 2, end, base, neg, status) }
+    }
+    // decimal digits
+    let dig = Bytes()
+    let dweight = -1
+    let dscale = 0
+    let haveDp = false
+    while i < end {
+        let c = b[i]
+        if isDigitC(c) {
+            dig.add(c - 48)
+            if haveDp { dscale += 1 } else { dweight += 1 }
+            i += 1
+        } else if c == 46 {
+            if haveDp {
+                status[0] = 1
+                return nan()
+            }
+            haveDp = true
+            i += 1
+            if i < end && b[i] == 95 {
+                status[0] = 1
+                return nan()
+            }
+        } else if c == 95 {
+            i += 1
+            if i >= end || !isDigitC(b[i]) {
+                status[0] = 1
+                return nan()
+            }
+        } else {
+            break
+        }
+    }
+    if dig.length == 0 {
+        status[0] = 1
+        return nan()
+    }
+    if i < end && (b[i] == 101 || b[i] == 69) {
+        i += 1
+        let eneg = false
+        if i < end && b[i] == 43 {
+            i += 1
+        } else if i < end && b[i] == 45 {
+            eneg = true
+            i += 1
+        }
+        if i >= end || !isDigitC(b[i]) {
+            status[0] = 1
+            return nan()
+        }
+        let ex = 0
+        while i < end {
+            let c = b[i]
+            if isDigitC(c) {
+                ex = ex * 10 + (c - 48)
+                if ex > 1073741823 {
+                    status[0] = 2
+                    return nan()
+                }
+                i += 1
+            } else if c == 95 {
+                i += 1
+                if i >= end || !isDigitC(b[i]) {
+                    status[0] = 1
+                    return nan()
+                }
+            } else {
+                break
+            }
+        }
+        if eneg { ex = -ex }
+        dweight += ex
+        dscale -= ex
+        if dscale < 0 { dscale = 0 }
+    }
+    while i < end {
+        if !isSpaceC(b[i]) {
+            status[0] = 1
+            return nan()
+        }
+        i += 1
+    }
+    // value range check before building huge digit arrays
+    let firstNz = 0
+    while firstNz < dig.length && dig[firstNz] == 0 { firstNz += 1 }
+    if firstNz < dig.length && dweight - firstNz > WEIGHT_MAX * 4 + 3 {
+        status[0] = 2
+        return nan()
+    }
+    if dscale > DSCALE_MAX {
+        status[0] = 2
+        return nan()
+    }
+    let weight = 0
+    if dweight >= 0 {
+        weight = (dweight + 1 + 3) / 4 - 1
+    } else {
+        weight = -((-dweight - 1) / 4 + 1)
+    }
+    let offset = (weight + 1) * 4 - (dweight + 1)
+    let ndig = (dig.length + offset + 3) / 4
+    let out: List<Integer> = []
+    let k = 0
+    let pos = -offset
+    while k < ndig {
+        let v = 0
+        let j = 0
+        while j < 4 {
+            let idx = pos + j
+            let dv = 0
+            if idx >= 0 && idx < dig.length { dv = dig[idx] }
+            v = v * 10 + dv
+            j += 1
+        }
+        out.add(v)
+        pos += 4
+        k += 1
+    }
+    let s = NPOS
+    if neg { s = NNEG }
+    return build(s, weight, dscale, out, 0, out.length)
+}
+
+function parseNonDecimal(b: Bytes, start: Integer, end: Integer, base: Integer, neg: Boolean, status: List<Integer>): Num {
+    let i = start
+    let acc: List<Integer> = []
+    let any = false
+    while i < end {
+        let c = b[i]
+        let d = hexVal(c)
+        if c == 95 {
+            i += 1
+            if i >= end || hexVal(b[i]) < 0 || hexVal(b[i]) >= base {
+                status[0] = 1
+                return nan()
+            }
+            continue
+        }
+        if d < 0 || d >= base { break }
+        acc = bmulSmall(acc, base)
+        if d > 0 { acc = badd(acc, [d]) }
+        if acc.length > WEIGHT_MAX + 1 {
+            status[0] = 2
+            return nan()
+        }
+        any = true
+        i += 1
+    }
+    if !any {
+        status[0] = 1
+        return nan()
+    }
+    while i < end {
+        if !isSpaceC(b[i]) {
+            status[0] = 1
+            return nan()
+        }
+        i += 1
+    }
+    return fromNat(neg, acc, 0, 0)
+}
+
+public function parseText(t: Text, status: List<Integer>): Num {
+    let b = Bytes(t)
+    return parse(b, 0, b.length, status)
+}
+
+// numeric_out
+public function format(x: Num, out: Bytes) {
+    if x.sign == NNAN {
+        out.addBytes(Bytes("NaN"))
+        return
+    }
+    if x.sign == NPINF {
+        out.addBytes(Bytes("Infinity"))
+        return
+    }
+    if x.sign == NNINF {
+        out.addBytes(Bytes("-Infinity"))
+        return
+    }
+    let d = x.digits
+    let nd = d.length
+    if x.sign == NNEG && nd > 0 { out.add(45) }
+    let k = 0
+    if x.weight < 0 || nd == 0 {
+        out.add(48)
+        k = x.weight + 1
+        if nd == 0 { k = 0 }
+    } else {
+        while k <= x.weight {
+            let dig = 0
+            if k < nd { dig = d[k] }
+            let d1 = dig / 1000
+            let r = dig - d1 * 1000
+            let d2 = r / 100
+            r = r - d2 * 100
+            let d3 = r / 10
+            let d4 = r - d3 * 10
+            let put = k > 0
+            if put || d1 > 0 { out.add(48 + d1); put = true }
+            if put || d2 > 0 { out.add(48 + d2); put = true }
+            if put || d3 > 0 { out.add(48 + d3) }
+            out.add(48 + d4)
+            k += 1
+        }
+    }
+    let ds = x.dscale
+    if ds > 0 {
+        out.add(46)
+        let written = 0
+        // the first fractional NBASE digit (weight -1) is at index x.weight + 1
+        let idx = x.weight + 1
+        while written < ds {
+            let dig = 0
+            if idx >= 0 && idx < nd { dig = d[idx] }
+            let d1 = dig / 1000
+            let r = dig - d1 * 1000
+            let d2 = r / 100
+            r = r - d2 * 100
+            let d3 = r / 10
+            let d4 = r - d3 * 10
+            out.add(48 + d1)
+            written += 1
+            if written < ds {
+                out.add(48 + d2)
+                written += 1
+            }
+            if written < ds {
+                out.add(48 + d3)
+                written += 1
+            }
+            if written < ds {
+                out.add(48 + d4)
+                written += 1
+            }
+            idx += 1
+        }
+    }
+}
+
+public function toText(x: Num): Text {
+    let b = Bytes()
+    format(x, b)
+    return Text(b)
+}
+
+// ---------------------------------------------------------------- conversions
+
+// Round to integer and convert; ok=false if out of Int64 range (or special).
+public function toInt64(x: Num, ok: List<Integer>): Integer {
+    ok[0] = 0
+    if isSpecial(x) { return 0 }
+    let r = roundTo(x, 0)
+    if r.digits.length == 0 {
+        ok[0] = 1
+        return 0
+    }
+    if r.weight > 4 { return 0 }
+    let v = 0
+    let i = 0
+    while i <= r.weight {
+        let dig = 0
+        if i < r.digits.length { dig = r.digits[i] }
+        if v < (-9223372036854775807 - 1 + dig) / NBASE { return 0 }
+        v = v * NBASE - dig
+        i += 1
+    }
+    if r.sign != NNEG {
+        if v == -9223372036854775807 - 1 { return 0 }
+        v = -v
+    }
+    ok[0] = 1
+    return v
+}
+
+// Fast-path representation: unscaled Int64 with dscale <= 18. ok[0] = 1 when it fits.
+public function toScaled(x: Num, ok: List<Integer>): Integer {
+    ok[0] = 0
+    if isSpecial(x) || x.dscale > 18 || x.dscale < 0 { return 0 }
+    if x.digits.length == 0 {
+        ok[0] = 1
+        return 0
+    }
+    // integer digits + dscale must fit in 18 decimal digits (keeps headroom for rescaling)
+    let intDigits = (x.weight + 1) * 4
+    if intDigits > 0 {
+        let lead = x.digits[0]
+        if lead < 10 { intDigits -= 3 } else if lead < 100 { intDigits -= 2 } else if lead < 1000 { intDigits -= 1 }
+    } else {
+        intDigits = 0
+    }
+    if intDigits + x.dscale > 18 { return 0 }
+    // value * 10^dscale, built digit group by digit group; never exceeds 18 decimal digits
+    let fracSlots = (x.dscale + 3) / 4
+    let lastW = -fracSlots
+    let wi = x.weight
+    if wi < 0 { wi = -1 }
+    let v = 0
+    while wi >= lastW {
+        let idx = x.weight - wi
+        let dig = 0
+        if idx >= 0 && idx < x.digits.length { dig = x.digits[idx] }
+        if wi == lastW && wi < 0 {
+            let keep = x.dscale - 4 * (fracSlots - 1)
+            let m = 1
+            let dv = 1
+            let j = 0
+            while j < keep {
+                m = m * 10
+                j += 1
+            }
+            while j < 4 {
+                dv = dv * 10
+                j += 1
+            }
+            v = v * m + dig / dv
+        } else if wi >= 0 || wi > lastW {
+            v = v * NBASE + dig
+        }
+        wi -= 1
+    }
+    if x.sign == NNEG { v = -v }
+    ok[0] = 1
+    return v
+}
+
+// value * 10^scale as an exact Int64 (digits below 10^-scale are ignored); ok[0] = 1 when it fits.
+public function toUnscaled(x: Num, scale: Integer, ok: List<Integer>): Integer {
+    ok[0] = 0
+    if isSpecial(x) || scale < 0 || scale > 18 { return 0 }
+    if x.digits.length == 0 {
+        ok[0] = 1
+        return 0
+    }
+    if x.weight > 5 { return 0 }
+    let fracSlots = (scale + 3) / 4
+    let wi = x.weight
+    if wi < 0 { wi = 0 }
+    let v = 0
+    while wi >= -fracSlots {
+        let idx = x.weight - wi
+        let dig = 0
+        if idx >= 0 && idx < x.digits.length { dig = x.digits[idx] }
+        let pw = 1000
+        let j = 0
+        while j < 4 {
+            let dec = (dig / pw) % 10
+            let pos = 4 * wi + 3 - j
+            if pos >= -scale {
+                if v < (-9223372036854775807 - 1 + dec) / 10 { return 0 }
+                v = v * 10 - dec
+            }
+            pw = pw / 10
+            j += 1
+        }
+        wi -= 1
+    }
+    if x.sign != NNEG {
+        if v == -9223372036854775807 - 1 { return 0 }
+        v = -v
+    }
+    ok[0] = 1
+    return v
+}
+
+// float8_numeric / float4_numeric: the value printed with %.<sig>g (exact, round half to even) read back as
+// numeric, so 0.1::float8::numeric = 0.1 and 1e20 keeps dscale 0.
+public function fromFloatSig(f: Float, sig: Integer): Num {
+    if f != f { return nan() }
+    if f > 1.7976931348623157e308 { return pinf() }
+    if f < -1.7976931348623157e308 { return ninf() }
+    if f == 0.0 { return zero(0) }
+    let bb = Bytes(8)
+    bb.setFloat64(0, f)
+    let bits = bb.getInt64(0)
+    let neg = bits < 0
+    let ex = (bits >> 52) & 2047
+    let mant = bits & 4503599627370495
+    let e2 = -1074
+    if ex != 0 {
+        mant = mant | 4503599627370496
+        e2 = ex - 1075
+    }
+    let nat = fromFloatInt(Float(0))
+    let mv = mant
+    let rev: List<Integer> = []
+    while mv > 0 {
+        rev.add(mv % NBASE)
+        mv = mv / NBASE
+    }
+    let i = rev.length - 1
+    while i >= 0 {
+        nat.add(rev[i])
+        i -= 1
+    }
+    let d10 = 0
+    if e2 >= 0 {
+        let k = e2
+        while k > 0 {
+            let step = minI(k, 29)
+            nat = bmulSmall(nat, 1 << step)
+            k -= step
+        }
+    } else {
+        let k = -e2
+        d10 = k
+        while k > 0 {
+            let step = minI(k, 12)
+            let m = 1
+            let j = 0
+            while j < step {
+                m = m * 5
+                j += 1
+            }
+            nat = bmulSmall(nat, m)
+            k -= step
+        }
+    }
+    let txt = Bytes()
+    format(fromNat(false, nat, 0, 0), txt)
+    let dlen = txt.length
+    let keep = Bytes()
+    let k = 0
+    if dlen > sig {
+        let j = 0
+        while j < sig {
+            keep.add(txt[j])
+            j += 1
+        }
+        k = dlen - sig
+        let first = txt[sig]
+        let restNz = false
+        j = sig + 1
+        while j < dlen {
+            if txt[j] != 48 { restNz = true }
+            j += 1
+        }
+        let lastOdd = ((keep[sig - 1] - 48) & 1) == 1
+        if first > 53 || (first == 53 && (restNz || lastOdd)) {
+            let pos = sig - 1
+            let carry = 1
+            while pos >= 0 && carry > 0 {
+                let d = keep[pos] - 48 + carry
+                if d >= 10 {
+                    keep[pos] = 48
+                    carry = 1
+                } else {
+                    keep[pos] = 48 + d
+                    carry = 0
+                }
+                pos -= 1
+            }
+            if carry > 0 {
+                // 999..9 rounded up: 1 followed by zeros, one more integer digit
+                let nk = Bytes()
+                nk.add(49)
+                nk.addBytes(keep)
+                keep = nk
+            }
+        }
+    } else {
+        keep.addBytes(txt)
+    }
+    while keep.length > 1 && keep[keep.length - 1] == 48 {
+        keep.resize(keep.length - 1)
+        k += 1
+    }
+    let lit = Bytes()
+    if neg { lit.add(45) }
+    lit.addBytes(keep)
+    lit.add(101)
+    lit.addBytes(Bytes(Text(k - d10)))
+    let st: List<Integer> = [0]
+    return parse(lit, 0, lit.length, st)
+}
+
+// 2^k as a Float (k in [-1074, 1023]); exact.
+function pow2F(k: Integer): Float {
+    let bb = Bytes(8)
+    if k >= -1022 {
+        bb.setInt64(0, (k + 1023) << 52)
+    } else {
+        bb.setInt64(0, 1 << (k + 1074))
+    }
+    return bb.getFloat64(0)
+}
+
+function natOfInt(v: Integer): List<Integer> {
+    let rev: List<Integer> = []
+    let x = v
+    while x > 0 {
+        rev.add(x % NBASE)
+        x = x / NBASE
+    }
+    let r: List<Integer> = []
+    let i = rev.length - 1
+    while i >= 0 {
+        r.add(rev[i])
+        i -= 1
+    }
+    return r
+}
+
+function natMulPow2(a: List<Integer>, k: Integer): List<Integer> {
+    let r = a
+    let left = k
+    while left > 0 {
+        let step = minI(left, 29)
+        r = bmulSmall(r, 1 << step)
+        left -= step
+    }
+    return r
+}
+
+function natPow10(k: Integer): List<Integer> {
+    return decShiftNat([1], k)
+}
+
+// Correctly rounded (half to even) binary value of digits * 10^exp10, as Postgres's strtod/strtof give.
+// dig: decimal digit values 0..9 with a nonzero first digit. Float8: mantBits 53, minExp -1074, maxExp 1023;
+// float4: 24, -149, 127 (the result is then exactly representable as a float4). Overflow gives +Inf,
+// underflow 0.0 (callers turn both into "out of range" errors).
+public function decimalToBinary(dig: Bytes, exp10: Integer, mantBits: Integer, minExp: Integer, maxExp: Integer): Float {
+    let nd = dig.length
+    let dec10 = nd + exp10
+    if dec10 > maxExp / 3 + 2 { return 1.0 / 0.0 }
+    if dec10 < minExp / 3 - 2 { return 0.0 }
+    // N / M = value
+    let nat: List<Integer> = []
+    let k = 0
+    let acc = 0
+    let cnt = 0
+    // build the integer from digits in groups of 4 (msd first)
+    let lead = nd % 4
+    if lead == 0 { lead = 4 }
+    let i = 0
+    while i < nd {
+        acc = acc * 10 + dig[i]
+        cnt += 1
+        if cnt == lead {
+            nat.add(acc)
+            acc = 0
+            cnt = 0
+            lead = 4
+        }
+        i += 1
+    }
+    nat = bnorm(nat)
+    let m: List<Integer> = [1]
+    if exp10 >= 0 {
+        nat = decShiftNat(nat, exp10)
+    } else {
+        m = natPow10(-exp10)
+    }
+    // estimate floor(log2(value)) from the leading digits
+    let lf = 0.0
+    let ln = 0
+    while ln < nd && ln < 17 {
+        lf = lf * 10.0 + Float(dig[ln])
+        ln += 1
+    }
+    let est = math.log(lf) / math.log(2.0) + Float(nd - ln + exp10) * 3.321928094887362
+    let e2 = Integer(math.floor(est))
+    let topBit = 1 << (mantBits - 1)
+    let guard = 0
+    while guard < 8 {
+        guard += 1
+        let unitExp = e2 - (mantBits - 1)
+        if unitExp < minExp { unitExp = minExp }
+        let a = nat
+        let b = m
+        if unitExp >= 0 { b = natMulPow2(m, unitExp) } else { a = natMulPow2(nat, -unitExp) }
+        let dv = bdivmod(a, b)
+        if dv.q.length > 5 {
+            e2 += 1
+            continue
+        }
+        let q = 0
+        for d in dv.q { q = q * NBASE + d }
+        if q >= topBit * 2 {
+            e2 += 1
+            continue
+        }
+        if q < topBit && unitExp > minExp {
+            e2 -= 1
+            continue
+        }
+        let c = bcmp(bmulSmall(dv.r, 2), b)
+        if c > 0 || (c == 0 && (q & 1) == 1) { q += 1 }
+        if q == topBit * 2 {
+            q = topBit
+            unitExp += 1
+        }
+        if unitExp + mantBits - 1 > maxExp { return 1.0 / 0.0 }
+        if q == 0 { return 0.0 }
+        return Float(q) * pow2F(unitExp)
+    }
+    return 0.0
+}
+
+// Approximate Float (no overflow error: huge values give +/-Inf).
+public function toFloatApprox(x: Num): Float {
+    if x.sign == NNAN { return 0.0 / 0.0 }
+    if x.sign == NPINF { return 1.0 / 0.0 }
+    if x.sign == NNINF { return -1.0 / 0.0 }
+    if x.digits.length == 0 { return 0.0 }
+    let f = 0.0
+    let i = 0
+    while i < x.digits.length && i < 5 {
+        f = f * 10000.0 + Float(x.digits[i])
+        i += 1
+    }
+    let e = (x.weight - i + 1) * 4
+    let r = f
+    if e > 0 {
+        if e > 400 { r = 1.0 / 0.0 } else { r = f * math.pow(10.0, Float(e)) }
+    } else if e < 0 {
+        if e < -400 { r = 0.0 } else { r = f / math.pow(10.0, Float(-e)) }
+    }
+    if x.sign == NNEG { return -r }
+    return r
+}
+
+// ---------------------------------------------------------------- transcendental functions
+
+function cnum(t: Text): Num {
+    let st: List<Integer> = [0]
+    return parseText(t, st)
+}
+
+// Postgres estimate_ln_dweight
+function estimateLnDweight(x: Num): Integer {
+    if x.sign != NPOS { return 0 }
+    if cmp(x, cnum("0.9")) >= 0 && cmp(x, cnum("1.1")) <= 0 {
+        let y = addFinite(x, one(), true)
+        if y.digits.length > 0 {
+            return y.weight * 4 + ilog10(y.digits[0])
+        }
+        return 0
+    }
+    if x.digits.length > 0 {
+        let digits = x.digits[0]
+        let dweight = x.weight * 4
+        if x.digits.length > 1 {
+            digits = digits * NBASE + x.digits[1]
+            dweight -= 4
+        }
+        let lnv = math.log(Float(digits)) + Float(dweight) * 2.302585092994046
+        let a = lnv
+        if a < 0.0 { a = -a }
+        if a == 0.0 { return 0 }
+        return truncF(log10F(a))
+    }
+    return 0
+}
+
+// floor(log10(d)) for 1 <= d < NBASE
+function ilog10(d: Integer): Integer {
+    if d >= 1000 { return 3 }
+    if d >= 100 { return 2 }
+    if d >= 10 { return 1 }
+    return 0
+}
+
+// log10 that is exact for powers of ten (C's log10 is; log(x)/log(10) is not)
+function log10F(x: Float): Float {
+    let r = math.log(x) / math.log(10.0)
+    let n = math.floor(r + 0.5)
+    let d = r - n
+    if d < 0.0 { d = -d }
+    if d < 0.000000001 && n >= -22.0 && n <= 22.0 && math.pow(10.0, n) == x { return n }
+    return r
+}
+
+function truncF(f: Float): Integer {
+    if f != f { return 0 }
+    if f > 1.0e15 { return 1000000000000000 }
+    if f < -1.0e15 { return -1000000000000000 }
+    return Integer(f)
+}
+
+// sqrt to rscale (rscale may be negative), correctly rounded; x >= 0
+function sqrtVar(x: Num, rscale: Integer): Num {
+    if x.digits.length == 0 { return zero(rscale) }
+    // Y = floor(sqrt(x) * 10^(r1)), r1 = rscale + 1, computed on an integer N = x * 10^(2*r1)
+    let r1 = rscale + 1
+    // x = D * NBASE^-s4 = D * 10^(-4*s4); N = D * 10^(2*r1 - 4*s4)
+    let e10 = 2 * r1 - 4 * s4Of(x)
+    let n: List<Integer> = []
+    if e10 >= 0 {
+        n = decShiftNat(x.digits, e10)
+    } else {
+        n = decUnshiftNat(x.digits, -e10)
+    }
+    let y = bisqrt(n)
+    // y * 10^-r1 -> Num, then round to rscale
+    let yn = natDecScaled(y, r1)
+    return roundTo(yn, rscale)
+}
+
+// nat * 10^k (k >= 0)
+function decShiftNat(a: List<Integer>, k: Integer): List<Integer> {
+    let whole = k / 4
+    let rem = k % 4
+    let m = 1
+    let i = 0
+    while i < rem {
+        m = m * 10
+        i += 1
+    }
+    return bshift(bmulSmall(a, m), whole)
+}
+
+// floor(nat / 10^k) (k >= 0)
+function decUnshiftNat(a: List<Integer>, k: Integer): List<Integer> {
+    let whole = k / 4
+    let rem = k % 4
+    let r: List<Integer> = []
+    let i = 0
+    while i < a.length - whole {
+        r.add(a[i])
+        i += 1
+    }
+    let m = 1
+    i = 0
+    while i < rem {
+        m = m * 10
+        i += 1
+    }
+    if m == 1 { return bnorm(r) }
+    let rm: List<Integer> = [0]
+    return bdivSmall(bnorm(r), m, rm)
+}
+
+// nat * 10^-d as a Num (sign positive), dscale d (d may be negative)
+function natDecScaled(a: List<Integer>, d: Integer): Num {
+    if a.length == 0 { return zero(d) }
+    // align to NBASE: value = a * 10^-d = (a * 10^pad) * NBASE^-(s4) with 4*s4 = d + pad
+    let pad = 0
+    let dd = d
+    while (dd + pad) % 4 != 0 { pad += 1 }
+    let nat = a
+    if pad > 0 {
+        let m = 1
+        let i = 0
+        while i < pad {
+            m = m * 10
+            i += 1
+        }
+        nat = bmulSmall(a, m)
+    }
+    let s4 = (d + pad) / 4
+    return fromNat(false, nat, s4, d)
+}
+
+public function sqrtNum(x: Num, e: NErr): Num {
+    if x.sign == NNAN || x.sign == NPINF { return x }
+    if x.sign == NNINF || (x.sign == NNEG && x.digits.length > 0) {
+        setErr(e, "2201F", "cannot take square root of a negative number")
+        return nan()
+    }
+    let sweight = 0
+    let w = x.weight
+    if x.digits.length == 0 { w = 0 }
+    sweight = cdiv((w + 1) * 4, 2) - 1
+    let rscale = MIN_SIG_DIGITS - sweight
+    rscale = maxI(rscale, x.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    if x.digits.length > MAX_WORK_DIGITS / 4 {
+        setErr(e, "54000", "numeric value too large to compute")
+        return nan()
+    }
+    return sqrtVar(x, rscale)
+}
+
+// C-style truncating division (Minyar's / already truncates; kept explicit for clarity)
+function cdiv(a: Integer, b: Integer): Integer {
+    return a / b
+}
+
+// ln_var (x > 0)
+function lnVar(arg: Num, rscale: Integer): Num {
+    let x = arg
+    let fact = fromInt(2)
+    let nsqrt = 0
+    let z9 = cnum("0.9")
+    let z11 = cnum("1.1")
+    while cmp(x, z9) <= 0 {
+        let lr = rscale - cdiv(x.weight * 4, 2) + 8
+        x = sqrtVar(x, lr)
+        fact = mulExact(fact, fromInt(2))
+        nsqrt += 1
+        if nsqrt > 200 { break }
+    }
+    while cmp(x, z11) >= 0 {
+        let lr = rscale - cdiv(x.weight * 4, 2) + 8
+        x = sqrtVar(x, lr)
+        fact = mulExact(fact, fromInt(2))
+        nsqrt += 1
+        if nsqrt > 200 { break }
+    }
+    let lrs = rscale + truncF(Float(nsqrt + 1) * 0.301029995663981) + 8
+    let result = addFinite(x, one(), true)
+    let elem = addFinite(x, one(), false)
+    result = divScale(result, elem, lrs, true)
+    let xx = result
+    x = mulScale(result, result, lrs)
+    let ni = 1
+    let guard = 0
+    while guard < 100000 {
+        ni += 2
+        xx = mulScale(xx, x, lrs)
+        let el = divScale(xx, fromInt(ni), lrs, true)
+        if el.digits.length == 0 { break }
+        result = addFinite(result, el, false)
+        if el.weight < result.weight - cdiv(lrs * 2, 4) { break }
+        guard += 1
+    }
+    return mulScale(result, fact, rscale)
+}
+
+public function lnNum(x: Num, e: NErr): Num {
+    if x.sign == NNINF {
+        setErr(e, "2201E", "cannot take logarithm of a negative number")
+        return nan()
+    }
+    if x.sign == NNAN || x.sign == NPINF { return x }
+    if x.digits.length == 0 {
+        setErr(e, "2201E", "cannot take logarithm of zero")
+        return nan()
+    }
+    if x.sign == NNEG {
+        setErr(e, "2201E", "cannot take logarithm of a negative number")
+        return nan()
+    }
+    let lnw = estimateLnDweight(x)
+    let rscale = MIN_SIG_DIGITS - lnw
+    rscale = maxI(rscale, x.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    if x.digits.length > MAX_WORK_DIGITS / 8 {
+        setErr(e, "54000", "numeric value too large to compute")
+        return nan()
+    }
+    return lnVar(x, rscale)
+}
+
+// log(base, x)
+public function logNum(base: Num, x: Num, e: NErr): Num {
+    if isSpecial(base) || isSpecial(x) {
+        if isNaN(base) || isNaN(x) { return nan() }
+        let s1 = signOf(base)
+        let s2 = signOf(x)
+        if s1 < 0 || s2 < 0 {
+            setErr(e, "2201E", "cannot take logarithm of a negative number")
+            return nan()
+        }
+        if s1 == 0 || s2 == 0 {
+            setErr(e, "2201E", "cannot take logarithm of zero")
+            return nan()
+        }
+        if base.sign == NPINF {
+            if x.sign == NPINF { return nan() }
+            return zero(0)
+        }
+        return pinf()
+    }
+    let sb = signOf(base)
+    let sx = signOf(x)
+    if sb == 0 || sx == 0 {
+        setErr(e, "2201E", "cannot take logarithm of zero")
+        return nan()
+    }
+    if sb < 0 || sx < 0 {
+        setErr(e, "2201E", "cannot take logarithm of a negative number")
+        return nan()
+    }
+    if base.digits.length > MAX_WORK_DIGITS / 8 || x.digits.length > MAX_WORK_DIGITS / 8 {
+        setErr(e, "54000", "numeric value too large to compute")
+        return nan()
+    }
+    let lbw = estimateLnDweight(base)
+    let lnw = estimateLnDweight(x)
+    let rdw = lnw - lbw
+    let rscale = MIN_SIG_DIGITS - rdw
+    rscale = maxI(rscale, base.dscale)
+    rscale = maxI(rscale, x.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    let lbr = maxI(rscale + rdw - lbw + 8, 0)
+    let lnr = maxI(rscale + rdw - lnw + 8, 0)
+    let lb = lnVar(base, lbr)
+    let ln = lnVar(x, lnr)
+    if lb.digits.length == 0 {
+        setErr(e, "22012", "division by zero")
+        return nan()
+    }
+    return divScale(ln, lb, rscale, true)
+}
+
+// exp_var
+function expVar(arg: Num, rscale: Integer, e: NErr): Num {
+    let x = arg
+    let val = toFloatApprox(x)
+    let av = val
+    if av < 0.0 { av = -av }
+    if av >= Float(MAX_RESULT_SCALE * 3) {
+        if val > 0.0 {
+            setErr(e, "22003", "value overflows numeric format")
+            return nan()
+        }
+        return zero(rscale)
+    }
+    let dweight = truncF(val * 0.434294481903252)
+    let ndiv2 = 0
+    if av > 0.01 {
+        ndiv2 = 1
+        val = val / 2.0
+        let a2 = val
+        if a2 < 0.0 { a2 = -a2 }
+        while a2 > 0.01 {
+            ndiv2 += 1
+            val = val / 2.0
+            a2 = val
+            if a2 < 0.0 { a2 = -a2 }
+        }
+        let lr = x.dscale + ndiv2
+        x = divScale(x, fromInt(1 << ndiv2), lr, true)
+    }
+    let sig = 1 + dweight + rscale + truncF(Float(ndiv2) * 0.301029995663981)
+    sig = maxI(sig, 0) + 8
+    let lrs = sig - 1
+    let result = addFinite(one(), x, false)
+    let elem = mulScale(x, x, lrs)
+    let ni = 2
+    elem = divScale(elem, fromInt(ni), lrs, true)
+    let guard = 0
+    while elem.digits.length != 0 && guard < 100000 {
+        result = addFinite(result, elem, false)
+        elem = mulScale(elem, x, lrs)
+        ni += 1
+        elem = divScale(elem, fromInt(ni), lrs, true)
+        guard += 1
+    }
+    while ndiv2 > 0 {
+        let lr = sig - result.weight * 2 * 4
+        lr = maxI(lr, 0)
+        result = mulScale(result, result, lr)
+        ndiv2 -= 1
+    }
+    return roundTo(result, rscale)
+}
+
+public function expNum(x: Num, e: NErr): Num {
+    if x.sign == NNAN || x.sign == NPINF { return x }
+    if x.sign == NNINF { return zero(0) }
+    let val = toFloatApprox(x)
+    val = val * 0.434294481903252
+    if val < -Float(MAX_RESULT_SCALE) { val = -Float(MAX_RESULT_SCALE) }
+    if val > Float(MAX_RESULT_SCALE) { val = Float(MAX_RESULT_SCALE) }
+    let rscale = MIN_SIG_DIGITS - truncF(val)
+    rscale = maxI(rscale, x.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    return expVar(x, rscale, e)
+}
+
+// x is an integer value (no fractional digits)
+function isIntegral(x: Num): Boolean {
+    return x.digits.length == 0 || x.digits.length <= x.weight + 1
+}
+
+function isOddInt(x: Num): Boolean {
+    if x.digits.length == 0 || x.digits.length != x.weight + 1 { return false }
+    return (x.digits[x.digits.length - 1] & 1) == 1
+}
+
+public function powerNum(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) {
+        if isNaN(a) {
+            if !isSpecial(b) && b.digits.length == 0 { return one() }
+            return nan()
+        }
+        if isNaN(b) {
+            if !isSpecial(a) && cmp(a, one()) == 0 { return one() }
+            return nan()
+        }
+        let s1 = signOf(a)
+        let s2 = signOf(b)
+        if s1 == 0 && s2 < 0 {
+            setErr(e, "2201F", "zero raised to a negative power is undefined")
+            return nan()
+        }
+        if s1 < 0 && !(isSpecial(b) || isIntegral(b)) {
+            setErr(e, "2201F", "a negative number raised to a non-integer power yields a complex result")
+            return nan()
+        }
+        if !isSpecial(a) && cmp(a, one()) == 0 { return one() }
+        if s2 == 0 { return one() }
+        if !isSpecial(a) && cmp(a, negate(one())) == 0 { return one() }
+        if isInf(b) {
+            let gt = true
+            if !isSpecial(a) { gt = cmpAbs(a, one()) > 0 }
+            if gt == (s2 > 0) { return pinf() }
+            return zero(0)
+        }
+        if a.sign == NPINF {
+            if s2 > 0 { return pinf() }
+            return zero(0)
+        }
+        if s2 < 0 { return zero(0) }
+        if isOddInt(b) { return ninf() }
+        return pinf()
+    }
+    let s1 = signOf(a)
+    let s2 = signOf(b)
+    if s1 == 0 && s2 < 0 {
+        setErr(e, "2201F", "zero raised to a negative power is undefined")
+        return nan()
+    }
+    return powerVar(a, b, e)
+}
+
+function powerVar(base: Num, ex: Num, e: NErr): Num {
+    if isIntegral(ex) {
+        let ok: List<Integer> = [0]
+        let v = toInt64(ex, ok)
+        if ok[0] == 1 && v >= -2147483648 && v <= 2147483647 {
+            return powerVarInt(base, v, ex.dscale, e)
+        }
+    }
+    if base.digits.length == 0 {
+        return zero(MIN_SIG_DIGITS)
+    }
+    let b = base
+    let resNeg = false
+    if base.sign == NNEG {
+        if !isIntegral(ex) {
+            setErr(e, "2201F", "a negative number raised to a non-integer power yields a complex result")
+            return nan()
+        }
+        resNeg = isOddInt(ex)
+        b = absNum(base)
+    }
+    if b.digits.length > MAX_WORK_DIGITS / 8 || ex.digits.length > MAX_WORK_DIGITS / 8 {
+        setErr(e, "54000", "numeric value too large to compute")
+        return nan()
+    }
+    let lnw = estimateLnDweight(b)
+    let lr = maxI(8 - lnw, 0)
+    let lnb = lnVar(b, lr)
+    let lnn = mulScale(lnb, ex, lr)
+    let val = toFloatApprox(lnn)
+    let av = val
+    if av < 0.0 { av = -av }
+    if av > Float(MAX_RESULT_SCALE) * 3.01 {
+        if val > 0.0 {
+            setErr(e, "22003", "value overflows numeric format")
+            return nan()
+        }
+        return zero(MAX_DISPLAY_SCALE)
+    }
+    val = val * 0.434294481903252
+    let rscale = MIN_SIG_DIGITS - truncF(val)
+    rscale = maxI(rscale, b.dscale)
+    rscale = maxI(rscale, ex.dscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    let sig = maxI(rscale + truncF(val), 0)
+    let lr2 = maxI(sig - lnw + 8, 0)
+    lnb = lnVar(b, lr2)
+    lnn = mulScale(lnb, ex, lr2)
+    let r = expVar(lnn, rscale, e)
+    if resNeg && r.digits.length > 0 { return negate(r) }
+    return r
+}
+
+function powerVarInt(base: Num, ex: Integer, exDscale: Integer, e: NErr): Num {
+    let f = 0.0
+    if base.digits.length != 0 {
+        let fd = Float(base.digits[0])
+        let p = base.weight * 4
+        let i = 1
+        while i < base.digits.length && i * 4 < 16 {
+            fd = fd * 10000.0 + Float(base.digits[i])
+            p -= 4
+            i += 1
+        }
+        f = Float(ex) * (log10F(fd) + Float(p))
+    }
+    if f > Float((WEIGHT_MAX + 1) * 4) {
+        setErr(e, "22003", "value overflows numeric format")
+        return nan()
+    }
+    if f + 1.0 < -Float(MAX_DISPLAY_SCALE) {
+        return zero(MAX_DISPLAY_SCALE)
+    }
+    let rscale = MIN_SIG_DIGITS - truncF(f)
+    rscale = maxI(rscale, base.dscale)
+    rscale = maxI(rscale, exDscale)
+    rscale = maxI(rscale, 0)
+    rscale = minI(rscale, MAX_DISPLAY_SCALE)
+    if ex == 0 { return Num { sign: NPOS; weight: 0; dscale: rscale; digits: [1] } }
+    if ex == 1 { return roundTo(base, rscale) }
+    if ex == -1 { return divScale(one(), base, rscale, true) }
+    if ex == 2 { return mulScale(base, base, rscale) }
+    if base.digits.length == 0 {
+        if ex < 0 {
+            setErr(e, "22012", "division by zero")
+            return nan()
+        }
+        return zero(rscale)
+    }
+    let sig = 1 + rscale + truncF(f)
+    let aex = ex
+    if aex < 0 { aex = -aex }
+    sig = sig + truncF(math.log(Float(aex))) + 8
+    let neg = ex < 0
+    let mask = aex
+    let bp = base
+    let result = one()
+    if (mask & 1) == 1 { result = base }
+    mask = mask >> 1
+    while mask > 0 {
+        let lr = sig - 2 * bp.weight * 4
+        lr = minI(lr, 2 * bp.dscale)
+        lr = maxI(lr, 0)
+        bp = mulScale(bp, bp, lr)
+        if (mask & 1) == 1 {
+            let lr2 = sig - (bp.weight + result.weight) * 4
+            lr2 = minI(lr2, bp.dscale + result.dscale)
+            lr2 = maxI(lr2, 0)
+            result = mulScale(bp, result, lr2)
+        }
+        if bp.weight > WEIGHT_MAX || result.weight > WEIGHT_MAX {
+            if !neg {
+                setErr(e, "22003", "value overflows numeric format")
+                return nan()
+            }
+            result = zero(0)
+            neg = false
+            break
+        }
+        mask = mask >> 1
+    }
+    if neg {
+        if result.digits.length == 0 {
+            setErr(e, "22012", "division by zero")
+            return nan()
+        }
+        return divScale(one(), result, rscale, true)
+    }
+    return roundTo(result, rscale)
+}
+
+// gcd(a, b) / lcm(a, b) for numeric (Postgres gcd_var / numeric_lcm); specials give NaN.
+public function gcdNum(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) { return nan() }
+    let ds = maxI(a.dscale, b.dscale)
+    let x = absNum(a)
+    let y = absNum(b)
+    let c = cmpAbs(x, y)
+    if c < 0 {
+        let t = x
+        x = y
+        y = t
+    }
+    if c == 0 || y.digits.length == 0 { return withDscale(x, ds) }
+    let guard = 0
+    while guard < 100000 {
+        let m = mod(x, y, e)
+        if e.err { return nan() }
+        if m.digits.length == 0 { break }
+        x = y
+        y = absNum(m)
+        guard += 1
+    }
+    return withDscale(absNum(y), ds)
+}
+
+public function lcmNum(a: Num, b: Num, e: NErr): Num {
+    if isSpecial(a) || isSpecial(b) { return nan() }
+    let ds = maxI(a.dscale, b.dscale)
+    if a.digits.length == 0 || b.digits.length == 0 { return zero(ds) }
+    let g = gcdNum(a, b, e)
+    if e.err { return nan() }
+    let q = divScale(a, g, 0, false)
+    let r = absNum(mulScale(b, q, b.dscale))
+    return withDscale(r, ds)
+}
+
+// ---------------------------------------------------------------- aggregates helpers
+
+// numeric_stddev_internal on exact sums; null result signalled by isNull[0] = 1
+public function stddevFinal(n: Integer, sumX: Num, sumX2: Num, variance: Boolean, sample: Boolean, isNull: List<Integer>): Num {
+    isNull[0] = 0
+    if n == 0 || (sample && n <= 1) {
+        isNull[0] = 1
+        return nan()
+    }
+    if isSpecial(sumX) || isSpecial(sumX2) { return nan() }
+    let vn = fromInt(n)
+    let vnm1 = addFinite(vn, one(), true)
+    let rscale = sumX.dscale * 2
+    let sx = mulScale(sumX, sumX, rscale)
+    let sx2 = mulScale(vn, sumX2, rscale)
+    sx2 = addFinite(sx2, sx, true)
+    if signOf(sx2) <= 0 { return zero(0) }
+    let den = vnm1
+    if sample { den = mulScale(vn, vnm1, 0) } else { den = mulScale(vn, vn, 0) }
+    let rs = selectDivScale(sx2, den)
+    let r = divScale(sx2, den, rs, true)
+    if !variance { r = sqrtVar(r, rs) }
+    return r
+}
+
+// scale(x): display scale; minScale: minimal scale that keeps the value; trimScale
+public function minScale(x: Num): Integer {
+    if x.digits.length == 0 { return 0 }
+    let last = x.digits.length - 1
+    let fracW = last - x.weight
+    if fracW <= 0 { return 0 }
+    let dig = x.digits[last]
+    let s = fracW * 4
+    while dig % 10 == 0 && s > 0 {
+        dig = dig / 10
+        s -= 1
+    }
+    return s
+}
+
+public function withDscale(x: Num, ds: Integer): Num {
+    return Num { sign: x.sign; weight: x.weight; dscale: ds; digits: x.digits }
+}
+
+// Canonical hash: equal values (any display scale) hash equally.
+public function hashOf(x: Num): Integer {
+    if x.sign == NNAN { return 1000003 }
+    if x.sign == NPINF { return 1000033 }
+    if x.sign == NNINF { return 1000037 }
+    let h = 0
+    if x.sign == NNEG { h = 7 }
+    h = wrappingAdd(wrappingMultiply(h, 1099511628211), x.weight)
+    for d in x.digits {
+        h = wrappingAdd(wrappingMultiply(h, 1099511628211), d)
+    }
+    return h
+}

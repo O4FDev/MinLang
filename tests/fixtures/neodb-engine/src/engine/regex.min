@@ -1,0 +1,742 @@
+// POSIX/ARE regular expressions for ~, ~*, !~, !~* (compat agent).
+// Compiled to a small program run by a Pike VM (Thompson NFA simulation): matching is O(text x program) with no
+// backtracking and no recursion. Supported: literals, ., [...] (ranges, negation, [:class:]), \d \s \w \D \S \W,
+// escapes, ^ $ \A \Z \y \Y \m \M, groups ( ) (?: ), alternation, * + ? {m} {m,} {m,n} and their lazy forms (laziness
+// does not change a boolean match). Not supported (error 2201B): back-references, lookaround, embedded options.
+// Guards (no client input may stop the server): nesting depth, repetition bounds (PG's 255), program size, and a
+// work budget per match.
+
+public constant MAX_DEPTH = 100
+public constant MAX_PROG = 20000
+public constant MAX_REP = 255
+public constant MAX_WORK = 400000000
+
+// instructions
+constant I_CHAR = 1
+constant I_ANY = 2
+constant I_CLASS = 3
+constant I_SPLIT = 4
+constant I_JMP = 5
+constant I_BOL = 6
+constant I_EOL = 7
+constant I_WORDB = 8
+constant I_NWORDB = 9
+constant I_WSTART = 10
+constant I_WEND = 11
+constant I_MATCH = 12
+
+// parse nodes
+constant N_EMPTY = 0
+constant N_CHAR = 1
+constant N_ANY = 2
+constant N_CLASS = 3
+constant N_CAT = 4
+constant N_ALT = 5
+constant N_REP = 6
+constant N_ASSERT = 7
+
+public record Regex {
+    ok: Boolean
+    err: Text
+    errCode: Text
+    op: List<Integer>
+    a1: List<Integer>
+    a2: List<Integer>
+    // classes: 256-bit ASCII/byte map (32 bytes each) + non-ASCII code point ranges + negation
+    cmap: Bytes
+    cneg: List<Boolean>
+    crangeStart: List<Integer>   // index into cr (pairs lo, hi) per class
+    crangeCount: List<Integer>
+    cr: List<Integer>
+    // matcher state (reused)
+    mark: List<Integer>
+    gen: Integer
+    cur: Bytes
+    nxt: Bytes
+    stack: Bytes
+    work: Integer
+    pattern: Bytes
+    icase: Boolean
+}
+
+record PNode {
+    kind: Integer
+    a: Integer
+    b: Integer
+    c: Integer
+    kids: List<Integer>
+}
+
+record Parser {
+    s: Bytes
+    i: Integer
+    n: Integer
+    icase: Boolean
+    nodes: List<PNode>
+    rx: Regex
+    failed: Boolean
+    depth: Integer
+}
+
+function newRegex(pattern: Bytes, icase: Boolean): Regex {
+    return Regex { ok: true; err: ""; errCode: ""; op: []; a1: []; a2: []; cmap: Bytes(); cneg: []; crangeStart: []; crangeCount: []; cr: []
+                   mark: []; gen: 0; cur: Bytes(); nxt: Bytes(); stack: Bytes(); work: 0; pattern: pattern; icase: icase }
+}
+
+function rxFail(ps: Parser, msg: Text) {
+    if ps.failed { return }
+    ps.failed = true
+    ps.rx.ok = false
+    ps.rx.err = "invalid regular expression: " + msg
+    ps.rx.errCode = "2201B"
+}
+
+function node(ps: Parser, kind: Integer, a: Integer, b: Integer, c: Integer, kids: List<Integer>): Integer {
+    ps.nodes.add(PNode { kind: kind; a: a; b: b; c: c; kids: kids })
+    return ps.nodes.length - 1
+}
+
+// Decode one UTF-8 code point at s[i] (malformed bytes decode as themselves). Returns cp; width in w[0].
+function decode(s: Bytes, i: Integer, n: Integer, w: List<Integer>): Integer {
+    let c = s[i]
+    if c < 128 || i + 1 >= n {
+        w[0] = 1
+        return c
+    }
+    if c >= 192 && c < 224 && (s[i + 1] & 192) == 128 {
+        w[0] = 2
+        return ((c & 31) << 6) | (s[i + 1] & 63)
+    }
+    if c >= 224 && c < 240 && i + 2 < n && (s[i + 1] & 192) == 128 && (s[i + 2] & 192) == 128 {
+        w[0] = 3
+        return ((c & 15) << 12) | ((s[i + 1] & 63) << 6) | (s[i + 2] & 63)
+    }
+    if c >= 240 && c < 248 && i + 3 < n && (s[i + 1] & 192) == 128 && (s[i + 2] & 192) == 128 && (s[i + 3] & 192) == 128 {
+        w[0] = 4
+        return ((c & 7) << 18) | ((s[i + 1] & 63) << 12) | ((s[i + 2] & 63) << 6) | (s[i + 3] & 63)
+    }
+    w[0] = 1
+    return c
+}
+
+// ---------------------------------------------------------------- classes
+
+function newClass(ps: Parser, neg: Boolean): Integer {
+    let rx = ps.rx
+    let id = rx.cneg.length
+    rx.cmap.resize(rx.cmap.length + 32)
+    rx.cneg.add(neg)
+    rx.crangeStart.add(rx.cr.length)
+    rx.crangeCount.add(0)
+    return id
+}
+
+function classAdd(ps: Parser, id: Integer, lo: Integer, hi: Integer) {
+    let rx = ps.rx
+    let a = lo
+    while a <= hi && a < 128 {
+        rx.cmap[id * 32 + (a >> 3)] = rx.cmap[id * 32 + (a >> 3)] | (1 << (a & 7))
+        if ps.icase {
+            if a >= 65 && a <= 90 { setBit(rx, id, a + 32) }
+            if a >= 97 && a <= 122 { setBit(rx, id, a - 32) }
+        }
+        a += 1
+    }
+    if hi >= 128 {
+        let l = lo
+        if l < 128 { l = 128 }
+        // ranges must be appended contiguously per class: classes are built one at a time
+        rx.cr.add(l)
+        rx.cr.add(hi)
+        rx.crangeCount[id] = rx.crangeCount[id] + 1
+    }
+}
+
+function setBit(rx: Regex, id: Integer, a: Integer) {
+    rx.cmap[id * 32 + (a >> 3)] = rx.cmap[id * 32 + (a >> 3)] | (1 << (a & 7))
+}
+
+function classHas(rx: Regex, id: Integer, cp: Integer): Boolean {
+    let hit = false
+    if cp < 128 {
+        hit = (rx.cmap[id * 32 + (cp >> 3)] & (1 << (cp & 7))) != 0
+    } else {
+        let k = 0
+        let st = rx.crangeStart[id]
+        while k < rx.crangeCount[id] && !hit {
+            if cp >= rx.cr[st + 2 * k] && cp <= rx.cr[st + 2 * k + 1] { hit = true }
+            k += 1
+        }
+    }
+    if rx.cneg[id] { return !hit }
+    return hit
+}
+
+// \d \s \w (and negated forms) as classes
+function escClass(ps: Parser, ch: Integer): Integer {
+    let neg = ch == 68 || ch == 83 || ch == 87
+    let id = newClass(ps, neg)
+    addEscInto(ps, id, ch)
+    return id
+}
+
+function addEscInto(ps: Parser, id: Integer, ch: Integer) {
+    let lower = ch
+    if ch >= 65 && ch <= 90 { lower = ch + 32 }
+    if lower == 100 { classAdd(ps, id, 48, 57) }
+    if lower == 115 {
+        classAdd(ps, id, 9, 13)
+        classAdd(ps, id, 32, 32)
+    }
+    if lower == 119 {
+        classAdd(ps, id, 48, 57)
+        classAdd(ps, id, 65, 90)
+        classAdd(ps, id, 97, 122)
+        classAdd(ps, id, 95, 95)
+        classAdd(ps, id, 128, 1114111)
+    }
+}
+
+function namedClass(ps: Parser, id: Integer, name: Text): Boolean {
+    if name == "alpha" { classAdd(ps, id, 65, 90); classAdd(ps, id, 97, 122); classAdd(ps, id, 128, 1114111); return true }
+    if name == "digit" { classAdd(ps, id, 48, 57); return true }
+    if name == "alnum" { classAdd(ps, id, 48, 57); classAdd(ps, id, 65, 90); classAdd(ps, id, 97, 122); classAdd(ps, id, 128, 1114111); return true }
+    if name == "upper" { classAdd(ps, id, 65, 90); return true }
+    if name == "lower" { classAdd(ps, id, 97, 122); return true }
+    if name == "space" { classAdd(ps, id, 9, 13); classAdd(ps, id, 32, 32); return true }
+    if name == "blank" { classAdd(ps, id, 9, 9); classAdd(ps, id, 32, 32); return true }
+    if name == "punct" { classAdd(ps, id, 33, 47); classAdd(ps, id, 58, 64); classAdd(ps, id, 91, 96); classAdd(ps, id, 123, 126); return true }
+    if name == "xdigit" { classAdd(ps, id, 48, 57); classAdd(ps, id, 65, 70); classAdd(ps, id, 97, 102); return true }
+    if name == "word" { addEscInto(ps, id, 119); return true }
+    if name == "cntrl" { classAdd(ps, id, 0, 31); classAdd(ps, id, 127, 127); return true }
+    if name == "print" { classAdd(ps, id, 32, 126); classAdd(ps, id, 128, 1114111); return true }
+    if name == "graph" { classAdd(ps, id, 33, 126); classAdd(ps, id, 128, 1114111); return true }
+    return false
+}
+
+// ---------------------------------------------------------------- parser
+
+function peek(ps: Parser): Integer {
+    if ps.i >= ps.n { return -1 }
+    return ps.s[ps.i]
+}
+
+function parseAlt(ps: Parser): Integer {
+    ps.depth += 1
+    if ps.depth > MAX_DEPTH {
+        rxFail(ps, "parentheses nested too deeply")
+        ps.depth -= 1
+        return node(ps, N_EMPTY, 0, 0, 0, [])
+    }
+    let branches: List<Integer> = [parseCat(ps)]
+    while !ps.failed && peek(ps) == 124 {
+        ps.i += 1
+        branches.add(parseCat(ps))
+    }
+    ps.depth -= 1
+    if branches.length == 1 { return branches[0] }
+    return node(ps, N_ALT, 0, 0, 0, branches)
+}
+
+function parseCat(ps: Parser): Integer {
+    let items: List<Integer> = []
+    while !ps.failed {
+        let c = peek(ps)
+        if c < 0 || c == 124 || c == 41 { break }
+        let atom = parseAtom(ps)
+        if ps.failed { break }
+        atom = parseQuant(ps, atom)
+        items.add(atom)
+    }
+    if items.length == 1 { return items[0] }
+    return node(ps, N_CAT, 0, 0, 0, items)
+}
+
+function readNum(ps: Parser): Integer {
+    let x = -1
+    while ps.i < ps.n && ps.s[ps.i] >= 48 && ps.s[ps.i] <= 57 {
+        if x < 0 { x = 0 }
+        if x < 100000 { x = x * 10 + ps.s[ps.i] - 48 }
+        ps.i += 1
+    }
+    return x
+}
+
+function parseQuant(ps: Parser, atomIn: Integer): Integer {
+    let atom = atomIn
+    while !ps.failed {
+        let c = peek(ps)
+        let lo = -1
+        let hi = -1
+        if c == 42 {
+            lo = 0
+            hi = -1
+            ps.i += 1
+        } else if c == 43 {
+            lo = 1
+            hi = -1
+            ps.i += 1
+        } else if c == 63 {
+            lo = 0
+            hi = 1
+            ps.i += 1
+        } else if c == 123 {
+            // ARE: '{' not followed by a digit is an ordinary character
+            if ps.i + 1 >= ps.n || ps.s[ps.i + 1] < 48 || ps.s[ps.i + 1] > 57 { return atom }
+            ps.i += 1
+            let m = readNum(ps)
+            lo = m
+            hi = m
+            if peek(ps) == 44 {
+                ps.i += 1
+                hi = readNum(ps)
+            }
+            if peek(ps) != 125 {
+                rxFail(ps, "brace {} not balanced")
+                return atom
+            }
+            ps.i += 1
+            if lo > MAX_REP || hi > MAX_REP || (hi >= 0 && hi < lo) {
+                rxFail(ps, "invalid repetition count(s)")
+                return atom
+            }
+        } else {
+            return atom
+        }
+        if peek(ps) == 63 { ps.i += 1 }
+        let k = ps.nodes[atom].kind
+        if k == N_ASSERT || k == N_EMPTY {
+            rxFail(ps, "quantifier operand invalid")
+            return atom
+        }
+        atom = node(ps, N_REP, lo, hi, 0, [atom])
+    }
+    return atom
+}
+
+function litNode(ps: Parser, cp: Integer): Integer {
+    if ps.icase && ((cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)) {
+        let id = newClass(ps, false)
+        classAdd(ps, id, cp, cp)
+        return node(ps, N_CLASS, id, 0, 0, [])
+    }
+    return node(ps, N_CHAR, cp, 0, 0, [])
+}
+
+function parseAtom(ps: Parser): Integer {
+    let c = peek(ps)
+    if c == 40 {
+        ps.i += 1
+        if peek(ps) == 63 {
+            if ps.i + 1 < ps.n && ps.s[ps.i + 1] == 58 {
+                ps.i += 2
+            } else {
+                rxFail(ps, "lookaround constraints and embedded options are not supported")
+                return node(ps, N_EMPTY, 0, 0, 0, [])
+            }
+        }
+        let inner = node(ps, N_EMPTY, 0, 0, 0, [])
+        if peek(ps) != 41 { inner = parseAlt(ps) }
+        if ps.failed { return inner }
+        if peek(ps) != 41 {
+            rxFail(ps, "parentheses () not balanced")
+            return inner
+        }
+        ps.i += 1
+        return inner
+    }
+    if c == 41 {
+        rxFail(ps, "parentheses () not balanced")
+        return node(ps, N_EMPTY, 0, 0, 0, [])
+    }
+    if c == 46 {
+        ps.i += 1
+        return node(ps, N_ANY, 0, 0, 0, [])
+    }
+    if c == 94 {
+        ps.i += 1
+        return node(ps, N_ASSERT, I_BOL, 0, 0, [])
+    }
+    if c == 36 {
+        ps.i += 1
+        return node(ps, N_ASSERT, I_EOL, 0, 0, [])
+    }
+    if c == 91 { return parseBracket(ps) }
+    if c == 42 || c == 43 || c == 63 || (c == 123 && ps.i + 1 < ps.n && ps.s[ps.i + 1] >= 48 && ps.s[ps.i + 1] <= 57) {
+        rxFail(ps, "quantifier operand invalid")
+        return node(ps, N_EMPTY, 0, 0, 0, [])
+    }
+    if c == 92 { return parseEscape(ps) }
+    let w: List<Integer> = [1]
+    let cp = decode(ps.s, ps.i, ps.n, w)
+    ps.i += w[0]
+    return litNode(ps, cp)
+}
+
+function parseEscape(ps: Parser): Integer {
+    ps.i += 1
+    if ps.i >= ps.n {
+        rxFail(ps, "invalid escape \\ sequence")
+        return node(ps, N_EMPTY, 0, 0, 0, [])
+    }
+    let ch = ps.s[ps.i]
+    ps.i += 1
+    if ch == 100 || ch == 68 || ch == 115 || ch == 83 || ch == 119 || ch == 87 {
+        return node(ps, N_CLASS, escClass(ps, ch), 0, 0, [])
+    }
+    if ch == 65 { return node(ps, N_ASSERT, I_BOL, 1, 0, []) }
+    if ch == 90 { return node(ps, N_ASSERT, I_EOL, 1, 0, []) }
+    if ch == 121 { return node(ps, N_ASSERT, I_WORDB, 0, 0, []) }
+    if ch == 89 { return node(ps, N_ASSERT, I_NWORDB, 0, 0, []) }
+    if ch == 109 { return node(ps, N_ASSERT, I_WSTART, 0, 0, []) }
+    if ch == 77 { return node(ps, N_ASSERT, I_WEND, 0, 0, []) }
+    if ch >= 49 && ch <= 57 {
+        rxFail(ps, "invalid backreference number")
+        return node(ps, N_EMPTY, 0, 0, 0, [])
+    }
+    let cp = escapeChar(ps, ch)
+    return litNode(ps, cp)
+}
+
+// Character-entry escapes: \n \t \r \f \v \a \b \e \0 \xhh \uhhhh, else the character itself.
+function escapeChar(ps: Parser, ch: Integer): Integer {
+    if ch == 110 { return 10 }
+    if ch == 116 { return 9 }
+    if ch == 114 { return 13 }
+    if ch == 102 { return 12 }
+    if ch == 118 { return 11 }
+    if ch == 97 { return 7 }
+    if ch == 98 { return 8 }
+    if ch == 101 { return 27 }
+    if ch == 48 { return 0 }
+    if ch == 120 || ch == 117 || ch == 85 {
+        let maxd = 8
+        if ch == 117 { maxd = 4 }
+        let x = 0
+        let d = 0
+        while d < maxd && ps.i < ps.n {
+            let h = hexVal(ps.s[ps.i])
+            if h < 0 { break }
+            x = x * 16 + h
+            ps.i += 1
+            d += 1
+        }
+        if d == 0 || x > 1114111 {
+            rxFail(ps, "invalid escape \\ sequence")
+            return 0
+        }
+        return x
+    }
+    if ch >= 128 {
+        // multi-byte literal after a backslash: re-decode from its first byte
+        let w: List<Integer> = [1]
+        let cp = decode(ps.s, ps.i - 1, ps.n, w)
+        ps.i = ps.i - 1 + w[0]
+        return cp
+    }
+    return ch
+}
+
+function hexVal(c: Integer): Integer {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+function parseBracket(ps: Parser): Integer {
+    ps.i += 1
+    let neg = false
+    if peek(ps) == 94 {
+        neg = true
+        ps.i += 1
+    }
+    let id = newClass(ps, neg)
+    let first = true
+    while !ps.failed {
+        if ps.i >= ps.n {
+            rxFail(ps, "brackets [] not balanced")
+            break
+        }
+        let c = ps.s[ps.i]
+        if c == 93 && !first {
+            ps.i += 1
+            break
+        }
+        first = false
+        if c == 91 && ps.i + 1 < ps.n && ps.s[ps.i + 1] == 58 {
+            let end = ps.i + 2
+            while end + 1 < ps.n && !(ps.s[end] == 58 && ps.s[end + 1] == 93) { end += 1 }
+            if end + 1 >= ps.n {
+                rxFail(ps, "brackets [] not balanced")
+                break
+            }
+            let name = Text(ps.s.slice(ps.i + 2, end))
+            if !namedClass(ps, id, name) {
+                rxFail(ps, "invalid character class")
+                break
+            }
+            ps.i = end + 2
+            continue
+        }
+        let lo = 0
+        if c == 92 && ps.i + 1 < ps.n {
+            let e = ps.s[ps.i + 1]
+            if e == 100 || e == 115 || e == 119 {
+                addEscInto(ps, id, e)
+                ps.i += 2
+                continue
+            }
+            ps.i += 2
+            lo = escapeChar(ps, e)
+        } else {
+            let w: List<Integer> = [1]
+            lo = decode(ps.s, ps.i, ps.n, w)
+            ps.i += w[0]
+        }
+        let hi = lo
+        if ps.i + 1 < ps.n && ps.s[ps.i] == 45 && ps.s[ps.i + 1] != 93 {
+            ps.i += 1
+            if ps.s[ps.i] == 92 && ps.i + 1 < ps.n {
+                let e = ps.s[ps.i + 1]
+                ps.i += 2
+                hi = escapeChar(ps, e)
+            } else {
+                let w: List<Integer> = [1]
+                hi = decode(ps.s, ps.i, ps.n, w)
+                ps.i += w[0]
+            }
+            if hi < lo {
+                rxFail(ps, "invalid character range")
+                break
+            }
+        }
+        classAdd(ps, id, lo, hi)
+    }
+    return node(ps, N_CLASS, id, 0, 0, [])
+}
+
+// ---------------------------------------------------------------- code generation
+
+function emit(rx: Regex, op: Integer, a: Integer, b: Integer): Integer {
+    rx.op.add(op)
+    rx.a1.add(a)
+    rx.a2.add(b)
+    return rx.op.length - 1
+}
+
+function gen(ps: Parser, nid: Integer, depth: Integer) {
+    let rx = ps.rx
+    if ps.failed { return }
+    if rx.op.length > MAX_PROG || depth > MAX_DEPTH + 10 {
+        ps.failed = true
+        rx.ok = false
+        rx.err = "regular expression is too complex"
+        rx.errCode = "2201B"
+        return
+    }
+    let nd = ps.nodes[nid]
+    let k = nd.kind
+    if k == N_EMPTY { return }
+    if k == N_CHAR {
+        emit(rx, I_CHAR, nd.a, 0)
+        return
+    }
+    if k == N_ANY {
+        emit(rx, I_ANY, 0, 0)
+        return
+    }
+    if k == N_CLASS {
+        emit(rx, I_CLASS, nd.a, 0)
+        return
+    }
+    if k == N_ASSERT {
+        emit(rx, nd.a, nd.b, 0)
+        return
+    }
+    if k == N_CAT {
+        for kid in nd.kids { gen(ps, kid, depth + 1) }
+        return
+    }
+    if k == N_ALT {
+        // split L1, next; L1: a; jmp end; next: split ...
+        let jumps: List<Integer> = []
+        let i = 0
+        while i < nd.kids.length {
+            if i < nd.kids.length - 1 {
+                let sp = emit(rx, I_SPLIT, 0, 0)
+                rx.a1[sp] = rx.op.length
+                gen(ps, nd.kids[i], depth + 1)
+                jumps.add(emit(rx, I_JMP, 0, 0))
+                rx.a2[sp] = rx.op.length
+            } else {
+                gen(ps, nd.kids[i], depth + 1)
+            }
+            i += 1
+        }
+        for j in jumps { rx.a1[j] = rx.op.length }
+        return
+    }
+    if k == N_REP {
+        let lo = nd.a
+        let hi = nd.b
+        let kid = nd.kids[0]
+        let i = 0
+        while i < lo && !ps.failed {
+            gen(ps, kid, depth + 1)
+            i += 1
+        }
+        if hi < 0 {
+            // L: split body, out; body; jmp L
+            let sp = emit(rx, I_SPLIT, 0, 0)
+            rx.a1[sp] = rx.op.length
+            gen(ps, kid, depth + 1)
+            emit(rx, I_JMP, sp, 0)
+            rx.a2[sp] = rx.op.length
+            return
+        }
+        let splits: List<Integer> = []
+        while i < hi && !ps.failed {
+            let sp = emit(rx, I_SPLIT, 0, 0)
+            rx.a1[sp] = rx.op.length
+            splits.add(sp)
+            gen(ps, kid, depth + 1)
+            i += 1
+        }
+        for sp in splits { rx.a2[sp] = rx.op.length }
+        return
+    }
+}
+
+// Compile a pattern. On error: ok = false, err/errCode set.
+public function compile(pattern: Bytes, icase: Boolean): Regex {
+    let rx = newRegex(pattern, icase)
+    let ps = Parser { s: pattern; i: 0; n: pattern.length; icase: icase; nodes: []; rx: rx; failed: false; depth: 0 }
+    if pattern.length > 100000 {
+        rxFail(ps, "pattern too long")
+        return rx
+    }
+    let root = parseAlt(ps)
+    if !ps.failed && ps.i < ps.n { rxFail(ps, "parentheses () not balanced") }
+    if ps.failed { return rx }
+    gen(ps, root, 0)
+    if ps.failed { return rx }
+    emit(rx, I_MATCH, 0, 0)
+    let i = 0
+    while i < rx.op.length {
+        rx.mark.add(-1)
+        i += 1
+    }
+    return rx
+}
+
+// ---------------------------------------------------------------- matching (Pike VM)
+
+function isWord(cp: Integer): Boolean {
+    return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 95 || cp >= 128
+}
+
+// Code point before byte position pos (-1 at the start).
+function prevCp(s: Bytes, so: Integer, pos: Integer): Integer {
+    if pos <= 0 { return -1 }
+    let j = pos - 1
+    while j > 0 && (s[so + j] & 192) == 128 { j -= 1 }
+    let w: List<Integer> = [1]
+    return decode(s, so + j, so + pos, w)
+}
+
+function assertOk(rx: Regex, pc: Integer, s: Bytes, so: Integer, sl: Integer, pos: Integer): Boolean {
+    let op = rx.op[pc]
+    if op == I_BOL { return pos == 0 }
+    if op == I_EOL { return pos == sl }
+    let before = false
+    let after = false
+    let pcp = prevCp(s, so, pos)
+    if pcp >= 0 { before = isWord(pcp) }
+    if pos < sl {
+        let w: List<Integer> = [1]
+        after = isWord(decode(s, so + pos, so + sl, w))
+    }
+    if op == I_WORDB { return before != after }
+    if op == I_NWORDB { return before == after }
+    if op == I_WSTART { return !before && after }
+    return before && !after
+}
+
+// Add pc (and its epsilon closure at text position pos) to list. Returns true when MATCH is reachable.
+function addThread(rx: Regex, list: Bytes, pc0: Integer, s: Bytes, so: Integer, sl: Integer, pos: Integer): Boolean {
+    let st = rx.stack
+    st.clear()
+    st.addInt32(pc0)
+    while st.length > 0 {
+        let pc = st.getInt32(st.length - 4)
+        st.resize(st.length - 4)
+        if rx.mark[pc] == rx.gen { continue }
+        rx.mark[pc] = rx.gen
+        rx.work += 1
+        let op = rx.op[pc]
+        if op == I_MATCH { return true }
+        if op == I_JMP {
+            st.addInt32(rx.a1[pc])
+        } else if op == I_SPLIT {
+            st.addInt32(rx.a2[pc])
+            st.addInt32(rx.a1[pc])
+        } else if op >= I_BOL && op <= I_WEND {
+            if assertOk(rx, pc, s, so, sl, pos) { st.addInt32(pc + 1) }
+        } else {
+            list.addInt32(pc)
+        }
+    }
+    return false
+}
+
+// Does the regex match anywhere in s[so, so+sl)? Sets rx.ok = false / err on work-budget exhaustion.
+public function search(rx: Regex, s: Bytes, so: Integer, sl: Integer): Boolean {
+    rx.work = 0
+    rx.gen += 1
+    let cur = rx.cur
+    let nxt = rx.nxt
+    cur.clear()
+    if addThread(rx, cur, 0, s, so, sl, 0) { return true }
+    let pos = 0
+    let w: List<Integer> = [1]
+    while pos < sl {
+        let cp = decode(s, so + pos, so + sl, w)
+        let width = w[0]
+        rx.gen += 1
+        nxt.clear()
+        let i = 0
+        let n = cur.length / 4
+        while i < n {
+            let pc = cur.getInt32(i * 4)
+            let op = rx.op[pc]
+            let ok = false
+            if op == I_CHAR {
+                ok = rx.a1[pc] == cp
+            } else if op == I_ANY {
+                ok = true
+            } else if op == I_CLASS {
+                ok = classHas(rx, rx.a1[pc], cp)
+            }
+            if ok {
+                if addThread(rx, nxt, pc + 1, s, so, sl, pos + width) { return true }
+            }
+            i += 1
+        }
+        pos += width
+        // unanchored search: a new attempt starts at every position
+        if addThread(rx, nxt, 0, s, so, sl, pos) { return true }
+        let tmp = cur
+        cur = nxt
+        nxt = tmp
+        if rx.work > MAX_WORK {
+            rx.ok = false
+            rx.err = "regular expression is too complex"
+            rx.errCode = "54000"
+            return false
+        }
+    }
+    rx.cur = cur
+    rx.nxt = nxt
+    return false
+}

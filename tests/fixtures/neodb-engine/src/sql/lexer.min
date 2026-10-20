@@ -1,0 +1,799 @@
+// SQL lexer (PostgreSQL dialect). Works on the UTF-8 bytes of the input; token positions are
+// reported as character offsets. Keywords are recognised here (hash lookup into keywords.min) so the
+// parser compares Integer ids; token texts are materialised lazily.
+
+use "math" as math
+use "./keywords.min" as kw
+
+public constant T_EOF = 0
+public constant T_IDENT = 1     // unquoted identifier or keyword, lower-cased; code = KW_* reservation class
+public constant T_QIDENT = 2    // "quoted identifier", verbatim
+public constant T_INT = 3       // integer literal; text = digits, ival = value, flags 1 = overflow
+public constant T_NUM = 4       // decimal / exponent literal; text as written
+public constant T_STR = 5       // string literal; text = decoded value; flags = ast F_STR_* bits; ival = 2/16 for B''/X''
+public constant T_PARAM = 6     // $n; ival = n
+public constant T_OP = 7        // operator or punctuation; text = symbol; code = byte for one-char symbols or C_*
+
+// identifier reservation classes (code of T_IDENT)
+public constant KW_NONE = 0
+public constant KW_RESERVED = 1     // cannot be a column name, table name or bare alias
+public constant KW_TYPE_FUNC = 2    // may name a function or type, not a column; never a bare alias
+
+// multi-character symbol codes
+public constant C_TYPECAST = 256    // ::
+public constant C_LE = 257          // <=
+public constant C_GE = 258          // >=
+public constant C_NE = 259          // <> or !=
+public constant C_CONCAT = 260      // ||
+public constant C_ARROW = 261       // =>
+public constant C_COLONEQ = 262     // :=
+public constant C_OTHER = 300       // any other multi-character operator
+
+// Token storage: one Bytes buffer, TOKEN_SIZE bytes per token:
+//   0 kind (u8) | 1 flags (u8) | 2 code (u16) | 4 keyword id (u16) | 8 char start (i32)
+//   12 byte start (i32) | 16 byte end (i32) | 20 decoded-text index (i32, -1 = slice of folded source) | 24 ival (i64)
+constant TOKEN_SIZE = 32
+
+public record Tokens {
+    buf: Bytes
+    count: Integer
+    source: Bytes               // UTF-8 input
+    folded: Bytes               // input with unquoted identifiers lower-cased
+    foldedText: Text            // Text(folded), used for cheap slicing when the input is ASCII
+    texts: List<Text>           // decoded texts (strings, quoted identifiers, converted numbers)
+    charLength: Integer
+    error: Text
+    errorPos: Integer
+    errorState: Text            // "42601" syntax, "22021" invalid UTF-8
+    maxParam: Integer
+    ascii: Boolean
+    charIndex: List<Integer>    // byte offset -> char offset (only when input is not ASCII)
+}
+
+record Lex {
+    src: Bytes
+    n: Integer
+    i: Integer
+    toks: Tokens
+    ascii: Boolean
+    folding: Boolean
+}
+
+public function tokenize(sql: Text): Tokens {
+    let src = Bytes(sql)
+    let n = src.length
+    let toks = Tokens {
+        buf: Bytes((n / 8 + 8) * TOKEN_SIZE); count: 0; source: src; folded: src; foldedText: sql; texts: []
+        charLength: n; error: ""; errorPos: -1; errorState: "42601"; maxParam: 0; ascii: true; charIndex: []
+    }
+    let lx = Lex { src: src; n: n; i: 0; toks: toks; ascii: true; folding: false }
+    for b in src {
+        if b >= 128 { lx.ascii = false }
+    }
+    toks.ascii = lx.ascii
+    if !lx.ascii {
+        let bad = invalidUtf8At(src)
+        if bad >= 0 {
+            let hex = "0123456789abcdef"
+            toks.error = "invalid byte sequence for encoding \"UTF8\": 0x" + hex.slice(src[bad] >> 4, (src[bad] >> 4) + 1) +
+                hex.slice(src[bad] & 15, (src[bad] & 15) + 1)
+            toks.errorPos = 0
+            toks.errorState = "22021"
+            return toks
+        }
+        let count = 0
+        for b in src {
+            toks.charIndex.add(count)
+            if b < 128 || b >= 192 { count += 1 }
+        }
+        toks.charIndex.add(count)
+        toks.charLength = count
+    }
+    scan(lx)
+    if lx.folding { toks.foldedText = Text(toks.folded) }
+    return toks
+}
+
+// Offset of the first byte that is not valid UTF-8, or -1.
+function invalidUtf8At(src: Bytes): Integer {
+    let i = 0
+    let n = src.length
+    while i < n {
+        let first = src[i]
+        if first < 128 {
+            i += 1
+        } else {
+            let count = 0
+            let lower = 128
+            let upper = 191
+            if first >= 194 && first <= 223 { count = 2 }
+            if first >= 224 && first <= 239 {
+                count = 3
+                if first == 224 { lower = 160 }
+                if first == 237 { upper = 159 }
+            }
+            if first >= 240 && first <= 244 {
+                count = 4
+                if first == 240 { lower = 144 }
+                if first == 244 { upper = 143 }
+            }
+            if count == 0 || count > n - i { return i }
+            let second = src[i + 1]
+            if second < lower || second > upper { return i }
+            for k in 2..count {
+                let c = src[i + k]
+                if c < 128 || c > 191 { return i }
+            }
+            if first == 0 { return i }
+            i += count
+        }
+    }
+    return -1
+}
+
+// Character offset of a byte offset into the source.
+public function charAt(toks: Tokens, byteOffset: Integer): Integer {
+    if toks.ascii { return byteOffset }
+    return toks.charIndex[byteOffset]
+}
+
+public function kindAt(t: Tokens, i: Integer): Integer {
+    return t.buf[i * TOKEN_SIZE]
+}
+
+public function flagsAt(t: Tokens, i: Integer): Integer {
+    return t.buf[i * TOKEN_SIZE + 1]
+}
+
+public function codeAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getUInt16(i * TOKEN_SIZE + 2)
+}
+
+public function kwAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getUInt16(i * TOKEN_SIZE + 4)
+}
+
+public function startAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getInt32(i * TOKEN_SIZE + 8)
+}
+
+public function bstartAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getInt32(i * TOKEN_SIZE + 12)
+}
+
+public function bendAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getInt32(i * TOKEN_SIZE + 16)
+}
+
+public function ivalAt(t: Tokens, i: Integer): Integer {
+    return t.buf.getInt64(i * TOKEN_SIZE + 24)
+}
+
+// Token text: lower-cased identifier, decoded string / quoted identifier, number as written, operator symbol.
+public function textAt(t: Tokens, i: Integer): Text {
+    let o = i * TOKEN_SIZE
+    let kind = t.buf[o]
+    if kind == T_IDENT {
+        let k = t.buf.getUInt16(o + 4)
+        if k != 0 { return kw.text(k) }
+    }
+    let ti = t.buf.getInt32(o + 20)
+    if ti >= 0 { return t.texts[ti] }
+    if kind == T_OP {
+        let code = t.buf.getUInt16(o + 2)
+        if code < 256 { return symbolText(code) }
+        if code == C_TYPECAST { return "::" }
+        if code == C_LE { return "<=" }
+        if code == C_GE { return ">=" }
+        if code == C_NE { return "<>" }
+        if code == C_CONCAT { return "||" }
+        if code == C_ARROW { return "=>" }
+        if code == C_COLONEQ { return ":=" }
+    }
+    return sourceSlice(t, t.buf.getInt32(o + 12), t.buf.getInt32(o + 16))
+}
+
+// Raw source text of a token (as written, not folded).
+public function rawAt(t: Tokens, i: Integer): Text {
+    return Text(t.source.slice(bstartAt(t, i), bendAt(t, i)))
+}
+
+function sourceSlice(t: Tokens, bs: Integer, be: Integer): Text {
+    if t.ascii && t.source.length <= 65536 { return t.foldedText.slice(bs, be) }
+    return Text(t.folded.slice(bs, be))
+}
+
+function charPos(lx: Lex, b: Integer): Integer {
+    if lx.ascii { return b }
+    return lx.toks.charIndex[b]
+}
+
+function push(lx: Lex, kind: Integer, code: Integer, keyword: Integer, bs: Integer, be: Integer, ival: Integer, flags: Integer, textIndex: Integer) {
+    let t = lx.toks
+    let o = t.count * TOKEN_SIZE
+    if o + TOKEN_SIZE > t.buf.length { t.buf.resize(t.buf.length * 2 + TOKEN_SIZE) }
+    let buf = t.buf
+    buf[o] = kind
+    buf[o + 1] = flags
+    buf.setUInt16(o + 2, code)
+    buf.setUInt16(o + 4, keyword)
+    buf.setInt32(o + 8, charPos(lx, bs))
+    buf.setInt32(o + 12, bs)
+    buf.setInt32(o + 16, be)
+    buf.setInt32(o + 20, textIndex)
+    buf.setInt64(o + 24, ival)
+    t.count += 1
+}
+
+function addText(lx: Lex, text: Text): Integer {
+    lx.toks.texts.add(text)
+    return lx.toks.texts.length - 1
+}
+
+function lexError(lx: Lex, message: Text, at: Integer) {
+    if lx.toks.error == "" {
+        lx.toks.error = message
+        lx.toks.errorPos = charPos(lx, at)
+    }
+    lx.i = lx.n
+}
+
+function isSpace(b: Integer): Boolean {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 12 || b == 11
+}
+
+function isDigit(b: Integer): Boolean {
+    return b >= 48 && b <= 57
+}
+
+function isIdentStart(b: Integer): Boolean {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95 || b >= 128
+}
+
+function isIdentChar(b: Integer): Boolean {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95 || b >= 128 || (b >= 48 && b <= 57) || b == 36
+}
+
+// + - * / < > = ~ ! @ # % ^ & | ` ?
+function isOpChar(b: Integer): Boolean {
+    return b == 43 || b == 45 || b == 42 || b == 47 || b == 60 || b == 62 || b == 61 || b == 126 || b == 33 ||
+        b == 64 || b == 35 || b == 37 || b == 94 || b == 38 || b == 124 || b == 96 || b == 63
+}
+
+function slice(lx: Lex, s: Integer, e: Integer): Text {
+    return Text(lx.src.slice(s, e))
+}
+
+function scan(lx: Lex) {
+    let src = lx.src
+    let n = lx.n
+    while lx.i < n {
+        let b = src[lx.i]
+        if isSpace(b) {
+            lx.i += 1
+            continue
+        }
+        let s = lx.i
+        let next = -1
+        if s + 1 < n { next = src[s + 1] }
+        // comments
+        if b == 45 && next == 45 {
+            while lx.i < n && src[lx.i] != 10 { lx.i += 1 }
+            continue
+        }
+        if b == 47 && next == 42 {
+            let depth = 1
+            lx.i += 2
+            while lx.i < n && depth > 0 {
+                let c = src[lx.i]
+                if c == 47 && lx.i + 1 < n && src[lx.i + 1] == 42 {
+                    depth += 1
+                    lx.i += 2
+                } else if c == 42 && lx.i + 1 < n && src[lx.i + 1] == 47 {
+                    depth -= 1
+                    lx.i += 2
+                } else {
+                    lx.i += 1
+                }
+            }
+            if depth > 0 { lexError(lx, "unterminated /* comment at or near \"" + slice(lx, s, min(n, s + 20)) + "\"", s) }
+            continue
+        }
+        // strings with prefixes
+        if next == 39 && (b == 69 || b == 101) {
+            lx.i = s + 1
+            scanString(lx, s, true, 1)
+            continue
+        }
+        if next == 39 && (b == 66 || b == 98 || b == 88 || b == 120) {
+            lx.i = s + 1
+            scanBitString(lx, s, b == 66 || b == 98)
+            continue
+        }
+        if next == 39 && (b == 78 || b == 110) {
+            lx.i = s + 1
+            scanString(lx, s, false, 8)
+            continue
+        }
+        if b == 39 {
+            scanString(lx, s, false, 0)
+            continue
+        }
+        if isIdentStart(b) {
+            scanIdent(lx)
+            continue
+        }
+        if isDigit(b) || (b == 46 && isDigit(next)) {
+            scanNumber(lx)
+            continue
+        }
+        if b == 34 {
+            scanQuotedIdent(lx)
+            continue
+        }
+        if b == 36 {
+            if isDigit(next) {
+                lx.i = s + 1
+                let v = 0
+                while lx.i < n && isDigit(src[lx.i]) {
+                    if v < 100000000 { v = v * 10 + src[lx.i] - 48 }
+                    lx.i += 1
+                }
+                if v > lx.toks.maxParam { lx.toks.maxParam = v }
+                push(lx, T_PARAM, 0, 0, s, lx.i, v, 0, -1)
+                continue
+            }
+            scanDollarString(lx)
+            continue
+        }
+        // punctuation
+        if b == 40 || b == 41 || b == 44 || b == 59 || b == 91 || b == 93 || b == 46 {
+            lx.i = s + 1
+            push(lx, T_OP, b, 0, s, s + 1, 0, 0, -1)
+            continue
+        }
+        if b == 58 {
+            if next == 58 {
+                lx.i = s + 2
+                push(lx, T_OP, C_TYPECAST, 0, s, s + 2, 0, 0, -1)
+            } else if next == 61 {
+                lx.i = s + 2
+                push(lx, T_OP, C_COLONEQ, 0, s, s + 2, 0, 0, -1)
+            } else {
+                lx.i = s + 1
+                push(lx, T_OP, 58, 0, s, s + 1, 0, 0, -1)
+            }
+            continue
+        }
+        if isOpChar(b) {
+            scanOperator(lx)
+            continue
+        }
+        lexError(lx, "syntax error at or near \"" + slice(lx, s, s + 1) + "\"", s)
+    }
+    push(lx, T_EOF, 0, 0, n, n, 0, 0, -1)
+}
+
+function symbolText(b: Integer): Text {
+    if b == 40 { return "(" }
+    if b == 41 { return ")" }
+    if b == 44 { return "," }
+    if b == 59 { return ";" }
+    if b == 91 { return "[" }
+    if b == 93 { return "]" }
+    if b == 46 { return "." }
+    if b == 43 { return "+" }
+    if b == 45 { return "-" }
+    if b == 42 { return "*" }
+    if b == 47 { return "/" }
+    if b == 60 { return "<" }
+    if b == 62 { return ">" }
+    if b == 61 { return "=" }
+    if b == 126 { return "~" }
+    if b == 37 { return "%" }
+    if b == 94 { return "^" }
+    if b == 38 { return "&" }
+    if b == 124 { return "|" }
+    if b == 35 { return "#" }
+    if b == 64 { return "@" }
+    if b == 33 { return "!" }
+    if b == 63 { return "?" }
+    return Text(Character(b))
+}
+
+function scanOperator(lx: Lex) {
+    let src = lx.src
+    let s = lx.i
+    let e = s
+    while e < lx.n && isOpChar(src[e]) {
+        // a comment start ends the operator
+        if e > s && e + 1 < lx.n && ((src[e] == 45 && src[e + 1] == 45) || (src[e] == 47 && src[e + 1] == 42)) { break }
+        e += 1
+    }
+    let len = e - s
+    if len > 1 && (src[e - 1] == 43 || src[e - 1] == 45) {
+        let special = false
+        for k in s..e {
+            let c = src[k]
+            if c == 126 || c == 33 || c == 64 || c == 35 || c == 37 || c == 94 || c == 38 || c == 124 || c == 96 || c == 63 { special = true }
+        }
+        if !special {
+            while e - s > 1 && (src[e - 1] == 43 || src[e - 1] == 45) { e -= 1 }
+        }
+    }
+    len = e - s
+    lx.i = e
+    if len == 1 {
+        let b = src[s]
+        push(lx, T_OP, b, 0, s, e, 0, 0, -1)
+        return
+    }
+    let a = src[s]
+    let b2 = src[s + 1]
+    if len == 2 {
+        if a == 60 && b2 == 61 { push(lx, T_OP, C_LE, 0, s, e, 0, 0, -1); return }
+        if a == 62 && b2 == 61 { push(lx, T_OP, C_GE, 0, s, e, 0, 0, -1); return }
+        if a == 60 && b2 == 62 { push(lx, T_OP, C_NE, 0, s, e, 0, 0, -1); return }
+        if a == 33 && b2 == 61 { push(lx, T_OP, C_NE, 0, s, e, 0, 0, -1); return }
+        if a == 124 && b2 == 124 { push(lx, T_OP, C_CONCAT, 0, s, e, 0, 0, -1); return }
+        if a == 61 && b2 == 62 { push(lx, T_OP, C_ARROW, 0, s, e, 0, 0, -1); return }
+    }
+    push(lx, T_OP, C_OTHER, 0, s, e, 0, 0, -1)
+}
+
+function scanIdent(lx: Lex) {
+    let src = lx.src
+    let s = lx.i
+    let n = lx.n
+    let h = kw.HASH_SEED
+    let e = s
+    while e < n {
+        let c = src[e]
+        if (c >= 97 && c <= 122) || c == 95 || (c >= 48 && c <= 57) {
+            h = wrappingMultiply(h ^ c, kw.HASH_PRIME)
+        } else if c >= 65 && c <= 90 {
+            foldByte(lx, e, c + 32)
+            h = wrappingMultiply(h ^ (c + 32), kw.HASH_PRIME)
+        } else if c >= 128 || c == 36 {
+            h = wrappingMultiply(h ^ c, kw.HASH_PRIME)
+        } else {
+            break
+        }
+        e += 1
+    }
+    lx.i = e
+    let id = 0
+    if e - s <= 17 { id = kw.lookup(h, e - s) }
+    let cls = KW_NONE
+    if id > 0 && id <= kw.RESERVED_MAX {
+        cls = KW_RESERVED
+    } else if id > kw.RESERVED_MAX && id <= kw.TYPE_FUNC_MAX {
+        cls = KW_TYPE_FUNC
+    }
+    push(lx, T_IDENT, cls, id, s, e, 0, 0, -1)
+}
+
+// Lower-case one identifier byte in the folded copy of the source (copied on first use).
+function foldByte(lx: Lex, at: Integer, value: Integer) {
+    let t = lx.toks
+    if !lx.folding {
+        t.folded = lx.src.slice(0, lx.n)
+        lx.folding = true
+    }
+    t.folded[at] = value
+}
+
+function scanQuotedIdent(lx: Lex) {
+    let src = lx.src
+    let s = lx.i
+    lx.i += 1
+    let buf = Bytes()
+    while true {
+        if lx.i >= lx.n {
+            lexError(lx, "unterminated quoted identifier at or near \"" + slice(lx, s, min(lx.n, s + 20)) + "\"", s)
+            return
+        }
+        let c = src[lx.i]
+        if c == 34 {
+            if lx.i + 1 < lx.n && src[lx.i + 1] == 34 {
+                buf.add(34)
+                lx.i += 2
+                continue
+            }
+            lx.i += 1
+            break
+        }
+        buf.add(c)
+        lx.i += 1
+    }
+    if buf.length == 0 {
+        lexError(lx, "zero-length delimited identifier at or near \"\"\"\"", s)
+        return
+    }
+    push(lx, T_QIDENT, 0, 0, s, lx.i, 0, 0, addText(lx, Text(buf)))
+}
+
+function scanNumber(lx: Lex) {
+    let src = lx.src
+    let n = lx.n
+    let s = lx.i
+    // 0x / 0o / 0b integers
+    if src[s] == 48 && s + 2 < n {
+        let p = src[s + 1] | 32
+        let base = 0
+        if p == 120 { base = 16 }
+        if p == 111 { base = 8 }
+        if p == 98 { base = 2 }
+        if base > 0 && digitValue(src[s + 2]) >= 0 && digitValue(src[s + 2]) < base {
+            let k = s + 2
+            let v = 0
+            let overflow = false
+            while k < n && (digitValue(src[k]) >= 0 && digitValue(src[k]) < base || src[k] == 95) {
+                if src[k] != 95 {
+                    let d = digitValue(src[k])
+                    if v > (9223372036854775807 - d) / base { overflow = true } else { v = v * base + d }
+                }
+                k += 1
+            }
+            lx.i = k
+            let flags = 0
+            if overflow { flags = 1 }
+            push(lx, T_INT, 0, 0, s, k, v, flags, addText(lx, Text(v)))
+            return
+        }
+    }
+    let k = s
+    let isFloat = false
+    while k < n && (isDigit(src[k]) || (src[k] == 95 && k + 1 < n && isDigit(src[k + 1]))) {
+        k += 1
+    }
+    if k < n && src[k] == 46 && !(k + 1 < n && src[k + 1] == 46) {
+        isFloat = true
+        k += 1
+        while k < n && isDigit(src[k]) { k += 1 }
+    }
+    let exp = 0
+    if k < n && (src[k] | 32) == 101 {
+        let m = k + 1
+        let sign = 1
+        if m < n && (src[m] == 43 || src[m] == 45) {
+            if src[m] == 45 { sign = -1 }
+            m += 1
+        }
+        if m < n && isDigit(src[m]) {
+            isFloat = true
+            while m < n && isDigit(src[m]) {
+                if exp < 100000 { exp = exp * 10 + src[m] - 48 }
+                m += 1
+            }
+            exp = exp * sign
+            k = m
+        }
+    }
+    lx.i = k
+    if isFloat {
+        push(lx, T_NUM, 0, 0, s, k, 0, 0, -1)
+        return
+    }
+    // integer: compute value with overflow detection
+    let v = 0
+    let overflow = false
+    for j in s..k {
+        let c = src[j]
+        if c != 95 {
+            let d = c - 48
+            if overflow || v > (9223372036854775807 - d) / 10 { overflow = true } else { v = v * 10 + d }
+        }
+    }
+    let flags = 0
+    if overflow {
+        flags = 1
+        v = 0
+    }
+    push(lx, T_INT, 0, 0, s, k, v, flags, -1)
+}
+
+// Approximate value of a numeric literal's text (used for K_NUM_LIT.floatValue).
+public function approximateFloat(text: Text): Float {
+    let b = Bytes(text)
+    let mant = 0.0
+    let scale = 0
+    let k = 0
+    let n = b.length
+    let seenDot = false
+    while k < n && (isDigit(b[k]) || b[k] == 46 || b[k] == 95) {
+        if b[k] == 46 {
+            seenDot = true
+        } else if b[k] != 95 {
+            mant = mant * 10.0 + Float(b[k] - 48)
+            if seenDot { scale -= 1 }
+        }
+        k += 1
+    }
+    if k < n && (b[k] | 32) == 101 {
+        k += 1
+        let sign = 1
+        if k < n && (b[k] == 43 || b[k] == 45) {
+            if b[k] == 45 { sign = -1 }
+            k += 1
+        }
+        let e = 0
+        while k < n && isDigit(b[k]) {
+            if e < 100000 { e = e * 10 + b[k] - 48 }
+            k += 1
+        }
+        scale += sign * e
+    }
+    if scale == 0 { return mant }
+    return mant * math.pow(10.0, Float(scale))
+}
+
+function digitValue(b: Integer): Integer {
+    if b >= 48 && b <= 57 { return b - 48 }
+    let l = b | 32
+    if l >= 97 && l <= 102 { return l - 87 }
+    return -1
+}
+
+// lx.i points at the opening quote. flags: 1 = E'' escapes, 8 = N''.
+function scanString(lx: Lex, s: Integer, escapes: Boolean, flags: Integer) {
+    let src = lx.src
+    let n = lx.n
+    let buf = Bytes()
+    let flagsOut = flags
+    while true {
+        // lx.i at an opening quote
+        lx.i += 1
+        while true {
+            if lx.i >= n {
+                lexError(lx, "unterminated quoted string at or near \"" + slice(lx, s, min(n, s + 20)) + "\"", s)
+                return
+            }
+            let c = src[lx.i]
+            if c == 39 {
+                if lx.i + 1 < n && src[lx.i + 1] == 39 {
+                    buf.add(39)
+                    lx.i += 2
+                    continue
+                }
+                lx.i += 1
+                break
+            }
+            if c == 92 && escapes {
+                lx.i += 1
+                if lx.i >= n { continue }
+                let e = src[lx.i]
+                if e == 110 { buf.add(10); lx.i += 1 }
+                else if e == 116 { buf.add(9); lx.i += 1 }
+                else if e == 114 { buf.add(13); lx.i += 1 }
+                else if e == 98 { buf.add(8); lx.i += 1 }
+                else if e == 102 { buf.add(12); lx.i += 1 }
+                else if e >= 48 && e <= 55 {
+                    let v = 0
+                    let count = 0
+                    while count < 3 && lx.i < n && src[lx.i] >= 48 && src[lx.i] <= 55 {
+                        v = v * 8 + src[lx.i] - 48
+                        lx.i += 1
+                        count += 1
+                    }
+                    buf.add(v & 255)
+                } else if e == 120 {
+                    lx.i += 1
+                    let v = 0
+                    let count = 0
+                    while count < 2 && lx.i < n && digitValue(src[lx.i]) >= 0 {
+                        v = v * 16 + digitValue(src[lx.i])
+                        lx.i += 1
+                        count += 1
+                    }
+                    if count == 0 { buf.add(120) } else { buf.add(v) }   // PG keeps a bare \x as "x"
+                } else if e == 117 || e == 85 {
+                    let want = 4
+                    if e == 85 { want = 8 }
+                    lx.i += 1
+                    let v = 0
+                    let count = 0
+                    while count < want && lx.i < n && digitValue(src[lx.i]) >= 0 {
+                        v = v * 16 + digitValue(src[lx.i])
+                        lx.i += 1
+                        count += 1
+                    }
+                    addUtf8(buf, v)
+                } else {
+                    buf.add(e)
+                    lx.i += 1
+                }
+                continue
+            }
+            buf.add(c)
+            lx.i += 1
+        }
+        // continuation: whitespace with a newline, then another quote
+        let k = lx.i
+        let newline = false
+        while k < n && isSpace(src[k]) {
+            if src[k] == 10 || src[k] == 13 { newline = true }
+            k += 1
+        }
+        if newline && k < n && src[k] == 39 {
+            lx.i = k
+            continue
+        }
+        break
+    }
+    push(lx, T_STR, 0, 0, s, lx.i, 0, flagsOut, addText(lx, Text(buf)))
+}
+
+function addUtf8(buf: Bytes, v: Integer) {
+    if v < 128 {
+        buf.add(v)
+    } else if v < 2048 {
+        buf.add(192 | (v >> 6))
+        buf.add(128 | (v & 63))
+    } else if v < 65536 {
+        buf.add(224 | (v >> 12))
+        buf.add(128 | ((v >> 6) & 63))
+        buf.add(128 | (v & 63))
+    } else {
+        buf.add(240 | ((v >> 18) & 7))
+        buf.add(128 | ((v >> 12) & 63))
+        buf.add(128 | ((v >> 6) & 63))
+        buf.add(128 | (v & 63))
+    }
+}
+
+function scanBitString(lx: Lex, s: Integer, binary: Boolean) {
+    let src = lx.src
+    lx.i += 1
+    let start = lx.i
+    while lx.i < lx.n && src[lx.i] != 39 { lx.i += 1 }
+    if lx.i >= lx.n {
+        lexError(lx, "unterminated bit string literal at or near \"" + slice(lx, s, min(lx.n, s + 20)) + "\"", s)
+        return
+    }
+    let text = slice(lx, start, lx.i)
+    lx.i += 1
+    let base = 16
+    if binary { base = 2 }
+    push(lx, T_STR, 0, 0, s, lx.i, base, 4, addText(lx, text))
+}
+
+// lx.i at '$' which is not followed by a digit.
+function scanDollarString(lx: Lex) {
+    let src = lx.src
+    let n = lx.n
+    let s = lx.i
+    let k = s + 1
+    while k < n && src[k] != 36 {
+        if !isIdentChar(src[k]) || src[k] == 36 {
+            lexError(lx, "syntax error at or near \"$\"", s)
+            return
+        }
+        k += 1
+    }
+    if k >= n {
+        lexError(lx, "syntax error at or near \"$\"", s)
+        return
+    }
+    let tagLen = k - s + 1     // includes both dollars
+    let bodyStart = k + 1
+    let j = bodyStart
+    while j < n {
+        if src[j] == 36 && j + tagLen <= n {
+            let same = true
+            for m in 0..tagLen {
+                if src[j + m] != src[s + m] {
+                    same = false
+                    break
+                }
+            }
+            if same {
+                lx.i = j + tagLen
+                push(lx, T_STR, 0, 0, s, lx.i, 0, 2, addText(lx, slice(lx, bodyStart, j)))
+                return
+            }
+        }
+        j += 1
+    }
+    lexError(lx, "unterminated dollar-quoted string at or near \"" + slice(lx, s, min(n, s + 20)) + "\"", s)
+}

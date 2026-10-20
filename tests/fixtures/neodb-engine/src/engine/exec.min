@@ -1,0 +1,5923 @@
+// Plan arena, register-based expression evaluator and pull-based operators.
+// Every expression node owns a register (null flag, Integer, aux Integers, Float, text view); evaluating a node
+// writes its register. Operators set slot rows; column references read table storage directly.
+use "math" as math
+use "./values.min" as v
+use "./hashmap.min" as hm
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+use "./txn.min" as txn
+use "./numeric.min" as nm
+use "./strfn.min" as sf
+use "./pgcatalog.min" as pgc
+use "./regex.min" as rx
+
+// ---- value classes
+public constant CL_INT = 0
+public constant CL_FLT = 1
+public constant CL_NUM = 2
+public constant CL_TEXT = 3
+public constant CL_IV = 4
+public constant CL_BPCHAR = 5
+
+// ---- expression kinds
+public constant EX_CONST = 1
+public constant EX_PARAM = 2
+public constant EX_COL = 3
+public constant EX_ARITH = 4
+public constant EX_CMP = 5
+public constant EX_AND = 6
+public constant EX_OR = 7
+public constant EX_NOT = 8
+public constant EX_ISNULL = 9
+public constant EX_CAST = 10
+public constant EX_NEG = 11
+public constant EX_CASE = 12
+public constant EX_COALESCE = 13
+public constant EX_NULLIF = 14
+public constant EX_GREATEST = 15
+public constant EX_INLIST = 16
+public constant EX_LIKE = 17
+public constant EX_CONCAT = 18
+public constant EX_FUNC = 19
+public constant EX_SUBQ = 20
+public constant EX_EXISTS = 21
+public constant EX_INSUB = 22
+public constant EX_ISBOOL = 23
+public constant EX_DISTINCT = 24
+public constant EX_QUANT = 25
+public constant EX_LITCAST = 26   // runtime cast of an unknown-typed literal/param (text) to a type
+public constant EX_NOW = 27
+// compat agent: a ~ b (c: 1 negate | 2 case-insensitive), a[b] on catalog arrays, (a).field of a record (c: field 0 x, 1 n)
+public constant EX_REGEX = 50
+public constant EX_SUBSCRIPT = 51
+public constant EX_FIELD = 52
+
+// arithmetic modes
+public constant AM_INT = 0
+public constant AM_FLT = 1
+public constant AM_NUM = 2
+public constant AM_DATE_INT = 3
+public constant AM_DATE_DATE = 4
+public constant AM_DATE_IV = 5
+public constant AM_TS_IV = 6
+public constant AM_TS_TS = 7
+public constant AM_IV_IV = 8
+public constant AM_IV_MUL = 9
+public constant AM_INT_DATE = 10
+public constant AM_IV_DIV = 11
+
+// ops (same numbering as the AST)
+public constant OPR_ADD = 1
+public constant OPR_SUB = 2
+public constant OPR_MUL = 3
+public constant OPR_DIV = 4
+public constant OPR_MOD = 5
+public constant OPR_POW = 6
+public constant OPR_EQ = 10
+public constant OPR_NE = 11
+public constant OPR_LT = 12
+public constant OPR_LE = 13
+public constant OPR_GT = 14
+public constant OPR_GE = 15
+public constant OPR_BAND = 40
+public constant OPR_BOR = 41
+public constant OPR_BXOR = 42
+public constant OPR_SHL = 43
+public constant OPR_SHR = 44
+public constant OPR_BNOT = 45
+
+// functions
+public constant FN_ABS = 1
+public constant FN_ROUND = 2
+public constant FN_FLOOR = 3
+public constant FN_CEIL = 4
+public constant FN_MOD = 5
+public constant FN_POWER = 6
+public constant FN_SQRT = 7
+public constant FN_LENGTH = 8
+public constant FN_LOWER = 9
+public constant FN_UPPER = 10
+public constant FN_SUBSTR = 11
+public constant FN_POSITION = 12
+public constant FN_BTRIM = 13
+public constant FN_LTRIM = 14
+public constant FN_RTRIM = 15
+public constant FN_REPLACE = 16
+public constant FN_EXTRACT = 17
+public constant FN_TRUNC = 18
+public constant FN_SIGN = 19
+public constant FN_LEFT = 20
+public constant FN_RIGHT = 21
+public constant FN_CONCAT = 22
+public constant FN_EXP = 23
+public constant FN_LN = 24
+public constant FN_LOG10 = 25
+public constant FN_RANDOM = 26
+public constant FN_CHR = 27
+public constant FN_ASCII = 28
+public constant FN_REPEAT = 29
+public constant FN_REVERSE = 30
+public constant FN_LPAD = 31
+public constant FN_RPAD = 32
+public constant FN_STRPOS = 33
+public constant FN_DATE_TRUNC = 34
+public constant FN_TEXTCONST = 35   // returns a constant text computed at plan time (version(), current_setting)
+public constant FN_OCTET_LENGTH = 36
+public constant FN_INITCAP = 37
+public constant FN_CBRT = 38
+public constant FN_PI = 39
+public constant FN_DIV = 40
+public constant FN_TO_CHAR = 41
+public constant FN_SPLIT_PART = 42
+public constant FN_MD5 = 43
+public constant FN_AGE = 44
+public constant FN_TRANSLATE = 45
+public constant FN_CONCAT_WS = 46
+// r2 sql agent range (300+)
+public constant FN_GCD = 380
+public constant FN_LCM = 381
+public constant FN_BOOLAND = 382
+public constant FN_BOOLOR = 383
+// string / bytea functions evaluated by evalStrFunc (algorithms in strfn.min)
+public constant FN_STR_BASE = 200
+public constant FN_QUOTE_LITERAL = 200
+public constant FN_QUOTE_IDENT = 201
+public constant FN_QUOTE_NULLABLE = 202
+public constant FN_TO_BASE = 203        // ed: bits per digit (1 bin, 3 oct, 4 hex)
+public constant FN_OVERLAY = 204
+public constant FN_UNISTR = 205
+public constant FN_SHA = 206            // ed: 224, 256, 384, 512
+public constant FN_MD5_HEX = 207
+public constant FN_ENCODE = 208
+public constant FN_DECODE = 209
+public constant FN_FORMAT = 210         // ed: 1 when the last argument is a VARIADIC text[] (not used yet)
+public constant FN_GET_BIT = 211
+public constant FN_SET_BIT = 212
+public constant FN_GET_BYTE = 213
+public constant FN_SET_BYTE = 214
+public constant FN_BIT_COUNT = 215
+public constant FN_PART_HASH = 216      // hash partitioning: (key..., modulus) -> bucket
+// catalog functions (compat agent), evaluated by evalCatFunc
+public constant FN_CAT_BASE = 300
+public constant FN_PG_INDEXDEF = 300
+public constant FN_FORMAT_TYPE = 301
+public constant FN_CONSTRAINTDEF = 302
+public constant FN_ARRAY_UPPER = 303
+public constant FN_ARRAY_LOWER = 304
+public constant FN_ARRAY_LENGTH = 305
+public constant FN_REL_SIZE = 306
+public constant FN_CAT_END = 349
+
+// ---- operator kinds
+public constant O_SCAN = 1
+public constant O_HASHEQ = 2
+public constant O_RANGE = 3
+public constant O_FILTER = 4
+public constant O_NL = 5
+public constant O_HASHJ = 6
+public constant O_AGG = 7
+public constant O_SORT = 8
+public constant O_LIMIT = 9
+public constant O_ONE = 10
+public constant O_VALUES = 11
+public constant O_SERIES = 12
+public constant O_MAT = 13
+public constant O_DISTINCT = 14
+public constant O_SETOP = 15
+public constant O_TEMPSCAN = 16
+public constant O_APPEND = 17     // partitioned table: b = temp, c = output slot, e = olist [n, (root, ncols, expr...)...]
+// compat agent: catalog relation (a = slot, b = temp, c = relation code, d = state node), set-returning function in
+// the select list (a = child, b = temp, c = slot, d = arg expr, e = kind), window functions (see buildWindow)
+public constant O_CATALOG = 50
+public constant O_SRF = 51
+public constant O_WINDOW = 52
+
+// aggregate kinds
+public constant AG_COUNT_STAR = 1
+public constant AG_COUNT = 2
+public constant AG_SUM = 3
+public constant AG_AVG = 4
+public constant AG_MIN = 5
+public constant AG_MAX = 6
+public constant AG_BOOL_AND = 7
+public constant AG_BOOL_OR = 8
+public constant AG_STRING_AGG = 9
+public constant AG_STDDEV = 10
+public constant AG_VARIANCE = 11
+public constant AG_STDDEV_POP = 12
+public constant AG_VAR_POP = 13
+// r2 sql agent range (100+): first non-null value; float8 regression/covariance aggregates (args Y, X)
+public constant AG_ANY_VALUE = 100
+public constant AG_REGR_COUNT = 101
+public constant AG_REGR_SXX = 102
+public constant AG_REGR_SYY = 103
+public constant AG_REGR_SXY = 104
+public constant AG_REGR_AVGX = 105
+public constant AG_REGR_AVGY = 106
+public constant AG_REGR_R2 = 107
+public constant AG_REGR_SLOPE = 108
+public constant AG_REGR_INTERCEPT = 109
+public constant AG_COVAR_POP = 110
+public constant AG_COVAR_SAMP = 111
+public constant AG_CORR = 112
+// aggregate spec stride: kind, arg, distinct map+1, filter, extra node (min/max tmp, string_agg separator),
+// distinct temp, second arg, first regression column
+public constant AGS = 8
+
+public record Env {
+    cat: cat.Catalog
+    tm: txn.TxnMgr
+    me: Integer
+    nowMicros: Integer
+    randState: Integer
+    session: Integer       // session running the current statement (temp-table namespace)
+    tempCount: Integer     // live temp tables in the catalog (0: no temp lookups, plan cache usable)
+}
+
+public record Plan {
+    // expressions
+    ek: List<Integer>
+    et: List<Integer>
+    ea: List<Integer>
+    eb: List<Integer>
+    ec: List<Integer>
+    ed: List<Integer>
+    eargs: List<Integer>
+    eState: List<Integer>
+    eConst: Bytes            // 1 = constant subtree Postgres folds at plan time (computeConst)
+    rNull: Bytes
+    rInt: List<Integer>
+    rAux: List<Integer>
+    rAux2: List<Integer>
+    rFlt: List<Float>
+    rBuf: List<Bytes>
+    rOff: List<Integer>
+    rLen: List<Integer>
+    scratch: List<Bytes>
+    scratchOwned: Bytes
+    // operators
+    ok: List<Integer>
+    oa: List<Integer>
+    ob: List<Integer>
+    oc: List<Integer>
+    od: List<Integer>
+    oe: List<Integer>
+    of: List<Integer>
+    olist: List<Integer>
+    os1: List<Integer>
+    os2: List<Integer>
+    os3: List<Integer>
+    // slots
+    slotTable: List<tb.Table>
+    slotBase: List<tb.Table>
+    slotScratch: List<tb.Table>
+    slotRow: List<Integer>
+    slotOrig: List<Integer>
+    // auxiliary storage
+    temps: List<tb.Table>
+    maps: List<hm.IntMap>
+    chains: List<Bytes>
+    keys: List<ix.Key>
+    // error
+    err: Boolean
+    errCode: Text
+    errMsg: Text
+    errDetail: Text
+    blockedBy: Integer
+    env: Env
+    empty: Bytes
+    pq: v.Parsed
+    numBuf: Bytes
+    nanText: Bytes
+    regexNodes: List<Integer>
+    regexes: List<rx.Regex>
+}
+
+public function newPlan(env: Env): Plan {
+    return Plan {
+        ek: []; et: []; ea: []; eb: []; ec: []; ed: []; eargs: []; eState: []; eConst: Bytes()
+        rNull: Bytes(); rInt: []; rAux: []; rAux2: []; rFlt: []; rBuf: []; rOff: []; rLen: []; scratch: []; scratchOwned: Bytes()
+        ok: []; oa: []; ob: []; oc: []; od: []; oe: []; of: []; olist: []; os1: []; os2: []; os3: []
+        slotTable: []; slotBase: []; slotScratch: []; slotRow: []; slotOrig: []
+        temps: []; maps: []; chains: []; keys: []
+        err: false; errCode: ""; errMsg: ""; errDetail: ""; blockedBy: -1; env: env; empty: Bytes(); pq: v.newParsed()
+        numBuf: Bytes(); nanText: Bytes("NaN"); regexNodes: []; regexes: []
+    }
+}
+
+public function raise(p: Plan, code: Text, msg: Text) {
+    if p.err { return }
+    p.err = true
+    p.errCode = code
+    p.errMsg = msg
+}
+
+public function clearError(p: Plan) {
+    p.err = false
+    p.errCode = ""
+    p.errMsg = ""
+    p.errDetail = ""
+    p.blockedBy = -1
+}
+
+public function classOf(t: Integer): Integer {
+    if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return CL_FLT }
+    if t == v.T_NUMERIC { return CL_NUM }
+    if v.isTextType(t) { return CL_TEXT }
+    if t == v.T_INTERVAL { return CL_IV }
+    return CL_INT
+}
+
+// ---------------------------------------------------------------- construction
+
+public function addExpr(p: Plan, kind: Integer, type: Integer, a: Integer, b: Integer, c: Integer, d: Integer): Integer {
+    let n = p.ek.length
+    p.ek.add(kind)
+    p.et.add(type)
+    p.ea.add(a)
+    p.eb.add(b)
+    p.ec.add(c)
+    p.ed.add(d)
+    p.eState.add(0)
+    p.eConst.add(0)
+    p.rNull.add(1)
+    p.rInt.add(0)
+    p.rAux.add(0)
+    p.rAux2.add(0)
+    p.rFlt.add(0.0)
+    p.rBuf.add(p.empty)
+    p.rOff.add(0)
+    p.rLen.add(0)
+    p.scratch.add(p.empty)
+    p.scratchOwned.add(0)
+    return n
+}
+
+public function addArgs(p: Plan, args: List<Integer>): Integer {
+    let start = p.eargs.length
+    for a in args { p.eargs.add(a) }
+    return start
+}
+
+public function addOp(p: Plan, kind: Integer, a: Integer, b: Integer, c: Integer, d: Integer, e: Integer, f: Integer): Integer {
+    let n = p.ok.length
+    p.ok.add(kind)
+    p.oa.add(a)
+    p.ob.add(b)
+    p.oc.add(c)
+    p.od.add(d)
+    p.oe.add(e)
+    p.of.add(f)
+    p.os1.add(0)
+    p.os2.add(0)
+    p.os3.add(0)
+    return n
+}
+
+public function addSlot(p: Plan, t: tb.Table): Integer {
+    let s = p.slotTable.length
+    p.slotTable.add(t)
+    p.slotBase.add(t)
+    p.slotScratch.add(t)
+    p.slotRow.add(-1)
+    p.slotOrig.add(-1)
+    return s
+}
+
+public function addTemp(p: Plan, t: tb.Table): Integer {
+    p.temps.add(t)
+    return p.temps.length - 1
+}
+
+public function addMap(p: Plan): Integer {
+    p.maps.add(hm.newIntMap(16))
+    p.chains.add(Bytes())
+    return p.maps.length - 1
+}
+
+public function listBlock(p: Plan, items: List<Integer>): Integer {
+    let start = p.olist.length
+    for x in items { p.olist.add(x) }
+    return start
+}
+
+// Scratch text buffer of node n (allocated on first use, then reused).
+public function scratchOf(p: Plan, n: Integer): Bytes {
+    if p.scratchOwned[n] != 0 {
+        let s = p.scratch[n]
+        s.clear()
+        return s
+    }
+    let fresh = Bytes()
+    p.scratch[n] = fresh
+    p.scratchOwned[n] = 1
+    return fresh
+}
+
+// ---------------------------------------------------------------- register helpers
+
+public function isNullReg(p: Plan, n: Integer): Boolean { return p.rNull[n] != 0 }
+public function setNullReg(p: Plan, n: Integer) { p.rNull[n] = 1 }
+
+public function setIntReg(p: Plan, n: Integer, x: Integer) {
+    p.rNull[n] = 0
+    p.rInt[n] = x
+}
+
+public function setBoolReg(p: Plan, n: Integer, b: Boolean) {
+    p.rNull[n] = 0
+    if b { p.rInt[n] = 1 } else { p.rInt[n] = 0 }
+}
+
+public function setFltReg(p: Plan, n: Integer, f: Float) {
+    p.rNull[n] = 0
+    p.rFlt[n] = f
+}
+
+public function setNumReg(p: Plan, n: Integer, x: Integer, scale: Integer) {
+    p.rNull[n] = 0
+    p.rInt[n] = x
+    p.rAux[n] = scale
+}
+
+// ---- numeric registers. Small: unscaled Int64 in rInt, scale (0..18) in rAux. Big: rAux = NUM_BIG and the
+// numeric_out text in rBuf/rOff/rLen (more than 18 digits, NaN, +/-Infinity); arithmetic on big values uses
+// numeric.min. Text-stored columns (T_NUMTEXT) load as small when the value fits.
+public constant NUM_BIG = -1
+// perRowScale marker: the cell's Int64 is a heap reference (offset << 24 | length) to big numeric text
+public constant SCALE_BIG = 255
+// fixed-scale (typmod) numeric cells store NaN as this Int64 (never a valid unscaled value of <= 18 digits)
+public constant NUM_NAN_CELL = -9223372036854775808
+
+public function numIsBig(p: Plan, n: Integer): Boolean { return p.rAux[n] < 0 }
+
+public function regNum(p: Plan, n: Integer): nm.Num {
+    if p.rAux[n] < 0 { return v.numOfText(p.rBuf[n], p.rOff[n], p.rLen[n]) }
+    return nm.fromScaledInt(p.rInt[n], p.rAux[n])
+}
+
+// Register n = x (small when it fits). Values outside the numeric format raise 22003.
+public function setRegNum(p: Plan, n: Integer, x: nm.Num) {
+    p.rNull[n] = 0
+    if !nm.isSpecial(x) {
+        if (x.digits.length > 0 && x.weight > nm.WEIGHT_MAX) || x.dscale > nm.DSCALE_MAX {
+            raise(p, "22003", "value overflows numeric format")
+            return
+        }
+        let ok: List<Integer> = [0]
+        let y = nm.toScaled(x, ok)
+        if ok[0] == 1 {
+            p.rInt[n] = y
+            p.rAux[n] = x.dscale
+            return
+        }
+    }
+    let s = scratchOf(p, n)
+    nm.format(x, s)
+    p.rBuf[n] = s
+    p.rOff[n] = 0
+    p.rLen[n] = s.length
+    p.rAux[n] = NUM_BIG
+}
+
+// Load numeric text (numeric_out format) into register n without copying when it does not fit Int64.
+function loadNumText(p: Plan, n: Integer, b: Bytes, o: Integer, l: Integer) {
+    let q = p.pq
+    v.parseNumeric(b, o, l, q)
+    if q.ok {
+        p.rInt[n] = q.i
+        p.rAux[n] = q.scale
+        return
+    }
+    p.rBuf[n] = b
+    p.rOff[n] = o
+    p.rLen[n] = l
+    p.rAux[n] = NUM_BIG
+}
+
+// Exact comparison of two small numerics.
+public function cmpNumSmall(a: Integer, sa: Integer, b: Integer, sb: Integer): Integer {
+    if sa == sb { return ix.cmpInt(a, b) }
+    let q = v.newParsed()
+    if sa < sb {
+        v.rescale(a, sa, sb, q)
+        if q.ok { return ix.cmpInt(q.i, b) }
+    } else {
+        v.rescale(b, sb, sa, q)
+        if q.ok { return ix.cmpInt(a, q.i) }
+    }
+    return nm.cmp(nm.fromScaledInt(a, sa), nm.fromScaledInt(b, sb))
+}
+
+public function cmpNumRegs(p: Plan, a: Integer, b: Integer): Integer {
+    if p.rAux[a] >= 0 && p.rAux[b] >= 0 { return cmpNumSmall(p.rInt[a], p.rAux[a], p.rInt[b], p.rAux[b]) }
+    return nm.cmp(regNum(p, a), regNum(p, b))
+}
+
+// Numeric value of a cell as a Num (any numeric storage form).
+function cellNum(c: tb.Column, r: Integer): nm.Num {
+    if c.type == v.T_NUMTEXT || (c.perRowScale && c.scales[r] == SCALE_BIG) {
+        return v.numOfText(c.heap, tb.textOff(c, r), tb.textLen(c, r))
+    }
+    let x = tb.getInt(c, r)
+    if !c.perRowScale && x == NUM_NAN_CELL { return nm.nan() }
+    return nm.fromScaledInt(x, tb.getScale(c, r))
+}
+
+function cellIsSmallNum(c: tb.Column, r: Integer): Boolean {
+    if c.type == v.T_NUMTEXT { return false }
+    if c.perRowScale { return c.scales[r] != SCALE_BIG }
+    return tb.getInt(c, r) != NUM_NAN_CELL
+}
+
+// Compare numeric register n with a numeric cell (both non-null).
+function cmpRegCellNum(p: Plan, n: Integer, c: tb.Column, r: Integer): Integer {
+    if p.rAux[n] >= 0 && cellIsSmallNum(c, r) { return cmpNumSmall(p.rInt[n], p.rAux[n], tb.getInt(c, r), tb.getScale(c, r)) }
+    return nm.cmp(regNum(p, n), cellNum(c, r))
+}
+
+// Append big numeric text to a perRowScale column's heap and point the cell at it.
+function setBigNumCell(c: tb.Column, r: Integer, b: Bytes, o: Integer, l: Integer) {
+    let at = c.heap.length
+    appendView(c.heap, b, o, l)
+    c.data.setInt64(r * 8, (at << 24) | l)
+    c.scales[r] = SCALE_BIG
+}
+
+// Numeric register -> Int64 rounded half away from zero (casts, LIMIT). ok[0] = 0 on overflow/NaN/Inf.
+public function numRegToInt(p: Plan, n: Integer, ok: List<Integer>): Integer {
+    if p.rAux[n] >= 0 {
+        let q = p.pq
+        v.rescale(p.rInt[n], p.rAux[n], 0, q)
+        ok[0] = 1
+        return q.i
+    }
+    return nm.toInt64(regNum(p, n), ok)
+}
+
+function numErr(p: Plan, e: nm.NErr): Boolean {
+    if e.err {
+        raise(p, e.code, e.msg)
+        return true
+    }
+    return false
+}
+
+public function setTextReg(p: Plan, n: Integer, b: Bytes, off: Integer, len: Integer) {
+    p.rNull[n] = 0
+    p.rBuf[n] = b
+    p.rOff[n] = off
+    p.rLen[n] = len
+}
+
+public function setIvReg(p: Plan, n: Integer, micros: Integer, days: Integer, months: Integer) {
+    p.rNull[n] = 0
+    p.rInt[n] = micros
+    p.rAux[n] = days
+    p.rAux2[n] = months
+}
+
+public function copyReg(p: Plan, from: Integer, to: Integer) {
+    p.rNull[to] = p.rNull[from]
+    p.rInt[to] = p.rInt[from]
+    p.rAux[to] = p.rAux[from]
+    p.rAux2[to] = p.rAux2[from]
+    p.rFlt[to] = p.rFlt[from]
+    p.rBuf[to] = p.rBuf[from]
+    p.rOff[to] = p.rOff[from]
+    p.rLen[to] = p.rLen[from]
+}
+
+// Copy with text bytes duplicated into `to`'s scratch (value survives later evaluations of `from`).
+public function copyRegOwned(p: Plan, from: Integer, to: Integer) {
+    copyReg(p, from, to)
+    if p.rNull[from] == 0 && (classOf(p.et[from]) == CL_TEXT || (classOf(p.et[from]) == CL_NUM && p.rAux[from] < 0)) {
+        let s = scratchOf(p, to)
+        let b = p.rBuf[from]
+        let o = p.rOff[from]
+        let l = p.rLen[from]
+        s.addBytes(b.slice(o, o + l))
+        p.rBuf[to] = s
+        p.rOff[to] = 0
+    }
+}
+
+// Load a table cell into register n (class by the column type).
+public function loadCell(p: Plan, n: Integer, c: tb.Column, r: Integer) {
+    if tb.isNull(c, r) {
+        p.rNull[n] = 1
+        return
+    }
+    p.rNull[n] = 0
+    let t = c.type
+    let w = c.width
+    if t == v.T_NUMTEXT {
+        let ref = c.data.getInt64(r * 8)
+        loadNumText(p, n, c.heap, (ref >> 24) & 1099511627775, ref & 16777215)
+        return
+    }
+    if v.isTextType(t) {
+        let ref = c.data.getInt64(r * 8)
+        p.rBuf[n] = c.heap
+        p.rOff[n] = (ref >> 24) & 1099511627775
+        p.rLen[n] = ref & 16777215
+        return
+    }
+    if t == v.T_FLOAT8 {
+        p.rFlt[n] = c.data.getFloat64(r * 8)
+        return
+    }
+    if t == v.T_FLOAT4 {
+        p.rFlt[n] = c.data.getFloat32(r * 4)
+        return
+    }
+    if t == v.T_INTERVAL {
+        p.rInt[n] = c.data.getInt64(r * 16)
+        p.rAux[n] = c.data.getInt32(r * 16 + 8)
+        p.rAux2[n] = c.data.getInt32(r * 16 + 12)
+        return
+    }
+    if w == 8 {
+        p.rInt[n] = c.data.getInt64(r * 8)
+    } else if w == 4 {
+        p.rInt[n] = c.data.getInt32(r * 4)
+        // oid / xid are unsigned 32-bit: stored wrapped into the signed cell
+        if p.rInt[n] < 0 && (t == v.T_OID || t == v.T_XID) { p.rInt[n] += 4294967296 }
+    } else if w == 1 {
+        p.rInt[n] = c.data[r]
+    } else {
+        p.rInt[n] = c.data.getInt16(r * 2)
+    }
+    if t == v.T_NUMERIC {
+        if c.perRowScale {
+            let sc = c.scales[r]
+            if sc == SCALE_BIG {
+                let ref = p.rInt[n]
+                p.rBuf[n] = c.heap
+                p.rOff[n] = (ref >> 24) & 1099511627775
+                p.rLen[n] = ref & 16777215
+                p.rAux[n] = NUM_BIG
+            } else {
+                p.rAux[n] = sc
+            }
+        } else if p.rInt[n] == NUM_NAN_CELL {
+            p.rBuf[n] = p.nanText
+            p.rOff[n] = 0
+            p.rLen[n] = 3
+            p.rAux[n] = NUM_BIG
+        } else {
+            p.rAux[n] = c.fixedScale
+        }
+    }
+}
+
+// Store register n into a table cell (types must already match the column class).
+public function storeCell(p: Plan, n: Integer, c: tb.Column, r: Integer) {
+    // after an evaluation error the register may hold an out-of-range value (e.g. a failed int4 cast);
+    // storing it into a narrow column would stop the process, and the statement is failing anyway
+    if p.err { return }
+    if p.rNull[n] != 0 {
+        tb.setNull(c, r)
+        return
+    }
+    tb.clearNull(c, r)
+    let t = c.type
+    if t == v.T_NUMTEXT && classOf(p.et[n]) == CL_NUM {
+        if p.rAux[n] < 0 {
+            tb.setText(c, r, p.rBuf[n], p.rOff[n], p.rLen[n])
+        } else {
+            let nb = p.numBuf
+            nb.clear()
+            v.addNumeric(nb, p.rInt[n], p.rAux[n])
+            tb.setText(c, r, nb, 0, nb.length)
+        }
+        return
+    }
+    if v.isTextType(t) {
+        tb.setText(c, r, p.rBuf[n], p.rOff[n], p.rLen[n])
+        return
+    }
+    if t == v.T_FLOAT8 || t == v.T_FLOAT4 {
+        tb.setFloat(c, r, p.rFlt[n])
+        return
+    }
+    if t == v.T_INTERVAL {
+        tb.setInterval(c, r, p.rInt[n], p.rAux[n], p.rAux2[n])
+        return
+    }
+    if t == v.T_NUMERIC && p.rAux[n] < 0 {
+        if c.perRowScale {
+            setBigNumCell(c, r, p.rBuf[n], p.rOff[n], p.rLen[n])
+            return
+        }
+        let x = regNum(p, n)
+        if nm.isNaN(x) {
+            tb.setInt(c, r, NUM_NAN_CELL)
+            return
+        }
+        let ok: List<Integer> = [0]
+        let y = nm.toUnscaled(nm.roundTo(x, c.fixedScale), c.fixedScale, ok)
+        if ok[0] == 0 || y == NUM_NAN_CELL {
+            raise(p, "22003", "numeric field overflow")
+            return
+        }
+        tb.setInt(c, r, y)
+        return
+    }
+    if t == v.T_NUMERIC && !c.perRowScale && p.rAux[n] != c.fixedScale {
+        let q = p.pq
+        v.rescale(p.rInt[n], p.rAux[n], c.fixedScale, q)
+        if !q.ok || q.i == NUM_NAN_CELL {
+            raise(p, "22003", "numeric field overflow")
+            return
+        }
+        tb.setInt(c, r, q.i)
+        return
+    }
+    if c.width == 4 && (t == v.T_OID || t == v.T_XID) {
+        let x = p.rInt[n]
+        if x > 2147483647 && x <= 4294967295 { x -= 4294967296 }
+        if x < -2147483648 || x > 2147483647 { x = 0 }
+        tb.setInt(c, r, x)
+        return
+    }
+    tb.setInt(c, r, p.rInt[n])
+    if c.perRowScale { c.scales[r] = p.rAux[n] }
+}
+
+// Hash of register n consistent with ix.hashCell for the same class.
+public function hashReg(p: Plan, n: Integer): Integer {
+    if p.rNull[n] != 0 { return 7 }
+    let t = p.et[n]
+    let cl = classOf(t)
+    if cl == CL_INT { return v.hashInt(p.rInt[n]) }
+    if cl == CL_TEXT {
+        let len = p.rLen[n]
+        if t == v.T_BPCHAR { len = v.trimmedLen(p.rBuf[n], p.rOff[n], len) }
+        return v.hashBytes(p.rBuf[n], p.rOff[n], len)
+    }
+    if cl == CL_FLT { return v.hashFloat(p.rFlt[n]) }
+    if cl == CL_NUM {
+        if p.rAux[n] < 0 { return v.hashNum(regNum(p, n)) }
+        return ix.normNumeric(p.rInt[n], p.rAux[n])
+    }
+    return v.hashInt(ix.ivKey(p.rInt[n], p.rAux[n], p.rAux2[n]))
+}
+
+// Compare two non-null registers of the same class. cl: class, bp: bpchar semantics.
+public function cmpRegs(p: Plan, a: Integer, b: Integer, cl: Integer): Integer {
+    if cl == CL_INT { return ix.cmpInt(p.rInt[a], p.rInt[b]) }
+    if cl == CL_TEXT { return v.compareBytes(p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b]) }
+    if cl == CL_FLT { return ix.cmpFloat(p.rFlt[a], p.rFlt[b]) }
+    if cl == CL_NUM { return cmpNumRegs(p, a, b) }
+    if cl == CL_BPCHAR {
+        return v.compareBytes(p.rBuf[a], p.rOff[a], v.trimmedLen(p.rBuf[a], p.rOff[a], p.rLen[a]),
+                              p.rBuf[b], p.rOff[b], v.trimmedLen(p.rBuf[b], p.rOff[b], p.rLen[b]))
+    }
+    return ix.cmpInt(ix.ivKey(p.rInt[a], p.rAux[a], p.rAux2[a]), ix.ivKey(p.rInt[b], p.rAux[b], p.rAux2[b]))
+}
+
+// Register vs table cell, NULL-safe equality (NULL equals NULL) — grouping / distinct semantics.
+public function regEqualsCell(p: Plan, n: Integer, c: tb.Column, r: Integer): Boolean {
+    let rn = p.rNull[n] != 0
+    let cn = tb.isNull(c, r)
+    if rn || cn { return rn && cn }
+    let t = c.type
+    if t == v.T_NUMTEXT || t == v.T_NUMERIC { return cmpRegCellNum(p, n, c, r) == 0 }
+    if v.isTextType(t) {
+        if t == v.T_BPCHAR {
+            return ix.cmpText(t, p.rBuf[n], p.rOff[n], p.rLen[n], c.heap, tb.textOff(c, r), tb.textLen(c, r)) == 0
+        }
+        return v.equalBytes(p.rBuf[n], p.rOff[n], p.rLen[n], c.heap, tb.textOff(c, r), tb.textLen(c, r))
+    }
+    if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return ix.cmpFloat(p.rFlt[n], tb.getFloat(c, r)) == 0 }
+    if t == v.T_INTERVAL {
+        return p.rInt[n] == tb.getInt(c, r) && p.rAux[n] == tb.getIvDays(c, r) && p.rAux2[n] == tb.getIvMonths(c, r)
+    }
+    return p.rInt[n] == tb.getInt(c, r)
+}
+
+// Fill key part i from register n.
+public function keyFromReg(p: Plan, k: ix.Key, i: Integer, n: Integer) {
+    if p.rNull[n] != 0 {
+        k.nulls[i] = true
+        return
+    }
+    k.nulls[i] = false
+    k.ints[i] = p.rInt[n]
+    k.flts[i] = p.rFlt[n]
+    k.scales[i] = p.rAux[n]
+    let cl = classOf(p.et[n])
+    if cl == CL_NUM {
+        if p.rAux[n] < 0 {
+            // big key: usable on Int64 columns only when it is a small value in disguise
+            let x = regNum(p, n)
+            let ms = nm.minScale(x)
+            let ok: List<Integer> = [0]
+            let y = nm.toUnscaled(x, ms, ok)
+            if ok[0] == 1 && !nm.isSpecial(x) {
+                k.ints[i] = y
+                k.scales[i] = ms
+            } else {
+                k.ints[i] = NUM_NAN_CELL + 1
+                k.scales[i] = 0
+            }
+            k.bufs[i] = p.rBuf[n]
+            k.offs[i] = p.rOff[n]
+            k.lens[i] = p.rLen[n]
+        } else {
+            let s = scratchOf(p, n)
+            v.addNumeric(s, p.rInt[n], p.rAux[n])
+            k.bufs[i] = s
+            k.offs[i] = 0
+            k.lens[i] = s.length
+        }
+        return
+    }
+    if cl == CL_TEXT {
+        k.bufs[i] = p.rBuf[n]
+        k.offs[i] = p.rOff[n]
+        k.lens[i] = p.rLen[n]
+    }
+}
+
+// ---------------------------------------------------------------- text output (PG text format)
+
+public function formatReg(p: Plan, n: Integer, t: Integer, out: Bytes) {
+    if t == v.T_INT4 || t == v.T_INT8 || t == v.T_INT2 || t == v.T_OID {
+        v.addInt(out, p.rInt[n])
+        return
+    }
+    if t == v.T_BYTEA {
+        sf.byteaOut(p.rBuf[n], p.rOff[n], p.rLen[n], out)
+        return
+    }
+    if v.isTextType(t) {
+        let b = p.rBuf[n]
+        let o = p.rOff[n]
+        let l = p.rLen[n]
+        if o == 0 && l == b.length {
+            out.addBytes(b)
+        } else {
+            let i = 0
+            while i + 8 <= l {
+                out.addInt64(b.getInt64(o + i))
+                i += 8
+            }
+            while i < l {
+                out.add(b[o + i])
+                i += 1
+            }
+        }
+        return
+    }
+    if t == v.T_BOOL {
+        if p.rInt[n] != 0 { out.add(116) } else { out.add(102) }
+        return
+    }
+    if t == v.T_FLOAT8 {
+        v.addFloat(out, p.rFlt[n], false)
+        return
+    }
+    if t == v.T_FLOAT4 {
+        v.addFloat(out, p.rFlt[n], true)
+        return
+    }
+    if t == v.T_NUMERIC {
+        if p.rAux[n] < 0 {
+            appendView(out, p.rBuf[n], p.rOff[n], p.rLen[n])
+        } else {
+            v.addNumeric(out, p.rInt[n], p.rAux[n])
+        }
+        return
+    }
+    if t == v.T_DATE {
+        v.addDate(out, p.rInt[n])
+        return
+    }
+    if t == v.T_TIMESTAMP {
+        v.addTimestamp(out, p.rInt[n], false)
+        return
+    }
+    if t == v.T_TIMESTAMPTZ {
+        v.addTimestamp(out, p.rInt[n], true)
+        return
+    }
+    if t == v.T_INTERVAL {
+        v.addInterval(out, p.rInt[n], p.rAux[n], p.rAux2[n])
+        return
+    }
+    if t == v.T_TIME {
+        v.addTime(out, p.rInt[n])
+        return
+    }
+    if t == v.T_REGCLASS {
+        let name = pgc.relNameByOid(p.env.cat, p.rInt[n])
+        if name == "" { v.addInt(out, p.rInt[n]) } else { v.addText(out, pgc.quoteIdent(name)) }
+        return
+    }
+    v.addInt(out, p.rInt[n])
+}
+
+// Append one DataRow field (length + bytes) for register n in text (fmt 0) or binary (fmt 1).
+public function encodeField(p: Plan, n: Integer, t: Integer, fmt: Integer, out: Bytes) {
+    if p.rNull[n] != 0 {
+        v.addBE32(out, -1)
+        return
+    }
+    if fmt == 1 {
+        encodeBinary(p, n, t, out)
+        return
+    }
+    let at = out.length
+    out.addInt32(0)
+    formatReg(p, n, t, out)
+    v.setBE32(out, at, out.length - at - 4)
+}
+
+function encodeBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
+    if t == v.T_INT4 || t == v.T_DATE || t == v.T_OID || t == v.T_XID || t == v.T_REGCLASS {
+        v.addBE32(out, 4)
+        v.addBE32(out, p.rInt[n])
+        return
+    }
+    if t == v.T_INT8 || t == v.T_TIMESTAMP || t == v.T_TIMESTAMPTZ || t == v.T_TIME {
+        v.addBE32(out, 8)
+        v.addBE64(out, p.rInt[n])
+        return
+    }
+    if t == v.T_INT2 {
+        v.addBE32(out, 2)
+        v.addBE16(out, p.rInt[n])
+        return
+    }
+    if t == v.T_BOOL {
+        v.addBE32(out, 1)
+        out.add(p.rInt[n] & 1)
+        return
+    }
+    if t == v.T_FLOAT8 {
+        let b = Bytes(8)
+        b.setFloat64(0, p.rFlt[n])
+        v.addBE32(out, 8)
+        v.addBE64(out, b.getInt64(0))
+        return
+    }
+    if t == v.T_FLOAT4 {
+        let b = Bytes(4)
+        b.setFloat32(0, p.rFlt[n])
+        v.addBE32(out, 4)
+        v.addBE32(out, b.getInt32(0))
+        return
+    }
+    if t == v.T_NUMERIC {
+        if p.rAux[n] < 0 {
+            encodeNumBinary(regNum(p, n), out)
+        } else {
+            encodeNumericBinary(p.rInt[n], p.rAux[n], out)
+        }
+        return
+    }
+    if t == v.T_INTERVAL {
+        v.addBE32(out, 16)
+        v.addBE64(out, p.rInt[n])
+        v.addBE32(out, p.rAux[n])
+        v.addBE32(out, p.rAux2[n])
+        return
+    }
+    if v.isArrayType(t) {
+        encodeArrayBinary(p.rBuf[n], p.rOff[n], p.rLen[n], t, out)
+        return
+    }
+    // text-like and anything else: raw text bytes
+    let at = out.length
+    out.addInt32(0)
+    formatReg(p, n, t, out)
+    v.setBE32(out, at, out.length - at - 4)
+}
+
+// Binary array format (array_send) of a catalog array kept as text ("{1,2}" or the vector form "1 2").
+function encodeArrayBinary(b: Bytes, o: Integer, l: Integer, t: Integer, out: Bytes) {
+    let elems: List<Bytes> = []
+    let nulls: List<Boolean> = []
+    splitArrayText(b, o, l, v.isVectorType(t), elems, nulls)
+    let et = v.arrayElemType(t)
+    let at = out.length
+    out.addInt32(0)
+    let hasNull = 0
+    for x in nulls {
+        if x { hasNull = 1 }
+    }
+    if elems.length == 0 {
+        v.addBE32(out, 0)
+        v.addBE32(out, 0)
+        v.addBE32(out, v.typeOid(et))
+    } else {
+        v.addBE32(out, 1)
+        v.addBE32(out, hasNull)
+        v.addBE32(out, v.typeOid(et))
+        v.addBE32(out, elems.length)
+        v.addBE32(out, v.arrayLowerBound(t))
+        let i = 0
+        while i < elems.length {
+            if nulls[i] {
+                v.addBE32(out, -1)
+            } else if et == v.T_INT2 {
+                v.addBE32(out, 2)
+                v.addBE16(out, textInt(elems[i]))
+            } else if et == v.T_OID {
+                v.addBE32(out, 4)
+                v.addBE32(out, textInt(elems[i]))
+            } else {
+                v.addBE32(out, elems[i].length)
+                out.addBytes(elems[i])
+            }
+            i += 1
+        }
+    }
+    v.setBE32(out, at, out.length - at - 4)
+}
+
+function textInt(b: Bytes): Integer {
+    let q = v.newParsed()
+    v.parseInt(b, 0, b.length, q, -2147483648, 4294967295)
+    if !q.ok { return 0 }
+    return q.i
+}
+
+// Elements of an array's text form: "{a,b,\"c d\",NULL}" or a vector "1 2 3". Quoted elements are unescaped.
+public function splitArrayText(b: Bytes, o: Integer, l: Integer, vector: Boolean, elems: List<Bytes>, nulls: List<Boolean>) {
+    let i = o
+    let e = o + l
+    if vector {
+        while i < e {
+            while i < e && b[i] == 32 { i += 1 }
+            if i >= e { break }
+            let j = i
+            while j < e && b[j] != 32 { j += 1 }
+            elems.add(b.slice(i, j))
+            nulls.add(false)
+            i = j
+        }
+        return
+    }
+    // optional "[lo:hi]=" dimension decoration
+    if i < e && b[i] == 91 {
+        while i < e && b[i] != 61 { i += 1 }
+        i += 1
+    }
+    if i >= e || b[i] != 123 { return }
+    i += 1
+    while i < e && b[i] != 125 {
+        while i < e && b[i] == 32 { i += 1 }
+        let cur = Bytes()
+        let quoted = false
+        if i < e && b[i] == 34 {
+            quoted = true
+            i += 1
+            while i < e && b[i] != 34 {
+                if b[i] == 92 && i + 1 < e { i += 1 }
+                cur.add(b[i])
+                i += 1
+            }
+            i += 1
+        } else {
+            while i < e && b[i] != 44 && b[i] != 125 {
+                cur.add(b[i])
+                i += 1
+            }
+        }
+        let isNull = !quoted && cur.length == 4 && (cur[0] == 78 || cur[0] == 110) && (cur[1] == 85 || cur[1] == 117) && (cur[2] == 76 || cur[2] == 108) && (cur[3] == 76 || cur[3] == 108)
+        elems.add(cur)
+        nulls.add(isNull)
+        while i < e && b[i] == 32 { i += 1 }
+        if i < e && b[i] == 44 { i += 1 }
+    }
+}
+
+// PG binary numeric: ndigits, weight, sign, dscale, base-10000 digits.
+function encodeNumericBinary(x: Integer, scale: Integer, out: Bytes) {
+    let neg = x < 0
+    let digits = Bytes()
+    if neg {
+        if x == -9223372036854775808 { v.addText(digits, "9223372036854775808") } else { v.addInt(digits, -x) }
+    } else {
+        v.addInt(digits, x)
+    }
+    // pad so that integer part and fraction align to groups of 4
+    let nd = digits.length
+    let intLen = nd - scale
+    let s = Bytes()
+    let fracPad = 0
+    if intLen <= 0 {
+        let z = -intLen
+        while z > 0 {
+            s.add(48)
+            z -= 1
+        }
+        s.addBytes(digits)
+        intLen = 0
+    } else {
+        s.addBytes(digits)
+    }
+    let leadPad = (4 - intLen % 4) % 4
+    let full = Bytes()
+    let i = 0
+    while i < leadPad {
+        full.add(48)
+        i += 1
+    }
+    full.addBytes(s)
+    while (full.length - leadPad - intLen) % 4 != 0 { full.add(48) }
+    let groups = full.length / 4
+    let weight = (intLen + leadPad) / 4 - 1
+    // strip leading/trailing zero groups
+    let first = 0
+    let vals: List<Integer> = []
+    i = 0
+    while i < groups {
+        let g = (full[i * 4] - 48) * 1000 + (full[i * 4 + 1] - 48) * 100 + (full[i * 4 + 2] - 48) * 10 + (full[i * 4 + 3] - 48)
+        vals.add(g)
+        i += 1
+    }
+    let lo = 0
+    while lo < vals.length && vals[lo] == 0 {
+        lo += 1
+        weight -= 1
+    }
+    let hi = vals.length
+    while hi > lo && vals[hi - 1] == 0 { hi -= 1 }
+    if lo >= hi {
+        weight = 0
+    }
+    let nd2 = hi - lo
+    v.addBE32(out, 8 + 2 * nd2)
+    v.addBE16(out, nd2)
+    v.addBE16(out, weight)
+    if neg { v.addBE16(out, 16384) } else { v.addBE16(out, 0) }
+    v.addBE16(out, scale)
+    i = lo
+    while i < hi {
+        v.addBE16(out, vals[i])
+        i += 1
+    }
+    let unusedFirst = first
+}
+
+// PG binary numeric from a Num (NaN 0xC000, +Inf 0xD000, -Inf 0xF000).
+function encodeNumBinary(x: nm.Num, out: Bytes) {
+    let nd = x.digits.length
+    v.addBE32(out, 8 + 2 * nd)
+    v.addBE16(out, nd)
+    v.addBE16(out, x.weight)
+    let sign = 0
+    if x.sign == nm.NNEG { sign = 16384 }
+    if x.sign == nm.NNAN { sign = 49152 }
+    if x.sign == nm.NPINF { sign = 53248 }
+    if x.sign == nm.NNINF { sign = 61440 }
+    v.addBE16(out, sign)
+    let ds = x.dscale
+    if ds < 0 { ds = 0 }
+    v.addBE16(out, ds)
+    for d in x.digits { v.addBE16(out, d) }
+}
+
+// ---------------------------------------------------------------- casts
+
+// Cast register `src` (type from) into register `dst` (type to). Errors set p.err.
+// explicit: explicit cast (varchar truncation instead of error).
+function boolWord(b: Boolean): Bytes {
+    if b { return Bytes("true") }
+    return Bytes("false")
+}
+
+public function castReg(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer, explicit: Boolean, unitHint: Integer) {
+    if p.rNull[src] != 0 {
+        p.rNull[dst] = 1
+        return
+    }
+    let fc = classOf(from)
+    let tc = classOf(to)
+    if from == to && typmod < 0 {
+        copyReg(p, src, dst)
+        return
+    }
+    if fc == CL_TEXT && tc != CL_TEXT {
+        parseInto(p, p.rBuf[src], p.rOff[src], p.rLen[src], from == v.T_BPCHAR, dst, to, typmod, unitHint)
+        return
+    }
+    if tc == CL_TEXT {
+        if to == v.T_BYTEA && from != v.T_BYTEA {
+            if fc == CL_TEXT {
+                byteaFromText(p, p.rBuf[src], p.rOff[src], p.rLen[src], dst)
+                return
+            }
+            raise(p, "42846", "cannot cast type " + v.typeName(from) + " to bytea")
+            return
+        }
+        if fc == CL_TEXT && from == v.T_BYTEA && to != v.T_BYTEA {
+            let s = scratchOf(p, dst)
+            sf.byteaOut(p.rBuf[src], p.rOff[src], p.rLen[src], s)
+            setTextReg(p, dst, s, 0, s.length)
+            applyTextTypmod(p, dst, to, typmod, explicit)
+            return
+        }
+        if fc == CL_TEXT {
+            let b = p.rBuf[src]
+            let o = p.rOff[src]
+            let l = p.rLen[src]
+            if from == v.T_BPCHAR && to != v.T_BPCHAR { l = v.trimmedLen(b, o, l) }
+            setTextReg(p, dst, b, o, l)
+        } else if from == v.T_BOOL {
+            let wb = boolWord(p.rInt[src] != 0)
+            setTextReg(p, dst, wb, 0, wb.length)
+        } else {
+            let s = scratchOf(p, dst)
+            formatReg(p, src, from, s)
+            setTextReg(p, dst, s, 0, s.length)
+        }
+        applyTextTypmod(p, dst, to, typmod, explicit)
+        return
+    }
+    p.rNull[dst] = 0
+    if tc == CL_INT {
+        if fc == CL_INT {
+            let x = p.rInt[src]
+            if from == v.T_DATE && (to == v.T_TIMESTAMP || to == v.T_TIMESTAMPTZ) {
+                if x >= v.TS_END / v.USECS_PER_DAY || x < v.TS_MIN / v.USECS_PER_DAY {
+                    raise(p, "22008", "date out of range for timestamp")
+                    return
+                }
+                p.rInt[dst] = x * v.USECS_PER_DAY
+                return
+            }
+            if (from == v.T_TIMESTAMP || from == v.T_TIMESTAMPTZ) && to == v.T_DATE {
+                let d = x / v.USECS_PER_DAY
+                if x < 0 && x % v.USECS_PER_DAY != 0 { d -= 1 }
+                p.rInt[dst] = d
+                return
+            }
+            if (from == v.T_TIMESTAMP || from == v.T_TIMESTAMPTZ) && to == v.T_TIME {
+                let m = x % v.USECS_PER_DAY
+                if m < 0 { m += v.USECS_PER_DAY }
+                p.rInt[dst] = m
+                return
+            }
+            if to == v.T_BOOL {
+                p.rInt[dst] = 0
+                if x != 0 { p.rInt[dst] = 1 }
+                return
+            }
+            if to == v.T_OID && from != v.T_OID {
+                if from == v.T_INT8 && (x < 0 || x > 4294967295) {
+                    raise(p, "22003", "OID out of range")
+                    return
+                }
+                if x < 0 { x += 4294967296 }
+            }
+            p.rInt[dst] = x
+            checkIntRange(p, dst, to)
+            return
+        }
+        if fc == CL_FLT {
+            let f = p.rFlt[src]
+            if f != f || f >= 9.2233720368547758e18 || f < -9.2233720368547758e18 {
+                intRangeError(p, to)
+                return
+            }
+            p.rInt[dst] = roundHalfEven(f)
+            checkIntRange(p, dst, to)
+            return
+        }
+        if fc == CL_NUM {
+            if p.rAux[src] < 0 {
+                let x = regNum(p, src)
+                if nm.isNaN(x) {
+                    raise(p, "0A000", "cannot convert NaN to " + v.typeName(to))
+                    return
+                }
+                if nm.isInf(x) {
+                    raise(p, "0A000", "cannot convert infinity to " + v.typeName(to))
+                    return
+                }
+                let ok: List<Integer> = [0]
+                let y = nm.toInt64(x, ok)
+                if ok[0] == 0 {
+                    intRangeError(p, to)
+                    return
+                }
+                p.rInt[dst] = y
+                checkIntRange(p, dst, to)
+                return
+            }
+            let q = p.pq
+            v.rescale(p.rInt[src], p.rAux[src], 0, q)
+            p.rInt[dst] = q.i
+            checkIntRange(p, dst, to)
+            return
+        }
+    }
+    if tc == CL_FLT {
+        let finite = true
+        if fc == CL_INT {
+            p.rFlt[dst] = Float(p.rInt[src])
+        } else if fc == CL_NUM {
+            if p.rAux[src] < 0 {
+                let x = regNum(p, src)
+                if nm.isSpecial(x) {
+                    p.rFlt[dst] = nm.toFloatApprox(x)
+                    finite = false
+                } else {
+                    let q = p.pq
+                    v.parseFloat(p.rBuf[src], p.rOff[src], p.rLen[src], q)
+                    let f = q.f
+                    if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308 || (f == 0.0 && !nm.isZero(x)) {
+                        raise(p, "22003", "\"" + viewText(p.rBuf[src], p.rOff[src], p.rLen[src]) + "\" is out of range for type " + v.typeName(to))
+                        return
+                    }
+                    p.rFlt[dst] = f
+                }
+            } else {
+                p.rFlt[dst] = numToFloat(p.rInt[src], p.rAux[src])
+            }
+        } else {
+            p.rFlt[dst] = p.rFlt[src]
+            finite = false
+        }
+        if to == v.T_FLOAT4 {
+            let src64 = p.rFlt[dst]
+            let b = Bytes(4)
+            b.setFloat32(0, src64)
+            p.rFlt[dst] = b.getFloat32(0)
+            let f = p.rFlt[dst]
+            if finite && (f > 3.4028234663852886e38 || f < -3.4028234663852886e38 || (f == 0.0 && src64 != 0.0)) {
+                let tb2 = Bytes()
+                formatReg(p, src, from, tb2)
+                raise(p, "22003", "\"" + Text(tb2) + "\" is out of range for type real")
+                return
+            }
+        }
+        return
+    }
+    if tc == CL_NUM {
+        if fc == CL_INT {
+            p.rInt[dst] = p.rInt[src]
+            p.rAux[dst] = 0
+        } else if fc == CL_FLT {
+            let sig = 15
+            if from == v.T_FLOAT4 { sig = 6 }
+            setRegNum(p, dst, nm.fromFloatSig(p.rFlt[src], sig))
+            if p.err { return }
+        } else {
+            copyReg(p, src, dst)
+        }
+        applyNumericTypmod(p, dst, typmod)
+        return
+    }
+    if tc == CL_IV && fc == CL_IV {
+        copyReg(p, src, dst)
+        return
+    }
+    raise(p, "42846", "cannot cast type " + v.typeName(from) + " to " + v.typeName(to))
+}
+
+// Round half to even on floats without leaving the Float domain (safe for huge values).
+public function roundHalfEvenF(f: Float): Float {
+    if f != f || f >= 4503599627370496.0 || f <= -4503599627370496.0 { return f }
+    let r = roundHalfEven(f)
+    if r == 0 { return f * 0.0 }
+    return Float(r)
+}
+
+public function roundHalfEven(f: Float): Integer {
+    let r = math.round(f)
+    let diff = r - f
+    if diff == 0.5 || diff == -0.5 {
+        let ri = Integer(r)
+        if ri % 2 != 0 {
+            if diff > 0.0 { return ri - 1 }
+            return ri + 1
+        }
+        return ri
+    }
+    return Integer(r)
+}
+
+// cbrt exactly as glibc computes it (Postgres calls libm cbrt, which is not correctly rounded:
+// cbrt(27) = 3.0000000000000004). Verified bit-for-bit against libm on 600k values.
+function cbrtGlibc(x: Float): Float {
+    if x == 0.0 || x != x || isInfF(x) { return x + x }
+    let ax = abs(x)
+    let bb = Bytes(8)
+    bb.setFloat64(0, ax)
+    let bits = bb.getInt64(0)
+    let e = (bits >> 52) & 2047
+    let adj = 0
+    if e == 0 {
+        bb.setFloat64(0, ax * 18014398509481984.0)
+        bits = bb.getInt64(0)
+        e = (bits >> 52) & 2047
+        adj = 54
+    }
+    let xe = e - 1022 - adj
+    bb.setInt64(0, (bits & 4503599627370495) | (1022 << 52))
+    let xm = bb.getFloat64(0)
+    let u = (0.354895765043919860 + ((1.50819193781584896 + ((-2.11499494167371287 + ((2.44693122563534430 + ((-1.83469277483613086 + (0.784932344976639262 - 0.145263899385486377 * xm) * xm) * xm)) * xm)) * xm)) * xm))
+    let t2 = u * u * u
+    let q = xe / 3
+    let rm = xe - 3 * q
+    let f = 1.0
+    if rm == -2 { f = 1.0 / 1.5874010519681994748 }
+    if rm == -1 { f = 1.0 / 1.2599210498948731648 }
+    if rm == 1 { f = 1.2599210498948731648 }
+    if rm == 2 { f = 1.5874010519681994748 }
+    let ym = u * (t2 + 2.0 * xm) / (2.0 * t2 + xm) * f
+    if x < 0.0 { ym = -ym }
+    let pb = Bytes(8)
+    pb.setInt64(0, (q + 1023) << 52)
+    return ym * pb.getFloat64(0)
+}
+
+// Postgres dpow: POSIX special cases handled explicitly, overflow/underflow raise 22003.
+function floatPow(p: Plan, x: Float, y: Float): Float {
+    if x != x {
+        if y != y || y != 0.0 { return 0.0 / 0.0 }
+        return 1.0
+    }
+    if y != y {
+        if x != 1.0 { return 0.0 / 0.0 }
+        return 1.0
+    }
+    if x == 0.0 && y < 0.0 {
+        raise(p, "2201F", "zero raised to a negative power is undefined")
+        return 0.0
+    }
+    if x < 0.0 && math.floor(y) != y {
+        raise(p, "2201F", "a negative number raised to a non-integer power yields a complex result")
+        return 0.0
+    }
+    if isInfF(y) {
+        let ax = abs(x)
+        if ax == 1.0 { return 1.0 }
+        if y > 0.0 {
+            if ax > 1.0 { return y }
+            return 0.0
+        }
+        if ax > 1.0 { return 0.0 }
+        return -y
+    }
+    if isInfF(x) {
+        if y == 0.0 { return 1.0 }
+        if x > 0.0 {
+            if y > 0.0 { return x }
+            return 0.0
+        }
+        let half = y / 2.0
+        let odd = math.floor(half) != half
+        if y > 0.0 {
+            if odd { return x }
+            return -x
+        }
+        if odd { return -0.0 }
+        return 0.0
+    }
+    let r = math.pow(x, y)
+    if isInfF(r) {
+        raise(p, "22003", "value out of range: overflow")
+        return 0.0
+    }
+    if r == 0.0 && x != 0.0 {
+        raise(p, "22003", "value out of range: underflow")
+        return 0.0
+    }
+    return r
+}
+
+function isInfF(f: Float): Boolean {
+    return f > 1.7976931348623157e308 || f < -1.7976931348623157e308
+}
+
+public function numToFloat(x: Integer, s: Integer): Float {
+    if s == 0 { return Float(x) }
+    if s <= 22 {
+        // exact-ish: format and parse for correct rounding
+        let b = Bytes()
+        v.addNumeric(b, x, s)
+        let q = v.newParsed()
+        v.parseFloat(b, 0, b.length, q)
+        return q.f
+    }
+    return Float(x) / v.pow10float(s)
+}
+
+function intRangeError(p: Plan, t: Integer) {
+    if t == v.T_INT2 {
+        raise(p, "22003", "smallint out of range")
+    } else if t == v.T_INT4 {
+        raise(p, "22003", "integer out of range")
+    } else {
+        raise(p, "22003", "bigint out of range")
+    }
+}
+
+function checkIntRange(p: Plan, n: Integer, t: Integer) {
+    let x = p.rInt[n]
+    if t == v.T_INT4 {
+        if x < -2147483648 || x > 2147483647 { raise(p, "22003", "integer out of range") }
+    } else if t == v.T_INT2 {
+        if x < -32768 || x > 32767 { raise(p, "22003", "smallint out of range") }
+    }
+}
+
+public function applyNumericTypmod(p: Plan, n: Integer, typmod: Integer) {
+    if typmod < 0 || p.rNull[n] != 0 { return }
+    let prec = v.typmodPrecision(typmod)
+    let scale = v.typmodScale(typmod)
+    if p.rAux[n] >= 0 && scale >= 0 && scale <= 18 && prec <= 18 {
+        let q = p.pq
+        v.rescale(p.rInt[n], p.rAux[n], scale, q)
+        if q.ok {
+            let limit = v.pow10i(prec)
+            if q.i >= limit || q.i <= -limit {
+                numFieldOverflow(p, prec, scale)
+                return
+            }
+            p.rInt[n] = q.i
+            p.rAux[n] = scale
+            return
+        }
+    }
+    let x = regNum(p, n)
+    if nm.isNaN(x) { return }
+    if nm.isInf(x) {
+        raise(p, "22003", "numeric field overflow")
+        p.errDetail = "A field with precision " + Text(prec) + ", scale " + Text(scale) + " cannot hold an infinite value."
+        return
+    }
+    let r = nm.roundTo(x, scale)
+    if r.dscale < 0 { r = nm.withDscale(r, 0) }
+    if r.digits.length > 0 {
+        let ddigits = (r.weight + 1) * 4
+        let lead = r.digits[0]
+        if lead < 10 { ddigits -= 3 } else if lead < 100 { ddigits -= 2 } else if lead < 1000 { ddigits -= 1 }
+        if ddigits > prec - scale {
+            numFieldOverflow(p, prec, scale)
+            return
+        }
+    }
+    setRegNum(p, n, r)
+}
+
+function numFieldOverflow(p: Plan, prec: Integer, scale: Integer) {
+    raise(p, "22003", "numeric field overflow")
+    let maxd = prec - scale
+    if maxd == 0 {
+        p.errDetail = "A field with precision " + Text(prec) + ", scale " + Text(scale) + " must round to an absolute value less than 1."
+    } else {
+        p.errDetail = "A field with precision " + Text(prec) + ", scale " + Text(scale) + " must round to an absolute value less than 10^" + Text(maxd) + "."
+    }
+}
+
+// Count UTF-8 characters in a view.
+public function charCount(b: Bytes, o: Integer, l: Integer): Integer {
+    let n = 0
+    let i = 0
+    while i < l {
+        if (b[o + i] & 192) != 128 { n += 1 }
+        i += 1
+    }
+    return n
+}
+
+// Byte offset of the k-th character (0-based) in a view; l if beyond.
+public function charOffset(b: Bytes, o: Integer, l: Integer, k: Integer): Integer {
+    let n = 0
+    let i = 0
+    while i < l {
+        if (b[o + i] & 192) != 128 {
+            if n == k { return i }
+            n += 1
+        }
+        i += 1
+    }
+    return l
+}
+
+function applyTextTypmod(p: Plan, n: Integer, to: Integer, typmod: Integer, explicit: Boolean) {
+    if typmod < 0 { return }
+    let b = p.rBuf[n]
+    let o = p.rOff[n]
+    let l = p.rLen[n]
+    let chars = charCount(b, o, l)
+    if to == v.T_VARCHAR {
+        if chars > typmod {
+            let cut = charOffset(b, o, l, typmod)
+            if !explicit {
+                // allowed only if the excess is all spaces
+                let i = cut
+                while i < l {
+                    if b[o + i] != 32 {
+                        raise(p, "22001", "value too long for type character varying(" + Text(typmod) + ")")
+                        return
+                    }
+                    i += 1
+                }
+            }
+            p.rLen[n] = cut
+        }
+        return
+    }
+    if to == v.T_BPCHAR {
+        if chars > typmod {
+            let cut = charOffset(b, o, l, typmod)
+            if !explicit {
+                let i = cut
+                while i < l {
+                    if b[o + i] != 32 {
+                        raise(p, "22001", "value too long for type character(" + Text(typmod) + ")")
+                        return
+                    }
+                    i += 1
+                }
+            }
+            p.rLen[n] = cut
+            return
+        }
+        if chars < typmod {
+            let s = Bytes()
+            s.addBytes(b.slice(o, o + l))
+            let k = chars
+            while k < typmod {
+                s.add(32)
+                k += 1
+            }
+            let sc = scratchOf(p, n)
+            sc.addBytes(s)
+            setTextReg(p, n, sc, 0, sc.length)
+        }
+    }
+}
+
+function typeErrorText(t: Integer): Text {
+    return v.typeName(t)
+}
+
+function viewText(b: Bytes, o: Integer, l: Integer): Text {
+    return Text(b.slice(o, o + l))
+}
+
+// Parse text into register dst of type `to`.
+public function parseInto(p: Plan, b: Bytes, o: Integer, l: Integer, fromBpchar: Boolean, dst: Integer, to: Integer, typmod: Integer, unitHint: Integer) {
+    let q = p.pq
+    p.rNull[dst] = 0
+    if to == v.T_INT4 || to == v.T_INT8 || to == v.T_INT2 || to == v.T_OID {
+        let lo = -9223372036854775807 - 1
+        let hi = 9223372036854775807
+        if to == v.T_INT4 {
+            lo = -2147483648
+            hi = 2147483647
+        }
+        if to == v.T_INT2 {
+            lo = -32768
+            hi = 32767
+        }
+        if to == v.T_OID {
+            lo = -2147483648
+            hi = 4294967295
+        }
+        v.parseInt(b, o, l, q, lo, hi)
+        if !q.ok {
+            if q.aux == 1 {
+                raise(p, "22003", "value \"" + viewText(b, o, l) + "\" is out of range for type " + v.typeName(to))
+            } else {
+                raise(p, "22P02", "invalid input syntax for type " + v.typeName(to) + ": \"" + viewText(b, o, l) + "\"")
+            }
+            return
+        }
+        p.rInt[dst] = q.i
+        if to == v.T_OID && q.i < 0 { p.rInt[dst] = q.i + 4294967296 }
+        return
+    }
+    if to == v.T_FLOAT8 || to == v.T_FLOAT4 {
+        if to == v.T_FLOAT4 { v.parseFloat4(b, o, l, q) } else { v.parseFloat(b, o, l, q) }
+        if !q.ok {
+            raise(p, "22P02", "invalid input syntax for type " + v.typeName(to) + ": \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        if q.aux == 1 {
+            raise(p, "22003", "\"" + viewText(b, o, l) + "\" is out of range for type " + v.typeName(to))
+            return
+        }
+        p.rFlt[dst] = q.f
+        if to == v.T_FLOAT4 {
+            let fb = Bytes(4)
+            fb.setFloat32(0, q.f)
+            p.rFlt[dst] = fb.getFloat32(0)
+        }
+        return
+    }
+    if to == v.T_NUMERIC || to == v.T_NUMTEXT {
+        v.parseNumeric(b, o, l, q)
+        if q.ok {
+            p.rInt[dst] = q.i
+            p.rAux[dst] = q.scale
+            applyNumericTypmod(p, dst, typmod)
+            return
+        }
+        let st: List<Integer> = [0]
+        let x = nm.parse(b, o, l, st)
+        if st[0] == 1 {
+            raise(p, "22P02", "invalid input syntax for type numeric: \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        if st[0] == 2 {
+            raise(p, "22003", "value overflows numeric format")
+            return
+        }
+        setRegNum(p, dst, x)
+        applyNumericTypmod(p, dst, typmod)
+        return
+    }
+    if to == v.T_BOOL {
+        v.parseBool(b, o, l, q)
+        if !q.ok {
+            raise(p, "22P02", "invalid input syntax for type boolean: \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        p.rInt[dst] = q.i
+        return
+    }
+    if to == v.T_DATE {
+        v.parseDate(b, o, l, q)
+        if q.ok && q.scale != 1 {
+            p.rInt[dst] = q.i
+            return
+        }
+        v.parseTimestamp(b, o, l, q)
+        if !q.ok {
+            if q.aux == 1 {
+                raise(p, "22008", "date/time field value out of range: \"" + viewText(b, o, l) + "\"")
+            } else {
+                raise(p, "22007", "invalid input syntax for type date: \"" + viewText(b, o, l) + "\"")
+            }
+            return
+        }
+        let d = q.i / v.USECS_PER_DAY
+        if q.i < 0 && q.i % v.USECS_PER_DAY != 0 { d -= 1 }
+        p.rInt[dst] = d
+        return
+    }
+    if to == v.T_TIMESTAMP || to == v.T_TIMESTAMPTZ {
+        if v.equalsIgnoreCase(b, o, l, "now") || v.equalsIgnoreCase(b, o, l, "current_timestamp") {
+            p.rInt[dst] = p.env.nowMicros
+            return
+        }
+        v.parseTimestamp(b, o, l, q)
+        if !q.ok {
+            if q.aux == 1 {
+                raise(p, "22008", "date/time field value out of range: \"" + viewText(b, o, l) + "\"")
+            } else {
+                raise(p, "22007", "invalid input syntax for type " + v.typeName(to) + ": \"" + viewText(b, o, l) + "\"")
+            }
+            return
+        }
+        p.rInt[dst] = q.i
+        return
+    }
+    if to == v.T_INTERVAL {
+        v.parseInterval(b, o, l, unitHint, q)
+        if !q.ok && q.aux == 2 {
+            raise(p, "22015", "interval field value out of range: \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        if !q.ok {
+            raise(p, "22007", "invalid input syntax for type interval: \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        p.rInt[dst] = q.i
+        p.rAux[dst] = q.aux
+        p.rAux2[dst] = q.aux2
+        return
+    }
+    if to == v.T_TIME {
+        let tmp = Bytes("2000-01-01 ")
+        tmp.addBytes(b.slice(o, o + l))
+        v.parseTimestamp(tmp, 0, tmp.length, q)
+        if !q.ok {
+            raise(p, "22007", "invalid input syntax for type time: \"" + viewText(b, o, l) + "\"")
+            return
+        }
+        p.rInt[dst] = q.i
+        return
+    }
+    if to == v.T_REGCLASS {
+        // a relation name (optionally schema-qualified / quoted) or a numeric oid
+        let q2 = v.newParsed()
+        v.parseInt(b, o, l, q2, 0, 4294967295)
+        if q2.ok {
+            p.rInt[dst] = q2.i
+            return
+        }
+        let name = viewText(b, o, l)
+        let oid = pgc.relOidByName(p.env.cat, name)
+        if oid < 0 {
+            raise(p, "42P01", "relation \"" + name + "\" does not exist")
+            return
+        }
+        p.rInt[dst] = oid
+        return
+    }
+    if to == v.T_BYTEA {
+        byteaFromText(p, b, o, l, dst)
+        return
+    }
+    if v.isTextType(to) {
+        let len = l
+        if fromBpchar && to != v.T_BPCHAR { len = v.trimmedLen(b, o, l) }
+        setTextReg(p, dst, b, o, len)
+        applyTextTypmod(p, dst, to, typmod, false)
+        return
+    }
+    raise(p, "0A000", "unsupported type " + v.typeName(to))
+}
+
+// bytea input (hex or escape format) into register dst (raw bytes).
+function byteaFromText(p: Plan, b: Bytes, o: Integer, l: Integer, dst: Integer) {
+    let s = scratchOf(p, dst)
+    let e = sf.newErr()
+    sf.byteaIn(b, o, l, s, e)
+    if e.code != "" {
+        raise(p, e.code, e.msg)
+        return
+    }
+    setTextReg(p, dst, s, 0, s.length)
+}
+
+// ---------------------------------------------------------------- arithmetic
+
+function addOv(a: Integer, b: Integer): Boolean {
+    if b > 0 { return a > 9223372036854775807 - b }
+    return a < -9223372036854775807 - 1 - b
+}
+
+function mulOv(a: Integer, b: Integer): Boolean {
+    if a == 0 || b == 0 { return false }
+    if a == -1 { return b == -9223372036854775807 - 1 }
+    if b == -1 { return a == -9223372036854775807 - 1 }
+    let aa = a
+    let bb = b
+    if aa == -9223372036854775807 - 1 || bb == -9223372036854775807 - 1 { return true }
+    if aa < 0 { aa = -aa }
+    if bb < 0 { bb = -bb }
+    return aa > 9223372036854775807 / bb
+}
+
+// Integer bitwise operators with C semantics (shift counts masked like PG on x86-64, results wrap to the type).
+function bitwise(op: Integer, x: Integer, y: Integer, t: Integer): Integer {
+    if op == OPR_BAND { return x & y }
+    if op == OPR_BOR { return x | y }
+    if op == OPR_BXOR { return x ^ y }
+    if op == OPR_BNOT { return ~x }
+    let bits = 32
+    if t == v.T_INT8 { bits = 64 }
+    let sh = y & (bits - 1)
+    if op == OPR_SHR {
+        return x >> sh
+    }
+    let r = wrappingMultiply(x, 1 << sh)
+    if bits == 32 {
+        r = r & 4294967295
+        if r >= 2147483648 { r = r - 4294967296 }
+        if t == v.T_INT2 {
+            r = r & 65535
+            if r >= 32768 { r = r - 65536 }
+        }
+    }
+    return r
+}
+
+// C semantics of Postgres int2/int4/int8 shl on x86-64: the count is masked to the operand width and the
+// result wraps to the type width.
+function shiftLeftInt(x: Integer, c: Integer, t: Integer): Integer {
+    if t == v.T_INT8 {
+        let k = c & 63
+        if k == 0 { return x }
+        if k == 63 {
+            if (x & 1) != 0 { return -9223372036854775807 - 1 }
+            return 0
+        }
+        return wrappingMultiply(x, 1 << k)
+    }
+    let k = c & 31
+    let u = ((x & 4294967295) << k) & 4294967295
+    if u >= 2147483648 { u -= 4294967296 }
+    if t == v.T_INT2 {
+        u = u & 65535
+        if u >= 32768 { u -= 65536 }
+    }
+    return u
+}
+
+// Evaluate the operands of a strict binary operator. Postgres folds an operator with a constant NULL operand to
+// NULL at plan time, so the other operand is never evaluated (no errors from it): constant operands go first.
+// Returns false when the result is already decided (NULL set on n).
+function evalStrictPair(p: Plan, n: Integer, a: Integer, b: Integer): Boolean {
+    let ca = p.eConst[a] != 0
+    let cb = p.eConst[b] != 0
+    if cb && !ca {
+        ev(p, b)
+        if p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return false
+        }
+        ev(p, a)
+        return true
+    }
+    if ca && !cb {
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return false
+        }
+    } else {
+        ev(p, a)
+    }
+    ev(p, b)
+    return true
+}
+
+// Mark constant subtrees (literals and immutable operations over them); parameters, columns, subqueries and
+// volatile functions are not constant. Called once per plan after compilation.
+public function computeConst(p: Plan) {
+    let pass = 0
+    while pass < 2 {
+        let n = 0
+        while n < p.ek.length {
+            if constNode(p, n) { p.eConst[n] = 1 } else { p.eConst[n] = 0 }
+            n += 1
+        }
+        pass += 1
+    }
+}
+
+function cst(p: Plan, x: Integer): Boolean {
+    if x < 0 || x >= p.eConst.length { return x < 0 }
+    return p.eConst[x] != 0
+}
+
+function argsConst(p: Plan, start: Integer, cnt: Integer): Boolean {
+    let i = 0
+    while i < cnt {
+        if !cst(p, p.eargs[start + i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+function constNode(p: Plan, n: Integer): Boolean {
+    let k = p.ek[n]
+    if k == EX_CONST { return true }
+    if k == EX_ARITH || k == EX_CMP || k == EX_CONCAT || k == EX_DISTINCT || k == EX_NULLIF || k == EX_AND || k == EX_OR {
+        return cst(p, p.ea[n]) && cst(p, p.eb[n])
+    }
+    if k == EX_NEG || k == EX_CAST || k == EX_LITCAST || k == EX_NOT || k == EX_ISNULL || k == EX_ISBOOL {
+        return cst(p, p.ea[n])
+    }
+    if k == EX_LIKE { return cst(p, p.ea[n]) && cst(p, p.eb[n]) && cst(p, p.ed[n]) }
+    if k == EX_COALESCE || k == EX_GREATEST { return argsConst(p, p.ea[n], p.eb[n]) }
+    if k == EX_INLIST { return cst(p, p.ea[n]) && argsConst(p, p.eb[n], p.ec[n] & 1048575) }
+    if k == EX_CASE { return cst(p, p.ea[n]) && argsConst(p, p.eb[n], 2 * p.ec[n]) && cst(p, p.ed[n]) }
+    if k == EX_FUNC {
+        let fn = p.ec[n]
+        if fn == FN_RANDOM || fn == FN_TEXTCONST || (fn >= FN_CAT_BASE && fn <= FN_CAT_END) { return false }
+        return argsConst(p, p.ea[n], p.eb[n])
+    }
+    return false
+}
+
+function evalArith(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    let b = p.eb[n]
+    if !evalStrictPair(p, n, a, b) { return }
+    if p.rNull[a] != 0 || p.rNull[b] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let op = p.ec[n]
+    let mode = p.ed[n]
+    p.rNull[n] = 0
+    if mode == AM_INT {
+        let x = p.rInt[a]
+        let y = p.rInt[b]
+        let t = p.et[n]
+        let r = 0
+        if op == OPR_ADD {
+            if addOv(x, y) { intRangeError(p, t); return }
+            r = x + y
+        } else if op == OPR_SUB {
+            if y == -9223372036854775807 - 1 || addOv(x, -y) { intRangeError(p, t); return }
+            r = x - y
+        } else if op == OPR_MUL {
+            if mulOv(x, y) { intRangeError(p, t); return }
+            r = x * y
+        } else if op == OPR_DIV {
+            if y == 0 { raise(p, "22012", "division by zero"); return }
+            if y == -1 && x == -9223372036854775807 - 1 { intRangeError(p, t); return }
+            r = x / y
+        } else if op == OPR_MOD {
+            if y == 0 { raise(p, "22012", "division by zero"); return }
+            if y == -1 { r = 0 } else { r = x % y }
+        } else if op >= OPR_BAND && op <= OPR_BNOT {
+            r = bitwise(op, x, y, t)
+        } else {
+            r = x
+        }
+        p.rInt[n] = r
+        if t == v.T_INT4 {
+            if r < -2147483648 || r > 2147483647 { raise(p, "22003", "integer out of range") }
+        } else if t == v.T_INT2 {
+            if r < -32768 || r > 32767 { raise(p, "22003", "smallint out of range") }
+        }
+        return
+    }
+    if mode == AM_FLT {
+        let x = p.rFlt[a]
+        let y = p.rFlt[b]
+        let r = 0.0
+        if op == OPR_ADD {
+            r = x + y
+        } else if op == OPR_SUB {
+            r = x - y
+        } else if op == OPR_MUL {
+            r = x * y
+            if r == 0.0 && x != 0.0 && y != 0.0 && x == x && y == y {
+                raise(p, "22003", "value out of range: underflow")
+                return
+            }
+        } else if op == OPR_DIV {
+            if y == 0.0 && x == x { raise(p, "22012", "division by zero"); return }
+            r = x / y
+            if r == 0.0 && x != 0.0 && x == x && !isInfF(y) && y == y {
+                raise(p, "22003", "value out of range: underflow")
+                return
+            }
+        } else if op == OPR_MOD {
+            if y == 0.0 { raise(p, "22012", "division by zero"); return }
+            r = x - y * Float(Integer(x / y))
+        } else if op == OPR_POW {
+            r = floatPow(p, x, y)
+            if p.err { return }
+            p.rFlt[n] = r
+            return
+        }
+        if (r > 1.7976931348623157e308 || r < -1.7976931348623157e308) && x == x && y == y && x <= 1.7976931348623157e308 && x >= -1.7976931348623157e308 && y <= 1.7976931348623157e308 && y >= -1.7976931348623157e308 {
+            raise(p, "22003", "value out of range: overflow")
+            return
+        }
+        if p.et[n] == v.T_FLOAT4 {
+            let fb = Bytes(4)
+            fb.setFloat32(0, r)
+            let r4 = fb.getFloat32(0)
+            if isInfF(r4) && !isInfF(r) && !isInfF(x) && !isInfF(y) {
+                raise(p, "22003", "value out of range: overflow")
+                return
+            }
+            r = r4
+        }
+        p.rFlt[n] = r
+        return
+    }
+    if mode == AM_NUM {
+        if p.rAux[a] >= 0 && p.rAux[b] >= 0 && op != OPR_POW {
+            let x = p.rInt[a]
+            let sx = p.rAux[a]
+            let y = p.rInt[b]
+            let sy = p.rAux[b]
+            let q = p.pq
+            if op == OPR_ADD || op == OPR_SUB {
+                let s = sx
+                if sy > s { s = sy }
+                v.rescale(x, sx, s, q)
+                let okx = q.ok
+                let xx = q.i
+                v.rescale(y, sy, s, q)
+                let yy = q.i
+                if okx && q.ok && yy != -9223372036854775807 - 1 {
+                    if op == OPR_SUB { yy = -yy }
+                    if !addOv(xx, yy) {
+                        p.rInt[n] = xx + yy
+                        p.rAux[n] = s
+                        return
+                    }
+                }
+            } else if op == OPR_MUL {
+                if sx + sy <= 18 && !mulOv(x, y) {
+                    p.rInt[n] = x * y
+                    p.rAux[n] = sx + sy
+                    return
+                }
+            } else if op == OPR_DIV {
+                if y == 0 {
+                    raise(p, "22012", "division by zero")
+                    return
+                }
+                let rs = v.divScale(x, sx, y, sy)
+                if rs <= 18 {
+                    v.numericDiv(x, sx, y, sy, rs, q)
+                    if q.ok {
+                        p.rInt[n] = q.i
+                        p.rAux[n] = rs
+                        return
+                    }
+                }
+            } else if op == OPR_MOD {
+                if y == 0 {
+                    raise(p, "22012", "division by zero")
+                    return
+                }
+                let s = sx
+                if sy > s { s = sy }
+                v.rescale(x, sx, s, q)
+                let okx = q.ok
+                let xx = q.i
+                v.rescale(y, sy, s, q)
+                if okx && q.ok {
+                    if q.i == -1 { p.rInt[n] = 0 } else { p.rInt[n] = xx % q.i }
+                    p.rAux[n] = s
+                    return
+                }
+            }
+        }
+        let e = nm.newErr()
+        let xa = regNum(p, a)
+        let xb = regNum(p, b)
+        let r = xa
+        if op == OPR_ADD {
+            r = nm.add(xa, xb)
+        } else if op == OPR_SUB {
+            r = nm.sub(xa, xb)
+        } else if op == OPR_MUL {
+            r = nm.mul(xa, xb)
+        } else if op == OPR_DIV {
+            r = nm.div(xa, xb, e)
+        } else if op == OPR_MOD {
+            r = nm.mod(xa, xb, e)
+        } else if op == OPR_POW {
+            r = nm.powerNum(xa, xb, e)
+        }
+        if numErr(p, e) { return }
+        setRegNum(p, n, r)
+        return
+    }
+    if mode == AM_DATE_INT || mode == AM_INT_DATE || mode == AM_DATE_DATE {
+        let x = p.rInt[a]
+        let y = p.rInt[b]
+        let r = 0
+        if mode == AM_DATE_DATE || op == OPR_SUB { r = x - y } else { r = x + y }
+        if mode != AM_DATE_DATE && (r < v.DATE_MIN_DAYS || r >= v.DATE_END_DAYS) {
+            raise(p, "22008", "date out of range")
+            return
+        }
+        p.rInt[n] = r
+        return
+    }
+    if mode == AM_DATE_IV || mode == AM_TS_IV {
+        let base = p.rInt[a]
+        if mode == AM_DATE_IV {
+            if base >= v.TS_END / v.USECS_PER_DAY || base < v.TS_MIN / v.USECS_PER_DAY {
+                raise(p, "22008", "date out of range for timestamp")
+                return
+            }
+            base = base * v.USECS_PER_DAY
+        }
+        let mi = p.rInt[b]
+        let d = p.rAux[b]
+        let mo = p.rAux2[b]
+        if op == OPR_SUB {
+            if mi == -9223372036854775807 - 1 {
+                raise(p, "22008", "timestamp out of range")
+                return
+            }
+            mi = -mi
+            d = -d
+            mo = -mo
+        }
+        let q = p.pq
+        v.timestampAddIntervalChecked(base, mi, d, mo, q)
+        if !q.ok {
+            raise(p, "22008", "timestamp out of range")
+            return
+        }
+        p.rInt[n] = q.i
+        return
+    }
+    if mode == AM_TS_TS {
+        let x = p.rInt[a]
+        let y = p.rInt[b]
+        if y == -9223372036854775807 - 1 || addOv(x, -y) {
+            raise(p, "22008", "interval out of range")
+            return
+        }
+        let diff = x - y
+        let days = diff / v.USECS_PER_DAY
+        setIvReg(p, n, diff - days * v.USECS_PER_DAY, days, 0)
+        return
+    }
+    if mode == AM_IV_IV {
+        let m1 = p.rInt[b]
+        let d1 = p.rAux[b]
+        let mo1 = p.rAux2[b]
+        if op != OPR_ADD {
+            if m1 == -9223372036854775807 - 1 {
+                raise(p, "22008", "interval out of range")
+                return
+            }
+            m1 = -m1
+            d1 = -d1
+            mo1 = -mo1
+        }
+        let rd = p.rAux[a] + d1
+        let rmo = p.rAux2[a] + mo1
+        if addOv(p.rInt[a], m1) || rd > 2147483647 || rd < -2147483648 || rmo > 2147483647 || rmo < -2147483648 {
+            raise(p, "22008", "interval out of range")
+            return
+        }
+        setIvReg(p, n, p.rInt[a] + m1, rd, rmo)
+        return
+    }
+    if mode == AM_IV_MUL || mode == AM_IV_DIV {
+        let f = p.rFlt[b]
+        if mode == AM_IV_DIV {
+            if f == 0.0 { raise(p, "22012", "division by zero"); return }
+            f = 1.0 / f
+        }
+        let months = Float(p.rAux2[a]) * f
+        let ok = f == f && months == months && months < 2147483648.0 && months > -2147483649.0
+        let mi = 0
+        let days = 0.0
+        if ok {
+            mi = Integer(months)
+            days = Float(p.rAux[a]) * f + (months - Float(mi)) * 30.0
+            ok = days == days && days < 2147483648.0 && days > -2147483649.0
+        }
+        let di = 0
+        let micf = 0.0
+        if ok {
+            di = Integer(days)
+            micf = Float(p.rInt[a]) * f + (days - Float(di)) * 86400000000.0
+            ok = micf == micf && micf < 9.2233720368547e18 && micf > -9.2233720368547e18
+        }
+        if !ok {
+            raise(p, "22008", "interval out of range")
+            return
+        }
+        setIvReg(p, n, Integer(micf), di, mi)
+        return
+    }
+    raise(p, "0A000", "unsupported arithmetic")
+}
+
+// ---------------------------------------------------------------- LIKE
+
+function lowerByte(c: Integer): Integer {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+// SQL LIKE with % and _ and an escape character (-1 none). ci: case-insensitive (ASCII).
+public function likeMatch(s: Bytes, so: Integer, sl: Integer, pt: Bytes, po: Integer, pl: Integer, esc: Integer, ci: Boolean): Boolean {
+    let si = 0
+    let pi = 0
+    let starP = -1
+    let starS = 0
+    while si < sl {
+        if pi < pl {
+            let pc = pt[po + pi]
+            if pc == 37 {
+                starP = pi
+                starS = si
+                pi += 1
+                continue
+            }
+            let lit = pc
+            let isAny = pc == 95
+            let plen = 1
+            if pc == esc && pi + 1 < pl {
+                lit = pt[po + pi + 1]
+                isAny = false
+                plen = 2
+            }
+            if isAny {
+                // one character (UTF-8 aware)
+                let step = 1
+                while si + step < sl && (s[so + si + step] & 192) == 128 { step += 1 }
+                si += step
+                pi += 1
+                continue
+            }
+            let sc = s[so + si]
+            let matched = sc == lit
+            if !matched && ci { matched = lowerByte(sc) == lowerByte(lit) }
+            if matched {
+                si += 1
+                pi += plen
+                continue
+            }
+        }
+        if starP >= 0 {
+            pi = starP + 1
+            starS += 1
+            si = starS
+            continue
+        }
+        return false
+    }
+    while pi < pl && pt[po + pi] == 37 { pi += 1 }
+    return pi == pl
+}
+
+// ---------------------------------------------------------------- evaluation
+
+public function ev(p: Plan, n: Integer) {
+    let k = p.ek[n]
+    if k == EX_COL {
+        let s = p.ea[n]
+        let r = p.slotRow[s]
+        if r < 0 {
+            p.rNull[n] = 1
+            return
+        }
+        loadCell(p, n, p.slotTable[s].cols[p.eb[n]], r)
+        return
+    }
+    if k == EX_CONST || k == EX_PARAM { return }
+    if k == EX_CMP {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        if !evalStrictPair(p, n, a, b) { return }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let c = cmpRegs(p, a, b, p.ed[n])
+        let op = p.ec[n]
+        let res = false
+        if op == OPR_EQ {
+            res = c == 0
+        } else if op == OPR_NE {
+            res = c != 0
+        } else if op == OPR_LT {
+            res = c < 0
+        } else if op == OPR_LE {
+            res = c <= 0
+        } else if op == OPR_GT {
+            res = c > 0
+        } else {
+            res = c >= 0
+        }
+        p.rNull[n] = 0
+        if res { p.rInt[n] = 1 } else { p.rInt[n] = 0 }
+        return
+    }
+    if k == EX_AND {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] == 0 && p.rInt[a] == 0 {
+            p.rNull[n] = 0
+            p.rInt[n] = 0
+            return
+        }
+        let b = p.eb[n]
+        ev(p, b)
+        if p.rNull[b] == 0 && p.rInt[b] == 0 {
+            p.rNull[n] = 0
+            p.rInt[n] = 0
+            return
+        }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        p.rNull[n] = 0
+        p.rInt[n] = 1
+        return
+    }
+    if k == EX_OR {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] == 0 && p.rInt[a] != 0 {
+            p.rNull[n] = 0
+            p.rInt[n] = 1
+            return
+        }
+        let b = p.eb[n]
+        ev(p, b)
+        if p.rNull[b] == 0 && p.rInt[b] != 0 {
+            p.rNull[n] = 0
+            p.rInt[n] = 1
+            return
+        }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        p.rNull[n] = 0
+        p.rInt[n] = 0
+        return
+    }
+    if k == EX_ARITH {
+        evalArith(p, n)
+        return
+    }
+    if k == EX_NOT {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        p.rNull[n] = 0
+        p.rInt[n] = 1 - p.rInt[a]
+        return
+    }
+    if k == EX_ISNULL {
+        let a = p.ea[n]
+        ev(p, a)
+        let isn = p.rNull[a] != 0
+        if p.ec[n] == 1 { isn = !isn }
+        setBoolReg(p, n, isn)
+        return
+    }
+    if k == EX_CAST {
+        let a = p.ea[n]
+        ev(p, a)
+        castReg(p, a, p.et[a], n, p.et[n], p.ec[n], p.eb[n] == 1, p.ed[n])
+        return
+    }
+    if k == EX_LITCAST {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        if classOf(p.et[a]) == CL_TEXT {
+            parseInto(p, p.rBuf[a], p.rOff[a], p.rLen[a], false, n, p.et[n], p.ec[n], p.ed[n])
+        } else {
+            castReg(p, a, p.et[a], n, p.et[n], p.ec[n], false, p.ed[n])
+        }
+        return
+    }
+    if k == EX_NEG {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let cl = classOf(p.et[n])
+        p.rNull[n] = 0
+        if cl == CL_NUM && (p.rAux[a] < 0 || p.rInt[a] == -9223372036854775807 - 1) {
+            setRegNum(p, n, nm.negate(regNum(p, a)))
+        } else if cl == CL_FLT {
+            p.rFlt[n] = -p.rFlt[a]
+        } else if cl == CL_IV {
+            if p.rInt[a] == -9223372036854775807 - 1 || p.rAux[a] == -2147483648 || p.rAux2[a] == -2147483648 {
+                raise(p, "22008", "interval out of range")
+                return
+            }
+            setIvReg(p, n, -p.rInt[a], -p.rAux[a], -p.rAux2[a])
+        } else {
+            let x = p.rInt[a]
+            if x == -9223372036854775807 - 1 {
+                intRangeError(p, p.et[n])
+                return
+            }
+            p.rInt[n] = -x
+            p.rAux[n] = p.rAux[a]
+            checkIntRange(p, n, p.et[n])
+        }
+        return
+    }
+    if k == EX_CASE {
+        evalCase(p, n)
+        return
+    }
+    if k == EX_COALESCE {
+        let start = p.ea[n]
+        let cnt = p.eb[n]
+        let i = 0
+        while i < cnt {
+            let a = p.eargs[start + i]
+            ev(p, a)
+            if p.rNull[a] == 0 {
+                copyReg(p, a, n)
+                return
+            }
+            i += 1
+        }
+        p.rNull[n] = 1
+        return
+    }
+    if k == EX_NULLIF {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        ev(p, a)
+        ev(p, b)
+        if p.rNull[a] == 0 && p.rNull[b] == 0 && cmpRegs(p, a, b, p.ed[n]) == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        copyReg(p, a, n)
+        return
+    }
+    if k == EX_GREATEST {
+        let start = p.ea[n]
+        let cnt = p.eb[n]
+        let least = p.ec[n] == 1
+        let best = -1
+        let i = 0
+        while i < cnt {
+            let a = p.eargs[start + i]
+            ev(p, a)
+            if p.rNull[a] == 0 {
+                if best < 0 {
+                    best = a
+                } else {
+                    let c = cmpRegs(p, a, best, p.ed[n])
+                    if (least && c < 0) || (!least && c > 0) { best = a }
+                }
+            }
+            i += 1
+        }
+        if best < 0 {
+            p.rNull[n] = 1
+        } else {
+            copyReg(p, best, n)
+        }
+        return
+    }
+    if k == EX_INLIST {
+        let a = p.ea[n]
+        ev(p, a)
+        let start = p.eb[n]
+        let cnt = p.ec[n] & 1048575
+        let negate = (p.ec[n] & 1048576) != 0
+        let cl = p.ed[n]
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let sawNull = false
+        let i = 0
+        while i < cnt {
+            let x = p.eargs[start + i]
+            ev(p, x)
+            if p.rNull[x] != 0 {
+                sawNull = true
+            } else if cmpRegs(p, a, x, cl) == 0 {
+                setBoolReg(p, n, !negate)
+                return
+            }
+            i += 1
+        }
+        if sawNull {
+            p.rNull[n] = 1
+            return
+        }
+        setBoolReg(p, n, negate)
+        return
+    }
+    if k == EX_LIKE {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        ev(p, a)
+        ev(p, b)
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let flags = p.ec[n]
+        let esc = 92
+        if p.ed[n] >= 0 {
+            let e = p.ed[n]
+            ev(p, e)
+            if p.rNull[e] != 0 || p.rLen[e] == 0 {
+                esc = -1
+            } else {
+                esc = p.rBuf[e][p.rOff[e]]
+            }
+        }
+        let m = likeMatch(p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b], esc, (flags & 2) != 0)
+        if (flags & 1) != 0 { m = !m }
+        setBoolReg(p, n, m)
+        return
+    }
+    if k == EX_CONCAT {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        if !evalStrictPair(p, n, a, b) { return }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let s = scratchOf(p, n)
+        appendView(s, p.rBuf[a], p.rOff[a], p.rLen[a])
+        appendView(s, p.rBuf[b], p.rOff[b], p.rLen[b])
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if k == EX_FUNC {
+        evalFunc(p, n)
+        return
+    }
+    if k == EX_ISBOOL {
+        let a = p.ea[n]
+        ev(p, a)
+        let which = p.ec[n]
+        let res = false
+        if which == 2 { res = p.rNull[a] == 0 && p.rInt[a] != 0 }
+        if which == 3 { res = p.rNull[a] == 0 && p.rInt[a] == 0 }
+        if which == 4 { res = p.rNull[a] != 0 }
+        if p.ed[n] == 1 { res = !res }
+        setBoolReg(p, n, res)
+        return
+    }
+    if k == EX_DISTINCT {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        ev(p, a)
+        ev(p, b)
+        let an = p.rNull[a] != 0
+        let bn = p.rNull[b] != 0
+        let distinct = false
+        if an || bn {
+            distinct = an != bn
+        } else {
+            distinct = cmpRegs(p, a, b, p.ed[n]) != 0
+        }
+        if p.ec[n] == 1 { distinct = !distinct }
+        setBoolReg(p, n, distinct)
+        return
+    }
+    if k == EX_SUBQ {
+        evalScalarSubquery(p, n)
+        return
+    }
+    if k == EX_EXISTS {
+        let correlated = p.ec[n] == 1
+        if !correlated && p.eState[n] != 0 { return }
+        let root = p.ea[n]
+        open(p, root)
+        let found = next(p, root)
+        setBoolReg(p, n, found)
+        p.eState[n] = 1
+        return
+    }
+    if k == EX_INSUB {
+        evalInSubquery(p, n)
+        return
+    }
+    if k == EX_QUANT {
+        evalQuantified(p, n)
+        return
+    }
+    if k == EX_NOW {
+        setIntReg(p, n, p.env.nowMicros)
+        return
+    }
+    if k == EX_REGEX {
+        evalRegex(p, n)
+        return
+    }
+    if k == EX_SUBSCRIPT {
+        evalSubscript(p, n)
+        return
+    }
+    if k == EX_FIELD {
+        evalField(p, n)
+        return
+    }
+    raise(p, "0A000", "unsupported expression kind " + Text(k))
+}
+
+public function appendView(out: Bytes, b: Bytes, o: Integer, l: Integer) {
+    let i = 0
+    while i + 8 <= l {
+        out.addInt64(b.getInt64(o + i))
+        i += 8
+    }
+    while i < l {
+        out.add(b[o + i])
+        i += 1
+    }
+}
+
+function evalCase(p: Plan, n: Integer) {
+    let operand = p.ea[n]
+    let start = p.eb[n]
+    let pairs = p.ec[n]
+    let elseN = p.ed[n]
+    if operand >= 0 { ev(p, operand) }
+    let i = 0
+    while i < pairs {
+        let w = p.eargs[start + 2 * i]
+        ev(p, w)
+        let hit = false
+        if operand >= 0 {
+            // w is a comparison node prepared by the planner (operand = value); evaluated directly
+            hit = p.rNull[w] == 0 && p.rInt[w] != 0
+        } else {
+            hit = p.rNull[w] == 0 && p.rInt[w] != 0
+        }
+        if hit {
+            let t = p.eargs[start + 2 * i + 1]
+            ev(p, t)
+            copyReg(p, t, n)
+            return
+        }
+        i += 1
+    }
+    if elseN >= 0 {
+        ev(p, elseN)
+        copyReg(p, elseN, n)
+        return
+    }
+    p.rNull[n] = 1
+}
+
+function evalScalarSubquery(p: Plan, n: Integer) {
+    let correlated = p.ec[n] == 1
+    if !correlated && p.eState[n] != 0 { return }
+    let root = p.ea[n]
+    let out = p.eb[n]
+    open(p, root)
+    if p.err { return }
+    if !next(p, root) {
+        p.rNull[n] = 1
+        p.eState[n] = 1
+        return
+    }
+    ev(p, out)
+    copyRegOwned(p, out, n)
+    if next(p, root) {
+        raise(p, "21000", "more than one row returned by a subquery used as an expression")
+        return
+    }
+    p.eState[n] = 1
+}
+
+// IN (subquery): uncorrelated subqueries are materialized once into a hash set (map + chain + temp table).
+function evalInSubquery(p: Plan, n: Integer) {
+    let lhs = p.ea[n]
+    let root = p.eb[n]
+    let out = p.ec[n]
+    let flags = p.ed[n]
+    let negate = (flags & 1) != 0
+    let correlated = (flags & 2) != 0
+    let cl = (flags >> 8) & 255
+    ev(p, lhs)
+    if correlated {
+        // iterate
+        let lhsNull = p.rNull[lhs] != 0
+        let sawNull = false
+        open(p, root)
+        while next(p, root) {
+            ev(p, out)
+            if p.rNull[out] != 0 {
+                sawNull = true
+            } else if lhsNull {
+                sawNull = true
+            } else if cmpRegs(p, lhs, out, cl) == 0 {
+                setBoolReg(p, n, !negate)
+                return
+            }
+            if p.err { return }
+        }
+        if sawNull {
+            p.rNull[n] = 1
+            return
+        }
+        setBoolReg(p, n, negate)
+        return
+    }
+    let setIdx = (flags >> 16) & 65535
+    let tmpIdx = setIdx
+    if p.eState[n] == 0 {
+        // build
+        let t = p.temps[tmpIdx]
+        tb.truncate(t)
+        let m = p.maps[setIdx]
+        hm.clear(m)
+        let chain = p.chains[setIdx]
+        chain.clear()
+        let hasNull = 0
+        open(p, root)
+        while next(p, root) {
+            ev(p, out)
+            if p.err { return }
+            if p.rNull[out] != 0 {
+                hasNull = 1
+            } else {
+                let h = hashReg(p, out)
+                let r = tb.reserveRow(t, 0)
+                storeCell(p, out, t.cols[0], r)
+                chain.addInt64(hm.get(m, h, -1))
+                hm.put(m, h, r)
+            }
+        }
+        p.eState[n] = 1 + hasNull
+    }
+    if p.rNull[lhs] != 0 {
+        if p.temps[tmpIdx].nrows == 0 && p.eState[n] == 1 {
+            setBoolReg(p, n, negate)
+            return
+        }
+        p.rNull[n] = 1
+        return
+    }
+    let t = p.temps[tmpIdx]
+    let m = p.maps[setIdx]
+    let chain = p.chains[setIdx]
+    let h = hashReg(p, lhs)
+    let r = hm.get(m, h, -1)
+    while r >= 0 {
+        if regEqualsCell(p, lhs, t.cols[0], r) {
+            setBoolReg(p, n, !negate)
+            return
+        }
+        r = chain.getInt64(r * 8)
+    }
+    if p.eState[n] == 2 {
+        p.rNull[n] = 1
+        return
+    }
+    setBoolReg(p, n, negate)
+}
+
+// x op ANY/ALL (subquery): a = lhs, b = root, c = out, d = op | all<<8 | class<<16
+function evalQuantified(p: Plan, n: Integer) {
+    let lhs = p.ea[n]
+    let root = p.eb[n]
+    let out = p.ec[n]
+    let op = p.ed[n] & 255
+    let all = ((p.ed[n] >> 8) & 1) == 1
+    let cl = (p.ed[n] >> 16) & 255
+    ev(p, lhs)
+    let sawNull = false
+    open(p, root)
+    while next(p, root) {
+        ev(p, out)
+        if p.err { return }
+        if p.rNull[out] != 0 || p.rNull[lhs] != 0 {
+            sawNull = true
+        } else {
+            let c = cmpRegs(p, lhs, out, cl)
+            let res = false
+            if op == OPR_EQ { res = c == 0 }
+            if op == OPR_NE { res = c != 0 }
+            if op == OPR_LT { res = c < 0 }
+            if op == OPR_LE { res = c <= 0 }
+            if op == OPR_GT { res = c > 0 }
+            if op == OPR_GE { res = c >= 0 }
+            if all && !res {
+                setBoolReg(p, n, false)
+                return
+            }
+            if !all && res {
+                setBoolReg(p, n, true)
+                return
+            }
+        }
+    }
+    if sawNull {
+        p.rNull[n] = 1
+        return
+    }
+    setBoolReg(p, n, all)
+}
+
+// ---------------------------------------------------------------- functions
+
+function argAt(p: Plan, n: Integer, i: Integer): Integer {
+    return p.eargs[p.ea[n] + i]
+}
+
+function evalFunc(p: Plan, n: Integer) {
+    let fn = p.ec[n]
+    if fn != FN_CONCAT && fn != FN_CONCAT_WS && (fn < FN_STR_BASE || fn >= FN_GCD) {
+        let j = 0
+        let cntj = p.eb[n]
+        while j < cntj {
+            let aj = argAt(p, n, j)
+            if p.eConst[aj] != 0 {
+                ev(p, aj)
+                if p.rNull[aj] != 0 {
+                    p.rNull[n] = 1
+                    return
+                }
+            }
+            j += 1
+        }
+    }
+    if fn >= FN_CAT_BASE && fn <= FN_CAT_END {
+        evalCatFunc(p, n)
+        return
+    }
+    if fn >= FN_STR_BASE && fn < FN_CAT_BASE {
+        evalStrFunc(p, n)
+        return
+    }
+    let cnt = p.eb[n]
+    let i = 0
+    while i < cnt {
+        let a = argAt(p, n, i)
+        ev(p, a)
+        if p.rNull[a] != 0 && fn != FN_CONCAT && !(fn == FN_CONCAT_WS && i > 0) {
+            p.rNull[n] = 1
+            return
+        }
+        i += 1
+    }
+    p.rNull[n] = 0
+    let t = p.et[n]
+    let a0 = -1
+    if cnt > 0 { a0 = argAt(p, n, 0) }
+    let a1 = -1
+    if cnt > 1 { a1 = argAt(p, n, 1) }
+    let a2 = -1
+    if cnt > 2 { a2 = argAt(p, n, 2) }
+    if fn == FN_ABS {
+        let cl = classOf(t)
+        if cl == CL_FLT {
+            p.rFlt[n] = abs(p.rFlt[a0])
+        } else if cl == CL_NUM && (p.rAux[a0] < 0 || p.rInt[a0] == -9223372036854775807 - 1) {
+            setRegNum(p, n, nm.absNum(regNum(p, a0)))
+        } else {
+            let x = p.rInt[a0]
+            if x == -9223372036854775807 - 1 { intRangeError(p, t); return }
+            if x < 0 { x = -x }
+            p.rInt[n] = x
+            p.rAux[n] = p.rAux[a0]
+            checkIntRange(p, n, t)
+        }
+        return
+    }
+    if fn == FN_ROUND || fn == FN_TRUNC || fn == FN_FLOOR || fn == FN_CEIL {
+        let cl = classOf(t)
+        if cl == CL_FLT {
+            let x = p.rFlt[a0]
+            if fn == FN_ROUND {
+                if cnt > 1 {
+                    let d = p.rInt[a1]
+                    let m = math.pow(10.0, Float(d))
+                    p.rFlt[n] = roundHalfEvenF(x * m) / m
+                } else {
+                    p.rFlt[n] = roundHalfEvenF(x)
+                }
+            } else if fn == FN_TRUNC {
+                if x >= 0.0 { p.rFlt[n] = math.floor(x) } else { p.rFlt[n] = math.ceil(x) }
+            } else if fn == FN_FLOOR {
+                p.rFlt[n] = math.floor(x)
+            } else {
+                p.rFlt[n] = math.ceil(x)
+            }
+            return
+        }
+        if cl == CL_NUM {
+            let x = regNum(p, a0)
+            let target = 0
+            if cnt > 1 { target = p.rInt[a1] }
+            let e = nm.newErr()
+            let r = x
+            if fn == FN_FLOOR {
+                r = nm.floorNum(x)
+            } else if fn == FN_CEIL {
+                r = nm.ceilNum(x)
+            } else {
+                r = nm.roundSql(x, target, fn == FN_TRUNC, e)
+            }
+            if numErr(p, e) { return }
+            setRegNum(p, n, r)
+            return
+        }
+        // integers: unchanged
+        p.rInt[n] = p.rInt[a0]
+        return
+    }
+    if fn == FN_MOD {
+        // planner uses arithmetic nodes for mod of ints; numeric path here
+        let x = p.rInt[a0]
+        let y = p.rInt[a1]
+        if y == 0 { raise(p, "22012", "division by zero"); return }
+        if classOf(t) == CL_NUM {
+            let e = nm.newErr()
+            let r = nm.mod(regNum(p, a0), regNum(p, a1), e)
+            if numErr(p, e) { return }
+            setRegNum(p, n, r)
+            return
+        }
+        if y == -1 { p.rInt[n] = 0 } else { p.rInt[n] = x % y }
+        return
+    }
+    if (fn == FN_POWER || fn == FN_SQRT || fn == FN_EXP || fn == FN_LN || fn == FN_LOG10) && classOf(t) == CL_NUM {
+        let e = nm.newErr()
+        let x = regNum(p, a0)
+        let r = x
+        if fn == FN_POWER {
+            r = nm.powerNum(x, regNum(p, a1), e)
+        } else if fn == FN_SQRT {
+            r = nm.sqrtNum(x, e)
+        } else if fn == FN_EXP {
+            r = nm.expNum(x, e)
+        } else if fn == FN_LN {
+            r = nm.lnNum(x, e)
+        } else if cnt > 1 {
+            r = nm.logNum(x, regNum(p, a1), e)
+        } else {
+            r = nm.logNum(nm.fromInt(10), x, e)
+        }
+        if numErr(p, e) { return }
+        setRegNum(p, n, r)
+        return
+    }
+    if fn == FN_POWER || fn == FN_SQRT || fn == FN_EXP || fn == FN_LN || fn == FN_LOG10 || fn == FN_CBRT {
+        let x = p.rFlt[a0]
+        let r = 0.0
+        if fn == FN_POWER {
+            r = floatPow(p, x, p.rFlt[a1])
+            if p.err { return }
+        } else if fn == FN_SQRT {
+            if x < 0.0 { raise(p, "2201F", "cannot take square root of a negative number"); return }
+            r = math.sqrt(x)
+        } else if fn == FN_EXP {
+            if x != x {
+                r = x
+            } else if isInfF(x) {
+                if x > 0.0 { r = x } else { r = 0.0 }
+            } else {
+                r = math.exp(x)
+                if isInfF(r) { raise(p, "22003", "value out of range: overflow"); return }
+                if r == 0.0 { raise(p, "22003", "value out of range: underflow"); return }
+            }
+        } else if fn == FN_LN {
+            if x == 0.0 { raise(p, "2201E", "cannot take logarithm of zero"); return }
+            if x < 0.0 { raise(p, "2201E", "cannot take logarithm of a negative number"); return }
+            r = math.log(x)
+        } else if fn == FN_LOG10 {
+            if x == 0.0 { raise(p, "2201E", "cannot take logarithm of zero"); return }
+            if x < 0.0 { raise(p, "2201E", "cannot take logarithm of a negative number"); return }
+            r = math.log(x) / math.log(10.0)
+            let rr = math.round(r)
+            if abs(r - rr) < 1.0e-12 && math.pow(10.0, rr) == x { r = rr }
+        } else {
+            r = cbrtGlibc(x)
+        }
+        if classOf(t) == CL_NUM {
+            let fb = Bytes()
+            v.addFloat(fb, r, false)
+            let q = p.pq
+            v.parseNumeric(fb, 0, fb.length, q)
+            p.rInt[n] = q.i
+            p.rAux[n] = q.scale
+            if q.scale < 16 && fn != FN_POWER {
+                v.rescale(q.i, q.scale, 16, q)
+                if q.ok {
+                    p.rInt[n] = q.i
+                    p.rAux[n] = 16
+                }
+            }
+            return
+        }
+        p.rFlt[n] = r
+        return
+    }
+    if fn == FN_SIGN {
+        let cl = classOf(t)
+        if cl == CL_FLT {
+            let x = p.rFlt[a0]
+            if x > 0.0 { p.rFlt[n] = 1.0 } else if x < 0.0 { p.rFlt[n] = -1.0 } else { p.rFlt[n] = 0.0 }
+        } else if cl == CL_NUM && p.rAux[a0] < 0 {
+            setRegNum(p, n, nm.signNum(regNum(p, a0)))
+        } else {
+            let x = p.rInt[a0]
+            if x > 0 { p.rInt[n] = 1 } else if x < 0 { p.rInt[n] = -1 } else { p.rInt[n] = 0 }
+            p.rAux[n] = 0
+        }
+        return
+    }
+    if fn == FN_LENGTH {
+        let l = p.rLen[a0]
+        if p.et[a0] == v.T_BYTEA {
+            p.rInt[n] = l
+            return
+        }
+        if p.et[a0] == v.T_BPCHAR { l = v.trimmedLen(p.rBuf[a0], p.rOff[a0], l) }
+        p.rInt[n] = charCount(p.rBuf[a0], p.rOff[a0], l)
+        return
+    }
+    if fn == FN_OCTET_LENGTH {
+        p.rInt[n] = p.rLen[a0]
+        return
+    }
+    if fn == FN_LOWER || fn == FN_UPPER || fn == FN_INITCAP {
+        let s = scratchOf(p, n)
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let j = 0
+        let prevAlnum = false
+        while j < l {
+            let c = b[o + j]
+            if fn == FN_LOWER {
+                if c >= 65 && c <= 90 { c += 32 }
+            } else if fn == FN_UPPER {
+                if c >= 97 && c <= 122 { c -= 32 }
+            } else {
+                if prevAlnum {
+                    if c >= 65 && c <= 90 { c += 32 }
+                } else {
+                    if c >= 97 && c <= 122 { c -= 32 }
+                }
+                prevAlnum = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+            }
+            s.add(c)
+            j += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_SUBSTR {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let start = p.rInt[a1]
+        let isBytes = p.et[a0] == v.T_BYTEA
+        let total = l
+        if !isBytes { total = charCount(b, o, l) }
+        let endc = total + 1
+        if cnt > 2 {
+            let len = p.rInt[a2]
+            if len < 0 { raise(p, "22011", "negative substring length not allowed"); return }
+            if addOv(start, len) { endc = total + 1 } else { endc = start + len }
+        }
+        if isBytes {
+            let s0b = start
+            if s0b < 1 { s0b = 1 }
+            if endc > total + 1 { endc = total + 1 }
+            if endc <= s0b {
+                setTextReg(p, n, b, o, 0)
+                return
+            }
+            setTextReg(p, n, b, o + s0b - 1, endc - s0b)
+            return
+        }
+        let s0 = start
+        if s0 < 1 { s0 = 1 }
+        if endc > total + 1 { endc = total + 1 }
+        if endc <= s0 {
+            setTextReg(p, n, b, o, 0)
+            return
+        }
+        let bo = charOffset(b, o, l, s0 - 1)
+        let be = charOffset(b, o, l, endc - 1)
+        setTextReg(p, n, b, o + bo, be - bo)
+        return
+    }
+    if fn == FN_LEFT || fn == FN_RIGHT {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let k = p.rInt[a1]
+        let total = charCount(b, o, l)
+        let take = k
+        if k < 0 { take = total + k }
+        // PG negates INT_MIN to itself, so right(s, -2147483648) is the whole string
+        if fn == FN_RIGHT && k == -2147483648 { take = total }
+        if take < 0 { take = 0 }
+        if take > total { take = total }
+        if fn == FN_LEFT {
+            setTextReg(p, n, b, o, charOffset(b, o, l, take))
+        } else {
+            let from = charOffset(b, o, l, total - take)
+            setTextReg(p, n, b, o + from, l - from)
+        }
+        return
+    }
+    if fn == FN_POSITION || fn == FN_STRPOS {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let sb = p.rBuf[a1]
+        let so = p.rOff[a1]
+        let sl = p.rLen[a1]
+        let pos = 0
+        let j = 0
+        while j + sl <= l {
+            if v.equalBytes(b, o + j, sl, sb, so, sl) {
+                pos = charCount(b, o, j) + 1
+                break
+            }
+            j += 1
+        }
+        p.rInt[n] = pos
+        return
+    }
+    if fn == FN_BTRIM || fn == FN_LTRIM || fn == FN_RTRIM {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let chars = Bytes(" ")
+        let co = 0
+        let cl = 1
+        if cnt > 1 {
+            chars = p.rBuf[a1]
+            co = p.rOff[a1]
+            cl = p.rLen[a1]
+        }
+        let s = 0
+        let e = l
+        if fn != FN_RTRIM {
+            while s < e && inSet(b[o + s], chars, co, cl) { s += 1 }
+        }
+        if fn != FN_LTRIM {
+            while e > s && inSet(b[o + e - 1], chars, co, cl) { e -= 1 }
+        }
+        setTextReg(p, n, b, o + s, e - s)
+        return
+    }
+    if fn == FN_REPLACE {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let fb = p.rBuf[a1]
+        let fo = p.rOff[a1]
+        let fl = p.rLen[a1]
+        let s = scratchOf(p, n)
+        let j = 0
+        while j < l {
+            if fl > 0 && j + fl <= l && v.equalBytes(b, o + j, fl, fb, fo, fl) {
+                appendView(s, p.rBuf[a2], p.rOff[a2], p.rLen[a2])
+                j += fl
+            } else {
+                s.add(b[o + j])
+                j += 1
+            }
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_TRANSLATE {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let s = scratchOf(p, n)
+        let j = 0
+        while j < l {
+            let c = b[o + j]
+            let idx = -1
+            let q = 0
+            while q < p.rLen[a1] {
+                if p.rBuf[a1][p.rOff[a1] + q] == c {
+                    idx = q
+                    break
+                }
+                q += 1
+            }
+            if idx < 0 {
+                s.add(c)
+            } else if idx < p.rLen[a2] {
+                s.add(p.rBuf[a2][p.rOff[a2] + idx])
+            }
+            j += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_CONCAT_WS {
+        let s = scratchOf(p, n)
+        let j = 1
+        let first = true
+        while j < cnt {
+            let a = argAt(p, n, j)
+            if p.rNull[a] == 0 {
+                if !first { appendView(s, p.rBuf[a0], p.rOff[a0], p.rLen[a0]) }
+                first = false
+                if classOf(p.et[a]) == CL_TEXT {
+                    appendView(s, p.rBuf[a], p.rOff[a], p.rLen[a])
+                } else {
+                    formatReg(p, a, p.et[a], s)
+                }
+            }
+            j += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_CONCAT {
+        let s = scratchOf(p, n)
+        let j = 0
+        while j < cnt {
+            let a = argAt(p, n, j)
+            if p.rNull[a] == 0 {
+                if classOf(p.et[a]) == CL_TEXT {
+                    appendView(s, p.rBuf[a], p.rOff[a], p.rLen[a])
+                } else {
+                    formatReg(p, a, p.et[a], s)
+                }
+            }
+            j += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_REPEAT {
+        let s = scratchOf(p, n)
+        let k = p.rInt[a1]
+        if k > 0 && p.rLen[a0] > 0 && k > 1073741823 / p.rLen[a0] {
+            raise(p, "54000", "requested length too large")
+            return
+        }
+        while k > 0 {
+            appendView(s, p.rBuf[a0], p.rOff[a0], p.rLen[a0])
+            k -= 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_REVERSE {
+        let s = scratchOf(p, n)
+        let j = p.rLen[a0] - 1
+        while j >= 0 {
+            s.add(p.rBuf[a0][p.rOff[a0] + j])
+            j -= 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_LPAD || fn == FN_RPAD {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let want = p.rInt[a1]
+        // Postgres sizes the buffer for 4-byte characters and refuses more than 1 GB (54000)
+        if want > 268435455 {
+            raise(p, "54000", "requested length too large")
+            return
+        }
+        let fill = Bytes(" ")
+        let fo = 0
+        let fl = 1
+        if cnt > 2 {
+            fill = p.rBuf[a2]
+            fo = p.rOff[a2]
+            fl = p.rLen[a2]
+        }
+        let have = charCount(b, o, l)
+        let s = scratchOf(p, n)
+        if want <= 0 {
+            setTextReg(p, n, s, 0, 0)
+            return
+        }
+        if have >= want {
+            setTextReg(p, n, b, o, charOffset(b, o, l, want))
+            return
+        }
+        let padN = want - have
+        let pad = Bytes()
+        let j = 0
+        while j < padN && fl > 0 {
+            pad.add(fill[fo + j % fl])
+            j += 1
+        }
+        if fn == FN_LPAD {
+            s.addBytes(pad)
+            appendView(s, b, o, l)
+        } else {
+            appendView(s, b, o, l)
+            s.addBytes(pad)
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_CHR {
+        let s = scratchOf(p, n)
+        let c = p.rInt[a0]
+        if c == 0 { raise(p, "54000", "null character not permitted"); return }
+        if c < 0 { raise(p, "22023", "character number must be positive"); return }
+        if c > 1114111 { raise(p, "54000", "requested character too large for encoding: " + Text(c)); return }
+        if c >= 55296 && c <= 57343 { raise(p, "54000", "requested character not valid for encoding: " + Text(c)); return }
+        if c < 128 {
+            s.add(c)
+        } else {
+            s.addBytes(Bytes(Text(Character(c))))
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_ASCII {
+        if p.rLen[a0] == 0 { p.rInt[n] = 0 } else { p.rInt[n] = p.rBuf[a0][p.rOff[a0]] }
+        return
+    }
+    if fn == FN_SPLIT_PART {
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let l = p.rLen[a0]
+        let db = p.rBuf[a1]
+        let dO = p.rOff[a1]
+        let dl = p.rLen[a1]
+        let want = p.rInt[a2]
+        if want == 0 { raise(p, "22023", "field position must not be zero"); return }
+        if want < 0 {
+            // count fields, then index from the end
+            let nf = 1
+            if l == 0 { nf = 0 }
+            let q = 0
+            while dl > 0 && q + dl <= l {
+                if v.equalBytes(b, o + q, dl, db, dO, dl) {
+                    nf += 1
+                    q += dl
+                } else {
+                    q += 1
+                }
+            }
+            if -want > nf {
+                setTextReg(p, n, b, o, 0)
+                return
+            }
+            want = nf + want + 1
+        }
+        let field = 1
+        let start = 0
+        let j = 0
+        while j <= l {
+            let atDelim = dl > 0 && j + dl <= l && v.equalBytes(b, o + j, dl, db, dO, dl)
+            if atDelim || j == l {
+                if field == want {
+                    setTextReg(p, n, b, o + start, j - start)
+                    return
+                }
+                field += 1
+                if atDelim {
+                    j += dl
+                    start = j
+                    continue
+                }
+            }
+            j += 1
+        }
+        setTextReg(p, n, b, o, 0)
+        return
+    }
+    if fn == FN_EXTRACT {
+        // a0 = field text constant, a1 = value
+        let f = viewText(p.rBuf[a0], p.rOff[a0], p.rLen[a0])
+        let st = p.et[a1]
+        let q = p.pq
+        let res = 0
+        let micros = 0
+        let days = 0
+        if st == v.T_DATE {
+            days = p.rInt[a1]
+        } else if st == v.T_TIMESTAMP || st == v.T_TIMESTAMPTZ {
+            let x = p.rInt[a1]
+            days = x / v.USECS_PER_DAY
+            micros = x % v.USECS_PER_DAY
+            if micros < 0 {
+                micros += v.USECS_PER_DAY
+                days -= 1
+            }
+        } else if st == v.T_INTERVAL {
+            let mo = p.rAux2[a1]
+            if f == "year" { res = mo / 12 }
+            if f == "month" { res = mo % 12 }
+            if f == "day" { res = p.rAux[a1] }
+            if f == "hour" { res = p.rInt[a1] / 3600000000 }
+            if f == "minute" { res = (p.rInt[a1] / 60000000) % 60 }
+            if f == "second" { res = (p.rInt[a1] / 1000000) % 60 }
+            if f == "epoch" { res = p.rInt[a1] / 1000000 + p.rAux[a1] * 86400 + mo * 30 * 86400 }
+            setNumReg(p, n, res, 0)
+            return
+        }
+        v.j2date(days + v.POSTGRES_EPOCH_JDATE, q)
+        if f == "year" {
+            res = q.i
+        } else if f == "month" {
+            res = q.aux
+        } else if f == "day" {
+            res = q.aux2
+        } else if f == "hour" {
+            res = micros / 3600000000
+        } else if f == "minute" {
+            res = (micros / 60000000) % 60
+        } else if f == "second" {
+            setNumReg(p, n, micros % 60000000, 6)
+            return
+        } else if f == "quarter" {
+            res = (q.aux - 1) / 3 + 1
+        } else if f == "dow" {
+            res = (days + 6) % 7
+            if res < 0 { res += 7 }
+        } else if f == "doy" {
+            res = days + v.POSTGRES_EPOCH_JDATE - v.date2j(q.i, 1, 1) + 1
+        } else if f == "epoch" {
+            res = (days * v.USECS_PER_DAY + micros) / 1000000 + 946684800
+        } else if f == "decade" {
+            res = q.i / 10
+        } else if f == "century" {
+            res = (q.i + 99) / 100
+        } else if f == "week" {
+            // ISO week (approximation via day of year)
+            let doy = days + v.POSTGRES_EPOCH_JDATE - v.date2j(q.i, 1, 1)
+            res = doy / 7 + 1
+        } else {
+            raise(p, "22023", "unit \"" + f + "\" not recognized")
+            return
+        }
+        setNumReg(p, n, res, 0)
+        return
+    }
+    if fn == FN_DATE_TRUNC {
+        let f = viewText(p.rBuf[a0], p.rOff[a0], p.rLen[a0])
+        let x = p.rInt[a1]
+        if p.et[a1] == v.T_DATE { x = x * v.USECS_PER_DAY }
+        let days = x / v.USECS_PER_DAY
+        let micros = x % v.USECS_PER_DAY
+        if micros < 0 {
+            micros += v.USECS_PER_DAY
+            days -= 1
+        }
+        let q = p.pq
+        v.j2date(days + v.POSTGRES_EPOCH_JDATE, q)
+        let r = x
+        if f == "year" { r = (v.date2j(q.i, 1, 1) - v.POSTGRES_EPOCH_JDATE) * v.USECS_PER_DAY }
+        if f == "quarter" { r = (v.date2j(q.i, ((q.aux - 1) / 3) * 3 + 1, 1) - v.POSTGRES_EPOCH_JDATE) * v.USECS_PER_DAY }
+        if f == "month" { r = (v.date2j(q.i, q.aux, 1) - v.POSTGRES_EPOCH_JDATE) * v.USECS_PER_DAY }
+        if f == "day" { r = days * v.USECS_PER_DAY }
+        if f == "hour" { r = days * v.USECS_PER_DAY + (micros / 3600000000) * 3600000000 }
+        if f == "minute" { r = days * v.USECS_PER_DAY + (micros / 60000000) * 60000000 }
+        if f == "second" { r = days * v.USECS_PER_DAY + (micros / 1000000) * 1000000 }
+        p.rInt[n] = r
+        return
+    }
+    if fn == FN_RANDOM {
+        let st = p.env.randState
+        st = wrappingAdd(wrappingMultiply(st, 6364136223846793005), 1442695040888963407)
+        p.env.randState = st
+        p.rFlt[n] = Float((st >> 11) & 9007199254740991) / 9007199254740992.0
+        return
+    }
+    if fn == FN_PI {
+        p.rFlt[n] = 3.141592653589793
+        return
+    }
+    if fn == FN_GCD || fn == FN_LCM {
+        if classOf(t) == CL_NUM {
+            let e = nm.newErr()
+            let r = nm.zero(0)
+            if fn == FN_GCD { r = nm.gcdNum(regNum(p, a0), regNum(p, a1), e) } else { r = nm.lcmNum(regNum(p, a0), regNum(p, a1), e) }
+            if numErr(p, e) { return }
+            setRegNum(p, n, r)
+            return
+        }
+        let lo = -2147483648
+        if t == v.T_INT8 { lo = -9223372036854775807 - 1 }
+        let x = p.rInt[a0]
+        let y = p.rInt[a1]
+        if fn == FN_LCM {
+            if x == 0 || y == 0 {
+                p.rInt[n] = 0
+                return
+            }
+            let gd = intGcd(p, x, y, lo, t)
+            if p.err { return }
+            let q = x / gd
+            if mulOv(q, y) || (t == v.T_INT4 && (q * y > 2147483647 || q * y < -2147483648)) {
+                intRangeError(p, t)
+                return
+            }
+            let r = q * y
+            if r == lo {
+                intRangeError(p, t)
+                return
+            }
+            if r < 0 { r = -r }
+            p.rInt[n] = r
+            return
+        }
+        p.rInt[n] = intGcd(p, x, y, lo, t)
+        return
+    }
+    if fn == FN_BOOLAND {
+        setBoolReg(p, n, p.rInt[a0] != 0 && p.rInt[a1] != 0)
+        return
+    }
+    if fn == FN_BOOLOR {
+        setBoolReg(p, n, p.rInt[a0] != 0 || p.rInt[a1] != 0)
+        return
+    }
+    if fn == FN_DIV {
+        let e = nm.newErr()
+        let r = nm.divTrunc(regNum(p, a0), regNum(p, a1), e)
+        if numErr(p, e) { return }
+        setRegNum(p, n, r)
+        return
+    }
+    if fn == FN_TEXTCONST {
+        // constant registers prepared at plan time live in arg 0
+        copyReg(p, a0, n)
+        return
+    }
+    raise(p, "0A000", "unsupported function")
+}
+
+// Postgres int4gcd_internal / int8gcd_internal: lo is the type minimum.
+function intGcd(p: Plan, x0: Integer, y0: Integer, lo: Integer, t: Integer): Integer {
+    let x = x0
+    let y = y0
+    let ax = x
+    if ax > 0 { ax = -ax }
+    let ay = y
+    if ay > 0 { ay = -ay }
+    if ax > ay {
+        let sw = x
+        x = y
+        y = sw
+    }
+    if x == lo {
+        if y == 0 || y == lo {
+            intRangeError(p, t)
+            return 0
+        }
+        if y == -1 { return 1 }
+    }
+    while y != 0 {
+        let sw = y
+        if y == -1 { y = 0 } else { y = x % y }
+        x = sw
+    }
+    if x < 0 { x = -x }
+    return x
+}
+
+// String / bytea functions (FN_STR_BASE..): arguments are evaluated here (some are not strict).
+function evalStrFunc(p: Plan, n: Integer) {
+    let fn = p.ec[n]
+    let cnt = p.eb[n]
+    let anyNull = false
+    let i = 0
+    while i < cnt {
+        let a = argAt(p, n, i)
+        ev(p, a)
+        if p.rNull[a] != 0 { anyNull = true }
+        i += 1
+    }
+    if p.err { return }
+    let a0 = -1
+    if cnt > 0 { a0 = argAt(p, n, 0) }
+    let a1 = -1
+    if cnt > 1 { a1 = argAt(p, n, 1) }
+    let a2 = -1
+    if cnt > 2 { a2 = argAt(p, n, 2) }
+    if fn == FN_PART_HASH {
+        let h = 0
+        let k = 0
+        while k < cnt - 1 {
+            let a = argAt(p, n, k)
+            h = v.hashCombine(h, hashReg(p, a))
+            k += 1
+        }
+        let m = p.rInt[argAt(p, n, cnt - 1)]
+        p.rNull[n] = 0
+        if m <= 0 {
+            p.rInt[n] = 0
+            return
+        }
+        let b = h % m
+        if b < 0 { b += m }
+        p.rInt[n] = b
+        return
+    }
+    if fn == FN_QUOTE_NULLABLE && p.rNull[a0] != 0 {
+        let s = scratchOf(p, n)
+        s.addBytes(Bytes("NULL"))
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_FORMAT {
+        if p.rNull[a0] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let fa = sf.FmtArgs { vals: []; nulls: [] }
+        i = 1
+        while i < cnt {
+            let a = argAt(p, n, i)
+            let tb2 = Bytes()
+            if p.rNull[a] == 0 {
+                if classOf(p.et[a]) == CL_TEXT && p.et[a] != v.T_BYTEA {
+                    appendView(tb2, p.rBuf[a], p.rOff[a], p.rLen[a])
+                } else {
+                    formatReg(p, a, p.et[a], tb2)
+                }
+            }
+            fa.vals.add(tb2)
+            fa.nulls.add(p.rNull[a] != 0)
+            i += 1
+        }
+        let s = scratchOf(p, n)
+        let fb = Bytes()
+        appendView(fb, p.rBuf[a0], p.rOff[a0], p.rLen[a0])
+        let e = sf.newErr()
+        sf.format(fb, fa, s, e)
+        if e.code != "" {
+            strFail(p, n, e.code, e.msg)
+            return
+        }
+        p.rNull[n] = 0
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if anyNull {
+        p.rNull[n] = 1
+        return
+    }
+    p.rNull[n] = 0
+    let b = p.rBuf[a0]
+    let o = p.rOff[a0]
+    let l = p.rLen[a0]
+    if fn == FN_QUOTE_LITERAL || fn == FN_QUOTE_NULLABLE || fn == FN_QUOTE_IDENT {
+        let s = scratchOf(p, n)
+        if fn == FN_QUOTE_IDENT { sf.quoteIdent(b, o, l, s) } else { sf.quoteLiteral(b, o, l, s) }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_TO_BASE {
+        let s = scratchOf(p, n)
+        let w = 64
+        if p.et[a0] == v.T_INT4 || p.et[a0] == v.T_INT2 { w = 32 }
+        sf.toBase(p.rInt[a0], w, p.ed[n], s)
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_OVERLAY {
+        let s = scratchOf(p, n)
+        let count = -1
+        if cnt > 3 {
+            let a3 = argAt(p, n, 3)
+            count = p.rInt[a3]
+            if count < 0 {
+                strFail(p, n, "22011", "negative substring length not allowed")
+                return
+            }
+        }
+        let e = sf.newErr()
+        sf.overlay(b, o, l, p.rBuf[a1], p.rOff[a1], p.rLen[a1], p.rInt[a2], count, p.et[n] == v.T_BYTEA, s, e)
+        if e.code != "" {
+            strFail(p, n, e.code, e.msg)
+            return
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_UNISTR || fn == FN_ENCODE || fn == FN_DECODE {
+        let s = scratchOf(p, n)
+        let e = sf.newErr()
+        if fn == FN_UNISTR {
+            sf.unistr(b, o, l, s, e)
+        } else {
+            let fmt = Text(p.rBuf[a1].slice(p.rOff[a1], p.rOff[a1] + p.rLen[a1]))
+            if fn == FN_ENCODE { sf.encode(fmt, b, o, l, s, e) } else { sf.decode(fmt, b, o, l, s, e) }
+        }
+        if e.code != "" {
+            strFail(p, n, e.code, e.msg)
+            return
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_SHA || fn == FN_MD5_HEX {
+        let s = scratchOf(p, n)
+        let bits = p.ed[n]
+        if fn == FN_MD5_HEX {
+            sf.md5Hex(b, o, l, s)
+        } else if bits == 224 || bits == 256 {
+            sf.sha256(bits, b, o, l, s)
+        } else {
+            sf.sha512(bits, b, o, l, s)
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_BIT_COUNT {
+        let c = 0
+        i = 0
+        while i < l {
+            let x = b[o + i]
+            while x != 0 {
+                c += x & 1
+                x = x >> 1
+            }
+            i += 1
+        }
+        p.rInt[n] = c
+        return
+    }
+    if fn == FN_GET_BIT || fn == FN_SET_BIT || fn == FN_GET_BYTE || fn == FN_SET_BYTE {
+        let idx = p.rInt[a1]
+        let lim = l
+        if fn == FN_GET_BIT || fn == FN_SET_BIT { lim = l * 8 }
+        if idx < 0 || idx >= lim {
+            strFail(p, n, "2202E", "index " + Text(idx) + " out of valid range, 0.." + Text(lim - 1))
+            return
+        }
+        if fn == FN_GET_BYTE {
+            p.rInt[n] = b[o + idx]
+            return
+        }
+        if fn == FN_GET_BIT {
+            p.rInt[n] = (b[o + idx / 8] >> (idx % 8)) & 1
+            return
+        }
+        let s = scratchOf(p, n)
+        appendView(s, b, o, l)
+        let nv = p.rInt[a2]
+        if fn == FN_SET_BYTE {
+            s[idx] = nv & 255
+        } else {
+            if nv != 0 && nv != 1 {
+                strFail(p, n, "22023", "new bit must be 0 or 1")
+                return
+            }
+            let bit = 1 << (idx % 8)
+            if nv == 1 { s[idx / 8] = s[idx / 8] | bit } else { s[idx / 8] = s[idx / 8] & (255 - bit) }
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    strFail(p, n, "0A000", "unsupported function")
+}
+
+// Raise an error from a string function; the result register becomes NULL so no stale scratch view is read.
+function strFail(p: Plan, n: Integer, code: Text, msg: Text) {
+    p.rNull[n] = 1
+    raise(p, code, msg)
+}
+
+function inSet(c: Integer, chars: Bytes, co: Integer, cl: Integer): Boolean {
+    let i = 0
+    while i < cl {
+        if chars[co + i] == c { return true }
+        i += 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- operators
+
+// Visibility-aware positioning of slot s on row r of its base table. Returns false if invisible.
+function positionRow(p: Plan, s: Integer, t: tb.Table, r: Integer): Boolean {
+    let st = t.state[r]
+    if st == 0 {
+        p.slotTable[s] = t
+        p.slotRow[s] = r
+        return true
+    }
+    if t.isTemp && t.id < 0 {
+        if (st & tb.ST_DEAD) != 0 { return false }
+        p.slotTable[s] = t
+        p.slotRow[s] = r
+        return true
+    }
+    let vis = txn.visibility(p.env.tm, t, r, p.env.me)
+    if vis == 0 { return false }
+    if vis == 1 {
+        p.slotTable[s] = t
+        p.slotRow[s] = r
+        return true
+    }
+    let sc = p.slotScratch[s]
+    if sc.id != -2 {
+        sc = tb.cloneSchema(t, -2)
+        p.slotScratch[s] = sc
+    }
+    txn.loadBeforeImage(p.env.tm, t, r, sc)
+    p.slotTable[s] = sc
+    p.slotRow[s] = 0
+    p.slotOrig[s] = r
+    return true
+}
+
+function filterOk(p: Plan, f: Integer): Boolean {
+    if f < 0 { return true }
+    ev(p, f)
+    return p.rNull[f] == 0 && p.rInt[f] != 0
+}
+
+public function open(p: Plan, o: Integer) {
+    let k = p.ok[o]
+    p.os1[o] = 0
+    p.os2[o] = 0
+    p.os3[o] = 0
+    if k == O_SCAN || k == O_TEMPSCAN {
+        return
+    }
+    if k == O_HASHEQ {
+        openHashEq(p, o)
+        return
+    }
+    if k == O_RANGE {
+        openRange(p, o)
+        return
+    }
+    if k == O_FILTER || k == O_DISTINCT {
+        open(p, p.oa[o])
+        if k == O_DISTINCT {
+            let mi = p.of[o]
+            hm.clear(p.maps[mi])
+            p.chains[mi].clear()
+            tb.truncate(p.temps[p.ob[o]])
+        }
+        return
+    }
+    if k == O_NL {
+        open(p, p.oa[o])
+        return
+    }
+    if k == O_HASHJ {
+        open(p, p.oa[o])
+        return
+    }
+    if k == O_AGG {
+        buildAgg(p, o)
+        return
+    }
+    if k == O_SORT {
+        buildSort(p, o)
+        return
+    }
+    if k == O_LIMIT {
+        let lim = -1
+        if p.ob[o] >= 0 {
+            let e = p.ob[o]
+            ev(p, e)
+            if p.rNull[e] == 0 {
+                lim = p.rInt[e]
+                if classOf(p.et[e]) == CL_NUM {
+                    let ok: List<Integer> = [0]
+                    lim = numRegToInt(p, e, ok)
+                    if ok[0] == 0 {
+                        raise(p, "22003", "bigint out of range")
+                        return
+                    }
+                }
+                if lim < 0 { raise(p, "2201W", "LIMIT must not be negative") }
+            }
+        }
+        let off = 0
+        if p.oc[o] >= 0 {
+            let e = p.oc[o]
+            ev(p, e)
+            if p.rNull[e] == 0 {
+                off = p.rInt[e]
+                if classOf(p.et[e]) == CL_NUM {
+                    let ok: List<Integer> = [0]
+                    off = numRegToInt(p, e, ok)
+                    if ok[0] == 0 {
+                        raise(p, "22003", "bigint out of range")
+                        return
+                    }
+                }
+                if off < 0 { raise(p, "2201X", "OFFSET must not be negative") }
+            }
+        }
+        if p.od[o] > 0 && lim < 0 && p.ob[o] >= 0 { raise(p, "2201W", "row count cannot be null in FETCH FIRST ... WITH TIES clause") }
+        p.os2[o] = lim
+        p.os3[o] = off
+        // LIMIT 0 never runs its input (no evaluation side effects such as division errors)
+        if lim != 0 { open(p, p.oa[o]) }
+        return
+    }
+    if k == O_ONE {
+        return
+    }
+    if k == O_VALUES || k == O_MAT {
+        buildMat(p, o)
+        return
+    }
+    if k == O_SERIES {
+        let a = p.oc[o]
+        let b = p.od[o]
+        ev(p, a)
+        ev(p, b)
+        let step = 1
+        if p.oe[o] >= 0 {
+            let e = p.oe[o]
+            ev(p, e)
+            step = p.rInt[e]
+            if step == 0 { raise(p, "22023", "step size cannot equal zero") }
+        }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.os3[o] = 0
+            p.os1[o] = 1
+            p.os2[o] = 0
+            return
+        }
+        p.os1[o] = p.rInt[a]
+        p.os2[o] = p.rInt[b]
+        p.os3[o] = step
+        return
+    }
+    if k == O_SETOP {
+        buildSetOp(p, o)
+        return
+    }
+    if k == O_CATALOG {
+        let sn = p.od[o]
+        if p.eState[sn] == 0 {
+            pgc.fill(p.env.cat, p.oc[o], p.temps[p.ob[o]])
+            p.eState[sn] = 1
+        }
+        return
+    }
+    if k == O_SRF {
+        open(p, p.oa[o])
+        return
+    }
+    if k == O_WINDOW {
+        buildWindow(p, o)
+        return
+    }
+    if k == O_APPEND {
+        buildAppend(p, o)
+        return
+    }
+}
+
+// Materialize the leaves of a partitioned table into the output temp (columns mapped by the planner).
+function buildAppend(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oe[o]
+    let n = p.olist[blk]
+    let at = blk + 1
+    let i = 0
+    while i < n {
+        let root = p.olist[at]
+        let nc = p.olist[at + 1]
+        open(p, root)
+        while next(p, root) {
+            let r = tb.reserveRow(t, 0)
+            let j = 0
+            while j < nc {
+                let e = p.olist[at + 2 + j]
+                ev(p, e)
+                storeCell(p, e, t.cols[j], r)
+                j += 1
+            }
+            if p.err { return }
+        }
+        if p.err { return }
+        at = at + 2 + nc
+        i += 1
+    }
+}
+
+public function next(p: Plan, o: Integer): Boolean {
+    if p.err { return false }
+    let k = p.ok[o]
+    if k == O_SCAN {
+        let s = p.oa[o]
+        let t = p.slotBase[s]
+        let f = p.oc[o]
+        let r = p.os1[o]
+        let n = t.nrows
+        while r < n {
+            if t.state[r] == 0 {
+                p.slotTable[s] = t
+                p.slotRow[s] = r
+            } else if !positionRow(p, s, t, r) {
+                r += 1
+                continue
+            }
+            r += 1
+            if f < 0 {
+                p.os1[o] = r
+                return true
+            }
+            ev(p, f)
+            if p.rNull[f] == 0 && p.rInt[f] != 0 {
+                p.os1[o] = r
+                return true
+            }
+            if p.err { return false }
+        }
+        p.os1[o] = r
+        p.slotRow[s] = -1
+        return false
+    }
+    if k == O_HASHEQ { return nextHashEq(p, o) }
+    if k == O_RANGE { return nextRange(p, o) }
+    if k == O_FILTER {
+        let c = p.oa[o]
+        let f = p.oc[o]
+        while next(p, c) {
+            if filterOk(p, f) { return true }
+            if p.err { return false }
+        }
+        return false
+    }
+    if k == O_NL { return nextNL(p, o) }
+    if k == O_HASHJ { return nextHashJoin(p, o) }
+    if k == O_AGG || k == O_SORT || k == O_VALUES || k == O_MAT || k == O_SETOP || k == O_TEMPSCAN || k == O_APPEND {
+        return nextTemp(p, o)
+    }
+    if k == O_LIMIT {
+        let lim = p.os2[o]
+        if lim == 0 { return false }
+        while p.os3[o] > 0 {
+            if !next(p, p.oa[o]) { return false }
+            p.os3[o] = p.os3[o] - 1
+        }
+        let ties = p.od[o] - 1
+        if lim >= 0 && p.os1[o] >= lim {
+            // FETCH FIRST n ROWS WITH TIES: keep going while the sort keys equal the n-th row's
+            if ties < 0 { return false }
+            if !next(p, p.oa[o]) { return false }
+            if !tiesEqual(p, ties) {
+                p.os2[o] = 0
+                return false
+            }
+            return true
+        }
+        if !next(p, p.oa[o]) { return false }
+        p.os1[o] = p.os1[o] + 1
+        if ties >= 0 && p.os1[o] == lim { tiesSave(p, ties) }
+        return true
+    }
+    if k == O_ONE {
+        if p.os1[o] != 0 { return false }
+        p.os1[o] = 1
+        return true
+    }
+    if k == O_SERIES {
+        let cur = p.os1[o]
+        let stop = p.os2[o]
+        let step = p.os3[o]
+        if step == 0 { return false }
+        if (step > 0 && cur > stop) || (step < 0 && cur < stop) { return false }
+        let s = p.oa[o]
+        let t = p.temps[p.ob[o]]
+        if t.nrows == 0 { tb.reserveRow(t, 0) }
+        tb.setInt(t.cols[0], 0, cur)
+        p.slotTable[s] = t
+        p.slotRow[s] = 0
+        if (step > 0 && cur > 9223372036854775807 - step) || (step < 0 && cur < -9223372036854775807 - 1 - step) {
+            p.os3[o] = 0
+        } else {
+            p.os1[o] = cur + step
+        }
+        return true
+    }
+    if k == O_DISTINCT { return nextDistinct(p, o) }
+    if k == O_CATALOG {
+        let s = p.oa[o]
+        let t = p.temps[p.ob[o]]
+        let pos = p.os1[o]
+        if pos < t.nrows {
+            p.slotTable[s] = t
+            p.slotRow[s] = pos
+            p.os1[o] = pos + 1
+            return true
+        }
+        p.slotRow[s] = -1
+        return false
+    }
+    if k == O_SRF { return nextSrf(p, o) }
+    if k == O_WINDOW {
+        let s = p.oc[o]
+        let ids = p.chains[p.of[o]]
+        let pos = p.os1[o]
+        if pos >= ids.length / 8 {
+            p.slotRow[s] = -1
+            return false
+        }
+        p.slotTable[s] = p.temps[p.ob[o]]
+        p.slotRow[s] = ids.getInt64(pos * 8)
+        p.os1[o] = pos + 1
+        return true
+    }
+    return false
+}
+
+// ---- temp-table iteration (AGG / SORT / VALUES / MAT / SETOP outputs)
+// os1 = position; for SORT, positions index into the sorted row-id chain.
+function nextTemp(p: Plan, o: Integer): Boolean {
+    let k = p.ok[o]
+    let s = p.oc[o]
+    let t = p.temps[p.ob[o]]
+    let pos = p.os1[o]
+    if k == O_SORT {
+        let ids = p.chains[p.of[o]]
+        if pos >= ids.length / 8 {
+            p.slotRow[s] = -1
+            return false
+        }
+        p.slotTable[s] = t
+        p.slotRow[s] = ids.getInt64(pos * 8)
+        p.os1[o] = pos + 1
+        return true
+    }
+    let f = -1
+    if k == O_TEMPSCAN { f = p.od[o] }
+    while pos < t.nrows {
+        if t.state[pos] == 0 {
+            p.slotTable[s] = t
+            p.slotRow[s] = pos
+            pos += 1
+            if f < 0 || filterOk(p, f) {
+                p.os1[o] = pos
+                return true
+            }
+        } else {
+            pos += 1
+        }
+    }
+    p.os1[o] = pos
+    p.slotRow[s] = -1
+    return false
+}
+
+// ---- hash index equality: a = slot, b = hash index id, c = filter, d = olist block [nkeys, exprs...], e = key idx
+function openHashEq(p: Plan, o: Integer) {
+    let blk = p.od[o]
+    let nk = p.olist[blk]
+    let key = p.keys[p.oe[o]]
+    let i = 0
+    let anyNull = false
+    while i < nk {
+        let e = p.olist[blk + 1 + i]
+        ev(p, e)
+        keyFromReg(p, key, i, e)
+        if p.rNull[e] != 0 { anyNull = true }
+        i += 1
+    }
+    let h = p.env.cat.hashIdx[p.ob[o]]
+    let t = p.slotBase[p.oa[o]]
+    if anyNull {
+        p.os1[o] = -1
+        return
+    }
+    let hv = ix.hashKey(t, h.cols, key)
+    p.os2[o] = hv
+    p.os1[o] = ix.probeStart(h, hv)
+}
+
+function nextHashEq(p: Plan, o: Integer) : Boolean {
+    let slot = p.os1[o]
+    if slot < 0 { return false }
+    let h = p.env.cat.hashIdx[p.ob[o]]
+    let s = p.oa[o]
+    let t = p.slotBase[s]
+    let hv = p.os2[o]
+    let key = p.keys[p.oe[o]]
+    let f = p.oc[o]
+    let cur = ix.probeNext(h, hv, slot)
+    while cur >= 0 {
+        let r = ix.slotRow(h, cur)
+        if r < t.nrows && ix.rowMatchesKey(t, h.cols, r, key) && positionRow(p, s, t, r) {
+            if filterOk(p, f) {
+                p.os1[o] = cur + 1
+                return true
+            }
+            if p.err { return false }
+        }
+        cur = ix.probeNext(h, hv, cur + 1)
+    }
+    p.os1[o] = -1
+    p.slotRow[s] = -1
+    return false
+}
+
+// ---- ordered range: a = slot, b = ord index id, c = filter, d = olist block:
+// [loN, loStrict, hiN, hiStrict, loKeyIdx, hiKeyIdx, desc, lo exprs..., hi exprs...]
+// state: os1 = main pos, os2 = delta pos, os3 = done flag
+function openRange(p: Plan, o: Integer) {
+    let blk = p.od[o]
+    let loN = p.olist[blk]
+    let loStrict = p.olist[blk + 1] == 1
+    let hiN = p.olist[blk + 2]
+    let ix0 = p.env.cat.ordIdx[p.ob[o]]
+    let t = p.slotBase[p.oa[o]]
+    let lo = p.keys[p.olist[blk + 4]]
+    let hi = p.keys[p.olist[blk + 5]]
+    let i = 0
+    while i < loN {
+        let e = p.olist[blk + 7 + i]
+        ev(p, e)
+        keyFromReg(p, lo, i, e)
+        if p.rNull[e] != 0 { p.os3[o] = 1 }
+        i += 1
+    }
+    i = 0
+    while i < hiN {
+        let e = p.olist[blk + 7 + loN + i]
+        ev(p, e)
+        keyFromReg(p, hi, i, e)
+        if p.rNull[e] != 0 { p.os3[o] = 1 }
+        i += 1
+    }
+    if loN > 0 {
+        lo.n = loN
+        p.os1[o] = ix.lowerBoundKey(t, ix0.cols, ix0.main, lo, loStrict)
+        p.os2[o] = ix.lowerBoundKey(t, ix0.cols, ix0.delta, lo, loStrict)
+    } else {
+        p.os1[o] = 0
+        p.os2[o] = 0
+    }
+    hi.n = hiN
+}
+
+function nextRange(p: Plan, o: Integer): Boolean {
+    if p.os3[o] != 0 { return false }
+    let blk = p.od[o]
+    let hiN = p.olist[blk + 2]
+    let hiStrict = p.olist[blk + 3] == 1
+    let ix0 = p.env.cat.ordIdx[p.ob[o]]
+    let s = p.oa[o]
+    let t = p.slotBase[s]
+    let hi = p.keys[p.olist[blk + 5]]
+    let f = p.oc[o]
+    let nmain = ix0.main.length / 8
+    let nd = ix0.delta.length / 8
+    while true {
+        let pm = p.os1[o]
+        let pd = p.os2[o]
+        let r = -1
+        if pm < nmain && pd < nd {
+            let a = ix0.main.getInt64(pm * 8)
+            let b = ix0.delta.getInt64(pd * 8)
+            if ix.cmpRows(t, ix0.cols, a, b) <= 0 {
+                r = a
+                p.os1[o] = pm + 1
+            } else {
+                r = b
+                p.os2[o] = pd + 1
+            }
+        } else if pm < nmain {
+            r = ix0.main.getInt64(pm * 8)
+            p.os1[o] = pm + 1
+        } else if pd < nd {
+            r = ix0.delta.getInt64(pd * 8)
+            p.os2[o] = pd + 1
+        } else {
+            p.os3[o] = 1
+            p.slotRow[s] = -1
+            return false
+        }
+        if tb.isNull(t.cols[ix0.cols[0]], r) {
+            // NULL keys sort last and never satisfy a range bound
+            p.os3[o] = 1
+            p.slotRow[s] = -1
+            return false
+        }
+        if hiN > 0 {
+            let c = ix.cmpRowKey(t, ix0.cols, r, hi)
+            if c > 0 || (hiStrict && c == 0) {
+                p.os3[o] = 1
+                p.slotRow[s] = -1
+                return false
+            }
+        }
+        if positionRow(p, s, t, r) {
+            if filterOk(p, f) { return true }
+            if p.err { return false }
+        }
+    }
+}
+
+// ---- nested loop: a = outer, b = inner, c = cond, d = join type (0 inner, 1 left), e = olist block [n, slots...]
+// state: os1 = 0 need outer, 1 in inner; os2 = matched
+function nextNL(p: Plan, o: Integer): Boolean {
+    let outer = p.oa[o]
+    let inner = p.ob[o]
+    let cond = p.oc[o]
+    let left = p.od[o] == 1
+    while true {
+        if p.os1[o] == 0 {
+            if !next(p, outer) { return false }
+            open(p, inner)
+            p.os1[o] = 1
+            p.os2[o] = 0
+        }
+        while next(p, inner) {
+            if filterOk(p, cond) {
+                p.os2[o] = 1
+                return true
+            }
+            if p.err { return false }
+        }
+        if p.err { return false }
+        p.os1[o] = 0
+        if left && p.os2[o] == 0 {
+            nullSlots(p, p.oe[o])
+            return true
+        }
+    }
+}
+
+function nullSlots(p: Plan, blk: Integer) {
+    let n = p.olist[blk]
+    let i = 0
+    while i < n {
+        p.slotRow[p.olist[blk + 1 + i]] = -1
+        i += 1
+    }
+}
+
+// ---- hash join: a = probe (outer), b = build (inner), c = residual, d = join type, e = olist block
+// [nkeys, buildExprs..., probeExprs..., nInnerSlots, innerSlots...], f = map idx
+// entries in chains[f]: per entry: next, hash, rows of inner slots
+function buildHashJoin(p: Plan, o: Integer) {
+    let blk = p.oe[o]
+    let nk = p.olist[blk]
+    let nIn = p.olist[blk + 1 + 2 * nk]
+    let m = p.maps[p.of[o]]
+    hm.clear(m)
+    let entries = p.chains[p.of[o]]
+    entries.clear()
+    let build = p.ob[o]
+    open(p, build)
+    let width = 2 + nIn
+    while next(p, build) {
+        let h = 0
+        let anyNull = false
+        let i = 0
+        while i < nk {
+            let e = p.olist[blk + 1 + i]
+            ev(p, e)
+            if p.rNull[e] != 0 { anyNull = true }
+            h = v.hashCombine(h, hashReg(p, e))
+            i += 1
+        }
+        if p.err { return }
+        if anyNull { continue }
+        let idx = entries.length / (8 * width)
+        entries.addInt64(hm.get(m, h, -1))
+        entries.addInt64(h)
+        i = 0
+        while i < nIn {
+            entries.addInt64(p.slotRow[p.olist[blk + 2 + 2 * nk + i]])
+            i += 1
+        }
+        hm.put(m, h, idx)
+    }
+}
+
+function nextHashJoin(p: Plan, o: Integer): Boolean {
+    if p.os3[o] == 0 {
+        buildHashJoin(p, o)
+        if p.err { return false }
+        p.os3[o] = 1
+        p.os1[o] = -2
+    }
+    let blk = p.oe[o]
+    let nk = p.olist[blk]
+    let nIn = p.olist[blk + 1 + 2 * nk]
+    let width = 2 + nIn
+    let m = p.maps[p.of[o]]
+    let entries = p.chains[p.of[o]]
+    let probe = p.oa[o]
+    let cond = p.oc[o]
+    let left = p.od[o] == 1
+    while true {
+        let cur = p.os1[o]
+        if cur == -2 {
+            // fetch next probe row
+            if !next(p, probe) { return false }
+            let h = 0
+            let anyNull = false
+            let i = 0
+            while i < nk {
+                let e = p.olist[blk + 1 + nk + i]
+                ev(p, e)
+                if p.rNull[e] != 0 { anyNull = true }
+                h = v.hashCombine(h, hashReg(p, e))
+                i += 1
+            }
+            if p.err { return false }
+            p.os2[o] = 0
+            if anyNull {
+                cur = -1
+            } else {
+                cur = hm.get(m, h, -1)
+            }
+            p.os1[o] = cur
+            // stash probe hash in os3's upper bits is not needed: compare via stored hash below
+            p.os3[o] = 1
+            if cur < 0 {
+                p.os1[o] = -2
+                if left {
+                    nullSlotsList(p, blk + 1 + 2 * nk)
+                    return true
+                }
+                continue
+            }
+        }
+        // walk chain from cur
+        while cur >= 0 {
+            let base = cur * width * 8
+            let nxt = entries.getInt64(base)
+            // restore inner slots
+            let i = 0
+            while i < nIn {
+                let s = p.olist[blk + 2 + 2 * nk + i]
+                p.slotTable[s] = p.slotBase[s]
+                p.slotRow[s] = entries.getInt64(base + 16 + i * 8)
+                i += 1
+            }
+            // verify keys
+            let eq = true
+            i = 0
+            while i < nk && eq {
+                let be = p.olist[blk + 1 + i]
+                let pe = p.olist[blk + 1 + nk + i]
+                ev(p, be)
+                if p.rNull[be] != 0 || p.rNull[pe] != 0 || cmpRegs(p, be, pe, cmpClassOf(p, be)) != 0 { eq = false }
+                i += 1
+            }
+            cur = nxt
+            if eq && filterOk(p, cond) {
+                p.os1[o] = cur
+                if cur < 0 { p.os1[o] = -3 }
+                p.os2[o] = 1
+                return true
+            }
+            if p.err { return false }
+        }
+        // chain exhausted
+        let matched = p.os2[o] == 1
+        p.os1[o] = -2
+        if left && !matched {
+            nullSlotsList(p, blk + 1 + 2 * nk)
+            return true
+        }
+        if p.os1[o] == -3 { p.os1[o] = -2 }
+    }
+}
+
+function tiesSave(p: Plan, blk: Integer) {
+    let n = p.olist[blk]
+    let i = 0
+    while i < n {
+        let k = p.olist[blk + 1 + i * 2]
+        ev(p, k)
+        copyRegOwned(p, k, p.olist[blk + 2 + i * 2])
+        i += 1
+    }
+}
+
+function tiesEqual(p: Plan, blk: Integer): Boolean {
+    let n = p.olist[blk]
+    let i = 0
+    while i < n {
+        let k = p.olist[blk + 1 + i * 2]
+        let sv = p.olist[blk + 2 + i * 2]
+        ev(p, k)
+        let kn = p.rNull[k] != 0
+        let sn = p.rNull[sv] != 0
+        if kn != sn { return false }
+        if !kn && cmpRegs(p, k, sv, cmpClassOf(p, k)) != 0 { return false }
+        i += 1
+    }
+    return true
+}
+
+function cmpClassOf(p: Plan, n: Integer): Integer {
+    let t = p.et[n]
+    if t == v.T_BPCHAR { return CL_BPCHAR }
+    return classOf(t)
+}
+
+function nullSlotsList(p: Plan, blk: Integer) {
+    let n = p.olist[blk]
+    let i = 0
+    while i < n {
+        p.slotRow[p.olist[blk + 1 + i]] = -1
+        i += 1
+    }
+}
+
+// ---- materialize (VALUES rows / subquery in FROM): a = child op (-1 for VALUES), b = temp idx, c = slot,
+// e = olist block. VALUES: [nRows, nCols, exprs row-major...]; MAT: [nCols, exprs...]; os2 = built (uncorrelated cache)
+function buildMat(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    let blk = p.oe[o]
+    if p.ok[o] == O_VALUES {
+        tb.truncate(t)
+        let nr = p.olist[blk]
+        let nc = p.olist[blk + 1]
+        let r = 0
+        while r < nr {
+            let row = tb.reserveRow(t, 0)
+            let c = 0
+            while c < nc {
+                let e = p.olist[blk + 2 + r * nc + c]
+                ev(p, e)
+                storeCell(p, e, t.cols[c], row)
+                c += 1
+            }
+            r += 1
+        }
+        return
+    }
+    tb.truncate(t)
+    let child = p.oa[o]
+    let nc = p.olist[blk]
+    open(p, child)
+    while next(p, child) {
+        let row = tb.reserveRow(t, 0)
+        let c = 0
+        while c < nc {
+            let e = p.olist[blk + 1 + c]
+            ev(p, e)
+            storeCell(p, e, t.cols[c], row)
+            c += 1
+        }
+        if p.err { return }
+    }
+}
+
+// ---- distinct: a = child, b = temp idx (seen values), e = block [n, exprs...], f = map idx
+function nextDistinct(p: Plan, o: Integer): Boolean {
+    let child = p.oa[o]
+    let blk = p.oe[o]
+    let nc = p.olist[blk]
+    let t = p.temps[p.ob[o]]
+    let m = p.maps[p.of[o]]
+    let chain = p.chains[p.of[o]]
+    while next(p, child) {
+        let h = 0
+        let i = 0
+        while i < nc {
+            let e = p.olist[blk + 1 + i]
+            ev(p, e)
+            h = v.hashCombine(h, hashReg(p, e))
+            i += 1
+        }
+        if p.err { return false }
+        let r = hm.get(m, h, -1)
+        let dup = false
+        while r >= 0 && !dup {
+            let same = true
+            i = 0
+            while i < nc && same {
+                if !regEqualsCell(p, p.olist[blk + 1 + i], t.cols[i], r) { same = false }
+                i += 1
+            }
+            if same { dup = true }
+            r = chain.getInt64(r * 8)
+        }
+        if dup { continue }
+        let row = tb.reserveRow(t, 0)
+        i = 0
+        while i < nc {
+            storeCell(p, p.olist[blk + 1 + i], t.cols[i], row)
+            i += 1
+        }
+        chain.addInt64(hm.get(m, h, -1))
+        hm.put(m, h, row)
+        return true
+    }
+    return false
+}
+
+// ---- aggregation: a = child, b = temp idx (output: group cols then agg cols), c = out slot,
+// e = block [nGroup, groupExprs..., nAgg, per agg: kind, argExpr, distinct, filterExpr, resultType], f = map idx
+// Extra state columns (count for avg, sum2 for stddev) appended after the visible columns.
+function buildAgg(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oe[o]
+    let ng = p.olist[blk]
+    let na = p.olist[blk + 1 + ng]
+    let ab = blk + 2 + ng
+    let m = p.maps[p.of[o]]
+    hm.clear(m)
+    let chain = p.chains[p.of[o]]
+    chain.clear()
+    let child = p.oa[o]
+    let extraBase = ng + na
+    // distinct support: per agg, a set keyed by (group row, value hash) in a separate map (map idx f+1+i)
+    open(p, child)
+    while next(p, child) {
+        let h = 0
+        let i = 0
+        while i < ng {
+            let e = p.olist[blk + 1 + i]
+            ev(p, e)
+            h = v.hashCombine(h, hashReg(p, e))
+            i += 1
+        }
+        if p.err { return }
+        let g = hm.get(m, h, -1)
+        while g >= 0 {
+            let same = true
+            i = 0
+            while i < ng && same {
+                if !regEqualsCell(p, p.olist[blk + 1 + i], t.cols[i], g) { same = false }
+                i += 1
+            }
+            if same { break }
+            g = chain.getInt64(g * 8)
+        }
+        if g < 0 {
+            g = newGroup(p, t, blk, ng, na, ab)
+            chain.addInt64(hm.get(m, h, -1))
+            hm.put(m, h, g)
+        }
+        accumulate(p, o, t, g, ng, na, ab, extraBase)
+        if p.err { return }
+    }
+    if ng == 0 && t.nrows == 0 {
+        newGroup(p, t, blk, ng, na, ab)
+    }
+    finalizeAgg(p, t, ng, na, ab, extraBase)
+}
+
+function newGroup(p: Plan, t: tb.Table, blk: Integer, ng: Integer, na: Integer, ab: Integer): Integer {
+    let g = tb.reserveRow(t, 0)
+    let i = 0
+    while i < ng {
+        storeCell(p, p.olist[blk + 1 + i], t.cols[i], g)
+        i += 1
+    }
+    i = 0
+    while i < na {
+        let kind = p.olist[ab + i * AGS]
+        let c = t.cols[ng + i]
+        if kind == AG_COUNT || kind == AG_COUNT_STAR || kind == AG_REGR_COUNT {
+            tb.setInt(c, g, 0)
+        } else {
+            tb.setNull(c, g)
+        }
+        // extra: count column (for avg/stddev) and sum-of-squares
+        let cc = t.cols[ng + na + i * 2]
+        tb.setInt(cc, g, 0)
+        let rc = p.olist[ab + i * AGS + 7]
+        if rc >= 0 {
+            let j = 0
+            while j < 4 {
+                tb.setFloat(t.cols[rc + j], g, 0.0)
+                j += 1
+            }
+        }
+        let sq = t.cols[ng + na + i * 2 + 1]
+        if sq.type == v.T_NUMERIC {
+            tb.setInt(sq, g, 0)
+            tb.setScale(sq, g, 0)
+        } else {
+            tb.setFloat(sq, g, 0.0)
+        }
+        i += 1
+    }
+    return g
+}
+
+// Store a Num into a numeric temp cell (perRowScale: small form or big text in the heap).
+function storeNumCell(p: Plan, c: tb.Column, r: Integer, x: nm.Num) {
+    if !nm.isSpecial(x) && ((x.digits.length > 0 && x.weight > nm.WEIGHT_MAX) || x.dscale > nm.DSCALE_MAX) {
+        raise(p, "22003", "value overflows numeric format")
+        return
+    }
+    tb.clearNull(c, r)
+    let ok: List<Integer> = [0]
+    let y = nm.toScaled(x, ok)
+    if ok[0] == 1 {
+        tb.setInt(c, r, y)
+        tb.setScale(c, r, x.dscale)
+        return
+    }
+    let nb = p.numBuf
+    nb.clear()
+    nm.format(x, nb)
+    setBigNumCell(c, r, nb, 0, nb.length)
+}
+
+// Numeric value of an aggregate argument register (numeric or integer class).
+function argNum(p: Plan, arg: Integer): nm.Num {
+    if classOf(p.et[arg]) == CL_NUM { return regNum(p, arg) }
+    return nm.fromInt(p.rInt[arg])
+}
+
+// Small fast path for cell += value (both small): true when done.
+function addSmallCell(p: Plan, c: tb.Column, g: Integer, x: Integer, sx: Integer): Boolean {
+    let cur = tb.getInt(c, g)
+    let cs = tb.getScale(c, g)
+    let q = p.pq
+    let s = cs
+    if sx > s { s = sx }
+    v.rescale(cur, cs, s, q)
+    if !q.ok { return false }
+    let a1 = q.i
+    v.rescale(x, sx, s, q)
+    if !q.ok { return false }
+    let a2 = q.i
+    if addOv(a1, a2) { return false }
+    tb.setInt(c, g, a1 + a2)
+    tb.setScale(c, g, s)
+    return true
+}
+
+function accumulate(p: Plan, o: Integer, t: tb.Table, g: Integer, ng: Integer, na: Integer, ab: Integer, extraBase: Integer) {
+    let i = 0
+    while i < na {
+        let kind = p.olist[ab + i * AGS]
+        let arg = p.olist[ab + i * AGS + 1]
+        let distinct = p.olist[ab + i * AGS + 2]
+        let filt = p.olist[ab + i * AGS + 3]
+        let c = t.cols[ng + i]
+        if filt >= 0 && !filterOk(p, filt) {
+            i += 1
+            continue
+        }
+        if kind == AG_COUNT_STAR {
+            tb.setInt(c, g, tb.getInt(c, g) + 1)
+            i += 1
+            continue
+        }
+        ev(p, arg)
+        if p.rNull[arg] != 0 {
+            i += 1
+            continue
+        }
+        if kind >= AG_REGR_COUNT && kind <= AG_CORR {
+            let arg2 = p.olist[ab + i * AGS + 6]
+            ev(p, arg2)
+            if p.rNull[arg2] == 0 {
+                accumulateRegr(p, t, g, extraBase + i * 2, p.olist[ab + i * AGS + 7], p.rFlt[arg], p.rFlt[arg2])
+                if p.err { return }
+            }
+            i += 1
+            continue
+        }
+        if kind == AG_ANY_VALUE {
+            if tb.isNull(c, g) { storeCell(p, arg, c, g) }
+            i += 1
+            continue
+        }
+        if distinct > 0 {
+            // distinct: dedupe on (group, value) via map distinct-1 and its temp table (one column + group col)
+            let dm = p.maps[distinct - 1]
+            let dch = p.chains[distinct - 1]
+            let dt = p.temps[p.olist[ab + i * AGS + 5]]
+            let h = v.hashCombine(v.hashInt(g), hashReg(p, arg))
+            let r = hm.get(dm, h, -1)
+            let dup = false
+            while r >= 0 {
+                if tb.getInt(dt.cols[1], r) == g && regEqualsCell(p, arg, dt.cols[0], r) {
+                    dup = true
+                    break
+                }
+                r = dch.getInt64(r * 8)
+            }
+            if dup {
+                i += 1
+                continue
+            }
+            let nr = tb.reserveRow(dt, 0)
+            storeCell(p, arg, dt.cols[0], nr)
+            tb.setInt(dt.cols[1], nr, g)
+            dch.addInt64(hm.get(dm, h, -1))
+            hm.put(dm, h, nr)
+        }
+        let cnt = t.cols[extraBase + i * 2]
+        tb.setInt(cnt, g, tb.getInt(cnt, g) + 1)
+        if kind == AG_COUNT {
+            tb.setInt(c, g, tb.getInt(c, g) + 1)
+        } else if kind == AG_SUM || kind == AG_AVG || kind == AG_STDDEV || kind == AG_VARIANCE || kind == AG_STDDEV_POP || kind == AG_VAR_POP {
+            let cl = classOf(c.type)
+            let argCl = classOf(p.et[arg])
+            let varKind = kind == AG_STDDEV || kind == AG_VARIANCE || kind == AG_STDDEV_POP || kind == AG_VAR_POP
+            if cl == CL_FLT {
+                let x = 0.0
+                if argCl == CL_FLT {
+                    x = p.rFlt[arg]
+                } else if argCl == CL_NUM {
+                    x = numToFloat(p.rInt[arg], p.rAux[arg])
+                } else {
+                    x = Float(p.rInt[arg])
+                }
+                let sxOld = 0.0
+                if !tb.isNull(c, g) { sxOld = tb.getFloat(c, g) }
+                let sx = sxOld + x
+                if isInfF(sx) && !isInfF(sxOld) && !isInfF(x) {
+                    raise(p, "22003", "value out of range: overflow")
+                    return
+                }
+                tb.clearNull(c, g)
+                tb.setFloat(c, g, sx)
+                if (kind == AG_SUM || kind == AG_AVG) && c.type == v.T_FLOAT8 && sx == sx && !isInfF(sx) {
+                    let sq = t.cols[extraBase + i * 2 + 1]
+                    let correction = 0.0
+                    if abs(sxOld) >= abs(x) {
+                        correction = (sxOld - sx) + x
+                    } else {
+                        correction = (x - sx) + sxOld
+                    }
+                    let sc = tb.getFloat(sq, g) + correction
+                    if isInfF(sc) {
+                        raise(p, "22003", "value out of range: overflow")
+                        return
+                    }
+                    tb.setFloat(sq, g, sc)
+                }
+                if varKind {
+                    // Youngs-Cramer, as Postgres float8_accum
+                    let sq = t.cols[extraBase + i * 2 + 1]
+                    let nn = Float(tb.getInt(cnt, g))
+                    let sxx = tb.getFloat(sq, g)
+                    if nn > 1.0 {
+                        let tmp = x * nn - sx
+                        sxx = sxx + tmp * tmp / (nn * (nn - 1.0))
+                        if isInfF(sx) || isInfF(sxx) {
+                            if !isInfF(sxOld) && !isInfF(x) {
+                                raise(p, "22003", "value out of range: overflow")
+                                return
+                            }
+                            sxx = 0.0 / 0.0
+                        }
+                    } else if x != x || isInfF(x) {
+                        sxx = 0.0 / 0.0
+                    }
+                    tb.setFloat(sq, g, sxx)
+                }
+            } else if cl == CL_NUM {
+                let small = argCl != CL_NUM || p.rAux[arg] >= 0
+                let x = p.rInt[arg]
+                let sx = 0
+                if argCl == CL_NUM && small { sx = p.rAux[arg] }
+                if tb.isNull(c, g) {
+                    if small {
+                        tb.clearNull(c, g)
+                        tb.setInt(c, g, x)
+                        tb.setScale(c, g, sx)
+                    } else {
+                        storeNumCell(p, c, g, regNum(p, arg))
+                    }
+                } else if !(small && cellIsSmallNum(c, g) && addSmallCell(p, c, g, x, sx)) {
+                    storeNumCell(p, c, g, nm.add(cellNum(c, g), argNum(p, arg)))
+                    if p.err { return }
+                }
+                if varKind {
+                    let sq = t.cols[extraBase + i * 2 + 1]
+                    let done = false
+                    if small && cellIsSmallNum(sq, g) && sx + sx <= 18 && !mulOv(x, x) {
+                        done = addSmallCell(p, sq, g, x * x, sx + sx)
+                    }
+                    if !done {
+                        let xn = argNum(p, arg)
+                        storeNumCell(p, sq, g, nm.add(cellNum(sq, g), nm.mul(xn, xn)))
+                        if p.err { return }
+                    }
+                }
+            } else {
+                // integer sum (bigint)
+                let x = p.rInt[arg]
+                if tb.isNull(c, g) {
+                    tb.clearNull(c, g)
+                    tb.setInt(c, g, x)
+                } else {
+                    let cur = tb.getInt(c, g)
+                    if addOv(cur, x) {
+                        raise(p, "22003", "bigint out of range")
+                        return
+                    }
+                    tb.setInt(c, g, cur + x)
+                }
+            }
+        } else if kind == AG_MIN || kind == AG_MAX {
+            if tb.isNull(c, g) {
+                storeCell(p, arg, c, g)
+            } else {
+                // compare register with cell
+                let tmp = p.olist[ab + i * AGS + 4]
+                loadCell(p, tmp, c, g)
+                let cmp = cmpRegs(p, arg, tmp, cmpClassOf(p, arg))
+                if (kind == AG_MIN && cmp < 0) || (kind == AG_MAX && cmp > 0) {
+                    storeCell(p, arg, c, g)
+                }
+            }
+        } else if kind == AG_BOOL_AND {
+            if tb.isNull(c, g) {
+                tb.clearNull(c, g)
+                tb.setInt(c, g, p.rInt[arg])
+            } else if p.rInt[arg] == 0 {
+                tb.setInt(c, g, 0)
+            }
+        } else if kind == AG_BOOL_OR {
+            if tb.isNull(c, g) {
+                tb.clearNull(c, g)
+                tb.setInt(c, g, p.rInt[arg])
+            } else if p.rInt[arg] != 0 {
+                tb.setInt(c, g, 1)
+            }
+        } else if kind == AG_STRING_AGG {
+            // separator is evaluated from the extra expr (stored in tmp slot's arg); default ","
+            let sepE = p.olist[ab + i * AGS + 4]
+            ev(p, sepE)
+            if tb.isNull(c, g) {
+                tb.clearNull(c, g)
+                tb.setText(c, g, p.rBuf[arg], p.rOff[arg], p.rLen[arg])
+            } else {
+                let s = Bytes()
+                s.addBytes(c.heap.slice(tb.textOff(c, g), tb.textOff(c, g) + tb.textLen(c, g)))
+                if p.rNull[sepE] == 0 { appendView(s, p.rBuf[sepE], p.rOff[sepE], p.rLen[sepE]) }
+                appendView(s, p.rBuf[arg], p.rOff[arg], p.rLen[arg])
+                tb.setText(c, g, s, 0, s.length)
+            }
+        }
+        i += 1
+    }
+}
+
+// float8_regr_accum (Youngs-Cramer). cntCol: N (cnt) and Sx (q); rc: Sxx, Syy, Sxy, Sy.
+function accumulateRegr(p: Plan, t: tb.Table, g: Integer, cntCol: Integer, rc: Integer, y: Float, x: Float) {
+    let cc = t.cols[cntCol]
+    let sxc = t.cols[cntCol + 1]
+    let n0 = Float(tb.getInt(cc, g))
+    let nn = n0 + 1.0
+    tb.setInt(cc, g, tb.getInt(cc, g) + 1)
+    let sx0 = tb.getFloat(sxc, g)
+    let sy0 = tb.getFloat(t.cols[rc + 3], g)
+    let sx = sx0 + x
+    let sy = sy0 + y
+    let sxx = tb.getFloat(t.cols[rc], g)
+    let syy = tb.getFloat(t.cols[rc + 1], g)
+    let sxy = tb.getFloat(t.cols[rc + 2], g)
+    let nan = 0.0 / 0.0
+    if n0 > 0.0 {
+        let tx = x * nn - sx
+        let ty = y * nn - sy
+        let scale = 1.0 / (nn * n0)
+        sxx = sxx + tx * tx * scale
+        syy = syy + ty * ty * scale
+        sxy = sxy + tx * ty * scale
+        if isInfF(sx) || isInfF(sxx) || isInfF(sy) || isInfF(syy) || isInfF(sxy) {
+            if ((isInfF(sx) || isInfF(sxx)) && !isInfF(sx0) && !isInfF(x)) || ((isInfF(sy) || isInfF(syy)) && !isInfF(sy0) && !isInfF(y)) ||
+               (isInfF(sxy) && !isInfF(sx0) && !isInfF(x) && !isInfF(sy0) && !isInfF(y)) {
+                raise(p, "22003", "value out of range: overflow")
+                return
+            }
+            if isInfF(sxx) { sxx = nan }
+            if isInfF(syy) { syy = nan }
+            if isInfF(sxy) { sxy = nan }
+        }
+    } else {
+        if x != x || isInfF(x) {
+            sxx = nan
+            sxy = nan
+        }
+        if y != y || isInfF(y) {
+            syy = nan
+            sxy = nan
+        }
+    }
+    tb.setFloat(sxc, g, sx)
+    tb.setFloat(t.cols[rc], g, sxx)
+    tb.setFloat(t.cols[rc + 1], g, syy)
+    tb.setFloat(t.cols[rc + 2], g, sxy)
+    tb.setFloat(t.cols[rc + 3], g, sy)
+}
+
+function finalizeRegr(p: Plan, t: tb.Table, kind: Integer, c: tb.Column, cntCol: Integer, rc: Integer) {
+    let g = 0
+    while g < t.nrows {
+        let n = Float(tb.getInt(t.cols[cntCol], g))
+        let sx = tb.getFloat(t.cols[cntCol + 1], g)
+        let sxx = tb.getFloat(t.cols[rc], g)
+        let syy = tb.getFloat(t.cols[rc + 1], g)
+        let sxy = tb.getFloat(t.cols[rc + 2], g)
+        let sy = tb.getFloat(t.cols[rc + 3], g)
+        let isNull = n < 1.0
+        let r = 0.0
+        if kind == AG_REGR_COUNT {
+            tb.clearNull(c, g)
+            tb.setInt(c, g, tb.getInt(t.cols[cntCol], g))
+            g += 1
+            continue
+        }
+        if !isNull {
+            if kind == AG_REGR_SXX {
+                r = sxx
+            } else if kind == AG_REGR_SYY {
+                r = syy
+            } else if kind == AG_REGR_SXY {
+                r = sxy
+            } else if kind == AG_REGR_AVGX {
+                r = sx / n
+            } else if kind == AG_REGR_AVGY {
+                r = sy / n
+            } else if kind == AG_COVAR_POP {
+                r = sxy / n
+            } else if kind == AG_COVAR_SAMP {
+                if n < 2.0 { isNull = true } else { r = sxy / (n - 1.0) }
+            } else if kind == AG_CORR {
+                if sxx == 0.0 || syy == 0.0 { isNull = true } else { r = sxy / math.sqrt(sxx * syy) }
+            } else if kind == AG_REGR_R2 {
+                if sxx == 0.0 {
+                    isNull = true
+                } else if syy == 0.0 {
+                    r = 1.0
+                } else {
+                    r = (sxy * sxy) / (sxx * syy)
+                }
+            } else if kind == AG_REGR_SLOPE {
+                if sxx == 0.0 { isNull = true } else { r = sxy / sxx }
+            } else if kind == AG_REGR_INTERCEPT {
+                if sxx == 0.0 { isNull = true } else { r = (sy - sx * sxy / sxx) / n }
+            }
+        }
+        if isNull {
+            tb.setNull(c, g)
+        } else {
+            tb.clearNull(c, g)
+            tb.setFloat(c, g, r)
+        }
+        g += 1
+    }
+}
+
+function finalizeAgg(p: Plan, t: tb.Table, ng: Integer, na: Integer, ab: Integer, extraBase: Integer) {
+    let i = 0
+    while i < na {
+        let kind = p.olist[ab + i * AGS]
+        if kind >= AG_REGR_COUNT && kind <= AG_CORR {
+            finalizeRegr(p, t, kind, t.cols[ng + i], extraBase + i * 2, p.olist[ab + i * AGS + 7])
+        }
+        if kind == AG_AVG || kind == AG_STDDEV || kind == AG_VARIANCE || kind == AG_STDDEV_POP || kind == AG_VAR_POP ||
+           (kind == AG_SUM && t.cols[ng + i].type == v.T_FLOAT8) {
+            let c = t.cols[ng + i]
+            let cc = t.cols[extraBase + i * 2]
+            let sq = t.cols[extraBase + i * 2 + 1]
+            let g = 0
+            while g < t.nrows {
+                let cnt = tb.getInt(cc, g)
+                if cnt == 0 || tb.isNull(c, g) {
+                    tb.setNull(c, g)
+                } else if kind == AG_AVG || kind == AG_SUM {
+                    if classOf(c.type) == CL_FLT {
+                        let sx = tb.getFloat(c, g)
+                        if c.type == v.T_FLOAT8 && sx == sx && !isInfF(sx) {
+                            sx = sx + tb.getFloat(sq, g)
+                            if isInfF(sx) {
+                                raise(p, "22003", "value out of range: overflow")
+                                return
+                            }
+                        }
+                        if kind == AG_AVG { sx = sx / Float(cnt) }
+                        tb.setFloat(c, g, sx)
+                    } else {
+                        let e = nm.newErr()
+                        let r = nm.div(cellNum(c, g), nm.fromInt(cnt), e)
+                        if numErr(p, e) { return }
+                        storeNumCell(p, c, g, r)
+                    }
+                } else {
+                    let pop = kind == AG_STDDEV_POP || kind == AG_VAR_POP
+                    let isVar = kind == AG_VARIANCE || kind == AG_VAR_POP
+                    if classOf(c.type) == CL_FLT {
+                        let nn = Float(cnt)
+                        if (pop && cnt == 0) || (!pop && cnt <= 1) {
+                            tb.setNull(c, g)
+                        } else {
+                            let den = nn - 1.0
+                            if pop { den = nn }
+                            let r = tb.getFloat(sq, g) / den
+                            if !isVar { r = math.sqrt(r) }
+                            tb.setFloat(c, g, r)
+                        }
+                    } else {
+                        let isNull: List<Integer> = [0]
+                        let r = nm.stddevFinal(cnt, cellNum(c, g), cellNum(sq, g), isVar, !pop, isNull)
+                        if isNull[0] == 1 {
+                            tb.setNull(c, g)
+                        } else {
+                            storeNumCell(p, c, g, r)
+                        }
+                    }
+                }
+                g += 1
+            }
+        }
+        i += 1
+    }
+}
+
+// ---- sort: a = child, b = temp idx, c = out slot, e = block [nCols, colExprs..., nKeys, (col, desc, nullsFirst)...],
+// f = chain idx for sorted ids
+function buildSort(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oe[o]
+    let nc = p.olist[blk]
+    let child = p.oa[o]
+    open(p, child)
+    while next(p, child) {
+        let row = tb.reserveRow(t, 0)
+        let c = 0
+        while c < nc {
+            let e = p.olist[blk + 1 + c]
+            ev(p, e)
+            storeCell(p, e, t.cols[c], row)
+            c += 1
+        }
+        if p.err { return }
+    }
+    let ids = p.chains[p.of[o]]
+    ids.clear()
+    let r = 0
+    while r < t.nrows {
+        ids.addInt64(r)
+        r += 1
+    }
+    let kb = blk + 1 + nc
+    sortIds(t, p.olist, kb, ids)
+}
+
+function cmpSortRows(t: tb.Table, spec: List<Integer>, kb: Integer, a: Integer, b: Integer): Integer {
+    let nk = spec[kb]
+    let i = 0
+    while i < nk {
+        let col = spec[kb + 1 + i * 3]
+        let desc = spec[kb + 2 + i * 3] == 1
+        let nullsFirst = spec[kb + 3 + i * 3] == 1
+        let c = t.cols[col]
+        let an = tb.isNull(c, a)
+        let bn = tb.isNull(c, b)
+        if an || bn {
+            if !(an && bn) {
+                if an {
+                    if nullsFirst { return -1 }
+                    return 1
+                }
+                if nullsFirst { return 1 }
+                return -1
+            }
+        } else {
+            let r = 0
+            if c.type == v.T_NUMERIC || c.type == v.T_NUMTEXT {
+                if cellIsSmallNum(c, a) && cellIsSmallNum(c, b) {
+                    r = cmpNumSmall(tb.getInt(c, a), tb.getScale(c, a), tb.getInt(c, b), tb.getScale(c, b))
+                } else {
+                    r = nm.cmp(cellNum(c, a), cellNum(c, b))
+                }
+            } else {
+                r = ix.cmpCells(c, a, c, b)
+            }
+            if r != 0 {
+                if desc { return -r }
+                return r
+            }
+        }
+        i += 1
+    }
+    return ix.cmpInt(a, b)
+}
+
+public function sortIds(t: tb.Table, spec: List<Integer>, kb: Integer, ids: Bytes) {
+    let n = ids.length / 8
+    if n < 2 { return }
+    let tmp = Bytes(n * 8)
+    let run = 16
+    let s = 0
+    while s < n {
+        let e = s + run
+        if e > n { e = n }
+        let i = s + 1
+        while i < e {
+            let x = ids.getInt64(i * 8)
+            let j = i - 1
+            while j >= s && cmpSortRows(t, spec, kb, ids.getInt64(j * 8), x) > 0 {
+                ids.setInt64((j + 1) * 8, ids.getInt64(j * 8))
+                j -= 1
+            }
+            ids.setInt64((j + 1) * 8, x)
+            i += 1
+        }
+        s = e
+    }
+    let src = ids
+    let dst = tmp
+    let inIds = true
+    let width = run
+    while width < n {
+        let lo = 0
+        while lo < n {
+            let mid = lo + width
+            if mid > n { mid = n }
+            let hi = lo + 2 * width
+            if hi > n { hi = n }
+            let i = lo
+            let j = mid
+            let k = lo
+            while i < mid && j < hi {
+                let x = src.getInt64(i * 8)
+                let y = src.getInt64(j * 8)
+                if cmpSortRows(t, spec, kb, x, y) <= 0 {
+                    dst.setInt64(k * 8, x)
+                    i += 1
+                } else {
+                    dst.setInt64(k * 8, y)
+                    j += 1
+                }
+                k += 1
+            }
+            while i < mid {
+                dst.setInt64(k * 8, src.getInt64(i * 8))
+                i += 1
+                k += 1
+            }
+            while j < hi {
+                dst.setInt64(k * 8, src.getInt64(j * 8))
+                j += 1
+                k += 1
+            }
+            lo = hi
+        }
+        let sw = src
+        src = dst
+        dst = sw
+        inIds = !inIds
+        width = width * 2
+    }
+    if !inIds {
+        let i = 0
+        while i < n {
+            ids.setInt64(i * 8, src.getInt64(i * 8))
+            i += 1
+        }
+    }
+}
+
+// ---- set operations: a = left op, b = temp idx (result), c = slot, d = kind | all << 8, e = block
+// [nCols, leftExprs..., rightOp, rightExprs...], f = map idx
+function buildSetOp(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oe[o]
+    let nc = p.olist[blk]
+    let left = p.oa[o]
+    let right = p.olist[blk + 1 + nc]
+    let kind = p.od[o] & 255
+    let all = ((p.od[o] >> 8) & 1) == 1
+    let m = p.maps[p.of[o]]
+    hm.clear(m)
+    let chain = p.chains[p.of[o]]
+    chain.clear()
+    // count columns: extra two Integer columns after nc: left count, right count
+    open(p, left)
+    while next(p, left) {
+        addSetRow(p, t, m, chain, blk + 1, nc, 0, all && kind == 1)
+        if p.err { return }
+    }
+    open(p, right)
+    while next(p, right) {
+        addSetRow(p, t, m, chain, blk + 2 + nc, nc, 1, all && kind == 1)
+        if p.err { return }
+    }
+    // decide which rows survive and how many copies
+    let finalRows = Bytes()
+    let r = 0
+    let n = t.nrows
+    while r < n {
+        let lc = tb.getInt(t.cols[nc], r)
+        let rc = tb.getInt(t.cols[nc + 1], r)
+        let copies = 0
+        if kind == 1 {
+            if all { copies = lc + rc } else { copies = 1 }
+        } else if kind == 2 {
+            if all {
+                copies = lc
+                if rc < copies { copies = rc }
+            } else if lc > 0 && rc > 0 {
+                copies = 1
+            }
+        } else {
+            if all {
+                copies = lc - rc
+                if copies < 0 { copies = 0 }
+            } else if lc > 0 && rc == 0 {
+                copies = 1
+            }
+        }
+        if copies == 0 {
+            t.state[r] = tb.ST_DEAD
+        } else {
+            let extra = copies - 1
+            while extra > 0 {
+                finalRows.addInt64(r)
+                extra -= 1
+            }
+        }
+        r += 1
+    }
+    // append duplicate copies
+    let i = 0
+    while i < finalRows.length / 8 {
+        let src = finalRows.getInt64(i * 8)
+        let d = tb.reserveRow(t, 0)
+        tb.copyRow(t, src, t, d)
+        i += 1
+    }
+}
+
+function addSetRow(p: Plan, t: tb.Table, m: hm.IntMap, chain: Bytes, exprBlk: Integer, nc: Integer, side: Integer, noDedupe: Boolean) {
+    let h = 0
+    let i = 0
+    while i < nc {
+        let e = p.olist[exprBlk + i]
+        ev(p, e)
+        h = v.hashCombine(h, hashReg(p, e))
+        i += 1
+    }
+    let r = -1
+    if !noDedupe {
+        r = hm.get(m, h, -1)
+        while r >= 0 {
+            let same = true
+            i = 0
+            while i < nc && same {
+                if !regEqualsCell(p, p.olist[exprBlk + i], t.cols[i], r) { same = false }
+                i += 1
+            }
+            if same { break }
+            r = chain.getInt64(r * 8)
+        }
+    }
+    if r < 0 {
+        r = tb.reserveRow(t, 0)
+        i = 0
+        while i < nc {
+            storeCell(p, p.olist[exprBlk + i], t.cols[i], r)
+            i += 1
+        }
+        tb.setInt(t.cols[nc], r, 0)
+        tb.setInt(t.cols[nc + 1], r, 0)
+        chain.addInt64(hm.get(m, h, -1))
+        hm.put(m, h, r)
+    }
+    let cc = t.cols[nc + side]
+    tb.setInt(cc, r, tb.getInt(cc, r) + 1)
+}
+
+// ---------------------------------------------------------------- compat agent: regex, arrays, catalog functions
+
+// a ~ b: compiled patterns are cached per node and reused while the pattern text is unchanged.
+function evalRegex(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    let b = p.eb[n]
+    ev(p, a)
+    ev(p, b)
+    if p.rNull[a] != 0 || p.rNull[b] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let flags = p.ec[n]
+    let icase = (flags & 2) != 0
+    let idx = -1
+    let i = 0
+    while i < p.regexNodes.length {
+        if p.regexNodes[i] == n { idx = i }
+        i += 1
+    }
+    let pb = p.rBuf[b]
+    let po = p.rOff[b]
+    let pl = p.rLen[b]
+    if idx >= 0 {
+        let old = p.regexes[idx]
+        if !old.ok || !v.equalBytes(old.pattern, 0, old.pattern.length, pb, po, pl) {
+            p.regexes[idx] = rx.compile(pb.slice(po, po + pl), icase)
+        }
+    } else {
+        p.regexes.add(rx.compile(pb.slice(po, po + pl), icase))
+        p.regexNodes.add(n)
+        idx = p.regexes.length - 1
+    }
+    let r = p.regexes[idx]
+    if !r.ok {
+        raise(p, r.errCode, r.err)
+        return
+    }
+    let m = rx.search(r, p.rBuf[a], p.rOff[a], p.rLen[a])
+    if !r.ok {
+        raise(p, r.errCode, r.err)
+        return
+    }
+    if (flags & 1) != 0 { m = !m }
+    setBoolReg(p, n, m)
+}
+
+// arr[i] on a catalog array (int2vector/oidvector count from 0, arrays from 1); NULL when out of range.
+function evalSubscript(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    let b = p.eb[n]
+    ev(p, a)
+    ev(p, b)
+    if p.rNull[a] != 0 || p.rNull[b] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let at = p.et[a]
+    let k = p.rInt[b]
+    if k < -1000000000 || k > 1000000000 {
+        p.rNull[n] = 1
+        return
+    }
+    let elems: List<Bytes> = []
+    let nulls: List<Boolean> = []
+    splitArrayText(p.rBuf[a], p.rOff[a], p.rLen[a], v.isVectorType(at), elems, nulls)
+    let pos = k - v.arrayLowerBound(at)
+    if pos < 0 || pos >= elems.length || nulls[pos] {
+        p.rNull[n] = 1
+        return
+    }
+    let e = elems[pos]
+    parseInto(p, e, 0, e.length, false, n, p.et[n], -1, 0)
+}
+
+// (rec).x / (rec).n of a record "(x,n)" from information_schema._pg_expandarray.
+function evalField(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    ev(p, a)
+    if p.rNull[a] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let b = p.rBuf[a]
+    let o = p.rOff[a]
+    let l = p.rLen[a]
+    // strip the parentheses, then split on the comma
+    let start = o
+    let end = o + l
+    if l >= 2 && b[o] == 40 && b[o + l - 1] == 41 {
+        start = o + 1
+        end = o + l - 1
+    }
+    let want = p.ec[n]
+    let field = 0
+    let fs = start
+    let i = start
+    while i <= end {
+        if i == end || b[i] == 44 {
+            if field == want {
+                if i == fs {
+                    p.rNull[n] = 1
+                    return
+                }
+                parseInto(p, b, fs, i - fs, false, n, p.et[n], -1, 0)
+                return
+            }
+            field += 1
+            fs = i + 1
+        }
+        i += 1
+    }
+    p.rNull[n] = 1
+}
+
+function setTextResult(p: Plan, n: Integer, txt: Text) {
+    let sc = scratchOf(p, n)
+    v.addText(sc, txt)
+    setTextReg(p, n, sc, 0, sc.length)
+}
+
+function evalCatFunc(p: Plan, n: Integer) {
+    let fn = p.ec[n]
+    let cnt = p.eb[n]
+    let i = 0
+    while i < cnt {
+        let a = argAt(p, n, i)
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        i += 1
+    }
+    p.rNull[n] = 0
+    let a0 = argAt(p, n, 0)
+    let c = p.env.cat
+    if fn == FN_PG_INDEXDEF {
+        let col = 0
+        if cnt > 1 { col = p.rInt[argAt(p, n, 1)] }
+        let d = pgc.indexDef(c, p.rInt[a0], col)
+        if d == "" && col == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        setTextResult(p, n, d)
+        return
+    }
+    if fn == FN_FORMAT_TYPE {
+        let tm = -1
+        if cnt > 1 { tm = p.rInt[argAt(p, n, 1)] }
+        setTextResult(p, n, pgc.formatType(p.rInt[a0], tm))
+        return
+    }
+    if fn == FN_CONSTRAINTDEF {
+        let d = pgc.constraintDef(c, p.rInt[a0])
+        if d == "" {
+            p.rNull[n] = 1
+            return
+        }
+        setTextResult(p, n, d)
+        return
+    }
+    if fn == FN_ARRAY_UPPER || fn == FN_ARRAY_LOWER || fn == FN_ARRAY_LENGTH {
+        let at = p.et[a0]
+        let dim = 1
+        if cnt > 1 { dim = p.rInt[argAt(p, n, 1)] }
+        let elems: List<Bytes> = []
+        let nulls: List<Boolean> = []
+        splitArrayText(p.rBuf[a0], p.rOff[a0], p.rLen[a0], v.isVectorType(at), elems, nulls)
+        if dim != 1 || elems.length == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let lb = v.arrayLowerBound(at)
+        if fn == FN_ARRAY_UPPER { p.rInt[n] = lb + elems.length - 1 }
+        if fn == FN_ARRAY_LOWER { p.rInt[n] = lb }
+        if fn == FN_ARRAY_LENGTH { p.rInt[n] = elems.length }
+        return
+    }
+    if fn == FN_REL_SIZE {
+        let oid = p.rInt[a0]
+        let tid = oid - pgc.OID_TABLE
+        p.rInt[n] = 0
+        if tid >= 0 && tid < c.tables.length && !cat.isDropped(c.tables[tid]) { p.rInt[n] = tb.memoryBytes(c.tables[tid]) }
+        return
+    }
+    p.rNull[n] = 1
+}
+
+// ---- set-returning function in the select list: a = child, b = temp, c = slot, d = olist block [kind, args...]
+// kind 1 _pg_expandarray(arr) -> (x, n); 2 unnest(arr) -> x; 3 generate_series(lo, hi[, step]) streamed.
+// state: os1 = 0 need a child row / 1 iterating; os2 = position (or current value); os3 = stop (series)
+function nextSrf(p: Plan, o: Integer): Boolean {
+    let child = p.oa[o]
+    let t = p.temps[p.ob[o]]
+    let s = p.oc[o]
+    let blk = p.od[o]
+    let kind = p.olist[blk]
+    while true {
+        if p.err { return false }
+        if p.os1[o] == 1 {
+            if kind == 3 {
+                let cur = p.os2[o]
+                let stop = p.os3[o]
+                let st = p.olist[blk + 3]
+                let step = 1
+                if st >= 0 { step = p.rInt[st] }
+                if (step > 0 && cur <= stop) || (step < 0 && cur >= stop) {
+                    if t.nrows == 0 { tb.reserveRow(t, 0) }
+                    tb.clearNull(t.cols[0], 0)
+                    tb.setInt(t.cols[0], 0, cur)
+                    p.slotTable[s] = t
+                    p.slotRow[s] = 0
+                    if (step > 0 && cur > 9223372036854775807 - step) || (step < 0 && cur < -9223372036854775807 - 1 - step) {
+                        p.os1[o] = 0
+                    } else {
+                        p.os2[o] = cur + step
+                    }
+                    return true
+                }
+            } else {
+                let pos = p.os2[o]
+                if pos < t.nrows {
+                    p.slotTable[s] = t
+                    p.slotRow[s] = pos
+                    p.os2[o] = pos + 1
+                    return true
+                }
+            }
+            p.os1[o] = 0
+        }
+        if !next(p, child) { return false }
+        if kind == 3 {
+            let lo = p.olist[blk + 1]
+            let hi = p.olist[blk + 2]
+            let st = p.olist[blk + 3]
+            ev(p, lo)
+            ev(p, hi)
+            if st >= 0 {
+                ev(p, st)
+                if p.rNull[st] == 0 && p.rInt[st] == 0 {
+                    raise(p, "22023", "step size cannot equal zero")
+                    return false
+                }
+            }
+            if p.rNull[lo] == 0 && p.rNull[hi] == 0 && (st < 0 || p.rNull[st] == 0) {
+                p.os2[o] = p.rInt[lo]
+                p.os3[o] = p.rInt[hi]
+                p.os1[o] = 1
+            }
+            continue
+        }
+        let arr = p.olist[blk + 1]
+        ev(p, arr)
+        tb.truncate(t)
+        if p.rNull[arr] == 0 {
+            let at = p.et[arr]
+            let elems: List<Bytes> = []
+            let nulls: List<Boolean> = []
+            splitArrayText(p.rBuf[arr], p.rOff[arr], p.rLen[arr], v.isVectorType(at), elems, nulls)
+            let i = 0
+            while i < elems.length {
+                let r = tb.reserveRow(t, 0)
+                let c0 = t.cols[0]
+                if nulls[i] {
+                    tb.setNull(c0, r)
+                } else if v.isTextType(c0.type) {
+                    tb.setText(c0, r, elems[i], 0, elems[i].length)
+                } else {
+                    let q = p.pq
+                    let lo = -2147483648
+                    let hi = 2147483647
+                    if c0.type == v.T_INT2 {
+                        lo = -32768
+                        hi = 32767
+                    }
+                    v.parseInt(elems[i], 0, elems[i].length, q, lo, hi)
+                    if q.ok { tb.setInt(c0, r, q.i) } else { tb.setNull(c0, r) }
+                }
+                if t.cols.length > 1 { tb.setInt(t.cols[1], r, i + 1) }
+                // record form "(x,n)" for a bare _pg_expandarray(arr) target
+                if t.cols.length > 2 {
+                    let rec = Bytes()
+                    rec.add(40)
+                    if !nulls[i] { rec.addBytes(elems[i]) }
+                    rec.add(44)
+                    v.addInt(rec, i + 1)
+                    rec.add(41)
+                    tb.setText(t.cols[2], r, rec, 0, rec.length)
+                }
+                i += 1
+            }
+        }
+        p.os1[o] = 1
+        p.os2[o] = 0
+    }
+}
+
+// ---- window functions: a = child, b = temp T, c = T's slot, e = olist block, f = chain (output order)
+// block: [nCap, (capSrc, col)..., nEval, (expr, col)..., nSpec, per spec: [sortSpecPos, nPart, nOrd, nFn, (kind, col)...]]
+// where olist[sortSpecPos] = [nKeys, (col, desc, nullsFirst)...] (partition keys first, then order keys).
+// Captured columns are copied into T first; the expressions of the select list were redirected to read T.
+public constant WF_ROW_NUMBER = 1
+public constant WF_RANK = 2
+public constant WF_DENSE_RANK = 3
+public constant WF_COUNT = 4
+
+function buildWindow(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oe[o]
+    let nCap = p.olist[blk]
+    let child = p.oa[o]
+    open(p, child)
+    while next(p, child) {
+        let row = tb.reserveRow(t, 0)
+        let i = 0
+        while i < nCap {
+            let e = p.olist[blk + 1 + 2 * i]
+            ev(p, e)
+            storeCell(p, e, t.cols[p.olist[blk + 2 + 2 * i]], row)
+            i += 1
+        }
+        if p.err { return }
+    }
+    let s = p.oc[o]
+    let eb = blk + 1 + 2 * nCap
+    let nEval = p.olist[eb]
+    let r = 0
+    while r < t.nrows && nEval > 0 {
+        p.slotTable[s] = t
+        p.slotRow[s] = r
+        let i = 0
+        while i < nEval {
+            let e = p.olist[eb + 1 + 2 * i]
+            ev(p, e)
+            storeCell(p, e, t.cols[p.olist[eb + 2 + 2 * i]], r)
+            i += 1
+        }
+        if p.err { return }
+        r += 1
+    }
+    let ids = p.chains[p.of[o]]
+    let sb = eb + 1 + 2 * nEval
+    let nSpec = p.olist[sb]
+    let pos = sb + 1
+    let si = 0
+    while si < nSpec {
+        let sortPos = p.olist[pos]
+        let nPart = p.olist[pos + 1]
+        let nOrd = p.olist[pos + 2]
+        let nFn = p.olist[pos + 3]
+        ids.clear()
+        r = 0
+        while r < t.nrows {
+            ids.addInt64(r)
+            r += 1
+        }
+        sortIds(t, p.olist, sortPos, ids)
+        let n = ids.length / 8
+        let rn = 0
+        let rank = 0
+        let dense = 0
+        let partStart = 0
+        let prev = -1
+        let i = 0
+        while i < n {
+            let row = ids.getInt64(i * 8)
+            let newPart = prev < 0 || !winKeysEqual(t, p.olist, sortPos, 0, nPart, prev, row)
+            if newPart {
+                rn = 1
+                rank = 1
+                dense = 1
+                partStart = i
+            } else {
+                rn += 1
+                if !winKeysEqual(t, p.olist, sortPos, nPart, nPart + nOrd, prev, row) {
+                    rank = rn
+                    dense += 1
+                }
+            }
+            let f = 0
+            while f < nFn {
+                let kind = p.olist[pos + 4 + 2 * f]
+                let col = t.cols[p.olist[pos + 5 + 2 * f]]
+                let x = rn
+                if kind == WF_RANK { x = rank }
+                if kind == WF_DENSE_RANK { x = dense }
+                tb.clearNull(col, row)
+                tb.setInt(col, row, x)
+                f += 1
+            }
+            prev = row
+            i += 1
+            // count(*) over the partition: fill once the partition ends
+            if i == n || !winKeysEqual(t, p.olist, sortPos, 0, nPart, prev, ids.getInt64(i * 8)) {
+                let f2 = 0
+                while f2 < nFn {
+                    if p.olist[pos + 4 + 2 * f2] == WF_COUNT {
+                        let col = t.cols[p.olist[pos + 5 + 2 * f2]]
+                        let j = partStart
+                        while j < i {
+                            let rr = ids.getInt64(j * 8)
+                            tb.clearNull(col, rr)
+                            tb.setInt(col, rr, i - partStart)
+                            j += 1
+                        }
+                    }
+                    f2 += 1
+                }
+            }
+        }
+        pos = pos + 4 + 2 * nFn
+        si += 1
+    }
+    if nSpec == 0 {
+        ids.clear()
+        r = 0
+        while r < t.nrows {
+            ids.addInt64(r)
+            r += 1
+        }
+    }
+}
+
+// Rows a and b equal on sort keys [from, to) of the spec at kb (NULLs equal NULLs).
+function winKeysEqual(t: tb.Table, spec: List<Integer>, kb: Integer, from: Integer, to: Integer, a: Integer, b: Integer): Boolean {
+    let i = from
+    while i < to {
+        let c = t.cols[spec[kb + 1 + i * 3]]
+        let an = tb.isNull(c, a)
+        let bn = tb.isNull(c, b)
+        if an || bn {
+            if !(an && bn) { return false }
+        } else if c.type == v.T_NUMERIC || c.type == v.T_NUMTEXT {
+            if cellIsSmallNum(c, a) && cellIsSmallNum(c, b) {
+                if cmpNumSmall(tb.getInt(c, a), tb.getScale(c, a), tb.getInt(c, b), tb.getScale(c, b)) != 0 { return false }
+            } else if nm.cmp(cellNum(c, a), cellNum(c, b)) != 0 {
+                return false
+            }
+        } else if ix.cmpCells(c, a, c, b) != 0 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}

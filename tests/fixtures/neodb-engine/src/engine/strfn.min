@@ -1,0 +1,1000 @@
+// String and bytea algorithms behind SQL functions (format, quote_*, to_hex/oct/bin, overlay, unistr,
+// SHA-2 / MD5, encode/decode, bytea text I/O). Pure byte-level code: callers marshal registers.
+// Errors are returned as an SQLSTATE in StrErr (code "" = ok) so the executor can raise them.
+use "../sql/keywords.min" as kw
+
+public record StrErr {
+    code: Text
+    msg: Text
+}
+
+public function newErr(): StrErr {
+    return StrErr { code: ""; msg: "" }
+}
+
+function setErr(e: StrErr, code: Text, msg: Text) {
+    if e.code != "" { return }
+    e.code = code
+    e.msg = msg
+}
+
+// ---------------------------------------------------------------- UTF-8 helpers
+
+// Byte length of the UTF-8 sequence starting with lead byte c (1 for invalid lead bytes).
+function seqLen(c: Integer): Integer {
+    if c < 128 { return 1 }
+    if c >= 240 { return 4 }
+    if c >= 224 { return 3 }
+    if c >= 192 { return 2 }
+    return 1
+}
+
+public function charLen(b: Bytes, o: Integer, l: Integer): Integer {
+    let n = 0
+    let i = 0
+    while i < l {
+        i += seqLen(b[o + i])
+        n += 1
+    }
+    return n
+}
+
+// Byte offset (relative to o) of character k (clamped to l).
+public function charOff(b: Bytes, o: Integer, l: Integer, k: Integer): Integer {
+    let i = 0
+    let n = 0
+    while i < l && n < k {
+        i += seqLen(b[o + i])
+        n += 1
+    }
+    if i > l { return l }
+    return i
+}
+
+public function addCodePoint(out: Bytes, c: Integer) {
+    if c < 128 {
+        out.add(c)
+    } else if c < 2048 {
+        out.add(192 | (c >> 6))
+        out.add(128 | (c & 63))
+    } else if c < 65536 {
+        out.add(224 | (c >> 12))
+        out.add(128 | ((c >> 6) & 63))
+        out.add(128 | (c & 63))
+    } else {
+        out.add(240 | (c >> 18))
+        out.add(128 | ((c >> 12) & 63))
+        out.add(128 | ((c >> 6) & 63))
+        out.add(128 | (c & 63))
+    }
+}
+
+function hexVal(c: Integer): Integer {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+function hexDigit(x: Integer): Integer {
+    if x < 10 { return 48 + x }
+    return 87 + x
+}
+
+function addHexByte(out: Bytes, x: Integer) {
+    out.add(hexDigit((x >> 4) & 15))
+    out.add(hexDigit(x & 15))
+}
+
+// ---------------------------------------------------------------- quoting
+
+// quote_literal: '...' with quotes doubled; E'...' (backslashes doubled) when the value has a backslash.
+public function quoteLiteral(b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    let i = 0
+    let bs = false
+    while i < l {
+        if b[o + i] == 92 { bs = true }
+        i += 1
+    }
+    if bs { out.add(69) }
+    out.add(39)
+    i = 0
+    while i < l {
+        let c = b[o + i]
+        if c == 39 || c == 92 { out.add(c) }
+        out.add(c)
+        i += 1
+    }
+    out.add(39)
+}
+
+// quote_ident: double-quoted unless a plain lower-case identifier that is not a (non-unreserved) keyword.
+public function quoteIdent(b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    let safe = l > 0
+    let h = kw.HASH_SEED
+    let i = 0
+    while i < l {
+        let c = b[o + i]
+        let ok = (c >= 97 && c <= 122) || c == 95 || (i > 0 && c >= 48 && c <= 57)
+        if !ok { safe = false }
+        h = wrappingMultiply(h ^ c, kw.HASH_PRIME)
+        i += 1
+    }
+    if safe && l <= 17 {
+        let id = kw.lookup(h, l)
+        if id > 0 && id <= kw.TYPE_FUNC_MAX && kw.text(id) == Text(b.slice(o, o + l)) { safe = false }
+    }
+    if safe {
+        out.addBytes(b.slice(o, o + l))
+        return
+    }
+    out.add(34)
+    i = 0
+    while i < l {
+        let c = b[o + i]
+        if c == 34 { out.add(34) }
+        out.add(c)
+        i += 1
+    }
+    out.add(34)
+}
+
+// ---------------------------------------------------------------- to_hex / to_oct / to_bin
+
+// Unsigned digits of x in base 2^bits; width 32 treats x as an int4 (two's complement in 32 bits).
+public function toBase(x: Integer, width: Integer, bits: Integer, out: Bytes) {
+    let u = x
+    if width == 32 { u = x & 4294967295 }
+    let mask = (1 << bits) - 1
+    let digits = Bytes()
+    let first = true
+    while first || u != 0 {
+        first = false
+        digits.add(hexDigit(u & mask))
+        // logical shift right
+        u = (u >> bits) & (9223372036854775807 >> (bits - 1))
+    }
+    let i = digits.length - 1
+    while i >= 0 {
+        out.add(digits[i])
+        i -= 1
+    }
+}
+
+// ---------------------------------------------------------------- overlay
+
+// overlay(s placing r from start [for count]); positions in characters (bytes when isBytes). count < 0: length of r.
+public function overlay(b: Bytes, o: Integer, l: Integer, rb: Bytes, ro: Integer, rl: Integer, start: Integer, count: Integer,
+                        isBytes: Boolean, out: Bytes, e: StrErr) {
+    let cnt = count
+    if cnt < 0 {
+        if isBytes { cnt = rl } else { cnt = charLen(rb, ro, rl) }
+    }
+    if start < 1 {
+        setErr(e, "22011", "negative substring length not allowed")
+        return
+    }
+    let total = l
+    if !isBytes { total = charLen(b, o, l) }
+    let headEnd = start - 1
+    if headEnd > total { headEnd = total }
+    let tailStart = start - 1
+    if cnt > total { tailStart = total } else { tailStart = start - 1 + cnt }
+    if tailStart > total { tailStart = total }
+    let hb = headEnd
+    let tb = tailStart
+    if !isBytes {
+        hb = charOff(b, o, l, headEnd)
+        tb = charOff(b, o, l, tailStart)
+    }
+    out.addBytes(b.slice(o, o + hb))
+    out.addBytes(rb.slice(ro, ro + rl))
+    out.addBytes(b.slice(o + tb, o + l))
+}
+
+// ---------------------------------------------------------------- unistr
+
+function hexRun(b: Bytes, o: Integer, l: Integer, at: Integer, n: Integer): Integer {
+    if at + n > l { return -1 }
+    let x = 0
+    let i = 0
+    while i < n {
+        let d = hexVal(b[o + at + i])
+        if d < 0 { return -1 }
+        x = x * 16 + d
+        i += 1
+    }
+    return x
+}
+
+function cpText(x: Integer): Text {
+    let s = Bytes()
+    let started = false
+    let sh = 20
+    while sh >= 0 {
+        let d = (x >> sh) & 15
+        if d != 0 || started || sh == 0 {
+            started = true
+            let c = hexDigit(d)
+            if c >= 97 { c -= 32 }
+            s.add(c)
+        }
+        sh -= 4
+    }
+    let t = Text(s)
+    while t.length < 4 { t = "0" + t }
+    return t
+}
+
+public function unistr(b: Bytes, o: Integer, l: Integer, out: Bytes, e: StrErr) {
+    let i = 0
+    let pendingHi = -1
+    while i < l {
+        let c = b[o + i]
+        if c != 92 {
+            if pendingHi >= 0 {
+                setErr(e, "42601", "invalid Unicode surrogate pair")
+                return
+            }
+            out.add(c)
+            i += 1
+            continue
+        }
+        if i + 1 < l && b[o + i + 1] == 92 {
+            if pendingHi >= 0 {
+                setErr(e, "42601", "invalid Unicode surrogate pair")
+                return
+            }
+            out.add(92)
+            i += 2
+            continue
+        }
+        let cp = -1
+        let n = 0
+        if i + 1 < l && b[o + i + 1] == 43 {
+            cp = hexRun(b, o, l, i + 2, 6)
+            n = 8
+        } else if i + 1 < l && b[o + i + 1] == 117 {
+            cp = hexRun(b, o, l, i + 2, 4)
+            n = 6
+        } else if i + 1 < l && b[o + i + 1] == 85 {
+            cp = hexRun(b, o, l, i + 2, 8)
+            n = 10
+        } else {
+            cp = hexRun(b, o, l, i + 1, 4)
+            n = 5
+        }
+        if cp < 0 {
+            setErr(e, "42601", "invalid Unicode escape")
+            return
+        }
+        if cp > 1114111 {
+            setErr(e, "22023", "invalid Unicode code point: " + cpText(cp))
+            return
+        }
+        if cp >= 55296 && cp <= 56319 {
+            if pendingHi >= 0 {
+                setErr(e, "42601", "invalid Unicode surrogate pair")
+                return
+            }
+            pendingHi = cp
+        } else if cp >= 56320 && cp <= 57343 {
+            if pendingHi < 0 {
+                setErr(e, "42601", "invalid Unicode surrogate pair")
+                return
+            }
+            addCodePoint(out, 65536 + ((pendingHi - 55296) << 10) + (cp - 56320))
+            pendingHi = -1
+        } else {
+            if pendingHi >= 0 {
+                setErr(e, "42601", "invalid Unicode surrogate pair")
+                return
+            }
+            if cp == 0 {
+                setErr(e, "22023", "invalid Unicode code point: 0000")
+                return
+            }
+            addCodePoint(out, cp)
+        }
+        i += n
+    }
+    if pendingHi >= 0 { setErr(e, "42601", "invalid Unicode surrogate pair") }
+}
+
+// ---------------------------------------------------------------- bytea text I/O
+
+// PG bytea input: '\x' hex (whitespace between bytes allowed) or the escape format.
+public function byteaIn(b: Bytes, o: Integer, l: Integer, out: Bytes, e: StrErr) {
+    if l >= 2 && b[o] == 92 && b[o + 1] == 120 {
+        let i = 2
+        while i < l {
+            let c = b[o + i]
+            if c == 32 || c == 9 || c == 10 || c == 13 {
+                i += 1
+                continue
+            }
+            let hi = hexVal(c)
+            if hi < 0 {
+                setErr(e, "22023", "invalid hexadecimal digit: \"" + Text(b.slice(o + i, o + i + seqLen(c))) + "\"")
+                return
+            }
+            if i + 1 >= l {
+                setErr(e, "22023", "invalid hexadecimal data: odd number of digits")
+                return
+            }
+            let c2 = b[o + i + 1]
+            let lo = hexVal(c2)
+            if lo < 0 {
+                setErr(e, "22023", "invalid hexadecimal digit: \"" + Text(b.slice(o + i + 1, o + i + 1 + seqLen(c2))) + "\"")
+                return
+            }
+            out.add(hi * 16 + lo)
+            i += 2
+        }
+        return
+    }
+    let i = 0
+    while i < l {
+        let c = b[o + i]
+        if c != 92 {
+            out.add(c)
+            i += 1
+            continue
+        }
+        if i + 1 < l && b[o + i + 1] == 92 {
+            out.add(92)
+            i += 2
+            continue
+        }
+        if i + 3 < l {
+            let d1 = b[o + i + 1] - 48
+            let d2 = b[o + i + 2] - 48
+            let d3 = b[o + i + 3] - 48
+            if d1 >= 0 && d1 <= 3 && d2 >= 0 && d2 <= 7 && d3 >= 0 && d3 <= 7 {
+                out.add(d1 * 64 + d2 * 8 + d3)
+                i += 4
+                continue
+            }
+        }
+        setErr(e, "22P02", "invalid input syntax for type bytea")
+        return
+    }
+}
+
+// PG bytea output (bytea_output = hex).
+public function byteaOut(b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    out.add(92)
+    out.add(120)
+    let i = 0
+    while i < l {
+        addHexByte(out, b[o + i])
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- encode / decode
+
+constant B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function b64Val(c: Integer): Integer {
+    if c >= 65 && c <= 90 { return c - 65 }
+    if c >= 97 && c <= 122 { return c - 71 }
+    if c >= 48 && c <= 57 { return c + 4 }
+    if c == 43 { return 62 }
+    if c == 47 { return 63 }
+    return -1
+}
+
+// encode(bytea, format) -> text. format: "hex", "base64", "escape".
+public function encode(fmt: Text, b: Bytes, o: Integer, l: Integer, out: Bytes, e: StrErr) {
+    if fmt == "hex" {
+        let i = 0
+        while i < l {
+            addHexByte(out, b[o + i])
+            i += 1
+        }
+        return
+    }
+    if fmt == "base64" {
+        let alpha = Bytes(B64)
+        let i = 0
+        let lineLen = 0
+        while i < l {
+            let b0 = b[o + i]
+            let b1 = 0
+            let b2 = 0
+            if i + 1 < l { b1 = b[o + i + 1] }
+            if i + 2 < l { b2 = b[o + i + 2] }
+            if lineLen >= 76 {
+                out.add(10)
+                lineLen = 0
+            }
+            out.add(alpha[b0 >> 2])
+            out.add(alpha[((b0 & 3) << 4) | (b1 >> 4)])
+            if i + 1 < l { out.add(alpha[((b1 & 15) << 2) | (b2 >> 6)]) } else { out.add(61) }
+            if i + 2 < l { out.add(alpha[b2 & 63]) } else { out.add(61) }
+            lineLen += 4
+            i += 3
+        }
+        return
+    }
+    if fmt == "escape" {
+        let i = 0
+        while i < l {
+            let c = b[o + i]
+            if c == 92 {
+                out.add(92)
+                out.add(92)
+            } else if c == 0 || c >= 128 {
+                out.add(92)
+                out.add(48 + (c >> 6))
+                out.add(48 + ((c >> 3) & 7))
+                out.add(48 + (c & 7))
+            } else {
+                out.add(c)
+            }
+            i += 1
+        }
+        return
+    }
+    setErr(e, "22023", "unrecognized encoding: \"" + fmt + "\"")
+}
+
+// decode(text, format) -> bytea.
+public function decode(fmt: Text, b: Bytes, o: Integer, l: Integer, out: Bytes, e: StrErr) {
+    if fmt == "hex" {
+        let i = 0
+        while i < l {
+            let c = b[o + i]
+            if c == 32 || c == 9 || c == 10 || c == 13 {
+                i += 1
+                continue
+            }
+            let hi = hexVal(c)
+            if hi < 0 {
+                setErr(e, "22023", "invalid hexadecimal digit: \"" + Text(b.slice(o + i, o + i + seqLen(c))) + "\"")
+                return
+            }
+            if i + 1 >= l {
+                setErr(e, "22023", "invalid hexadecimal data: odd number of digits")
+                return
+            }
+            let lo = hexVal(b[o + i + 1])
+            if lo < 0 {
+                setErr(e, "22023", "invalid hexadecimal digit: \"" + Text(b.slice(o + i + 1, o + i + 1 + seqLen(b[o + i + 1]))) + "\"")
+                return
+            }
+            out.add(hi * 16 + lo)
+            i += 2
+        }
+        return
+    }
+    if fmt == "base64" {
+        let acc = 0
+        let bitsN = 0
+        let pad = 0
+        let i = 0
+        while i < l {
+            let c = b[o + i]
+            i += 1
+            if c == 32 || c == 9 || c == 10 || c == 13 { continue }
+            if c == 61 {
+                pad += 1
+                continue
+            }
+            let x = b64Val(c)
+            if x < 0 || pad > 0 {
+                let sym = Bytes()
+                sym.add(c)
+                setErr(e, "22023", "invalid symbol \"" + Text(sym) + "\" found while decoding base64 sequence")
+                return
+            }
+            acc = ((acc << 6) | x) & 16777215
+            bitsN += 6
+            if bitsN >= 8 {
+                bitsN -= 8
+                out.add((acc >> bitsN) & 255)
+            }
+        }
+        return
+    }
+    if fmt == "escape" {
+        byteaIn(b, o, l, out, e)
+        return
+    }
+    setErr(e, "22023", "unrecognized encoding: \"" + fmt + "\"")
+}
+
+// ---------------------------------------------------------------- format()
+
+// One format() argument already rendered as text (null: SQL NULL).
+public record FmtArgs {
+    vals: List<Bytes>
+    nulls: List<Boolean>
+}
+
+function fmtDigits(f: Bytes, i: Integer, n: Integer, e: StrErr, out: List<Integer>): Integer {
+    // parses digits at i; out[0] = value, out[1] = 1 if any; returns new i (or -1 on error)
+    let val = 0
+    let any = false
+    let j = i
+    while j < n && f[j] >= 48 && f[j] <= 57 {
+        if val > 214748364 || (val == 214748364 && f[j] - 48 > 7) {
+            setErr(e, "22003", "number is out of range")
+            return -1
+        }
+        val = val * 10 + (f[j] - 48)
+        any = true
+        j += 1
+        if j >= n {
+            setErr(e, "22023", "unterminated format() type specifier")
+            return -1
+        }
+    }
+    out[0] = val
+    if any { out[1] = 1 } else { out[1] = 0 }
+    return j
+}
+
+function padTo(out: Bytes, s: Bytes, width: Integer, left: Boolean) {
+    let have = charLen(s, 0, s.length)
+    if !left {
+        let k = have
+        while k < width {
+            out.add(32)
+            k += 1
+        }
+    }
+    out.addBytes(s)
+    if left {
+        let k = have
+        while k < width {
+            out.add(32)
+            k += 1
+        }
+    }
+}
+
+public function format(f: Bytes, args: FmtArgs, out: Bytes, e: StrErr) {
+    let n = f.length
+    let nargs = args.vals.length + 1
+    let arg = 0
+    let i = 0
+    let dv: List<Integer> = [0, 0]
+    while i < n {
+        let c = f[i]
+        if c != 37 {
+            out.add(c)
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= n {
+            setErr(e, "22023", "unterminated format() type specifier")
+            return
+        }
+        if f[i] == 37 {
+            out.add(37)
+            i += 1
+            continue
+        }
+        let argpos = -1
+        let widthpos = -1
+        let left = false
+        let width = 0
+        i = fmtDigits(f, i, n, e, dv)
+        if i < 0 { return }
+        if dv[1] == 1 {
+            if f[i] != 36 {
+                width = dv[0]
+            } else {
+                argpos = dv[0]
+                if argpos == 0 {
+                    setErr(e, "22023", "format specifies argument 0, but arguments are numbered from 1")
+                    return
+                }
+                i += 1
+                if i >= n {
+                    setErr(e, "22023", "unterminated format() type specifier")
+                    return
+                }
+            }
+        }
+        if dv[1] == 0 || f[i - 1] == 36 {
+            while f[i] == 45 {
+                left = true
+                i += 1
+                if i >= n {
+                    setErr(e, "22023", "unterminated format() type specifier")
+                    return
+                }
+            }
+            if f[i] == 42 {
+                i += 1
+                if i >= n {
+                    setErr(e, "22023", "unterminated format() type specifier")
+                    return
+                }
+                i = fmtDigits(f, i, n, e, dv)
+                if i < 0 { return }
+                if dv[1] == 1 {
+                    if f[i] != 36 {
+                        setErr(e, "22023", "width argument position must be ended by \"$\"")
+                        return
+                    }
+                    widthpos = dv[0]
+                    if widthpos == 0 {
+                        setErr(e, "22023", "format specifies argument 0, but arguments are numbered from 1")
+                        return
+                    }
+                    i += 1
+                    if i >= n {
+                        setErr(e, "22023", "unterminated format() type specifier")
+                        return
+                    }
+                } else {
+                    widthpos = 0
+                }
+            } else {
+                i = fmtDigits(f, i, n, e, dv)
+                if i < 0 { return }
+                if dv[1] == 1 { width = dv[0] }
+            }
+        }
+        let t = f[i]
+        if t != 115 && t != 73 && t != 76 {
+            setErr(e, "22023", "unrecognized format() type specifier \"" + Text(f.slice(i, i + seqLen(t))) + "\"")
+            return
+        }
+        i += 1
+        if widthpos >= 0 {
+            if widthpos > 0 { arg = widthpos } else { arg += 1 }
+            if arg >= nargs {
+                setErr(e, "22023", "too few arguments for format()")
+                return
+            }
+            if args.nulls[arg - 1] {
+                width = 0
+            } else {
+                let wb = args.vals[arg - 1]
+                let w = 0
+                let neg = false
+                let k = 0
+                if k < wb.length && wb[k] == 45 {
+                    neg = true
+                    k += 1
+                }
+                while k < wb.length && w < 1000000000 {
+                    w = w * 10 + (wb[k] - 48)
+                    k += 1
+                }
+                if neg {
+                    left = true
+                    if w > 2147483647 {
+                        setErr(e, "22003", "number is out of range")
+                        return
+                    }
+                }
+                width = w
+            }
+        }
+        if argpos > 0 { arg = argpos } else { arg += 1 }
+        if arg >= nargs {
+            setErr(e, "22023", "too few arguments for format()")
+            return
+        }
+        let isNull = args.nulls[arg - 1]
+        let val = args.vals[arg - 1]
+        let s = Bytes()
+        if t == 115 {
+            if !isNull { s.addBytes(val) }
+        } else if t == 73 {
+            if isNull {
+                setErr(e, "22004", "null values cannot be formatted as an SQL identifier")
+                return
+            }
+            quoteIdent(val, 0, val.length, s)
+        } else {
+            if isNull { s.addBytes(Bytes("NULL")) } else { quoteLiteral(val, 0, val.length, s) }
+        }
+        padTo(out, s, width, left)
+    }
+}
+
+// ---------------------------------------------------------------- SHA-2 / MD5
+
+function u32(x: Integer): Integer {
+    return x & 4294967295
+}
+
+function rotr32(x: Integer, n: Integer): Integer {
+    return ((x >> n) | (x << (32 - n))) & 4294967295
+}
+
+// logical shift right for 64-bit values
+function lsr(x: Integer, n: Integer): Integer {
+    if n == 0 { return x }
+    return (x >> n) & (9223372036854775807 >> (n - 1))
+}
+
+function rotr64(x: Integer, n: Integer): Integer {
+    return lsr(x, n) | (x << (64 - n))
+}
+
+constant K256 = "428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2"
+
+constant K512 = "428a2f98d728ae22 7137449123ef65cd b5c0fbcfec4d3b2f e9b5dba58189dbbc 3956c25bf348b538 59f111f1b605d019 923f82a4af194f9b ab1c5ed5da6d8118 d807aa98a3030242 12835b0145706fbe 243185be4ee4b28c 550c7dc3d5ffb4e2 72be5d74f27b896f 80deb1fe3b1696b1 9bdc06a725c71235 c19bf174cf692694 e49b69c19ef14ad2 efbe4786384f25e3 0fc19dc68b8cd5b5 240ca1cc77ac9c65 2de92c6f592b0275 4a7484aa6ea6e483 5cb0a9dcbd41fbd4 76f988da831153b5 983e5152ee66dfab a831c66d2db43210 b00327c898fb213f bf597fc7beef0ee4 c6e00bf33da88fc2 d5a79147930aa725 06ca6351e003826f 142929670a0e6e70 27b70a8546d22ffc 2e1b21385c26c926 4d2c6dfc5ac42aed 53380d139d95b3df 650a73548baf63de 766a0abb3c77b2a8 81c2c92e47edaee6 92722c851482353b a2bfe8a14cf10364 a81a664bbc423001 c24b8b70d0f89791 c76c51a30654be30 d192e819d6ef5218 d69906245565a910 f40e35855771202a 106aa07032bbd1b8 19a4c116b8d2d0c8 1e376c085141ab53 2748774cdf8eeb99 34b0bcb5e19b48a8 391c0cb3c5c95a63 4ed8aa4ae3418acb 5b9cca4f7763e373 682e6ff3d6b2b8a3 748f82ee5defb2fc 78a5636f43172f60 84c87814a1f0ab72 8cc702081a6439ec 90befffa23631e28 a4506cebde82bde9 bef9a3f7b2c67915 c67178f2e372532b ca273eceea26619c d186b8c721c0c207 eada7dd6cde0eb1e f57d4f7fee6ed178 06f067aa72176fba 0a637dc5a2c898a6 113f9804bef90dae 1b710b35131c471b 28db77f523047d84 32caab7b40c72493 3c9ebe0a15c9bebc 431d67c49c100d4c 4cc5d4becb3e42b6 597f299cfc657e2a 5fcb6fab3ad6faec 6c44198c4a475817"
+
+// Parse space-separated hex words into Integers (64-bit words wrap into negative values).
+function hexWords(t: Text): List<Integer> {
+    let b = Bytes(t)
+    let out: List<Integer> = []
+    let x = 0
+    let any = false
+    for c in b {
+        let d = hexVal(c)
+        if d >= 0 {
+            x = (x << 4) | d
+            any = true
+        } else if any {
+            out.add(x)
+            x = 0
+            any = false
+        }
+    }
+    if any { out.add(x) }
+    return out
+}
+
+// Message padded for a 64-byte (len128 false) or 128-byte block hash, length big-endian.
+function padMessage(b: Bytes, o: Integer, l: Integer, block: Integer, bigEndianLen: Boolean): Bytes {
+    let m = Bytes()
+    m.addBytes(b.slice(o, o + l))
+    m.add(128)
+    let lenBytes = 8
+    if block == 128 { lenBytes = 16 }
+    while (m.length + lenBytes) % block != 0 { m.add(0) }
+    let bitsLen = l * 8
+    if bigEndianLen {
+        let k = lenBytes - 1
+        while k >= 0 {
+            if k < 8 { m.add((bitsLen >> (k * 8)) & 255) } else { m.add(0) }
+            k -= 1
+        }
+    } else {
+        let k = 0
+        while k < 8 {
+            m.add((bitsLen >> (k * 8)) & 255)
+            k += 1
+        }
+    }
+    return m
+}
+
+function be32(m: Bytes, at: Integer): Integer {
+    return (m[at] << 24) | (m[at + 1] << 16) | (m[at + 2] << 8) | m[at + 3]
+}
+
+function be64(m: Bytes, at: Integer): Integer {
+    let x = 0
+    let i = 0
+    while i < 8 {
+        x = (x << 8) | m[at + i]
+        i += 1
+    }
+    return x
+}
+
+// SHA-224 (bits 224) or SHA-256 (bits 256); raw digest appended to out.
+public function sha256(bits: Integer, b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    let k = hexWords(K256)
+    let h: List<Integer> = hexWords("6a09e667 bb67ae85 3c6ef372 a54ff53a 510e527f 9b05688c 1f83d9ab 5be0cd19")
+    if bits == 224 { h = hexWords("c1059ed8 367cd507 3070dd17 f70e5939 ffc00b31 68581511 64f98fa7 befa4fa4") }
+    let m = padMessage(b, o, l, 64, true)
+    let w: List<Integer> = []
+    let i = 0
+    while i < 64 {
+        w.add(0)
+        i += 1
+    }
+    let blk = 0
+    while blk < m.length {
+        i = 0
+        while i < 16 {
+            w[i] = be32(m, blk + i * 4)
+            i += 1
+        }
+        while i < 64 {
+            let s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3)
+            let s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10)
+            w[i] = u32(w[i - 16] + s0 + w[i - 7] + s1)
+            i += 1
+        }
+        let a = h[0]
+        let bb = h[1]
+        let c = h[2]
+        let d = h[3]
+        let e = h[4]
+        let f = h[5]
+        let g = h[6]
+        let hh = h[7]
+        i = 0
+        while i < 64 {
+            let S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+            let ch = (e & f) ^ ((~e & 4294967295) & g)
+            let t1 = u32(hh + S1 + ch + k[i] + w[i])
+            let S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+            let mj = (a & bb) ^ (a & c) ^ (bb & c)
+            let t2 = u32(S0 + mj)
+            hh = g
+            g = f
+            f = e
+            e = u32(d + t1)
+            d = c
+            c = bb
+            bb = a
+            a = u32(t1 + t2)
+            i += 1
+        }
+        h[0] = u32(h[0] + a)
+        h[1] = u32(h[1] + bb)
+        h[2] = u32(h[2] + c)
+        h[3] = u32(h[3] + d)
+        h[4] = u32(h[4] + e)
+        h[5] = u32(h[5] + f)
+        h[6] = u32(h[6] + g)
+        h[7] = u32(h[7] + hh)
+        blk += 64
+    }
+    let words = 8
+    if bits == 224 { words = 7 }
+    i = 0
+    while i < words {
+        out.add((h[i] >> 24) & 255)
+        out.add((h[i] >> 16) & 255)
+        out.add((h[i] >> 8) & 255)
+        out.add(h[i] & 255)
+        i += 1
+    }
+}
+
+// SHA-384 (bits 384) or SHA-512 (bits 512).
+public function sha512(bits: Integer, b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    let k = hexWords(K512)
+    let h: List<Integer> = hexWords("6a09e667f3bcc908 bb67ae8584caa73b 3c6ef372fe94f82b a54ff53a5f1d36f1 510e527fade682d1 9b05688c2b3e6c1f 1f83d9abfb41bd6b 5be0cd19137e2179")
+    if bits == 384 {
+        h = hexWords("cbbb9d5dc1059ed8 629a292a367cd507 9159015a3070dd17 152fecd8f70e5939 67332667ffc00b31 8eb44a8768581511 db0c2e0d64f98fa7 47b5481dbefa4fa4")
+    }
+    let m = padMessage(b, o, l, 128, true)
+    let w: List<Integer> = []
+    let i = 0
+    while i < 80 {
+        w.add(0)
+        i += 1
+    }
+    let blk = 0
+    while blk < m.length {
+        i = 0
+        while i < 16 {
+            w[i] = be64(m, blk + i * 8)
+            i += 1
+        }
+        while i < 80 {
+            let s0 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8) ^ lsr(w[i - 15], 7)
+            let s1 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61) ^ lsr(w[i - 2], 6)
+            w[i] = wrappingAdd(wrappingAdd(w[i - 16], s0), wrappingAdd(w[i - 7], s1))
+            i += 1
+        }
+        let a = h[0]
+        let bb = h[1]
+        let c = h[2]
+        let d = h[3]
+        let e = h[4]
+        let f = h[5]
+        let g = h[6]
+        let hh = h[7]
+        i = 0
+        while i < 80 {
+            let S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+            let ch = (e & f) ^ (~e & g)
+            let t1 = wrappingAdd(wrappingAdd(wrappingAdd(hh, S1), wrappingAdd(ch, k[i])), w[i])
+            let S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+            let mj = (a & bb) ^ (a & c) ^ (bb & c)
+            let t2 = wrappingAdd(S0, mj)
+            hh = g
+            g = f
+            f = e
+            e = wrappingAdd(d, t1)
+            d = c
+            c = bb
+            bb = a
+            a = wrappingAdd(t1, t2)
+            i += 1
+        }
+        h[0] = wrappingAdd(h[0], a)
+        h[1] = wrappingAdd(h[1], bb)
+        h[2] = wrappingAdd(h[2], c)
+        h[3] = wrappingAdd(h[3], d)
+        h[4] = wrappingAdd(h[4], e)
+        h[5] = wrappingAdd(h[5], f)
+        h[6] = wrappingAdd(h[6], g)
+        h[7] = wrappingAdd(h[7], hh)
+        blk += 128
+    }
+    let words = 8
+    if bits == 384 { words = 6 }
+    i = 0
+    while i < words {
+        let sh = 56
+        while sh >= 0 {
+            out.add(lsr(h[i], sh) & 255)
+            sh -= 8
+        }
+        i += 1
+    }
+}
+
+constant MD5S = "07 0c 11 16 07 0c 11 16 07 0c 11 16 07 0c 11 16 05 09 0e 14 05 09 0e 14 05 09 0e 14 05 09 0e 14 04 0b 10 17 04 0b 10 17 04 0b 10 17 04 0b 10 17 06 0a 0f 15 06 0a 0f 15 06 0a 0f 15 06 0a 0f 15"
+
+constant MD5K = "d76aa478 e8c7b756 242070db c1bdceee f57c0faf 4787c62a a8304613 fd469501 698098d8 8b44f7af ffff5bb1 895cd7be 6b901122 fd987193 a679438e 49b40821 f61e2562 c040b340 265e5a51 e9b6c7aa d62f105d 02441453 d8a1e681 e7d3fbc8 21e1cde6 c33707d6 f4d50d87 455a14ed a9e3e905 fcefa3f8 676f02d9 8d2a4c8a fffa3942 8771f681 6d9d6122 fde5380c a4beea44 4bdecfa9 f6bb4b60 bebfbc70 289b7ec6 eaa127fa d4ef3085 04881d05 d9d4d039 e6db99e5 1fa27cf8 c4ac5665 f4292244 432aff97 ab9423a7 fc93a039 655b59c3 8f0ccc92 ffeff47d 85845dd1 6fa87e4f fe2ce6e0 a3014314 4e0811a1 f7537e82 bd3af235 2ad7d2bb eb86d391"
+
+function le32(m: Bytes, at: Integer): Integer {
+    return m[at] | (m[at + 1] << 8) | (m[at + 2] << 16) | (m[at + 3] << 24)
+}
+
+function rotl32(x: Integer, n: Integer): Integer {
+    return ((x << n) | (x >> (32 - n))) & 4294967295
+}
+
+// MD5 digest as 32 lower-case hex characters.
+public function md5Hex(b: Bytes, o: Integer, l: Integer, out: Bytes) {
+    let s = hexWords(MD5S)
+    let k = hexWords(MD5K)
+    let m = padMessage(b, o, l, 64, false)
+    let a0 = 1732584193
+    let b0 = 4023233417
+    let c0 = 2562383102
+    let d0 = 271733878
+    let blk = 0
+    while blk < m.length {
+        let a = a0
+        let bb = b0
+        let c = c0
+        let d = d0
+        let i = 0
+        while i < 64 {
+            let f = 0
+            let g = 0
+            if i < 16 {
+                f = (bb & c) | ((~bb & 4294967295) & d)
+                g = i
+            } else if i < 32 {
+                f = (d & bb) | ((~d & 4294967295) & c)
+                g = (5 * i + 1) % 16
+            } else if i < 48 {
+                f = bb ^ c ^ d
+                g = (3 * i + 5) % 16
+            } else {
+                f = c ^ (bb | (~d & 4294967295))
+                g = (7 * i) % 16
+            }
+            f = u32(f + a + k[i] + le32(m, blk + g * 4))
+            a = d
+            d = c
+            c = bb
+            bb = u32(bb + rotl32(f, s[i]))
+            i += 1
+        }
+        a0 = u32(a0 + a)
+        b0 = u32(b0 + bb)
+        c0 = u32(c0 + c)
+        d0 = u32(d0 + d)
+        blk += 64
+    }
+    for x in [a0, b0, c0, d0] {
+        addHexByte(out, x & 255)
+        addHexByte(out, (x >> 8) & 255)
+        addHexByte(out, (x >> 16) & 255)
+        addHexByte(out, (x >> 24) & 255)
+    }
+}

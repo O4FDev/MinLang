@@ -1,0 +1,4044 @@
+// SQL parser (PostgreSQL dialect) producing the AST arena described in docs/AST.md.
+// Recursive descent with PG operator precedence. On the first error the cursor jumps to EOF,
+// so every caller unwinds quickly; only the first error is reported.
+
+use "./ast.min" as ast
+use "./lexer.min" as lexer
+use "./keywords.min" as kw
+
+constant LP = 40
+constant RP = 41
+constant COMMA = 44
+constant SEMI = 59
+constant DOT = 46
+constant LB = 91
+constant RB = 93
+constant STAR = 42
+constant PLUS = 43
+constant MINUS = 45
+constant SLASH = 47
+constant PCT = 37
+constant CARET = 94
+constant EQ = 61
+constant LT = 60
+constant GT = 62
+constant COLON = 58
+// Nesting limit (parentheses, subqueries, unary chains, ...) and left-deep operator chain limit. Both keep the
+// parser and the engine's recursive tree walks well inside Minyar's maximum call depth (G14).
+constant MAX_DEPTH = 1000
+constant MAX_CHAIN = 5000
+
+record P {
+    toks: lexer.Tokens
+    pos: Integer
+    eof: Integer
+    tree: ast.Ast
+    failed: Boolean
+    error: Text
+    errorPos: Integer
+    sqlstate: Text
+    figStrength: Integer
+    empty: List<Integer>        // shared (never mutated) child list for leaf nodes
+    // the token at pos, cached as scalars so checks need no reference counting
+    curKind: Integer
+    curCode: Integer
+    curKw: Integer
+    curStart: Integer
+    depth: Integer
+}
+
+// ---------------------------------------------------------------- entry point
+
+public function parse(sql: Text): ast.ParseResult {
+    let toks = lexer.tokenize(sql)
+    let tree = ast.newAst()
+    if toks.error != "" {
+        return ast.ParseResult { ast: tree; ok: false; error: toks.error; errorPosition: toks.errorPos; sqlstate: toks.errorState }
+    }
+    let p = P {
+        toks: toks; pos: 0; eof: toks.count - 1; tree: tree; failed: false; error: ""; errorPos: -1
+        sqlstate: ""; figStrength: 0; empty: []; curKind: 0; curCode: 0; curKw: 0; curStart: 0; depth: 0
+    }
+    sync(p)
+    while true {
+        while acceptSym(p, SEMI) {}
+        if tk(p) == lexer.T_EOF { break }
+        let first = p.pos
+        let root = parseStatement(p)
+        if p.failed { break }
+        if !(isSym(p, SEMI) || tk(p) == lexer.T_EOF) {
+            syntaxError(p)
+            break
+        }
+        let last = p.pos - 1
+        tree.statements.add(root)
+        tree.stmtStart.add(lexer.startAt(toks, first))
+        tree.stmtEnd.add(lexer.charAt(toks, lexer.bendAt(toks, last)))
+        tree.stmtText.add(Text(toks.source.slice(lexer.bstartAt(toks, first), lexer.bendAt(toks, last))))
+    }
+    tree.paramCount = toks.maxParam
+    if p.failed {
+        return ast.ParseResult { ast: tree; ok: false; error: p.error; errorPosition: p.errorPos; sqlstate: p.sqlstate }
+    }
+    return ast.ParseResult { ast: tree; ok: true; error: ""; errorPosition: -1; sqlstate: "" }
+}
+
+// ---------------------------------------------------------------- token helpers
+
+// refresh the cached current-token fields after p.pos changes
+function sync(p: P) {
+    let o = p.pos * 32
+    let buf = p.toks.buf
+    p.curKind = buf[o]
+    p.curCode = buf.getUInt16(o + 2)
+    p.curKw = buf.getUInt16(o + 4)
+    p.curStart = buf.getInt32(o + 8)
+}
+
+function seek(p: P, pos: Integer) {
+    p.pos = pos
+    sync(p)
+}
+
+function tk(p: P): Integer {
+    return p.curKind
+}
+
+function tkAt(p: P, k: Integer): Integer {
+    let i = p.pos + k
+    if i > p.eof { i = p.eof }
+    return lexer.kindAt(p.toks, i)
+}
+
+function tcode(p: P): Integer {
+    return p.curCode
+}
+
+function ttext(p: P): Text {
+    return lexer.textAt(p.toks, p.pos)
+}
+
+function tkw(p: P): Integer {
+    return p.curKw
+}
+
+function tstart(p: P): Integer {
+    return p.curStart
+}
+
+function advance(p: P) {
+    if p.pos < p.eof {
+        p.pos += 1
+        sync(p)
+    }
+}
+
+function isKw(p: P, w: Integer): Boolean {
+    return p.curKw == w
+}
+
+function isKwAt(p: P, k: Integer, w: Integer): Boolean {
+    let i = p.pos + k
+    if i > p.eof { return false }
+    return lexer.kwAt(p.toks, i) == w
+}
+
+function acceptKw(p: P, w: Integer): Boolean {
+    if isKw(p, w) {
+        advance(p)
+        return true
+    }
+    return false
+}
+
+function expectKw(p: P, w: Integer) {
+    if !acceptKw(p, w) { syntaxError(p) }
+}
+
+function isSym(p: P, c: Integer): Boolean {
+    return p.curKind == lexer.T_OP && p.curCode == c
+}
+
+function isSymAt(p: P, k: Integer, c: Integer): Boolean {
+    let i = p.pos + k
+    if i > p.eof { return false }
+    return lexer.kindAt(p.toks, i) == lexer.T_OP && lexer.codeAt(p.toks, i) == c
+}
+
+function acceptSym(p: P, c: Integer): Boolean {
+    if isSym(p, c) {
+        advance(p)
+        return true
+    }
+    return false
+}
+
+function expectSym(p: P, c: Integer) {
+    if !acceptSym(p, c) { syntaxError(p) }
+}
+
+function syntaxError(p: P) {
+    if p.failed { return }
+    if tk(p) == lexer.T_EOF {
+        failAt(p, "syntax error at end of input", p.toks.charLength, "42601")
+        return
+    }
+    let b = p.toks.source.slice(lexer.bstartAt(p.toks, p.pos), lexer.bendAt(p.toks, p.pos))
+    failAt(p, "syntax error at or near \"" + Text(b) + "\"", tstart(p), "42601")
+}
+
+function unsupported(p: P, what: Text) {
+    failAt(p, what + " is not supported", tstart(p), "0A000")
+}
+
+function depthError(p: P) {
+    failAt(p, "stack depth limit exceeded", tstart(p), "54001")
+}
+
+// counts one more link of a left-deep operator chain; false (and an error) when too long
+function chainOk(p: P, n: Integer): Boolean {
+    if n > MAX_CHAIN {
+        depthError(p)
+        return false
+    }
+    return true
+}
+
+function failAt(p: P, message: Text, position: Integer, state: Text) {
+    if p.failed { return }
+    p.failed = true
+    p.error = message
+    p.errorPos = position
+    p.sqlstate = state
+    seek(p, p.eof)
+}
+
+// identifier usable as a column / table name (ColId)
+function isColId(p: P): Boolean {
+    let k = tk(p)
+    return k == lexer.T_QIDENT || (k == lexer.T_IDENT && tcode(p) == lexer.KW_NONE)
+}
+
+function isColIdAt(p: P, k: Integer): Boolean {
+    let i = p.pos + k
+    if i > p.eof { return false }
+    let kind = lexer.kindAt(p.toks, i)
+    return kind == lexer.T_QIDENT || (kind == lexer.T_IDENT && lexer.codeAt(p.toks, i) == lexer.KW_NONE)
+}
+
+function parseColId(p: P): Text {
+    if isColId(p) {
+        let t = ttext(p)
+        advance(p)
+        return t
+    }
+    syntaxError(p)
+    return ""
+}
+
+// any identifier or keyword (ColLabel)
+function isLabel(p: P): Boolean {
+    let k = tk(p)
+    return k == lexer.T_QIDENT || k == lexer.T_IDENT
+}
+
+function parseLabel(p: P): Text {
+    if isLabel(p) {
+        let t = ttext(p)
+        advance(p)
+        return t
+    }
+    syntaxError(p)
+    return ""
+}
+
+// ---------------------------------------------------------------- node helpers
+
+function mk(p: P, kind: Integer, op: Integer, text: Text, pos: Integer, children: List<Integer>): Integer {
+    return ast.addNode(p.tree, kind, op, text, pos, children)
+}
+
+function mkf(p: P, kind: Integer, op: Integer, text: Text, pos: Integer, children: List<Integer>, flags: Integer): Integer {
+    let id = ast.addNode(p.tree, kind, op, text, pos, children)
+    p.tree.nodes[id].flags = flags
+    return id
+}
+
+function setFlag(p: P, id: Integer, f: Integer) {
+    if id >= 0 { p.tree.nodes[id].flags = p.tree.nodes[id].flags | f }
+}
+
+function setInt(p: P, id: Integer, v: Integer) {
+    if id >= 0 { p.tree.nodes[id].intValue = v }
+}
+
+function setSlot(p: P, id: Integer, slot: Integer, v: Integer) {
+    if id >= 0 && slot < p.tree.nodes[id].children.length { p.tree.nodes[id].children[slot] = v }
+}
+
+function slot(p: P, id: Integer, i: Integer): Integer {
+    return ast.child(p.tree, id, i)
+}
+
+function kindOf(p: P, id: Integer): Integer {
+    return ast.kind(p.tree, id)
+}
+
+function mkName(p: P, text: Text, pos: Integer): Integer {
+    return mk(p, ast.K_NAME, 0, text, pos, p.empty)
+}
+
+function mkList(p: P, items: List<Integer>, pos: Integer): Integer {
+    return mk(p, ast.K_LIST, 0, "", pos, items)
+}
+
+function mkInt(p: P, v: Integer, pos: Integer): Integer {
+    let id = mk(p, ast.K_INT_LIT, 0, Text(v), pos, p.empty)
+    setInt(p, id, v)
+    return id
+}
+
+function mkStr(p: P, v: Text, pos: Integer): Integer {
+    return mk(p, ast.K_STR_LIT, 0, v, pos, p.empty)
+}
+
+// ---------------------------------------------------------------- statements
+
+function parseStatement(p: P): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseStatementInner(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseStatementInner(p: P): Integer {
+    if isSym(p, LP) { return parseQuery(p) }
+    if tk(p) != lexer.T_IDENT {
+        syntaxError(p)
+        return -1
+    }
+    let w = tkw(p)
+    if w == kw.SELECT || w == kw.VALUES || w == kw.TABLE { return parseQuery(p) }
+    if w == kw.WITH { return parseWithStatement(p) }
+    if w == kw.INSERT { return parseInsert(p, -1) }
+    if w == kw.UPDATE { return parseUpdate(p, -1) }
+    if w == kw.DELETE { return parseDelete(p, -1) }
+    if w == kw.CREATE { return parseCreate(p) }
+    if w == kw.DROP { return parseDrop(p) }
+    if w == kw.ALTER { return parseAlter(p) }
+    if w == kw.TRUNCATE { return parseTruncate(p) }
+    if w == kw.BEGIN || w == kw.START || w == kw.COMMIT || w == kw.END || w == kw.ROLLBACK || w == kw.ABORT ||
+        w == kw.SAVEPOINT || w == kw.RELEASE {
+        return parseTransaction(p)
+    }
+    if w == kw.PREPARE {
+        if isKwAt(p, 1, kw.TRANSACTION) { return parseTransaction(p) }
+        return parsePrepare(p)
+    }
+    if w == kw.SET { return parseSet(p) }
+    if w == kw.SHOW { return parseShow(p) }
+    if w == kw.RESET { return parseReset(p) }
+    if w == kw.VACUUM { return parseVacuum(p) }
+    if w == kw.ANALYZE || w == kw.ANALYSE { return parseAnalyze(p) }
+    if w == kw.CHECKPOINT {
+        let pos = tstart(p)
+        advance(p)
+        return mk(p, ast.K_CHECKPOINT, 0, "", pos, p.empty)
+    }
+    if w == kw.COPY { return parseCopy(p) }
+    if w == kw.EXPLAIN { return parseExplain(p) }
+    if w == kw.DISCARD { return parseDiscard(p) }
+    if w == kw.DEALLOCATE { return parseDeallocate(p) }
+    if w == kw.EXECUTE { return parseExecute(p) }
+    if w == kw.LOCK { return parseLock(p) }
+    if w == kw.LISTEN || w == kw.UNLISTEN || w == kw.NOTIFY { return parseListen(p) }
+    if w == kw.COMMENT { return parseComment(p) }
+    if w == kw.DECLARE { return parseDeclare(p) }
+    if w == kw.FETCH || w == kw.MOVE { return parseFetch(p) }
+    if w == kw.CLOSE { return parseClose(p) }
+    if w == kw.GRANT || w == kw.REVOKE || w == kw.DO || w == kw.REINDEX || w == kw.CLUSTER || w == kw.REFRESH ||
+        w == kw.SECURITY || w == kw.IMPORT || w == kw.LOAD || w == kw.CALL || w == kw.MERGE || w == kw.REASSIGN {
+        unsupported(p, ttext(p))
+        return -1
+    }
+    syntaxError(p)
+    return -1
+}
+
+// ---------------------------------------------------------------- cursors
+
+// Non-keyword word (plain identifier) at the cursor, e.g. "cursor", "scroll".
+function isWord(p: P, w: Text): Boolean {
+    return tk(p) == lexer.T_IDENT && tcode(p) == lexer.KW_NONE && ttext(p) == w
+}
+
+function acceptWord(p: P, w: Text): Boolean {
+    if isWord(p, w) {
+        advance(p)
+        return true
+    }
+    return false
+}
+
+function parseDeclare(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    let name = parseColId(p)
+    let flags = 0
+    while !p.failed {
+        if acceptKw(p, kw.BINARY) {
+            flags = flags | ast.F_CUR_BINARY
+        } else if acceptWord(p, "insensitive") || acceptWord(p, "asensitive") {
+        } else if isKw(p, kw.NO) && tkAt(p, 1) == lexer.T_IDENT && p.pos + 1 <= p.eof && lexer.textAt(p.toks, p.pos + 1) == "scroll" {
+            advance(p)
+            advance(p)
+            flags = flags | ast.F_CUR_NO_SCROLL
+        } else if acceptWord(p, "scroll") {
+            flags = flags | ast.F_CUR_SCROLL
+        } else {
+            break
+        }
+    }
+    if !acceptWord(p, "cursor") {
+        syntaxError(p)
+        return -1
+    }
+    if isKw(p, kw.WITH) || isKw(p, kw.WITHOUT) {
+        let with = isKw(p, kw.WITH)
+        advance(p)
+        if !acceptWord(p, "hold") {
+            syntaxError(p)
+            return -1
+        }
+        if with { flags = flags | ast.F_CUR_HOLD }
+    }
+    expectKw(p, kw.FOR)
+    if p.failed { return -1 }
+    let q = parseQuery(p)
+    return mkf(p, ast.K_DECLARE, 0, name, pos, [q], flags)
+}
+
+// Signed integer count of FETCH / MOVE.
+function parseFetchCount(p: P): Integer {
+    let neg = false
+    if acceptSym(p, MINUS) { neg = true } else { acceptSym(p, PLUS) }
+    if tk(p) != lexer.T_INT {
+        syntaxError(p)
+        return 0
+    }
+    let x = lexer.ivalAt(p.toks, p.pos)
+    advance(p)
+    if neg { return -x }
+    return x
+}
+
+function isFetchCountStart(p: P): Boolean {
+    return tk(p) == lexer.T_INT || ((isSym(p, MINUS) || isSym(p, PLUS)) && tkAt(p, 1) == lexer.T_INT)
+}
+
+function parseFetch(p: P): Integer {
+    let pos = tstart(p)
+    let flags = 0
+    if isKw(p, kw.MOVE) { flags = ast.F_FETCH_MOVE }
+    advance(p)
+    let op = ast.FETCH_FORWARD
+    let count = 1
+    if acceptKw(p, kw.NEXT) {
+    } else if acceptWord(p, "prior") {
+        op = ast.FETCH_BACKWARD
+    } else if acceptKw(p, kw.FIRST) {
+        op = ast.FETCH_ABSOLUTE
+    } else if acceptKw(p, kw.LAST) {
+        op = ast.FETCH_ABSOLUTE
+        count = -1
+    } else if acceptWord(p, "absolute") {
+        op = ast.FETCH_ABSOLUTE
+        count = parseFetchCount(p)
+    } else if acceptWord(p, "relative") {
+        op = ast.FETCH_RELATIVE
+        count = parseFetchCount(p)
+    } else if acceptKw(p, kw.ALL) {
+        flags = flags | ast.F_FETCH_ALL
+    } else if isWord(p, "forward") || isWord(p, "backward") {
+        if isWord(p, "backward") { op = ast.FETCH_BACKWARD }
+        advance(p)
+        if acceptKw(p, kw.ALL) {
+            flags = flags | ast.F_FETCH_ALL
+        } else if isFetchCountStart(p) {
+            count = parseFetchCount(p)
+        }
+    } else if isFetchCountStart(p) {
+        count = parseFetchCount(p)
+    }
+    if !acceptKw(p, kw.FROM) { acceptKw(p, kw.IN) }
+    let name = parseColId(p)
+    let id = mkf(p, ast.K_FETCH, op, name, pos, p.empty, flags)
+    setInt(p, id, count)
+    return id
+}
+
+function parseClose(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    if acceptKw(p, kw.ALL) { return mkf(p, ast.K_CLOSE, 0, "", pos, p.empty, ast.F_ALL) }
+    let name = parseColId(p)
+    return mk(p, ast.K_CLOSE, 0, name, pos, p.empty)
+}
+
+function parseWithStatement(p: P): Integer {
+    let w = parseWith(p)
+    if isKw(p, kw.INSERT) { return parseInsert(p, w) }
+    if isKw(p, kw.UPDATE) { return parseUpdate(p, w) }
+    if isKw(p, kw.DELETE) { return parseDelete(p, w) }
+    let body = parseSetOpUnion(p)
+    parseQueryTail(p, body)
+    attachWith(p, body, w)
+    return body
+}
+
+// ---------------------------------------------------------------- queries
+
+// True if the tokens at p.pos (after any number of '(') start a query.
+function isQueryStart(p: P): Boolean {
+    let i = p.pos
+    while i < p.eof && lexer.kindAt(p.toks, i) == lexer.T_OP && lexer.codeAt(p.toks, i) == LP { i += 1 }
+    let w = lexer.kwAt(p.toks, i)
+    return w == kw.SELECT || w == kw.VALUES || w == kw.WITH || w == kw.TABLE
+}
+
+function parseQuery(p: P): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseQueryInner(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseQueryInner(p: P): Integer {
+    let w = -1
+    if isKw(p, kw.WITH) { w = parseWith(p) }
+    let body = parseSetOpUnion(p)
+    parseQueryTail(p, body)
+    attachWith(p, body, w)
+    return body
+}
+
+function attachWith(p: P, body: Integer, w: Integer) {
+    if w < 0 || body < 0 { return }
+    if slot(p, body, ast.Q_WITH) >= 0 {
+        failAt(p, "multiple WITH clauses not allowed", p.tree.nodes[w].position, "42601")
+        return
+    }
+    setSlot(p, body, ast.Q_WITH, w)
+}
+
+function parseWith(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.WITH)
+    let flags = 0
+    if acceptKw(p, kw.RECURSIVE) { flags = ast.F_RECURSIVE }
+    let ctes: List<Integer> = []
+    while !p.failed {
+        let cpos = tstart(p)
+        let name = parseColId(p)
+        let cols = -1
+        if isSym(p, LP) { cols = parseNameList(p) }
+        expectKw(p, kw.AS)
+        let cflags = 0
+        if acceptKw(p, kw.MATERIALIZED) {
+            cflags = ast.F_MATERIALIZED
+        } else if isKw(p, kw.NOT) && isKwAt(p, 1, kw.MATERIALIZED) {
+            advance(p)
+            advance(p)
+            cflags = ast.F_NOT_MATERIALIZED
+        }
+        expectSym(p, LP)
+        let q = -1
+        if isKw(p, kw.INSERT) {
+            q = parseInsert(p, -1)
+        } else if isKw(p, kw.UPDATE) {
+            q = parseUpdate(p, -1)
+        } else if isKw(p, kw.DELETE) {
+            q = parseDelete(p, -1)
+        } else {
+            q = parseQuery(p)
+        }
+        expectSym(p, RP)
+        // SEARCH / CYCLE clauses are not supported
+        ctes.add(mkf(p, ast.K_CTE, 0, name, cpos, [q, cols], cflags))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkf(p, ast.K_WITH, 0, "", pos, [mkList(p, ctes, pos)], flags)
+}
+
+function parseSetOpUnion(p: P): Integer {
+    let l = parseSetOpIntersect(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && (isKw(p, kw.UNION) || isKw(p, kw.EXCEPT)) {
+        n += 1
+        let pos = tstart(p)
+        let op = ast.SETOP_UNION
+        if isKw(p, kw.EXCEPT) { op = ast.SETOP_EXCEPT }
+        advance(p)
+        let flags = 0
+        if acceptKw(p, kw.ALL) {
+            flags = ast.F_ALL
+        } else {
+            acceptKw(p, kw.DISTINCT)
+        }
+        let r = parseSetOpIntersect(p)
+        l = mkf(p, ast.K_SET_OP, op, "", pos, [l, r, -1, -1, -1, -1, -1, -1, -1, -1, -1], flags)
+    }
+    return l
+}
+
+function parseSetOpIntersect(p: P): Integer {
+    let l = parseSimpleQuery(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && isKw(p, kw.INTERSECT) {
+        n += 1
+        let pos = tstart(p)
+        advance(p)
+        let flags = 0
+        if acceptKw(p, kw.ALL) {
+            flags = ast.F_ALL
+        } else {
+            acceptKw(p, kw.DISTINCT)
+        }
+        let r = parseSimpleQuery(p)
+        l = mkf(p, ast.K_SET_OP, ast.SETOP_INTERSECT, "", pos, [l, r, -1, -1, -1, -1, -1, -1, -1, -1, -1], flags)
+    }
+    return l
+}
+
+function parseSimpleQuery(p: P): Integer {
+    if isSym(p, LP) {
+        advance(p)
+        let q = parseQuery(p)
+        expectSym(p, RP)
+        return q
+    }
+    if isKw(p, kw.SELECT) { return parseSelectCore(p) }
+    if isKw(p, kw.VALUES) { return parseValues(p) }
+    if isKw(p, kw.TABLE) {
+        let pos = tstart(p)
+        advance(p)
+        let t = parseRelation(p, false)
+        let star = mk(p, ast.K_STAR, 0, "", pos, p.empty)
+        let target = mk(p, ast.K_TARGET, 0, "*", pos, [star])
+        return mk(p, ast.K_SELECT, 0, "", pos,
+            [mkList(p, [target], pos), mkList(p, [t], pos), -1, -1, -1, -1, -1, -1, -1, -1, -1])
+    }
+    syntaxError(p)
+    return -1
+}
+
+// ORDER BY / LIMIT / OFFSET / FETCH / FOR UPDATE after a query body.
+function parseQueryTail(p: P, q: Integer) {
+    while !p.failed {
+        if isKw(p, kw.ORDER) && isKwAt(p, 1, kw.BY) {
+            let pos = tstart(p)
+            advance(p)
+            advance(p)
+            let list = parseSortList(p)
+            if slot(p, q, ast.Q_ORDER_BY) >= 0 {
+                failAt(p, "multiple ORDER BY clauses not allowed", pos, "42601")
+                return
+            }
+            setSlot(p, q, ast.Q_ORDER_BY, list)
+        } else if isKw(p, kw.LIMIT) {
+            let pos = tstart(p)
+            advance(p)
+            let e = -1
+            if !acceptKw(p, kw.ALL) { e = parseExpr(p) }
+            if isSym(p, COMMA) {
+                failAt(p, "LIMIT #,# syntax is not supported", pos, "42601")
+                return
+            }
+            if slot(p, q, ast.Q_LIMIT) >= 0 {
+                failAt(p, "multiple LIMIT clauses not allowed", pos, "42601")
+                return
+            }
+            setSlot(p, q, ast.Q_LIMIT, e)
+        } else if isKw(p, kw.OFFSET) {
+            let pos = tstart(p)
+            advance(p)
+            let e = parseExpr(p)
+            if !acceptKw(p, kw.ROWS) { acceptKw(p, kw.ROW) }
+            if slot(p, q, ast.Q_OFFSET) >= 0 {
+                failAt(p, "multiple OFFSET clauses not allowed", pos, "42601")
+                return
+            }
+            setSlot(p, q, ast.Q_OFFSET, e)
+        } else if isKw(p, kw.FETCH) {
+            let pos = tstart(p)
+            advance(p)
+            if !acceptKw(p, kw.FIRST) { expectKw(p, kw.NEXT) }
+            let e = -1
+            if isKw(p, kw.ROW) || isKw(p, kw.ROWS) {
+                e = mkInt(p, 1, pos)
+            } else {
+                e = parseUnary(p)
+            }
+            if !acceptKw(p, kw.ROWS) { expectKw(p, kw.ROW) }
+            if acceptKw(p, kw.WITH) {
+                expectKw(p, kw.TIES)
+                setFlag(p, q, ast.F_WITH_TIES)
+            } else {
+                expectKw(p, kw.ONLY)
+            }
+            if slot(p, q, ast.Q_LIMIT) >= 0 {
+                failAt(p, "multiple LIMIT clauses not allowed", pos, "42601")
+                return
+            }
+            setSlot(p, q, ast.Q_LIMIT, e)
+        } else if isKw(p, kw.FOR) && (isKwAt(p, 1, kw.UPDATE) || isKwAt(p, 1, kw.SHARE) || isKwAt(p, 1, kw.NO) || isKwAt(p, 1, kw.KEY)) {
+            advance(p)
+            if acceptKw(p, kw.UPDATE) {
+                setFlag(p, q, ast.F_FOR_UPDATE)
+            } else if acceptKw(p, kw.SHARE) {
+                setFlag(p, q, ast.F_FOR_SHARE)
+            } else if acceptKw(p, kw.NO) {
+                expectKw(p, kw.KEY)
+                expectKw(p, kw.UPDATE)
+                setFlag(p, q, ast.F_FOR_NO_KEY_UPDATE)
+            } else {
+                expectKw(p, kw.KEY)
+                expectKw(p, kw.SHARE)
+                setFlag(p, q, ast.F_FOR_KEY_SHARE)
+            }
+            if acceptKw(p, kw.OF) {
+                parseRelation(p, false)
+                while acceptSym(p, COMMA) { parseRelation(p, false) }
+            }
+            if acceptKw(p, kw.NOWAIT) {
+                setFlag(p, q, ast.F_NOWAIT)
+            } else if isKw(p, kw.SKIP) {
+                advance(p)
+                expectKw(p, kw.LOCKED)
+                setFlag(p, q, ast.F_SKIP_LOCKED)
+            }
+        } else if isKw(p, kw.FOR) && isKwAt(p, 1, kw.READ) && isKwAt(p, 2, kw.ONLY) {
+            advance(p)
+            advance(p)
+            advance(p)
+        } else {
+            return
+        }
+    }
+}
+
+function selectTargetsEnd(p: P): Boolean {
+    let k = tk(p)
+    if k == lexer.T_EOF { return true }
+    if k == lexer.T_OP { return isSym(p, SEMI) || isSym(p, RP) }
+    if k != lexer.T_IDENT { return false }
+    let w = tkw(p)
+    return w == kw.FROM || w == kw.WHERE || w == kw.GROUP || w == kw.HAVING || w == kw.ORDER || w == kw.LIMIT ||
+        w == kw.OFFSET || w == kw.UNION || w == kw.INTERSECT || w == kw.EXCEPT || w == kw.WINDOW || w == kw.FOR ||
+        w == kw.FETCH || w == kw.INTO
+}
+
+function parseSelectCore(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.SELECT)
+    let flags = 0
+    let distinctOn = -1
+    if acceptKw(p, kw.DISTINCT) {
+        if acceptKw(p, kw.ON) {
+            expectSym(p, LP)
+            distinctOn = parseExprList(p)
+            expectSym(p, RP)
+            flags = ast.F_DISTINCT_ON
+        } else {
+            flags = ast.F_DISTINCT
+        }
+    } else {
+        acceptKw(p, kw.ALL)
+    }
+    let targets = -1
+    if selectTargetsEnd(p) {
+        targets = mkList(p, [], pos)
+    } else {
+        targets = parseTargetList(p)
+    }
+    if isKw(p, kw.INTO) {
+        advance(p)
+        if !acceptKw(p, kw.TEMPORARY) && !acceptKw(p, kw.TEMP) { acceptKw(p, kw.UNLOGGED) }
+        acceptKw(p, kw.TABLE)
+        parseRelation(p, false)
+        flags = flags | ast.F_SELECT_INTO
+    }
+    let from = -1
+    if acceptKw(p, kw.FROM) { from = parseFromList(p) }
+    let where = -1
+    if acceptKw(p, kw.WHERE) { where = parseExpr(p) }
+    let group = -1
+    if isKw(p, kw.GROUP) {
+        advance(p)
+        expectKw(p, kw.BY)
+        if !acceptKw(p, kw.ALL) { acceptKw(p, kw.DISTINCT) }
+        group = parseGroupList(p)
+    }
+    let having = -1
+    if acceptKw(p, kw.HAVING) { having = parseExpr(p) }
+    let windows = -1
+    if isKw(p, kw.WINDOW) {
+        let wpos = tstart(p)
+        advance(p)
+        let defs: List<Integer> = []
+        while !p.failed {
+            let npos = tstart(p)
+            let name = parseColId(p)
+            expectKw(p, kw.AS)
+            defs.add(parseWindowSpec(p, name, npos))
+            if !acceptSym(p, COMMA) { break }
+        }
+        windows = mkList(p, defs, wpos)
+    }
+    return mkf(p, ast.K_SELECT, 0, "", pos, [targets, from, where, group, having, -1, -1, -1, distinctOn, -1, windows], flags)
+}
+
+function parseGroupList(p: P): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseGroupListInner(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseGroupListInner(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = []
+    while !p.failed {
+        let gpos = tstart(p)
+        if (isKw(p, kw.ROLLUP) || isKw(p, kw.CUBE)) && isSymAt(p, 1, LP) {
+            let op = ast.GSET_ROLLUP
+            if isKw(p, kw.CUBE) { op = ast.GSET_CUBE }
+            advance(p)
+            advance(p)
+            let list = parseExprList(p)
+            expectSym(p, RP)
+            items.add(mk(p, ast.K_GROUPING_SET, op, "", gpos, [list]))
+        } else if isKw(p, kw.GROUPING) && isKwAt(p, 1, kw.SETS) {
+            advance(p)
+            advance(p)
+            expectSym(p, LP)
+            let list = parseGroupList(p)
+            expectSym(p, RP)
+            items.add(mk(p, ast.K_GROUPING_SET, ast.GSET_SETS, "", gpos, [list]))
+        } else if isSym(p, LP) && isSymAt(p, 1, RP) {
+            advance(p)
+            advance(p)
+            items.add(mk(p, ast.K_GROUPING_SET, ast.GSET_EMPTY, "", gpos, [mkList(p, [], gpos)]))
+        } else {
+            items.add(parseExpr(p))
+        }
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, items, pos)
+}
+
+function parseTargetList(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = []
+    while !p.failed {
+        let tpos = tstart(p)
+        let e = -1
+        if isSym(p, STAR) {
+            advance(p)
+            e = mk(p, ast.K_STAR, 0, "", tpos, p.empty)
+        } else {
+            e = parseExpr(p)
+        }
+        let name = ""
+        let flags = 0
+        if acceptKw(p, kw.AS) {
+            name = parseLabel(p)
+            flags = ast.F_TARGET_ALIAS
+        } else if isColId(p) {
+            name = ttext(p)
+            advance(p)
+            flags = ast.F_TARGET_ALIAS
+        } else if kindOf(p, e) == ast.K_STAR {
+            name = "*"
+        } else {
+            name = figureName(p, e)
+            if name == "" { name = "?column?" }
+        }
+        items.add(mkf(p, ast.K_TARGET, 0, name, tpos, [e], flags))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, items, pos)
+}
+
+// PG's FigureColname. Returns "" when no name; p.figStrength = 2 strong, 1 weak.
+function figureName(p: P, e: Integer): Text {
+    p.figStrength = 0
+    if e < 0 { return "" }
+    let n = p.tree.nodes[e]
+    let k = n.kind
+    if k == ast.K_COLUMN_REF || k == ast.K_FUNC_CALL || k == ast.K_FIELD_SELECT {
+        p.figStrength = 2
+        return n.text
+    }
+    if k == ast.K_CAST {
+        let inner = figureName(p, n.children[0])
+        if p.figStrength > 0 { return inner }
+        p.figStrength = 1
+        return ast.text(p.tree, n.children[1])
+    }
+    if k == ast.K_BOOL_LIT {
+        p.figStrength = 1
+        return "bool"
+    }
+    if k == ast.K_CASE {
+        let inner = figureName(p, n.children[2])
+        if p.figStrength == 2 { return inner }
+        p.figStrength = 1
+        return "case"
+    }
+    if k == ast.K_ARRAY_EXPR || k == ast.K_ARRAY_SUBQUERY {
+        p.figStrength = 2
+        return "array"
+    }
+    if k == ast.K_ROW_EXPR {
+        p.figStrength = 2
+        return "row"
+    }
+    if k == ast.K_EXISTS {
+        p.figStrength = 2
+        return "exists"
+    }
+    if k == ast.K_SUBQUERY_EXPR {
+        let q = n.children[0]
+        while kindOf(p, q) == ast.K_SET_OP { q = slot(p, q, 0) }
+        if kindOf(p, q) == ast.K_SELECT {
+            let targets = ast.items(p.tree, slot(p, q, 0))
+            if targets.length > 0 {
+                let name = ast.text(p.tree, targets[0])
+                if name != "?column?" && name != "" {
+                    p.figStrength = 2
+                    return name
+                }
+            }
+        }
+        return ""
+    }
+    if k == ast.K_SUBSCRIPT || k == ast.K_COLLATE {
+        return figureName(p, n.children[0])
+    }
+    return ""
+}
+
+function parseFromList(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = [parseTableRef(p)]
+    while !p.failed && acceptSym(p, COMMA) { items.add(parseTableRef(p)) }
+    return mkList(p, items, pos)
+}
+
+function parseTableRef(p: P): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseTableRefInner(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseTableRefInner(p: P): Integer {
+    let l = parseTablePrimary(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) {
+        n += 1
+        let pos = tstart(p)
+        if isKw(p, kw.CROSS) && isKwAt(p, 1, kw.JOIN) {
+            advance(p)
+            advance(p)
+            let r = parseTablePrimary(p)
+            l = mk(p, ast.K_JOIN, ast.JOIN_CROSS, "", pos, [l, r, -1, -1, -1])
+            continue
+        }
+        let natural = false
+        if isKw(p, kw.NATURAL) {
+            natural = true
+            advance(p)
+        }
+        let jt = 0
+        if isKw(p, kw.JOIN) {
+            jt = ast.JOIN_INNER
+        } else if isKw(p, kw.INNER) {
+            advance(p)
+            jt = ast.JOIN_INNER
+        } else if isKw(p, kw.LEFT) || isKw(p, kw.RIGHT) || isKw(p, kw.FULL) {
+            jt = ast.JOIN_LEFT
+            if isKw(p, kw.RIGHT) { jt = ast.JOIN_RIGHT }
+            if isKw(p, kw.FULL) { jt = ast.JOIN_FULL }
+            advance(p)
+            acceptKw(p, kw.OUTER)
+        } else {
+            if natural { syntaxError(p) }
+            break
+        }
+        expectKw(p, kw.JOIN)
+        let r = parseTablePrimary(p)
+        let on = -1
+        let using = -1
+        let alias = -1
+        let flags = 0
+        if natural {
+            flags = ast.F_NATURAL
+        } else if acceptKw(p, kw.ON) {
+            on = parseExpr(p)
+        } else if acceptKw(p, kw.USING) {
+            using = parseNameList(p)
+            if isKw(p, kw.AS) {
+                let apos = tstart(p)
+                advance(p)
+                alias = mk(p, ast.K_ALIAS, 0, parseColId(p), apos, [-1])
+            }
+        } else {
+            syntaxError(p)
+        }
+        l = mkf(p, ast.K_JOIN, jt, "", pos, [l, r, on, using, alias], flags)
+    }
+    return l
+}
+
+function parseTablePrimary(p: P): Integer {
+    let pos = tstart(p)
+    let flags = 0
+    if acceptKw(p, kw.LATERAL) { flags = ast.F_LATERAL }
+    if isSym(p, LP) {
+        let save = p.pos
+        advance(p)
+        if isQueryStart(p) {
+            seek(p, save)
+            // parenthesised query (possibly with set operations)
+            let q = parseSetOpUnion(p)
+            parseQueryTail(p, q)
+            let alias = parseAlias(p)
+            return mkf(p, ast.K_SUBQUERY_REF, 0, "", pos, [q, alias], flags)
+        }
+        let j = parseTableRef(p)
+        expectSym(p, RP)
+        if kindOf(p, j) == ast.K_JOIN {
+            let alias = parseAlias(p)
+            if alias >= 0 { setSlot(p, j, 4, alias) }
+        }
+        return j
+    }
+    let only = false
+    if acceptKw(p, kw.ONLY) { only = true }
+    if !isColId(p) && !(tk(p) == lexer.T_IDENT && tcode(p) == lexer.KW_TYPE_FUNC && isSymAt(p, 1, LP)) {
+        syntaxError(p)
+        return -1
+    }
+    let name = ttext(p)
+    let npos = tstart(p)
+    advance(p)
+    let schema = -1
+    if isSym(p, DOT) {
+        advance(p)
+        let spos = npos
+        let second = parseLabel(p)
+        if isSym(p, DOT) {
+            // catalog.schema.name: drop the catalog
+            advance(p)
+            spos = npos
+            schema = mkName(p, second, spos)
+            name = parseLabel(p)
+        } else {
+            schema = mkName(p, name, spos)
+            name = second
+        }
+    }
+    if isSym(p, LP) {
+        let f = parseFuncCall(p, name, schema, npos)
+        if isKw(p, kw.WITH) && isKwAt(p, 1, kw.ORDINALITY) {
+            advance(p)
+            advance(p)
+            flags = flags | ast.F_WITH_ORDINALITY
+        }
+        let alias = parseAlias(p)
+        return mkf(p, ast.K_FUNC_REF, 0, "", pos, [f, alias], flags)
+    }
+    acceptSym(p, STAR)
+    let alias = parseAlias(p)
+    let tflags = 0
+    if only { tflags = ast.F_ONLY }
+    return mkf(p, ast.K_TABLE_REF, 0, name, npos, [schema, alias], tflags)
+}
+
+// [AS] alias [(col, ...)] or -1
+function parseAlias(p: P): Integer {
+    let pos = tstart(p)
+    let name = ""
+    if acceptKw(p, kw.AS) {
+        name = parseColId(p)
+    } else if isColId(p) && !isKw(p, kw.SET) {
+        name = ttext(p)
+        advance(p)
+    } else {
+        return -1
+    }
+    let cols = -1
+    if isSym(p, LP) { cols = parseNameList(p) }
+    return mk(p, ast.K_ALIAS, 0, name, pos, [cols])
+}
+
+// qualified relation name -> K_TABLE_REF (no alias); allowAlias parses [AS] alias too
+function parseRelation(p: P, allowAlias: Boolean): Integer {
+    let pos = tstart(p)
+    let flags = 0
+    if acceptKw(p, kw.ONLY) { flags = ast.F_ONLY }
+    let name = parseColId(p)
+    let schema = -1
+    if isSym(p, DOT) {
+        advance(p)
+        let second = parseLabel(p)
+        if isSym(p, DOT) {
+            advance(p)
+            schema = mkName(p, second, pos)
+            name = parseLabel(p)
+        } else {
+            schema = mkName(p, name, pos)
+            name = second
+        }
+    }
+    acceptSym(p, STAR)
+    let alias = -1
+    if allowAlias { alias = parseAlias(p) }
+    return mkf(p, ast.K_TABLE_REF, 0, name, pos, [schema, alias], flags)
+}
+
+// '(' name, ... ')' -> K_LIST of K_NAME
+function parseNameList(p: P): Integer {
+    let pos = tstart(p)
+    expectSym(p, LP)
+    let items: List<Integer> = []
+    while !p.failed {
+        let npos = tstart(p)
+        items.add(mkName(p, parseColId(p), npos))
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    return mkList(p, items, pos)
+}
+
+function parseValues(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.VALUES)
+    let rows: List<Integer> = []
+    while !p.failed {
+        let rpos = tstart(p)
+        expectSym(p, LP)
+        let row = parseExprList(p)
+        expectSym(p, RP)
+        rows.add(row)
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mk(p, ast.K_VALUES, 0, "", pos, [mkList(p, rows, pos), -1, -1, -1, -1, -1, -1, -1, -1, -1, -1])
+}
+
+function parseSortList(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = []
+    while !p.failed {
+        items.add(parseSortItem(p))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, items, pos)
+}
+
+function parseSortItem(p: P): Integer {
+    let pos = tstart(p)
+    let e = parseExpr(p)
+    let op = ast.SORT_DEFAULT
+    let text = ""
+    if acceptKw(p, kw.ASC) {
+        op = ast.SORT_ASC
+    } else if acceptKw(p, kw.DESC) {
+        op = ast.SORT_DESC
+    } else if acceptKw(p, kw.USING) {
+        op = ast.SORT_USING
+        text = ttext(p)
+        if tk(p) != lexer.T_OP { syntaxError(p) }
+        advance(p)
+    }
+    let nulls = ast.NULLS_DEFAULT
+    if acceptKw(p, kw.NULLS) {
+        if acceptKw(p, kw.FIRST) {
+            nulls = ast.NULLS_FIRST
+        } else {
+            expectKw(p, kw.LAST)
+            nulls = ast.NULLS_LAST
+        }
+    }
+    let id = mk(p, ast.K_SORT_ITEM, op, text, pos, [e])
+    setInt(p, id, nulls)
+    return id
+}
+
+function parseExprList(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = []
+    while !p.failed {
+        items.add(parseExpr(p))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, items, pos)
+}
+
+// ---------------------------------------------------------------- expressions
+
+function parseExpr(p: P): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseOr(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseOr(p: P): Integer {
+    let l = parseAnd(p)
+    let n = 0
+    while !p.failed && isKw(p, kw.OR) && chainOk(p, n) {
+        n += 1
+        let pos = tstart(p)
+        advance(p)
+        let r = parseAnd(p)
+        l = mk(p, ast.K_BINARY_OP, ast.OP_OR, "or", pos, [l, r])
+    }
+    return l
+}
+
+function parseAnd(p: P): Integer {
+    let l = parseNot(p)
+    let n = 0
+    while !p.failed && isKw(p, kw.AND) && chainOk(p, n) {
+        n += 1
+        let pos = tstart(p)
+        advance(p)
+        let r = parseNot(p)
+        l = mk(p, ast.K_BINARY_OP, ast.OP_AND, "and", pos, [l, r])
+    }
+    return l
+}
+
+function parseNot(p: P): Integer {
+    if isKw(p, kw.NOT) {
+        let pos = tstart(p)
+        advance(p)
+        p.depth += 1
+        let a = -1
+        if p.depth <= MAX_DEPTH {
+            a = parseNot(p)
+        } else {
+            depthError(p)
+        }
+        p.depth -= 1
+        return mk(p, ast.K_UNARY_OP, ast.OP_NOT, "not", pos, [a])
+    }
+    return parseIsLevel(p)
+}
+
+function parseIsLevel(p: P): Integer {
+    let l = parseCmp(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) {
+        n += 1
+        let pos = tstart(p)
+        if isKw(p, kw.IS) {
+            advance(p)
+            let f = 0
+            if acceptKw(p, kw.NOT) { f = ast.F_NOT }
+            if acceptKw(p, kw.NULL) {
+                l = mkf(p, ast.K_IS_TEST, ast.TEST_NULL, "", pos, [l], f)
+            } else if acceptKw(p, kw.TRUE) {
+                l = mkf(p, ast.K_IS_TEST, ast.TEST_TRUE, "", pos, [l], f)
+            } else if acceptKw(p, kw.FALSE) {
+                l = mkf(p, ast.K_IS_TEST, ast.TEST_FALSE, "", pos, [l], f)
+            } else if acceptKw(p, kw.UNKNOWN) {
+                l = mkf(p, ast.K_IS_TEST, ast.TEST_UNKNOWN, "", pos, [l], f)
+            } else if acceptKw(p, kw.DOCUMENT) {
+                l = mkf(p, ast.K_IS_TEST, ast.TEST_DOCUMENT, "", pos, [l], f)
+            } else if acceptKw(p, kw.DISTINCT) {
+                expectKw(p, kw.FROM)
+                let r = parseCmp(p)
+                if f != 0 {
+                    l = mk(p, ast.K_BINARY_OP, ast.OP_IS_NOT_DISTINCT_FROM, "is not distinct from", pos, [l, r])
+                } else {
+                    l = mk(p, ast.K_BINARY_OP, ast.OP_IS_DISTINCT_FROM, "is distinct from", pos, [l, r])
+                }
+            } else {
+                syntaxError(p)
+                return -1
+            }
+        } else if isKw(p, kw.ISNULL) {
+            advance(p)
+            l = mk(p, ast.K_IS_TEST, ast.TEST_NULL, "", pos, [l])
+        } else if isKw(p, kw.NOTNULL) {
+            advance(p)
+            l = mkf(p, ast.K_IS_TEST, ast.TEST_NULL, "", pos, [l], ast.F_NOT)
+        } else {
+            break
+        }
+    }
+    return l
+}
+
+function cmpOp(p: P): Integer {
+    if tk(p) != lexer.T_OP { return 0 }
+    let c = tcode(p)
+    if c == EQ { return ast.OP_EQ }
+    if c == LT { return ast.OP_LT }
+    if c == GT { return ast.OP_GT }
+    if c == lexer.C_LE { return ast.OP_LE }
+    if c == lexer.C_GE { return ast.OP_GE }
+    if c == lexer.C_NE { return ast.OP_NE }
+    return 0
+}
+
+function parseCmp(p: P): Integer {
+    let l = parsePred(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) {
+        n += 1
+        let op = cmpOp(p)
+        if op == 0 { break }
+        let pos = tstart(p)
+        let sym = ttext(p)
+        advance(p)
+        if (isKw(p, kw.ANY) || isKw(p, kw.SOME) || isKw(p, kw.ALL)) && isSymAt(p, 1, LP) {
+            l = parseQuantified(p, l, op, sym, pos)
+        } else {
+            let r = parsePred(p)
+            l = mk(p, ast.K_BINARY_OP, op, sym, pos, [l, r])
+        }
+    }
+    return l
+}
+
+function parseQuantified(p: P, l: Integer, op: Integer, sym: Text, pos: Integer): Integer {
+    let quant = ast.QUANT_ANY
+    if isKw(p, kw.ALL) { quant = ast.QUANT_ALL }
+    advance(p)
+    expectSym(p, LP)
+    let flags = 0
+    let r = -1
+    if isQueryStart(p) {
+        r = parseQuery(p)
+        flags = ast.F_SUBQUERY
+    } else {
+        r = parseExpr(p)
+    }
+    expectSym(p, RP)
+    let id = mkf(p, ast.K_QUANTIFIED, op, sym, pos, [l, r], flags)
+    setInt(p, id, quant)
+    return id
+}
+
+function isPredKw(p: P, k: Integer): Boolean {
+    return isKwAt(p, k, kw.BETWEEN) || isKwAt(p, k, kw.IN) || isKwAt(p, k, kw.LIKE) || isKwAt(p, k, kw.ILIKE) ||
+        isKwAt(p, k, kw.SIMILAR)
+}
+
+function parsePred(p: P): Integer {
+    let l = parseOther(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) {
+        n += 1
+        let f = 0
+        if isKw(p, kw.NOT) && isPredKw(p, 1) {
+            advance(p)
+            f = ast.F_NOT
+        } else if !isPredKw(p, 0) {
+            break
+        }
+        let pos = tstart(p)
+        if acceptKw(p, kw.BETWEEN) {
+            if acceptKw(p, kw.SYMMETRIC) {
+                f = f | ast.F_SYMMETRIC
+            } else {
+                acceptKw(p, kw.ASYMMETRIC)
+            }
+            let lo = parseOther(p)
+            expectKw(p, kw.AND)
+            let hi = parseOther(p)
+            l = mkf(p, ast.K_BETWEEN, 0, "", pos, [l, lo, hi], f)
+        } else if acceptKw(p, kw.IN) {
+            expectSym(p, LP)
+            if isQueryStart(p) {
+                let q = parseQuery(p)
+                expectSym(p, RP)
+                l = mkf(p, ast.K_IN_SUBQUERY, 0, "", pos, [l, q], f)
+            } else {
+                let list = parseExprList(p)
+                expectSym(p, RP)
+                l = mkf(p, ast.K_IN_LIST, 0, "", pos, [l, list], f)
+            }
+        } else {
+            let op = ast.LIKE_LIKE
+            if isKw(p, kw.ILIKE) { op = ast.LIKE_ILIKE }
+            if isKw(p, kw.SIMILAR) {
+                op = ast.LIKE_SIMILAR
+                advance(p)
+                expectKw(p, kw.TO)
+            } else {
+                advance(p)
+            }
+            let pat = parseOther(p)
+            let esc = -1
+            if acceptKw(p, kw.ESCAPE) { esc = parseOther(p) }
+            l = mkf(p, ast.K_LIKE, op, "", pos, [l, pat, esc], f)
+        }
+    }
+    return l
+}
+
+function isOtherOp(p: P): Boolean {
+    if tk(p) != lexer.T_OP { return false }
+    let c = tcode(p)
+    return c == lexer.C_CONCAT || c == lexer.C_OTHER || c == 126 || c == 38 || c == 124 || c == 35 || c == 64 ||
+        c == 33 || c == 63 || c == 96
+}
+
+function otherOpCode(sym: Text): Integer {
+    if sym == "||" { return ast.OP_CONCAT }
+    if sym == "~" { return ast.OP_REGEX }
+    if sym == "~*" { return ast.OP_REGEX_I }
+    if sym == "!~" { return ast.OP_NOT_REGEX }
+    if sym == "!~*" { return ast.OP_NOT_REGEX_I }
+    if sym == "&" { return ast.OP_BIT_AND }
+    if sym == "|" { return ast.OP_BIT_OR }
+    if sym == "#" { return ast.OP_BIT_XOR }
+    if sym == "<<" { return ast.OP_SHL }
+    if sym == ">>" { return ast.OP_SHR }
+    return ast.OP_OTHER
+}
+
+function symOpCode(sym: Text): Integer {
+    if sym == "=" { return ast.OP_EQ }
+    if sym == "<>" || sym == "!=" { return ast.OP_NE }
+    if sym == "<" { return ast.OP_LT }
+    if sym == "<=" { return ast.OP_LE }
+    if sym == ">" { return ast.OP_GT }
+    if sym == ">=" { return ast.OP_GE }
+    if sym == "+" { return ast.OP_ADD }
+    if sym == "-" { return ast.OP_SUB }
+    if sym == "*" { return ast.OP_MUL }
+    if sym == "/" { return ast.OP_DIV }
+    if sym == "%" { return ast.OP_MOD }
+    if sym == "^" { return ast.OP_POW }
+    return otherOpCode(sym)
+}
+
+function parseOther(p: P): Integer {
+    let l = parseAdd(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && (isOtherOp(p) || (isKw(p, kw.OPERATOR) && isSymAt(p, 1, LP))) {
+        n += 1
+        let pos = tstart(p)
+        if isKw(p, kw.OPERATOR) {
+            // OPERATOR(schema.op)
+            advance(p)
+            advance(p)
+            if isLabel(p) {
+                advance(p)
+                expectSym(p, DOT)
+            }
+            let sym = ttext(p)
+            if tk(p) != lexer.T_OP { syntaxError(p) }
+            advance(p)
+            expectSym(p, RP)
+            let r = parseAdd(p)
+            l = mk(p, ast.K_BINARY_OP, symOpCode(sym), sym, pos, [l, r])
+            continue
+        }
+        let sym = ttext(p)
+        advance(p)
+        let r = parseAdd(p)
+        if sym == "~~" || sym == "~~*" || sym == "!~~" || sym == "!~~*" {
+            let op = ast.LIKE_LIKE
+            if sym == "~~*" || sym == "!~~*" { op = ast.LIKE_ILIKE }
+            let f = 0
+            if sym == "!~~" || sym == "!~~*" { f = ast.F_NOT }
+            l = mkf(p, ast.K_LIKE, op, "", pos, [l, r, -1], f)
+        } else {
+            l = mk(p, ast.K_BINARY_OP, otherOpCode(sym), sym, pos, [l, r])
+        }
+    }
+    return l
+}
+
+function parseAdd(p: P): Integer {
+    let l = parseMul(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && (isSym(p, PLUS) || isSym(p, MINUS)) {
+        n += 1
+        let pos = tstart(p)
+        let op = ast.OP_ADD
+        let sym = "+"
+        if isSym(p, MINUS) {
+            op = ast.OP_SUB
+            sym = "-"
+        }
+        advance(p)
+        let r = parseMul(p)
+        l = mk(p, ast.K_BINARY_OP, op, sym, pos, [l, r])
+    }
+    return l
+}
+
+function parseMul(p: P): Integer {
+    let l = parsePow(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && (isSym(p, STAR) || isSym(p, SLASH) || isSym(p, PCT)) {
+        n += 1
+        let pos = tstart(p)
+        let op = ast.OP_MUL
+        let sym = "*"
+        if isSym(p, SLASH) {
+            op = ast.OP_DIV
+            sym = "/"
+        } else if isSym(p, PCT) {
+            op = ast.OP_MOD
+            sym = "%"
+        }
+        advance(p)
+        let r = parsePow(p)
+        l = mk(p, ast.K_BINARY_OP, op, sym, pos, [l, r])
+    }
+    return l
+}
+
+function parsePow(p: P): Integer {
+    let l = parseUnary(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) && isSym(p, CARET) {
+        n += 1
+        let pos = tstart(p)
+        advance(p)
+        let r = parseUnary(p)
+        l = mk(p, ast.K_BINARY_OP, ast.OP_POW, "^", pos, [l, r])
+    }
+    return l
+}
+
+function parseUnary(p: P): Integer {
+    let c = p.curCode
+    if p.curKind != lexer.T_OP || !(c == MINUS || c == PLUS || c == 126 || c == 64 || c == lexer.C_OTHER) { return parsePostfix(p) }
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseUnaryInner(p)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseUnaryInner(p: P): Integer {
+    if tk(p) == lexer.T_OP {
+        let pos = tstart(p)
+        if isSym(p, MINUS) {
+            advance(p)
+            let a = parseUnary(p)
+            return mk(p, ast.K_UNARY_OP, ast.OP_NEG, "-", pos, [a])
+        }
+        if isSym(p, PLUS) {
+            advance(p)
+            let a = parseUnary(p)
+            return mk(p, ast.K_UNARY_OP, ast.OP_POS, "+", pos, [a])
+        }
+        if isSym(p, 126) {
+            advance(p)
+            let a = parseUnary(p)
+            return mk(p, ast.K_UNARY_OP, ast.OP_BIT_NOT, "~", pos, [a])
+        }
+        let c = tcode(p)
+        if c == 64 || (c == lexer.C_OTHER && (ttext(p) == "|/" || ttext(p) == "||/" || ttext(p) == "@-@" || ttext(p) == "!!")) {
+            let sym = ttext(p)
+            advance(p)
+            let a = parseUnary(p)
+            return mk(p, ast.K_UNARY_OP, ast.OP_OTHER, sym, pos, [a])
+        }
+    }
+    return parsePostfix(p)
+}
+
+function parsePostfix(p: P): Integer {
+    let e = parsePrimary(p)
+    let n = 0
+    while !p.failed && chainOk(p, n) {
+        n += 1
+        let pos = tstart(p)
+        if isSym(p, lexer.C_TYPECAST) {
+            advance(p)
+            let t = parseTypeName(p)
+            e = mk(p, ast.K_CAST, ast.CAST_COLON, "", pos, [e, t])
+        } else if isSym(p, LB) {
+            advance(p)
+            let lo = -1
+            let hi = -1
+            let flags = 0
+            if !isSym(p, COLON) { lo = parseExpr(p) }
+            if acceptSym(p, COLON) {
+                flags = ast.F_SLICE
+                if !isSym(p, RB) { hi = parseExpr(p) }
+            }
+            expectSym(p, RB)
+            e = mkf(p, ast.K_SUBSCRIPT, 0, "", pos, [e, lo, hi], flags)
+        } else if isKw(p, kw.COLLATE) {
+            advance(p)
+            let name = parseLabel(p)
+            while acceptSym(p, DOT) { name = parseLabel(p) }
+            e = mk(p, ast.K_COLLATE, 0, name, pos, [e])
+        } else if isKw(p, kw.AT) && isKwAt(p, 1, kw.TIME) && isKwAt(p, 2, kw.ZONE) {
+            advance(p)
+            advance(p)
+            advance(p)
+            let z = parseUnary(p)
+            let args = mkList(p, [z, e], pos)
+            e = mkf(p, ast.K_FUNC_CALL, 0, "timezone", pos, [-1, args, -1, -1, -1], ast.F_FUNC_SPECIAL)
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+function isNoParenFunc(w: Integer): Boolean {
+    return w == kw.CURRENT_DATE || w == kw.CURRENT_TIMESTAMP || w == kw.CURRENT_TIME || w == kw.LOCALTIMESTAMP ||
+        w == kw.LOCALTIME || w == kw.CURRENT_USER || w == kw.SESSION_USER || w == kw.USER || w == kw.CURRENT_ROLE ||
+        w == kw.CURRENT_CATALOG || w == kw.CURRENT_SCHEMA
+}
+
+function parsePrimary(p: P): Integer {
+    let k = tk(p)
+    let pos = tstart(p)
+    if k == lexer.T_INT {
+        let id = mk(p, ast.K_INT_LIT, 0, ttext(p), pos, p.empty)
+        setInt(p, id, lexer.ivalAt(p.toks, p.pos))
+        if lexer.flagsAt(p.toks, p.pos) != 0 { setFlag(p, id, ast.F_INT_OVERFLOW) }
+        advance(p)
+        return id
+    }
+    if k == lexer.T_NUM {
+        let t = ttext(p)
+        let id = mk(p, ast.K_NUM_LIT, 0, t, pos, p.empty)
+        p.tree.nodes[id].floatValue = lexer.approximateFloat(t)
+        advance(p)
+        return id
+    }
+    if k == lexer.T_STR {
+        let id = mkf(p, ast.K_STR_LIT, 0, ttext(p), pos, p.empty, lexer.flagsAt(p.toks, p.pos))
+        setInt(p, id, lexer.ivalAt(p.toks, p.pos))
+        advance(p)
+        return id
+    }
+    if k == lexer.T_PARAM {
+        let id = mk(p, ast.K_PARAM, 0, "", pos, p.empty)
+        setInt(p, id, lexer.ivalAt(p.toks, p.pos))
+        advance(p)
+        return id
+    }
+    if k == lexer.T_OP {
+        if isSym(p, LP) { return parseParenExpr(p) }
+        syntaxError(p)
+        return -1
+    }
+    if k == lexer.T_QIDENT { return parseNameExpr(p) }
+    if k != lexer.T_IDENT {
+        syntaxError(p)
+        return -1
+    }
+    let w = tkw(p)
+    let code = tcode(p)
+    if code == lexer.KW_RESERVED {
+        if w == kw.TRUE || w == kw.FALSE {
+            advance(p)
+            let id = mk(p, ast.K_BOOL_LIT, 0, "", pos, p.empty)
+            if w == kw.TRUE { setInt(p, id, 1) }
+            return id
+        }
+        if w == kw.NULL {
+            advance(p)
+            return mk(p, ast.K_NULL_LIT, 0, "", pos, p.empty)
+        }
+        if w == kw.CASE { return parseCase(p) }
+        if w == kw.CAST { return parseCast(p) }
+        if w == kw.ARRAY { return parseArray(p) }
+        if w == kw.DEFAULT {
+            advance(p)
+            return mk(p, ast.K_DEFAULT, 0, "", pos, p.empty)
+        }
+        if isNoParenFunc(w) { return parseNoParenFunc(p) }
+        syntaxError(p)
+        return -1
+    }
+    if w == kw.EXISTS && isSymAt(p, 1, LP) {
+        advance(p)
+        advance(p)
+        let q = parseQuery(p)
+        expectSym(p, RP)
+        return mk(p, ast.K_EXISTS, 0, "", pos, [q])
+    }
+    if w == kw.ROW && isSymAt(p, 1, LP) {
+        advance(p)
+        advance(p)
+        let items: List<Integer> = []
+        if !isSym(p, RP) {
+            let list = parseExprList(p)
+            expectSym(p, RP)
+            return mkf(p, ast.K_ROW_EXPR, 0, "", pos, [list], ast.F_EXPLICIT_ROW)
+        }
+        expectSym(p, RP)
+        return mkf(p, ast.K_ROW_EXPR, 0, "", pos, [mkList(p, items, pos)], ast.F_EXPLICIT_ROW)
+    }
+    if isNoParenFunc(w) && !isSymAt(p, 1, LP) { return parseNoParenFunc(p) }
+    if w == kw.CURRENT_SCHEMA { return parseNoParenFunc(p) }
+    if typedLiteralAhead(p) { return parseTypedLiteral(p) }
+    return parseNameExpr(p)
+}
+
+function parseNoParenFunc(p: P): Integer {
+    let pos = tstart(p)
+    let w = ttext(p)
+    advance(p)
+    let args: List<Integer> = []
+    if isSym(p, LP) {
+        advance(p)
+        if !isSym(p, RP) { args.add(parseExpr(p)) }
+        expectSym(p, RP)
+    }
+    return mkf(p, ast.K_FUNC_CALL, 0, w, pos, [-1, mkList(p, args, pos), -1, -1, -1], ast.F_FUNC_NO_PARENS)
+}
+
+function parseParenExpr(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    if isKw(p, kw.SELECT) || isKw(p, kw.WITH) || isKw(p, kw.VALUES) {
+        let q = parseQuery(p)
+        expectSym(p, RP)
+        let e = mk(p, ast.K_SUBQUERY_EXPR, 0, "", pos, [q])
+        return parseIndirection(p, e)
+    }
+    let e = parseExpr(p)
+    if isSym(p, COMMA) {
+        let items: List<Integer> = [e]
+        while !p.failed && acceptSym(p, COMMA) { items.add(parseExpr(p)) }
+        expectSym(p, RP)
+        return mk(p, ast.K_ROW_EXPR, 0, "", pos, [mkList(p, items, pos)])
+    }
+    expectSym(p, RP)
+    return parseIndirection(p, e)
+}
+
+// (expr).field / (expr).*
+function parseIndirection(p: P, e: Integer): Integer {
+    let r = e
+    while !p.failed && isSym(p, DOT) {
+        let pos = tstart(p)
+        advance(p)
+        if acceptSym(p, STAR) {
+            r = mk(p, ast.K_FIELD_SELECT, 0, "*", pos, [r])
+        } else {
+            r = mk(p, ast.K_FIELD_SELECT, 0, parseLabel(p), pos, [r])
+        }
+    }
+    return r
+}
+
+// name [. name ...] [ ( args ) ]  -> column ref, star or function call
+function parseNameExpr(p: P): Integer {
+    let pos = tstart(p)
+    let parts: List<Text> = [ttext(p)]
+    let positions: List<Integer> = [pos]
+    advance(p)
+    while !p.failed && isSym(p, DOT) {
+        if isSymAt(p, 1, STAR) {
+            advance(p)
+            advance(p)
+            let quals: List<Integer> = []
+            for i in 0..parts.length { quals.add(mkName(p, parts[i], positions[i])) }
+            return mk(p, ast.K_STAR, 0, "", pos, quals)
+        }
+        advance(p)
+        positions.add(tstart(p))
+        parts.add(parseLabel(p))
+    }
+    let last = parts[parts.length - 1]
+    if isSym(p, LP) {
+        let schema = -1
+        if parts.length >= 2 { schema = mkName(p, parts[parts.length - 2], positions[parts.length - 2]) }
+        return parseFuncCall(p, last, schema, pos)
+    }
+    let quals: List<Integer> = []
+    for i in 0..parts.length - 1 { quals.add(mkName(p, parts[i], positions[i])) }
+    return mk(p, ast.K_COLUMN_REF, 0, last, pos, quals)
+}
+
+function parseFuncCall(p: P, name: Text, schema: Integer, pos: Integer): Integer {
+    expectSym(p, LP)
+    if schema < 0 {
+        if name == "extract" { return parseExtract(p, pos) }
+        if name == "position" { return parsePosition(p, pos) }
+        if name == "trim" { return parseTrim(p, pos) }
+        if name == "overlay" { return parseOverlay(p, pos) }
+        if name == "substring" && !isSym(p, RP) { return parseSubstring(p, pos) }
+    }
+    let flags = 0
+    let args: List<Integer> = []
+    let aggOrder = -1
+    if isSym(p, STAR) {
+        advance(p)
+        flags = ast.F_FUNC_STAR
+    } else if !isSym(p, RP) {
+        if acceptKw(p, kw.DISTINCT) {
+            flags = ast.F_FUNC_DISTINCT
+        } else if acceptKw(p, kw.ALL) {
+            flags = ast.F_FUNC_ALL
+        }
+        while !p.failed {
+            if acceptKw(p, kw.VARIADIC) { flags = flags | ast.F_FUNC_VARIADIC }
+            if isLabel(p) && (isSymAt(p, 1, lexer.C_ARROW) || isSymAt(p, 1, lexer.C_COLONEQ)) {
+                advance(p)
+                advance(p)
+            }
+            args.add(parseExpr(p))
+            if !acceptSym(p, COMMA) { break }
+        }
+        if isKw(p, kw.ORDER) && isKwAt(p, 1, kw.BY) {
+            advance(p)
+            advance(p)
+            aggOrder = parseSortList(p)
+        }
+    }
+    expectSym(p, RP)
+    return parseFuncTail(p, name, schema, args, aggOrder, flags, pos)
+}
+
+function parseFuncTail(p: P, name: Text, schema: Integer, args: List<Integer>, aggOrderIn: Integer, flagsIn: Integer, pos: Integer): Integer {
+    let flags = flagsIn
+    let aggOrder = aggOrderIn
+    if isKw(p, kw.WITHIN) && isKwAt(p, 1, kw.GROUP) {
+        advance(p)
+        advance(p)
+        expectSym(p, LP)
+        expectKw(p, kw.ORDER)
+        expectKw(p, kw.BY)
+        aggOrder = parseSortList(p)
+        expectSym(p, RP)
+        flags = flags | ast.F_FUNC_WITHIN_GROUP
+    }
+    let filter = -1
+    if isKw(p, kw.FILTER) && isSymAt(p, 1, LP) {
+        advance(p)
+        advance(p)
+        expectKw(p, kw.WHERE)
+        filter = parseExpr(p)
+        expectSym(p, RP)
+    }
+    let over = -1
+    if isKw(p, kw.OVER) {
+        let opos = tstart(p)
+        advance(p)
+        if isSym(p, LP) {
+            over = parseWindowSpec(p, "", opos)
+        } else {
+            let ref = mkName(p, parseColId(p), opos)
+            over = mk(p, ast.K_WINDOW_DEF, 0, "", opos, [ref, -1, -1, -1])
+        }
+    }
+    return mkf(p, ast.K_FUNC_CALL, 0, name, pos, [schema, mkList(p, args, pos), filter, over, aggOrder], flags)
+}
+
+function special(p: P, name: Text, args: List<Integer>, pos: Integer): Integer {
+    expectSym(p, RP)
+    return mkf(p, ast.K_FUNC_CALL, 0, name, pos, [-1, mkList(p, args, pos), -1, -1, -1], ast.F_FUNC_SPECIAL)
+}
+
+function parseExtract(p: P, pos: Integer): Integer {
+    let fpos = tstart(p)
+    let field = ""
+    if tk(p) == lexer.T_STR || isLabel(p) {
+        field = ttext(p)
+        if tk(p) == lexer.T_STR { field = lowerAscii(field) }
+        advance(p)
+    } else {
+        syntaxError(p)
+    }
+    expectKw(p, kw.FROM)
+    let e = parseExpr(p)
+    return special(p, "extract", [mkStr(p, field, fpos), e], pos)
+}
+
+function lowerAscii(t: Text): Text {
+    let b = Bytes(t)
+    for i in 0..b.length {
+        if b[i] >= 65 && b[i] <= 90 { b[i] = b[i] + 32 }
+    }
+    return Text(b)
+}
+
+function parsePosition(p: P, pos: Integer): Integer {
+    let a = parseOther(p)
+    expectKw(p, kw.IN)
+    let b = parseOther(p)
+    return special(p, "position", [b, a], pos)
+}
+
+function parseTrim(p: P, pos: Integer): Integer {
+    let name = "btrim"
+    if acceptKw(p, kw.LEADING) {
+        name = "ltrim"
+    } else if acceptKw(p, kw.TRAILING) {
+        name = "rtrim"
+    } else {
+        acceptKw(p, kw.BOTH)
+    }
+    if acceptKw(p, kw.FROM) {
+        let args: List<Integer> = [parseExpr(p)]
+        while acceptSym(p, COMMA) { args.add(parseExpr(p)) }
+        return special(p, name, args, pos)
+    }
+    let first = parseExpr(p)
+    if acceptKw(p, kw.FROM) {
+        let x = parseExpr(p)
+        return special(p, name, [x, first], pos)
+    }
+    let args: List<Integer> = [first]
+    while acceptSym(p, COMMA) { args.add(parseExpr(p)) }
+    return special(p, name, args, pos)
+}
+
+function parseOverlay(p: P, pos: Integer): Integer {
+    let x = parseExpr(p)
+    if acceptSym(p, COMMA) {
+        let args: List<Integer> = [x]
+        args.add(parseExpr(p))
+        while acceptSym(p, COMMA) { args.add(parseExpr(p)) }
+        return special(p, "overlay", args, pos)
+    }
+    expectKw(p, kw.PLACING)
+    let y = parseExpr(p)
+    expectKw(p, kw.FROM)
+    let a = parseExpr(p)
+    if acceptKw(p, kw.FOR) {
+        let b = parseExpr(p)
+        return special(p, "overlay", [x, y, a, b], pos)
+    }
+    return special(p, "overlay", [x, y, a], pos)
+}
+
+function parseSubstring(p: P, pos: Integer): Integer {
+    let x = parseExpr(p)
+    if acceptKw(p, kw.FROM) {
+        let a = parseExpr(p)
+        if acceptKw(p, kw.FOR) {
+            let b = parseExpr(p)
+            return special(p, "substring", [x, a, b], pos)
+        }
+        return special(p, "substring", [x, a], pos)
+    }
+    if acceptKw(p, kw.FOR) {
+        let b = parseExpr(p)
+        if acceptKw(p, kw.FROM) {
+            let a = parseExpr(p)
+            return special(p, "substring", [x, a, b], pos)
+        }
+        return special(p, "substring", [x, mkInt(p, 1, pos), b], pos)
+    }
+    if acceptKw(p, kw.SIMILAR) {
+        let pat = parseExpr(p)
+        expectKw(p, kw.ESCAPE)
+        let esc = parseExpr(p)
+        return special(p, "substring", [x, pat, esc], pos)
+    }
+    let args: List<Integer> = [x]
+    while !p.failed && acceptSym(p, COMMA) { args.add(parseExpr(p)) }
+    expectSym(p, RP)
+    return parseFuncTail(p, "substring", -1, args, -1, 0, pos)
+}
+
+function parseWindowSpec(p: P, name: Text, pos: Integer): Integer {
+    expectSym(p, LP)
+    let ref = -1
+    if isColId(p) && !isKw(p, kw.PARTITION) && !isKw(p, kw.RANGE) && !isKw(p, kw.ROWS) && !isKw(p, kw.GROUPS) {
+        ref = mkName(p, ttext(p), tstart(p))
+        advance(p)
+    }
+    let part = -1
+    if isKw(p, kw.PARTITION) {
+        advance(p)
+        expectKw(p, kw.BY)
+        part = parseExprList(p)
+    }
+    let ord = -1
+    if isKw(p, kw.ORDER) {
+        advance(p)
+        expectKw(p, kw.BY)
+        ord = parseSortList(p)
+    }
+    let frame = -1
+    if isKw(p, kw.RANGE) || isKw(p, kw.ROWS) || isKw(p, kw.GROUPS) {
+        let fpos = tstart(p)
+        let mode = ast.FRAME_RANGE
+        if isKw(p, kw.ROWS) { mode = ast.FRAME_ROWS }
+        if isKw(p, kw.GROUPS) { mode = ast.FRAME_GROUPS }
+        advance(p)
+        let start = -1
+        let end = -1
+        if acceptKw(p, kw.BETWEEN) {
+            start = parseFrameBound(p)
+            expectKw(p, kw.AND)
+            end = parseFrameBound(p)
+        } else {
+            start = parseFrameBound(p)
+        }
+        let excl = ast.EXCLUDE_NONE
+        if acceptKw(p, kw.EXCLUDE) {
+            if acceptKw(p, kw.CURRENT) {
+                expectKw(p, kw.ROW)
+                excl = ast.EXCLUDE_CURRENT_ROW
+            } else if acceptKw(p, kw.GROUP) {
+                excl = ast.EXCLUDE_GROUP
+            } else if acceptKw(p, kw.TIES) {
+                excl = ast.EXCLUDE_TIES
+            } else {
+                expectKw(p, kw.NO)
+                expectKw(p, kw.OTHERS)
+            }
+        }
+        frame = mk(p, ast.K_FRAME, mode, "", fpos, [start, end])
+        setInt(p, frame, excl)
+    }
+    expectSym(p, RP)
+    return mk(p, ast.K_WINDOW_DEF, 0, name, pos, [ref, part, ord, frame])
+}
+
+function parseFrameBound(p: P): Integer {
+    let pos = tstart(p)
+    if isKw(p, kw.UNBOUNDED) {
+        advance(p)
+        if acceptKw(p, kw.PRECEDING) { return mk(p, ast.K_FRAME_BOUND, ast.BOUND_UNBOUNDED_PRECEDING, "", pos, [-1]) }
+        expectKw(p, kw.FOLLOWING)
+        return mk(p, ast.K_FRAME_BOUND, ast.BOUND_UNBOUNDED_FOLLOWING, "", pos, [-1])
+    }
+    if isKw(p, kw.CURRENT) && isKwAt(p, 1, kw.ROW) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_FRAME_BOUND, ast.BOUND_CURRENT_ROW, "", pos, [-1])
+    }
+    let e = parseOther(p)
+    if acceptKw(p, kw.PRECEDING) { return mk(p, ast.K_FRAME_BOUND, ast.BOUND_PRECEDING, "", pos, [e]) }
+    expectKw(p, kw.FOLLOWING)
+    return mk(p, ast.K_FRAME_BOUND, ast.BOUND_FOLLOWING, "", pos, [e])
+}
+
+function parseCase(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.CASE)
+    let arg = -1
+    if !isKw(p, kw.WHEN) { arg = parseExpr(p) }
+    let whens: List<Integer> = []
+    let lpos = tstart(p)
+    while !p.failed && isKw(p, kw.WHEN) {
+        let wpos = tstart(p)
+        advance(p)
+        let c = parseExpr(p)
+        expectKw(p, kw.THEN)
+        let r = parseExpr(p)
+        whens.add(mk(p, ast.K_WHEN, 0, "", wpos, [c, r]))
+    }
+    if whens.length == 0 { syntaxError(p) }
+    let els = -1
+    if acceptKw(p, kw.ELSE) { els = parseExpr(p) }
+    expectKw(p, kw.END)
+    return mk(p, ast.K_CASE, 0, "", pos, [arg, mkList(p, whens, lpos), els])
+}
+
+function parseCast(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.CAST)
+    expectSym(p, LP)
+    let e = parseExpr(p)
+    expectKw(p, kw.AS)
+    let t = parseTypeName(p)
+    expectSym(p, RP)
+    return mk(p, ast.K_CAST, ast.CAST_FUNC, "", pos, [e, t])
+}
+
+function parseArray(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.ARRAY)
+    if isSym(p, LP) {
+        advance(p)
+        let q = parseQuery(p)
+        expectSym(p, RP)
+        return mk(p, ast.K_ARRAY_SUBQUERY, 0, "", pos, [q])
+    }
+    return parseArrayBody(p, pos)
+}
+
+function parseArrayBody(p: P, pos: Integer): Integer {
+    p.depth += 1
+    let r = -1
+    if p.depth <= MAX_DEPTH {
+        r = parseArrayBodyInner(p, pos)
+    } else {
+        depthError(p)
+    }
+    p.depth -= 1
+    return r
+}
+
+function parseArrayBodyInner(p: P, pos: Integer): Integer {
+    expectSym(p, LB)
+    let items: List<Integer> = []
+    if !isSym(p, RB) {
+        while !p.failed {
+            if isSym(p, LB) {
+                items.add(parseArrayBody(p, tstart(p)))
+            } else {
+                items.add(parseExpr(p))
+            }
+            if !acceptSym(p, COMMA) { break }
+        }
+    }
+    expectSym(p, RB)
+    return mk(p, ast.K_ARRAY_EXPR, 0, "", pos, [mkList(p, items, pos)])
+}
+
+// identifier (type name) followed by a string literal, e.g. DATE '1998-12-01', double precision '1.5'
+function typedLiteralAhead(p: P): Boolean {
+    let i = p.pos + 1
+    let toks = p.toks
+    while i < p.eof {
+        let k = lexer.kindAt(toks, i)
+        if k == lexer.T_STR { return true }
+        if k == lexer.T_IDENT {
+            let w = lexer.kwAt(toks, i)
+            if w == kw.PRECISION || w == kw.VARYING || w == kw.WITH || w == kw.WITHOUT || w == kw.TIME || w == kw.ZONE {
+                i += 1
+                continue
+            }
+            return false
+        }
+        if k == lexer.T_OP && lexer.codeAt(toks, i) == LP {
+            // only (n) or (n, m)
+            if i + 2 <= p.eof && lexer.kindAt(toks, i + 1) == lexer.T_INT && lexer.kindAt(toks, i + 2) == lexer.T_OP && lexer.codeAt(toks, i + 2) == RP {
+                i += 3
+                continue
+            }
+            return false
+        }
+        return false
+    }
+    return false
+}
+
+function parseTypedLiteral(p: P): Integer {
+    let pos = tstart(p)
+    let t = parseTypeName(p)
+    if t < 0 || tk(p) != lexer.T_STR {
+        syntaxError(p)
+        return -1
+    }
+    let s = mkf(p, ast.K_STR_LIT, 0, ttext(p), tstart(p), p.empty, lexer.flagsAt(p.toks, p.pos))
+    advance(p)
+    if p.tree.nodes[t].text == "interval" {
+        let fields = parseIntervalFields(p)
+        if fields != 0 { p.tree.nodes[t].op = fields }
+        if isSym(p, LP) && isSymAt(p, 2, RP) && tkAt(p, 1) == lexer.T_INT {
+            let mods = parseTypeMods(p)
+            if slot(p, t, 0) < 0 { setSlot(p, t, 0, mods) }
+        }
+    }
+    return mk(p, ast.K_CAST, ast.CAST_TYPED_LITERAL, "", pos, [s, t])
+}
+
+function parseIntervalFields(p: P): Integer {
+    if acceptKw(p, kw.YEAR) {
+        if isKw(p, kw.TO) && isKwAt(p, 1, kw.MONTH) {
+            advance(p)
+            advance(p)
+            return ast.INTERVAL_YEAR_TO_MONTH
+        }
+        return ast.INTERVAL_YEAR
+    }
+    if acceptKw(p, kw.MONTH) { return ast.INTERVAL_MONTH }
+    if acceptKw(p, kw.DAY) {
+        if isKw(p, kw.TO) {
+            if isKwAt(p, 1, kw.HOUR) { advance(p); advance(p); return ast.INTERVAL_DAY_TO_HOUR }
+            if isKwAt(p, 1, kw.MINUTE) { advance(p); advance(p); return ast.INTERVAL_DAY_TO_MINUTE }
+            if isKwAt(p, 1, kw.SECOND) { advance(p); advance(p); return ast.INTERVAL_DAY_TO_SECOND }
+        }
+        return ast.INTERVAL_DAY
+    }
+    if acceptKw(p, kw.HOUR) {
+        if isKw(p, kw.TO) {
+            if isKwAt(p, 1, kw.MINUTE) { advance(p); advance(p); return ast.INTERVAL_HOUR_TO_MINUTE }
+            if isKwAt(p, 1, kw.SECOND) { advance(p); advance(p); return ast.INTERVAL_HOUR_TO_SECOND }
+        }
+        return ast.INTERVAL_HOUR
+    }
+    if acceptKw(p, kw.MINUTE) {
+        if isKw(p, kw.TO) && isKwAt(p, 1, kw.SECOND) {
+            advance(p)
+            advance(p)
+            return ast.INTERVAL_MINUTE_TO_SECOND
+        }
+        return ast.INTERVAL_MINUTE
+    }
+    if acceptKw(p, kw.SECOND) { return ast.INTERVAL_SECOND }
+    return ast.INTERVAL_NONE
+}
+
+function parseTypeMods(p: P): Integer {
+    if !isSym(p, LP) { return -1 }
+    advance(p)
+    let list = parseExprList(p)
+    expectSym(p, RP)
+    return list
+}
+
+function canonicalType(w: Text): Text {
+    if w == "int" || w == "integer" || w == "int4" { return "int4" }
+    if w == "bigint" || w == "int8" { return "int8" }
+    if w == "smallint" || w == "int2" { return "int2" }
+    if w == "real" || w == "float4" { return "float4" }
+    if w == "float8" { return "float8" }
+    if w == "decimal" || w == "dec" || w == "numeric" { return "numeric" }
+    if w == "boolean" || w == "bool" { return "bool" }
+    if w == "varchar" { return "varchar" }
+    if w == "bpchar" { return "bpchar" }
+    return w
+}
+
+function parseTypeName(p: P): Integer {
+    let pos = tstart(p)
+    let name = ""
+    let mods = -1
+    let op = 0
+    if tk(p) == lexer.T_QIDENT {
+        name = ttext(p)
+        advance(p)
+        if isSym(p, DOT) {
+            advance(p)
+            name = parseLabel(p)
+        }
+    } else if tk(p) == lexer.T_IDENT {
+        let w = ttext(p)
+        advance(p)
+        if w == "double" {
+            expectKw(p, kw.PRECISION)
+            name = "float8"
+        } else if w == "character" || w == "char" || w == "nchar" || w == "national" {
+            if w == "national" {
+                if !acceptKw(p, kw.CHARACTER) { expectKw(p, kw.CHAR) }
+            }
+            if acceptKw(p, kw.VARYING) {
+                name = "varchar"
+            } else {
+                name = "bpchar"
+            }
+            mods = parseTypeMods(p)
+        } else if w == "bit" {
+            if acceptKw(p, kw.VARYING) {
+                name = "varbit"
+            } else {
+                name = "bit"
+            }
+            mods = parseTypeMods(p)
+        } else if w == "float" {
+            name = "float8"
+            if isSym(p, LP) {
+                advance(p)
+                if tk(p) == lexer.T_INT && lexer.ivalAt(p.toks, p.pos) <= 24 { name = "float4" }
+                if tk(p) != lexer.T_INT { syntaxError(p) }
+                advance(p)
+                expectSym(p, RP)
+            }
+        } else if w == "timestamp" || w == "time" {
+            name = w
+            mods = parseTypeMods(p)
+            if acceptKw(p, kw.WITH) {
+                expectKw(p, kw.TIME)
+                expectKw(p, kw.ZONE)
+                name = name + "tz"
+            } else if acceptKw(p, kw.WITHOUT) {
+                expectKw(p, kw.TIME)
+                expectKw(p, kw.ZONE)
+            }
+        } else if w == "interval" {
+            name = "interval"
+            if isSym(p, LP) {
+                mods = parseTypeMods(p)
+            } else {
+                op = parseIntervalFields(p)
+                if op != 0 { mods = parseTypeMods(p) }
+            }
+        } else {
+            name = w
+            if isSym(p, DOT) {
+                advance(p)
+                name = parseLabel(p)
+            }
+            name = canonicalType(name)
+            mods = parseTypeMods(p)
+        }
+    } else {
+        syntaxError(p)
+        return -1
+    }
+    let dims = 0
+    while !p.failed {
+        if isSym(p, LB) {
+            advance(p)
+            if tk(p) == lexer.T_INT { advance(p) }
+            expectSym(p, RB)
+            dims += 1
+        } else if isKw(p, kw.ARRAY) {
+            advance(p)
+            if isSym(p, LB) {
+                advance(p)
+                if tk(p) == lexer.T_INT { advance(p) }
+                expectSym(p, RB)
+            }
+            dims += 1
+        } else {
+            break
+        }
+    }
+    let id = mk(p, ast.K_TYPENAME, op, name, pos, [mods])
+    setInt(p, id, dims)
+    return id
+}
+
+// ---------------------------------------------------------------- DML
+
+function parseInsert(p: P, with: Integer): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.INSERT)
+    expectKw(p, kw.INTO)
+    let target = parseRelation(p, false)
+    if isKw(p, kw.AS) {
+        let apos = tstart(p)
+        advance(p)
+        setSlot(p, target, 1, mk(p, ast.K_ALIAS, 0, parseColId(p), apos, [-1]))
+    }
+    let cols = -1
+    if isSym(p, LP) && !isQueryStart(p) {
+        let cpos = tstart(p)
+        advance(p)
+        let items: List<Integer> = []
+        while !p.failed {
+            let npos = tstart(p)
+            let name = parseColId(p)
+            while isSym(p, DOT) || isSym(p, LB) {
+                if acceptSym(p, DOT) {
+                    parseLabel(p)
+                } else {
+                    advance(p)
+                    parseExpr(p)
+                    expectSym(p, RB)
+                }
+            }
+            items.add(mkName(p, name, npos))
+            if !acceptSym(p, COMMA) { break }
+        }
+        expectSym(p, RP)
+        cols = mkList(p, items, cpos)
+    }
+    if acceptKw(p, kw.OVERRIDING) {
+        if !acceptKw(p, kw.SYSTEM) { expectKw(p, kw.USER) }
+        expectKw(p, kw.VALUE)
+    }
+    let flags = 0
+    let src = -1
+    if isKw(p, kw.DEFAULT) && isKwAt(p, 1, kw.VALUES) {
+        advance(p)
+        advance(p)
+        flags = ast.F_DEFAULT_VALUES
+    } else {
+        src = parseQuery(p)
+    }
+    let conflict = -1
+    if isKw(p, kw.ON) && isKwAt(p, 1, kw.CONFLICT) { conflict = parseOnConflict(p) }
+    let returning = -1
+    if acceptKw(p, kw.RETURNING) { returning = parseTargetList(p) }
+    return mkf(p, ast.K_INSERT, 0, "", pos, [target, cols, src, conflict, returning, with], flags)
+}
+
+function parseOnConflict(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    advance(p)
+    let targetCols = -1
+    let targetWhere = -1
+    let constraintName = ""
+    if isSym(p, LP) {
+        let lpos = tstart(p)
+        advance(p)
+        let items: List<Integer> = []
+        while !p.failed {
+            let e = parseExpr(p)
+            if acceptKw(p, kw.COLLATE) { parseLabel(p) }
+            if isColId(p) { advance(p) }  // opclass
+            items.add(e)
+            if !acceptSym(p, COMMA) { break }
+        }
+        expectSym(p, RP)
+        targetCols = mkList(p, items, lpos)
+        if acceptKw(p, kw.WHERE) { targetWhere = parseExpr(p) }
+    } else if isKw(p, kw.ON) && isKwAt(p, 1, kw.CONSTRAINT) {
+        advance(p)
+        advance(p)
+        constraintName = parseColId(p)
+    }
+    expectKw(p, kw.DO)
+    if acceptKw(p, kw.NOTHING) {
+        return mk(p, ast.K_ON_CONFLICT, ast.CONFLICT_NOTHING, constraintName, pos, [targetCols, -1, -1, targetWhere])
+    }
+    expectKw(p, kw.UPDATE)
+    expectKw(p, kw.SET)
+    let set = parseSetList(p)
+    let where = -1
+    if acceptKw(p, kw.WHERE) { where = parseExpr(p) }
+    return mk(p, ast.K_ON_CONFLICT, ast.CONFLICT_UPDATE, constraintName, pos, [targetCols, set, where, targetWhere])
+}
+
+function parseSetList(p: P): Integer {
+    let pos = tstart(p)
+    let items: List<Integer> = []
+    while !p.failed {
+        let ipos = tstart(p)
+        if isSym(p, LP) {
+            let names = parseNameList(p)
+            expectSym(p, EQ)
+            let v = parseExpr(p)
+            items.add(mk(p, ast.K_MULTI_SET, 0, "", ipos, [names, v]))
+        } else {
+            let name = parseColId(p)
+            let ind = -1
+            if isSym(p, DOT) || isSym(p, LB) {
+                let parts: List<Integer> = []
+                while isSym(p, DOT) || isSym(p, LB) {
+                    let fpos = tstart(p)
+                    if acceptSym(p, DOT) {
+                        parts.add(mkName(p, parseLabel(p), fpos))
+                    } else {
+                        advance(p)
+                        parts.add(parseExpr(p))
+                        expectSym(p, RB)
+                    }
+                }
+                ind = mkList(p, parts, ipos)
+            }
+            expectSym(p, EQ)
+            let v = parseExpr(p)
+            items.add(mk(p, ast.K_SET_ITEM, 0, name, ipos, [v, ind]))
+        }
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, items, pos)
+}
+
+function parseUpdate(p: P, with: Integer): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.UPDATE)
+    let target = parseRelation(p, true)
+    expectKw(p, kw.SET)
+    let set = parseSetList(p)
+    let from = -1
+    if acceptKw(p, kw.FROM) { from = parseFromList(p) }
+    let where = -1
+    if acceptKw(p, kw.WHERE) {
+        if isKw(p, kw.CURRENT) && isKwAt(p, 1, kw.OF) {
+            unsupported(p, "WHERE CURRENT OF")
+            return -1
+        }
+        where = parseExpr(p)
+    }
+    let returning = -1
+    if acceptKw(p, kw.RETURNING) { returning = parseTargetList(p) }
+    return mk(p, ast.K_UPDATE, 0, "", pos, [target, set, from, where, returning, with])
+}
+
+function parseDelete(p: P, with: Integer): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.DELETE)
+    expectKw(p, kw.FROM)
+    let target = parseRelation(p, true)
+    let using = -1
+    if acceptKw(p, kw.USING) { using = parseFromList(p) }
+    let where = -1
+    if acceptKw(p, kw.WHERE) {
+        if isKw(p, kw.CURRENT) && isKwAt(p, 1, kw.OF) {
+            unsupported(p, "WHERE CURRENT OF")
+            return -1
+        }
+        where = parseExpr(p)
+    }
+    let returning = -1
+    if acceptKw(p, kw.RETURNING) { returning = parseTargetList(p) }
+    return mk(p, ast.K_DELETE, 0, "", pos, [target, using, where, returning, with])
+}
+
+// ---------------------------------------------------------------- DDL
+
+function parseIfNotExists(p: P): Boolean {
+    if isKw(p, kw.IF) && isKwAt(p, 1, kw.NOT) && isKwAt(p, 2, kw.EXISTS) {
+        advance(p)
+        advance(p)
+        advance(p)
+        return true
+    }
+    return false
+}
+
+function parseIfExists(p: P): Boolean {
+    if isKw(p, kw.IF) && isKwAt(p, 1, kw.EXISTS) {
+        advance(p)
+        advance(p)
+        return true
+    }
+    return false
+}
+
+// schema-qualified object name: returns [schemaNode, name] via the K_TABLE_REF shape
+function parseObjectName(p: P): Integer {
+    return parseRelation(p, false)
+}
+
+function parseCreate(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.CREATE)
+    let flags = 0
+    if isKw(p, kw.OR) && isKwAt(p, 1, kw.REPLACE) {
+        advance(p)
+        advance(p)
+        flags = flags | ast.F_OR_REPLACE
+    }
+    if acceptKw(p, kw.TEMPORARY) || acceptKw(p, kw.TEMP) {
+        flags = flags | ast.F_TEMP
+    } else if (isKw(p, kw.LOCAL) || isKw(p, kw.GLOBAL)) && (isKwAt(p, 1, kw.TEMPORARY) || isKwAt(p, 1, kw.TEMP)) {
+        advance(p)
+        advance(p)
+        flags = flags | ast.F_TEMP
+    } else if acceptKw(p, kw.UNLOGGED) {
+        flags = flags | ast.F_UNLOGGED
+    }
+    if isKw(p, kw.TABLE) { return parseCreateTable(p, pos, flags) }
+    if isKw(p, kw.UNIQUE) || isKw(p, kw.INDEX) { return parseCreateIndex(p, pos) }
+    if isKw(p, kw.VIEW) || (isKw(p, kw.MATERIALIZED) && isKwAt(p, 1, kw.VIEW)) || (isKw(p, kw.RECURSIVE) && isKwAt(p, 1, kw.VIEW)) {
+        return parseCreateView(p, pos, flags)
+    }
+    if acceptKw(p, kw.SEQUENCE) {
+        if parseIfNotExists(p) { flags = flags | ast.F_IF_NOT_EXISTS }
+        let name = parseObjectName(p)
+        let opts: List<Integer> = []
+        while !p.failed && !isSym(p, SEMI) && tk(p) != lexer.T_EOF {
+            let opos = tstart(p)
+            let key = parseLabel(p)
+            if (key == "increment" && acceptKw(p, kw.BY)) || (key == "start" && acceptKw(p, kw.WITH)) {
+                // optional noise words
+            }
+            if key == "no" {
+                key = "no " + parseLabel(p)
+                opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [-1]))
+            } else if key == "owned" {
+                expectKw(p, kw.BY)
+                let o = parseNameExpr(p)
+                opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [o]))
+            } else if key == "as" {
+                opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [parseTypeName(p)]))
+            } else if key == "cycle" {
+                opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [-1]))
+            } else {
+                opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [parseUnary(p)]))
+            }
+        }
+        return mkf(p, ast.K_CREATE_SEQUENCE, 0, ast.text(p.tree, name), pos, [slot(p, name, 0), mkList(p, opts, pos)], flags)
+    }
+    if acceptKw(p, kw.SCHEMA) {
+        if parseIfNotExists(p) { flags = flags | ast.F_IF_NOT_EXISTS }
+        let name = ""
+        if acceptKw(p, kw.AUTHORIZATION) {
+            name = parseColId(p)
+        } else {
+            name = parseColId(p)
+            if acceptKw(p, kw.AUTHORIZATION) { parseColId(p) }
+        }
+        return mkf(p, ast.K_CREATE_SCHEMA, 0, name, pos, p.empty, flags)
+    }
+    if acceptKw(p, kw.DATABASE) {
+        let name = parseColId(p)
+        acceptKw(p, kw.WITH)
+        let opts = parseLooseOptions(p)
+        return mk(p, ast.K_CREATE_DATABASE, 0, name, pos, [opts])
+    }
+    if isLabel(p) {
+        unsupported(p, "CREATE " + ttext(p))
+        return -1
+    }
+    syntaxError(p)
+    return -1
+}
+
+// name [=] value ... until end of statement
+function parseLooseOptions(p: P): Integer {
+    let pos = tstart(p)
+    let opts: List<Integer> = []
+    while !p.failed && !isSym(p, SEMI) && tk(p) != lexer.T_EOF {
+        let opos = tstart(p)
+        let key = parseLabel(p)
+        acceptSym(p, EQ)
+        opts.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [parseOptionValue(p)]))
+    }
+    return mkList(p, opts, pos)
+}
+
+function parseCreateTable(p: P, pos: Integer, flagsIn: Integer): Integer {
+    let flags = flagsIn
+    expectKw(p, kw.TABLE)
+    if parseIfNotExists(p) { flags = flags | ast.F_IF_NOT_EXISTS }
+    let name = parseObjectName(p)
+    let schema = slot(p, name, 0)
+    let tname = ast.text(p.tree, name)
+    // CREATE TABLE t [(a, b)] AS query
+    let ctasCols = isSym(p, LP) && isColIdAt(p, 1) && (isSymAt(p, 2, COMMA) || isSymAt(p, 2, RP))
+    if isKw(p, kw.AS) || ctasCols {
+        let cols = -1
+        if ctasCols { cols = parseNameList(p) }
+        let opts = -1
+        if isKw(p, kw.WITH) && isSymAt(p, 1, LP) {
+            advance(p)
+            opts = parseDefList(p)
+        }
+        expectKw(p, kw.AS)
+        let q = parseQuery(p)
+        if acceptKw(p, kw.WITH) {
+            if acceptKw(p, kw.NO) { flags = flags | ast.F_WITH_NO_DATA }
+            expectKw(p, kw.DATA)
+        }
+        return mkf(p, ast.K_CREATE_TABLE_AS, 0, tname, pos, [schema, cols, q, opts], flags)
+    }
+    let parentRef = -1
+    let bound = -1
+    let spec = -1
+    let lpos = tstart(p)
+    let elems: List<Integer> = []
+    if isKw(p, kw.PARTITION) && isKwAt(p, 1, kw.OF) {
+        advance(p)
+        advance(p)
+        parentRef = parseRelation(p, false)
+        if isSym(p, LP) {
+            // column options / table constraints for the partition
+            advance(p)
+            while !p.failed && !isSym(p, RP) {
+                if isTableConstraintStart(p) {
+                    elems.add(parseTableConstraint(p))
+                } else {
+                    skipToCommaOrEnd(p)
+                }
+                if !acceptSym(p, COMMA) { break }
+            }
+            expectSym(p, RP)
+        }
+        bound = parsePartBound(p)
+    } else {
+        expectSym(p, LP)
+        if !isSym(p, RP) {
+            while !p.failed {
+                let e = parseTableElement(p)
+                if e >= 0 { elems.add(e) }
+                if !acceptSym(p, COMMA) { break }
+            }
+        }
+        expectSym(p, RP)
+    }
+    let opts = -1
+    while !p.failed {
+        if acceptKw(p, kw.INHERITS) {
+            skipParens(p)
+        } else if isKw(p, kw.PARTITION) && isKwAt(p, 1, kw.BY) {
+            spec = parsePartSpec(p)
+        } else if isKw(p, kw.USING) {
+            advance(p)
+            parseLabel(p)
+        } else if isKw(p, kw.WITH) && isSymAt(p, 1, LP) {
+            advance(p)
+            opts = parseDefList(p)
+        } else if (isKw(p, kw.WITH) || isKw(p, kw.WITHOUT)) && isKwAt(p, 1, kw.OIDS) {
+            advance(p)
+            advance(p)
+        } else if isKw(p, kw.ON) && isKwAt(p, 1, kw.COMMIT) {
+            advance(p)
+            advance(p)
+            if acceptKw(p, kw.DROP) {
+            } else {
+                if !acceptKw(p, kw.PRESERVE) { expectKw(p, kw.DELETE) }
+                expectKw(p, kw.ROWS)
+            }
+        } else if acceptKw(p, kw.TABLESPACE) {
+            parseLabel(p)
+        } else {
+            break
+        }
+    }
+    return mkf(p, ast.K_CREATE_TABLE, 0, tname, pos, [schema, mkList(p, elems, lpos), opts, spec, parentRef, bound], flags)
+}
+
+// PARTITION BY {RANGE | LIST | HASH} (key [opclass], ...)
+function parsePartSpec(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    advance(p)
+    let op = 0
+    if isWord(p, "range") || isKw(p, kw.RANGE) {
+        op = ast.PART_RANGE
+    } else if isWord(p, "list") {
+        op = ast.PART_LIST
+    } else if isWord(p, "hash") {
+        op = ast.PART_HASH
+    } else {
+        failAt(p, "unrecognized partitioning strategy \"" + ttext(p) + "\"", tstart(p), "22023")
+        return -1
+    }
+    advance(p)
+    let lpos = tstart(p)
+    expectSym(p, LP)
+    let keys: List<Integer> = []
+    while !p.failed {
+        let kpos = tstart(p)
+        let e = parseExpr(p)
+        let opclass = ""
+        if acceptKw(p, kw.COLLATE) { parseLabel(p) }
+        if isColId(p) { opclass = parseColId(p) }
+        keys.add(mk(p, ast.K_DEF_ELEM, 0, opclass, kpos, [e]))
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    return mk(p, ast.K_PART_SPEC, op, "", pos, [mkList(p, keys, lpos)])
+}
+
+// FOR VALUES IN (..) | FROM (..) TO (..) | WITH (MODULUS m, REMAINDER r) | DEFAULT
+function parsePartBound(p: P): Integer {
+    let pos = tstart(p)
+    if acceptKw(p, kw.DEFAULT) { return mk(p, ast.K_PART_BOUND, ast.PB_DEFAULT, "", pos, [-1, -1]) }
+    expectKw(p, kw.FOR)
+    expectKw(p, kw.VALUES)
+    if acceptKw(p, kw.IN) {
+        return mk(p, ast.K_PART_BOUND, ast.PB_LIST, "", pos, [parseBoundList(p), -1])
+    }
+    if acceptKw(p, kw.FROM) {
+        let lo = parseBoundList(p)
+        expectKw(p, kw.TO)
+        let hi = parseBoundList(p)
+        return mk(p, ast.K_PART_BOUND, ast.PB_RANGE, "", pos, [lo, hi])
+    }
+    expectKw(p, kw.WITH)
+    let lpos = tstart(p)
+    expectSym(p, LP)
+    let mods: List<Integer> = [-1, -1]
+    while !p.failed {
+        let w = parseLabel(p)
+        let v = parseFetchCount(p)
+        if w == "modulus" {
+            mods[0] = mkInt(p, v, lpos)
+        } else if w == "remainder" {
+            mods[1] = mkInt(p, v, lpos)
+        } else {
+            failAt(p, "unrecognized hash partition bound specification \"" + w + "\"", lpos, "42601")
+        }
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    if !p.failed && (mods[0] < 0 || mods[1] < 0) {
+        failAt(p, "modulus and remainder must be specified for hash partition", lpos, "42601")
+    }
+    return mk(p, ast.K_PART_BOUND, ast.PB_HASH, "", pos, [mkList(p, mods, lpos), -1])
+}
+
+// '(' value | MINVALUE | MAXVALUE, ... ')'
+function parseBoundList(p: P): Integer {
+    let pos = tstart(p)
+    expectSym(p, LP)
+    let items: List<Integer> = []
+    while !p.failed {
+        let ipos = tstart(p)
+        if (isWord(p, "minvalue") || isWord(p, "maxvalue")) && (isSymAt(p, 1, COMMA) || isSymAt(p, 1, RP)) {
+            items.add(mkName(p, ttext(p), ipos))
+            advance(p)
+        } else {
+            items.add(parseExpr(p))
+        }
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    return mkList(p, items, pos)
+}
+
+// skip a balanced parenthesised group
+function skipParens(p: P) {
+    expectSym(p, LP)
+    let depth = 1
+    while !p.failed && depth > 0 {
+        if tk(p) == lexer.T_EOF {
+            syntaxError(p)
+            return
+        }
+        if isSym(p, LP) { depth += 1 }
+        if isSym(p, RP) { depth -= 1 }
+        advance(p)
+    }
+}
+
+// '(' name [= value], ... ')' -> K_LIST of K_DEF_ELEM
+function parseDefList(p: P): Integer {
+    let pos = tstart(p)
+    expectSym(p, LP)
+    let items: List<Integer> = []
+    while !p.failed && !isSym(p, RP) {
+        let opos = tstart(p)
+        let key = parseLabel(p)
+        while acceptSym(p, DOT) { key = key + "." + parseLabel(p) }
+        let v = -1
+        if acceptSym(p, EQ) {
+            v = parseOptionValue(p)
+        } else if !isSym(p, COMMA) && !isSym(p, RP) {
+            v = parseOptionValue(p)
+        }
+        items.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [v]))
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    return mkList(p, items, pos)
+}
+
+// option value: string, number (signed), bare word, '*', or a parenthesised name list
+function parseOptionValue(p: P): Integer {
+    let pos = tstart(p)
+    let k = tk(p)
+    if k == lexer.T_STR {
+        let s = mkStr(p, ttext(p), pos)
+        advance(p)
+        return s
+    }
+    if k == lexer.T_INT || k == lexer.T_NUM || isSym(p, MINUS) || isSym(p, PLUS) { return parseUnary(p) }
+    if k == lexer.T_IDENT || k == lexer.T_QIDENT {
+        let w = ttext(p)
+        advance(p)
+        return mkName(p, w, pos)
+    }
+    if isSym(p, STAR) {
+        advance(p)
+        return mk(p, ast.K_STAR, 0, "", pos, p.empty)
+    }
+    if isSym(p, LP) { return parseNameList(p) }
+    syntaxError(p)
+    return -1
+}
+
+function isTableConstraintStart(p: P): Boolean {
+    return isKw(p, kw.CONSTRAINT) || isKw(p, kw.PRIMARY) || isKw(p, kw.UNIQUE) || isKw(p, kw.FOREIGN) ||
+        isKw(p, kw.CHECK) || isKw(p, kw.EXCLUDE)
+}
+
+function parseTableElement(p: P): Integer {
+    if isTableConstraintStart(p) { return parseTableConstraint(p) }
+    if isKw(p, kw.LIKE) {
+        let pos = tstart(p)
+        advance(p)
+        let ref = parseRelation(p, false)
+        let flags = 0
+        while !p.failed && (isKw(p, kw.INCLUDING) || isKw(p, kw.EXCLUDING)) {
+            let inc = isKw(p, kw.INCLUDING)
+            advance(p)
+            let what = parseLabel(p)
+            if inc && (what == "defaults" || what == "all") { flags = flags | ast.F_LIKE_DEFAULTS }
+        }
+        return mkf(p, ast.K_TABLE_LIKE, 0, "", pos, [ref], flags)
+    }
+    return parseColumnDef(p)
+}
+
+function parseColumnDef(p: P): Integer {
+    let pos = tstart(p)
+    let name = parseColId(p)
+    let t = parseTypeName(p)
+    let cons: List<Integer> = []
+    let lpos = tstart(p)
+    while !p.failed && !isSym(p, COMMA) && !isSym(p, RP) && !isSym(p, SEMI) && tk(p) != lexer.T_EOF {
+        if isConstraintAttr(p) {
+            if cons.length > 0 {
+                parseConstraintAttrs(p, cons[cons.length - 1])
+            } else {
+                syntaxError(p)
+            }
+            continue
+        }
+        if acceptKw(p, kw.COLLATE) {
+            parseLabel(p)
+            while acceptSym(p, DOT) { parseLabel(p) }
+            continue
+        }
+        cons.add(parseColumnConstraint(p))
+    }
+    return mk(p, ast.K_COLUMN_DEF, 0, name, pos, [t, mkList(p, cons, lpos)])
+}
+
+function isConstraintAttr(p: P): Boolean {
+    return isKw(p, kw.DEFERRABLE) || isKw(p, kw.INITIALLY) || (isKw(p, kw.NOT) && (isKwAt(p, 1, kw.DEFERRABLE) || isKwAt(p, 1, kw.VALID)))
+}
+
+function parseConstraintAttrs(p: P, c: Integer) {
+    while !p.failed && isConstraintAttr(p) {
+        if acceptKw(p, kw.DEFERRABLE) {
+            setFlag(p, c, ast.F_DEFERRABLE)
+        } else if acceptKw(p, kw.INITIALLY) {
+            if acceptKw(p, kw.DEFERRED) {
+                setFlag(p, c, ast.F_INITIALLY_DEFERRED)
+            } else {
+                expectKw(p, kw.IMMEDIATE)
+            }
+        } else {
+            advance(p)
+            if acceptKw(p, kw.VALID) {
+                setFlag(p, c, ast.F_NOT_VALID)
+            } else {
+                expectKw(p, kw.DEFERRABLE)
+            }
+        }
+    }
+}
+
+function parseColumnConstraint(p: P): Integer {
+    let pos = tstart(p)
+    let name = ""
+    if acceptKw(p, kw.CONSTRAINT) { name = parseColId(p) }
+    if isKw(p, kw.NOT) && isKwAt(p, 1, kw.NULL) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_NOT_NULL, name, pos, [-1, -1, -1, -1, -1])
+    }
+    if acceptKw(p, kw.NULL) { return mk(p, ast.K_CONSTRAINT, ast.CONSTR_NULL, name, pos, [-1, -1, -1, -1, -1]) }
+    if acceptKw(p, kw.DEFAULT) {
+        let e = parseOther(p)
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_DEFAULT, name, pos, [e, -1, -1, -1, -1])
+    }
+    if isKw(p, kw.PRIMARY) {
+        advance(p)
+        expectKw(p, kw.KEY)
+        let opts = parseIndexParams(p)
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_PRIMARY_KEY, name, pos, [-1, -1, -1, -1, opts])
+    }
+    if acceptKw(p, kw.UNIQUE) {
+        skipNullsDistinct(p)
+        let opts = parseIndexParams(p)
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_UNIQUE, name, pos, [-1, -1, -1, -1, opts])
+    }
+    if acceptKw(p, kw.REFERENCES) {
+        let c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_FOREIGN_KEY, name, pos, [-1, -1, -1, -1, -1])
+        parseReferences(p, c)
+        return c
+    }
+    if acceptKw(p, kw.CHECK) {
+        expectSym(p, LP)
+        let e = parseExpr(p)
+        expectSym(p, RP)
+        if isKw(p, kw.NO) && isKwAt(p, 1, kw.INHERIT) {
+            advance(p)
+            advance(p)
+        }
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_CHECK, name, pos, [e, -1, -1, -1, -1])
+    }
+    if acceptKw(p, kw.GENERATED) {
+        let always = 1
+        if acceptKw(p, kw.BY) {
+            expectKw(p, kw.DEFAULT)
+            always = 0
+        } else {
+            expectKw(p, kw.ALWAYS)
+        }
+        expectKw(p, kw.AS)
+        if acceptKw(p, kw.IDENTITY) {
+            let opts = -1
+            if isSym(p, LP) { skipParens(p) }
+            let c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_IDENTITY, name, pos, [-1, -1, -1, -1, opts])
+            setInt(p, c, always)
+            return c
+        }
+        expectSym(p, LP)
+        let e = parseExpr(p)
+        expectSym(p, RP)
+        expectKw(p, kw.STORED)
+        return mk(p, ast.K_CONSTRAINT, ast.CONSTR_GENERATED, name, pos, [e, -1, -1, -1, -1])
+    }
+    syntaxError(p)
+    return -1
+}
+
+function skipNullsDistinct(p: P) {
+    if isKw(p, kw.NULLS) {
+        advance(p)
+        acceptKw(p, kw.NOT)
+        expectKw(p, kw.DISTINCT)
+    }
+}
+
+// [INCLUDE (..)] [WITH (..)] [USING INDEX TABLESPACE x]
+function parseIndexParams(p: P): Integer {
+    let opts = -1
+    while !p.failed {
+        if acceptKw(p, kw.INCLUDE) {
+            parseNameList(p)
+        } else if isKw(p, kw.WITH) && isSymAt(p, 1, LP) {
+            advance(p)
+            opts = parseDefList(p)
+        } else if isKw(p, kw.USING) && isKwAt(p, 1, kw.INDEX) {
+            advance(p)
+            advance(p)
+            expectKw(p, kw.TABLESPACE)
+            parseLabel(p)
+        } else {
+            return opts
+        }
+    }
+    return opts
+}
+
+// after REFERENCES: table [(cols)] [MATCH x] [ON DELETE a] [ON UPDATE a]
+function parseReferences(p: P, c: Integer) {
+    let t = parseObjectName(p)
+    setSlot(p, c, 2, t)
+    if isSym(p, LP) { setSlot(p, c, 3, parseNameList(p)) }
+    let onDelete = 0
+    let onUpdate = 0
+    while !p.failed {
+        if acceptKw(p, kw.MATCH) {
+            parseLabel(p)
+        } else if isKw(p, kw.ON) && (isKwAt(p, 1, kw.DELETE) || isKwAt(p, 1, kw.UPDATE)) {
+            advance(p)
+            let isDelete = isKw(p, kw.DELETE)
+            advance(p)
+            let action = parseFkAction(p)
+            if isDelete { onDelete = action } else { onUpdate = action }
+        } else {
+            break
+        }
+    }
+    setInt(p, c, onDelete + 8 * onUpdate)
+}
+
+function parseFkAction(p: P): Integer {
+    if acceptKw(p, kw.CASCADE) { return ast.FK_CASCADE }
+    if acceptKw(p, kw.RESTRICT) { return ast.FK_RESTRICT }
+    if acceptKw(p, kw.NO) {
+        expectKw(p, kw.ACTION)
+        return ast.FK_NO_ACTION
+    }
+    expectKw(p, kw.SET)
+    let a = ast.FK_SET_NULL
+    if acceptKw(p, kw.DEFAULT) {
+        a = ast.FK_SET_DEFAULT
+    } else {
+        expectKw(p, kw.NULL)
+    }
+    if isSym(p, LP) { parseNameList(p) }
+    return a
+}
+
+function parseTableConstraint(p: P): Integer {
+    let pos = tstart(p)
+    let name = ""
+    if acceptKw(p, kw.CONSTRAINT) { name = parseColId(p) }
+    let c = -1
+    if isKw(p, kw.PRIMARY) {
+        advance(p)
+        expectKw(p, kw.KEY)
+        let cols = parseNameList(p)
+        let opts = parseIndexParams(p)
+        c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_PRIMARY_KEY, name, pos, [-1, cols, -1, -1, opts])
+    } else if acceptKw(p, kw.UNIQUE) {
+        skipNullsDistinct(p)
+        let cols = parseNameList(p)
+        let opts = parseIndexParams(p)
+        c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_UNIQUE, name, pos, [-1, cols, -1, -1, opts])
+    } else if acceptKw(p, kw.FOREIGN) {
+        expectKw(p, kw.KEY)
+        let cols = parseNameList(p)
+        expectKw(p, kw.REFERENCES)
+        c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_FOREIGN_KEY, name, pos, [-1, cols, -1, -1, -1])
+        parseReferences(p, c)
+    } else if acceptKw(p, kw.CHECK) {
+        expectSym(p, LP)
+        let e = parseExpr(p)
+        expectSym(p, RP)
+        if isKw(p, kw.NO) && isKwAt(p, 1, kw.INHERIT) {
+            advance(p)
+            advance(p)
+        }
+        c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_CHECK, name, pos, [e, -1, -1, -1, -1])
+    } else if acceptKw(p, kw.EXCLUDE) {
+        if acceptKw(p, kw.USING) { parseLabel(p) }
+        skipParens(p)
+        parseIndexParams(p)
+        if acceptKw(p, kw.WHERE) { skipParens(p) }
+        c = mk(p, ast.K_CONSTRAINT, ast.CONSTR_EXCLUDE, name, pos, [-1, -1, -1, -1, -1])
+    } else {
+        syntaxError(p)
+        return -1
+    }
+    parseConstraintAttrs(p, c)
+    return c
+}
+
+function parseCreateIndex(p: P, pos: Integer): Integer {
+    let flags = 0
+    if acceptKw(p, kw.UNIQUE) { flags = ast.F_UNIQUE }
+    expectKw(p, kw.INDEX)
+    if acceptKw(p, kw.CONCURRENTLY) { flags = flags | ast.F_CONCURRENTLY }
+    if parseIfNotExists(p) { flags = flags | ast.F_IF_NOT_EXISTS }
+    let name = ""
+    if !isKw(p, kw.ON) {
+        name = parseColId(p)
+        if acceptSym(p, DOT) { name = parseLabel(p) }
+    }
+    expectKw(p, kw.ON)
+    let table = parseRelation(p, false)
+    let method = -1
+    if acceptKw(p, kw.USING) { method = mkName(p, parseLabel(p), tstart(p)) }
+    let lpos = tstart(p)
+    expectSym(p, LP)
+    let elems: List<Integer> = []
+    while !p.failed {
+        let epos = tstart(p)
+        let e = parseExpr(p)
+        if acceptKw(p, kw.COLLATE) { parseLabel(p) }
+        if isColId(p) && !isKw(p, kw.NULLS) {
+            // operator class
+            advance(p)
+            while acceptSym(p, DOT) { parseLabel(p) }
+            if isSym(p, LP) { skipParens(p) }
+        }
+        let op = ast.SORT_DEFAULT
+        if acceptKw(p, kw.ASC) {
+            op = ast.SORT_ASC
+        } else if acceptKw(p, kw.DESC) {
+            op = ast.SORT_DESC
+        }
+        let nulls = ast.NULLS_DEFAULT
+        if acceptKw(p, kw.NULLS) {
+            if acceptKw(p, kw.FIRST) {
+                nulls = ast.NULLS_FIRST
+            } else {
+                expectKw(p, kw.LAST)
+                nulls = ast.NULLS_LAST
+            }
+        }
+        let item = mk(p, ast.K_SORT_ITEM, op, "", epos, [e])
+        setInt(p, item, nulls)
+        elems.add(item)
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    let include = -1
+    let opts = -1
+    let where = -1
+    while !p.failed {
+        if isKw(p, kw.INCLUDE) {
+            advance(p)
+            include = parseNameList(p)
+        } else if isKw(p, kw.NULLS) {
+            skipNullsDistinct(p)
+        } else if isKw(p, kw.WITH) && isSymAt(p, 1, LP) {
+            advance(p)
+            opts = parseDefList(p)
+        } else if acceptKw(p, kw.TABLESPACE) {
+            parseLabel(p)
+        } else if acceptKw(p, kw.WHERE) {
+            where = parseExpr(p)
+        } else {
+            break
+        }
+    }
+    return mkf(p, ast.K_CREATE_INDEX, 0, name, pos, [table, mkList(p, elems, lpos), where, include, opts, method], flags)
+}
+
+function parseCreateView(p: P, pos: Integer, flagsIn: Integer): Integer {
+    let flags = flagsIn
+    if acceptKw(p, kw.MATERIALIZED) { flags = flags | ast.F_MATERIALIZED }
+    acceptKw(p, kw.RECURSIVE)
+    expectKw(p, kw.VIEW)
+    if parseIfNotExists(p) { flags = flags | ast.F_IF_NOT_EXISTS }
+    let name = parseObjectName(p)
+    let cols = -1
+    if isSym(p, LP) { cols = parseNameList(p) }
+    if isKw(p, kw.WITH) && isSymAt(p, 1, LP) {
+        advance(p)
+        parseDefList(p)
+    }
+    expectKw(p, kw.AS)
+    let q = parseQuery(p)
+    if acceptKw(p, kw.WITH) {
+        if !acceptKw(p, kw.CASCADED) { acceptKw(p, kw.LOCAL) }
+        if acceptKw(p, kw.CHECK) {
+            expectKw(p, kw.OPTION)
+        } else {
+            if acceptKw(p, kw.NO) { flags = flags | ast.F_WITH_NO_DATA }
+            expectKw(p, kw.DATA)
+        }
+    }
+    return mkf(p, ast.K_CREATE_VIEW, 0, ast.text(p.tree, name), pos, [slot(p, name, 0), cols, q], flags)
+}
+
+function parseDrop(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.DROP)
+    let obj = 0
+    let flags = 0
+    if acceptKw(p, kw.TABLE) {
+        obj = ast.OBJ_TABLE
+    } else if acceptKw(p, kw.INDEX) {
+        obj = ast.OBJ_INDEX
+        if acceptKw(p, kw.CONCURRENTLY) { flags = ast.F_CONCURRENTLY }
+    } else if acceptKw(p, kw.VIEW) {
+        obj = ast.OBJ_VIEW
+    } else if isKw(p, kw.MATERIALIZED) && isKwAt(p, 1, kw.VIEW) {
+        advance(p)
+        advance(p)
+        obj = ast.OBJ_MATERIALIZED_VIEW
+    } else if acceptKw(p, kw.SEQUENCE) {
+        obj = ast.OBJ_SEQUENCE
+    } else if acceptKw(p, kw.SCHEMA) {
+        obj = ast.OBJ_SCHEMA
+    } else if acceptKw(p, kw.DATABASE) {
+        obj = ast.OBJ_DATABASE
+    } else if acceptKw(p, kw.TYPE) {
+        obj = ast.OBJ_TYPE
+    } else if acceptKw(p, kw.FUNCTION) {
+        obj = ast.OBJ_FUNCTION
+    } else if acceptKw(p, kw.EXTENSION) {
+        obj = ast.OBJ_EXTENSION
+    } else {
+        if isLabel(p) {
+            unsupported(p, "DROP " + ttext(p))
+            return -1
+        }
+        syntaxError(p)
+        return -1
+    }
+    if parseIfExists(p) { flags = flags | ast.F_IF_EXISTS }
+    let lpos = tstart(p)
+    let names: List<Integer> = []
+    while !p.failed {
+        names.add(parseObjectName(p))
+        if obj == ast.OBJ_FUNCTION && isSym(p, LP) { skipParens(p) }
+        if !acceptSym(p, COMMA) { break }
+    }
+    if acceptKw(p, kw.CASCADE) {
+        flags = flags | ast.F_CASCADE
+    } else if acceptKw(p, kw.RESTRICT) {
+        flags = flags | ast.F_RESTRICT
+    }
+    return mkf(p, ast.K_DROP, obj, "", pos, [mkList(p, names, lpos)], flags)
+}
+
+function parseAlter(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.ALTER)
+    if !acceptKw(p, kw.TABLE) {
+        if isLabel(p) {
+            unsupported(p, "ALTER " + ttext(p))
+            return -1
+        }
+        syntaxError(p)
+        return -1
+    }
+    let flags = 0
+    if parseIfExists(p) { flags = ast.F_IF_EXISTS }
+    if acceptKw(p, kw.ONLY) { flags = flags | ast.F_ONLY }
+    let table = parseRelation(p, false)
+    let lpos = tstart(p)
+    let cmds: List<Integer> = []
+    while !p.failed {
+        cmds.add(parseAlterCmd(p))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkf(p, ast.K_ALTER_TABLE, 0, "", pos, [table, mkList(p, cmds, lpos)], flags)
+}
+
+function parseAlterCmd(p: P): Integer {
+    let pos = tstart(p)
+    if acceptKw(p, kw.ADD) {
+        if isTableConstraintStart(p) {
+            let c = parseTableConstraint(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_ADD_CONSTRAINT, ast.text(p.tree, c), pos, [c, -1])
+        }
+        acceptKw(p, kw.COLUMN)
+        let flags = 0
+        if parseIfNotExists(p) { flags = ast.F_IF_NOT_EXISTS }
+        let d = parseColumnDef(p)
+        return mkf(p, ast.K_ALTER_CMD, ast.AT_ADD_COLUMN, ast.text(p.tree, d), pos, [d, -1], flags)
+    }
+    if acceptKw(p, kw.DROP) {
+        let op = ast.AT_DROP_COLUMN
+        if acceptKw(p, kw.CONSTRAINT) {
+            op = ast.AT_DROP_CONSTRAINT
+        } else {
+            acceptKw(p, kw.COLUMN)
+        }
+        let flags = 0
+        if parseIfExists(p) { flags = ast.F_IF_EXISTS }
+        let name = parseColId(p)
+        if acceptKw(p, kw.CASCADE) {
+            flags = flags | ast.F_CASCADE
+        } else {
+            acceptKw(p, kw.RESTRICT)
+        }
+        return mkf(p, ast.K_ALTER_CMD, op, name, pos, [-1, -1], flags)
+    }
+    if acceptKw(p, kw.ALTER) {
+        acceptKw(p, kw.COLUMN)
+        let col = parseColId(p)
+        if isKw(p, kw.TYPE) || (isKw(p, kw.SET) && isKwAt(p, 1, kw.DATA)) {
+            if acceptKw(p, kw.SET) { expectKw(p, kw.DATA) }
+            expectKw(p, kw.TYPE)
+            let t = parseTypeName(p)
+            if acceptKw(p, kw.COLLATE) { parseLabel(p) }
+            if acceptKw(p, kw.USING) { parseExpr(p) }
+            return mk(p, ast.K_ALTER_CMD, ast.AT_ALTER_COLUMN_TYPE, col, pos, [t, -1])
+        }
+        if isKw(p, kw.SET) && isKwAt(p, 1, kw.DEFAULT) {
+            advance(p)
+            advance(p)
+            let e = parseOther(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_SET_DEFAULT, col, pos, [e, -1])
+        }
+        if isKw(p, kw.DROP) && isKwAt(p, 1, kw.DEFAULT) {
+            advance(p)
+            advance(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_DROP_DEFAULT, col, pos, [-1, -1])
+        }
+        if isKw(p, kw.SET) && isKwAt(p, 1, kw.NOT) && isKwAt(p, 2, kw.NULL) {
+            advance(p)
+            advance(p)
+            advance(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_SET_NOT_NULL, col, pos, [-1, -1])
+        }
+        if isKw(p, kw.DROP) && isKwAt(p, 1, kw.NOT) && isKwAt(p, 2, kw.NULL) {
+            advance(p)
+            advance(p)
+            advance(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_DROP_NOT_NULL, col, pos, [-1, -1])
+        }
+        skipToCommaOrEnd(p)
+        return mk(p, ast.K_ALTER_CMD, ast.AT_OTHER, col, pos, [-1, -1])
+    }
+    if acceptKw(p, kw.RENAME) {
+        if acceptKw(p, kw.TO) {
+            let npos = tstart(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_RENAME_TABLE, "", pos, [-1, mkName(p, parseColId(p), npos)])
+        }
+        let op = ast.AT_RENAME_COLUMN
+        if acceptKw(p, kw.CONSTRAINT) {
+            op = ast.AT_RENAME_CONSTRAINT
+        } else {
+            acceptKw(p, kw.COLUMN)
+        }
+        let old = parseColId(p)
+        expectKw(p, kw.TO)
+        let npos = tstart(p)
+        return mk(p, ast.K_ALTER_CMD, op, old, pos, [-1, mkName(p, parseColId(p), npos)])
+    }
+    if isKw(p, kw.SET) && isSymAt(p, 1, LP) {
+        advance(p)
+        let opts = parseDefList(p)
+        return mk(p, ast.K_ALTER_CMD, ast.AT_SET_OPTIONS, "", pos, [opts, -1])
+    }
+    if (isWord(p, "attach") || isWord(p, "detach")) && isKwAt(p, 1, kw.PARTITION) {
+        let attach = isWord(p, "attach")
+        advance(p)
+        advance(p)
+        let part = parseRelation(p, false)
+        if attach {
+            let b = parsePartBound(p)
+            return mk(p, ast.K_ALTER_CMD, ast.AT_ATTACH_PARTITION, "", pos, [b, part])
+        }
+        if !acceptKw(p, kw.CONCURRENTLY) { acceptWord(p, "finalize") }
+        return mk(p, ast.K_ALTER_CMD, ast.AT_DETACH_PARTITION, "", pos, [-1, part])
+    }
+    let what = ""
+    if isLabel(p) { what = ttext(p) }
+    skipToCommaOrEnd(p)
+    return mk(p, ast.K_ALTER_CMD, ast.AT_OTHER, what, pos, [-1, -1])
+}
+
+function skipToCommaOrEnd(p: P) {
+    let depth = 0
+    while !p.failed && tk(p) != lexer.T_EOF {
+        if depth == 0 && (isSym(p, COMMA) || isSym(p, SEMI)) { return }
+        if isSym(p, LP) { depth += 1 }
+        if isSym(p, RP) { depth -= 1 }
+        advance(p)
+    }
+}
+
+function parseTruncate(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.TRUNCATE)
+    acceptKw(p, kw.TABLE)
+    let lpos = tstart(p)
+    let names: List<Integer> = []
+    while !p.failed {
+        names.add(parseRelation(p, false))
+        if !acceptSym(p, COMMA) { break }
+    }
+    let flags = 0
+    if acceptKw(p, kw.RESTART) {
+        expectKw(p, kw.IDENTITY)
+        flags = ast.F_RESTART_IDENTITY
+    } else if acceptKw(p, kw.CONTINUE) {
+        expectKw(p, kw.IDENTITY)
+    }
+    if acceptKw(p, kw.CASCADE) {
+        flags = flags | ast.F_CASCADE
+    } else if acceptKw(p, kw.RESTRICT) {
+        flags = flags | ast.F_RESTRICT
+    }
+    return mkf(p, ast.K_TRUNCATE, 0, "", pos, [mkList(p, names, lpos)], flags)
+}
+
+// ---------------------------------------------------------------- utility statements
+
+// transaction modes; sets intValue (isolation) and flags on node id
+function parseTxModes(p: P, id: Integer) {
+    while !p.failed {
+        if isKw(p, kw.ISOLATION) {
+            advance(p)
+            expectKw(p, kw.LEVEL)
+            if acceptKw(p, kw.SERIALIZABLE) {
+                setInt(p, id, ast.ISO_SERIALIZABLE)
+            } else if acceptKw(p, kw.REPEATABLE) {
+                expectKw(p, kw.READ)
+                setInt(p, id, ast.ISO_REPEATABLE_READ)
+            } else {
+                expectKw(p, kw.READ)
+                if acceptKw(p, kw.COMMITTED) {
+                    setInt(p, id, ast.ISO_READ_COMMITTED)
+                } else {
+                    expectKw(p, kw.UNCOMMITTED)
+                    setInt(p, id, ast.ISO_READ_UNCOMMITTED)
+                }
+            }
+        } else if isKw(p, kw.READ) && isKwAt(p, 1, kw.ONLY) {
+            advance(p)
+            advance(p)
+            setFlag(p, id, ast.F_TX_READ_ONLY)
+        } else if isKw(p, kw.READ) && isKwAt(p, 1, kw.WRITE) {
+            advance(p)
+            advance(p)
+            setFlag(p, id, ast.F_TX_READ_WRITE)
+        } else if acceptKw(p, kw.DEFERRABLE) {
+            setFlag(p, id, ast.F_TX_DEFERRABLE)
+        } else if isKw(p, kw.NOT) && isKwAt(p, 1, kw.DEFERRABLE) {
+            advance(p)
+            advance(p)
+            setFlag(p, id, ast.F_TX_NOT_DEFERRABLE)
+        } else if acceptSym(p, COMMA) {
+            // separators are optional
+        } else {
+            return
+        }
+    }
+}
+
+function parseChain(p: P, id: Integer) {
+    if isKw(p, kw.AND) {
+        advance(p)
+        if acceptKw(p, kw.NO) {
+            expectKw(p, kw.CHAIN)
+        } else {
+            expectKw(p, kw.CHAIN)
+            setFlag(p, id, ast.F_TX_CHAIN)
+        }
+    }
+}
+
+function parseTransaction(p: P): Integer {
+    let pos = tstart(p)
+    let w = tkw(p)
+    advance(p)
+    if w == kw.BEGIN || w == kw.START {
+        if w == kw.START {
+            expectKw(p, kw.TRANSACTION)
+        } else if !acceptKw(p, kw.WORK) {
+            acceptKw(p, kw.TRANSACTION)
+        }
+        let id = mk(p, ast.K_TRANSACTION, ast.TX_BEGIN, "", pos, p.empty)
+        if w == kw.START { setFlag(p, id, ast.F_TX_START) }
+        parseTxModes(p, id)
+        return id
+    }
+    if w == kw.COMMIT || w == kw.END {
+        if w == kw.COMMIT && acceptKw(p, kw.PREPARED) {
+            let gid = ttext(p)
+            if tk(p) != lexer.T_STR { syntaxError(p) }
+            advance(p)
+            return mk(p, ast.K_TRANSACTION, ast.TX_COMMIT_PREPARED, gid, pos, p.empty)
+        }
+        if !acceptKw(p, kw.WORK) { acceptKw(p, kw.TRANSACTION) }
+        let id = mk(p, ast.K_TRANSACTION, ast.TX_COMMIT, "", pos, p.empty)
+        parseChain(p, id)
+        return id
+    }
+    if w == kw.ROLLBACK || w == kw.ABORT {
+        if w == kw.ROLLBACK && acceptKw(p, kw.PREPARED) {
+            let gid = ttext(p)
+            if tk(p) != lexer.T_STR { syntaxError(p) }
+            advance(p)
+            return mk(p, ast.K_TRANSACTION, ast.TX_ROLLBACK_PREPARED, gid, pos, p.empty)
+        }
+        if !acceptKw(p, kw.WORK) { acceptKw(p, kw.TRANSACTION) }
+        if w == kw.ROLLBACK && acceptKw(p, kw.TO) {
+            acceptKw(p, kw.SAVEPOINT)
+            let name = parseColId(p)
+            return mk(p, ast.K_TRANSACTION, ast.TX_ROLLBACK_TO, name, pos, p.empty)
+        }
+        let id = mk(p, ast.K_TRANSACTION, ast.TX_ROLLBACK, "", pos, p.empty)
+        parseChain(p, id)
+        return id
+    }
+    if w == kw.SAVEPOINT {
+        let name = parseColId(p)
+        return mk(p, ast.K_TRANSACTION, ast.TX_SAVEPOINT, name, pos, p.empty)
+    }
+    if w == kw.RELEASE {
+        acceptKw(p, kw.SAVEPOINT)
+        let name = parseColId(p)
+        return mk(p, ast.K_TRANSACTION, ast.TX_RELEASE, name, pos, p.empty)
+    }
+    // PREPARE TRANSACTION 'gid'
+    expectKw(p, kw.TRANSACTION)
+    let gid = ttext(p)
+    if tk(p) != lexer.T_STR { syntaxError(p) }
+    advance(p)
+    return mk(p, ast.K_TRANSACTION, ast.TX_PREPARE, gid, pos, p.empty)
+}
+
+function parseVarName(p: P): Text {
+    let name = parseLabel(p)
+    while !p.failed && isSym(p, DOT) {
+        advance(p)
+        name = name + "." + parseLabel(p)
+    }
+    return name
+}
+
+function parseSetValue(p: P): Integer {
+    let pos = tstart(p)
+    let k = tk(p)
+    if k == lexer.T_STR {
+        let s = mkStr(p, ttext(p), pos)
+        advance(p)
+        return s
+    }
+    if k == lexer.T_INT || k == lexer.T_NUM || isSym(p, MINUS) || isSym(p, PLUS) { return parseUnary(p) }
+    if k == lexer.T_IDENT || k == lexer.T_QIDENT {
+        let w = ttext(p)
+        advance(p)
+        return mkName(p, w, pos)
+    }
+    syntaxError(p)
+    return -1
+}
+
+function parseSet(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.SET)
+    if acceptKw(p, kw.TRANSACTION) {
+        let id = mk(p, ast.K_SET_TRANSACTION, 0, "", pos, p.empty)
+        if acceptKw(p, kw.SNAPSHOT) {
+            unsupported(p, "SET TRANSACTION SNAPSHOT")
+            return -1
+        }
+        parseTxModes(p, id)
+        return id
+    }
+    if isKw(p, kw.SESSION) && isKwAt(p, 1, kw.CHARACTERISTICS) {
+        advance(p)
+        advance(p)
+        expectKw(p, kw.AS)
+        expectKw(p, kw.TRANSACTION)
+        let id = mkf(p, ast.K_SET_TRANSACTION, 0, "", pos, p.empty, ast.F_TX_SESSION_CHARACTERISTICS)
+        parseTxModes(p, id)
+        return id
+    }
+    let flags = 0
+    if isKw(p, kw.SESSION) && !isSymAt(p, 1, EQ) && !isKwAt(p, 1, kw.TO) {
+        advance(p)
+        flags = ast.F_SET_SESSION
+    } else if isKw(p, kw.LOCAL) && !isSymAt(p, 1, EQ) && !isKwAt(p, 1, kw.TO) {
+        advance(p)
+        flags = ast.F_SET_LOCAL
+    }
+    let name = ""
+    if isKw(p, kw.TIME) && isKwAt(p, 1, kw.ZONE) {
+        advance(p)
+        advance(p)
+        if acceptKw(p, kw.LOCAL) || acceptKw(p, kw.DEFAULT) {
+            return mkf(p, ast.K_SET, ast.SET_DEFAULT, "timezone", pos, [-1], flags)
+        }
+        let v = -1
+        if isKw(p, kw.INTERVAL) {
+            v = parseExpr(p)
+        } else {
+            v = parseSetValue(p)
+        }
+        return mkf(p, ast.K_SET, ast.SET_VALUE, "timezone", pos, [mkList(p, [v], pos)], flags)
+    }
+    if acceptKw(p, kw.NAMES) {
+        let vals: List<Integer> = []
+        if acceptKw(p, kw.DEFAULT) {
+            return mkf(p, ast.K_SET, ast.SET_DEFAULT, "client_encoding", pos, [-1], flags)
+        }
+        vals.add(parseSetValue(p))
+        return mkf(p, ast.K_SET, ast.SET_VALUE, "client_encoding", pos, [mkList(p, vals, pos)], flags)
+    }
+    if isKw(p, kw.SCHEMA) && tkAt(p, 1) == lexer.T_STR {
+        advance(p)
+        let v = parseSetValue(p)
+        return mkf(p, ast.K_SET, ast.SET_VALUE, "search_path", pos, [mkList(p, [v], pos)], flags)
+    }
+    if isKw(p, kw.SESSION) && isKwAt(p, 1, kw.AUTHORIZATION) {
+        advance(p)
+        advance(p)
+        if acceptKw(p, kw.DEFAULT) {
+            return mkf(p, ast.K_SET, ast.SET_DEFAULT, "session_authorization", pos, [-1], flags)
+        }
+        let v = parseSetValue(p)
+        return mkf(p, ast.K_SET, ast.SET_VALUE, "session_authorization", pos, [mkList(p, [v], pos)], flags)
+    }
+    if isKw(p, kw.CONSTRAINTS) {
+        advance(p)
+        skipToCommaOrEnd(p)
+        return mkf(p, ast.K_SET, ast.SET_VALUE, "constraints", pos, [mkList(p, p.empty, pos)], flags)
+    }
+    name = parseVarName(p)
+    if isKw(p, kw.FROM) && isKwAt(p, 1, kw.CURRENT) {
+        advance(p)
+        advance(p)
+        return mkf(p, ast.K_SET, ast.SET_FROM_CURRENT, name, pos, [-1], flags)
+    }
+    if !acceptSym(p, EQ) { expectKw(p, kw.TO) }
+    if isKw(p, kw.DEFAULT) {
+        advance(p)
+        return mkf(p, ast.K_SET, ast.SET_DEFAULT, name, pos, [-1], flags)
+    }
+    let vals: List<Integer> = []
+    while !p.failed {
+        vals.add(parseSetValue(p))
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkf(p, ast.K_SET, ast.SET_VALUE, name, pos, [mkList(p, vals, pos)], flags)
+}
+
+function parseShow(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.SHOW)
+    if isKw(p, kw.TIME) && isKwAt(p, 1, kw.ZONE) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_SHOW, 0, "timezone", pos, p.empty)
+    }
+    if isKw(p, kw.TRANSACTION) && isKwAt(p, 1, kw.ISOLATION) {
+        advance(p)
+        advance(p)
+        expectKw(p, kw.LEVEL)
+        return mk(p, ast.K_SHOW, 0, "transaction_isolation", pos, p.empty)
+    }
+    if isKw(p, kw.SESSION) && isKwAt(p, 1, kw.AUTHORIZATION) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_SHOW, 0, "session_authorization", pos, p.empty)
+    }
+    return mk(p, ast.K_SHOW, 0, parseVarName(p), pos, p.empty)
+}
+
+function parseReset(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.RESET)
+    if isKw(p, kw.TIME) && isKwAt(p, 1, kw.ZONE) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_RESET, 0, "timezone", pos, p.empty)
+    }
+    if isKw(p, kw.SESSION) && isKwAt(p, 1, kw.AUTHORIZATION) {
+        advance(p)
+        advance(p)
+        return mk(p, ast.K_RESET, 0, "session_authorization", pos, p.empty)
+    }
+    return mk(p, ast.K_RESET, 0, parseVarName(p), pos, p.empty)
+}
+
+function vacuumFlag(w: Text): Integer {
+    if w == "full" { return ast.F_VACUUM_FULL }
+    if w == "freeze" { return ast.F_VACUUM_FREEZE }
+    if w == "verbose" { return ast.F_VACUUM_VERBOSE }
+    if w == "analyze" || w == "analyse" { return ast.F_VACUUM_ANALYZE }
+    return 0
+}
+
+// (option [value], ...) for VACUUM / ANALYZE / EXPLAIN; sets flags via mapper kind (0 vacuum, 1 explain)
+function parseUtilityOptions(p: P, id: Integer, explain: Boolean): Integer {
+    let pos = tstart(p)
+    expectSym(p, LP)
+    let items: List<Integer> = []
+    while !p.failed {
+        let opos = tstart(p)
+        let key = parseLabel(p)
+        let v = -1
+        if !isSym(p, COMMA) && !isSym(p, RP) { v = parseOptionValue(p) }
+        let on = true
+        if v >= 0 {
+            let vt = ast.text(p.tree, v)
+            if vt == "off" || vt == "false" || vt == "0" { on = false }
+        }
+        if on {
+            if explain {
+                if key == "analyze" || key == "analyse" { setFlag(p, id, ast.F_EXPLAIN_ANALYZE) }
+                if key == "verbose" { setFlag(p, id, ast.F_EXPLAIN_VERBOSE) }
+            } else {
+                setFlag(p, id, vacuumFlag(key))
+            }
+        }
+        items.add(mk(p, ast.K_DEF_ELEM, 0, key, opos, [v]))
+        if !acceptSym(p, COMMA) { break }
+    }
+    expectSym(p, RP)
+    return mkList(p, items, pos)
+}
+
+function parseTableListOpt(p: P): Integer {
+    if isSym(p, SEMI) || tk(p) == lexer.T_EOF { return -1 }
+    let pos = tstart(p)
+    let names: List<Integer> = []
+    while !p.failed {
+        names.add(parseRelation(p, false))
+        if isSym(p, LP) { skipParens(p) }
+        if !acceptSym(p, COMMA) { break }
+    }
+    return mkList(p, names, pos)
+}
+
+function parseVacuum(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.VACUUM)
+    let id = mk(p, ast.K_VACUUM, 0, "", pos, [-1])
+    if isSym(p, LP) {
+        parseUtilityOptions(p, id, false)
+    } else {
+        while !p.failed && tk(p) == lexer.T_IDENT && vacuumFlag(ttext(p)) != 0 {
+            setFlag(p, id, vacuumFlag(ttext(p)))
+            advance(p)
+        }
+    }
+    setSlot(p, id, 0, parseTableListOpt(p))
+    return id
+}
+
+function parseAnalyze(p: P): Integer {
+    let pos = tstart(p)
+    advance(p)
+    let id = mk(p, ast.K_ANALYZE, 0, "", pos, [-1])
+    if isSym(p, LP) {
+        parseUtilityOptions(p, id, false)
+    } else if acceptKw(p, kw.VERBOSE) {
+        setFlag(p, id, ast.F_VACUUM_VERBOSE)
+    }
+    setSlot(p, id, 0, parseTableListOpt(p))
+    return id
+}
+
+function copyOpt(p: P, items: List<Integer>, key: Text, v: Integer, pos: Integer) {
+    items.add(mk(p, ast.K_DEF_ELEM, 0, key, pos, [v]))
+}
+
+function parseCopy(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.COPY)
+    let items: List<Integer> = []
+    if isKw(p, kw.BINARY) {
+        let bpos = tstart(p)
+        advance(p)
+        copyOpt(p, items, "format", mkName(p, "binary", bpos), bpos)
+    }
+    let table = -1
+    let cols = -1
+    let query = -1
+    if isSym(p, LP) {
+        advance(p)
+        if isKw(p, kw.INSERT) {
+            query = parseInsert(p, -1)
+        } else if isKw(p, kw.UPDATE) {
+            query = parseUpdate(p, -1)
+        } else if isKw(p, kw.DELETE) {
+            query = parseDelete(p, -1)
+        } else {
+            query = parseQuery(p)
+        }
+        expectSym(p, RP)
+    } else {
+        table = parseRelation(p, false)
+        if isSym(p, LP) { cols = parseNameList(p) }
+    }
+    let op = ast.COPY_FROM
+    if acceptKw(p, kw.TO) {
+        op = ast.COPY_TO
+    } else {
+        expectKw(p, kw.FROM)
+    }
+    let where = 0
+    let text = ""
+    if acceptKw(p, kw.STDIN) || acceptKw(p, kw.STDOUT) {
+        where = ast.COPY_STDIO
+    } else if acceptKw(p, kw.PROGRAM) {
+        where = ast.COPY_PROGRAM
+        text = ttext(p)
+        if tk(p) != lexer.T_STR { syntaxError(p) }
+        advance(p)
+    } else if tk(p) == lexer.T_STR {
+        where = ast.COPY_FILE
+        text = ttext(p)
+        advance(p)
+    } else {
+        syntaxError(p)
+    }
+    if isKw(p, kw.WITH) && isSymAt(p, 1, LP) { advance(p) }
+    if isSym(p, LP) {
+        let opts = parseDefList(p)
+        for o in ast.items(p.tree, opts) { items.add(o) }
+    } else {
+        acceptKw(p, kw.WITH)
+        // old-style options
+        while !p.failed && tk(p) == lexer.T_IDENT {
+            let opos = tstart(p)
+            let w = ttext(p)
+            if w == "where" { break }
+            advance(p)
+            if w == "binary" || w == "csv" || w == "text" {
+                copyOpt(p, items, "format", mkName(p, w, opos), opos)
+            } else if w == "header" || w == "oids" || w == "freeze" {
+                copyOpt(p, items, w, -1, opos)
+            } else if w == "delimiter" || w == "null" || w == "quote" || w == "escape" || w == "encoding" {
+                acceptKw(p, kw.AS)
+                let v = mkStr(p, ttext(p), tstart(p))
+                if tk(p) != lexer.T_STR { syntaxError(p) }
+                advance(p)
+                copyOpt(p, items, w, v, opos)
+            } else if w == "force" {
+                let key = "force_quote"
+                if acceptKw(p, kw.NOT) {
+                    expectKw(p, kw.NULL)
+                    key = "force_not_null"
+                } else if acceptKw(p, kw.NULL) {
+                    key = "force_null"
+                } else {
+                    expectKw(p, kw.QUOTE)
+                }
+                let v = -1
+                if isSym(p, STAR) {
+                    v = mk(p, ast.K_STAR, 0, "", tstart(p), p.empty)
+                    advance(p)
+                } else {
+                    let lpos = tstart(p)
+                    let names: List<Integer> = []
+                    while !p.failed {
+                        let npos = tstart(p)
+                        names.add(mkName(p, parseColId(p), npos))
+                        if !acceptSym(p, COMMA) { break }
+                    }
+                    v = mkList(p, names, lpos)
+                }
+                copyOpt(p, items, key, v, opos)
+            } else {
+                seek(p, p.pos - 1)
+                syntaxError(p)
+            }
+        }
+    }
+    let cond = -1
+    if acceptKw(p, kw.WHERE) { cond = parseExpr(p) }
+    let opts = -1
+    if items.length > 0 { opts = mkList(p, items, pos) }
+    let id = mk(p, ast.K_COPY, op, text, pos, [table, cols, query, opts, cond])
+    setInt(p, id, where)
+    return id
+}
+
+function parseExplain(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.EXPLAIN)
+    let id = mk(p, ast.K_EXPLAIN, 0, "", pos, [-1, -1])
+    if isSym(p, LP) {
+        setSlot(p, id, 1, parseUtilityOptions(p, id, true))
+    } else {
+        if acceptKw(p, kw.ANALYZE) || acceptKw(p, kw.ANALYSE) { setFlag(p, id, ast.F_EXPLAIN_ANALYZE) }
+        if acceptKw(p, kw.VERBOSE) { setFlag(p, id, ast.F_EXPLAIN_VERBOSE) }
+    }
+    setSlot(p, id, 0, parseStatement(p))
+    return id
+}
+
+function parseDiscard(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.DISCARD)
+    let w = ""
+    if acceptKw(p, kw.ALL) {
+        w = "all"
+    } else if acceptKw(p, kw.PLANS) {
+        w = "plans"
+    } else if acceptKw(p, kw.SEQUENCES) {
+        w = "sequences"
+    } else if acceptKw(p, kw.TEMP) || acceptKw(p, kw.TEMPORARY) {
+        w = "temp"
+    } else {
+        syntaxError(p)
+    }
+    return mk(p, ast.K_DISCARD, 0, w, pos, p.empty)
+}
+
+function parseDeallocate(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.DEALLOCATE)
+    acceptKw(p, kw.PREPARE)
+    if acceptKw(p, kw.ALL) { return mkf(p, ast.K_DEALLOCATE, 0, "", pos, p.empty, ast.F_ALL) }
+    return mk(p, ast.K_DEALLOCATE, 0, parseColId(p), pos, p.empty)
+}
+
+function parsePrepare(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.PREPARE)
+    let name = parseColId(p)
+    let types = -1
+    if isSym(p, LP) {
+        let lpos = tstart(p)
+        advance(p)
+        let items: List<Integer> = []
+        while !p.failed {
+            items.add(parseTypeName(p))
+            if !acceptSym(p, COMMA) { break }
+        }
+        expectSym(p, RP)
+        types = mkList(p, items, lpos)
+    }
+    expectKw(p, kw.AS)
+    let stmt = parseStatement(p)
+    return mk(p, ast.K_PREPARE, 0, name, pos, [types, stmt])
+}
+
+function parseExecute(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.EXECUTE)
+    let name = parseColId(p)
+    let args = -1
+    if isSym(p, LP) {
+        advance(p)
+        args = parseExprList(p)
+        expectSym(p, RP)
+    }
+    return mk(p, ast.K_EXECUTE, 0, name, pos, [args])
+}
+
+function parseLock(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.LOCK)
+    acceptKw(p, kw.TABLE)
+    let lpos = tstart(p)
+    let names: List<Integer> = []
+    while !p.failed {
+        names.add(parseRelation(p, false))
+        if !acceptSym(p, COMMA) { break }
+    }
+    let mode = "access exclusive"
+    if acceptKw(p, kw.IN) {
+        let parts: List<Text> = []
+        while !p.failed && !isKw(p, kw.MODE) && tk(p) == lexer.T_IDENT {
+            if parts.length > 0 { parts.add(" ") }
+            parts.add(ttext(p))
+            advance(p)
+        }
+        expectKw(p, kw.MODE)
+        mode = joinText(parts)
+    }
+    let flags = 0
+    if acceptKw(p, kw.NOWAIT) { flags = ast.F_NOWAIT }
+    return mkf(p, ast.K_LOCK, 0, mode, pos, [mkList(p, names, lpos)], flags)
+}
+
+function parseListen(p: P): Integer {
+    let pos = tstart(p)
+    let w = ttext(p)
+    advance(p)
+    if w == "unlisten" && acceptSym(p, STAR) { return mk(p, ast.K_UNLISTEN, 0, "*", pos, p.empty) }
+    let channel = parseColId(p)
+    if w == "listen" { return mk(p, ast.K_LISTEN, 0, channel, pos, p.empty) }
+    if w == "unlisten" { return mk(p, ast.K_UNLISTEN, 0, channel, pos, p.empty) }
+    let payload = -1
+    if acceptSym(p, COMMA) {
+        if tk(p) != lexer.T_STR { syntaxError(p) }
+        payload = mkStr(p, ttext(p), tstart(p))
+        advance(p)
+    }
+    return mk(p, ast.K_NOTIFY, 0, channel, pos, [payload])
+}
+
+function parseComment(p: P): Integer {
+    let pos = tstart(p)
+    expectKw(p, kw.COMMENT)
+    expectKw(p, kw.ON)
+    let what = parseLabel(p)
+    let obj = -1
+    if what == "column" || what == "table" || what == "index" || what == "view" || what == "sequence" || what == "schema" {
+        obj = parseRelation(p, false)
+        if what == "column" && acceptSym(p, DOT) { parseLabel(p) }
+    } else {
+        while !p.failed && !isKw(p, kw.IS) && tk(p) != lexer.T_EOF { advance(p) }
+    }
+    expectKw(p, kw.IS)
+    let c = -1
+    if tk(p) == lexer.T_STR {
+        c = mkStr(p, ttext(p), tstart(p))
+        advance(p)
+    } else {
+        expectKw(p, kw.NULL)
+    }
+    return mk(p, ast.K_COMMENT, 0, what, pos, [obj, c])
+}

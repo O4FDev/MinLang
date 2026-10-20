@@ -1,0 +1,1198 @@
+// Statement execution: parameter/literal binding, SELECT row encoding, INSERT/UPDATE/DELETE with row locks,
+// undo images, redo records and index maintenance.
+use "./values.min" as v
+use "./hashmap.min" as hm
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+use "./txn.min" as txn
+use "./exec.min" as ex
+use "./plan.min" as pl
+use "./numeric.min" as nm
+
+// redo opcodes
+public constant R_INSERT = 1
+public constant R_UPDATE = 2
+public constant R_DELETE = 3
+public constant R_DDL = 4
+public constant R_TRUNCATE = 5
+public constant R_SERIAL = 6
+
+public record Run {
+    rowData: Bytes
+    rowCount: Integer
+    affected: Integer
+    keys: List<ix.Key>
+    rows: Bytes
+    seen: hm.IntMap        // UPDATE ... FROM: target rows already collected
+    conflictRow: Integer   // row that made the last unique check fail
+    conflictHid: Integer   // its hash index
+    touched: hm.IntMap     // ON CONFLICT DO UPDATE: rows this statement inserted or updated
+}
+
+public function newRun(): Run {
+    return Run { rowData: Bytes(); rowCount: 0; affected: 0; keys: []; rows: Bytes(); seen: hm.newIntMap(16); conflictRow: -1; conflictHid: -1; touched: hm.newIntMap(16) }
+}
+
+// ---------------------------------------------------------------- binding
+
+// Bind parameters (extended protocol). Returns false with p.err set on bad input.
+public function bindParams(st: pl.Stmt, params: List<Bytes>, nulls: List<Boolean>, formats: List<Integer>): Boolean {
+    let p = st.p
+    let i = 0
+    while i < st.paramNodes.length {
+        let n = st.paramNodes[i]
+        let idx = st.paramIdx[i]
+        if idx >= params.length {
+            ex.raise(p, "08P01", "bind message supplies " + Text(params.length) + " parameters, but prepared statement requires " + Text(st.paramTypes.length))
+            return false
+        }
+        let isNull = false
+        if idx < nulls.length { isNull = nulls[idx] }
+        if isNull {
+            ex.setNullReg(p, n)
+        } else {
+            let fmt = 0
+            if formats.length == 1 { fmt = formats[0] }
+            if formats.length > idx && formats.length > 1 { fmt = formats[idx] }
+            let b = params[idx]
+            let t = p.et[n]
+            if fmt == 1 {
+                bindBinary(p, n, t, b)
+            } else {
+                ex.parseInto(p, b, 0, b.length, false, n, t, -1, 0)
+            }
+            if p.err { return false }
+        }
+        i += 1
+    }
+    return true
+}
+
+function bindBinary(p: ex.Plan, n: Integer, t: Integer, b: Bytes) {
+    let len = b.length
+    if t == v.T_INT4 || t == v.T_DATE || t == v.T_OID {
+        if len == 4 {
+            ex.setIntReg(p, n, v.getBE32(b, 0))
+        } else if len == 8 {
+            ex.setIntReg(p, n, v.getBE64(b, 0))
+        } else {
+            ex.raise(p, "22P03", "incorrect binary data format")
+        }
+        return
+    }
+    if t == v.T_INT8 || t == v.T_TIMESTAMP || t == v.T_TIMESTAMPTZ || t == v.T_TIME {
+        if len == 8 {
+            ex.setIntReg(p, n, v.getBE64(b, 0))
+        } else if len == 4 {
+            ex.setIntReg(p, n, v.getBE32(b, 0))
+        } else {
+            ex.raise(p, "22P03", "incorrect binary data format")
+        }
+        return
+    }
+    if t == v.T_INT2 {
+        ex.setIntReg(p, n, v.getBE16(b, 0))
+        return
+    }
+    if t == v.T_BOOL {
+        ex.setIntReg(p, n, b[0] & 1)
+        return
+    }
+    if t == v.T_FLOAT8 {
+        let x = Bytes(8)
+        x.setInt64(0, v.getBE64(b, 0))
+        ex.setFltReg(p, n, x.getFloat64(0))
+        return
+    }
+    if t == v.T_FLOAT4 {
+        let x = Bytes(4)
+        x.setInt32(0, v.getBE32(b, 0))
+        ex.setFltReg(p, n, x.getFloat32(0))
+        return
+    }
+    if t == v.T_NUMERIC {
+        // ndigits, weight, sign, dscale, digits (base 10000)
+        if len < 8 {
+            ex.raise(p, "22P03", "insufficient data left in message")
+            return
+        }
+        let nd = v.getBE16(b, 0)
+        let weight = v.getBE16(b, 2)
+        let sign = v.getBE16(b, 4) & 65535
+        let dscale = v.getBE16(b, 6) & 65535
+        if nd < 0 || len < 8 + nd * 2 {
+            ex.raise(p, "22P03", "insufficient data left in message")
+            return
+        }
+        if sign == 49152 {
+            ex.setRegNum(p, n, nm.nan())
+            return
+        }
+        if sign == 53248 {
+            ex.setRegNum(p, n, nm.pinf())
+            return
+        }
+        if sign == 61440 {
+            ex.setRegNum(p, n, nm.ninf())
+            return
+        }
+        if (sign != 0 && sign != 16384) || dscale > nm.DSCALE_MAX {
+            ex.raise(p, "22P03", "invalid sign in external \"numeric\" value")
+            return
+        }
+        let digits: List<Integer> = []
+        let i = 0
+        while i < nd {
+            let d = v.getBE16(b, 8 + i * 2)
+            if d < 0 || d >= 10000 {
+                ex.raise(p, "22P03", "invalid digit in external \"numeric\" value")
+                return
+            }
+            digits.add(d)
+            i += 1
+        }
+        let sg = nm.NPOS
+        if sign == 16384 { sg = nm.NNEG }
+        let x = nm.Num { sign: sg; weight: weight; dscale: dscale; digits: digits }
+        // normalise (strip zero digits) and round to the declared display scale, as numeric_recv does
+        ex.setRegNum(p, n, nm.roundTo(nm.normalized(x), dscale))
+        return
+    }
+    ex.setTextReg(p, n, b, 0, len)
+}
+
+// Literal re-binding for skeleton-cached plans: values[i] is the literal text (decoded) of literal i.
+public function bindLiterals(st: pl.Stmt, kinds: List<Integer>, vals: List<Bytes>): Boolean {
+    let p = st.p
+    let i = 0
+    let n = st.litNodes.length
+    if n != vals.length { return false }
+    while i < n {
+        let node = st.litNodes[i]
+        let b = vals[i]
+        let t = p.et[node]
+        if t == v.T_UNKNOWN || v.isTextType(t) {
+            ex.setTextReg(p, node, b, 0, b.length)
+        } else if t == v.T_INT4 || t == v.T_INT8 {
+            let q = v.newParsed()
+            v.parseInt(b, 0, b.length, q, -9223372036854775807 - 1, 9223372036854775807)
+            ex.setIntReg(p, node, q.i)
+        } else {
+            ex.parseInto(p, b, 0, b.length, false, node, t, -1, 0)
+        }
+        i += 1
+    }
+    return !p.err
+}
+
+// ---------------------------------------------------------------- execution reset
+
+public function resetForRun(st: pl.Stmt) {
+    let p = st.p
+    ex.clearError(p)
+    // subquery caches and temp builds are per execution
+    let i = 0
+    while i < p.eState.length {
+        if p.eState[i] != 0 { p.eState[i] = 0 }
+        i += 1
+    }
+    i = 0
+    while i < p.slotRow.length {
+        p.slotRow[i] = -1
+        p.slotTable[i] = p.slotBase[i]
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- SELECT
+
+function fmtFor(formats: List<Integer>, i: Integer): Integer {
+    if formats.length == 0 { return 0 }
+    if formats.length == 1 { return formats[0] }
+    if i < formats.length { return formats[i] }
+    return 0
+}
+
+public function encodeRow(st: pl.Stmt, formats: List<Integer>, out: Bytes) {
+    let p = st.p
+    let start = out.length
+    out.add(68)
+    let at = out.length
+    out.addInt32(0)
+    let n = st.outExprs.length
+    v.addBE16(out, n)
+    let i = 0
+    while i < n {
+        let e = st.outExprs[i]
+        ex.ev(p, e)
+        // an error leaves registers undefined: the statement fails, the partial row is discarded
+        if p.err {
+            out.resize(start)
+            return
+        }
+        ex.encodeField(p, e, st.outTypes[i], fmtFor(formats, i), out)
+        i += 1
+    }
+    v.setBE32(out, at, out.length - at)
+}
+
+public function runSelect(st: pl.Stmt, formats: List<Integer>, run: Run) {
+    let p = st.p
+    let root = st.root
+    ex.open(p, root)
+    while ex.next(p, root) {
+        encodeRow(st, formats, run.rowData)
+        run.rowCount += 1
+        if p.err { return }
+    }
+}
+
+// ---------------------------------------------------------------- INSERT
+
+function keyFor(run: Run, h: ix.HashIndex): ix.Key {
+    while run.keys.length <= h.id { run.keys.add(ix.newKey(0)) }
+    let k = run.keys[h.id]
+    if k.n != h.cols.length {
+        k = ix.newKey(h.cols.length)
+        run.keys[h.id] = k
+    }
+    return k
+}
+
+// Unique check for the values in registers nodes[base + col]. Returns 0 ok, 1 conflict, 2 blocked (p.blockedBy set).
+function uniqueCheck(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, me: Integer, t: tb.Table, nodes: List<Integer>, base: Integer, self: Integer, run: Run): Integer {
+    let p = st.p
+    for hid in t.hashIds {
+        let h = c.hashIdx[hid]
+        if h.unique {
+            let k = keyFor(run, h)
+            let i = 0
+            let anyNull = false
+            while i < h.cols.length {
+                let n = nodes[base + h.cols[i]]
+                ex.keyFromReg(p, k, i, n)
+                if p.rNull[n] != 0 { anyNull = true }
+                i += 1
+            }
+            if !anyNull {
+                let hv = ix.hashKey(t, h.cols, k)
+                let s = ix.probeNext(h, hv, ix.probeStart(h, hv))
+                while s >= 0 {
+                    let r = ix.slotRow(h, s)
+                    if r != self && r < t.nrows {
+                        let stt = t.state[r]
+                        let skip = (stt & tb.ST_DEAD) != 0 && (stt & tb.ST_LOCKED) == 0
+                        if !skip && ix.rowMatchesKey(t, h.cols, r, k) {
+                            if (stt & tb.ST_LOCKED) != 0 {
+                                let owner = txn.ownerOf(tm, t.id, r)
+                                if owner == me || owner < 0 {
+                                    if (stt & tb.ST_DEAD) == 0 {
+                                        uniqueError(st, t, h, r)
+                                        run.conflictRow = r
+                                        run.conflictHid = hid
+                                        return 1
+                                    }
+                                } else {
+                                    p.blockedBy = owner
+                                    return 2
+                                }
+                            } else {
+                                uniqueError(st, t, h, r)
+                                run.conflictRow = r
+                                run.conflictHid = hid
+                                return 1
+                            }
+                        }
+                    }
+                    s = ix.probeNext(h, hv, s + 1)
+                }
+            }
+        }
+    }
+    return 0
+}
+
+function uniqueError(st: pl.Stmt, t: tb.Table, h: ix.HashIndex, r: Integer) {
+    let p = st.p
+    ex.raise(p, "23505", "duplicate key value violates unique constraint \"" + h.name + "\"")
+    let names: List<Text> = []
+    let vals: List<Text> = []
+    for ci in h.cols {
+        names.add(t.cols[ci].name)
+        vals.add(cellText(t.cols[ci], r))
+    }
+    p.errDetail = "Key (" + joinWith(names, ", ") + ")=(" + joinWith(vals, ", ") + ") already exists."
+}
+
+public function joinWith(parts: List<Text>, sep: Text): Text {
+    let out: List<Text> = []
+    let i = 0
+    while i < parts.length {
+        if i > 0 { out.add(sep) }
+        out.add(parts[i])
+        i += 1
+    }
+    return joinText(out)
+}
+
+public function cellText(c: tb.Column, r: Integer): Text {
+    if tb.isNull(c, r) { return "null" }
+    let b = Bytes()
+    let t = c.type
+    if v.isTextType(t) {
+        b.addBytes(c.heap.slice(tb.textOff(c, r), tb.textOff(c, r) + tb.textLen(c, r)))
+    } else if t == v.T_FLOAT8 || t == v.T_FLOAT4 {
+        v.addFloat(b, tb.getFloat(c, r), t == v.T_FLOAT4)
+    } else if t == v.T_NUMERIC {
+        if !c.perRowScale && tb.getInt(c, r) == ex.NUM_NAN_CELL {
+            v.addText(b, "NaN")
+        } else {
+            v.addNumeric(b, tb.getInt(c, r), tb.getScale(c, r))
+        }
+    } else if t == v.T_BOOL {
+        if tb.getInt(c, r) != 0 { b.add(116) } else { b.add(102) }
+    } else if t == v.T_DATE {
+        v.addDate(b, tb.getInt(c, r))
+    } else if t == v.T_TIMESTAMP {
+        v.addTimestamp(b, tb.getInt(c, r), false)
+    } else {
+        v.addInt(b, tb.getInt(c, r))
+    }
+    return Text(b)
+}
+
+function notNullCheck(st: pl.Stmt, t: tb.Table, nodes: List<Integer>, base: Integer): Boolean {
+    let p = st.p
+    let i = 0
+    while i < t.cols.length {
+        let c = t.cols[i]
+        if c.notNull && p.rNull[nodes[base + i]] != 0 {
+            ex.raise(p, "23502", "null value in column \"" + c.name + "\" of relation \"" + t.name + "\" violates not-null constraint")
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Insert one row from registers nodes[base..base+ncols). Returns 0 inserted, 1 skipped (conflict do nothing), -1 error.
+function insertOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, nodes: List<Integer>, base: Integer, run: Run): Integer {
+    let p = st.p
+    let i = 0
+    let nc = t.cols.length
+    // serial defaults
+    if st.serialNodes.length > 0 {
+        for sn in st.serialNodes {
+            i = 0
+            while i < nc {
+                if nodes[base + i] == sn {
+                    t.serial += 1
+                    ex.setIntReg(p, sn, t.serial)
+                    tx.redo.add(R_SERIAL)
+                    tb.putVarint(tx.redo, t.id)
+                    tb.putVarint(tx.redo, t.serial)
+                }
+                i += 1
+            }
+        }
+    }
+    i = 0
+    while i < nc {
+        ex.ev(p, nodes[base + i])
+        i += 1
+    }
+    if p.err { return -1 }
+    if !notNullCheck(st, t, nodes, base) { return -1 }
+    let u = uniqueCheck(st, c, tm, tx.slot, t, nodes, base, -1, run)
+    if u == 2 { return -1 }
+    if u == 1 {
+        if st.conflict == 1 {
+            ex.clearError(p)
+            return 1
+        }
+        if st.conflict == 2 && run.conflictHid == st.conflictHid {
+            ex.clearError(p)
+            return conflictUpdate(st, c, tm, tx, t, nodes, base, run)
+        }
+        return -1
+    }
+    let r = tb.reserveRow(t, 0)
+    if st.conflict == 2 { hm.put(run.touched, r, 1) }
+    i = 0
+    while i < nc {
+        ex.storeCell(p, nodes[base + i], t.cols[i], r)
+        i += 1
+    }
+    txn.addUndo(tm, tx, t, r, txn.U_INSERT, false)
+    t.state[r] = t.state[r] | tb.ST_NEW
+    cat.indexInsertRow(c, t, r)
+    tx.redo.add(R_INSERT)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    tb.encodeRow(t, r, tx.redo)
+    if st.returning {
+        p.slotTable[st.slot] = t
+        p.slotRow[st.slot] = r
+        encodeRow(st, [], run.rowData)
+        run.rowCount += 1
+    }
+    return 0
+}
+
+public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    let p = st.p
+    let t = c.tables[st.tableId]
+    let nc = t.cols.length
+    if st.routeIdx >= 0 && st.root < 0 {
+        // partitioned table or partition: route / check each row
+        let rt = st.route[st.routeIdx]
+        let r = 0
+        while r < st.nRows {
+            let nodes: List<Integer> = []
+            let i = 0
+            while i < nc {
+                nodes.add(st.rowExprs[r * nc + i])
+                i += 1
+            }
+            assignSerials(st, t, tx, nodes)
+            for n in nodes { ex.ev(p, n) }
+            if p.err { return }
+            let res = insertRouted(st, c, tm, tx, rt, nodes, formats, run)
+            if res < 0 { return }
+            if res == 0 { run.affected += 1 }
+            r += 1
+        }
+        return
+    }
+    if st.root < 0 {
+        let r = 0
+        while r < st.nRows {
+            let res = insertOne(st, c, tm, tx, t, st.rowExprs, r * nc, run)
+            if res < 0 { return }
+            if res == 0 { run.affected += 1 }
+            r += 1
+        }
+        return
+    }
+    // INSERT ... SELECT: materialize source first (the source may read the target)
+    let root = st.root
+    ex.open(p, root)
+    let buf = tb.newTable(-1, "insbuf")
+    buf.isTemp = true
+    let i = 0
+    while i < nc {
+        tb.addColumn(buf, tb.newColumn(t.cols[i].name, t.cols[i].type, t.cols[i].typmod, false))
+        i += 1
+    }
+    let serialCols: List<Integer> = []
+    while ex.next(p, root) {
+        let br = tb.reserveRow(buf, 0)
+        i = 0
+        while i < nc {
+            let n = st.srcExprs[i]
+            let isSerial = false
+            for sn in st.serialNodes {
+                if sn == n { isSerial = true }
+            }
+            if !isSerial {
+                ex.ev(p, n)
+                ex.storeCell(p, n, buf.cols[i], br)
+            }
+            i += 1
+        }
+        if p.err { return }
+    }
+    // re-insert from buffer through loader registers: reuse srcExprs registers by loading cells
+    let r = 0
+    while r < buf.nrows {
+        i = 0
+        while i < nc {
+            let n = st.srcExprs[i]
+            let isSerial = false
+            for sn in st.serialNodes {
+                if sn == n { isSerial = true }
+            }
+            if !isSerial { ex.loadCell(p, n, buf.cols[i], r) }
+            i += 1
+        }
+        let res = 0
+        if st.routeIdx >= 0 {
+            assignSerials(st, t, tx, st.srcExprs)
+            res = insertRouted(st, c, tm, tx, st.route[st.routeIdx], st.srcExprs, formats, run)
+        } else {
+            res = insertLoaded(st, c, tm, tx, t, st.srcExprs, run)
+        }
+        if res < 0 { return }
+        if res == 0 { run.affected += 1 }
+        r += 1
+    }
+}
+
+// serial / identity defaults among the row registers (target table counter)
+function assignSerials(st: pl.Stmt, t: tb.Table, tx: txn.Txn, nodes: List<Integer>) {
+    for sn in st.serialNodes {
+        for n in nodes {
+            if n == sn {
+                t.serial += 1
+                ex.setIntReg(st.p, sn, t.serial)
+                tx.redo.add(R_SERIAL)
+                tb.putVarint(tx.redo, t.id)
+                tb.putVarint(tx.redo, t.serial)
+            }
+        }
+    }
+}
+
+// Put a row (registers in the routing root's column order) into the route buffer.
+function fillRouteBuffer(p: ex.Plan, rt: pl.Route, nodes: List<Integer>) {
+    let i = 0
+    while i < rt.buf.cols.length && i < nodes.length {
+        ex.storeCell(p, nodes[i], rt.buf.cols[i], 0)
+        i += 1
+    }
+    p.slotTable[rt.bufSlot] = rt.buf
+    p.slotRow[rt.bufSlot] = 0
+}
+
+function isTrue(p: ex.Plan, n: Integer): Boolean {
+    if n < 0 { return true }
+    ex.ev(p, n)
+    return p.rNull[n] == 0 && p.rInt[n] != 0
+}
+
+// Leaf index for the row in the route buffer (-1 with an error raised).
+function routeRow(p: ex.Plan, c: cat.Catalog, rt: pl.Route): Integer {
+    if rt.nodeTid.length == 0 { return 0 }
+    let node = 0
+    let depth = 0
+    while depth < 64 {
+        let first = rt.nodeFirst[node]
+        let cnt = rt.nodeCount[node]
+        let found = -1
+        let i = 0
+        while i < cnt && found < 0 {
+            if isTrue(p, rt.chBound[first + i]) { found = first + i }
+            if p.err { return -1 }
+            i += 1
+        }
+        if found < 0 {
+            ex.raise(p, "23514", "no partition of relation \"" + pl.displayName(c.tables[rt.nodeTid[node]].name) + "\" found for row")
+            return -1
+        }
+        if rt.chLeaf[found] >= 0 { return rt.chLeaf[found] }
+        node = rt.chNode[found]
+        depth += 1
+    }
+    ex.raise(p, "54001", "partition tree too deep")
+    return -1
+}
+
+// Insert a row given as registers in the routing root's column order. Returns like insertLoaded.
+function insertRouted(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, rt: pl.Route, nodes: List<Integer>, formats: List<Integer>, run: Run): Integer {
+    let p = st.p
+    fillRouteBuffer(p, rt, nodes)
+    if !isTrue(p, rt.check) {
+        if !p.err { ex.raise(p, "23514", "new row for relation \"" + rt.rootName + "\" violates partition constraint") }
+        return -1
+    }
+    let li = routeRow(p, c, rt)
+    if li < 0 { return -1 }
+    let leaf = c.tables[rt.leafTid[li]]
+    let regs = rt.leafRegs[li]
+    let map = rt.leafMap[li]
+    let j = 0
+    while j < regs.length {
+        if map[j] >= 0 { ex.loadCell(p, regs[j], rt.buf.cols[map[j]], 0) } else { ex.setNullReg(p, regs[j]) }
+        j += 1
+    }
+    let ret = st.returning
+    st.returning = false
+    let res = insertLoaded(st, c, tm, tx, leaf, regs, run)
+    st.returning = ret
+    if res == 0 && ret {
+        // RETURNING over the routing root's columns: read them from the buffer
+        p.slotTable[st.slot] = rt.buf
+        p.slotRow[st.slot] = 0
+        encodeRow(st, formats, run.rowData)
+        run.rowCount += 1
+    }
+    return res
+}
+
+// Like insertOne but registers are already loaded (no evaluation except serial defaults).
+function insertLoaded(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, nodes: List<Integer>, run: Run): Integer {
+    let p = st.p
+    let nc = t.cols.length
+    for sn in st.serialNodes {
+        let i = 0
+        while i < nc {
+            if nodes[i] == sn {
+                t.serial += 1
+                ex.setIntReg(p, sn, t.serial)
+                tx.redo.add(R_SERIAL)
+                tb.putVarint(tx.redo, t.id)
+                tb.putVarint(tx.redo, t.serial)
+            }
+            i += 1
+        }
+    }
+    if !notNullCheck(st, t, nodes, 0) { return -1 }
+    let u = uniqueCheck(st, c, tm, tx.slot, t, nodes, 0, -1, run)
+    if u == 2 { return -1 }
+    if u == 1 {
+        if st.conflict == 1 {
+            ex.clearError(p)
+            return 1
+        }
+        if st.conflict == 2 && run.conflictHid == st.conflictHid {
+            ex.clearError(p)
+            return conflictUpdate(st, c, tm, tx, t, nodes, 0, run)
+        }
+        return -1
+    }
+    let r = tb.reserveRow(t, 0)
+    if st.conflict == 2 { hm.put(run.touched, r, 1) }
+    let i = 0
+    while i < nc {
+        ex.storeCell(p, nodes[i], t.cols[i], r)
+        i += 1
+    }
+    txn.addUndo(tm, tx, t, r, txn.U_INSERT, false)
+    t.state[r] = t.state[r] | tb.ST_NEW
+    cat.indexInsertRow(c, t, r)
+    tx.redo.add(R_INSERT)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    tb.encodeRow(t, r, tx.redo)
+    if st.returning {
+        p.slotTable[st.slot] = t
+        p.slotRow[st.slot] = r
+        encodeRow(st, [], run.rowData)
+        run.rowCount += 1
+    }
+    return 0
+}
+
+// ON CONFLICT DO UPDATE: update existing row run.conflictRow from the proposed row (registers nodes[base..]).
+// Returns 0 when updated (counted), 1 when the WHERE skipped it, -1 on error.
+function conflictUpdate(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, nodes: List<Integer>, base: Integer, run: Run): Integer {
+    let p = st.p
+    let r = run.conflictRow
+    if hm.contains(run.touched, r) {
+        ex.raise(p, "21000", "ON CONFLICT DO UPDATE command cannot affect row a second time")
+        return -1
+    }
+    let excl = p.temps[st.exclTemp]
+    let i = 0
+    while i < t.cols.length {
+        ex.storeCell(p, nodes[base + i], excl.cols[i], 0)
+        i += 1
+    }
+    p.slotTable[st.exclSlot] = excl
+    p.slotRow[st.exclSlot] = 0
+    p.slotTable[st.slot] = t
+    p.slotRow[st.slot] = r
+    if st.conflictWhere >= 0 {
+        ex.ev(p, st.conflictWhere)
+        if p.err { return -1 }
+        if p.rNull[st.conflictWhere] != 0 || p.rInt[st.conflictWhere] == 0 { return 1 }
+    }
+    for n in st.setExprs { ex.ev(p, n) }
+    if p.err { return -1 }
+    hm.put(run.touched, r, 1)
+    if !updateRowInPlace(st, c, tm, tx, t, r, run) { return -1 }
+    if st.returning {
+        p.slotTable[st.slot] = t
+        p.slotRow[st.slot] = r
+        encodeRow(st, [], run.rowData)
+        run.rowCount += 1
+    }
+    return 0
+}
+
+// Store the SET registers into row r (not-null and unique checks, undo, index maintenance, redo).
+function updateRowInPlace(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, r: Integer, run: Run): Boolean {
+    let p = st.p
+    let ns = st.setCols.length
+    let j = 0
+    while j < ns {
+        let col = t.cols[st.setCols[j]]
+        if col.notNull && p.rNull[st.setExprs[j]] != 0 {
+            ex.raise(p, "23502", "null value in column \"" + col.name + "\" of relation \"" + pl.displayName(t.name) + "\" violates not-null constraint")
+            return false
+        }
+        j += 1
+    }
+    let keyChange = false
+    j = 0
+    while j < ns {
+        let ci = st.setCols[j]
+        if cat.columnIndexed(c, t, ci) && !ex.regEqualsCell(p, st.setExprs[j], t.cols[ci], r) { keyChange = true }
+        j += 1
+    }
+    let u = txn.addUndo(tm, tx, t, r, txn.U_UPDATE, true)
+    if keyChange {
+        if !uniqueCheckUpdate(st, c, tm, tx.slot, t, r, run) { return false }
+        txn.markKeyChange(tx, u)
+        cat.indexRemoveRow(c, t, r)
+    }
+    j = 0
+    while j < ns {
+        ex.storeCell(p, st.setExprs[j], t.cols[st.setCols[j]], r)
+        j += 1
+    }
+    if keyChange { cat.indexInsertRow(c, t, r) }
+    tx.redo.add(R_UPDATE)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    tb.putVarint(tx.redo, ns)
+    j = 0
+    while j < ns {
+        let ci = st.setCols[j]
+        tb.putVarint(tx.redo, ci)
+        tb.encodeValue(t.cols[ci], r, tx.redo)
+        j += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- UPDATE / DELETE
+
+// Collect target rows. Returns false if blocked/error.
+function collectTargets(st: pl.Stmt, tm: txn.TxnMgr, me: Integer, t: tb.Table, run: Run): Boolean {
+    let p = st.p
+    let rows = run.rows
+    rows.clear()
+    let root = st.root
+    let slot = st.slot
+    if st.fromBuf >= 0 {
+        hm.clear(run.seen)
+        tb.truncate(p.temps[st.fromBuf])
+    }
+    if root < 0 { return true }
+    ex.open(p, root)
+    while ex.next(p, root) {
+        let r = p.slotRow[slot]
+        if p.slotTable[slot].id != t.id || p.slotTable[slot].nrows != t.nrows {
+            // positioned on a before-image: the row is locked by another transaction
+            let orig = p.slotOrig[slot]
+            p.blockedBy = txn.ownerOf(tm, t.id, orig)
+            if p.blockedBy < 0 { p.blockedBy = 0 }
+            return false
+        }
+        if (t.state[r] & tb.ST_LOCKED) != 0 {
+            let b = txn.blocker(tm, t, r, me)
+            if b >= 0 {
+                p.blockedBy = b
+                return false
+            }
+        }
+        if st.fromBuf >= 0 {
+            // UPDATE ... FROM: each target row once (first join match), SET values computed now
+            if hm.contains(run.seen, r) { continue }
+            hm.put(run.seen, r, 1)
+            let fb = p.temps[st.fromBuf]
+            let br = tb.reserveRow(fb, 0)
+            let j = 0
+            while j < st.setExprs.length {
+                ex.ev(p, st.setExprs[j])
+                ex.storeCell(p, st.setExprs[j], fb.cols[j], br)
+                j += 1
+            }
+            if p.err { return false }
+        }
+        rows.addInt64(r)
+    }
+    return !p.err
+}
+
+public function runUpdate(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    if st.mtTid.length == 0 {
+        runUpdateOne(st, c, tm, tx, formats, run)
+        return
+    }
+    // partitioned target: each leaf in turn
+    let saveTid = st.tableId
+    let saveSlot = st.slot
+    let saveRoot = st.root
+    let saveCols = st.setCols
+    let saveExprs = st.setExprs
+    let saveOut = st.outExprs
+    let saveRoute = st.routeIdx
+    let saveFrom = st.fromBuf
+    let i = 0
+    while i < st.mtTid.length {
+        if st.mtTid[i] >= 0 {
+            st.tableId = st.mtTid[i]
+            st.slot = st.mtSlot[i]
+            st.root = st.mtRoot[i]
+            st.setCols = st.mtSetCols[i]
+            st.setExprs = st.mtSetExprs[i]
+            st.outExprs = st.mtOut[i]
+            st.routeIdx = st.mtRoute[i]
+            st.fromBuf = st.mtFromBuf[i]
+            runUpdateOne(st, c, tm, tx, formats, run)
+            if st.p.err || st.p.blockedBy >= 0 { break }
+        }
+        i += 1
+    }
+    st.tableId = saveTid
+    st.slot = saveSlot
+    st.root = saveRoot
+    st.setCols = saveCols
+    st.setExprs = saveExprs
+    st.outExprs = saveOut
+    st.routeIdx = saveRoute
+    st.fromBuf = saveFrom
+}
+
+function runUpdateOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    let p = st.p
+    let t = c.tables[st.tableId]
+    if !collectTargets(st, tm, tx.slot, t, run) { return }
+    let rows = run.rows
+    let n = rows.length / 8
+    let slot = st.slot
+    let ns = st.setCols.length
+    // does any SET column participate in an index?
+    let keyCols = false
+    for ci in st.setCols {
+        if cat.columnIndexed(c, t, ci) { keyCols = true }
+    }
+    let i = 0
+    while i < n {
+        let r = rows.getInt64(i * 8)
+        p.slotTable[slot] = t
+        p.slotRow[slot] = r
+        let j = 0
+        if st.fromBuf >= 0 {
+            let fb = p.temps[st.fromBuf]
+            while j < ns {
+                ex.loadCell(p, st.setExprs[j], fb.cols[j], i)
+                j += 1
+            }
+        } else {
+            while j < ns {
+                ex.ev(p, st.setExprs[j])
+                j += 1
+            }
+        }
+        if p.err { return }
+        if st.routeIdx >= 0 {
+            // partition constraint of the new row; a row that belongs elsewhere in the tree moves there
+            let mv = routeUpdatedRow(st, c, tm, tx, t, r, formats, run)
+            if mv < 0 { return }
+            if mv == 1 {
+                run.affected += 1
+                i += 1
+                continue
+            }
+            p.slotTable[slot] = t
+            p.slotRow[slot] = r
+        }
+        j = 0
+        while j < ns {
+            let col = t.cols[st.setCols[j]]
+            if col.notNull && p.rNull[st.setExprs[j]] != 0 {
+                ex.raise(p, "23502", "null value in column \"" + col.name + "\" of relation \"" + t.name + "\" violates not-null constraint")
+                return
+            }
+            j += 1
+        }
+        let keyChange = false
+        if keyCols {
+            j = 0
+            while j < ns {
+                let ci = st.setCols[j]
+                if cat.columnIndexed(c, t, ci) && !ex.regEqualsCell(p, st.setExprs[j], t.cols[ci], r) { keyChange = true }
+                j += 1
+            }
+        }
+        let u = txn.addUndo(tm, tx, t, r, txn.U_UPDATE, true)
+        if keyChange {
+            if !uniqueCheckUpdate(st, c, tm, tx.slot, t, r, run) { return }
+            txn.markKeyChange(tx, u)
+            cat.indexRemoveRow(c, t, r)
+        }
+        j = 0
+        while j < ns {
+            ex.storeCell(p, st.setExprs[j], t.cols[st.setCols[j]], r)
+            j += 1
+        }
+        if keyChange { cat.indexInsertRow(c, t, r) }
+        tx.redo.add(R_UPDATE)
+        tb.putVarint(tx.redo, t.id)
+        tb.putVarint(tx.redo, r)
+        tb.putVarint(tx.redo, ns)
+        j = 0
+        while j < ns {
+            let ci = st.setCols[j]
+            tb.putVarint(tx.redo, ci)
+            tb.encodeValue(t.cols[ci], r, tx.redo)
+            j += 1
+        }
+        if st.returning {
+            p.slotTable[slot] = t
+            p.slotRow[slot] = r
+            encodeRow(st, formats, run.rowData)
+            run.rowCount += 1
+        }
+        run.affected += 1
+        i += 1
+    }
+}
+
+// Check / route the updated row r of leaf t. Returns 0 to update in place, 1 when the row was moved to another
+// partition (deleted here, inserted there), -1 on error.
+function routeUpdatedRow(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, r: Integer, formats: List<Integer>, run: Run): Integer {
+    let p = st.p
+    let rt = st.route[st.routeIdx]
+    let b = 0
+    while b < rt.buf.cols.length {
+        let reg = rt.bufRegs[b]
+        let lc = tb.columnIndex(t, rt.buf.cols[b].name)
+        let si = -1
+        let j = 0
+        while j < st.setCols.length {
+            if st.setCols[j] == lc { si = j }
+            j += 1
+        }
+        if si >= 0 {
+            ex.copyReg(p, st.setExprs[si], reg)
+        } else if lc >= 0 {
+            ex.loadCell(p, reg, t.cols[lc], r)
+        } else {
+            ex.setNullReg(p, reg)
+        }
+        b += 1
+    }
+    fillRouteBuffer(p, rt, rt.bufRegs)
+    if !isTrue(p, rt.check) {
+        if !p.err { ex.raise(p, "23514", "new row for relation \"" + rt.rootName + "\" violates partition constraint") }
+        return -1
+    }
+    let li = routeRow(p, c, rt)
+    if li < 0 {
+        if p.errCode == "23514" && rt.nodeTid.length > 0 {
+            ex.clearError(p)
+            ex.raise(p, "23514", "new row for relation \"" + pl.displayName(t.name) + "\" violates partition constraint")
+        }
+        return -1
+    }
+    if rt.leafTid[li] == t.id { return 0 }
+    // move: delete here, insert into the routed leaf
+    txn.addUndo(tm, tx, t, r, txn.U_DELETE, false)
+    t.state[r] = t.state[r] | tb.ST_DEAD
+    t.live -= 1
+    tx.redo.add(R_DELETE)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    let leaf = c.tables[rt.leafTid[li]]
+    let regs = rt.leafRegs[li]
+    let map = rt.leafMap[li]
+    let j = 0
+    while j < regs.length {
+        if map[j] >= 0 { ex.loadCell(p, regs[j], rt.buf.cols[map[j]], 0) } else { ex.setNullReg(p, regs[j]) }
+        j += 1
+    }
+    let ret = st.returning
+    st.returning = false
+    let res = insertLoaded(st, c, tm, tx, leaf, regs, run)
+    st.returning = ret
+    if res < 0 { return -1 }
+    return 1
+}
+
+// Unique check for an update: compares the new values (SET registers merged with current cells).
+function uniqueCheckUpdate(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, me: Integer, t: tb.Table, r: Integer, run: Run): Boolean {
+    let p = st.p
+    for hid in t.hashIds {
+        let h = c.hashIdx[hid]
+        if h.unique {
+            let k = keyFor(run, h)
+            let anyNull = false
+            let i = 0
+            while i < h.cols.length {
+                let ci = h.cols[i]
+                let setIdx = -1
+                let j = 0
+                while j < st.setCols.length {
+                    if st.setCols[j] == ci { setIdx = j }
+                    j += 1
+                }
+                if setIdx >= 0 {
+                    let n = st.setExprs[setIdx]
+                    ex.keyFromReg(p, k, i, n)
+                    if p.rNull[n] != 0 { anyNull = true }
+                } else {
+                    let col = t.cols[ci]
+                    if tb.isNull(col, r) {
+                        anyNull = true
+                        k.nulls[i] = true
+                    } else {
+                        k.nulls[i] = false
+                        if v.isTextType(col.type) {
+                            k.bufs[i] = col.heap
+                            k.offs[i] = tb.textOff(col, r)
+                            k.lens[i] = tb.textLen(col, r)
+                        } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
+                            k.flts[i] = tb.getFloat(col, r)
+                        } else {
+                            k.ints[i] = tb.getInt(col, r)
+                            k.scales[i] = tb.getScale(col, r)
+                        }
+                    }
+                }
+                i += 1
+            }
+            if !anyNull {
+                let hv = ix.hashKey(t, h.cols, k)
+                let s = ix.probeNext(h, hv, ix.probeStart(h, hv))
+                while s >= 0 {
+                    let o = ix.slotRow(h, s)
+                    if o != r && o < t.nrows {
+                        let stt = t.state[o]
+                        let skip = (stt & tb.ST_DEAD) != 0 && (stt & tb.ST_LOCKED) == 0
+                        if !skip && ix.rowMatchesKey(t, h.cols, o, k) {
+                            if (stt & tb.ST_LOCKED) != 0 {
+                                let owner = txn.ownerOf(tm, t.id, o)
+                                if owner != me && owner >= 0 {
+                                    p.blockedBy = owner
+                                    return false
+                                }
+                                if (stt & tb.ST_DEAD) == 0 {
+                                    uniqueError(st, t, h, o)
+                                    return false
+                                }
+                            } else {
+                                uniqueError(st, t, h, o)
+                                return false
+                            }
+                        }
+                    }
+                    s = ix.probeNext(h, hv, s + 1)
+                }
+            }
+        }
+    }
+    return true
+}
+
+public function runDelete(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    if st.mtTid.length == 0 {
+        runDeleteOne(st, c, tm, tx, formats, run)
+        return
+    }
+    let saveTid = st.tableId
+    let saveSlot = st.slot
+    let saveRoot = st.root
+    let saveOut = st.outExprs
+    let i = 0
+    while i < st.mtTid.length {
+        if st.mtTid[i] >= 0 {
+            st.tableId = st.mtTid[i]
+            st.slot = st.mtSlot[i]
+            st.root = st.mtRoot[i]
+            st.outExprs = st.mtOut[i]
+            runDeleteOne(st, c, tm, tx, formats, run)
+            if st.p.err || st.p.blockedBy >= 0 { break }
+        }
+        i += 1
+    }
+    st.tableId = saveTid
+    st.slot = saveSlot
+    st.root = saveRoot
+    st.outExprs = saveOut
+}
+
+function runDeleteOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    let p = st.p
+    let t = c.tables[st.tableId]
+    if !collectTargets(st, tm, tx.slot, t, run) { return }
+    let rows = run.rows
+    let n = rows.length / 8
+    let i = 0
+    while i < n {
+        let r = rows.getInt64(i * 8)
+        if (t.state[r] & tb.ST_DEAD) != 0 {
+            // joined more than once (DELETE ... USING): already deleted by this statement
+            i += 1
+            continue
+        }
+        if st.returning {
+            p.slotTable[st.slot] = t
+            p.slotRow[st.slot] = r
+            encodeRow(st, formats, run.rowData)
+            run.rowCount += 1
+        }
+        txn.addUndo(tm, tx, t, r, txn.U_DELETE, false)
+        t.state[r] = t.state[r] | tb.ST_DEAD
+        t.live -= 1
+        tx.redo.add(R_DELETE)
+        tb.putVarint(tx.redo, t.id)
+        tb.putVarint(tx.redo, r)
+        run.affected += 1
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- redo replay (recovery)
+
+// Apply one redo payload (a committed transaction's operations). DDL records are returned to the caller
+// through ddlOut (in order) because replaying them needs the parser.
+public function replayOps(c: cat.Catalog, b: Bytes, start: Integer, end: Integer, ddlOut: List<Text>, ddlAt: List<Integer>, need: List<Integer>): Integer {
+    let cur = tb.Cursor { pos: start }
+    let count = 0
+    while cur.pos < end {
+        let opStart = cur.pos
+        let op = b[cur.pos]
+        cur.pos += 1
+        if op == R_DDL {
+            let len = tb.getVarint(b, cur)
+            ddlOut.add(Text(b.slice(cur.pos, cur.pos + len)))
+            ddlAt.add(cur.pos + len)
+            cur.pos += len
+            return cur.pos
+        }
+        let tid = tb.getVarint(b, cur)
+        let t = c.tables[tid]
+        if t.chunk >= 0 {
+            if op == R_TRUNCATE {
+                t.chunk = -1
+            } else {
+                need.add(tid)
+                return opStart
+            }
+        }
+        if op == R_INSERT {
+            let r = tb.getVarint(b, cur)
+            tb.ensureRows(t, r + 1)
+            tb.decodeRow(t, r, b, cur)
+            if t.state[r] != 0 { t.live += 1 }
+            t.state[r] = 0
+        } else if op == R_UPDATE {
+            let r = tb.getVarint(b, cur)
+            let n = tb.getVarint(b, cur)
+            let i = 0
+            while i < n {
+                let ci = tb.getVarint(b, cur)
+                tb.decodeValue(t.cols[ci], r, b, cur)
+                i += 1
+            }
+        } else if op == R_DELETE {
+            let r = tb.getVarint(b, cur)
+            if r < t.nrows {
+                if t.state[r] == 0 { t.live -= 1 }
+                t.state[r] = tb.ST_DEAD
+            }
+        } else if op == R_TRUNCATE {
+            tb.truncate(t)
+        } else if op == R_SERIAL {
+            let s = tb.getVarint(b, cur)
+            if s > t.serial { t.serial = s }
+        }
+        count += 1
+    }
+    return end
+}

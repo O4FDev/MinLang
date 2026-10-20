@@ -1,0 +1,174 @@
+// Literal-stripping lexer for the simple-protocol plan cache. One pass over the SQL bytes produces a skeleton
+// key (numeric literals -> ?, ?8, ?n; string literals -> '?') and the literal values in source order with their
+// character positions, so a cached plan can be re-bound without parsing.
+use "./values.min" as v
+
+public record Skel {
+    key: Bytes
+    vals: List<Bytes>
+    kinds: List<Integer>     // 1 int4, 2 int8, 3 numeric, 4 string
+    pos: List<Integer>       // character offset of the literal token
+    count: Integer
+    ok: Boolean              // false: contains constructs we do not strip safely (dollar quotes etc.)
+    hasLiteral: Boolean
+}
+
+public function newSkel(): Skel {
+    return Skel { key: Bytes(); vals: []; kinds: []; pos: []; count: 0; ok: true; hasLiteral: false }
+}
+
+function isIdent(c: Integer): Boolean {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 36 || c >= 128
+}
+
+function setVal(s: Skel, i: Integer, b: Bytes, kind: Integer, pos: Integer) {
+    if i < s.vals.length {
+        s.vals[i] = b
+        s.kinds[i] = kind
+        s.pos[i] = pos
+    } else {
+        s.vals.add(b)
+        s.kinds.add(kind)
+        s.pos.add(pos)
+    }
+}
+
+public function scan(sql: Bytes, s: Skel) {
+    let key = s.key
+    key.clear()
+    s.count = 0
+    s.ok = true
+    s.hasLiteral = false
+    let n = sql.length
+    let i = 0
+    let chars = 0          // character offset of byte i
+    while i < n {
+        let c = sql[i]
+        // A token continues an identifier only when the byte right before it is an identifier byte: `t1` is a
+        // name, but in `SELECT 1` / `LIMIT 10` the digit is a literal and E'..' / $$..$$ start new tokens.
+        let adj = 32
+        if i > 0 { adj = sql[i - 1] }
+        if c == 39 || ((c == 69 || c == 101) && i + 1 < n && sql[i + 1] == 39 && !isIdent(adj)) {
+            // string literal (E'..' escapes are not decoded here: mark not ok)
+            let startChars = chars
+            if c != 39 {
+                s.ok = false
+                key.add(c)
+                i += 1
+                chars += 1
+            }
+            let val = Bytes()
+            i += 1
+            chars += 1
+            let closed = false
+            while i < n {
+                let d = sql[i]
+                if d == 39 {
+                    if i + 1 < n && sql[i + 1] == 39 {
+                        val.add(39)
+                        i += 2
+                        chars += 2
+                        continue
+                    }
+                    i += 1
+                    chars += 1
+                    closed = true
+                    break
+                }
+                val.add(d)
+                if (d & 192) != 128 { chars += 1 }
+                i += 1
+            }
+            if !closed { s.ok = false }
+            // adjacent string continuation across newline is rare: mark not ok if another quote follows
+            key.add(39)
+            key.add(63)
+            key.add(39)
+            setVal(s, s.count, val, 4, startChars)
+            s.count += 1
+            s.hasLiteral = true
+            continue
+        }
+        if c >= 48 && c <= 57 && !isIdent(adj) && adj != 46 {
+            let start = i
+            let startChars = chars
+            let isInt = true
+            while i < n && sql[i] >= 48 && sql[i] <= 57 { i += 1 }
+            if i < n && sql[i] == 46 {
+                isInt = false
+                i += 1
+                while i < n && sql[i] >= 48 && sql[i] <= 57 { i += 1 }
+            }
+            if i < n && (sql[i] == 101 || sql[i] == 69) {
+                let j = i + 1
+                if j < n && (sql[j] == 43 || sql[j] == 45) { j += 1 }
+                if j < n && sql[j] >= 48 && sql[j] <= 57 {
+                    isInt = false
+                    i = j
+                    while i < n && sql[i] >= 48 && sql[i] <= 57 { i += 1 }
+                }
+            }
+            if i < n && (isIdent(sql[i])) {
+                // 1abc / 0x1F: not a plain literal
+                s.ok = false
+            }
+            chars += i - start
+            let val = sql.slice(start, i)
+            let kind = 3
+            if isInt {
+                let len = i - start
+                if len < 10 || (len == 10 && v.compareBytes(val, 0, 10, Bytes("2147483647"), 0, 10) <= 0) {
+                    kind = 1
+                } else if len < 19 || (len == 19 && v.compareBytes(val, 0, 19, Bytes("9223372036854775807"), 0, 19) <= 0) {
+                    kind = 2
+                }
+            }
+            key.add(63)
+            if kind == 2 { key.add(56) }
+            if kind == 3 { key.add(110) }
+            setVal(s, s.count, val, kind, startChars)
+            s.count += 1
+            s.hasLiteral = true
+            continue
+        }
+        if c == 36 && i + 1 < n && (sql[i + 1] == 36 || (sql[i + 1] >= 65 && !isDigitByte(sql[i + 1]))) && !isIdent(adj) {
+            s.ok = false
+        }
+        if c == 45 && i + 1 < n && sql[i + 1] == 45 {
+            // comment to end of line
+            while i < n && sql[i] != 10 {
+                key.add(sql[i])
+                if (sql[i] & 192) != 128 { chars += 1 }
+                i += 1
+            }
+            continue
+        }
+        if c == 47 && i + 1 < n && sql[i + 1] == 42 {
+            s.ok = false
+        }
+        if c == 34 {
+            // quoted identifier: copy verbatim
+            key.add(c)
+            i += 1
+            chars += 1
+            while i < n && sql[i] != 34 {
+                key.add(sql[i])
+                if (sql[i] & 192) != 128 { chars += 1 }
+                i += 1
+            }
+            if i < n {
+                key.add(34)
+                i += 1
+                chars += 1
+            }
+            continue
+        }
+        key.add(c)
+        if (c & 192) != 128 { chars += 1 }
+        i += 1
+    }
+}
+
+function isDigitByte(c: Integer): Boolean {
+    return c >= 48 && c <= 57
+}

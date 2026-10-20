@@ -1,0 +1,896 @@
+// Memory-resident columnar tables. Row id = position. Per column: a typed fixed-width vector, a null bitmap,
+// and for text a byte arena (heap) addressed by 8-byte refs (offset << 24 | length).
+//
+// Persistence (format v3, ADR-010): every buffer of a catalog table is stored as-is in PIECE-sized pieces
+// (src/engine/persist.min). Writes to a tracked buffer go through touch()/touchRange() first: the piece is marked
+// dirty for the next checkpoint and, while a checkpoint is capturing the buffer, copied before its first change
+// (copy-on-write), so the checkpoint writes exactly the state at its begin LSN. The row state and per-row numeric
+// scales are written by other modules directly; checkpoints detect their changes by content hash instead.
+use "../../lib/dbio.min" as dbio
+use "./values.min" as v
+
+public constant ST_DEAD = 1     // row deleted (or never committed)
+public constant ST_LOCKED = 2   // row is owned by an open or committing transaction (see the lock map)
+public constant ST_NEW = 4      // row inserted by its owning transaction
+
+public constant MAX_TEXT_LEN = 16777215
+
+public constant PIECE_SHIFT = 17
+public constant PIECE = 131072        // persisted buffers are tracked and written in 128 KiB pieces
+
+// Change tracking of one persisted buffer (column data / nulls / heap, index slots, ordered runs).
+public record Seg {
+    dirty: Bytes              // one byte per piece: changed in place since the last checkpoint captured it
+    all: Boolean              // never persisted (or replaced): every piece is dirty
+    capOn: Boolean            // a checkpoint is capturing this buffer: copy pieces before their first change
+    capState: Bytes           // per piece while capturing: 1 = still to be written from the live buffer
+    capCopies: List<Bytes>    // per piece: copy taken before the first change after capture (empty = none)
+    capLen: Integer           // buffer length when captured
+}
+
+public function newSeg(): Seg {
+    return Seg { dirty: Bytes(); all: true; capOn: false; capState: Bytes(); capCopies: []; capLen: 0 }
+}
+
+// Call BEFORE changing buf at byte offset off (buf is the buffer s tracks).
+public function touch(s: Seg, buf: Bytes, off: Integer) {
+    let p = off >> PIECE_SHIFT
+    if s.capOn { copyBeforeWrite(s, buf, p) }
+    if !s.all {
+        if p >= s.dirty.length { s.dirty.resize(p + 16) }
+        s.dirty[p] = 1
+    }
+}
+
+// Same for bytes [from, to) of buf.
+public function touchRange(s: Seg, buf: Bytes, from: Integer, to: Integer) {
+    if to <= from { return }
+    let p = from >> PIECE_SHIFT
+    let last = (to - 1) >> PIECE_SHIFT
+    while p <= last {
+        if s.capOn { copyBeforeWrite(s, buf, p) }
+        if !s.all {
+            if p >= s.dirty.length { s.dirty.resize(p + 16) }
+            s.dirty[p] = 1
+        }
+        p += 1
+    }
+}
+
+function copyBeforeWrite(s: Seg, buf: Bytes, p: Integer) {
+    if p < s.capState.length && s.capState[p] == 1 {
+        let from = p << PIECE_SHIFT
+        let to = min(from + PIECE, s.capLen)
+        s.capCopies[p] = buf.slice(from, to)
+        s.capState[p] = 2
+    }
+}
+
+// When a buffer object is replaced (truncate, rebuild, resize), its tracker is replaced by newSeg(): a checkpoint
+// capturing the old object keeps writing it (nobody changes it any more) and the new object starts all dirty.
+
+public record Column {
+    name: Text
+    type: Integer
+    typmod: Integer        // varchar/bpchar: n; numeric: precision * 65536 + scale; else -1
+    notNull: Boolean
+    width: Integer
+    data: Bytes
+    heap: Bytes
+    nulls: Bytes           // bitmap, bit per row (allocated lazily: empty means no nulls yet)
+    scales: Bytes          // numeric without typmod: one scale byte per row
+    perRowScale: Boolean
+    fixedScale: Integer    // numeric with typmod: the scale
+    heapDead: Integer
+    heapShared: Integer    // heap[0, heapShared) may be referenced by several rows (equal adjacent values share one
+                           // copy): setText never overwrites a value in place below this offset
+    segs: List<Seg>        // [data, nulls, heap] trackers for catalog tables; empty for temp/scratch columns
+    defaultKind: Integer   // 0 none, 1 constant text (cast at insert), 2 serial (sequence), 3 current_timestamp, 4 expr sql
+    defaultText: Text
+    defaultNull: Boolean
+}
+
+public record Table {
+    id: Integer
+    name: Text
+    cols: List<Column>
+    nrows: Integer
+    state: Bytes
+    live: Integer
+    lockedCount: Integer
+    hashIds: List<Integer>     // catalog hash index ids
+    ordIds: List<Integer>      // catalog ordered index ids
+    pkCols: List<Integer>      // primary key columns (empty if none)
+    serial: Integer            // last value handed out by serial/identity defaults
+    isTemp: Boolean
+    checks: List<Text>         // CHECK constraint SQL (unused for now)
+    chunk: Integer             // snapshot chunk holding this table's data when not yet loaded, else -1
+    paged: List<Paged>         // not loaded, answering point lookups from its persisted image (row 0 = stand-in)
+}
+
+// Where a persisted buffer's pieces are in the data file.
+public record SegMap {
+    length: Integer
+    offs: Bytes                // i64 per piece: byte offset in the data file, -1 = constant piece
+    words: Bytes               // i64 per piece: the repeated 8-byte word of a constant piece
+}
+
+public function emptySegMap(): SegMap { return SegMap { length: 0; offs: Bytes(); words: Bytes() } }
+
+// A table not loaded yet that answers PK point lookups from its image: faultRow(t, r) copies row r's cells into
+// row 0 of the (one-row) in-memory table.
+public record Paged {
+    fd: Integer
+    nrows: Integer
+    state: SegMap
+    data: List<SegMap>
+    nulls: List<SegMap>
+    scales: List<SegMap>
+    heap: List<SegMap>
+    buf: Bytes
+    faults: Integer
+}
+
+public function newColumn(name: Text, type: Integer, typmod: Integer, notNull: Boolean): Column {
+    let perRow = false
+    let fixedScale = 0
+    if type == v.T_NUMERIC {
+        if typmod < 0 {
+            perRow = true
+        } else {
+            fixedScale = typmod & 65535
+        }
+    }
+    return Column {
+        name: name; type: type; typmod: typmod; notNull: notNull; width: v.storageWidth(type)
+        data: Bytes(); heap: Bytes(); nulls: Bytes(); scales: Bytes(); perRowScale: perRow; fixedScale: fixedScale
+        heapDead: 0; heapShared: 0; segs: []; defaultKind: 0; defaultText: ""; defaultNull: true
+    }
+}
+
+public function newTable(id: Integer, name: Text): Table {
+    return Table {
+        id: id; name: name; cols: []; nrows: 0; state: Bytes(); live: 0; lockedCount: 0
+        hashIds: []; ordIds: []; pkCols: []; serial: 0; isTemp: false; checks: []; chunk: -1; paged: []
+    }
+}
+
+public function addColumn(t: Table, c: Column) {
+    if t.id >= 0 && c.segs.length == 0 { c.segs = [newSeg(), newSeg(), newSeg()] }
+    // existing rows get NULLs
+    c.data.resize(t.nrows * c.width)
+    if c.perRowScale { c.scales.resize(t.nrows) }
+    if t.nrows > 0 {
+        c.nulls = Bytes((t.nrows + 8) / 8 + 1)
+        let r = 0
+        while r < t.nrows {
+            setNull(c, r)
+            r += 1
+        }
+    }
+    t.cols.add(c)
+}
+
+public function columnIndex(t: Table, name: Text): Integer {
+    let i = 0
+    let n = t.cols.length
+    while i < n {
+        if t.cols[i].name == name { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Reserve a new row slot (all values zero / non-null). Returns its row id.
+public function reserveRow(t: Table, state: Integer): Integer {
+    let r = t.nrows
+    for c in t.cols {
+        let w = c.width
+        if w == 8 {
+            c.data.addInt64(0)
+        } else if w == 4 {
+            c.data.addInt32(0)
+        } else if w == 1 {
+            c.data.add(0)
+        } else if w == 2 {
+            c.data.addInt16(0)
+        } else {
+            c.data.resize(c.data.length + w)
+        }
+        if c.perRowScale { c.scales.add(0) }
+    }
+    t.state.add(state)
+    t.nrows = r + 1
+    if (state & ST_DEAD) == 0 { t.live += 1 }
+    return r
+}
+
+// Ensure rows [0, n) exist (used by WAL replay). New rows are dead.
+public function ensureRows(t: Table, n: Integer) {
+    while t.nrows < n {
+        reserveRow(t, ST_DEAD)
+    }
+}
+
+public function truncate(t: Table) {
+    for c in t.cols {
+        c.data = Bytes()
+        c.heap = Bytes()
+        c.nulls = Bytes()
+        c.scales = Bytes()
+        c.heapDead = 0
+        c.heapShared = 0
+        if c.segs.length > 0 { c.segs = [newSeg(), newSeg(), newSeg()] }
+    }
+    t.state = Bytes()
+    t.nrows = 0
+    t.live = 0
+    t.lockedCount = 0
+}
+
+// ---- nulls
+
+public function isNull(c: Column, r: Integer): Boolean {
+    let i = r >> 3
+    if i >= c.nulls.length { return false }
+    return (c.nulls[i] & (1 << (r & 7))) != 0
+}
+
+function ensureNulls(c: Column, nrows: Integer) {
+    let need = (nrows + 7) / 8 + 1
+    if c.nulls.length < need { c.nulls.resize(need) }
+}
+
+public function setNull(c: Column, r: Integer) {
+    if c.nulls.length <= (r >> 3) { c.nulls.resize((r >> 3) + 64) }
+    if c.segs.length > 0 { touch(c.segs[1], c.nulls, r >> 3) }
+    c.nulls[r >> 3] = c.nulls[r >> 3] | (1 << (r & 7))
+}
+
+public function clearNull(c: Column, r: Integer) {
+    if c.nulls.length == 0 { return }
+    if c.nulls.length <= (r >> 3) { c.nulls.resize((r >> 3) + 64) }
+    if (c.nulls[r >> 3] & (1 << (r & 7))) == 0 { return }
+    if c.segs.length > 0 { touch(c.segs[1], c.nulls, r >> 3) }
+    c.nulls[r >> 3] = c.nulls[r >> 3] & (255 - (1 << (r & 7)))
+}
+
+// ---- fixed values
+
+public function getInt(c: Column, r: Integer): Integer {
+    let w = c.width
+    if w == 8 { return c.data.getInt64(r * 8) }
+    if w == 4 { return c.data.getInt32(r * 4) }
+    if w == 1 { return c.data[r] }
+    if w == 2 { return c.data.getInt16(r * 2) }
+    return c.data.getInt64(r * 16)
+}
+
+public function setInt(c: Column, r: Integer, x: Integer) {
+    let w = c.width
+    if c.segs.length > 0 { touch(c.segs[0], c.data, r * w) }
+    if w == 8 {
+        c.data.setInt64(r * 8, x)
+    } else if w == 4 {
+        c.data.setInt32(r * 4, x)
+    } else if w == 1 {
+        c.data[r] = x
+    } else if w == 2 {
+        c.data.setInt16(r * 2, x)
+    } else {
+        c.data.setInt64(r * 16, x)
+    }
+}
+
+public function getFloat(c: Column, r: Integer): Float {
+    if c.width == 4 { return c.data.getFloat32(r * 4) }
+    return c.data.getFloat64(r * 8)
+}
+
+public function setFloat(c: Column, r: Integer, f: Float) {
+    if c.segs.length > 0 { touch(c.segs[0], c.data, r * c.width) }
+    if c.width == 4 {
+        c.data.setFloat32(r * 4, f)
+    } else {
+        c.data.setFloat64(r * 8, f)
+    }
+}
+
+public function getScale(c: Column, r: Integer): Integer {
+    if c.perRowScale { return c.scales[r] }
+    return c.fixedScale
+}
+
+public function setScale(c: Column, r: Integer, s: Integer) {
+    if c.perRowScale { c.scales[r] = s }
+}
+
+// interval: micros at +0, days int32 at +8, months int32 at +12
+public function getIvDays(c: Column, r: Integer): Integer { return c.data.getInt32(r * 16 + 8) }
+public function getIvMonths(c: Column, r: Integer): Integer { return c.data.getInt32(r * 16 + 12) }
+public function setInterval(c: Column, r: Integer, micros: Integer, days: Integer, months: Integer) {
+    if c.segs.length > 0 { touch(c.segs[0], c.data, r * 16) }
+    c.data.setInt64(r * 16, micros)
+    c.data.setInt32(r * 16 + 8, days)
+    c.data.setInt32(r * 16 + 12, months)
+}
+
+// ---- text
+
+public function textOff(c: Column, r: Integer): Integer {
+    return (c.data.getInt64(r * 8) >> 24) & 1099511627775
+}
+
+public function textLen(c: Column, r: Integer): Integer {
+    return c.data.getInt64(r * 8) & 16777215
+}
+
+public function setText(c: Column, r: Integer, buf: Bytes, off: Integer, len: Integer) {
+    let ref = c.data.getInt64(r * 8)
+    let oldLen = ref & 16777215
+    let tracked = c.segs.length > 0
+    if tracked { touch(c.segs[0], c.data, r * 8) }
+    if oldLen == 0 && r > 0 && len > 0 {
+        // Equal adjacent values (COPY/INSERT of repeated text, e.g. pgbench's blank filler) share one copy.
+        let pref = c.data.getInt64(r * 8 - 8)
+        if (pref & 16777215) == len {
+            let pat = (pref >> 24) & 1099511627775
+            if v.equalBytes(c.heap, pat, len, buf, off, len) {
+                c.data.setInt64(r * 8, pref)
+                if pat + len > c.heapShared { c.heapShared = pat + len }
+                return
+            }
+        }
+    }
+    if len <= oldLen && oldLen > 0 && ((ref >> 24) & 1099511627775) >= c.heapShared {
+        let at = (ref >> 24) & 1099511627775
+        if tracked { touchRange(c.segs[2], c.heap, at, at + len) }
+        let i = 0
+        while i + 8 <= len {
+            c.heap.setInt64(at + i, buf.getInt64(off + i))
+            i += 8
+        }
+        while i < len {
+            c.heap[at + i] = buf[off + i]
+            i += 1
+        }
+        c.heapDead += oldLen - len
+        c.data.setInt64(r * 8, (at << 24) | len)
+        return
+    }
+    c.heapDead += oldLen
+    let at = c.heap.length
+    if off == 0 && len == buf.length {
+        c.heap.addBytes(buf)
+    } else {
+        let i = 0
+        while i + 8 <= len {
+            c.heap.addInt64(buf.getInt64(off + i))
+            i += 8
+        }
+        while i < len {
+            c.heap.add(buf[off + i])
+            i += 1
+        }
+    }
+    c.data.setInt64(r * 8, (at << 24) | len)
+}
+
+// ---- row state
+
+public function isLive(t: Table, r: Integer): Boolean {
+    return t.state[r] == 0
+}
+
+// ---------------------------------------------------------------- binary value/row encoding (redo + undo images)
+
+public record Cursor {
+    pos: Integer
+}
+
+public function putVarint(out: Bytes, x: Integer) {
+    // zigzag
+    let u = (x << 1) ^ (x >> 63)
+    while true {
+        let low = u & 127
+        u = (u >> 7) & 144115188075855871
+        if u == 0 {
+            out.add(low)
+            return
+        }
+        out.add(low | 128)
+    }
+}
+
+public function getVarint(b: Bytes, cur: Cursor): Integer {
+    let u = 0
+    let shift = 0
+    let p = cur.pos
+    while true {
+        let x = b[p]
+        p += 1
+        u = u | ((x & 127) << shift)
+        if x < 128 { break }
+        shift += 7
+    }
+    cur.pos = p
+    // unzigzag
+    let r = (u >> 1) & 9223372036854775807
+    if (u & 1) != 0 { r = -r - 1 }
+    return r
+}
+
+// Encode one column value of row r.
+public function encodeValue(c: Column, r: Integer, out: Bytes) {
+    if isNull(c, r) {
+        out.add(0)
+        return
+    }
+    out.add(1)
+    let t = c.type
+    if v.isTextType(t) {
+        let len = textLen(c, r)
+        putVarint(out, len)
+        let off = textOff(c, r)
+        let i = 0
+        while i + 8 <= len {
+            out.addInt64(c.heap.getInt64(off + i))
+            i += 8
+        }
+        while i < len {
+            out.add(c.heap[off + i])
+            i += 1
+        }
+        return
+    }
+    if t == v.T_FLOAT8 {
+        out.addFloat64(c.data.getFloat64(r * 8))
+        return
+    }
+    if t == v.T_FLOAT4 {
+        out.addFloat32(c.data.getFloat32(r * 4))
+        return
+    }
+    if t == v.T_INTERVAL {
+        putVarint(out, c.data.getInt64(r * 16))
+        putVarint(out, getIvDays(c, r))
+        putVarint(out, getIvMonths(c, r))
+        return
+    }
+    putVarint(out, getInt(c, r))
+    if c.perRowScale { out.add(c.scales[r]) }
+}
+
+public function decodeValue(c: Column, r: Integer, b: Bytes, cur: Cursor) {
+    let tag = b[cur.pos]
+    cur.pos += 1
+    if tag == 0 {
+        setNull(c, r)
+        return
+    }
+    clearNull(c, r)
+    let t = c.type
+    if v.isTextType(t) {
+        let len = getVarint(b, cur)
+        setText(c, r, b, cur.pos, len)
+        cur.pos += len
+        return
+    }
+    if t == v.T_FLOAT8 {
+        c.data.setFloat64(r * 8, b.getFloat64(cur.pos))
+        cur.pos += 8
+        return
+    }
+    if t == v.T_FLOAT4 {
+        c.data.setFloat32(r * 4, b.getFloat32(cur.pos))
+        cur.pos += 4
+        return
+    }
+    if t == v.T_INTERVAL {
+        let mi = getVarint(b, cur)
+        let d = getVarint(b, cur)
+        let mo = getVarint(b, cur)
+        setInterval(c, r, mi, d, mo)
+        return
+    }
+    setInt(c, r, getVarint(b, cur))
+    if c.perRowScale {
+        c.scales[r] = b[cur.pos]
+        cur.pos += 1
+    }
+}
+
+public function encodeRow(t: Table, r: Integer, out: Bytes) {
+    for c in t.cols {
+        encodeValue(c, r, out)
+    }
+}
+
+public function decodeRow(t: Table, r: Integer, b: Bytes, cur: Cursor) {
+    for c in t.cols {
+        decodeValue(c, r, b, cur)
+    }
+}
+
+// Copy row `src` of table a into row `dst` of table b (same schema).
+public function copyRow(a: Table, src: Integer, b: Table, dst: Integer) {
+    let i = 0
+    let n = a.cols.length
+    while i < n {
+        let ca = a.cols[i]
+        let cb = b.cols[i]
+        if isNull(ca, src) {
+            setNull(cb, dst)
+        } else {
+            clearNull(cb, dst)
+            if v.isTextType(ca.type) {
+                setText(cb, dst, ca.heap, textOff(ca, src), textLen(ca, src))
+            } else if ca.width == 16 {
+                cb.data.setInt64(dst * 16, ca.data.getInt64(src * 16))
+                cb.data.setInt64(dst * 16 + 8, ca.data.getInt64(src * 16 + 8))
+            } else if ca.type == v.T_FLOAT8 || ca.type == v.T_FLOAT4 {
+                setFloat(cb, dst, getFloat(ca, src))
+            } else {
+                setInt(cb, dst, getInt(ca, src))
+                if cb.perRowScale { cb.scales[dst] = getScale(ca, src) }
+            }
+        }
+        i += 1
+    }
+}
+
+// A table with the same columns (no data) for before-image scratch rows and temp results.
+public function cloneSchema(t: Table, id: Integer): Table {
+    let n = newTable(id, t.name)
+    for c in t.cols {
+        n.cols.add(newColumn(c.name, c.type, c.typmod, false))
+    }
+    return n
+}
+
+// ---------------------------------------------------------------- compaction
+
+// Rewrite text heaps (dropping garbage). Row ids unchanged.
+public function compactHeaps(t: Table) {
+    for c in t.cols {
+        if v.isTextType(c.type) && c.heapDead > 0 {
+            let nh = Bytes()
+            let r = 0
+            while r < t.nrows {
+                let ref = c.data.getInt64(r * 8)
+                let len = ref & 16777215
+                if len > 0 {
+                    let off = (ref >> 24) & 1099511627775
+                    let at = nh.length
+                    if (t.state[r] & ST_DEAD) == 0 || (t.state[r] & ST_LOCKED) != 0 {
+                        nh.addBytes(c.heap.slice(off, off + len))
+                        c.data.setInt64(r * 8, (at << 24) | len)
+                    } else {
+                        c.data.setInt64(r * 8, 0)
+                    }
+                }
+                r += 1
+            }
+            c.heap = nh
+            c.heapDead = 0
+            c.heapShared = 0
+            if c.segs.length > 0 { c.segs = [newSeg(), newSeg(), newSeg()] }
+        }
+    }
+}
+
+// Remove dead rows (only when no row is locked). Row ids change: caller rebuilds indexes.
+public function compactRows(t: Table): Boolean {
+    if t.lockedCount > 0 { return false }
+    if t.live == t.nrows { return false }
+    let fresh = cloneSchema(t, t.id)
+    let r = 0
+    while r < t.nrows {
+        if t.state[r] == 0 {
+            let d = reserveRow(fresh, 0)
+            copyRow(t, r, fresh, d)
+        }
+        r += 1
+    }
+    let i = 0
+    while i < t.cols.length {
+        let c = t.cols[i]
+        let f = fresh.cols[i]
+        c.data = f.data
+        c.heap = f.heap
+        c.nulls = f.nulls
+        c.scales = f.scales
+        c.heapDead = 0
+        c.heapShared = 0
+        if c.segs.length > 0 { c.segs = [newSeg(), newSeg(), newSeg()] }
+        i += 1
+    }
+    t.state = fresh.state
+    t.nrows = fresh.nrows
+    t.live = fresh.live
+    return true
+}
+
+public function memoryBytes(t: Table): Integer {
+    let total = t.state.length
+    for c in t.cols {
+        total += c.data.length + c.heap.length + c.nulls.length + c.scales.length
+    }
+    return total
+}
+
+// ---------------------------------------------------------------- snapshot column encoding
+// Table chunk: [nrows][live bitmap]; per column: [hasNulls byte][null bitmap over live rows if any]
+// then values of live non-null rows: ints as zigzag varint deltas (+ scale byte for per-row numeric),
+// floats raw, intervals as 3 varints, text as varint(len+1) or 0 for "same as previous value".
+// `liveRows` lists the row ids to encode; `src`/`srcRow` give the data source per live row (before-images).
+
+public function encodeColumnSnap(c: Column, live: Bytes, srcCols: List<Column>, srcRows: Bytes, out: Bytes) {
+    let n = live.length / 8
+    let anyNull = false
+    let i = 0
+    while i < n {
+        let sc = srcCols[i]
+        if isNull(sc, srcRows.getInt64(i * 8)) {
+            anyNull = true
+            break
+        }
+        i += 1
+    }
+    if anyNull {
+        out.add(1)
+        let bm = Bytes((n + 7) / 8)
+        i = 0
+        while i < n {
+            if isNull(srcCols[i], srcRows.getInt64(i * 8)) { bm[i >> 3] = bm[i >> 3] | (1 << (i & 7)) }
+            i += 1
+        }
+        out.addBytes(bm)
+    } else {
+        out.add(0)
+    }
+    let t = c.type
+    let prev = 0
+    let prevOff = -1
+    let prevLen = -1
+    let prevHeap = c.heap
+    i = 0
+    while i < n {
+        let sc = srcCols[i]
+        let r = srcRows.getInt64(i * 8)
+        if !isNull(sc, r) {
+            if v.isTextType(t) {
+                let off = textOff(sc, r)
+                let len = textLen(sc, r)
+                if prevLen == len && v.equalBytes(sc.heap, off, len, prevHeap, prevOff, prevLen) {
+                    out.add(0)
+                } else {
+                    putUVarint(out, len + 1)
+                    let j = 0
+                    while j + 8 <= len {
+                        out.addInt64(sc.heap.getInt64(off + j))
+                        j += 8
+                    }
+                    while j < len {
+                        out.add(sc.heap[off + j])
+                        j += 1
+                    }
+                    prevHeap = sc.heap
+                    prevOff = off
+                    prevLen = len
+                }
+            } else if t == v.T_FLOAT8 {
+                out.addFloat64(getFloat(sc, r))
+            } else if t == v.T_FLOAT4 {
+                out.addFloat32(getFloat(sc, r))
+            } else if t == v.T_INTERVAL {
+                putVarint(out, sc.data.getInt64(r * 16))
+                putVarint(out, getIvDays(sc, r))
+                putVarint(out, getIvMonths(sc, r))
+            } else {
+                let x = getInt(sc, r)
+                putVarint(out, wrappingSubtract(x, prev))
+                prev = x
+                if c.perRowScale { out.add(getScale(sc, r)) }
+            }
+        }
+        i += 1
+    }
+}
+
+public function putUVarint(out: Bytes, x: Integer) {
+    let u = x
+    while true {
+        let low = u & 127
+        u = (u >> 7) & 144115188075855871
+        if u == 0 {
+            out.add(low)
+            return
+        }
+        out.add(low | 128)
+    }
+}
+
+public function getUVarint(b: Bytes, cur: Cursor): Integer {
+    let u = 0
+    let shift = 0
+    let p = cur.pos
+    while true {
+        let x = b[p]
+        p += 1
+        u = u | ((x & 127) << shift)
+        if x < 128 { break }
+        shift += 7
+    }
+    cur.pos = p
+    return u
+}
+
+// Decode a table chunk into t (which must be empty). Fast path: arrays are sized once.
+public function decodeTableSnap(t: Table, b: Bytes) {
+    let cur = Cursor { pos: 0 }
+    let n = getUVarint(b, cur)
+    let bmStart = cur.pos
+    cur.pos += (n + 7) / 8
+    t.state = Bytes(n)
+    let liveIds = Bytes()
+    let r = 0
+    while r < n {
+        if (b[bmStart + (r >> 3)] & (1 << (r & 7))) != 0 {
+            liveIds.addInt64(r)
+        } else {
+            t.state[r] = ST_DEAD
+        }
+        r += 1
+    }
+    t.nrows = n
+    let nl = liveIds.length / 8
+    t.live = nl
+    for c in t.cols {
+        let w = c.width
+        c.data = Bytes(n * w)
+        c.heap = Bytes()
+        c.nulls = Bytes()
+        if c.perRowScale { c.scales = Bytes(n) } else { c.scales = Bytes() }
+        let hasNulls = b[cur.pos] == 1
+        cur.pos += 1
+        let nb = -1
+        if hasNulls {
+            nb = cur.pos
+            cur.pos += (nl + 7) / 8
+            c.nulls = Bytes((n + 7) / 8 + 1)
+        }
+        let t0 = c.type
+        let isText = v.isTextType(t0)
+        let prev = 0
+        let prevRef = 0
+        let i = 0
+        while i < nl {
+            let row = liveIds.getInt64(i * 8)
+            let isN = false
+            if nb >= 0 { isN = (b[nb + (i >> 3)] & (1 << (i & 7))) != 0 }
+            if isN {
+                c.nulls[row >> 3] = c.nulls[row >> 3] | (1 << (row & 7))
+            } else if isText {
+                let l1 = getUVarint(b, cur)
+                if l1 == 0 {
+                    c.data.setInt64(row * 8, prevRef)
+                } else {
+                    let len = l1 - 1
+                    let at = c.heap.length
+                    c.heap.addBytes(b.slice(cur.pos, cur.pos + len))
+                    cur.pos += len
+                    prevRef = (at << 24) | len
+                    c.data.setInt64(row * 8, prevRef)
+                }
+            } else if t0 == v.T_FLOAT8 {
+                c.data.setFloat64(row * 8, b.getFloat64(cur.pos))
+                cur.pos += 8
+            } else if t0 == v.T_FLOAT4 {
+                c.data.setFloat32(row * 4, b.getFloat32(cur.pos))
+                cur.pos += 4
+            } else if t0 == v.T_INTERVAL {
+                let mi = getVarint(b, cur)
+                let d = getVarint(b, cur)
+                let mo = getVarint(b, cur)
+                setInterval(c, row, mi, d, mo)
+            } else {
+                let x = wrappingAdd(prev, getVarint(b, cur))
+                prev = x
+                if w == 8 {
+                    c.data.setInt64(row * 8, x)
+                } else if w == 4 {
+                    c.data.setInt32(row * 4, x)
+                } else if w == 1 {
+                    c.data[row] = x
+                } else {
+                    c.data.setInt16(row * 2, x)
+                }
+                if c.perRowScale {
+                    c.scales[row] = b[cur.pos]
+                    cur.pos += 1
+                }
+            }
+            i += 1
+        }
+        c.heapShared = c.heap.length
+        if c.segs.length > 0 { c.segs = [newSeg(), newSeg(), newSeg()] }
+    }
+}
+
+// ---------------------------------------------------------------- persisted images: positioned reads
+
+// Appends bytes [off, off + len) of a persisted buffer to out (constant pieces are expanded).
+public function segRead(fd: Integer, m: SegMap, off: Integer, len: Integer, out: Bytes) {
+    let at = off
+    let end = off + len
+    if off < 0 || end > m.length { fail("storage: read past the end of a persisted buffer") }
+    while at < end {
+        let p = at >> PIECE_SHIFT
+        let pieceEnd = min((p + 1) << PIECE_SHIFT, end)
+        let n = pieceEnd - at
+        let fo = m.offs.getInt64(p * 8)
+        if fo < 0 {
+            let word = m.words.getInt64(p * 8)
+            let x = at
+            while x < pieceEnd {
+                out.add((word >> ((x & 7) * 8)) & 255)
+                x += 1
+            }
+        } else {
+            let got = dbio.preadAppend(fd, fo + (at - (p << PIECE_SHIFT)), out, n)
+            if got != n {
+                if got < 0 { fail("storage: read data.db: " + dbio.errorText(got)) }
+                fail("storage: short read of data.db (truncated data file)")
+            }
+        }
+        at = pieceEnd
+    }
+}
+
+// Copies row r of a paged table's image into row 0 of t (the stand-in). Rows outside the image read as dead.
+public function faultRow(t: Table, r: Integer) {
+    let pg = t.paged[0]
+    pg.faults += 1
+    let b = pg.buf
+    if r < 0 || r >= pg.nrows {
+        t.state[0] = ST_DEAD
+        return
+    }
+    b.clear()
+    segRead(pg.fd, pg.state, r, 1, b)
+    t.state[0] = b[0]
+    let i = 0
+    while i < t.cols.length {
+        let c = t.cols[i]
+        let w = c.width
+        let isNul = false
+        let nm = pg.nulls[i]
+        if (r >> 3) < nm.length {
+            b.clear()
+            segRead(pg.fd, nm, r >> 3, 1, b)
+            isNul = (b[0] & (1 << (r & 7))) != 0
+        }
+        if isNul { c.nulls[0] = 1 } else { c.nulls[0] = 0 }
+        b.clear()
+        segRead(pg.fd, pg.data[i], r * w, w, b)
+        let k = 0
+        while k < w {
+            c.data[k] = b[k]
+            k += 1
+        }
+        if c.perRowScale {
+            b.clear()
+            segRead(pg.fd, pg.scales[i], r, 1, b)
+            c.scales[0] = b[0]
+        }
+        if v.isTextType(c.type) && !isNul {
+            let ref = c.data.getInt64(0)
+            let len = ref & 16777215
+            c.heap.clear()
+            if len > 0 { segRead(pg.fd, pg.heap[i], (ref >> 24) & 1099511627775, len, c.heap) }
+            c.data.setInt64(0, len)
+        }
+        i += 1
+    }
+}

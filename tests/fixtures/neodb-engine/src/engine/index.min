@@ -1,0 +1,753 @@
+// Indexes over columnar tables: a hash index (open addressing over Bytes) for equality, and an ordered index
+// (sorted main run + small sorted delta of row ids, merged when the delta grows) for range scans / ORDER BY.
+// Both are persisted as images (ADR-010): in-place writes go through tb.touch (dirty pieces, copy-on-write during a
+// checkpoint). A hash index of a table that is not loaded can be probed from its image (paged mode).
+use "./values.min" as v
+use "./table.min" as tb
+
+// Probe key values supplied by the executor (one entry per key column).
+public record Key {
+    n: Integer
+    nulls: List<Boolean>
+    ints: List<Integer>
+    flts: List<Float>
+    scales: List<Integer>
+    bufs: List<Bytes>
+    offs: List<Integer>
+    lens: List<Integer>
+}
+
+public function newKey(n: Integer): Key {
+    let k = Key { n: n; nulls: []; ints: []; flts: []; scales: []; bufs: []; offs: []; lens: [] }
+    let i = 0
+    let empty = Bytes()
+    while i < n {
+        k.nulls.add(false)
+        k.ints.add(0)
+        k.flts.add(0.0)
+        k.scales.add(0)
+        k.bufs.add(empty)
+        k.offs.add(0)
+        k.lens.add(0)
+        i += 1
+    }
+    return k
+}
+
+public record HashIndex {
+    id: Integer
+    tableId: Integer
+    name: Text
+    cols: List<Integer>
+    unique: Boolean
+    primary: Boolean
+    slots: Bytes
+    mask: Integer
+    used: Integer       // live entries + tombstones
+    live: Integer
+    segs: List<tb.Seg>  // [slots] tracker for catalog tables
+    paged: List<PagedSlots>   // probing the persisted image of a table that is not loaded (see probeNext)
+}
+
+// Persisted slots of a hash index whose table is answering point lookups from its image (tb.Paged).
+public record PagedSlots {
+    table: tb.Table
+    slots: tb.SegMap
+    pageNos: Bytes            // cached 4 KiB pages of the slots image (page numbers)
+    pages: List<Bytes>
+}
+
+public record OrdIndex {
+    id: Integer
+    tableId: Integer
+    name: Text
+    cols: List<Integer>
+    unique: Boolean
+    main: Bytes
+    delta: Bytes
+    segs: List<tb.Seg>  // [main, delta] trackers for catalog tables
+}
+
+// ---------------------------------------------------------------- hashing of values
+
+public function normNumeric(x: Integer, s: Integer): Integer {
+    let y = x
+    let k = s
+    while k > 0 && y % 10 == 0 {
+        y = y / 10
+        k -= 1
+    }
+    return v.hashCombine(v.hashInt(y), k)
+}
+
+public function hashCell(c: tb.Column, r: Integer): Integer {
+    if tb.isNull(c, r) { return 7 }
+    let t = c.type
+    if t == v.T_NUMTEXT { return v.hashNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r)) }
+    if v.isTextType(t) {
+        let off = tb.textOff(c, r)
+        let len = tb.textLen(c, r)
+        if t == v.T_BPCHAR { len = v.trimmedLen(c.heap, off, len) }
+        return v.hashBytes(c.heap, off, len)
+    }
+    if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return v.hashFloat(tb.getFloat(c, r)) }
+    if t == v.T_NUMERIC { return normNumeric(tb.getInt(c, r), tb.getScale(c, r)) }
+    return v.hashInt(tb.getInt(c, r))
+}
+
+public function hashRow(t: tb.Table, cols: List<Integer>, r: Integer): Integer {
+    let h = 0
+    for ci in cols {
+        h = v.hashCombine(h, hashCell(t.cols[ci], r))
+    }
+    return v.mix64(h)
+}
+
+public function hashKeyPart(type: Integer, k: Key, i: Integer): Integer {
+    if k.nulls[i] { return 7 }
+    if type == v.T_NUMTEXT { return v.hashNumText(k.bufs[i], k.offs[i], k.lens[i]) }
+    if v.isTextType(type) {
+        let len = k.lens[i]
+        if type == v.T_BPCHAR { len = v.trimmedLen(k.bufs[i], k.offs[i], len) }
+        return v.hashBytes(k.bufs[i], k.offs[i], len)
+    }
+    if type == v.T_FLOAT8 || type == v.T_FLOAT4 { return v.hashFloat(k.flts[i]) }
+    if type == v.T_NUMERIC { return normNumeric(k.ints[i], k.scales[i]) }
+    return v.hashInt(k.ints[i])
+}
+
+public function hashKey(t: tb.Table, cols: List<Integer>, k: Key): Integer {
+    let h = 0
+    let i = 0
+    let n = cols.length
+    while i < n {
+        h = v.hashCombine(h, hashKeyPart(t.cols[cols[i]].type, k, i))
+        i += 1
+    }
+    return v.mix64(h)
+}
+
+// ---------------------------------------------------------------- comparisons
+
+public function cmpInt(a: Integer, b: Integer): Integer {
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+}
+
+public function cmpFloat(a: Float, b: Float): Integer {
+    // NaN sorts greater than everything (PG semantics); NaN = NaN
+    let an = a != a
+    let bn = b != b
+    if an || bn {
+        if an && bn { return 0 }
+        if an { return 1 }
+        return -1
+    }
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+}
+
+public function cmpNumeric(a: Integer, sa: Integer, b: Integer, sb: Integer): Integer {
+    if sa == sb { return cmpInt(a, b) }
+    let p = v.newParsed()
+    if sa < sb {
+        v.rescale(a, sa, sb, p)
+        if p.ok { return cmpInt(p.i, b) }
+    } else {
+        v.rescale(b, sb, sa, p)
+        if p.ok { return cmpInt(a, p.i) }
+    }
+    return cmpFloat(Float(a) / v.pow10float(sa), Float(b) / v.pow10float(sb))
+}
+
+public function cmpText(type: Integer, a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    if type == v.T_BPCHAR {
+        return v.compareBytes(a, ao, v.trimmedLen(a, ao, al), b, bo, v.trimmedLen(b, bo, bl))
+    }
+    return v.compareBytes(a, ao, al, b, bo, bl)
+}
+
+// Compare two non-null cells of the same column type (possibly different tables).
+public function cmpCells(ca: tb.Column, ra: Integer, cb: tb.Column, rb: Integer): Integer {
+    let t = ca.type
+    if t == v.T_NUMTEXT {
+        return v.cmpNumText(ca.heap, tb.textOff(ca, ra), tb.textLen(ca, ra), cb.heap, tb.textOff(cb, rb), tb.textLen(cb, rb))
+    }
+    if v.isTextType(t) {
+        return cmpText(t, ca.heap, tb.textOff(ca, ra), tb.textLen(ca, ra), cb.heap, tb.textOff(cb, rb), tb.textLen(cb, rb))
+    }
+    if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return cmpFloat(tb.getFloat(ca, ra), tb.getFloat(cb, rb)) }
+    if t == v.T_NUMERIC { return cmpNumeric(tb.getInt(ca, ra), tb.getScale(ca, ra), tb.getInt(cb, rb), tb.getScale(cb, rb)) }
+    if t == v.T_INTERVAL {
+        let x = ivKey(tb.getInt(ca, ra), tb.getIvDays(ca, ra), tb.getIvMonths(ca, ra))
+        let y = ivKey(tb.getInt(cb, rb), tb.getIvDays(cb, rb), tb.getIvMonths(cb, rb))
+        return cmpInt(x, y)
+    }
+    return cmpInt(tb.getInt(ca, ra), tb.getInt(cb, rb))
+}
+
+public function ivKey(micros: Integer, days: Integer, months: Integer): Integer {
+    return micros + days * v.USECS_PER_DAY + months * 30 * v.USECS_PER_DAY
+}
+
+// Row comparison over columns; NULLs sort last (ASC); ties broken by row id.
+public function cmpRows(t: tb.Table, cols: List<Integer>, a: Integer, b: Integer): Integer {
+    for ci in cols {
+        let c = t.cols[ci]
+        let an = tb.isNull(c, a)
+        let bn = tb.isNull(c, b)
+        if an || bn {
+            if an && bn { continue }
+            if an { return 1 }
+            return -1
+        }
+        let r = cmpCells(c, a, c, b)
+        if r != 0 { return r }
+    }
+    return cmpInt(a, b)
+}
+
+// Compare row r against the first k.n key parts. NULL key part: treated as greater than all non-null.
+public function cmpRowKey(t: tb.Table, cols: List<Integer>, r: Integer, k: Key): Integer {
+    let i = 0
+    while i < k.n {
+        let c = t.cols[cols[i]]
+        let rn = tb.isNull(c, r)
+        let kn = k.nulls[i]
+        if rn || kn {
+            if rn && kn {
+                i += 1
+                continue
+            }
+            if rn { return 1 }
+            return -1
+        }
+        let res = 0
+        let ty = c.type
+        if ty == v.T_NUMTEXT {
+            res = v.cmpNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
+        } else if v.isTextType(ty) {
+            res = cmpText(ty, c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
+        } else if ty == v.T_FLOAT8 || ty == v.T_FLOAT4 {
+            res = cmpFloat(tb.getFloat(c, r), k.flts[i])
+        } else if ty == v.T_NUMERIC {
+            res = cmpNumeric(tb.getInt(c, r), tb.getScale(c, r), k.ints[i], k.scales[i])
+        } else {
+            res = cmpInt(tb.getInt(c, r), k.ints[i])
+        }
+        if res != 0 { return res }
+        i += 1
+    }
+    return 0
+}
+
+// Equality of row r with key over all index columns (NULL never equal).
+public function rowMatchesKey(t: tb.Table, cols: List<Integer>, r: Integer, k: Key): Boolean {
+    let i = 0
+    let n = cols.length
+    while i < n {
+        let c = t.cols[cols[i]]
+        if k.nulls[i] || tb.isNull(c, r) { return false }
+        let ty = c.type
+        if ty == v.T_NUMTEXT {
+            if v.cmpNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
+        } else if v.isTextType(ty) {
+            if ty == v.T_BPCHAR {
+                if cmpText(ty, c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
+            } else if !v.equalBytes(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) {
+                return false
+            }
+        } else if ty == v.T_FLOAT8 || ty == v.T_FLOAT4 {
+            if cmpFloat(tb.getFloat(c, r), k.flts[i]) != 0 { return false }
+        } else if ty == v.T_NUMERIC {
+            if cmpNumeric(tb.getInt(c, r), tb.getScale(c, r), k.ints[i], k.scales[i]) != 0 { return false }
+        } else if tb.getInt(c, r) != k.ints[i] {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Rows a and b equal on cols (NULLs never equal) — for unique checks between rows.
+public function rowsEqual(t: tb.Table, cols: List<Integer>, a: Integer, b: Integer): Boolean {
+    for ci in cols {
+        let c = t.cols[ci]
+        if tb.isNull(c, a) || tb.isNull(c, b) { return false }
+        if cmpCells(c, a, c, b) != 0 { return false }
+    }
+    return true
+}
+
+public function rowHasNullKey(t: tb.Table, cols: List<Integer>, r: Integer): Boolean {
+    for ci in cols {
+        if tb.isNull(t.cols[ci], r) { return true }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- hash index
+
+public function newHashIndex(id: Integer, tableId: Integer, name: Text, cols: List<Integer>, unique: Boolean, capacity: Integer): HashIndex {
+    let n = 64
+    while n < capacity * 2 { n = n * 2 }
+    let segs: List<tb.Seg> = []
+    if tableId >= 0 { segs = [tb.newSeg()] }
+    return HashIndex { id: id; tableId: tableId; name: name; cols: cols; unique: unique; primary: false
+                       slots: Bytes(n * 8); mask: n - 1; used: 0; live: 0; segs: segs; paged: [] }
+}
+
+function newSlots(ix: HashIndex, n: Integer) {
+    ix.slots = Bytes(n * 8)
+    ix.mask = n - 1
+    if ix.segs.length > 0 { ix.segs = [tb.newSeg()] }
+}
+
+function tagOf(h: Integer): Integer {
+    return (h >> 40) & 8388607
+}
+
+public function hashInsert(ix: HashIndex, t: tb.Table, h: Integer, row: Integer) {
+    if ix.paged.length > 0 { fail("internal: write to a paged hash index") }
+    if (ix.used + 1) * 10 > (ix.mask + 1) * 7 { hashResize(ix, t, (ix.live + 1) * 2) }
+    let entry = (tagOf(h) << 40) | (row + 1)
+    let i = h & ix.mask
+    while true {
+        let s = ix.slots.getInt64(i * 8)
+        if s == 0 {
+            if ix.segs.length > 0 { tb.touch(ix.segs[0], ix.slots, i * 8) }
+            ix.slots.setInt64(i * 8, entry)
+            ix.used += 1
+            ix.live += 1
+            return
+        }
+        if s == -1 {
+            if ix.segs.length > 0 { tb.touch(ix.segs[0], ix.slots, i * 8) }
+            ix.slots.setInt64(i * 8, entry)
+            ix.live += 1
+            return
+        }
+        i = (i + 1) & ix.mask
+    }
+}
+
+public function hashRemove(ix: HashIndex, h: Integer, row: Integer): Boolean {
+    let i = h & ix.mask
+    let want = row + 1
+    while true {
+        let s = ix.slots.getInt64(i * 8)
+        if s == 0 { return false }
+        if s != -1 && (s & 1099511627775) == want {
+            if ix.segs.length > 0 { tb.touch(ix.segs[0], ix.slots, i * 8) }
+            ix.slots.setInt64(i * 8, -1)
+            ix.live -= 1
+            return true
+        }
+        i = (i + 1) & ix.mask
+    }
+}
+
+function hashResize(ix: HashIndex, t: tb.Table, want: Integer) {
+    let n = 64
+    while n < want * 2 { n = n * 2 }
+    let old = ix.slots
+    let total = old.length / 8
+    newSlots(ix, n)
+    ix.used = 0
+    ix.live = 0
+    let i = 0
+    while i < total {
+        let s = old.getInt64(i * 8)
+        if s != 0 && s != -1 {
+            let row = (s & 1099511627775) - 1
+            hashInsert(ix, t, hashRow(t, ix.cols, row), row)
+        }
+        i += 1
+    }
+}
+
+// Candidate iteration: start at probeStart(ix, h), call probeNext(ix, h, slot) to get the next slot whose tag
+// matches (or -1 at the end of the chain); the row id is slotRow(ix, slot); continue from slot + 1.
+public function probeStart(ix: HashIndex, h: Integer): Integer {
+    return h & ix.mask
+}
+
+public function probeNext(ix: HashIndex, h: Integer, from: Integer): Integer {
+    if ix.paged.length > 0 { return pagedProbeNext(ix, h, from) }
+    let tag = tagOf(h)
+    let i = from & ix.mask
+    while true {
+        let s = ix.slots.getInt64(i * 8)
+        if s == 0 { return -1 }
+        if s != -1 && ((s >> 40) & 8388607) == tag { return i }
+        i = (i + 1) & ix.mask
+    }
+}
+
+public function slotRow(ix: HashIndex, slot: Integer): Integer {
+    if ix.paged.length > 0 { return pagedSlotRow(ix, slot) }
+    return (ix.slots.getInt64(slot * 8) & 1099511627775) - 1
+}
+
+// ---- paged mode: the table is not loaded; slots are read from the persisted image (4 KiB pages, cached) and a
+// candidate row is copied into row 0 of the stand-in table (tb.faultRow), which slotRow returns.
+
+function pagedSlot(ix: HashIndex, slot: Integer): Integer {
+    let pp = ix.paged[0]
+    let page = slot >> 9
+    let n = pp.pageNos.length / 8
+    let i = 0
+    while i < n {
+        if pp.pageNos.getInt64(i * 8) == page { return pp.pages[i].getInt64((slot & 511) * 8) }
+        i += 1
+    }
+    if n >= 64 {
+        pp.pageNos = Bytes()
+        pp.pages = []
+    }
+    let b = Bytes()
+    let from = page * 4096
+    tb.segRead(pp.table.paged[0].fd, pp.slots, from, min(4096, pp.slots.length - from), b)
+    pp.pageNos.addInt64(page)
+    pp.pages.add(b)
+    return b.getInt64((slot & 511) * 8)
+}
+
+function pagedProbeNext(ix: HashIndex, h: Integer, from: Integer): Integer {
+    let tag = tagOf(h)
+    let i = from & ix.mask
+    let steps = 0
+    while steps <= ix.mask {
+        let s = pagedSlot(ix, i)
+        if s == 0 { return -1 }
+        if s != -1 && ((s >> 40) & 8388607) == tag { return i }
+        i = (i + 1) & ix.mask
+        steps += 1
+    }
+    return -1
+}
+
+function pagedSlotRow(ix: HashIndex, slot: Integer): Integer {
+    let r = (pagedSlot(ix, slot) & 1099511627775) - 1
+    tb.faultRow(ix.paged[0].table, r)
+    return 0
+}
+
+// Rebuild from table rows that are live or locked (locked rows may be visible to someone).
+public function hashBuild(ix: HashIndex, t: tb.Table) {
+    hashBuildCheck(ix, t)
+}
+
+// Build; returns 0 = no duplicate among live rows, 1 = duplicate found, 2 = not checked.
+public function hashBuildCheck(ix: HashIndex, t: tb.Table): Integer {
+    if ix.cols.length == 1 {
+        let c0 = t.cols[ix.cols[0]]
+        let ty = c0.type
+        if !v.isTextType(ty) && ty != v.T_FLOAT8 && ty != v.T_FLOAT4 && ty != v.T_NUMERIC && ty != v.T_INTERVAL {
+            return hashBuildInt(ix, t, c0)
+        }
+    }
+    hashBuildGeneric(ix, t)
+    return 2
+}
+
+function hashBuildGeneric(ix: HashIndex, t: tb.Table) {
+    let n = 64
+    while n < t.nrows * 2 + 2 { n = n * 2 }
+    newSlots(ix, n)
+    ix.used = 0
+    ix.live = 0
+    let r = 0
+    while r < t.nrows {
+        let st = t.state[r]
+        if st == 0 || (st & tb.ST_LOCKED) != 0 {
+            hashInsert(ix, t, hashRow(t, ix.cols, r), r)
+        }
+        r += 1
+    }
+}
+
+// ---------------------------------------------------------------- ordered index
+
+public function newOrdIndex(id: Integer, tableId: Integer, name: Text, cols: List<Integer>, unique: Boolean): OrdIndex {
+    let segs: List<tb.Seg> = []
+    if tableId >= 0 { segs = [tb.newSeg(), tb.newSeg()] }
+    return OrdIndex { id: id; tableId: tableId; name: name; cols: cols; unique: unique; main: Bytes(); delta: Bytes()
+                      segs: segs }
+}
+
+function freshOrdSegs(ix: OrdIndex) {
+    if ix.segs.length > 0 { ix.segs = [tb.newSeg(), tb.newSeg()] }
+}
+
+public constant DELTA_MAX = 4096
+
+// First position in run (Bytes of Int64 row ids) whose row is >= row `r` (by key, then row id).
+function lowerBoundRow(t: tb.Table, cols: List<Integer>, run: Bytes, r: Integer): Integer {
+    let lo = 0
+    let hi = run.length / 8
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if cmpRows(t, cols, run.getInt64(mid * 8), r) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+// First position whose key prefix is >= k (strict=false) or > k (strict=true).
+public function lowerBoundKey(t: tb.Table, cols: List<Integer>, run: Bytes, k: Key, strict: Boolean): Integer {
+    let lo = 0
+    let hi = run.length / 8
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let c = cmpRowKey(t, cols, run.getInt64(mid * 8), k)
+        if c < 0 || (strict && c == 0) {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+function insertAt(run: Bytes, pos: Integer, r: Integer) {
+    let n = run.length / 8
+    run.addInt64(0)
+    let i = n
+    while i > pos {
+        run.setInt64(i * 8, run.getInt64((i - 1) * 8))
+        i -= 1
+    }
+    run.setInt64(pos * 8, r)
+}
+
+function removeAt(run: Bytes, pos: Integer) {
+    let n = run.length / 8
+    let i = pos
+    while i + 1 < n {
+        run.setInt64(i * 8, run.getInt64((i + 1) * 8))
+        i += 1
+    }
+    run.resize((n - 1) * 8)
+}
+
+public function ordInsert(ix: OrdIndex, t: tb.Table, r: Integer) {
+    let pos = lowerBoundRow(t, ix.cols, ix.delta, r)
+    if ix.segs.length > 0 { tb.touchRange(ix.segs[1], ix.delta, pos * 8, ix.delta.length) }
+    insertAt(ix.delta, pos, r)
+    if ix.delta.length / 8 >= DELTA_MAX { ordMerge(ix, t) }
+}
+
+// Remove row r (its key must still be the one it was inserted with).
+public function ordRemove(ix: OrdIndex, t: tb.Table, r: Integer): Boolean {
+    let pos = lowerBoundRow(t, ix.cols, ix.delta, r)
+    if pos < ix.delta.length / 8 && ix.delta.getInt64(pos * 8) == r {
+        if ix.segs.length > 0 { tb.touchRange(ix.segs[1], ix.delta, pos * 8, ix.delta.length) }
+        removeAt(ix.delta, pos)
+        return true
+    }
+    pos = lowerBoundRow(t, ix.cols, ix.main, r)
+    if pos < ix.main.length / 8 && ix.main.getInt64(pos * 8) == r {
+        if ix.segs.length > 0 { tb.touchRange(ix.segs[0], ix.main, pos * 8, ix.main.length) }
+        removeAt(ix.main, pos)
+        return true
+    }
+    return false
+}
+
+public function ordMerge(ix: OrdIndex, t: tb.Table) {
+    let a = ix.main
+    let b = ix.delta
+    let na = a.length / 8
+    let nb = b.length / 8
+    let out = Bytes()
+    let i = 0
+    let j = 0
+    while i < na && j < nb {
+        let x = a.getInt64(i * 8)
+        let y = b.getInt64(j * 8)
+        if cmpRows(t, ix.cols, x, y) <= 0 {
+            out.addInt64(x)
+            i += 1
+        } else {
+            out.addInt64(y)
+            j += 1
+        }
+    }
+    while i < na {
+        out.addInt64(a.getInt64(i * 8))
+        i += 1
+    }
+    while j < nb {
+        out.addInt64(b.getInt64(j * 8))
+        j += 1
+    }
+    ix.main = out
+    ix.delta = Bytes()
+    freshOrdSegs(ix)
+}
+
+public function ordBuild(ix: OrdIndex, t: tb.Table) {
+    let ids = Bytes()
+    let r = 0
+    while r < t.nrows {
+        let st = t.state[r]
+        if st == 0 || (st & tb.ST_LOCKED) != 0 { ids.addInt64(r) }
+        r += 1
+    }
+    sortRowIds(t, ix.cols, ids)
+    ix.main = ids
+    ix.delta = Bytes()
+    freshOrdSegs(ix)
+}
+
+// Merge sort of row ids by cmpRows (stable, O(n log n)).
+public function sortRowIds(t: tb.Table, cols: List<Integer>, ids: Bytes) {
+    let n = ids.length / 8
+    if n < 2 { return }
+    let tmp = Bytes(n * 8)
+    // insertion sort runs of 16
+    let run = 16
+    let s = 0
+    while s < n {
+        let e = s + run
+        if e > n { e = n }
+        let i = s + 1
+        while i < e {
+            let x = ids.getInt64(i * 8)
+            let j = i - 1
+            while j >= s && cmpRows(t, cols, ids.getInt64(j * 8), x) > 0 {
+                ids.setInt64((j + 1) * 8, ids.getInt64(j * 8))
+                j -= 1
+            }
+            ids.setInt64((j + 1) * 8, x)
+            i += 1
+        }
+        s = e
+    }
+    let src = ids
+    let dst = tmp
+    let inIds = true
+    let width = run
+    while width < n {
+        let lo = 0
+        while lo < n {
+            let mid = lo + width
+            if mid > n { mid = n }
+            let hi = lo + 2 * width
+            if hi > n { hi = n }
+            let i = lo
+            let j = mid
+            let k = lo
+            while i < mid && j < hi {
+                let x = src.getInt64(i * 8)
+                let y = src.getInt64(j * 8)
+                if cmpRows(t, cols, x, y) <= 0 {
+                    dst.setInt64(k * 8, x)
+                    i += 1
+                } else {
+                    dst.setInt64(k * 8, y)
+                    j += 1
+                }
+                k += 1
+            }
+            while i < mid {
+                dst.setInt64(k * 8, src.getInt64(i * 8))
+                i += 1
+                k += 1
+            }
+            while j < hi {
+                dst.setInt64(k * 8, src.getInt64(j * 8))
+                j += 1
+                k += 1
+            }
+            lo = hi
+        }
+        let sw = src
+        src = dst
+        dst = sw
+        inIds = !inIds
+        width = width * 2
+    }
+    if !inIds {
+        let i = 0
+        while i < n {
+            ids.setInt64(i * 8, src.getInt64(i * 8))
+            i += 1
+        }
+    }
+}
+
+// Range cursor over main + delta: positions are kept by the caller (two Integers).
+public function runLength(run: Bytes): Integer {
+    return run.length / 8
+}
+public function runAt(run: Bytes, i: Integer): Integer {
+    return run.getInt64(i * 8)
+}
+
+// Fast build for a single integer-like key column: no per-row calls, slots sized for load <= 2/3.
+function hashBuildInt(ix: HashIndex, t: tb.Table, c: tb.Column): Integer {
+    let nrows = t.nrows
+    let n = 64
+    while n * 2 < nrows * 3 + 2 { n = n * 2 }
+    let slots = Bytes(n * 8)
+    let mask = n - 1
+    let data = c.data
+    let w = c.width
+    let state = t.state
+    let nulls = c.nulls
+    let hasNulls = nulls.length > 0
+    let count = 0
+    let dup = 0
+    let r = 0
+    while r < nrows {
+        let st = state[r]
+        if st == 0 || (st & tb.ST_LOCKED) != 0 {
+            let isNullRow = false
+            if hasNulls && (r >> 3) < nulls.length { isNullRow = (nulls[r >> 3] & (1 << (r & 7))) != 0 }
+            let h = 0
+            if isNullRow {
+                h = v.mix64(7)
+            } else {
+                let x = 0
+                if w == 8 {
+                    x = data.getInt64(r * 8)
+                } else if w == 4 {
+                    x = data.getInt32(r * 4)
+                } else if w == 2 {
+                    x = data.getInt16(r * 2)
+                } else {
+                    x = data[r]
+                }
+                h = v.mix64(v.hashInt(x))
+            }
+            let tag = (h >> 40) & 8388607
+            let entry = (tag << 40) | (r + 1)
+            let i = h & mask
+            while true {
+                let e0 = slots.getInt64(i * 8)
+                if e0 == 0 { break }
+                if dup == 0 && st == 0 && !isNullRow && ((e0 >> 40) & 8388607) == tag {
+                    let o = (e0 & 1099511627775) - 1
+                    if state[o] == 0 && !tb.isNull(c, o) && tb.getInt(c, o) == tb.getInt(c, r) { dup = 1 }
+                }
+                i = (i + 1) & mask
+            }
+            slots.setInt64(i * 8, entry)
+            count += 1
+        }
+        r += 1
+    }
+    ix.slots = slots
+    ix.mask = mask
+    ix.used = count
+    ix.live = count
+    if ix.segs.length > 0 { ix.segs = [tb.newSeg()] }
+    return dup
+}

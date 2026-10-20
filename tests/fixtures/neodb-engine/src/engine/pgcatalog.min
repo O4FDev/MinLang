@@ -1,0 +1,1899 @@
+// pg_catalog and information_schema relations, materialised from the engine catalog when a query opens them
+// (compat agent). Column lists are PG 17's (names, order, types); rows describe neo-db's own tables, views,
+// indexes and constraints with stable OIDs, so drivers' metadata queries (pgjdbc DatabaseMetaData, psql \d,
+// ORMs) work unchanged. Ordinary statements never touch this module.
+//
+// OIDs (stable across restarts: the catalog is rebuilt by replaying DDL in order, so positions never move):
+//   user table 16384 + table id; view 1016384 + view position; index 3016384 + hash index id (or 4016384 +
+//   ordered index id when it has no hash part); PRIMARY KEY / UNIQUE constraint = its index oid + 2000000;
+//   foreign key 7016384 + position; column default 8016384 + table id * 1700 + attnum.
+use "./values.min" as v
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+
+public constant OID_TABLE = 16384
+public constant OID_VIEW = 1016384
+public constant OID_HASHIDX = 3016384
+public constant OID_ORDIDX = 4016384
+public constant OID_CON_OFFSET = 2000000
+public constant OID_FK = 7016384
+public constant OID_ATTRDEF = 8016384
+public constant NS_CATALOG = 11
+public constant NS_PUBLIC = 2200
+public constant NS_INFO = 13265
+public constant NS_TOAST = 99
+
+// relation codes
+public constant R_NAMESPACE = 1
+public constant R_CLASS = 2
+public constant R_ATTRIBUTE = 3
+public constant R_TYPE = 4
+public constant R_INDEX = 5
+public constant R_CONSTRAINT = 6
+public constant R_ATTRDEF = 7
+public constant R_DESCRIPTION = 8
+public constant R_AM = 9
+public constant R_SETTINGS = 10
+public constant R_DATABASE = 11
+public constant R_TABLES = 12
+public constant R_INDEXES = 13
+public constant R_VIEWS = 14
+public constant R_STAT_ARCHIVER = 15
+public constant R_STAT_BGWRITER = 16
+public constant R_STAT_DATABASE = 17
+public constant R_STAT_DB_CONFLICTS = 18
+public constant R_STAT_USER_TABLES = 19
+public constant R_STATIO_USER_TABLES = 20
+public constant R_STAT_USER_INDEXES = 21
+public constant R_STATIO_USER_INDEXES = 22
+public constant R_ROLES = 23
+public constant R_USER = 24
+public constant R_PROC = 25
+public constant R_INHERITS = 26
+public constant R_TRIGGER = 27
+public constant R_SEQUENCE = 28
+public constant R_COLLATION = 29
+public constant R_TABLESPACE = 30
+public constant R_EXTENSION = 31
+public constant R_ENUM = 32
+public constant R_RANGE = 33
+public constant R_STAT_ACTIVITY = 34
+public constant R_IS_TABLES = 35
+public constant R_IS_COLUMNS = 36
+public constant R_IS_SCHEMATA = 37
+public constant R_IS_KEY_COLUMN_USAGE = 38
+public constant R_IS_TABLE_CONSTRAINTS = 39
+public constant R_IS_REFERENTIAL_CONSTRAINTS = 40
+public constant R_IS_VIEWS = 41
+public constant R_LAST = 41
+
+// ---------------------------------------------------------------- relation registry
+
+public function relName(code: Integer): Text {
+    if code == R_NAMESPACE { return "pg_namespace" }
+    if code == R_CLASS { return "pg_class" }
+    if code == R_ATTRIBUTE { return "pg_attribute" }
+    if code == R_TYPE { return "pg_type" }
+    if code == R_INDEX { return "pg_index" }
+    if code == R_CONSTRAINT { return "pg_constraint" }
+    if code == R_ATTRDEF { return "pg_attrdef" }
+    if code == R_DESCRIPTION { return "pg_description" }
+    if code == R_AM { return "pg_am" }
+    if code == R_SETTINGS { return "pg_settings" }
+    if code == R_DATABASE { return "pg_database" }
+    if code == R_TABLES { return "pg_tables" }
+    if code == R_INDEXES { return "pg_indexes" }
+    if code == R_VIEWS { return "pg_views" }
+    if code == R_STAT_ARCHIVER { return "pg_stat_archiver" }
+    if code == R_STAT_BGWRITER { return "pg_stat_bgwriter" }
+    if code == R_STAT_DATABASE { return "pg_stat_database" }
+    if code == R_STAT_DB_CONFLICTS { return "pg_stat_database_conflicts" }
+    if code == R_STAT_USER_TABLES { return "pg_stat_user_tables" }
+    if code == R_STATIO_USER_TABLES { return "pg_statio_user_tables" }
+    if code == R_STAT_USER_INDEXES { return "pg_stat_user_indexes" }
+    if code == R_STATIO_USER_INDEXES { return "pg_statio_user_indexes" }
+    if code == R_ROLES { return "pg_roles" }
+    if code == R_USER { return "pg_user" }
+    if code == R_PROC { return "pg_proc" }
+    if code == R_INHERITS { return "pg_inherits" }
+    if code == R_TRIGGER { return "pg_trigger" }
+    if code == R_SEQUENCE { return "pg_sequence" }
+    if code == R_COLLATION { return "pg_collation" }
+    if code == R_TABLESPACE { return "pg_tablespace" }
+    if code == R_EXTENSION { return "pg_extension" }
+    if code == R_ENUM { return "pg_enum" }
+    if code == R_RANGE { return "pg_range" }
+    if code == R_STAT_ACTIVITY { return "pg_stat_activity" }
+    if code == R_IS_TABLES { return "tables" }
+    if code == R_IS_COLUMNS { return "columns" }
+    if code == R_IS_SCHEMATA { return "schemata" }
+    if code == R_IS_KEY_COLUMN_USAGE { return "key_column_usage" }
+    if code == R_IS_TABLE_CONSTRAINTS { return "table_constraints" }
+    if code == R_IS_REFERENTIAL_CONSTRAINTS { return "referential_constraints" }
+    if code == R_IS_VIEWS { return "views" }
+    return ""
+}
+
+public function relOidOf(code: Integer): Integer {
+    if code == R_NAMESPACE { return 2615 }
+    if code == R_CLASS { return 1259 }
+    if code == R_ATTRIBUTE { return 1249 }
+    if code == R_TYPE { return 1247 }
+    if code == R_INDEX { return 2610 }
+    if code == R_CONSTRAINT { return 2606 }
+    if code == R_ATTRDEF { return 2604 }
+    if code == R_DESCRIPTION { return 2609 }
+    if code == R_AM { return 2601 }
+    if code == R_SETTINGS { return 12104 }
+    if code == R_DATABASE { return 1262 }
+    if code == R_TABLES { return 12033 }
+    if code == R_INDEXES { return 12043 }
+    if code == R_VIEWS { return 12028 }
+    if code == R_STAT_ARCHIVER { return 12285 }
+    if code == R_STAT_BGWRITER { return 12289 }
+    if code == R_STAT_DATABASE { return 12266 }
+    if code == R_STAT_DB_CONFLICTS { return 12271 }
+    if code == R_STAT_USER_TABLES { return 12161 }
+    if code == R_STATIO_USER_TABLES { return 12179 }
+    if code == R_STAT_USER_INDEXES { return 12192 }
+    if code == R_STATIO_USER_INDEXES { return 12205 }
+    if code == R_ROLES { return 12000 }
+    if code == R_USER { return 12014 }
+    if code == R_PROC { return 1255 }
+    if code == R_INHERITS { return 2611 }
+    if code == R_TRIGGER { return 2620 }
+    if code == R_SEQUENCE { return 2224 }
+    if code == R_COLLATION { return 3456 }
+    if code == R_TABLESPACE { return 1213 }
+    if code == R_EXTENSION { return 3079 }
+    if code == R_ENUM { return 3501 }
+    if code == R_RANGE { return 3541 }
+    if code == R_STAT_ACTIVITY { return 12222 }
+    return 13300 + code
+}
+
+public function relSchemaOid(code: Integer): Integer {
+    if code >= R_IS_TABLES { return NS_INFO }
+    return NS_CATALOG
+}
+
+// 'r' for catalog tables, 'v' for the system views.
+public function relKindOf(code: Integer): Integer {
+    if code == R_SETTINGS || code == R_TABLES || code == R_INDEXES || code == R_VIEWS || code == R_ROLES || code == R_USER || code == R_STAT_ACTIVITY { return 118 }
+    if code >= R_STAT_ARCHIVER && code <= R_STATIO_USER_INDEXES { return 118 }
+    if code >= R_IS_TABLES { return 118 }
+    return 114
+}
+
+// Catalog relation for (schema, name), or 0. Unqualified names resolve in pg_catalog only (callers try user
+// tables first, as PG's search path puts pg_catalog first but neo-db users cannot create pg_* tables anyway).
+public function lookup(schema: Text, name: Text): Integer {
+    if schema != "" && schema != "pg_catalog" && schema != "information_schema" { return 0 }
+    let code = 1
+    while code <= R_LAST {
+        if relName(code) == name {
+            let isInfo = code >= R_IS_TABLES
+            if schema == "information_schema" && isInfo { return code }
+            if schema != "information_schema" && !isInfo { return code }
+        }
+        code += 1
+    }
+    return 0
+}
+
+function relSpec(code: Integer): Text {
+    if code == R_NAMESPACE { return "oid oid;nspname name;nspowner oid;nspacl aclitem[]" }
+    if code == R_CLASS {
+        return "oid oid;relname name;relnamespace oid;reltype oid;reloftype oid;relowner oid;relam oid;relfilenode oid;reltablespace oid;relpages int4;reltuples float4;relallvisible int4;reltoastrelid oid;relhasindex bool;relisshared bool;relpersistence char;relkind char;relnatts int2;relchecks int2;relhasrules bool;relhastriggers bool;relhassubclass bool;relrowsecurity bool;relforcerowsecurity bool;relispopulated bool;relreplident char;relispartition bool;relrewrite oid;relfrozenxid xid;relminmxid xid;relacl aclitem[];reloptions text[];relpartbound pg_node_tree"
+    }
+    if code == R_ATTRIBUTE {
+        return "attrelid oid;attname name;atttypid oid;attlen int2;attnum int2;attcacheoff int4;atttypmod int4;attndims int2;attbyval bool;attalign char;attstorage char;attcompression char;attnotnull bool;atthasdef bool;atthasmissing bool;attidentity char;attgenerated char;attisdropped bool;attislocal bool;attinhcount int2;attcollation oid;attstattarget int2;attacl aclitem[];attoptions text[];attfdwoptions text[];attmissingval anyarray"
+    }
+    if code == R_TYPE {
+        return "oid oid;typname name;typnamespace oid;typowner oid;typlen int2;typbyval bool;typtype char;typcategory char;typispreferred bool;typisdefined bool;typdelim char;typrelid oid;typsubscript regproc;typelem oid;typarray oid;typinput regproc;typoutput regproc;typreceive regproc;typsend regproc;typmodin regproc;typmodout regproc;typanalyze regproc;typalign char;typstorage char;typnotnull bool;typbasetype oid;typtypmod int4;typndims int4;typcollation oid;typdefaultbin pg_node_tree;typdefault text;typacl aclitem[]"
+    }
+    if code == R_INDEX {
+        return "indexrelid oid;indrelid oid;indnatts int2;indnkeyatts int2;indisunique bool;indnullsnotdistinct bool;indisprimary bool;indisexclusion bool;indimmediate bool;indisclustered bool;indisvalid bool;indcheckxmin bool;indisready bool;indislive bool;indisreplident bool;indkey int2vector;indcollation oidvector;indclass oidvector;indoption int2vector;indexprs pg_node_tree;indpred pg_node_tree"
+    }
+    if code == R_CONSTRAINT {
+        return "oid oid;conname name;connamespace oid;contype char;condeferrable bool;condeferred bool;convalidated bool;conrelid oid;contypid oid;conindid oid;conparentid oid;confrelid oid;confupdtype char;confdeltype char;confmatchtype char;conislocal bool;coninhcount int2;connoinherit bool;conkey int2[];confkey int2[];conpfeqop oid[];conppeqop oid[];conffeqop oid[];confdelsetcols int2[];conexclop oid[];conbin pg_node_tree"
+    }
+    if code == R_ATTRDEF { return "oid oid;adrelid oid;adnum int2;adbin pg_node_tree" }
+    if code == R_DESCRIPTION { return "objoid oid;classoid oid;objsubid int4;description text" }
+    if code == R_AM { return "oid oid;amname name;amhandler regproc;amtype char" }
+    if code == R_SETTINGS {
+        return "name text;setting text;unit text;category text;short_desc text;extra_desc text;context text;vartype text;source text;min_val text;max_val text;enumvals text[];boot_val text;reset_val text;sourcefile text;sourceline int4;pending_restart bool"
+    }
+    if code == R_DATABASE {
+        return "oid oid;datname name;datdba oid;encoding int4;datlocprovider char;datistemplate bool;datallowconn bool;dathasloginevt bool;datconnlimit int4;datfrozenxid xid;datminmxid xid;dattablespace oid;datcollate text;datctype text;datlocale text;daticurules text;datcollversion text;datacl aclitem[]"
+    }
+    if code == R_TABLES { return "schemaname name;tablename name;tableowner name;tablespace name;hasindexes bool;hasrules bool;hastriggers bool;rowsecurity bool" }
+    if code == R_INDEXES { return "schemaname name;tablename name;indexname name;tablespace name;indexdef text" }
+    if code == R_VIEWS { return "schemaname name;viewname name;viewowner name;definition text" }
+    if code == R_STAT_ARCHIVER {
+        return "archived_count int8;last_archived_wal text;last_archived_time timestamptz;failed_count int8;last_failed_wal text;last_failed_time timestamptz;stats_reset timestamptz"
+    }
+    if code == R_STAT_BGWRITER { return "buffers_clean int8;maxwritten_clean int8;buffers_alloc int8;stats_reset timestamptz" }
+    if code == R_STAT_DATABASE {
+        return "datid oid;datname name;numbackends int4;xact_commit int8;xact_rollback int8;blks_read int8;blks_hit int8;tup_returned int8;tup_fetched int8;tup_inserted int8;tup_updated int8;tup_deleted int8;conflicts int8;temp_files int8;temp_bytes int8;deadlocks int8;checksum_failures int8;checksum_last_failure timestamptz;blk_read_time float8;blk_write_time float8;session_time float8;active_time float8;idle_in_transaction_time float8;sessions int8;sessions_abandoned int8;sessions_fatal int8;sessions_killed int8;stats_reset timestamptz"
+    }
+    if code == R_STAT_DB_CONFLICTS {
+        return "datid oid;datname name;confl_tablespace int8;confl_lock int8;confl_snapshot int8;confl_bufferpin int8;confl_deadlock int8;confl_active_logicalslot int8"
+    }
+    if code == R_STAT_USER_TABLES {
+        return "relid oid;schemaname name;relname name;seq_scan int8;last_seq_scan timestamptz;seq_tup_read int8;idx_scan int8;last_idx_scan timestamptz;idx_tup_fetch int8;n_tup_ins int8;n_tup_upd int8;n_tup_del int8;n_tup_hot_upd int8;n_tup_newpage_upd int8;n_live_tup int8;n_dead_tup int8;n_mod_since_analyze int8;n_ins_since_vacuum int8;last_vacuum timestamptz;last_autovacuum timestamptz;last_analyze timestamptz;last_autoanalyze timestamptz;vacuum_count int8;autovacuum_count int8;analyze_count int8;autoanalyze_count int8"
+    }
+    if code == R_STATIO_USER_TABLES {
+        return "relid oid;schemaname name;relname name;heap_blks_read int8;heap_blks_hit int8;idx_blks_read int8;idx_blks_hit int8;toast_blks_read int8;toast_blks_hit int8;tidx_blks_read int8;tidx_blks_hit int8"
+    }
+    if code == R_STAT_USER_INDEXES {
+        return "relid oid;indexrelid oid;schemaname name;relname name;indexrelname name;idx_scan int8;last_idx_scan timestamptz;idx_tup_read int8;idx_tup_fetch int8"
+    }
+    if code == R_STATIO_USER_INDEXES { return "relid oid;indexrelid oid;schemaname name;relname name;indexrelname name;idx_blks_read int8;idx_blks_hit int8" }
+    if code == R_ROLES {
+        return "rolname name;rolsuper bool;rolinherit bool;rolcreaterole bool;rolcreatedb bool;rolcanlogin bool;rolreplication bool;rolconnlimit int4;rolpassword text;rolvaliduntil timestamptz;rolbypassrls bool;rolconfig text[];oid oid"
+    }
+    if code == R_USER { return "usename name;usesysid oid;usecreatedb bool;usesuper bool;userepl bool;usebypassrls bool;passwd text;valuntil timestamptz;useconfig text[]" }
+    if code == R_PROC {
+        return "oid oid;proname name;pronamespace oid;proowner oid;prolang oid;procost float4;prorows float4;provariadic oid;prosupport regproc;prokind char;prosecdef bool;proleakproof bool;proisstrict bool;proretset bool;provolatile char;proparallel char;pronargs int2;pronargdefaults int2;prorettype oid;proargtypes oidvector;proallargtypes oid[];proargmodes char[];proargnames text[];proargdefaults pg_node_tree;protrftypes oid[];prosrc text;probin text;prosqlbody pg_node_tree;proconfig text[];proacl aclitem[]"
+    }
+    if code == R_INHERITS { return "inhrelid oid;inhparent oid;inhseqno int4;inhdetachpending bool" }
+    if code == R_TRIGGER {
+        return "oid oid;tgrelid oid;tgparentid oid;tgname name;tgfoid oid;tgtype int2;tgenabled char;tgisinternal bool;tgconstrrelid oid;tgconstrindid oid;tgconstraint oid;tgdeferrable bool;tginitdeferred bool;tgnargs int2;tgattr int2vector;tgargs bytea;tgqual pg_node_tree;tgoldtable name;tgnewtable name"
+    }
+    if code == R_SEQUENCE { return "seqrelid oid;seqtypid oid;seqstart int8;seqincrement int8;seqmax int8;seqmin int8;seqcache int8;seqcycle bool" }
+    if code == R_COLLATION {
+        return "oid oid;collname name;collnamespace oid;collowner oid;collprovider char;collisdeterministic bool;collencoding int4;collcollate text;collctype text;colllocale text;collicurules text;collversion text"
+    }
+    if code == R_TABLESPACE { return "oid oid;spcname name;spcowner oid;spcacl aclitem[];spcoptions text[]" }
+    if code == R_EXTENSION { return "oid oid;extname name;extowner oid;extnamespace oid;extrelocatable bool;extversion text;extconfig oid[];extcondition text[]" }
+    if code == R_ENUM { return "oid oid;enumtypid oid;enumsortorder float4;enumlabel name" }
+    if code == R_RANGE { return "rngtypid oid;rngsubtype oid;rngmultitypid oid;rngcollation oid;rngsubopc oid;rngcanonical regproc;rngsubdiff regproc" }
+    if code == R_STAT_ACTIVITY {
+        return "datid oid;datname name;pid int4;leader_pid int4;usesysid oid;usename name;application_name text;client_addr text;client_hostname text;client_port int4;backend_start timestamptz;xact_start timestamptz;query_start timestamptz;state_change timestamptz;wait_event_type text;wait_event text;state text;backend_xid xid;backend_xmin xid;query_id int8;query text;backend_type text"
+    }
+    if code == R_IS_TABLES {
+        return "table_catalog name;table_schema name;table_name name;table_type varchar;self_referencing_column_name name;reference_generation varchar;user_defined_type_catalog name;user_defined_type_schema name;user_defined_type_name name;is_insertable_into varchar;is_typed varchar;commit_action varchar"
+    }
+    if code == R_IS_COLUMNS {
+        return "table_catalog name;table_schema name;table_name name;column_name name;ordinal_position int4;column_default varchar;is_nullable varchar;data_type varchar;character_maximum_length int4;character_octet_length int4;numeric_precision int4;numeric_precision_radix int4;numeric_scale int4;datetime_precision int4;interval_type varchar;interval_precision int4;character_set_catalog name;character_set_schema name;character_set_name name;collation_catalog name;collation_schema name;collation_name name;domain_catalog name;domain_schema name;domain_name name;udt_catalog name;udt_schema name;udt_name name;scope_catalog name;scope_schema name;scope_name name;maximum_cardinality int4;dtd_identifier name;is_self_referencing varchar;is_identity varchar;identity_generation varchar;identity_start varchar;identity_increment varchar;identity_maximum varchar;identity_minimum varchar;identity_cycle varchar;is_generated varchar;generation_expression varchar;is_updatable varchar"
+    }
+    if code == R_IS_SCHEMATA {
+        return "catalog_name name;schema_name name;schema_owner name;default_character_set_catalog name;default_character_set_schema name;default_character_set_name name;sql_path varchar"
+    }
+    if code == R_IS_KEY_COLUMN_USAGE {
+        return "constraint_catalog name;constraint_schema name;constraint_name name;table_catalog name;table_schema name;table_name name;column_name name;ordinal_position int4;position_in_unique_constraint int4"
+    }
+    if code == R_IS_TABLE_CONSTRAINTS {
+        return "constraint_catalog name;constraint_schema name;constraint_name name;table_catalog name;table_schema name;table_name name;constraint_type varchar;is_deferrable varchar;initially_deferred varchar;enforced varchar;nulls_distinct varchar"
+    }
+    if code == R_IS_REFERENTIAL_CONSTRAINTS {
+        return "constraint_catalog name;constraint_schema name;constraint_name name;unique_constraint_catalog name;unique_constraint_schema name;unique_constraint_name name;match_option varchar;update_rule varchar;delete_rule varchar"
+    }
+    if code == R_IS_VIEWS {
+        return "table_catalog name;table_schema name;table_name name;view_definition varchar;check_option varchar;is_updatable varchar;is_insertable_into varchar;is_trigger_updatable varchar;is_trigger_deletable varchar;is_trigger_insertable_into varchar"
+    }
+    return ""
+}
+
+function specType(name: Text): Integer {
+    if name == "oid" { return v.T_OID }
+    if name == "name" { return v.T_NAME }
+    if name == "char" { return v.T_CHAR }
+    if name == "bool" { return v.T_BOOL }
+    if name == "int2" { return v.T_INT2 }
+    if name == "int4" { return v.T_INT4 }
+    if name == "int8" { return v.T_INT8 }
+    if name == "float4" { return v.T_FLOAT4 }
+    if name == "float8" { return v.T_FLOAT8 }
+    if name == "text" { return v.T_TEXT }
+    if name == "varchar" { return v.T_VARCHAR }
+    if name == "xid" { return v.T_XID }
+    if name == "regproc" { return v.T_REGPROC }
+    if name == "int2vector" { return v.T_INT2VECTOR }
+    if name == "oidvector" { return v.T_OIDVECTOR }
+    if name == "int2[]" { return v.T_INT2ARRAY }
+    if name == "oid[]" { return v.T_OIDARRAY }
+    if name == "text[]" { return v.T_TEXTARRAY }
+    if name == "aclitem[]" { return v.T_ACLARRAY }
+    if name == "char[]" { return v.T_CHARARRAY }
+    if name == "pg_node_tree" { return v.T_PGNODETREE }
+    if name == "anyarray" { return v.T_ANYARRAY }
+    if name == "timestamptz" { return v.T_TIMESTAMPTZ }
+    if name == "bytea" { return v.T_BYTEA }
+    return v.T_TEXT
+}
+
+// Empty temp table with the relation's columns.
+public function newRelTable(code: Integer): tb.Table {
+    let t = tb.newTable(-1, relName(code))
+    t.isTemp = true
+    let spec = Bytes(relSpec(code))
+    let i = 0
+    let n = spec.length
+    while i < n {
+        let j = i
+        while j < n && spec[j] != 32 { j += 1 }
+        let k = j + 1
+        while k < n && spec[k] != 59 { k += 1 }
+        if j < n && k <= n {
+            let name = Text(spec.slice(i, j))
+            let ty = specType(Text(spec.slice(j + 1, k)))
+            tb.addColumn(t, tb.newColumn(name, ty, -1, false))
+        }
+        i = k + 1
+    }
+    return t
+}
+
+// ---------------------------------------------------------------- row builder
+
+record RB {
+    t: tb.Table
+    r: Integer
+    c: Integer
+}
+
+function startRow(b: RB) {
+    b.r = tb.reserveRow(b.t, 0)
+    b.c = 0
+}
+
+function nextCol(b: RB): Integer {
+    let i = b.c
+    b.c += 1
+    if i >= b.t.cols.length { return -1 }
+    return i
+}
+
+function pI(b: RB, x: Integer) {
+    let i = nextCol(b)
+    if i < 0 { return }
+    let col = b.t.cols[i]
+    tb.clearNull(col, b.r)
+    let ty = col.type
+    if v.isTextType(ty) {
+        let s = Bytes(Text(x))
+        tb.setText(col, b.r, s, 0, s.length)
+    } else if ty == v.T_FLOAT4 || ty == v.T_FLOAT8 {
+        tb.setFloat(col, b.r, Float(x))
+    } else if ty == v.T_INT2 && (x < -32768 || x > 32767) {
+        tb.setNull(col, b.r)
+    } else if (ty == v.T_INT4 || ty == v.T_OID || ty == v.T_XID) && (x < -2147483648 || x > 2147483647) {
+        tb.setNull(col, b.r)
+    } else if ty == v.T_BOOL {
+        if x != 0 { tb.setInt(col, b.r, 1) } else { tb.setInt(col, b.r, 0) }
+    } else {
+        tb.setInt(col, b.r, x)
+    }
+}
+
+function pT(b: RB, s: Text) {
+    let i = nextCol(b)
+    if i < 0 { return }
+    let col = b.t.cols[i]
+    if !v.isTextType(col.type) {
+        tb.setNull(col, b.r)
+        return
+    }
+    tb.clearNull(col, b.r)
+    let bs = Bytes(s)
+    tb.setText(col, b.r, bs, 0, bs.length)
+}
+
+function pB(b: RB, x: Boolean) {
+    if x { pI(b, 1) } else { pI(b, 0) }
+}
+
+function pF(b: RB, f: Float) {
+    let i = nextCol(b)
+    if i < 0 { return }
+    let col = b.t.cols[i]
+    tb.clearNull(col, b.r)
+    if col.type == v.T_FLOAT4 || col.type == v.T_FLOAT8 {
+        tb.setFloat(col, b.r, f)
+    } else {
+        tb.setNull(col, b.r)
+    }
+}
+
+function pN(b: RB) {
+    let i = nextCol(b)
+    if i < 0 { return }
+    tb.setNull(b.t.cols[i], b.r)
+}
+
+function pNs(b: RB, n: Integer) {
+    let i = 0
+    while i < n {
+        pN(b)
+        i += 1
+    }
+}
+
+// Remaining columns of the row become NULL.
+function endRow(b: RB) {
+    while b.c < b.t.cols.length { pN(b) }
+}
+
+// ---------------------------------------------------------------- catalog views (indexes grouped by name)
+
+public record IdxInfo {
+    name: Text
+    tableId: Integer
+    cols: List<Integer>
+    unique: Boolean
+    primary: Boolean
+    hasOrd: Boolean
+    oid: Integer
+}
+
+function liveTable(c: cat.Catalog, tid: Integer): Boolean {
+    return tid >= 0 && tid < c.tables.length && !cat.isDropped(c.tables[tid])
+}
+
+// Every named index (a hash and an ordered structure with the same name are one PG index).
+public function indexes(c: cat.Catalog): List<IdxInfo> {
+    let out: List<IdxInfo> = []
+    for h in c.hashIdx {
+        if h.name != "" && liveTable(c, h.tableId) && stillAttached(c, h.tableId, h.id, true) {
+            out.add(IdxInfo { name: h.name; tableId: h.tableId; cols: h.cols; unique: h.unique; primary: h.primary; hasOrd: false; oid: OID_HASHIDX + h.id })
+        }
+    }
+    for o in c.ordIdx {
+        if o.name != "" && liveTable(c, o.tableId) && stillAttached(c, o.tableId, o.id, false) {
+            let found = -1
+            let i = 0
+            while i < out.length {
+                if out[i].tableId == o.tableId && out[i].name == o.name { found = i }
+                i += 1
+            }
+            if found >= 0 {
+                out[found].hasOrd = true
+            } else {
+                out.add(IdxInfo { name: o.name; tableId: o.tableId; cols: o.cols; unique: o.unique; primary: false; hasOrd: true; oid: OID_ORDIDX + o.id })
+            }
+        }
+    }
+    return out
+}
+
+function stillAttached(c: cat.Catalog, tid: Integer, id: Integer, hash: Boolean): Boolean {
+    let t = c.tables[tid]
+    if hash {
+        for x in t.hashIds {
+            if x == id { return true }
+        }
+        return false
+    }
+    for x in t.ordIds {
+        if x == id { return true }
+    }
+    return false
+}
+
+function isConstraintIndex(c: cat.Catalog, ii: IdxInfo): Boolean {
+    if ii.primary { return true }
+    if !ii.unique { return false }
+    for n in c.conNames {
+        if n == ii.name { return true }
+    }
+    return false
+}
+
+function amOf(ii: IdxInfo): Integer {
+    if !ii.unique && !ii.hasOrd { return 405 }
+    return 403
+}
+
+function tableOid(id: Integer): Integer { return OID_TABLE + id }
+
+function liveViewCount(c: cat.Catalog): Integer {
+    let n = 0
+    for nm in c.viewNames {
+        if nm != "" { n += 1 }
+    }
+    return n
+}
+
+// ---------------------------------------------------------------- name <-> oid
+
+// Parse "schema.name" / "\"Quoted\"" (unquoted parts fold to lower case).
+function splitQualified(s: Text, parts: List<Text>) {
+    let b = Bytes(s)
+    let n = b.length
+    let i = 0
+    let cur = Bytes()
+    while i < n {
+        let ch = b[i]
+        if ch == 34 {
+            i += 1
+            while i < n {
+                if b[i] == 34 {
+                    if i + 1 < n && b[i + 1] == 34 {
+                        cur.add(34)
+                        i += 2
+                        continue
+                    }
+                    break
+                }
+                cur.add(b[i])
+                i += 1
+            }
+            i += 1
+            continue
+        }
+        if ch == 46 {
+            parts.add(Text(cur))
+            cur = Bytes()
+            i += 1
+            continue
+        }
+        if ch >= 65 && ch <= 90 { ch += 32 }
+        if ch != 32 { cur.add(ch) }
+        i += 1
+    }
+    parts.add(Text(cur))
+}
+
+// OID of a relation name (regclass input), or -1.
+public function relOidByName(c: cat.Catalog, s: Text): Integer {
+    let parts: List<Text> = []
+    splitQualified(s, parts)
+    let schema = ""
+    let name = parts[parts.length - 1]
+    if parts.length >= 2 { schema = parts[parts.length - 2] }
+    if schema == "" || schema == "public" {
+        let tid = cat.findTable(c, name)
+        if tid >= 0 { return tableOid(tid) }
+        let vi = 0
+        while vi < c.viewNames.length {
+            if c.viewNames[vi] == name { return OID_VIEW + vi }
+            vi += 1
+        }
+        for ii in indexes(c) {
+            if ii.name == name { return ii.oid }
+        }
+        if schema == "public" { return -1 }
+    }
+    let code = lookup(schema, name)
+    if code > 0 { return relOidOf(code) }
+    return -1
+}
+
+// Relation name for an oid (regclass output); "" if unknown.
+public function relNameByOid(c: cat.Catalog, oid: Integer): Text {
+    if oid >= OID_TABLE && oid < OID_VIEW {
+        let tid = oid - OID_TABLE
+        if liveTable(c, tid) { return c.tables[tid].name }
+        return ""
+    }
+    if oid >= OID_VIEW && oid < OID_VIEW + 1000000 {
+        let vi = oid - OID_VIEW
+        if vi < c.viewNames.length { return c.viewNames[vi] }
+        return ""
+    }
+    if oid >= OID_HASHIDX && oid < OID_ORDIDX + 1000000 {
+        for ii in indexes(c) {
+            if ii.oid == oid { return ii.name }
+        }
+        return ""
+    }
+    let code = 1
+    while code <= R_LAST {
+        if relOidOf(code) == oid {
+            if code >= R_IS_TABLES { return "information_schema." + relName(code) }
+            return relName(code)
+        }
+        code += 1
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------- types
+
+// PG catalog facts for an internal type id.
+public function pgTypmod(t: Integer, typmod: Integer): Integer {
+    if typmod < 0 { return -1 }
+    if t == v.T_VARCHAR || t == v.T_BPCHAR || t == v.T_NUMERIC { return typmod + 4 }
+    return -1
+}
+
+function typByval(t: Integer): Boolean {
+    let len = v.typeLen(t)
+    if t == v.T_NAME || t == v.T_INTERVAL { return false }
+    return len == 1 || len == 2 || len == 4 || len == 8
+}
+
+function typAlign(t: Integer): Integer {
+    let len = v.typeLen(t)
+    if t == v.T_NAME || t == v.T_CHAR || t == v.T_BOOL { return 99 }
+    if len == 2 { return 115 }
+    if len == 4 { return 105 }
+    if len == 8 || t == v.T_INTERVAL || t == v.T_RECORD || t == v.T_ANYARRAY || t == v.T_ACLARRAY { return 100 }
+    return 105
+}
+
+function typStorage(t: Integer): Integer {
+    if t == v.T_NUMERIC { return 109 }
+    if t == v.T_TEXT || t == v.T_VARCHAR || t == v.T_BPCHAR || t == v.T_BYTEA || t == v.T_PGNODETREE || t == v.T_RECORD { return 120 }
+    if v.isArrayType(t) && !v.isVectorType(t) { return 120 }
+    return 112
+}
+
+function typCollation(t: Integer): Integer {
+    if t == v.T_TEXT || t == v.T_VARCHAR || t == v.T_BPCHAR || t == v.T_PGNODETREE { return 100 }
+    if t == v.T_NAME { return 950 }
+    return 0
+}
+
+// PG typname of an internal type.
+public function pgTypeName(t: Integer): Text {
+    if t == v.T_BOOL { return "bool" }
+    if t == v.T_INT2 { return "int2" }
+    if t == v.T_INT4 { return "int4" }
+    if t == v.T_INT8 { return "int8" }
+    if t == v.T_FLOAT4 { return "float4" }
+    if t == v.T_FLOAT8 { return "float8" }
+    if t == v.T_NUMERIC { return "numeric" }
+    if t == v.T_TEXT { return "text" }
+    if t == v.T_VARCHAR { return "varchar" }
+    if t == v.T_BPCHAR { return "bpchar" }
+    if t == v.T_DATE { return "date" }
+    if t == v.T_TIMESTAMP { return "timestamp" }
+    if t == v.T_TIMESTAMPTZ { return "timestamptz" }
+    if t == v.T_INTERVAL { return "interval" }
+    if t == v.T_BYTEA { return "bytea" }
+    if t == v.T_NAME { return "name" }
+    if t == v.T_TIME { return "time" }
+    if t == v.T_OID { return "oid" }
+    if t == v.T_REGCLASS { return "regclass" }
+    if t == v.T_CHAR { return "char" }
+    if t == v.T_XID { return "xid" }
+    if t == v.T_RECORD { return "record" }
+    if t == v.T_INT2VECTOR { return "int2vector" }
+    if t == v.T_OIDVECTOR { return "oidvector" }
+    if t == v.T_INT2ARRAY { return "_int2" }
+    if t == v.T_OIDARRAY { return "_oid" }
+    if t == v.T_TEXTARRAY { return "_text" }
+    if t == v.T_ACLARRAY { return "_aclitem" }
+    if t == v.T_CHARARRAY { return "_char" }
+    if t == v.T_REGPROC { return "regproc" }
+    if t == v.T_PGNODETREE { return "pg_node_tree" }
+    if t == v.T_ANYARRAY { return "anyarray" }
+    return "text"
+}
+
+// format_type(oid, typmod) for the types neo-db knows; PG's own type names for the rest of pg_type.
+public function formatType(oid: Integer, typmod: Integer): Text {
+    let t = v.typeFromOid(oid)
+    let mod = typmod - 4
+    if oid == 1043 {
+        if typmod >= 4 { return "character varying(" + Text(mod) + ")" }
+        return "character varying"
+    }
+    if oid == 1042 {
+        if typmod >= 4 { return "character(" + Text(mod) + ")" }
+        return "bpchar"
+    }
+    if oid == 1700 {
+        if typmod >= 4 {
+            let p = (mod >> 16) & 65535
+            let s = mod & 65535
+            return "numeric(" + Text(p) + "," + Text(s) + ")"
+        }
+        return "numeric"
+    }
+    if oid == 1114 { return "timestamp without time zone" }
+    if oid == 1184 { return "timestamp with time zone" }
+    if oid == 1083 { return "time without time zone" }
+    if oid == 18 { return "\"char\"" }
+    if oid == 22 { return "int2vector" }
+    if oid == 30 { return "oidvector" }
+    if oid == 24 { return "regproc" }
+    if oid == 28 { return "xid" }
+    if oid == 194 { return "pg_node_tree" }
+    if oid == 2249 { return "record" }
+    if oid == 2277 { return "anyarray" }
+    if oid == 1033 { return "aclitem" }
+    if oid == 114 { return "json" }
+    if oid == 3802 { return "jsonb" }
+    if oid == 2950 { return "uuid" }
+    let elem = arrayElemOid(oid)
+    if elem > 0 { return formatType(elem, typmod) + "[]" }
+    if t != v.T_UNKNOWN { return v.typeName(t) }
+    return "???"
+}
+
+// ---------------------------------------------------------------- built-in types (pg_type rows)
+// oid name len byval category preferred elem array align storage collation typtype input
+function typeTable(): Text {
+    return "16 bool 1 t B t 0 1000 c p 0 b boolin;17 bytea -1 f U f 0 1001 i x 0 b byteain;18 char 1 t Z f 0 1002 c p 0 b charin;" +
+        "19 name 64 f S f 18 1003 c p 950 b namein;20 int8 8 t N f 0 1016 d p 0 b int8in;21 int2 2 t N f 0 1005 s p 0 b int2in;" +
+        "22 int2vector -1 f A f 21 1006 i p 0 b int2vectorin;23 int4 4 t N f 0 1007 i p 0 b int4in;24 regproc 4 t N f 0 1008 i p 0 b regprocin;" +
+        "25 text -1 f S t 0 1009 i x 100 b textin;26 oid 4 t N t 0 1028 i p 0 b oidin;28 xid 4 t U f 0 1011 i p 0 b xidin;" +
+        "30 oidvector -1 f A f 26 1013 i p 0 b oidvectorin;114 json -1 f U f 0 199 i x 0 b json_in;194 pg_node_tree -1 f Z f 0 0 i x 100 b pg_node_tree_in;" +
+        "700 float4 4 t N f 0 1021 i p 0 b float4in;701 float8 8 t N t 0 1022 d p 0 b float8in;1033 aclitem 16 f U f 0 1034 d p 0 b aclitemin;" +
+        "1042 bpchar -1 f S f 0 1014 i x 100 b bpcharin;1043 varchar -1 f S f 0 1015 i x 100 b varcharin;1082 date 4 t D f 0 1182 i p 0 b date_in;" +
+        "1083 time 8 t D f 0 1183 d p 0 b time_in;1114 timestamp 8 t D f 0 1115 d p 0 b timestamp_in;1184 timestamptz 8 t D t 0 1185 d p 0 b timestamptz_in;" +
+        "1186 interval 16 f T t 0 1187 d p 0 b interval_in;1700 numeric -1 f N f 0 1231 i m 0 b numeric_in;2205 regclass 4 t N f 0 2210 i p 0 b regclassin;" +
+        "2249 record -1 f P f 0 2287 d x 0 p record_in;2277 anyarray -1 f P f 0 0 d x 0 p anyarray_in;2950 uuid 16 f U f 0 2951 c p 0 b uuid_in;" +
+        "3802 jsonb -1 f U f 0 3807 i x 0 b jsonb_in;" +
+        "1000 _bool -1 f A f 16 0 c x 0 b array_in;1001 _bytea -1 f A f 17 0 i x 0 b array_in;1002 _char -1 f A f 18 0 c x 0 b array_in;" +
+        "1003 _name -1 f A f 19 0 c x 950 b array_in;1005 _int2 -1 f A f 21 0 s x 0 b array_in;1006 _int2vector -1 f A f 22 0 i x 0 b array_in;" +
+        "1007 _int4 -1 f A f 23 0 i x 0 b array_in;1008 _regproc -1 f A f 24 0 i x 0 b array_in;1009 _text -1 f A f 25 0 i x 100 b array_in;" +
+        "1011 _xid -1 f A f 28 0 i x 0 b array_in;1013 _oidvector -1 f A f 30 0 i x 0 b array_in;1014 _bpchar -1 f A f 1042 0 i x 100 b array_in;" +
+        "1015 _varchar -1 f A f 1043 0 i x 100 b array_in;1016 _int8 -1 f A f 20 0 d x 0 b array_in;1021 _float4 -1 f A f 700 0 i x 0 b array_in;" +
+        "1022 _float8 -1 f A f 701 0 d x 0 b array_in;1028 _oid -1 f A f 26 0 i x 0 b array_in;1034 _aclitem -1 f A f 1033 0 d x 0 b array_in;" +
+        "1115 _timestamp -1 f A f 1114 0 d x 0 b array_in;1182 _date -1 f A f 1082 0 i x 0 b array_in;1183 _time -1 f A f 1083 0 d x 0 b array_in;" +
+        "1185 _timestamptz -1 f A f 1184 0 d x 0 b array_in;1187 _interval -1 f A f 1186 0 d x 0 b array_in;1231 _numeric -1 f A f 1700 0 i x 0 b array_in;" +
+        "2210 _regclass -1 f A f 2205 0 i x 0 b array_in;2287 _record -1 f A f 2249 0 d x 0 p array_in;199 _json -1 f A f 114 0 i x 0 b array_in;" +
+        "2951 _uuid -1 f A f 2950 0 c x 0 b array_in;3807 _jsonb -1 f A f 3802 0 i x 0 b array_in"
+}
+
+// Element oid of an array type oid (0 if not an array).
+public function arrayElemOid(oid: Integer): Integer {
+    if oid == 1000 { return 16 }
+    if oid == 1001 { return 17 }
+    if oid == 1002 { return 18 }
+    if oid == 1003 { return 19 }
+    if oid == 1005 { return 21 }
+    if oid == 1006 { return 22 }
+    if oid == 1007 { return 23 }
+    if oid == 1008 { return 24 }
+    if oid == 1009 { return 25 }
+    if oid == 1011 { return 28 }
+    if oid == 1013 { return 30 }
+    if oid == 1014 { return 1042 }
+    if oid == 1015 { return 1043 }
+    if oid == 1016 { return 20 }
+    if oid == 1021 { return 700 }
+    if oid == 1022 { return 701 }
+    if oid == 1028 { return 26 }
+    if oid == 1034 { return 1033 }
+    if oid == 1115 { return 1114 }
+    if oid == 1182 { return 1082 }
+    if oid == 1183 { return 1083 }
+    if oid == 1185 { return 1184 }
+    if oid == 1187 { return 1186 }
+    if oid == 1231 { return 1700 }
+    if oid == 2210 { return 2205 }
+    if oid == 2287 { return 2249 }
+    if oid == 199 { return 114 }
+    if oid == 2951 { return 2950 }
+    if oid == 3807 { return 3802 }
+    return 0
+}
+
+function splitFields(line: Bytes, out: List<Text>) {
+    let i = 0
+    let n = line.length
+    while i < n {
+        let j = i
+        while j < n && line[j] != 32 { j += 1 }
+        out.add(Text(line.slice(i, j)))
+        i = j + 1
+    }
+}
+
+function fnBase(input: Text): Text {
+    let b = Bytes(input)
+    if b.length > 3 && b[b.length - 3] == 95 && b[b.length - 2] == 105 && b[b.length - 1] == 110 { return Text(b.slice(0, b.length - 3)) + "_" }
+    if b.length > 2 && b[b.length - 2] == 105 && b[b.length - 1] == 110 { return Text(b.slice(0, b.length - 2)) }
+    return input
+}
+
+function fillTypes(b: RB) {
+    let all = Bytes(typeTable())
+    let i = 0
+    let n = all.length
+    while i < n {
+        let j = i
+        while j < n && all[j] != 59 { j += 1 }
+        let f: List<Text> = []
+        splitFields(all.slice(i, j), f)
+        i = j + 1
+        if f.length < 13 { continue }
+        let oid = toInt(f[0])
+        let name = f[1]
+        let isArr = f[4] == "A" && !(name == "int2vector" || name == "oidvector")
+        startRow(b)
+        pI(b, oid)
+        pT(b, name)
+        pI(b, NS_CATALOG)
+        pI(b, 10)
+        pI(b, toInt(f[2]))
+        pB(b, f[3] == "t")
+        pT(b, f[11])
+        pT(b, f[4])
+        pB(b, f[5] == "t")
+        pB(b, true)
+        pT(b, ",")
+        pI(b, 0)
+        if isArr {
+            pT(b, "array_subscript_handler")
+        } else if name == "name" || name == "int2vector" || name == "oidvector" {
+            pT(b, "raw_array_subscript_handler")
+        } else {
+            pT(b, "-")
+        }
+        pI(b, toInt(f[6]))
+        pI(b, toInt(f[7]))
+        let input = f[12]
+        let base = fnBase(input)
+        pT(b, input)
+        pT(b, base + "out")
+        pT(b, base + "recv")
+        pT(b, base + "send")
+        let modin = "-"
+        let modout = "-"
+        if name == "varchar" { modin = "varchartypmodin"; modout = "varchartypmodout" }
+        if name == "bpchar" { modin = "bpchartypmodin"; modout = "bpchartypmodout" }
+        if name == "numeric" { modin = "numerictypmodin"; modout = "numerictypmodout" }
+        if name == "timestamp" { modin = "timestamptypmodin"; modout = "timestamptypmodout" }
+        if name == "timestamptz" { modin = "timestamptztypmodin"; modout = "timestamptztypmodout" }
+        if name == "time" { modin = "timetypmodin"; modout = "timetypmodout" }
+        if name == "interval" { modin = "intervaltypmodin"; modout = "intervaltypmodout" }
+        pT(b, modin)
+        pT(b, modout)
+        if isArr { pT(b, "array_typanalyze") } else { pT(b, "-") }
+        pT(b, f[8])
+        pT(b, f[9])
+        pB(b, false)
+        pI(b, 0)
+        pI(b, -1)
+        pI(b, 0)
+        pI(b, toInt(f[10]))
+        endRow(b)
+    }
+}
+
+function toInt(s: Text): Integer {
+    let b = Bytes(s)
+    let neg = false
+    let i = 0
+    if b.length > 0 && b[0] == 45 {
+        neg = true
+        i = 1
+    }
+    let x = 0
+    while i < b.length && i < 12 {
+        let d = b[i] - 48
+        if d < 0 || d > 9 { break }
+        x = x * 10 + d
+        i += 1
+    }
+    if neg { return -x }
+    return x
+}
+
+// ---------------------------------------------------------------- text helpers
+
+function charText(code: Integer): Text {
+    let b = Bytes()
+    b.add(code)
+    return Text(b)
+}
+
+// "{1,2,3}" (arrays) or "1 2 3" (vectors).
+function intList(xs: List<Integer>, vector: Boolean): Text {
+    let parts: List<Text> = []
+    if !vector { parts.add("{") }
+    let i = 0
+    while i < xs.length {
+        if i > 0 {
+            if vector { parts.add(" ") } else { parts.add(",") }
+        }
+        parts.add(Text(xs[i]))
+        i += 1
+    }
+    if !vector { parts.add("}") }
+    return joinText(parts)
+}
+
+function attnums(cols: List<Integer>): List<Integer> {
+    let out: List<Integer> = []
+    for ci in cols { out.add(ci + 1) }
+    return out
+}
+
+function repeatInt(x: Integer, n: Integer): List<Integer> {
+    let out: List<Integer> = []
+    let i = 0
+    while i < n {
+        out.add(x)
+        i += 1
+    }
+    return out
+}
+
+function isReservedWord(s: Text): Boolean {
+    return s == "all" || s == "analyse" || s == "analyze" || s == "and" || s == "any" || s == "array" || s == "as" || s == "asc" ||
+        s == "both" || s == "case" || s == "cast" || s == "check" || s == "collate" || s == "column" || s == "constraint" ||
+        s == "create" || s == "current_date" || s == "current_time" || s == "current_timestamp" || s == "current_user" ||
+        s == "default" || s == "desc" || s == "distinct" || s == "do" || s == "else" || s == "end" || s == "except" ||
+        s == "false" || s == "fetch" || s == "for" || s == "foreign" || s == "from" || s == "grant" || s == "group" ||
+        s == "having" || s == "in" || s == "initially" || s == "intersect" || s == "into" || s == "lateral" || s == "leading" ||
+        s == "limit" || s == "localtime" || s == "localtimestamp" || s == "not" || s == "null" || s == "offset" || s == "on" ||
+        s == "only" || s == "or" || s == "order" || s == "placing" || s == "primary" || s == "references" || s == "returning" ||
+        s == "select" || s == "session_user" || s == "some" || s == "symmetric" || s == "table" || s == "then" || s == "to" ||
+        s == "trailing" || s == "true" || s == "union" || s == "unique" || s == "user" || s == "using" || s == "variadic" ||
+        s == "when" || s == "where" || s == "window" || s == "with"
+}
+
+// quote_ident rules: quote unless lower-case letters/digits/underscores (not starting with a digit), not reserved.
+public function quoteIdent(s: Text): Text {
+    let b = Bytes(s)
+    let plain = b.length > 0
+    let i = 0
+    while i < b.length {
+        let ch = b[i]
+        let ok = (ch >= 97 && ch <= 122) || ch == 95 || (i > 0 && ch >= 48 && ch <= 57)
+        if !ok { plain = false }
+        i += 1
+    }
+    if plain && !isReservedWord(s) { return s }
+    let out = Bytes()
+    out.add(34)
+    for ch in b {
+        if ch == 34 { out.add(34) }
+        out.add(ch)
+    }
+    out.add(34)
+    return Text(out)
+}
+
+function sqlLiteral(s: Text): Text {
+    let out = Bytes()
+    out.add(39)
+    for ch in Bytes(s) {
+        if ch == 39 { out.add(39) }
+        out.add(ch)
+    }
+    out.add(39)
+    return Text(out)
+}
+
+// pg_get_expr form of a column default.
+public function defaultExprText(t: tb.Table, ci: Integer): Text {
+    let c = t.cols[ci]
+    if c.defaultKind == 2 { return "nextval(" + sqlLiteral(t.name + "_" + c.name + "_seq") + "::regclass)" }
+    if c.defaultKind == 3 { return "CURRENT_TIMESTAMP" }
+    if c.defaultKind == 1 && !c.defaultNull {
+        let ty = v.sqlType(c.type)
+        if v.isIntType(ty) || ty == v.T_NUMERIC || ty == v.T_FLOAT4 || ty == v.T_FLOAT8 || ty == v.T_BOOL {
+            let txt = c.defaultText
+            if ty == v.T_BOOL {
+                let lower = Bytes(txt)
+                if lower.length > 0 && (lower[0] == 116 || lower[0] == 84) { return "true" }
+                return "false"
+            }
+            if Bytes(txt).length > 0 && Bytes(txt)[0] == 45 { return "'" + txt + "'::" + v.typeName(ty) }
+            return txt
+        }
+        return sqlLiteral(c.defaultText) + "::" + v.typeName(ty)
+    }
+    return ""
+}
+
+function hasDefault(t: tb.Table, ci: Integer): Boolean {
+    return defaultExprText(t, ci) != ""
+}
+
+// ---------------------------------------------------------------- pg_get_indexdef / pg_get_constraintdef
+
+function findIndexByOid(c: cat.Catalog, oid: Integer): IdxInfo {
+    for ii in indexes(c) {
+        if ii.oid == oid { return ii }
+    }
+    return IdxInfo { name: ""; tableId: -1; cols: []; unique: false; primary: false; hasOrd: false; oid: -1 }
+}
+
+// pg_get_indexdef(oid, column, pretty): column 0 = the whole CREATE INDEX statement, k > 0 = column k's name.
+public function indexDef(c: cat.Catalog, oid: Integer, col: Integer): Text {
+    let ii = findIndexByOid(c, oid)
+    if ii.tableId < 0 { return "" }
+    let t = c.tables[ii.tableId]
+    if col > 0 {
+        if col > ii.cols.length { return "" }
+        return quoteIdent(t.cols[ii.cols[col - 1]].name)
+    }
+    let names: List<Text> = []
+    for ci in ii.cols { names.add(quoteIdent(t.cols[ci].name)) }
+    let u = ""
+    if ii.unique { u = "UNIQUE " }
+    let am = "btree"
+    if amOf(ii) == 405 { am = "hash" }
+    return "CREATE " + u + "INDEX " + quoteIdent(ii.name) + " ON public." + quoteIdent(t.name) + " USING " + am + " (" + joinWith(names, ", ") + ")"
+}
+
+function joinWith(parts: List<Text>, sep: Text): Text {
+    let out: List<Text> = []
+    let i = 0
+    while i < parts.length {
+        if i > 0 { out.add(sep) }
+        out.add(parts[i])
+        i += 1
+    }
+    return joinText(out)
+}
+
+function fkAction(code: Integer): Integer {
+    // FK_NO_ACTION 0 'a', FK_RESTRICT 1 'r', FK_CASCADE 2 'c', FK_SET_NULL 3 'n', FK_SET_DEFAULT 4 'd'
+    if code == 1 { return 114 }
+    if code == 2 { return 99 }
+    if code == 3 { return 110 }
+    if code == 4 { return 100 }
+    return 97
+}
+
+function fkActionWords(code: Integer): Text {
+    if code == 1 { return "RESTRICT" }
+    if code == 2 { return "CASCADE" }
+    if code == 3 { return "SET NULL" }
+    if code == 4 { return "SET DEFAULT" }
+    return "NO ACTION"
+}
+
+function colNames(t: tb.Table, cols: List<Integer>): Text {
+    let names: List<Text> = []
+    for ci in cols { names.add(quoteIdent(t.cols[ci].name)) }
+    return joinWith(names, ", ")
+}
+
+// pg_get_constraintdef(oid).
+public function constraintDef(c: cat.Catalog, oid: Integer): Text {
+    if oid >= OID_FK && oid < OID_FK + 1000000 {
+        let i = oid - OID_FK
+        if i >= c.fks.length || c.fks[i].dropped { return "" }
+        let fk = c.fks[i]
+        if !liveTable(c, fk.childId) || !liveTable(c, fk.parentId) { return "" }
+        let ch = c.tables[fk.childId]
+        let pa = c.tables[fk.parentId]
+        let s = "FOREIGN KEY (" + colNames(ch, fk.childCols) + ") REFERENCES " + quoteIdent(pa.name) + "(" + colNames(pa, fk.parentCols) + ")"
+        if fk.onUpdate != 0 { s = s + " ON UPDATE " + fkActionWords(fk.onUpdate) }
+        if fk.onDelete != 0 { s = s + " ON DELETE " + fkActionWords(fk.onDelete) }
+        if fk.deferrable {
+            s = s + " DEFERRABLE"
+            if fk.deferred { s = s + " INITIALLY DEFERRED" }
+        }
+        return s
+    }
+    let ii = findIndexByOid(c, oid - OID_CON_OFFSET)
+    if ii.tableId < 0 { return "" }
+    let t = c.tables[ii.tableId]
+    if ii.primary { return "PRIMARY KEY (" + colNames(t, ii.cols) + ")" }
+    return "UNIQUE (" + colNames(t, ii.cols) + ")"
+}
+
+// ---------------------------------------------------------------- fill
+
+// Materialise relation `code` into t (truncated first).
+public function fill(c: cat.Catalog, code: Integer, t: tb.Table) {
+    tb.truncate(t)
+    let b = RB { t: t; r: 0; c: 0 }
+    if code == R_NAMESPACE {
+        nsRow(b, NS_CATALOG, "pg_catalog")
+        nsRow(b, NS_TOAST, "pg_toast")
+        nsRow(b, NS_PUBLIC, "public")
+        nsRow(b, NS_INFO, "information_schema")
+        return
+    }
+    if code == R_CLASS {
+        fillClass(c, b)
+        return
+    }
+    if code == R_ATTRIBUTE {
+        fillAttribute(c, b)
+        return
+    }
+    if code == R_TYPE {
+        fillTypes(b)
+        return
+    }
+    if code == R_INDEX {
+        fillIndex(c, b)
+        return
+    }
+    if code == R_CONSTRAINT {
+        fillConstraint(c, b)
+        return
+    }
+    if code == R_ATTRDEF {
+        let tid = 0
+        while tid < c.tables.length {
+            if userTable(c, tid) {
+                let tt = c.tables[tid]
+                let ci = 0
+                while ci < tt.cols.length {
+                    let d = defaultExprText(tt, ci)
+                    if d != "" {
+                        startRow(b)
+                        pI(b, OID_ATTRDEF + tid * 1700 + ci + 1)
+                        pI(b, tableOid(tid))
+                        pI(b, ci + 1)
+                        pT(b, d)
+                        endRow(b)
+                    }
+                    ci += 1
+                }
+            }
+            tid += 1
+        }
+        return
+    }
+    if code == R_AM {
+        amRow(b, 2, "heap", "heap_tableam_handler", 116)
+        amRow(b, 403, "btree", "bthandler", 105)
+        amRow(b, 405, "hash", "hashhandler", 105)
+        amRow(b, 783, "gist", "gisthandler", 105)
+        amRow(b, 2742, "gin", "ginhandler", 105)
+        amRow(b, 3580, "brin", "brinhandler", 105)
+        amRow(b, 4000, "spgist", "spghandler", 105)
+        return
+    }
+    if code == R_SETTINGS {
+        fillSettings(b)
+        return
+    }
+    if code == R_DATABASE {
+        dbRow(b, 5, "postgres", false)
+        dbRow(b, 1, "template1", true)
+        dbRow(b, 4, "template0", true)
+        return
+    }
+    if code == R_TABLES {
+        let tid = 0
+        while tid < c.tables.length {
+            if userTable(c, tid) {
+                let tt = c.tables[tid]
+                startRow(b)
+                pT(b, "public")
+                pT(b, tt.name)
+                pT(b, "postgres")
+                pN(b)
+                pB(b, tt.hashIds.length + tt.ordIds.length > 0)
+                pB(b, false)
+                pB(b, hasTriggers(c, tid))
+                pB(b, false)
+                endRow(b)
+            }
+            tid += 1
+        }
+        return
+    }
+    if code == R_INDEXES {
+        for ii in indexes(c) {
+            startRow(b)
+            pT(b, "public")
+            pT(b, c.tables[ii.tableId].name)
+            pT(b, ii.name)
+            pN(b)
+            pT(b, indexDef(c, ii.oid, 0))
+            endRow(b)
+        }
+        return
+    }
+    if code == R_VIEWS || code == R_IS_VIEWS {
+        let vi = 0
+        while vi < c.viewNames.length {
+            if c.viewNames[vi] != "" {
+                startRow(b)
+                let def = ""
+                if vi < c.viewSql.length { def = c.viewSql[vi] }
+                if code == R_VIEWS {
+                    pT(b, "public")
+                    pT(b, c.viewNames[vi])
+                    pT(b, "postgres")
+                    pT(b, def)
+                } else {
+                    pT(b, "postgres")
+                    pT(b, "public")
+                    pT(b, c.viewNames[vi])
+                    pT(b, def)
+                    pT(b, "NONE")
+                    pT(b, "NO")
+                    pT(b, "NO")
+                    pT(b, "NO")
+                    pT(b, "NO")
+                    pT(b, "NO")
+                }
+                endRow(b)
+            }
+            vi += 1
+        }
+        return
+    }
+    if code == R_STAT_ARCHIVER {
+        startRow(b)
+        pI(b, 0)
+        pN(b)
+        pN(b)
+        pI(b, 0)
+        endRow(b)
+        return
+    }
+    if code == R_STAT_BGWRITER {
+        startRow(b)
+        pI(b, 0)
+        pI(b, 0)
+        pI(b, 0)
+        endRow(b)
+        return
+    }
+    if code == R_STAT_DATABASE || code == R_STAT_DB_CONFLICTS {
+        startRow(b)
+        pI(b, 5)
+        pT(b, "postgres")
+        while b.c < b.t.cols.length {
+            let ty = b.t.cols[b.c].type
+            if ty == v.T_TIMESTAMPTZ { pN(b) } else if ty == v.T_FLOAT8 { pF(b, 0.0) } else { pI(b, 0) }
+        }
+        return
+    }
+    if code == R_STAT_USER_TABLES || code == R_STATIO_USER_TABLES {
+        let tid = 0
+        while tid < c.tables.length {
+            if userTable(c, tid) {
+                let tt = c.tables[tid]
+                startRow(b)
+                pI(b, tableOid(tid))
+                pT(b, "public")
+                pT(b, tt.name)
+                while b.c < b.t.cols.length {
+                    let nm = b.t.cols[b.c].name
+                    let ty = b.t.cols[b.c].type
+                    if nm == "n_live_tup" {
+                        pI(b, tt.live)
+                    } else if ty == v.T_TIMESTAMPTZ {
+                        pN(b)
+                    } else {
+                        pI(b, 0)
+                    }
+                }
+            }
+            tid += 1
+        }
+        return
+    }
+    if code == R_STAT_USER_INDEXES || code == R_STATIO_USER_INDEXES {
+        for ii in indexes(c) {
+            startRow(b)
+            pI(b, tableOid(ii.tableId))
+            pI(b, ii.oid)
+            pT(b, "public")
+            pT(b, c.tables[ii.tableId].name)
+            pT(b, ii.name)
+            while b.c < b.t.cols.length {
+                if b.t.cols[b.c].type == v.T_TIMESTAMPTZ { pN(b) } else { pI(b, 0) }
+            }
+        }
+        return
+    }
+    if code == R_ROLES {
+        startRow(b)
+        pT(b, "postgres")
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pI(b, -1)
+        pT(b, "********")
+        pN(b)
+        pB(b, true)
+        pN(b)
+        pI(b, 10)
+        endRow(b)
+        return
+    }
+    if code == R_USER {
+        startRow(b)
+        pT(b, "postgres")
+        pI(b, 10)
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pB(b, true)
+        pT(b, "********")
+        endRow(b)
+        return
+    }
+    if code == R_COLLATION {
+        collRow(b, 100, "default", 100)
+        collRow(b, 950, "C", 99)
+        collRow(b, 951, "POSIX", 99)
+        return
+    }
+    if code == R_TABLESPACE {
+        startRow(b)
+        pI(b, 1663)
+        pT(b, "pg_default")
+        pI(b, 10)
+        endRow(b)
+        startRow(b)
+        pI(b, 1664)
+        pT(b, "pg_global")
+        pI(b, 10)
+        endRow(b)
+        return
+    }
+    if code == R_EXTENSION {
+        startRow(b)
+        pI(b, 13254)
+        pT(b, "plpgsql")
+        pI(b, 10)
+        pI(b, NS_CATALOG)
+        pB(b, false)
+        pT(b, "1.0")
+        endRow(b)
+        return
+    }
+    if code == R_IS_TABLES {
+        let tid = 0
+        while tid < c.tables.length {
+            if userTable(c, tid) { isTableRow(b, c.tables[tid].name, "BASE TABLE") }
+            tid += 1
+        }
+        let vi = 0
+        while vi < c.viewNames.length {
+            if c.viewNames[vi] != "" { isTableRow(b, c.viewNames[vi], "VIEW") }
+            vi += 1
+        }
+        return
+    }
+    if code == R_IS_COLUMNS {
+        fillIsColumns(c, b)
+        return
+    }
+    if code == R_IS_SCHEMATA {
+        schemaRow(b, "pg_catalog")
+        schemaRow(b, "public")
+        schemaRow(b, "information_schema")
+        return
+    }
+    if code == R_IS_TABLE_CONSTRAINTS || code == R_IS_KEY_COLUMN_USAGE || code == R_IS_REFERENTIAL_CONSTRAINTS {
+        fillIsConstraints(c, b, code)
+        return
+    }
+    // remaining relations are empty (pg_description, pg_proc, pg_inherits, pg_trigger, pg_sequence, pg_enum,
+    // pg_range, pg_stat_activity)
+}
+
+function userTable(c: cat.Catalog, tid: Integer): Boolean {
+    let t = c.tables[tid]
+    return !cat.isDropped(t) && !t.isTemp
+}
+
+function hasTriggers(c: cat.Catalog, tid: Integer): Boolean {
+    for fk in c.fks {
+        if !fk.dropped && (fk.childId == tid || fk.parentId == tid) { return true }
+    }
+    return false
+}
+
+function nsRow(b: RB, oid: Integer, name: Text) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, 10)
+    pN(b)
+    endRow(b)
+}
+
+function amRow(b: RB, oid: Integer, name: Text, handler: Text, kind: Integer) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pT(b, handler)
+    pT(b, charText(kind))
+    endRow(b)
+}
+
+function collRow(b: RB, oid: Integer, name: Text, provider: Integer) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, NS_CATALOG)
+    pI(b, 10)
+    pT(b, charText(provider))
+    pB(b, true)
+    pI(b, -1)
+    if oid == 100 {
+        pN(b)
+        pN(b)
+    } else {
+        pT(b, name)
+        pT(b, name)
+    }
+    endRow(b)
+}
+
+function dbRow(b: RB, oid: Integer, name: Text, template: Boolean) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, 10)
+    pI(b, 6)
+    pT(b, "c")
+    pB(b, template)
+    pB(b, oid != 4)
+    pB(b, false)
+    pI(b, -1)
+    pI(b, 1)
+    pI(b, 1)
+    pI(b, 1663)
+    pT(b, "C")
+    pT(b, "C")
+    endRow(b)
+}
+
+function schemaRow(b: RB, name: Text) {
+    startRow(b)
+    pT(b, "postgres")
+    pT(b, name)
+    pT(b, "postgres")
+    endRow(b)
+}
+
+function isTableRow(b: RB, name: Text, kind: Text) {
+    startRow(b)
+    pT(b, "postgres")
+    pT(b, "public")
+    pT(b, name)
+    pT(b, kind)
+    pN(b)
+    pN(b)
+    pN(b)
+    pN(b)
+    pN(b)
+    if kind == "VIEW" { pT(b, "NO") } else { pT(b, "YES") }
+    pT(b, "NO")
+    pN(b)
+    endRow(b)
+}
+
+function classRow(b: RB, oid: Integer, name: Text, ns: Integer, am: Integer, pages: Integer, tuples: Float, hasIndex: Boolean,
+                  persistence: Integer, kind: Integer, natts: Integer, triggers: Boolean) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, ns)
+    pI(b, 0)
+    pI(b, 0)
+    pI(b, 10)
+    pI(b, am)
+    if kind == 118 { pI(b, 0) } else { pI(b, oid) }
+    pI(b, 0)
+    pI(b, pages)
+    pF(b, tuples)
+    pI(b, 0)
+    pI(b, 0)
+    pB(b, hasIndex)
+    pB(b, false)
+    pT(b, charText(persistence))
+    pT(b, charText(kind))
+    pI(b, natts)
+    pI(b, 0)
+    pB(b, kind == 118)
+    pB(b, triggers)
+    pB(b, false)
+    pB(b, false)
+    pB(b, false)
+    pB(b, true)
+    if kind == 118 { pT(b, "n") } else { pT(b, "d") }
+    pB(b, false)
+    pI(b, 0)
+    if kind == 114 { pI(b, 1) } else { pI(b, 0) }
+    if kind == 114 { pI(b, 1) } else { pI(b, 0) }
+    endRow(b)
+}
+
+function pagesOf(t: tb.Table): Integer {
+    let bytes = tb.memoryBytes(t)
+    if bytes <= 0 { return 0 }
+    return bytes / 8192 + 1
+}
+
+function fillClass(c: cat.Catalog, b: RB) {
+    let code = 1
+    while code <= R_LAST {
+        let natts = newRelTable(code).cols.length
+        let kind = relKindOf(code)
+        let am = 2
+        if kind == 118 { am = 0 }
+        classRow(b, relOidOf(code), relName(code), relSchemaOid(code), am, 0, -1.0, false, 112, kind, natts, false)
+        code += 1
+    }
+    let tid = 0
+    while tid < c.tables.length {
+        if userTable(c, tid) {
+            let t = c.tables[tid]
+            classRow(b, tableOid(tid), t.name, NS_PUBLIC, 2, pagesOf(t), Float(t.live), t.hashIds.length + t.ordIds.length > 0,
+                     112, 114, t.cols.length, hasTriggers(c, tid))
+        }
+        tid += 1
+    }
+    let vi = 0
+    while vi < c.viewNames.length {
+        if c.viewNames[vi] != "" {
+            classRow(b, OID_VIEW + vi, c.viewNames[vi], NS_PUBLIC, 0, 0, -1.0, false, 112, 118, 0, false)
+        }
+        vi += 1
+    }
+    for ii in indexes(c) {
+        let t = c.tables[ii.tableId]
+        classRow(b, ii.oid, ii.name, NS_PUBLIC, amOf(ii), t.live / 256 + 1, Float(t.live), false, 112, 105, ii.cols.length, false)
+    }
+}
+
+function attRow(b: RB, relOid: Integer, name: Text, ty: Integer, typmod: Integer, attnum: Integer, notNull: Boolean, hasDef: Boolean) {
+    startRow(b)
+    pI(b, relOid)
+    pT(b, name)
+    pI(b, v.typeOid(ty))
+    pI(b, v.typeLen(ty))
+    pI(b, attnum)
+    pI(b, -1)
+    pI(b, pgTypmod(ty, typmod))
+    if v.isArrayType(ty) && !v.isVectorType(ty) { pI(b, 1) } else { pI(b, 0) }
+    pB(b, typByval(ty))
+    pT(b, charText(typAlign(ty)))
+    pT(b, charText(typStorage(ty)))
+    pT(b, "")
+    pB(b, notNull)
+    pB(b, hasDef)
+    pB(b, false)
+    pT(b, "")
+    pT(b, "")
+    pB(b, false)
+    pB(b, true)
+    pI(b, 0)
+    pI(b, typCollation(ty))
+    endRow(b)
+}
+
+function fillAttribute(c: cat.Catalog, b: RB) {
+    let code = 1
+    while code <= R_LAST {
+        let rt = newRelTable(code)
+        let i = 0
+        while i < rt.cols.length {
+            let ty = rt.cols[i].type
+            let nullable = v.isArrayType(ty) || ty == v.T_PGNODETREE || ty == v.T_ANYARRAY
+            attRow(b, relOidOf(code), rt.cols[i].name, ty, -1, i + 1, relKindOf(code) == 114 && !nullable, false)
+            i += 1
+        }
+        code += 1
+    }
+    let tid = 0
+    while tid < c.tables.length {
+        if userTable(c, tid) {
+            let t = c.tables[tid]
+            let i = 0
+            while i < t.cols.length {
+                let col = t.cols[i]
+                attRow(b, tableOid(tid), col.name, v.sqlType(col.type), col.typmod, i + 1, col.notNull, hasDefault(t, i))
+                i += 1
+            }
+        }
+        tid += 1
+    }
+    for ii in indexes(c) {
+        let t = c.tables[ii.tableId]
+        let i = 0
+        while i < ii.cols.length {
+            let col = t.cols[ii.cols[i]]
+            attRow(b, ii.oid, col.name, v.sqlType(col.type), col.typmod, i + 1, false, false)
+            i += 1
+        }
+    }
+}
+
+function fillIndex(c: cat.Catalog, b: RB) {
+    for ii in indexes(c) {
+        let t = c.tables[ii.tableId]
+        let colls: List<Integer> = []
+        for ci in ii.cols { colls.add(typCollation(v.sqlType(t.cols[ci].type))) }
+        startRow(b)
+        pI(b, ii.oid)
+        pI(b, tableOid(ii.tableId))
+        pI(b, ii.cols.length)
+        pI(b, ii.cols.length)
+        pB(b, ii.unique)
+        pB(b, false)
+        pB(b, ii.primary)
+        pB(b, false)
+        pB(b, true)
+        pB(b, false)
+        pB(b, true)
+        pB(b, false)
+        pB(b, true)
+        pB(b, true)
+        pB(b, false)
+        pT(b, intList(attnums(ii.cols), true))
+        pT(b, intList(colls, true))
+        pT(b, intList(repeatInt(0, ii.cols.length), true))
+        pT(b, intList(repeatInt(0, ii.cols.length), true))
+        pN(b)
+        pN(b)
+        endRow(b)
+    }
+}
+
+function conRow(b: RB, oid: Integer, name: Text, kind: Integer, deferrable: Boolean, deferred: Boolean, relOid: Integer, indexOid: Integer,
+                frelOid: Integer, updType: Integer, delType: Integer, matchType: Integer, key: Text, fkey: Text) {
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, NS_PUBLIC)
+    pT(b, charText(kind))
+    pB(b, deferrable)
+    pB(b, deferred)
+    pB(b, true)
+    pI(b, relOid)
+    pI(b, 0)
+    pI(b, indexOid)
+    pI(b, 0)
+    pI(b, frelOid)
+    pT(b, charText(updType))
+    pT(b, charText(delType))
+    pT(b, charText(matchType))
+    pB(b, true)
+    pI(b, 0)
+    pB(b, true)
+    pT(b, key)
+    if fkey == "" { pN(b) } else { pT(b, fkey) }
+    endRow(b)
+}
+
+// The parent index a foreign key uses (conindid): its unique index over the referenced columns.
+function fkIndexOid(c: cat.Catalog, fk: cat.ForeignKey): Integer {
+    let name = ""
+    if fk.parentIdx >= 0 && fk.parentIdx < c.hashIdx.length { name = c.hashIdx[fk.parentIdx].name }
+    for ii in indexes(c) {
+        if ii.tableId == fk.parentId && ii.name == name { return ii.oid }
+    }
+    return 0
+}
+
+function fillConstraint(c: cat.Catalog, b: RB) {
+    for ii in indexes(c) {
+        if isConstraintIndex(c, ii) {
+            let kind = 117
+            if ii.primary { kind = 112 }
+            conRow(b, ii.oid + OID_CON_OFFSET, ii.name, kind, false, false, tableOid(ii.tableId), ii.oid, 0, 32, 32, 32, intList(attnums(ii.cols), false), "")
+        }
+    }
+    let i = 0
+    while i < c.fks.length {
+        let fk = c.fks[i]
+        if !fk.dropped && liveTable(c, fk.childId) && liveTable(c, fk.parentId) {
+            conRow(b, OID_FK + i, fk.name, 102, fk.deferrable, fk.deferred, tableOid(fk.childId), fkIndexOid(c, fk), tableOid(fk.parentId),
+                   fkAction(fk.onUpdate), fkAction(fk.onDelete), 115, intList(attnums(fk.childCols), false), intList(attnums(fk.parentCols), false))
+        }
+        i += 1
+    }
+}
+
+function setRow(b: RB, name: Text, setting: Text, unit: Text, category: Text, desc: Text, context: Text, vartype: Text, minv: Text, maxv: Text) {
+    startRow(b)
+    pT(b, name)
+    pT(b, setting)
+    if unit == "" { pN(b) } else { pT(b, unit) }
+    pT(b, category)
+    pT(b, desc)
+    pN(b)
+    pT(b, context)
+    pT(b, vartype)
+    pT(b, "default")
+    if minv == "" { pN(b) } else { pT(b, minv) }
+    if maxv == "" { pN(b) } else { pT(b, maxv) }
+    pN(b)
+    pT(b, setting)
+    pT(b, setting)
+    pN(b)
+    pN(b)
+    pB(b, false)
+    endRow(b)
+}
+
+function fillSettings(b: RB) {
+    setRow(b, "application_name", "", "", "Reporting and Logging / What to Log", "Sets the application name to be reported in statistics and logs.", "user", "string", "", "")
+    setRow(b, "block_size", "8192", "", "Preset Options", "Shows the size of a disk block.", "internal", "integer", "8192", "8192")
+    setRow(b, "client_encoding", "UTF8", "", "Client Connection Defaults / Locale and Formatting", "Sets the client's character set encoding.", "user", "string", "", "")
+    setRow(b, "DateStyle", "ISO, MDY", "", "Client Connection Defaults / Locale and Formatting", "Sets the display format for date and time values.", "user", "string", "", "")
+    setRow(b, "default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior", "Sets the transaction isolation level of each new transaction.", "user", "enum", "", "")
+    setRow(b, "default_transaction_read_only", "off", "", "Client Connection Defaults / Statement Behavior", "Sets the default read-only status of new transactions.", "user", "bool", "", "")
+    setRow(b, "fsync", "on", "", "Write-Ahead Log / Settings", "Forces synchronization of updates to disk.", "sighup", "bool", "", "")
+    setRow(b, "integer_datetimes", "on", "", "Preset Options", "Shows whether datetimes are integer based.", "internal", "bool", "", "")
+    setRow(b, "IntervalStyle", "postgres", "", "Client Connection Defaults / Locale and Formatting", "Sets the display format for interval values.", "user", "enum", "", "")
+    setRow(b, "is_superuser", "on", "", "Preset Options", "Shows whether the current user is a superuser.", "internal", "bool", "", "")
+    setRow(b, "max_connections", "10000", "", "Connections and Authentication / Connection Settings", "Sets the maximum number of concurrent connections.", "postmaster", "integer", "1", "262143")
+    setRow(b, "max_function_args", "100", "", "Preset Options", "Shows the maximum number of function arguments.", "internal", "integer", "100", "100")
+    setRow(b, "max_identifier_length", "63", "", "Preset Options", "Shows the maximum identifier length.", "internal", "integer", "63", "63")
+    setRow(b, "max_index_keys", "32", "", "Preset Options", "Shows the maximum number of index keys.", "internal", "integer", "32", "32")
+    setRow(b, "search_path", "\"$user\", public", "", "Client Connection Defaults / Statement Behavior", "Sets the schema search order for names that are not schema-qualified.", "user", "string", "", "")
+    setRow(b, "server_encoding", "UTF8", "", "Preset Options", "Shows the server (database) character set encoding.", "internal", "string", "", "")
+    setRow(b, "server_version", "17.0", "", "Preset Options", "Shows the server version.", "internal", "string", "", "")
+    setRow(b, "server_version_num", "170000", "", "Preset Options", "Shows the server version as an integer.", "internal", "integer", "170000", "170000")
+    setRow(b, "standard_conforming_strings", "on", "", "Version and Platform Compatibility / Previous PostgreSQL Versions", "Causes '...' strings to treat backslashes literally.", "user", "bool", "", "")
+    setRow(b, "synchronous_commit", "on", "", "Write-Ahead Log / Settings", "Sets the current transaction's synchronization level.", "user", "enum", "", "")
+    setRow(b, "TimeZone", "UTC", "", "Client Connection Defaults / Locale and Formatting", "Sets the time zone for displaying and interpreting time stamps.", "user", "string", "", "")
+    setRow(b, "transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior", "Sets the current transaction's isolation level.", "user", "enum", "", "")
+    setRow(b, "transaction_read_only", "off", "", "Client Connection Defaults / Statement Behavior", "Sets the current transaction's read-only status.", "user", "bool", "", "")
+}
+
+// ---------------------------------------------------------------- information_schema
+
+function isDataType(t: Integer): Text {
+    if t == v.T_NAME { return "name" }
+    if t == v.T_CHAR { return "\"char\"" }
+    if t == v.T_OID { return "oid" }
+    if v.isArrayType(t) { return "ARRAY" }
+    if t == v.T_REGPROC || t == v.T_PGNODETREE || t == v.T_XID || t == v.T_ANYARRAY { return "USER-DEFINED" }
+    return v.typeName(t)
+}
+
+function fillIsColumns(c: cat.Catalog, b: RB) {
+    let tid = 0
+    while tid < c.tables.length {
+        if userTable(c, tid) {
+            let t = c.tables[tid]
+            let i = 0
+            while i < t.cols.length {
+                let col = t.cols[i]
+                let ty = v.sqlType(col.type)
+                startRow(b)
+                pT(b, "postgres")
+                pT(b, "public")
+                pT(b, t.name)
+                pT(b, col.name)
+                pI(b, i + 1)
+                let d = defaultExprText(t, i)
+                if d == "" { pN(b) } else { pT(b, d) }
+                if col.notNull { pT(b, "NO") } else { pT(b, "YES") }
+                pT(b, isDataType(ty))
+                if (ty == v.T_VARCHAR || ty == v.T_BPCHAR) && col.typmod >= 0 {
+                    pI(b, col.typmod)
+                    pI(b, col.typmod * 4)
+                } else if ty == v.T_TEXT || ty == v.T_VARCHAR || ty == v.T_BPCHAR {
+                    pN(b)
+                    pI(b, 1073741824)
+                } else {
+                    pN(b)
+                    pN(b)
+                }
+                if ty == v.T_INT2 { numInfo(b, 16, 2, 0) }
+                else if ty == v.T_INT4 { numInfo(b, 32, 2, 0) }
+                else if ty == v.T_INT8 { numInfo(b, 64, 2, 0) }
+                else if ty == v.T_FLOAT4 { numInfo(b, 24, 2, -1) }
+                else if ty == v.T_FLOAT8 { numInfo(b, 53, 2, -1) }
+                else if ty == v.T_NUMERIC {
+                    if col.typmod >= 0 {
+                        numInfo(b, (col.typmod >> 16) & 65535, 10, col.typmod & 65535)
+                    } else {
+                        pN(b)
+                        pI(b, 10)
+                        pN(b)
+                    }
+                } else {
+                    pNs(b, 3)
+                }
+                if ty == v.T_DATE { pI(b, 0) } else if ty == v.T_TIMESTAMP || ty == v.T_TIMESTAMPTZ || ty == v.T_TIME || ty == v.T_INTERVAL { pI(b, 6) } else { pN(b) }
+                pNs(b, 2)
+                pNs(b, 3)
+                if typCollation(ty) == 100 {
+                    pNs(b, 3)
+                } else {
+                    pNs(b, 3)
+                }
+                pNs(b, 3)
+                pT(b, "postgres")
+                pT(b, "pg_catalog")
+                pT(b, pgTypeName(ty))
+                pNs(b, 3)
+                pN(b)
+                pT(b, Text(i + 1))
+                pT(b, "NO")
+                pT(b, "NO")
+                pNs(b, 5)
+                pT(b, "NO")
+                pT(b, "NEVER")
+                pN(b)
+                pT(b, "YES")
+                endRow(b)
+                i += 1
+            }
+        }
+        tid += 1
+    }
+}
+
+function numInfo(b: RB, precision: Integer, radix: Integer, scale: Integer) {
+    pI(b, precision)
+    pI(b, radix)
+    if scale < 0 { pN(b) } else { pI(b, scale) }
+}
+
+function fillIsConstraints(c: cat.Catalog, b: RB, code: Integer) {
+    for ii in indexes(c) {
+        if isConstraintIndex(c, ii) {
+            let t = c.tables[ii.tableId]
+            let ty = "UNIQUE"
+            if ii.primary { ty = "PRIMARY KEY" }
+            if code == R_IS_TABLE_CONSTRAINTS {
+                tcRow(b, ii.name, t.name, ty, false, false)
+            } else if code == R_IS_KEY_COLUMN_USAGE {
+                let i = 0
+                while i < ii.cols.length {
+                    kcuRow(b, ii.name, t.name, t.cols[ii.cols[i]].name, i + 1, -1)
+                    i += 1
+                }
+            }
+        }
+    }
+    let i = 0
+    while i < c.fks.length {
+        let fk = c.fks[i]
+        if !fk.dropped && liveTable(c, fk.childId) && liveTable(c, fk.parentId) {
+            let ch = c.tables[fk.childId]
+            if code == R_IS_TABLE_CONSTRAINTS {
+                tcRow(b, fk.name, ch.name, "FOREIGN KEY", fk.deferrable, fk.deferred)
+            } else if code == R_IS_KEY_COLUMN_USAGE {
+                let j = 0
+                while j < fk.childCols.length {
+                    kcuRow(b, fk.name, ch.name, ch.cols[fk.childCols[j]].name, j + 1, j + 1)
+                    j += 1
+                }
+            } else {
+                startRow(b)
+                pT(b, "postgres")
+                pT(b, "public")
+                pT(b, fk.name)
+                pT(b, "postgres")
+                pT(b, "public")
+                let un = ""
+                if fk.parentIdx >= 0 && fk.parentIdx < c.hashIdx.length { un = c.hashIdx[fk.parentIdx].name }
+                pT(b, un)
+                pT(b, "NONE")
+                pT(b, fkActionWords(fk.onUpdate))
+                pT(b, fkActionWords(fk.onDelete))
+                endRow(b)
+            }
+        }
+        i += 1
+    }
+}
+
+function tcRow(b: RB, name: Text, table: Text, ty: Text, deferrable: Boolean, deferred: Boolean) {
+    startRow(b)
+    pT(b, "postgres")
+    pT(b, "public")
+    pT(b, name)
+    pT(b, "postgres")
+    pT(b, "public")
+    pT(b, table)
+    pT(b, ty)
+    if deferrable { pT(b, "YES") } else { pT(b, "NO") }
+    if deferred { pT(b, "YES") } else { pT(b, "NO") }
+    pT(b, "YES")
+    if ty == "FOREIGN KEY" { pN(b) } else { pT(b, "YES") }
+    endRow(b)
+}
+
+function kcuRow(b: RB, name: Text, table: Text, column: Text, pos: Integer, posUnique: Integer) {
+    startRow(b)
+    pT(b, "postgres")
+    pT(b, "public")
+    pT(b, name)
+    pT(b, "postgres")
+    pT(b, "public")
+    pT(b, table)
+    pT(b, column)
+    pI(b, pos)
+    if posUnique < 0 { pN(b) } else { pI(b, posUnique) }
+    endRow(b)
+}

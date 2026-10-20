@@ -1,0 +1,70 @@
+// CRC32C (Castagnoli, reflected polynomial 0x82F63B78), slicing-by-8, in Minyar.
+// Minyar modules cannot hold global state, so the lookup tables live in a Table value that callers keep.
+// update() chains: update(t, update(t, 0, a), b) == crc of a ++ b. crc32c("123456789") == 0xE3069283.
+
+public record Table {
+    private t: List<Integer>     // 8 x 256 entries: t[k * 256 + i]
+}
+
+public function makeTable(): Table {
+    let t: List<Integer> = []
+    for i in 0..256 {
+        let c = i
+        for bit in 0..8 {
+            if c & 1 == 1 {
+                c = (c >> 1) ^ 0x82F63B78
+            } else {
+                c = c >> 1
+            }
+        }
+        t.add(c)
+    }
+    for k in 1..8 {
+        for i in 0..256 {
+            let prev = t[(k - 1) * 256 + i]
+            t.add((prev >> 8) ^ t[prev & 0xFF])
+        }
+    }
+    return Table { t: t }
+}
+
+public function update(table: Table, crc: Integer, data: Bytes, offset: Integer, length: Integer): Integer {
+    if offset < 0 || length < 0 || offset + length > data.length {
+        fail("crc32c: range out of bounds")
+    }
+    let t = table.t
+    let c = crc ^ 0xFFFFFFFF
+    let i = offset
+    let end = offset + length
+    // byte-at-a-time until 8-byte alignment of the remaining length is irrelevant: process 8-byte blocks
+    while end - i >= 8 {
+        let one = data.getUInt32(i) ^ c
+        let two = data.getUInt32(i + 4)
+        c = t[1792 + (one & 0xFF)] ^ t[1536 + ((one >> 8) & 0xFF)] ^
+            t[1280 + ((one >> 16) & 0xFF)] ^ t[1024 + (one >> 24)] ^
+            t[768 + (two & 0xFF)] ^ t[512 + ((two >> 8) & 0xFF)] ^
+            t[256 + ((two >> 16) & 0xFF)] ^ t[two >> 24]
+        i += 8
+    }
+    while i < end {
+        c = t[(c ^ data[i]) & 0xFF] ^ (c >> 8)
+        i += 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+public function of(table: Table, data: Bytes): Integer {
+    return update(table, 0, data, 0, data.length)
+}
+
+// CRC of an Integer as 8 little-endian bytes appended to a running crc (used for the WAL LSN).
+public function updateInt64(table: Table, crc: Integer, value: Integer): Integer {
+    let t = table.t
+    let c = crc ^ 0xFFFFFFFF
+    let v = value
+    for k in 0..8 {
+        c = t[(c ^ (v & 0xFF)) & 0xFF] ^ (c >> 8)
+        v = v >> 8
+    }
+    return c ^ 0xFFFFFFFF
+}
