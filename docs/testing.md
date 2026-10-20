@@ -5,6 +5,32 @@ Python harnesses use the standard library. CI selects CPython 3.15.0 from
 packages are needed. Use the same interpreter when reproducing Python
 harness failures. Packager minimum versions remain documented separately.
 
+For feedback on uncommitted work, `make check-changed-plan` prints the checks
+and reasons, and `make check-changed` runs them against the working tree. Both
+reuse the staged-commit selector: a fixed core gate, complete checks for changed
+library modules and their transitive dependents, and `check-portable` for unknown
+paths or missing coverage. Staged, unstaged, deleted and untracked files count.
+The previous library graph preserves removed import edges. `CHECK_CHANGED_BASE`
+defaults to `HEAD`; set it to a branch point to include already committed work.
+The plan builds its Minyar planner, so it belongs on the build host too.
+
+For a build box without Git metadata, capture inputs on the source machine
+without building, then sync and run on the box:
+
+```sh
+make check-changed-export CHECK_CHANGED_EXPORT=target/changes-1
+/path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed-plan
+/path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed
+```
+
+Each export needs a new directory under `target/`. Source content and executable modes, changed
+paths and previous modules are validated before and after checks; re-export
+after editing. Generated `build/`, `target/` and Python bytecode are excluded.
+The export is an input capture, not a passing gate or a staged snapshot.
+Checks reuse the working tree's warm build and retain the existing commit-check
+logs and JSON results. `make check-changed-inputs` tests Git/input handling
+without compiling the language; `make check-check-selection` tests the policy.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery
