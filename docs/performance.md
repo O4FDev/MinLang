@@ -313,6 +313,30 @@ iterations; on the frozen safelibs fixtures this cut JPEG decode from 32.59 to
 21.19 ms and PNG from 9.17 to 7.58 ms. Resizing and other calls retain their
 ordinary memory effects; invalid accesses still use the runtime diagnostic.
 
+The call-free Bytes and List length helpers describe their effects as
+`memory(argmem: read)`, with noncapturing, non-null headers readable for sixteen
+bytes. They do no allocation, synchronization or unwinding and always return.
+This describes each read; aliases can still change the next observed length.
+Checked accessors expose non-null backing storage only after their bounds check.
+Empty Lists may have a null backing pointer, and native Bytes views imply no
+backing-allocation size, alignment or disjointness. Trap branches carry source
+likelihood hints, with the failing successor unlikely; ordinary append growth
+does not. These contracts preserve the existing runtime checks and diagnostics.
+`make check-llvm-helper-contracts` verifies the emitted contracts and mutable,
+overlapping views at O0/O2 with ownership cleanup; its sanitizer variant also
+instruments the compiler and generated memory accesses.
+
+On one Linux x86_64 LLVM 23.1.2 host, seven alternating retained pairs against
+the same frozen inputs measured 2,233,443,703 → 2,231,188,537 median user
+instructions for arena compiler self-compilation (−0.10%). Whole-process
+instructions for the frozen safelibs zlib/PNG/JPEG workers fell by
+0.17%/0.47%/0.12%; the three jsmn sizes were unchanged. Compiler file size grew
+from 2,040,344 to 2,041,440 bytes; codec and jsmn file sizes stayed unchanged.
+Decode CPU timings were mixed, so these narrow instruction reductions do not
+establish a general speedup. Compiler output matched after removing exactly
+the intended helper-contract differences; decoded bytes and jsmn checksums
+matched without normalization.
+
 `make check-bytes-access check-list-access` checks the raw helpers and optimized
 loops: a proven traversal removes redundant bounds and index-overflow checks
 while retaining checked accumulation. The suites also exercise errors, shared

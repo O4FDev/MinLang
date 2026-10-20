@@ -1,0 +1,79 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+
+function body(llvm: Text, name: Text): Text {
+    let active = false
+    let result: List<Text> = []
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " @" + name + "(") { active = true }
+        if active {
+            result.add(line + "\n")
+            if line == "}" { return joinText(result) }
+        }
+    }
+    fail("missing LLVM helper: " + name)
+}
+
+let compiler = test.compiler()
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
+io.writeTextFile(compiler.directory + "/runtime.c", contract)
+compiler.runtime = compiler.directory + "/runtime.o"
+let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime"]
+for flag in compiler.flags { build.add(flag) }
+for item in ["-c", compiler.directory + "/runtime.c", "-o", compiler.runtime] { build.add(item) }
+test.require(test.run(build, system.environment(), "", compiler.directory + "/runtime", 120), "build helper ownership oracle")
+
+// Headers stay live when empty. Length is mutable through another alias, and
+// overlapping, shifted C-layout views retain the same backing bytes.
+test.executes(compiler, #"""
+function grow(bytes: Bytes, values: List<Integer>) { bytes.add(65); values.add(42) }
+record Window native "c_packed" { data: Bytes[2] }
+let bytes = Bytes(0)
+let values: List<Integer> = []
+print(bytes.length); print(values.length)
+grow(bytes, values)
+print(bytes.length); print(values.length); print(bytes[0]); print(values[0])
+values[0] = 43; print(values[0])
+let backing = Bytes(4)
+let first = cBytes(cView(Window, backing, 0))
+let shifted = cBytes(cView(Window, backing, 1))
+first[1] = 77
+print(shifted[0]); shifted[1] = 88; print(backing[2])
+"""#, "0\n0\n1\n1\n65\n42\n43\n77\n88\n")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+for name in ["bytes", "list"] {
+    let length = body(llvm, ".minyar." + name + ".length")
+    for attribute in ["nonnull", "captures(none)", "dereferenceable(16)", "nofree", "nosync", "nounwind", "willreturn", "memory(argmem: read)"] {
+        test.check(test.contains(length, attribute), name + " length missing contract: " + attribute)
+    }
+    test.check(!test.contains(length, "noalias") && !test.contains(length, "invariant.load"), "mutable headers must keep aliasing and mutation")
+    test.check(test.contains(length, "!range !{i64 0, i64 -9223372036854775808}"), "length range must stay nonnegative")
+}
+for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked", "record.get.checked", "record.set.scalar.checked", "shift.checked", "character.checked", "float.integer.checked", "integer.absolute.checked", "clamp.integer.checked", "clamp.float.checked"] {
+    let helper = body(llvm, ".minyar." + name)
+    test.check(test.contains(helper, "label %good, label %bad, !prof !{!\"branch_weights\", !\"expected\", i32 2000, i32 1}"), name + " must mark only the failure successor unlikely")
+    // A reporting path may do I/O or terminate. Pure-reader attributes belong
+    // only on the two call-free length functions.
+    for attribute in ["memory(", "nofree", "nosync", "willreturn"] {
+        test.check(!test.contains(helper, attribute), name + " overstates failure-path effects: " + attribute)
+    }
+}
+for name in ["integer.overflow.checked", "integer.division.checked"] {
+    test.check(test.contains(body(llvm, ".minyar." + name), "label %bad, label %good, !prof !{!\"branch_weights\", !\"expected\", i32 1, i32 2000}"), name + " has reversed trap successors")
+}
+let append = body(llvm, ".minyar.bytes.add.checked")
+test.check(!test.contains(append, "!prof"), "ordinary append growth must not inherit a trap likelihood")
+for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked"] {
+    let helper = body(llvm, ".minyar." + name)
+    let storage = "%data = load ptr, ptr %bytes"
+    if name.startsWith("list.") { storage = "%values = load ptr, ptr %list" }
+    test.check(test.contains(helper, "good:\n  " + storage + ", !nonnull !{}\n"), name + " must expose storage only in its successful block")
+    test.check(!test.contains(helper, "dereferenceable(") && !test.contains(helper, "!tbaa") && !test.contains(helper, "!alias.scope"), name + " must preserve native-view aliasing")
+}
+
+// Verify the actual emitted module independently of execution and optimization.
+test.require(test.run([compiler.clang, "-Wno-override-module", "-c", path + ".ll", "-o", path + ".verify.o"], system.environment(), "", path + ".verify", compiler.linkTimeout), "verify helper attributes and metadata")
+test.removeTree(compiler.directory)
+print("LLVM helper contracts: passed")
