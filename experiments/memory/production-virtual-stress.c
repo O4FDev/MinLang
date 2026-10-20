@@ -192,6 +192,9 @@ static size_t unassigned_frame_debt(void) {
         minyar_pool_deallocate(frame);
     }
 #ifdef MINYAR_BOUNDED_TRACKED_LOCALS
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 #endif
     recovered();
@@ -249,6 +252,9 @@ static size_t rotating_frame_cache(void) {
         minyar_pool_deallocate(frame);
     }
 #ifdef MINYAR_BOUNDED_TRACKED_LOCALS
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 #endif
     recovered();
@@ -282,6 +288,9 @@ static size_t temporary_owner_debt(void) {
         minyar_pool_deallocate(frame);
     }
 #ifdef MINYAR_BOUNDED_TRACKED_LOCALS
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 #endif
     recovered();

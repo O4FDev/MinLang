@@ -350,7 +350,7 @@ static void rc_bounded_chunk_unit(void) {
     }
     rc_bounded_chunk_head = chunk->next;
     if (!rc_bounded_chunk_head) rc_bounded_chunk_tail = NULL;
-    rc_heap_deallocate(chunk);
+    rc_bounded_chunk_retire(chunk);
     rc_pending_count--;
 }
 
@@ -463,6 +463,35 @@ static inline __attribute__((always_inline)) size_t rc_bounded_poll_body(size_t 
         while (work < budget && rc_pending_count) {
             unsigned queue = rc_bounded_next_queue;
             const unsigned queues = cycles ? 4 : 3;
+            /* Sole owner queue: a traced drop may request either object or
+             * cycle work. Return to general selection immediately afterward;
+             * every visit and finalization still consumes its own unit. */
+            unsigned objects = rc_bounded_active || rc_bounded_head || rc_bounded_recent_head;
+            if (cycles && !objects && !rc_cycle_pending &&
+                rc_bounded_frame_head && !rc_bounded_chunk_head) {
+                size_t pending;
+                do {
+                    pending = rc_pending_count;
+                    rc_bounded_next_queue = 2;
+                    rc_bounded_frame_unit();
+                    work++;
+                } while (work < budget && rc_bounded_frame_head &&
+                         rc_pending_count <= pending);
+                continue;
+            }
+            if (cycles && !objects && !rc_cycle_pending &&
+                rc_bounded_chunk_head && !rc_bounded_frame_head) {
+                size_t pending;
+                do {
+                    pending = rc_pending_count;
+                    rc_bounded_next_queue = (2 + 1) % queues;
+                    rc_bounded_chunk_unit();
+                    work++;
+                } while (work < budget && rc_bounded_chunk_head &&
+                         rc_pending_count <= pending);
+                continue;
+            }
+            /* End sole owner queue batching. */
             for (unsigned tries = 0; tries < queues; tries++) {
                 if ((queue == 0 && (rc_bounded_active || rc_bounded_head || rc_bounded_recent_head)) ||
                     (queue == 1 && rc_bounded_frame_head) ||

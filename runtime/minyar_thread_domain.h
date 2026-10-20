@@ -4,6 +4,10 @@ static inline void rc_thread_domain_init(void) {
      * existing domain's live ownership/collector state to simulate isolation. */
     if (rc_frames || rc_scopes || rc_free_frames || rc_pending_count)
         minyar_stop("a thread domain was already initialized.");
+#ifdef MINYAR_BOUNDED_RC
+    if (rc_bounded_cached_chunk || rc_bounded_cached_frame_bytes)
+        minyar_stop("a thread domain was already initialized.");
+#endif
 }
 
 static inline void rc_thread_domain_drain(void) {
@@ -34,6 +38,7 @@ static inline void rc_thread_domain_dispose(void) {
 #endif
     }
 #ifdef MINYAR_BOUNDED_RC
+    rc_bounded_chunk_cache_clear();
     rc_bounded_cached_frame_bytes = 0;
 #else
     free(rc_pending);

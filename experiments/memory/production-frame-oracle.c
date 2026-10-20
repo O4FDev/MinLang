@@ -73,6 +73,10 @@ static size_t scan_frame_owners(void) {
         for (RcFrame *cached = rc_free_frames; cached; cached = cached->previous)
             assert(cached != frame); /* Partial retirement cannot be reused. */
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    if (rc_bounded_cached_chunk)
+        assert(!rc_bounded_cached_chunk->count && !rc_bounded_cached_chunk->next);
+#endif
     return count + scan_chunks(rc_bounded_chunk_head);
 }
 
@@ -95,6 +99,9 @@ static void clear_frame_cache(void) {
 #endif
     }
 #ifdef MINYAR_BOUNDED_TRACKED_LOCALS
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 #endif
 }

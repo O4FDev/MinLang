@@ -93,6 +93,7 @@ static MINYAR_THREAD_LOCAL size_t rc_object_count, rc_bytes, rc_immortal_object_
 
 #ifdef MINYAR_BOUNDED_RC
 #include "minyar_heap.h"
+#include "minyar_owner_cache.h"
 #ifndef MINYAR_RC_POLL_BUDGET
 #define MINYAR_RC_POLL_BUDGET 32u
 #endif
@@ -381,7 +382,7 @@ void minyar_rc_keep(void *value) {
         /* The incoming owned reference already protects value. Use the
          * chunk's existing extra service budget before requesting storage. */
         rc_service_pending(MINYAR_RC_POLL_BUDGET);
-        chunk = rc_heap_allocate(sizeof(*chunk));
+        chunk = rc_bounded_chunk_allocate();
         chunk->next = NULL;
         chunk->count = 0;
         if (frame->temporary_tail) frame->temporary_tail->next = chunk;

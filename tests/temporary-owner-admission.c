@@ -49,6 +49,9 @@ int main(int argc,char **argv) {
  for(size_t i=0;i<count;i++)minyar_rc_release(held[i]);drain();
  assert(!rc_frames&&!rc_object_count&&!rc_bytes&&!rc_immortal_object_count);assert(minyar_pool_used==rc_bounded_cached_frame_bytes);
  while(rc_free_frames){RcFrame *frame=rc_free_frames;rc_free_frames=frame->previous;minyar_pool_deallocate(frame->locals);minyar_pool_deallocate(frame);}
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+ rc_bounded_chunk_cache_clear();
+#endif
  rc_bounded_cached_frame_bytes=0;
  assert(!minyar_pool_used);void *whole=minyar_pool_try_allocate(MINYAR_POOL_BYTES);assert(whole==minyar_pool);minyar_pool_deallocate(whole);
  puts("one existing retirement admits chunk; aliases and complete object cleanup passed");

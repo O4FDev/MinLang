@@ -13,6 +13,9 @@ static void clear_cache(void) {
         RcFrame *frame=rc_free_frames;rc_free_frames=frame->previous;
         rc_heap_deallocate(frame->locals);rc_heap_deallocate(frame);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes=0;
 }
 static void *volatile escaped_allocation;

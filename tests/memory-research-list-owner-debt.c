@@ -24,6 +24,9 @@ static void clear_frames(void) {
         rc_heap_deallocate(frame->locals);
         rc_heap_deallocate(frame);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 }
 

@@ -1065,6 +1065,18 @@ The Linux correctness runner includes these three checks and both compiler
 fixed points. Correctness under virtualization or instruction translation is
 not a latency measurement on native deployment hardware.
 
+`make check-temporary-owner-cache` checks actual chunk reuse, separate owner and
+finalization units, both keep service batches, shared cache-cap boundaries,
+K1 overlap, active cycle phases and complete pool recovery. Numeric thread
+domains additionally require cache disposal and reject cached residual state.
+`make check-owner-queue-batching` compares every poll with the generic cycle
+scheduler, including partial/zero budgets, queue competition and cycle phases.
+Both run at O0/O2 with system, fixed and lazy heaps and budgets 1, 2, 7, 32 and
+1024. Their `-sanitize` variants add ASan/UBSan. Reuse/service and
+scheduler-stop/work-charge mutants must fail after successful compilation.
+Native checks belong to `check-portable`; sanitizer checks belong to
+`check-ownership` and `check-sanitize`. All logs and failed artifacts are retained.
+
 ## Running the suites
 
 `build/tooling/scripts/check-linux` (Linux) and `build/tooling/scripts/check-macos` (macOS, the

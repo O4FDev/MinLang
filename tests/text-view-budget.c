@@ -34,6 +34,9 @@ static void clear(void) {
         rc_free_frames = f->previous;
         rc_heap_deallocate(f->locals); rc_heap_deallocate(f);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 #ifdef MINYAR_SYSTEM_HEAP
     assert(!rc_heap_allocation_count);

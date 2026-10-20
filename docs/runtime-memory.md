@@ -436,7 +436,9 @@ points. Allocator calls and copying have separate costs outside that budget.
 The eager profile frees leaves directly and processes reference containers with
 an iterative queue, avoiding recursive C-stack destruction while still allowing
 a graph-sized release. Its queue/frame buffers can retain their high-water
-capacity. Incremental profiles bound cached ownership-frame bytes separately.
+capacity. Incremental profiles bound cached ownership storage separately: frames
+and at most one fully finalized eight-owner temporary chunk share the same byte
+cap. Reusing the empty chunk changes no counts, service points, or cleanup units.
 
 Single-threaded eager and system profiles serve allocations up to 1008 bytes
 from a small-object heap: 4 KiB pages divided into 64, 128, 256, 512 or

@@ -286,7 +286,7 @@ static void rc_bounded_chunk_unit(void) {
     }
     rc_bounded_chunk_head = chunk->next;
     if (!rc_bounded_chunk_head) rc_bounded_chunk_tail = NULL;
-    rc_heap_deallocate(chunk);
+    rc_bounded_chunk_retire(chunk);
     rc_pending_count--;
 }
 

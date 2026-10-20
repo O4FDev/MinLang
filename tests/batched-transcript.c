@@ -30,6 +30,9 @@ int main(void) {
     }
     assert((((RcObject *)shared-1)->ownership>>3)==1);minyar_rc_release(shared);
     while(rc_free_frames){RcFrame *f=rc_free_frames;rc_free_frames=f->previous;rc_heap_deallocate(f->locals);rc_heap_deallocate(f);}
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes=0;
     assert(!rc_bytes&&!rc_object_count&&!rc_heap_allocation_count);
 }

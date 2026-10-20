@@ -60,7 +60,7 @@ activate incremental cleanup. Combining lazy and system allocation is rejected.
 | --- | ---: | --- |
 | `MINYAR_RC_POLL_BUDGET` | 32 work units | 1–1,024 |
 | `MINYAR_BOUNDED_HEAP_BYTES` | 64 MiB | A representable power of two, at least 4,096 bytes |
-| `MINYAR_FRAME_CACHE_BYTES` | 256 KiB | Cache capacity in bytes |
+| `MINYAR_FRAME_CACHE_BYTES` | 256 KiB | Shared frame and retired temporary-chunk cache capacity |
 | `MINYAR_INTEGER_TEXT_CACHE_LIMIT` | 32,768 entries | 0–32,768 |
 
 The pool needs one metadata byte per 32 bytes of capacity. With the default
@@ -226,11 +226,21 @@ it also means more formatting and allocation for repeated uncached values.
 For example, set `-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=256` when compiling the
 runtime source, rather than when linking an existing runtime object or IR file.
 
-The frame cache has a separate `MINYAR_FRAME_CACHE_BYTES` cap. Charges include
-each frame header and the full capacity of its local-value and written-index
-arrays. Pool profiles count rounded blocks; the system profile counts requested
-bytes without allocator overhead. Active frames and frames awaiting retirement
-are outside this cache cap.
+The ownership-storage cache has a separate `MINYAR_FRAME_CACHE_BYTES` cap.
+Charges include each frame header, the full capacity of its local-value and
+written-index arrays, and at most one completely retired temporary chunk.
+The chunk is cached only after its separate finalization unit; it owns no
+values and never joins the pending queues again until reused. Both keep service
+opportunities remain on cache hits. Pool profiles count rounded blocks; the
+system profile counts requested bytes without allocator overhead. On the
+current ABI the chunk requests 80 bytes (one 128-byte pool block), sharing the
+existing cap with frames. A zero cap disables both caches. Active and pending
+frames/chunks are outside this cache cap.
+
+Native integrations that manually discard private ownership roots must also
+discard the chunk-cache root. Normal numeric thread-domain disposal frees it.
+The cache invariant and amortized cost are in
+[the temporary-storage design](perfcs/temporary-cache.md).
 
 There is no full cleanup drain at process exit. Measurements of complete
 reclamation must add one to their harness.

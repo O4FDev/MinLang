@@ -79,6 +79,13 @@ static size_t scan_frame_owners(void) {
         cached_bytes += rc_heap_charge(f, sizeof(*f));
         if (f->locals) cached_bytes += rc_heap_charge(f->locals, f->local_capacity * 16);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    if (rc_bounded_cached_chunk) {
+        outside_stack(rc_bounded_cached_chunk);
+        assert(!rc_bounded_cached_chunk->count && !rc_bounded_cached_chunk->next);
+        cached_bytes += rc_heap_charge(rc_bounded_cached_chunk, sizeof(*rc_bounded_cached_chunk));
+    }
+#endif
     assert(cached_bytes == rc_bounded_cached_frame_bytes);
     return count + scan_chunks(rc_bounded_chunk_head);
 }
@@ -88,6 +95,9 @@ static void clean_cache(void) {
         outside_stack(f); outside_stack(f->locals);
         rc_heap_deallocate(f->locals); rc_heap_deallocate(f);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
 }
 static void drain(MinyarRecord **roots) {

@@ -178,6 +178,9 @@ static void frames_and_temporaries(void) {
 #endif
         minyar_pool_deallocate(frame);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
     rc_bounded_cached_frame_bytes = 0;
     empty_pool();
 }

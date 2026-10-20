@@ -26,6 +26,9 @@ static void release_frame_cache(void) {
         minyar_pool_deallocate(frame->locals);
         minyar_pool_deallocate(frame);
     }
+#ifdef MINYAR_BOUNDED_OWNER_CACHE
+    rc_bounded_chunk_cache_clear();
+#endif
 }
 static void complete_recovery(void) {
     release_frame_cache();
