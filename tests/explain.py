@@ -31,7 +31,7 @@ CODES = (
     "E0408", "E0409", "E0410", "E0411",
     "E0501", "E0502",
     "E0601", "E0602", "E0603",
-    "E0701",
+    "E0701", "E0801",
 )
 FIELDS = {
     "version", "severity", "code", "message", "file", "line", "column",
@@ -193,6 +193,22 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
             )
             assert human.stderr == expected_text, ("complete independent text diagnostic", source, human.stderr, expected_text)
         return value
+
+    # The completion family has an independent code oracle in both renderers.
+    completion_repair = ("complete or transfer each token exactly once on every normal path; "
+                         "keep tokens in direct local bindings and use the protocol library primitives")
+    completion_source = ('use "protocol" as protocol\n'
+                         'function forgot(token: protocol.Completion) {}\n')
+    completion_path = root / "protocol-completion-forgot.min"
+    completion_path.write_text(completion_source, encoding="utf-8")
+    diagnostic(completion_path, "E0801", expected_help=completion_repair,
+               expected_message="Protocol ownership: normal exit must complete or transfer every live completion token",
+               expected_span=(2, 1, 2, 9), expected_source_lines=completion_source.splitlines(),
+               exact_output=True)
+    completion_native = root / "protocol-completion-native.min"
+    completion_native.write_text('function begin(): Integer { native "protocol" }\n', encoding="utf-8")
+    diagnostic(completion_native, "E0801", expected_help=completion_repair,
+               expected_message="protocol primitives need the canonical completion declaration and exact signature")
 
     # Existing rejections prove code identities across unrelated front-end
     # paths. Complete presentation remains covered by check-diagnostics.

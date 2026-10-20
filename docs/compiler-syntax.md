@@ -484,3 +484,20 @@ reports, including while reading source files; JSON formatting does not catch
 them. Host failures writing LLVM or cache files also use runtime reports.
 Hosted Linux currently loads libgcc_s for unwinding; this is a fixed
 startup cost, so a strict zero-instruction claim does not apply there.
+
+## Ownership remarks and protocol obligations
+
+The standalone `--explain-ownership` option buffers version-1 JSON remarks in
+`TerminalReuseSite` and publishes them after complete source validation. It
+reports the final terminal Text/List local-transfer proof, including conservative
+fallback reasons, without changing emitted LLVM. Default success stays quiet;
+cached module-state and metadata-only modes reject the option. A transfer remark
+does not prove runtime storage reuse. See [ownership explanations](ownership-explanations.md).
+
+Opaque `protocol_completion` records reuse the DMA flow checker's stable logical
+binding identities and final complete-tree audit, as a distinct obligation phase.
+Exact `protocol` provider/name/signature rules recognize token creation and
+completion. Ordinary bindings and helper arguments move the obligation, and all
+normal exits prove completion or transfer. Unsupported containment, exceptional
+and concurrent edges reject before LLVM publication. The existing managed record
+ABI remains; source responsibility is independent of RC ownership slots.

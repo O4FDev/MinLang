@@ -1,5 +1,6 @@
 // Source-level ownership, independent of RC owner-slot lowering. CPU/Pending
 // remain managed handles; payload completion/coherency belongs to the runtime.
+// Phase 4 is a protocol completion obligation with no runtime state machine.
 // The first control-flow subset is straight-line code, if/else and returns.
 record DmaFlowProgram {
     context: CompilerContext
@@ -30,12 +31,21 @@ record DmaFlowFrame {
 
 function dmaFlowReject(context: CompilerContext, node: Integer, message: Text) {
     if node < 0 || node >= context.syntax.nodes.length { node = 0 }
+    if hasProtocolCompletion(context) {
+        let symbol = 0
+        while symbol < context.dma.kinds.length {
+            let kind = context.dma.kinds[symbol]
+            if kind > 0 && kind < 4 { failAtSyntax(context.syntax, node, "Affine ownership: " + message) }
+            symbol = symbol + 1
+        }
+        failAtSyntax(context.syntax, node, "Protocol ownership: " + message)
+    }
     failAtSyntax(context.syntax, node, "DMA ownership: " + message)
 }
 
 function dmaFlowPhase(context: CompilerContext, type: Integer): Integer {
     let kind = dmaKind(context, type)
-    if kind == 1 || kind == 2 { return kind }
+    if kind == 1 || kind == 2 || kind == 4 { return kind }
     return 0
 }
 
@@ -130,6 +140,7 @@ function dmaFlowContains(context: CompilerContext, type: Integer): Boolean {
 
 function dmaFlowType(context: CompilerContext, node: Integer, type: Integer, direct: Boolean) {
     if dmaFlowContains(context, type) && (!direct || dmaKind(context, type) == 0) {
+        if hasProtocolCompletion(context) { dmaFlowReject(context, node, "completion tokens and opaque handles cannot be contained in records, containers, choices, Results, callbacks or globals") }
         dmaFlowReject(context, node, "opaque DMA handles cannot be contained in records, containers, choices, Results, callbacks or globals")
     }
 }
@@ -190,7 +201,7 @@ function dmaFlowName(frame: DmaFlowFrame, node: Integer, state: List<Integer>): 
     }
     if state[slot] != phase {
         let moved = frame.moves[slot]
-        if state[slot] == 0 && moved >= 0 { dmaFlowReject(context, node, dmaFlowMovedReason(frame, slot, moved)) }
+        if phase != 4 && state[slot] == 0 && moved >= 0 { dmaFlowReject(context, node, dmaFlowMovedReason(frame, slot, moved)) }
         dmaFlowReject(context, node, "binding is unavailable, out of scope or already moved")
     }
     dmaFlowUse(frame, node)
@@ -243,6 +254,7 @@ function dmaFlowEmpty(frame: DmaFlowFrame, state: List<Integer>, node: Integer) 
     let index = 0
     while index < state.length {
         let phase = state[index]
+        if phase == 4 { dmaFlowReject(frame.program.context, node, "normal exit must complete or transfer every live completion token") }
         if phase == 1 || phase == 2 { dmaFlowReject(frame.program.context, node, dmaFlowLiveReason(frame, index, "normal exit must transfer, dispose or retire every live CPU/Pending capability")) }
         index = index + 1
     }
@@ -252,6 +264,7 @@ function dmaFlowClose(frame: DmaFlowFrame, state: List<Integer>, locals: List<In
     let index = 0
     while index < locals.length {
         let slot = locals[index]
+        if state[slot] == 4 { dmaFlowReject(frame.program.context, node, "scope exit leaves a live completion token; complete or transfer it explicitly") }
         if state[slot] == 1 || state[slot] == 2 { dmaFlowReject(frame.program.context, node, dmaFlowLiveReason(frame, slot, "scope exit leaves a live capability; transfer, dispose or retire it explicitly")) }
         state[slot] = -1
         index = index + 1
@@ -352,6 +365,7 @@ function dmaFlowScalarLoop(frame: DmaFlowFrame, node: Integer, state: List<Integ
     let index = 0
     while index < state.length {
         let phase = state[index]
+        if phase == 4 { dmaFlowReject(context, node, "loops cannot hold a live completion token; complete or transfer it first") }
         if phase == 1 || phase == 2 { dmaFlowReject(context, node, "loops cannot hold a live CPU/Pending capability") }
         index = index + 1
     }
@@ -591,6 +605,7 @@ function dmaFlowConcurrent(program: DmaFlowProgram) {
             if dmaFlowFind(program.dmaActors, actor) >= 0 || (actor < program.primitives.length && program.primitives[actor] > 0) {
                 let site = root - context.functionNames.length
                 if root < context.functionNames.length { site = dmaFlowFact(context.syntax.symbolNodes, root) }
+                if hasProtocolCompletion(context) { dmaFlowReject(context, site, "completion tokens and opaque handles cannot be reached from thread, parallel or callback execution") }
                 dmaFlowReject(context, site, "serialized boot-CPU DMA cannot be reached from thread, parallel or callback execution")
             }
             let edge = 0
@@ -621,7 +636,10 @@ function checkDmaOwnership(context: CompilerContext) {
         let type = context.functionReturnTypes[symbol]
         let direct = context.symbolKinds[symbol] == 1 || (symbol < context.dma.kinds.length && context.dma.kinds[symbol] > 0)
         dmaFlowType(context, site, type, direct)
-        if !direct && dmaFlowPhase(context, type) > 0 { dmaFlowReject(context, site, "CPU/Pending cannot be stored in module constants or globals") }
+        if !direct && dmaFlowPhase(context, type) > 0 {
+            if dmaKind(context, type) == 4 { dmaFlowReject(context, site, "completion tokens cannot be stored in module constants or globals") }
+            dmaFlowReject(context, site, "CPU/Pending cannot be stored in module constants or globals")
+        }
         if context.symbolKinds[symbol] == 4 && isCallbackType(1000 + symbol, context.functionNames) {
             let signature = callbackSignatureTypes(context.functionNames[symbol])
             let component = 0
@@ -699,13 +717,17 @@ function checkDmaOwnership(context: CompilerContext) {
             if operation == "==" || operation == "!=" || operation == "<" || operation == "<=" || operation == ">" || operation == ">=" {
                 let operand = syntax.firstChild
                 while operand >= 0 {
-                    if dmaKind(context, context.syntax.nodes[operand].type) > 0 { dmaFlowReject(context, node, "opaque DMA handles have no automatic record equality, ordering or hashing") }
+                    if dmaKind(context, context.syntax.nodes[operand].type) > 0 {
+                        if dmaKind(context, context.syntax.nodes[operand].type) == 4 { dmaFlowReject(context, node, "completion tokens have no automatic record equality, ordering or hashing") }
+                        dmaFlowReject(context, node, "opaque DMA handles have no automatic record equality, ordering or hashing")
+                    }
                     operand = context.syntax.nodes[operand].nextSibling
                 }
             }
         }
         let phase = dmaFlowPhase(context, syntax.type)
         if dmaKind(context, syntax.type) > 0 && (closure || syntax.kind == 3 || syntax.kind == 4 || syntax.kind == 5) {
+            if phase == 4 { dmaFlowReject(context, node, "completion tokens cannot be captured or stored in globals or aggregate fields") }
             dmaFlowReject(context, node, "opaque DMA handles cannot be captured or stored in globals or aggregate fields")
         }
         if phase > 0 {
@@ -713,7 +735,10 @@ function checkDmaOwnership(context: CompilerContext) {
             if syntax.kind == 3 || syntax.kind == 4 || syntax.kind == 5 { dmaFlowReject(context, node, "CPU/Pending cannot be stored in globals or aggregate fields") }
             if syntax.kind != 2 { program.selected[owner] = true }
         }
-        if syntax.kind == 210 && dmaKind(context, syntax.type) > 0 { dmaFlowReject(context, node, "opaque DMA handles cannot be constructed as records") }
+        if syntax.kind == 210 && dmaKind(context, syntax.type) > 0 {
+            if phase == 4 { dmaFlowReject(context, node, "opaque completion tokens cannot be constructed as records; use protocol.begin()") }
+            dmaFlowReject(context, node, "opaque DMA handles cannot be constructed as records")
+        }
         let previous = -1
         let child = syntax.firstChild
         while child >= 0 {
@@ -734,7 +759,17 @@ function checkDmaOwnership(context: CompilerContext) {
         let owner = program.owners[node]
         let trusted = owner > 0 && program.primitives[context.syntax.nodes[owner].symbol] > 0
         if program.selected[owner] && !trusted {
-            if context.tokenLines.features / 8 % 2 != 0 { dmaFlowReject(context, node, "recoverable call-depth mode requires unsupported exceptional ownership edges") }
+            if context.tokenLines.features / 8 % 2 != 0 {
+                let site = node
+                if node == 0 {
+                    let candidate = 1
+                    while candidate < count && site == 0 {
+                        if program.owners[candidate] == 0 && context.syntax.nodes[candidate].kind >= 200 && dmaFlowPhase(context, context.syntax.nodes[candidate].type) > 0 { site = candidate }
+                        candidate = candidate + 1
+                    }
+                }
+                dmaFlowReject(context, site, "recoverable call-depth mode requires unsupported exceptional ownership edges")
+            }
             let syntax = context.syntax.nodes[node]
             let kind = syntax.kind
             if !program.inLoops[node] {

@@ -713,6 +713,15 @@ copying behavior. Parentheses do not change this rule.
 The same applies when replacing the local itself, such as
 `values = (values).appended(values[0])`: the index is read before storage reuse.
 
+For values named by delayed events, the [handles library](handles.md) provides
+typed pool identities with generation checks. Removing a value invalidates its
+handles, and an old event cannot accidentally reach a replacement in that slot.
+
+The [protocol library](protocol-completion.md) can require explicit completion
+or transfer of a transaction or close witness on every normal return path.
+The standalone compiler's [ownership explanations](ownership-explanations.md)
+describe terminal Text/List transfer decisions and conservative fallbacks.
+
 Reconstructing a scalar record into its local can also reuse uniquely owned
 storage. Every field initializer runs before any old field is replaced, so
 `point = Point { x: point.y; y: point.x }` still swaps the two values. Other

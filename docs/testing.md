@@ -1360,7 +1360,7 @@ have separate checks. Multi-error goldens assert exact independent spans,
 shadowing. The bootstrap native suite repeats recovery at O0/O2 with ownership
 assertions and a native probe that enters a real stack ownership header.
 
-`make check-explain` checks all 35 published codes through the compiler and
+`make check-explain` checks all published codes through the compiler and
 the public launcher from outside a project. It compiles the explanation
 examples, checks exact usage and unknown-code errors, and verifies code/help
 parity for independent rejection cases, including malformed numbers, choice
@@ -1625,3 +1625,26 @@ absent names, duplicate policy and deterministic `pretty` diagnostics at
 O0/O2. Normal returns use exact ownership/debt checks; deliberate fatal stops
 do not claim unwind cleanup. `check-json-values-sanitize` repeats these with
 a sanitized compiler, emitted-LLVM ASan and C runtime ASan/UBSan.
+
+`make check-handles` runs typed generational pools at O0/O2 with exact ownership
+cleanup checks. It covers wrong pools, stale copies, replacement, repeated clear,
+bounded generation exhaustion, nested Maybe payloads, shared record values, a
+2,000-operation independent history model, private-field and type rejections,
+and the delayed-window gallery. `check-handles-sanitize` repeats these through
+the sanitized compiler, emitted LLVM and C runtime.
+
+`make check-protocol-completion` proves completion witnesses at O0/O2 with exact
+ownership cleanup. It exercises moves, generic aliases, helpers, returns, branch
+agreement, scope exit, explicit commit/rollback, private opaque construction and
+rejections of stale aliases, dropped obligations, aggregate escape, loops,
+callbacks, recursion, native boundaries and exceptional modes. Cold/warm module
+entry must retain complete-source proof, including after an imported helper is
+changed. `check-protocol-completion-sanitize` repeats the executable paths with
+compiler/generated LLVM/C runtime sanitizers. `check-osdev-dma` preserves the
+existing checker's separate DMA behavior.
+
+`make check-ownership-explanations` checks actual source-site JSON remark reasons,
+quiet ordinary and JSON success, byte-identical emitted LLVM, no success remarks
+on rejection, unsupported cached-mode rejection and O0/O2 alias-preserving
+execution with exact cleanup. Its sanitizer variant is
+`check-ownership-explanations-sanitize`.
