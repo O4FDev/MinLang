@@ -98,7 +98,7 @@ _Noreturn void exit(int status) {
 /* Called by the exception vectors in os/arch/arm64/head.S. */
 _Noreturn void minyar_arm_exception(unsigned long kind, unsigned long syndrome, unsigned long address, unsigned long fault) {
     static const char *const kinds[4] = {"synchronous exception", "interrupt", "fast interrupt", "system error"};
-    fprintf(stderr, "\nMinyar stopped: %s (vector %lu) at %#lx, ESR %#lx, FAR %#lx\n",
+    fprintf(stderr, "\nMinyar stopped: %s (vector %lu) at 0x%lx, ESR 0x%lx, FAR 0x%lx\n",
             kinds[kind & 3], kind, address, syndrome, fault);
     minyar_print_stack_trace();
     exit(1);

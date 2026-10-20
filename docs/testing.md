@@ -127,6 +127,21 @@ check retains `build/sequences-evidence.ll`, `build/sequences-loop.ll` and their
 `sequences-generic-*` counterparts.
 `check-sequences-sanitize` adds ASan/UBSan.
 
+`make check-osdev-fields` checks all 2,780 valid 8/16/32/64-bit field layouts
+against a bit-at-a-time oracle (22,240 samples at each of O0 and O2), hosted
+MMIO memory, private/width rejection, invalid ranges and signed 64-bit edges.
+Successful fixtures assert ownership cleanup. It also checks the actual e1000
+configuration builders, packed DMA descriptor bytes/offsets and the device-fields
+gallery. `check-osdev-fields-sanitize`
+adds ASan/UBSan. `check-osdev-host` combines these with the hosted kernel HTTP
+parser. No privileged instructions are executed by the host tests.
+`check-osdev-workflow` uses fake tools to test QEMU deadlines, exit codes,
+serial evidence and debugger commands. Both focused checks are portable gates.
+`check-osdev-freestanding` cross-compiles both runtime C units at O0/O2 for
+x86-64 and AArch64 with host headers excluded. This catches accidental hosted
+header dependencies without booting a guest.
+The real finite e1000 guest is opt-in: see [kernel development](os-development.md).
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

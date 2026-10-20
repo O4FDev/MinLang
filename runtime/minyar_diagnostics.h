@@ -90,6 +90,7 @@ _Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
  * fatal. Unwind ownership while callback stack storage is still live. */
+#if defined(__STDC_HOSTED__) && __STDC_HOSTED__
 #include <setjmp.h>
 typedef struct MinyarDiagnosticBoundary {
     jmp_buf *jump;
@@ -168,6 +169,20 @@ MINYAR_NORETURN void minyar_runtime_diagnosticRaise(void) {
     minyar_diagnostic_jump(1);
 }
 MINYAR_NORETURN void minyar_runtime_diagnosticDiscard(void) { minyar_diagnostic_jump(2); }
+#else
+/* The private compiler-only recovery ABI needs hosted setjmp/longjmp.
+ * Normal freestanding programs never call it; fail closed if requested. */
+_Bool minyar_compiler_try(void (*compile)(void *), void *job) {
+    (void)compile;
+    (void)job;
+    minyar_stop("compiler diagnostic recovery is unavailable in freestanding programs.");
+}
+_Bool minyar_runtime_diagnosticHasJob(void) { return 0; }
+void *minyar_runtime_diagnosticCurrentJob(void) { return NULL; }
+long long minyar_runtime_diagnosticErrorCount(void) { return 0; }
+MINYAR_NORETURN void minyar_runtime_diagnosticRaise(void) { exit(1); }
+MINYAR_NORETURN void minyar_runtime_diagnosticDiscard(void) { exit(1); }
+#endif
 
 /* Terminal cell ranges generated from Unicode 16.0.0 categories Mn/Me
  * and assigned East_Asian_Width W/F. Source coordinates remain scalars. */

@@ -13,6 +13,15 @@ make -C os release         # both
 make -C os run ARCH=arm64  # boot it in QEMU
 ```
 
+For a portable headless run, bounded kernel test, GDB connection or serial-log
+symbolization, use the [kernel development workflow](../docs/os-development.md):
+
+```sh
+python3 tools/osdev.py run
+make check-osdev-host
+make check-osdev-qemu       # real finite e1000 guest; requires QEMU
+```
+
 Needs Homebrew LLVM (`brew install llvm lld`) and QEMU (`brew install qemu`).
 The compiler builds on first use. On an Arm Mac the arm64 build runs under
 Apple's hypervisor at the processor's own speed; the x86-64 build is

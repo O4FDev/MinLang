@@ -1409,6 +1409,47 @@ parallel function taking two Integers through that address, and
 functions can call parallel functions directly. Minyar OS uses them to spread
 per-pixel work over every processor; see freestanding programs.
 
+## Hardware register fields
+
+The `device` module gives memory-mapped registers distinct widths. A
+`Field8`, `Field16`, `Field32` or `Field64` describes a field within a register
+of that width. Its first argument is the least-significant bit; the second
+is the number of bits. Both the field range and its values are checked:
+
+```minyar
+use "device" as device
+let distance = device.field32(12, 10)
+let control = device.encode32(distance, 64)
+print(device.extract32(distance, control)) // 64
+let changed = device.replace32(distance, control, 96)
+```
+
+`encode32` creates the field's bits with all other bits zero. `extract32`
+reads a field from an Integer; `replace32` preserves the other bits. The
+same operations exist for 8, 16 and 64 bits. Words narrower than 64 bits
+must be nonnegative and fit their width. A full-width `Field64` accepts every
+Integer bit pattern, including negative values. A field cannot be built by a
+record literal or passed to a register operation of a different width.
+
+`device.readField32(register, field)` performs one volatile read.
+`device.updateField32(register, field, value)` checks the value, reads once
+and writes once. It is a non-atomic read-modify-write for ordinary read/write
+registers. For write-only or write-one-to-clear registers, use
+`device.write32(register, device.encode32(field, value))`; this performs no
+read. These operations add no hardware memory barrier. Use `machine.fence()`
+where the device and architecture require one.
+
+A field descriptor is an ordinary managed record, allocated when constructed;
+keep it for repeated access. Its operations use Integer masks and shifts with
+range checks and the usual record ownership cost. They add no dynamic dispatch.
+Native `record ... native "c_packed"` layouts can describe DMA storage; the
+e1000 driver uses `sizeOf` and `offsetOf` on its 16-byte descriptors, so strides
+and offsets come from the declared layout. Those queries are compile-time values;
+they do not create a record. Packed layouts describe storage and do not make
+ordinary record field accesses into volatile MMIO operations.
+See [kernel development](os-development.md) for hosted driver tests, bounded
+QEMU tests, GDB and symbolized panic addresses.
+
 ## Programs and entry points
 
 Executable statements may be written directly at the top level. They run from
