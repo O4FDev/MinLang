@@ -284,8 +284,9 @@ any value type, including a record or a List, but cannot return `Nothing`.
 
 Import `sequence` for lazy `sequence.range(first, after)` values. Iterable values
 also support `.map(functionName)`, `.filter(functionName)` and
-`.fold(initial, functionName)` with concrete named functions. Stored recipes do
-no transform work until traversed. Map/filter chains fuse into one loop with
+`.fold(initial, functionName)` with named functions. Generic transforms infer
+concrete type arguments from the items and fold seed, retaining direct calls and
+ordinary generic constraints. Stored recipes do no transform work until traversed. Map/filter chains fuse into one loop with
 direct calls, and fold combines items from left to right. Recipes allocate one
 small record per stage when created, with no intermediate Lists or per-item
 protocol wrappers. See [lazy iteration](iteration.md) for examples, costs and

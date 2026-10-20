@@ -27,10 +27,16 @@ from left to right, passing the accumulator and item to the combining function.
 Its result has the accumulator's type. An empty fold returns its initial value.
 The source and initial value are ordinary expressions evaluated once.
 
-Transforms in this first implementation are concrete named functions. They
-compile to direct calls. Closures, callback values and generic transform
-functions receive an explicit rejection. Existing user methods named `map`,
-`filter` or `fold` take precedence over sequence operations.
+Transforms are named functions and compile to direct calls. A generic transform
+infers its type arguments from the source item and, for fold, the initial value.
+Its bounds and instantiated body receive the same checks as an ordinary generic
+call. For example, `function singleton<Item>(value: Item): List<Item>` can map
+Integer or Text items without choosing callback types by hand. An unresolved
+type argument needs a concrete named wrapper with explicit types. Closures and
+callback values still receive an explicit rejection. Existing user methods named
+`map`, `filter` or `fold` take precedence over sequence operations.
+
+A consuming pipeline supports up to 64 map/filter stages.
 
 Recipe types are inferred from their expressions. Modules using these operations
 currently take the compiler's whole-graph compatibility path rather than reusing
@@ -85,7 +91,9 @@ programs with the ownership oracle. `make check-iteration` separately checks
 the user-record protocol and its diagnostics.
 
 The reproducible study in `experiments/iteration-study` compares a dynamic List
-pipeline with a handwritten loop using the same named transforms. On Linux
+pipeline with a handwritten loop using the same named transforms. It invokes
+`build/minyarc` directly with its legacy ownership lowering; the public eager
+launcher now selects scope ownership, whose code counts are separate. On Linux
 x86_64 with Clang 23.1.2, both optimized loop bodies contained 31 static LLVM
 instructions and the same five direct call sites: checked multiplication,
 checked addition, List access fallback, List length and ownership step. Neither

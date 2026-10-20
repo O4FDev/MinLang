@@ -418,7 +418,195 @@ fixtures.rejects(frontend, stageBoundary(65, false), "a lazy sequence supports a
 
 fixtures.rejects(frontend, arithmetic + "let recipe = [1].map(function(value: Integer): Integer { return value })\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
 fixtures.rejects(frontend, arithmetic + "let callback: (Integer) -> Integer = function(value) { return value * 2 }\nlet recipe = [1].map(callback)\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
-fixtures.rejects(frontend, "function identity<Item>(value: Item): Item { return value }\nlet recipe = [1].map(identity)\n", "sequence map needs a concrete named function; generic callbacks are not supported yet", true)
+// Generic named transforms: G1
+fixtures.executes(frontend, #"""
+    function infer<Item>(value: Item): Item { return value }
+    function add(total: Integer, value: Integer): Integer { return total + value }
+    print([1, 2, 3].map(infer).fold(0, add))
+    for word in ["moon", "light"].map(infer) { print(word) }
+    for value in [Bytes("AB")].map(infer) { print(Text(value)) }
+    """#, "6\nmoon\nlight\nAB\n", levels, 0, "", true)
+
+// Generic named transforms: G2
+fixtures.executes(frontend, #"""
+    global CALLS: List<Integer> = [0]
+    function infer<Item>(value: Item): Item { CALLS[0] += 1; return value }
+    function add(total: Integer, value: Integer): Integer { return total + value }
+    let recipe = [1, 2].map(infer)
+    print(CALLS[0])
+    print(recipe.fold(0, add)); print(CALLS[0])
+    print(recipe.fold(0, add)); print(CALLS[0])
+    for value in recipe { print(value); break }
+    print(CALLS[0])
+    """#, "0\n3\n2\n3\n4\n1\n5\n", levels, 0, "", true)
+
+// Generic named transforms: G3
+fixtures.executes(frontend, #"""
+    function singleton<Item>(value: Item): List<Item> { return [value] }
+    function first<Item>(values: List<Item>): Item { return values[0] }
+    function nonempty<Item>(values: List<Item>): Boolean { return values.length > 0 }
+    for value in [1, 2, 3].map(singleton).filter(nonempty).map(first) { print(value) }
+    for values in ["moon", "sea"].map(singleton) { print(values[0]) }
+    """#, "1\n2\n3\nmoon\nsea\n", levels, 0, "", true)
+
+// Generic named transforms: G4
+fixtures.executes(frontend, #"""
+    function stable<Item: Ordered>(value: Item): Item { return value }
+    function reflexive<Item: Equatable>(value: Item): Boolean { return value == value }
+    function size<Source: Iterable>(source: Source): Integer {
+        let total = 0
+        for value in source { total += 1 }
+        return total
+    }
+    for value in [1, 2].map(stable).filter(reflexive) { print(value) }
+    for value in ["a", "b"].map(stable).filter(reflexive) { print(value) }
+    let groups: List<List<Integer>> = [[1, 2], []]
+    for value in groups.map(size) { print(value) }
+    """#, "1\n2\na\nb\n2\n0\n", levels, 0, "", true)
+
+// Generic named transforms: G5
+fixtures.executes(frontend, #"""
+    function append<Item>(total: List<Item>, value: Item): List<Item> { total.add(value); return total }
+    function pick<Item>(total: Item, value: Item): Item { return value }
+    let words = ["moon", "sea"].fold([], append)
+    print(words[0]); print(words[1])
+    print([1, 2, 3].fold(0, pick))
+    print(["a", "b"].fold("start", pick))
+    let empty: List<Text> = []
+    let seed = ["kept"]
+    let result = empty.fold(seed, append)
+    seed.add("same")
+    print(result.length); print(result[1])
+    """#, "moon\nsea\n3\nb\n2\nsame\n", levels, 0, "", true)
+
+// Generic named transforms: G6
+fixtures.executes(frontend, #"""
+    function infer<Item>(value: Item): Item { return value }
+    type Count = Integer
+    record Letter { value: Text }
+    type Message = Letter
+    let numbers: List<Count> = [7]
+    for value in numbers.map(infer) { print(value) }
+    for value in [8].map(infer) { print(value) }
+    let original: Message = Letter { value: "old" }
+    let recipe = [original].map(infer)
+    original.value = "new"
+    for value in recipe { print(value.value); value.value = "kept" }
+    print(original.value)
+    let bytes = [Bytes("AB")]
+    for value in bytes.map(infer) { value[0] = 67 }
+    print(Text(bytes[0]))
+    """#, "7\n8\nnew\nkept\nCB\n", levels, 0, "", true)
+
+// Generic named transforms: G8
+fixtures.executes(frontend, #"""
+    function keep<Accumulator, Item>(total: Accumulator, value: Item): Accumulator { return total }
+    print([1, 2].fold("kept", keep))
+    print(["a", "b"].fold(42, keep))
+    """#, "kept\n42\n", levels, 0, "", true)
+
+// Generic named transforms: G10
+fixtures.executes(frontend, #"""
+    function infer<Item>(value: Item): Item { return value }
+    function countStep<Item>(total: Integer, value: Item): Integer { return total + 1 }
+    function size<Source: Iterable>(source: Source): Integer {
+        return source.map(infer).fold(0, countStep)
+    }
+    let groups: List<List<Integer>> = [[1, 2], []]
+    for value in groups.map(size) { print(value) }
+    """#, "2\n0\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    function infer<Item>(value: Item): Item { return value }
+    function add(total: Integer, value: Integer): Integer { return total + value }
+    let warm = infer(7)
+    print([warm].map(infer).fold(0, add))
+    let words = ["sea"].map(infer)
+    for value in [1].map(infer) { print(value) }
+    for word in words { print(word) }
+    for value in [2].map(infer) { print(value) }
+    """#, "7\n1\nsea\n2\n", levels, 0, "", true)
+
+fixtures.rejects(frontend, "function empty<Output, Input>(value: Input): List<Output> { return [] }\nlet recipe = [1].map(empty)\n", "I can't infer type argument 'Output' for 'empty'", true)
+
+fixtures.rejects(frontend, "function keep<Unknown, Item>(value: Item): Boolean { return true }\nlet recipe = [1].filter(keep)\n", "I can't infer type argument 'Unknown' for 'keep'", true)
+
+fixtures.rejects(frontend, "function append<Unknown, Item>(total: List<Item>, value: Item): List<Item> { total.add(value); return total }\nlet result = [1].fold([], append)\n", "I can't infer type argument 'Unknown' for 'append'", true)
+
+fixtures.rejects(frontend, "function choose<Item>(total: Item, value: Item): Item { return total }\nlet result = [1].fold(\"start\", choose)\n", "type argument 'Item' is used inconsistently: Integer and Text", true)
+
+fixtures.rejects(frontend, "function stable<Item: Ordered>(value: Item): Item { return value }\nlet empty: List<Bytes> = []\nlet recipe = empty.map(stable)\n", "does not satisfy Ordered", true)
+
+fixtures.rejects(frontend, "function valid<Item: Ordered>(value: Item): Boolean { return true }\nlet empty: List<Bytes> = []\nlet recipe = empty.filter(valid)\n", "does not satisfy Ordered", true)
+
+fixtures.rejects(frontend, "function first<Item>(values: List<Item>): Item { return values[0] }\nlet recipe = [1].map(first)\n", "I can't infer type argument 'Item' for 'first'", true)
+
+fixtures.rejects(frontend, "function two<Item>(left: Item, right: Item): Item { return left }\nlet recipe = [1].map(two)\n", "sequence map function must take one Integer argument", true)
+
+fixtures.rejects(frontend, "function consume<Item>(value: Item) {}\nlet recipe = [1].map(consume)\n", "sequence map function must return an item, not Nothing", true)
+
+fixtures.rejects(frontend, "function infer<Item>(value: Item): Item { return value }\nlet recipe = [1].filter(infer)\n", "sequence filter function must return Boolean", true)
+
+fixtures.rejects(frontend, "function infer<Item>(value: Item): Item { return value }\nfunction run() { let infer = 7; let recipe = [1].map(infer) }\nrun()\n", "'infer' is a local value", true)
+
+io.writeTextFile(frontend.compiler.directory + "/generic-sequence-transforms.min", test.sourceModules(#"""
+    public function infer<Item>(value: Item): Item { return value }
+    public function append<Item>(total: List<Item>, value: Item): List<Item> { total.add(value); return total }
+    function hidden<Item>(value: Item): Item { return value }
+    """#))
+fixtures.executes(frontend, #"""
+    use "./generic-sequence-transforms.min" as transforms
+    function add(total: Integer, value: Integer): Integer { return total + value }
+    print([1, 2].map(transforms.infer).fold(0, add))
+    let words = ["moon", "sea"].fold([], transforms.append)
+    print(words[0]); print(words[1])
+    """#, "3\nmoon\nsea\n", levels, 0, "", true)
+fixtures.rejects(frontend, "use \"./generic-sequence-transforms.min\" as transforms\nlet recipe = [1].map(transforms.hidden)\n", "'transforms.hidden' is private to its module", true)
+
+fixtures.executes(frontend, #"""
+    function infer<Item>(value: Item): Item { return value }
+    function reflexive<Item: Equatable>(value: Item): Boolean { return value == value }
+    public function genericFused(values: List<Integer>): Integer {
+        let total = 0
+        for value in values.map(infer).filter(reflexive) { total += value }
+        return total
+    }
+    print(genericFused([])); print(genericFused([1, 2, 3]))
+    """#, "0\n6\n", levels, 0, "", true)
+let genericPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let genericLLVM = io.readTextFile(genericPath + ".ll")
+let genericBody = functionBody(genericLLVM, functionSymbol(genericLLVM, "genericFused"))
+test.check(occurrences(genericBody, "\nfor.condition.") == 1, "generic named transforms must fuse into one source loop")
+let genericLoop = genericBody.slice(genericBody.find("\nfor.condition."), genericBody.length)
+test.check(noMaterialization(genericLoop), "generic scalar traversal must not allocate recipe/callback/collection objects per item")
+let genericTargets: List<Text> = []
+for definition in test.lines(genericLLVM) {
+    if definition.startsWith("define ") && test.contains(definition, "minyar_generic_function_") {
+        let begin = definition.find("@")
+        let end = definition.find("(")
+        let symbol = definition.slice(begin, end)
+        if symbol.endsWith("_infer") || symbol.endsWith("_reflexive") { genericTargets.add(symbol) }
+    }
+}
+test.check(genericTargets.length == 2, "expected one concrete scalar map and predicate specialization")
+for symbol in genericTargets {
+    test.check(test.contains(genericLoop, " " + symbol + "("), "the fused loop must call each original specialization directly")
+    test.check(noMaterialization(functionBody(genericLLVM, symbol)), "selected generic scalar transforms must not allocate")
+}
+test.check(!test.contains(genericBody, "@minyar_callback_") && !test.contains(genericBody, "call i64 %") && !test.contains(genericBody, "call zeroext i1 %") && !test.contains(genericBody, "call ptr %") && !test.contains(genericBody, "_apply"), "generic recipes must retain static direct dispatch without apply wrappers")
+test.require(test.run([optimizer(frontend), "-passes=verify", "-disable-output", genericPath + ".ll"], frontend.environment, "", genericPath + ".verify", 30), "verify generic fused sequence LLVM")
+io.writeTextFile("build/sequences-generic-evidence.ll", genericLLVM)
+io.writeTextFile("build/sequences-generic-loop.ll", genericBody)
+
+fixtures.executes(frontend, #"""
+    record Box<Item> { value: Item }
+    function box<Item>(value: Item): Box<Item> { return Box { value: value } }
+    function unbox<Item>(value: Box<Item>): Item { return value.value }
+    for value in [1, 2].map(box).map(unbox) { print(value) }
+    for value in ["moon"].map(box).map(unbox) { print(value) }
+    """#, "1\n2\nmoon\n", levels, 0, "", true)
+fixtures.rejects(frontend, "function broken<Item>(value: Item): Integer { return value }\nlet recipe = [\"wrong\"].map(broken)\n", "a returned value has the wrong type; expected Integer, found Text", true)
+
 fixtures.rejects(frontend, "function transform(value: Integer): Integer { return value }\nfunction run() { let transform = 7; let recipe = [1].map(transform) }\nrun()\n", "'transform' is a local value", true)
 fixtures.rejects(frontend, "let recipe = [1].map(missing)\n", "sequence map cannot find named function 'missing'", true)
 fixtures.rejects(frontend, "function wrong(): Integer { return 1 }\nlet recipe = [1].map(wrong)\n", "sequence map function must take one Integer argument", true)

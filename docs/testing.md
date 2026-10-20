@@ -95,10 +95,13 @@ adds ASan/UBSan.
 
 `make check-sequences` checks stored lazy map/filter recipes and left-to-right
 folds over collections, ranges and user iterators. O0/O2 ownership cases cover
-early exits, type-changing maps, rejected managed items, reuse and Integer limits.
+early exits, type-changing maps, rejected managed items, reuse, Integer limits
+and the 64-stage boundary. Generic named transforms cover inferred item/seed
+types, bounds, instantiated bodies, aliases, imports and specialization reuse.
 IR assertions prove one loop with direct unboxed transforms and no intermediate
 List or callback dispatch; the LLVM verifier checks the emitted module. The
-check retains `build/sequences-evidence.ll` and `build/sequences-loop.ll`.
+check retains `build/sequences-evidence.ll`, `build/sequences-loop.ll` and their
+`sequences-generic-*` counterparts.
 `check-sequences-sanitize` adds ASan/UBSan.
 
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
