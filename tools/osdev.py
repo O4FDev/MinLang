@@ -242,6 +242,20 @@ def run(args):
     print(f"osdev: serial log: {log}", file=sys.stderr)
     if args.dry_run:
         return 0
+    # Validate every writable path before either building or starting QEMU.
+    # Resolve symlinks and compare inodes too: hard links can alias a journal.
+    def aliases(first, second):
+        return first.resolve() == second.resolve() or (first.exists() and second.exists() and first.samefile(second))
+
+    journal = getattr(args, "record", None) or getattr(args, "replay", None)
+    for name in ("minyar-os.img", "kernel.elf"):
+        artifact = args.root / "build/os" / args.arch / name
+        if aliases(log, artifact):
+            raise WorkflowError("serial log must not overwrite the kernel or disk image")
+        if journal and aliases(journal, artifact):
+            raise WorkflowError("replay journal must not overwrite the kernel or disk image")
+    if journal and aliases(log, journal):
+        raise WorkflowError("serial log must not overwrite the replay journal")
     qemu[0] = tool(qemu[0])
     if not args.no_build:
         make[0] = str(Path(tool(make[0])).resolve())
@@ -274,10 +288,6 @@ def run(args):
         path = args.root / "build/os" / args.arch / artifact
         if not path.is_file():
             raise WorkflowError(f"missing {path}; build the selected architecture first")
-    for name in ("minyar-os.img", "kernel.elf"):
-        artifact = args.root / "build/os" / args.arch / name
-        if log == artifact.resolve() or (log.exists() and log.samefile(artifact)):
-            raise WorkflowError("serial log must not overwrite the kernel or disk image")
     log.parent.mkdir(parents=True, exist_ok=True)
     status = boot(args, qemu, log)
     elf = args.root / "build/os" / args.arch / "kernel.elf"

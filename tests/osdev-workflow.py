@@ -289,6 +289,38 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
         self.invoke("test", "--log", str(alias), expected=2)
         self.assertEqual((self.output / "kernel.elf").read_text(), "fixture\n")
 
+    def test_replay_paths_cannot_destroy_journal_or_artifacts(self):
+        arm = self.root / "build/os/arm64"
+        arm.mkdir()
+        for name in ("kernel.elf", "minyar-os.img"):
+            (arm / name).write_bytes(b"preserved kernel artifact")
+        journal = self.work / "saved replay"
+        journal.write_bytes(b"preserved replay journal")
+        hard = self.work / "journal hard link"
+        os.link(journal, hard)
+        symbolic = self.work / "journal symbolic link"
+        symbolic.symlink_to(journal)
+        for mode in ("--record", "--replay"):
+            for alias in (journal, hard, symbolic):
+                with self.subTest(mode=mode, alias=alias):
+                    result = self.invoke("test", "--arch", "arm64", mode, str(journal),
+                                         "--log", str(alias), no_build=False, expected=2)
+                    self.assertIn(b"serial log must not overwrite the replay journal", result.stderr)
+                    self.assertEqual(journal.read_bytes(), b"preserved replay journal")
+            for name in ("kernel.elf", "minyar-os.img"):
+                artifact = arm / name
+                for alias in (artifact, self.work / (name + " hard link")):
+                    if alias != artifact and not alias.exists():
+                        os.link(artifact, alias)
+                    with self.subTest(mode=mode, artifact=alias):
+                        result = self.invoke("test", "--arch", "arm64", mode, str(alias),
+                                             no_build=False, expected=2)
+                        self.assertIn(b"replay journal must not overwrite the kernel or disk image", result.stderr)
+                        self.assertEqual(artifact.read_bytes(), b"preserved kernel artifact")
+        self.assertFalse((self.work / "qemu.json").exists())
+        self.assertFalse((self.work / "bootstrap.json").exists())
+        self.assertFalse(self.log.exists())
+
     def test_invalid_deadlines_are_rejected(self):
         for value in ("0", "-1", "nan", "inf"):
             with self.subTest(value=value):
