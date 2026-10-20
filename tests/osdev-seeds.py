@@ -236,7 +236,11 @@ class Study:
     def run(self, label, command, cwd=None, timeout=120, stdin=None, quiet=False):
         started = time.monotonic()
         try:
-            result = subprocess.run([str(part) for part in command], cwd=cwd, input=stdin,
+            # An enclosing make's flags (and os/Makefile's LLVM_BIN) must not
+            # reach nested ./minyar builds, which would pick another clang.
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "LLVM_BIN")}
+            result = subprocess.run([str(part) for part in command], cwd=cwd, input=stdin, env=environment,
                                     capture_output=True, text=True, timeout=timeout)
             status, stdout, stderr = result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired as error:
@@ -268,8 +272,9 @@ class Study:
                 # mkimage is built through the checkout's ./minyar launcher, which
                 # these private trees omit; its source is never seeded.
                 mkimage = ROOT / "build/os/mkimage"
-                status, _, stderr = self.run("mkimage", ["make", "-C", ROOT / "os", "ARCH=x86_64",
-                                                         f"LLVM_BIN={self.llvm_bin}", mkimage], timeout=600)
+                mkimage.parent.mkdir(parents=True, exist_ok=True)
+                status, _, stderr = self.run("mkimage", [ROOT / "minyar", ROOT / "os/tools/mkimage.min", "-o", mkimage],
+                                             cwd=ROOT, timeout=600)
                 if status != 0:
                     raise StudyFailure("could not build build/os/mkimage:\n" + stderr[-2000:])
                 (base / "build/os").mkdir()
