@@ -53,10 +53,11 @@ edits save less work than body edits even when few function bodies change.
 Missing dependencies, import cycles, and invalid source are still errors.
 Diagnostics retain the original source filenames and line numbers.
 
-Prior module rows are indexed once by their exact path and entry/library role.
-Graph loading, delta overlays and publication reuse that index rather than
-scanning the saved rows for each module. This changes neither cache formats
-nor invalidation rules. `make check-incremental-module-index` checks the lookup
+Prior module tables with more than 512 rows are indexed once by their exact
+path and entry/library role. Graph loading, delta overlays and publication
+reuse that index. Smaller tables retain a bounded scan to avoid hashing overhead.
+This changes neither cache formats nor invalidation rules.
+`make check-incremental-module-index` checks both lookup paths
 against a linear oracle, including collisions, Unicode, duplicate keys and
 incomplete rows, at O0 and O2.
 
