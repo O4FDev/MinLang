@@ -1,6 +1,6 @@
 # macOS binary distributions
 
-Minyar can be packaged with its exact LLVM **23.1.2** compiler, LLD linker,
+Minyar can be packaged with its exact LLVM **23.1.3** compiler, LLD linker,
 debug-symbol tool, compiler headers, standard library and prebuilt Minyar tools.
 Users do not need Homebrew, Python, Make, Git, or an existing LLVM installation.
 The installed toolchain never rebuilds itself. Generated files go into
@@ -73,11 +73,11 @@ LLVM. Remove stale overrides if `--doctor` reports an unexpected compiler.
 ## Build and qualify a release
 
 Run on a Mac of the target architecture with Python 3.9+, the Apple SDK and a
-native LLVM 23.1.2 prefix containing `clang`, `lld`, `dsymutil` and `lib/clang`:
+native LLVM 23.1.3 prefix containing `clang`, `lld`, `dsymutil` and `lib/clang`:
 
 ```sh
 make package-macos MINYAR_VERSION=0.1.0-rc1 \
-  MINYAR_LLVM_ROOT="$HOME/.cache/minyar/toolchains/llvm-23.1.2"
+  MINYAR_LLVM_ROOT="$HOME/.cache/minyar/toolchains/llvm-23.1.3"
 mkdir -p build/release-test
 tar -xzf build/releases/minyar-0.1.0-rc1-macos-arm64.tar.gz -C build/release-test
 make check-macos-distribution \

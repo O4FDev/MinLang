@@ -3,7 +3,7 @@ export LC_ALL=C
 test "$(uname -s)" = Linux
 clang=${MINYAR_TEST_CLANG:-/usr/lib/llvm-23/bin/clang}
 fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}
-"$clang" --version | head -1 | grep -F '23.1.2'
+"$clang" --version | head -1 | grep -F '23.1.3'
 mkdir -p 'build'
 work=$(mktemp -d "$PWD/build/erofs-layers-check.XXXXXXXX")
 fallback=''

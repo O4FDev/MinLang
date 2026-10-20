@@ -7,6 +7,7 @@ use "../../library/device.min" as device
 use "./library/machine.min" as machine
 use "./library/model.min" as model
 use "process" as processInfo
+use "simulation" as simulation
 
 function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
 
@@ -145,7 +146,156 @@ function memoryCopy() {
     check(device.load8(memory, 79) == 0, "oracle: Memory copy must not touch trailing sentinel")
 }
 
+// Seeded fault campaign. A simulation World makes every device decision, so a
+// seed replays the exact interleaving of delayed/reordered/duplicate TX
+// completions, missed and spurious interrupts, and well-formed, errored and
+// multi-descriptor (oversized) RX frames. Same seed => same transcript.
+function seededCheck(seed: Integer, condition: Boolean, message: Text) {
+    if !condition { fail("seeded campaign seed " + Text(seed) + ": " + message) }
+}
+
+function seededFrame(world: simulation.World, ordinal: Integer, length: Integer): Bytes {
+    let bytes = Bytes(length)
+    let salt = simulation.choose(world, 256)
+    for index in 0..length { bytes[index] = (ordinal * 31 + salt + index * 7) & 255 }
+    return bytes
+}
+
+function digestText(value: Integer, text: Text): Integer {
+    let result = value
+    for byte in Bytes(text) { result = wrappingAdd(wrappingMultiply(result, 1099511628211), byte) }
+    return result
+}
+
+function seededPoll(adapter: e1000.Adapter, seed: Integer, expected: List<Bytes>, delivered: Integer): Integer {
+    let frame = e1000.receive(adapter)
+    if frame.length == 0 { return delivered }
+    seededCheck(seed, delivered < expected.length, "driver delivered a frame no well-formed descriptor carried (" + Text(frame.length) + " bytes)")
+    seededCheck(seed, same(frame, expected[delivered]), "driver delivered frame " + Text(delivered) + " with the wrong bytes")
+    return delivered + 1
+}
+
+record CampaignTotals { sent: Integer; delivered: Integer; malformed: Integer; duplicates: Integer; spurious: Integer; missed: Integer }
+
+function seededRun(seed: Integer, steps: Integer, totals: CampaignTotals) {
+    let adapter = boot()
+    let world = simulation.create(seed)
+    let txSlots: List<Integer> = []
+    let txGenerations: List<Integer> = []
+    let sent = 0
+    let expected: List<Bytes> = []
+    let delivered = 0
+    let rxDevice = 0
+    let malformed = 0
+    let duplicates = 0
+    let spurious = 0
+    let missed = 0
+    for step in 0..steps {
+        let action = simulation.choose(world, 6)
+        if action == 0 {
+            let slot = adapter.transmitNext
+            let bytes = seededFrame(world, sent, 1 + simulation.choose(world, 64))
+            if e1000.send(adapter, bytes) {
+                seededCheck(seed, same(model.transmitted(sent), bytes), "published TX bytes differ")
+                sent += 1
+                txSlots.add(slot)
+                txGenerations.add(model.transmitGeneration(slot))
+                simulation.submitTimer(world, simulation.choose(world, 8), txSlots.length - 1)
+            }
+        } else if action == 1 {
+            if simulation.pendingCount(world) > 0 {
+                let token = simulation.next(world).token
+                let interrupt = simulation.choose(world, 2) == 1
+                if !interrupt { missed += 1 }
+                seededCheck(seed, model.completeTransmit(txSlots[token], txGenerations[token], interrupt), "TX completion for an owned slot was refused")
+                if simulation.choose(world, 4) == 0 {
+                    duplicates += 1
+                    seededCheck(seed, !model.completeTransmit(txSlots[token], txGenerations[token], false), "duplicate TX completion was accepted")
+                }
+            }
+        } else if action == 2 {
+            let free = 63 - (rxDevice - adapter.receiveNext + 64) % 64
+            let kind = simulation.choose(world, 4)
+            let interrupt = simulation.choose(world, 2) == 1
+            if kind <= 1 && free >= 1 {
+                let bytes = seededFrame(world, 1000 + expected.length, 1 + simulation.choose(world, 2048))
+                seededCheck(seed, model.receiveInto(rxDevice, model.receiveGeneration(rxDevice), bytes, bytes.length, 3, 0, interrupt), "device could not write an owned RX slot")
+                expected.add(bytes)
+                rxDevice = (rxDevice + 1) % 64
+            } else if kind == 2 && free >= 1 {
+                let bytes = seededFrame(world, 2000 + malformed, 1 + simulation.choose(world, 2048))
+                let errors = 1 + simulation.choose(world, 255)
+                seededCheck(seed, model.receiveInto(rxDevice, model.receiveGeneration(rxDevice), bytes, bytes.length, 3, errors, interrupt), "device could not write an owned RX slot")
+                malformed += 1
+                rxDevice = (rxDevice + 1) % 64
+            } else if kind == 3 && free >= 2 {
+                // An oversized frame spans two descriptors: the first lacks EOP,
+                // the tail has EOP and looks like a whole frame on its own.
+                let head = seededFrame(world, 3000 + malformed, 2048)
+                seededCheck(seed, model.receiveInto(rxDevice, model.receiveGeneration(rxDevice), head, 2048, 1, 0, false), "device could not write an owned RX slot")
+                rxDevice = (rxDevice + 1) % 64
+                let tail = seededFrame(world, 4000 + malformed, 1 + simulation.choose(world, 64))
+                seededCheck(seed, model.receiveInto(rxDevice, model.receiveGeneration(rxDevice), tail, tail.length, 3, 0, interrupt), "device could not write an owned RX slot")
+                rxDevice = (rxDevice + 1) % 64
+                malformed += 1
+            }
+        } else if action == 3 {
+            delivered = seededPoll(adapter, seed, expected, delivered)
+        } else if action == 4 {
+            // A spurious or duplicated interrupt only wakes the driver.
+            spurious += 1
+            model.wakeOnly()
+            seededCheck(seed, model.takeWake(), "wake was lost")
+            delivered = seededPoll(adapter, seed, expected, delivered)
+        } else {
+            simulation.advance(world, 1)
+        }
+    }
+    while simulation.pendingCount(world) > 0 {
+        let token = simulation.next(world).token
+        seededCheck(seed, model.completeTransmit(txSlots[token], txGenerations[token], false), "drained TX completion was refused")
+    }
+    let polls = 0
+    while polls < 200 {
+        delivered = seededPoll(adapter, seed, expected, delivered)
+        polls += 1
+    }
+    seededCheck(seed, delivered == expected.length, "only " + Text(delivered) + " of " + Text(expected.length) + " well-formed frames were delivered")
+    seededCheck(seed, adapter.received == expected.length, "driver counted " + Text(adapter.received) + " frames, expected " + Text(expected.length))
+    seededCheck(seed, model.transmittedCount() == sent && adapter.sent == sent, "TX count mismatch")
+    let digest = digestText(seed, model.events())
+    for line in simulation.transcript(world) { digest = digestText(digest, line) }
+    print("seed " + Text(seed) + ": tx " + Text(sent) + ", rx " + Text(delivered) + ", malformed " + Text(malformed) + ", duplicate completions " + Text(duplicates) + ", spurious IRQs " + Text(spurious) + ", decisions " + Text(simulation.choices(world).length) + ", trace " + Text(digest))
+    totals.sent += sent; totals.delivered += delivered; totals.malformed += malformed
+    totals.duplicates += duplicates; totals.spurious += spurious; totals.missed += missed
+}
+
+function decimal(text: Text): Integer {
+    let value = 0
+    check(text.length > 0 && text.length < 10, "seeded arguments are small decimal numbers")
+    for byte in Bytes(text) {
+        check(byte >= 48 && byte <= 57, "seeded arguments are small decimal numbers")
+        value = value * 10 + byte - 48
+    }
+    return value
+}
+
+function seededCampaign(first: Integer, count: Integer, steps: Integer) {
+    let totals = CampaignTotals { sent: 0; delivered: 0; malformed: 0; duplicates: 0; spurious: 0; missed: 0 }
+    for seed in first..first + count { seededRun(seed, steps, totals) }
+    // A campaign that never exercised a fault proves nothing about it.
+    if count >= 4 {
+        check(totals.sent > 0 && totals.delivered > 0, "seeded campaign never moved traffic")
+        check(totals.malformed > 0 && totals.duplicates > 0 && totals.spurious > 0 && totals.missed > 0, "seeded campaign missed a fault class")
+    }
+    print("SEEDED PASS seeds " + Text(first) + ".." + Text(first + count - 1) + ", " + Text(steps) + " steps each: " + Text(totals.sent) + " frames sent, " + Text(totals.delivered) + " delivered, " + Text(totals.malformed) + " malformed dropped, " + Text(totals.duplicates) + " duplicate completions refused, " + Text(totals.missed) + " missed and " + Text(totals.spurious) + " spurious interrupts")
+}
+
 function main(): Integer {
+    if processInfo.argumentCount() == 4 && processInfo.argument(0) == "seeded" {
+        seededCampaign(decimal(processInfo.argument(1)), decimal(processInfo.argument(2)), decimal(processInfo.argument(3)))
+        return 0
+    }
     check(processInfo.argumentCount() == 1, "driver fixture needs exactly one scenario")
     let scenario = processInfo.argument(0)
     if scenario == "unknown-address" { machine.read8(0x1234); fail("oracle: unknown address accepted") }

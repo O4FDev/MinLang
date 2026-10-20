@@ -18,12 +18,12 @@ support into `$HOME/.local/lib/minyar`. The installed command works independentl
 of the source checkout. Use `make install PREFIX=/another/prefix` for a different
 location; its `bin` directory must be on `PATH`. Re-running the installer publishes
 a new toolchain without modifying the previous installation's files.
-Source installations require LLVM **23.1.2**, Make, zsh and system C headers;
+Source installations require LLVM **23.1.3**, Make, zsh and system C headers;
 follow the [toolchain setup](toolchain.md), then select the pinned Clang with
 `MINYAR_CLANG` and `LLVM_CC`. `minyar --doctor`
 checks the installation. Project commands currently require macOS or Linux.
 
-Clang installed at `$HOME/.cache/minyar/toolchains/llvm-23.1.2/bin/clang`
+Clang installed at `$HOME/.cache/minyar/toolchains/llvm-23.1.3/bin/clang`
 is discovered automatically by the launcher, link driver and Make. Explicit
 `MINYAR_CLANG` and `LLVM_CC` selections take precedence. The default fallback
 is `clang` on macOS and `clang-23` elsewhere; all selections are version checked.

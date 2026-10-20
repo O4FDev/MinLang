@@ -1,9 +1,9 @@
 # Linux distributions
 
 `make package-linux` builds a native release containing Minyar, its standard
-library, LLVM 23.1.2, Clang resource headers and the matching LLD linker. Running
+library, LLVM 23.1.3, Clang resource headers and the matching LLD linker. Running
 the release does not need Make, Python, zsh or an existing LLVM installation.
-The build host needs Python 3.9+, Make, zsh, binutils and native LLVM 23.1.2.
+The build host needs Python 3.9+, Make, zsh, binutils and native LLVM 23.1.3.
 
 The initial runtime contract is glibc 2.39 or newer, with the build's OS runtime
 libraries and C development files installed. Ubuntu 24.04 ARM64 is the initial

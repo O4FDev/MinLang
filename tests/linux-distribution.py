@@ -39,7 +39,7 @@ def main():
         assert not Path("/usr/lib/llvm-23").exists(), "qualification host has system LLVM"
     distribution = args.distribution.resolve()
     metadata = json.loads((distribution / "distribution.json").read_text())
-    assert metadata["platform"] == "linux" and metadata["llvm"] == "23.1.2"
+    assert metadata["platform"] == "linux" and metadata["llvm"] == "23.1.3"
     for path, expected in metadata["files"].items():
         assert hashlib.sha256((distribution / path).read_bytes()).hexdigest() == expected, f"release checksum mismatch: {path}"
     for frontend in (distribution / "tools").glob("*-cli.min"):

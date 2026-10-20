@@ -64,6 +64,7 @@ class Case:
     normal_helper: str | None = None
     ordinary_signals: tuple = ()
     host_output: str | None = None
+    message: str | None = None
 
 
 def root(body="signalInterrupt(0)", vector="@VECTOR@", name="irqProof"):
@@ -214,6 +215,34 @@ def matrix():
         source = root(shadow)
         cases.append(Case("local-shadow-cannot-bypass-effects-" + name, "compatibility", source, False,
                           ("indirect", "callback", "managed", "alloc"), control=ordinary(source)))
+    # A handler reads and acknowledges its device through fixed-width MMIO
+    # and (x86) port I/O; these compiler intrinsics neither allocate nor wait.
+    device = 'use "machine" as machine\n'
+    cases.append(Case("device-mmio-acknowledge", "positive", device + root(
+        "let status = machine.read32(268435480); if (status & 16) != 0 { machine.write32(268435524, 2047) }; machine.fence(); signalInterrupt(0)")))
+    cases.append(Case("device-mmio-widths", "positive", device + root(
+        "let a = machine.read8(4096); let b = machine.read16(4098); let c = machine.read64(4104); machine.write8(4096, a); machine.write16(4098, b); machine.write64(4104, c)"), signal_slots=()))
+    cases.append(Case("device-port-acknowledge", "positive", device + root(
+        "let key = machine.in8(96); machine.out8(32, 32); if key != 0 { signalInterrupt(1) }"), signal_slots=(1,), target="x86_64"))
+    cases.append(Case("device-port-on-arm64", "effect", device + root("machine.out8(32, 32)"), False,
+                      ("native", "machine", "interrupt-safe"), target="arm64"))
+    for name, call in (("halt", "machine.halt()"), ("wait-for-interrupt", "machine.waitForInterrupt()"),
+                       ("enable-interrupts", "machine.enableInterrupts()"), ("pause-spin", "machine.pause()")):
+        cases.append(Case("device-" + name, "effect", device + root(call), False, ("native", "machine", "block"),
+                          control=ordinary(device + root(call))))
+    # Exact plain-English reasons for representative real-bug classes.
+    messages = {
+        "sleep-helper": "sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep",
+        "serialization-lock-helper": "calls native code (library 'sync') that the compiler cannot prove interrupt-safe",
+        "loop-built-lock-direct": "loops are not allowed in interrupt context: a wait or spin loop can block forever",
+        "format-allocation-helper": "uses managed Text: managed values allocate and change reference counts",
+        "float-state-direct": "uses Float, whose floating-point state interrupt entry does not save",
+    }
+    for case in cases:
+        if case.name in messages:
+            case.message = messages[case.name]
+    if any(not any(case.name == name for case in cases) for name in messages):
+        raise Failure("message expectation names an unknown case")
     return cases
 
 
@@ -426,6 +455,44 @@ def no_cycle(edges, label):
         visit(node)
 
 
+def device_templates(target):
+    """Exact compiler-generated device intrinsic bodies an IRQ graph may call.
+    Independent of the compiler: one volatile access, port access or fence."""
+    result = {}
+    for width in ("8", "16", "32", "64"):
+        kind = "i" + width
+        extend = f"%value = zext {kind} %loaded to i64" if width != "64" else "%value = add i64 %loaded, 0"
+        narrow = f"%narrow = trunc i64 %argument.1 to {kind}" if width != "64" else "%narrow = add i64 %argument.1, 0"
+        result["read" + width] = (f"%address = inttoptr i64 %argument.0 to ptr\n%loaded = load volatile {kind}, ptr %address, align 1\n"
+                                  f"{extend}\nret i64 %value\n")
+        result["write" + width] = (f"%address = inttoptr i64 %argument.0 to ptr\n{narrow}\n"
+                                   f"store volatile {kind} %narrow, ptr %address, align 1\nret void\n")
+    result["fence"] = "fence seq_cst\nret void\n"
+    if target == "arm64":
+        result["fence-arm64"] = 'call void asm sideeffect "dmb sy", "~{memory}"()\nret void\n'
+    if target == "x86_64":
+        clobbers = "~{dirflag},~{fpsr},~{flags}"
+        for width, register, suffix in (("8", "al", "b"), ("16", "ax", "w"), ("32", "eax", "l")):
+            kind = "i" + width
+            result["in" + width] = (f'%port = trunc i64 %argument.0 to i16\n%loaded = call {kind} asm sideeffect "in{suffix} $1, $0", '
+                                    f'"={{{register}}},{{dx}},{clobbers}"(i16 %port)\n%value = zext {kind} %loaded to i64\nret i64 %value\n')
+            result["out" + width] = (f"%port = trunc i64 %argument.0 to i16\n%narrow = trunc i64 %argument.1 to {kind}\n"
+                                     f'call void asm sideeffect "out{suffix} $0, $1", "{{{register}}},{{dx}},{clobbers}"({kind} %narrow, i16 %port)\nret void\n')
+    return {name: tokens("entry:\n" + body) for name, body in result.items()}
+
+
+def device_intrinsic(definitions, callee, target):
+    """The callee is an ordinary compiled machine intrinsic with an exact body."""
+    if callee not in definitions:
+        return False
+    header, body = definitions[callee]
+    words = tokens(body)
+    signature = tokens(header)
+    if "internal" not in signature or "alwaysinline" not in signature:
+        return False
+    return any(words == template and callee.endswith("_" + name.split("-")[0]) for name, template in device_templates(target).items())
+
+
 def audit_ir(ir, case, target):
     definitions = functions(ir)
     metadata = re.findall(r"^; minyar-interrupt: vector=(\d+) root=(\d+) clone=(\S+) target=(\S+)\s*$", ir, re.MULTILINE)
@@ -476,6 +543,9 @@ def audit_ir(ir, case, target):
         for callee, position in calls:
             # The frozen first policy permits no llvm.* intrinsic, even pure
             # sounding ones. Never replace proof with a wildcard name exception.
+            if device_intrinsic(definitions, callee, target):
+                allowed_globals.add(position)
+                continue
             if not callee.startswith(".minyar.irq.body.") or callee not in definitions:
                 raise Failure("unclassified/non-cloned callee in IRQ graph: " + name + " -> " + callee)
             edges.setdefault(name, []).append(callee)
@@ -635,6 +705,8 @@ class Runner:
             raise Failure(case.name + ": missing expected diagnostic family\n" + errors)
         if any(name.lower() not in lower for name in case.chain):
             raise Failure(case.name + ": missing transitive root-to-effect chain\n" + errors)
+        if case.message and case.message not in errors:
+            raise Failure(case.name + ": diagnostic must explain the rule: " + case.message + "\n" + errors)
         return None
 
     def assembly(self, case, target, ir, roots):

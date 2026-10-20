@@ -29,7 +29,10 @@ The linked fixture accepts one scenario argument:
 | unknown-address, port | Hard model failure without foreign dereference or port execution |
 | unpublished, unacquired | Hard model failure for missing publication/acquire fences |
 | bad-descriptor | A bad DMA address hard-fails inside owned-address lookup |
-| rx-oversized, rx-fragment, rx-error | Reject the frame without increasing received; retained red oracles for the current driver |
+| rx-oversized, rx-fragment, rx-error | Reject the frame without increasing received |
+| tx-oversized | An empty or larger-than-buffer frame is refused, never truncated |
+| rx-fragment-tail | An oversized frame is dropped through its end-of-packet tail (Linux CVE-2009-4536) |
+| seeded FIRST COUNT STEPS | Seeded fault campaign (below) |
 
 The model retains every registered Bytes owner and checks its address/size remain
 stable. The sole native call is the actual raw machine `address(Bytes)` intrinsic.
@@ -44,10 +47,24 @@ not a claim that the driver can identify arbitrary stale physical DMA writes.
 The model samples each TX doorbell immediately and stages that DMA packet while
 allowing DD completion to be delayed/reordered. It models descriptor protocol,
 not Ethernet filtering/padding/FCS or arbitrary NIC timing. RX reserves one tail
-slot, consistent with QEMU's head != tail availability. Fault scripts are explicit
-and deterministic, with seed7 payloads/transcripts. A systems simulation World
-adapter and delayed/coalesced doorbell sampling are pending; no simulation library
-or driver implementation is copied here.
+slot, consistent with QEMU's head != tail availability.
 
-Source authored and statically reviewed only. Compilation, execution, sanitizer
-and real-guest evidence must be supplied by the parent qualifier.
+## Seeded fault campaign
+
+`driver seeded FIRST COUNT STEPS` runs COUNT seeds. For each seed a
+`simulation.World` (library/simulation.min) makes every device decision: when to
+send, when each TX completion fires (delayed and reordered through World
+timers), duplicate completions, missed and spurious interrupts, and RX frames
+that are well formed, errored, or oversized two-descriptor chains. After a drain
+it checks that every well-formed frame arrived exactly once and in order, no
+malformed frame or fragment tail was ever delivered, and the TX bytes match.
+Each seed prints a trace digest over the World transcript and the model's event
+log, so `tests/osdev-devices.min` requires identical output at -O0 and -O2: the
+same seed replays the same interleaving. A failure names its seed; rerun with
+`seeded SEED 1 STEPS` to reproduce it.
+
+Before the driver fix the campaign failed on seed 1 (a malformed frame was
+delivered). With only an end-of-packet and error check it still failed on seed
+1: the tail of an oversized frame was delivered as a frame, the CVE-2009-4536
+bug class. The driver now drops a multi-descriptor frame up to and including its
+tail.

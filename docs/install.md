@@ -94,7 +94,7 @@ do not create a host, upload, push or publish anything.
 
 ```sh
 make package-macos MINYAR_VERSION=0.1.0 \
-  MINYAR_LLVM_ROOT="$HOME/.cache/minyar/toolchains/llvm-23.1.2"
+  MINYAR_LLVM_ROOT="$HOME/.cache/minyar/toolchains/llvm-23.1.3"
 python3 install/prepare-release.py \
   --archive build/releases/minyar-0.1.0-macos-arm64.tar.gz \
   --version 0.1.0 \

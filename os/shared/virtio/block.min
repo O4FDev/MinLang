@@ -17,6 +17,8 @@ public record Drive {
     private requests: virtio.Queue
     // The header at 0, the status byte at STATUS, the data from DATA.
     private request: device.Memory
+    // DMA address of the data area, made once so reads allocate none.
+    private data: device.DeviceAddress
     // The disk's size in sectors.
     sectors: Integer
 }
@@ -34,11 +36,10 @@ public function open(devices: List<pci.Device>): Drive {
     let requests = virtio.openQueue(opened, 0, 4)
     virtio.ready(opened)
     let request = device.allocate(DATA + BATCH * SECTOR, 4096)
-    let base = device.addressOf(request, 0)
-    virtio.describe(requests, 0, base, 16, virtio.NEXT, 1)
-    virtio.describe(requests, 2, base + STATUS, 1, virtio.WRITE, 0)
+    virtio.describe(requests, 0, device.deviceAddress(request, 0), 16, virtio.NEXT, 1)
+    virtio.describe(requests, 2, device.deviceAddress(request, STATUS), 1, virtio.WRITE, 0)
     let capacity = device.readAt32(virtio.configuration(opened), 0) | (device.readAt32(virtio.configuration(opened), 4) << 32)
-    return Drive { opened: opened; requests: requests; request: request; sectors: capacity }
+    return Drive { opened: opened; requests: requests; request: request; data: device.deviceAddress(request, DATA); sectors: capacity }
 }
 
 // Read `count` sectors from `sector`.
@@ -55,10 +56,13 @@ public function read(drive: Drive, sector: Integer, count: Integer): Bytes {
         device.store32(drive.request, 4, 0)
         device.store64(drive.request, 8, sector + done)
         device.store8(drive.request, STATUS, 0xFF)
-        virtio.describe(drive.requests, 1, device.addressOf(drive.request, DATA), bytes, virtio.NEXT | virtio.WRITE, 2)
+        virtio.describe(drive.requests, 1, drive.data, bytes, virtio.NEXT | virtio.WRITE, 2)
         virtio.complete(drive.requests, 0)
-        if !used.validLength(drive.requests.length, bytes + 1, bytes + 1) {
-            fail("virtio disk reported an invalid read length")
+        // The device reports how many bytes it wrote: all the data, then the
+        // status byte. Anything shorter leaves stale bytes in the buffer.
+        let wrote = drive.requests.length
+        if !used.validLength(wrote, bytes + 1, bytes + 1) {
+            fail("the disk wrote " + Text(wrote) + " bytes for a " + Text(bytes) + "-byte read of sector " + Text(sector + done))
         }
         let status = device.load8(drive.request, STATUS)
         if status != 0 {

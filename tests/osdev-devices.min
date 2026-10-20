@@ -20,6 +20,7 @@ if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.ins
 let platform = test.run(["uname", "-s"], environment, "", path + ".platform", 10)
 test.require(platform, "host device-model platform")
 let failures: List<Text> = []
+let campaigns: List<Text> = []
 for optimization in ["-O0", "-O2"] {
     let command = [compiler.clang, optimization, "-Wno-override-module", "-ffunction-sections", "-fdata-sections"]
     for flag in compiler.flags { command.add(flag) }
@@ -43,6 +44,17 @@ for optimization in ["-O0", "-O2"] {
             "model safety oracle " + rejected[index] + " " + optimization + "\n" + result.output + result.errorOutput)
     }
     print(optimization + ": 8 actual-driver positives and 5 model safety rejections passed")
+    // Seeded fault campaign: the simulation World chooses delayed/reordered/
+    // duplicate completions, missed/spurious IRQs and malformed RX descriptors.
+    // A seed replays exactly, so the transcript must match across runs and -O levels.
+    // Sanitized builds run the same campaign over fewer seeds.
+    let seeds = 40
+    if test.addressEnabled(compiler.flags) { seeds = 6 }
+    let result = test.run([path + ".exe", "seeded", "1", Text(seeds), "300"], environment, "", path + optimization + "-seeded", 120)
+    test.check(result.status == 0 && result.errorOutput == "" && test.contains(result.output, "SEEDED PASS seeds 1.." + Text(seeds)),
+        "seeded e1000 fault campaign " + optimization + "\n" + result.output + result.errorOutput)
+    campaigns.add(result.output)
+    print(optimization + ": seeded fault campaign passed (" + Text(seeds) + " seeds x 300 steps)")
     if !positiveOnly {
         let malformed = ["rx-oversized", "rx-fragment", "rx-error"]
         let reasons = ["oversized", "fragmented", "errored"]
@@ -59,6 +71,10 @@ for optimization in ["-O0", "-O2"] {
         }
     }
 }
+for index in 1..campaigns.length {
+    test.check(campaigns[index] == campaigns[0], "seeded campaign transcripts must replay identically across runs and optimization levels")
+}
+print("seeded campaign replayed identically: " + Text(campaigns.length) + " runs")
 if positiveOnly { print("narrow bring-up only: oversized/fragment/error RX rejection oracles were not run") }
 test.check(failures.length == 0, "actual e1000 still violates " + Text(failures.length) + " retained RX rejection oracles; logs: " + compiler.directory)
 test.removeTree(compiler.directory)

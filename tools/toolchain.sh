@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-llvm_version=23.1.2
+llvm_version=23.1.3
 tab=$(printf '\t')
 cr=$(printf '\r')
 newline='

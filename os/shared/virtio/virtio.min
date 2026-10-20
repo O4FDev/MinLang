@@ -134,9 +134,9 @@ public function configuration(opened: Device): device.Registers {
     return opened.configuration
 }
 
-function writeAddress(common: device.Registers, offset: Integer, address: Integer) {
-    device.writeAt32(common, offset, address & 0xFFFFFFFF)
-    device.writeAt32(common, offset + 4, address >> 32)
+function writeAddress(common: device.Registers, offset: Integer, address: device.DeviceAddress) {
+    device.writeAt32(common, offset, device.addressLow(address))
+    device.writeAt32(common, offset + 4, device.addressHigh(address))
 }
 
 // Set up queue `index` with at most `size` descriptors (a power of two).
@@ -153,9 +153,9 @@ public function openQueue(opened: Device, index: Integer, size: Integer): Queue 
     let used = device.allocate(6 + count * 8, 4)
     let outstanding: List<Boolean> = []
     for slot in 0..count { outstanding.add(false) }
-    writeAddress(common, 0x20, device.addressOf(descriptors, 0))
-    writeAddress(common, 0x28, device.addressOf(available, 0))
-    writeAddress(common, 0x30, device.addressOf(used, 0))
+    writeAddress(common, 0x20, device.deviceAddress(descriptors, 0))
+    writeAddress(common, 0x28, device.deviceAddress(available, 0))
+    writeAddress(common, 0x30, device.deviceAddress(used, 0))
     let notifyAddress = opened.notifyBase + device.readAt16(common, 0x1E) * opened.notifyMultiplier
     device.writeAt16(common, 0x1C, 1)
     return Queue {
@@ -172,9 +172,10 @@ public function ready(opened: Device) {
 
 // Fill descriptor `slot`: a buffer at a physical address, with NEXT and WRITE
 // flags and the following descriptor when NEXT is set.
-public function describe(queue: Queue, slot: Integer, address: Integer, length: Integer, flags: Integer, next: Integer) {
+// `address` is a DMA address from device.deviceAddress, never a CPU pointer.
+public function describe(queue: Queue, slot: Integer, address: device.DeviceAddress, length: Integer, flags: Integer, next: Integer) {
     let at = slot * 16
-    device.store64(queue.descriptors, at, address)
+    device.storeAddress(queue.descriptors, at, address)
     device.store32(queue.descriptors, at + 8, length)
     device.store16(queue.descriptors, at + 12, flags)
     device.store16(queue.descriptors, at + 14, next)
@@ -228,16 +229,24 @@ public function collect(queue: Queue): Integer {
 }
 
 // Offer one chain, notify, and wait for the device to finish it.
+// The device must hand back the chain that was offered: a used entry for any
+// other descriptor (stale, duplicated or forged) would let the caller read a
+// buffer the device has not filled, so it stops instead.
 public function complete(queue: Queue, head: Integer) {
     offer(queue, head)
     notify(queue)
     let spins = 0
-    while collect(queue) < 0 {
+    let finished = collect(queue)
+    while finished < 0 {
         machine.pause()
         spins += 1
         if spins > 100000000 {
             fail("a virtio device did not answer")
         }
+        finished = collect(queue)
+    }
+    if finished != head {
+        fail("virtio device completed chain " + Text(finished) + " instead of the offered chain " + Text(head))
     }
 }
 record EntropyDmaState { attempted: Boolean }

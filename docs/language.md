@@ -1772,6 +1772,19 @@ e1000 driver uses `sizeOf` and `offsetOf` on its 16-byte descriptors, so strides
 and offsets come from the declared layout. Those queries are compile-time values;
 they do not create a record. Packed layouts describe storage and do not make
 ordinary record field accesses into volatile MMIO operations.
+
+A DMA address has its own type, `device.DeviceAddress`. Only
+`device.deviceAddress(memory, offset)` makes one, and descriptor fields take it
+through `device.storeAddress`; `addressLow` and `addressHigh` split it for base
+registers. Storing a CPU pointer, an offset or another Integer where the device
+expects a DMA address is a compile error:
+
+```text
+error: an argument passed to storeAddress has the wrong type; expected DeviceAddress, found Integer
+```
+
+A DeviceAddress is a small managed record, so make them while setting up rings.
+The e1000 driver does, and its per-packet path stores none.
 See [kernel development](os-development.md) for hosted driver tests, bounded
 QEMU tests, GDB and symbolized panic addresses.
 
@@ -1789,9 +1802,31 @@ Compile this context with `--freestanding --kernel-target x86_64` or `arm64`.
 PIC vectors 32..47 and GIC IDs 16..1019 are accepted respectively. A handler
 takes one Integer and returns Nothing. Its complete direct call graph must use
 scalar, acyclic code: allocation, managed values, Float, blocking, locks,
-native calls, indirect calls, recursion and loops reject. Ordinary functions
-keep their ordinary behavior. This context proof is separate from hardware
+native calls, indirect calls, recursion and loops reject. A handler may read and
+acknowledge its device: fixed-width MMIO (`machine.read8` to `machine.write64`),
+x86 port I/O (`machine.in8` to `machine.out32`) and `machine.fence()` are allowed,
+because each is one access or barrier. Halting, waiting, pausing and changing the
+interrupt mask are not. Ordinary functions keep their ordinary behavior. This context proof is separate from hardware
 entry, register preservation and a physical stack bound.
+
+A rejection names the path from the handler to the unsafe operation:
+
+```text
+error: interrupt context handles(42): linkChanged -> waitForLink -> sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep, take a lock or allocate
+```
+
+The check costs nothing at run time. Programs without interrupt handlers compile
+to the same LLVM IR as before, and a handler that only signals a flag compiles
+to one release store.
+
+```minyar
+use "machine" as machine
+
+interrupt function keyboard(vector: Integer) handles(33) {
+    let key = machine.in8(0x60)
+    if key != 0 { signalInterrupt(1) }
+}
+```
 
 `signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
 `takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.
@@ -1815,7 +1850,13 @@ print(dma.load8(completed, 0)) // 104
 dma.dispose(completed)
 ```
 
-Moving a Cpu or Pending binding makes its previous binding unavailable.
+Moving a Cpu or Pending binding makes its previous binding unavailable. Touching
+a buffer after handing it to the device is a compile error that says so:
+
+```text
+error: DMA ownership: 'buffer' was handed to the device by submit on line 5; the device owns it now, so the CPU cannot read or write it until reclaim returns the completed buffer
+```
+
 `load8`, `store8` and `copyOut` borrow Cpu; `ready` borrows Pending.
 `submit`, `reclaim`, `dispose` and `retire` consume their capability. Ordinary
 helpers consume affine arguments; only compiler-owned native primitives have
