@@ -1602,3 +1602,11 @@ exponents. Corrupt expected bits must fail both native and public-API probes.
 The sanitizer target adds ASan/UBSan to C and ASan to emitted LLVM. The helper
 also compiles to freestanding x86-64/ARM64 LLVM and objects, without claiming
 a linked kernel or execution there. See [JSON numbers](json-numbers.md).
+
+`make check-json-values` exercises public mutable object Lists through aliases,
+clear/truncate/pop, replacement and unequal appends. It checks strict, Result,
+optional and permissive access, matched INVALID children, explicit null,
+absent names, duplicate policy and deterministic `pretty` diagnostics at
+O0/O2. Normal returns use exact ownership/debt checks; deliberate fatal stops
+do not claim unwind cleanup. `check-json-values-sanitize` repeats these with
+a sanitized compiler, emitted-LLVM ASan and C runtime ASan/UBSan.

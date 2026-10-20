@@ -16,7 +16,7 @@ public constant INVALID = 6
 
 /// A JSON value: null, Boolean, number, string, array, object, or invalid input.
 /// `kind` identifies the form. Arrays use `items`; objects pair `keys` with
-/// `items`. An invalid value keeps its diagnostic in `text`.
+/// `items` of the same length. An invalid value keeps its diagnostic in `text`.
 public record Value {
     kind: Integer
     text: Text
@@ -407,10 +407,14 @@ function parseNumber(cursor: Cursor): Value {
 
 // ----- Access -----
 
+constant OBJECT_SHAPE_ERROR = "JSON object keys and items have different lengths"
+function objectShapeMatches(value: Value): Boolean { return value.keys.length == value.items.length }
+
 // Presence is independent of the member's kind: explicit null is present.
 /// Whether an object contains a name. A member whose value is null is still present.
+/// Malformed objects with unequal key/item lengths return false.
 public function hasMember(value: Value, name: Text): Boolean {
-    if value.kind != OBJECT { return false }
+    if value.kind != OBJECT || !objectShapeMatches(value) { return false }
     for key in value.keys { if key == name { return true } }
     return false
 }
@@ -422,6 +426,7 @@ public function hasMember(value: Value, name: Text): Boolean {
 /// Unlike `member`, a missing name stays distinguishable from explicit null.
 public function lookup(value: Value, name: Text): Value {
     if value.kind != OBJECT { return leaf(INVALID, "expected a JSON object", 0.0, false) }
+    if !objectShapeMatches(value) { return leaf(INVALID, OBJECT_SHAPE_ERROR, 0.0, false) }
     for index in 0..value.keys.length {
         if value.keys[index] == name { return value.items[index] }
     }
@@ -441,9 +446,9 @@ public function requireString(value: Value, name: Text): Value { return typedMem
 public function requireBoolean(value: Value, name: Text): Value { return typedMember(value, name, BOOLEAN, "a boolean") }
 public function requireNumber(value: Value, name: Text): Value { return typedMember(value, name, NUMBER, "a number") }
 
-/// Find an object member, returning a null value when the name is absent or the input is not an object.
+/// Find an object member, returning null for absent names, non-objects or unequal key/item lengths.
 public function member(value: Value, name: Text): Value {
-    if value.kind == OBJECT {
+    if value.kind == OBJECT && objectShapeMatches(value) {
         for index in 0..value.keys.length {
             if value.keys[index] == name {
                 return value.items[index]
@@ -492,9 +497,11 @@ public function quote(text: Text): Text {
 /// Write readable JSON with two spaces per nesting level.
 /// Pass an empty `indent` for a complete document; `Value.pretty("")` is the
 /// same operation in method form.
+/// Unequal object key/item lengths stop with a diagnostic.
 public function pretty(value: Value, indent: Text): Text {
     if value.kind == STRING { return quote(value.text) }
     if value.kind == OBJECT {
+        if !objectShapeMatches(value) { fail(OBJECT_SHAPE_ERROR) }
         if value.items.length == 0 { return "{}" }
         let parts: List<Text> = ["{\n"]
         for index in 0..value.items.length {
@@ -519,11 +526,11 @@ public function pretty(value: Value, indent: Text): Text {
     return value.text
 }
 
-/// Whether this object contains a name, including a member whose value is null.
+/// Whether this object contains a name, including null members. Unequal key/item lengths return false.
 public function Value.hasMember(name: Text): Boolean { return hasMember(self, name) }
 /// Look up a member while keeping a missing name distinguishable from explicit null.
 public function Value.lookup(name: Text): Value { return lookup(self, name) }
-/// Look up a member, returning a null value when the name is absent or this is not an object.
+/// Look up a member, returning null for absent names, non-objects or unequal key/item lengths.
 public function Value.member(name: Text): Value { return member(self, name) }
 /// Require a named string member; otherwise return an invalid value with a diagnostic.
 public function Value.requireString(name: Text): Value { return requireString(self, name) }
@@ -556,8 +563,12 @@ public function decodeUniqueBytesWithin(source: Bytes, maximumBytes: Integer, ma
 public function get(value: Value, name: Text): Result<Value, errors.Error> { return decoded(lookup(value, name)) }
 public function findMember(value: Value, name: Text): Result<Maybe<Value>, errors.Error> {
     if value.kind != OBJECT { return Err(errors.make(errors.invalidDataCode(), 0, "expected a JSON object")) }
+    if !objectShapeMatches(value) { return Err(errors.make(errors.invalidDataCode(), 0, OBJECT_SHAPE_ERROR)) }
     for index in 0..value.keys.length {
-        if value.keys[index] == name { return Ok(Some(value.items[index])) }
+        if value.keys[index] == name {
+            let found = try decoded(value.items[index])
+            return Ok(Some(found))
+        }
     }
     return Ok(None)
 }

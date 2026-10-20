@@ -1,0 +1,90 @@
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    use "json" as json
+    use "errors" as errors
+    function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+    function rejected(value: json.Value) {
+        let message = "JSON object keys and items have different lengths"
+        for name in ["first", "second", "absent"] {
+            match json.get(value, name) {
+                Ok(found) { fail("malformed get succeeded") }
+                Err(error) { check(error.code() == errors.invalidDataCode() && error.message() == message, "wrong get error") }
+            }
+            check(value.get(name).isErr(), "malformed get method succeeded")
+            match json.findMember(value, name) {
+                Ok(found) { fail("malformed optional lookup succeeded") }
+                Err(error) { check(error.code() == errors.invalidDataCode() && error.message() == message, "wrong optional error") }
+            }
+            check(value.findMember(name).isErr(), "malformed optional method succeeded")
+            check(json.lookup(value, name).kind == json.INVALID, "malformed strict lookup succeeded")
+            check(value.lookup(name).text == message, "wrong strict lookup diagnostic")
+            check(json.requireString(value, name).kind == json.INVALID, "malformed required string succeeded")
+            check(value.requireBoolean(name).kind == json.INVALID, "malformed required Boolean succeeded")
+            check(value.requireNumber(name).kind == json.INVALID, "malformed required number succeeded")
+            check(!json.hasMember(value, name) && !value.hasMember(name), "malformed object reported presence")
+            check(json.member(value, name).kind == json.NULL && value.member(name).kind == json.NULL, "malformed permissive lookup changed")
+            check(json.string(value, name) == "", "malformed permissive string changed")
+        }
+    }
+    let shorterItems = json.parse(#"{"first":"a","second":null}"#)
+    let itemAlias = shorterItems.items
+    itemAlias.clear()
+    rejected(shorterItems)
+    let shorterKeys = json.parse(#"{"first":"a","second":null}"#)
+    let keyAlias = shorterKeys.keys
+    keyAlias.clear()
+    rejected(shorterKeys)
+    let earlyMatch = json.parse(#"{"first":"a","second":null}"#)
+    earlyMatch.items.truncate(1)
+    rejected(earlyMatch)
+    let poppedKey = json.parse(#"{"first":"a","second":null}"#)
+    poppedKey.keys.pop()
+    rejected(poppedKey)
+    let extraItem = json.parse(#"{"first":"a","second":null}"#)
+    extraItem.items = extraItem.items.appended(json.parse("true"))
+    rejected(extraItem)
+    let extraKey = json.parse(#"{"first":"a","second":null}"#)
+    extraKey.keys.add("third")
+    rejected(extraKey)
+    let equalShape = json.parse(#"{"first":"a","second":null}"#)
+    equalShape.items[0] = json.parse(#""b""#)
+    equalShape.keys[0] = "renamed"
+    check(equalShape.get("renamed").unwrap().asText().unwrap() == "b", "equal-length edits lost shared mutation")
+    check(equalShape.findMember("first").unwrap().isNone(), "renamed key remained present")
+    check(equalShape.findMember("second").unwrap().unwrap().kind == json.NULL, "explicit null became absent")
+    let invalidChild = json.parse(#"{"first":"a","second":null}"#)
+    invalidChild.items[0] = json.parse("broken")
+    check(invalidChild.get("first").isErr(), "get accepted an invalid child")
+    match invalidChild.findMember("first") {
+        Ok(found) { fail("optional lookup accepted an invalid child") }
+        Err(error) { check(error.code() == errors.invalidDataCode() && error.message() == invalidChild.items[0].text, "invalid child error was lost") }
+    }
+    check(invalidChild.findMember("absent").unwrap().isNone(), "unrelated invalid child hid an absent name")
+    let array = json.parse("[0]")
+    array.items[0] = json.parse("broken")
+    check(array.element(0).isErr(), "array element accepted an invalid child")
+    let duplicate = json.parse(#"{"same":"first","same":"second"}"#)
+    check(duplicate.get("same").unwrap().asText().unwrap() == "first", "first duplicate policy changed")
+    check(duplicate.findMember("same").unwrap().unwrap().asText().unwrap() == "first", "optional duplicate policy changed")
+    check(!json.hasMember(json.parse("null"), "first"), "non-object presence changed")
+    print("JSON mutable value contracts passed")
+    """#
+fixtures.executes(frontend, source, "JSON mutable value contracts passed\n", ["-O0", "-O2"], 0, "", true)
+for mutation in ["value.items.clear()", "value.keys.clear()", "value.items.truncate(1)"] {
+    let malformed = "use \"json\" as json\nlet value = json.parse(#\"{\"first\":1,\"second\":2}\"#)\n" + mutation + "\nprint(value.pretty(\"\"))\n"
+    fixtures.executes(frontend, malformed, "", ["-O0", "-O2"], 1, "Minyar stopped: JSON object keys and items have different lengths\n", true)
+}
+let nested = #"""
+    use "json" as json
+    let child = json.parse(#"{"first":1}"#)
+    child.keys.clear()
+    let parent = json.parse("[null]")
+    parent.items[0] = child
+    print(parent.pretty(""))
+    """#
+fixtures.executes(frontend, nested, "", ["-O0", "-O2"], 1, "Minyar stopped: JSON object keys and items have different lengths\n", true)
+test.removeTree(frontend.compiler.directory)
+print("JSON mutable value checks: passed")

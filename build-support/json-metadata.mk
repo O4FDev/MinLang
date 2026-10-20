@@ -16,3 +16,13 @@ check-json-numbers-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitiz
 
 check check-portable: check-json-numbers
 check-sanitize: check-json-numbers-sanitize
+
+.PHONY: check-json-values check-json-values-sanitize
+check-json-values: build/minyarc build/minyar-runtime.o build/tooling/tests/json-values
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/json-values"
+
+check-json-values-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/json-values
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/json-values"
+
+check check-portable: check-json-values
+check-sanitize: check-json-values-sanitize

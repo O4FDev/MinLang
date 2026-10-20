@@ -1488,6 +1488,13 @@ JSON getters never coerce types. `findMember` returns `Result<Maybe<Value>,
 errors.Error>`: a non-object is an error, an absent member is `Ok(None)`, and
 an explicit JSON null is `Ok(Some(value))` with `value.kind == json.NULL`.
 `get` reports missing members, and `element` reports invalid array positions.
+The public `Value.keys` and `Value.items` Lists remain shared and mutable.
+Objects must keep their lengths equal. Member access checks this in constant
+time before searching: unequal lengths produce an invalid-data error from
+`get`/`findMember`, `INVALID` from `lookup`/`require*`, false from `hasMember`,
+and the usual null/empty fallback from `member`/`string`. `pretty` stops with
+`JSON object keys and items have different lengths`. Matched INVALID children
+also produce an invalid-data error from both `get` and `findMember`.
 `asInteger` parses the original signed decimal integer spelling exactly;
 fractional and exponent spellings use `asNumber`, which checks the finite
 Float range. Decimal conversion rounds once to the nearest Float, choosing the
