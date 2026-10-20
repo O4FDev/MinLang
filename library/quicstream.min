@@ -46,23 +46,43 @@ public function insert(stream: Stream, offset: Integer, data: Bytes, fin: Boolea
     if stream.reset { stream.delivered = stream.highest; return true }
     if end <= stream.delivered { return true }
     let begin = max(offset, stream.delivered)
-    let joined = data.slice(begin - offset, data.length)
-    let remaining: List<Segment> = []
-    let buffered = 0
+    // A duplicate fully covered by one buffered segment only needs its own
+    // bytes checked. Rebuilding the segment would amplify every tiny retry.
     for segment in stream.segments {
         let last = segment.offset + segment.data.length
-        if last < begin || segment.offset > end { remaining.add(segment); buffered += segment.data.length }
+        if segment.offset <= begin && last >= end {
+            for index in begin..end {
+                if data[index - offset] != segment.data[index - segment.offset] { return failInput(stream, "conflicting bytes at one stream offset") }
+            }
+            return true
+        }
+    }
+    let joined = data.slice(begin - offset, data.length)
+    let remaining: List<Segment> = []
+    let merging: List<Segment> = []
+    let buffered = 0
+    let first = begin
+    let limit = end
+    for segment in stream.segments {
+        let last = segment.offset + segment.data.length
+        if last < first || segment.offset > limit { remaining.add(segment); buffered += segment.data.length }
         else {
             for index in max(begin, segment.offset)..min(end, last) {
                 if joined[index - begin] != segment.data[index - segment.offset] { return failInput(stream, "conflicting bytes at one stream offset") }
             }
-            let first = min(begin, segment.offset); let limit = max(end, last)
-            if limit - first > 1048576 { return failInput(stream, "reassembly buffer limit exceeded") }
-            let combined = Bytes(limit - first)
-            for index in 0..joined.length { combined[begin - first + index] = joined[index] }
-            for index in 0..segment.data.length { combined[segment.offset - first + index] = segment.data[index] }
-            begin = first; end = limit; joined = combined
+            first = min(first, segment.offset); limit = max(limit, last); merging.add(segment)
         }
+    }
+    if limit - first > 1048576 { return failInput(stream, "reassembly buffer limit exceeded") }
+    // Copy an overlapping union once. Reallocating it for every fragment lets
+    // a bounded 512-fragment peer input cause hundreds of full-buffer copies.
+    if merging.length > 0 {
+        let combined = Bytes(limit - first)
+        for index in 0..joined.length { combined[begin - first + index] = joined[index] }
+        for segment in merging {
+            for index in 0..segment.data.length { combined[segment.offset - first + index] = segment.data[index] }
+        }
+        begin = first; end = limit; joined = combined
     }
     if buffered + joined.length + stream.incoming.length > 1048576 || remaining.length >= 512 { return failInput(stream, "reassembly memory or fragment count limit exceeded") }
     let ordered: List<Segment> = []; let added = false

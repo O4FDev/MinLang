@@ -19,6 +19,7 @@ public record Value {
 public record Result {
     private value: Value
     private consumed: Integer
+    private work: Integer
     private incomplete: Boolean
     private error: errors.Error
 }
@@ -26,6 +27,7 @@ record Cursor {
     source: Bytes
     position: Integer
     remainingNodes: Integer
+    work: Integer
     incomplete: Boolean
     error: errors.Error
 }
@@ -37,6 +39,7 @@ public function ok(result: Result): Boolean { return !errors.isError(result.erro
 public function incomplete(result: Result): Boolean { return result.incomplete }
 public function error(result: Result): errors.Error { return result.error }
 public function consumed(result: Result): Integer { return result.consumed }
+public function work(result: Result): Integer { return result.work }
 public function value(result: Result): Value {
     if !ok(result) { fail("cannot read a failed RESP result") }
     return result.value
@@ -62,26 +65,32 @@ function active(cursor: Cursor): Boolean { return !cursor.incomplete && !errors.
 // Limits: 2 MiB input, 1 MiB bulk, 4096-byte simple line, 1024 array members,
 // 4096 total values, and 16 levels of nested arrays.
 public function parse(source: Bytes): Result {
-    let cursor = Cursor { source: source; position: 0; remainingNodes: 4096; incomplete: false; error: errors.none() }
-    if source.length > 2097152 { invalid(cursor, "RESP input limit exceeded") }
+    return parseFrom(source, 0)
+}
+public function parseFrom(source: Bytes, start: Integer): Result {
+    let cursor = Cursor { source: source; position: start; remainingNodes: 4096; work: 0; incomplete: false; error: errors.none() }
+    if start < 0 || start > source.length { invalid(cursor, "invalid RESP input cursor") }
+    if active(cursor) && source.length - start > 2097152 { invalid(cursor, "RESP input limit exceeded") }
     let parsed = missing()
     if active(cursor) { parsed = parseValue(cursor, 0) }
     if errors.isError(cursor.error) {
-        return Result { value: missing(); consumed: 0; incomplete: false; error: cursor.error }
+        return Result { value: missing(); consumed: 0; work: cursor.work; incomplete: false; error: cursor.error }
     }
     if cursor.incomplete {
-        return Result { value: missing(); consumed: 0; incomplete: true; error: errors.make(errors.wouldBlockCode(), 0, "incomplete RESP reply") }
+        return Result { value: missing(); consumed: 0; work: cursor.work; incomplete: true; error: errors.make(errors.wouldBlockCode(), 0, "incomplete RESP reply") }
     }
-    return Result { value: parsed; consumed: cursor.position; incomplete: false; error: errors.none() }
+    return Result { value: parsed; consumed: cursor.position - start; work: cursor.work; incomplete: false; error: errors.none() }
 }
 
 function line(cursor: Cursor, limit: Integer): Bytes {
     let start = cursor.position
     while cursor.position < cursor.source.length {
         let byte = cursor.source[cursor.position]
+        cursor.work += 1
         if byte == 10 { invalid(cursor, "bare LF in RESP line"); return Bytes() }
         if byte == 13 {
             if cursor.position + 1 >= cursor.source.length { waiting(cursor); return Bytes() }
+            cursor.work += 1
             if cursor.source[cursor.position + 1] != 10 { invalid(cursor, "invalid RESP line delimiter"); return Bytes() }
             let result = cursor.source.slice(start, cursor.position)
             cursor.position += 2
@@ -107,6 +116,7 @@ function decimal(cursor: Cursor, text: Bytes, allowPlus: Boolean): Integer {
     let number = 0
     while position < text.length {
         let byte = text[position]
+        cursor.work += 1
         if byte < 48 || byte > 57 { invalid(cursor, "invalid RESP number"); return 0 }
         let digit = byte - 48
         if number < (minimum + digit) / 10 { invalid(cursor, "RESP integer overflow"); return 0 }
@@ -122,6 +132,7 @@ function parseValue(cursor: Cursor, depth: Integer): Value {
     cursor.remainingNodes -= 1
     if cursor.position >= cursor.source.length { waiting(cursor); return missing() }
     let tag = cursor.source[cursor.position]
+    cursor.work += 1
     cursor.position += 1
     if tag != 43 && tag != 45 && tag != 58 && tag != 36 && tag != 42 {
         invalid(cursor, "unknown RESP2 type")
@@ -147,6 +158,7 @@ function parseValue(cursor: Cursor, depth: Integer): Value {
         if remaining == number + 1 { waiting(cursor); return missing() }
         if cursor.source[end + 1] != 10 { invalid(cursor, "invalid RESP bulk delimiter"); return missing() }
         let data = cursor.source.slice(cursor.position, end)
+        cursor.work += number
         cursor.position = end + 2
         return scalar(BULK, data, 0)
     }

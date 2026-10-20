@@ -13,8 +13,9 @@ public constant DATA = 5
 public constant CLOSE = 6
 public constant START = 7
 constant BUFFER_LIMIT = 1048576
+constant COMPACT_AFTER = 65536
 
-public record Decoder { private buffer: Bytes; private ended: Boolean; private error: errors.Error }
+public record Decoder { private buffer: Bytes; private cursor: Integer; private ended: Boolean; private error: errors.Error }
 public record FrameResult { private error: errors.Error; private type: Integer; private id: Integer; private body: Bytes }
 public record MetadataResult { private error: errors.Error; private value: json.Value }
 public record OpenResult { private error: errors.Error; private grant: Bytes; private exit: Text; private connection: Text; private deadline: Integer }
@@ -25,7 +26,9 @@ public choice StatusResult {
 public record Device { private binding: auth.Binding; private hello: Boolean; private error: errors.Error }
 public record Relay {
     private error: errors.Error; private id: Integer; private exit: Text; private connection: Text
-    private stage: Integer; private status: Text; private incoming: Bytes; private outgoing: Bytes
+    private stage: Integer; private status: Text
+    private incoming: Bytes; private incomingCursor: Integer
+    private outgoing: Bytes; private outgoingCursor: Integer
 }
 
 function error(code: Integer, message: Text): errors.Error { return errors.make(code, 0, message) }
@@ -42,15 +45,22 @@ function validHeader(type: Integer, id: Integer, size: Integer): Boolean {
     if (type == HELLO || type == HEARTBEAT) != (id == 0) { return false }
     return type == CLOSE || size > 0
 }
-public function create(): Decoder { return Decoder { buffer: Bytes(); ended: false; error: errors.none() } }
+public function create(): Decoder { return Decoder { buffer: Bytes(); cursor: 0; ended: false; error: errors.none() } }
 public function decoderError(value: Decoder): errors.Error { return value.error }
-public function bufferedBytes(value: Decoder): Integer { return value.buffer.length }
+public function bufferedBytes(value: Decoder): Integer { return value.buffer.length - value.cursor }
+function clear(value: Decoder) { value.buffer = Bytes(); value.cursor = 0 }
 public function feed(value: Decoder, bytes: Bytes): errors.BooleanResult {
     if errors.isError(value.error) { return errors.booleanFailure(value.error) }
     if value.ended { return failure(errors.closedCode(), "wire input has ended") }
-    if bytes.length > BUFFER_LIMIT - value.buffer.length {
+    if bytes.length > BUFFER_LIMIT - bufferedBytes(value) {
         value.error = error(errors.invalidDataCode(), "wire buffer limit exceeded")
-        value.buffer = Bytes(); return errors.booleanFailure(value.error)
+        clear(value); return errors.booleanFailure(value.error)
+    }
+    // Keep take O(1) in the queued byte count. Compact only after a useful
+    // prefix has accumulated, so alternating small feeds and frames remain
+    // amortized linear while physical storage stays tightly bounded.
+    if value.cursor >= COMPACT_AFTER {
+        value.buffer = value.buffer.slice(value.cursor, value.buffer.length); value.cursor = 0
     }
     value.buffer.addBytes(bytes)
     return errors.boolean(true)
@@ -63,13 +73,13 @@ public function finish(value: Decoder): errors.BooleanResult {
     return errors.boolean(true)
 }
 function abandon(value: Decoder, message: Text): FrameResult {
-    value.error = error(errors.protocolCode(), message); value.buffer = Bytes()
+    value.error = error(errors.protocolCode(), message); clear(value)
     return frameFailure(value.error)
 }
 function incomplete(value: Decoder): FrameResult {
     if !value.ended { return frameFailure(error(errors.wouldBlockCode(), "incomplete wire frame")) }
-    if value.buffer.length == 0 { return frameFailure(error(errors.closedCode(), "wire input ended")) }
-    value.error = error(errors.truncatedCode(), "wire input ended inside a frame"); value.buffer = Bytes()
+    if bufferedBytes(value) == 0 { return frameFailure(error(errors.closedCode(), "wire input ended")) }
+    value.error = error(errors.truncatedCode(), "wire input ended inside a frame"); clear(value)
     return frameFailure(value.error)
 }
 function get32(bytes: Bytes, at: Integer): Integer {
@@ -77,14 +87,16 @@ function get32(bytes: Bytes, at: Integer): Integer {
 }
 public function take(value: Decoder): FrameResult {
     if errors.isError(value.error) { return frameFailure(value.error) }
-    if value.buffer.length < 16 { return incomplete(value) }
-    let bytes = value.buffer
-    if bytes[0] != 72 || bytes[1] != 80 || bytes[2] != 87 || bytes[3] != 49 || bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0 { return abandon(value, "invalid HPW1 magic or reserved flags") }
-    let type = bytes[4]; let id = get32(bytes, 8); let size = get32(bytes, 12)
+    let available = bufferedBytes(value)
+    if available < 16 { return incomplete(value) }
+    let bytes = value.buffer; let at = value.cursor
+    if bytes[at] != 72 || bytes[at + 1] != 80 || bytes[at + 2] != 87 || bytes[at + 3] != 49 || bytes[at + 5] != 0 || bytes[at + 6] != 0 || bytes[at + 7] != 0 { return abandon(value, "invalid HPW1 magic or reserved flags") }
+    let type = bytes[at + 4]; let id = get32(bytes, at + 8); let size = get32(bytes, at + 12)
     if !validHeader(type, id, size) { return abandon(value, "invalid wire kind, stream ID or length") }
-    if size > bytes.length - 16 { return incomplete(value) }
-    let body = bytes.slice(16, 16 + size)
-    value.buffer = bytes.slice(16 + size, bytes.length)
+    if size > available - 16 { return incomplete(value) }
+    let body = bytes.slice(at + 16, at + 16 + size)
+    value.cursor = at + 16 + size
+    if value.cursor == bytes.length { clear(value) }
     return FrameResult { error: errors.none(); type: type; id: id; body: body }
 }
 public function frameOk(value: FrameResult): Boolean { return !errors.isError(value.error) }
@@ -268,7 +280,7 @@ public function receiveDevice(value: Device, frame: FrameResult): errors.Boolean
 }
 
 public function createRelay(grant: auth.Grant, id: Integer): Relay {
-    let result = Relay { error: errors.none(); id: id; exit: ""; connection: ""; stage: 0; status: ""; incoming: Bytes(); outgoing: Bytes() }
+    let result = Relay { error: errors.none(); id: id; exit: ""; connection: ""; stage: 0; status: ""; incoming: Bytes(); incomingCursor: 0; outgoing: Bytes(); outgoingCursor: 0 }
     if !auth.grantOk(grant) { result.error = auth.grantError(grant) }
     else if id < 1 || id > 4294967295 { result.error = error(errors.invalidDataCode(), "invalid relay stream ID") }
     else { result.exit = auth.exitID(grant); result.connection = auth.connID(grant) }
@@ -282,10 +294,20 @@ function requireRelay(value: Relay) { if errors.isError(value.error) { fail("can
 public function relayExitID(value: Relay): Text { requireRelay(value); return value.exit }
 public function relayConnID(value: Relay): Text { requireRelay(value); return value.connection }
 public function relayStreamID(value: Relay): Integer { requireRelay(value); return value.id }
-public function incomingBytes(value: Relay): Integer { return value.incoming.length }
-public function outgoingBytes(value: Relay): Integer { return value.outgoing.length }
+public function incomingBytes(value: Relay): Integer { return value.incoming.length - value.incomingCursor }
+public function outgoingBytes(value: Relay): Integer { return value.outgoing.length - value.outgoingCursor }
+function clearIncoming(value: Relay) { value.incoming = Bytes(); value.incomingCursor = 0 }
+function clearOutgoing(value: Relay) { value.outgoing = Bytes(); value.outgoingCursor = 0 }
+function compactIncoming(value: Relay) {
+    if value.incomingCursor < COMPACT_AFTER { return }
+    value.incoming = value.incoming.slice(value.incomingCursor, value.incoming.length); value.incomingCursor = 0
+}
+function compactOutgoing(value: Relay) {
+    if value.outgoingCursor < COMPACT_AFTER { return }
+    value.outgoing = value.outgoing.slice(value.outgoingCursor, value.outgoing.length); value.outgoingCursor = 0
+}
 function relayFailure(value: Relay, message: Text): errors.BooleanResult {
-    value.error = error(errors.protocolCode(), message); value.incoming = Bytes(); value.outgoing = Bytes()
+    value.error = error(errors.protocolCode(), message); clearIncoming(value); clearOutgoing(value)
     return errors.booleanFailure(value.error)
 }
 public function receiveRelay(value: Relay, frame: FrameResult): errors.BooleanResult {
@@ -300,7 +322,8 @@ public function receiveRelay(value: Relay, frame: FrameResult): errors.BooleanRe
         return errors.boolean(true)
     }
     if frame.type == DATA && value.stage == 1 {
-        if frame.body.length > BUFFER_LIMIT - value.incoming.length { return failure(errors.wouldBlockCode(), "relay sink is full") }
+        if frame.body.length > BUFFER_LIMIT - incomingBytes(value) { return failure(errors.wouldBlockCode(), "relay sink is full") }
+        compactIncoming(value)
         value.incoming.addBytes(frame.body); return errors.boolean(true)
     }
     if frame.type == CLOSE && value.stage == 1 { value.stage = 2; return errors.boolean(true) }
@@ -310,23 +333,31 @@ public function enqueueRelay(value: Relay, bytes: Bytes): errors.BooleanResult {
     if errors.isError(value.error) { return errors.booleanFailure(value.error) }
     if value.stage != 1 { return failure(errors.protocolCode(), "relay is not open") }
     if bytes.length > 65536 || bytes.length == 0 { return failure(errors.invalidDataCode(), "invalid relay data size") }
-    if bytes.length + 16 > BUFFER_LIMIT - value.outgoing.length { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    if bytes.length + 16 > BUFFER_LIMIT - outgoingBytes(value) { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    compactOutgoing(value)
     value.outgoing.addBytes(errors.bytesValue(encode(DATA, value.id, bytes))); return errors.boolean(true)
 }
 public function closeRelay(value: Relay): errors.BooleanResult {
     if errors.isError(value.error) { return errors.booleanFailure(value.error) }
     if value.stage != 1 { return failure(errors.protocolCode(), "relay is not open") }
-    if 16 > BUFFER_LIMIT - value.outgoing.length { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    if 16 > BUFFER_LIMIT - outgoingBytes(value) { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    compactOutgoing(value)
     value.outgoing.addBytes(errors.bytesValue(encode(CLOSE, value.id, Bytes()))); value.stage = 2
     return errors.boolean(true)
 }
 public function takeIncoming(value: Relay, maximumBytes: Integer): Bytes {
     if maximumBytes < 1 { fail("relay drain maximum must be positive") }
-    let end = min(value.incoming.length, maximumBytes); let result = value.incoming.slice(0, end)
-    value.incoming = value.incoming.slice(end, value.incoming.length); return result
+    let count = min(incomingBytes(value), maximumBytes)
+    let result = value.incoming.slice(value.incomingCursor, value.incomingCursor + count)
+    value.incomingCursor += count
+    if value.incomingCursor == value.incoming.length { clearIncoming(value) }
+    return result
 }
 public function takeOutgoing(value: Relay, maximumBytes: Integer): Bytes {
     if maximumBytes < 1 { fail("relay drain maximum must be positive") }
-    let end = min(value.outgoing.length, maximumBytes); let result = value.outgoing.slice(0, end)
-    value.outgoing = value.outgoing.slice(end, value.outgoing.length); return result
+    let count = min(outgoingBytes(value), maximumBytes)
+    let result = value.outgoing.slice(value.outgoingCursor, value.outgoingCursor + count)
+    value.outgoingCursor += count
+    if value.outgoingCursor == value.outgoing.length { clearOutgoing(value) }
+    return result
 }
