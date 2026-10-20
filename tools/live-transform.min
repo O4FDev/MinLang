@@ -194,7 +194,7 @@ function definition(line: Text, generation: Integer, index: Integer, initial: Bo
 }
 
 // Replace symbol references, never strings/inline assembly/comments or prefixes.
-function renamed(text: Text, functions: List<Function>): Rewritten {
+function renamed(text: Text, names: Map<Text, Text>): Rewritten {
     let data = Bytes(text)
     let parts: List<Text> = []
     let start = 0
@@ -215,13 +215,10 @@ function renamed(text: Text, functions: List<Function>): Rewritten {
         if data[index] == 64 {
             let parsed = symbol(data, index + 1)
             if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
-            for function in functions {
-                if function.raw == parsed.raw {
-                    parts.add(Text(data.slice(start, index + 1)))
-                    parts.add(function.wrapper)
-                    start = parsed.end
-                    break
-                }
+            if names.has(parsed.raw) {
+                parts.add(Text(data.slice(start, index + 1)))
+                parts.add(names[parsed.raw])
+                start = parsed.end
             }
             index = parsed.end
         } else { index += 1 }
@@ -258,6 +255,7 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
     if generation < 0 { return failed("live generation must be nonnegative") }
     if host.hasText(llvm, "; minyar-thread-runtime: 1") || host.hasText(llvm, "; minyar-data-parallel-runtime: 1") { return failed("live reload currently requires a single-threaded program") }
     let functions: List<Function> = []
+    let namesBySymbol = Map<Text, Text>()
     let lines = host.lines(llvm)
     let inFunction = false
     for line in lines {
@@ -265,7 +263,8 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
             if inFunction { return failed("generated LLVM contains a nested function definition") }
             let function = definition(line, generation, functions.length, initial)
             if function.error != "" { return failed(function.error) }
-            for prior in functions { if prior.raw == function.raw { return failed("generated LLVM repeats a function definition") } }
+            if namesBySymbol.has(function.raw) { return failed("generated LLVM repeats a function definition") }
+            namesBySymbol[function.raw] = function.wrapper
             functions.add(function)
             inFunction = true
         } else if line == "}" {
@@ -283,7 +282,7 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
     for line in lines {
         let state = rootCell(line, initial)
         if state.error != "" { return failed(state.error) }
-        let replaced = renamed(state.text, functions)
+        let replaced = renamed(state.text, namesBySymbol)
         if replaced.error != "" { return failed(replaced.error) }
         let result = replaced.text
         if line.startsWith("define ") {
