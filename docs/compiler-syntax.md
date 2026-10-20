@@ -293,7 +293,7 @@ overnight charter and are separate from lexer and type codes:
 
 - 0: module.
 - 1–6: function, record, constant, global, field and parameter.
-- 7–10: choice, type alias, test and capability in raw documentation trees. Typed compilation
+- 7–11: choice, type alias, test, capability and benchmark in raw documentation trees. Typed compilation
   continues to describe normalized declarations with the existing kinds.
 - 100–111: block, conditional, loop, binding, return, jump, match, native body,
   expression statement and assignment.

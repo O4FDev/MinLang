@@ -1,0 +1,314 @@
+use "system" as system
+
+/// Deterministic generation and explicit shrinking. sample receives a seed and
+/// zero-based case index; its first cases should cover important boundaries.
+/// copy must deeply copy mutable data. Callbacks must be deterministic, and
+/// predicates must return normally; a runtime failure cannot be shrunk.
+/// A predicate may mutate its input, but reproducible shrinking requires it to
+/// leave other observable state unchanged.
+public record Generator<Item> {
+    sample: (Integer, Integer) -> Item
+    shrink: (Item) -> List<Item>
+    render: (Item) -> Text
+    copy: (Item) -> Item
+}
+
+public record Outcome {
+    passed: Boolean
+    name: Text
+    seed: Integer
+    cases: Integer
+    caseIndex: Integer
+    shrinks: Integer
+    original: Text
+    smallest: Text
+}
+
+public constant DEFAULT_SEED = 1
+public constant DEFAULT_CASES = 100
+public constant MAXIMUM_SEED = 2147483646
+public constant SHRINK_LIMIT = 1000
+
+function validate(seed: Integer, cases: Integer) {
+    if seed < 0 || seed > MAXIMUM_SEED { fail("property seed must be between 0 and 2147483646") }
+    if cases < 1 || cases > 100000 { fail("property cases must be between 1 and 100000") }
+}
+
+function setting(name: Text, fallback: Integer, minimum: Integer, maximum: Integer): Integer {
+    let source = system.getenv(name)
+    let error = system.lastError()
+    if error == -2 { return fallback }
+    let message = name + " must be an integer between " + Text(minimum) + " and " + Text(maximum)
+    if error != 0 || source.length == 0 { fail(message) }
+    let value = 0
+    for character in source {
+        if character < '0' || character > '9' { fail(message) }
+        let digit = Integer(character) - Integer('0')
+        if value > (maximum - digit) / 10 { fail(message) }
+        value = value * 10 + digit
+    }
+    if value < minimum || value > maximum { fail(message) }
+    return value
+}
+
+public function configuredSeed(): Integer { return setting("MINYAR_PROPERTY_SEED", DEFAULT_SEED, 0, MAXIMUM_SEED) }
+public function configuredCases(): Integer { return setting("MINYAR_PROPERTY_CASES", DEFAULT_CASES, 1, 100000) }
+
+/// Runs at most cases generated inputs and SHRINK_LIMIT shrink candidates.
+/// Every predicate and shrink callback receives a fresh generator.copy value.
+/// Custom callbacks remain responsible for terminating and respecting copy's
+/// deep-copy contract. shrinks counts attempted candidates, including passes.
+public function run<Item>(name: Text, generator: Generator<Item>, predicate: (Item) -> Boolean, seed: Integer, cases: Integer): Outcome {
+    validate(seed, cases)
+    for index in 0..cases {
+        let value = generator.sample(seed, index)
+        if !predicate(generator.copy(value)) {
+            let original = generator.render(generator.copy(value))
+            let current = generator.copy(value)
+            let attempts = 0
+            let changed = true
+            while changed && attempts < SHRINK_LIMIT {
+                changed = false
+                let candidates = generator.shrink(generator.copy(current))
+                for candidate in candidates {
+                    if attempts >= SHRINK_LIMIT { break }
+                    attempts += 1
+                    if !predicate(generator.copy(candidate)) {
+                        current = generator.copy(candidate)
+                        changed = true
+                        break
+                    }
+                }
+            }
+            return Outcome { passed: false; name: name; seed: seed; cases: index + 1;
+                caseIndex: index; shrinks: attempts; original: original;
+                smallest: generator.render(generator.copy(current)) }
+        }
+    }
+    return Outcome { passed: true; name: name; seed: seed; cases: cases;
+        caseIndex: -1; shrinks: 0; original: ""; smallest: "" }
+}
+
+public function describe(outcome: Outcome): Text {
+    if outcome.passed { return "property passed: " + outcome.name + " (" + Text(outcome.cases) + " cases)" }
+    return "property failed: " + outcome.name + "\n  original: " + outcome.original +
+        "\n  shrunk: " + outcome.smallest + "\n  seed: " + Text(outcome.seed) +
+        "\n  case: " + Text(outcome.caseIndex + 1) + "\n  shrink attempts: " + Text(outcome.shrinks) +
+        "\n  replay: MINYAR_PROPERTY_SEED=" + Text(outcome.seed) + " MINYAR_PROPERTY_CASES=" + Text(outcome.cases)
+}
+
+public function check<Item>(name: Text, generator: Generator<Item>, predicate: (Item) -> Boolean) {
+    let outcome = run(name, generator, predicate, configuredSeed(), configuredCases())
+    if !outcome.passed { fail(describe(outcome)) }
+}
+
+// Park-Miller arithmetic fits comfortably within Integer, including its product.
+function next(state: Integer): Integer { return state * 48271 % 2147483647 }
+function caseSeed(seed: Integer, index: Integer): Integer {
+    return next((seed + index * 104729) % 2147483646 + 1)
+}
+function positive(seed: Integer): Integer {
+    let second = next(seed)
+    return (seed - 1) * 4294967296 + (second - 1) * 2 + next(second) % 2
+}
+function atMost(seed: Integer, maximum: Integer): Integer {
+    let value = positive(seed)
+    if maximum == 9223372036854775807 { return value }
+    return value % (maximum + 1)
+}
+function integerSample(seed: Integer, minimum: Integer, maximum: Integer): Integer {
+    if minimum >= 0 { return minimum + atMost(seed, maximum - minimum) }
+    if maximum < 0 { return maximum - atMost(seed, maximum - minimum) }
+    if seed % 2 == 0 { return -1 - atMost(next(seed), -(minimum + 1)) }
+    return atMost(next(seed), maximum)
+}
+function integerTarget(minimum: Integer, maximum: Integer): Integer {
+    if minimum > 0 { return minimum }
+    if maximum < 0 { return maximum }
+    return 0
+}
+function integerShrinks(value: Integer, target: Integer): List<Integer> {
+    let candidates: List<Integer> = []
+    if value == target { return candidates }
+    candidates.add(target)
+    let delta = (value - target) / 2
+    while delta != 0 {
+        candidates.add(value - delta)
+        delta /= 2
+    }
+    return candidates
+}
+
+/// Includes the value nearest zero, the minimum, and the maximum before random
+/// inputs. The complete signed Integer range is supported without overflow.
+public function integers(minimum: Integer, maximum: Integer): Generator<Integer> {
+    if minimum > maximum { fail("property integer minimum must not exceed maximum") }
+    let target = integerTarget(minimum, maximum)
+    return Generator<Integer> {
+        sample: function(seed, index) {
+            if index == 0 { return target }
+            if index == 1 { return minimum }
+            if index == 2 { return maximum }
+            return integerSample(caseSeed(seed, index), minimum, maximum)
+        }
+        shrink: function(value) { return integerShrinks(value, target) }
+        render: function(value) { return Text(value) }
+        copy: function(value) { return value }
+    }
+}
+
+public function booleans(): Generator<Boolean> {
+    return Generator<Boolean> {
+        sample: function(seed, index) {
+            if index == 0 { return false }
+            if index == 1 { return true }
+            return caseSeed(seed, index) % 2 == 0
+        }
+        shrink: function(value) { if value { return [false] }; return [] }
+        render: function(value) { if value { return "true" }; return "false" }
+        copy: function(value) { return value }
+    }
+}
+
+function hexadecimal(value: Integer): Text {
+    let digits = "0123456789abcdef"
+    let result = ""
+    while value > 0 {
+        result = Text(digits[value % 16]) + result
+        value /= 16
+    }
+    if result == "" { return "0" }
+    return result
+}
+function quoted(value: Text): Text {
+    let parts: List<Text> = ["\""]
+    for character in value {
+        if character == '"' { parts.add("\\\"") }
+        else if character == '\\' { parts.add("\\\\") }
+        else if character == '\n' { parts.add("\\n") }
+        else if character == '\r' { parts.add("\\r") }
+        else if character == '\t' { parts.add("\\t") }
+        else if Integer(character) < 32 || Integer(character) == 127 {
+            parts.add("\\u{" + hexadecimal(Integer(character)) + "}")
+        } else { parts.add(Text(character)) }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+function textAlphabet(): List<Text> {
+    return ["a", "Z", "0", " ", "\n", "\t", "\"", "\\", Text(Character(0)), "é", "中", "🙂", "é", Text(Character(1114111))]
+}
+function textShrinks(value: Text): List<Text> {
+    let candidates: List<Text> = []
+    if value.length == 0 { return candidates }
+    candidates.add("")
+    let width = value.length / 2
+    while width > 0 {
+        let start = 0
+        while start + width <= value.length && candidates.length < 256 {
+            candidates.add(value.slice(0, start) + value.slice(start + width, value.length))
+            start += width
+        }
+        width /= 2
+    }
+    if value.length == 1 && value != "a" { candidates.add("a") }
+    return candidates
+}
+
+/// Length is measured in Unicode scalar values. Boundaries include empty Text,
+/// ASCII, embedded NUL, combining marks, and two-, three-, and four-byte UTF-8.
+public function texts(maximumLength: Integer): Generator<Text> {
+    if maximumLength < 0 || maximumLength > 10000 { fail("property text maximum length must be between 0 and 10000") }
+    let alphabet = textAlphabet()
+    return Generator<Text> {
+        sample: function(seed, index) {
+            if maximumLength == 0 || index == 0 { return "" }
+            if index <= alphabet.length {
+                let boundary = alphabet[index - 1]
+                return boundary.slice(0, min(boundary.length, maximumLength))
+            }
+            let state = caseSeed(seed, index)
+            let length = state % (maximumLength + 1)
+            if index == alphabet.length + 1 { length = maximumLength }
+            let parts: List<Text> = []
+            let count = 0
+            while count < length {
+                state = next(state)
+                let part = alphabet[state % alphabet.length]
+                if count + part.length > length { part = "a" }
+                parts.add(part)
+                count += part.length
+            }
+            return joinText(parts)
+        }
+        shrink: function(value) { return textShrinks(value) }
+        render: function(value) { return quoted(value) }
+        copy: function(value) { return value }
+    }
+}
+
+function listCopy<Item>(values: List<Item>, element: Generator<Item>): List<Item> {
+    let result: List<Item> = []
+    for value in values { result.add(element.copy(value)) }
+    return result
+}
+function listShrinks<Item>(values: List<Item>, element: Generator<Item>): List<List<Item>> {
+    let candidates: List<List<Item>> = []
+    if values.length == 0 { return candidates }
+    candidates.add([])
+    let width = values.length / 2
+    while width > 0 {
+        let start = 0
+        while start + width <= values.length && candidates.length < 128 {
+            let candidate: List<Item> = []
+            for index in 0..values.length {
+                if index < start || index >= start + width { candidate.add(element.copy(values[index])) }
+            }
+            candidates.add(candidate)
+            start += width
+        }
+        width /= 2
+    }
+    for index in 0..values.length {
+        if candidates.length >= 256 { break }
+        let smaller = element.shrink(element.copy(values[index]))
+        for value in smaller {
+            if candidates.length >= 256 { break }
+            let candidate = listCopy(values, element)
+            candidate[index] = element.copy(value)
+            candidates.add(candidate)
+        }
+    }
+    return candidates
+}
+
+/// Recursively copies elements, removes chunks, then shrinks individual values.
+public function lists<Item>(element: Generator<Item>, maximumLength: Integer): Generator<List<Item>> {
+    if maximumLength < 0 || maximumLength > 10000 { fail("property list maximum length must be between 0 and 10000") }
+    return Generator<List<Item>> {
+        sample: function(seed, index) {
+            let values: List<Item> = []
+            if maximumLength == 0 || index == 0 { return values }
+            let state = caseSeed(seed, index)
+            let length = state % (maximumLength + 1)
+            if index == 1 { length = 1 }
+            if index == 2 { length = maximumLength }
+            for position in 0..length {
+                state = next(state)
+                values.add(element.sample(state, (index + position - 1) % 100000))
+            }
+            return values
+        }
+        shrink: function(values) { return listShrinks(values, element) }
+        render: function(values) {
+            let parts: List<Text> = ["["]
+            for index in 0..values.length {
+                if index > 0 { parts.add(", ") }
+                parts.add(element.render(element.copy(values[index])))
+            }
+            parts.add("]")
+            return joinText(parts)
+        }
+        copy: function(values) { return listCopy(values, element) }
+    }
+}

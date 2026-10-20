@@ -1,0 +1,130 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "../tools/driver-support.min" as host
+use "io" as io
+use "system" as system
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+frontend.sources = ["runtime/native/system.c"]
+let compiler = frontend.compiler
+let actual = compiler.executable
+let wrapper = compiler.directory + "/property-compiler"
+io.writeTextFile(wrapper, "#!/bin/sh\nexec " + host.shellQuote(actual) + " \"$@\" --test-mode --bounded-owners 32\n")
+test.require(test.run(["chmod", "+x", wrapper], system.environment(), "", compiler.directory + "/chmod", 10), "property compiler wrapper")
+compiler.executable = wrapper
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "property" as values
+    global draws: List<Integer> = [0]
+    global harvest: List<Integer> = [3, 1, 2]
+    function generator(): values.Generator<Integer> { draws[0] += 1; return values.integers(-100, 100) }
+    function property(value: Integer): Integer { return value + 1 }
+    function bench(value: Integer): Integer { return value + 2 }
+    test "generated inputs and one generator evaluation" {
+        let offset = 1
+        property "the interval is respected" for value in generator() {
+            expect(value >= -100 && value <= 100)
+            expect(property(value) == value + offset)
+            expect(bench(value) == value + 2)
+            let copy = [value]
+            expect(copy[0] == value)
+        }
+        expect(draws[0] == 1)
+        expect(harvest.sorted()[0] == 1)
+        print("checked")
+    }
+    bench "not selected by test mode" { unknownBenchmarkFunction(); startThread(unknown) }
+    """#, "checked\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    use "property" as values
+    record Parcel { return: Integer }
+    record Holder { match: Maybe<(Integer) -> Integer>; function: () -> Maybe<(Integer) -> Integer> }
+    record Empty {}
+    function Empty.optional(): Maybe<(Integer) -> Integer> {
+        return Some(function(number: Integer): Integer { return number })
+    }
+    test "ordinary contextual names" {
+        property "fields, callbacks and loop binders" for value in values.integers(0, 1) {
+            let parcel = Parcel { return: value }
+            expect(parcel.return == value)
+            for expect in [function(expect: Integer): Integer { return expect }] {
+                if expect(value) != value { fail("the loop binding changed") }
+            }
+            let identity = function(expect: Integer): Integer { return expect }
+            expect(identity(value) == value)
+            let wrapped: Maybe<(Integer) -> Integer> = Some(identity)
+            match wrapped {
+                Some(expect) { if expect(value) != value { fail("the match binding changed") } }
+                None { expect(false) }
+            }
+            match match wrapped { Some(_) { wrapped } None { wrapped } } {
+                Some(expect) { if expect(value) != value { fail("the nested match binding changed") } }
+                None { expect(false) }
+            }
+            let holder = Holder { match: wrapped; function: function() { return wrapped } }
+            match holder.match {
+                Some(expect) { if expect(value) != value { fail("the member match binding changed") } }
+                None { expect(false) }
+            }
+            match holder.function() {
+                Some(expect) { if expect(value) != value { fail("the callable member binding changed") } }
+                None { expect(false) }
+            }
+            match Empty {}.optional() {
+                Some(expect) { if expect(value) != value { fail("the empty record binding changed") } }
+                None { expect(false) }
+            }
+            expect(true)
+        }
+        if true {
+            let expect = function(value: Integer): Integer { return value }
+            property "captured user expectation" for value in values.integers(0, 1) {
+                if expect(value) != value { fail("the captured binding changed") }
+            }
+        }
+        property "input named expect" for expect in values.integers(0, 1) {
+            if expect < 0 || expect > 1 { fail("the input binding changed") }
+        }
+        expect(true)
+    }
+    """#, "", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/seed-laws.min"), "", levels, 0, "", true)
+
+for pair in [
+    ["property \"\" for value in values.integers(0, 1) {}", "a property needs a nonempty name"],
+    ["property \"name\" {}", "a property names its input"],
+    ["property \"name\" for 42 in values.integers(0, 1) {}", "a property needs a name"],
+    ["property \"name\" for value values.integers(0, 1) {}", "write 'in'"],
+    ["property \"name\" for value in {}", "a property needs a generator"],
+    ["property \"name\" for value in values.integers(0, 1) { return false }", "a property uses expect instead of return"],
+    ["property \"name\" for value in values.integers(0, 1) { let nested = function() { expect(true) }; nested() }", "keep a property's expectations in its own body"],
+    ["property \"name\" for value in values.integers(0, 1) { property \"nested\" for other in values.integers(0, 1) {} }", "put each property directly inside its test"]
+] {
+    fixtures.rejects(frontend, "use \"property\" as values\ntest \"rejected\" { " + pair[0] + " }\n", pair[1], true)
+}
+
+compiler.executable = actual
+fixtures.executes(frontend, #"""
+    function invoke(callback: () -> Integer): Integer { return callback() }
+    record Parcel { value: Integer }
+    global parcel: Parcel = Parcel { value: 42 }
+    global harvest: List<Integer> = [3, 1, 2]
+    if parcel.value != 42 || harvest.sorted()[0] != 1 { fail("dotted globals were not qualified") }
+    print(42)
+    """#, "42\n", levels, 0, "", true)
+let callable = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(test.contains(callable, "declare void @minyar_callback_check(ptr)"), "call-only modules declare callback ABI")
+fixtures.executes(frontend, #"""
+    test "excluded property" { property "gone" for value in unknownGenerator() { expect(unknownValue) } }
+    bench "excluded benchmark" { unknownBenchmark(); print("excluded benchmark literal") }
+    print("ordinary")
+    """#, "ordinary\n", levels, 0, "", true)
+let ordinary = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(!test.contains(ordinary, "excluded benchmark literal") && !test.contains(ordinary, "minyar-callback-runtime") && !test.contains(ordinary, "property failed:"), "ordinary programs exclude property and benchmark code and runtime")
+fixtures.executes(frontend, io.readTextFile("examples/gallery/seed-laws.min"), "Every seed has a place; every name finds its way home.\n", levels, 0, "", true)
+test.removeTree(compiler.directory)
+print("Property cases: passed")

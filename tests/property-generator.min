@@ -1,0 +1,106 @@
+use "../library/property.min" as property
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+
+let integers = property.integers(-1000, 1000)
+check(integers.sample(1, 0) == 0, "integer zero boundary")
+check(integers.sample(1, 1) == -1000, "integer minimum boundary")
+check(integers.sample(1, 2) == 1000, "integer maximum boundary")
+let integerFailure = property.run("threshold", integers, function(value) { return value < 10 }, 42, 100)
+check(!integerFailure.passed, "integer counterexample")
+check(integerFailure.original == "1000", "original counterexample retained")
+check(integerFailure.smallest == "10", "integer counterexample shrinks to threshold")
+check(integerFailure.caseIndex == 2 && integerFailure.cases == 3, "failure case tracked")
+check(integerFailure.shrinks > 0 && integerFailure.shrinks <= property.SHRINK_LIMIT, "shrink work bounded")
+check(property.describe(integerFailure).find("seed: 42") >= 0, "seed reported")
+check(property.describe(integerFailure).find("case: 3") >= 0, "case reported")
+check(property.describe(integerFailure).find("threshold") >= 0, "property name reported")
+let replay = property.run("threshold", integers, function(value) { return value < 10 }, 42, 100)
+check(property.describe(replay) == property.describe(integerFailure), "failure replay is exact")
+let negative = property.run("negative threshold", integers, function(value) { return value > -10 }, 42, 100)
+check(negative.smallest == "-10", "negative threshold shrinks")
+
+let minimum = -9223372036854775807 - 1
+let maximum = 9223372036854775807
+let fullRange = property.integers(minimum, maximum)
+check(fullRange.sample(0, 1) == minimum, "full range minimum")
+check(fullRange.sample(property.MAXIMUM_SEED, 2) == maximum, "full range maximum")
+let bounds = property.run("full signed range", fullRange, function(value) { return value >= minimum && value <= maximum }, property.MAXIMUM_SEED, 1000)
+check(bounds.passed && bounds.cases == 1000, "full range generation does not overflow")
+let minimumFailure = property.run("minimum shrink", fullRange, function(value) { return value >= -10 }, 0, 100)
+check(minimumFailure.smallest == "-11", "minimum endpoint shrinks without overflow")
+let onlyMinimum = property.integers(minimum, minimum)
+check(onlyMinimum.sample(0, 55) == minimum && onlyMinimum.shrink(minimum).length == 0, "singleton minimum")
+let onlyMaximum = property.integers(maximum, maximum)
+check(onlyMaximum.sample(0, 55) == maximum && onlyMaximum.shrink(maximum).length == 0, "singleton maximum")
+let seen: List<Integer> = []
+for index in 3..103 { seen.add(integers.sample(77, index)) }
+let changedSeed = false
+for index in 3..103 {
+    check(integers.sample(77, index) == seen[index - 3], "same seed same random inputs")
+    if integers.sample(78, index) != seen[index - 3] { changedSeed = true }
+}
+check(changedSeed, "changing seed changes random inputs")
+
+let booleans = property.booleans()
+check(!booleans.sample(1, 0) && booleans.sample(1, 1), "Boolean boundaries")
+let booleanFailure = property.run("Boolean false", booleans, function(value) { return value }, 1, 5)
+check(booleanFailure.smallest == "false", "Boolean rendering")
+
+let texts = property.texts(12)
+check(texts.sample(1, 0) == "", "empty text boundary")
+let unicode = false
+let nul = false
+let maximumLength = false
+for index in 0..100 {
+    let value = texts.sample(9, index)
+    check(value.length <= 12, "text stays within scalar bound")
+    if value.byteLength > value.length { unicode = true }
+    if value.find(Text(Character(0))) >= 0 { nul = true }
+    if value.length == 12 { maximumLength = true }
+    for candidate in texts.shrink(value) { check(candidate.length < value.length || candidate == "a", "text shrink makes progress") }
+}
+check(unicode && nul && maximumLength, "Unicode, NUL and maximum length boundaries")
+check(texts.render("\n\"\\" + Text(Character(0))) == "\"\\n\\\"\\\\\\u{0}\"", "escaped text rendering")
+let textFailure = property.run("text length", texts, function(value) { return value.length < 3 }, 9, 100)
+check(!textFailure.passed && textFailure.smallest.length >= 5, "text shrinking finds failure")
+let measuredTexts = property.Generator<Text> {
+    sample: texts.sample
+    shrink: texts.shrink
+    render: function(value) { return Text(value.length) }
+    copy: texts.copy
+}
+let measuredFailure = property.run("text scalar length", measuredTexts, function(value) { return value.length < 3 }, 9, 100)
+check(measuredFailure.smallest == "3", "text shrinks to exact scalar length threshold")
+check(property.texts(0).sample(1, 99) == "", "zero maximum text length")
+
+let lists = property.lists(property.integers(-100, 100), 10)
+check(lists.sample(1, 0).length == 0, "empty list boundary")
+check(lists.sample(1, 1).length == 1 && lists.sample(1, 2).length == 10, "list length boundaries")
+let listFailure = property.run("list length", lists, function(values) { return values.length < 3 }, 21, 100)
+check(!listFailure.passed && listFailure.smallest == "[0, 0, 0]", "list shrinking removes chunks and shrinks elements")
+let nested = property.lists(property.lists(property.integers(-10, 10), 4), 4)
+let source = nested.sample(2, 2)
+let copied = nested.copy(source)
+check(copied.length > 0 && copied[0].length > 0, "nested list sample has mutable data")
+let originalValue = source[0][0]
+copied[0][0] = originalValue + 1
+check(source[0][0] == originalValue, "nested list copy is deep")
+let mutation = property.run("predicate mutations", lists, function(values) {
+    let passes = values.length < 3
+    values.add(9999)
+    return passes
+}, 21, 100)
+check(mutation.original.find("9999") < 0 && mutation.smallest == "[0, 0, 0]", "predicate mutations cannot corrupt shrink data")
+
+let stubborn = property.Generator<Integer> {
+    sample: function(seed, index) { return 7 }
+    shrink: function(value) { return [value] }
+    render: function(value) { return Text(value) }
+    copy: function(value) { return value }
+}
+let bounded = property.run("cyclic custom shrinker", stubborn, function(value) { return false }, 1, 1)
+check(bounded.shrinks == property.SHRINK_LIMIT, "custom shrinker cannot cycle forever")
+check(bounded.original == "7" && bounded.smallest == "7", "custom generator rendering")
+property.check("passing check", integers, function(value) { return value >= -1000 && value <= 1000 })
+print("Property generators: passed")

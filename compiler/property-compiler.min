@@ -1,0 +1,147 @@
+// Property syntax is contextual and exists only in a selected test module.
+function propertyCaseAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return position + 1 < kinds.length && kinds[position] == 1 && texts[position] == "property" && kinds[position + 1] == 3
+}
+
+function moduleHasProperties(kinds: List<Integer>, texts: List<Text>, starts: List<Integer>, ends: List<Integer>): Boolean {
+    let index = 0
+    while index < starts.length {
+        let position = starts[index] + 2
+        while position < ends[index] {
+            if propertyCaseAt(kinds, texts, position) { return true }
+            position = position + 1
+        }
+        index = index + 1
+    }
+    return false
+}
+
+// Lex scaffolding too: injected callbacks must enable closure conversion, and
+// the original tokens retain their source coordinates for useful diagnostics.
+function propertyTokens(source: Text, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, origins: SourceMap, origin: Integer) {
+    let generatedKinds: List<Integer> = []
+    let generatedTexts: List<Text> = []
+    let generatedLines = newSourceMap()
+    tokenize(source, generatedKinds, generatedTexts, generatedLines)
+    lines.features = testMergedFeatures(lines.features, generatedLines.features)
+    let position = 0
+    while generatedKinds[position] != 0 {
+        let word = generatedTexts[position]
+        if generatedKinds[position] == 1 && word == "minyar_property_module" { word = "minyar$property" }
+        if generatedKinds[position] == 1 && word == "minyar_benchmark_module" { word = "minyar$benchmark" }
+        testSynthetic(kinds, texts, lines, generatedKinds[position], word, origins, origin)
+        position = position + 1
+    }
+}
+
+function propertyBodyOpening(kinds: List<Integer>, texts: List<Text>, first: Integer, after: Integer): Integer {
+    let position = first
+    let depth = 0
+    while position < after && kinds[position] != 0 {
+        if kinds[position] == 4 {
+            let word = texts[position]
+            if word == "{" && depth == 0 { return position }
+            if word == "(" || word == "[" || word == "{" { depth = depth + 1 }
+            if word == ")" || word == "]" || word == "}" { depth = depth - 1 }
+            if depth < 0 { return position }
+        }
+        position = position + 1
+    }
+    return position
+}
+
+function propertyMatchOpening(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, first: Integer, after: Integer): Integer {
+    let position = first + 1
+    let depth = 0
+    while position < after && kinds[position] != 0 {
+        if depth == 0 && kinds[position] == 1 && texts[position] == "match" && texts[position - 1] != "." && texts[position + 1] != "." {
+            let nested = propertyMatchOpening(kinds, texts, lines, position, after)
+            if nested >= after { return after }
+            position = testClosing(kinds, texts, lines, nested) + 1
+        } else if depth == 0 && kinds[position] == 1 && texts[position] == "function" && texts[position + 1] == "(" && texts[position - 1] != "." {
+            let callback = propertyBodyOpening(kinds, texts, position + 1, after)
+            if callback >= after { return after }
+            position = testClosing(kinds, texts, lines, callback) + 1
+        } else if depth == 0 && kinds[position] == 4 && texts[position] == "{" {
+            let member: List<Integer> = [position + 1]
+            skipTerminators(kinds, member)
+            let record = kinds[member[0]] == 1 && texts[member[0] + 1] == ":"
+            if texts[member[0]] == "}" && member[0] + 1 < after && (texts[member[0] + 1] == "." || texts[member[0] + 1] == "(" || texts[member[0] + 1] == "[") { record = true }
+            if record {
+                position = testClosing(kinds, texts, lines, position) + 1
+            } else { return position }
+        } else {
+            if kinds[position] == 4 {
+                let word = texts[position]
+                if word == "(" || word == "[" || word == "{" { depth = depth + 1 }
+                if word == ")" || word == "]" || word == "}" { depth = depth - 1 }
+                if depth < 0 { return after }
+            }
+            position = position + 1
+        }
+    }
+    return after
+}
+
+// Match payloads bind values throughout their guard and body. Store half-open
+// ranges separately from brace scopes, including nested match expressions.
+function propertyMatchShadows(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, first: Integer, after: Integer, shadows: List<Integer>) {
+    let opening = propertyMatchOpening(kinds, texts, lines, first, after)
+    if opening >= after || texts[opening] != "{" { return }
+    let closing = testClosing(kinds, texts, lines, opening)
+    let cursor: List<Integer> = [opening + 1]
+    skipTerminators(kinds, cursor)
+    while cursor[0] < closing {
+        let body = propertyBodyOpening(kinds, texts, cursor[0], closing)
+        if body >= closing || texts[body] != "{" { return }
+        let position = cursor[0]
+        let depth = 0
+        let pattern = true
+        let binds = false
+        while position < body && pattern {
+            if kinds[position] == 1 && texts[position] == "where" && depth == 0 { pattern = false }
+            if kinds[position] == 1 && texts[position] == "expect" && !(position > cursor[0] && texts[position - 1] == ".") && texts[position + 1] != ":" { binds = true }
+            if kinds[position] == 4 && (texts[position] == "(" || texts[position] == "[") { depth = depth + 1 }
+            if kinds[position] == 4 && (texts[position] == ")" || texts[position] == "]") { depth = depth - 1 }
+            position = position + 1
+        }
+        cursor[0] = testClosing(kinds, texts, lines, body) + 1
+        if binds { shadows.add(position); shadows.add(cursor[0]) }
+        skipTerminators(kinds, cursor)
+    }
+}
+
+function propertyMatchShadowed(position: Integer, scopes: List<Integer>): Boolean {
+    let index = 0
+    while index + 1 < scopes.length {
+        if position >= scopes[index] && position < scopes[index + 1] { return true }
+        index = index + 2
+    }
+    return false
+}
+
+function propertyCase(source: Text, path: Text, sourceKinds: List<Integer>, sourceTexts: List<Text>, sourceLines: SourceMap, first: Integer, after: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, shadowed: Boolean): Integer {
+    let cursor: List<Integer> = [first + 2]
+    skipTerminators(sourceKinds, cursor)
+    if sourceTexts[first + 1] == "" { failAtToken(sourceLines, first + 1, "a property needs a nonempty name") }
+    if !tokenIs(sourceKinds, sourceTexts, cursor, "for") { failAtToken(sourceLines, cursor[0], "a property names its input with 'for value in generator'") }
+    cursor[0] = cursor[0] + 1
+    if sourceKinds[cursor[0]] != 1 { failAtToken(sourceLines, cursor[0], "a property needs a name for its generated input") }
+    let binding = sourceTexts[cursor[0]]
+    cursor[0] = cursor[0] + 1
+    if !tokenIs(sourceKinds, sourceTexts, cursor, "in") { failAtToken(sourceLines, cursor[0], "write 'in' before the property's generator") }
+    cursor[0] = cursor[0] + 1
+    skipTerminators(sourceKinds, cursor)
+    let generator = cursor[0]
+    let opening = propertyBodyOpening(sourceKinds, sourceTexts, generator, after)
+    if opening >= after || sourceKinds[opening] != 4 || sourceTexts[opening] != "{" { failAtToken(sourceLines, first, "a property needs a generator followed by a body in braces") }
+    if opening == generator { failAtToken(sourceLines, opening, "a property needs a generator after 'in'") }
+    let closing = testClosing(sourceKinds, sourceTexts, sourceLines, opening)
+    let location = path + ":" + Text(sourceLines.coordinates[first * 2]) + ":" + Text(sourceLines.coordinates[first * 2 + 1])
+    propertyTokens("minyar_property_module.check(" + testQuoted(location + ": property " + sourceTexts[first + 1]) + ", ", kinds, texts, lines, sourceLines, first)
+    testCopy(kinds, texts, lines, sourceKinds, sourceTexts, sourceLines, generator, opening)
+    propertyTokens(", function(" + binding + "): Boolean ", kinds, texts, lines, sourceLines, first)
+    testBodyMode(source, path, sourceKinds, sourceTexts, sourceLines, opening, closing + 1, kinds, texts, lines, true, shadowed || binding == "expect")
+    propertyTokens(")\n", kinds, texts, lines, sourceLines, closing)
+    return closing + 1
+}

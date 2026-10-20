@@ -1,0 +1,73 @@
+use "benchmark" as benchmark
+use "../tools/testing.min" as test
+use "process" as processInfo
+use "system" as system
+use "files" as files
+use "json" as json
+use "io" as io
+use "math" as math
+
+if processInfo.argumentCount() > 0 && processInfo.argument(0) == "child" {
+    let calls = [0]
+    exit(benchmark.run(function() { calls[0] += 1; print("benchmark body output") }))
+}
+if processInfo.argumentCount() > 0 && processInfo.argument(0) == "empty" { benchmark.summarize([]); exit(0) }
+if processInfo.argumentCount() > 0 && processInfo.argument(0) == "negative" { benchmark.summarize([-1.0]); exit(0) }
+if processInfo.argumentCount() > 0 && processInfo.argument(0) == "nan" { benchmark.summarize([math.sqrt(-1.0)]); exit(0) }
+if processInfo.argumentCount() > 0 && processInfo.argument(0) == "infinity" { benchmark.summarize([math.exp(1000.0)]); exit(0) }
+
+let odd = [100.0, 4.0, 1.0, 3.0, 2.0]
+let summary = benchmark.summarize(odd)
+test.check(summary.median == 3.0 && summary.mad == 1.0 && summary.p95 == 100.0, "odd sample median, robust MAD and nearest-rank p95")
+test.check(summary.minimum == 1.0 && summary.maximum == 100.0 && odd[0] == 100.0, "extremes and original sample order")
+let even = benchmark.summarize([10.0, 4.0, 2.0, 8.0])
+test.check(even.median == 6.0 && even.mad == 3.0 && even.p95 == 10.0, "even sample midpoint and MAD midpoint")
+let single = benchmark.summarize([0.0])
+test.check(single.median == 0.0 && single.mad == 0.0 && single.p95 == 0.0, "one sample statistics")
+let twenty: List<Float> = []
+for index in 1..21 { twenty.add(Float(index)) }
+let percentile = benchmark.summarize(twenty)
+test.check(percentile.median == 10.5 && percentile.p95 == 19.0, "nearest-rank percentile uses ceiling rather than maximum")
+
+let configuration = benchmark.options(["--samples", "3", "--warmup", "0", "--target-ms", "1", "--max-iterations", "1"])
+test.check(configuration.error == "" && configuration.samples == 3 && configuration.warmup == 0 && configuration.targetNanoseconds == 1000000 && configuration.maxIterations == 1, "bounded measurement controls")
+for invalid in [
+    ["--samples", "2"], ["--samples", "101"], ["--samples", "3x"], ["--samples", "-1"],
+    ["--samples", "99999999999999999999999999"], ["--samples"], ["--samples", "3", "--samples", "4"],
+    ["--warmup", "101"], ["--target-ms", "0"], ["--target-ms", "101"],
+    ["--max-iterations", "0"], ["--max-iterations", "1000001"], ["--unknown", "1"]
+] { test.check(benchmark.options(invalid).error != "", "invalid benchmark control rejected") }
+
+let calls = [0]
+let measured = benchmark.measure(function() { calls[0] += 1 }, configuration)
+test.check(measured.iterations == 1 && measured.samples.length == 3 && calls[0] == 4, "one calibration plus three samples with no warmup")
+let adaptive = benchmark.options(["--samples", "3", "--warmup", "2", "--target-ms", "100", "--max-iterations", "8"])
+let batches = [0]
+let calibrated = benchmark.measure(function() { batches[0] += 1 }, adaptive)
+test.check(calibrated.iterations > 0 && calibrated.iterations <= 8 && calibrated.samples.length == 3 && calibrated.warmup == 2, "adaptive iteration cap and retained sample count")
+test.check(batches[0] >= calibrated.iterations * 6, "calibration, warmup and measured bodies all execute")
+let document = json.parse(benchmark.report(measured))
+test.check(document.kind == json.OBJECT && json.member(document, "samples").items.length == 3 && json.member(document, "unit").text == "ns/op", "machine report retains raw nanoseconds per operation")
+test.check(measured.batchNanoseconds.length == 3 && json.member(document, "batch_ns").items.length == 3, "exact raw batch durations remain available")
+let fractions = [1.0 / 3.0, 2.0 / 3.0, 4.0 / 3.0]
+let repeating = benchmark.Measurement { iterations: 3; calibrationNanoseconds: 0; warmup: 0; targetNanoseconds: 1000000; batchNanoseconds: [1, 2, 4]; samples: fractions; statistics: benchmark.summarize(fractions) }
+let repeated = json.parse(benchmark.report(repeating))
+test.check(json.member(repeated, "samples").items[0].text == Text(1.0 / 3.0) && json.member(repeated, "batch_ns").items[2].text == "4", "repeating fractions preserve canonical sample text and exact durations")
+
+let work = test.scratch()
+let self = test.selfPath()
+let child = test.run([self, "child", work + "/result.json", "--samples", "3", "--warmup", "0", "--max-iterations", "1"], system.environment(), "", work + "/child", 10)
+test.require(child, "benchmark child protocol")
+test.check(test.contains(child.output, "benchmark body output"), "benchmark body stdout stays separate from report")
+let result = json.parse(io.readTextFile(work + "/result.json"))
+test.check(json.member(result, "iterations").number == 1.0 && json.member(result, "samples").items.length == 3, "separate child JSON report")
+let existing = test.run([self, "child", work + "/result.json", "--samples", "3", "--max-iterations", "1"], system.environment(), "", work + "/existing", 10)
+test.check(existing.status == 1 && test.contains(existing.errorOutput, "cannot create benchmark report"), "report refuses to overwrite an existing path")
+let invalid = test.run([self, "child", work + "/invalid.json", "--samples", "0"], system.environment(), "", work + "/invalid", 10)
+test.check(invalid.status == 1 && files.pathSize(work + "/invalid.json") < 0 && invalid.output == "", "invalid controls fail before executing benchmark")
+for mode in ["empty", "negative", "nan", "infinity"] {
+    let rejected = test.run([self, mode], system.environment(), "", work + "/" + mode, 10)
+    test.check(rejected.status == 1 && test.contains(rejected.errorOutput, "benchmark"), "invalid statistics input fails")
+}
+test.removeTree(work)
+print("Benchmark statistics and runner: passed")
