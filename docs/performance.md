@@ -173,6 +173,18 @@ one shared output filename. The 1.2 times arena target remains unmet. Full
 observations and identities are in
 [`frames-publish-borrows.json`](../experiments/memory/frames-publish-borrows.json).
 
+Inlining idle public eager releases reduced instructions from 2,360,820,459
+with a rebuilt control runtime to 2,357,641,733, or 0.1346%. All four profiles
+link the same saved cell-reuse compiler LLVM, which predates publication-borrow
+and empty-header lowering. The saved eager runtime gives 2,360,820,636;
+matching arena gives 1,188,646,974, so candidate eager is 1.9835 times arena.
+Both runtime variants were built through the same frozen source/header paths.
+All 32 outputs match the frozen original LLVM with continuous unscaled counters.
+The linked field-replacement region contains the guarded old-object decrement;
+the aggregate saving is not attributed to a single region. Full observations,
+source identities and the native inspection digest are in
+[`frames-public-release.json`](../experiments/memory/frames-public-release.json).
+
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
 attaches to a stopped child, enables at exec, excludes the Python parent and

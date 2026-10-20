@@ -301,6 +301,12 @@ without a write. Last owners, traced values and pending work use the ordinary
 release path. Incremental profiles keep their ordinary release and service
 accounting. Null cells do not request an unlimited cycle drain.
 
+The public eager release entry also inlines idle shared decrements and immortal
+returns. Its original general body remains behind a separate noinline helper.
+Public NULL requests, last owners, pending destruction and traced cycle values
+retain that general path, including its service and barrier behavior. The
+external release ABI and bounded release budgets are unchanged.
+
 The direct compiler rejects combining this mode with `--bounded-owners`. The
 system, fixed and lazy launcher profiles retain ordinary bounded lowering.
 Linking scope output against an incremental runtime preserves ownership but performs a separately budgeted
