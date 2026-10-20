@@ -217,6 +217,15 @@ per-bit oracle runs at O0/O2. IR and allocator probes check that field operation
 create no managed descriptors or field-name strings. `check-register-layouts-sanitize`
 adds compiler/generated-code ASan/UBSan; the ordinary target is a portable gate.
 
+`make check-osdev-rtc` runs the actual shared RTC decoder and bounded reader
+against Python calendar expectations and scripted register transactions at
+O0/O2. It covers BCD/binary and 12/24-hour modes, leap dates, update windows,
+rollovers, invalid reads and timeouts. Two typed port-misuse controls must fail
+compilation; byte-value overflow remains a runtime check. `check-osdev-rtc-sanitize`
+adds ASan/UBSan. These hosted checks execute no port instructions. The optional
+fixed-clock QEMU run in [kernel development](os-development.md) checks the x86
+adapter and guest exit separately.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

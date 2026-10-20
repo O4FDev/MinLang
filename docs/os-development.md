@@ -56,6 +56,10 @@ The existing Makefile's recipe paths
 are not fully quoted, so actual builds require a checkout path without spaces.
 Already-built images can be run from paths with spaces or commas.
 
+`--rtc-base 2026-10-20T12:34:56` selects a fixed initial QEMU calendar with
+`clock=vm`. The calendar advances as the guest runs; initial seconds are not
+frozen. Invalid dates and extra QEMU options reject before any tools run.
+
 ## Finite kernel tests
 
 Use a kernel that prints a unique success line, then exits with status zero:

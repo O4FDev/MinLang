@@ -1,0 +1,127 @@
+// Read-only MC146818 calendar support. The RTC contains a two-digit year;
+// this interface deliberately interprets it as 2000..2099, without guessing
+// a platform-specific century register or converting local time to UTC.
+// Calendar, Result and callback values use ordinary managed storage.
+
+// Hardware field descriptions are compile-time metadata, not device objects.
+record StatusA native "register8" {
+    updating: Integer at(7, 1)
+}
+
+record StatusB native "register8" {
+    binary: Integer at(2, 1)
+    fullDay: Integer at(1, 1)
+}
+
+record Hour native "register8" {
+    value: Integer at(0, 7)
+    afternoon: Integer at(7, 1)
+}
+
+public record Calendar {
+    year: Integer
+    month: Integer
+    day: Integer
+    hour: Integer
+    minute: Integer
+    second: Integer
+}
+
+public constant MAX_ATTEMPTS = 1000000
+
+function isByte(value: Integer): Boolean {
+    return value >= 0 && value <= 255
+}
+
+// A negative result is private to the decoder: public failures are Results.
+function decodedByte(value: Integer, binary: Boolean): Integer {
+    if !isByte(value) { return -1 }
+    if binary { return value }
+    let low = value & 15
+    let high = value >> 4
+    if low > 9 || high > 9 { return -1 }
+    return high * 10 + low
+}
+
+function daysInMonth(year: Integer, month: Integer): Integer {
+    if month == 2 {
+        if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { return 29 }
+        return 28
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
+    return 31
+}
+
+// Decode one coherent raw snapshot, with every argument still a device byte.
+// Register B's other control bits are preserved by leaving the RTC untouched.
+public function decode(statusB: Integer, year: Integer, month: Integer, day: Integer, hour: Integer, minute: Integer, second: Integer): Result<Calendar, Text> {
+    if !isByte(statusB) || !isByte(hour) { return Err("RTC mode and hour must be bytes") }
+    let binary = extractField(StatusB, "binary", statusB) != 0
+    let fullDay = extractField(StatusB, "fullDay", statusB) != 0
+    let afternoon = extractField(Hour, "afternoon", hour) != 0
+    let decodedYear = decodedByte(year, binary)
+    let decodedMonth = decodedByte(month, binary)
+    let decodedDay = decodedByte(day, binary)
+    let decodedHour = decodedByte(extractField(Hour, "value", hour), binary)
+    let decodedMinute = decodedByte(minute, binary)
+    let decodedSecond = decodedByte(second, binary)
+    if decodedYear < 0 || decodedMonth < 0 || decodedDay < 0 || decodedHour < 0 || decodedMinute < 0 || decodedSecond < 0 {
+        return Err("RTC calendar contains an invalid byte or BCD digit")
+    }
+    if decodedYear > 99 || decodedMonth < 1 || decodedMonth > 12 || decodedMinute > 59 || decodedSecond > 59 {
+        return Err("RTC calendar is outside its supported ranges")
+    }
+    let calendarYear = 2000 + decodedYear
+    if decodedDay < 1 || decodedDay > daysInMonth(calendarYear, decodedMonth) {
+        return Err("RTC day does not exist in this month")
+    }
+    let calendarHour = decodedHour
+    if fullDay {
+        if afternoon || decodedHour > 23 { return Err("RTC 24-hour value is outside 0 to 23") }
+    } else {
+        if decodedHour < 1 || decodedHour > 12 { return Err("RTC 12-hour value is outside 1 to 12") }
+        calendarHour = decodedHour % 12
+        if afternoon { calendarHour += 12 }
+    }
+    return Ok(Calendar {
+        year: calendarYear; month: decodedMonth; day: decodedDay
+        hour: calendarHour; minute: decodedMinute; second: decodedSecond
+    })
+}
+
+function readByte(readRegister: Callback<Integer, Integer>, index: Integer): Result<Integer, Text> {
+    let value = readRegister(index)
+    if !isByte(value) { return Err("RTC register " + Text(index) + " did not return a byte") }
+    return Ok(value)
+}
+
+// The callback reads a selected RTC register and must return promptly. The
+// caller exclusively owns the selector: no competing CPU, handler or writer.
+// This is an attempt bound, not a wall-clock timeout; it needs no working
+// timer. A stuck UIP exhausts the budget. Checked reads also create Results.
+// Linux v6.18 mc146818_avoid_UIP documents this seconds/UIP ordering, including
+// rechecks for an update hidden by an NMI or virtualization delay.
+public function read(readRegister: Callback<Integer, Integer>, attempts: Integer): Result<Calendar, Text> {
+    if attempts <= 0 || attempts > MAX_ATTEMPTS {
+        return Err("RTC read needs between 1 and 1000000 attempts")
+    }
+    for attempt in 0..attempts {
+        let second = try readByte(readRegister, 0)
+        let before = try readByte(readRegister, 10)
+        if extractField(StatusA, "updating", before) != 0 { continue }
+        let checkedSecond = try readByte(readRegister, 0)
+        if checkedSecond != second { continue }
+        let statusB = try readByte(readRegister, 11)
+        let minute = try readByte(readRegister, 2)
+        let hour = try readByte(readRegister, 4)
+        let day = try readByte(readRegister, 7)
+        let month = try readByte(readRegister, 8)
+        let year = try readByte(readRegister, 9)
+        let after = try readByte(readRegister, 10)
+        if extractField(StatusA, "updating", after) != 0 { continue }
+        let finalSecond = try readByte(readRegister, 0)
+        if finalSecond != second { continue }
+        return decode(statusB, year, month, day, hour, minute, second)
+    }
+    return Err("RTC did not provide a stable calendar within the attempt limit")
+}

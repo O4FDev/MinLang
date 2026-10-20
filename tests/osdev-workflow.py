@@ -142,6 +142,18 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
         self.assertIn(str(arm / "kernel.elf"), command)
         self.assertIn("virtio-rng-pci,disable-legacy=on", command)
 
+    def test_fixed_rtc_base_advances_on_virtual_time(self):
+        self.invoke("test", "--rtc-base", "2026-10-20T12:34:56")
+        command = json.loads((self.work / "qemu.json").read_text())
+        self.assertEqual(command[command.index("-rtc") + 1], "base=2026-10-20T12:34:56,clock=vm")
+
+    def test_invalid_rtc_base_is_rejected_before_tools(self):
+        for value in ("2025-02-29T12:34:56", "2026-10-20T24:00:00", "2026-1-2T03:04:05", "2026-10-20T12:34:56,clock=host", "2026-10-20T12:34:56Z"):
+            with self.subTest(value=value):
+                self.invoke("test", "--rtc-base", value, expected=2)
+        self.assertFalse((self.work / "qemu.json").exists())
+        self.assertFalse(self.log.exists())
+
     def test_missing_marker_rejects_stale_serial_log(self):
         self.log.write_text("kernel checks passed\n")
         self.invoke(mode="missing", expected=1)

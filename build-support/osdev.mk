@@ -1,4 +1,4 @@
-.PHONY: check-osdev-fields check-osdev-fields-sanitize check-osdev-workflow check-osdev-host
+.PHONY: check-osdev-fields check-osdev-fields-sanitize check-osdev-workflow check-osdev-host check-osdev-rtc check-osdev-rtc-sanitize
 
 .PHONY: check-register-layouts check-register-layouts-sanitize
 build/tooling/tests/register-layouts.ll: tests/frontend-fixtures.min
@@ -18,10 +18,16 @@ check-osdev-fields-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitiz
 check-osdev-workflow:
 	python3 tests/osdev-workflow.py
 
+check-osdev-rtc: build/.toolchain.json build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-rtc.py
+
+check-osdev-rtc-sanitize: build/.toolchain.json build/minyarc-sanitize
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) python3 tests/osdev-rtc.py
+
 check-osdev-host: check-osdev-fields check-security-os-http
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts
-check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc
+check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize
 
 # Optional real hardware-emulation proof, separate from portable fake-tool tests.
 .PHONY: check-osdev-qemu

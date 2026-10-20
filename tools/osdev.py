@@ -2,6 +2,7 @@
 """Build, run, test and debug Minyar OS using the existing os/Makefile."""
 
 import argparse
+from datetime import datetime
 import math
 import os
 from pathlib import Path
@@ -32,6 +33,16 @@ def positive_seconds(value):
     if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("timeout must be a finite positive number")
     return result
+
+
+def rtc_datetime(value):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}", value):
+        raise argparse.ArgumentTypeError("RTC base must use YYYY-MM-DDTHH:MM:SS")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("RTC base must be a valid calendar date and time") from error
+    return value
 
 
 def tool(name):
@@ -100,6 +111,8 @@ def qemu_command(args):
     command = [executable, "-m", "1G", "-smp", "4", "-accel", "tcg", "-cpu", "max",
                "-display", args.display, "-serial", "stdio", "-monitor", "none",
                "-no-reboot", "-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
+    if args.rtc_base:
+        command += ["-rtc", f"base={args.rtc_base},clock=vm"]
     # QEMU key/value options use doubled commas for literal path commas.
     image = str(output / "minyar-os.img").replace(",", ",,")
     if args.arch == "x86_64":
@@ -302,6 +315,7 @@ def main(argv=None):
             part.add_argument("--kernel-source", help="finite test kernel, passed to os/Makefile with forced rebuild")
             part.add_argument("--qemu", help="QEMU executable (one path, not shell syntax)")
             part.add_argument("--display", default="none", help="QEMU display backend, e.g. cocoa or gtk; default none")
+            part.add_argument("--rtc-base", type=rtc_datetime, help="initial QEMU calendar YYYY-MM-DDTHH:MM:SS, advancing on virtual time")
             if action == "test":
                 part.add_argument("--expect", required=True, help="nonempty exact guest serial line required for success")
             if action == "debug":
