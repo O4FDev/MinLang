@@ -32,6 +32,10 @@
 #include <shellapi.h>
 #elif defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #endif
 
 /*
@@ -154,16 +158,35 @@ static MINYAR_COLD void minyar_find_stack_bounds(void) {
     }
 #elif defined(__linux__)
     {
-        pthread_attr_t attributes;
-        void *low = NULL;
-        size_t size = 0;
-        if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
-            if (pthread_attr_getstack(&attributes, &low, &size) == 0) {
-                minyar_stack_low = (uintptr_t)low;
-                if (size <= UINTPTR_MAX - minyar_stack_low)
-                    minyar_stack_high = minyar_stack_low + size;
+        /* glibc finds the main thread's stack by reading /proc/self/maps,
+         * which costs microseconds per query. That mapping never moves, so
+         * hosts that refresh bounds on every foreign call reuse the first
+         * answer. Only the main thread reads or writes this cache; a forked
+         * child has a new process id and queries its own main stack. */
+        static uintptr_t main_low, main_high;
+        static long main_process;
+        long process = (long)getpid();
+        int main_thread = (long)syscall(SYS_gettid) == process;
+        if (main_thread && main_process == process) {
+            minyar_stack_low = main_low;
+            minyar_stack_high = main_high;
+        } else {
+            pthread_attr_t attributes;
+            void *low = NULL;
+            size_t size = 0;
+            if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+                if (pthread_attr_getstack(&attributes, &low, &size) == 0) {
+                    minyar_stack_low = (uintptr_t)low;
+                    if (size <= UINTPTR_MAX - minyar_stack_low)
+                        minyar_stack_high = minyar_stack_low + size;
+                }
+                pthread_attr_destroy(&attributes);
             }
-            pthread_attr_destroy(&attributes);
+            if (main_thread) {
+                main_low = minyar_stack_low;
+                main_high = minyar_stack_high;
+                main_process = process;
+            }
         }
     }
 #endif

@@ -1275,7 +1275,10 @@ origin invariants.
 
 Generated functions check the current thread's actual stack bounds on Linux,
 macOS, and Windows, reserving enough stack to report an error. Platforms where
-bounds are unavailable use a conservative 32,768-call fallback. A 5,000-deep
+bounds are unavailable use a conservative 32,768-call fallback. On Linux, glibc
+finds the main thread's stack by reading `/proc/self/maps`; the runtime keeps
+that answer for the rest of the process, so C hosts that refresh bounds on
+every call into Minyar pay that cost once. A 5,000-deep
 program must run; compiler or program exhaustion must exit with
 `Minyar stopped: the program exceeded the maximum call depth.` rather than a
 signal.
