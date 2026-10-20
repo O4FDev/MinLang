@@ -1,0 +1,44 @@
+use "./lsp-workspace.min" as workspace
+use "./lsp-protocol.min" as protocol
+use "./driver-support.min" as host
+use "json" as json
+
+public function quickFixes(state: workspace.Workspace, document: Integer, first: Integer, after: Integer, context: json.Value): Text {
+    if !state.literalCodeActions {
+        return "[]"
+    }
+    let only = json.member(context, "only")
+    if only.kind == json.ARRAY {
+        let allowed = false
+        for kind in only.items {
+            if kind.kind == json.STRING && (kind.text == "" || kind.text == "quickfix") {
+                allowed = true
+            }
+        }
+        if !allowed {
+            return "[]"
+        }
+    }
+    let current = state.documents[document]
+    let actions: List<Text> = []
+    // Use the current server diagnostics, never edits supplied by the client.
+    for raw in current.diagnostics {
+        let diagnostic = json.parse(raw)
+        let range = json.member(diagnostic, "range")
+        let start = protocol.at(current.text, json.member(range, "start"))
+        let end = protocol.at(current.text, json.member(range, "end"))
+        if start < 0 || end <= start || start > after || end < first {
+            continue
+        }
+        let data = json.member(diagnostic, "data")
+        let original = json.string(data, "original")
+        let replacement = json.string(data, "replacement")
+        if replacement == "" || original == "" || host.textSlice(current.text, start, end) != original {
+            continue
+        }
+        let changes = "[{\"range\":" + protocol.raw(range) + ",\"newText\":" + json.quote(replacement) + "}]"
+        let edit = workspace.edits(state, [document], [changes])
+        actions.add("{\"title\":" + json.quote("Replace `" + original + "` with `" + replacement + "`") + ",\"kind\":\"quickfix\",\"diagnostics\":[" + raw + "],\"isPreferred\":true,\"edit\":" + edit + "}")
+    }
+    return "[" + host.joined(actions, ",") + "]"
+}

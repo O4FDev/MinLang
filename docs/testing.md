@@ -1475,7 +1475,14 @@ See [style](style.md) for the precise scope of this proof. The older
 
 `make check-minyar-lsp` exercises the source index, UTF-16 and file URI mapping,
 then speaks real JSON-RPC over stdio to check incremental edits, live compiler
-diagnostics, navigation, completion, symbols and formatting. Cases include
+diagnostics, navigation, completion, symbols and formatting. Refactoring cases
+check scoped references, multi-file rename with unopened callers, applying and
+compiling returned edits, alias shadowing in incomplete buffers, literal inlay
+hints and applying compiler quick fixes. Closed external callers changed on disk,
+stale diagnostics, name capture and client capability fallbacks are covered.
+Source and import-graph controls require the 512-file cap to stop loading files
+and require rename to reject a truncated search. The lighthouse editor gallery
+executes with exact output at O0/O2. Other cases include
 unsaved imported buffers, private members, configured packages, malformed
 frames/JSON/UTF-8, a missing compiler and the NDJSON diagnostic schema.
 Failures retain their source and protocol transcript. `check-minyar-tooling-ownership`

@@ -2,6 +2,8 @@ use "./lsp-workspace.min" as workspace
 use "./lsp-protocol.min" as protocol
 use "./lsp-diagnostics.min" as diagnostics
 use "./lsp-features.min" as features
+use "./lsp-inlay.min" as inlay
+use "./lsp-actions.min" as actions
 use "./editor-host.min" as native
 use "./driver-support.min" as host
 use "files" as files
@@ -25,6 +27,11 @@ function addLibrary(state: workspace.Workspace, directory: Text) {
     state.libraries.add(standard)
 }
 function initialize(state: workspace.Workspace, params: json.Value) {
+    let client = json.member(json.member(json.member(params, "capabilities"), "workspace"), "workspaceEdit")
+    let versioned = json.member(client, "documentChanges")
+    state.versionedEdits = versioned.kind == json.BOOLEAN && versioned.truth
+    let textDocument = json.member(json.member(params, "capabilities"), "textDocument")
+    state.literalCodeActions = json.member(json.member(textDocument, "codeAction"), "codeActionLiteralSupport").kind == json.OBJECT
     let root = protocol.path(json.string(params, "rootUri"))
     if root == "" {
         let folders = json.member(params, "workspaceFolders")
@@ -209,7 +216,17 @@ public function run(first: Integer) {
             }
             initialize(state, params)
             initialized = true
-            protocol.reply(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":2,\"save\":{\"includeText\":false}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"documentSymbolProvider\":true,\"documentFormattingProvider\":true},\"serverInfo\":{\"name\":\"Minyar\",\"version\":\"0.1.0\"}}")
+            let textDocument = json.member(json.member(params, "capabilities"), "textDocument")
+            let prepare = json.member(json.member(textDocument, "rename"), "prepareSupport")
+            let rename = "true"
+            if prepare.kind == json.BOOLEAN && prepare.truth {
+                rename = "{\"prepareProvider\":true}"
+            }
+            let codeAction = "false"
+            if state.literalCodeActions {
+                codeAction = "{\"codeActionKinds\":[\"quickfix\"]}"
+            }
+            protocol.reply(id, "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":2,\"save\":{\"includeText\":false}},\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":" + rename + ",\"inlayHintProvider\":true,\"codeActionProvider\":" + codeAction + ",\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"documentSymbolProvider\":true,\"documentFormattingProvider\":true},\"serverInfo\":{\"name\":\"Minyar\",\"version\":\"0.2.0\"}}")
             continue
         }
         if !initialized {
@@ -255,7 +272,7 @@ public function run(first: Integer) {
             if found >= 0 {
                 let document = state.documents[found]
                 document.open = false
-                diagnostics.publish(document.uri, document.version, [])
+                diagnostics.publishDocument(document, [])
                 workspace.loadDocument(state, document.uri)
                 for dependent in 0..state.documents.length {
                     if state.documents[dependent].open {
@@ -275,7 +292,7 @@ public function run(first: Integer) {
         if !isRequest {
             continue
         }
-        if !host.listed(["textDocument/documentSymbol", "textDocument/formatting", "textDocument/hover", "textDocument/definition", "textDocument/completion"], method.text) {
+        if !host.listed(["textDocument/documentSymbol", "textDocument/formatting", "textDocument/hover", "textDocument/definition", "textDocument/completion", "textDocument/references", "textDocument/prepareRename", "textDocument/rename", "textDocument/inlayHint", "textDocument/codeAction"], method.text) {
             protocol.error(id, - 32601, "This method is not supported.")
             continue
         }
@@ -291,7 +308,21 @@ public function run(first: Integer) {
         else if method.text == "textDocument/formatting" {
             protocol.reply(id, features.formatting(state, document))
         }
-        else if method.text == "textDocument/hover" || method.text == "textDocument/definition" || method.text == "textDocument/completion" {
+        else if method.text == "textDocument/inlayHint" || method.text == "textDocument/codeAction" {
+            let range = json.member(params, "range")
+            let first = protocol.at(state.documents[document].text, json.member(range, "start"))
+            let after = protocol.at(state.documents[document].text, json.member(range, "end"))
+            if first < 0 || after < first {
+                protocol.error(id, - 32602, "The range is outside this document.")
+                continue
+            }
+            if method.text == "textDocument/inlayHint" {
+                protocol.reply(id, inlay.hints(state, document, first, after))
+            } else {
+                protocol.reply(id, actions.quickFixes(state, document, first, after, json.member(params, "context")))
+            }
+        }
+        else {
             if offset < 0 {
                 protocol.error(id, - 32602, "The position is outside this document.")
                 continue
@@ -302,11 +333,29 @@ public function run(first: Integer) {
             else if method.text == "textDocument/definition" {
                 protocol.reply(id, features.definition(state, document, offset))
             }
-            else {
+            else if method.text == "textDocument/completion" {
                 protocol.reply(id, features.completion(state, document, offset))
             }
-        } else {
-            protocol.error(id, - 32601, "This method is not supported.")
+            else if method.text == "textDocument/references" {
+                let include = json.member(json.member(params, "context"), "includeDeclaration")
+                protocol.reply(id, features.references(state, document, offset, include.kind == json.BOOLEAN && include.truth))
+            }
+            else if method.text == "textDocument/prepareRename" {
+                protocol.reply(id, features.prepareRename(state, document, offset))
+            }
+            else if method.text == "textDocument/rename" {
+                let name = json.member(params, "newName")
+                if name.kind != json.STRING {
+                    protocol.error(id, - 32602, "Rename needs a new identifier.")
+                    continue
+                }
+                let error = features.renameError(state, document, offset, name.text)
+                if error != "" {
+                    protocol.error(id, - 32602, error)
+                } else {
+                    protocol.reply(id, features.rename(state, document, offset, name.text))
+                }
+            }
         }
     }
 }

@@ -86,7 +86,7 @@ function concreteType(state: workspace.Workspace, document: Integer, type: Text,
     }
     return found
 }
-function displayedType(state: workspace.Workspace, document: Integer, type: Text): Text {
+public function displayedType(state: workspace.Workspace, document: Integer, type: Text): Text {
     let found = typeTarget(state, document, type)
     if found.symbol >= 0 {
         let symbol = state.documents[found.document].syntax.symbols[found.symbol]
@@ -100,6 +100,46 @@ function displayedType(state: workspace.Workspace, document: Integer, type: Text
         }
     }
     return type
+}
+function importedReceiver(state: workspace.Workspace, receiver: Target): Integer {
+    if receiver.symbol < 0 || receiver.document < 0 {
+        return - 1
+    }
+    let current = state.documents[receiver.document]
+    let symbol = current.syntax.symbols[receiver.symbol]
+    if symbol.kind != 2 {
+        return - 1
+    }
+    return workspace.imported(state, current, symbol.name)
+}
+function literalField(state: workspace.Workspace, document: Integer, token: Integer, depth: Integer): Target {
+    let tokens = state.documents[document].syntax.tokens
+    let cursor = token - 1
+    let nested = 0
+    while cursor >= 0 {
+        if tokens[cursor].text == "}" {
+            nested += 1
+        }
+        if tokens[cursor].text == "{" {
+            if nested == 0 {
+                if cursor == 0 || tokens[cursor - 1].kind != 1 {
+                    return absent()
+                }
+                let owner = resolve(state, document, cursor - 1, depth + 1)
+                if owner.symbol < 0 {
+                    return absent()
+                }
+                let declaration = state.documents[owner.document].syntax.symbols[owner.symbol]
+                if declaration.kind != 23 && declaration.kind != 26 {
+                    return absent()
+                }
+                return memberTarget(state, document, owner, tokens[token].text)
+            }
+            nested -= 1
+        }
+        cursor -= 1
+    }
+    return absent()
 }
 function resolve(state: workspace.Workspace, document: Integer, token: Integer, depth: Integer): Target {
     if token < 0 || depth > 32 {
@@ -115,7 +155,8 @@ function resolve(state: workspace.Workspace, document: Integer, token: Integer, 
         }
     }
     if token >= 2 && tokens[token - 1].text == "." {
-        let imported = workspace.imported(state, current, tokens[token - 2].text)
+        let receiver = resolve(state, document, token - 2, depth + 1)
+        let imported = importedReceiver(state, receiver)
         if imported >= 0 {
             let found = index.find(state.documents[imported].syntax, name, 0, "")
             if found >= 0 && state.documents[imported].syntax.symbols[found].exported {
@@ -123,7 +164,10 @@ function resolve(state: workspace.Workspace, document: Integer, token: Integer, 
             }
             return absent()
         }
-        return memberTarget(state, document, resolve(state, document, token - 2, depth + 1), name)
+        return memberTarget(state, document, receiver, name)
+    }
+    if token + 1 < tokens.length && tokens[token + 1].text == ":" {
+        return literalField(state, document, token, depth)
     }
     let found = index.find(current.syntax, name, tokens[token].start, "")
     if found < 0 && name == "self" {
@@ -158,15 +202,13 @@ public function hover(state: workspace.Workspace, document: Integer, offset: Int
 public function definition(state: workspace.Workspace, document: Integer, offset: Integer): Text {
     let current = state.documents[document]
     let token = tokenAt(current, offset)
-    if token >= 0 {
-        let imported = workspace.imported(state, current, current.syntax.tokens[token].text)
-        if imported >= 0 {
-            return "{\"uri\":" + json.quote(state.documents[imported].uri) + ",\"range\":" + protocol.range(state.documents[imported].text, 0, 0) + "}"
-        }
-    }
     let found = resolve(state, document, token, 0)
     if found.symbol < 0 {
         return "null"
+    }
+    let imported = importedReceiver(state, found)
+    if imported >= 0 {
+        return "{\"uri\":" + json.quote(state.documents[imported].uri) + ",\"range\":" + protocol.range(state.documents[imported].text, 0, 0) + "}"
     }
     let owner = state.documents[found.document]
     return "{\"uri\":" + json.quote(owner.uri) + ",\"range\":" + selection(owner, owner.syntax.symbols[found.symbol]) + "}"
@@ -215,10 +257,10 @@ public function completion(state: workspace.Workspace, document: Integer, offset
     let container = ""
     let module = false
     if dot > 0 {
-        owner = workspace.imported(state, current, tokens[dot - 1].text)
+        let receiver = resolve(state, document, dot - 1, 0)
+        owner = importedReceiver(state, receiver)
         module = owner >= 0
         if owner < 0 {
-            let receiver = resolve(state, document, dot - 1, 0)
             if receiver.symbol < 0 {
                 return "[]"
             }
@@ -294,6 +336,300 @@ public function completion(state: workspace.Workspace, document: Integer, offset
         }
     }
     return "[" + host.joined(items, ",") + "]"
+}
+record Occurrence {
+    document: Integer
+    token: Integer
+}
+function sameTarget(first: Target, second: Target): Boolean {
+    return first.document == second.document && first.symbol == second.symbol
+}
+function localTarget(state: workspace.Workspace, found: Target): Boolean {
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    return symbol.scopeStart > 0 || symbol.kind == 2
+}
+function occurrences(state: workspace.Workspace, documents: List<Integer>, found: Target, includeDeclaration: Boolean): List<Occurrence> {
+    let items: List<Occurrence> = []
+    if found.symbol < 0 {
+        return items
+    }
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    let local = localTarget(state, found)
+    for document in documents {
+        if local && document != found.document {
+            continue
+        }
+        let current = state.documents[document]
+        for token in 0..current.syntax.tokens.length {
+            let value = current.syntax.tokens[token]
+            if value.kind != 1 || value.text != symbol.name {
+                continue
+            }
+            if !includeDeclaration && document == found.document && value.start == symbol.start {
+                continue
+            }
+            if sameTarget(resolve(state, document, token, 0), found) {
+                items.add(Occurrence { document: document; token: token })
+            }
+        }
+    }
+    return items
+}
+public function references(state: workspace.Workspace, document: Integer, offset: Integer, includeDeclaration: Boolean): Text {
+    let documents = workspace.projectDocuments(state)
+    let found = resolve(state, document, tokenAt(state.documents[document], offset), 0)
+    let items: List<Text> = []
+    for occurrence in occurrences(state, documents, found, includeDeclaration) {
+        let current = state.documents[occurrence.document]
+        let token = current.syntax.tokens[occurrence.token]
+        items.add("{\"uri\":" + json.quote(current.uri) + ",\"range\":" + protocol.range(current.text, token.start, token.end) + "}")
+    }
+    return "[" + host.joined(items, ",") + "]"
+}
+function nameStart(byte: Integer): Boolean {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function namePart(byte: Integer): Boolean {
+    return nameStart(byte) || (byte >= 48 && byte <= 57)
+}
+function identifier(name: Text): Boolean {
+    let data = Bytes(name)
+    if data.length == 0 || !nameStart(data[0]) {
+        return false
+    }
+    for byte in data {
+        if !namePart(byte) {
+            return false
+        }
+    }
+    return true
+}
+function reserved(name: Text): Boolean {
+    return host.listed(["_", "self", "true", "false", "let", "constant", "global", "function", "record", "choice", "type", "match", "if", "else", "for", "in", "while", "return", "break", "continue", "use", "as", "public", "private", "try", "native", "parallel", "thread", "reduce", "test", "expect", "where", "capability", "conform", "to", "requires", "ensures", "together", "Integer", "Float", "Boolean", "Text", "Character", "Bytes", "Nothing", "List", "Map", "Set", "Result", "Maybe", "Ok", "Err", "Some", "None", "abs", "clamp", "exit", "fail", "joinText", "max", "min", "parallelEntry", "print", "wrappingAdd", "wrappingMultiply", "wrappingSubtract"], name)
+}
+function containsName(text: Text, name: Text): Boolean {
+    let data = Bytes(text)
+    let start = 0
+    while start < data.length {
+        let found = host.findText(text, name, start)
+        if found < 0 {
+            return false
+        }
+        let end = found + name.byteLength
+        if (found == 0 || !namePart(data[found - 1])) && (end == data.length || !namePart(data[end])) {
+            return true
+        }
+        start = end
+    }
+    return false
+}
+function editable(state: workspace.Workspace, found: Target): Boolean {
+    if found.symbol < 0 || found.document < 0 {
+        return false
+    }
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    if symbol.container == "@self" || symbol.kind == 22 || reserved(symbol.name) {
+        return false
+    }
+    // Choice cases and generic/pattern binders need a compiler-backed index.
+    if symbol.kind == 23 && symbol.detail.startsWith("choice ") {
+        return false
+    }
+    return identifier(symbol.name)
+}
+function unsupportedBinding(state: workspace.Workspace, document: Integer, found: Target, newName: Text): Boolean {
+    let current = state.documents[document]
+    let tokens = current.syntax.tokens
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    let local = localTarget(state, found)
+    for token in 0..tokens.length {
+        if local && !index.visible(symbol, tokens[token].start) {
+            continue
+        }
+        let value = tokens[token]
+        if value.kind == 3 && !value.text.startsWith("#") && host.hasText(value.text, "\\(") && (containsName(value.text, symbol.name) || containsName(value.text, newName)) {
+            return true
+        }
+        if (value.text == "let" || value.text == "constant" || value.text == "global") && token + 1 < tokens.length {
+            let declared = tokens[token + 1].text
+            if declared == symbol.name || declared == newName {
+                let cursor = token + 2
+                let nesting = 0
+                let initializer = false
+                while cursor < tokens.length {
+                    let item = tokens[cursor]
+                    if nesting == 0 && (item.text == ";" || item.text == "}" || item.line > tokens[cursor - 1].line) {
+                        break
+                    }
+                    if item.text == "=" {
+                        initializer = true
+                    }
+                    if initializer && item.kind == 1 && item.text == declared {
+                        return true
+                    }
+                    if item.text == "(" || item.text == "[" || item.text == "{" {
+                        nesting += 1
+                    }
+                    if item.text == ")" || item.text == "]" || item.text == "}" {
+                        nesting -= 1
+                    }
+                    cursor += 1
+                }
+            }
+        }
+        if value.text == "for" {
+            let cursor = token + 1
+            while cursor < tokens.length && tokens[cursor].text != "in" && tokens[cursor].text != "{" && tokens[cursor].line <= value.line + 1 {
+                if tokens[cursor].text == symbol.name || tokens[cursor].text == newName {
+                    return true
+                }
+                cursor += 1
+            }
+        }
+        if value.text == "function" || value.text == "record" || value.text == "choice" {
+            let cursor = token + 1
+            let generic = false
+            let anonymous = cursor < tokens.length && tokens[cursor].text == "("
+            while cursor < tokens.length && tokens[cursor].text != "{" && tokens[cursor].text != ")" && tokens[cursor].line <= value.line + 10 {
+                if tokens[cursor].text == "<" {
+                    generic = true
+                }
+                if (anonymous || generic) && (tokens[cursor].text == symbol.name || tokens[cursor].text == newName) {
+                    return true
+                }
+                if tokens[cursor].text == "(" && !anonymous {
+                    break
+                }
+                if tokens[cursor].text == ">" || tokens[cursor].text == ">>" {
+                    generic = false
+                }
+                cursor += 1
+            }
+        }
+        if value.text == "(" && token > 0 && tokens[token - 1].kind == 1 {
+            let declaration = false
+            for callable in current.syntax.symbols {
+                if callable.start == tokens[token - 1].start && (callable.kind == 12 || callable.kind == 6) {
+                    declaration = true
+                }
+            }
+            let cursor = token + 1
+            let nested = 1
+            let named = false
+            while cursor < tokens.length && nested > 0 {
+                if tokens[cursor].text == "(" {
+                    nested += 1
+                }
+                if tokens[cursor].text == ")" {
+                    nested -= 1
+                }
+                if tokens[cursor].text == symbol.name || tokens[cursor].text == newName {
+                    named = true
+                }
+                cursor += 1
+            }
+            if !declaration && named && cursor < tokens.length && (tokens[cursor].text == "{" || tokens[cursor].text == "where") {
+                return true
+            }
+        }
+    }
+    return false
+}
+function renameIssue(state: workspace.Workspace, documents: List<Integer>, found: Target, newName: Text): Text {
+    if !editable(state, found) {
+        return "Choose a declared name that the language server can safely rename."
+    }
+    if !identifier(newName) || reserved(newName) {
+        return "Choose a name using ASCII letters, digits and underscores that is not a language or built-in name."
+    }
+    if state.graphTruncated {
+        return "This workspace exceeds the source scan limit, so a complete rename cannot be guaranteed."
+    }
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    let local = localTarget(state, found)
+    for document in documents {
+        if local && document != found.document {
+            continue
+        }
+        let current = state.documents[document]
+        if current.syntax.error != "" && (document == found.document || containsName(current.text, symbol.name)) {
+            return "Fix the source syntax errors before renaming this name."
+        }
+        if unsupportedBinding(state, document, found, newName) {
+            return "This name appears in an interpolation or binding form that cannot yet be renamed safely."
+        }
+        if newName == symbol.name {
+            continue
+        }
+        if document == found.document {
+            for other in current.syntax.symbols {
+                if other.name == newName && other.container == symbol.container && other.scopeStart <= symbol.scopeEnd && symbol.scopeStart <= other.scopeEnd {
+                    return "That name already belongs to another declaration in an overlapping scope."
+                }
+            }
+        }
+        for token in 0..current.syntax.tokens.length {
+            let value = current.syntax.tokens[token]
+            if value.kind != 1 || (local && !index.visible(symbol, value.start)) {
+                continue
+            }
+            if value.text == symbol.name && resolve(state, document, token, 0).symbol < 0 {
+                return "Some uses of this name cannot be resolved safely."
+            }
+            if value.text == newName && document == found.document && symbol.container == "" && index.visible(symbol, value.start) {
+                let member = token > 0 && current.syntax.tokens[token - 1].text == "."
+                let label = token + 1 < current.syntax.tokens.length && current.syntax.tokens[token + 1].text == ":"
+                if !member && !label {
+                    return "That name would capture an existing use in this scope."
+                }
+            }
+        }
+    }
+    return ""
+}
+public function prepareRename(state: workspace.Workspace, document: Integer, offset: Integer): Text {
+    let documents = workspace.projectDocuments(state)
+    let token = tokenAt(state.documents[document], offset)
+    let found = resolve(state, document, token, 0)
+    if !editable(state, found) {
+        return "null"
+    }
+    let symbol = state.documents[found.document].syntax.symbols[found.symbol]
+    if renameIssue(state, documents, found, symbol.name) != "" {
+        return "null"
+    }
+    let current = state.documents[document]
+    return "{\"range\":" + protocol.range(current.text, current.syntax.tokens[token].start, current.syntax.tokens[token].end) + ",\"placeholder\":" + json.quote(symbol.name) + "}"
+}
+public function renameError(state: workspace.Workspace, document: Integer, offset: Integer, newName: Text): Text {
+    let documents = workspace.projectDocuments(state)
+    let found = resolve(state, document, tokenAt(state.documents[document], offset), 0)
+    return renameIssue(state, documents, found, newName)
+}
+public function rename(state: workspace.Workspace, document: Integer, offset: Integer, newName: Text): Text {
+    let documents = workspace.projectDocuments(state)
+    let found = resolve(state, document, tokenAt(state.documents[document], offset), 0)
+    if renameIssue(state, documents, found, newName) != "" {
+        return "null"
+    }
+    let changes = occurrences(state, documents, found, true)
+    let changed: List<Integer> = []
+    let edits: List<Text> = []
+    for owner in documents {
+        let items: List<Text> = []
+        let current = state.documents[owner]
+        for occurrence in changes {
+            if occurrence.document == owner {
+                let token = current.syntax.tokens[occurrence.token]
+                items.add("{\"range\":" + protocol.range(current.text, token.start, token.end) + ",\"newText\":" + json.quote(newName) + "}")
+            }
+        }
+        if items.length > 0 {
+            changed.add(owner)
+            edits.add("[" + host.joined(items, ",") + "]")
+        }
+    }
+    return workspace.edits(state, changed, edits)
 }
 public function symbols(state: workspace.Workspace, document: Integer): Text {
     let current = state.documents[document]

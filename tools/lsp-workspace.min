@@ -12,6 +12,7 @@ public record Document {
     version: Integer
     open: Boolean
     syntax: index.Index
+    diagnostics: List<Text>
 }
 public record Workspace {
     root: Text
@@ -21,6 +22,8 @@ public record Workspace {
     temporary: Text
     jsonDiagnostics: Integer
     graphTruncated: Boolean
+    versionedEdits: Boolean
+    literalCodeActions: Boolean
 }
 
 public function create(root: Text, compiler: Text, libraries: List<Text>): Workspace {
@@ -32,6 +35,8 @@ public function create(root: Text, compiler: Text, libraries: List<Text>): Works
         temporary: ""
         jsonDiagnostics: 0
         graphTruncated: false
+        versionedEdits: false
+        literalCodeActions: false
     }
 }
 public function find(workspace: Workspace, path: Text): Integer {
@@ -61,13 +66,19 @@ public function loadDocument(workspace: Workspace, uri: Text): Integer {
     if valid {
         text = Text(loaded.data)
     }
+    if existing >= 0 && valid && workspace.documents[existing].text == text && workspace.documents[existing].syntax.error != "This source file is not valid UTF-8." {
+        return existing
+    }
     let syntax = index.build(text)
     if !valid {
         syntax.error = "This source file is not valid UTF-8."
     }
     if existing >= 0 {
-        workspace.documents[existing].text = text
-        workspace.documents[existing].syntax = syntax
+        if workspace.documents[existing].text != text || workspace.documents[existing].syntax.error != syntax.error {
+            workspace.documents[existing].text = text
+            workspace.documents[existing].syntax = syntax
+            workspace.documents[existing].diagnostics.clear()
+        }
         return existing
     }
     workspace.documents.add(Document {
@@ -77,6 +88,7 @@ public function loadDocument(workspace: Workspace, uri: Text): Integer {
         version: 0
         open: false
         syntax: syntax
+        diagnostics: []
     })
     return workspace.documents.length - 1
 }
@@ -97,6 +109,7 @@ public function update(workspace: Workspace, uri: Text, text: Text, version: Int
         old.version = version
         old.open = true
         old.syntax = index.build(text)
+        old.diagnostics.clear()
         return found
     }
     workspace.documents.add(Document {
@@ -106,6 +119,7 @@ public function update(workspace: Workspace, uri: Text, text: Text, version: Int
         version: version
         open: true
         syntax: index.build(text)
+        diagnostics: []
     })
     return workspace.documents.length - 1
 }
@@ -153,6 +167,125 @@ public function imported(workspace: Workspace, document: Document, name: Text): 
     return - 1
 }
 
+// Search project sources, open buffers and their import graphs. Bound both
+// files and directory work; rename must refuse a truncated search.
+function includes(documents: List<Integer>, document: Integer): Boolean {
+    for existing in documents {
+        if existing == document {
+            return true
+        }
+    }
+    return false
+}
+public function projectDocuments(workspace: Workspace): List<Integer> {
+    workspace.graphTruncated = false
+    let found: List<Integer> = []
+    for position in 0..workspace.documents.length {
+        if workspace.documents[position].open {
+            graph(workspace, position, found)
+            if workspace.graphTruncated {
+                return found
+            }
+        }
+    }
+    let directories = [workspace.root]
+    let visited: List<Text> = []
+    let position = 0
+    let entries = 0
+    while position < directories.length {
+        let directory = host.resolveName(directories[position])
+        position += 1
+        if host.listed(visited, directory) {
+            continue
+        }
+        visited.add(directory)
+        let names = files.list(directory)
+        if files.lastError() < 0 {
+            workspace.graphTruncated = true
+            continue
+        }
+        if names.length > 32768 - entries {
+            workspace.graphTruncated = true
+            return found
+        }
+        names.sort()
+        for name in names {
+            entries += 1
+            if entries > 32768 || directories.length > 4096 {
+                workspace.graphTruncated = true
+                return found
+            }
+            if name.startsWith(".") || host.listed(["build", "target", "node_modules", "vendor"], name) {
+                continue
+            }
+            let path = directory + "/" + name
+            let kind = host.fileStatus(path).kind
+            if kind == "d" {
+                directories.add(path)
+            }
+            else if kind == "f" && name.endsWith(".min") {
+                if found.length >= 512 && !includes(found, find(workspace, host.resolveName(path))) {
+                    workspace.graphTruncated = true
+                    return found
+                }
+                let document = loadDocument(workspace, protocol.uri(path))
+                if document >= 0 {
+                    graph(workspace, document, found)
+                    if workspace.graphTruncated {
+                        return found
+                    }
+                } else {
+                    workspace.graphTruncated = true
+                }
+            }
+        }
+    }
+    // Include a directly queried external module, even without an open buffer.
+    for document in 0..workspace.documents.length {
+        if workspace.documents[document].open || host.isFile(workspace.documents[document].path) {
+            if includes(found, document) {
+                continue
+            }
+            if found.length >= 512 {
+                workspace.graphTruncated = true
+                return found
+            }
+            let refreshed = loadDocument(workspace, workspace.documents[document].uri)
+            if refreshed >= 0 {
+                graph(workspace, refreshed, found)
+                if workspace.graphTruncated {
+                    return found
+                }
+            } else {
+                workspace.graphTruncated = true
+            }
+        }
+    }
+    return found
+}
+
+// Prefer versioned edits when the client supports them. Otherwise retain the
+// WorkspaceEdit changes representation supported by every LSP client.
+public function edits(workspace: Workspace, documents: List<Integer>, changes: List<Text>): Text {
+    let items: List<Text> = []
+    for position in 0..documents.length {
+        let document = workspace.documents[documents[position]]
+        if workspace.versionedEdits {
+            let version = "null"
+            if document.open {
+                version = Text(document.version)
+            }
+            items.add("{\"textDocument\":{\"uri\":" + json.quote(document.uri) + ",\"version\":" + version + "},\"edits\":" + changes[position] + "}")
+        } else {
+            items.add(json.quote(document.uri) + ":" + changes[position])
+        }
+    }
+    if workspace.versionedEdits {
+        return "{\"documentChanges\":[" + host.joined(items, ",") + "]}"
+    }
+    return "{\"changes\":{" + host.joined(items, ",") + "}}"
+}
+
 // Load only the import graph, using every open buffer's current contents.
 // Diagnostics compile a private rewritten graph; user files are never changed.
 function graph(workspace: Workspace, document: Integer, found: List<Integer>) {
@@ -172,9 +305,16 @@ function graph(workspace: Workspace, document: Integer, found: List<Integer>) {
         if path == "" {
             continue
         }
+        if found.length >= 512 && !includes(found, find(workspace, path)) {
+            workspace.graphTruncated = true
+            return
+        }
         let child = loadDocument(workspace, protocol.uri(path))
         if child >= 0 {
             graph(workspace, child, found)
+            if workspace.graphTruncated {
+                return
+            }
         }
     }
 }

@@ -1,7 +1,12 @@
 use "../tools/editor-index.min" as index
 use "../tools/lsp-protocol.min" as protocol
 use "../tools/editor-source.min" as source
+use "../tools/lsp-workspace.min" as workspace
+use "../tools/lsp-features.min" as features
+use "../tools/lsp-inlay.min" as inlay
+use "../tools/driver-support.min" as host
 use "../tools/testing.min" as test
+use "io" as io
 use "json" as json
 
 let code = "/// The home light.\npublic record Lamp { light: Integer; private secret: Text }\nfunction Lamp.glow(amount: Integer) { let hidden = 0xFE; self.light += amount }\nlet name: Text = \"moon\"\nfunction other() { let name: Integer = 42; print(name) }\nprint(name)\n"
@@ -91,4 +96,35 @@ test.check(protocol.scalarOffset(text, 1, 3) == 5 && protocol.scalarOffset(text,
 let path = "/tmp/Minyar café #星?.min"
 test.check(protocol.path(protocol.uri(path)) == path, "file URI round trip")
 test.check(protocol.path("https://example.invalid/a.min") == "" && protocol.path("file:///tmp/%00.min") == "" && protocol.path("file:///tmp/%ff.min") == "", "invalid URI rejection")
+
+let scratch = test.scratch()
+let state = workspace.create(scratch, "", [])
+let literalSource = "let moon = \"🌙\"; constant count = -2\nlet typed: Integer = 3\nlet compared = 1 == 1\nlet commented = 1 /*\n*/ == 1\nlet multiline = \"\"\"hello\nthere\"\"\" == \"hello\"\n"
+let document = workspace.update(state, protocol.uri(scratch + "/literals.min"), literalSource, 1)
+let hints = json.parse(inlay.hints(state, document, 0, literalSource.byteLength))
+test.check(hints.kind == json.ARRAY && hints.items.length == 2, "inlay hints must not guess expression types")
+test.check(json.string(hints.items[0], "label") == ": Text" && json.string(hints.items[1], "label") == ": Integer", "literal inlay types")
+
+// A truncated scan must stop loading source files, not merely stop returning
+// their IDs. The same limit applies to a single root with many direct imports.
+let bounded = scratch + "/bounded"
+host.makeDirectories(bounded)
+let imports: List<Text> = []
+for number in 0..520 {
+    let name = "source-\(number).min"
+    io.writeTextFile(bounded + "/" + name, "let value = 1\n")
+    imports.add("use \"./" + name + "\" as source\(number)\n")
+}
+let boundedState = workspace.create(bounded, "", [])
+let discovered = workspace.projectDocuments(boundedState)
+test.check(discovered.length == 512 && boundedState.documents.length == 512 && boundedState.graphTruncated, "workspace file scan exceeded its source limit")
+let issue = features.renameError(boundedState, discovered[0], 5, "renamed")
+test.check(host.hasText(issue, "source scan limit"), "rename must reject a truncated workspace")
+io.writeTextFile(bounded + "/root.min", joinText(imports))
+let graphState = workspace.create(bounded, "", [])
+let root = workspace.loadDocument(graphState, protocol.uri(bounded + "/root.min"))
+let graph = workspace.snapshot(graphState, root)
+test.check(graph.documents.length == 512 && graphState.documents.length == 512 && graphState.graphTruncated, "import graph exceeded its source limit")
+host.cleanup()
+test.removeScratch(scratch)
 print("editor source index, scopes, recovery, UTF-16 and URI checks passed")

@@ -1,5 +1,6 @@
 use "./lsp-workspace.min" as workspace
 use "./lsp-protocol.min" as protocol
+use "./editor-source.min" as source
 use "./driver-support.min" as host
 use "json" as json
 use "system" as system
@@ -58,6 +59,38 @@ function compile(state: workspace.Workspace, snapshot: workspace.Snapshot, json:
 function diagnostic(text: Text, first: Integer, after: Integer, message: Text, severity: Integer): Text {
     return "{\"range\":" + protocol.range(text, first, after) + ",\"severity\":\(severity),\"source\":\"minyar\",\"message\":" + json.quote(message) + "}"
 }
+function suggestion(item: json.Value): Text {
+    let help = json.member(item, "help")
+    if help.kind != json.ARRAY {
+        return ""
+    }
+    for hint in help.items {
+        if hint.kind != json.STRING || !hint.text.startsWith("did you mean `") || !hint.text.endsWith("`?") {
+            continue
+        }
+        let name = host.textSlice(hint.text, 14, hint.text.byteLength - 2)
+        let scanned = source.scan(name)
+        if scanned.error == "" && scanned.tokens.length == 1 && scanned.tokens[0].kind == 1 && scanned.tokens[0].text == name {
+            return name
+        }
+    }
+    return ""
+}
+function compilerDiagnostic(document: workspace.Document, first: Integer, after: Integer, message: Text, severity: Integer, item: json.Value): Text {
+    let ordinary = diagnostic(document.text, first, after, message, severity)
+    let replacement = suggestion(item)
+    if replacement == "" {
+        return ordinary
+    }
+    // Suggestions replace exactly the identifier underlined by the compiler.
+    // A zero-width legacy span or a range covering an expression is not a fix.
+    for token in document.syntax.tokens {
+        if token.kind == 1 && token.start == first && token.end == after && token.text != replacement {
+            return host.textSlice(ordinary, 0, ordinary.byteLength - 1) + ",\"data\":{\"original\":" + json.quote(token.text) + ",\"replacement\":" + json.quote(replacement) + "}}"
+        }
+    }
+    return ordinary
+}
 function digitsAfter(text: Text, prefix: Text, fallback: Integer): Integer {
     let found = host.findText(text, prefix, 0)
     if found < 0 {
@@ -80,16 +113,20 @@ function digitsAfter(text: Text, prefix: Text, fallback: Integer): Integer {
 public function publish(uri: Text, version: Integer, items: List<Text>) {
     protocol.notify("textDocument/publishDiagnostics", "{\"uri\":" + json.quote(uri) + ",\"version\":\(version),\"diagnostics\":[" + host.joined(items, ",") + "]}")
 }
+public function publishDocument(document: workspace.Document, items: List<Text>) {
+    document.diagnostics = items
+    publish(document.uri, document.version, items)
+}
 public function check(state: workspace.Workspace, root: Integer) {
     let current = state.documents[root]
     if current.syntax.error != "" {
         let first = min(current.syntax.errorStart, current.text.byteLength)
-        publish(current.uri, current.version, [diagnostic(current.text, first, first, current.syntax.error, 1)])
+        publishDocument(current, [diagnostic(current.text, first, first, current.syntax.error, 1)])
         return
     }
     let snapshot = workspace.snapshot(state, root)
     if state.graphTruncated {
-        publish(current.uri, current.version, [diagnostic(current.text, 0, 0, "The editor can check up to 512 reachable source files at once.", 2)])
+        publishDocument(current, [diagnostic(current.text, 0, 0, "The editor can check up to 512 reachable source files at once.", 2)])
         return
     }
     let sourceErrors = false
@@ -106,7 +143,7 @@ public function check(state: workspace.Workspace, root: Integer) {
                 let first = min(document.syntax.errorStart, document.text.byteLength)
                 items.add(diagnostic(document.text, first, first, document.syntax.error, 1))
             }
-            publish(document.uri, document.version, items)
+            publishDocument(document, items)
         }
         return
     }
@@ -154,7 +191,7 @@ public function check(state: workspace.Workspace, root: Integer) {
             }
             for position in 0..snapshot.documents.length {
                 if snapshot.documents[position] == target {
-                    collected[position].add(diagnostic(document.text, first, max(first, after), message, severity))
+                    collected[position].add(compilerDiagnostic(document, first, max(first, after), message, severity, item))
                 }
             }
             count += 1
@@ -188,6 +225,6 @@ public function check(state: workspace.Workspace, root: Integer) {
     }
     for position in 0..snapshot.documents.length {
         let document = state.documents[snapshot.documents[position]]
-        publish(document.uri, document.version, collected[position])
+        publishDocument(document, collected[position])
     }
 }

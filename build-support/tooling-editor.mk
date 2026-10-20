@@ -10,7 +10,7 @@ check-minyar-format: build/tooling/tools/format-cli build/tooling/tests/format b
 .PHONY: check-minyar-lsp check-minyar-tooling-ownership check-minyar-tooling-sanitize
 check-minyar-lsp: build/tooling/tools/lsp-cli build/tooling/tests/editor-index build/minyarc
 	./build/tooling/tests/editor-index
-	python3 tests/editor-lsp.py "$(CURDIR)/build/tooling/tools/lsp-cli" "$(CURDIR)/build/minyarc"
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/editor-lsp.py "$(CURDIR)/build/tooling/tools/lsp-cli" "$(CURDIR)/build/minyarc"
 
 check-minyar-tooling-ownership: build/tooling/tests/editor-verification build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/editor-verification

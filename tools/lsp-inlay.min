@@ -1,0 +1,98 @@
+use "./lsp-workspace.min" as workspace
+use "./lsp-protocol.min" as protocol
+use "./editor-index.min" as index
+use "./editor-source.min" as source
+use "./driver-support.min" as host
+use "json" as json
+
+// Symbols include parameters and synthetic entries, and are not a token index.
+// Match their exact byte offset rather than resolving a possibly shadowed name.
+function bindingToken(document: workspace.Document, symbol: index.Symbol): Integer {
+    let tokens = document.syntax.tokens
+    let first = 0
+    let after = tokens.length
+    while first < after {
+        let middle = first + (after - first) / 2
+        if tokens[middle].start < symbol.start {
+            first = middle + 1
+        } else {
+            after = middle
+        }
+    }
+    if first >= tokens.length || tokens[first].start != symbol.start || tokens[first].text != symbol.name {
+        return - 1
+    }
+    return first
+}
+
+// The source index infers from the first initializer token, not a checked
+// expression. Only complete scalar literals are certain here: for example,
+// `1 == 1` must never inherit the first token's Integer type. Other expression
+// forms need compiler-derived type metadata before they can produce hints.
+function literalInitializer(document: workspace.Document, name: Integer): Boolean {
+    let tokens = document.syntax.tokens
+    let value = name + 2
+    if value >= tokens.length {
+        return false
+    }
+    if tokens[value].text == "-" {
+        value += 1
+        if value >= tokens.length || tokens[value].kind != 2 {
+            return false
+        }
+    }
+    let literal = tokens[value]
+    if literal.kind != 2 && literal.kind != 3 && literal.text != "true" && literal.text != "false" {
+        return false
+    }
+    if value + 1 == tokens.length {
+        return true
+    }
+    let next = tokens[value + 1]
+    if next.text == ";" || next.text == "}" {
+        return true
+    }
+    // Comments and newlines are absent from Index.tokens. Scan only the gap so
+    // LF inside a block comment cannot masquerade as a statement terminator;
+    // a multiline literal's interior must not count as a terminator either.
+    let gap = source.scan(host.textSlice(document.text, literal.end, next.start))
+    for token in gap.tokens {
+        if token.kind == 6 {
+            return true
+        }
+    }
+    return false
+}
+
+public function hints(state: workspace.Workspace, document: Integer, first: Integer, after: Integer): Text {
+    if document < 0 || document >= state.documents.length || first < 0 || after <= first {
+        return "[]"
+    }
+    let current = state.documents[document]
+    if current.syntax.error != "" {
+        return "[]"
+    }
+    let tokens = current.syntax.tokens
+    let items: List<Text> = []
+    for symbol in current.syntax.symbols {
+        if (symbol.kind != 13 && symbol.kind != 14) || symbol.container != "" || symbol.type == "" {
+            continue
+        }
+        let name = bindingToken(current, symbol)
+        if name < 1 || name + 1 >= tokens.length {
+            continue
+        }
+        let keyword = tokens[name - 1].text
+        // Requiring '=' immediately after the name also suppresses explicit
+        // annotations. Parameters and global declarations have no such prefix.
+        if (keyword != "let" && keyword != "constant") || tokens[name + 1].text != "=" {
+            continue
+        }
+        let position = tokens[name].end
+        if position < first || position >= after || !literalInitializer(current, name) {
+            continue
+        }
+        items.add("{\"position\":" + protocol.position(current.text, position) + ",\"label\":" + json.quote(": " + symbol.type) + ",\"kind\":1,\"paddingLeft\":false,\"paddingRight\":false}")
+    }
+    return "[" + host.joined(items, ",") + "]"
+}

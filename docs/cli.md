@@ -224,7 +224,8 @@ is for user projects, not the compiler repository's full test suite.
 `minyar fmt src tests` formats Minyar source; `--check` reports files needing
 formatting, and `--stdout FILE` previews one file. See the [style guide](style.md)
 for canonical layout and file handling. `minyar lsp --stdio` starts the language
-server for diagnostics, completion, navigation and formatting; the
+server for diagnostics, completion, navigation, rename, type hints, quick fixes
+and formatting; the
 [editor guide](editor.md) describes client setup and current navigation limits.
 
 ## Package discovery and release records
