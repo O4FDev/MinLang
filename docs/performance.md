@@ -291,3 +291,33 @@ baseline/candidate/native batches, retains every order and CPU/wall sample,
 and verifies exact baseline/candidate output and live-object cleanup. Those
 timings include the existing Python wrapper, copies, allocations and guards;
 they must not be substituted for a native decoder-throughput measurement.
+
+## Compiler profile guidance
+
+On native Linux, `make compiler-pgo` builds an isolated compiler using LLVM IR
+profile guidance and compares it with the same compiler built without a profile.
+It leaves the ordinary compiler unchanged. The pinned LLVM installation must
+include matching `llvm-profdata`, LLD and the compiler-rt profile archive.
+
+Each invocation creates a fresh directory below `build/compiler-pgo`. It retains
+the baseline, instrumented trainer, profile-use compiler, raw and merged profiles,
+input hashes, exact commands, reference LLVM, all samples and `results.json`.
+The JSON summary gives the candidate path. `make check-compiler-pgo` runs the
+same correctness checks with three retained pairs instead of the default 31.
+These targets are explicit experiments, outside the portable gate by default.
+
+Training uses self-compilation and three ordinary language/gallery programs.
+Timing alternates baseline and candidate processes after three warmups per role.
+Self-compilation is a trained workload; the separate holdouts contain 1,200
+functions with a late call, 1,000 records and a 64-module import graph. Every
+measured invocation must emit identical LLVM, stdout and stderr. Additional
+gallery programs and three rejected inputs must agree, and generated holdouts
+must execute with independently expected output at O0 and O2. Input and profile
+hashes must stay unchanged throughout validation and timing.
+
+Child CPU measurements exclude the Python harness. Wall measurements cover
+subprocess startup through exit with stdout/stderr capture; this is a warm-filesystem, fresh-process
+comparison on one host. The tool reports the median paired ratios and their
+full range. It enforces correctness, not a speed threshold: inspect the retained
+samples and holdouts before choosing a compiler. Profile generation and extra
+links have a cost, and no result from this experiment changes release defaults.

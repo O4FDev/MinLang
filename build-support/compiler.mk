@@ -149,3 +149,11 @@ check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o 
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/native-records
 
 check check-portable: check-native-records
+
+# Profiling is opt-in and creates separate executables and retained evidence.
+.PHONY: compiler-pgo check-compiler-pgo
+compiler-pgo: build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/minyar-runtime.o
+	python3 experiments/compiler/pgo.py
+
+check-compiler-pgo: build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/minyar-runtime.o
+	python3 experiments/compiler/pgo.py --samples 3
