@@ -1106,3 +1106,12 @@ header/payload/directory gallery at O0/O2 with ownership assertions. The decoder
 rejects every truncated prefix and malformed ranges without overflowing offset
 arithmetic. `check-pages-sanitize` adds ASan/UBSan. See [pages](pages.md) for the
 explicit checks, copies and Result construction costs.
+
+`make check-completionio` checks bounded queue ownership, copied buffers,
+descriptor retention, partial submissions, EINTR, short/failed completions,
+cleanup and typed wrappers at O0/O2. The syscall mock and forced-unsupported
+controls run portably; `check-completionio-sanitize` adds ASan/UBSan.
+`make check-completionio-kernel` requires actual Linux io_uring reads, writes
+and drained syncs, including the managed ABI and gallery. Unsupported kernels
+fail this separate proof target. See [completion I/O](completion-io.md) for
+resource and durability limits.

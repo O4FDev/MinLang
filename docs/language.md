@@ -498,6 +498,12 @@ little-endian fields. Invalid ranges return Results, and copied input/output
 buffers keep page bounds stable across aliases. See [checked pages](pages.md)
 for the runtime checks and allocation costs.
 
+Import `completionio` for bounded Linux io_uring file reads, writes and syncs.
+Its typed queue reports submission and completion failures separately, copies
+buffers and retains file descriptors until completion. Queues require explicit
+draining and closing. See [completion I/O](completion-io.md) for platform
+support, ownership and durability requirements.
+
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically. Acyclic components

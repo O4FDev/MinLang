@@ -1,0 +1,58 @@
+use "completionio" as queue
+use "files" as files
+use "system" as system
+
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+
+let harbour = Bytes("The harbour is lit.\n")
+let home = Bytes("The boats are home.\n")
+let q = queue.create(3, harbour.length + home.length).unwrap()
+
+let path = "durable-batch-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds()) + ".log"
+let file = files.openFile(path, files.WRITE | files.CREATE | files.EXCLUSIVE).unwrap()
+let light = q.write(file, 0, harbour, 1).unwrap()
+let boats = q.write(file, harbour.length, home, 2).unwrap()
+let promise = q.sync(file, 3).unwrap()
+files.closeFile(file).unwrap()
+
+let attempts = 0
+while q.staged().unwrap() > 0 {
+    attempts += 1
+    require(attempts <= 64, "submission did not progress")
+    let submitted = q.submit()
+    match submitted {
+        Ok(count) { require(count > 0, "submission made no progress") }
+        Err(failure) { require(failure.nativeCode() == 4, failure.describe()) }
+    }
+}
+
+let lit = false
+let arrived = false
+let durable = false
+attempts = 0
+while q.pending().unwrap() > 0 {
+    attempts += 1
+    require(attempts <= 64, "collection did not progress")
+    let completion = q.next(true)
+    match completion {
+        Ok(available) {
+            match available {
+                Some(done) {
+                    let count = done.count().unwrap()
+                    if done.id == light { require(count == harbour.length && !lit, "incomplete first record"); lit = true }
+                    else if done.id == boats { require(count == home.length && !arrived, "incomplete second record"); arrived = true }
+                    else { require(done.id == promise && count == 0 && !durable, "sync failed"); durable = true }
+                }
+                None { fail("a submitted operation has no completion") }
+            }
+        }
+        Err(failure) { require(failure.nativeCode() == 4, failure.describe()) }
+    }
+}
+require(lit && arrived && durable, "the whole batch must complete")
+q.close().unwrap()
+files.flushDirectory(".").unwrap()
+print("Two records, one durable promise.")
+
+// The demonstration has acknowledged its batch; tidy the example's file.
+files.deleteFile(path).unwrap()
