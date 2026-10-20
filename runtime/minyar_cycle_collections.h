@@ -420,6 +420,37 @@ MinyarRecord *minyar_record_new_scalar(long long field_count) {
     return record_allocate(field_count, 0);
 }
 
+/* The caller owns record, has evaluated every scalar initializer, and will
+ * write every field before publishing the result. Nominal type/layout checks
+ * belong to that compiler proof; only ordinary scalar allocations may reuse. */
+MinyarRecord *minyar_record_reuse_scalar_take(MinyarRecord *record, long long field_count) {
+    if (field_count < 0 || (unsigned long long)field_count > SIZE_MAX / sizeof(long long))
+        minyar_stop("this record has too many fields.");
+#ifdef MINYAR_COMPILER_ARENA
+    (void)record;
+    return minyar_record_new_scalar(field_count);
+#else
+    if ((unsigned long long)field_count >
+        (SIZE_MAX - sizeof(RcObject) - sizeof(*record)) / sizeof(long long))
+        out_of_memory();
+    if (record && ((RcObject *)record - 1)->ownership == (8 | RC_SCALAR_RECORD) &&
+        record->length == field_count) {
+#ifdef MINYAR_BOUNDED_RC
+        /* Reuse removes the allocation, but retains its cleanup batch. */
+        rc_service_pending(MINYAR_RC_POLL_BUDGET);
+#endif
+        /* Retain the returned owner before consuming the incoming owner. This
+         * keeps generic release's queue/cycle service and K-total ceiling. */
+        minyar_rc_retain(record);
+        minyar_rc_release(record);
+        return record;
+    }
+    MinyarRecord *result = minyar_record_new_scalar(field_count);
+    if (record) minyar_rc_release(record);
+    return result;
+#endif
+}
+
 long long minyar_record_get(const MinyarRecord *record, long long field) {
     if ((unsigned long long)field >= (unsigned long long)record->length)
         list_position_stop(field, record->length);
