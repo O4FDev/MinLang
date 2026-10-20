@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Target selection, SDK isolation, provider rejection and output safety."""
 import importlib.util
+import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("minyar_mobile", ROOT / "tools/mobile.py")
 mobile = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mobile)
+IOS_SPEC = importlib.util.spec_from_file_location("minyar_mobile_ios", ROOT / "tests/check-mobile-ios.py")
+ios = importlib.util.module_from_spec(IOS_SPEC)
+IOS_SPEC.loader.exec_module(ios)
 ENTRY = "define i32 @main(i32 %argc, ptr %argv) uwtable {\n  ret i32 0\n}\n"
 
 
@@ -164,6 +169,62 @@ class MobileTools(unittest.TestCase):
             mobile.publish_archive(archive, metadata, output, sidecar)
         self.assertEqual(output.read_text(), "old archive")
         self.assertEqual(sidecar.read_text(), "old metadata")
+
+    def test_ios_failed_install_clears_prior_launch_evidence(self):
+        evidence = self.directory / "evidence"
+        evidence.mkdir()
+        for name in ("stdout", "stderr", "command.json", "launch.result.json"):
+            (evidence / name).write_text("old success")
+        ios.prepare_evidence(evidence)
+        process = Mock(returncode=7)
+        def start(command, **streams):
+            streams["stdout"].write(b"installation output\n")
+            streams["stderr"].write(b"installation rejected\n")
+            return process
+        command = ["xcrun", "simctl", "install", "device", "App.app"]
+        with patch.object(ios.subprocess, "Popen", side_effect=start):
+            self.assertEqual(ios.run_evidenced(command, evidence, "install", 45), 7)
+        self.assertFalse((evidence / "stdout").exists())
+        self.assertFalse((evidence / "launch.result.json").exists())
+        self.assertEqual((evidence / "install.stdout").read_bytes(), b"installation output\n")
+        self.assertEqual((evidence / "install.stderr").read_bytes(), b"installation rejected\n")
+        result = json.loads((evidence / "install.result.json").read_text())
+        self.assertEqual(result["command"], command)
+        self.assertEqual(result["returncode"], 7)
+        self.assertFalse(result["timed_out"])
+
+    def test_ios_launch_timeout_keeps_partial_output_and_status(self):
+        evidence = self.directory / "evidence"
+        ios.prepare_evidence(evidence)
+        command = ["xcrun", "simctl", "launch", "--console", "device", "app"]
+        process = Mock(returncode=-9)
+        process.wait.side_effect = [subprocess.TimeoutExpired(command, 60), -9]
+        def start(actual, **streams):
+            self.assertEqual(actual, command)
+            streams["stdout"].write(b"launch started\n")
+            streams["stderr"].write(b"partial UIKit diagnostics\n")
+            return process
+        with patch.object(ios.subprocess, "Popen", side_effect=start), self.assertRaises(subprocess.TimeoutExpired):
+            ios.run_evidenced(command, evidence, "launch", 60)
+        process.kill.assert_called_once_with()
+        self.assertEqual((evidence / "stdout").read_bytes(), b"launch started\n")
+        self.assertEqual((evidence / "stderr").read_bytes(), b"partial UIKit diagnostics\n")
+        result = json.loads((evidence / "launch.result.json").read_text())
+        self.assertEqual(result["command"], command)
+        self.assertEqual(result["returncode"], -9)
+        self.assertTrue(result["timed_out"])
+        self.assertIn("TimeoutExpired", result["error"])
+
+    def test_ios_spawn_error_keeps_result_metadata(self):
+        evidence = self.directory / "evidence"
+        ios.prepare_evidence(evidence)
+        command = ["missing-xcrun"]
+        with patch.object(ios.subprocess, "Popen", side_effect=FileNotFoundError("missing tool")), self.assertRaises(OSError):
+            ios.run_evidenced(command, evidence, "install", 45)
+        result = json.loads((evidence / "install.result.json").read_text())
+        self.assertIsNone(result["returncode"])
+        self.assertFalse(result["timed_out"])
+        self.assertIn("FileNotFoundError", result["error"])
 
 
 if __name__ == "__main__":
