@@ -1,0 +1,178 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing stable borrow function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let rest = source
+    let position = rest.find(needle)
+    while position >= 0 {
+        found += 1
+        rest = rest.slice(position + needle.length, rest.length)
+        position = rest.find(needle)
+    }
+    return found
+}
+
+function owners(ir: Text, name: Text): Integer {
+    let emitted = body(ir, name)
+    return count(emitted, "call void @minyar_rc_local(") + count(emitted, "call void @minyar_rc_local_traced(") + count(emitted, "call void @minyar_rc_borrow(") + count(emitted, "call void @minyar_rc_borrow_traced(") + count(emitted, "call void @minyar_rc_keep(")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let source = #"""
+    record Label { text: Text; parts: List<Text> }
+    record Shelf { label: Label; title: Text; items: List<Text>; count: Integer }
+    record Holder { name: Text }
+    record Node { tag: Text; children: List<Node> }
+
+    function makeShelf(seed: Integer): Shelf {
+        return Shelf { label: Label { text: "label" + Text(seed); parts: ["a" + "!", "b"] }; title: "title" + Text(seed); items: ["x" + "!"]; count: seed }
+    }
+    function stableLocal(shelf: Shelf): Integer {
+        let items = shelf.items
+        let label = shelf.label
+        let parts = shelf.label.parts
+        items.add("added")
+        return items.length + parts.length + label.text.length
+    }
+    function stableReturn(shelf: Shelf): Text {
+        let title = shelf.title
+        return title
+    }
+    function stableConsume(shelf: Shelf): Text {
+        let title = shelf.title
+        return title + "!"
+    }
+    function stableSelfAppend(shelf: Shelf): Text {
+        let title = shelf.title
+        title = title + " more"
+        return title
+    }
+    function stableStore(shelf: Shelf): Shelf {
+        let label = shelf.label
+        return Shelf { label: label; title: "copy"; items: []; count: 0 }
+    }
+    function loopBorrow(shelf: Shelf): Integer {
+        let total = 0
+        for index in 0..3 {
+            let parts = shelf.label.parts
+            total += parts.length + index
+        }
+        return total
+    }
+    function constantRoot(seed: Integer): Integer {
+        constant shelf = makeShelf(seed)
+        let items = shelf.items
+        return items.length
+    }
+    function constantReturn(seed: Integer): Text {
+        constant shelf = makeShelf(seed)
+        let title = shelf.title
+        return title
+    }
+    function letRoot(seed: Integer): Text {
+        let shelf = makeShelf(seed)
+        let label = shelf.label
+        return label.text
+    }
+    function captureRoot(shelf: Shelf): Integer {
+        let read: () -> Integer = function(): Integer {
+            let items = shelf.items
+            return items.length
+        }
+        return read()
+    }
+    function rename(holder: Holder) { holder.name = "renamed" + "!" }
+    function unstableField(holder: Holder): Text {
+        let name = holder.name
+        rename(holder)
+        return name
+    }
+    function assignedRoot(shelf: Shelf, other: Shelf): Integer {
+        shelf = other
+        let items = shelf.items
+        return items.length
+    }
+    function mutableLocalRoot(seed: Integer): Integer {
+        let shelf = makeShelf(seed)
+        let items = shelf.items
+        shelf = makeShelf(seed + 1)
+        return items.length
+    }
+    function tracedField(node: Node): Integer {
+        let children = node.children
+        return children.length
+    }
+
+    let shelf = makeShelf(1)
+    print(stableLocal(shelf))
+    print(shelf.items.length)
+    print(stableReturn(shelf))
+    print(stableConsume(shelf))
+    print(shelf.title)
+    print(stableSelfAppend(shelf))
+    print(shelf.title)
+    let copy = stableStore(shelf)
+    print(copy.label.text)
+    print(loopBorrow(shelf))
+    print(constantRoot(2))
+    print(constantReturn(5))
+    print(letRoot(6))
+    print(captureRoot(shelf))
+    let holder = Holder { name: "holder" + "!" }
+    print(unstableField(holder))
+    print(holder.name)
+    print(assignedRoot(shelf, makeShelf(3)))
+    print(mutableLocalRoot(4))
+    let node = Node { tag: "node" + "!"; children: [] }
+    node.children.add(node)
+    print(tracedField(node))
+    """#
+let expected = "10\n2\ntitle1\ntitle1!\ntitle1\ntitle1 more\ntitle1\nlabel1\n9\n1\ntitle5\nlabel6\n2\nholder!\nrenamed!\n1\n1\n1\n"
+
+test.require(fixtures.compile(frontend, source), "compile stable field borrow IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+for name in ["stableLocal", "stableReturn", "stableConsume", "stableSelfAppend", "stableStore", "loopBorrow", "constantReturn"] {
+    test.check(owners(ir, name) == 0, name + ": a stable field path must not take a local or temporary owner")
+}
+test.check(count(body(ir, "stableLocal"), "call void @minyar_rc_retain(") == 0, "stableLocal: borrowed field paths must not count")
+test.check(count(body(ir, "stableReturn"), "call void @minyar_rc_retain(") == 1, "stableReturn: a returned borrow gives the caller one count")
+for name in ["stableReturn", "stableConsume"] {
+    test.check(count(body(ir, name), "call void @minyar_rc_local_move_owner(") == 0, name + ": a borrowed binding has no owner to move")
+}
+test.check(count(body(ir, "stableSelfAppend"), "call void @minyar_rc_local_move_owner(") == 1, "stableSelfAppend: the replaced binding returns its new owner")
+for name in ["stableConsume", "stableSelfAppend"] {
+    test.check(test.contains(body(ir, name), "call ptr @minyar_join_text(") && !test.contains(body(ir, name), "@minyar_join_text_take_left("), name + ": a borrowed left operand is copied, never consumed")
+}
+test.check(owners(ir, "letRoot") == 0 && count(body(ir, "letRoot"), "call void @minyar_rc_local_take(") == 1, "letRoot: a never-reassigned record binding is a stable root")
+test.check(owners(ir, "constantRoot") == 0 && count(body(ir, "constantRoot"), "call void @minyar_rc_local_take(") == 1, "constantRoot: only the constant root owns its value")
+test.check(owners(ir, "unstableField") > 0, "unstableField: an assigned field keeps its owner")
+test.check(owners(ir, "assignedRoot") > 0, "assignedRoot: a reassigned parameter root keeps its owner")
+test.check(count(body(ir, "mutableLocalRoot"), "call void @minyar_rc_local(") == 1, "mutableLocalRoot: a field read from a mutable local keeps its owner")
+test.check(test.contains(body(ir, "tracedField"), "call void @minyar_rc_local_traced("), "tracedField: a traced value keeps its shading owner")
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+
+test.require(test.run([compiler.executable, compiler.directory + "/case" + Text(compiler.serial) + ".min", compiler.directory + "/scope.ll", "--scope-owners", "--library", "library"], frontend.environment, "", compiler.directory + "/scope.compile", compiler.compileTimeout), "compile stable field borrows with scope owners")
+let scope = io.readTextFile(compiler.directory + "/scope.ll")
+for name in ["stableLocal", "stableReturn", "loopBorrow"] {
+    test.check(!test.contains(body(scope, name), "@minyar_rc_scope_enter_v1("), name + ": stable borrows need no scope cells")
+}
+test.removeTree(compiler.directory)
+print("Stable field borrows: passed")
