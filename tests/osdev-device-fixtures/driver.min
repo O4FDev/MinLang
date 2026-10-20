@@ -1,0 +1,189 @@
+// All driver, PCI and typed-memory behavior comes from production modules.
+// The actual pci.min imports "arch"; tests/osdev-devices.min puts
+// ./library first, so it resolves to the fixture library/arch.min.
+use "../../os/kernel/net/e1000.min" as e1000
+use "../../os/shared/pci.min" as pci
+use "../../library/device.min" as device
+use "./library/machine.min" as machine
+use "./library/model.min" as model
+use "process" as processInfo
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+
+function same(first: Bytes, second: Bytes): Boolean {
+    if first.length != second.length { return false }
+    for index in 0..first.length { if first[index] != second[index] { return false } }
+    return true
+}
+
+function packet(seed: Integer, count: Integer): Bytes {
+    let bytes = Bytes(count)
+    for index in 0..count { bytes[index] = (seed * 17 + index * 29) & 255 }
+    return bytes
+}
+
+function boot(): e1000.Adapter {
+    model.reset(7)
+    let cards = pci.scan()
+    check(cards.length == 1 && cards[0].vendor == 0x8086 && cards[0].device == 0x100E, "oracle: real PCI scan must find one e1000")
+    check(model.probeCount() == 8199, "oracle: real PCI scan probe coverage changed")
+    let adapter = e1000.start(cards)
+    check(adapter.present && e1000.macText(adapter.mac) == "52:54:00:12:34:56", "oracle: actual driver MAC/init")
+    check(model.command() == 7 && model.resetCount() == 1, "oracle: PCI enable/reset read-clear")
+    let expected = "reset:7\npci-found:0:3:0\npci-enable:7\nreset-request\nreset-complete\nrx-ring-ready:63\nrx-enable\ntx-ring-ready:32\ntx-enable\n"
+    check(model.events() == expected, "oracle: exact initialization transcript\n" + model.events())
+    model.clearEvents()
+    return adapter
+}
+
+function basic(adapter: e1000.Adapter) {
+    let sent = Bytes("tx-three")
+    check(e1000.send(adapter, sent), "oracle: first actual TX")
+    check(model.transmittedCount() == 1 && same(model.transmitted(0), sent), "oracle: exact published TX bytes")
+    sent[0] = 0
+    check(model.transmitted(0)[0] == 116, "oracle: TX payload must be copied")
+    check(model.completeTransmit(0, 1, false), "oracle: complete TX generation1")
+    let incoming = Bytes("received")
+    check(model.receiveInto(0, 1, incoming, incoming.length, 3, 0, false), "oracle: publish real RX descriptor")
+    check(!model.takeWake(), "oracle: missing IRQ must stay missing")
+    let received = e1000.receive(adapter)
+    check(same(received, incoming), "oracle: exact acquired RX payload")
+    received[0] = 0
+    check(device.load8(adapter.receiveBuffers, 0) == 114, "oracle: returned RX Bytes must be a copy")
+    check(e1000.receive(adapter).length == 0 && adapter.received == 1 && adapter.sent == 1, "oracle: actual counters/empty RX")
+    let expected = "tx-submit:0:1:8\ntx-done:0:1:silent\nrx-done:0:1:silent\nobserve:rx:0:1\nacquire:rx:0:1\nrx-return:0:1\n"
+    check(model.events() == expected, "oracle: exact TX/RX ordering transcript\n" + model.events())
+}
+
+function transmitReorder(adapter: e1000.Adapter) {
+    for slot in 0..32 {
+        let bytes = packet(slot, 24)
+        check(e1000.send(adapter, bytes), "oracle: fill actual TX ring")
+        check(same(model.transmitted(slot), bytes), "oracle: queued TX copy")
+    }
+    check(!e1000.send(adapter, Bytes("full")), "oracle: TX backpressure")
+    check(model.completeTransmit(31, 1, true), "oracle: reordered late slot completion")
+    check(!e1000.send(adapter, Bytes("still full")), "oracle: later DD must not release next slot")
+    check(model.completeTransmit(0, 1, false), "oracle: delayed next-slot completion")
+    check(e1000.send(adapter, Bytes("reused")), "oracle: actual TX acquire before reuse")
+    check(model.transmitGeneration(0) == 2 && adapter.sent == 33, "oracle: generation after wrap")
+    check(!model.completeTransmit(0, 1, false), "oracle: stale completion must not alter new descriptor")
+    check(!model.completeTransmit(31, 1, false), "oracle: duplicate completion must not be replayed")
+    check(!model.completeTransmit(32, 1, false) && !model.completeTransmit(-1, 1, false), "oracle: completion slot range")
+    check(model.takeWake() && !model.takeWake(), "oracle: IRQ is a coalesced wake only")
+    check(!e1000.send(adapter, Bytes("slot one still busy")), "oracle: exact next-slot ownership")
+}
+
+function transmitWrap(adapter: e1000.Adapter) {
+    for round in 0..3 {
+        for slot in 0..32 {
+            let bytes = packet(round * 32 + slot, 17)
+            check(e1000.send(adapter, bytes), "oracle: TX ring wrap")
+            check(same(model.transmitted(round * 32 + slot), bytes), "oracle: exact wrap TX bytes")
+            check(model.completeTransmit(slot, model.transmitGeneration(slot), false), "oracle: scripted TX completion")
+        }
+    }
+    check(adapter.sent == 96 && adapter.transmitNext == 0 && model.transmitGeneration(0) == 3, "oracle: three actual TX ring generations")
+    check(!model.completeTransmit(0, 1, false), "oracle: old TX generation rejected")
+    check(!model.takeWake(), "oracle: polling TX progress without IRQ")
+}
+
+function receiveReorder(adapter: e1000.Adapter) {
+    model.wakeOnly()
+    check(model.takeWake() && e1000.receive(adapter).length == 0, "oracle: IRQ alone cannot complete a descriptor")
+    let later = packet(2, 31)
+    let first = packet(1, 29)
+    check(model.receiveInto(1, 1, later, later.length, 3, 0, false), "oracle: reordered RX completion")
+    check(e1000.receive(adapter).length == 0, "oracle: RX must wait for next descriptor")
+    check(model.receiveInto(0, 1, first, first.length, 3, 0, true), "oracle: delayed RX completion")
+    check(same(e1000.receive(adapter), first) && same(e1000.receive(adapter), later), "oracle: actual RX order/acquire")
+    check(!model.receiveInto(1, 1, later, later.length, 3, 0, false), "oracle: duplicate RX completion")
+    check(!model.receiveInto(0, 1, first, first.length, 3, 0, false), "oracle: stale RX generation")
+    check(!model.receiveInto(64, 1, first, first.length, 3, 0, false), "oracle: out of range RX completion")
+    check(adapter.received == 2 && adapter.receiveNext == 2, "oracle: actual RX counters")
+    check(model.takeWake() && !model.takeWake(), "oracle: scripted IRQ delivery")
+}
+
+function receiveWrap(adapter: e1000.Adapter) {
+    for ordinal in 0..133 {
+        let slot = ordinal % 64
+        let bytes = packet(ordinal, 31)
+        check(model.receiveInto(slot, model.receiveGeneration(slot), bytes, bytes.length, 3, 0, false), "oracle: RX device ownership over wrap")
+        check(same(e1000.receive(adapter), bytes), "oracle: exact RX bytes over wrap")
+    }
+    check(adapter.received == 133 && adapter.receiveNext == 5, "oracle: actual RX ring wraps")
+    check(e1000.receive(adapter).length == 0 && !model.takeWake(), "oracle: polling RX without interrupts")
+}
+
+function memoryCopy() {
+    let memory = device.allocate(80, 16)
+    let bytes = packet(4, 32)
+    device.write(memory, 4, bytes, 0, bytes.length)
+    device.copy(memory, 9, memory, 4, 32)
+    check(same(device.read(memory, 9, 32), bytes), "oracle: actual overlapping Memory copy")
+    device.fill(memory, 0, 8, 0xA5)
+    let prefix = device.read(memory, 0, 8)
+    for byte in prefix { check(byte == 0xA5, "oracle: actual Memory fill") }
+    check(device.load8(memory, 79) == 0, "oracle: Memory copy must not touch trailing sentinel")
+}
+
+function main(): Integer {
+    check(processInfo.argumentCount() == 1, "driver fixture needs exactly one scenario")
+    let scenario = processInfo.argument(0)
+    if scenario == "unknown-address" { machine.read8(0x1234); fail("oracle: unknown address accepted") }
+    if scenario == "port" { machine.in32(0xCF8); fail("oracle: port instruction accepted") }
+    let adapter = boot()
+    if scenario == "basic" { basic(adapter) }
+    else {
+    if scenario == "tx-reorder" { transmitReorder(adapter) }
+    else {
+    if scenario == "tx-wrap" { transmitWrap(adapter) }
+    else {
+    if scenario == "rx-reorder" { receiveReorder(adapter) }
+    else {
+    if scenario == "rx-wrap" { receiveWrap(adapter) }
+    else {
+    if scenario == "copy" { memoryCopy() }
+    else {
+    if scenario == "unpublished" {
+        device.store64(adapter.transmitRing, 8, 8 | (11 << 24))
+        device.write32(adapter.transmitTail, 1)
+        fail("oracle: missing publish fence accepted")
+    } else {
+    if scenario == "unacquired" {
+        let bytes = packet(1, 8)
+        check(model.receiveInto(0, 1, bytes, 8, 3, 0, false), "oracle: RX script")
+        device.load8(adapter.receiveRing, 12)
+        device.load16(adapter.receiveRing, 8)
+        fail("oracle: metadata read before acquire accepted")
+    } else {
+    if scenario == "bad-descriptor" {
+        device.store64(adapter.transmitRing, 0, 0x1234)
+        machine.fence()
+        e1000.send(adapter, Bytes("bad DMA pointer"))
+        fail("oracle: bad DMA pointer accepted")
+    } else {
+    if scenario == "rx-oversized" || scenario == "rx-fragment" || scenario == "rx-error" {
+        let bytes = packet(3, 32)
+        let reported = 32
+        let status = 3
+        let errors = 0
+        let reason = "errored"
+        if scenario == "rx-oversized" { bytes = packet(3, 2048); reported = 2049; reason = "oversized" }
+        if scenario == "rx-fragment" { status = 1; reason = "fragmented" }
+        if scenario == "rx-error" { errors = 1 }
+        check(model.receiveInto(0, 1, bytes, reported, status, errors, false), "oracle: malformed RX script")
+        check(e1000.receive(adapter).length == 0 && adapter.received == 0, "oracle: " + reason + " RX must be dropped")
+    } else { fail("unknown driver scenario " + scenario) }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    print("PASS:" + scenario)
+    return 0
+}

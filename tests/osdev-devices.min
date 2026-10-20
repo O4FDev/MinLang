@@ -1,0 +1,65 @@
+// Remote-only host qualification. The default retains RX rejection failures;
+// --positive-only is an explicit narrow bring-up control, not the full gate.
+use "../tools/testing.min" as test
+use "io" as io
+use "system" as system
+use "process" as processInfo
+
+let positiveOnly = false
+if processInfo.argumentCount() == 1 {
+    test.check(processInfo.argument(0) == "--positive-only", "unknown device test option")
+    positiveOnly = true
+} else { test.check(processInfo.argumentCount() == 0, "device tests accept only --positive-only") }
+let compiler = test.compiler()
+let path = compiler.directory + "/e1000-model"
+let environment = system.environment()
+let compiled = test.run([compiler.executable, "tests/osdev-device-fixtures/driver.min", path + ".ll",
+    "--library", "tests/osdev-device-fixtures/library", "--library", "library"], environment, "", path + ".compile", 60)
+test.require(compiled, "compile actual e1000/device/PCI with injected machine/arch")
+if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+let platform = test.run(["uname", "-s"], environment, "", path + ".platform", 10)
+test.require(platform, "host device-model platform")
+let failures: List<Text> = []
+for optimization in ["-O0", "-O2"] {
+    let command = [compiler.clang, optimization, "-Wno-override-module", "-ffunction-sections", "-fdata-sections"]
+    for flag in compiler.flags { command.add(flag) }
+    // The actual raw-machine module is imported for address(Bytes) only.
+    // Unused internal boot helpers must not introduce hosted linker symbols.
+    if platform.output == "Darwin\n" { command.add("-Wl,-dead_strip") }
+    else { command.add("-Wl,--gc-sections") }
+    for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+    test.require(test.run(command, environment, "", path + optimization + ".link", 60), "link actual driver model " + optimization)
+    for scenario in ["basic", "tx-reorder", "tx-wrap", "rx-reorder", "rx-wrap", "copy"] {
+        let result = test.run([path + ".exe", scenario], environment, "", path + optimization + "-" + scenario, 60)
+        test.require(result, "actual e1000 model " + scenario + " " + optimization)
+        test.check(result.errorOutput == "" && result.output.endsWith("PASS:" + scenario + "\n"), "model positive transcript/diagnostics\n" + result.output + result.errorOutput)
+    }
+    let rejected = ["unknown-address", "port", "unpublished", "unacquired", "bad-descriptor"]
+    let messages = ["model: unknown host address", "model: privileged port input is forbidden",
+        "model: tail published before descriptor/payload fence", "model: CPU descriptor access before completion acquire", "model: unknown host address"]
+    for index in 0..rejected.length {
+        let result = test.run([path + ".exe", rejected[index]], environment, "", path + optimization + "-" + rejected[index], 60)
+        test.check(result.status != 0 && result.status != 124 && result.status != 137 && test.contains(result.errorOutput, messages[index]),
+            "model safety oracle " + rejected[index] + " " + optimization + "\n" + result.output + result.errorOutput)
+    }
+    print(optimization + ": 6 actual-driver positives and 5 model safety rejections passed")
+    if !positiveOnly {
+        let malformed = ["rx-oversized", "rx-fragment", "rx-error"]
+        let reasons = ["oversized", "fragmented", "errored"]
+        for index in 0..malformed.length {
+            let result = test.run([path + ".exe", malformed[index]], environment, "", path + optimization + "-" + malformed[index], 60)
+            if result.status != 0 {
+                test.check(result.status != 124 && result.status != 137 && test.contains(result.errorOutput, "oracle: " + reasons[index] + " RX must be dropped"),
+                    "unexpected malformed-RX fixture failure\n" + result.output + result.errorOutput)
+                failures.add(optimization + ":" + malformed[index])
+                print("RED actual driver rejection oracle: " + optimization + ":" + malformed[index])
+            } else {
+                test.check(result.errorOutput == "" && result.output.endsWith("PASS:" + malformed[index] + "\n"), "malformed RX transcript")
+            }
+        }
+    }
+}
+if positiveOnly { print("narrow bring-up only: oversized/fragment/error RX rejection oracles were not run") }
+test.check(failures.length == 0, "actual e1000 still violates " + Text(failures.length) + " retained RX rejection oracles; logs: " + compiler.directory)
+test.removeTree(compiler.directory)
+print("actual-driver host device model passed")

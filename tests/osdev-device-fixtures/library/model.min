@@ -1,0 +1,456 @@
+// A host model around the actual device/pci/e1000 modules. The only native
+// operation used here obtains an owned Bytes address; no raw loads/stores run.
+use "../../../library/machine.min" as raw
+
+public constant MMIO_BASE = 0x10000000
+constant MMIO_BYTES = 0x20000
+constant BUFFER = 2048
+
+record Region {
+    owner: Bytes
+    base: Integer
+    device: Bytes
+    dirty: Bytes
+    changed: List<Integer>
+}
+
+record Completion {
+    receive: Boolean
+    slot: Integer
+    generation: Integer
+    descriptor: Integer
+    payload: Integer
+    count: Integer
+    observed: Boolean
+    acquired: Boolean
+}
+
+record State {
+    regions: List<Region>
+    events: List<Text>
+    completions: List<Completion>
+    packets: List<Bytes>
+    registers: Bytes
+    txLife: List<Integer>
+    txGeneration: List<Integer>
+    rxLife: List<Integer>
+    rxGeneration: List<Integer>
+    txRing: Integer
+    rxRing: Integer
+    txTail: Integer
+    rxTail: Integer
+    txEnabled: Boolean
+    rxEnabled: Boolean
+    resetReads: Integer
+    resets: Integer
+    probes: Integer
+    command: Integer
+    barSizing: Boolean
+    wake: Boolean
+    fences: Integer
+    seed: Integer
+    multicastWrites: Integer
+}
+
+function integers(count: Integer, value: Integer): List<Integer> {
+    let result: List<Integer> = []
+    for index in 0..count { result.add(value) }
+    return result
+}
+
+function newState(): State {
+    let regions: List<Region> = []
+    let events: List<Text> = []
+    let completions: List<Completion> = []
+    let packets: List<Bytes> = []
+    let registers = Bytes(MMIO_BYTES)
+    registers.setUInt32(0x0008, 2)
+    registers.setUInt32(0x5400, 0x12005452)
+    registers.setUInt32(0x5404, 0x80005634)
+    return State {
+        regions: regions; events: events; completions: completions; packets: packets; registers: registers
+        txLife: integers(32, 0); txGeneration: integers(32, 0)
+        rxLife: integers(64, 0); rxGeneration: integers(64, 1)
+        txRing: 0; rxRing: 0; txTail: -1; rxTail: -1; txEnabled: false; rxEnabled: false
+        resetReads: 0; resets: 0; probes: 0; command: 0; barSizing: false; wake: false
+        fences: 0; seed: 0; multicastWrites: 0
+    }
+}
+
+global MODEL: State = newState()
+
+function note(state: State, message: Text) { state.events.add(message + "\n") }
+
+public function reset(seed: Integer) {
+    let state = MODEL
+    let fresh = newState()
+    state.regions = fresh.regions; state.events = fresh.events
+    state.completions = fresh.completions; state.packets = fresh.packets
+    state.registers = fresh.registers
+    state.txLife = fresh.txLife; state.txGeneration = fresh.txGeneration
+    state.rxLife = fresh.rxLife; state.rxGeneration = fresh.rxGeneration
+    state.txRing = 0; state.rxRing = 0; state.txTail = -1; state.rxTail = -1
+    state.txEnabled = false; state.rxEnabled = false; state.resetReads = 0
+    state.resets = 0; state.probes = 0; state.command = 0; state.barSizing = false
+    state.wake = false; state.fences = 0; state.seed = seed; state.multicastWrites = 0
+    note(state, "reset:" + Text(seed))
+}
+
+public function events(): Text { let state = MODEL; return joinText(state.events) }
+public function clearEvents() { let state = MODEL; state.events.clear() }
+public function probeCount(): Integer { let state = MODEL; return state.probes }
+public function command(): Integer { let state = MODEL; return state.command }
+public function resetCount(): Integer { let state = MODEL; return state.resets }
+public function fenceCount(): Integer { let state = MODEL; return state.fences }
+public function transmittedCount(): Integer { let state = MODEL; return state.packets.length }
+public function transmitted(index: Integer): Bytes { let state = MODEL; let bytes = state.packets[index]; return bytes.slice(0, bytes.length) }
+public function transmitGeneration(slot: Integer): Integer { let state = MODEL; return state.txGeneration[slot] }
+public function receiveGeneration(slot: Integer): Integer { let state = MODEL; return state.rxGeneration[slot] }
+
+function overlap(first: Integer, count: Integer, base: Integer, size: Integer): Boolean {
+    return count > 0 && size > 0 && first < base + size && base < first + count
+}
+
+function regionIndex(state: State, address: Integer, count: Integer): Integer {
+    if address <= 0 || count < 0 { fail("model: invalid owned address/range") }
+    for index in 0..state.regions.length {
+        let region = state.regions[index]
+        if region.owner.length != region.device.length || raw.address(region.owner) != region.base { fail("model: registered Bytes was resized or moved") }
+        if address >= region.base && address - region.base <= region.owner.length - count { return index }
+    }
+    fail("model: unknown host address; raw memory was not dereferenced")
+    return -1
+}
+
+public function address(bytes: Bytes): Integer {
+    let state = MODEL
+    if bytes.length == 0 { fail("model: address of empty Bytes is not registered") }
+    let base = raw.address(bytes)
+    if base <= 0 || bytes.length > 9223372036854775807 - base { fail("model: unsupported owned address range") }
+    if overlap(base, bytes.length, MMIO_BASE, MMIO_BYTES) { fail("model: host allocation collides with virtual MMIO") }
+    for region in state.regions {
+        if region.owner.length != region.device.length || raw.address(region.owner) != region.base { fail("model: registered Bytes was resized or moved") }
+        if region.base == base {
+            if region.device.length != bytes.length { fail("model: registered Bytes was resized") }
+            return base
+        }
+        if overlap(base, bytes.length, region.base, region.owner.length) { fail("model: overlapping owner registration") }
+    }
+    let changed: List<Integer> = []
+    state.regions.add(Region { owner: bytes; base: base; device: bytes.slice(0, bytes.length); dirty: Bytes(bytes.length); changed: changed })
+    return base
+}
+
+function getWord(bytes: Bytes, offset: Integer, width: Integer): Integer {
+    let result = 0
+    for byte in 0..width { result = result | (bytes[offset + byte] << (byte * 8)) }
+    return result
+}
+
+function setWord(bytes: Bytes, offset: Integer, width: Integer, value: Integer) {
+    for byte in 0..width { bytes[offset + byte] = (value >> (byte * 8)) & 255 }
+}
+
+function deviceWord(state: State, address: Integer, width: Integer): Integer {
+    let region = state.regions[regionIndex(state, address, width)]
+    return getWord(region.device, address - region.base, width)
+}
+
+function deviceStore(state: State, address: Integer, width: Integer, value: Integer) {
+    let region = state.regions[regionIndex(state, address, width)]
+    setWord(region.device, address - region.base, width, value)
+}
+
+function cpuVisible(state: State, address: Integer, width: Integer, value: Integer) {
+    let region = state.regions[regionIndex(state, address, width)]
+    let offset = address - region.base
+    for byte in 0..width {
+        if region.dirty[offset + byte] != 0 { fail("model: DMA completion conflicts with pending CPU writes") }
+    }
+    setWord(region.owner, offset, width, value)
+}
+
+function published(state: State, address: Integer, count: Integer) {
+    let region = state.regions[regionIndex(state, address, count)]
+    let offset = address - region.base
+    for byte in 0..count {
+        if region.dirty[offset + byte] != 0 || region.owner[offset + byte] != region.device[offset + byte] {
+            fail("model: tail published before descriptor/payload fence")
+        }
+    }
+}
+
+function acquired(state: State, receive: Boolean, slot: Integer): Boolean {
+    for completion in state.completions {
+        if completion.receive == receive && completion.slot == slot && !completion.acquired { return false }
+    }
+    return true
+}
+
+function cpuAccess(state: State, address: Integer, count: Integer, write: Boolean) {
+    // Only DD polling is legal while a descriptor belongs to the device.
+    for kind in 0..2 {
+        let ring = state.txRing
+        let life = state.txLife
+        let receive = kind == 1
+        if receive { ring = state.rxRing; life = state.rxLife }
+        if ring != 0 {
+            for slot in 0..life.length {
+                let owned = life[slot] == 1 || (life[slot] == 2 && !acquired(state, receive, slot))
+                let descriptor = ring + slot * 16
+                if owned {
+                    if overlap(address, count, descriptor, 16) {
+                        if write || address != descriptor + 12 || count != 1 { fail("model: CPU descriptor access before completion acquire") }
+                    }
+                    let payload = deviceWord(state, descriptor, 8)
+                    if payload != 0 && overlap(address, count, payload, BUFFER) { fail("model: CPU payload access while device owns slot") }
+                }
+            }
+        }
+    }
+    if !write {
+        for completion in state.completions {
+            if !completion.acquired && address == completion.descriptor + 12 && count == 1 && !completion.observed {
+                completion.observed = true
+                let kind = "tx"
+                if completion.receive { kind = "rx" }
+                note(state, "observe:" + kind + ":" + Text(completion.slot) + ":" + Text(completion.generation))
+            }
+        }
+    }
+}
+
+function mmioRead(state: State, offset: Integer): Integer {
+    if offset == 0 && state.resetReads > 0 {
+        state.resetReads -= 1
+        if state.resetReads == 0 {
+            state.registers.setUInt32(0, state.registers.getUInt32(0) & ~(1 << 26))
+            note(state, "reset-complete")
+        }
+    }
+    if offset != 0 && offset != 8 && offset != 0x5400 && offset != 0x5404 { fail("model: unknown e1000 MMIO read") }
+    return state.registers.getUInt32(offset)
+}
+
+function ringAddress(state: State, low: Integer): Integer {
+    return state.registers.getUInt32(low) | (state.registers.getUInt32(low + 4) << 32)
+}
+
+function receiveTail(state: State, tail: Integer) {
+    if tail < 0 || tail >= 64 { fail("model: RX tail outside ring") }
+    if state.rxTail < 0 {
+        if tail != 63 || state.registers.getUInt32(0x2808) != 1024 || state.registers.getUInt32(0x2810) != 0 { fail("model: invalid RX ring initialization") }
+        state.rxRing = ringAddress(state, 0x2800)
+        published(state, state.rxRing, 1024)
+        for slot in 0..64 {
+            let payload = deviceWord(state, state.rxRing + slot * 16, 8)
+            regionIndex(state, payload, BUFFER)
+            if deviceWord(state, state.rxRing + slot * 16 + 8, 8) != 0 { fail("model: RX descriptor not initially clear") }
+            if slot < 63 { state.rxLife[slot] = 1 }
+        }
+        note(state, "rx-ring-ready:63")
+    } else {
+        if tail != (state.rxTail + 1) % 64 || state.rxLife[tail] != 2 || !acquired(state, true, tail) { fail("model: RX slot returned without acquired completion") }
+        published(state, state.rxRing + tail * 16, 16)
+        if deviceWord(state, state.rxRing + tail * 16 + 8, 8) != 0 { fail("model: RX descriptor returned without clear") }
+        // RDT is exclusive: returning slot N makes the previous reserved tail
+        // available and leaves N as the new reserved slot.
+        let returned = state.rxTail
+        if state.rxLife[returned] != 0 { fail("model: RX ownership overlap") }
+        state.rxLife[tail] = 0
+        state.rxLife[returned] = 1
+        state.rxGeneration[returned] += 1
+        note(state, "rx-return:" + Text(tail) + ":" + Text(state.rxGeneration[tail]))
+    }
+    state.rxTail = tail
+}
+
+function transmitTail(state: State, tail: Integer) {
+    if tail < 0 || tail >= 32 { fail("model: TX tail outside ring") }
+    if state.txTail < 0 {
+        if tail != 0 || state.registers.getUInt32(0x3808) != 512 || state.registers.getUInt32(0x3810) != 0 { fail("model: invalid TX ring initialization") }
+        state.txRing = ringAddress(state, 0x3800)
+        regionIndex(state, state.txRing, 512)
+        note(state, "tx-ring-ready:32")
+    } else {
+        let slot = state.txTail
+        if !state.txEnabled || tail != (slot + 1) % 32 || state.txLife[slot] != 0 { fail("model: TX reuse without completion acquire") }
+        let descriptor = state.txRing + slot * 16
+        published(state, descriptor, 16)
+        let payload = deviceWord(state, descriptor, 8)
+        let length = deviceWord(state, descriptor + 8, 2)
+        if length > BUFFER || deviceWord(state, descriptor + 11, 1) != 11 || deviceWord(state, descriptor + 12, 1) != 0 { fail("model: invalid TX descriptor") }
+        published(state, payload, length)
+        let region = state.regions[regionIndex(state, payload, length)]
+        state.packets.add(region.device.slice(payload - region.base, payload - region.base + length))
+        state.txGeneration[slot] += 1
+        state.txLife[slot] = 1
+        note(state, "tx-submit:" + Text(slot) + ":" + Text(state.txGeneration[slot]) + ":" + Text(length))
+    }
+    state.txTail = tail
+}
+
+function mmioWrite(state: State, offset: Integer, value: Integer) {
+    let known = offset == 0 || offset == 0xD8 || offset == 0x100 || offset == 0x400 || offset == 0x410 || offset == 0x2800 || offset == 0x2804 || offset == 0x2808 || offset == 0x2810 || offset == 0x2818 || offset == 0x3800 || offset == 0x3804 || offset == 0x3808 || offset == 0x3810 || offset == 0x3818
+    if offset >= 0x5200 && offset < 0x5400 && offset % 4 == 0 {
+        if value != 0 { fail("model: multicast table initialization must clear") }
+        state.multicastWrites += 1
+        known = true
+    }
+    if !known { fail("model: unknown e1000 MMIO write") }
+    state.registers.setUInt32(offset, value)
+    if offset == 0 && (value & (1 << 26)) != 0 { state.resetReads = 2; state.resets += 1; note(state, "reset-request") }
+    if offset == 0x2818 { receiveTail(state, value) }
+    if offset == 0x3818 { transmitTail(state, value) }
+    if offset == 0x100 {
+        if state.rxRing == 0 || state.multicastWrites != 128 || (value & 2) == 0 { fail("model: RX enabled before initialization") }
+        state.rxEnabled = true
+        note(state, "rx-enable")
+    }
+    if offset == 0x400 {
+        if state.txRing == 0 || (value & 2) == 0 { fail("model: TX enabled before initialization") }
+        state.txEnabled = true
+        note(state, "tx-enable")
+    }
+}
+
+public function read(address: Integer, width: Integer): Integer {
+    let state = MODEL
+    if width != 1 && width != 2 && width != 4 && width != 8 { fail("model: unsupported access width") }
+    if address >= MMIO_BASE && address < MMIO_BASE + MMIO_BYTES {
+        if width != 4 || address % 4 != 0 { fail("model: MMIO width/alignment mismatch") }
+        return mmioRead(state, address - MMIO_BASE)
+    }
+    let region = state.regions[regionIndex(state, address, width)]
+    cpuAccess(state, address, width, false)
+    return getWord(region.owner, address - region.base, width)
+}
+
+public function write(address: Integer, width: Integer, value: Integer) {
+    let state = MODEL
+    if width != 1 && width != 2 && width != 4 && width != 8 { fail("model: unsupported access width") }
+    if address >= MMIO_BASE && address < MMIO_BASE + MMIO_BYTES {
+        if width != 4 || address % 4 != 0 { fail("model: MMIO width/alignment mismatch") }
+        mmioWrite(state, address - MMIO_BASE, value)
+        return
+    }
+    let region = state.regions[regionIndex(state, address, width)]
+    cpuAccess(state, address, width, true)
+    let offset = address - region.base
+    for byte in 0..width {
+        if region.dirty[offset + byte] == 0 { region.changed.add(offset + byte) }
+        region.dirty[offset + byte] = 1
+    }
+    setWord(region.owner, offset, width, value)
+}
+
+public function copy(destination: Integer, source: Integer, count: Integer) {
+    let state = MODEL
+    let from = state.regions[regionIndex(state, source, count)]
+    regionIndex(state, destination, count)
+    cpuAccess(state, source, count, false)
+    cpuAccess(state, destination, count, true)
+    let bytes = from.owner.slice(source - from.base, source - from.base + count)
+    for index in 0..count { write(destination + index, 1, bytes[index]) }
+}
+
+public function fill(address: Integer, count: Integer, value: Integer) {
+    let state = MODEL
+    regionIndex(state, address, count)
+    cpuAccess(state, address, count, true)
+    for index in 0..count { write(address + index, 1, value & 255) }
+}
+
+public function fence() {
+    let state = MODEL
+    state.fences += 1
+    for region in state.regions {
+        for offset in region.changed { region.device[offset] = region.owner[offset]; region.dirty[offset] = 0 }
+        region.changed.clear()
+    }
+    for completion in state.completions {
+        if completion.observed && !completion.acquired {
+            let descriptor = state.regions[regionIndex(state, completion.descriptor, 16)]
+            let at = completion.descriptor - descriptor.base
+            for byte in 8..16 { descriptor.owner[at + byte] = descriptor.device[at + byte] }
+            if completion.receive {
+                let payload = state.regions[regionIndex(state, completion.payload, completion.count)]
+                let first = completion.payload - payload.base
+                for byte in 0..completion.count { payload.owner[first + byte] = payload.device[first + byte] }
+            } else { state.txLife[completion.slot] = 0 }
+            completion.acquired = true
+            let kind = "tx"
+            if completion.receive { kind = "rx" }
+            note(state, "acquire:" + kind + ":" + Text(completion.slot) + ":" + Text(completion.generation))
+        }
+    }
+}
+
+function done(state: State, receive: Boolean, slot: Integer, generation: Integer, payload: Integer, count: Integer, status: Integer, interrupt: Boolean) {
+    let ring = state.txRing
+    let kind = "tx"
+    if receive { ring = state.rxRing; kind = "rx" }
+    let descriptor = ring + slot * 16
+    deviceStore(state, descriptor + 12, 1, status)
+    cpuVisible(state, descriptor + 12, 1, status)
+    state.completions.add(Completion { receive: receive; slot: slot; generation: generation; descriptor: descriptor; payload: payload; count: count; observed: false; acquired: false })
+    let notification = "silent"
+    if interrupt { notification = "irq"; state.wake = true }
+    note(state, kind + "-done:" + Text(slot) + ":" + Text(generation) + ":" + notification)
+}
+
+public function completeTransmit(slot: Integer, generation: Integer, interrupt: Boolean): Boolean {
+    let state = MODEL
+    if slot < 0 || slot >= 32 { note(state, "drop:tx:range"); return false }
+    if state.txLife[slot] != 1 || state.txGeneration[slot] != generation { note(state, "drop:tx:stale"); return false }
+    state.txLife[slot] = 2
+    done(state, false, slot, generation, 0, 0, 1, interrupt)
+    return true
+}
+
+public function receiveInto(slot: Integer, generation: Integer, bytes: Bytes, reportedLength: Integer, status: Integer, errors: Integer, interrupt: Boolean): Boolean {
+    let state = MODEL
+    if slot < 0 || slot >= 64 { note(state, "drop:rx:range"); return false }
+    if !state.rxEnabled || state.rxLife[slot] != 1 || state.rxGeneration[slot] != generation { note(state, "drop:rx:stale"); return false }
+    if bytes.length > BUFFER || reportedLength < 0 || reportedLength > 65535 || status < 1 || status > 255 || (status & 1) == 0 || errors < 0 || errors > 255 { fail("model: malformed RX script") }
+    let descriptor = state.rxRing + slot * 16
+    let payload = deviceWord(state, descriptor, 8)
+    regionIndex(state, payload, BUFFER)
+    for index in 0..bytes.length { deviceStore(state, payload + index, 1, bytes[index]) }
+    deviceStore(state, descriptor + 8, 2, reportedLength)
+    deviceStore(state, descriptor + 13, 1, errors)
+    state.rxLife[slot] = 2
+    done(state, true, slot, generation, payload, bytes.length, status, interrupt)
+    return true
+}
+
+public function wakeOnly() { let state = MODEL; state.wake = true; note(state, "wake-only") }
+public function takeWake(): Boolean { let state = MODEL; let pending = state.wake; state.wake = false; return pending }
+
+public function pciRead(bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    let state = MODEL
+    if bus < 0 || bus > 255 || slot < 0 || slot > 31 || function < 0 || function > 7 || offset < 0 || offset > 252 || offset % 4 != 0 { fail("model: invalid PCI config access") }
+    if offset == 0 { state.probes += 1 }
+    if bus != 0 || slot != 3 || function != 0 { return 0xFFFFFFFF }
+    if offset == 0 { note(state, "pci-found:0:3:0"); return 0x100E8086 }
+    if offset == 4 { return state.command }
+    if offset == 8 { return 0x02000000 }
+    if offset == 0x10 {
+        if state.barSizing { return 0xFFFE0000 }
+        return MMIO_BASE
+    }
+    return 0
+}
+
+public function pciWrite(bus: Integer, slot: Integer, function: Integer, offset: Integer, value: Integer) {
+    let state = MODEL
+    if bus != 0 || slot != 3 || function != 0 { fail("model: write to absent PCI function") }
+    if offset == 4 { state.command = value & 0xFFFF; note(state, "pci-enable:" + Text(state.command)); return }
+    if offset == 0x10 {
+        if value == 0xFFFFFFFF { state.barSizing = true; return }
+        if value != MMIO_BASE { fail("model: unsupported PCI BAR relocation") }
+        state.barSizing = false
+        return
+    }
+    fail("model: unexpected PCI config write")
+}

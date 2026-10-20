@@ -61,7 +61,8 @@ build/testing/cycle-runtime-sanitize.o: build/testing/cycle-runtime.c $(wildcard
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
 # Seeded-mistake study: the same driver mistakes applied to Minyar and C, each
-# classified by the first stage that notices. Needs QEMU; not in check-portable.
+# classified by the first stage that notices. The QEMU variant is explicit;
+# the host variant runs in check-portable.
 .PHONY: check-osdev-seeds check-osdev-seeds-host
 check-osdev-seeds: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-seeds.py
@@ -73,8 +74,15 @@ check-osdev-seeds-host: build/minyarc build/minyar-runtime.o
 check-osdev-allocator: build/.toolchain.json
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-allocator.py
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host
-check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices
+check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator check-osdev-devices-sanitize
+
+.PHONY: check-osdev-devices check-osdev-devices-sanitize
+check-osdev-devices: build/minyarc build/minyar-runtime.o build/tooling/tests/osdev-devices
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/osdev-devices
+
+check-osdev-devices-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/osdev-devices
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) ./build/tooling/tests/osdev-devices
 
 # Optional real hardware-emulation proof, separate from portable fake-tool tests.
 .PHONY: check-osdev-qemu
