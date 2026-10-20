@@ -14,6 +14,36 @@ function program(binary: Text, log: Text): Text {
     test.require(result, "cold bootstrap program")
     return result.output
 }
+function cacheCorrectness(clang: Text, root: Text, work: Text, environment: List<Text>) {
+    let cache = work + "/user's cache, objects"
+    let source = work + "/cache-probe.c"
+    let binary = work + "/cache-probe"
+    let previous = Bytes()
+    let values = [42, 42, 43, 43, 43]
+    for index in 0..values.length {
+        let directory = cache
+        if index == 3 { directory = "" }
+        let policy = "cache_size=0%:cache_size_bytes=1m:cache_size_files=1:prune_after=168h:prune_interval=0s"
+        if index == 4 { policy = "cache_size=0%:cache_size_bytes=1:cache_size_files=0:prune_after=168h:prune_interval=0s" }
+        let configured = support.merge(environment, ["LLVM_CC=" + clang, "COMPILER_LTO_CACHE_DIR=" + directory, "COMPILER_LTO_CACHE_POLICY=" + policy])
+        let selection = test.run(["sh", root + "/tools/toolchain.sh", "compiler-lto-flags"], configured, "", work + "/cache-flags", 10)
+        test.require(selection, "compiler cache flag selection")
+        let command = [clang, "-O2"]
+        for flag in support.shellWords(selection.output) { command.add(flag) }
+        for arg in [source, "-o", binary] { command.add(arg) }
+        io.writeTextFile(source, "int main(void) { return " + Text(values[index]) + "; }\n")
+        test.require(test.run(command, configured, "", work + "/cache-link", 30), "compiler cache probe link")
+        let result = test.run([binary], configured, "", work + "/cache-run", 10)
+        test.check(result.status == values[index], "cached link must reflect changed input")
+        let bytes = io.readBytesFile(binary)
+        if index == 1 || index == 3 || index == 4 { test.check(support.same(previous, bytes), "warm, uncached and pruned links must produce identical executable bytes") }
+        previous = bytes
+        let entries = 0
+        for name in files.list(cache) { if support.starts(name, "llvmcache-") { entries += 1 } }
+        if index < 4 { test.check(entries == 1, "cache file limit must prune older input variants") }
+        else { test.check(entries == 0, "cache byte limit must prune oversized entries without changing the executable") }
+    }
+}
 let scratch = test.scratch()
 let kernel = test.lines(support.output(["uname", "-s"], scratch + "/kernel"))[0]
 let clang = support.which(test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang")), scratch + "/which-clang")
@@ -46,7 +76,7 @@ if linkerIsFile {
 let environment: List<Text> = []
 for entry in system.environment() {
     let keep = true
-    for name in ["LIMITED", "SANITIZER_LIMITED", "MAKEFLAGS", "MFLAGS", "COMPILER_LTO_FLAGS", "LLVM_FLAGS", "CC", "LLVM_CC", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG"] {
+    for name in ["LIMITED", "SANITIZER_LIMITED", "MAKEFLAGS", "MFLAGS", "COMPILER_LTO_FLAGS", "COMPILER_LTO_CACHE_DIR", "COMPILER_LTO_CACHE_POLICY", "LLVM_FLAGS", "CC", "LLVM_CC", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG"] {
         if support.starts(entry, name + "=") { keep = false }
     }
     if keep { environment.add(entry) }
@@ -68,6 +98,11 @@ if kernel == "Linux" && linkerIsFile {
     let chosen: List<Text> = []
     for option in options { if support.starts(option, "-fuse-ld=") { chosen.add(Text(Bytes(option).slice(9, Bytes(option).length))) } }
     test.check(chosen.length == 1 && support.resolve(chosen[0], scratch + "/chosen") == support.resolve(linker, scratch + "/pinned"), "cold bootstrap selects the pinned linker: " + explicit)
+    test.check(support.has(options, "--thinlto-cache-dir=build/thinlto-cache"), "cold bootstrap enables the compiler ThinLTO cache")
+    let cached = 0
+    for name in files.list(project + "/build/thinlto-cache") { if support.starts(name, "llvmcache-") { cached += 1 } }
+    test.check(cached > 0, "cold bootstrap must populate the compiler ThinLTO cache")
+    cacheCorrectness(selected, root, work, environment)
 }
 let again = test.run(command, support.merge(environment, ["COMPILER_LTO_FLAGS=" + explicit]), "", scratch + "/explicit", 240)
 test.check(again.status == 0, "explicit LTO bootstrap failed\n" + again.output + again.errorOutput)

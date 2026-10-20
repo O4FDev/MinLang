@@ -2,7 +2,7 @@ record CallbackTokens { kinds: List<Integer>; texts: List<Text>; lines: SourceMa
 
 function closureSortComparatorThunk(names: List<Text>, type: Integer, element: Integer, globals: List<Text>): Text {
     if !isCallbackType(type, names) { failCompiler("sortBy and sortedBy require Callback<T, T, Integer>") }
-    let signature = callbackSignatureTypes(names[type - 1000])
+    let signature = callbackSignatureTypes(names[recordTypeIndex(type)])
     if signature.length != 3 { failCompiler("sortBy and sortedBy require Callback<T, T, Integer>") }
     if signature[0] != element || signature[1] != element || signature[2] != 1 {
         failCompiler("sortBy and sortedBy require Callback<T, T, Integer>")
@@ -16,7 +16,7 @@ function closureSortComparatorThunk(names: List<Text>, type: Integer, element: I
     code = code + "  %code = inttoptr i64 %code.slot to ptr\n  %env = inttoptr i64 %env.slot to ptr\n"
     let left = "%left.slot"
     let right = "%right.slot"
-    if element != 1 {
+    if element != 1 && !isScalarChoiceType(element) {
         let conversion = "trunc"
         if isReferenceType(element) { conversion = "inttoptr" }
         if element == 7 { conversion = "bitcast" }
@@ -157,7 +157,7 @@ function callbackSignatureTypes(name: Text): List<Integer> {
 
 function isCallbackType(type: Integer, names: List<Text>): Boolean {
     if !isRecordType(type) { return false }
-    let name = names[type - 1000]
+    let name = names[recordTypeIndex(type)]
     return name.length > 10 && name.slice(0, 10) == "#Callback:"
 }
 
@@ -179,6 +179,7 @@ function takeCallbackType(kinds: List<Integer>, texts: List<Text>, lines: Source
     let record = findSymbol(names, symbols, name, 4)
     if record < 0 && create {
         record = names.length
+        if record >= 99000 { failCompiler("too many nominal types") }
         names.add(name)
         symbols.add(4)
     }
@@ -191,6 +192,7 @@ function registerCallbackType(types: List<Integer>, names: List<Text>, kinds: Li
     let record = findSymbol(names, kinds, name, 4)
     if record < 0 {
         record = names.length
+        if record >= 99000 { failCompiler("too many nominal types") }
         names.add(name)
         kinds.add(4)
     }
@@ -198,8 +200,9 @@ function registerCallbackType(types: List<Integer>, names: List<Text>, kinds: Li
 }
 
 function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, parameters: List<Text>, types: List<Integer>, expected: Integer, deferred: Boolean): Integer {
+    let headerStart = cursor[0]
     let contextual: List<Integer> = []
-    if isCallbackType(expected, names) { contextual = callbackSignatureTypes(names[expected - 1000]) }
+    if isCallbackType(expected, names) { contextual = callbackSignatureTypes(names[recordTypeIndex(expected)]) }
     expectToken(kinds, texts, lines, cursor, "function")
     expectToken(kinds, texts, lines, cursor, "(")
     while !tokenIs(kinds, texts, cursor, ")") {
@@ -229,7 +232,7 @@ function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: Sour
         cursor[0] = cursor[0] + 1
         result = takeType(kinds, texts, lines, cursor, names, symbols)
     }
-    if !tokenIs(kinds, texts, cursor, "{") { failCompiler("callback is missing its body") }
+    if !tokenIs(kinds, texts, cursor, "{") { failAtToken(lines, headerStart, "callback is missing its body") }
     types.add(result)
     return registerCallbackType(types, names, symbols)
 }
@@ -252,6 +255,7 @@ function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: 
             let parameters: List<Text> = []
             let types: List<Integer> = []
             let signature = takeCallbackHeader(kinds, texts, lines, cursor, names, symbols, parameters, types, 0, true)
+            if names.length >= 99000 { failCompiler("too many nominal types") }
             names.add("#Environment:" + Text(position) + ":" + Text(signature))
             symbols.add(4)
         }
@@ -288,7 +292,7 @@ function callbackEnvironmentType(name: Text): Integer {
     return type
 }
 
-function callbackBodyEnd(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
+function callbackBodyEnd(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, start: Integer): Integer {
     let position = start + 1
     let depth = 1
     while depth > 0 && kinds[position] != 0 {
@@ -296,11 +300,11 @@ function callbackBodyEnd(kinds: List<Integer>, texts: List<Text>, start: Integer
         if texts[position] == "}" && kinds[position] == 4 { depth = depth - 1 }
         position = position + 1
     }
-    if depth != 0 { failCompiler("callback body is missing its closing brace") }
+    if depth != 0 { failAtToken(lines, start, "callback body is missing its closing brace") }
     return position
 }
 
-function callbackReadsName(kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer, name: Text): Boolean {
+function callbackReadsName(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, start: Integer, end: Integer, name: Text): Boolean {
     let position = start + 1
     let shadows: List<Integer> = []
     let depth = 0
@@ -317,8 +321,8 @@ function callbackReadsName(kinds: List<Integer>, texts: List<Text>, start: Integ
                 header = header + 1
             }
             while header < end && texts[header] != "{" { header = header + 1 }
-            if header >= end { failCompiler("nested callback is missing its body") }
-            if parameterShadows { position = callbackBodyEnd(kinds, texts, header) } else { position = header }
+            if header >= end { failAtToken(lines, position, "nested callback is missing its body") }
+            if parameterShadows { position = callbackBodyEnd(kinds, texts, lines, header) } else { position = header }
             if position >= end { return false }
         }
         if texts[position] == "{" {
@@ -383,11 +387,11 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     context.syntax.symbolNodes[environment] = context.syntax.active
     context.syntax.nodes[context.syntax.active].symbol = environment
     functionNames[environment] = "#Environment:" + Text(start) + ":" + Text(signature)
-    let end = callbackBodyEnd(tokenKinds, tokenTexts, state[0])
+    let end = callbackBodyEnd(tokenKinds, tokenTexts, tokenLines, state[0])
     let captured: List<Integer> = []
     let local = 0
     while local < state[3] {
-        if (localTypes[local] > 0 || isContainerType(localTypes[local])) && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
+        if (localTypes[local] > 0 || isContainerType(localTypes[local])) && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, tokenLines, state[0], end, localNames[local]) {
             captured.add(local)
         }
         local = local + 1
@@ -403,7 +407,7 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
         functionParameterTypes.add(localTypes[local])
         capture = capture + 1
     }
-    addCallbackEdge(functionParameterCounts, functionParameterTypes, functionParameterNames, signature - 1000, 1000 + environment)
+    addCallbackEdge(functionParameterCounts, functionParameterTypes, functionParameterNames, recordTypeIndex(signature), 1000 + environment)
     let env = valueName(textState, newTemporary(state))
     noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + environment, 0)
     output.add("  " + env + " = call ptr @minyar_record_new(i64 " + Text(captured.length + 1) + ")\n")
@@ -450,7 +454,7 @@ function parseCallbackCall(context: CompilerContext, localNames: List<Text>, loc
     let functionParameterCounts = context.functionParameterCounts
     let functionParameterTypes = context.functionParameterTypes
     if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "callback call", "unreviewed") }
-    let signature = callbackSignatureTypes(functionNames[callbackType - 1000])
+    let signature = callbackSignatureTypes(functionNames[recordTypeIndex(callbackType)])
     let count = signature.length - 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
     output.add("  call void @minyar_callback_check(ptr " + callback + ")\n")
@@ -519,6 +523,26 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             let parameterTypes: List<Integer> = []
             let expected = callbackEnvironmentType(functionNames[callbackEnvironment(functionNames, start)])
             let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, parameterTypes, expected, false)
+            let parameterOrigins: List<Integer> = []
+            let originParameter = 0
+            let header = start + 2
+            while originParameter < parameters.length {
+                parameterOrigins.add(header)
+                header = header + 1
+                let nesting = 0
+                let afterParameter = false
+                while header < state[0] && !afterParameter {
+                    let token = tokenTexts[header]
+                    if nesting == 0 && (token == "," || token == ")") { afterParameter = true } else {
+                        if token == "<" || token == "(" { nesting = nesting + 1 }
+                        if token == ">" || token == ")" { nesting = nesting - 1 }
+                        if token == ">>" { nesting = nesting - 2 }
+                        header = header + 1
+                    }
+                }
+                if header < state[0] && tokenTexts[header] == "," { header = header + 1 }
+                originParameter = originParameter + 1
+            }
             let result = parameterTypes[parameters.length]
             let environment = callbackEnvironment(functionNames, start)
             let textState: List<Text> = ["entry", "callback", ""]
@@ -527,7 +551,10 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             let localTypes: List<Integer> = []
             let localIds: List<Integer> = []
             let localLengths: List<Integer> = []
+            let pendingDebugTypes: List<Integer> = []
+            context.debugTypes = pendingDebugTypes
             recordRuntimeTrace(context, ".minyar.closure." + Text(start), "anonymous function", start, false)
+            emitDebugOrigin(output, tokenLines, start, "function")
             output.add("define " + llvmType(result) + " @.minyar.closure." + Text(start) + "(ptr %environment")
             let parameter = 0
             while parameter < parameters.length {
@@ -549,6 +576,7 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
                 output.add(value)
                 output.add("\n")
                 addLocal(localNames, localTypes, localIds, localLengths, state, functionParameterNames[first + capture], type, id)
+                emitDebugBinding(context, output, start, functionParameterNames[first + capture], type, llvmType(type) + " " + value, 0, false)
                 capture = capture + 1
             }
             parameter = 0
@@ -558,6 +586,7 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
                 output.add("  %local." + Text(id) + " = alloca " + llvmType(parameterTypes[parameter]) + "\n")
                 output.add("  store " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter) + ", ptr %local." + Text(id) + "\n")
                 addLocal(localNames, localTypes, localIds, localLengths, state, parameters[parameter], parameterTypes[parameter], id)
+                emitDebugBinding(context, output, parameterOrigins[parameter], parameters[parameter], parameterTypes[parameter], "ptr %local." + Text(id), parameter + 1, true)
                 parameter = parameter + 1
             }
             context.syntax.active = context.syntax.symbolNodes[environment]

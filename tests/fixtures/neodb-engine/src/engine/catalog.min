@@ -1,0 +1,224 @@
+// Catalog: tables (id = position, never reused), indexes, views, and the DDL history used by snapshots.
+use "./values.min" as v
+use "./table.min" as tb
+use "./index.min" as ix
+
+public record Catalog {
+    tables: List<tb.Table>
+    hashIdx: List<ix.HashIndex>
+    ordIdx: List<ix.OrdIndex>
+    viewNames: List<Text>
+    viewSql: List<Text>
+    ddlLog: List<Text>       // replayable DDL in order (snapshot catalog)
+    version: Integer         // bumped on every DDL: invalidates cached plans
+    nextOid: Integer
+    fks: List<ForeignKey>    // foreign keys (position = identity, dropped ones stay as tombstones); rebuilt by DDL replay
+    conNames: List<Text>     // index names that back a PRIMARY KEY / UNIQUE constraint (pg_constraint rows)
+    nLiveFks: Integer        // foreign keys not dropped: 0 keeps the DML paths free of FK work
+}
+
+// FOREIGN KEY (childCols) REFERENCES parent (parentCols). Enforced at statement end (src/engine/fk.min).
+public record ForeignKey {
+    name: Text
+    childId: Integer
+    childCols: List<Integer>
+    parentId: Integer
+    parentCols: List<Integer>
+    parentIdx: Integer       // unique hash index on the parent covering exactly parentCols
+    keyMap: List<Integer>    // per parent index column j: position i in childCols/parentCols
+    onDelete: Integer        // ast.FK_* action codes
+    onUpdate: Integer
+    deferrable: Boolean
+    deferred: Boolean
+    dropped: Boolean
+    probe: ix.Key            // reusable probe key for the parent index (child -> parent checks)
+}
+
+public function newCatalog(): Catalog {
+    return Catalog { tables: []; hashIdx: []; ordIdx: []; viewNames: []; viewSql: []; ddlLog: []; version: 1; nextOid: 16384
+                     fks: []; conNames: []; nLiveFks: 0 }
+}
+
+public function addForeignKey(c: Catalog, fk: ForeignKey) {
+    c.fks.add(fk)
+    c.nLiveFks += 1
+    c.version += 1
+}
+
+public function dropForeignKey(c: Catalog, i: Integer) {
+    if c.fks[i].dropped { return }
+    c.fks[i].dropped = true
+    c.nLiveFks -= 1
+    c.version += 1
+}
+
+public function findTable(c: Catalog, name: Text): Integer {
+    let i = 0
+    let n = c.tables.length
+    while i < n {
+        let t = c.tables[i]
+        if t.name == name && t.cols.length >= 0 && !isDropped(t) { return i }
+        i += 1
+    }
+    return -1
+}
+
+public function isDropped(t: tb.Table): Boolean {
+    return t.name == ""
+}
+
+public function findView(c: Catalog, name: Text): Integer {
+    let i = 0
+    while i < c.viewNames.length {
+        if c.viewNames[i] == name { return i }
+        i += 1
+    }
+    return -1
+}
+
+public function createTable(c: Catalog, name: Text): tb.Table {
+    let t = tb.newTable(c.tables.length, name)
+    c.tables.add(t)
+    c.version += 1
+    return t
+}
+
+public function dropTable(c: Catalog, id: Integer) {
+    // foreign keys from or to a dropped table go with it
+    let fi = 0
+    while fi < c.fks.length {
+        if !c.fks[fi].dropped && (c.fks[fi].childId == id || c.fks[fi].parentId == id) { dropForeignKey(c, fi) }
+        fi += 1
+    }
+    let t = c.tables[id]
+    // detach indexes
+    for hid in t.hashIds {
+        c.hashIdx[hid].tableId = -1
+        c.hashIdx[hid].name = ""
+    }
+    for oid in t.ordIds {
+        c.ordIdx[oid].tableId = -1
+        c.ordIdx[oid].name = ""
+    }
+    let dead = tb.newTable(id, "")
+    c.tables[id] = dead
+    c.version += 1
+}
+
+public function indexNameExists(c: Catalog, name: Text): Boolean {
+    for h in c.hashIdx {
+        if h.name == name { return true }
+    }
+    for o in c.ordIdx {
+        if o.name == name { return true }
+    }
+    return false
+}
+
+// Create the index structures for a table. kind: 0 auto (hash + ordered for a single-column key),
+// 1 hash only, 2 ordered only. Returns false if a unique index finds duplicates.
+public function addIndex(c: Catalog, t: tb.Table, name: Text, cols: List<Integer>, unique: Boolean, primary: Boolean, wantHash: Boolean, wantOrd: Boolean): Boolean {
+    if wantHash {
+        let h = ix.newHashIndex(c.hashIdx.length, t.id, name, cols, unique, t.nrows)
+        h.primary = primary
+        let chk = ix.hashBuildCheck(h, t)
+        if unique && (chk == 1 || (chk == 2 && hasDuplicates(t, h))) { return false }
+        c.hashIdx.add(h)
+        t.hashIds.add(h.id)
+    }
+    if wantOrd {
+        let o = ix.newOrdIndex(c.ordIdx.length, t.id, name, cols, unique)
+        ix.ordBuild(o, t)
+        if unique && !wantHash && ordHasDuplicates(t, o) { return false }
+        c.ordIdx.add(o)
+        t.ordIds.add(o.id)
+    }
+    if primary {
+        t.pkCols = cols
+        for ci in cols { t.cols[ci].notNull = true }
+    }
+    c.version += 1
+    return true
+}
+
+function hasDuplicates(t: tb.Table, h: ix.HashIndex): Boolean {
+    let r = 0
+    while r < t.nrows {
+        if t.state[r] == 0 && !ix.rowHasNullKey(t, h.cols, r) {
+            let hv = ix.hashRow(t, h.cols, r)
+            let s = ix.probeNext(h, hv, ix.probeStart(h, hv))
+            while s >= 0 {
+                let o = ix.slotRow(h, s)
+                if o != r && t.state[o] == 0 && ix.rowsEqual(t, h.cols, r, o) { return true }
+                s = ix.probeNext(h, hv, s + 1)
+            }
+        }
+        r += 1
+    }
+    return false
+}
+
+function ordHasDuplicates(t: tb.Table, o: ix.OrdIndex): Boolean {
+    let n = o.main.length / 8
+    let i = 1
+    while i < n {
+        let a = o.main.getInt64((i - 1) * 8)
+        let b = o.main.getInt64(i * 8)
+        if t.state[a] == 0 && t.state[b] == 0 && ix.rowsEqual(t, o.cols, a, b) { return true }
+        i += 1
+    }
+    return false
+}
+
+public function rebuildIndexes(c: Catalog, t: tb.Table) {
+    for hid in t.hashIds { ix.hashBuild(c.hashIdx[hid], t) }
+    for oid in t.ordIds { ix.ordBuild(c.ordIdx[oid], t) }
+}
+
+// Does any index of t involve column ci?
+public function columnIndexed(c: Catalog, t: tb.Table, ci: Integer): Boolean {
+    for hid in t.hashIds {
+        for k in c.hashIdx[hid].cols {
+            if k == ci { return true }
+        }
+    }
+    for oid in t.ordIds {
+        for k in c.ordIdx[oid].cols {
+            if k == ci { return true }
+        }
+    }
+    return false
+}
+
+public function indexRemoveRow(c: Catalog, t: tb.Table, r: Integer) {
+    for hid in t.hashIds {
+        let h = c.hashIdx[hid]
+        ix.hashRemove(h, ix.hashRow(t, h.cols, r), r)
+    }
+    for oid in t.ordIds { ix.ordRemove(c.ordIdx[oid], t, r) }
+}
+
+public function indexInsertRow(c: Catalog, t: tb.Table, r: Integer) {
+    for hid in t.hashIds {
+        let h = c.hashIdx[hid]
+        ix.hashInsert(h, t, ix.hashRow(t, h.cols, r), r)
+    }
+    for oid in t.ordIds { ix.ordInsert(c.ordIdx[oid], t, r) }
+}
+
+// Find a hash index whose columns are exactly `cols` (any order), or -1.
+public function findHashIndexOn(c: Catalog, t: tb.Table, col: Integer): Integer {
+    for hid in t.hashIds {
+        let h = c.hashIdx[hid]
+        if h.cols.length == 1 && h.cols[0] == col { return hid }
+    }
+    return -1
+}
+
+public function findOrdIndexOn(c: Catalog, t: tb.Table, col: Integer): Integer {
+    for oid in t.ordIds {
+        let o = c.ordIdx[oid]
+        if o.cols.length >= 1 && o.cols[0] == col { return oid }
+    }
+    return -1
+}

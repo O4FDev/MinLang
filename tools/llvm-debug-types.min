@@ -1,0 +1,175 @@
+// Semantic type graphs are scoped to one emitted function. Cached modules may
+// reuse numeric compiler IDs for different declarations in the final image.
+use "./driver-support.min" as host
+
+record Description { key: Text; parts: List<Text>; fields: List<Text>; cases: List<Text>; id: Integer; body: Integer; ready: Boolean }
+public record Graph { nodes: List<Text>; types: List<Description>; arena: Boolean }
+
+public function graph(nodes: List<Text>, arena: Boolean): Graph { return Graph { nodes: nodes; types: []; arena: arena } }
+function node(graph: Graph, value: Text): Integer {
+    let id = graph.nodes.length
+    graph.nodes.add("!" + Text(id) + " = " + value + "\n")
+    return id
+}
+function set(graph: Graph, id: Integer, value: Text) { graph.nodes[id] = "!" + Text(id) + " = " + value + "\n" }
+function fields(value: Text): List<Text> {
+    let parts: List<Text> = []
+    let start = 0
+    while start <= value.byteLength {
+        let end = host.findText(value, "|", start)
+        if end < 0 { end = value.byteLength }
+        parts.add(host.textSlice(value, start, end))
+        start = end + 1
+    }
+    return parts
+}
+function entry(graph: Graph, key: Text): Description {
+    for item in graph.types { if item.key == key { return item } }
+    let id = node(graph, "!{}")
+    let body = node(graph, "!{}")
+    let result = Description { key: key; parts: []; fields: []; cases: []; id: id; body: body; ready: false }
+    graph.types.add(result)
+    return result
+}
+public function describe(graph: Graph, line: Text) {
+    let prefix = "; minyar-debug-type: "
+    let kind = 0
+    if line.startsWith("; minyar-debug-field: ") { prefix = "; minyar-debug-field: "; kind = 1 }
+    else if line.startsWith("; minyar-debug-case: ") { prefix = "; minyar-debug-case: "; kind = 2 }
+    else if !line.startsWith(prefix) { return }
+    let value = host.textAfter(line, prefix)
+    let parts = fields(value)
+    let item = entry(graph, parts[0])
+    if kind == 0 {
+        if item.parts.length == 0 { item.parts = parts }
+    } else {
+        let rows = item.fields
+        if kind == 2 { rows = item.cases }
+        for row in rows { if row == value { return } }
+        rows.add(value)
+    }
+}
+function member(graph: Graph, owner: Integer, name: Text, type: Integer, bits: Integer, offset: Integer): Integer {
+    return node(graph, "!DIDerivedType(tag: DW_TAG_member, name: \"" + name + "\", scope: !" + Text(owner) + ", baseType: !" + Text(type) + ", size: " + Text(bits) + ", offset: " + Text(offset) + ")")
+}
+function tuple(graph: Graph, members: List<Integer>): Integer {
+    let pieces: List<Text> = []
+    for index in 0..members.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add("!" + Text(members[index]))
+    }
+    return node(graph, "!{" + joinText(pieces) + "}")
+}
+function composite(graph: Graph, body: Integer, name: Text, bits: Integer, members: List<Integer>) {
+    let children = tuple(graph, members)
+    set(graph, body, "distinct !DICompositeType(tag: DW_TAG_structure_type, name: \"" + name + "\", size: " + Text(bits) + ", elements: !" + Text(children) + ")")
+}
+function pointer(graph: Graph, body: Integer): Integer { return node(graph, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + Text(body) + ", size: 64)") }
+function integer(graph: Graph): Integer { return entry(graph, "1").id }
+function list(graph: Graph, body: Integer, name: Text, child: Description) {
+    // Slots occupy eight bytes even when the semantic value is Boolean/Character.
+    let slot = node(graph, "!{}")
+    let bits = 64
+    if child.parts.length > 3 && child.parts[1] == "basic" { bits = Integer(child.parts[3]) }
+    let slotMembers: List<Integer> = [member(graph, slot, "value", child.id, bits, 0)]
+    let childName = child.key
+    if child.parts.length > 2 { childName = child.parts[2] }
+    composite(graph, slot, "minyar.slot<" + childName + ">", 64, slotMembers)
+    let members: List<Integer> = [member(graph, body, "values", pointer(graph, slot), 64, 0), member(graph, body, "length", integer(graph), 64, 64), member(graph, body, "capacity", integer(graph), 64, 128)]
+    composite(graph, body, name, 192, members)
+}
+function listPointer(graph: Graph, child: Description): Integer {
+    let body = node(graph, "!{}")
+    let name = child.key
+    if child.parts.length > 2 { name = child.parts[2] }
+    list(graph, body, "List<" + name + ">", child)
+    return pointer(graph, body)
+}
+function complete(graph: Graph, item: Description, virtualRecord: Boolean) {
+    if item.ready { return }
+    item.ready = true
+    let parts = item.parts
+    if parts.length < 4 { host.stop("missing compiler debug type: " + item.key) }
+    let kind = parts[1]
+    let name = parts[2]
+    if kind == "basic" {
+        set(graph, item.id, "!DIBasicType(name: \"" + name + "\", size: " + parts[3] + ", encoding: " + parts[4] + ")")
+        return
+    }
+    if kind == "enum" {
+        // A payload-free choice is its zero-based case tag, not a pointer.
+        let cases: List<Integer> = []
+        for row in item.cases {
+            let parts = fields(row)
+            cases.add(node(graph, "!DIEnumerator(name: \"" + parts[2] + "\", value: " + parts[1] + ")"))
+        }
+        set(graph, item.id, "!DICompositeType(tag: DW_TAG_enumeration_type, name: \"" + name + "\", baseType: !" + Text(integer(graph)) + ", size: 64, elements: !" + Text(tuple(graph, cases)) + ")")
+        return
+    }
+    if kind == "opaque" && parts.length > 4 && parts[4] == "nothing" {
+        set(graph, item.id, "!DICompositeType(tag: DW_TAG_structure_type, name: \"Nothing\", size: 0)")
+        return
+    }
+    set(graph, item.id, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + Text(item.body) + ", size: 64)")
+    if kind == "opaque" || (graph.arena && !virtualRecord && (kind == "record" || kind == "map")) {
+        set(graph, item.body, "!DICompositeType(tag: DW_TAG_structure_type, name: \"" + name + "\", flags: DIFlagFwdDecl)")
+        return
+    }
+    if kind == "text" || kind == "bytes" {
+        let byte = node(graph, "!DIBasicType(name: \"Byte\", size: 8, encoding: DW_ATE_unsigned_char)")
+        let cacheName = "character_length"
+        if kind == "bytes" { cacheName = "capacity" }
+        let members: List<Integer> = [member(graph, item.body, "bytes", pointer(graph, byte), 64, 0), member(graph, item.body, "byte_length", integer(graph), 64, 64), member(graph, item.body, cacheName, integer(graph), 64, 128)]
+        composite(graph, item.body, name, 256, members)
+    } else if kind == "list" {
+        list(graph, item.body, name, entry(graph, parts[4]))
+    } else if kind == "map" {
+        let hashes = listPointer(graph, entry(graph, "1"))
+        let keys = listPointer(graph, entry(graph, parts[4]))
+        let values = listPointer(graph, entry(graph, parts[5]))
+        let members: List<Integer> = [member(graph, item.body, "minyar_record_length", integer(graph), 64, 0), member(graph, item.body, "hashes", hashes, 64, 64), member(graph, item.body, "keys", keys, 64, 128), member(graph, item.body, "values", values, 64, 192), member(graph, item.body, "key_kind", integer(graph), 64, 256), member(graph, item.body, "value_references", integer(graph), 64, 320), member(graph, item.body, "length", integer(graph), 64, 384)]
+        composite(graph, item.body, name, Integer(parts[3]), members)
+    } else if kind == "record" {
+        let members: List<Integer> = []
+        if !virtualRecord { members.add(member(graph, item.body, "minyar_record_length", integer(graph), 64, 0)) }
+        // LLDB merges same-named C record DIEs even when their layouts differ.
+        if virtualRecord { name = "minyar.value<" + name + ">" }
+        let tag = -1
+        if item.cases.length > 0 {
+            name = "minyar.choice<" + name + ">"
+            let cases: List<Integer> = []
+            for row in item.cases {
+                let parts = fields(row)
+                cases.add(node(graph, "!DIEnumerator(name: \"" + parts[2] + "\", value: " + parts[1] + ")"))
+            }
+            let choices = tuple(graph, cases)
+            tag = node(graph, "!DICompositeType(tag: DW_TAG_enumeration_type, name: \"" + name + ".case\", baseType: !" + Text(integer(graph)) + ", size: 64, elements: !" + Text(choices) + ")")
+        }
+        for row in item.fields {
+            let field = fields(row)
+            let child = entry(graph, field[1])
+            if child.parts.length > 4 && child.parts[1] == "opaque" && child.parts[4] == "nothing" { continue }
+            let type = child.id
+            let bits = 64
+            if child.parts.length > 3 && child.parts[1] == "basic" { bits = Integer(child.parts[3]) }
+            if tag >= 0 && field[2].startsWith("minyar_choice_tag") { type = tag }
+            members.add(member(graph, item.body, field[2], type, bits, Integer(field[3])))
+        }
+        composite(graph, item.body, name, Integer(parts[3]), members)
+    } else { host.stop("unknown compiler debug type: " + kind) }
+}
+public function valueType(graph: Graph, key: Text): Integer {
+    let result = entry(graph, key).id
+    let index = 0
+    while index < graph.types.length { complete(graph, graph.types[index], false); index += 1 }
+    return result
+}
+public function objectType(graph: Graph, key: Text): Integer {
+    valueType(graph, key)
+    let item = entry(graph, key)
+    // A scalarized record has source fields but no runtime header. Its separate
+    // body also keeps real arena pointers opaque.
+    let copy = Description { key: item.key; parts: item.parts; fields: item.fields; cases: item.cases; id: node(graph, "!{}"); body: node(graph, "!{}"); ready: false }
+    complete(graph, copy, true)
+    return copy.body
+}

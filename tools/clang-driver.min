@@ -19,6 +19,9 @@ public function ltoFlags(clang: Text, linkFlags: List<Text>): List<Text> {
     if platform == "Linux" {
         let linker = host.strip(host.captureOutput([clang, "-print-prog-name=ld.lld"], 10))
         lto.add("-fuse-ld=" + host.pinnedLld(linker))
+        // Keep linker thread stacks inside the same virtual-memory envelope
+        // as the bootstrap link. ThinLTO's default follows the host CPU count.
+        lto.add("-Wl,--threads=1")
         return lto
     }
     let isWindows = host.windows()
@@ -90,6 +93,11 @@ function nativeObject(project: Text, clang: Text, base: Bytes, name: Text, compi
         let vendor = files.list(project + "/vendor/monocypher")
         vendor.sort()
         for entry in vendor { dependencies.add("vendor/monocypher/" + entry) }
+    }
+    if name == "unicode.c" || name == "unicode_data.c" {
+        let vendor = files.list(project + "/vendor/utf8proc")
+        vendor.sort()
+        for entry in vendor { dependencies.add("vendor/utf8proc/" + entry) }
     }
     let identity = base.slice(0, base.length)
     identity.addBytes(Bytes(host.jsonList([name]) + host.jsonList(compileFlags)))
@@ -198,6 +206,28 @@ function configuredSource(project: Text, runtime: Text): Text {
     let directive = "#include \"minyar_runtime.c\""
     if host.countText(configuration, directive) != 1 { host.stop("cycle runtime configuration must include the engine once") }
     return host.replaceText(configuration, directive, engineSource(project))
+}
+function debugManagedRecords(project: Text, clang: Text, runtime: Text): Boolean {
+    let file = host.baseName(runtime)
+    let adjacent = host.parentPath(runtime) + "/runtime.c"
+    let known = (file == "runtime.o" || file == "runtime.ll") && host.isFile(adjacent)
+    known = known || file.startsWith("minyar-default-runtime") || file.startsWith("minyar-runtime-eager")
+    let standard = file == "minyar-runtime.o" || file == "minyar-runtime-release.ll" || file == "minyar-runtime-sanitize.o"
+    if standard && host.setting("PROGRAM_RUNTIME_FLAGS", "-DMINYAR_SYSTEM_HEAP=1") == "-DMINYAR_SYSTEM_HEAP=1" { known = true }
+    // Unknown prebuilt runtimes keep records opaque rather than guessing an ABI.
+    if !known { return false }
+    let directory = host.temporaryDirectory("", "minyar-debug-layout-")
+    let source = directory + "/runtime.c"
+    host.writeBytes(source, Bytes(runtimeConfiguration(project, runtime, "debug type layout")))
+    let command = [clang]
+    for option in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { command.add(option) }
+    for option in ["-iquote", project + "/runtime", "-E", "-dM", source] { command.add(option) }
+    let macros = host.captureOutput(command, 0)
+    host.release(directory)
+    for line in host.lines(macros) {
+        if line == "#define MINYAR_COMPILER_ARENA" || line.startsWith("#define MINYAR_COMPILER_ARENA ") { return false }
+    }
+    return true
 }
 function threadSource(project: Text, runtime: Text, cycles: Boolean): Text {
     let configuration = runtimeConfiguration(project, runtime, "thread memory policy")
@@ -491,25 +521,64 @@ record Binding { original: Text; retained: Text; digest: Text; size: Integer; er
 function unbound(original: Text, failure: Text, message: Text): Binding {
     return Binding { original: original; retained: ""; digest: ""; size: 0; error: message; failure: failure }
 }
+// Reuse the host's existing streaming SHA-256 implementation without its
+// stop-on-error wrapper: a failed binding must still finalize link evidence.
+function hashFileNative(path: Text): Text { native "driverhost" }
+function makeTemporary(directory: Text, prefix: Text): Text { native "driverhost" }
+function registerTemporary(path: Text): Integer { native "driverhost" }
+function copyBinding(source: Text, destination: Text): Integer {
+    let input = files.open(source, files.READ)
+    if input < 0 { return input }
+    // Stage beside the retained path. Rebinding an existing path, a symlink or
+    // a hard link must never truncate the source before it has been copied.
+    let directory = makeTemporary(host.parentPath(destination), ".retain-")
+    if directory == "" { let error = host.lastError(); files.close(input); return -error }
+    let registered = registerTemporary(directory)
+    if registered < 0 { files.close(input); host.release(directory); return registered }
+    let staged = directory + "/input"
+    let output = files.open(staged, files.WRITE | files.CREATE | files.EXCLUSIVE)
+    if output < 0 { files.close(input); host.release(directory); return output }
+    let buffer = Bytes()
+    let position = 0
+    let error = 0
+    while true {
+        buffer.clear()
+        let count = files.readAppend(input, position, buffer, 65536)
+        if count < 0 { error = count; break }
+        if count == 0 { break }
+        let written = files.write(output, buffer, 0, count)
+        if written < 0 { error = written; break }
+        position += count
+    }
+    let inputClosed = files.close(input)
+    let outputClosed = files.close(output)
+    if error == 0 && inputClosed < 0 { error = inputClosed }
+    if error == 0 && outputClosed < 0 { error = outputClosed }
+    if error == 0 { error = files.rename(staged, destination) }
+    host.release(directory)
+    if error < 0 { return error }
+    return position
+}
 function binding(path: Text, retained: Text): Binding {
     let original = host.resolveName(path)
     let target = host.resolveName(retained)
-    let before = host.load(original)
-    if before.error != 0 { return unbound(original, host.osRepr(before.error), host.osError(before.error, original)) }
+    let first = hashFileNative(original)
+    if first == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, original)) }
     if original != target {
-        let stored = host.store(target, before.data)
+        let stored = copyBinding(original, target)
         if stored < 0 { return unbound(original, host.osRepr(stored), host.osError(stored, target)) }
     }
-    let copied = host.load(target)
-    if copied.error != 0 { return unbound(original, host.osRepr(copied.error), host.osError(copied.error, target)) }
-    let after = host.load(original)
-    if after.error != 0 { return unbound(original, host.osRepr(after.error), host.osError(after.error, original)) }
-    let first = host.hashBytes(before.data)
-    if first != host.hashBytes(copied.data) || first != host.hashBytes(after.data) {
+    let copied = hashFileNative(target)
+    if copied == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, target)) }
+    let after = hashFileNative(original)
+    if after == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, original)) }
+    if first != copied || first != after {
         let message = "link input changed while retaining evidence"
         return unbound(original, "ValueError(" + host.pythonText(message) + ")", message)
     }
-    return Binding { original: original; retained: host.baseName(target); digest: first; size: before.data.length; error: ""; failure: "" }
+    let size = files.pathSize(target)
+    if size < 0 { return unbound(original, host.osRepr(size), host.osError(size, target)) }
+    return Binding { original: original; retained: host.baseName(target); digest: first; size: size; error: ""; failure: "" }
 }
 function bindingFailed(link: Link, value: Binding): Boolean { return failedWith(link, value.failure, value.error) }
 function bindingObject(doc: host.Document, value: Binding): Integer {
@@ -899,6 +968,17 @@ function linkCommand(arguments: List<Text>) {
     }
     libraries.sort()
     let isWindows = host.windows()
+    let opaqueDebugRecords = true
+    if debug && debugInfo.enabled(linkFlags) && debugInfo.full(linkFlags) {
+        opaqueDebugRecords = !debugManagedRecords(project, clang, runtime)
+        // LLVM's ARM64 GlobalISel path drops i1 SSA debug locations at O0.
+        // SelectionDAG tracks the same values without adding IR storage or uses.
+        let machine = host.hostMachine()
+        if machine == "arm64" || machine == "aarch64" {
+            linkFlags.add("-mllvm")
+            linkFlags.add("-global-isel=false")
+        }
+    }
     if dataParallel && !isWindows { native.add("-pthread") }
     if threaded {
         let options = runtimeOptions(clang, release, linkFlags)
@@ -953,6 +1033,9 @@ function linkCommand(arguments: List<Text>) {
             native.add(nativeObject(project, clang, base, "wincert.c", nativeFlags))
             for item in ["-lcrypt32", "-lbcrypt", "-lncrypt"] { native.add(item) }
         } else if library == "machine" || library == "machine_arm64" || library == "callbackruntime" || library == "runtime" {
+        } else if library == "unicode" {
+            native.add(nativeObject(project, clang, base, "unicode.c", nativeFlags))
+            native.add(nativeObject(project, clang, base, "unicode_data.c", nativeFlags))
         } else if library == "net" {
             native.add(nativeObject(project, clang, base, "net.c", nativeFlags))
             if isWindows { native.add("-lws2_32") }
@@ -970,6 +1053,8 @@ function linkCommand(arguments: List<Text>) {
             native.add("-pthread")
         } else if library == "quicinteropio" {
             native.add(nativeObject(project, clang, base, "quicinteropio.c", nativeFlags))
+        } else if library == "completionio" {
+            native.add(nativeObject(project, clang, base, "completionio.c", nativeFlags))
         } else if library == "erofs" {
             if platform != "Linux" { host.stop("the erofs package currently supports Linux") }
             let lz4 = providers.formatProvider("lz4", clang, nativeFlags, linkFlags)
@@ -1052,7 +1137,7 @@ function linkCommand(arguments: List<Text>) {
         if annotated.error != "" { host.stop(annotated.error) }
         let directory = host.temporaryDirectory("", "minyar-debug-")
         program = directory + "/program.ll"
-        host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source)))
+        host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source, debugInfo.full(linkFlags), opaqueDebugRecords)))
     }
     linkProgram(clang, linkFlags, lto, program, runtime, native, math, output, source)
 }

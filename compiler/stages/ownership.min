@@ -60,6 +60,69 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
     return false
 }
 
+function ungroupOwnershipNode(tree: SyntaxTree, node: Integer): Integer {
+    while node >= 0 && tree.nodes[node].kind == 207 {
+        let child = tree.nodes[node].firstChild
+        if child < 0 || tree.nodes[child].nextSibling >= 0 { return -1 }
+        node = child
+    }
+    return node
+}
+
+// Keep only the most recent consumer site. A complete expression root emits after
+// its arguments, so exact node identity suffices; inner/stale sites cannot match.
+function noteTerminalReuse(context: CompilerContext, node: Integer, transferPiece: Integer, calleePiece: Integer, receiver: Text) {
+    let site = context.terminalReuse
+    site.node = node
+    site.transferPiece = transferPiece
+    site.calleePiece = calleePiece
+    site.receiver = receiver
+}
+
+function takeTerminalReuse(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, target: Integer) {
+    if recoveryEnabled(state) { return }
+    let tree = context.syntax
+    let node = ungroupOwnershipNode(tree, tree.nodes[tree.active].lastChild)
+    let site = context.terminalReuse
+    if node < 0 || site.node != node { return }
+    let callee = output[site.calleePiece]
+    if callee != "minyar_join_text" && callee != "minyar_list_appended" { return }
+    let receiver = ungroupOwnershipNode(tree, tree.nodes[node].firstChild)
+    if receiver < 0 || tree.nodes[receiver].kind != 200 { return }
+    let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[receiver].start])
+    if local < 0 || localIds[local] < 0 { return }
+    // Assignment ends this owner's lifetime only when replacing that binding.
+    // A return passes -1 because every local ends on its completed path.
+    if target >= 0 && localIds[local] != target { return }
+    state[6] = 1
+    let slot = ownershipSlot(state, localIds[local])
+    // The reserved fragment follows all argument evaluation. Keep the local
+    // rooted until then; the consuming runtime operation checks actual aliases.
+    output[site.transferPiece] = "  call void @minyar_rc_local_move_owner(i64 " + Text(slot) + ", ptr " + site.receiver + ")\n"
+    if callee == "minyar_join_text" { output[site.calleePiece] = "minyar_join_text_take_left" }
+    else { output[site.calleePiece] = "minyar_list_appended_take" }
+    site.node = -1
+}
+
+// A direct local return is the binding's last use on this control-flow path.
+// Inspect the checked expression, so fields, calls and operators cannot be
+// mistaken for a return of their receiver. Shared heap values remain shared.
+function takeReturnedLocal(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, value: Text): Boolean {
+    if recoveryEnabled(state) { return false }
+    let tree = context.syntax
+    let node = ungroupOwnershipNode(tree, tree.nodes[tree.active].lastChild)
+    if node < 0 || tree.nodes[node].kind != 200 || !isReferenceType(tree.nodes[node].type) { return false }
+    let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[node].start])
+    if local < 0 || localIds[local] < 0 { return false }
+    state[6] = 1
+    output.add("  call void @minyar_rc_local_move_owner(i64 ")
+    output.add(Text(ownershipSlot(state, localIds[local])))
+    output.add(", ptr ")
+    output.add(value)
+    output.add(")\n")
+    return true
+}
+
 function ownershipSlot(state: List<Integer>, id: Integer): Integer {
     let entry = 16 + id * 2
     while state.length <= entry + 1 {
@@ -89,7 +152,8 @@ function markScalarRecord(state: List<Integer>, id: Integer, values: Integer) {
     state[entry + 1] = -2 - values
 }
 
-function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, symbolLookup: List<Integer>, counts: List<Integer>, fields: List<Integer>, state: List<Integer>, name: Text) {
+function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, symbolLookup: List<Integer>, counts: List<Integer>, fields: List<Integer>, state: List<Integer>, name: Text, context: CompilerContext) {
+    context.mutableScalarRecord = false
     if (state[15] / 1 % 2) != 0 || state[15] / 32 % 2 != 0 { return }
     let record = findCompiledSymbol(functionNames, symbolKinds, symbolLookup, tokenTexts[state[0]], 2)
     if record < 0 { return }
@@ -104,16 +168,17 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
     }
     state[11] = state[11] + cost
     let cursor: List<Integer> = [state[0]]
-    skipDeclaration(tokenKinds, tokenTexts, cursor)
+    skipDeclaration(tokenKinds, tokenTexts, context.tokenLines, cursor)
     let position = cursor[0]
     if tokenKinds[position] != 0 && tokenKinds[position] != 6 && tokenTexts[position] != "}" { return }
     let depth = 0
     let done = false
+    let writable = false
     while tokenKinds[position] != 0 && !done {
         if tokenKinds[position] == 1 && tokenTexts[position] == name {
             if position + 1 >= tokenTexts.length || tokenTexts[position + 1] != "." { return }
             if position + 3 < tokenTexts.length && tokenTexts[position + 3] == "(" { return }
-            if position + 3 < tokenTexts.length && tokenKinds[position + 3] == 4 && isAssignmentOperator(tokenTexts[position + 3]) { return }
+            if position + 3 < tokenTexts.length && tokenKinds[position + 3] == 4 && isAssignmentOperator(tokenTexts[position + 3]) { writable = true }
         }
         if tokenKinds[position] == 4 {
             if tokenTexts[position] == "{" { depth = depth + 1 }
@@ -124,6 +189,7 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
         position = position + 1
     }
     state[10] = state[4]
+    context.mutableScalarRecord = writable
 }
 
 function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
@@ -239,6 +305,7 @@ function activateCycleType(returnTypes: List<Integer>, type: Integer, start: Int
 }
 
 function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
+    if isScalarChoiceType(from) || isScalarChoiceType(target) { return false }
     if from == target { return true }
     if !isContainerType(from) && !isRecordType(from) { return false }
     let visited: List<Boolean> = []
@@ -255,8 +322,8 @@ function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>,
             type = containerValueType(type)
         }
         if type == target { return true }
-        if isRecordType(type) && !visited[type - 1000] {
-            let record = type - 1000
+        if isRecordType(type) && !isScalarChoiceType(type) && !visited[recordTypeIndex(type)] {
+            let record = recordTypeIndex(type)
             visited[record] = true
             let field = 0
             let first = functionParameterOffset(counts, record)
@@ -272,7 +339,7 @@ function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>,
 function possibleCycleType(type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
     let base = type
     while isContainerType(base) { base = containerValueType(base) }
-    if !isRecordType(base) { return false }
+    if !isRecordType(base) || isScalarChoiceType(base) { return false }
     let position = counts.length
     while position < returnTypes.length {
         if returnTypes[position] == -2 { position = position + 4 } else {
@@ -286,7 +353,7 @@ function possibleCycleType(type: Integer, counts: List<Integer>, fields: List<In
     if isContainerType(type) {
         starts.add(containerValueType(type))
     } else {
-        let record = type - 1000
+        let record = recordTypeIndex(type)
         let first = functionParameterOffset(counts, record)
         position = 0
         while position < counts[record] { starts.add(fields[first + position])
@@ -306,7 +373,7 @@ function noteCycleFixup(output: List<Text>, returnTypes: List<Integer>, counts: 
     let baseB = typeB
     while isContainerType(baseA) { baseA = containerValueType(baseA) }
     while isContainerType(baseB) { baseB = containerValueType(baseB) }
-    if !isRecordType(baseA) && !isRecordType(baseB) { return }
+    if (!isRecordType(baseA) || isScalarChoiceType(baseA)) && (!isRecordType(baseB) || isScalarChoiceType(baseB)) { return }
     returnTypes.add(-2)
     returnTypes.add(-1 - piece)
     returnTypes.add(-1 - typeA)
@@ -314,6 +381,7 @@ function noteCycleFixup(output: List<Text>, returnTypes: List<Integer>, counts: 
 }
 
 function cycleTypeActive(type: Integer, roots: List<Integer>, counts: List<Integer>, fields: List<Integer>, seenTypes: List<Integer>, activeTypes: List<Integer>): Boolean {
+    if isScalarChoiceType(type) { return false }
     if !isContainerType(type) && !isRecordType(type) { return false }
     let position = 0
     while position < seenTypes.length {
@@ -334,7 +402,7 @@ function cycleTypeActive(type: Integer, roots: List<Integer>, counts: List<Integ
     return false
 }
 
-function finishCycleFixups(output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+function finishCycleFixups(context: CompilerContext, output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
     let position = counts.length
     let enabled = false
     while position + 1 < returnTypes.length {
@@ -371,8 +439,8 @@ function finishCycleFixups(output: List<Text>, returnTypes: List<Integer>, count
     while position + 3 < returnTypes.length {
         if returnTypes[position] == -2 {
             let piece = -1 - returnTypes[position + 1]
-            let typeA = -1 - returnTypes[position + 2]
-            let typeB = -1 - returnTypes[position + 3]
+            let typeA = choiceOwnershipType(context, -1 - returnTypes[position + 2])
+            let typeB = choiceOwnershipType(context, -1 - returnTypes[position + 3])
             if cycleTypeActive(typeA, roots, counts, fields, seenTypes, activeTypes) || cycleTypeActive(typeB, roots, counts, fields, seenTypes, activeTypes) {
                 enabled = true
                 let text = output[piece]

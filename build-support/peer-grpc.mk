@@ -1,6 +1,7 @@
 # Pinned independent peers are test-only. Native modules import no Python stack.
-build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/edge.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum | build
-	cd tests/interop/peergrpc && GOMAXPROCS=2 go build -mod=readonly -trimpath -o "$(abspath $@).tmp" . && "$(abspath $@).tmp" self-test
+# Their Go-only protocol and fixture TLS code needs no host C runtime.
+build/peergrpc-peer: tests/interop/peergrpc/main.go tests/interop/peergrpc/edge.go tests/interop/peergrpc/go.mod tests/interop/peergrpc/go.sum $(lastword $(MAKEFILE_LIST)) | build
+	cd tests/interop/peergrpc && CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -trimpath -o "$(abspath $@).tmp" . && "$(abspath $@).tmp" self-test
 	mv -f "$@.tmp" "$@"
 
 PEER_GRPC_TOOLS = http2-test http2-churn-test peer-grpc-test peer-grpc-churn-test peer-grpc-retire-test

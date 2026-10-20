@@ -90,7 +90,9 @@ _Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
  * fatal. Unwind ownership while callback stack storage is still live. */
-#ifndef MINYAR_FREESTANDING
+/* Freestanding runtimes (MINYAR_FREESTANDING, or any non-hosted compile) have
+ * no setjmp.h; they get the fail-closed stubs below instead. */
+#if !defined(MINYAR_FREESTANDING) && defined(__STDC_HOSTED__) && __STDC_HOSTED__
 #include <setjmp.h>
 typedef struct MinyarDiagnosticBoundary {
     jmp_buf *jump;
@@ -99,6 +101,7 @@ typedef struct MinyarDiagnosticBoundary {
     size_t depth, limit;
 #ifndef MINYAR_COMPILER_ARENA
     RcFrame *frames;
+    MinyarRcScope *scopes;
 #endif
 } MinyarDiagnosticBoundary;
 static MinyarDiagnosticBoundary *minyar_diagnostic_boundary;
@@ -109,7 +112,7 @@ _Bool minyar_compiler_try(void (*compile)(void *), void *job) {
     MinyarDiagnosticBoundary boundary = {&jump, minyar_diagnostic_boundary, job,
                                         minyar_call_depth, minyar_depth_limit
 #ifndef MINYAR_COMPILER_ARENA
-                                        , rc_frames
+                                        , rc_frames, rc_scopes
 #endif
     };
     minyar_diagnostic_boundary = &boundary;
@@ -123,6 +126,7 @@ static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
     MinyarDiagnosticBoundary *boundary = minyar_diagnostic_boundary;
     if (!boundary) exit(1);
 #ifndef MINYAR_COMPILER_ARENA
+    rc_scope_unwind(boundary->scopes);
 #ifdef MINYAR_BOUNDED_RC
     if (!minyar_stack_bounds_ready) minyar_find_stack_bounds();
 #endif
@@ -151,6 +155,8 @@ static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
 #endif
     minyar_call_depth = boundary->depth;
     minyar_depth_limit = boundary->limit;
+    /* An omitted empty scope has no header for the unwind walk to leave. */
+    minyar_rc_scope_leave_empty_v1();
     longjmp(*boundary->jump, reason);
 }
 
@@ -167,6 +173,19 @@ MINYAR_NORETURN void minyar_runtime_diagnosticRaise(void) {
     minyar_diagnostic_jump(1);
 }
 MINYAR_NORETURN void minyar_runtime_diagnosticDiscard(void) { minyar_diagnostic_jump(2); }
+#else
+/* The private compiler-only recovery ABI needs hosted setjmp/longjmp.
+ * Normal freestanding programs never call it; fail closed if requested. */
+_Bool minyar_compiler_try(void (*compile)(void *), void *job) {
+    (void)compile;
+    (void)job;
+    minyar_stop("compiler diagnostic recovery is unavailable in freestanding programs.");
+}
+_Bool minyar_runtime_diagnosticHasJob(void) { return 0; }
+void *minyar_runtime_diagnosticCurrentJob(void) { return NULL; }
+long long minyar_runtime_diagnosticErrorCount(void) { return 0; }
+MINYAR_NORETURN void minyar_runtime_diagnosticRaise(void) { exit(1); }
+MINYAR_NORETURN void minyar_runtime_diagnosticDiscard(void) { exit(1); }
 #endif
 
 /* Terminal cell ranges generated from Unicode 16.0.0 categories Mn/Me

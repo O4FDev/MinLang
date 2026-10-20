@@ -1,15 +1,18 @@
-COMPILER_SOURCES = build/choice-builtins.min \
+COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/source.min \
 	compiler/stages/syntax.min \
+	compiler/stages/diagnostic-catalog.min \
 	compiler/stages/diagnostics.min \
 	compiler/stages/suggestions.min \
 	compiler/stages/runtime-traces.min \
 	compiler/stages/lexer.min \
 	compiler/stages/symbols.min \
 	compiler/stages/declarations.min \
+	compiler/stages/typed-byte-helpers.min \
 	compiler/stages/runtime-abi.min \
 	compiler/stages/types.min $(wildcard compiler/stages/c-layout.min) \
 	compiler/stages/ownership.min \
+	compiler/stages/scope-ownership.min \
 	compiler/stages/operators.min \
 	compiler/stages/expressions.min \
 	compiler/stages/statements.min \
@@ -21,6 +24,7 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/parallel-compiler.min \
 	compiler/parallel-outline.min \
 	compiler/parallel-reductions.min \
+	compiler/stages/debug-types.min \
 	compiler/stages/functions.min \
 	compiler/stages/pipeline.min \
 	compiler/stages/modules.min \
@@ -31,9 +35,16 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/closure-compiler.min \
 	compiler/callable-types.min \
 	compiler/generic-compiler.min \
+	compiler/iteration-compiler.min \
+	compiler/sequence-compiler.min \
+	compiler/sequence-lowering.min \
+	compiler/iteration-capabilities.min \
+	compiler/user-capabilities.min \
 	compiler/result-methods.min \
 	compiler/errors-compiler.min \
+	compiler/patterns.min \
 	compiler/choice-compiler.min \
+	compiler/choice-layout.min \
 	compiler/choice-generic.min \
 	compiler/test-compiler.min \
 	compiler/documentation-compiler.min \
@@ -140,3 +151,11 @@ check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o 
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/native-records
 
 check check-portable: check-native-records
+
+# Profiling is opt-in and creates separate executables and retained evidence.
+.PHONY: compiler-pgo check-compiler-pgo
+compiler-pgo: build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/minyar-runtime.o
+	python3 experiments/compiler/pgo.py
+
+check-compiler-pgo: build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/minyar-runtime.o
+	python3 experiments/compiler/pgo.py --samples 3

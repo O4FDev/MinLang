@@ -1,0 +1,174 @@
+use "text" as text
+use "json" as json
+
+public constant CAPACITY = 128
+public constant TITLE_BYTES = 512
+
+public choice Progress {
+    Open
+    Done
+}
+
+public record Task {
+    id: Integer
+    title: Text
+    progress: Progress
+}
+
+public record Problem {
+    status: Integer
+    message: Text
+}
+
+public record Board {
+    private tasks: List<Task>
+}
+
+public function empty(): Board { return Board { tasks: [] } }
+
+function whitespace(byte: Integer): Boolean {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+public function title(source: Bytes): Result<Text, Problem> {
+    if source.length > TITLE_BYTES {
+        return Err(Problem { status: 413; message: "a title may contain at most 512 UTF-8 bytes" })
+    }
+    match text.decode(source) {
+        Err(error) { return Err(Problem { status: 400; message: "the title must be valid UTF-8" }) }
+        Ok(decoded) {
+            let first = 0
+            let after = source.length
+            while first < after && whitespace(source[first]) { first += 1 }
+            while after > first && whitespace(source[after - 1]) { after -= 1 }
+            if first == after {
+                return Err(Problem { status: 400; message: "give the task a title" })
+            }
+            for index in first..after {
+                let byte = source[index]
+                if byte < 32 || byte == 127 {
+                    return Err(Problem { status: 400; message: "use one line without control characters" })
+                }
+            }
+            return Ok(Text(source.slice(first, after)))
+        }
+    }
+}
+
+public function Board.create(source: Bytes): Result<Task, Problem> {
+    let name = try title(source)
+    if self.tasks.length == CAPACITY {
+        return Err(Problem { status: 409; message: "this board is full; restart to begin a fresh one" })
+    }
+    let task = Task { id: self.tasks.length + 1; title: name; progress: Progress.Open }
+    self.tasks.add(task)
+    return Ok(task)
+}
+
+public function Board.complete(id: Integer): Maybe<Task> {
+    if id < 1 || id > self.tasks.length { return None }
+    let task = self.tasks[id - 1]
+    task.progress = Progress.Done
+    return Some(task)
+}
+
+public function Task.json(): Text {
+    let completed = match self.progress {
+        Open { false }
+        Done { true }
+    }
+    let quoted = json.quote(self.title)
+    return "{\"id\":\(self.id),\"title\":\(quoted),\"completed\":\(completed)}"
+}
+
+public function Board.json(): Text {
+    let parts: List<Text> = ["{\"tasks\":["]
+    for index in 0..self.tasks.length {
+        if index > 0 { parts.add(",") }
+        parts.add(self.tasks[index].json())
+    }
+    parts.add("],\"capacity\":\(CAPACITY)}")
+    return joinText(parts)
+}
+
+// Routes use canonical decimal IDs: no sign, zero, padding, encoding or overflow.
+public function completionId(path: Text): Maybe<Integer> {
+    if !path.startsWith("/tasks/") || !path.endsWith("/complete") { return None }
+    if path.length <= 16 { return None }
+    let digits = path.slice(7, path.length - 9)
+    if digits.length == 0 || digits.length > 3 || digits[0] == '0' { return None }
+    let id = 0
+    for digit in digits {
+        if digit < '0' || digit > '9' { return None }
+        id = id * 10 + Integer(digit) - Integer('0')
+    }
+    if id > CAPACITY { return None }
+    return Some(id)
+}
+
+test "a task changes from open to done and completion is repeatable" {
+    let board = empty()
+    expect(board.json() == "{\"tasks\":[],\"capacity\":128}")
+    match board.create(Bytes("  Watch the tide  \r\n")) {
+        Err(problem) { expect(false) }
+        Ok(task) {
+            expect(task.id == 1)
+            expect(task.title == "Watch the tide")
+            expect(task.json() == "{\"id\":1,\"title\":\"Watch the tide\",\"completed\":false}")
+        }
+    }
+    match board.complete(1) {
+        None { expect(false) }
+        Some(task) { expect(task.json() == "{\"id\":1,\"title\":\"Watch the tide\",\"completed\":true}") }
+    }
+    expect(board.complete(1).isSome())
+    expect(board.complete(0).isNone())
+    expect(board.complete(2).isNone())
+}
+
+test "titles validate original bytes and JSON preserves punctuation and Unicode" {
+    expect(title(Bytes()).isErr())
+    expect(title(Bytes(" \t\r\n ")).isErr())
+    expect(title(Bytes("two\nlines")).isErr())
+    let invalid = Bytes(1)
+    invalid[0] = 255
+    expect(title(invalid).isErr())
+    let zero = Bytes("sea")
+    zero.add(0)
+    expect(title(zero).isErr())
+    let tooLong = Bytes(513)
+    for index in 0..tooLong.length { tooLong[index] = 97 }
+    expect(title(tooLong).isErr())
+    let board = empty()
+    match board.create(Bytes("Héllo \"sea\" \\ 🌊")) {
+        Err(problem) { expect(false) }
+        Ok(task) {
+            expect(task.json() == "{\"id\":1,\"title\":\"Héllo \\\"sea\\\" \\\\ 🌊\",\"completed\":false}")
+        }
+    }
+}
+
+test "capacity is bounded and failed writes do not consume IDs" {
+    let board = empty()
+    expect(board.create(Bytes(" ")).isErr())
+    for index in 0..CAPACITY {
+        match board.create(Bytes("Task \(index + 1)")) {
+            Err(problem) { expect(false) }
+            Ok(task) { expect(task.id == index + 1) }
+        }
+    }
+    match board.create(Bytes("one too many")) {
+        Ok(task) { expect(false) }
+        Err(problem) { expect(problem.status == 409) }
+    }
+    expect(board.complete(CAPACITY).isSome())
+    expect(board.complete(CAPACITY + 1).isNone())
+}
+
+test "completion paths reject ambiguous IDs without parsing large integers" {
+    expect(completionId("/tasks/1/complete").unwrapOr(0) == 1)
+    expect(completionId("/tasks/128/complete").unwrapOr(0) == 128)
+    for path in ["/tasks/0/complete", "/tasks/01/complete", "/tasks/+1/complete", "/tasks/129/complete", "/tasks/999999999999999999999999/complete", "/tasks//complete", "/tasks/1/complete/", "/tasks/%31/complete"] {
+        expect(completionId(path).isNone())
+    }
+}

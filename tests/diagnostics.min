@@ -48,8 +48,10 @@ for suite in 0..sources.length {
             test.check(machine.status == 1 && machine.output == "", source + ": JSON rejection status/stdout")
             test.check(test.lines(machine.errorOutput).length == 1, source + ": one JSON object per error")
             let diagnostic = json.parse(machine.errorOutput)
-            test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 11, source + ": complete stable schema")
-            for key in ["version", "severity", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"] { test.check(json.member(diagnostic, key).kind != json.INVALID, source + ": missing JSON field " + key) }
+            test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 12, source + ": complete stable schema")
+            for key in ["version", "severity", "code", "message", "file", "line", "column", "endLine", "endColumn", "sourceLine", "label", "help"] { test.check(json.member(diagnostic, key).kind != json.INVALID, source + ": missing JSON field " + key) }
+            let code = json.member(diagnostic, "code").text
+            test.check(code != "E0001" && test.contains(expected, "= explain: minyar explain " + code + "\n"), source + ": recorded errors have a specific code with text/JSON parity")
             let origin = rows[1].slice(7 + source.length, rows[1].length)
             let separator = origin.find(":")
             let line = Integer(origin.slice(0, separator))
@@ -70,7 +72,7 @@ for suite in 0..sources.length {
             let notes = json.member(diagnostic, "help")
             let help = ""
             if rows.length > 5 { let start = rows[5].find("= help: "); if start >= 0 { help = rows[5].slice(start + 8, rows[5].length) } }
-            test.check(notes.kind == json.ARRAY, source + ": help is an array")
+            test.check(notes.kind == json.ARRAY && help != "", source + ": every recorded error has a repair note")
             if help == "" { test.check(notes.items.length == 0, source + ": empty help array") }
             else { test.check(notes.items.length == 1 && notes.items[0].text == help, source + ": JSON/text help parity") }
             test.check(files.pathSize(output) < 0, source + ": JSON rejection left LLVM")
@@ -95,7 +97,8 @@ for item in recoveryCases.items {
     test.check(machine.status == 1 && machine.output == "" && rows.length == expectedLines.length, "safe recovery count and cap " + name)
     for index in 0..rows.length {
         let diagnostic = json.parse(rows[index])
-        test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 11 && json.member(diagnostic, "version").number == 1.0, "one complete JSON object per recovered error")
+        test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 12 && json.member(diagnostic, "version").number == 1.0, "one complete JSON object per recovered error")
+        test.check(json.member(diagnostic, "code").text != "E0001" && json.member(diagnostic, "help").items.length == 1, "recovered errors retain specific codes and repair notes")
         test.check(json.member(diagnostic, "file").text == source && json.member(diagnostic, "line").number == expectedLines[index].number && json.member(diagnostic, "column").number == expectedColumns[index].number, "independent recovery token oracle " + name)
         test.check(json.member(diagnostic, "message").text == messages[index].text, "independent recovery messages without cascades " + name)
     }
@@ -125,7 +128,7 @@ for mode in ["", "--doc-json", "--list-tests"] {
         let rows = test.lines(result.errorOutput)
         test.check(result.status == 1 && result.output == "" && rows.length == 1, "one structured source-read failure")
         let diagnostic = json.parse(rows[0])
-        test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 11 && json.member(diagnostic, "file").text == input, "source-read failure keeps original path and schema")
+        test.check(diagnostic.kind == json.OBJECT && diagnostic.keys.length == 12 && json.member(diagnostic, "file").text == input, "source-read failure keeps original path and schema")
         if input == invalidSource {
             test.check(json.member(diagnostic, "message").text == "Text contained invalid UTF-8." && json.member(diagnostic, "line").number == 2.0 && json.member(diagnostic, "column").number == 7.0, "first invalid UTF-8 byte has a Unicode scalar source location")
         }
@@ -147,7 +150,7 @@ let replacedSourceControls = "A�B�C�D"
 let controlMessageSource = work + "/control-message.min"
 io.writeTextFile(controlMessageSource, "use \"" + sourceControls + "\" as unsafe\n")
 let controlMessage = test.run([compiler, controlMessageSource, work + "/control-message.ll", "--library", "library"], system.environment(), "", work + "/control-message", 10)
-let expectedControlMessage = "error: package names use letters, digits, '-', and '_'; found '" + visibleSourceControls + "'\n  --> " + controlMessageSource + ":1:1\n   |\n 1 | use \"" + replacedSourceControls + "\" as unsafe\n   | ^^^\n"
+let expectedControlMessage = "error: package names use letters, digits, '-', and '_'; found '" + visibleSourceControls + "'\n  --> " + controlMessageSource + ":1:1\n   |\n 1 | use \"" + replacedSourceControls + "\" as unsafe\n   | ^^^\n   = help: use ASCII letters, digits, and '_' in this name; keep other characters inside Text\n   = explain: minyar explain E0103\n"
 test.check(controlMessage.status == 1 && controlMessage.output == "" && controlMessage.errorOutput == expectedControlMessage, "text diagnostic message and excerpt escape C0, ESC, and C1 controls byte-for-byte")
 let controlJSON = test.run([compiler, controlMessageSource, work + "/control-message-json.ll", "--error-format", "json", "--library", "library"], system.environment(), "", work + "/control-message-json", 10)
 let controlJSONValue = json.parse(controlJSON.errorOutput)
@@ -166,7 +169,7 @@ test.check(bidiJSON.status == 1 && json.member(bidiJSONValue, "message").text ==
 let controlPath = work + "/path-" + terminalControls + ".min"
 io.writeTextFile(controlPath, "print(missing)\n")
 let controlPathResult = test.run([compiler, controlPath, work + "/control-path.ll"], system.environment(), "", work + "/control-path", 10)
-let expectedControlPath = "error: I can't find a value named 'missing'\n  --> " + work + "/path-" + visibleControls + ".min:1:7\n   |\n 1 | print(missing)\n   |       ^^^^^^^\n"
+let expectedControlPath = "error: I can't find a value named 'missing'\n  --> " + work + "/path-" + visibleControls + ".min:1:7\n   |\n 1 | print(missing)\n   |       ^^^^^^^\n   = help: check the spelling, or declare this value before using it in the current scope\n   = explain: minyar explain E0301\n"
 test.check(controlPathResult.status == 1 && controlPathResult.output == "" && controlPathResult.errorOutput == expectedControlPath, "text diagnostic path escapes C0, ESC, C1, and bidi controls byte-for-byte")
 let success = test.run([compiler, "examples/gallery/weather-lantern.min", work + "/success.ll", "--error-format", "json", "--library", "library"], system.environment(), "", work + "/success", 10)
 test.check(success.status == 0 && success.output == "" && success.errorOutput == "", "JSON success emits no diagnostics")
@@ -192,5 +195,6 @@ test.removeScratch(work)
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 fixtures.executes(frontend, io.readTextFile("examples/gallery/diagnostics.min"), "The harbour: a light to come home to.\nThe lighthouse: the stars have the night to themselves.\n", ["-O0", "-O2"], 0, "", true)
 fixtures.executes(frontend, io.readTextFile("examples/gallery/weather-lantern.min"), "The harbour: the stars have room to shine.\nThe harbour: 3 drops, and one warm window.\n", ["-O0", "-O2"], 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/first-light.min"), "The harbour: 3 small lights against the dark.\nThe hill: 4 small lights against the dark.\n", ["-O0", "-O2"], 0, "", true)
 test.removeTree(frontend.compiler.directory)
 print(Text(checked) + " complete compiler diagnostics match byte-for-byte golden files")

@@ -77,7 +77,7 @@ function readModuleFields(source: Text): List<Text> {
     if fields.length == 5 && fields[0] == "minyar-local-cache-v1" {
         fields = decodeModuleFields(fields[4])
     }
-    if fields.length < 3 || fields[0] != "minyar-module-interface-v5" || (fields.length - 3) % 10 != 0 {
+    if fields.length < 3 || fields[0] != "minyar-module-interface-v11" || (fields.length - 3) % 10 != 0 {
         let empty: List<Text> = []
         return empty
     }
@@ -98,9 +98,9 @@ function priorModule(prior: List<Text>, path: Text, role: Text): Integer {
 function overlayModuleFields(base: List<Text>, source: Text, baseIdentity: Text): List<Text> {
     let delta = decodeModuleFields(source)
     if delta.length == 5 && delta[0] == "minyar-local-cache-v1" { delta = decodeModuleFields(delta[4]) }
-    if delta.length < 4 || delta[0] != "minyar-module-delta-v3" || delta[1] != baseIdentity || (delta.length - 4) % 10 != 0 { return base }
+    if delta.length < 4 || delta[0] != "minyar-module-delta-v9" || delta[1] != baseIdentity || (delta.length - 4) % 10 != 0 { return base }
     let rows: List<Text> = []
-    rows.add("minyar-module-interface-v5")
+    rows.add("minyar-module-interface-v11")
     rows.add(delta[2])
     let table = delta[3]
     if table == "" {
@@ -146,7 +146,7 @@ function writeModuleUpdate(path: Text, next: List<Text>, base: List<Text>, baseI
     if base.length < 3 || baseIdentity == "" { io.writeTextFile(path, encodeModuleFields(next))
         return }
     let delta: List<Text> = []
-    delta.add("minyar-module-delta-v3")
+    delta.add("minyar-module-delta-v9")
     delta.add(baseIdentity)
     delta.add(next[1])
     if next[1] == base[1] { delta.add("") } else { delta.add(next[2]) }
@@ -214,7 +214,8 @@ function stableInterfaceType(type: Integer, names: List<Text>): Text {
     if isSetType(type) { return "set:" + stableInterfaceType(setElementType(type), names) }
     if isMapType(type) { return "map:" + stableInterfaceType(mapKeyType(type), names) + ":" + stableInterfaceType(mapValueType(type), names) }
     if isListType(type) { return "list:" + stableInterfaceType(listElementType(type), names) }
-    if isRecordType(type) { return "record:" + names[type - 1000] }
+    if isScalarChoiceType(type) { return "enum:" + names[recordTypeIndex(type)] }
+    if isRecordType(type) { return "record:" + names[recordTypeIndex(type)] }
     return Text(type)
 }
 
@@ -235,9 +236,12 @@ function moduleOwnerHeads(count: Integer, owners: List<Integer>, next: List<Inte
 
 function markInterfaceType(type: Integer, selected: List<Integer>, pending: List<Integer>, stamp: Integer) {
     let element = type
-    while isContainerType(element) { element = containerValueType(element) }
+    while isContainerType(element) {
+        if isMapType(element) { markInterfaceType(mapKeyType(element), selected, pending, stamp) }
+        element = containerValueType(element)
+    }
     if isRecordType(element) {
-        let record = element - 1000
+        let record = recordTypeIndex(element)
         if selected[record] != stamp {
             selected[record] = stamp
             pending.add(record)
@@ -404,12 +408,18 @@ function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, module
     allTokenLines.diagnosticPath = canonicalPath
     tokenizeModule(tokenSource, canonicalPath, false, allTokenKinds, allTokenTexts, allTokenLines)
     let inspect = moduleTokenStarts[module]
+    let maybeNeeded = false
+    let maybeDefined = false
     while allTokenKinds[inspect] != 0 {
         if allTokenKinds[inspect] == 1 && allTokenTexts[inspect] == "native" && allTokenKinds[inspect + 1] == 3 {
             lexerStats[2] = 1
         }
+        if allTokenKinds[inspect] == 1 && (allTokenTexts[inspect] == "Maybe" || allTokenTexts[inspect] == "Some" || allTokenTexts[inspect] == "None") { maybeNeeded = true }
+        if (choiceDeclarationAt(allTokenKinds, allTokenTexts, inspect) || allTokenTexts[inspect] == "record") && allTokenTexts[inspect + 1] == "Maybe" { maybeDefined = true }
         inspect = inspect + 1
     }
+    // The implicit generic Maybe prelude still uses the complete frontend.
+    if maybeNeeded && !maybeDefined { lexerStats[2] = 1 }
     let cursor: List<Integer> = [moduleTokenStarts[module]]
     skipTerminators(allTokenKinds, cursor)
     while allTokenKinds[cursor[0]] != 0 {
@@ -456,14 +466,14 @@ function loadInterfaceModule(library: Text, path: Text, isEntry: Boolean, module
                 declarationCursor = declarationCursor + 1
             }
             let marker: List<Integer> = [declarationCursor]
-            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") || tokenIs(allTokenKinds, allTokenTexts, marker, "global") || isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) {
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") || tokenIs(allTokenKinds, allTokenTexts, marker, "global") || isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) || capabilityDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) || conformanceToAt(allTokenKinds, allTokenTexts, marker[0]) >= 0 {
                 lexerStats[2] = 1
-                if isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) { skipTypeAliasDeclaration(allTokenKinds, allTokenTexts, allTokenLines, marker) } else { skipTopLevelStatement(allTokenKinds, allTokenTexts, marker) }
+                if isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) { skipTypeAliasDeclaration(allTokenKinds, allTokenTexts, allTokenLines, marker) } else { if capabilityDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) { skipDeclaration(allTokenKinds, allTokenTexts, allTokenLines, marker) } else { skipTopLevelStatement(allTokenKinds, allTokenTexts, marker) } }
                 cursor[0] = marker[0]
             } else {
             if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || choiceDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
                 declarationStarts.add(declarationCursor)
-                skipDeclaration(allTokenKinds, allTokenTexts, marker)
+                skipDeclaration(allTokenKinds, allTokenTexts, allTokenLines, marker)
                 declarationEnds.add(marker[0])
                 if tokenIs(allTokenKinds, allTokenTexts, cursor, "public") { cursor[0] = cursor[0] + 1 }
                 if tokenIs(allTokenKinds, allTokenTexts, cursor, "function") {
@@ -519,7 +529,7 @@ function takeModuleField(fields: List<Text>, cursor: List<Integer>): Text {
 }
 
 function writeModuleTable(names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameters: List<Text>, types: List<Integer>, lookup: List<Integer>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLookup: List<Integer>): Text {
-    // Preserve the on-disk table format for existing local module caches.
+    // Nominal return types persist enum identity alongside the logical fields.
     let persistedLookup = buildSymbolLookup(names, kinds)
     let persistedDeclarations = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
     let pieces: List<Text> = []
@@ -755,6 +765,12 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
         module = module + 1
     }
     addEndToken(tokenKinds, tokenTexts, tokenLines, "end of interfaces")
+    if tokenLines.features / 4096 % 2 != 0 {
+        let normalized = normalizeChoiceTypes(tokenKinds, tokenTexts, tokenLines)
+        tokenKinds = normalized.kinds
+        tokenTexts = normalized.texts
+        tokenLines = normalized.lines
+    }
 
     let ends: List<Integer> = []
     let nameLocations: List<Text> = []
@@ -763,6 +779,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
     discoverSyntaxSymbols(interfaceSyntax, tokenTexts, tokenLines, names, kinds, nameLocations, returns, counts, ends)
     lookup = buildDeclarationIndex(names, kinds)
     tokenLines.symbolLookup = lookup
+    discoverScalarChoiceTypes(interfaceSyntax, tokenTexts, tokenLines, names, kinds, returns)
     requireUniqueSymbols(tokenLines, lookup, names, kinds, nameLocations)
     let parameterStarts: List<Integer> = []
     let position = 0
@@ -781,6 +798,19 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
         position = position + 1
     }
         table = writeModuleTable(names, kinds, returns, counts, parameters, types, lookup, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLookup)
+    }
+    let choiceFeatures = 0
+    let choiceSymbol = 0
+    while choiceSymbol < names.length {
+        if kinds[choiceSymbol] == 2 && counts[choiceSymbol] > 0 && resultPrefix(parameters[functionParameterOffset(counts, choiceSymbol)], "minyar_choice_tag|") { choiceFeatures = 4096 }
+        choiceSymbol = choiceSymbol + 1
+    }
+    // Warm sources can skip lexing. Preserve the choice fallback even when
+    // their only evidence is the restored logical declaration table.
+    if choiceFeatures != 0 {
+        io.writeTextFile(outputState, "")
+        io.writeTextFile(statsPath, "0 " + Text(modulePaths.length) + " " + Text(lexerStats[0]) + " " + Text(lexerStats[1]) + " 0 0 false\n")
+        return joinText(compileEntryWithLibrary(path, stackOwnerLimit, library))
     }
     let needsInterfaces = !tableReused
     module = 0
@@ -836,7 +866,7 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
         declarationPiece = declarationPiece + 1
     }
     let nextFields: List<Text> = []
-    nextFields.add("minyar-module-interface-v5")
+    nextFields.add("minyar-module-interface-v11")
     nextFields.add(signature)
     nextFields.add(table)
     let bodyStats: List<Integer> = [0, 0]
@@ -880,6 +910,16 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
                 appendModuleTokens(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, localKinds, localTexts, localLines, identities)
             }
             addEndToken(localKinds, localTexts, localLines, "end of module")
+            // A relexed client may use imported cases without a local choice declaration.
+            localLines.features = testMergedFeatures(localLines.features, choiceFeatures)
+            if localLines.features / 4096 % 2 != 0 {
+                let normalized = normalizeChoiceTypes(localKinds, localTexts, localLines)
+                localKinds = normalized.kinds
+                localTexts = normalized.texts
+                localLines = normalized.lines
+            }
+            localLines.symbolLookup = lookup
+            attachNominalTypes(localLines, kinds, returns)
             let pieces: List<Text> = []
             let globals: List<Text> = []
             appendLiteralDeclarations(pieces, localKinds, localTexts, identities[module], false)

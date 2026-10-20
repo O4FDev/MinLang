@@ -1,0 +1,393 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let levels = ["-O0", "-O2"]
+let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery"]
+fixtures.validate("simulation", cases)
+let prelude = #"""
+    use "simulation" as sim
+    function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+
+    """#
+
+if fixtures.selected("simulation", "seed") {
+    fixtures.executes(frontend, prelude + #"""
+        // Published Park-Miller multiplier 48271, seed 1: literal known answers.
+        // The test contains no copy of the generator under test.
+        let world = sim.create(1)
+        for expected in [48270, 182605793, 1291394885, 1914720636, 2078669040, 407355682] {
+            check(sim.choose(world, 2147483646) == expected, "Park-Miller known answer")
+        }
+        let rejected = sim.create(1)
+        for expected in [48270, 182605793, 407355682, 854716504, 564586690] {
+            check(sim.choose(rejected, 1073741824) == expected, "uneven random tail must be rejected")
+        }
+        check(sim.choose(sim.create(0), 2147483646) == 48270, "zero seed normalization")
+        check(sim.choose(sim.create(2147483647), 2147483646) == 48270, "modulus seed normalization")
+        check(sim.choose(sim.create(-1), 3) == 2, "negative seed normalization")
+        let singleton = sim.create(1)
+        check(sim.choose(singleton, 1) == 0, "singleton choice")
+        check(sim.choose(singleton, 2147483646) == 182605793, "singleton consumes a decision")
+        check(sim.choices(world).length == 6, "each decision is recorded")
+        check(sim.finished(world), "recording world is finished")
+        print("seed: passed")
+
+        """#, "seed: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "replay") {
+    fixtures.executes(frontend, prelude + #"""
+        function workload(world: sim.World): Text {
+            let first = sim.submitPacket(world, 7, Bytes("alpha"), 4, 10)
+            let second = sim.submitPacket(world, 8, Bytes("beta"), 4, 20)
+            let timer = sim.submitTimer(world, 1, 30)
+            let result = ""
+            while sim.pendingCount(world) > 0 {
+                let completion = sim.next(world)
+                result += Text(completion.token) + ":" + Text(completion.result) + ":" + Text(completion.at) + ":" + Text(completion.data) + ";"
+            }
+            return result
+        }
+        let original = sim.create(42)
+        let output = workload(original)
+        let script = sim.choices(original)
+        check(script.length == 3 && script[0].options == 1 && script[1].options == 2, "scheduler records available choices")
+        let replay = sim.replay(99999, script)
+        check(!sim.finished(replay), "unconsumed replay is unfinished")
+        script[0].options = 99
+        script[0].selected = 88
+        script.clear()
+        check(workload(replay) == output, "replay snapshots its input and ignores seed")
+        check(sim.finished(replay), "all replay decisions consumed")
+        let recorded = sim.choices(original)
+        recorded[0].options = 77
+        recorded[0].selected = 66
+        recorded.clear()
+        check(sim.choices(original)[0].options == 1 && sim.choices(original)[0].selected == 0, "history snapshots its decisions")
+        let before = sim.transcript(original)
+        let after = sim.transcript(replay)
+        check(before.length == after.length, "replay transcript length")
+        for index in 0..before.length { check(before[index] == after[index], "replay transcript equality") }
+        before.clear()
+        check(sim.transcript(original).length > 0, "transcript list is isolated")
+        let unfinished = sim.replay(1, [sim.Decision { options: 1; selected: 0 }, sim.Decision { options: 1; selected: 0 }])
+        let choice = sim.choose(unfinished, 1)
+        check(!sim.finished(unfinished), "trailing replay decision is observable")
+        check(sim.finished(sim.replay(1, [])), "empty replay is finished")
+        print("replay: passed")
+
+        """#, "replay: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "ordering") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(2)
+        let late = sim.submitTimer(world, 20, 100)
+        let earlyFirst = sim.submitTimer(world, 5, 200)
+        let earlySecond = sim.submitTimer(world, 5, 300)
+        let first = sim.next(world)
+        check(first.id == earlySecond && first.token == 300 && first.at == 5, "seed breaks earliest-deadline tie")
+        check(first.kind == sim.TIMER && first.target == 0 && first.result == 0 && first.data.length == 0, "timer completion fields")
+        let second = sim.next(world)
+        check(second.id == earlyFirst && second.at == 5, "remaining early deadline precedes late submission")
+        let third = sim.next(world)
+        check(third.id == late && third.at == 20, "latest deadline runs last")
+        let another = sim.create(1)
+        let a = sim.submitTimer(another, 5, 11)
+        let b = sim.submitTimer(another, 5, 22)
+        check(sim.next(another).id == a, "different seed selects other tied completion")
+        sim.advance(another, 50)
+        check(sim.next(another).at == 55 && sim.now(another) == 55, "overdue completion cannot rewind time")
+        check(sim.pendingCount(world) == 0, "all completions consumed")
+        print("ordering: passed")
+
+        """#, "ordering: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "causality") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.replay(1, [sim.Decision { options: 2; selected: 1 }, sim.Decision { options: 1; selected: 0 }])
+        let file = sim.openFile(world, "db/page", true)
+        check(sim.write(world, file, 0, Bytes("old")) == 3, "initial contents")
+        check(sim.syncFile(world, file) == 0 && sim.syncDirectory(world, "db") == 0, "initial durable state")
+        let payload = Bytes("new")
+        let write = sim.submitWrite(world, file, 0, payload, 41)
+        let sync = sim.submitSync(world, file, 42)
+        payload[0] = 88
+        payload.resize(0)
+        check(Text(sim.read(world, file, 0, 3)) == "old", "submission has no write side effect")
+        check(sim.next(world).id == sync, "sync may complete before concurrent write")
+        let completion = sim.next(world)
+        check(completion.id == write && completion.token == 41 && completion.kind == sim.WRITE && completion.target == file && completion.result == 3, "write completion metadata")
+        check(Text(sim.read(world, file, 0, 3)) == "new", "submitted write snapshots payload bytes")
+        sim.crash(world)
+        let recovered = sim.openFile(world, "db/page", false)
+        check(Text(sim.read(world, recovered, 0, 3)) == "old", "early sync cannot persist a later completion")
+        let ordered = sim.create(9)
+        let durable = sim.openFile(ordered, "page", true)
+        let submitted = sim.submitWrite(ordered, durable, 0, Bytes("safe"), 51)
+        check(sim.next(ordered).id == submitted, "wait for write completion")
+        let barrier = sim.submitSync(ordered, durable, 52)
+        check(sim.next(ordered).id == barrier, "then wait for sync completion")
+        check(sim.syncDirectory(ordered, ".") == 0, "persist name")
+        sim.crash(ordered)
+        check(Text(sim.read(ordered, sim.openFile(ordered, "page", false), 0, 4)) == "safe", "completed write before sync survives")
+        let reads = sim.replay(1, [sim.Decision { options: 2; selected: 1 }, sim.Decision { options: 1; selected: 0 }])
+        let page = sim.openFile(reads, "page", true)
+        check(sim.write(reads, page, 0, Bytes("old")) == 3, "read fixture")
+        let pendingWrite = sim.submitWrite(reads, page, 0, Bytes("new"), 61)
+        let pendingRead = sim.submitRead(reads, page, 0, 3, 62)
+        let read = sim.next(reads)
+        check(read.id == pendingRead && read.kind == sim.READ && read.result == 3 && Text(read.data) == "old", "read observes completed writes only")
+        let written = sim.next(reads)
+        read.data[0] = 88
+        check(Text(sim.read(reads, page, 0, 3)) == "new", "completion read bytes do not alias file")
+        print("causality: passed")
+
+        """#, "causality: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "durability") {
+    fixtures.executes(frontend, prelude + #"""
+        let fileOnly = sim.create(1)
+        let unnamed = sim.openFile(fileOnly, "db/file", true)
+        check(sim.write(fileOnly, unnamed, 0, Bytes("saved")) == 5 && sim.syncFile(fileOnly, unnamed) == 0, "sync file contents")
+        sim.crash(fileOnly)
+        check(sim.openFile(fileOnly, "db/file", false) == -2, "file sync does not persist its directory entry")
+        let nameOnly = sim.create(1)
+        let empty = sim.openFile(nameOnly, "db/file", true)
+        check(sim.write(nameOnly, empty, 0, Bytes("lost")) == 4 && sim.syncDirectory(nameOnly, "db") == 0, "sync directory only")
+        sim.crash(nameOnly)
+        let exists = sim.openFile(nameOnly, "db/file", false)
+        check(exists > 0 && sim.size(nameOnly, exists) == 0, "directory sync preserves name without data")
+        let world = sim.create(1)
+        let durable = sim.openFile(world, "db/file", true)
+        let sibling = sim.openFile(world, "other/file", true)
+        check(sim.write(world, durable, 0, Bytes("old")) == 3 && sim.syncFile(world, durable) == 0, "durable original")
+        check(sim.syncDirectory(world, "db") == 0, "directory scope")
+        check(sim.write(world, durable, 0, Bytes("new")) == 3, "volatile overwrite")
+        check(sim.syncDirectory(world, "db") == 0, "directory sync is not a data barrier")
+        sim.crash(world)
+        check(Text(sim.read(world, sim.openFile(world, "db/file", false), 0, 99)) == "old", "unsynced overwrite lost")
+        check(sim.openFile(world, "other/file", false) == -2, "unrelated directory not persisted")
+        let list = sim.names(world, "db")
+        check(list.length == 1 && list[0] == "file", "directory reports base names")
+        list.clear()
+        check(sim.names(world, "db").length == 1, "name enumeration is isolated")
+        print("durability: passed")
+
+        """#, "durability: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "namespace") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(1)
+        let source = sim.openFile(world, "/old", true)
+        let replaced = sim.openFile(world, "/new", true)
+        check(sim.write(world, source, 0, Bytes("source")) == 6 && sim.write(world, replaced, 0, Bytes("target")) == 6, "two identities")
+        check(sim.syncFile(world, source) == 0 && sim.syncFile(world, replaced) == 0 && sim.syncDirectory(world, "/") == 0, "initial namespace")
+        check(sim.rename(world, "/old", "/new") == 0, "rename replaces destination")
+        check(sim.openFile(world, "/new", false) == source && sim.openFile(world, "/old", false) == -2, "rename preserves source identity")
+        check(Text(sim.read(world, replaced, 0, 99)) == "target", "replaced open identity remains readable")
+        check(sim.remove(world, "/new") == 0, "unlink renamed path")
+        check(Text(sim.read(world, source, 0, 99)) == "source", "unlink does not destroy open identity")
+        let fresh = sim.openFile(world, "/new", true)
+        check(fresh != source && fresh != replaced && sim.size(world, fresh) == 0, "recreate allocates a fresh identity")
+        sim.crash(world)
+        let recoveredOld = sim.openFile(world, "/old", false)
+        let recoveredNew = sim.openFile(world, "/new", false)
+        check(Text(sim.read(world, recoveredOld, 0, 99)) == "source" && Text(sim.read(world, recoveredNew, 0, 99)) == "target", "uncommitted namespace changes roll back")
+        check(sim.rename(world, "/old", "/new") == 0 && sim.syncDirectory(world, "/") == 0, "commit replacement rename")
+        sim.crash(world)
+        check(sim.openFile(world, "/old", false) == -2, "old durable name removed")
+        check(Text(sim.read(world, sim.openFile(world, "/new", false), 0, 99)) == "source", "new durable name has source contents")
+        check(sim.remove(world, "/new") == 0, "volatile unlink")
+        sim.crash(world)
+        check(sim.openFile(world, "/new", false) > 0, "unsynced unlink rolls back")
+        check(sim.remove(world, "/new") == 0 && sim.syncDirectory(world, "/") == 0, "commit unlink")
+        sim.crash(world)
+        check(sim.openFile(world, "/new", false) == -2 && sim.names(world, "/").length == 0, "durable unlink survives")
+        print("namespace: passed")
+
+        """#, "namespace: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "torn-write") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(1)
+        let file = sim.openFile(world, "page", true)
+        check(sim.write(world, file, 0, Bytes("AAAAAA")) == 6 && sim.syncFile(world, file) == 0 && sim.syncDirectory(world, ".") == 0, "durable original page")
+        check(sim.write(world, file, 0, Bytes("BBBBBB")) == 6, "volatile replacement page")
+        sim.persistPrefix(world, file, 3)
+        sim.crash(world)
+        let recovered = sim.openFile(world, "page", false)
+        check(Text(sim.read(world, recovered, 0, 99)) == "BBBAAA", "torn write persists exact prefix only")
+        check(sim.resize(world, recovered, 2) == 0 && sim.write(world, recovered, 0, Bytes("CC")) == 2, "volatile shrink")
+        sim.persistPrefix(world, recovered, 2)
+        sim.crash(world)
+        check(Text(sim.read(world, sim.openFile(world, "page", false), 0, 99)) == "CCBAAA", "prefix fault does not truncate durable suffix")
+        let added = sim.openFile(world, "new", true)
+        check(sim.syncDirectory(world, ".") == 0 && sim.write(world, added, 0, Bytes("abcdef")) == 6, "new unsynced contents")
+        sim.persistPrefix(world, added, 3)
+        sim.crash(world)
+        check(Text(sim.read(world, sim.openFile(world, "new", false), 0, 99)) == "abc", "prefix fault may extend durable length")
+        let zero = sim.openFile(world, "zero", true)
+        check(sim.syncDirectory(world, ".") == 0 && sim.write(world, zero, 0, Bytes("lost")) == 4, "zero-prefix fixture")
+        sim.persistPrefix(world, zero, 0)
+        sim.crash(world)
+        check(sim.size(world, sim.openFile(world, "zero", false)) == 0, "empty persisted prefix guarantees no bytes")
+        print("torn-write: passed")
+
+        """#, "torn-write: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "faults") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(1)
+        let file = sim.openFile(world, "page", true)
+        check(sim.write(world, file, 0, Bytes("data")) == 4, "fault fixture data")
+        sim.injectError(world, sim.WRITE, -28)
+        sim.injectError(world, sim.READ, -5)
+        sim.injectError(world, sim.READ, -6)
+        sim.injectError(world, sim.SYNC, -30)
+        check(sim.openFile(world, "page", false) == file && sim.size(world, file) == 4, "metadata does not consume I/O faults")
+        check(sim.read(world, file, 0, 4).length == 0 && sim.lastError(world) == -5, "first matching read fault")
+        check(sim.read(world, file, 0, 4).length == 0 && sim.lastError(world) == -6, "matching faults preserve queue order")
+        check(Text(sim.read(world, file, 0, 4)) == "data" && sim.lastError(world) == 0, "read faults each consumed once")
+        check(sim.resize(world, file, 9) == -28 && sim.size(world, file) == 4, "resize consumes write fault without mutation")
+        check(sim.write(world, file, 0, Bytes("next")) == 4, "write fault consumed once")
+        check(sim.syncDirectory(world, ".") == -30, "sync fault remains armed across other kinds")
+        check(sim.syncFile(world, file) == 0, "sync fault consumed once")
+        sim.crash(world)
+        check(sim.openFile(world, "page", false) == -2, "failed directory sync has no durability effect")
+        let asyncWorld = sim.create(2)
+        let target = sim.openFile(asyncWorld, "page", true)
+        sim.injectError(asyncWorld, sim.WRITE, -5)
+        let pending = sim.submitWrite(asyncWorld, target, 0, Bytes("later"), 71)
+        check(sim.write(asyncWorld, target, 0, Bytes("now")) == -5, "submission does not consume fault")
+        check(sim.next(asyncWorld).result == 5, "fault consumed at operation execution")
+        sim.injectError(asyncWorld, sim.READ, -11)
+        let read = sim.submitRead(asyncWorld, target, 0, 5, 72)
+        let failed = sim.next(asyncWorld)
+        check(failed.id == read && failed.result == -11 && failed.data.length == 0, "async read exposes negative error")
+        check(Text(sim.read(asyncWorld, target, 0, 5)) == "later", "failed async read consumes fault once")
+        check(sim.read(asyncWorld, target, -1, 1).length == 0 && sim.lastError(asyncWorld) == -22, "negative read offset")
+        check(sim.read(asyncWorld, target, 0, -1).length == 0 && sim.lastError(asyncWorld) == -22, "negative read length")
+        check(sim.write(asyncWorld, target, 100, Bytes()) == 0 && sim.size(asyncWorld, target) == 5, "empty write beyond EOF does not grow file")
+        check(sim.write(asyncWorld, target, -1, Bytes("x")) == -22 && sim.resize(asyncWorld, target, -1) == -22, "negative write and resize")
+        check(sim.write(asyncWorld, target, 16777217, Bytes()) == -27 && sim.resize(asyncWorld, target, 16777217) == -27, "bounded file size rejects without allocation")
+        check(sim.size(asyncWorld, 0) == -9 && sim.syncFile(asyncWorld, 999) == -9, "invalid file identity")
+        print("faults: passed")
+
+        """#, "faults: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "packets") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(1)
+        let bytes = Bytes("packet")
+        let first = sim.submitPacket(world, 7, bytes, 2, 81)
+        bytes[0] = 88
+        bytes.resize(0)
+        sim.partition(world, 7, true)
+        let failed = sim.next(world)
+        check(failed.id == first && failed.result == -110 && failed.data.length == 0 && failed.at == 2, "partition applied when packet completes")
+        let other = sim.submitPacket(world, 8, Bytes("other"), 0, 82)
+        check(Text(sim.next(world).data) == "other", "partition affects only selected channel")
+        sim.partition(world, 7, false)
+        let payload = Bytes("packet")
+        let delivered = sim.submitPacket(world, 7, payload, 3, 83)
+        payload[0] = 88
+        let good = sim.next(world)
+        check(good.id == delivered && good.kind == sim.PACKET && good.target == 7 && good.token == 83 && good.result == 6 && Text(good.data) == "packet" && good.at == 5, "packet payload copied on submission")
+        sim.partition(world, 7, true)
+        sim.injectError(world, sim.PACKET, -5)
+        let errorPacket = sim.submitPacket(world, 7, Bytes("x"), 0, 84)
+        check(sim.next(world).result == -5, "injected packet error wins once")
+        let blockedPacket = sim.submitPacket(world, 7, Bytes("x"), 0, 85)
+        check(sim.next(world).result == -110, "partition persists after one-shot error")
+        sim.partition(world, 7, false)
+        let healed = sim.submitPacket(world, 7, Bytes("ok"), 0, 86)
+        check(Text(sim.next(world).data) == "ok", "healed link delivers again")
+        print("packets: passed")
+
+        """#, "packets: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "clock-cancel") {
+    fixtures.executes(frontend, prelude + #"""
+        let world = sim.create(1)
+        check(sim.now(world) == 0 && sim.wallTime(world) == 0, "initial clocks")
+        let timer = sim.submitTimer(world, 10, 91)
+        sim.jumpClock(world, 1000)
+        check(sim.now(world) == 0 && sim.wallTime(world) == 1000, "wall jump does not advance monotonic clock")
+        sim.jumpClock(world, -2000)
+        check(sim.wallTime(world) == -1000, "wall clock may move backwards")
+        sim.advance(world, 3)
+        check(sim.now(world) == 3 && sim.wallTime(world) == -997, "elapsed time advances both clocks")
+        check(sim.next(world).at == 10 && sim.now(world) == 10 && sim.wallTime(world) == -990, "wall faults cannot reschedule monotonic deadline")
+        let canceled = sim.submitTimer(world, 1, 92)
+        let kept = sim.submitTimer(world, 2, 93)
+        check(sim.cancel(world, canceled) && !sim.cancel(world, canceled), "cancel succeeds exactly once")
+        check(!sim.cancel(world, 9999) && sim.pendingCount(world) == 1, "unknown cancel leaves queue intact")
+        check(sim.next(world).id == kept && !sim.cancel(world, kept), "consumed completion cannot be canceled")
+        let file = sim.openFile(world, "page", true)
+        check(sim.write(world, file, 0, Bytes("safe")) == 4 && sim.syncFile(world, file) == 0 && sim.syncDirectory(world, ".") == 0, "crash fixture durable state")
+        let write = sim.submitWrite(world, file, 0, Bytes("lost"), 94)
+        let read = sim.submitRead(world, file, 0, 4, 95)
+        let abandoned = sim.submitTimer(world, 100, 96)
+        sim.injectError(world, sim.READ, -5)
+        sim.crash(world)
+        check(sim.pendingCount(world) == 0 && !sim.cancel(world, write) && !sim.cancel(world, read) && !sim.cancel(world, abandoned), "crash drops every outstanding operation")
+        let recovered = sim.openFile(world, "page", false)
+        check(Text(sim.read(world, recovered, 0, 4)) == "safe" && sim.lastError(world) == 0, "crash drops unexecuted writes and armed faults")
+        let restarted = sim.submitTimer(world, 0, 97)
+        check(restarted > abandoned && sim.next(world).id == restarted, "operation IDs cannot collide after crash")
+        print("clock-cancel: passed")
+
+        """#, "clock-cancel: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "invalid") {
+    let invalidSources = [
+        "let choice = sim.choose(sim.create(1), 0)",
+        "let choice = sim.choose(sim.create(1), -1)",
+        "let choice = sim.choose(sim.create(1), 2147483647)",
+        "let world = sim.replay(1, []); let choice = sim.choose(world, 1)",
+        "let world = sim.replay(1, [sim.Decision { options: 2; selected: 0 }]); let choice = sim.choose(world, 3)",
+        "let world = sim.replay(1, [sim.Decision { options: 2; selected: -1 }]); let choice = sim.choose(world, 2)",
+        "let world = sim.replay(1, [sim.Decision { options: 2; selected: 2 }]); let choice = sim.choose(world, 2)",
+        "let completion = sim.next(sim.create(1))",
+        "sim.advance(sim.create(1), -1)",
+        "let id = sim.submitTimer(sim.create(1), -1, 0)",
+        "let id = sim.submitPacket(sim.create(1), 0, Bytes(), -1, 0)",
+        "sim.injectError(sim.create(1), sim.TIMER, -5)",
+        "sim.injectError(sim.create(1), 0, -5)",
+        "sim.injectError(sim.create(1), sim.READ, 0)",
+        "sim.injectError(sim.create(1), sim.WRITE, 5)",
+        "sim.persistPrefix(sim.create(1), 1, 0)",
+        "let world = sim.create(1); let file = sim.openFile(world, \"page\", true); sim.persistPrefix(world, file, -1)",
+        "let world = sim.create(1); let file = sim.openFile(world, \"page\", true); sim.persistPrefix(world, file, 1)"
+    ]
+    let diagnostics = [
+        "choice count must be between 1 and 2147483646", "choice count must be between 1 and 2147483646", "choice count must be between 1 and 2147483646",
+        "replay ran out of decisions", "replay decision does not match the available choices", "replay decision does not match the available choices", "replay decision does not match the available choices",
+        "no operation is pending", "monotonic time cannot move backwards", "an operation delay cannot be negative", "an operation delay cannot be negative",
+        "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code",
+        "torn-write fault needs an open file", "torn-write prefix is outside the file", "torn-write prefix is outside the file"
+    ]
+    test.check(invalidSources.length == diagnostics.length, "invalid fixture oracle count")
+    for index in 0..invalidSources.length {
+        fixtures.executes(frontend, prelude + invalidSources[index] + "\nprint(\"too late\")\n", "", levels, 1, "Minyar stopped: simulation: " + diagnostics[index] + "\n", false)
+    }
+}
+
+if fixtures.selected("simulation", "gallery") {
+    fixtures.executes(frontend, io.readTextFile("examples/gallery/the-harbour-remembers.min"), "There is a light on the shore.\nThe unfinished bell is quiet.\n", levels, 0, "", true)
+}
+
+test.removeTree(frontend.compiler.directory)
+print("Deterministic simulation: passed")

@@ -1,0 +1,309 @@
+// Opt-in live code images. The ordinary compiler and its bootstrap stay unchanged.
+use "./editor-source.min" as editor
+use "./driver-support.min" as host
+
+public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; error: Text }
+record Symbol { token: Text; raw: Text; end: Integer; error: Text }
+record Function { name: Text; raw: Text; wrapper: Text; body: Text; language: Boolean; result: Text; returned: Text; parameters: Text; arguments: Text; signature: Text; error: Text }
+record Rewritten { text: Text; error: Text }
+
+function field(parts: List<Text>, value: Text) { parts.add(Text(value.byteLength) + ":" + value + "\n") }
+function surfaceError(message: Text): Text { return "live-surface-error: " + message }
+
+// Success is recognisable so malformed edits can leave the running image alone.
+public function surface(text: Text): Text {
+    let source = editor.scan(text)
+    if source.error != "" { return surfaceError(source.error) }
+    let tokens: List<editor.Token> = []
+    for token in source.tokens { if token.kind != 5 { tokens.add(token) } }
+    let delimiters: List<Text> = []
+    for token in tokens {
+        if token.kind == 3 { continue }
+        let value = token.text
+        if value == "(" || value == "[" || value == "{" { delimiters.add(value) }
+        if value == ")" || value == "]" || value == "}" {
+            if delimiters.length == 0 { return surfaceError("unexpected closing delimiter") }
+            let opening = delimiters[delimiters.length - 1]
+            if (value == ")" && opening != "(") || (value == "]" && opening != "[") || (value == "}" && opening != "{") { return surfaceError("mismatched closing delimiter") }
+            delimiters.pop()
+        }
+    }
+    if delimiters.length != 0 { return surfaceError("declaration or expression is missing its closing delimiter") }
+    let parts: List<Text> = ["live-surface-v1\n"]
+    let index = 0
+    let depth = 0
+    while index < tokens.length {
+        let token = tokens[index]
+        // Named top-level functions only; closures and capability bodies stay exact.
+        if depth == 0 && token.kind == 1 && token.text == "function" && index + 1 < tokens.length && tokens[index + 1].kind == 1 {
+            let name = tokens[index + 1].text
+            let body = index + 2
+            let round = 0
+            let square = 0
+            while body < tokens.length {
+                let value = tokens[body].text
+                if tokens[body].kind != 3 {
+                    if value == "(" { round += 1 }
+                    if value == ")" { round -= 1 }
+                    if value == "[" { square += 1 }
+                    if value == "]" { square -= 1 }
+                    if value == "{" && round == 0 && square == 0 { break }
+                    if value == ";" || value == "}" { return surfaceError("a named function needs a body") }
+                }
+                body += 1
+            }
+            if body == tokens.length { return surfaceError("a named function needs a body") }
+            let end = body + 1
+            let nesting = 1
+            while end < tokens.length && nesting > 0 {
+                if tokens[end].kind != 3 {
+                    if tokens[end].text == "{" { nesting += 1 }
+                    if tokens[end].text == "}" { nesting -= 1 }
+                }
+                end += 1
+            }
+            if nesting != 0 { return surfaceError("a named function needs its closing brace") }
+            let native = false
+            for statement in (body + 1)..end {
+                if tokens[statement].kind == 1 && tokens[statement].text == "native" {
+                    let value = statement + 1
+                    while value < end && tokens[value].kind == 6 { value += 1 }
+                    if value < end && tokens[value].kind == 3 { native = true }
+                }
+            }
+            let main = name == "main" && index + 2 < tokens.length && tokens[index + 2].text != "."
+            if !main && !native {
+                for header in index..(body + 1) { field(parts, tokens[header].text) }
+                field(parts, "<live function body>")
+                field(parts, "}")
+                index = end
+                continue
+            }
+        }
+        field(parts, token.text)
+        if token.kind != 3 {
+            if token.text == "{" { depth += 1 }
+            if token.text == "}" { depth -= 1 }
+        }
+        index += 1
+    }
+    return joinText(parts)
+}
+
+function hex(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    return -1
+}
+function identifier(byte: Integer): Boolean {
+    return editor.word(byte) || editor.digit(byte) || byte == 36 || byte == 46 || byte == 45
+}
+function symbol(data: Bytes, start: Integer): Symbol {
+    let result = Symbol { token: ""; raw: ""; end: start; error: "" }
+    if start >= data.length { result.error = "generated LLVM has an incomplete symbol"; return result }
+    let index = start
+    let decoded = Bytes()
+    if data[index] == 34 {
+        index += 1
+        let closed = false
+        while index < data.length {
+            let byte = data[index]
+            if byte == 34 { index += 1; closed = true; break }
+            if byte == 92 {
+                if index + 2 >= data.length { result.error = "generated LLVM has an incomplete symbol escape"; return result }
+                let high = hex(data[index + 1])
+                let low = hex(data[index + 2])
+                if high < 0 || low < 0 { result.error = "generated LLVM has an invalid symbol escape"; return result }
+                byte = high * 16 + low
+                index += 2
+            }
+            if byte == 0 || byte == 10 || byte == 13 { result.error = "live function names cannot contain zero bytes or newlines"; return result }
+            decoded.add(byte)
+            index += 1
+        }
+        if !closed { result.error = "generated LLVM has an unterminated symbol"; return result }
+    } else {
+        while index < data.length && identifier(data[index]) { decoded.add(data[index]); index += 1 }
+    }
+    if decoded.length == 0 { result.error = "generated LLVM has an empty symbol"; return result }
+    result.token = Text(data.slice(start, index))
+    result.raw = Text(decoded)
+    result.end = index
+    return result
+}
+function escaped(value: Text): Text {
+    let parts: List<Text> = []
+    let digits = "0123456789ABCDEF"
+    for byte in Bytes(value) {
+        if byte >= 32 && byte <= 126 && byte != 34 && byte != 92 { parts.add(Text(Character(byte))) }
+        else { parts.add("\\" + Text(digits[byte / 16]) + Text(digits[byte % 16])) }
+    }
+    return joinText(parts)
+}
+function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; error: message } }
+function scalar(value: Text): Boolean { return host.listed(["void", "i64", "i32", "i1", "double", "ptr"], value) }
+function definition(line: Text, generation: Integer, index: Integer, initial: Boolean): Function {
+    let found = Function { name: ""; raw: ""; wrapper: ""; body: ""; language: false; result: ""; returned: ""; parameters: ""; arguments: ""; signature: ""; error: "" }
+    let at = host.findText(line, "@", 0)
+    if at < 0 { found.error = "generated LLVM function is missing its symbol"; return found }
+    let parsed = symbol(Bytes(line), at + 1)
+    if parsed.error != "" { found.error = parsed.error; return found }
+    found.name = parsed.token
+    found.raw = parsed.raw
+    found.wrapper = "minyar.live." + Text(generation) + ".function." + Text(index)
+    found.body = "minyar.live." + Text(generation) + ".body." + Text(index)
+    if initial && parsed.raw == "main" { found.wrapper = "main" }
+    found.language = parsed.raw.startsWith(".minyar.fn.")
+    if !found.language { return found }
+    let leading = host.words(host.textSlice(line, 7, at))
+    if leading.length == 0 { found.error = "generated LLVM function is missing its return type"; return found }
+    found.returned = leading[leading.length - 1]
+    if !scalar(found.returned) { found.error = "live functions require a supported scalar or managed return ABI"; return found }
+    found.result = found.returned
+    for item in leading {
+        if !host.listed(["internal", "private", "dso_local", "hidden", "default", "zeroext", "signext", found.returned], item) { found.error = "unsupported live function return attribute: " + item; return found }
+        if item == "zeroext" || item == "signext" { found.result = item + " " + found.returned }
+    }
+    let begin = parsed.end
+    let data = Bytes(line)
+    while begin < data.length && host.isSpace(data[begin]) { begin += 1 }
+    if begin >= data.length || data[begin] != 40 { found.error = "generated LLVM function is missing its parameter list"; return found }
+    let end = host.findText(line, ")", begin + 1)
+    if end < 0 || !host.strip(line).endsWith("{") { found.error = "live functions require a complete single-line LLVM header"; return found }
+    let parameters = host.strip(host.textSlice(line, begin + 1, end))
+    let declarations: List<Text> = []
+    let arguments: List<Text> = []
+    let signature: List<Text> = []
+    field(signature, found.raw)
+    field(signature, found.result)
+    if parameters != "" {
+        for parameter in parameters.split(",") {
+            let words = host.words(parameter)
+            if words.length != 2 { found.error = "unsupported live function parameter attributes"; return found }
+            if !scalar(words[0]) || words[0] == "void" || !words[1].startsWith("%") { found.error = "unsupported live function parameter ABI"; return found }
+            declarations.add(words[0] + " " + words[1])
+            arguments.add(words[0] + " " + words[1])
+            field(signature, words[0])
+        }
+    }
+    found.parameters = host.joined(declarations, ", ")
+    found.arguments = host.joined(arguments, ", ")
+    found.signature = joinText(signature)
+    return found
+}
+
+// Replace symbol references, never strings/inline assembly/comments or prefixes.
+function renamed(text: Text, names: Map<Text, Text>): Rewritten {
+    let data = Bytes(text)
+    let parts: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < data.length {
+        if data[index] == 59 { while index < data.length && data[index] != 10 { index += 1 }; continue }
+        if data[index] == 34 {
+            index += 1
+            let closed = false
+            while index < data.length {
+                if data[index] == 92 { index += 2 }
+                else if data[index] == 34 { index += 1; closed = true; break }
+                else { index += 1 }
+            }
+            if !closed { return Rewritten { text: ""; error: "generated LLVM has an unterminated string" } }
+            continue
+        }
+        if data[index] == 64 {
+            let parsed = symbol(data, index + 1)
+            if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
+            if names.has(parsed.raw) {
+                parts.add(Text(data.slice(start, index + 1)))
+                parts.add(names[parsed.raw])
+                start = parsed.end
+            }
+            index = parsed.end
+        } else { index += 1 }
+    }
+    parts.add(Text(data.slice(start, data.length)))
+    return Rewritten { text: joinText(parts); error: "" }
+}
+function rootCell(line: Text, initial: Boolean): Rewritten {
+    if !line.startsWith("@") { return Rewritten { text: line; error: "" } }
+    let parsed = symbol(Bytes(line), 1)
+    if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
+    if !parsed.raw.startsWith("minyar.constant|") || !(parsed.raw.endsWith("|value") || parsed.raw.endsWith("|state")) { return Rewritten { text: line; error: "" } }
+    let tail = host.strip(host.textSlice(line, parsed.end, line.byteLength))
+    if !tail.startsWith("= internal global ") { return Rewritten { text: ""; error: "unsupported module state cell linkage" } }
+    let words = host.words(host.textAfter(tail, "= internal global "))
+    if words.length != 2 || !(scalar(words[0]) || words[0] == "i8") { return Rewritten { text: ""; error: "unsupported module state cell layout" } }
+    if initial { return Rewritten { text: "@" + parsed.token + " = global " + words[0] + " " + words[1]; error: "" } }
+    return Rewritten { text: "@" + parsed.token + " = external global " + words[0]; error: "" }
+}
+function wrapper(function: Function, index: Integer, generation: Integer): Text {
+    let key = "minyar.live." + Text(generation) + ".key." + Text(index)
+    let output: List<Text> = ["@" + key + " = private unnamed_addr constant [" + Text(function.raw.byteLength + 1) + " x i8] c\"" + escaped(function.raw) + "\\00\"\n"]
+    output.add("define " + function.result + " @" + function.wrapper + "(" + function.parameters + ") noinline uwtable {\nentry:\n")
+    output.add("  %live.target = call ptr @minyar_live_resolve(ptr @" + key + ", ptr @" + function.body + ")\n")
+    if function.returned == "void" {
+        output.add("  call void %live.target(" + function.arguments + ")\n  ret void\n}\n")
+    } else {
+        output.add("  %live.result = call " + function.result + " %live.target(" + function.arguments + ")\n  ret " + function.returned + " %live.result\n}\n")
+    }
+    return joinText(output)
+}
+
+public function transform(llvm: Text, generation: Integer, initial: Boolean): Image {
+    if generation < 0 { return failed("live generation must be nonnegative") }
+    if host.hasText(llvm, "; minyar-thread-runtime: 1") || host.hasText(llvm, "; minyar-data-parallel-runtime: 1") { return failed("live reload currently requires a single-threaded program") }
+    let functions: List<Function> = []
+    let namesBySymbol = Map<Text, Text>()
+    let lines = host.lines(llvm)
+    let inFunction = false
+    for line in lines {
+        if line.startsWith("define ") {
+            if inFunction { return failed("generated LLVM contains a nested function definition") }
+            let function = definition(line, generation, functions.length, initial)
+            if function.error != "" { return failed(function.error) }
+            if namesBySymbol.has(function.raw) { return failed("generated LLVM repeats a function definition") }
+            namesBySymbol[function.raw] = function.wrapper
+            functions.add(function)
+            inFunction = true
+        } else if line == "}" {
+            if !inFunction { return failed("generated LLVM has an unexpected function closing brace") }
+            inFunction = false
+        }
+    }
+    if inFunction { return failed("generated LLVM is missing a function closing brace") }
+    if functions.length == 0 { return failed("generated LLVM contains no functions") }
+    let output: List<Text> = []
+    let names: List<Text> = []
+    let symbols: List<Text> = []
+    let signatures: List<Text> = ["live-image-v1\n"]
+    let current = 0
+    for line in lines {
+        let state = rootCell(line, initial)
+        if state.error != "" { return failed(state.error) }
+        let replaced = renamed(state.text, namesBySymbol)
+        if replaced.error != "" { return failed(replaced.error) }
+        let result = replaced.text
+        if line.startsWith("define ") {
+            let function = functions[current]
+            if function.language {
+                result = host.replaceText(result, "@" + function.wrapper + "(", "@" + function.body + "(")
+                result = host.replaceText(result, "define internal ", "define ")
+                result = host.replaceText(result, "define private ", "define ")
+                result = host.replaceText(result, "define hidden ", "define ")
+                names.add(function.raw)
+                symbols.add(function.body)
+                field(signatures, function.signature)
+            }
+            current += 1
+        }
+        if line.startsWith("%") && host.hasText(line, " = type ") { field(signatures, line) }
+        if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { field(signatures, line) }
+        if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
+        output.add(result + "\n")
+    }
+    output.add("declare ptr @minyar_live_resolve(ptr, ptr)\n")
+    for index in 0..functions.length { if functions[index].language { output.add(wrapper(functions[index], index, generation)) } }
+    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures); error: "" }
+}

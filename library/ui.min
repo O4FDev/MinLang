@@ -1,0 +1,128 @@
+// Immutable descriptions of native views. Build a description, then check
+// problem before giving it to a renderer. No native objects are created here.
+
+public constant LABEL = 1
+public constant HEADING = 2
+public constant BUTTON = 3
+public constant INPUT = 4
+public constant TOGGLE = 5
+public constant ROW = 6
+public constant COLUMN = 7
+
+public record View {
+    private kind: Integer
+    private key: Text
+    private text: Text
+    private checked: Boolean
+    private spacing: Integer
+    private padding: Integer
+    private children: List<View>
+}
+
+function copyChildren(values: List<View>): List<View> {
+    let result: List<View> = []
+    for value in values { result.add(value) }
+    return result
+}
+
+function leaf(kind: Integer, key: Text, text: Text, checked: Boolean): View {
+    return View { kind: kind; key: key; text: text; checked: checked; spacing: 12; padding: 0; children: [] }
+}
+
+public function label(text: Text): View { return leaf(LABEL, "", text, false) }
+public function heading(text: Text): View { return leaf(HEADING, "", text, false) }
+public function button(key: Text, text: Text): View { return leaf(BUTTON, key, text, false) }
+public function input(key: Text, text: Text): View { return leaf(INPUT, key, text, false) }
+public function toggle(key: Text, text: Text, checked: Boolean): View { return leaf(TOGGLE, key, text, checked) }
+
+// The caller keeps its List; later edits to it cannot change the description.
+public function row(children: List<View>): View {
+    return View { kind: ROW; key: ""; text: ""; checked: false; spacing: 12; padding: 0; children: copyChildren(children) }
+}
+public function column(children: List<View>): View {
+    return View { kind: COLUMN; key: ""; text: ""; checked: false; spacing: 12; padding: 0; children: copyChildren(children) }
+}
+
+// Modifiers return fresh descriptions. They never change another alias.
+// Layout belongs to rows and columns; problem rejects nondefault leaf layout.
+public function spaced(view: View, points: Integer): View {
+    return View { kind: view.kind; key: view.key; text: view.text; checked: view.checked; spacing: points; padding: view.padding; children: copyChildren(view.children) }
+}
+public function padded(view: View, points: Integer): View {
+    return View { kind: view.kind; key: view.key; text: view.text; checked: view.checked; spacing: view.spacing; padding: points; children: copyChildren(view.children) }
+}
+
+public function kind(view: View): Integer { return view.kind }
+public function key(view: View): Text { return view.key }
+public function text(view: View): Text { return view.text }
+public function isChecked(view: View): Boolean { return view.checked }
+public function spacing(view: View): Integer { return view.spacing }
+public function padding(view: View): Integer { return view.padding }
+// Returning a copy also prevents callers from attaching a view to itself.
+public function children(view: View): List<View> { return copyChildren(view.children) }
+
+record Visit { view: View; depth: Integer }
+
+function hasZero(text: Text): Boolean {
+    for byte in Bytes(text) { if byte == 0 { return true } }
+    return false
+}
+
+// An empty result means valid. Factories retain invalid values so validation
+// can report them without stopping the application. The root has depth one;
+// shared descriptions count once for each place where they will be rendered.
+// Validation visits at most 1024 nodes and never uses the native call stack.
+public function problem(view: View): Text {
+    let pending = [Visit { view: view; depth: 1 }]
+    let keys: List<Text> = []
+    let position = 0
+    while position < pending.length {
+        let visit = pending[position]
+        let node = visit.view
+        position += 1
+        if visit.depth > 64 { return "a view may be nested at most 64 levels deep" }
+        if node.spacing < 0 || node.spacing > 256 { return "view spacing must be between 0 and 256 points" }
+        if node.padding < 0 || node.padding > 256 { return "view padding must be between 0 and 256 points" }
+        if node.kind != ROW && node.kind != COLUMN {
+            if node.spacing != 12 { return "spacing applies only to a row or column" }
+            if node.padding != 0 { return "padding applies only to a row or column" }
+        }
+        if hasZero(node.text) { return "view text must not contain a zero byte" }
+        if node.kind == BUTTON || node.kind == INPUT || node.kind == TOGGLE {
+            if node.key == "" { return "each control needs a nonempty key" }
+            if node.key.byteLength > 256 { return "a control key may contain at most 256 UTF-8 bytes" }
+            if hasZero(node.key) { return "a control key must not contain a zero byte" }
+            for prior in keys {
+                if prior == node.key { return "control keys must be unique: " + node.key }
+            }
+            keys.add(node.key)
+        }
+        if node.children.length > 1024 - pending.length { return "a view may contain at most 1024 nodes" }
+        for child in node.children { pending.add(Visit { view: child; depth: visit.depth + 1 }) }
+    }
+    return ""
+}
+
+record Pair { left: View; right: View; depth: Integer }
+
+// Text, checked state, spacing and padding can change in place. Kind, key and
+// ordered child structure decide whether native controls can keep their handles.
+// Descriptions beyond the validation limits never have reusable structure.
+public function sameStructure(left: View, right: View): Boolean {
+    let pending = [Pair { left: left; right: right; depth: 1 }]
+    let position = 0
+    while position < pending.length {
+        let pair = pending[position]
+        position += 1
+        if pair.depth > 64 { return false }
+        if pair.left.kind != pair.right.kind || pair.left.key != pair.right.key { return false }
+        if pair.left.children.length != pair.right.children.length { return false }
+        if pair.left.children.length > 1024 - pending.length { return false }
+        let index = 0
+        while index < pair.left.children.length {
+            pending.add(Pair { left: pair.left.children[index]; right: pair.right.children[index]; depth: pair.depth + 1 })
+            index += 1
+        }
+    }
+    return true
+}

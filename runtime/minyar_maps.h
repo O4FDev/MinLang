@@ -11,6 +11,37 @@ typedef _Bool (*MinyarRecordEqual)(const MinyarRecord *, const MinyarRecord *);
 typedef MinyarRecord *(*MinyarRecordCopy)(const MinyarRecord *);
 static inline int map_key_references(long long kind) { return kind == 2 || kind >= 1000; }
 
+/* Callback scopes keep every inspected Map alive and prevent callbacks from
+ * invalidating cached bucket arrays. Cooperative recovery returns through the
+ * scope's ordinary cleanup; no pointer to a returned stack frame survives. */
+typedef struct MinyarMapReadGuard {
+    const MinyarRecord *first, *second;
+    struct MinyarMapReadGuard *previous;
+} MinyarMapReadGuard;
+static MINYAR_THREAD_LOCAL MinyarMapReadGuard *map_active_reads;
+
+static inline void map_read_begin(MinyarMapReadGuard *guard, const MinyarRecord *first,
+                                  const MinyarRecord *second) {
+    guard->first = first;
+    guard->second = second != first ? second : NULL;
+    guard->previous = map_active_reads;
+    if (!first) return;
+    minyar_rc_retain((void *)first);
+    if (guard->second) minyar_rc_retain((void *)guard->second);
+    map_active_reads = guard;
+}
+static inline void map_read_end(const MinyarMapReadGuard *guard) {
+    if (!guard->first) return;
+    map_active_reads = guard->previous;
+    if (guard->second) minyar_rc_release((void *)guard->second);
+    minyar_rc_release((void *)guard->first);
+}
+static inline void map_check_mutation(const MinyarRecord *map) {
+    for (const MinyarMapReadGuard *guard = map_active_reads; guard; guard = guard->previous)
+        if (guard->first == map || guard->second == map)
+            minyar_stop("a Map cannot be mutated from its hash or equality method.");
+}
+
 static inline MinyarList *map_array(const MinyarRecord *map, unsigned field) {
     return (MinyarList *)(uintptr_t)map->values[field];
 }
@@ -55,9 +86,11 @@ uint64_t minyar_hash_slot(long long kind, long long key) {
     return minyar_map_hash(kind, key);
 }
 static inline uint64_t map_hash_key(const MinyarRecord *map, long long key) {
+    if (minyar_recovery_pending()) return 0;
     if (map->values[MAP_KEY_KIND] < 1000) return minyar_map_hash(map->values[MAP_KEY_KIND], key);
     MinyarRecordHash hash = (MinyarRecordHash)(uintptr_t)map->values[MAP_HASH_CALLBACK];
     uint64_t value = hash((const MinyarRecord *)(uintptr_t)key);
+    if (minyar_recovery_pending()) return 0;
     return value ? value : UINT64_C(0x9e3779b97f4a7c15);
 }
 static inline int map_key_equal(long long kind, long long a, long long b) {
@@ -70,9 +103,11 @@ static inline int map_key_equal(long long kind, long long a, long long b) {
 }
 
 static inline int map_keys_equal(const MinyarRecord *map, long long a, long long b) {
+    if (minyar_recovery_pending()) return 0;
     if (map->values[MAP_KEY_KIND] < 1000) return map_key_equal(map->values[MAP_KEY_KIND], a, b);
     MinyarRecordEqual equal = (MinyarRecordEqual)(uintptr_t)map->values[MAP_EQUAL_CALLBACK];
-    return equal((const MinyarRecord *)(uintptr_t)a, (const MinyarRecord *)(uintptr_t)b);
+    int result = equal((const MinyarRecord *)(uintptr_t)a, (const MinyarRecord *)(uintptr_t)b);
+    return !minyar_recovery_pending() && result;
 }
 static MinyarList *map_new_array(long long capacity, int references) {
     MinyarList *array = minyar_list_new();
@@ -111,12 +146,16 @@ MinyarRecord *minyar_map_new_record(long long key_kind, long long value_referenc
     return map;
 }
 static inline size_t map_find(const MinyarRecord *map, long long key, uint64_t hash) {
+    if (minyar_recovery_pending()) return SIZE_MAX;
     MinyarList *hashes = map_array(map, MAP_HASHES), *keys = map_array(map, MAP_KEYS);
     if (!hashes->length) return SIZE_MAX;
     size_t mask = (size_t)hashes->length - 1, bucket = (size_t)hash & mask;
     while (hashes->values[bucket]) {
-        if ((uint64_t)hashes->values[bucket] == hash &&
-            map_keys_equal(map, keys->values[bucket], key)) return bucket;
+        if ((uint64_t)hashes->values[bucket] == hash) {
+            int equal = map_keys_equal(map, keys->values[bucket], key);
+            if (minyar_recovery_pending()) return SIZE_MAX;
+            if (equal) return bucket;
+        }
         bucket = (bucket + 1) & mask;
     }
     return bucket;
@@ -152,16 +191,37 @@ static MINYAR_COLD void map_grow(MinyarRecord *map) {
 }
 long long minyar_map_length(const MinyarRecord *map) { return map->values[MAP_LENGTH]; }
 _Bool minyar_map_has(const MinyarRecord *map, long long key) {
+    if (minyar_recovery_pending()) return 0;
     long long kind = map->values[MAP_KEY_KIND]; key = map_canonical_key(kind, key);
-    size_t bucket = map_find(map, key, map_hash_key(map, key));
-    return bucket != SIZE_MAX && map_array(map, MAP_HASHES)->values[bucket] != 0;
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, kind >= 1000 ? map : NULL, NULL);
+    int result = 0;
+    uint64_t hash = map_hash_key(map, key);
+    if (minyar_recovery_pending()) goto done;
+    size_t bucket = map_find(map, key, hash);
+    if (!minyar_recovery_pending())
+        result = bucket != SIZE_MAX && map_array(map, MAP_HASHES)->values[bucket] != 0;
+done:
+    map_read_end(&guard);
+    return result;
 }
 long long minyar_map_get(const MinyarRecord *map, long long key) {
+    if (minyar_recovery_pending()) return 0;
     long long kind = map->values[MAP_KEY_KIND]; key = map_canonical_key(kind, key);
-    size_t bucket = map_find(map, key, map_hash_key(map, key));
-    if (bucket == SIZE_MAX || !map_array(map, MAP_HASHES)->values[bucket])
-        minyar_stop("Map key is absent.");
-    return map_array(map, MAP_VALUES)->values[bucket]; /* Borrowed, like List.get. */
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, kind >= 1000 ? map : NULL, NULL);
+    long long result = 0;
+    int absent = 0;
+    uint64_t hash = map_hash_key(map, key);
+    if (minyar_recovery_pending()) goto done;
+    size_t bucket = map_find(map, key, hash);
+    if (minyar_recovery_pending()) goto done;
+    if (bucket == SIZE_MAX || !map_array(map, MAP_HASHES)->values[bucket]) absent = 1;
+    else result = map_array(map, MAP_VALUES)->values[bucket]; /* Borrowed, like List.get. */
+done:
+    map_read_end(&guard);
+    if (absent) minyar_stop("Map key is absent.");
+    return result;
 }
 static inline void map_store(MinyarList *array, size_t bucket, long long value) {
 #ifdef MINYAR_MAP_CYCLE_RUNTIME
@@ -176,17 +236,29 @@ static inline void map_store(MinyarList *array, size_t bucket, long long value) 
 #endif
 }
 void minyar_map_set(MinyarRecord *map, long long key, long long value) {
+    if (minyar_recovery_pending()) return;
+    map_check_mutation(map);
     long long kind = map->values[MAP_KEY_KIND]; key = map_canonical_key(kind, key);
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, kind >= 1000 ? map : NULL, NULL);
     uint64_t hash = map_hash_key(map, key);
+    if (minyar_recovery_pending()) goto done;
     size_t bucket = map_find(map, key, hash);
+    if (minyar_recovery_pending()) goto done;
     if (bucket != SIZE_MAX && map_array(map, MAP_HASHES)->values[bucket]) {
         /* Retain before replacing, including m[k] = m[k]. Keep the first key. */
         map_store(map_array(map, MAP_VALUES), bucket, value);
-        return;
+        goto done;
     }
     long long capacity = map_array(map, MAP_HASHES)->length;
     if (!capacity || map->values[MAP_LENGTH] >= capacity - capacity / 4) {
-        map_grow(map); bucket = map_find(map, key, hash);
+        map_grow(map);
+        /* Absence was established before mutation. Rehashing moves stored
+         * hashes, so finding the new empty slot needs no further user call. */
+        MinyarList *hashes = map_array(map, MAP_HASHES);
+        size_t mask = (size_t)hashes->length - 1;
+        bucket = (size_t)hash & mask;
+        while (hashes->values[bucket]) bucket = (bucket + 1) & mask;
     }
     if (kind >= 1000) {
         MinyarRecordCopy copy = (MinyarRecordCopy)(uintptr_t)map->values[MAP_COPY_CALLBACK];
@@ -197,12 +269,22 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
     map_store(map_array(map, MAP_VALUES), bucket, value);
     map_array(map, MAP_HASHES)->values[bucket] = (long long)hash;
     map->values[MAP_LENGTH]++;
+done:
+    map_read_end(&guard);
 }
 _Bool minyar_map_remove(MinyarRecord *map, long long key) {
+    if (minyar_recovery_pending()) return 0;
+    map_check_mutation(map);
     long long kind = map->values[MAP_KEY_KIND]; key = map_canonical_key(kind, key);
-    size_t hole = map_find(map, key, map_hash_key(map, key));
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, kind >= 1000 ? map : NULL, NULL);
+    int result = 0;
+    uint64_t hash = map_hash_key(map, key);
+    if (minyar_recovery_pending()) goto done;
+    size_t hole = map_find(map, key, hash);
+    if (minyar_recovery_pending()) goto done;
     MinyarList *arrays[3] = {map_array(map, MAP_HASHES), map_array(map, MAP_KEYS), map_array(map, MAP_VALUES)};
-    if (hole == SIZE_MAX || !arrays[0]->values[hole]) return 0;
+    if (hole == SIZE_MAX || !arrays[0]->values[hole]) goto done;
     /* Save references, close the cluster, then release. RC polls cannot see a
      * duplicate owner or a removed slot while the arrays are being moved. */
     long long removed_key = arrays[1]->values[hole], removed_value = arrays[2]->values[hole];
@@ -219,9 +301,14 @@ _Bool minyar_map_remove(MinyarRecord *map, long long key) {
     map->values[MAP_LENGTH]--;
     if (map_key_references(kind)) minyar_rc_release((void *)(uintptr_t)removed_key);
     if (map->values[MAP_VALUE_REFERENCES]) minyar_rc_release((void *)(uintptr_t)removed_value);
-    return 1;
+    result = 1;
+done:
+    map_read_end(&guard);
+    return result;
 }
 void minyar_map_clear(MinyarRecord *map) {
+    if (minyar_recovery_pending()) return;
+    map_check_mutation(map);
     if (!map->values[MAP_LENGTH]) return;
     MinyarList *old[3] = {map_array(map, MAP_HASHES), map_array(map, MAP_KEYS), map_array(map, MAP_VALUES)};
     MinyarList *fresh[3] = {map_new_array(0, 0), map_new_array(0, map_key_references(map->values[MAP_KEY_KIND])),
@@ -250,33 +337,71 @@ MinyarList *minyar_map_keys(const MinyarRecord *map) {
     return result;
 }
 
+/* Decode the compiler's reserved positive-child Map<Record, Enum> escape. */
+static long long map_record_enum_value(long long type) {
+    long long tag = -type % 8;
+    long long index = tag - 1;
+    if (tag == 7) index = 4;
+    else if (tag < 1 || tag > 4) return 0;
+    long long payload = -type / 8;
+    if (payload % 2) return 0;
+    long long child = payload / 2;
+    if (child < 32 || (child >= 1000000000 && child < 1000099000)) return 0;
+    long long remainder = child % 100000;
+    if (remainder < 32 || remainder > 999) return 0;
+    if (child >= 1000100000) child -= 100000;
+    long long pair = (child / 100000 * 968 + remainder - 32) * 5 + index;
+    if (pair >= 9801000000) return 0;
+    return 1000000000 + pair % 99000;
+}
+
 _Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
                             long long value_type) {
+    if (minyar_recovery_pending()) return 0;
     if (!left || !right) return left == right;
     if (left->values[MAP_LENGTH] != right->values[MAP_LENGTH] ||
         left->values[MAP_KEY_KIND] != right->values[MAP_KEY_KIND])
         return 0;
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, left, right);
+    int result = 0;
     MinyarList *hashes = map_array(left, MAP_HASHES), *keys = map_array(left, MAP_KEYS);
     MinyarList *values = map_array(left, MAP_VALUES), *other_values = map_array(right, MAP_VALUES);
     for (long long bucket = 0; bucket < hashes->length; bucket++) {
         if (!hashes->values[bucket]) continue;
         size_t other = map_find(right, keys->values[bucket], (uint64_t)hashes->values[bucket]);
-        if (other == SIZE_MAX || !map_array(right, MAP_HASHES)->values[other]) return 0;
+        if (minyar_recovery_pending()) goto done;
+        if (other == SIZE_MAX || !map_array(right, MAP_HASHES)->values[other]) goto done;
         long long a = values->values[bucket], b = other_values->values[other];
         if (value_type == 2) {
-            if (!map_key_equal(2, a, b)) return 0;
+            if (!map_key_equal(2, a, b)) goto done;
         } else if (value_type == 7) {
             double x, y;
             memcpy(&x, &a, sizeof(x)); memcpy(&y, &b, sizeof(y));
-            if (!(x == y)) return 0;
+            if (!(x == y)) goto done;
         } else if (value_type < -8 && (-value_type % 8) != 0) {
             long long payload = -value_type / 8;
-            if ((-value_type % 8) == 5) payload /= 100000;
+            int enum_key = 0;
+            if ((-value_type % 8) == 5) {
+                enum_key = payload % 100000 < 1000;
+                payload /= 100000;
+                if (enum_key) payload /= 99;
+            }
             long long child = payload % 2 ? -(payload / 2) - 1 : payload / 2;
+            if (enum_key) {
+                if (child >= 19 && child < 99019) child = 1000000000 + child - 19;
+                else if (child >= 99019) child -= 99000;
+            }
+            long long enum_value = map_record_enum_value(value_type);
+            if (enum_value) child = enum_value;
             if ((-value_type % 8) == 6) child = 4;
             if (!minyar_maps_are_equal((const MinyarRecord *)(uintptr_t)a,
-                                      (const MinyarRecord *)(uintptr_t)b, child)) return 0;
-        } else if (a != b) return 0;
+                                      (const MinyarRecord *)(uintptr_t)b, child) ||
+                minyar_recovery_pending()) goto done;
+        } else if (a != b) goto done;
     }
-    return 1;
+    result = 1;
+done:
+    map_read_end(&guard);
+    return result;
 }

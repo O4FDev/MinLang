@@ -6,12 +6,52 @@ checker records statement and expression nodes while emitting LLVM; it does
 not run a second expression parser. Declaration nodes reuse the module scan's
 token ranges when those ranges are available.
 
+User-defined capabilities are checked during generic normalization. Their
+signatures use the same type shapes as generic declarations. Conformance checking
+resolves aliases before comparing methods; defaults become ordinary concrete
+method declarations with an explicit receiver. Copied tokens preserve their
+capability module's source spans. Capability declarations and conformance
+statements emit no runtime representation. Raw documentation trees use kind 10
+for capabilities and ordinary function nodes for their method signatures. The
+compiler embeds the ordinary built-in capability declarations at bootstrap time.
+Explicit built-in conformances add empty compiler-only record symbols keyed by
+the receiver and capability; they allocate no values and emit no runtime tables.
+Derived operation wrappers call the checked concrete methods. Call-effect and
+cooperative-recovery hooks run at each actual operator or collection use, even
+when an operation wrapper was already emitted for another function.
+
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations
 again. Initial record and constant name collection also walks those nodes in
 ordinary and cached-interface compilation; the duplicate discovery scanners
 have been removed. Header type checking and body emission still consume
 tokens, as do some ownership lookahead helpers.
+
+Reference returns inspect the completed typed expression. A direct local name,
+optionally wrapped in grouping nodes, is a last use on that return path and can
+transfer its local owner. A complete return of a Text join or List `appended`
+can also consume a named local left operand or receiver, after all arguments
+have run. Other member, index and call receivers keep their existing rules.
+These proofs need no future-token scan and do not assume heap uniqueness.
+Direct local reassignment uses the same completed-root proof when the receiver
+is the binding being replaced. Same-source RHS reads finish before the move;
+assignments to another binding and implicit compound-assignment roots do not
+use this proof. The older lexical chain fast path remains available.
+
+One `TerminalReuseSite` per compiler context remembers the most recently emitted
+ordinary join or append: its typed node, receiver SSA value and two stable output
+fragment indexes. The final eligible root must match that exact node, ignoring
+groups. Inner expressions and stale sites cannot match. Filling a reserved
+fragment inserts the local-owner move immediately before the consumer; changing
+its callee fragment selects the existing uniqueness-checked runtime operation.
+Cycle fixups retain their original fragment indexes. Metadata uses constant
+space; proof traversal visits only the root's and receiver's grouping nodes.
+
+Scalar-record escape analysis remains a budgeted lexical proof. Readonly
+candidates keep captured SSA fields; candidates with direct field writes use
+entry-block i64 slots and fresh loads at each field read. An explicit metadata
+tag distinguishes these representations. The existing whole-object escape
+guards, constructor order and proof-attempt budget also apply to writable fields.
 
 Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
 column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant
@@ -48,6 +88,20 @@ name, index and assignment-target children before outlining worker LLVM.
 For a reduction, the loop's operator token is `reduce` and its symbol is the
 existing mutable accumulator binding. No extra syntax kind or type tag is used.
 
+User-record `for` loops also use kind 103. Their source remains a typed child;
+the checker resolves the concrete `iterator`, `advance` and `current` symbols
+and records their call dependencies before emitting ordinary loop blocks.
+There is no new syntax kind, type tag or runtime iteration ABI.
+
+Match patterns use a separate flat `MatchPattern` tree in `compiler/patterns.min`.
+Constructor tests branch before loading payloads; bindings acquire ownership only
+after the whole pattern succeeds. A false guard clears those binding roots before
+trying the next arm. Coverage specializes a matrix of unguarded patterns by
+constructor, preserving relationships between payloads and rebuilding a missing
+example from the uncovered row. This analysis emits no runtime coverage code.
+Patterns are limited to 128 nesting levels; coverage has a bounded work budget
+and requests an `else` arm if that budget is exhausted.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its
@@ -56,6 +110,58 @@ parameter nodes span the binding name and refer to their type-table offset.
 Folded negative numeric literals span both the minus and the digits.
 Parameter names come from the shared declaration table through that offset;
 later consumers need not read their header tokens.
+
+Payload-free choices retain nominal identity while using LLVM `i64` values.
+Their type codes are `1000000000 + symbol index`; ordinary records use
+`1000 + symbol index`. `recordTypeIndex` recovers either symbol index, and
+`typeForSymbol` reads the nominal representation discovered from the normalized
+choice declaration before signatures are checked. Both namespaces require a
+symbol index below 99000. Semantic record checks include these choices, while
+reference ownership checks exclude them. Constructors emit the case tag;
+matching and derived capabilities operate on that integer directly.
+
+Lists of these choices use the negative structural List encoding, keeping the
+positive List namespace below the nominal choice base. Ordinary containers
+without enums retain their existing encodings and nesting capacity. Scalar choice
+keys use its otherwise unused low-key codes 0..999: the symbol index is split
+into a low remainder and a high quotient, with the quotient packed beside the
+zigzag value using radix 99. Only enum-key Maps compact enum value types into
+19..99018 and shift other positive children above that range; decoding restores
+the nominal identity. Their runtime Map/Set key kind is Integer.
+
+Record-key Maps with a direct enum value use otherwise invalid positive child
+residues 32..999 modulo 100000 under Map tags 1, 2, 3, 4 and 7, leaving scalar
+codes 19..31 and Lists of those scalar types available. Each bucket contains
+968 escape children. The encoder skips the enum-ID bucket; `recordEnumMapPair` reverses this escape. The runtime's nested
+Map equality decoder mirrors it. Every two-level record-key Map ending in an
+enum fits within signed i64 for all supported nominal indexes. Type encoding
+still has a finite nesting limit: extreme enum-containing wrapper chains may
+reach it earlier than their former record-valued representation. Ordinary List
+type encodings remain compact through 64 layers.
+
+Finite scalar payload niches share the same nominal i64 namespace and Map
+codecs. `isScalarChoiceType` describes physical layout; the legacy `isEnumType`
+query remains an alias for that physical predicate. Use context-aware
+`isPureEnumChoice` for payload-free semantics. `choiceLayoutKind` returns 4 for
+a scalar payload niche (storage count 0), alongside 1 for pure enums, 2 for
+tagged unions and 3 for nullable record niches. Logical payload fields remain
+available; `readChoiceMatchTag` and `readChoiceMatchPayload` project logical
+values rather than exposing encoded codes as case ordinals.
+
+`discoverScalarChoiceTypes` runs after all nominal registrations and declaration
+index construction, before callbacks or signatures capture numeric IDs. It
+updates return IDs and SourceMap nominal IDs together. A linear token scan
+collects immutable pure-enum domains; indexed payload lookups then recognize
+Boolean, Character and payload-free enum payloads regardless of declaration
+order. Nested scalar niches and recursive choices stay boxed in this slice.
+No repeated graph rescans or late pointer-to-i64 reclassification occur.
+
+Cached interfaces use `minyar-module-interface-v11` and deltas use
+`minyar-module-delta-v9`, so earlier record/enum escape codecs, scalar-choice
+and nullable-Set ABI artifacts are rebuilt. This Set ABI revision follows
+scalar-choice interface10/delta8.
+Choice-bearing module graphs retain whole-program compilation, including when
+restored logical choice metadata is the only evidence in a warm state.
 
 `declarations` lists declarations in source order. `symbolNodes[symbol]`
 finds their node without a scan. Internal callback environment symbols map
@@ -70,7 +176,7 @@ overnight charter and are separate from lexer and type codes:
 
 - 0: module.
 - 1–6: function, record, constant, global, field and parameter.
-- 7–9: choice, type alias and test in raw documentation trees. Typed compilation
+- 7–10: choice, type alias, test and capability in raw documentation trees. Typed compilation
   continues to describe normalized declarations with the existing kinds.
 - 100–111: block, conditional, loop, binding, return, jump, match, native body,
   expression statement and assignment.
@@ -151,12 +257,22 @@ with no diagnostic output on success. Exit status remains 1 for rejected input.
 The standalone launcher and incremental module driver forward this option.
 
 Schema version 1 always includes `version` (1), `severity` ("error"),
-`message`, `file`, `line`, `column`, `endLine`, `endColumn`, `sourceLine`,
+`code` (such as "E0401"), `message`, `file`, `line`, `column`, `endLine`, `endColumn`, `sourceLine`,
 `label`, and `help` (an array of strings). Positions are 1-based Unicode scalar
 columns, with an exclusive end. An empty range marks end of input. `sourceLine`
-is the original line without its line ending; `label` and `help` may be empty.
+is the original line without its line ending; `label` may be empty.
 JSON preserves source characters and escapes control characters. Tools using
 UTF-16 positions can convert columns from `sourceLine`.
+
+`code` is an additive version-1 field. Consumers should accept unknown fields.
+Every compiler diagnostic has a repair note; a specific spelling suggestion
+takes precedence over the advice for its family. Human output ends with
+`= explain: minyar explain CODE`. The same compiler embeds the catalogue used
+by `minyar explain CODE` and `minyar explain --list`, so installed explanations
+match the toolchain without reading a project or downloading documentation.
+The catalogue maps legacy message families to stable codes; E0001 covers checks
+that do not yet have a dedicated family. All recorded error goldens require a
+specific code. New message families should receive a code and a tested example.
 
 Explicit compiler rejections share the central formatter. Legacy messages
 keep their original decoded locations. Within a checked body, an older caller
@@ -191,6 +307,50 @@ a best-effort source prefix. Display-cell ranges follow Unicode 14.0 assigned
 wide/full-width and combining categories, plus common emoji sequences. JSON
 positions remain scalar offsets and preserve the original valid source line.
 
+## Choice storage metadata
+
+Choice declarations retain every logical payload field for type checking and
+cycle reachability. `choiceLayoutKind(context, type)` identifies an ordinary
+type (0), pure enum (1), tagged union (2), nullable managed choice (3), or
+scalar payload niche (4).
+`choiceStorageCount` reports slots owned by the choice itself; integer and
+nullable and scalar choices own no slots. `choiceStorageField` maps a union's logical field to its physical
+slot. Debug readers must inspect the layout kind before using an offset.
+
+For nullable choices, `choiceNicheType` identifies the actual managed payload
+type, including structural Lists and Sets. The runtime value is a nullable
+pointer to that payload's header; readers must not assume record fields.
+`choiceNicheTag` gives the non-null case's zero-based tag. The empty case has
+the other tag. `readChoiceMatchTag` and `readChoiceMatchPayload` generate the
+representation-specific projections, shared by matches and test diagnostics.
+Cycle analysis retains the logical graph and projects nullable aliases only
+when selecting the runtime ownership entry points. Nullable Set equality delegates
+to `minyar_maps_are_equal` with Boolean value kind 4; its null check distinguishes
+an absent choice from a present empty Set. Set payloads remain unsupported for
+ordering, hashing and key snapshots. Maps retain tagged choice storage.
+
+## Debugger metadata
+
+`debug-types.min` records semantic type graphs in LLVM comments beside initialized
+bindings. Each function has its own numeric type namespace, preserved with its
+cached code. The debug linker materializes the graph only for debug builds;
+release builds keep ordinary executable LLVM. Parameters use their existing SSA
+values or stack slots. Small scalarized records use field fragments describing
+a virtual aggregate, without introducing stores or allocations.
+
+Lexical markers preserve nested, loop and match-arm scopes. Closure captures and
+parameters and outlined worker bindings carry the same descriptions; outlining
+regenerates its type graph and invalidates the parent's emission memo. List
+storage uses eight-byte slot wrappers whose `value` member has the semantic
+element type, preserving Boolean and Character stride. Choice tags retain case
+enumerators and payload field names for bounded debugger projections.
+
+Text and Bytes describe their shared runtime prefix. Managed records and Maps
+describe their inline storage; arena record/Map pointers, native C-layout
+records and callable values currently remain opaque. Optional Python adapters
+for LLDB and GDB read these types and inferior memory without evaluating program
+code. See the [debugging guide](debugging.md).
+
 ## Runtime trace metadata
 
 `runtime-traces.min` records readable names and original token locations while
@@ -200,10 +360,15 @@ its current module graph, even on a cache hit. No function address is retained
 by a row, so unused functions still disappear during LTO. LLVM `uwtable`
 attributes preserve existing unwind descriptions without injected trace calls.
 
-The private runtime ABI uses 32-byte rows (four i32 fields and two i64 source
-coordinates) and an eight-byte module registry row. Offsets are signed i32
+The private runtime ABI uses 40-byte rows (four i32 string offsets, one i32 entry
+flag and two i64 source coordinates) and an eight-byte module registry row. Offsets are signed i32
 relative to their table and resolved by the static linker. They add no PIE
-pointer fixups. The cold Mach-O reader resolves symbols from loaded __LINKEDIT
+pointer fixups. Declaration source excerpts are captured at compile time, with
+tabs expanded, terminal controls replaced and at most 160 Unicode scalars including
+an ellipsis for clipped lines. Missing source text leaves the excerpt empty.
+Excerpts remain available after the source is moved or removed; reporting them
+adds no source-file reads, runtime allocation or normal-path instructions.
+The cold Mach-O reader resolves symbols from loaded __LINKEDIT
 and walks ARM64 compact unwind/DWARF CFI. Linux reads ELF symbols only after a
 failure and uses the platform unwinder. If symbols or unwind information are
 unavailable, the registry supplies an entry location. No C runtime failure is

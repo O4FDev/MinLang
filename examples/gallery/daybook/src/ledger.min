@@ -1,0 +1,125 @@
+use "errors" as errors
+use "json" as json
+use "text" as text
+
+public choice Row {
+    Skip
+    Work(project: Text, minutes: Integer)
+}
+
+public record Ledger {
+    private projects: Map<Text, Integer>
+    private entries: Integer
+    private total: Integer
+}
+
+public function ledger(): Ledger {
+    return Ledger { projects: {}; entries: 0; total: 0 }
+}
+
+function invalid(message: Text): errors.Error {
+    return errors.make(errors.invalidDataCode(), 0, message)
+}
+
+function trim(source: Text): Text {
+    let first = 0
+    let after = source.length
+    while first < after && (source[first] == ' ' || source[first] == '\t') { first += 1 }
+    while after > first && (source[after - 1] == ' ' || source[after - 1] == '\t' || source[after - 1] == '\r') { after -= 1 }
+    return source.slice(first, after)
+}
+
+/// Read one project, a tab, and a nonnegative whole number of minutes.
+/// Blank lines and comments beginning with # are welcome.
+public function row(source: Text): Result<Row, errors.Error> {
+    let line = trim(source)
+    if line.length == 0 { return Ok(Row.Skip) }
+    if line[0] == '#' { return Ok(Row.Skip) }
+    let tab = line.find("\t")
+    if tab < 0 { return Err(invalid("expected project, a tab, and whole minutes")) }
+    let project = trim(line.slice(0, tab))
+    if project.length == 0 { return Err(invalid("the project name is empty")) }
+    if project.length > 80 { return Err(invalid("project names can have at most 80 characters")) }
+    for character in project {
+        let code = Integer(character)
+        if code < 32 || (code >= 127 && code <= 159) { return Err(invalid("project names cannot contain control characters")) }
+    }
+    let minutes = try text.integer(line.slice(tab + 1, line.length)) else "reading whole minutes"
+    if minutes < 0 { return Err(invalid("minutes cannot be negative")) }
+    return Ok(Row.Work(project, minutes))
+}
+
+public function Ledger.add(project: Text, minutes: Integer): Result<Nothing, errors.Error> {
+    if minutes < 0 { return Err(invalid("minutes cannot be negative")) }
+    if self.entries >= 50000 { return Err(invalid("a daybook can contain at most 50000 entries")) }
+    if !self.projects.has(project) && self.projects.length >= 4096 { return Err(invalid("a daybook can contain at most 4096 projects")) }
+    if minutes > 9223372036854775807 - self.total { return Err(invalid("the total minutes exceed the Integer range")) }
+    let previous = 0
+    if self.projects.has(project) { previous = self.projects[project] }
+    self.projects[project] = previous + minutes
+    self.total += minutes
+    self.entries += 1
+    return Ok()
+}
+
+public function Ledger.read(source: Text): Result<Nothing, errors.Error> {
+    let first = 0
+    let lineNumber = 1
+    // Include the final line even when the file has no trailing newline.
+    for after in 0..source.length + 1 {
+        if after == source.length || source[after] == '\n' {
+            let context = "line \(lineNumber)"
+            let parsed = try row(source.slice(first, after)) else context
+            match parsed {
+                Skip { }
+                Work(project, minutes) { try self.add(project, minutes) else context }
+            }
+            first = after + 1
+            lineNumber += 1
+        }
+    }
+    return Ok()
+}
+
+function Ledger.names(): List<Text> {
+    let names: List<Text> = []
+    for name in self.projects { names.add(name) }
+    names.sort()
+    return names
+}
+
+public function Ledger.asJson(): Text {
+    let pieces = ["{\"entries\":\(self.entries),\"totalMinutes\":\(self.total),\"projects\":["]
+    let separator = ""
+    for name in self.names() {
+        pieces.add(separator)
+        pieces.add("{\"name\":" + json.quote(name) + ",\"minutes\":\(self.projects[name])}")
+        separator = ","
+    }
+    pieces.add("]}")
+    return joinText(pieces)
+}
+
+public function Ledger.table(): Text {
+    let pieces = ["DAYBOOK\nproject\tminutes\n"]
+    for name in self.names() { pieces.add("\(name)\t\(self.projects[name])\n") }
+    pieces.add("total\t\(self.total)\n\(self.entries) entries · \(self.projects.length) projects")
+    return joinText(pieces)
+}
+
+test "comments, CRLF, Unicode names and the last line compose" {
+    let book = ledger()
+    expect(book.read("# the quiet work\r\n\r\nCafé\t20\r\nGarden\t30\nCafé\t22").isOk())
+    expect(book.asJson() == "{\"entries\":3,\"totalMinutes\":72,\"projects\":[{\"name\":\"Café\",\"minutes\":42},{\"name\":\"Garden\",\"minutes\":30}]}")
+}
+
+test "bad rows and total overflow are recoverable" {
+    expect(row("garden 20").isErr())
+    expect(row("garden\t-1").isErr())
+    expect(row("garden\t1\t2").isErr())
+    let book = ledger()
+    expect(book.add("garden", 9223372036854775807).isOk())
+    expect(book.add("garden", 1).isErr())
+    expect(book.entries == 1)
+    expect(book.total == 9223372036854775807)
+}

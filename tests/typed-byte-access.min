@@ -1,0 +1,228 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "system" as system
+
+function typedByteCasePath(compiler: test.Compiler): Text {
+    return compiler.directory + "/case" + Text(compiler.serial)
+}
+
+function typedByteFunction(llvm: Text, name: Text): Text {
+    let active = false
+    let body: List<Text> = []
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " @" + name + "(") { active = true }
+        if active {
+            body.add(line + "\n")
+            if line == "}" { return joinText(body) }
+        }
+    }
+    fail("missing typed Bytes LLVM function: " + name)
+}
+
+function typedByteTrap(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    test.require(test.compile(compiler, source), "compile checked typed Bytes failure")
+    let path = typedByteCasePath(compiler)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link checked typed Bytes failure")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1 && result.output == "", "typed Bytes failure status/output " + optimization + "\n" + result.output + result.errorOutput)
+        test.check(test.sameDiagnostic(result.errorOutput, "Minyar stopped: " + diagnostic + "\n"), "typed Bytes failure diagnostic " + optimization + "\n" + result.errorOutput)
+    }
+}
+
+function typedByteInvalidPosition(compiler: test.Compiler, kind: Text, size: Integer, position: Integer) {
+    let declaration = "let bytes = Bytes(" + Text(size) + ")\n"
+    let diagnostic = "a 4-byte value at position " + Text(position) + " does not fit in Bytes of length " + Text(size) + "."
+    typedByteTrap(compiler, declaration + "print(bytes.get" + kind + "(" + Text(position) + "))\n", diagnostic)
+    typedByteTrap(compiler, declaration + "bytes.set" + kind + "(" + Text(position) + ", 0)\n", diagnostic)
+}
+
+let compiler = test.compiler()
+test.check(processInfo.argumentCount() <= 1, "unexpected typed Bytes access selector")
+let irOnly = false
+if processInfo.argumentCount() == 1 {
+    test.check(processInfo.argument(0) == "--ir-only", "unknown typed Bytes access selector")
+    irOnly = true
+}
+
+// Raw-only mode proves the previous compiler lacks these helpers without
+// building a C runtime or linking/executing a generated program.
+test.require(test.compile(compiler, "let bytes = Bytes(8)\nbytes.setInt32(0, -1)\nbytes.setUInt32(4, 4294967295)\nprint(bytes.getInt32(0))\nprint(bytes.getUInt32(4))\nbytes.addInt32(-1)\nbytes.addUInt32(4294967295)\n"), "compile typed Bytes helper calls")
+let llvm = io.readTextFile(typedByteCasePath(compiler) + ".ll")
+let main = typedByteFunction(llvm, "main")
+let length = typedByteFunction(llvm, ".minyar.bytes.length")
+test.check(test.contains(length, "!range !{i64 0, i64 -9223372036854775808}"), "typed Bytes helpers lost the common nonnegative length fact")
+for kind in ["int32", "uint32"] {
+    let getter = typedByteFunction(llvm, ".minyar.bytes.get." + kind + ".checked")
+    let setter = typedByteFunction(llvm, ".minyar.bytes.set." + kind + ".checked")
+    for body in [getter, setter] {
+        for expected in ["alwaysinline", "%length = call i64 @.minyar.bytes.length(ptr %bytes)", "%last.start = sub i64 %length, 4", "%nonnegative = icmp sge i64 %position, 0", "%fits = icmp sle i64 %position, %last.start", "%position.valid = and i1 %nonnegative, %fits", "%slot.0 = getelementptr inbounds i8, ptr %data, i64 %position"] {
+            test.check(test.contains(body, expected), "missing typed Bytes guard/address IR: " + expected)
+        }
+        let good = body.find("\ngood:\n")
+        test.check(good >= 0, "missing typed Bytes success block")
+        let before = body.slice(0, good)
+        test.check(!test.contains(before, "getelementptr") && !test.contains(before, "load i8") && !test.contains(before, "store i8"), "typed Bytes address/access precedes validation")
+    }
+    for byte in 0..4 {
+        let number = Text(byte)
+        test.check(test.contains(getter, "%byte." + number + " = load i8, ptr %slot." + number + ", align 1"), "typed Bytes getter lost an unaligned byte")
+        test.check(test.contains(setter, "store i8 %byte." + number + ", ptr %slot." + number + ", align 1"), "typed Bytes setter lost an unaligned byte")
+        if byte > 0 {
+            test.check(test.contains(getter, "shl i32 %part." + number + ", " + Text(byte * 8)), "typed Bytes getter lost little-endian assembly")
+            test.check(test.contains(setter, "lshr i32 %narrow, " + Text(byte * 8)), "typed Bytes setter lost little-endian storage")
+        }
+    }
+    let extension = "zext"
+    if kind == "int32" {
+        extension = "sext"
+        test.check(test.contains(setter, "%roundtrip = sext i32 %narrow to i64\n  %value.valid = icmp eq i64 %value, %roundtrip"), "signed setter lost range check")
+    } else {
+        test.check(test.contains(setter, "%value.valid = icmp ult i64 %value, 4294967296"), "unsigned setter lost range check")
+    }
+    test.check(test.contains(getter, "%result = " + extension + " i32 %word.3 to i64"), "typed Bytes getter has wrong signedness")
+    test.check(test.contains(getter, "call i64 @minyar_bytes_get_" + kind + "(ptr %bytes, i64 %position)\n  unreachable"), "typed Bytes getter lost exact fallback")
+    test.check(test.contains(setter, "call void @minyar_bytes_set_" + kind + "(ptr %bytes, i64 %position, i64 %value)\n  unreachable"), "typed Bytes setter lost exact fallback")
+    for verb in ["get", "set"] {
+        test.check(test.contains(main, "@.minyar.bytes." + verb + "." + kind + ".checked("), "typed Bytes call did not select common helper")
+        test.check(!test.contains(main, "@minyar_bytes_" + verb + "_" + kind + "("), "typed Bytes call still selects runtime directly")
+    }
+    test.check(test.contains(main, "@minyar_bytes_add_" + kind + "("), "growing typed Bytes add lost its runtime path")
+}
+
+if !irOnly {
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
+    io.writeTextFile(compiler.directory + "/runtime.c", contract)
+    compiler.runtime = compiler.directory + "/runtime.o"
+    let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime"]
+    for flag in compiler.flags { build.add(flag) }
+    for item in ["-c", compiler.directory + "/runtime.c", "-o", compiler.runtime] { build.add(item) }
+    test.require(test.run(build, system.environment(), "", compiler.directory + "/ownership-runtime", 120), "build typed Bytes ownership oracle")
+
+    // Literal byte patterns make getter and setter endian checks independent.
+    test.executes(compiler, #"""
+    record Pattern { unsigned: Integer; signed: Integer; octets: List<Integer> }
+    function require(condition: Boolean) { if !condition { fail("typed Bytes pattern or sentinel mismatch") } }
+    function filled(): Bytes { let bytes = Bytes(16); for index in 0..16 { bytes[index] = 165 }; return bytes }
+    function sentinels(bytes: Bytes, offset: Integer, octets: List<Integer>) {
+        for index in 0..16 {
+            let expected = 165
+            if index >= offset && index < offset + 4 { expected = octets[index - offset] }
+            require(bytes[index] == expected)
+        }
+    }
+    let patterns = [
+        Pattern { unsigned: 0; signed: 0; octets: [0, 0, 0, 0] },
+        Pattern { unsigned: 1; signed: 1; octets: [1, 0, 0, 0] },
+        Pattern { unsigned: 16909060; signed: 16909060; octets: [4, 3, 2, 1] },
+        Pattern { unsigned: 2147483647; signed: 2147483647; octets: [255, 255, 255, 127] },
+        Pattern { unsigned: 2147483648; signed: -2147483648; octets: [0, 0, 0, 128] },
+        Pattern { unsigned: 2309737967; signed: -1985229329; octets: [239, 205, 171, 137] },
+        Pattern { unsigned: 4294967295; signed: -1; octets: [255, 255, 255, 255] }
+    ]
+    for offset in [0, 1, 2, 3, 4, 5, 6, 7, 12] {
+        for pattern in patterns {
+            let input = filled()
+            for byte in 0..4 { input[offset + byte] = pattern.octets[byte] }
+            require(input.getUInt32(offset) == pattern.unsigned)
+            require(input.getInt32(offset) == pattern.signed)
+            let unsigned = filled()
+            unsigned.setUInt32(offset, pattern.unsigned)
+            sentinels(unsigned, offset, pattern.octets)
+            let signed = filled()
+            signed.setInt32(offset, pattern.signed)
+            sentinels(signed, offset, pattern.octets)
+        }
+    }
+    for size in [4, 5, 8] {
+        let bytes = Bytes(size)
+        bytes.setUInt32(size - 4, 4294967295)
+        require(bytes.getInt32(size - 4) == -1)
+        bytes.setInt32(size - 4, -2147483648)
+        require(bytes.getUInt32(size - 4) == 2147483648)
+    }
+    print("typed byte patterns: passed")
+    """#, "typed byte patterns: passed\n")
+
+    test.executes(compiler, #"""
+    function position(bytes: Bytes): Integer { bytes.resize(2048); print(11); return 1023 }
+    function replacement(bytes: Bytes): Integer { bytes.resize(4096); print(22); return 2309737967 }
+    function changed(bytes: Bytes): Integer { bytes.resize(8192); bytes.setInt32(1023, -7); return 1023 }
+    let bytes = Bytes(4)
+    let alias = bytes
+    bytes.setUInt32(position(alias), replacement(alias))
+    print(alias.getUInt32(1023)); print(alias.getInt32(1023)); print(alias.length); print(alias[4095])
+    print(bytes.getInt32(changed(alias))); print(alias.length); print(alias[8191])
+    """#, "11\n22\n2309737967\n-1985229329\n4096\n0\n-7\n8192\n0\n")
+    test.executes(compiler, #"""
+    record Holder { bytes: Bytes }
+    function position(holder: Holder): Integer { holder.bytes = Bytes(4); holder.bytes.setInt32(0, 8); return 0 }
+    function replacement(holder: Holder): Integer { holder.bytes = Bytes(4); holder.bytes.setInt32(0, 9); return 77 }
+    let holder = Holder { bytes: Bytes(4) }
+    let alias = holder.bytes
+    holder.bytes.setInt32(position(holder), replacement(holder))
+    print(alias.getInt32(0)); print(holder.bytes.getInt32(0))
+    let lonely = Holder { bytes: Bytes(4) }
+    lonely.bytes.setUInt32(position(lonely), replacement(lonely))
+    print(lonely.bytes.getUInt32(0))
+    """#, "77\n9\n9\n")
+    test.executes(compiler, #"""
+    use "machine" as machine
+    record Window native "c_packed" { data: Bytes[8] }
+    function retained(): Bytes { let backing = Bytes(16); backing.setUInt32(3, 2309737967); return cBytes(cView(Window, backing, 1)) }
+    let backing = Bytes(16)
+    for index in 0..16 { backing[index] = 165 }
+    let first = cBytes(cView(Window, backing, 1))
+    let shifted = cBytes(cView(Window, backing, 3))
+    first.setUInt32(2, 16909060)
+    print(shifted.getUInt32(0))
+    shifted.setInt32(1, -2147483648)
+    print(first.getUInt32(2)); print(backing[7]); print(backing[0]); print(backing[8])
+    let addressed = cBytes(cAt(Window, machine.address(backing) + 1))
+    print(addressed.getUInt32(2)); print(addressed.length)
+    let view = retained()
+    print(view.getUInt32(2)); print(view.getInt32(2))
+    """#, "16909060\n4\n128\n165\n165\n4\n8\n2309737967\n-1985229329\n")
+
+    for kind in ["Int32", "UInt32"] {
+        for size in [0, 1, 2, 3] { typedByteInvalidPosition(compiler, kind, size, 0) }
+        for size in [4, 5] { typedByteInvalidPosition(compiler, kind, size, size - 3) }
+        for position in [-9223372036854775808, -1, 5, 8, 9223372036854775807] {
+            typedByteInvalidPosition(compiler, kind, 8, position)
+        }
+        let values = [-9223372036854775808, -2147483649, 2147483648, 9223372036854775807]
+        let description = "a signed 32-bit Integer"
+        if kind == "UInt32" {
+            values = [-9223372036854775808, -1, 4294967296, 9223372036854775807]
+            description = "an unsigned 32-bit Integer"
+        }
+        for value in values {
+            typedByteTrap(compiler, "let bytes = Bytes(4)\nbytes.set" + kind + "(0, " + Text(value) + ")\n", Text(value) + " does not fit in " + description + ".")
+        }
+        for position in [-1, 1] {
+            typedByteTrap(compiler, "let bytes = Bytes(4)\nbytes.set" + kind + "(" + Text(position) + ", -9223372036854775808)\n", "a 4-byte value at position " + Text(position) + " does not fit in Bytes of length 4.")
+        }
+        typedByteTrap(compiler, "let bytes = Bytes(3)\nbytes.get" + kind + "(0)\n", "a 4-byte value at position 0 does not fit in Bytes of length 3.")
+        typedByteTrap(compiler, "function position(bytes: Bytes): Integer { bytes.resize(3); return 0 }\nlet bytes = Bytes(4)\nprint(bytes.get" + kind + "(position(bytes)))\n", "a 4-byte value at position 0 does not fit in Bytes of length 3.")
+        typedByteTrap(compiler, "function replacement(bytes: Bytes): Integer { bytes.resize(3); return 1 }\nlet bytes = Bytes(4)\nbytes.set" + kind + "(0, replacement(bytes))\n", "a 4-byte value at position 0 does not fit in Bytes of length 3.")
+        test.rejects(compiler, "let input = Bytes(8)\nlet output = Bytes(8)\nparallel for index in 0..2 { output[index] = input.get" + kind + "(index) }\n", "parallel for:")
+        test.rejects(compiler, "let output = Bytes(8)\nparallel for index in 0..2 { output.set" + kind + "(index, 1) }\n", "parallel for:")
+    }
+
+    test.executes(compiler, "function pair(bytes: Bytes, position: Integer): Integer { bytes.setInt32(position, -1); return bytes.getUInt32(position) }\nlet bytes = Bytes(8)\nprint(pair(bytes, 1))\n", "4294967295\n")
+    let path = typedByteCasePath(compiler)
+    let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+    for flag in compiler.flags { optimize.add(flag) }
+    for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
+    test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize typed Bytes IR")
+    for line in test.lines(io.readTextFile(path + ".optimized.ll")) {
+        test.check(!(test.contains(line, "call ") && test.contains(line, "@.minyar.bytes.")), "optimized typed Bytes helper call survived\n" + line)
+    }
+}
+
+test.removeTree(compiler.directory)
+print("typed bytes access: passed")

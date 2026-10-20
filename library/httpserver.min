@@ -94,6 +94,7 @@ public record Server {
     private active: Integer
     private nextTicket: Integer
     private closed: Boolean
+    private draining: Boolean
     private error: errors.Error
 }
 public record Batch { private requests: List<Request>; private error: errors.Error }
@@ -133,7 +134,7 @@ public function listen(host: Text, port: Integer, limits: Limits): Server {
         headerMilliseconds: limits.headerMilliseconds; bodyMilliseconds: limits.bodyMilliseconds;
         applicationMilliseconds: limits.applicationMilliseconds; writeMilliseconds: limits.writeMilliseconds }
     let server = Server { handle: -1; listener: -1; listenerRegistration: -1; limits: copied;
-        connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; error: errors.none() }
+        connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; draining: false; error: errors.none() }
     if !validLimits(copied) {
         server.error = errors.make(errors.invalidDataCode(), 0, "invalid HTTP server limits")
         server.closed = true
@@ -186,7 +187,7 @@ function drop(server: Server, slot: Integer) {
     else { server.freeSlots.add(slot) }
     server.freeCount += 1
     // Unwatch the full listener (rather than interest=0) to avoid HUP spin.
-    if !server.closed && server.listenerRegistration < 0 {
+    if !server.closed && !server.draining && server.listenerRegistration < 0 {
         let watched = loop.watch(server.handle, server.listener, loop.readableInterest(), -1)
         if errors.integerOk(watched) { server.listenerRegistration = errors.integerValue(watched) }
         else { server.error = errors.integerError(watched) }
@@ -201,6 +202,24 @@ public function close(server: Server) {
     }
     if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
     if server.handle >= 0 { loop.close(server.handle) }
+}
+// Stop accepting and reading new requests. Already dispatched requests retain
+// their tickets; their responses finish before closing. Keep advancing the
+// shared loop until connectionCount reaches zero, then close the server.
+public function drain(server: Server) {
+    if server.closed || server.draining { return }
+    server.draining = true
+    if server.listenerRegistration >= 0 {
+        loop.remove(server.handle, server.listenerRegistration); server.listenerRegistration = -1
+    }
+    if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
+    for slot in 0..server.connections.length {
+        let connection = server.connections[slot]
+        if connection.active {
+            if connection.phase == 0 { drop(server, slot) }
+            else { connection.closing = true }
+        }
+    }
 }
 function watch(server: Server, slot: Integer, interest: Integer): Boolean {
     let connection = server.connections[slot]
@@ -577,7 +596,7 @@ function validResponse(response: Response, limits: Limits): Boolean {
 public function respond(server: Server, request: Request, response: Response): Boolean {
     if !requestActive(server, request) || !validResponse(response, server.limits) { return false }
     let connection = server.connections[request.slot]
-    let closing = !connection.parsed.keepAlive || connection.count >= server.limits.maxRequestsPerConnection ||
+    let closing = server.draining || !connection.parsed.keepAlive || connection.count >= server.limits.maxRequestsPerConnection ||
         connection.eof && connection.inputStart == connection.input.length
     return startResponse(server, request.slot, response, connection.parsed.method == "HEAD", closing)
 }

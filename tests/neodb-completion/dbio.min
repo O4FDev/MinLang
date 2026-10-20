@@ -1,0 +1,379 @@
+// Test-only, single-threaded standalone dbio contract for unchanged NeoDB
+// storage modules. Host files, real typed io_uring syncs, explicit progress.
+// No native background syncer, simulated provider, or reactor notification fd.
+use "files" as files
+use "system" as system
+use "completionio" as completionio
+
+public constant OPEN_READ = 1
+public constant OPEN_WRITE = 2
+public constant OPEN_CREATE = 4
+public constant OPEN_APPEND = 8
+public constant OPEN_TRUNCATE = 16
+public constant OPEN_EXCLUSIVE = 32
+public constant ENOENT = -2
+public constant EEXIST = -17
+public constant ETIMEDOUT = -110
+public constant ENOTSUP = -95
+
+// Public facade descriptors never get reused. A syncer retains a reference to
+// the same open file description, so caller close cannot change its identity.
+// Each queued operation additionally owns the provider's CLOEXEC duplicate.
+record Descriptor { native: Integer; references: Integer; closed: Boolean; directory: Boolean }
+record Request { id: Integer; upTo: Integer; done: Boolean; result: Integer }
+record Syncer {
+    queue: completionio.Queue
+    file: Descriptor
+    requests: List<Request>
+    acknowledged: Integer
+    requested: Integer
+    synced: Integer
+    error: Integer
+    stopped: Boolean
+}
+record Context { descriptors: List<Descriptor>; directories: List<Text>; syncers: List<Syncer>; error: Integer; collected: Integer }
+global STATE: Context = Context { descriptors: []; directories: []; syncers: []; error: 0; collected: 0 }
+
+function status(code: Integer): Integer { let state = STATE; state.error = min(0, code); return code }
+function valid(fd: Integer): Boolean {
+    let state = STATE
+    state.error = 0
+    if fd < 1 || fd > state.descriptors.length { status(-9); return false }
+    if state.descriptors[fd - 1].closed { status(-9); return false }
+    return true
+}
+function release(file: Descriptor): Integer {
+    file.references -= 1
+    if file.references == 0 { return status(files.close(file.native)) }
+    return status(0)
+}
+public function lastError(): Integer { let state = STATE; return state.error }
+public function errorText(code: Integer): Text { return files.errorText(code) }
+public function wallClockMicros(): Integer { return system.wallClockMicroseconds() }
+public function mkdir(path: Text): Integer {
+    let rc = files.makeDirectory(path)
+    if rc == 0 {
+        let state = STATE
+        let known = false
+        for directory in state.directories { if directory == path { known = true } }
+        if !known { state.directories.add(path) }
+    }
+    return status(rc)
+}
+public function open(path: Text, flags: Integer): Integer {
+    // These six selected dbio bits have exactly the files package meanings.
+    if flags < 0 || flags > 63 { return status(-22) }
+    let native = files.open(path, flags)
+    if native < 0 { return status(native) }
+    let state = STATE
+    // Fixture directories must be declared through mkdir. No path reopen is
+    // used to duplicate or classify a live syncer's retained descriptor.
+    let directory = false
+    for known in state.directories { if known == path { directory = true } }
+    state.descriptors.add(Descriptor { native: native; references: 1; closed: false; directory: directory })
+    status(0)
+    return state.descriptors.length
+}
+public function close(fd: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    let file = state.descriptors[fd - 1]
+    file.closed = true
+    return release(file)
+}
+public function fileSize(fd: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    return status(files.size(state.descriptors[fd - 1].native))
+}
+public function pathSize(path: Text): Integer { return status(files.pathSize(path)) }
+public function pwrite(fd: Integer, data: Bytes, offset: Integer, length: Integer, position: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    // Preserve production dbio's all-or-error contract. A short kernel WRITE
+    // completion is not substituted for the WAL's ordinary positioned writes.
+    return status(files.writeAt(state.descriptors[fd - 1].native, data, offset, length, position))
+}
+public function write(fd: Integer, data: Bytes, offset: Integer, length: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    return status(files.write(state.descriptors[fd - 1].native, data, offset, length))
+}
+public function pread(fd: Integer, position: Integer, length: Integer): Bytes {
+    if !valid(fd) { return Bytes() }
+    let state = STATE
+    let data = files.readAt(state.descriptors[fd - 1].native, position, length)
+    status(files.lastError())
+    return data
+}
+public function ftruncate(fd: Integer, length: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    return status(files.truncate(state.descriptors[fd - 1].native, length))
+}
+// These are the production modules' explicitly synchronous publication/reopen
+// calls. The asynchronous syncer below never calls either as a fallback.
+public function fdatasync(fd: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    return status(files.syncData(state.descriptors[fd - 1].native))
+}
+public function fsync(fd: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    return status(files.sync(state.descriptors[fd - 1].native))
+}
+public function fsyncDir(path: Text): Integer { return status(files.syncDirectory(path)) }
+public function rename(from: Text, to: Text): Integer { return status(files.rename(from, to)) }
+public function unlink(path: Text): Integer { return status(files.remove(path)) }
+public function listDir(path: Text): List<Text> {
+    let names = files.list(path)
+    status(files.lastError())
+    return names
+}
+public function firstNonZero(data: Bytes, offset: Integer, length: Integer): Integer {
+    for index in offset..(offset + length) { if data[index] != 0 { return index } }
+    return -1
+}
+
+function syncerValid(handle: Integer): Boolean {
+    let state = STATE
+    if handle < 1 || handle > state.syncers.length { status(-9); return false }
+    if state.syncers[handle - 1].stopped { status(-9); return false }
+    return true
+}
+function sticky(syncer: Syncer, code: Integer): Integer {
+    if code < 0 && syncer.error == 0 { syncer.error = code }
+    return syncer.error
+}
+function submitAll(syncer: Syncer): Integer {
+    let attempts = 0
+    while syncer.queue.staged().unwrap() > 0 {
+        attempts += 1
+        if attempts > 64 { return sticky(syncer, -110) }
+        let result = syncer.queue.submit()
+        match result {
+            Ok(count) {}
+            Err(failure) {
+                if failure.nativeCode() != 4 { return sticky(syncer, -failure.nativeCode()) }
+            }
+        }
+    }
+    return 0
+}
+public function syncerStart(fd: Integer): Integer {
+    if !valid(fd) { return lastError() }
+    let state = STATE
+    let created = completionio.create(8, 0)
+    match created {
+        Ok(queue) {
+            let file = state.descriptors[fd - 1]
+            file.references += 1
+            state.syncers.add(Syncer { queue: queue; file: file; requests: []; acknowledged: 0
+                requested: 0; synced: 0; error: 0; stopped: false })
+        }
+        Err(failure) { return status(-failure.nativeCode()) }
+    }
+    return status(state.syncers.length)
+}
+// Selected standalone contract only: there is no event-loop notification socket.
+public function syncerNotifyFd(handle: Integer): Integer { return -1 }
+public function syncerRequest(handle: Integer, upTo: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    let syncer = state.syncers[handle - 1]
+    if upTo < 0 { return status(-22) }
+    if syncer.error < 0 { return status(syncer.error) }
+    if upTo <= syncer.requested { return status(0) }
+    if syncer.file.directory { return status(sticky(syncer, ENOTSUP)) }
+    let token = syncer.requests.length + 1
+    let queued = syncer.queue.sync(syncer.file.native, token)
+    match queued {
+        Ok(id) {
+            syncer.requests.add(Request { id: id; upTo: upTo; done: false; result: 0 })
+            syncer.requested = upTo
+        }
+        Err(failure) { return status(sticky(syncer, -failure.nativeCode())) }
+    }
+    return status(submitAll(syncer))
+}
+// Collect at most one CQE. Merely submitting, querying state, or seeing a file
+// in the page cache cannot acknowledge it. EINTR retries are finite; blocking
+// kernel calls also have the host fixture's process deadline.
+public function progress(handle: Integer, wait: Boolean): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    let syncer = state.syncers[handle - 1]
+    let attempts = 0
+    let found: Maybe<completionio.Completion> = None
+    while found.isNone() {
+        attempts += 1
+        if attempts > 64 { return status(sticky(syncer, -110)) }
+        let collected = syncer.queue.next(wait)
+        match collected {
+            Ok(value) {
+                if value.isNone() { return status(0) }
+                found = value
+            }
+            Err(failure) {
+                if failure.nativeCode() != 4 { return status(sticky(syncer, -failure.nativeCode())) }
+            }
+        }
+    }
+    let done = found.unwrap()
+    if done.kind != completionio.SYNC || done.token < 1 || done.token > syncer.requests.length {
+        fail("NeoDB completion facade: unknown CQE identity")
+    }
+    let request = syncer.requests[done.token - 1]
+    if request.done || request.id != done.id { fail("NeoDB completion facade: duplicate or stale CQE") }
+    request.done = true
+    let count = done.count()
+    match count {
+        Ok(value) {
+            if value != 0 { request.result = -5 }
+        }
+        Err(failure) { request.result = -failure.nativeCode() }
+    }
+    sticky(syncer, request.result)
+    state.collected += 1
+    // Collecting a later CQE cannot skip an unchecked earlier request. Once
+    // any operation fails, no later success can clear it or advance durability.
+    while syncer.error == 0 && syncer.acknowledged < syncer.requests.length {
+        let first = syncer.requests[syncer.acknowledged]
+        if !first.done { break }
+        syncer.synced = first.upTo
+        syncer.acknowledged += 1
+    }
+    return status(1)
+}
+public function pending(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    return state.syncers[handle - 1].queue.pending().unwrap()
+}
+public function syncerSyncedOffset(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    return state.syncers[handle - 1].synced
+}
+public function requestedOffset(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    return state.syncers[handle - 1].requested
+}
+public function syncerError(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    return state.syncers[handle - 1].error
+}
+public function syncerDrain(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let count = 0
+    while pending(handle) > 0 {
+        let rc = progress(handle, false)
+        if rc < 0 { return rc }
+        if rc == 0 { break }
+        count += 1
+    }
+    return count
+}
+public function syncerWait(handle: Integer, upTo: Integer, timeoutMs: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    if upTo < 0 || timeoutMs < -1 { return status(-22) }
+    // Positive deadlines would need a real bounded kernel wait facility.
+    if timeoutMs > 0 { return status(ENOTSUP) }
+    let state = STATE
+    let syncer = state.syncers[handle - 1]
+    if syncer.error < 0 { return status(syncer.error) }
+    if syncer.synced >= upTo { return syncer.synced }
+    if timeoutMs == 0 { return status(ETIMEDOUT) }
+    let rc = syncerRequest(handle, upTo)
+    if rc < 0 { return rc }
+    let attempts = 0
+    while syncer.synced < upTo && syncer.error == 0 {
+        attempts += 1
+        if attempts > 64 { return status(sticky(syncer, ETIMEDOUT)) }
+        rc = progress(handle, true)
+        if rc <= 0 { return status(sticky(syncer, -5)) }
+    }
+    if syncer.error < 0 { return status(syncer.error) }
+    return syncer.synced
+}
+public function syncerSwitch(handle: Integer, fd: Integer, startOffset: Integer): Integer {
+    if !syncerValid(handle) || !valid(fd) { return lastError() }
+    let state = STATE
+    let syncer = state.syncers[handle - 1]
+    if startOffset < 0 || startOffset < syncer.requested || startOffset < syncer.synced { return status(-22) }
+    if syncer.error < 0 { return status(syncer.error) }
+    let next = state.descriptors[fd - 1]
+    if next.directory { return status(ENOTSUP) }
+    // Deliberately blocking switch: finish all old-file requests and the exact
+    // boundary before changing the retained descriptor. Never re-open by path.
+    // The sole exception is the initial directory placeholder: it contains no
+    // WAL bytes, and the caller already synced namespace publication. Selecting
+    // its first segment does not advance requested/synced, even at a nonzero
+    // checkpoint LSN. Only a subsequent successful regular-file CQE can do so.
+    let rc = 0
+    if !syncer.file.directory {
+        rc = syncerWait(handle, startOffset, -1)
+        if rc < 0 { return rc }
+    }
+    if pending(handle) != 0 { fail("NeoDB completion facade: switching with live old-file operations") }
+    next.references += 1
+    rc = release(syncer.file)
+    syncer.file = next
+    if rc < 0 { return status(sticky(syncer, rc)) }
+    return status(0)
+}
+public function syncerStop(handle: Integer): Integer {
+    if !syncerValid(handle) { return lastError() }
+    let state = STATE
+    let syncer = state.syncers[handle - 1]
+    let rc = submitAll(syncer)
+    if rc < 0 { return status(rc) }
+    let attempts = 0
+    // Even after an operation fails, every other kernel owner must be collected.
+    while pending(handle) > 0 {
+        attempts += 1
+        if attempts > 64 { fail("NeoDB completion facade: stop retains undrained kernel owners") }
+        rc = progress(handle, true)
+        if rc <= 0 { fail("NeoDB completion facade: cannot safely drain kernel owners") }
+    }
+    let closed = syncer.queue.close()
+    match closed {
+        Ok() {}
+        Err(failure) { return status(sticky(syncer, -failure.nativeCode())) }
+    }
+    rc = release(syncer.file)
+    sticky(syncer, rc)
+    syncer.stopped = true
+    return status(syncer.error)
+}
+// One explicit collection from the first live nonempty queue. This test driver
+// does not claim a scheduler ordering between distinct kernel rings.
+public function completeNext(): Integer {
+    let state = STATE
+    for index in 0..state.syncers.length {
+        let syncer = state.syncers[index]
+        if !syncer.stopped && syncer.queue.pending().unwrap() > 0 {
+            let rc = progress(index + 1, true)
+            if rc != 1 { fail("NeoDB completion facade: explicit progress failed") }
+            return index + 1
+        }
+    }
+    return 0
+}
+// Test observations count actual retained resources, not managed record aliases.
+public function liveFiles(): Integer {
+    let state = STATE
+    let count = 0
+    for file in state.descriptors { if file.references > 0 { count += 1 } }
+    return count
+}
+public function liveQueues(): Integer {
+    let state = STATE
+    let count = 0
+    for syncer in state.syncers { if !syncer.stopped { count += 1 } }
+    return count
+}
+public function collectedSyncs(): Integer { let state = STATE; return state.collected }

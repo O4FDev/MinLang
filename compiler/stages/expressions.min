@@ -114,8 +114,9 @@ function parseListBasicMethod(context: CompilerContext, localNames: List<Text>, 
         return slotAsValue(output, textState, state, raw, resultType[0])
     }
     let startType: List<Integer> = [0]
+    let startLocation = state[0]
     let start = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, startType)
-    requireType(tokenLines, state, startType[0], 1, "List." + member + " positions must be Integers")
+    if startType[0] != 1 { requireContextType(context, startLocation, startType[0], 1, "List." + member + " positions must be Integers") }
     if member == "truncate" {
         expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
         output.add("  call void @minyar_list_truncate(ptr " + receiver + ", i64 " + start + ")\n")
@@ -124,8 +125,9 @@ function parseListBasicMethod(context: CompilerContext, localNames: List<Text>, 
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
     let endType: List<Integer> = [0]
+    let endLocation = state[0]
     let end = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, endType)
-    requireType(tokenLines, state, endType[0], 1, "List.slice positions must be Integers")
+    if endType[0] != 1 { requireContextType(context, endLocation, endType[0], 1, "List.slice positions must be Integers") }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
     let value = valueName(textState, newTemporary(state))
     let references = "0"
@@ -220,15 +222,19 @@ function parseMapMethod(context: CompilerContext, localNames: List<Text>, localT
     requireType(tokenLines, state, keyType[0], mapKeyType(receiverType), "Map key has the wrong type")
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
     let slot = valueAsListSlot(output, textState, state, key, keyType[0])
+    let custom = noteHashableCalls(context, keyType[0], state, textState, output)
     let value = valueName(textState, newTemporary(state))
     output.add("  " + value + " = call zeroext i1 @minyar_map_" + member + "(ptr " + receiver + ", i64 " + slot + ")\n")
+    if custom { recoveryCheckpoint(output, textState, state) }
     setType(resultType, 4)
     return value
 }
 
-function readMapElement(output: List<Text>, textState: List<Text>, state: List<Integer>, map: Text, key: Text, type: Integer): Text {
+function readMapElement(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, map: Text, key: Text, type: Integer, keyType: Integer): Text {
+    let custom = noteHashableCalls(context, keyType, state, textState, output)
     let raw = valueName(textState, newTemporary(state))
     output.add("  " + raw + " = call i64 @minyar_map_get(ptr " + map + ", i64 " + key + ")\n")
+    if custom { recoveryCheckpoint(output, textState, state) }
     return slotAsValue(output, textState, state, raw, type)
 }
 
@@ -304,12 +310,13 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                         thunk = sortComparatorThunk(functionNames, compareType[0], element, globals)
                         sortBorrowReference(output, state, compare, compareType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     } else {
-                        if isRecordType(element) {
+                        if isRecordType(element) && !isScalarChoiceType(element) {
+                            noteCapabilityCalls(context, element, "compare", state, textState, output)
                             thunk = derivedRecordSort(context, element, globals, memberLocation)
                             compare = "null"
                             by = true
                         } else {
-                        if element != 1 && element != 2 && element != 3 && element != 4 && element != 7 {
+                        if element != 1 && element != 2 && element != 3 && element != 4 && element != 7 && !isScalarChoiceType(element) {
                             failCompiler("this List element type has no natural order; use sortBy or sortedBy with Callback<T, T, Integer>")
                         }
                         }
@@ -328,7 +335,9 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     if by {
                         output.add(", ptr " + compare + ", ptr " + thunk)
                     } else {
-                        output.add(", i64 " + Text(element))
+                        let kind = element
+                        if isScalarChoiceType(kind) { kind = 1 }
+                        output.add(", i64 " + Text(kind))
                     }
                     if by || copying {
                         if isReferenceType(element) { output.add(", i64 1") } else { output.add(", i64 0") }
@@ -373,16 +382,17 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                 if (member == "add" || member == "appended") && isListType(receiverType) {
                     argumentType[0] = listElementType(receiverType)
                 }
+                let argumentLocation = state[0]
                 let argument = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
                 if receiverType == 2 && member == "slice" {
                     ownsResult = true
                     expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
                     let endType: List<Integer> = [0]
+                    let endLocation = state[0]
                     let end = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, endType)
                     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
-                    if argumentType[0] != 1 || endType[0] != 1 {
-                        failCompiler("Text.slice positions must be Integers")
-                    }
+                    if argumentType[0] != 1 { requireContextType(context, argumentLocation, argumentType[0], 1, "Text.slice positions must be Integers") }
+                    if endType[0] != 1 { requireContextType(context, endLocation, endType[0], 1, "Text.slice positions must be Integers") }
                     let temporary = newTemporary(state)
                     value = valueName(textState, temporary)
                     output.add("  ")
@@ -407,11 +417,17 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                         if takeOwner(output, state, receiver, receiverOwner) {
                             runtimeName = "minyar_list_appended_take"
                         }
+                        let transferPiece = -1
+                        if runtimeName == "minyar_list_appended" && !recoveryEnabled(state) {
+                            transferPiece = output.length
+                            output.add("")
+                        }
                         let temporary = newTemporary(state)
                         value = valueName(textState, temporary)
                         output.add("  ")
                         output.add(value)
                         output.add(" = call ptr @")
+                        if transferPiece >= 0 { noteTerminalReuse(context, syntaxNode, transferPiece, output.length, receiver) }
                         noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
                         output.add(runtimeName)
                         output.add("(ptr ")
@@ -475,8 +491,8 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     if field < 0 {
                         failUnknownField(context, memberLocation, receiverType, member)
                     }
-                    checkFieldAccess(tokenLines, functionParameterNames[field], functionNames[receiverType - 1000], memberLocation)
-                    let first = functionParameterOffset(functionParameterCounts, receiverType - 1000)
+                    checkFieldAccess(tokenLines, functionParameterNames[field], functionNames[recordTypeIndex(receiverType)], memberLocation)
+                    let first = functionParameterOffset(functionParameterCounts, recordTypeIndex(receiverType))
                     let fieldType = functionParameterTypes[field]
                     if state[15] / 32 % 2 != 0 && isCRecord(context, receiverType) {
                         value = readCField(context, output, textState, state, receiver, field)
@@ -485,10 +501,11 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     let raw = valueName(textState, temporary)
                     if scalarValues >= 0 {
                         raw = output[scalarValues + (field - first) * 3 + 1]
+                        if output[scalarValues] == "; mutable scalar field " { raw = loadScalarSlot(output, textState, state, raw) }
                     } else {
                         output.add("  ")
                         output.add(raw)
-                        output.add(" = call i64 @minyar_record_get(ptr ")
+                        output.add(" = call i64 @.minyar.record.get.checked(ptr ")
                         output.add(receiver)
                         output.add(", i64 ")
                         output.add(Text(field - first))
@@ -525,8 +542,12 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     if operation == "list_length" {
                         output.add(" = call i64 @.minyar.list.length")
                     } else {
+                        if operation == "bytes_length" {
+                            output.add(" = call i64 @.minyar.bytes.length")
+                        } else {
                         output.add(" = call i64 @minyar_")
                         output.add(operation)
+                        }
                     }
                     output.add("(ptr ")
                     output.add(receiver)
@@ -549,7 +570,7 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                 declareMapRuntime(globals)
                 requireTypeAt(tokenLines, positionLocation, positionType[0], mapKeyType(collectionType), "Map key has the wrong type")
                 let slot = valueAsListSlot(output, textState, state, position, positionType[0])
-                value = readMapElement(output, textState, state, collection, slot, mapValueType(collectionType))
+                value = readMapElement(context, output, textState, state, collection, slot, mapValueType(collectionType), mapKeyType(collectionType))
                 setType(resultType, mapValueType(collectionType))
             } else {
             requireTypeAt(tokenLines, positionLocation, positionType[0], 1, "a position must be an Integer")
@@ -597,7 +618,9 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
             ownResult(output, state, value, resultType)
         } else {
             let fieldRead = tokenIs(tokenKinds, tokenTexts, state, ".") && state[0] + 2 < tokenTexts.length && tokenTexts[state[0] + 2] != "("
-            if !fieldRead && !syntaxIndexHasNoCalls(context.syntax, state[0]) {
+            let unshared = resultType[0] == 8 && bytesAccessWithoutCalls(tokenKinds, tokenTexts, state[0])
+            if isListType(resultType[0]) && !possibleCycleType(resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) && listAppendWithoutCalls(tokenKinds, tokenTexts, state[0]) { unshared = true }
+            if !fieldRead && !unshared && !syntaxIndexHasNoCalls(context.syntax, state[0]) {
                 borrowReference(output, state, value, resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
             }
         }
@@ -624,7 +647,7 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
     if record < 0 {
         failUnknownRecord(context, state[0], name)
     }
-    if context.tokenLines.features / 4096 % 2 != 0 && choiceCases(context, 1000 + record).length > 0 { failCompiler("choice values require a case constructor") }
+    if context.tokenLines.features / 4096 % 2 != 0 && choiceCases(context, typeForSymbol(context, record)).length > 0 { failCompiler("choice values require a case constructor") }
     let hidden = 0
     while hidden < functionParameterCounts[record] {
         let stored = functionParameterNames[functionParameterOffset(functionParameterCounts, record) + hidden]
@@ -642,9 +665,11 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
     let fieldCount = functionParameterCounts[record]
     let first = functionParameterOffset(functionParameterCounts, record)
     let cLayout = false
-    if state[15] / 32 % 2 != 0 { cLayout = isCRecord(context, 1000 + record) }
+    if state[15] / 32 % 2 != 0 { cLayout = isCRecord(context, typeForSymbol(context, record)) }
     let scalarLocal = state[10]
     state[10] = -1
+    let mutableScalar = scalarLocal >= 0 && context.mutableScalarRecord
+    context.mutableScalarRecord = false
     let scalarValues = -1
     let scalar = true
     let inspect = 0
@@ -661,8 +686,13 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
         scalarValues = output.length
         let field = 0
         while field < fieldCount {
-            output.add("; ")
-            output.add("")
+            if mutableScalar {
+                output.add("; mutable scalar field ")
+                output.add("%local." + Text(nextLocal(state)))
+            } else {
+                output.add("; ")
+                output.add("")
+            }
             output.add("\n")
             field = field + 1
         }
@@ -676,15 +706,15 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
         if scalar {
             output.add(" = call ptr @minyar_record_new_scalar(i64 ")
         } else {
-            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, 0)
+            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, typeForSymbol(context, record), 0)
             output.add(" = call ptr @minyar_record_new(i64 ")
         }
         }
         let allocation = fieldCount
-        if cLayout { allocation = cRecordSize(context, 1000 + record) }
+        if cLayout { allocation = cRecordSize(context, typeForSymbol(context, record)) }
         output.add(Text(allocation))
         output.add(")\n")
-        owner = keepReference(output, state, value, 1000 + record)
+        owner = keepReference(output, state, value, typeForSymbol(context, record))
     }
     let seen: List<Boolean> = []
     let position = 0
@@ -697,9 +727,9 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
         let fieldLocation = state[0]
         state[0] = state[0] + 1
         expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
-        let field = findRecordField(functionParameterCounts, functionParameterNames, 1000 + record, fieldName)
+        let field = findRecordField(functionParameterCounts, functionParameterNames, typeForSymbol(context, record), fieldName)
         if field < 0 {
-            failUnknownField(context, fieldLocation, 1000 + record, fieldName)
+            failUnknownField(context, fieldLocation, typeForSymbol(context, record), fieldName)
         }
         let fieldPosition = field - first
         if seen[fieldPosition] {
@@ -716,9 +746,10 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
         } else {
         let slot = valueAsListSlot(output, textState, state, fieldValue, fieldType[0])
         if scalarValues >= 0 {
-            output[scalarValues + fieldPosition * 3 + 1] = slot
+            if mutableScalar { storeScalarSlot(output, output[scalarValues + fieldPosition * 3 + 1], slot) }
+            else { output[scalarValues + fieldPosition * 3 + 1] = slot }
         } else {
-        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, fieldType[0])
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, typeForSymbol(context, record), fieldType[0])
         if isReferenceType(fieldType[0]) {
             if takeResult(output, state, fieldValue, fieldType) {
                 output.add("  call void @minyar_record_set_take(ptr ")
@@ -727,7 +758,7 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
             }
         } else {
             if scalar {
-                output.add("  call void @minyar_record_set_scalar(ptr ")
+                output.add("  call void @.minyar.record.set.scalar.checked(ptr ")
             } else {
                 output.add("  call void @minyar_record_set(ptr ")
             }
@@ -755,7 +786,7 @@ function parseRecord(context: CompilerContext, localNames: List<Text>, localType
         }
         position = position + 1
     }
-    setType(resultType, 1000 + record)
+    setType(resultType, typeForSymbol(context, record))
     markOwner(resultType, owner)
     return value
 }

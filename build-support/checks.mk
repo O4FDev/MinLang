@@ -20,6 +20,30 @@ $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK): build/tooling/tests/stac
 
 check: check-ownership-policy check-stack-ownership
 
+.PHONY: check-last-use-returns
+check: check-last-use-returns
+check-last-use-returns: build/minyarc build/minyarc-sanitize build/tooling/tests/last-use-returns
+	$(LIMITED) ./build/tooling/tests/last-use-returns
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/last-use-returns
+
+.PHONY: check-terminal-return-reuse
+check: check-terminal-return-reuse
+check-terminal-return-reuse: build/minyarc build/minyarc-sanitize build/tooling/tests/terminal-return-reuse
+	$(LIMITED) ./build/tooling/tests/terminal-return-reuse
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/terminal-return-reuse
+
+.PHONY: check-mutable-scalar-records
+check: check-mutable-scalar-records
+check-mutable-scalar-records: build/minyarc build/minyarc-sanitize build/tooling/tests/mutable-scalar-records
+	$(LIMITED) ./build/tooling/tests/mutable-scalar-records
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/mutable-scalar-records
+
+.PHONY: check-typed-assignment-reuse
+check: check-typed-assignment-reuse
+check-typed-assignment-reuse: build/minyarc build/minyarc-sanitize build/tooling/tests/typed-assignment-reuse
+	$(LIMITED) ./build/tooling/tests/typed-assignment-reuse
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/typed-assignment-reuse
+
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 
@@ -493,6 +517,13 @@ check-compiler-hardening: build/minyarc build/minyarc-modules build/minyar-runti
 check-compiler-hardening-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/compiler-hardening
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compiler-hardening
 
+.PHONY: check-record-access check-record-access-sanitize
+check-record-access: build/minyarc build/minyar-runtime.o build/tooling/tests/record-access
+	$(LIMITED) ./build/tooling/tests/record-access
+
+check-record-access-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/record-access
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/record-access
+
 .PHONY: check-list-access check-list-access-sanitize
 check-list-access: build/minyarc build/minyar-runtime.o build/tooling/tests/list-access
 	$(LIMITED) ./build/tooling/tests/list-access
@@ -535,10 +566,10 @@ check-sanitize: check-checked-scalars-sanitize
 check-incremental-language-hardening: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-language-hardening
 	$(LIMITED) ./build/tooling/tests/incremental-language-hardening
 
-check-portable: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
+check-portable: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access check-record-access
 check-incremental-modules: check-incremental-language-hardening check-module-driver-options
-check-sanitize: check-runtime-bytes-sanitize check-runtime-traps-sanitize check-compiler-hardening-sanitize check-list-access-sanitize
-check: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
+check-sanitize: check-runtime-bytes-sanitize check-runtime-traps-sanitize check-compiler-hardening-sanitize check-list-access-sanitize check-record-access-sanitize
+check: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access check-record-access
 
 .PHONY: check-format format
 check-format: build/tooling/scripts/format
@@ -874,8 +905,8 @@ check-transport-cancel: build/minyarc build/tooling/tests/transport-cancel-test
 check-transport-cancel-sanitize: build/minyarc build/tooling/tests/transport-cancel-test
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-cancel-test --sanitize
 
-build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum | build
-	cd tests/interop/yamux && GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
+build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum $(lastword $(MAKEFILE_LIST)) | build
+	cd tests/interop/yamux && CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
 
 # The ordinary and FIN-schedule runs share one compiled Minyar peer per recipe.
 check-transport-go: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build

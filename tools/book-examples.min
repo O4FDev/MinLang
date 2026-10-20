@@ -1,0 +1,206 @@
+use "files" as files
+
+public record Example { source: Text; output: Text; line: Integer; path: Text; rejected: Boolean }
+public record Parsed { examples: List<Example>; error: Text }
+
+function whitespace(character: Character): Boolean {
+    return character == ' ' || character == '\t' || character == '\r' || character == '\n'
+}
+function stripped(value: Text): Text {
+    let first = 0
+    let after = value.length
+    while first < after && whitespace(value[first]) { first += 1 }
+    while after > first && whitespace(value[after - 1]) { after -= 1 }
+    return value.slice(first, after)
+}
+function rows(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 {
+            let line = Text(raw.slice(start, index))
+            if line.endsWith("\r") { line = line.slice(0, line.length - 1) }
+            result.add(line)
+            start = index + 1
+        }
+    }
+    if start < raw.length {
+        let line = Text(raw.slice(start, raw.length))
+        if line.endsWith("\r") { line = line.slice(0, line.length - 1) }
+        result.add(line)
+    }
+    return result
+}
+function fence(line: Text): Boolean {
+    let value = stripped(line)
+    return value.startsWith("```") || value.startsWith("~~~")
+}
+function closing(lines: List<Text>, first: Integer): Integer {
+    let position = first + 1
+    while position < lines.length {
+        if fence(lines[position]) {
+            if lines[position] == "```" { return position }
+            return -2
+        }
+        position += 1
+    }
+    return -1
+}
+function content(lines: List<Text>, first: Integer, after: Integer): Text {
+    let parts: List<Text> = []
+    for index in first..after { parts.add(lines[index] + "\n") }
+    return joinText(parts)
+}
+function displayFence(line: Text): Boolean {
+    for tag in ["text", "sh", "shell", "console", "rust", "cpp", "c++", "swift"] {
+        if line == "```" + tag { return true }
+    }
+    return false
+}
+function invalid(line: Integer, message: Text): Parsed {
+    return Parsed { examples: []; error: "line " + Text(line + 1) + ": " + message }
+}
+function nameCharacter(character: Character): Boolean {
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+        (character >= '0' && character <= '9') || character == '_' || character == '-'
+}
+// Project files must remain distinct on both case-sensitive and default macOS
+// filesystems. Fold only the validated ASCII lookup key, preserving source paths.
+function pathKey(path: Text): Text {
+    let raw = Bytes(path)
+    for index in 0..raw.length {
+        if raw[index] >= 65 && raw[index] <= 90 { raw[index] += 32 }
+    }
+    return Text(raw)
+}
+function safePath(path: Text): Boolean {
+    if !path.endsWith(".min") || path.length <= 4 { return false }
+    let stem = path.slice(0, path.length - 4)
+    let start = 0
+    for index in 0..stem.length {
+        if stem[index] == '/' {
+            if index == start { return false }
+            start = index + 1
+        } else {
+            if !nameCharacter(stem[index]) || (index == start && stem[index] == '-') { return false }
+        }
+    }
+    return start < stem.length
+}
+function markerLike(line: Text): Boolean {
+    let value = stripped(line)
+    if !value.startsWith("//") { return false }
+    value = stripped(value.slice(2, value.length))
+    if value.length < 4 { return false }
+    if (value[0] != 'f' && value[0] != 'F') || (value[1] != 'i' && value[1] != 'I') ||
+        (value[2] != 'l' && value[2] != 'L') || (value[3] != 'e' && value[3] != 'E') { return false }
+    if value.length == 4 { return true }
+    if value[4] == ':' || value[4] == '=' { return true }
+    if !whitespace(value[4]) { return false }
+    let tail = stripped(value.slice(4, value.length))
+    if !tail.endsWith(".min") { return false }
+    for character in tail { if whitespace(character) { return false } }
+    return true
+}
+
+public function parse(source: Text): Parsed {
+    let result = Parsed { examples: []; error: "" }
+    let lines = rows(source)
+    let position = 0
+    let paths: Map<Text, Boolean> = Map<Text, Boolean>()
+    while position < lines.length {
+        let line = lines[position]
+        // Reject unsupported spellings instead of silently losing an example.
+        if line.find("```") >= 0 || line.find("~~~") >= 0 {
+            if line == "```output" { return invalid(position, "orphan output fence") }
+            if line == "```diagnostic" { return invalid(position, "orphan diagnostic fence") }
+            if line != "```minyar" && line != "```minyar-reject" && !displayFence(line) { return invalid(position, "unsupported or indented code fence") }
+            let after = closing(lines, position)
+            if after == -1 { return invalid(position, "unclosed code fence") }
+            if after == -2 { return invalid(position, "malformed closing code fence") }
+            if line != "```minyar" && line != "```minyar-reject" { position = after + 1; continue }
+            let rejected = line == "```minyar-reject"
+            let first = position
+            let program = content(lines, position + 1, after)
+            if stripped(program) == "" { return invalid(first, "empty Minyar program") }
+            let path = ""
+            // Only the first source line can declare metadata. The body is
+            // Minyar: comments and raw Text must not be parsed as file headers.
+            let header = first + 1
+            if markerLike(lines[header]) {
+                if rejected { return invalid(header, "rejection examples cannot have file markers") }
+                if !lines[header].startsWith("// file: ") { return invalid(header, "malformed file marker; use // file: src/main.min") }
+                path = lines[header].slice(9, lines[header].length)
+                if !safePath(path) { return invalid(header, "file marker needs a safe canonical relative .min path") }
+                if stripped(content(lines, header + 1, after)) == "" { return invalid(first, "empty Minyar program after file marker") }
+            }
+            if result.examples.length > 0 {
+                if (path == "") != (result.examples[0].path == "") { return invalid(first, "cannot mix project files and standalone programs on one page") }
+            }
+            if path != "" {
+                let key = pathKey(path)
+                if paths.has(key) { return invalid(first + 1, "duplicate project file path: " + path) }
+                paths[key] = true
+            }
+            position = after + 1
+            while position < lines.length && stripped(lines[position]) == "" { position += 1 }
+            let oracleTag = "output"
+            if rejected { oracleTag = "diagnostic" }
+            let needsOracle = "Minyar program needs an immediately following " + oracleTag + " fence"
+            if position == lines.length { return invalid(first, needsOracle) }
+            if lines[position] != "```" + oracleTag { return invalid(position, needsOracle) }
+            after = closing(lines, position)
+            if after == -1 { return invalid(position, "unclosed " + oracleTag + " fence") }
+            if after == -2 { return invalid(position, "malformed closing " + oracleTag + " fence") }
+            let oracle = content(lines, position + 1, after)
+            if rejected && stripped(oracle) == "" { return invalid(position, "rejection example needs a nonempty diagnostic oracle") }
+            result.examples.add(Example { source: program; output: oracle; line: first + 2; path: path; rejected: rejected })
+            position = after + 1
+        } else { position += 1 }
+    }
+    if result.examples.length == 0 { return invalid(0, "each book page needs at least one Minyar program") }
+    return result
+}
+
+// The caller exclusively owns this already-existing private directory, including
+// every existing entry, and must not supply symlinks. It may be a fresh project
+// scaffold: generated source files are replaced, and other files are preserved.
+// files has no no-follow API; this is not an API for arbitrary user directories.
+// Reject every invalid project request before creating or replacing anything.
+public function writeFiles(examples: List<Example>, directory: Text) {
+    if examples.length == 0 { fail("book project has no files") }
+    let paths: Map<Text, Boolean> = Map<Text, Boolean>()
+    for example in examples {
+        if example.rejected { fail("rejection examples cannot be project files") }
+        if !safePath(example.path) { fail("book project needs safe canonical relative .min paths") }
+        let key = pathKey(example.path)
+        if paths.has(key) { fail("duplicate book project file: " + example.path) }
+        paths[key] = true
+        if !example.source.startsWith("// file: " + example.path + "\n") { fail("book project source does not match its file marker") }
+    }
+    let entries = files.list(directory)
+    let code = files.lastError()
+    if code != 0 { fail("book project needs an existing private directory: " + directory) }
+    let parents: Map<Text, Boolean> = Map<Text, Boolean>()
+    for example in examples {
+        for index in 0..example.path.length {
+            if example.path[index] == '/' {
+                let parent = directory + "/" + example.path.slice(0, index)
+                if !parents.has(parent) {
+                    if files.makeDirectory(parent) != 0 { fail("cannot create book project directory: " + parent) }
+                    let children = files.list(parent)
+                    if files.lastError() != 0 { fail("book project parent is not a directory: " + parent) }
+                    parents[parent] = true
+                }
+            }
+        }
+        let path = directory + "/" + example.path
+        let file = files.open(path, files.WRITE | files.CREATE | files.TRUNCATE)
+        if file < 0 { fail("cannot create book project file: " + path) }
+        let data = Bytes(example.source)
+        let written = files.write(file, data, 0, data.length)
+        let closed = files.close(file)
+        if written != data.length || closed != 0 { fail("cannot write book project file: " + path) }
+    }
+}

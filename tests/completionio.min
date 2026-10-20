@@ -1,0 +1,182 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let levels = ["-O0", "-O2"]
+fixtures.validate("completionio", ["unsupported", "queue", "gallery", "privacy"])
+
+if fixtures.selected("completionio", "unsupported") {
+    frontend.sources = ["-DCOMPLETIONIO_FORCE_UNSUPPORTED", "runtime/native/completionio.c"]
+    fixtures.executes(frontend, #"""
+        use "completionio" as queue
+        use "errors" as errors
+        function check(value: Boolean) { if !value { fail("unsupported completion I/O contract") } }
+        let unavailable = queue.create(3, 1024)
+        match unavailable {
+            Ok(value) { fail("unsupported provider created a queue") }
+            Err(failure) {
+                check(failure.code() == errors.systemCode())
+                check(failure.nativeCode() > 0)
+                check(failure.contexts().length == 1)
+            }
+        }
+        print("unsupported: passed")
+
+        """#, "unsupported: passed\n", levels, 0, "", true)
+}
+
+let kernel = test.setting("MINYAR_COMPLETIONIO_KERNEL", "0") == "1"
+let mocked = test.setting("MINYAR_COMPLETIONIO_MOCK", "0") == "1"
+if kernel || mocked {
+    frontend.sources = ["runtime/native/completionio.c", "runtime/native/files.c"]
+    if !kernel { frontend.sources = ["-DCOMPLETIONIO_MINYAR_FIXTURE", "tests/completionio-unit.c", "runtime/native/files.c"] }
+    if fixtures.selected("completionio", "queue") {
+        let path = frontend.compiler.directory + "/queue-data"
+        let prelude = "constant PATH = \"" + path + "\"\n"
+        fixtures.executes(frontend, prelude + #"""
+            use "completionio" as queue
+            use "files" as files
+            use "errors" as errors
+            function check(value: Boolean, message: Text) { if !value { fail(message) } }
+            function submitAll(q: queue.Queue) {
+                let attempts = 0
+                while q.staged().unwrap() > 0 {
+                    attempts += 1
+                    check(attempts <= 64, "bounded submission attempts")
+                    let result = q.submit()
+                    match result {
+                        Ok(count) { check(count > 0, "submission makes progress") }
+                        Err(failure) { check(failure.nativeCode() == 4, "only EINTR is retried") }
+                    }
+                }
+            }
+            function completed(q: queue.Queue): queue.Completion {
+                let found: Maybe<queue.Completion> = None
+                let attempts = 0
+                while found.isNone() {
+                    attempts += 1
+                    check(attempts <= 64, "bounded collection attempts")
+                    let result = q.next(true)
+                    match result {
+                        Ok(value) { check(value.isSome(), "submitted work produces a completion"); found = value }
+                        Err(failure) { check(failure.nativeCode() == 4, "only collection EINTR is retried") }
+                    }
+                }
+                return found.unwrap()
+            }
+            let q = queue.create(3, 8).unwrap()
+            let alias = q
+            let fd = files.openFile(PATH, files.WRITE | files.CREATE | files.EXCLUSIVE).unwrap()
+            let payload = Bytes("moon")
+            let first = q.write(fd, 0, payload, -11).unwrap()
+            payload.setUInt32(0, 0)
+            let second = q.write(fd, 4, Bytes("rise"), 22).unwrap()
+            let sync = q.sync(fd, 33).unwrap()
+            check(first > 0 && second > first && sync > second, "stable completion ids")
+            files.closeFile(fd).unwrap()
+            check(q.pending().unwrap() == 3 && q.staged().unwrap() == 3, "bounded outstanding count")
+            match q.read(fd, 0, 1, 0) {
+                Ok(id) { fail("full queue accepted another owner") }
+                Err(failure) { check(failure.nativeCode() == 11, "queue capacity is recoverable EAGAIN") }
+            }
+            match q.close() {
+                Ok() { fail("close discarded staged owners") }
+                Err(failure) { check(failure.nativeCode() == 16, "busy close preserves native errno") }
+            }
+            check(alias.pending().unwrap() == 3, "busy close leaves every alias usable")
+            let absent = q.next(false).unwrap()
+            check(absent.isNone(), "staging never submits implicitly")
+            match q.next(true) {
+                Ok(value) { fail("waiting on an entirely staged queue did not report EAGAIN") }
+                Err(failure) { check(failure.nativeCode() == 11, "unsubmitted wait is recoverable") }
+            }
+            submitAll(q)
+            let firstSeen = false
+            let secondSeen = false
+            let synced = false
+            while q.pending().unwrap() > 0 {
+                let done = completed(q)
+                let count = done.count().unwrap()
+                if done.id == first {
+                    check(done.kind == queue.WRITE && done.token == -11 && count == 4 && !firstSeen, "first copied write")
+                    firstSeen = true
+                    match done.bytes() {
+                        Ok(data) { fail("a write completion exposed read bytes") }
+                        Err(failure) { check(failure.code() == errors.invalidDataCode() && failure.nativeCode() == 0, "wrong completion kind is recoverable") }
+                    }
+                } else if done.id == second {
+                    check(done.kind == queue.WRITE && done.token == 22 && count == 4 && !secondSeen, "temporary copied write")
+                    secondSeen = true
+                } else {
+                    check(done.id == sync && done.kind == queue.SYNC && done.token == 33 && count == 0 && !synced, "restricted drain sync")
+                    synced = true
+                }
+            }
+            check(firstSeen && secondSeen && synced, "observe both writes and the barrier")
+            check(q.next(false).unwrap().isNone() && q.next(true).unwrap().isNone(), "empty queues return None")
+
+            let reader = files.openFile(PATH, files.READ).unwrap()
+            let read = q.read(reader, 0, 8, 44).unwrap()
+            check(read > sync, "read receives a fresh identity")
+            files.closeFile(reader).unwrap()
+            submitAll(q)
+            let done = completed(q)
+            check(done.id == read && done.kind == queue.READ && done.token == 44, "read identity")
+            let readBytes = done.bytes().unwrap()
+            check(done.count().unwrap() == 8 && Text(readBytes) == "moonrise", "caller-thread read copy")
+
+            // A regular read-only fd is accepted, then its write fails in the CQE.
+            // The outer next result still preserves the failed operation's identity.
+            let readonly = files.openFile(PATH, files.READ).unwrap()
+            let failedWrite = q.write(readonly, 0, Bytes("bad"), 55).unwrap()
+            files.closeFile(readonly).unwrap()
+            submitAll(q)
+            let failed = completed(q)
+            check(failed.id == failedWrite && failed.token == 55 && failed.kind == queue.WRITE, "failed completion keeps its identity")
+            match failed.count() {
+                Ok(count) { fail("a failed write became a successful count") }
+                Err(failure) { check(failure.nativeCode() == 9 && failure.code() == errors.systemCode(), "negative CQE becomes positive native EBADF") }
+            }
+            match failed.bytes() {
+                Ok(data) { fail("a failed completion exposed bytes") }
+                Err(failure) { check(failure.nativeCode() == 9, "bytes preserves the operation failure") }
+            }
+            q.close().unwrap()
+            match alias.pending() {
+                Ok(count) { fail("closed alias retained a usable native handle") }
+                Err(failure) { check(failure.nativeCode() == 9, "closing one alias invalidates every alias") }
+            }
+            match q.close() {
+                Ok() { fail("double close succeeded") }
+                Err(failure) { check(failure.nativeCode() == 9, "double close is recoverable") }
+            }
+            match q.next(false) {
+                Ok(value) { fail("closed queue returned a completion") }
+                Err(failure) { check(failure.nativeCode() == 9, "stale collection is recoverable") }
+            }
+            check(Text(done.bytes().unwrap()) == "moonrise" && Text(readBytes) == "moonrise", "managed result outlives native queue")
+            files.deleteFile(PATH).unwrap()
+            print("queue: passed")
+
+            """#, "queue: passed\n", levels, 0, "", true)
+    }
+    if fixtures.selected("completionio", "gallery") {
+        frontend.sources.add("runtime/native/system.c")
+        frontend.sources.add("-pthread")
+        fixtures.executes(frontend, io.readTextFile("examples/gallery/durable-batch.min"), "Two records, one durable promise.\n", levels, 0, "", true)
+    }
+} else {
+    print("completionio queue/gallery: unavailable on this host (not kernel proof)")
+}
+if fixtures.selected("completionio", "privacy") {
+    fixtures.rejects(frontend, "use \"completionio\" as queue\nlet forged = queue.Queue { handle: 1 }\n", "has private fields, so only its own module can create one", true)
+    fixtures.rejects(frontend, "use \"completionio\" as queue\nfunction expose(value: queue.Queue): Integer { return value.handle }\n", "is private to its module", true)
+    fixtures.rejects(frontend, "use \"completionio\" as queue\nlet raw = queue.open(1, 0)\n", "private", true)
+    fixtures.rejects(frontend, "use \"completionio\" as queue\nfunction expose(value: queue.Completion): Integer { return value.result }\n", "is private to its module", true)
+    fixtures.rejects(frontend, "use \"completionio\" as queue\nfunction expose(value: queue.Completion): Bytes { return value.data }\n", "is private to its module", true)
+}
+test.removeTree(frontend.compiler.directory)
+if kernel { print("Completion I/O real-kernel ABI: passed") }
+else { print("Completion I/O controls: passed (not kernel proof)") }

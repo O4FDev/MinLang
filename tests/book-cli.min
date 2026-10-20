@@ -1,0 +1,300 @@
+use "../tools/testing.min" as test
+use "../tools/book-examples.min" as book
+use "io" as io
+use "system" as system
+use "files" as files
+
+record Walkthrough { launcher: Text; directory: Text; log: Text; serial: Integer }
+record GreetingCase { name: Text; arguments: List<Text>; output: Text }
+
+function page(path: Text): List<book.Example> {
+    let parsed = book.parse(io.readTextFile(path))
+    test.check(parsed.error == "", path + ": " + parsed.error)
+    return parsed.examples
+}
+
+function environment(): List<Text> {
+    let result: List<Text> = []
+    // A terminal walkthrough has no parent Make jobserver descriptors. Do not
+    // pass the harness's stale jobserver flags into the launcher's nested Make.
+    for entry in system.environment() {
+        if !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("MAKELEVEL=") &&
+            !entry.startsWith("MAKEFILES=") && !entry.startsWith("GNUMAKEFLAGS=") { result.add(entry) }
+    }
+    return result
+}
+
+function invoke(walkthrough: Walkthrough, arguments: List<Text>): test.Result {
+    walkthrough.serial += 1
+    let command = [walkthrough.launcher]
+    for argument in arguments { command.add(argument) }
+    let result = test.run(command, environment(), walkthrough.directory,
+        walkthrough.log + "/command-" + Text(walkthrough.serial), 180)
+    test.require(result, "book walkthrough " + arguments[0])
+    test.check(result.errorOutput == "", "book walkthrough " + arguments[0] + " wrote diagnostics\n" + result.errorOutput)
+    return result
+}
+
+// Only the actual source location is shortened; pathname literals in the
+// message, excerpt and help stay exact. Raw pre-normalized locations cannot
+// supply source origin, including inside a multi-error diagnostic.
+function sourceLocation(stderr: Text, source: Text): Boolean {
+    let prefix = "  --> " + source + ":"
+    return stderr.startsWith(prefix) || stderr.find("\n" + prefix) >= 0
+}
+function normalizeLocations(stderr: Text, source: Text): Text {
+    let prefix = "  --> " + source + ":"
+    let normalized = test.replace(stderr, "\n" + prefix, "\n  --> program.min:")
+    if normalized.startsWith(prefix) { normalized = "  --> program.min:" + normalized.slice(prefix.length, normalized.length) }
+    return normalized
+}
+function noteMatches(directory: Text, expected: Text, label: Text) {
+    let path = directory + "/garden-note.tmp"
+    let actual = files.readFile(path)
+    test.check(files.lastError() == 0, label + ": cannot read the saved garden note")
+    let wanted = Bytes(expected)
+    test.check(actual.length == wanted.length && files.pathSize(path) == wanted.length,
+        label + ": garden note has the wrong byte length")
+    for index in 0..wanted.length {
+        test.check(actual[index] == wanted[index], label + ": garden note differs at byte " + Text(index))
+    }
+    test.check(files.pathSize(directory + "/src/garden-note.tmp") == -2,
+        label + ": relative file writes must use the project directory, not src")
+}
+
+let work = test.scratch()
+let root = test.resolvePath(".")
+let walkthrough = Walkthrough { launcher: root + "/minyar"; directory: work; log: work; serial: 0 }
+invoke(walkthrough, ["new", "hello"])
+walkthrough.directory = work + "/hello"
+test.check(files.pathSize(walkthrough.directory + "/src/main.min") > 0, "book project scaffold exists")
+let first = page("docs/book/01-first-program.md")
+test.check(first.length == 2, "first chapter has the expected two programs")
+io.writeTextFile(walkthrough.directory + "/src/main.min", first[0].source)
+let hello = invoke(walkthrough, ["run"])
+let debugPrefix = "built " + walkthrough.directory + "/target/debug/hello\nFinished debug hello\n"
+test.check(hello.output == debugPrefix + first[0].output, "first book program runs through the public CLI\n" + hello.output)
+
+let garden = page("docs/book/08-garden.md")
+test.check(garden.length == 1, "garden chapter has one complete program")
+io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
+invoke(walkthrough, ["check"])
+let plan = invoke(walkthrough, ["run"])
+test.check(plan.output == debugPrefix + garden[0].output, "garden output matches through the public CLI\n" + plan.output)
+let checked = invoke(walkthrough, ["test"])
+for name in ["an empty garden needs no seeds", "every bed contributes to the total", "3 passed; 0 failed"] {
+    test.check(test.contains(checked.output, name), "garden tests are discovered: " + name + "\n" + checked.output)
+}
+let broken = test.replace(garden[0].source, "expect(totalSeeds([]) == 0)", "expect(totalSeeds([]) == 1)")
+test.check(broken != garden[0].source, "negative control changed the garden expectation")
+io.writeTextFile(walkthrough.directory + "/src/main.min", broken)
+let rejected = test.run([walkthrough.launcher, "test"], environment(), walkthrough.directory, work + "/failed-expectation", 180)
+test.check(rejected.status == 1 && test.contains(rejected.output, "2 passed; 1 failed") &&
+    test.contains(rejected.output + rejected.errorOutput, "an empty garden needs no seeds") &&
+    test.contains(rejected.output + rejected.errorOutput, "expectation failed") &&
+    test.contains(rejected.output + rejected.errorOutput, "expected 1, got 0"),
+    "an incorrect garden expectation must fail, not merely be discovered\n" + rejected.output + rejected.errorOutput)
+io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
+invoke(walkthrough, ["build", "--release"])
+let executable = walkthrough.directory + "/target/release/hello"
+test.check(files.pathSize(executable) > 0, "book's documented release executable exists")
+let released = test.run([executable], system.environment(), walkthrough.directory, work + "/release-run", 10)
+test.require(released, "book release executable")
+test.check(released.output == garden[0].output && released.errorOutput == "", "release garden has exact output\n" + released.output + released.errorOutput)
+
+walkthrough.directory = work
+invoke(walkthrough, ["new", "harvest"])
+walkthrough.directory = work + "/harvest"
+let modules = page("docs/book/09-modules.md")
+test.check(modules.length == 2, "modules chapter has two complete source files")
+book.writeFiles(modules, walkthrough.directory)
+let moduleSource = ""
+let expected = ""
+for example in modules {
+    if example.path == "src/garden.min" { moduleSource = example.source }
+    if example.path == "src/main.min" { expected = example.output }
+}
+test.check(moduleSource != "" && expected != "", "modules chapter has a library and a printing entry file")
+invoke(walkthrough, ["check"])
+let harvest = invoke(walkthrough, ["run"])
+let harvestPrefix = "built " + walkthrough.directory + "/target/debug/harvest\nFinished debug harvest\n"
+test.check(harvest.output == harvestPrefix + expected, "the imported harvest calculation has exact output\n" + harvest.output)
+let moduleTests = invoke(walkthrough, ["test"])
+for name in ["a module can test its private helper", "an empty imported garden needs no seeds", "3 passed; 0 failed"] {
+    test.check(test.contains(moduleTests.output, name), "imported module tests are discovered: " + name + "\n" + moduleTests.output)
+}
+
+let hidden = test.replace(moduleSource, "public function totalSeeds", "function totalSeeds")
+test.check(hidden != moduleSource, "private-access control changed the exported function")
+io.writeTextFile(walkthrough.directory + "/src/garden.min", hidden)
+let privateAccess = test.run([walkthrough.launcher, "check"], environment(), walkthrough.directory, work + "/private-module", 180)
+test.check(privateAccess.status == 1 && test.contains(privateAccess.errorOutput, "'garden.totalSeeds' is private to its module"),
+    "removing public must reject the calling file\n" + privateAccess.output + privateAccess.errorOutput)
+
+let wrongHelper = test.replace(moduleSource, "name: \"Practice\"; seeds: seeds", "name: \"Practice\"; seeds: seeds + 1")
+test.check(wrongHelper != moduleSource, "private-helper control changed the module's calculation")
+io.writeTextFile(walkthrough.directory + "/src/garden.min", wrongHelper)
+let failedModule = test.run([walkthrough.launcher, "test"], environment(), walkthrough.directory, work + "/failed-module-test", 180)
+test.check(failedModule.status == 1 && test.contains(failedModule.output, "2 passed; 1 failed") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "a module can test its private helper") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "expectation failed") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "expected 4, got 5"),
+    "a wrong private helper must fail its imported module test\n" + failedModule.output + failedModule.errorOutput)
+book.writeFiles(modules, walkthrough.directory)
+let recoveredModule = invoke(walkthrough, ["test"])
+test.check(test.contains(recoveredModule.output, "3 passed; 0 failed"), "restoring the private helper recovers every project test\n" + recoveredModule.output)
+invoke(walkthrough, ["build", "--release"])
+let harvestExecutable = walkthrough.directory + "/target/release/harvest"
+test.check(files.pathSize(harvestExecutable) > 0, "harvest's documented release executable exists")
+let harvestRelease = test.run([harvestExecutable], environment(), walkthrough.directory, work + "/harvest-release", 10)
+test.require(harvestRelease, "harvest release executable")
+test.check(harvestRelease.output == expected && harvestRelease.errorOutput == "", "harvest release has exact output\n" + harvestRelease.output + harvestRelease.errorOutput)
+walkthrough.directory = work
+invoke(walkthrough, ["new", "repair-practice"])
+walkthrough.directory = work + "/repair-practice"
+let corrections = page("docs/book/10-errors.md")
+let rejectionCount = 0
+let repairCount = 0
+for example in corrections {
+    test.check(example.path == "", "error and repair examples are complete standalone sources")
+    if example.rejected { rejectionCount += 1 } else { repairCount += 1 }
+}
+test.check(corrections.length == 8 && rejectionCount == 4 && repairCount == 4,
+    "errors chapter has four compiler rejections and four complete repairs")
+let repairSource = walkthrough.directory + "/src/main.min"
+let actualRepairSource = test.resolvePath(repairSource)
+test.check(actualRepairSource == repairSource, "repair source has the actual absolute project pathname")
+let repairPrefix = "built " + walkthrough.directory + "/target/debug/repair-practice\nFinished debug repair-practice\n"
+for example in corrections {
+    io.writeTextFile(repairSource, example.source)
+    if example.rejected {
+        walkthrough.serial += 1
+        let failure = test.run([walkthrough.launcher, "check"], environment(), walkthrough.directory,
+            walkthrough.log + "/command-" + Text(walkthrough.serial), 180)
+        test.check(failure.status == 1 && failure.output == "" && failure.errorOutput != "" && example.output != "" &&
+            sourceLocation(failure.errorOutput, actualRepairSource) && !sourceLocation(failure.errorOutput, "program.min") &&
+            normalizeLocations(failure.errorOutput, actualRepairSource) == example.output,
+            "docs/book/10-errors.md:" + Text(example.line) + " public check rejection differs (status " + Text(failure.status) + ")\n" +
+            "expected diagnostic:\n" + example.output + "received stdout:\n" + failure.output +
+            "received stderr:\n" + normalizeLocations(failure.errorOutput, actualRepairSource))
+    } else {
+        invoke(walkthrough, ["check"])
+        let repaired = invoke(walkthrough, ["run"])
+        test.check(repaired.output == repairPrefix + example.output,
+            "docs/book/10-errors.md:" + Text(example.line) + " repaired program has exact public CLI output\n" + repaired.output)
+    }
+}
+let explained = invoke(walkthrough, ["explain", "E0401"])
+test.check(explained.output.startsWith("E0401: A value has a different type than required\n\n") &&
+    test.contains(explained.output, "The expected type comes from a declaration, parameter, field, or return type.") &&
+    test.contains(explained.output, "The found type describes the expression you supplied."),
+    "the public explanation connects E0401 to the declaration and supplied expression\n" + explained.output)
+
+walkthrough.directory = work
+invoke(walkthrough, ["new", "garden-notes"])
+walkthrough.directory = work + "/garden-notes"
+let notes = page("docs/book/11-files.md")
+test.check(notes.length == 1 && !notes[0].rejected && notes[0].path == "",
+    "files chapter has one complete successful standalone program")
+let noteProgram = notes[0].source
+let note = "Peas: 8; herbs: 6"
+let noteDeclaration = "let note = \"Peas: 8; herbs: 6\""
+test.check(Bytes(note).length == 17 && test.contains(noteProgram, noteDeclaration),
+    "files chapter saves the promised seventeen-byte note")
+let notePath = walkthrough.directory + "/garden-note.tmp"
+let notesSource = walkthrough.directory + "/src/main.min"
+let notesPrefix = "built " + walkthrough.directory + "/target/debug/garden-notes\nFinished debug garden-notes\n"
+test.check(files.pathSize(notePath) == -2 && files.pathSize(walkthrough.directory + "/src/garden-note.tmp") == -2,
+    "the notes walkthrough starts without a saved data file")
+io.writeTextFile(notesSource, noteProgram)
+invoke(walkthrough, ["check"])
+test.check(files.pathSize(notePath) == -2, "checking source must not execute its file writes")
+let saved = invoke(walkthrough, ["run"])
+test.check(saved.output == notesPrefix + notes[0].output, "saving and bounded reading have exact public CLI output\n" + saved.output)
+noteMatches(walkthrough.directory, note, "debug notes program")
+
+// The chapter promises both reads succeed for empty Text. Keep the existing
+// nonempty file here, proving that this exercise replaces it with zero bytes.
+let emptyProgram = test.replace(noteProgram, noteDeclaration, "let note = \"\"")
+test.check(emptyProgram != noteProgram, "empty-note exercise changes the saved value")
+io.writeTextFile(notesSource, emptyProgram)
+invoke(walkthrough, ["check"])
+let empty = invoke(walkthrough, ["run"])
+let emptyOutput = "Read limit: 64 bytes\nSaved and read: \nRead limit: 8 bytes\nSaved and read: \n"
+test.check(empty.output == notesPrefix + emptyOutput,
+    "an empty note is successful text for both limits, with exact trailing spaces\n" + empty.output)
+noteMatches(walkthrough.directory, "", "empty-note exercise")
+
+io.writeTextFile(notesSource, noteProgram)
+invoke(walkthrough, ["build", "--release"])
+let notesExecutable = walkthrough.directory + "/target/release/garden-notes"
+test.check(files.pathSize(notesExecutable) > 0, "the notes release executable exists")
+test.check(files.remove(notePath) == 0 && files.pathSize(notePath) == -2,
+    "release execution must create its own note instead of inheriting debug data")
+let notesRelease = test.run([notesExecutable], environment(), walkthrough.directory, work + "/notes-release", 10)
+test.require(notesRelease, "garden notes release executable")
+test.check(notesRelease.output == notes[0].output && notesRelease.errorOutput == "",
+    "the restored notes release program has exact output\n" + notesRelease.output + notesRelease.errorOutput)
+noteMatches(walkthrough.directory, note, "release notes program")
+
+walkthrough.directory = work
+let greetingsName = "greetings"
+invoke(walkthrough, ["new", greetingsName])
+walkthrough.directory = work + "/" + greetingsName
+let greetings = page("docs/book/12-arguments.md")
+test.check(greetings.length == 1 && !greetings[0].rejected && greetings[0].path == "",
+    "arguments chapter has one complete successful standalone program")
+test.check(greetings[0].output == "Hello, gardener!\n", "arguments chapter promises the no-argument default greeting")
+let greetingsSource = walkthrough.directory + "/src/main.min"
+let greetingsProgram = greetings[0].source
+io.writeTextFile(greetingsSource, greetingsProgram)
+invoke(walkthrough, ["check"])
+let greetingsPrefix = "built " + walkthrough.directory + "/target/debug/" + greetingsName +
+    "\nFinished debug " + greetingsName + "\n"
+let greetingCases: List<GreetingCase> = [
+    GreetingCase { name: "default"; arguments: []; output: "Hello, gardener!\n" },
+    GreetingCase { name: "spaced"; arguments: ["Ada Lovelace"]; output: "Hello, Ada Lovelace!\n" },
+    GreetingCase { name: "empty"; arguments: [""]; output: "Please give a name, or leave the argument out.\n" },
+    GreetingCase { name: "flag"; arguments: ["--help"]; output: "Hello, --help!\n" },
+    GreetingCase { name: "extra"; arguments: ["Ada", "Jo"]; output: "Hello, Ada!\n" },
+    GreetingCase { name: "second-separator"; arguments: ["--"]; output: "Hello, --!\n" }
+]
+// Write the chapter source once: every later invocation changes only argv.
+for candidate in greetingCases {
+    test.check(io.readTextFile(greetingsSource) == greetingsProgram,
+        "greetings source changed before public " + candidate.name + " argument case")
+    let command = ["run"]
+    if candidate.arguments.length > 0 {
+        command.add("--")
+        for argument in candidate.arguments { command.add(argument) }
+    }
+    if candidate.name == "empty" {
+        test.check(command.length == 3 && command[2] == "", "public empty argument must remain one literal argv element")
+    }
+    let greeted = invoke(walkthrough, command)
+    test.check(greeted.output == greetingsPrefix + candidate.output,
+        "public " + candidate.name + " arguments have exact greeting output\n" + greeted.output)
+    test.check(io.readTextFile(greetingsSource) == greetingsProgram,
+        "public " + candidate.name + " argument run changed the chapter source")
+}
+invoke(walkthrough, ["build", "--release"])
+let greetingsExecutable = walkthrough.directory + "/target/release/" + greetingsName
+test.check(files.pathSize(greetingsExecutable) > 0, "the greetings release executable exists")
+for candidate in greetingCases {
+    test.check(io.readTextFile(greetingsSource) == greetingsProgram,
+        "greetings source changed before release " + candidate.name + " argument case")
+    let command = [greetingsExecutable]
+    for argument in candidate.arguments { command.add(argument) }
+    if candidate.name == "empty" {
+        test.check(command.length == 2 && command[1] == "", "release empty argument must remain one literal argv element")
+    }
+    let greeted = test.run(command, environment(), walkthrough.directory, work + "/greetings-release-" + candidate.name, 10)
+    test.require(greeted, "greetings release " + candidate.name + " arguments")
+    test.check(greeted.output == candidate.output && greeted.errorOutput == "",
+        "release " + candidate.name + " arguments have exact greeting output\n" + greeted.output + greeted.errorOutput)
+    test.check(io.readTextFile(greetingsSource) == greetingsProgram,
+        "release " + candidate.name + " argument run changed the chapter source")
+}
+
+test.removeScratch(work)
+print("Book walkthroughs passed: gardens, modules, compiler repairs and explanations, saved notes, program arguments and release executables")

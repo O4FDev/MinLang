@@ -1,0 +1,262 @@
+// Sequence recipes retain their source and name concrete transform functions.
+// Traversal is lowered by the ordinary compiler without intermediate Lists.
+function sequenceNamedArgumentAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    if position >= 3 && texts[position - 1] == "(" && texts[position - 3] == "." && (texts[position - 2] == "map" || texts[position - 2] == "filter") { return true }
+    if position < 1 || texts[position - 1] != "," { return false }
+    let cursor = position - 2
+    let depth = 0
+    while cursor >= 0 {
+        if kinds[cursor] == 4 {
+            let token = texts[cursor]
+            if token == ")" || token == "]" || token == "}" { depth = depth + 1 }
+            if token == "(" || token == "[" || token == "{" {
+                if depth == 0 { return token == "(" && cursor >= 2 && texts[cursor - 1] == "fold" && texts[cursor - 2] == "." }
+                depth = depth - 1
+            }
+        }
+        cursor = cursor - 1
+    }
+    return false
+}
+
+function genericSequenceRecipe(name: Text): Integer {
+    if resultPrefix(name, "minyar_sequence_map_") { return 1 }
+    if resultPrefix(name, "minyar_sequence_filter_") { return 2 }
+    return 0
+}
+
+function genericSequenceElementAt(program: GenericProgram, type: Integer, depth: Integer): Integer {
+    if type == 0 { return 0 }
+    if depth > 64 { failCompiler("sequence nesting exceeds 64") }
+    let shape = program.types[type]
+    if shape.name == "Text" { return genericNamedType(program, "Character") }
+    if shape.name == "Bytes" { return genericNamedType(program, "Integer") }
+    if (shape.name == "List" || shape.name == "Set" || shape.name == "Map") && shape.arguments.length > 0 { return shape.arguments[0] }
+    let recipe = genericSequenceRecipe(shape.name)
+    if recipe != 0 {
+        let record = genericDeclaration(program, shape.name, 2)
+        if record < 0 { return 0 }
+        let source = program.declarations[record]
+        if source.types.length != 1 || source.names.length != 1 { return 0 }
+        let prefix = "minyar_sequence_map|"
+        if recipe == 2 { prefix = "minyar_sequence_filter|" }
+        let marker = source.names[0]
+        if !resultPrefix(marker, prefix) { return 0 }
+        let target = genericDeclaration(program, marker.slice(prefix.length, marker.length), 1)
+        if target < 0 { return 0 }
+        if recipe == 1 { return program.declarations[target].result }
+        return genericSequenceElementAt(program, source.types[0], depth + 1)
+    }
+    return genericIterationElement(program, type)
+}
+
+function genericSequenceElement(program: GenericProgram, type: Integer): Integer {
+    return genericSequenceElementAt(program, type, 0)
+}
+
+function genericSequenceUserMethod(program: GenericProgram, receiver: Integer, member: Text): Boolean {
+    let shape = program.types[receiver]
+    let record = genericDeclaration(program, shape.name, 2)
+    if record < 0 { return false }
+    if findText(program.declarations[record].names, member) >= 0 { return true }
+    let name = shape.name
+    if shape.arguments.length > 0 { name = genericEmitType(program, program.source, program.declarations[record].start, receiver, 0) }
+    return genericDeclaration(program, methodFunctionName(name, member), 1) >= 0 || genericDeclaration(program, methodFunctionName(name, member + "$private"), 1) >= 0
+}
+
+function genericSequenceNamedFunction(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, member: Text): Integer {
+    let position = cursor[0]
+    let name = stream.texts[position]
+    let message = "sequence " + member + " needs a named function; closures and callback values are not supported yet"
+    if stream.kinds[position] != 1 || name == "function" { genericError(stream, position, message) }
+    let local = scope.active
+    while local > 0 {
+        local = local - 1
+        if scope.names[local] == name { genericError(stream, position, message + "; '" + readableDeclarationName(name) + "' is a local value") }
+    }
+    if genericScopeType(program, scope, name) > 0 { genericError(stream, position, message) }
+    let target = genericDeclaration(program, name, 1)
+    if target < 0 {
+        let declaration = 0
+        while declaration < program.declarations.length {
+            let candidate = program.declarations[declaration]
+            if candidate.kind == 1 && !resultPrefix(candidate.name, "minyar_generic_function_") && readableDeclarationName(candidate.name) == name {
+                if tokenPath(program.source.lines, candidate.start) == tokenPath(stream.lines, position) { target = declaration }
+            }
+            declaration = declaration + 1
+        }
+    }
+    if target < 0 { genericError(stream, position, "sequence " + member + " cannot find named function '" + readableDeclarationName(name) + "'") }
+    cursor[0] = cursor[0] + 1
+    if !tokenIs(stream.kinds, stream.texts, cursor, ")") { genericError(stream, cursor[0], message) }
+    return target
+}
+
+function genericSequenceCompatible(program: GenericProgram, actual: Integer, expected: Integer, depth: Integer): Boolean {
+    if actual == 0 || actual == expected { return true }
+    if depth >= 64 { return false }
+    let left = program.types[actual]
+    let right = program.types[expected]
+    if left.name != right.name || left.arguments.length != right.arguments.length { return false }
+    let child = 0
+    while child < left.arguments.length {
+        if !genericSequenceCompatible(program, left.arguments[child], right.arguments[child], depth + 1) { return false }
+        child = child + 1
+    }
+    return true
+}
+
+function genericSequenceDeclaration(program: GenericProgram, name: Text, kind: Integer, names: List<Text>, types: List<Integer>, result: Integer, position: Integer) {
+    let declaration = GenericDeclaration { name: name; kind: kind; start: position; parametersStart: 0; body: 0; end: 0; variables: []; constraints: []; names: names; types: types; result: result }
+    genericIndexPut(program.declarationIndex, Text(kind) + ":" + name, program.declarations.length)
+    program.declarations.add(declaration)
+}
+
+function genericSequenceStream(program: GenericProgram, stream: GenericStream, position: Integer, source: Text, nameMarkers: List<Text>, names: List<Text>, typeMarkers: List<Text>, types: List<Integer>): GenericStream {
+    let rawKinds: List<Integer> = []
+    let rawTexts: List<Text> = []
+    let rawLines = newSourceMap()
+    tokenize(source, rawKinds, rawTexts, rawLines)
+    let kinds: List<Integer> = []
+    let texts: List<Text> = []
+    let lines = newSourceMap()
+    lines.inputPath = stream.lines.inputPath
+    lines.features = stream.lines.features
+    let origin = sourcePath(lines, tokenPath(stream.lines, position))
+    let token = 0
+    while token < rawKinds.length {
+        let name = -1
+        let type = -1
+        if rawKinds[token] == 1 {
+            name = findText(nameMarkers, rawTexts[token])
+            type = findText(typeMarkers, rawTexts[token])
+        }
+        if type >= 0 {
+            appendResultMethodType(program, stream, position, types[type], kinds, texts, lines, 0)
+        } else {
+            let spelling = rawTexts[token]
+            if name >= 0 { spelling = names[name] }
+            copyModuleToken(kinds, texts, lines, rawKinds[token], spelling, stream.lines, position, origin)
+        }
+        token = token + 1
+    }
+    return newGenericStream(kinds, texts, lines)
+}
+
+// Specialize named transforms through the ordinary monomorphization worklist.
+// A signature descriptor makes stored recipe element types available before
+// that worklist emits the original function body.
+function genericSequenceSpecialize(program: GenericProgram, stream: GenericStream, position: Integer, target: Integer, member: Text, item: Integer, initial: Integer): Integer {
+    let template = program.declarations[target]
+    if template.variables.length == 0 { return target }
+    let bindings = genericBindings(template)
+    if member == "fold" {
+        if template.types.length != 2 { genericError(stream, position, "sequence fold function must take an accumulator and an item") }
+        genericUnify(program, stream, position, template.types[1], item, template.variables, bindings, 0)
+        genericUnify(program, stream, position, template.types[0], initial, template.variables, bindings, 0)
+    } else {
+        if template.types.length != 1 { genericError(stream, position, "sequence " + member + " function must take one " + program.types[item].spelling + " argument") }
+        genericUnify(program, stream, position, template.types[0], item, template.variables, bindings, 0)
+    }
+    let variable = 0
+    while variable < bindings.length {
+        if !genericConcreteType(program, bindings[variable]) { genericError(stream, position, "I can't infer type argument '" + template.variables[variable] + "' for '" + readableDeclarationName(template.name) + "'; wrap this transform in a concrete named function") }
+        variable = variable + 1
+    }
+    let name = genericInstantiate(program, stream, position, target, bindings)
+    let existing = genericDeclaration(program, name, 1)
+    if existing >= 0 { return existing }
+    let types: List<Integer> = []
+    let parameter = 0
+    while parameter < template.types.length {
+        types.add(genericSubstitute(program, template.types[parameter], template.variables, bindings, 0))
+        parameter = parameter + 1
+    }
+    let result = genericSubstitute(program, template.result, template.variables, bindings, 0)
+    let descriptor = program.declarations.length
+    genericSequenceDeclaration(program, name, 1, template.names, types, result, position)
+    return descriptor
+}
+
+function genericSequenceMethod(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, receiver: Integer, start: Integer, expected: Integer, depth: Integer): Integer {
+    if receiver == 0 || !tokenIs(stream.kinds, stream.texts, cursor, ".") { return -1 }
+    let dot = cursor[0]
+    let member = stream.texts[dot + 1]
+    if (member != "map" && member != "filter" && member != "fold") || stream.texts[dot + 2] != "(" { return -1 }
+    if genericSequenceUserMethod(program, receiver, member) { return -1 }
+    let item = genericSequenceElement(program, receiver)
+    if item == 0 { return -1 }
+    if !genericConcreteType(program, receiver) || !genericConcreteType(program, item) { genericError(stream, dot + 1, "sequence " + member + " needs a complete source type; annotate the source") }
+    cursor[0] = dot + 3
+    let initial = 0
+    let initialPosition = cursor[0]
+    let separator = -1
+    if member == "fold" {
+        initial = genericExpression(program, stream, cursor, scope, 0, 0, depth + 1)
+        separator = cursor[0]
+        expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",")
+    }
+    let target = genericSequenceNamedFunction(program, stream, cursor, scope, member)
+    target = genericSequenceSpecialize(program, stream, dot + 1, target, member, item, initial)
+    let signature = program.declarations[target]
+    let result = signature.result
+    if member == "fold" {
+        if signature.types.length != 2 { genericError(stream, dot + 1, "sequence fold function must take an accumulator and an item") }
+        let accumulator = signature.types[0]
+        if signature.types[1] != item || result != accumulator || program.types[accumulator].name == "Nothing" {
+            genericError(stream, dot + 1, "sequence fold function must take (Accumulator, " + program.types[item].spelling + ") and return the same Accumulator type")
+        }
+        if !genericSequenceCompatible(program, initial, accumulator, 0) { genericError(stream, initialPosition, "sequence fold initial value must have type " + program.types[accumulator].spelling) }
+        result = accumulator
+    } else {
+        if signature.types.length != 1 || signature.types[0] != item { genericError(stream, dot + 1, "sequence " + member + " function must take one " + program.types[item].spelling + " argument") }
+        if member == "filter" && program.types[result].name != "Boolean" { genericError(stream, dot + 1, "sequence filter function must return Boolean") }
+        if member == "map" && program.types[result].name == "Nothing" { genericError(stream, dot + 1, "sequence map function must return an item, not Nothing") }
+    }
+    let closing = cursor[0]
+    expectToken(stream.kinds, stream.texts, stream.lines, cursor, ")")
+    let key = "sequence:" + member + ":" + Text(receiver) + ":" + Text(target)
+    let helper = genericIndexGet(program.methodIndex, key)
+    let prefix = "minyar_sequence_" + member + "_"
+    if helper < 0 {
+        helper = program.methodStreams.length
+        let candidate = prefix + Text(helper)
+        while genericDeclaration(program, candidate, 2) >= 0 || genericDeclaration(program, candidate, 1) >= 0 || genericDeclaration(program, candidate + "_make", 1) >= 0 {
+            helper = helper + 1
+            candidate = prefix + Text(helper)
+        }
+        genericIndexPut(program.methodIndex, key, helper)
+        let name = prefix + Text(helper)
+        let generated = ""
+        let nameMarkers: List<Text> = ["SequenceName", "SequenceTarget"]
+        let names: List<Text> = [name, signature.name]
+        let typeMarkers: List<Text> = ["SequenceSource", "SequenceOutput"]
+        let types: List<Integer> = [receiver, result]
+        if member == "fold" {
+            generated = "function SequenceName(source: SequenceSource, initial: SequenceOutput): SequenceOutput { let total = initial; for item in source { total = SequenceTarget(total, item) }; return total }\n"
+            genericSequenceDeclaration(program, name, 1, ["source", "initial"], [receiver, result], result, dot)
+        } else {
+            let recipe = genericNamedType(program, name)
+            let marker = "minyar_sequence_" + member + "|" + signature.name
+            generated = "record SequenceName { SequenceField: SequenceSource }\nfunction SequenceMake(source: SequenceSource): SequenceName { return SequenceName { SequenceField: source } }\n"
+            nameMarkers.add("SequenceMake"); names.add(name + "_make")
+            nameMarkers.add("SequenceField"); names.add(marker)
+            genericSequenceDeclaration(program, name, 2, [marker], [receiver], genericNamedType(program, "Nothing"), dot)
+            genericSequenceDeclaration(program, name + "_make", 1, ["source"], [receiver], recipe, dot)
+        }
+        program.methodStreams.add(genericSequenceStream(program, stream, dot, generated, nameMarkers, names, typeMarkers, types))
+    }
+    let name = prefix + Text(helper)
+    if member == "fold" {
+        stream.prefixes[start] = name + "(" + stream.prefixes[start]
+        stream.replacements[dot] = ","
+        stream.ends[dot] = dot + 3
+        stream.replacements[separator] = ""
+        stream.ends[separator] = closing
+        return result
+    }
+    stream.prefixes[start] = name + "_make(" + stream.prefixes[start]
+    stream.replacements[dot] = ""
+    stream.ends[dot] = closing
+    return genericNamedType(program, name)
+}

@@ -1,0 +1,142 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "json" as json
+
+function occurrences(text: Text, needle: Text): Integer {
+    let count = 0
+    let offset = text.find(needle)
+    while offset >= 0 {
+        count += 1
+        text = text.slice(offset + needle.length, text.length)
+        offset = text.find(needle)
+    }
+    return count
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let named = "capability Named { function name(): Text; function greeting(): Text { return \"Hello, \" + self.name() } }\n"
+let person = "record Person { name: Text }\nfunction Person.name(): Text { return self.name }\n"
+let greet = "function greet<Item: Named>(value: Item): Text { return value.greeting() }\n"
+
+// A declaration supplies defaults; each concrete type opts in explicitly.
+fixtures.executes(frontend, named + person + "conform Person to Named\n" + greet + "let ada = Person { name: \"Ada\" }\nprint(ada.name())\nprint(ada.greeting())\nprint(greet(ada))\nprint(greet<Person>(Person { name: \"Grace\" }))\n", "Ada\nHello, Ada\nHello, Ada\nHello, Grace\n", levels, 0, "", true)
+
+// A default has an ordinary concrete receiver and a direct function call.
+fixtures.executes(frontend, "capability Answer { function answer(): Integer { return 42 } }\nrecord Token { value: Integer }\nconform Token to Answer\nfunction answer<Item: Answer>(value: Item): Integer { return value.answer() }\nprint(answer(Token { value: 1 }))\nprint(answer<Token>(Token { value: 2 }))\n", "42\n42\n", levels, 0, "", true)
+let directLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+let defaultSymbol = ""
+for line in test.lines(directLLVM) {
+    if test.contains(line, "define i64 @") && test.contains(line, "Token$answer") {
+        defaultSymbol = line.slice(line.find("@"), line.find("("))
+    }
+}
+test.check(defaultSymbol != "", "a capability default has an ordinary Integer-returning function")
+test.check(test.contains(directLLVM, "call i64 " + defaultSymbol + "(ptr "), "a capability default is called directly with its concrete receiver")
+test.check(!test.contains(directLLVM, "call i64 %"), "capability calls need no indirect Integer-returning dispatch")
+test.check(occurrences(directLLVM, "define i64 @.minyar.fn.minyar_generic_function_") == 1, "inferred and explicit capability calls share one concrete specialization")
+
+// An implementation wins over the default, independent of declaration order.
+fixtures.executes(frontend, named + person + "conform Person to Named\nfunction Person.greeting(): Text { return \"Welcome, \" + self.name() }\n" + greet + "print(greet(Person { name: \"Ada\" }))\nprint(Person { name: \"Grace\" }.greeting())\n", "Welcome, Ada\nWelcome, Grace\n", levels, 0, "", true)
+
+// A record resolves competing defaults by supplying its own method.
+let competing = "capability First { function label(): Text { return \"sea\" } }\ncapability Second { function label(): Text { return \"sky\" } }\nrecord Place { name: Text }\n"
+let competingOrders = ["conform Place to First\nconform Place to Second\n", "conform Place to Second\nconform Place to First\n"]
+for order in competingOrders {
+    fixtures.executes(frontend, competing + order + "function Place.label(): Text { return self.name }\nfunction first<Item: First>(value: Item): Text { return value.label() }\nfunction second<Item: Second>(value: Item): Text { return value.label() }\nlet place = Place { name: \"shore\" }\nprint(first(place))\nprint(second(place))\n", "shore\nshore\n", levels, 0, "", true)
+}
+
+// One capability's default can satisfy another's requirement in either order.
+let supplied = "capability Required { function label(): Text }\ncapability Provided { function label(): Text { return \"sea\" } }\nrecord Place { name: Text }\nfunction label<Item: Required>(value: Item): Text { return value.label() }\n"
+for order in ["conform Place to Required\nconform Place to Provided\n", "conform Place to Provided\nconform Place to Required\n"] {
+    fixtures.executes(frontend, supplied + order + "let place = Place { name: \"shore\" }\nprint(place.label())\nprint(label(place))\n", "sea\nsea\n", levels, 0, "", true)
+}
+
+// Default methods can call later defaults and a required concrete method.
+fixtures.executes(frontend, "capability Described { function description(): Text { return self.prefix() + self.name() }; function prefix(): Text { return \"a little \" }; function name(): Text }\nrecord Garden { flower: Text }\nfunction Garden.name(): Text { return self.flower }\nconform Garden to Described\nfunction describe<Item: Described>(value: Item): Text { return value.description() }\nprint(describe(Garden { flower: \"garden\" }))\n", "a little garden\n", levels, 0, "", true)
+
+// Self means the concrete receiver type in parameters, results and defaults.
+fixtures.executes(frontend, "capability Returning { function choose(other: Self): Self; function again(): Self { return self.choose(self) } }\nrecord Note { text: Text }\nfunction Note.choose(candidate: Note): Note { return candidate }\nconform Note to Returning\nfunction again<Item: Returning>(value: Item): Item { return value.again() }\nlet first = Note { text: \"sea\" }\nlet second = first.choose(Note { text: \"sky\" })\nprint(second.text)\nlet alias = again(first)\nalias.text = \"shore\"\nprint(first.text)\nprint(first.again().text)\n", "sky\nshore\nshore\n", levels, 0, "", true)
+
+// Self is substituted in type positions, and remains an ordinary value name.
+fixtures.executes(frontend, "capability Passing { function pass(Self: Integer): Integer { return Self } }\nrecord Token { value: Integer }\nconform Token to Passing\nprint(Token { value: 1 }.pass(42))\n", "42\n", levels, 0, "", true)
+
+// A concrete generic receiver keeps its field shape through inferred locals.
+fixtures.executes(frontend, "capability Valued { function value(): Integer { let x = self.value; let y = identity(x); return y } }\nrecord Box<Item> { value: Item }\ntype IntBox = Box<Integer>\nfunction identity<Item>(value: Item): Item { return value }\nconform IntBox to Valued\nfunction read<Item: Valued>(value: Item): Integer { return value.value() }\nprint(IntBox { value: 42 }.value())\nprint(read(IntBox { value: 7 }))\n", "42\n7\n", levels, 0, "", true)
+
+// A type can satisfy separate capabilities and generic record constraints.
+fixtures.executes(frontend, named + person + "capability Counted { function count(): Integer }\nfunction Person.count(): Integer { return 1 }\nconform Person to Named\nconform Person to Counted\nrecord Labelled<Item: Named> { value: Item }\nfunction count<Item: Counted>(value: Item): Integer { return value.count() }\nlet label = Labelled { value: Person { name: \"Ada\" } }\nprint(label.value.greeting())\nprint(count(label.value))\n", "Hello, Ada\n1\n", levels, 0, "", true)
+
+// Transparent aliases retain the original record's conformance.
+fixtures.executes(frontend, named + person + "type Visitor = Person\nconform Visitor to Named\n" + greet + "let visitor: Visitor = Visitor { name: \"Grace\" }\nprint(greet<Person>(visitor))\nprint(greet<Visitor>(Person { name: \"Ada\" }))\n", "Hello, Grace\nHello, Ada\n", levels, 0, "", true)
+
+// Constrained aliases see conformance declarations on either side of the alias.
+fixtures.executes(frontend, named + person + "record Box<Item: Named> { value: Item }\ntype Arrival = Box<Person>\nconform Person to Named\ntype Guest = Box<Person>\nlet arrival: Arrival = Arrival { value: Person { name: \"Ada\" } }\nlet guest: Guest = Guest { value: Person { name: \"Grace\" } }\nprint(arrival.value.greeting())\nprint(guest.value.greeting())\n", "Hello, Ada\nHello, Grace\n", levels, 0, "", true)
+
+// Contextual words remain ordinary local, field, parameter and function names.
+fixtures.executes(frontend, "record Words { capability: Text; conform: Text; to: Text }\nfunction read(words: Words): Text { let capability = words.capability; let conform = words.conform; let to = words.to; return capability + conform + to }\nprint(read(Words { capability: \"a \"; conform: \"quiet \"; to: \"shore\" }))\nfunction capability(value: Integer): Integer { return value + 1 }\nfunction conform(to: Integer): Integer { return capability(to) + 1 }\nfunction to(value: Integer): Integer { return conform(value) }\nprint(to(40))\n", "a quiet shore\n42\n", levels, 0, "", true)
+
+io.writeTextFile(frontend.compiler.directory + "/numbers.min", "public constant answer = 1\n")
+fixtures.executes(frontend, "use \"./numbers.min\" as numbers\nlet to = 41\nprint(to + numbers.answer)\nrecord Words { conform: Integer }\nlet words = Words { conform: 41 }\nprint(words.conform + numbers.answer)\nlet conform = words.conform\nprint(conform + numbers.answer)\n", "42\n42\n42\n", levels, 0, "", true)
+
+io.writeTextFile(frontend.compiler.directory + "/named.min", "public capability Named { function name(): Text; function greeting(): Text { return \"Hello, \" + self.name() } }\ncapability Hidden { function secret(): Text }\npublic record Person { name: Text }\npublic function Person.name(): Text { return self.name }\nconform Person to Named\npublic function open(name: Text): Person { return Person { name: name } }\npublic function greet<Item: Named>(value: Item): Text { return value.greeting() }\n")
+fixtures.executes(frontend, "use \"./named.min\" as shared\nfunction greet<Item: shared.Named>(value: Item): Text { return value.greeting() }\nlet ada = shared.open(\"Ada\")\nprint(ada.greeting())\nprint(greet(ada))\nprint(shared.greet(ada))\nrecord Visitor { name: Text }\npublic function Visitor.name(): Text { return self.name }\nconform Visitor to shared.Named\nprint(greet(Visitor { name: \"Grace\" }))\n", "Hello, Ada\nHello, Ada\nHello, Ada\nHello, Grace\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/capabilities.min"), "At the edge of the evening\nThere is a place for the traveller.\nThe lantern is lit for the last boat.\n", levels, 0, "", true)
+
+// Documentation keeps public capability and method spelling before lowering.
+let docPath = frontend.compiler.directory + "/capability-docs.min"
+io.writeTextFile(docPath, "/// A shared voice.\npublic capability Named {\n    /// The name to remember.\n    function name(): Text\n    /// A greeting to carry home.\n    function greeting(prefix: Text): Text {\n        return prefix + self.name()\n    }\n}\n/// A private voice.\ncapability Hidden { function secret(): Text }\n")
+let documented = test.run([frontend.compiler.executable, docPath, docPath + ".json", "--doc-json"], frontend.environment, "", docPath + ".document", frontend.compiler.compileTimeout)
+test.require(documented, "document a public capability")
+test.check(documented.output == "" && documented.errorOutput == "", "capability documentation has no unexpected output")
+let documentation = json.parseUnique(io.readTextFile(docPath + ".json"))
+test.check(documentation.kind == json.OBJECT && documentation.member("version").number == 1.0, "versioned capability documentation JSON")
+let declarations = documentation.member("declarations").items
+test.check(declarations.length == 1, "documentation includes the public capability and excludes the private one")
+test.check(json.string(declarations[0], "name") == "Named" && json.string(declarations[0], "kind") == "capability", "capability documentation name and kind")
+test.check(json.string(declarations[0], "signature") == "public capability Named" && json.string(declarations[0], "documentation") == "A shared voice.", "capability signature and documentation")
+let members = declarations[0].member("members").items
+test.check(members.length == 2, "required and default capability methods appear in documentation")
+test.check(json.string(members[0], "name") == "name" && json.string(members[0], "signature") == "function name(): Text" && json.string(members[0], "documentation") == "The name to remember.", "required method signature and documentation")
+test.check(json.string(members[1], "name") == "greeting" && json.string(members[1], "signature") == "function greeting(prefix: Text): Text" && json.string(members[1], "documentation") == "A greeting to carry home.", "default method signature and documentation")
+test.check(members[0].member("span").member("line").number == 4.0 && members[1].member("span").member("line").number == 6.0, "capability method documentation keeps source lines")
+
+// Matching method names alone do not silently opt a type into a capability.
+for order in competingOrders { fixtures.rejects(frontend, competing + order, "conflicting defaults", true) }
+fixtures.rejects(frontend, named + person + greet + "print(greet(Person { name: \"Ada\" }))\n", "does not satisfy Named", true)
+for value in ["42", "1.25", "\"Ada\"", "true", "'a'"] {
+    fixtures.rejects(frontend, named + "function keep<Item: Named>(value: Item): Item { return value }\nlet value = keep(" + value + ")\n", "does not satisfy Named", true)
+}
+fixtures.rejects(frontend, named + "record Person { name: Text }\nconform Person to Named\n", "missing method 'name'", true)
+fixtures.rejects(frontend, named + "record Person { name: Text }\nfunction Person.name(): Integer { return 42 }\nconform Person to Named\n", "wrong type", true)
+fixtures.rejects(frontend, "capability Named { function name(prefix: Text): Text }\nrecord Person { name: Text }\nfunction Person.name(prefix: Integer): Text { return self.name }\nconform Person to Named\n", "wrong type", true)
+fixtures.rejects(frontend, "capability Named { function name(prefix: Text): Text }\nrecord Person { name: Text }\nfunction Person.name(): Text { return self.name }\nconform Person to Named\n", "wrong type", true)
+fixtures.rejects(frontend, "capability Returning { function choose(other: Self): Self }\nrecord First { value: Integer }\nrecord Second { value: Integer }\nfunction First.choose(other: Second): First { return self }\nconform First to Returning\n", "wrong type", true)
+fixtures.rejects(frontend, "capability Returning { function again(): Self }\nrecord First { value: Integer }\nrecord Second { value: Integer }\nfunction First.again(): Second { return Second { value: self.value } }\nconform First to Returning\n", "wrong type", true)
+fixtures.rejects(frontend, "record Person { name: Text }\nconform Person to Missing\n", "unknown capability 'Missing'", true)
+fixtures.rejects(frontend, "function keep<Item: Missing>(value: Item): Item { return value }\n", "unknown capability 'Missing'", true)
+fixtures.rejects(frontend, named + person + "conform Person to Named\nconform Person to Named\n", "more than once", true)
+fixtures.rejects(frontend, named + person + "type Visitor = Person\nconform Person to Named\nconform Visitor to Named\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text }\ncapability Named { function label(): Text }\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text; function name(): Text }\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text { return \"sea\" }; function name(): Text { return \"sky\" } }\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text }\nrecord Named { value: Text }\n", "more than once", true)
+fixtures.rejects(frontend, "record Named { value: Text }\ncapability Named { function name(): Text }\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text }\ntype Named = Integer\n", "more than once", true)
+fixtures.rejects(frontend, "type Named = Integer\ncapability Named { function name(): Text }\n", "more than once", true)
+fixtures.rejects(frontend, "capability Named { function name(): Text }\nchoice Named { Value }\n", "more than once", true)
+fixtures.rejects(frontend, "choice Named { Value }\ncapability Named { function name(): Text }\n", "more than once", true)
+fixtures.rejects(frontend, named + person + "record Labelled<Item: Named> { value: Item }\nlet value = Labelled { value: Person { name: \"Ada\" } }\n", "does not satisfy Named", true)
+fixtures.rejects(frontend, named + "record Box<Item: Named> { value: Item }\ntype Count = Box<Integer>\nlet count: Count = Count { value: 42 }\n", "does not satisfy Named", true)
+fixtures.rejects(frontend, "use \"./named.min\" as shared\nfunction keep<Item: shared.Hidden>(value: Item): Item { return value }\n", "is private to its module", true)
+fixtures.rejects(frontend, "use \"./named.min\" as shared\nrecord Visitor { name: Text }\nfunction Visitor.name(): Text { return self.name }\nconform Visitor to shared.Named\n", "must be public", true)
+
+// Defaults compose with returned closures, concrete Self collections and Result methods.
+fixtures.executes(frontend, "capability Readable { function name(): Text; function reader(): () -> Text { return function(): Text { return self.name() } } }\nrecord Note { text: Text }\nfunction Note.name(): Text { return self.text }\nconform Note to Readable\nfunction open(): () -> Text { return Note { text: \"the shore\" }.reader() }\nlet read = open()\nprint(read())\n", "the shore\n", levels, 0, "", true)
+fixtures.executes(frontend, "capability Shared { function repeated(): List<Self> { return [self, self] } }\nrecord Note { text: Text }\nconform Note to Shared\nfunction repeat<Item: Shared>(item: Item): List<Item> { return item.repeated() }\nlet notes = repeat(Note { text: \"sea\" })\nnotes[0].text = \"shore\"\nprint(notes[1].text)\n", "shore\n", levels, 0, "", true)
+fixtures.executes(frontend, "capability Reading { function read(): Result<Integer, Text>; function doubled(): Result<Integer, Text> { return self.read().map(function(value: Integer): Integer { return value * 2 }) } }\nrecord Gauge { value: Integer }\nfunction Gauge.read(): Result<Integer, Text> { if self.value < 0 { return Err(\"no reading\") }; return Ok(self.value) }\nconform Gauge to Reading\nlet good = Gauge { value: 21 }.doubled()\nlet missing = Gauge { value: -1 }.doubled()\nmatch good { Ok(value) { print(value) }; Err(error) { print(error) } }\nmatch missing { Ok(value) { print(value) }; Err(error) { print(error) } }\n", "42\nno reading\n", levels, 0, "", true)
+
+test.removeTree(frontend.compiler.directory)
+print("User capabilities: passed")

@@ -1,0 +1,315 @@
+// Direct O0/O2 probe: link with utf8-validation-oracle.c and the usual runtime.
+use "text" as text
+use "errors" as errors
+
+function reference(source: Bytes): Boolean { native "utf8oracle" }
+function scalarValue(source: Bytes): Integer { native "utf8oracle" }
+
+record Counts { name: Text; cases: Integer; valid: Integer; bytes: Integer; decoded: Integer; checksum: Integer }
+record Vector { values: List<Integer>; valid: Boolean }
+record Generator { state: Integer }
+
+function counts(name: Text): Counts {
+    return Counts { name: name; cases: 0; valid: 0; bytes: 0; decoded: 0; checksum: 1 }
+}
+function stop(totals: Counts, source: Bytes, reason: Text) {
+    print("UTF-8 " + totals.name + " case " + Text(totals.cases) + ": " + reason + "; length=" + Text(source.length))
+    let values: List<Text> = []
+    for index in 0..min(source.length, 32) {
+        if index > 0 { values.add(",") }
+        values.add(Text(source[index]))
+    }
+    print(joinText(values))
+    exit(1)
+}
+function probe(totals: Counts, source: Bytes, snapshot: Bytes, wanted: Integer, decode: Boolean) {
+    let length = source.length
+    if length > snapshot.length { stop(totals, source, "shared preservation snapshot is too small") }
+    for index in 0..length { snapshot[index] = source[index] }
+    let alias = source
+    let actual = text.validUTF8(source)
+    let expected = reference(source)
+    if actual != expected { stop(totals, source, "validator disagrees with independent scalar oracle") }
+    if wanted >= 0 && actual != (wanted == 1) { stop(totals, source, "validator disagrees with explicit expected validity") }
+    if decode {
+        match text.decode(source) {
+            Ok(decoded) {
+                if !actual { stop(totals, source, "decode accepted invalid bytes") }
+                let raw = Bytes(decoded)
+                if raw.length != length { stop(totals, source, "decode changed the valid byte length") }
+                for index in 0..length {
+                    if raw[index] != snapshot[index] { stop(totals, source, "decode changed valid bytes") }
+                }
+            }
+            Err(error) {
+                if actual { stop(totals, source, "decode rejected valid bytes") }
+                if errors.code(error) != errors.invalidDataCode() { stop(totals, source, "decode did not return invalidData") }
+            }
+        }
+        totals.decoded += 1
+    }
+    if source.length != length || alias.length != length { stop(totals, source, "input or alias length changed") }
+    totals.checksum = (totals.checksum * 257 + length + 1) & 0x7fffffff
+    for index in 0..length {
+        if source[index] != snapshot[index] || alias[index] != snapshot[index] { stop(totals, source, "input or alias bytes changed") }
+        totals.checksum = (totals.checksum * 257 + source[index] + 1) & 0x7fffffff
+    }
+    totals.checksum = (totals.checksum * 3) & 0x7fffffff
+    if actual { totals.valid += 1; totals.checksum += 1 }
+    totals.cases += 1
+    totals.bytes += length
+}
+function finish(totals: Counts, cases: Integer, valid: Integer) {
+    if totals.cases != cases || (valid >= 0 && totals.valid != valid) {
+        stop(totals, Bytes(), "coverage count changed")
+    }
+    print("utf8-validation " + totals.name + " cases=" + Text(totals.cases) + " valid=" + Text(totals.valid) +
+        " bytes=" + Text(totals.bytes) + " decoded=" + Text(totals.decoded) + " checksum=" + Text(totals.checksum))
+}
+
+function exhaustive(totals: Counts, snapshot: Bytes) {
+    probe(totals, Bytes(0), snapshot, 1, false)
+    let one = Bytes(1)
+    let two = Bytes(2)
+    for first in 0..256 {
+        one[0] = first
+        probe(totals, one, snapshot, -1, false)
+        two[0] = first
+        for second in 0..256 {
+            two[1] = second
+            probe(totals, two, snapshot, -1, false)
+        }
+    }
+    // 1 empty + 128 ASCII + 128^2 ASCII pairs + 30*64 two-byte scalars.
+    finish(totals, 65793, 18433)
+}
+
+function scalarWidth(scalar: Integer): Integer {
+    if scalar < 0x80 { return 1 }
+    if scalar < 0x800 { return 2 }
+    if scalar < 0x10000 { return 3 }
+    return 4
+}
+function writeScalar(target: Bytes, offset: Integer, scalar: Integer): Integer {
+    let width = scalarWidth(scalar)
+    if width == 1 { target[offset] = scalar }
+    if width == 2 {
+        target[offset] = 0xc0 | (scalar >> 6)
+        target[offset + 1] = 0x80 | (scalar & 63)
+    }
+    if width == 3 {
+        target[offset] = 0xe0 | (scalar >> 12)
+        target[offset + 1] = 0x80 | ((scalar >> 6) & 63)
+        target[offset + 2] = 0x80 | (scalar & 63)
+    }
+    if width == 4 {
+        target[offset] = 0xf0 | (scalar >> 18)
+        target[offset + 1] = 0x80 | ((scalar >> 12) & 63)
+        target[offset + 2] = 0x80 | ((scalar >> 6) & 63)
+        target[offset + 3] = 0x80 | (scalar & 63)
+    }
+    return width
+}
+function everyScalar(totals: Counts, snapshot: Bytes) {
+    let one = Bytes(1)
+    let two = Bytes(2)
+    let three = Bytes(3)
+    let four = Bytes(4)
+    for scalar in 0..0x110000 {
+        if scalar >= 0xd800 && scalar <= 0xdfff { continue }
+        let raw = one
+        let width = scalarWidth(scalar)
+        if width == 2 { raw = two }
+        if width == 3 { raw = three }
+        if width == 4 { raw = four }
+        writeScalar(raw, 0, scalar)
+        let alias = raw
+        probe(totals, raw, snapshot, 1, false)
+        if scalarValue(raw) != scalar { stop(totals, raw, "manual encoding represents a different scalar") }
+        if raw.length != width || alias.length != width { stop(totals, raw, "scalar oracle changed input or alias length") }
+        for index in 0..width {
+            if raw[index] != snapshot[index] || alias[index] != snapshot[index] { stop(totals, raw, "scalar oracle changed input or alias bytes") }
+        }
+    }
+    finish(totals, 1112064, 1112064)
+}
+
+function ascii(source: Bytes, salt: Integer) {
+    for index in 0..source.length { source[index] = (index * 17 + salt) & 127 }
+}
+function boundaries(totals: Counts, snapshot: Bytes) {
+    let lengths: List<Integer> = []
+    for length in 0..34 { lengths.add(length) }
+    for length in [63, 64, 65, 127, 128, 129, 1023, 1024, 1025] { lengths.add(length) }
+    for length in lengths {
+        let raw = Bytes(length)
+        ascii(raw, length)
+        let decode = length == 0 || length == 8 || length == 16 || length == 33 || length == 1024
+        probe(totals, raw, snapshot, 1, decode)
+    }
+    let lanes = Bytes(32)
+    for lane in 0..16 {
+        ascii(lanes, lane)
+        for value in 0..256 {
+            lanes[lane] = value
+            let wanted = 0
+            if value < 128 { wanted = 1 }
+            probe(totals, lanes, snapshot, wanted, false)
+        }
+    }
+    let vectors = [
+        Vector { values: []; valid: true },
+        Vector { values: [0]; valid: true },
+        Vector { values: [0x7f]; valid: true },
+        Vector { values: [0xc2, 0x80]; valid: true },
+        Vector { values: [0xdf, 0xbf]; valid: true },
+        Vector { values: [0xe0, 0xa0, 0x80]; valid: true },
+        Vector { values: [0xed, 0x9f, 0xbf]; valid: true },
+        Vector { values: [0xee, 0x80, 0x80]; valid: true },
+        Vector { values: [0xef, 0xbf, 0xbf]; valid: true },
+        Vector { values: [0xef, 0xbb, 0xbf]; valid: true },
+        Vector { values: [0xef, 0xb7, 0x90]; valid: true },
+        Vector { values: [0xf0, 0x90, 0x80, 0x80]; valid: true },
+        Vector { values: [0xf4, 0x8f, 0xbf, 0xbf]; valid: true },
+        Vector { values: [0xf0, 0x9f, 0x8d, 0x8a]; valid: true },
+        Vector { values: [0xc3, 0xa9]; valid: true },
+        Vector { values: [0xe2, 0x82, 0xac]; valid: true },
+        Vector { values: [0x80]; valid: false },
+        Vector { values: [0xbf]; valid: false },
+        Vector { values: [0xc0, 0x80]; valid: false },
+        Vector { values: [0xc1, 0xbf]; valid: false },
+        Vector { values: [0xe0, 0x80, 0x80]; valid: false },
+        Vector { values: [0xed, 0xa0, 0x80]; valid: false },
+        Vector { values: [0xed, 0xbf, 0xbf]; valid: false },
+        Vector { values: [0xf0, 0x80, 0x80, 0x80]; valid: false },
+        Vector { values: [0xf4, 0x90, 0x80, 0x80]; valid: false },
+        Vector { values: [0xf5, 0x80, 0x80, 0x80]; valid: false },
+        Vector { values: [0xf7, 0xbf, 0xbf, 0xbf]; valid: false },
+        Vector { values: [0xf8]; valid: false },
+        Vector { values: [0xfe]; valid: false },
+        Vector { values: [0xff]; valid: false },
+        Vector { values: [0xc2, 0]; valid: false },
+        Vector { values: [0xe1, 0x80, 0x7f]; valid: false },
+        Vector { values: [0xf1, 0x80, 0xc0, 0x80]; valid: false },
+        Vector { values: [0xe2, 0x28, 0xa1]; valid: false },
+        Vector { values: [0xf0, 0x28, 0x8c, 0xbc]; valid: false },
+        Vector { values: [0xc2, 0xc2]; valid: false },
+        Vector { values: [0xe0, 0xa0, 0xc0]; valid: false },
+        Vector { values: [0xf4, 0x8f, 0xff]; valid: false },
+        Vector { values: [0xc2]; valid: false },
+        Vector { values: [0xdf]; valid: false },
+        Vector { values: [0xe0]; valid: false },
+        Vector { values: [0xe0, 0xa0]; valid: false },
+        Vector { values: [0xed]; valid: false },
+        Vector { values: [0xed, 0x9f]; valid: false },
+        Vector { values: [0xef]; valid: false },
+        Vector { values: [0xef, 0xbf]; valid: false },
+        Vector { values: [0xf0]; valid: false },
+        Vector { values: [0xf0, 0x90]; valid: false },
+        Vector { values: [0xf0, 0x90, 0x80]; valid: false },
+        Vector { values: [0xf4]; valid: false },
+        Vector { values: [0xf4, 0x8f]; valid: false },
+        Vector { values: [0xf4, 0x8f, 0xbf]; valid: false }
+    ]
+    let validVectors = 0
+    for vector in vectors {
+        let wanted = 0
+        if vector.valid { wanted = 1; validVectors += 1 }
+        let raw = Bytes(vector.values.length)
+        for index in 0..vector.values.length { raw[index] = vector.values[index] }
+        probe(totals, raw, snapshot, wanted, true)
+        for style in 0..3 {
+            for offset in 0..16 {
+                for tail in 0..8 {
+                    // A valid sixteen-byte prefix, then every offset modulo
+                    // sixteen. The multibyte style begins with 2/3/4-byte scalars.
+                    let start = 16 + offset
+                    let joined = Bytes(start + raw.length + tail)
+                    ascii(joined, 65)
+                    if style == 1 {
+                        for index in 0..start { joined[index] = 0 }
+                    }
+                    if style == 2 {
+                        writeScalar(joined, 0, 0xe9)
+                        writeScalar(joined, 2, 0x20ac)
+                        writeScalar(joined, 5, 0x1f34a)
+                    }
+                    for index in 0..raw.length { joined[start + index] = raw[index] }
+                    probe(totals, joined, snapshot, wanted, false)
+                }
+            }
+        }
+    }
+    if lengths.length != 43 || vectors.length != 52 || validVectors != 16 {
+        stop(totals, Bytes(), "boundary corpus inventory changed")
+    }
+    finish(totals, 24159, 8251)
+}
+
+function next(generator: Generator): Integer {
+    let value = generator.state
+    value = (value ^ (value << 13)) & 0xffffffff
+    value = value ^ (value >> 17)
+    value = (value ^ (value << 5)) & 0xffffffff
+    generator.state = value
+    return value
+}
+function longer(totals: Counts, snapshot: Bytes) {
+    let generator = Generator { state: 0x6d2b79f5 }
+    let buffers: List<Bytes> = []
+    for length in [31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025] { buffers.add(Bytes(length)) }
+    let scalars = [0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff, 0xfeff, 0xfdd0]
+    for iteration in 0..2048 {
+        let raw = buffers[iteration % buffers.length]
+        let style = (iteration / buffers.length) % 3
+        let position = 0
+        while position < raw.length {
+            let drawn = next(generator)
+            let scalar = drawn & 127
+            if style == 1 || (style == 2 && drawn % 4 == 0) { scalar = scalars[drawn % scalars.length] }
+            if scalarWidth(scalar) > raw.length - position { scalar = drawn & 127 }
+            position += writeScalar(raw, position, scalar)
+        }
+        // Four controls span ASCII, dense multibyte (31 and 1025 bytes), and
+        // mixed input. Four decode paths each keep the subset at sixteen calls.
+        let decode = iteration == 0 || iteration == 15 || iteration == 29 || iteration == 30
+        probe(totals, raw, snapshot, 1, decode)
+        let changed = next(generator) % raw.length
+        let saved = raw[changed]
+        raw[changed] = saved ^ (1 << (next(generator) % 8))
+        probe(totals, raw, snapshot, -1, false)
+        raw[changed] = saved
+        let last = raw.length - 1
+        saved = raw[last]
+        raw[last] = 0xff
+        probe(totals, raw, snapshot, 0, decode)
+        raw[last] = 0xc2
+        probe(totals, raw, snapshot, 0, decode)
+        raw[last] = saved
+        let swapped = next(generator) % (raw.length - 1)
+        let left = raw[swapped]
+        let right = raw[swapped + 1]
+        raw[swapped] = right
+        raw[swapped + 1] = left
+        probe(totals, raw, snapshot, -1, false)
+        raw[swapped] = left
+        raw[swapped + 1] = right
+        let cut = next(generator) % (raw.length + 1)
+        probe(totals, raw.slice(0, cut), snapshot, -1, decode)
+    }
+    if totals.valid < 2048 || totals.valid > 8192 { stop(totals, Bytes(), "longer corpus lost valid controls or forced invalid tails") }
+    finish(totals, 12288, -1)
+}
+
+let snapshot = Bytes(2048)
+let short = counts("short")
+let scalar = counts("scalar")
+let boundary = counts("boundary")
+let mutation = counts("mutation")
+exhaustive(short, snapshot)
+everyScalar(scalar, snapshot)
+boundaries(boundary, snapshot)
+longer(mutation, snapshot)
+let decoded = short.decoded + scalar.decoded + boundary.decoded + mutation.decoded
+if decoded != 73 { stop(boundary, Bytes(), "decode subset coverage changed") }
+print("utf8-validation total cases=" + Text(short.cases + scalar.cases + boundary.cases + mutation.cases) + " decoded=" + Text(decoded))

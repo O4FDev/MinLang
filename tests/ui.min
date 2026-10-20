@@ -1,0 +1,119 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+
+fixtures.executes(frontend, #"""
+    use "ui" as ui
+
+    function require(value: Boolean, message: Text) {
+        if !value { fail(message) }
+    }
+    function valid(view: ui.View) { require(ui.problem(view) == "", ui.problem(view)) }
+
+    let title = ui.heading("A little light 🙂")
+    let caption = ui.label("Ready")
+    let action = ui.button("add", "Add light")
+    let name = ui.input("name", "Ada")
+    let enabled = ui.toggle("enabled", "Keep shining", true)
+    require(ui.kind(title) == ui.HEADING && ui.kind(caption) == ui.LABEL, "text kinds")
+    require(ui.kind(action) == ui.BUTTON && ui.kind(name) == ui.INPUT && ui.kind(enabled) == ui.TOGGLE, "control kinds")
+    require(ui.key(action) == "add" && ui.text(title) == "A little light 🙂", "key and Unicode text")
+    require(ui.isChecked(enabled) && !ui.isChecked(caption), "checked state")
+    require(ui.spacing(caption) == 12 && ui.padding(caption) == 0, "default layout")
+    let controls = ui.row([action, name, enabled])
+    let page = ui.column([title, caption, controls])
+    valid(page)
+    require(ui.kind(controls) == ui.ROW && ui.kind(page) == ui.COLUMN, "container kinds")
+    require(ui.children(controls).length == 3 && ui.children(caption).length == 0, "children")
+
+    // Both directions of List aliasing must be isolated, including a would-be cycle.
+    let source = [caption]
+    let copied = ui.column(source)
+    source[0] = action
+    source.add(copied)
+    require(ui.children(copied).length == 1 && ui.text(ui.children(copied)[0]) == "Ready", "factory List alias")
+    let exposed = ui.children(copied)
+    exposed[0] = name
+    exposed.add(copied)
+    require(ui.children(copied).length == 1 && ui.kind(ui.children(copied)[0]) == ui.LABEL, "accessor List alias")
+    valid(copied)
+    let spaced = ui.spaced(page, 24)
+    let padded = ui.padded(spaced, 16)
+    require(ui.spacing(page) == 12 && ui.padding(page) == 0, "modifiers changed an alias")
+    require(ui.spacing(spaced) == 24 && ui.padding(spaced) == 0, "spaced copy")
+    require(ui.spacing(padded) == 24 && ui.padding(padded) == 16, "padded copy")
+    let leafPadding = ui.padded(title, 8)
+    let leafSpacing = ui.spaced(enabled, 0)
+    require(ui.text(leafPadding) == ui.text(title), "modifier lost leaf text")
+    require(ui.isChecked(leafSpacing), "modifier lost checked state")
+    require(ui.problem(leafPadding) == "padding applies only to a row or column", "unsupported leaf padding")
+    require(ui.problem(leafSpacing) == "spacing applies only to a row or column", "unsupported leaf spacing")
+    valid(ui.padded(title, 0))
+    valid(ui.spaced(enabled, 12))
+    let detached = ui.children(padded)
+    detached.clear()
+    require(ui.children(page).length == 3 && ui.children(padded).length == 3, "modified children alias")
+
+    let changed = ui.column([ui.heading("Evening"), ui.label("Changed"), ui.row([ui.button("add", "More"), ui.input("name", "Grace"), ui.toggle("enabled", "Rest", false)])])
+    require(ui.sameStructure(page, ui.padded(ui.spaced(changed, 0), 256)), "value-only update changed structure")
+    require(!ui.sameStructure(action, ui.button("remove", "Add light")), "changed key retained structure")
+    require(!ui.sameStructure(action, ui.input("add", "Add light")), "changed kind retained structure")
+    require(!ui.sameStructure(ui.row([action, name]), ui.row([name, action])), "reordered controls retained structure")
+    require(!ui.sameStructure(ui.column([caption]), ui.column([])), "changed child count retained structure")
+    require(!ui.sameStructure(ui.row([]), ui.column([])), "changed container retained structure")
+
+    require(ui.problem(ui.button("", "Go")) == "each control needs a nonempty key", "empty key")
+    let duplicate = ui.column([ui.button("same", "Go"), ui.row([ui.input("same", "")])])
+    require(ui.problem(duplicate) == "control keys must be unique: same", "duplicate key across branches")
+    let zero = Text(Bytes(1))
+    require(ui.problem(ui.toggle("a" + zero + "b", "Go", false)) == "a control key must not contain a zero byte", "zero key")
+    require(ui.problem(ui.label("a" + zero + "b")) == "view text must not contain a zero byte", "zero text")
+    let longKey = ""
+    for index in 0..128 { longKey += "é" }
+    valid(ui.button(longKey, "Unicode key"))
+    longKey += "é"
+    require(ui.problem(ui.input(longKey, "")) == "a control key may contain at most 256 UTF-8 bytes", "key byte limit")
+    valid(ui.padded(ui.spaced(page, 256), 0))
+    for points in [-1, 257] {
+        require(ui.problem(ui.spaced(page, points)) == "view spacing must be between 0 and 256 points", "spacing limit")
+        require(ui.problem(ui.padded(page, points)) == "view padding must be between 0 and 256 points", "padding limit")
+    }
+
+    let deep = ui.label("bottom")
+    for index in 0..63 { deep = ui.column([deep]) }
+    valid(deep)
+    require(ui.sameStructure(deep, deep), "depth boundary structure")
+    let tooDeep = ui.column([deep])
+    require(ui.problem(tooDeep) == "a view may be nested at most 64 levels deep", "depth limit")
+    require(!ui.sameStructure(tooDeep, tooDeep), "unbounded depth comparison")
+    let wide: List<ui.View> = []
+    for index in 0..1023 { wide.add(caption) }
+    let full = ui.row(wide)
+    valid(full)
+    require(ui.sameStructure(full, full), "node boundary structure")
+    wide.add(caption)
+    let tooWide = ui.row(wide)
+    require(ui.problem(tooWide) == "a view may contain at most 1024 nodes", "node limit")
+    require(!ui.sameStructure(tooWide, tooWide), "unbounded node comparison")
+    // Count occurrences rather than distinct shared descriptions.
+    let shared = ui.column([caption, caption])
+    let repeated: List<ui.View> = []
+    for index in 0..342 { repeated.add(shared) }
+    require(ui.problem(ui.column(repeated)) == "a view may contain at most 1024 nodes", "shared occurrence limit")
+    for index in 0..200 {
+        let temporary = ui.column([ui.heading(Text(index)), ui.row([ui.button("button", Text(index)), ui.input("field", "kept")])])
+        valid(temporary)
+        require(ui.sameStructure(temporary, ui.padded(temporary, 12)), "repeated temporary structure")
+    }
+    print("Declarative UI model checks passed")
+
+    """#, "Declarative UI model checks passed\n", levels, 0, "", true)
+
+fixtures.rejects(frontend, "use \"ui\" as ui\nlet view = ui.label(\"hello\")\nprint(view.kind)\n", "is private to its module", true)
+fixtures.rejects(frontend, "use \"ui\" as ui\nlet view = ui.label(\"hello\")\nview.children = [view]\n", "is private to its module", true)
+fixtures.rejects(frontend, "use \"ui\" as ui\nlet view = ui.View { kind: 1; key: \"\"; text: \"forged\"; checked: false; spacing: 12; padding: 0; children: [] }\n", "has private fields, so only its own module can create one", true)
+
+test.removeTree(frontend.compiler.directory)
+print("Declarative UI model, validation, structure and ownership verified at O0 and O2")

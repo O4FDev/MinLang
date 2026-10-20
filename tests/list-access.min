@@ -37,12 +37,43 @@ function invalidAccess(compiler: test.Compiler, declaration: Text, length: Integ
     }
 }
 
+function constructorReturns(compiler: test.Compiler, llvm: Text) {
+    for name in ["bytes_new", "list_new", "record_new", "record_new_scalar"] {
+        let parameters = "i64"
+        let arguments = "i64 %size"
+        if name == "list_new" { parameters = ""; arguments = "" }
+        let signature = "ptr @minyar_" + name + "(" + parameters + ")"
+        test.check(test.contains(llvm, "declare nonnull " + signature), "constructor return lacks nonnull: " + name)
+        // Compare the same observable call with and without the return promise.
+        for annotation in ["", "nonnull "] {
+            let source = "declare " + annotation + signature + "\ndefine i1 @constructor_can_return_null(i64 %size) {\n  %fresh = call ptr @minyar_" + name + "(" + arguments + ")\n  %isnull = icmp eq ptr %fresh, null\n  ret i1 %isnull\n}\n"
+            let prefix = compiler.directory + "/constructor-" + name
+            let input = prefix + ".ll"
+            let output = prefix + ".optimized.ll"
+            io.writeTextFile(input, source)
+            test.require(test.run([compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", input, "-o", output], system.environment(), "", prefix + ".optimize", 30), "optimize constructor return " + name)
+            let optimized = io.readTextFile(output)
+            let callRemains = false
+            for line in test.lines(optimized) {
+                if test.contains(line, "call ") && test.contains(line, "@minyar_" + name + "(") { callRemains = true }
+            }
+            test.check(callRemains, "nonnull removed observable constructor call " + name)
+            if annotation == "" {
+                test.check(test.contains(optimized, "icmp eq ptr") && !test.contains(optimized, "ret i1 false"), "nullable control lost comparison " + name)
+            } else {
+                test.check(!test.contains(optimized, "icmp eq ptr") && test.contains(optimized, "ret i1 false"), "nonnull did not remove impossible comparison " + name)
+            }
+        }
+    }
+}
+
 let compiler = test.compiler()
 test.check(processInfo.argumentCount() <= 1, "unexpected List access test selector")
 if processInfo.argumentCount() == 1 { test.check(processInfo.argument(0) == "ListAccess.test_inline_access_helpers_preserve_checked_fallback", "unknown List access test selector") }
 test.executes(compiler, "let values = [42]\nvalues[0] = 42\nprint(values[0])\nprint(values.length)\n", "42\n1\n")
 let llvm = generated(compiler)
-for expected in ["define internal i64 @.minyar.list.get.checked", "define internal void @.minyar.list.set.scalar.checked", "define internal i64 @.minyar.list.length", "%get.valid = icmp ult i64 %position, %length", "%set.valid = icmp ult i64 %position, %length", "%fallback = call i64 @minyar_list_get(ptr %list, i64 %position)\n  ret i64 %fallback", "call void @minyar_list_set(ptr %list, i64 %position, i64 %value)\n  ret void"] {
+constructorReturns(compiler, llvm)
+for expected in ["define internal i64 @.minyar.list.get.checked", "define internal void @.minyar.list.set.scalar.checked", "define internal i64 @.minyar.list.length", "%get.valid = icmp ult i64 %position, %length", "%set.valid = icmp ult i64 %position, %length", "call i64 @minyar_list_get(ptr %list, i64 %position)\n  unreachable", "call void @minyar_list_set(ptr %list, i64 %position, i64 %value)\n  unreachable"] {
     test.check(test.contains(llvm, expected), "missing checked List helper IR: " + expected)
 }
 let helpers: List<Text> = []
@@ -59,7 +90,15 @@ for line in test.lines(llvm) {
     }
 }
 test.check(helpers.length == 3, "expected exactly three internal List helpers")
-for body in helpers { test.check(!test.contains(body, "unreachable"), "checked List helper lost fallback") }
+for body in helpers {
+    // A failed check reports through the runtime, which never returns.
+    test.check(test.contains(body, "@.minyar.list.length(") || test.contains(body, "@minyar_list_get(ptr %list, i64 %position)\n  unreachable") || test.contains(body, "@minyar_list_set(ptr %list, i64 %position, i64 %value)\n  unreachable"), "checked List helper lost its runtime diagnostic")
+    test.check(test.contains(body, "!range !{i64 0, i64 -9223372036854775808}"), "List length lost its nonnegative range fact")
+    test.check(test.contains(body, "getelementptr inbounds { ptr, i64, i64 }, ptr %list"), "List header lost its allocation fact")
+    if !test.contains(body, "@.minyar.list.length(") {
+        test.check(test.contains(body, "getelementptr inbounds i64, ptr %values, i64 %position"), "checked List slot lost its allocation fact")
+    }
+}
 test.check(!test.contains(llvm, "noalias"), "List IR incorrectly claims noalias")
 if processInfo.argumentCount() == 0 {
 test.executes(compiler, "let integers = [0]\nintegers[0] = -9223372036854775808\nprint(integers[0])\nlet floats = [1.0]\nfloats[0] = -0.0\nprint(floats[0])\nfloats[0] = 2.5\nfloats[0] *= 4.0\nprint(floats[0])\nlet booleans = [false]\nbooleans[0] = true\nprint(booleans[0])\nlet characters = ['a']\ncharacters[0] = '🙂'\nprint(characters[0])\n", "-9223372036854775808\n-0.0\n10.0\ntrue\n🙂\n")
@@ -78,6 +117,34 @@ test.executes(compiler, "function replace(values: List<Text>): Text {\nvalues[0]
 let main = after(generated(compiler), "define i32 @main(")
 test.check(!test.contains(main, "call void @.minyar.list.set.scalar.checked("), "reference assignment uses scalar setter")
 test.check(test.contains(main, "call void @minyar_list_set_take("), "reference assignment lost ownership transfer")
+// An acyclic List receiver held by a field needs no temporary count when its
+// appended argument makes no calls; a call that can replace the field keeps it.
+test.executes(compiler, "record Holder { values: List<Integer>; names: List<Text> }\nfunction fill(holder: Holder) { let index = 0; while index < 4 { holder.values.add(index + holder.values.length); holder.names.add(\"n\"); index += 1 } }\nfunction replace(holder: Holder): Integer { holder.values = [9]; return 7 }\nfunction mixed(holder: Holder) { holder.values.add(replace(holder)) }\nlet holder = Holder { values: []; names: [] }\nfill(holder)\nprint(holder.values.length)\nprint(holder.values[3])\nprint(holder.names.length)\nmixed(holder)\nprint(holder.values.length)\nprint(holder.values[0])\n", "4\n6\n4\n1\n9\n")
+let appended = generated(compiler)
+let fill = after(appended, "define void @.minyar.fn.fill(")
+fill = Text(Bytes(fill).slice(0, fill.find("\n}\n")))
+test.check(!test.contains(fill, "@minyar_rc_borrow(") && !test.contains(fill, "@minyar_rc_keep("), "call-free List appends kept a temporary owner")
+let mixed = after(appended, "define void @.minyar.fn.mixed(")
+mixed = Text(Bytes(mixed).slice(0, mixed.find("\n}\n")))
+test.check(test.contains(mixed, "call void @minyar_rc_borrow("), "a List append whose argument calls a function must keep its receiver owner")
+test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { optimize.add(flag) }
+for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
+test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize List loop IR")
+let active = false
+let additions = 0
+let functions = 0
+for line in test.lines(io.readTextFile(path + ".optimized.ll")) {
+    if startsWith(line, "define ") && test.contains(line, " @.minyar.fn.sum(") { active = true; functions += 1 }
+    if active {
+        test.check(!test.contains(line, "@minyar_list_get("), "proven List loop retained its redundant bounds fallback")
+        if test.contains(line, "call ") && test.contains(line, "@llvm.sadd.with.overflow.i64(") { additions += 1 }
+        if line == "}" { active = false }
+    }
+}
+test.check(functions == 1 && additions == 1, "List loop must check its sum and eliminate the proven index overflow check")
 }
 test.removeTree(compiler.directory)
 print("list access: passed")

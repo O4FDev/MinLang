@@ -100,7 +100,7 @@ _Noreturn void exit(int status) {
 /* Called by the exception vectors in os/arch/arm64/head.S. */
 _Noreturn void minyar_arm_exception(unsigned long kind, unsigned long syndrome, unsigned long address, unsigned long fault) {
     static const char *const kinds[4] = {"synchronous exception", "interrupt", "fast interrupt", "system error"};
-    fprintf(stderr, "\nMinyar stopped: %s (vector %lu) at %#lx, ESR %#lx, FAR %#lx\n",
+    fprintf(stderr, "\nMinyar stopped: %s (vector %lu) at 0x%lx, ESR 0x%lx, FAR 0x%lx\n",
             kinds[kind & 3], kind, address, syndrome, fault);
     minyar_print_stack_trace();
     exit(1);
@@ -510,8 +510,9 @@ double strtod(const char *text, char **end) {
 /* ----- Mathematics ----- */
 
 double fabs(double x) { return __builtin_fabs(x); }
-/* __builtin_sqrt may lower to a call to this very symbol under -ffreestanding,
- * which LTO turns into recursive undefined behaviour. Force the LLVM intrinsic. */
+/* __builtin_sqrt may lower to a call to this very symbol under -ffreestanding
+ * when math errno is enabled, which LTO turns into recursive undefined
+ * behaviour. The elementwise intrinsic always performs the operation. */
 double sqrt(double x) { return __builtin_elementwise_sqrt(x); }
 double trunc(double x) {
     if (!(fabs(x) < 4503599627370496.0)) return x;

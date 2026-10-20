@@ -1,0 +1,153 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "./toolchain-files.min" as tf
+use "system" as system
+use "files" as files
+
+record Fixture {
+    project: Text
+    cache: Text
+    clang: Text
+    driver: Text
+    environment: List<Text>
+    logs: tf.Logs
+}
+
+function copy(source: Text, destination: Text) {
+    let contents = files.readFile(source)
+    test.check(files.lastError() == 0, "read cache fixture source " + source)
+    io.writeBytesFile(destination, contents)
+}
+
+function objectName(name: Text): Boolean {
+    let prefix = "unicode-"
+    if name.startsWith("unicode_data-") { prefix = "unicode_data-" }
+    if !name.startsWith(prefix) || !name.endsWith(".o") || name.length != prefix.length + 66 { return false }
+    for index in prefix.length..(prefix.length + 64) {
+        let character = name[index]
+        if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) { return false }
+    }
+    return true
+}
+
+function build(fixture: Fixture): List<Text> {
+    let linked = tf.run(fixture.logs, [fixture.driver, "link", fixture.project, fixture.project + "/program.ll",
+        fixture.project + "/runtime.o", fixture.project + "/program", "0"], fixture.environment, "", 120)
+    test.require(linked, "link Unicode provider cache fixture")
+    let ran = tf.run(fixture.logs, [fixture.project + "/program"], fixture.environment, "", 30)
+    test.require(ran, "run Unicode provider cache fixture")
+    test.check(ran.output == "" && ran.errorOutput == "", "Unicode cache fixture must run silently")
+    let objects = tf.listing(fixture.cache + "/native")
+    for name in objects {
+        test.check(objectName(name), "unexpected native cache artifact " + name)
+        test.check(files.pathSize(fixture.cache + "/native/" + name) > 0, "empty native cache artifact " + name)
+    }
+    return objects
+}
+
+function newObjects(before: List<Text>, after: List<Text>, dependency: Text): List<Text> {
+    test.check(after.length == before.length + 2, dependency + ": expected two new cached objects")
+    for name in before { test.check(support.has(after, name), dependency + ": previous cache artifact disappeared") }
+    let added: List<Text> = []
+    for name in after { if !support.has(before, name) { added.add(name) } }
+    test.check(added.length == 2, dependency + ": native cache identities did not both change")
+    let bridge = false
+    let data = false
+    for name in added {
+        if name.startsWith("unicode-") { bridge = true }
+        if name.startsWith("unicode_data-") { data = true }
+    }
+    test.check(bridge && data, dependency + ": expected bridge and data cache invalidation")
+    return added
+}
+
+// Change actual content without changing file size or either timestamp. A key
+// based only on path, size and mtime cannot satisfy this regression.
+function mutate(path: Text) {
+    let accessTime = tf.atime(path)
+    let modifyTime = tf.mtime(path)
+    let contents = files.readFile(path)
+    test.check(files.lastError() == 0 && contents.length >= 5, "read dependency to mutate " + path)
+    let length = contents.length
+    test.check(contents[length - 5] == 48, "missing cache probe byte in " + path)
+    contents[length - 5] = 49
+    io.writeBytesFile(path, contents)
+    tf.stamp(path, accessTime, modifyTime)
+    test.check(files.pathSize(path) == length && tf.mtime(path) == modifyTime && tf.atime(path) == accessTime,
+        "cache mutation must preserve size and timestamps: " + path)
+}
+
+let scratch = test.scratch()
+let logs = tf.logs(scratch + "/logs")
+let root = test.resolvePath(".")
+let project = scratch + "/unicode project"
+let cache = scratch + "/isolated cache"
+for directory in [project, project + "/runtime", project + "/runtime/native", project + "/vendor", project + "/vendor/utf8proc", cache] {
+    tf.directory(directory)
+}
+test.check(tf.listing(cache).length == 0, "Unicode provider cache must start empty")
+let vendor = tf.listing(root + "/vendor/utf8proc")
+test.check(tf.equal(vendor, ["LICENSE.md", "utf8proc.c", "utf8proc.h", "utf8proc_data.c"]), "review the Unicode vendor cache inventory")
+let dependencies: List<Text> = []
+for name in vendor { dependencies.add("vendor/utf8proc/" + name) }
+dependencies.add("runtime/native/unicode_case_data.h")
+for path in ["runtime/native/unicode.c", "runtime/native/unicode_data.c", "runtime/minyar_native.h"] {
+    copy(root + "/" + path, project + "/" + path)
+}
+for path in dependencies {
+    copy(root + "/" + path, project + "/" + path)
+    // C comments are harmless in each source/header and plain license text.
+    tf.append(project + "/" + path, Bytes("\n/* Unicode cache probe: 0 */\n"))
+}
+io.writeTextFile(project + "/program.ll", "; minyar-native-library: unicode\ndefine i32 @main() {\nentry:\n  ret i32 0\n}\n")
+// No provider function is called. Abort stubs resolve its owned-value ABI
+// without bringing the real runtime or its configuration into the cache key.
+io.writeTextFile(project + "/runtime.c", #"""
+    #include "runtime/minyar_native.h"
+    MinyarBytes *minyar_bytes_new(long long length) {
+        (void)length;
+        abort();
+    }
+    MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
+        (void)source;
+        (void)length;
+        abort();
+    }
+
+    """#)
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", test.setting("LLVM_CC", "clang")))
+let environment = support.merge(tf.without(system.environment(), ["MINYAR_LINK_ARTIFACTS", "MINYAR_TEST_HOST_SYSTEM"]), [
+    "MINYAR_CLANG=" + clang, "MINYAR_CACHE_DIR=" + cache,
+    "MINYAR_CLANG_FLAGS=-O0 -Wno-override-module", "MINYAR_NATIVE_FLAGS=-O0"])
+test.check(!tf.present(environment, "MINYAR_LINK_ARTIFACTS"), "cache regression must not retain link evidence")
+test.require(tf.run(logs, [clang, "-O0", "-c", project + "/runtime.c", "-o", project + "/runtime.o"], environment, "", 60), "compile tiny Unicode cache runtime")
+let fixture = Fixture { project: project; cache: cache; clang: clang; driver: root + "/build/tooling/tools/clang-driver";
+    environment: environment; logs: logs }
+let objects = build(fixture)
+test.check(objects.length == 2, "first Unicode link must cache bridge and data objects")
+let initial = newObjects([], objects, "initial link")
+let identities: List<Text> = []
+let modified: List<Integer> = []
+for name in initial {
+    let path = cache + "/native/" + name
+    let identity = tf.identity(path)
+    test.check(identity != "", "cannot inspect cached object identity")
+    identities.add(identity)
+    modified.add(tf.mtime(path))
+}
+let repeated = build(fixture)
+test.check(tf.equal(objects, repeated), "unchanged Unicode sources must reuse both cached paths")
+for index in 0..initial.length {
+    let path = cache + "/native/" + initial[index]
+    test.check(tf.identity(path) == identities[index] && tf.mtime(path) == modified[index], "unchanged Unicode object was rebuilt")
+}
+for dependency in dependencies {
+    mutate(project + "/" + dependency)
+    let changed = build(fixture)
+    newObjects(objects, changed, dependency)
+    objects = changed
+}
+test.check(objects.length == 12, "every vendor file and generated header must invalidate both Unicode objects")
+test.removeTree(scratch)
+print("Unicode provider cache: reuse and five content-only dependency mutations passed")

@@ -1,0 +1,1757 @@
+// Engine value types, PG text I/O, hashing and byte-view comparison.
+// Values never live in a heap object: ints/bools/dates/timestamps/numerics are Integers (numeric carries a
+// separate scale), floats are Floats, and text is a view (Bytes, offset, length).
+// NUMERIC values that do not fit the scaled Int64 (more than 18 digits, NaN, Infinity) use numeric.min.
+use "./numeric.min" as nm
+
+// ---- type ids (engine-internal) ----
+public constant T_UNKNOWN = 0     // untyped NULL / unresolved string literal
+public constant T_BOOL = 1
+public constant T_INT2 = 2
+public constant T_INT4 = 3
+public constant T_INT8 = 4
+public constant T_FLOAT4 = 5
+public constant T_FLOAT8 = 6
+public constant T_NUMERIC = 7
+public constant T_TEXT = 8
+public constant T_VARCHAR = 9
+public constant T_BPCHAR = 10
+public constant T_DATE = 11
+public constant T_TIMESTAMP = 12
+public constant T_TIMESTAMPTZ = 13
+public constant T_INTERVAL = 14
+public constant T_BYTEA = 15
+public constant T_NAME = 16
+public constant T_TIME = 17
+public constant T_REGCLASS = 18
+public constant T_OID = 19
+// Column storage type only (never an expression type): NUMERIC without a typmod or wider than 18 digits,
+// stored as its numeric_out text so the storage layer keeps it in the text heap. SQL-visible type: numeric.
+public constant T_NUMTEXT = 20
+public constant T_CHAR = 40       // "char" (oid 18): one byte, stored as text
+public constant T_XID = 41        // xid (oid 28): integer
+public constant T_RECORD = 42     // record (oid 2249): text "(x,n)" from information_schema._pg_expandarray
+// Catalog-only types kept in their PG text form (compat agent): T_PGTEXT + the PG type oid, e.g. int2vector,
+// oidvector, int2[], oid[], text[], aclitem[], regproc, pg_node_tree. sql2's general arrays can replace these.
+public constant T_PGTEXT = 1000
+public constant T_INT2VECTOR = 1022
+public constant T_REGPROC = 1024
+public constant T_OIDVECTOR = 1030
+public constant T_PGNODETREE = 1194
+public constant T_CHARARRAY = 2002
+public constant T_INT2ARRAY = 2005
+public constant T_TEXTARRAY = 2009
+public constant T_OIDARRAY = 2028
+public constant T_ACLARRAY = 2034
+public constant T_ANYARRAY = 3277
+
+public constant POSTGRES_EPOCH_JDATE = 2451545
+public constant USECS_PER_DAY = 86400000000
+
+public function typeOid(t: Integer): Integer {
+    if t == T_BOOL { return 16 }
+    if t == T_INT2 { return 21 }
+    if t == T_INT4 { return 23 }
+    if t == T_INT8 { return 20 }
+    if t == T_FLOAT4 { return 700 }
+    if t == T_FLOAT8 { return 701 }
+    if t == T_NUMERIC || t == T_NUMTEXT { return 1700 }
+    if t == T_TEXT { return 25 }
+    if t == T_VARCHAR { return 1043 }
+    if t == T_BPCHAR { return 1042 }
+    if t == T_DATE { return 1082 }
+    if t == T_TIMESTAMP { return 1114 }
+    if t == T_TIMESTAMPTZ { return 1184 }
+    if t == T_INTERVAL { return 1186 }
+    if t == T_BYTEA { return 17 }
+    if t == T_NAME { return 19 }
+    if t == T_TIME { return 1083 }
+    if t == T_REGCLASS { return 2205 }
+    if t == T_OID { return 26 }
+    if t == T_CHAR { return 18 }
+    if t == T_XID { return 28 }
+    if t == T_RECORD { return 2249 }
+    if t > T_PGTEXT { return t - T_PGTEXT }
+    return 25
+}
+
+// Catalog array types: element type, lower bound (int2vector/oidvector start at 0) and element oid.
+public function isArrayType(t: Integer): Boolean {
+    return t == T_INT2VECTOR || t == T_OIDVECTOR || t == T_INT2ARRAY || t == T_OIDARRAY || t == T_TEXTARRAY || t == T_ACLARRAY || t == T_CHARARRAY
+}
+
+public function arrayElemType(t: Integer): Integer {
+    if t == T_INT2VECTOR || t == T_INT2ARRAY { return T_INT2 }
+    if t == T_OIDVECTOR || t == T_OIDARRAY { return T_OID }
+    if t == T_CHARARRAY { return T_CHAR }
+    return T_TEXT
+}
+
+public function arrayLowerBound(t: Integer): Integer {
+    if t == T_INT2VECTOR || t == T_OIDVECTOR { return 0 }
+    return 1
+}
+
+// Vectors print as "1 2 3", arrays as "{1,2,3}".
+public function isVectorType(t: Integer): Boolean {
+    return t == T_INT2VECTOR || t == T_OIDVECTOR
+}
+
+public function typeFromOid(oid: Integer): Integer {
+    if oid == 16 { return T_BOOL }
+    if oid == 21 { return T_INT2 }
+    if oid == 23 { return T_INT4 }
+    if oid == 20 { return T_INT8 }
+    if oid == 700 { return T_FLOAT4 }
+    if oid == 701 { return T_FLOAT8 }
+    if oid == 1700 { return T_NUMERIC }
+    if oid == 25 { return T_TEXT }
+    if oid == 1043 { return T_VARCHAR }
+    if oid == 1042 { return T_BPCHAR }
+    if oid == 1082 { return T_DATE }
+    if oid == 1114 { return T_TIMESTAMP }
+    if oid == 1184 { return T_TIMESTAMPTZ }
+    if oid == 1186 { return T_INTERVAL }
+    if oid == 17 { return T_BYTEA }
+    if oid == 19 { return T_NAME }
+    if oid == 26 { return T_OID }
+    if oid == 18 { return T_CHAR }
+    if oid == 28 { return T_XID }
+    if oid == 2205 { return T_REGCLASS }
+    return T_UNKNOWN
+}
+
+public function typeLen(t: Integer): Integer {
+    if t == T_BOOL { return 1 }
+    if t == T_INT2 { return 2 }
+    if t == T_INT4 || t == T_FLOAT4 || t == T_DATE || t == T_OID || t == T_REGCLASS { return 4 }
+    if t == T_INT8 || t == T_FLOAT8 || t == T_TIMESTAMP || t == T_TIMESTAMPTZ || t == T_TIME { return 8 }
+    if t == T_INTERVAL { return 16 }
+    if t == T_NAME { return 64 }
+    if t == T_CHAR { return 1 }
+    if t == T_XID { return 4 }
+    return -1
+}
+
+public function typeName(t: Integer): Text {
+    if t == T_BOOL { return "boolean" }
+    if t == T_INT2 { return "smallint" }
+    if t == T_INT4 { return "integer" }
+    if t == T_INT8 { return "bigint" }
+    if t == T_FLOAT4 { return "real" }
+    if t == T_FLOAT8 { return "double precision" }
+    if t == T_NUMERIC || t == T_NUMTEXT { return "numeric" }
+    if t == T_TEXT { return "text" }
+    if t == T_VARCHAR { return "character varying" }
+    if t == T_BPCHAR { return "character" }
+    if t == T_DATE { return "date" }
+    if t == T_TIMESTAMP { return "timestamp without time zone" }
+    if t == T_TIMESTAMPTZ { return "timestamp with time zone" }
+    if t == T_INTERVAL { return "interval" }
+    if t == T_BYTEA { return "bytea" }
+    if t == T_NAME { return "name" }
+    if t == T_TIME { return "time without time zone" }
+    if t == T_OID { return "oid" }
+    if t == T_REGCLASS { return "regclass" }
+    if t == T_CHAR { return "\"char\"" }
+    if t == T_XID { return "xid" }
+    if t == T_RECORD { return "record" }
+    if t == T_INT2VECTOR { return "int2vector" }
+    if t == T_OIDVECTOR { return "oidvector" }
+    if t == T_INT2ARRAY { return "smallint[]" }
+    if t == T_OIDARRAY { return "oid[]" }
+    if t == T_TEXTARRAY { return "text[]" }
+    if t == T_ACLARRAY { return "aclitem[]" }
+    if t == T_CHARARRAY { return "\"char\"[]" }
+    if t == T_REGPROC { return "regproc" }
+    if t == T_PGNODETREE { return "pg_node_tree" }
+    if t == T_ANYARRAY { return "anyarray" }
+    return "unknown"
+}
+
+// Storage class: 0 integer-like (rInt), 1 float (rFlt), 2 text view, 3 interval (rInt micros, rAux days, rAux2 months)
+public function isTextType(t: Integer): Boolean {
+    return t == T_TEXT || t == T_VARCHAR || t == T_BPCHAR || t == T_NAME || t == T_BYTEA || t == T_UNKNOWN || t == T_NUMTEXT || t == T_CHAR || t == T_RECORD || t > T_PGTEXT
+}
+
+// SQL-visible type of a column storage type.
+public function sqlType(t: Integer): Integer {
+    if t == T_NUMTEXT { return T_NUMERIC }
+    return t
+}
+
+// Column storage type for a NUMERIC column with this typmod (precision * 65536 + scale, -1 = none): the scaled
+// Int64 when every value fits 18 digits, else text.
+public function numStorageType(typmod: Integer): Integer {
+    if typmod < 0 { return T_NUMTEXT }
+    let prec = typmodPrecision(typmod)
+    let sc = typmodScale(typmod)
+    if prec > 18 || sc > 18 || sc < 0 { return T_NUMTEXT }
+    return T_NUMERIC
+}
+
+public function typmodPrecision(typmod: Integer): Integer {
+    return (typmod >> 16) & 65535
+}
+
+// scale is a signed 16-bit field (Postgres 15+ allows negative scales)
+public function typmodScale(typmod: Integer): Integer {
+    let s = typmod & 65535
+    if s >= 32768 { s -= 65536 }
+    return s
+}
+
+// Canonical numeric hash: equal values hash equally whatever their display scale or representation.
+// Matches index.normNumeric for values that fit the scaled Int64.
+public function hashNum(x: nm.Num): Integer {
+    if nm.isSpecial(x) { return nm.hashOf(x) }
+    let ms = nm.minScale(x)
+    let ok: List<Integer> = [0]
+    let y = nm.toUnscaled(x, ms, ok)
+    if ok[0] == 1 { return hashCombine(hashInt(y), ms) }
+    return nm.hashOf(x)
+}
+
+// Parse a stored numeric text (numeric_out format).
+public function numOfText(b: Bytes, o: Integer, l: Integer): nm.Num {
+    let st: List<Integer> = [0]
+    return nm.parse(b, o, l, st)
+}
+
+public function hashNumText(b: Bytes, o: Integer, l: Integer): Integer {
+    return hashNum(numOfText(b, o, l))
+}
+
+public function cmpNumText(a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    return nm.cmp(numOfText(a, ao, al), numOfText(b, bo, bl))
+}
+public function isFloatType(t: Integer): Boolean { return t == T_FLOAT8 || t == T_FLOAT4 }
+public function isIntType(t: Integer): Boolean { return t == T_INT2 || t == T_INT4 || t == T_INT8 }
+public function isNumericCategory(t: Integer): Boolean {
+    return t == T_INT2 || t == T_INT4 || t == T_INT8 || t == T_FLOAT4 || t == T_FLOAT8 || t == T_NUMERIC || t == T_OID
+}
+
+// Fixed column width in bytes (text columns store an 8-byte ref).
+public function storageWidth(t: Integer): Integer {
+    if t == T_BOOL { return 1 }
+    if t == T_INT2 { return 2 }
+    if t == T_INT4 || t == T_DATE || t == T_FLOAT4 || t == T_OID || t == T_XID { return 4 }
+    if t == T_INTERVAL { return 16 }
+    return 8
+}
+
+// ---------------------------------------------------------------- byte helpers
+
+public function addText(out: Bytes, t: Text) {
+    out.addBytes(Bytes(t))
+}
+
+public function addBE32(out: Bytes, v: Integer) {
+    out.add((v >> 24) & 255)
+    out.add((v >> 16) & 255)
+    out.add((v >> 8) & 255)
+    out.add(v & 255)
+}
+
+public function addBE16(out: Bytes, v: Integer) {
+    out.add((v >> 8) & 255)
+    out.add(v & 255)
+}
+
+public function addBE64(out: Bytes, v: Integer) {
+    addBE32(out, (v >> 32) & 4294967295)
+    addBE32(out, v & 4294967295)
+}
+
+public function setBE32(out: Bytes, at: Integer, v: Integer) {
+    out[at] = (v >> 24) & 255
+    out[at + 1] = (v >> 16) & 255
+    out[at + 2] = (v >> 8) & 255
+    out[at + 3] = v & 255
+}
+
+public function getBE32(b: Bytes, at: Integer): Integer {
+    let v = (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+    if v >= 2147483648 { v = v - 4294967296 }
+    return v
+}
+
+public function getBE16(b: Bytes, at: Integer): Integer {
+    let v = (b[at] << 8) | b[at + 1]
+    if v >= 32768 { v = v - 65536 }
+    return v
+}
+
+public function getBE64(b: Bytes, at: Integer): Integer {
+    let hi = getBE32(b, at)
+    let lo = getBE32(b, at + 4) & 4294967295
+    return (hi << 32) | lo
+}
+
+// Append decimal digits of v.
+public function addInt(out: Bytes, v: Integer) {
+    if v >= 0 && v < 10 {
+        out.add(48 + v)
+        return
+    }
+    if v == -9223372036854775808 {
+        addText(out, "-9223372036854775808")
+        return
+    }
+    if v < 0 {
+        out.add(45)
+        v = -v
+    }
+    let digits = Bytes(20)
+    let n = 0
+    while v > 0 {
+        digits[n] = 48 + v % 10
+        v = v / 10
+        n += 1
+    }
+    while n > 0 {
+        n -= 1
+        out.add(digits[n])
+    }
+}
+
+public function intText(v: Integer): Text {
+    return Text(v)
+}
+
+// ---------------------------------------------------------------- byte views
+
+public function compareBytes(a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    let n = al
+    if bl < n { n = bl }
+    let i = 0
+    while i < n {
+        let x = a[ao + i]
+        let y = b[bo + i]
+        if x != y {
+            if x < y { return -1 }
+            return 1
+        }
+        i += 1
+    }
+    if al < bl { return -1 }
+    if al > bl { return 1 }
+    return 0
+}
+
+public function equalBytes(a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Boolean {
+    if al != bl { return false }
+    let i = 0
+    while i + 8 <= al {
+        if a.getInt64(ao + i) != b.getInt64(bo + i) { return false }
+        i += 8
+    }
+    while i < al {
+        if a[ao + i] != b[bo + i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// Length without trailing spaces (bpchar semantics).
+public function trimmedLen(a: Bytes, ao: Integer, al: Integer): Integer {
+    let n = al
+    while n > 0 && a[ao + n - 1] == 32 { n -= 1 }
+    return n
+}
+
+public function textEqualsAscii(a: Bytes, ao: Integer, al: Integer, lit: Text): Boolean {
+    let b = Bytes(lit)
+    return equalBytes(a, ao, al, b, 0, b.length)
+}
+
+// Case-insensitive ASCII compare against a lower-case literal.
+public function equalsIgnoreCase(a: Bytes, ao: Integer, al: Integer, lowerLit: Text): Boolean {
+    let b = Bytes(lowerLit)
+    if b.length != al { return false }
+    let i = 0
+    while i < al {
+        let c = a[ao + i]
+        if c >= 65 && c <= 90 { c += 32 }
+        if c != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- hashing
+
+public function mix64(h: Integer): Integer {
+    h = h ^ ((h >> 33) & 2147483647)
+    h = wrappingMultiply(h, -49064778989728563)
+    h = h ^ ((h >> 33) & 2147483647)
+    h = wrappingMultiply(h, -4265267296055464877)
+    h = h ^ ((h >> 33) & 2147483647)
+    return h
+}
+
+public function hashInt(v: Integer): Integer {
+    return mix64(wrappingAdd(v, -7046029254386353131))
+}
+
+public function hashBytes(a: Bytes, ao: Integer, al: Integer): Integer {
+    let h = wrappingAdd(-3750763034362895579, al)
+    let i = 0
+    while i + 8 <= al {
+        h = wrappingMultiply(h ^ a.getInt64(ao + i), -4658895280553007687)
+        h = h ^ ((h >> 29) & 34359738367)
+        i += 8
+    }
+    let tail = 0
+    let shift = 0
+    while i < al {
+        tail = tail | (a[ao + i] << shift)
+        shift += 8
+        i += 1
+    }
+    h = wrappingMultiply(h ^ tail, -7723592293110705685)
+    return mix64(h)
+}
+
+public function hashCombine(h: Integer, v: Integer): Integer {
+    return wrappingAdd(wrappingMultiply(h, 1099511628211), v)
+}
+
+public function hashFloat(f: Float): Integer {
+    if f == 0.0 { return hashInt(0) }
+    let b = Bytes(8)
+    b.setFloat64(0, f)
+    return hashInt(b.getInt64(0))
+}
+
+// ---------------------------------------------------------------- integer parsing
+
+// Result holder for parsers (avoids allocating per call when reused).
+public record Parsed {
+    ok: Boolean
+    i: Integer
+    f: Float
+    scale: Integer
+    aux: Integer
+    aux2: Integer
+}
+
+public function newParsed(): Parsed {
+    return Parsed { ok: false; i: 0; f: 0.0; scale: 0; aux: 0; aux2: 0 }
+}
+
+function isSpace(c: Integer): Boolean {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+// Parse a signed integer in [lo, hi]. ok=false on syntax error; aux=1 when out of range.
+public function parseInt(b: Bytes, o: Integer, l: Integer, p: Parsed, lo: Integer, hi: Integer) {
+    p.ok = false
+    p.aux = 0
+    let i = o
+    let e = o + l
+    while i < e && isSpace(b[i]) { i += 1 }
+    while e > i && isSpace(b[e - 1]) { e -= 1 }
+    if i >= e { return }
+    let neg = false
+    if b[i] == 45 {
+        neg = true
+        i += 1
+    } else if b[i] == 43 {
+        i += 1
+    }
+    if i >= e { return }
+    let base = 10
+    if i + 2 < e && b[i] == 48 {
+        let x = b[i + 1]
+        if x == 120 || x == 88 { base = 16 }
+        if x == 111 || x == 79 { base = 8 }
+        if x == 98 || x == 66 { base = 2 }
+        if base != 10 { i += 2 }
+    }
+    if base != 10 {
+        // accumulate on the negative side so the minimum (-0x8000000000000000) is reachable
+        let acc = 0
+        let any = false
+        while i < e {
+            let c = b[i]
+            let d = -1
+            if c >= 48 && c <= 57 { d = c - 48 }
+            if c >= 97 && c <= 102 { d = c - 87 }
+            if c >= 65 && c <= 70 { d = c - 55 }
+            if c == 95 {
+                // an underscore must be followed by another digit (allowed right after the prefix)
+                if i + 1 >= e { return }
+                let n2 = b[i + 1]
+                let d2 = -1
+                if n2 >= 48 && n2 <= 57 { d2 = n2 - 48 }
+                if n2 >= 97 && n2 <= 102 { d2 = n2 - 87 }
+                if n2 >= 65 && n2 <= 70 { d2 = n2 - 55 }
+                if d2 < 0 || d2 >= base { return }
+                i += 1
+                continue
+            }
+            if d < 0 || d >= base { return }
+            if acc < (-9223372036854775807 - 1 + d) / base {
+                p.aux = 1
+                return
+            }
+            acc = acc * base - d
+            any = true
+            i += 1
+        }
+        if !any { return }
+        if !neg {
+            if acc == -9223372036854775807 - 1 {
+                p.aux = 1
+                return
+            }
+            acc = -acc
+        }
+        if acc < lo || acc > hi {
+            p.aux = 1
+            return
+        }
+        p.i = acc
+        p.ok = true
+        return
+    }
+    let v = 0
+    let overflow = false
+    while i < e {
+        let c = b[i]
+        if c < 48 || c > 57 {
+            if c == 95 && i + 1 < e && i > o && b[i - 1] >= 48 && b[i - 1] <= 57 { i += 1; continue }
+            return
+        }
+        if !overflow {
+            if v < -922337203685477580 || (v == -922337203685477580 && c - 48 > 8) {
+                overflow = true
+            } else {
+                v = v * 10 - (c - 48)
+            }
+        }
+        i += 1
+    }
+    if overflow {
+        p.aux = 1
+        return
+    }
+    if !neg {
+        if v == -9223372036854775808 {
+            p.aux = 1
+            return
+        }
+        v = -v
+    }
+    if v < lo || v > hi {
+        p.aux = 1
+        return
+    }
+    p.i = v
+    p.ok = true
+}
+
+// ---------------------------------------------------------------- floats
+
+public function pow10float(e: Integer): Float {
+    return pow10f(e)
+}
+
+function pow10f(e: Integer): Float {
+    let r = 1.0
+    let base = 10.0
+    let n = e
+    if n < 0 { n = -n }
+    while n > 0 {
+        if (n & 1) == 1 { r = r * base }
+        base = base * base
+        n = n >> 1
+    }
+    if e < 0 { return 1.0 / r }
+    return r
+}
+
+public function parseFloat(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    parseFloatPrec(b, o, l, p, false)
+}
+
+public function parseFloat4(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    parseFloatPrec(b, o, l, p, true)
+}
+
+// strtod/strtof semantics: correctly rounded (half to even). ok=false on syntax error; aux=1 when the
+// value is out of range (overflows to infinity, or a nonzero value rounds to zero): Postgres raises 22003.
+function parseFloatPrec(b: Bytes, o: Integer, l: Integer, p: Parsed, isFloat4: Boolean) {
+    p.ok = false
+    p.aux = 0
+    let i = o
+    let e = o + l
+    while i < e && isSpace(b[i]) { i += 1 }
+    while e > i && isSpace(b[e - 1]) { e -= 1 }
+    if i >= e { return }
+    let neg = false
+    if b[i] == 45 {
+        neg = true
+        i += 1
+    } else if b[i] == 43 {
+        i += 1
+    }
+    let rest = e - i
+    if rest == 3 && equalsIgnoreCase(b, i, 3, "nan") {
+        p.f = 0.0 / 0.0
+        p.ok = true
+        return
+    }
+    if (rest == 8 && equalsIgnoreCase(b, i, 8, "infinity")) || (rest == 3 && equalsIgnoreCase(b, i, 3, "inf")) {
+        p.f = 1.0 / 0.0
+        if neg { p.f = -1.0 / 0.0 }
+        p.ok = true
+        return
+    }
+    // pass 1: digits span, significant digit count, decimal exponent of the last significant digit
+    let mant = 0
+    let sig = 0
+    let exp10 = 0
+    let sawDigit = false
+    let sawDot = false
+    let digStart = i
+    while i < e {
+        let c = b[i]
+        if c >= 48 && c <= 57 {
+            sawDigit = true
+            if sig > 0 || c != 48 {
+                if sig < 18 { mant = mant * 10 + (c - 48) }
+                sig += 1
+                if sawDot { exp10 -= 1 }
+            } else if sawDot {
+                exp10 -= 1
+            }
+        } else if c == 46 && !sawDot {
+            sawDot = true
+        } else {
+            break
+        }
+        i += 1
+    }
+    let digEnd = i
+    if !sawDigit { return }
+    if i < e {
+        let c = b[i]
+        if c != 101 && c != 69 { return }
+        i += 1
+        let eneg = false
+        if i < e && (b[i] == 45 || b[i] == 43) {
+            eneg = b[i] == 45
+            i += 1
+        }
+        if i >= e { return }
+        let ev = 0
+        while i < e {
+            let d = b[i]
+            if d < 48 || d > 57 { return }
+            if ev < 100000 { ev = ev * 10 + (d - 48) }
+            i += 1
+        }
+        if eneg { ev = -ev }
+        exp10 += ev
+    }
+    // digits beyond the 18 kept in mant: value = all significant digits * 10^exp10
+    p.ok = true
+    if sig == 0 {
+        p.f = 0.0
+        if neg { p.f = -0.0 }
+        return
+    }
+    let f = 0.0
+    let done = false
+    if sig <= 15 && !isFloat4 {
+        if exp10 >= 0 && exp10 <= 22 {
+            f = Float(mant) * pow10f(exp10)
+            done = true
+        } else if exp10 < 0 && exp10 >= -22 {
+            f = Float(mant) / pow10f(-exp10)
+            done = true
+        } else if exp10 > 22 && exp10 <= 37 - sig {
+            f = (Float(mant) * pow10f(exp10 - 22)) * pow10f(22)
+            done = true
+        }
+    } else if sig <= 15 && isFloat4 && exp10 >= 0 && exp10 <= 15 - sig {
+        // exact integer below 2^53: one rounding to float4
+        f = Float(mant) * pow10f(exp10)
+        done = true
+    }
+    if !done {
+        let dig = Bytes()
+        let j = digStart
+        let started = false
+        let fracSeen = false
+        let kept = 0
+        while j < digEnd {
+            let c = b[j]
+            if c == 46 {
+                fracSeen = true
+            } else if started || c != 48 {
+                started = true
+                dig.add(c - 48)
+                kept += 1
+            }
+            j += 1
+        }
+        if isFloat4 {
+            f = nm.decimalToBinary(dig, exp10, 24, -149, 127)
+        } else {
+            f = nm.decimalToBinary(dig, exp10, 53, -1074, 1023)
+        }
+    }
+    if isFloat4 {
+        let fb = Bytes(4)
+        fb.setFloat32(0, f)
+        f = fb.getFloat32(0)
+    }
+    if f == 0.0 || f > 1.7976931348623157e308 || (isFloat4 && f > 3.4028234663852886e38) {
+        p.aux = 1
+    }
+    if neg { f = -f }
+    p.f = f
+}
+
+// Shortest digits of a float (a > 0): fills digits (ASCII, no trailing zeros) and returns the scientific exponent.
+// Uses Minyar's shortest round-trip Float printing.
+function floatDigits(f: Float, digits: Bytes): Integer {
+    let s = Bytes(Text(f))
+    digits.clear()
+    let n = s.length
+    let end = n
+    let expAdj = 0
+    let i = 0
+    while i < n {
+        if s[i] == 101 || s[i] == 69 {
+            end = i
+            let p = newParsed()
+            parseInt(s, i + 1, n - i - 1, p, -100000, 100000)
+            expAdj = p.i
+        }
+        i += 1
+    }
+    let intDigits = 0
+    let seenPoint = false
+    let lead = 0
+    let started = false
+    i = 0
+    while i < end {
+        let c = s[i]
+        if c == 46 {
+            seenPoint = true
+        } else if c >= 48 && c <= 57 {
+            if !seenPoint { intDigits += 1 }
+            if !started && c == 48 {
+                lead += 1
+            } else {
+                started = true
+                digits.add(c)
+            }
+        }
+        i += 1
+    }
+    while digits.length > 1 && digits[digits.length - 1] == 48 {
+        digits.resize(digits.length - 1)
+    }
+    if digits.length == 0 {
+        digits.add(48)
+        return 0
+    }
+    return intDigits - 1 - lead + expAdj
+}
+
+// PG float8out / float4out (extra_float_digits = 1: shortest exact representation).
+public function addFloat(out: Bytes, f: Float, isFloat4: Boolean) {
+    if f != f {
+        addText(out, "NaN")
+        return
+    }
+    if f > 1.7976931348623157e308 {
+        addText(out, "Infinity")
+        return
+    }
+    if f < -1.7976931348623157e308 {
+        addText(out, "-Infinity")
+        return
+    }
+    let digits = Bytes()
+    let neg = f < 0.0
+    if f == 0.0 {
+        let bits = Bytes(8)
+        bits.setFloat64(0, f)
+        if bits.getInt64(0) != 0 { out.add(45) }
+        out.add(48)
+        return
+    }
+    let a = f
+    if neg { a = -f }
+    let exp = 0
+    if isFloat4 {
+        exp = float4Digits(a, digits)
+    } else {
+        exp = floatDigits(a, digits)
+    }
+    if neg { out.add(45) }
+    let nd = digits.length
+    let limit = 15
+    if isFloat4 { limit = 6 }
+    if exp < -4 || exp >= limit {
+        out.add(digits[0])
+        if nd > 1 {
+            out.add(46)
+            let i = 1
+            while i < nd {
+                out.add(digits[i])
+                i += 1
+            }
+        }
+        out.add(101)
+        let ee = exp
+        if ee < 0 {
+            out.add(45)
+            ee = -ee
+        } else {
+            out.add(43)
+        }
+        if ee < 10 { out.add(48) }
+        addInt(out, ee)
+        return
+    }
+    if exp < 0 {
+        out.add(48)
+        out.add(46)
+        let z = -exp - 1
+        while z > 0 {
+            out.add(48)
+            z -= 1
+        }
+        let i = 0
+        while i < nd {
+            out.add(digits[i])
+            i += 1
+        }
+        return
+    }
+    // exp >= 0: integer part has exp+1 digits
+    let i = 0
+    while i <= exp {
+        if i < nd { out.add(digits[i]) } else { out.add(48) }
+        i += 1
+    }
+    if nd > exp + 1 {
+        out.add(46)
+        while i < nd {
+            out.add(digits[i])
+            i += 1
+        }
+    }
+}
+
+// Shortest digits that round-trip through float32.
+function float4Digits(a: Float, digits: Bytes): Integer {
+    let target = Bytes(4)
+    target.setFloat32(0, a)
+    let want = target.getFloat32(0)
+    let tmp = Bytes(4)
+    let all = Bytes()
+    let exp = floatDigits(want, all)
+    let p = 1
+    while p <= 9 {
+        // round `all` to p significant digits
+        digits.clear()
+        let carry = false
+        if p < all.length && all[p] >= 53 { carry = true }
+        let k = 0
+        while k < p {
+            if k < all.length { digits.add(all[k]) } else { digits.add(48) }
+            k += 1
+        }
+        let e2 = exp
+        if carry {
+            let j = p - 1
+            let done = false
+            while j >= 0 && !done {
+                if digits[j] == 57 {
+                    digits[j] = 48
+                    j -= 1
+                } else {
+                    digits[j] = digits[j] + 1
+                    done = true
+                }
+            }
+            if !done {
+                let nd = Bytes()
+                nd.add(49)
+                nd.addBytes(digits.slice(0, p - 1))
+                digits.clear()
+                digits.addBytes(nd)
+                e2 += 1
+            }
+        }
+        // value = 0.d1d2.. * 10^(e2+1)
+        let m = 0
+        let q = 0
+        while q < digits.length {
+            m = m * 10 + (digits[q] - 48)
+            q += 1
+        }
+        let v = Float(m) * pow10f(e2 - digits.length + 1)
+        if e2 - digits.length + 1 < 0 { v = Float(m) / pow10f(digits.length - 1 - e2) }
+        tmp.setFloat32(0, v)
+        if tmp.getFloat32(0) == want {
+            while digits.length > 1 && digits[digits.length - 1] == 48 {
+                digits.resize(digits.length - 1)
+            }
+            return e2
+        }
+        p += 1
+    }
+    digits.clear()
+    digits.addBytes(all)
+    return exp
+}
+
+public function floatText(f: Float): Text {
+    let b = Bytes()
+    addFloat(b, f, false)
+    return Text(b)
+}
+
+// ---------------------------------------------------------------- numeric (scaled int64)
+
+public function pow10i(n: Integer): Integer {
+    let r = 1
+    let i = 0
+    if n > 18 { n = 18 }
+    while i < n {
+        r = r * 10
+        i += 1
+    }
+    return r
+}
+
+// Parse a numeric literal into (p.i unscaled, p.scale). ok=false on syntax error; aux=1 on overflow.
+public function parseNumeric(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    p.ok = false
+    p.aux = 0
+    let i = o
+    let e = o + l
+    while i < e && isSpace(b[i]) { i += 1 }
+    while e > i && isSpace(b[e - 1]) { e -= 1 }
+    if i >= e { return }
+    let neg = false
+    if b[i] == 45 {
+        neg = true
+        i += 1
+    } else if b[i] == 43 {
+        i += 1
+    }
+    let v = 0
+    let scale = 0
+    let sawDot = false
+    let sawDigit = false
+    while i < e {
+        let c = b[i]
+        if c >= 48 && c <= 57 {
+            sawDigit = true
+            if v > 922337203685477579 {
+                p.aux = 1
+                return
+            }
+            v = v * 10 + (c - 48)
+            if sawDot { scale += 1 }
+        } else if c == 46 && !sawDot {
+            sawDot = true
+        } else {
+            break
+        }
+        i += 1
+    }
+    if !sawDigit { return }
+    if i < e {
+        let c = b[i]
+        if c != 101 && c != 69 { return }
+        i += 1
+        let eneg = false
+        if i < e && (b[i] == 45 || b[i] == 43) {
+            eneg = b[i] == 45
+            i += 1
+        }
+        if i >= e { return }
+        let ev = 0
+        while i < e {
+            let d = b[i]
+            if d < 48 || d > 57 { return }
+            ev = ev * 10 + (d - 48)
+            if ev > 1000 {
+                p.aux = 1
+                return
+            }
+            i += 1
+        }
+        if eneg {
+            scale += ev
+        } else {
+            while ev > 0 {
+                if scale > 0 {
+                    scale -= 1
+                } else {
+                    if v > 922337203685477579 {
+                        p.aux = 1
+                        return
+                    }
+                    v = v * 10
+                }
+                ev -= 1
+            }
+        }
+    }
+    if scale > 18 {
+        // more fractional digits than the scaled Int64 holds: the caller uses numeric.min
+        p.aux = 1
+        return
+    }
+    if neg { v = -v }
+    p.i = v
+    p.scale = scale
+    p.ok = true
+}
+
+function roundDiv10(v: Integer): Integer {
+    let q = v / 10
+    let r = v % 10
+    if r >= 5 { q += 1 }
+    if r <= -5 { q -= 1 }
+    return q
+}
+
+// Rescale an unscaled value from scale s to scale t (rounding half away from zero). ok via p.ok.
+public function rescale(v: Integer, s: Integer, t: Integer, p: Parsed) {
+    p.ok = true
+    if t == s {
+        p.i = v
+        return
+    }
+    if t > s {
+        let k = t - s
+        let r = v
+        while k > 0 {
+            if r > 922337203685477580 || r < -922337203685477580 {
+                p.ok = false
+                return
+            }
+            r = r * 10
+            k -= 1
+        }
+        p.i = r
+        return
+    }
+    let k = s - t
+    if k > 18 {
+        p.i = 0
+        return
+    }
+    let d = pow10i(k)
+    let q = v / d
+    let r = v % d
+    if r * 2 >= d { q += 1 }
+    if r * 2 <= -d { q -= 1 }
+    p.i = q
+}
+
+public function addNumeric(out: Bytes, v: Integer, scale: Integer) {
+    if scale <= 0 {
+        addInt(out, v)
+        return
+    }
+    let neg = v < 0
+    let digits = Bytes()
+    if neg {
+        out.add(45)
+        if v == -9223372036854775808 {
+            addText(digits, "9223372036854775808")
+        } else {
+            addInt(digits, -v)
+        }
+    } else {
+        addInt(digits, v)
+    }
+    let n = digits.length
+    if n <= scale {
+        out.add(48)
+        out.add(46)
+        let z = scale - n
+        while z > 0 {
+            out.add(48)
+            z -= 1
+        }
+        out.addBytes(digits)
+        return
+    }
+    out.addBytes(digits.slice(0, n - scale))
+    out.add(46)
+    out.addBytes(digits.slice(n - scale, n))
+}
+
+public function numericText(v: Integer, scale: Integer): Text {
+    let b = Bytes()
+    addNumeric(b, v, scale)
+    return Text(b)
+}
+
+// Number of decimal digits of |v| (v != 0) (1 for 0).
+public function digitCount(v: Integer): Integer {
+    if v < 0 {
+        if v == -9223372036854775808 { return 19 }
+        v = -v
+    }
+    let n = 1
+    while v >= 10 {
+        v = v / 10
+        n += 1
+    }
+    return n
+}
+
+// PG select_div_scale for numeric division; (v1,s1)/(v2,s2).
+public function divScale(v1: Integer, s1: Integer, v2: Integer, s2: Integer): Integer {
+    let q = newParsed()
+    nbaseWeight(v1, s1, q)
+    let w1 = q.aux
+    let f1 = q.aux2
+    nbaseWeight(v2, s2, q)
+    let w2 = q.aux
+    let f2 = q.aux2
+    let qweight = w1 - w2
+    if f1 <= f2 { qweight -= 1 }
+    let rscale = 16 - qweight * 4
+    if rscale < s1 { rscale = s1 }
+    if rscale < s2 { rscale = s2 }
+    if rscale < 0 { rscale = 0 }
+    if rscale > 1000 { rscale = 1000 }
+    return rscale
+}
+
+// Weight (base 10000) and first base-10000 digit of v * 10^-s.
+function nbaseWeight(v: Integer, s: Integer, q: Parsed) {
+    if v < 0 { v = -v }
+    if v == 0 {
+        q.aux = 0
+        q.aux2 = 0
+        return
+    }
+    // integer digits count of the value
+    let nd = digitCount(v)
+    let intDigits = nd - s       // may be <= 0
+    // align: total digits positions relative to the point; groups of 4 aligned at the decimal point
+    // position of most significant digit: p = intDigits - 1 (power of ten)
+    let p = intDigits - 1
+    // weight = floor(p / 4)
+    let w = 0
+    if p >= 0 { w = p / 4 } else { w = -((-p + 3) / 4) }
+    // first digit group = floor(value / 10000^w) mod 10000, value = v * 10^-s
+    // group exponent in unscaled units: 10^(4w + s)
+    let shift = 4 * w + s
+    let g = 0
+    if shift >= 0 {
+        if shift > 18 { g = 0 } else { g = v / pow10i(shift) }
+    } else {
+        g = v * pow10i(-shift)
+    }
+    q.aux2 = g % 10000
+    q.aux = w
+}
+
+// Division of scaled numerics with rounding to rscale. Returns false on overflow / division by zero handled by caller.
+public function numericDiv(v1: Integer, s1: Integer, v2: Integer, s2: Integer, rscale: Integer, p: Parsed) {
+    // result = (v1 / 10^s1) / (v2 / 10^s2) = v1 * 10^(s2 - s1) / v2 ; scaled by 10^rscale:
+    // R = v1 * 10^(s2 - s1 + rscale) / v2
+    p.ok = true
+    let neg = (v1 < 0) != (v2 < 0)
+    let a = v1
+    if a < 0 { a = -a }
+    let b = v2
+    if b < 0 { b = -b }
+    let k = s2 - s1 + rscale
+    // if k < 0, divide a by 10^-k first (with remainder tracked approximately)
+    if k < 0 && -k > 18 {
+        p.i = 0
+        return
+    }
+    if k < 0 {
+        let d = pow10i(-k)
+        // a / (d*b): compute as (a / d) / b with rounding on the combined remainder
+        let q1 = a / d
+        let r1 = a % d
+        let q = q1 / b
+        let r = q1 % b
+        // remainder fraction = (r*d + r1) / (b*d) ; round half up
+        if r >= b - r { q += 1 }
+        if neg { q = -q }
+        p.i = q
+        return
+    }
+    let q = a / b
+    let r = a % b
+    let i = 0
+    while i < k {
+        if q > 922337203685477580 {
+            p.ok = false
+            return
+        }
+        // r < b; r*10 may overflow if b is huge
+        if r > 922337203685477580 {
+            p.ok = false
+            return
+        }
+        let r10 = r * 10
+        q = q * 10 + r10 / b
+        r = r10 % b
+        i += 1
+    }
+    if r > 461168601842738790 {
+        if r >= b - r { q += 1 }
+    } else if r * 2 >= b {
+        q += 1
+    }
+    if neg { q = -q }
+    p.i = q
+}
+
+// ---------------------------------------------------------------- dates and timestamps
+
+public function date2j(y: Integer, m: Integer, d: Integer): Integer {
+    if m > 2 {
+        m += 1
+        y += 4800
+    } else {
+        m += 13
+        y += 4799
+    }
+    let century = y / 100
+    let julian = y * 365 - 32167
+    julian += y / 4 - century + century / 4
+    julian += 7834 * m / 256 + d
+    return julian
+}
+
+// Fills p.i = year, p.aux = month, p.aux2 = day
+public function j2date(jd: Integer, p: Parsed) {
+    let julian = jd + 32044
+    let quad = julian / 146097
+    let extra = (julian - quad * 146097) * 4 + 3
+    julian += 60 + quad * 3 + extra / 146097
+    quad = julian / 1461
+    julian -= quad * 1461
+    let y = julian * 4 / 1461
+    if y != 0 {
+        julian = (julian + 305) % 365
+    } else {
+        julian = (julian + 306) % 366
+    }
+    julian += 123
+    y += quad * 4
+    p.i = y - 4800
+    quad = julian * 2141 / 65536
+    p.aux2 = julian - 7834 * quad / 256
+    p.aux = (quad + 10) % 12 + 1
+}
+
+public function daysInMonth(y: Integer, m: Integer): Integer {
+    if m == 2 {
+        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { return 29 }
+        return 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { return 30 }
+    return 31
+}
+
+function add2(out: Bytes, v: Integer) {
+    out.add(48 + v / 10)
+    out.add(48 + v % 10)
+}
+
+public function addDate(out: Bytes, days: Integer) {
+    let p = newParsed()
+    j2date(days + POSTGRES_EPOCH_JDATE, p)
+    let y = p.i
+    let bc = false
+    if y <= 0 {
+        bc = true
+        y = -y + 1
+    }
+    if y < 1000 {
+        if y < 10 { out.add(48) }
+        if y < 100 { out.add(48) }
+        out.add(48)
+    }
+    addInt(out, y)
+    out.add(45)
+    add2(out, p.aux)
+    out.add(45)
+    add2(out, p.aux2)
+    if bc { addText(out, " BC") }
+}
+
+public function addTime(out: Bytes, micros: Integer) {
+    let secs = micros / 1000000
+    let frac = micros % 1000000
+    add2(out, secs / 3600)
+    out.add(58)
+    add2(out, (secs / 60) % 60)
+    out.add(58)
+    add2(out, secs % 60)
+    if frac > 0 {
+        out.add(46)
+        let digits = Bytes()
+        let f = frac + 1000000
+        addInt(digits, f)
+        let n = 7
+        while n > 2 && digits[n - 1] == 48 { n -= 1 }
+        out.addBytes(digits.slice(1, n))
+    }
+}
+
+public function addTimestamp(out: Bytes, ts: Integer, withZone: Boolean) {
+    let days = ts / USECS_PER_DAY
+    let rem = ts % USECS_PER_DAY
+    if rem < 0 {
+        rem += USECS_PER_DAY
+        days -= 1
+    }
+    addDate(out, days)
+    out.add(32)
+    addTime(out, rem)
+    if withZone { addText(out, "+00") }
+}
+
+public function addInterval(out: Bytes, micros: Integer, days: Integer, months: Integer) {
+    let first = true
+    let years = months / 12
+    let mons = months % 12
+    if years != 0 {
+        addInt(out, years)
+        if years == 1 || years == -1 { addText(out, " year") } else { addText(out, " years") }
+        first = false
+    }
+    if mons != 0 {
+        if !first { out.add(32) }
+        addInt(out, mons)
+        if mons == 1 || mons == -1 { addText(out, " mon") } else { addText(out, " mons") }
+        first = false
+    }
+    if days != 0 {
+        if !first { out.add(32) }
+        addInt(out, days)
+        if days == 1 || days == -1 { addText(out, " day") } else { addText(out, " days") }
+        first = false
+    }
+    if micros != 0 || first {
+        if !first { out.add(32) }
+        let m = micros
+        if m < 0 {
+            out.add(45)
+            m = -m
+        }
+        let secs = m / 1000000
+        let h = secs / 3600
+        if h < 10 { out.add(48) }
+        addInt(out, h)
+        out.add(58)
+        add2(out, (secs / 60) % 60)
+        out.add(58)
+        add2(out, secs % 60)
+        let frac = m % 1000000
+        if frac > 0 {
+            out.add(46)
+            let digits = Bytes()
+            addInt(digits, frac + 1000000)
+            let n = 7
+            while n > 2 && digits[n - 1] == 48 { n -= 1 }
+            out.addBytes(digits.slice(1, n))
+        }
+    }
+}
+
+function readNum(b: Bytes, i: Integer, e: Integer, p: Parsed): Integer {
+    // reads digits from i; p.i = value, p.scale = digit count; returns new index
+    let v = 0
+    let n = 0
+    while i < e && b[i] >= 48 && b[i] <= 57 {
+        if n < 18 { v = v * 10 + (b[i] - 48) }
+        n += 1
+        i += 1
+    }
+    p.i = v
+    p.scale = n
+    return i
+}
+
+// Parse 'YYYY-MM-DD' (also YYYYMMDD) -> p.i = days since 2000-01-01. Allows a trailing time part when allowTime.
+public function parseDate(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    p.ok = false
+    let i = o
+    let e = o + l
+    while i < e && isSpace(b[i]) { i += 1 }
+    while e > i && isSpace(b[e - 1]) { e -= 1 }
+    let q = newParsed()
+    i = readNum(b, i, e, q)
+    if q.scale == 0 { return }
+    let y = q.i
+    let m = 0
+    let d = 0
+    if q.scale == 8 && (i >= e || b[i] == 32 || b[i] == 84) {
+        d = y % 100
+        m = (y / 100) % 100
+        y = y / 10000
+    } else {
+        if i >= e || (b[i] != 45 && b[i] != 47) { return }
+        i += 1
+        i = readNum(b, i, e, q)
+        if q.scale == 0 { return }
+        m = q.i
+        if i >= e || (b[i] != 45 && b[i] != 47) { return }
+        i += 1
+        i = readNum(b, i, e, q)
+        if q.scale == 0 { return }
+        d = q.i
+    }
+    if m < 1 || m > 12 || d < 1 || d > daysInMonth(y, m) {
+        p.aux = 1
+        return
+    }
+    if y > 5874898 {
+        p.aux = 1
+        return
+    }
+    p.i = date2j(y, m, d) - POSTGRES_EPOCH_JDATE
+    if p.i < DATE_MIN_DAYS || p.i >= DATE_END_DAYS {
+        p.aux = 1
+        return
+    }
+    p.aux2 = i - o  // consumed
+    p.ok = true
+    // remaining text must be empty or a time part (handled by parseTimestamp)
+    if i < e {
+        p.aux2 = i
+        p.scale = 1
+    } else {
+        p.scale = 0
+    }
+}
+
+public function parseTimestamp(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    let e = o + l
+    while e > o && isSpace(b[e - 1]) { e -= 1 }
+    parseDate(b, o, l, p)
+    if !p.ok { return }
+    let days = p.i
+    if days >= TS_END / USECS_PER_DAY + 1 {
+        p.ok = false
+        p.aux = 1
+        return
+    }
+    let micros = 0
+    if p.scale == 1 {
+        let i = p.aux2
+        p.ok = false
+        if b[i] != 32 && b[i] != 84 { return }
+        i += 1
+        while i < e && b[i] == 32 { i += 1 }
+        let q = newParsed()
+        i = readNum(b, i, e, q)
+        if q.scale == 0 { return }
+        let hh = q.i
+        let mm = 0
+        let ss = 0
+        let frac = 0
+        if i < e && b[i] == 58 {
+            i += 1
+            i = readNum(b, i, e, q)
+            mm = q.i
+            if i < e && b[i] == 58 {
+                i += 1
+                i = readNum(b, i, e, q)
+                ss = q.i
+                if i < e && b[i] == 46 {
+                    i += 1
+                    let start = i
+                    i = readNum(b, i, e, q)
+                    let n = i - start
+                    let f = q.i
+                    if n > 6 {
+                        let k = n - 6
+                        let digitsVal = 0
+                        let j = 0
+                        f = 0
+                        while j < 6 {
+                            f = f * 10 + (b[start + j] - 48)
+                            j += 1
+                        }
+                        if b[start + 6] >= 53 { f += 1 }
+                        digitsVal = k
+                    } else {
+                        while n < 6 {
+                            f = f * 10
+                            n += 1
+                        }
+                    }
+                    frac = f
+                }
+            }
+        }
+        // optional zone suffix: +00, Z, +00:00 (ignored: treated as UTC)
+        while i < e && b[i] == 32 { i += 1 }
+        if i < e {
+            let c = b[i]
+            if c != 43 && c != 45 && c != 90 && c != 122 && !(c == 85 || c == 117) { return }
+        }
+        if hh > 24 || mm > 59 || ss > 60 { return }
+        micros = ((hh * 60 + mm) * 60 + ss) * 1000000 + frac
+        p.ok = true
+    }
+    p.i = days * USECS_PER_DAY + micros
+}
+
+public function parseBool(b: Bytes, o: Integer, l: Integer, p: Parsed) {
+    p.ok = false
+    let i = o
+    let e = o + l
+    while i < e && isSpace(b[i]) { i += 1 }
+    while e > i && isSpace(b[e - 1]) { e -= 1 }
+    let n = e - i
+    if n == 0 { return }
+    let c = b[i]
+    if c >= 65 && c <= 90 { c += 32 }
+    // PG accepts any unique prefix of true/false/yes/no, "on", and "of"/"off"
+    if c == 116 && prefixCI(b, i, n, "true") { p.i = 1; p.ok = true; return }
+    if c == 102 && prefixCI(b, i, n, "false") { p.i = 0; p.ok = true; return }
+    if c == 121 && prefixCI(b, i, n, "yes") { p.i = 1; p.ok = true; return }
+    if c == 110 && prefixCI(b, i, n, "no") { p.i = 0; p.ok = true; return }
+    if n == 1 && c == 49 { p.i = 1; p.ok = true; return }
+    if n == 1 && c == 48 { p.i = 0; p.ok = true; return }
+    if equalsIgnoreCase(b, i, n, "on") { p.i = 1; p.ok = true; return }
+    if n >= 2 && prefixCI(b, i, n, "off") { p.i = 0; p.ok = true; return }
+}
+
+// b[i, i+n) is a case-insensitive prefix of the lower-case word.
+function prefixCI(b: Bytes, i: Integer, n: Integer, word: Text): Boolean {
+    let w = Bytes(word)
+    if n > w.length { return false }
+    let k = 0
+    while k < n {
+        let c = b[i + k]
+        if c >= 65 && c <= 90 { c += 32 }
+        if c != w[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// Interval text: "3 days", "1 year 2 mons", "90", "01:00:00", "3 month". unitHint: AST INTERVAL_* field (0 none).
+public function parseInterval(b: Bytes, o: Integer, l: Integer, unitHint: Integer, p: Parsed) {
+    p.ok = false
+    let i = o
+    let e = o + l
+    let micros = 0
+    let days = 0
+    let months = 0
+    let any = false
+    while i < e {
+        while i < e && isSpace(b[i]) { i += 1 }
+        if i >= e { break }
+        let neg = false
+        if b[i] == 45 { neg = true; i += 1 } else if b[i] == 43 { i += 1 }
+        let q = newParsed()
+        let start = i
+        i = readNum(b, i, e, q)
+        if q.scale == 0 { return }
+        let v = q.i
+        let fracMicros = 0
+        if i < e && b[i] == 58 {
+            // time hh:mm[:ss]
+            i += 1
+            i = readNum(b, i, e, q)
+            let mm = q.i
+            let ss = 0
+            if i < e && b[i] == 58 {
+                i += 1
+                i = readNum(b, i, e, q)
+                ss = q.i
+            }
+            if v > 2562047787 || mm > 59 || ss > 59 {
+                p.aux = 2
+                return
+            }
+            let t = ((v * 60 + mm) * 60 + ss) * 1000000
+            if neg { t = -t }
+            if !ivAddOk(micros, t) {
+                p.aux = 2
+                return
+            }
+            micros += t
+            any = true
+            continue
+        }
+        let frac = 0.0
+        if i < e && b[i] == 46 {
+            i += 1
+            let fs = i
+            i = readNum(b, i, e, q)
+            frac = Float(q.i) / pow10f(i - fs)
+        }
+        while i < e && isSpace(b[i]) { i += 1 }
+        let us = i
+        while i < e && ((b[i] >= 97 && b[i] <= 122) || (b[i] >= 65 && b[i] <= 90)) { i += 1 }
+        let ul = i - us
+        if neg { v = -v; frac = -frac }
+        let unit = 0   // 1 year 2 month 3 day 4 hour 5 minute 6 second 7 week
+        if ul == 0 {
+            unit = 6
+            if unitHint == 1 { unit = 1 }
+            if unitHint == 2 { unit = 2 }
+            if unitHint == 3 { unit = 3 }
+            if unitHint == 4 { unit = 4 }
+            if unitHint == 5 { unit = 5 }
+        } else {
+            let c = b[us]
+            if c >= 65 && c <= 90 { c += 32 }
+            if c == 121 { unit = 1 }
+            if c == 100 { unit = 3 }
+            if c == 104 { unit = 4 }
+            if c == 119 { unit = 7 }
+            if c == 115 { unit = 6 }
+            if c == 109 {
+                // mon/month vs min/minute vs ms
+                if ul >= 2 {
+                    let c2 = b[us + 1]
+                    if c2 >= 65 && c2 <= 90 { c2 += 32 }
+                    if c2 == 111 { unit = 2 } else { unit = 5 }
+                } else {
+                    unit = 5
+                }
+            }
+            if unit == 0 { return }
+        }
+        // Postgres: years/months/days/weeks are int32 fields, the time part an int64 of microseconds (22015)
+        let lim = 2147483647
+        if unit == 4 { lim = 2562047787 }
+        if unit == 5 { lim = 153722867280 }
+        if unit == 6 { lim = 9223372036854 }
+        if v > lim || v < -lim {
+            p.aux = 2
+            return
+        }
+        let dm = 0
+        let dd = 0
+        let du = 0
+        if unit == 1 { dm = v * 12 + Integer(frac * 12.0) }
+        if unit == 2 { dm = v; dd = Integer(frac * 30.0) }
+        if unit == 3 { dd = v; du = Integer(frac * 86400000000.0) }
+        if unit == 7 { dd = v * 7; du = Integer(frac * 7.0 * 86400000000.0) }
+        if unit == 4 { du = v * 3600000000 + Integer(frac * 3600000000.0) }
+        if unit == 5 { du = v * 60000000 + Integer(frac * 60000000.0) }
+        if unit == 6 { du = v * 1000000 + Integer(frac * 1000000.0) }
+        months += dm
+        days += dd
+        if !ivAddOk(micros, du) || months > 2147483647 || months < -2147483648 || days > 2147483647 || days < -2147483648 {
+            p.aux = 2
+            return
+        }
+        micros += du
+        any = true
+    }
+    if !any { return }
+    p.i = micros
+    p.aux = days
+    p.aux2 = months
+    p.ok = true
+}
+
+function ivAddOk(a: Integer, b: Integer): Boolean {
+    if b > 0 { return a <= 9223372036854775807 - b }
+    return a >= -9223372036854775807 - 1 - b
+}
+
+// Postgres date / timestamp ranges (days and microseconds since 2000-01-01)
+public constant DATE_MIN_DAYS = -2451545
+public constant DATE_END_DAYS = 2145031949
+public constant TS_MIN = -211813488000000000
+public constant TS_END = 9223371331200000000
+
+// ts + interval with Postgres's range checks: p.ok = false when the result is outside the timestamp range.
+public function timestampAddIntervalChecked(ts: Integer, micros: Integer, days: Integer, months: Integer, p: Parsed) {
+    p.ok = false
+    let r = ts
+    if months != 0 {
+        let d = ts / USECS_PER_DAY
+        let rem = ts % USECS_PER_DAY
+        if rem < 0 {
+            rem += USECS_PER_DAY
+            d -= 1
+        }
+        let nd = dateAddMonths(d, months)
+        if nd < -2451545 || nd > 106751992 { return }
+        r = nd * USECS_PER_DAY + rem
+    }
+    // more than ~110 million days moves any timestamp out of range (and would overflow the multiply)
+    if days > 110000000 || days < -110000000 { return }
+    let dm = days * USECS_PER_DAY
+    if !ivAddOk(r, dm) { return }
+    r += dm
+    if !ivAddOk(r, micros) { return }
+    r += micros
+    if r < TS_MIN || r >= TS_END { return }
+    p.i = r
+    p.ok = true
+}
+
+// Add months to a date (days since epoch), clamping the day like PG.
+public function dateAddMonths(days: Integer, months: Integer): Integer {
+    let p = newParsed()
+    j2date(days + POSTGRES_EPOCH_JDATE, p)
+    let y = p.i
+    let m = p.aux + months
+    let d = p.aux2
+    // normalise
+    let mz = m - 1
+    y += mz / 12
+    mz = mz % 12
+    if mz < 0 {
+        mz += 12
+        y -= 1
+    }
+    m = mz + 1
+    let dim = daysInMonth(y, m)
+    if d > dim { d = dim }
+    return date2j(y, m, d) - POSTGRES_EPOCH_JDATE
+}
+
+public function timestampAddInterval(ts: Integer, micros: Integer, days: Integer, months: Integer): Integer {
+    let r = ts
+    if months != 0 {
+        let d = ts / USECS_PER_DAY
+        let rem = ts % USECS_PER_DAY
+        if rem < 0 {
+            rem += USECS_PER_DAY
+            d -= 1
+        }
+        r = dateAddMonths(d, months) * USECS_PER_DAY + rem
+    }
+    return r + days * USECS_PER_DAY + micros
+}
+
+// Division with PG's result scale, reduced until the result fits in int64. p.i = value, p.scale = scale.
+public function numericDivFit(v1: Integer, s1: Integer, v2: Integer, s2: Integer, p: Parsed) {
+    let rs = divScale(v1, s1, v2, s2)
+    numericDiv(v1, s1, v2, s2, rs, p)
+    while !p.ok && rs > 0 {
+        rs -= 1
+        numericDiv(v1, s1, v2, s2, rs, p)
+    }
+    p.scale = rs
+}

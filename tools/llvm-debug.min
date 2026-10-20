@@ -1,9 +1,10 @@
-// Source line tables for generated Minyar IR. No temporary LLVM filenames are
+// Source locations and variable descriptions for generated Minyar IR. No temporary LLVM filenames are
 // presented as source files, and this pass never changes release-mode IR.
 use "./driver-support.min" as host
+use "./llvm-debug-types.min" as debugTypes
 
 record Origin { line: Integer; column: Integer; file: Text }
-record Metadata { nodes: List<Text>; files: List<Text>; ids: List<Integer> }
+record Metadata { nodes: List<Text>; files: List<Text>; ids: List<Integer>; typeNames: List<Text>; typeIds: List<Integer> }
 function node(metadata: Metadata, value: Text): Integer {
     let id = metadata.nodes.length
     metadata.nodes.add("!" + Text(id) + " = " + value + "\n")
@@ -33,6 +34,34 @@ function origin(value: Text, fallback: Text): Origin {
     if path == "" { path = fallback }
     return Origin { line: Integer(host.textSlice(value, 0, first)); column: Integer(host.textSlice(value, first + 1, second)); file: path }
 }
+function fields(value: Text): List<Text> {
+    let result: List<Text> = []
+    let start = 0
+    while start <= value.byteLength {
+        let end = host.findText(value, "|", start)
+        if end < 0 { end = value.byteLength }
+        result.add(host.textSlice(value, start, end))
+        start = end + 1
+    }
+    return result
+}
+function variableType(metadata: Metadata, llvm: Text, name: Text): Integer {
+    let key = llvm + "|" + name
+    for index in 0..metadata.typeNames.length { if metadata.typeNames[index] == key { return metadata.typeIds[index] } }
+    let encoding = "DW_ATE_signed"
+    let size = 64
+    if llvm == "i1" { encoding = "DW_ATE_boolean"; size = 8 }
+    else if llvm == "i32" { encoding = "DW_ATE_UTF"; size = 32 }
+    else if llvm == "double" { encoding = "DW_ATE_float" }
+    let id = -1
+    if llvm == "ptr" {
+        let record = node(metadata, "!DICompositeType(tag: DW_TAG_structure_type, name: \"" + name + "\", flags: DIFlagFwdDecl)")
+        id = node(metadata, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + Text(record) + ", size: 64)")
+    } else { id = node(metadata, "!DIBasicType(name: \"" + name + "\", size: " + Text(size) + ", encoding: " + encoding + ")") }
+    metadata.typeNames.add(key)
+    metadata.typeIds.add(id)
+    return id
+}
 public function enabled(flags: List<Text>): Boolean {
     let result = false
     for flag in flags {
@@ -41,12 +70,22 @@ public function enabled(flags: List<Text>): Boolean {
     }
     return result
 }
-public function program(source: Text, path: Text): Text {
+public function full(flags: List<Text>): Boolean {
+    let result = true
+    for flag in flags {
+        if flag == "-g0" || flag == "-g1" || flag == "-gline-tables-only" { result = false }
+        else if flag == "-g" || flag == "-g2" || flag == "-g3" { result = true }
+    }
+    return result
+}
+public function program(source: Text, path: Text, variablesEnabled: Boolean, opaqueRecords: Boolean): Text {
     if host.hasText(source, "!llvm.dbg.cu") { return source }
-    let metadata = Metadata { nodes: []; files: []; ids: [] }
+    let metadata = Metadata { nodes: []; files: []; ids: []; typeNames: []; typeIds: [] }
     let fallback = escaped(host.resolveName(path))
     let root = file(metadata, fallback)
-    let unit = node(metadata, "distinct !DICompileUnit(language: DW_LANG_C, file: !" + Text(root) + ", producer: \"Minyar\", isOptimized: false, runtimeVersion: 0, emissionKind: LineTablesOnly)")
+    let emission = "LineTablesOnly"
+    if variablesEnabled { emission = "FullDebug" }
+    let unit = node(metadata, "distinct !DICompileUnit(language: DW_LANG_C, file: !" + Text(root) + ", producer: \"Minyar\", isOptimized: false, runtimeVersion: 0, emissionKind: " + emission + ")")
     let empty = node(metadata, "!{}")
     let type = node(metadata, "!DISubroutineType(types: !" + Text(empty) + ")")
     let dwarf = node(metadata, "!{i32 7, !\"Dwarf Version\", i32 4}")
@@ -59,6 +98,13 @@ public function program(source: Text, path: Text): Text {
     let scopeFile = -1
     let lastKey = ""
     let location = -1
+    let scopes: List<Integer> = []
+    let depth = 0
+    let retained = -1
+    let variables = ""
+    let types = debugTypes.graph(metadata.nodes, opaqueRecords)
+    let fragmentVariable = -1
+    let fragmentLocation = -1
     for original in host.lines(source) {
         let line = original
         if line.startsWith("; minyar-debug-function: ") {
@@ -66,33 +112,87 @@ public function program(source: Text, path: Text): Text {
             pending = true
         } else if line.startsWith("; minyar-debug-line: ") {
             current = origin(host.textAfter(line, "; minyar-debug-line: "), fallback)
+        } else if variablesEnabled && subprogram >= 0 && (line.startsWith("; minyar-debug-type: ") || line.startsWith("; minyar-debug-field: ") || line.startsWith("; minyar-debug-case: ")) {
+            debugTypes.describe(types, line)
+        } else if variablesEnabled && subprogram >= 0 && line.startsWith("; minyar-debug-fragment: ") {
+            let parts = fields(host.textAfter(line, "; minyar-debug-fragment: "))
+            if parts.length != 3 || fragmentVariable < 0 { host.stop("invalid compiler debug fragment") }
+            let operation = "value"
+            if parts[0].startsWith("ptr ") { operation = "declare" }
+            output.add("    #dbg_" + operation + "(" + parts[0] + ", !" + Text(fragmentVariable) + ", !DIExpression(DW_OP_LLVM_fragment, " + parts[1] + ", " + parts[2] + "), !" + Text(fragmentLocation) + ")\n")
+        } else if subprogram >= 0 && line == "; minyar-debug-scope: begin" {
+            let block = node(metadata, "distinct !DILexicalBlock(scope: !" + Text(scope) + ", file: !" + Text(file(metadata, current.file)) + ")")
+            if depth < scopes.length { scopes[depth] = scope } else { scopes.add(scope) }
+            depth += 1
+            scope = block
+            // Braces do not execute. Until the next real statement origin,
+            // synthetic branches must not inherit an unexecuted sibling arm.
+            current.line = 0
+            current.column = 0
+            lastKey = ""
+        } else if subprogram >= 0 && line == "; minyar-debug-scope: end" {
+            if depth <= 0 { host.stop("unbalanced compiler debug scope") }
+            depth -= 1
+            scope = scopes[depth]
+            lastKey = ""
+        } else if variablesEnabled && subprogram >= 0 && line.startsWith("; minyar-debug-local: ") {
+            let parts = fields(host.textAfter(line, "; minyar-debug-local: "))
+            if parts.length != 6 && parts.length != 7 { host.stop("invalid compiler debug local") }
+            let fileId = file(metadata, current.file)
+            if parts[5] == "0" && (parts[0] == "declare" || parts[0] == "aggregate") {
+                // A binding begins after its initializer. Nesting also preserves
+                // successive declarations with the same name in one source block.
+                scope = node(metadata, "distinct !DILexicalBlock(scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", line: " + Text(current.line) + ", column: " + Text(current.column) + ")")
+                lastKey = ""
+            }
+            let type = -1
+            if parts.length == 7 {
+                if parts[0] == "aggregate" { type = debugTypes.objectType(types, parts[6]) }
+                else { type = debugTypes.valueType(types, parts[6]) }
+            } else { type = variableType(metadata, parts[2], parts[3]) }
+            let variable = node(metadata, "!DILocalVariable(name: \"" + parts[4] + "\", arg: " + parts[5] + ", scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", line: " + Text(current.line) + ", type: !" + Text(type) + ")")
+            if variables != "" { variables += ", " }
+            variables += "!" + Text(variable)
+            let at = node(metadata, "!DILocation(line: " + Text(current.line) + ", column: " + Text(current.column) + ", scope: !" + Text(scope) + ")")
+            fragmentVariable = variable
+            fragmentLocation = at
+            if parts[0] != "aggregate" { output.add("    #dbg_" + parts[0] + "(" + parts[1] + ", !" + Text(variable) + ", !DIExpression(), !" + Text(at) + ")\n") }
         } else if line.startsWith("define ") {
             scope = -1
             subprogram = -1
+            depth = 0
+            variables = ""
+            retained = -1
+            types = debugTypes.graph(metadata.nodes, opaqueRecords)
+            fragmentVariable = -1
             if pending {
                 let begin = host.findText(line, "@", 0)
                 let end = host.findText(line, "(", begin)
                 let name = host.textSlice(line, begin + 1, end)
                 if name.startsWith("\"") && name.endsWith("\"") { name = host.textSlice(name, 1, name.byteLength - 1) }
                 scopeFile = file(metadata, current.file)
-                subprogram = node(metadata, "distinct !DISubprogram(name: \"" + name + "\", linkageName: \"" + name + "\", scope: !" + Text(scopeFile) + ", file: !" + Text(scopeFile) + ", line: " + Text(current.line) + ", type: !" + Text(type) + ", scopeLine: " + Text(current.line) + ", spFlags: DISPFlagDefinition, unit: !" + Text(unit) + ")")
+                retained = node(metadata, "!{}")
+                subprogram = node(metadata, "distinct !DISubprogram(name: \"" + name + "\", linkageName: \"" + name + "\", scope: !" + Text(scopeFile) + ", file: !" + Text(scopeFile) + ", line: " + Text(current.line) + ", type: !" + Text(type) + ", scopeLine: " + Text(current.line) + ", spFlags: DISPFlagDefinition, unit: !" + Text(unit) + ", retainedNodes: !" + Text(retained) + ")")
                 scope = subprogram
                 let brace = host.findText(line, "{", 0)
                 line = host.textSlice(line, 0, brace) + "!dbg !" + Text(scope) + " " + host.textSlice(line, brace, line.byteLength)
                 lastKey = ""
             }
             pending = false
-        } else if line == "}" { scope = -1; subprogram = -1 }
+        } else if line == "}" {
+            if retained >= 0 { metadata.nodes[retained] = "!" + Text(retained) + " = !{" + variables + "}\n" }
+            scope = -1; subprogram = -1; retained = -1
+        }
         else if scope >= 0 && line.startsWith("  ") {
             let instruction = host.strip(line)
             let attach = instruction.startsWith("%") || instruction.startsWith("call ") || instruction.startsWith("tail call ") || instruction.startsWith("musttail call ") || instruction.startsWith("ret ") || instruction.startsWith("br ") || instruction.startsWith("store ") || instruction == "unreachable" || instruction == "]"
             if attach && !host.hasText(line, "!dbg") {
                 let fileId = file(metadata, current.file)
-                let key = Text(current.line) + ":" + Text(current.column) + ":" + Text(fileId)
+                let key = Text(current.line) + ":" + Text(current.column) + ":" + Text(fileId) + ":" + Text(scope)
                 if key != lastKey {
-                    scope = subprogram
-                    if fileId != scopeFile { scope = node(metadata, "!DILexicalBlockFile(scope: !" + Text(subprogram) + ", file: !" + Text(fileId) + ", discriminator: 0)") }
-                    location = node(metadata, "!DILocation(line: " + Text(current.line) + ", column: " + Text(current.column) + ", scope: !" + Text(scope) + ")")
+                    let locationScope = scope
+                    if fileId != scopeFile { locationScope = node(metadata, "!DILexicalBlockFile(scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", discriminator: 0)") }
+                    location = node(metadata, "!DILocation(line: " + Text(current.line) + ", column: " + Text(current.column) + ", scope: !" + Text(locationScope) + ")")
                     lastKey = key
                 }
                 line += ", !dbg !" + Text(location)

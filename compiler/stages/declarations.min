@@ -1,13 +1,15 @@
-function skipDeclaration(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: List<Integer>) {
-    let position = cursor[0]
+function skipDeclaration(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>) {
+    let declaration = cursor[0]
+    let position = declaration
     let kind = tokenKinds[position]
     while kind != 0 && !(kind == 4 && tokenTexts[position] == "{") {
         position = position + 1
         kind = tokenKinds[position]
     }
     if kind == 0 {
-        failCompiler("a declaration is missing its '{ ... }' body")
+        failAtToken(tokenLines, declaration, "a declaration is missing its '{ ... }' body")
     }
+    let opening = position
     position = position + 1
     let depth = 1
     kind = tokenKinds[position]
@@ -26,7 +28,7 @@ function skipDeclaration(tokenKinds: List<Integer>, tokenTexts: List<Text>, curs
     }
     cursor[0] = position
     if depth > 0 {
-        failCompiler("a declaration is missing its closing '}'")
+        failAtToken(tokenLines, opening, "a declaration is missing its closing '}'")
     }
 }
 
@@ -75,8 +77,19 @@ function discoverSyntaxSymbols(tree: SyntaxTree, tokenTexts: List<Text>, tokenLi
             let type = 0
             if kind == 2 {
                 if isThreadType(simpleTypeCode(readableDeclarationName(name))) { failCompiler("reserved thread type name") }
+                if symbolNames.length >= 99000 { failCompiler("nominal type index exceeds the supported limit") }
                 type = 1000 + symbolNames.length
+                let token = tree.nodes[node].body + 1
+                let fields = 0
+                let choice = false
+                while token < tree.nodes[node].end {
+                    if tokenTexts[token] == ":" { fields = fields + 1 }
+                    if resultPrefix(tokenTexts[token], "minyar_choice_tag|") { choice = true }
+                    token = token + 1
+                }
+                if choice && fields == 1 { type = 1000000000 + symbolNames.length }
             } else { kind = 3 }
+            tokenLines.nominalTypes.add(type)
             symbolNames.add(name)
             symbolKinds.add(kind)
             symbolLocations.add(tokenLocation(tokenLines, tree.nodes[node].start + 1))
@@ -85,6 +98,66 @@ function discoverSyntaxSymbols(tree: SyntaxTree, tokenTexts: List<Text>, tokenLi
         }
         declarationEnds.add(tree.nodes[node].end)
         declaration = declaration + 1
+    }
+}
+
+// Register every nominal symbol first, then freeze finite scalar layouts before
+// callback signatures or takeType can capture an ID. Only payload-free enum
+// domains seed this pass: nested scalar niches deliberately remain boxed.
+function discoverScalarChoiceTypes(tree: SyntaxTree, texts: List<Text>, lines: SourceMap, names: List<Text>, kinds: List<Integer>, returns: List<Integer>) {
+    let domains: List<Integer> = []
+    let payloads: List<Integer> = []
+    let index = 0
+    while index < names.length {
+        domains.add(-1)
+        payloads.add(-1)
+        index = index + 1
+    }
+    let declaration = 0
+    while declaration < tree.declarations.length {
+        let node = tree.declarations[declaration]
+        if tree.nodes[node].kind == 2 {
+            let symbol = findIndexedSymbol(lines.symbolLookup, names, kinds, texts[tree.nodes[node].start + 1], 2)
+            let token = tree.nodes[node].body + 1
+            let fields = 0
+            let marker = ""
+            let payload = -1
+            while token < tree.nodes[node].end {
+                if texts[token] == ":" { fields = fields + 1 }
+                if resultPrefix(texts[token], "minyar_choice_tag|") { marker = texts[token] }
+                if resultPrefix(texts[token], "minyar_choice_payload|") { payload = token }
+                token = token + 1
+            }
+            if marker != "" {
+                let cases = marker.split("|")
+                if fields == 1 { domains[symbol] = cases.length - 2 }
+                if fields == 2 && cases.length == 3 && payload >= 0 {
+                    let parts = texts[payload].split("|")
+                    // A concrete scalar payload is one normalized type token.
+                    if parts.length == 3 && findText(cases, parts[1]) > 0 && texts[payload + 1] == ":" && (texts[payload + 3] == ";" || texts[payload + 3] == "}") {
+                        payloads[symbol] = payload + 2
+                    }
+                }
+            }
+        }
+        declaration = declaration + 1
+    }
+    index = 0
+    while index < names.length {
+        if payloads[index] >= 0 {
+            let name = texts[payloads[index]]
+            let primitive = simpleTypeCode(name)
+            let finite = primitive == 4 || primitive == 3
+            if primitive == 0 {
+                let payload = findIndexedSymbol(lines.symbolLookup, names, kinds, name, 2)
+                if payload >= 0 { finite = domains[payload] >= 0 }
+            }
+            if finite {
+                returns[index] = 1000000000 + index
+                lines.nominalTypes[index] = returns[index]
+            }
+        }
+        index = index + 1
     }
 }
 

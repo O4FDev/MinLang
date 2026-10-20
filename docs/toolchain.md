@@ -129,3 +129,35 @@ See the [CLI guide](cli.md) for project dependencies and executable installation
 Optional packages have additional prerequisites: `graphics` uses GLFW,
 while the native Swift/GTK backends use separate compiler/SDK installations.
 The basic hello project does not require those optional backends.
+
+## Compiler ThinLTO cache on Linux
+
+Source builds and first-use bootstrap cache compiler ThinLTO backend objects
+when selecting ELF lld automatically. The default directory is
+`build/thinlto-cache`; `make clean` removes it. Ordinary program links do not
+use this compiler cache. Configure Make or bootstrap through these variables:
+
+```sh
+make COMPILER_LTO_CACHE_DIR='/scratch/minyar compiler cache'
+COMPILER_LTO_CACHE_DIR='/scratch/minyar compiler cache' ./minyar hello.min
+make COMPILER_LTO_CACHE_DIR=  # disable caching while keeping ThinLTO
+```
+
+`COMPILER_LTO_CACHE_POLICY` defaults to
+`cache_size=10%:cache_size_bytes=1g:cache_size_files=10000:prune_after=168h:prune_interval=0s`.
+LLD applies the 10% available-space, 1 GiB and 10,000-file limits together,
+expires entries unused for a week, and scans after every link. These are
+post-link pruning limits; a link can temporarily exceed them. A shared directory
+shares its limits across builds. An override uses LLVM's colon-separated policy
+syntax; setting a limit to zero disables that limit.
+
+Explicit `COMPILER_LTO_FLAGS`, including an empty value, are preserved exactly
+and bypass automatic cache options. A linker selected through `LLVM_FLAGS`
+also receives no automatic cache options. Darwin and Windows do not receive
+automatic compiler caching. To configure another linker, supply its own options
+explicitly. Paths containing spaces, apostrophes or commas are supported.
+
+LLVM derives cache keys from the LLVM version, input modules, imports/exports
+and code generation configuration. Deleting the cache is safe; the next link
+rebuilds its objects. See LLVM's [ThinLTO cache and pruning options](https://clang.llvm.org/docs/ThinLTO.html#incremental)
+and [cache key implementation](https://github.com/llvm/llvm-project/blob/llvmorg-23.1.2/llvm/lib/LTO/LTO.cpp).

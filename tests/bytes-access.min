@@ -1,0 +1,206 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "system" as system
+
+function casePath(compiler: test.Compiler): Text {
+    return compiler.directory + "/case" + Text(compiler.serial)
+}
+
+function functionBody(llvm: Text, name: Text): Text {
+    let active = false
+    let body: List<Text> = []
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " @" + name + "(") { active = true }
+        if active {
+            body.add(line + "\n")
+            if line == "}" { return joinText(body) }
+        }
+    }
+    fail("missing LLVM function: " + name)
+}
+
+function traps(compiler: test.Compiler, source: Text, message: Text) {
+    test.require(test.compile(compiler, source), "compile invalid Bytes access")
+    let path = casePath(compiler)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link invalid Bytes access")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1 && result.output == "", "invalid Bytes access status/output " + optimization + "\n" + result.output + result.errorOutput)
+        test.check(test.sameDiagnostic(result.errorOutput, "Minyar stopped: " + message + "\n"), "Bytes access diagnostic " + optimization + "\n" + result.errorOutput)
+    }
+}
+
+let compiler = test.compiler()
+test.check(processInfo.argumentCount() <= 1, "unexpected Bytes access selector")
+let irOnly = false
+if processInfo.argumentCount() == 1 {
+    test.check(processInfo.argument(0) == "--ir-only", "unknown Bytes access selector")
+    irOnly = true
+}
+
+// This selector compiles once and checks raw IR only, so the previous compiler
+// can demonstrate the missing-helper failure without linking or executing code.
+test.require(test.compile(compiler, "let bytes = Bytes(4)\nbytes[0] = 255\nbytes[3] += 7\nprint(bytes[0])\nprint(bytes.length)\nlet total = 0\nfor byte in bytes { total += byte }\nprint(total)\nbytes.add(9)\n"), "compile inline Bytes accesses")
+let llvm = io.readTextFile(casePath(compiler) + ".ll")
+let length = functionBody(llvm, ".minyar.bytes.length")
+let getter = functionBody(llvm, ".minyar.bytes.get.checked")
+let setter = functionBody(llvm, ".minyar.bytes.set.checked")
+let adder = functionBody(llvm, ".minyar.bytes.add.checked")
+for body in [length, getter, setter, adder] {
+    test.check(test.contains(body, "alwaysinline"), "Bytes helper must inline without runtime LTO")
+}
+// Failed checks call the runtime, which reports the error and never returns;
+// growth is the one slow path that continues.
+test.check(!test.contains(length, "unreachable") && !test.contains(adder, "unreachable"), "Bytes length/append must keep a continuing path")
+test.check(test.contains(length, "getelementptr inbounds { ptr, i64 }, ptr %bytes, i32 0, i32 1"), "Bytes length helper lost its ABI prefix")
+test.check(test.contains(length, "!range !{i64 0, i64 -9223372036854775808}"), "Bytes length lost its nonnegative range fact")
+for body in [getter, setter] {
+    test.check(test.contains(body, "getelementptr inbounds i8, ptr %data, i64 %position"), "checked byte address lost its allocation fact")
+}
+for expected in ["%get.valid = icmp ult i64 %position, %length", "%byte = load i8, ptr %slot", "%value = zext i8 %byte to i64", "call i64 @minyar_bytes_get(ptr %bytes, i64 %position)\n  unreachable"] {
+    test.check(test.contains(getter, expected), "missing checked Bytes getter IR: " + expected)
+}
+for expected in ["%position.valid = icmp ult i64 %position, %length", "%value.valid = icmp ult i64 %value, 256", "%byte = trunc i64 %value to i8", "store i8 %byte, ptr %slot", "call void @minyar_bytes_set(ptr %bytes, i64 %position, i64 %value)\n  unreachable"] {
+    test.check(test.contains(setter, expected), "missing checked Bytes setter IR: " + expected)
+}
+// Appends take the inline path only within capacity; a view's negative
+// capacity, growth and invalid values all keep the runtime's exact behavior.
+for expected in ["%capacity.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %bytes, i32 0, i32 2", "%room = icmp slt i64 %length, %capacity", "%value.valid = icmp ult i64 %value, 256", "%slot = getelementptr inbounds i8, ptr %data, i64 %length", "store i8 %byte, ptr %slot", "%next = add nuw nsw i64 %length, 1", "store i64 %next, ptr %length.pointer", "call void @minyar_bytes_add(ptr %bytes, i64 %value)\n  ret void"] {
+    test.check(test.contains(adder, expected), "missing checked Bytes append IR: " + expected)
+}
+let main = functionBody(llvm, "main")
+for call in ["call i64 @.minyar.bytes.get.checked(", "call void @.minyar.bytes.set.checked(", "call i64 @.minyar.bytes.length(", "call void @.minyar.bytes.add.checked("] {
+    test.check(test.contains(main, call), "Bytes expression did not use inline helper: " + call)
+}
+for call in ["call i64 @minyar_bytes_get(", "call void @minyar_bytes_set(", "call i64 @minyar_bytes_length(", "call void @minyar_bytes_add("] {
+    test.check(!test.contains(main, call), "ordinary Bytes access still calls runtime directly: " + call)
+}
+
+if !irOnly {
+    // Every normal return must close its frames and release owned objects.
+    let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
+    io.writeTextFile(compiler.directory + "/runtime.c", contract)
+    compiler.runtime = compiler.directory + "/runtime.o"
+    let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime"]
+    for flag in compiler.flags { build.add(flag) }
+    for item in ["-c", compiler.directory + "/runtime.c", "-o", compiler.runtime] { build.add(item) }
+    test.require(test.run(build, system.environment(), "", compiler.directory + "/ownership-runtime", 120), "build Bytes ownership contract runtime")
+
+    test.executes(compiler, "let bytes = Bytes(4)\nbytes[0] = 255\nbytes[3] += 7\nprint(bytes[0])\nprint(bytes[3])\nprint(bytes.length)\nbytes.resize(1)\nbytes.resize(4)\nprint(bytes[3])\nbytes.clear()\nbytes.resize(4)\nprint(bytes[0])\nprint(Bytes(\"A\")[0])\n", "255\n7\n4\n0\n0\n65\n")
+    test.executes(compiler, #"""
+    function index(bytes: Bytes): Integer { bytes.resize(2048); bytes[1024] = 7; return 1024 }
+    function replacement(bytes: Bytes): Integer { bytes.resize(4096); return 99 }
+    function grow(bytes: Bytes): Integer { bytes.resize(8192); bytes[1024] = 50; return 1 }
+    let bytes = Bytes(1)
+    let alias = bytes
+    bytes[index(alias)] = replacement(alias)
+    print(alias[1024]); print(alias.length); print(alias[4095])
+    bytes[1024] += grow(alias)
+    print(alias[1024]); print(alias.length); print(alias[8191])
+    let growing = Bytes(1)
+    for byte in growing { print(byte); if growing.length == 1 { growing.add(3) } }
+    """#, "99\n4096\n0\n100\n8192\n0\n0\n3\n")
+    test.executes(compiler, #"""
+    record Holder { bytes: Bytes }
+    function index(holder: Holder): Integer { holder.bytes = Bytes(1); holder.bytes[0] = 8; return 0 }
+    function replacement(holder: Holder): Integer { holder.bytes = Bytes(1); holder.bytes[0] = 9; return 77 }
+    let holder = Holder { bytes: Bytes(1) }
+    let alias = holder.bytes
+    holder.bytes[index(holder)] = replacement(holder)
+    print(alias[0]); print(holder.bytes[0])
+    let lonely = Holder { bytes: Bytes(1) }
+    lonely.bytes[index(lonely)] = replacement(lonely)
+    print(lonely.bytes[0])
+    """#, "77\n9\n9\n")
+    test.executes(compiler, #"""
+    use "machine" as machine
+    record Window native "c_packed" { data: Bytes[4] }
+    function retained(): Bytes { let backing = Bytes(8); backing[4] = 99; return cBytes(cView(Window, backing, 2)) }
+    let backing = Bytes(8)
+    let first = cBytes(cView(Window, backing, 0))
+    let shifted = cBytes(cView(Window, backing, 2))
+    first[2] = 77
+    print(shifted[0])
+    shifted[1] = 88
+    print(backing[3]); print(first.length); print(shifted.length)
+    let addressed = cBytes(cAt(Window, machine.address(backing) + 2))
+    addressed[0] = 66
+    print(backing[2]); print(addressed.length)
+    let view = retained()
+    print(view[2])
+    """#, "77\n88\n4\n4\n66\n4\n99\n")
+
+    // A projected Bytes receiver needs no temporary count when its arguments
+    // make no calls; a call that can replace the field keeps the old owner alive.
+    test.executes(compiler, #"""
+    record Holder { bytes: Bytes; count: Integer }
+    function fill(holder: Holder) { let index = 0; while index < holder.count { holder.bytes.add(index + holder.bytes.length); holder.bytes.setInt32(0, index); index += 1 } }
+    function replace(holder: Holder): Integer { holder.bytes = Bytes(0); return 7 }
+    function mixed(holder: Holder) { holder.bytes.add(replace(holder)) }
+    let holder = Holder { bytes: Bytes(4); count: 6 }
+    fill(holder)
+    print(holder.bytes.length); print(holder.bytes.getInt32(0)); print(holder.bytes[5])
+    mixed(holder)
+    print(holder.bytes.length)
+    holder.bytes.add(1)
+    let alias = holder.bytes
+    mixed(holder)
+    print(alias.length); print(alias[1]); print(holder.bytes.length)
+    """#, "10\n5\n6\n0\n2\n7\n0\n")
+    let borrowed = io.readTextFile(casePath(compiler) + ".ll")
+    let fill = functionBody(borrowed, ".minyar.fn.fill")
+    test.check(!test.contains(fill, "@minyar_rc_borrow(") && !test.contains(fill, "@minyar_rc_keep("), "call-free Bytes updates kept a temporary owner")
+    test.check(test.contains(fill, "call void @.minyar.bytes.add.checked("), "Bytes field append must stay inline")
+    test.check(test.contains(functionBody(borrowed, ".minyar.fn.mixed"), "call void @minyar_rc_borrow("), "a Bytes update whose argument calls a function must keep its receiver owner")
+
+    // Appends grow through repeated doublings and keep aliases in step.
+    test.executes(compiler, "let bytes = Bytes(0)\nlet alias = bytes\nlet index = 0\nwhile index < 1000 { bytes.add(index % 256); index += 1 }\nprint(alias.length)\nprint(alias[0]); print(alias[255]); print(alias[256]); print(alias[999])\nbytes.resize(2)\nbytes.add(255)\nprint(alias.length); print(alias[2])\n", "1000\n0\n255\n0\n231\n3\n255\n")
+    for value in [-9223372036854775808, -1, 256, 9223372036854775807] {
+        traps(compiler, "let bytes = Bytes(0)\nbytes.add(" + Text(value) + ")\n", Text(value) + " does not fit in a byte (0 to 255).")
+        traps(compiler, "let bytes = Bytes(0)\nbytes.add(1)\nbytes.add(" + Text(value) + ")\n", Text(value) + " does not fit in a byte (0 to 255).")
+    }
+    traps(compiler, "record Window native \"c_packed\" { data: Bytes[4] }\nlet backing = Bytes(8)\nlet view = cBytes(cView(Window, backing, 2))\nview.add(1)\n", "Bytes storage with C-layout views cannot grow.")
+
+    for size in [0, 2] {
+        for position in [-9223372036854775808, -1, size, 9223372036854775807] {
+            let declaration = "let bytes = Bytes(" + Text(size) + ")\n"
+            let diagnostic = "Bytes position " + Text(position) + " is outside its length of " + Text(size) + "."
+            traps(compiler, declaration + "print(bytes[" + Text(position) + "])\n", diagnostic)
+            traps(compiler, declaration + "bytes[" + Text(position) + "] = 0\n", diagnostic)
+        }
+    }
+    for value in [-9223372036854775808, -1, 256, 9223372036854775807] {
+        traps(compiler, "let bytes = Bytes(1)\nbytes[0] = " + Text(value) + "\n", Text(value) + " does not fit in a byte (0 to 255).")
+    }
+    for position in [-1, 1] {
+        traps(compiler, "let bytes = Bytes(1)\nbytes[" + Text(position) + "] = 256\n", "Bytes position " + Text(position) + " is outside its length of 1.")
+    }
+    traps(compiler, "let bytes = Bytes(1)\nbytes[0] = 255\nbytes[0] += 1\n", "256 does not fit in a byte (0 to 255).")
+    traps(compiler, "function index(bytes: Bytes): Integer { bytes.resize(0); return 0 }\nlet bytes = Bytes(1)\nprint(bytes[index(bytes)])\n", "Bytes position 0 is outside its length of 0.")
+    traps(compiler, "function replacement(bytes: Bytes): Integer { bytes.resize(0); return 1 }\nlet bytes = Bytes(1)\nbytes[0] = replacement(bytes)\n", "Bytes position 0 is outside its length of 0.")
+
+    test.executes(compiler, "function copy(input: Bytes, output: Bytes) { let index = 0; while index < input.length && index < output.length { output[index] = input[index]; index += 1 } }\nfunction sum(input: Bytes): Integer { let total = 0; let index = 0; while index < input.length { total += input[index]; index += 1 }; return total }\nlet input = Bytes(\"bytes\")\nlet output = Bytes(input.length)\ncopy(input, output)\nprint(Text(output))\nprint(sum(output))\n", "bytes\n551\n")
+    let path = casePath(compiler)
+    let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+    for flag in compiler.flags { optimize.add(flag) }
+    for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
+    test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize Bytes loop IR")
+    let optimized = io.readTextFile(path + ".optimized.ll")
+    for line in test.lines(optimized) {
+        test.check(!(test.contains(line, "call ") && test.contains(line, "@.minyar.bytes.")), "optimized loop still calls a Bytes helper\n" + line)
+    }
+    let sum = functionBody(optimized, ".minyar.fn.sum")
+    test.check(!test.contains(sum, "@minyar_bytes_get("), "proven byte loop retained its redundant bounds fallback")
+    let additions = 0
+    for line in test.lines(sum) {
+        if test.contains(line, "call ") && test.contains(line, "@llvm.sadd.with.overflow.i64(") { additions += 1 }
+    }
+    test.check(additions == 1, "byte loop must check its sum and eliminate the proven index overflow check")
+}
+
+test.removeTree(compiler.directory)
+print("bytes access: passed")

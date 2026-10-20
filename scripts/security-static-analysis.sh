@@ -25,6 +25,7 @@ for source in \
     runtime/native/securecrypto.c \
     runtime/native/system.c \
     runtime/native/tlsverify.c \
+    runtime/native/unicode.c \
     runtime/native/update.c \
     runtime/native/update_ed25519.c \
     runtime/native/update_monocypher.c \

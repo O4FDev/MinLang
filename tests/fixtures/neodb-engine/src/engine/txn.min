@@ -1,0 +1,303 @@
+// Transactions: undo log, exclusive row locks (held until durable), before-image visibility, serial lock.
+use "./values.min" as v
+use "./hashmap.min" as hm
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+
+public constant U_INSERT = 1
+public constant U_UPDATE = 2
+public constant U_DELETE = 3
+public constant U_BULK = 4        // rows [uRow, uImgOff) inserted dead+new by COPY; made live at commit
+public constant U_OWNER = 16      // flag: this entry took the row lock (first touch of the row by the txn)
+public constant U_KEYCHG = 32     // flag: the update changed an indexed column
+
+public constant TX_IDLE = 0
+public constant TX_ACTIVE = 1
+public constant TX_COMMITTING = 2
+
+public record Txn {
+    slot: Integer
+    session: Integer
+    state: Integer
+    failed: Boolean
+    serializable: Boolean
+    commitLsn: Integer
+    uKind: Bytes          // Int64 per undo entry (Bytes so it can be truncated)
+    uTable: Bytes
+    uRow: Bytes
+    uImgOff: Bytes
+    uCount: Integer
+    uImg: Bytes
+    redo: Bytes
+    ddl: Boolean
+    gen: Integer
+}
+
+public record TxnMgr {
+    txns: List<Txn>
+    freeSlots: Bytes
+    locks: hm.IntMap
+    serialOwner: Integer
+    waitsFor: List<Integer>
+    lockEpoch: Integer
+}
+
+public function newTxnMgr(): TxnMgr {
+    return TxnMgr { txns: []; freeSlots: Bytes(); locks: hm.newIntMap(1024); serialOwner: -1; waitsFor: []; lockEpoch: 0 }
+}
+
+public function begin(m: TxnMgr, session: Integer): Txn {
+    let slot = -1
+    if m.freeSlots.length > 0 {
+        slot = m.freeSlots.getInt64(m.freeSlots.length - 8)
+        m.freeSlots.resize(m.freeSlots.length - 8)
+    }
+    if slot < 0 {
+        slot = m.txns.length
+        let t = newTxn(slot)
+        m.txns.add(t)
+        m.waitsFor.add(-1)
+    }
+    let t = m.txns[slot]
+    t.session = session
+    t.state = TX_ACTIVE
+    t.failed = false
+    t.serializable = false
+    t.commitLsn = 0
+    t.ddl = false
+    t.gen += 1
+    m.waitsFor[slot] = -1
+    return t
+}
+
+function newTxn(slot: Integer): Txn {
+    return Txn { slot: slot; session: -1; state: TX_IDLE; failed: false; serializable: false; commitLsn: 0
+                 uKind: Bytes(); uTable: Bytes(); uRow: Bytes(); uImgOff: Bytes(); uCount: 0; uImg: Bytes(); redo: Bytes(); ddl: false; gen: 0 }
+}
+
+function resetTxn(m: TxnMgr, t: Txn) {
+    t.state = TX_IDLE
+    t.uKind.clear()
+    t.uTable.clear()
+    t.uRow.clear()
+    t.uImgOff.clear()
+    t.uCount = 0
+    if t.uImg.length > 65536 { t.uImg = Bytes() } else { t.uImg.clear() }
+    if t.redo.length > 65536 { t.redo = Bytes() } else { t.redo.clear() }
+    t.failed = false
+    if m.serialOwner == t.slot { m.serialOwner = -1 }
+    m.waitsFor[t.slot] = -1
+    m.freeSlots.addInt64(t.slot)
+}
+
+public function lockKey(tableId: Integer, row: Integer): Integer {
+    return (tableId << 40) | row
+}
+
+// Owner txn slot of a locked row, or -1.
+public function ownerOf(m: TxnMgr, tableId: Integer, row: Integer): Integer {
+    let x = hm.get(m.locks, lockKey(tableId, row), -1)
+    if x < 0 { return -1 }
+    return x >> 32
+}
+
+public function ownerUndo(m: TxnMgr, tableId: Integer, row: Integer): Integer {
+    let x = hm.get(m.locks, lockKey(tableId, row), -1)
+    if x < 0 { return -1 }
+    return x & 4294967295
+}
+
+// Visibility of row r of t for reader txn slot `me` (-1 = no txn).
+// Returns 0 invisible, 1 visible (current data), 2 visible through the before-image.
+public function visibility(m: TxnMgr, t: tb.Table, r: Integer, me: Integer): Integer {
+    let st = t.state[r]
+    if st == 0 { return 1 }
+    if (st & tb.ST_LOCKED) == 0 { return 0 }
+    let x = hm.get(m.locks, lockKey(t.id, r), -1)
+    if x < 0 {
+        if (st & tb.ST_DEAD) != 0 { return 0 }
+        return 1
+    }
+    let owner = x >> 32
+    if owner == me {
+        if (st & tb.ST_DEAD) != 0 { return 0 }
+        return 1
+    }
+    if (st & tb.ST_NEW) != 0 { return 0 }
+    let ow = m.txns[owner]
+    let u = x & 4294967295
+    if (ow.uKind.getInt64(u * 8) & 15) == U_UPDATE { return 2 }
+    return 1
+}
+
+// Decode the before-image of a locked row into row 0 of scratch.
+public function loadBeforeImage(m: TxnMgr, t: tb.Table, r: Integer, scratch: tb.Table) {
+    let x = hm.get(m.locks, lockKey(t.id, r), -1)
+    let owner = x >> 32
+    let u = x & 4294967295
+    let ow = m.txns[owner]
+    if scratch.nrows == 0 { tb.reserveRow(scratch, 0) }
+    let cur = tb.Cursor { pos: ow.uImgOff.getInt64(u * 8) }
+    tb.decodeRow(scratch, 0, ow.uImg, cur)
+}
+
+// Can txn `me` modify row r? Returns -1 if yes, else the owner slot that blocks.
+public function blocker(m: TxnMgr, t: tb.Table, r: Integer, me: Integer): Integer {
+    let st = t.state[r]
+    if (st & tb.ST_LOCKED) == 0 { return -1 }
+    let owner = ownerOf(m, t.id, r)
+    if owner < 0 || owner == me { return -1 }
+    return owner
+}
+
+// Record an undo entry; takes the lock on first touch. Returns the undo index.
+public function addUndo(m: TxnMgr, tx: Txn, t: tb.Table, r: Integer, kind: Integer, withImage: Boolean): Integer {
+    let u = tx.uCount
+    let k = kind
+    let st = t.state[r]
+    if (st & tb.ST_LOCKED) == 0 {
+        k = k | U_OWNER
+        hm.put(m.locks, lockKey(t.id, r), (tx.slot << 32) | u)
+        t.state[r] = st | tb.ST_LOCKED
+        t.lockedCount += 1
+    }
+    tx.uKind.addInt64(k)
+    tx.uTable.addInt64(t.id)
+    tx.uRow.addInt64(r)
+    tx.uImgOff.addInt64(tx.uImg.length)
+    tx.uCount = u + 1
+    if withImage { tb.encodeRow(t, r, tx.uImg) }
+    return u
+}
+
+// Bulk-insert undo entry (no locks): rows [start, end) of t.
+public function addBulkUndo(tx: Txn, t: tb.Table, start: Integer, end: Integer) {
+    tx.uKind.addInt64(U_BULK | (end << 8))
+    tx.uTable.addInt64(t.id)
+    tx.uRow.addInt64(start)
+    tx.uImgOff.addInt64(tx.uImg.length)
+    tx.uCount += 1
+}
+
+public function extendBulkUndo(tx: Txn, u: Integer, end: Integer) {
+    tx.uKind.setInt64(u * 8, U_BULK | (end << 8))
+}
+
+public function markKeyChange(tx: Txn, u: Integer) {
+    tx.uKind.setInt64(u * 8, tx.uKind.getInt64(u * 8) | U_KEYCHG)
+}
+
+// Undo entries [from, end) in reverse; releases locks taken by them.
+public function rollbackTo(m: TxnMgr, c: cat.Catalog, tx: Txn, from: Integer) {
+    let i = tx.uCount - 1
+    let released = false
+    while i >= from {
+        let k = tx.uKind.getInt64(i * 8)
+        let t = c.tables[tx.uTable.getInt64(i * 8)]
+        let r = tx.uRow.getInt64(i * 8)
+        let kind = k & 15
+        if !cat.isDropped(t) && r < t.nrows {
+            if kind == U_INSERT {
+                if (t.state[r] & tb.ST_DEAD) == 0 { t.live -= 1 }
+                t.state[r] = t.state[r] | tb.ST_DEAD
+            } else if kind == U_UPDATE {
+                if (k & U_KEYCHG) != 0 { cat.indexRemoveRow(c, t, r) }
+                let cur = tb.Cursor { pos: tx.uImgOff.getInt64(i * 8) }
+                tb.decodeRow(t, r, tx.uImg, cur)
+                if (k & U_KEYCHG) != 0 { cat.indexInsertRow(c, t, r) }
+            } else if kind == U_DELETE {
+                if (t.state[r] & tb.ST_DEAD) != 0 { t.live += 1 }
+                t.state[r] = t.state[r] & (255 - tb.ST_DEAD)
+            } else if kind == U_BULK {
+                let e = k >> 8
+                let x = r
+                while x < e && x < t.nrows {
+                    t.state[x] = tb.ST_DEAD
+                    x += 1
+                }
+            }
+            if (k & U_OWNER) != 0 {
+                hm.remove(m.locks, lockKey(t.id, r))
+                t.state[r] = t.state[r] & (255 - tb.ST_LOCKED - tb.ST_NEW)
+                t.lockedCount -= 1
+                released = true
+            }
+        }
+        i -= 1
+    }
+    if from < tx.uCount {
+        tx.uImg.resize(tx.uImgOff.getInt64(from * 8))
+    }
+    tx.uKind.resize(from * 8)
+    tx.uTable.resize(from * 8)
+    tx.uRow.resize(from * 8)
+    tx.uImgOff.resize(from * 8)
+    tx.uCount = from
+    if released { m.lockEpoch += 1 }
+}
+
+// Abort: undo everything and free the txn.
+public function abort(m: TxnMgr, c: cat.Catalog, tx: Txn) {
+    rollbackTo(m, c, tx, 0)
+    resetTxn(m, tx)
+    m.lockEpoch += 1
+}
+
+// Commit became durable: release locks, keep changes.
+public function finishCommit(m: TxnMgr, c: cat.Catalog, tx: Txn) {
+    let n = tx.uCount
+    let i = 0
+    while i < n {
+        let k = tx.uKind.getInt64(i * 8)
+        if (k & 15) == U_BULK {
+            let t = c.tables[tx.uTable.getInt64(i * 8)]
+            let x = tx.uRow.getInt64(i * 8)
+            let e = k >> 8
+            if !cat.isDropped(t) {
+                while x < e && x < t.nrows {
+                    if t.state[x] == tb.ST_DEAD + tb.ST_NEW {
+                        t.state[x] = 0
+                        t.live += 1
+                    }
+                    x += 1
+                }
+            }
+        }
+        if (k & U_OWNER) != 0 {
+            let t = c.tables[tx.uTable.getInt64(i * 8)]
+            let r = tx.uRow.getInt64(i * 8)
+            if !cat.isDropped(t) && r < t.nrows {
+                hm.remove(m.locks, lockKey(t.id, r))
+                t.state[r] = t.state[r] & (255 - tb.ST_LOCKED - tb.ST_NEW)
+                t.lockedCount -= 1
+            }
+        }
+        i += 1
+    }
+    resetTxn(m, tx)
+    m.lockEpoch += 1
+}
+
+// Read-only or already-empty txn end.
+public function finishEmpty(m: TxnMgr, tx: Txn) {
+    resetTxn(m, tx)
+    m.lockEpoch += 1
+}
+
+public function hasWrites(tx: Txn): Boolean {
+    return tx.uCount > 0 || tx.redo.length > 0
+}
+
+// Wait-for graph: does making `me` wait for `other` close a cycle?
+public function wouldDeadlock(m: TxnMgr, me: Integer, other: Integer): Boolean {
+    let cur = other
+    let steps = 0
+    while cur >= 0 && steps < 10000 {
+        if cur == me { return true }
+        if m.txns[cur].state != TX_ACTIVE { return false }
+        cur = m.waitsFor[cur]
+        steps += 1
+    }
+    return false
+}

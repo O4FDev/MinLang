@@ -1,6 +1,8 @@
 // The Intel 82540EM (e1000) network adapter that QEMU emulates: registers
 // through memory-mapped I/O, frames through DMA rings of descriptors.
 use "device" as device
+use "machine" as machine
+use "./e1000config.min" as configuration
 use "../../shared/pci.min" as pci
 
 constant CONTROL = 0x0000
@@ -77,8 +79,8 @@ public function start(devices: List<pci.Device>): Adapter {
     let adapter = Adapter {
         present: true; registers: window
         receiveTail: device.register32(window, RECEIVE_TAIL); transmitTail: device.register32(window, TRANSMIT_TAIL)
-        receiveRing: device.view(memory, 0, RECEIVE_COUNT * 16)
-        transmitRing: device.view(memory, RECEIVE_COUNT * 16, TRANSMIT_COUNT * 16)
+        receiveRing: device.view(memory, 0, RECEIVE_COUNT * sizeOf(configuration.ReceiveDescriptor))
+        transmitRing: device.view(memory, RECEIVE_COUNT * sizeOf(configuration.ReceiveDescriptor), TRANSMIT_COUNT * sizeOf(configuration.TransmitDescriptor))
         receiveBuffers: device.view(memory, 4096, RECEIVE_COUNT * BUFFER)
         transmitBuffers: device.view(memory, 4096 + RECEIVE_COUNT * BUFFER, TRANSMIT_COUNT * BUFFER)
         receiveNext: 0; transmitNext: 0; mac: Bytes(6); sent: 0; received: 0
@@ -102,30 +104,32 @@ public function start(devices: List<pci.Device>): Adapter {
     }
     // Receive ring: every descriptor owns one buffer.
     for slot in 0..RECEIVE_COUNT {
-        device.store64(adapter.receiveRing, slot * 16, device.addressOf(adapter.receiveBuffers, slot * BUFFER))
-        device.store64(adapter.receiveRing, slot * 16 + 8, 0)
+        device.store64(adapter.receiveRing, slot * sizeOf(configuration.ReceiveDescriptor), device.addressOf(adapter.receiveBuffers, slot * BUFFER))
+        device.store64(adapter.receiveRing, slot * sizeOf(configuration.ReceiveDescriptor) + offsetOf(configuration.ReceiveDescriptor, "length"), 0)
     }
+    // Publish every receive buffer before enabling the device's DMA engine.
+    machine.fence()
     let receiveRing = device.addressOf(adapter.receiveRing, 0)
     write(adapter, RECEIVE_BASE_LOW, receiveRing & 0xFFFFFFFF)
     write(adapter, RECEIVE_BASE_HIGH, receiveRing >> 32)
-    write(adapter, RECEIVE_LENGTH, RECEIVE_COUNT * 16)
+    write(adapter, RECEIVE_LENGTH, RECEIVE_COUNT * sizeOf(configuration.ReceiveDescriptor))
     write(adapter, RECEIVE_HEAD, 0)
     write(adapter, RECEIVE_TAIL, RECEIVE_COUNT - 1)
     // Enable, accept broadcast, 2048-byte buffers, strip the CRC.
     write(adapter, RECEIVE_CONTROL, (1 << 1) | (1 << 15) | (1 << 26))
     for slot in 0..TRANSMIT_COUNT {
-        device.store64(adapter.transmitRing, slot * 16, device.addressOf(adapter.transmitBuffers, slot * BUFFER))
+        device.store64(adapter.transmitRing, slot * sizeOf(configuration.TransmitDescriptor), device.addressOf(adapter.transmitBuffers, slot * BUFFER))
         // Mark every slot done so the first pass can use it.
-        device.store64(adapter.transmitRing, slot * 16 + 8, 1 << 32)
+        device.store64(adapter.transmitRing, slot * sizeOf(configuration.TransmitDescriptor) + offsetOf(configuration.TransmitDescriptor, "length"), 1 << 32)
     }
     let transmitRing = device.addressOf(adapter.transmitRing, 0)
     write(adapter, TRANSMIT_BASE_LOW, transmitRing & 0xFFFFFFFF)
     write(adapter, TRANSMIT_BASE_HIGH, transmitRing >> 32)
-    write(adapter, TRANSMIT_LENGTH, TRANSMIT_COUNT * 16)
+    write(adapter, TRANSMIT_LENGTH, TRANSMIT_COUNT * sizeOf(configuration.TransmitDescriptor))
     write(adapter, TRANSMIT_HEAD, 0)
     write(adapter, TRANSMIT_TAIL, 0)
-    write(adapter, TRANSMIT_GAP, 10 | (8 << 10) | (6 << 20))
-    write(adapter, TRANSMIT_CONTROL, (1 << 1) | (1 << 3) | (15 << 4) | (64 << 12))
+    write(adapter, TRANSMIT_GAP, configuration.transmitGap(10, 8, 6))
+    write(adapter, TRANSMIT_CONTROL, configuration.transmitControl(15, 64))
     print("net: e1000 at " + Text(device.base(window)) + ", MAC " + macText(adapter.mac) + ", link " + Text((read(adapter, STATUS) >> 1) & 1))
     return adapter
 }
@@ -145,15 +149,19 @@ public function macText(mac: Bytes): Text {
 public function send(adapter: Adapter, frame: Bytes): Boolean {
     if !adapter.present { return false }
     let slot = adapter.transmitNext
-    let descriptor = slot * 16
-    if (device.load8(adapter.transmitRing, descriptor + 12) & 1) == 0 {
+    let descriptor = slot * sizeOf(configuration.TransmitDescriptor)
+    if (device.load8(adapter.transmitRing, descriptor + offsetOf(configuration.TransmitDescriptor, "status")) & 1) == 0 {
         return false
     }
+    // Acquire the device's completion before reusing its descriptor/buffer.
+    machine.fence()
     let length = min(frame.length, BUFFER)
     device.write(adapter.transmitBuffers, slot * BUFFER, frame, 0, length)
     // Length, then command: end of packet, insert checksum, report status.
-    device.store64(adapter.transmitRing, descriptor + 8, length | ((1 | 2 | 8) << 24))
+    device.store64(adapter.transmitRing, descriptor + offsetOf(configuration.TransmitDescriptor, "length"), length | ((1 | 2 | 8) << 24))
     adapter.transmitNext = (slot + 1) % TRANSMIT_COUNT
+    // Publish the descriptor and payload before ringing the device's tail.
+    machine.fence()
     device.write32(adapter.transmitTail, adapter.transmitNext)
     adapter.sent += 1
     return true
@@ -163,14 +171,18 @@ public function send(adapter: Adapter, frame: Bytes): Boolean {
 public function receive(adapter: Adapter): Bytes {
     if !adapter.present { return Bytes() }
     let slot = adapter.receiveNext
-    let descriptor = slot * 16
-    let status = device.load8(adapter.receiveRing, descriptor + 12)
+    let descriptor = slot * sizeOf(configuration.ReceiveDescriptor)
+    let status = device.load8(adapter.receiveRing, descriptor + offsetOf(configuration.ReceiveDescriptor, "status"))
     if (status & 1) == 0 {
         return Bytes()
     }
-    let length = device.load16(adapter.receiveRing, descriptor + 8)
+    // DD is the device's publication flag: acquire before metadata/payload.
+    machine.fence()
+    let length = device.load16(adapter.receiveRing, descriptor + offsetOf(configuration.ReceiveDescriptor, "length"))
     let frame = device.read(adapter.receiveBuffers, slot * BUFFER, min(length, BUFFER))
-    device.store64(adapter.receiveRing, descriptor + 8, 0)
+    device.store64(adapter.receiveRing, descriptor + offsetOf(configuration.ReceiveDescriptor, "length"), 0)
+    // Finish reading and clearing the slot before giving it back to DMA.
+    machine.fence()
     device.write32(adapter.receiveTail, slot)
     adapter.receiveNext = (slot + 1) % RECEIVE_COUNT
     adapter.received += 1

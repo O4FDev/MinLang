@@ -1,0 +1,154 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function pack(values: List<Text>): Text {
+    let pieces: List<Text> = []
+    for value in values { pieces.add(Text(value.length) + "\n" + value) }
+    return joinText(pieces)
+}
+
+function link(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text) {
+    let compiler = frontend.compiler
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for argument in ["-Wno-override-module", path + ".ll", object, "-lm", "-o", path + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", path + ".link", 60), "link Set niche fixture " + level)
+        let result = test.run([path + ".exe"], frontend.environment, "", path + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == diagnostic, "Set niche fixture " + level + "\n" + result.output + result.errorOutput)
+    }
+}
+
+function allocations(frontend: fixtures.Frontend, baseline: Boolean) {
+    let compiler = frontend.compiler
+    let source = "function sampleSet(value: Set<Integer>, index: Integer): Maybe<Set<Integer>> { if index % 2 == 0 { return Some(value) }; return None }\nlet payload: Set<Integer> = Set()\npayload.add(42)\nlet values: List<Maybe<Set<Integer>>> = []\nfor index in 0..10000 { values.add(sampleSet(payload, index)) }\nlet total = 0\nfor value in values { total += match value { Some(item) { item.length } None { 0 } } }\nprint(total)\n"
+    test.require(fixtures.compile(frontend, source), "compile preallocated Set wrapper benchmark")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let llvm = io.readTextFile(path + ".ll")
+    if !baseline {
+        test.check(test.contains(llvm, "ptr @.minyar.fn.sampleSet(ptr %argument.0, i64 %argument.1)"), "Set choice parameter and return must be pointers")
+        test.check(test.contains(llvm, "ret ptr null") && test.contains(llvm, "icmp eq ptr"), "Set choice must project header/null")
+        test.check(!test.contains(llvm, "call ptr @minyar_record_new"), "Set benchmark still allocates a choice wrapper")
+    }
+    // Redirect generated calls only; map_create's runtime header is not counted.
+    io.writeTextFile(path + ".ll", test.replace(llvm, "@minyar_record_new", "@choice_set_new"))
+    let contract = test.replace(io.readTextFile("tests/choice-set-niche-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+    io.writeTextFile(path + "-runtime.c", contract)
+    let command = [compiler.clang, "-O1"]
+    for flag in compiler.flags { command.add(flag) }
+    for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+    test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 60), "compile exact Set wrapper counter runtime")
+    let counts = "0 records, 0 slots"
+    if baseline { counts = "10000 records, 20000 slots" }
+    link(frontend, path, path + "-runtime.o", "5000\n", "choice set: " + counts + ", 0 live objects, 0 live bytes\n")
+    print("Set: 10,000 alternating values, " + counts + " from generated wrapper calls")
+}
+
+function state(frontend: fixtures.Frontend, entry: Text, output: Text, prior: Text, next: Text) {
+    let stats = output + ".stats"
+    test.require(test.run([frontend.compiler.executable, entry, output + ".ll", "--module-state", prior, next, stats, "--library", "library"], frontend.environment, "", output + ".compile", 60), "compile imported Set choice state")
+    let fields = test.words(io.readTextFile(stats))
+    test.check(fields.length >= 7 && fields[0] == "0" && fields[6] == "false", "Set choices must retain whole-program fallback\n" + io.readTextFile(stats))
+    test.check(io.readTextFile(next) == "", "Set fallback persisted unsupported module artifacts")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let baseline = test.setting("MINYAR_CHOICE_SET_BASELINE", "")
+if baseline != "" { compiler.executable = baseline }
+allocations(frontend, baseline != "")
+if baseline == "" {
+    frontend.runtimeFlags = ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0", "-DMINYAR_MEMORY_CONTRACT_CUSTOM_CLEANUP=1"]
+    frontend.helpers = io.readTextFile("tests/choice-set-niche-native.c")
+    for program in ["choice-set-niche", "choice-set-niche-ownership", "choice-set-scalar-keys"] {
+        fixtures.executes(frontend, io.readTextFile("tests/" + program + ".min"), io.readTextFile("tests/" + program + ".expected"), ["-O0", "-O2"], 0, "", true)
+    }
+    let exactRuntime = compiler.directory + "/case" + Text(compiler.serial) + "-runtime.o"
+    test.require(fixtures.compile(frontend, "function sameSet(left: Maybe<Set<Integer>>, right: Maybe<Set<Integer>>): Boolean { return left == right }\nprint(sameSet(None, None))\n"), "compile Set equality ABI")
+    let equality = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    test.check(test.contains(equality, "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)") && test.contains(equality, "call zeroext i1 @minyar_maps_are_equal(ptr %left, ptr %right, i64 4)"), "nullable Set equality must preserve Boolean ABI and membership kind 4")
+    let definition = ""
+    let checkedDefinition = false
+    for line in test.lines(equality) {
+        if line.startsWith("define ") { definition = line }
+        if test.contains(line, "call zeroext i1 @minyar_maps_are_equal(ptr %left, ptr %right, i64 4)") {
+            test.check(definition.startsWith("define internal zeroext i1 ") && test.contains(definition, "(ptr %left, ptr %right) ") && definition.endsWith("{"), "nullable Set thunk definition must preserve zeroext i1 ABI")
+            checkedDefinition = true
+        }
+    }
+    test.check(checkedDefinition, "missing nullable Set equality thunk definition")
+    test.require(fixtures.compile(frontend, "function nativeOptional(mode: Integer): Maybe<Set<Integer>> { native \"choice_set\" }\nfunction nativeIdentity(value: Maybe<Set<Integer>>): Maybe<Set<Integer>> { native \"choice_set\" }\nprint(nativeIdentity(nativeOptional(1)).unwrap().length)\n"), "compile native optional Set ABI")
+    let native = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    test.check(test.contains(native, "declare ptr @minyar_choice_set_nativeOptional(i64)") && test.contains(native, "declare ptr @minyar_choice_set_nativeIdentity(ptr)"), "native optional Set must pass actual nullable headers")
+
+    for payload in ["Set<Integer>", "Set<Text>"] {
+        fixtures.rejects(frontend, "let first: Maybe<" + payload + "> = None\nlet second: Maybe<" + payload + "> = None\nprint(first < second)\n", "not Ordered", true)
+        fixtures.rejects(frontend, "let values: List<Maybe<" + payload + ">> = [None]\nvalues.sort()\n", "not Ordered", true)
+        fixtures.rejects(frontend, "let keys: Map<Maybe<" + payload + ">, Integer> = Map()\n", "not Hashable", true)
+        fixtures.rejects(frontend, "let keys: Set<Maybe<" + payload + ">> = Set()\n", "not Hashable", true)
+        fixtures.rejects(frontend, "function hashable<Item: Hashable>(value: Item) {}\nlet value: Maybe<" + payload + "> = None\nhashable(value)\n", "does not satisfy Hashable", true)
+        fixtures.rejects(frontend, "record Key { value: Maybe<" + payload + "> }\nlet keys: Map<Key, Integer> = Map()\n", "not Hashable", true)
+        fixtures.rejects(frontend, "let first: Map<Text, Maybe<" + payload + ">> = Map()\nlet second: Map<Text, Maybe<" + payload + ">> = Map()\nprint(first == second)\n", "Map equality needs comparable values", true)
+        fixtures.rejects(frontend, "record Box { values: Map<Text, Maybe<" + payload + ">> }\nlet box = Box { values: Map() }\nprint(box == box)\n", "not Equatable", true)
+    }
+    fixtures.rejects(frontend, "function direct(value: Set<Integer>) { native \"choice_set\" }\n", "native functions accept", true)
+    fixtures.rejects(frontend, "function direct(): Set<Integer> { native \"choice_set\" }\n", "native functions return", true)
+    fixtures.rejects(frontend, "choice Chain { Link(values: Map<Text, Chain>); End }\nlet values: Map<Text, Chain> = Map()\nvalues[\"self\"] = Link(values)\n", "Map mutation could create a reference cycle", true)
+    fixtures.rejects(frontend, "record Node { values: Maybe<Map<Text, Node>> }\nlet values: Map<Text, Node> = Map()\nlet node = Node { values: Some(values) }\nvalues[\"self\"] = node\n", "Map mutation could create a reference cycle", true)
+    let shape = "choice Availability { Present(value: Set<Integer>); Absent }\nlet value: Availability = "
+    fixtures.rejects(frontend, shape + "Present()\n", "choice case 'Present' expects 1 payload value, but fewer were provided", true)
+    fixtures.rejects(frontend, shape + "Present(Set<Integer>(), Set<Integer>())\n", "choice case 'Present' expects 1 payload value, but more were provided", true)
+    fixtures.rejects(frontend, shape + "Absent(1)\n", "choice case 'Absent' expects 0 payload values, but more were provided", true)
+    for source in [
+        "function nested(value: Maybe<Set<Integer>>): Maybe<Maybe<Set<Integer>>> { return Some(value) }\n",
+        "choice Packet { Data(value: Map<Text, Integer>); Empty }\nfunction boxed(value: Map<Text, Integer>): Packet { return Data(value) }\n",
+        "choice Packet { Data(value: Set<Integer>) }\nfunction boxed(value: Set<Integer>): Packet { return Data(value) }\n",
+        "choice Packet { Data(value: Set<Integer>); Empty; Missing }\nfunction boxed(value: Set<Integer>): Packet { return Data(value) }\n",
+        "choice Packet { Data(first: Set<Integer>, second: Set<Integer>); Empty }\nfunction boxed(value: Set<Integer>): Packet { return Data(value, value) }\n"
+    ] {
+        test.require(fixtures.compile(frontend, source), "compile excluded Set/Map choice shape")
+        test.check(test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "call ptr @minyar_record_new"), "ineligible shape must retain tagged storage")
+    }
+    for source in [
+        "let keys: Set<Float> = Set()\nlet value: Maybe<Set<Float>> = Some(keys)\nvalue.unwrap().add(0.0 / 0.0)\n",
+        "record Key { value: Float }\nlet keys: Set<Key> = Set()\nlet value: Maybe<Set<Key>> = Some(keys)\nvalue.unwrap().add(Key { value: 0.0 / 0.0 })\n"
+    ] { fixtures.executes(frontend, source, "", ["-O0", "-O2"], 1, "Minyar stopped: NaN cannot be used as a Map key or Set element.\n", false) }
+
+    let leaf = compiler.directory + "/optional.min"
+    let entry = compiler.directory + "/main.min"
+    let exported = "public choice Group { Empty; Members(value: Set<Text>) }\npublic type Optional = Maybe<Set<Text>>\npublic record Holder<Item> { value: Item; names: Optional }\npublic function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }\npublic function optional(): Optional { let names: Set<Text> = Set(); names.add(\"module\"); return wrap(names) }\npublic function group(): Group { return Members(Set<Text>()) }\npublic function length(value: Group): Integer { return match value { Empty { -1 } Members(names) { names.length } } }\n"
+    io.writeTextFile(leaf, exported)
+    io.writeTextFile(entry, "use \"./optional.min\" as optional\nlet names = optional.optional()\nprint(names.unwrap().contains(\"module\"))\nprint(optional.length(optional.group()))\nlet holder = optional.Holder<Integer> { value: 42; names: names }\nlet wrapped: Maybe<optional.Holder<Integer>> = optional.wrap(holder)\nprint(wrapped.unwrap() == holder)\nprint(optional.wrap(Set<Text>()).unwrap().length)\n")
+    let empty = compiler.directory + "/empty.state"
+    let prior = compiler.directory + "/prior.state"
+    let next = compiler.directory + "/next.state"
+    io.writeTextFile(empty, "")
+    state(frontend, entry, compiler.directory + "/cold", empty, prior)
+    state(frontend, entry, compiler.directory + "/warm", prior, next)
+    let cold = io.readTextFile(compiler.directory + "/cold.ll")
+    test.check(io.readTextFile(compiler.directory + "/warm.ll") == cold, "warm Set fallback changed ABI")
+    test.require(test.run([compiler.executable, entry, compiler.directory + "/direct.ll", "--library", "library"], frontend.environment, "", compiler.directory + "/direct.compile", 60), "compile direct imported Set choices")
+    test.check(io.readTextFile(compiler.directory + "/direct.ll") == cold, "Set fallback differs from direct compilation")
+    // Synthetic prior-version headers test invalidation, not real warm artifacts.
+    for schema in ["minyar-module-interface-v10", "minyar-module-delta-v8", "minyar-module-interface-v9", "minyar-module-delta-v7"] {
+        let stale = compiler.directory + "/stale.state"
+        io.writeTextFile(stale, pack([schema, "old", "old"]))
+        state(frontend, entry, compiler.directory + "/stale", stale, next)
+        test.check(io.readTextFile(compiler.directory + "/stale.ll") == cold, "stale Set ABI state retained artifacts: " + schema)
+    }
+    io.writeTextFile(leaf, test.replace(exported, "\"module\"", "\"edited\""))
+    state(frontend, entry, compiler.directory + "/edited", prior, next)
+    state(frontend, entry, compiler.directory + "/fresh", empty, prior)
+    test.check(io.readTextFile(compiler.directory + "/edited.ll") == io.readTextFile(compiler.directory + "/fresh.ll"), "producer edit retained stale Set ABI")
+    for mode in ["cold", "warm", "edited"] {
+        let path = compiler.directory + "/" + mode
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+        let expected = "true\n0\ntrue\n0\n"
+        if mode == "edited" { expected = "false\n0\ntrue\n0\n" }
+        link(frontend, path, exactRuntime, expected, "")
+    }
+}
+test.removeTree(compiler.directory)
+print("Choice Set niche: passed")

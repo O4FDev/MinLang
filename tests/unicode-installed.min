@@ -1,0 +1,128 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+record Fixture { work: Text; serial: Integer }
+function run(fixture: Fixture, command: List<Text>, environment: List<Text>, cwd: Text, phase: Text): test.Result {
+    fixture.serial += 1
+    let result = test.run(command, environment, cwd, fixture.work + "/command-" + Text(fixture.serial), 600)
+    test.require(result, phase)
+    return result
+}
+
+// Keep the caller's system toolchain and SDK, while excluding inherited Minyar
+// source/cache/flag overrides and retained link evidence from this installation.
+function isolatedEnvironment(cache: Text, clang: Text): List<Text> {
+    let clean: List<Text> = []
+    for entry in support.environment([]) {
+        if !entry.startsWith("MINYAR_") && !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("GNUMAKEFLAGS=") {
+            clean.add(entry)
+        }
+    }
+    let overrides = ["MINYAR_CACHE_DIR=" + cache, "MINYAR_MODULE_CACHE=" + cache + "/modules"]
+    if clang != "" { overrides.add("MINYAR_CLANG=" + clang) }
+    return support.merge(clean, overrides)
+}
+
+function installedRoot(prefix: Text): Text {
+    let versions = prefix + "/lib/minyar/versions"
+    let names = files.list(versions)
+    test.check(files.lastError() == 0 && names.length == 1, "one installed Unicode toolchain at " + prefix)
+    return versions + "/" + names[0]
+}
+
+function compiledProviders(cache: Text, profile: Text) {
+    let directory = cache + "/native"
+    let names = files.list(directory)
+    test.check(files.lastError() == 0, profile + ": installed launcher did not create a native cache")
+    let bridge = 0
+    let data = 0
+    for name in names {
+        if name.endsWith(".o") && (name.startsWith("unicode-") || name.startsWith("unicode_data-")) {
+            test.check(files.pathSize(directory + "/" + name) > 0, profile + ": empty Unicode provider object")
+            if name.startsWith("unicode-") { bridge += 1 }
+            if name.startsWith("unicode_data-") { data += 1 }
+        }
+    }
+    test.check(bridge == 1 && data == 1, profile + ": expected newly compiled bridge and data provider objects")
+}
+
+test.check(processInfo.argumentCount() == 1, "usage: unicode-installed SOURCE_CHECKOUT")
+let source = test.resolvePath(processInfo.argument(0))
+test.check(source != "", "resolve source toolchain checkout")
+let fixture = Fixture { work: test.scratch(); serial: 0 }
+test.check(!fixture.work.startsWith(source + "/"), "installed Unicode fixture needs TMPDIR outside the source checkout")
+let first = fixture.work + "/first installation"
+let final = fixture.work + "/final installation"
+let external = fixture.work + "/external Unicode project"
+let installationCache = fixture.work + "/installation cache"
+test.check(files.makeDirectory(external) == 0 && files.makeDirectory(installationCache) == 0, "create external installation workspace")
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", test.setting("LLVM_CC", "")))
+let installEnvironment = isolatedEnvironment(installationCache, clang)
+run(fixture, [source + "/build/tooling/tools/install-cli", "--source", source, "--prefix", first], installEnvironment, external, "first Unicode toolchain installation")
+let firstRoot = installedRoot(first)
+run(fixture, [firstRoot + "/build/tooling/tools/install-cli", "--source", firstRoot, "--prefix", final], installEnvironment, external, "relocated Unicode toolchain installation")
+let finalRoot = installedRoot(final)
+for path in ["runtime/native/unicode.c", "runtime/native/unicode_data.c", "runtime/native/unicode_case_data.h", "runtime/minyar_native.h",
+    "vendor/utf8proc/LICENSE.md", "vendor/utf8proc/utf8proc.c", "vendor/utf8proc/utf8proc.h", "vendor/utf8proc/utf8proc_data.c",
+    "library/unicode.min", "library/text.min"] {
+    test.check(io.fileExists(finalRoot + "/" + path) && files.pathSize(finalRoot + "/" + path) > 0, "installed Unicode input missing: " + path)
+    run(fixture, ["cmp", source + "/" + path, finalRoot + "/" + path], installEnvironment, external,
+        "verify installed Unicode source bytes " + path)
+}
+let launcher = final + "/bin/minyar"
+let wrapper = io.readTextFile(launcher)
+test.check(!test.contains(wrapper, source) && !test.contains(wrapper, first), "final wrapper must have no checkout or first-installation dependency")
+test.check(test.contains(wrapper, "# Installed by Minyar; self-contained toolchain"), "final launcher is the installed wrapper")
+test.removeTree(first)
+test.check(!io.fileExists(first + "/bin/minyar") && files.pathSize(firstRoot) < 0, "first installation must be gone before compiling")
+
+let program = external + "/postcard.min"
+io.writeTextFile(program, #"""
+    use "unicode" as unicode
+    use "text" as text
+
+    let acute = Text(Character(0x301))
+    let zero = Text(Character(0))
+    let sample = "e" + acute + "👩🏽‍🚀🇬🇧"
+    print(unicode.unicodeVersion())
+    print(unicode.graphemeCount(sample))
+    print(unicode.graphemes(sample)[1])
+    for position in unicode.graphemeBoundaries(sample) { print(position) }
+    print(unicode.normalized("Cafe" + acute))
+    print(unicode.caseFold("Straße Σς"))
+    print(unicode.uppercased("Straße ﬃ"))
+    print(unicode.lowercased("AΣ AΣB İ"))
+    print(unicode.normalized("e" + acute + zero + "A" + Text(Character(0x30A))))
+    print(unicode.caseFold("A" + zero + "ẞ"))
+    print(unicode.uppercased("a" + zero + "ß"))
+    print(unicode.lowercased("AΣ" + zero + "B"))
+    print(text.validUTF8(Bytes("sea" + zero + "é")))
+    let invalid = Bytes(1)
+    invalid[0] = 255
+    print(text.validUTF8(invalid))
+
+    """#)
+let zero = Text(Character(0))
+let expected = "18.0.0\n3\n👩🏽‍🚀\n0\n2\n6\n8\nCafé\nstrasse σσ\nSTRASSE FFI\naς aσb i" + Text(Character(0x307)) + "\né" + zero + "Å\na" + zero + "ss\nA" + zero + "SS\naς" + zero + "b\ntrue\nfalse\n"
+for profile in ["ordinary", "release"] {
+    let cache = fixture.work + "/" + profile + " cold cache"
+    test.check(files.makeDirectory(cache) == 0, "create isolated " + profile + " cache")
+    let initial = files.list(cache)
+    test.check(files.lastError() == 0 && initial.length == 0, profile + ": native cache must start empty")
+    let environment = isolatedEnvironment(cache, clang)
+    let executable = external + "/postcard-" + profile
+    let command = [launcher]
+    if profile == "release" { command.add("--release") }
+    for argument in [program, "-o", executable] { command.add(argument) }
+    run(fixture, command, environment, external, "compile installed Unicode program " + profile)
+    compiledProviders(cache, profile)
+    let result = run(fixture, [executable], environment, external, "run installed Unicode program " + profile)
+    test.check(result.output == expected, profile + ": installed Unicode stdout differs, including embedded NUL bytes")
+    test.check(result.errorOutput == "", profile + ": installed Unicode program wrote stderr\n" + result.errorOutput)
+}
+test.removeTree(fixture.work)
+print("Installed Unicode: relocated ordinary/release programs and cold provider caches passed")

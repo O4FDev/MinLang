@@ -166,6 +166,31 @@ function contains(values: List<Integer>, value: Integer): Boolean {
     return false
 }
 
+// RFC6066 host_name is ASCII DNS syntax without a trailing dot or IP literal.
+// Validate bytes before Text construction: ClientHello is not authenticated.
+function validServerName(name: Bytes): Boolean {
+    if name.length < 1 || name.length > 253 { return false }
+    let label = 0; let previous = 0; let labels = 1; let numeric = true
+    for byte in name {
+        if byte == 46 {
+            if label == 0 || previous == 45 { return false }
+            label = 0; labels += 1
+        } else {
+            let digit = byte >= 48 && byte <= 57
+            let letter = byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122
+            if !digit && !letter && byte != 45 { return false }
+            if label == 0 && byte == 45 { return false }
+            if !digit { numeric = false }
+            label += 1
+            if label > 63 { return false }
+        }
+        previous = byte
+    }
+    if label == 0 || previous == 45 { return false }
+    // A dotted quad is an address, not a DNS host_name. IPv6 is rejected above.
+    return !numeric || labels != 4
+}
+
 function clientHello(session: Session, hello: Bytes) {
     if hello.length < 45 || get16(hello, 4) != 0x0303 { abandon(session, "malformed ClientHello"); return }
     let at = 38
@@ -226,7 +251,9 @@ function clientHello(session: Session, hello: Bytes) {
             session.peerTransportParameters = body; parameters = true
         } else if type == 0 {
             if size < 5 || get16(body, 0) != size - 2 || body[2] != 0 || get16(body, 3) != size - 5 || size - 5 > 253 || size == 5 { abandon(session, "malformed server name"); return }
-            session.serverName = Text(body.slice(5, size))
+            let name = body.slice(5, size)
+            if !validServerName(name) { abandon(session, "invalid TLS server name"); return }
+            session.serverName = Text(name)
         } else if type == 45 {
             if size < 2 || body[0] != size - 1 { abandon(session, "malformed PSK modes"); return }
             for index in 1..size { if body[index] == 1 { pskMode = true } }

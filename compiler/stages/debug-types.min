@@ -1,0 +1,160 @@
+// Type IDs belong to the enclosing emitted function, not the final LLVM module.
+// A cached function keeps its descriptors even when compiler symbol IDs move.
+// Emit names already escaped for LLVM strings, with the comment delimiter also
+// escaped. Escaping the delimiter last keeps \7C from becoming \5C7C.
+function debugTypeText(value: Text): Text {
+    let escaped = escapeLLVMText(value)
+    let pieces: List<Text> = []
+    let position = 0
+    while position < escaped.length {
+        let character = escaped[position]
+        if character == '|' { pieces.add("\\7C") } else { pieces.add(Text(character)) }
+        position = position + 1
+    }
+    return joinText(pieces)
+}
+
+function debugTypeQueue(context: CompilerContext, types: List<Integer>, type: Integer) {
+    let index = 0
+    while index < context.debugTypes.length {
+        if context.debugTypes[index] == type { return }
+        index = index + 1
+    }
+    index = 0
+    while index < types.length {
+        if types[index] == type { return }
+        index = index + 1
+    }
+    types.add(type)
+}
+
+// Schema:
+// type: id|kind|escaped source name|object bits|kind-specific fields
+// basic fields: DW_ATE encoding; list: child ID; map: key ID|value ID|slots;
+// record: slot count; enum: none (its cases follow). Text/Bytes describe their
+// common 32-byte prefix.
+// field: owner ID|child ID|escaped raw field name|bit offset
+// case: owner ID|zero-based tag|escaped case name
+// opaque: zero object bits, followed by the reason the layout is unavailable.
+// All non-basic, non-enum types are pointer values. Object bits never include RcObject.
+// managed-v1 describes ordinary inline record/map storage. An arena link driver
+// must downgrade these descriptors, because arena records use List storage.
+function emitDebugType(context: CompilerContext, output: List<Text>, type: Integer) {
+    let types: List<Integer> = []
+    debugTypeQueue(context, types, type)
+    debugTypeQueue(context, types, 1)
+    if types.length > 0 { output.add("; minyar-debug-layout: managed-v1\n") }
+    let position = 0
+    while position < types.length {
+        let current = types[position]
+        position = position + 1
+        context.debugTypes.add(current)
+        let name = debugTypeText(diagnosticType(context, current))
+        let head = "; minyar-debug-type: " + Text(current) + "|"
+        if current == 1 || current == 3 || current == 4 || current == 7 {
+            let bits = 64
+            let encoding = "DW_ATE_signed"
+            if current == 3 { bits = 32; encoding = "DW_ATE_UTF" }
+            if current == 4 { bits = 8; encoding = "DW_ATE_boolean" }
+            if current == 7 { encoding = "DW_ATE_float" }
+            output.add(head + "basic|" + name + "|" + Text(bits) + "|" + encoding + "\n")
+        } else if current == 2 {
+            output.add(head + "text|" + name + "|256\n")
+        } else if current == 8 {
+            output.add(head + "bytes|" + name + "|256\n")
+        } else if isListType(current) {
+            let child = listElementType(current)
+            output.add(head + "list|" + name + "|192|" + Text(child) + "\n")
+            debugTypeQueue(context, types, child)
+        } else if isMapType(current) || isSetType(current) {
+            let key = 1
+            let value = 1
+            if isSetType(current) { key = setElementType(current) } else { key = mapKeyType(current); value = mapValueType(current) }
+            let slots = 6
+            if isRecordType(key) { slots = 9 }
+            output.add(head + "map|" + name + "|" + Text(64 + slots * 64) + "|" + Text(key) + "|" + Text(value) + "|" + Text(slots) + "\n")
+            debugTypeQueue(context, types, key)
+            debugTypeQueue(context, types, value)
+        } else if isRecordType(current) {
+            // Choices follow their storage layout: pure enums are plain tags,
+            // niches reuse a payload pointer or scalar code, and tagged unions
+            // overlap payload slots after the tag.
+            let layout = choiceLayoutKind(context, current)
+            if layout == 1 {
+                output.add(head + "enum|" + name + "|64\n")
+                let cases = choiceCases(context, current)
+                let variant = 1
+                while variant < cases.length {
+                    output.add("; minyar-debug-case: " + Text(current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
+                    variant = variant + 1
+                }
+            } else if layout == 3 || layout == 4 {
+                output.add(head + "opaque|" + name + "|0|niche-choice\n")
+            } else if isCallbackType(current, context.functionNames) {
+                output.add(head + "opaque|" + name + "|0|callback\n")
+            } else if isCRecord(context, current) {
+                output.add(head + "opaque|" + name + "|0|c-layout\n")
+            } else {
+                let record = current - 1000
+                let count = context.functionParameterCounts[record]
+                let first = functionParameterOffset(context.functionParameterCounts, record)
+                // Descriptors belong to each function. A very wide type would
+                // otherwise repeat millions of fields across its accessors.
+                // Scalarized records already have at most 64 fields.
+                let wide = count > 64
+                if count > 0 && context.functionParameterNames[first].byteLength > 512 && resultPrefix(context.functionParameterNames[first], "minyar_choice_tag|") { wide = true }
+                if wide {
+                    output.add(head + "opaque|" + name + "|0|wide-type\n")
+                } else {
+                    let slots = count
+                    if layout == 2 { slots = choiceStorageCount(context, current) }
+                    output.add(head + "record|" + name + "|" + Text(64 + slots * 64) + "|" + Text(slots) + "\n")
+                    let field = 0
+                    while field < count {
+                        let child = context.functionParameterTypes[first + field]
+                        let fieldName = declaredFieldName(context.functionParameterNames[first + field])
+                        let slot = field
+                        if layout == 2 { slot = choiceStorageField(context, current, field) }
+                        output.add("; minyar-debug-field: " + Text(current) + "|" + Text(child) + "|" + debugTypeText(fieldName) + "|" + Text(64 + slot * 64) + "\n")
+                        debugTypeQueue(context, types, child)
+                        field = field + 1
+                    }
+                    let cases = choiceCases(context, current)
+                    let variant = 1
+                    while variant < cases.length {
+                        output.add("; minyar-debug-case: " + Text(current) + "|" + Text(variant - 1) + "|" + debugTypeText(cases[variant]) + "\n")
+                        variant = variant + 1
+                    }
+                }
+            }
+        } else {
+            let reason = "unsupported"
+            if current == 5 || current == 6 { reason = "nothing" }
+            output.add(head + "opaque|" + name + "|0|" + reason + "\n")
+        }
+    }
+}
+
+// Scalar record lowering stores each field's i64 slot operand in an output
+// piece, even for Float bit patterns and zero-extended Boolean/Character values.
+// The fragments describe a virtual record value, never the null pointer used
+// by the ordinary lowering. They add no executable LLVM instructions.
+function emitDebugScalarBinding(context: CompilerContext, output: List<Text>, position: Integer, name: Text, type: Integer, values: Integer) {
+    emitDebugType(context, output, type)
+    emitDebugOrigin(output, context.tokenLines, position, "line")
+    let record = type - 1000
+    let count = context.functionParameterCounts[record]
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    output.add("; minyar-debug-local: aggregate|i64 " + Text(count) + "|ptr|" + debugTypeText(diagnosticType(context, type)) + "|" + debugTypeText(name) + "|0|" + Text(type) + "\n")
+    let field = 0
+    while field < count {
+        let child = context.functionParameterTypes[first + field]
+        let bits = 64
+        if child == 4 { bits = 8 }
+        if child == 3 { bits = 32 }
+        let storage = "i64 "
+        if output[values + field * 3] == "; mutable scalar field " { storage = "ptr " }
+        output.add("; minyar-debug-fragment: " + storage + output[values + field * 3 + 1] + "|" + Text(64 + field * 64) + "|" + Text(bits) + "\n")
+        field = field + 1
+    }
+}

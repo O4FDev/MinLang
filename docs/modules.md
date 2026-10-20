@@ -78,9 +78,9 @@ AppKit desktop applications and needs no third-party library. On macOS,
 before `library`, so `use "http"` there gets an `http` with the same
 `Response`, `get`, `post`, `request`, `getBounded` and `getBoundedWithin` APIs
 implemented through NSURLSession. Both backends validate TLS certificates.
-The macOS backend also follows redirects, decodes chunked bodies, and provides
-streaming extensions (`start`, `read`, `finished`). The portable backend does
-not follow redirects and rejects unsupported transfer encodings explicitly.
+Both buffered backends decode chunked transfer framing. The macOS backend also
+follows redirects and provides streaming extensions (`start`, `read`, `finished`).
+The portable backend does not follow redirects and rejects other transfer codings.
 `./minyar --library library` picks the portable one on macOS too.
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or
@@ -150,14 +150,28 @@ statuses such as 404 are still complete responses, so check `status` separately.
 The portable backend validates the status line, header bytes and declared
 body length. A truncated Content-Length body or malformed header is an error,
 not a successful partial download. HEAD, no-body statuses and informational
-responses receive their appropriate framing treatment. Protocol switching and
-transfer encodings such as chunked are unsupported by that backend.
+responses receive their appropriate framing treatment. HTTP/1.1 chunked bodies
+are decoded incrementally, including validated extensions and discarded trailers.
+`Response.headers` retains only the original header section, including its
+Transfer-Encoding field; the body contains application bytes after transfer
+framing, with content encodings left unchanged. Duplicate/stacked transfer
+codings, Transfer-Encoding with Content-Length, overflowing sizes, malformed
+framing and incomplete bodies fail with an empty body. Protocol switching and
+other transfer codings remain unsupported. The client closes each connection
+when framing completes; it does not wait for EOF or reuse the connection.
 
 The portable timeout bounds reads after connection establishment; DNS and the
 initial blocking connection retain platform timeouts. On macOS, the deadline
 covers the NSURLSession request including redirects, and the body limit applies
 to decoded response bytes. Both cap HTTP header storage at 32 KiB for bounded
-requests. These controls do not promise a universal bound on OS or TLS memory.
+requests. Portable chunked responses share that same 32 KiB metadata budget
+across informational/final headers, chunk sizes/extensions, data delimiters and
+trailers. The body limit bounds decoded bytes, and retained transfer bytes are
+bounded by that limit plus 32 KiB. Decoding also retains a separate bounded body;
+temporary slices, parser and TLS buffers add memory. These controls do not
+promise a universal bound on OS or TLS memory. See RFC 9112 sections
+[6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) and
+[7.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1) for framing rules.
 
 ## JSON validation
 

@@ -8,6 +8,40 @@ static void empty_heap(void) {
     assert(rc_bytes == 0);
 }
 
+static void scope_release_paths(void) {
+    minyar_rc_scope_release_v1(NULL);
+    static const struct { size_t ownership; unsigned char payload[8]; } immortal = { RC_TEXT, { 0 } };
+    minyar_rc_scope_release_v1((void *)immortal.payload);
+    assert(immortal.ownership == RC_TEXT);
+
+    MinyarRecord *shared = rc_allocate_object(sizeof(*shared), RC_SCALAR_RECORD);
+    shared->length = 0;
+    minyar_rc_retain(shared);
+    minyar_rc_scope_release_v1(shared);
+    assert((((RcObject *)shared - 1)->ownership >> 3) == 1);
+    assert(rc_object_count == 1 && rc_pending_count == 0);
+
+    minyar_rc_retain(shared);
+    MinyarRecord *queued = rc_allocate_object(sizeof(*queued), RC_RECORD);
+    queued->length = 0;
+    rc_drop(queued);
+    assert(rc_pending_count == 1 && rc_object_count == 2);
+    minyar_rc_scope_release_v1(NULL);
+    assert(rc_pending_count == 1);
+    minyar_rc_scope_release_v1(shared);
+    assert(rc_pending_count == 0 && rc_object_count == 1);
+    assert((((RcObject *)shared - 1)->ownership >> 3) == 1);
+
+    queued = rc_allocate_object(sizeof(*queued), RC_RECORD);
+    queued->length = 0;
+    rc_drop(queued);
+    minyar_rc_scope_release_v1((void *)immortal.payload);
+    assert(rc_pending_count == 0 && rc_object_count == 1);
+    assert(immortal.ownership == RC_TEXT);
+    minyar_rc_scope_release_v1(shared);
+    empty_heap();
+}
+
 /* A bounded abstract machine models owned and borrowed parameter slots. Every
  * transition checks actual counts against all modeled owners, not just exit. */
 static void borrowed_frame_model(void) {
@@ -174,6 +208,7 @@ static void mixed_ascii_index_blocks(void) {
 }
 
 int main(void) {
+    scope_release_paths();
     minyar_rc_release(NULL);
     minyar_rc_enter(3);
     MinyarText *unicode = copy_c_text("é🙂");

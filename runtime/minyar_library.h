@@ -317,6 +317,7 @@ double minyar_atan2(double y, double x) {
 /* Recoverable whole-file I/O captures an errno in a private native snapshot.
  * Neither empty files nor truncated reads are mistaken for successful data.
  * Legacy entry points below retain their original diagnostics and behavior. */
+#if defined(__STDC_HOSTED__) && __STDC_HOSTED__
 #include <errno.h>
 static void release_io_path(char *path) {
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
@@ -381,6 +382,26 @@ static long long checked_file_write(const MinyarText *path_text, const MinyarByt
     if (fclose(file) != 0 && !code) code = errno ? errno : EIO;
     return -code;
 }
+
+#else
+/* There is no hosted filesystem or errno in the freestanding shim. Keep
+ * typed I/O recoverable without importing host headers or fabricating data.
+ * Codes match the existing freestanding process/sync contract: EINVAL=22,
+ * ENOSYS=38. The kernel's own disk driver is independent of these APIs. */
+MinyarRecord *minyar_runtime_readBytesOutcome(const MinyarText *path, long long maximum) {
+    int invalid = maximum < 0 || memchr(path->bytes, 0, (size_t)path->byte_length);
+    MinyarRecord *result = minyar_record_new(2);
+    minyar_record_set_take(result, 0, (long long)(intptr_t)minyar_bytes_new(0));
+    minyar_record_set(result, 1, invalid ? 22 : 38);
+    return result;
+}
+static long long checked_file_write(const MinyarText *path, const MinyarBytes *contents,
+                                    const MinyarList *parts) {
+    (void)contents;
+    (void)parts;
+    return memchr(path->bytes, 0, (size_t)path->byte_length) ? -22 : -38;
+}
+#endif
 
 long long minyar_runtime_writeBytesStatus(const MinyarText *path, const MinyarBytes *contents) {
     return checked_file_write(path, contents, NULL);

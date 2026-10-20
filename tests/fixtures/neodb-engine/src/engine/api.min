@@ -1,0 +1,3780 @@
+// Engine API (docs/ENGINE_API.md): sessions, transactions, statement dispatch, DDL, COPY, plan cache,
+// WAL group commit, checkpoints and recovery.
+use "../../lib/dbio.min" as dbio
+use "../sql/ast.min" as ast
+use "../sql/parser.min" as parser
+use "../storage/wal.min" as wal
+use "../storage/snapshot.min" as snapshot
+use "./values.min" as v
+use "./hashmap.min" as hm
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+use "./txn.min" as txn
+use "./exec.min" as ex
+use "./plan.min" as pl
+use "./dml.min" as dml
+use "./skel.min" as skel
+use "./compat.min" as compat
+use "./fk.min" as fkm
+use "./persist.min" as persist
+use "../storage/datafile.min" as df
+
+public constant STATUS_OK = 0
+public constant STATUS_ERROR = 1
+public constant STATUS_WOULD_BLOCK = 2
+public constant STATUS_COPY_IN = 3
+
+public record Column {
+    name: Text
+    typeOid: Integer
+    typeSize: Integer
+    typeMod: Integer
+}
+
+public record Outcome {
+    status: Integer
+    hasRowDescription: Boolean
+    columns: List<Column>
+    rowData: Bytes
+    rowCount: Integer
+    commandTag: Text
+    sqlstate: Text
+    message: Text
+    detail: Text
+    position: Integer
+    txnStatus: Integer
+    waitLsn: Integer
+    copyColumns: Integer
+    notices: List<Text>
+}
+
+record CacheEntry {
+    key: Bytes
+    stmts: List<pl.Stmt>
+    litOrd: List<List<Integer>>
+    pinOrd: List<List<Integer>>
+    pinVal: List<List<Text>>
+    version: Integer
+    tree: ast.Ast
+    roots: List<Integer>
+    utility: List<Boolean>
+    starts: List<Integer>
+    cols: List<List<Column>>      // result columns per statement, filled on first run (reset on re-plan)
+    litVals: List<List<Bytes>>    // per-statement literal values, overwritten on every hit
+}
+
+public record Engine {
+    private c: cat.Catalog
+    private tm: txn.TxnMgr
+    private views: pl.ViewCache
+    private env: ex.Env
+    private dataDir: Text
+    private walBox: List<wal.Wal>
+    private hasWal: Boolean
+    private committing: Bytes
+    private durable: Integer
+    private nextSession: Integer
+    private cacheMap: hm.IntMap
+    private cache: List<CacheEntry>
+    private sk: skel.Skel
+    private replaying: Boolean
+    private ckptLsn: Integer
+    private lastCkptTick: Integer
+    private ticks: Integer
+    private nextXid: Integer
+    private sys: Session
+    private stmtCount: Integer
+    private snapBox: List<snapshot.Opened>
+    private idleTicks: Integer
+    private lastSeenStmt: Integer
+    private nBlocks: Integer
+    private nCommits: Integer
+    private nReleases: Integer
+    private nSyncWakes: Integer
+    private lastStatTick: Integer
+    private statStmts: Integer
+    private opts: Options
+    private closed: Boolean
+    private st: persist.Store      // table images in data.db (format v3, ADR-010)
+    private snapVersion: Integer   // catalog format of the snapshot tables are loaded from: 2 (round 1) or 3
+    private pointHits: Integer     // point lookups answered from an image without loading the table
+    private ck: persist.Ckpt       // checkpoint in progress (sliced, M3)
+    private ckptGen: Integer       // checkpoints published since open
+    private ckptWanted: Integer    // a CHECKPOINT statement waits for checkpoint number ckptWanted
+    private ckptPublishUs: Integer // diagnostics: longest publish step on the loop thread
+    private pubPhase: Integer      // 0 none, 1 waiting for the WAL to be durable to the LSN, 2 manifest fdatasync
+    private pubLsn: Integer
+    private pubBytes: Bytes
+    private pubSlot: Integer
+    private pubFd: Integer
+    private pubSyncer: Integer
+    private curSlot: Integer       // manifest slot holding the current manifest (-1: none / a snap-*.db file)
+    private lastCkptMs: Integer    // monotonic ms when the last checkpoint began (time-based trigger)
+    private prepMap: hm.IntMap          // extended-protocol Parse cache: hash(sql, param types) -> prepCache index
+    private prepCache: List<Prepared>
+    private tags: List<Text>
+    private noOutcome: Outcome
+    private noColumns: List<Column>
+    private idleCopy: IdleCopy
+}
+
+// Storage options (docs/STORAGE_API.md "Engine open/close"). checkpointWalBytes: a checkpoint starts once this
+// much WAL was written since the last one (server flag --checkpoint-wal-mb).
+public record Options {
+    checkpointWalBytes: Integer
+    checkpointIntervalMs: Integer   // also checkpoint this long after the last one if WAL was written (0 = off)
+    noPrealloc: Boolean
+}
+
+public function defaultOptions(): Options {
+    return Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 300000; noPrealloc: false }
+}
+
+public record Session {
+    private id: Integer
+    private user: Text
+    private txSlot: Integer
+    private inBlock: Boolean
+    private failed: Boolean
+    private defaultSerializable: Boolean
+    private nextSerializable: Boolean
+    private remaining: Text
+    private settingNames: List<Text>
+    private settingValues: List<Text>
+    private copyTable: Integer
+    private copyCols: List<Integer>
+    private copyBuf: Bytes
+    private copyRows: Integer
+    private copyCsv: Boolean
+    private copyDelim: Integer
+    private copyNull: Bytes
+    private copyHeader: Boolean
+    private copyPlan: ex.Plan
+    private copyBulk: Integer
+    private copyErr: Outcome
+    private copyImplicit: Boolean
+    private savepointNames: List<Text>
+    private savepointUndo: Bytes
+    private savepointRedo: Bytes
+    private ownSettings: Boolean         // settingNames/Values are this session's own lists (else shared empties)
+    private ownSavepoints: Boolean       // savepoint lists are this session's own (else shared empties)
+    private txStart: Integer
+    private xid: Integer
+    private waitSlot: Integer
+    private waitGen: Integer
+    private ckptWait: Integer      // CHECKPOINT statement parked until this checkpoint number is published
+    // transaction characteristics of the current block (SHOW / read-only checks)
+    private txIso: Integer
+    private txReadOnly: Boolean
+    private txDeferrable: Boolean
+    private txSnap: Boolean
+    private defaultReadOnly: Boolean
+    private spReadOnly: Bytes
+    private cursors: List<Cursor>
+    private ddlUndo: List<DdlUndo>
+}
+
+// Catalog change made inside a transaction block, undone by ROLLBACK (TO SAVEPOINT).
+record DdlUndo {
+    kind: Integer          // UNDO_CREATED, UNDO_DROPPED, UNDO_INDEX
+    tid: Integer
+    name: Text             // table name before the change (UNDO_DROPPED) / created table or index name
+    depth: Integer         // savepoints open when the change was made
+}
+
+constant UNDO_CREATED = 1  // table created: rollback drops it
+constant UNDO_DROPPED = 2  // table dropped: renamed to a hidden name until COMMIT, rollback renames it back
+constant UNDO_INDEX = 3    // index created: rollback drops it
+
+// A DECLAREd cursor: the query result is materialized at DECLARE (the cursor's snapshot); an error while
+// producing it is deferred to the FETCH that reaches the failing row, as in PG.
+record Cursor {
+    name: Text
+    columns: List<Column>
+    rows: Bytes            // DataRow messages
+    offs: Bytes            // int64 start offset of each row, plus the end
+    n: Integer
+    pos: Integer           // 0 before the first row, k on row k, n + 1 after the last
+    errCode: Text          // "" or the error raised after row n
+    errMsg: Text
+    failed: Boolean        // an error escaped a FETCH: "portal cannot be run"
+    depth: Integer         // savepoints open when declared (closed by ROLLBACK TO an older one)
+    hold: Boolean
+    inTxn: Boolean         // declared in the current transaction
+}
+
+public record Prepared {
+    private st: pl.Stmt
+    private err: Outcome
+    private columns: List<Column>
+    private params: List<Integer>
+    private sql: Text
+    private tree: ast.Ast
+    private root: Integer
+    private utility: Boolean
+    private version: Integer
+    private paramHint: List<Integer>
+    private memo: Bytes                 // opaque bytes the server caches with the statement (its RowDescription)
+}
+
+// ---------------------------------------------------------------- outcomes
+
+function newOutcome(): Outcome {
+    return Outcome {
+        status: STATUS_OK; hasRowDescription: false; columns: []; rowData: Bytes(); rowCount: 0; commandTag: ""
+        sqlstate: ""; message: ""; detail: ""; position: 0; txnStatus: 73; waitLsn: 0; copyColumns: 0; notices: []
+    }
+}
+
+function okTag(s: Session, tag: Text): Outcome {
+    let o = newOutcome()
+    o.commandTag = tag
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+function errOut(s: Session, code: Text, msg: Text, pos: Integer): Outcome {
+    let o = newOutcome()
+    o.status = STATUS_ERROR
+    o.sqlstate = code
+    o.message = msg
+    o.position = pos
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+function txnStatus(s: Session): Integer {
+    if s.failed { return 69 }
+    if s.inBlock { return 84 }
+    return 73
+}
+
+function columnsOf(st: pl.Stmt): List<Column> {
+    let out: List<Column> = []
+    let i = 0
+    while i < st.outExprs.length {
+        let t = st.outTypes[i]
+        let mod = st.outMods[i]
+        if mod >= 0 && (t == v.T_VARCHAR || t == v.T_BPCHAR || t == v.T_NUMERIC) { mod = mod + 4 } else { mod = -1 }
+        out.add(Column { name: st.outNames[i]; typeOid: v.typeOid(t); typeSize: v.typeLen(t); typeMod: mod })
+        i += 1
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- open / recovery
+
+public function open(dataDir: Text): Engine {
+    return openWithOptions(dataDir, defaultOptions())
+}
+
+public function openWith(dataDir: Text, noPrealloc: Boolean): Engine {
+    let o = defaultOptions()
+    o.noPrealloc = noPrealloc
+    return openWithOptions(dataDir, o)
+}
+
+// Open (and recover) the database in dataDir. Cheap for a database closed cleanly: one directory listing, the
+// snapshot header + chunk directory + catalog chunk, no WAL to read, nothing written or fsynced (the WAL segment
+// is created on the first write). Tables are decoded when a statement first touches them.
+public function openWithOptions(dataDir: Text, opts: Options): Engine {
+    dbio.init()
+    let c = cat.newCatalog()
+    let tm = txn.newTxnMgr()
+    let env = ex.Env { cat: c; tm: tm; me: -1; nowMicros: 0; randState: 88172645463325252; session: 0; tempCount: 0 }
+    let ic = newIdleCopy(env)
+    let e = Engine {
+        c: c; tm: tm; views: pl.newViewCache(); env: env; dataDir: dataDir; walBox: []; hasWal: false
+        committing: Bytes(); durable: 0; nextSession: 1; cacheMap: hm.newIntMap(256); cache: []; sk: skel.newSkel()
+        replaying: false; ckptLsn: 0; lastCkptTick: 0; ticks: 0; nextXid: 1; sys: blankSession(0, ic); stmtCount: 0; snapBox: []; idleTicks: 0; lastSeenStmt: 0
+        nBlocks: 0; nCommits: 0; nReleases: 0; nSyncWakes: 0; lastStatTick: 0; statStmts: 0; opts: opts; closed: false
+        st: persist.newStore(dataDir); snapVersion: 3; pointHits: 0; ck: persist.idleCkpt(); ckptGen: 0; ckptWanted: 0; ckptPublishUs: 0; pubPhase: 0; pubLsn: 0; pubBytes: Bytes(); pubSlot: 0; pubFd: -1; pubSyncer: 0; curSlot: -1; lastCkptMs: dbio.monotonicNanos() / 1000000
+        prepMap: hm.newIntMap(64); prepCache: []; tags: []; noOutcome: newOutcome(); noColumns: []; idleCopy: ic
+    }
+    if dataDir == "" { return e }
+    dbio.mkdir(dataDir)
+    e.replaying = true
+    let names = dbio.listDir(dataDir)
+    let snap = snapshot.openLatestIn(dataDir, names)
+    let snapLsn = 0
+    if snap.found {
+        e.curSlot = snapshot.slotOf(snap)
+        e.snapBox.add(snap)
+        loadCatalog(e, snapshot.readChunk(snap, 0))
+        e.ckptLsn = snap.lsn
+        snapLsn = snap.lsn
+    }
+    let r = wal.openReaderIn(dataDir, names, snapLsn)
+    let partials = hm.newIntMap(16)
+    let partialBufs: List<Bytes> = []
+    while wal.next(r) {
+        let b = wal.buffer(r)
+        let off = wal.payloadOffset(r)
+        let len = wal.payloadLength(r)
+        if len > 0 {
+            let kind = b[off]
+            if kind == 67 {
+                applyOps(e, b, off + 1, off + len)
+            } else if kind == 80 || kind == 69 {
+                let cur = tb.Cursor { pos: off + 1 }
+                let xid = tb.getVarint(b, cur)
+                let idx = hm.get(partials, xid, -1)
+                if idx < 0 {
+                    partialBufs.add(Bytes())
+                    idx = partialBufs.length - 1
+                    hm.put(partials, xid, idx)
+                }
+                let pb = partialBufs[idx]
+                pb.addBytes(b.slice(cur.pos, off + len))
+                if kind == 69 {
+                    applyOps(e, pb, 0, pb.length)
+                    partialBufs[idx] = Bytes()
+                    hm.remove(partials, xid)
+                }
+            }
+        }
+    }
+    let wopts = wal.defaultOptions()
+    if opts.noPrealloc { wopts.preallocate = false }
+    e.walBox.add(wal.openWriter(dataDir, r, wopts))
+    e.hasWal = true
+    // A snapshot that is alone in the directory went through retention (published + verified); with no WAL after
+    // it, close may retire the segments below it without writing a new checkpoint.
+    if snap.found && wal.recordsRead(r) == 0 && (snapshot.slotOf(snap) >= 0 || snapshotFiles(names) == 1) { wal.setVerifiedSnapshot(e.walBox[0], snap.lsn) }
+    e.durable = wal.durableLsn(e.walBox[0])
+    for t in e.c.tables {
+        if !cat.isDropped(t) && t.chunk < 0 && t.nrows > 0 { cat.rebuildIndexes(e.c, t) }
+    }
+    if e.snapBox.length > 0 {
+        if unloadedCount(e) > 0 {
+            snapshot.pin(e.snapBox[0], e.walBox[0])
+        } else {
+            snapshot.close(e.snapBox[0])
+            e.snapBox = []
+        }
+    }
+    dropOrphanTemps(e)
+    e.replaying = false
+    return e
+}
+
+function snapshotFiles(names: List<Text>): Integer {
+    let n = 0
+    for name in names {
+        let b = Bytes(name)
+        if b.length == 24 && b[0] == 115 && b[1] == 110 && b[2] == 97 && b[3] == 112 && b[4] == 45 && b[21] == 46 && b[22] == 100 && b[23] == 98 { n += 1 }
+    }
+    return n
+}
+
+// Idle sessions share one placeholder for the COPY state (copyStart installs fresh ones, endCopy restores these),
+// so a session that never runs COPY costs a few hundred bytes (row 5: memory per connection).
+// Settings and savepoint lists are shared the same way until the first SET / SAVEPOINT (copy on write).
+record IdleCopy {
+    plan: ex.Plan
+    err: Outcome
+    buf: Bytes
+    cols: List<Integer>
+    names: List<Text>
+}
+
+function newIdleCopy(env: ex.Env): IdleCopy {
+    return IdleCopy { plan: ex.newPlan(env); err: newOutcome(); buf: Bytes(); cols: []; names: [] }
+}
+
+function ownSavepoints(s: Session) {
+    if s.ownSavepoints { return }
+    s.savepointNames = []
+    s.savepointUndo = Bytes()
+    s.savepointRedo = Bytes()
+    s.ownSavepoints = true
+}
+
+// End of a transaction block: forget every savepoint (names and their undo/redo offsets together).
+function dropSavepoints(e: Engine, s: Session) {
+    if !s.ownSavepoints { return }
+    s.savepointNames = e.idleCopy.names
+    s.savepointUndo = e.idleCopy.buf
+    s.savepointRedo = e.idleCopy.buf
+    s.ownSavepoints = false
+}
+
+function blankSession(id: Integer, ic: IdleCopy): Session {
+    return Session {
+        id: id; user: ""; txSlot: -1; inBlock: false; failed: false; defaultSerializable: false; nextSerializable: false
+        remaining: ""; settingNames: ic.names; settingValues: ic.names; copyTable: -1; copyCols: ic.cols; copyBuf: ic.buf; copyRows: 0
+        copyCsv: false; copyDelim: 9; copyNull: ic.buf; copyHeader: false; copyPlan: ic.plan
+        copyBulk: -1; copyErr: ic.err; copyImplicit: false; savepointNames: ic.names; savepointUndo: ic.buf; savepointRedo: ic.buf; txStart: 0; xid: 0; waitSlot: -1; waitGen: 0; ckptWait: 0
+        txIso: 0; txReadOnly: false; txDeferrable: false; txSnap: false; defaultReadOnly: false; spReadOnly: Bytes()
+        cursors: []; ddlUndo: []
+        ownSettings: false; ownSavepoints: false
+    }
+}
+
+function endCopy(e: Engine, s: Session) {
+    s.copyTable = -1
+    s.copyPlan = e.idleCopy.plan
+    s.copyErr = e.idleCopy.err
+    s.copyBuf = e.idleCopy.buf
+    s.copyNull = e.idleCopy.buf
+    s.copyCols = e.idleCopy.cols
+}
+
+// Apply a committed transaction's operations (recovery).
+function applyOps(e: Engine, b: Bytes, start: Integer, end: Integer) {
+    let pos = start
+    while pos < end {
+        let ddl: List<Text> = []
+        let at: List<Integer> = []
+        let need: List<Integer> = []
+        let np = dml.replayOps(e.c, b, pos, end, ddl, at, need)
+        if need.length > 0 {
+            ensureLoaded(e, need[0], false)
+            pos = np
+        } else if ddl.length > 0 {
+            runDdlText(e, ddl[0])
+            pos = at[0]
+        } else {
+            pos = np
+            if np >= end { break }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- lazy table loading
+
+function unloadedCount(e: Engine): Integer {
+    let n = 0
+    for t in e.c.tables {
+        if t.chunk >= 0 && !cat.isDropped(t) { n += 1 }
+    }
+    return n
+}
+
+// Decode a table from the startup snapshot on first touch.
+function ensureLoaded(e: Engine, tid: Integer, buildIndexes: Boolean) {
+    let t = e.c.tables[tid]
+    if t.chunk < 0 { return }
+    let chunk = t.chunk
+    t.chunk = -1
+    if e.snapBox.length == 0 || cat.isDropped(t) { return }
+    let o = e.snapBox[0]
+    if e.snapVersion == 3 {
+        // format v3: pread the table's buffers (indexes included); no decode, no index build
+        persist.loadTable(e.st, e.c, t, imageOf(e, t.id, chunk))
+    } else {
+        let b = snapshot.readChunk(o, chunk)
+        if b.length > 0 { tb.decodeTableSnap(t, b) }
+        if buildIndexes { cat.rebuildIndexes(e.c, t) }
+    }
+    e.c.version += 1
+    if !e.replaying && unloadedCount(e) == 0 && e.hasWal {
+        snapshot.release(o, e.walBox[0])
+        e.snapBox = []
+    }
+}
+
+// The persisted image of table tid (descriptor chunk read from the snapshot the first time).
+function imageOf(e: Engine, tid: Integer, chunk: Integer): persist.TableImage {
+    if !persist.isKnown(e.st, tid) {
+        persist.setImage(e.st, tid, persist.decodeDescriptor(snapshot.readChunk(e.snapBox[0], chunk)))
+    }
+    return persist.imageOf(e.st, tid)
+}
+
+// A SELECT whose only access to a table that is not loaded is one probe of a hash index (a primary-key point
+// lookup) is answered from the table's image: the index probe and the matching row's cells are preads into a
+// one-row stand-in (persist.pagedSetup). Anything else loads the table.
+function pointLookup(e: Engine, st: pl.Stmt): Boolean {
+    if st.kind != pl.SK_SELECT || st.tableIds.length != 1 || e.snapVersion != 3 { return false }
+    let tid = st.tableIds[0]
+    if tid >= e.c.tables.length { return false }
+    let t = e.c.tables[tid]
+    if t.chunk < 0 || cat.isDropped(t) { return false }
+    let p = st.p
+    let hid = -1
+    let uses = 0
+    let o = 0
+    while o < p.ok.length {
+        let k = p.ok[o]
+        if k == ex.O_SCAN || k == ex.O_RANGE || k == ex.O_HASHEQ {
+            if p.slotBase[p.oa[o]].id == tid {
+                if k != ex.O_HASHEQ { return false }
+                hid = p.ob[o]
+                uses += 1
+            }
+        }
+        o += 1
+    }
+    if uses != 1 { return false }
+    if !persist.pagedSetup(e.st, e.c, t, hid, imageOf(e, tid, t.chunk)) { return false }
+    e.pointHits += 1
+    return true
+}
+
+function ensureTables(e: Engine, ids: List<Integer>) {
+    for tid in ids {
+        if tid < e.c.tables.length && e.c.tables[tid].chunk >= 0 { ensureLoaded(e, tid, true) }
+    }
+}
+
+// Engine shutdown (SIGTERM): same as close.
+public function shutdown(e: Engine) {
+    close(e)
+}
+
+// Close the database (multi-tenant eviction, shutdown): abort open transactions, checkpoint if anything was
+// written since the last checkpoint, stop the WAL syncer thread, release the snapshot, drop every table and cache.
+// After a verified checkpoint the WAL segments are retired (at most one ready walprep file is kept), so the data
+// directory holds the snapshot only and the next open reads no WAL. The Engine must not be used afterwards
+// (statements on a closed engine fail; close is idempotent).
+public function close(e: Engine) {
+    if e.closed { return }
+    e.closed = true
+    if e.hasWal {
+        for tx in e.tm.txns {
+            if tx.state == txn.TX_ACTIVE { txn.abort(e.tm, e.c, tx) }
+        }
+        let w = e.walBox[0]
+        finishCheckpoint(e)
+        if wal.appendedLsn(w) > e.ckptLsn || (wal.hasSegment(w) && wal.verifiedSnapshot(w) != wal.appendedLsn(w)) {
+            checkpoint(e)
+        }
+        if e.snapBox.length > 0 {
+            snapshot.release(e.snapBox[0], w)
+            e.snapBox = []
+        }
+        let end = wal.appendedLsn(w)
+        if wal.verifiedSnapshot(w) == end && e.ckptLsn == end {
+            wal.closeAfterCheckpoint(w, end, 1)
+        } else {
+            wal.close(w)
+        }
+        e.hasWal = false
+        e.walBox = []
+        df.close(persist.dataFile(e.st))
+    } else if e.snapBox.length > 0 {
+        snapshot.close(e.snapBox[0])
+        e.snapBox = []
+    }
+    // free everything: the caller may keep the Engine record around (e.g. in a tenant table)
+    let c = cat.newCatalog()
+    e.c = c
+    e.tm = txn.newTxnMgr()
+    e.env = ex.Env { cat: c; tm: e.tm; me: -1; nowMicros: 0; randState: 1; session: 0; tempCount: 0 }
+    e.views = pl.newViewCache()
+    e.cache = []
+    e.cacheMap = hm.newIntMap(16)
+    e.prepCache = []
+    e.prepMap = hm.newIntMap(16)
+    e.committing = Bytes()
+    e.st = persist.newStore("")
+}
+
+public function isClosed(e: Engine): Boolean { return e.closed }
+
+function runDdlText(e: Engine, sql: Text) {
+    let r = parser.parse(sql)
+    if !r.ok { return }
+    let s = e.sys
+    // "--neo sid=N" prefix: the session that ran it (temp-table namespace)
+    let saveSession = e.env.session
+    e.env.session = 0
+    if sql.length > 10 && sql.slice(0, 10) == "--neo sid=" {
+        let n = 0
+        let j = 10
+        while j < sql.length && sql[j] >= '0' && sql[j] <= '9' && n < 100000000000 {
+            n = n * 10 + (Integer(sql[j]) - 48)
+            j += 1
+        }
+        e.env.session = n
+    }
+    let i = 0
+    while i < r.ast.statements.length {
+        runUtility(e, s, r.ast, r.ast.statements[i], r.ast.stmtText[i])
+        i += 1
+    }
+    e.env.session = saveSession
+}
+
+// After recovery: temp tables of sessions that no longer exist are dropped (not logged; replay recreates
+// and drops them the same way, so table ids stay aligned with the WAL).
+function dropOrphanTemps(e: Engine) {
+    let i = 0
+    while i < e.c.tables.length {
+        let t = e.c.tables[i]
+        if !cat.isDropped(t) && pl.isTempName(t.name) { cat.dropTable(e.c, i) }
+        i += 1
+    }
+    e.env.tempCount = 0
+}
+
+// ---------------------------------------------------------------- sessions
+
+public function newSession(e: Engine, user: Text, database: Text): Session {
+    let s = blankSession(e.nextSession, e.idleCopy)
+    e.nextSession += 1
+    s.user = user
+    return s
+}
+
+public function closeSession(e: Engine, s: Session) {
+    e.env.session = s.id
+    // abort any open transaction (undoing its catalog changes) and close cursors
+    rollbackSession(e, s)
+    s.cursors = []
+    if e.env.tempCount > 0 {
+        // drop this session's temp tables (logged, so replay drops them too)
+        let prefix = pl.tempName(s.id, "")
+        let names: List<Text> = []
+        for t in e.c.tables {
+            if !cat.isDropped(t) && t.name.length > prefix.length && t.name.slice(0, prefix.length) == prefix { names.add(t.name) }
+        }
+        for nm in names {
+            e.env.session = s.id
+            let r = parser.parse("DROP TABLE " + quoteIdent(nm))
+            if r.ok { runUtility(e, s, r.ast, r.ast.statements[0], r.ast.stmtText[0]) }
+        }
+    }
+}
+
+// Table id of a relation name as the current session sees it (its temp tables first).
+function relId(e: Engine, name: Text): Integer {
+    return pl.findRel(e.c, e.env, name)
+}
+
+// User-facing name of a catalog table (temp tables without their namespace prefix).
+function displayName(name: Text): Text {
+    if !pl.isTempName(name) { return name }
+    let i = 8
+    while i < name.length && name[i] != '.' { i += 1 }
+    if i >= name.length { return name }
+    return name.slice(i + 1, name.length)
+}
+
+public function serverParameters(e: Engine): List<Text> {
+    return ["server_version", "17.0", "server_encoding", "UTF8", "client_encoding", "UTF8", "DateStyle", "ISO, MDY",
+            "TimeZone", "UTC", "integer_datetimes", "on", "standard_conforming_strings", "on", "IntervalStyle", "postgres",
+            "is_superuser", "on", "session_authorization", "postgres", "application_name", "", "default_transaction_read_only", "off",
+            "in_hot_standby", "off", "search_path", "\"$user\", public"]
+}
+
+// ---------------------------------------------------------------- transactions
+
+function now(): Integer {
+    // microseconds since 2000-01-01
+    return dbio.wallClockMicros() - 946684800000000
+}
+
+function ensureTxn(e: Engine, s: Session): txn.Txn {
+    if s.txSlot >= 0 {
+        let tx = e.tm.txns[s.txSlot]
+        if tx.state == txn.TX_ACTIVE { return tx }
+    }
+    let tx = txn.begin(e.tm, s.id)
+    s.txSlot = tx.slot
+    tx.redo.clear()
+    tx.redo.add(67)
+    tx.serializable = s.nextSerializable || s.defaultSerializable
+    s.nextSerializable = false
+    s.txStart = now()
+    s.xid = e.nextXid
+    e.nextXid += 1
+    return tx
+}
+
+// Commit: append redo to the WAL; returns the LSN to wait for (0 if nothing to wait for).
+function commitTxn(e: Engine, s: Session, tx: txn.Txn): Integer {
+    s.txSlot = -1
+    if tx.redo.length <= 1 && tx.uCount == 0 {
+        txn.finishEmpty(e.tm, tx)
+        return 0
+    }
+    if !e.hasWal || e.replaying {
+        txn.finishCommit(e.tm, e.c, tx)
+        return 0
+    }
+    let lsn = 0
+    if tx.redo[0] == 80 {
+        // partial records were written: finish with an 'E' record
+        let rec = Bytes()
+        rec.add(69)
+        tb.putVarint(rec, s.xid)
+        rec.addBytes(tx.redo.slice(1 + varintLen(s.xid), tx.redo.length))
+        lsn = wal.append(e.walBox[0], rec)
+    } else {
+        lsn = wal.append(e.walBox[0], tx.redo)
+    }
+    tx.state = txn.TX_COMMITTING
+    tx.commitLsn = lsn
+    e.nCommits += 1
+    e.committing.addInt64(tx.slot)
+    return lsn
+}
+
+function varintLen(x: Integer): Integer {
+    let b = Bytes()
+    tb.putVarint(b, x)
+    return b.length
+}
+
+// Large transactions spill their redo as 'P' records (replayed only if the final 'E' record exists).
+function maybeSpill(e: Engine, s: Session, tx: txn.Txn) {
+    if !e.hasWal || e.replaying { return }
+    if tx.redo.length < 4194304 { return }
+    let rec = Bytes()
+    rec.add(80)
+    tb.putVarint(rec, s.xid)
+    let hdr = 1
+    if tx.redo[0] == 80 { hdr = 1 + varintLen(s.xid) }
+    rec.addBytes(tx.redo.slice(hdr, tx.redo.length))
+    wal.append(e.walBox[0], rec)
+    tx.redo.clear()
+    tx.redo.add(80)
+    tb.putVarint(tx.redo, s.xid)
+}
+
+function rollbackSession(e: Engine, s: Session) {
+    if s.txSlot >= 0 {
+        let tx = e.tm.txns[s.txSlot]
+        if tx.state == txn.TX_ACTIVE { txn.abort(e.tm, e.c, tx) }
+    }
+    s.txSlot = -1
+    s.inBlock = false
+    s.failed = false
+    dropSavepoints(e, s)
+    s.spReadOnly.clear()
+    cursorsAtEnd(s, false)
+    undoDdl(e, s, -1)
+}
+
+// Transaction end: non-holdable cursors close; on rollback, holdable ones declared in it close too.
+function cursorsAtEnd(s: Session, commit: Boolean) {
+    if s.cursors.length == 0 { return }
+    let keep: List<Cursor> = []
+    for c in s.cursors {
+        if c.hold && (commit || !c.inTxn) {
+            c.inTxn = false
+            keep.add(c)
+        }
+    }
+    s.cursors = keep
+}
+
+// ROLLBACK TO savepoint idx closes cursors declared after it; RELEASE idx moves them to its level.
+function cursorsAtSavepoint(s: Session, idx: Integer, rollback: Boolean) {
+    if s.cursors.length == 0 { return }
+    let keep: List<Cursor> = []
+    for c in s.cursors {
+        if c.depth > idx {
+            if !rollback {
+                c.depth = idx
+                keep.add(c)
+            }
+        } else {
+            keep.add(c)
+        }
+    }
+    s.cursors = keep
+}
+
+public function syncSocket(e: Engine): Integer {
+    if !e.hasWal { return -1 }
+    return wal.syncSocket(e.walBox[0])
+}
+
+public function onSyncReadable(e: Engine) {
+    if !e.hasWal { return }
+    let d = wal.onSyncReadable(e.walBox[0])
+    e.nSyncWakes += 1
+    releaseDurable(e, d)
+}
+
+function releaseDurable(e: Engine, d: Integer) {
+    e.durable = d
+    let n = e.committing.length / 8
+    if n == 0 { return }
+    let keep = Bytes()
+    let i = 0
+    while i < n {
+        let slot = e.committing.getInt64(i * 8)
+        let tx = e.tm.txns[slot]
+        if tx.state == txn.TX_COMMITTING && tx.commitLsn <= d {
+            e.nReleases += 1
+            txn.finishCommit(e.tm, e.c, tx)
+        } else if tx.state == txn.TX_COMMITTING {
+            keep.addInt64(slot)
+        }
+        i += 1
+    }
+    e.committing = keep
+}
+
+public function durableLsn(e: Engine): Integer {
+    if !e.hasWal { return 1 << 60 }
+    return e.durable
+}
+
+public function afterLoopIteration(e: Engine) {
+    if !e.hasWal { return }
+    if e.ck.active || e.pubPhase > 0 { ckptStep(e, 1000000) }
+    if wal.appendedLsn(e.walBox[0]) > wal.writtenLsn(e.walBox[0]) || e.committing.length > 0 {
+        wal.requestSync(e.walBox[0])
+    }
+}
+
+function walDiag(e: Engine): Text {
+    if !e.hasWal { return "" }
+    let w = e.walBox[0]
+    let pre = "no"
+    if wal.inPreallocated(w) { pre = "yes" }
+    return " prealloc " + pre + " prepared " + Text(wal.preparedCount(w)) + " lsn " + Text(wal.appendedLsn(w)) +
+           " ckpts " + Text(e.ckptGen) + " ckptMaxSliceUs " + Text(e.ck.maxSliceUs) + " ckptPublishUs " + Text(e.ckptPublishUs)
+}
+
+// Storage diagnostics (tests, logs): point lookups served from images, tables loaded, last checkpoint's writes.
+public function storageStats(e: Engine): Text {
+    return "pointHits " + Text(e.pointHits) + " loads " + Text(e.st.loads) + " ckptPiecesWritten " + Text(e.st.lastPieces) +
+           " ckptBytesWritten " + Text(e.st.lastWritten) + " ckptPiecesReused " + Text(e.st.lastReused) +
+           " unloaded " + Text(unloadedCount(e))
+}
+
+public function lockEpoch(e: Engine): Integer {
+    return e.tm.lockEpoch
+}
+
+public function tick(e: Engine) {
+    e.ticks += 1
+    if e.ticks - e.lastStatTick >= 50 && e.stmtCount != e.statStmts {
+        print("neo-db stats: stmts " + Text(e.stmtCount - e.statStmts) + " commits " + Text(e.nCommits) + " blocks " + Text(e.nBlocks) + " syncWakes " + Text(e.nSyncWakes) + " released " + Text(e.nReleases) + walDiag(e))
+        e.lastStatTick = e.ticks
+        e.statStmts = e.stmtCount
+    }
+    if !e.hasWal { return }
+    wal.tick(e.walBox[0])
+    let w = e.walBox[0]
+    let pending = wal.appendedLsn(w) - e.ckptLsn
+    if e.ck.active || e.pubPhase > 0 {
+        ckptStep(e, 1000000)
+        return
+    }
+    if e.ckptWanted > e.ckptGen { ckptBegin(e) }
+    // checkpoint when the WAL since the last checkpoint is large
+    if pending > e.opts.checkpointWalBytes && e.ticks - e.lastCkptTick > 50 {
+        if ckptBegin(e) { ckptStep(e, 1000000) }
+        return
+    }
+    // timed checkpoint (like Postgres's checkpoint_timeout, default 5 min): bounds the WAL to replay after a crash
+    // when the size trigger is far away (TPC-B writes ~74 bytes of WAL per transaction)
+    if pending > 0 && e.opts.checkpointIntervalMs > 0 && dbio.monotonicNanos() / 1000000 - e.lastCkptMs >= e.opts.checkpointIntervalMs {
+        if ckptBegin(e) { ckptStep(e, 1000000) }
+        return
+    }
+    // idle checkpoint: nothing executed for ~2 s and WAL written since the last checkpoint
+    if e.stmtCount != e.lastSeenStmt {
+        e.lastSeenStmt = e.stmtCount
+        e.idleTicks = 0
+        return
+    }
+    e.idleTicks += 1
+    if pending > 0 && e.idleTicks >= 20 && e.committing.length == 0 {
+        if ckptBegin(e) { ckptStep(e, 1000000) }
+        e.idleTicks = 0
+    }
+}
+
+// ---------------------------------------------------------------- simple query
+
+function anyPrepare(t: ast.Ast): Boolean {
+    for root in t.statements {
+        if ast.kind(t, root) == ast.K_PREPARE { return true }
+    }
+    return false
+}
+
+public function simpleQuery(e: Engine, s: Session, sql: Text): List<Outcome> {
+    let outs: List<Outcome> = []
+    s.remaining = ""
+    e.env.session = s.id
+    let sqlBytes = Bytes(sql)
+    // skeleton cache (probe statements are never cached, so a hit skips the probe check)
+    let sk = e.sk
+    skel.scan(sqlBytes, sk)
+    let entry = -1
+    let h = 0
+    // temp tables make name resolution per session: no plan sharing through the skeleton cache
+    if e.env.tempCount > 0 { sk.ok = false }
+    if sk.ok {
+        h = v.hashBytes(sk.key, 0, sk.key.length)
+        let idx = hm.get(e.cacheMap, h, -1)
+        if idx >= 0 {
+            let ce = e.cache[idx]
+            if ce.version == e.c.version && v.equalBytes(ce.key, 0, ce.key.length, sk.key, 0, sk.key.length) && pinsMatch(ce, sk) {
+                entry = idx
+            }
+        }
+    }
+    if entry < 0 {
+        let probe = compat.classify(sqlBytes)
+        if probe != compat.PROBE_NONE {
+            outs.add(runProbe(e, s, probe, sqlBytes))
+            return outs
+        }
+        let r = parser.parse(sql)
+        if !r.ok {
+            let pos = r.errorPosition + 1
+            if r.errorPosition < 0 { pos = 0 }
+            outs.add(errOut(s, r.sqlstate, r.error, pos))
+            if s.inBlock { s.failed = true; outs[0].txnStatus = txnStatus(s) }
+            return outs
+        }
+        if r.ast.paramCount > 0 && !anyPrepare(r.ast) {
+            // the simple protocol binds no parameters (Postgres: 42P02)
+            outs.add(errOut(s, "42P02", "there is no parameter $" + Text(r.ast.paramCount), 0))
+            if s.inBlock { s.failed = true; outs[0].txnStatus = txnStatus(s) }
+            return outs
+        }
+        if r.ast.statements.length == 0 {
+            let o = okTag(s, "")
+            o.commandTag = ""
+            outs.add(o)
+            return outs
+        }
+        let ce = CacheEntry { key: Bytes(); stmts: []; litOrd: []; pinOrd: []; pinVal: []; version: e.c.version; tree: r.ast; roots: []; utility: []; starts: []
+                             cols: []; litVals: [] }
+        let cacheable = sk.ok
+        let i = 0
+        while i < r.ast.statements.length {
+            let root = r.ast.statements[i]
+            ce.roots.add(root)
+            ce.starts.add(r.ast.stmtStart[i])
+            let k = ast.kind(r.ast, root)
+            let isUtil = !(ast.isQuery(r.ast, root) || k == ast.K_INSERT || k == ast.K_UPDATE || k == ast.K_DELETE)
+            ce.utility.add(isUtil)
+            ce.cols.add([])
+            if isUtil {
+                ce.stmts.add(pl.newStmt(r.ast, root, ex.newPlan(e.env), r.ast.stmtText[i]))
+                if k != ast.K_TRANSACTION || sk.hasLiteral { cacheable = false }
+            } else {
+                let st = pl.planStatement(e.c, e.views, e.env, r.ast, root, r.ast.stmtText[i], [])
+                ce.stmts.add(st)
+                if st.err { cacheable = false }
+            }
+            i += 1
+        }
+        if cacheable { cacheable = mapLiterals(ce, sk) }
+        // execute
+        let res = runEntry(e, s, ce, sql, false, outs)
+        if cacheable && res {
+            ce.key = sk.key.slice(0, sk.key.length)
+            if e.cache.length > 2000 {
+                e.cache = []
+                hm.clear(e.cacheMap)
+            }
+            e.cache.add(ce)
+            hm.put(e.cacheMap, h, e.cache.length - 1)
+        }
+        return outs
+    }
+    let ce = e.cache[entry]
+    // re-bind literals
+    let i = 0
+    while i < ce.stmts.length {
+        if !ce.utility[i] {
+            let ords = ce.litOrd[i]
+            let vals = ce.litVals[i]
+            let j = 0
+            while j < ords.length {
+                vals[j] = sk.vals[ords[j]]
+                j += 1
+            }
+            dml.bindLiterals(ce.stmts[i], sk.kinds, vals)
+        }
+        i += 1
+    }
+    runEntry(e, s, ce, sql, true, outs)
+    return outs
+}
+
+function pinsMatch(ce: CacheEntry, sk: skel.Skel): Boolean {
+    let i = 0
+    while i < ce.pinOrd.length {
+        let ords = ce.pinOrd[i]
+        let vals = ce.pinVal[i]
+        let j = 0
+        while j < ords.length {
+            if ords[j] >= sk.count { return false }
+            if Text(sk.vals[ords[j]]) != vals[j] { return false }
+            j += 1
+        }
+        i += 1
+    }
+    return true
+}
+
+// Map each statement's literal nodes / pinned literals to skeleton literal ordinals (by character position).
+function mapLiterals(ce: CacheEntry, sk: skel.Skel): Boolean {
+    let i = 0
+    while i < ce.stmts.length {
+        let st = ce.stmts[i]
+        let ords: List<Integer> = []
+        let j = 0
+        while j < st.litPos.length {
+            let o = findPos(sk, st.litPos[j])
+            if o < 0 { return false }
+            ords.add(o)
+            j += 1
+        }
+        ce.litOrd.add(ords)
+        let lv: List<Bytes> = []
+        for o in ords { lv.add(sk.vals[o]) }
+        ce.litVals.add(lv)
+        let pords: List<Integer> = []
+        let pvals: List<Text> = []
+        j = 0
+        while j < st.pinPos.length {
+            let o = findPos(sk, st.pinPos[j])
+            if o < 0 { return false }
+            pords.add(o)
+            pvals.add(Text(sk.vals[o]))
+            j += 1
+        }
+        ce.pinOrd.add(pords)
+        ce.pinVal.add(pvals)
+        i += 1
+    }
+    // every skeleton literal must be accounted for (else a literal was consumed at plan time without a pin)
+    let used = Bytes(sk.count + 1)
+    for ords in ce.litOrd {
+        for o in ords { used[o] = 1 }
+    }
+    for ords in ce.pinOrd {
+        for o in ords { used[o] = 1 }
+    }
+    let k = 0
+    while k < sk.count {
+        if used[k] == 0 { return false }
+        k += 1
+    }
+    return true
+}
+
+function findPos(sk: skel.Skel, pos: Integer): Integer {
+    let i = 0
+    while i < sk.count {
+        if sk.pos[i] == pos { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Execute the statements of a cache entry. Returns false if anything failed (do not cache).
+function runEntry(e: Engine, s: Session, ce: CacheEntry, sql: Text, cached: Boolean, outs: List<Outcome>): Boolean {
+    let ok = true
+    let i = 0
+    while i < ce.stmts.length {
+        let o = e.noOutcome
+        if ce.utility[i] {
+            o = runUtility(e, s, ce.tree, ce.roots[i], ce.tree.stmtText[i])
+        } else {
+            let st = ce.stmts[i]
+            if st.catVersion != e.c.version {
+                st = pl.planStatement(e.c, e.views, e.env, ce.tree, ce.roots[i], ce.tree.stmtText[i], [])
+                ce.stmts[i] = st
+                ce.cols[i] = []
+                ok = false
+            }
+            o = runPlanned(e, s, st, [], ce.cols[i])
+            if o.columns.length > 0 { ce.cols[i] = o.columns }
+        }
+        outs.add(o)
+        if o.status == STATUS_WOULD_BLOCK {
+            s.remaining = sql.slice(ce.starts[i], sql.length)
+            return false
+        }
+        if o.status == STATUS_ERROR { return false }
+        if o.status == STATUS_COPY_IN { return false }
+        i += 1
+    }
+    return ok
+}
+
+public function simpleQueryRemaining(e: Engine, s: Session): Text {
+    return s.remaining
+}
+
+// ---------------------------------------------------------------- planned statement execution
+
+// cols: the statement's result columns if the caller has them cached (empty = compute).
+function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, cols: List<Column>): Outcome {
+    if st.err {
+        let o = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
+        if st.errPos < 0 { o.position = 0 }
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    if s.failed {
+        return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
+    }
+    if s.inBlock { s.txSnap = true }
+    if st.kind != pl.SK_SELECT && st.tableId >= 0 && readOnlyNow(s) && !pl.isTempName(e.c.tables[st.tableId].name) {
+        let what = "INSERT"
+        if st.kind == pl.SK_UPDATE { what = "UPDATE" }
+        if st.kind == pl.SK_DELETE { what = "DELETE" }
+        let o = readOnlyError(s, what)
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    if s.waitSlot >= 0 {
+        // parked retry: still blocked while the transaction we wait for is unfinished (O(1), no re-execution)
+        let ow = e.tm.txns[s.waitSlot]
+        if ow.gen == s.waitGen && ow.state != txn.TX_IDLE {
+            let o = newOutcome()
+            o.status = STATUS_WOULD_BLOCK
+            o.txnStatus = txnStatus(s)
+            return o
+        }
+        s.waitSlot = -1
+    }
+    if e.snapBox.length > 0 && !pointLookup(e, st) { ensureTables(e, st.tableIds) }
+    e.stmtCount += 1
+    let tx = ensureTxn(e, s)
+    // serializable: global serial-execution lock
+    let tm = e.tm
+    if tm.serialOwner >= 0 && tm.serialOwner != tx.slot {
+        let owner = tm.serialOwner
+        return blockOn(e, s, tx, owner)
+    }
+    if tx.serializable && tm.serialOwner < 0 { tm.serialOwner = tx.slot }
+    let env = e.env
+    env.me = tx.slot
+    env.nowMicros = s.txStart
+    let p = st.p
+    p.env = env
+    dml.resetForRun(st)
+    let saveU = tx.uCount
+    let saveR = tx.redo.length
+    let run = dml.newRun()
+    let k = st.kind
+    // constant subexpressions PG evaluates while planning (errors even when no row is produced)
+    for cn in st.constChecks {
+        if !p.err { ex.ev(p, cn) }
+    }
+    if p.err {
+    } else if k == pl.SK_SELECT {
+        dml.runSelect(st, formats, run)
+    } else if k == pl.SK_INSERT {
+        dml.runInsert(st, e.c, tm, tx, formats, run)
+    } else if k == pl.SK_UPDATE {
+        dml.runUpdate(st, e.c, tm, tx, formats, run)
+    } else if k == pl.SK_DELETE {
+        dml.runDelete(st, e.c, tm, tx, formats, run)
+    }
+    if e.c.nLiveFks > 0 && k != pl.SK_SELECT && !p.err && p.blockedBy < 0 && tx.uCount > saveU {
+        let topT = -1
+        if k == pl.SK_UPDATE { topT = st.tableId }
+        fkm.afterStatement(e.c, tm, tx, p, saveU, topT, st.setCols)
+    }
+    if p.err || p.blockedBy >= 0 {
+        txn.rollbackTo(tm, e.c, tx, saveU)
+        tx.redo.resize(saveR)
+        if p.blockedBy >= 0 && !p.err {
+            return blockOn(e, s, tx, p.blockedBy)
+        }
+        if p.blockedBy >= 0 && p.err && p.errCode == "" {
+            return blockOn(e, s, tx, p.blockedBy)
+        }
+        let o = errOut(s, p.errCode, p.errMsg, 0)
+        o.detail = p.errDetail
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    tm.waitsFor[tx.slot] = -1
+    let o = newOutcome()
+    o.rowData = run.rowData
+    o.rowCount = run.rowCount
+    if k == pl.SK_SELECT || st.returning {
+        o.hasRowDescription = true
+        if cols.length > 0 { o.columns = cols } else { o.columns = columnsOf(st) }
+    }
+    if k == pl.SK_SELECT {
+        o.commandTag = countTag(e, 0, run.rowCount)
+    } else {
+        if k == pl.SK_INSERT { o.commandTag = countTag(e, 1, run.affected) }
+        if k == pl.SK_UPDATE { o.commandTag = countTag(e, 2, run.affected) }
+        if k == pl.SK_DELETE { o.commandTag = countTag(e, 3, run.affected) }
+        maybeSpill(e, s, tx)
+    }
+    if !s.inBlock {
+        o.waitLsn = commitTxn(e, s, tx)
+    }
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+// Command tags for small counts are built once ("SELECT 1", "UPDATE 1", "INSERT 0 1"): kind 0..3.
+function countTag(e: Engine, kind: Integer, n: Integer): Text {
+    if n >= 0 && n < 16 {
+        if e.tags.length == 0 {
+            for prefix in ["SELECT ", "INSERT 0 ", "UPDATE ", "DELETE "] {
+                for i in 0..16 { e.tags.add(prefix + Text(i)) }
+            }
+        }
+        return e.tags[kind * 16 + n]
+    }
+    if kind == 0 { return "SELECT " + Text(n) }
+    if kind == 1 { return "INSERT 0 " + Text(n) }
+    if kind == 2 { return "UPDATE " + Text(n) }
+    return "DELETE " + Text(n)
+}
+
+// Statement could not proceed because `owner` holds a lock: WOULD_BLOCK, or 40P01 on a deadlock.
+function blockOn(e: Engine, s: Session, tx: txn.Txn, owner: Integer): Outcome {
+    let tm = e.tm
+    if txn.wouldDeadlock(tm, tx.slot, owner) {
+        tm.waitsFor[tx.slot] = -1
+        let o = errOut(s, "40P01", "deadlock detected", 0)
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    tm.waitsFor[tx.slot] = owner
+    s.waitSlot = owner
+    s.waitGen = tm.txns[owner].gen
+    e.nBlocks += 1
+    if !s.inBlock {
+        // implicit transaction: discard it entirely; the retry starts fresh
+        txn.abort(tm, e.c, tx)
+        s.txSlot = -1
+    }
+    let o = newOutcome()
+    o.status = STATUS_WOULD_BLOCK
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+function failStatement(e: Engine, s: Session) {
+    if s.inBlock {
+        s.failed = true
+        return
+    }
+    if s.txSlot >= 0 {
+        let tx = e.tm.txns[s.txSlot]
+        if tx.state == txn.TX_ACTIVE { txn.abort(e.tm, e.c, tx) }
+        s.txSlot = -1
+    }
+}
+
+// ---------------------------------------------------------------- extended protocol
+
+// Parse + plan, memoized per (SQL text, declared parameter types) across sessions: drivers that send an unnamed
+// Parse before every execution (pgbench -M extended, many ORMs) reuse the plan. Plans are session-independent
+// and every execution rebinds its parameters, as with the simple-protocol skeleton cache.
+public function prepare(e: Engine, s: Session, sql: Text, paramTypes: List<Integer>): Prepared {
+    e.env.session = s.id
+    let sqlBytes = Bytes(sql)
+    // temp tables shadow permanent ones per session, so plans are session-specific while any exist
+    if e.env.tempCount > 0 { return prepareNew(e, s, sql, sqlBytes, paramTypes) }
+    let h = v.hashBytes(sqlBytes, 0, sqlBytes.length)
+    for t in paramTypes { h = wrappingMultiply(h ^ t, -4658895280553007687) }
+    let at = hm.get(e.prepMap, h, -1)
+    if at >= 0 {
+        let c = e.prepCache[at]
+        if c.version == e.c.version && c.sql == sql && sameInts(c.paramHint, paramTypes) { return c }
+    }
+    let pr = prepareNew(e, s, sql, sqlBytes, paramTypes)
+    if pr.err.status == STATUS_OK && (!pr.utility || pr.root < 0 || ast.kind(pr.tree, pr.root) == ast.K_TRANSACTION) {
+        if e.prepCache.length >= 1000 {
+            e.prepCache = []
+            hm.clear(e.prepMap)
+        }
+        e.prepCache.add(pr)
+        hm.put(e.prepMap, h, e.prepCache.length - 1)
+    }
+    return pr
+}
+
+function sameInts(a: List<Integer>, b: List<Integer>): Boolean {
+    if a.length != b.length { return false }
+    let i = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function prepareNew(e: Engine, s: Session, sql: Text, sqlBytes: Bytes, paramTypes: List<Integer>): Prepared {
+    let pr = Prepared { st: pl.newStmt(ast.newAst(), -1, ex.newPlan(e.env), sql); err: newOutcome(); columns: []; params: []; sql: sql
+                        tree: ast.newAst(); root: -1; utility: false; version: e.c.version; paramHint: paramTypes; memo: Bytes() }
+    let probe = compat.classify(sqlBytes)
+    if probe != compat.PROBE_NONE {
+        pr.utility = true
+        pr.root = -2 - probe
+        return pr
+    }
+    let r = parser.parse(sql)
+    if !r.ok {
+        pr.err = errOut(s, r.sqlstate, r.error, r.errorPosition + 1)
+        return pr
+    }
+    if r.ast.statements.length == 0 {
+        pr.utility = true
+        pr.root = -1
+        return pr
+    }
+    if r.ast.statements.length > 1 {
+        pr.err = errOut(s, "42601", "cannot insert multiple commands into a prepared statement", 0)
+        return pr
+    }
+    pr.tree = r.ast
+    let root = r.ast.statements[0]
+    pr.root = root
+    let k = ast.kind(r.ast, root)
+    if !(ast.isQuery(r.ast, root) || k == ast.K_INSERT || k == ast.K_UPDATE || k == ast.K_DELETE) {
+        pr.utility = true
+        // utility statements that return rows describe them (extended protocol Describe)
+        if k == ast.K_SHOW { pr.columns = showColumns(r.ast.nodes[root].text) }
+        if k == ast.K_EXPLAIN { pr.columns = [Column { name: "QUERY PLAN"; typeOid: 25; typeSize: -1; typeMod: -1 }] }
+        return pr
+    }
+    let types: List<Integer> = []
+    for oid in paramTypes { types.add(v.typeFromOid(oid)) }
+    let st = pl.planStatement(e.c, e.views, e.env, r.ast, root, r.ast.stmtText[0], types)
+    pr.st = st
+    if st.err {
+        pr.err = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
+        if st.errPos < 0 { pr.err.position = 0 }
+        return pr
+    }
+    for t in st.paramTypes { pr.params.add(v.typeOid(t)) }
+    if st.kind == pl.SK_SELECT || st.returning { pr.columns = columnsOf(st) }
+    return pr
+}
+
+public function prepareError(p: Prepared): Outcome { return p.err }
+public function paramTypes(p: Prepared): List<Integer> { return p.params }
+public function resultColumns(p: Prepared): List<Column> { return p.columns }
+public function returnsRows(p: Prepared): Boolean { return p.columns.length > 0 }
+public function preparedMemo(p: Prepared): Bytes { return p.memo }
+public function setPreparedMemo(p: Prepared, b: Bytes) { p.memo = b }
+
+public function execute(e: Engine, s: Session, p: Prepared, params: List<Bytes>, paramNulls: List<Boolean>,
+                        paramFormats: List<Integer>, resultFormats: List<Integer>): Outcome {
+    e.env.session = s.id
+    if p.err.status == STATUS_ERROR { return p.err }
+    if p.utility {
+        if p.root == -1 { return okTag(s, "") }
+        if p.root < -1 {
+            return runProbe(e, s, -2 - p.root, Bytes(p.sql))
+        }
+        return runUtility(e, s, p.tree, p.root, p.sql)
+    }
+    let st = p.st
+    let cols = p.columns
+    if st.catVersion != e.c.version {
+        let types: List<Integer> = []
+        for oid in p.paramHint { types.add(v.typeFromOid(oid)) }
+        st = pl.planStatement(e.c, e.views, e.env, p.tree, p.root, p.sql, types)
+        p.st = st
+        cols = e.noColumns
+        if st.err { return errOut(s, st.errCode, st.errMsg, st.errPos + 1) }
+    }
+    if s.failed {
+        return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
+    }
+    ex.clearError(st.p)
+    st.p.env = e.env
+    if !dml.bindParams(st, params, paramNulls, paramFormats) {
+        let o = errOut(s, st.p.errCode, st.p.errMsg, 0)
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    return runPlanned(e, s, st, resultFormats, cols)
+}
+
+// ---------------------------------------------------------------- compat probes
+
+function runProbe(e: Engine, s: Session, probe: Integer, sql: Bytes): Outcome {
+    let o = newOutcome()
+    o.hasRowDescription = true
+    o.txnStatus = txnStatus(s)
+    if probe == compat.PROBE_PGBENCH_PARTITION {
+        o.columns = [Column { name: "n"; typeOid: 23; typeSize: 4; typeMod: -1 },
+                     Column { name: "partstrat"; typeOid: 18; typeSize: 1; typeMod: -1 },
+                     Column { name: "count"; typeOid: 20; typeSize: 8; typeMod: -1 }]
+        let name = compat.firstQuoted(sql)
+        if cat.findTable(e.c, name) >= 0 {
+            let out = o.rowData
+            out.add(68)
+            v.addBE32(out, 4 + 2 + 5 + 4 + 5)
+            v.addBE16(out, 3)
+            v.addBE32(out, 1)
+            out.add(49)
+            v.addBE32(out, -1)
+            v.addBE32(out, 1)
+            out.add(48)
+            o.rowCount = 1
+        }
+        o.commandTag = "SELECT " + Text(o.rowCount)
+        return o
+    }
+    if probe == compat.PROBE_RELKIND {
+        o.columns = [Column { name: "relkind"; typeOid: 18; typeSize: 1; typeMod: -1 }]
+        let name = compat.firstQuoted(sql)
+        if cat.findTable(e.c, name) < 0 {
+            let err = errOut(s, "42P01", "relation \"" + name + "\" does not exist", 0)
+            return err
+        }
+        let out = o.rowData
+        out.add(68)
+        v.addBE32(out, 4 + 2 + 5)
+        v.addBE16(out, 1)
+        v.addBE32(out, 1)
+        out.add(114)
+        o.rowCount = 1
+        o.commandTag = "SELECT 1"
+        return o
+    }
+    o.commandTag = "SELECT 0"
+    return o
+}
+
+// ---------------------------------------------------------------- utility statements
+
+function logDdl(e: Engine, s: Session, sqlIn: Text): Integer {
+    if s.inBlock && !e.replaying {
+        // catalog changes take effect now: log them now (their undo is logged too), so the WAL and the
+        // positional table ids replay exactly as the live catalog evolved
+        logDdlAuto(e, sqlIn)
+        return 0
+    }
+    let sql = sqlIn
+    if e.env.tempCount > 0 && !e.replaying { sql = "--neo sid=" + Text(e.env.session) + "\n" + sqlIn }
+    e.c.ddlLog.add(sql)
+    if e.replaying { return 0 }
+    let tx = ensureTxn(e, s)
+    tx.redo.add(dml.R_DDL)
+    let b = Bytes(sql)
+    tb.putVarint(tx.redo, b.length)
+    tx.redo.addBytes(b)
+    if !s.inBlock { return commitTxn(e, s, tx) }
+    return 0
+}
+
+// DDL text written to the WAL as a self-contained committed record (and to the snapshot DDL history).
+function logDdlAuto(e: Engine, sqlIn: Text) {
+    if e.replaying { return }
+    let sql = sqlIn
+    if e.env.tempCount > 0 { sql = "--neo sid=" + Text(e.env.session) + "\n" + sqlIn }
+    e.c.ddlLog.add(sql)
+    if !e.hasWal { return }
+    let rec = Bytes()
+    rec.add(67)
+    rec.add(dml.R_DDL)
+    let b = Bytes(sql)
+    tb.putVarint(rec, b.length)
+    rec.addBytes(b)
+    wal.append(e.walBox[0], rec)
+}
+
+function pushUndo(e: Engine, s: Session, kind: Integer, tid: Integer, name: Text) {
+    if !s.inBlock || e.replaying { return }
+    s.ddlUndo.add(DdlUndo { kind: kind; tid: tid; name: name; depth: s.savepointUndo.length / 8 })
+}
+
+// Undo catalog changes made after savepoint level `keep` (all of them for keep = -1), newest first.
+function undoDdl(e: Engine, s: Session, keep: Integer) {
+    if s.ddlUndo.length == 0 { return }
+    let rest: List<DdlUndo> = []
+    let i = s.ddlUndo.length - 1
+    let undone: List<DdlUndo> = []
+    while i >= 0 {
+        let u = s.ddlUndo[i]
+        if u.depth > keep { undone.add(u) }
+        i -= 1
+    }
+    for u in s.ddlUndo {
+        if u.depth <= keep { rest.add(u) }
+    }
+    s.ddlUndo = rest
+    for u in undone {
+        if u.kind == UNDO_CREATED {
+            if u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) {
+                let t = e.c.tables[u.tid]
+                logDdlAuto(e, "DROP TABLE " + quoteIdent(t.name))
+                if pl.isTempName(t.name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
+                cat.dropTable(e.c, u.tid)
+            }
+        } else if u.kind == UNDO_DROPPED {
+            if u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) {
+                let t = e.c.tables[u.tid]
+                logDdlAuto(e, "ALTER TABLE " + quoteIdent(t.name) + " RENAME TO " + quoteIdent(u.name))
+                t.name = u.name
+                if pl.isTempName(u.name) { e.env.tempCount += 1 }
+            }
+        } else if u.kind == UNDO_INDEX {
+            if dropIndex(e, u.name) { logDdlAuto(e, "DROP INDEX " + quoteIdent(u.name)) }
+        }
+    }
+    e.c.version += 1
+}
+
+// COMMIT: tables dropped in the block are dropped for good (logged with the commit record).
+function commitDdl(e: Engine, s: Session) {
+    if s.ddlUndo.length == 0 { return }
+    let tx = ensureTxn(e, s)
+    for u in s.ddlUndo {
+        if u.kind == UNDO_DROPPED && u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) {
+            let t = e.c.tables[u.tid]
+            let sql = "DROP TABLE " + quoteIdent(t.name)
+            e.c.ddlLog.add(sql)
+            tx.redo.add(dml.R_DDL)
+            let b = Bytes(sql)
+            tb.putVarint(tx.redo, b.length)
+            tx.redo.addBytes(b)
+            // rows this transaction touched are released after the commit is durable: keep the (hidden)
+            // table object until restart in that case
+            if t.lockedCount == 0 { cat.dropTable(e.c, u.tid) }
+        }
+    }
+    s.ddlUndo = []
+    e.c.version += 1
+}
+
+function ddlDone(e: Engine, s: Session, tag: Text, sql: Text): Outcome {
+    let o = okTag(s, tag)
+    o.waitLsn = logDdl(e, s, sql)
+    o.txnStatus = txnStatus(s)
+    e.c.version += 1
+    return o
+}
+
+function settingValue(s: Session, name: Text): Text {
+    if name == "transaction_isolation" {
+        if s.inBlock { return isoName(s.txIso) }
+        if s.defaultSerializable { return "serializable" }
+        return "read committed"
+    }
+    if name == "transaction_read_only" { return onOff(readOnlyNow(s)) }
+    if name == "transaction_deferrable" {
+        if s.inBlock { return onOff(s.txDeferrable) }
+        return "off"
+    }
+    if name == "default_transaction_read_only" { return onOff(s.defaultReadOnly) }
+    let i = s.settingNames.length - 1
+    while i >= 0 {
+        if s.settingNames[i] == name { return s.settingValues[i] }
+        i -= 1
+    }
+    if name == "transaction_isolation" {
+        if s.txSlot >= 0 && s.inBlock {
+            return "read committed"
+        }
+        if s.defaultSerializable { return "serializable" }
+    }
+    if name == "default_transaction_isolation" && s.defaultSerializable { return "serializable" }
+    return pl.settingDefault(name)
+}
+
+function setSetting(s: Session, name: Text, value: Text) {
+    if !s.ownSettings {
+        s.settingNames = []
+        s.settingValues = []
+        s.ownSettings = true
+    }
+    let i = 0
+    while i < s.settingNames.length {
+        if s.settingNames[i] == name {
+            s.settingValues[i] = value
+            return
+        }
+        i += 1
+    }
+    s.settingNames.add(name)
+    s.settingValues.add(value)
+}
+
+function litText(a: ast.Ast, id: Integer): Text {
+    let k = ast.kind(a, id)
+    if k == ast.K_UNARY_OP {
+        return "-" + litText(a, ast.child(a, id, 0))
+    }
+    if k == ast.K_BOOL_LIT {
+        if a.nodes[id].intValue == 1 { return "true" }
+        return "false"
+    }
+    if k == ast.K_NULL_LIT { return "" }
+    return a.nodes[id].text
+}
+
+// Any error aborts the enclosing transaction block (or discards the implicit transaction), as in PG.
+function runUtility(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let o = runUtilityInner(e, s, a, root, sql)
+    if o.status == STATUS_ERROR && !e.replaying {
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+    }
+    return o
+}
+
+function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let k = nd.kind
+    e.stmtCount += 1
+    if e.snapBox.length > 0 && !e.replaying && (k == ast.K_COPY || k == ast.K_ALTER_TABLE || k == ast.K_CREATE_INDEX || k == ast.K_TRUNCATE) {
+        // these read or rewrite table data: decode any referenced table first (TRUNCATE just discards it)
+        let refs: List<Integer> = []
+        if k == ast.K_TRUNCATE {
+            for ref in ast.items(a, ast.child(a, root, 0)) {
+                let tid = relId(e, a.nodes[ref].text)
+                if tid >= 0 { e.c.tables[tid].chunk = -1 }
+            }
+        } else {
+            let ref = ast.child(a, root, 0)
+            if ref >= 0 && ast.kind(a, ref) == ast.K_TABLE_REF {
+                let tid = relId(e, a.nodes[ref].text)
+                if tid >= 0 { refs.add(tid) }
+            }
+        }
+        ensureTables(e, refs)
+    }
+    if k == ast.K_TRANSACTION { return runTxnControl(e, s, a, root) }
+    if s.failed {
+        return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
+    }
+    if !e.replaying && readOnlyNow(s) {
+        let what = ""
+        if k == ast.K_CREATE_TABLE { what = "CREATE TABLE" }
+        if k == ast.K_CREATE_TABLE_AS { what = "CREATE TABLE AS" }
+        if k == ast.K_CREATE_INDEX { what = "CREATE INDEX" }
+        if k == ast.K_CREATE_VIEW { what = "CREATE VIEW" }
+        if k == ast.K_ALTER_TABLE { what = "ALTER TABLE" }
+        if k == ast.K_TRUNCATE { what = "TRUNCATE TABLE" }
+        if k == ast.K_DROP {
+            what = "DROP TABLE"
+            if nd.op == ast.OBJ_VIEW { what = "DROP VIEW" }
+            if nd.op == ast.OBJ_INDEX { what = "DROP INDEX" }
+        }
+        if k == ast.K_COPY && nd.op == ast.COPY_FROM { what = "COPY FROM" }
+        if what != "" { return readOnlyError(s, what) }
+    }
+    if k == ast.K_SET {
+        let name = nd.text
+        let vals = ast.items(a, ast.child(a, root, 0))
+        let value = ""
+        if vals.length > 0 { value = litText(a, vals[0]) }
+        if name == "default_transaction_isolation" || name == "transaction_isolation" {
+            let lower = value
+            s.defaultSerializable = lower == "serializable" || lower == "SERIALIZABLE"
+        }
+        if name == "default_transaction_read_only" {
+            s.defaultReadOnly = value == "on" || value == "true" || value == "1" || value == "yes"
+        }
+        setSetting(s, name, value)
+        return okTag(s, "SET")
+    }
+    if k == ast.K_SET_TRANSACTION {
+        let iso = nd.intValue
+        let fl = nd.flags
+        if (fl & ast.F_TX_SESSION_CHARACTERISTICS) != 0 {
+            if iso != ast.ISO_DEFAULT { s.defaultSerializable = iso == ast.ISO_SERIALIZABLE }
+            if (fl & ast.F_TX_READ_ONLY) != 0 { s.defaultReadOnly = true }
+            if (fl & ast.F_TX_READ_WRITE) != 0 { s.defaultReadOnly = false }
+            return okTag(s, "SET")
+        }
+        if !s.inBlock {
+            s.nextSerializable = iso == ast.ISO_SERIALIZABLE
+            let o = okTag(s, "SET")
+            o.notices.add("SET TRANSACTION can only be used in transaction blocks")
+            return o
+        }
+        let sub = s.savepointUndo.length > 0
+        if iso != ast.ISO_DEFAULT && iso != s.txIso {
+            if sub { return errOut(s, "25001", "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", 0) }
+            if s.txSnap { return errOut(s, "25001", "SET TRANSACTION ISOLATION LEVEL must be called before any query", 0) }
+        }
+        if (fl & ast.F_TX_READ_WRITE) != 0 && s.txReadOnly {
+            if sub { return errOut(s, "25001", "cannot set transaction read-write mode inside a read-only transaction", 0) }
+            if s.txSnap { return errOut(s, "25001", "transaction read-write mode must be set before any query", 0) }
+        }
+        if iso != ast.ISO_DEFAULT {
+            s.txIso = iso
+            if s.txSlot >= 0 { e.tm.txns[s.txSlot].serializable = iso == ast.ISO_SERIALIZABLE }
+        }
+        if (fl & ast.F_TX_READ_ONLY) != 0 { s.txReadOnly = true }
+        if (fl & ast.F_TX_READ_WRITE) != 0 { s.txReadOnly = false }
+        if (fl & ast.F_TX_DEFERRABLE) != 0 { s.txDeferrable = true }
+        if (fl & ast.F_TX_NOT_DEFERRABLE) != 0 { s.txDeferrable = false }
+        return okTag(s, "SET")
+    }
+    if k == ast.K_SHOW && nd.text == "all" {
+        let o = okTag(s, "SHOW")
+        o.hasRowDescription = true
+        o.columns = showColumns("all")
+        for nm in showAllNames() {
+            let vals: List<Bytes> = [Bytes(nm), Bytes(settingValue(s, nm)), Bytes("")]
+            let out = o.rowData
+            out.add(68)
+            let at = out.length
+            out.addInt32(0)
+            v.addBE16(out, 3)
+            for b in vals {
+                v.addBE32(out, b.length)
+                out.addBytes(b)
+            }
+            v.setBE32(out, at, out.length - at)
+            o.rowCount += 1
+        }
+        return o
+    }
+    if k == ast.K_SHOW {
+        let name = nd.text
+        let o = okTag(s, "SHOW")
+        o.hasRowDescription = true
+        o.columns = [Column { name: name; typeOid: 25; typeSize: -1; typeMod: -1 }]
+        let val = Bytes(settingValue(s, name))
+        let out = o.rowData
+        out.add(68)
+        v.addBE32(out, 4 + 2 + 4 + val.length)
+        v.addBE16(out, 1)
+        v.addBE32(out, val.length)
+        out.addBytes(val)
+        o.rowCount = 1
+        return o
+    }
+    if k == ast.K_RESET {
+        let name = nd.text
+        if name == "transaction_isolation" || name == "transaction_read_only" || name == "transaction_deferrable" {
+            return errOut(s, "0A000", "parameter \"" + name + "\" cannot be reset", 0)
+        }
+        if name == "default_transaction_read_only" || name == "all" { s.defaultReadOnly = false }
+        if name == "default_transaction_isolation" || name == "all" { s.defaultSerializable = false }
+        setSetting(s, name, pl.settingDefault(name))
+        return okTag(s, "RESET")
+    }
+    if k == ast.K_DECLARE { return declareCursor(e, s, a, root, sql) }
+    if k == ast.K_FETCH { return fetchCursor(e, s, nd) }
+    if k == ast.K_CLOSE {
+        if (nd.flags & ast.F_ALL) != 0 {
+            s.cursors = []
+            return okTag(s, "CLOSE CURSOR ALL")
+        }
+        let ci = findCursor(s, nd.text)
+        if ci < 0 { return errOut(s, "34000", "cursor \"" + nd.text + "\" does not exist", 0) }
+        let keep: List<Cursor> = []
+        let i = 0
+        while i < s.cursors.length {
+            if i != ci { keep.add(s.cursors[i]) }
+            i += 1
+        }
+        s.cursors = keep
+        return okTag(s, "CLOSE CURSOR")
+    }
+    if k == ast.K_CREATE_TABLE { return createTable(e, s, a, root, sql) }
+    if k == ast.K_CREATE_INDEX { return createIndex(e, s, a, root, sql) }
+    if k == ast.K_DROP { return dropObjects(e, s, a, root, sql) }
+    if k == ast.K_TRUNCATE { return truncateTables(e, s, a, root, sql) }
+    if k == ast.K_CREATE_VIEW { return createView(e, s, a, root, sql) }
+    if k == ast.K_ALTER_TABLE { return alterTable(e, s, a, root, sql) }
+    if k == ast.K_CREATE_TABLE_AS { return createTableAs(e, s, a, root, sql) }
+    if k == ast.K_VACUUM { return okTag(s, "VACUUM") }
+    if k == ast.K_ANALYZE { return okTag(s, "ANALYZE") }
+    if k == ast.K_CHECKPOINT {
+        if !e.hasWal { return okTag(s, "CHECKPOINT") }
+        if s.ckptWait == 0 {
+            // everything acknowledged so far is covered by a checkpoint that begins after this point
+            let busy = e.ck.active || e.pubPhase > 0
+            let want = e.ckptGen + 1
+            if busy { want = e.ckptGen + 2 }
+            if !busy && !ckptBegin(e) { return okTag(s, "CHECKPOINT") }
+            s.ckptWait = want
+            if want > e.ckptWanted { e.ckptWanted = want }
+        }
+        if e.ckptGen >= s.ckptWait {
+            s.ckptWait = 0
+            return okTag(s, "CHECKPOINT")
+        }
+        let o = newOutcome()
+        o.status = STATUS_WOULD_BLOCK
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    if k == ast.K_COPY { return copyStart(e, s, a, root) }
+    if k == ast.K_DISCARD { return okTag(s, "DISCARD ALL") }
+    if k == ast.K_DEALLOCATE { return okTag(s, "DEALLOCATE") }
+    if k == ast.K_LOCK { return okTag(s, "LOCK TABLE") }
+    if k == ast.K_LISTEN { return okTag(s, "LISTEN") }
+    if k == ast.K_UNLISTEN { return okTag(s, "UNLISTEN") }
+    if k == ast.K_NOTIFY { return okTag(s, "NOTIFY") }
+    if k == ast.K_COMMENT { return okTag(s, "COMMENT") }
+    if k == ast.K_CREATE_SCHEMA { return okTag(s, "CREATE SCHEMA") }
+    if k == ast.K_EXPLAIN {
+        let o = okTag(s, "EXPLAIN")
+        o.hasRowDescription = true
+        o.columns = [Column { name: "QUERY PLAN"; typeOid: 25; typeSize: -1; typeMod: -1 }]
+        let val = Bytes("neo-db plan")
+        let out = o.rowData
+        out.add(68)
+        v.addBE32(out, 4 + 2 + 4 + val.length)
+        v.addBE16(out, 1)
+        v.addBE32(out, val.length)
+        out.addBytes(val)
+        o.rowCount = 1
+        return o
+    }
+    return errOut(s, "0A000", "statement not supported: " + ast.kindName(k), nd.position + 1)
+}
+
+// ---------------------------------------------------------------- cursors
+
+function findCursor(s: Session, name: Text): Integer {
+    let i = 0
+    while i < s.cursors.length {
+        if s.cursors[i].name == name { return i }
+        i += 1
+    }
+    return -1
+}
+
+function declareCursor(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let hold = (nd.flags & ast.F_CUR_HOLD) != 0
+    if !s.inBlock && !hold { return errOut(s, "25P01", "DECLARE CURSOR can only be used in transaction blocks", 0) }
+    if findCursor(s, nd.text) >= 0 { return errOut(s, "42P03", "cursor \"" + nd.text + "\" already exists", 0) }
+    let q = ast.child(a, root, 0)
+    let st = pl.planStatement(e.c, e.views, e.env, a, q, sql, [])
+    if st.err {
+        let o = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
+        if st.errPos < 0 { o.position = 0 }
+        return o
+    }
+    if e.snapBox.length > 0 { ensureTables(e, st.tableIds) }
+    if s.inBlock { s.txSnap = true }
+    let tx = ensureTxn(e, s)
+    let env = e.env
+    env.me = tx.slot
+    env.nowMicros = s.txStart
+    let p = st.p
+    p.env = env
+    dml.resetForRun(st)
+    let run = dml.newRun()
+    for cn in st.constChecks {
+        if !p.err { ex.ev(p, cn) }
+    }
+    if !p.err { dml.runSelect(st, [], run) }
+    let cur = Cursor {
+        name: nd.text; columns: columnsOf(st); rows: run.rowData; offs: Bytes(); n: 0; pos: 0; errCode: ""; errMsg: ""
+        failed: false; depth: s.savepointUndo.length / 8; hold: hold; inTxn: s.inBlock
+    }
+    // index the DataRow messages ('D', int32 length, ...)
+    let at = 0
+    let rd = cur.rows
+    while at + 5 <= rd.length {
+        let len = v.getBE32(rd, at + 1)
+        if len < 4 { break }
+        cur.offs.addInt64(at)
+        at = at + 1 + len
+    }
+    if at > rd.length { at = rd.length }
+    rd.resize(at)
+    cur.offs.addInt64(rd.length)
+    cur.n = cur.offs.length / 8 - 1
+    if p.err {
+        cur.errCode = p.errCode
+        cur.errMsg = p.errMsg
+        ex.clearError(p)
+    }
+    s.cursors.add(cur)
+    let o = okTag(s, "DECLARE CURSOR")
+    if !s.inBlock && s.txSlot >= 0 { o.waitLsn = commitTxn(e, s, e.tm.txns[s.txSlot]) }
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+// FETCH / MOVE with PG positioning: pos 0 is before the first row, n + 1 after the last.
+function fetchCursor(e: Engine, s: Session, nd: ast.Node): Outcome {
+    let ci = findCursor(s, nd.text)
+    if ci < 0 { return errOut(s, "34000", "cursor \"" + nd.text + "\" does not exist", 0) }
+    let c = s.cursors[ci]
+    if c.failed { return errOut(s, "55000", "portal \"" + nd.text + "\" cannot be run", 0) }
+    let move = (nd.flags & ast.F_FETCH_MOVE) != 0
+    let all = (nd.flags & ast.F_FETCH_ALL) != 0
+    let n = c.n
+    let errRow = -1
+    if c.errCode != "" { errRow = n + 1 }
+    // rows to return, in order (1-based row numbers)
+    let rowsOut = Bytes()
+    let op = nd.op
+    let count = nd.intValue
+    if op == ast.FETCH_FORWARD && count < 0 && !all {
+        op = ast.FETCH_BACKWARD
+        count = -count
+    }
+    if op == ast.FETCH_BACKWARD && count < 0 && !all {
+        op = ast.FETCH_FORWARD
+        count = -count
+    }
+    let failAt = -1
+    if op == ast.FETCH_FORWARD {
+        let want = count
+        if all { want = n + 2 }
+        let k = 0
+        while k < want && c.pos <= n {
+            if c.pos + 1 == errRow {
+                failAt = errRow
+                break
+            }
+            c.pos += 1
+            if c.pos <= n {
+                rowsOut.addInt64(c.pos)
+                k += 1
+            }
+        }
+    } else if op == ast.FETCH_BACKWARD {
+        let want = count
+        if all { want = n + 2 }
+        if c.pos > n + 1 { c.pos = n + 1 }
+        let k = 0
+        while k < want && c.pos >= 1 {
+            c.pos -= 1
+            if c.pos >= 1 {
+                rowsOut.addInt64(c.pos)
+                k += 1
+            }
+        }
+    } else {
+        // ABSOLUTE / RELATIVE: position on one row
+        let target = count
+        if op == ast.FETCH_ABSOLUTE {
+            if count < 0 { target = n + 1 + count }
+        } else {
+            target = c.pos + count
+        }
+        if errRow > 0 && target >= errRow {
+            failAt = errRow
+        } else if target < 1 {
+            c.pos = 0
+        } else if target > n {
+            c.pos = n + 1
+        } else {
+            c.pos = target
+            rowsOut.addInt64(target)
+        }
+    }
+    if failAt >= 0 {
+        c.failed = true
+        return errOut(s, c.errCode, c.errMsg, 0)
+    }
+    let k = rowsOut.length / 8
+    if move { return okTag(s, "MOVE " + Text(k)) }
+    let o = okTag(s, "FETCH " + Text(k))
+    o.hasRowDescription = true
+    o.columns = c.columns
+    let i = 0
+    while i < k {
+        let r = rowsOut.getInt64(i * 8)
+        let from = c.offs.getInt64((r - 1) * 8)
+        let to = c.offs.getInt64(r * 8)
+        o.rowData.addBytes(c.rows.slice(from, to))
+        i += 1
+    }
+    o.rowCount = k
+    return o
+}
+
+// ---------------------------------------------------------------- transaction control
+
+function runTxnControl(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
+    let nd = a.nodes[root]
+    let op = nd.op
+    let chain = (nd.flags & ast.F_TX_CHAIN) != 0
+    if op == ast.TX_BEGIN {
+        let tag = "BEGIN"
+        if (nd.flags & ast.F_TX_START) != 0 { tag = "START TRANSACTION" }
+        if s.inBlock {
+            let o = okTag(s, tag)
+            o.notices.add("there is already a transaction in progress")
+            return o
+        }
+        s.inBlock = true
+        s.failed = false
+        let tx = ensureTxn(e, s)
+        if nd.intValue == ast.ISO_SERIALIZABLE { tx.serializable = true }
+        if nd.intValue == ast.ISO_READ_COMMITTED || nd.intValue == ast.ISO_REPEATABLE_READ { tx.serializable = false }
+        beginCharacteristics(s, nd.intValue, nd.flags)
+        return okTag(s, tag)
+    }
+    if op == ast.TX_COMMIT || op == ast.TX_ROLLBACK {
+        let word = "COMMIT"
+        if op == ast.TX_ROLLBACK { word = "ROLLBACK" }
+        if !s.inBlock {
+            if chain { return errOut(s, "25P01", word + " AND CHAIN can only be used in transaction blocks", 0) }
+            let o = okTag(s, word)
+            o.notices.add("there is no transaction in progress")
+            return o
+        }
+        let iso = s.txIso
+        let ro = s.txReadOnly
+        let df = s.txDeferrable
+        let tag = word
+        let lsn = 0
+        if op == ast.TX_ROLLBACK || s.failed {
+            rollbackSession(e, s)
+            tag = "ROLLBACK"
+        } else {
+            commitDdl(e, s)
+            s.inBlock = false
+            if s.txSlot >= 0 {
+                let tx = e.tm.txns[s.txSlot]
+                lsn = commitTxn(e, s, tx)
+            }
+            cursorsAtEnd(s, true)
+            dropSavepoints(e, s)
+            s.spReadOnly.clear()
+        }
+        if chain {
+            s.inBlock = true
+            s.failed = false
+            let tx = ensureTxn(e, s)
+            tx.serializable = iso == ast.ISO_SERIALIZABLE
+            s.txIso = iso
+            s.txReadOnly = ro
+            s.txDeferrable = df
+            s.txSnap = false
+        }
+        let o = okTag(s, tag)
+        o.waitLsn = lsn
+        return o
+    }
+    if op == ast.TX_SAVEPOINT {
+        if !s.inBlock { return errOut(s, "25P01", "SAVEPOINT can only be used in transaction blocks", 0) }
+        if s.failed { return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0) }
+        let tx = ensureTxn(e, s)
+        ownSavepoints(s)
+        let cnt = s.savepointUndo.length / 8
+        if cnt < s.savepointNames.length { s.savepointNames[cnt] = nd.text } else { s.savepointNames.add(nd.text) }
+        s.savepointUndo.addInt64(tx.uCount)
+        s.savepointRedo.addInt64(tx.redo.length)
+        s.spReadOnly.resize(cnt)
+        if s.txReadOnly { s.spReadOnly.add(1) } else { s.spReadOnly.add(0) }
+        return okTag(s, "SAVEPOINT")
+    }
+    if op == ast.TX_RELEASE || op == ast.TX_ROLLBACK_TO {
+        if !s.inBlock {
+            if op == ast.TX_RELEASE { return errOut(s, "25P01", "RELEASE SAVEPOINT can only be used in transaction blocks", 0) }
+            return errOut(s, "25P01", "ROLLBACK TO SAVEPOINT can only be used in transaction blocks", 0)
+        }
+        if op == ast.TX_RELEASE && s.failed {
+            return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
+        }
+        let idx = -1
+        let n = s.savepointUndo.length / 8
+        let i = 0
+        while i < n && i < s.savepointNames.length {
+            if s.savepointNames[i] == nd.text { idx = i }
+            i += 1
+        }
+        if idx < 0 || idx >= n {
+            s.failed = true
+            return errOut(s, "3B001", "savepoint \"" + nd.text + "\" does not exist", 0)
+        }
+        if idx < s.spReadOnly.length { s.txReadOnly = s.spReadOnly[idx] != 0 }
+        if op == ast.TX_ROLLBACK_TO {
+            if s.txSlot >= 0 {
+                let tx = e.tm.txns[s.txSlot]
+                txn.rollbackTo(e.tm, e.c, tx, s.savepointUndo.getInt64(idx * 8))
+                tx.redo.resize(s.savepointRedo.getInt64(idx * 8))
+            }
+            s.failed = false
+            s.savepointUndo.resize((idx + 1) * 8)
+            s.savepointRedo.resize((idx + 1) * 8)
+            s.spReadOnly.resize(idx + 1)
+            cursorsAtSavepoint(s, idx, true)
+            undoDdl(e, s, idx)
+            return okTag(s, "ROLLBACK")
+        }
+        cursorsAtSavepoint(s, idx, false)
+        for u in s.ddlUndo {
+            if u.depth > idx { u.depth = idx }
+        }
+        s.savepointUndo.resize(idx * 8)
+        s.savepointRedo.resize(idx * 8)
+        s.spReadOnly.resize(idx)
+        return okTag(s, "RELEASE")
+    }
+    return errOut(s, "0A000", "two-phase commit is not supported", 0)
+}
+
+// Characteristics of a new transaction block: ISO_* level (0 = session default) and F_TX_* mode flags.
+function beginCharacteristics(s: Session, iso: Integer, flags: Integer) {
+    s.txIso = iso
+    if iso == ast.ISO_DEFAULT || iso == ast.ISO_READ_UNCOMMITTED {
+        s.txIso = ast.ISO_READ_COMMITTED
+        if s.defaultSerializable { s.txIso = ast.ISO_SERIALIZABLE }
+    }
+    s.txReadOnly = s.defaultReadOnly
+    if (flags & ast.F_TX_READ_ONLY) != 0 { s.txReadOnly = true }
+    if (flags & ast.F_TX_READ_WRITE) != 0 { s.txReadOnly = false }
+    s.txDeferrable = (flags & ast.F_TX_DEFERRABLE) != 0
+    s.txSnap = false
+    s.spReadOnly.clear()
+}
+
+function isoName(iso: Integer): Text {
+    if iso == ast.ISO_SERIALIZABLE { return "serializable" }
+    if iso == ast.ISO_REPEATABLE_READ { return "repeatable read" }
+    if iso == ast.ISO_READ_UNCOMMITTED { return "read uncommitted" }
+    return "read committed"
+}
+
+function onOff(b: Boolean): Text {
+    if b { return "on" }
+    return "off"
+}
+
+// Effective read-only state for the statement about to run.
+function readOnlyNow(s: Session): Boolean {
+    if s.inBlock { return s.txReadOnly }
+    return s.defaultReadOnly
+}
+
+function readOnlyError(s: Session, what: Text): Outcome {
+    return errOut(s, "25006", "cannot execute " + what + " in a read-only transaction", 0)
+}
+
+// ---------------------------------------------------------------- DDL
+
+function typmodOf(a: ast.Ast, tn: Integer, t: Integer): Integer {
+    let mods = ast.items(a, ast.child(a, tn, 0))
+    if t == v.T_VARCHAR {
+        if mods.length > 0 { return a.nodes[mods[0]].intValue }
+        return -1
+    }
+    if t == v.T_BPCHAR {
+        if mods.length > 0 { return a.nodes[mods[0]].intValue }
+        return 1
+    }
+    if t == v.T_NUMERIC {
+        if mods.length > 0 {
+            let sc = 0
+            if mods.length > 1 { sc = a.nodes[mods[1]].intValue }
+            return a.nodes[mods[0]].intValue * 65536 + (sc & 65535)
+        }
+    }
+    return -1
+}
+
+function defaultFromAst(a: ast.Ast, c: tb.Column, id: Integer) {
+    let k = ast.kind(a, id)
+    if k == ast.K_NULL_LIT { return }
+    if k == ast.K_INT_LIT || k == ast.K_NUM_LIT || k == ast.K_STR_LIT || k == ast.K_BOOL_LIT || k == ast.K_UNARY_OP {
+        c.defaultKind = 1
+        c.defaultText = litText(a, id)
+        c.defaultNull = false
+        return
+    }
+    if k == ast.K_CAST {
+        defaultFromAst(a, c, ast.child(a, id, 0))
+        return
+    }
+    if k == ast.K_FUNC_CALL {
+        let name = a.nodes[id].text
+        if name == "now" || name == "current_timestamp" || name == "localtimestamp" || name == "current_date" {
+            c.defaultKind = 3
+            return
+        }
+        if name == "nextval" {
+            c.defaultKind = 2
+            return
+        }
+    }
+}
+
+function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let name = nd.text
+    let internal = name
+    if (nd.flags & ast.F_TEMP) != 0 { internal = pl.tempName(e.env.session, name) }
+    let isTemp = pl.isTempName(internal)
+    if cat.findTable(e.c, internal) >= 0 || (!isTemp && pl.findView(e.views, name) >= 0) {
+        if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 {
+            let o = okTag(s, "CREATE TABLE")
+            o.notices.add("relation \"" + name + "\" already exists, skipping")
+            return o
+        }
+        return errOut(s, "42P07", "relation \"" + name + "\" already exists", 0)
+    }
+    let t = tb.newTable(e.c.tables.length, internal)
+    let pkCols: List<Integer> = []
+    let uniques: List<List<Integer>> = []
+    let fkCons: List<Integer> = []
+    let fkColLevel: List<Integer> = []
+    let spec = ast.child(a, root, 3)
+    let parentRef = ast.child(a, root, 4)
+    let bound = ast.child(a, root, 5)
+    let parentTid = -1
+    if parentRef >= 0 {
+        parentTid = relId(e, a.nodes[parentRef].text)
+        if parentTid < 0 { return errOut(s, "42P01", "relation \"" + a.nodes[parentRef].text + "\" does not exist", 0) }
+        if !pl.isPartitioned(e.views, e.c, parentTid) {
+            return errOut(s, "42809", "\"" + a.nodes[parentRef].text + "\" is not partitioned", 0)
+        }
+        let bo = checkBound(e, s, a, bound, parentTid, name)
+        if bo.status == STATUS_ERROR { return bo }
+        for col in e.c.tables[parentTid].cols { tb.addColumn(t, copyColumn(col, true)) }
+    }
+    let elems = ast.items(a, ast.child(a, root, 1))
+    if elems.length > 1600 { return errOut(s, "54011", "tables can have at most 1600 columns", 0) }
+    for el in elems {
+        if ast.kind(a, el) == ast.K_TABLE_LIKE {
+            let lref = ast.child(a, el, 0)
+            let lid = relId(e, a.nodes[lref].text)
+            if lid < 0 { return errOut(s, "42P01", "relation \"" + a.nodes[lref].text + "\" does not exist", 0) }
+            for col in e.c.tables[lid].cols {
+                if tb.columnIndex(t, col.name) >= 0 { return errOut(s, "42701", "column \"" + col.name + "\" specified more than once", 0) }
+                tb.addColumn(t, copyColumn(col, (a.nodes[el].flags & ast.F_LIKE_DEFAULTS) != 0))
+            }
+        } else if ast.kind(a, el) == ast.K_COLUMN_DEF {
+            let tn = ast.child(a, el, 0)
+            let tname = a.nodes[tn].text
+            let ty = pl.typeOfName(tname)
+            if ty < 0 { return errOut(s, "42704", "type \"" + tname + "\" does not exist", a.nodes[tn].position + 1) }
+            if a.nodes[tn].intValue > 0 { return errOut(s, "0A000", "array types are not supported", a.nodes[tn].position + 1) }
+            let cn = a.nodes[el].text
+            if tb.columnIndex(t, cn) >= 0 { return errOut(s, "42701", "column \"" + cn + "\" specified more than once", 0) }
+            let ctm = typmodOf(a, tn, ty)
+            let cty = ty
+            if ty == v.T_NUMERIC { cty = v.numStorageType(ctm) }
+            let col = tb.newColumn(cn, cty, ctm, false)
+            if tname == "serial" || tname == "bigserial" || tname == "smallserial" {
+                col.defaultKind = 2
+                col.notNull = true
+            }
+            tb.addColumn(t, col)
+            let ci = t.cols.length - 1
+            for con in ast.items(a, ast.child(a, el, 1)) {
+                let cop = a.nodes[con].op
+                if cop == ast.CONSTR_NOT_NULL { col.notNull = true }
+                if cop == ast.CONSTR_PRIMARY_KEY {
+                    pkCols = [ci]
+                    col.notNull = true
+                }
+                if cop == ast.CONSTR_UNIQUE { uniques.add([ci]) }
+                if cop == ast.CONSTR_DEFAULT { defaultFromAst(a, col, ast.child(a, con, 0)) }
+                if cop == ast.CONSTR_IDENTITY {
+                    col.defaultKind = 2
+                    col.notNull = true
+                }
+                if cop == ast.CONSTR_FOREIGN_KEY {
+                    fkCons.add(con)
+                    fkColLevel.add(ci)
+                }
+            }
+        } else if ast.kind(a, el) == ast.K_CONSTRAINT {
+            let cop = a.nodes[el].op
+            if cop == ast.CONSTR_FOREIGN_KEY {
+                fkCons.add(el)
+                fkColLevel.add(-1)
+            }
+            if cop == ast.CONSTR_PRIMARY_KEY || cop == ast.CONSTR_UNIQUE {
+                let cols: List<Integer> = []
+                for cn in ast.items(a, ast.child(a, el, 1)) {
+                    let ci = tb.columnIndex(t, a.nodes[cn].text)
+                    if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[cn].text + "\" named in key does not exist", 0) }
+                    cols.add(ci)
+                }
+                if cop == ast.CONSTR_PRIMARY_KEY {
+                    pkCols = cols
+                } else {
+                    uniques.add(cols)
+                }
+            }
+        }
+    }
+    if spec >= 0 {
+        let so = checkPartSpec(e, s, a, spec, t)
+        if so.status == STATUS_ERROR { return so }
+    }
+    // foreign keys are fully validated before the table exists (a failure must not consume a table id)
+    let fks: List<FkSpec> = []
+    let fi = 0
+    while fi < fkCons.length {
+        let fs = fkResolve(e, a, fkCons[fi], fkColLevel[fi], t, name, pkCols, uniques)
+        if fs.err != "" { return fkErr(s, fs.err) }
+        fks.add(fs)
+        fi += 1
+    }
+    e.c.tables.add(t)
+    if isTemp { e.env.tempCount += 1 }
+    pushUndo(e, s, UNDO_CREATED, t.id, internal)
+    if spec >= 0 {
+        let pi = pl.partEnsure(e.views, t.id)
+        e.views.pSpecTree[pi] = a
+        e.views.pSpec[pi] = spec
+    }
+    if parentTid >= 0 {
+        let pi = pl.partEnsure(e.views, t.id)
+        e.views.pParent[pi] = parentTid
+        e.views.pBoundTree[pi] = a
+        e.views.pBound[pi] = bound
+    }
+    if pkCols.length > 0 {
+        // multi-column keys also get an ordered index: lookups on a leading prefix (TPC-C) use a range on it
+        let wantOrd = v.isTextType(t.cols[pkCols[0]].type) || pkCols.length > 1
+        cat.addIndex(e.c, t, name + "_pkey", pkCols, true, true, true, wantOrd)
+        e.c.conNames.add(name + "_pkey")
+    }
+    for u in uniques {
+        let nm = name
+        for ci in u { nm = nm + "_" + t.cols[ci].name }
+        cat.addIndex(e.c, t, nm + "_key", u, true, false, true, u.length > 1)
+        e.c.conNames.add(nm + "_key")
+    }
+    for fs in fks {
+        let parent = t
+        if !fs.selfRef { parent = e.c.tables[fs.parentId] }
+        let err = fkm.define(e.c, t, fs.name, fs.childCols, parent, fs.parentCols, fs.onDelete, fs.onUpdate, fs.deferrable, fs.deferred, false)
+        if err != "" { print("neo-db: foreign key " + fs.name + " not registered: " + err) }
+    }
+    return ddlDone(e, s, "CREATE TABLE", sql)
+}
+
+// SHOW result columns (compat agent): SHOW ALL is name / setting / description.
+function showColumns(name: Text): List<Column> {
+    if name == "all" {
+        return [Column { name: "name"; typeOid: 25; typeSize: -1; typeMod: -1 }, Column { name: "setting"; typeOid: 25; typeSize: -1; typeMod: -1 },
+                Column { name: "description"; typeOid: 25; typeSize: -1; typeMod: -1 }]
+    }
+    return [Column { name: name; typeOid: 25; typeSize: -1; typeMod: -1 }]
+}
+
+function showAllNames(): List<Text> {
+    return ["application_name", "block_size", "client_encoding", "datestyle", "default_transaction_isolation", "default_transaction_read_only",
+            "extra_float_digits", "fsync", "integer_datetimes", "intervalstyle", "is_superuser", "max_connections", "max_identifier_length",
+            "max_index_keys", "search_path", "server_encoding", "server_version", "server_version_num", "standard_conforming_strings",
+            "synchronous_commit", "timezone", "transaction_isolation", "transaction_read_only"]
+}
+
+// ---------------------------------------------------------------- foreign keys (compat agent)
+
+record FkSpec {
+    err: Text
+    name: Text
+    childCols: List<Integer>
+    selfRef: Boolean
+    parentId: Integer
+    parentCols: List<Integer>
+    onDelete: Integer
+    onUpdate: Integer
+    deferrable: Boolean
+    deferred: Boolean
+}
+
+function fkErr(s: Session, err: Text): Outcome {
+    let b = Bytes(err)
+    let i = 0
+    while i < b.length && b[i] != 124 { i += 1 }
+    if i >= b.length { return errOut(s, "42830", err, 0) }
+    let rest = Text(b.slice(i + 1, b.length))
+    let rb = Bytes(rest)
+    let j = 0
+    while j < rb.length && rb[j] != 124 { j += 1 }
+    let o = errOut(s, Text(b.slice(0, i)), rest, 0)
+    if j < rb.length {
+        o.message = Text(rb.slice(0, j))
+        o.detail = Text(rb.slice(j + 1, rb.length))
+    }
+    return o
+}
+
+function isConName(e: Engine, name: Text): Boolean {
+    for n in e.c.conNames {
+        if n == name { return true }
+    }
+    return false
+}
+
+function sameColSet(a: List<Integer>, b: List<Integer>): Boolean {
+    if a.length != b.length { return false }
+    for x in a {
+        let found = false
+        for y in b {
+            if x == y { found = true }
+        }
+        if !found { return false }
+    }
+    return true
+}
+
+// Resolve a FOREIGN KEY / REFERENCES constraint of child table t (colLevel: the column it is attached to, or -1).
+// selfName / pkCols / uniques describe t itself when it is being created (self-references).
+function fkResolve(e: Engine, a: ast.Ast, con: Integer, colLevel: Integer, t: tb.Table, selfName: Text, pkCols: List<Integer>, uniques: List<List<Integer>>): FkSpec {
+    let nd = a.nodes[con]
+    let fs = FkSpec { err: ""; name: nd.text; childCols: []; selfRef: false; parentId: -1; parentCols: []; onDelete: nd.intValue & 7
+                      onUpdate: (nd.intValue >> 3) & 7; deferrable: (nd.flags & ast.F_DEFERRABLE) != 0; deferred: (nd.flags & ast.F_INITIALLY_DEFERRED) != 0 }
+    if colLevel >= 0 {
+        fs.childCols.add(colLevel)
+    } else {
+        for cn in ast.items(a, ast.child(a, con, 1)) {
+            let ci = tb.columnIndex(t, a.nodes[cn].text)
+            if ci < 0 {
+                fs.err = "42703|column \"" + a.nodes[cn].text + "\" referenced in foreign key constraint does not exist"
+                return fs
+            }
+            fs.childCols.add(ci)
+        }
+    }
+    let ref = ast.child(a, con, 2)
+    let pname = a.nodes[ref].text
+    let parent = t
+    if pname == selfName && cat.findTable(e.c, t.name) < 0 {
+        fs.selfRef = true
+    } else {
+        let pid = relId(e, pname)
+        if pid < 0 {
+            fs.err = "42P01|relation \"" + pname + "\" does not exist"
+            return fs
+        }
+        fs.parentId = pid
+        parent = e.c.tables[pid]
+        if pid == t.id { fs.selfRef = false }
+    }
+    for cn in ast.items(a, ast.child(a, con, 3)) {
+        let ci = tb.columnIndex(parent, a.nodes[cn].text)
+        if ci < 0 {
+            fs.err = "42703|column \"" + a.nodes[cn].text + "\" referenced in foreign key constraint does not exist"
+            return fs
+        }
+        fs.parentCols.add(ci)
+    }
+    if fs.name == "" { fs.name = fkm.defaultName(e.c, t, fs.childCols) }
+    if fs.selfRef {
+        if fs.parentCols.length == 0 {
+            if pkCols.length == 0 {
+                fs.err = "42830|there is no primary key for referenced table \"" + selfName + "\""
+                return fs
+            }
+            fs.parentCols = pkCols
+        }
+        if fs.parentCols.length != fs.childCols.length {
+            fs.err = "42830|number of referencing and referenced columns for foreign key disagree"
+            return fs
+        }
+        let ok = sameColSet(pkCols, fs.parentCols)
+        for u in uniques {
+            if sameColSet(u, fs.parentCols) { ok = true }
+        }
+        if !ok {
+            fs.err = "42830|there is no unique constraint matching given keys for referenced table \"" + selfName + "\""
+            return fs
+        }
+        let i = 0
+        while i < fs.childCols.length {
+            if !fkm.sameClass(t.cols[fs.childCols[i]].type, t.cols[fs.parentCols[i]].type) {
+                fs.err = "42804|foreign key constraint \"" + fs.name + "\" cannot be implemented"
+                return fs
+            }
+            i += 1
+        }
+        if fs.onDelete == ast.FK_SET_DEFAULT || fs.onUpdate == ast.FK_SET_DEFAULT {
+            fs.err = "0A000|ON DELETE / ON UPDATE SET DEFAULT is not supported"
+        }
+        return fs
+    }
+    fs.err = fkm.define(e.c, t, fs.name, fs.childCols, parent, fs.parentCols, fs.onDelete, fs.onUpdate, fs.deferrable, fs.deferred, true)
+    if fs.parentCols.length == 0 { fs.parentCols = parent.pkCols }
+    return fs
+}
+
+// ---------------------------------------------------------------- partitioning DDL
+
+function copyColumn(col: tb.Column, withDefault: Boolean): tb.Column {
+    let c = tb.newColumn(col.name, col.type, col.typmod, col.notNull)
+    if withDefault {
+        c.defaultKind = col.defaultKind
+        c.defaultText = col.defaultText
+        c.defaultNull = col.defaultNull
+    }
+    return c
+}
+
+// PARTITION BY validation: key columns exist; operator classes are not supported (none exist).
+function checkPartSpec(e: Engine, s: Session, a: ast.Ast, spec: Integer, t: tb.Table): Outcome {
+    let strategy = a.nodes[spec].op
+    for item in ast.items(a, ast.child(a, spec, 0)) {
+        let opclass = a.nodes[item].text
+        if opclass != "" {
+            let method = "btree"
+            if strategy == ast.PART_HASH { method = "hash" }
+            return errOut(s, "42704", "operator class \"" + opclass + "\" does not exist for access method \"" + method + "\"", 0)
+        }
+        let k = ast.child(a, item, 0)
+        if ast.kind(a, k) == ast.K_COLUMN_REF && tb.columnIndex(t, a.nodes[k].text) < 0 {
+            return errOut(s, "42703", "column \"" + a.nodes[k].text + "\" named in partition key does not exist", 0)
+        }
+    }
+    if strategy == ast.PART_LIST && ast.items(a, ast.child(a, spec, 0)).length != 1 {
+        return errOut(s, "42P16", "cannot use \"list\" partition strategy with more than one column", 0)
+    }
+    return okTag(s, "")
+}
+
+// FOR VALUES / DEFAULT of a new partition of parentTid.
+function checkBound(e: Engine, s: Session, a: ast.Ast, bound: Integer, parentTid: Integer, name: Text): Outcome {
+    let strategy = pl.partStrategy(e.views, parentTid)
+    let kind = a.nodes[bound].op
+    let pname = displayName(e.c.tables[parentTid].name)
+    if kind == ast.PB_DEFAULT {
+        if strategy == ast.PART_HASH { return errOut(s, "42P16", "a hash-partitioned table may not have a default partition", 0) }
+        let d = pl.partDefaultChild(e.views, e.c, parentTid)
+        if d >= 0 {
+            return errOut(s, "42P17", "partition \"" + name + "\" conflicts with existing default partition \"" + displayName(e.c.tables[d].name) + "\"", 0)
+        }
+        return okTag(s, "")
+    }
+    if strategy == ast.PART_LIST && kind != ast.PB_LIST { return errOut(s, "42P16", "invalid bound specification for a list partition", 0) }
+    if strategy == ast.PART_RANGE && kind != ast.PB_RANGE { return errOut(s, "42P16", "invalid bound specification for a range partition", 0) }
+    if strategy == ast.PART_HASH && kind != ast.PB_HASH { return errOut(s, "42P16", "invalid bound specification for a hash partition", 0) }
+    let pi = pl.partIndex(e.views, parentTid)
+    let nkeys = ast.items(e.views.pSpecTree[pi], ast.child(e.views.pSpecTree[pi], e.views.pSpec[pi], 0)).length
+    if kind == ast.PB_RANGE {
+        let lo = ast.items(a, ast.child(a, bound, 0))
+        let hi = ast.items(a, ast.child(a, bound, 1))
+        if lo.length != nkeys { return errOut(s, "42P16", "FROM must specify exactly one value per partitioning column", 0) }
+        if hi.length != nkeys { return errOut(s, "42P16", "TO must specify exactly one value per partitioning column", 0) }
+        let lb = infiniteBounds(s, a, lo)
+        if lb.status == STATUS_ERROR { return lb }
+        let ub = infiniteBounds(s, a, hi)
+        if ub.status == STATUS_ERROR { return ub }
+    }
+    if kind == ast.PB_HASH {
+        let mods = ast.items(a, ast.child(a, bound, 0))
+        let m = a.nodes[mods[0]].intValue
+        let r = a.nodes[mods[1]].intValue
+        if m <= 0 { return errOut(s, "42P16", "modulus for hash partition must be an integer value greater than zero", 0) }
+        if r < 0 { return errOut(s, "42P16", "remainder for hash partition must be an integer value greater than or equal to zero", 0) }
+        if r >= m { return errOut(s, "42P16", "remainder for hash partition must be less than modulus", 0) }
+    }
+    let unused = pname
+    return okTag(s, "")
+}
+
+// After a MINVALUE (MAXVALUE) every following range bound must be MINVALUE (MAXVALUE).
+function infiniteBounds(s: Session, a: ast.Ast, vals: List<Integer>): Outcome {
+    let seen = 0
+    for v0 in vals {
+        let m = boundMarkerOf(a, v0)
+        if seen != 0 && m != seen {
+            if seen == 1 { return errOut(s, "42804", "every bound following MINVALUE must also be MINVALUE", 0) }
+            return errOut(s, "42804", "every bound following MAXVALUE must also be MAXVALUE", 0)
+        }
+        if m != 0 { seen = m }
+    }
+    return okTag(s, "")
+}
+
+function boundMarkerOf(a: ast.Ast, id: Integer): Integer {
+    let k = ast.kind(a, id)
+    if (k == ast.K_NAME || (k == ast.K_COLUMN_REF && ast.items(a, id).length == 0)) {
+        if a.nodes[id].text == "minvalue" { return 1 }
+        if a.nodes[id].text == "maxvalue" { return 2 }
+    }
+    return 0
+}
+
+// ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...
+function attachPartition(e: Engine, s: Session, a: ast.Ast, cmd: Integer, parentTid: Integer): Outcome {
+    let ref = ast.child(a, cmd, 1)
+    let cname = a.nodes[ref].text
+    let ctid = relId(e, cname)
+    if ctid < 0 { return errOut(s, "42P01", "relation \"" + cname + "\" does not exist", 0) }
+    let parent = e.c.tables[parentTid]
+    if !pl.isPartitioned(e.views, e.c, parentTid) {
+        return errOut(s, "42809", "table \"" + displayName(parent.name) + "\" is not partitioned", 0)
+    }
+    if pl.partParentOf(e.views, e.c, ctid) >= 0 { return errOut(s, "42P17", "\"" + cname + "\" is already a partition", 0) }
+    let child = e.c.tables[ctid]
+    for col in child.cols {
+        let pc0 = tb.columnIndex(parent, col.name)
+        if pc0 < 0 {
+            return errOut(s, "42804", "table \"" + cname + "\" contains column \"" + col.name + "\" not found in parent \"" + displayName(parent.name) + "\"", 0)
+        }
+        if parent.cols[pc0].type != col.type {
+            return errOut(s, "42804", "child table \"" + cname + "\" has different type for column \"" + col.name + "\"", 0)
+        }
+    }
+    for col in parent.cols {
+        if tb.columnIndex(child, col.name) < 0 { return errOut(s, "42804", "child table is missing column \"" + col.name + "\"", 0) }
+    }
+    let bound = ast.child(a, cmd, 0)
+    let bo = checkBound(e, s, a, bound, parentTid, cname)
+    if bo.status == STATUS_ERROR { return bo }
+    let pi = pl.partEnsure(e.views, ctid)
+    e.views.pParent[pi] = parentTid
+    e.views.pBoundTree[pi] = a
+    e.views.pBound[pi] = bound
+    return okTag(s, "")
+}
+
+function detachPartition(e: Engine, s: Session, a: ast.Ast, cmd: Integer, parentTid: Integer): Outcome {
+    let ref = ast.child(a, cmd, 1)
+    let cname = a.nodes[ref].text
+    let ctid = relId(e, cname)
+    if ctid < 0 { return errOut(s, "42P01", "relation \"" + cname + "\" does not exist", 0) }
+    if pl.partParentOf(e.views, e.c, ctid) != parentTid {
+        return errOut(s, "42P01", "relation \"" + cname + "\" is not a partition of relation \"" + displayName(e.c.tables[parentTid].name) + "\"", 0)
+    }
+    let pi = pl.partIndex(e.views, ctid)
+    e.views.pParent[pi] = -1
+    e.views.pBound[pi] = -1
+    return okTag(s, "")
+}
+
+// ALTER TABLE ... DROP COLUMN: the column, and any index using it, disappear (row ids are unchanged).
+function dropColumn(e: Engine, s: Session, t: tb.Table, name: Text, ifExists: Boolean): Outcome {
+    let ci = tb.columnIndex(t, name)
+    if ci < 0 {
+        if ifExists { return okTag(s, "") }
+        return errOut(s, "42703", "column \"" + name + "\" of relation \"" + displayName(t.name) + "\" does not exist", 0)
+    }
+    if t.lockedCount > 0 && !e.replaying {
+        return errOut(s, "55006", "cannot ALTER TABLE \"" + displayName(t.name) + "\" because it is being used by active queries", 0)
+    }
+    let pi = pl.partIndex(e.views, t.id)
+    if pi >= 0 && e.views.pSpec[pi] >= 0 {
+        let st = e.views.pSpecTree[pi]
+        for item in ast.items(st, ast.child(st, e.views.pSpec[pi], 0)) {
+            let k = ast.child(st, item, 0)
+            if ast.kind(st, k) == ast.K_COLUMN_REF && st.nodes[k].text == name {
+                return errOut(s, "42P16", "cannot drop column \"" + name + "\" because it is part of the partition key of relation \"" + displayName(t.name) + "\"", 0)
+            }
+        }
+    }
+    let cols: List<tb.Column> = []
+    let i = 0
+    while i < t.cols.length {
+        if i != ci { cols.add(t.cols[i]) }
+        i += 1
+    }
+    t.cols = cols
+    let hs: List<Integer> = []
+    for hid in t.hashIds {
+        let h = e.c.hashIdx[hid]
+        let rm = remapCols(h.cols, ci)
+        if rm.length < h.cols.length {
+            h.name = ""
+            h.tableId = -1
+        } else {
+            h.cols = rm
+            hs.add(hid)
+        }
+    }
+    t.hashIds = hs
+    let os: List<Integer> = []
+    for oid in t.ordIds {
+        let o = e.c.ordIdx[oid]
+        let rm = remapCols(o.cols, ci)
+        if rm.length < o.cols.length {
+            o.name = ""
+            o.tableId = -1
+        } else {
+            o.cols = rm
+            os.add(oid)
+        }
+    }
+    t.ordIds = os
+    fkm.columnDropped(e.c, t.id, ci)
+    let pk = remapCols(t.pkCols, ci)
+    if pk.length < t.pkCols.length { t.pkCols = [] } else { t.pkCols = pk }
+    return okTag(s, "")
+}
+
+// Column positions after dropping column ci (ci itself is left out).
+function remapCols(cols: List<Integer>, ci: Integer): List<Integer> {
+    let out: List<Integer> = []
+    for k in cols {
+        if k > ci { out.add(k - 1) } else if k < ci { out.add(k) }
+    }
+    return out
+}
+
+function createIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let tref = ast.child(a, root, 0)
+    let tname = a.nodes[tref].text
+    let tid = relId(e, tname)
+    if tid < 0 { return errOut(s, "42P01", "relation \"" + tname + "\" does not exist", 0) }
+    let t = e.c.tables[tid]
+    let cols: List<Integer> = []
+    for el in ast.items(a, ast.child(a, root, 1)) {
+        let ex0 = ast.child(a, el, 0)
+        if ast.kind(a, ex0) != ast.K_COLUMN_REF { return errOut(s, "0A000", "expression indexes are not supported", 0) }
+        let ci = tb.columnIndex(t, a.nodes[ex0].text)
+        if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[ex0].text + "\" does not exist", 0) }
+        cols.add(ci)
+    }
+    let name = nd.text
+    if name == "" {
+        name = tname
+        for ci in cols { name = name + "_" + t.cols[ci].name }
+        name = name + "_idx"
+    }
+    if cat.indexNameExists(e.c, name) {
+        if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 { return okTag(s, "CREATE INDEX") }
+        return errOut(s, "42P07", "relation \"" + name + "\" already exists", 0)
+    }
+    let unique = (nd.flags & ast.F_UNIQUE) != 0
+    if ast.child(a, root, 2) >= 0 { return errOut(s, "0A000", "partial indexes are not supported", 0) }
+    let method = ast.text(a, ast.child(a, root, 5))
+    let wantHash = unique || method == "hash"
+    let wantOrd = method != "hash"
+    if !cat.addIndex(e.c, t, name, cols, unique, false, wantHash, wantOrd) {
+        return errOut(s, "23505", "could not create unique index \"" + name + "\"", 0)
+    }
+    pushUndo(e, s, UNDO_INDEX, t.id, name)
+    return ddlDone(e, s, "CREATE INDEX", sql)
+}
+
+function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let ifExists = (nd.flags & ast.F_IF_EXISTS) != 0
+    let o = okTag(s, "DROP TABLE")
+    if nd.op == ast.OBJ_VIEW { o.commandTag = "DROP VIEW" }
+    if nd.op == ast.OBJ_INDEX { o.commandTag = "DROP INDEX" }
+    if nd.op == ast.OBJ_SCHEMA { return okTag(s, "DROP SCHEMA") }
+    if nd.op == ast.OBJ_SEQUENCE { return okTag(s, "DROP SEQUENCE") }
+    let changed = false
+    let inBlockDrop = false
+    // resolve every name first: a partition listed after its partitioned table is dropped with it
+    let preTids: List<Integer> = []
+    for ref in ast.items(a, ast.child(a, root, 0)) {
+        if nd.op == ast.OBJ_TABLE { preTids.add(relId(e, a.nodes[ref].text)) } else { preTids.add(-1) }
+    }
+    // foreign keys from other tables: an error without CASCADE, dropped with it
+    if nd.op == ast.OBJ_TABLE && e.c.nLiveFks > 0 && !e.replaying {
+        let cascade = (nd.flags & ast.F_CASCADE) != 0
+        let drops: List<Integer> = []
+        for tid in preTids {
+            if tid >= 0 {
+                for d in fkm.dependents(e.c, tid) {
+                    let fk = e.c.fks[d]
+                    let alsoDropped = false
+                    for x in preTids {
+                        if x == fk.childId { alsoDropped = true }
+                    }
+                    if !alsoDropped {
+                        if !cascade {
+                            let o2 = errOut(s, "2BP01", "cannot drop table " + displayName(e.c.tables[tid].name) + " because other objects depend on it", 0)
+                            o2.detail = "constraint " + fk.name + " on table " + displayName(e.c.tables[fk.childId].name) + " depends on table " + displayName(e.c.tables[tid].name)
+                            return o2
+                        }
+                        drops.add(d)
+                    }
+                }
+            }
+        }
+        for d in drops {
+            let fk = e.c.fks[d]
+            if !fk.dropped {
+                let child = e.c.tables[fk.childId]
+                o.notices.add("drop cascades to constraint " + fk.name + " on table " + displayName(child.name))
+                if s.inBlock { logDdlAuto(e, "ALTER TABLE " + quoteIdent(child.name) + " DROP CONSTRAINT " + quoteIdent(fk.name)) }
+                cat.dropForeignKey(e.c, d)
+            }
+        }
+    }
+    let refIdx = -1
+    for ref in ast.items(a, ast.child(a, root, 0)) {
+        refIdx += 1
+        let name = a.nodes[ref].text
+        if nd.op == ast.OBJ_TABLE {
+            let tid = relId(e, name)
+            if tid < 0 && preTids[refIdx] >= 0 { continue }
+            if tid >= 0 && pl.isPartitioned(e.views, e.c, tid) {
+                // partitions are dropped with their partitioned table (deepest first)
+                let desc = pl.partDescendants(e.views, e.c, tid)
+                let di = desc.length - 1
+                while di >= 0 {
+                    let dt = desc[di]
+                    if s.inBlock && !e.replaying {
+                        let tt = e.c.tables[dt]
+                        let hidden = "pg_neo_dropped_" + Text(dt)
+                        logDdlAuto(e, "ALTER TABLE " + quoteIdent(tt.name) + " RENAME TO " + quoteIdent(hidden))
+                        pushUndo(e, s, UNDO_DROPPED, dt, tt.name)
+                        if pl.isTempName(tt.name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
+                        tt.name = hidden
+                    } else {
+                        if pl.isTempName(e.c.tables[dt].name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
+                        cat.dropTable(e.c, dt)
+                    }
+                    di -= 1
+                }
+            }
+            if tid < 0 {
+                if !ifExists { return errOut(s, "42P01", "table \"" + name + "\" does not exist", 0) }
+                o.notices.add("table \"" + name + "\" does not exist, skipping")
+            } else {
+                if s.inBlock && !e.replaying {
+                    // dropped at COMMIT; until then hidden under a name no query can reach
+                    let t = e.c.tables[tid]
+                    let hidden = "pg_neo_dropped_" + Text(tid)
+                    logDdlAuto(e, "ALTER TABLE " + quoteIdent(t.name) + " RENAME TO " + quoteIdent(hidden))
+                    pushUndo(e, s, UNDO_DROPPED, tid, t.name)
+                    if pl.isTempName(t.name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
+                    t.name = hidden
+                    e.c.version += 1
+                    inBlockDrop = true
+                    continue
+                }
+                if e.c.tables[tid].lockedCount > 0 && !e.replaying {
+                    return errOut(s, "55006", "cannot DROP TABLE \"" + name + "\" because it is being used by active queries", 0)
+                }
+                if pl.isTempName(e.c.tables[tid].name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
+                cat.dropTable(e.c, tid)
+                changed = true
+            }
+        } else if nd.op == ast.OBJ_VIEW {
+            let vi = pl.findView(e.views, name)
+            if vi < 0 {
+                if !ifExists { return errOut(s, "42P01", "view \"" + name + "\" does not exist", 0) }
+                o.notices.add("view \"" + name + "\" does not exist, skipping")
+            } else {
+                e.views.names[vi] = ""
+                changed = true
+            }
+        } else if nd.op == ast.OBJ_INDEX {
+            if !dropIndex(e, name) {
+                if !ifExists { return errOut(s, "42704", "index \"" + name + "\" does not exist", 0) }
+                o.notices.add("index \"" + name + "\" does not exist, skipping")
+            } else {
+                changed = true
+            }
+        } else {
+            return errOut(s, "0A000", "DROP of this object type is not supported", 0)
+        }
+    }
+    if !changed { return o }
+    if inBlockDrop {
+        // other objects in the same statement: logged as their own DROP
+        e.c.version += 1
+        return o
+    }
+    let d = ddlDone(e, s, o.commandTag, sql)
+    d.notices = o.notices
+    return d
+}
+
+function dropIndex(e: Engine, name: Text): Boolean {
+    let found = false
+    for t in e.c.tables {
+        let hs: List<Integer> = []
+        for hid in t.hashIds {
+            if e.c.hashIdx[hid].name == name {
+                found = true
+                e.c.hashIdx[hid].name = ""
+            } else {
+                hs.add(hid)
+            }
+        }
+        let os: List<Integer> = []
+        for oid in t.ordIds {
+            if e.c.ordIdx[oid].name == name {
+                found = true
+                e.c.ordIdx[oid].name = ""
+            } else {
+                os.add(oid)
+            }
+        }
+        t.hashIds = hs
+        t.ordIds = os
+    }
+    return found
+}
+
+function truncateTables(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    for ref in ast.items(a, ast.child(a, root, 0)) {
+        let name = a.nodes[ref].text
+        let tid = relId(e, name)
+        if tid < 0 { return errOut(s, "42P01", "relation \"" + name + "\" does not exist", 0) }
+    }
+    let tx = ensureTxn(e, s)
+    let tids: List<Integer> = []
+    for ref in ast.items(a, ast.child(a, root, 0)) {
+        let tid0 = relId(e, a.nodes[ref].text)
+        tids.add(tid0)
+        if pl.isPartitioned(e.views, e.c, tid0) {
+            for d in pl.partDescendants(e.views, e.c, tid0) { tids.add(d) }
+        }
+    }
+    // a table referenced by a foreign key is truncated only together with the referencing tables (or CASCADE)
+    if e.c.nLiveFks > 0 && !e.replaying {
+        let ti = 0
+        while ti < tids.length {
+            for d in fkm.dependents(e.c, tids[ti]) {
+                let child = e.c.fks[d].childId
+                let listed = false
+                for x in tids {
+                    if x == child { listed = true }
+                }
+                if !listed {
+                    if (a.nodes[root].flags & ast.F_CASCADE) == 0 {
+                        let o2 = errOut(s, "0A000", "cannot truncate a table referenced in a foreign key constraint", 0)
+                        o2.detail = "Table \"" + displayName(e.c.tables[child].name) + "\" references \"" + displayName(e.c.tables[tids[ti]].name) + "\"."
+                        return o2
+                    }
+                    tids.add(child)
+                }
+            }
+            ti += 1
+        }
+    }
+    for tidT in tids {
+        let t = e.c.tables[tidT]
+        if t.lockedCount > 0 && !e.replaying {
+            let owner = firstLockOwner(e, t, tx.slot)
+            if owner >= 0 { return blockOn(e, s, tx, owner) }
+        }
+        tb.truncate(t)
+        cat.rebuildIndexes(e.c, t)
+        if (a.nodes[root].flags & ast.F_RESTART_IDENTITY) != 0 { t.serial = 0 }
+        tx.redo.add(dml.R_TRUNCATE)
+        tb.putVarint(tx.redo, t.id)
+    }
+    let o = okTag(s, "TRUNCATE TABLE")
+    if !s.inBlock { o.waitLsn = commitTxn(e, s, tx) }
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+function firstLockOwner(e: Engine, t: tb.Table, me: Integer): Integer {
+    let r = 0
+    while r < t.nrows {
+        if (t.state[r] & tb.ST_LOCKED) != 0 {
+            let o = txn.ownerOf(e.tm, t.id, r)
+            if o >= 0 && o != me { return o }
+        }
+        r += 1
+    }
+    return -1
+}
+
+function createView(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let name = nd.text
+    let existing = pl.findView(e.views, name)
+    if existing >= 0 || cat.findTable(e.c, name) >= 0 {
+        if (nd.flags & ast.F_OR_REPLACE) == 0 || existing < 0 {
+            return errOut(s, "42P07", "relation \"" + name + "\" already exists", 0)
+        }
+        e.views.names[existing] = ""
+    }
+    let q = ast.child(a, root, 2)
+    // validate by planning once
+    let st = pl.planStatement(e.c, e.views, e.env, a, q, sql, [])
+    if st.err { return errOut(s, st.errCode, st.errMsg, 0) }
+    let cols: List<Text> = []
+    for n in ast.items(a, ast.child(a, root, 1)) { cols.add(a.nodes[n].text) }
+    e.views.names.add(name)
+    e.views.trees.add(a)
+    e.views.roots.add(q)
+    e.views.cols.add(cols)
+    return ddlDone(e, s, "CREATE VIEW", sql)
+}
+
+function alterTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let tref = ast.child(a, root, 0)
+    let tname = a.nodes[tref].text
+    let tid = relId(e, tname)
+    if tid < 0 {
+        if (nd.flags & ast.F_IF_EXISTS) != 0 { return okTag(s, "ALTER TABLE") }
+        return errOut(s, "42P01", "relation \"" + tname + "\" does not exist", 0)
+    }
+    let t = e.c.tables[tid]
+    for cmd in ast.items(a, ast.child(a, root, 1)) {
+        let cn = a.nodes[cmd]
+        let op = cn.op
+        if op == ast.AT_ADD_CONSTRAINT {
+            let con = ast.child(a, cmd, 0)
+            let cop = a.nodes[con].op
+            if cop == ast.CONSTR_PRIMARY_KEY || cop == ast.CONSTR_UNIQUE {
+                let cols: List<Integer> = []
+                for c in ast.items(a, ast.child(a, con, 1)) {
+                    let ci = tb.columnIndex(t, a.nodes[c].text)
+                    if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[c].text + "\" named in key does not exist", 0) }
+                    cols.add(ci)
+                }
+                let primary = cop == ast.CONSTR_PRIMARY_KEY
+                if primary && t.pkCols.length > 0 {
+                    return errOut(s, "42P16", "multiple primary keys for table \"" + tname + "\" are not allowed", 0)
+                }
+                let nm = a.nodes[con].text
+                if nm == "" {
+                    if primary { nm = tname + "_pkey" } else {
+                        nm = tname
+                        for ci in cols { nm = nm + "_" + t.cols[ci].name }
+                        nm = nm + "_key"
+                    }
+                }
+                let wantOrd = v.isTextType(t.cols[cols[0]].type) || cols.length > 1
+                if !cat.addIndex(e.c, t, nm, cols, true, primary, true, wantOrd) {
+                    return errOut(s, "23505", "could not create unique index \"" + nm + "\"", 0)
+                }
+                e.c.conNames.add(nm)
+            } else if cop == ast.CONSTR_FOREIGN_KEY {
+                let fs = fkResolve(e, a, con, -1, t, "", t.pkCols, [])
+                if fs.err != "" { return fkErr(s, fs.err) }
+                let err = fkm.define(e.c, t, fs.name, fs.childCols, e.c.tables[fs.parentId], fs.parentCols, fs.onDelete, fs.onUpdate, fs.deferrable, fs.deferred, false)
+                if err != "" { return fkErr(s, err) }
+                if !e.replaying && (a.nodes[con].flags & ast.F_NOT_VALID) == 0 {
+                    let me = -1
+                    if s.txSlot >= 0 { me = e.tm.txns[s.txSlot].slot }
+                    let blockedBy: List<Integer> = [-1]
+                    let verr = fkm.validate(e.c, e.tm, me, e.c.fks.length - 1, blockedBy)
+                    if verr != "" || blockedBy[0] >= 0 {
+                        fkm.undefineLast(e.c)
+                        if blockedBy[0] >= 0 { return errOut(s, "55P03", "could not validate foreign key: rows are locked by another transaction", 0) }
+                        return fkErr(s, verr)
+                    }
+                }
+            }
+        } else if op == ast.AT_DROP_CONSTRAINT {
+            let fi = fkm.findByName(e.c, t.id, cn.text)
+            if fi >= 0 {
+                cat.dropForeignKey(e.c, fi)
+            } else if cat.indexNameExists(e.c, cn.text) && isConName(e, cn.text) {
+                let deps = fkm.dependents(e.c, t.id)
+                for d in deps {
+                    let fk = e.c.fks[d]
+                    if fk.parentIdx >= 0 && e.c.hashIdx[fk.parentIdx].name == cn.text {
+                        return errOut(s, "2BP01", "cannot drop constraint " + cn.text + " on table " + displayName(t.name) + " because other objects depend on it", 0)
+                    }
+                }
+                dropIndex(e, cn.text)
+                if t.pkCols.length > 0 && cn.text == tname + "_pkey" { t.pkCols = [] }
+            }
+        } else if op == ast.AT_ADD_COLUMN {
+            for tt in alterTargets(e, nd, tid) {
+                let r0 = addColumnCmd(e, s, a, cmd, tt)
+                if r0.status == STATUS_ERROR { return r0 }
+            }
+        } else if op == ast.AT_DROP_COLUMN {
+            for tt in alterTargets(e, nd, tid) {
+                let r0 = dropColumn(e, s, tt, cn.text, (cn.flags & ast.F_IF_EXISTS) != 0)
+                if r0.status == STATUS_ERROR { return r0 }
+            }
+        } else if op == ast.AT_ATTACH_PARTITION {
+            let r0 = attachPartition(e, s, a, cmd, tid)
+            if r0.status == STATUS_ERROR { return r0 }
+        } else if op == ast.AT_DETACH_PARTITION {
+            let r0 = detachPartition(e, s, a, cmd, tid)
+            if r0.status == STATUS_ERROR { return r0 }
+        } else if op == ast.AT_SET_NOT_NULL {
+            let ci = tb.columnIndex(t, cn.text)
+            if ci >= 0 { t.cols[ci].notNull = true }
+        } else if op == ast.AT_DROP_NOT_NULL {
+            let ci = tb.columnIndex(t, cn.text)
+            if ci >= 0 { t.cols[ci].notNull = false }
+        } else if op == ast.AT_SET_DEFAULT {
+            let ci = tb.columnIndex(t, cn.text)
+            if ci >= 0 { defaultFromAst(a, t.cols[ci], ast.child(a, cmd, 0)) }
+        } else if op == ast.AT_DROP_DEFAULT {
+            let ci = tb.columnIndex(t, cn.text)
+            if ci >= 0 { t.cols[ci].defaultKind = 0 }
+        } else if op == ast.AT_RENAME_TABLE {
+            t.name = a.nodes[ast.child(a, cmd, 1)].text
+        } else if op == ast.AT_RENAME_COLUMN {
+            let ci = tb.columnIndex(t, cn.text)
+            if ci < 0 { return errOut(s, "42703", "column \"" + cn.text + "\" does not exist", 0) }
+            t.cols[ci].name = a.nodes[ast.child(a, cmd, 1)].text
+        } else if op == ast.AT_ALTER_COLUMN_TYPE {
+            return errOut(s, "0A000", "this ALTER TABLE form is not supported", 0)
+        }
+    }
+    return ddlDone(e, s, "ALTER TABLE", sql)
+}
+
+// ALTER TABLE ... ADD COLUMN on one table.
+function addColumnCmd(e: Engine, s: Session, a: ast.Ast, cmd: Integer, t: tb.Table): Outcome {
+    let def = ast.child(a, cmd, 0)
+    let tn = ast.child(a, def, 0)
+    let ty = pl.typeOfName(a.nodes[tn].text)
+    if ty < 0 { return errOut(s, "42704", "type \"" + a.nodes[tn].text + "\" does not exist", 0) }
+    let cname = a.nodes[def].text
+    if tb.columnIndex(t, cname) >= 0 {
+        if (a.nodes[cmd].flags & ast.F_IF_NOT_EXISTS) != 0 { return okTag(s, "") }
+        return errOut(s, "42701", "column \"" + cname + "\" of relation \"" + displayName(t.name) + "\" already exists", 0)
+    }
+    let ctm = typmodOf(a, tn, ty)
+    let cty = ty
+    if ty == v.T_NUMERIC { cty = v.numStorageType(ctm) }
+    let col = tb.newColumn(cname, cty, ctm, false)
+    for con in ast.items(a, ast.child(a, def, 1)) {
+        if a.nodes[con].op == ast.CONSTR_NOT_NULL { col.notNull = true }
+        if a.nodes[con].op == ast.CONSTR_DEFAULT { defaultFromAst(a, col, ast.child(a, con, 0)) }
+    }
+    tb.addColumn(t, col)
+    if col.defaultKind == 1 && t.nrows > 0 {
+        // fill existing rows with the default
+        let p = ex.newPlan(e.env)
+        let n = ex.addExpr(p, ex.EX_CONST, v.T_TEXT, 0, 0, 0, 0)
+        let b = Bytes(col.defaultText)
+        ex.setTextReg(p, n, b, 0, b.length)
+        let m = ex.addExpr(p, ex.EX_CONST, ty, 0, 0, 0, 0)
+        ex.parseInto(p, b, 0, b.length, false, m, ty, col.typmod, 0)
+        let r = 0
+        let ci = t.cols.length - 1
+        while r < t.nrows {
+            ex.storeCell(p, m, t.cols[ci], r)
+            r += 1
+        }
+    }
+    return okTag(s, "")
+}
+
+// Tables a column change applies to: the table and, for a partitioned table (without ONLY), its partitions.
+function alterTargets(e: Engine, nd: ast.Node, tid: Integer): List<tb.Table> {
+    let out: List<tb.Table> = [e.c.tables[tid]]
+    if (nd.flags & ast.F_ONLY) == 0 && pl.isPartitioned(e.views, e.c, tid) {
+        for d in pl.partDescendants(e.views, e.c, tid) { out.add(e.c.tables[d]) }
+    }
+    return out
+}
+
+function createTableAs(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let name = nd.text
+    if (nd.flags & ast.F_TEMP) != 0 { name = pl.tempName(e.env.session, name) }
+    if cat.findTable(e.c, name) >= 0 {
+        if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 { return okTag(s, "CREATE TABLE AS") }
+        return errOut(s, "42P07", "relation \"" + displayName(name) + "\" already exists", 0)
+    }
+    let q = ast.child(a, root, 2)
+    let st = pl.planStatement(e.c, e.views, e.env, a, q, sql, [])
+    if st.err { return errOut(s, st.errCode, st.errMsg, st.errPos + 1) }
+    if e.snapBox.length > 0 { ensureTables(e, st.tableIds) }
+    let t = tb.newTable(e.c.tables.length, name)
+    let names: List<Text> = []
+    for n in ast.items(a, ast.child(a, root, 1)) { names.add(a.nodes[n].text) }
+    let i = 0
+    while i < st.outExprs.length {
+        let nm = st.outNames[i]
+        if i < names.length { nm = names[i] }
+        let cty = st.outTypes[i]
+        if cty == v.T_NUMERIC { cty = v.T_NUMTEXT }
+        tb.addColumn(t, tb.newColumn(nm, cty, -1, false))
+        i += 1
+    }
+    e.c.tables.add(t)
+    if pl.isTempName(name) { e.env.tempCount += 1 }
+    e.c.version += 1
+    // log the DDL as an equivalent CREATE TABLE for replay, then the rows as inserts
+    let ddl = "CREATE TABLE " + quoteIdent(name) + " ("
+    i = 0
+    while i < t.cols.length {
+        if i > 0 { ddl = ddl + ", " }
+        ddl = ddl + quoteIdent(t.cols[i].name) + " " + sqlTypeName(t.cols[i].type)
+        i += 1
+    }
+    ddl = ddl + ")"
+    let lsn0 = 0
+    if s.inBlock && !e.replaying {
+        logDdlAuto(e, ddl)
+        pushUndo(e, s, UNDO_CREATED, t.id, name)
+    } else {
+        e.c.ddlLog.add(ddl)
+        if !e.replaying {
+            let tx = ensureTxn(e, s)
+            tx.redo.add(dml.R_DDL)
+            let b = Bytes(ddl)
+            tb.putVarint(tx.redo, b.length)
+            tx.redo.addBytes(b)
+        }
+    }
+    let count = 0
+    if (nd.flags & ast.F_WITH_NO_DATA) == 0 {
+        let tx = ensureTxn(e, s)
+        e.env.me = tx.slot
+        e.env.nowMicros = s.txStart
+        st.p.env = e.env
+        dml.resetForRun(st)
+        let p = st.p
+        ex.open(p, st.root)
+        while ex.next(p, st.root) {
+            let r = tb.reserveRow(t, 0)
+            i = 0
+            while i < st.outExprs.length {
+                ex.ev(p, st.outExprs[i])
+                ex.storeCell(p, st.outExprs[i], t.cols[i], r)
+                i += 1
+            }
+            if !e.replaying {
+                tx.redo.add(dml.R_INSERT)
+                tb.putVarint(tx.redo, t.id)
+                tb.putVarint(tx.redo, r)
+                tb.encodeRow(t, r, tx.redo)
+            }
+            count += 1
+        }
+        if p.err { return errOut(s, p.errCode, p.errMsg, 0) }
+    }
+    let o = okTag(s, "SELECT " + Text(count))
+    if !s.inBlock && s.txSlot >= 0 {
+        let tx = e.tm.txns[s.txSlot]
+        lsn0 = commitTxn(e, s, tx)
+    }
+    o.waitLsn = lsn0
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+function quoteIdent(n: Text): Text {
+    return "\"" + n + "\""
+}
+
+function sqlTypeName(t: Integer): Text {
+    if t == v.T_BOOL { return "boolean" }
+    if t == v.T_INT2 { return "smallint" }
+    if t == v.T_INT4 { return "integer" }
+    if t == v.T_INT8 { return "bigint" }
+    if t == v.T_FLOAT4 { return "real" }
+    if t == v.T_FLOAT8 { return "double precision" }
+    if t == v.T_NUMERIC || t == v.T_NUMTEXT { return "numeric" }
+    if t == v.T_VARCHAR { return "varchar" }
+    if t == v.T_BPCHAR { return "text" }
+    if t == v.T_DATE { return "date" }
+    if t == v.T_TIMESTAMP { return "timestamp" }
+    if t == v.T_TIMESTAMPTZ { return "timestamptz" }
+    if t == v.T_INTERVAL { return "interval" }
+    return "text"
+}
+
+// ---------------------------------------------------------------- COPY FROM STDIN
+
+function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
+    let nd = a.nodes[root]
+    if nd.op != ast.COPY_FROM || nd.intValue != ast.COPY_STDIO {
+        return errOut(s, "0A000", "only COPY ... FROM STDIN is supported", 0)
+    }
+    let tref = ast.child(a, root, 0)
+    if tref < 0 { return errOut(s, "0A000", "COPY (query) is not supported", 0) }
+    let tname = a.nodes[tref].text
+    let tid = relId(e, tname)
+    if tid < 0 { return errOut(s, "42P01", "relation \"" + tname + "\" does not exist", 0) }
+    let t = e.c.tables[tid]
+    s.copyTable = tid
+    s.copyCols = []
+    let cl = ast.child(a, root, 1)
+    if cl >= 0 {
+        for cn in ast.items(a, cl) {
+            let ci = tb.columnIndex(t, a.nodes[cn].text)
+            if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[cn].text + "\" of relation \"" + tname + "\" does not exist", 0) }
+            s.copyCols.add(ci)
+        }
+    } else {
+        let i = 0
+        while i < t.cols.length {
+            s.copyCols.add(i)
+            i += 1
+        }
+    }
+    s.copyCsv = false
+    s.copyDelim = 9
+    s.copyNull = Bytes("\\N")
+    s.copyHeader = false
+    for opt in ast.items(a, ast.child(a, root, 3)) {
+        let on = a.nodes[opt].text
+        let val = ast.child(a, opt, 0)
+        let vt = ""
+        if val >= 0 { vt = a.nodes[val].text }
+        if on == "format" && vt == "csv" {
+            s.copyCsv = true
+            s.copyDelim = 44
+            s.copyNull = Bytes("")
+        }
+        if on == "format" && vt == "binary" { return errOut(s, "0A000", "COPY BINARY is not supported", 0) }
+        if on == "delimiter" && vt != "" { s.copyDelim = Bytes(vt)[0] }
+        if on == "null" { s.copyNull = Bytes(vt) }
+        if on == "header" && vt != "false" && vt != "off" && vt != "0" { s.copyHeader = true }
+    }
+    // parse registers: one node per target column
+    let p = ex.newPlan(e.env)
+    let i = 0
+    while i < t.cols.length {
+        ex.addExpr(p, ex.EX_CONST, v.sqlType(t.cols[i].type), 0, 0, 0, 0)
+        ex.setNullReg(p, i)
+        i += 1
+    }
+    s.copyPlan = p
+    s.copyBuf = Bytes()
+    s.copyRows = 0
+    s.copyBulk = -1
+    s.copyErr = newOutcome()
+    s.copyImplicit = !s.inBlock
+    let tx = ensureTxn(e, s)
+    s.copyBulk = -1
+    let unusedTx = tx
+    let o = newOutcome()
+    o.status = STATUS_COPY_IN
+    o.copyColumns = s.copyCols.length
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+public function copyData(e: Engine, s: Session, data: Bytes) {
+    if s.copyTable < 0 || s.copyErr.status == STATUS_ERROR { return }
+    let buf = s.copyBuf
+    buf.addBytes(data)
+    let start = 0
+    let n = buf.length
+    let i = 0
+    while i < n {
+        if buf[i] == 10 {
+            copyLine(e, s, buf, start, i)
+            if s.copyErr.status == STATUS_ERROR { return }
+            start = i + 1
+        }
+        i += 1
+    }
+    if start > 0 {
+        s.copyBuf = buf.slice(start, n)
+    }
+    let tx = e.tm.txns[s.txSlot]
+    maybeSpill(e, s, tx)
+}
+
+function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer) {
+    let e0 = end
+    if e0 > start && b[e0 - 1] == 13 { e0 -= 1 }
+    if e0 - start == 2 && b[start] == 92 && b[start + 1] == 46 { return }
+    if s.copyHeader {
+        s.copyHeader = false
+        return
+    }
+    let t = e.c.tables[s.copyTable]
+    let p = s.copyPlan
+    let tx = e.tm.txns[s.txSlot]
+    let nc = t.cols.length
+    // defaults for columns not listed: NULL
+    let i = 0
+    while i < nc {
+        ex.setNullReg(p, i)
+        i += 1
+    }
+    let field = 0
+    let pos = start
+    let delim = s.copyDelim
+    while pos <= e0 && field < s.copyCols.length {
+        // find field end
+        let fe = pos
+        let unq = s.copyNull
+        let simple = true
+        if s.copyCsv && fe < e0 && b[fe] == 34 {
+            simple = false
+            unq = Bytes()
+            fe += 1
+            while fe < e0 {
+                if b[fe] == 34 {
+                    if fe + 1 < e0 && b[fe + 1] == 34 {
+                        unq.add(34)
+                        fe += 2
+                        continue
+                    }
+                    fe += 1
+                    break
+                }
+                unq.add(b[fe])
+                fe += 1
+            }
+            while fe < e0 && b[fe] != delim { fe += 1 }
+        } else {
+            while fe < e0 && b[fe] != delim {
+                if b[fe] == 92 && !s.copyCsv { simple = false }
+                fe += 1
+            }
+        }
+        let ci = s.copyCols[field]
+        let fb = b
+        let fo = pos
+        let fl = fe - pos
+        // text format compares the raw field (before backslash processing) with the null string, so \N is NULL;
+        // in CSV a quoted field is never NULL
+        let isNull = v.equalBytes(b, pos, fe - pos, s.copyNull, 0, s.copyNull.length) && (simple || !s.copyCsv)
+        if !simple && !s.copyCsv {
+            unq = unescapeCopy(b, pos, fe)
+        }
+        if !simple {
+            fb = unq
+            fo = 0
+            fl = unq.length
+        }
+        if isNull {
+            ex.setNullReg(p, ci)
+        } else {
+            ex.parseInto(p, fb, fo, fl, false, ci, t.cols[ci].type, t.cols[ci].typmod, 0)
+            if p.err {
+                s.copyErr = errOut(s, p.errCode, p.errMsg + ", COPY " + t.name + ", line " + Text(s.copyRows + 1), 0)
+                ex.clearError(p)
+                return
+            }
+            if !simple {
+                // value must outlive the temporary buffer
+                if ex.classOf(v.sqlType(t.cols[ci].type)) == ex.CL_TEXT {
+                    let own = Bytes()
+                    own.addBytes(unq)
+                    ex.setTextReg(p, ci, own, 0, own.length)
+                }
+            }
+        }
+        field += 1
+        pos = fe + 1
+    }
+    if field < s.copyCols.length {
+        s.copyErr = errOut(s, "22P04", "missing data for column \"" + t.cols[s.copyCols[field]].name + "\"", 0)
+        return
+    }
+    if pos <= e0 {
+        s.copyErr = errOut(s, "22P04", "extra data after last expected column", 0)
+        return
+    }
+    i = 0
+    while i < nc {
+        if t.cols[i].notNull && p.rNull[i] != 0 {
+            s.copyErr = errOut(s, "23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + t.name + "\" violates not-null constraint", 0)
+            return
+        }
+        i += 1
+    }
+    let r = tb.reserveRow(t, tb.ST_DEAD + tb.ST_NEW)
+    i = 0
+    while i < nc {
+        ex.storeCell(p, i, t.cols[i], r)
+        i += 1
+    }
+    if s.copyBulk < 0 {
+        s.copyBulk = tx.uCount
+        txn.addBulkUndo(tx, t, r, r + 1)
+    } else {
+        txn.extendBulkUndo(tx, s.copyBulk, r + 1)
+    }
+    if t.hashIds.length > 0 || t.ordIds.length > 0 { cat.indexInsertRow(e.c, t, r) }
+    tx.redo.add(dml.R_INSERT)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    tb.encodeRow(t, r, tx.redo)
+    s.copyRows += 1
+}
+
+function unescapeCopy(b: Bytes, start: Integer, end: Integer): Bytes {
+    let out = Bytes()
+    let i = start
+    while i < end {
+        let c = b[i]
+        if c == 92 && i + 1 < end {
+            let d = b[i + 1]
+            if d == 116 { out.add(9) }
+            else if d == 110 { out.add(10) }
+            else if d == 114 { out.add(13) }
+            else if d == 98 { out.add(8) }
+            else if d == 102 { out.add(12) }
+            else if d == 118 { out.add(11) }
+            else { out.add(d) }
+            i += 2
+        } else {
+            out.add(c)
+            i += 1
+        }
+    }
+    return out
+}
+
+public function copyDone(e: Engine, s: Session): Outcome {
+    if s.copyTable >= 0 && s.copyErr.status != STATUS_ERROR && s.copyBuf.length > 0 {
+        copyLine(e, s, s.copyBuf, 0, s.copyBuf.length)
+    }
+    let failed = s.copyErr
+    // foreign keys of the loaded rows (the bulk undo entry onwards)
+    if failed.status != STATUS_ERROR && s.copyBulk >= 0 && e.c.nLiveFks > 0 && s.txSlot >= 0 && !e.replaying {
+        let tx = e.tm.txns[s.txSlot]
+        let p = s.copyPlan
+        ex.clearError(p)
+        fkm.afterStatement(e.c, e.tm, tx, p, s.copyBulk, -1, [])
+        if p.err {
+            failed = errOut(s, p.errCode, p.errMsg, 0)
+            failed.detail = p.errDetail
+        } else if p.blockedBy >= 0 {
+            failed = errOut(s, "55P03", "COPY cannot wait for a row locked by another transaction (foreign key check)", 0)
+        }
+        ex.clearError(p)
+    }
+    endCopy(e, s)
+    if failed.status == STATUS_ERROR {
+        let o = failed
+        failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    let o = okTag(s, "COPY " + Text(s.copyRows))
+    if !s.inBlock && s.txSlot >= 0 {
+        let tx = e.tm.txns[s.txSlot]
+        o.waitLsn = commitTxn(e, s, tx)
+    }
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+public function copyFail(e: Engine, s: Session, message: Text): Outcome {
+    endCopy(e, s)
+    let o = errOut(s, "57014", "COPY from stdin failed: " + message, 0)
+    failStatement(e, s)
+    o.txnStatus = txnStatus(s)
+    return o
+}
+
+// ---------------------------------------------------------------- checkpoint / snapshot
+
+// Chunk 0 = catalog: [2][ddl count][ddl...][ntables][per table: serial, hasData]. Chunk 1 + k = table k
+// (empty for dropped tables), so a table not yet decoded is copied byte for byte from the old snapshot.
+// A transaction that spilled 'P' records before the snapshot LSN would lose them on recovery: wait for it.
+function checkpointBlocked(e: Engine): Boolean {
+    for t in e.tm.txns {
+        if t.state == txn.TX_ACTIVE && t.redo.length > 0 && t.redo[0] == 80 { return true }
+    }
+    return false
+}
+
+// Format v3 (ADR-010): the manifest is a snapshot file whose chunk 0 is the catalog and chunk 1 + k the descriptor
+// of table k (empty when dropped); table data lives in data.db. M3: a checkpoint is captured at LSN S in one short
+// step and then written in slices of about 1 ms (afterLoopIteration, tick); statements keep running in between.
+
+// Start a checkpoint at the current end of the WAL unless one is running. False if none could start (a transaction
+// with spilled redo is active: its 'P' records below S would be lost).
+function ckptBegin(e: Engine): Boolean {
+    if e.ck.active || e.pubPhase > 0 { return e.ck.active }
+    if !e.hasWal || checkpointBlocked(e) { return false }
+    e.lastCkptMs = dbio.monotonicNanos() / 1000000
+    let st = e.st
+    if e.snapVersion == 2 {
+        // one-time upgrade: tables still in a round-1 (format 2) snapshot are decoded first
+        for t in e.c.tables {
+            if t.chunk >= 0 && !cat.isDropped(t) { ensureLoaded(e, t.id, true) }
+        }
+    }
+    // every image must be known: unloaded tables carry theirs over, and the allocator needs all extents
+    for t in e.c.tables {
+        if t.chunk >= 0 && !cat.isDropped(t) { imageOf(e, t.id, t.chunk) }
+    }
+    persist.initAllocator(st, otherManifestImages(e))
+    persist.begin(st, e.ck, e.c, e.tm, e.committing, wal.appendedLsn(e.walBox[0]), catalogChunk(e))
+    return true
+}
+
+// Advance the running checkpoint for about budgetNs; publishes it when its pieces are durable and verified.
+function ckptStep(e: Engine, budgetNs: Integer) {
+    if e.pubPhase > 0 {
+        pubStep(e, false)
+        return
+    }
+    if !e.ck.active { return }
+    if persist.step(e.st, e.ck, budgetNs) { pubStart(e) }
+}
+
+// Publishing (ADR-012) runs in short steps too: the manifest goes into the slot file that does not hold the
+// current manifest, its fdatasync runs on a background syncer, then it is re-read and verified; only then are the
+// replaced images' extents freed and the WAL below the checkpoint retired. No rename, no directory fsync.
+function pubStart(e: Engine) {
+    let t0 = dbio.monotonicNanos()
+    let lsn = e.ck.lsn
+    let chunks: List<Bytes> = [e.ck.catalog]
+    for d in persist.finish(e.st, e.ck) { chunks.add(d) }
+    e.pubBytes = snapshot.encodeManifest(lsn, chunks)
+    e.pubLsn = lsn
+    e.pubPhase = 1
+    pubTime(e, t0)
+    pubStep(e, false)
+}
+
+function pubTime(e: Engine, t0: Integer) {
+    let us = (dbio.monotonicNanos() - t0) / 1000
+    if us > e.ckptPublishUs { e.ckptPublishUs = us }
+}
+
+function pubStep(e: Engine, blocking: Boolean) {
+    let t0 = dbio.monotonicNanos()
+    let w = e.walBox[0]
+    if e.pubPhase == 1 {
+        // the WAL must be durable up to the manifest's LSN before the manifest can be
+        if wal.durableLsn(w) < e.pubLsn {
+            if !blocking {
+                wal.requestSync(w)
+                pubTime(e, t0)
+                return
+            }
+            wal.syncNow(w)
+            e.durable = wal.durableLsn(w)
+            releaseDurable(e, e.durable)
+        }
+        let k = 0
+        if e.curSlot == 0 { k = 1 }
+        e.pubSlot = k
+        e.pubFd = snapshot.writeSlot(e.dataDir, k, e.pubBytes)
+        e.pubSyncer = dbio.syncerStart(e.pubFd)
+        if e.pubSyncer < 0 { fail("storage: start manifest syncer: " + dbio.errorText(e.pubSyncer)) }
+        dbio.syncerRequest(e.pubSyncer, 1)
+        e.pubPhase = 2
+        pubTime(e, t0)
+        if !blocking { return }
+    }
+    if e.pubPhase == 2 {
+        if blocking {
+            let r = dbio.syncerWait(e.pubSyncer, 1, -1)
+            if r < 0 { fail("storage: manifest fdatasync: " + dbio.errorText(r)) }
+        } else {
+            let err = dbio.syncerError(e.pubSyncer)
+            if err != 0 { fail("storage: manifest fdatasync: " + dbio.errorText(err)) }
+            if dbio.syncerSyncedOffset(e.pubSyncer) < 1 {
+                pubTime(e, t0)
+                return
+            }
+        }
+        dbio.syncerStop(e.pubSyncer)
+        dbio.close(e.pubFd)
+        e.pubSyncer = 0
+        e.pubFd = -1
+        e.pubPhase = 0
+        e.pubBytes = Bytes()
+        pubDone(e)
+        pubTime(e, t0)
+        if e.ckptWanted > e.ckptGen { ckptBegin(e) }
+    }
+}
+
+function pubDone(e: Engine) {
+    let w = e.walBox[0]
+    let st = e.st
+    let lsn = e.pubLsn
+    if snapshot.verifySlot(e.dataDir, e.pubSlot, lsn) {
+        e.curSlot = e.pubSlot
+        // unloaded tables' images are carried in the new manifest: unpin the old one
+        if e.snapBox.length > 0 {
+            snapshot.release(e.snapBox[0], w)
+            e.snapBox = []
+        }
+        snapshot.slotRetention(e.dataDir, lsn, w)
+        persist.commit(st)          // extents only the replaced images used are free now
+    } else {
+        persist.abandon(st, e.c)    // the previous manifest (other slot) stays current: so do its extents
+        print("neo-db: checkpoint at " + Text(lsn) + " abandoned: manifest slot did not verify")
+    }
+    e.snapVersion = 3
+    if unloadedCount(e) > 0 && e.snapBox.length == 0 {
+        let o2 = snapshot.openLatest(e.dataDir)
+        if o2.found {
+            snapshot.pin(o2, w)
+            e.snapBox.add(o2)
+        }
+    }
+    e.ckptLsn = lsn
+    e.lastCkptTick = e.ticks
+    e.ckptGen += 1
+    e.tm.lockEpoch += 1             // wake sessions parked in CHECKPOINT
+    e.durable = wal.durableLsn(w)
+    releaseDurable(e, e.durable)
+}
+
+// Blocking checkpoint (close, shutdown): finish the running one, then one at the current end of the WAL.
+function checkpoint(e: Engine) {
+    finishCheckpoint(e)
+    if !ckptBegin(e) { return }
+    finishCheckpoint(e)
+}
+
+function finishCheckpoint(e: Engine) {
+    while e.ck.active || e.pubPhase > 0 {
+        if e.pubPhase > 0 { pubStep(e, true) } else { ckptStep(e, 1000000000) }
+    }
+}
+
+// The server keeps polling (no epoll sleep) while this is true, so slices run back to back when idle.
+public function backgroundPending(e: Engine): Boolean { return e.ck.active || e.pubPhase > 0 }
+
+// Chunk 0 (format 3): [3][ddl count][ddl...][ntables][per table: serial, has image][hash fingerprint i64].
+function catalogChunk(e: Engine): Bytes {
+    let b = Bytes()
+    b.add(3)
+    tb.putVarint(b, e.c.ddlLog.length)
+    for d in e.c.ddlLog {
+        let x = Bytes(d)
+        tb.putVarint(b, x.length)
+        b.addBytes(x)
+    }
+    tb.putVarint(b, e.c.tables.length)
+    for t in e.c.tables {
+        tb.putVarint(b, t.serial)
+        if cat.isDropped(t) { b.add(0) } else { b.add(1) }
+    }
+    b.addInt64(persist.fingerprint())
+    return b
+}
+
+// Table images of manifests other than the newest that are still on disk (kept as a fallback when a newer one
+// failed verification): their extents stay allocated. Normally there are none.
+function otherManifestImages(e: Engine): List<persist.TableImage> {
+    let out: List<persist.TableImage> = []
+    if df.isReady(persist.dataFile(e.st)) || e.dataDir == "" { return out }
+    let newest = -1
+    if e.snapBox.length > 0 { newest = e.snapBox[0].lsn }
+    for name in dbio.listDir(e.dataDir) {
+        let b = Bytes(name)
+        if b.length == 24 && Text(b.slice(0, 5)) == "snap-" && Text(b.slice(21, 24)) == ".db" {
+            let o = snapshot.openLatestIn(e.dataDir, [name])
+            if o.found && o.lsn != newest && o.chunkCount > 0 {
+                let c0 = snapshot.readChunk(o, 0)
+                if c0.length > 0 && c0[0] == 3 {
+                    let k = 1
+                    while k < o.chunkCount {
+                        out.add(persist.decodeDescriptor(snapshot.readChunk(o, k)))
+                        k += 1
+                    }
+                }
+            }
+            snapshot.close(o)
+        }
+    }
+    return out
+}
+
+function loadCatalog(e: Engine, b: Bytes) {
+    e.snapVersion = b[0]
+    if e.snapVersion != 2 && e.snapVersion != 3 { fail("storage: unknown catalog format " + Text(b[0])) }
+    let cur = tb.Cursor { pos: 1 }
+    let nd = tb.getVarint(b, cur)
+    let i = 0
+    while i < nd {
+        let len = tb.getVarint(b, cur)
+        let sql = Text(b.slice(cur.pos, cur.pos + len))
+        cur.pos += len
+        runDdlText(e, sql)
+        i += 1
+    }
+    let ntab = tb.getVarint(b, cur)
+    i = 0
+    while i < ntab {
+        let serial = tb.getVarint(b, cur)
+        let has = b[cur.pos]
+        cur.pos += 1
+        if i < e.c.tables.length {
+            let t = e.c.tables[i]
+            t.serial = serial
+            if has == 1 && !cat.isDropped(t) { t.chunk = i + 1 }
+        }
+        i += 1
+    }
+    if e.snapVersion == 3 { e.st.fingerprintOk = cur.pos + 8 <= b.length && b.getInt64(cur.pos) == persist.fingerprint() }
+}

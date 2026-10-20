@@ -229,7 +229,10 @@ static void rc_drop(void *value) {
     if (text_backing) rc_drop(text_backing);
 }
 
-void minyar_rc_release(void *value) {
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void rc_release_slow(void *value) {
     rc_drop(value);
     /* Iterative destruction: releasing a deep graph never recurses in C. */
     while (rc_pending_count) {
@@ -252,6 +255,20 @@ void minyar_rc_release(void *value) {
         RC_ACCOUNT(rc_object_count--);
         free(object);
     }
+}
+
+/* Public NULL requests and pending destruction retain the full drain path. */
+MINYAR_INLINE_ENTRY void minyar_rc_release(void *value) {
+    if (value && !rc_pending_count) {
+        RcObject *object = (RcObject *)value - 1;
+        size_t ownership = object->ownership;
+        if (ownership < 8) return;
+        if (ownership >= 16) {
+            object->ownership = ownership - 8;
+            return;
+        }
+    }
+    rc_release_slow(value);
 }
 
 #endif

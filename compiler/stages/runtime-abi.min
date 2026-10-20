@@ -1,41 +1,140 @@
 function appendRuntimeHelpers(output: List<Text>) {
     output.add("
+; Checked inline Bytes accesses. ABI prefix: { data pointer, byte length }.
+; Visible length is nonnegative, including for shifted C-layout views.
+define internal i64 @.minyar.bytes.length(ptr %bytes) alwaysinline {
+entry:
+  %length.pointer = getelementptr inbounds { ptr, i64 }, ptr %bytes, i32 0, i32 1
+  %length = load i64, ptr %length.pointer, !range !{i64 0, i64 -9223372036854775808}
+  ret i64 %length
+}
+define internal i64 @.minyar.bytes.get.checked(ptr %bytes, i64 %position) alwaysinline {
+entry:
+  %length = call i64 @.minyar.bytes.length(ptr %bytes)
+  %get.valid = icmp ult i64 %position, %length
+  br i1 %get.valid, label %good, label %bad
+good:
+  %data = load ptr, ptr %bytes
+  %slot = getelementptr inbounds i8, ptr %data, i64 %position
+  %byte = load i8, ptr %slot
+  %value = zext i8 %byte to i64
+  ret i64 %value
+bad:
+  call i64 @minyar_bytes_get(ptr %bytes, i64 %position)
+  unreachable
+}
+define internal void @.minyar.bytes.set.checked(ptr %bytes, i64 %position, i64 %value) alwaysinline {
+entry:
+  %length = call i64 @.minyar.bytes.length(ptr %bytes)
+  %position.valid = icmp ult i64 %position, %length
+  %value.valid = icmp ult i64 %value, 256
+  %set.valid = and i1 %position.valid, %value.valid
+  br i1 %set.valid, label %good, label %bad
+good:
+  %data = load ptr, ptr %bytes
+  %slot = getelementptr inbounds i8, ptr %data, i64 %position
+  %byte = trunc i64 %value to i8
+  store i8 %byte, ptr %slot
+  ret void
+bad:
+  call void @minyar_bytes_set(ptr %bytes, i64 %position, i64 %value)
+  unreachable
+}
+
+; Appends within existing capacity. Bytes keeps its capacity in the third
+; header word; C-layout views store a negative capacity and never take this
+; path. Growth, views and invalid values use the runtime's exact behavior.
+define internal void @.minyar.bytes.add.checked(ptr %bytes, i64 %value) alwaysinline {
+entry:
+  %length.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %bytes, i32 0, i32 1
+  %length = load i64, ptr %length.pointer, !range !{i64 0, i64 -9223372036854775808}
+  %capacity.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %bytes, i32 0, i32 2
+  %capacity = load i64, ptr %capacity.pointer
+  %room = icmp slt i64 %length, %capacity
+  %value.valid = icmp ult i64 %value, 256
+  %add.valid = and i1 %room, %value.valid
+  br i1 %add.valid, label %good, label %bad
+good:
+  %data = load ptr, ptr %bytes
+  %slot = getelementptr inbounds i8, ptr %data, i64 %length
+  %byte = trunc i64 %value to i8
+  store i8 %byte, ptr %slot
+  %next = add nuw nsw i64 %length, 1
+  store i64 %next, ptr %length.pointer
+  ret void
+bad:
+  call void @minyar_bytes_add(ptr %bytes, i64 %value)
+  ret void
+}
+
 ; Checked inline List accesses. ABI: { values pointer, length, capacity }.
+; Length is nonnegative; checked slots stay within the values allocation.
 define internal i64 @.minyar.list.get.checked(ptr %list, i64 %position) alwaysinline {
 entry:
-  %length.pointer = getelementptr { ptr, i64, i64 }, ptr %list, i32 0, i32 1
-  %length = load i64, ptr %length.pointer
+  %length.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %list, i32 0, i32 1
+  %length = load i64, ptr %length.pointer, !range !{i64 0, i64 -9223372036854775808}
   %get.valid = icmp ult i64 %position, %length
   br i1 %get.valid, label %good, label %bad
 good:
   %values = load ptr, ptr %list
-  %slot = getelementptr i64, ptr %values, i64 %position
+  %slot = getelementptr inbounds i64, ptr %values, i64 %position
   %value = load i64, ptr %slot
   ret i64 %value
 bad:
-  %fallback = call i64 @minyar_list_get(ptr %list, i64 %position)
-  ret i64 %fallback
+  call i64 @minyar_list_get(ptr %list, i64 %position)
+  unreachable
 }
 define internal void @.minyar.list.set.scalar.checked(ptr %list, i64 %position, i64 %value) alwaysinline {
 entry:
-  %length.pointer = getelementptr { ptr, i64, i64 }, ptr %list, i32 0, i32 1
-  %length = load i64, ptr %length.pointer
+  %length.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %list, i32 0, i32 1
+  %length = load i64, ptr %length.pointer, !range !{i64 0, i64 -9223372036854775808}
   %set.valid = icmp ult i64 %position, %length
   br i1 %set.valid, label %good, label %bad
 good:
   %values = load ptr, ptr %list
-  %slot = getelementptr i64, ptr %values, i64 %position
+  %slot = getelementptr inbounds i64, ptr %values, i64 %position
   store i64 %value, ptr %slot
   ret void
 bad:
   call void @minyar_list_set(ptr %list, i64 %position, i64 %value)
+  unreachable
+}
+
+; Checked inline record fields. ABI: { length, values[] } in every runtime
+; profile. Records never grow; fields stay within the record allocation.
+define internal i64 @.minyar.record.get.checked(ptr %record, i64 %field) alwaysinline {
+entry:
+  %length = load i64, ptr %record, !range !{i64 0, i64 -9223372036854775808}
+  %get.valid = icmp ult i64 %field, %length
+  br i1 %get.valid, label %good, label %bad
+good:
+  %values = getelementptr inbounds i8, ptr %record, i64 8
+  %slot = getelementptr inbounds i64, ptr %values, i64 %field
+  %value = load i64, ptr %slot
+  ret i64 %value
+bad:
+  call i64 @minyar_record_get(ptr %record, i64 %field)
+  unreachable
+}
+define internal void @.minyar.record.set.scalar.checked(ptr %record, i64 %field, i64 %value) alwaysinline {
+entry:
+  %length = load i64, ptr %record, !range !{i64 0, i64 -9223372036854775808}
+  %set.valid = icmp ult i64 %field, %length
+  br i1 %set.valid, label %good, label %bad
+good:
+  %values = getelementptr inbounds i8, ptr %record, i64 8
+  %slot = getelementptr inbounds i64, ptr %values, i64 %field
+  store i64 %value, ptr %slot
   ret void
+bad:
+  call void @minyar_record_set_scalar(ptr %record, i64 %field, i64 %value)
+  unreachable
 }
 
 define internal i64 @.minyar.list.length(ptr %list) alwaysinline {
 entry:
-  %pointer = getelementptr { ptr, i64, i64 }, ptr %list, i32 0, i32 1
-  %length = load i64, ptr %pointer
+  %pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %list, i32 0, i32 1
+  %length = load i64, ptr %pointer, !range !{i64 0, i64 -9223372036854775808}
   ret i64 %length
 }
 
@@ -191,7 +290,7 @@ declare void @minyar_record_append_text(ptr, i64, ptr, ptr)
 declare i64 @minyar_bytes_get(ptr, i64)
 declare void @minyar_bytes_set(ptr, i64, i64)
 declare i64 @minyar_bytes_length(ptr)
-declare ptr @minyar_bytes_new(i64)
+declare nonnull ptr @minyar_bytes_new(i64)
 declare ptr @minyar_text_bytes(ptr)
 declare ptr @minyar_bytes_text(ptr)
 declare void @minyar_bytes_resize(ptr, i64)
@@ -242,7 +341,7 @@ declare ptr @minyar_integer_text(i64)
 declare ptr @minyar_character_text(i32)
 declare ptr @minyar_boolean_text(i1 zeroext)
 declare void @minyar_initialize_arguments(i32, ptr)
-declare ptr @minyar_list_new()
+declare nonnull ptr @minyar_list_new()
 declare void @minyar_list_references(ptr)
 declare void @minyar_list_add(ptr, i64)
 declare void @minyar_list_append_scalars(ptr, ptr, i64)
@@ -253,8 +352,8 @@ declare void @minyar_list_set(ptr, i64, i64)
 declare void @minyar_list_set_take(ptr, i64, i64)
 declare ptr @minyar_list_appended(ptr, i64, i64, i64)
 declare ptr @minyar_list_appended_take(ptr, i64, i64, i64)
-declare ptr @minyar_record_new(i64)
-declare ptr @minyar_record_new_scalar(i64)
+declare nonnull ptr @minyar_record_new(i64)
+declare nonnull ptr @minyar_record_new_scalar(i64)
 declare i64 @minyar_record_get(ptr, i64)
 declare void @minyar_record_set(ptr, i64, i64)
 declare void @minyar_record_set_scalar(ptr, i64, i64)
@@ -270,6 +369,7 @@ declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)
 
 ")
     appendRuntimeHelpers(output)
+    appendTypedByteHelpers(output)
 }
 
 function appendLiteralDeclarations(output: List<Text>, tokenKinds: List<Integer>, tokenTexts: List<Text>, prefix: Text, threaded: Boolean) {

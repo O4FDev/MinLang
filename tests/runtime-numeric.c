@@ -56,7 +56,8 @@ static void bounded_output(void) {
         assert(!strcmp(scientific, decimal_transitions[index].expected));
     }
     const double values[] = {
-        0.0, -0.0, 42.0, -42.0, 0.1, 1e-8, 1e21, from_bits(UINT64_C(1)), INFINITY, -INFINITY, NAN};
+        0.0, -0.0, 42.0, -42.0, 9007199254740991.0, -9007199254740991.0,
+        0.1, 1e-8, 1e21, from_bits(UINT64_C(1)), INFINITY, -INFINITY, NAN};
     for (size_t index = 0; index < sizeof(values) / sizeof(*values); index++) {
         char full[48];
         size_t length = format_float(values[index], full, sizeof(full));
@@ -91,7 +92,7 @@ static void exact_integer_budget(void) {
            parse_calls);
     fflush(stdout);
     assert(parse_calls == 0);
-    assert(format_calls <= 2001);
+    assert(format_calls == 0);
 }
 
 static void benchmark(const char *kind, unsigned repetitions) {

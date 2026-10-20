@@ -3,8 +3,32 @@ use "io" as io
 use "system" as system
 use "files" as files
 use "./frontend-fixtures.min" as fixtures
+use "./release-support.min" as arguments
+
+function optimization(command: List<Text>, level: Text, defaults: List<Text>) {
+    if level != "LTO" { command.add(level); return }
+    command.add("-O2")
+    command.add("-flto=thin")
+    for flag in defaults { command.add(flag) }
+    for flag in arguments.shellWords(test.setting("MINYAR_TEST_LTO_FLAGS", "")) {
+        test.check(flag != "-fno-lto", "runtime diagnostic LTO flags cannot disable LTO")
+        command.add(flag)
+    }
+}
+
 record Stop { name: Text; body: Text; imports: Text; message: Text; native: Boolean }
 let compiler = test.compiler()
+let ltoFlags: List<Text> = []
+let platform = test.run(["uname", "-s"], system.environment(), "", compiler.directory + "/platform", 10)
+test.require(platform, "runtime diagnostics platform")
+if test.contains(platform.output, "Linux") {
+    let linker = test.run([compiler.clang, "-print-prog-name=ld.lld"], system.environment(), "", compiler.directory + "/linker", 10)
+    test.require(linker, "runtime diagnostics ThinLTO linker")
+    let names = test.lines(linker.output)
+    test.check(names.length > 0 && names[0] != "", "runtime diagnostics need Clang's matching LLD")
+    ltoFlags.add("-fuse-ld=" + names[0])
+    ltoFlags.add("-Wl,--threads=1")
+}
 let stops = [
     Stop { name: "fail"; body: "fail(\"The harbour has no light.\")"; imports: ""; message: "The harbour has no light."; native: false },
     Stop { name: "bounds"; body: "let lights = [1]; return lights[2]"; imports: ""; message: "List position 2 is outside its length of 1."; native: false },
@@ -18,18 +42,23 @@ let stops = [
 ]
 let sample = "Minyar stopped: a quiet harbour\nMinyar stack trace:\n  at portrait (harbour.min:2:10)\n"
 test.check(test.runtimeDiagnostic(sample) == "Minyar stopped: a quiet harbour\n", "validated stack suffix preserves the complete message")
-for invalid in [sample + "extra stderr\n", test.replace(sample, ":2:10", ":0:10"), test.replace(sample, ":2:10", ":2:no"), test.replace(sample, "  at portrait", "arbitrary"), test.replace(sample, "portrait", ""), test.replace(sample, "harbour.min", "") ] {
+let excerptSample = sample + "    | function portrait(): Integer {\n"
+test.check(test.runtimeDiagnostic(excerptSample) == "Minyar stopped: a quiet harbour\n", "validated source excerpt preserves the complete message")
+let longLine = ""
+for index in 0..161 { longLine += "灯" }
+for invalid in [sample + "extra stderr\n", test.replace(sample, ":2:10", ":0:10"), test.replace(sample, ":2:10", ":2:no"), test.replace(sample, "  at portrait", "arbitrary"), test.replace(sample, "portrait", ""), test.replace(sample, "harbour.min", ""), excerptSample + "    | duplicate\n", sample + "    | \n", sample + "    | " + longLine + "\n", sample + "    | " + Text(Character(27)) + "\n", test.replace(excerptSample, "  at portrait (harbour.min:2:10)\n", "") ] {
     test.check(test.runtimeDiagnostic(invalid) == invalid, "stack projection must reject malformed or extra stderr")
 }
 for item in stops {
     let source = item.imports + "function darkWindow(): Integer {\n    " + item.body + "\n}\nfunction evening(): Integer {\n    return darkWindow()\n}\nprint(evening())\n"
     test.require(test.compile(compiler, source), "compile runtime stop " + item.name)
     let path = compiler.directory + "/case" + Text(compiler.serial)
+    if item.name == "fail" { test.check(files.remove(path + ".min") == 0, "source excerpt must survive removal of the original file") }
     let levels = ["-O0", "-O2"]
     if !test.addressEnabled(compiler.flags) { levels.add("LTO") }
     for level in levels {
         let command = [compiler.clang]
-        if level == "LTO" { command.add("-O2"); command.add("-flto=thin") } else { command.add(level) }
+        optimization(command, level, ltoFlags)
         for flag in compiler.flags { command.add(flag) }
         for part in ["-Wno-override-module", path + ".ll", compiler.runtime] { command.add(part) }
         if item.native { command.add("tests/diagnostics/runtime-native.c") }
@@ -40,12 +69,13 @@ for item in stops {
         test.check(result.status == 1 && result.output == "", "runtime stop status/stdout " + item.name)
         test.check(test.runtimeDiagnostic(result.errorOutput) == message && result.errorOutput != message, "runtime message and validated nonempty source trace " + item.name + " " + level + "\n" + result.errorOutput)
         test.check(test.contains(result.errorOutput, path + ".min:"), "trace keeps original user source " + item.name)
+        test.check(test.contains(result.errorOutput, "    | "), "trace embeds original source lines " + item.name + " " + level)
         test.check(!test.contains(result.errorOutput, ".minyar.fn.") && !test.contains(result.errorOutput, "minyar_module_"), "trace uses readable Minyar names")
         if level == "-O0" {
             for name in ["darkWindow", "evening", "top level"] { test.check(test.contains(result.errorOutput, "  at " + name + " ("), "unoptimized stop retains every Minyar caller " + item.name + " " + name + "\n" + result.errorOutput) }
         }
         if item.name == "fail" && level == "-O0" {
-            test.check(result.errorOutput == message + "Minyar stack trace:\n  at darkWindow (" + path + ".min:1:10)\n  at evening (" + path + ".min:4:10)\n  at top level (" + path + ".min:7:1)\n", "independent exact three-frame O0 source oracle")
+            test.check(result.errorOutput == message + "Minyar stack trace:\n  at darkWindow (" + path + ".min:1:10)\n    | function darkWindow(): Integer {\n  at evening (" + path + ".min:4:10)\n    | function evening(): Integer {\n  at top level (" + path + ".min:7:1)\n    | print(evening())\n", "independent exact three-frame O0 source oracle")
         }
     }
 }
@@ -68,7 +98,52 @@ for item in named {
     let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 10)
     test.check(result.status == 1 && result.output == "" && test.runtimeDiagnostic(result.errorOutput) == "Minyar stopped: The harbour has no light.\n", "named trace preserves complete failure")
     test.check(test.contains(result.errorOutput, "  at " + item.name + " ("), "readable original name " + item.name + "\n" + result.errorOutput)
-    if item.frames > 0 { test.check(test.lines(result.errorOutput).length == item.frames + 2, "recursion stops at exactly twelve trace frames") }
+    if item.frames > 0 {
+        let frames = 0
+        for row in test.lines(result.errorOutput) { if row.startsWith("  at ") { frames += 1 } }
+        test.check(frames == item.frames, "recursion stops at exactly twelve trace frames")
+    }
+}
+let parallelSource = "let output = Bytes(256)\nlet divisor = 0\nparallel for index in 0..256 {\n    output[index] = 0\n    if index == 128 { output[index] = 1 / divisor }\n}\n"
+test.require(test.compile(compiler, parallelSource), "compile outlined worker source trace")
+let parallelPath = compiler.directory + "/case" + Text(compiler.serial)
+test.check(files.remove(parallelPath + ".min") == 0, "worker source trace survives removal of the original file")
+let parallelLevels = ["-O0", "-O2"]
+if !test.addressEnabled(compiler.flags) { parallelLevels.add("LTO") }
+for level in parallelLevels {
+    let command = [compiler.clang]
+    optimization(command, level, ltoFlags)
+    for flag in compiler.flags { command.add(flag) }
+    for part in ["-Wno-override-module", parallelPath + ".ll", compiler.runtime, "-pthread", "-lm", "-o", parallelPath + ".exe"] { command.add(part) }
+    test.require(test.run(command, system.environment(), "", parallelPath + ".link", 60), "link outlined worker source trace " + level)
+    for threads in ["1", "2"] {
+        let environment: List<Text> = []
+        for entry in system.environment() { if !entry.startsWith("MINYAR_PARALLEL_THREADS=") { environment.add(entry) } }
+        environment.add("MINYAR_PARALLEL_THREADS=" + threads)
+        let result = test.run([parallelPath + ".exe"], environment, "", parallelPath + ".run", 10)
+        let message = "Minyar stopped: an Integer cannot be divided by zero.\n"
+        let firstFrame = "Minyar stack trace:\n  at parallel loop (" + parallelPath + ".min:3:1)\n    | parallel for index in 0..256 {\n"
+        test.check(result.status == 1 && result.output == "", "outlined worker preserves failure status/stdout " + level + " " + threads)
+        test.check(test.runtimeDiagnostic(result.errorOutput) == message, "outlined worker preserves its exact diagnostic and valid trace " + level + " " + threads + "\n" + result.errorOutput)
+        test.check(result.errorOutput.startsWith(message + firstFrame), "independent first-frame worker source oracle " + level + " " + threads + "\n" + result.errorOutput)
+    }
+}
+let visibleHead = "    function portrait(): Integer { fail(\"The harbour has no light.\") } //     ���"
+let expectedExcerpt = visibleHead
+for index in visibleHead.length..159 { expectedExcerpt += "灯" }
+expectedExcerpt += "…"
+let sourceHead = "\tfunction portrait(): Integer { fail(\"The harbour has no light.\") } // \t" + Text(Character(27)) + Text(Character(133)) + Text(Character(8238))
+test.require(test.compile(compiler, sourceHead + longLine + "\r\nprint(portrait())"), "compile bounded Unicode source excerpt")
+let excerptPath = compiler.directory + "/case" + Text(compiler.serial)
+test.check(files.remove(excerptPath + ".min") == 0, "remove Unicode source before failure")
+for level in ["-O0", "-O2"] {
+    let command = [compiler.clang, level, "-Wno-override-module", excerptPath + ".ll", compiler.runtime, "-lm", "-o", excerptPath + ".exe"]
+    for flag in compiler.flags { command.add(flag) }
+    test.require(test.run(command, system.environment(), "", excerptPath + ".link", 60), "link bounded Unicode source excerpt")
+    let result = test.run([excerptPath + ".exe"], system.environment(), "", excerptPath + ".run", 10)
+    test.check(result.status == 1 && result.output == "" && test.runtimeDiagnostic(result.errorOutput) == "Minyar stopped: The harbour has no light.\n", "bounded source excerpt keeps failure contract")
+    if level == "-O0" { test.check(test.contains(result.errorOutput, "    | " + expectedExcerpt + "\n"), "tabs and terminal controls are sanitized; Unicode clips at 160 scalars\n" + result.errorOutput) }
+    test.check(test.contains(result.errorOutput, "    | print(portrait())\n"), "last source line needs no final newline")
 }
 let entry = compiler.directory + "/entry.min"
 let shore = compiler.directory + "/shore.min"
@@ -92,6 +167,7 @@ for phase in 0..3 {
     let result = test.run([executable], system.environment(), "", compiler.directory + "/cached-run", 10)
     test.check(result.status == 1 && result.output == "" && test.runtimeDiagnostic(result.errorOutput) == "Minyar stopped: " + expected + "\n", "cache keeps exact stop message")
     test.check(test.contains(result.errorOutput, original + ":1:17)"), "cache keeps original imported declaration coordinates\n" + result.errorOutput)
+    test.check(test.contains(result.errorOutput, "    | public function light(): Integer { fail(\"" + expected + "\") }\n"), "cold/warm/changed cache keeps the imported source excerpt")
 }
 let gallery = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 fixtures.executes(gallery, io.readTextFile("examples/gallery/way-home.min"), "The old harbour: 2 small reasons to keep coming.\nThe lighthouse: 1 small reason to keep coming.\nThe village: 3 small reasons to keep coming.\nEvery lit window says: there is room for you here.\n", ["-O0", "-O2"], 0, "", true)

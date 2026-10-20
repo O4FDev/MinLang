@@ -1,0 +1,47 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let levels = ["-O0", "-O2"]
+fixtures.executes(frontend, io.readTextFile("tests/choice-layout.min"), io.readTextFile("tests/choice-layout.expected"), levels, 0, "", true)
+fixtures.executes(frontend, io.readTextFile("examples/gallery/choice-layout.min"), io.readTextFile("examples/gallery/choice-layout.expected"), levels, 0, "", true)
+fixtures.executes(frontend, "choice Value { Word(text: Text); Count(number: Integer); Pair(a: Text, b: Text) }\nprint(Value.Word(\"x\") == Value.Count(42))\nprint(Value.Count(42) == Value.Word(\"x\"))\nprint(Value.Word(\"x\") < Value.Count(42))\nprint(Value.Pair(\"a\", \"b\") == Value.Pair(\"a\", \"b\"))\nlet values: Map<Value, Integer> = Map()\nvalues[Value.Pair(\"a\", \"b\")] = 42\nprint(values[Value.Pair(\"a\", \"b\")])\n", "false\nfalse\ntrue\ntrue\n42\n", levels, 0, "", true)
+
+// Sixteen two-field cases used to reserve thirty-three slots per value.
+// Count constructor traffic before LLVM optimization, then execute it at O0/O2.
+let source = "choice Sample {\n"
+for index in 0..16 { source += "Case" + Text(index) + "(left: Integer, right: Integer)\n" }
+source += "}\nfunction total(value: Sample): Integer { return match value {\n"
+for index in 0..16 { source += "Case" + Text(index) + "(left, right) { left + right }\n" }
+source += "} }\nlet sum = 0\nfor index in 0..1000 {\n"
+for index in 0..16 { source += "sum += total(Sample.Case" + Text(index) + "(index, 1))\n" }
+source += "}\nprint(sum)\n"
+test.require(fixtures.compile(frontend, source), "compile compact choice allocation benchmark")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+test.check(!test.contains(llvm, "@minyar_record_new(i64 33)") && !test.contains(llvm, "@minyar_record_new_scalar(i64 33)"), "choice still reserves every case payload")
+test.check(test.contains(llvm, "@minyar_record_new(i64 3)") || test.contains(llvm, "@minyar_record_new_scalar(i64 3)"), "choice union must reserve tag plus largest case")
+llvm = test.replace(llvm, "@minyar_record_new_scalar", "@choice_layout_new_scalar")
+llvm = test.replace(llvm, "@minyar_record_new(", "@choice_layout_new(")
+io.writeTextFile(path + ".ll", llvm)
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+contract += "\nstatic long long choice_layout_allocations, choice_layout_slots;\nMinyarRecord *choice_layout_new(long long fields) { ++choice_layout_allocations; choice_layout_slots += fields; return minyar_record_new(fields); }\nMinyarRecord *choice_layout_new_scalar(long long fields) { ++choice_layout_allocations; choice_layout_slots += fields; return minyar_record_new_scalar(fields); }\n__attribute__((destructor)) static void choice_layout_report(void) { fprintf(stderr, \"choice layout: %lld records, %lld slots\\n\", choice_layout_allocations, choice_layout_slots); }\n"
+io.writeTextFile(path + "-runtime.c", contract)
+let command = [compiler.clang, "-O2"]
+for flag in compiler.flags { command.add(flag) }
+for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 30), "compile choice allocation counter runtime")
+for level in levels {
+    let link = [compiler.clang, level]
+    for flag in compiler.flags { link.add(flag) }
+    for argument in ["-Wno-override-module", path + ".ll", path + "-runtime.o", "-lm", "-o", path + ".exe"] { link.add(argument) }
+    test.require(test.run(link, frontend.environment, "", path + ".link", 30), "link compact choice benchmark " + level)
+    let result = test.run([path + ".exe"], frontend.environment, "", path + ".run", 30)
+    test.check(result.status == 0 && result.output == "8008000\n", "choice benchmark result " + level + "\n" + result.errorOutput)
+    test.check(result.errorOutput == "choice layout: 16000 records, 48000 slots\n", "choice benchmark allocation counts " + level + "\n" + result.errorOutput)
+}
+test.removeTree(compiler.directory)
+print("Choice layout: passed; 16,000 values use 48,000 slots instead of 528,000")

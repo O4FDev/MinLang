@@ -32,6 +32,63 @@ function setUp(root: Text, scratch: Text, label: Text, clang: Text, logs: tf.Log
     return Fixture { project: project; program: program; runtime: runtime; clang: clang; driver: root + "/build/tooling/tools/clang-driver";
         scratch: scratch; serial: 0; logs: logs }
 }
+// External tools stream the large Clang executable; this regression must not
+// reproduce the driver's former whole-file allocation while checking its copy.
+function digest(fixture: Fixture, path: Text): Text {
+    let result = tf.run(fixture.logs, ["/bin/sh", "-c", "if command -v sha256sum >/dev/null; then exec sha256sum -- \"$1\"; else exec shasum -a 256 -- \"$1\"; fi", "minyar", path], system.environment(), "", 120)
+    test.require(result, "independent streaming digest " + path)
+    let words = test.words(result.output)
+    test.check(words.length > 0 && words[0].byteLength == 64, "invalid independent SHA256 for " + path)
+    return words[0]
+}
+function retainedDigest(fixture: Fixture, evidence: Text, row: json.Value): Text {
+    test.check(row.kind == json.OBJECT, "missing retained input/output record")
+    let name = json.string(row, "retained")
+    test.check(name != "" && !test.contains(name, "/") && !test.contains(name, "\\") && name != "." && name != "..", "retained path must be a local evidence filename")
+    let path = evidence + "/" + name
+    let size = files.pathSize(path)
+    let bytes = json.member(row, "bytes")
+    test.check(size >= 0 && bytes.kind == json.NUMBER && bytes.number == Float(size), "retained byte count changed: " + name)
+    let actual = digest(fixture, path)
+    test.check(json.string(row, "sha256") == actual, "retained SHA256 differs: " + name)
+    return actual
+}
+function bindingDigest(fixture: Fixture, evidence: Text, row: json.Value): Text {
+    let actual = retainedDigest(fixture, evidence, row)
+    let original = json.string(row, "original")
+    test.check(original != "" && files.pathSize(original) == files.pathSize(evidence + "/" + json.string(row, "retained")), "original/retained size differs")
+    test.check(digest(fixture, original) == actual, "original/retained bytes differ: " + original)
+    for key in ["source_before_sha256", "retained_sha256", "source_after_sha256"] {
+        test.check(json.string(row, key) == actual, "binding fingerprint differs: " + key)
+    }
+    return actual
+}
+function fingerprints(fixture: Fixture, evidence: Text, manifest: json.Value) {
+    test.check(json.member(manifest, "link_status").kind == json.NUMBER && json.member(manifest, "link_status").number == 0.0 && json.member(manifest, "link_attempted").truth, "link must record successful attempted publication")
+    let raw = json.member(manifest, "raw_program_input")
+    let program = json.member(manifest, "program_input")
+    test.check(json.string(raw, "original") == fixture.program && json.string(program, "original") == fixture.program, "program input ownership")
+    test.check(bindingDigest(fixture, evidence, raw) == bindingDigest(fixture, evidence, program), "raw/linked native IR bytes differ")
+    let runtime = 0
+    let provider = 0
+    for row in json.member(manifest, "inputs").items {
+        let hash = bindingDigest(fixture, evidence, row)
+        for key in ["pre_link_sha256", "post_link_sha256"] { test.check(json.string(row, key) == hash, "linked input changed: " + key) }
+        if json.string(row, "role") == "runtime" { runtime += 1; test.check(json.string(row, "original") == fixture.runtime, "runtime input ownership") }
+        if json.string(row, "role") == "provider" { provider += 1 }
+    }
+    test.check(runtime == 1 && provider == 1, "fixture must retain one runtime and one provider")
+    let clang = json.member(json.member(manifest, "tool_bindings"), "clang.bin")
+    let compiler = json.string(manifest, "compiler")
+    test.check(json.string(clang, "original") == compiler && json.string(clang, "retained") == "clang.bin", "Clang binding ownership")
+    let clangHash = bindingDigest(fixture, evidence, clang)
+    test.check(files.pathSize(compiler) > 65536, "Clang fixture must exercise more than one retention chunk")
+    test.check(json.string(json.member(manifest, "tools"), "clang.bin") == clangHash && json.string(json.member(manifest, "compiler_pre_link"), "sha256") == clangHash, "Clang fingerprints differ")
+    let final = json.member(manifest, "final_output")
+    let finalHash = retainedDigest(fixture, evidence, final)
+    test.check(digest(fixture, json.string(final, "path")) == finalHash, "published/retained program bytes differ")
+    test.check(retainedDigest(fixture, evidence, json.member(manifest, "staged_output")) == finalHash && json.string(manifest, "binary_sha256") == finalHash, "staged/published program fingerprints differ")
+}
 function build(fixture: Fixture, flags: List<Text>): Text {
     fixture.serial += 1
     let parent = fixture.scratch + "/native-cache-evidence-" + Text(fixture.serial)
@@ -42,8 +99,9 @@ function build(fixture: Fixture, flags: List<Text>): Text {
     let result = tf.run(fixture.logs, [fixture.driver, "link", fixture.project, fixture.program, fixture.runtime, fixture.project + "/program", "0"], environment, "", 120)
     test.check(result.status == 0, "native cache link failed (" + Text(result.status) + ")\n" + result.errorOutput)
     let manifest = json.parse(io.readTextFile(evidence + "/manifest.json"))
-    test.require(tf.run(fixture.logs, ["rm", "-rf", "--", parent], system.environment(), "", 30), "remove link evidence")
     test.check(manifest.kind == json.OBJECT, "link manifest must be a JSON object")
+    fingerprints(fixture, evidence, manifest)
+    test.require(tf.run(fixture.logs, ["rm", "-rf", "--", parent], system.environment(), "", 30), "remove link evidence")
     let inputs = json.member(manifest, "inputs")
     test.check(inputs.kind == json.ARRAY, "link manifest must list inputs")
     let rows: List<Text> = []
@@ -67,7 +125,7 @@ let scratch = test.scratch()
 let logs = tf.logs(scratch + "/logs")
 let root = test.lines(support.output(["pwd", "-P"], tf.next(logs)))[0]
 let clang = test.setting("MINYAR_CLANG", test.setting("LLVM_CC", "clang"))
-let names = ["test_unchanged_sources_reuse_the_object", "test_header_source_and_flag_changes_compile_a_new_object"]
+let names = ["test_unchanged_sources_reuse_the_object", "test_header_source_and_flag_changes_compile_a_new_object", "test_changed_link_input_preserves_evidence_and_previous_output"]
 for index in 0..processInfo.argumentCount() {
     let valid = processInfo.argument(index) == "NativeObjectCache"
     for name in names { if processInfo.argument(index) == name || processInfo.argument(index) == "NativeObjectCache." + name { valid = true } }
@@ -99,6 +157,42 @@ if chosen("test_header_source_and_flag_changes_compile_a_new_object") {
     let leftovers: List<Text> = []
     for name in tf.listing(fixture.project + "/build/native") { if !contentObject(name) { leftovers.add(name) } }
     test.check(leftovers.length == 0, "temporary objects must not be left behind: " + tf.show(leftovers))
+    cases += 1
+}
+if chosen("test_changed_link_input_preserves_evidence_and_previous_output") {
+    let fixture = setUp(root, scratch, "mutation", clang, logs)
+    let replacement = fixture.project + "/replacement.o"
+    io.writeTextFile(fixture.project + "/replacement.c", "int changed_runtime_input;\n")
+    test.require(tf.run(logs, [clang, "-c", fixture.project + "/replacement.c", "-o", replacement], system.environment(), "", 60), "compile replacement runtime")
+    let before = digest(fixture, fixture.runtime)
+    let changed = digest(fixture, replacement)
+    test.check(before != changed, "mutation must change actual runtime bytes")
+    let wrapper = fixture.project + "/mutating-clang"
+    tf.executable(wrapper, "for argument do\n  if [ \"$argument\" = \"$MINYAR_MUTATED_PROGRAM\" ]; then cp -- \"$MINYAR_REPLACEMENT_RUNTIME\" \"$MINYAR_MUTATED_RUNTIME\" || exit 91; fi\ndone\nexec \"$MINYAR_REAL_CLANG\" \"$@\"\n", logs)
+    let output = fixture.project + "/program"
+    io.writeTextFile(output, "previous executable\n")
+    let retained = fixture.project + "/mutation-evidence"
+    let environment = support.merge(system.environment(), ["MINYAR_CLANG=" + wrapper, "MINYAR_NATIVE_FLAGS=", "MINYAR_CLANG_FLAGS=-O1 -Wno-override-module",
+        "MINYAR_LINK_ARTIFACTS=" + retained, "MINYAR_REAL_CLANG=" + clang, "MINYAR_MUTATED_PROGRAM=" + fixture.program,
+        "MINYAR_REPLACEMENT_RUNTIME=" + replacement, "MINYAR_MUTATED_RUNTIME=" + fixture.runtime])
+    let result = tf.run(logs, [fixture.driver, "link", fixture.project, fixture.program, fixture.runtime, output, "0"], environment, "", 120)
+    test.check(result.status != 0 && test.contains(result.errorOutput, "link input changed while Clang ran"), "changed input was not rejected\n" + result.errorOutput)
+    test.check(io.readTextFile(output) == "previous executable\n", "input mutation replaced the previous output")
+    test.check(digest(fixture, fixture.runtime) == changed, "link wrapper did not perform the intended mutation")
+    let manifest = json.parse(io.readTextFile(retained + "/manifest.json"))
+    test.check(json.member(manifest, "link_attempted").truth, "mutation must reach the actual link")
+    let runtimeRows = 0
+    for row in json.member(manifest, "inputs").items {
+        if json.string(row, "role") == "runtime" {
+            runtimeRows += 1
+            test.check(retainedDigest(fixture, retained, row) == before, "failed link lost the original runtime evidence")
+            for key in ["source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256"] {
+                test.check(json.string(row, key) == before, "failed link lost its earlier fingerprint: " + key)
+            }
+            test.check(json.string(row, "post_link_sha256") == changed, "failed link did not record the changed input")
+        }
+    }
+    test.check(runtimeRows == 1, "failed link must retain its runtime row")
     cases += 1
 }
 test.removeTree(scratch)

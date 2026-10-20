@@ -1,0 +1,387 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing assignment reuse function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function compiled(frontend: fixtures.Frontend, source: Text): Text {
+    test.require(fixtures.compile(frontend, source), "compile typed assignment IR")
+    return io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+}
+
+function checkCalls(ir: Text, name: Text, moves: Integer, ordinary: Text, copies: Integer, consuming: Text, takes: Integer) {
+    let emitted = body(ir, name)
+    test.check(count(emitted, "call void @minyar_rc_local_move_owner(") == moves, name + ": assignment owner transfers")
+    test.check(count(emitted, "call ptr @" + ordinary + "(") == copies, name + ": ordinary consumer calls")
+    test.check(count(emitted, "call ptr @" + consuming + "(") == takes, name + ": consuming calls")
+}
+
+function checkText(ir: Text, name: Text, moves: Integer, copies: Integer, takes: Integer) {
+    checkCalls(ir, name, moves, "minyar_join_text", copies, "minyar_join_text_take_left", takes)
+}
+
+function checkList(ir: Text, name: Text, moves: Integer, copies: Integer, takes: Integer) {
+    checkCalls(ir, name, moves, "minyar_list_appended", copies, "minyar_list_appended_take", takes)
+}
+
+function checkOrder(ir: Text, name: Text, rhs: Text, consumer: Text) {
+    let emitted = body(ir, name)
+    let evaluated = emitted.find("call ptr @.minyar.fn." + rhs + "(")
+    if evaluated < 0 { evaluated = emitted.find("call ptr @.minyar.fn.minyar_module_0_" + rhs + "(") }
+    let moved = emitted.find("call void @minyar_rc_local_move_owner(")
+    let consumed = emitted.find("call ptr @" + consumer + "(")
+    test.check(evaluated >= 0 && moved > evaluated && consumed > moved, name + ": RHS must finish before moving the original receiver")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    record Holder { text: Text; values: List<Integer> }
+    record Node { value: Integer; children: List<Node> }
+
+    // Negative Integer conversions bypass the immortal numeric Text cache.
+    function selfText(seed: Integer) {
+        let value = Text(seed)
+        value = (((value) + value))
+        print(value)
+    }
+    function selfList(seed: Integer) {
+        let values = [Text(seed)]
+        values = (((values).appended(values[0])))
+        print(values[0])
+        print(values[1])
+    }
+    function aliasText() {
+        let value = Text(-12)
+        let alias = value
+        value = (((value) + value))
+        print(value)
+        print(alias)
+    }
+    function aliasList() {
+        let values = [Text(13)]
+        let alias = values
+        values = ((values).appended(values[0]))
+        print(values.length)
+        print(alias.length)
+        values[0] = Text(99)
+        print(alias[0])
+        print(values[0])
+    }
+    function sliceText() {
+        let base = Text(123456)
+        let value = base.slice(1, 5)
+        value = (((value) + value.slice(1, value.length)))
+        print(value)
+        print(base)
+    }
+    function observe(value: Text): Text { print(value); return value }
+    function textCall() {
+        let value = Text(-14)
+        value = (((value) + observe(value)))
+        print(value)
+    }
+    function mutate(values: List<Text>): Text {
+        print(values[0])
+        values[0] = "after" + "!"
+        return values[0]
+    }
+    function listCall() {
+        let values = ["before" + "!"]
+        values = (((values).appended(mutate(values))))
+        print(values[0])
+        print(values[1])
+    }
+    function captureAlias() {
+        let value = Text(-19)
+        let callback: () -> Text = function(): Text { return value }
+        value = (((value) + callback()))
+        print(value)
+        print(callback())
+    }
+    function capturedReceiver() {
+        let text = Text(23)
+        let values = [3]
+        let callback: () -> Integer = function(): Integer {
+            let result = Text(0)
+            result = ((text) + text)
+            let other: List<Integer> = []
+            other = ((values).appended(values[0]))
+            print(result)
+            print(other.length)
+            return values.length
+        }
+        print(callback())
+        print(text)
+        print(values.length)
+    }
+    function readonlyText(value: Text) {
+        let result = Text(0)
+        result = ((value) + value)
+        print(result)
+        print(value)
+    }
+    function readonlyList(values: List<Integer>) {
+        let result: List<Integer> = []
+        result = ((values).appended(values[0]))
+        print(result.length)
+        print(values.length)
+    }
+    function differentTarget() {
+        let value = Text(42)
+        let other = Text(0)
+        other = ((value) + value)
+        print(other)
+        print(value)
+        let values = [4]
+        let others: List<Integer> = []
+        others = ((values).appended(values[0]))
+        print(others.length)
+        print(values.length)
+    }
+    function mutableText(value: Text, replace: Boolean) {
+        if replace { value = Text(-8) }
+        value = (((value) + value))
+        print(value)
+    }
+    function mutableList(values: List<Integer>, replace: Boolean) {
+        if replace { values = [8] }
+        values = (((values).appended(values[0])))
+        print(values[0])
+        print(values[1])
+    }
+    function textDescendant() {
+        let value = Text(21)
+        value = ((value + "!") + value)
+        print(value)
+    }
+    function listDescendant() {
+        let values = [4]
+        values = ((values.appended(5)).appended(values.length))
+        print(values[2])
+    }
+    function projected(holder: Holder) {
+        let text = Text(0)
+        text = ((holder.text) + holder.text)
+        let values: List<Integer> = []
+        values = ((holder.values).appended(holder.values[0]))
+        print(text)
+        print(values.length)
+        print(holder.values.length)
+    }
+    function fresh(): Text { return Text(31) }
+    function callReceiver() {
+        let value = Text(32)
+        value = (fresh() + value)
+        print(value)
+    }
+    function repeat() {
+        let value = Text(1)
+        let index = 0
+        while index < 3 { value = (value) + value; index += 1 }
+        print(value)
+        let values = [1]
+        for index in 0..3 { values = (values).appended(values[0]) }
+        print(values.length)
+    }
+    function branch(flag: Boolean) {
+        let value = Text(2)
+        if flag { value = ((value) + value) }
+        else { value = ((value) + "!") }
+        print(value)
+    }
+    function shadowed() {
+        let value = Text(7)
+        if true {
+            let value = Text(8)
+            value = ((value) + value)
+            print(value)
+        }
+        print(value)
+    }
+    function nested() {
+        let value = Text(3)
+        let other = Text(4)
+        value = ((value) + (other + "!"))
+        print(value)
+        let values = [3]
+        let others = [4]
+        values = ((values).appended(others.appended(5)[1]))
+        print(values[1])
+    }
+    function compound() {
+        let pieces: List<Text> = []
+        for index in 0..64 { pieces.add("abcdefgh") }
+        let value = joinText(pieces)
+        value += (value + "!")
+        print(value.length)
+        print(value.slice(0, 512) == value.slice(512, 1024))
+        print(value[1024])
+    }
+    function legacy() {
+        let text = Text(11)
+        text = text + "a" + "b"
+        print(text)
+        let values = [1]
+        values = values.appended(2).appended(3)
+        print(values.length)
+        print(values[2])
+    }
+    function traced() {
+        let values: List<Node> = []
+        let node = Node { value: 3; children: values }
+        values.add(node)
+        let alias = values
+        values = (((values).appended(values[0])))
+        print(values.length)
+        print(alias.length)
+        values[0].value = 4
+        print(alias[0].value)
+    }
+    function propagated(values: List<Integer>, result: Result<Integer, Text>): Result<List<Integer>, Text> {
+        values = ((values).appended(try result))
+        return Ok<List<Integer>, Text>(values)
+    }
+
+    selfText(-7)
+    selfList(8)
+    aliasText()
+    aliasList()
+    sliceText()
+    textCall()
+    listCall()
+    captureAlias()
+    capturedReceiver()
+    readonlyText(Text(41))
+    readonlyList([4])
+    differentTarget()
+    let originalText = Text(-5)
+    mutableText(originalText, false)
+    print(originalText)
+    mutableText(originalText, true)
+    print(originalText)
+    let originalList = [5]
+    mutableList(originalList, false)
+    print(originalList.length)
+    mutableList(originalList, true)
+    print(originalList[0])
+    textDescendant()
+    listDescendant()
+    projected(Holder { text: Text(6); values: [6] })
+    callReceiver()
+    repeat()
+    branch(true)
+    branch(false)
+    shadowed()
+    nested()
+    compound()
+    legacy()
+    traced()
+    let input = [10]
+    let success = propagated(input, Ok<Integer, Text>(20))
+    match success {
+        Ok(values) { print(values.length); print(values[0]); print(values[1]) }
+        Err(error) { fail(error) }
+    }
+    print(input.length)
+    let failed = propagated(input, Err<Integer, Text>("no" + "!"))
+    match failed {
+        Ok(values) { fail("propagation accepted a failure") }
+        Err(error) { print(error) }
+    }
+    print(input.length)
+    print(input[0])
+    """#
+let ir = compiled(frontend, source)
+for name in ["selfText", "aliasText", "sliceText", "textCall", "captureAlias", "mutableText", "shadowed"] { checkText(ir, name, 1, 0, 1) }
+for name in ["selfList", "aliasList", "listCall", "mutableList"] { checkList(ir, name, 1, 0, 1) }
+for name in ["readonlyText", "differentTarget", "projected"] { checkText(ir, name, 0, 1, 0) }
+for name in ["readonlyList", "differentTarget", "projected"] { checkList(ir, name, 0, 1, 0) }
+checkText(ir, "textDescendant", 0, 1, 1)
+checkList(ir, "listDescendant", 0, 1, 1)
+checkText(ir, "callReceiver", 0, 0, 1)
+checkText(ir, "repeat", 2, 0, 1)
+checkList(ir, "repeat", 2, 0, 1)
+checkText(ir, "branch", 2, 0, 2)
+checkText(ir, "nested", 2, 1, 1)
+checkList(ir, "nested", 2, 1, 1)
+checkText(ir, "compound", 0, 2, 0)
+checkText(ir, "legacy", 2, 0, 2)
+checkList(ir, "legacy", 2, 0, 2)
+checkCalls(ir, "traced", 1, "minyar_list_appended_traced", 0, "minyar_list_appended_take_traced", 1)
+checkList(ir, "propagated", 1, 0, 1)
+test.check(!test.contains(body(ir, "traced"), "call ptr @minyar_list_appended_take("), "typed assignment must preserve traced append edges")
+checkOrder(ir, "textCall", "observe", "minyar_join_text_take_left")
+checkOrder(ir, "listCall", "mutate", "minyar_list_appended_take")
+
+let closures: List<Text> = []
+let capturing = false
+let parts: List<Text> = []
+for line in test.lines(ir) {
+    if !capturing && test.contains(line, "define ") && test.contains(line, "@.minyar.closure.") { capturing = true; parts = [] }
+    else if capturing {
+        if line == "}" { capturing = false; closures.add(joinText(parts)) }
+        else { parts.add(line + "\n") }
+    }
+}
+test.check(closures.length == 2, "assignment capture coverage")
+let captured = joinText(closures)
+test.check(count(captured, "call void @minyar_rc_local_move_owner(") == 0, "captured receivers must not transfer ownership into another local")
+test.check(count(captured, "call ptr @minyar_join_text(") == 1 && count(captured, "call ptr @minyar_join_text_take_left(") == 0, "captured Text assignment stays borrowed")
+test.check(count(captured, "call ptr @minyar_list_appended(") == 1 && count(captured, "call ptr @minyar_list_appended_take(") == 0, "captured List assignment stays borrowed")
+fixtures.executes(frontend, source, "-7-7\n8\n8\n-12-12\n-12\n2\n1\n13\n99\n2345345\n123456\n-14\n-14-14\nbefore!\nafter!\nafter!\n-19-19\n-19\n2323\n2\n1\n23\n1\n4141\n41\n2\n1\n4242\n42\n2\n1\n-5-5\n-5\n-8-8\n-5\n5\n5\n1\n8\n8\n5\n21!21\n1\n66\n2\n1\n3132\n11111111\n4\n22\n2!\n88\n7\n34!\n5\n1025\ntrue\n!\n11ab\n3\n3\n2\n1\n4\n2\n10\n20\n1\nno!\n1\n10\n", ["-O0", "-O2"], 0, "", true)
+
+let recovery = #"""
+    use "calldepth" as depth
+    function recoveryText() {
+        let value = Text(9)
+        value = (((value) + value))
+        print(value)
+    }
+    function recoveryList() {
+        let values = [9]
+        values = (((values).appended(values[0])))
+        print(values.length)
+    }
+    recoveryText()
+    recoveryList()
+    print(depth.remaining())
+    """#
+let recoveryIR = compiled(frontend, recovery)
+test.check(test.contains(recoveryIR, "@minyar_recovery_enter("), "recovery assignment control must activate recovery lowering")
+checkText(recoveryIR, "recoveryText", 0, 1, 0)
+checkList(recoveryIR, "recoveryList", 0, 1, 0)
+fixtures.executes(frontend, recovery, "99\n2\n-1\n", ["-O0", "-O2"], 0, "", true)
+fixtures.rejects(frontend, "let value = Text(1)\nlet callback = function() { value = (value) + value }\ncallback()\n", "captured bindings cannot be reassigned", false)
+fixtures.rejects(frontend, "let values = [1]\nlet callback = function() { values = (values).appended(values[0]) }\ncallback()\n", "captured bindings cannot be reassigned", false)
+
+let gallery = io.readTextFile("examples/gallery/typed-assignment-reuse.min")
+test.check(gallery.length > 0, "missing typed assignment gallery")
+fixtures.executes(frontend, gallery, "The tide comes in.\nThe tide goes out.\nThe tide comes in.\nA little light can travel far.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Typed assignment reuse: passed")

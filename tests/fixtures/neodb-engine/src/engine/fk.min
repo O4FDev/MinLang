@@ -1,0 +1,807 @@
+// Foreign keys (compat agent): definition at DDL time and enforcement at statement end.
+//
+// A statement's row changes are exactly its undo entries [from, tx.uCount), so the checks run over those after the
+// statement, as Postgres runs its RI triggers at statement end (NO ACTION). Phase 1 applies ON DELETE / ON UPDATE
+// CASCADE and SET NULL (which add entries of their own, processed until none are new); phase 2 checks every
+// inserted/updated referencing row against the parent's unique hash index (O(1) per row) and every deleted or
+// re-keyed referenced row against its referencing rows. MATCH SIMPLE: a NULL in the referencing columns passes.
+//
+// Concurrency (ADR-003 row locks, READ COMMITTED), without a shared-lock table: a referencing row checks the parent
+// row's state, and a parent delete checks the referencing rows' states. Whichever statement runs second sees the
+// other's uncommitted row (locked) and waits for its transaction (WOULD_BLOCK, retried after it ends):
+// - parent row inserted by an open transaction: invisible (as in PG) -> 23503;
+// - parent row deleted, or its key changed, by an open transaction: wait; non-key updates do not conflict;
+// - referencing row inserted/updated/deleted by an open transaction when the parent row is deleted: wait.
+// The undo images of other open transactions are scanned (failure paths only) for rows whose committed key matches
+// but whose current key moved away, so a key change that may still roll back is waited for as well.
+use "./values.min" as v
+use "./table.min" as tb
+use "./index.min" as ix
+use "./catalog.min" as cat
+use "./txn.min" as txn
+use "./exec.min" as ex
+use "./dml.min" as dml
+use "../sql/ast.min" as ast
+
+// ---------------------------------------------------------------- DDL
+
+public function sameClass(a: Integer, b: Integer): Boolean {
+    let ta = v.sqlType(a)
+    let tb2 = v.sqlType(b)
+    if v.isIntType(ta) && v.isIntType(tb2) { return true }
+    if ta == v.T_BPCHAR || tb2 == v.T_BPCHAR { return ta == tb2 }
+    if (ta == v.T_TEXT || ta == v.T_VARCHAR || ta == v.T_NAME) && (tb2 == v.T_TEXT || tb2 == v.T_VARCHAR || tb2 == v.T_NAME) { return true }
+    return a == b
+}
+
+function joinNames(t: tb.Table, cols: List<Integer>): Text {
+    let parts: List<Text> = []
+    let i = 0
+    while i < cols.length {
+        if i > 0 { parts.add(", ") }
+        parts.add(t.cols[cols[i]].name)
+        i += 1
+    }
+    return joinText(parts)
+}
+
+// Default constraint name: <table>_<col>[_<col>...]_fkey, made unique among the table's foreign keys.
+public function defaultName(c: cat.Catalog, child: tb.Table, cols: List<Integer>): Text {
+    let base = child.name
+    for ci in cols { base = base + "_" + child.cols[ci].name }
+    let name = base + "_fkey"
+    let k = 1
+    while nameTaken(c, child.id, name) {
+        name = base + "_fkey" + Text(k)
+        k += 1
+    }
+    return name
+}
+
+function nameTaken(c: cat.Catalog, tid: Integer, name: Text): Boolean {
+    for fk in c.fks {
+        if !fk.dropped && fk.childId == tid && fk.name == name { return true }
+    }
+    return false
+}
+
+// Register FOREIGN KEY (childCols) REFERENCES parent (parentCols). Returns "" or "SQLSTATE|message".
+public function define(c: cat.Catalog, child: tb.Table, name: Text, childCols: List<Integer>, parent: tb.Table, parentColsIn: List<Integer>,
+                       onDelete: Integer, onUpdate: Integer, deferrable: Boolean, deferred: Boolean, dry: Boolean): Text {
+    let parentCols = parentColsIn
+    if parentCols.length == 0 {
+        if parent.pkCols.length == 0 { return "42830|there is no primary key for referenced table \"" + parent.name + "\"" }
+        parentCols = parent.pkCols
+    }
+    let n = childCols.length
+    if n != parentCols.length { return "42830|number of referencing and referenced columns for foreign key disagree" }
+    if onDelete == ast.FK_SET_DEFAULT || onUpdate == ast.FK_SET_DEFAULT { return "0A000|ON DELETE / ON UPDATE SET DEFAULT is not supported" }
+    let hidx = -1
+    for hid in parent.hashIds {
+        let h = c.hashIdx[hid]
+        if hidx < 0 && h.unique && h.cols.length == n && sameSet(h.cols, parentCols) { hidx = hid }
+    }
+    if hidx < 0 { return "42830|there is no unique constraint matching given keys for referenced table \"" + parent.name + "\"" }
+    let i = 0
+    while i < n {
+        let ct = child.cols[childCols[i]]
+        let pt = parent.cols[parentCols[i]]
+        if !sameClass(ct.type, pt.type) || (v.sqlType(ct.type) == v.T_NUMERIC && ct.typmod != pt.typmod) {
+            return "42804|foreign key constraint \"" + name + "\" cannot be implemented|Key columns \"" + ct.name + "\" and \"" + pt.name +
+                "\" are of incompatible types: " + v.typeName(v.sqlType(ct.type)) + " and " + v.typeName(v.sqlType(pt.type)) + "."
+        }
+        i += 1
+    }
+    if dry { return "" }
+    let h = c.hashIdx[hidx]
+    let keyMap: List<Integer> = []
+    for hc in h.cols {
+        let j = 0
+        while j < n {
+            if parentCols[j] == hc { keyMap.add(j) }
+            j += 1
+        }
+    }
+    let nm = name
+    if nm == "" { nm = defaultName(c, child, childCols) }
+    cat.addForeignKey(c, cat.ForeignKey { name: nm; childId: child.id; childCols: childCols; parentId: parent.id; parentCols: parentCols
+                                         parentIdx: hidx; keyMap: keyMap; onDelete: onDelete; onUpdate: onUpdate; deferrable: deferrable
+                                         deferred: deferred; dropped: false; probe: ix.newKey(n) })
+    return ""
+}
+
+function sameSet(a: List<Integer>, b: List<Integer>): Boolean {
+    if a.length != b.length { return false }
+    for x in a {
+        let found = false
+        for y in b {
+            if x == y { found = true }
+        }
+        if !found { return false }
+    }
+    return true
+}
+
+// Remove the most recently added foreign key (ALTER TABLE ADD FOREIGN KEY whose validation failed).
+public function undefineLast(c: cat.Catalog) {
+    let keep: List<cat.ForeignKey> = []
+    let i = 0
+    while i < c.fks.length - 1 {
+        keep.add(c.fks[i])
+        i += 1
+    }
+    if c.fks.length > 0 && !c.fks[c.fks.length - 1].dropped { c.nLiveFks -= 1 }
+    c.fks = keep
+    c.version += 1
+}
+
+// Column ci of table tid was removed (ALTER TABLE DROP COLUMN): foreign keys using it are dropped, the others'
+// column positions shift down.
+public function columnDropped(c: cat.Catalog, tid: Integer, ci: Integer) {
+    let i = 0
+    while i < c.fks.length {
+        let fk = c.fks[i]
+        if !fk.dropped {
+            let uses = false
+            if fk.childId == tid {
+                for x in fk.childCols {
+                    if x == ci { uses = true }
+                }
+            }
+            if fk.parentId == tid {
+                for x in fk.parentCols {
+                    if x == ci { uses = true }
+                }
+                if fk.parentIdx >= 0 && c.hashIdx[fk.parentIdx].name == "" { uses = true }
+            }
+            if uses {
+                cat.dropForeignKey(c, i)
+            } else {
+                if fk.childId == tid { fk.childCols = shiftDown(fk.childCols, ci) }
+                if fk.parentId == tid { fk.parentCols = shiftDown(fk.parentCols, ci) }
+            }
+        }
+        i += 1
+    }
+}
+
+function shiftDown(cols: List<Integer>, ci: Integer): List<Integer> {
+    let out: List<Integer> = []
+    for x in cols {
+        if x > ci { out.add(x - 1) } else { out.add(x) }
+    }
+    return out
+}
+
+// Live foreign keys from other tables that reference table tid.
+public function dependents(c: cat.Catalog, tid: Integer): List<Integer> {
+    let out: List<Integer> = []
+    let i = 0
+    while i < c.fks.length {
+        let fk = c.fks[i]
+        if !fk.dropped && fk.parentId == tid && fk.childId != tid { out.add(i) }
+        i += 1
+    }
+    return out
+}
+
+public function findByName(c: cat.Catalog, tid: Integer, name: Text): Integer {
+    let i = 0
+    while i < c.fks.length {
+        if !c.fks[i].dropped && c.fks[i].childId == tid && c.fks[i].name == name { return i }
+        i += 1
+    }
+    return -1
+}
+
+// ALTER TABLE ADD FOREIGN KEY on existing rows: every row must reference an existing parent row.
+// Returns "" or "SQLSTATE|message|detail"; blockedBy[0] is set to an owner to wait for.
+public function validate(c: cat.Catalog, tm: txn.TxnMgr, me: Integer, fi: Integer, blockedBy: List<Integer>): Text {
+    let fk = c.fks[fi]
+    let ct = c.tables[fk.childId]
+    let r = 0
+    while r < ct.nrows {
+        let st = ct.state[r]
+        if st == 0 || (st & tb.ST_DEAD) == 0 {
+            if fillKey(fk, fk.probe, ct, r, false) {
+                let res = probeParent(c, tm, me, fk, fk.probe, -1)
+                if res >= 0 {
+                    blockedBy[0] = res
+                    return ""
+                }
+                if res == -1 {
+                    return "23503|insert or update on table \"" + ct.name + "\" violates foreign key constraint \"" + fk.name + "\"|" + missingDetail(c, fk, ct, r)
+                }
+            }
+        }
+        r += 1
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------- keys and probes
+
+// Fill k (parent-index column order) from row r of src: parent columns (parent-side) or child columns.
+// False when a key column is NULL (MATCH SIMPLE: nothing to check).
+function fillKey(fk: cat.ForeignKey, k: ix.Key, src: tb.Table, r: Integer, parentCols: Boolean): Boolean {
+    let j = 0
+    let n = fk.keyMap.length
+    while j < n {
+        let i = fk.keyMap[j]
+        let ci = fk.childCols[i]
+        if parentCols { ci = fk.parentCols[i] }
+        let col = src.cols[ci]
+        if tb.isNull(col, r) { return false }
+        k.nulls[j] = false
+        let ty = col.type
+        if v.isTextType(ty) {
+            k.bufs[j] = col.heap
+            k.offs[j] = tb.textOff(col, r)
+            k.lens[j] = tb.textLen(col, r)
+        } else if ty == v.T_FLOAT8 || ty == v.T_FLOAT4 {
+            k.flts[j] = tb.getFloat(col, r)
+        } else {
+            k.ints[j] = tb.getInt(col, r)
+            k.scales[j] = tb.getScale(col, r)
+        }
+        j += 1
+    }
+    return true
+}
+
+// Committed (pre-lock) version of a row locked by another transaction still carries key k?
+function committedKeySame(tm: txn.TxnMgr, t: tb.Table, r: Integer, cols: List<Integer>, k: ix.Key): Boolean {
+    let sc = tb.cloneSchema(t, -2)
+    txn.loadBeforeImage(tm, t, r, sc)
+    return ix.rowMatchesKey(sc, cols, 0, k)
+}
+
+// Another open transaction updated a row of t whose committed version has key k (cols): its slot, else -1.
+function oldKeyOwner(c: cat.Catalog, tm: txn.TxnMgr, me: Integer, t: tb.Table, cols: List<Integer>, k: ix.Key): Integer {
+    if t.lockedCount == 0 { return -1 }
+    let sc = tb.cloneSchema(t, -2)
+    for tx2 in tm.txns {
+        if tx2.slot != me && tx2.state != txn.TX_IDLE {
+            let u = 0
+            while u < tx2.uCount {
+                if tx2.uTable.getInt64(u * 8) == t.id && (tx2.uKind.getInt64(u * 8) & 15) == txn.U_UPDATE {
+                    if sc.nrows == 0 { tb.reserveRow(sc, 0) }
+                    let cur = tb.Cursor { pos: tx2.uImgOff.getInt64(u * 8) }
+                    tb.decodeRow(sc, 0, tx2.uImg, cur)
+                    let r = tx2.uRow.getInt64(u * 8)
+                    if ix.rowMatchesKey(sc, cols, 0, k) && !(r < t.nrows && ix.rowMatchesKey(t, cols, r, k)) { return tx2.slot }
+                }
+                u += 1
+            }
+        }
+    }
+    return -1
+}
+
+// Parent row with key k visible to `me` (excluding row `exclude`): -2 found, -1 none, else the owner slot to
+// wait for.
+function probeParent(c: cat.Catalog, tm: txn.TxnMgr, me: Integer, fk: cat.ForeignKey, k: ix.Key, exclude: Integer): Integer {
+    let pt = c.tables[fk.parentId]
+    let h = c.hashIdx[fk.parentIdx]
+    let hv = ix.hashKey(pt, h.cols, k)
+    let s = ix.probeNext(h, hv, ix.probeStart(h, hv))
+    let block = -1
+    while s >= 0 {
+        let r = ix.slotRow(h, s)
+        if r < pt.nrows && r != exclude && ix.rowMatchesKey(pt, h.cols, r, k) {
+            let st = pt.state[r]
+            if st == 0 { return -2 }
+            if (st & tb.ST_LOCKED) != 0 {
+                let owner = txn.ownerOf(tm, pt.id, r)
+                if owner < 0 || owner == me {
+                    if (st & tb.ST_DEAD) == 0 { return -2 }
+                } else if (st & tb.ST_NEW) == 0 {
+                    if (st & tb.ST_DEAD) != 0 {
+                        block = owner
+                    } else if committedKeySame(tm, pt, r, h.cols, k) {
+                        return -2
+                    } else {
+                        block = owner
+                    }
+                }
+            }
+        }
+        s = ix.probeNext(h, hv, s + 1)
+    }
+    if block >= 0 { return block }
+    return oldKeyOwner(c, tm, me, pt, h.cols, k)
+}
+
+function cellText(col: tb.Column, r: Integer): Text {
+    return dml.cellText(col, r)
+}
+
+function missingDetail(c: cat.Catalog, fk: cat.ForeignKey, ct: tb.Table, r: Integer): Text {
+    let vals: List<Text> = []
+    let i = 0
+    while i < fk.childCols.length {
+        if i > 0 { vals.add(", ") }
+        vals.add(cellText(ct.cols[fk.childCols[i]], r))
+        i += 1
+    }
+    return "Key (" + joinNames(ct, fk.childCols) + ")=(" + joinText(vals) + ") is not present in table \"" + c.tables[fk.parentId].name + "\"."
+}
+
+// ---------------------------------------------------------------- referencing rows
+
+function cellsEqual(a: tb.Column, ra: Integer, b: tb.Column, rb: Integer): Boolean {
+    let an = tb.isNull(a, ra)
+    let bn = tb.isNull(b, rb)
+    if an || bn { return false }
+    let ta = a.type
+    if v.isTextType(ta) && v.isTextType(b.type) {
+        return ix.cmpText(ta, a.heap, tb.textOff(a, ra), tb.textLen(a, ra), b.heap, tb.textOff(b, rb), tb.textLen(b, rb)) == 0
+    }
+    if ta == v.T_FLOAT8 || ta == v.T_FLOAT4 { return ix.cmpFloat(tb.getFloat(a, ra), tb.getFloat(b, rb)) == 0 }
+    if ta == v.T_NUMERIC { return ix.cmpNumeric(tb.getInt(a, ra), tb.getScale(a, ra), tb.getInt(b, rb), tb.getScale(b, rb)) == 0 }
+    if ta == v.T_INTERVAL { return ix.cmpCells(a, ra, b, rb) == 0 }
+    return tb.getInt(a, ra) == tb.getInt(b, rb)
+}
+
+// Does child row cr reference the key held in parent columns of (src, sr)?
+function childMatches(fk: cat.ForeignKey, ct: tb.Table, cr: Integer, src: tb.Table, sr: Integer): Boolean {
+    let i = 0
+    while i < fk.childCols.length {
+        if !cellsEqual(ct.cols[fk.childCols[i]], cr, src.cols[fk.parentCols[i]], sr) { return false }
+        i += 1
+    }
+    return true
+}
+
+// Child rows referencing the old key in (src, sr). Visible referencing rows go to `out`; returns the owner of a
+// referencing row locked by another transaction (wait for it), else -1.
+// forAction (CASCADE / SET NULL): rows the action must change but cannot yet (locked) are waited for.
+function referencing(c: cat.Catalog, tm: txn.TxnMgr, me: Integer, fk: cat.ForeignKey, src: tb.Table, sr: Integer, out: List<Integer>, forAction: Boolean): Integer {
+    let ct = c.tables[fk.childId]
+    // a child hash index whose columns are all foreign-key columns narrows the search
+    let hid = -1
+    for x in ct.hashIds {
+        let h = c.hashIdx[x]
+        if hid < 0 && subsetPositions(h.cols, fk.childCols).length == h.cols.length { hid = x }
+    }
+    let cands = Bytes()
+    if hid >= 0 {
+        let h = c.hashIdx[hid]
+        let pos = subsetPositions(h.cols, fk.childCols)
+        let k = ix.newKey(h.cols.length)
+        let j = 0
+        while j < h.cols.length {
+            let col = src.cols[fk.parentCols[pos[j]]]
+            k.nulls[j] = false
+            if v.isTextType(col.type) {
+                k.bufs[j] = col.heap
+                k.offs[j] = tb.textOff(col, sr)
+                k.lens[j] = tb.textLen(col, sr)
+            } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
+                k.flts[j] = tb.getFloat(col, sr)
+            } else {
+                k.ints[j] = tb.getInt(col, sr)
+                k.scales[j] = tb.getScale(col, sr)
+            }
+            j += 1
+        }
+        let hv = ix.hashKey(ct, h.cols, k)
+        let s = ix.probeNext(h, hv, ix.probeStart(h, hv))
+        while s >= 0 {
+            cands.addInt64(ix.slotRow(h, s))
+            s = ix.probeNext(h, hv, s + 1)
+        }
+    } else {
+        let r = 0
+        while r < ct.nrows {
+            cands.addInt64(r)
+            r += 1
+        }
+    }
+    let n = cands.length / 8
+    let i = 0
+    while i < n {
+        let cr = cands.getInt64(i * 8)
+        if cr < ct.nrows && childMatches(fk, ct, cr, src, sr) {
+            let st = ct.state[cr]
+            if st == 0 {
+                out.add(cr)
+            } else if (st & tb.ST_LOCKED) != 0 {
+                let owner = txn.ownerOf(tm, ct.id, cr)
+                if owner < 0 || owner == me {
+                    if (st & tb.ST_DEAD) == 0 { out.add(cr) }
+                } else if (st & (tb.ST_NEW | tb.ST_DEAD)) != 0 {
+                    // inserted (it holds a key-share on the parent, in PG terms) or deleted by an open transaction
+                    return owner
+                } else {
+                    // updated by an open transaction: PG checks the committed version unless a key column changed
+                    let sc = tb.cloneSchema(ct, -2)
+                    txn.loadBeforeImage(tm, ct, cr, sc)
+                    if forAction || !childMatches(fk, sc, 0, src, sr) || ownerKeyChanged(tm, ct, cr) { return owner }
+                    out.add(cr)
+                }
+            }
+        }
+        i += 1
+    }
+    // referencing rows whose committed version pointed at this key but were changed by an open transaction
+    let ck = ix.newKey(fk.childCols.length)
+    let j = 0
+    while j < fk.childCols.length {
+        let col = src.cols[fk.parentCols[j]]
+        ck.nulls[j] = false
+        if v.isTextType(col.type) {
+            ck.bufs[j] = col.heap
+            ck.offs[j] = tb.textOff(col, sr)
+            ck.lens[j] = tb.textLen(col, sr)
+        } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
+            ck.flts[j] = tb.getFloat(col, sr)
+        } else {
+            ck.ints[j] = tb.getInt(col, sr)
+            ck.scales[j] = tb.getScale(col, sr)
+        }
+        j += 1
+    }
+    let o = oldKeyOwner(c, tm, me, ct, fk.childCols, ck)
+    if o >= 0 && !forAction && !oldKeyChanged(tm, o, ct, fk.childCols, ck) {
+        // re-pointed away by a non-key update that may still roll back: the committed version still references
+        out.add(-1)
+        return -1
+    }
+    return o
+}
+
+// Did the open transaction owning row r change one of the row's indexed columns?
+function ownerKeyChanged(tm: txn.TxnMgr, t: tb.Table, r: Integer): Boolean {
+    let owner = txn.ownerOf(tm, t.id, r)
+    if owner < 0 { return false }
+    let ow = tm.txns[owner]
+    let u = 0
+    while u < ow.uCount {
+        if ow.uTable.getInt64(u * 8) == t.id && ow.uRow.getInt64(u * 8) == r && (ow.uKind.getInt64(u * 8) & txn.U_KEYCHG) != 0 { return true }
+        u += 1
+    }
+    return false
+}
+
+// Did transaction slot `owner` move a row away from key k (cols) with an update that changed indexed columns?
+function oldKeyChanged(tm: txn.TxnMgr, owner: Integer, t: tb.Table, cols: List<Integer>, k: ix.Key): Boolean {
+    let ow = tm.txns[owner]
+    let sc = tb.cloneSchema(t, -2)
+    let u = 0
+    while u < ow.uCount {
+        let kind = ow.uKind.getInt64(u * 8)
+        if ow.uTable.getInt64(u * 8) == t.id && (kind & 15) == txn.U_UPDATE && (kind & txn.U_KEYCHG) != 0 {
+            if sc.nrows == 0 { tb.reserveRow(sc, 0) }
+            let cur = tb.Cursor { pos: ow.uImgOff.getInt64(u * 8) }
+            tb.decodeRow(sc, 0, ow.uImg, cur)
+            if ix.rowMatchesKey(sc, cols, 0, k) { return true }
+        }
+        u += 1
+    }
+    return false
+}
+
+// Positions in fkCols of each of idxCols (only those found).
+function subsetPositions(idxCols: List<Integer>, fkCols: List<Integer>): List<Integer> {
+    let out: List<Integer> = []
+    for ci in idxCols {
+        let j = 0
+        while j < fkCols.length {
+            if fkCols[j] == ci { out.add(j) }
+            j += 1
+        }
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- referential actions
+
+function deleteRow(c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: tb.Table, r: Integer) {
+    if (t.state[r] & tb.ST_DEAD) != 0 { return }
+    txn.addUndo(tm, tx, t, r, txn.U_DELETE, false)
+    t.state[r] = t.state[r] | tb.ST_DEAD
+    t.live -= 1
+    tx.redo.add(dml.R_DELETE)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+}
+
+// Copy a key cell (same class; integer narrowing is range checked).
+function copyCell(p: ex.Plan, dst: tb.Column, dr: Integer, src: tb.Column, sr: Integer): Boolean {
+    if tb.isNull(src, sr) {
+        tb.setNull(dst, dr)
+        return true
+    }
+    tb.clearNull(dst, dr)
+    if v.isTextType(dst.type) {
+        let off = tb.textOff(src, sr)
+        let len = tb.textLen(src, sr)
+        let b = src.heap.slice(off, off + len)
+        tb.setText(dst, dr, b, 0, len)
+        return true
+    }
+    if dst.type == v.T_FLOAT8 || dst.type == v.T_FLOAT4 {
+        tb.setFloat(dst, dr, tb.getFloat(src, sr))
+        return true
+    }
+    let x = tb.getInt(src, sr)
+    if (dst.width == 4 && (x < -2147483648 || x > 2147483647)) || (dst.width == 2 && (x < -32768 || x > 32767)) {
+        ex.raise(p, "22003", "integer out of range")
+        return false
+    }
+    tb.setInt(dst, dr, x)
+    tb.setScale(dst, dr, tb.getScale(src, sr))
+    return true
+}
+
+// ON UPDATE CASCADE (src row = new parent values) or SET NULL (srcRow < 0) on child row cr.
+function setChildKey(c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, p: ex.Plan, fk: cat.ForeignKey, ct: tb.Table, cr: Integer, src: tb.Table, srcRow: Integer) {
+    if srcRow < 0 {
+        for ci in fk.childCols {
+            if ct.cols[ci].notNull {
+                ex.raise(p, "23502", "null value in column \"" + ct.cols[ci].name + "\" of relation \"" + ct.name + "\" violates not-null constraint")
+                return
+            }
+        }
+    }
+    let u = txn.addUndo(tm, tx, ct, cr, txn.U_UPDATE, true)
+    let indexed = false
+    for ci in fk.childCols {
+        if cat.columnIndexed(c, ct, ci) { indexed = true }
+    }
+    if indexed {
+        txn.markKeyChange(tx, u)
+        cat.indexRemoveRow(c, ct, cr)
+    }
+    let i = 0
+    while i < fk.childCols.length {
+        let col = ct.cols[fk.childCols[i]]
+        if srcRow < 0 {
+            tb.setNull(col, cr)
+        } else if !copyCell(p, col, cr, src.cols[fk.parentCols[i]], srcRow) {
+            if indexed { cat.indexInsertRow(c, ct, cr) }
+            return
+        }
+        i += 1
+    }
+    if indexed { cat.indexInsertRow(c, ct, cr) }
+    tx.redo.add(dml.R_UPDATE)
+    tb.putVarint(tx.redo, ct.id)
+    tb.putVarint(tx.redo, cr)
+    tb.putVarint(tx.redo, fk.childCols.length)
+    for ci in fk.childCols {
+        tb.putVarint(tx.redo, ci)
+        tb.encodeValue(ct.cols[ci], cr, tx.redo)
+    }
+}
+
+// ---------------------------------------------------------------- statement end
+
+record Ctx {
+    c: cat.Catalog
+    tm: txn.TxnMgr
+    tx: txn.Txn
+    p: ex.Plan
+    topTable: Integer
+    topEnd: Integer
+    setCols: List<Integer>
+    scratchIds: List<Integer>
+    scratch: List<tb.Table>
+}
+
+// Before image of undo entry i (row 0 of a per-table scratch table).
+function image(x: Ctx, i: Integer, t: tb.Table): tb.Table {
+    let k = 0
+    let sc = tb.newTable(-2, "")
+    let found = false
+    while k < x.scratchIds.length {
+        if x.scratchIds[k] == t.id {
+            sc = x.scratch[k]
+            found = true
+        }
+        k += 1
+    }
+    if !found {
+        sc = tb.cloneSchema(t, -2)
+        x.scratchIds.add(t.id)
+        x.scratch.add(sc)
+    }
+    if sc.nrows == 0 { tb.reserveRow(sc, 0) }
+    let cur = tb.Cursor { pos: x.tx.uImgOff.getInt64(i * 8) }
+    tb.decodeRow(sc, 0, x.tx.uImg, cur)
+    return sc
+}
+
+// Did the update recorded by undo entry i change any of cols?
+function changed(x: Ctx, i: Integer, t: tb.Table, r: Integer, cols: List<Integer>): Boolean {
+    if i < x.topEnd && t.id == x.topTable {
+        for ci in cols {
+            for sc in x.setCols {
+                if sc == ci { return true }
+            }
+        }
+        return false
+    }
+    let img = image(x, i, t)
+    for ci in cols {
+        let a = img.cols[ci]
+        let b = t.cols[ci]
+        let an = tb.isNull(a, 0)
+        let bn = tb.isNull(b, r)
+        if an != bn { return true }
+        if !an && !cellsEqual(a, 0, b, r) { return true }
+    }
+    return false
+}
+
+function blocked(x: Ctx, owner: Integer) {
+    x.p.blockedBy = owner
+}
+
+function stillReferenced(x: Ctx, fk: cat.ForeignKey, src: tb.Table, sr: Integer) {
+    let c = x.c
+    let pt = c.tables[fk.parentId]
+    ex.raise(x.p, "23503", "update or delete on table \"" + pt.name + "\" violates foreign key constraint \"" + fk.name + "\" on table \"" +
+             c.tables[fk.childId].name + "\"")
+    let vals: List<Text> = []
+    let i = 0
+    while i < fk.parentCols.length {
+        if i > 0 { vals.add(", ") }
+        vals.add(cellText(src.cols[fk.parentCols[i]], sr))
+        i += 1
+    }
+    x.p.errDetail = "Key (" + joinNames(pt, fk.parentCols) + ")=(" + joinText(vals) + ") is still referenced from table \"" + c.tables[fk.childId].name + "\"."
+}
+
+// Phase 1: referential actions for undo entry i (a deleted or re-keyed parent row).
+function actions(x: Ctx, i: Integer) {
+    let c = x.c
+    let tx = x.tx
+    let kind = tx.uKind.getInt64(i * 8) & 15
+    if kind != txn.U_DELETE && kind != txn.U_UPDATE { return }
+    let tid = tx.uTable.getInt64(i * 8)
+    let r = tx.uRow.getInt64(i * 8)
+    let t = c.tables[tid]
+    if cat.isDropped(t) || r >= t.nrows { return }
+    let fi = 0
+    while fi < c.fks.length {
+        let fk = c.fks[fi]
+        if !fk.dropped && fk.parentId == tid {
+            let act = fk.onDelete
+            if kind == txn.U_UPDATE { act = fk.onUpdate }
+            if (act == ast.FK_CASCADE || act == ast.FK_SET_NULL) && (kind == txn.U_DELETE || changed(x, i, t, r, fk.parentCols)) {
+                let src = t
+                let sr = r
+                if kind == txn.U_UPDATE {
+                    src = image(x, i, t)
+                    sr = 0
+                }
+                let refs: List<Integer> = []
+                let owner = referencing(c, x.tm, tx.slot, fk, src, sr, refs, true)
+                if owner >= 0 {
+                    blocked(x, owner)
+                    return
+                }
+                let ct = c.tables[fk.childId]
+                for cr in refs {
+                    if cr >= 0 && (ct.state[cr] & tb.ST_DEAD) == 0 {
+                        if kind == txn.U_DELETE && act == ast.FK_CASCADE {
+                            deleteRow(c, x.tm, tx, ct, cr)
+                        } else if act == ast.FK_SET_NULL {
+                            setChildKey(c, x.tm, tx, x.p, fk, ct, cr, t, -1)
+                        } else if (t.state[r] & tb.ST_DEAD) == 0 {
+                            setChildKey(c, x.tm, tx, x.p, fk, ct, cr, t, r)
+                        }
+                        if x.p.err { return }
+                    }
+                }
+            }
+        }
+        fi += 1
+    }
+}
+
+// Phase 2: checks for undo entry i.
+function checks(x: Ctx, i: Integer) {
+    let c = x.c
+    let tx = x.tx
+    let me = tx.slot
+    let k = tx.uKind.getInt64(i * 8)
+    let kind = k & 15
+    let tid = tx.uTable.getInt64(i * 8)
+    let r = tx.uRow.getInt64(i * 8)
+    let t = c.tables[tid]
+    if cat.isDropped(t) || r >= t.nrows { return }
+    let fi = 0
+    while fi < c.fks.length {
+        let fk = c.fks[fi]
+        if !fk.dropped {
+            if fk.childId == tid && (kind == txn.U_INSERT || kind == txn.U_UPDATE || kind == txn.U_BULK) {
+                let from = r
+                let to = r + 1
+                if kind == txn.U_BULK { to = k >> 8 }
+                let row = from
+                while row < to && row < t.nrows {
+                    let live = (t.state[row] & tb.ST_DEAD) == 0 || (kind == txn.U_BULK && (t.state[row] & tb.ST_NEW) != 0)
+                    if live && (kind != txn.U_UPDATE || changed(x, i, t, row, fk.childCols)) && fillKey(fk, fk.probe, t, row, false) {
+                        let res = probeParent(c, x.tm, me, fk, fk.probe, -1)
+                        if res >= 0 {
+                            blocked(x, res)
+                            return
+                        }
+                        if res == -1 {
+                            ex.raise(x.p, "23503", "insert or update on table \"" + t.name + "\" violates foreign key constraint \"" + fk.name + "\"")
+                            x.p.errDetail = missingDetail(c, fk, t, row)
+                            return
+                        }
+                    }
+                    row += 1
+                }
+            }
+            if fk.parentId == tid && (kind == txn.U_DELETE || kind == txn.U_UPDATE) {
+                let act = fk.onDelete
+                if kind == txn.U_UPDATE { act = fk.onUpdate }
+                if (act == ast.FK_NO_ACTION || act == ast.FK_RESTRICT) && (kind == txn.U_DELETE || changed(x, i, t, r, fk.parentCols)) {
+                    let src = t
+                    let sr = r
+                    if kind == txn.U_UPDATE {
+                        src = image(x, i, t)
+                        sr = 0
+                    }
+                    // NO ACTION: fine if the old key still exists (another row took it in this statement)
+                    let stillThere = false
+                    if act == ast.FK_NO_ACTION {
+                        let pk = ix.newKey(fk.keyMap.length)
+                        if fillKey(fk, pk, src, sr, true) && probeParent(c, x.tm, me, fk, pk, r) == -2 { stillThere = true }
+                    }
+                    if !stillThere {
+                        let refs: List<Integer> = []
+                        let owner = referencing(c, x.tm, me, fk, src, sr, refs, false)
+                        if owner >= 0 {
+                            blocked(x, owner)
+                            return
+                        }
+                        if refs.length > 0 {
+                            stillReferenced(x, fk, src, sr)
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        fi += 1
+    }
+}
+
+// Enforce foreign keys for the changes of one statement: undo entries [from, tx.uCount). topTable / setCols: the
+// table and SET columns of a top-level UPDATE (lets unchanged keys skip without decoding images), else -1 / [].
+// Errors and waits are reported through p (p.err / p.blockedBy); the caller rolls the statement back.
+public function afterStatement(c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, p: ex.Plan, from: Integer, topTable: Integer, setCols: List<Integer>) {
+    if c.nLiveFks == 0 || from >= tx.uCount { return }
+    let x = Ctx { c: c; tm: tm; tx: tx; p: p; topTable: topTable; topEnd: tx.uCount; setCols: setCols; scratchIds: []; scratch: [] }
+    let start = from
+    let rounds = 0
+    while start < tx.uCount {
+        let end = tx.uCount
+        let i = start
+        while i < end {
+            actions(x, i)
+            if p.err || p.blockedBy >= 0 { return }
+            i += 1
+        }
+        start = end
+        rounds += 1
+        if rounds > 100000 {
+            ex.raise(p, "54001", "foreign key cascade too deep")
+            return
+        }
+    }
+    let i = from
+    let n = tx.uCount
+    while i < n {
+        checks(x, i)
+        if p.err || p.blockedBy >= 0 { return }
+        i += 1
+    }
+}

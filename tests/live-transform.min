@@ -1,0 +1,96 @@
+use "../tools/live-transform.min" as live
+use "../tools/driver-support.min" as host
+use "../tools/testing.min" as test
+use "io" as io
+use "system" as system
+
+function same(before: Text, after: Text, label: Text) {
+    let first = live.surface(before)
+    let second = live.surface(after)
+    test.check(first.startsWith("live-surface-v1\n") && second.startsWith("live-surface-v1\n"), label + " was not a complete source surface")
+    test.check(first == second, label)
+}
+function different(before: Text, after: Text, label: Text) {
+    let first = live.surface(before)
+    let second = live.surface(after)
+    test.check(first.startsWith("live-surface-v1\n") && second.startsWith("live-surface-v1\n"), label + " was not a complete source surface")
+    test.check(first != second, label)
+}
+
+same("function value(): Integer { return 1 }\n", "function value(): Integer {\n    let result = 40\n    return result + 2\n}\n", "ordinary function body edits preserve the surface")
+same("function Counter.tick(): Integer { return self.value }\n", "function Counter.tick(): Integer { self.value += 1; return self.value }\n", "method body edits preserve the surface")
+same("// first\nfunction value(): Integer { return 1 }\n", "// changed comment\nfunction /* header comment */ value(): Integer { return 2 }\n", "comments are excluded from the surface")
+same("function value(): Text { return #\"a } b\"# }\n", "function value(): Text { return \"\"\"a { b\nsecond line }\"\"\" }\n", "raw and multiline literal braces stay inside the function")
+same("function value(): Character { return '{' }\n", "function value(): Character { return '}' }\n", "character literal braces stay inside the function")
+same("function value(): Text { return \"a \\(1 + 2) }\" }\n", "function value(): Text { return \"b \\(3 + 4) {\" }\n", "interpolation is kept inside its containing literal")
+same("function value(): Integer { /* } { */ return 1 }\n", "function value(): Integer { if true { return 2 }; return 3 }\n", "nested bodies and comment braces are balanced")
+different("function value(): Integer { return 1 }\n", "function value(): Float { return 1.0 }\n", "function return headers are part of the surface")
+different("function value(x: Integer): Integer { return x }\n", "function value(x: Float): Integer { return 1 }\n", "function parameter headers are part of the surface")
+different("function main() { print(1) }\n", "function main() { print(2) }\n", "main remains initialization code")
+different("print(1)\n", "print(2)\n", "top-level initialization stays exact")
+different("record Point { x: Integer; y: Text }\n", "record Point { y: Text; x: Integer }\n", "record field order is part of the surface")
+different("record Point { x: Integer }\n", "record Point { x: Text }\n", "record field types are part of the surface")
+different("global count: Integer = 1\n", "global count: Integer = 2\n", "global initialization is part of the surface")
+different("constant count = 1\n", "constant count = 2\n", "constant values are part of the surface")
+different("use \"./first.min\" as dependency\n", "use \"./second.min\" as dependency\n", "imports are part of the surface")
+different("function value(): Integer { native \"first\" }\n", "function value(): Integer { native \"second\" }\n", "native implementations require restarting")
+different("function lastError(): Integer { ; native \"files\" }\n", "function lastError(): Integer { ; native \"system\" }\n", "native implementations after a semicolon require restarting")
+different("function lastError(): Integer { let marker = 0; native \"files\" }\n", "function lastError(): Integer { let marker = 0; native \"system\" }\n", "native implementations after another statement require restarting")
+different("function lastError(): Integer { ; native\n\"files\" }\n", "function lastError(): Integer { ; native\n\"system\" }\n", "native implementations separated from their library by a newline stay guarded")
+different("function value(): Integer { return 1 }\n", "function value(): Integer { native \"first\" }\n", "switching from Minyar to native requires restarting")
+for malformed in ["function broken() {", "function broken() { return [1) }", "function broken(): Text { return \"unfinished }", "/* unfinished"] {
+    test.check(live.surface(malformed).startsWith("live-surface-error: "), "malformed source must not become a reusable ABI surface")
+}
+
+let ir = "@\"minyar.constant|session|value\" = internal global ptr zeroinitializer\n@\"minyar.constant|session|state\" = internal global i8 0\n@.text = private unnamed_addr constant [16 x i8] c\"@.minyar.fn.add\\00\"\n; preserve @.minyar.fn.add in this comment\ndefine internal i64 @.helper() alwaysinline {\nentry:\n  ret i64 2\n}\ndefine i64 @.minyar.fn.add(i64 %argument.0, i64 %argument.1) uwtable {\nentry:\n  %sum = add i64 %argument.0, %argument.1\n  ret i64 %sum\n}\ndefine i1 @.minyar.fn.flip(i1 %argument.0) uwtable {\nentry:\n  %result = xor i1 %argument.0, true\n  ret i1 %result\n}\ndefine double @.minyar.fn.scale(double %argument.0) uwtable {\nentry:\n  %result = fmul double %argument.0, 2.0\n  ret double %result\n}\ndefine i32 @.minyar.fn.character(i32 %argument.0) uwtable {\nentry:\n  ret i32 %argument.0\n}\ndefine ptr @.minyar.fn.identity(ptr %argument.0) uwtable {\nentry:\n  ret ptr %argument.0\n}\ndefine void @.minyar.fn.observe(ptr %argument.0) uwtable {\nentry:\n  store i64 42, ptr %argument.0\n  ret void\n}\ndefine i32 @main(i32 %count, ptr %values) uwtable {\nentry:\n  %two = call i64 @.helper()\n  %sum = call i64 @.minyar.fn.add(i64 40, i64 %two)\n  %integer.ok = icmp eq i64 %sum, 42\n  %boolean.ok = call i1 @.minyar.fn.flip(i1 false)\n  %scaled = call double @.minyar.fn.scale(double 21.0)\n  %float.ok = fcmp oeq double %scaled, 42.0\n  %character = call i32 @.minyar.fn.character(i32 65)\n  %character.ok = icmp eq i32 %character, 65\n  %cell = alloca i64\n  store i64 0, ptr %cell\n  %identity = call ptr @.minyar.fn.identity(ptr %cell)\n  %reference.ok = icmp eq ptr %identity, %cell\n  call void @.minyar.fn.observe(ptr %identity)\n  %observed = load i64, ptr %cell\n  %nothing.ok = icmp eq i64 %observed, 42\n  %a = and i1 %integer.ok, %boolean.ok\n  %b = and i1 %float.ok, %character.ok\n  %c = and i1 %reference.ok, %nothing.ok\n  %d = and i1 %a, %b\n  %ok = and i1 %d, %c\n  %bad = xor i1 %ok, true\n  %status = zext i1 %bad to i32\n  ret i32 %status\n}\n"
+let initial = live.transform(ir, 0, true)
+let next = live.transform(ir, 1, false)
+test.check(initial.error == "" && next.error == "", "supported LLVM must transform: " + initial.error + next.error)
+test.check(initial.names.length == 6 && initial.symbols.length == 6, "only ordinary named language functions enter the manifest")
+test.check(initial.names[0] == ".minyar.fn.add", "the manifest keeps canonical source function names")
+test.check(initial.symbols[0] != next.symbols[0], "implementation exports differ between generations")
+test.check(initial.signature == next.signature, "generation names do not change the ABI signature")
+let changedPolicy = live.transform(ir + "; minyar-cycle-runtime: 1\n", 1, false)
+test.check(changedPolicy.error == "" && changedPolicy.signature != initial.signature, "runtime ownership requirements are part of the image ABI")
+test.check(host.hasText(initial.llvm, "define i32 @main("), "the original executable retains main")
+test.check(!host.hasText(next.llvm, "define i32 @main("), "replacement images cannot preempt main")
+test.check(!host.hasText(initial.llvm, "define internal i64 @.helper("), "internal helpers receive generation-specific names")
+test.check(host.hasText(initial.llvm, "@\"minyar.constant|session|value\" = global ptr zeroinitializer"), "original module values are exported")
+test.check(host.hasText(initial.llvm, "@\"minyar.constant|session|state\" = global i8 0"), "original module initialization states are exported")
+test.check(host.hasText(next.llvm, "@\"minyar.constant|session|value\" = external global ptr"), "reloaded code refers to original module values")
+test.check(host.hasText(next.llvm, "@\"minyar.constant|session|state\" = external global i8"), "reloaded code refers to original initialization state")
+test.check(host.hasText(initial.llvm, "c\"@.minyar.fn.add\\00\""), "symbol rewriting preserves literal data")
+test.check(host.hasText(initial.llvm, "; preserve @.minyar.fn.add in this comment"), "symbol rewriting preserves comments")
+test.check(host.hasText(initial.llvm, "call ptr @minyar_live_resolve(ptr @minyar.live.0.key."), "wrappers ask the shared runtime for the current body")
+test.check(host.hasText(initial.llvm, "call double %live.target(double %argument.0)"), "Float forwarding retains the scalar ABI")
+test.check(host.hasText(initial.llvm, "call void %live.target(ptr %argument.0)"), "Nothing forwarding does not invent a return value")
+let changedBody = live.transform(host.replaceText(ir, "%sum = add i64", "%sum = sub i64"), 2, false)
+let changedHeader = live.transform(host.replaceText(ir, "define i64 @.minyar.fn.add(i64", "define i64 @.minyar.fn.add(i32"), 2, false)
+test.check(changedBody.error == "" && changedBody.signature == initial.signature, "body instructions do not become ABI signatures")
+test.check(changedHeader.error == "" && changedHeader.signature != initial.signature, "parameter ABI changes alter the image signature")
+let quoted = live.transform("define i64 @\".minyar.fn.quote\\22slash\\5Cname\"() {\nentry:\n  ret i64 1\n}\n", 9, false)
+test.check(quoted.error == "" && quoted.names[0] == ".minyar.fn.quote\"slash\\name", "quoted LLVM names decode exact bytes for runtime lookup")
+test.check(host.hasText(quoted.llvm, "c\".minyar.fn.quote\\22slash\\5Cname\\00\""), "runtime lookup keys re-escape quotes and backslashes")
+let aliases = live.transform("define i64 @\".minyar.fn.alias\"() {\nentry:\n  ret i64 1\n}\ndefine i32 @main() {\nentry:\n  %value = call i64 @.minyar.fn.alias()\n  ret i32 0\n}\n", 0, true)
+test.check(aliases.error == "" && !host.hasText(aliases.llvm, "call i64 @.minyar.fn.alias("), "quoted and unquoted spellings of one LLVM symbol share their binding")
+test.check(live.transform("define i64 @\".minyar.fn.bad\\GG\"() {\n  ret i64 0\n}\n", 0, true).error != "", "invalid LLVM symbol escapes fail closed")
+test.check(live.transform("define i64 @.minyar.fn.bad(i64 noundef %x) {\n  ret i64 %x\n}\n", 0, true).error != "", "unsupported parameter attributes fail closed")
+test.check(live.transform(ir + "; minyar-thread-runtime: 1\n", 0, true).error != "", "threaded programs are rejected by this first slice")
+test.check(live.transform(ir + "; minyar-data-parallel-runtime: 1\n", 0, true).error != "", "parallel programs are rejected by this first slice")
+test.check(live.transform(ir, -1, true).error != "", "invalid generation identity is rejected")
+test.check(live.transform("define i64 @.minyar.fn.bad() {\n  ret i64 1\n", 0, true).error != "", "incomplete generated functions fail closed")
+
+// Compile generated forwarding code, so the contract checks cover real LLVM
+// syntax and every supported scalar/pointer ABI at both useful optimizations.
+let work = test.scratch()
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+io.writeTextFile(work + "/initial.ll", initial.llvm)
+io.writeTextFile(work + "/next.ll", next.llvm)
+io.writeTextFile(work + "/resolver.c", "void *minyar_live_resolve(const char *name, void *initial) { (void)name; return initial; }\n")
+for optimization in ["-O0", "-O2"] {
+    test.require(test.run([clang, optimization, "-Wno-override-module", work + "/initial.ll", work + "/resolver.c", "-o", work + "/program"], system.environment(), "", work + "/link", 30), "live forwarding " + optimization)
+    let execution = test.run([work + "/program"], system.environment(), "", work + "/run", 10)
+    test.check(execution.status == 0 && execution.output == "" && execution.errorOutput == "", "live forwarding ABI execution " + optimization + ": " + execution.errorOutput)
+    test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/next.ll", "-o", work + "/next.o"], system.environment(), "", work + "/object", 30), "replacement image LLVM " + optimization)
+}
+print("live transform tests passed")

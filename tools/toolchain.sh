@@ -246,6 +246,51 @@ toolchain() {
     printf '%s\n' "$pinned_path"
 }
 
+compiler_lto_flags() {
+    split_words llvm_options "${LLVM_FLAGS--O2 -Wno-override-module}" LLVM_FLAGS
+    eval "set -- $llvm_options"
+    custom_linker=0
+    for option in "$@"; do
+        case $option in -fuse-ld=*|--ld-path=*) custom_linker=1 ;; esac
+    done
+    lto_flags "${LLVM_CC-$(default_clang)}" "$@"
+    eval "set -- $llvm_options $lto"
+    linker=
+    linker_path=
+    threads=0
+    for option in "$@"; do
+        case $option in
+            -fuse-ld=*) linker=${option#*=} ;;
+            --ld-path=*) linker_path=${option#*=} ;;
+        esac
+        case $option in *--threads*) threads=1 ;; esac
+    done
+    [ -z "$linker_path" ] || linker=$linker_path
+    if [ "$(host_system)" = Linux ]; then
+        case $linker in
+            */lld|lld|*/ld.lld|ld.lld)
+                [ "$threads" != 0 ] || lto="$lto '-Wl,--threads=1'"
+                # Only the automatically selected ELF lld gets cache options.
+                # Custom linkers and explicit COMPILER_LTO_FLAGS remain user-owned.
+                cache_dir=${COMPILER_LTO_CACHE_DIR-build/thinlto-cache}
+                if [ "$custom_linker" = 0 ] && [ -n "$cache_dir" ]; then
+                    cache_policy=${COMPILER_LTO_CACHE_POLICY-cache_size=10%:cache_size_bytes=1g:cache_size_files=10000:prune_after=168h:prune_interval=0s}
+                    quote_word "--thinlto-cache-dir=$cache_dir"
+                    lto="$lto '-Xlinker' $_quoted"
+                    quote_word "--thinlto-cache-policy=$cache_policy"
+                    lto="$lto '-Xlinker' $_quoted"
+                fi ;;
+        esac
+    fi
+    eval "set -- $lto"
+    flags=
+    for option in "$@"; do
+        python_quote "$option"
+        flags="$flags${flags:+ }$_quoted"
+    done
+    printf '%s\n' "$flags"
+}
+
 bootstrap() {
     prepare_sdk
     project=$1
@@ -270,30 +315,15 @@ bootstrap() {
     export LLVM_CC
     if [ "${CC+x}" != x ]; then CC=$LLVM_CC; export CC; fi
     if [ "${COMPILER_LTO_FLAGS+x}" != x ]; then
-        split_words llvm_options "${LLVM_FLAGS--O2 -Wno-override-module}" LLVM_FLAGS
-        eval "set -- $llvm_options"
-        lto_flags "$LLVM_CC" "$@"
-        eval "set -- $llvm_options $lto"
-        lld=0
-        threads=0
-        for option in "$@"; do
-            case $option in
-                -fuse-ld=*|--ld-path=*)
-                    case ${option#*=} in */lld|lld|*/ld.lld|ld.lld) lld=1 ;; esac ;;
-            esac
-            case $option in *--threads*) threads=1 ;; esac
-        done
-        if [ "$(host_system)" = Linux ] && [ "$lld" = 1 ] && [ "$threads" = 0 ]; then lto="$lto '-Wl,--threads=1'"; fi
-        eval "set -- $lto"
-        COMPILER_LTO_FLAGS=
-        for option in "$@"; do
-            python_quote "$option"
-            COMPILER_LTO_FLAGS="$COMPILER_LTO_FLAGS${COMPILER_LTO_FLAGS:+ }$_quoted"
-        done
+        COMPILER_LTO_FLAGS=$(compiler_lto_flags)
         export COMPILER_LTO_FLAGS
     fi
     split_words make_options "${MINYAR_MAKE_FLAGS-}" MINYAR_MAKE_FLAGS
     eval "set -- $make_options $targets"
+    # Launchers may be called by a Make recipe through a process API that closes
+    # jobserver descriptors. Use our explicit options instead of stale parent
+    # recursion state, which makes nested Make warn about missing descriptors.
+    unset MAKEFLAGS MFLAGS MAKELEVEL
     lock=$project/build/bootstrap.lock
     if find_command lockf >/dev/null; then
         exec lockf -k "$lock" make -s -C "$project" "$@"
@@ -551,12 +581,13 @@ host_directory() {
 
 command=${1-}
 [ "$#" -eq 0 ] || shift
-usage='usage: toolchain.sh toolchain | doctor | version PROJECT | stamp TARGET | bootstrap PROJECT TARGET...'
+usage='usage: toolchain.sh toolchain | compiler-lto-flags | doctor | version PROJECT | stamp TARGET | bootstrap PROJECT TARGET...'
 case $command:$# in
     stamp:1) stamp "$1" ;;
     host-path:1) host_path "$1"; printf '%s\n' "$host_value" ;;
     host-directory:1) host_directory "$1"; printf '%s\n' "$host_value" ;;
     toolchain:0) toolchain ;;
+    compiler-lto-flags:0) compiler_lto_flags ;;
     default-clang:0) default_clang ;;
     sdkroot:0) sdkroot ;;
     doctor:0) doctor ;;

@@ -5,11 +5,12 @@ use "./registry.min" as registry
 use "./registry-publish.min" as publish
 use "./module-tests.min" as moduleTests
 use "./documentation.min" as documentation
+use "./live-project.min" as live
 use "./driver-support.min" as host
 use "system" as system
 use "files" as files
 
-record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; registry: Text; description: Text; errorFormat: Text; release: Boolean; library: Boolean; locked: Boolean; offline: Boolean; force: Boolean; incremental: Boolean; positionals: List<Text>; arguments: List<Text> }
+record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; registry: Text; description: Text; errorFormat: Text; release: Boolean; library: Boolean; locked: Boolean; offline: Boolean; force: Boolean; incremental: Boolean; watch: Boolean; hot: Boolean; positionals: List<Text>; arguments: List<Text> }
 
 function help() {
     print("""
@@ -53,6 +54,8 @@ function help() {
       --locked                    Require an up-to-date Minyar.lock
       --offline                   Use cached sources; never download
       --no-incremental            Disable module compilation caching
+      --watch                     Rebuild and run after source edits (run only)
+      --hot                       Preserve state on function edits (--watch only)
       --name NAME                 Set the project name for new/init
       --lib                       Create a library with new/init
       --root DIR                  Install in $MINYAR_HOME or ~/.minyar by default
@@ -67,7 +70,7 @@ function help() {
     """)
 }
 function parse(): Options {
-    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; registry: ""; description: "Minyar source library."; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; positionals: []; arguments: [] }
+    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; registry: ""; description: "Minyar source library."; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; watch: false; hot: false; positionals: []; arguments: [] }
     let seen: List<Text> = []
     let index = 1
     while index < processInfo.argumentCount() {
@@ -88,6 +91,8 @@ function parse(): Options {
             else if item == "--offline" { options.offline = true }
             else if item == "--force" { options.force = true }
             else if item == "--no-incremental" { options.incremental = false }
+            else if item == "--watch" { options.watch = true }
+            else if item == "--hot" { options.hot = true }
             else if item == "--dry-run" { }
             else if item == "--manifest-path" || item == "--path" || item == "--name" || item == "--root" || item == "--registry" || item == "--description" || item == "--error-format" {
                 index += 1
@@ -115,12 +120,14 @@ function parse(): Options {
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--dry-run" || option == "--description" { allowed = options.command == "publish" }
         else if option == "--registry" { allowed = options.command == "search" || options.command == "info" }
+        else if option == "--watch" || option == "--hot" { allowed = options.command == "run" }
         else if option == "--manifest-path" { allowed = options.command != "new" && options.command != "init" && options.command != "uninstall" && options.command != "search" && options.command != "info" }
         else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "doc", "tree", "metadata", "install"], options.command) }
         else if option == "--offline" { allowed = host.listed(["build", "run", "check", "test", "doc", "tree", "metadata", "install", "add", "remove", "search", "info"], options.command) }
         else { allowed = host.listed(["build", "run", "check", "test", "doc", "install"], options.command) }
         if !allowed { host.stop(option + " is not supported by " + options.command) }
     }
+    if options.hot && !options.watch { host.stop("--hot requires run --watch") }
     return options
 }
 function execute(arguments: List<Text>, directory: Text, environment: List<Text>): Integer {
@@ -241,6 +248,7 @@ function build(graph: project.Graph, options: Options): Text {
     let output = directory + "/" + package.name
     if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
     compile(graph, options, source, output, !project.isBinary(package))
+    live.publishRoots(graph)
     print("Finished " + profile(options) + " " + package.name)
     return output
 }
@@ -540,6 +548,16 @@ function dispatch() {
     }
     if options.command == "run" {
         if !project.isBinary(package) { host.stop("run requires src/main.min in a binary package") }
+        if options.watch {
+            let flags: List<Text> = []
+            if options.release { flags.add("--release") }
+            if options.locked { flags.add("--locked") }
+            if options.offline { flags.add("--offline") }
+            if !options.incremental { flags.add("--no-incremental") }
+            if options.errorFormat != "" { flags.add("--error-format"); flags.add(options.errorFormat) }
+            let output = outputDirectory(root, profile(options)) + "/" + package.name
+            exit(live.run(graph, compiler(), output, options.arguments, flags, options.hot))
+        }
         let output = build(graph, options)
         let arguments = [output]
         for item in options.arguments { arguments.add(item) }

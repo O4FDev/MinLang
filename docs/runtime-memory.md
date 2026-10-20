@@ -155,6 +155,31 @@ and run scope cleanup; cycles through either payload follow the same
 graph analysis. See the Result language contract
 and the independent review.
 
+Choices share their payload slots across cases and track only the active
+reference fields. A two-case choice with one Text, Bytes, List or ordinary managed record
+payload uses that payload pointer directly, reserving null for the empty case.
+This includes `Maybe<Text>`, `Maybe<Bytes>`, `Maybe<List<Item>>` and `Maybe<Record>`
+and adds no wrapper object or reference-count edge. Empty Text headers are
+non-null. Text key snapshots
+retain the immutable payload and return one owned result; record payloads
+keep their existing deep snapshot copy. Bytes optionals retain the mutable
+header without copying its contents. Empty headers are non-null; C-layout
+Bytes views retain their existing backing-owner edge. Bytes remain ineligible
+for implicit key snapshots or derived equality, ordering and hashing.
+List optionals also retain their mutable header without copying elements.
+Scalar-element and reference-element Lists keep their element kinds and
+allocation metadata. A nullable choice/List cycle can become one physical List
+self-edge; its tracing metadata still identifies a List, rather than a record.
+The compiler keeps the full logical field graph for cycle analysis and projects
+nullable aliases to their payload type when choosing traced ownership calls.
+Choice, callback and C-layout payloads retain an explicit tag; in particular,
+an optional containing another optional must preserve `Some(None)`.
+Physical layout kind 3 denotes this nullable payload contract, with zero
+choice-owned storage slots. Its niche type may be Text (type 2), Bytes (type 8),
+a structural List type or an ordinary managed record; consumers must classify
+the payload before reading its layout. Logical SCC metadata is preserved, and
+both endpoints of traced ownership operations use the physical payload type.
+
 ## Compiler/runtime ownership contract
 
 - Managed constructors and ordinary functions returning references produce one owned
@@ -178,7 +203,22 @@ and the independent review.
 - `minyar_rc_step` releases completed expression owners. It does not scan the
   heap. Nested function calls have separate expression storage.
 - A reference return transfers its owned result, or retains a borrowed result
-  for the caller.
+  for the caller. A checked return of a local name, optionally parenthesized,
+  moves that local's ownership count to the caller: returning ends the binding's
+  lifetime on that path. Other aliases retain their counts. Readonly borrowed
+  parameters, fields and indexed values keep the borrowed-return rule; a mutable
+  parameter without an established local owner receives a retained count instead.
+  Recoverable compiler jobs keep the existing retain-and-cleanup path.
+  A complete return expression using Text `+` or List `appended` can consume a
+  named local left operand or receiver after argument evaluation. Only the
+  complete root is eligible: an inner consumer cannot invalidate a later read
+  in the same return expression. Existing consuming runtime operations check
+  dynamic uniqueness and copy when aliases remain; traced Lists keep their
+  edge bookkeeping. No runtime ABI or reference semantics change.
+  Direct reassignment can use the same proof when the named receiver is the
+  target binding, including grouped receivers and RHS reads of that binding.
+  The old owner ends after all RHS evaluation and before the consuming call;
+  assignment roots the new result in its place.
   `minyar_rc_leave` retires that function's expression and local owners; the
   incremental profiles can complete their reclamation at later service points.
 - Functions using only scalars and borrowed parameters can omit ownership frames. Local stack slots are
@@ -187,32 +227,126 @@ and the independent review.
   Their stack storage never enters a deferred queue or cache. Other ownership
   frames use pooled heap storage; K1 keeps that ordinary representation.
 
+## Scope ownership lowering
+
+The launcher selects scope ownership for `--memory-profile eager`, including
+incremental module builds and release builds. The direct compiler exposes the
+same lowering as `--scope-owners`. It replaces local-frame lookups with explicit
+retain, store and release operations. Each remaining expression producer uses an initialized-null stack
+cell. A control-flow walk places its release at the first statement cleanup or
+return on every reachable path, including both sides of a conditional and loop
+exits. Cleanup visits only cells that can be live there. A producer that could
+repeat before cleanup, or a function needing more than 256 cells before
+coalescing or cell reuse, keeps the ordinary frame representation.
+
+Temporary producers share a cell only when their inclusive visited-line ranges
+are disjoint. Ranges include every reachable line through each first cleanup,
+including backward branches and cleanup paths that skip the producer. Local
+owner cells remain distinct. Reuse preserves every retain, store, ordered
+normal release and poll; it reduces stack storage and null initialization.
+Diagnostic unwind still releases each live root once, without promising an
+order among independent roots.
+
+A plain temporary borrow immediately retained into a local or returned value
+shares that lasting owner's count. This requires adjacent emitted operations;
+intervening calls, branches and traced borrows keep their temporary owners.
+Local cleanup polls remain, and a coalesced return explicitly services pending
+work before unlinking its scope.
+
+A projected Text used only by the immediately following text equality call
+needs no temporary count. This requires a plain borrow from the generated
+record or checked List getter. The lowering audits every use of both the
+pointer and its raw field value; another use, an intervening call or an
+unsupported local identifier keeps the owner. Traced borrows keep their
+barriers. Statement and return service points remain present.
+
+The same lifetime proof covers ordinary text joins and text search: their
+allocation and lazy index work preserve the argument's existing parent owner
+and invoke no user callbacks. A consuming text join qualifies only for its
+borrowed right operand; its left input still needs the transferred owner.
+
+A projected reference packed only for the immediately following retaining
+record/List publication can likewise share the destination's real count. The
+lowering audits the pointer, raw getter value and packed value throughout the
+function; the packed value must occur once in the actual new-value operand.
+Record replacement requires a literal nontaking flag. Generic List setters and
+appenders qualify under the frontend's checked reference-element typing, which
+scalar pointer-bit storage cannot satisfy. List growth preserves existing
+source edges across allocation before publishing the new retained edge. Taking
+publishers, traced borrows, intervening effects and later SSA uses retain their
+temporary owners. The publisher's retain/barrier and cleanup polls remain.
+
+A nonempty scope uses a 24-byte stack header to link cells for diagnostics. Diagnostics
+release these roots before jumping back to their native recovery boundary;
+normal returns clear cells explicitly and unlink the header. Neither the header
+nor its cells enter a heap queue or cache. Traced retains and cycle service points
+remain present, and the final cycle drain waits for both kinds of ownership root.
+Reference arguments still borrow their callers; consuming an unowned parameter
+first creates the consumer's count.
+
+A function with zero final owner/temporary cells omits its header and entry
+registration. It keeps every poll, return retain and publication, and uses an
+empty-leave terminal check. After restoring both ownership chains and call
+depth, diagnostic recovery performs the same check before jumping: eager cycle
+work finishes when both registered chains are empty. A nonempty child can now
+finish dead cycles while its empty parent remains active; native/caller/return
+counts still protect live values. Collection and native-resource finalization
+can occur earlier, without promising an identical service trace. Empty leave
+adds no work in arena, ordinary non-cycle or bounded runtimes and does not call
+public release with NULL. Previously generated nonempty scope ABIs remain.
+
+Eager scope releases inline the count decrement for shared untraced values
+when no destruction or collector work is pending; immortal values return
+without a write. Last owners, traced values and pending work use the ordinary
+release path. Incremental profiles keep their ordinary release and service
+accounting. Null cells do not request an unlimited cycle drain.
+
+The public eager release entry also inlines idle shared decrements and immortal
+returns. Its original general body remains behind a separate noinline helper.
+Public NULL requests, last owners, pending destruction and traced cycle values
+retain that general path, including its service and barrier behavior. The
+external release ABI and bounded release budgets are unchanged.
+
+The direct compiler rejects combining this mode with `--bounded-owners`. The
+system, fixed and lazy launcher profiles retain ordinary bounded lowering.
+Linking scope output against an incremental runtime preserves ownership but performs a separately budgeted
+release for each live cell, followed by a service batch. The ordinary frame's
+single K-total limit for statement cleanup or frame exit therefore does not apply
+to this experimental sequence. It is not a replacement for that bounded contract.
+
 ## Scalar record replacement
 
 The compiler can eliminate a directly constructed local record whose fields
-are all Integer, Boolean or Character values. Its conservative lexical proof
+are all Integer, Float, Boolean or Character values. Its conservative lexical proof
 requires every later use of that binding in its scope to be a direct field
-projection. Whole-object aliases, arguments, returns, reassignment and container
+read or write. Whole-object aliases, arguments, returns, reassignment and container
 insertion keep the managed representation. Later same-name declarations also
 prevent replacement, even when a more precise analysis could prove them safe.
 Records with reference fields and immediately projected constructor expressions
 currently keep the managed representation.
 
-Each initializer is evaluated once in source order. The generated field reads
-use the captured scalar values, so a replaced object needs no allocation,
-reference count or cleanup. Unused records still evaluate their initializers.
-The proof relies on a binding that cannot escape or be reassigned and whose
-fields are never assigned; any `name.field = value` or compound field
-assignment in scope keeps the managed representation: its initializer definitions dominate every permitted use, including
-uses within nested branches or the current loop iteration. Capturing a value
-does not reread a mutable initializer input later. Any future feature that
+The binding's local ID is reserved before checking its initializer, without
+adding the name to scope early. A match expression can allocate its own locals
+without changing which binding owns the captured field metadata.
+Each initializer is evaluated once in source order. Readonly fields use the
+captured scalar values. A record with direct field updates instead uses private
+i64 field slots allocated once at function entry; field reads load the current
+value, and assignments store it. Loop-local construction initializes those slots
+again on each iteration. Compound assignment captures the old field before
+evaluating its right operand, matching managed records. LLVM can promote these
+slots to registers and branch/loop values at O2.
+
+Neither representation allocates a managed record or needs reference counting
+or cleanup. Unused records still evaluate their initializers. The binding must
+not escape or be reassigned, so no outside alias can observe private storage.
+Readonly candidates keep their previous LLVM at O0. Any future feature that
 allows whole-object access through another route must revisit this proof.
 
 The analysis charges each attempt before lookahead: eight bytes per field and
 at least eight per record, with a 512-byte cap per compiled function or top-level
 body. Rejected candidates consume this budget too. At most 64 attempts can scan
 the body's tokens, making this additional lookahead work linear in body size
-with a fixed factor. The cap also limits captured fields; it is not a physical
+with a fixed factor. The cap also limits captured and addressable fields; it is not a physical
 stack-size guarantee. LLVM handles remaining locals and register spills.
 
 ## Readonly parameter bindings
@@ -251,6 +385,12 @@ or scalar values. Records store a field count followed by inline fields; a
 two-Integer record requests 32 bytes including the ownership prefix. Generated
 LLVM accesses managed records through runtime calls, while scalar-replaced
 records use captured values.
+
+The ordinary Bytes, List and record allocation entry points declare non-null
+header returns in LLVM, including empty objects. Invalid sizes and allocation
+failure terminate before returning. The guarantee covers the returned header;
+an empty List can still have a null values buffer. It adds no pointer-argument
+alias promise or allocation-success guarantee.
 
 Records with reference fields have a byte per field identifying owned references.
 Scalar-only records omit that map. Cleanup releases only initialized reference

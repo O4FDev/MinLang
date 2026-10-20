@@ -1,0 +1,187 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "files" as files
+
+function pack(values: List<Text>): Text {
+    let pieces: List<Text> = []
+    for value in values { pieces.add(Text(value.length) + "\n" + value) }
+    return joinText(pieces)
+}
+
+function linkAndRun(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text) {
+    let compiler = frontend.compiler
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for argument in ["-Wno-override-module", path + ".ll", object, "-pthread", "-lm", "-o", path + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", path + ".link", 60), "link enum fixture " + level)
+        let result = test.run([path + ".exe"], frontend.environment, "", path + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == diagnostic, "enum fixture " + level + "\n" + result.output + result.errorOutput)
+    }
+}
+
+function state(frontend: fixtures.Frontend, entry: Text, output: Text, prior: Text, next: Text, stats: Text) {
+    test.require(test.run([frontend.compiler.executable, entry, output + ".ll", "--module-state", prior, next, stats, "--library", "library"], frontend.environment, "", output + ".compile", 60), "compile exported enum module state")
+}
+
+function fallback(stats: Text) {
+    let fields = test.words(io.readTextFile(stats))
+    test.check(fields.length >= 7 && fields[0] == "0" && fields[1] == "2" && fields[6] == "false", "enum modules must use whole-program fallback\n" + io.readTextFile(stats))
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let source = "choice Sample {\n"
+for index in 0..16 { source += "Case" + Text(index) + "\n" }
+source += "}\nfunction choiceEnumIdentity(value: Sample): Sample { return value }\nfunction choiceEnumCode(value: Sample): Integer { return match value {\n"
+for index in 0..16 { source += "Case" + Text(index) + " { " + Text(index) + " }\n" }
+source += "} }\nlet sum = 0\nfor index in 0..1000 {\n"
+for index in 0..16 { source += "sum += choiceEnumCode(choiceEnumIdentity(Sample.Case" + Text(index) + "))\n" }
+source += "}\nprint(sum)\n"
+test.require(fixtures.compile(frontend, source), "compile scalar enum allocation benchmark")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+test.check(test.contains(llvm, "i64 @.minyar.fn.choiceEnumIdentity(i64 %argument.0)") && test.contains(llvm, "i64 @.minyar.fn.choiceEnumCode(i64 %argument.0)"), "payload-free choice parameters and returns must use i64")
+for operation in ["call ptr @minyar_record_new", "call i64 @minyar_record_get", "call i64 @.minyar.record.get.checked", "call void @minyar_record_set", "call void @.minyar.record.set.scalar.checked", "call void @minyar_rc_retain", "call void @minyar_rc_borrow", "call void @minyar_rc_local", "call void @minyar_rc_keep"] {
+    test.check(!test.contains(test.withoutRuntimeHelpers(llvm), operation), "enum constructor/match emitted managed-object traffic: " + operation)
+}
+test.check(!test.contains(llvm, " = inttoptr i64 ") && !test.contains(llvm, " = ptrtoint ptr "), "enum scalar ABI used a pointer conversion")
+llvm = test.replace(llvm, "@minyar_record_new", "@choice_enums_new")
+io.writeTextFile(path + ".ll", llvm)
+let contract = test.replace(io.readTextFile("tests/choice-enums-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+io.writeTextFile(path + "-runtime.c", contract)
+let command = [compiler.clang, "-O1"]
+for flag in compiler.flags { command.add(flag) }
+for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 60), "compile enum zero-allocation runtime")
+linkAndRun(frontend, path, path + "-runtime.o", "120000\n", "choice enums: 0 record allocations, 0 live objects, 0 live bytes\n")
+
+frontend.helpers = "\nlong long minyar_choice_enum_abi_nativeSignal(long long value) { assert(value >= 0 && value < 3); return (value + 1) % 3; }\n"
+fixtures.executes(frontend, io.readTextFile("tests/choice-enums-values.min"), io.readTextFile("tests/choice-enums-values.expected"), ["-O0", "-O2"], 0, "", true)
+let composition = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+let scalarCallback = false
+let scalarComparator = false
+for line in test.lines(composition) {
+    if test.contains(line, "define i64 @.minyar.closure.") && test.contains(line, "(ptr %environment, i64 %argument.0)") { scalarCallback = true }
+    if test.contains(line, "define i64 @.minyar.closure.") && test.contains(line, "(ptr %environment, i64 %argument.0, i64 %argument.1)") { scalarComparator = true }
+    test.check(!(test.contains(line, "trunc i64 ") || test.contains(line, "zext i64 ")) || !line.endsWith(" to i64"), "enum list/callback slot conversion must preserve i64")
+}
+test.check(scalarCallback && scalarComparator && test.contains(composition, "call i64 %code(ptr %env, i64 %left.slot, i64 %right.slot)"), "enum callback/comparator ABI must pass and return i64")
+test.check(test.contains(composition, "declare i64 @minyar_choice_enum_abi_nativeSignal(i64)"), "native enum ABI must pass and return i64")
+test.require(fixtures.compile(frontend, "choice Signal { Low; High }\nrecord Header native \"c\" { value: Integer }\nfunction convert(value: Signal, header: Header): Signal { native \"choice_enum_abi\" value }\n"), "compile enum C-value ABI metadata")
+test.check(test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "; minyar-c-value: minyar_choice_enum_abi_convert|1|1|C"), "native C-value enum metadata must use scalar kind 1")
+
+// Ordinary record-key Maps retain the original radix and nesting capacity.
+// Keep Key first in this separate source so its nominal index is zero.
+fixtures.executes(frontend, "record Key { value: Integer }\nlet leaf: Map<Key, Integer> = Map()\nleaf[Key { value: 1 }] = 42\nlet leafCopy: Map<Key, Integer> = Map()\nleafCopy[Key { value: 1 }] = 42\nlet middle: Map<Key, Map<Key, Integer>> = Map()\nmiddle[Key { value: 2 }] = leaf\nlet middleCopy: Map<Key, Map<Key, Integer>> = Map()\nmiddleCopy[Key { value: 2 }] = leafCopy\nlet outer: Map<Key, Map<Key, Map<Key, Integer>>> = Map()\nouter[Key { value: 3 }] = middle\nlet outerCopy: Map<Key, Map<Key, Map<Key, Integer>>> = Map()\nouterCopy[Key { value: 3 }] = middleCopy\nprint(outer == outerCopy)\nprint(outer[Key { value: 3 }][Key { value: 2 }][Key { value: 1 }])\n", "true\n42\n", ["-O0", "-O2"], 0, "", true)
+
+// Deep ordinary Lists retain their compact encoding and nesting capacity.
+let deepType = "Integer"
+let deepValue = "42"
+let deepRead = "nested"
+for index in 0..20 { deepType = "List<" + deepType + ">"; deepValue = "[" + deepValue + "]"; deepRead += "[0]" }
+fixtures.executes(frontend, "let nested: " + deepType + " = " + deepValue + "\nprint(" + deepRead + ")\n", "42\n", ["-O0", "-O2"], 0, "", true)
+
+// Enum keys above nominal index 999 exercise the reserved-key high factor;
+// nested equality must decode the Float value through the same runtime path.
+let late = ""
+for index in 0..1001 { late += "record Filler" + Text(index) + " { value: Integer }\n" }
+late += "choice Late { First; Last }\nlet numbers: Map<Late, Integer> = Map()\nnumbers[Late.Last] = 42\nprint(numbers[Late.Last])\nprint(numbers.has(Late.Last))\nprint(numbers.has(Late.First))\nlet first: Map<Late, Float> = Map()\nfirst[Late.First] = 1.5\nlet second: Map<Late, Float> = Map()\nsecond[Late.First] = 1.5\nlet nested: Map<Integer, Map<Late, Float>> = Map()\nnested[7] = first\nlet same: Map<Integer, Map<Late, Float>> = Map()\nsame[7] = second\nprint(nested == same)\nsecond[Late.First] = 2.5\nprint(nested == same)\n"
+fixtures.executes(frontend, late, "42\ntrue\nfalse\ntrue\nfalse\n", ["-O0", "-O2"], 0, "", true)
+
+// Cover every reserved-child escape tag, plus the skipped enum-ID bucket.
+// Nested equality independently exercises the native runtime's decoder.
+for fillers in [0, 1, 2, 3, 4, 500] {
+    let escaped = ""
+    for index in 0..fillers { escaped += "record Filler" + Text(index) + " { value: Integer }\n" }
+    escaped += "record Key { value: Integer }\nchoice Tone { Soft; Clear }\nfunction name(tone: Tone): Text { return match tone { Soft { \"soft\" } Clear { \"clear\" } } }\n"
+    escaped += "let first: Map<Key, Tone> = Map()\nfirst[Key { value: 1 }] = Soft\nlet second: Map<Key, Tone> = Map()\nsecond[Key { value: 1 }] = Soft\nprint(first == second)\n"
+    escaped += "let outer: Map<Key, Map<Key, Tone>> = Map()\nouter[Key { value: 2 }] = first\nlet same: Map<Key, Map<Key, Tone>> = Map()\nsame[Key { value: 2 }] = second\nprint(outer == same)\nfirst[Key { value: 1 }] = Clear\nprint(outer == same)\n"
+    escaped += "let scalar: Map<Integer, Tone> = Map()\nscalar[7] = Soft\nprint(name(scalar[7]))\nprint(name(outer[Key { value: 2 }][Key { value: 1 }]))\n"
+    fixtures.executes(frontend, escaped, "true\ntrue\nfalse\nsoft\nclear\n", ["-O0", "-O2"], 0, "", true)
+}
+
+for invalid in [
+    "choice First { Same }\nchoice Second { Same }\nfunction take(value: First) {}\ntake(Second.Same)\n",
+    "choice Signal { Low; High }\nlet value: Signal = 0\n",
+    "choice Signal { Low; High }\nlet value = Signal.Low + 1\n",
+    "choice Flag<Item> { Raised; Lowered }\nfunction take(value: Flag<Integer>) {}\ntake(Flag<Text>.Raised)\n"
+] {
+    let rejected = fixtures.compile(frontend, invalid)
+    test.check(rejected.status == 1 && test.validCompilerDiagnostics(rejected.errorOutput), "scalar enum lost nominal type checking\n" + rejected.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected enum source emitted LLVM")
+}
+
+// Module-state entrypoints keep the established whole-program choice fallback,
+// including imported scalar enum ABI and replay after client/producer edits.
+let leaf = compiler.directory + "/clock.min"
+let entry = compiler.directory + "/main.min"
+let exported = "public choice Phase { Dawn; Noon; Dusk }\npublic function today(): Phase { return Dawn }\npublic function next(value: Phase): Phase { return match value { Dawn { Noon } Noon { Dusk } Dusk { Dawn } } }\npublic function code(value: Phase): Integer { return match value { Dawn { 0 } Noon { 1 } Dusk { 2 } } }\n"
+io.writeTextFile(leaf, exported)
+let entrySource = "use \"./clock.min\" as clock\nlet value = clock.today()\nprint(clock.code(value))\nprint(clock.code(clock.next(value)))\nlet direct: clock.Phase = clock.Phase.Dusk\nprint(clock.code(direct))\n"
+io.writeTextFile(entry, entrySource)
+let empty = compiler.directory + "/empty.state"
+let prior = compiler.directory + "/prior.state"
+let next = compiler.directory + "/next.state"
+let stats = compiler.directory + "/stats"
+io.writeTextFile(empty, "")
+state(frontend, entry, compiler.directory + "/cold", empty, prior, stats)
+fallback(stats)
+let baseline = io.readTextFile(compiler.directory + "/cold.ll")
+test.check(io.readTextFile(prior) == "", "enum fallback persisted unsupported module artifacts")
+test.require(test.run([compiler.executable, entry, compiler.directory + "/direct.ll", "--library", "library"], frontend.environment, "", compiler.directory + "/direct.compile", 60), "compile ordinary exported scalar choices")
+test.check(io.readTextFile(compiler.directory + "/direct.ll") == baseline, "enum module-state fallback differs from ordinary compilation")
+state(frontend, entry, compiler.directory + "/warm", prior, next, stats)
+fallback(stats)
+test.check(io.readTextFile(compiler.directory + "/warm.ll") == baseline && io.readTextFile(next) == "", "enum warm state differs from cold compilation")
+for mode in ["cold", "warm"] {
+    let modulePath = compiler.directory + "/" + mode
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(modulePath + ".ll", test.instrument(io.readTextFile(modulePath + ".ll"))) }
+    linkAndRun(frontend, modulePath, compiler.runtime, "0\n1\n2\n", "")
+}
+
+// The importer has no choice keyword; its producer still selects fallback.
+io.writeTextFile(entry, entrySource + "print(clock.code(clock.Phase.Dawn))\n")
+state(frontend, entry, compiler.directory + "/client-edit", prior, compiler.directory + "/client.state", stats)
+fallback(stats)
+let client = io.readTextFile(compiler.directory + "/client-edit.ll")
+state(frontend, entry, compiler.directory + "/client-fresh", empty, next, stats)
+test.check(io.readTextFile(compiler.directory + "/client-fresh.ll") == client, "edited enum importer differs from fresh compilation")
+state(frontend, entry, compiler.directory + "/client-warm", compiler.directory + "/client.state", next, stats)
+fallback(stats)
+test.check(io.readTextFile(compiler.directory + "/client-warm.ll") == client, "edited enum importer did not preserve its warm ABI")
+for mode in ["client-edit", "client-warm"] {
+    let modulePath = compiler.directory + "/" + mode
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(modulePath + ".ll", test.instrument(io.readTextFile(modulePath + ".ll"))) }
+    linkAndRun(frontend, modulePath, compiler.runtime, "0\n1\n2\n0\n", "")
+}
+io.writeTextFile(entry, entrySource)
+
+let delta = compiler.directory + "/delta.state"
+let plan = compiler.directory + "/plan.state"
+io.writeTextFile(delta, "")
+io.writeTextFile(plan, pack(["minyar-module-plan-v1", prior, delta, "enum-base-generation"]))
+io.writeTextFile(leaf, test.replace(exported, "return Dawn", "return Noon"))
+state(frontend, entry, compiler.directory + "/edited", plan, delta, stats)
+fallback(stats)
+test.check(io.readTextFile(delta) == "", "enum fallback persisted an unsupported delta")
+let edited = io.readTextFile(compiler.directory + "/edited.ll")
+state(frontend, entry, compiler.directory + "/replay", plan, next, stats)
+fallback(stats)
+test.check(io.readTextFile(compiler.directory + "/replay.ll") == edited && io.readTextFile(next) == "", "enum delta replay changed the scalar ABI")
+state(frontend, entry, compiler.directory + "/fresh", empty, next, stats)
+test.check(io.readTextFile(compiler.directory + "/fresh.ll") == edited, "enum delta differs from a fresh body compilation")
+for mode in ["edited", "replay"] {
+    let modulePath = compiler.directory + "/" + mode
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(modulePath + ".ll", test.instrument(io.readTextFile(modulePath + ".ll"))) }
+    linkAndRun(frontend, modulePath, compiler.runtime, "1\n2\n2\n", "")
+}
+io.writeTextFile(compiler.directory + "/old.state", pack(["minyar-module-interface-v8", "old", "old"]))
+state(frontend, entry, compiler.directory + "/old-schema", compiler.directory + "/old.state", next, stats)
+fallback(stats)
+test.check(io.readTextFile(compiler.directory + "/old-schema.ll") == edited, "old enum state schema retained pointer ABI artifacts")
+
+test.removeTree(compiler.directory)
+print("Choice enums: passed; 16,000 loop values, zero record allocations/live bytes, i64 ABI, nominal types, composition and module-state fallback")

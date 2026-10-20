@@ -1,0 +1,132 @@
+// Explicit bounded completion I/O. See docs/completion-io.md for ownership,
+// resource limits, short results and durability. Linux io_uring only.
+use "errors" as errors
+
+public constant READ = 1
+public constant WRITE = 2
+public constant SYNC = 3
+
+public record Queue { private handle: Integer }
+
+public record Completion {
+    id: Integer
+    token: Integer
+    kind: Integer
+    private result: Integer
+    private data: Bytes
+}
+
+// Private declarations preserve the native ABI while keeping raw handles and
+// negative errno values behind the public Result/Maybe interface.
+function open(capacity: Integer, maximumBytes: Integer): Integer { native "completionio" }
+function queueRead(queue: Integer, file: Integer, offset: Integer, length: Integer, token: Integer): Integer { native "completionio" }
+function queueWrite(queue: Integer, file: Integer, offset: Integer, data: Bytes, token: Integer): Integer { native "completionio" }
+function queueSync(queue: Integer, file: Integer, token: Integer): Integer { native "completionio" }
+function submit(queue: Integer): Integer { native "completionio" }
+function staged(queue: Integer): Integer { native "completionio" }
+function pending(queue: Integer): Integer { native "completionio" }
+function collectNative(queue: Integer, wait: Boolean): Bytes { native "completionio" }
+function close(queue: Integer): Integer { native "completionio" }
+
+function nativeFailure(code: Integer, operation: Text): errors.Error {
+    let nativeCode = -code
+    let failure = errors.make(errors.systemCode(), nativeCode,
+        "completion I/O failed (native code " + Text(nativeCode) + ")")
+    return failure.withContext(operation)
+}
+function countResult(value: Integer, operation: Text): Result<Integer, errors.Error> {
+    if value < 0 {
+        let failure = nativeFailure(value, operation)
+        return Err(failure)
+    }
+    return Ok(value)
+}
+
+// Capacity 1..1024; maximumBytes 0..67108864 bounds all outstanding C buffers.
+// The queue belongs to its opening thread and requires explicit draining/close.
+public function create(capacity: Integer, maximumBytes: Integer): Result<Queue, errors.Error> {
+    let handle = open(capacity, maximumBytes)
+    if handle < 0 {
+        let failure = nativeFailure(handle, "creating the completion queue")
+        return Err(failure)
+    }
+    let queue = Queue { handle: handle }
+    return Ok(queue)
+}
+
+// Each staged operation owns a duplicated regular-file fd until collection.
+// Writes also copy their data before returning. Success is an operation ID.
+public function Queue.read(file: Integer, offset: Integer, length: Integer, token: Integer): Result<Integer, errors.Error> {
+    let result = queueRead(self.handle, file, offset, length, token)
+    return countResult(result, "queuing a read")
+}
+public function Queue.write(file: Integer, offset: Integer, data: Bytes, token: Integer): Result<Integer, errors.Error> {
+    let result = queueWrite(self.handle, file, offset, data, token)
+    return countResult(result, "queuing a write")
+}
+// IO_DRAIN waits for earlier operations on all files, then syncs this file only.
+public function Queue.sync(file: Integer, token: Integer): Result<Integer, errors.Error> {
+    let result = queueSync(self.handle, file, token)
+    return countResult(result, "queuing a file sync")
+}
+// One enter syscall, without a completion wait. Retry while staged() is nonzero;
+// partial success and interrupted calls preserve every operation owner.
+public function Queue.submit(): Result<Integer, errors.Error> {
+    let result = submit(self.handle)
+    return countResult(result, "submitting queued I/O")
+}
+public function Queue.staged(): Result<Integer, errors.Error> {
+    let result = staged(self.handle)
+    return countResult(result, "counting staged operations")
+}
+public function Queue.pending(): Result<Integer, errors.Error> {
+    let result = pending(self.handle)
+    return countResult(result, "counting pending completions")
+}
+// None means no completion. An operation failure still arrives as Some with its
+// identity intact; count()/bytes() report that operation's recoverable error.
+public function Queue.next(wait: Boolean): Result<Maybe<Completion>, errors.Error> {
+    let raw = collectNative(self.handle, wait)
+    let status = raw.getInt64(0)
+    if status < 0 {
+        let failure = nativeFailure(status, "collecting queued I/O")
+        return Err(failure)
+    }
+    if status == 0 {
+        let absent: Maybe<Completion> = None
+        return Ok(absent)
+    }
+    let data = raw.slice(40, raw.length)
+    let completion = Completion { id: raw.getInt64(8); token: raw.getInt64(16)
+        kind: raw.getInt64(24); result: raw.getInt64(32); data: data }
+    let present: Maybe<Completion> = Some(completion)
+    return Ok(present)
+}
+// EBUSY includes staged entries and completed entries not yet collected.
+// Closing one alias invalidates every alias. There is no implicit finalizer.
+public function Queue.close(): Result<Nothing, errors.Error> {
+    let result = close(self.handle)
+    if result < 0 {
+        let failure = nativeFailure(result, "closing the completion queue")
+        return Err(failure)
+    }
+    return Ok()
+}
+
+// Counts include short reads/writes and zero for EOF or a successful sync.
+// Check the exact count before acknowledging a write.
+public function Completion.count(): Result<Integer, errors.Error> {
+    return countResult(self.result, "completing queued I/O")
+}
+public function Completion.bytes(): Result<Bytes, errors.Error> {
+    if self.result < 0 {
+        let failure = nativeFailure(self.result, "reading a queued completion")
+        return Err(failure)
+    }
+    if self.kind != READ {
+        let failure = errors.make(errors.invalidDataCode(), 0, "only a read completion has bytes")
+        return Err(failure)
+    }
+    let data = self.data
+    return Ok(data)
+}

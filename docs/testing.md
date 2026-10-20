@@ -1,5 +1,48 @@
 # Testing strategy
 
+Python harnesses use the standard library. CI selects CPython 3.15.0 from
+`.python-version` through the pinned `actions/setup-python` action; no pip
+packages are needed. Use the same interpreter when reproducing Python
+harness failures. Packager minimum versions remain documented separately.
+
+For feedback on uncommitted work, `make check-changed-plan` prints the checks
+and reasons, and `make check-changed` runs them against the working tree. Both
+reuse the staged-commit selector: a fixed core gate, complete checks for changed
+library modules and their transitive dependents, and `check-portable` for unknown
+paths or missing coverage. Staged, unstaged, deleted and untracked files count.
+The previous library graph preserves removed import edges. `CHECK_CHANGED_BASE`
+defaults to `HEAD`; set it to a branch point to include already committed work.
+The plan builds its Minyar planner, so it belongs on the build host too.
+
+For a build box without Git metadata, capture inputs on the source machine
+without building, then sync and run on the box:
+
+```sh
+python3 tools/check-changed.py --export target/changes-1
+/path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed-plan
+/path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed
+```
+
+The equivalent Make entry point is `make check-changed-export
+CHECK_CHANGED_EXPORT=target/changes-1`. The direct Python command avoids starting
+Make when the source machine prohibits local build processes.
+Each export needs a new directory under `target/`. Source content and executable
+modes, changed paths and previous modules are validated before and after checks; re-export
+after editing. Generated `build/`, `target/` and Python bytecode are excluded.
+The export is an input capture, not a passing gate or a staged snapshot.
+Checks reuse the working tree's warm build and retain the existing commit-check
+logs and JSON results. `make check-changed-inputs` tests Git/input handling
+without compiling the language; `make check-check-selection` tests the policy.
+
+For a smaller deterministic fuzz loop, use `make check-fuzz-expressions`,
+`check-fuzz-language`, `check-fuzz-semantic`, `check-fuzz-hostile`,
+`check-fuzz-regressions`, `check-fuzz-seeds` or `check-fuzz-modules`. Each runs
+the existing `--stage` with its ordinary seed, counts and O0/O2 assertions.
+The complete `check-fuzz` gate still includes every stage and its harness and
+stateful List controls. One named regression can run with
+`make check-regressions-case CHECK_REGRESSION_CASE=Regressions.test_integer_boundaries`;
+missing or unknown case names fail instead of selecting an empty suite.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery
@@ -9,6 +52,17 @@ modules and dependencies and preserves the existing integration-test runner.
 reports and raw binary output. Where `mkfifo` is available, a blocking FIFO
 exchange between a project case and a dependency case proves they overlap;
 the test does not use timing or sleep polling as its concurrency oracle.
+
+`make check-live-programming` exercises real project watch sessions at O0/O2:
+atomic saves, nested modules, external local dependencies, manifest graph changes,
+literal arguments, failed-build survival/recovery, and shutdown of descendant
+process groups. Output readiness and FIFO handshakes establish ordering.
+`make check-live-transform` executes LLVM forwarding at O0/O2 and checks source
+and image ABI guards. `make check-live-hot` checks the same PID and heap roots
+across function updates and rejected edits, and reports edit-to-observation time.
+`make check-minyar-repl` runs exact O0/O2 transcripts proving persistent mutations,
+function replacement, one-time effects and initializers, Text/List lifetimes,
+multiline input, and recovery after rejected declarations and expressions.
 
 `make check-doc-comments` checks lexer-backed documentation, generic and alias
 signatures, fields, choice cases, methods, Unicode locations, BOM/CRLF input
@@ -21,6 +75,43 @@ nested module documentation, escaped prose, source signatures, stable links,
 doctest filtering and aggregation, standalone release examples and expectation
 failures. A wrong output must leave both previous site files byte-identical.
 Documentation examples run in private temporary working directories.
+
+`make check-book` reads every Markdown page under `docs/book` and the Rust,
+C++ and Swift transition guides. Successful `minyar` fences need explicit,
+immediately following `output` fences. Ordinary examples are complete programs;
+project pages label every source file on its first source line with
+`// file: relative.min`. Later file-looking comments remain source. The
+checker assembles all page files in each example's private directory before
+compilation. It rejects mixed standalone/project pages, unsafe paths, duplicate
+or ASCII-case-aliasing filenames, malformed markers and malformed fences.
+Successful programs run in ordinary and test modes at O0/O2, checking exact
+ordinary stdout, zero status and empty stderr, plus embedded tests.
+
+Intentional `minyar-reject` sources need immediately following nonempty
+`diagnostic` fences. These standalone programs compile once in ordinary mode:
+test mode omits application statements. The checker requires status exactly 1,
+empty stdout, no LLVM file and exact full human stderr after shortening only
+actual-source location fields to `program.min`. Parser and rejection-result
+controls reject wrong statuses, output, paths, spacing and emitted LLVM.
+Both kinds run with bounded compiler deadlines; successful programs also have
+bounded link and execution deadlines. `./build/tooling/tests/book --self-check`
+runs only parser, materialization and rejection-result controls after building
+the harness. The target belongs to `check-portable`.
+
+`make check-book-cli` follows the first-program, garden and multi-file harvest
+walkthroughs through the public launcher: project creation, checking, running,
+embedded-test discovery, release builds and exact executable output. Private
+module access and deliberately wrong expectations must fail precisely; restoring
+the private helper recovers every test. The runnable garden gallery must match
+its complete book source. Chapter 10's four rejected sources and four repairs
+also pass through public check/run with exact diagnostics and output, followed
+by the documented explanation command. The file chapter checks actual saved
+bytes, handled bounded-read failure, nonempty-to-empty replacement and fresh
+release creation at the project root. Chapter 12 keeps one source unchanged
+while checking six argument vectors through public run and direct release:
+absent, spaced, empty, flag-shaped, extra arguments and a second separator.
+Each requires exact output, zero status and empty stderr, preserving literal
+empty arguments. Both targets belong to `check-portable`.
 
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including
@@ -35,14 +126,73 @@ diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
 targets are recorded in the hardening review.
 
+`make check-mobile` checks mobile target selection, output protection, the
+hello app's real model gallery, and callbacks with Unicode events and complete
+ownership cleanup at O0/O2. `check-mobile-sanitize` adds ASan/UBSan.
+`check-mobile-ios` cross-compiles and links both UIKit SDK targets without
+booting a Simulator. With an installed `ANDROID_NDK_HOME`,
+`check-mobile-android` builds both NDK archives and checks real JNI shared
+links and ELF architecture/visibility. See [mobile apps](mobile.md) for the
+separate device-execution and signing requirements.
+
 `make check-methods` checks record methods, module visibility, receiver and
 argument lifetime, shared mutation, callable fields and rejection diagnostics.
 It runs the methods gallery and ownership assertions at O0/O2.
 `check-methods-sanitize` repeats these checks with ASan/UBSan.
 
+`make check-iteration` checks user-record iteration through `iterator`, `advance`
+and `current`, including independent cursors, control flow, managed items, generic
+item inference, module visibility and rejected protocol signatures. Programs and
+the iteration gallery run at O0/O2 with ownership assertions. LLVM checks retain
+the direct method calls and ordinary loop branches. `check-iteration-sanitize`
+adds compiler and generated-program ASan/UBSan instrumentation.
+
+`make check-iteration-capabilities` checks structural `Iterable` and `Iterator`
+bounds on generic functions over collections, recipes and user cursors. It
+includes constraints on otherwise unused type arguments, so scalar types and
+malformed cursors cannot pass through a primitive fast path. Successful programs
+run at O0/O2 with ownership assertions; `check-iteration-capabilities-sanitize`
+adds ASan/UBSan.
+
+`make check-sequences` checks stored lazy map/filter recipes and left-to-right
+folds over collections, ranges and user iterators. O0/O2 ownership cases cover
+early exits, type-changing maps, rejected managed items, reuse, Integer limits
+and the 64-stage boundary. Generic named transforms cover inferred item/seed
+types, bounds, instantiated bodies, aliases, imports and specialization reuse.
+IR assertions prove one loop with direct unboxed transforms and no intermediate
+List or callback dispatch; the LLVM verifier checks the emitted module.
+Whole-function checks compare directly consumed named `for` chains with stored
+and parenthesized controls: immediate wrappers disappear while the controls
+retain setup. Cases cover mixed stored/immediate order, combined 64/65-stage
+limits, source replacement, contextual argument checks and recovery. The check
+retains `build/sequences-evidence.ll`, `build/sequences-loop.ll` and their
+`sequences-generic-*` counterparts.
+`check-sequences-sanitize` adds ASan/UBSan.
+
+`make check-osdev-fields` checks all 2,780 valid 8/16/32/64-bit field layouts
+against a bit-at-a-time oracle (22,240 samples at each of O0 and O2), hosted
+MMIO memory, private/width rejection, invalid ranges and signed 64-bit edges.
+Successful fixtures assert ownership cleanup. It also checks the actual e1000
+configuration builders, packed DMA descriptor bytes/offsets and the device-fields
+gallery. `check-osdev-fields-sanitize`
+adds ASan/UBSan. `check-osdev-host` combines these with the hosted kernel HTTP
+parser. No privileged instructions are executed by the host tests.
+`check-osdev-workflow` uses fake tools to test QEMU deadlines, exit codes,
+serial evidence and debugger commands. Both focused checks are portable gates.
+`check-osdev-freestanding` cross-compiles both runtime C units at O0/O2 for
+x86-64 and AArch64 with host headers excluded. This catches accidental hosted
+header dependencies without booting a guest.
+The real finite e1000 guest is opt-in: see [kernel development](os-development.md).
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.
+Deterministic fuzzing applies the scale to fractional hostile limits too and
+records base/effective bounds and scale in its report. Exact evidence replay
+uses the recorded effective request and does not multiply it again. Native
+regression evidence likewise records the effective `timeout`, keeps the base
+in `configured_timeout`, and reports phase, elapsed time, command and retained
+evidence path on a timeout.
 
 `make check-record-capabilities` checks structural equality, nominal type
 boundaries, finite-shape rejection and lexicographic ordering of records. It
@@ -107,6 +257,106 @@ fixtures check missing cases and malformed arms. `check-choice-sanitize` adds
 ASan/UBSan. Before choice support, compiling `tests/choice/shapes.min` failed
 with `unknown type 'Shape'`; the focused gate is the passing feature regression.
 
+`make check-patterns` runs nested choice/Result/Maybe patterns, scalar literals,
+Boolean product coverage, contextual `where` guards and the lantern gallery at
+O0/O2 with ownership cleanup assertions. It checks nested bindings after input
+mutation, failed guard cleanup, escaping closures, pattern type errors, binding
+scope, and missing-case example values. `check-patterns-sanitize` adds ASan/UBSan.
+
+`make check-choice-layout` checks shared payload storage, cross-case comparisons,
+Map key snapshots, mixed scalar/reference payloads, optional record lifetimes,
+recursive choice cycles and the lantern-walk gallery at O0/O2 with ownership
+assertions. A sixteen-case allocation benchmark intercepts actual constructor
+calls: 16,000 values reserve 48,000 eight-byte slots, compared with 528,000 in
+the former expanded layout. LLVM assertions independently require three slots
+per value. `check-choice-layout-sanitize` adds ASan/UBSan.
+
+`make check-choice-enums` requires 16,000 payload-free choice values to allocate
+zero records, with zero live objects or bytes. LLVM assertions require `i64`
+parameters, returns and callback slots without reference-count traffic. Further
+O0/O2 cases cover nominal type rejection, generics, methods, native calls,
+parallel buffers, collections and module boundaries. Capacity controls cover
+ordinary nested Lists, three-level record-key Maps and nested Maps ending in
+an enum. The latter exercise all five reserved-child tags and the skipped
+enum-ID bucket, including the independent runtime equality decoder.
+`check-choice-enums-sanitize` adds ASan/UBSan.
+
+`make check-choice-niche` checks nullable record choices, borrowed and owned
+payloads, nested optionals, reversed case order, snapshots, alias lifetimes and
+cycles. Its O0/O2 constructor counter requires 10,000 optional readings to
+allocate only the 5,000 present records, using 5,000 slots. The former wrapper
+layout allocated 15,000 records and 25,000 slots for the same workload.
+`check-choice-niche-sanitize` adds ASan/UBSan.
+
+`make check-choice-text-niche` checks nullable Text choices, immutable key
+snapshots, Unicode, empty values, callbacks, native Text adapters and module
+fallback. `check-choice-container-niche` checks nullable Bytes and Lists,
+mutable aliases, C-layout byte-view lifetimes and container capability
+rejections. Each 10,000-value benchmark removes 10,000 choice wrapper records
+and 20,000 slots. Three observed plain-system K1 collector MARK windows check
+physical List self-edges, optional roots and edge replacement; a missing-barrier
+control must fail before temporary cleanup can mask it. Both targets have
+ASan/UBSan counterparts ending in `-sanitize`.
+
+`make check-choice-set-niche` covers nullable Set choices, content equality
+through mutable aliases, retained key snapshots, native owned-header/null ABI,
+generic records, callbacks, propagation and a separate record self-cycle owning
+an optional Set. It rejects ordering, hashing, natural sorting, unsupported Map
+value equality and cyclic Map mutation, and checks cold/warm/edited choice
+fallback plus stale scalar schemas. O0/O2 cleanup requires zero remaining
+objects and bytes. The scalar-key follow-up requires the scalar-choice
+predecessor; this Set checkpoint does not implement scalar lowering.
+`check-choice-set-niche-sanitize` instruments the compiler, generated LLVM and
+runtime with ASan/UBSan. Both targets check 18 generated-program executions,
+23 strict rejections and five boxed-layout controls.
+
+The Set allocation fixture preallocates one payload before constructing 10,000
+alternating `Some(payload)`/`None` values. It asserts zero generated wrapper
+records/slots. `MINYAR_CHOICE_SET_BASELINE=/path/to/saved-pre-set-compiler`
+runs only the counter fixture and requires the previous 10,000 records/20,000
+slots. The retained qualified pre-Set compiler passes that old-count mode and
+fails the default new-layout assertion before any native header call. Save
+that genuine compiler before rebuilding. Runtime Set headers, bucket Lists
+and storage are outside this wrapper counter; it makes no claim of zero
+collection allocations.
+
+`make check-choice-runtime-profiles` runs the choice-cycle, container, Set and
+native Set ownership fixtures at O0/O2 across eager, system K32, plain-system K1,
+fixed 1 MiB K1/K1024 and POSIX lazy 1 MiB K32 runtimes. Each profile rejects
+incorrect allocator flags. Integer Text caching is disabled only in these
+test programs; after bounded cleanup, every program must have zero owners,
+objects and bytes. `check-choice-runtime-profiles-sanitize` repeats the matrix
+with compiler, generated LLVM and runtime ASan/UBSan instrumentation.
+The four fixtures produce 24 fixture/profile pairs per target, 48 O0/O2 runs;
+native and sanitizer targets together produce 96 runs on POSIX. The Set native
+helper is included only for its ownership fixture. A single shared bounded
+cleanup destructor checks all four fixtures; cyclic Owner field mutation is
+covered without claiming an observed active MARK phase.
+On Windows these maintained targets select the five supported profiles;
+the two targets produce 80 runs in total. An explicitly requested lazy profile
+still rejects as unsupported.
+
+`make check-choice-type-codec` checks 4,720 real compiler-helper cases per
+optimization at O0/O2, including reserved scalar codes 19..31, 64 List layers,
+ordinary encoding compatibility, nominal boundaries, all five Map escape tags
+and exact signed-i64 limits. Its `-sanitize` counterpart instruments the
+compiler and generated probe. Enum tests separately exercise the runtime Map
+decoder through nested equality and mutation.
+
+`make check-choice-propagation` checks partial choice cleanup when a payload's
+`try` returns early. It covers scalar and mixed reference payloads, borrowed and
+owned arguments, assignment, return, List storage and lazy error context at
+O0/O2 with exact ownership cleanup. A construction root stays alive on failure;
+the completed value receives a separate transferable owner on success.
+Composition fixtures combine scalar enums, nullable payloads and tagged unions
+through snapshots, callbacks and parallel calls. Recursive records combine
+enum fields with nullable links and List cycles; `Maybe<Enum>` distinguishes
+the empty case from an enum's zero tag. C-layout enum fields retain scalar
+storage. Maybe/Result mapping and `try` propagation also transfer scalar enum
+payloads, including skipped callbacks on empty/error cases. Every composition
+case runs with the same exact cleanup oracle.
+`check-choice-propagation-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.
@@ -147,6 +397,50 @@ The configuration gallery and programs run at O0/O2 with ownership assertions;
 `check-result-library-sanitize` adds ASan/UBSan. Compatibility getters and native
 status APIs are also exercised by their existing focused suites.
 
+`make check-utf8-validation` compares the public `text.validUTF8` function
+against an independent native scalar-accumulation RFC 3629 oracle at O0/O2.
+It covers every zero-, one- and two-byte buffer, every valid Unicode scalar,
+ASCII block boundaries, malformed and truncated sequences, longer mutations,
+input preservation and representative recoverable decoding. The sanitizer
+variant is `check-utf8-validation-sanitize`; it annotates generated LLVM for
+ASan and instruments the native oracle and runtime with ASan/UBSan.
+
+`make check-unicode-text` checks explicit grapheme boundaries, NFC, canonical
+comparison and full default case folding at O0/O2 with ownership assertions,
+including the Unicode text gallery. `make check-unicode-conformance` checks
+all 853 grapheme, 20,171 normalization and 1,606 full default case-fold vectors
+from the pinned Unicode 18.0.0 files at O0/O2. Normalization checks all five NFC
+column invariants and canonical-fold consistency; folding checks idempotence.
+Both targets are in the portable gate. `check-unicode-text-sanitize` repeats
+the focused cases and full corpora with ASan/UBSan, including the native provider.
+
+`make check-unicode-normalization` adds byte-exact ordering, stability, leading
+marks, zero-class barriers and composition regressions at O0/O2. It compares
+2,048 bounded deterministic inputs against the pinned provider's original
+normalization algorithm. Long adversarial runs through 131,072 combining marks
+use independent exact outputs and deterministic ordering-work bounds, including
+many short runs; they never call the quadratic reference. Test-only counters
+charge scalar visits, moves and bucket iterations. These are operation bounds,
+not timing assertions. `check-unicode-normalization-sanitize` adds ASan/UBSan.
+
+`make check-unicode-installed` installs twice into temporary paths containing
+spaces, removes the first installation, then builds an external Unicode program
+with the final installed launcher in ordinary and release modes. Each build uses
+a separate empty native-provider cache. Exact output includes embedded zero
+bytes, graphemes, normalization, folding, display casing and UTF-8 validation.
+
+`make check-unicode-case` checks full default uppercase and lowercase mappings
+against 41,297 UnicodeData scalar rows and all 104 unconditional SpecialCasing
+rows, at O0/O2. Focused ownership cases cover expansions, original-order casing,
+embedded zero bytes and Greek final sigma, including overlapping Cased and
+Case_Ignorable properties. `check-unicode-case-sanitize` repeats these checks
+with ASan/UBSan. `check-unicode-case-data` regenerates the compact mapping and
+property tables from the pinned sources and rejects stale generated contents.
+
+`check-runtime-numeric` also requires zero `snprintf` and `strtod` calls when
+formatting the 2,001 exact Float integers from −1,000 through 1,000. Its bounded
+buffer probes include the integral fast path near ±2^53, signed zero and specials.
+
 `make check-result-network` exercises typed sockets, TLS, workers and HTTP at
 O0/O2 with the ownership oracle. Loopback peers cover nonblocking accept,
 would-block, empty datagrams, truncation prefixes, batches and stream EOF.
@@ -160,6 +454,16 @@ Unchanged C providers are built once per suite, at O2 normally and O1 with
 sanitizers, matching the ownership runtime. Vendored Monocypher uses O0 with
 sanitizers to avoid excessive compiler optimization time. Minyar programs
 run at O0/O2; their assertions and subprocess deadlines stay the same.
+
+`make check-proxy-http-drain` checks HTTP/1 shutdown at O0/O2: a partial
+writer and an already dispatched request finish, idle readers close, the
+listener refuses new connections and releasing slots cannot reactivate it.
+`check-proxy-http-drain-sanitize` adds ASan/UBSan. These are dependencies of
+the existing HTTP server checks. `check-proxy-tls-sni` checks valid and invalid
+DNS names, every inserted byte value and absent SNI through TCP/QUIC whole
+and fragmented ClientHello inputs at O0/O2; its sanitizer variant is
+`check-proxy-tls-sni-sanitize`. Both run through the TLS server check targets.
+See [proxy networking](proxy-networking.md) for the API and ingress rules.
 
 `make check-generics` checks inferred and explicit generic calls, result-context
 inference, recursion, shared module instantiations, and rejection diagnostics.
@@ -187,6 +491,20 @@ on functions and records, using built-in values and finite record shapes. It run
 O0/O2 ownership fixtures, capability rejections and the constraints gallery.
 `check-generic-constraints-sanitize` instruments the compiler and generated programs.
 
+`make check-user-capabilities` checks explicit user-defined conformances,
+defaults and overrides, `Self`, aliases, constrained generic records, imported
+capabilities and contextual identifiers. The gallery and successful fixtures run
+at O0/O2 with ownership cleanup assertions. Rejections cover missing and wrongly
+typed methods, unknown capabilities, duplicates and missing conformances.
+`check-user-capabilities-sanitize` instruments compiler and generated programs.
+
+`make check-builtin-capabilities` checks explicit Equatable, Ordered and Hashable
+methods through operators, stable sorting, nested records, generic bounds and
+Map/Set snapshots. It verifies direct LLVM calls, matching hash/equality semantics,
+implicit derivation boundaries and finite snapshot rejection. Successful programs
+and the ordering gallery run at O0/O2 with ownership assertions.
+`check-builtin-capabilities-sanitize` instruments compiler and generated programs.
+
 `make check-generic-results` checks shared generic value/error storage and the
 IntegerResult/BooleanResult compatibility APIs at O0/O2 with ownership assertions.
 It preserves exact fatal messages and private fields and checks the results gallery.
@@ -199,10 +517,30 @@ Cases include truncated and malformed responses, split headers, bodyless and
 informational responses, bounded downloads and read deadlines. macOS also runs
 the same bounded API through NSURLSession. The socket fixture requires POSIX.
 
-`make check-debug-info` verifies Minyar DWARF line tables with `llvm-dwarfdump`,
-checks direct and cached builds, sanitizer compatibility and release exclusion,
-and uses LLDB on macOS to resolve imported `.min` source lines after temporary
+`make check-http-chunked` runs the portable client's private parser tests and
+independent Python socket peers at explicit generated/native/runtime O0/O2.
+Every split, binary bytes, extensions, discarded trailers, ambiguous framing,
+size/metadata bounds, incomplete input and absolute deadlines have exact oracles.
+Linux also uses a private fixture CA through the unchanged OpenSSL root provider
+for TLS 1.3 responses and an untrusted-certificate rejection control.
+`check-http-chunked-sanitize` repeats with generated/native/runtime ASan/UBSan
+and leak detection enabled. Raw commands, peer requests, bodies, reports and
+hashes remain in fresh run directories under `build/http-chunked` (override
+`HTTP_CHUNKED_ARTIFACTS`). No public network or macOS-provider proof is inferred.
+
+`make check-debug-info` verifies Minyar DWARF with `llvm-dwarfdump`, including
+typed arguments, initialized locals and nested lexical scopes. It checks direct
+and cached builds, sanitizer compatibility, line-only flags, release exclusion
+and the night-watch gallery. On macOS, LLDB resolves imported `.min` source lines
+and reads mutated arguments, SSA arguments and shadowed bindings after temporary
 link inputs are removed. It also checks dSYM retention and failed-link preservation.
+
+`make check-debugger-values` checks semantic Text, Bytes, List, Map, recursive
+record and choice DWARF in direct and cold/warm cached builds. Live LLDB and
+Linux GDB check bounded previews and narrow collection slots; LLDB also checks
+scalarized record fragments, captured closure values and outlined worker locals.
+`MINYAR_REQUIRE_DEBUGGERS=1` requires those debuggers instead of reporting a skip.
+The independent Python formatter checks cover malformed values and bounded reads.
 
 `make check-thread-native-regions` runs Linux mapping, sharing, atomic access,
 ownership and rejection controls. Its real x86 guest test runs when `/dev/kvm`
@@ -248,6 +586,15 @@ compare optimized and unoptimized language behavior against independent models,
 including operand evaluation order and conversion boundaries. Generated LLVM
 and runtime C are both instrumented in their sanitizer variants.
 
+`make check-structured-tasks` runs the one-shot typed task protocol and together
+gallery at O0/O2 with ownership assertions. It checks automatic completion of
+unobserved tasks, copied messages, cancellation, whole-scope deadlines, body and
+worker failures, closed aliases and malformed replies. The sanitizer companion
+instruments generated LLVM, the ownership runtime and both native providers.
+Typed scope values cover scalars, records, Bytes and nested collections. Native
+PID handshakes prove blocked children are reaped on body errors, propagated
+errors and cancellation before program shutdown can hide a lifetime leak.
+
 `make check-parallel-for` runs safe range programs and the parallel gallery at
 O0/O2 with exact output and ownership cleanup assertions. Race rejections cover
 shared scalars, changed indices, overlapping slots, managed values, escaping
@@ -274,6 +621,12 @@ each checksum and complete timing output. Timing is separate from correctness.
 ## Memory contracts
 
 ## Peer-derived tests and failure evidence
+
+The independent HTTP/2, gRPC, yamux and device reference peers build with
+`CGO_ENABLED=0`. Their protocol and fixture TLS paths use Go APIs, with explicit
+test certificate roots. This keeps the peers independent of the host C runtime
+while retaining the ordinary development resource limits. Changes to a cached
+peer build recipe force a fresh binary.
 
 `make check-peer-regressions` exercises checked-arithmetic traps, huge List
 indices, module aliases, terminal evaluation order, mixed-width Text access and
@@ -519,6 +872,28 @@ thresholds; in particular, they keep shared replacement inference open.
 
 ## Compiler-selected stack ownership
 
+`make check-scope-ownership` exercises the direct compiler's
+`--scope-owners` lowering at O0/O2. Its eager ordinary and cycle runtimes require
+empty scope/frame chains, no pending work, and zero managed objects and bytes
+at normal exit. Cases cover condition owners on either branch, short circuits,
+loop exit and jumps, borrowed parameter moves, aliases across mutation, early
+propagation, escaping closures, large cycles, nested and mixed-frame diagnostic
+recovery, call-depth recovery, cold/warm module replay, and the large-function
+fallback. Eight public launcher builds check eager and system selection through
+direct and incremental compilation, in default and release modes, by inspecting
+the actual generated LLVM and checking exact alias output. The module-driver
+option checks cover forwarding, conflicting modes and flag-shaped library values.
+Adjacent plain-borrow tests require only the lasting local/return cells, retain
+traced barriers, preserve aliases through field replacement and later arguments,
+and compare a fallback function with its exact original LLVM. A pending-cycle
+probe verifies return service at O0/O2; removing that poll must fail its explicit
+status/diagnostic oracle, also under ASan/UBSan.
+`make check-scope-ownership-sanitize` instruments the direct fixtures' generated LLVM
+and both runtimes with ASan/UBSan. `make check-scope-fixed-point` checks that a
+scope-lowered compiler emits exactly its own LLVM. The native and fixed-point
+checks are part of `check-portable`; the sanitizer check also belongs to
+`check-ownership`.
+
 The combined candidate includes three maintained checks in `make check`:
 
 - `make check-ownership-policy`: ordinary/module compiler budget boundaries,
@@ -742,6 +1117,22 @@ escaped into evidence rather than losing the report. The fault-injection harness
 checks candidate selection, stderr rejection, rejecting/empty corpora, retained
 failure evidence, invalid diagnostic encoding and POSIX descendant cleanup.
 
+`make check-differential-fuzz` adds a broader compiler matrix. Its Python oracle
+generates valid self-checking programs with arithmetic, control flow, aliased
+records and Lists, Map and Set key snapshots, managed collection values, generic
+scalar/reference specialization, Result/Maybe propagation, Bytes, escaping
+callbacks and choice payloads, then runs each program through stage2 and stage3
+with eager and arena runtimes at O0 and O2.
+The first mismatch is reduced by deleting independent case functions and
+shrinking operation counts while preserving a stable per-check failure identity.
+`make check-differential-fuzz-regressions` replays the checked-in minimized-spec
+corpus across the same matrix. Exact sources, replay specifications and command
+evidence are retained; output is capped at 16 MiB and every process group has a
+finite deadline. `make check-fuzz` runs the generator's independent fault-
+injection harness without paying for the compiler matrix. See
+[differential compiler fuzzing](differential-fuzz.md) for replay and campaign
+controls.
+
 `make check-text-literals` checks interpolation, multi-line indentation, raw
 delimiters, continuation, exact rejection locations and the text gallery at
 O0/O2 with ownership cleanup assertions. Its runtime probe measures one output
@@ -755,6 +1146,34 @@ slices must share a flattened owning root, tiny slices of large sources must
 copy, owned join chains must keep one Text identity with geometric capacity,
 and shared join operands must take the copying fallback. The compiler test also
 asserts that only owned producer tokens select the consuming join entry point.
+
+`make check-last-use-returns` checks local-owner transfers using emitted LLVM
+and O0/O2 executions. Aliased records and Lists, grouped names, branches, loops,
+shadowing and parameter reassignment preserve their values and lifetimes.
+Fields, indexes, calls and readonly borrowed parameters keep their existing
+return paths. The sanitized run checks both the compiler and generated programs,
+with the ownership runtime asserting complete cleanup at normal exit.
+
+`make check-terminal-return-reuse` checks terminal Text joins and List appends
+with typed local receivers. It covers aliases, side effects during argument
+evaluation, same-source reads, grouped expressions, borrowed parameters and
+recursive List elements. Negative descendant cases keep their source alive for
+later reads. Native and sanitized O0/O2 runs use the complete-cleanup graph
+runtime; emitted LLVM separately identifies the consuming calls and owner moves.
+
+`make check-typed-assignment-reuse` checks grouped and same-source Text/List
+self-assignment, argument order, aliases and traced elements at O0/O2 with
+native/sanitized complete cleanup. Other-local destinations, inner consumers
+and compound assignment retain their existing ownership paths; older lexical
+chain optimizations remain covered.
+
+`make check-mutable-scalar-records` checks direct scalar field updates without
+managed record calls. Integer, Float, Boolean and Character storage, compound
+updates, branch merges, loop initialization and match-expression initializers
+run at O0/O2 with native/sanitized cleanup assertions. Escaping aliases,
+reassignment, reference fields, captures and C layouts keep their managed paths;
+checked arithmetic keeps its existing failure behavior. LLVM checks require
+entry-only storage and O2 promotion for the pure fixture.
 
 Diagnostic locations are captured at token start. The byte-exact corpus covers
 lexer, parser, type, encoding, and whole-program failures; every current golden
@@ -801,10 +1220,19 @@ accepts a leading UTF-8 byte-order mark and gives an exact line and column for
 unsupported non-ASCII identifier characters.
 
 Every golden includes its source filename, line, column, source excerpt and
-token underline. The renderer's CRLF, tab, control-character and help-note
+token underline, a repair note, and a `minyar explain` code. Recorded errors
+must have a specific family rather than the general E0001 fallback.
+The renderer's CRLF, tab, control-character and help-note
 contracts also run in `check-syntax-tree` at O0/O2. `check-bootstrap-native`
 checks the runtime-native bridge used by the compiler, including native Text,
 Boolean and Integer results, void calls and malformed native bodies.
+
+`make check-c-import` imports selected C headers through Clang and runs their
+generated scalar/aggregate wrappers at O0/O2. It checks enums, macro expressions,
+constants, target options, nested/packed layouts, range failures, layout drift,
+unsupported interfaces, preserved outputs and exact normal-return ownership.
+The header-lantern gallery uses the same generated module and C adapter.
+`check-c-import-smoke` selects the constants, scalar, record and rejection cases.
 
 The diagnostics corpus also checks spelling suggestions, ambiguous names,
 private fields/methods/members, block and function scope, missing match cases,
@@ -813,12 +1241,18 @@ gallery runs at O0/O2 with ownership assertions. Spelling distance has separate
 insertion, deletion, transposition, distance and tie oracles in the syntax probe.
 
 Each single-error golden also runs in JSON mode and must preserve its file,
-message, source, label and help. Version and schema fields, exclusive token
+code, message, source, label and help. Version and schema fields, exclusive token
 ranges, control escapes, Unicode filenames and incremental cache invalidation
 have separate checks. Multi-error goldens assert exact independent spans,
 20-error caps, else-chain recovery, failed-binding suppression, fields and
 shadowing. The bootstrap native suite repeats recovery at O0/O2 with ownership
 assertions and a native probe that enters a real stack ownership header.
+
+`make check-explain` checks all 35 published codes through the compiler and
+the public launcher from outside a project. It compiles the explanation
+examples, checks exact usage and unknown-code errors, and verifies code/help
+parity for independent rejection cases, including malformed numbers, choice
+payload counts, empty interpolation, and source-read failures.
 
 `make check-conformance` executes the feature-indexed programs under
 `tests/conformance/` at O0 and O2. Its README maps every section of the language
@@ -841,7 +1275,10 @@ origin invariants.
 
 Generated functions check the current thread's actual stack bounds on Linux,
 macOS, and Windows, reserving enough stack to report an error. Platforms where
-bounds are unavailable use a conservative 32,768-call fallback. A 5,000-deep
+bounds are unavailable use a conservative 32,768-call fallback. On Linux, glibc
+finds the main thread's stack by reading `/proc/self/maps`; the runtime keeps
+that answer for the rest of the process, so C hosts that refresh bounds on
+every call into Minyar pay that cost once. A 5,000-deep
 program must run; compiler or program exhaustion must exit with
 `Minyar stopped: the program exceeded the maximum call depth.` rather than a
 signal.
@@ -1004,3 +1441,43 @@ must bind to the runtime reporter; header-only C probes retain a weak no-op
 fallback. Existing semantic oracles use a strict trace-suffix projection;
 malformed frames and unrelated stderr are rejected. Cold counters and LLVM
 body comparisons are measured separately from functional success.
+
+`make check-simulation` checks deterministic choices and replay, asynchronous
+completion ordering, virtual clocks, explicit disk/network faults and crash
+durability at O0/O2 with ownership cleanup assertions. `check-simulation-neodb`
+runs pinned, unmodified neo-db WAL modules through simulated I/O and checks
+recovery against acknowledged records and torn tails. The fixtures record their
+upstream revision and hashes. `check-simulation-sanitize` adds ASan/UBSan to the
+compiler and generated programs. See [simulation](simulation.md) for the model's
+limits; this is explicit cooperative testing, not native thread exploration.
+
+`make check-simulation-manifests` extends the real neo-db proof to snapshot
+encoding, alternating manifest slots, 596 prefix crashes, 148 configured byte
+corruptions and WAL-before-snapshot publication. It runs at O0/O2 with ownership
+checks and exact failure controls; `check-simulation-manifests-sanitize` adds
+ASan/UBSan. The [manifest contract](simulation-manifests.md) states the prefix
+overlay model and the engine/filesystem behavior outside this proof.
+
+`make check-pages` checks fixed page sizes, copied import/export, shared region
+and cursor aliases, integer/width boundaries, private storage, and a checked
+header/payload/directory gallery at O0/O2 with ownership assertions. The decoder
+rejects every truncated prefix and malformed ranges without overflowing offset
+arithmetic. `check-pages-sanitize` adds ASan/UBSan. See [pages](pages.md) for the
+explicit checks, copies and Result construction costs.
+
+`make check-completionio` checks bounded queue ownership, copied buffers,
+descriptor retention, partial submissions, EINTR, short/failed completions,
+cleanup and typed wrappers at O0/O2. The syscall mock and forced-unsupported
+controls run portably; `check-completionio-sanitize` adds ASan/UBSan.
+`make check-completionio-kernel` requires actual Linux io_uring reads, writes
+and drained syncs, including the managed ABI and gallery. Unsupported kernels
+fail this separate proof target. See [completion I/O](completion-io.md) for
+resource and durability limits.
+
+`make check-completionio-neodb-kernel` runs the pinned production neo-db WAL
+and snapshot modules through a real typed completion-queue facade. It checks
+batches, 64 segment rotations, completion acknowledgements, descriptor lifetime,
+CRC recovery and snapshot publication at O0/O2 with ownership assertions.
+`check-completionio-neodb-sanitize` adds compiler/runtime/generated ASan/UBSan
+and a real-kernel C probe with leak detection. Both strict Linux targets are
+separate from portable checks; see [the integration contract](completion-io-neodb.md).

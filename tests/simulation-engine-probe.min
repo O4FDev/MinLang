@@ -1,0 +1,138 @@
+use "simulation" as simulation
+use "./fixtures/neodb-engine/lib/dbio.min" as dbio
+use "./fixtures/neodb-engine/src/engine/api.min" as engine
+use "./fixtures/neodb-engine/src/engine/values.min" as values
+use "./fixtures/neodb-engine/src/storage/wal.min" as wal
+use "./fixtures/neodb-engine/src/storage/snapshot.min" as snapshot
+
+function check(value: Boolean, message: Text) {
+    if !value { fail("NeoDB engine simulation: " + message) }
+}
+function drain(world: simulation.World) {
+    let attempts = 0
+    while simulation.pendingCount(world) > 0 {
+        attempts += 1
+        check(attempts <= 128, "bounded completion progress")
+        check(dbio.completeNext() > 0, "every submitted sync is collected")
+    }
+}
+function drive(e: engine.Engine, world: simulation.World) {
+    engine.afterLoopIteration(e)
+    drain(world)
+    engine.onSyncReadable(e)
+}
+function acknowledge(e: engine.Engine, world: simulation.World, upTo: Integer) {
+    let attempts = 0
+    while engine.durableLsn(e) < upTo {
+        attempts += 1
+        check(attempts <= 128, "commit reaches its requested durable LSN")
+        drive(e, world)
+    }
+}
+function sql(e: engine.Engine, session: engine.Session, world: simulation.World, text: Text): List<engine.Outcome> {
+    let outcomes = engine.simpleQuery(e, session, text)
+    check(outcomes.length > 0, "statement returns an outcome")
+    for outcome in outcomes {
+        check(outcome.status == engine.STATUS_OK, "SQL succeeds: " + text.slice(0, min(text.length, 80)) + ": " + outcome.message)
+        acknowledge(e, world, outcome.waitLsn)
+    }
+    return outcomes
+}
+function scalar(e: engine.Engine, session: engine.Session, world: simulation.World, text: Text): Text {
+    let outcomes = sql(e, session, world, text)
+    check(outcomes.length == 1 && outcomes[0].rowCount == 1, "one scalar result row")
+    let data = outcomes[0].rowData
+    check(data.length >= 11 && data[0] == 68, "actual PostgreSQL DataRow frame")
+    check(values.getBE32(data, 1) == data.length - 1, "complete scalar DataRow frame")
+    check(values.getBE16(data, 5) == 1, "one scalar column")
+    let length = values.getBE32(data, 7)
+    check(length >= 0 && length == data.length - 11, "complete scalar field")
+    return Text(data.slice(11, 11 + length))
+}
+function open(): engine.Engine {
+    return engine.openWithOptions("/db", engine.Options {
+        checkpointWalBytes: 1073741824; checkpointIntervalMs: 0; noPrealloc: true
+    })
+}
+function payload(): Text {
+    let data = Bytes(65536)
+    for index in 0..data.length { data[index] = 120 }
+    return Text(data)
+}
+function copyRows(e: engine.Engine, session: engine.Session, world: simulation.World): Text {
+    let start = engine.simpleQuery(e, session, "COPY cargo (id, payload) FROM STDIN")
+    check(start.length == 1 && start[0].status == engine.STATUS_COPY_IN, "production COPY begins")
+    let text = payload()
+    // Five MiB crosses the unchanged production 4 MiB redo-spill threshold.
+    for index in 0..80 { engine.copyData(e, session, Bytes(Text(index) + "\t" + text + "\n")) }
+    drive(e, world)
+    let reader = wal.openReader("/db", 0)
+    let partials = 0
+    while wal.next(reader) {
+        let data = wal.payload(reader)
+        if data.length > 0 && data[0] == 80 { partials += 1 }
+    }
+    check(partials > 0 && !wal.corruptionDetected(reader), "actual durable P spill records exist")
+    return text
+}
+function committedCopy() {
+    let world = simulation.create(20261020)
+    dbio.bind(world)
+    let e = open()
+    let writer = engine.newSession(e, "probe", "probe")
+    let checkpoint = engine.newSession(e, "probe", "probe")
+    sql(e, writer, world, "CREATE TABLE cargo (id INTEGER, payload TEXT)")
+    let text = copyRows(e, writer, world)
+
+    // Fixed production returns OK when it cannot begin. A guard-omission
+    // control starts a checkpoint and parks instead; drive both through the
+    // same public loop boundary, without asserting the guard's implementation.
+    let requested = engine.simpleQuery(e, checkpoint, "CHECKPOINT")
+    check(requested.length == 1 && requested[0].status != engine.STATUS_ERROR, "checkpoint request is valid")
+    let attempts = 0
+    while engine.backgroundPending(e) {
+        attempts += 1
+        check(attempts <= 128, "checkpoint publication makes bounded progress")
+        drive(e, world)
+    }
+    let before = snapshot.openLatest("/db")
+    if before.found { snapshot.close(before) }
+
+    let committed = engine.copyDone(e, writer)
+    check(committed.status == engine.STATUS_OK && committed.commandTag == "COPY 80" && committed.waitLsn > 0,
+        "production COPY commit has a real acknowledgement boundary")
+    acknowledge(e, world, committed.waitLsn)
+    check(engine.durableLsn(e) >= committed.waitLsn, "commit is acknowledged only after successful sync")
+    // No tick or clean close here: close would checkpoint, masking the bug.
+    dbio.crash()
+    let recovered = open()
+    let reader = engine.newSession(recovered, "probe", "probe")
+    check(scalar(recovered, reader, world, "SELECT count(*) FROM cargo") == "80", "acknowledged COPY rows missing")
+    check(scalar(recovered, reader, world, "SELECT sum(id) FROM cargo") == "3160", "acknowledged identifier sum survives")
+    check(scalar(recovered, reader, world, "SELECT count(*) FROM cargo WHERE payload = '" + text + "'") == "80",
+        "every acknowledged payload survives byte-for-byte")
+    // Check after the recovered-data oracle, so the labeled negative control
+    // must expose data loss rather than merely observe a changed guard.
+    check(!before.found, "active spilled transaction prevented manifest publication")
+}
+function incompleteCopy() {
+    let world = simulation.create(901)
+    dbio.bind(world)
+    let e = open()
+    let writer = engine.newSession(e, "probe", "probe")
+    sql(e, writer, world, "CREATE TABLE cargo (id INTEGER, payload TEXT)")
+    copyRows(e, writer, world)
+    // P records without a final E record are not committed transactions.
+    dbio.crash()
+    let recovered = open()
+    let reader = engine.newSession(recovered, "probe", "probe")
+    check(scalar(recovered, reader, world, "SELECT count(*) FROM cargo") == "0", "unfinished COPY never becomes committed")
+}
+function suite() {
+    committedCopy()
+    incompleteCopy()
+    print("NeoDB engine: acknowledged spilled COPY survives; unfinished COPY stays absent")
+}
+
+// selected entry
+suite()

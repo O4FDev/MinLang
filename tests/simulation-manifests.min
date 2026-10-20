@@ -1,0 +1,57 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.compiler.compileTimeout = 120
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let root = test.resolvePath(".")
+// Printed before any assertion: failures retain generated sources, fixture
+// copies, LLVM, compile/link/run stdout and stderr in this exact directory.
+print("Manifest proof evidence: " + frontend.compiler.directory)
+let provenance = #"""
+    import hashlib, pathlib, sys
+    root = pathlib.Path(sys.argv[1])
+    expected = {
+        'wal.min': '1dc0de2a4cc00e6c6490686dd14b1b0f704142cf5baab5c497b8a8cc4be2635b',
+        'crc32c.min': '585a6697149eb7dd2ac828eb734dbc73841bcff4313fe23f44c4ae3c8f6514b1',
+        'util.min': 'db3a95e5e7b00dbdebed389a6afbc7fcd5a831984de00cb3aff5ef2ac458f04d',
+        'snapshot.min': '0d54ab9a5f5725cdc93929ae0db10e894dfc64b333dca1eb5b94e9fa0e6f9c65',
+    }
+    for name, digest in expected.items():
+        actual = hashlib.sha256((root / 'src' / 'storage' / name).read_bytes()).hexdigest()
+        assert actual == digest, 'production NeoDB source changed: ' + name
+    print('NeoDB manifest source pin verified')
+    """#
+let pin = test.run(["python3", "-c", provenance, root + "/tests/fixtures/neodb-simulation"],
+    system.environment(), "", frontend.compiler.directory + "/provenance", 10)
+test.require(pin, "verify byte-for-byte pinned production NeoDB storage sources")
+test.check(pin.output == "NeoDB manifest source pin verified\n" && pin.errorOutput == "", "manifest provenance oracle")
+let destination = frontend.compiler.directory + "/fixtures/neodb-simulation"
+for directory in ["/fixtures", "/fixtures/neodb-simulation", "/fixtures/neodb-simulation/lib", "/fixtures/neodb-simulation/src", "/fixtures/neodb-simulation/src/storage"] {
+    test.check(files.makeDirectory(frontend.compiler.directory + directory) == 0, "create manifest fixture directory")
+}
+for path in ["lib/dbio.min", "src/storage/wal.min", "src/storage/crc32c.min", "src/storage/util.min", "src/storage/snapshot.min"] {
+    io.writeBytesFile(destination + "/" + path, io.readBytesFile("tests/fixtures/neodb-simulation/" + path))
+}
+let source = io.readTextFile("tests/simulation-manifests-probe.min")
+// Separate generated cases retain each optimization's evidence if a later
+// case fails; the shared frontend execution/ownership oracle is unchanged.
+for optimization in ["-O0", "-O2"] {
+    fixtures.executes(frontend, source,
+        "NeoDB manifests: 596 prefix crashes, alternating slots, CRC fallback and WAL publication verified\n",
+        [optimization], 0, "", true)
+    fixtures.executes(frontend, test.replace(source, "// selected entry\nsuite()", "slotWriteFailure()"),
+        "", [optimization], 1, "Minyar stopped: storage: write /db/manifest-0.db: simulated I/O error (-5)\n", false)
+    fixtures.executes(frontend, test.replace(source, "// selected entry\nsuite()", "beyondWalFailure()"),
+        "", [optimization], 1, "Minyar stopped: storage: snapshot LSN is beyond the end of the WAL\n", false)
+    fixtures.executes(frontend, test.replace(source, "// selected entry\nsuite()", "walSyncFailure()"),
+        "", [optimization], 1, "Minyar stopped: storage: WAL sync: simulated I/O error (-5)\n", false)
+    fixtures.executes(frontend, test.replace(source, "// selected entry\nsuite()", "chunkReadFailure()"),
+        "", [optimization], 1,
+        "Minyar stopped: storage: snapshot /db/manifest-0.db chunk 0 is corrupt (CRC mismatch or short read); the file was renamed *.corrupt: restart to recover from the previous snapshot and the WAL\n", false)
+}
+test.removeTree(frontend.compiler.directory)
+print("Pinned production NeoDB manifests passed crash, CRC, publication and ownership checks at O0/O2")

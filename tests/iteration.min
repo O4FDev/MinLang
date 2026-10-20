@@ -1,0 +1,331 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function functionSymbol(llvm: Text, name: Text): Text {
+    let found = ""
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") {
+            let at = line.find("@")
+            let end = line.find("(")
+            if at >= 0 && end > at {
+                let symbol = line.slice(at, end)
+                if symbol == "@.minyar.fn." + name || symbol == "@.minyar.fn.minyar_module_0_" + name || symbol.startsWith("@\".minyar.fn.minyar.module|" + name + "|") {
+                    test.check(found == "", "iteration LLVM has duplicate functions named " + name)
+                    found = symbol
+                }
+            }
+        }
+    }
+    test.check(found != "", "iteration LLVM has no function named " + name)
+    return found
+}
+
+function functionBody(llvm: Text, symbol: Text): Text {
+    let body: List<Text> = []
+    let taking = false
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " " + symbol + "(") { taking = true }
+        if taking {
+            body.add(line + "\n")
+            if line == "}" { return joinText(body) }
+        }
+    }
+    fail("iteration LLVM function is missing or incomplete: " + symbol)
+}
+
+function optimizer(frontend: fixtures.Frontend): Text {
+    let directory = test.setting("MINYAR_LLVM_BIN", "")
+    let candidates: List<Text> = []
+    if directory != "" { candidates.add(directory + "/opt") }
+    else {
+        let clang = frontend.compiler.clang
+        let last = -1
+        for index in 0..clang.length { if clang[index] == '/' { last = index } }
+        if last >= 0 { candidates.add(clang.slice(0, last + 1) + "opt") }
+        candidates.add("/usr/lib/llvm-23/bin/opt")
+        candidates.add("opt-23")
+        candidates.add("opt")
+    }
+    let command = ["/bin/sh", "-c", "for tool do if command -v \"$tool\"; then exit 0; fi; done; exit 1", "minyar"]
+    for candidate in candidates { command.add(candidate) }
+    let found = test.run(command, frontend.environment, "", frontend.compiler.directory + "/optimizer-tool", 10)
+    test.check(found.status == 0 && found.output != "", "Required LLVM optimizer unavailable; set MINYAR_LLVM_BIN")
+    return test.lines(found.output)[0]
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let span = #"""
+    record Span { first: Integer; after: Integer }
+    record Cursor { position: Integer; after: Integer }
+    public function Span.iterator(): Cursor {
+        return Cursor { position: self.first - 1; after: self.after }
+    }
+    public function Cursor.advance(): Boolean {
+        self.position += 1
+        return self.position < self.after
+    }
+    public function Cursor.current(): Integer { return self.position }
+
+    """#
+
+fixtures.executes(frontend, span + #"""
+    for value in Span { first: 2; after: 5 } { print(value) }
+    for value in Span { first: 3; after: 3 } { fail("an empty source produced an item") }
+    for value in Span { first: 5; after: 3 } { fail("a reversed source produced an item") }
+    for value in Span { first: 7; after: 8 } { print(value) }
+    let value = 77
+    let total = 0
+    for value in Span { first: 1; after: 4 } { total += value; value = 99 }
+    print(total)
+    print(value)
+    let source = Span { first: 1; after: 4 }
+    total = 0
+    for value in source {
+        for value in source { total += value }
+    }
+    print(total)
+    """#, "2\n3\n4\n7\n6\n77\n18\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Calls { sources: Integer; cursors: Integer; advances: Integer; reads: Integer }
+    record Counted { after: Integer; calls: Calls }
+    record CountedCursor { position: Integer; after: Integer; calls: Calls }
+    function create(calls: Calls): Counted {
+        calls.sources += 1
+        return Counted { after: 6; calls: calls }
+    }
+    function Counted.iterator(): CountedCursor {
+        self.calls.cursors += 1
+        return CountedCursor { position: 0; after: self.after; calls: self.calls }
+    }
+    function CountedCursor.advance(): Boolean {
+        self.calls.advances += 1
+        self.position += 1
+        return self.position < self.after
+    }
+    function CountedCursor.current(): Integer {
+        self.calls.reads += 1
+        if self.position >= self.after { fail("current read after exhaustion") }
+        return self.position
+    }
+    let calls = Calls { sources: 0; cursors: 0; advances: 0; reads: 0 }
+    let total = 0
+    for value in create(calls) {
+        if value == 2 { continue }
+        total += value
+        if value == 3 { break }
+    }
+    print(total)
+    print(calls.sources); print(calls.cursors); print(calls.advances); print(calls.reads)
+    calls.advances = 0; calls.reads = 0
+    for value in Counted { after: 1; calls: calls } { fail("empty body ran") }
+    print(calls.advances); print(calls.reads)
+    calls.advances = 0; calls.reads = 0
+    total = 0
+    for value in Counted { after: 4; calls: calls } { total += value }
+    print(total); print(calls.advances); print(calls.reads)
+    """#, "4\n1\n1\n3\n3\n1\n0\n6\n4\n3\n", levels, 0, "", true)
+
+fixtures.executes(frontend, span + #"""
+    function first(source: Span): Integer {
+        let protected = [Bytes(64), Bytes(32)]
+        for value in source { let scratch = Bytes(128); return value + protected.length - 2 }
+        return -1
+    }
+    function leave(source: Span) {
+        for value in source { let protected = Bytes(64); return }
+    }
+    let total = 0
+    for outer in Span { first: 1; after: 4 } {
+        for inner in Span { first: 1; after: 6 } {
+            if inner == 2 { break }
+            total += outer * 10 + inner
+        }
+    }
+    print(total)
+    print(first(Span { first: 42; after: 45 }))
+    print(first(Span { first: 0; after: 0 }))
+    for repetition in 0..100 { leave(Span { first: 1; after: 4 }) }
+    function read(good: Boolean): Result<Integer, Text> {
+        if good { return Ok(2) }
+        return Err("stopped")
+    }
+    function consume(good: Boolean): Result<Integer, Text> {
+        for value in Span { first: 1; after: 4 } {
+            let protected = [Bytes(64), Bytes(32)]
+            let amount = try read(good)
+            return Ok(value + amount + protected.length)
+        }
+        return Ok(0)
+    }
+    match consume(true) { Ok(value) { print(value) } Err(error) { print(error) } }
+    match consume(false) { Ok(value) { print(value) } Err(error) { print(error) } }
+    """#, "63\n42\n-1\n5\nstopped\n", levels, 0, "", true)
+
+let letters = #"""
+    record Letters { words: List<Text> }
+    record LetterCursor { words: List<Text>; position: Integer }
+    function Letters.iterator(): LetterCursor {
+        return LetterCursor { words: self.words; position: -1 }
+    }
+    function LetterCursor.advance(): Boolean {
+        self.position += 1
+        return self.position < self.words.length
+    }
+    function LetterCursor.current(): Text { return self.words[self.position] }
+
+    """#
+fixtures.executes(frontend, span + letters + #"""
+    function total<Source>(source: Source): Integer {
+        let answer = 0
+        for value in source { answer += value }
+        return answer
+    }
+    function firstOr<Source, Item>(source: Source, fallback: Item): Item {
+        for value in source { return value }
+        return fallback
+    }
+    print(total(Span { first: 1; after: 4 }))
+    print(firstOr(Span { first: 42; after: 43 }, 0))
+    print(firstOr(Span { first: 0; after: 0 }, 7))
+    print(firstOr(Letters { words: ["home", "shore"] }, "absent"))
+    print(firstOr(Letters { words: [] }, "quiet"))
+    """#, "6\n42\n7\nhome\nquiet\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Packet { name: Text; bytes: Bytes }
+    record Packets { count: Integer }
+    record PacketCursor { position: Integer; count: Integer; packet: Packet }
+    function Packets.iterator(): PacketCursor {
+        return PacketCursor { position: 0; count: self.count; packet: Packet { name: "unused"; bytes: Bytes() } }
+    }
+    function PacketCursor.advance(): Boolean {
+        self.position += 1
+        self.packet = Packet { name: "packet \(self.position)"; bytes: Bytes(Text(self.position)) }
+        return self.position <= self.count
+    }
+    function PacketCursor.current(): Packet { return self.packet }
+    function first(): Packet {
+        for packet in Packets { count: 3 } { return packet }
+        return Packet { name: "missing"; bytes: Bytes() }
+    }
+    let kept: List<Packet> = []
+    for packet in Packets { count: 3 } {
+        kept.add(packet)
+        if packet.name == "packet 2" { continue }
+    }
+    let returned = first()
+    let stopped: List<Packet> = []
+    for packet in Packets { count: 3 } { stopped.add(packet); break }
+    for index in 0..100 { let scratch = [Bytes(256), Bytes(128)] }
+    for packet in kept { print(packet.name); print(Text(packet.bytes)) }
+    print(returned.name); print(Text(returned.bytes))
+    print(stopped[0].name)
+    for repetition in 0..100 {
+        for packet in Packets { count: 2 } { if packet.bytes.length != 1 { fail("lost current bytes") } }
+    }
+    """#, "packet 1\n1\npacket 2\n2\npacket 3\n3\npacket 1\n1\npacket 1\n", levels, 0, "", true)
+
+fixtures.executes(frontend, letters + #"""
+    function make(): Letters { return Letters { words: ["kept", "alive"] } }
+    let kept: List<Text> = []
+    for word in make() { kept.add(word) }
+    for index in 0..100 { let scratch = Bytes(128) }
+    print(kept[0] + " " + kept[1])
+    let source = Letters { words: ["first", "last"] }
+    for word in source {
+        source.words.clear()
+        let scratch = Bytes(128)
+        print(word)
+        break
+    }
+    """#, "kept alive\nfirst\n", levels, 0, "", true)
+
+io.writeTextFile(frontend.compiler.directory + "/public-iteration.min", test.sourceModules(#"""
+    public record Route { count: Integer }
+    public record RouteCursor { position: Integer; count: Integer }
+    public function Route.iterator(): RouteCursor { return RouteCursor { position: 0; count: self.count } }
+    public function RouteCursor.advance(): Boolean { self.position += 1; return self.position <= self.count }
+    public function RouteCursor.current(): Integer { return self.position }
+    public function open(count: Integer): Route { return Route { count: count } }
+    """#))
+fixtures.executes(frontend, #"""
+    use "./public-iteration.min" as route
+    let total = 0
+    for value in route.open(3) { total += value }
+    print(total)
+    """#, "6\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    function bound(calls: List<Integer>, value: Integer): Integer { calls[0] += 1; return value }
+    let calls = [0]
+    let total = 0
+    for value in bound(calls, 1)..bound(calls, 4) { total += value; value = 99 }
+    print(total); print(calls[0])
+    for value in 4..2 { fail("reversed range body ran") }
+    for value in 9223372036854775806..9223372036854775807 { print(value) }
+    let values = [1]
+    total = 0
+    for value in values { total += value; if value == 1 { values.add(2) } }
+    print(total)
+    for value in Bytes("AB") { print(value) }
+    for value in "é🙂" { print(value) }
+    let iterator = 20; let advance = 21; let current = 1
+    print(iterator + advance + current)
+    """#, "6\n2\n9223372036854775806\n3\n65\n66\né\n🙂\n42\n", levels, 0, "", true)
+
+fixtures.executes(frontend, span + #"""
+    public function total(source: Span): Integer {
+        let answer = 0
+        for value in source { answer += value }
+        return answer
+    }
+    for count in [0, 1, 2, 3, 17] { print(total(Span { first: 0; after: count })) }
+    """#, "0\n0\n1\n3\n136\n", levels, 0, "", true)
+let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+let totalSymbol = functionSymbol(llvm, "total")
+let iteratorSymbol = functionSymbol(llvm, "Span$iterator")
+let advanceSymbol = functionSymbol(llvm, "Cursor$advance")
+let currentSymbol = functionSymbol(llvm, "Cursor$current")
+let body = functionBody(llvm, totalSymbol)
+test.check(test.contains(body, " i64 " + totalSymbol + "("), "iteration consumer must return an unboxed Integer")
+test.check(test.contains(body, "call ptr " + iteratorSymbol + "("), "iteration must call the concrete iterator")
+test.check(test.contains(body, "call zeroext i1 " + advanceSymbol + "("), "iteration must call the concrete advance method")
+test.check(test.contains(body, "call i64 " + currentSymbol + "("), "iteration items must have an unboxed Integer signature")
+test.check(test.contains(body, "br i1 ") && test.contains(body, "for.condition."), "iteration must lower to a conditional loop")
+test.check(!test.contains(body, "@minyar_list_new") && !test.contains(body, "@minyar_list_add"), "iteration must not materialize an intermediate List")
+test.check(!test.contains(body, "@minyar_callback_check") && !test.contains(body, "call i64 %") && !test.contains(body, "call zeroext i1 %"), "iteration must not dispatch through a callback")
+test.require(test.run([optimizer(frontend), "-passes=verify", "-disable-output", path + ".ll"], frontend.environment, "", path + ".verify", 30), "verify concrete iteration LLVM")
+
+fixtures.rejects(frontend, "record Plain { value: Integer }\nfor value in Plain { value: 1 } {}\n", "iteration needs a method named 'iterator'", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(n: Integer): Source { return self }\nfor value in Source {} {}\n", "iteration method 'iterator' must take no arguments", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Integer { return 1 }\nfor value in Source {} {}\n", "iteration needs a record cursor with advance(): Boolean and current(): Item", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfor value in Source {} {}\n", "iteration needs a method named 'advance'", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfunction Source.advance(): Boolean { return false }\nfor value in Source {} {}\n", "iteration needs a method named 'current'", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfunction Source.advance(n: Integer): Boolean { return false }\nfunction Source.current(): Integer { return 0 }\nfor value in Source {} {}\n", "iteration method 'advance' must take no arguments", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfunction Source.advance(): Integer { return 0 }\nfunction Source.current(): Integer { return 0 }\nfor value in Source {} {}\n", "iteration method 'advance' must return Boolean", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfunction Source.advance(): Boolean { return false }\nfunction Source.current(n: Integer): Integer { return n }\nfor value in Source {} {}\n", "iteration method 'current' must take no arguments", true)
+fixtures.rejects(frontend, "record Source {}\nfunction Source.iterator(): Source { return self }\nfunction Source.advance(): Boolean { return false }\nfunction Source.current() {}\nfor value in Source {} {}\n", "iteration method 'current' must return an item, not Nothing", true)
+for member in ["iterator", "advance", "current"] {
+    let visibility = "public function "
+    let source = "public record Source {}\n"
+    if member == "iterator" { visibility = "function " }
+    source += visibility + "Source.iterator(): Source { return self }\n"
+    visibility = "public function "
+    if member == "advance" { visibility = "function " }
+    source += visibility + "Source.advance(): Boolean { return false }\n"
+    visibility = "public function "
+    if member == "current" { visibility = "function " }
+    source += visibility + "Source.current(): Integer { return 0 }\n"
+    io.writeTextFile(frontend.compiler.directory + "/private-iteration.min", test.sourceModules(source))
+    fixtures.rejects(frontend, "use \"./private-iteration.min\" as hidden\nfor value in hidden.Source {} {}\n", "iteration method '" + member + "' is private to its module", true)
+}
+fixtures.rejects(frontend, span + "for value in Span { first: 0; after: 0 } { missing() }\n", "function named 'missing'", true)
+fixtures.rejects(frontend, span + "parallel for value in Span { first: 0; after: 3 } {}\n", "parallel for needs an Integer range", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/iteration.min"), "Leave a light for the quay.\nLeave a light for the bridge.\nLeave a light for the last boat home.\nEvery journey begins with one small light.\n", levels, 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("User-defined iteration: passed")

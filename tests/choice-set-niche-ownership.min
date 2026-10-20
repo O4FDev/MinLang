@@ -1,0 +1,104 @@
+use "maybe" as maybe
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+function nativeOptional(mode: Integer): Maybe<Set<Integer>> { native "choice_set" }
+function nativeIdentity(value: Maybe<Set<Integer>>): Maybe<Set<Integer>> { native "choice_set" }
+function nativeSame(left: Maybe<Set<Integer>>, right: Maybe<Set<Integer>>): Boolean { native "choice_set" }
+function single(value: Integer): Set<Integer> { let values: Set<Integer> = Set(); values.add(value); return values }
+function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }
+function same<Item: Equatable>(left: Item, right: Item): Boolean { return left == right }
+function remember(value: Maybe<Set<Integer>>): () -> Maybe<Set<Integer>> { return function() { return value } }
+record Holder<Item> { value: Item; names: Maybe<Set<Text>> }
+record Owner { self: Maybe<Owner>; value: Maybe<Set<Integer>> }
+record Box { value: Maybe<Set<Integer>> }
+choice Partial { Empty; Pair(values: Set<Integer>, count: Integer) }
+
+function cycle(): Owner {
+    let owner = Owner { self: None; value: Some(single(7)) }
+    owner.self = Some(owner)
+    return owner
+}
+function decode(good: Boolean): Result<Set<Integer>, Text> {
+    if good { return Ok(single(42)) }
+    return Err("failed" + " decode")
+}
+function number(good: Boolean): Result<Integer, Text> {
+    if good { return Ok(42) }; return Err("failed" + " number")
+}
+function store(box: Box, good: Boolean): Result<Maybe<Set<Integer>>, Text> {
+    box.value = Some(try decode(good))
+    return Ok(box.value)
+}
+function partial(good: Boolean): Result<Partial, Text> { return Ok(Pair(single(7), try number(good))) }
+function replace(box: Box): (Set<Integer>) -> Set<Integer> {
+    box.value = None
+    return function(values) { values.add(9); return values }
+}
+
+let empty = nativeOptional(1)
+let absent = nativeOptional(0)
+check(empty.isSome() && empty.unwrap().length == 0 && absent.isNone(), "native empty header differs from null")
+check(nativeIdentity(absent).isNone() && nativeSame(absent, None), "native null identity")
+check(nativeSame(empty, nativeIdentity(empty)), "native identity retains the same header")
+check(nativeIdentity(Some(Set<Integer>())).isSome(), "owned language empty header crosses native ABI")
+let held = nativeIdentity(nativeOptional(2))
+check(held.unwrap().contains(42), "owned native temporary survives identity")
+check(absent == None && absent != empty && empty != absent, "null equality truth table")
+check(empty == Some(Set<Integer>()) && held != empty, "native and language present headers compare by contents")
+empty = None
+let borrowed = single(1)
+let optional = wrap(borrowed)
+borrowed = Set<Integer>()
+check(optional.unwrap().contains(1), "borrowed Some owns payload")
+check(nativeSame(optional, nativeIdentity(optional)), "borrowed language header crosses native ABI unchanged")
+let owned = Some(single(2))
+let read = remember(owned)
+let rows: List<Maybe<Set<Integer>>> = [optional, None, owned]
+optional = None
+check(rows[0].unwrap().contains(1), "List retains borrowed payload")
+owned = None
+rows[2] = None
+check(read().unwrap().contains(2), "callback retains owned payload")
+let input = Some(single(3))
+match input {
+    Some(values) { input = None; values.add(4); check(values.length == 2, "match retains replaced input") }
+    None { fail("missing match input") }
+}
+let box = Box { value: Some(single(5)) }
+let mapped = box.value.map(replace(box))
+check(box.value.isNone() && mapped.unwrap().contains(5) && mapped.unwrap().contains(9), "map protects receiver during callback evaluation")
+check(mapped.filter(function(values) { return values.length == 2 }).isSome(), "Maybe filter")
+check(mapped.andThen(function(values): Maybe<Set<Integer>> { return Some(values) }).unwrap().contains(9), "Maybe andThen")
+check(absent.orElse(function(): Maybe<Set<Integer>> { return Some(single(6)) }).unwrap().contains(6), "Maybe recovery")
+check(mapped.okOr("missing").map(function(values) { return values.length }).unwrap() == 2, "Result map")
+check(store(box, true).unwrap().unwrap().contains(42), "try constructs Set niche")
+check(store(box, false).isErr() && box.value.unwrap().contains(42), "failed try preserves destination")
+check(partial(true).isOk() && partial(false).isErr(), "partial tagged construction cleans Set owner")
+let qualified: maybe.Maybe<Set<Integer>> = maybe.Maybe<Set<Integer>>.Some(single(8))
+check(qualified.unwrap().contains(8) && maybe.Maybe<Set<Integer>>.None.isNone(), "qualified Maybe ABI")
+
+let firstNames = Set<Text>(); firstNames.add("sea")
+let secondNames = Set<Text>(); secondNames.add("sea")
+let first = Holder<Integer> { value: 42; names: Some(firstNames) }
+let second = Holder<Integer> { value: 42; names: Some(secondNames) }
+let wrapped: Maybe<Holder<Integer>> = Some(first)
+check(same(first, second) && same(wrapped, Some(second)), "generic Holder equality true")
+secondNames.add("sky")
+check(!same(first, second) && !same(wrapped, Some(second)), "generic Holder equality false after alias mutation")
+check(secondNames.remove("sky"), "remove added key")
+check(same(first, second) && same(wrapped, Some(second)), "generic Holder equality restored")
+
+if true {
+    let root = cycle()
+    let saved = root.value
+    root.value = None
+    check(saved.unwrap().contains(7), "self-cycle removal preserves saved Set")
+    root.value = Some(single(11))
+    check(root.self.unwrap().value.unwrap().contains(11), "self-cycle optional Set replacement")
+    root.value = None
+    root.value = saved
+    check(root.value.unwrap().contains(7), "Some None Some shares original Set")
+}
+let zeros: Set<Float> = Set(); zeros.add(0.0); zeros.add(-0.0)
+check(Some(zeros).unwrap().length == 1 && zeros.contains(-0.0), "Float Set keys canonicalize signed zero")
+print("Set niche ownership: passed")

@@ -7,6 +7,8 @@ record GenericDeclaration {
     variables: List<Text>; constraints: List<Text>
     names: List<Text>; types: List<Integer>; result: Integer
 }
+record GenericCapability { name: Text; start: Integer; methods: List<GenericDeclaration> }
+record GenericConformance { type: Integer; capability: Text; start: Integer }
 record GenericInstance { declaration: Integer; arguments: List<Integer>; name: Text }
 record GenericStream {
     kinds: List<Integer>; texts: List<Text>; lines: SourceMap
@@ -21,6 +23,8 @@ record GenericProgram {
     constraints: List<GenericConstraint>; constraintIndex: GenericIndex
     aliases: GenericIndex; aliasPositions: List<Integer>
     methodStreams: List<GenericStream>; methodIndex: GenericIndex
+    capabilities: List<GenericCapability>; capabilityIndex: GenericIndex
+    conformances: List<GenericConformance>; conformanceIndex: GenericIndex
 }
 record GenericScope { names: List<Text>; types: List<Integer>; active: Integer; result: Integer }
 
@@ -222,9 +226,14 @@ function genericConcreteType(program: GenericProgram, type: Integer): Boolean {
 }
 
 function genericRequireCapability(program: GenericProgram, stream: GenericStream, position: Integer, type: Integer, capability: Text, variable: Text) {
+    if !builtinCapability(capability) && genericIndexGet(program.capabilityIndex, capability) >= 0 {
+        if genericIndexGet(program.conformanceIndex, Text(type) + ":" + capability) < 0 { genericError(stream, position, "type '" + program.types[type].spelling + "' does not satisfy " + readableDeclarationName(capability) + " for type argument '" + variable + "'; declare its conformance explicitly") }
+        return
+    }
     let shape = program.types[type]
     let record = genericDeclaration(program, shape.name, 2)
     let structural = shape.name == "Result" || ((shape.name == "Map" || shape.name == "Set") && capability == "Equatable")
+    if capability == "Iterable" || capability == "Iterator" { structural = true }
     if record < 0 && !structural { genericError(stream, position, "type '" + shape.spelling + "' does not satisfy " + capability + " for type argument '" + variable + "'") }
     let key = capability + ":" + Text(type)
     if genericIndexGet(program.constraintIndex, key) >= 0 { return }
@@ -246,7 +255,7 @@ function genericValidateConstraints(context: CompilerContext) {
             let supported = typeSupportsCapability(context, type, capability)
             if !supported {
                 let description = describeType(type)
-                if isRecordType(type) { description = readableDeclarationName(context.functionNames[type - 1000]) }
+                if isRecordType(type) { description = readableDeclarationName(context.functionNames[recordTypeIndex(type)]) }
                 failCompiler(describeLocation(tokenLocation(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[record]].start + 1)) + ": type '" + description + "' does not satisfy " + capability + " for type argument '" + declaredFieldName(context.functionParameterNames[field]) + "'")
             }
         }
@@ -272,7 +281,7 @@ function genericInstantiate(program: GenericProgram, stream: GenericStream, posi
         if constraint != "" {
             let shape = program.types[arguments[argument]]
             let builtin = shape.arguments.length == 0 && (shape.name == "Integer" || shape.name == "Float" || shape.name == "Text" || shape.name == "Character" || shape.name == "Boolean")
-            if !builtin { genericRequireCapability(program, stream, position, arguments[argument], constraint, template.variables[argument]) }
+            if !builtin || !builtinCapability(constraint) { genericRequireCapability(program, stream, position, arguments[argument], constraint, template.variables[argument]) }
         }
         key = key + ":" + Text(arguments[argument])
 
@@ -352,7 +361,7 @@ function genericCollectAlias(program: GenericProgram, stream: GenericStream, cur
         genericError(stream, start + 1, "a type alias cannot replace built-in type '" + readable + "'")
     }
     if resultPrefix(name, "minyar_generic_") || resultPrefix(readable, "minyar_generic_") { genericError(stream, start + 1, "reserved generic compiler name") }
-    if genericIndexGet(program.aliases, name) >= 0 || genericDeclaration(program, name, 2) >= 0 { genericError(stream, start + 1, "module declares type '" + readable + "' more than once") }
+    if genericIndexGet(program.aliases, name) >= 0 || genericDeclaration(program, name, 2) >= 0 || (!builtinCapability(name) && genericIndexGet(program.capabilityIndex, name) >= 0) { genericError(stream, start + 1, "module declares type '" + readable + "' more than once") }
     cursor[0] = start + 2
     expectToken(stream.kinds, stream.texts, stream.lines, cursor, "=")
     let target = genericReadType(program, stream, cursor, 0)
@@ -515,7 +524,7 @@ function genericCollectDeclaration(program: GenericProgram, stream: GenericStrea
                 if stream.kinds[cursor[0]] != 1 { genericError(stream, cursor[0], "expected a capability name after ':'") }
                 constraint = stream.texts[cursor[0]]
                 cursor[0] = cursor[0] + 1
-                if constraint != "Equatable" && constraint != "Ordered" && constraint != "Hashable" { genericError(stream, cursor[0] - 1, "unknown capability '" + constraint + "'") }
+                if !genericKnownCapability(program, constraint) { genericError(stream, cursor[0] - 1, "unknown capability '" + readableDeclarationName(constraint) + "'") }
             }
             constraints.add(constraint)
             if !tokenIs(stream.kinds, stream.texts, cursor, ">") { expectToken(stream.kinds, stream.texts, stream.lines, cursor, ",") }
@@ -866,6 +875,7 @@ function genericResultConstructor(program: GenericProgram, stream: GenericStream
 function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: List<Integer>, scope: GenericScope, type: Integer, start: Integer, contextual: Integer, depth: Integer): Integer {
     while tokenIs(stream.kinds, stream.texts, cursor, ".") || tokenIs(stream.kinds, stream.texts, cursor, "[") || tokenIs(stream.kinds, stream.texts, cursor, "(") {
         let resultMethod = genericResultMethod(program, stream, cursor, scope, type, start, contextual, depth)
+        if resultMethod < 0 { resultMethod = genericSequenceMethod(program, stream, cursor, scope, type, start, contextual, depth) }
         if resultMethod >= 0 { type = resultMethod } else {
         let token = stream.texts[cursor[0]]
         cursor[0] = cursor[0] + 1
@@ -1103,7 +1113,7 @@ function genericStatement(program: GenericProgram, stream: GenericStream, cursor
         let result = genericChoiceMatch(program, stream, cursor, scope, 0, depth + 1, false)
         return
     }
-    if (token == "let" || (scope.result == 0 && (token == "constant" || token == "global"))) && stream.kinds[cursor[0] + 1] == 1 {
+    if (token == "let" || token == "constant" || (scope.result == 0 && token == "global")) && stream.kinds[cursor[0] + 1] == 1 {
         cursor[0] = cursor[0] + 1
         let name = stream.texts[cursor[0]]
         cursor[0] = cursor[0] + 1
@@ -1127,14 +1137,22 @@ function genericStatement(program: GenericProgram, stream: GenericStream, cursor
         return
     }
     if token == "for" {
+        let parallel = cursor[0] > 0 && stream.kinds[cursor[0] - 1] == 1 && stream.texts[cursor[0] - 1] == "parallel"
         let name = stream.texts[cursor[0] + 1]
         cursor[0] = cursor[0] + 3
         let collection = genericExpression(program, stream, cursor, scope, 0, 0, depth + 1)
+        if parallel && tokenIs(stream.kinds, stream.texts, cursor, "reduce") {
+            cursor[0] = cursor[0] + 1
+            if stream.kinds[cursor[0]] != 1 { genericError(stream, cursor[0], "reduce needs a mutable Integer or Float binding") }
+            cursor[0] = cursor[0] + 1
+        }
         let type = genericNamedType(program, "Integer")
         if collection > 0 {
             let shape = program.types[collection]
             if shape.name == "Text" { type = genericNamedType(program, "Character") }
             if shape.name == "List" || shape.name == "Set" || shape.name == "Map" { type = shape.arguments[0] }
+            let item = genericSequenceElement(program, collection)
+            if item > 0 { type = item }
         }
         let active = scope.active
         genericScopeAdd(scope, name, type)
@@ -1269,29 +1287,36 @@ function genericInstanceStream(program: GenericProgram, instance: GenericInstanc
 }
 
 function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): CallbackTokens {
+    let prelude = capabilityPrelude(kinds, texts, lines)
+    kinds = prelude.kinds
+    texts = prelude.texts
+    lines = prelude.lines
     let source = newGenericStream(kinds, texts, lines)
     let declarations: List<GenericDeclaration> = []
     let types: List<GenericType> = []
     let instances: List<GenericInstance> = []
     let methodStreams: List<GenericStream> = []
-    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); constraints: []; constraintIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: []; methodStreams: methodStreams; methodIndex: newGenericIndex() }
+    let program = GenericProgram { source: source; typePositions: callbackTypePositions(kinds, texts); declarations: declarations; declarationIndex: newGenericIndex(); types: types; typeIndex: newGenericIndex(); instances: instances; instanceIndex: newGenericIndex(); constraints: []; constraintIndex: newGenericIndex(); aliases: newGenericIndex(); aliasPositions: []; methodStreams: methodStreams; methodIndex: newGenericIndex(); capabilities: []; capabilityIndex: newGenericIndex(); conformances: []; conformanceIndex: newGenericIndex() }
     genericNamedType(program, "?")
+    genericCollectCapabilities(program)
     let cursor: List<Integer> = [0, 0]
     skipTerminators(kinds, cursor)
     while kinds[cursor[0]] != 0 {
         let start = cursor[0]
+        if capabilityDeclarationAt(kinds, texts, start) || conformanceToAt(kinds, texts, start) >= 0 { cursor[0] = source.ends[start] } else {
         if isTypeAliasDeclaration(kinds, texts, cursor) {
             genericCollectAlias(program, source, cursor)
         } else {
         if kinds[start] == 1 && (texts[start] == "function" || texts[start] == "record") {
-            skipDeclaration(kinds, texts, cursor)
+            skipDeclaration(kinds, texts, lines, cursor)
             let declaration = genericCollectDeclaration(program, source, start, cursor[0])
             if resultPrefix(declaration.name, "minyar_generic_") || resultPrefix(readableDeclarationName(declaration.name), "minyar_generic_") { genericError(source, start + 1, "reserved generic compiler name") }
             if resultPrefix(readableDeclarationName(declaration.name), "minyar_core_method_") { genericError(source, start + 1, "reserved Result/Maybe method compiler name") }
+            if resultPrefix(readableDeclarationName(declaration.name), "minyar_sequence_") { genericError(source, start + 1, "reserved sequence compiler name") }
             if declaration.kind == 1 && isBuiltinName(readableDeclarationName(declaration.name)) { genericError(source, start + 1, "function '" + readableDeclarationName(declaration.name) + "' uses a reserved built-in name; rename this function") }
             if declaration.name == "main" && declaration.variables.length > 0 { genericError(source, start + 1, "main cannot have type parameters") }
             let key = Text(declaration.kind) + ":" + declaration.name
-            if genericIndexGet(program.declarationIndex, key) >= 0 || (declaration.kind == 2 && genericIndexGet(program.aliases, declaration.name) >= 0) { genericError(source, start + 1, "module declares '" + readableDeclarationName(declaration.name) + "' more than once") }
+            if genericIndexGet(program.declarationIndex, key) >= 0 || (declaration.kind == 2 && (genericIndexGet(program.aliases, declaration.name) >= 0 || (!builtinCapability(declaration.name) && genericIndexGet(program.capabilityIndex, declaration.name) >= 0))) { genericError(source, start + 1, "module declares '" + readableDeclarationName(declaration.name) + "' more than once") }
             genericIndexPut(program.declarationIndex, key, declarations.length)
             declarations.add(declaration)
         } else {
@@ -1312,15 +1337,18 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
             skipTopLevelStatement(kinds, texts, cursor)
         }
         }
+        }
         skipTerminators(kinds, cursor)
     }
+    genericIndexConformances(program)
     genericResolveAliases(program)
+    genericPrepareConformances(program)
     let scope = GenericScope { names: []; types: []; active: 0; result: 0 }
     cursor[0] = 0
     skipTerminators(kinds, cursor)
     while kinds[cursor[0]] != 0 {
         let start = cursor[0]
-        if isTypeAliasDeclaration(kinds, texts, cursor) {
+        if isTypeAliasDeclaration(kinds, texts, cursor) || capabilityDeclarationAt(kinds, texts, start) || conformanceToAt(kinds, texts, start) >= 0 {
             cursor[0] = source.ends[start]
         } else {
         let declarationIndex = -1
@@ -1366,6 +1394,7 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
         genericAppendStream(methodStreams[method], outputKinds, outputTexts, outputLines)
         method = method + 1
     }
+    genericAppendCapabilityMarkers(program, outputKinds, outputTexts, outputLines)
     addEndToken(outputKinds, outputTexts, outputLines, "end of generic program")
     return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }
 }

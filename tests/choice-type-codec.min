@@ -1,0 +1,121 @@
+use "io" as io
+use "system" as system
+use "../tools/testing.min" as test
+
+function codecFind(source: Text, needle: Text): Integer {
+    let bytes = Bytes(source)
+    let pattern = Bytes(needle)
+    if bytes.length < pattern.length { return -1 }
+    for position in 0..(bytes.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length {
+            if bytes[position + index] != pattern[index] { equal = false; break }
+        }
+        if equal { return position }
+    }
+    return -1
+}
+
+// The unchanged pre-enum ABI is the independent oracle for ordinary Maps.
+// Reserved scalar codes are numeric probes; no future address parser is needed.
+function codecLegacyMap(key: Integer, value: Integer): Integer {
+    let zigzag = value * 2
+    if value < 0 { zigzag = -value * 2 - 1 }
+    if key < 1000 { return -(zigzag * 8 + key) }
+    return -((zigzag * 100000 + key) * 8 + 5)
+}
+
+function codecRow(output: List<Integer>, cursor: List<Integer>, key: Integer, value: Integer, encoded: Integer, pair: Integer): Integer {
+    let position = cursor[0]
+    test.check(position + 6 < output.length, "choice codec output ended before row " + Text(position / 7))
+    let actual = output[position]
+    let context = "choice codec row " + Text(position / 7) + " key " + Text(key) + " value " + Text(value)
+    if encoded != 0 { test.check(actual == encoded, context + " changed its stable numeric encoding") }
+    test.check(output[position + 1] == key, context + " changed nominal key identity")
+    test.check(output[position + 2] == value, context + " changed value identity")
+    test.check(output[position + 3] == pair, context + " misclassified a reserved scalar child as an enum escape")
+    test.check(output[position + 4] == 1 && output[position + 5] == 0 && output[position + 6] == 0, context + " is not exclusively a Map type")
+    cursor[0] += 7
+    return actual
+}
+
+let compiler = test.compiler()
+compiler.compileTimeout = 120
+// Compile the checked-in C probe against the actual included runtime. It has
+// literal expectations and links no prebuilt compiler.runtime object.
+for optimization in ["-O0", "-O2"] {
+    let executable = compiler.directory + "/choice-runtime-codec"
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-iquote", "runtime", "tests/choice-runtime-codec.c", "-pthread", "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", compiler.directory + "/runtime-codec-build", 120), "compile actual runtime choice codec probe " + optimization)
+    let result = test.run([executable], system.environment(), "", compiler.directory + "/runtime-codec-run", 30)
+    test.require(result, "execute actual runtime choice codec probe " + optimization)
+    test.check(result.output == "Choice runtime codec: literal nominal IDs and rejection boundaries passed\n" && result.errorOutput == "", "actual runtime choice codec output/diagnostics")
+}
+let core = io.readTextFile(test.setting("MINYAR_TEST_SOURCE", "build/compiler.min"))
+let main = codecFind(core, "\nfunction main(")
+test.check(main >= 0, "compiler source entry point changed")
+core = Text(Bytes(core).slice(0, main))
+
+// Compile the real compiler helpers with a replacement entry point. Expected
+// ordinary encodings and pinned escape boundaries are checked by this harness.
+let probe = "\nfunction choiceCodecShowMap(key: Integer, value: Integer) {\n    let type = makeMapType(key, value)\n    print(type); print(mapKeyType(type)); print(mapValueType(type)); print(recordEnumMapPair(type))\n    if isMapType(type) { print(1) } else { print(0) }\n    if isListType(type) { print(1) } else { print(0) }\n    if isSetType(type) { print(1) } else { print(0) }\n}\nfunction main() {\n    let tags: List<Integer> = [1, 2, 3, 4, 7]\n    for reserved in 19..32 {\n        let value = reserved\n        for depth in 0..65 {\n            for key in tags { choiceCodecShowMap(key, value) }\n            value = makeListType(value)\n        }\n    }\n    for key in [1000, 1001, 1999, 2000, 99999] {\n        for value in [1, 2, 3, 4, 7, 19, 21, 31, 100019, 6400031, 99999] { choiceCodecShowMap(key, value) }\n        for tag in tags { choiceCodecShowMap(key, makeMapType(tag, 19)) }\n    }\n    for index in [0, 1, 999, 1000, 98998, 98999] {\n        for value in 19..32 { choiceCodecShowMap(1000000000 + index, value) }\n        for value in [1, 2, 3, 4, 7, 100019, 6400031, 1000000000, 1000000019, 1000000031, 1000000999, 1000098999] { choiceCodecShowMap(1000000000 + index, value) }\n    }\n    for tag in tags {\n        for index in [0, 1, 19, 31, 32, 999, 1000, 98999] { choiceCodecShowMap(tag, 1000000000 + index) }\n    }\n    for key in [0, 1, 488, 499, 500, 999, 1000, 98998, 98999] {\n        for value in [0, 1, 4, 19, 31, 32, 999, 1000, 87999, 88000, 98998, 98999] {\n            let inner = makeMapType(1000 + key, 1000000000 + value)\n            choiceCodecShowMap(1000 + key, 1000000000 + value)\n            choiceCodecShowMap(99999, inner)\n        }\n    }\n    let keys: List<Integer> = [0, 0, 0, 0, 0, 488, 488, 488, 98999]\n    let values: List<Integer> = [0, 1, 2, 3, 4, 87999, 88000, 88001, 98999]\n    for index in 0..keys.length { choiceCodecShowMap(1000 + keys[index], 1000000000 + values[index]) }\n}\n"
+test.require(test.compile(compiler, core + probe), "compile real compiler choice type codec source")
+let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+for optimization in ["-O0", "-O2"] {
+    let executable = compiler.directory + "/choice-type-codec"
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", compiler.directory + "/link", 120), "link choice type codec probe " + optimization)
+    let result = test.run([executable], system.environment(), "", compiler.directory + "/run", 60)
+    test.require(result, "execute choice type codec probe " + optimization)
+    test.check(result.errorOutput == "", "choice type codec probe diagnostics")
+    let output: List<Integer> = []
+    for line in test.lines(result.output) { output.add(Integer(line)) }
+    let cursor: List<Integer> = [0]
+    let tags = [1, 2, 3, 4, 7]
+    for reserved in 19..32 {
+        for depth in 0..65 {
+            let value = reserved + depth * 100000
+            for key in tags { codecRow(output, cursor, key, value, codecLegacyMap(key, value), -1) }
+        }
+    }
+    for key in [1000, 1001, 1999, 2000, 99999] {
+        for value in [1, 2, 3, 4, 7, 19, 21, 31, 100019, 6400031, 99999] { codecRow(output, cursor, key, value, codecLegacyMap(key, value), -1) }
+        for tag in tags {
+            let value = codecLegacyMap(tag, 19)
+            codecRow(output, cursor, key, value, codecLegacyMap(key, value), -1)
+        }
+    }
+    for index in [0, 1, 999, 1000, 98998, 98999] {
+        for value in 19..32 { codecRow(output, cursor, 1000000000 + index, value, 0, -1) }
+        for value in [1, 2, 3, 4, 7, 100019, 6400031, 1000000000, 1000000019, 1000000031, 1000000999, 1000098999] { codecRow(output, cursor, 1000000000 + index, value, 0, -1) }
+    }
+    for tag in tags {
+        for index in [0, 1, 19, 31, 32, 999, 1000, 98999] {
+            let value = 1000000000 + index
+            codecRow(output, cursor, tag, value, codecLegacyMap(tag, value), -1)
+        }
+    }
+    for key in [0, 1, 488, 499, 500, 999, 1000, 98998, 98999] {
+        for value in [0, 1, 4, 19, 31, 32, 999, 1000, 87999, 88000, 98998, 98999] {
+            let inner = codecRow(output, cursor, 1000 + key, 1000000000 + value, 0, key * 99000 + value)
+            let outer = codecLegacyMap(99999, inner)
+            codecRow(output, cursor, 99999, inner, outer, -1)
+            if key == 98999 && value == 98999 {
+                test.check(inner == -3240000015991 && outer == -5184000025585599997, "maximum two-record-key Map enum shape exceeded its pinned signed-i64 bound")
+            }
+        }
+    }
+    // Fixed, independently calculated values pin all five tags, the last
+    // pre-enum bucket child, the first post-skip child, and maximum indexes.
+    let keys = [0, 0, 0, 0, 0, 488, 488, 488, 98999]
+    let values = [0, 1, 2, 3, 4, 87999, 88000, 88001, 98999]
+    let encoded = [-513, -514, -515, -516, -519, -15998415991, -16001600513, -16001600514, -3240000015991]
+    for index in 0..keys.length { codecRow(output, cursor, 1000 + keys[index], 1000000000 + values[index], encoded[index], keys[index] * 99000 + values[index]) }
+    test.check(cursor[0] == output.length && cursor[0] == 33040, "choice codec probe output domain changed")
+}
+test.removeTree(compiler.directory)
+print("Choice type codec: reserved scalar codes 19..31, 64 List layers, ordinary ABI, all escape tags/skip/bounds and nominal roundtrips passed")

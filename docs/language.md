@@ -7,6 +7,12 @@ interoperability. Their value types and additional syntax are outside this
 contract. An alternative compiler must pass the same language conformance
 tests before it can become a Minyar backend.
 
+Ordinary Minyar also runs inside a native mobile application. The
+[mobile guide](mobile.md) describes UIKit over the shared `ui.View` model,
+iOS device and Simulator targets, and Android NDK core-code embedding. These
+use ordinary functions, records and native calls; no separate mobile dialect
+is needed.
+
 ## Tests beside the code
 
 A module can keep named tests beside its declarations. Tests can use private
@@ -133,6 +139,10 @@ print(Float(7) / 2.0)  // 3.5
 print(Integer(-7.9))   // -7
 ```
 
+Exact integral Floats strictly inside ±2^53 format directly as decimal digits
+followed by `.0`, without calling the C formatting or parsing libraries.
+Zero retains its sign. Other finite values keep the shortest-roundtrip rule.
+
 Integer and Float never mix implicitly; convert with `Float(integer)` or
 `Integer(float)`. `Integer` truncates toward zero and stops if the Float is NaN
 or outside the Integer range. `Integer(character)` gives a code point and
@@ -237,6 +247,54 @@ is a fresh binding for each iteration, so assigning to it does not change which
 value comes next. A List loop rereads the List's length on every iteration.
 `break` leaves the innermost loop and `continue` starts its next iteration.
 
+A record can be iterable too. Its `iterator()` method returns a record cursor.
+The cursor's `advance(): Boolean` moves to the next item and says whether one
+exists; `current()` returns that item. All three methods take no arguments:
+
+```minyar
+record Countdown { start: Integer }
+record CountdownCursor { remaining: Integer }
+
+function Countdown.iterator(): CountdownCursor {
+    return CountdownCursor { remaining: self.start }
+}
+function CountdownCursor.advance(): Boolean {
+    if self.remaining <= 0 { return false }
+    self.remaining -= 1
+    return true
+}
+function CountdownCursor.current(): Integer { return self.remaining }
+
+for number in Countdown { start: 3 } { print(number) } // 2, 1, 0
+```
+
+The loop evaluates its source and calls `iterator()` once. Before each turn,
+it calls `advance()` and, only when that returns true, `current()`. An empty
+cursor never calls `current()`. Assigning the loop variable does not change
+the cursor. A fresh cursor makes nested and repeated traversals independent;
+a method that returns `self` deliberately shares progress with its aliases.
+Methods used outside their module must be public.
+
+Iteration checks this method shape structurally. It uses ordinary direct calls
+and a branch loop, with no dispatch table, intermediate List or per-item wrapper.
+The source and cursor keep their ordinary record allocation and ownership costs;
+allocations inside user methods remain their own costs. `current()` can return
+any value type, including a record or a List, but cannot return `Nothing`.
+`parallel for` continues to require an Integer range.
+
+Import `sequence` for lazy `sequence.range(first, after)` values. Iterable values
+also support `.map(functionName)`, `.filter(functionName)` and
+`.fold(initial, functionName)` with named functions. Generic transforms infer
+concrete type arguments from the items and fold seed, retaining direct calls and
+ordinary generic constraints. Stored recipes do no transform work until
+traversed. Map/filter chains fuse into one loop with direct calls, and fold
+combines items from left to right. Eligible named chains used directly as an
+ordinary `for` source remove their recipe setup. Stored recipes and chains passed
+to `fold` keep one small record per stage; declined source forms retain the same
+setup. Traversal has no intermediate Lists or per-item protocol wrappers.
+Source records and cursors keep their own costs. See [lazy iteration](iteration.md)
+for examples, setup limits and the generated LLVM shape.
+
 Conditions accept only `Boolean`.
 
 ## Types and built-in operations
@@ -281,6 +339,60 @@ Keep arbitrary file contents in Bytes. Import `text` and call
 `text.decode(bytes): Result<Text, errors.Error>` for recoverable decoding;
 invalid UTF-8 produces `errors.invalidDataCode()`. Character-offset caches
 remain lazy.
+
+Import `unicode` when a character should mean a whole visible cluster:
+
+```minyar
+use "unicode" as unicode
+print("é".length)                       // 2 scalar values
+print(unicode.graphemeCount("é"))          // 1 grapheme cluster
+for piece in unicode.graphemes("👩🏽‍🚀🌙") { print(piece) }
+print(unicode.canonicallyEqual("é", "é"))  // true
+print(unicode.caselessEqual("Straße", "STRASSE")) // true
+```
+
+`unicode.graphemeBoundaries(value)` returns scalar offsets, including zero and
+the end, suitable for `value.slice`. Empty Text has the single boundary `[0]`
+and no graphemes. Segmentation follows Unicode 18.0.0 extended grapheme
+clusters, including combining marks, joined emoji, flag pairs, Indic conjuncts
+and CRLF. `unicode.unicodeVersion()` reports the pinned Unicode data version.
+A grapheme cluster is a text boundary, not a promise about a font's display width.
+
+`unicode.normalized(value)` returns canonical composition (NFC).
+`unicode.canonicallyEqual(left, right)` compares these canonical spellings.
+`unicode.caseFold(value)` creates a canonical, locale-independent comparison key
+using full default case folding; `unicode.caselessEqual` compares those keys.
+Folding handles expansions such as `ß` to `ss` and preserves accents.
+It decomposes before folding and composes afterward, so canonically equivalent
+spellings keep the same key. It is not a display-oriented lowercase operation.
+These operations preserve embedded zero bytes and control characters; they do
+not strip marks or apply compatibility normalization. Ordinary `==`, ordering,
+hashing, `length` and indexing retain their exact-content and scalar contracts.
+
+`unicode.uppercased(value)` and `unicode.lowercased(value)` apply full default
+Unicode casing for display, including multi-character expansions (`ß` to `SS`)
+and Greek final sigma. They use the original input for context and preserve
+its scalar order. They do not implicitly normalize. Default casing is
+locale-independent; Turkish, Azerbaijani and Lithuanian tailoring is not applied.
+Use `caseFold` when making comparison keys rather than comparing lowercase text.
+
+The Unicode provider is linked when the `unicode` module is imported.
+Counting scans once and allocates no boundary storage. Boundary lists scan
+twice and allocate one temporary byte per scalar plus their Integer List;
+splitting also creates Text slices and may build the scalar-offset cache.
+Normalization, folding and display casing allocate native temporary buffers and copy their
+output into managed Text. Folding first allocates a decomposed intermediate.
+Casing uses two linear passes with a checked, exactly sized output buffer.
+Native scratch storage uses the system allocator rather than the selected
+Minyar heap profile. Unicode tables add read-only program data when linked.
+
+Normalization and folding take linear time in the input size for the pinned
+Unicode tables. Canonical reordering uses stable counting sort for disordered
+runs longer than 16 combining marks, with four scratch bytes per scalar in the
+largest such run. Shorter runs use bounded insertion sort; they and already
+ordered input need no sorting buffer. Recursive decomposition uses four bytes
+per resulting scalar before in-place UTF-8 encoding and an optional buffer
+shrink. Normalize complete keys after concatenating their parts.
 
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
@@ -430,6 +542,12 @@ Discarded storage is not a secure erase; it remains private and is initialized
 before a later resize or native extension exposes it. `io.readBytesFile(path)` and `io.writeBytesFile(path, bytes)` transfer files
 unchanged. `for byte in bytes` visits each byte as an Integer.
 
+Byte indexing, indexed replacement and `.length` use checked inline helpers,
+including when the runtime is linked as a separate native object. Invalid
+positions and byte values keep the runtime's bounds and range errors. Aliases
+and C-layout views retain their shared storage semantics; a mutating call can
+change the length or storage before the access completes.
+
 `Bytes(text)` is a Text's UTF-8 encoding. `Text(bytes)` validates and copies
 UTF-8 immediately; invalid UTF-8 stops at that conversion. Use
 `text.decode(bytes)` for untrusted input that needs recoverable failure:
@@ -444,6 +562,22 @@ generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,
 `BCryptGenRandom` on Windows and the processor's `RDRAND` instruction in
 freestanding programs.
 
+For reproducible system tests, import `simulation`. Its explicit I/O boundary
+provides seeded completion ordering, virtual time, disk and network faults,
+durable file/name models and replayable decisions. It performs no host I/O.
+See [deterministic simulation](simulation.md) for its contracts and costs.
+
+Import `pages` for fixed-size byte images, bounded named regions and typed
+little-endian fields. Invalid ranges return Results, and copied input/output
+buffers keep page bounds stable across aliases. See [checked pages](pages.md)
+for the runtime checks and allocation costs.
+
+Import `completionio` for bounded Linux io_uring file reads, writes and syncs.
+Its typed queue reports submission and completion failures separately, copies
+buffers and retains file descriptors until completion. Queues require explicit
+draining and closing. See [completion I/O](completion-io.md) for platform
+support, ownership and durability requirements.
+
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically. Acyclic components
@@ -451,7 +585,19 @@ use reference counting; cycle-capable record and List components use traced
 allocation selected by the compiler and launcher. No extra build option or
 memory-management syntax is required. Expression temporaries are released
 between statements; locals retain their values until reassignment or scope exit.
+Returning a local can transfer its existing ownership to the caller. This
+does not copy the value or change what other aliases observe.
 Aliases keep shared values alive.
+
+A local record with only scalar fields can stay in registers or stack storage
+when its fields are the only way it is used. This includes direct field updates.
+
+When returning `words + suffix` or `values.appended(item)`, the compiler can
+transfer a local's ownership after evaluating the other operand. The runtime
+reuses storage when that value has no other owner; shared values keep the
+copying behavior. Parentheses do not change this rule.
+The same applies when replacing the local itself, such as
+`values = (values).appended(values[0])`: the index is read before storage reuse.
 
 Recursive records support construction, sharing and mutation:
 
@@ -641,10 +787,42 @@ are written `Empty` or `Shape.Empty`; empty parentheses are also accepted.
 Use `public choice` to export a choice and its cases. In another module,
 `geometry.Shape.Circle(2.0)` constructs an exported case.
 
-A match evaluates its input once. It must cover every case exactly once, or end
-with `else { ... }` to handle the remaining cases. A missing-case diagnostic
-names the cases still needed. Payload names in an arm are local bindings; `_`
-ignores a payload. Arms may return, break or continue just like other blocks.
+A match evaluates its input once and tries its arms in order. It must cover
+every possible value, or end with `else { ... }` to handle the rest. A missing-case
+diagnostic shows an example value that still needs handling. Payload names in
+an arm are local bindings; `_` ignores a value. Arms may return, break or continue
+just like other blocks. An `_` in a diagnostic example stands for any value of
+that payload type.
+
+Patterns can nest choice and Result cases, and match Integer, Float, Boolean,
+Character and Text literals. A binding or `_` matches any value of its expected
+type. Case names resolve from the value being matched, including nested payloads.
+Add `where` and a Boolean expression to accept a pattern only when its guard is
+true:
+
+```minyar
+function describe(value: Maybe<Maybe<Integer>>): Text {
+    return match value {
+        Some(Some(0)) { "nothing yet" }
+        Some(Some(number)) where number > 0 { "a little light" }
+        Some(Some(_)) { "below the horizon" }
+        Some(None) { "an empty lantern" }
+        None { "no lantern" }
+    }
+}
+```
+
+A guard runs only after its pattern matches. It can use the arm's bindings;
+if it returns false, matching continues with the next arm. Guarded arms do not
+prove coverage, even when the guard is `true`. Without an `else` or wildcard,
+Boolean patterns must cover both `true` and `false`; numeric and text literals
+need a binding or wildcard for the remaining values. Scalar values can also be
+matched directly: `match count { 0 { "none" } _ { "some" } }`.
+
+Nested bindings have the same ownership as ordinary arm bindings. They remain
+alive if a guard or arm replaces the original input, and can be returned or
+captured by a closure. Names are scoped to one arm and cannot repeat within its
+pattern. `where` remains an ordinary identifier outside the guard position.
 
 A match can also produce a value. Each arm then contains one expression, and
 all arms must have the same type. This works for choices and `Result`:
@@ -700,12 +878,70 @@ The library also exposes choices through existing APIs. For example,
 `statusValue` and `statusError` helpers remain available; matching lets a caller
 handle both outcomes directly.
 
-Choices currently share the record representation and automatic memory
-management. Each value allocates a tag and slots for all declared payloads;
-inactive slots are empty. This includes choices with no payloads. Payloads can
-hold choices, records, Lists and callbacks, with the same ownership and cycle
-analysis as records. Cases and payload fields are accessed through constructors
-and matching. Nested or literal patterns are not yet supported.
+A choice whose cases all have no payloads stores its case as one eight-byte
+integer. Constructing, passing, returning and matching these values allocate
+nothing and need no reference counting. They remain distinct named types:
+an Integer or a different choice cannot stand in for one. Methods, generic
+constraints and derived equality, ordering and hashing work as usual. Lists,
+records, callbacks, Maps and Sets store these cases directly as scalar values.
+
+A two-case choice with exactly one Boolean, Character or payload-free choice
+payload also stores one eight-byte integer, without a wrapper or reference
+counting. This includes `Maybe<Boolean>`, `Maybe<Character>` and `Maybe<Signal>`
+when every Signal case has no payload. Case order is preserved. With the payload
+case first, present values keep their scalar code and the empty case uses the
+next code; with the empty case first, empty uses zero and present codes increase
+by one. Boolean codes are false = 0 and true = 1. Character codes are Unicode
+scalar values, retaining the existing rejection of surrogates and out-of-range
+values. Enum payload codes retain declaration order.
+
+Native parameters and results for these choices use i64, including callback
+signatures and C-layout fields. A native producer of `Maybe<Boolean>` must
+return an encoded i64 (Some(false) = 0, Some(true) = 1, None = 2), rather than
+a managed wrapper pointer; a pointer to such a value points to i64 storage.
+Native producers must maintain the encoded domain and the existing Character
+validity contract. Nested wrappers such as `Maybe<Maybe<Boolean>>` retain a
+tagged outer wrapper, so `Some(None)` remains distinct from `None`.
+Integer and Float payloads retain tagged storage.
+
+Tagged choices share record ownership and automatic memory management.
+A value stores a tag and a union large enough for its largest case: different
+cases share the same payload slots. Only the active case's reference payloads
+are retained and traced. A payload occupies one eight-byte slot, with reference
+tracking stored separately. Payloads can hold choices, records, Lists and
+callbacks, with the same ownership and cycle analysis as records. Cases and
+payload fields are accessed through constructors and matching. Patterns inspect only the active case and its payloads.
+
+A two-case choice with one Text, Bytes, List, Set or ordinary record payload uses
+a nullable pointer.
+For example, `Maybe<Reading>` stores the `Reading` pointer for `Some(reading)`
+and null for `None`, with no wrapper allocation. The record keeps its usual
+shared ownership. `Maybe<Text>` likewise stores Text directly; even an empty
+Text has a non-null header, so `Some("")` remains distinct from `None`.
+Text equality, ordering and hashing use contents, and key snapshots retain
+the immutable Text. This also applies to a user-declared choice with the same
+shape, preserving its case order. Nested payload-bearing choices, callbacks
+and C-layout payloads keep the tagged union, so values such as `Some(None)` remain distinct from
+`None`. Native functions returning an ordinary managed record must return a
+valid, non-null record. Native functions returning an eligible choice return
+the nullable payload pointer, rather than a tagged wrapper; a present Text
+must have a valid, non-null Text header. `Maybe<Bytes>` stores its Bytes header
+the same way: `Some(Bytes())` is present even when its backing buffer is empty.
+Unwrapping shares the mutable Bytes value, including retained C-layout views.
+This representation does not add equality, ordering, hashing or Map-key/Set
+support for Bytes. Native functions returning such a choice must return the
+Bytes header or null, rather than an old choice wrapper or an interior address.
+`Maybe<List<Item>>` likewise stores the List header or null, including for an
+empty List. Unwrapping keeps the same mutable List and its element ownership.
+Reference-element Lists retain their usual cycle tracing; even a choice/List
+cycle that becomes a physical List self-edge is collected as a List. Lists
+gain no implicit equality, ordering, hashing or Map-key/Set support. Native
+functions returning these choices must return the List header or null.
+`Maybe<Set<Item>>` stores the Set header or null too, so `Some(Set<Item>())`
+remains distinct from `None`. Unwrapping shares the same mutable Set. Equality
+compares present Sets by their contents; these choices have no implicit ordering
+or hashing and cannot be Map keys or Set elements. Native producers must return
+one owned Set header for a present value or null for an absent one.
 
 ## Maps and Sets
 
@@ -835,15 +1071,100 @@ function largest<Item: Ordered>(values: List<Item>, fallback: Item): Item {
 print(largest([1.2, 2.7, 1.4], 0.0)) // 2.7
 ```
 
-`Equatable`, `Ordered` and `Hashable` are the supported capability names.
-Integer, Float, Text, Character and Boolean satisfy all three. Finite records
+A capability describes the methods a type promises to provide:
+
+```minyar
+capability Named {
+    function name(): Text
+    function greeting(): Text { return "Hello, " + self.name() }
+}
+
+record Visitor { name: Text }
+function Visitor.name(): Text { return self.name }
+conform Visitor to Named
+
+function greet<Guest: Named>(guest: Guest): Text {
+    return guest.greeting()
+}
+print(greet(Visitor { name: "Ada" })) // Hello, Ada
+```
+
+A conformance belongs to the module that declares the record. It checks every
+method's parameter and result types, even when no generic function uses it.
+A matching method overrides its default; a missing method uses its default or
+reports an error. Method parameter names may differ. `Self` in an annotation
+means the conforming record, including inside a collection or callable type.
+Aliases retain their underlying record's conformance. A concrete generic record
+can conform through an alias or a type such as `Box<Integer>`.
+
+User-defined capability names share the type namespace. Export one with `public capability`
+and refer to an imported one with its module alias, such as `labels.Named`.
+Implement an imported capability's required methods with `public function` so
+its defaults can call them. Defaults retain access to helpers in their original
+module. `capability`, `conform` and `to` remain ordinary identifiers elsewhere.
+This first form supports concrete record conformances and ordinary method
+signatures; capability inheritance and generic capability methods are not supported.
+
+A type opts into a user-defined capability explicitly; matching method names
+alone do not establish conformance. The compiler specializes defaults as ordinary
+record methods and generic functions as ordinary concrete functions. There is no
+boxing, witness table or runtime method dispatch.
+
+The three built-in capabilities use ordinary declarations in
+`compiler/builtin-capabilities.min`:
+
+| Capability | Required methods | Default |
+| --- | --- | --- |
+| `Equatable` | `equal(other: Self): Boolean` | none |
+| `Ordered` | `compare(other: Self): Integer` | `equal` tests whether `compare` returns zero |
+| `Hashable` | `equal(other: Self): Boolean`, `hash(): Integer` | none |
+
+A record can opt into them with the same `conform` declaration. `==` and `!=`
+use its `equal` method; ordering and natural sorting use the sign of `compare`.
+`Ordered` and `Hashable` also satisfy `Equatable`. Custom operations compose
+through nested records, choices, generic bounds and record collection keys.
+An explicit record method overrides the default equality supplied by `Ordered`.
+
+Equal keys must return equal hashes and keep their meaning while stored. After
+a custom equality or order is declared, the compiler requires an explicit
+`Hashable` conformance instead of deriving an incompatible field-wise hash.
+Custom equality also requires an explicit `Ordered` conformance for ordering.
+Map and Set record keys still need a finite snapshot shape: Lists, Bytes,
+callbacks, native records and recursive fields cannot be copied as keys, even
+when the record supplies custom hashing. A generic Hashable bound by itself
+does not require a key snapshot.
+
+Record collection keys use the existing hash/equality callback path. The runtime
+checks mutation during those callbacks; changing the same Map from its hash or
+equality method stops with a clear error. Sorting stages its permutation before
+committing it. Cooperative call-depth failure stops custom comparisons and
+lookups before committing collection changes. Capability calls themselves
+remain direct calls with concrete arguments and no runtime trait representation.
+
+The built-in names keep their capability meaning in an unqualified bound.
+Existing ordinary record and alias names such as `Ordered` continue to work in
+type annotations, constructors and explicit type arguments.
+
+`Iterable` and `Iterator` are also built-in, structural capability names; a
+user capability cannot reuse any built-in name.
+
+Implicit scalar and structural conformances remain available.
+Integer, Float, Text, Character and Boolean satisfy the three comparison
+capabilities. Finite records
 whose fields support a capability inherit it. Maps and Sets support Equatable
 where their ordinary equality is defined, including as record fields; they do not
-derive Ordered or Hashable. Lists, Bytes, callbacks, recursive record shapes and
-native record layouts need an explicit operation. A record
+derive Ordered or Hashable. Comparison of Lists, Bytes, callbacks, recursive
+record shapes and native record layouts needs an explicit operation. A record
 can constrain its type parameters in the same way as a function. The compiler
 checks each concrete argument before emitting its instantiation; constraints
 add no runtime dispatch.
+
+`Iterable` accepts the built-in collections, lazy recipes and records with the
+iteration method shape described above. `Iterator` accepts a record cursor with
+`advance(): Boolean` and a value-returning `current()`. Their concrete cursor and
+item types are inferred; no conformance declaration or runtime dispatch is needed.
+For example, `function total<Source: Iterable>(source: Source): Integer` can sum
+the Integer items of a List, a lazy range or a user sequence with one body.
 
 The errors library also shares one value/error record across its checked APIs.
 `errors.ValueResult<Item>` stores a value with an `errors.Error`. Create one with
@@ -945,8 +1266,8 @@ Callbacks infer parameter and return types from the value and their bodies.
 They are evaluated once as ordinary arguments and called only for their
 matching case. Receiver and argument lifetimes follow ordinary function calls.
 The compiler specializes small Minyar match functions for these methods;
-there is no dynamic dispatch. Mapping allocates a new Result or Maybe, with
-the same representation described above. Inspecting or unwrapping does not
+there is no dynamic dispatch. Mapping constructs a new Result or Maybe, with
+the storage cost described above. Inspecting or unwrapping does not
 allocate a new container. Captured callbacks may allocate their environment.
 
 `unwrap()` returns success and stops on failure; `expect(message)` uses the
@@ -1074,6 +1395,27 @@ as `+=`. To maintain captured state, mutate a field of a captured record.
 Callbacks belong to their creator's execution domain; they do not transfer
 managed objects between threads.
 
+## Structured tasks
+
+`tasks.together(timeoutMs, body)` owns a scope of one-shot worker processes.
+The ordinary callback starts typed tasks with `tasks.start` and reads replies
+with `tasks.response`. Returning waits for unobserved replies; errors,
+cancellation and deadlines close and reap every child before the scope returns.
+The callback may return a typed value, delivered after all children finish;
+Lists, records and Bytes keep their ordinary ownership outside the scope.
+Task and Scope aliases cannot be used after the callback ends. Managed values
+stay on their creating domain, and workers receive copied messages in separate
+heaps. There is no function colouring or shared managed mutation.
+
+`tasks.channel` pairs request and reply codecs, with built-in codecs for Bytes,
+Text and Integer. The event loop services all outstanding workers while waiting
+for a reply. Each worker uses `tasks.serve` to handle one request and send a
+terminal Result. A terminal reply ends task work; process exit status is not a
+separate result. Deadlines are cooperative at task operations and after user
+callbacks. This first slice supports macOS and Linux; task workers cannot create
+descendant task scopes. See [Tasks that come home together](tasks.md) for the
+complete contract, costs and a runnable example.
+
 ## Parallel ranges
 
 `parallel for` gives each iteration its own slot in an existing `Bytes` or a
@@ -1173,6 +1515,47 @@ parallel function taking two Integers through that address, and
 functions can call parallel functions directly. Minyar OS uses them to spread
 per-pixel work over every processor; see freestanding programs.
 
+## Hardware register fields
+
+The `device` module gives memory-mapped registers distinct widths. A
+`Field8`, `Field16`, `Field32` or `Field64` describes a field within a register
+of that width. Its first argument is the least-significant bit; the second
+is the number of bits. Both the field range and its values are checked:
+
+```minyar
+use "device" as device
+let distance = device.field32(12, 10)
+let control = device.encode32(distance, 64)
+print(device.extract32(distance, control)) // 64
+let changed = device.replace32(distance, control, 96)
+```
+
+`encode32` creates the field's bits with all other bits zero. `extract32`
+reads a field from an Integer; `replace32` preserves the other bits. The
+same operations exist for 8, 16 and 64 bits. Words narrower than 64 bits
+must be nonnegative and fit their width. A full-width `Field64` accepts every
+Integer bit pattern, including negative values. A field cannot be built by a
+record literal or passed to a register operation of a different width.
+
+`device.readField32(register, field)` performs one volatile read.
+`device.updateField32(register, field, value)` checks the value, reads once
+and writes once. It is a non-atomic read-modify-write for ordinary read/write
+registers. For write-only or write-one-to-clear registers, use
+`device.write32(register, device.encode32(field, value))`; this performs no
+read. These operations add no hardware memory barrier. Use `machine.fence()`
+where the device and architecture require one.
+
+A field descriptor is an ordinary managed record, allocated when constructed;
+keep it for repeated access. Its operations use Integer masks and shifts with
+range checks and the usual record ownership cost. They add no dynamic dispatch.
+Native `record ... native "c_packed"` layouts can describe DMA storage; the
+e1000 driver uses `sizeOf` and `offsetOf` on its 16-byte descriptors, so strides
+and offsets come from the declared layout. Those queries are compile-time values;
+they do not create a record. Packed layouts describe storage and do not make
+ordinary record field accesses into volatile MMIO operations.
+See [kernel development](os-development.md) for hosted driver tests, bounded
+QEMU tests, GDB and symbolized panic addresses.
+
 ## Programs and entry points
 
 Executable statements may be written directly at the top level. They run from
@@ -1212,7 +1595,15 @@ error: the value for 'stars' does not match its declared type; expected Integer,
    |
  1 | let stars: Integer = "many"
    |     ^^^^^
+   = help: change this value to the expected type, or change the declaration if it should accept the found type
+   = explain: minyar explain E0401
 ```
+
+Each error includes a repair note and an error code. Run `minyar explain E0401`
+for a longer explanation with a valid example, or `minyar explain --list` to
+browse the error families. Explanations work outside a project and need no
+network access. Codes describe the problem rather than the particular name or
+type in the message, so they remain useful when the wording changes.
 
 When a spelling is close, the compiler suggests a name available at that point.
 This includes values, functions, record fields and methods, types, choice cases
@@ -1239,11 +1630,18 @@ Runtime stops keep their message and add a short Minyar stack trace:
 Minyar stopped: The harbour has no light.
 Minyar stack trace:
   at darkWindow (harbour.min:1:10)
+    | function darkWindow(): Integer {
   at evening (harbour.min:4:10)
+    | function evening(): Integer {
   at top level (harbour.min:7:1)
+    | print(evening())
 ```
 
 A frame names the function's declaration, or the first top-level statement.
+Its source line is saved when the program is compiled, so it remains readable
+after the original file is moved or removed. Lines are limited to 160 characters,
+with an ellipsis when clipped; tabs expand to spaces and terminal controls are
+replaced. A source line is omitted if it was unavailable during compilation.
 Optimized code may inline or merge functions and remove tail calls; the trace
 shows the frames that remain. A trace has at most twelve Minyar frames.
 Stripped images and hosts without readable unwind information retain the
@@ -1278,8 +1676,10 @@ arguments. A file cannot mix this form with executable top-level statements
 because that would create two entry points. The executable entry `main` cannot
 be called from language code; put shared work in a separate function. An imported
 module function named `main` is an ordinary function and remains callable.
+Reaching the end of the executable entry `main` returns process status zero;
+an explicit `return` can choose another Integer status.
 
-Functions with a value return type must return a value on every reachable path.
+Other functions with a value return type must return a value on every reachable path.
 A path ending in `fail(...)`, `exit(...)`, or a literal `while true` loop without
 a reachable `break` is also terminal. Literal `true` and `false` conditions
 select the reachable branch for return analysis, though unreachable source is
@@ -1307,6 +1707,13 @@ print(geometry.answer(point))
 Imported modules cannot contain executable top-level statements. Imports are
 resolved relative to the importing file, declarations are private unless
 marked `public`, and cycles are rejected. See [modules](modules.md).
+
+C headers can supply ordinary modules through the
+[C header importer](c-interop.md). Select the functions, fixed-layout structs,
+enums and integer constants you need. Clang checks their declarations and
+layouts; generated wrappers check narrow integer conversions and use the
+existing native calling convention. Pointer ownership needs an explicit C
+facade. No additional language syntax is required.
 
 A statement ends at the end of its line, using LF or CRLF. A bare CR is whitespace,
 not a line boundary. The end of the source file also ends
@@ -1399,3 +1806,11 @@ See [Minyar style](style.md) for examples and the preservation checks.
 `minyar lsp --stdio` provides live compiler diagnostics, hover documentation,
 definitions, completion, symbols and formatting to an editor. See
 [editor tooling](editor.md) for setup and the current navigation capabilities.
+
+`minyar run --watch` rebuilds a project after source edits. Add `--hot` to replace
+function implementations while the process and its values stay alive. Keep state
+in ordinary records, Lists and globals; pass it to the functions you are editing.
+The [lanterns gallery](../examples/gallery/lanterns.min) follows this shape.
+Changes to types, declarations or initialization require a fresh run. See
+[live programming](cli.md#live-programming) for the reload boundary and its
+development-time costs.

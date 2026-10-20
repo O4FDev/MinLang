@@ -58,6 +58,13 @@ entry file, and preserve existing `.gitignore` and smoke tests. A binary uses
 `src/main.min`; a library named `geometry` uses `src/geometry.min`. Package names
 start with a letter or underscore and contain letters, digits, `_` or `-`.
 
+Compiler errors show a source excerpt, a caret, a repair note, and an error
+code. `minyar explain E0401` explains a type mismatch with an example;
+`minyar explain --list` lists the available codes. These commands work in any
+directory, use the installed compiler's own catalogue, and need no network.
+Tools requesting `--error-format json` receive the same code in the `code`
+field and the same repair note in `help`.
+
 ## Manifest and dependencies
 
 `Minyar.toml` uses this deliberately small TOML subset:
@@ -147,11 +154,15 @@ compiler diagnostic is preserved with its original exit status. Use
 renderer. Argument, manifest and runtime messages use their command's normal
 format.
 
-Debug builds include Minyar source line tables for breakpoints, stepping and
-backtraces, including imported modules. On macOS the matching `.dSYM` bundle is
-kept beside each executable. This currently supplies function and source-line
-information; local-variable/type inspection is not yet implemented. Release
-builds omit this debug information.
+Debug builds include Minyar source locations for breakpoints, stepping and
+backtraces, including imported modules. Named arguments and initialized local
+bindings carry their types and locations; nested blocks preserve shadowed
+bindings. Scalars and ordinary record fields can be inspected in LLDB or GDB;
+optional [value formatters](debugging.md) preview Text, Bytes, Lists, Maps and
+choices without running program code. A value that is no longer used may be
+unavailable after its register is reused. On macOS the matching `.dSYM` bundle
+is kept beside each executable. `-gline-tables-only` retains source locations
+without variable descriptions. Release builds omit this debug information.
 
 `check` validates the entry point and top-level `tests/*.min` without linking.
 `test` validates the entry point, discovers named `test "name" { ... }` blocks
@@ -233,3 +244,69 @@ no default public registry deployed yet. `publish` emits metadata only and is a
 dry run even without the flag. It requires a clean committed library and a version
 tag at HEAD. See [the registry guide](registry.md) for records, checksums, local
 testing and static hosting.
+
+## Live programming
+
+`minyar run --watch` rebuilds after source or manifest edits, including local
+dependencies. A successful build replaces the running program. An invalid edit
+prints its diagnostics and keeps the previous program alive. Arguments after
+`--` reach each run unchanged. Interrupting the watcher stops its program and
+descendants. Watching uses filesystem notifications on Linux and macOS; generated
+`target`, `build` and `.git` directories are excluded.
+
+```sh
+minyar run --watch -- first-argument
+minyar run --watch --hot
+```
+
+Add `--hot` to preserve the running process, its module globals and heap values.
+Later calls to ordinary functions and methods use the new implementation. An
+active call finishes with the code it entered; initialization and `main` keep
+running in their original version. A blocked program observes updates when it
+next calls a function. The lanterns gallery shows state passed through ordinary
+functions; no special declaration syntax is needed.
+
+Hot reload accepts function-body edits only. Function signatures, records,
+constants, globals, imports, native bodies, manifests and initialization must stay
+unchanged. Incompatible edits are rejected; stop and run again to accept them.
+Managed threads and parallel loops currently require ordinary watch mode.
+
+After a successful function update, saving identical source bytes keeps the
+published image and skips frontend compilation and native compilation/linking.
+Source discovery, identity checks and the Clang version probe still run. This
+shortcut starts after the first accepted update; initial builds and changed
+function bodies still compile. Missing or corrupt cache metadata rebuilds.
+
+Hot mode adds an indirect dispatch to function calls and checks for a published
+update at most every 25 milliseconds. Debug uses O0 and release uses O2 without
+whole-program LTO. Successful code generations remain resident because old
+frames, closures and literal values may still refer to them; memory therefore
+grows with edits until the session ends. This development mode does not add a
+runtime cost to ordinary builds. Native debugger/trace metadata for replacement
+generations is not yet registered.
+
+`minyar repl` opens a persistent native session. Enter an expression to see its
+value, a `let` binding to keep a value, or a function declaration to define or
+replace a function. Mutations persist, and successful earlier actions and
+initializers are never replayed. Braces, parentheses and brackets support
+multiline input. Compile errors leave the previous declarations and values
+available. `:help` describes the session; `:quit` or end of input closes it.
+
+```minyar
+let evenings = 1
+evenings += 1
+function light(): Text { return Text(evenings) + " lights" }
+light()
+```
+
+Literal bindings infer their type. Other initializers need an annotation, such
+as `let names: List<Text> = ["Ada", "Lin"]`. The first REPL slice supports
+bindings, named functions and actions. Type declarations, callbacks, managed
+threads and local bindings that shadow session values require a source file.
+Text interpolation reads current session values, including in named functions
+and nested Text literals. Raw Text and escaped interpolation stay literal.
+Native imports are limited to providers present in the REPL host.
+A runtime failure or `exit()` ends the session. `:reset` asks
+you to restart it so native code and managed state are both cleared.
+Use `--release` for O2 submissions; the default is O0. Accepted code images and
+their persistent roots stay resident until the session exits.

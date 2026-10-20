@@ -123,7 +123,7 @@ function normalizeChoiceTypes(kinds: List<Integer>, texts: List<Text>, lines: So
 function choiceCases(context: CompilerContext, type: Integer): List<Text> {
     let empty: List<Text> = []
     if !isRecordType(type) { return empty }
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     if context.functionParameterCounts[record] == 0 { return empty }
     let marker = context.functionParameterNames[functionParameterOffset(context.functionParameterCounts, record)]
     if !resultPrefix(marker, "minyar_choice_tag|") { return empty }
@@ -132,7 +132,7 @@ function choiceCases(context: CompilerContext, type: Integer): List<Text> {
 
 function choicePayloadFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
     let fields: List<Integer> = []
-    let record = type - 1000
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let prefix = "minyar_choice_payload|" + name + "|"
     let field = 1
@@ -143,9 +143,33 @@ function choicePayloadFields(context: CompilerContext, type: Integer, name: Text
     return fields
 }
 
+// Logical fields describe every case for type checking and cycle analysis.
+// Physical payload slots overlap: each case starts immediately after the tag.
+function choiceStorageField(context: CompilerContext, type: Integer, field: Integer): Integer {
+    if field == 0 || choiceCases(context, type).length == 0 { return field }
+    let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
+    let parts = context.functionParameterNames[first + field].split("|")
+    let prefix = "minyar_choice_payload|" + parts[1] + "|"
+    let start = field
+    while start > 1 && resultPrefix(context.functionParameterNames[first + start - 1], prefix) { start = start - 1 }
+    return field - start + 1
+}
+
+function choiceStorageCount(context: CompilerContext, type: Integer): Integer {
+    if isScalarChoiceType(type) || choiceNicheType(context, type) != 0 { return 0 }
+    let count = 1
+    let field = 1
+    while field < context.functionParameterCounts[recordTypeIndex(type)] {
+        let slot = choiceStorageField(context, type, field)
+        if slot + 1 > count { count = slot + 1 }
+        field = field + 1
+    }
+    return count
+}
+
 function choiceLocalType(context: CompilerContext, type: Integer, location: Integer): Boolean {
     let position = 0
-    let name = context.functionNames[type - 1000]
+    let name = context.functionNames[recordTypeIndex(type)]
     while position + 1 < context.tokenKinds.length {
         if context.tokenKinds[position] == 1 && context.tokenTexts[position] == "record" && context.tokenTexts[position + 1] == name {
             return tokenPath(context.tokenLines, position) == tokenPath(context.tokenLines, location)
@@ -160,8 +184,8 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     let name = context.tokenTexts[location]
     if context.tokenKinds[location] != 1 { return 0 }
     let record = findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 2)
-    if record >= 0 && context.tokenTexts[location + 1] == "{" && choiceCases(context, 1000 + record).length == 0 { return 0 }
-    if record >= 0 && context.tokenTexts[location + 1] == "." && choiceCases(context, 1000 + record).length > 0 { return 1000 + record }
+    if record >= 0 && context.tokenTexts[location + 1] == "{" && choiceCases(context, typeForSymbol(context, record)).length == 0 { return 0 }
+    if record >= 0 && context.tokenTexts[location + 1] == "." && choiceCases(context, typeForSymbol(context, record)).length > 0 { return typeForSymbol(context, record) }
     if (name == "Ok" || name == "Err") && resultTypeName(expected, context.functionNames) { return 0 }
     if isBuiltinName(name) { return 0 }
     if findLocal(localNames, localLengths, state, name) >= 0 || findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name) >= 0 || findCompiledSymbol(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name, 3) >= 0 { return 0 }
@@ -170,13 +194,42 @@ function choiceConstructorType(context: CompilerContext, localNames: List<Text>,
     let found = 0
     record = 0
     while record < context.functionNames.length {
-        if context.symbolKinds[record] == 2 && findText(choiceCases(context, 1000 + record), name) > 0 && choiceLocalType(context, 1000 + record, location) {
+        if context.symbolKinds[record] == 2 && findText(choiceCases(context, typeForSymbol(context, record)), name) > 0 && choiceLocalType(context, typeForSymbol(context, record), location) {
             if found != 0 { failAtToken(context.tokenLines, location, "ambiguous choice case '" + name + "'; qualify it with its choice type") }
-            found = 1000 + record
+            found = typeForSymbol(context, record)
         }
         record = record + 1
     }
     return found
+}
+
+function failChoicePayloadCount(context: CompilerContext, position: Integer, type: Integer, name: Text, fields: List<Integer>, extra: Boolean) {
+    let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
+    let signature: List<Text> = [name + "("]
+    let index = 0
+    while index < fields.length {
+        if index > 0 { signature.add(", ") }
+        let fieldName = declaredFieldName(context.functionParameterNames[first + fields[index]])
+        let prefix = "minyar_choice_payload|" + name + "|"
+        if resultPrefix(fieldName, prefix) { fieldName = fieldName.slice(prefix.length, fieldName.length) }
+        signature.add(fieldName + ": " + diagnosticType(context, context.functionParameterTypes[first + fields[index]]))
+        index = index + 1
+    }
+    signature.add(")")
+    let problem = "fewer were provided"
+    if extra { problem = "more were provided" }
+    let noun = " payload values"
+    if fields.length == 1 { noun = " payload value" }
+    let help = "supply each value in declaration order: " + joinText(signature)
+    if fields.length == 0 { help = "this case has no payload; remove the values inside its parentheses" }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "choice case '" + name + "' expects " + Text(fields.length) + noun + ", but " + problem, "", help)
+}
+
+function finishChoicePayloadArguments(context: CompilerContext, state: List<Integer>, type: Integer, name: Text, fields: List<Integer>) {
+    if context.tokenKinds[state[0]] != 0 && context.tokenKinds[state[0]] != 6 && !tokenIs(context.tokenKinds, context.tokenTexts, state, ")") && !tokenIs(context.tokenKinds, context.tokenTexts, state, "}") {
+        failChoicePayloadCount(context, state[0], type, name, fields, true)
+    }
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
 }
 
 function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer): Text {
@@ -185,14 +238,24 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
     let name = context.tokenTexts[state[0]]
     let cases = choiceCases(context, type)
     let tag = findText(cases, name)
-    if tag < 1 { failUnknownChoice(context, state[0], type, name, "choice '" + readableDeclarationName(context.functionNames[type - 1000]) + "' has no case '" + name + "'") }
+    if tag < 1 { failUnknownChoice(context, state[0], type, name, "choice '" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "' has no case '" + name + "'") }
     state[0] = state[0] + 1
     let fields = choicePayloadFields(context, type, name)
-    let record = type - 1000
+    if isPureEnumChoice(context, type) {
+        if tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+            state[0] = state[0] + 1
+            finishChoicePayloadArguments(context, state, type, name, fields)
+        }
+        setType(resultType, type)
+        return Text(tag - 1)
+    }
+    if isScalarChoiceType(type) { return parseScalarNicheChoice(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, type, fields.length > 0) }
+    if choiceNicheType(context, type) != 0 { return parseNicheChoice(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, type, fields.length > 0) }
+    let record = recordTypeIndex(type)
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let value = valueName(textState, newTemporary(state))
     noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, 0)
-    output.add("  " + value + " = call ptr @minyar_record_new(i64 " + Text(context.functionParameterCounts[record]) + ")\n")
+    output.add("  " + value + " = call ptr @minyar_record_new(i64 " + Text(choiceStorageCount(context, type)) + ")\n")
     output.add("  call void @minyar_record_set(ptr " + value + ", i64 0, i64 " + Text(tag - 1) + ")\n")
     let owned: List<Integer> = [type]
     ownResult(output, state, value, owned)
@@ -200,7 +263,9 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
         expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
         let index = 0
         while index < fields.length {
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ")") { failChoicePayloadCount(context, state[0], type, name, fields, false) }
             if index > 0 { expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",") }
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ")") { failChoicePayloadCount(context, state[0], type, name, fields, false) }
             let field = fields[index]
             let expected = context.functionParameterTypes[first + field]
             let payloadType: List<Integer> = [expected]
@@ -214,14 +279,20 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
                 if takeResult(output, state, payload, payloadType) { setter = "minyar_record_set_take" }
             }
             noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, expected)
-            output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(field) + ", i64 " + slot + ")\n")
+            output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(index + 1) + ", i64 " + slot + ")\n")
             index = index + 1
         }
         if fields.length > 0 && tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
-        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+        finishChoicePayloadArguments(context, state, type, name, fields)
     }
     setType(resultType, type)
-    if owned.length > 1 { markOwner(resultType, owned[1]) }
+    if !recoveryEnabled(state) && resultTypeName(context.activeReturnType, context.functionNames) {
+        // An early try can leave before all payloads exist. Keep construction
+        // rooted on that path and transfer only a separately owned success.
+        noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, 0)
+        output.add("  call void @minyar_rc_retain(ptr " + value + ")\n")
+        ownResult(output, state, value, resultType)
+    } else { if owned.length > 1 { markOwner(resultType, owned[1]) } }
     return value
 }
 
@@ -236,7 +307,7 @@ function choiceMatchCases(context: CompilerContext, type: Integer): List<Text> {
 function choiceMatchFields(context: CompilerContext, type: Integer, name: Text): List<Integer> {
     if resultTypeName(type, context.functionNames) {
         let fields: List<Integer> = []
-        let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+        let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
         if name == "Err" { fields.add(2) }
         if name == "Ok" && context.functionParameterTypes[first + 1] != 5 { fields.add(1) }
         return fields
@@ -249,7 +320,7 @@ function parseMatchExpression(context: CompilerContext, localNames: List<Text>, 
     state[0] = state[0] + 1
     let inputType: List<Integer> = [0]
     let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
-    if choiceMatchCases(context, inputType[0]).length == 0 { failCompiler(describeLocation(tokenLocation(context.tokenLines, location)) + ": match needs a Result or choice") }
+    if !matchInputType(context, inputType[0]) { failAtToken(context.tokenLines, location, "match needs a choice, Result or scalar value") }
     let values: List<Text> = []
     let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, context.activeReturnType, input, inputType, location, resultType, values)
     return values[0]
@@ -274,7 +345,8 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
     assignReference(output, state, owner, input, inputType, counts, types, returns)
     storeLocal(output, owner, inputType[0], input)
-    let tag = readRecordField(output, textState, state, input, 0, 1)
+    let nodes: List<MatchPattern> = []
+    let rows: List<PatternRow> = []
     let endLabel = "choice.match.end." + Text(newLabel(state))
     let allReturn = true
     let seenElse = false
@@ -285,58 +357,55 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         let name = texts[armLocation]
         if seenElse { failAtToken(lines, armLocation, "else must be the last match arm") }
         let fallback = name == "else" && kinds[armLocation] == 1
-        let variant = findText(cases, name)
-        if resultTypeName(inputType[0], context.functionNames) {
-            if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "expected Ok or Err in result match") }
-            if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate result arm " + name) }
+        let variant = -1
+        if kinds[armLocation] == 1 { variant = findText(cases, name) }
+        if !fallback && variant > 0 && seen[variant] != 0 {
+            if resultTypeName(inputType[0], context.functionNames) { failAtToken(lines, armLocation, "duplicate result arm " + name) }
+            failAtToken(lines, armLocation, "duplicate match arm '" + name + "'")
         }
-        if !fallback && (kinds[armLocation] != 1 || variant < 1) { failUnknownChoice(context, armLocation, inputType[0], name, "unknown case '" + name + "' in choice match") }
-        if !fallback && seen[variant] != 0 { failAtToken(lines, armLocation, "duplicate match arm '" + name + "'") }
-        state[0] = state[0] + 1
-        let fields: List<Integer> = []
-        if fallback { seenElse = true } else { seen[variant] = 1; fields = choiceMatchFields(context, inputType[0], name) }
         let bindings: List<Text> = []
-        if fields.length > 0 || tokenIs(kinds, texts, state, "(") {
-            expectToken(kinds, texts, lines, state, "(")
-            let index = 0
-            while index < fields.length {
-                if index > 0 { expectToken(kinds, texts, lines, state, ",") }
-                if kinds[state[0]] != 1 || texts[state[0]] == "true" || texts[state[0]] == "false" { failAtToken(lines, state[0], "expected a choice payload binding") }
-                let binding = texts[state[0]]
-                if binding != "_" && findText(bindings, binding) >= 0 { failAtToken(lines, state[0], "duplicate choice payload binding '" + binding + "'") }
-                bindings.add(binding)
-                state[0] = state[0] + 1
-                index = index + 1
-            }
-            expectToken(kinds, texts, lines, state, ")")
-        }
-        let armLabel = "choice.match.arm." + Text(newLabel(state))
+        let node = -1
+        if fallback {
+            state[0] = state[0] + 1
+            let children: List<Integer> = []
+            node = nodes.length
+            nodes.add(MatchPattern { kind: 0; type: inputType[0]; location: armLocation; after: state[0]; name: "_"; children: children })
+            seenElse = true
+        } else { node = parseMatchPattern(context, state, inputType[0], nodes, bindings, 0) }
         let nextLabel = "choice.match.next." + Text(newLabel(state))
-        if fallback { output.add("  br label %" + armLabel + "\n") } else {
-            let condition = valueName(textState, newTemporary(state))
-            output.add("  " + condition + " = icmp eq i64 " + tag + ", " + Text(variant - 1) + "\n")
-            output.add(conditionalBranch(condition, armLabel, nextLabel))
-        }
-        output.add("\n" + armLabel + ":\n")
-        textState[0] = armLabel
+        let guardFailure = "choice.match.guard." + Text(newLabel(state))
         let scope = state[3]
+        let bindingNodes: List<Integer> = []
+        let bindingValues: List<Text> = []
         let bindingIds: List<Integer> = []
-        let first = functionParameterOffset(counts, inputType[0] - 1000)
+        emitDebugOrigin(output, lines, armLocation, "line")
+        output.add("; minyar-debug-scope: begin\n")
+        emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, nextLabel, bindingNodes, bindingValues)
         let index = 0
-        while index < fields.length {
-            let field = fields[index]
-            let type = types[first + field]
-            let id = -1
-            if bindings[index] != "_" {
-                let payload = readRecordField(output, textState, state, input, field, type)
-                id = nextLocal(state)
-                addLocal(localNames, localTypes, localIds, localLengths, state, bindings[index], type, id)
-                let payloadType: List<Integer> = [type]
-                assignReference(output, state, id, payload, payloadType, counts, types, returns)
-                storeLocal(output, id, type, payload)
-            }
+        while index < bindingNodes.length {
+            let pattern = nodes[bindingNodes[index]]
+            let id = nextLocal(state)
+            addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
+            let payloadType: List<Integer> = [pattern.type]
+            assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
+            storeLocal(output, id, pattern.type, bindingValues[index])
+            emitDebugBinding(context, output, pattern.location, pattern.name, pattern.type, "ptr %local." + Text(id), 0, true)
             bindingIds.add(id)
             index = index + 1
+        }
+        let guarded = kinds[state[0]] == 1 && texts[state[0]] == "where"
+        if fallback && guarded { failAtToken(lines, state[0], "an else arm cannot have a guard; use a binding or _ pattern") }
+        if guarded {
+            let guardLocation = state[0]
+            state[0] = state[0] + 1
+            let guardType: List<Integer> = [4]
+            let condition = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, guardType)
+            if guardType[0] != 4 { failAtToken(lines, guardLocation, "match guard must be Boolean") }
+            matchPatternBranch(output, textState, state, condition, guardFailure)
+        } else {
+            let values: List<Integer> = [node]
+            rows.add(PatternRow { values: values })
+            if variant > 0 && matchPatternTotalCase(context, nodes, node) { seen[variant] = 1 }
         }
         let terminal = false
         if expression {
@@ -354,40 +423,55 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         } else {
             terminal = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         }
+        output.add("; minyar-debug-scope: end\n")
         if !terminal {
             index = 0
-            while index < fields.length {
-                if bindingIds[index] >= 0 { rootLocal(output, state, bindingIds[index], "null", types[first + fields[index]]) }
+            while index < bindingIds.length {
+                rootLocal(output, state, bindingIds[index], "null", nodes[bindingNodes[index]].type)
                 index = index + 1
             }
             output.add("  br label %" + endLabel + "\n")
             allReturn = false
         }
         state[3] = scope
-        if !fallback {
-            output.add("\n" + nextLabel + ":\n")
-            textState[0] = nextLabel
+        if guarded {
+            output.add("\n" + guardFailure + ":\n")
+            index = 0
+            while index < bindingIds.length {
+                rootLocal(output, state, bindingIds[index], "null", nodes[bindingNodes[index]].type)
+                index = index + 1
+            }
+            output.add("  br label %" + nextLabel + "\n")
         }
+        output.add("\n" + nextLabel + ":\n")
+        textState[0] = nextLabel
         skipTerminators(kinds, state)
     }
     expectToken(kinds, texts, lines, state, "}")
-    let missing: List<Text> = []
-    let variant = 1
-    while variant < cases.length {
-        if seen[variant] == 0 {
-            if missing.length > 0 { missing.add(", ") }
-            missing.add(cases[variant])
+    if !seenElse {
+        let inputTypes: List<Integer> = [inputType[0]]
+        let fuel: List<Integer> = [100000]
+        let witness = missingMatchPatterns(context, nodes, rows, inputTypes, fuel, location)
+        if witness.missing {
+            let missing: List<Text> = []
+            let names: List<Text> = []
+            let variant = 1
+            while variant < cases.length {
+                if missingMatchCase(context, nodes, rows, inputType[0], cases[variant], fuel, location) {
+                    if missing.length > 0 { missing.add(", ") }
+                    missing.add(cases[variant])
+                    names.add(cases[variant])
+                }
+                variant = variant + 1
+            }
+            let detail = "; for example: " + witness.values[0]
+            if resultTypeName(inputType[0], context.functionNames) { failAtToken(lines, location, "match must handle both Ok and Err; missing cases: " + diagnosticNameList(names) + detail) }
+            let description = joinText(missing)
+            if description == "" { description = witness.values[0] }
+            failAtToken(lines, location, "match is missing cases: " + description + detail)
         }
-        variant = variant + 1
     }
-    if !seenElse && missing.length > 0 && resultTypeName(inputType[0], context.functionNames) {
-        let names: List<Text> = []
-        variant = 1
-        while variant < cases.length { if seen[variant] == 0 { names.add(cases[variant]) }; variant = variant + 1 }
-        failAtToken(lines, location, "match must handle both Ok and Err; missing cases: " + diagnosticNameList(names))
-    }
-    if !seenElse && missing.length > 0 { failAtToken(lines, location, "match is missing cases: " + joinText(missing)) }
-    if !seenElse { output.add("  unreachable\n") }
+    output.add("  unreachable\n")
     if !allReturn {
         output.add("\n" + endLabel + ":\n")
         textState[0] = endLabel

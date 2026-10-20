@@ -1,0 +1,1768 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "../tools/check-runner.min" as runner
+use "./frontend-fixtures.min" as fixtures
+use "system" as system
+
+function program(lines: List<Text>): Text {
+    let pieces: List<Text> = []
+    for line in lines { pieces.add(line + "\n") }
+    return joinText(pieces)
+}
+
+function body(llvm: Text, name: Text): Text {
+    let pieces: List<Text> = []
+    let found = false
+    let complete = false
+    for line in test.lines(llvm) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(") || test.contains(line, "@\".minyar.fn.minyar.module|" + name + "|")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            pieces.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing scope ownership function " + name)
+    return joinText(pieces)
+}
+
+function checkEmptyScope(emitted: Text, label: Text) {
+    for forbidden in ["%rc.scope.header", "%rc.scope.cells", "%rc.scope.slot.", "%rc.scope.drop.", "call void @minyar_rc_scope_enter_v1(", "call void @minyar_rc_scope_leave_v1(", "call void @minyar_rc_scope_release_v1("] {
+        test.check(!test.contains(emitted, forbidden), "empty scope must omit " + forbidden + ": " + label)
+    }
+    test.check(test.contains(emitted, "call void @minyar_rc_scope_leave_empty_v1()"), "missing empty scope leave: " + label)
+}
+
+function checkScopeCells(emitted: Text, count: Integer, label: Text) {
+    if count == 0 { checkEmptyScope(emitted, label) }
+    else {
+        test.check(test.contains(emitted, "%rc.scope.cells = alloca [" + Text(count) + " x ptr]"), label)
+        test.check(test.contains(emitted, "call void @minyar_rc_scope_enter_v1(") && test.contains(emitted, "call void @minyar_rc_scope_leave_v1("), "nonempty scope must retain its header: " + label)
+        test.check(!test.contains(emitted, "call void @minyar_rc_scope_leave_empty_v1()"), "nonempty scope must keep normal leaves: " + label)
+    }
+}
+
+function checkLowered(llvm: Text, name: Text) {
+    let emitted = body(llvm, name)
+    if test.contains(emitted, "call void @minyar_rc_scope_leave_empty_v1()") { checkEmptyScope(emitted, name) }
+    else {
+        test.check(test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "missing scope entry in " + name)
+        test.check(test.contains(emitted, "call void @minyar_rc_scope_leave_v1("), "missing scope leave in " + name)
+    }
+    for legacy in ["enter", "leave", "keep", "borrow", "borrow_traced", "local", "local_traced", "local_take", "local_move", "local_move_owner", "step", "enter_stack_v1", "leave_stack_v1"] {
+        test.check(!test.contains(emitted, "call void @minyar_rc_" + legacy + "("), "legacy ownership call in lowered " + name + ": " + legacy)
+    }
+}
+
+function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List<Text>): Text {
+    return buildRuntimeWithBudget(compiler, cycle, environment, 0)
+}
+
+function buildRuntimeWithBudget(compiler: test.Compiler, cycle: Boolean, environment: List<Text>, budget: Integer): Text {
+    let engine = io.readTextFile("runtime/minyar_runtime.c")
+    let name = "scope-eager"
+    if cycle { engine = runtime.cycleSource(engine); name = "scope-cycle" }
+    let source = "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + engine
+    if budget == 0 {
+    source += "\n#if defined(MINYAR_BOUNDED_RC) || defined(MINYAR_COMPILER_ARENA)\n#error Scope ownership cleanup oracle requires eager reference counting.\n#endif\n"
+    }
+    if budget > 0 {
+        name += "-k" + Text(budget)
+        source = "#define MINYAR_BOUNDED_RC 1\n#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET " + Text(budget) + "\n" + source
+    }
+    source += "\n#include <assert.h>\nstatic void scope_drain_bounded(void) {\n#ifdef MINYAR_BOUNDED_RC\n  size_t steps = 0;\n  while (rc_pending_count) {\n    minyar_rc_poll(MINYAR_RC_POLL_BUDGET);\n    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);\n    assert(++steps < 100000);\n  }\n#endif\n}\n"
+    source += "__attribute__((destructor)) static void check_scope_cleanup(void) {\n"
+    if budget > 0 { source += "  scope_drain_bounded();\n" }
+    source += "  assert(rc_scopes == NULL);\n  assert(rc_frames == NULL);\n  assert(rc_pending_count == 0);\n"
+    if cycle && budget == 0 {
+        source += "  assert(rc_cycle_pending == 0);\n  assert(rc_cycle_phase == RC_CYCLE_IDLE);\n"
+        source += "  assert(rc_cycle_inside == 0);\n  assert(rc_cycle_shading == 0);\n"
+        source += "  assert(rc_cycle_gray_head == NULL && rc_cycle_gray_tail == NULL);\n  assert(rc_cycle_active == NULL);\n"
+        source += "  assert(rc_cycle_cohort == NULL && rc_cycle_cursor == NULL && rc_cycle_last == NULL);\n"
+        source += "  assert(rc_cycle_head == NULL && rc_cycle_tail == NULL);\n  assert(rc_cycle_known_head == NULL && rc_cycle_known_tail == NULL);\n"
+    }
+    source += "  assert(rc_object_count == 0);\n  assert(rc_immortal_object_count == 0);\n  assert(rc_bytes == 0);\n}\n"
+    source += program([
+        "static size_t scope_return_before;",
+        "MinyarRecord *minyar_runtime_scopeArmBorrow(MinyarRecord *box) {",
+        "  minyar_rc_retain(box);",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "  MinyarRecord *ring = minyar_record_new_traced(512);",
+        "  minyar_record_set_reference_traced(ring, 0, (long long)(uintptr_t)ring);",
+        "  minyar_record_set_reference_traced(ring, 1, minyar_record_get(box, 0));",
+        "  rc_drop(ring);",
+        "  assert(rc_cycle_pending);",
+        "  scope_return_before = rc_cycle_units;",
+        "#endif",
+        "  return box;",
+        "}",
+        "long long minyar_runtime_scopeBorrowProgress(MinyarText *value) {",
+        "  (void)value;",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "  if (rc_cycle_units <= scope_return_before) {",
+        "    fputs(\"scope return did not service pending cycles\\n\", stderr);",
+        "    _Exit(73);",
+        "  }",
+        "  assert(rc_cycle_units - scope_return_before <= 32);",
+        "#else",
+        "  (void)scope_return_before; assert(0);",
+        "#endif",
+        "  return 1;",
+        "}",
+        "long long minyar_runtime_scopeCompareProgress(_Bool value) {",
+        "  assert(value);",
+        "  return minyar_runtime_scopeBorrowProgress(NULL);",
+        "}",
+        "long long minyar_runtime_scopeJoinAllocation() {",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "  for (int taking = 0; taking < 2; taking++) {",
+        "    MinyarText *text = minyar_native_copy_text((const unsigned char *)\"seed\", 4);",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "    MinyarRecord *parent = minyar_record_new_traced(2);",
+        "    minyar_record_set_reference_traced(parent, 0, (long long)(uintptr_t)text);",
+        "    minyar_record_set_reference_traced(parent, 1, (long long)(uintptr_t)parent);",
+        "#else",
+        "    MinyarRecord *parent = minyar_record_new(1);",
+        "    minyar_record_set_reference(parent, 0, (long long)(uintptr_t)text);",
+        "#endif",
+        "    minyar_rc_release(text);",
+        "    void *owners[1] = { parent };",
+        "    MinyarRcScope scope;",
+        "    minyar_rc_scope_enter_v1(&scope, owners, 1);",
+        "    MinyarRecord *pending = minyar_record_new(512);",
+        "    minyar_record_set_reference(pending, 0, (long long)(uintptr_t)text);",
+        "    rc_drop(pending);",
+        "    assert(rc_pending_count > 0);",
+        "    text = (MinyarText *)(uintptr_t)minyar_record_get(parent, 0);",
+        "    if (taking) minyar_rc_retain(text); /* Transferred LEFT, no RIGHT retain. */",
+        "    MinyarText *joined = taking ? minyar_join_text_take_left(text, text) : minyar_join_text(text, text);",
+        "    assert(joined->byte_length == 8 && !memcmp(joined->bytes, \"seedseed\", 8));",
+        "    assert(text->byte_length == 4 && !memcmp(text->bytes, \"seed\", 4));",
+        "    assert((MinyarText *)(uintptr_t)minyar_record_get(parent, 0) == text);",
+        "    assert(rc_bounded_cursor > 0 && rc_bounded_cursor <= (size_t)(taking ? 3 : 2) * MINYAR_RC_POLL_BUDGET);",
+        "    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);",
+        "    minyar_rc_release(joined);",
+        "    owners[0] = NULL;",
+        "    minyar_rc_scope_release_v1(parent);",
+        "    minyar_rc_scope_leave_v1(&scope);",
+        "    scope_drain_bounded();",
+        "    assert(rc_object_count == 0 && rc_bytes == 0 && rc_pending_count == 0);",
+        "  }",
+        "#else",
+        "  assert(0);",
+        "#endif",
+        "  return 1;",
+        "}",
+        "long long minyar_runtime_scopePublishAllocation() {",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "  for (int same = 0; same < 2; same++) {",
+        "    MinyarText *text = minyar_native_copy_text((const unsigned char *)\"kept\", 4);",
+        "    MinyarText *filler = same ? text : minyar_native_copy_text((const unsigned char *)\"fill\", 4);",
+        "    MinyarList *list = minyar_list_new();",
+        "    minyar_list_references(list);",
+        "    minyar_list_add(list, (long long)(uintptr_t)filler);",
+        "    while (list->length < list->capacity) minyar_list_add(list, (long long)(uintptr_t)filler);",
+        "    if (!same) minyar_rc_release(filler);",
+        "    MinyarRecord *parent = NULL;",
+        "    if (!same) { parent = minyar_record_new(1); minyar_record_set_reference(parent, 0, (long long)(uintptr_t)text); }",
+        "    minyar_rc_release(text);",
+        "    void *owners[2] = { same ? (void *)list : (void *)parent, same ? NULL : (void *)list };",
+        "    MinyarRcScope scope;",
+        "    minyar_rc_scope_enter_v1(&scope, owners, 2);",
+        "    MinyarRecord *pending = minyar_record_new(512);",
+        "    minyar_record_set_reference(pending, 0, (long long)(uintptr_t)text);",
+        "    rc_drop(pending);",
+        "    assert(rc_pending_count > 0);",
+        "    text = (MinyarText *)(uintptr_t)(same ? minyar_list_get(list, 0) : minyar_record_get(parent, 0));",
+        "    long long length = list->length, capacity = list->capacity;",
+        "    minyar_list_add(list, (long long)(uintptr_t)text); /* No temporary retain. */",
+        "    assert(list->length == length + 1 && list->capacity > capacity);",
+        "    assert((MinyarText *)(uintptr_t)minyar_list_get(list, length) == text);",
+        "    assert(text->byte_length == 4 && !memcmp(text->bytes, \"kept\", 4));",
+        "    assert((MinyarText *)(uintptr_t)(same ? minyar_list_get(list, 0) : minyar_record_get(parent, 0)) == text);",
+        "    assert((((RcObject *)text - 1)->ownership >> 3) == (size_t)(same ? length : 1) + 1);",
+        "    assert(rc_bounded_cursor > 0 && rc_bounded_cursor <= (size_t)2 * MINYAR_RC_POLL_BUDGET);",
+        "    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);",
+        "    void *first = owners[0], *second = owners[1];",
+        "    owners[0] = owners[1] = NULL;",
+        "    minyar_rc_scope_release_v1(second);",
+        "    minyar_rc_scope_release_v1(first);",
+        "    minyar_rc_scope_leave_v1(&scope);",
+        "    scope_drain_bounded();",
+        "    assert(rc_object_count == 0 && rc_bytes == 0 && rc_pending_count == 0);",
+        "  }",
+        "#else",
+        "  assert(0);",
+        "#endif",
+        "  return 1;",
+        "}"
+    ])
+    let path = compiler.directory + "/" + name
+    io.writeTextFile(path + ".c", source)
+    let command = [compiler.clang, "-O1"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-iquote", "runtime", "-c", path + ".c", "-o", path + ".o"] { command.add(item) }
+    test.require(test.run(command, environment, "", path + ".build", 120), "compile scope allocation oracle " + name)
+    return path + ".o"
+}
+
+function executesLLVM(compiler: test.Compiler, path: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text): Text {
+    let llvm = io.readTextFile(path + ".ll")
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+    let object = ordinary
+    if test.contains(llvm, "; minyar-cycle-runtime: 1") || test.contains(llvm, "@minyar_callback_domain(") || test.contains(llvm, "; minyar-calldepth-policy:") { object = cycle }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", object, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link scope fixture " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.require(observed, "execute scope fixture " + optimization)
+        test.check(observed.errorOutput == "", "scope fixture diagnostics " + optimization + "\n" + observed.errorOutput)
+        test.check(observed.output == expected, "scope fixture output " + optimization + "\n" + observed.output + "expected\n" + expected)
+    }
+    return llvm
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text): Text {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", test.sourceModules(source))
+    let compiled = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners", "--library", "library"], environment, "", path + ".compile", compiler.compileTimeout)
+    test.require(compiled, "compile scope ownership fixture")
+    test.check(compiled.output == "" && compiled.errorOutput == "", "unexpected scope compiler output\n" + compiled.output + compiled.errorOutput)
+    return executesLLVM(compiler, path, expected, environment, ordinary, cycle)
+}
+
+let names = ["test_direct_owners_and_borrowed_parameter_moves", "test_condition_owners_on_both_branches", "test_loop_false_exit_break_continue_and_nested_loops", "test_early_return_and_try_cleanup", "test_aliases_survive_later_argument_mutation", "test_escaping_closure_and_cycle_owners", "test_repeated_and_nested_diagnostic_unwind", "test_large_function_keeps_legacy_fallback", "test_scope_modes_and_private_symbols", "test_mixed_scoped_and_legacy_diagnostic_unwind", "test_module_state_replay_lowers_cached_owners", "test_recoverable_call_depth_cleans_scope_owners", "test_large_cycle_drains_at_final_scope"]
+names.add("test_eager_launcher_selects_scope_owners")
+names.add("test_plain_borrows_share_local_and_return_owners")
+names.add("test_comparison_borrows_have_no_later_uses")
+names.add("test_comparison_borrow_ssa_boundaries")
+names.add("test_allocating_text_read_borrows_keep_parent_owners")
+names.add("test_choice_composition_cycle_scope_owners")
+names.add("test_choice_container_niche_scope_owners")
+names.add("test_choice_scalar_niche_scope_owners")
+names.add("test_temporary_cells_reuse_only_disjoint_cfg_ranges")
+names.add("test_projected_borrows_publish_one_lasting_owner")
+names.add("test_empty_scopes_finish_recovery_without_losing_roots")
+fixtures.validate("ScopeOwnership", names)
+let compiler = test.compiler()
+compiler.compileTimeout = 30
+compiler.linkTimeout = 120
+compiler.runTimeout = 30
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:detect_stack_use_after_return=1:halt_on_error=1")
+environment = runner.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+let ordinary = buildRuntime(compiler, false, environment)
+let cycle = buildRuntime(compiler, true, environment)
+
+if fixtures.selected("ScopeOwnership", "test_direct_owners_and_borrowed_parameter_moves") {
+    let source = program([
+        "function decorate(value: Text): Text {",
+        "value = value + \"!\"",
+        "let alias = value",
+        "value = value + \"?\"",
+        "value = value",
+        "return alias + \"/\" + value",
+        "}",
+        "function append(values: List<Text>): List<Text> {",
+        "values = values.appended(\"next\" + \"!\")",
+        "return values",
+        "}",
+        "let original = \"root\" + \".\"",
+        "print(decorate(original))",
+        "print(original)",
+        "let values = [\"base\" + \"!\"]",
+        "let extended = append(values)",
+        "print(values[0])",
+        "print(values.length)",
+        "print(extended.length)",
+        "print(extended[1])"
+    ])
+    let llvm = executes(compiler, source, "root.!/root.!?\nroot.\nbase!\n1\n2\nnext!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "decorate")
+    checkLowered(llvm, "append")
+    test.check(test.contains(body(llvm, "decorate"), "call void @minyar_rc_scope_move_v1("), "self-consuming assignment must move its local owner")
+}
+
+let condition = program([
+    "function condition(good: Boolean): List<Integer> {",
+    "if good { return [1] }",
+    "return []",
+    "}"
+])
+
+if fixtures.selected("ScopeOwnership", "test_condition_owners_on_both_branches") {
+    let source = condition + program([
+        "function choose(good: Boolean): Text {",
+        "let result = \"start\" + \".\"",
+        "if condition(good).length > 0 { result = result + \"then\" }",
+        "else { result = result + \"else\" }",
+        "if condition(good).length > 0 { if true {} } else {}",
+        "if good && condition(true).length > 0 { result = result + \"!\" }",
+        "if good || condition(false).length > 0 {} else { result = result + \"?\" }",
+        "return result",
+        "}",
+        "print(choose(true))",
+        "print(choose(false))"
+    ])
+    let llvm = executes(compiler, source, "start.then!\nstart.else?\n", environment, ordinary, cycle)
+    checkLowered(llvm, "choose")
+}
+
+if fixtures.selected("ScopeOwnership", "test_loop_false_exit_break_continue_and_nested_loops") {
+    let source = condition + program([
+        "function countRows(good: Boolean): Integer {",
+        "let index = 0",
+        "while condition(good && index < 3).length > 0 {",
+        "let guard = Bytes(\"owned\")",
+        "index = index + guard.length - 4",
+        "}",
+        "return index",
+        "}",
+        "function nested(): Integer {",
+        "let total = 0",
+        "let row = 0",
+        "while condition(row < 3).length > 0 {",
+        "let rowText = \"row\" + Text(row)",
+        "let column = 0",
+        "while condition(column < 4).length > 0 {",
+        "let cell = rowText + Text(column)",
+        "column = column + 1",
+        "if column == 2 { continue }",
+        "if column == 4 { break }",
+        "total = total + cell.length",
+        "}",
+        "row = row + 1",
+        "}",
+        "return total",
+        "}",
+        "function counted(): Integer {",
+        "let total = 0",
+        "for index in 0..5 {",
+        "let guard = Bytes(\"for\")",
+        "if index == 1 { continue }",
+        "if index == 4 { break }",
+        "total = total + guard.length",
+        "}",
+        "return total",
+        "}",
+        "print(countRows(true))",
+        "print(countRows(false))",
+        "print(nested())",
+        "print(counted())"
+    ])
+    let llvm = executes(compiler, source, "3\n0\n30\n9\n", environment, ordinary, cycle)
+    for name in ["countRows", "nested", "counted"] { checkLowered(llvm, name) }
+}
+
+if fixtures.selected("ScopeOwnership", "test_early_return_and_try_cleanup") {
+    let source = program([
+        "function leaf(index: Integer): Result<Text, Text> {",
+        "let local = Bytes(\"owned\")",
+        "if index == 2 { return Err<Text, Text>(\"error\" + Text(index)) }",
+        "return Ok<Text, Text>(\"value\" + Text(index) + Text(local.length))",
+        "}",
+        "function outer(index: Integer): Result<Text, Text> {",
+        "let locals = [Bytes(\"a\"), Bytes(\"b\")]",
+        "for candidate in 0..4 {",
+        "if candidate == index {",
+        "let value = try leaf(index)",
+        "if value.length > 0 { return Ok<Text, Text>(value + Text(locals.length)) }",
+        "}",
+        "}",
+        "return Err<Text, Text>(\"missing\" + \"!\")",
+        "}",
+        "for index in 0..5 {",
+        "match outer(index) { Ok(value) { print(value) } Err(error) { print(error) } }",
+        "}"
+    ])
+    let llvm = executes(compiler, source, "value052\nvalue152\nerror2\nvalue352\nmissing!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "leaf")
+    checkLowered(llvm, "outer")
+}
+
+if fixtures.selected("ScopeOwnership", "test_aliases_survive_later_argument_mutation") {
+    let source = program([
+        "record Box { text: Text }",
+        "function replace(values: List<Box>): Text {",
+        "values[0] = Box { text: \"changed\" + \"!\" }",
+        "return \"right\" + \"!\"",
+        "}",
+        "function change(values: List<Box>): Integer {",
+        "values[0] = Box { text: \"last\" + \"!\" }",
+        "return 0",
+        "}",
+        "function keep(value: Text, ignored: Integer): Text { return value }",
+        "let values = [Box { text: \"left\" + \"!\" }]",
+        "let alias = values[0]",
+        "print(values[0].text + (\"/\" + replace(values)))",
+        "print(alias.text)",
+        "print(values[0].text)",
+        "print(keep(values[0].text, change(values)))",
+        "print(values[0].text)"
+    ])
+    executes(compiler, source, "left!/right!\nleft!\nchanged!\nchanged!\nlast!\n", environment, ordinary, cycle)
+}
+
+if fixtures.selected("ScopeOwnership", "test_escaping_closure_and_cycle_owners") {
+    let source = program([
+        "record State { callbacks: List<Callback<Integer, Text>>; label: Text }",
+        "function make(): Callback<Integer, Text> {",
+        "let state = State { callbacks: []; label: \"saved\" + \"!\" }",
+        "let callback = function(value: Integer): Text {",
+        "let result = state.label + Text(value)",
+        "return result",
+        "}",
+        "state.callbacks.add(callback)",
+        "return callback",
+        "}",
+        "let callback = make()",
+        "print(callback(7))",
+        "let alias = callback",
+        "callback = make()",
+        "print(alias(8))",
+        "print(callback(9))"
+    ])
+    let llvm = executes(compiler, source, "saved!7\nsaved!8\nsaved!9\n", environment, ordinary, cycle)
+    checkLowered(llvm, "make")
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "callback ownership fixture must select the cycle engine")
+    test.check(test.contains(llvm, "call void @minyar_rc_retain_traced("), "cyclic alias acquisition must keep its traced retain barrier")
+}
+
+if fixtures.selected("ScopeOwnership", "test_repeated_and_nested_diagnostic_unwind") {
+    let source = program([
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function discard(value: Text): Integer {",
+        "let owned = Bytes(value)",
+        "diagnosticDiscard()",
+        "return owned.length",
+        "}",
+        "function keepArgument(value: Text, ignored: Integer): Text { return value }",
+        "function diagnosticCompileJob(job: Job) {",
+        "let held = [job.text + \"!\"]",
+        "if job.mode == 2 {",
+        "let child = Job { text: \"child\" + \"!\"; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "print(held[0])",
+        "diagnosticDiscard()",
+        "}",
+        "if job.mode == 1 {",
+        "print(keepArgument(job.text + \" temporary\", discard(held[0])))",
+        "}",
+        "print(held[0])",
+        "}",
+        "let saved = Job { text: \"safe\" + \"\"; mode: 0 }",
+        "for index in 0..3 { print(diagnosticRun(Job { text: \"lost\" + Text(index); mode: 1 })) }",
+        "print(diagnosticRun(Job { text: \"outer\" + \"\"; mode: 2 }))",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ])
+    let llvm = executes(compiler, source, "false\nfalse\nfalse\nfalse\nouter!\nfalse\nsafe!\ntrue\nsafe\n", environment, ordinary, cycle)
+    checkLowered(llvm, "discard")
+    checkLowered(llvm, "diagnosticCompileJob")
+}
+
+if fixtures.selected("ScopeOwnership", "test_large_function_keeps_legacy_fallback") {
+    let lines = ["function wide(seed: Text): Text {"]
+    for index in 0..260 { lines.add("let value" + Text(index) + " = seed + Text(" + Text(index) + ")") }
+    lines.add("return value259")
+    lines.add("}")
+    lines.add("print(wide(\"wide\"))")
+    let llvm = executes(compiler, program(lines), "wide259\n", environment, ordinary, cycle)
+    let emitted = body(llvm, "wide")
+    test.check(test.contains(emitted, "call void @minyar_rc_enter("), "oversized ownership function must retain its safe legacy fallback")
+    test.check(!test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "oversized ownership function must not partially lower")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    test.require(test.run([compiler.executable, path + ".min", path + ".legacy.ll", "--library", "library"], environment, "", path + ".legacy", compiler.compileTimeout), "compile legacy fallback comparison")
+    test.check(body(io.readTextFile(path + ".legacy.ll"), "wide") == emitted, "scope fallback must preserve the complete original function")
+}
+
+if fixtures.selected("ScopeOwnership", "test_scope_modes_and_private_symbols") {
+    let path = compiler.directory + "/modes"
+    io.writeTextFile(path + ".min", "print(42)\n")
+    for budget in ["1", "32"] {
+        for reverse in [false, true] {
+            let command = [compiler.executable, path + ".min", path + ".ll"]
+            if reverse { command.add("--scope-owners") }
+            command.add("--bounded-owners")
+            command.add(budget)
+            if !reverse { command.add("--scope-owners") }
+            let observed = test.run(command, environment, "", path + ".reject", compiler.compileTimeout)
+            test.check(observed.status == 1 && observed.output == "" && test.contains(observed.errorOutput, "scope ownership cannot be combined with bounded ownership"), "scope/bounded modes must reject every budget and flag order")
+        }
+    }
+    for name in ["enter", "leave", "leave_empty", "move", "poll", "release"] {
+        let symbol = name + "_v1"
+        io.writeTextFile(path + ".min", "function " + symbol + "() { native \"rc_scope\" }\n")
+        let observed = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners"], environment, "", path + ".native", compiler.compileTimeout)
+        test.check(observed.status == 1 && observed.output == "" && test.contains(observed.errorOutput, "native symbol conflicts with scope ownership"), "scope private native symbol must be rejected: " + symbol)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_mixed_scoped_and_legacy_diagnostic_unwind") {
+    let lines = [
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function scopeDiscard(value: Text): Integer {",
+        "let owned = Bytes(value)",
+        "diagnosticDiscard()",
+        "return owned.length",
+        "}",
+        "function wideAbort(job: Job): Integer {"
+    ]
+    for index in 0..260 { lines.add("let value" + Text(index) + " = job.text + Text(" + Text(index) + ")") }
+    for line in ["return scopeDiscard(value259)", "}", "function wideResume(job: Job): Text {"] { lines.add(line) }
+    for index in 0..260 { lines.add("let value" + Text(index) + " = job.text + Text(" + Text(index) + ")") }
+    for line in [
+        "let child = Job { text: value0; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "return value259 + \"/\" + value0",
+        "}",
+        "function diagnosticCompileJob(job: Job) {",
+        "let held = [job.text + \" scoped\"]",
+        "if job.mode == 0 { wideAbort(job) }",
+        "if job.mode == 1 { scopeDiscard(held[0]) }",
+        "if job.mode == 2 { print(wideResume(job)) }",
+        "}",
+        "let saved = Job { text: \"root\" + \"!\"; mode: 0 }",
+        "for index in 0..3 { print(diagnosticRun(saved)) }",
+        "saved.mode = 2",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ] { lines.add(line) }
+    let llvm = executes(compiler, program(lines), "false\nfalse\nfalse\nfalse\nroot!259/root!0\ntrue\nroot!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "scopeDiscard")
+    checkLowered(llvm, "diagnosticCompileJob")
+    for name in ["wideAbort", "wideResume"] {
+        let emitted = body(llvm, name)
+        test.check(test.contains(emitted, "call void @minyar_rc_enter("), "mixed diagnostic fixture must exercise legacy frame " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "wide diagnostic fixture must not partially lower " + name)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_module_state_replay_lowers_cached_owners") {
+    let entry = compiler.directory + "/scope-cache-main.min"
+    io.writeTextFile(compiler.directory + "/scope-cache-owner.min", program([
+        "public function decorated(seed: Text): Text {",
+        "let value = seed + \"!\"",
+        "value = value + \"?\"",
+        "return value",
+        "}"
+    ]))
+    io.writeTextFile(entry, program([
+        "use \"./scope-cache-owner.min\" as owner",
+        "function caller(): Text {",
+        "let retained = owner.decorated(\"cached\")",
+        "return retained",
+        "}",
+        "print(caller())"
+    ]))
+    let previous = compiler.directory + "/scope-cache-empty.state"
+    io.writeTextFile(previous, "")
+    let cold = ""
+    for stage in ["cold", "warm"] {
+        let path = compiler.directory + "/scope-cache-" + stage
+        let command = [compiler.executable, entry, path + ".ll", "--module-state", previous, path + ".state", path + ".stats", "--scope-owners", "--library", "library"]
+        let compiled = test.run(command, environment, "", path + ".compile", compiler.compileTimeout)
+        test.require(compiled, "compile scope module cache " + stage)
+        test.check(compiled.output == "" && compiled.errorOutput == "", "unexpected scope module cache diagnostics " + stage)
+        let fields = test.words(io.readTextFile(path + ".stats"))
+        let reused = 0
+        if stage == "warm" { reused = 2 }
+        test.check(fields.length >= 2 && Integer(fields[0]) == reused && Integer(fields[1]) == 2 - reused, "scope module cache must really reuse both modules on the warm pass")
+        let update = io.readTextFile(path + ".state")
+        if stage == "cold" { test.check(update != "", "scope module cache must produce reusable cold state") }
+        else { test.check(update == "", "unchanged scope module replay must not produce a state delta") }
+        let llvm = executesLLVM(compiler, path, "cached!?\n", environment, ordinary, cycle)
+        checkLowered(llvm, "decorated")
+        checkLowered(llvm, "caller")
+        if stage == "cold" { cold = llvm }
+        else { test.check(llvm == cold, "cold and replayed scope module LLVM must match byte-for-byte") }
+        previous = path + ".state"
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_recoverable_call_depth_cleans_scope_owners") {
+    let llvm = executes(compiler, io.readTextFile("tests/calldepth/ownership.min"), "0\nfresh text\n3\n", environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-calldepth-policy: cooperative-v1-full-program"), "scope recovery fixture must retain cooperative call-depth lowering")
+    checkLowered(llvm, "deepText")
+    test.check(test.contains(body(llvm, "deepText"), "@minyar_recovery_pending("), "scope reference return must preserve the recovery checkpoint")
+}
+
+if fixtures.selected("ScopeOwnership", "test_large_cycle_drains_at_final_scope") {
+    let source = program([
+        "record Link { next: List<Link>; value: Integer }",
+        "let first = Link { next: []; value: 0 }",
+        "let last = first",
+        "for index in 1..512 {",
+        "let node = Link { next: []; value: index }",
+        "last.next.add(node)",
+        "last = node",
+        "}",
+        "last.next.add(first)",
+        "print(first.next[0].value)",
+        "print(last.value)"
+    ])
+    let llvm = executes(compiler, source, "1\n511\n", environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "large ring fixture must select the cycle engine")
+    test.check(test.contains(llvm, "call void @minyar_rc_scope_enter_v1("), "large ring must exercise the final scope drain")
+}
+
+if fixtures.selected("ScopeOwnership", "test_eager_launcher_selects_scope_owners") {
+    let source = compiler.directory + "/scope-launcher.min"
+    io.writeTextFile(source, program([
+        "function owned(value: Text): Text {",
+        "let text = value + \"!\"",
+        "let alias = text",
+        "text = text + \"?\"",
+        "return alias + \"/\" + text",
+        "}",
+        "let original = \"root\" + \".\"",
+        "print(owned(original))",
+        "print(original)"
+    ]))
+    let shim = compiler.directory + "/scope-launch-clang"
+    io.writeTextFile(shim, program([
+        "#!/bin/sh",
+        "set -eu",
+        "for scope_input do",
+        "  case \"$scope_input\" in",
+        "    *.ll)",
+        "      if [ -f \"$scope_input\" ]; then",
+        "        scope_first=",
+        "        IFS= read -r scope_first < \"$scope_input\" || :",
+        "        if [ \"$scope_first\" = '; Generated by the compiler written in Minyar.' ]; then",
+        "          cp \"$scope_input\" \"$SCOPE_LAUNCH_IR\"",
+        "        fi",
+        "      fi",
+        "      ;;",
+        "  esac",
+        "done",
+        "exec \"$SCOPE_LAUNCH_CC\" \"$@\""
+    ]))
+    test.require(test.run(["chmod", "700", shim], environment, "", shim + ".chmod", 10), "make scope launcher capture shim executable")
+    let launchEnvironment = runner.environment(environment, "MINYAR_CLANG", shim)
+    launchEnvironment = runner.environment(launchEnvironment, "SCOPE_LAUNCH_CC", compiler.clang)
+    launchEnvironment = runner.environment(launchEnvironment, "LLVM_CC", compiler.clang)
+    for setting in ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS"] {
+        launchEnvironment = runner.environment(launchEnvironment, setting, "-O2 -Wno-override-module")
+    }
+    let platform = test.run(["uname", "-s"], environment, "", shim + ".platform", 10)
+    test.require(platform, "identify scope launcher linker platform")
+    for profile in ["eager", "system"] {
+        for incremental in [false, true] {
+            for release in [false, true] {
+                let label = profile + "-direct-default"
+                if incremental { label = profile + "-incremental-default" }
+                if release {
+                    label = profile + "-direct-release"
+                    if incremental { label = profile + "-incremental-release" }
+                }
+                let path = compiler.directory + "/launcher-" + label
+                let selectedEnvironment = runner.environment(launchEnvironment, "SCOPE_LAUNCH_IR", path + ".ll")
+                if release && platform.output == "Linux\n" {
+                    // Keep ThinLTO workers inside the existing address-space cap.
+                    selectedEnvironment = runner.environment(selectedEnvironment, "MINYAR_CLANG_FLAGS", "-O2 -Wno-override-module -Wl,--threads=1")
+                }
+                selectedEnvironment = runner.environment(selectedEnvironment, "MINYAR_CACHE_DIR", path + "-cache")
+                selectedEnvironment = runner.environment(selectedEnvironment, "MINYAR_MODULE_CACHE", path + "-modules")
+                let command = ["./minyar", "--memory-profile", profile]
+                if incremental { command.add("--incremental") }
+                if release { command.add("--release") }
+                for item in [source, "-o", path + ".exe"] { command.add(item) }
+                test.require(test.run(command, selectedEnvironment, "", path + ".build", 120), "public scope launcher build " + label)
+                let observed = test.run([path + ".exe"], selectedEnvironment, "", path + ".run", compiler.runTimeout)
+                test.require(observed, "public scope launcher execution " + label)
+                test.check(observed.output == "root.!/root.!?\nroot.\n" && observed.errorOutput == "", "public scope launcher changed alias output " + label + "\n" + observed.output + observed.errorOutput)
+                let llvm = io.readTextFile(path + ".ll")
+                test.check(test.contains(llvm, "; Generated by the compiler written in Minyar.\n"), "public launcher did not pass generated program LLVM to the capture shim " + label)
+                if profile == "eager" { checkLowered(llvm, "owned") }
+                else {
+                    let emitted = body(llvm, "owned")
+                    test.check(!test.contains(emitted, "@minyar_rc_scope_"), "system launcher must retain bounded ownership lowering " + label)
+                    test.check(test.contains(emitted, "call void @minyar_rc_enter(") || test.contains(emitted, "call void @minyar_rc_enter_stack_v1("), "system launcher must retain an ownership frame " + label)
+                }
+            }
+        }
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_plain_borrows_share_local_and_return_owners") {
+    let source = program([
+        "record Box { text: Text; values: List<Integer> }",
+        "function selected(box: Box): Text { return box.text }",
+        "function listLength(box: Box): Integer {",
+        "let held = box.values",
+        "return held.length",
+        "}",
+        "function projected(box: Box): Text {",
+        "let alias = box.text",
+        "box.text = box.text + \"?\"",
+        "return alias",
+        "}",
+        "function replace(box: Box): Text { box.text = \"after\"; return \"!\" }",
+        "function combined(value: Text, suffix: Text): Text { return value + suffix }",
+        "function separated(box: Box): Text { return combined(box.text, replace(box)) }",
+        "let box = Box { text: \"seed\" + \"!\"; values: [3, 7] }",
+        "print(selected(box))",
+        "print(listLength(box))",
+        "print(projected(box))",
+        "print(box.text)",
+        "print(separated(box))",
+        "print(box.text)"
+    ])
+    let llvm = executes(compiler, source, "seed!\n2\nseed!\nseed!?\nseed!?!\nafter\n", environment, ordinary, cycle)
+    for name in ["selected", "listLength", "projected", "separated"] { checkLowered(llvm, name) }
+    let returned = body(llvm, "selected")
+    checkEmptyScope(returned, "direct borrowed return must keep only its return owner")
+    test.check(test.contains(returned, "call void @minyar_rc_retain("), "direct borrowed return must retain its lasting owner")
+    test.check(test.contains(returned, "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_empty_v1()"), "coalesced return must retain cleanup progress")
+    test.check(!test.contains(returned, "call void @minyar_rc_scope_release_v1("), "direct borrowed return must omit a redundant temporary release")
+    test.check(test.contains(body(llvm, "listLength"), "%rc.scope.cells = alloca [1 x ptr]"), "plain projection must keep its local owner without a temporary cell")
+    let traced = executes(compiler, program([
+        "record Link { edges: List<Link> }",
+        "function tracedAlias(value: Link): List<Link> {",
+        "let edges = value.edges",
+        "return edges",
+        "}",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "print(tracedAlias(node).length)"
+    ]), "1\n", environment, ordinary, cycle)
+    let tracedBody = body(traced, "tracedAlias")
+    test.check(test.contains(tracedBody, "%rc.scope.cells = alloca [2 x ptr]"), "traced projection must retain both local and temporary cells")
+    test.check(test.contains(tracedBody, "call void @minyar_rc_retain_traced("), "traced projection must keep its retain barrier")
+    let progress = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Link { edges: List<Link> }",
+        "function scopeArmBorrow(box: Box): Box { native \"runtime\" }",
+        "function scopeBorrowProgress(value: Text): Integer { native \"runtime\" }",
+        "function returned(box: Box): Text { return box.text }",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "let box = Box { text: \"service\" + \"!\" }",
+        "print(scopeBorrowProgress(returned(scopeArmBorrow(box))))",
+        "print(box.text)"
+    ]), "1\nservice!\n", environment, ordinary, cycle)
+    let progressBody = body(progress, "returned")
+    checkEmptyScope(progressBody, "pending-work probe must exercise a return with no temporary cells")
+    let parts = progress.split(progressBody)
+    test.check(parts.length == 2, "pending-work mutation must identify exactly one return body")
+    let withoutPoll = joinText(progressBody.split("  call void @minyar_rc_scope_poll_v1()\n"))
+    test.check(withoutPoll != progressBody, "pending-work mutation must remove the return poll")
+    let mutant = parts[0] + withoutPoll + parts[1]
+    if test.addressEnabled(compiler.flags) { mutant = test.instrument(mutant) }
+    let path = compiler.directory + "/missing-return-poll"
+    io.writeTextFile(path + ".ll", mutant)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", cycle, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link pending-work mutation " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.check(observed.status == 73 && test.contains(observed.errorOutput, "scope return did not service pending cycles"), "missing return poll must fail the pending-cycle oracle " + optimization + "\n" + observed.output + observed.errorOutput)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_comparison_borrows_have_no_later_uses") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "function matches(box: Box): Boolean { return \"seed!\" == box.text }",
+        "function matchesLeft(box: Box): Boolean { return box.text == \"seed!\" }",
+        "function listMatches(values: List<Text>): Boolean { return \"seed!\" == values[0] }",
+        "function alternate(box: Box, take: Boolean): Boolean {",
+        "if take { return \"seed!\" == box.text }",
+        "return false",
+        "}",
+        "function mixed(box: Box, early: Boolean): Text {",
+        "if early { if \"seed!\" == box.text { return box.text } }",
+        "return box.text",
+        "}",
+        "function replacedAfter(box: Box): Boolean {",
+        "let same = \"seed!\" == box.text",
+        "box.text = \"changed\"",
+        "return same",
+        "}",
+        "function replace(box: Box): Text { box.text = \"changed\"; return \"seed!\" }",
+        "function separated(box: Box): Boolean { return box.text == replace(box) }",
+        "function repeated(box: Box): Integer {",
+        "let count = 0",
+        "for index in 0..4 {",
+        "if \"seed!\" == box.text { count += 1; continue }",
+        "if index == 3 { break }",
+        "}",
+        "return count",
+        "}",
+        "let box = Box { text: \"seed\" + \"!\" }",
+        "print(matches(box))",
+        "print(matchesLeft(box))",
+        "print(listMatches([box.text]))",
+        "print(alternate(box, true))",
+        "print(alternate(box, false))",
+        "print(mixed(box, true))",
+        "print(mixed(box, false))",
+        "print(repeated(box))",
+        "print(replacedAfter(box))",
+        "print(box.text)",
+        "box.text = \"seed\" + \"!\"",
+        "print(separated(box))",
+        "print(box.text)"
+    ]), "true\ntrue\ntrue\ntrue\nfalse\nseed!\nseed!\n4\ntrue\nchanged\ntrue\nchanged\n", environment, ordinary, cycle)
+    for name in ["matches", "matchesLeft", "listMatches", "alternate", "replacedAfter", "repeated"] {
+        checkLowered(llvm, name)
+        let emitted = body(llvm, name)
+        checkEmptyScope(emitted, "comparison-only projection must not acquire a temporary owner in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "comparison-only projection must omit its redundant retain in " + name)
+        test.check(test.contains(emitted, "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_empty_v1()"), "comparison return must service pending work in " + name)
+    }
+    let exitPoll = "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_empty_v1()"
+    test.check(body(llvm, "alternate").split(exitPoll).length == 3, "both exits must poll, including the path that skips comparison")
+    let mixed = body(llvm, "mixed")
+    checkEmptyScope(mixed, "comparison and borrowed-return coalescing must combine without temporary cells")
+    test.check(mixed.split("call void @minyar_rc_retain(").length == 3 && mixed.split(exitPoll).length == 3, "both mixed reference returns must retain their result and poll")
+    test.check(test.contains(body(llvm, "separated"), "call void @minyar_rc_retain("), "mutating later argument must keep the earlier comparison operand alive")
+    let progress = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Link { edges: List<Link> }",
+        "function scopeArmBorrow(box: Box): Box { native \"runtime\" }",
+        "function scopeCompareProgress(value: Boolean): Integer { native \"runtime\" }",
+        "function compared(box: Box): Boolean { return \"service!\" == box.text }",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "let box = Box { text: \"service\" + \"!\" }",
+        "print(scopeCompareProgress(compared(scopeArmBorrow(box))))",
+        "print(box.text)"
+    ]), "1\nservice!\n", environment, ordinary, cycle)
+    let progressBody = body(progress, "compared")
+    checkEmptyScope(progressBody, "comparison pending-work probe must use no temporary cells")
+    let parts = progress.split(progressBody)
+    test.check(parts.length == 2, "comparison mutation must identify exactly one body")
+    let withoutPoll = joinText(progressBody.split("  call void @minyar_rc_scope_poll_v1()\n"))
+    test.check(withoutPoll != progressBody, "comparison mutation must remove its return poll")
+    let mutant = parts[0] + withoutPoll + parts[1]
+    if test.addressEnabled(compiler.flags) { mutant = test.instrument(mutant) }
+    let path = compiler.directory + "/missing-comparison-poll"
+    io.writeTextFile(path + ".ll", mutant)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", cycle, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link comparison pending-work mutation " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.check(observed.status == 73 && test.contains(observed.errorOutput, "scope return did not service pending cycles"), "missing comparison poll must fail the pending-cycle oracle " + optimization + "\n" + observed.output + observed.errorOutput)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_comparison_borrow_ssa_boundaries") {
+    // Execute the real lowering and symbol index on deliberately varied LLVM.
+    // These patterns exercise lifetime forms the current emitter never emits.
+    let patterns: List<Text> = []
+    let expectedCells = [0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0]
+    for index in 0..expectedCells.length {
+        let resultType = "i1"
+        if index >= 9 { resultType = "ptr" }
+        if index == 14 { resultType = "i64" }
+        let lines = ["define " + resultType + " @.minyar.fn.probe" + Text(index) + "(ptr %box, ptr %other) {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+        if index == 8 { lines.add("  %value.10 = select i1 true, ptr %other, ptr %box") }
+        let getter = "@minyar_record_get"
+        if index == 1 { getter = "@.minyar.list.get.checked" }
+        lines.add("  %raw = call i64 " + getter + "(ptr %box, i64 0)")
+        lines.add("  %value.1 = inttoptr i64 %raw to ptr")
+        let borrow = "borrow"
+        if index == 7 { borrow = "borrow_traced" }
+        lines.add("  call void @minyar_rc_" + borrow + "(ptr %value.1)")
+        if index == 4 { lines.add("  call void @mutate(ptr %box)") }
+        if index >= 9 {
+            let helper = "ptr @minyar_join_text"
+            if index >= 11 && index <= 13 { helper = "ptr @minyar_join_text_take_left" }
+            if index == 14 { helper = "i64 @minyar_text_find" }
+            let left = "%other"
+            let right = "%value.1"
+            if index == 9 || index == 12 || index == 14 { left = "%value.1"; right = "%other" }
+            if index == 13 { left = "%value.1" }
+            lines.add("  %equal = call " + helper + "(ptr " + left + ", ptr " + right + ")")
+        } else if index == 6 { lines.add("  %equal = call zeroext i1 @other() ; = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %value.1)") }
+        else {
+            let other = "%other"
+            if index == 1 { other = "%value.1" }
+            lines.add("  %equal = call zeroext i1 @minyar_texts_are_equal(ptr " + other + ", ptr %value.1)")
+        }
+        if index == 2 { lines.add("  call void @observe(ptr %value.1)") }
+        if index == 3 {
+            lines.add("  %later = inttoptr i64 %raw to ptr")
+            lines.add("  call void @observe(ptr %later)")
+        }
+        if index == 5 { lines.add("  call void @observe(ptr %\"value.1\")") }
+        if index == 8 { lines.add("  call void @observe(ptr %value.10)") }
+        for line in ["  call void @minyar_rc_leave()", "  ret " + resultType + " %equal", "}"] { lines.add(line) }
+        patterns.add(program(lines))
+    }
+    let wide = test.replace(patterns[0], "@.minyar.fn.probe0(", "@.minyar.fn.wide(")
+    wide = test.replace(wide, "@minyar_rc_enter(i64 0)", "@minyar_rc_enter(i64 257)")
+    patterns.add(wide)
+    let looping = test.replace(patterns[0], "@.minyar.fn.probe0(", "@.minyar.fn.looping(")
+    looping = test.replace(looping, "  call void @minyar_rc_leave()\n  ret i1 %equal", "  call void @minyar_rc_keep(ptr null)\n  br label %entry")
+    patterns.add(looping)
+    let input = compiler.directory + "/comparison-patterns.ll"
+    let output = compiler.directory + "/comparison-lowered.ll"
+    io.writeTextFile(input, joinText(patterns))
+    let symbols = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = symbols.slice(symbols.find("function declarationHash("), symbols.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program([
+        "function failCompiler(message: Text) { fail(message) }",
+        "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))",
+        "print(\"patterns passed\")"
+    ])
+    executes(compiler, harness, "patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    for index in 0..expectedCells.length {
+        let emitted = body(lowered, "probe" + Text(index))
+        checkScopeCells(emitted, expectedCells[index], "comparison SSA boundary mismatch " + Text(index))
+        if index == 7 { test.check(test.contains(emitted, "@minyar_rc_retain_traced("), "traced comparison must keep its barrier") }
+    }
+    test.check(body(lowered, "wide") == body(wide, "wide"), "raw cell cap must preserve the complete original body")
+    test.check(body(lowered, "looping") == body(looping, "looping"), "failed CFG proof after coalescing must preserve the complete original body")
+}
+
+if fixtures.selected("ScopeOwnership", "test_allocating_text_read_borrows_keep_parent_owners") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "function selected(box: Box): Text { return box.text }",
+        "function joinedLeft(box: Box): Text { return box.text + \"!\" }",
+        "function joinedRight(box: Box): Text { return \"[\" + box.text }",
+        "function joinedTake(box: Box): Text { return (\"prefix\" + \"!\") + box.text }",
+        "function aliasJoined(box: Box): Text { return selected(box) + box.text }",
+        "function searched(values: List<Text>): Integer { return values[0].find(\"l\") }",
+        "function replace(box: Box): Text { box.text = \"changed\"; return \"seed!\" }",
+        "function separated(box: Box): Text { return box.text + replace(box) }",
+        "let box = Box { text: \"seed\" + \"!\" }",
+        "print(joinedLeft(box))",
+        "print(joinedRight(box))",
+        "print(joinedTake(box))",
+        "print(aliasJoined(box))",
+        "print(box.text)",
+        "print(searched([\"h\" + \"éllo\"]))",
+        "print(separated(box))",
+        "print(box.text)"
+    ]), "seed!!\n[seed!\nprefix!seed!\nseed!seed!\nseed!\n2\nseed!seed!\nchanged\n", environment, ordinary, cycle)
+    for name in ["joinedLeft", "joinedRight", "joinedTake", "aliasJoined", "searched"] {
+        let emitted = body(llvm, name)
+        checkLowered(llvm, name)
+        checkEmptyScope(emitted, "single-use text helper operand must borrow its parent owner in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "single-use text helper operand must omit its redundant retain in " + name)
+    }
+    for name in ["joinedTake", "aliasJoined"] { test.check(test.contains(body(llvm, name), "call ptr @minyar_join_text_take_left("), "borrowed-right fixture must really consume its independent left result") }
+    test.check(test.contains(body(llvm, "separated"), "call void @minyar_rc_retain("), "mutating later join argument must preserve the earlier borrowed text")
+    executes(compiler, program([
+        "record Graph { text: Text; edges: List<Graph> }",
+        "function scopeArmBorrow(value: Graph): Graph { native \"runtime\" }",
+        "function scopeBorrowProgress(value: Text): Integer { native \"runtime\" }",
+        "function joined(value: Graph): Text { return value.text + \"!\" }",
+        "let graph = Graph { text: \"cycle\" + \"!\"; edges: [] }",
+        "graph.edges.add(graph)",
+        "print(scopeBorrowProgress(joined(scopeArmBorrow(graph))))",
+        "print(graph.text)"
+    ]), "1\ncycle!\n", environment, ordinary, cycle)
+    for budget in [1, 32] {
+        let boundedOrdinary = buildRuntimeWithBudget(compiler, false, environment, budget)
+        let boundedCycle = buildRuntimeWithBudget(compiler, true, environment, budget)
+        let source = "function scopeJoinAllocation(): Integer { native \"runtime\" }\nprint(scopeJoinAllocation())\n"
+        executes(compiler, source, "1\n", environment, boundedOrdinary, boundedCycle)
+        source = program([
+            "record Graph { edges: List<Graph> }",
+            "function scopeJoinAllocation(): Integer { native \"runtime\" }",
+            "function cycleType(value: Graph): Integer { return value.edges.length }",
+            "print(scopeJoinAllocation())"
+        ])
+        // The unused function selects the cycle engine without allocating an
+        // unrelated live language graph during the native cleanup assertion.
+        executes(compiler, source, "1\n", environment, boundedOrdinary, boundedCycle)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_composition_cycle_scope_owners") {
+    let source = io.readTextFile("tests/choice-composition-cycle.min")
+    let expected = io.readTextFile("tests/choice-composition-cycle.expected")
+    let llvm = executes(compiler, source, expected, environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "choice composition must select the cycle engine")
+    checkLowered(llvm, "propagateTone")
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_container_niche_scope_owners") {
+    let source = io.readTextFile("tests/choice-container-niche.min") + "\n" + program([
+        "function scopedChoiceListCycle(): Integer {",
+        "let links: List<Chain> = []",
+        "let chain: Chain = Link(links)",
+        "links.add(chain)",
+        "let saved = chain",
+        "chain = End",
+        "links.add(End)",
+        "links[1] = saved",
+        "return chainLength(saved)",
+        "}",
+        "print(scopedChoiceListCycle())"
+    ])
+    let expected = io.readTextFile("tests/choice-container-niche.expected") + "2\n"
+    let llvm = executes(compiler, source, expected, environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "choice container fixture must select the cycle engine")
+    checkLowered(llvm, "viewBytes")
+    checkLowered(llvm, "scopedChoiceListCycle")
+}
+
+if fixtures.selected("ScopeOwnership", "test_choice_scalar_niche_scope_owners") {
+    let source = io.readTextFile("tests/choice-scalar-niche-bench.min")
+    let llvm = executes(compiler, source, "19999\n250000\n", environment, ordinary, cycle)
+    for name in ["choiceScalarBool", "choiceScalarEnum"] {
+        test.check(test.contains(llvm, "i64 @.minyar.fn." + name + "(i64 %argument.0)"), "scalar niche choice ABI must remain i64: " + name)
+    }
+    for line in test.lines(test.withoutRuntimeHelpers(llvm)) {
+        if test.contains(line, "call ") {
+            test.check(!test.contains(line, "@minyar_rc_"), "scalar niche benchmark emitted an ownership call: " + line)
+            for operation in ["@minyar_record_new(", "@minyar_record_get(", "@minyar_record_set(", "@.minyar.record.get.checked(", "@.minyar.record.set.scalar.checked("] {
+                test.check(!test.contains(line, operation), "scalar niche benchmark emitted record traffic: " + line)
+            }
+        }
+    }
+    test.check(test.contains(llvm, "zext i1 ") && test.contains(llvm, " to i64") && test.contains(llvm, " to i1"), "Boolean payload projection must retain i1")
+    test.check(!test.contains(llvm, " = inttoptr i64 ") && !test.contains(llvm, " = ptrtoint ptr "), "scalar niche benchmark used pointer conversions")
+}
+
+if fixtures.selected("ScopeOwnership", "test_temporary_cells_reuse_only_disjoint_cfg_ranges") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Graph { edges: List<Graph> }",
+        "function sequential(value: Text): Integer { print(value + \"!\"); print(value + \"?\"); return 0 }",
+        "function branchLoop(box: Box, left: Boolean): Integer {",
+        "let alias = box.text",
+        "if left { print(alias + \"L\") } else { print(alias + \"R\") }",
+        "let index = 0",
+        "while index < 4 {",
+        "index += 1",
+        "if index == 2 { continue }",
+        "print(alias + Text(index))",
+        "if index == 3 { break }",
+        "}",
+        "box.text = \"changed\"",
+        "print(alias)",
+        "return index",
+        "}",
+        "function observeGraph(edges: List<Graph>): Integer { return edges.length }",
+        "function graphReads(value: Graph): Integer {",
+        "let edges = value.edges",
+        "print(edges.length)",
+        "print(observeGraph(value.edges))",
+        "return edges.length",
+        "}",
+        "let original = \"root\" + \".\"",
+        "let alias = original",
+        "print(sequential(original))",
+        "print(alias)",
+        "let box = Box { text: \"branch\" + \"!\" }",
+        "print(branchLoop(box, true))",
+        "print(box.text)",
+        "box.text = \"else\" + \"!\"",
+        "print(branchLoop(box, false))",
+        "print(box.text)",
+        "let graph = Graph { edges: [] }",
+        "graph.edges.add(graph)",
+        "print(graphReads(graph))"
+    ]), "root.!\nroot.?\n0\nroot.\nbranch!L\nbranch!1\nbranch!3\nbranch!\n3\nchanged\nelse!R\nelse!1\nelse!3\nelse!\n3\nchanged\n1\n1\n1\n", environment, ordinary, cycle)
+    for name in ["sequential", "branchLoop", "graphReads"] { checkLowered(llvm, name) }
+    let sequential = body(llvm, "sequential")
+    test.check(test.contains(sequential, "%rc.scope.cells = alloca [1 x ptr]"), "two disjoint statement results must reuse one temporary cell")
+    test.check(sequential.split("call void @minyar_rc_scope_release_v1(").length == 3, "both sequential result drops must remain after coloring")
+    test.check(sequential.split("call void @minyar_rc_scope_poll_v1()").length == 3, "both sequential statement polls must remain after coloring")
+    test.check(body(llvm, "graphReads").split("call void @minyar_rc_retain_traced(").length == 4, "traced temporary/local acquisitions must all keep their barriers")
+
+    executes(compiler, program([
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function touch(value: Text): Integer { return value.length }",
+        "function discard(value: Text): Integer { diagnosticDiscard(); return value.length }",
+        "function diagnosticCompileJob(job: Job) {",
+        "touch(job.text + \" first\")",
+        "if job.mode == 0 { discard(job.text + \" early\") }",
+        "touch(job.text + \" second\")",
+        "if job.mode == 1 { discard(job.text + \" late\") }",
+        "if job.mode == 2 {",
+        "let child = Job { text: \"child\" + \"!\"; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "diagnosticDiscard()",
+        "}",
+        "}",
+        "let saved = Job { text: \"safe\" + \"!\"; mode: 3 }",
+        "for index in 0..3 { print(diagnosticRun(Job { text: \"lost\" + Text(index); mode: index })) }",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ]), "false\nfalse\nfalse\nfalse\ntrue\nsafe!\n", environment, ordinary, cycle)
+
+    // Run the real CFG walk and emitter on ownership IR whose expected
+    // intervals are independent of current source expression lowering.
+    let patterns: List<Text> = []
+    let patternNames = ["cellSequential", "cellBranches", "cellShared", "cellBackward", "cellLoop", "cellPhantom", "cellGap"]
+    let expectedCells = [2, 1, 2, 2, 1, 2, 1]
+    let expectedDrops = [4, 2, 2, 2, 2, 2, 2]
+    let expectedPolls = [2, 2, 1, 2, 2, 1, 4]
+    patterns.add(program([
+        "define void @.minyar.fn.cellSequential(ptr %held, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 1)",
+        "  call void @minyar_rc_local(i64 0, ptr %held)",
+        "  call void @minyar_rc_borrow(ptr %a)", "  call void @observe(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_borrow_traced(ptr %b)", "  call void @observe(ptr %b)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellBranches(i1 %left, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br i1 %left, label %yes, label %no",
+        "yes:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()", "  br label %done",
+        "no:", "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %done",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellShared(i1 %left, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_keep(ptr %a)",
+        "  br i1 %left, label %yes, label %no",
+        "yes:", "  call void @minyar_rc_keep(ptr %b)", "  br label %join",
+        "no:", "  call void @observe(ptr %a)", "  br label %join",
+        "join:", "  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellBackward(ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br label %first",
+        "back:", "  call void @observe(ptr %b)", "  br label %finish",
+        "first:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()", "  br label %second",
+        "second:", "  call void @minyar_rc_keep(ptr %b)", "  br label %back",
+        "finish:", "  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellLoop(i1 %stop, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  br label %loop",
+        "loop:", "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  br i1 %stop, label %done, label %again",
+        "again:", "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %loop",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellPhantom(i1 %stop, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_keep(ptr %a)", "  br label %frontier",
+        "frontier:", "  call void @minyar_rc_step()", "  br i1 %stop, label %done, label %again",
+        "again:", "  call void @minyar_rc_keep(ptr %b)", "  br label %frontier",
+        "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    patterns.add(program([
+        "define void @.minyar.fn.cellGap(ptr %box, ptr %other, ptr %a, ptr %b) {", "entry:",
+        "  call void @minyar_rc_enter(i64 0)",
+        "  %raw = call i64 @minyar_record_get(ptr %box, i64 0)", "  %projected = inttoptr i64 %raw to ptr",
+        "  call void @minyar_rc_borrow(ptr %projected)",
+        "  %same = call zeroext i1 @minyar_texts_are_equal(ptr %other, ptr %projected)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_borrow_traced(ptr %b)", "  call void @observe(ptr %b)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_leave()", "  ret void", "}"
+    ]))
+    let wideLines = ["define void @.minyar.fn.cellWide() {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+    for index in 0..257 {
+        wideLines.add("  call void @minyar_rc_keep(ptr null)")
+        wideLines.add("  call void @minyar_rc_step()")
+    }
+    for line in ["  call void @minyar_rc_leave()", "  ret void", "}"] { wideLines.add(line) }
+    let wide = program(wideLines)
+    patterns.add(wide)
+    let repeated = program([
+        "define void @.minyar.fn.cellRepeated(ptr %a) {", "entry:", "  call void @minyar_rc_enter(i64 0)", "  br label %spin",
+        "spin:", "  call void @minyar_rc_keep(ptr %a)", "  br label %spin", "}"
+    ])
+    patterns.add(repeated)
+    let rejected = program([
+        "define void @.minyar.fn.cellRejected(ptr %a, ptr %b, ptr %c) {", "entry:", "  call void @minyar_rc_enter(i64 0)",
+        "  call void @minyar_rc_keep(ptr %a)", "  call void @minyar_rc_step()",
+        "  call void @minyar_rc_keep(ptr %b)", "  call void @minyar_rc_step()", "  br label %spin",
+        "spin:", "  call void @minyar_rc_keep(ptr %c)", "  br label %spin", "}"
+    ])
+    patterns.add(rejected)
+    let input = compiler.directory + "/cell-patterns.ll"
+    let output = compiler.directory + "/cell-lowered.ll"
+    io.writeTextFile(input, joinText(patterns))
+    let symbols = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = symbols.slice(symbols.find("function declarationHash("), symbols.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program([
+        "function failCompiler(message: Text) { fail(message) }",
+        "let touching = scopeBody([\"  call void @minyar_rc_enter(i64 0)\", \"  call void @minyar_rc_keep(ptr %a)\", \"  call void @minyar_rc_step()\", \"  call void @minyar_rc_keep(ptr %b)\", \"  call void @minyar_rc_step()\"])",
+        "if !scopeCleanupPaths(touching) { fail(\"touching range fixture rejected\") }",
+        "touching.firsts[1] = touching.lasts[0]",
+        "if scopeReuseCells(touching) != 2 { fail(\"equal inclusive endpoints must not share a color\") }",
+        "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))",
+        "print(\"cell patterns passed\")"
+    ])
+    executes(compiler, harness, "cell patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    for index in 0..patternNames.length {
+        let emitted = body(lowered, patternNames[index])
+        checkScopeCells(emitted, expectedCells[index], "CFG interval cell count " + patternNames[index])
+        test.check(emitted.split("call void @minyar_rc_scope_release_v1(").length == expectedDrops[index] + 1, "every original logical drop must survive " + patternNames[index])
+        test.check(emitted.split("call void @minyar_rc_scope_poll_v1()").length == expectedPolls[index] + 1, "every original poll must survive " + patternNames[index])
+    }
+    let mixed = body(lowered, "cellSequential")
+    for name in ["%a", "%b"] { test.check(test.contains(mixed, "store ptr " + name + ", ptr %rc.scope.slot.1"), "temporary color must be offset beyond unchanged local owners") }
+    test.check(test.contains(mixed, "store ptr %held, ptr %rc.scope.slot.0"), "local owner must never be colored with temporaries")
+    test.check(mixed.split("call void @minyar_rc_retain(ptr ").length == 3 && mixed.split("call void @minyar_rc_retain_traced(ptr ").length == 2, "coloring must preserve plain and traced acquisitions")
+    for name in ["cellShared", "cellPhantom"] {
+        let releases: List<Text> = []
+        for line in test.lines(body(lowered, name)) { if test.contains(line, "call void @minyar_rc_scope_release_v1(") { releases.add(line) } }
+        test.check(releases.length == 2, "shared frontier must keep two distinct releases")
+        test.check(releases[0].slice(releases[0].length - 3, releases[0].length) == ".1)" && releases[1].slice(releases[1].length - 3, releases[1].length) == ".0)", "shared/phantom cleanup order must remain reverse logical producer order")
+    }
+    test.check(test.contains(body(lowered, "cellGap"), "call void @minyar_rc_retain_traced(ptr %b)"), "post-coalescer producer gaps must keep traced barriers")
+    test.check(test.contains(body(lowered, "cellGap"), "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_v1("), "post-coalescer op13 return must keep service")
+    test.check(body(lowered, "cellWide") == body(wide, "cellWide"), "257 raw disjoint producers must retain original fallback despite fitting one color")
+    test.check(body(lowered, "cellRepeated") == body(repeated, "cellRepeated"), "a producer repeated before cleanup must retain original fallback")
+    test.check(body(lowered, "cellRejected") == body(rejected, "cellRejected"), "late CFG failure must restore the complete original colorable prefix")
+}
+
+if fixtures.selected("ScopeOwnership", "test_projected_borrows_publish_one_lasting_owner") {
+    let llvm = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Pair { first: Text; second: Text }",
+        "record Graph { edges: List<Graph> }",
+        "function replaceField(destination: Box, source: Box) { destination.text = source.text }",
+        "function buildPair(source: Box): Pair { return Pair { first: source.text; second: source.text } }",
+        "function replaceList(destination: List<Text>, source: List<Text>) { destination[0] = source[0] }",
+        "function appendText(destination: List<Text>, source: List<Text>) { destination.add(source[0]) }",
+        "function growSelf(values: List<Text>) { for index in 0..40 { values.add(values[0]) } }",
+        "function publishBranch(destination: List<Text>, source: List<Text>, enabled: Boolean): Integer {",
+        "if !enabled { return 0 }",
+        "destination.add(source[0])",
+        "return 1",
+        "}",
+        "function change(box: Box): Text { box.text = \"after!\"; return box.text }",
+        "function publishPair(first: Text, second: Text, destination: List<Text>) { destination.add(first); destination.add(second) }",
+        "function delayed(box: Box, destination: List<Text>) { publishPair(box.text, change(box), destination) }",
+        "function publishTraced(destination: List<List<Graph>>, source: Graph) { destination.add(source.edges) }",
+        "function scalarControl(values: List<Integer>) { values[0] = values[1]; values.add(values[0]) }",
+        "let source = Box { text: \"seed\" + \"!\" }",
+        "let destination = Box { text: \"old\" + \"!\" }",
+        "replaceField(destination, source)",
+        "replaceField(source, source)",
+        "let pair = buildPair(source)",
+        "let values = [source.text]",
+        "let output = [\"old\"]",
+        "replaceList(output, values)",
+        "appendText(output, values)",
+        "growSelf(values)",
+        "source.text = \"changed\"",
+        "values[0] = \"replaced\"",
+        "print(destination.text)",
+        "print(pair.first)",
+        "print(pair.second)",
+        "print(output[0])",
+        "print(output[1])",
+        "print(values[1])",
+        "print(values.length)",
+        "print(source.text)",
+        "print(values[0])",
+        "let later = Box { text: \"before\" + \"!\" }",
+        "let effects: List<Text> = []",
+        "delayed(later, effects)",
+        "print(effects[0])",
+        "print(effects[1])",
+        "print(later.text)",
+        "let branches: List<Text> = []",
+        "print(publishBranch(branches, values, false))",
+        "print(publishBranch(branches, values, true))",
+        "print(branches[0])",
+        "let graph = Graph { edges: [] }",
+        "graph.edges.add(graph)",
+        "let graphs: List<List<Graph>> = []",
+        "publishTraced(graphs, graph)",
+        "print(graphs[0].length)",
+        "let numbers = [1, 2]",
+        "scalarControl(numbers)",
+        "print(numbers[0])",
+        "print(numbers.length)"
+    ]), "seed!\nseed!\nseed!\nseed!\nseed!\nseed!\n41\nchanged\nreplaced\nbefore!\nafter!\nafter!\n0\n1\nreplaced\n1\n2\n3\n", environment, ordinary, cycle)
+    let replaced = body(llvm, "replaceField")
+    checkEmptyScope(replaced, "record publication must keep its real publisher owner without a redundant borrow cell")
+    for name in ["replaceField", "replaceList", "appendText", "growSelf", "publishBranch"] {
+        checkLowered(llvm, name)
+        let emitted = body(llvm, name)
+        checkEmptyScope(emitted, "publisher-only projection must need no temporary cell in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_retain("), "publisher must keep its own retain instead of a caller temporary retain in " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_scope_release_v1("), "publisher-only projection must omit only its redundant temporary drop in " + name)
+    }
+    test.check(test.contains(replaced, "call void @minyar_record_replace(") && test.contains(replaced, ", i64 0)"), "record publisher and literal retaining flag must remain")
+    test.check(body(llvm, "buildPair").split("call void @minyar_record_set_reference(").length == 3, "both constructor field publishers must remain")
+    test.check(!test.contains(body(llvm, "buildPair"), "call void @minyar_rc_retain("), "constructor field borrows must defer to both real publisher retains")
+    test.check(body(llvm, "replaceList").split("call void @minyar_list_set(").length == 2, "reference List replacement must remain")
+    for name in ["appendText", "growSelf", "publishBranch"] { test.check(body(llvm, name).split("call void @minyar_list_add(").length == 2, "reference List publisher must remain in " + name) }
+    let exitPoll = "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_empty_v1()"
+    test.check(body(llvm, "publishBranch").split(exitPoll).length == 3, "both publisher-affected exits must poll, including the bypassed branch")
+    test.check(test.contains(body(llvm, "delayed"), "call void @minyar_rc_retain("), "mutating later RHS evaluation must preserve the earlier argument owner")
+    test.check(test.contains(body(llvm, "publishTraced"), "call void @minyar_rc_retain_traced(") && test.contains(body(llvm, "publishTraced"), "call void @minyar_list_add_traced("), "traced projection and publisher barriers must remain")
+    test.check(test.contains(body(llvm, "scalarControl"), "@.minyar.list.set.scalar.checked("), "scalar destinations must keep their scalar frontend path")
+
+    // Exact symbol/position/SSA controls; generic List C calls here represent
+    // canonical reference destinations, never pointer bits in scalar Lists.
+    let patterns: List<Text> = []
+    let publishers: List<Text> = []
+    let expectedCells = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1]
+    for index in 0..expectedCells.length {
+        let lines = ["define void @.minyar.fn.publishProbe" + Text(index) + "(ptr %source, ptr %destination, i64 %flag) {", "entry:", "  call void @minyar_rc_enter(i64 0)"]
+        let getter = "@minyar_record_get"
+        if index == 2 || index == 3 { getter = "@.minyar.list.get.checked" }
+        lines.add("  %raw = call i64 " + getter + "(ptr %source, i64 0)")
+        lines.add("  %value.1 = inttoptr i64 %raw to ptr")
+        let borrow = "borrow"
+        if index == 13 { borrow = "borrow_traced" }
+        lines.add("  call void @minyar_rc_" + borrow + "(ptr %value.1)")
+        if index == 7 { lines.add("  call void @mutate(ptr %source)") }
+        lines.add("  %packed.1 = ptrtoint ptr %value.1 to i64")
+        let publisher = "  call void @minyar_record_replace(ptr %destination, i64 0, i64 %packed.1, i64 0)"
+        if index == 1 { publisher = "  call void @minyar_record_set_reference(ptr %destination, i64 0, i64 %packed.1)" }
+        if index == 2 { publisher = "  call void @minyar_list_set(ptr %destination, i64 0, i64 %packed.1)" }
+        if index == 3 { publisher = "  call void @minyar_list_add(ptr %destination, i64 %packed.1)" }
+        if index == 8 { publisher = "  call void @minyar_record_replace(ptr %destination, i64 0, i64 %packed.1, i64 1)" }
+        if index == 9 { publisher = "  call void @minyar_record_replace(ptr %destination, i64 0, i64 %packed.1, i64 %flag)" }
+        if index == 10 { publisher = "  call void @minyar_record_set_scalar(ptr %destination, i64 0, i64 %packed.1)" }
+        if index == 11 { publisher = "  call void @minyar_list_add_take(ptr %destination, i64 %packed.1)" }
+        if index == 12 { publisher = "  call void @minyar_list_set_take(ptr %destination, i64 0, i64 %packed.1)" }
+        if index == 14 { publisher = "  call void @minyar_list_set(ptr %destination, i64 %packed.1, i64 0)" }
+        if index == 15 { publisher = "  call void @minyar_list_set(ptr %destination, i64 %packed.1, i64 %packed.1)" }
+        if index == 17 { publisher = "  call void @.minyar.list.set.scalar.checked(ptr %destination, i64 0, i64 %packed.1)" }
+        if index == 19 { lines.add("  br label %publish"); lines.add("publish:") }
+        lines.add(publisher)
+        publishers.add(publisher)
+        if index == 4 { lines.add("  call void @observe_word(i64 %packed.1)") }
+        if index == 5 { lines.add("  %later = inttoptr i64 %raw to ptr") }
+        if index == 6 { lines.add("  call void @observe(ptr %value.1)") }
+        if index == 16 { lines.add("  %packed.10 = add i64 0, 0"); lines.add("  call void @observe_word(i64 %packed.10)") }
+        if index == 18 { lines.add("  call void @observe_word(i64 %\"packed.1\")") }
+        for line in ["  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"] { lines.add(line) }
+        patterns.add(program(lines))
+    }
+    let branch = program([
+        "define void @.minyar.fn.publishBranchProbe(i1 %enabled, ptr %source, ptr %destination) {", "entry:", "  call void @minyar_rc_enter(i64 0)",
+        "  br i1 %enabled, label %publish, label %skip", "skip:", "  call void @minyar_rc_leave()", "  ret void", "publish:",
+        "  %raw = call i64 @minyar_record_get(ptr %source, i64 0)", "  %value = inttoptr i64 %raw to ptr", "  call void @minyar_rc_borrow(ptr %value)",
+        "  %packed = ptrtoint ptr %value to i64", "  call void @minyar_list_add(ptr %destination, i64 %packed)", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ])
+    patterns.add(branch)
+    let loop = program([
+        "define void @.minyar.fn.publishLoopProbe(i1 %again, ptr %source, ptr %destination) {", "entry:", "  call void @minyar_rc_enter(i64 0)", "  br label %loop", "loop:",
+        "  %raw = call i64 @.minyar.list.get.checked(ptr %source, i64 0)", "  %value = inttoptr i64 %raw to ptr", "  call void @minyar_rc_borrow(ptr %value)",
+        "  %packed = ptrtoint ptr %value to i64", "  call void @minyar_list_add(ptr %destination, i64 %packed)", "  call void @minyar_rc_step()",
+        "  br i1 %again, label %loop, label %done", "done:", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ])
+    patterns.add(loop)
+    let wide = test.replace(patterns[0], "@.minyar.fn.publishProbe0(", "@.minyar.fn.publishWide(")
+    wide = test.replace(wide, "@minyar_rc_enter(i64 0)", "@minyar_rc_enter(i64 256)")
+    patterns.add(wide)
+    let rejected = test.replace(patterns[0], "@.minyar.fn.publishProbe0(", "@.minyar.fn.publishRejected(")
+    rejected = test.replace(rejected, "  call void @minyar_rc_leave()\n  ret void", "  br label %spin\nspin:\n  call void @minyar_rc_keep(ptr null)\n  br label %spin")
+    patterns.add(rejected)
+    let input = compiler.directory + "/publisher-patterns.ll"
+    let output = compiler.directory + "/publisher-lowered.ll"
+    io.writeTextFile(input, joinText(patterns))
+    let symbols = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = symbols.slice(symbols.find("function declarationHash("), symbols.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program([
+        "function failCompiler(message: Text) { fail(message) }",
+        "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))",
+        "print(\"publisher patterns passed\")"
+    ])
+    executes(compiler, harness, "publisher patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    for index in 0..expectedCells.length {
+        let emitted = body(lowered, "publishProbe" + Text(index))
+        checkScopeCells(emitted, expectedCells[index], "publisher SSA/operand cell boundary " + Text(index))
+        test.check(test.contains(emitted, publishers[index] + "\n"), "actual publisher call/flags/operands must remain byte-identical " + Text(index))
+        test.check(emitted.split("call void @minyar_rc_scope_release_v1(").length == expectedCells[index] + 1, "only proven redundant publisher drops may disappear " + Text(index))
+        let polls = 1
+        if expectedCells[index] == 0 { polls = 2 }
+        test.check(emitted.split("call void @minyar_rc_scope_poll_v1()").length == polls + 1, "publisher statement/return service boundary " + Text(index))
+        if index == 13 { test.check(emitted.split("call void @minyar_rc_retain_traced(").length == 2, "traced publisher operand must retain its barrier") }
+        else { test.check(emitted.split("call void @minyar_rc_retain(").length == expectedCells[index] + 1, "caller temporary retain boundary " + Text(index)) }
+    }
+    for name in ["publishBranchProbe", "publishLoopProbe"] {
+        let emitted = body(lowered, name)
+        checkEmptyScope(emitted, "branch/loop publisher must remove only its dead operand count")
+        test.check(emitted.split("call void @minyar_rc_scope_poll_v1()").length == 3, "branch/loop publisher service must remain on both static frontiers")
+        test.check(emitted.split("call void @minyar_list_add(").length == 2, "branch/loop retaining publisher must remain")
+    }
+    test.check(body(lowered, "publishWide") == body(wide, "publishWide"), "257 raw cells must preserve original fallback even when publisher borrow would disappear")
+    test.check(body(lowered, "publishRejected") == body(rejected, "publishRejected"), "late CFG failure after a removed publisher borrow must restore original lines")
+
+    for budget in [1, 32] {
+        let boundedOrdinary = buildRuntimeWithBudget(compiler, false, environment, budget)
+        let boundedCycle = buildRuntimeWithBudget(compiler, true, environment, budget)
+        executes(compiler, "function scopePublishAllocation(): Integer { native \"runtime\" }\nprint(scopePublishAllocation())\n", "1\n", environment, boundedOrdinary, boundedCycle)
+        executes(compiler, program([
+            "record Graph { edges: List<Graph> }",
+            "function cycleType(value: Graph): Integer { return value.edges.length }",
+            "function scopePublishAllocation(): Integer { native \"runtime\" }",
+            "print(scopePublishAllocation())"
+        ]), "1\n", environment, boundedOrdinary, boundedCycle)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_empty_scopes_finish_recovery_without_losing_roots") {
+    let llvm = executes(compiler, program([
+        "record TextBox { text: Text }",
+        "function plain(value: Integer, box: TextBox): Integer {",
+        "if box.text == \"unreachable\" { print(0) }",
+        "if value < 0 { return -1 }",
+        "let total = 0",
+        "for index in 0..value { if index == 1 { continue }; total += index; if index == 3 { break } }",
+        "return total",
+        "}",
+        "function nonempty(value: Text): Integer { let held = value + \"!\"; return held.length }",
+        "function returned(value: TextBox): Text { return value.text }",
+        "let text = \"root\" + \".\"",
+        "let box = TextBox { text: text }",
+        "print(plain(-1, box))", "print(plain(5, box))", "print(nonempty(text))", "print(returned(box))"
+    ]), "-1\n5\n6\nroot.\n", environment, ordinary, cycle)
+    checkEmptyScope(body(llvm, "plain"), "coalesced zero with branch/loop")
+    checkEmptyScope(body(llvm, "returned"), "explicit retained return")
+    checkScopeCells(body(llvm, "nonempty"), 1, "live local keeps its header")
+    test.check(body(llvm, "plain").split("call void @minyar_rc_scope_leave_empty_v1()").length == 3, "both scalar normal exits must use empty leave")
+    test.check(body(llvm, "returned").split("call void @minyar_rc_retain(").length == 2, "empty return must retain its real returned owner")
+
+    compiler.serial += 1
+    let path = compiler.directory + "/empty-recovery" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", program([
+        "record Job { mode: Integer; text: Text }", "record Graph { edges: List<Graph>; text: Text }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function scopeEmptyDiscard(job: Job) { native \"runtime\" }",
+        "function scopeEmptyTouch(value: Graph): Integer { native \"runtime\" }",
+        "function scopeEmptyObserve(value: Graph): Integer { native \"runtime\" }",
+        "function diagnosticCompileJob(job: Job) { if job.text == \"unreachable\" { print(0) }; scopeEmptyDiscard(job) }",
+        "function nonempty(value: Graph): Integer { let held = value; return scopeEmptyTouch(held) }",
+        "function emptyOuter(value: Graph): Integer { if value.text == \"unreachable\" { print(0) }; nonempty(value); return scopeEmptyObserve(value) }",
+        "function returned(value: Graph): Graph { if value.text == \"unreachable\" { print(0) }; return value }",
+        "let links: List<Graph> = []",
+        "let witness = Graph { edges: links, text: \"live\" }",
+        "links.add(witness)",
+        "print(0)"
+    ]))
+    test.require(test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners", "--library", "library"], environment, "", path + ".compile", compiler.compileTimeout), "compile strict empty recovery callback")
+    let generated = io.readTextFile(path + ".ll")
+    for name in ["diagnosticCompileJob", "emptyOuter", "returned"] { checkEmptyScope(body(generated, name), "native entry " + name) }
+    checkScopeCells(body(generated, "nonempty"), 1, "nonempty nested child")
+    test.check(body(generated, "returned").split("call void @minyar_rc_retain_traced(").length == 2, "returned traced graph must keep its acquisition barrier")
+    let symbols: List<Text> = []
+    for name in ["diagnosticCompileJob", "emptyOuter", "returned"] {
+        let symbol = ""
+        for line in test.lines(generated) {
+            if test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(") || test.contains(line, "@\".minyar.fn.minyar.module|" + name + "|")) {
+                symbol = line.slice(line.find("@"), line.find("(")); break
+            }
+        }
+        test.check(symbol != "", "missing portable bridge target " + name)
+        symbols.add(symbol)
+    }
+    test.check(generated.split("define i32 @main(").length == 2, "strict fixture must rename exactly one generated main")
+    generated = test.replace(generated, "define i32 @main(", "define i32 @scope_empty_unused_main(")
+    generated += program([
+        "define void @scope_empty_callback(ptr %job) {", "entry:", "  call void " + symbols[0] + "(ptr %job)", "  ret void", "}",
+        "define i64 @scope_empty_outer(ptr %value) {", "entry:", "  %result = call i64 " + symbols[1] + "(ptr %value)", "  ret i64 %result", "}",
+        "define ptr @scope_empty_returned(ptr %value) {", "entry:", "  %result = call ptr " + symbols[2] + "(ptr %value)", "  ret ptr %result", "}"
+    ])
+    if test.addressEnabled(compiler.flags) { generated = test.instrument(generated) }
+    io.writeTextFile(path + ".ll", generated)
+    let controls = program([
+        "#include <assert.h>",
+        "extern void scope_empty_callback(void *);",
+        "extern long long scope_empty_outer(void *);",
+        "extern void *scope_empty_returned(void *);",
+        "static size_t scope_empty_objects, scope_empty_bytes;",
+        "static unsigned scope_empty_phase_target, scope_empty_diagnostic_phases, scope_empty_normal_phases;",
+        "static void scope_empty_graph(MinyarRecord *value) {",
+        "    MinyarList *edges = (MinyarList *)(uintptr_t)minyar_record_get(value, 0);",
+        "    assert(edges->length == 1 && (MinyarRecord *)(uintptr_t)edges->values[0] == value);",
+        "    MinyarText *text = (MinyarText *)(uintptr_t)minyar_record_get(value, 1);",
+        "    assert(text->byte_length == 4 && !memcmp(text->bytes, \"live\", 4));",
+        "}",
+        "static MinyarRecord *scope_empty_make_graph(void) {",
+        "    MinyarRecord *value = minyar_record_new_traced(2);",
+        "    MinyarList *edges = minyar_list_new_traced();",
+        "    MinyarText *text = minyar_native_copy_text((const unsigned char *)\"live\", 4);",
+        "    minyar_record_set_reference_traced(value, 0, (long long)(uintptr_t)edges);",
+        "    minyar_record_set_reference_traced(value, 1, (long long)(uintptr_t)text);",
+        "    minyar_list_add_traced(edges, (long long)(uintptr_t)value);",
+        "    minyar_rc_release(edges);",
+        "    minyar_rc_release(text);",
+        "    return value;",
+        "}",
+        "static void scope_empty_arm(void) {",
+        "    MinyarRecord *ring = minyar_record_new_traced(512);",
+        "    minyar_record_set_reference_traced(ring, 0, (long long)(uintptr_t)ring);",
+        "    rc_drop(ring);",
+        "    assert(rc_cycle_pending);",
+        "}",
+        "static void scope_empty_seek(unsigned phase) {",
+        "    assert(phase >= RC_CYCLE_ROOTS && phase <= RC_CYCLE_SWEEP);",
+        "    size_t steps = 0;",
+        "    while (rc_cycle_phase != phase) {",
+        "        assert(rc_cycle_pending && ++steps < 100000);",
+        "        rc_cycle_unit();",
+        "    }",
+        "    assert(rc_cycle_pending && rc_cycle_phase == phase);",
+        "}",
+        "static void scope_empty_clean(size_t objects, size_t bytes) {",
+        "    if (rc_cycle_pending || rc_pending_count || rc_object_count != objects || rc_bytes != bytes) {",
+        "        fputs(\"empty scope recovery left pending cycles\\n\", stderr);",
+        "        _Exit(73);",
+        "    }",
+        "}",
+        "static void scope_empty_run(void (*callback)(void *), MinyarRecord *job) {",
+        "    assert(!rc_scopes && !rc_frames);",
+        "    size_t objects = rc_object_count, bytes = rc_bytes;",
+        "    size_t depth = minyar_call_depth, limit = minyar_depth_limit;",
+        "    assert(!minyar_compiler_try(callback, job));",
+        "    assert(!rc_scopes && !rc_frames && minyar_call_depth == depth && minyar_depth_limit == limit);",
+        "    scope_empty_clean(objects, bytes); /* Before any native drain or teardown. */",
+        "}",
+        "MINYAR_NORETURN void minyar_runtime_scopeEmptyDiscard(MinyarRecord *job) {",
+        "    assert(!rc_scopes && !rc_frames);",
+        "    if (job->values[0]) {",
+        "        job->values[0] = 0;",
+        "        scope_empty_run(scope_empty_callback, job);",
+        "        job->values[0] = 1;",
+        "    }",
+        "    scope_empty_arm();",
+        "    if (scope_empty_phase_target) {",
+        "        scope_empty_seek(scope_empty_phase_target);",
+        "        scope_empty_diagnostic_phases |= 1u << scope_empty_phase_target;",
+        "    }",
+        "    minyar_depth_limit = 1;",
+        "    minyar_runtime_diagnosticDiscard(); /* No generated step/normal leave can run. */",
+        "}",
+        "static void scope_empty_native_callback(void *job) {",
+        "    minyar_runtime_scopeEmptyDiscard(job);",
+        "}",
+        "long long minyar_runtime_scopeEmptyTouch(MinyarRecord *value) {",
+        "    scope_empty_graph(value);",
+        "    return 1;",
+        "}",
+        "long long minyar_runtime_scopeEmptyObserve(MinyarRecord *value) {",
+        "    assert(!rc_scopes && !rc_frames);",
+        "    scope_empty_clean(scope_empty_objects, scope_empty_bytes);",
+        "    scope_empty_graph(value);",
+        "    return 1;",
+        "}",
+        "int main(void) {",
+        "    MinyarRecord *job = minyar_record_new(2); /* C-owned Job and its Text edge. */",
+        "    MinyarText *job_text = minyar_native_copy_text((const unsigned char *)\"live\", 4);",
+        "    minyar_record_set_reference(job, 1, (long long)(uintptr_t)job_text);",
+        "    minyar_rc_release(job_text);",
+        "    for (int round = 0; round < 4; round++) {",
+        "        job->values[0] = 0;",
+        "        scope_empty_run(scope_empty_callback, job);",
+        "        job->values[0] = 1;",
+        "        scope_empty_run(scope_empty_callback, job);",
+        "        job->values[0] = 0;",
+        "        scope_empty_run(scope_empty_native_callback, job);",
+        "    }",
+        "    unsigned all_phases = (1u << RC_CYCLE_ROOTS) | (1u << RC_CYCLE_MARK) | (1u << RC_CYCLE_SWEEP);",
+        "    for (unsigned phase = RC_CYCLE_ROOTS; phase <= RC_CYCLE_SWEEP; phase++) {",
+        "        scope_empty_phase_target = phase;",
+        "        scope_empty_run(scope_empty_callback, job);",
+        "    }",
+        "    scope_empty_phase_target = 0;",
+        "    assert(scope_empty_diagnostic_phases == all_phases);",
+        "    MinyarRecord *graph = scope_empty_make_graph();",
+        "    for (unsigned phase = RC_CYCLE_ROOTS; phase <= RC_CYCLE_SWEEP; phase++) {",
+        "        scope_empty_objects = rc_object_count; scope_empty_bytes = rc_bytes;",
+        "        scope_empty_arm();",
+        "        scope_empty_seek(phase);",
+        "        scope_empty_normal_phases |= 1u << phase;",
+        "        assert(scope_empty_outer(graph) == 1);",
+        "        scope_empty_graph(graph);",
+        "    }",
+        "    assert(scope_empty_normal_phases == all_phases);",
+        "#if MINYAR_THREADED",
+        "    size_t native_allocations = atomic_load(&rc_thread_native_allocations);",
+        "    size_t native_bytes = atomic_load(&rc_thread_native_bytes);",
+        "    size_t destroyed = atomic_load(&rc_thread_frozen_destructions);",
+        "    scope_empty_objects = rc_object_count; scope_empty_bytes = rc_bytes;",
+        "    MinyarBytes *payload = minyar_bytes_new(4);",
+        "    memcpy((unsigned char *)payload->bytes, \"live\", 4);",
+        "    RcThreadLeaf *frozen = minyar_frozen_bytes_copy(payload);",
+        "    RcFrozenBytes *shared = frozen->control;",
+        "    rc_thread_control_retain(shared); /* Independent legal native owner. */",
+        "    minyar_rc_release(payload);",
+        "    MinyarRecord *resource_ring = minyar_record_new_traced(512);",
+        "    minyar_record_set_reference_traced(resource_ring, 0, (long long)(uintptr_t)resource_ring);",
+        "    minyar_record_set_reference_traced(resource_ring, 1, (long long)(uintptr_t)frozen);",
+        "    rc_drop(frozen); /* Only the unreachable ring owns the managed wrapper. */",
+        "    rc_drop(resource_ring);",
+        "    scope_empty_seek(RC_CYCLE_SWEEP);",
+        "    assert(scope_empty_outer(graph) == 1); /* Earlier finish destroys wrapper, not native share. */",
+        "    assert(atomic_load(&shared->owner.strong) == 1);",
+        "    assert(atomic_load(&rc_thread_frozen_destructions) == destroyed);",
+        "    assert(shared->buffer.length == 4 && !memcmp(shared->buffer.data + 1, \"live\", 4));",
+        "    assert(atomic_load(&rc_thread_native_allocations) == native_allocations + 2);",
+        "    rc_thread_control_release(shared);",
+        "    assert(atomic_load(&rc_thread_frozen_destructions) == destroyed + 1);",
+        "    assert(atomic_load(&rc_thread_native_allocations) == native_allocations);",
+        "    assert(atomic_load(&rc_thread_native_bytes) == native_bytes);",
+        "#endif",
+        "    scope_empty_objects = rc_object_count; scope_empty_bytes = rc_bytes;",
+        "    scope_empty_arm();",
+        "    assert(scope_empty_outer(graph) == 1); /* Nonempty child finishes while empty outer runs. */",
+        "    scope_empty_graph(graph);",
+        "    scope_empty_arm();",
+        "    MinyarRecord *returned = scope_empty_returned(graph);",
+        "    assert(returned == graph);",
+        "    scope_empty_clean(scope_empty_objects, scope_empty_bytes);",
+        "    minyar_rc_release(graph); /* Only the explicit returned count remains external. */",
+        "    scope_empty_objects = rc_object_count; scope_empty_bytes = rc_bytes;",
+        "    scope_empty_arm();",
+        "    assert(scope_empty_outer(returned) == 1);",
+        "    scope_empty_graph(returned);",
+        "    minyar_rc_release(returned);",
+        "    minyar_rc_release(NULL);",
+        "    assert(rc_object_count == 2); /* The C-owned Job and its Text remain. */",
+        "    for (int legacy = 0; legacy < 2; legacy++) {",
+        "        MinyarRcScope guard;",
+        "        if (legacy) minyar_rc_enter(0); else minyar_rc_scope_enter_v1(&guard, NULL, 0);",
+        "        size_t objects = rc_object_count, bytes = rc_bytes;",
+        "        scope_empty_arm();",
+        "        size_t units = rc_cycle_units;",
+        "        minyar_rc_scope_leave_empty_v1();",
+        "        assert(rc_cycle_pending && rc_cycle_units == units); /* Either chain blocks finish. */",
+        "        if (legacy) minyar_rc_leave(); else minyar_rc_scope_leave_v1(&guard);",
+        "        scope_empty_clean(objects, bytes);",
+        "    }",
+        "    minyar_rc_release(job);",
+        "    minyar_rc_release(NULL);",
+        "    assert(!rc_scopes && !rc_frames && !rc_pending_count && !rc_cycle_pending);",
+        "    assert(!rc_object_count && !rc_bytes && !minyar_call_depth);",
+        "#if MINYAR_THREADED",
+        "    assert(!atomic_load(&rc_thread_native_allocations) && !atomic_load(&rc_thread_native_bytes));",
+        "    assert(!atomic_load(&rc_thread_transit_allocations) && !atomic_load(&rc_thread_transit_bytes));",
+        "#endif",
+        "    puts(\"Empty scope recovery and roots passed\");",
+        "    return 0;",
+        "}"
+    ])
+    let diagnostics = io.readTextFile("runtime/minyar_diagnostics.h")
+    let finish = "    minyar_rc_scope_leave_empty_v1();\n"
+    test.check(diagnostics.split(finish).length == 2, "mutant must remove exactly the diagnostic boundary finish")
+    let include = "#include \"minyar_diagnostics.h\""
+    let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
+    test.check(engine.split(include).length == 2, "strict callback runtime must inline exactly one diagnostic header")
+    for mutant in [false, true] {
+        let header = diagnostics
+        if mutant { header = joinText(header.split(finish)) }
+        let label = "normal"
+        if mutant { label = "missing-finish" }
+        let source = path + "-" + label + ".c"
+        io.writeTextFile(source, "#define MINYAR_THREADED 1\n#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + test.replace(engine, include, header) + "\n" + controls)
+        for optimization in ["-O0", "-O2"] {
+            let executable = path + "-" + label + optimization + ".exe"
+            let command = [compiler.clang, optimization, "-Wno-override-module"]
+            for flag in compiler.flags { command.add(flag) }
+            for item in ["-UNDEBUG", "-pthread", "-iquote", "runtime", path + ".ll", source, "-lm", "-o", executable] { command.add(item) }
+            test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link empty diagnostic oracle " + label + optimization)
+            let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+            if mutant { test.check(observed.status == 73 && observed.output == "" && test.contains(observed.errorOutput, "empty scope recovery left pending cycles"), "missing post-unwind finish must fail the immediate oracle, not compile/link " + optimization) }
+            else { test.require(observed, "run empty diagnostic/root oracle " + optimization); test.check(observed.output == "Empty scope recovery and roots passed\n" && observed.errorOutput == "", "empty recovery/root oracle output " + optimization) }
+        }
+    }
+    let profileControl = program([
+        "#include <assert.h>",
+        "int main(void) {",
+        "#ifdef MINYAR_COMPILER_ARENA",
+        "    minyar_rc_scope_leave_empty_v1();",
+        "    minyar_rc_release(NULL);",
+        "#else",
+        "    MinyarRecord *pending = minyar_record_new(512);",
+        "    rc_drop(pending);",
+        "    assert(rc_pending_count);",
+        "    size_t objects = rc_object_count, bytes = rc_bytes, debt = rc_pending_count;",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "    size_t cursor = rc_bounded_cursor;",
+        "    rc_bounded_last_work = MINYAR_RC_POLL_BUDGET + 7;",
+        "#endif",
+        "    minyar_rc_scope_leave_empty_v1();",
+        "    minyar_rc_scope_release_v1(NULL);",
+        "    assert(rc_object_count == objects && rc_bytes == bytes && rc_pending_count == debt);",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "    assert(rc_bounded_cursor == cursor && rc_bounded_last_work == MINYAR_RC_POLL_BUDGET + 7);",
+        "#endif",
+        "    minyar_rc_release(NULL); /* Preserve the public native drain/service contract. */",
+        "#ifdef MINYAR_BOUNDED_RC",
+        "    assert(rc_bounded_cursor > 0 && rc_bounded_cursor <= MINYAR_RC_POLL_BUDGET);",
+        "    assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);",
+        "    size_t steps = 0;",
+        "    while (rc_pending_count) {",
+        "        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);",
+        "        assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET && ++steps < 100000);",
+        "    }",
+        "#else",
+        "    assert(!rc_pending_count);",
+        "#endif",
+        "    assert(!rc_scopes && !rc_frames && !rc_object_count && !rc_bytes);",
+        "#endif",
+        "    puts(\"Empty scope profile passed\");",
+        "    return 0;",
+        "}"
+    ])
+    let profileNames = ["ordinary", "cycle", "arena", "system-k1", "system-k32", "cycle-k1", "cycle-k32"]
+    for index in 0..profileNames.length {
+        let profile = profileNames[index]
+        let profileEngine = io.readTextFile("runtime/minyar_runtime.c")
+        if index == 1 || index >= 5 { profileEngine = runtime.cycleSource(profileEngine) }
+        let defines = "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n"
+        if index == 2 { defines += "#define MINYAR_COMPILER_ARENA 1\n" }
+        if index >= 3 {
+            let budget = 1
+            if index % 2 == 0 { budget = 32 }
+            defines += "#define MINYAR_SYSTEM_HEAP 1\n#define MINYAR_RC_POLL_BUDGET " + Text(budget) + "\n"
+        }
+        let source = path + "-" + profile + ".c"
+        io.writeTextFile(source, defines + profileEngine + "\n" + profileControl)
+        for optimization in ["-O0", "-O2"] {
+            let executable = path + "-" + profile + optimization + ".exe"
+            let command = [compiler.clang, optimization]
+            for flag in compiler.flags { command.add(flag) }
+            for item in ["-UNDEBUG", "-iquote", "runtime", source, "-lm", "-o", executable] { command.add(item) }
+            test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "compile empty no-op/NULL profile " + profile + optimization)
+            let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+            test.require(observed, "run empty no-op/NULL profile " + profile + optimization)
+            test.check(observed.output == "Empty scope profile passed\n" && observed.errorOutput == "", "empty no-op/NULL instrumentation " + profile + optimization)
+        }
+    }
+
+    let patterns = program([
+        "define void @.minyar.fn.emptyRaw() {", "entry:", "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_leave()", "  ret void", "}",
+        "define void @.minyar.fn.nullLocal() {", "entry:", "  call void @minyar_rc_enter(i64 1)", "  call void @minyar_rc_local_take(i64 0, ptr null)", "  call void @minyar_rc_leave()", "  ret void", "}",
+        "define void @.minyar.fn.nullTemporary() {", "entry:", "  call void @minyar_rc_enter(i64 0)", "  call void @minyar_rc_keep(ptr null)", "  call void @minyar_rc_step()", "  call void @minyar_rc_leave()", "  ret void", "}"
+    ])
+    let input = path + "-patterns.ll"
+    let output = path + "-lowered.ll"
+    io.writeTextFile(input, patterns)
+    let indexFile = io.readTextFile("compiler/stages/symbols.min")
+    let indexSource = indexFile.slice(indexFile.find("function declarationHash("), indexFile.find("function requireUniqueSymbols("))
+    let harness = "use \"io\" as io\n" + indexSource + io.readTextFile("compiler/stages/scope-ownership.min")
+    harness += program(["function failCompiler(message: Text) { fail(message) }", "io.writeTextFile(\"" + output + "\", lowerScopeOwnership(io.readTextFile(\"" + input + "\")))", "print(\"empty patterns passed\")"])
+    executes(compiler, harness, "empty patterns passed\n", environment, ordinary, cycle)
+    let lowered = io.readTextFile(output)
+    checkEmptyScope(body(lowered, "emptyRaw"), "synthetic raw zero")
+    checkScopeCells(body(lowered, "nullLocal"), 1, "null payload does not erase a local owner cell")
+    checkScopeCells(body(lowered, "nullTemporary"), 1, "null payload does not erase a retained producer")
+}
+
+test.removeTree(compiler.directory)
+print("Scope ownership: O0/O2 behavior, allocation cleanup, cycles and diagnostic unwind passed")

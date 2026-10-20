@@ -1,0 +1,343 @@
+use "io" as io
+use "system" as system
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing mutable scalar function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function compiled(frontend: fixtures.Frontend, source: Text): Text {
+    test.require(fixtures.compile(frontend, source), "compile mutable scalar IR")
+    return io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+}
+
+function checkHoisted(ir: Text, name: Text) {
+    let entry = true
+    for line in test.lines(body(ir, name)) {
+        if line.endsWith(":") && line != "entry:" { entry = false }
+        if test.contains(line, " alloca ") { test.check(entry, name + ": local storage must be hoisted to entry") }
+    }
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let source = #"""
+    record Pair { x: Integer; y: Integer }
+    record Scalars { number: Integer; fraction: Float; flag: Boolean; letter: Character }
+
+    function kinds(seed: Integer) {
+        let value = Scalars { letter: 'a'; flag: false; fraction: 1.5; number: seed }
+        value.number = value.number + 2
+        value.number += 3
+        value.number -= 1
+        value.number *= 2
+        value.number /= 4
+        value.number %= 3
+        value.fraction = 2.5
+        value.fraction += 0.5
+        value.fraction *= 2.0
+        value.fraction /= 4.0
+        value.fraction -= 0.25
+        value.flag = true
+        value.flag = !value.flag
+        if !value.flag { value.flag = true }
+        value.letter = 'λ'
+        print(value.number)
+        print(value.fraction)
+        print(value.flag)
+        print(value.letter)
+    }
+    function immutableBinding(): Integer {
+        constant p = Pair { x: 1; y: 2 }
+        p.x += 4
+        p.y = p.x + 1
+        return p.x * 10 + p.y
+    }
+    function oldValues(): Integer {
+        let p = Pair { x: 3; y: 8 }
+        p.x += p.x * 2
+        p.y = p.x
+        p.x = p.y + 1
+        return p.x * 100 + p.y
+    }
+    function noted(value: Integer): Integer { print(value); return value }
+    function initializerEffects(): Integer {
+        let p = Pair { y: noted(2); x: noted(3) }
+        p.x += noted(p.x)
+        p.y = noted(p.x + p.y)
+        return p.x * 100 + p.y
+    }
+    function merge(flag: Boolean): Integer {
+        let p = Pair { x: 1; y: 2 }
+        if flag { p.x = 10; p.y += p.x }
+        else { p.x = 20; p.y -= p.x }
+        return p.x * 100 + p.y
+    }
+    function evolve(limit: Integer): Integer {
+        let p = Pair { x: 0; y: 1 }
+        let index = 0
+        while index < limit {
+            index += 1
+            if index == 2 { p.y += 10; continue }
+            p.x += index
+            p.y *= 2
+            if index == 4 { break }
+        }
+        return p.x * 100 + p.y
+    }
+    function fresh(limit: Integer): Integer {
+        let total = 0
+        for index in 0..limit {
+            let p = Pair { x: index; y: 2 }
+            p.x += p.y
+            p.y = p.x * 2
+            total += p.x + p.y
+        }
+        return total
+    }
+    function early(limit: Integer): Integer {
+        let p = Pair { x: 1; y: 2 }
+        let index = 0
+        while index < limit {
+            p.x += index
+            p.y += 1
+            if index == 2 { return p.x * 10 + p.y }
+            index += 1
+        }
+        return p.x * 10 + p.y
+    }
+    function matched(input: Result<Integer, Text>): Integer {
+        let p = Pair {
+            x: match input { Ok(value) { value } Err(error) { -1 } }
+            y: 2
+        }
+        p.x += 2
+        let q = Pair { x: 7; y: 8 }
+        q.y += p.y
+        return p.x * 100 + p.y + q.x + q.y
+    }
+    function readonly(seed: Integer): Integer {
+        let p = Pair { x: seed; y: 3 }
+        return p.x + p.y
+    }
+
+    kinds(10)
+    print(immutableBinding())
+    print(oldValues())
+    print(initializerEffects())
+    print(merge(true))
+    print(merge(false))
+    print(evolve(0))
+    print(evolve(1))
+    print(evolve(5))
+    print(fresh(0))
+    print(fresh(4))
+    print(matched(Ok<Integer, Text>(40)))
+    print(matched(Err<Integer, Text>("no")))
+    print(readonly(39))
+    print(early(0))
+    print(early(4))
+    let top = Pair { x: 4; y: 5 }
+    top.x += 3
+    if top.x == 7 { top.y *= 2 }
+    print(top.x * 10 + top.y)
+    """#
+let ir = compiled(frontend, source)
+for name in ["kinds", "immutableBinding", "oldValues", "initializerEffects", "merge", "evolve", "fresh", "early", "readonly"] {
+    let emitted = body(ir, name)
+    test.check(!test.contains(emitted, "@minyar_record_"), name + ": local scalar fields must avoid runtime records")
+    test.check(!test.contains(emitted, "@minyar_rc_"), name + ": local scalar fields must avoid RC calls")
+    checkHoisted(ir, name)
+}
+test.check(count(body(ir, "oldValues"), " = alloca i64") >= 2, "writable scalar fields need entry storage before optimization")
+test.check(test.contains(body(ir, "oldValues"), "load i64") && test.contains(body(ir, "oldValues"), "store i64"), "writable scalar fields must read and update storage")
+test.check(!test.contains(body(ir, "readonly"), "load i64") && !test.contains(body(ir, "readonly"), "store i64"), "readonly scalar fields must keep their SSA path")
+test.check(!test.contains(body(ir, "matched"), "@minyar_record_new") && !test.contains(body(ir, "matched"), "@minyar_record_set"), "match initializer and following writable record must both be eliminated")
+test.check(!test.contains(ir, "call ptr @minyar_record_new_scalar("), "top-level mutable scalar record must also be eliminated")
+checkHoisted(ir, "matched")
+let llvm = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll"
+let optimized = frontend.compiler.directory + "/mutable-optimized.ll"
+test.require(test.run([frontend.compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", llvm, "-o", optimized], system.environment(), "", frontend.compiler.directory + "/optimize", 30), "optimize mutable scalar fields")
+let hot = body(io.readTextFile(optimized), "merge")
+test.check(!test.contains(hot, "alloca ") && !test.contains(hot, "@minyar_record_") && !test.contains(hot, "@minyar_rc_"), "O2 must promote nonescaping writable fields")
+fixtures.executes(frontend, source, "1\n1.25\ntrue\nλ\n56\n1009\n2\n3\n3\n8\n608\n1012\n1982\n1\n102\n848\n0\n42\n4219\n119\n42\n12\n45\n80\n", ["-O0", "-O2"], 0, "", true)
+
+let fallback = #"""
+    record Pair { x: Integer; y: Integer }
+    record Mixed { x: Integer; label: Text }
+    function Pair.bump() { self.x += 3 }
+    function alias(): Integer {
+        let p = Pair { x: 1; y: 2 }
+        let other = p
+        p.x += 5
+        other.y = p.x + 1
+        return p.x * 10 + p.y
+    }
+    function save(p: Pair, values: List<Pair>) { values.add(p) }
+    function passed(values: List<Pair>): Integer {
+        let p = Pair { x: 3; y: 4 }
+        save(p, values)
+        p.x += 10
+        return values[0].x
+    }
+    function returned(): Pair {
+        let p = Pair { x: 5; y: 6 }
+        p.x += 2
+        return p
+    }
+    function container(): Integer {
+        let p = Pair { x: 5; y: 6 }
+        let values = [p]
+        p.x += 3
+        values[0].y += 2
+        return p.x * 10 + p.y
+    }
+    function rebound(): Integer {
+        let p = Pair { x: 1; y: 2 }
+        p.x += 10
+        p = Pair { x: p.y; y: p.x }
+        p.y += 1
+        return p.x * 100 + p.y
+    }
+    function reference(): Integer {
+        let p = Mixed { x: 1; label: "a" + "!" }
+        p.x += 2
+        p.label = p.label + "b"
+        print(p.label)
+        return p.x
+    }
+    function shadow(flag: Boolean): Integer {
+        let p = Pair { x: 1; y: 2 }
+        p.x += 1
+        if flag {
+            let p = Pair { x: p.y; y: p.x }
+            p.x += 10
+            print(p.x)
+            print(p.y)
+        }
+        return p.x * 10 + p.y
+    }
+    function change(p: Pair): Integer { p.x = 100; return 2 }
+    function oldRhs(): Integer {
+        let p = Pair { x: 5; y: 0 }
+        p.x += change(p)
+        return p.x
+    }
+    function methodFallback(): Integer {
+        let p = Pair { x: 2; y: 3 }
+        p.y += 1
+        p.bump()
+        return p.x * 10 + p.y
+    }
+    function lateEscape(values: List<Pair>, flag: Boolean): Integer {
+        let p = Pair { x: 2; y: 3 }
+        p.x += 4
+        if flag { p.y += 5 }
+        else { p.y -= 1 }
+        if flag {
+            if p.x == 6 { values.add(p) }
+        } else {
+            if p.y == 2 { save(p, values) }
+        }
+        p.x += 1
+        return p.x * 10 + p.y
+    }
+
+    print(alias())
+    let saved: List<Pair> = []
+    print(passed(saved))
+    print(saved[0].y)
+    print(returned().x)
+    print(container())
+    print(rebound())
+    print(reference())
+    print(shadow(true))
+    print(shadow(false))
+    print(oldRhs())
+    print(methodFallback())
+    let lateSaved: List<Pair> = []
+    print(lateEscape(lateSaved, true))
+    print(lateSaved[0].x)
+    print(lateSaved[0].y)
+    print(lateEscape(lateSaved, false))
+    print(lateSaved[1].x)
+    print(lateSaved[1].y)
+    """#
+let managed = compiled(frontend, fallback)
+for name in ["alias", "passed", "returned", "container", "rebound", "shadow", "oldRhs", "methodFallback", "lateEscape"] {
+    test.check(test.contains(body(managed, name), "@minyar_record_new_scalar"), name + ": escaping or shadowed record must stay managed")
+}
+test.check(test.contains(body(managed, "reference"), "call ptr @minyar_record_new("), "reference fields must stay managed")
+fixtures.executes(frontend, fallback, "67\n13\n4\n7\n88\n212\na!b\n3\n12\n2\n22\n22\n7\n54\n78\n7\n8\n72\n7\n2\n", ["-O0", "-O2"], 0, "", true)
+
+let callback = #"""
+    record Cell { value: Integer }
+    function escaped(): () -> Integer {
+        let cell = Cell { value: 1 }
+        let callback: () -> Integer = function(): Integer {
+            cell.value += 1
+            return cell.value
+        }
+        cell.value += 10
+        return callback
+    }
+    let next = escaped()
+    print(next())
+    print(next())
+    """#
+let callbackIR = compiled(frontend, callback)
+test.check(test.contains(body(callbackIR, "escaped"), "@minyar_record_new_scalar"), "captured scalar record must stay managed")
+fixtures.executes(frontend, callback, "12\n13\n", ["-O0", "-O2"], 0, "", true)
+
+let nativeLayout = #"""
+    record Position native "c" { x: Int64; y: Int64 }
+    function nativeGeometry(): Integer {
+        let p = Position { x: 5; y: 7 }
+        p.x += 2
+        p.y = p.x + 3
+        return p.x * 10 + p.y
+    }
+    print(nativeGeometry())
+    """#
+let nativeIR = compiled(frontend, nativeLayout)
+test.check(test.contains(body(nativeIR, "nativeGeometry"), "@minyar_c_record_new"), "native layout must preserve its C storage")
+fixtures.executes(frontend, nativeLayout, "80\n", ["-O0", "-O2"], 0, "", true)
+
+record Failure { initial: Text; operation: Text; right: Text; message: Text }
+for failure in [
+    Failure { initial: "9223372036854775807"; operation: "+="; right: "1"; message: "this Integer calculation is outside the supported range." },
+    Failure { initial: "7"; operation: "/="; right: "0"; message: "an Integer cannot be divided by zero." },
+] {
+    let checked = "record Counter { value: Integer }\nfunction right(): Integer { print(\"rhs\"); return " + failure.right + " }\nfunction checked() {\nlet counter = Counter { value: " + failure.initial + " }\ncounter.value " + failure.operation + " right()\nprint(\"unreachable\")\n}\nchecked()\n"
+    fixtures.executes(frontend, checked, "rhs\n", ["-O0", "-O2"], 1, "Minyar stopped: " + failure.message + "\n", true)
+}
+
+let gallery = io.readTextFile("examples/gallery/mutable-scalar-records.min")
+test.check(gallery.length > 0, "missing mutable scalar gallery")
+fixtures.executes(frontend, gallery, "Day 1: 2 leaves.\nDay 2: 4 leaves.\nDay 3: 6 leaves.\nOne small flower, facing the sun.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Mutable scalar records: passed")

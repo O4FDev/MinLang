@@ -1,0 +1,95 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function link(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text, arguments: List<Text>) {
+    let compiler = frontend.compiler
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for argument in ["-Wno-override-module", path + ".ll", object, "-lm", "-o", path + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", path + ".link", 60), "link Text niche fixture " + level)
+        let run = [path + ".exe"]
+        for argument in arguments { run.add(argument) }
+        let result = test.run(run, frontend.environment, "", path + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == diagnostic, "Text niche fixture " + level + "\n" + result.output + result.errorOutput)
+    }
+}
+
+function state(frontend: fixtures.Frontend, entry: Text, output: Text, prior: Text, next: Text) {
+    let stats = output + ".stats"
+    test.require(test.run([frontend.compiler.executable, entry, output + ".ll", "--module-state", prior, next, stats, "--library", "library"], frontend.environment, "", output + ".compile", 60), "compile exported Text choice module state")
+    let fields = test.words(io.readTextFile(stats))
+    test.check(fields.length >= 7 && fields[0] == "0" && fields[6] == "false", "Text choices must preserve whole-program fallback\n" + io.readTextFile(stats))
+    test.check(io.readTextFile(next) == "", "Text fallback persisted unsupported module artifacts")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let baseline = test.setting("MINYAR_CHOICE_TEXT_BASELINE", "")
+if baseline != "" { compiler.executable = baseline }
+test.require(fixtures.compile(frontend, io.readTextFile("tests/choice-text-niche-benchmark.min")), "compile Text choice allocation benchmark")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+if baseline == "" {
+    test.check(test.contains(llvm, "ret ptr null") && test.contains(llvm, "icmp eq ptr"), "Text choice must project pointer/null")
+    test.check(!test.contains(llvm, "call ptr @minyar_record_new"), "Text choice benchmark allocated a wrapper")
+}
+llvm = test.replace(llvm, "@minyar_record_new", "@choice_text_new")
+io.writeTextFile(path + ".ll", llvm)
+let contract = test.replace(io.readTextFile("tests/choice-text-niche-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c")))
+io.writeTextFile(path + "-runtime.c", contract)
+let command = [compiler.clang, "-O1"]
+for flag in compiler.flags { command.add(flag) }
+for argument in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + "-runtime.c", "-o", path + "-runtime.o"] { command.add(argument) }
+test.require(test.run(command, frontend.environment, "", path + ".runtime-build", 60), "compile exact Text choice counter runtime")
+let counts = "0 records, 0 slots"
+if baseline != "" { counts = "10000 records, 20000 slots" }
+link(frontend, path, path + "-runtime.o", "60000\n", "choice Text: " + counts + ", 0 live objects, 0 live bytes\n", [])
+
+if baseline == "" {
+    fixtures.executes(frontend, io.readTextFile("tests/choice-text-niche-values.min"), "Text niche values: passed\n", ["-O0", "-O2"], 0, "", true)
+    path = compiler.directory + "/case" + Text(compiler.serial)
+    llvm = io.readTextFile(path + ".ll")
+    for operation in ["call zeroext i1 @minyar_equal_slots(i64 2", "call i64 @minyar_compare_slots(i64 2", "call i64 @minyar_hash_slot(i64 2", "call void @minyar_rc_retain(ptr %left)\n  ret ptr %left"] {
+        test.check(test.contains(llvm, operation), "Text choice derived payload operation missing: " + operation)
+    }
+    link(frontend, path, path + "-runtime.o", "Text niche values: passed\n", "", ["", "海🌙"])
+    for payload in ["Bytes", "List<Integer>"] {
+        let value = "Bytes()"
+        if payload == "List<Integer>" { value = "[1]" }
+        fixtures.rejects(frontend, "let value: Maybe<" + payload + "> = Some(" + value + ")\nprint(value == value)\n", "not Equatable", true)
+        fixtures.rejects(frontend, "let values: List<Maybe<" + payload + ">> = [Some(" + value + ")]\nvalues.sort()\n", "not Ordered", true)
+        fixtures.rejects(frontend, "let keys: Map<Maybe<" + payload + ">, Integer> = Map()\n", "not Hashable", true)
+    }
+
+    let leaf = compiler.directory + "/optional.min"
+    let entry = compiler.directory + "/main.min"
+    let exported = "public choice Notice { Quiet; Word(value: Text) }\npublic type Optional = Maybe<Text>\npublic function wrap<Item>(value: Item): Maybe<Item> { return Some(value) }\npublic function optional(): Optional { return wrap(\"module\" + \"!\") }\npublic function notice(): Notice { return Word(\"\" + \"\") }\npublic function read(value: Notice): Text { return match value { Quiet { \"absent\" } Word(item) { item } } }\n"
+    io.writeTextFile(leaf, exported)
+    io.writeTextFile(entry, "use \"./optional.min\" as optional\nlet value: optional.Optional = optional.optional()\nprint(value.unwrap())\nprint(optional.read(optional.notice()).length)\nprint(optional.wrap(\"imported\" + \"!\").unwrap())\n")
+    let empty = compiler.directory + "/empty.state"
+    let prior = compiler.directory + "/prior.state"
+    let next = compiler.directory + "/next.state"
+    io.writeTextFile(empty, "")
+    state(frontend, entry, compiler.directory + "/cold", empty, prior)
+    state(frontend, entry, compiler.directory + "/warm", prior, next)
+    let cold = io.readTextFile(compiler.directory + "/cold.ll")
+    test.check(io.readTextFile(compiler.directory + "/warm.ll") == cold, "warm Text fallback changed ABI")
+    test.require(test.run([compiler.executable, entry, compiler.directory + "/direct.ll", "--library", "library"], frontend.environment, "", compiler.directory + "/direct.compile", 60), "compile direct imported Text choices")
+    test.check(io.readTextFile(compiler.directory + "/direct.ll") == cold, "module fallback differs from direct Text compilation")
+    io.writeTextFile(leaf, test.replace(exported, "\"module\"", "\"edited\""))
+    state(frontend, entry, compiler.directory + "/edited", prior, next)
+    state(frontend, entry, compiler.directory + "/fresh", empty, prior)
+    test.check(io.readTextFile(compiler.directory + "/edited.ll") == io.readTextFile(compiler.directory + "/fresh.ll"), "producer edit retained stale Text ABI")
+    for mode in ["cold", "warm", "edited"] {
+        path = compiler.directory + "/" + mode
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll"))) }
+        let expected = "module!\n0\nimported!\n"
+        if mode == "edited" { expected = "edited!\n0\nimported!\n" }
+        link(frontend, path, compiler.runtime, expected, "", [])
+    }
+}
+test.removeTree(compiler.directory)
+print("Choice Text niche: passed; 10,000 alternating values, " + counts + ", zero residual objects/bytes")

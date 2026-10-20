@@ -1,0 +1,528 @@
+// Checkpoint (snapshot) files: chunk-addressable, lazily readable. See docs/STORAGE_API.md.
+//
+// File <dataDir>/snap-<16 hex lsn>.db, written as .tmp, fdatasynced, renamed, directory fsynced. Layout (LE):
+//   header (64 bytes): i64 magic "NEOSNAP2", u32 version=2, u32 headerCrc32c (computed with this field 0),
+//                      i64 lsn, i64 payloadLength, u32 directoryCrc32c, u32 chunkCount, i64 createdMicros,
+//                      i64 directoryOffset (= 64 + payloadLength), i64 reserved 0
+//   chunks:  the chunk bytes back to back (opaque to storage; the engine encodes its tables)
+//   directory (24 bytes per chunk): i64 offset, i64 length, u32 crc32c(chunk), u32 reserved 0
+// The header CRC covers the directory CRC, which covers every chunk's CRC and length: one CRC pass per chunk
+// verifies the whole file, and any single chunk can be read and verified on its own.
+//
+// Publishing requires the Wal: a snapshot at LSN S is only renamed into place once the WAL is durable up to S.
+// Retention: the newest snapshot, the previous valid one, and any pinned (still served) one are kept; WAL below the
+// previous snapshot's LSN is removed, so recovery can fall back if the newest is corrupt. Snapshots that fail
+// validation are renamed *.corrupt.
+use "../../lib/dbio.min" as dbio
+use "./crc32c.min" as crc
+use "./wal.min" as wal
+use "./util.min" as util
+
+public constant HEADER_BYTES = 64
+public constant DIRECTORY_ENTRY_BYTES = 24
+public constant VERSION = 2
+constant MAGIC = 0x3250414E534F454E    // "NEOSNAP2" read as a little-endian i64
+
+public function snapshotPath(dataDir: Text, lsn: Integer): Text {
+    return dataDir + "/snap-" + util.hex16(lsn) + ".db"
+}
+
+function tmpPath(dataDir: Text, lsn: Integer): Text {
+    return dataDir + "/snap-" + util.hex16(lsn) + ".tmp"
+}
+
+function corruptPath(dataDir: Text, lsn: Integer): Text {
+    return dataDir + "/snap-" + util.hex16(lsn) + ".corrupt"
+}
+
+// ------------------------------------------------------------------ writing
+
+public record Writer {
+    private dir: Text
+    private lsn: Integer
+    private tmp: Text
+    private fd: Integer
+    private table: crc.Table
+    private directory: Bytes       // 24-byte entries
+    private length: Integer
+    private chunks: Integer
+    private finished: Boolean
+}
+
+// Starts a snapshot of the state as of WAL LSN lsn (normally wal.appendedLsn(w) when the state was captured).
+public function begin(dataDir: Text, lsn: Integer): Writer {
+    let tmp = tmpPath(dataDir, lsn)
+    let fd = dbio.open(tmp, dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_TRUNCATE)
+    if fd < 0 { util.storageFail("create " + tmp, fd) }
+    let header = Bytes(HEADER_BYTES)     // placeholder, patched by finishWal()
+    let n = dbio.write(fd, header, 0, HEADER_BYTES)
+    if n < 0 { util.storageFail("write " + tmp, n) }
+    return Writer {
+        dir: dataDir; lsn: lsn; tmp: tmp; fd: fd; table: crc.makeTable(); directory: Bytes(); length: 0
+        chunks: 0; finished: false
+    }
+}
+
+// Appends chunk number chunkCount (empty chunks are kept, so chunk numbers are stable). A chunk read from an
+// older snapshot with readChunk can be passed straight back in: it is copied byte for byte.
+public function add(sw: Writer, chunk: Bytes) {
+    if sw.finished { fail("storage: snapshot add after finish") }
+    if chunk.length > 0 {
+        let n = dbio.write(sw.fd, chunk, 0, chunk.length)
+        if n < 0 { util.storageFail("write " + sw.tmp, n) }
+    }
+    let d = sw.directory
+    d.addInt64(HEADER_BYTES + sw.length)
+    d.addInt64(chunk.length)
+    d.addUInt32(crc.update(sw.table, 0, chunk, 0, chunk.length))
+    d.addUInt32(0)
+    sw.length += chunk.length
+    sw.chunks += 1
+}
+
+function encodeHeader(table: crc.Table, lsn: Integer, length: Integer, directoryCrc: Integer, chunks: Integer,
+                      created: Integer): Bytes {
+    let h = Bytes()
+    h.addInt64(MAGIC)
+    h.addUInt32(VERSION)
+    h.addUInt32(0)
+    h.addInt64(lsn)
+    h.addInt64(length)
+    h.addUInt32(directoryCrc)
+    h.addUInt32(chunks)
+    h.addInt64(created)
+    h.addInt64(HEADER_BYTES + length)
+    h.addInt64(0)
+    h.setUInt32(12, crc.of(table, h))
+    return h
+}
+
+// Publishes the snapshot: makes the WAL durable up to the snapshot LSN (fails if the WAL has not even reached
+// it), writes directory + header, fdatasyncs, renames, fsyncs the directory, then applies retention.
+// Returns the file size.
+public function finishWal(sw: Writer, w: wal.Wal): Integer {
+    if sw.finished { fail("storage: snapshot finished twice") }
+    if wal.dataDir(w) != sw.dir { fail("storage: snapshot and WAL are in different directories") }
+    if wal.appendedLsn(w) < sw.lsn { fail("storage: snapshot LSN is beyond the end of the WAL") }
+    if wal.durableLsn(w) < sw.lsn { wal.syncNow(w) }
+    if wal.durableLsn(w) < sw.lsn { fail("storage: WAL not durable up to the snapshot LSN") }
+    let d = sw.directory
+    let n = dbio.write(sw.fd, d, 0, d.length)
+    if n < 0 { util.storageFail("write directory " + sw.tmp, n) }
+    let header = encodeHeader(sw.table, sw.lsn, sw.length, crc.of(sw.table, d), sw.chunks, dbio.wallClockMicros())
+    n = dbio.pwrite(sw.fd, header, 0, HEADER_BYTES, 0)
+    if n < 0 { util.storageFail("write header " + sw.tmp, n) }
+    let rc = dbio.fdatasync(sw.fd)
+    if rc < 0 { util.storageFail("fdatasync " + sw.tmp, rc) }
+    dbio.close(sw.fd)
+    sw.fd = -1
+    let final = snapshotPath(sw.dir, sw.lsn)
+    rc = dbio.rename(sw.tmp, final)
+    if rc < 0 { util.storageFail("rename " + sw.tmp, rc) }
+    rc = dbio.fsyncDir(sw.dir)
+    if rc < 0 { util.storageFail("fsync dir " + sw.dir, rc) }
+    sw.finished = true
+    applyRetention(sw.dir, sw.lsn, w)
+    return HEADER_BYTES + sw.length + d.length
+}
+
+// Blocking checkpoint at the current end of the WAL. The chunks must encode exactly the state at
+// wal.appendedLsn(w). Returns the file size.
+public function checkpoint(w: wal.Wal, chunks: List<Bytes>): Integer {
+    let sw = begin(wal.dataDir(w), wal.appendedLsn(w))
+    for chunk in chunks { add(sw, chunk) }
+    return finishWal(sw, w)
+}
+
+// Keep the new snapshot, the newest older snapshot whose header+directory are valid ("previous"), and pinned ones.
+// Delete other older snapshots and the WAL entirely below the previous snapshot's LSN, so a recovery that has to
+// fall back from a corrupt newest snapshot still finds every record it needs. With no valid previous snapshot no
+// WAL is deleted: the fallback is then a replay of the whole WAL.
+// Re-read one snapshot file from disk and check the header, directory and every chunk CRC (16 MiB slices).
+function verifyFile(table: crc.Table, dataDir: Text, s: util.NamedLsn): Boolean {
+    let o = openFile(table, dataDir, s)
+    if !o.found { return false }
+    let ok = true
+    let i = 0
+    while ok && i < o.chunkCount {
+        let off = o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES)
+        let len = o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES + 8)
+        let want = o.directory.getUInt32(i * DIRECTORY_ENTRY_BYTES + 16)
+        let c = 0
+        let done = 0
+        while ok && done < len {
+            let n = min(16777216, len - done)
+            let data = dbio.pread(o.fd, off + done, n)
+            if data.length != n {
+                ok = false
+            } else {
+                c = crc.update(table, c, data, 0, n)
+                done += n
+            }
+        }
+        if ok && c != want { ok = false }
+        i += 1
+    }
+    close(o)
+    return ok
+}
+
+// Single-copy retention (like one Postgres heap): once the new snapshot is durable AND re-read and verified,
+// older unpinned snapshots and the WAL entirely below the new snapshot's LSN are removed. If verification fails,
+// fall back to keeping the previous valid snapshot and its WAL (keepPreviousRetention).
+function applyRetention(dataDir: Text, newLsn: Integer, w: wal.Wal) {
+    let table = crc.makeTable()
+    let verified = false
+    for s in listSnapshots(dataDir) {
+        if s.lsn == newLsn { verified = verifyFile(table, dataDir, s) }
+    }
+    if !verified {
+        keepPreviousRetention(dataDir, newLsn, w)
+        return
+    }
+    wal.setVerifiedSnapshot(w, newLsn)
+    let removed = false
+    for s in listSnapshots(dataDir) {
+        if s.lsn < newLsn && !wal.isSnapshotPinned(w, s.lsn) {
+            let rc = dbio.unlink(s.path)
+            if rc < 0 && rc != dbio.ENOENT { util.storageFail("unlink " + s.path, rc) }
+            removed = true
+        }
+    }
+    if removed {
+        let rc = dbio.fsyncDir(dataDir)
+        if rc < 0 { util.storageFail("fsync dir " + dataDir, rc) }
+    }
+    wal.removeSegmentsBelow(w, newLsn)
+}
+
+function keepPreviousRetention(dataDir: Text, newLsn: Integer, w: wal.Wal) {
+    let table = crc.makeTable()
+    let previous = -1
+    let removed = false
+    for s in listSnapshots(dataDir) {      // newest first
+        if s.lsn < newLsn {
+            let keep = wal.isSnapshotPinned(w, s.lsn)
+            if previous < 0 {
+                let probe = openFile(table, dataDir, s)
+                if probe.found {
+                    previous = s.lsn
+                    keep = true
+                }
+                close(probe)
+            }
+            if !keep {
+                let rc = dbio.unlink(s.path)
+                if rc < 0 && rc != dbio.ENOENT { util.storageFail("unlink " + s.path, rc) }
+                removed = true
+            }
+        }
+    }
+    if removed {
+        let rc = dbio.fsyncDir(dataDir)
+        if rc < 0 { util.storageFail("fsync dir " + dataDir, rc) }
+    }
+    if previous >= 0 { wal.removeSegmentsBelow(w, previous) }
+}
+
+// ------------------------------------------------------------------ lazy reading
+
+public record Opened {
+    found: Boolean
+    lsn: Integer
+    chunkCount: Integer
+    payloadLength: Integer
+    skippedCorrupt: Integer
+    path: Text
+    private dir: Text
+    private fd: Integer
+    private directory: Bytes
+    private table: crc.Table
+}
+
+// snap-<16 hex>.db files sorted newest first; deletes leftover .tmp files (incomplete checkpoints).
+function listSnapshots(dataDir: Text): List<util.NamedLsn> {
+    return snapshotsIn(dataDir, dbio.listDir(dataDir))
+}
+
+function snapshotsIn(dataDir: Text, names: List<Text>): List<util.NamedLsn> {
+    let found: List<util.NamedLsn> = []
+    let removedTmp = false
+    for name in names {
+        if name == "manifest-0.db" || name == "manifest-1.db" {
+            let lsn = slotLsn(dataDir + "/" + name)
+            if lsn >= 0 { found.add(util.NamedLsn { lsn: lsn; path: dataDir + "/" + name }) }
+        }
+        if util.matchHexName(name, "snap-", ".tmp") >= 0 {
+            dbio.unlink(dataDir + "/" + name)
+            removedTmp = true
+        }
+        let lsn = util.matchHexName(name, "snap-", ".db")
+        if lsn >= 0 { found.add(util.NamedLsn { lsn: lsn; path: dataDir + "/" + name }) }
+    }
+    if removedTmp { dbio.fsyncDir(dataDir) }
+    util.sortByLsn(found, true)
+    return found
+}
+
+function notFound(table: crc.Table, dataDir: Text, skipped: Integer): Opened {
+    return Opened {
+        found: false; lsn: 0; chunkCount: 0; payloadLength: 0; skippedCorrupt: skipped; path: ""; dir: dataDir
+        fd: -1; directory: Bytes(); table: table
+    }
+}
+
+// Opens one snapshot and validates header + directory (raw bytes only: untrusted data is never turned into Text,
+// which would stop the process on invalid UTF-8). found=false (fd closed) if anything is inconsistent.
+function openFile(table: crc.Table, dataDir: Text, s: util.NamedLsn): Opened {
+    let bad = notFound(table, dataDir, 1)
+    let fd = dbio.open(s.path, dbio.OPEN_READ)
+    if fd < 0 { return bad }
+    let size = dbio.fileSize(fd)
+    let header = dbio.pread(fd, 0, HEADER_BYTES)
+    if size < HEADER_BYTES || header.length != HEADER_BYTES || header.getInt64(0) != MAGIC {
+        dbio.close(fd)
+        return bad
+    }
+    let storedHeaderCrc = header.getUInt32(12)
+    let copy = header.slice(0, HEADER_BYTES)
+    copy.setUInt32(12, 0)
+    let lsn = header.getInt64(16)
+    let length = header.getInt64(24)
+    let dirCrc = header.getUInt32(32)
+    let count = header.getUInt32(36)
+    let dirOffset = header.getInt64(48)
+    let ok = crc.of(table, copy) == storedHeaderCrc && header.getUInt32(8) == VERSION && lsn == s.lsn &&
+             length >= 0 && dirOffset == HEADER_BYTES + length &&
+             size == dirOffset + count * DIRECTORY_ENTRY_BYTES
+    let directory = Bytes()
+    if ok {
+        directory = dbio.pread(fd, dirOffset, count * DIRECTORY_ENTRY_BYTES)
+        ok = directory.length == count * DIRECTORY_ENTRY_BYTES && crc.of(table, directory) == dirCrc
+    }
+    if ok {
+        // entries must tile the payload exactly
+        let expect = HEADER_BYTES
+        for i in 0..count {
+            let off = directory.getInt64(i * DIRECTORY_ENTRY_BYTES)
+            let len = directory.getInt64(i * DIRECTORY_ENTRY_BYTES + 8)
+            if off != expect || len < 0 { ok = false }
+            expect = off + len
+        }
+        if expect != dirOffset { ok = false }
+    }
+    if !ok {
+        dbio.close(fd)
+        return bad
+    }
+    return Opened {
+        found: true; lsn: lsn; chunkCount: count; payloadLength: length; skippedCorrupt: 0; path: s.path
+        dir: dataDir; fd: fd; directory: directory; table: table
+    }
+}
+
+// Newest snapshot whose header and chunk directory are valid; reads nothing else. Invalid ones are renamed
+// *.corrupt and the next older one is tried. found=false, lsn=0 if none. The fd stays open until close/release.
+public function openLatest(dataDir: Text): Opened {
+    return openLatestIn(dataDir, dbio.listDir(dataDir))
+}
+
+// Same as openLatest, with a directory listing the caller already has (startup lists the directory once).
+public function openLatestIn(dataDir: Text, names: List<Text>): Opened {
+    let table = crc.makeTable()
+    let skipped = 0
+    for s in snapshotsIn(dataDir, names) {
+        // a slot is rewritten in place: a torn rewrite can leave a valid header and directory over bad chunks, so
+        // slots are verified in full (they are small) before use
+        let o = notFound(table, dataDir, 1)
+        if !isSlotPath(s.path) || verifyFile(table, dataDir, s) { o = openFile(table, dataDir, s) }
+        if o.found {
+            o.skippedCorrupt = skipped
+            if skipped > 0 { dbio.fsyncDir(dataDir) }
+            return o
+        }
+        if !isSlotPath(s.path) { dbio.rename(s.path, corruptPath(dataDir, s.lsn)) }   // a torn slot is reused
+        skipped += 1
+    }
+    if skipped > 0 { dbio.fsyncDir(dataDir) }
+    return notFound(table, dataDir, skipped)
+}
+
+public function chunkLength(o: Opened, i: Integer): Integer {
+    if !o.found || i < 0 || i >= o.chunkCount { fail("storage: snapshot chunk index out of range") }
+    return o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES + 8)
+}
+
+// Positioned read of chunk i, verified against its CRC32C. A mismatch is fatal: the file is first renamed
+// *.corrupt, so the restart falls back to the previous snapshot + WAL (kept by retention).
+public function readChunk(o: Opened, i: Integer): Bytes {
+    let len = chunkLength(o, i)
+    let off = o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES)
+    let data = dbio.pread(o.fd, off, len)
+    if data.length != len || crc.update(o.table, 0, data, 0, len) != o.directory.getUInt32(i * DIRECTORY_ENTRY_BYTES + 16) {
+        dbio.rename(o.path, corruptPath(o.dir, o.lsn))
+        dbio.fsyncDir(o.dir)
+        fail("storage: snapshot " + o.path + " chunk " + Text(i) + " is corrupt (CRC mismatch or short read); " +
+             "the file was renamed *.corrupt: restart to recover from the previous snapshot and the WAL")
+    }
+    return data
+}
+
+// Keep this snapshot file through later checkpoints while chunks are still being read from it.
+public function pin(o: Opened, w: wal.Wal) {
+    if o.found { wal.pinSnapshot(w, o.lsn) }
+}
+
+// Done with the snapshot: unpin it (deleted by a later checkpoint's retention) and close the fd.
+public function release(o: Opened, w: wal.Wal) {
+    if o.found { wal.unpinSnapshot(w, o.lsn) }
+    close(o)
+}
+
+public function close(o: Opened) {
+    if o.fd >= 0 {
+        dbio.close(o.fd)
+        o.fd = -1
+    }
+}
+
+// ------------------------------------------------------------------ eager loading (existing callers)
+
+public record Loaded {
+    found: Boolean
+    lsn: Integer
+    payload: Bytes                 // all chunks concatenated
+    skippedCorrupt: Integer
+    path: Text
+}
+
+// Newest snapshot whose header, directory and every chunk verify; falls back to older ones otherwise (corrupt
+// ones are renamed *.corrupt). found=false, lsn=0 if none.
+public function loadLatest(dataDir: Text): Loaded {
+    let table = crc.makeTable()
+    let skipped = 0
+    for s in listSnapshots(dataDir) {
+        let o = openFile(table, dataDir, s)
+        let ok = o.found
+        let payload = Bytes()
+        if ok {
+            payload = dbio.pread(o.fd, HEADER_BYTES, o.payloadLength)
+            ok = payload.length == o.payloadLength
+            let i = 0
+            while ok && i < o.chunkCount {
+                let off = o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES) - HEADER_BYTES
+                let len = o.directory.getInt64(i * DIRECTORY_ENTRY_BYTES + 8)
+                ok = crc.update(table, 0, payload, off, len) == o.directory.getUInt32(i * DIRECTORY_ENTRY_BYTES + 16)
+                i += 1
+            }
+        }
+        close(o)
+        if ok {
+            if skipped > 0 { dbio.fsyncDir(dataDir) }
+            return Loaded { found: true; lsn: s.lsn; payload: payload; skippedCorrupt: skipped; path: s.path }
+        }
+        dbio.rename(s.path, corruptPath(dataDir, s.lsn))
+        skipped += 1
+    }
+    if skipped > 0 { dbio.fsyncDir(dataDir) }
+    return Loaded { found: false; lsn: 0; payload: Bytes(); skippedCorrupt: skipped; path: "" }
+}
+
+// ------------------------------------------------------------------ manifest slots (ADR-012)
+//
+// Two fixed files, manifest-0.db and manifest-1.db, hold the newest and the previous manifest in the same container
+// format as snap-*.db. A checkpoint rewrites the slot that does NOT hold the current manifest (write, truncate to
+// the new length, fdatasync on a background syncer, re-read and verify): no rename and no directory fsync, so
+// publishing never blocks the loop thread on a journal commit. A crash mid-rewrite leaves that slot torn (its
+// header/directory/chunk CRCs fail) and the other slot, the previous checkpoint, is used. Only the very first write
+// of a slot creates the file (one directory fsync per data directory).
+
+public function slotPath(dataDir: Text, k: Integer): Text { return dataDir + "/manifest-" + Text(k) + ".db" }
+
+public function isSlotPath(path: Text): Boolean {
+    let b = Bytes(path)
+    let s = Bytes("/manifest-0.db")
+    if b.length < s.length { return false }
+    let off = b.length - s.length
+    for i in 0..s.length {
+        if i != 10 && b[off + i] != s[i] { return false }
+    }
+    return b[off + 10] == 48 || b[off + 10] == 49
+}
+
+// Slot index of an opened manifest, -1 for a snap-*.db file or none.
+public function slotOf(o: Opened): Integer {
+    if !o.found || !isSlotPath(o.path) { return -1 }
+    let b = Bytes(o.path)
+    return b[b.length - 4] - 48
+}
+
+// LSN in a slot file's header (-1 if unreadable); the full validation happens in openFile.
+function slotLsn(path: Text): Integer {
+    let fd = dbio.open(path, dbio.OPEN_READ)
+    if fd < 0 { return -1 }
+    let h = dbio.pread(fd, 0, HEADER_BYTES)
+    dbio.close(fd)
+    if h.length != HEADER_BYTES || h.getInt64(0) != MAGIC { return -1 }
+    let lsn = h.getInt64(16)
+    if lsn < 0 { return -1 }
+    return lsn
+}
+
+// The container bytes (header + chunks + directory) of a manifest at lsn.
+public function encodeManifest(lsn: Integer, chunks: List<Bytes>): Bytes {
+    let table = crc.makeTable()
+    let body = Bytes()
+    body.resize(HEADER_BYTES)
+    let directory = Bytes()
+    let length = 0
+    for chunk in chunks {
+        body.addBytes(chunk)
+        directory.addInt64(HEADER_BYTES + length)
+        directory.addInt64(chunk.length)
+        directory.addUInt32(crc.update(table, 0, chunk, 0, chunk.length))
+        directory.addUInt32(0)
+        length += chunk.length
+    }
+    body.addBytes(directory)
+    let header = encodeHeader(table, lsn, length, crc.of(table, directory), chunks.length, dbio.wallClockMicros())
+    for i in 0..HEADER_BYTES { body[i] = header[i] }
+    return body
+}
+
+// Writes manifest bytes into slot k (page cache only) and returns the slot's descriptor; the caller makes it
+// durable (fdatasync, e.g. on a background syncer) and closes it. Creating the slot file the first time fsyncs
+// the directory.
+public function writeSlot(dataDir: Text, k: Integer, bytes: Bytes): Integer {
+    let path = slotPath(dataDir, k)
+    let created = dbio.pathSize(path) < 0
+    let fd = dbio.open(path, dbio.OPEN_WRITE | dbio.OPEN_CREATE)
+    if fd < 0 { util.storageFail("open " + path, fd) }
+    let n = dbio.pwrite(fd, bytes, 0, bytes.length, 0)
+    if n < 0 { util.storageFail("write " + path, n) }
+    let rc = dbio.ftruncate(fd, bytes.length)
+    if rc < 0 { util.storageFail("ftruncate " + path, rc) }
+    if created {
+        rc = dbio.fsyncDir(dataDir)
+        if rc < 0 { util.storageFail("fsync dir " + dataDir, rc) }
+    }
+    return fd
+}
+
+// Re-read slot k after its fdatasync: header, directory and every chunk CRC must verify and the LSN match.
+public function verifySlot(dataDir: Text, k: Integer, lsn: Integer): Boolean {
+    let s = util.NamedLsn { lsn: lsn; path: slotPath(dataDir, k) }
+    return verifyFile(crc.makeTable(), dataDir, s)
+}
+
+// After a slot manifest at lsn is durable and verified: delete round-1 style snapshot files (older by
+// construction) and retire the WAL below lsn. No directory fsync: a deletion lost in a crash only brings back a
+// file that recovery ignores (an older snapshot, or WAL segments below the manifest's LSN).
+public function slotRetention(dataDir: Text, lsn: Integer, w: wal.Wal) {
+    wal.setVerifiedSnapshot(w, lsn)
+    for name in dbio.listDir(dataDir) {
+        let l = util.matchHexName(name, "snap-", ".db")
+        if l >= 0 && l < lsn && !wal.isSnapshotPinned(w, l) { dbio.unlink(dataDir + "/" + name) }
+    }
+    wal.retireSegmentsBelow(w, lsn)
+}

@@ -76,11 +76,17 @@ function emitBinary(context: CompilerContext, globals: List<Text>, output: List<
         setType(resultType, 4)
         return value
     }
+    if isScalarChoiceType(leftType) && (operator == "==" || operator == "!=" || isOrderedOperator(operator)) {
+        let value = emitInstruction(output, textState, state, "icmp " + comparisonCondition(operator, 1) + " i64 " + left + ", " + right)
+        setType(resultType, 4)
+        return value
+    }
     if isRecordType(leftType) && (operator == "==" || operator == "!=" || isOrderedOperator(operator)) {
         let capability = "Equatable"
         let operation = "equal"
         if operator != "==" && operator != "!=" { capability = "Ordered"; operation = "compare" }
         requireRecordCapability(context, leftType, capability, location)
+        let custom = noteCapabilityCalls(context, leftType, operation, state, textState, output)
         let callee = derivedRecordFunction(context, leftType, operation, globals)
         let value = valueName(textState, newTemporary(state))
         if operation == "equal" {
@@ -92,6 +98,7 @@ function emitBinary(context: CompilerContext, globals: List<Text>, output: List<
             output.add("  " + value + " = call i64 " + callee + "(ptr " + left + ", ptr " + right + ")\n")
             value = emitInstruction(output, textState, state, "icmp " + comparisonCondition(operator, 1) + " i64 " + value + ", 0")
         }
+        if custom { recoveryCheckpoint(output, textState, state) }
         setType(resultType, 4)
         return value
     }
@@ -102,12 +109,14 @@ function emitBinary(context: CompilerContext, globals: List<Text>, output: List<
         while isMapType(comparable) || isSetType(comparable) {
             if isSetType(comparable) { comparable = 4 } else { comparable = mapValueType(comparable) }
         }
-        if comparable != 1 && comparable != 2 && comparable != 3 && comparable != 4 && comparable != 7 {
+        if comparable != 1 && comparable != 2 && comparable != 3 && comparable != 4 && comparable != 7 && !isScalarChoiceType(comparable) {
             failAtToken(locations, location, "Map equality needs comparable values: Integer, Text, Character, Boolean, Float, or Map")
         }
+        let custom = noteCapabilityCalls(context, leftType, "equal", state, textState, output)
         let result = valueName(textState, newTemporary(state))
         output.add("  " + result + " = call zeroext i1 @minyar_maps_are_equal(ptr " + left + ", ptr " + right + ", i64 " + Text(valueType) + ")\n")
         if operator == "!=" { result = emitInstruction(output, textState, state, "xor i1 " + result + ", true") }
+        if custom { recoveryCheckpoint(output, textState, state) }
         setType(resultType, 4)
         return result
     }
@@ -147,7 +156,16 @@ function emitBinary(context: CompilerContext, globals: List<Text>, output: List<
         if takeOwner(output, state, left, leftOwner) {
             runtimeName = "minyar_join_text_take_left"
         }
-        output.add("  \(result) = call ptr @\(runtimeName)(ptr \(left), ptr \(right))\n")
+        if runtimeName == "minyar_join_text" && !recoveryEnabled(state) && context.syntax.nodes[context.syntax.active].kind == 221 {
+            let transferPiece = output.length
+            output.add("")
+            output.add("  " + result + " = call ptr @")
+            noteTerminalReuse(context, context.syntax.active, transferPiece, output.length, left)
+            output.add(runtimeName)
+            output.add("(ptr " + left + ", ptr " + right + ")\n")
+        } else {
+            output.add("  \(result) = call ptr @\(runtimeName)(ptr \(left), ptr \(right))\n")
+        }
         setType(resultType, 2)
     } else {
         if (operator == "==" || operator == "!=") && leftType == 2 {
@@ -244,7 +262,9 @@ function parseExpression(context: CompilerContext, localNames: List<Text>, local
     while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "||") {
         let syntaxNode = wrapSyntaxOperand(context.syntax, 221, state[0])
         state[0] = state[0] + 1
-        requireType(tokenLines, state, resultType[0], 4, "the left side of || must be Boolean")
+        if resultType[0] != 4 {
+            requireTypeAt(tokenLines, context.syntax.nodes[context.syntax.nodes[syntaxNode].firstChild].start, resultType[0], 4, "the left side of || must be Boolean")
+        }
         let rightLabel = newLabel(state)
         let endLabel = newLabel(state)
         let leftBlock = textState[0]
@@ -257,7 +277,9 @@ function parseExpression(context: CompilerContext, localNames: List<Text>, local
         textState[0] = "logical.right." + Text(rightLabel)
         let rightType: List<Integer> = [0]
         let right = parseAnd(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
-        requireType(tokenLines, state, rightType[0], 4, "the right side of || must be Boolean")
+        if rightType[0] != 4 {
+            requireTypeAt(tokenLines, context.syntax.nodes[context.syntax.lastValue].start, rightType[0], 4, "the right side of || must be Boolean")
+        }
         let rightBlock = textState[0]
         output.add("""
               br label %logical.end.\(endLabel)
@@ -283,7 +305,9 @@ function parseAnd(context: CompilerContext, localNames: List<Text>, localTypes: 
     while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "&&") {
         let syntaxNode = wrapSyntaxOperand(context.syntax, 221, state[0])
         state[0] = state[0] + 1
-        requireType(tokenLines, state, resultType[0], 4, "the left side of && must be Boolean")
+        if resultType[0] != 4 {
+            requireTypeAt(tokenLines, context.syntax.nodes[context.syntax.nodes[syntaxNode].firstChild].start, resultType[0], 4, "the left side of && must be Boolean")
+        }
         let rightLabel = newLabel(state)
         let endLabel = newLabel(state)
         let leftBlock = textState[0]
@@ -296,7 +320,9 @@ function parseAnd(context: CompilerContext, localNames: List<Text>, localTypes: 
         textState[0] = "logical.right." + Text(rightLabel)
         let rightType: List<Integer> = [0]
         let right = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType, 1)
-        requireType(tokenLines, state, rightType[0], 4, "the right side of && must be Boolean")
+        if rightType[0] != 4 {
+            requireTypeAt(tokenLines, context.syntax.nodes[context.syntax.lastValue].start, rightType[0], 4, "the right side of && must be Boolean")
+        }
         let rightBlock = textState[0]
         output.add("""
               br label %logical.end.\(endLabel)
@@ -357,7 +383,7 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         if resultType.length > 1 {
             leftOwner = resultType[1]
         }
-        if isRecordType(leftType) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
+        if isRecordType(leftType) && !isScalarChoiceType(leftType) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
         if leftType == 2 && isOrderedOperator(operator) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
         if isMapType(leftType) || isSetType(leftType) {
             let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
@@ -593,7 +619,7 @@ function parseBytesMethod(context: CompilerContext, localNames: List<Text>, loca
     let callee = ""
     let returnType = 5
     if member == "add" {
-        callee = "minyar_bytes_add"
+        callee = ".minyar.bytes.add.checked"
         expected.add(1)
     }
     if member == "addBytes" {
@@ -622,6 +648,9 @@ function parseBytesMethod(context: CompilerContext, localNames: List<Text>, loca
         }
         if suffix != "" && (verb == "add" || verb == "get" || verb == "set") {
             callee = "minyar_bytes_" + verb + "_" + suffix
+            if (verb == "get" || verb == "set") && (suffix == "int32" || suffix == "uint32") {
+                callee = ".minyar.bytes." + verb + "." + suffix + ".checked"
+            }
             if verb == "add" {
                 expected.add(valueType)
             }
@@ -666,6 +695,28 @@ function callAt(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: Integ
     if tokenKinds[cursor + 1] != 4 || tokenTexts[cursor + 1] != "(" { return false }
     if tokenKinds[cursor] == 1 { return true }
     return tokenKinds[cursor] == 4 && (tokenTexts[cursor] == ")" || tokenTexts[cursor] == "]" || tokenTexts[cursor] == "}")
+}
+
+// A Bytes method that only reads or updates its own storage cannot release the
+// field or element that holds it. When its arguments make no calls, nothing
+// else can replace that container slot first, so the receiver needs no count.
+function bytesAccessWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+    if tokenTexts[position] != "." || tokenKinds[position + 1] != 1 || tokenKinds[position + 2] != 4 || tokenTexts[position + 2] != "(" { return false }
+    let member = tokenTexts[position + 1]
+    let update = member == "add" || member == "resize" || member == "clear"
+    if !update && member.length > 3 {
+        let verb = member.slice(0, 3)
+        update = (verb == "add" || verb == "set" || verb == "get") && bytesKindSuffix(member.slice(3, member.length)) != ""
+    }
+    return update && statementWithoutCalls(tokenKinds, tokenTexts, position + 3)
+}
+
+// Appending retains its argument and releases nothing, so an acyclic List
+// receiver held by a field or element needs no count when the argument makes
+// no calls.
+function listAppendWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+    if tokenTexts[position] != "." || tokenTexts[position + 1] != "add" || tokenKinds[position + 2] != 4 || tokenTexts[position + 2] != "(" { return false }
+    return statementWithoutCalls(tokenKinds, tokenTexts, position + 3)
 }
 
 function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {

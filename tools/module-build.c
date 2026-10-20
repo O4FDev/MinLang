@@ -305,7 +305,8 @@ static void ensure_directory(const char *path) {
 enum { MAX_LIBRARIES = 8 };
 static int compiler_run(const char *compiler, const char *entry, const char *output, int input_fd,
                         const char *state, const char *stats, const char *error, const char *budget,
-                        char *const *libraries, size_t library_count, const char *error_format) {
+                        int scope_owners, char *const *libraries, size_t library_count,
+                        const char *error_format) {
     if (lseek(input_fd, 0, SEEK_SET) < 0)
         stop("cache seek");
     pid_t child = fork();
@@ -322,7 +323,7 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
             _exit(126);
         char path[64];
         snprintf(path, sizeof path, "/dev/fd/%d", input_fd);
-        char *args[12 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
+        char *args[13 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
                                               "--module-state", path,          (char *)state,
                                               (char *)stats};
         size_t argc = 7;
@@ -330,6 +331,8 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
             args[argc++] = "--bounded-owners";
             args[argc++] = (char *)budget;
         }
+        if (scope_owners)
+            args[argc++] = "--scope-owners";
         for (size_t i = 0; i < library_count; i++) {
             args[argc++] = "--library";
             args[argc++] = libraries[i];
@@ -496,12 +499,24 @@ int main(int argc, char **argv) {
     checksum_self_test();
     if (argc == 2 && !strcmp(argv[1], "--checksum-self-test"))
         return 0;
-    int positional = argc;
+    int positional = 5;
+    if (argc > 5 && strncmp(argv[5], "--", 2))
+        positional = 6;
     const char *budget = NULL, *error_format = NULL, *library_options[MAX_LIBRARIES];
     size_t library_count = 0;
     unsigned owner_limit = 0;
-    while (positional >= 7) {
-        const char *option = argv[positional - 2], *value = argv[positional - 1];
+    int scope_owners = 0;
+    int next = positional;
+    while (next < argc) {
+        const char *option = argv[next];
+        if (!strcmp(option, "--scope-owners") && !scope_owners) {
+            scope_owners = 1;
+            next++;
+            continue;
+        }
+        if (next + 1 >= argc)
+            break;
+        const char *value = argv[next + 1];
         if (!strcmp(option, "--bounded-owners") && !budget) {
             budget = value;
             if (!owner_limit_for_budget(budget, &owner_limit)) {
@@ -516,18 +531,21 @@ int main(int argc, char **argv) {
             error_format = value;
         else
             break;
-        positional -= 2;
+        next += 2;
     }
-    if ((positional != 5 && positional != 6) || (positional == 6 && !strncmp(argv[5], "--", 2))) {
+    if (argc < 5 || next != argc) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET] [--library DIRECTORY]... [--error-format text|json]\n",
+              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json]\n",
               stderr);
         return 2;
     }
-    /* Options were read from the end; restore the order they were given in. */
+    if (scope_owners && budget) {
+        fputs("module build: --scope-owners and --bounded-owners cannot be combined\n", stderr);
+        return 2;
+    }
     char *libraries[MAX_LIBRARIES];
     for (size_t i = 0; i < library_count; i++)
-        libraries[i] = absolute_source(library_options[library_count - 1 - i]);
+        libraries[i] = absolute_source(library_options[i]);
     umask(077);
     char *compiler = realpath(argv[1], NULL);
     if (!compiler)
@@ -540,6 +558,12 @@ int main(int argc, char **argv) {
         size_t length = strlen(compiler_hex);
         char *identity = allocate(length + 40);
         snprintf(identity, length + 40, "%s:stack-owners-v1:%u", compiler_hex, owner_limit);
+        free(compiler_hex);
+        compiler_hex = identity;
+    } else if (scope_owners) {
+        size_t length = strlen(compiler_hex);
+        char *identity = allocate(length + sizeof ":scope-owners-v1");
+        snprintf(identity, length + sizeof ":scope-owners-v1", "%s:scope-owners-v1", compiler_hex);
         free(compiler_hex);
         compiler_hex = identity;
     }
@@ -560,6 +584,8 @@ int main(int argc, char **argv) {
     if (owner_limit)
         snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u.cache", entry_hash,
                  owner_limit);
+    else if (scope_owners)
+        snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1.cache", entry_hash);
     else
         snprintf(key, sizeof key, "%016" PRIx64 ".cache", entry_hash);
     char *cache = join(argv[4], key);
@@ -631,10 +657,10 @@ int main(int argc, char **argv) {
         input_fd = plan_fd;
     }
     int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
-                              libraries, library_count, error_format);
+                              scope_owners, libraries, library_count, error_format);
     if (result && cache_valid)
         result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
-                              libraries, library_count, error_format);
+                              scope_owners, libraries, library_count, error_format);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
@@ -670,9 +696,9 @@ int main(int argc, char **argv) {
                 errno = EPROTO;
                 stop("invalid compiler state");
             }
-            if (equals(schema, "minyar-module-delta-v3"))
+            if (equals(schema, "minyar-module-delta-v9"))
                 publish_cache(delta, compiler_hex, entry, fresh);
-            else if (equals(schema, "minyar-module-interface-v5"))
+            else if (equals(schema, "minyar-module-interface-v11"))
                 publish_cache(cache, compiler_hex, entry, fresh);
             else {
                 errno = EPROTO;

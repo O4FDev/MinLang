@@ -1,0 +1,297 @@
+use "../tools/testing.min" as test
+use "../tools/book-examples.min" as book
+use "io" as io
+use "files" as files
+use "system" as system
+use "process" as arguments
+
+record Page { path: Text; examples: List<book.Example> }
+
+// Normalize only actual-source location fields at the start of a line. The
+// same pathname in a source excerpt, error message or help remains exact.
+function sourceLocation(stderr: Text, source: Text): Boolean {
+    let prefix = "  --> " + source + ":"
+    return stderr.startsWith(prefix) || stderr.find("\n" + prefix) >= 0
+}
+function normalizeLocations(stderr: Text, source: Text): Text {
+    let prefix = "  --> " + source + ":"
+    let normalized = test.replace(stderr, "\n" + prefix, "\n  --> program.min:")
+    if normalized.startsWith(prefix) { normalized = "  --> program.min:" + normalized.slice(prefix.length, normalized.length) }
+    return normalized
+}
+function rejectionMatches(result: test.Result, source: Text, diagnostic: Text, llvmPresent: Boolean): Boolean {
+    return result.status == 1 && result.output == "" && result.errorOutput != "" && diagnostic != "" &&
+        sourceLocation(result.errorOutput, source) && !sourceLocation(result.errorOutput, "program.min") &&
+        normalizeLocations(result.errorOutput, source) == diagnostic && !llvmPresent
+}
+function rejectionControls(): Integer {
+    let source = "/private/book-control/program.min"
+    let diagnostic = "error: example failure\n  --> program.min:1:3\n  |\n1 | wrong()\n  |   ^ expected a value\n"
+    let actual = test.replace(diagnostic, "program.min", source)
+    let correct = test.Result { status: 1; output: ""; errorOutput: actual }
+    test.check(rejectionMatches(correct, source, diagnostic, false), "exact compiler rejection normalizes only the private source location")
+    let literal = "  = help: preserve literal " + source + "\n"
+    let withLiteral = test.Result { status: 1; output: ""; errorOutput: actual + literal }
+    test.check(rejectionMatches(withLiteral, source, diagnostic + literal, false), "source pathname outside a location must remain unchanged")
+    let wrong: List<test.Result> = [
+        test.Result { status: 0; output: ""; errorOutput: actual },
+        test.Result { status: 2; output: ""; errorOutput: actual },
+        test.Result { status: 124; output: ""; errorOutput: actual },
+        test.Result { status: 137; output: ""; errorOutput: actual },
+        test.Result { status: 1; output: "unexpected stdout\n"; errorOutput: actual },
+        test.Result { status: 1; output: ""; errorOutput: "" },
+        test.Result { status: 1; output: ""; errorOutput: actual + "extra diagnostic\n" },
+        test.Result { status: 1; output: ""; errorOutput: test.replace(actual, source, "/different/program.min") },
+        test.Result { status: 1; output: ""; errorOutput: diagnostic },
+        test.Result { status: 1; output: ""; errorOutput: test.replace(actual, source, source + "-copy") }
+    ]
+    for result in wrong {
+        test.check(!rejectionMatches(result, source, diagnostic, false), "rejection oracle accepted wrong status/output/diagnostic")
+    }
+    test.check(!rejectionMatches(correct, source, diagnostic, true), "compiler rejection must not emit LLVM")
+    test.check(!rejectionMatches(correct, source, "", false), "compiler rejection must have an expected diagnostic")
+    test.check(!rejectionMatches(correct, source, test.replace(diagnostic, "expected a value", "expected  a value"), false), "rejection oracle must preserve diagnostic spacing")
+    let outside = test.Result { status: 1; output: ""; errorOutput: diagnostic + "  = help: " + source + "\n" }
+    test.check(!rejectionMatches(outside, source, diagnostic + "  = help: program.min\n", false), "pathname outside a location cannot establish source origin")
+    test.check(!rejectionMatches(withLiteral, source, diagnostic + test.replace(literal, source, "program.min"), false), "normalization must not rewrite pathname literals in help")
+    let mixed = test.Result { status: 1; output: ""; errorOutput: actual + diagnostic }
+    test.check(!rejectionMatches(mixed, source, diagnostic + diagnostic, false), "every diagnostic location must originate from actual compiler stderr, not a pre-normalized block")
+    return wrong.length + 6
+}
+
+function parserControls(): Integer {
+    let example = "```minyar\nprint(\"Héllo, sea.\")\n```\n\n```output\nHéllo, sea. \n\n```\n"
+    let quiet = "```minyar\nlet answer = 42\n```\n```output\n```\n"
+    let parsed = book.parse("# A chapter\n\n```rust\nfn main() {}\n```\n" + example + quiet)
+    test.check(parsed.error == "" && parsed.examples.length == 2, "parser discovers every complete program beside display fences")
+    test.check(parsed.examples[0].source == "print(\"Héllo, sea.\")\n" && parsed.examples[0].output == "Héllo, sea. \n\n" && parsed.examples[0].line == 7,
+        "parser preserves UTF-8, source lines, trailing spaces and blank output lines")
+    test.check(parsed.examples[1].output == "" && parsed.examples[0].path == "" && parsed.examples[1].path == "", "standalone programs have no file path and explicit empty output means zero bytes")
+    let windows = book.parse(test.replace(quiet, "\n", "\r\n"))
+    test.check(windows.error == "" && windows.examples[0].source == "let answer = 42\n" && windows.examples[0].output == "", "CRLF documentation has the same source and output")
+    test.check(!parsed.examples[0].rejected && !parsed.examples[1].rejected, "ordinary examples retain successful-source behavior")
+    let failureSource = "let total: Integer = \"many\"\n"
+    let diagnostic = "error: example failure\n  --> program.min:1:22\n  |\n1 | let total: Integer = \"many\"\n  |                      ^ expected Integer\n"
+    let rejecting = "```minyar-reject\n" + failureSource + "```\n```diagnostic\n" + diagnostic + "```\n"
+    let failure = book.parse(rejecting)
+    test.check(failure.error == "" && failure.examples.length == 1 && failure.examples[0].rejected && failure.examples[0].path == "" &&
+        failure.examples[0].source == failureSource && failure.examples[0].output == diagnostic && failure.examples[0].line == 2,
+        "rejection source and full human diagnostic are preserved byte for byte")
+    let failureWindows = book.parse(test.replace(rejecting, "\n", "\r\n"))
+    test.check(failureWindows.error == "" && failureWindows.examples[0].source == failureSource && failureWindows.examples[0].output == diagnostic,
+        "CRLF rejection pairs preserve normalized source and diagnostic bytes")
+    let repairing = book.parse(rejecting + quiet)
+    test.check(repairing.error == "" && repairing.examples.length == 2 && repairing.examples[0].rejected && !repairing.examples[1].rejected,
+        "a rejection and its successful repair can share a standalone page")
+    for program in ["// file operations can fail\nprint(42)\n", "print(42)\n// file: src/main.min\n", "\n// file: src/main.min\nprint(42)\n", "let words = \"\"\"\n// file: src/main.min\n\"\"\"\nprint(words)\n", "let words = #\"\"\"\n// file: src/main.min\n\"\"\"#\nprint(words)\n"] {
+        let prose = book.parse("```minyar\n" + program + "```\n```output\n42\n```\n")
+        test.check(prose.error == "" && prose.examples[0].path == "" && prose.examples[0].source == program,
+            "only the first source line can declare file metadata; prose comments and raw Text remain source")
+    }
+    let module = "// file: src/garden.min\npublic function name(): Text { return \"Héllo, sea.\" }\n"
+    let main = "// file: src/main.min\nuse \"./garden.min\" as garden\nprint(garden.name())\n"
+    let projectPage = "# Files\n\n```minyar\n" + module + "```\n```output\n```\n\n```minyar\n" + main + "```\n```output\nHéllo, sea.\n```\n"
+    let project = book.parse(projectPage)
+    test.check(project.error == "" && project.examples.length == 2, "parser discovers a complete project page")
+    test.check(project.examples[0].path == "src/garden.min" && project.examples[0].source == module && project.examples[0].output == "" && project.examples[0].line == 4,
+        "project module preserves marker, source, line and explicit empty output")
+    test.check(project.examples[1].path == "src/main.min" && project.examples[1].source == main && project.examples[1].output == "Héllo, sea.\n",
+        "project entry preserves relative import and expected output")
+    let projectWindows = book.parse(test.replace(projectPage, "\n", "\r\n"))
+    test.check(projectWindows.error == "" && projectWindows.examples[0].source == module && projectWindows.examples[1].source == main,
+        "CRLF project markers retain normalized complete source files")
+    let nested = book.parse("```minyar\n// file: src/garden_2/Bed-3.min\nprint(42)\n```\n```output\n42\n```\n")
+    test.check(nested.error == "" && nested.examples[0].path == "src/garden_2/Bed-3.min", "safe nested ASCII names are accepted")
+    let private = test.scratch()
+    test.check(files.makeDirectory(private + "/src") == 0, "cannot create private scaffold directory")
+    io.writeTextFile(private + "/src/main.min", "generated source\n")
+    io.writeTextFile(private + "/Minyar.toml", "keep this scaffold\n")
+    book.writeFiles(project.examples, private)
+    test.check(io.readTextFile(private + "/src/main.min") == main && io.readTextFile(private + "/src/garden.min") == module,
+        "materialization copies every page file exactly and replaces scaffold source")
+    test.check(io.readTextFile(private + "/Minyar.toml") == "keep this scaffold\n", "materialization preserves unrelated scaffold files")
+    let second = private + "/second"
+    test.check(files.makeDirectory(second) == 0, "cannot create independent project directory")
+    book.writeFiles(project.examples, second)
+    io.writeTextFile(private + "/src/garden.min", "changed first worktree\n")
+    test.check(io.readTextFile(second + "/src/garden.min") == module, "each project materialization has independent source files")
+    book.writeFiles(nested.examples, second)
+    test.check(io.readTextFile(second + "/src/garden_2/Bed-3.min") == nested.examples[0].source, "materialization creates nested parents")
+    test.removeTree(private)
+    let invalidCases: List<List<Text>> = [
+        ["# No program\n", "at least one"],
+        ["```output\n42\n```\n", "orphan output"],
+        ["```minyar\nprint(42)\n```\n", "immediately following output"],
+        ["```minyar\nprint(42)\n```\nSome prose\n```output\n42\n```\n", "immediately following output"],
+        ["```minyar\n```\n```output\n```\n", "empty Minyar"],
+        ["```minyar\n \t\n```\n```output\n```\n", "empty Minyar"],
+        ["```minyarr\nprint(42)\n```\n", "unsupported"],
+        ["```Minyar\nprint(42)\n```\n", "unsupported"],
+        ["```minyar skip\nprint(42)\n```\n", "unsupported"],
+        [" ```minyar\nprint(42)\n```\n", "unsupported"],
+        ["> ```minyar\nprint(42)\n```\n", "unsupported"],
+        ["~~~minyar\nprint(42)\n~~~\n", "unsupported"],
+        ["````minyar\nprint(42)\n````\n", "unsupported"],
+        ["```python\nprint(42)\n```\n", "unsupported"],
+        ["```\n", "unsupported"],
+        ["```minyar\nprint(42)\n", "unclosed code"],
+        ["```text\nunfinished\n", "unclosed code"],
+        ["```minyar\nprint(42)\n```output\n", "malformed closing code"],
+        ["```minyar\nprint(42)\n ```\n", "malformed closing code"],
+        ["```minyar\nprint(42)\n```\n```output\n42\n", "unclosed output"],
+        ["```minyar\nprint(42)\n```\n```output\n42\n````\n", "malformed closing output"],
+        [quiet + "```output\n```\n", "orphan output"],
+        [quiet + "```minyarr\nprint(42)\n```\n", "unsupported"]
+    ]
+    let marked = "```minyar\n// file: src/main.min\nprint(42)\n```\n```output\n42\n```\n"
+    for path in ["", "/main.min", "../main.min", "src/../main.min", "./main.min", "src/./main.min", "src//main.min", "src/main.min/", "src/.min", "src/main", "src/main.txt", "src/main.MIN", "C:/main.min", "src\\main.min", "-main.min", "src/--main.min", "src/main.min ", "src/my file.min", "src/ma\tin.min", "src/é.min", "src/main;echo.min", "src/a.b.min"] {
+        invalidCases.add([test.replace(marked, "src/main.min", path), "safe canonical relative .min path"])
+    }
+    for marker in ["//file: src/main.min", " // file: src/main.min", "// file:src/main.min", "// file src/main.min", "// file", "// file:\tsrc/main.min", "// File: src/main.min", "// FILE: src/main.min", "// file=src/main.min"] {
+        invalidCases.add([test.replace(marked, "// file: src/main.min", marker), "malformed file marker"])
+    }
+    invalidCases.add([marked + marked, "duplicate project file path"])
+    for path in ["src/Main.min", "Src/main.min", "SRC/MAIN.min"] {
+        invalidCases.add([marked + test.replace(marked, "src/main.min", path), "duplicate project file path"])
+    }
+    invalidCases.add([marked + quiet, "cannot mix project files"])
+    invalidCases.add([quiet + marked, "cannot mix project files"])
+    invalidCases.add([test.replace(marked, "print(42)\n", ""), "empty Minyar"])
+    invalidCases.add(["```minyar\n// file: src/main.min\nprint(42)\n```\n", "immediately following output"])
+    invalidCases.add(["```diagnostic\nerror: orphan\n```\n", "orphan diagnostic"])
+    invalidCases.add([test.replace(rejecting, "```minyar-reject", "```minyar-reject skip"), "unsupported"])
+    invalidCases.add([test.replace(rejecting, "```diagnostic", "```output"), "immediately following diagnostic"])
+    invalidCases.add([test.replace(quiet, "```output", "```diagnostic"), "immediately following output"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n", "immediately following diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\nSome prose\n```diagnostic\nerror: wrong\n```\n", "immediately following diagnostic"])
+    invalidCases.add(["```minyar-reject\n```\n```diagnostic\nerror: wrong\n```\n", "empty Minyar"])
+    invalidCases.add([test.replace(rejecting, diagnostic, ""), "nonempty diagnostic"])
+    invalidCases.add([test.replace(rejecting, diagnostic, " \t\n"), "nonempty diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n```diagnostic\nerror: wrong\n", "unclosed diagnostic"])
+    invalidCases.add(["```minyar-reject\nwrong()\n```\n```diagnostic\nerror: wrong\n ````\n", "malformed closing diagnostic"])
+    invalidCases.add([test.replace(rejecting, failureSource, "// file: src/main.min\n" + failureSource), "cannot have file markers"])
+    invalidCases.add([test.replace(rejecting, failureSource, "//file: src/main.min\n" + failureSource), "cannot have file markers"])
+    invalidCases.add([marked + rejecting, "cannot mix project files"])
+    invalidCases.add([rejecting + marked, "cannot mix project files"])
+    invalidCases.add([marked + test.replace(marked, "// file: src/main.min\nprint(42)", "print(42)\n// file: src/main.min"), "cannot mix project files"])
+    for candidate in invalidCases {
+        let rejected = book.parse(candidate[0])
+        test.check(test.contains(rejected.error, candidate[1]), "parser accepted or misreported invalid documentation: " + candidate[0] + "\n" + rejected.error)
+    }
+    return invalidCases.length
+}
+
+function discover(directory: Text, root: Text, found: List<Text>, seen: Map<Text, Boolean>) {
+    let real = test.resolvePath(directory)
+    test.check(real != "" && (real == root || real.startsWith(root + "/")), "book directory escapes its root: " + directory)
+    test.check(!seen.has(real), "book directory is repeated or cyclic: " + directory)
+    seen[real] = true
+    let names = files.list(directory)
+    test.check(files.lastError() == 0, "cannot list book directory: " + directory)
+    names.sort()
+    for name in names {
+        let path = directory + "/" + name
+        let children = files.list(path)
+        let error = files.lastError()
+        if error == 0 { discover(path, root, found, seen) }
+        else {
+            test.check(error == -20, "cannot inspect book entry: " + path + " (" + Text(error) + ")")
+            if path.endsWith(".md") { found.add(path) }
+        }
+    }
+}
+function read(path: Text): Text {
+    let data = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot read required book page: " + path)
+    return Text(data)
+}
+function verify(compiler: test.Compiler, page: Page, example: book.Example, location: Text, serial: Integer) {
+    let work = compiler.directory + "/example-" + Text(serial)
+    test.check(files.makeDirectory(work) == 0, "cannot create example directory")
+    let source = work + "/program.min"
+    if example.path == "" { io.writeTextFile(source, example.source) }
+    else {
+        book.writeFiles(page.examples, work)
+        source = work + "/" + example.path
+    }
+    if example.rejected {
+        // Ordinary mode is deliberate: test mode omits application statements.
+        let llvm = work + "/rejected.ll"
+        test.check(files.pathSize(llvm) < 0, "rejection LLVM output already exists")
+        let command = [compiler.executable, source, llvm, "--library", "library"]
+        let built = test.run(command, system.environment(), "", work + "/rejected-compile", compiler.compileTimeout)
+        test.check(rejectionMatches(built, source, example.output, files.pathSize(llvm) >= 0),
+            location + " rejection differs (status " + Text(built.status) + ")\nexpected diagnostic:\n" + example.output +
+            "received stdout:\n" + built.output + "received stderr:\n" + normalizeLocations(built.errorOutput, source))
+        return
+    }
+    for mode in ["program", "tests"] {
+        let llvm = work + "/" + mode + ".ll"
+        let command = [compiler.executable, source, llvm, "--library", "library"]
+        if mode == "tests" { command.add("--test-mode") }
+        let built = test.run(command, system.environment(), "", work + "/" + mode + "-compile", compiler.compileTimeout)
+        test.require(built, location + " " + mode + " compilation")
+        test.check(built.errorOutput == "" && files.pathSize(llvm) > 0, location + " compilation produced diagnostics or no LLVM\n" + built.errorOutput)
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(llvm, test.instrument(io.readTextFile(llvm))) }
+        for optimization in ["-O0", "-O2"] {
+            let directory = work + "/" + mode + optimization
+            test.check(files.makeDirectory(directory) == 0, "cannot create private execution directory")
+            let executable = directory + "/program"
+            test.check(files.pathSize(executable) < 0, "example executable already exists")
+            let link = [compiler.clang, optimization]
+            for flag in compiler.flags { link.add(flag) }
+            for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", executable] { link.add(item) }
+            test.require(test.run(link, system.environment(), "", directory + "/link", compiler.linkTimeout), location + " " + mode + " " + optimization + " link")
+            let run = test.run([executable], system.environment(), directory, directory + "/run", compiler.runTimeout)
+            test.require(run, location + " " + mode + " " + optimization + " execution")
+            test.check(run.errorOutput == "", location + " " + mode + " " + optimization + " wrote diagnostics\n" + run.errorOutput)
+            if mode == "program" {
+                test.check(run.output == example.output, location + " " + optimization + " output differs\nexpected:\n" + example.output + "received:\n" + run.output)
+            }
+        }
+    }
+}
+
+let rejected = parserControls()
+let rejectedResults = rejectionControls()
+if arguments.argumentCount() == 1 && arguments.argument(0) == "--self-check" {
+    print("Book parser: " + Text(rejected) + " invalid controls rejected; " + Text(rejectedResults) + " invalid compiler results rejected; source, diagnostic and project controls passed")
+    exit(0)
+}
+test.check(arguments.argumentCount() == 0, "usage: book [--self-check]")
+let paths: List<Text> = []
+let root = test.resolvePath("docs/book")
+test.check(root != "", "required docs/book directory is missing")
+discover("docs/book", root, paths, Map<Text, Boolean>())
+test.check(paths.length > 0, "book has no Markdown pages")
+let introduction = false
+for path in paths { if path == "docs/book/README.md" { introduction = true } }
+test.check(introduction, "required docs/book/README.md is missing")
+for path in ["docs/from-rust.md", "docs/from-cpp.md", "docs/from-swift.md"] { paths.add(path) }
+paths.sort()
+let pages: List<Page> = []
+for path in paths {
+    let parsed = book.parse(read(path))
+    test.check(parsed.error == "", path + ": " + parsed.error)
+    if path == "docs/book/08-garden.md" {
+        test.check(parsed.examples.length == 1 && read("examples/gallery/community-garden.min") == parsed.examples[0].source,
+            "the runnable garden gallery must match the complete book program")
+    }
+    pages.add(Page { path: path; examples: parsed.examples })
+}
+let compiler = test.compiler()
+if compiler.flags.length == 0 { compiler.compileTimeout = 15 }
+let checked = 0
+let successful = 0
+let compilerRejections = 0
+for page in pages {
+    for example in page.examples {
+        checked += 1
+        if example.rejected { compilerRejections += 1 } else { successful += 1 }
+        verify(compiler, page, example, page.path + ":" + Text(example.line), checked)
+    }
+}
+test.removeTree(compiler.directory)
+print(Text(successful) + " successful book source examples (" + Text(successful * 4) + " native executions at O0/O2, including embedded tests) and " +
+    Text(compilerRejections) + " compiler rejection examples across " + Text(paths.length) + " pages passed; " + Text(rejected) + " invalid parser controls and " +
+    Text(rejectedResults) + " invalid compiler results rejected")

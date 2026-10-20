@@ -1,0 +1,274 @@
+// Test-only facade. Production WAL/CRC/util/snapshot sources are unchanged.
+// This single-owner adapter owns the World's completion stream. Directory
+// existence is fixture configuration; names and bytes use simulation durability.
+use "simulation" as simulation
+
+public constant OPEN_READ = 1
+public constant OPEN_WRITE = 2
+public constant OPEN_CREATE = 4
+public constant OPEN_APPEND = 8
+public constant OPEN_TRUNCATE = 16
+public constant OPEN_EXCLUSIVE = 32
+public constant ENOENT = -2
+public constant EEXIST = -17
+public constant ETIMEDOUT = -110
+
+record Descriptor { file: Integer; path: Text; offset: Integer; flags: Integer; closed: Boolean }
+record Syncer { file: Integer; synced: Integer; requested: Integer; error: Integer; stopped: Boolean }
+record Request { operation: Integer; handle: Integer; upTo: Integer; done: Boolean }
+record Context {
+    world: simulation.World
+    descriptors: List<Descriptor>
+    directories: List<Text>
+    syncers: List<Syncer>
+    requests: List<Request>
+    error: Integer
+}
+global STATE: Context = Context {
+    world: simulation.create(1); descriptors: []; directories: []; syncers: []; requests: []; error: 0
+}
+
+public function bind(world: simulation.World) {
+    STATE.world = world
+    STATE.descriptors = []
+    STATE.directories = []
+    STATE.syncers = []
+    STATE.requests = []
+    STATE.error = 0
+}
+public function crash() {
+    simulation.crash(STATE.world)
+    // Restart drops process handles; the configured directory objects survive.
+    STATE.descriptors = []
+    STATE.syncers = []
+    STATE.requests = []
+    STATE.error = 0
+}
+public function lastError(): Integer { return STATE.error }
+// World's clocks use milliseconds. Snapshot timestamps use microseconds.
+public function wallClockMicros(): Integer { return simulation.wallTime(STATE.world) * 1000 }
+public function errorText(code: Integer): Text { return "simulated I/O error" }
+public function mkdir(path: Text): Integer {
+    for name in STATE.directories { if name == path { return EEXIST } }
+    STATE.directories.add(path)
+    return 0
+}
+function directory(path: Text): Boolean {
+    for name in STATE.directories { if name == path { return true } }
+    return false
+}
+function valid(fd: Integer): Boolean {
+    STATE.error = 0
+    if fd < 1 || fd > STATE.descriptors.length { STATE.error = -9; return false }
+    if STATE.descriptors[fd - 1].closed { STATE.error = -9; return false }
+    return true
+}
+public function open(path: Text, flags: Integer): Integer {
+    STATE.error = 0
+    let file = 0
+    if !directory(path) {
+        if flags & OPEN_EXCLUSIVE != 0 {
+            let existing = simulation.openFile(STATE.world, path, false)
+            if existing >= 0 { STATE.error = EEXIST; return EEXIST }
+        }
+        file = simulation.openFile(STATE.world, path, flags & OPEN_CREATE != 0)
+        if file < 0 { STATE.error = file; return file }
+        if flags & OPEN_TRUNCATE != 0 {
+            let rc = simulation.resize(STATE.world, file, 0)
+            if rc < 0 { STATE.error = rc; return rc }
+        }
+    }
+    let offset = 0
+    if file > 0 && flags & OPEN_APPEND != 0 { offset = simulation.size(STATE.world, file) }
+    STATE.descriptors.add(Descriptor { file: file; path: path; offset: offset; flags: flags; closed: false })
+    return STATE.descriptors.length
+}
+public function close(fd: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    STATE.descriptors[fd - 1].closed = true
+    return 0
+}
+public function fileSize(fd: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    let file = STATE.descriptors[fd - 1].file
+    if file == 0 { STATE.error = -21; return STATE.error }
+    let rc = simulation.size(STATE.world, file)
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function pathSize(path: Text): Integer {
+    let file = simulation.openFile(STATE.world, path, false)
+    STATE.error = simulation.lastError(STATE.world)
+    if file < 0 { return file }
+    return simulation.size(STATE.world, file)
+}
+public function pwrite(fd: Integer, data: Bytes, offset: Integer, length: Integer, fileOffset: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    let descriptor = STATE.descriptors[fd - 1]
+    if descriptor.file == 0 { STATE.error = -21; return STATE.error }
+    if descriptor.flags & OPEN_WRITE == 0 { STATE.error = -9; return STATE.error }
+    if offset < 0 || length < 0 || offset > data.length || length > data.length - offset {
+        STATE.error = -22; return STATE.error
+    }
+    let rc = simulation.write(STATE.world, descriptor.file, fileOffset, data.slice(offset, offset + length))
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function write(fd: Integer, data: Bytes, offset: Integer, length: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    let descriptor = STATE.descriptors[fd - 1]
+    if descriptor.flags & OPEN_APPEND != 0 { descriptor.offset = fileSize(fd) }
+    let rc = pwrite(fd, data, offset, length, descriptor.offset)
+    if rc > 0 { descriptor.offset += rc }
+    return rc
+}
+public function pread(fd: Integer, fileOffset: Integer, length: Integer): Bytes {
+    if !valid(fd) { return Bytes() }
+    let file = STATE.descriptors[fd - 1].file
+    if file == 0 { STATE.error = -21; return Bytes() }
+    let data = simulation.read(STATE.world, file, fileOffset, length)
+    STATE.error = simulation.lastError(STATE.world)
+    return data
+}
+public function ftruncate(fd: Integer, length: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    let rc = simulation.resize(STATE.world, STATE.descriptors[fd - 1].file, length)
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function fdatasync(fd: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    let descriptor = STATE.descriptors[fd - 1]
+    let rc = 0
+    if descriptor.file == 0 { rc = simulation.syncDirectory(STATE.world, descriptor.path) }
+    else { rc = simulation.syncFile(STATE.world, descriptor.file) }
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function fsync(fd: Integer): Integer { return fdatasync(fd) }
+public function fsyncDir(path: Text): Integer {
+    let rc = simulation.syncDirectory(STATE.world, path)
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function rename(from: Text, to: Text): Integer {
+    let rc = simulation.rename(STATE.world, from, to)
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function unlink(path: Text): Integer {
+    let rc = simulation.remove(STATE.world, path)
+    STATE.error = simulation.lastError(STATE.world)
+    return rc
+}
+public function listDir(path: Text): List<Text> { return simulation.names(STATE.world, path) }
+public function firstNonZero(data: Bytes, offset: Integer, length: Integer): Integer {
+    for index in offset..(offset + length) { if data[index] != 0 { return index } }
+    return -1
+}
+
+function syncerValid(handle: Integer): Boolean {
+    if handle < 1 || handle > STATE.syncers.length { STATE.error = -9; return false }
+    if STATE.syncers[handle - 1].stopped { STATE.error = -9; return false }
+    return true
+}
+public function syncerStart(fd: Integer): Integer {
+    if !valid(fd) { return STATE.error }
+    STATE.syncers.add(Syncer {
+        file: STATE.descriptors[fd - 1].file; synced: 0; requested: 0; error: 0; stopped: false
+    })
+    return STATE.syncers.length
+}
+// There is deliberately no native notification socket in a simulated world.
+public function syncerNotifyFd(handle: Integer): Integer { return -1 }
+public function syncerRequest(handle: Integer, upTo: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    let syncer = STATE.syncers[handle - 1]
+    if syncer.error < 0 { return syncer.error }
+    if upTo <= syncer.requested { return 0 }
+    if syncer.file <= 0 { return -9 }
+    let token = STATE.requests.length + 1
+    let operation = simulation.submitSync(STATE.world, syncer.file, token)
+    STATE.requests.add(Request { operation: operation; handle: handle; upTo: upTo; done: false })
+    syncer.requested = upTo
+    return 0
+}
+// The caller drives progress explicitly. Equal-time syncs are chosen by the
+// World's seeded scheduler and replayed by the same recorded decisions.
+public function completeNext(): Integer {
+    if simulation.pendingCount(STATE.world) == 0 { return 0 }
+    let completion = simulation.next(STATE.world)
+    if completion.kind != simulation.SYNC || completion.token < 1 || completion.token > STATE.requests.length {
+        fail("simulated dbio: unexpected completion")
+    }
+    let request = STATE.requests[completion.token - 1]
+    if request.operation != completion.id || request.done { fail("simulated dbio: stale completion") }
+    request.done = true
+    let syncer = STATE.syncers[request.handle - 1]
+    if syncer.error == 0 {
+        if completion.result < 0 { syncer.error = completion.result }
+        else { syncer.synced = max(syncer.synced, request.upTo) }
+    }
+    return request.handle
+}
+public function syncerSyncedOffset(handle: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    return STATE.syncers[handle - 1].synced
+}
+public function syncerError(handle: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    return STATE.syncers[handle - 1].error
+}
+public function syncerDrain(handle: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    return 0
+}
+public function syncerWait(handle: Integer, upTo: Integer, timeoutMs: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    if upTo < 0 || timeoutMs < -1 { return -22 }
+    let syncer = STATE.syncers[handle - 1]
+    if syncer.error < 0 { return syncer.error }
+    if syncer.synced >= upTo { return syncer.synced }
+    if timeoutMs == 0 { return ETIMEDOUT }
+    let rc = syncerRequest(handle, upTo)
+    if rc < 0 { return rc }
+    while syncer.synced < upTo && syncer.error == 0 && simulation.pendingCount(STATE.world) > 0 { completeNext() }
+    if syncer.error < 0 { return syncer.error }
+    if syncer.synced < upTo { return ETIMEDOUT }
+    return syncer.synced
+}
+public function syncerSwitch(handle: Integer, newFd: Integer, startOffset: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    if !valid(newFd) { return STATE.error }
+    let syncer = STATE.syncers[handle - 1]
+    if startOffset < 0 || startOffset < syncer.requested || startOffset < syncer.synced { return -22 }
+    // The native API queues this boundary; this fixture deliberately waits for
+    // it before returning. Both models make old data durable before publishing
+    // the new segment. General asynchronous switch latency is not modeled.
+    let rc = syncerWait(handle, startOffset, -1)
+    if rc < 0 { return rc }
+    syncer.file = STATE.descriptors[newFd - 1].file
+    syncer.synced = max(syncer.synced, startOffset)
+    syncer.requested = max(syncer.requested, startOffset)
+    return 0
+}
+public function syncerStop(handle: Integer): Integer {
+    if !syncerValid(handle) { return STATE.error }
+    let syncer = STATE.syncers[handle - 1]
+    let outstanding = true
+    while outstanding && syncer.error == 0 {
+        outstanding = false
+        for request in STATE.requests { if request.handle == handle && !request.done { outstanding = true } }
+        if outstanding {
+            // External cancellation or a direct World crash may remove an
+            // operation without delivering its completion. Stop must terminate
+            // with a sticky cancellation error rather than wait forever.
+            if completeNext() == 0 { syncer.error = -125 }
+        }
+    }
+    for request in STATE.requests {
+        if request.handle == handle && !request.done { simulation.cancel(STATE.world, request.operation); request.done = true }
+    }
+    syncer.stopped = true
+    return syncer.error
+}

@@ -73,31 +73,44 @@ public function validCompilerDiagnostics(output: Text): Boolean {
 }
 
 // Accept a runtime suffix only after checking every frame and both positive
-// source coordinates. The message remains exact, including embedded newlines.
+// source coordinates and optional bounded excerpts. The message remains exact.
 public function runtimeDiagnostic(output: Text): Text {
     if !output.startsWith("Minyar stopped: ") { return output }
     let marker = -1
     let tag = "Minyar stack trace:"
     let rows = lines(output)
     for index in 0..rows.length { if rows[index] == tag { marker = index } }
-    if marker < 1 || rows.length - marker < 2 || rows.length - marker > 13 { return output }
+    if marker < 1 || rows.length - marker < 2 || rows.length - marker > 25 { return output }
+    let frames = 0
+    let previousFrame = false
     for index in (marker + 1)..rows.length {
         let row = rows[index]
-        if !row.startsWith("  at ") || row.length < 14 || row[row.length - 1] != ')' { return output }
-        let last = -1
-        let before = -1
-        for position in 0..row.length { if row[position] == ':' { before = last; last = position } }
-        if before < 7 || last <= before + 1 || last + 1 >= row.length - 1 || row.find(" (") < 6 { return output }
-        if before <= row.find(" (") + 2 { return output }
-        for start in [before + 1, last + 1] {
-            let end = last
-            if start == last + 1 { end = row.length - 1 }
-            let nonzero = false
-            for position in start..end {
-                if row[position] < '0' || row[position] > '9' { return output }
-                if row[position] != '0' { nonzero = true }
+        if row.startsWith("    | ") {
+            if !previousFrame || row.length <= 6 || row.length > 166 { return output }
+            for position in 6..row.length {
+                let code = Integer(row[position])
+                if code < 32 || (code >= 127 && code <= 159) || code == 1564 || code == 8206 || code == 8207 || code == 8232 || code == 8233 || (code >= 8234 && code <= 8238) || (code >= 8294 && code <= 8297) { return output }
             }
-            if !nonzero { return output }
+            previousFrame = false
+        } else {
+            frames += 1
+            if frames > 12 || !row.startsWith("  at ") || row.length < 14 || row[row.length - 1] != ')' { return output }
+            let last = -1
+            let before = -1
+            for position in 0..row.length { if row[position] == ':' { before = last; last = position } }
+            if before < 7 || last <= before + 1 || last + 1 >= row.length - 1 || row.find(" (") < 6 { return output }
+            if before <= row.find(" (") + 2 { return output }
+            for start in [before + 1, last + 1] {
+                let end = last
+                if start == last + 1 { end = row.length - 1 }
+                let nonzero = false
+                for position in start..end {
+                    if row[position] < '0' || row[position] > '9' { return output }
+                    if row[position] != '0' { nonzero = true }
+                }
+                if !nonzero { return output }
+            }
+            previousFrame = true
         }
     }
     let message: List<Text> = []
@@ -131,6 +144,18 @@ public function lines(source: Text): List<Text> {
     }
     if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
     return result
+}
+// Every generated module defines the checked inline runtime helpers, whose
+// slow paths call the runtime. Remove them to inspect the program's own code.
+public function withoutRuntimeHelpers(llvm: Text): Text {
+    let parts: List<Text> = []
+    let helper = false
+    for line in lines(llvm) {
+        if !helper && line.startsWith("define internal ") && contains(line, " @.minyar.") && contains(line, ") alwaysinline") { helper = true }
+        if !helper { parts.add(line + "\n") }
+        else if line == "}" { helper = false }
+    }
+    return joinText(parts)
 }
 public function words(source: Text): List<Text> {
     let result: List<Text> = []

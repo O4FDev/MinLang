@@ -1,0 +1,200 @@
+// A two-case choice with one non-null managed payload has a spare null pointer.
+// Eligible payloads are Text, Bytes, Lists, Sets or ordinary managed records.
+// Keep the full logical field graph, including nullable List SCC endpoints.
+// Layout kinds: 0 ordinary, 1 pure enum, 2 tagged, 3 null niche, 4 scalar niche.
+// For kind 3, choiceNicheType returns the payload type (including Lists and Sets),
+// not necessarily a record. choiceStorageCount counts only choice-owned slots.
+function choiceLayoutKind(context: CompilerContext, type: Integer): Integer {
+    if isPureEnumChoice(context, type) { return 1 }
+    if isScalarChoiceType(type) { return 4 }
+    if choiceCases(context, type).length == 0 { return 0 }
+    if choiceNicheType(context, type) != 0 { return 3 }
+    return 2
+}
+
+// The physical ID alone cannot distinguish a pure enum from a payload niche.
+function isPureEnumChoice(context: CompilerContext, type: Integer): Boolean {
+    return isScalarChoiceType(type) && context.functionParameterCounts[recordTypeIndex(type)] == 1
+}
+
+function choiceScalarPayloadType(context: CompilerContext, type: Integer): Integer {
+    if !isScalarChoiceType(type) || isPureEnumChoice(context, type) { return 0 }
+    return context.functionParameterTypes[functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type)) + 1]
+}
+
+function choiceScalarPayloadMax(context: CompilerContext, type: Integer): Integer {
+    let payload = choiceScalarPayloadType(context, type)
+    if payload == 4 { return 1 }
+    if payload == 3 { return 1114111 }
+    return choiceCases(context, payload).length - 2
+}
+
+function choiceScalarEmptyCode(context: CompilerContext, type: Integer): Integer {
+    if choiceNicheTag(context, type) == 1 { return 0 }
+    return choiceScalarPayloadMax(context, type) + 1
+}
+
+function choiceNicheType(context: CompilerContext, type: Integer): Integer {
+    if !isRecordType(type) || isScalarChoiceType(type) { return 0 }
+    let record = recordTypeIndex(type)
+    if context.functionParameterCounts[record] != 2 { return 0 }
+    let cases = choiceCases(context, type)
+    if cases.length != 3 { return 0 }
+    let first = functionParameterOffset(context.functionParameterCounts, record)
+    let payload = context.functionParameterTypes[first + 1]
+    if payload == 2 || payload == 8 || isListType(payload) || isSetType(payload) { return payload }
+    if !isRecordType(payload) || isScalarChoiceType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
+    // A nested optional may already use null, so Some(None) needs its own tag.
+    if choiceCases(context, payload).length > 0 { return 0 }
+    return payload
+}
+
+function choiceNicheTag(context: CompilerContext, type: Integer): Integer {
+    let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
+    let parts = context.functionParameterNames[first + 1].split("|")
+    return findText(choiceCases(context, type), parts[1]) - 1
+}
+
+function choiceOwnershipType(context: CompilerContext, type: Integer): Integer {
+    let payload = choiceNicheType(context, type)
+    if payload != 0 { return payload }
+    return type
+}
+
+function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer): Text {
+    if isPureEnumChoice(context, type) { return value }
+    if isScalarChoiceType(type) {
+        let present = choiceNicheTag(context, type)
+        let absent = emitInstruction(output, textState, state, "icmp eq i64 " + value + ", " + Text(choiceScalarEmptyCode(context, type)))
+        return emitInstruction(output, textState, state, "select i1 " + absent + ", i64 " + Text(1 - present) + ", i64 " + Text(present))
+    }
+    if choiceNicheType(context, type) == 0 { return readRecordField(output, textState, state, value, 0, 1) }
+    let present = choiceNicheTag(context, type)
+    let absent = emitInstruction(output, textState, state, "icmp eq ptr " + value + ", null")
+    return emitInstruction(output, textState, state, "select i1 " + absent + ", i64 " + Text(1 - present) + ", i64 " + Text(present))
+}
+
+function readChoiceMatchPayload(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer, field: Integer, payload: Integer): Text {
+    if isScalarChoiceType(type) {
+        let raw = value
+        if choiceNicheTag(context, type) == 1 { raw = emitInstruction(output, textState, state, "sub i64 " + value + ", 1") }
+        return slotAsValue(output, textState, state, raw, payload)
+    }
+    if choiceNicheType(context, type) != 0 { return value }
+    return readRecordField(output, textState, state, value, choiceStorageField(context, type, field), payload)
+}
+
+// Codes preserve declaration order, then payload order. Boolean/Character
+// convert through the ordinary slot helpers; pure-enum payloads are already i64.
+function parseScalarNicheChoice(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer, present: Boolean): Text {
+    let expected = choiceScalarPayloadType(context, type)
+    let value = Text(choiceScalarEmptyCode(context, type))
+    if present || tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+        let name = context.tokenTexts[state[0] - 1]
+        let fields = choicePayloadFields(context, type, name)
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+        if present {
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ")") { failChoicePayloadCount(context, state[0], type, name, fields, false) }
+            let payloadType: List<Integer> = [expected]
+            let location = state[0]
+            let payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+            requireContextType(context, location, payloadType[0], expected, "choice payload has the wrong type")
+            value = valueAsListSlot(output, textState, state, payload, expected)
+            if choiceNicheTag(context, type) == 1 { value = emitInstruction(output, textState, state, "add i64 " + value + ", 1") }
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
+        }
+        finishChoicePayloadArguments(context, state, type, name, fields)
+    }
+    setType(resultType, type)
+    return value
+}
+
+function parseNicheChoice(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, type: Integer, present: Boolean): Text {
+    let value = "null"
+    let payloadType: List<Integer> = [choiceNicheType(context, type)]
+    if present || tokenIs(context.tokenKinds, context.tokenTexts, state, "(") {
+        let name = context.tokenTexts[state[0] - 1]
+        let fields = choicePayloadFields(context, type, name)
+        expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "(")
+        if present {
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ")") { failChoicePayloadCount(context, state[0], type, name, fields, false) }
+            let location = state[0]
+            value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+            requireContextType(context, location, payloadType[0], choiceNicheType(context, type), "choice payload has the wrong type")
+            if tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
+        }
+        finishChoicePayloadArguments(context, state, type, name, fields)
+    }
+    setType(resultType, type)
+    if present {
+        if payloadType.length > 1 && payloadType[1] >= 0 { markOwner(resultType, payloadType[1]) } else {
+            // Constructors return an owned value. A borrowed payload needs its
+            // own count before the parser registers that constructor result.
+            noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, payloadType[0], 0)
+            output.add("  call void @minyar_rc_retain(ptr " + value + ")\n")
+            ownResult(output, state, value, resultType)
+        }
+    }
+    return value
+}
+
+function derivedNicheChoice(context: CompilerContext, type: Integer, operation: Text, globals: List<Text>, name: Text): Text {
+    let payload = choiceNicheType(context, type)
+    if isSetType(payload) {
+        if operation != "equal" { failCompiler("this nullable Set payload only supports equality") }
+        let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        // The runtime checks null before reading a header; Set values are Boolean.
+        globals.add("define internal zeroext i1 " + name + "(ptr %left, ptr %right) {\nentry:\n  %result = call zeroext i1 @minyar_maps_are_equal(ptr %left, ptr %right, i64 4)\n  ret i1 %result\n}\n")
+        return name
+    }
+    // Lists and Bytes have no implicit operation. Never interpret their
+    // headers as records or retain them as key snapshots.
+    if payload != 2 && !isRecordType(payload) { failCompiler("this nullable payload needs an explicit operation") }
+    let child = ""
+    if payload != 2 { child = derivedRecordFunction(context, payload, operation, globals) }
+    let resultType = "i64"
+    if operation == "equal" { resultType = "zeroext i1" }
+    if operation == "copy" { resultType = "ptr" }
+    let binary = operation == "equal" || operation == "compare"
+    let code = "define internal " + resultType + " " + name + "(ptr %left"
+    if binary { code = code + ", ptr %right" }
+    code = code + ") {\nentry:\n  %left.absent = icmp eq ptr %left, null\n"
+    if binary {
+        code = code + "  %right.absent = icmp eq ptr %right, null\n  %either.absent = or i1 %left.absent, %right.absent\n  br i1 %either.absent, label %absent, label %present\nabsent:\n"
+        if operation == "equal" { code = code + "  %both.absent = and i1 %left.absent, %right.absent\n  ret i1 %both.absent\n" } else {
+            code = code + "  %left.zero = zext i1 %left.absent to i64\n  %right.zero = zext i1 %right.absent to i64\n"
+            if choiceNicheTag(context, type) == 0 { code = code + "  %order = sub i64 %left.zero, %right.zero\n" } else { code = code + "  %order = sub i64 %right.zero, %left.zero\n" }
+            code = code + "  ret i64 %order\n"
+        }
+    } else {
+        code = code + "  br i1 %left.absent, label %absent, label %present\nabsent:\n"
+        if operation == "copy" { code = code + "  ret ptr null\n" } else { code = code + "  ret i64 0\n" }
+    }
+    code = code + "present:\n"
+    if payload == 2 {
+        if operation == "copy" {
+            // Text is immutable. A key snapshot returns one owned alias,
+            // just as a Text field in a derived record copy does.
+            code = code + "  call void @minyar_rc_retain(ptr %left)\n  ret ptr %left\n}\n"
+            globals.add(code)
+            return name
+        }
+        child = "@minyar_hash_slot"
+        let declaration = "declare i64 @minyar_hash_slot(i64, i64)\n"
+        if operation == "equal" { child = "@minyar_equal_slots"; declaration = "declare zeroext i1 @minyar_equal_slots(i64, i64, i64)\n" }
+        if operation == "compare" { child = "@minyar_compare_slots"; declaration = "declare i64 @minyar_compare_slots(i64, i64, i64)\n" }
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        code = code + "  %left.slot = ptrtoint ptr %left to i64\n"
+        if binary { code = code + "  %right.slot = ptrtoint ptr %right to i64\n" }
+        code = code + "  %result = call " + resultType + " " + child + "(i64 2, i64 %left.slot"
+        if binary { code = code + ", i64 %right.slot" }
+    } else {
+        code = code + "  %result = call " + resultType + " " + child + "(ptr %left"
+        if binary { code = code + ", ptr %right" }
+    }
+    code = code + ")\n"
+    if operation == "equal" { code = code + "  ret i1 %result\n}\n" } else { code = code + "  ret " + resultType + " %result\n}\n" }
+    globals.add(code)
+    return name
+}

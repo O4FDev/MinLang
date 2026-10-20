@@ -1,0 +1,280 @@
+use "completionio" as completionio
+use "files" as files
+use "system" as system
+use "./fixtures/neodb-completion/lib/dbio.min" as dbio
+use "./fixtures/neodb-completion/src/storage/wal.min" as wal
+use "./fixtures/neodb-completion/src/storage/snapshot.min" as snapshot
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail("NeoDB kernel completion: " + message) }
+}
+function submitAll(queue: completionio.Queue) {
+    let attempts = 0
+    while queue.staged().unwrap() > 0 {
+        attempts += 1
+        check(attempts <= 64, "bounded provider submission")
+        let submitted = queue.submit()
+        match submitted {
+            Ok(count) {}
+            Err(failure) { check(failure.nativeCode() == 4, "only submission EINTR is retried") }
+        }
+    }
+}
+function completed(queue: completionio.Queue): completionio.Completion {
+    let found: Maybe<completionio.Completion> = None
+    let attempts = 0
+    while found.isNone() {
+        attempts += 1
+        check(attempts <= 64, "bounded provider collection")
+        let collected = queue.next(true)
+        match collected {
+            Ok(value) { check(value.isSome(), "submitted provider work has a CQE"); found = value }
+            Err(failure) { check(failure.nativeCode() == 4, "only collection EINTR is retried") }
+        }
+    }
+    return found.unwrap()
+}
+function provider(directory: Text) {
+    // Factory failure is fatal, including EPERM/ENOSYS/ENOTSUP. This program
+    // cannot pass by taking an unsupported branch or linking a mock provider.
+    let queue = completionio.create(4, 32).unwrap()
+    let path = directory + "/provider"
+    let fd = files.openFile(path, files.WRITE | files.CREATE | files.EXCLUSIVE).unwrap()
+    let data = Bytes("moon")
+    let first = queue.write(fd, 0, data, -11).unwrap()
+    data.setUInt32(0, 0)
+    let second = queue.write(fd, 4, Bytes("rise"), 22).unwrap()
+    let sync = queue.sync(fd, 33).unwrap()
+    check(first > 0 && second > first && sync > second, "provider operation identities")
+    files.closeFile(fd).unwrap()
+    check(queue.pending().unwrap() == 3 && queue.staged().unwrap() == 3, "staged ownership after caller close")
+    match queue.close() {
+        Ok() { fail("kernel queue discarded outstanding owners") }
+        Err(failure) { check(failure.nativeCode() == 16, "busy close is EBUSY") }
+    }
+    submitAll(queue)
+    let seenFirst = false
+    let seenSecond = false
+    let seenSync = false
+    for index in 0..3 {
+        let done = completed(queue)
+        let count = done.count().unwrap()
+        if done.id == first {
+            check(!seenFirst && done.token == -11 && done.kind == completionio.WRITE && count == 4, "copied first WRITE")
+            seenFirst = true
+        } else if done.id == second {
+            check(!seenSecond && done.token == 22 && done.kind == completionio.WRITE && count == 4, "second WRITE identity/count")
+            seenSecond = true
+        } else {
+            // Missing the provider SQE-flags allowlist yields EACCES here and
+            // must fail; collecting a CQE alone is insufficient evidence.
+            check(!seenSync && done.id == sync && done.token == 33 && done.kind == completionio.SYNC && count == 0,
+                "real restricted IO_DRAIN FSYNC succeeds")
+            seenSync = true
+        }
+    }
+    check(seenFirst && seenSecond && seenSync && queue.pending().unwrap() == 0, "all provider owners collected")
+    let reader = files.openFile(path, files.READ).unwrap()
+    let read = queue.read(reader, 0, 8, 44).unwrap()
+    let eof = queue.read(reader, 1024, 8, 55).unwrap()
+    files.closeFile(reader).unwrap()
+    submitAll(queue)
+    let seenRead = false
+    let seenEof = false
+    for index in 0..2 {
+        let done = completed(queue)
+        check(done.kind == completionio.READ, "provider READ kind")
+        let bytes = done.bytes().unwrap()
+        if done.id == read {
+            check(!seenRead && done.token == 44 && done.count().unwrap() == 8 && Text(bytes) == "moonrise", "READ after reopen")
+            seenRead = true
+        } else {
+            check(!seenEof && done.id == eof && done.token == 55 && done.count().unwrap() == 0 && bytes.length == 0, "EOF count")
+            seenEof = true
+        }
+    }
+    check(seenRead && seenEof, "both READ identities observed")
+    let readonly = files.openFile(path, files.READ).unwrap()
+    let failedId = queue.write(readonly, 0, Bytes("bad"), 66).unwrap()
+    files.closeFile(readonly).unwrap()
+    submitAll(queue)
+    let failed = completed(queue)
+    check(failed.id == failedId && failed.token == 66 && failed.kind == completionio.WRITE, "failed WRITE keeps identity")
+    match failed.count() {
+        Ok(count) { fail("read-only WRITE unexpectedly succeeded") }
+        Err(failure) { check(failure.nativeCode() == 9, "real WRITE CQE reports EBADF") }
+    }
+    queue.close().unwrap()
+}
+function writer(directory: Text, segmentBytes: Integer): wal.Wal {
+    check(dbio.mkdir(directory) == 0, "create WAL directory")
+    let reader = wal.openReader(directory, 0)
+    while wal.next(reader) {}
+    return wal.openWriter(directory, reader, wal.Options { segmentBytes: segmentBytes; preallocate: false; recycleKeep: 0 })
+}
+function batch(directory: Text) {
+    let log = writer(directory, 4096)
+    check(!wal.hasSegment(log) && wal.syncSocket(log) == -1, "lazy WAL and explicit absent reactor socket")
+    check(wal.append(log, Bytes()) == 16, "empty record framing")
+    check(wal.appendSlice(log, Bytes("xxmoonzz"), 2, 4) == 36, "slice record framing")
+    let buffer = wal.beginRecord(log)
+    buffer.addBytes(Bytes("rise"))
+    let end = wal.endRecord(log)
+    check(end == 56 && wal.appendedLsn(log) == end && wal.writtenLsn(log) == 0, "buffered record batch")
+    let before = dbio.collectedSyncs()
+    check(wal.requestSync(log) == end && wal.writtenLsn(log) == end, "production flush writes complete batch")
+    check(wal.durableLsn(log) == 0 && dbio.collectedSyncs() == before, "submit is not acknowledgement")
+    check(dbio.completeNext() > 0 && dbio.collectedSyncs() == before + 1, "explicitly collect the sync CQE")
+    check(wal.durableLsn(log) == 0, "WAL cached acknowledgement awaits production callback")
+    check(wal.onSyncReadable(log) == end, "production callback publishes collected offset")
+    check(wal.append(log, Bytes("tail")) == 76, "append after acknowledged batch")
+    wal.requestSync(log)
+    check(wal.durableLsn(log) == 56, "next submitted batch remains outstanding")
+    wal.close(log)
+    check(wal.durableLsn(log) == 76, "close safely waits for pending sync")
+    let reader = wal.openReader(directory, 0)
+    let expected = ["", "moon", "rise", "tail"]
+    let at = 0
+    for payload in expected {
+        check(wal.next(reader), "recover each exact batch record")
+        check(wal.lsn(reader) == at && Text(wal.payload(reader)) == payload, "production CRC/LSN/payload recovery")
+        at += wal.HEADER_BYTES + Bytes(payload).length
+    }
+    check(!wal.next(reader) && wal.endLsn(reader) == 76 && wal.recordsRead(reader) == 4 && !wal.corruptionDetected(reader),
+        "reopen reaches exactly the acknowledged batch end")
+}
+function rotations(directory: Text) {
+    let log = writer(directory, 64)
+    let end = 0
+    for index in 0..128 {
+        let previous = wal.durableLsn(log)
+        let payload = Bytes(16)
+        payload.setInt64(0, index)
+        payload.setInt64(8, index ^ 0x55)
+        end = wal.append(log, payload)
+        wal.requestSync(log)
+        if index & 1 == 0 {
+            check(wal.durableLsn(log) == previous, "non-rotating submission remains unacknowledged")
+            check(dbio.completeNext() > 0, "collect tiny-segment sync")
+        }
+        check(wal.onSyncReadable(log) == end, "rotation keeps a contiguous acknowledged prefix")
+    }
+    check(wal.rotations(log) == 64 && end == 4096, "64 real tiny-segment rotations")
+    wal.close(log)
+    let reader = wal.openReader(directory, 0)
+    let index = 0
+    while wal.next(reader) {
+        check(index < 128, "finite rotation record count")
+        let payload = wal.payload(reader)
+        check(payload.length == 16 && payload.getInt64(0) == index && payload.getInt64(8) == (index ^ 0x55), "rotated record bytes")
+        check(wal.lsn(reader) == index * 32, "rotated record LSN")
+        index += 1
+    }
+    check(index == 128 && wal.endLsn(reader) == end && !wal.corruptionDetected(reader), "reopen verifies all 128 rotated records")
+}
+function adapter(directory: Text) {
+    let first = dbio.open(directory + "/old", dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_EXCLUSIVE)
+    let second = dbio.open(directory + "/new", dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_EXCLUSIVE)
+    check(first > 0 && second > 0, "adapter owns real host files")
+    check(dbio.write(first, Bytes("old"), 0, 3) == 3, "production all-or-error sequential write")
+    let handle = dbio.syncerStart(first)
+    check(handle > 0 && dbio.syncerNotifyFd(handle) == -1, "real queue with no invented socket")
+    check(dbio.syncerRequest(handle, -1) == -22, "negative target rejected")
+    check(dbio.syncerRequest(handle, 1) == 0 && dbio.syncerRequest(handle, 3) == 0, "two syncs submitted")
+    check(dbio.pending(handle) == 2 && dbio.requestedOffset(handle) == 3 && dbio.syncerSyncedOffset(handle) == 0,
+        "outstanding identities retain exact requested target")
+    check(dbio.syncerWait(handle, 3, 0) == dbio.ETIMEDOUT, "zero wait does not collect")
+    check(dbio.syncerWait(handle, 3, 25) == dbio.ENOTSUP, "positive timeout is explicitly unsupported")
+    check(dbio.progress(handle, true) == 1 && dbio.pending(handle) == 1 && dbio.syncerSyncedOffset(handle) <= 1,
+        "one CQE cannot acknowledge an unchecked prefix")
+    check(dbio.progress(handle, true) == 1 && dbio.syncerSyncedOffset(handle) == 3, "both CQEs acknowledge exact target")
+    check(dbio.syncerRequest(handle, 3) == 0 && dbio.pending(handle) == 0, "duplicate target does not enqueue")
+    check(dbio.write(first, Bytes("!"), 0, 1) == 1 && dbio.close(first) == 0, "caller close while syncer owns old file")
+    check(dbio.liveFiles() == 2 && dbio.close(first) == -9, "retained descriptor cannot be closed twice")
+    check(dbio.syncerSwitch(handle, second, 2) == -22, "switch cannot regress")
+    check(dbio.syncerSwitch(handle, second, 4) == 0 && dbio.syncerSyncedOffset(handle) == 4 && dbio.pending(handle) == 0,
+        "switch collects old-file boundary before changing ownership")
+    check(dbio.liveFiles() == 1, "switch releases caller-closed old descriptor")
+    check(dbio.write(second, Bytes("new"), 0, 3) == 3 && dbio.syncerRequest(handle, 7) == 0, "new file uses continued logical target")
+    check(dbio.close(second) == 0 && dbio.pending(handle) == 1 && dbio.liveFiles() == 1, "pending sync survives caller close")
+    check(dbio.syncerStop(handle) == 0 && dbio.liveFiles() == 0, "stop collects and releases final file")
+    check(dbio.syncerStop(handle) == -9 && dbio.syncerRequest(handle, 8) == -9, "stopped handle never revives")
+    check(Text(files.readFile(directory + "/old")) == "old!" && Text(files.readFile(directory + "/new")) == "new", "switch/stop preserve both files")
+
+    let directoryFd = dbio.open(directory, dbio.OPEN_READ)
+    let bootstrap = dbio.syncerStart(directoryFd)
+    let segment = dbio.open(directory + "/bootstrap", dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_EXCLUSIVE)
+    check(directoryFd > 0 && bootstrap > 0 && segment > 0 && dbio.close(directoryFd) == 0, "retain lazy-WAL directory placeholder")
+    check(dbio.syncerSwitch(bootstrap, segment, 40) == 0 && dbio.syncerSyncedOffset(bootstrap) == 0 &&
+        dbio.requestedOffset(bootstrap) == 0 && dbio.pending(bootstrap) == 0, "initial nonzero LSN handoff invents no durability acknowledgement")
+    check(dbio.close(segment) == 0 && dbio.syncerStop(bootstrap) == 0, "idle bootstrap releases both descriptors and ring")
+
+    // procfs regular files accept the descriptor but have no fsync method:
+    // their real FSYNC CQEs return EINVAL. A missing IO_DRAIN allowlist would
+    // produce EACCES instead and fails this exact errno check.
+    let bad = dbio.open("/proc/self/status", dbio.OPEN_READ)
+    check(bad > 0, "Linux procfs failure control is required")
+    let failed = dbio.syncerStart(bad)
+    check(failed > 0 && dbio.syncerRequest(failed, 1) == 0 && dbio.syncerRequest(failed, 2) == 0, "real failing FSYNCs are submitted")
+    check(dbio.close(bad) == 0 && dbio.progress(failed, true) == 1, "collect failing CQE after caller close")
+    check(dbio.syncerError(failed) == -22 && dbio.syncerSyncedOffset(failed) == 0 && dbio.pending(failed) == 1,
+        "failed CQE is sticky and acknowledges nothing")
+    check(dbio.syncerRequest(failed, 3) == -22 && dbio.syncerWait(failed, 2, -1) == -22, "request/wait retain failure")
+    check(dbio.syncerStop(failed) == -22 && dbio.syncerStop(failed) == -9, "failed stop still drains and invalidates ownership")
+}
+function checkpoint(directory: Text) {
+    let log = writer(directory, 4096)
+    wal.append(log, Bytes("A"))
+    let end = wal.append(log, Bytes("B"))
+    wal.requestSync(log)
+    check(end == 34 && wal.durableLsn(log) == 0, "checkpoint begins with outstanding WAL sync")
+    let writer = snapshot.begin(directory, end)
+    snapshot.add(writer, Bytes("state"))
+    snapshot.add(writer, Bytes())
+    snapshot.add(writer, Bytes("v1"))
+    check(snapshot.finishWal(writer, log) == 143, "production snapshot exact file length")
+    check(wal.durableLsn(log) == end && wal.verifiedSnapshot(log) == end, "finishWal waits for successful CQE and verifies snapshot")
+    let opened = snapshot.openLatest(directory)
+    check(opened.found && opened.lsn == end && opened.chunkCount == 3 && opened.payloadLength == 7, "reopen validates snapshot header/directory CRC")
+    check(Text(snapshot.readChunk(opened, 0)) == "state" && snapshot.readChunk(opened, 1).length == 0 &&
+        Text(snapshot.readChunk(opened, 2)) == "v1", "production snapshot chunk CRCs and empty chunk")
+    snapshot.close(opened)
+    wal.closeAfterCheckpoint(log, end, 0)
+    let latest = snapshot.loadLatest(directory)
+    check(latest.found && latest.lsn == end && Text(latest.payload) == "statev1", "eager snapshot reopen after checkpoint close")
+    let reader = wal.openReader(directory, latest.lsn)
+    check(!wal.next(reader) && wal.endLsn(reader) == end, "checkpoint close retires old WAL")
+    let again = wal.openWriter(directory, reader, wal.Options { segmentBytes: 4096; preallocate: false; recycleKeep: 0 })
+    check(wal.append(again, Bytes("after")) == 55 && wal.syncNow(again) == 55, "WAL resumes at snapshot LSN")
+    wal.close(again)
+    let tail = wal.openReader(directory, latest.lsn)
+    check(wal.next(tail) && wal.lsn(tail) == end && Text(wal.payload(tail)) == "after", "recover post-checkpoint tail")
+    check(!wal.next(tail) && wal.endLsn(tail) == 55 && !wal.corruptionDetected(tail), "post-checkpoint exact end")
+}
+function crcControl(directory: Text) {
+    let log = writer(directory, 4096)
+    wal.append(log, Bytes("CRC"))
+    wal.close(log)
+    let fd = dbio.open(wal.segmentPath(directory, 0), dbio.OPEN_WRITE)
+    check(fd > 0 && dbio.pwrite(fd, Bytes("X"), 0, 1, wal.HEADER_BYTES) == 1, "deliberately corrupt stored payload")
+    check(dbio.fdatasync(fd) == 0 && dbio.close(fd) == 0, "persist corruption control")
+    let reader = wal.openReader(directory, 0)
+    check(!wal.next(reader) && wal.recordsRead(reader) == 0 && wal.endLsn(reader) == 0 && wal.stopReason(reader) == "torn",
+        "unchanged production CRC rejects mutated payload")
+}
+function suite() {
+    let base = system.getenv("MINYAR_NEODB_COMPLETION_DATA")
+    check(base != "", "host supplies private data path")
+    let directory = base + "/run-" + Text(system.processId())
+    check(dbio.mkdir(directory) == 0, "create private run directory")
+    provider(directory)
+    batch(directory + "/batch")
+    rotations(directory + "/rotations")
+    check(dbio.liveFiles() == 0 && dbio.liveQueues() == 0, "WAL close and recovery release all owners")
+    adapter(directory)
+    checkpoint(directory + "/checkpoint")
+    crcControl(directory + "/crc")
+    check(dbio.completeNext() == 0 && dbio.liveFiles() == 0 && dbio.liveQueues() == 0, "all kernel/facade owners drained and closed")
+    print("NeoDB kernel completion: typed READ/WRITE/FSYNC, batch/CRC/LSNs, 64 rotations, ownership, sticky failure and snapshot verified")
+}
+suite()

@@ -1,0 +1,683 @@
+// SQL AST arena shared by the parser (src/sql/parser.min) and the engine.
+//
+// Every node lives in Ast.nodes; a node refers to its children by index (node id).
+// -1 means "absent" in a fixed child slot. Variable-length parts are a K_LIST node.
+// The full contract (slots, op, flags, text, intValue for every kind) is docs/AST.md.
+// Numbering is stable: kinds/ops/flags may be ADDED but never renumbered or repurposed.
+
+public record Node {
+    kind: Integer
+    op: Integer
+    text: Text
+    intValue: Integer
+    floatValue: Float
+    flags: Integer
+    position: Integer          // 0-based character offset into the whole SQL string (PG position = +1)
+    children: List<Integer>
+}
+
+public record Ast {
+    nodes: List<Node>
+    statements: List<Integer>   // root node id of each statement, in source order (empty statements skipped)
+    stmtStart: List<Integer>    // character offset of each statement's first character
+    stmtEnd: List<Integer>      // character offset one past its last character (the ';' is excluded)
+    stmtText: List<Text>        // source text of each statement (trimmed of surrounding whitespace)
+    paramCount: Integer         // highest $n seen anywhere (0 if none)
+}
+
+public record ParseResult {
+    ast: Ast
+    ok: Boolean
+    error: Text                 // "" when ok
+    errorPosition: Integer      // 0-based character offset of the offending token, -1 if none
+    sqlstate: Text              // "42601" on syntax errors, "" when ok
+}
+
+// ---------------------------------------------------------------- node kinds
+// Generic
+public constant K_LIST = 1              // children: the items
+public constant K_NAME = 2              // text: identifier (unquoted ones are lower-cased)
+// Literals
+public constant K_INT_LIT = 10          // text: digits as written; intValue: value; flags F_INT_OVERFLOW if it does not fit int64
+public constant K_NUM_LIT = 11          // text: literal as written (1.5, .5, 1e10); floatValue: approximate value
+public constant K_STR_LIT = 12          // text: decoded string value; flags F_STR_ESCAPE (E'..'), F_STR_DOLLAR, F_STR_BIT (B'..'/X'..' raw)
+public constant K_BOOL_LIT = 13         // intValue: 1 true, 0 false
+public constant K_NULL_LIT = 14
+public constant K_PARAM = 15            // intValue: n of $n (1-based)
+public constant K_DEFAULT = 16          // DEFAULT keyword inside VALUES rows / SET c = DEFAULT
+// Expressions
+public constant K_COLUMN_REF = 20       // text: column name; children: qualifier K_NAMEs in order (t | s,t | c,s,t)
+public constant K_STAR = 21             // * or t.*; children: qualifier K_NAMEs in order
+public constant K_BINARY_OP = 22        // op: OP_*; text: operator symbol / keyword; children [left, right]
+public constant K_UNARY_OP = 23         // op: OP_NEG/OP_POS/OP_NOT/OP_BIT_NOT/OP_OTHER; text: symbol; children [arg]
+public constant K_FUNC_CALL = 24        // text: function name; children [schema K_NAME|-1, args K_LIST, filter|-1, over K_WINDOW_DEF|-1, aggOrderBy K_LIST|-1]
+public constant K_CAST = 25             // op: CAST_*; children [expr, K_TYPENAME]
+public constant K_TYPENAME = 26         // text: canonical type name; op: INTERVAL_* fields; intValue: array dims; children [modifiers K_LIST|-1]
+public constant K_CASE = 27             // children [arg|-1, whens K_LIST of K_WHEN, else|-1]
+public constant K_WHEN = 28             // children [condition (or comparand for simple CASE), result]
+public constant K_BETWEEN = 29          // flags F_NOT, F_SYMMETRIC; children [expr, low, high]
+public constant K_IN_LIST = 30          // flags F_NOT; children [expr, K_LIST of values]
+public constant K_IN_SUBQUERY = 31      // flags F_NOT; children [expr, query]
+public constant K_EXISTS = 32           // children [query]
+public constant K_SUBQUERY_EXPR = 33    // scalar subquery; children [query]
+public constant K_QUANTIFIED = 34       // x op ANY/SOME/ALL (...); op: OP_*; text: symbol; intValue: QUANT_*; flags F_SUBQUERY; children [expr, query|arrayExpr]
+public constant K_LIKE = 35             // op: LIKE_*; flags F_NOT; children [expr, pattern, escape|-1]
+public constant K_IS_TEST = 36          // op: TEST_*; flags F_NOT; children [expr]
+public constant K_ARRAY_EXPR = 37       // ARRAY[...]; children [K_LIST of elements]
+public constant K_ARRAY_SUBQUERY = 38   // ARRAY(select); children [query]
+public constant K_ROW_EXPR = 39         // (a, b) or ROW(a, b); flags F_EXPLICIT_ROW for ROW(...); children [K_LIST]
+public constant K_SUBSCRIPT = 40        // a[i] / a[i:j]; flags F_SLICE; children [expr, lower|-1, upper|-1]
+public constant K_COLLATE = 41          // text: collation name; children [expr]
+public constant K_WINDOW_DEF = 42       // text: window name (WINDOW w AS ...) or ""; intValue unused;
+                                        // children [refName K_NAME|-1, partitionBy K_LIST|-1, orderBy K_LIST|-1, frame K_FRAME|-1]
+public constant K_FRAME = 43            // op: FRAME_*; intValue: EXCLUDE_*; children [start K_FRAME_BOUND, end K_FRAME_BOUND|-1]
+public constant K_FRAME_BOUND = 44      // op: BOUND_*; children [offset|-1]
+public constant K_FIELD_SELECT = 45     // (expr).field; text: field name ("*" for (expr).*); children [expr]
+public constant K_GROUPING_SET = 46     // op: GSET_*; children [K_LIST] (items may be K_ROW_EXPR for sub-lists)
+// Queries (a "query" is K_SELECT, K_SET_OP or K_VALUES; all three share slots 5,6,7,9)
+public constant K_SELECT = 60           // children [targets, from|-1, where|-1, groupBy|-1, having|-1, orderBy|-1, limit|-1, offset|-1, distinctOn|-1, with|-1, windows|-1]
+public constant K_SET_OP = 61           // op: SETOP_*; flags F_ALL; children [left, right, -1, -1, -1, orderBy|-1, limit|-1, offset|-1, -1, with|-1, -1]
+public constant K_VALUES = 62           // children [rows K_LIST of K_LIST, -1, -1, -1, -1, orderBy|-1, limit|-1, offset|-1, -1, with|-1, -1]
+public constant K_TARGET = 63           // text: output column name (alias, or PG's derived name); flags F_TARGET_ALIAS; children [expr]
+public constant K_TABLE_REF = 64        // text: table name; flags F_ONLY; children [schema K_NAME|-1, alias K_ALIAS|-1]
+public constant K_SUBQUERY_REF = 65     // flags F_LATERAL; children [query, alias K_ALIAS|-1]
+public constant K_FUNC_REF = 66         // function in FROM; flags F_LATERAL, F_WITH_ORDINALITY; children [K_FUNC_CALL, alias K_ALIAS|-1]
+public constant K_JOIN = 67             // op: JOIN_*; flags F_NATURAL; children [left, right, on|-1, using K_LIST of K_NAME|-1, alias K_ALIAS|-1]
+public constant K_ALIAS = 68            // text: alias; children [columnAliases K_LIST of K_NAME|-1]
+public constant K_SORT_ITEM = 69        // op: SORT_*; intValue: NULLS_*; children [expr]  (also used for index elements)
+public constant K_WITH = 70             // flags F_RECURSIVE; children [K_LIST of K_CTE]
+public constant K_CTE = 71              // text: name; flags F_MATERIALIZED/F_NOT_MATERIALIZED; children [query (or DML), columns K_LIST|-1]
+// DML
+public constant K_INSERT = 80           // flags F_DEFAULT_VALUES; children [target K_TABLE_REF, columns K_LIST of K_NAME|-1, source query|-1, onConflict|-1, returning K_LIST of K_TARGET|-1, with|-1]
+public constant K_UPDATE = 81           // children [target K_TABLE_REF, set K_LIST of K_SET_ITEM/K_MULTI_SET, from K_LIST|-1, where|-1, returning|-1, with|-1]
+public constant K_DELETE = 82           // children [target K_TABLE_REF, using K_LIST|-1, where|-1, returning|-1, with|-1]
+public constant K_SET_ITEM = 83         // text: column name; children [value expr (may be K_DEFAULT), subscripts/fields K_LIST|-1]
+public constant K_MULTI_SET = 84        // (a, b) = (expr, expr) | (select); children [columns K_LIST of K_NAME, value (K_ROW_EXPR or K_SUBQUERY_EXPR)]
+public constant K_ON_CONFLICT = 85      // op: CONFLICT_*; text: constraint name (ON CONSTRAINT x) or ""; children [targetCols K_LIST|-1, set K_LIST|-1, updateWhere|-1, targetWhere|-1]
+// DDL
+public constant K_CREATE_TABLE = 90     // text: table; flags F_IF_NOT_EXISTS, F_TEMP, F_UNLOGGED; children [schema K_NAME|-1, elements K_LIST, options K_LIST of K_DEF_ELEM|-1]
+public constant K_CREATE_TABLE_AS = 91  // text: table; flags F_IF_NOT_EXISTS, F_TEMP, F_UNLOGGED, F_WITH_NO_DATA; children [schema|-1, columns K_LIST|-1, query, options|-1]
+public constant K_COLUMN_DEF = 92       // text: column name; children [K_TYPENAME, constraints K_LIST of K_CONSTRAINT]
+public constant K_CONSTRAINT = 93       // op: CONSTR_*; text: constraint name or ""; intValue: FK actions (onDelete + 8*onUpdate);
+                                        // flags F_DEFERRABLE, F_INITIALLY_DEFERRED, F_NOT_VALID; children
+                                        // [expr|-1 (DEFAULT/CHECK/GENERATED), columns K_LIST|-1 (table-level), refTable K_TABLE_REF|-1, refColumns K_LIST|-1, options K_LIST|-1]
+public constant K_DEF_ELEM = 94         // name = value option; text: name (lower); children [value|-1]
+public constant K_CREATE_INDEX = 95     // text: index name or ""; flags F_UNIQUE, F_IF_NOT_EXISTS, F_CONCURRENTLY;
+                                        // children [table K_TABLE_REF, elements K_LIST of K_SORT_ITEM, where|-1, include K_LIST|-1, options K_LIST|-1, method K_NAME|-1]
+public constant K_DROP = 96             // op: OBJ_*; flags F_IF_EXISTS, F_CASCADE, F_RESTRICT, F_CONCURRENTLY; children [K_LIST of K_TABLE_REF (names)]
+public constant K_CREATE_VIEW = 97      // text: view; flags F_OR_REPLACE, F_TEMP, F_MATERIALIZED; children [schema|-1, columns K_LIST|-1, query]
+public constant K_ALTER_TABLE = 98      // flags F_IF_EXISTS, F_ONLY; children [K_TABLE_REF, K_LIST of K_ALTER_CMD]
+public constant K_ALTER_CMD = 99        // op: AT_*; text: column/constraint name; flags F_IF_EXISTS, F_IF_NOT_EXISTS, F_CASCADE;
+                                        // children [definition|-1 (K_COLUMN_DEF/K_CONSTRAINT/K_TYPENAME/expr/K_LIST), newName K_NAME|-1]
+public constant K_TRUNCATE = 100        // flags F_RESTART_IDENTITY, F_CASCADE; children [K_LIST of K_TABLE_REF]
+public constant K_CREATE_SCHEMA = 101   // text: schema; flags F_IF_NOT_EXISTS
+public constant K_CREATE_SEQUENCE = 102 // text: name; flags F_IF_NOT_EXISTS, F_TEMP; children [schema|-1, options K_LIST of K_DEF_ELEM|-1]
+public constant K_CREATE_DATABASE = 103 // text: name; children [options K_LIST|-1]
+// Utility
+public constant K_TRANSACTION = 110     // op: TX_*; text: savepoint / gid; intValue: ISO_*; flags F_TX_*
+public constant K_SET = 111             // op: SET_*; text: variable name (lower, dotted); flags F_SET_LOCAL, F_SET_SESSION; children [values K_LIST|-1]
+public constant K_SET_TRANSACTION = 112 // intValue: ISO_*; flags F_TX_* (F_TX_SESSION_CHARACTERISTICS for SET SESSION CHARACTERISTICS AS TRANSACTION)
+public constant K_SHOW = 113            // text: variable name (lower), "all"
+public constant K_RESET = 114           // text: variable name (lower), "all"
+public constant K_VACUUM = 115          // flags F_VACUUM_*; children [tables K_LIST|-1]
+public constant K_ANALYZE = 116         // flags F_VACUUM_VERBOSE; children [tables K_LIST|-1]
+public constant K_CHECKPOINT = 117
+public constant K_COPY = 118            // op: COPY_FROM/COPY_TO; intValue: COPY_STDIO/COPY_FILE/COPY_PROGRAM; text: file name / program;
+                                        // children [table K_TABLE_REF|-1, columns K_LIST|-1, query|-1, options K_LIST of K_DEF_ELEM|-1, where|-1]
+public constant K_EXPLAIN = 119         // flags F_EXPLAIN_*; children [statement, options K_LIST of K_DEF_ELEM|-1]
+public constant K_DISCARD = 120         // text: "all" | "plans" | "sequences" | "temp"
+public constant K_DEALLOCATE = 121      // text: name or ""; flags F_ALL
+public constant K_PREPARE = 122         // text: name; children [paramTypes K_LIST of K_TYPENAME|-1, statement]
+public constant K_EXECUTE = 123         // text: name; children [args K_LIST|-1]
+public constant K_LOCK = 124            // text: lock mode (lower, e.g. "access exclusive"); flags F_NOWAIT; children [K_LIST of K_TABLE_REF]
+public constant K_LISTEN = 125          // text: channel
+public constant K_UNLISTEN = 126        // text: channel or "*"
+public constant K_NOTIFY = 127          // text: channel; children [payload K_STR_LIT|-1]
+public constant K_COMMENT = 128         // COMMENT ON ... (parsed, no-op); text: object kind; children [object K_TABLE_REF|-1, comment|-1]
+// Cursors (kinds 150..169 are reserved for the sql2 agent's additions)
+public constant K_DECLARE = 150         // DECLARE name ... CURSOR FOR query; text: name; flags F_CUR_*; children [query]
+public constant K_FETCH = 151           // FETCH / MOVE; text: cursor; op: FETCH_*; intValue: count; flags F_FETCH_ALL, F_FETCH_MOVE
+public constant K_CLOSE = 152           // CLOSE name | ALL; text: name ("" with F_ALL)
+// Partitioning. K_CREATE_TABLE children gain [3] = K_PART_SPEC|-1 (PARTITION BY), [4] = parent K_TABLE_REF|-1
+// (PARTITION OF), [5] = K_PART_BOUND|-1.
+public constant K_PART_SPEC = 153       // op: PART_*; children [K_LIST of K_DEF_ELEM (text: opclass or ""; children [key expr])]
+public constant K_PART_BOUND = 154      // op: PB_*; children [K_LIST values (IN list / FROM / MODULUS, REMAINDER), K_LIST TO values|-1];
+                                        // MINVALUE / MAXVALUE are K_NAME "minvalue" / "maxvalue"
+public constant K_TABLE_LIKE = 155      // LIKE t in CREATE TABLE elements; flags F_LIKE_DEFAULTS; children [K_TABLE_REF]
+
+// ---------------------------------------------------------------- operators (op)
+public constant OP_NONE = 0
+public constant OP_ADD = 1
+public constant OP_SUB = 2
+public constant OP_MUL = 3
+public constant OP_DIV = 4
+public constant OP_MOD = 5
+public constant OP_POW = 6
+public constant OP_CONCAT = 7           // ||
+public constant OP_EQ = 10
+public constant OP_NE = 11              // <> and !=
+public constant OP_LT = 12
+public constant OP_LE = 13
+public constant OP_GT = 14
+public constant OP_GE = 15
+public constant OP_AND = 20
+public constant OP_OR = 21
+public constant OP_NOT = 22             // unary
+public constant OP_NEG = 23             // unary -
+public constant OP_POS = 24             // unary +
+public constant OP_IS_DISTINCT_FROM = 25
+public constant OP_IS_NOT_DISTINCT_FROM = 26
+public constant OP_REGEX = 30           // ~
+public constant OP_REGEX_I = 31         // ~*
+public constant OP_NOT_REGEX = 32       // !~
+public constant OP_NOT_REGEX_I = 33     // !~*
+public constant OP_BIT_AND = 40         // &
+public constant OP_BIT_OR = 41          // |
+public constant OP_BIT_XOR = 42         // #
+public constant OP_SHL = 43             // <<
+public constant OP_SHR = 44             // >>
+public constant OP_BIT_NOT = 45         // unary ~
+public constant OP_OTHER = 99           // any other operator; text holds the symbol (@>, ->>, &&, |/, @, ...)
+
+// K_CAST variants (op)
+public constant CAST_FUNC = 0           // CAST(x AS t)
+public constant CAST_COLON = 1          // x::t
+public constant CAST_TYPED_LITERAL = 2  // DATE '1998-12-01', INTERVAL '3' MONTH (child 0 is a K_STR_LIT)
+// K_LIKE (op)
+public constant LIKE_LIKE = 1
+public constant LIKE_ILIKE = 2
+public constant LIKE_SIMILAR = 3
+// K_IS_TEST (op)
+public constant TEST_NULL = 1
+public constant TEST_TRUE = 2
+public constant TEST_FALSE = 3
+public constant TEST_UNKNOWN = 4
+public constant TEST_DOCUMENT = 5
+// K_QUANTIFIED (intValue)
+public constant QUANT_ANY = 1           // ANY and SOME
+public constant QUANT_ALL = 2
+// K_SET_OP (op)
+public constant SETOP_UNION = 1
+public constant SETOP_INTERSECT = 2
+public constant SETOP_EXCEPT = 3
+// K_JOIN (op)
+public constant JOIN_INNER = 1
+public constant JOIN_LEFT = 2
+public constant JOIN_RIGHT = 3
+public constant JOIN_FULL = 4
+public constant JOIN_CROSS = 5
+// K_SORT_ITEM (op / intValue)
+public constant SORT_DEFAULT = 0
+public constant SORT_ASC = 1
+public constant SORT_DESC = 2
+public constant SORT_USING = 3          // ORDER BY x USING <op>; text holds the operator
+public constant NULLS_DEFAULT = 0
+public constant NULLS_FIRST = 1
+public constant NULLS_LAST = 2
+// K_FRAME (op), K_FRAME_BOUND (op), K_FRAME exclusion (intValue)
+public constant FRAME_RANGE = 1
+public constant FRAME_ROWS = 2
+public constant FRAME_GROUPS = 3
+public constant BOUND_UNBOUNDED_PRECEDING = 1
+public constant BOUND_PRECEDING = 2
+public constant BOUND_CURRENT_ROW = 3
+public constant BOUND_FOLLOWING = 4
+public constant BOUND_UNBOUNDED_FOLLOWING = 5
+public constant EXCLUDE_NONE = 0
+public constant EXCLUDE_CURRENT_ROW = 1
+public constant EXCLUDE_GROUP = 2
+public constant EXCLUDE_TIES = 3
+// K_GROUPING_SET (op)
+public constant GSET_ROLLUP = 1
+public constant GSET_CUBE = 2
+public constant GSET_SETS = 3
+public constant GSET_EMPTY = 4          // ()
+// K_TYPENAME interval fields (op)
+public constant INTERVAL_NONE = 0
+public constant INTERVAL_YEAR = 1
+public constant INTERVAL_MONTH = 2
+public constant INTERVAL_DAY = 3
+public constant INTERVAL_HOUR = 4
+public constant INTERVAL_MINUTE = 5
+public constant INTERVAL_SECOND = 6
+public constant INTERVAL_YEAR_TO_MONTH = 7
+public constant INTERVAL_DAY_TO_HOUR = 8
+public constant INTERVAL_DAY_TO_MINUTE = 9
+public constant INTERVAL_DAY_TO_SECOND = 10
+public constant INTERVAL_HOUR_TO_MINUTE = 11
+public constant INTERVAL_HOUR_TO_SECOND = 12
+public constant INTERVAL_MINUTE_TO_SECOND = 13
+// K_ON_CONFLICT (op)
+public constant CONFLICT_NOTHING = 1
+public constant CONFLICT_UPDATE = 2
+// K_CONSTRAINT (op)
+public constant CONSTR_NOT_NULL = 1
+public constant CONSTR_NULL = 2
+public constant CONSTR_DEFAULT = 3
+public constant CONSTR_PRIMARY_KEY = 4
+public constant CONSTR_UNIQUE = 5
+public constant CONSTR_FOREIGN_KEY = 6  // REFERENCES (column-level) or FOREIGN KEY (...) REFERENCES (table-level)
+public constant CONSTR_CHECK = 7
+public constant CONSTR_IDENTITY = 8     // GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY; intValue 1 = ALWAYS, 0 = BY DEFAULT
+public constant CONSTR_GENERATED = 9    // GENERATED ALWAYS AS (expr) STORED
+public constant CONSTR_EXCLUDE = 10
+// FK actions (packed into K_CONSTRAINT.intValue as onDelete + 8 * onUpdate)
+public constant FK_NO_ACTION = 0
+public constant FK_RESTRICT = 1
+public constant FK_CASCADE = 2
+public constant FK_SET_NULL = 3
+public constant FK_SET_DEFAULT = 4
+// K_DROP object types (op)
+public constant OBJ_TABLE = 1
+public constant OBJ_INDEX = 2
+public constant OBJ_VIEW = 3
+public constant OBJ_SEQUENCE = 4
+public constant OBJ_SCHEMA = 5
+public constant OBJ_DATABASE = 6
+public constant OBJ_MATERIALIZED_VIEW = 7
+public constant OBJ_TYPE = 8
+public constant OBJ_FUNCTION = 9
+public constant OBJ_EXTENSION = 10
+// K_ALTER_CMD (op)
+public constant AT_ADD_COLUMN = 1       // child 0: K_COLUMN_DEF
+public constant AT_DROP_COLUMN = 2      // text: column
+public constant AT_ADD_CONSTRAINT = 3   // child 0: K_CONSTRAINT
+public constant AT_DROP_CONSTRAINT = 4  // text: constraint name
+public constant AT_RENAME_COLUMN = 5    // text: old column; child 1: new K_NAME
+public constant AT_RENAME_TABLE = 6     // child 1: new K_NAME
+public constant AT_ALTER_COLUMN_TYPE = 7 // text: column; child 0: K_TYPENAME
+public constant AT_SET_DEFAULT = 8      // text: column; child 0: expr
+public constant AT_DROP_DEFAULT = 9     // text: column
+public constant AT_SET_NOT_NULL = 10    // text: column
+public constant AT_DROP_NOT_NULL = 11   // text: column
+public constant AT_RENAME_CONSTRAINT = 12 // text: old name; child 1: new K_NAME
+public constant AT_SET_OPTIONS = 13     // child 0: K_LIST of K_DEF_ELEM (SET (fillfactor = 100))
+public constant AT_ATTACH_PARTITION = 30 // children [K_PART_BOUND, partition K_TABLE_REF]
+public constant AT_DETACH_PARTITION = 31 // children [-1, partition K_TABLE_REF]
+public constant AT_OTHER = 99           // parsed but not modelled (text: first keywords)
+// K_TRANSACTION (op)
+public constant TX_BEGIN = 1            // BEGIN / START TRANSACTION (F_TX_START)
+public constant TX_COMMIT = 2           // COMMIT / END
+public constant TX_ROLLBACK = 3         // ROLLBACK / ABORT
+public constant TX_SAVEPOINT = 4
+public constant TX_RELEASE = 5
+public constant TX_ROLLBACK_TO = 6
+public constant TX_PREPARE = 7          // PREPARE TRANSACTION 'gid'
+public constant TX_COMMIT_PREPARED = 8
+public constant TX_ROLLBACK_PREPARED = 9
+// isolation levels (intValue of K_TRANSACTION / K_SET_TRANSACTION)
+public constant ISO_DEFAULT = 0
+public constant ISO_READ_UNCOMMITTED = 1
+public constant ISO_READ_COMMITTED = 2
+public constant ISO_REPEATABLE_READ = 3
+public constant ISO_SERIALIZABLE = 4
+// K_SET (op)
+public constant SET_VALUE = 1           // SET x = v / TO v (children[0] = K_LIST of values)
+public constant SET_DEFAULT = 2         // SET x TO DEFAULT
+public constant SET_FROM_CURRENT = 3
+// K_COPY (op / intValue)
+public constant COPY_FROM = 1
+public constant COPY_TO = 2
+public constant COPY_STDIO = 1          // STDIN / STDOUT
+public constant COPY_FILE = 2
+public constant COPY_PROGRAM = 3
+// K_PART_SPEC (op)
+public constant PART_RANGE = 1
+public constant PART_LIST = 2
+public constant PART_HASH = 3
+// K_PART_BOUND (op)
+public constant PB_LIST = 1
+public constant PB_RANGE = 2
+public constant PB_HASH = 3
+public constant PB_DEFAULT = 4
+// K_FETCH (op)
+public constant FETCH_FORWARD = 1       // NEXT, FORWARD [n|ALL], n, ALL
+public constant FETCH_BACKWARD = 2      // PRIOR, BACKWARD [n|ALL]
+public constant FETCH_ABSOLUTE = 3      // FIRST (1), LAST (-1), ABSOLUTE n
+public constant FETCH_RELATIVE = 4      // RELATIVE n
+
+// ---------------------------------------------------------------- flags (bit masks; meaning is per kind, see docs/AST.md)
+public constant F_NOT = 1               // K_IN_LIST, K_IN_SUBQUERY, K_BETWEEN, K_LIKE, K_IS_TEST
+public constant F_SYMMETRIC = 2         // K_BETWEEN
+public constant F_SUBQUERY = 2          // K_QUANTIFIED: right side is a subquery (else an array expression)
+public constant F_INT_OVERFLOW = 1      // K_INT_LIT: does not fit int64 (treat as numeric)
+public constant F_STR_ESCAPE = 1        // K_STR_LIT: E'..'
+public constant F_STR_DOLLAR = 2        // K_STR_LIT: $$..$$
+public constant F_STR_BIT = 4           // K_STR_LIT: B'..' or X'..' (text holds the raw digits)
+public constant F_STR_NATIONAL = 8      // K_STR_LIT: N'..'
+public constant F_EXPLICIT_ROW = 1      // K_ROW_EXPR: ROW(...)
+public constant F_SLICE = 1             // K_SUBSCRIPT
+// K_FUNC_CALL
+public constant F_FUNC_DISTINCT = 1     // agg(DISTINCT x)
+public constant F_FUNC_STAR = 2         // count(*) (args list empty)
+public constant F_FUNC_NO_PARENS = 4    // CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_USER, ...
+public constant F_FUNC_SPECIAL = 8      // rewritten from EXTRACT/SUBSTRING/POSITION/TRIM/OVERLAY/AT TIME ZONE syntax
+public constant F_FUNC_VARIADIC = 16
+public constant F_FUNC_ALL = 32         // agg(ALL x)
+public constant F_FUNC_WITHIN_GROUP = 64 // aggOrderBy came from WITHIN GROUP (ORDER BY ..)
+// K_TARGET
+public constant F_TARGET_ALIAS = 1      // explicit alias given (with or without AS)
+// K_SELECT
+public constant F_DISTINCT = 1
+public constant F_DISTINCT_ON = 2
+public constant F_FOR_UPDATE = 4
+public constant F_FOR_SHARE = 8
+public constant F_FOR_NO_KEY_UPDATE = 16
+public constant F_FOR_KEY_SHARE = 32
+public constant F_NOWAIT = 64           // also K_LOCK
+public constant F_SKIP_LOCKED = 128
+public constant F_WITH_TIES = 256       // FETCH FIRST n ROWS WITH TIES
+public constant F_SELECT_INTO = 512     // SELECT ... INTO t (unsupported by engine; parsed)
+// K_SET_OP, K_DEALLOCATE
+public constant F_ALL = 1
+// K_JOIN
+public constant F_NATURAL = 1
+// K_SUBQUERY_REF / K_FUNC_REF
+public constant F_LATERAL = 1
+public constant F_WITH_ORDINALITY = 2
+// K_TABLE_REF, K_ALTER_TABLE
+public constant F_ONLY = 1024
+// K_WITH / K_CTE
+public constant F_RECURSIVE = 1
+public constant F_MATERIALIZED = 1      // K_CTE, K_CREATE_VIEW (CREATE MATERIALIZED VIEW)
+public constant F_NOT_MATERIALIZED = 2
+// K_INSERT
+public constant F_DEFAULT_VALUES = 1
+// DDL flags (unique bits so they can be combined freely)
+public constant F_IF_EXISTS = 4
+public constant F_IF_NOT_EXISTS = 8
+public constant F_CASCADE = 16
+public constant F_RESTRICT = 32
+public constant F_TEMP = 64
+public constant F_UNIQUE = 128
+public constant F_OR_REPLACE = 256
+public constant F_CONCURRENTLY = 512
+public constant F_UNLOGGED = 2048
+public constant F_WITH_NO_DATA = 4096
+public constant F_RESTART_IDENTITY = 8192
+// K_CONSTRAINT
+public constant F_DEFERRABLE = 1
+public constant F_INITIALLY_DEFERRED = 2
+public constant F_NOT_VALID = 4
+// K_TRANSACTION / K_SET_TRANSACTION
+public constant F_TX_READ_ONLY = 1
+public constant F_TX_READ_WRITE = 2
+public constant F_TX_DEFERRABLE = 4
+public constant F_TX_NOT_DEFERRABLE = 8
+public constant F_TX_CHAIN = 16
+public constant F_TX_START = 32
+public constant F_TX_SESSION_CHARACTERISTICS = 64
+// K_DECLARE
+public constant F_CUR_SCROLL = 1
+public constant F_CUR_NO_SCROLL = 2
+public constant F_CUR_HOLD = 4
+public constant F_CUR_BINARY = 8
+// K_TABLE_LIKE
+public constant F_LIKE_DEFAULTS = 1
+// K_FETCH
+public constant F_FETCH_ALL = 1
+public constant F_FETCH_MOVE = 2
+// K_SET
+public constant F_SET_LOCAL = 1
+public constant F_SET_SESSION = 2
+// K_VACUUM / K_ANALYZE
+public constant F_VACUUM_FULL = 1
+public constant F_VACUUM_FREEZE = 2
+public constant F_VACUUM_VERBOSE = 4
+public constant F_VACUUM_ANALYZE = 8
+// K_EXPLAIN
+public constant F_EXPLAIN_ANALYZE = 1
+public constant F_EXPLAIN_VERBOSE = 2
+
+// Fixed child slots of query nodes (K_SELECT / K_SET_OP / K_VALUES share 5,6,7,9).
+public constant Q_TARGETS = 0
+public constant Q_FROM = 1
+public constant Q_WHERE = 2
+public constant Q_GROUP_BY = 3
+public constant Q_HAVING = 4
+public constant Q_ORDER_BY = 5
+public constant Q_LIMIT = 6
+public constant Q_OFFSET = 7
+public constant Q_DISTINCT_ON = 8
+public constant Q_WITH = 9
+public constant Q_WINDOWS = 10
+public constant Q_LEFT = 0              // K_SET_OP
+public constant Q_RIGHT = 1             // K_SET_OP
+public constant Q_ROWS = 0              // K_VALUES
+
+// ---------------------------------------------------------------- construction
+
+public function newAst(): Ast {
+    return Ast { nodes: []; statements: []; stmtStart: []; stmtEnd: []; stmtText: []; paramCount: 0 }
+}
+
+public function addNode(ast: Ast, kind: Integer, op: Integer, text: Text, position: Integer, children: List<Integer>): Integer {
+    let id = ast.nodes.length
+    ast.nodes.add(Node { kind: kind; op: op; text: text; intValue: 0; floatValue: 0.0; flags: 0; position: position; children: children })
+    return id
+}
+
+// ---------------------------------------------------------------- access helpers
+
+public function node(ast: Ast, id: Integer): Node {
+    return ast.nodes[id]
+}
+
+public function kind(ast: Ast, id: Integer): Integer {
+    if id < 0 { return 0 }
+    return ast.nodes[id].kind
+}
+
+public function text(ast: Ast, id: Integer): Text {
+    if id < 0 { return "" }
+    return ast.nodes[id].text
+}
+
+public function hasFlag(ast: Ast, id: Integer, flag: Integer): Boolean {
+    if id < 0 { return false }
+    return (ast.nodes[id].flags & flag) != 0
+}
+
+// Child i of node id, or -1 when id is absent or the slot does not exist.
+public function child(ast: Ast, id: Integer, i: Integer): Integer {
+    if id < 0 { return -1 }
+    let children = ast.nodes[id].children
+    if i < 0 || i >= children.length { return -1 }
+    return children[i]
+}
+
+public function childCount(ast: Ast, id: Integer): Integer {
+    if id < 0 { return 0 }
+    return ast.nodes[id].children.length
+}
+
+// Items of a K_LIST (empty for -1).
+public function items(ast: Ast, listId: Integer): List<Integer> {
+    if listId < 0 { return [] }
+    return ast.nodes[listId].children
+}
+
+public function isQuery(ast: Ast, id: Integer): Boolean {
+    let k = kind(ast, id)
+    return k == K_SELECT || k == K_SET_OP || k == K_VALUES
+}
+
+// Immediate qualifier of a K_COLUMN_REF / K_STAR (t in s.t.a), or "".
+public function qualifier(ast: Ast, id: Integer): Text {
+    if id < 0 { return "" }
+    let children = ast.nodes[id].children
+    if children.length == 0 { return "" }
+    return ast.nodes[children[children.length - 1]].text
+}
+
+// Schema of a K_TABLE_REF / K_FUNC_CALL / named DDL node, or "".
+public function schemaOf(ast: Ast, id: Integer): Text {
+    return text(ast, child(ast, id, 0))
+}
+
+// Alias name of a K_TABLE_REF / K_SUBQUERY_REF / K_FUNC_REF / K_JOIN, or "".
+public function aliasOf(ast: Ast, id: Integer): Text {
+    let k = kind(ast, id)
+    if k == K_TABLE_REF || k == K_SUBQUERY_REF || k == K_FUNC_REF { return text(ast, child(ast, id, 1)) }
+    if k == K_JOIN { return text(ast, child(ast, id, 4)) }
+    return ""
+}
+
+// ---------------------------------------------------------------- names (for dumps and messages)
+
+public function kindName(k: Integer): Text {
+    if k == K_LIST { return "list" }
+    if k == K_NAME { return "name" }
+    if k == K_INT_LIT { return "int" }
+    if k == K_NUM_LIT { return "num" }
+    if k == K_STR_LIT { return "str" }
+    if k == K_BOOL_LIT { return "bool" }
+    if k == K_NULL_LIT { return "null" }
+    if k == K_PARAM { return "param" }
+    if k == K_DEFAULT { return "default" }
+    if k == K_COLUMN_REF { return "col" }
+    if k == K_STAR { return "star" }
+    if k == K_BINARY_OP { return "binop" }
+    if k == K_UNARY_OP { return "unop" }
+    if k == K_FUNC_CALL { return "func" }
+    if k == K_CAST { return "cast" }
+    if k == K_TYPENAME { return "type" }
+    if k == K_CASE { return "case" }
+    if k == K_WHEN { return "when" }
+    if k == K_BETWEEN { return "between" }
+    if k == K_IN_LIST { return "in" }
+    if k == K_IN_SUBQUERY { return "in-sub" }
+    if k == K_EXISTS { return "exists" }
+    if k == K_SUBQUERY_EXPR { return "subquery" }
+    if k == K_QUANTIFIED { return "quantified" }
+    if k == K_LIKE { return "like" }
+    if k == K_IS_TEST { return "is" }
+    if k == K_ARRAY_EXPR { return "array" }
+    if k == K_ARRAY_SUBQUERY { return "array-sub" }
+    if k == K_ROW_EXPR { return "row" }
+    if k == K_SUBSCRIPT { return "subscript" }
+    if k == K_COLLATE { return "collate" }
+    if k == K_WINDOW_DEF { return "window" }
+    if k == K_FRAME { return "frame" }
+    if k == K_FRAME_BOUND { return "bound" }
+    if k == K_FIELD_SELECT { return "field" }
+    if k == K_GROUPING_SET { return "grouping-set" }
+    if k == K_SELECT { return "select" }
+    if k == K_SET_OP { return "setop" }
+    if k == K_VALUES { return "values" }
+    if k == K_TARGET { return "target" }
+    if k == K_TABLE_REF { return "table" }
+    if k == K_SUBQUERY_REF { return "subquery-ref" }
+    if k == K_FUNC_REF { return "func-ref" }
+    if k == K_JOIN { return "join" }
+    if k == K_ALIAS { return "alias" }
+    if k == K_SORT_ITEM { return "sort" }
+    if k == K_WITH { return "with" }
+    if k == K_CTE { return "cte" }
+    if k == K_INSERT { return "insert" }
+    if k == K_UPDATE { return "update" }
+    if k == K_DELETE { return "delete" }
+    if k == K_SET_ITEM { return "set-item" }
+    if k == K_MULTI_SET { return "multi-set" }
+    if k == K_ON_CONFLICT { return "on-conflict" }
+    if k == K_CREATE_TABLE { return "create-table" }
+    if k == K_CREATE_TABLE_AS { return "create-table-as" }
+    if k == K_COLUMN_DEF { return "column" }
+    if k == K_CONSTRAINT { return "constraint" }
+    if k == K_DEF_ELEM { return "option" }
+    if k == K_CREATE_INDEX { return "create-index" }
+    if k == K_DROP { return "drop" }
+    if k == K_CREATE_VIEW { return "create-view" }
+    if k == K_ALTER_TABLE { return "alter-table" }
+    if k == K_ALTER_CMD { return "alter-cmd" }
+    if k == K_TRUNCATE { return "truncate" }
+    if k == K_CREATE_SCHEMA { return "create-schema" }
+    if k == K_CREATE_SEQUENCE { return "create-sequence" }
+    if k == K_CREATE_DATABASE { return "create-database" }
+    if k == K_TRANSACTION { return "transaction" }
+    if k == K_SET { return "set" }
+    if k == K_SET_TRANSACTION { return "set-transaction" }
+    if k == K_SHOW { return "show" }
+    if k == K_RESET { return "reset" }
+    if k == K_VACUUM { return "vacuum" }
+    if k == K_ANALYZE { return "analyze" }
+    if k == K_CHECKPOINT { return "checkpoint" }
+    if k == K_COPY { return "copy" }
+    if k == K_EXPLAIN { return "explain" }
+    if k == K_DISCARD { return "discard" }
+    if k == K_DEALLOCATE { return "deallocate" }
+    if k == K_PREPARE { return "prepare" }
+    if k == K_EXECUTE { return "execute" }
+    if k == K_LOCK { return "lock" }
+    if k == K_LISTEN { return "listen" }
+    if k == K_UNLISTEN { return "unlisten" }
+    if k == K_NOTIFY { return "notify" }
+    if k == K_COMMENT { return "comment" }
+    if k == K_DECLARE { return "declare" }
+    if k == K_FETCH { return "fetch" }
+    if k == K_CLOSE { return "close" }
+    if k == K_PART_SPEC { return "part-spec" }
+    if k == K_PART_BOUND { return "part-bound" }
+    if k == K_TABLE_LIKE { return "like" }
+    return "kind" + Text(k)
+}
+
+// Canonical S-expression of a subtree: (kind[:op][ "text"][ #int][ !flags] child...); -1 prints as _.
+public function dump(ast: Ast, id: Integer): Text {
+    let parts: List<Text> = []
+    dumpInto(ast, id, parts)
+    return joinText(parts)
+}
+
+function dumpInto(ast: Ast, id: Integer, parts: List<Text>) {
+    if id < 0 {
+        parts.add("_")
+        return
+    }
+    let n = ast.nodes[id]
+    parts.add("(")
+    parts.add(kindName(n.kind))
+    if n.op != 0 {
+        parts.add(":")
+        parts.add(Text(n.op))
+    }
+    if n.text != "" || n.kind == K_STR_LIT {
+        parts.add(" ")
+        parts.add(quote(n.text))
+    }
+    if n.intValue != 0 {
+        parts.add(" #")
+        parts.add(Text(n.intValue))
+    }
+    if n.flags != 0 {
+        parts.add(" !")
+        parts.add(Text(n.flags))
+    }
+    for c in n.children {
+        parts.add(" ")
+        dumpInto(ast, c, parts)
+    }
+    parts.add(")")
+}
+
+function quote(value: Text): Text {
+    let simple = true
+    for c in value {
+        if c == '"' || c == '\\' || c == '\n' { simple = false }
+    }
+    if simple { return "\"" + value + "\"" }
+    let parts: List<Text> = ["\""]
+    for c in value {
+        if c == '"' {
+            parts.add("\\\"")
+        } else if c == '\\' {
+            parts.add("\\\\")
+        } else if c == '\n' {
+            parts.add("\\n")
+        } else {
+            parts.add(Text(c))
+        }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}

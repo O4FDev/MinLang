@@ -1,0 +1,646 @@
+// This optional final lowering runs after owner transfers and cycle fixups.
+// Walk each temporary's control-flow paths through the first cleanup, so
+// branches never lose a condition owner. Disjoint inclusive visited ranges
+// may share an initialized-null cell; local owners keep distinct cells.
+record ScopeOwnershipBody {
+    lines: List<Text>
+    operations: List<Integer>
+    slots: List<Integer>
+    values: List<Text>
+    targets: List<List<Integer>>
+    cleanups: List<List<Integer>>
+    producers: List<Integer>
+    firsts: List<Integer>
+    lasts: List<Integer>
+    owners: Integer
+    entry: Integer
+}
+
+function scopeStarts(text: Text, prefix: Text): Boolean {
+    return text.byteLength >= prefix.byteLength && text.slice(0, prefix.byteLength) == prefix
+}
+
+function scopeOperation(line: Text): Integer {
+    let prefix = "  call void @minyar_rc_"
+    if !scopeStarts(line, prefix) { return 0 }
+    let end = line.find("(")
+    if end < 0 { return 0 }
+    let name = line.slice(prefix.length, end)
+    if name == "enter" { return 1 }
+    if name == "leave" { return 2 }
+    if name == "step" { return 3 }
+    if name == "keep" { return 4 }
+    if name == "borrow" { return 5 }
+    if name == "local" { return 6 }
+    if name == "local_take" { return 7 }
+    if name == "local_move" { return 8 }
+    if name == "local_move_owner" { return 9 }
+    if name == "borrow_traced" { return 10 }
+    if name == "local_traced" { return 11 }
+    return 0
+}
+
+function scopeBody(lines: List<Text>): ScopeOwnershipBody {
+    let body = ScopeOwnershipBody { lines: lines; operations: []; slots: []; values: []; targets: []; cleanups: []; producers: []; firsts: []; lasts: []; owners: 0; entry: -1 }
+    let labels: List<Text> = []
+    let labelKinds: List<Integer> = []
+    let labelLines: List<Integer> = []
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.length > 0 && line[0] != ' ' && line[line.length - 1] == ':' {
+            labels.add(line.slice(0, line.length - 1))
+            labelKinds.add(1)
+            labelLines.add(index)
+        }
+        let operation = scopeOperation(line)
+        body.operations.add(operation)
+        body.slots.add(-1)
+        body.values.add("")
+        let targets: List<Integer> = []
+        let cleanups: List<Integer> = []
+        body.targets.add(targets)
+        body.cleanups.add(cleanups)
+        if operation == 1 {
+            let prefix = "  call void @minyar_rc_enter(i64 "
+            body.owners = Integer(line.slice(prefix.length, line.length - 1))
+            body.entry = index
+        }
+        if operation == 4 || operation == 5 || operation == 10 {
+            body.slots[index] = body.producers.length
+            body.producers.add(index)
+            let start = line.find("(ptr ") + 5
+            body.values[index] = line.slice(start, line.length - 1)
+        }
+        if operation >= 6 && operation <= 9 || operation == 11 {
+            let start = line.find("(i64 ") + 5
+            let end = line.find(", ptr ")
+            if end < 0 { end = line.length - 1 }
+            body.slots[index] = Integer(line.slice(start, end))
+            if end < line.length - 1 { body.values[index] = line.slice(end + 6, line.length - 1) }
+        }
+        index = index + 1
+    }
+    let labelLookup = buildDeclarationIndex(labels, labelKinds)
+    index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if scopeStarts(line, "  br ") || scopeStarts(line, "  switch ") {
+            let last = index + 1
+            if scopeStarts(line, "  switch ") {
+                while last < lines.length && lines[last - 1].find("]") < 0 { last = last + 1 }
+            }
+            let cursor = index
+            while cursor < last {
+                let parts = lines[cursor].split("label %")
+                let part = 1
+                while part < parts.length {
+                    let name = parts[part]
+                    let end = 0
+                    while end < name.length && name[end] != ',' && name[end] != ' ' && name[end] != ']' { end = end + 1 }
+                    let label = findIndexedSymbol(labelLookup, labels, labelKinds, name.slice(0, end), 1)
+                    if label < 0 { body.entry = -1 } else { body.targets[index].add(labelLines[label]) }
+                    part = part + 1
+                }
+                cursor = cursor + 1
+            }
+        }
+        index = index + 1
+    }
+    return body
+}
+
+function scopeSSACharacter(value: Character): Boolean {
+    return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '.' || value == '$' || value == '-'
+}
+
+function scopeSSAName(value: Text): Boolean {
+    if value.length < 2 || value[0] != '%' { return false }
+    let index = 1
+    while index < value.length {
+        if !scopeSSACharacter(value[index]) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+function scopePublisherUsesPacked(line: Text, packed: Text): Boolean {
+    let prefix = "  call void @minyar_record_replace("
+    let count = 4
+    let position = 2
+    let replacing = true
+    if scopeStarts(line, "  call void @minyar_record_set_reference(") {
+        prefix = "  call void @minyar_record_set_reference("
+        count = 3
+        replacing = false
+    }
+    if scopeStarts(line, "  call void @minyar_list_set(") {
+        prefix = "  call void @minyar_list_set("
+        count = 3
+        replacing = false
+    }
+    if scopeStarts(line, "  call void @minyar_list_add(") {
+        prefix = "  call void @minyar_list_add("
+        count = 2
+        position = 1
+        replacing = false
+    }
+    if !scopeStarts(line, prefix) || line[line.length - 1] != ')' { return false }
+    let arguments = line.slice(prefix.length, line.length - 1)
+    let parts: List<Text> = []
+    let start = 0
+    let cursor = 0
+    let depth = 0
+    while cursor < arguments.length {
+        let character = arguments[cursor]
+        if character == '(' { depth = depth + 1 }
+        if character == ')' { depth = depth - 1; if depth < 0 { return false } }
+        if character == ',' && depth == 0 {
+            if cursor + 1 >= arguments.length || arguments[cursor + 1] != ' ' { return false }
+            parts.add(arguments.slice(start, cursor))
+            start = cursor + 2
+        }
+        cursor = cursor + 1
+    }
+    if depth != 0 { return false }
+    parts.add(arguments.slice(start, arguments.length))
+    if parts.length != count || !scopeStarts(parts[0], "ptr ") { return false }
+    cursor = 1
+    while cursor < parts.length {
+        if !scopeStarts(parts[cursor], "i64 ") { return false }
+        cursor = cursor + 1
+    }
+    if replacing && parts[3] != "i64 0" { return false }
+    return parts[position] == "i64 " + packed
+}
+
+// Canonical reference publication retains the new edge before replacing an
+// old edge. List growth may allocate first, but preserves every source edge
+// while its independent parent owner stays live. Generic List C APIs do not
+// universally retain: this matcher relies on the frontend's checked reference
+// element types and pointer packing, and never removes the publisher's count.
+function scopeCoalescePublishedBorrows(body: ScopeOwnershipBody) {
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let borrows: List<Integer> = []
+    let valid: List<Boolean> = []
+    let uses: List<Integer> = []
+    let index = 2
+    while index + 2 < body.lines.length {
+        if body.operations[index] == 5 {
+            let value = body.values[index]
+            let prefix = "  " + value + " = inttoptr i64 "
+            let definition = body.lines[index - 1]
+            if scopeSSAName(value) && scopeStarts(definition, prefix) && definition.slice(definition.length - 7, definition.length) == " to ptr" {
+                let raw = definition.slice(prefix.length, definition.length - 7)
+                let packing = body.lines[index + 1]
+                let assignment = packing.find(" = ")
+                if assignment > 2 && scopeStarts(packing, "  %") {
+                    let packed = packing.slice(2, assignment)
+                    let exact = packing == "  " + packed + " = ptrtoint ptr " + value + " to i64"
+                    let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.record.get.checked(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
+                    if exact && projected && scopeSSAName(raw) && scopeSSAName(packed) && scopePublisherUsesPacked(body.lines[index + 2], packed) {
+                        names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length)); names.add(packed.slice(1, packed.length))
+                        kinds.add(1); kinds.add(1); kinds.add(1)
+                        borrows.add(index)
+                        valid.add(true)
+                        uses.add(0)
+                    }
+                }
+            }
+        }
+        index = index + 1
+    }
+    if names.length == 0 { return }
+    let lookup = buildDeclarationIndex(names, kinds)
+    index = 0
+    while index < names.length {
+        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 3] = false }
+        index = index + 1
+    }
+    index = 0
+    while index < body.lines.length {
+        let parts = body.lines[index].split("%")
+        let part = 1
+        while part < parts.length {
+            let text = parts[part]
+            let after = 0
+            while after < text.length && scopeSSACharacter(text[after]) { after = after + 1 }
+            if after == 0 { return }
+            let symbol = findIndexedSymbol(lookup, names, kinds, text.slice(0, after), 1)
+            if symbol >= 0 {
+                let candidate = symbol / 3
+                let borrow = borrows[candidate]
+                if symbol % 3 == 0 {
+                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
+                } else if symbol % 3 == 1 {
+                    if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
+                } else {
+                    if index != borrow + 1 && index != borrow + 2 { valid[candidate] = false }
+                    if index == borrow + 2 { uses[candidate] = uses[candidate] + 1 }
+                }
+            }
+            part = part + 1
+        }
+        index = index + 1
+    }
+    let removed = false
+    index = 0
+    while index < borrows.length {
+        if valid[index] && uses[index] == 1 { body.operations[borrows[index]] = 12; removed = true }
+        index = index + 1
+    }
+    if removed {
+        index = 0
+        while index < body.operations.length {
+            if body.operations[index] == 2 { body.operations[index] = 13 }
+            index = index + 1
+        }
+    }
+}
+
+// These runtime helpers preserve the projected operand's owning parent path.
+// Allocation may service dead work, but cannot consume that live owner. The
+// taking join only qualifies on its borrowed right operand. Audit the raw i64
+// too: another inttoptr could otherwise hide a later use of the same value.
+function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let borrows: List<Integer> = []
+    let valid: List<Boolean> = []
+    let consumed: List<Boolean> = []
+    let index = 2
+    while index + 1 < body.lines.length {
+        if body.operations[index] == 5 {
+            let value = body.values[index]
+            let prefix = "  " + value + " = inttoptr i64 "
+            let definition = body.lines[index - 1]
+            if scopeSSAName(value) && scopeStarts(definition, prefix) && definition.slice(definition.length - 7, definition.length) == " to ptr" {
+                let raw = definition.slice(prefix.length, definition.length - 7)
+                let consumer = body.lines[index + 1]
+                let assignment = consumer.find(" = ")
+                let read = false
+                if assignment > 2 && scopeStarts(consumer, "  %") {
+                    let call = " = call zeroext i1 @minyar_texts_are_equal("
+                    let taking = false
+                    let rhs = consumer.slice(assignment, consumer.length)
+                    if scopeStarts(rhs, " = call ptr @minyar_join_text(") { call = " = call ptr @minyar_join_text(" }
+                    if scopeStarts(rhs, " = call ptr @minyar_join_text_take_left(") {
+                        call = " = call ptr @minyar_join_text_take_left("
+                        taking = true
+                    }
+                    if scopeStarts(rhs, " = call i64 @minyar_text_find(") { call = " = call i64 @minyar_text_find(" }
+                    if scopeSSAName(consumer.slice(2, assignment)) && scopeStarts(consumer.slice(assignment, consumer.length), call) && consumer[consumer.length - 1] == ')' {
+                        // Literal Text operands contain a getelementptr
+                        // constant expression with its own commas.
+                        let arguments = consumer.slice(assignment + call.length, consumer.length - 1)
+                        let cursor = 0
+                        let depth = 0
+                        let separator = -1
+                        let supported = true
+                        while cursor < arguments.length {
+                            let character = arguments[cursor]
+                            if character == '(' { depth = depth + 1 }
+                            if character == ')' { depth = depth - 1; if depth < 0 { supported = false } }
+                            if character == ',' && depth == 0 {
+                                if separator >= 0 { supported = false }
+                                separator = cursor
+                            }
+                            cursor = cursor + 1
+                        }
+                        if supported && depth == 0 && separator > 0 && separator + 2 < arguments.length && arguments[separator + 1] == ' ' {
+                            let left = arguments.slice(0, separator) == "ptr " + value
+                            let right = arguments.slice(separator + 2, arguments.length) == "ptr " + value
+                            read = left || right
+                            if taking { read = right && !left }
+                        }
+                    }
+                }
+                let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.record.get.checked(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
+                if read && scopeSSAName(raw) && projected {
+                    names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length))
+                    kinds.add(1); kinds.add(1)
+                    borrows.add(index)
+                    valid.add(true)
+                    consumed.add(false)
+                }
+            }
+        }
+        index = index + 1
+    }
+    if names.length == 0 { return }
+    let lookup = buildDeclarationIndex(names, kinds)
+    index = 0
+    while index < names.length {
+        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 2] = false }
+        index = index + 1
+    }
+    index = 0
+    while index < body.lines.length {
+        let parts = body.lines[index].split("%")
+        let part = 1
+        while part < parts.length {
+            let text = parts[part]
+            let after = 0
+            while after < text.length && scopeSSACharacter(text[after]) { after = after + 1 }
+            // Quoted or unsupported local identifiers require a different
+            // parser. Conservatively keep every comparison borrow here.
+            if after == 0 { return }
+            let symbol = findIndexedSymbol(lookup, names, kinds, text.slice(0, after), 1)
+            if symbol >= 0 {
+                let candidate = symbol / 2
+                let borrow = borrows[candidate]
+                if symbol % 2 == 0 {
+                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
+                    if index == borrow + 1 { consumed[candidate] = true }
+                } else if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
+            }
+            part = part + 1
+        }
+        index = index + 1
+    }
+    let removed = false
+    index = 0
+    while index < borrows.length {
+        if valid[index] && consumed[index] {
+            body.operations[borrows[index]] = 12
+            removed = true
+        }
+        index = index + 1
+    }
+    if removed {
+        // A removed borrow might have been the only release at a return.
+        // Keep a service point on every exit, including branch/loop exits.
+        index = 0
+        while index < body.operations.length {
+            if body.operations[index] == 2 { body.operations[index] = 13 }
+            index = index + 1
+        }
+    }
+}
+
+// A plain borrow immediately followed by a lasting owner needs no separate
+// temporary count. Keep the local/return retain, including its overflow check.
+// No call or control-flow edge can occur before that retaining consumer.
+function scopeCoalesceBorrows(body: ScopeOwnershipBody) {
+    scopeCoalescePublishedBorrows(body)
+    scopeCoalesceReadBorrows(body)
+    let index = 0
+    while index + 3 < body.lines.length {
+        if body.operations[index] == 5 {
+            let value = body.values[index]
+            let local = body.operations[index + 1] == 6 && body.values[index + 1] == value
+            local = local && scopeStarts(body.lines[index + 2], "  store ptr " + value + ", ptr %local.") && body.operations[index + 3] == 3
+            let returned = body.lines[index + 1] == "  call void @minyar_rc_retain(ptr " + value + ")" && (body.operations[index + 2] == 2 || body.operations[index + 2] == 13)
+            let result = index + 3
+            if body.lines[result] == "  call void @minyar_stack_leave()" { result = result + 1 }
+            returned = returned && result < body.lines.length && body.lines[result] == "  ret ptr " + value
+            if local || returned {
+                body.operations[index] = 12
+                if returned {
+                    // A return that loses its temporary drop still services
+                    // pending cycle/incremental work before unlinking roots.
+                    body.operations[index + 2] = 13
+                }
+            }
+        }
+        index = index + 1
+    }
+    let producers: List<Integer> = []
+    index = 0
+    while index < body.producers.length {
+        let producer = body.producers[index]
+        if body.operations[producer] != 12 {
+            body.slots[producer] = producers.length
+            producers.add(producer)
+        }
+        index = index + 1
+    }
+    body.producers = producers
+}
+
+function scopeCleanupPaths(body: ScopeOwnershipBody): Boolean {
+    let visited: List<Integer> = []
+    let index = 0
+    while index < body.lines.length { visited.add(-1); index = index + 1 }
+    let temporary = 0
+    while temporary < body.producers.length {
+        let producer = body.producers[temporary]
+        let first = producer
+        let last = producer
+        let pending: List<Integer> = [producer + 1]
+        let cursor = 0
+        while cursor < pending.length {
+            let line = pending[cursor]
+            cursor = cursor + 1
+            let done = false
+            while line < body.lines.length && !done {
+                if visited[line] == temporary { done = true } else {
+                    visited[line] = temporary
+                    if line < first { first = line }
+                    if line > last { last = line }
+                    let operation = body.operations[line]
+                    if line == producer { return false }
+                    if operation == 2 || operation == 3 || operation == 13 {
+                        body.cleanups[line].add(body.owners + temporary)
+                        done = true
+                    } else if body.targets[line].length > 0 {
+                        let target = 0
+                        while target < body.targets[line].length {
+                            pending.add(body.targets[line][target])
+                            target = target + 1
+                        }
+                        done = true
+                    } else if scopeStarts(body.lines[line], "  ret ") || body.lines[line] == "  unreachable" {
+                        done = true
+                    }
+                    line = line + 1
+                }
+            }
+        }
+        body.firsts.add(first)
+        body.lasts.add(last)
+        temporary = temporary + 1
+    }
+    return true
+}
+
+function scopeReuseCells(body: ScopeOwnershipBody): Integer {
+    let ends: List<Integer> = []
+    let colors: List<Integer> = []
+    let temporary = 0
+    while temporary < body.producers.length {
+        let color = 0
+        // Include cleanup lines in the range: a cleanup reached without this
+        // producer must never clear another live temporary's shared cell.
+        while color < ends.length && ends[color] >= body.firsts[temporary] { color = color + 1 }
+        if color == ends.length { ends.add(body.lasts[temporary]) } else { ends[color] = body.lasts[temporary] }
+        colors.add(color)
+        body.slots[body.producers[temporary]] = color
+        temporary = temporary + 1
+    }
+    let line = 0
+    while line < body.cleanups.length {
+        let cleanup = 0
+        while cleanup < body.cleanups[line].length {
+            let original = body.cleanups[line][cleanup] - body.owners
+            body.cleanups[line][cleanup] = body.owners + colors[original]
+            cleanup = cleanup + 1
+        }
+        line = line + 1
+    }
+    return ends.length
+}
+
+function scopeCell(slot: Integer): Text {
+    return "%rc.scope.slot." + Text(slot)
+}
+
+function scopeDrop(output: List<Text>, line: Integer, slot: Integer) {
+    let value = "%rc.scope.drop." + Text(line) + "." + Text(slot)
+    let cell = scopeCell(slot)
+    output.add("  " + value + " = load ptr, ptr " + cell + "\n")
+    output.add("  store ptr null, ptr " + cell + "\n")
+    output.add("  call void @minyar_rc_scope_release_v1(ptr " + value + ")\n")
+}
+
+// Analysis reads neighbouring instructions, so LLVM comments such as debug
+// descriptions are set aside and re-emitted before the same instruction.
+function lowerScopeBody(source: List<Text>): Text {
+    let lines: List<Text> = []
+    let notes: List<Text> = []
+    let pending: List<Text> = []
+    let sourceIndex = 0
+    while sourceIndex < source.length {
+        let line = source[sourceIndex]
+        if line.length > 0 && line[0] == ';' { pending.add(line + "\n") } else {
+            lines.add(line)
+            notes.add(joinText(pending))
+            let nextPending: List<Text> = []
+            pending = nextPending
+        }
+        sourceIndex = sourceIndex + 1
+    }
+    let body = scopeBody(lines)
+    let count = body.owners + body.producers.length
+    if body.entry >= 0 && count <= 256 {
+        scopeCoalesceBorrows(body)
+        count = body.owners + body.producers.length
+    }
+    if body.entry < 0 || count > 256 || !scopeCleanupPaths(body) {
+        let original: List<Text> = []
+        let index = 0
+        while index < source.length { original.add(source[index] + "\n"); index = index + 1 }
+        return joinText(original)
+    }
+    count = body.owners + scopeReuseCells(body)
+    let output: List<Text> = []
+    let index = 0
+    while index < lines.length {
+        output.add(notes[index])
+        let operation = body.operations[index]
+        let slot = body.slots[index]
+        let value = body.values[index]
+        if operation == 0 { output.add(lines[index] + "\n") } else if operation == 1 {
+            if count > 0 {
+                output.add("  %rc.scope.header = alloca [24 x i8], align 8\n")
+                output.add("  %rc.scope.cells = alloca [" + Text(count) + " x ptr], align 8\n")
+                let owner = 0
+                while owner < count {
+                    output.add("  " + scopeCell(owner) + " = getelementptr [" + Text(count) + " x ptr], ptr %rc.scope.cells, i64 0, i64 " + Text(owner) + "\n")
+                    output.add("  store ptr null, ptr " + scopeCell(owner) + "\n")
+                    owner = owner + 1
+                }
+                output.add("  call void @minyar_rc_scope_enter_v1(ptr %rc.scope.header, ptr %rc.scope.cells, i64 " + Text(count) + ")\n")
+            }
+        } else if operation == 2 || operation == 3 || operation == 13 {
+            let temporary = body.cleanups[index].length
+            while temporary > 0 {
+                temporary = temporary - 1
+                scopeDrop(output, index, body.cleanups[index][temporary])
+            }
+            if operation != 3 {
+                let owner = 0
+                while owner < body.owners { scopeDrop(output, index, owner); owner = owner + 1 }
+                if operation == 13 { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
+                if count == 0 { output.add("  call void @minyar_rc_scope_leave_empty_v1()\n") }
+                else { output.add("  call void @minyar_rc_scope_leave_v1(ptr %rc.scope.header)\n") }
+            } else { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
+        } else if operation == 4 || operation == 5 || operation == 10 {
+            if operation != 4 {
+                let suffix = ""
+                if operation == 10 { suffix = "_traced" }
+                output.add("  call void @minyar_rc_retain" + suffix + "(ptr " + value + ")\n")
+            }
+            output.add("  store ptr " + value + ", ptr " + scopeCell(body.owners + slot) + "\n")
+        } else if operation == 8 {
+            output.add("  store ptr null, ptr " + scopeCell(slot) + "\n")
+        } else if operation == 9 {
+            output.add("  call void @minyar_rc_scope_move_v1(ptr " + scopeCell(slot) + ", ptr " + value + ")\n")
+        } else if operation != 12 {
+            if operation != 7 {
+                let suffix = ""
+                if operation == 11 { suffix = "_traced" }
+                output.add("  call void @minyar_rc_retain" + suffix + "(ptr " + value + ")\n")
+            }
+            let previous = "%rc.scope.old." + Text(index)
+            output.add("  " + previous + " = load ptr, ptr " + scopeCell(slot) + "\n")
+            output.add("  store ptr " + value + ", ptr " + scopeCell(slot) + "\n")
+            output.add("  call void @minyar_rc_scope_release_v1(ptr " + previous + ")\n")
+        }
+        index = index + 1
+    }
+    output.add(joinText(pending))
+    return joinText(output)
+}
+
+function lowerScopeOwnership(llvm: Text): Text {
+    let output: List<Text> = []
+    let body: List<Text> = []
+    let inFunction = false
+    let lines = llvm.split("\n")
+    let index = 0
+    let names = ["enter", "leave", "leave_empty", "move", "poll", "release"]
+    while index < lines.length {
+        let line = lines[index]
+        let ending = "\n"
+        if index == lines.length - 1 { ending = "" }
+        if scopeStarts(line, "declare ") {
+            let name = 0
+            while name < names.length {
+                let symbol = "minyar_rc_scope_" + names[name] + "_v1"
+                if line.find("@" + symbol + "(") >= 0 { failCompiler("native symbol conflicts with scope ownership: '" + symbol + "'") }
+                name = name + 1
+            }
+        }
+        if scopeStarts(line, "define ") { inFunction = true }
+        if inFunction {
+            body.add(line + ending)
+            if line == "}" {
+                // Parsing uses lines without terminators; emission keeps the
+                // original pieces for operations that are left unchanged.
+                let parsed: List<Text> = []
+                let itemIndex = 0
+                while itemIndex < body.length {
+                    let item = body[itemIndex]
+                    if item.length > 0 && item[item.length - 1] == '\n' { parsed.add(item.slice(0, item.length - 1)) } else { parsed.add(item) }
+                    itemIndex = itemIndex + 1
+                }
+                if joinText(body).find("  call void @minyar_rc_enter(") < 0 {
+                    output.add(joinText(body))
+                } else { output.add(lowerScopeBody(parsed)) }
+                let nextBody: List<Text> = []
+                body = nextBody
+                inFunction = false
+            }
+        } else { output.add(line + ending) }
+        index = index + 1
+    }
+    output.add("declare void @minyar_rc_scope_enter_v1(ptr, ptr, i64)\n")
+    output.add("declare void @minyar_rc_scope_leave_v1(ptr)\n")
+    output.add("declare void @minyar_rc_scope_leave_empty_v1()\n")
+    output.add("declare void @minyar_rc_scope_move_v1(ptr, ptr)\n")
+    output.add("declare void @minyar_rc_scope_poll_v1()\n")
+    output.add("declare void @minyar_rc_scope_release_v1(ptr)\n")
+    return joinText(output)
+}

@@ -1,0 +1,153 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources = ["runtime/native/unicode.c", "runtime/native/unicode_data.c"]
+let levels = ["-O0", "-O2"]
+let checks = #"""
+    use "unicode" as text
+    function verify(condition: Boolean, message: Text) {
+        if !condition { fail(message) }
+    }
+    function scalars(values: List<Integer>): Text {
+        let parts: List<Text> = []
+        for value in values { parts.add(Text(Character(value))) }
+        return joinText(parts)
+    }
+    function mapping(name: Text, source: Text, expectedUpper: Text, expectedLower: Text) {
+        let original = Bytes(source)
+        verify(text.uppercased(source) == expectedUpper, name + ": uppercase")
+        verify(text.lowercased(source) == expectedLower, name + ": lowercase")
+        let after = Bytes(source)
+        verify(after.length == original.length, name + ": input byte count preserved")
+        for index in 0..original.length {
+            verify(after[index] == original[index], name + ": input byte " + Text(index) + " preserved")
+        }
+    }
+
+    """#
+
+fixtures.executes(frontend, checks + #"""
+    verify(text.unicodeVersion() == "18.0.0", "pinned Unicode version")
+    mapping("empty", "", "", "")
+    mapping("ASCII", "Ab9", "AB9", "ab9")
+    mapping("sharp s", "Straße ẞ", "STRASSE ẞ", "straße ß")
+    mapping("dotted I expansion", "İ", "İ", scalars([0x69, 0x307]))
+    mapping("locale-neutral I", "Iiı", "III", "iiı")
+    mapping("ligature expansion", "ﬃ", "FFI", "ﬃ")
+    mapping("Unicode 18 ligature", scalars([0x1DF95]), "SS", scalars([0x1DF95]))
+    mapping("Greek expansion", scalars([0x390]), scalars([0x399, 0x308, 0x301]), scalars([0x390]))
+    mapping("Armenian expansion", scalars([0x587]), scalars([0x535, 0x552]), scalars([0x587]))
+    mapping("titlecase digraph", scalars([0x1C5]), scalars([0x1C4]), scalars([0x1C6]))
+    mapping("supplementary letters", scalars([0x10400, 0x10428]), scalars([0x10400, 0x10400]), scalars([0x10428, 0x10428]))
+    mapping("new Unicode 18 simple mapping", scalars([0xA7CE, 0xA7CF]), scalars([0xA7CE, 0xA7CE]), scalars([0xA7CF, 0xA7CF]))
+    let zero = scalars([0])
+    mapping("embedded NUL", "A" + zero + "b", "A" + zero + "B", "a" + zero + "b")
+    mapping("unassigned and noncharacters", scalars([0x378, 0xFFFF, 0x10FFFF]), scalars([0x378, 0xFFFF, 0x10FFFF]), scalars([0x378, 0xFFFF, 0x10FFFF]))
+    mapping("no canonical composition", scalars([0x65, 0x301]), scalars([0x45, 0x301]), scalars([0x65, 0x301]))
+    mapping("no canonical decomposition", "é", "É", "é")
+    mapping("original iota mark order", scalars([0x61, 0x345, 0x300]), scalars([0x41, 0x399, 0x300]), scalars([0x61, 0x345, 0x300]))
+    mapping("original accent order", scalars([0x41, 0x315, 0x300]), scalars([0x41, 0x315, 0x300]), scalars([0x61, 0x315, 0x300]))
+    mapping("no Lithuanian tailoring", scalars([0x49, 0x301]), scalars([0x49, 0x301]), scalars([0x69, 0x301]))
+    mapping("no Turkish tailoring", scalars([0x49, 0x307]), scalars([0x49, 0x307]), scalars([0x69, 0x307]))
+    mapping("emoji and controls", scalars([0x1F642, 0x200D, 0, 0xA]), scalars([0x1F642, 0x200D, 0, 0xA]), scalars([0x1F642, 0x200D, 0, 0xA]))
+    print("Full Unicode casing: passed")
+
+    """#, "Full Unicode casing: passed\n", levels, 0, "", true)
+
+// Expected values refer to the original input. In particular U+0345 is both
+// Cased and Case_Ignorable, so context matching must skip it before Cased.
+fixtures.executes(frontend, checks + #"""
+    function lower(name: Text, source: List<Integer>, expected: List<Integer>) {
+        verify(text.lowercased(scalars(source)) == scalars(expected), name)
+    }
+    lower("sigma alone", [0x3A3], [0x3C3])
+    lower("sigma starts word", [0x3A3, 0x41], [0x3C3, 0x61])
+    lower("final sigma", [0x41, 0x3A3], [0x61, 0x3C2])
+    lower("medial sigma", [0x41, 0x3A3, 0x42], [0x61, 0x3C3, 0x62])
+    lower("two sigmas", [0x41, 0x3A3, 0x3A3], [0x61, 0x3C3, 0x3C2])
+    lower("ignorable before sigma", [0x41, 0x301, 0x3A3], [0x61, 0x301, 0x3C2])
+    lower("ignorable after sigma", [0x41, 0x3A3, 0x301], [0x61, 0x3C2, 0x301])
+    lower("ignorable then cased", [0x41, 0x3A3, 0x301, 0x42], [0x61, 0x3C3, 0x301, 0x62])
+    lower("leading marks", [0x301, 0x308, 0x3A3], [0x301, 0x308, 0x3C3])
+    lower("trailing marks", [0x41, 0x3A3, 0x301, 0x308], [0x61, 0x3C2, 0x301, 0x308])
+    lower("apostrophe then cased", [0x41, 0x3A3, 0x27, 0x42], [0x61, 0x3C3, 0x27, 0x62])
+    lower("apostrophe final", [0x41, 0x3A3, 0x27], [0x61, 0x3C2, 0x27])
+    lower("period is ignorable", [0x41, 0x3A3, 0x2E, 0x42], [0x61, 0x3C3, 0x2E, 0x62])
+    lower("hyphen stops after", [0x41, 0x3A3, 0x2D, 0x42], [0x61, 0x3C2, 0x2D, 0x62])
+    lower("hyphen stops before", [0x41, 0x2D, 0x3A3], [0x61, 0x2D, 0x3C3])
+    lower("digit stops after", [0x41, 0x3A3, 0x31, 0x42], [0x61, 0x3C2, 0x31, 0x62])
+    lower("digit stops before", [0x41, 0x31, 0x3A3], [0x61, 0x31, 0x3C3])
+    lower("space stops after", [0x41, 0x3A3, 0x20, 0x42], [0x61, 0x3C2, 0x20, 0x62])
+    lower("space stops before", [0x41, 0x20, 0x3A3], [0x61, 0x20, 0x3C3])
+    lower("NUL stops after", [0x41, 0x3A3, 0, 0x42], [0x61, 0x3C2, 0, 0x62])
+    lower("NUL stops before", [0x41, 0, 0x3A3], [0x61, 0, 0x3C3])
+    lower("Cased plus ignorable before", [0x345, 0x3A3], [0x345, 0x3C3])
+    lower("Cased plus ignorable after base", [0x41, 0x345, 0x3A3], [0x61, 0x345, 0x3C2])
+    lower("Cased plus ignorable after sigma", [0x41, 0x3A3, 0x345], [0x61, 0x3C2, 0x345])
+    lower("Cased plus ignorable then base", [0x41, 0x3A3, 0x345, 0x42], [0x61, 0x3C3, 0x345, 0x62])
+    lower("modifier Cased plus ignorable", [0x2B0, 0x3A3], [0x2B0, 0x3C3])
+    lower("ZWJ before sigma", [0x41, 0x200D, 0x3A3], [0x61, 0x200D, 0x3C2])
+    lower("ZWJ then cased", [0x41, 0x3A3, 0x200D, 0x42], [0x61, 0x3C3, 0x200D, 0x62])
+    lower("Roman numeral is Cased", [0x2160, 0x3A3], [0x2170, 0x3C2])
+    lower("circled letter is Cased", [0x24B6, 0x3A3], [0x24D0, 0x3C2])
+    lower("supplementary cased context", [0x10400, 0x3A3, 0x10400], [0x10428, 0x3C3, 0x10428])
+    let parts: List<Text> = []
+    for index in 0..512 { parts.add(scalars([0x301, 0x345, 0x200D])) }
+    let marks = joinText(parts)
+    verify(text.lowercased("A" + marks + "Σ" + marks) == "a" + marks + "ς" + marks, "long ignored runs retain final context")
+    verify(text.lowercased("AΣ" + marks + "B") == "aσ" + marks + "b", "long ignored run finds following Cased")
+    verify(text.lowercased(marks + "Σ") == marks + "σ", "long ignored run alone is not preceding Cased")
+    print("Final sigma context: passed")
+
+    """#, "Final sigma context: passed\n", levels, 0, "", true)
+
+fixtures.executes(frontend, checks + #"""
+    function freshUpper(): Text {
+        return text.uppercased(joinText(["Stra", "ße", scalars([0]), "İ"]))
+    }
+    function freshLower(): Text {
+        let source = joinText(["A", "Σ", scalars([0]), "İ"])
+        return text.lowercased(source)
+    }
+    function freshUnchanged(): Text {
+        return text.uppercased(joinText(["SEA", scalars([0]), "🙂"]))
+    }
+    let zero = scalars([0])
+    let expectedUpper = "STRASSE" + zero + "İ"
+    let expectedLower = "aς" + zero + scalars([0x69, 0x307])
+    for iteration in 0..128 {
+        let inputs = [joinText(["Stra", "ße", zero, "İ"])]
+        let source = inputs[0]
+        let alias = source
+        let upper = text.uppercased(source)
+        let lower = text.lowercased(source)
+        source = "replaced"
+        inputs[0] = "changed"
+        inputs = []
+        verify(alias == "Straße" + zero + "İ", "casing preserves input alias")
+        verify(upper == expectedUpper, "uppercase survives input replacement")
+        verify(lower == "straße" + zero + scalars([0x69, 0x307]), "lowercase survives input replacement")
+        let outputs = [freshUpper(), freshLower(), freshUnchanged()]
+        let escapedUpper = outputs[0]
+        let escapedLower = outputs[1]
+        let escapedUnchanged = outputs[2]
+        outputs[0] = "changed"
+        outputs[1] = "changed"
+        outputs[2] = "changed"
+        outputs = []
+        verify(escapedUpper == expectedUpper && escapedLower == expectedLower, "transformed results outlive temporary inputs and List")
+        verify(escapedUnchanged == "SEA" + zero + "🙂", "unchanged result outlives temporary input")
+        let resultAlias = upper
+        upper = "replaced"
+        verify(resultAlias == expectedUpper, "uppercase output alias survives replacement")
+        verify(text.lowercased(joinText(["A", "Σ"])) == "aς", "direct temporary input lifetime")
+    }
+    print("Unicode casing ownership: passed")
+
+    """#, "Unicode casing ownership: passed\n", levels, 0, "", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/unicode-case.min"), "The sign above the door:\n  STRASSE\n  CAFÉ\nA softer greeting:\n  καλημέρα\n  i̇stanbul\n", levels, 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Unicode casing: passed O0/O2 full mappings, final sigma and ownership")

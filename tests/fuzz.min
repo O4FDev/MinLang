@@ -15,6 +15,7 @@ record Context {
     compiler: Text
     clang: Text
     runtime: Text
+    timeoutScale: Integer
     flags: List<Text>
     temporary: Text
     commands: List<Text>
@@ -168,15 +169,17 @@ function abort(context: Context, message: Text) {
 }
 function execute(context: Context, arguments: List<Text>, timeout: Float): Result {
     let started = system.monotonicNanoseconds()
-    let request = evidence.command(arguments, timeout)
+    // Scale before constructing evidence so replay keeps the exact effective limit.
+    let effectiveTimeout = timeout * Float(context.timeoutScale)
+    let request = evidence.command(arguments, effectiveTimeout)
     request.cwd = "."
     request.allowTimeout = true
     let raw = evidence.run(context.trace, request)
     let status = raw.status
     if raw.timedOut { status = -1 }
     let result = Result { status: status; stdout: decoded(raw.stdout); stderr: decoded(raw.stderr); timedOut: raw.timedOut; error: raw.error }
-    context.commands.add(object(["command", "cwd", "timeout_seconds", "elapsed_seconds", "status", "timed_out", "stdout", "stderr"],
-        [strings(arguments), evidence.quote(evidence.resolve(".")), seconds(timeout),
+    context.commands.add(object(["command", "cwd", "base_timeout_seconds", "timeout_seconds", "timeout_scale", "elapsed_seconds", "status", "timed_out", "stdout", "stderr"],
+        [strings(arguments), evidence.quote(evidence.resolve(".")), seconds(timeout), seconds(effectiveTimeout), Text(context.timeoutScale),
         rounded(Float(system.monotonicNanoseconds() - started) / 1000000000.0), Text(status), Text(raw.timedOut),
         evidence.quote(result.stdout), evidence.quote(result.stderr)]))
     return result
@@ -665,6 +668,8 @@ for name in stages { if name == stage { knownStage = true } }
 if !knownStage { usage("argument --stage: invalid choice: '" + stage + "'") }
 if cases < 1 || (programCases != -1 && programCases < 1) { usage("case counts must be positive") }
 if !(hostileTimeout > 0.0 && hostileTimeout < 1.0e308) { usage("--hostile-timeout must be positive and finite") }
+let timeoutScale = test.scaledSeconds(1)
+let effectiveHostileTimeout = hostileTimeout * Float(timeoutScale)
 let compiler = evidence.resolve(compilerOption)
 let runtime = test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o")
 if system.getenv("MINYAR_TEST_RUNTIME") == "" && files.pathSize(runtime) < 0 { runtime = "runtime/minyar_runtime.c" }
@@ -674,13 +679,15 @@ if programCount == -1 { programCount = max(8, min(40, cases / 5)) }
 let trace = evidence.openIn(outputDirectory, "campaign", [compiler, runtime])
 let programText = "null"
 if programCases != -1 { programText = Text(programCases) }
-evidence.control(trace, "arguments", object(["compiler", "clang", "cases", "hostile_timeout", "program_cases", "seed", "output_dir"],
-    [evidence.quote(compilerOption), evidence.quote(clang), Text(cases), Text(hostileTimeout), programText, Text(seed), evidence.quote(outputDirectory)]))
-let context = Context { trace: trace; compiler: compiler; clang: clang; runtime: runtime; flags: flags; temporary: trace.path;
+evidence.control(trace, "arguments", object(["compiler", "clang", "cases", "hostile_timeout", "effective_hostile_timeout", "timeout_scale", "program_cases", "seed", "output_dir", "stage"],
+    [evidence.quote(compilerOption), evidence.quote(clang), Text(cases), Text(hostileTimeout), Text(effectiveHostileTimeout), Text(timeoutScale), programText, Text(seed), evidence.quote(outputDirectory), evidence.quote(stage)]))
+let reportedStage = stage
+if reportedStage == "" { reportedStage = "all" }
+let context = Context { trace: trace; compiler: compiler; clang: clang; runtime: runtime; timeoutScale: timeoutScale; flags: flags; temporary: trace.path;
     commands: []; oracleNames: []; oracleValues: [];
-    report: ["seed", "expressions", "program_cases", "compiler", "runtime", "clang", "link_flags", "math_flags", "hostile_timeout_seconds"];
+    report: ["seed", "expressions", "program_cases", "compiler", "runtime", "clang", "link_flags", "math_flags", "hostile_timeout_seconds", "effective_hostile_timeout_seconds", "timeout_scale", "stage"];
     reportValues: [Text(seed), Text(cases), Text(programCount), evidence.quote(compiler), evidence.quote(evidence.resolve(runtime)), evidence.quote(clang),
-        strings(flags), "[\"-lm\"]", Text(hostileTimeout)] }
+        strings(flags), "[\"-lm\"]", Text(hostileTimeout), Text(effectiveHostileTimeout), Text(timeoutScale), evidence.quote(reportedStage)] }
 if files.pathSize(compiler) < 0 || !io.fileExists(compiler) { finish(context, "FileNotFoundError: [Errno 2] No such file or directory: " + evidence.quote(compiler)) }
 if files.pathSize(runtime) < 0 || !io.fileExists(runtime) { finish(context, "FileNotFoundError: [Errno 2] No such file or directory: " + evidence.quote(runtime)) }
 if !evidence.launchable(compiler) { finish(context, "PermissionError: [Errno 13] Permission denied: " + evidence.quote(compiler)) }
@@ -706,4 +713,6 @@ if stage == "" || stage == "regressions" { regressionCorpus(context) }
 if stage == "" || stage == "seeds" { seedCorpus(context) }
 if stage == "" || stage == "modules" { moduleChain(context, 24) }
 finish(context, "")
-print("deterministic fuzzing passed: " + Text(cases) + " expressions, " + Text(programCount) + " full-language cases, " + Text(programCount) + " semantic cases in two forms, " + Text(cases) + " hostile inputs, 24 modules (all valid programs at O0/O2)")
+if stage == "" {
+    print("deterministic fuzzing passed: " + Text(cases) + " expressions, " + Text(programCount) + " full-language cases, " + Text(programCount) + " semantic cases in two forms, " + Text(cases) + " hostile inputs, 24 modules (all valid programs at O0/O2)")
+} else { print("deterministic fuzzing passed: " + stage + " stage") }

@@ -1,0 +1,185 @@
+choice Tone { Soft; Clear }
+choice ByteChoice { Missing; Data(value: Bytes) }
+choice ByteFirst { Present(value: Bytes); Vacant }
+choice Chain { Link(next: List<Chain>); End }
+record ByteCell { value: Maybe<Bytes> }
+record ListCell<Item> { value: Maybe<List<Item>> }
+record Tree { name: Text; children: List<Tree> }
+record TreeHolder { value: Maybe<List<Tree>> }
+record Node { name: Text; children: Maybe<List<Node>> }
+record Part native "c" { a: UInt8; b: UInt8; c: UInt8; d: UInt8 }
+record Packet native "c" { prefix: UInt8; part: Part }
+
+function byteName(value: Maybe<Bytes>): Text {
+    return match value { Some(bytes) { "bytes " + Text(bytes.length) } None { "none" } }
+}
+function nestedBytes(value: Maybe<Maybe<Bytes>>): Text {
+    return match value { Some(inner) { match inner { Some(bytes) { "bytes " + Text(bytes.length) } None { "inner none" } } } None { "outer none" } }
+}
+function rememberBytes(value: Maybe<Bytes>): () -> Maybe<Bytes> { return function() { return value } }
+function viewBytes(): Maybe<Bytes> {
+    let storage = Bytes(sizeOf(Packet))
+    let packet = cView(Packet, storage, 0)
+    packet.part.a = 118; packet.part.b = 105; packet.part.c = 101; packet.part.d = 119
+    return Some(cBytes(packet.part))
+}
+function fetchBytes(good: Boolean): Result<Bytes, Text> {
+    if good { return Ok(Bytes("done")) }
+    return Err("closed")
+}
+function propagateBytes(good: Boolean): Result<Maybe<Bytes>, Text> { return Ok(Some(try fetchBytes(good))) }
+function decodeNumber(good: Boolean): Result<Integer, Text> {
+    if good { return Ok(42) }
+    return Err("closed")
+}
+function gather(good: Boolean): Result<Maybe<List<Integer>>, Text> {
+    return Ok(Some([7, try decodeNumber(good)]))
+}
+function scalarList<Item: Ordered>(empty: Maybe<List<Item>>, first: Item, second: Item): Item {
+    if !empty.isSome() || empty.unwrap().length != 0 { fail("expected a present empty List") }
+    let values = empty.unwrap()
+    for index in 0..20 { values.add(first) }
+    values[0] = second
+    let cell = ListCell<Item> { value: Some(values) }
+    let carriers: List<Maybe<List<Item>>> = [None, cell.value]
+    cell.value = None
+    let projected = carriers[1].unwrap()
+    projected[1] = second
+    if values[1] != second || projected.length != 20 { fail("lost a shared List alias") }
+    let extended = projected.appended(first)
+    if projected.length != 20 || extended.length != 21 { fail("appended changed its source") }
+    let sorted = extended.sorted()
+    return sorted[sorted.length - 1]
+}
+function holdTrees(values: List<Tree>): Maybe<List<Tree>> { return Some(values) }
+function chainLength(value: Chain): Integer { return match value { Link(values) { values.length } End { 0 } } }
+
+print("bytes")
+print(match ByteChoice.Missing { Missing { "missing" } Data(bytes) { "data " + Text(bytes.length) } })
+print(match Data(Bytes()) { Missing { "missing" } Data(bytes) { "data " + Text(bytes.length) } })
+print(match Present(Bytes()) { Present(bytes) { "present " + Text(bytes.length) } Vacant { "vacant" } })
+print(match ByteFirst.Vacant { Present(bytes) { "present " + Text(bytes.length) } Vacant { "vacant" } })
+let empty: Maybe<Bytes> = Some(Bytes())
+let missing: Maybe<Bytes> = None
+print(empty.isSome()); print(empty.unwrap().length); print(missing.isSome())
+let source = Bytes("borrowed")
+let optional: Maybe<Bytes> = Some(source)
+let alias = optional
+optional = None
+source = Bytes("new")
+let preserved = alias.unwrap()
+preserved[0] = 66
+print(Text(alias.unwrap()))
+let owned: Maybe<Bytes> = Some(Bytes("owned"))
+let saved = match owned { Some(bytes) { bytes } None { Bytes() } }
+owned = None
+print(Text(saved))
+let rebound: Maybe<Bytes> = Some(Bytes("held"))
+match (rebound) { Some(bytes) { rebound = None; bytes[0] = 72; print(Text(bytes)) } None { print("lost") } }
+let read = rememberBytes(Some(Bytes("callback")))
+print(Text(read().unwrap()))
+print(alias.map(function(bytes) { return bytes.length }).unwrap())
+print(Text(alias.map(function(bytes) { return bytes.slice(0, 4) }).unwrap()))
+let cell = ByteCell { value: alias }
+let byteRows: List<Maybe<Bytes>> = [None, cell.value]
+let byteValues: Map<Text, Maybe<Bytes>> = { "saved": cell.value }
+cell.value = None
+alias = None
+let row = byteRows[1].unwrap()
+row[0] = 98
+print(Text(byteValues["saved"].unwrap()))
+let outerNone: Maybe<Maybe<Bytes>> = None
+let innerNone: Maybe<Maybe<Bytes>> = Some(None<Bytes>())
+let nestedEmpty: Maybe<Maybe<Bytes>> = Some(Some(Bytes()))
+print(nestedBytes(outerNone)); print(nestedBytes(innerNone)); print(nestedBytes(nestedEmpty))
+for good in [true, false] {
+    match propagateBytes(good) { Ok(value) { print(Text(value.unwrap())) } Err(error) { print("error " + error) } }
+}
+print(fetchBytes(true).map(function(bytes) { return Some(bytes) }).unwrap().isSome())
+let view = viewBytes()
+let escaped = view.unwrap()
+view = None
+escaped[0] = 86
+print(Text(escaped))
+
+print("scalar lists")
+print(scalarList(Some<List<Integer>>([]), 1, 42))
+print(scalarList(Some<List<Float>>([]), 1.25, 2.5))
+print(scalarList(Some<List<Boolean>>([]), false, true))
+print(scalarList(Some<List<Character>>([]), 'a', 'é'))
+let tone = scalarList(Some<List<Tone>>([]), Soft, Clear)
+print(match tone { Soft { "soft" } Clear { "clear" } })
+let listOuterNone: Maybe<Maybe<List<Integer>>> = None
+let listInnerNone: Maybe<Maybe<List<Integer>>> = Some(None<List<Integer>>())
+let listNestedEmpty: Maybe<Maybe<List<Integer>>> = Some(Some<List<Integer>>([]))
+print(listOuterNone.isNone())
+print(listInnerNone.unwrap().isNone())
+print(listNestedEmpty.unwrap().isSome())
+print(listNestedEmpty.unwrap().unwrap().length)
+for good in [true, false] {
+    match gather(good) { Ok(value) { print(value.unwrap().length); print(value.unwrap()[1]) } Err(error) { print("error " + error) } }
+}
+
+print("chain")
+if true {
+    let links: List<Chain> = []
+    let chain: Chain = Link(links)
+    links.add(chain)
+    print(chainLength(chain))
+    let kept = chain
+    chain = End
+    print(chainLength(kept))
+    links.add(End)
+    print(chainLength(kept))
+    links[1] = kept
+    print(chainLength(links[1]))
+}
+
+print("traced alias")
+if true {
+    let roots: List<Tree> = []
+    let tree = Tree { name: "root"; children: roots }
+    roots.add(tree)
+    let optionalTrees = holdTrees(roots)
+    let holder = TreeHolder { value: optionalTrees }
+    let carriers: List<Maybe<List<Tree>>> = [optionalTrees, None]
+    optionalTrees = None
+    roots = []
+    tree = Tree { name: "replacement"; children: [] }
+    for index in 0..64 {
+        let garbage: List<Tree> = []
+        let temporary = Tree { name: "scratch"; children: garbage }
+        garbage.add(temporary)
+    }
+    print(holder.value.unwrap()[0].name)
+    let kept = carriers[0].unwrap()
+    holder.value = None
+    carriers[0] = None
+    print(kept[0].name)
+    kept.add(Tree { name: "later"; children: [] })
+    print(kept.length)
+    print(kept[1].name)
+}
+
+print("nullable children")
+if true {
+    let children: List<Node> = []
+    let node = Node { name: "optional"; children: Some(children) }
+    children.add(node)
+    let kept = node.children.unwrap()
+    for index in 0..32 {
+        let garbage: List<Node> = []
+        let temporary = Node { name: "scratch"; children: Some(garbage) }
+        garbage.add(temporary)
+    }
+    node.children = None
+    print(node.children.isNone())
+    print(kept[0].name)
+    node.children = Some(kept)
+    node = Node { name: "replacement"; children: None }
+    print(kept[0].name)
+    kept[0].children = None
+    print(kept[0].children.isNone())
+    kept[0].children = Some(kept)
+    print(kept.length)
+}

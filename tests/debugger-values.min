@@ -1,0 +1,295 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "io" as io
+use "system" as system
+use "files" as files
+
+record Fixture { root: Text; work: Text; serial: Integer }
+function frameOutput(output: Text): Text {
+    let result: List<Text> = []
+    let frame = false
+    for line in test.lines(output) {
+        if line.startsWith("(lldb) frame variable") { frame = true }
+        else if frame { result.add(line + "\n") }
+    }
+    return joinText(result)
+}
+function run(fixture: Fixture, command: List<Text>): test.Result {
+    fixture.serial += 1
+    let result = test.run(command, system.environment(), fixture.root, fixture.work + "/command-" + Text(fixture.serial), 120)
+    test.require(result, "debugger values command")
+    return result
+}
+function steppingSection(output: Text, first: Text, after: Text): Text {
+    let result: List<Text> = []
+    let active = false
+    for line in test.lines(output) {
+        if line == first { active = true }
+        else if line == after { active = false }
+        else if active && !line.startsWith("(lldb)") && !line.startsWith("(gdb)") { result.add(line + "\n") }
+    }
+    return joinText(result)
+}
+function steppingFrame(output: Text, prefix: Text, functionName: Text, file: Text, lineNumber: Integer): Boolean {
+    for line in test.lines(output) {
+        let start = 0
+        while start < line.length && line[start] == ' ' { start += 1 }
+        let frame = line.slice(start, line.length)
+        if frame.startsWith(prefix) && test.contains(frame, functionName) && test.contains(frame, file + ":" + Text(lineNumber)) { return true }
+    }
+    return false
+}
+function steppingMarker(name: Text, lldb: Boolean): Text {
+    if lldb { return "script print('" + name + "')" }
+    return "echo " + name + "\\n"
+}
+function verifyStepping(fixture: Fixture, debugger: Text, binary: Text, emptyBinary: Text, lldb: Boolean) {
+    for over in [false, true] {
+        let option = "-ex"
+        let frameCommand = "frame"
+        let argumentCommand = "info args"
+        let localCommand = "info locals"
+        let prefix = "#0 "
+        let label = "GDB"
+        let commands: List<Text> = ["set auto-load python-scripts off", "set width 0", "break stepping.min:6", "run"]
+        if lldb {
+            option = "-o"
+            frameCommand = "frame info"
+            argumentCommand = "frame variable value"
+            localCommand = "frame variable twice"
+            prefix = "frame #0:"
+            label = "LLDB"
+            commands = ["settings set target.disable-aslr false", "breakpoint set -f stepping.min -l 6", "run"]
+        }
+        if !over {
+            commands.add("step")
+            commands.add(steppingMarker("MINYAR-STEP-FRAME", lldb))
+            commands.add(frameCommand)
+            commands.add(steppingMarker("MINYAR-STEP-ARGUMENT", lldb))
+            commands.add(argumentCommand)
+            commands.add(steppingMarker("MINYAR-STEP-DONE", lldb))
+            if !lldb {
+                commands.add("next")
+                commands.add(steppingMarker("MINYAR-PROLOGUE-FRAME", lldb))
+                commands.add(frameCommand)
+                commands.add(steppingMarker("MINYAR-PROLOGUE-DONE", lldb))
+            }
+        } else if lldb { localCommand = "frame variable answer" }
+        commands.add("next")
+        commands.add(steppingMarker("MINYAR-NEXT-FRAME", lldb))
+        commands.add(frameCommand)
+        commands.add(steppingMarker("MINYAR-NEXT-LOCAL", lldb))
+        commands.add(localCommand)
+        commands.add(steppingMarker("MINYAR-NEXT-DONE", lldb))
+        let command = [debugger, "--batch", binary]
+        for item in commands { command.add(option); command.add(item) }
+        let inspected = run(fixture, command)
+        let detail = "\n" + inspected.output + inspected.errorOutput
+        if !over {
+            let frame = steppingSection(inspected.output, "MINYAR-STEP-FRAME", "MINYAR-STEP-ARGUMENT")
+            let entryLine = 1
+            if lldb { entryLine = 2 }
+            test.check(steppingFrame(frame, prefix, "steppingDouble", "stepping.min", entryLine), label + " step enters the callee at stepping.min:" + Text(entryLine) + detail)
+            let argument = steppingSection(inspected.output, "MINYAR-STEP-ARGUMENT", "MINYAR-STEP-DONE")
+            test.check(test.contains(argument, "value = 20"), label + " step retains the argument at function entry" + detail)
+            if !lldb {
+                let prologue = steppingSection(inspected.output, "MINYAR-PROLOGUE-FRAME", "MINYAR-PROLOGUE-DONE")
+                test.check(steppingFrame(prologue, prefix, "steppingDouble", "stepping.min", 2), "GDB next crosses the prologue to stepping.min:2" + detail)
+            }
+        }
+        let functionName = "steppingDouble"
+        let lineNumber = 3
+        let localName = "twice"
+        if over { functionName = "steppingCaller"; lineNumber = 7; localName = "answer" }
+        let frame = steppingSection(inspected.output, "MINYAR-NEXT-FRAME", "MINYAR-NEXT-LOCAL")
+        test.check(steppingFrame(frame, prefix, functionName, "stepping.min", lineNumber), label + " next reaches " + functionName + " at stepping.min:" + Text(lineNumber) + detail)
+        let local = steppingSection(inspected.output, "MINYAR-NEXT-LOCAL", "MINYAR-NEXT-DONE")
+        test.check(test.contains(local, localName + " = 40"), label + " next exposes the initialized " + localName + " local" + detail)
+    }
+    let option = "-ex"
+    let prefix = "#0 "
+    let label = "GDB"
+    let commands = ["set auto-load python-scripts off", "set width 0", "break stepping-empty.min:2", "run", "next", steppingMarker("MINYAR-EMPTY-FRAME", lldb), "frame", steppingMarker("MINYAR-EMPTY-DONE", lldb)]
+    if lldb {
+        option = "-o"
+        prefix = "frame #0:"
+        label = "LLDB"
+        commands = ["settings set target.disable-aslr false", "breakpoint set -f stepping-empty.min -l 2", "run", "next", steppingMarker("MINYAR-EMPTY-FRAME", lldb), "frame info", steppingMarker("MINYAR-EMPTY-DONE", lldb)]
+    }
+    let command = [debugger, "--batch", emptyBinary]
+    for item in commands { command.add(option); command.add(item) }
+    let inspected = run(fixture, command)
+    let frame = steppingSection(inspected.output, "MINYAR-EMPTY-FRAME", "MINYAR-EMPTY-DONE")
+    test.check(steppingFrame(frame, prefix, "steppingEmpty", "stepping-empty.min", 6), label + " next skips the unexecuted then arm and empty else to stepping-empty.min:6\n" + inspected.output + inspected.errorOutput)
+}
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "debugger root")
+let fixture = Fixture { root: test.lines(rootResult.output)[0]; work: work; serial: 0 }
+let clang = support.which(test.setting("MINYAR_TEST_CLANG", "clang"), work + "/clang")
+let directory = test.lines(run(fixture, ["dirname", clang]).output)[0]
+let dwarf = directory + "/llvm-dwarfdump"
+let darwin = test.contains(run(fixture, ["uname", "-s"]).output, "Darwin")
+let source = "examples/gallery/night-watch-values.min"
+let binary = work + "/values"
+let symbols = binary
+if darwin { symbols += ".dSYM" }
+let pause = 0
+let rows = test.lines(io.readTextFile(source))
+for index in 0..rows.length { if test.contains(rows[index], "debugger pause:") { pause = index + 1 } }
+test.check(pause > 0, "gallery has a debugger pause")
+for mode in ["direct", "incremental-cold", "incremental-warm"] {
+    let command = [fixture.root + "/minyar", "--debug"]
+    if mode != "direct" { command.add("--incremental") }
+    for item in [source, "-o", binary] { command.add(item) }
+    run(fixture, command)
+    test.check(run(fixture, [binary]).output == io.readTextFile("examples/gallery/night-watch-values.stdout"), "typed debugger gallery output " + mode)
+    run(fixture, [dwarf, "--verify", symbols])
+    let info = run(fixture, [dwarf, "--debug-info", symbols]).output
+    for name in ["Text", "Bytes", "Star", "Branch", "minyar.value<Reading>", "List<Integer>", "List<Boolean>", "List<Character>", "Map<Text, Integer>", "minyar.choice<Sky>", "brightness", "children", "byte_length", "minyar.slot<Boolean>"] {
+        test.check(test.contains(info, "\"" + name + "\""), "semantic DWARF retains " + name + " in " + mode)
+    }
+    test.check(test.contains(info, "DW_TAG_enumeration_type") && test.contains(info, "\"Clouded\""), "choice discriminator has source case names")
+}
+let wideSource = "record AtLimit {\n"
+for index in 0..64 { wideSource += "    field" + Text(index) + ": Text\n" }
+wideSource += "}\nrecord BeyondLimit {\n"
+for index in 0..65 { wideSource += "    field" + Text(index) + ": Text\n" }
+wideSource += "}\nfunction atLimit(value: AtLimit): Text { return value.field0 }\nfunction beyondLimit(value: BeyondLimit): Text { return value.field0 }\n"
+let widePath = work + "/wide-types.min"
+let wideBinary = work + "/wide-types"
+io.writeTextFile(widePath, wideSource)
+run(fixture, [fixture.root + "/minyar", "--debug", widePath, "-o", wideBinary])
+test.check(run(fixture, [wideBinary]).output == "", "wide type fixture executes without source changes")
+let wideSymbols = wideBinary
+if darwin { wideSymbols += ".dSYM" }
+run(fixture, [dwarf, "--verify", wideSymbols])
+let wideInfo = run(fixture, [dwarf, "--debug-info", wideSymbols]).output
+test.check(test.contains(wideInfo, "\"AtLimit\"") && test.contains(wideInfo, "\"field63\""), "64-field records retain complete debug layouts")
+test.check(test.contains(wideInfo, "\"BeyondLimit\"") && !test.contains(wideInfo, "\"field64\""), "wider records stay explicitly opaque without false fields")
+run(fixture, ["python3", "tools/debugger/test_formatters.py"])
+let lldb = support.which(test.setting("MINYAR_TEST_LLDB", "/usr/bin/lldb"), work + "/lldb")
+if lldb == "" && io.fileExists(directory + "/lldb") { lldb = directory + "/lldb" }
+// A toolchain can ship an LLDB whose Python runtime is missing. Live checks
+// then skip like an absent debugger; MINYAR_REQUIRE_DEBUGGERS=1 still fails.
+if lldb != "" {
+    let probe = test.run([lldb, "--version"], system.environment(), fixture.root, work + "/lldb-version", 30)
+    if probe.status != 0 {
+        print("LLDB at " + lldb + " cannot start: " + probe.errorOutput)
+        lldb = ""
+    }
+}
+if test.setting("MINYAR_REQUIRE_DEBUGGERS", "0") == "1" { test.check(lldb != "", "LLDB is required") }
+if io.fileExists(lldb) {
+    let inspected = run(fixture, [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "command script import \"" + fixture.root + "/tools/debugger/minyar_lldb.py\"", "-o", "breakpoint set -f night-watch-values.min -l " + Text(pause), "-o", "run", "-o", "frame variable -P 2 -D 5 message star stars windows lights letters readings visitors sky branch bytes reading"])
+    for value in ["A quiet sky 🌙", "Sirius", "List<Integer>(length=3)", "List<Boolean>(length=3)", "List<Character>(length=2)", "Map<Text, Integer>(length=1)", "Ada", "Sky.Clouded", "cover = 0.25", "brightness = 1.5", "north", "[1] = false", "degrees = 2.5", "count = 7", "lit = true"] {
+        test.check(test.contains(frameOutput(inspected.output), value), "LLDB reads " + value + "\n" + inspected.output + inspected.errorOutput)
+    }
+} else { print("LLDB unavailable: live formatter verification skipped") }
+let gdb = support.which("gdb", work + "/gdb")
+if !darwin && test.setting("MINYAR_REQUIRE_DEBUGGERS", "0") == "1" { test.check(gdb != "", "GDB is required") }
+if gdb != "" && !darwin {
+    let inspected = run(fixture, [gdb, "--batch", binary, "-ex", "set auto-load python-scripts off", "-ex", "python import sys; sys.path.insert(0, " + "'" + fixture.root + "/tools/debugger')" + "; import minyar_gdb", "-ex", "break " + source + ":" + Text(pause), "-ex", "run", "-ex", "info locals"])
+    for value in ["A quiet sky 🌙", "List<Integer>(length=3)", "Map<Text, Integer>(length=1)", "Sky.Clouded", "cover = 0.25"] {
+        test.check(test.contains(inspected.output, value), "GDB reads " + value + "\n" + inspected.output + inspected.errorOutput)
+    }
+} else { print("GDB unavailable: live formatter verification skipped") }
+let stepping = work + "/stepping"
+run(fixture, [fixture.root + "/minyar", "--debug", "tests/debugger/stepping.min", "-o", stepping])
+test.check(run(fixture, [stepping]).output == "40\n40\n", "source stepping fixture output")
+let steppingSymbols = stepping
+if darwin { steppingSymbols += ".dSYM" }
+run(fixture, [dwarf, "--verify", steppingSymbols])
+let emptyStepping = work + "/stepping-empty"
+run(fixture, [fixture.root + "/minyar", "--debug", "tests/debugger/stepping-empty.min", "-o", emptyStepping])
+test.check(run(fixture, [emptyStepping]).output == "41\n", "empty-else stepping fixture output")
+let emptySteppingSymbols = emptyStepping
+if darwin { emptySteppingSymbols += ".dSYM" }
+run(fixture, [dwarf, "--verify", emptySteppingSymbols])
+if io.fileExists(lldb) { verifyStepping(fixture, lldb, stepping, emptyStepping, true) }
+if gdb != "" && !darwin { verifyStepping(fixture, gdb, stepping, emptyStepping, false) }
+record SourceCase { name: Text; output: Text; pause: Integer; variables: Text; expected: List<Text> }
+let cases = [SourceCase { name: "closures"; output: "40\n42\n"; pause: 4; variables: ""; expected: ["base = 40", "step = 2", "answer = 42"] }, SourceCase { name: "parallel"; output: "40\n41\nfalse\n"; pause: 5; variables: ""; expected: ["base = 40", "index = 0", "bright = true"] }, SourceCase { name: "shadow"; output: "1\n2\n"; pause: 5; variables: "value"; expected: ["value = 2"] }, SourceCase { name: "unit-result"; output: "Clear\n"; pause: 0; variables: ""; expected: [] }]
+cases.add(SourceCase { name: "mutable"; output: "42\n2.5\ntrue\nZ\n7\n"; pause: 8; variables: "value"; expected: ["number = 42", "fraction = 2.5", "flag = true"] })
+for item in cases {
+    let source = "tests/debugger/" + item.name + ".min"
+    let binary = work + "/" + item.name
+    run(fixture, [fixture.root + "/minyar", "--debug", source, "-o", binary])
+    let execution = test.run([binary], support.merge(system.environment(), ["MINYAR_PARALLEL_THREADS=1"]), fixture.root, work + "/execute-" + item.name, 30)
+    test.require(execution, "debugger " + item.name)
+    test.check(execution.output == item.output, "debugger fixture output " + item.name)
+    let symbols = binary
+    if darwin { symbols += ".dSYM" }
+    run(fixture, [dwarf, "--verify", symbols])
+    if item.pause > 0 && lldb != "" {
+        let command = [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "settings set target.env-vars MINYAR_PARALLEL_THREADS=1", "-o", "breakpoint set -f " + item.name + ".min -l " + Text(item.pause), "-o", "run", "-o", "frame variable " + item.variables]
+        if item.name == "mutable" {
+            for part in ["-o", "frame variable -f decimal value.letter", "-o", "script print('MINYAR-MUTABLE-END')", "-o", "script print('MINYAR-POINTER-BEGIN')", "-o", "frame variable -P 2 -D 5 input", "-o", "script print('MINYAR-POINTER-END')"] { command.add(part) }
+        }
+        let inspected = run(fixture, command)
+        for value in item.expected { test.check(test.contains(frameOutput(inspected.output), value), "LLDB " + item.name + " retains " + value + "\n" + inspected.output + inspected.errorOutput) }
+        if item.name == "mutable" {
+            test.check(test.contains(frameOutput(inspected.output), "value.letter = 90"), "LLDB reads the mutated Character slot\n" + inspected.output)
+            let virtual = steppingSection(inspected.output, "(lldb) frame variable value", "MINYAR-MUTABLE-END")
+            test.check(!test.contains(virtual, "minyar_record_length"), "virtual scalar records have no synthetic runtime header\n" + inspected.output)
+            let pointer = steppingSection(inspected.output, "MINYAR-POINTER-BEGIN", "MINYAR-POINTER-END")
+            test.check(test.contains(pointer, "minyar_record_length = 4") && test.contains(pointer, "number = 7"), "same-type real pointer retains its runtime layout\n" + inspected.output)
+        }
+    }
+    if item.name == "mutable" && gdb != "" && !darwin {
+        let inspected = run(fixture, [gdb, "--batch", binary, "-ex", "set auto-load python-scripts off", "-ex", "break mutable.min:8", "-ex", "run", "-ex", "echo MINYAR-MUTABLE-BEGIN\\n", "-ex", "print value", "-ex", "print /d value.letter", "-ex", "echo MINYAR-MUTABLE-END\\n", "-ex", "echo MINYAR-POINTER-BEGIN\\n", "-ex", "print *input", "-ex", "echo MINYAR-POINTER-END\\n"])
+        let actual = steppingSection(inspected.output, "MINYAR-MUTABLE-BEGIN", "MINYAR-MUTABLE-END")
+        for value in item.expected { test.check(test.contains(actual, value), "GDB mutable record retains " + value + "\n" + inspected.output + inspected.errorOutput) }
+        test.check(test.contains(actual, "= 90"), "GDB reads the mutated Character slot\n" + inspected.output)
+        test.check(!test.contains(actual, "minyar_record_length"), "GDB virtual scalar records have no synthetic runtime header\n" + inspected.output)
+        let pointer = steppingSection(inspected.output, "MINYAR-POINTER-BEGIN", "MINYAR-POINTER-END")
+        test.check(test.contains(pointer, "minyar_record_length = 4") && test.contains(pointer, "number = 7"), "GDB same-type real pointer retains its runtime layout\n" + inspected.output)
+    }
+}
+// Choices describe their actual storage: pure enums are tags, niches stay
+// opaque, and tagged unions place each payload in its shared physical slot.
+let choiceBinary = work + "/choices"
+run(fixture, [fixture.root + "/minyar", "--debug", "tests/debugger/choices.min", "-o", choiceBinary])
+test.check(run(fixture, [choiceBinary]).output == "watching\nfull\nVega\ntrue\n12\n0.75\n", "choice layout fixture output")
+let choiceSymbols = choiceBinary
+if darwin { choiceSymbols += ".dSYM" }
+run(fixture, [dwarf, "--verify", choiceSymbols])
+let choiceInfo = run(fixture, [dwarf, "--debug-info", choiceSymbols]).output
+for name in ["Phase", "Waning", "minyar.choice<Weather>", "minyar_choice_payload|Storm|rain"] { test.check(test.contains(choiceInfo, "\"" + name + "\""), "choice layout DWARF retains " + name) }
+if io.fileExists(lldb) {
+    let inspected = run(fixture, [lldb, "--batch", choiceBinary, "-o", "settings set target.disable-aslr false", "-o", "command script import \"" + fixture.root + "/tools/debugger/minyar_lldb.py\"", "-o", "breakpoint set -f choices.min -l 10", "-o", "run", "-o", "frame variable -P 2 -D 5 phase weather"])
+    for value in ["phase = Full", "Weather.Storm", "wind = 12", "rain = 0.75"] {
+        test.check(test.contains(frameOutput(inspected.output), value), "LLDB choice layout reads " + value + "\n" + inspected.output + inspected.errorOutput)
+    }
+}
+// The launcher overrides arena-looking flags. A custom runtime can select arena
+// in its source instead, and an unknown prebuilt object must never imply a layout.
+let override = test.run([fixture.root + "/minyar", "--debug", "tests/debugger/layout.min", "-o", work + "/override"], support.merge(system.environment(), ["MINYAR_RUNTIME_FLAGS=-O0 -DMINYAR_COMPILER_ARENA=1"]), fixture.root, work + "/override-build", 120)
+test.require(override, "debug runtime flag override")
+let overrideSymbols = work + "/override"
+if darwin { overrideSymbols += ".dSYM" }
+let overrideInfo = run(fixture, [dwarf, "--debug-info", overrideSymbols]).output
+test.check(test.contains(overrideInfo, "\"name\"") && test.contains(overrideInfo, "\"count\""), "source undefines override command-line arena flags for debug layout")
+let arena = work + "/arena"
+test.check(files.makeDirectory(arena) == 0, "arena runtime fixture")
+io.writeTextFile(arena + "/runtime.c", "#define MINYAR_COMPILER_ARENA 1\n#include \"minyar_runtime.c\"\n")
+run(fixture, [clang, "-O0", "-iquote", fixture.root + "/runtime", "-c", arena + "/runtime.c", "-o", arena + "/runtime.o"])
+run(fixture, [fixture.root + "/build/minyarc", "tests/debugger/layout.min", work + "/layout.ll", "--library", "library"])
+for unknown in [false, true] {
+    let runtime = arena + "/runtime.o"
+    if unknown { runtime = arena + "/unknown.o"; run(fixture, ["cp", arena + "/runtime.o", runtime]) }
+    let binary = work + "/arena-" + Text(unknown)
+    run(fixture, [fixture.root + "/build/tooling/tools/clang-driver", "link", fixture.root, work + "/layout.ll", runtime, binary, "0", "1", "tests/debugger/layout.min"])
+    test.check(run(fixture, [binary]).output == "north\n7\n2.5\ntrue\n", "arena debug execution")
+    let symbols = binary
+    if darwin { symbols += ".dSYM" }
+    run(fixture, [dwarf, "--verify", symbols])
+    let info = run(fixture, [dwarf, "--debug-info", symbols]).output
+    test.check(!test.contains(info, "\"name\"") && !test.contains(info, "\"count\"") && test.contains(info, "\"degrees\""), "arena/unknown pointers stay opaque while scalar virtual records retain fields")
+    if lldb != "" {
+        let inspected = run(fixture, [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "breakpoint set -f layout.min -l 5", "-o", "run", "-o", "frame variable reading"])
+        test.check(test.contains(frameOutput(inspected.output), "degrees = 2.5") && test.contains(frameOutput(inspected.output), "lit = true"), "arena scalar fragments retain source values\n" + inspected.output + inspected.errorOutput)
+    }
+}
+test.removeTree(work)
+print("Typed debugger values, recursive records, choices and bounded formatters: passed")

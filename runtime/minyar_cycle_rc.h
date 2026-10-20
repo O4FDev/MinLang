@@ -273,7 +273,10 @@ static void rc_drop(void *value) {
     if (text_backing) rc_drop(text_backing);
 }
 
-void minyar_rc_release(void *value) {
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void rc_release_slow(void *value) {
     rc_drop(value);
     /* Iterative destruction: releasing a deep graph never recurses in C. */
     while (rc_pending_count) {
@@ -305,6 +308,22 @@ void minyar_rc_release(void *value) {
         rc_cycle_free_object(object);
     }
     rc_cycle_eager_service(value ? 32 : SIZE_MAX);
+}
+
+/* Traced decrements retain their barriers and ordinary cycle service. */
+MINYAR_INLINE_ENTRY void minyar_rc_release(void *value) {
+    if (value && !rc_pending_count && !rc_cycle_pending) {
+        RcObject *object = (RcObject *)value - 1;
+        if (!rc_traced(object)) {
+            size_t ownership = object->ownership;
+            if (ownership < 8) return;
+            if (ownership >= 16) {
+                object->ownership = ownership - 8;
+                return;
+            }
+        }
+    }
+    rc_release_slow(value);
 }
 
 #endif
@@ -391,7 +410,7 @@ void minyar_rc_leave(void) {
     rc_frames = frame->previous;
     frame->previous = rc_free_frames;
     rc_free_frames = frame;
-    if (!rc_frames) rc_cycle_eager_service(SIZE_MAX);
+    if (!rc_frames && !rc_scopes) rc_cycle_eager_service(SIZE_MAX);
 #endif
 }
 

@@ -19,6 +19,8 @@ static _Noreturn void contract_exit(int status) {
     exit(status);
 }
 
+/* A specialized harness can supply one ordered cleanup/check destructor. */
+#ifndef MINYAR_MEMORY_CONTRACT_CUSTOM_CLEANUP
 __attribute__((destructor)) static void check_memory_contract(void) {
     if (contract_explicit_exit) return;
     assert(rc_frames == NULL);
@@ -29,3 +31,4 @@ __attribute__((destructor)) static void check_memory_contract(void) {
 #endif
     assert(rc_object_count == rc_immortal_object_count);
 }
+#endif

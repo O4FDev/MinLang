@@ -9,7 +9,7 @@ function resultPrefix(name: Text, prefix: Text): Boolean {
 }
 
 function resultTypeName(type: Integer, names: List<Text>): Boolean {
-    return isRecordType(type) && resultPrefix(names[type - 1000], "minyar_result_type_")
+    return isRecordType(type) && resultPrefix(names[recordTypeIndex(type)], "minyar_result_type_")
 }
 
 function resultClose(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>) {
@@ -220,7 +220,7 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
         if !resultTypeName(resultType[0], functionNames) {
             failAtToken(tokenLines, location, "" + name + " needs a contextual Result<T, E> type or explicit type arguments")
         }
-        record = resultType[0] - 1000
+        record = recordTypeIndex(resultType[0])
     } else {
         record = findCompiledSymbol(functionNames, symbolKinds, context.tokenLines.symbolLookup, "minyar_result_type_" + name.slice(start, name.length), 2)
     }
@@ -241,8 +241,8 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
     if payloadType[0] != expected {
         requireContextType(context, payloadLocation, payloadType[0], expected, "result payload has the wrong type")
     }
-    let value = emitResultValue(output, textState, state, payload, payloadType, success, 1000 + record, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-    setType(resultType, 1000 + record)
+    let value = emitResultValue(output, textState, state, payload, payloadType, success, typeForSymbol(context, record), functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    setType(resultType, typeForSymbol(context, record))
     return value
 }
 
@@ -253,20 +253,28 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
     let functionParameterCounts = context.functionParameterCounts
     let functionParameterTypes = context.functionParameterTypes
     let location = state[0]
-    if textState[1] == "top level" || !resultTypeName(returnType, functionNames) {
+    if textState[1] == "top level" {
         failAtToken(tokenLines, location, "try requires a Result-returning function")
     }
+    if !resultTypeName(returnType, functionNames) {
+        failAtToken(tokenLines, location, "try requires a Result-returning function; found " + diagnosticType(context, returnType))
+    }
     state[0] = state[0] + 1
+    let inputLocation = state[0]
     let inputType: List<Integer> = [0]
     let input = parseUnary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
     if !resultTypeName(inputType[0], functionNames) {
-        failAtToken(tokenLines, location, "try needs a Result")
+        failAtToken(tokenLines, inputLocation, "try needs a Result; found " + diagnosticType(context, inputType[0]))
     }
-    let first = functionParameterOffset(functionParameterCounts, inputType[0] - 1000)
-    let target = functionParameterOffset(functionParameterCounts, returnType - 1000)
+    let first = functionParameterOffset(functionParameterCounts, recordTypeIndex(inputType[0]))
+    let target = functionParameterOffset(functionParameterCounts, recordTypeIndex(returnType))
     let errorType = functionParameterTypes[first + 2]
     if errorType != functionParameterTypes[target + 2] {
-        failAtToken(tokenLines, location, "try error type must match the enclosing Result error type")
+        let expected = diagnosticType(context, functionParameterTypes[target + 2])
+        let found = diagnosticType(context, errorType)
+        let distinction = ""
+        if expected == found { distinction = " (these are different types)" }
+        failAtToken(tokenLines, location, "try error type must match the enclosing Result error type; expected " + expected + ", found " + found + distinction)
     }
     if inputType.length == 1 || inputType[1] == -1 {
         noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, inputType[0], 0)
@@ -289,17 +297,30 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
         state[0] = state[0] + 1
         let method = -1
         if isRecordType(errorType) {
-            method = findFunction(functionNames, context.symbolKinds, tokenLines.symbolLookup, methodFunctionName(functionNames[errorType - 1000], "withContext"))
+            method = findFunction(functionNames, context.symbolKinds, tokenLines.symbolLookup, methodFunctionName(functionNames[recordTypeIndex(errorType)], "withContext"))
         }
-        if method < 0 { failCompiler(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context needs an error type with a public withContext(Text) method returning the same error type") }
+        if method < 0 { failAtToken(tokenLines, contextLocation, "try context needs an error type with a public withContext(Text) method returning the same error type; found " + diagnosticType(context, errorType)) }
         let parameters = functionParameterOffset(functionParameterCounts, method)
         if functionParameterCounts[method] != 2 || functionParameterTypes[parameters] != errorType || functionParameterTypes[parameters + 1] != 2 || functionReturnTypes[method] != errorType {
-            failCompiler(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context needs an error type with a public withContext(Text) method returning the same error type")
+            let signature: List<Text> = ["("]
+            let parameter = 1
+            while parameter < functionParameterCounts[method] {
+                if parameter > 1 { signature.add(", ") }
+                signature.add(diagnosticType(context, functionParameterTypes[parameters + parameter]))
+                parameter = parameter + 1
+            }
+            signature.add(") -> " + diagnosticType(context, functionReturnTypes[method]))
+            let expected = "(Text) -> " + diagnosticType(context, errorType)
+            let found = joinText(signature)
+            let distinction = ""
+            if expected == found { distinction = " (these are different types)" }
+            failAtToken(tokenLines, contextLocation, "try context needs an error type with a public withContext(Text) method returning the same error type; expected " + expected + ", found " + found + distinction)
         }
         borrowReference(output, state, error, errorType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+        let contextValueLocation = state[0]
         let contextType: List<Integer> = [2]
         let message = parseUnary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, contextType)
-        if contextType[0] != 2 { failCompiler(describeLocation(tokenLocation(tokenLines, contextLocation)) + ": try context must be Text") }
+        if contextType[0] != 2 { failAtToken(tokenLines, contextValueLocation, "try context must be Text; expected Text, found " + diagnosticType(context, contextType[0])) }
         let values: List<Text> = [error, message]
         let types: List<Integer> = [errorType, 2]
         if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "call", functionNames[method], threadSignature(errorType, types)) }
@@ -332,8 +353,8 @@ function compileResultMatch(context: CompilerContext, localNames: List<Text>, lo
     state[0] = state[0] + 1
     let inputType: List<Integer> = [0]
     let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
-    if choiceMatchCases(context, inputType[0]).length == 0 {
-        failAtToken(tokenLines, location, "match needs a Result or choice")
+    if !matchInputType(context, inputType[0]) {
+        failAtToken(tokenLines, location, "match needs a choice, Result or scalar value")
     }
     let expressionType: List<Integer> = []
     let expressionValue: List<Text> = []

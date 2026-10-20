@@ -1,0 +1,73 @@
+use "io" as io
+use "process" as processInfo
+use "system" as system
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.compiler.compileTimeout = 300
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+fixtures.validate("simulation-engine", ["compile", "fixed", "guard-control"])
+let root = test.resolvePath(".")
+let destination = frontend.compiler.directory + "/fixtures/neodb-engine"
+print("Engine simulation evidence: " + frontend.compiler.directory)
+let prepare = #"""
+    import hashlib, json, pathlib, shutil, sys
+    source, destination = map(pathlib.Path, sys.argv[1:])
+    pins = json.loads((source / 'source-pins.json').read_text())
+    assert pins['revision'] == '3dd6b03d47e66e5695feefd74603ed2ee0e5a038'
+    assert len(pins['sha256']) == 27
+    for name, expected in pins['sha256'].items():
+        relative = pathlib.PurePosixPath(name)
+        assert not relative.is_absolute() and '..' not in relative.parts
+        data = (source / name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == expected, 'production source changed: ' + name
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    (destination / 'lib').mkdir(exist_ok=True)
+    shutil.copyfile(source / 'lib/dbio.min', destination / 'lib/dbio.min')
+    shutil.copyfile(source / 'source-pins.json', destination / 'source-pins.json')
+    print('NeoDB engine: 27 production source pins verified')
+    """#
+let prepared = test.run(["python3", "-c", prepare, root + "/tests/fixtures/neodb-engine", destination],
+    system.environment(), "", frontend.compiler.directory + "/source-provenance", 30)
+test.require(prepared, "verify and stage unchanged production engine graph")
+test.check(prepared.output == "NeoDB engine: 27 production source pins verified\n" && prepared.errorOutput == "", "engine source provenance")
+let source = io.readTextFile("tests/simulation-engine-probe.min")
+if processInfo.argumentCount() > 0 && fixtures.selected("simulation-engine", "compile") {
+    test.require(fixtures.compile(frontend, source), "compile actual engine through deterministic facade")
+    print("NeoDB engine simulation source compiled")
+    exit(0)
+}
+if fixtures.selected("simulation-engine", "fixed") {
+    fixtures.executes(frontend, source,
+        "NeoDB engine: acknowledged spilled COPY survives; unfinished COPY stays absent\n",
+        ["-O0", "-O2"], 0, "", true)
+    print("NeoDB engine fixed cases passed at O0/O2")
+}
+if fixtures.selected("simulation-engine", "guard-control") {
+    let mutate = #"""
+        import pathlib, sys
+        source = pathlib.Path(sys.argv[1])
+        data = source.read_text()
+        header = 'function checkpointBlocked(e: Engine): Boolean {'
+        assert data.count(header) == 1
+        start = data.index(header)
+        end = data.index('\n}\n', start) + 3
+        original = data[start:end]
+        assert 't.state == txn.TX_ACTIVE' in original and 't.redo[0] == 80' in original
+        source.with_name('api.original.min.txt').write_text(data)
+        source.write_text(data[:start] + header + ' return false }\n' + data[end:])
+        print('Labeled control: exactly one checkpoint guard omitted')
+        """#
+    let changed = test.run(["python3", "-c", mutate, destination + "/src/engine/api.min"],
+        system.environment(), "", frontend.compiler.directory + "/guard-control", 10)
+    test.require(changed, "prepare labeled historical guard-omission control")
+    test.check(changed.output == "Labeled control: exactly one checkpoint guard omitted\n" && changed.errorOutput == "", "control changes only its intended guard")
+    fixtures.executes(frontend, test.replace(source, "// selected entry\nsuite()", "committedCopy()"), "",
+        ["-O0", "-O2"], 1, "Minyar stopped: NeoDB engine simulation: acknowledged COPY rows missing\n", false)
+    print("NeoDB engine guard-omission control exposed data loss at O0/O2")
+}
+// Preserve the actual source/LLVM/compiler/link/run evidence even on success.
+print("Selected NeoDB engine simulation checks completed")

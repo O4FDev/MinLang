@@ -1,0 +1,73 @@
+// A finite Minyar-OS kernel: real PCI/e1000 initialisation, checked fields,
+// descriptor storage, and a success marker only after every assertion passes.
+use "device" as device
+use "io" as io
+use "errors" as errors
+use "machine" as machine
+use "math" as math
+use "../shared/pci.min" as pci
+use "../shared/disk.min" as disk
+use "../kernel/net/e1000.min" as e1000
+use "../kernel/net/e1000config.min" as configuration
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function main(): Integer {
+    print("OSDEV FIELDS START")
+    // Typed hosted I/O is explicitly unavailable in a freestanding kernel.
+    match io.readBytesWithin("missing", 16) {
+        Ok(data) { fail("freestanding read fabricated data") }
+        Err(error) { check(errors.nativeCode(error) == 38, "freestanding read status") }
+    }
+    match io.readBytesWithin("missing", -1) {
+        Ok(data) { fail("freestanding read accepted a negative limit") }
+        Err(error) { check(errors.nativeCode(error) == 22, "freestanding invalid read status") }
+    }
+    match io.writeBytes("missing", Bytes()) {
+        Ok() { fail("freestanding write reported success") }
+        Err(error) { check(errors.nativeCode(error) == 38, "freestanding write status") }
+    }
+    match io.writeParts("missing", ["hello"]) {
+        Ok() { fail("freestanding parts write reported success") }
+        Err(error) { check(errors.nativeCode(error) == 38, "freestanding parts status") }
+    }
+    let invalidPath = "bad" + Text(Character(0)) + "path"
+    match io.writeBytes(invalidPath, Bytes()) {
+        Ok() { fail("freestanding write accepted a zero byte") }
+        Err(error) { check(errors.nativeCode(error) == 22, "freestanding invalid path status") }
+    }
+    print("OSDEV HOST IO PASS")
+    let devices = pci.scan()
+    pci.assignAddresses(devices)
+    let adapter = e1000.start(devices)
+    check(adapter.present, "the OS test needs QEMU's e1000 adapter")
+    let control = device.register32(adapter.registers, 0x0400)
+    // QEMU's legacy e1000 does not emulate TIPG; its bytes are checked hosted.
+    // TCTL is emulated and provides a real read/write field preservation test.
+    check(device.readField32(control, device.field32(4, 8)) == 15, "e1000 collision threshold")
+    check(device.readField32(control, device.field32(12, 10)) == 64, "e1000 collision distance")
+    // Changing one ordinary read/write field preserves its neighbours.
+    device.updateField32(control, device.field32(4, 8), 16)
+    check(device.read32(control) == configuration.transmitControl(16, 64), "e1000 field update")
+    device.updateField32(control, device.field32(4, 8), 15)
+    check(e1000.send(adapter, Bytes(64)), "e1000 transmit descriptor")
+    let statusOffset = offsetOf(configuration.TransmitDescriptor, "status")
+    let completed = false
+    for spin in 0..100000 {
+        if (device.load8(adapter.transmitRing, statusOffset) & 1) != 0 { completed = true; break }
+    }
+    check(completed, "e1000 DMA transmit completion")
+    machine.fence()
+    let transmittedLength = device.load16(adapter.transmitRing, offsetOf(configuration.TransmitDescriptor, "length"))
+    check(transmittedLength == 64, "e1000 DMA descriptor length")
+    // A volatile device-written length keeps this square root a runtime check.
+    check(math.sqrt(Float(transmittedLength)) == 8.0, "freestanding square root")
+    // On Arm this exercises virtio's device-written used ring and disk data.
+    let files = disk.directory(disk.open(devices))
+    check(disk.find(files, "config.txt") >= 0, "OS disk directory over DMA")
+    print("OSDEV DMA PASS")
+    print("OSDEV FIELDS PASS")
+    return 0
+}
