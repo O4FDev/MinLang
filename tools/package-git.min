@@ -1,5 +1,6 @@
 // Fetch source packages without checking out or executing anything from them.
 use "./driver-support.min" as host
+use "./editor-source.min" as editorSource
 use "files" as files
 use "system" as system
 
@@ -81,7 +82,7 @@ public function cache(): Text {
 function gitArguments(directory: Text, arguments: List<Text>): List<Text> {
     let executable = host.which("git")
     if executable == "" { host.stop("Git is required to download packages; install Git, then repeat minyar add") }
-    let command = [executable, "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "http.followRedirects=false", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never"]
+    let command = [executable, "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "http.followRedirects=false", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never", "-c", "fetch.unpackLimit=0"]
     if directory != "" { command.add("--git-dir=" + directory) }
     for item in arguments { command.add(item) }
     return command
@@ -102,7 +103,21 @@ public function gitEnvironment(scratch: Text): List<Text> {
     return result
 }
 function gitTo(directory: Text, arguments: List<Text>, output: Text, errors: Text): Integer {
-    return host.spawn(gitArguments(directory, arguments), gitEnvironment(host.parentPath(errors)), false, output, errors, 180)
+    let status = host.spawnBounded(gitArguments(directory, arguments), gitEnvironment(host.parentPath(errors)), false, output, errors, 180, 33554432, 1048576)
+    if status == host.ERROR_LIMIT { host.stop("Git error output exceeds 1 MiB") }
+    if status == host.OUTPUT_LIMIT { host.stop("Git output exceeds 32 MiB") }
+    return status
+}
+function gitFetchTo(directory: Text, arguments: List<Text>, output: Text, errors: Text): Integer {
+    // Keep the transfer as one pack and cap each file written by Git and its children.
+    // POSIX shells report file blocks differently, so this is a conservative 256-512 MiB cap.
+    let command = ["/bin/sh", "-c", "ulimit -f 524288 || exit 125; exec \"$@\"", "minyar-git-fetch"]
+    for argument in gitArguments(directory, arguments) { command.add(argument) }
+    let status = host.spawnBounded(command, gitEnvironment(host.parentPath(errors)), false, output, errors, 180, 33554432, 1048576)
+    if status == 125 { host.stop("could not apply the Git package file limit") }
+    if status == host.ERROR_LIMIT { host.stop("Git error output exceeds 1 MiB") }
+    if status == host.OUTPUT_LIMIT { host.stop("Git output exceeds 32 MiB") }
+    return status
 }
 function git(directory: Text, arguments: List<Text>, scratch: Text): Text {
     let status = gitTo(directory, arguments, scratch + "/out", scratch + "/err")
@@ -142,7 +157,10 @@ public function exportTree(directory: Text, commit: Text, scratch: Text): Text {
     // cat-file reads raw objects, without attributes, filters or text conversion.
     let command = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar-git-blobs", input]
     for argument in gitArguments(directory, ["cat-file", "--batch"]) { command.add(argument) }
-    if host.spawn(command, gitEnvironment(scratch), false, output, scratch + "/err", 180) != 0 { host.stop("could not read package blobs: " + host.strip(host.readText(scratch + "/err"))) }
+    let status = host.spawnBounded(command, gitEnvironment(scratch), false, output, scratch + "/err", 180, batchSize, 1048576)
+    if status == host.ERROR_LIMIT { host.stop("Git error output exceeds 1 MiB") }
+    if status == host.OUTPUT_LIMIT { host.stop("Git blob batch has an unexpected size") }
+    if status != 0 { host.stop("could not read package blobs: " + host.strip(host.readText(scratch + "/err"))) }
     if files.pathSize(output) != batchSize { host.stop("Git blob batch has an unexpected size") }
     let file = files.open(output, files.READ)
     if file < 0 { host.stop("cannot open the Git blob batch") }
@@ -291,7 +309,11 @@ public function sourceHasNative(source: Text): Boolean { return inspectSource(so
 function checkSource(path: Text, full: Text) {
     let suffix = lowercase(host.suffixOf(path))
     if host.listed([".c", ".h", ".cc", ".cpp", ".m", ".mm", ".o", ".a", ".so", ".dylib", ".dll", ".exe", ".s", ".swift"], suffix) { host.stop("remote packages must contain portable Minyar source; native code is not allowed: " + path) }
-    if suffix == ".min" && inspectSource(host.readText(full), path) { host.stop("remote packages cannot declare native implementations: " + path) }
+    if suffix == ".min" {
+        let source = host.readText(full)
+        if editorSource.bidirectionalControl(Bytes(source)) >= 0 { host.stop("remote package source has bidirectional formatting controls: " + path) }
+        if inspectSource(source, path) { host.stop("remote packages cannot declare native implementations: " + path) }
+    }
 }
 function treeFiles(root: Text, relative: Text, result: List<Text>) {
     let directory = root
@@ -331,22 +353,68 @@ function verify(root: Text, checksum: Text) {
 function reference(root: Text, repository: Text, revision: Text): Text {
     return root + "/refs/" + host.hashBytes(Bytes(repository + "\n" + revision))
 }
-function remember(store: Text, requested: Text, source: Source) {
+function writeReference(path: Text, content: Text) {
+    let staging = host.temporaryDirectory(host.parentPath(path), ".minyar-reference-")
+    let temporary = staging + "/" + host.baseName(path)
+    let file = files.open(temporary, files.WRITE + files.CREATE + files.EXCLUSIVE)
+    if file < 0 { host.release(staging); host.stop(host.osError(file, path)) }
+    let data = Bytes(content)
+    let written = files.write(file, data, 0, data.length)
+    let closed = files.close(file)
+    if written != data.length || closed != 0 {
+        host.release(staging)
+        host.stop("could not write package cache reference")
+    }
+    if files.rename(temporary, path) != 0 { host.release(staging); host.stop("could not write package cache reference") }
+    host.release(staging)
+}
+function lockReference(path: Text): Integer {
+    let lock = host.lockExclusive(path + ".lock")
+    if lock < 0 { host.stop(host.osError(lock, path + ".lock")) }
+    return lock
+}
+function unlockReference(lock: Integer, path: Text) {
+    let status = files.close(lock)
+    if status != 0 { host.stop(host.osError(status, path + ".lock")) }
+}
+function publishReference(path: Text, content: Text) {
+    let lock = lockReference(path)
+    writeReference(path, content)
+    unlockReference(lock, path)
+}
+function publishRelease(path: Text, content: Text, source: Source) {
+    let lock = lockReference(path)
+    if host.isFile(path) && host.readText(path) != content {
+        files.close(lock)
+        host.stop("Git release changed after it was cached: " + source.repository + "@" + source.revision + "; review the repository before choosing a new release")
+    }
+    writeReference(path, content)
+    unlockReference(lock, path)
+}
+function publishLatest(path: Text, content: Text, source: Source) {
+    let lock = lockReference(path)
+    if host.isFile(path) {
+        let previous = host.lines(host.readText(path))
+        if previous.length == 3 && semver(previous[2]) && compare(source.revision, previous[2]) < 0 {
+            files.close(lock)
+            host.stop("latest Git release moved backwards from " + previous[2] + " to " + source.revision + " for " + source.repository + "; review the repository before choosing an older release")
+        }
+    }
+    writeReference(path, content)
+    unlockReference(lock, path)
+}
+public function remember(store: Text, requested: Text, source: Source) {
     let content = source.commit + "\n" + source.checksum + "\n" + source.revision + "\n"
-    let references = [reference(store, source.repository, requested)]
     if semver(source.revision) {
-        let release = reference(store, source.repository, source.revision)
-        if host.isFile(release) && host.readText(release) != content { host.stop("Git release changed after it was cached: " + source.repository + "@" + source.revision + "; review the repository before choosing a new release") }
-        if requested != source.revision { references.add(release) }
+        publishRelease(reference(store, source.repository, source.revision), content, source)
+        if requested == "latest" { publishLatest(reference(store, source.repository, requested), content, source) }
+        return
     }
-    for path in references {
-        let temporary = path + "." + Text(system.processId())
-        host.writeBytes(temporary, Bytes(content))
-        if files.rename(temporary, path) != 0 { host.stop("could not write package cache reference") }
-    }
+    publishReference(reference(store, source.repository, requested), content)
 }
 public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pinnedHash: Text, offline: Boolean): Source {
     if hexadecimal(requested, 40) && pinnedCommit != "" && pinnedCommit != requested { host.stop("exact Git commit " + requested + " disagrees with Minyar.lock; review the lock, then repeat minyar add " + repository + "@" + requested) }
+    if requested != "" && requested.byteLength < 40 && hexadecimal(requested, requested.byteLength) { host.stop("abbreviated Git commit IDs are not supported; use the full 40-character commit ID") }
     let source = Source { repository: repository; revision: requested; commit: pinnedCommit; checksum: pinnedHash; root: "" }
     let store = cache()
     let ref = reference(store, repository, requested)
@@ -391,20 +459,22 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
     }
     let fetched = false
     if wanted != "" {
-        let exact = host.extended(arguments, ["fetch", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, wanted])
-        if gitTo(bare, exact, scratch + "/out", scratch + "/err") == 0 {
+        let exact = host.extended(arguments, ["fetch", "--no-auto-maintenance", "--no-write-commit-graph", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, wanted])
+        if gitFetchTo(bare, exact, scratch + "/out", scratch + "/err") == 0 {
             fetched = gitTo(bare, ["cat-file", "-e", wanted + "^{commit}"], scratch + "/out", scratch + "/err") == 0
         }
     } else if semver(revision) {
         let reference = "refs/tags/" + revision
-        let release = host.extended(arguments, ["fetch", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, "+" + reference + ":" + reference])
-        fetched = gitTo(bare, release, scratch + "/out", scratch + "/err") == 0
+        let release = host.extended(arguments, ["fetch", "--no-auto-maintenance", "--no-write-commit-graph", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, "+" + reference + ":" + reference])
+        fetched = gitFetchTo(bare, release, scratch + "/out", scratch + "/err") == 0
+    } else if revision != "latest" && !hexadecimal(revision, revision.byteLength) {
+        if !validRevision(revision) { host.stop("invalid Git revision: " + revision) }
+        let reference = "refs/heads/" + revision
+        let branch = host.extended(arguments, ["fetch", "--no-auto-maintenance", "--no-write-commit-graph", "--quiet", "--force", "--no-tags", "--depth=1", "--no-recurse-submodules", "--", url, "+" + reference + ":" + reference])
+        fetched = gitFetchTo(bare, branch, scratch + "/out", scratch + "/err") == 0
+        if !fetched { host.stop("revision not found: " + repository + "@" + revision + "; choose an existing tag, branch or commit") }
     }
-    if !fetched {
-        let fallback = host.extended(arguments, ["fetch", "--quiet", "--force", "--tags", "--no-recurse-submodules"])
-        if host.isFile(bare + "/shallow") { fallback.add("--unshallow") }
-        git(bare, host.extended(fallback, ["--", url, "+refs/heads/*:refs/heads/*"]), scratch)
-    }
+    if !fetched { host.stop("revision not found: " + repository + "@" + revision + "; choose an existing tag, branch or full 40-character commit") }
     if discovered != "" {
         let status = gitTo(bare, ["rev-parse", "--verify", "refs/tags/" + revision], scratch + "/out", scratch + "/err")
         if status != 0 || host.strip(host.readText(scratch + "/out")) != discovered { host.stop("Git release changed during download: " + repository + "@" + revision + "; repeat minyar add after reviewing the repository") }

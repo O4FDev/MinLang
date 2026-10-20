@@ -31,6 +31,46 @@ MinyarText *minyar_editorhost_kind(const MinyarText *text) {
     free(path);
     return minyar_native_copy_text((const unsigned char *)&kind, 1);
 }
+
+enum { EDITOR_SOURCE_LIMIT = 16 * 1024 * 1024 };
+static int editor_source_error;
+long long minyar_editorhost_sourceError(void) { return editor_source_error; }
+
+static MinyarBytes *editor_source_empty(int error) {
+    editor_source_error = error;
+    return minyar_bytes_new(0);
+}
+
+MinyarBytes *minyar_editorhost_readSource(const MinyarText *text) {
+    char *path = editor_path(text);
+    if (!path) return editor_source_empty(EINVAL);
+    int input = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    int error = input < 0 ? errno : 0;
+    free(path);
+    if (error) return editor_source_empty(error);
+
+    struct stat info;
+    if (fstat(input, &info)) error = errno;
+    else if (!S_ISREG(info.st_mode)) error = EINVAL;
+    else if (info.st_size < 0 || info.st_size > EDITOR_SOURCE_LIMIT) error = EMSGSIZE;
+    MinyarBytes *source = minyar_bytes_new(0);
+    unsigned char buffer[65536];
+    while (!error && source->byte_length <= EDITOR_SOURCE_LIMIT) {
+        size_t count = (size_t)(EDITOR_SOURCE_LIMIT + 1 - source->byte_length);
+        if (count > sizeof buffer) count = sizeof buffer;
+        ssize_t got = read(input, buffer, count);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) { error = errno; break; }
+        if (!got) break;
+        memcpy(minyar_native_bytes_append(source, got), buffer, (size_t)got);
+    }
+    close(input);
+    if (!error && source->byte_length > EDITOR_SOURCE_LIMIT) error = EMSGSIZE;
+    if (error) source->byte_length = 0;
+    editor_source_error = error;
+    return source;
+}
+
 long long minyar_editorhost_replace(const MinyarText *text, const MinyarBytes *before, const MinyarBytes *after) {
     char *path = editor_path(text);
     if (!path) return -EINVAL;
@@ -98,26 +138,31 @@ MinyarBytes *minyar_editorhost_readFrame(void) {
     }
     if (!used && byte == EOF) return editor_empty(ferror(stdin) ? EIO : 0);
     if (byte == EOF) return editor_empty(EPROTO);
-    header[used] = 0;
     size_t length = 0;
     bool found = false;
-    char *line = header;
-    while (*line) {
-        char *end = strstr(line, "\r\n");
-        if (!end) return editor_empty(EPROTO);
-        *end = 0;
-        if (!*line) break;
-        if (!strncasecmp(line, "Content-Length:", 15)) {
+    size_t line = 0;
+    while (line < used) {
+        size_t end = line;
+        while (end + 1 < used && !(header[end] == '\r' && header[end + 1] == '\n')) {
+            if (!header[end] || header[end] == '\r' || header[end] == '\n') return editor_empty(EPROTO);
+            end++;
+        }
+        if (end + 1 >= used) return editor_empty(EPROTO);
+        if (end == line) {
+            if (end + 2 != used) return editor_empty(EPROTO);
+            break;
+        }
+        if (end - line >= 15 && !strncasecmp(header + line, "Content-Length:", 15)) {
             if (found) return editor_empty(EPROTO);
-            char *digits = line + 15;
-            while (*digits == ' ' || *digits == '\t') digits++;
-            if (*digits < '0' || *digits > '9') return editor_empty(EPROTO);
-            while (*digits >= '0' && *digits <= '9') {
-                length = length * 10 + (unsigned)(*digits++ - '0');
+            size_t digits = line + 15;
+            while (digits < end && (header[digits] == ' ' || header[digits] == '\t')) digits++;
+            if (digits == end || header[digits] < '0' || header[digits] > '9') return editor_empty(EPROTO);
+            while (digits < end && header[digits] >= '0' && header[digits] <= '9') {
+                length = length * 10 + (unsigned)(header[digits++] - '0');
                 if (length > 16 * 1024 * 1024) return editor_empty(EMSGSIZE);
             }
-            while (*digits == ' ' || *digits == '\t') digits++;
-            if (*digits) return editor_empty(EPROTO);
+            while (digits < end && (header[digits] == ' ' || header[digits] == '\t')) digits++;
+            if (digits != end) return editor_empty(EPROTO);
             found = true;
         }
         line = end + 2;

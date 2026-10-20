@@ -11,9 +11,11 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -190,6 +192,63 @@ MinyarText *minyar_driverhost_makeTemporary(const MinyarText *directory, const M
     return result;
 }
 
+long long minyar_driverhost_copyExclusive(const MinyarText *source, const MinyarText *destination) {
+    char *from = host_cstring(source);
+    char *to = host_cstring(destination);
+    if (!from || !to) {
+        int error = host_error ? host_error : EINVAL;
+        free(from);
+        free(to);
+        return -error;
+    }
+    int input = open(from, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    int output = -1;
+    int error = input < 0 ? errno : 0;
+    struct stat info;
+    if (!error && fstat(input, &info)) error = errno;
+    if (!error && !S_ISREG(info.st_mode)) error = EINVAL;
+    if (!error) {
+        output = open(to, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, info.st_mode & 0777);
+        if (output < 0) error = errno;
+    }
+    unsigned char buffer[65536];
+    while (!error) {
+        ssize_t count = read(input, buffer, sizeof buffer);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) { error = errno; break; }
+        if (!count) break;
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(output, buffer + offset, (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) { error = written < 0 ? errno : EIO; break; }
+            offset += written;
+        }
+    }
+    if (!error && fchmod(output, info.st_mode & 0777)) error = errno;
+    if (output >= 0 && close(output) && !error) error = errno;
+    if (input >= 0 && close(input) && !error) error = errno;
+    free(from);
+    free(to);
+    return -error;
+}
+
+long long minyar_driverhost_lockExclusive(const MinyarText *path) {
+    char *name = host_cstring(path);
+    if (!name) return -(host_error ? host_error : EINVAL);
+    int descriptor = open(name, O_RDONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0666);
+    int error = descriptor < 0 ? errno : 0;
+    struct stat info;
+    if (!error && fstat(descriptor, &info)) error = errno;
+    if (!error && !S_ISREG(info.st_mode)) error = EINVAL;
+    while (!error && flock(descriptor, LOCK_EX) < 0) {
+        if (errno != EINTR) error = errno;
+    }
+    if (error && descriptor >= 0) close(descriptor);
+    free(name);
+    return error ? -error : descriptor;
+}
+
 static int host_remove_entry(const char *path, const struct stat *info, int flag, struct FTW *walk);
 
 static long long host_remove(const char *name) {
@@ -345,81 +404,218 @@ static int host_raise_pipe_descriptors(int descriptors[2]) {
     return 0;
 }
 
+typedef struct {
+    int descriptors[2];
+    int file;
+    long long limit;
+    long long captured;
+    int error;
+    int exceeded;
+} HostCapture;
+
+static void host_initialize_capture(HostCapture *capture, long long limit) {
+    capture->descriptors[0] = -1;
+    capture->descriptors[1] = -1;
+    capture->file = -1;
+    capture->limit = limit;
+    capture->captured = 0;
+    capture->error = 0;
+    capture->exceeded = 0;
+}
+
+static int host_prepare_capture(HostCapture *capture, const char *path) {
+    if (!capture->limit) return 0;
+    if (pipe(capture->descriptors)) return errno;
+    int descriptor_error = host_raise_pipe_descriptors(capture->descriptors);
+    if (descriptor_error) return descriptor_error;
+    int flags = fcntl(capture->descriptors[0], F_GETFL);
+    if (flags < 0 || fcntl(capture->descriptors[0], F_SETFL, flags | O_NONBLOCK) < 0) return errno;
+    capture->file = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    return capture->file < 0 ? errno : 0;
+}
+
+static void host_add_capture_actions(posix_spawn_file_actions_t *actions, HostCapture *capture, int target) {
+    posix_spawn_file_actions_addclose(actions, capture->descriptors[0]);
+    posix_spawn_file_actions_adddup2(actions, capture->descriptors[1], target);
+    posix_spawn_file_actions_addclose(actions, capture->descriptors[1]);
+}
+
+static int host_read_capture(HostCapture *capture) {
+    if (capture->descriptors[0] < 0) return 0;
+    unsigned char buffer[65536];
+    ssize_t count;
+    do {
+        count = read(capture->descriptors[0], buffer, sizeof buffer);
+    } while (count < 0 && errno == EINTR && !(host_guarded && host_signal));
+    if (count > 0) {
+        size_t keep = (size_t)count;
+        if (capture->captured >= capture->limit) keep = 0;
+        else if ((long long)keep > capture->limit - capture->captured) keep = (size_t)(capture->limit - capture->captured);
+        if (keep < (size_t)count) capture->exceeded = 1;
+        if (keep && !capture->error) capture->error = host_write_capture(capture->file, buffer, keep);
+        capture->captured += (long long)keep;
+        return 1;
+    }
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+    if (count < 0 && !capture->error) capture->error = errno;
+    close(capture->descriptors[0]);
+    capture->descriptors[0] = -1;
+    return 0;
+}
+
+static void host_close_capture(HostCapture *capture) {
+    if (capture->descriptors[0] >= 0) close(capture->descriptors[0]);
+    if (capture->descriptors[1] >= 0) close(capture->descriptors[1]);
+    if (capture->file >= 0) close(capture->file);
+    capture->descriptors[0] = -1;
+    capture->descriptors[1] = -1;
+    capture->file = -1;
+}
+
+static void host_kill_capture_process(pid_t child) {
+    kill(-child, SIGKILL);
+    kill(child, SIGKILL);
+}
+
 static long long host_execute(const MinyarBytes *arguments, const MinyarBytes *environment,
                               bool inherit, const MinyarText *output, const MinyarText *errors,
-                              long long timeout, long long error_limit) {
+                              long long timeout, long long output_limit, long long error_limit) {
     char **argv = host_vector(arguments);
     char **envp = inherit ? NULL : host_vector(environment);
     char *out = output->byte_length ? host_cstring(output) : NULL;
     char *err = errors->byte_length ? host_cstring(errors) : NULL;
-    int error_pipe[2] = {-1, -1};
-    int error_file = -1;
+    HostCapture output_capture;
+    HostCapture error_capture;
+    host_initialize_capture(&output_capture, output_limit);
+    host_initialize_capture(&error_capture, error_limit);
     long long result;
     if (!argv || !argv[0] || (!inherit && !envp) || (output->byte_length && !out) ||
-        (errors->byte_length && !err) || error_limit < 0 || (error_limit && (!err || timeout))) {
+        (errors->byte_length && !err) || output_limit < 0 || error_limit < 0 ||
+        (output_limit && !out) || (error_limit && !err)) {
         result = -EINVAL;
         goto done;
     }
-    if (error_limit) {
-        if (pipe(error_pipe)) { result = -errno; goto done; }
-        int descriptor_error = host_raise_pipe_descriptors(error_pipe);
-        if (descriptor_error) { result = -descriptor_error; goto done; }
-        error_file = open(err, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (error_file < 0) { result = -errno; goto done; }
-    }
+    int capture_error = host_prepare_capture(&output_capture, out);
+    if (!capture_error) capture_error = host_prepare_capture(&error_capture, err);
+    if (capture_error) { result = -capture_error; goto done; }
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    if (out) posix_spawn_file_actions_addopen(&actions, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (error_limit) {
-        posix_spawn_file_actions_addclose(&actions, error_pipe[0]);
-        if (error_pipe[1] != 2) {
-            posix_spawn_file_actions_adddup2(&actions, error_pipe[1], 2);
-            posix_spawn_file_actions_addclose(&actions, error_pipe[1]);
-        }
-    } else if (err) posix_spawn_file_actions_addopen(&actions, 2, err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (output_limit) host_add_capture_actions(&actions, &output_capture, 1);
+    else if (out) posix_spawn_file_actions_addopen(&actions, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (error_limit) host_add_capture_actions(&actions, &error_capture, 2);
+    else if (err) posix_spawn_file_actions_addopen(&actions, 2, err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 #ifdef __APPLE__
     char **current = *_NSGetEnviron();
 #else
     char **current = environ;
 #endif
     pid_t child;
-    int failed = posix_spawnp(&child, argv[0], &actions, NULL, argv, inherit ? current : envp);
+    posix_spawnattr_t attributes;
+    posix_spawnattr_t *attributes_pointer = NULL;
+    int attributes_initialized = 0;
+    int failed = 0;
+    if (output_limit || error_limit) {
+        failed = posix_spawnattr_init(&attributes);
+        if (!failed) {
+            attributes_initialized = 1;
+            failed = posix_spawnattr_setpgroup(&attributes, 0);
+        }
+        if (!failed) failed = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+        if (!failed) attributes_pointer = &attributes;
+    }
+    if (!failed) failed = posix_spawnp(&child, argv[0], &actions, attributes_pointer, argv, inherit ? current : envp);
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
-    if (error_pipe[1] >= 0) { close(error_pipe[1]); error_pipe[1] = -1; }
+    if (output_capture.descriptors[1] >= 0) { close(output_capture.descriptors[1]); output_capture.descriptors[1] = -1; }
+    if (error_capture.descriptors[1] >= 0) { close(error_capture.descriptors[1]); error_capture.descriptors[1] = -1; }
     if (failed) {
         result = -failed;
         goto done;
     }
-    if (error_limit) {
-        unsigned char buffer[65536];
-        long long captured = 0;
-        int capture_error = 0;
+    if (output_limit || error_limit) {
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        int status = 0;
+        int child_done = 0;
+        int fixed_result = 0;
         for (;;) {
-            ssize_t count = read(error_pipe[0], buffer, sizeof buffer);
-            if (count < 0 && errno == EINTR) {
-                if (host_guarded && host_signal) { kill(child, SIGKILL); break; }
-                continue;
+            host_read_capture(&output_capture);
+            host_read_capture(&error_capture);
+            if (!child_done && (output_capture.exceeded || error_capture.exceeded)) {
+                host_kill_capture_process(child);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                result = output_capture.exceeded ? -100001 : -100002;
+                child_done = 1;
+                fixed_result = 1;
             }
-            if (count < 0) { capture_error = errno; break; }
-            if (!count) break;
-            size_t keep = (size_t)count;
-            if (captured >= error_limit) keep = 0;
-            else if ((long long)keep > error_limit - captured) keep = (size_t)(error_limit - captured);
-            if (keep && !capture_error) capture_error = host_write_capture(error_file, buffer, keep);
-            captured += (long long)keep;
+            if (!child_done && host_guarded && host_signal) {
+                host_kill_capture_process(child);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                result = -(200000 + (long long)host_signal);
+                child_done = 1;
+                fixed_result = 1;
+            }
+            if (!child_done) {
+                pid_t waited = waitpid(child, &status, WNOHANG);
+                if (waited == child) child_done = 1;
+                else if (waited < 0 && errno != EINTR) {
+                    result = -(long long)errno;
+                    child_done = 1;
+                    fixed_result = 1;
+                }
+            }
+            if (!child_done && timeout > 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long long elapsed = (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+                if (elapsed >= timeout) {
+                    host_kill_capture_process(child);
+                    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                    result = -100000;
+                    child_done = 1;
+                    fixed_result = 1;
+                }
+            }
+            if (child_done) {
+                if (!fixed_result) {
+                    host_kill_capture_process(child);
+                    for (;;) {
+                        int progress = host_read_capture(&output_capture);
+                        progress |= host_read_capture(&error_capture);
+                        if (output_capture.exceeded || error_capture.exceeded || !progress) break;
+                    }
+                    if (output_capture.exceeded) result = -100001;
+                    else if (error_capture.exceeded) result = -100002;
+                    else if (output_capture.error) result = -output_capture.error;
+                    else if (error_capture.error) result = -error_capture.error;
+                    else result = host_finish(status);
+                }
+                break;
+            }
+            struct pollfd descriptors[2];
+            nfds_t count = 0;
+            if (output_capture.descriptors[0] >= 0) {
+                descriptors[count].fd = output_capture.descriptors[0];
+                descriptors[count].events = POLLIN;
+                descriptors[count].revents = 0;
+                count += 1;
+            }
+            if (error_capture.descriptors[0] >= 0) {
+                descriptors[count].fd = error_capture.descriptors[0];
+                descriptors[count].events = POLLIN;
+                descriptors[count].revents = 0;
+                count += 1;
+            }
+            int polled = poll(descriptors, count, 50);
+            if (polled < 0 && errno != EINTR) {
+                int poll_error = errno;
+                host_kill_capture_process(child);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                result = -poll_error;
+                child_done = 1;
+                fixed_result = 1;
+            }
         }
-        close(error_pipe[0]); error_pipe[0] = -1;
-        close(error_file); error_file = -1;
-        int status;
-        pid_t waited;
-        do {
-            waited = waitpid(child, &status, 0);
-            if (waited < 0 && errno == EINTR && host_guarded && host_signal) kill(child, SIGKILL);
-        } while (waited < 0 && errno == EINTR);
-        if (waited < 0) result = -errno;
-        else if (host_guarded && host_signal) result = -(200000 + (long long)host_signal);
-        else if (capture_error) result = -capture_error;
-        else result = host_finish(status);
         goto done;
     }
     struct timespec start;
@@ -456,9 +652,8 @@ static long long host_execute(const MinyarBytes *arguments, const MinyarBytes *e
         }
     }
 done:
-    if (error_pipe[0] >= 0) close(error_pipe[0]);
-    if (error_pipe[1] >= 0) close(error_pipe[1]);
-    if (error_file >= 0) close(error_file);
+    host_close_capture(&output_capture);
+    host_close_capture(&error_capture);
     host_free_vector(argv);
     host_free_vector(envp);
     free(out);
@@ -469,13 +664,19 @@ done:
 long long minyar_driverhost_execute(const MinyarBytes *arguments, const MinyarBytes *environment,
                                     bool inherit, const MinyarText *output, const MinyarText *errors,
                                     long long timeout) {
-    return host_execute(arguments, environment, inherit, output, errors, timeout, 0);
+    return host_execute(arguments, environment, inherit, output, errors, timeout, 0, 0);
 }
 
 long long minyar_driverhost_executeBoundedErrors(const MinyarBytes *arguments, const MinyarBytes *environment,
                                                  bool inherit, const MinyarText *output, const MinyarText *errors,
                                                  long long timeout, long long error_limit) {
-    return host_execute(arguments, environment, inherit, output, errors, timeout, error_limit);
+    return host_execute(arguments, environment, inherit, output, errors, timeout, 0, error_limit);
+}
+
+long long minyar_driverhost_executeBounded(const MinyarBytes *arguments, const MinyarBytes *environment,
+                                           bool inherit, const MinyarText *output, const MinyarText *errors,
+                                           long long timeout, long long output_limit, long long error_limit) {
+    return host_execute(arguments, environment, inherit, output, errors, timeout, output_limit, error_limit);
 }
 
 typedef struct {

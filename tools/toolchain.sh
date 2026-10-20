@@ -12,6 +12,21 @@ fail() {
     exit 1
 }
 
+sanitize_path() {
+    _search=${PATH-/bin:/usr/bin}:
+    _safe=
+    while [ -n "$_search" ]; do
+        _directory=${_search%%:*}
+        _search=${_search#*:}
+        case $_directory in
+            /*|[A-Za-z]:[\\/]*|\\\\*) _safe=$_safe${_safe:+:}$_directory ;;
+        esac
+    done
+    PATH=${_safe:-/bin:/usr/bin}
+    export PATH
+}
+sanitize_path
+
 host_system() {
     if [ -n "${MINYAR_TEST_HOST_SYSTEM-}" ]; then printf '%s\n' "$MINYAR_TEST_HOST_SYSTEM"; return 0; fi
     uname -s 2>/dev/null || printf 'unknown\n'
@@ -28,7 +43,10 @@ find_command() {
     while [ -n "$_search" ]; do
         _directory=${_search%%:*}
         _search=${_search#*:}
-        if [ -n "$_directory" ]; then _candidate=$_directory/$1; else _candidate=$1; fi
+        case $_directory in
+            /*|[A-Za-z]:[\\/]*|\\\\*) _candidate=$_directory/$1 ;;
+            *) continue ;;
+        esac
         if [ -f "$_candidate" ] && [ -x "$_candidate" ]; then printf '%s\n' "$_candidate"; return 0; fi
     done
     return 1
