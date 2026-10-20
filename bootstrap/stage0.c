@@ -181,6 +181,9 @@ typedef struct {
     Lexer lexer;
     Token token;
     Program program;
+    int parse_depth;
+    int expression_depth;
+    int expression_nodes;
 } Parser;
 
 typedef struct {
@@ -651,6 +654,15 @@ static int find_record(Program *program, const char *name) {
     return -1;
 }
 
+enum { MAX_PARSE_DEPTH = 256 };
+static void enter_parse(Parser *parser) {
+    if (parser->parse_depth >= MAX_PARSE_DEPTH)
+        fail_at(parser->token.line, parser->token.column,
+                "bootstrap syntax exceeds the 256-level nesting limit");
+    parser->parse_depth++;
+}
+static void leave_parse(Parser *parser) { parser->parse_depth--; }
+
 static Type parse_type(Parser *parser) {
     Type type = TYPE_UNKNOWN;
     if (word_is(parser, "Integer"))
@@ -666,6 +678,7 @@ static Type parse_type(Parser *parser) {
     else if (word_is(parser, "Bytes"))
         type = TYPE_BYTES;
     else if (word_is(parser, "List")) {
+        enter_parse(parser);
         advance(parser);
         expect(parser, '<', "'<' followed by the list's element type");
         type = parse_type(parser);
@@ -673,7 +686,9 @@ static Type parse_type(Parser *parser) {
             fail_at(parser->token.line, parser->token.column,
                     "a bootstrap List needs a value element type");
         expect(parser, '>', "a closing '>' after the list's element type");
-        return bootstrap_list_type(type);
+        Type result = bootstrap_list_type(type);
+        leave_parse(parser);
+        return result;
     } else {
         int record = parser->token.kind == TOKEN_NAME
                          ? find_record(&parser->program, parser->token.text)
@@ -688,6 +703,9 @@ static Type parse_type(Parser *parser) {
 }
 
 static Expression *new_expression(Parser *parser, ExpressionKind kind) {
+    if (++parser->expression_nodes > 1024)
+        fail_at(parser->token.line, parser->token.column,
+                "bootstrap expression exceeds the 1024-node limit");
     Expression *expression = allocate(sizeof(*expression));
     expression->kind = kind;
     expression->line = parser->token.line;
@@ -864,10 +882,12 @@ static Expression *parse_primary(Parser *parser) {
 
 static Expression *parse_unary(Parser *parser) {
     if (parser->token.kind == '!' || parser->token.kind == '-') {
+        enter_parse(parser);
         Expression *expression = new_expression(parser, EXPRESSION_UNARY);
         expression->operator = parser->token.kind;
         advance(parser);
         expression->right = parse_unary(parser);
+        leave_parse(parser);
         return expression;
     }
     return parse_primary(parser);
@@ -922,7 +942,13 @@ static Expression *parse_and(Parser *parser) {
 
 static Expression *parse_expression(Parser *parser) {
     static const int operators[] = {TOKEN_OR};
-    return parse_binary(parser, parse_and, operators, 1);
+    enter_parse(parser);
+    if (parser->expression_depth++ == 0)
+        parser->expression_nodes = 0;
+    Expression *expression = parse_binary(parser, parse_and, operators, 1);
+    parser->expression_depth--;
+    leave_parse(parser);
+    return expression;
 }
 
 static void finish_simple_statement(Parser *parser) {
@@ -975,9 +1001,11 @@ static Statement parse_statement(Parser *parser) {
         skip_separators(parser);
         if (word_is(parser, "else")) {
             advance(parser);
-            if (word_is(parser, "if"))
+            if (word_is(parser, "if")) {
+                enter_parse(parser);
                 arrput(statement.else_body, parse_statement(parser));
-            else
+                leave_parse(parser);
+            } else
                 statement.else_body = parse_block(parser);
         }
         return statement;
@@ -1016,6 +1044,7 @@ static Statement parse_statement(Parser *parser) {
 
 static Statement *parse_block(Parser *parser) {
     Statement *statements = NULL;
+    enter_parse(parser);
     expect(parser, '{', "an opening brace");
     skip_separators(parser);
     while (parser->token.kind != '}') {
@@ -1025,6 +1054,7 @@ static Statement *parse_block(Parser *parser) {
         skip_separators(parser);
     }
     advance(parser);
+    leave_parse(parser);
     return statements;
 }
 
