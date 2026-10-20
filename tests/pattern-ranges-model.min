@@ -1,0 +1,243 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "files" as files
+use "system" as system
+
+record Generator { state: Integer }
+record Row { kind: Integer; first: Integer; after: Integer; flag: Integer; guarded: Boolean; id: Integer }
+record Matrix { rows: List<Row>; isChoice: Boolean; accepted: Boolean; holeNumber: Integer; holeFlag: Boolean; index: Integer }
+record Rendered { source: Text; expected: Text }
+
+function draw(generator: Generator, limit: Integer): Integer {
+    generator.state = generator.state * 48271 % 2147483647
+    return generator.state % limit
+}
+
+// This is a row interpreter, independent of compiler syntax and coverage code.
+// kind 0 = any Integer; kind 1 = half-open interval; kind 2 = MAX singleton.
+function matches(row: Row, number: Integer, flag: Boolean): Boolean {
+    if row.flag == 0 && flag { return false }
+    if row.flag == 1 && !flag { return false }
+    if row.kind == 0 { return true }
+    if row.kind == 1 { return row.first <= number && number < row.after }
+    return number == row.first
+}
+
+function select(matrix: Matrix, number: Integer, flag: Boolean): Integer {
+    for row in matrix.rows {
+        if !row.guarded && matches(row, number, flag) { return row.id }
+    }
+    return -1
+}
+
+function complete(matrix: Matrix, samples: List<Integer>): Boolean {
+    for number in samples {
+        if select(matrix, number, false) < 0 || select(matrix, number, true) < 0 { return false }
+    }
+    return true
+}
+
+function generate(generator: Generator, index: Integer, cuts: List<Integer>): Matrix {
+    let rows: List<Row> = []
+    // Two independent rows per fixed atomic region guarantee the base domain.
+    // The last region is MAX itself, which no representable half-open end covers.
+    for region in 0..cuts.length {
+        let kind = 2
+        let after = cuts[region]
+        if region + 1 < cuts.length { kind = 1; after = cuts[region + 1] }
+        for flag in 0..2 {
+            rows.add(Row { kind: kind; first: cuts[region]; after: after; flag: flag; guarded: false; id: rows.length })
+        }
+    }
+    for noise in 0..12 {
+        let kind = draw(generator, 3)
+        let first = 9223372036854775807
+        let after = first
+        if kind == 1 {
+            let lower = draw(generator, cuts.length - 1)
+            let upper = lower + 1 + draw(generator, cuts.length - lower - 1)
+            first = cuts[lower]
+            after = cuts[upper]
+        }
+        let flag = draw(generator, 3) - 1
+        // Avoid duplicate total Cell(_, _) rows, whose legacy redundancy
+        // diagnostic is independent of interval coverage.
+        if kind == 0 { flag = draw(generator, 2) }
+        rows.add(Row { kind: kind; first: first; after: after; flag: flag; guarded: draw(generator, 4) == 0; id: rows.length })
+    }
+    let accepted = index % 2 == 0
+    let holeNumber = cuts[draw(generator, cuts.length)]
+    let holeFlag = draw(generator, 2) == 1
+    if !accepted {
+        // Keep every row in the source, but make every row covering this
+        // region/Boolean combination false-guarded. Other regions retain
+        // their complete unguarded base; the chosen correlation stays missing.
+        for row in rows {
+            if matches(row, holeNumber, holeFlag) { row.guarded = true }
+        }
+    }
+    let remaining = rows.length
+    while remaining > 1 {
+        remaining -= 1
+        let chosen = draw(generator, remaining + 1)
+        let held = rows[remaining]
+        rows[remaining] = rows[chosen]
+        rows[chosen] = held
+    }
+    return Matrix { rows: rows; isChoice: index % 4 < 2; accepted: accepted; holeNumber: holeNumber; holeFlag: holeFlag; index: index }
+}
+
+function arm(row: Row, name: Text): Text {
+    let number = "_"
+    if row.kind == 1 { number = Text(row.first) + ".." + Text(row.after) }
+    if row.kind == 2 { number = Text(row.first) }
+    let flag = "_"
+    if row.flag == 0 { flag = "false" }
+    if row.flag == 1 { flag = "true" }
+    let guard = ""
+    if row.guarded { guard = " where false" }
+    return "        " + name + "(" + number + ", " + flag + ")" + guard + " { " + Text(row.id) + " }\n"
+}
+
+function signature(matrix: Matrix): Text {
+    let parts: List<Text> = []
+    for row in matrix.rows { parts.add(arm(row, "Cell")) }
+    return joinText(parts)
+}
+
+function header(matrix: Matrix, name: Text, functionName: Text): Text {
+    let type = name
+    let declaration = "record " + name + " { number: Integer; flag: Boolean }\n"
+    if matrix.isChoice {
+        type = "Input" + Text(matrix.index)
+        declaration = "choice " + type + " { " + name + "(number: Integer, flag: Boolean) }\n"
+    }
+    let parts = [declaration, "function " + functionName + "(cell: " + type + "): Integer {\n    return match cell {\n"]
+    for row in matrix.rows { parts.add(arm(row, name)) }
+    parts.add("    }\n}\n")
+    return joinText(parts)
+}
+
+function invocation(matrix: Matrix, name: Text, functionName: Text, number: Integer, flag: Boolean): Text {
+    let value = name + " { number: " + Text(number) + "; flag: " + Text(flag) + " }"
+    if matrix.isChoice { value = name + "(" + Text(number) + ", " + Text(flag) + ")" }
+    return "print(" + functionName + "(" + value + "))\n"
+}
+
+function acceptedSource(matrix: Matrix, samples: List<Integer>): Rendered {
+    let name = "Cell" + Text(matrix.index)
+    let functionName = "select" + Text(matrix.index)
+    let parts = [header(matrix, name, functionName)]
+    let expected: List<Text> = []
+    for number in samples {
+        for bit in 0..2 {
+            let flag = bit == 1
+            parts.add(invocation(matrix, name, functionName, number, flag))
+            expected.add(Text(select(matrix, number, flag)) + "\n")
+        }
+    }
+    return Rendered { source: joinText(parts); expected: joinText(expected) }
+}
+
+function stripped(value: Text): Text {
+    let first = 0
+    let after = value.length
+    while first < after && value[first] == ' ' { first += 1 }
+    while after > first && value[after - 1] == ' ' { after -= 1 }
+    return value.slice(first, after)
+}
+
+function rejection(frontend: fixtures.Frontend, matrix: Matrix) {
+    let source = header(matrix, "Cell", "select") + invocation(matrix, "Cell", "select", matrix.holeNumber, matrix.holeFlag)
+    let result = fixtures.compile(frontend, source)
+    let label = "matrix " + Text(matrix.index)
+    test.check(result.status == 1, label + " should reject\n" + result.errorOutput)
+    test.check(result.output == "", label + " rejection stdout")
+    test.check(test.containsDiagnostic(result.errorOutput, "match is missing cases:"), label + " missing coverage diagnostic\n" + result.errorOutput)
+    test.check(!test.contains(result.errorOutput, "List position"), label + " internal List fault")
+    let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll"
+    test.check(files.pathSize(path) < 0, label + " rejection emitted LLVM")
+
+    let prefix = "for example: Cell("
+    let first = result.errorOutput.find(prefix)
+    test.check(first >= 0, label + " needs a concrete Cell witness\n" + result.errorOutput)
+    let tail = result.errorOutput.slice(first + prefix.length, result.errorOutput.length)
+    let after = tail.find(")")
+    test.check(after >= 0, label + " unterminated witness")
+    let body = tail.slice(0, after)
+    let comma = body.find(",")
+    test.check(comma >= 0, label + " witness needs both fields")
+    let numberText = stripped(body.slice(0, comma))
+    let flagText = stripped(body.slice(comma + 1, body.length))
+    let number = Integer(numberText)
+    test.check(Text(number) == numberText, label + " witness needs a canonical signed Integer")
+    test.check(flagText == "true" || flagText == "false", label + " witness needs a concrete Boolean")
+    let flag = flagText == "true"
+    test.check(select(matrix, number, flag) < 0, label + " compiler witness is covered: " + body)
+}
+
+function withinBudget(deadline: Integer) {
+    test.check(system.monotonicNanoseconds() < deadline, "pattern matrix campaign exceeded its 15-minute budget")
+}
+
+fixtures.validate("PatternRangesModel", ["accepted", "rejected"])
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.compiler.compileTimeout = 30
+let levels = ["-O0", "-O2"]
+let deadline = system.monotonicNanoseconds() + 900000000000
+let generator = Generator { state: 20261020 }
+
+// The grid is fixed before generation, rather than recovered by partitioning
+// emitted rows. Every row is constant on each adjacent-grid region. These
+// representatives cover both sides of every cut, and both signed extremes.
+let cuts = [-9223372036854775808, -12, -4, -1, 0, 1, 5, 13, 9223372036854775807]
+let samples = [-9223372036854775808, -9223372036854775807, -13, -12, -11, -5, -4, -3, -2, -1, 0, 1, 2, 4, 5, 6, 12, 13, 14, 9223372036854775806, 9223372036854775807]
+let signatures: List<Text> = []
+let sources: List<Text> = []
+let expected: List<Text> = []
+let pending = 0
+let accepted = 0
+let rejected = 0
+let acceptedChoices = 0
+let rejectedChoices = 0
+
+for index in 0..120 {
+    withinBudget(deadline)
+    let matrix = generate(generator, index, cuts)
+    test.check(complete(matrix, samples) == matrix.accepted, "independent coverage classification " + Text(index))
+    let fingerprint = signature(matrix)
+    for previous in signatures { test.check(previous != fingerprint, "matrix campaign repeated a row matrix") }
+    signatures.add(fingerprint)
+
+    if matrix.accepted && fixtures.selected("PatternRangesModel", "accepted") {
+        let rendered = acceptedSource(matrix, samples)
+        sources.add(rendered.source)
+        expected.add(rendered.expected)
+        pending += 1
+        accepted += 1
+        if matrix.isChoice { acceptedChoices += 1 }
+        if pending == 10 {
+            withinBudget(deadline)
+            fixtures.executes(frontend, joinText(sources), joinText(expected), levels, 0, "", true)
+            withinBudget(deadline)
+            sources = []
+            expected = []
+            pending = 0
+        }
+    }
+    if !matrix.accepted && fixtures.selected("PatternRangesModel", "rejected") {
+        rejection(frontend, matrix)
+        withinBudget(deadline)
+        rejected += 1
+        if matrix.isChoice { rejectedChoices += 1 }
+    }
+}
+if pending > 0 {
+    withinBudget(deadline)
+    fixtures.executes(frontend, joinText(sources), joinText(expected), levels, 0, "", true)
+    withinBudget(deadline)
+}
+if accepted > 0 { test.check(accepted == 60 && acceptedChoices == 30, "balanced accepted record/choice campaign") }
+if rejected > 0 { test.check(rejected == 60 && rejectedChoices == 30, "balanced rejected record/choice campaign") }
+test.removeTree(frontend.compiler.directory)
+print("Pattern ranges model: " + Text(accepted) + " accepted, " + Text(rejected) + " rejected")

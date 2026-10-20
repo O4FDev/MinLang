@@ -398,6 +398,13 @@ fallback for very wide matches. Programs run at O0/O2 with ownership checks;
 the IR checks require real `switch` instructions and no repeated tag tests.
 `check-pattern-dispatch-sanitize` adds ASan/UBSan.
 
+`make check-pattern-ranges` checks half-open Integer ranges, overlapping and
+guarded arms, signed64 endpoints, full-domain coverage and correlated nested
+fields. Text cases include dynamic values, raw/escaped literals, embedded zero
+bytes and distinct Unicode spellings. Positive programs run at O0/O2 with exact
+allocation/debt assertions; malformed/refutable patterns and missing examples
+are checked separately. `check-pattern-ranges-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

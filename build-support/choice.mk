@@ -15,6 +15,21 @@ build/choice-builtins.min: library/maybe.min build-support/choice-prelude.awk | 
 
 .PHONY: check-pattern-bindings check-pattern-bindings-sanitize
 
+.PHONY: check-pattern-ranges check-pattern-ranges-sanitize
+.PHONY: check-pattern-ranges-model check-pattern-ranges-model-sanitize
+
+check-pattern-ranges-model: build/minyarc build/minyar-runtime.o build/tooling/tests/pattern-ranges-model
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/pattern-ranges-model"
+
+check-pattern-ranges-model-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/pattern-ranges-model
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/pattern-ranges-model"
+
+check-pattern-ranges: build/minyarc build/minyar-runtime.o build/tooling/tests/pattern-ranges
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/pattern-ranges"
+
+check-pattern-ranges-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/pattern-ranges
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/pattern-ranges"
+
 check-pattern-bindings: build/minyarc build/minyar-runtime.o build/tooling/tests/pattern-bindings
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/pattern-bindings"
 
@@ -154,3 +169,6 @@ check-pattern-dispatch-sanitize: build/minyarc-sanitize build/minyar-runtime-san
 
 check check-portable: check-pattern-dispatch
 check-sanitize: check-pattern-dispatch-sanitize
+
+check check-portable: check-pattern-ranges check-pattern-ranges-model
+check-sanitize: check-pattern-ranges-sanitize check-pattern-ranges-model-sanitize

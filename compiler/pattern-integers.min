@@ -1,0 +1,106 @@
+record IntegerPatternBounds { first: Integer; after: Integer }
+
+function integerPatternBounds(pattern: MatchPattern): IntegerPatternBounds {
+    let split = pattern.name.find("..")
+    return IntegerPatternBounds { first: Integer(pattern.name.slice(0, split)); after: Integer(pattern.name.slice(split + 2, pattern.name.length)) }
+}
+
+function takePatternInteger(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>): Text {
+    let position = cursor[0]
+    let negative = tokenIs(kinds, texts, cursor, "-")
+    if negative { cursor[0] = cursor[0] + 1 }
+    if kinds[cursor[0]] != 2 { failAtToken(lines, position, "range pattern bounds must be Integer literals") }
+    let digits = checkedIntegerLiteral(texts[cursor[0]], negative, lines, cursor[0])
+    cursor[0] = cursor[0] + 1
+    if negative && digits != "0" { return "-" + digits }
+    return digits
+}
+
+function requirePatternRangeEnd(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>) {
+    if kinds[cursor[0]] != 4 { return }
+    let token = texts[cursor[0]]
+    if operatorLevel(kinds, texts, cursor) > 0 || token == ".." || token == "(" || token == "[" || token == "." { failAtToken(lines, cursor[0], "range pattern bounds must be Integer literals") }
+}
+
+function emitIntegerRangePattern(output: List<Text>, textState: List<Text>, state: List<Integer>, pattern: MatchPattern, input: Text, failure: Text) {
+    let bounds = integerPatternBounds(pattern)
+    let first = emitInstruction(output, textState, state, "icmp sge i64 " + input + ", " + Text(bounds.first))
+    let after = emitInstruction(output, textState, state, "icmp slt i64 " + input + ", " + Text(bounds.after))
+    let condition = emitInstruction(output, textState, state, "and i1 " + first + ", " + after)
+    matchPatternBranch(output, textState, state, condition, failure)
+}
+
+// Partition one Integer column into membership-constant cells. Keep whole rows
+// when specializing: intervals on one field cannot erase another field's facts.
+function missingIntegerPatterns(context: CompilerContext, nodes: List<MatchPattern>, rows: List<PatternRow>, types: List<Integer>, fuel: List<Integer>, location: Integer): PatternWitness {
+    let minimum = -9223372036854775807 - 1
+    let maximum = 9223372036854775807
+    let cuts: List<Integer> = [minimum]
+    let firsts: List<Integer> = []
+    let lasts: List<Integer> = []
+    let rowIndex = 0
+    while rowIndex < rows.length {
+        let node = rows[rowIndex].values[0]
+        let first = minimum
+        let last = maximum
+        if !matchPatternWildcard(nodes, node) {
+            let pattern = nodes[node]
+            if pattern.kind == 4 {
+                let bounds = integerPatternBounds(pattern)
+                first = bounds.first
+                // A validated nonempty interval proves after > minimum.
+                last = bounds.after - 1
+            } else { first = Integer(pattern.name); last = first }
+            cuts.add(first)
+            if last < maximum { cuts.add(last + 1) }
+        }
+        firsts.add(first)
+        lasts.add(last)
+        rowIndex = rowIndex + 1
+    }
+    cuts.sort()
+    let boundaries: List<Integer> = []
+    let index = 0
+    while index < cuts.length {
+        if index == 0 || cuts[index] != cuts[index - 1] { boundaries.add(cuts[index]) }
+        index = index + 1
+    }
+    let tailTypes: List<Integer> = []
+    index = 1
+    while index < types.length { tailTypes.add(types[index]); index = index + 1 }
+    // Prefer zero as an approachable witness when its cell is uncovered.
+    let zeroCell = 0
+    while zeroCell + 1 < boundaries.length && boundaries[zeroCell + 1] <= 0 { zeroCell = zeroCell + 1 }
+    let visit = 0
+    while visit < boundaries.length {
+        let cell = zeroCell
+        if visit > 0 {
+            cell = visit - 1
+            if cell >= zeroCell { cell = cell + 1 }
+        }
+        let value = boundaries[cell]
+        if cell == zeroCell { value = 0 }
+        let selected: List<PatternRow> = []
+        rowIndex = 0
+        while rowIndex < rows.length {
+            if firsts[rowIndex] <= value && value <= lasts[rowIndex] {
+                let tail: List<Integer> = []
+                let row = rows[rowIndex].values
+                index = 1
+                while index < row.length { tail.add(row[index]); index = index + 1 }
+                selected.add(PatternRow { values: tail })
+            }
+            rowIndex = rowIndex + 1
+        }
+        let witness = missingMatchPatterns(context, nodes, selected, tailTypes, fuel, location)
+        if witness.missing {
+            let values: List<Text> = [Text(value)]
+            index = 0
+            while index < witness.values.length { values.add(witness.values[index]); index = index + 1 }
+            return PatternWitness { missing: true; values: values }
+        }
+        visit = visit + 1
+    }
+    let empty: List<Text> = []
+    return PatternWitness { missing: false; values: empty }
+}

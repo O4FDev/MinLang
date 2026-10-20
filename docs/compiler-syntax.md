@@ -147,6 +147,13 @@ binding roots. The enclosing body owns those roots, including on loop jumps.
 `let` resolves its right side before its pattern names and rejects a missing
 coverage witness. Existing statement syntax kinds remain unchanged.
 
+Integer ranges use pattern kind4 and canonical literal endpoints. Runtime tests
+use signed comparisons without subtraction. Coverage builds disjoint cells at
+all literal/range boundaries, guarding successor arithmetic at the maximum
+Integer. It specializes complete rows for each cell, preserving correlations
+with later fields. Text remains an open literal domain with exact-content
+comparison and a wildcard/default requirement.
+
 `nodes[node].type` uses the compiler's existing type codes. Zero means that a node
 is still being constructed; checked trees have resolved types. Module,
 statement and block nodes use `Nothing`. A function declaration stores its

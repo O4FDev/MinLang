@@ -933,6 +933,24 @@ Boolean patterns must cover both `true` and `false`; numeric and text literals
 need a binding or wildcard for the remaining values. Scalar values can also be
 matched directly: `match count { 0 { "none" } _ { "some" } }`.
 
+An Integer range pattern includes its first bound and excludes its end, like a
+`for` range. `1..9` matches 1 through 8. Both bounds are Integer literals; a
+range must increase. Ranges can appear inside any other pattern:
+
+```minyar
+match first([7]) {
+    Some(1..9) { print("a single digit") }
+    Some(number) { print(number) }
+    None { print("nothing yet") }
+}
+```
+
+Overlapping ranges keep arm order. Exhaustiveness checks account for their
+unions and for relationships between nested fields. A range ending at the
+maximum Integer still excludes that value; add its literal or a fallback when
+needed. Text patterns use exact content, including zero bytes; composed and
+decomposed Unicode spellings remain distinct, as with ordinary `==`.
+
 Nested bindings have the same ownership as ordinary arm bindings. They remain
 alive if a guard or arm replaces the original input, and can be returned or
 captured by a closure. Names are scoped to one arm and cannot repeat within its
