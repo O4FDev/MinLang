@@ -15,9 +15,19 @@ tokens, as do some ownership lookahead helpers.
 
 Reference returns inspect the completed typed expression. A direct local name,
 optionally wrapped in grouping nodes, is a last use on that return path and can
-transfer its local owner. Member, index, call and operator nodes retain their
-existing ownership rules. This proof needs no future-token scan and does not
-assume that the returned heap object has only one alias.
+transfer its local owner. A complete return of a Text join or List `appended`
+can also consume a named local left operand or receiver, after all arguments
+have run. Other member, index and call receivers keep their existing rules.
+These proofs need no future-token scan and do not assume heap uniqueness.
+
+One `TerminalReuseSite` per compiler context remembers the most recently emitted
+ordinary join or append: its typed node, receiver SSA value and two stable output
+fragment indexes. The final return root must match that exact node, ignoring
+groups. Inner expressions and stale sites cannot match. Filling a reserved
+fragment inserts the local-owner move immediately before the consumer; changing
+its callee fragment selects the existing uniqueness-checked runtime operation.
+Cycle fixups retain their original fragment indexes. Metadata uses constant
+space; proof traversal visits only the root's and receiver's grouping nodes.
 
 Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
 column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant

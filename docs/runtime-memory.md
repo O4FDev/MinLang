@@ -184,6 +184,12 @@ and the independent review.
   parameters, fields and indexed values keep the borrowed-return rule; a mutable
   parameter without an established local owner receives a retained count instead.
   Recoverable compiler jobs keep the existing retain-and-cleanup path.
+  A complete return expression using Text `+` or List `appended` can consume a
+  named local left operand or receiver after argument evaluation. Only the
+  complete root is eligible: an inner consumer cannot invalidate a later read
+  in the same return expression. Existing consuming runtime operations check
+  dynamic uniqueness and copy when aliases remain; traced Lists keep their
+  edge bookkeeping. No runtime ABI or reference semantics change.
   `minyar_rc_leave` retires that function's expression and local owners; the
   incremental profiles can complete their reclamation at later service points.
 - Functions using only scalars and borrowed parameters can omit ownership frames. Local stack slots are

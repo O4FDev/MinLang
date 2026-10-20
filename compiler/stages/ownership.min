@@ -60,18 +60,54 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
     return false
 }
 
+function ungroupOwnershipNode(tree: SyntaxTree, node: Integer): Integer {
+    while node >= 0 && tree.nodes[node].kind == 207 {
+        let child = tree.nodes[node].firstChild
+        if child < 0 || tree.nodes[child].nextSibling >= 0 { return -1 }
+        node = child
+    }
+    return node
+}
+
+// Keep only the most recent consumer site. A complete return root emits after
+// its arguments, so exact node identity suffices; inner/stale sites cannot match.
+function noteTerminalReuse(context: CompilerContext, node: Integer, transferPiece: Integer, calleePiece: Integer, receiver: Text) {
+    let site = context.terminalReuse
+    site.node = node
+    site.transferPiece = transferPiece
+    site.calleePiece = calleePiece
+    site.receiver = receiver
+}
+
+function takeTerminalReturn(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>) {
+    if recoveryEnabled(state) { return }
+    let tree = context.syntax
+    let node = ungroupOwnershipNode(tree, tree.nodes[tree.active].lastChild)
+    let site = context.terminalReuse
+    if node < 0 || site.node != node { return }
+    let callee = output[site.calleePiece]
+    if callee != "minyar_join_text" && callee != "minyar_list_appended" { return }
+    let receiver = ungroupOwnershipNode(tree, tree.nodes[node].firstChild)
+    if receiver < 0 || tree.nodes[receiver].kind != 200 { return }
+    let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[receiver].start])
+    if local < 0 || localIds[local] < 0 { return }
+    state[6] = 1
+    let slot = ownershipSlot(state, localIds[local])
+    // The reserved fragment follows all argument evaluation. Keep the local
+    // rooted until then; the consuming runtime operation checks actual aliases.
+    output[site.transferPiece] = "  call void @minyar_rc_local_move_owner(i64 " + Text(slot) + ", ptr " + site.receiver + ")\n"
+    if callee == "minyar_join_text" { output[site.calleePiece] = "minyar_join_text_take_left" }
+    else { output[site.calleePiece] = "minyar_list_appended_take" }
+    site.node = -1
+}
+
 // A direct local return is the binding's last use on this control-flow path.
 // Inspect the checked expression, so fields, calls and operators cannot be
 // mistaken for a return of their receiver. Shared heap values remain shared.
 function takeReturnedLocal(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, value: Text): Boolean {
     if recoveryEnabled(state) { return false }
     let tree = context.syntax
-    let node = tree.nodes[tree.active].lastChild
-    while node >= 0 && tree.nodes[node].kind == 207 {
-        let child = tree.nodes[node].firstChild
-        if child < 0 || tree.nodes[child].nextSibling >= 0 { return false }
-        node = child
-    }
+    let node = ungroupOwnershipNode(tree, tree.nodes[tree.active].lastChild)
     if node < 0 || tree.nodes[node].kind != 200 || !isReferenceType(tree.nodes[node].type) { return false }
     let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[node].start])
     if local < 0 || localIds[local] < 0 { return false }

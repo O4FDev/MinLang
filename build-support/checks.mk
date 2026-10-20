@@ -26,6 +26,12 @@ check-last-use-returns: build/minyarc build/minyarc-sanitize build/tooling/tests
 	$(LIMITED) ./build/tooling/tests/last-use-returns
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/last-use-returns
 
+.PHONY: check-terminal-return-reuse
+check: check-terminal-return-reuse
+check-terminal-return-reuse: build/minyarc build/minyarc-sanitize build/tooling/tests/terminal-return-reuse
+	$(LIMITED) ./build/tooling/tests/terminal-return-reuse
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/terminal-return-reuse
+
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 

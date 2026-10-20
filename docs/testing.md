@@ -850,6 +850,13 @@ Fields, indexes, calls and readonly borrowed parameters keep their existing
 return paths. The sanitized run checks both the compiler and generated programs,
 with the ownership runtime asserting complete cleanup at normal exit.
 
+`make check-terminal-return-reuse` checks terminal Text joins and List appends
+with typed local receivers. It covers aliases, side effects during argument
+evaluation, same-source reads, grouped expressions, borrowed parameters and
+recursive List elements. Negative descendant cases keep their source alive for
+later reads. Native and sanitized O0/O2 runs use the complete-cleanup graph
+runtime; emitted LLVM separately identifies the consuming calls and owner moves.
+
 Diagnostic locations are captured at token start. The byte-exact corpus covers
 lexer, parser, type, encoding, and whole-program failures; every current golden
 diagnostic asserts both line and column, including duplicate declarations and
