@@ -508,7 +508,9 @@ double strtod(const char *text, char **end) {
 /* ----- Mathematics ----- */
 
 double fabs(double x) { return __builtin_fabs(x); }
-double sqrt(double x) { return __builtin_sqrt(x); }
+/* The libc-style builtin may lower to a call to sqrt itself when math errno
+ * is enabled. This intrinsic always performs the floating-point operation. */
+double sqrt(double x) { return __builtin_elementwise_sqrt(x); }
 double trunc(double x) {
     if (!(fabs(x) < 4503599627370496.0)) return x;
     return (double)(long long)x;

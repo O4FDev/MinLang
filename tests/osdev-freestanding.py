@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-compile bare-metal runtimes and verify emitted device barriers."""
+"""Cross-compile bare-metal runtimes and verify device barriers and sqrt."""
 
 import os
 from pathlib import Path
@@ -90,6 +90,38 @@ def barrier_probes(compiler, clang, directory, environment):
     return passed, attempted, generation_failures
 
 
+def sqrt_probes(clang, flags, directory, environment):
+    passed = attempted = 0
+    source = ROOT / "runtime/freestanding/freestanding.c"
+    for target, cpu in TARGETS:
+        arm = target.startswith("aarch64")
+        expected = "fsqrt" if arm else "sqrtsd"
+        instruction = (r"fsqrt[ \t]+d[0-9]+[ \t]*,[ \t]*d[0-9]+\b" if arm else
+                       r"sqrtsd[ \t]+")
+        for optimization in ("-O0", "-O2"):
+            assembly = directory / f"{target}-sqrt-{optimization[1:]}.s"
+            command = [clang, f"--target={target}", *cpu, optimization, *flags,
+                       "-S", str(source), "-o", str(assembly)]
+            status, output, elapsed = invoke(command, environment)
+            attempted += 1
+            if status == 0:
+                # Inspect only this ELF function, excluding other math functions
+                # and comments that happen to mention the desired instruction.
+                function = re.search(r"^[ \t]*sqrt:[^\n]*\n(.*?)^[ \t]*\.size[ \t]+sqrt[ \t]*,",
+                                     assembly.read_text(), re.MULTILINE | re.DOTALL)
+                if function is None:
+                    status = 1
+                    output += "could not isolate the ELF sqrt function body\n"
+                elif not re.search(r"^[ \t]*" + instruction, function[1], re.MULTILINE | re.IGNORECASE):
+                    status = 1
+                    output += f"sqrt body lacks required native {expected} instruction\n"
+                    output += "sqrt assembly:\n" + function[1][:4000]
+            report(f"{target} {optimization} C shim sqrt => {expected}", status, output, elapsed, command)
+            if status == 0:
+                passed += 1
+    return passed, attempted
+
+
 def main():
     selected = os.environ.get("MINYAR_TEST_CLANG", "")
     clang = shutil.which(selected) if selected else None
@@ -135,11 +167,12 @@ def main():
                     if status == 0:
                         passed += 1
         barriers, attempted, generation_failures = barrier_probes(compiler, clang, Path(temporary), environment)
+        square_roots, math_attempted = sqrt_probes(clang, flags, Path(temporary), environment)
     elapsed = time.perf_counter() - started
-    print(f"osdev freestanding: {passed + barriers}/12 checks passed in {elapsed:.2f}s "
-          f"({passed}/8 runtime compiles; {barriers}/4 barrier probes, "
-          f"{attempted} assembly compiles, {generation_failures} LLVM generation failures)", flush=True)
-    return 0 if passed == 8 and barriers == 4 else 1
+    print(f"osdev freestanding: {passed + barriers + square_roots}/16 checks passed in {elapsed:.2f}s "
+          f"({passed}/8 runtime compiles; {barriers}/4 barrier probes; {square_roots}/4 sqrt probes; "
+          f"{attempted + math_attempted} assembly compiles, {generation_failures} LLVM generation failures)", flush=True)
+    return 0 if passed == 8 and barriers == 4 and square_roots == 4 else 1
 
 
 if __name__ == "__main__":
