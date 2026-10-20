@@ -27,6 +27,9 @@ Read in order:
 7. [When something is missing or fails](07-results.md): handle both outcomes.
 8. [A small program of your own](08-garden.md): bring the pieces together.
 
+After trying the last exercise, compare it with a
+[worked answer that checks the garden plan](answers.md).
+
 Take breaks. Run each example, change one thing and predict what will happen.
 Understanding a small program is more useful than rushing through a large one.
 The exercises have answers you can check by running your changed program.

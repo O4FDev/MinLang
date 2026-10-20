@@ -92,6 +92,10 @@ and run the tests after changing a function.
    a negative seed count. Handle success and failure with `match`, as in
    chapter 7. Test a negative count as well as an ordinary plan.
 
+There is a [complete worked answer to the validation exercise](answers.md)
+when you are ready to compare approaches. Its program and tests are checked
+alongside every other example in this book.
+
 You now have the pieces to write small tools: data, decisions, repetition,
 functions, tests and explicit failures. For bigger programs, learn
 [modules](../modules.md), which let files share public declarations, and
