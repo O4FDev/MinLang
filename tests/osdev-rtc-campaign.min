@@ -129,15 +129,45 @@ function naiveRead(register: Callback<Integer, Integer>): Result<rtc.Calendar, T
     return rtc.decode(register(11), year, month, day, hour, minute, second)
 }
 
+// The production protocol with one protection removed (1: the update flag
+// before, 2: the seconds recheck, 3: the update flag after, 4: the final
+// seconds check). Used only to show which protections the campaign needs.
+function mutantRead(register: Callback<Integer, Integer>, removed: Integer): Result<rtc.Calendar, Text> {
+    let attempt = 0
+    while attempt < 1000 {
+        attempt += 1
+        let second = register(0)
+        let before = register(10)
+        let retry = removed != 1 && (before & 128) != 0
+        if !retry && removed != 2 { retry = register(0) != second }
+        if !retry {
+            let statusB = register(11)
+            let minute = register(2)
+            let hour = register(4)
+            let day = register(7)
+            let month = register(8)
+            let year = register(9)
+            let after = register(10)
+            retry = removed != 3 && (after & 128) != 0
+            if !retry && removed != 4 { retry = register(0) != second }
+            if !retry { return rtc.decode(statusB, year, month, day, hour, minute, second) }
+        }
+    }
+    return Err("RTC did not provide a stable calendar within the attempt limit")
+}
+
 // One seeded read. Returns "" when the result is coherent, else a reason.
-function trial(seed: Integer, naive: Boolean, digest: List<Integer>): Text {
+// variant 0 = production reader, -1 = naive one-pass reader, 1..4 = mutants.
+function trial(seed: Integer, variant: Integer, digest: List<Integer>): Text {
     let world = simulation.create(seed)
     let first = start(world)
     let clock = Clock { world: world; now: simulation.choose(world, SECOND); moments: [first]; binary: simulation.choose(world, 2) == 1; fullDay: simulation.choose(world, 4) != 0; stalls: 0; garbage: 0 }
     let reader: Callback<Integer, Integer> = function(index: Integer): Integer { return readRegister(clock, index) }
     let before = clock.now
     let result: Result<rtc.Calendar, Text> = Err("no read")
-    if naive { result = naiveRead(reader) } else { result = rtc.read(reader, 1000) }
+    if variant == 0 { result = rtc.read(reader, 1000) }
+    if variant < 0 { result = naiveRead(reader) }
+    if variant > 0 { result = mutantRead(reader, variant) }
     let after = clock.now
     for line in simulation.transcript(world) { digest[0] = wrappingAdd(wrappingMultiply(digest[0], 1099511628211), line.length) }
     digest[1] += clock.stalls
@@ -161,18 +191,18 @@ function trial(seed: Integer, naive: Boolean, digest: List<Integer>): Text {
 let seeds = 20000
 let first: List<Integer> = [0, 0, 0]
 for seed in 1..seeds + 1 {
-    let reason = trial(seed, false, first)
+    let reason = trial(seed, 0, first)
     test.check(reason == "", "RTC campaign seed " + Text(seed) + ": " + reason)
 }
 test.check(first[1] > 0 && first[2] > 0, "RTC campaign never stalled or never read during an update")
 let again: List<Integer> = [0, 0, 0]
-for seed in 1..seeds + 1 { trial(seed, false, again) }
+for seed in 1..seeds + 1 { trial(seed, 0, again) }
 test.check(first[0] == again[0] && first[1] == again[1] && first[2] == again[2], "RTC campaign must replay identically from its seeds")
 let caught = 0
 let torn = 0
 let firstTorn = 0
 for seed in 1..seeds + 1 {
-    let reason = trial(seed, true, [0, 0, 0])
+    let reason = trial(seed, -1, [0, 0, 0])
     if reason != "" { caught += 1 }
     if reason.startsWith("accepted") {
         torn += 1
@@ -181,3 +211,18 @@ for seed in 1..seeds + 1 {
 }
 test.check(torn > 0, "the campaign must catch the naive one-pass reader accepting a torn calendar")
 print("RTC campaign: production reader coherent on " + Text(seeds) + " seeds (" + Text(first[1]) + " stalls, " + Text(first[2]) + " garbage update-cycle reads), replay identical; naive reader wrong on " + Text(caught) + " seeds, " + Text(torn) + " of them silently torn (first: seed " + Text(firstTorn) + ")")
+let names = ["", "update flag before", "seconds recheck", "update flag after", "final seconds check"]
+let mutants: List<Text> = []
+for removed in 1..5 {
+    let torn = 0
+    for seed in 1..seeds + 1 {
+        if trial(seed, removed, [0, 0, 0]).startsWith("accepted") { torn += 1 }
+    }
+    if removed == 4 { test.check(torn > 0, "the campaign must catch a reader without its final seconds check") }
+    let separator = ""
+    if removed > 1 { separator = "; " }
+    mutants.add(separator + "without " + names[removed] + ": " + Text(torn) + " torn")
+}
+// Under this model the final seconds check alone catches every crossing; the
+// update-flag checks are defense in depth for faults the model does not have.
+print("RTC protocol mutants (" + Text(seeds) + " seeds each): " + joinText(mutants))
