@@ -41,6 +41,13 @@ The generator is a bounded Park–Miller sequence with rejection sampling.
 Run the same scenario with `replay(seed, decisions)` to reproduce its choices.
 Replay rejects a different choice count, an invalid selection or an exhausted
 script. Check `finished(world)` afterward to reject an unused suffix too.
+`fork(seed, decisions)` replays `decisions` exactly, then continues with fresh
+choices from `seed`, as if created by `create(seed)`. Inside the prefix it
+rejects mismatches exactly as replay does. The same seed and prefix give the
+same run, and different seeds diverge only after the prefix. An explorer can
+therefore branch many continuations from the moment a recorded run first
+reached a rare state, instead of hoping a new seed reaches it again. The
+transcript starts with `fork N`, the prefix length.
 The seed alone reproduces a run only when the application and input are the same.
 A decision script checks choice counts, not program identity: preserve the
 source revision, fault scenario and input with a failing script. `transcript`
