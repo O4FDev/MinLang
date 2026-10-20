@@ -1,0 +1,330 @@
+// Compile-time nominal layouts have no runtime type or descriptor object.
+// The raw module category and syntax node stay records; compiled kind 5
+// keeps layout operands separate from managed records and callback signatures.
+function registerLayoutSymbolKind(): Integer { return 5 }
+
+function registerLayoutWidth(tag: Text): Integer {
+    if tag == "register8" { return 8 }
+    if tag == "register16" { return 16 }
+    if tag == "register32" { return 32 }
+    if tag == "register64" { return 64 }
+    return 0
+}
+
+function registerLayoutWidthAt(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
+    if start < 0 || start > kinds.length - 5 { return 0 }
+    if kinds[start] != 1 || texts[start] != "record" { return 0 }
+    if kinds[start + 1] != 1 || kinds[start + 2] != 1 || texts[start + 2] != "native" { return 0 }
+    if kinds[start + 3] != 3 || kinds[start + 4] != 4 || texts[start + 4] != "{" { return 0 }
+    return registerLayoutWidth(texts[start + 3])
+}
+
+function isRegisterLayoutBuiltin(name: Text): Boolean {
+    return name == "encodeField" || name == "extractField" || name == "replaceField" || name == "fieldFits"
+}
+
+// Early declaration/generic readers have no CompilerContext yet. Consume the
+// contextual annotation structurally; actual coordinate evaluation and bounds
+// belong to discoverRegisterLayouts after all declaration symbols exist.
+function skipRegisterFieldAnnotation(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>) {
+    let location = cursor[0]
+    expectToken(kinds, texts, lines, cursor, "at")
+    expectToken(kinds, texts, lines, cursor, "(")
+    let round = 1
+    let square = 0
+    let commas = 0
+    let operand = false
+    while round > 0 {
+        let position = cursor[0]
+        if kinds[position] == 0 || texts[position] == "{" || texts[position] == "}" {
+            failAtToken(lines, location, "a register field needs at(first, width)")
+        }
+        let word = texts[position]
+        if kinds[position] == 4 && word == ")" {
+            if round == 1 {
+                if square != 0 || commas != 1 || !operand { failAtToken(lines, position, "a register field needs exactly two coordinates in at(first, width)") }
+            }
+            round = round - 1
+        } else {
+            if kinds[position] == 4 && word == "," && round == 1 && square == 0 {
+                if commas != 0 || !operand { failAtToken(lines, position, "a register field needs exactly two coordinates in at(first, width)") }
+                commas = commas + 1
+                operand = false
+            } else {
+                if kinds[position] != 6 { operand = true }
+                if kinds[position] == 4 && word == "(" { round = round + 1 }
+                if kinds[position] == 4 && word == "[" { square = square + 1 }
+                if kinds[position] == 4 && word == "]" {
+                    if square == 0 { failAtToken(lines, position, "unexpected ']' in register field coordinates") }
+                    square = square - 1
+                }
+            }
+        }
+        cursor[0] = position + 1
+    }
+}
+
+function discoverRegisterLayouts(context: CompilerContext) {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let names = context.functionNames
+    let symbols = context.symbolKinds
+    let counts = context.functionParameterCounts
+    let fields = context.functionParameterNames
+    let types = context.functionParameterTypes
+    let widths = context.registerWidths
+    let metadata = context.registerFields
+    while widths.length < names.length { widths.add(0) }
+    while metadata.length < types.length * 2 { metadata.add(0) }
+    if widths.length != names.length || metadata.length != types.length * 2 { failCompiler("internal register metadata size mismatch") }
+    let index = 0
+    while index < widths.length { widths[index] = 0; index = index + 1 }
+    index = 0
+    while index < metadata.length { metadata[index] = 0; index = index + 1 }
+
+    let cursor: List<Integer> = [0]
+    skipTerminators(kinds, cursor)
+    while kinds[cursor[0]] != 0 {
+        let start = cursor[0]
+        let bits = registerLayoutWidthAt(kinds, texts, start)
+        if bits > 0 {
+            context.registerLiteralTokens.add(start + 3)
+            let layout = findCompiledSymbol(names, symbols, lines.symbolLookup, texts[start + 1], registerLayoutSymbolKind())
+            if layout < 0 { failAtToken(lines, start + 1, "internal register layout symbol is missing") }
+            if findCompiledSymbol(names, symbols, lines.symbolLookup, texts[start + 1], 3) >= 0 || findCompiledSymbol(names, symbols, lines.symbolLookup, texts[start + 1], 2) >= 0 {
+                failAtToken(lines, start + 1, "a register layout cannot share a name with a runtime record, module constant or global")
+            }
+            if context.functionReturnTypes[layout] != 0 { failAtToken(lines, start + 1, "a register layout cannot have a runtime type") }
+            if widths[layout] != 0 { failAtToken(lines, start + 1, "register layout is declared twice") }
+            widths[layout] = bits
+            let firstField = functionParameterOffset(counts, layout)
+            let count = counts[layout]
+            if count < 1 { failAtToken(lines, start + 1, "a register layout needs at least one field") }
+            cursor[0] = start + 5
+            skipTerminators(kinds, cursor)
+            let field = 0
+            while !tokenIs(kinds, texts, cursor, "}") {
+                if kinds[cursor[0]] == 0 { failAtToken(lines, start, "a register layout is missing its closing '}'") }
+                if tokenIs(kinds, texts, cursor, "private") && kinds[cursor[0] + 1] == 1 { cursor[0] = cursor[0] + 1 }
+                let fieldLocation = cursor[0]
+                if kinds[fieldLocation] != 1 { failAtToken(lines, fieldLocation, "expected a register field name") }
+                if field >= count { failAtToken(lines, fieldLocation, "internal register field count mismatch") }
+                let slot = firstField + field
+                if !isFieldNamed(fields[slot], texts[fieldLocation]) { failAtToken(lines, fieldLocation, "internal register field order mismatch") }
+                let previous = 0
+                while previous < field {
+                    if isFieldNamed(fields[firstField + previous], texts[fieldLocation]) { failAtToken(lines, fieldLocation, "a register layout cannot declare the same field twice") }
+                    previous = previous + 1
+                }
+                cursor[0] = cursor[0] + 1
+                expectToken(kinds, texts, lines, cursor, ":")
+                if kinds[cursor[0]] != 1 || texts[cursor[0]] != "Integer" || types[slot] != 1 {
+                    failAtToken(lines, cursor[0], "register fields require Integer at(first, width)")
+                }
+                cursor[0] = cursor[0] + 1
+                expectToken(kinds, texts, lines, cursor, "at")
+                expectToken(kinds, texts, lines, cursor, "(")
+                let firstLocation = cursor[0]
+                let first = takeRegisterCoordinate(context, cursor)
+                expectToken(kinds, texts, lines, cursor, ",")
+                let widthLocation = cursor[0]
+                let width = takeRegisterCoordinate(context, cursor)
+                expectToken(kinds, texts, lines, cursor, ")")
+                if width < 1 || width > bits { failAtToken(lines, widthLocation, "register field width must be between 1 and " + Text(bits)) }
+                if first < 0 || first > bits - width { failAtToken(lines, firstLocation, "register field lies outside its " + Text(bits) + "-bit word") }
+                previous = 0
+                while previous < field {
+                    let previousSlot = (firstField + previous) * 2
+                    let previousFirst = metadata[previousSlot]
+                    let previousWidth = metadata[previousSlot + 1]
+                    // All endpoints are now in 0..64, so these additions fit.
+                    if first < previousFirst + previousWidth && previousFirst < first + width {
+                        failAtToken(lines, fieldLocation, "register field '" + texts[fieldLocation] + "' overlaps '" + declaredFieldName(fields[firstField + previous]) + "'")
+                    }
+                    previous = previous + 1
+                }
+                metadata[slot * 2] = first
+                metadata[slot * 2 + 1] = width
+                field = field + 1
+                if tokenIs(kinds, texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
+                skipTerminators(kinds, cursor)
+            }
+            if field != count { failAtToken(lines, start + 1, "internal register field count mismatch") }
+        }
+        cursor[0] = start
+        if texts[start] == "record" || texts[start] == "function" { skipDeclaration(kinds, texts, lines, cursor) } else { skipTopLevelStatement(kinds, texts, cursor) }
+        skipTerminators(kinds, cursor)
+    }
+    index = 0
+    while index < names.length {
+        if symbols[index] == registerLayoutSymbolKind() && widths[index] == 0 { failCompiler("internal register layout declaration was not discovered") }
+        index = index + 1
+    }
+}
+
+// Compiler-side arithmetic only. The compiler's own stage0 must not rely on
+// source bitwise operators to calculate masks or encode the top bit.
+function registerLowMask(width: Integer): Integer {
+    if width == 64 { return -1 }
+    let mask = 0
+    let bit = 0
+    while bit < width { mask = mask * 2 + 1; bit = bit + 1 }
+    return mask
+}
+
+function registerShiftLeftBits(value: Integer, count: Integer): Integer {
+    let minimum = -9223372036854775807 - 1
+    let half = 4611686018427387904
+    let bit = 0
+    while bit < count {
+        if value >= half { value = (value - half) * 2 + minimum } else {
+            if value < 0 - half { value = (value + half) * 2 - minimum } else { value = value * 2 }
+        }
+        bit = bit + 1
+    }
+    return value
+}
+
+// Parsed Integer LLVM operands are either SSA names or signed decimal
+// literals, including substituted module constants. Arithmetic expressions
+// yielding SSA names remain dynamic; this is not general constant evaluation.
+function registerLLVMIntegerIsConstant(value: Text): Boolean {
+    if value.length == 0 { failCompiler("internal empty register word operand") }
+    if value[0] == '%' { return false }
+    let position = 0
+    if value[0] == '-' { position = 1 }
+    if position == value.length { failCompiler("internal invalid register word operand") }
+    while position < value.length {
+        if value[position] < '0' || value[position] > '9' { failCompiler("internal register word operand is neither an SSA value nor an Integer literal") }
+        position = position + 1
+    }
+    return true
+}
+
+function registerLLVMInteger(value: Text, lines: SourceMap, location: Integer): Integer {
+    let negative = value[0] == '-'
+    let start = 0
+    if negative { start = 1 }
+    let digits = checkedIntegerLiteral(value.slice(start, value.length), negative, lines, location)
+    // Accumulate negatively so minimum Integer needs no positive magnitude.
+    let number = 0
+    let digit = 0
+    while digit < digits.length { number = number * 10 - (Integer(digits[digit]) - 48); digit = digit + 1 }
+    if negative { return number }
+    return 0 - number
+}
+
+function registerFitCondition(output: List<Text>, textState: List<Text>, state: List<Integer>, lines: SourceMap, location: Integer, value: Text, width: Integer): Text {
+    if width == 64 { return "true" }
+    let mask = registerLowMask(width)
+    if registerLLVMIntegerIsConstant(value) {
+        let number = registerLLVMInteger(value, lines, location)
+        if number >= 0 && number <= mask { return "true" }
+        return "false"
+    }
+    // Unsigned comparison also rejects every negative Integer bit pattern.
+    return emitInstruction(output, textState, state, "icmp ule i64 " + value + ", " + Text(mask))
+}
+
+function registerRequireFits(output: List<Text>, textState: List<Text>, state: List<Integer>, lines: SourceMap, location: Integer, value: Text, width: Integer, description: Text) {
+    let valid = registerFitCondition(output, textState, state, lines, location, value, width)
+    if valid == "false" { failAtToken(lines, location, description + " is outside its unsigned " + Text(width) + "-bit range") }
+    if valid == "true" { return }
+    let label = Text(newLabel(state))
+    output.add("  br i1 " + valid + ", label %register.good." + label + ", label %register.bad." + label + "\nregister.bad." + label + ":\n")
+    output.add("  call void @minyar_fail_integer_overflow()\n  unreachable\nregister.good." + label + ":\n")
+    textState[0] = "register.good." + label
+}
+
+function parseRegisterLayoutBuiltin(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let name = texts[state[0]]
+    if !isRegisterLayoutBuiltin(name) { failCompiler("internal unknown register layout builtin") }
+    state[0] = state[0] + 1
+    expectToken(kinds, texts, lines, state, "(")
+    let layoutLocation = state[0]
+    if kinds[layoutLocation] != 1 { failAtToken(lines, layoutLocation, name + " requires a register layout declaration") }
+    let layout = findCompiledSymbol(context.functionNames, context.symbolKinds, lines.symbolLookup, texts[layoutLocation], registerLayoutSymbolKind())
+    if layout < 0 { failAtToken(lines, layoutLocation, name + " requires a register layout declaration") }
+    if layout >= context.registerWidths.length || context.registerWidths[layout] == 0 { failAtToken(lines, layoutLocation, "internal register layout metadata is missing") }
+    let wordWidth = context.registerWidths[layout]
+    state[0] = state[0] + 1
+    expectToken(kinds, texts, lines, state, ",")
+    let fieldLocation = state[0]
+    if kinds[fieldLocation] != 3 { failAtToken(lines, fieldLocation, name + " requires a literal field name") }
+    context.registerLiteralTokens.add(fieldLocation)
+    let firstField = functionParameterOffset(context.functionParameterCounts, layout)
+    let field = -1
+    let index = 0
+    while index < context.functionParameterCounts[layout] {
+        if isFieldNamed(context.functionParameterNames[firstField + index], texts[fieldLocation]) { field = firstField + index }
+        index = index + 1
+    }
+    if field < 0 { failAtToken(lines, fieldLocation, "register layout has no field named '" + texts[fieldLocation] + "'") }
+    checkFieldAccess(lines, context.functionParameterNames[field], context.functionNames[layout], fieldLocation)
+    let first = context.registerFields[field * 2]
+    let width = context.registerFields[field * 2 + 1]
+    state[0] = state[0] + 1
+    expectToken(kinds, texts, lines, state, ",")
+    let operandLocation = state[0]
+    let operandType: List<Integer> = [1]
+    let operand = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, operandType)
+    if operandType[0] != 1 { failAtToken(lines, operandLocation, name + " requires an Integer word or value") }
+    let value = operand
+    let valueLocation = operandLocation
+    let runtimeTypes: List<Integer> = [1]
+    if name == "replaceField" {
+        expectToken(kinds, texts, lines, state, ",")
+        valueLocation = state[0]
+        let valueType: List<Integer> = [1]
+        value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+        if valueType[0] != 1 { failAtToken(lines, valueLocation, name + " requires an Integer field value") }
+        runtimeTypes.add(1)
+    }
+    expectToken(kinds, texts, lines, state, ")")
+    let returns = 1
+    if name == "fieldFits" { returns = 4 }
+    setType(resultType, returns)
+    if state[15] / 4 % 2 != 0 { threadNote(output, textState[1], "builtin", name, threadSignature(returns, runtimeTypes)) }
+
+    if name == "fieldFits" { return registerFitCondition(output, textState, state, lines, valueLocation, value, width) }
+    // All runtime expressions have been parsed once, in source order, before
+    // checks are emitted. The declaration/field operands caused no evaluation.
+    if name == "extractField" || name == "replaceField" {
+        registerRequireFits(output, textState, state, lines, operandLocation, operand, wordWidth, "register word")
+    }
+    if name == "encodeField" || name == "replaceField" {
+        registerRequireFits(output, textState, state, lines, valueLocation, value, width, "register field value")
+    }
+    if name == "extractField" {
+        if first == 0 && width == wordWidth { return operand }
+        let shifted = operand
+        if first > 0 { shifted = emitInstruction(output, textState, state, "lshr i64 " + operand + ", " + Text(first)) }
+        return emitInstruction(output, textState, state, "and i64 " + shifted + ", " + Text(registerLowMask(width)))
+    }
+    let encoded = value
+    if first > 0 { encoded = emitInstruction(output, textState, state, "shl i64 " + value + ", " + Text(first)) }
+    if name == "encodeField" || (first == 0 && width == wordWidth) { return encoded }
+    let shiftedMask = registerShiftLeftBits(registerLowMask(width), first)
+    let clearMask = -1 - shiftedMask
+    let cleared = emitInstruction(output, textState, state, "and i64 " + operand + ", " + Text(clearMask))
+    return emitInstruction(output, textState, state, "or i64 " + cleared + ", " + encoded)
+}
+
+// Keep native tags and resolved selectors out of O0 data as well as the heap.
+// Only the typed builtin records selectors, so shadowing ordinary functions
+// and callbacks never removes their runtime Text arguments.
+function appendRegisterAwareLiterals(context: CompilerContext, output: List<Text>, threaded: Boolean) {
+    if context.registerLiteralTokens.length == 0 {
+        appendLiteralDeclarations(output, context.tokenKinds, context.tokenTexts, "", threaded)
+        return
+    }
+    let kinds: List<Integer> = []
+    let position = 0
+    while position < context.tokenKinds.length { kinds.add(context.tokenKinds[position]); position = position + 1 }
+    for token in context.registerLiteralTokens { kinds[token] = 0 }
+    appendLiteralDeclarations(output, kinds, context.tokenTexts, "", threaded)
+}

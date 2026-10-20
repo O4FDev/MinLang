@@ -1,0 +1,419 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "files" as files
+use "json" as json
+
+// This oracle selects one bit using signed-safe arithmetic division/remainder.
+// It shares no aggregate mask/shift implementation with register lowering.
+function oracleBit(value: Integer, position: Integer): Integer {
+    if position == 63 { if value < 0 { return 1 }; return 0 }
+    let positive = value
+    if positive < 0 { positive -= -9223372036854775808 }
+    for step in 0..position { positive /= 2 }
+    return positive % 2
+}
+function oracleWeight(position: Integer): Integer {
+    if position == 63 { return -9223372036854775808 }
+    let weight = 1
+    for step in 0..position { weight *= 2 }
+    return weight
+}
+function oracleMaximum(width: Integer): Integer {
+    let value = 0
+    for bit in 0..width { value = wrappingAdd(wrappingMultiply(value, 2), 1) }
+    return value
+}
+function oracleEncode(first: Integer, width: Integer, value: Integer): Integer {
+    let encoded = 0
+    for bit in 0..width {
+        if oracleBit(value, bit) == 1 { encoded = wrappingAdd(encoded, oracleWeight(first + bit)) }
+    }
+    return encoded
+}
+function oracleExtract(first: Integer, width: Integer, word: Integer): Integer {
+    let extracted = 0
+    for bit in 0..width {
+        if oracleBit(word, first + bit) == 1 { extracted = wrappingAdd(extracted, oracleWeight(bit)) }
+    }
+    return extracted
+}
+function oracleReplace(bits: Integer, first: Integer, width: Integer, word: Integer, value: Integer): Integer {
+    let replaced = 0
+    for bit in 0..bits {
+        let selected = oracleBit(word, bit)
+        if bit >= first && bit - first < width { selected = oracleBit(value, bit - first) }
+        if selected == 1 { replaced = wrappingAdd(replaced, oracleWeight(bit)) }
+    }
+    return replaced
+}
+function rejectFamily(frontend: fixtures.Frontend, source: Text, family: Text, alternatives: List<Text>) {
+    let result = fixtures.compile(frontend, source)
+    let message = test.diagnosticMessage(result.errorOutput)
+    let matches = false
+    for alternative in alternatives { if test.contains(message, alternative) { matches = true } }
+    test.check(result.status == 1 && result.output == "", family + ": expected a compile rejection\n" + result.output + result.errorOutput)
+    test.check(test.validCompilerDiagnostics(result.errorOutput), family + ": malformed diagnostic\n" + result.errorOutput)
+    test.check(matches, family + ": wrong primary diagnostic\n" + result.errorOutput)
+    test.check(!test.contains(message, "native layout must be c or c_packed"), family + ": register layouts were not recognized")
+    test.check(!test.contains(result.errorOutput, "List position"), family + ": internal List fault")
+    test.check(files.pathSize(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll") < 0, family + ": rejected source emitted LLVM")
+}
+function scalarBody(ir: Text, name: Text): Text {
+    let rows = test.lines(ir)
+    let active = false
+    let body: List<Text> = []
+    for row in rows {
+        if row.startsWith("define ") && test.contains(row, "@.minyar.fn." + name + "(") { active = true }
+        if active {
+            body.add(row + "\n")
+            if row.startsWith("}") { return joinText(body) }
+        }
+    }
+    fail("missing scalar layout function " + name)
+}
+function checkScalarIR(ir: Text, name: Text, full: Boolean) {
+    let body = scalarBody(ir, name)
+    for forbidden in ["@minyar_record_", "@minyar_c_record_", "@minyar_list_", "@minyar_bytes_", "@minyar_text_", "@minyar_integer_text", "@minyar_join_text", "@minyar_rc_enter", "@malloc", "@calloc", "@realloc", "undef", "poison"] {
+        test.check(!test.contains(body, forbidden), name + ": scalar operation contains " + forbidden + "\n" + body)
+    }
+    for row in test.lines(body) {
+        if test.contains(row, "shl i64") || test.contains(row, "lshr i64") || test.contains(row, "ashr i64") {
+            test.check(!test.contains(row, ", 64"), name + ": shift by register width\n" + row)
+        }
+        if test.contains(row, " call ") {
+            let allowed = test.contains(row, "@llvm.") || test.contains(row, "@.minyar.integer.overflow.checked(") || test.contains(row, "@minyar_fail_integer_overflow(") || test.contains(row, "@minyar_stack_enter(") || test.contains(row, "@minyar_stack_leave(")
+            test.check(allowed, name + ": operation needs a runtime helper\n" + row)
+            if full { test.check(!test.contains(row, "overflow"), name + ": full64 value unexpectedly has a fit trap") }
+        }
+    }
+}
+function checkFallback(frontend: fixtures.Frontend) {
+    let compiler = frontend.compiler
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    io.writeTextFile(path + ".prior", "")
+    for pass in 0..2 {
+        let result = test.run([compiler.executable, path + ".min", path + ".module.ll", "--module-state", path + ".prior", path + ".state", path + ".stats", "--library", "library"], frontend.environment, "", path + ".module-build", compiler.compileTimeout)
+        test.require(result, "register layout full-graph module fallback")
+        let code = io.readTextFile(path + ".module.ll")
+        if test.addressEnabled(compiler.flags) { code = test.instrument(code) }
+        test.check(code == io.readTextFile(path + ".ll"), "register layout module fallback changed LLVM")
+        test.check(io.readTextFile(path + ".state") == "", "register layout fallback published unsupported interface state")
+        let counts = test.words(io.readTextFile(path + ".stats"))
+        test.check(counts.length == 7 && counts[0] == "0" && counts[4] == "0" && counts[5] == "0" && counts[6] == "false", "register layout fallback reused an unsupported interface")
+        io.writeTextFile(path + ".prior", io.readTextFile(path + ".state"))
+    }
+}
+
+let groups = ["boundaries", "oracle", "zero_cost", "dynamic_failures", "rejections", "modules", "compatibility"]
+fixtures.validate("RegisterLayouts", groups)
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+
+if fixtures.selected("RegisterLayouts", "boundaries") {
+    fixtures.executes(frontend, #"""
+record ByteControl native "register8" { low: Integer at(0, 4); high: Integer at(4, 4) }
+record HalfControl native "register16" { top: Integer at(15, 1) }
+record WordControl native "register32" { top: Integer at(31, 1) }
+record Full64 native "register64" { all: Integer at(0, 64) }
+record Top64 native "register64" { sign: Integer at(63, 1); nearby: Integer at(60, 3) }
+record Low63 native "register64" { low: Integer at(0, 63) }
+print(encodeField(ByteControl, "high", 15))
+print(replaceField(ByteControl, "low", 165, 3))
+print(encodeField(HalfControl, "top", 1))
+print(replaceField(WordControl, "top", 4294967295, 0))
+print(encodeField(Top64, "sign", 1))
+print(extractField(Top64, "nearby", -1))
+print(replaceField(Top64, "sign", -1, 0))
+print(encodeField(Full64, "all", -1))
+print(extractField(Full64, "all", -9223372036854775808))
+print(replaceField(Full64, "all", 7, -1))
+print(fieldFits(Full64, "all", -9223372036854775808))
+print(fieldFits(Full64, "all", -1))
+print(fieldFits(Low63, "low", -1))
+print(replaceField(Low63, "low", -1, 0))
+"""#, "240\n163\n32768\n2147483647\n-9223372036854775808\n7\n9223372036854775807\n-1\n-9223372036854775808\n-1\ntrue\ntrue\nfalse\n-9223372036854775808\n", levels, 0, "", true)
+    fixtures.executes(frontend, #"""
+record RawTag native #"register32"# { field: Integer at(4, 3) }
+record MultilineTag native """
+    register32
+    """ { field: Integer at(4, 3) }
+print(encodeField(RawTag, "field", 5))
+print(encodeField(MultilineTag, "field", 5))
+print(fieldFits(RawTag, "field", 8))
+print(fieldFits(MultilineTag, "field", -1))
+"""#, "80\n80\nfalse\nfalse\n", levels, 0, "", true)
+    // Embedded gallery fixture: declarations explain the transmitter's word.
+    fixtures.executes(frontend, #"""
+record Transmitter native "register32" {
+    enabled: Integer at(1, 1)
+    padShortPackets: Integer at(3, 1)
+    collisionThreshold: Integer at(4, 8)
+    collisionDistance: Integer at(12, 10)
+}
+let control = encodeField(Transmitter, "enabled", 1) | encodeField(Transmitter, "padShortPackets", 1) | encodeField(Transmitter, "collisionThreshold", 15) | encodeField(Transmitter, "collisionDistance", 64)
+print(control)
+print(extractField(Transmitter, "enabled", control) == 1)
+print(extractField(Transmitter, "collisionThreshold", control))
+print(extractField(Transmitter, "collisionDistance", control))
+"""#, "262394\ntrue\n15\n64\n", levels, 0, "", true)
+}
+
+if fixtures.selected("RegisterLayouts", "oracle") {
+    let declarations: List<Text> = []
+    let checks: List<Text> = ["function check(value: Boolean) { if !value { fail(\"register layout bit oracle mismatch\") } }\nlet cases = 0\n"]
+    let cases = 0
+    let layouts = 0
+    let seed = 20261020
+    for bits in [8, 16, 32, 64] {
+        for first in 0..bits {
+            for width in 1..(bits - first + 1) {
+                let chosen = bits == 8 || ((first == 0 || first == bits / 2 || first == bits - 1) && (width == 1 || width == bits - first))
+                if chosen {
+                    layouts += 1
+                    let name = "Layout" + Text(bits) + "_" + Text(first) + "_" + Text(width)
+                    let suffix = Text(layouts)
+                    declarations.add("record " + name + " native \"register" + Text(bits) + "\" { field: Integer at(" + Text(first) + ", " + Text(width) + ") }\n")
+                    declarations.add("function pack" + suffix + "(value: Integer): Integer { return encodeField(" + name + ", \"field\", value) }\n")
+                    declarations.add("function unpack" + suffix + "(word: Integer): Integer { return extractField(" + name + ", \"field\", word) }\n")
+                    declarations.add("function update" + suffix + "(word: Integer, value: Integer): Integer { return replaceField(" + name + ", \"field\", word, value) }\n")
+                    declarations.add("function fits" + suffix + "(value: Integer): Boolean { return fieldFits(" + name + ", \"field\", value) }\n")
+                    for sample in 0..8 {
+                        seed = wrappingAdd(wrappingMultiply(seed, 6364136223846793005), 1442695040888963407)
+                        let word = oracleExtract(0, bits, seed)
+                        let value = oracleExtract(0, width, seed)
+                        if sample == 0 { word = 0; value = 0 }
+                        if sample == 1 { word = oracleMaximum(bits); value = oracleMaximum(width) }
+                        if sample == 2 { word = oracleExtract(0, bits, 6148914691236517205); value = oracleExtract(0, width, -6148914691236517206) }
+                        if sample == 3 { word = oracleExtract(0, bits, -6148914691236517206); value = oracleExtract(0, width, 6148914691236517205) }
+                        if sample == 4 { word = oracleExtract(0, bits, -9223372036854775808); value = oracleMaximum(width) }
+                        if sample == 5 { word = oracleExtract(0, bits, 9223372036854775807); value = 1 }
+                        let encoded = oracleEncode(first, width, value)
+                        let extracted = oracleExtract(first, width, word)
+                        let replaced = oracleReplace(bits, first, width, word, value)
+                        checks.add("check(pack" + suffix + "(" + Text(value) + ") == " + Text(encoded) + ")\n")
+                        checks.add("check(unpack" + suffix + "(" + Text(word) + ") == " + Text(extracted) + ")\n")
+                        checks.add("check(update" + suffix + "(" + Text(word) + ", " + Text(value) + ") == " + Text(replaced) + ")\n")
+                        checks.add("check(unpack" + suffix + "(update" + suffix + "(" + Text(word) + ", " + Text(value) + ")) == " + Text(value) + ")\n")
+                        checks.add("check(fits" + suffix + "(" + Text(value) + "))\ncases += 1\n")
+                        cases += 1
+                    }
+                    if width < 64 { checks.add("check(!fits" + suffix + "(-1))\n") }
+                    if width < 63 { checks.add("check(!fits" + suffix + "(" + Text(oracleMaximum(width) + 1) + "))\n") }
+                }
+            }
+        }
+    }
+    test.check(layouts == 51 && cases == 408, "oracle enumeration changed")
+    fixtures.executes(frontend, joinText(declarations) + joinText(checks) + "print(cases)\n", "408\n", levels, 0, "", true)
+}
+
+// Runtime helpers are embedded test data, never product/runtime source changes.
+// Count requests, not live allocations; a short-lived descriptor still fails.
+let measured = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+if fixtures.selected("RegisterLayouts", "zero_cost") || fixtures.selected("RegisterLayouts", "dynamic_failures") {
+    let header = measured.compiler.directory + "/layout-allocation-probe.h"
+    io.writeTextFile(header, #"""
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+#include <stdlib.h>
+#include <assert.h>
+static int layout_probe_active;
+static size_t layout_probe_requests;
+static void *layout_probe_malloc(size_t size) { if (layout_probe_active) ++layout_probe_requests; return malloc(size); }
+static void *layout_probe_calloc(size_t count, size_t size) { if (layout_probe_active) ++layout_probe_requests; return calloc(count, size); }
+static void *layout_probe_realloc(void *pointer, size_t size) { if (layout_probe_active) ++layout_probe_requests; return realloc(pointer, size); }
+#define malloc layout_probe_malloc
+#define calloc layout_probe_calloc
+#define realloc layout_probe_realloc
+"""#)
+    measured.runtimeFlags = ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_SYSTEM_SMALL_HEAP=0", "-include", header]
+    measured.helpers = #"""
+void minyar_layoutprobe_beginLayoutProbe(void) { layout_probe_requests = 0; layout_probe_active = 1; }
+long long minyar_layoutprobe_endLayoutProbe(void) { layout_probe_active = 0; return (long long)layout_probe_requests; }
+__attribute__((destructor)) static void check_layout_probe_failure(void) { if (layout_probe_active) assert(layout_probe_requests == 0); }
+"""#
+}
+let probeDeclarations = "function beginLayoutProbe() { native \"layoutprobe\" }\nfunction endLayoutProbe(): Integer { native \"layoutprobe\" }\n"
+let scalar = #"""
+record Control native "register32" { threshold: Integer at(4, 3) }
+record Full native "register64" { all: Integer at(0, 64) }
+record Sign native "register64" { bit: Integer at(63, 1) }
+function scalarPack(value: Integer): Integer { return encodeField(Control, "threshold", value) }
+function scalarExtract(word: Integer): Integer { return extractField(Control, "threshold", word) }
+function scalarReplace(word: Integer, value: Integer): Integer { return replaceField(Control, "threshold", word, value) }
+function scalarFits(value: Integer): Boolean { return fieldFits(Control, "threshold", value) }
+function fullPack(value: Integer): Integer { return encodeField(Full, "all", value) }
+function fullExtract(word: Integer): Integer { return extractField(Full, "all", word) }
+function fullReplace(word: Integer, value: Integer): Integer { return replaceField(Full, "all", word, value) }
+function fullFits(value: Integer): Boolean { return fieldFits(Full, "all", value) }
+function signExtract(word: Integer): Integer { return extractField(Sign, "bit", word) }
+"""#
+if fixtures.selected("RegisterLayouts", "zero_cost") {
+    // Setup/global initialization has completed before beginLayoutProbe. End
+    // the region before print, fail formatting or ownership-destructor checks.
+    let program = scalar + "\n" + probeDeclarations + #"""
+beginLayoutProbe()
+let total = 0
+for index in 0..1024 {
+    let value = index % 8
+    let packed = scalarPack(value)
+    if scalarExtract(packed) != value || scalarReplace(165, value) < 0 || !scalarFits(value) { exit(7) }
+    if fullPack(-1) != -1 || fullExtract(-9223372036854775808) != -9223372036854775808 || fullReplace(0, -1) != -1 || !fullFits(-1) || signExtract(-1) != 1 { exit(8) }
+    total += packed
+}
+let requests = endLayoutProbe()
+if requests != 0 { fail("layout operation allocated") }
+print(total)
+"""#
+    fixtures.executes(measured, program, "57344\n", levels, 0, "", true)
+    let ir = io.readTextFile(measured.compiler.directory + "/case" + Text(measured.compiler.serial) + ".ll")
+    test.check(!test.contains(ir, "c\"threshold\\00\"") && !test.contains(ir, "c\"register32\\00\""), "metadata-only names do not emit runtime Text globals")
+    for name in ["scalarPack", "scalarExtract", "scalarReplace", "scalarFits", "signExtract"] { checkScalarIR(ir, name, false) }
+    for name in ["fullPack", "fullExtract", "fullReplace", "fullFits"] { checkScalarIR(ir, name, true) }
+}
+if fixtures.selected("RegisterLayouts", "dynamic_failures") {
+    let narrow = "record Narrow native \"register8\" { field: Integer at(0, 3) }\nfunction narrowExtract(word: Integer): Integer { return extractField(Narrow, \"field\", word) }\nfunction narrowReplace(word: Integer, value: Integer): Integer { return replaceField(Narrow, \"field\", word, value) }\n"
+    for call in ["scalarPack(-1)", "scalarPack(8)", "scalarReplace(0, 8)", "scalarExtract(-1)", "scalarReplace(4294967296, 0)", "narrowExtract(-1)", "narrowExtract(256)", "narrowReplace(-1, 0)"] {
+        let program = scalar + "\n" + narrow + probeDeclarations + "beginLayoutProbe()\nprint(" + call + ")\n"
+        fixtures.executes(measured, program, "", levels, 1, "Minyar stopped: this Integer calculation is outside the supported range.\n", true)
+    }
+}
+
+let control = "record Control native \"register32\" { field: Integer at(4, 3) }\n"
+if fixtures.selected("RegisterLayouts", "rejections") {
+    fixtures.executes(frontend, control + "print(encodeField(Control, \"field\", 5))\n", "80\n", levels, 0, "", true)
+    for bits in [8, 16, 32, 64] {
+        let prefix = "record Bad native \"register" + Text(bits) + "\" { field: Integer at("
+        for pair in [[-1, 1], [bits, 1], [bits - 1, 2], [9223372036854775807, 2]] {
+            rejectFamily(frontend, prefix + Text(pair[0]) + ", " + Text(pair[1]) + ") }\n", "position", ["position", "range", "bit"])
+        }
+        for width in [0, -1, bits + 1] { rejectFamily(frontend, prefix + "0, " + Text(width) + ") }\n", "width", ["width", "positive", "range"]) }
+        rejectFamily(frontend, "record Bad native \"register" + Text(bits) + "\" { a: Integer at(0, 4); b: Integer at(3, 2) }\n", "overlap", ["overlap"])
+    }
+    for field in ["Float", "Boolean", "Text", "Bytes"] { rejectFamily(frontend, "record Bad native \"register32\" { field: " + field + " at(0, 1) }\n", "field type", ["Integer"]) }
+    rejectFamily(frontend, "record Bad native \"register32\" { field: Integer }\n", "missing marker", ["at", "field"])
+    rejectFamily(frontend, "record Bad native \"register32\" { field: Integer at(0) }\n", "marker arity", ["width", "argument", "expected"])
+    rejectFamily(frontend, "record Bad native \"register32\" { field: Integer at(0, 1, 2) }\n", "marker arity", ["argument", "expected"])
+    rejectFamily(frontend, "function first(): Integer { return 4 }\nrecord Bad native \"register32\" { field: Integer at(first(), 3) }\n", "constant metadata", ["constant", "compile-time"])
+    rejectFamily(frontend, "record Bad native \"register64\" { all: Integer at(0, 64); sign: Integer at(63, 1) }\n", "full overlap", ["overlap"])
+    rejectFamily(frontend, control + "print(encodeField(Control, \"missing\", 1))\n", "field name", ["field", "missing"])
+    rejectFamily(frontend, control + "function pack(name: Text): Integer { return encodeField(Control, name, 1) }\n", "field selector", ["literal", "constant", "field name"])
+    for expression in ["encodeField(Control, \"field\", -1)", "encodeField(Control, \"field\", 8)", "replaceField(Control, \"field\", 0, 8)", "extractField(Control, \"field\", -1)", "extractField(Control, \"field\", 4294967296)", "replaceField(Control, \"field\", -1, 0)"] {
+        rejectFamily(frontend, control + "print(" + expression + ")\n", "constant operand", ["fit", "range", "overflow"])
+    }
+    for suffix in ["let value = Control { field: 1 }\n", "let value = Control\n", "function wrong(value: Control): Integer { return 1 }\n", "function wrong(): Control { fail(\"unused\") }\n", "record Holder { value: Control }\n", "let values: List<Control> = []\n", "type Alias = Control\nfunction wrong(value: Alias): Integer { return 1 }\n", "type Alias = Control\nlet values: List<Alias> = []\n"] {
+        rejectFamily(frontend, control + suffix, "metadata runtime escape", ["runtime", "compile-time", "layout", "register"])
+    }
+    for expression in ["cView(Control, Bytes(4), 0)", "cAt(Control, 4096)", "sizeOf(Control)", "alignOf(Control)", "offsetOf(Control, \"field\")"] {
+        rejectFamily(frontend, control + "let value = " + expression + "\n", "C layout escape", ["C-layout", "C layout", "register", "layout"])
+    }
+    rejectFamily(frontend, "record Plain { field: Integer }\nprint(encodeField(Plain, \"field\", 1))\n", "ordinary record is not metadata", ["register", "layout"])
+    rejectFamily(frontend, "record Control { value: Integer }\n" + control, "runtime record and layout name collision", ["duplicate", "already", "same name", "conflict"])
+    rejectFamily(frontend, control + "print(encodeField(Control, \"field\", true))\n", "operand type", ["Integer", "type"])
+    // Direct arithmetic in at() and positive layout-alias metadata wait for
+    // their specified compiler/contract bridge; runtime alias escapes do not.
+}
+
+if fixtures.selected("RegisterLayouts", "modules") {
+    let directory = frontend.compiler.directory
+    io.writeTextFile(directory + "/bits.min", "public constant FIRST = 4\npublic constant WIDTH = 3\n")
+    let publicLayout = "use \"./bits.min\" as bits\npublic record Control native \"register32\" { field: Integer at(bits.FIRST, bits.WIDTH); private secret: Integer at(12, 2) }\npublic function secret(): Integer { return encodeField(Control, \"secret\", 3) }\n"
+    io.writeTextFile(directory + "/hardware.min", publicLayout)
+    let source = "use \"./hardware.min\" as hardware\nprint(encodeField(hardware.Control, \"field\", 5))\nprint(hardware.secret())\n"
+    fixtures.executes(frontend, source, "80\n12288\n", levels, 0, "", true)
+    checkFallback(frontend)
+    io.writeTextFile(directory + "/bits.min", "public constant FIRST = 5\npublic constant WIDTH = 3\n")
+    fixtures.executes(frontend, source, "160\n12288\n", levels, 0, "", true)
+    checkFallback(frontend)
+    io.writeTextFile(directory + "/bits.min", "public constant FIRST = 4\npublic constant WIDTH = 0\n")
+    rejectFamily(frontend, source, "changed imported metadata", ["width", "positive", "range"])
+    io.writeTextFile(directory + "/bits.min", "public constant FIRST = 4\npublic constant WIDTH = 3\n")
+    rejectFamily(frontend, "use \"./hardware.min\" as hardware\nprint(extractField(hardware.Control, \"secret\", 0))\n", "private field", ["private"])
+    rejectFamily(frontend, "use \"./hardware.min\" as hardware\nlet value = hardware.Control { field: 1; secret: 0 }\n", "imported metadata escape", ["runtime", "compile-time", "layout", "register", "private"])
+    io.writeTextFile(directory + "/bits.min", "constant FIRST = 4\npublic constant WIDTH = 3\n")
+    rejectFamily(frontend, source, "private metadata constant", ["private"])
+    io.writeTextFile(directory + "/bits.min", "public constant FIRST = 4\npublic constant WIDTH = 3\n")
+    fixtures.executes(frontend, source, "80\n12288\n", levels, 0, "", true)
+    io.writeTextFile(directory + "/hidden-layout.min", "record Control native \"register32\" { field: Integer at(4, 3) }\npublic constant Control = 0\n")
+    rejectFamily(frontend, "use \"./hidden-layout.min\" as hidden\nprint(encodeField(hidden.Control, \"field\", 5))\n", "public scalar cannot export private layout", ["duplicate", "already", "same name", "conflict"])
+    let documentation = directory + "/register-documentation.min"
+    io.writeTextFile(documentation, #"""
+/// The transmitter's control word.
+public record Documented native "register32" {
+    /// The collision threshold.
+    threshold: Integer at(4, 3)
+    private hidden: Integer at(12, 2)
+}
+record Internal native "register8" { field: Integer at(0, 1) }
+"""#)
+    test.require(test.run([frontend.compiler.executable, documentation, documentation + ".json", "--doc-json", "--library", "library"], frontend.environment, "", documentation + ".compile", frontend.compiler.compileTimeout), "register layout documentation metadata")
+    let document = json.parse(io.readTextFile(documentation + ".json"))
+    test.check(document.kind == json.OBJECT && document.member("version").number == 1.0, "versioned register layout documentation")
+    let declarations = document.member("declarations").items
+    test.check(declarations.length == 1 && json.string(declarations[0], "name") == "Documented", "only public register layouts are documented")
+    let signature = json.string(declarations[0], "signature")
+    test.check(test.contains(signature, "native") && test.contains(signature, "register32"), "documentation preserves register native annotation")
+    let members = declarations[0].member("members").items
+    test.check(members.length == 1 && json.string(members[0], "name") == "threshold", "private register fields are excluded from documentation")
+    let annotation = json.string(members[0], "signature")
+    test.check(test.contains(annotation, "Integer") && test.contains(annotation, "at") && test.contains(annotation, "4") && test.contains(annotation, "3"), "documentation preserves at position and width")
+}
+
+if fixtures.selected("RegisterLayouts", "compatibility") {
+    fixtures.executes(frontend, #"""
+function at(first: Integer, width: Integer): Integer { return first + width }
+function encodeField(layout: Integer, field: Text, value: Integer): Integer { return layout + value }
+function extractField(layout: Integer, field: Text, value: Integer): Integer { return layout + value }
+function replaceField(layout: Integer, field: Text, word: Integer, value: Integer): Integer { return layout + word + value }
+function fieldFits(layout: Integer, field: Text, value: Integer): Boolean { return layout == value }
+record Control native "register32" { threshold: Integer at(4, 3) }
+print(at(4, 3))
+print(encodeField(10, "ordinary", 5))
+print(extractField(10, "ordinary", 5))
+print(replaceField(1, "ordinary", 2, 3))
+print(fieldFits(5, "ordinary", 5))
+"""#, "7\n15\n15\n6\ntrue\n", levels, 0, "", true)
+    // Ordinary user functions/local callables take precedence. A layout cannot
+    // be smuggled in as their runtime argument through overload dispatch.
+    rejectFamily(frontend, control + "function encodeField(layout: Integer, field: Text, value: Integer): Integer { return value }\nprint(encodeField(Control, \"field\", 1))\n", "named function precedence", ["value", "runtime", "layout", "register", "find"])
+    rejectFamily(frontend, control + "let encodeField = function(layout: Integer, field: Text, value: Integer): Integer { return value }\nprint(encodeField(Control, \"field\", 1))\n", "local callable precedence", ["value", "runtime", "layout", "register", "find"])
+    fixtures.executes(frontend, control + "let encodeField = function(layout: Integer, field: Text, value: Integer): Integer { return layout + value }\nprint(encodeField(10, \"ordinary\", 5))\n", "15\n", levels, 0, "", true)
+    io.writeTextFile(frontend.compiler.directory + "/ordinary-scalar.min", "public constant VALUE = 9\n")
+    fixtures.executes(frontend, "use \"./ordinary-scalar.min\" as scalar\nfunction apply(value: Integer): Integer { let encodeField = function(argument: Integer): Integer { return argument + 1 }; return encodeField(value) }\nprint(apply(scalar.VALUE))\n", "10\n", levels, 0, "", true)
+    fixtures.executes(frontend, control + "let encodeField: Callback<Integer, Integer> = function(value: Integer): Integer { return value + 1 }\nprint(encodeField(9))\n", "10\n", levels, 0, "", true)
+    fixtures.executes(frontend, scalar + "\nprint(\"threshold\")\nprint(\"register32\")\nprint(scalarPack(5))\n", "threshold\nregister32\n80\n", levels, 0, "", true)
+    fixtures.executes(frontend, #"""
+constant FIRST = 4
+constant WIDTH = 3
+record Box<Item> { value: Item }
+function identity<Item>(value: Item): Item { return value }
+function keep(at: Integer): Integer { return at }
+record Control native "register32" { threshold: Integer at(FIRST, WIDTH) }
+record Ordinary { at: Integer; encodeField: Integer }
+let box = Box<Integer> { value: 9 }
+let ordinary = Ordinary { at: 7; encodeField: 8 }
+let fieldFits = 42
+print(box.value)
+print(identity(11))
+print(keep(ordinary.at))
+print(ordinary.encodeField)
+print(fieldFits)
+print(encodeField(Control, "threshold", identity(5)))
+"""#, "9\n11\n7\n8\n42\n80\n", levels, 0, "", true)
+    fixtures.executes(frontend, #"""
+record Packet native "c_packed" { value: Integer }
+record Control native "register32" { threshold: Integer at(4, 3) }
+function apply(callback: Callback<Integer, Integer>, value: Integer): Integer { return callback(value) }
+let callback = function(value: Integer): Integer { return encodeField(Control, "threshold", value) }
+let packet = cView(Packet, Bytes(8), 0)
+packet.value = 5
+print(apply(callback, packet.value))
+print(sizeOf(Packet))
+"""#, "80\n8\n", levels, 0, "", true)
+}
+
+test.removeScratch(frontend.compiler.directory)
+test.removeScratch(measured.compiler.directory)
+print("register layouts: selected boundary, bit oracle, zero-cost, rejection and module checks passed")

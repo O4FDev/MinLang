@@ -221,6 +221,15 @@ to their closure expression; synthetic symbols without a source declaration
 have no node. Literal module initializers get typed literal children, and
 runtime initializers get the expressions recorded by their checker.
 
+Compile-time native `register8/16/32/64` layouts retain record syntax nodes
+and field children, with runtime type zero. Their compiled symbol kind is 5
+(callback signatures use 4); they are excluded from ordinary value/type lookup.
+`CompilerContext.registerWidths` is indexed by declaration symbol, and
+`registerFields` stores first-bit/width pairs at the ordinary field-table offset.
+The contextual `at(first, width)` metadata is consumed by module/generic/header
+readers before typed layout validation. Declaration-operand operations emit
+scalar IR and never create a runtime record, field-name literal or initializer.
+
 ## Node kinds
 
 `syntaxKindName` is the central catalogue. The ranges are registered in the

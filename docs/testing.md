@@ -210,6 +210,13 @@ x86-64 and AArch64 with host headers excluded. This catches accidental hosted
 header dependencies without booting a guest.
 The real finite e1000 guest is opt-in: see [kernel development](os-development.md).
 
+`make check-register-layouts` checks native compile-time register declarations,
+field boundaries and overlap, private/imported fields, generic coexistence,
+dynamic range failures and ordinary identifier compatibility. Its independent
+per-bit oracle runs at O0/O2. IR and allocator probes check that field operations
+create no managed descriptors or field-name strings. `check-register-layouts-sanitize`
+adds compiler/generated-code ASan/UBSan; the ordinary target is a portable gate.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

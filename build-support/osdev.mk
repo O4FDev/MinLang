@@ -1,5 +1,13 @@
 .PHONY: check-osdev-fields check-osdev-fields-sanitize check-osdev-workflow check-osdev-host
 
+.PHONY: check-register-layouts check-register-layouts-sanitize
+build/tooling/tests/register-layouts.ll: tests/frontend-fixtures.min
+check-register-layouts: build/minyarc build/minyar-runtime.o build/tooling/tests/register-layouts
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/register-layouts
+
+check-register-layouts-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/register-layouts
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) ./build/tooling/tests/register-layouts
+
 build/tooling/tests/device-fields.ll: tests/frontend-fixtures.min
 check-osdev-fields: build/minyarc build/minyar-runtime.o build/tooling/tests/device-fields
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/device-fields
@@ -12,8 +20,8 @@ check-osdev-workflow:
 
 check-osdev-host: check-osdev-fields check-security-os-http
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding
-check-sanitize: check-osdev-fields-sanitize
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts
+check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize
 
 # Optional real hardware-emulation proof, separate from portable fake-tool tests.
 .PHONY: check-osdev-qemu

@@ -1686,6 +1686,39 @@ per-pixel work over every processor; see freestanding programs.
 
 ## Hardware register fields
 
+Use a native register layout when bit positions are known at compile time:
+
+```minyar
+record Control native "register32" {
+    enabled: Integer at(1, 1)
+    threshold: Integer at(4, 8)
+    distance: Integer at(12, 10)
+}
+let control = encodeField(Control, "enabled", 1) |
+    encodeField(Control, "threshold", 15)
+print(extractField(Control, "threshold", control)) // 15
+let changed = replaceField(Control, "distance", control, 64)
+print(fieldFits(Control, "distance", 1024)) // false
+```
+
+The native tags `register8`, `register16`, `register32` and `register64`
+select the word width. Each Integer field declares its first bit and width
+with contextual `at(first, width)`. Coordinates are compile-time Integer
+constants; fields must fit the word and cannot overlap. Private fields follow
+ordinary module visibility. A layout is a declaration operand for these four
+operations; it cannot be constructed, stored or passed as a runtime value.
+Its name must be distinct from runtime records, module constants and globals.
+Field names must be literal text. The operations emit scalar shifts and masks
+directly, including at O0, without allocating a descriptor or a field-name string.
+
+`encodeField` produces a zero-filled payload; `extractField` reads a field
+from an Integer; `replaceField` preserves every other bit. Narrow words and
+field values must fit their unsigned widths. A full-width 64-bit field accepts
+every Integer bit pattern. Invalid literal or scalar-constant operands reject
+at compile time; other invalid values stop through the ordinary Integer range
+failure. `fieldFits` returns false for an invalid field value. These are pure
+operations: use explicit volatile device reads/writes and required barriers.
+
 The `device` module gives memory-mapped registers distinct widths. A
 `Field8`, `Field16`, `Field32` or `Field64` describes a field within a register
 of that width. Its first argument is the least-significant bit; the second

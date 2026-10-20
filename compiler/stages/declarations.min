@@ -91,17 +91,22 @@ function discoverSyntaxSymbols(tree: SyntaxTree, tokenTexts: List<Text>, tokenLi
             let type = 0
             if kind == 2 {
                 if isThreadType(simpleTypeCode(readableDeclarationName(name))) { failCompiler("reserved thread type name") }
-                if symbolNames.length >= 99000 { failCompiler("nominal type index exceeds the supported limit") }
-                type = 1000 + symbolNames.length
-                let token = tree.nodes[node].body + 1
-                let fields = 0
-                let choice = false
-                while token < tree.nodes[node].end {
-                    if tokenTexts[token] == ":" { fields = fields + 1 }
-                    if resultPrefix(tokenTexts[token], "minyar_choice_tag|") { choice = true }
-                    token = token + 1
+                let start = tree.nodes[node].start
+                if tokenTexts[start + 2] == "native" && registerLayoutWidth(tokenTexts[start + 3]) > 0 {
+                    kind = registerLayoutSymbolKind()
+                } else {
+                    if symbolNames.length >= 99000 { failCompiler("nominal type index exceeds the supported limit") }
+                    type = 1000 + symbolNames.length
+                    let token = tree.nodes[node].body + 1
+                    let fields = 0
+                    let choice = false
+                    while token < tree.nodes[node].end {
+                        if tokenTexts[token] == ":" { fields = fields + 1 }
+                        if resultPrefix(tokenTexts[token], "minyar_choice_tag|") { choice = true }
+                        token = token + 1
+                    }
+                    if choice && fields == 1 { type = 1000000000 + symbolNames.length }
                 }
-                if choice && fields == 1 { type = 1000000000 + symbolNames.length }
             } else { kind = 3 }
             tokenLines.nominalTypes.add(type)
             symbolNames.add(name)
@@ -250,17 +255,20 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         } else {
         if tokenIs(tokenKinds, tokenTexts, cursor, "record") {
             declaration = declaration + 1
+            let registerWidth = registerLayoutWidthAt(tokenKinds, tokenTexts, cursor[0])
             cursor[0] = cursor[0] + 1
             if tokenKinds[cursor[0]] != 1 {
                 failAtToken(tokenLines, cursor[0], "expected a name after record")
             }
-            let record = findIndexedSymbol(symbolLookup, symbolNames, symbolKinds, tokenTexts[cursor[0]], 2)
+            let recordKind = 2
+            if registerWidth > 0 { recordKind = registerLayoutSymbolKind() }
+            let record = findIndexedSymbol(symbolLookup, symbolNames, symbolKinds, tokenTexts[cursor[0]], recordKind)
             cursor[0] = cursor[0] + 1
             let cLayout = false
             if tokenIs(tokenKinds, tokenTexts, cursor, "native") {
                 cursor[0] = cursor[0] + 1
-                if tokenKinds[cursor[0]] != 3 || (tokenTexts[cursor[0]] != "c" && tokenTexts[cursor[0]] != "c_packed") { failCompiler("record native layout must be c or c_packed") }
-                cLayout = true
+                if tokenKinds[cursor[0]] != 3 || (registerWidth == 0 && tokenTexts[cursor[0]] != "c" && tokenTexts[cursor[0]] != "c_packed") { failCompiler("record native layout must be c, c_packed, or register8/16/32/64") }
+                cLayout = registerWidth == 0
                 cursor[0] = cursor[0] + 1
             }
             expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "{")
@@ -299,6 +307,10 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                         symbolParameterTypes.add(takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds))
                     }
                 }
+                if registerWidth > 0 {
+                    if symbolParameterTypes[symbolParameterTypes.length - 1] != 1 { failAtToken(tokenLines, cursor[0], "register fields need Integer values") }
+                    skipRegisterFieldAnnotation(tokenKinds, tokenTexts, tokenLines, cursor)
+                }
                 count = count + 1
                 if tokenIs(tokenKinds, tokenTexts, cursor, ",") {
                     cursor[0] = cursor[0] + 1
@@ -306,6 +318,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 skipTerminators(tokenKinds, cursor)
             }
             symbolParameterCounts[record] = count
+            if registerWidth > 0 && count == 0 { failAtToken(tokenLines, cursor[0], "register layouts need at least one field") }
             cursor[0] = cursor[0] + 1
         } else {
             if tokenIs(tokenKinds, tokenTexts, cursor, "function") {
