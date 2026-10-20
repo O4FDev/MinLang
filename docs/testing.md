@@ -391,6 +391,13 @@ input replacement and escaping closures. The letters gallery is included.
 `check-pattern-bindings-sanitize` adds compiler, generated-code and runtime
 ASan/UBSan checks.
 
+`make check-pattern-dispatch` checks that choice matches dispatch through one
+tag switch per shared discriminant: source-order arms, guards that fall
+through, nested constructor trees, record products, and the bounded linear
+fallback for very wide matches. Programs run at O0/O2 with ownership checks;
+the IR checks require real `switch` instructions and no repeated tag tests.
+`check-pattern-dispatch-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

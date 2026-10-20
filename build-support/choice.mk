@@ -144,3 +144,13 @@ check-sanitize: check-choice-set-niche-sanitize
 
 check check-portable: check-pattern-bindings
 check-sanitize: check-pattern-bindings-sanitize
+
+.PHONY: check-pattern-dispatch check-pattern-dispatch-sanitize
+check-pattern-dispatch: build/minyarc build/minyar-runtime.o build/tooling/tests/pattern-dispatch
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/pattern-dispatch"
+
+check-pattern-dispatch-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/pattern-dispatch
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/pattern-dispatch"
+
+check check-portable: check-pattern-dispatch
+check-sanitize: check-pattern-dispatch-sanitize
