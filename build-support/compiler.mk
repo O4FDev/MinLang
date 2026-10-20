@@ -37,6 +37,7 @@ COMPILER_SOURCES = build/choice-builtins.min \
 	compiler/sequence-compiler.min \
 	compiler/sequence-lowering.min \
 	compiler/iteration-capabilities.min \
+	compiler/user-capabilities.min \
 	compiler/result-methods.min \
 	compiler/errors-compiler.min \
 	compiler/patterns.min \

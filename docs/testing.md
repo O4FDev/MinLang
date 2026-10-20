@@ -459,6 +459,13 @@ on functions and records, using built-in values and finite record shapes. It run
 O0/O2 ownership fixtures, capability rejections and the constraints gallery.
 `check-generic-constraints-sanitize` instruments the compiler and generated programs.
 
+`make check-user-capabilities` checks explicit user-defined conformances,
+defaults and overrides, `Self`, aliases, constrained generic records, imported
+capabilities and contextual identifiers. The gallery and successful fixtures run
+at O0/O2 with ownership cleanup assertions. Rejections cover missing and wrongly
+typed methods, unknown capabilities, duplicates and missing conformances.
+`check-user-capabilities-sanitize` instruments compiler and generated programs.
+
 `make check-generic-results` checks shared generic value/error storage and the
 IntegerResult/BooleanResult compatibility APIs at O0/O2 with ownership assertions.
 It preserves exact fatal messages and private fields and checks the results gallery.

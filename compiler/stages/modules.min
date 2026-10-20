@@ -230,13 +230,13 @@ function loadModule(library: Text, path: Text, isEntry: Boolean, modulePaths: Li
                 declarationCursor = declarationCursor + 1
             }
             let marker: List<Integer> = [declarationCursor]
-            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") || tokenIs(allTokenKinds, allTokenTexts, marker, "global") || isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) {
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") || tokenIs(allTokenKinds, allTokenTexts, marker, "global") || isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) || conformanceToAt(allTokenKinds, allTokenTexts, marker[0]) >= 0 {
                 declarationStarts.add(declarationCursor)
                 if isTypeAliasDeclaration(allTokenKinds, allTokenTexts, marker) { skipTypeAliasDeclaration(allTokenKinds, allTokenTexts, allTokenLines, marker) } else { skipTopLevelStatement(allTokenKinds, allTokenTexts, marker) }
                 declarationEnds.add(marker[0])
                 cursor[0] = marker[0]
             } else {
-            if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || choiceDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || choiceDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) || capabilityDeclarationAt(allTokenKinds, allTokenTexts, marker[0]) || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
                 declarationStarts.add(declarationCursor)
                 skipDeclaration(allTokenKinds, allTokenTexts, marker)
                 declarationEnds.add(marker[0])
@@ -312,7 +312,7 @@ function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart
             if tokenIs(tokenKinds, tokenTexts, cursor, "function") {
                 kind = 1
             }
-            if tokenIs(tokenKinds, tokenTexts, cursor, "record") || choiceDeclarationAt(tokenKinds, tokenTexts, cursor[0]) || isTypeAliasDeclaration(tokenKinds, tokenTexts, cursor) {
+            if tokenIs(tokenKinds, tokenTexts, cursor, "record") || choiceDeclarationAt(tokenKinds, tokenTexts, cursor[0]) || isTypeAliasDeclaration(tokenKinds, tokenTexts, cursor) || capabilityDeclarationAt(tokenKinds, tokenTexts, cursor[0]) {
                 kind = 2
             }
             if tokenIs(tokenKinds, tokenTexts, cursor, "constant") || tokenIs(tokenKinds, tokenTexts, cursor, "global") {
@@ -393,6 +393,8 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
     let scopeDepth = 0
     let typeAlias = false
     let typeAliasEnd = 0
+    let conformanceType = -1
+    let conformanceCapability = -1
     let typeVariables: List<Text> = []
     let typeVariableStart = 0
     let typeVariableEnd = 0
@@ -414,6 +416,12 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                 if typeAlias && position >= typeAliasEnd { typeAlias = false; typeMode = false; genericDepth = 0 }
                 if declarationMode == 0 && scopeDepth == 0 && isTypeAliasAt(tokenKinds, tokenTexts, position) { typeAlias = true; let aliasCursor: List<Integer> = [position]; skipTypeAliasDeclaration(tokenKinds, tokenTexts, tokenLines, aliasCursor); typeAliasEnd = aliasCursor[0] }
                 if typeAlias && token == "=" { typeMode = true; genericDepth = 0 }
+                if declarationMode == 0 && scopeDepth == 0 && conformanceToAt(tokenKinds, tokenTexts, position) >= 0 {
+                    conformanceType = position + 1
+                    conformanceCapability = conformanceToAt(tokenKinds, tokenTexts, position) + 1
+                }
+                if position == conformanceType || position == conformanceCapability { typeMode = true; genericDepth = 0 }
+                if declarationMode == 0 && scopeDepth == 0 && capabilityDeclarationAt(tokenKinds, tokenTexts, position) { declarationMode = 3 }
                 if declarationMode == 0 && token == "function" && tokenTexts[position + 2] == "." {
                     let recordName = tokenTexts[position + 1]
                     let record = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, recordName, 2, identities)
@@ -436,7 +444,7 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                     token = tokenTexts[position]
                     kind = tokenKinds[position]
                 }
-                if token == "function" && tokenTexts[position + 1] == "(" { functionHeader = true }
+                if token == "function" && (tokenTexts[position + 1] == "(" || declarationMode == 3) { functionHeader = true }
                 if token == "{" && functionHeader { functionHeader = false }
                 let rewritten = token
                 let memberSelector = position > tokenStart && tokenTexts[position - 1] == "."
@@ -516,10 +524,10 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                 } else {
                     if kind == 1 && !memberSelector {
                         let declarationKind = 0
-                        if position > 0 && tokenTexts[position - 1] == "function" {
+                        if position > 0 && tokenTexts[position - 1] == "function" && declarationMode != 3 {
                             declarationKind = 1
                         }
-                        if position > 0 && (tokenTexts[position - 1] == "record" || (scopeDepth == 0 && choiceDeclarationAt(tokenKinds, tokenTexts, position - 1)) || (scopeDepth == 0 && isTypeAliasAt(tokenKinds, tokenTexts, position - 1))) {
+                        if position > 0 && (tokenTexts[position - 1] == "record" || (scopeDepth == 0 && choiceDeclarationAt(tokenKinds, tokenTexts, position - 1)) || (scopeDepth == 0 && isTypeAliasAt(tokenKinds, tokenTexts, position - 1)) || (declarationMode == 3 && capabilityDeclarationAt(tokenKinds, tokenTexts, position - 1))) {
                             declarationKind = 2
                         }
                         if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "(" {
@@ -561,7 +569,8 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                             let constantDeclaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3, identities)
                             if functionDeclaration < 0 && constantDeclaration >= 0 { declarationKind = 3 }
                         }
-                        if (position >= typeVariableStart && position < typeVariableEnd) || (declarationKind == 2 && findText(typeVariables, token) >= 0) { declarationKind = 0 }
+                        if (position >= typeVariableStart && position < typeVariableEnd && (tokenTexts[position - 1] == "<" || tokenTexts[position - 1] == ",")) || (declarationKind == 2 && findText(typeVariables, token) >= 0) { declarationKind = 0 }
+                        if declarationMode == 3 && ((position > 0 && tokenTexts[position - 1] == "function") || token == "Self") { declarationKind = 0 }
                         if declarationKind > 0 {
                             let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind, identities)
                             if declaration >= 0 {

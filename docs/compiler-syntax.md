@@ -6,6 +6,14 @@ checker records statement and expression nodes while emitting LLVM; it does
 not run a second expression parser. Declaration nodes reuse the module scan's
 token ranges when those ranges are available.
 
+User-defined capabilities are checked during generic normalization. Their
+signatures use the same type shapes as generic declarations. Conformance checking
+resolves aliases before comparing methods; defaults become ordinary concrete
+method declarations with an explicit receiver. Copied tokens preserve their
+capability module's source spans. Capability declarations and conformance
+statements emit no runtime representation. Raw documentation trees use kind 10
+for capabilities and ordinary function nodes for their method signatures.
+
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations
 again. Initial record and constant name collection also walks those nodes in
@@ -160,7 +168,7 @@ overnight charter and are separate from lexer and type codes:
 
 - 0: module.
 - 1–6: function, record, constant, global, field and parameter.
-- 7–9: choice, type alias and test in raw documentation trees. Typed compilation
+- 7–10: choice, type alias, test and capability in raw documentation trees. Typed compilation
   continues to describe normalized declarations with the existing kinds.
 - 100–111: block, conditional, loop, binding, return, jump, match, native body,
   expression statement and assignment.

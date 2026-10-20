@@ -1062,8 +1062,47 @@ function largest<Item: Ordered>(values: List<Item>, fallback: Item): Item {
 print(largest([1.2, 2.7, 1.4], 0.0)) // 2.7
 ```
 
-`Equatable`, `Ordered`, `Hashable`, `Iterable` and `Iterator` are supported
-capability names.
+A capability describes the methods a type promises to provide:
+
+```minyar
+capability Named {
+    function name(): Text
+    function greeting(): Text { return "Hello, " + self.name() }
+}
+
+record Visitor { name: Text }
+function Visitor.name(): Text { return self.name }
+conform Visitor to Named
+
+function greet<Guest: Named>(guest: Guest): Text {
+    return guest.greeting()
+}
+print(greet(Visitor { name: "Ada" })) // Hello, Ada
+```
+
+A conformance belongs to the module that declares the record. It checks every
+method's parameter and result types, even when no generic function uses it.
+A matching method overrides its default; a missing method uses its default or
+reports an error. Method parameter names may differ. `Self` in an annotation
+means the conforming record, including inside a collection or callable type.
+Aliases retain their underlying record's conformance. A concrete generic record
+can conform through an alias or a type such as `Box<Integer>`.
+
+Capability names share the type namespace. Export one with `public capability`
+and refer to an imported one with its module alias, such as `labels.Named`.
+Implement an imported capability's required methods with `public function` so
+its defaults can call them. Defaults retain access to helpers in their original
+module. `capability`, `conform` and `to` remain ordinary identifiers elsewhere.
+This first form supports concrete record conformances and ordinary method
+signatures; capability inheritance and generic capability methods are not supported.
+
+A type opts into a user-defined capability explicitly; matching method names
+alone do not establish conformance. The compiler specializes defaults as ordinary
+record methods and generic functions as ordinary concrete functions. There is no
+boxing, witness table or runtime method dispatch.
+
+`Equatable`, `Ordered`, `Hashable`, `Iterable` and `Iterator` are built-in
+capability names; a user capability cannot reuse them.
 Integer, Float, Text, Character and Boolean satisfy the three comparison
 capabilities. Finite records
 whose fields support a capability inherit it. Maps and Sets support Equatable
