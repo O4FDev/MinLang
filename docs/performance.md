@@ -102,8 +102,7 @@ launcher's default bounded lowering.
 Arena measured 1,188,040,017 instructions with scope lowering. A subsequent
 inline eager release path reduced the same scope compiler from 3,726,245,042
 to 2,873,927,153 median instructions, another 22.87%. Its matching arena measured
-1,188,040,249: eager remains 2.4191 times arena, so the 1.2-times target is not
-met. An unmodified runtime rebuilt through the prototype's exact path differed
+1,188,040,249, giving 2.4191 times arena. An unmodified runtime rebuilt through the prototype's exact path differed
 from the saved eager control by only 144 instructions. All 32 follow-up outputs
 matched the same frozen LLVM. The counters and runtime/header identities are in
 [`frames-inline-release.json`](../experiments/memory/frames-inline-release.json).
@@ -113,6 +112,17 @@ All 48 executions, including warmups and legacy controls, produced exactly the
 frozen original compiler's LLVM bytes. Source, LLVM, runtime and executable
 hashes, every observation and the complete flags are retained in
 [`frames-ownership.json`](../experiments/memory/frames-ownership.json).
+
+Adjacent plain-borrow coalescing then reduced eager instructions from
+2,873,927,000 to 2,655,982,553, a further 7.58%. Matching arena counts were
+1,188,040,852 and 1,188,040,574. Eager is now 2.2356 times arena; the 1.2-times
+target remains unmet. Both same-source 722-function scope modules have no
+legacy frame calls or fallbacks. Coalescing removes 532 temporary cells,
+retains and releases while preserving lasting owners and adding 15 return
+polls. All 32 executions match the same frozen original LLVM, with continuous,
+unscaled counters. This campaign uses one fresh output filename for all four
+executables. Counts, every observation and input/runtime/executable identities
+are in [`frames-borrow-coalescing.json`](../experiments/memory/frames-borrow-coalescing.json).
 
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
