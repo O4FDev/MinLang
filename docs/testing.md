@@ -18,11 +18,14 @@ For a build box without Git metadata, capture inputs on the source machine
 without building, then sync and run on the box:
 
 ```sh
-make check-changed-export CHECK_CHANGED_EXPORT=target/changes-1
+python3 tools/check-changed.py --export target/changes-1
 /path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed-plan
 /path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed
 ```
 
+The equivalent Make entry point is `make check-changed-export
+CHECK_CHANGED_EXPORT=target/changes-1`. The direct Python command avoids starting
+Make when the source machine prohibits local build processes.
 Each export needs a new directory under `target/`. Source content and executable
 modes, changed paths and previous modules are validated before and after checks; re-export
 after editing. Generated `build/`, `target/` and Python bytecode are excluded.

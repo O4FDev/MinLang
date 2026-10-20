@@ -61,13 +61,15 @@ def inventory(root):
 def capture(root, base, destination):
     # Resolve before writing anything. A bad base must never become an empty diff.
     tree = git(root, "rev-parse", "--verify", "--end-of-options", base + "^{tree}").decode().strip()
+    # Bracket path selection too: an edit after Git lists changes must not be
+    # accepted as the baseline snapshot while disappearing from that list.
+    before = inventory(root)
     changed = git(root, "diff", "--name-only", "--no-renames", "-z", tree, "--")
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z")
     paths = sorted(set((changed + untracked).split(b"\0")) - {b""})
     # These directories are generated and intentionally absent from validation.
     if any(path.split(b"/", 1)[0] in (b"build", b"target") for path in paths):
         raise ValueError("changed source under build/ or target/ cannot be exported; move it to a source directory")
-    before = inventory(root)
     previous = destination / "previous"
     previous.mkdir(parents=True)
     (previous / "library").mkdir()

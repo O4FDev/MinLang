@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check real Git diffs, exported inputs and stale-input rejection."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parent.parent / "tools/check-changed.py"
@@ -142,6 +144,31 @@ class ChangedInputs(unittest.TestCase):
         self.export()
         (self.root / "new.min").write_text("new source\n")
         self.rejection("source differs")
+
+    def test_source_change_after_path_collection_is_rejected(self):
+        spec = importlib.util.spec_from_file_location("check_changed_capture_race", self.root / "tools/check-changed.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        original_git = module.git
+        mutations = []
+
+        def collect_then_change(root, *arguments):
+            result = original_git(root, *arguments)
+            if arguments[0] == "ls-files":
+                # The path list is already collected; no sleep or scheduler race.
+                (self.root / "tools/new-helper.min").write_text("new source after selection\n")
+                mutations.append(True)
+            return result
+
+        inputs = Path(self.temporary.name) / "racing-export"
+        inputs.mkdir()
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            with mock.patch.object(module, "git", side_effect=collect_then_change):
+                with self.assertRaisesRegex(ValueError, "source changed while exporting"):
+                    module.capture(self.root, "HEAD", inputs)
+        self.assertEqual(mutations, [True], "the mutation must follow exactly one path collection")
+        self.assertFalse((inputs / "manifest.json").exists(), "a racing capture must not publish a manifest")
+        self.assertFalse((self.root / "build").exists(), "capture must not build the planner")
 
     def test_deleted_source_is_rejected(self):
         self.export()
