@@ -36,7 +36,7 @@ class ClangCounter:
         assert real, "selected real Clang is not executable: " + repr(selected)
         real = str(Path(real).resolve())
         self.log = directory / "clang-calls.jsonl"
-        self.wrapper = directory / "clang counter.py"
+        self.wrapper = directory / "clang-counter.py"
         self.wrapper.write_text(
             "#!" + sys.executable + "\n" +
             "REAL = " + repr(real) + "\nLOG = " + repr(str(self.log)) + "\n" + '''import fcntl, json, os, sys
@@ -131,11 +131,12 @@ def begin(launcher, project, fifo, release, environment=None):
 
 
 def check(launcher, release):
-    with tempfile.TemporaryDirectory(prefix="minyar-hot-λ ") as temporary:
+    with tempfile.TemporaryDirectory(prefix="minyar-hot-λ ") as temporary, \
+            tempfile.TemporaryDirectory(prefix="minyar-clang-counter-") as counter_temporary:
         directory = Path(temporary)
         project = directory / "project"
         project.mkdir()
-        counter = ClangCounter(launcher, directory)
+        counter = ClangCounter(launcher, Path(counter_temporary))
         (project / "src").mkdir()
         (project / "Minyar.toml").write_text(
             '[package]\nname = "hot-probe"\nversion = "0.1.0"\nkind = "bin"\n', encoding="utf-8"
@@ -174,13 +175,17 @@ def check(launcher, release):
             latency = time.monotonic() - started
             watch.wait(b"program state preserved", "stderr", errors)
 
+            noop_latencies = []
+
             def unchanged_save(expected, atomic=True):
                 before = accepted_publication(project, release)[3]
                 calls = counter.calls()
                 errors = len(watch.output["stderr"])
+                started = time.monotonic()
                 publish(source, program("second"), atomic=atomic)
                 watch.wait(b"Unchanged source; keeping published update", "stderr", errors)
                 watch.wait(b"Reload ready", "stderr", errors)
+                noop_latencies.append(time.monotonic() - started)
                 after = accepted_publication(project, release)[3]
                 assert after == before, (
                     "identical source must preserve current bytes/inode, sidecar and generation directories",
@@ -248,7 +253,9 @@ def check(launcher, release):
             assert len(re.findall(rb"(?m)^PID ", watch.output["stdout"])) == 1, watch.diagnostics()
             watch.stop()
             print(f"hot reload {'O2' if release else 'O0'}: same PID, heap roots, thirteen state transitions, "
-                  f"identical-save no-ops without native work, trusted-sidecar recovery; edit-to-observation {latency:.3f}s")
+                  f"three identical saves with zero native calls, trusted-sidecar recovery; "
+                  f"edit-to-observation {latency:.3f}s, identical-save acceptance "
+                  f"{min(noop_latencies):.3f}–{max(noop_latencies):.3f}s")
         finally:
             watch.close()
 
