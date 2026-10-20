@@ -106,7 +106,7 @@ static void record(const char *label, size_t request, size_t work) {
            rc_bounded_cached_frame_bytes, model.count, model.capacity,
            model.written, model.pending, model.finalized);
     for (size_t i = 0; i < ROOTS; i++)
-        printf("%zu,", roots[i] ? ((RcObject *)roots[i] - 1)->ownership >> 3 : 0);
+        printf("%zu,", (size_t)(roots[i] ? ((RcObject *)roots[i] - 1)->ownership >> 3 : 0));
     printf("] remaining[");
     if (model.frame && !model.active)
         for (size_t i = 0; i < model.pending; i++)

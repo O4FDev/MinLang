@@ -43,7 +43,7 @@ static void object_chain(const char *label, RcObject *head) {
     for (RcObject *object = head; object;
          object = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7)) {
         assert(++limit < 4096);
-        printf("%zu/%zu/%zu,", object_identity(object), object->ownership & 7,
+        printf("%zu/%zu/%zu,", object_identity(object), (size_t)(object->ownership & 7),
                rc_bounded_saved_cursor(object));
     }
     putchar(']');
@@ -58,7 +58,7 @@ static void registry(const char *label, RcCycle *head) {
     for (RcCycle *cycle = head; cycle; cycle = cycle->next) {
         assert(++limit < 4096);
         printf("%zu/%zu/%zu/%u/%u/%u/%zu,", cycle_identity(cycle),
-               rc_cycle_object(cycle)->ownership >> 3, (size_t)cycle->incoming,
+               (size_t)(rc_cycle_object(cycle)->ownership >> 3), (size_t)cycle->incoming,
                (unsigned)cycle->marked, (unsigned)cycle->pinned,
                (unsigned)cycle->cleared, (size_t)(cycle->gray_next & 7));
     }
@@ -98,7 +98,7 @@ static void snapshot(const char *label, size_t requested, size_t work) {
     printf("] free[");
     for (RcFrame *frame = rc_free_frames; frame; frame = frame->previous)
         printf("%zu/%zu,", identity(frame), frame->local_capacity);
-    printf("] survivor=%zu", survivor ? ((RcObject *)survivor - 1)->ownership >> 3 : 0);
+    printf("] survivor=%zu", (size_t)(survivor ? ((RcObject *)survivor - 1)->ownership >> 3 : 0));
 #ifdef MINYAR_CYCLE_LOCAL_PROOFS
     printf(" cycle=%u/%u/%zu/%zu/%zu/%u/%u/%zu/%zu/%zu/%zu",
            rc_cycle_pending, rc_cycle_phase, rc_cycle_units, rc_cycle_epochs,
@@ -111,8 +111,8 @@ static void snapshot(const char *label, size_t requested, size_t work) {
         assert(cycle_child && cycle_root->values[0] == (long long)(uintptr_t)cycle_child);
         assert(cycle_child->values[0] == (long long)(uintptr_t)cycle_root);
         assert(cycle_root->values[1] == 73 && cycle_child->values[1] == 91);
-        printf(" roots=%zu/%zu/%zu/%zu", ((RcObject *)cycle_root - 1)->ownership >> 3,
-               ((RcObject *)cycle_child - 1)->ownership >> 3,
+        printf(" roots=%zu/%zu/%zu/%zu", (size_t)(((RcObject *)cycle_root - 1)->ownership >> 3),
+               (size_t)(((RcObject *)cycle_child - 1)->ownership >> 3),
                (size_t)rc_cycle_metadata((RcObject *)cycle_root - 1)->incoming,
                (size_t)rc_cycle_metadata((RcObject *)cycle_child - 1)->incoming);
     }
