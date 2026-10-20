@@ -23,7 +23,7 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = -(1 << 63)
 MAXIMUM = (1 << 63) - 1
-FAMILIES = ("arithmetic", "control", "aliases", "bytes", "callbacks", "choices")
+FAMILIES = ("arithmetic", "control", "aliases", "maps", "bytes", "callbacks", "choices")
 
 
 def signed(value: int) -> int:
@@ -172,6 +172,110 @@ def generate_case(case: Case) -> Block:
         lines.extend(("roots = []", "alias = []"))
         check("fork[3].number", cells[0]["number"])
         check("fork[3].values[0]", first)
+    elif case.family == "maps":
+        lines.extend((
+            'let original = FuzzKey { label: "ke" + "y"; number: 7 }',
+            'let value = ["kept" + "!"]',
+            "let table: Map<FuzzKey, List<Text>> = Map()",
+            "let tableAlias = table",
+            "let names: Set<FuzzKey> = Set()",
+            "let namesAlias = names",
+            "table[original] = value",
+            "names.add(original)",
+            'original.label = "changed" + "!"',
+            "original.number = 8",
+            'let stored = FuzzKey { label: "key"; number: 7 }',
+            "let saved = table[stored]",
+            "tableAlias.clear()",
+            'saved[0] = "changed"',
+        ))
+        check("value[0]", "changed")
+        check("table.length", 0)
+        check("names.contains(stored)", True)
+        check("names.contains(original)", False)
+        check("namesAlias.remove(stored)", True)
+        check("names.length", 0)
+        lines.extend((
+            "let evaluation = Map<Text, Text>()",
+            'evaluation["key"] = "borrowed" + "!"',
+            'evaluation[evaluation["key"]] = fuzzReset(evaluation)',
+        ))
+        check('evaluation["borrowed!"]', "after!")
+
+        key_count = 8
+        keys: list[list[object]] = []
+        payloads: dict[int, list[str]] = {}
+        for index in range(key_count):
+            label = f"key-{index}-{rng.randrange(1000)}"
+            number = rng.randint(-1000, 1000)
+            payload = f"value-{index}-{rng.randrange(1000)}!"
+            keys.append([label, number])
+            payloads[index] = [payload]
+            label_prefix = f"key-{index}-"
+            lines.append(f"let key{index} = FuzzKey {{ label: {literal(label_prefix)} + "
+                         f"{literal(label[len(label_prefix):])}; number: {number} }}")
+            lines.append(f"let value{index} = [{literal(payload[:-1])} + \"!\"]")
+
+        mapped: dict[tuple[str, int], int] = {}
+        members: set[tuple[str, int]] = set()
+
+        def key_term(key: tuple[str, int]) -> str:
+            return f"FuzzKey {{ label: {literal(key[0])}; number: {key[1]} }}"
+
+        for step in range(size):
+            key_index = rng.randrange(key_count)
+            value_index = rng.randrange(key_count)
+            frozen = (str(keys[key_index][0]), int(keys[key_index][1]))
+            lines.append(f"table[key{key_index}] = value{value_index}")
+            lines.append(f"names.add(key{key_index})")
+            mapped[frozen] = value_index
+            members.add(frozen)
+
+            new_number = int(keys[key_index][1]) + rng.randint(1, 1000) + step
+            label_suffix = rng.randrange(1000)
+            new_label = f"changed-{step}-{label_suffix}"
+            lines.append(f"key{key_index}.label = {literal(f'changed-{step}-')} + "
+                         f"{literal(str(label_suffix))}")
+            lines.append(f"key{key_index}.number = {new_number}")
+            keys[key_index][0] = new_label
+            keys[key_index][1] = new_number
+            current = (new_label, new_number)
+            check(f"tableAlias.has({key_term(frozen)})", True)
+            check(f"namesAlias.contains({key_term(frozen)})", True)
+            check(f"table.has({key_term(current)})", current in mapped)
+
+            lines.append(f"let saved{step} = tableAlias[{key_term(frozen)}]")
+            saved_id = mapped[frozen]
+            disposition = step % 3
+            if disposition == 0:
+                check(f"tableAlias.remove({key_term(frozen)})", True)
+                del mapped[frozen]
+            elif disposition == 1:
+                replacement = (saved_id + 1 + rng.randrange(key_count - 1)) % key_count
+                lines.append(f"tableAlias[{key_term(frozen)}] = value{replacement}")
+                mapped[frozen] = replacement
+            else:
+                lines.append("tableAlias.clear()")
+                mapped.clear()
+
+            changed = f"saved-{step}-{rng.randrange(1000)}"
+            lines.append(f"saved{step}[0] = {literal(changed)}")
+            payloads[saved_id][0] = changed
+            check(f"value{saved_id}[0]", changed)
+            if frozen in mapped:
+                check(f"table[{key_term(frozen)}][0]", payloads[mapped[frozen]][0])
+
+            set_disposition = step % 3
+            if set_disposition == 0:
+                check(f"namesAlias.remove({key_term(frozen)})", True)
+                members.remove(frozen)
+            elif set_disposition == 1:
+                lines.append("namesAlias.clear()")
+                members.clear()
+            else:
+                check(f"names.contains({key_term(frozen)})", True)
+            check("table.length", len(mapped))
+            check("namesAlias.length", len(members))
     elif case.family == "bytes":
         count = rng.randint(1, size + 1)
         values = [rng.randrange(256) for _ in range(count)]
@@ -230,8 +334,10 @@ def generate_case(case: Case) -> Block:
 
 PRELUDE = '''// Generated by tests/differential-fuzz.py. Integers are checked against a Python oracle.
 record FuzzCell { number: Integer; text: Text; values: List<Integer> }
+record FuzzKey { label: Text; number: Integer }
 choice FuzzChoice { Full(payload: FuzzCell); Empty }
 function mark(state: FuzzCell): Boolean { state.number += 1; return true }
+function fuzzReset(table: Map<Text, Text>): Text { table.clear(); return "after" + "!" }
 function choiceValue(value: FuzzChoice): Integer {
     match value { Full(payload) { return payload.number } Empty { return -1 } }
 }

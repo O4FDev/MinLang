@@ -92,7 +92,8 @@ class IntegerOracleTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def test_every_family_is_deterministic_and_has_observable_checks(self):
         self.assertEqual(set(fuzz.FAMILIES),
-                         {"arithmetic", "control", "aliases", "bytes", "callbacks", "choices"})
+                         {"arithmetic", "control", "aliases", "maps", "bytes", "callbacks",
+                          "choices"})
         global_state = random.getstate()
         for family in fuzz.FAMILIES:
             for size in (1, 12):
@@ -266,6 +267,179 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(bindings["roots"], [])
         self.assertEqual(bindings["alias"], [])
         self.assertEqual(bindings["fork"], ["first", "first", "other", "first"])
+
+    def test_map_set_oracle_matches_independent_operation_replay(self):
+        seed = 0xC0DE
+        block = fuzz.generate_case(fuzz.Case("maps", seed, 12))
+        records = {}
+        sequences = {}
+        maps = {}
+        sets = {}
+        text_maps = {}
+        observed = []
+
+        def text(expression):
+            return "".join(json.loads(part) for part in expression.split(" + "))
+
+        def key(expression):
+            if expression in records:
+                return tuple(records[expression])
+            inline = re.fullmatch(
+                r'FuzzKey \{ label: (.+); number: (-?\d+) \}', expression)
+            self.assertIsNotNone(inline, f"unmodeled map key: {expression}")
+            return text(inline.group(1)), int(inline.group(2))
+
+        def evaluate(term):
+            indexed = re.fullmatch(r'(table|tableAlias)\[(.+)\]\[0\]', term)
+            if indexed:
+                return maps[indexed.group(1)][key(indexed.group(2))][0]
+            item = re.fullmatch(r'(\w+)\[0\]', term)
+            if item and item.group(1) in sequences:
+                return sequences[item.group(1)][0]
+            lookup = re.fullmatch(r'evaluation\[("(?:[^"\\]|\\.)*")\]', term)
+            if lookup:
+                return text_maps["evaluation"][json.loads(lookup.group(1))]
+            length = re.fullmatch(r'(\w+)\.length', term)
+            if length:
+                name = length.group(1)
+                return len(maps[name] if name in maps else sets[name])
+            method = re.fullmatch(r'(\w+)\.(has|contains|remove)\((.+)\)', term)
+            if method:
+                name, operation, argument = method.groups()
+                frozen = key(argument)
+                container = maps[name] if name in maps else sets[name]
+                present = frozen in container
+                if operation == "remove" and present:
+                    if name in maps:
+                        del container[frozen]
+                    else:
+                        container.remove(frozen)
+                return present
+            self.fail(f"unmodeled map observation: {term}")
+
+        for line in block.body:
+            checkpoint = re.fullmatch(
+                r'check(Integer|Text|Boolean)\((.*), '
+                r'(true|false|-?\d+|"(?:[^"\\]|\\.)*"), '
+                r'("(?:[^"\\]|\\.)*")\)', line)
+            if checkpoint:
+                kind, term, expected_text, label_text = checkpoint.groups()
+                actual = evaluate(term)
+                expected = json.loads(expected_text)
+                self.assertEqual(actual, expected, line)
+                actual_kind = ("Boolean" if isinstance(actual, bool) else
+                               "Text" if isinstance(actual, str) else "Integer")
+                self.assertEqual(kind, actual_kind, line)
+                label = json.loads(label_text)
+                self.assertEqual(label, f"maps:{seed}:{len(observed)}")
+                displayed = actual if isinstance(actual, str) else fuzz.literal(actual)
+                observed.append(f"{label}={displayed}")
+                continue
+
+            creation = re.fullmatch(
+                r'let (\w+) = FuzzKey \{ label: (.+); number: (-?\d+) \}', line)
+            if creation:
+                name, label, number = creation.groups()
+                records[name] = [text(label), int(number)]
+                continue
+            sequence = re.fullmatch(r'let (value\d*|saved\d*) = \[(.+)\]', line)
+            if sequence:
+                sequences[sequence.group(1)] = [text(sequence.group(2))]
+                continue
+            if line == "let table: Map<FuzzKey, List<Text>> = Map()":
+                maps["table"] = {}
+                continue
+            if line == "let tableAlias = table":
+                maps["tableAlias"] = maps["table"]
+                continue
+            if line == "let names: Set<FuzzKey> = Set()":
+                sets["names"] = set()
+                continue
+            if line == "let namesAlias = names":
+                sets["namesAlias"] = sets["names"]
+                continue
+            if line == "let evaluation = Map<Text, Text>()":
+                text_maps["evaluation"] = {}
+                continue
+            evaluation_store = re.fullmatch(
+                r'evaluation\[("(?:[^"\\]|\\.)*")\] = (.+)', line)
+            if evaluation_store:
+                text_maps["evaluation"][json.loads(evaluation_store.group(1))] = text(
+                    evaluation_store.group(2))
+                continue
+            if line == 'evaluation[evaluation["key"]] = fuzzReset(evaluation)':
+                frozen_text_key = text_maps["evaluation"]["key"]
+                text_maps["evaluation"].clear()
+                text_maps["evaluation"][frozen_text_key] = "after!"
+                continue
+            assignment = re.fullmatch(
+                r'(table|tableAlias)\[(.+)\] = (value\d*|saved\d*)', line)
+            if assignment:
+                container, argument, sequence_name = assignment.groups()
+                maps[container][key(argument)] = sequences[sequence_name]
+                continue
+            addition = re.fullmatch(r'(names|namesAlias)\.add\((.+)\)', line)
+            if addition:
+                sets[addition.group(1)].add(key(addition.group(2)))
+                continue
+            mutation = re.fullmatch(r'(\w+)\.(label|number) = (.+)', line)
+            if mutation:
+                name, field, value = mutation.groups()
+                records[name][0 if field == "label" else 1] = (
+                    text(value) if field == "label" else int(value))
+                continue
+            saved = re.fullmatch(
+                r'let (saved\d*) = (table|tableAlias)\[(.+)\]', line)
+            if saved:
+                name, container, argument = saved.groups()
+                sequences[name] = maps[container][key(argument)]
+                continue
+            clear = re.fullmatch(r'(table|tableAlias|names|namesAlias)\.clear\(\)', line)
+            if clear:
+                name = clear.group(1)
+                (maps[name] if name in maps else sets[name]).clear()
+                continue
+            sequence_store = re.fullmatch(r'(\w+)\[0\] = (.+)', line)
+            if sequence_store and sequence_store.group(1) in sequences:
+                sequences[sequence_store.group(1)][0] = text(sequence_store.group(2))
+                continue
+            self.fail(f"unmodeled map operation: {line}")
+
+        self.assertEqual(observed, block.expected)
+        source = "\n".join(block.body)
+        self.assertIn("let tableAlias = table", source)
+        self.assertIn("let namesAlias = names", source)
+        self.assertIn('label: "ke" + "y"', source)
+        self.assertRegex(source, r'key\d+\.label = "changed-')
+        self.assertIn('evaluation[evaluation["key"]] = fuzzReset(evaluation)', source)
+        self.assertRegex(source, r"tableAlias\.remove\(FuzzKey \{")
+        self.assertRegex(source, r"tableAlias\[FuzzKey \{")
+        self.assertGreaterEqual(source.count("tableAlias.clear()"), 2)
+        self.assertIn("namesAlias.clear()", source)
+        self.assertRegex(source, r"saved\d+\[0\] = \"saved-")
+        rendered, _ = fuzz.render([fuzz.Case("maps", seed, 1)])
+        self.assertIn("record FuzzKey { label: Text; number: Integer }", rendered)
+        self.assertIn("function fuzzReset(table: Map<Text, Text>): Text", rendered)
+
+    def test_map_check_identity_is_stable_while_size_shrinks(self):
+        seed = 0x20261020
+        small = fuzz.generate_case(fuzz.Case("maps", seed, 1))
+        large = fuzz.generate_case(fuzz.Case("maps", seed, 12))
+
+        def checks(block):
+            result = {}
+            for line in block.body:
+                match = re.fullmatch(
+                    r'check(Integer|Text|Boolean)\((.*), (.+), '
+                    r'("(?:[^"\\]|\\.)*")\)', line)
+                if match:
+                    result[json.loads(match.group(4))] = match.groups()[:3]
+            return result
+
+        small_checks = checks(small)
+        large_checks = checks(large)
+        self.assertTrue(small_checks)
+        self.assertEqual(small_checks, {label: large_checks[label] for label in small_checks})
 
 
 class FingerprintTests(unittest.TestCase):
