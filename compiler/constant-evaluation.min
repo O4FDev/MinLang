@@ -1,0 +1,306 @@
+// Evaluate only scalar Integer expressions. The resulting declarations still use
+// ordinary literal substitution: no getter, allocation or initializer is emitted.
+// Keep this implementation within stage0's arithmetic-only bootstrap language.
+record ConstantEvaluation {
+    kinds: List<Integer>
+    texts: List<Text>
+    lines: SourceMap
+    names: List<Text>
+    starts: List<Integer>
+    ends: List<Integer>
+    values: List<Integer>
+    states: List<Integer>
+}
+
+function constantEvaluationLimit(evaluation: ConstantEvaluation, location: Integer, depth: Integer) {
+    if depth > 128 { failAtToken(evaluation.lines, location, "a compile-time constant expression is nested too deeply") }
+}
+
+function constantIntegerLiteral(evaluation: ConstantEvaluation, position: Integer, negative: Boolean): Integer {
+    let digits = checkedIntegerLiteral(evaluation.texts[position], negative, evaluation.lines, position)
+    // Accumulate negatively so the minimum Integer never needs a positive
+    // magnitude that cannot fit in the compiler's own Integer type.
+    let value = 0
+    let digit = 0
+    while digit < digits.length {
+        value = value * 10 - (Integer(digits[digit]) - 48)
+        digit = digit + 1
+    }
+    if negative { return value }
+    return 0 - value
+}
+
+function constantOverflow(evaluation: ConstantEvaluation, location: Integer) {
+    failAtToken(evaluation.lines, location, "Integer overflow in a compile-time constant")
+}
+
+function constantBitwiseLimb(left: Integer, right: Integer, operator: Text): Integer {
+    let result = 0
+    let place = 1
+    let bit = 0
+    while bit < 32 {
+        let a = left % 2
+        let b = right % 2
+        let set = a == 1 && b == 1
+        if operator == "|" { set = a == 1 || b == 1 }
+        if operator == "^" { set = a != b }
+        if set { result = result + place }
+        left = left / 2
+        right = right / 2
+        place = place * 2
+        bit = bit + 1
+    }
+    return result
+}
+
+function constantBitwise(left: Integer, right: Integer, operator: Text): Integer {
+    let base = 4294967296
+    let leftLow = left % base
+    let rightLow = right % base
+    let leftHigh = left / base
+    let rightHigh = right / base
+    if leftLow < 0 { leftLow = leftLow + base; leftHigh = leftHigh - 1 }
+    if rightLow < 0 { rightLow = rightLow + base; rightHigh = rightHigh - 1 }
+    if leftHigh < 0 { leftHigh = leftHigh + base }
+    if rightHigh < 0 { rightHigh = rightHigh + base }
+    let low = constantBitwiseLimb(leftLow, rightLow, operator)
+    let high = constantBitwiseLimb(leftHigh, rightHigh, operator)
+    if high >= 2147483648 { high = high - base }
+    return high * base + low
+}
+
+function constantShift(evaluation: ConstantEvaluation, value: Integer, count: Integer, operator: Text, location: Integer): Integer {
+    if count < 0 || count > 63 { failAtToken(evaluation.lines, location, "a compile-time shift count must be between 0 and 63") }
+    let minimum = -9223372036854775807 - 1
+    let half = 4611686018427387904
+    let position = 0
+    while position < count {
+        if operator == ">>" {
+            let oddNegative = value < 0 && value % 2 != 0
+            value = value / 2
+            if oddNegative { value = value - 1 }
+        } else {
+            // LLVM shl wraps the shifted bits; it does not check arithmetic
+            // overflow. Split the sign boundary before doubling to match it.
+            if value >= half { value = (value - half) * 2 + minimum } else {
+                if value < 0 - half { value = (value + half) * 2 - minimum } else { value = value * 2 }
+            }
+        }
+        position = position + 1
+    }
+    return value
+}
+
+function constantBinary(evaluation: ConstantEvaluation, left: Integer, right: Integer, operator: Text, location: Integer): Integer {
+    let maximum = 9223372036854775807
+    let minimum = -9223372036854775807 - 1
+    if operator == "+" {
+        if (right > 0 && left > maximum - right) || (right < 0 && left < minimum - right) { constantOverflow(evaluation, location) }
+        return left + right
+    }
+    if operator == "-" {
+        if (right < 0 && left > maximum + right) || (right > 0 && left < minimum + right) { constantOverflow(evaluation, location) }
+        return left - right
+    }
+    if operator == "*" {
+        if left > 0 {
+            if (right > 0 && left > maximum / right) || (right < 0 && right < minimum / left) { constantOverflow(evaluation, location) }
+        } else {
+            if left < 0 {
+                if (right > 0 && left < minimum / right) || (right < 0 && left < maximum / right) { constantOverflow(evaluation, location) }
+            }
+        }
+        return left * right
+    }
+    if operator == "/" || operator == "%" {
+        if right == 0 { failAtToken(evaluation.lines, location, "division by zero in a compile-time constant") }
+        if left == minimum && right == -1 { constantOverflow(evaluation, location) }
+        if operator == "/" { return left / right }
+        return left % right
+    }
+    if operator == "<<" || operator == ">>" { return constantShift(evaluation, left, right, operator, location) }
+    return constantBitwise(left, right, operator)
+}
+
+function constantExpression(evaluation: ConstantEvaluation, cursor: List<Integer>, end: Integer, minimumLevel: Integer, depth: Integer): Integer {
+    constantEvaluationLimit(evaluation, cursor[0], depth)
+    let left = constantUnary(evaluation, cursor, end, depth + 1)
+    let level = operatorLevel(evaluation.kinds, evaluation.texts, cursor)
+    while cursor[0] < end && level >= minimumLevel && level >= 3 {
+        let location = cursor[0]
+        let operator = evaluation.texts[location]
+        cursor[0] = cursor[0] + 1
+        let right = constantExpression(evaluation, cursor, end, level + 1, depth + 1)
+        left = constantBinary(evaluation, left, right, operator, location)
+        level = operatorLevel(evaluation.kinds, evaluation.texts, cursor)
+    }
+    return left
+}
+
+function constantUnary(evaluation: ConstantEvaluation, cursor: List<Integer>, end: Integer, depth: Integer): Integer {
+    let location = cursor[0]
+    constantEvaluationLimit(evaluation, location, depth)
+    if location >= end { failAtToken(evaluation.lines, location, "expected an Integer expression in a compile-time constant") }
+    let token = evaluation.texts[location]
+    let kind = evaluation.kinds[location]
+    cursor[0] = location + 1
+    if kind == 2 { return constantIntegerLiteral(evaluation, location, false) }
+    if kind == 4 && (token == "-" || token == "~") {
+        if token == "-" && cursor[0] < end && evaluation.kinds[cursor[0]] == 2 {
+            let value = constantIntegerLiteral(evaluation, cursor[0], true)
+            cursor[0] = cursor[0] + 1
+            return value
+        }
+        let value = constantUnary(evaluation, cursor, end, depth + 1)
+        if token == "~" { return -1 - value }
+        if value == -9223372036854775807 - 1 { constantOverflow(evaluation, location) }
+        return 0 - value
+    }
+    if kind == 4 && token == "(" {
+        let value = constantExpression(evaluation, cursor, end, 3, depth + 1)
+        if cursor[0] >= end || evaluation.texts[cursor[0]] != ")" { failAtToken(evaluation.lines, location, "expected ')' in a compile-time constant") }
+        cursor[0] = cursor[0] + 1
+        return value
+    }
+    if kind == 1 {
+        let constant = findText(evaluation.names, token)
+        if constant < 0 { failAtToken(evaluation.lines, location, "compile-time constants may refer only to Integer constants; '" + readableDeclarationName(token) + "' is not an Integer constant") }
+        if evaluation.states[constant] == 3 { failAtToken(evaluation.lines, location, "compile-time Integer expressions cannot use a non-Integer constant") }
+        return evaluateIntegerConstant(evaluation, constant, depth + 1)
+    }
+    failAtToken(evaluation.lines, location, "a module constant needs a literal initializer or a compile-time Integer expression; use global NAME: Type = expression for runtime initialization")
+    return 0
+}
+
+function evaluateIntegerConstant(evaluation: ConstantEvaluation, constant: Integer, depth: Integer): Integer {
+    constantEvaluationLimit(evaluation, evaluation.starts[constant], depth)
+    if evaluation.states[constant] == 2 { return evaluation.values[constant] }
+    if evaluation.states[constant] == 1 { failAtToken(evaluation.lines, evaluation.starts[constant], "compile-time constant '" + readableDeclarationName(evaluation.names[constant]) + "' depends on itself") }
+    evaluation.states[constant] = 1
+    let cursor: List<Integer> = [evaluation.starts[constant]]
+    let value = constantExpression(evaluation, cursor, evaluation.ends[constant], 3, depth + 1)
+    if cursor[0] != evaluation.ends[constant] { failAtToken(evaluation.lines, cursor[0], "only Integer arithmetic and constant names are allowed in a compile-time constant expression") }
+    evaluation.states[constant] = 2
+    evaluation.values[constant] = value
+    return value
+}
+
+function constantInitializerEnd(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
+    let cursor: List<Integer> = [start]
+    skipTopLevelStatement(kinds, texts, cursor)
+    let end = cursor[0]
+    while end > start && kinds[end - 1] == 6 { end = end - 1 }
+    return end
+}
+
+function constantCopy(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, kind: Integer, text: Text, source: SourceMap, location: Integer) {
+    copyModuleToken(kinds, texts, lines, kind, text, source, location, sourcePath(lines, tokenPath(source, location)))
+}
+
+function constantEmitInteger(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, value: Integer, source: SourceMap, location: Integer) {
+    let literal = Text(value)
+    if value < 0 {
+        constantCopy(kinds, texts, lines, 4, "-", source, location)
+        literal = literal.slice(1, literal.length)
+    }
+    constantCopy(kinds, texts, lines, 2, literal, source, location)
+}
+
+function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): ResultTokenSet {
+    let names: List<Text> = []
+    let starts: List<Integer> = []
+    let ends: List<Integer> = []
+    let values: List<Integer> = []
+    let states: List<Integer> = []
+    let sizeStarts: List<Integer> = []
+    let sizeEnds: List<Integer> = []
+    let sizeValues: List<Integer> = []
+    let cursor: List<Integer> = [0]
+    skipTerminators(kinds, cursor)
+    while kinds[cursor[0]] != 0 {
+        let start = cursor[0]
+        if texts[start] == "constant" && kinds[start] == 1 && kinds[start + 1] == 1 {
+            let name = texts[start + 1]
+            let initializer = start + 2
+            while kinds[initializer] != 0 && kinds[initializer] != 6 && texts[initializer] != "=" { initializer = initializer + 1 }
+            if texts[initializer] == "=" {
+                initializer = initializer + 1
+                let end = constantInitializerEnd(kinds, texts, initializer)
+                let state = 0
+                if end == initializer + 1 {
+                    let kind = kinds[initializer]
+                    if kind == 3 || kind == 5 || kind == 7 || (kind == 1 && (texts[initializer] == "true" || texts[initializer] == "false")) { state = 3 }
+                }
+                if end == initializer + 2 && texts[initializer] == "-" && kinds[initializer + 1] == 7 { state = 3 }
+                if findText(names, name) >= 0 { failAtToken(lines, start + 1, "duplicate constant declaration '" + readableDeclarationName(name) + "'") }
+                names.add(name); starts.add(initializer); ends.add(end); values.add(0); states.add(state)
+            }
+        }
+        if kinds[start] == 1 && (texts[start] == "record" || texts[start] == "function") {
+            if texts[start] == "record" {
+                let header = start + 1
+                let native = false
+                while kinds[header] != 0 && texts[header] != "{" {
+                    if texts[header] == "native" { native = true }
+                    header = header + 1
+                }
+                if native && texts[header] == "{" {
+                    let field = header + 1
+                    while kinds[field] != 0 && texts[field] != "}" {
+                        if texts[field] == ":" && texts[field + 1] == "Bytes" && texts[field + 2] == "[" {
+                            let end = field + 3
+                            while kinds[end] != 0 && kinds[end] != 6 && texts[end] != "]" && texts[end] != "}" { end = end + 1 }
+                            if texts[end] == "]" { sizeStarts.add(field + 3); sizeEnds.add(end); sizeValues.add(0) }
+                            field = end
+                        }
+                        field = field + 1
+                    }
+                }
+            }
+            skipDeclaration(kinds, texts, cursor)
+        } else { skipTopLevelStatement(kinds, texts, cursor) }
+        skipTerminators(kinds, cursor)
+    }
+    if starts.length == 0 && sizeStarts.length == 0 { return ResultTokenSet { kinds: kinds, texts: texts, lines: lines } }
+    let evaluation = ConstantEvaluation { kinds: kinds, texts: texts, lines: lines, names: names, starts: starts, ends: ends, values: values, states: states }
+    let constant = 0
+    while constant < names.length {
+        if states[constant] != 3 { let ignored = evaluateIntegerConstant(evaluation, constant, 0) }
+        constant = constant + 1
+    }
+    let size = 0
+    while size < sizeStarts.length {
+        let sizeCursor: List<Integer> = [sizeStarts[size]]
+        let value = constantExpression(evaluation, sizeCursor, sizeEnds[size], 3, 0)
+        if sizeCursor[0] != sizeEnds[size] { failAtToken(lines, sizeCursor[0], "a C-layout byte array needs a compile-time Integer length") }
+        if value <= 0 || value > 1073741824 { failAtToken(lines, sizeStarts[size], "a C-layout byte array length must be between 1 and 1073741824") }
+        sizeValues[size] = value
+        size = size + 1
+    }
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    outputLines.features = lines.features
+    outputLines.diagnosticPath = lines.diagnosticPath
+    let position = 0
+    constant = 0
+    size = 0
+    while position < kinds.length {
+        if constant < starts.length && position == starts[constant] && states[constant] == 2 {
+            constantEmitInteger(outputKinds, outputTexts, outputLines, values[constant], lines, position)
+            position = ends[constant]
+            constant = constant + 1
+        } else {
+            if size < sizeStarts.length && position == sizeStarts[size] {
+                constantEmitInteger(outputKinds, outputTexts, outputLines, sizeValues[size], lines, position)
+                position = sizeEnds[size]
+                size = size + 1
+            } else {
+                constantCopy(outputKinds, outputTexts, outputLines, kinds[position], texts[position], lines, position)
+                position = position + 1
+            }
+            if constant < starts.length && position >= ends[constant] { constant = constant + 1 }
+        }
+    }
+    return ResultTokenSet { kinds: outputKinds, texts: outputTexts, lines: outputLines }
+}

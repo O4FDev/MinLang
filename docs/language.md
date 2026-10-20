@@ -198,7 +198,7 @@ included.
 Function declarations cannot use a [reserved built-in name](#reserved-function-names).
 The compiler identifies the colliding name and suggests a rename.
 
-At module scope, `constant` declares a literal value that every function in the module
+At module scope, `constant` declares a compile-time value that every function in the module
 can use. It is a declaration, like a function or record, and `public` exports
 it from a module:
 
@@ -209,8 +209,25 @@ constant TITLE = "Minyarcraft"
 ```
 
 A literal value may omit its type annotation: an Integer, Float, Text,
-Character or Boolean, optionally negated. A module constant cannot execute
-initialization code. Use an explicit immutable `global` binding for runtime
+Character or Boolean, optionally negated. Integer constants also accept
+arithmetic, parentheses, bitwise operators and other Integer constants,
+including forward references and public constants from imported modules:
+
+```minyar
+constant PAGE_BYTES = 1 << 12
+constant HEADER_BYTES = 14 + 20 + 8
+constant PAYLOAD_BYTES = PAGE_BYTES - HEADER_BYTES
+```
+
+These expressions run in the compiler. Their results become ordinary literals;
+they allocate nothing and need no startup code. Arithmetic has the same checked
+64-bit limits as an ordinary Integer expression. Invalid shifts, division by
+zero, overflow, recursive dependencies and expressions deeper than the compiler's
+128-level limit are compile errors. A native record's `Bytes[expression]` field
+length can use the same expressions and constants. Functions, mutable globals
+and allocation are not available during constant evaluation.
+
+A module constant cannot execute initialization code. Use an explicit immutable `global` binding for runtime
 initialization. A nonliteral global initializer requires a type annotation:
 
 ```minyar
@@ -227,6 +244,61 @@ constants are substituted directly and cannot cause initialization side effects.
 The binding cannot be reassigned. A List, Bytes or record value retains its usual
 mutable alias semantics; initialize lookup tables once and share them within the
 owning domain. Normal return from the executable entry releases the module roots.
+
+## Contracts
+
+A function can describe the conditions it needs and the promises it makes:
+
+```minyar
+function share(light: Integer, people: Integer): Integer
+    requires(light >= 0)
+    requires(people > 0)
+    ensures(result >= 0 && result <= light) {
+    return light / people
+}
+```
+
+`requires(condition)` checks entry, before the body runs. `ensures(condition)`
+checks every normal return, including an error returned by `try`. In an ensures
+clause, `result` is the returned value. A function returning Nothing can make
+promises about its parameters without naming a result. Conditions must be Boolean.
+Clauses can repeat and span lines. Functions and record methods can both use
+them, including generic functions.
+
+`invariant(condition)` checks both entry and normal return. On a method, it can
+describe the state that an operation must preserve:
+
+```minyar
+record Lantern { light: Integer }
+
+function Lantern.share(amount: Integer)
+    requires(amount >= 0 && amount <= self.light)
+    invariant(self.light >= 0) {
+    self.light -= amount
+}
+```
+
+These are function boundary invariants; they do not watch individual field
+assignments or loop iterations. Entry clauses run in header order, omitting
+ensures; exit clauses run in header order, omitting requires. Scalar parameters
+in exit conditions retain their entry values. Reference parameters and `self`
+observe the body's changes. A body runs once and its return value is evaluated
+once. A failed check stops with its clause, source expression and file:line:column.
+An abort, `fail` or process exit does not run exit contracts.
+
+Default and debug builds check contracts. Tests check them even with `--release`.
+Ordinary release builds remove the clauses before name resolution and code
+generation, including their calls, literals and wrapper functions. A release
+contract therefore has no runtime cost. An enabled contract costs its predicate
+computations and branches, plus an ordinary wrapper call and the usual ownership
+work for its arguments and result; LLVM may inline these. Predicates may call
+ordinary functions, so write them without side effects that the program needs.
+They are debug checks, not validation for untrusted input.
+
+The words `requires`, `ensures` and `invariant` are contextual in function headers;
+existing functions, fields and local variables with those names keep working.
+Put entry-point checks on a function called by `main`. Native functions need an
+ordinary Minyar wrapper to add contracts.
 
 ## Loops
 

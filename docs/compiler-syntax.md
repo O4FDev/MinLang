@@ -20,6 +20,14 @@ Derived operation wrappers call the checked concrete methods. Call-effect and
 cooperative-recovery hooks run at each actual operator or collection use, even
 when an operation wrapper was already emitted for another function.
 
+Enabled header contracts become ordinary wrapper and body functions before
+module qualification. Their synthetic checks retain each clause's original
+source span. Release removes the clauses before feature discovery; test mode
+keeps them. Compile-time Integer expressions fold to literal tokens before
+typed declaration discovery, preserving their source origins. Raw incremental
+state signatures include the contract profile, as does the native cache driver,
+so changing profiles cannot reuse a function compiled with different checks.
+
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations
 again. Initial record and constant name collection also walks those nodes in

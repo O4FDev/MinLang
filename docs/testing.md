@@ -43,6 +43,18 @@ stateful List controls. One named regression can run with
 `make check-regressions-case CHECK_REGRESSION_CASE=Regressions.test_integer_boundaries`;
 missing or unknown case names fail instead of selecting an empty suite.
 
+`make check-language-contracts` checks function preconditions, postconditions and
+boundary invariants at O0/O2 with the ownership oracle. It covers methods,
+generics, early and propagated returns, parameter/result shadowing, imported
+source locations, Boolean rejections and release removal of predicates,
+literals, wrappers and runtime features. Release test mode keeps checks enabled.
+`check-language-contracts-sanitize` instruments the compiler and generated code.
+
+`make check-compile-time-constants` checks Integer constant arithmetic and bitwise
+evaluation, forward/imported references, native byte-array sizes, overflow,
+invalid shifts, zero division and recursive dependencies. O0/O2 and emitted LLVM
+checks distinguish literal substitution from runtime initialization.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery

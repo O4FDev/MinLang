@@ -1,0 +1,218 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function assertStatic(compiler: test.Compiler) {
+    let llvm = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    test.check(!test.contains(llvm, "@.minyar.constants.initialize"), "compile-time constants emitted runtime initialization")
+    test.check(!test.contains(llvm, "minyar.constant|"), "compile-time constants emitted a runtime getter")
+}
+
+function incrementalConstants(compiler: test.Compiler) {
+    // Constants and native layouts deliberately use the whole-module fallback.
+    // Repeat and edit through both public incremental entry points, in both
+    // profiles, so neither a stale summary nor a stale body can hide folding.
+    for family in ["scalar", "native-size"] {
+        for mode in ["state", "driver"] {
+            for profile in ["debug", "release"] {
+                let directory = compiler.directory + "/" + family + "-" + mode + "-" + profile
+                test.check(files.makeDirectory(directory) == 0, "make incremental constant fixture")
+                let leaf = directory + "/values.min"
+                let entry = directory + "/main.min"
+                let prior = directory + "/prior.state"
+                let next = directory + "/next.state"
+                let stats = directory + "/stats"
+                let source = "public constant SIZE = 1 << 6\npublic function value(): Integer { return SIZE }\n"
+                let edited = test.replace(source, "1 << 6", "1 << 7")
+                let expected = "64\n"
+                let editedExpected = "128\n"
+                if family == "native-size" {
+                    source = "public record Buffer native \"c\" { payload: Bytes[2 * (3 + 4)] }\npublic function value(): Integer { return sizeOf(Buffer) }\n"
+                    edited = test.replace(source, "3 + 4", "4 + 4")
+                    expected = "14\n"
+                    editedExpected = "16\n"
+                }
+                io.writeTextFile(leaf, source)
+                io.writeTextFile(entry, "use \"./values.min\" as values\nprint(values.value())\n")
+                io.writeTextFile(prior, "")
+                for phase in ["cold", "repeat", "edit"] {
+                    if phase == "edit" { io.writeTextFile(leaf, edited); expected = editedExpected }
+                    let path = directory + "/" + phase
+                    let command = [compiler.executable, entry, path + ".ll", "--module-state", prior, next, stats]
+                    if mode == "driver" { command = ["./build/minyar-module-build", compiler.executable, entry, path + ".ll", directory + "/cache", stats] }
+                    command.add("--library"); command.add("library")
+                    if profile == "release" { command.add("--release") }
+                    test.require(test.run(command, system.environment(), "", path + ".compile", compiler.compileTimeout), "incremental constants " + family + " " + mode + " " + profile + " " + phase)
+                    let fields = test.words(io.readTextFile(stats))
+                    test.check(fields.length == 7 && fields[0] == "0" && fields[4] == "0" && fields[5] == "0" && fields[6] == "false", "constant expression bypassed the whole-module fallback")
+                    if mode == "state" {
+                        test.check(files.pathSize(next) == 0, "constant fallback published a reusable summary")
+                        io.writeTextFile(prior, io.readTextFile(next))
+                    }
+                    let llvm = io.readTextFile(path + ".ll")
+                    test.check(!test.contains(llvm, "@.minyar.constants.initialize") && !test.contains(llvm, "minyar.constant|"), "incremental constants emitted runtime initialization")
+                    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+                    for optimization in ["-O0", "-O2"] {
+                        let link = [compiler.clang, optimization, "-Wno-override-module"]
+                        for flag in compiler.flags { link.add(flag) }
+                        for argument in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { link.add(argument) }
+                        test.require(test.run(link, system.environment(), "", path + ".link", compiler.linkTimeout), "link incremental constants")
+                        let observed = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+                        test.require(observed, "run incremental constants")
+                        test.check(observed.output == expected && observed.errorOutput == "", "incremental constants reused stale values\n" + observed.output + observed.errorOutput)
+                    }
+                }
+            }
+        }
+    }
+}
+
+let compiler = test.compiler()
+test.executes(compiler, #"""
+constant WINDOW = PAGE * 4
+constant PAGE: Integer = 1 << 12
+constant MASK = PAGE - 1
+constant ANSWER = (2 + 3 * 4) * 3
+constant ASSOCIATIVE = 100 / 5 / 2 - 2 - 1
+constant LOW = -9223372036854775808
+constant HIGH = 9223372036854775807
+constant ZERO = LOW - LOW
+constant OPPOSITE = ~LOW
+constant SIGN = 1 << 63
+constant NEGATIVE = -9 / 2
+constant REMAINDER = -9 % 2
+constant WORD = 0xF0 | 0x0A
+constant MODE = 0o700 | 0o055
+constant TITLE = "packet sizes"
+constant MARK = 'P'
+constant READY = true
+constant SCALE = -1.5
+function window(): Integer { return WINDOW }
+function main(): Integer {
+    print(window())
+    print(MASK)
+    print(ANSWER)
+    print(ASSOCIATIVE)
+    print(LOW)
+    print(HIGH)
+    print(ZERO)
+    print(OPPOSITE)
+    print(SIGN)
+    print(NEGATIVE)
+    print(REMAINDER)
+    print(WORD)
+    print(MODE)
+    print(TITLE)
+    print(MARK)
+    print(READY)
+    print(SCALE)
+    constant local = 20 + 22
+    print(local)
+    return 0
+}
+
+"""#, "16384\n4095\n42\n7\n-9223372036854775808\n9223372036854775807\n0\n9223372036854775807\n-9223372036854775808\n-4\n-1\n250\n493\npacket sizes\nP\ntrue\n-1.5\n42\n")
+assertStatic(compiler)
+let folded = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(test.contains(folded, "ret i64 16384"), "constant function did not return a folded literal")
+
+test.executes(compiler, #"""
+constant LOW = -9223372036854775808
+constant HIGH = 9223372036854775807
+constant EDGE1 = LOW * 1
+constant EDGE2 = 1 * LOW
+constant EDGE3 = HIGH + LOW
+constant EDGE4 = LOW - LOW
+constant EDGE5 = -3037000499 * -3037000499
+constant EDGE6 = 0 - HIGH
+constant EDGE7 = LOW / 1
+constant EDGE8 = LOW % 1
+print(EDGE1)
+print(EDGE2)
+print(EDGE3)
+print(EDGE4)
+print(EDGE5)
+print(EDGE6)
+print(EDGE7)
+print(EDGE8)
+"""#, "-9223372036854775808\n-9223372036854775808\n-1\n0\n9223372030926249001\n-9223372036854775807\n-9223372036854775808\n0\n")
+assertStatic(compiler)
+
+// Compare folded bitwise results with runtime operations over signed operands.
+for operator in ["&", "|", "^", "<<", ">>"] {
+    let pairs = [[0, 0], [1, 63], [-1, 1], [9223372036854775807, 31], [-9223372036854775808, 63], [-4294967297, 32], [4611686018427387904, 2]]
+    if operator == "&" || operator == "|" || operator == "^" { pairs.add([-4294967297, -9223372036854775808]); pairs.add([9223372036854775807, -1]) }
+    let pieces: List<Text> = ["function operation(left: Integer, right: Integer): Integer { return left " + operator + " right }\n"]
+    for index in 0..pairs.length {
+        let left = Text(pairs[index][0])
+        let right = Text(pairs[index][1])
+        pieces.add("constant VALUE" + Text(index) + " = " + left + " " + operator + " " + right + "\n")
+        pieces.add("if VALUE" + Text(index) + " != operation(" + left + ", " + right + ") { fail(\"constant bitwise operation differs\") }\n")
+    }
+    pieces.add("print(42)\n")
+    test.executes(compiler, joinText(pieces), "42\n")
+    assertStatic(compiler)
+}
+
+io.writeTextFile(compiler.directory + "/sizes.min", #"""
+public constant PACKET = HEADER + PAYLOAD
+constant HEADER = 20 + 8
+public constant PAYLOAD = (1 << 10) - 28
+public constant EMPTY = 0
+"""#)
+for module in ["left", "right"] {
+    io.writeTextFile(compiler.directory + "/" + module + ".min", "use \"./sizes.min\" as sizes\npublic function packetSize(): Integer { return sizes.PACKET }\n")
+}
+test.executes(compiler, #"""
+use "./sizes.min" as sizes
+use "./left.min" as left
+use "./right.min" as right
+constant DOUBLE = sizes.PACKET * 2
+record Frame native "c_packed" {
+    kind: UInt8
+    payload: Bytes[DOUBLE - sizes.PACKET]
+}
+print(left.packetSize())
+print(right.packetSize())
+print(DOUBLE)
+print(sizeOf(Frame))
+print(offsetOf(Frame, "payload"))
+"""#, "1024\n1024\n2048\n1025\n1\n")
+assertStatic(compiler)
+
+test.executes(compiler, "record Packet native \"c\" { data: Bytes[2 * (3 + 4)] }\nprint(sizeOf(Packet))\n", "14\n")
+test.executes(compiler, "\"function\"\n\"record\"\nconstant VALUE = 6 * 7\nprint(VALUE)\n", "42\n")
+test.executes(compiler, io.readTextFile("examples/gallery/packet-constants.min"), "Ethernet payload: 1500\nIPv4 payload: 1480\nUDP payload: 1472\nPage mask: 4095\n")
+assertStatic(compiler)
+
+for expression in ["9223372036854775807 + 1", "-9223372036854775808 - 1", "-(-9223372036854775808)", "9223372036854775807 * 2", "-9223372036854775808 * -1", "-1 * -9223372036854775808", "-4611686018427387905 * 2", "2 * -4611686018427387905", "-9223372036854775808 / -1", "-9223372036854775808 % -1"] {
+    test.rejects(compiler, "constant BAD = " + expression + "\n", "Integer overflow in a compile-time constant")
+}
+for expression in ["1 / 0", "1 % (2 - 2)"] {
+    test.rejects(compiler, "constant BAD = " + expression + "\n", "division by zero in a compile-time constant")
+}
+for expression in ["1 << -1", "1 >> 64"] {
+    test.rejects(compiler, "constant BAD = " + expression + "\n", "a compile-time shift count must be between 0 and 63")
+}
+test.rejects(compiler, "constant FIRST = SECOND + 1\nconstant SECOND = FIRST - 1\n", "depends on itself")
+test.rejects(compiler, "constant SELF = SELF\n", "depends on itself")
+test.rejects(compiler, "constant BAD = MISSING + 1\n", "may refer only to Integer constants")
+test.rejects(compiler, "global VALUE: Integer = 1 + 1\nconstant BAD = VALUE + 1\n", "may refer only to Integer constants")
+test.rejects(compiler, "constant NAME = \"packet\"\nconstant BAD = NAME + 1\n", "cannot use a non-Integer constant")
+test.rejects(compiler, "constant BAD = value()\nfunction value(): Integer { print(1); return 2 }\n", "may refer only to Integer constants")
+test.rejects(compiler, "constant BAD = [1, 2]\n", "a module constant needs a literal initializer")
+test.rejects(compiler, "constant BAD: Float = 1 + 2\n", "is Integer, not Float")
+test.rejects(compiler, "constant BAD = 1 == 1\n", "only Integer arithmetic and constant names")
+test.rejects(compiler, "constant BAD = (1 + 2\n", "expected ')'")
+test.rejects(compiler, "constant LENGTH = 0\nrecord Packet native \"c\" { data: Bytes[LENGTH] }\n", "a C-layout byte array length must be between 1 and 1073741824")
+test.rejects(compiler, "record Packet native \"c\" { data: Bytes[1073741824 + 1] }\n", "a C-layout byte array length must be between 1 and 1073741824")
+let nesting = ""
+for index in 0..160 { nesting += "(" }
+nesting += "1"
+for index in 0..160 { nesting += ")" }
+test.rejects(compiler, "constant BAD = " + nesting + "\n", "nested too deeply")
+
+if system.getenv("OS") != "Windows_NT" { incrementalConstants(compiler) }
+test.removeTree(compiler.directory)
+print("Compile-time constants: passed")

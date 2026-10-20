@@ -1,0 +1,364 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "files" as files
+use "system" as system
+
+function compileWith(compiler: test.Compiler, source: Text, options: List<Text>): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", test.sourceModules(source))
+    let command = [compiler.executable, path + ".min", path + ".ll", "--library", "library"]
+    for option in options { command.add(option) }
+    let result = test.run(command, system.environment(), "", path + ".compile", 30)
+    if result.status == 0 && test.addressEnabled(compiler.flags) {
+        io.writeTextFile(path + ".ll", test.instrument(io.readTextFile(path + ".ll")))
+    }
+    return result
+}
+
+function runCompiled(compiler: test.Compiler, level: Text): test.Result {
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let command = [compiler.clang, level, "-Wno-override-module"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".link", 60), "link contracts " + level)
+    return test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text, options: List<Text>) {
+    test.require(compileWith(compiler, source, options), "compile contracts")
+    for level in ["-O0", "-O2"] {
+        let result = runCompiled(compiler, level)
+        test.require(result, "execute contracts " + level)
+        test.check(result.output == expected, "contracts output " + level + "\n" + result.output)
+        test.check(result.errorOutput == "", "contracts stderr " + level + "\n" + result.errorOutput)
+    }
+}
+
+function fails(compiler: test.Compiler, source: Text, kind: Text, line: Integer, expected: Text, options: List<Text>) {
+    test.require(compileWith(compiler, source, options), "compile failing " + kind)
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for level in ["-O0", "-O2"] {
+        let result = runCompiled(compiler, level)
+        test.check(result.status == 1 && result.output == expected, "failing " + kind + " status/output " + level + "\n" + result.output + result.errorOutput)
+        test.check(test.contains(result.errorOutput, kind + " contract failed"), "failing contract names its clause\n" + result.errorOutput)
+        test.check(test.contains(result.errorOutput, path + ".min:" + Text(line) + ":"), "failing contract keeps its original source line\n" + result.errorOutput)
+    }
+}
+
+function definitions(ir: Text): Integer {
+    let count = 0
+    for line in test.lines(ir) { if line.startsWith("define ") { count += 1 } }
+    return count
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+fixtures.validate("LanguageContracts", ["boundaries", "ownership", "names", "failures", "rejections", "release", "incremental", "gallery"])
+
+// Every successful execution uses the exact ownership/debt oracle, including
+// release builds. Explicit contract failures use its exit-status exception.
+let engine = runtime.cycleSource(io.readTextFile("runtime/minyar_runtime.c"))
+let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+io.writeTextFile(compiler.directory + "/runtime.c", contract)
+compiler.runtime = compiler.directory + "/runtime.o"
+let runtimeBuild = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", compiler.directory + "/runtime.c", "-o", compiler.runtime]
+for flag in compiler.flags { runtimeBuild.add(flag) }
+test.require(test.run(runtimeBuild, system.environment(), "", compiler.directory + "/runtime-build", 60), "build exact contracts ownership runtime")
+
+if fixtures.selected("LanguageContracts", "boundaries") {
+    executes(compiler, #"""
+        global events: List<Text> = []
+        function note(label: Text): Boolean { events.add(label); return true }
+        function argument(): Integer { events.add("argument"); return 8 }
+        function half(value: Integer): Integer
+            requires(note("requires first"))
+            requires(value >= 0 && note("requires second"))
+            ensures(result == value / 2 && note("ensures first"))
+            ensures(note("ensures second")) {
+            events.add("body")
+            if value == 8 { return value / 2 }
+            return 0
+        }
+        print(half(argument()))
+        for event in events { print(event) }
+        """#, "4\nargument\nrequires first\nrequires second\nbody\nensures first\nensures second\n", [])
+
+    executes(compiler, #"""
+        global events: List<Text> = []
+        function note(): Boolean { events.add("invariant"); return true }
+        function finish(early: Boolean) invariant(note()) {
+            events.add("body")
+            if early { return }
+            events.add("end")
+        }
+        finish(true)
+        finish(false)
+        for event in events { print(event) }
+        """#, "invariant\nbody\ninvariant\ninvariant\nbody\nend\ninvariant\n", [])
+
+    executes(compiler, #"""
+        function reset(value: Integer): Integer requires(value == 42) ensures(value == 42 && result == 0) {
+            value = 0
+            return value
+        }
+        function welcome(names: List<Text>) requires(names.length == 0) ensures(names.length == 1) {
+            names.add("Ada")
+        }
+        let names: List<Text> = []
+        welcome(names)
+        print(reset(42))
+        print(names[0])
+        """#, "0\nAda\n", [])
+
+    executes(compiler, #"""
+        function first<Item>(values: List<Item>): Item requires(values.length > 0) ensures(true) { return values[0] }
+        record Lantern { light: Integer }
+        function Lantern.share(count: Integer): Integer
+            requires(count > 0 && count <= self.light)
+            invariant(self.light >= 0)
+            ensures(result == count) {
+            self.light -= count
+            return count
+        }
+        let lantern = Lantern { light: 10 }
+        print(first([42, 7]))
+        print(first<Text>(["harbour", "home"]))
+        print(lantern.share(3))
+        print(lantern.light)
+        """#, "42\nharbour\n3\n7\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "ownership") {
+    executes(compiler, #"""
+        function greet(name: Text): Text requires(name.length > 0) ensures(result.length > name.length) {
+            let pieces = ["Hello", name]
+            if name == "Ada" { return pieces[0] + ", " + pieces[1] }
+            return "Welcome, " + name
+        }
+        function pair(values: List<Text>): List<Text>
+            requires(values.length == 1)
+            ensures(result.length == 2 && result[1] == values[0]) {
+            let names = ["North"]
+            names.add(values[0])
+            return names
+        }
+        record Letter { message: Text }
+        function letter(name: Text): Letter ensures(result.message.length > name.length) {
+            let owned = [Bytes(64)]
+            return Letter { message: greet(name) + "!" }
+        }
+        print(letter("A" + "da").message)
+        let names = pair(["Star"])
+        print(names[0] + " " + names[1])
+        print(greet("Grace"))
+        """#, "Hello, Ada!\nNorth Star\nWelcome, Grace\n", [])
+
+    executes(compiler, #"""
+        global checked: List<Integer> = [0]
+        function postcondition(): Boolean { checked[0] += 1; return true }
+        function read(good: Boolean): Result<Integer, Text> { if good { return Ok(42) }; return Err("closed") }
+        function open(good: Boolean): Result<Integer, Text> ensures(postcondition()) {
+            let owned = [Bytes(64)]
+            let answer = try read(good)
+            return Ok(answer + owned.length - 1)
+        }
+        match open(true) { Ok(value) { print(value) } Err(error) { print(error) } }
+        match open(false) { Ok(value) { print(value) } Err(error) { print(error) } }
+        print(checked[0])
+        """#, "42\nclosed\n2\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "names") {
+    executes(compiler, #"""
+        function requires(value: Integer): Integer { return value + 1 }
+        function ensures(value: Integer): Integer { return value + 1 }
+        function invariant(value: Integer): Integer { return value + 1 }
+        function result(value: Integer): Integer { return value + 1 }
+        record Names { requires: Integer; ensures: Integer; invariant: Integer; result: Integer }
+        function scoped(): Integer {
+            let requires = 10
+            let ensures = 20
+            let invariant: (Integer) -> Integer = function(result) { return result + 12 }
+            return invariant(requires + ensures)
+        }
+        let names = Names { requires: 1; ensures: 2; invariant: 3; result: 4 }
+        print(result(invariant(ensures(requires(38)))))
+        print(scoped())
+        print(names.requires + names.ensures + names.invariant + names.result)
+        """#, "42\n42\n10\n", [])
+
+    executes(compiler, #"""
+        record Box { result: Integer }
+        function accepts(value: Integer, predicate: (Integer) -> Boolean): Boolean { return predicate(value) }
+        function shadow(result: Integer, box: Box): Integer
+            requires(result == 40)
+            invariant(result == 40)
+            ensures(result == 42)
+            ensures(box.result == 7)
+            ensures(accepts(7, function(result: Integer): Boolean { return result == box.result })) {
+            return result + 2
+        }
+        print(shadow(40, Box { result: 7 }))
+        """#, "42\n", [])
+
+    // The first function's name is token 1. Source identifiers matching both
+    // initial helper candidates must keep their ordinary function meaning.
+    executes(compiler, "function answer(): Integer ensures(result == 42) { return 42 }\nfunction minyar_contract_body_1(): Integer { return 7 }\nfunction minyar_contract_body_1_(): Integer { return 8 }\nprint(answer())\nprint(minyar_contract_body_1())\nprint(minyar_contract_body_1_())\n", "42\n7\n8\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "failures") {
+    fails(compiler, "function half(value: Integer): Integer\n    requires(value >= 0) { print(\"body ran\"); return value / 2 }\nprint(half(-1))\n", "requires", 2, "", [])
+    fails(compiler, "function half(value: Integer): Integer\n    ensures(result >= 0) { print(\"body ran\"); if value < 0 { return value }; return value / 2 }\nprint(half(-1))\n", "ensures", 2, "body ran\n", [])
+    fails(compiler, "record Lantern { light: Integer }\nfunction Lantern.dark()\n    invariant(self.light >= 0) { print(\"body ran\"); self.light = -1 }\nlet lantern = Lantern { light: -1 }\nlantern.dark()\n", "invariant", 3, "", [])
+    fails(compiler, "record Lantern { light: Integer }\nfunction Lantern.dark()\n    invariant(self.light >= 0) { print(\"body ran\"); self.light = -1 }\nlet lantern = Lantern { light: 1 }\nlantern.dark()\n", "invariant", 3, "body ran\n", [])
+
+    let imported = compiler.directory + "/promises.min"
+    io.writeTextFile(imported, "public function half(value: Integer): Integer\n    requires(value >= 0)\n    ensures(result >= 0) { return value / 2 }\n")
+    executes(compiler, "use \"./promises.min\" as promises\nprint(promises.half(8))\n", "4\n", [])
+    test.require(compileWith(compiler, "use \"./promises.min\" as promises\nprint(promises.half(-1))\n", []), "compile imported contract failure")
+    for level in ["-O0", "-O2"] {
+        let result = runCompiled(compiler, level)
+        test.check(result.status == 1 && result.output == "", "imported contract status/output " + level)
+        test.check(test.contains(result.errorOutput, "requires contract failed") && test.contains(result.errorOutput, imported + ":2:"), "imported contract keeps the declaring module's source line\n" + result.errorOutput)
+    }
+}
+
+if fixtures.selected("LanguageContracts", "rejections") {
+    for kind in ["requires", "ensures", "invariant"] {
+        let rejected = compileWith(compiler, "function wrong(): Integer " + kind + "(42) { return 0 }\nprint(wrong())\n", [])
+        let path = compiler.directory + "/case" + Text(compiler.serial)
+        test.check(rejected.status == 1 && rejected.output == "", "non-Boolean " + kind + " must reject")
+        test.check(test.contains(rejected.errorOutput, kind) && test.contains(rejected.errorOutput, "Boolean"), "non-Boolean " + kind + " diagnostic\n" + rejected.errorOutput)
+        test.check(test.contains(rejected.errorOutput, path + ".min:1:"), "non-Boolean contract keeps its location\n" + rejected.errorOutput)
+        test.check(files.pathSize(path + ".ll") < 0, "non-Boolean contract published LLVM")
+    }
+    fixtures.rejects(frontend, "function wrong(): Integer requires(result >= 0) { return 0 }\nprint(wrong())\n", "result", true)
+    fixtures.rejects(frontend, "function wrong(): Integer invariant(result >= 0) { return 0 }\nprint(wrong())\n", "result", true)
+    fixtures.rejects(frontend, "function wrong(): Integer { return result }\nprint(wrong())\n", "result", true)
+
+    for item in [
+        ["function clock(): Integer requires(true) { native \"system\" }\nprint(clock())\n", "contracts on native functions need an ordinary wrapper"],
+        ["function main(): Integer requires(true) { return 0 }\n", "put entry contracts on a function called by main"]
+    ] {
+        for release in [false, true] {
+            let options: List<Text> = []
+            if release { options.add("--release") }
+            let rejected = compileWith(compiler, item[0], options)
+            let path = compiler.directory + "/case" + Text(compiler.serial)
+            test.check(rejected.status == 1 && rejected.output == "", "unsupported contract boundary must reject")
+            test.check(test.contains(rejected.errorOutput, item[1]), "unsupported contract boundary diagnostic\n" + rejected.errorOutput)
+            test.check(test.contains(rejected.errorOutput, path + ".min:1:"), "unsupported contract boundary keeps its location\n" + rejected.errorOutput)
+            test.check(files.pathSize(path + ".ll") < 0, "unsupported contract boundary published LLVM")
+        }
+    }
+}
+
+if fixtures.selected("LanguageContracts", "release") {
+    // These names exist only in omitted predicates. Removing a contract removes
+    // its name resolution, literals, calls, and synthetic implementation too.
+    let source = "function answer(value: Integer): Integer\n    requires(removedRequires(\"requires-only-literal\"))\n    requires(startThread(neverDeclaredThread, 0) == 0)\n    ensures(removedEnsures(\"ensures-only-literal\", result))\n    invariant(removedInvariant(\"invariant-only-literal\")) { return value + 1 }\nprint(answer(41))\n"
+    executes(compiler, source, "42\n", ["--release"])
+    let release = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    for forbidden in ["removedRequires", "removedEnsures", "removedInvariant", "requires-only-literal", "ensures-only-literal", "invariant-only-literal", "contract failed", "startThread", "neverDeclaredThread", "minyar-thread-runtime", "minyar_thread_"] {
+        test.check(!test.contains(release, forbidden), "release retained omitted contract code/literal: " + forbidden)
+    }
+    executes(compiler, "function answer(value: Integer): Integer { return value + 1 }\nprint(answer(41))\n", "42\n", ["--release"])
+    let plain = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    test.check(definitions(release) == definitions(plain), "release retained a synthetic contract wrapper")
+
+    for kind in ["requires", "ensures", "invariant"] {
+        let checked = "function answer(): Integer\n    " + kind + "(false) { return 42 }\ntest \"contracts survive release test mode\" { print(answer()) }\nprint(answer())\n"
+        executes(compiler, checked, "42\n", ["--release"])
+        fails(compiler, checked, kind, 2, "", ["--release", "--test-mode"])
+        fails(compiler, checked, kind, 2, "", ["--test-mode", "--release"])
+    }
+
+    executes(compiler, "test \"excluded contracts need no checking\" {\n    function main() requires() { native \"not_a_library\" }\n}\nfunction answer(): Integer ensures(result == 42) { return 42 }\nprint(answer())\n", "42\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "gallery") {
+    let gallery = io.readTextFile("examples/gallery/contracts.min")
+    let expected = "North Star lends 3 lights to the harbour.\nNorth Star lends 2 lights to the village.\n5 lights remain for the way home.\n"
+    executes(compiler, gallery, expected, [])
+    executes(compiler, gallery, expected, ["--release"])
+}
+
+if fixtures.selected("LanguageContracts", "incremental") && system.getenv("OS") != "Windows_NT" {
+    let driver = test.setting("MINYAR_TEST_MODULE_DRIVER", "./build/minyar-module-build")
+    let entry = compiler.directory + "/cached-entry.min"
+    let imported = compiler.directory + "/cached-promises.min"
+    let cache = compiler.directory + "/contract-cache"
+    io.writeTextFile(entry, "use \"./cached-promises.min\" as promises\nprint(promises.positive(-1))\n")
+    io.writeTextFile(imported, "public function positive(value: Integer): Integer\n    requires(value >= 0 && \"cached-contract-only-literal\".length > 0)\n    ensures(result >= 0) { return value }\n")
+    let debugDefinitions = 0
+    // Cold/warm debug, cold/warm release, and warm debug again share exactly
+    // the same sources and cache directory. Profile switches must not reuse
+    // the other profile's code; warm counters also forbid silent fallback.
+    for phase in 0..5 {
+        compiler.serial += 1
+        let path = compiler.directory + "/case" + Text(compiler.serial)
+        let release = phase == 2 || phase == 3
+        let command = [driver, compiler.executable, entry, path + ".ll", cache, path + ".stats"]
+        if phase == 2 { command.add("--release") }
+        for option in ["--library", "library"] { command.add(option) }
+        if phase == 3 { command.add("--release") }
+        test.require(test.run(command, system.environment(), "", path + ".compile", 60), "compile cached contracts phase " + Text(phase))
+        let counters = test.words(io.readTextFile(path + ".stats"))
+        test.check(counters.length == 7, "cached contracts need complete build counters")
+        if phase == 0 || phase == 2 {
+            test.check(counters[0] == "0" && counters[1] == "2", "contract profile needs a cold two-module build")
+        } else {
+            test.check(counters[0] == "2" && counters[1] == "0", "contract profile needs a warm two-module cache hit")
+        }
+        let ir = io.readTextFile(path + ".ll")
+        if phase == 0 { debugDefinitions = definitions(ir) }
+        if release {
+            test.check(!test.contains(ir, "cached-contract-only-literal") && !test.contains(ir, "contract failed"), "cached release retained contract literals")
+            test.check(definitions(ir) < debugDefinitions, "cached release retained the contract implementation wrapper")
+        }
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(ir)) }
+        for level in ["-O0", "-O2"] {
+            let result = runCompiled(compiler, level)
+            if release {
+                test.check(result.status == 0 && result.output == "-1\n" && result.errorOutput == "", "cached release contracts output " + level + "\n" + result.output + result.errorOutput)
+            } else {
+                test.check(result.status == 1 && result.output == "", "cached debug contracts status/output " + level)
+                test.check(test.contains(result.errorOutput, "requires contract failed") && test.contains(result.errorOutput, imported + ":2:"), "cached debug contract keeps imported source coordinates\n" + result.errorOutput)
+            }
+        }
+    }
+
+    // The frontend's raw state protocol must also reject code cached under the
+    // opposite profile, even when no module driver chooses a cache namespace.
+    let prior = compiler.directory + "/direct-empty.state"
+    io.writeTextFile(prior, "")
+    for phase in 0..3 {
+        compiler.serial += 1
+        let path = compiler.directory + "/case" + Text(compiler.serial)
+        let release = phase == 1
+        let command = [compiler.executable, entry, path + ".ll", "--module-state", prior, path + ".state", path + ".stats", "--library", "library"]
+        if release { command.add("--release") }
+        test.require(test.run(command, system.environment(), "", path + ".compile", 60), "compile mixed-profile raw module state phase " + Text(phase))
+        prior = path + ".state"
+        let counters = test.words(io.readTextFile(path + ".stats"))
+        test.check(counters.length == 7 && counters[0] == "0" && counters[1] == "2", "raw module state reused code from another contract profile")
+        let ir = io.readTextFile(path + ".ll")
+        if release { test.check(!test.contains(ir, "cached-contract-only-literal") && !test.contains(ir, "contract failed"), "raw module state release retained contract literals") }
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(ir)) }
+        for level in ["-O0", "-O2"] {
+            let result = runCompiled(compiler, level)
+            if release {
+                test.check(result.status == 0 && result.output == "-1\n" && result.errorOutput == "", "raw module state release output " + level + "\n" + result.output + result.errorOutput)
+            } else {
+                test.check(result.status == 1 && result.output == "", "raw module state debug status/output " + level)
+                test.check(test.contains(result.errorOutput, "requires contract failed") && test.contains(result.errorOutput, imported + ":2:"), "raw module state debug lost the imported contract\n" + result.errorOutput)
+            }
+        }
+    }
+}
+
+test.removeTree(compiler.directory)
+print("Language contracts: passed")

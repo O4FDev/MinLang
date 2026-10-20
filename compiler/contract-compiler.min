@@ -1,0 +1,265 @@
+// Header contracts lower to ordinary, checked functions. Release keeps the
+// original function body, with no wrapper, predicates, or diagnostic literals.
+function contractsEnabled(): Boolean {
+    let enabled = true
+    let testing = false
+    let position = 0
+    while position < processInfo.argumentCount() {
+        if processInfo.argument(position) == "--release" { enabled = false }
+        if processInfo.argument(position) == "--test-mode" { testing = true }
+        position = position + 1
+    }
+    return enabled || testing
+}
+
+function contractClauseAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    if position + 1 >= kinds.length || kinds[position] != 1 { return false }
+    let name = texts[position]
+    return (name == "requires" || name == "ensures" || name == "invariant") && kinds[position + 1] == 4 && texts[position + 1] == "("
+}
+
+function contractClosing(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, opening: Integer): Integer {
+    let depth = 1
+    let position = opening + 1
+    let close = ")"
+    if texts[opening] == "{" { close = "}" }
+    while position < kinds.length && kinds[position] != 0 {
+        if kinds[position] == 4 {
+            if texts[position] == texts[opening] { depth = depth + 1 }
+            if texts[position] == close { depth = depth - 1 }
+            if depth == 0 { return position }
+        }
+        position = position + 1
+    }
+    failAtToken(lines, opening, "this contract is missing its closing delimiter")
+    return opening
+}
+
+function contractToken(target: ResultTokenSet, kind: Integer, text: Text, lines: SourceMap, position: Integer) {
+    testSynthetic(target.kinds, target.texts, target.lines, kind, text, lines, position)
+}
+
+function contractCopy(target: ResultTokenSet, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, first: Integer, after: Integer) {
+    testCopy(target.kinds, target.texts, target.lines, kinds, texts, lines, first, after)
+}
+
+function contractCheck(target: ResultTokenSet, source: Text, path: Text, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, clause: Integer, closing: Integer) {
+    let name = texts[clause]
+    let expression = source.slice(testSourceOffset(source, lines, clause + 2), testSourceOffset(source, lines, closing))
+    let location = path + ":" + Text(lines.coordinates[clause * 2]) + ":" + Text(lines.coordinates[clause * 2 + 1])
+    contractToken(target, 1, "contract check " + name, lines, clause)
+    contractToken(target, 4, "(", lines, clause)
+    contractCopy(target, kinds, texts, lines, clause + 2, closing)
+    contractToken(target, 4, ",", lines, clause)
+    contractToken(target, 3, location + ": " + name + " contract failed\n  " + name + "(" + expression + ")", lines, clause)
+    contractToken(target, 4, ")", lines, clause)
+    contractToken(target, 6, ";", lines, clause)
+}
+
+function contractParameters(kinds: List<Integer>, texts: List<Text>, first: Integer, after: Integer): List<Integer> {
+    let parameters: List<Integer> = []
+    let depth = 0
+    let position = first
+    while position < after {
+        if depth == 0 && kinds[position] == 1 && texts[position + 1] == ":" { parameters.add(position) }
+        if kinds[position] == 4 {
+            let word = texts[position]
+            if word == "(" || word == "[" || word == "<" { depth = depth + 1 }
+            if word == ")" || word == "]" || word == ">" { depth = depth - 1 }
+            if word == ">>" { depth = depth - 2 }
+        }
+        position = position + 1
+    }
+    return parameters
+}
+
+function contractWrapper(target: ResultTokenSet, source: Text, path: Text, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, function: Integer, name: Integer, helper: Text, opening: Integer, closing: Integer, header: Integer, body: Integer, after: Integer, clauses: List<Integer>, ends: List<Integer>) {
+    let parameters = contractParameters(kinds, texts, opening + 1, closing)
+    let method = name > function + 1 && texts[name - 1] == "."
+    let result = closing + 1
+    while kinds[result] == 6 { result = result + 1 }
+    let valued = texts[result] == ":"
+    if valued && texts[result + 1] == "Nothing" { valued = false }
+    contractCopy(target, kinds, texts, lines, function, header)
+    contractToken(target, 4, "{", lines, body)
+    let clause = 0
+    while clause < clauses.length {
+        if texts[clauses[clause]] != "ensures" { contractCheck(target, source, path, kinds, texts, lines, clauses[clause], ends[clause]) }
+        clause = clause + 1
+    }
+    if valued {
+        contractToken(target, 1, "let", lines, body)
+        contractToken(target, 1, "minyar$contract$result", lines, body)
+        contractToken(target, 4, "=", lines, body)
+    }
+    if method {
+        contractToken(target, 1, "self", lines, name)
+        contractToken(target, 4, ".", lines, name)
+    }
+    contractToken(target, 1, helper, lines, name)
+    // Forward generic type arguments explicitly, including parameters which
+    // occur only in the result type and therefore cannot be inferred.
+    if texts[name + 1] == "<" {
+        contractToken(target, 4, "<", lines, name)
+        let position = name + 2
+        let first = true
+        while position < opening - 1 {
+            if kinds[position] == 1 && (texts[position - 1] == "<" || texts[position - 1] == ",") {
+                if !first { contractToken(target, 4, ",", lines, position) }
+                contractCopy(target, kinds, texts, lines, position, position + 1)
+                first = false
+            }
+            position = position + 1
+        }
+        contractToken(target, 4, ">", lines, name)
+    }
+    contractToken(target, 4, "(", lines, name)
+    let index = 0
+    while index < parameters.length {
+        if index > 0 { contractToken(target, 4, ",", lines, parameters[index]) }
+        contractCopy(target, kinds, texts, lines, parameters[index], parameters[index] + 1)
+        index = index + 1
+    }
+    contractToken(target, 4, ")", lines, name)
+    contractToken(target, 6, ";", lines, body)
+    clause = 0
+    while clause < clauses.length {
+        let word = texts[clauses[clause]]
+        if word != "requires" {
+            // A lexical result binding preserves ordinary parameter/field and
+            // callback shadowing, and never changes an invariant's namespace.
+            if valued && word == "ensures" {
+                contractToken(target, 1, "if", lines, clauses[clause])
+                contractToken(target, 1, "true", lines, clauses[clause])
+                contractToken(target, 4, "{", lines, clauses[clause])
+                contractToken(target, 1, "let", lines, clauses[clause])
+                contractToken(target, 1, "result", lines, clauses[clause])
+                contractToken(target, 4, "=", lines, clauses[clause])
+                contractToken(target, 1, "minyar$contract$result", lines, clauses[clause])
+                contractToken(target, 6, ";", lines, clauses[clause])
+            }
+            contractCheck(target, source, path, kinds, texts, lines, clauses[clause], ends[clause])
+            if valued && word == "ensures" {
+                contractToken(target, 4, "}", lines, clauses[clause])
+                contractToken(target, 6, ";", lines, clauses[clause])
+            }
+        }
+        clause = clause + 1
+    }
+    if valued {
+        contractToken(target, 1, "return", lines, body)
+        contractToken(target, 1, "minyar$contract$result", lines, body)
+        contractToken(target, 6, ";", lines, body)
+    }
+    contractToken(target, 4, "}", lines, after - 1)
+    contractToken(target, 6, ";", lines, after - 1)
+    contractCopy(target, kinds, texts, lines, function, name)
+    contractToken(target, 1, helper, lines, name)
+    contractCopy(target, kinds, texts, lines, name + 1, header)
+    contractCopy(target, kinds, texts, lines, body, after)
+}
+
+function normalizeFunctionContracts(source: Text, path: Text, kinds: List<Integer>, texts: List<Text>, lines: SourceMap): ResultTokenSet {
+    let candidate = 0
+    while candidate < kinds.length && !contractClauseAt(kinds, texts, candidate) { candidate = candidate + 1 }
+    if candidate == kinds.length { return ResultTokenSet { kinds: kinds, texts: texts, lines: lines } }
+    let target = ResultTokenSet { kinds: [], texts: [], lines: newSourceMap() }
+    target.lines.features = lines.features
+    let enabled = contractsEnabled()
+    let removals: List<Integer> = []
+    let helperLookup: List<Integer> = []
+    let position = 0
+    let copied = 0
+    let depth = 0
+    while position + 2 < kinds.length {
+        if depth == 0 && kinds[position] == 1 && texts[position] == "function" && kinds[position + 1] == 1 {
+            let name = position + 1
+            if texts[name + 1] == "." { name = name + 2 }
+            let opening = name + 1
+            while opening < kinds.length && kinds[opening] != 0 && texts[opening] != "(" && texts[opening] != "{" { opening = opening + 1 }
+            if opening >= kinds.length || texts[opening] != "(" { position = position + 1 } else {
+            let closing = contractClosing(kinds, texts, lines, opening)
+            let header = closing + 1
+            while header < kinds.length && kinds[header] != 0 && !(kinds[header] == 4 && texts[header] == "{") && !contractClauseAt(kinds, texts, header) { header = header + 1 }
+            if header >= kinds.length || !contractClauseAt(kinds, texts, header) { position = closing + 1 } else {
+            if texts[name] == "main" && name == position + 1 { failAtToken(lines, name, "put entry contracts on a function called by main") }
+            let clauses: List<Integer> = []
+            let ends: List<Integer> = []
+            let body = header
+            while contractClauseAt(kinds, texts, body) {
+                clauses.add(body)
+                let end = contractClosing(kinds, texts, lines, body + 1)
+                if end == body + 2 { failAtToken(lines, body, texts[body] + " needs a Boolean condition") }
+                ends.add(end)
+                removals.add(body)
+                removals.add(end)
+                body = end + 1
+                while kinds[body] == 6 { body = body + 1 }
+            }
+            if kinds[body] != 4 || texts[body] != "{" { failAtToken(lines, body, "a function contract needs a body in braces") }
+            let firstStatement = body + 1
+            while kinds[firstStatement] == 6 { firstStatement = firstStatement + 1 }
+            if texts[firstStatement] == "native" && kinds[firstStatement + 1] == 3 { failAtToken(lines, firstStatement, "contracts on native functions need an ordinary wrapper") }
+            let after = contractClosing(kinds, texts, lines, body) + 1
+            let signatureEnd = header
+            while signatureEnd > closing && kinds[signatureEnd - 1] == 6 { signatureEnd = signatureEnd - 1 }
+            contractCopy(target, kinds, texts, lines, copied, position)
+            if enabled {
+                if helperLookup.length == 0 { helperLookup = buildDeclarationIndex(texts, kinds) }
+                let helper = "minyar_contract_body_" + Text(name)
+                while findIndexedSymbol(helperLookup, texts, kinds, helper, 1) >= 0 { helper = helper + "_" }
+                contractWrapper(target, source, path, kinds, texts, lines, position, name, helper, opening, closing, signatureEnd, body, after, clauses, ends)
+            } else {
+                contractCopy(target, kinds, texts, lines, position, signatureEnd)
+                contractCopy(target, kinds, texts, lines, body, after)
+            }
+            copied = after
+            position = after
+            }
+            }
+        } else {
+            if kinds[position] == 4 {
+                if texts[position] == "{" { depth = depth + 1 }
+                if texts[position] == "}" { depth = depth - 1 }
+            }
+            position = position + 1
+        }
+    }
+    if removals.length == 0 { return ResultTokenSet { kinds: kinds, texts: texts, lines: lines } }
+    contractCopy(target, kinds, texts, lines, copied, kinds.length)
+    if enabled { return target }
+    // Relex blanked source so contract-only features and literals disappear.
+    // Spaces preserve original coordinates, including multiline predicates.
+    let pieces: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < removals.length {
+        let first = testSourceOffset(source, lines, removals[index])
+        let after = testSourceOffset(source, lines, removals[index + 1]) + 1
+        pieces.add(source.slice(start, first))
+        let blank: List<Text> = []
+        while first < after { if source[first] == '\n' { blank.add("\n") } else { blank.add(" ") }; first = first + 1 }
+        pieces.add(joinText(blank))
+        start = after
+        index = index + 2
+    }
+    pieces.add(source.slice(start, source.length))
+    let retainedKinds: List<Integer> = []
+    let retainedTexts: List<Text> = []
+    let retainedLines = newSourceMap()
+    tokenize(joinText(pieces), retainedKinds, retainedTexts, retainedLines)
+    target.lines.features = retainedLines.features
+    return target
+}
+
+function isContractCheck(name: Text): Boolean { return resultPrefix(name, "contract check ") }
+
+function emitContractCheck(context: CompilerContext, globals: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>, location: Integer): Text {
+    if types.length != 2 || types[0] != 4 || types[1] != 2 { failAtToken(context.tokenLines, location, name.slice(15, name.length) + " needs a Boolean condition") }
+    let label = Text(newLabel(state))
+    output.add("  br i1 " + values[0] + ", label %contract.pass." + label + ", label %contract.fail." + label + "\ncontract.fail." + label + ":\n")
+    output.add("  call void @minyar_fail(ptr " + values[1] + ")\n  unreachable\ncontract.pass." + label + ":\n")
+    textState[0] = "contract.pass." + label
+    setType(resultType, 5)
+    return ""
+}

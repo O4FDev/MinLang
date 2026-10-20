@@ -19,6 +19,15 @@ if system.getenv("MODULE_OPTIONS_SHIM") == "1" {
     let state = -1
     for index in 0..processInfo.argumentCount() { if processInfo.argument(index) == "--module-state" { state = index } }
     test.check(state >= 0 && state + 3 < processInfo.argumentCount(), "protocol module-state arguments")
+    let log = system.getenv("MODULE_OPTIONS_LOG")
+    let input = io.readTextFile(processInfo.argument(state + 1))
+    io.writeTextFile(log + ".input", input)
+    let profile = "debug"
+    for index in 0..processInfo.argumentCount() { if processInfo.argument(index) == "--release" { profile = "release" } }
+    let profiles = ""
+    if files.pathSize(log + ".profiles") >= 0 { profiles = io.readTextFile(log + ".profiles") }
+    io.writeTextFile(log + ".profiles", profiles + profile + "\n")
+    if system.getenv("MODULE_OPTIONS_RETRY") == "1" && input != "" { exit(1) }
     let schema = system.getenv("MODULE_TEST_SCHEMA")
     let source = ""
     if schema != "" { source = Text(schema.length) + "\n" + schema }
@@ -26,24 +35,41 @@ if system.getenv("MODULE_OPTIONS_SHIM") == "1" {
     io.writeTextFile(processInfo.argument(state + 3), "0 0 0 0 0 0 false\n")
     exit(0)
 }
-record Invocation { result: test.Result; arguments: List<Text>; invoked: Boolean }
-function invoke(work: Text, driver: Text, compiler: Text, source: Text, options: List<Text>, schema: Text): Invocation {
+record Invocation { result: test.Result; arguments: List<Text>; invoked: Boolean; input: Text; profiles: List<Text> }
+function invokeProtocol(work: Text, driver: Text, compiler: Text, source: Text, options: List<Text>, schema: Text, retry: Boolean): Invocation {
     let log = work + "/options.log"
-    if files.pathSize(log) >= 0 { test.check(files.remove(log) == 0, "clear compiler protocol log") }
+    for path in [log, log + ".input", log + ".profiles"] {
+        if files.pathSize(path) >= 0 { test.check(files.remove(path) == 0, "clear compiler protocol log") }
+    }
     let environment: List<Text> = []
     for entry in system.environment() {
-        if !starts(entry, "MODULE_OPTIONS_LOG=") && !starts(entry, "MODULE_TEST_SCHEMA=") && !starts(entry, "MODULE_OPTIONS_SHIM=") { environment.add(entry) }
+        if !starts(entry, "MODULE_OPTIONS_LOG=") && !starts(entry, "MODULE_TEST_SCHEMA=") && !starts(entry, "MODULE_OPTIONS_SHIM=") && !starts(entry, "MODULE_OPTIONS_RETRY=") { environment.add(entry) }
     }
     environment.add("MODULE_OPTIONS_LOG=" + log)
     environment.add("MODULE_TEST_SCHEMA=" + schema)
     environment.add("MODULE_OPTIONS_SHIM=1")
+    if retry { environment.add("MODULE_OPTIONS_RETRY=1") }
     let command = [driver, compiler, source, work + "/program.ll", work + "/cache"]
     for option in options { command.add(option) }
     let result = test.run(command, environment, work, work + "/invoke", 10)
     let invoked = files.pathSize(log) >= 0
     let arguments: List<Text> = []
-    if invoked { arguments = test.lines(io.readTextFile(log)) }
-    return Invocation { result: result; arguments: arguments; invoked: invoked }
+    let input = ""
+    let profiles: List<Text> = []
+    if invoked {
+        arguments = test.lines(io.readTextFile(log))
+        input = io.readTextFile(log + ".input")
+        profiles = test.lines(io.readTextFile(log + ".profiles"))
+    }
+    return Invocation { result: result; arguments: arguments; invoked: invoked; input: input; profiles: profiles }
+}
+function invoke(work: Text, driver: Text, compiler: Text, source: Text, options: List<Text>, schema: Text): Invocation {
+    return invokeProtocol(work, driver, compiler, source, options, schema, false)
+}
+function count(arguments: List<Text>, name: Text): Integer {
+    let result = 0
+    for argument in arguments { if argument == name { result += 1 } }
+    return result
 }
 function option(arguments: List<Text>, name: Text): Text {
     for index in 0..arguments.length {
@@ -75,12 +101,24 @@ for options in [["--library", library, "--bounded-owners", "32"], ["--bounded-ow
     test.check(call.invoked, "valid options did not invoke compiler")
     test.check(option(call.arguments, "--library") == library, "forwarded library path")
     test.check(option(call.arguments, "--bounded-owners") == "32", "forwarded owner budget")
+    test.check(count(call.arguments, "--release") == 0, "debug compilation gained release flag")
 }
-for options in [["--scope-owners", "--library", library], ["--library", library, "--scope-owners"]] {
+for options in [["--release"], ["--release", "--library", library, "--bounded-owners", "32", "--error-format", "json"], ["--library", library, "--release", "--bounded-owners", "32", "--error-format", "json"], ["--library", library, "--bounded-owners", "32", "--error-format", "json", "--release"]] {
+    let call = invoke(directory, driver, compiler, source, options, "")
+    test.require(call.result, "forward mixed release options")
+    test.check(count(call.arguments, "--release") == 1, "forward release exactly once")
+    if options.length > 1 {
+        test.check(option(call.arguments, "--library") == library, "release library path")
+        test.check(option(call.arguments, "--bounded-owners") == "32", "release owner budget")
+        test.check(option(call.arguments, "--error-format") == "json", "release diagnostics option")
+    }
+}
+for options in [["--scope-owners", "--library", library], ["--library", library, "--scope-owners"], ["--release", "--scope-owners", "--library", library], ["--library", library, "--scope-owners", "--release"]] {
     let call = invoke(directory, driver, compiler, source, options, "")
     test.require(call.result, "forward scope owners and library")
     test.check(call.invoked, "scope options did not invoke compiler")
     test.check(option(call.arguments, "--library") == library, "scope library path")
+    test.check(count(call.arguments, "--release") == count(options, "--release"), "scope contract profile forwarding")
     let flags = 0
     for argument in call.arguments { if argument == "--scope-owners" { flags += 1 } }
     test.check(flags == 1, "scope flag must be forwarded once")
@@ -119,9 +157,18 @@ for index in 0..call.arguments.length {
     if call.arguments[index] == "--library" { test.check(index + 1 < call.arguments.length, "missing library value"); libraries.add(call.arguments[index + 1]) }
 }
 test.check(libraries.length == 2 && libraries[0] == first && libraries[1] == second, "library search order")
+call = invoke(directory, driver, compiler, source, [directory + "/stats", "--library", library, "--release", "--error-format", "json"], "")
+test.require(call.result, "release options with stats output")
+test.check(io.readTextFile(directory + "/stats") == "0 0 0 0 0 0 false\n", "release stats publication")
+test.check(count(call.arguments, "--release") == 1, "release with stats forwarded")
+let maximum = ["--release", "--bounded-owners", "32", "--error-format", "json"]
+for index in 0..8 { maximum.add("--library"); maximum.add(library) }
+call = invoke(directory, driver, compiler, source, maximum, "")
+test.require(call.result, "maximum compiler argument vector with release")
+test.check(count(call.arguments, "--library") == 8 && count(call.arguments, "--release") == 1, "maximum compiler arguments preserved")
 let excessive: List<Text> = []
 for index in 0..9 { excessive.add("--library"); excessive.add(library) }
-for options in [["--library"], excessive, ["--bounded-owners", "32", "--bounded-owners", "32"], ["--scope-owners", "--scope-owners"], ["--unknown", "value"]] {
+for options in [["--library"], excessive, ["--bounded-owners", "32", "--bounded-owners", "32"], ["--scope-owners", "--scope-owners"], ["--unknown", "value"], ["--release", "--release"], ["--release", "--library", library, "--release"], ["--release", "--library"], ["--library", "--release"], ["--release", "--error-format", "yaml"]] {
     call = invoke(directory, driver, compiler, source, options, "")
     test.check(call.result.status == 2, "invalid driver option status\n" + call.result.errorOutput)
     test.check(!call.invoked, "invalid options invoked compiler")
@@ -137,5 +184,49 @@ for schema in ["minyar-module-interface-v10", "minyar-module-delta-v8", "minyar-
     test.check(call.result.status == 1, "old state schema status")
     test.check(test.contains(call.result.errorOutput, "unsupported compiler state"), "old state schema diagnostic")
 }
+let profileDirectory = directory + "/profiles"
+test.check(files.makeDirectory(profileDirectory) == 0, "cache profile workspace")
+let schema = "minyar-module-interface-v5"
+call = invoke(profileDirectory, driver, compiler, source, [], schema)
+test.require(call.result, "cold debug profile")
+test.check(call.input == "", "debug profile starts cold")
+let debugCache = ""
+for name in files.list(profileDirectory + "/cache") {
+    if test.contains(name, ".cache") { debugCache = profileDirectory + "/cache/" + name }
+}
+test.check(debugCache != "", "debug cache published")
+let debugState = io.readBytesFile(debugCache)
+call = invoke(profileDirectory, driver, compiler, source, ["--release"], schema)
+test.require(call.result, "cold release profile")
+test.check(call.input == "", "release does not reuse debug profile")
+let releaseCache = ""
+for name in files.list(profileDirectory + "/cache") {
+    if test.contains(name, "-release-v1.cache") { releaseCache = profileDirectory + "/cache/" + name }
+}
+test.check(releaseCache != "" && releaseCache != debugCache, "release has separate cache filename")
+let releaseState = io.readBytesFile(releaseCache)
+for options in [["--release"], [], ["--release"], []] {
+    call = invoke(profileDirectory, driver, compiler, source, options, schema)
+    test.require(call.result, "alternating warm cache profiles")
+    test.check(test.contains(call.input, "minyar-module-plan-v1"), "profile retains its warm cache")
+}
+io.writeBytesFile(releaseCache, debugState)
+call = invoke(profileDirectory, driver, compiler, source, ["--release"], schema)
+test.require(call.result, "debug state copied to release path")
+test.check(call.input == "", "exact identity rejects debug state in release cache")
+io.writeBytesFile(debugCache, releaseState)
+call = invoke(profileDirectory, driver, compiler, source, [], schema)
+test.require(call.result, "release state copied to debug path")
+test.check(call.input == "", "exact identity rejects release state in debug cache")
+call = invokeProtocol(profileDirectory, driver, compiler, source, ["--release"], schema, true)
+test.require(call.result, "release cold retry after cached compiler failure")
+test.check(call.profiles.length == 2 && call.profiles[0] == "release" && call.profiles[1] == "release", "release forwarded on cached attempt and cold retry")
+test.check(call.input == "", "failed cache retries with empty input")
+call = invoke(profileDirectory, driver, compiler, source, ["--release", "--bounded-owners", "32"], schema)
+test.require(call.result, "cold release owner profile")
+test.check(call.input == "", "owner profile does not reuse ordinary release cache")
+call = invoke(profileDirectory, driver, compiler, source, ["--bounded-owners", "32", "--release"], schema)
+test.require(call.result, "warm release owner profile")
+test.check(test.contains(call.input, "minyar-module-plan-v1"), "release and owner profiles compose")
 test.removeTree(work)
 print("Module driver options: passed")

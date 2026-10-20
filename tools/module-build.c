@@ -15,8 +15,8 @@
 #include <unistd.h>
 
 /* Disposable, process-local build artifacts. Compiler identity is compared
- * byte-for-byte (hex encoded), with a versioned ownership-policy suffix when
- * enabled. Compiler snapshots still use only the actual executable bytes.
+ * byte-for-byte (hex encoded), with versioned code-generation profile suffixes
+ * when enabled. Compiler snapshots still use only the actual executable bytes.
  * XXH64 is an accidental-corruption checksum,
  * not authentication of artifacts supplied by another party. */
 #define CACHE_LIMIT (64u * 1024u * 1024u)
@@ -306,7 +306,7 @@ enum { MAX_LIBRARIES = 8 };
 static int compiler_run(const char *compiler, const char *entry, const char *output, int input_fd,
                         const char *state, const char *stats, const char *error, const char *budget,
                         int scope_owners, char *const *libraries, size_t library_count,
-                        const char *error_format) {
+                        const char *error_format, int release) {
     if (lseek(input_fd, 0, SEEK_SET) < 0)
         stop("cache seek");
     pid_t child = fork();
@@ -327,6 +327,8 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
                                               "--module-state", path,          (char *)state,
                                               (char *)stats};
         size_t argc = 7;
+        if (release)
+            args[argc++] = "--release";
         if (budget) {
             args[argc++] = "--bounded-owners";
             args[argc++] = (char *)budget;
@@ -505,10 +507,15 @@ int main(int argc, char **argv) {
     const char *budget = NULL, *error_format = NULL, *library_options[MAX_LIBRARIES];
     size_t library_count = 0;
     unsigned owner_limit = 0;
-    int scope_owners = 0;
+    int scope_owners = 0, release = 0;
     int next = positional;
     while (next < argc) {
         const char *option = argv[next];
+        if (!strcmp(option, "--release") && !release) {
+            release = 1;
+            next++;
+            continue;
+        }
         if (!strcmp(option, "--scope-owners") && !scope_owners) {
             scope_owners = 1;
             next++;
@@ -535,7 +542,7 @@ int main(int argc, char **argv) {
     }
     if (argc < 5 || next != argc) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json]\n",
+              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release]\n",
               stderr);
         return 2;
     }
@@ -567,6 +574,13 @@ int main(int argc, char **argv) {
         free(compiler_hex);
         compiler_hex = identity;
     }
+    if (release) {
+        size_t length = strlen(compiler_hex) + sizeof ":release-v1";
+        char *identity = allocate(length);
+        snprintf(identity, length, "%s:release-v1", compiler_hex);
+        free(compiler_hex);
+        compiler_hex = identity;
+    }
     for (size_t i = 0; i < library_count; i++) {
         Bytes library_bytes = {(unsigned char *)libraries[i], strlen(libraries[i])};
         char *library_hex = hexadecimal(library_bytes);
@@ -582,12 +596,14 @@ int main(int argc, char **argv) {
     char key[80];
     uint64_t entry_hash = artifact_hash((const unsigned char *)entry, strlen(entry));
     if (owner_limit)
-        snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u.cache", entry_hash,
-                 owner_limit);
+        snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u%s.cache", entry_hash,
+                 owner_limit, release ? "-release-v1" : "");
     else if (scope_owners)
-        snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1.cache", entry_hash);
+        snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1%s.cache", entry_hash,
+                 release ? "-release-v1" : "");
     else
-        snprintf(key, sizeof key, "%016" PRIx64 ".cache", entry_hash);
+        snprintf(key, sizeof key, "%016" PRIx64 "%s.cache", entry_hash,
+                 release ? "-release-v1" : "");
     char *cache = join(argv[4], key);
     size_t cache_length = strlen(cache);
     char *delta = allocate(cache_length + 7);
@@ -657,10 +673,10 @@ int main(int argc, char **argv) {
         input_fd = plan_fd;
     }
     int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format);
+                              scope_owners, libraries, library_count, error_format, release);
     if (result && cache_valid)
         result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format);
+                              scope_owners, libraries, library_count, error_format, release);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
