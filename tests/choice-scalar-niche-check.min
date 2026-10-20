@@ -3,6 +3,7 @@ use "../tools/test-runtime.min" as runtime
 use "./frontend-fixtures.min" as fixtures
 use "io" as io
 use "files" as files
+use "json" as json
 
 function pack(values: List<Text>): Text {
     let pieces: List<Text> = []
@@ -15,6 +16,23 @@ function hasIdentitySignature(code: Text, name: Text, physical: Text): Boolean {
         if line.startsWith("define " + physical + " @") && (test.contains(line, ".fn." + name + "(") || test.contains(line, "_" + name + "(")) && test.contains(line, "(" + physical + " %argument.0)") { return true }
     }
     return false
+}
+
+function rejectsArity(frontend: fixtures.Frontend, declarations: Text, initializer: Text, message: Text, help: Text, column: Integer) {
+    let result = fixtures.compile(frontend, declarations + initializer + "\n")
+    let compiler = frontend.compiler
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let line = test.lines(declarations).length + 1
+    test.check(result.status == 1 && result.output == "" && test.validCompilerDiagnostics(result.errorOutput), "constructor arity rejection status\n" + result.errorOutput)
+    test.check(test.diagnosticMessage(result.errorOutput) == "Minyar stopped: " + message + "\n" && test.contains(result.errorOutput, help), "constructor arity message/help\n" + result.errorOutput)
+    test.check(test.contains(result.errorOutput, ":" + Text(line) + ":" + Text(column) + "\n"), "constructor arity text token origin\n" + result.errorOutput)
+    test.check(files.pathSize(path + ".ll") < 0, "constructor arity rejection emitted LLVM")
+    let machine = test.run([compiler.executable, path + ".min", path + "-json.ll", "--error-format", "json", "--library", "library"], frontend.environment, "", path + ".json-compile", 60)
+    let diagnostic = json.parse(machine.errorOutput)
+    test.check(machine.status == 1 && machine.output == "" && diagnostic.kind == json.OBJECT && diagnostic.keys.length == 12, "constructor arity JSON schema\n" + machine.errorOutput)
+    test.check(json.member(diagnostic, "message").text == message && json.member(diagnostic, "help").items.length == 1 && test.contains(json.member(diagnostic, "help").items[0].text, help), "constructor arity JSON message/help")
+    test.check(json.member(diagnostic, "line").number == Float(line) && json.member(diagnostic, "column").number == Float(column) && json.member(diagnostic, "endLine").number == Float(line) && json.member(diagnostic, "endColumn").number > Float(column) && json.member(diagnostic, "sourceLine").text == initializer, "constructor arity JSON exact token origin")
+    test.check(files.pathSize(path + "-json.ll") < 0, "constructor arity JSON rejection emitted LLVM")
 }
 
 function linkAndRun(frontend: fixtures.Frontend, path: Text, object: Text, expected: Text, diagnostic: Text, status: Integer, partial: Boolean) {
@@ -77,6 +95,37 @@ fixtures.executes(frontend, io.readTextFile("examples/gallery/scalar-choices.min
 // Keep concrete Maybe alias coverage separate from the inherited ambiguity
 // between its facade and unqualified constructors of another instantiation.
 fixtures.executes(frontend, "choice Phase { Low; High }\ntype Current = Maybe<Phase>\nfunction aliasIdentity(value: Current): Current { return value }\nlet present: Current = Maybe<Phase>.Some(Phase.High)\nlet missing: Current = Maybe<Phase>.None\nprint(match aliasIdentity(present) { Some(phase) { phase == Phase.High } None { false } })\nprint(present != missing)\n", "true\ntrue\n", levels, 0, "", true)
+
+// Concrete custom choices bypass generic Maybe normalization and exercise
+// scalar constructor arity directly, in both declaration orders.
+let arityDeclarations = "choice Lamp { Off; On }\nchoice BitFirst { Present(value: Boolean); Absent }\nchoice BitLast { Absent; Present(value: Boolean) }\nchoice RuneFirst { Present(value: Character); Absent }\nchoice RuneLast { Absent; Present(value: Character) }\nchoice LampFirst { Present(value: Lamp); Absent }\nchoice LampLast { Absent; Present(value: Lamp) }\nchoice WordsFirst { Present(value: Text); Absent }\nchoice WordsLast { Absent; Present(value: Text) }\nchoice Parcel { Present(flag: Boolean, text: Text); Absent }\n"
+for row in [["BitFirst", "Boolean", "false", "true"], ["BitLast", "Boolean", "false", "true"], ["RuneFirst", "Character", "'a'", "'b'"], ["RuneLast", "Character", "'a'", "'b'"], ["LampFirst", "Lamp", "Lamp.Off", "Lamp.On"], ["LampLast", "Lamp", "Lamp.Off", "Lamp.On"], ["WordsFirst", "Text", "\"a\"", "\"b\""], ["WordsLast", "Text", "\"a\"", "\"b\""]] {
+    let type = row[0]
+    let prefix = "let invalid: " + type + " = " + type
+    let missing = prefix + ".Present()"
+    let extra = prefix + ".Present(" + row[2] + ", " + row[3] + ")"
+    let absent = prefix + ".Absent(" + row[2] + ")"
+    let signature = "Present(value: " + row[1] + ")"
+    rejectsArity(frontend, arityDeclarations, missing, "choice case 'Present' expects 1 payload value, but fewer were provided", signature, missing.find(")") + 1)
+    rejectsArity(frontend, arityDeclarations, extra, "choice case 'Present' expects 1 payload value, but more were provided", signature, extra.find(", ") + 3)
+    rejectsArity(frontend, arityDeclarations, absent, "choice case 'Absent' expects 0 payload values, but more were provided", "this case has no payload; remove the values inside its parentheses", absent.find("(") + 2)
+    let source = arityDeclarations + "function arityIdentity(value: " + type + "): " + type + " { return value }\nlet first: " + type + " = " + type + ".Present(" + row[2] + ")\nlet trailing: " + type + " = " + type + ".Present(" + row[2] + ",)\nlet absent: " + type + " = " + type + ".Absent\nlet empty: " + type + " = " + type + ".Absent()\nprint(match arityIdentity(first) { Present(value) { value == " + row[2] + " } Absent { false } })\nprint(first == trailing)\nprint(match absent { Present(value) { false } Absent { true } })\nprint(absent == empty)\n"
+    fixtures.executes(frontend, source, "true\ntrue\ntrue\ntrue\n", levels, 0, "", true)
+    let physical = "i64"
+    if row[1] == "Text" { physical = "ptr" }
+    test.check(hasIdentitySignature(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "arityIdentity", physical), "custom constructor arity controls lost physical layout: " + type)
+}
+let enumExtra = "let invalid: Lamp = Lamp.Off(false)"
+rejectsArity(frontend, arityDeclarations, enumExtra, "choice case 'Off' expects 0 payload values, but more were provided", "this case has no payload; remove the values inside its parentheses", enumExtra.find("(") + 2)
+for call in ["Parcel.Present()", "Parcel.Present(false)", "Parcel.Present(false,)"] {
+    let missing = "let invalid: Parcel = " + call
+    rejectsArity(frontend, arityDeclarations, missing, "choice case 'Present' expects 2 payload values, but fewer were provided", "Present(flag: Boolean, text: Text)", missing.find(")") + 1)
+}
+let taggedExtra = "let invalid: Parcel = Parcel.Present(false, \"a\", true)"
+rejectsArity(frontend, arityDeclarations, taggedExtra, "choice case 'Present' expects 2 payload values, but more were provided", "Present(flag: Boolean, text: Text)", taggedExtra.find("true") + 1)
+let taggedAbsent = "let invalid: Parcel = Parcel.Absent(false)"
+rejectsArity(frontend, arityDeclarations, taggedAbsent, "choice case 'Absent' expects 0 payload values, but more were provided", "this case has no payload; remove the values inside its parentheses", taggedAbsent.find("(") + 2)
+fixtures.executes(frontend, arityDeclarations + "print(Lamp.Off() == Lamp.Off)\nlet value = Parcel.Present(false, \"a\",)\nprint(match value { Present(flag, text) { !flag && text == \"a\" } Absent { false } })\n", "true\ntrue\n", levels, 0, "", true)
 
 // C-value ABI metadata must agree with direct native i64 and C field storage.
 test.require(fixtures.compile(frontend, "record Header native \"c\" { flag: Maybe<Boolean> }\nfunction convert(value: Maybe<Boolean>, header: Header): Maybe<Boolean> { native \"choice_scalar\" value }\n"), "compile scalar niche C-value ABI metadata")
