@@ -29,6 +29,12 @@ its callee fragment selects the existing uniqueness-checked runtime operation.
 Cycle fixups retain their original fragment indexes. Metadata uses constant
 space; proof traversal visits only the root's and receiver's grouping nodes.
 
+Scalar-record escape analysis remains a budgeted lexical proof. Readonly
+candidates keep captured SSA fields; candidates with direct field writes use
+entry-block i64 slots and fresh loads at each field read. An explicit metadata
+tag distinguishes these representations. The existing whole-object escape
+guards, constructor order and proof-attempt budget also apply to writable fields.
+
 Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
 column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant
 time, including for nested brackets; the old `indexWithoutCalls` scanner has

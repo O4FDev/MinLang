@@ -234,9 +234,9 @@ to this experimental sequence. It is not a replacement for that bounded contract
 ## Scalar record replacement
 
 The compiler can eliminate a directly constructed local record whose fields
-are all Integer, Boolean or Character values. Its conservative lexical proof
+are all Integer, Float, Boolean or Character values. Its conservative lexical proof
 requires every later use of that binding in its scope to be a direct field
-projection. Whole-object aliases, arguments, returns, reassignment and container
+read or write. Whole-object aliases, arguments, returns, reassignment and container
 insertion keep the managed representation. Later same-name declarations also
 prevent replacement, even when a more precise analysis could prove them safe.
 Records with reference fields and immediately projected constructor expressions
@@ -245,21 +245,25 @@ currently keep the managed representation.
 The binding's local ID is reserved before checking its initializer, without
 adding the name to scope early. A match expression can allocate its own locals
 without changing which binding owns the captured field metadata.
-Each initializer is evaluated once in source order. The generated field reads
-use the captured scalar values, so a replaced object needs no allocation,
-reference count or cleanup. Unused records still evaluate their initializers.
-The proof relies on a binding that cannot escape or be reassigned and whose
-fields are never assigned; any `name.field = value` or compound field
-assignment in scope keeps the managed representation: its initializer definitions dominate every permitted use, including
-uses within nested branches or the current loop iteration. Capturing a value
-does not reread a mutable initializer input later. Any future feature that
+Each initializer is evaluated once in source order. Readonly fields use the
+captured scalar values. A record with direct field updates instead uses private
+i64 field slots allocated once at function entry; field reads load the current
+value, and assignments store it. Loop-local construction initializes those slots
+again on each iteration. Compound assignment captures the old field before
+evaluating its right operand, matching managed records. LLVM can promote these
+slots to registers and branch/loop values at O2.
+
+Neither representation allocates a managed record or needs reference counting
+or cleanup. Unused records still evaluate their initializers. The binding must
+not escape or be reassigned, so no outside alias can observe private storage.
+Readonly candidates keep their previous LLVM at O0. Any future feature that
 allows whole-object access through another route must revisit this proof.
 
 The analysis charges each attempt before lookahead: eight bytes per field and
 at least eight per record, with a 512-byte cap per compiled function or top-level
 body. Rejected candidates consume this budget too. At most 64 attempts can scan
 the body's tokens, making this additional lookahead work linear in body size
-with a fixed factor. The cap also limits captured fields; it is not a physical
+with a fixed factor. The cap also limits captured and addressable fields; it is not a physical
 stack-size guarantee. LLVM handles remaining locals and register spills.
 
 ## Readonly parameter bindings

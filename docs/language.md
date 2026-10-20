@@ -556,6 +556,9 @@ Returning a local can transfer its existing ownership to the caller. This
 does not copy the value or change what other aliases observe.
 Aliases keep shared values alive.
 
+A local record with only scalar fields can stay in registers or stack storage
+when its fields are the only way it is used. This includes direct field updates.
+
 When returning `words + suffix` or `values.appended(item)`, the compiler can
 transfer a local's ownership after evaluating the other operand. The runtime
 reuses storage when that value has no other owner; shared values keep the

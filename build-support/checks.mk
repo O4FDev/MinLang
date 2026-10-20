@@ -32,6 +32,12 @@ check-terminal-return-reuse: build/minyarc build/minyarc-sanitize build/tooling/
 	$(LIMITED) ./build/tooling/tests/terminal-return-reuse
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/terminal-return-reuse
 
+.PHONY: check-mutable-scalar-records
+check: check-mutable-scalar-records
+check-mutable-scalar-records: build/minyarc build/minyarc-sanitize build/tooling/tests/mutable-scalar-records
+	$(LIMITED) ./build/tooling/tests/mutable-scalar-records
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/mutable-scalar-records
+
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 

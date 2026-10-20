@@ -857,6 +857,14 @@ recursive List elements. Negative descendant cases keep their source alive for
 later reads. Native and sanitized O0/O2 runs use the complete-cleanup graph
 runtime; emitted LLVM separately identifies the consuming calls and owner moves.
 
+`make check-mutable-scalar-records` checks direct scalar field updates without
+managed record calls. Integer, Float, Boolean and Character storage, compound
+updates, branch merges, loop initialization and match-expression initializers
+run at O0/O2 with native/sanitized cleanup assertions. Escaping aliases,
+reassignment, reference fields, captures and C layouts keep their managed paths;
+checked arithmetic keeps its existing failure behavior. LLVM checks require
+entry-only storage and O2 promotion for the pure fixture.
+
 Diagnostic locations are captured at token start. The byte-exact corpus covers
 lexer, parser, type, encoding, and whole-program failures; every current golden
 diagnostic asserts both line and column, including duplicate declarations and
