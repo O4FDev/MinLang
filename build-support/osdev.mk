@@ -131,6 +131,7 @@ check-osdev-panic-qemu: build/minyarc
 # Arm64: the checked DMA virtio bridge against QEMU's real virtio-rng, backed by /dev/zero.
 check-osdev-dma-virtio-qemu: build/minyarc
 	python3 tools/osdev.py test --arch arm64 --zero-entropy --kernel-source os/tests/dma-virtio-kernel.min --expect "OSDEV AFFINE VIRTIO RNG PASS" --timeout 60
+	python3 tools/osdev.py test --arch arm64 --zero-entropy --kernel-source os/tests/dma-ring-kernel.min --expect "OSDEV DMA RING PASS" --timeout 60
 
 .PHONY: check-osdev-callback-qemu
 check-osdev-callback-qemu: build/minyarc

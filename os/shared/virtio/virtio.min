@@ -241,7 +241,7 @@ function unsafeVirtioQueue(owner: Queue, descriptors: Integer, available: Intege
                           used: Integer, notify: Integer, size: Integer,
                           index: Integer): dma.Queue { native "dma" }
 
-function entropyDmaQueue(card: pci.Device): dma.Queue {
+function entropyDmaQueue(card: pci.Device, slots: Integer): dma.Queue {
     let state = entropyDmaState
     if state.attempted { fail("checked virtio-rng is one-shot for this VM; reset/retry is unsupported") }
     state.attempted = true
@@ -257,8 +257,8 @@ function entropyDmaQueue(card: pci.Device): dma.Queue {
     if device.readAt16(opened.common, 0x1C) != 0 {
         fail("virtio-rng queue zero is already enabled")
     }
-    let requests = openQueue(opened, 0, 1)
-    if requests.size != 1 || device.readAt16(opened.common, 0x1C) != 1 {
+    let requests = openQueue(opened, 0, slots)
+    if requests.size != slots || device.readAt16(opened.common, 0x1C) != 1 {
         fail("virtio-rng could not enable its one-shot queue")
     }
     // openQueue selected this exact queue. Recompute its exact notify register
@@ -284,7 +284,7 @@ function entropyDmaQueue(card: pci.Device): dma.Queue {
 public function readOneEntropyByte(devices: List<pci.Device>): Integer {
     let cards = find(devices, ENTROPY)
     if cards.length == 0 { fail("the one-shot entropy read needs virtio-rng PCI") }
-    let queue = entropyDmaQueue(cards[0])
+    let queue = entropyDmaQueue(cards[0], 1)
     let cpu = dma.allocate(1, 64)
     dma.store8(cpu, 0, 0xA5)
     let pending = dma.submit(queue, cpu, 1)
@@ -292,4 +292,37 @@ public function readOneEntropyByte(devices: List<pci.Device>): Integer {
     let value = dma.load8(completed, 0)
     dma.dispose(completed)
     return value
+}
+
+// Three poisoned 4-byte buffers in flight at once on a 4-slot checked queue,
+// reclaimed in order; returns the sum of every device-written byte.
+function entropyRound(queue: dma.Queue): Integer {
+    let a = dma.allocate(4, 64)
+    let b = dma.allocate(4, 64)
+    let c = dma.allocate(4, 64)
+    dma.store8(a, 0, 0xA5); dma.store8(a, 3, 0xA5)
+    dma.store8(b, 0, 0xA5); dma.store8(b, 3, 0xA5)
+    dma.store8(c, 0, 0xA5); dma.store8(c, 3, 0xA5)
+    let pa = dma.submit(queue, a, 4)
+    let pb = dma.submit(queue, b, 4)
+    let pc = dma.submit(queue, c, 4)
+    let ca = dma.reclaim(pa, 1000000)
+    let cb = dma.reclaim(pb, 1000000)
+    let cc = dma.reclaim(pc, 1000000)
+    let total = dma.load8(ca, 0) + dma.load8(ca, 3) + dma.load8(cb, 0) + dma.load8(cb, 3) + dma.load8(cc, 0) + dma.load8(cc, 3)
+    dma.dispose(ca)
+    dma.dispose(cb)
+    dma.dispose(cc)
+    return total
+}
+
+// `rounds` rounds of entropyRound on one 4-slot queue, so every slot is reused
+// with a new generation. Returns the sum of the device-written bytes checked.
+public function readEntropyRounds(devices: List<pci.Device>, rounds: Integer): Integer {
+    let cards = find(devices, ENTROPY)
+    if cards.length == 0 { fail("checked entropy rounds need virtio-rng PCI") }
+    let queue = entropyDmaQueue(cards[0], 4)
+    let total = 0
+    for round in 0..rounds { total += entropyRound(queue) }
+    return total
 }
