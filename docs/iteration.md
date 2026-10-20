@@ -84,6 +84,21 @@ absence of intermediate collection or callback operations, then runs O0/O2
 programs with the ownership oracle. `make check-iteration` separately checks
 the user-record protocol and its diagnostics.
 
+The reproducible study in `experiments/iteration-study` compares a dynamic List
+pipeline with a handwritten loop using the same named transforms. On Linux
+x86_64 with Clang 23.1.2, both optimized loop bodies contained 31 static LLVM
+instructions and the same five direct call sites: checked multiplication,
+checked addition, List access fallback, List length and ownership step. Neither
+loop contained an indirect call. The two dynamic inputs produced matching
+results, 3104 and 3300. This measures emitted code, not execution speed or
+retired instructions; hardware counters were unavailable on that box.
+
+Run `python3 experiments/iteration-study/measure.py --build` on an idle Linux
+Boat box through `bx`. It retains source, commands, raw/optimized LLVM, assembly
+and a machine-readable report under `build/iteration-study`. It also reports
+fixed setup separately: this two-stage pipeline creates two recipe records
+outside its consuming loop.
+
 Recipes and range values are ordinary reference records. Building a recipe
 allocates one small source-holding record per stage, once; a user `iterator()`
 may allocate one cursor per traversal. These fixed setup costs are not erased
