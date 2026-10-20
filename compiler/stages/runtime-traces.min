@@ -10,18 +10,45 @@ function newRuntimeTraces(): RuntimeTraces {
     return RuntimeTraces { symbols: symbols, names: names, files: files, lines: lines, columns: columns, entries: entries, sourceFiles: sourceFiles, sourceTexts: sourceTexts }
 }
 
+function traceSource(traces: RuntimeTraces, path: Text): Text {
+    let source = findText(traces.sourceFiles, path)
+    if source < 0 {
+        source = traces.sourceFiles.length
+        traces.sourceFiles.add(path)
+        traces.sourceTexts.add(diagnosticSource(path))
+    }
+    return traces.sourceTexts[source]
+}
+
+function appendTraceSourceLines(traces: RuntimeTraces, path: Text, lines: List<Text>) {
+    let source = traceSource(traces, path)
+    let first = 0
+    let position = 0
+    while position <= source.length {
+        if position == source.length || source[position] == '\n' {
+            let after = position
+            if after > first && source[after - 1] == '\r' { after = after - 1 }
+            lines.add(source.slice(first, after))
+            first = position + 1
+        }
+        position = position + 1
+    }
+}
+
+function traceSourceExcerpt(line: Text): Text {
+    let clipped = line.length > 160
+    if clipped { line = line.slice(0, 160) }
+    let display = diagnosticDisplay(line)
+    if clipped || display.length > 160 { display = display.slice(0, 159) + "…" }
+    return display
+}
+
 function traceReadableName(traces: RuntimeTraces, stored: Text, span: SourceSpan): Text {
     let name = readableDeclarationName(stored)
     if name.length >= 16 && name.slice(0, 16) == "minyar_parallel_" { return "parallel loop" }
     if name.length >= 15 && name.slice(0, 15) == "minyar_closure_" { return "anonymous function" }
     if !diagnosticGeneratedName(name) && findCharacter(name, '$') < 0 { return name }
-    let source = findText(traces.sourceFiles, span.file)
-    if source < 0 {
-        source = traces.sourceFiles.length
-        traces.sourceFiles.add(span.file)
-        traces.sourceTexts.add(diagnosticSource(span.file))
-    }
-    let line = diagnosticLine(traces.sourceTexts[source], span.line)
+    let line = diagnosticLine(traceSource(traces, span.file), span.line)
     let first = span.column - 1
     let after = first
     while after < line.length && (characterIsLetter(line[after]) || characterIsDigit(line[after]) || line[after] == '_' || line[after] == '.') { after = after + 1 }
@@ -62,7 +89,7 @@ function recordRuntimeTrace(context: CompilerContext, symbol: Text, name: Text, 
     let span = sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1)
     traces.symbols.add(traceLinkerName(symbol))
     traces.names.add(name)
-    traces.files.add(diagnosticDisplay(span.file))
+    traces.files.add(span.file)
     traces.lines.add(span.line)
     traces.columns.add(span.column)
     if entry { traces.entries.add(1) } else { traces.entries.add(0) }
@@ -91,13 +118,17 @@ function appendRuntimeTraceTable(context: CompilerContext, output: List<Text>, p
     let traces = context.traces
     let table = traceSymbol(prefix, "rows")
     let strings = traceSymbol(prefix, "strings")
-    let type = "{ i32, i32, i32, i32, i64, i64 }"
+    let type = "{ i32, i32, i32, i32, i32, i64, i64 }"
     let data: List<Text> = []
     let symbols: List<Integer> = []
     let names: List<Integer> = []
     let paths: List<Text> = []
     let pathOffsets: List<Integer> = []
     let files: List<Integer> = []
+    let excerpts: List<Integer> = []
+    let sourceStarts: List<Integer> = []
+    let sourceCounts: List<Integer> = []
+    let sourceLines: List<Text> = []
     let size = 0
     let zero = "\\00"
     let index = 0
@@ -115,11 +146,22 @@ function appendRuntimeTraceTable(context: CompilerContext, output: List<Text>, p
             path = paths.length
             paths.add(traces.files[index])
             pathOffsets.add(size)
-            data.add(escapeLLVMText(traces.files[index]))
+            let displayPath = diagnosticDisplay(traces.files[index])
+            data.add(escapeLLVMText(displayPath))
             data.add(zero)
-            size = size + traces.files[index].byteLength + 1
+            size = size + displayPath.byteLength + 1
+            sourceStarts.add(sourceLines.length)
+            appendTraceSourceLines(traces, traces.files[index], sourceLines)
+            sourceCounts.add(sourceLines.length - sourceStarts[path])
         }
         files.add(pathOffsets[path])
+        let excerpt = ""
+        let line = traces.lines[index] - 1
+        if line >= 0 && line < sourceCounts[path] { excerpt = traceSourceExcerpt(sourceLines[sourceStarts[path] + line]) }
+        excerpts.add(size)
+        data.add(escapeLLVMText(excerpt))
+        data.add(zero)
+        size = size + excerpt.byteLength + 1
         index = index + 1
     }
     output.add(strings + " = private unnamed_addr constant [" + Text(size) + " x i8] c\"" + joinText(data) + "\"\n")
@@ -130,7 +172,8 @@ function appendRuntimeTraceTable(context: CompilerContext, output: List<Text>, p
         let symbol = "getelementptr (i8, ptr " + strings + ", i64 " + Text(symbols[index]) + ")"
         let name = "getelementptr (i8, ptr " + strings + ", i64 " + Text(names[index]) + ")"
         let file = "getelementptr (i8, ptr " + strings + ", i64 " + Text(files[index]) + ")"
-        output.add(type + " { " + traceRelative(symbol, table) + ", " + traceRelative(name, table) + ", " + traceRelative(file, table) + ", i32 " + Text(traces.entries[index]) + ", i64 " + Text(traces.lines[index]) + ", i64 " + Text(traces.columns[index]) + " }")
+        let excerpt = "getelementptr (i8, ptr " + strings + ", i64 " + Text(excerpts[index]) + ")"
+        output.add(type + " { " + traceRelative(symbol, table) + ", " + traceRelative(name, table) + ", " + traceRelative(file, table) + ", " + traceRelative(excerpt, table) + ", i32 " + Text(traces.entries[index]) + ", i64 " + Text(traces.lines[index]) + ", i64 " + Text(traces.columns[index]) + " }")
         index = index + 1
     }
     output.add("]\n" + traceSymbol(prefix, "count") + " = hidden constant i64 " + Text(traces.symbols.length) + "\n")

@@ -500,9 +500,11 @@ and leak detection enabled. Raw commands, peer requests, bodies, reports and
 hashes remain in fresh run directories under `build/http-chunked` (override
 `HTTP_CHUNKED_ARTIFACTS`). No public network or macOS-provider proof is inferred.
 
-`make check-debug-info` verifies Minyar DWARF line tables with `llvm-dwarfdump`,
-checks direct and cached builds, sanitizer compatibility and release exclusion,
-and uses LLDB on macOS to resolve imported `.min` source lines after temporary
+`make check-debug-info` verifies Minyar DWARF with `llvm-dwarfdump`, including
+typed arguments, initialized locals and nested lexical scopes. It checks direct
+and cached builds, sanitizer compatibility, line-only flags, release exclusion
+and the night-watch gallery. On macOS, LLDB resolves imported `.min` source lines
+and reads mutated arguments, SSA arguments and shadowed bindings after temporary
 link inputs are removed. It also checks dSYM retention and failed-link preservation.
 
 `make check-thread-native-regions` runs Linux mapping, sharing, atomic access,

@@ -13,9 +13,9 @@ typedef struct { int32_t rows, count; } MinyarTraceModule;
 MINYAR_TRACE_WEAK const uint64_t minyar_trace_module_count = 0;
 MINYAR_TRACE_WEAK const MinyarTraceModule minyar_trace_modules[1] = {{0, 0}};
 
-typedef struct { int32_t symbol, name, file, entry; int64_t line, column; } MinyarTraceRow;
+typedef struct { int32_t symbol, name, file, source, entry; int64_t line, column; } MinyarTraceRow;
 typedef struct { const MinyarTraceRow *rows[12]; uintptr_t bases[12]; unsigned count; } MinyarTrace;
-_Static_assert(sizeof(MinyarTraceRow) == 32 && sizeof(MinyarTraceModule) == 8,
+_Static_assert(sizeof(MinyarTraceRow) == 40 && sizeof(MinyarTraceModule) == 8,
                "LLVM runtime trace metadata layout must match");
 
  #include "minyar_trace_symbols.h"
@@ -83,6 +83,8 @@ __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(
               (const char *)(base + (uintptr_t)row->name),
               (const char *)(base + (uintptr_t)row->file),
               (long long)row->line, (long long)row->column);
+        const char *source = (const char *)(base + (uintptr_t)row->source);
+        if (*source) print(stderr, "    | %s\n", source);
     }
 }
 

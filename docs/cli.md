@@ -154,11 +154,14 @@ compiler diagnostic is preserved with its original exit status. Use
 renderer. Argument, manifest and runtime messages use their command's normal
 format.
 
-Debug builds include Minyar source line tables for breakpoints, stepping and
-backtraces, including imported modules. On macOS the matching `.dSYM` bundle is
-kept beside each executable. This currently supplies function and source-line
-information; local-variable/type inspection is not yet implemented. Release
-builds omit this debug information.
+Debug builds include Minyar source locations for breakpoints, stepping and
+backtraces, including imported modules. Named arguments and initialized local
+bindings carry their types and locations; nested blocks preserve shadowed
+bindings. Scalar values can be inspected in LLDB or GDB. Managed values currently
+show their source type and pointer. A value that is no longer used may be
+unavailable after its register is reused. On macOS the matching `.dSYM` bundle
+is kept beside each executable. `-gline-tables-only` retains source locations
+without variable descriptions. Release builds omit this debug information.
 
 `check` validates the entry point and top-level `tests/*.min` without linking.
 `test` validates the entry point, discovers named `test "name" { ... }` blocks

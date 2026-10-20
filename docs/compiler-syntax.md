@@ -330,10 +330,15 @@ its current module graph, even on a cache hit. No function address is retained
 by a row, so unused functions still disappear during LTO. LLVM `uwtable`
 attributes preserve existing unwind descriptions without injected trace calls.
 
-The private runtime ABI uses 32-byte rows (four i32 fields and two i64 source
-coordinates) and an eight-byte module registry row. Offsets are signed i32
+The private runtime ABI uses 40-byte rows (four i32 string offsets, one i32 entry
+flag and two i64 source coordinates) and an eight-byte module registry row. Offsets are signed i32
 relative to their table and resolved by the static linker. They add no PIE
-pointer fixups. The cold Mach-O reader resolves symbols from loaded __LINKEDIT
+pointer fixups. Declaration source excerpts are captured at compile time, with
+tabs expanded, terminal controls replaced and at most 160 Unicode scalars including
+an ellipsis for clipped lines. Missing source text leaves the excerpt empty.
+Excerpts remain available after the source is moved or removed; reporting them
+adds no source-file reads, runtime allocation or normal-path instructions.
+The cold Mach-O reader resolves symbols from loaded __LINKEDIT
 and walks ARM64 compact unwind/DWARF CFI. Linux reads ELF symbols only after a
 failure and uses the platform unwinder. If symbols or unwind information are
 unavailable, the registry supplies an entry location. No C runtime failure is

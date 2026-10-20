@@ -1624,11 +1624,18 @@ Runtime stops keep their message and add a short Minyar stack trace:
 Minyar stopped: The harbour has no light.
 Minyar stack trace:
   at darkWindow (harbour.min:1:10)
+    | function darkWindow(): Integer {
   at evening (harbour.min:4:10)
+    | function evening(): Integer {
   at top level (harbour.min:7:1)
+    | print(evening())
 ```
 
 A frame names the function's declaration, or the first top-level statement.
+Its source line is saved when the program is compiled, so it remains readable
+after the original file is moved or removed. Lines are limited to 160 characters,
+with an ellipsis when clipped; tabs expand to spaces and terminal controls are
+replaced. A source line is omitted if it was unavailable during compilation.
 Optimized code may inline or merge functions and remove tail calls; the trace
 shows the frames that remain. A trace has at most twelve Minyar frames.
 Stripped images and hosts without readable unwind information retain the

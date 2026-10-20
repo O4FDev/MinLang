@@ -29,6 +29,9 @@ test.check(files.makeDirectory(sources) == 0, "debug source directory")
 let entry = sources + "/entry é.min"
 let library = sources + "/math module.min"
 let binary = work + "/program with spaces"
+let locals = sources + "/locals.min"
+let localsBinary = work + "/locals"
+io.writeTextFile(locals, test.sourceModules("function inspect(value: Integer, fixed: Float, active: Boolean, symbol: Character, message: Text): Integer {\n    value += 1\n    let answer = value\n    if active {\n        let answer = 99\n        print(answer)\n    }\n    print(message)\n    print(fixed)\n    print(symbol)\n    return answer\n}\nprint(inspect(40, 1.25, true, 'é', \"stars\"))\n"))
 io.writeTextFile(library, test.sourceModules("public function answer(value: Integer): Integer {\n    let twice = value * 2\n    return twice + 1\n}\n"))
 io.writeTextFile(entry, test.sourceModules("use \"./math module.min\" as math\nlet value = math.answer(20)\nprint(value)\n"))
 let platform = require(fixture, ["uname", "-s"], system.environment()).output
@@ -46,13 +49,26 @@ for mode in ["direct", "incremental-cold", "incremental-warm"] {
     require(fixture, [dwarf, "--verify", symbols], system.environment())
     let info = require(fixture, [dwarf, "--debug-info", "--debug-line", symbols], system.environment())
     test.check(test.contains(info.output, "Minyar") && test.contains(info.output, "math module.min") && test.contains(info.output, "entry"), "debug info references original entry and imported Minyar files")
+    test.check(test.contains(info.output, "DW_TAG_formal_parameter") && test.contains(info.output, "\"twice\"") && test.contains(info.output, "\"Integer\"") && test.contains(info.output, "DW_AT_location"), "imported arguments and initialized locals have named types and locations")
 }
+require(fixture, [root + "/minyar", "--debug", locals, "-o", localsBinary], system.environment())
+test.check(require(fixture, [localsBinary], system.environment()).output == "99\nstars\n1.25\né\n41\n", "debug locals preserve mutation and shadowing")
+let localsSymbols = localsBinary
+if darwin { localsSymbols += ".dSYM" }
+require(fixture, [dwarf, "--verify", localsSymbols], system.environment())
+let localsInfo = require(fixture, [dwarf, "--debug-info", localsSymbols], system.environment()).output
+for name in ["value", "fixed", "active", "symbol", "message", "answer", "Float", "Boolean", "Character", "Text"] {
+    test.check(test.contains(localsInfo, "\"" + name + "\""), "debug locals retain " + name)
+}
+test.check(test.contains(localsInfo, "DW_TAG_lexical_block"), "shadowed bindings retain lexical scopes")
 if darwin {
     test.check(io.fileExists(symbols + "/Contents/Resources/DWARF/program with spaces"), "dSYM survives atomic binary publication")
     let lldb = support.which("lldb", work + "/lldb")
     test.check(lldb != "", "LLDB is required for the macOS debug regression")
     let lookup = require(fixture, [lldb, "--batch", binary, "-o", "image lookup -v -f 'math module.min' -l 3"], system.environment())
     test.check(test.contains(lookup.output, "LineEntry:") && test.contains(lookup.output, "math module.min:3"), "LLDB resolves imported source line breakpoints after temporary build files are removed")
+    let inspected = require(fixture, [lldb, "--batch", localsBinary, "-o", "breakpoint set -f locals.min -l 8", "-o", "run", "-o", "frame variable"], system.environment())
+    test.check(test.contains(inspected.output, "value = 41") && test.contains(inspected.output, "answer = 41") && test.contains(inspected.output, "fixed = 1.25") && test.contains(inspected.output, "active = true"), "LLDB reads stack arguments, SSA arguments and the outer binding after a shadowed scope\n" + inspected.output)
     let uuid = require(fixture, [dwarf, "--uuid", symbols], system.environment()).output
     let invalid = support.merge(system.environment(), ["MINYAR_CLANG_FLAGS=-O0 -g -Wl,--minyar-invalid-link-option"])
     let failed = run(fixture, [root + "/minyar", "--debug", entry, "-o", binary], invalid)
@@ -65,10 +81,20 @@ let sanitizerFlags = support.merge(system.environment(), ["MINYAR_CLANG_FLAGS=-O
 let sanitizedBuild = require(fixture, [root + "/minyar", "--debug", entry, "-o", sanitized], sanitizerFlags)
 test.check(!test.contains(sanitizedBuild.errorOutput, "invalid debug"), "debug metadata composes with sanitizer attributes")
 require(fixture, [sanitized], system.environment())
+let linesOnly = work + "/lines-only"
+let lineFlags = support.merge(system.environment(), ["MINYAR_CLANG_FLAGS=-O0 -gline-tables-only"])
+require(fixture, [root + "/minyar", "--debug", entry, "-o", linesOnly], lineFlags)
+let lineSymbols = linesOnly
+if darwin { lineSymbols += ".dSYM" }
+let lineInfo = require(fixture, [dwarf, "--debug-info", "--debug-line", lineSymbols], system.environment()).output
+test.check(test.contains(lineInfo, "math module.min") && !test.contains(lineInfo, "DW_TAG_variable"), "line-tables-only retains source stepping without variable descriptions")
 let release = work + "/release"
 require(fixture, [root + "/minyar", "--release", entry, "-o", release], system.environment())
 let releaseInfo = require(fixture, [dwarf, "--debug-info", release], system.environment())
 test.check(!test.contains(releaseInfo.output, "Minyar"), "release builds do not acquire Minyar debug info")
+let gallery = work + "/night-watch"
+require(fixture, [root + "/minyar", "--debug", "examples/gallery/night-watch.min", "-o", gallery], system.environment())
+test.check(require(fixture, [gallery], system.environment()).output == io.readTextFile("examples/gallery/night-watch.stdout"), "debugger gallery output")
 test.removeTree(work)
 test.removeTree(compiler.directory)
-print("Minyar debug line tables, symbols, incremental builds and sanitizers: passed")
+print("Minyar debug source, typed locals, scopes, incremental builds and sanitizers: passed")
