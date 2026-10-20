@@ -1018,6 +1018,37 @@ public function retention(root: Text): Retention {
     return Retention { root: root; items: []; faults: faults }
 }
 function binding(raw: Bytes): json.Value { return data.object(["sha256", "bytes"], [data.string(sha(raw)), data.number(raw.length)]) }
+record CheckedRetainedFile { entry: json.Value; exact: Boolean }
+function checkRetainedFile(path: Text, expected: Bytes): CheckedRetainedFile {
+    let file = files.open(path, files.READ)
+    if file < 0 { return CheckedRetainedFile { entry: data.none(); exact: false } }
+    let hash = sha256.new()
+    let buffer = Bytes()
+    let position = 0
+    let exact = true
+    let valid = true
+    while true {
+        buffer.clear()
+        let count = files.readAppend(file, position, buffer, 65536)
+        if count < 0 { valid = false; break }
+        if count == 0 { break }
+        if !sha256.update(hash, buffer) { valid = false; break }
+        if position > expected.length { exact = false }
+        else if count > expected.length - position { exact = false }
+        else {
+            for index in 0..count {
+                if buffer[index] != expected[position + index] { exact = false }
+            }
+        }
+        position += count
+    }
+    let closed = files.close(file)
+    if !valid || closed < 0 { return CheckedRetainedFile { entry: data.none(); exact: false } }
+    let digest = sha256.finalize(hash)
+    if digest.length != 32 { return CheckedRetainedFile { entry: data.none(); exact: false } }
+    let entry = data.object(["sha256", "bytes"], [data.string(sha256.hex(digest)), data.number(position)])
+    return CheckedRetainedFile { entry: entry; exact: exact && position == expected.length }
+}
 public function canonicalPath(path: Text): Text {
     let log = test.scratch()
     let result = test.run(["/bin/sh", "-c", "if [ -e \"$1\" ]; then realpath -- \"$1\"; else d=$(dirname -- \"$1\") && b=$(basename -- \"$1\") && cd -- \"$d\" 2>/dev/null && printf '%s/%s\\n' \"$(pwd -P)\" \"$b\"; fi", "minyar", path], system.environment(), "", log + "/resolve", 30)
@@ -1048,10 +1079,10 @@ public function retain(state: Failure, value: Retention, path: Text): Bytes {
             if fault == "original-mutation" { io.writeBytesFile(key, concat([raw, Bytes("x")])) }
         }
     }
-    let copy = files.readFile(value.root + "/" + name)
-    let after = files.readFile(key)
-    let exact = same(raw, copy) && same(raw, after)
-    item.entry = data.with(data.with(data.with(entry, "retained", binding(copy)), "original_after", binding(after)), "copied_exact", data.boolean(exact))
+    let copy = checkRetainedFile(value.root + "/" + name, raw)
+    let after = checkRetainedFile(key, raw)
+    let exact = copy.exact && after.exact
+    item.entry = data.with(data.with(data.with(entry, "retained", copy.entry), "original_after", after.entry), "copied_exact", data.boolean(exact))
     if !exact { raise(state, "CoverageError: input changed during retention: " + key) }
     return raw
 }
@@ -1067,10 +1098,10 @@ public function expected(state: Failure, value: Retention, bound: json.Value): B
 public function recheck(value: Retention): List<Text> {
     let failures: List<Text> = []
     for item in value.items {
-        let original = files.readFile(item.key)
-        let copy = files.readFile(value.root + "/" + data.field(item.entry, "retained_path").text)
-        let exact = same(item.content, original) && same(item.content, copy)
-        item.entry = data.with(data.with(data.with(item.entry, "original_after", binding(original)), "retained", binding(copy)), "copied_exact", data.boolean(exact))
+        let original = checkRetainedFile(item.key, item.content)
+        let copy = checkRetainedFile(value.root + "/" + data.field(item.entry, "retained_path").text, item.content)
+        let exact = original.exact && copy.exact
+        item.entry = data.with(data.with(data.with(item.entry, "original_after", original.entry), "retained", copy.entry), "copied_exact", data.boolean(exact))
         if !exact { failures.add("CoverageError: input changed before finalization: " + item.key) }
     }
     return failures
