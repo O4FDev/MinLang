@@ -1,11 +1,19 @@
 /* Callback domain identities exist only in the opt-in managed graph engine.
  * Foreign calls are rejected before stack/RC/frame state is accessed. Domain
  * IDs are unique for the process lifetime, so recycled OS thread IDs cannot
- * authorize stale values. This does not make managed heaps shared. */
+ * authorize stale values. The freestanding profile instead binds its one
+ * execution domain to a physical CPU. This does not make managed heaps shared. */
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef MINYAR_FREESTANDING
+#include "freestanding/callback-domain.h"
+
+long long minyar_callback_domain(void) {
+    return minyar_freestanding_callback_domain(minyar_freestanding_callback_cpu());
+}
+#else
 static atomic_uint_fast64_t minyar_callback_next_domain = 1;
 static _Thread_local uint64_t minyar_callback_current_domain;
 
@@ -19,6 +27,7 @@ long long minyar_callback_domain(void) {
     }
     return (long long)domain;
 }
+#endif
 
 void minyar_callback_check(const MinyarRecord *callback) {
     if (!callback || callback->length != 3 || callback->values[2] != minyar_callback_domain())

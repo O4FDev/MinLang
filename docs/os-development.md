@@ -60,6 +60,25 @@ Already-built images can be run from paths with spaces or commas.
 `clock=vm`. The calendar advances as the guest runs; initial seconds are not
 frozen. Invalid dates and extra QEMU options reject before any tools run.
 
+The OS build selects the ordinary or managed graph runtime separately for the
+loader and kernel from each program's compiler-emitted LLVM markers. Callbacks
+use the same graph engine as hosted programs. The bare callback profile binds
+its execution domain to the boot CPU during argument initialization, before
+module constants and the kernel body run. Physical CPU checks reject callback
+use from another CPU; hosted callbacks retain their thread-local identities.
+The bare allocator, RC and frames remain a single execution domain: managed AP
+work, migration and callback entry from interrupts or NMIs are unsupported.
+Callback creation allocates before its domain is recorded, so the CPU check
+does not authorize managed allocation on other CPUs. Managed thread runtime
+requests reject explicitly in this OS profile. Existing compiler-checked
+scalar data parallelism retains its bare serial fallback and optional kernel
+scheduler; it does not invoke managed callbacks on worker CPUs.
+
+`check-osdev-runtime` checks engine selection and rejected configurations.
+`check-osdev-callback-domain` checks domain identity boundaries and foreign-CPU
+rejection, and cross-compiles the real provider for x86-64 and Arm without TLS.
+Both checks are included in `check-osdev-freestanding`.
+
 ## Finite kernel tests
 
 Use a kernel that prints a unique success line, then exits with status zero:

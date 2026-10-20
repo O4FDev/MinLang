@@ -18,7 +18,18 @@ check-osdev-fields-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitiz
 check-osdev-workflow:
 	python3 tests/osdev-workflow.py
 
-check-osdev-rtc: build/.toolchain.json build/minyarc
+.PHONY: check-osdev-runtime check-osdev-callback-domain
+check-osdev-runtime:
+	python3 tests/osdev-runtime.py
+
+check-osdev-callback-domain: build/.toolchain.json
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-callback-domain.py
+
+.PHONY: check-osdev-rtc-log
+check-osdev-rtc-log:
+	python3 tests/osdev-rtc-log.py
+
+check-osdev-rtc: build/.toolchain.json build/minyarc check-osdev-rtc-log
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-rtc.py
 
 check-osdev-rtc-sanitize: build/.toolchain.json build/minyarc-sanitize
@@ -35,6 +46,10 @@ OSDEV_ARCH ?= arm64
 check-osdev-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/fields-kernel.min --expect "OSDEV FIELDS PASS" --timeout 30
 
+.PHONY: check-osdev-callback-qemu
+check-osdev-callback-qemu: build/minyarc
+	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/callback-kernel.min --expect "OSDEV CALLBACK PASS" --timeout 30
+
 .PHONY: check-osdev-freestanding
-check-osdev-freestanding: build/.toolchain.json build/minyarc
+check-osdev-freestanding: build/.toolchain.json build/minyarc check-osdev-runtime check-osdev-callback-domain
 	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-freestanding.py

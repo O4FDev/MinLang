@@ -474,9 +474,14 @@ def qemu_log(path, base_text):
     if not 2000 <= base.year <= 2099:
         raise CheckFailure("RTC base is outside the frozen 2000..2099 year window")
     lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
-    calendars = [line for line in lines if line.startswith("OSDEV RTC ") and line != "OSDEV RTC PASS"]
-    if len(calendars) != 1 or lines.count("OSDEV RTC PASS") != 1:
-        raise CheckFailure("expected exactly one calendar line and one exact OSDEV RTC PASS")
+    start, passed = "OSDEV RTC START", "OSDEV RTC PASS"
+    if lines.count(start) != 1 or lines.count(passed) != 1:
+        raise CheckFailure("expected exactly one exact OSDEV RTC START and OSDEV RTC PASS")
+    calendars = [line for line in lines if line.startswith("OSDEV RTC ") and line not in (start, passed)]
+    if len(calendars) != 1:
+        raise CheckFailure("expected exactly one RTC calendar serial line")
+    if not lines.index(start) < lines.index(calendars[0]) < lines.index(passed):
+        raise CheckFailure("expected RTC START, calendar, PASS in that order")
     found = re.fullmatch(r"OSDEV RTC (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)", calendars[0])
     if found is None:
         raise CheckFailure("malformed RTC calendar serial line")

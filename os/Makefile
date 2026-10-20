@@ -65,6 +65,7 @@ LDFLAGS := -static --no-pie -nostdlib --lto-O3 $(LTO_CPU) -z max-page-size=4096 
 
 SOURCES := $(shell find $(ROOT)/os -name "*.min") $(shell find $(ROOT)/library -name "*.min")
 RUNTIME := $(OUT)/runtime.o $(OUT)/freestanding.o $(ENTRY)
+PROGRAM_RUNTIME := $(filter-out $(OUT)/runtime.o,$(RUNTIME))
 ATACAMA_HOST ?= 10.0.2.2
 ATACAMA_PORT ?= 8080
 ATACAMA_KEY ?= minyar-local
@@ -109,10 +110,23 @@ $(OUT)/head.o: arch/arm64/head.S | $(OUT)
 # never be compiled into a call to memcpy.
 STRIP_CPU := sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g'
 
-$(OUT)/runtime.o: $(ROOT)/runtime/freestanding/runtime.c $(wildcard $(ROOT)/runtime/*.h $(ROOT)/runtime/*.c) | $(OUT)
+RUNTIME_INPUTS := $(ROOT)/runtime/freestanding/runtime.c $(wildcard $(ROOT)/runtime/*.h $(ROOT)/runtime/*.c) \
+	$(ROOT)/runtime/freestanding/callback-domain.h $(wildcard $(ROOT)/runtime/freestanding/include/*.h)
+
+$(OUT)/runtime.o: $(RUNTIME_INPUTS) | $(OUT)
 	$(CLANG) $(CFLAGS) -S -emit-llvm $< -o $(OUT)/runtime.ll.tmp
 	$(STRIP_CPU) $(OUT)/runtime.ll.tmp | sed -E 's/"no-builtins" ?//g' > $(OUT)/runtime.ll
 	$(CLANG) $(IRFLAGS) -c $(OUT)/runtime.ll -o $@
+
+# Each program's authoritative LLVM markers select its own runtime engine.
+# Keep the generic runtime.o rule available to existing explicit consumers.
+$(OUT)/%-runtime.c: $(OUT)/%.ll $(RUNTIME_INPUTS) $(ROOT)/tools/osdev-runtime.py | $(OUT)
+	python3 "$(ROOT)/tools/osdev-runtime.py" --program "$<" --root "$(ROOT)" --output "$@"
+
+$(OUT)/%-runtime.o: $(OUT)/%-runtime.c
+	$(CLANG) $(CFLAGS) -iquote "$(ROOT)/runtime" -iquote "$(ROOT)/runtime/freestanding" -S -emit-llvm "$<" -o "$(OUT)/$*-runtime.ll.tmp"
+	$(STRIP_CPU) "$(OUT)/$*-runtime.ll.tmp" | sed -E 's/"no-builtins" ?//g' > "$(OUT)/$*-runtime.ll"
+	$(CLANG) $(IRFLAGS) -c "$(OUT)/$*-runtime.ll" -o "$@"
 
 FREESTANDING_PROVIDER_INPUTS := $(ROOT)/runtime/minyar_freestanding_providers.h \
 	$(ROOT)/runtime/minyar_ip_literal.h $(ROOT)/runtime/minyar_native.h \
@@ -126,7 +140,7 @@ $(OUT)/freestanding.o: $(ROOT)/runtime/freestanding/freestanding.c $(wildcard $(
 
 # ----- Minyar programs -----
 
-.PRECIOUS: $(OUT)/%.ll
+.PRECIOUS: $(OUT)/%.ll $(OUT)/%-runtime.c
 $(OUT)/kernel.ll: $(KERNEL_SOURCE) $(SOURCES) $(MINYARC) | $(OUT)
 	"$(MINYARC)" "$(KERNEL_SOURCE)" "$@" $(PACKAGES) --bounded-owners 32 --freestanding
 
@@ -136,14 +150,14 @@ $(OUT)/loader.ll: $(SOURCES) $(MINYARC) | $(OUT)
 $(OUT)/%-program.o: $(OUT)/%.ll
 	$(CLANG) $(IRFLAGS) -c $< -o $@
 
-$(OUT)/loader.elf: $(OUT)/loader-program.o $(RUNTIME) arch/x86_64/boot/loader.ld
-	$(LLD) $(LDFLAGS) -T arch/x86_64/boot/loader.ld $(ENTRY) $(OUT)/loader-program.o $(OUT)/runtime.o $(OUT)/freestanding.o -o $@
+$(OUT)/loader.elf: $(OUT)/loader-program.o $(OUT)/loader-runtime.o $(PROGRAM_RUNTIME) arch/x86_64/boot/loader.ld
+	$(LLD) $(LDFLAGS) -T arch/x86_64/boot/loader.ld $(ENTRY) $(OUT)/loader-program.o $(OUT)/loader-runtime.o $(OUT)/freestanding.o -o $@
 
 $(OUT)/loader.bin: $(OUT)/loader.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(OUT)/kernel.elf: $(OUT)/kernel-program.o $(RUNTIME) $(KERNEL_LD)
-	$(LLD) $(LDFLAGS) -T $(KERNEL_LD) $(ENTRY) $(OUT)/kernel-program.o $(OUT)/runtime.o $(OUT)/freestanding.o -o $@
+$(OUT)/kernel.elf: $(OUT)/kernel-program.o $(OUT)/kernel-runtime.o $(PROGRAM_RUNTIME) $(KERNEL_LD)
+	$(LLD) $(LDFLAGS) -T $(KERNEL_LD) $(ENTRY) $(OUT)/kernel-program.o $(OUT)/kernel-runtime.o $(OUT)/freestanding.o -o $@
 
 # ----- Disk image -----
 
