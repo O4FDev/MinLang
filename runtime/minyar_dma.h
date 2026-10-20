@@ -241,7 +241,7 @@ static inline int minyar_dma_overlap(uintptr_t first, size_t first_size,
 /* Compiler-owned unsafe bridge only, never a public Integer-address factory.
  * Caller proves: actual retained Queue, exclusive fresh rings, coherent RAM,
  * identity translation, 16-bit PCI notify register, initialized/ready device.
- * Parent compiler restricts this intrinsic to kernel targets. No reset/close.
+ * Only virtio.min's private factory calls it, after validating the device. No reset/close.
  * Ring/payload roots and metadata intentionally survive until VM termination. */
 MinyarRecord *minyar_dma_unsafeVirtioQueue(MinyarRecord *owner, long long descriptor_cpu,
         long long available_cpu, long long used_cpu, long long notify_cpu,
