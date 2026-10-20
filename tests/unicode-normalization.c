@@ -243,11 +243,16 @@ typedef MinyarText *(*Transform)(const MinyarText *);
 static unsigned long long measured(const char *name, const Buffer *source,
                                    const Buffer *expected, Transform transform,
                                    unsigned long long minimum, unsigned long long maximum) {
+    unsigned char *original = malloc(source->length + 1);
+    assert(original);
+    memcpy(original, source->bytes, source->length + 1);
     MinyarText input = borrowed(source);
     minyar_unicode_normalization_reset_work();
     MinyarText *result = transform(&input);
     unsigned long long work = minyar_unicode_normalization_ordering_work();
     matches(name, result, expected->bytes, expected->length);
+    assert(!memcmp(source->bytes, original, source->length + 1));
+    free(original);
     if (work < minimum || work > maximum) {
         fprintf(stderr, "%s: ordering work %llu outside [%llu, %llu]\n", name, work,
                 minimum, maximum);
@@ -257,17 +262,21 @@ static unsigned long long measured(const char *name, const Buffer *source,
     return work;
 }
 
+static void adversarial_marks(Buffer *source, Buffer *expected, size_t marks) {
+    size_t high = marks / 2, low = marks - high;
+    /* Alternation within each class makes the stability oracle observable.
+     * This input has quadratic inversion count but only one ordering run. */
+    for (size_t index = 0; index < high; index++) buffer_add(source, index % 2 ? 0x31A : 0x315);
+    for (size_t index = 0; index < low; index++) buffer_add(source, index % 2 ? 0x324 : 0x323);
+    for (size_t index = 0; index < low; index++) buffer_add(expected, index % 2 ? 0x324 : 0x323);
+    for (size_t index = 0; index < high; index++) buffer_add(expected, index % 2 ? 0x31A : 0x315);
+}
+
 static void long_adversarial(size_t marks) {
-    assert(marks % 2 == 0);
     Buffer source = buffer_new(marks + 1), expected = buffer_new(marks + 1);
     buffer_add(&source, 0x71);
     buffer_add(&expected, 0x71);
-    /* Alternation within each class makes the stability oracle observable.
-     * This input has quadratic inversion count but only one ordering run. */
-    for (size_t index = 0; index < marks / 2; index++) buffer_add(&source, index % 2 ? 0x31A : 0x315);
-    for (size_t index = 0; index < marks / 2; index++) buffer_add(&source, index % 2 ? 0x324 : 0x323);
-    for (size_t index = 0; index < marks / 2; index++) buffer_add(&expected, index % 2 ? 0x324 : 0x323);
-    for (size_t index = 0; index < marks / 2; index++) buffer_add(&expected, index % 2 ? 0x31A : 0x315);
+    adversarial_marks(&source, &expected, marks);
     unsigned long long scalars = (unsigned long long)marks + 1;
     unsigned long long normal_work = measured("long NFC", &source, &expected,
         minyar_unicode_normalized, marks, 12 * scalars + 1024);
@@ -295,7 +304,7 @@ static void many_short_runs(size_t runs) {
         buffer_add(&expected, 0x31A);
     }
     unsigned long long scalars = 5 * (unsigned long long)runs;
-    unsigned long long budget = 12 * scalars + 1024 * ((unsigned long long)runs + 1);
+    unsigned long long budget = 36 * scalars + 2;
     unsigned long long normal_work = measured("short-run NFC", &source, &expected,
         minyar_unicode_normalized, 4 * (unsigned long long)runs, budget);
     unsigned long long fold_work = measured("short-run fold", &source, &expected,
@@ -306,12 +315,39 @@ static void many_short_runs(size_t runs) {
     free(expected.bytes);
 }
 
+static void mixed_runs(void) {
+    static const size_t lengths[] = {3, 16, 17, 128, 2};
+    static const uint32_t barriers[] = {0x71, 0, 0x34F, 0x71, 0};
+    size_t runs = sizeof(lengths) / sizeof(*lengths), marks = 0;
+    assert(runs == sizeof(barriers) / sizeof(*barriers));
+    for (size_t index = 0; index < runs; index++) marks += lengths[index];
+    Buffer source = buffer_new(marks + runs), expected = buffer_new(marks + runs);
+    for (size_t index = 0; index < runs; index++) {
+        buffer_add(&source, barriers[index]);
+        buffer_add(&expected, barriers[index]);
+        adversarial_marks(&source, &expected, lengths[index]);
+    }
+    /* One map shares the large-run scratch between 17 and 128 marks while
+     * insertion sorting smaller runs before and after those counting sorts. */
+    unsigned long long scalars = (unsigned long long)marks + runs;
+    unsigned long long budget = 36 * scalars + 2;
+    unsigned long long normal_work = measured("mixed-run NFC", &source, &expected,
+        minyar_unicode_normalized, marks, budget);
+    unsigned long long fold_work = measured("mixed-run fold", &source, &expected,
+        minyar_unicode_caseFold, 2 * (unsigned long long)marks, 2 * budget);
+    printf("{\"mixed\":true,\"scalars\":%llu,\"runs\":%zu,\"nfc_ordering_work\":%llu,\"fold_ordering_work\":%llu}\n",
+           scalars, runs, normal_work, fold_work);
+    free(source.bytes);
+    free(expected.bytes);
+}
+
 int main(void) {
     exact_regressions();
     bounded_differential();
-    static const size_t sizes[] = {14, 16, 18, 32, 1024, 4096, 16384, 65536, 131072};
+    static const size_t sizes[] = {14, 15, 16, 17, 18, 32, 1024, 4096, 16384, 65536, 131072};
     for (size_t index = 0; index < sizeof(sizes) / sizeof(*sizes); index++) long_adversarial(sizes[index]);
     many_short_runs(2048);
+    mixed_runs();
     assert(live_texts == 0);
     printf("Unicode normalization: %zu exact and 2048 bounded differential vectors; linear ordering budgets passed\n",
            exact_count);
