@@ -78,7 +78,7 @@ mode = os.environ["OSDEV_FAKE_BUILD"]
 if mode == "hang": signal.pause()
 if mode == "shared-deadline":
     import threading
-    threading.Event().wait(0.6)
+    threading.Event().wait(1.5)
 sys.exit(9 if mode == "fail" or (mode == "fail-os" and sys.argv[-1] == "all") else 0)
 ''')
         probe = self.executable("bootstrap probe", '''
@@ -109,7 +109,9 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
                    "--log", str(self.log), "--qemu", str(self.qemu), "--make", str(self.make),
                    "--llvm-bin", str(self.bin)]
         if action == "test":
-            command += ["--expect", "kernel checks passed", "--timeout", "0.3"]
+            # The fake QEMU is a Python process; a loaded host can take longer than a
+            # fraction of a second just to start it, so success paths get a real deadline.
+            command += ["--expect", "kernel checks passed", "--timeout", "5"]
         if no_build:
             command.append("--no-build")
         command += list(extra)
@@ -175,7 +177,7 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
     def test_deadline_after_marker_is_failure(self):
         for mode in ("hang", "closed-hang"):
             with self.subTest(mode=mode):
-                result = self.invoke(mode=mode, expected=124)
+                result = self.invoke("test", "--timeout", "2", mode=mode, expected=124)
                 self.assertIn(b"timed out", result.stderr)
                 self.assertIn(b"kernel checks passed", self.log.read_bytes())
 
@@ -237,14 +239,14 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
         for mode, status, phases in (("fail", 9, 1), ("fail-os", 9, 2), ("hang", 124, 1)):
             with self.subTest(mode=mode):
                 (self.work / "make-history.jsonl").unlink(missing_ok=True)
-                timeout = "0.1" if mode == "hang" else "5"
+                timeout = "2" if mode == "hang" else "5"
                 self.invoke("test", "--build-timeout", timeout, build=mode, expected=status, no_build=False)
                 self.assertFalse((self.work / "qemu.json").exists())
                 history = (self.work / "make-history.jsonl").read_text().splitlines()
                 self.assertEqual(len(history), phases)
 
     def test_compiler_and_os_share_one_build_deadline(self):
-        self.invoke("test", "--build-timeout", "1", build="shared-deadline", expected=124, no_build=False)
+        self.invoke("test", "--build-timeout", "2.5", build="shared-deadline", expected=124, no_build=False)
         history = (self.work / "make-history.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 2)
         self.assertFalse((self.work / "qemu.json").exists())
