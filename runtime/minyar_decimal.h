@@ -134,20 +134,20 @@ static _Bool decimal_is_digit(unsigned char value) {
 
 double minyar_runtime_jsonNumber(const MinyarText *text) {
     if (text->byte_length <= 0 || (uint64_t)text->byte_length > SIZE_MAX)
-        return NAN;
+        return (double)NAN;
     const unsigned char *source = text->bytes;
     size_t length = (size_t)text->byte_length, position = 0;
     _Bool negative = source[position] == '-';
     if (negative && ++position == length)
-        return NAN;
+        return (double)NAN;
     DecimalInput input = {0};
     if (source[position] == '0') {
         position++;
         if (position < length && decimal_is_digit(source[position]))
-            return NAN;
+            return (double)NAN;
     } else {
         if (source[position] < '1' || source[position] > '9')
-            return NAN;
+            return (double)NAN;
         do {
             decimal_digit(&input, source[position++] - '0');
         } while (position < length && decimal_is_digit(source[position]));
@@ -158,7 +158,7 @@ double minyar_runtime_jsonNumber(const MinyarText *text) {
         while (position < length && decimal_is_digit(source[position]))
             decimal_digit(&input, source[position++] - '0');
         if (position == start)
-            return NAN;
+            return (double)NAN;
         fraction = position - start;
     }
     long long exponent = 0;
@@ -177,10 +177,10 @@ double minyar_runtime_jsonNumber(const MinyarText *text) {
                 exponent = exponent * 10 + digit;
         }
         if (position == start)
-            return NAN;
+            return (double)NAN;
     }
     if (position != length)
-        return NAN;
+        return (double)NAN;
     if (!input.significant)
         return decimal_float(0, negative);
     long long magnitude = (long long)input.significant - (long long)fraction;
