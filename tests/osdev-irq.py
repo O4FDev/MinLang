@@ -6,7 +6,8 @@ kernel: on x86-64, irq_32 is the compiler's x86_intrcc entry (iretq, cld, no
 x87/SSE registers, master-PIC acknowledgement only) rather than the weak stub;
 on Arm64, the GIC entry calls the compiled minyar_irq_dispatch, which uses no
 FP/SIMD registers. Then it boots each under QEMU; the guest proves delivery,
-counting and that interrupted code keeps its registers (see the kernel).
+counting, that the handler reads its interrupt controller (x86 port I/O, Arm64
+MMIO) and that interrupted code keeps its registers (see the kernel).
 """
 
 import argparse
@@ -96,7 +97,7 @@ def main():
         passed = re.search(r"^OSDEV IRQ PASS ticks during mix (\d+)\r?$", serial, re.M)
         if boot.returncode != 0 or passed is None:
             raise SystemExit(f"{arch}: the IRQ guest failed\nserial:\n{serial[-2000:]}\nosdev:\n{boot.stderr[-2000:]}")
-        print(f"{arch}: the Minyar handler is the timer entry; {passed.group(1)} interrupts landed inside the register mix")
+        print(f"{arch}: the Minyar handler is the timer entry and reads its interrupt controller; {passed.group(1)} interrupts landed inside the register mix")
     return 0
 
 
