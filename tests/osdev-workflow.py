@@ -37,7 +37,10 @@ class WorkflowTests(unittest.TestCase):
         self.bin.mkdir()
         self.env = dict(os.environ, OSDEV_FAKE_MODE="success", OSDEV_FAKE_BUILD="success",
                         OSDEV_QEMU_TRACE=str(self.work / "qemu.json"),
-                        OSDEV_BUILD_TRACE=str(self.work / "make.json"))
+                        OSDEV_BUILD_TRACE=str(self.work / "make.json"),
+                        OSDEV_BUILD_HISTORY=str(self.work / "make-history.jsonl"),
+                        OSDEV_BUILD_ENV_HISTORY=str(self.work / "make-env.jsonl"),
+                        OSDEV_BOOTSTRAP_TRACE=str(self.work / "bootstrap.json"))
         self.qemu = self.executable("qemu fake", '''
 import json, os, signal, sys
 from pathlib import Path
@@ -66,9 +69,31 @@ sys.exit(status)
 import json, os, signal, sys
 from pathlib import Path
 Path(os.environ["OSDEV_BUILD_TRACE"]).write_text(json.dumps(sys.argv[1:]))
-if os.environ["OSDEV_FAKE_BUILD"] == "hang": signal.pause()
-sys.exit(9 if os.environ["OSDEV_FAKE_BUILD"] == "fail" else 0)
+with Path(os.environ["OSDEV_BUILD_HISTORY"]).open("a") as history:
+    history.write(json.dumps(sys.argv[1:]) + "\\n")
+with Path(os.environ["OSDEV_BUILD_ENV_HISTORY"]).open("a") as history:
+    history.write(json.dumps({name: os.environ.get(name) for name in
+        ("MINYAR_CLANG", "LLVM_CC", "COMPILER_LTO_FLAGS", "MINYAR_INTERACTIVE_BOOTSTRAP")}) + "\\n")
+mode = os.environ["OSDEV_FAKE_BUILD"]
+if mode == "hang": signal.pause()
+if mode == "shared-deadline":
+    import threading
+    threading.Event().wait(0.6)
+sys.exit(9 if mode == "fail" or (mode == "fail-os" and sys.argv[-1] == "all") else 0)
 ''')
+        probe = self.executable("bootstrap probe", '''
+import json, os, shutil, subprocess, sys
+from pathlib import Path
+trace = {"argv": sys.argv[1:], "make": os.path.realpath(shutil.which("make")),
+         "environment": {name: os.environ.get(name) for name in
+            ("MINYAR_CLANG", "LLVM_CC", "COMPILER_LTO_FLAGS", "MINYAR_INTERACTIVE_BOOTSTRAP")}}
+Path(os.environ["OSDEV_BOOTSTRAP_TRACE"]).write_text(json.dumps(trace))
+if len(sys.argv) < 4 or sys.argv[1] != "bootstrap": sys.exit(2)
+sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).returncode)
+''')
+        self.env["OSDEV_BOOTSTRAP_PROBE"] = str(probe)
+        (self.root / "tools").mkdir()
+        (self.root / "tools/toolchain.sh").write_text('#!/bin/sh\nexec "$OSDEV_BOOTSTRAP_PROBE" "$@"\n')
         for name in ("clang", "ld.lld", "llvm-objcopy"):
             self.executable(name, "pass\n")
         self.log = self.work / "serial log.txt"
@@ -97,6 +122,8 @@ sys.exit(9 if os.environ["OSDEV_FAKE_BUILD"] == "fail" else 0)
         result = self.invoke()
         self.assertIn(b"test passed", result.stderr)
         self.assertEqual(self.log.read_bytes(), b"kernel checks passed\r\n")
+        self.assertFalse((self.work / "make-history.jsonl").exists())
+        self.assertFalse((self.work / "bootstrap.json").exists())
         command = json.loads((self.work / "qemu.json").read_text())
         self.assertIn("isa-debug-exit,iobase=0xf4,iosize=0x04", command)
         self.assertIn("-no-reboot", command)
@@ -165,21 +192,50 @@ sys.exit(9 if os.environ["OSDEV_FAKE_BUILD"] == "fail" else 0)
         self.assertEqual(command[command.index("-W") + 1], str(source))
         self.assertIn(f"KERNEL_SOURCE={source}", command)
         self.assertEqual(command[-1], "all")
+        history = [json.loads(line) for line in (self.work / "make-history.jsonl").read_text().splitlines()]
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0], ["-s", "-C", str(self.root), "build/minyarc"])
+        self.assertEqual(history[1], command)
+        bootstrap = json.loads((self.work / "bootstrap.json").read_text())
+        self.assertEqual(bootstrap["argv"], ["bootstrap", str(self.root), "build/minyarc"])
+        self.assertEqual(bootstrap["make"], str(self.make))
         # Returning to the default kernel must also invalidate the old test.
         self.invoke(no_build=False)
         command = json.loads((self.work / "make.json").read_text())
         self.assertIn(f"KERNEL_SOURCE={self.root / 'os/kernel/main.min'}", command)
         self.assertIn("-W", command)
 
+    def test_bootstrap_and_os_share_selected_compiler_and_explicit_flags(self):
+        explicit_flags = "-flto=thin '-fuse-ld=/explicit linker/ld.lld'"
+        self.env.update(MINYAR_CLANG="/conflicting/clang", LLVM_CC="/other/clang",
+                        COMPILER_LTO_FLAGS=explicit_flags, MINYAR_INTERACTIVE_BOOTSTRAP="0")
+        self.invoke(no_build=False)
+        expected = {"MINYAR_CLANG": str(self.bin / "clang"), "LLVM_CC": str(self.bin / "clang"),
+                    "COMPILER_LTO_FLAGS": explicit_flags, "MINYAR_INTERACTIVE_BOOTSTRAP": "1"}
+        bootstrap = json.loads((self.work / "bootstrap.json").read_text())
+        self.assertEqual(bootstrap["environment"], expected)
+        phases = [json.loads(line) for line in (self.work / "make-env.jsonl").read_text().splitlines()]
+        self.assertEqual(phases, [expected, expected])
+
     def test_existing_image_cannot_claim_a_new_kernel_source(self):
         self.invoke("test", "--kernel-source", str(self.root / "os/kernel/main.min"), expected=2)
         self.assertFalse((self.work / "qemu.json").exists())
 
     def test_build_failure_and_timeout_never_boot(self):
-        for mode, status in (("fail", 9), ("hang", 124)):
+        for mode, status, phases in (("fail", 9, 1), ("fail-os", 9, 2), ("hang", 124, 1)):
             with self.subTest(mode=mode):
-                self.invoke("test", "--build-timeout", "0.1", build=mode, expected=status, no_build=False)
+                (self.work / "make-history.jsonl").unlink(missing_ok=True)
+                timeout = "0.1" if mode == "hang" else "5"
+                self.invoke("test", "--build-timeout", timeout, build=mode, expected=status, no_build=False)
                 self.assertFalse((self.work / "qemu.json").exists())
+                history = (self.work / "make-history.jsonl").read_text().splitlines()
+                self.assertEqual(len(history), phases)
+
+    def test_compiler_and_os_share_one_build_deadline(self):
+        self.invoke("test", "--build-timeout", "1", build="shared-deadline", expected=124, no_build=False)
+        history = (self.work / "make-history.jsonl").read_text().splitlines()
+        self.assertEqual(len(history), 2)
+        self.assertFalse((self.work / "qemu.json").exists())
 
     def test_missing_tools_and_artifacts_are_diagnosed(self):
         result = self.invoke("test", "--qemu", str(self.work / "no qemu"), expected=2)
@@ -201,10 +257,18 @@ sys.exit(9 if os.environ["OSDEV_FAKE_BUILD"] == "fail" else 0)
         self.assertEqual(command[command.index("-gdb") + 1], "tcp:127.0.0.1:9123")
 
     def test_dry_run_has_no_tool_or_log_side_effects(self):
-        self.invoke("test", "--dry-run", "--qemu", "/missing/qemu", no_build=False)
+        result = self.invoke("test", "--dry-run", "--qemu", "/missing/qemu", no_build=False)
+        commands = [shlex.split(line[2:]) for line in result.stderr.decode().splitlines() if line.startswith("+ ")]
+        self.assertEqual(commands[0][-1], "build/minyarc")
+        self.assertEqual(commands[0][-4:], [str(self.root / "tools/toolchain.sh"), "bootstrap", str(self.root), "build/minyarc"])
+        self.assertIn(f"MINYAR_CLANG={self.bin / 'clang'}", commands[0])
+        self.assertIn(f"LLVM_CC={self.bin / 'clang'}", commands[1])
+        self.assertEqual(commands[1][-1], "all")
+        self.assertEqual(commands[2][0], "/missing/qemu")
         self.assertFalse(self.log.exists())
         self.assertFalse((self.work / "make.json").exists())
         self.assertFalse((self.work / "qemu.json").exists())
+        self.assertFalse((self.work / "bootstrap.json").exists())
 
     def test_log_cannot_destroy_artifacts(self):
         self.invoke("test", "--log", str(self.output / "kernel.elf"), expected=2)

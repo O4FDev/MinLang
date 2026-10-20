@@ -41,8 +41,9 @@ def tool(name):
     return found
 
 
-def announce(command):
-    print("+ " + shlex.join([str(item) for item in command]), file=sys.stderr, flush=True)
+def announce(command, overrides=None):
+    prefix = ["env"] + [f"{name}={value}" for name, value in overrides.items()] if overrides else []
+    print("+ " + shlex.join(prefix + [str(item) for item in command]), file=sys.stderr, flush=True)
 
 
 def stop(process):
@@ -62,8 +63,8 @@ def stop(process):
     process.wait(timeout=2)
 
 
-def build(command, timeout):
-    process = subprocess.Popen(command, start_new_session=True)
+def build(command, timeout, environment=None):
+    process = subprocess.Popen(command, env=environment, start_new_session=True)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -187,13 +188,19 @@ def run(args):
         raise WorkflowError(f"missing {args.root / 'os/Makefile'}; select a Minyar checkout with --root")
     llvm = llvm_directory(args)
     make = make_command(args, llvm)
+    bootstrap = args.root / "tools/toolchain.sh"
+    compiler = ["sh", str(bootstrap), "bootstrap", str(args.root), "build/minyarc"]
+    overrides = {"MINYAR_CLANG": str(llvm / "clang"), "LLVM_CC": str(llvm / "clang"),
+                 "MINYAR_INTERACTIVE_BOOTSTRAP": "1"}
     qemu = qemu_command(args)
     if args.action == "debug":
         elf = args.root / "build/os" / args.arch / "kernel.elf"
         print("osdev: connect with " + shlex.join(["gdb", str(elf), "-ex", f"target remote 127.0.0.1:{args.gdb_port}"]),
               file=sys.stderr)
     if not args.no_build:
-        announce(make)
+        print(f"osdev: bootstrap PATH make uses {args.make!r} through a temporary symlink", file=sys.stderr)
+        announce(compiler, overrides)
+        announce(make, overrides)
     announce(qemu)
     log = Path(args.log).resolve() if args.log else args.root / "build/os" / args.arch / "osdev-serial.log"
     print(f"osdev: serial log: {log}", file=sys.stderr)
@@ -201,16 +208,32 @@ def run(args):
         return 0
     qemu[0] = tool(qemu[0])
     if not args.no_build:
-        make[0] = tool(make[0])
+        make[0] = str(Path(tool(make[0])).resolve())
+        compiler[0] = tool(compiler[0])
+        if not bootstrap.is_file():
+            raise WorkflowError(f"missing bootstrap helper {bootstrap}")
         for executable in (llvm / "clang", llvm / "llvm-objcopy"):
             tool(executable)
         # os/Makefile searches LLVM_BIN first, then PATH for the ELF linker.
         tool(llvm / "ld.lld" if (llvm / "ld.lld").is_file() else "ld.lld")
         if args.kernel_source and not Path(args.kernel_source).is_file():
             raise WorkflowError(f"missing kernel source {args.kernel_source}")
-        status = build(make, args.build_timeout)
-        if status:
-            return status if status > 0 else 1
+        environment = dict(os.environ, **overrides)
+        # Public bootstrap and nested launchers invoke PATH's `make`. Preserve
+        # --make without changing shared scripts or normalizing their flags.
+        # Inherited explicit COMPILER_LTO_FLAGS stays byte-for-byte unchanged.
+        with tempfile.TemporaryDirectory(prefix="minyar-osdev-make-") as shim:
+            (Path(shim) / "make").symlink_to(make[0])
+            environment["PATH"] = shim + os.pathsep + environment.get("PATH", os.defpath)
+            deadline = time.monotonic() + args.build_timeout
+            for command in (compiler, make):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(f"osdev: build timed out after {args.build_timeout:g}s", file=sys.stderr)
+                    return 124
+                status = build(command, remaining, environment)
+                if status:
+                    return status if status > 0 else 1
     for artifact in ("minyar-os.img", "kernel.elf"):
         path = args.root / "build/os" / args.arch / artifact
         if not path.is_file():

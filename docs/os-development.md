@@ -2,8 +2,13 @@
 
 `tools/osdev.py` builds with the existing `os/Makefile` and starts QEMU with the
 same hardware devices. It runs on Linux and macOS with Python 3.9 or later,
-LLVM (`clang`, `ld.lld`, `llvm-objcopy`), Make and QEMU installed. The compiler
-is built by the Makefile when needed. The commands below run from the repository
+LLVM (`clang`, `ld.lld`, `llvm-objcopy`), Make and QEMU installed. Every build first
+checks `build/minyarc` through the public `tools/toolchain.sh bootstrap` path, then
+builds the OS through `os/Makefile`. This uses the same incremental graph, locking,
+compiler flags and interactive resource policy as the nested `./minyar` launcher.
+Compiler changes cannot leave a stale existing compiler in use, and equivalent
+flag quoting does not alternate the compiler's toolchain stamp between paths.
+The commands below run from the repository
 root; `--root /path/to/Minyar-OS` selects the neighbouring OS checkout instead.
 Relative `--kernel-source`, `--log` and `--elf` paths resolve from the current
 working directory. `--root` changes the checkout used for builds and default
@@ -42,7 +47,12 @@ Dry runs execute no tools and create no logs. The output shell-quotes each
 argument for review; commands themselves run as argument arrays. `--qemu PATH`
 and `--make PATH` each select one executable. `--llvm-bin DIRECTORY` (or the
 `LLVM_BIN` environment variable) selects the build tools; otherwise the wrapper
-uses the directory of `clang` on `PATH`. The existing Makefile's recipe paths
+uses the directory of `clang` on `PATH`. Both build phases and their nested
+launchers receive that selected compiler through `MINYAR_CLANG` and `LLVM_CC`;
+explicit `COMPILER_LTO_FLAGS` values are preserved. A temporary PATH entry named
+`make` points to the selected `--make` executable for public bootstrap and nested
+launchers, then is removed. Dry runs describe this selection without creating it.
+The existing Makefile's recipe paths
 are not fully quoted, so actual builds require a checkout path without spaces.
 Already-built images can be run from paths with spaces or commas.
 
@@ -57,12 +67,13 @@ python3 tools/osdev.py test --arch arm64 \
 ```
 
 `make check-osdev-qemu` runs this Arm test; `OSDEV_ARCH=x86_64` selects the
-PC boot path. The Arm guest exercises PCI discovery, the real e1000 driver's
-packed descriptors and checked TCTL fields, then exits. The legacy QEMU e1000
+PC boot path. Both guests exercise PCI discovery, the real e1000 driver's
+packed descriptors and checked TCTL fields, then exit. The legacy QEMU e1000
 does not emulate TIPG; its exact register bytes are checked by the host suite.
-The x86 loader currently stops in its pre-existing wordmark/graphics path with
-a NaN conversion failure on the Linux emulation box. The wrapper reports that
-failure; use the Arm test for the verified finite path while it is investigated.
+The freestanding square-root shim uses a direct floating-point intrinsic:
+the libc-style builtin could otherwise lower to a recursive call to `sqrt`
+and an undefined result. The guest checks a device-written descriptor length's
+square root; the portable gate also verifies native SQRTSD/FSQRT instructions.
 
 The runtime's typed whole-file I/O is unavailable in freestanding programs:
 valid requests return native error38 (ENOSYS), and negative limits or zero-byte
@@ -96,7 +107,7 @@ The test deadline defaults to 30 seconds and starts after the build. Timeout
 returns **124**, including a guest that prints success and then hangs. Closing
 serial output without exiting does not bypass the deadline. The desktop kernel
 normally runs forever and is therefore unsuitable for this finite test contract.
-Builds have their own 600-second deadline (`--build-timeout`). The wrapper
+The compiler check and OS build share one 600-second deadline (`--build-timeout`). The wrapper
 terminates and reaps the process group when a deadline or interruption occurs.
 Interactive `run` and `debug` have no QEMU deadline unless `--timeout` is supplied.
 
@@ -161,3 +172,16 @@ python3 tools/osdev.py symbolize --arch arm64 --log build/os/arm64/osdev-fault.l
 The first command must fail: the fixture reads an unmapped address. The second
 resolves the fault PC to the retained `faultingRead` function in the matching ELF.
 It is a postmortem symbol check, separate from the successful e1000 guest.
+
+The e1000 driver uses explicit full `machine.fence()` barriers before enabling
+the initial receive ring, after observing DMA completion, and before publishing
+a tail to the device. These order normal RAM and device registers; volatile
+accesses alone do not. Virtio acquires the
+used-ring entries after observing a changed used index. The finite Arm guest
+waits for actual e1000 transmit completion and reads the OS disk directory over
+virtio; `OSDEV DMA PASS` precedes its final success line. These QEMU checks
+exercise the protocol, while hardware ordering still follows the architecture
+and coherent-memory assumptions of the current OS mappings. On Arm,
+`machine.fence()` emits full-system DMB SY, beyond LLVM's inner-shareable
+inter-thread fence. These full fences are stronger than the
+minimum target-specific acquire/release barriers and carry that runtime cost.
