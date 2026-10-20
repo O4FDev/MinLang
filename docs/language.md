@@ -272,6 +272,15 @@ allocations inside user methods remain their own costs. `current()` can return
 any value type, including a record or a List, but cannot return `Nothing`.
 `parallel for` continues to require an Integer range.
 
+Import `sequence` for lazy `sequence.range(first, after)` values. Iterable values
+also support `.map(functionName)`, `.filter(functionName)` and
+`.fold(initial, functionName)` with concrete named functions. Stored recipes do
+no transform work until traversed. Map/filter chains fuse into one loop with
+direct calls, and fold combines items from left to right. Recipes allocate one
+small record per stage when created, with no intermediate Lists or per-item
+protocol wrappers. See [lazy iteration](iteration.md) for examples, costs and
+the generated LLVM shape.
+
 Conditions accept only `Boolean`.
 
 ## Types and built-in operations

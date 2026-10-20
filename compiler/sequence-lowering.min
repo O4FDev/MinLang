@@ -1,0 +1,75 @@
+// Lazy recipes keep only their source. Named transforms are concrete symbols.
+function sequenceRecipeKind(context: CompilerContext, type: Integer): Integer {
+    if !isRecordType(type) { return 0 }
+    let name = context.functionNames[type - 1000]
+    if resultPrefix(name, "minyar_sequence_map_") { return 1 }
+    if resultPrefix(name, "minyar_sequence_filter_") { return 2 }
+    return 0
+}
+
+function prepareSequenceSource(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, source: Text, sourceType: List<Integer>, stages: List<Integer>, location: Integer): Text {
+    if sequenceRecipeKind(context, sourceType[0]) == 0 { return source }
+    let recipe = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for recipe", sourceType[0], recipe)
+    assignReference(output, state, recipe, source, sourceType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, recipe, sourceType[0], source)
+    while sequenceRecipeKind(context, sourceType[0]) != 0 {
+        if stages.length >= 64 { failAtToken(context.tokenLines, location, "a lazy sequence supports at most 64 map and filter stages") }
+        let record = sourceType[0] - 1000
+        let kind = sequenceRecipeKind(context, sourceType[0])
+        if context.functionParameterCounts[record] != 1 { failAtToken(context.tokenLines, location, "invalid compiler-generated sequence recipe") }
+        let first = functionParameterOffset(context.functionParameterCounts, record)
+        let marker = context.functionParameterNames[first]
+        let prefix = "minyar_sequence_map|"
+        if kind == 2 { prefix = "minyar_sequence_filter|" }
+        if !resultPrefix(marker, prefix) { failAtToken(context.tokenLines, location, "invalid compiler-generated sequence transform") }
+        let targetName = marker.slice(prefix.length, marker.length)
+        let target = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, targetName)
+        if target < 0 { failAtToken(context.tokenLines, location, "a lazy sequence transform is unavailable") }
+        let stage = target
+        if kind == 2 { stage = -1 - target }
+        stages.add(stage)
+        let innerType = context.functionParameterTypes[first]
+        source = readRecordField(output, textState, state, source, 0, innerType)
+        setType(sourceType, innerType)
+    }
+    return source
+}
+
+function emitSequenceStages(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, stages: List<Integer>, value: Text, resultType: List<Integer>, stepLabel: Integer, location: Integer): Text {
+    if stages.length == 0 { return value }
+    output.add("  ; minyar-sequence: fused map/filter stages, direct calls\n")
+    let position = stages.length - 1
+    let filtered = false
+    while position >= 0 {
+        let target = stages[position]
+        let filter = target < 0
+        if filter { target = -1 - target }
+        let offset = functionParameterOffset(context.functionParameterCounts, target)
+        if context.functionParameterCounts[target] != 1 || context.functionParameterTypes[offset] != resultType[0] { failAtToken(context.tokenLines, location, "a sequence transform has the wrong item type") }
+        let types: List<Integer> = [resultType[0]]
+        let arguments: List<Text> = [value]
+        borrowReference(output, state, value, resultType[0], context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+        if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "call", context.functionNames[target], threadSignature(context.functionReturnTypes[target], types)) }
+        context.callTargets.add(target)
+        state[14] = state[14] + 1
+        let transformed = emitCall(output, textState, state, context.functionReturnTypes[target], context.functionIRNames[target], arguments, types)
+        recoveryCheckpoint(output, textState, state)
+        if filter {
+            filtered = true
+            if context.functionReturnTypes[target] != 4 { failAtToken(context.tokenLines, location, "a sequence filter must return Boolean") }
+            let keep = "sequence.keep." + Text(newLabel(state))
+            output.add("  br i1 " + transformed + ", label %" + keep + ", label %for.step." + Text(stepLabel) + "\n\n" + keep + ":\n")
+            textState[0] = keep
+        } else {
+            value = transformed
+            setType(resultType, context.functionReturnTypes[target])
+            ownResult(output, state, value, resultType)
+        }
+        position = position - 1
+    }
+    // A rejected item skips assignment. Preserve its temporary owner on that
+    // branch instead of moving the keep into the accepted loop-local store.
+    if filtered { markOwner(resultType, -1) }
+    return value
+}

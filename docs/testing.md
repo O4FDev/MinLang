@@ -65,6 +65,14 @@ the iteration gallery run at O0/O2 with ownership assertions. LLVM checks retain
 the direct method calls and ordinary loop branches. `check-iteration-sanitize`
 adds compiler and generated-program ASan/UBSan instrumentation.
 
+`make check-sequences` checks stored lazy map/filter recipes and left-to-right
+folds over collections, ranges and user iterators. O0/O2 ownership cases cover
+early exits, type-changing maps, rejected managed items, reuse and Integer limits.
+IR assertions prove one loop with direct unboxed transforms and no intermediate
+List or callback dispatch; the LLVM verifier checks the emitted module. The
+check retains `build/sequences-evidence.ll` and `build/sequences-loop.ll`.
+`check-sequences-sanitize` adds ASan/UBSan.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

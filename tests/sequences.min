@@ -1,0 +1,422 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+function functionSymbol(llvm: Text, name: Text): Text {
+    let found = ""
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") {
+            let at = line.find("@")
+            let end = line.find("(")
+            if at >= 0 && end > at {
+                let symbol = line.slice(at, end)
+                if symbol == "@.minyar.fn." + name || symbol == "@.minyar.fn.minyar_module_0_" + name || symbol.startsWith("@\".minyar.fn.minyar.module|" + name + "|") {
+                    test.check(found == "", "sequence LLVM has duplicate functions named " + name)
+                    found = symbol
+                }
+            }
+        }
+    }
+    test.check(found != "", "sequence LLVM has no function named " + name)
+    return found
+}
+
+function functionBody(llvm: Text, symbol: Text): Text {
+    let body: List<Text> = []
+    let taking = false
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " " + symbol + "(") { taking = true }
+        if taking {
+            body.add(line + "\n")
+            if line == "}" { return joinText(body) }
+        }
+    }
+    fail("sequence LLVM function is missing or incomplete: " + symbol)
+}
+
+function occurrences(source: Text, needle: Text): Integer {
+    let count = 0
+    let at = source.find(needle)
+    while at >= 0 {
+        count += 1
+        source = source.slice(at + needle.length, source.length)
+        at = source.find(needle)
+    }
+    return count
+}
+
+function noMaterialization(body: Text): Boolean {
+    return !test.contains(body, "@minyar_list_new") && !test.contains(body, "@minyar_list_add") && !test.contains(body, "@minyar_record_new") && !test.contains(body, "@minyar_bytes_new") && !test.contains(body, "@minyar_callback_check")
+}
+
+function optimizer(frontend: fixtures.Frontend): Text {
+    let directory = test.setting("MINYAR_LLVM_BIN", "")
+    let candidates: List<Text> = []
+    if directory != "" { candidates.add(directory + "/opt") }
+    else {
+        let clang = frontend.compiler.clang
+        let last = -1
+        for index in 0..clang.length { if clang[index] == '/' { last = index } }
+        if last >= 0 { candidates.add(clang.slice(0, last + 1) + "opt") }
+        candidates.add("/usr/lib/llvm-23/bin/opt")
+        candidates.add("opt-23")
+        candidates.add("opt")
+    }
+    let command = ["/bin/sh", "-c", "for tool do if command -v \"$tool\"; then exit 0; fi; done; exit 1", "minyar"]
+    for candidate in candidates { command.add(candidate) }
+    let found = test.run(command, frontend.environment, "", frontend.compiler.directory + "/optimizer-tool", 10)
+    test.check(found.status == 0 && found.output != "", "Required LLVM optimizer unavailable; set MINYAR_LLVM_BIN")
+    return test.lines(found.output)[0]
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let arithmetic = #"""
+    function double(value: Integer): Integer { return value * 2 }
+    function even(value: Integer): Boolean { return value % 2 == 0 }
+    function add(total: Integer, value: Integer): Integer { return total + value }
+
+    """#
+
+fixtures.executes(frontend, #"""
+    global CALLS: List<Integer> = [0, 0, 0]
+    function source(): List<Integer> { CALLS[0] += 1; return [1, 2, 3, 4] }
+    function double(value: Integer): Integer { CALLS[1] += 1; return value * 2 }
+    function aboveFour(value: Integer): Boolean { CALLS[2] += 1; return value > 4 }
+    let recipe = source().map(double).filter(aboveFour)
+    print(CALLS[0]); print(CALLS[1]); print(CALLS[2])
+    let total = 0
+    for value in recipe { total += value }
+    print(total); print(CALLS[0]); print(CALLS[1]); print(CALLS[2])
+    total = 0
+    for value in recipe { total += value }
+    print(total); print(CALLS[0]); print(CALLS[1]); print(CALLS[2])
+    for value in recipe { print(value); break }
+    print(CALLS[1]); print(CALLS[2])
+    """#, "1\n0\n0\n14\n1\n4\n4\n14\n1\n8\n8\n6\n11\n11\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    function reuse() {
+        let values = [1, 2]
+        constant recipe = values.map(double)
+        print(recipe.fold(0, add))
+        print(recipe.map(double).fold(0, add))
+        print(recipe.map(double).fold(0, add))
+    }
+    reuse()
+    function word(value: Integer): Text { return "light \(value)" }
+    function append(total: List<Text>, value: Text): List<Text> { total.add(value); return total }
+    let words = [1, 2].map(word).fold([], append)
+    print(words[0]); print(words[1]); print(words.length)
+    global VALUES: List<Integer> = [1]
+    function growing(value: Integer): Integer {
+        if value == 1 && VALUES.length == 1 { VALUES.add(2) }
+        return value * 2
+    }
+    let recipe = VALUES.map(growing)
+    print(VALUES.length)
+    print(recipe.fold(0, add))
+    print(VALUES.length)
+    """#, "6\n12\n12\nlight 1\nlight 2\n2\n1\n6\n2\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    function mapped(value: Integer): Integer { print("map \(value)"); return value + 10 }
+    function keep(value: Integer): Boolean { print("keep \(value)"); return value % 2 == 0 }
+    let first = [1, 2, 3].map(mapped).filter(keep)
+    print("ready")
+    for value in first { print("body \(value)") }
+    print("reverse")
+    for value in [1, 2, 3].filter(keep).map(mapped) { print("body \(value)") }
+    """#, "ready\nmap 1\nkeep 11\nmap 2\nkeep 12\nbody 12\nmap 3\nkeep 13\nreverse\nkeep 1\nkeep 2\nmap 2\nbody 12\nkeep 3\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    global CALLS: List<Integer> = [0, 0]
+    function double(value: Integer): Integer { CALLS[0] += 1; return value * 2 }
+    function even(value: Integer): Boolean { CALLS[1] += 1; return value % 2 == 0 }
+    let recipe = [1, 2, 3, 4].filter(even).map(double)
+    let total = 0
+    for value in recipe {
+        if value == 4 { continue }
+        total += value
+    }
+    print(total); print(CALLS[0]); print(CALLS[1])
+    CALLS[0] = 0; CALLS[1] = 0
+    function first(): Integer {
+        let protected = Bytes(64)
+        for value in [1, 2, 3, 4].filter(even).map(double) { return value }
+        return 0
+    }
+    print(first()); print(CALLS[0]); print(CALLS[1])
+    CALLS[0] = 0; CALLS[1] = 0
+    for value in recipe { print(value); break }
+    print(CALLS[0]); print(CALLS[1])
+    let empty: List<Integer> = []
+    for value in empty.map(double).filter(even) { fail("empty recipe produced an item") }
+    print(CALLS[0]); print(CALLS[1])
+    """#, "8\n2\n4\n4\n1\n2\n4\n1\n2\n1\n2\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    function digit(total: Integer, value: Integer): Integer { return total * 10 + value }
+    function subtract(total: Integer, value: Integer): Integer { return total - value }
+    function source(): List<Integer> { print("source"); return [1, 2, 3] }
+    function seed(): Integer { print("seed"); return 9 }
+    function traced(total: Integer, value: Integer): Integer { print(value); return total * 10 + value }
+    print(source().fold(seed(), traced))
+    print([1, 2, 3].fold(0, digit))
+    print([1, 2, 3].fold(20, subtract))
+    print([1, 2, 3, 4].map(double).filter(even).fold(0, add))
+    let empty: List<Integer> = []
+    print(empty.map(double).fold(7, add))
+    function never(value: Integer): Boolean { return false }
+    print([1, 2, 3].filter(never).fold(11, add))
+    function together(total: Text, word: Text): Text { return total + word }
+    function append(total: List<Text>, word: Text): List<Text> { total.add(word); return total }
+    function word(value: Integer): Text { return "light \(value)" }
+    print([1, 2].map(word).fold("", together))
+    let kept: List<Text> = []
+    let result = [1, 2].map(word).fold(kept, append)
+    print(result[0]); print(kept[1]); print(result.length)
+    """#, "source\nseed\n1\n2\n3\n9123\n123\n14\n20\n7\n11\nlight 1light 2\nlight 1\nlight 2\n2\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    use "sequence" as sequence
+    record Label { text: Text; bytes: Bytes }
+    function word(value: Integer): Text { return "light \(value)" }
+    function label(word: Text): Label { return Label { text: word; bytes: Bytes(word) } }
+    function pair(value: Label): List<Label> { return [value, value] }
+    function keep(values: List<Label>): Boolean { return values[0].text != "light 2" }
+    let recipe = sequence.range(1, 4).map(word).map(label).map(pair)
+    let kept: List<List<Label>> = []
+    for values in recipe { kept.add(values); if values[0].text == "light 2" { continue } }
+    let stopped: List<Label> = []
+    for values in recipe.filter(keep) { stopped = values; break }
+    function first(): List<Label> {
+        for values in sequence.range(1, 4).map(word).map(label).map(pair) { return values }
+        return []
+    }
+    let returned = first()
+    for index in 0..100 { let scratch = [Bytes(256), Bytes(128)] }
+    for values in kept { print(values[0].text); print(Text(values[1].bytes)) }
+    print(stopped[0].text); print(returned[1].text)
+    function allowed(good: Boolean): Result<Text, Text> { if good { return Ok("!") }; return Err("stopped") }
+    function consume(good: Boolean): Result<Text, Text> {
+        for values in sequence.range(1, 4).map(word).map(label).map(pair) {
+            let protected = Bytes(128)
+            let ending = try allowed(good)
+            return Ok(values[0].text + ending)
+        }
+        return Err("empty")
+    }
+    match consume(true) { Ok(value) { print(value) } Err(error) { print(error) } }
+    match consume(false) { Ok(value) { print(value) } Err(error) { print(error) } }
+    for index in 0..100 {
+        for values in sequence.range(1, 4).map(word).map(label).map(pair).filter(keep) {
+            if values[0].bytes.length != 7 { fail("lost a mapped reference") }
+        }
+    }
+    """#, "light 1\nlight 1\nlight 2\nlight 2\nlight 3\nlight 3\nlight 1\nlight 1\nlight 1!\nstopped\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    function render(value: Integer): Text { return "word " + Text(value) }
+    function never(word: Text): Boolean { return false }
+    function keep(word: Text): Boolean { return word != "word 2" }
+    record Words { count: Integer }
+    record WordCursor { position: Integer; count: Integer }
+    function Words.iterator(): WordCursor { return WordCursor { position: 0; count: self.count } }
+    function WordCursor.advance(): Boolean { self.position += 1; return self.position <= self.count }
+    function WordCursor.current(): Text { return render(self.position) }
+    let kept: List<Text> = []
+    for repetition in 0..100 {
+        for word in [1, 2, 3].map(render).filter(never) { fail("false map predicate accepted an item") }
+        let afterMap = Bytes(64)
+        for word in Words { count: 3 }.filter(never) { fail("false current predicate accepted an item") }
+        let afterCurrent = [Bytes(64), Bytes(32)]
+        for word in [1, 2, 3].map(render).filter(keep) {
+            let scratch = Bytes(64)
+            kept.add(word)
+            if word == "word 1" { continue }
+        }
+        for word in Words { count: 3 }.filter(keep) {
+            let scratch = Bytes(64)
+            kept.add(word)
+            if word == "word 1" { continue }
+        }
+    }
+    print(kept.length); print(kept[0]); print(kept[kept.length - 1])
+    """#, "400\nword 1\nword 3\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    function spelling(letter: Character): Text { return Text(letter) }
+    function notA(letter: Character): Boolean { return letter != 'a' }
+    function together(total: Text, word: Text): Text { return total + word }
+    function length(word: Text): Integer { return word.length }
+    function long(word: Text): Boolean { return word.length > 1 }
+    function aboveTwo(value: Integer): Boolean { return value > 2 }
+    print([1, 2, 3].map(double).fold(0, add))
+    print("aé🙂".filter(notA).map(spelling).fold("", together))
+    print(Bytes("AB").map(double).fold(0, add))
+    let names: Map<Text, Integer> = { "a": 1, "bc": 2 }
+    print(names.map(length).fold(0, add))
+    print(names.filter(long).map(length).fold(0, add))
+    let values: Set<Integer> = Set()
+    values.add(1); values.add(2); values.add(3)
+    print(values.map(double).filter(aboveTwo).fold(0, add))
+    """#, "12\né🙂\n262\n3\n2\n10\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    use "sequence" as sequence
+    function same(value: Integer): Integer { return value }
+    for value in sequence.range(-9223372036854775808, -9223372036854775806).map(same) { print(value) }
+    for value in sequence.range(9223372036854775806, 9223372036854775807).map(same) { print(value) }
+    print(sequence.range(9223372036854775807, 9223372036854775807).fold(7, add))
+    print(sequence.range(5, 3).map(same).fold(9, add))
+    print(sequence.range(1, 6).filter(even).map(double).fold(0, add))
+    global CALLS: List<Integer> = [0, 0]
+    function bound(value: Integer): Integer { CALLS[0] += 1; return value }
+    function measured(value: Integer): Integer { CALLS[1] += 1; return value }
+    let recipe = sequence.range(bound(2), bound(4)).map(measured)
+    print(CALLS[0]); print(CALLS[1])
+    for value in recipe { print(value) }
+    print(CALLS[0]); print(CALLS[1])
+    """#, "-9223372036854775808\n-9223372036854775807\n9223372036854775806\n7\n9\n12\n2\n0\n2\n3\n2\n2\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    record Steps { count: Integer; calls: List<Integer> }
+    record StepCursor { position: Integer; count: Integer; calls: List<Integer> }
+    function Steps.iterator(): StepCursor {
+        self.calls[0] += 1
+        return StepCursor { position: 0; count: self.count; calls: self.calls }
+    }
+    function StepCursor.advance(): Boolean { self.position += 1; return self.position <= self.count }
+    function StepCursor.current(): Integer { self.calls[1] += 1; return self.position }
+    let calls = [0, 0]
+    let source = Steps { count: 3; calls: calls }
+    let recipe = source.map(double).filter(even)
+    print(calls[0]); print(calls[1])
+    let total = 0
+    for left in recipe { for right in recipe { total += left + right } }
+    print(total); print(calls[0]); print(calls[1])
+    print(source.map(double).fold(0, add))
+    """#, "0\n0\n72\n4\n12\n12\n", levels, 0, "", true)
+
+fixtures.executes(frontend, #"""
+    record Garden { value: Integer }
+    record GardenCursor { value: Integer; done: Boolean }
+    function Garden.iterator(): GardenCursor { return GardenCursor { value: self.value; done: false } }
+    function GardenCursor.advance(): Boolean { if self.done { return false }; self.done = true; return true }
+    function GardenCursor.current(): Integer { return self.value }
+    function Garden.map(apply: (Integer) -> Integer): Integer { return apply(self.value) }
+    function Garden.filter(amount: Integer): Integer { return self.value + amount }
+    function Garden.fold(amount: Integer): Integer { return self.value - amount }
+    let garden = Garden { value: 40 }
+    print(garden.map(function(value) { return value + 2 }))
+    print(garden.filter(2)); print(garden.fold(2))
+    let optional: Maybe<Integer> = Some(20)
+    print(optional.map(function(value) { return value + 22 }).unwrapOr(0))
+    print(optional.filter(function(value) { return value == 20 }).isSome())
+    """#, "42\n42\n38\n42\ntrue\n", levels, 0, "", true)
+
+fixtures.executes(frontend, arithmetic + #"""
+    public function fused(values: List<Integer>): Integer {
+        let total = 0
+        for value in values.map(double).filter(even) { total += value }
+        return total
+    }
+    print(fused([])); print(fused([1])); print(fused([1, 2, 3, 4]))
+    """#, "0\n2\n20\n", levels, 0, "", true)
+let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+let fused = functionBody(llvm, functionSymbol(llvm, "fused"))
+test.check(occurrences(fused, "\nfor.condition.") == 1, "a map/filter chain must have one traversal loop")
+let loop = fused.find("\nfor.condition.")
+let scalarLoop = fused.slice(loop, fused.length)
+test.check(noMaterialization(scalarLoop), "a scalar fused loop must not allocate transform objects or intermediate Lists")
+test.check(!noMaterialization("call ptr @minyar_list_new()"), "sequence no-materialization check must reject a List allocation")
+test.check(!noMaterialization("call ptr @minyar_record_new(i64 1)"), "sequence no-materialization check must reject a record allocation")
+let doubleSymbol = functionSymbol(llvm, "double")
+let evenSymbol = functionSymbol(llvm, "even")
+test.check(test.contains(scalarLoop, "call i64 " + doubleSymbol + "("), "scalar mapping must call the user's concrete transform directly with an unboxed Integer")
+test.check(test.contains(scalarLoop, "call zeroext i1 " + evenSymbol + "("), "scalar filtering must call the user's concrete predicate directly with a Boolean result")
+for line in test.lines(fused) {
+    if test.contains(line, "call ") && test.contains(line, "minyar_sequence_") {
+        test.check(!test.contains(line, "_apply"), "fused sequence traversal must not call a per-item apply wrapper")
+    }
+}
+let doubleBody = functionBody(llvm, doubleSymbol)
+let evenBody = functionBody(llvm, evenSymbol)
+test.check(noMaterialization(doubleBody) && noMaterialization(evenBody), "the user's scalar transform and predicate must not allocate")
+for body in [fused, doubleBody, evenBody] {
+    test.check(!test.contains(body, "@minyar_callback_") && !test.contains(body, "call i64 %") && !test.contains(body, "call zeroext i1 %") && !test.contains(body, "call ptr %"), "sequence transforms must not use callback lookup or indirect dispatch")
+}
+test.require(test.run([optimizer(frontend), "-passes=verify", "-disable-output", path + ".ll"], frontend.environment, "", path + ".verify", 30), "verify fused sequence LLVM")
+io.writeTextFile("build/sequences-evidence.ll", llvm)
+io.writeTextFile("build/sequences-loop.ll", fused)
+
+io.writeTextFile(frontend.compiler.directory + "/sequence-transforms.min", test.sourceModules(#"""
+    public function double(value: Integer): Integer { return value * 2 }
+    public function even(value: Integer): Boolean { return value % 2 == 0 }
+    public function add(total: Integer, value: Integer): Integer { return total + value }
+    function secret(value: Integer): Integer { return value + 1 }
+    """#))
+let importedExpected = "43\n24\n"
+fixtures.executes(frontend, #"""
+    use "./sequence-transforms.min" as transforms
+    function seed(left: Integer, right: Integer): Integer { return left + right }
+    print([1, 2, 3].map(transforms.double).filter(transforms.even).fold((seed(10, (20 + 1))), transforms.add))
+    let recipe = [1, 2, 3].map(transforms.double).filter(transforms.even)
+    print(recipe.fold(
+        (((seed((1 + 2), (4 + 5))))),
+        transforms.add
+    ))
+    """#, importedExpected, levels, 0, "", true)
+let importedPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let importedLLVM = io.readTextFile(importedPath + ".ll")
+let prior = importedPath + ".empty.state"
+io.writeTextFile(prior, "")
+let moduleStats: List<Text> = []
+for pass in ["cold", "warm"] {
+    let base = importedPath + "." + pass
+    test.require(test.run([frontend.compiler.executable, importedPath + ".min", base + ".ll", "--module-state", prior, base + ".state", base + ".stats", "--library", "library"], frontend.environment, "", base + ".compile", 30), "compile imported sequence callbacks through " + pass + " module state")
+    let stats = io.readTextFile(base + ".stats")
+    moduleStats.add(pass + ": " + stats)
+    io.writeTextFile("build/sequences-module-stats.txt", joinText(moduleStats))
+    test.check(stats == "0 2 2 0 0 0 false\n", "sequence " + pass + " module state must report feature fallback, not cached body reuse\n" + stats)
+    test.check(io.readTextFile(base + ".state") == "", "sequence feature fallback must not publish unsupported cache interfaces")
+    let moduleLLVM = io.readTextFile(base + ".ll")
+    if test.addressEnabled(frontend.compiler.flags) { moduleLLVM = test.instrument(moduleLLVM) }
+    test.check(moduleLLVM == importedLLVM, "sequence " + pass + " module-state LLVM differs from ordinary compilation")
+    io.writeTextFile(base + ".ll", moduleLLVM)
+    for level in levels {
+        let command = [frontend.compiler.clang, level, "-Wno-override-module"]
+        for flag in frontend.compiler.flags { command.add(flag) }
+        for argument in [base + ".ll", importedPath + "-runtime.o", "-lm", "-o", base + ".exe"] { command.add(argument) }
+        test.require(test.run(command, frontend.environment, "", base + ".link", 30), "link imported sequence callbacks through " + pass + " module state " + level)
+        let result = test.run([base + ".exe"], frontend.environment, "", base + ".run", 30)
+        test.check(result.status == 0 && result.output == importedExpected && result.errorOutput == "", "imported sequence callbacks changed under " + pass + " module state " + level + "\n" + result.output + result.errorOutput)
+    }
+    prior = base + ".state"
+}
+fixtures.rejects(frontend, "use \"./sequence-transforms.min\" as transforms\nlet recipe = [1].map(transforms.secret)\n", "'transforms.secret' is private to its module", true)
+
+fixtures.rejects(frontend, arithmetic + "let recipe = [1].map(function(value: Integer): Integer { return value })\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
+fixtures.rejects(frontend, arithmetic + "let callback: (Integer) -> Integer = function(value) { return value * 2 }\nlet recipe = [1].map(callback)\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
+fixtures.rejects(frontend, "function identity<Item>(value: Item): Item { return value }\nlet recipe = [1].map(identity)\n", "sequence map needs a concrete named function; generic callbacks are not supported yet", true)
+fixtures.rejects(frontend, "function transform(value: Integer): Integer { return value }\nfunction run() { let transform = 7; let recipe = [1].map(transform) }\nrun()\n", "'transform' is a local value", true)
+fixtures.rejects(frontend, "let recipe = [1].map(missing)\n", "sequence map cannot find named function 'missing'", true)
+fixtures.rejects(frontend, "function wrong(): Integer { return 1 }\nlet recipe = [1].map(wrong)\n", "sequence map function must take one Integer argument", true)
+fixtures.rejects(frontend, "function wrong(value: Text): Integer { return value.length }\nlet recipe = [1].map(wrong)\n", "sequence map function must take one Integer argument", true)
+fixtures.rejects(frontend, "function wrong(value: Integer) {}\nlet recipe = [1].map(wrong)\n", "sequence map function must return an item, not Nothing", true)
+fixtures.rejects(frontend, "function wrong(value: Integer): Integer { return value }\nlet recipe = [1].filter(wrong)\n", "sequence filter function must return Boolean", true)
+fixtures.rejects(frontend, "function wrong(value: Text): Boolean { return true }\nlet recipe = [1].filter(wrong)\n", "sequence filter function must take one Integer argument", true)
+fixtures.rejects(frontend, arithmetic + "let recipe = [1].filter(function(value: Integer): Boolean { return true })\n", "sequence filter needs a named function; closures and callback values are not supported yet", true)
+fixtures.rejects(frontend, "function wrong(value: Integer): Integer { return value }\nprint([1].fold(0, wrong))\n", "sequence fold function must take an accumulator and an item", true)
+fixtures.rejects(frontend, "function wrong(total: Integer, value: Text): Integer { return total }\nprint([1].fold(0, wrong))\n", "sequence fold function must take (Accumulator, Integer) and return the same Accumulator type", true)
+fixtures.rejects(frontend, "function wrong(total: Integer, value: Integer): Text { return Text(value) }\nlet value = [1].fold(0, wrong)\n", "sequence fold function must take (Accumulator, Integer) and return the same Accumulator type", true)
+fixtures.rejects(frontend, arithmetic + "let value = [1].fold(\"wrong\", add)\n", "sequence fold initial value must have type Integer", true)
+fixtures.rejects(frontend, arithmetic + "let recipe = [1].map(double, double)\n", "sequence map needs a named function; closures and callback values are not supported yet", true)
+fixtures.rejects(frontend, "function word(value: Integer): Text { return Text(value) }\nfunction even(value: Integer): Boolean { return value % 2 == 0 }\nlet recipe = [1].map(word).filter(even)\n", "sequence filter function must take one Text argument", true)
+fixtures.rejects(frontend, arithmetic + "let callback: (Integer, Integer) -> Integer = function(total, value) { return total + value }\nlet value = [1].fold(0, callback)\n", "sequence fold needs a named function; closures and callback values are not supported yet", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/sequences.min"), "The town settles into evening.\nThere is a light in window 1.\nThere is a light in window 3.\nThere is a light in window 5.\nThere is a light in window 7.\n", levels, 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Lazy named sequences: passed")
