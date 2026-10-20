@@ -190,9 +190,14 @@ def main():
                     assert bool(lines[1]) == (status == 0), actual
                     assert body_path.read_bytes() == body, (body_path.read_bytes(), body)
                     result['body_sha256'] = sha(body_path)
-                    if status:
+                    if not (secure and not trusted):
                         assert request['request'].startswith(method + ' /chunked HTTP/1.1\r\n'), request
                         assert 'Connection: close\r\n' in request['request'], request
+                    else:
+                        assert request['request'] is None, request
+                    if name in ('read-deadline', 'absolute-deadline'):
+                        assert 'timed out' in lines[1], actual
+                    if status:
                         assert all(not h.lower().startswith('set-cookie:') for h in lines[2:]), lines
                     result['passed'] = True
                 except Exception as error:
