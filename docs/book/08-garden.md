@@ -97,8 +97,8 @@ when you are ready to compare approaches. Its program and tests are checked
 alongside every other example in this book.
 
 You now have the pieces to write small tools: data, decisions, repetition,
-functions, tests and explicit failures. For bigger programs, learn
-[modules](../modules.md), which let files share public declarations, and
+functions, tests and explicit failures. Continue with
+[more than one file](09-modules.md) to split the garden into modules, then read
 [the project CLI](../cli.md), which manages builds and dependencies.
 The [language guide](../language.md) describes the rest of Minyar. This
 [garden program is also a runnable gallery file](../../examples/gallery/community-garden.min);

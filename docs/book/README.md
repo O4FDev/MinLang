@@ -12,9 +12,11 @@ There is room for you here.
 ```
 
 The first box is a program. The second is what it prints. You type the first
-box into a file; the second lets you check what happened. Every Minyar box in
-this book is a complete, independent program. You can replace the entire file
-with the next box, without keeping code from an earlier page.
+box into a file; the second lets you check what happened. Through chapter 8,
+each Minyar box is a complete, independent program: replace the entire file
+with the next box, without keeping code from an earlier page. Project chapters
+label their files with a `// file:` comment; keep all the files shown on that
+page together.
 
 Read in order:
 
@@ -26,8 +28,9 @@ Read in order:
 6. [Keeping related things together](06-records.md): describe something real.
 7. [When something is missing or fails](07-results.md): handle both outcomes.
 8. [A small program of your own](08-garden.md): bring the pieces together.
+9. [More than one file](09-modules.md): share a module and test its private code.
 
-After trying the last exercise, compare it with a
+After trying chapter 8's validation exercise, compare it with a
 [worked answer that checks the garden plan](answers.md).
 
 Take breaks. Run each example, change one thing and predict what will happen.
@@ -45,6 +48,8 @@ It compiles every Minyar box and checks successful completion, exact printed
 output and empty standard error at O0 and O2. It also builds and runs embedded
 tests. Each example has its own temporary directory. No handwritten duplicate
 of a book program stands in for the page you read.
+For project pages, the checker assembles the labeled files before compiling
+each one, so imports and private module tests are checked too.
 
 Every program box must have an explicit `output` box, including an empty one
 for a program that prints nothing. The checker rejects missing, orphaned and
@@ -52,3 +57,5 @@ unclosed fences. Shell boxes describe commands to enter in a terminal; the
 [first-program walkthrough](01-first-program.md) explains their prerequisites.
 `make check-book-cli` follows those project commands through the public
 launcher and runs the final garden executable in the release profile.
+It also creates the multi-file harvest project directly from chapter 9,
+checks its imported function and tests, and runs its release executable.

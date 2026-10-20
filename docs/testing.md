@@ -23,8 +23,13 @@ failures. A wrong output must leave both previous site files byte-identical.
 Documentation examples run in private temporary working directories.
 
 `make check-book` reads every Markdown page under `docs/book` and the Rust,
-C++ and Swift transition guides. Each Minyar fence must be a complete program
-with an explicit, immediately following output fence. The suite rejects
+C++ and Swift transition guides. Each Minyar fence must have an explicit,
+immediately following output fence. Ordinary examples are complete programs;
+project pages label every source file with a leading `// file: relative.min`
+comment. The checker assembles all files from one page in each example's
+private directory before compilation. It rejects mixed standalone/project
+pages, unsafe paths, duplicate or ASCII-case-aliasing filenames and malformed
+markers. The suite rejects
 malformed or mistagged fences, checks parser rejection controls, and executes
 every program at O0/O2 against exact stdout, zero exit status and empty stderr.
 It also compiles each example in test mode and executes embedded tests at both
@@ -39,6 +44,8 @@ reads both programs from the published pages and checks the release output
 exactly. An intentionally wrong garden expectation must fail with status 1
 and a failed-test report. The runnable garden gallery must match the book's
 complete source. Both book targets belong to `check-portable`.
+The multi-file harvest walkthrough also proves public/private access and test
+discovery in an imported module, using source taken directly from chapter 9.
 
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including

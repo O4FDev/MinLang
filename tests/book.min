@@ -1,102 +1,52 @@
 use "../tools/testing.min" as test
+use "../tools/book-examples.min" as book
 use "io" as io
 use "files" as files
 use "system" as system
 use "process" as arguments
 
-record Example { source: Text; output: Text; line: Integer }
-record Parsed { examples: List<Example>; error: Text }
-record Page { path: Text; examples: List<Example> }
-
-function whitespace(character: Character): Boolean {
-    return character == ' ' || character == '\t' || character == '\r' || character == '\n'
-}
-function stripped(value: Text): Text {
-    let first = 0
-    let after = value.length
-    while first < after && whitespace(value[first]) { first += 1 }
-    while after > first && whitespace(value[after - 1]) { after -= 1 }
-    return value.slice(first, after)
-}
-function rows(source: Text): List<Text> {
-    let result: List<Text> = []
-    for line in test.lines(source) {
-        if line.endsWith("\r") { line = line.slice(0, line.length - 1) }
-        result.add(line)
-    }
-    return result
-}
-function fence(line: Text): Boolean {
-    let value = stripped(line)
-    return value.startsWith("```") || value.startsWith("~~~")
-}
-function closing(lines: List<Text>, first: Integer): Integer {
-    let position = first + 1
-    while position < lines.length {
-        if fence(lines[position]) {
-            if lines[position] == "```" { return position }
-            return -2
-        }
-        position += 1
-    }
-    return -1
-}
-function content(lines: List<Text>, first: Integer, after: Integer): Text {
-    let parts: List<Text> = []
-    for index in first..after { parts.add(lines[index] + "\n") }
-    return joinText(parts)
-}
-function displayFence(line: Text): Boolean {
-    for tag in ["text", "sh", "shell", "console", "rust", "cpp", "c++", "swift"] {
-        if line == "```" + tag { return true }
-    }
-    return false
-}
-function invalid(line: Integer, message: Text): Parsed {
-    return Parsed { examples: []; error: "line " + Text(line + 1) + ": " + message }
-}
-function parse(source: Text): Parsed {
-    let result = Parsed { examples: []; error: "" }
-    let lines = rows(source)
-    let position = 0
-    while position < lines.length {
-        let line = lines[position]
-        // Reject unsupported spellings instead of silently losing an example.
-        if test.contains(line, "```") || test.contains(line, "~~~") {
-            if line == "```output" { return invalid(position, "orphan output fence") }
-            if line != "```minyar" && !displayFence(line) { return invalid(position, "unsupported or indented code fence") }
-            let after = closing(lines, position)
-            if after == -1 { return invalid(position, "unclosed code fence") }
-            if after == -2 { return invalid(position, "malformed closing code fence") }
-            if line != "```minyar" { position = after + 1; continue }
-            let first = position
-            let program = content(lines, position + 1, after)
-            if stripped(program) == "" { return invalid(first, "empty Minyar program") }
-            position = after + 1
-            while position < lines.length && stripped(lines[position]) == "" { position += 1 }
-            if position == lines.length { return invalid(first, "Minyar program needs an immediately following output fence") }
-            if lines[position] != "```output" { return invalid(position, "Minyar program needs an immediately following output fence") }
-            after = closing(lines, position)
-            if after == -1 { return invalid(position, "unclosed output fence") }
-            if after == -2 { return invalid(position, "malformed closing output fence") }
-            result.examples.add(Example { source: program; output: content(lines, position + 1, after); line: first + 2 })
-            position = after + 1
-        } else { position += 1 }
-    }
-    if result.examples.length == 0 { return invalid(0, "each book page needs at least one Minyar program") }
-    return result
-}
+record Page { path: Text; examples: List<book.Example> }
 
 function parserControls(): Integer {
     let example = "```minyar\nprint(\"Héllo, sea.\")\n```\n\n```output\nHéllo, sea. \n\n```\n"
     let quiet = "```minyar\nlet answer = 42\n```\n```output\n```\n"
-    let parsed = parse("# A chapter\n\n```rust\nfn main() {}\n```\n" + example + quiet)
+    let parsed = book.parse("# A chapter\n\n```rust\nfn main() {}\n```\n" + example + quiet)
     test.check(parsed.error == "" && parsed.examples.length == 2, "parser discovers every complete program beside display fences")
     test.check(parsed.examples[0].source == "print(\"Héllo, sea.\")\n" && parsed.examples[0].output == "Héllo, sea. \n\n" && parsed.examples[0].line == 7,
         "parser preserves UTF-8, source lines, trailing spaces and blank output lines")
-    test.check(parsed.examples[1].output == "", "an explicit empty output fence means zero output bytes")
-    let windows = parse(test.replace(quiet, "\n", "\r\n"))
+    test.check(parsed.examples[1].output == "" && parsed.examples[0].path == "" && parsed.examples[1].path == "", "standalone programs have no file path and explicit empty output means zero bytes")
+    let windows = book.parse(test.replace(quiet, "\n", "\r\n"))
     test.check(windows.error == "" && windows.examples[0].source == "let answer = 42\n" && windows.examples[0].output == "", "CRLF documentation has the same source and output")
+    let module = "// file: src/garden.min\npublic function name(): Text { return \"Héllo, sea.\" }\n"
+    let main = "// file: src/main.min\nuse \"./garden.min\" as garden\nprint(garden.name())\n"
+    let projectPage = "# Files\n\n```minyar\n" + module + "```\n```output\n```\n\n```minyar\n" + main + "```\n```output\nHéllo, sea.\n```\n"
+    let project = book.parse(projectPage)
+    test.check(project.error == "" && project.examples.length == 2, "parser discovers a complete project page")
+    test.check(project.examples[0].path == "src/garden.min" && project.examples[0].source == module && project.examples[0].output == "" && project.examples[0].line == 4,
+        "project module preserves marker, source, line and explicit empty output")
+    test.check(project.examples[1].path == "src/main.min" && project.examples[1].source == main && project.examples[1].output == "Héllo, sea.\n",
+        "project entry preserves relative import and expected output")
+    let projectWindows = book.parse(test.replace(projectPage, "\n", "\r\n"))
+    test.check(projectWindows.error == "" && projectWindows.examples[0].source == module && projectWindows.examples[1].source == main,
+        "CRLF project markers retain normalized complete source files")
+    let nested = book.parse("```minyar\n// file: src/garden_2/Bed-3.min\nprint(42)\n```\n```output\n42\n```\n")
+    test.check(nested.error == "" && nested.examples[0].path == "src/garden_2/Bed-3.min", "safe nested ASCII names are accepted")
+    let private = test.scratch()
+    test.check(files.makeDirectory(private + "/src") == 0, "cannot create private scaffold directory")
+    io.writeTextFile(private + "/src/main.min", "generated source\n")
+    io.writeTextFile(private + "/Minyar.toml", "keep this scaffold\n")
+    book.writeFiles(project.examples, private)
+    test.check(io.readTextFile(private + "/src/main.min") == main && io.readTextFile(private + "/src/garden.min") == module,
+        "materialization copies every page file exactly and replaces scaffold source")
+    test.check(io.readTextFile(private + "/Minyar.toml") == "keep this scaffold\n", "materialization preserves unrelated scaffold files")
+    let second = private + "/second"
+    test.check(files.makeDirectory(second) == 0, "cannot create independent project directory")
+    book.writeFiles(project.examples, second)
+    io.writeTextFile(private + "/src/garden.min", "changed first worktree\n")
+    test.check(io.readTextFile(second + "/src/garden.min") == module, "each project materialization has independent source files")
+    book.writeFiles(nested.examples, second)
+    test.check(io.readTextFile(second + "/src/garden_2/Bed-3.min") == nested.examples[0].source, "materialization creates nested parents")
+    test.removeTree(private)
     let invalidCases: List<List<Text>> = [
         ["# No program\n", "at least one"],
         ["```output\n42\n```\n", "orphan output"],
@@ -122,8 +72,25 @@ function parserControls(): Integer {
         [quiet + "```output\n```\n", "orphan output"],
         [quiet + "```minyarr\nprint(42)\n```\n", "unsupported"]
     ]
+    let marked = "```minyar\n// file: src/main.min\nprint(42)\n```\n```output\n42\n```\n"
+    for path in ["", "/main.min", "../main.min", "src/../main.min", "./main.min", "src/./main.min", "src//main.min", "src/main.min/", "src/.min", "src/main", "src/main.txt", "src/main.MIN", "C:/main.min", "src\\main.min", "-main.min", "src/--main.min", "src/main.min ", "src/my file.min", "src/ma\tin.min", "src/é.min", "src/main;echo.min", "src/a.b.min"] {
+        invalidCases.add([test.replace(marked, "src/main.min", path), "safe canonical relative .min path"])
+    }
+    for marker in ["//file: src/main.min", " // file: src/main.min", "// file:src/main.min", "// file src/main.min", "// file", "// file:\tsrc/main.min", "// File: src/main.min", "// FILE: src/main.min", "// file=src/main.min"] {
+        invalidCases.add([test.replace(marked, "// file: src/main.min", marker), "malformed file marker"])
+    }
+    invalidCases.add([marked + marked, "duplicate project file path"])
+    for path in ["src/Main.min", "Src/main.min", "SRC/MAIN.min"] {
+        invalidCases.add([marked + test.replace(marked, "src/main.min", path), "duplicate project file path"])
+    }
+    invalidCases.add([marked + quiet, "cannot mix project files"])
+    invalidCases.add([quiet + marked, "cannot mix project files"])
+    invalidCases.add([test.replace(marked, "// file: src/main.min\nprint(42)", "print(42)\n// file: src/main.min"), "first source line"])
+    invalidCases.add([test.replace(marked, "// file: src/main.min\nprint(42)", "\n// file: src/main.min\nprint(42)"), "first source line"])
+    invalidCases.add([test.replace(marked, "print(42)\n", ""), "empty Minyar"])
+    invalidCases.add(["```minyar\n// file: src/main.min\nprint(42)\n```\n", "immediately following output"])
     for candidate in invalidCases {
-        let rejected = parse(candidate[0])
+        let rejected = book.parse(candidate[0])
         test.check(test.contains(rejected.error, candidate[1]), "parser accepted or misreported invalid documentation: " + candidate[0] + "\n" + rejected.error)
     }
     return invalidCases.length
@@ -153,11 +120,15 @@ function read(path: Text): Text {
     test.check(files.lastError() == 0, "cannot read required book page: " + path)
     return Text(data)
 }
-function verify(compiler: test.Compiler, example: Example, location: Text, serial: Integer) {
+function verify(compiler: test.Compiler, page: Page, example: book.Example, location: Text, serial: Integer) {
     let work = compiler.directory + "/example-" + Text(serial)
     test.check(files.makeDirectory(work) == 0, "cannot create example directory")
     let source = work + "/program.min"
-    io.writeTextFile(source, example.source)
+    if example.path == "" { io.writeTextFile(source, example.source) }
+    else {
+        book.writeFiles(page.examples, work)
+        source = work + "/" + example.path
+    }
     for mode in ["program", "tests"] {
         let llvm = work + "/" + mode + ".ll"
         let command = [compiler.executable, source, llvm, "--library", "library"]
@@ -203,7 +174,7 @@ for path in ["docs/from-rust.md", "docs/from-cpp.md", "docs/from-swift.md"] { pa
 paths.sort()
 let pages: List<Page> = []
 for path in paths {
-    let parsed = parse(read(path))
+    let parsed = book.parse(read(path))
     test.check(parsed.error == "", path + ": " + parsed.error)
     if path == "docs/book/08-garden.md" {
         test.check(parsed.examples.length == 1 && read("examples/gallery/community-garden.min") == parsed.examples[0].source,
@@ -217,7 +188,7 @@ let checked = 0
 for page in pages {
     for example in page.examples {
         checked += 1
-        verify(compiler, example, page.path + ":" + Text(example.line), checked)
+        verify(compiler, page, example, page.path + ":" + Text(example.line), checked)
     }
 }
 test.removeTree(compiler.directory)

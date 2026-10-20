@@ -1,10 +1,16 @@
 use "../tools/testing.min" as test
-use "../tools/documentation-markup.min" as markup
+use "../tools/book-examples.min" as book
 use "io" as io
 use "system" as system
 use "files" as files
 
 record Walkthrough { launcher: Text; directory: Text; log: Text; serial: Integer }
+
+function page(path: Text): List<book.Example> {
+    let parsed = book.parse(io.readTextFile(path))
+    test.check(parsed.error == "", path + ": " + parsed.error)
+    return parsed.examples
+}
 
 function environment(): List<Text> {
     let result: List<Text> = []
@@ -34,14 +40,14 @@ let walkthrough = Walkthrough { launcher: root + "/minyar"; directory: work; log
 invoke(walkthrough, ["new", "hello"])
 walkthrough.directory = work + "/hello"
 test.check(files.pathSize(walkthrough.directory + "/src/main.min") > 0, "book project scaffold exists")
-let first = markup.examples(io.readTextFile("docs/book/01-first-program.md"), "first chapter")
+let first = page("docs/book/01-first-program.md")
 test.check(first.length == 2, "first chapter has the expected two programs")
 io.writeTextFile(walkthrough.directory + "/src/main.min", first[0].source)
 let hello = invoke(walkthrough, ["run"])
 let debugPrefix = "built " + walkthrough.directory + "/target/debug/hello\nFinished debug hello\n"
 test.check(hello.output == debugPrefix + first[0].output, "first book program runs through the public CLI\n" + hello.output)
 
-let garden = markup.examples(io.readTextFile("docs/book/08-garden.md"), "garden chapter")
+let garden = page("docs/book/08-garden.md")
 test.check(garden.length == 1, "garden chapter has one complete program")
 io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
 invoke(walkthrough, ["check"])
@@ -56,7 +62,9 @@ test.check(broken != garden[0].source, "negative control changed the garden expe
 io.writeTextFile(walkthrough.directory + "/src/main.min", broken)
 let rejected = test.run([walkthrough.launcher, "test"], environment(), walkthrough.directory, work + "/failed-expectation", 180)
 test.check(rejected.status == 1 && test.contains(rejected.output, "2 passed; 1 failed") &&
-    test.contains(rejected.output + rejected.errorOutput, "expectation failed"),
+    test.contains(rejected.output + rejected.errorOutput, "an empty garden needs no seeds") &&
+    test.contains(rejected.output + rejected.errorOutput, "expectation failed") &&
+    test.contains(rejected.output + rejected.errorOutput, "expected 1, got 0"),
     "an incorrect garden expectation must fail, not merely be discovered\n" + rejected.output + rejected.errorOutput)
 io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
 invoke(walkthrough, ["build", "--release"])
@@ -65,5 +73,53 @@ test.check(files.pathSize(executable) > 0, "book's documented release executable
 let released = test.run([executable], system.environment(), walkthrough.directory, work + "/release-run", 10)
 test.require(released, "book release executable")
 test.check(released.output == garden[0].output && released.errorOutput == "", "release garden has exact output\n" + released.output + released.errorOutput)
+
+walkthrough.directory = work
+invoke(walkthrough, ["new", "harvest"])
+walkthrough.directory = work + "/harvest"
+let modules = page("docs/book/09-modules.md")
+test.check(modules.length == 2, "modules chapter has two complete source files")
+book.writeFiles(modules, walkthrough.directory)
+let moduleSource = ""
+let expected = ""
+for example in modules {
+    if example.path == "src/garden.min" { moduleSource = example.source }
+    if example.path == "src/main.min" { expected = example.output }
+}
+test.check(moduleSource != "" && expected != "", "modules chapter has a library and a printing entry file")
+invoke(walkthrough, ["check"])
+let harvest = invoke(walkthrough, ["run"])
+let harvestPrefix = "built " + walkthrough.directory + "/target/debug/harvest\nFinished debug harvest\n"
+test.check(harvest.output == harvestPrefix + expected, "the imported harvest calculation has exact output\n" + harvest.output)
+let moduleTests = invoke(walkthrough, ["test"])
+for name in ["a module can test its private helper", "an empty imported garden needs no seeds", "3 passed; 0 failed"] {
+    test.check(test.contains(moduleTests.output, name), "imported module tests are discovered: " + name + "\n" + moduleTests.output)
+}
+
+let hidden = test.replace(moduleSource, "public function totalSeeds", "function totalSeeds")
+test.check(hidden != moduleSource, "private-access control changed the exported function")
+io.writeTextFile(walkthrough.directory + "/src/garden.min", hidden)
+let privateAccess = test.run([walkthrough.launcher, "check"], environment(), walkthrough.directory, work + "/private-module", 180)
+test.check(privateAccess.status == 1 && test.contains(privateAccess.errorOutput, "'garden.totalSeeds' is private to its module"),
+    "removing public must reject the calling file\n" + privateAccess.output + privateAccess.errorOutput)
+
+let wrongHelper = test.replace(moduleSource, "name: \"Practice\"; seeds: seeds", "name: \"Practice\"; seeds: seeds + 1")
+test.check(wrongHelper != moduleSource, "private-helper control changed the module's calculation")
+io.writeTextFile(walkthrough.directory + "/src/garden.min", wrongHelper)
+let failedModule = test.run([walkthrough.launcher, "test"], environment(), walkthrough.directory, work + "/failed-module-test", 180)
+test.check(failedModule.status == 1 && test.contains(failedModule.output, "2 passed; 1 failed") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "a module can test its private helper") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "expectation failed") &&
+    test.contains(failedModule.output + failedModule.errorOutput, "expected 4, got 5"),
+    "a wrong private helper must fail its imported module test\n" + failedModule.output + failedModule.errorOutput)
+book.writeFiles(modules, walkthrough.directory)
+let recoveredModule = invoke(walkthrough, ["test"])
+test.check(test.contains(recoveredModule.output, "3 passed; 0 failed"), "restoring the private helper recovers every project test\n" + recoveredModule.output)
+invoke(walkthrough, ["build", "--release"])
+let harvestExecutable = walkthrough.directory + "/target/release/harvest"
+test.check(files.pathSize(harvestExecutable) > 0, "harvest's documented release executable exists")
+let harvestRelease = test.run([harvestExecutable], environment(), walkthrough.directory, work + "/harvest-release", 10)
+test.require(harvestRelease, "harvest release executable")
+test.check(harvestRelease.output == expected && harvestRelease.errorOutput == "", "harvest release has exact output\n" + harvestRelease.output + harvestRelease.errorOutput)
 test.removeScratch(work)
-print("Book walkthrough passed: new, run, check, test, failed-expectation control, release build and executable")
+print("Book walkthroughs passed: single-file garden and imported harvest, private access, failed expectations and release executables")
