@@ -39,8 +39,8 @@ build/tooling/tools/clang-driver: build/tooling/tools/clang-driver.ll build/miny
 build/tooling/tools/project-cli: build/tooling/tools/project-cli.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/live-watch-host.c runtime/minyar_native.h
 	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/live-watch-host.c -pthread -lm -o $@
 
-# install.mk is included before these shared objects are defined.
-build/tooling/tools/install-cli: $(MINYAR_TOOL_NATIVE_OBJECTS)
+# These explicit frontend rules are included before the shared objects are defined.
+build/tooling/tools/install-cli build/tooling/tools/repl-cli: $(MINYAR_TOOL_NATIVE_OBJECTS)
 
 .PHONY: check-project-cli
 check-project-cli: build/tooling/tools/project-cli build/tooling/tests/project-cli build/tooling/tools/clang-driver build/minyar-module-build
