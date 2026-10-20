@@ -267,6 +267,12 @@ constants, globals, imports, native bodies, manifests and initialization must st
 unchanged. Incompatible edits are rejected; stop and run again to accept them.
 Managed threads and parallel loops currently require ordinary watch mode.
 
+After a successful function update, saving identical source bytes keeps the
+published image and skips frontend compilation and native compilation/linking.
+Source discovery, identity checks and the Clang version probe still run. This
+shortcut starts after the first accepted update; initial builds and changed
+function bodies still compile. Missing or corrupt cache metadata rebuilds.
+
 Hot mode adds an indirect dispatch to function calls and checks for a published
 update at most every 25 milliseconds. Debug uses O0 and release uses O2 without
 whole-program LTO. Successful code generations remain resident because old

@@ -7,6 +7,7 @@ use "process" as process
 use "system" as system
 use "files" as files
 use "json" as json
+use "text" as textCodec
 
 record Sources { paths: List<Text>; texts: List<Text>; error: Text }
 function imports(source: Text): List<Text> {
@@ -65,6 +66,52 @@ function unchanged(inputs: Sources): Boolean {
         if !host.isFile(inputs.paths[index]) || host.readText(inputs.paths[index]) != inputs.texts[index] { return false }
     }
     return true
+}
+function snapshotField(parts: List<Text>, value: Text) { parts.add(Text(value.byteLength) + ":" + value + "\n") }
+function snapshot(inputs: Sources, abi: Text, compiler: Text, root: Text, state: Text, clang: Text, libraries: List<Text>, release: Boolean, incremental: Boolean): Text {
+    let parts = ["live-source-snapshot-v1\n"]
+    snapshotField(parts, abi)
+    snapshotField(parts, host.readText(state + "/signature"))
+    snapshotField(parts, compiler)
+    snapshotField(parts, host.hashFile(host.selfPath()))
+    snapshotField(parts, Text(release))
+    snapshotField(parts, Text(incremental))
+    if incremental { snapshotField(parts, host.hashFile(root + "/build/minyar-module-build")) }
+    let path = host.resolveName(clang)
+    let info = host.fileStatus(path)
+    snapshotField(parts, host.jsonList([path, info.device, info.inode, Text(info.size), Text(info.modified), Text(info.changed), host.hostName(), host.hostMachine()]))
+    for library in libraries { snapshotField(parts, library) }
+    for index in 0..inputs.paths.length {
+        snapshotField(parts, inputs.paths[index])
+        snapshotField(parts, inputs.texts[index])
+    }
+    // Ambient target/deployment/Clang controls count too. Persist only a digest,
+    // so environment values (which may contain credentials) stay out of files.
+    let environment: List<Text> = []
+    for entry in system.environment().sorted() { snapshotField(environment, entry) }
+    snapshotField(parts, host.hashBytes(Bytes(joinText(environment))))
+    return host.hashBytes(Bytes(joinText(parts)))
+}
+function publishedUnchanged(state: Text, identity: Text): Boolean {
+    let path = state + "/current"
+    if !host.isFile(path) || host.resolveName(path) != path || host.fileStatus(path).size > 16 * 1024 * 1024 { return false }
+    let current = host.load(state + "/current")
+    if current.error != 0 || current.data.length == 0 { return false }
+    let end = 0
+    while end < current.data.length && current.data[end] != 0 { end += 1 }
+    if end == 0 || end >= current.data.length - 1 { return false }
+    let imageBytes = current.data.slice(0, end)
+    if !textCodec.validUTF8(imageBytes) { return false }
+    let image = Text(imageBytes)
+    if !image.startsWith(state + "/generation-") || !image.endsWith("/update.so") || host.resolveName(image) != image || !host.isFile(image) { return false }
+    let sidecar = host.parentPath(image) + "/source-identity"
+    if host.resolveName(sidecar) != sidecar || !host.isFile(sidecar) || host.fileStatus(sidecar).size > 1024 { return false }
+    let stored = host.load(sidecar)
+    let code = host.load(image)
+    if stored.error != 0 || code.error != 0 || !textCodec.validUTF8(stored.data) { return false }
+    if Text(stored.data) != "live-snapshot-v1\n" + identity + "\n" + host.hashBytes(code.data) + "\n" + host.hashBytes(current.data) + "\n" { return false }
+    let latest = host.load(state + "/current")
+    return latest.error == 0 && host.hashBytes(latest.data) == host.hashBytes(current.data)
 }
 function run(command: List<Text>, environment: List<Text>): Integer {
     let merged: List<Text> = []
@@ -147,6 +194,20 @@ function buildLive() {
     if !initial && host.readText(state + "/abi") != abi {
         host.stop("hot reload accepts function-body edits only; declarations, state layouts, imports and initialization must stay unchanged. Stop and run again to accept this change")
     }
+    let clang = host.pinnedLlvm(host.selectedClang())
+    let identity = ""
+    if !initial {
+        identity = snapshot(inputs, abi, compiler, root, state, clang, libraries, release, incremental)
+        // Only an accepted table can authorize this shortcut. A successfully
+        // built but stale candidate must never become the next build's oracle.
+        if publishedUnchanged(state, identity) && unchanged(inputs) {
+            let rootsFile = system.getenv("MINYAR_WATCH_ROOTS")
+            if rootsFile != "" { host.writeBytes(rootsFile, graphRoots) }
+            system.writeStandardError("Unchanged source; keeping published update\n")
+            host.cleanup()
+            return
+        }
+    }
     let staging = host.temporaryDirectory(state, "generation-")
     let command = [compiler, entry, staging + "/source.ll"]
     if incremental { command = [root + "/build/minyar-module-build", compiler, entry, staging + "/source.ll", state + "/module-cache"] }
@@ -167,7 +228,6 @@ function buildLive() {
         llvm += "\n@minyar_live_manifest = constant [" + Text(path.byteLength + 1) + " x i8] c\"" + llvmString(path) + "\"\n; minyar-native-library: liveruntime\n"
     }
     host.writeBytes(staging + "/program.ll", Bytes(llvm))
-    let clang = host.pinnedLlvm(host.selectedClang())
     let library = staging + "/update.so"
     if initial {
         let flags = "-O0 -g -Wno-override-module"
@@ -199,6 +259,7 @@ function buildLive() {
             table.addBytes(Bytes(image.names[position])); table.add(0)
             table.addBytes(Bytes(image.symbols[position])); table.add(0)
         }
+        atomic(staging + "/source-identity", Bytes("live-snapshot-v1\n" + identity + "\n" + host.hashFile(library) + "\n" + host.hashBytes(table) + "\n"))
         let candidate = staging + "/candidate"
         atomic(candidate, table)
         let publication = system.getenv("MINYAR_WATCH_PUBLICATION")
