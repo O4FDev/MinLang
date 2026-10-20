@@ -26,10 +26,9 @@ function state(frontend: fixtures.Frontend, entry: Text, output: Text, prior: Te
     test.require(test.run([frontend.compiler.executable, entry, output + ".ll", "--module-state", prior, next, stats, "--library", "library"], frontend.environment, "", output + ".compile", 60), "compile exported enum module state")
 }
 
-function cached(stats: Text, reused: Integer, compiled: Integer) {
+function fallback(stats: Text) {
     let fields = test.words(io.readTextFile(stats))
-    test.check(fields.length >= 7 && Integer(fields[0]) == reused && Integer(fields[1]) == compiled, "enum module cache counters\n" + io.readTextFile(stats))
-    if compiled == 0 { test.check(fields[6] == "true", "enum warm cache did not reconstruct its checked table") }
+    test.check(fields.length >= 7 && fields[0] == "0" && fields[1] == "2" && fields[6] == "false", "enum modules must use whole-program fallback\n" + io.readTextFile(stats))
 }
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
@@ -115,8 +114,8 @@ for invalid in [
     test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected enum source emitted LLVM")
 }
 
-// Keep this graph free of generic/callback/method feature fallback: these are
-// real cached plain-choice bodies and checked tables, including a delta replay.
+// Module-state entrypoints keep the established whole-program choice fallback,
+// including imported scalar enum ABI and replay after client/producer edits.
 let leaf = compiler.directory + "/clock.min"
 let entry = compiler.directory + "/main.min"
 let exported = "public choice Phase { Dawn; Noon; Dusk }\npublic function today(): Phase { return Dawn }\npublic function next(value: Phase): Phase { return match value { Dawn { Noon } Noon { Dusk } Dusk { Dawn } } }\npublic function code(value: Phase): Integer { return match value { Dawn { 0 } Noon { 1 } Dusk { 2 } } }\n"
@@ -129,11 +128,13 @@ let next = compiler.directory + "/next.state"
 let stats = compiler.directory + "/stats"
 io.writeTextFile(empty, "")
 state(frontend, entry, compiler.directory + "/cold", empty, prior, stats)
-cached(stats, 0, 2)
+fallback(stats)
 let baseline = io.readTextFile(compiler.directory + "/cold.ll")
-test.check(test.contains(io.readTextFile(prior), "minyar-module-interface-v8"), "enum ABI state schema was not invalidated")
+test.check(io.readTextFile(prior) == "", "enum fallback persisted unsupported module artifacts")
+test.require(test.run([compiler.executable, entry, compiler.directory + "/direct.ll", "--library", "library"], frontend.environment, "", compiler.directory + "/direct.compile", 60), "compile ordinary exported scalar choices")
+test.check(io.readTextFile(compiler.directory + "/direct.ll") == baseline, "enum module-state fallback differs from ordinary compilation")
 state(frontend, entry, compiler.directory + "/warm", prior, next, stats)
-cached(stats, 2, 0)
+fallback(stats)
 test.check(io.readTextFile(compiler.directory + "/warm.ll") == baseline && io.readTextFile(next) == "", "enum warm state differs from cold compilation")
 for mode in ["cold", "warm"] {
     let modulePath = compiler.directory + "/" + mode
@@ -141,16 +142,15 @@ for mode in ["cold", "warm"] {
     linkAndRun(frontend, modulePath, compiler.runtime, "0\n1\n2\n", "")
 }
 
-// A dirty importer has no choice keyword of its own. Reconstruct choice
-// metadata from the cached producer before normalizing its new constructor.
+// The importer has no choice keyword; its producer still selects fallback.
 io.writeTextFile(entry, entrySource + "print(clock.code(clock.Phase.Dawn))\n")
 state(frontend, entry, compiler.directory + "/client-edit", prior, compiler.directory + "/client.state", stats)
-cached(stats, 1, 1)
+fallback(stats)
 let client = io.readTextFile(compiler.directory + "/client-edit.ll")
 state(frontend, entry, compiler.directory + "/client-fresh", empty, next, stats)
 test.check(io.readTextFile(compiler.directory + "/client-fresh.ll") == client, "edited enum importer differs from fresh compilation")
 state(frontend, entry, compiler.directory + "/client-warm", compiler.directory + "/client.state", next, stats)
-cached(stats, 2, 0)
+fallback(stats)
 test.check(io.readTextFile(compiler.directory + "/client-warm.ll") == client, "edited enum importer did not preserve its warm ABI")
 for mode in ["client-edit", "client-warm"] {
     let modulePath = compiler.directory + "/" + mode
@@ -165,11 +165,11 @@ io.writeTextFile(delta, "")
 io.writeTextFile(plan, pack(["minyar-module-plan-v1", prior, delta, "enum-base-generation"]))
 io.writeTextFile(leaf, test.replace(exported, "return Dawn", "return Noon"))
 state(frontend, entry, compiler.directory + "/edited", plan, delta, stats)
-cached(stats, 1, 1)
-test.check(test.contains(io.readTextFile(delta), "minyar-module-delta-v6"), "enum body edit did not produce the new delta schema")
+fallback(stats)
+test.check(io.readTextFile(delta) == "", "enum fallback persisted an unsupported delta")
 let edited = io.readTextFile(compiler.directory + "/edited.ll")
 state(frontend, entry, compiler.directory + "/replay", plan, next, stats)
-cached(stats, 2, 0)
+fallback(stats)
 test.check(io.readTextFile(compiler.directory + "/replay.ll") == edited && io.readTextFile(next) == "", "enum delta replay changed the scalar ABI")
 state(frontend, entry, compiler.directory + "/fresh", empty, next, stats)
 test.check(io.readTextFile(compiler.directory + "/fresh.ll") == edited, "enum delta differs from a fresh body compilation")
@@ -178,10 +178,10 @@ for mode in ["edited", "replay"] {
     if test.addressEnabled(compiler.flags) { io.writeTextFile(modulePath + ".ll", test.instrument(io.readTextFile(modulePath + ".ll"))) }
     linkAndRun(frontend, modulePath, compiler.runtime, "1\n2\n2\n", "")
 }
-io.writeTextFile(compiler.directory + "/old.state", test.replace(io.readTextFile(prior), "minyar-module-interface-v8", "minyar-module-interface-v7"))
+io.writeTextFile(compiler.directory + "/old.state", pack(["minyar-module-interface-v7", "old", "old"]))
 state(frontend, entry, compiler.directory + "/old-schema", compiler.directory + "/old.state", next, stats)
-cached(stats, 0, 2)
+fallback(stats)
 test.check(io.readTextFile(compiler.directory + "/old-schema.ll") == edited, "old enum state schema retained pointer ABI artifacts")
 
 test.removeTree(compiler.directory)
-print("Choice enums: passed; 16,000 loop values, zero record allocations/live bytes, i64 ABI, nominal types, composition and cold/warm/delta modules")
+print("Choice enums: passed; 16,000 loop values, zero record allocations/live bytes, i64 ABI, nominal types, composition and module-state fallback")

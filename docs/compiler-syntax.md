@@ -126,6 +126,8 @@ type encodings remain compact through 64 layers.
 
 Cached interfaces use `minyar-module-interface-v8` and deltas use
 `minyar-module-delta-v6`, so earlier pointer-ABI artifacts are rebuilt.
+Choice-bearing module graphs retain whole-program compilation, including when
+restored logical choice metadata is the only evidence in a warm state.
 
 `declarations` lists declarations in source order. `symbolNodes[symbol]`
 finds their node without a scan. Internal callback environment symbols map
