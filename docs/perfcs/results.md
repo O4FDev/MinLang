@@ -223,3 +223,50 @@ the downloaded measured-artifact archive; its
 and coordination archive index identify that byte audit. Measured binaries,
 LLVM, inputs and raw output are retained offbox; proof-source/log archives
 explicitly omit reproducible ELF/object files.
+
+## Final-source repeat after the NaN baseline repair
+
+This separate final campaign compares exact control runtime `ce0775824` with
+frozen candidate runtime `b7e605a81`; both include all seven explicit NaN casts.
+It shares the earlier frozen compiler LLVM/input/library and all product inputs.
+It isolates this lane's runtime changes rather than cumulative compiler changes
+or later composition into tonight. All 32 self executions emit identical
+17,171,630-byte LLVM with the hash above. All 272 product counters and 12 complete
+codec-byte oracles pass, with seven retained observations plus one warmup.
+Shipping JS/jsmn accounting is disabled; separate same-object ownership links
+pass. Safelibs remains instrumented for its frozen live-object API.
+
+| Workload/profile | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Self default | 15,278,646,435 | 14,690,629,119 | -3.84862% |
+| Self eager | 4,559,020,146 | 4,559,018,219 | unchanged |
+| JS create default | 169,369,200 | 164,776,858 | -2.71144% |
+| JS create eager | 95,614,966 | 95,615,220 | unchanged |
+| jsmn16 default | 11,149,279,269 | 10,796,870,639 | -3.16082% |
+| jsmn16 eager | 5,419,818,692 | 5,419,818,483 | unchanged |
+| jsmn1024 default | 6,459,141,996 | 6,021,821,391 | -6.77057% |
+| jsmn1024 eager | 2,957,318,637 | 2,957,318,557 | unchanged |
+| jsmn16384 default | 10,535,613,370 | 9,814,721,247 | -6.84243% |
+| jsmn16384 eager | 4,776,857,528 | 4,776,857,101 | unchanged |
+| JPEG default, instrumented | 12,707,542,102 | 12,524,071,846 | -1.44379% |
+| JPEG eager, instrumented | 8,126,381,639 | 8,126,385,883 | unchanged |
+| PNG default, instrumented | 7,132,489,688 | 7,132,484,003 | unchanged |
+| PNG eager, instrumented | 6,270,842,479 | 6,270,844,403 | unchanged |
+| zlib default, instrumented | 5,310,824,019 | 5,310,812,869 | unchanged |
+| zlib eager, instrumented | 4,747,509,798 | 4,747,510,164 | unchanged |
+
+Raw data/build manifests: [self](../../experiments/perfcs/results/postfix-self.json),
+[self manifest](../../experiments/perfcs/results/postfix-self-manifest.json),
+[products](../../experiments/perfcs/results/postfix-products.json) and
+[product manifest](../../experiments/perfcs/results/postfix-products-manifest.json).
+The [independent final-source audit](postfix-data-audit.md) recomputes all 304
+counters/16 medians and checks sample/output/accounting/link/helper identities,
+every runtime Git blob, and unchanged frozen compiler, 103 product input files
+and 78 library files. No discrepancy was found; it does not certify a landing.
+The parent separately verifies all 773 immutable files plus 12 complete decoded
+codec files against the downloaded archive, with a
+[byte receipt](../../experiments/perfcs/results/postfix-archive-coverage.json).
+Full ELF/LLVM/input/raw artifacts are retained in the coordination archive
+`postfix-artifacts.tar.gz`, 58,335,565 bytes, SHA-256
+`502e2a9a81d984f63800b2ea5f2c9165992ef80100902c2825d12e0837f22458`.
+No universal throughput/RSS gain or 1.2x-arena target claim follows.
