@@ -1,5 +1,5 @@
-// Evaluate only scalar Integer expressions. The resulting declarations still use
-// ordinary literal substitution: no getter, allocation or initializer is emitted.
+// Evaluate Integer expressions and immutable tables. Scalar declarations still
+// use literal substitution: no getter, allocation or initializer is emitted.
 // Keep this implementation within stage0's arithmetic-only bootstrap language.
 record ConstantEvaluation {
     kinds: List<Integer>
@@ -10,6 +10,8 @@ record ConstantEvaluation {
     ends: List<Integer>
     values: List<Integer>
     states: List<Integer>
+    tableOffsets: List<Integer>
+    tableValues: List<Integer>
 }
 
 function constantEvaluationLimit(evaluation: ConstantEvaluation, location: Integer, depth: Integer) {
@@ -158,13 +160,14 @@ function constantUnary(evaluation: ConstantEvaluation, cursor: List<Integer>, en
     }
     if kind == 4 && token == "(" {
         let value = constantExpression(evaluation, cursor, end, 3, depth + 1)
-        if cursor[0] >= end || evaluation.texts[cursor[0]] != ")" { failAtToken(evaluation.lines, location, "expected ')' in a compile-time constant") }
+        if cursor[0] >= end || evaluation.kinds[cursor[0]] != 4 || evaluation.texts[cursor[0]] != ")" { failAtToken(evaluation.lines, location, "expected ')' in a compile-time constant") }
         cursor[0] = cursor[0] + 1
         return value
     }
     if kind == 1 {
         let constant = findText(evaluation.names, token)
         if constant < 0 { failAtToken(evaluation.lines, location, "compile-time constants may refer only to Integer constants; '" + readableDeclarationName(token) + "' is not an Integer constant") }
+        if evaluation.states[constant] >= 4 { return constantTableReference(evaluation, constant, cursor, end, depth + 1) }
         if evaluation.states[constant] == 3 { failAtToken(evaluation.lines, location, "compile-time Integer expressions cannot use a non-Integer constant") }
         return evaluateIntegerConstant(evaluation, constant, depth + 1)
     }
@@ -212,6 +215,8 @@ function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, 
     let ends: List<Integer> = []
     let values: List<Integer> = []
     let states: List<Integer> = []
+    let tableOffsets: List<Integer> = []
+    let tableValues: List<Integer> = []
     let sizeStarts: List<Integer> = []
     let sizeEnds: List<Integer> = []
     let sizeValues: List<Integer> = []
@@ -232,8 +237,17 @@ function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, 
                     if kind == 3 || kind == 5 || kind == 7 || (kind == 1 && (texts[initializer] == "true" || texts[initializer] == "false")) { state = 3 }
                 }
                 if end == initializer + 2 && texts[initializer] == "-" && kinds[initializer + 1] == 7 { state = 3 }
+                if kinds[initializer] == 4 && texts[initializer] == "[" { state = 4 }
+                let value = 0
+                let tableOffset = -1
+                if state == 4 {
+                    value = constantTableLength(kinds, texts, lines, initializer, end)
+                    tableOffset = tableValues.length
+                    let item = 0
+                    while item < value { tableValues.add(0); item = item + 1 }
+                }
                 if findText(names, name) >= 0 { failAtToken(lines, start + 1, "module declares '" + readableDeclarationName(name) + "' more than once") }
-                names.add(name); starts.add(initializer); ends.add(end); values.add(0); states.add(state)
+                names.add(name); starts.add(initializer); ends.add(end); values.add(value); states.add(state); tableOffsets.add(tableOffset)
             }
         }
         if kinds[start] == 1 && (texts[start] == "record" || texts[start] == "function") {
@@ -249,7 +263,12 @@ function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, 
                     while kinds[field] != 0 && texts[field] != "}" {
                         if texts[field] == ":" && texts[field + 1] == "Bytes" && texts[field + 2] == "[" {
                             let end = field + 3
-                            while kinds[end] != 0 && kinds[end] != 6 && texts[end] != "]" && texts[end] != "}" { end = end + 1 }
+                            let square = 0
+                            while kinds[end] != 0 && kinds[end] != 6 && texts[end] != "}" && !(texts[end] == "]" && square == 0) {
+                                if kinds[end] == 4 && texts[end] == "[" { square = square + 1 }
+                                if kinds[end] == 4 && texts[end] == "]" { square = square - 1 }
+                                end = end + 1
+                            }
                             if texts[end] == "]" { sizeStarts.add(field + 3); sizeEnds.add(end); sizeValues.add(0) }
                             field = end
                         }
@@ -262,10 +281,15 @@ function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, 
         skipTerminators(kinds, cursor)
     }
     if starts.length == 0 && sizeStarts.length == 0 { return ResultTokenSet { kinds: kinds, texts: texts, lines: lines } }
-    let evaluation = ConstantEvaluation { kinds: kinds, texts: texts, lines: lines, names: names, starts: starts, ends: ends, values: values, states: states }
+    let evaluation = ConstantEvaluation { kinds: kinds, texts: texts, lines: lines, names: names, starts: starts, ends: ends, values: values, states: states, tableOffsets: tableOffsets, tableValues: tableValues }
     let constant = 0
     while constant < names.length {
-        if states[constant] != 3 { let ignored = evaluateIntegerConstant(evaluation, constant, 0) }
+        if states[constant] < 3 { let ignored = evaluateIntegerConstant(evaluation, constant, 0) }
+        constant = constant + 1
+    }
+    constant = 0
+    while constant < names.length {
+        if states[constant] >= 4 { evaluateConstantTable(evaluation, constant, 0) }
         constant = constant + 1
     }
     let size = 0
@@ -286,8 +310,8 @@ function normalizeCompileTimeConstants(kinds: List<Integer>, texts: List<Text>, 
     constant = 0
     size = 0
     while position < kinds.length {
-        if constant < starts.length && position == starts[constant] && states[constant] == 2 {
-            constantEmitInteger(outputKinds, outputTexts, outputLines, values[constant], lines, position)
+        if constant < starts.length && position == starts[constant] && (states[constant] == 2 || states[constant] >= 4) {
+            if states[constant] == 2 { constantEmitInteger(outputKinds, outputTexts, outputLines, values[constant], lines, position) } else { constantEmitTable(evaluation, constant, outputKinds, outputTexts, outputLines) }
             position = ends[constant]
             constant = constant + 1
         } else {

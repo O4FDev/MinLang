@@ -73,13 +73,15 @@ function contractParameters(kinds: List<Integer>, texts: List<Text>, first: Inte
     return parameters
 }
 
+function contractOutcomeName(): Text { return "minyar$contract$result" }
+
+function contractOutcomeAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return position + 1 < kinds.length && kinds[position] == 1 && texts[position] == contractOutcomeName() && (kinds[position + 1] == 6 || (kinds[position + 1] == 4 && texts[position + 1] == "}"))
+}
+
 function contractWrapper(target: ResultTokenSet, source: Text, path: Text, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, function: Integer, name: Integer, helper: Text, opening: Integer, closing: Integer, header: Integer, body: Integer, after: Integer, clauses: List<Integer>, ends: List<Integer>) {
     let parameters = contractParameters(kinds, texts, opening + 1, closing)
     let method = name > function + 1 && texts[name - 1] == "."
-    let result = closing + 1
-    while kinds[result] == 6 { result = result + 1 }
-    let valued = texts[result] == ":"
-    if valued && texts[result + 1] == "Nothing" { valued = false }
     contractCopy(target, kinds, texts, lines, function, header)
     contractToken(target, 4, "{", lines, body)
     let clause = 0
@@ -87,11 +89,11 @@ function contractWrapper(target: ResultTokenSet, source: Text, path: Text, kinds
         if texts[clauses[clause]] != "ensures" { contractCheck(target, source, path, kinds, texts, lines, clauses[clause], ends[clause]) }
         clause = clause + 1
     }
-    if valued {
-        contractToken(target, 1, "let", lines, body)
-        contractToken(target, 1, "minyar$contract$result", lines, body)
-        contractToken(target, 4, "=", lines, body)
-    }
+    // The typed emitter decides whether this outcome is a value or Nothing,
+    // after the ordinary alias and generic transformations have resolved it.
+    contractToken(target, 1, "let", lines, body)
+    contractToken(target, 1, contractOutcomeName(), lines, body)
+    contractToken(target, 4, "=", lines, body)
     if method {
         contractToken(target, 1, "self", lines, name)
         contractToken(target, 4, ".", lines, name)
@@ -128,31 +130,34 @@ function contractWrapper(target: ResultTokenSet, source: Text, path: Text, kinds
         if word != "requires" {
             // A lexical result binding preserves ordinary parameter/field and
             // callback shadowing, and never changes an invariant's namespace.
-            if valued && word == "ensures" {
+            if word == "ensures" {
                 contractToken(target, 1, "if", lines, clauses[clause])
                 contractToken(target, 1, "true", lines, clauses[clause])
                 contractToken(target, 4, "{", lines, clauses[clause])
                 contractToken(target, 1, "let", lines, clauses[clause])
                 contractToken(target, 1, "result", lines, clauses[clause])
                 contractToken(target, 4, "=", lines, clauses[clause])
-                contractToken(target, 1, "minyar$contract$result", lines, clauses[clause])
+                contractToken(target, 1, contractOutcomeName(), lines, clauses[clause])
                 contractToken(target, 6, ";", lines, clauses[clause])
             }
             contractCheck(target, source, path, kinds, texts, lines, clauses[clause], ends[clause])
-            if valued && word == "ensures" {
+            if word == "ensures" {
                 contractToken(target, 4, "}", lines, clauses[clause])
                 contractToken(target, 6, ";", lines, clauses[clause])
             }
         }
         clause = clause + 1
     }
-    if valued {
-        contractToken(target, 1, "return", lines, body)
-        contractToken(target, 1, "minyar$contract$result", lines, body)
-        contractToken(target, 6, ";", lines, body)
-    }
+    contractToken(target, 1, "return", lines, body)
+    contractToken(target, 1, contractOutcomeName(), lines, body)
+    contractToken(target, 6, ";", lines, body)
     contractToken(target, 4, "}", lines, after - 1)
     contractToken(target, 6, ";", lines, after - 1)
+    // Preserve the checked scalar effect boundary on the body helper too.
+    // The lexer canonicalizes both public modifier orders to parallel/public/function.
+    let modifier = function - 1
+    if modifier >= 0 && kinds[modifier] == 1 && texts[modifier] == "public" { modifier = modifier - 1 }
+    if modifier >= 0 && kinds[modifier] == 6 && texts[modifier] == "parallel" { contractCopy(target, kinds, texts, lines, modifier, modifier + 1) }
     contractCopy(target, kinds, texts, lines, function, name)
     contractToken(target, 1, helper, lines, name)
     contractCopy(target, kinds, texts, lines, name + 1, header)
@@ -254,11 +259,43 @@ function normalizeFunctionContracts(source: Text, path: Text, kinds: List<Intege
 
 function isContractCheck(name: Text): Boolean { return resultPrefix(name, "contract check ") }
 
-function emitContractCheck(context: CompilerContext, globals: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>, location: Integer): Text {
-    if types.length != 2 || types[0] != 4 || types[1] != 2 { failAtToken(context.tokenLines, location, name.slice(15, name.length) + " needs a Boolean condition") }
+// This intrinsic is only generated by the contract lowering pass. Its second
+// token is immutable diagnostic metadata, never a managed source expression.
+function parseContractCheck(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, name: Text, location: Integer): Text {
+    let conditionType: List<Integer> = [0]
+    let condition = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, conditionType)
+    if conditionType[0] != 4 { failAtToken(context.tokenLines, location, name.slice(15, name.length) + " needs a Boolean condition") }
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",")
+    if context.tokenKinds[state[0]] != 3 { failCompiler("internal error: invalid contract diagnostic metadata") }
+    let message = context.tokenTexts[state[0]]
+    state[0] = state[0] + 1
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    return emitContractCheck(globals, output, textState, state, condition, message, resultType)
+}
+
+// Only exact, compiler-generated no-argument failure thunks are exempt from
+// the scalar effect proof. User predicates and ordinary fail retain all checks.
+function contractFailureIntrinsic(globals: List<Text>, callee: Text): Boolean {
+    return findText(globals, "; minyar-contract-failure: " + callee + "\n") >= 0
+}
+
+// Keys belong to compiler emitters, never source values. Fixed keys share one
+// immutable message and exact, no-argument failure function per module.
+function staticFailureFunction(globals: List<Text>, textState: List<Text>, key: Text, message: Text): Text {
+    let failure = "\".minyar.contract.failure|" + textState[2] + "|" + key + "\""
+    let marker = "; minyar-contract-failure: " + failure + "\n"
+    if findText(globals, marker) >= 0 { return failure }
+    let literal = testLiteralInModule(globals, message, "contract." + textState[2] + ".")
+    globals.add(marker)
+    globals.add("define internal void @" + failure + "() cold noreturn uwtable {\nentry:\n  call void @minyar_fail(ptr " + literal + ")\n  unreachable\n}\n")
+    return failure
+}
+
+function emitContractCheck(globals: List<Text>, output: List<Text>, textState: List<Text>, state: List<Integer>, condition: Text, message: Text, resultType: List<Integer>): Text {
+    let failure = staticFailureFunction(globals, textState, Text(globals.length), message)
     let label = Text(newLabel(state))
-    output.add("  br i1 " + values[0] + ", label %contract.pass." + label + ", label %contract.fail." + label + "\ncontract.fail." + label + ":\n")
-    output.add("  call void @minyar_fail(ptr " + values[1] + ")\n  unreachable\ncontract.pass." + label + ":\n")
+    output.add("  br i1 " + condition + ", label %contract.pass." + label + ", label %contract.fail." + label + "\ncontract.fail." + label + ":\n")
+    output.add("  call void @" + failure + "()\n  unreachable\ncontract.pass." + label + ":\n")
     textState[0] = "contract.pass." + label
     setType(resultType, 5)
     return ""

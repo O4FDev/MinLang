@@ -6,7 +6,7 @@ check-language-contracts: build/minyarc build/minyar-runtime.o build/tooling/tes
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/language-contracts
 
 check-language-contracts-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/language-contracts
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/language-contracts
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/language-contracts
 
 check check-portable: check-language-contracts
 check-sanitize: check-language-contracts-sanitize

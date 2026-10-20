@@ -22,7 +22,7 @@ function runCompiled(compiler: test.Compiler, level: Text): test.Result {
     let path = compiler.directory + "/case" + Text(compiler.serial)
     let command = [compiler.clang, level, "-Wno-override-module"]
     for flag in compiler.flags { command.add(flag) }
-    for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+    for item in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"] { command.add(item) }
     test.require(test.run(command, system.environment(), "", path + ".link", 60), "link contracts " + level)
     return test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
 }
@@ -56,7 +56,7 @@ function definitions(ir: Text): Integer {
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let compiler = frontend.compiler
-fixtures.validate("LanguageContracts", ["boundaries", "ownership", "names", "failures", "rejections", "release", "incremental", "discovery", "gallery"])
+fixtures.validate("LanguageContracts", ["boundaries", "nothing", "ownership", "names", "failures", "rejections", "release", "parallel", "incremental", "discovery", "gallery"])
 
 // Every successful execution uses the exact ownership/debt oracle, including
 // release builds. Explicit contract failures use its exit-status exception.
@@ -129,6 +129,78 @@ if fixtures.selected("LanguageContracts", "boundaries") {
         print(lantern.share(3))
         print(lantern.light)
         """#, "42\nharbour\n3\n7\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "nothing") {
+    executes(compiler, #"""
+        type Done = Nothing
+        type Finished = Done
+        global events: List<Text> = []
+        function note(label: Text): Boolean { events.add(label); return true }
+        function finish(names: List<Text>, early: Boolean): Finished
+            requires(note("requires"))
+            ensures(names.length == 1 && note("ensures"))
+            invariant(note("invariant")) {
+            let owned = [Bytes(64)]
+            names.add("Ada")
+            if early { return }
+            print(owned.length)
+        }
+        for early in [true, false] {
+            let names: List<Text> = []
+            finish(names, early)
+            print(names[0])
+        }
+        for event in events { print(event) }
+        """#, "Ada\n1\nAda\nrequires\ninvariant\nensures\ninvariant\nrequires\ninvariant\nensures\ninvariant\n", [])
+
+    io.writeTextFile(compiler.directory + "/nothing-types.min", "public type Done = Nothing\npublic type Finished = Done\n")
+    io.writeTextFile(compiler.directory + "/nothing-worker.min", "use \"./nothing-types.min\" as types\npublic function remember(names: List<Text>): types.Finished requires(names.length == 0) ensures(names.length == 1) { names.add(\"home\") }\n")
+    let imported = #"""
+        use "./nothing-types.min" as types
+        use "./nothing-worker.min" as worker
+        function visit(names: List<Text>): types.Done ensures(names.length == 2) {
+            worker.remember(names)
+            names.add("harbour")
+        }
+        let names: List<Text> = []
+        visit(names)
+        for name in names { print(name) }
+        """#
+    executes(compiler, imported, "home\nharbour\n", [])
+    executes(compiler, imported, "home\nharbour\n", ["--release"])
+
+    executes(compiler, #"""
+        type Done = Nothing
+        function same<Item>(value: Item): Item { return value }
+        function check(result: Integer): Done ensures(same(result) == 42) {}
+        function remember<Item>(values: List<Item>, value: Item): Done
+            requires(values.length == 0)
+            ensures(values.length == 1) {
+            let owned = [Bytes(64)]
+            values.add(value)
+        }
+        function completed<Item>(): Item ensures(true) { return }
+        let numbers: List<Integer> = []
+        let names: List<Text> = []
+        remember(numbers, 42)
+        remember<Text>(names, "home")
+        check(42)
+        completed<Nothing>()
+        print(numbers[0])
+        print(names[0])
+        """#, "42\nhome\n", [])
+
+    fails(compiler, "type Done = Nothing\nfunction finish(): Done\n    ensures(false) {}\nfinish()\n", "ensures", 3, "", [])
+    fixtures.rejects(frontend, "type Done = Nothing\nfunction wrong(): Done ensures(result == 0) {}\nwrong()\n", "result", true)
+    for source in [
+        "function finish() {}\nlet value = finish()\n",
+        "function finish() {}\nlet result = finish()\n",
+        "type Done = Nothing\nfunction finish(): Done {}\nlet value = finish()\n",
+        "type Done = Nothing\nfunction finish(): Done ensures(true) {}\nlet value = finish()\n"
+    ] {
+        fixtures.rejects(frontend, source, "Nothing cannot be stored in a binding", true)
+    }
 }
 
 if fixtures.selected("LanguageContracts", "ownership") {
@@ -277,6 +349,86 @@ if fixtures.selected("LanguageContracts", "release") {
     }
 
     executes(compiler, "test \"excluded contracts need no checking\" {\n    function main() requires() { native \"not_a_library\" }\n}\nfunction answer(): Integer ensures(result == 42) { return 42 }\nprint(answer())\n", "42\n", [])
+}
+
+if fixtures.selected("LanguageContracts", "parallel") {
+    io.writeTextFile(compiler.directory + "/parallel-left.min", "public parallel function next(value: Integer): Integer requires(value >= 0) ensures(result == value + 1) { return value + 1 }\n")
+    io.writeTextFile(compiler.directory + "/parallel-right.min", "parallel public function double(value: Integer): Integer invariant(value >= 0) ensures(result == value * 2) { return value * 2 }\n")
+    let source = #"""
+        use "./parallel-left.min" as left
+        use "./parallel-right.min" as right
+        parallel function nonnegative(value: Integer): Boolean { return value >= 0 }
+        parallel function answer(value: Integer): Integer
+            requires(nonnegative(value))
+            ensures(result == (value + 1) * 2) { return right.double(left.next(value)) }
+        let values: List<Integer> = []
+        for index in 0..4096 { values.add(0) }
+        parallel for index in 0..values.length { values[index] = answer(index) }
+        print(values[4095])
+        """#
+    executes(compiler, source, "8192\n", [])
+    let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    let scalar = false
+    let scalarFunctions = 0
+    for line in test.lines(ir) {
+        if line.startsWith("define ") && test.contains(line, "@.minyar.fn.") { scalar = true; scalarFunctions += 1 }
+        if scalar {
+            test.check(!test.contains(line, "@minyar_rc_") && !test.contains(line, "@minyar_stack_"), "parallel contract wrapper/helper uses owner-thread machinery")
+        }
+        if line == "}" { scalar = false }
+    }
+    test.check(scalarFunctions >= 7, "parallel contract helper proof did not inspect imported bodies")
+    executes(compiler, source, "8192\n", ["--release"])
+    let erased = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    for omitted in ["contract failed", "contract.failure|", "minyar_contract_body_"] {
+        test.check(!test.contains(erased, omitted), "parallel release retains contract implementation " + omitted)
+    }
+
+    for kind in ["requires", "ensures", "invariant"] {
+        let failing = "parallel function answer(): Integer\n    " + kind + "(false) { return 42 }\ntest \"parallel contracts survive release test mode\" { print(answer()) }\nprint(answer())\n"
+        fails(compiler, failing, kind, 2, "", [])
+        executes(compiler, failing, "42\n", ["--release"])
+        fails(compiler, failing, kind, 2, "", ["--release", "--test-mode"])
+        fails(compiler, failing, kind, 2, "", ["--test-mode", "--release"])
+    }
+    fixtures.rejects(frontend, "function predicate(value: Integer): Boolean { print(value); return true }\nparallel function answer(value: Integer): Integer requires(predicate(value)) { return value }\nprint(answer(42))\n", "can only call parallel functions", true)
+    fixtures.rejects(frontend, "parallel function answer(value: Integer): Integer requires(true) { let owned = Bytes(1); return value }\nprint(answer(42))\n", "may use only Integer, Float, Boolean and Character values", true)
+    fixtures.rejects(frontend, "parallel function answer(value: Integer): Integer requires(\"managed predicate\".length > 0) { return value }\nprint(answer(42))\n", "cannot use the runtime ('minyar_text_length')", true)
+    fixtures.rejects(frontend, "use \"machine\" as machine\nparallel function predicate(value: Integer): Boolean { return machine.load64(value) == 0 }\nparallel function answer(value: Integer): Integer requires(predicate(value)) { return value }\nlet values = [0]\nparallel for index in 0..1 { values[index] = answer(index) }\n", "must be a pure parallel function", true)
+    for options in [["--release"], []] {
+        let native = compileWith(compiler, "parallel function clock(): Integer requires(true) { native \"system\" }\nprint(clock())\n", options)
+        test.check(native.status == 1 && test.contains(native.errorOutput, "contracts on native functions need an ordinary wrapper"), "parallel native contract bypassed wrapper rejection\n" + native.errorOutput)
+        test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected parallel native contract published LLVM")
+    }
+
+    if system.getenv("OS") != "Windows_NT" {
+        // Each cached module has its own globals list. Their first diagnostics
+        // must still name distinct literal and static-failure symbols.
+        io.writeTextFile(compiler.directory + "/literal-left.min", "public function answer(value: Integer): Integer requires(value >= 0) { return value + 1 }\n")
+        io.writeTextFile(compiler.directory + "/literal-right.min", "public function answer(value: Integer): Integer ensures(result >= value) { return value + 1 }\n")
+        let entry = compiler.directory + "/literal-entry.min"
+        io.writeTextFile(entry, "use \"./literal-left.min\" as left\nuse \"./literal-right.min\" as right\nprint(left.answer(20) + right.answer(20))\n")
+        let driver = test.setting("MINYAR_TEST_MODULE_DRIVER", "./build/minyar-module-build")
+        for phase in 0..4 {
+            compiler.serial += 1
+            let path = compiler.directory + "/case" + Text(compiler.serial)
+            let command = [driver, compiler.executable, entry, path + ".ll", compiler.directory + "/literal-cache", path + ".stats", "--library", "library"]
+            if phase >= 2 { command.add("--release") }
+            test.require(test.run(command, system.environment(), "", path + ".compile", 60), "cached independent contract literals")
+            let counters = test.words(io.readTextFile(path + ".stats"))
+            test.check(counters.length == 7, "cached literal counters")
+            if phase == 0 || phase == 2 { test.check(counters[0] == "0" && counters[1] == "3", "literal profile must compile cold") }
+            else { test.check(counters[0] == "3" && counters[1] == "0", "literal profile must reuse all three modules") }
+            let llvm = io.readTextFile(path + ".ll")
+            if phase >= 2 { test.check(!test.contains(llvm, "contract.failure|") && !test.contains(llvm, "contract failed"), "cached release retains static contract failure") }
+            if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+            for level in ["-O0", "-O2"] {
+                let observed = runCompiled(compiler, level)
+                test.require(observed, "run independent cached contract literals")
+                test.check(observed.output == "42\n" && observed.errorOutput == "", "cached contract literal output\n" + observed.output + observed.errorOutput)
+            }
+        }
+    }
 }
 
 if fixtures.selected("LanguageContracts", "gallery") {

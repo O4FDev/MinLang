@@ -45,15 +45,23 @@ missing or unknown case names fail instead of selecting an empty suite.
 
 `make check-language-contracts` checks function preconditions, postconditions and
 boundary invariants at O0/O2 with the ownership oracle. It covers methods,
-generics, early and propagated returns, parameter/result shadowing, imported
+generics, Nothing aliases, early and propagated returns, parameter/result shadowing, imported
 source locations, Boolean rejections and release removal of predicates,
 literals, wrappers and runtime features. Release test mode keeps checks enabled.
+Parallel predicates and helpers retain the ordinary scalar effect checks.
 `check-language-contracts-sanitize` instruments the compiler and generated code.
 
 `make check-compile-time-constants` checks Integer constant arithmetic and bitwise
 evaluation, forward/imported references, native byte-array sizes, overflow,
 invalid shifts, zero division and recursive dependencies. O0/O2 and emitted LLVM
 checks distinguish literal substitution from runtime initialization.
+
+`make check-constant-tables` checks arithmetic element folding, ordered and cyclic
+dependencies, empty/signed-limit tables, once-only dynamic indexes and bounds,
+shadowing, generics, parallel readers, imported tables, debug/release and incremental entry points.
+O0/O2 outputs and LLVM storage assertions prove direct read-only arrays without
+List/Bytes allocation or module initialization. Its sanitizer target checks the
+same ownership-sensitive temporary-index fixtures under ASan/UBSan/LSan.
 
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and

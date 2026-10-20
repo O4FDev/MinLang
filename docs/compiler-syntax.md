@@ -28,6 +28,25 @@ typed declaration discovery, preserving their source origins. Raw incremental
 state signatures include the contract profile, as does the native cache driver,
 so changing profiles cannot reuse a function compiled with different checks.
 
+Wrappers always carry an internal outcome token. Typed emission omits its
+storage, result alias and value return when the resolved return type is Nothing,
+including aliases and generic substitutions. User Nothing bindings still reject.
+Contract diagnostics use static metadata and exact compiler-generated cold
+failure functions, so scalar parallel predicates need no managed values.
+
+Immutable module Integer tables retain kind 3 symbols and canonical folded
+bracket initializers. Integer return-type metadata is an internal dispatch marker;
+the table name never becomes a first-class Integer value. `parseAtom` resolves
+local shadows before checking for a bracket initializer, then consumes indexing
+or `.length`. Index/member nodes retain a name receiver and source span. Native
+array lengths can include a constant table lookup. Generic inference temporarily
+uses a `List<Integer>` shape for member/index result inference; the emitting
+checker still rejects table aliases and mutation. No new type tag is allocated.
+
+The existing constant-declaration incremental fallback remains in force. Table
+sources publish empty state and compile through the complete qualified module
+graph, in debug and release profiles.
+
 Function emission consumes declaration nodes, typed parameter children and
 stored body starts. It does not parse signatures or skip other declarations
 again. Initial record and constant name collection also walks those nodes in

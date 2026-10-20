@@ -227,6 +227,42 @@ zero, overflow, recursive dependencies and expressions deeper than the compiler'
 length can use the same expressions and constants. Functions, mutable globals
 and allocation are not available during constant evaluation.
 
+### Immutable Integer tables
+
+At module scope, a bracket initializer declares an immutable table of Integers.
+Every element is evaluated by the compiler, with the same arithmetic and overflow
+rules as scalar constants:
+
+```minyar
+constant PORTS = [80, 443, 8000 + 80]
+constant COUNT = PORTS.length
+constant HTTPS = PORTS[1]
+
+function port(index: Integer): Integer { return PORTS[index] }
+```
+
+Tables support indexing and `.length`. They cannot be changed, passed as values,
+returned or assigned to another binding. A table declaration has no type annotation.
+Use a local List or an explicitly typed `global` when you need a mutable collection.
+The same bracket syntax inside a function still creates an ordinary List.
+
+Table data occupies eight bytes per element in read-only static storage, with no
+allocation, initialization code, ownership root or getter. Each dynamic access
+evaluates its index once, checks its bounds and loads an Integer. Optimization may
+remove a proven bounds check. An indexed module also contains one shared
+bounds-failure helper and message. `.length` is a literal with no runtime work; a table
+used only for compile-time values needs no runtime data. Empty tables have length
+zero, and every index into them fails. A bad index during constant evaluation is
+a compile error; a bad runtime index stops the program with a source stack trace.
+
+Scalar expressions and table elements can refer to table lengths and constant
+indexes, including declarations written later. Cyclic value dependencies reject.
+Lengths are determined by the source structure, so `constant T = [T.length]` is
+well defined. Dependencies between elements of the same table still count as a
+table value cycle. Existing compiler evaluation-depth limits apply.
+
+### Runtime globals
+
 A module constant cannot execute initialization code. Use an explicit immutable `global` binding for runtime
 initialization. A nonliteral global initializer requires a type annotation:
 
@@ -291,7 +327,8 @@ Ordinary release builds remove the clauses before name resolution and code
 generation, including their calls, literals and wrapper functions. A release
 contract therefore has no runtime cost. An enabled contract costs its predicate
 computations and branches, plus an ordinary wrapper call and the usual ownership
-work for its arguments and result; LLVM may inline these. Predicates may call
+work for its arguments and result, with static failure messages; LLVM may inline
+the calls. Predicates may call
 ordinary functions, so write them without side effects that the program needs.
 They are debug checks, not validation for untrusted input.
 

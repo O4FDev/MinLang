@@ -1,0 +1,173 @@
+// Immutable Integer tables backed by read-only LLVM storage.
+// Evaluator states: 4 = table pending, 5 = table active, 6 = table cached.
+// Cardinality is structural; elements are memoized in one flat compiler array.
+// This file deliberately uses only stage0-safe while loops and assignments.
+
+function constantTableItemEnd(kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer): Integer {
+    let round = 0
+    let square = 0
+    let position = start
+    while position < end && kinds[position] != 0 {
+        if kinds[position] == 4 {
+            let word = texts[position]
+            if round == 0 && square == 0 && (word == "," || word == "]") { return position }
+            if word == "(" { round = round + 1 }
+            if word == ")" { round = round - 1 }
+            if word == "[" { square = square + 1 }
+            if word == "]" { square = square - 1 }
+        }
+        position = position + 1
+    }
+    return position
+}
+
+function constantTableLength(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, start: Integer, end: Integer): Integer {
+    if end <= start + 1 || kinds[end - 1] != 4 || texts[end - 1] != "]" { failAtToken(lines, start, "a compile-time table needs its closing ']'") }
+    let position = start + 1
+    let count = 0
+    while position < end - 1 {
+        let after = constantTableItemEnd(kinds, texts, position, end)
+        if after == position { failAtToken(lines, position, "expected an Integer expression in a compile-time table") }
+        if after >= end { failAtToken(lines, position, "expected ',' or ']' in a compile-time table") }
+        count = count + 1
+        if texts[after] == "]" {
+            if after != end - 1 { failAtToken(lines, after + 1, "expected the end of the compile-time table initializer") }
+            position = end - 1
+        } else { position = after + 1 }
+    }
+    return count
+}
+
+function evaluateConstantTable(evaluation: ConstantEvaluation, constant: Integer, depth: Integer) {
+    let start = evaluation.starts[constant]
+    constantEvaluationLimit(evaluation, start, depth)
+    if evaluation.states[constant] == 6 { return }
+    if evaluation.states[constant] == 5 { failAtToken(evaluation.lines, start, "compile-time table '" + readableDeclarationName(evaluation.names[constant]) + "' depends on itself") }
+    evaluation.states[constant] = 5
+    let end = evaluation.ends[constant]
+    let position = start + 1
+    let item = 0
+    while position < end - 1 {
+        let after = constantTableItemEnd(evaluation.kinds, evaluation.texts, position, end)
+        let inspect = position
+        while inspect < after {
+            let kind = evaluation.kinds[inspect]
+            let word = evaluation.texts[inspect]
+            if kind == 3 || kind == 5 || kind == 7 || (kind == 1 && (word == "true" || word == "false")) { failAtToken(evaluation.lines, inspect, "a compile-time table element must be an Integer constant expression") }
+            inspect = inspect + 1
+        }
+        let cursor: List<Integer> = [position]
+        let value = constantExpression(evaluation, cursor, after, 3, depth + 1)
+        if cursor[0] != after { failAtToken(evaluation.lines, cursor[0], "a compile-time table element must be an Integer constant expression") }
+        evaluation.tableValues[evaluation.tableOffsets[constant] + item] = value
+        item = item + 1
+        if evaluation.texts[after] == "]" { position = end - 1 } else { position = after + 1 }
+    }
+    evaluation.states[constant] = 6
+}
+
+function constantTableReference(evaluation: ConstantEvaluation, constant: Integer, cursor: List<Integer>, end: Integer, depth: Integer): Integer {
+    let location = cursor[0] - 1
+    constantEvaluationLimit(evaluation, location, depth)
+    if cursor[0] + 1 < end && evaluation.kinds[cursor[0]] == 4 && evaluation.texts[cursor[0]] == "." && evaluation.kinds[cursor[0] + 1] == 1 && evaluation.texts[cursor[0] + 1] == "length" {
+        cursor[0] = cursor[0] + 2
+        return evaluation.values[constant]
+    }
+    if cursor[0] >= end || evaluation.kinds[cursor[0]] != 4 || evaluation.texts[cursor[0]] != "[" { failAtToken(evaluation.lines, location, "a compile-time table supports only indexing and .length; it cannot be used as a value") }
+    cursor[0] = cursor[0] + 1
+    let index = constantExpression(evaluation, cursor, end, 3, depth + 1)
+    if cursor[0] >= end || evaluation.kinds[cursor[0]] != 4 || evaluation.texts[cursor[0]] != "]" { failAtToken(evaluation.lines, location, "expected ']' after a compile-time table index") }
+    cursor[0] = cursor[0] + 1
+    if index < 0 || index >= evaluation.values[constant] { failAtToken(evaluation.lines, location, "a compile-time table index is outside its bounds") }
+    evaluateConstantTable(evaluation, constant, depth + 1)
+    return evaluation.tableValues[evaluation.tableOffsets[constant] + index]
+}
+
+function constantEmitTable(evaluation: ConstantEvaluation, constant: Integer, kinds: List<Integer>, texts: List<Text>, lines: SourceMap) {
+    evaluateConstantTable(evaluation, constant, 0)
+    let start = evaluation.starts[constant]
+    constantCopy(kinds, texts, lines, 4, "[", evaluation.lines, start)
+    let item = 0
+    let source = start + 1
+    while item < evaluation.values[constant] {
+        if item > 0 { constantCopy(kinds, texts, lines, 4, ",", evaluation.lines, source) }
+        constantEmitInteger(kinds, texts, lines, evaluation.tableValues[evaluation.tableOffsets[constant] + item], evaluation.lines, source)
+        let after = constantTableItemEnd(evaluation.kinds, evaluation.texts, source, evaluation.ends[constant])
+        source = after + 1
+        item = item + 1
+    }
+    constantCopy(kinds, texts, lines, 4, "]", evaluation.lines, evaluation.ends[constant] - 1)
+}
+
+function isStaticIntegerTable(context: CompilerContext, symbol: Integer): Boolean {
+    if symbol < 0 { return false }
+    let start = context.functionParameterCounts[symbol]
+    if start < 0 || start >= context.tokenKinds.length { return false }
+    return context.tokenKinds[start] == 4 && context.tokenTexts[start] == "["
+}
+
+function staticTableValues(context: CompilerContext, symbol: Integer): List<Text> {
+    let cursor: List<Integer> = [context.functionParameterCounts[symbol] + 1]
+    let values: List<Text> = []
+    while !tokenIs(context.tokenKinds, context.tokenTexts, cursor, "]") {
+        let negative = tokenIs(context.tokenKinds, context.tokenTexts, cursor, "-")
+        if negative { cursor[0] = cursor[0] + 1 }
+        if context.tokenKinds[cursor[0]] != 2 { failAtToken(context.tokenLines, cursor[0], "a compile-time table element must be an Integer constant expression") }
+        let digits = checkedIntegerLiteral(context.tokenTexts[cursor[0]], negative, context.tokenLines, cursor[0])
+        if negative { digits = "-" + digits }
+        values.add(digits)
+        cursor[0] = cursor[0] + 1
+        if !tokenIs(context.tokenKinds, context.tokenTexts, cursor, "]") { expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, cursor, ",") }
+    }
+    return values
+}
+
+function emitStaticTableData(context: CompilerContext, symbol: Integer, values: List<Text>, globals: List<Text>): Text {
+    let name = "@\"minyar.static.table|" + escapeLLVMText(context.functionNames[symbol]) + "\""
+    let pieces: List<Text> = [name + " = private unnamed_addr constant [" + Text(values.length) + " x i64] ["]
+    let item = 0
+    while item < values.length {
+        if item > 0 { pieces.add(", ") }
+        pieces.add("i64 " + values[item])
+        item = item + 1
+    }
+    pieces.add("], align 8\n")
+    let declaration = joinText(pieces)
+    if findText(globals, declaration) < 0 { globals.add(declaration) }
+    return name
+}
+
+function parseStaticIntegerTable(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, symbol: Integer): Text {
+    let location = state[0]
+    let node = context.syntax.active
+    let values = staticTableValues(context, symbol)
+    state[0] = location + 1
+    if tokenIs(context.tokenKinds, context.tokenTexts, state, ".") && context.tokenKinds[state[0] + 1] == 1 && context.tokenTexts[state[0] + 1] == "length" {
+        context.syntax.nodes[node].kind = 212
+        context.syntax.nodes[node].operator = state[0]
+        appendSyntaxNode(context.syntax, 200, location, location + 1, node, 1, symbol)
+        state[0] = state[0] + 2
+        setType(resultType, 1)
+        return Text(values.length)
+    }
+    if !tokenIs(context.tokenKinds, context.tokenTexts, state, "[") { failAtToken(context.tokenLines, location, "a compile-time table supports only indexing and .length; it cannot be used as a value") }
+    context.syntax.nodes[node].kind = 213
+    context.syntax.nodes[node].operator = state[0]
+    appendSyntaxNode(context.syntax, 200, location, location + 1, node, 1, symbol)
+    state[0] = state[0] + 1
+    let indexLocation = state[0]
+    let indexType: List<Integer> = [1]
+    let index = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, indexType)
+    if indexType[0] != 1 { failAtToken(context.tokenLines, indexLocation, "a compile-time table index must be an Integer") }
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, "]")
+    let data = emitStaticTableData(context, symbol, values, globals)
+    let valid = emitInstruction(output, textState, state, "icmp ult i64 " + index + ", " + Text(values.length))
+    let label = Text(newLabel(state))
+    output.add("  br i1 " + valid + ", label %table.good." + label + ", label %table.bad." + label + "\ntable.bad." + label + ":\n")
+    let failure = staticFailureFunction(globals, textState, "table-bounds", "compile-time table position is outside its bounds.")
+    output.add("  call void @" + failure + "()\n  unreachable\ntable.good." + label + ":\n")
+    textState[0] = "table.good." + label
+    let slot = emitInstruction(output, textState, state, "getelementptr inbounds [" + Text(values.length) + " x i64], ptr " + data + ", i64 0, i64 " + index)
+    setType(resultType, 1)
+    return emitInstruction(output, textState, state, "load i64, ptr " + slot + ", align 8")
+}

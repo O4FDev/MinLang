@@ -1,0 +1,294 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function checkStorage(llvm: Text, noContainers: Boolean) {
+    test.check(!test.contains(llvm, "@.minyar.constants.initialize"), "table emitted runtime initialization")
+    test.check(!test.contains(llvm, "minyar.constant|"), "table emitted a runtime getter")
+    if noContainers {
+        test.check(!test.contains(llvm, "call ptr @minyar_list_new("), "table allocated a List")
+        test.check(!test.contains(llvm, "call ptr @minyar_bytes_new("), "table allocated Bytes")
+        test.check(!test.contains(llvm, "call void @minyar_list_append_scalars("), "table copied static data into a List")
+    }
+}
+
+function occurrences(text: Text, needle: Text): Integer {
+    let count = 0
+    let position = 0
+    while position + needle.length <= text.length {
+        if text.slice(position, position + needle.length) == needle { count = count + 1; position = position + needle.length } else { position = position + 1 }
+    }
+    return count
+}
+
+function tableProgram(compiler: test.Compiler, source: Text, expected: Text, profile: Text, mode: Text, fixture: Text): Text {
+    compiler.serial = compiler.serial + 1
+    let path = compiler.directory + "/table" + Text(compiler.serial)
+    let input = path + ".min"
+    let key = path
+    if fixture != "" { key = compiler.directory + "/" + fixture; input = key + ".min" }
+    io.writeTextFile(input, source)
+    let command = [compiler.executable, input, path + ".ll", "--library", "library"]
+    if mode == "state" {
+        if files.pathSize(key + ".prior") < 0 { io.writeTextFile(key + ".prior", "") }
+        command = [compiler.executable, input, path + ".ll", "--module-state", key + ".prior", path + ".next", path + ".stats", "--library", "library"]
+    }
+    if mode == "driver" { command = ["./build/minyar-module-build", compiler.executable, input, path + ".ll", key + ".cache", path + ".stats", "--library", "library"] }
+    if profile == "release" { command.add("--release") }
+    test.require(test.run(command, system.environment(), "", path + ".compile", compiler.compileTimeout), "compile table " + profile + " " + mode)
+    if mode == "state" { test.check(files.pathSize(path + ".next") == 0, "table source published a reusable summary") }
+    let llvm = io.readTextFile(path + ".ll")
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+    let level = 0
+    while level < 2 {
+        let optimization = "-O0"
+        if level == 1 { optimization = "-O2" }
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        let flag = 0
+        while flag < compiler.flags.length { command.add(compiler.flags[flag]); flag = flag + 1 }
+        let arguments = [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"]
+        let argument = 0
+        while argument < arguments.length { command.add(arguments[argument]); argument = argument + 1 }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link table " + optimization)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.require(result, "run table " + optimization)
+        test.check(result.output == expected && result.errorOutput == "", "table output changed\n" + result.output + result.errorOutput + "expected\n" + expected)
+        level = level + 1
+    }
+    return llvm
+}
+
+function boundsFailure(compiler: test.Compiler, source: Text) {
+    test.require(test.compile(compiler, source), "compile dynamic table bounds")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    test.check(test.contains(io.readTextFile(path + ".ll"), "|table-bounds\"() cold noreturn uwtable"), "table bounds failure function needs unwind tables")
+    let level = 0
+    while level < 2 {
+        let optimization = "-O0"
+        if level == 1 { optimization = "-O2" }
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        let flag = 0
+        while flag < compiler.flags.length { command.add(compiler.flags[flag]); flag = flag + 1 }
+        let arguments = [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"]
+        let argument = 0
+        while argument < arguments.length { command.add(arguments[argument]); argument = argument + 1 }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link table bounds")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1, "table bounds status\n" + result.errorOutput)
+        test.check(result.output == "index\n", "table index evaluated more than once or wrong failure order")
+        test.check(test.sameDiagnostic(result.errorOutput, "Minyar stopped: compile-time table position is outside its bounds.\n"), "table bounds diagnostic\n" + result.errorOutput)
+        if level == 0 {
+            test.check(test.contains(result.errorOutput, "  at lookupBoundary (" + path + ".min:2:"), "table bounds trace lost its source caller\n" + result.errorOutput)
+        }
+        level = level + 1
+    }
+}
+
+function parallelBoundsFailure(compiler: test.Compiler, source: Text, profile: Text) {
+    compiler.serial = compiler.serial + 1
+    let path = compiler.directory + "/parallel-bounds" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", source)
+    let command = [compiler.executable, path + ".min", path + ".ll", "--library", "library"]
+    if profile == "release" { command.add("--release") }
+    test.require(test.run(command, system.environment(), "", path + ".compile", compiler.compileTimeout), "compile parallel table bounds " + profile)
+    let llvm = io.readTextFile(path + ".ll")
+    test.check(occurrences(llvm, "|table-bounds\"() cold noreturn") == 1, "parallel table bounds need one static failure function")
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+    for optimization in ["-O0", "-O2"] {
+        let link = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { link.add(flag) }
+        for argument in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"] { link.add(argument) }
+        test.require(test.run(link, system.environment(), "", path + ".link", compiler.linkTimeout), "link parallel table bounds")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1 && result.output == "", "parallel table bounds status/output\n" + result.output + result.errorOutput)
+        test.check(test.sameDiagnostic(result.errorOutput, "Minyar stopped: compile-time table position is outside its bounds.\n"), "parallel table bounds diagnostic\n" + result.errorOutput)
+    }
+}
+
+let compiler = test.compiler()
+let llvm = tableProgram(compiler, #"""
+constant WIDTH = TABLE.length
+constant FIRST = TABLE[0]
+constant BASE = 41
+constant TABLE = [BASE + 1, 1 << 12, -9223372036854775808, 9223372036854775807]
+constant EMPTY = []
+constant SELF_LENGTH = [SELF_LENGTH.length]
+constant LEFT = [RIGHT[0] + 1]
+constant RIGHT = [40 + 1]
+record Packet native "c_packed" { data: Bytes[TABLE[0] + WIDTH] }
+function first(index: Integer): Integer { return TABLE[index] }
+function second(index: Integer): Integer { return TABLE[index] }
+print(WIDTH)
+print(FIRST)
+print(first(1))
+print(second(2))
+print(TABLE[3])
+print(EMPTY.length)
+print(SELF_LENGTH[0])
+print(LEFT[0])
+print(sizeOf(Packet))
+"""#, "4\n42\n4096\n-9223372036854775808\n9223372036854775807\n0\n1\n42\n46\n", "debug", "direct", "")
+checkStorage(llvm, true)
+test.check(occurrences(llvm, " = private unnamed_addr constant [4 x i64]") == 1, "table data was duplicated across readers")
+test.check(test.contains(llvm, "i64 42, i64 4096, i64 -9223372036854775808, i64 9223372036854775807"), "table data was not folded")
+test.check(test.contains(llvm, "icmp ult i64") && test.contains(llvm, "getelementptr inbounds [4 x i64]"), "table did not lower to a checked direct load")
+test.check(occurrences(llvm, "|table-bounds\"() cold noreturn") == 1, "table bounds function duplicated across readers")
+test.check(occurrences(llvm, "compile-time table position is outside its bounds.") == 1, "table bounds message duplicated across readers")
+
+llvm = tableProgram(compiler, "constant TABLE = [1, 2, 3]\nconstant SIZE = TABLE.length\nprint(SIZE)\n", "3\n", "release", "direct", "")
+checkStorage(llvm, true)
+test.check(!test.contains(llvm, "minyar.static.table|"), "length-only table emitted unused runtime data")
+test.check(!test.contains(llvm, "|table-bounds"), "length-only table emitted an unused failure function")
+
+for profile in ["debug", "release"] {
+    llvm = tableProgram(compiler, #"""
+        constant TABLE = [7, 11]
+        parallel function read(index: Integer): Integer { return TABLE[index] }
+        parallel function fixed(): Integer { return TABLE[0] }
+        let values: List<Integer> = []
+        for index in 0..4096 { values.add(0) }
+        parallel for index in 0..values.length {
+            values[index] = read(index % TABLE.length) + TABLE[(index + 1) % TABLE.length]
+        }
+        print(values[4095])
+        print(fixed())
+        """#, "18\n7\n", profile, "direct", "")
+    checkStorage(llvm, false)
+    test.check(occurrences(llvm, "|table-bounds\"() cold noreturn") == 1, "parallel readers need one bounds function per LLVM module")
+    test.check(occurrences(llvm, "compile-time table position is outside its bounds.") == 1, "parallel readers need one static bounds message")
+    let scalar = false
+    let scalarFunctions = 0
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, "@.minyar.fn.") { scalar = true; scalarFunctions = scalarFunctions + 1 }
+        if scalar { test.check(!test.contains(line, "@minyar_rc_") && !test.contains(line, "@minyar_stack_"), "parallel table reader uses owner-thread machinery") }
+        if line == "}" { scalar = false }
+    }
+    test.check(scalarFunctions >= 2, "parallel table reader proof missed its functions")
+    for badIndex in ["-1", "2"] {
+        parallelBoundsFailure(compiler, "constant TABLE = [7, 11]\nparallel function read(index: Integer): Integer { return TABLE[index] }\nprint(read(" + badIndex + "))\n", profile)
+    }
+    // Only the last iteration fails, keeping the exact diagnostic deterministic.
+    parallelBoundsFailure(compiler, "constant TABLE = [7, 11]\nlet values: List<Integer> = []\nfor index in 0..4096 { values.add(0) }\nparallel for index in 0..values.length { values[index] = TABLE[(index / 4095) * 2] }\n", profile)
+}
+test.rejects(compiler, "constant TABLE = [7]\nfunction index(): Integer { return 0 }\nparallel function read(): Integer { return TABLE[index()] }\nprint(read())\n", "can only call parallel functions")
+
+llvm = tableProgram(compiler, "constant TABLE = [7, 11]\nfunction index(): Integer { print(\"index\"); return 1 }\nprint(TABLE[index()])\n", "index\n11\n", "debug", "direct", "")
+checkStorage(llvm, true)
+
+llvm = tableProgram(compiler, #"""
+constant TABLE = [10, 20]
+function parameter(TABLE: List<Integer>): Integer { TABLE[0] = 7; return TABLE[0] }
+function local(): Integer { let TABLE = [3, 4]; TABLE[0] += 2; return TABLE[0] }
+function immutableLocal(): Integer { constant TABLE = [1]; TABLE[0] = 9; return TABLE[0] }
+print(parameter([1]))
+print(local())
+print(immutableLocal())
+for TABLE in [0, 1] { print(TABLE) }
+print(TABLE[1])
+"""#, "7\n5\n9\n0\n1\n20\n", "debug", "direct", "")
+checkStorage(llvm, false)
+
+llvm = tableProgram(compiler, #"""
+constant TABLE = [3, 8]
+function index(data: Bytes): Integer { return data.length % TABLE.length }
+function ownedIndex(): Integer { let words = ["owned"]; return words.length }
+print(TABLE[index(Bytes(5))])
+let data = Bytes(2)
+print(TABLE[index(data)])
+print(data.length)
+print(TABLE[ownedIndex()])
+"""#, "8\n3\n2\n8\n", "debug", "direct", "")
+checkStorage(llvm, false)
+
+llvm = tableProgram(compiler, #"""
+constant TABLE = [40, 42]
+constant EMPTY = []
+function identity<Item>(value: Item): Item { return value }
+function read(): Integer { return identity(TABLE[1]) }
+print(read())
+print(identity(TABLE.length))
+print(identity(EMPTY.length))
+"""#, "42\n2\n0\n", "debug", "direct", "")
+checkStorage(llvm, true)
+
+llvm = tableProgram(compiler, #"""
+constant requires = [
+    20 * 2,
+    1 + 1,
+]
+function identity<Value>(value: Value): Value { return value }
+function read(): Integer { return identity(requires[0]) + identity(requires[1]) }
+print(read())
+print(identity(requires.length))
+"""#, "42\n2\n", "debug", "direct", "")
+checkStorage(llvm, true)
+
+let index = 0
+let badIndexes = ["-1", "2", "9223372036854775807"]
+while index < badIndexes.length {
+    boundsFailure(compiler, "constant TABLE = [7, 11]\nfunction lookupBoundary(index: Integer): Integer { return TABLE[index] }\nfunction index(): Integer { print(\"index\"); return " + badIndexes[index] + " }\nprint(lookupBoundary(index()))\n")
+    index = index + 1
+}
+boundsFailure(compiler, "constant TABLE = []\nfunction lookupBoundary(index: Integer): Integer { return TABLE[index] }\nfunction index(): Integer { print(\"index\"); return 0 }\nprint(lookupBoundary(index()))\n")
+
+let rejections = [
+    ["constant TABLE = [7]\nconstant BAD = TABLE \".\" length\n", "supports only indexing and .length"],
+    ["constant TABLE = [7]\nconstant BAD = TABLE \"[\" 0 \"]\"\n", "supports only indexing and .length"],
+    ["constant TABLE = [7]\nconstant BAD = TABLE[0 \"]\"\n", "expected ']' after a compile-time table index"],
+    ["constant BAD = (1 \")\"\n", "expected ')' in a compile-time constant"],
+    ["constant TABLE = [1]\nlet alias = TABLE\n", "supports only indexing and .length"],
+    ["constant TABLE = [1]\nfunction value(): Integer { return TABLE }\n", "supports only indexing and .length"],
+    ["constant TABLE = [1]\nTABLE[0] = 2\n", "cannot be changed"],
+    ["constant TABLE = [1]\nTABLE[0] += 2\n", "cannot be changed"],
+    ["constant TABLE = [1]\nTABLE.length = 2\n", "cannot be changed"],
+    ["constant TABLE = [1]\nTABLE.add(2)\n", "supports only indexing and .length"],
+    ["constant TABLE: List<Integer> = [1]\n", "a compile-time table has no type annotation"],
+    ["constant TABLE = [\"x\"]\n", "table element must be an Integer"],
+    ["constant TABLE = [1.5]\n", "table element must be an Integer"],
+    ["constant TABLE = [true]\n", "table element must be an Integer"],
+    ["constant TABLE = [[1]]\n", "literal initializer or a compile-time Integer expression"],
+    ["constant TABLE = [9223372036854775807 + 1]\n", "Integer overflow"],
+    ["constant TABLE = [1 / 0]\n", "division by zero"],
+    ["constant TABLE = [later()]\nfunction later(): Integer { return 1 }\n", "may refer only to Integer constants"],
+    ["constant TABLE = [TABLE[0]]\n", "depends on itself"],
+    ["constant A = [B[0]]\nconstant B = [A[0]]\n", "depends on itself"],
+    ["constant TABLE = [SIZE]\nconstant SIZE = TABLE[0]\n", "depends on itself"],
+    ["constant TABLE = []\nconstant BAD = TABLE[0]\n", "table index is outside its bounds"],
+    ["constant TABLE = [1]\nconstant BAD = TABLE[-1]\n", "table index is outside its bounds"],
+    ["constant TABLE = [1]\nconstant BAD = TABLE[1]\n", "table index is outside its bounds"],
+    ["constant TABLE = [1]\nprint(TABLE[true])\n", "table index must be an Integer"]
+]
+index = 0
+while index < rejections.length { test.rejects(compiler, rejections[index][0], rejections[index][1]); index = index + 1 }
+
+// Own-module PORTS.length in this imported module needs the shared systems
+// dotted-root qualification fix announced in NEWS; do not delete that assertion.
+let module = compiler.directory + "/ports.min"
+let source = "public constant PORTS = [80, 400 + 43]\npublic function count(): Integer { return PORTS.length }\npublic function shadow(PORTS: List<Integer>): Integer { return PORTS[0] }\n"
+let entry = "use \"./ports.min\" as ports\nconstant SIZE = ports.PORTS.length\nprint(ports.PORTS[1])\nprint(SIZE)\nprint(ports.count())\nprint(ports.shadow([7]))\n"
+let profiles = ["debug", "release"]
+let modes = ["direct"]
+if system.getenv("OS") != "Windows_NT" { modes.add("state"); modes.add("driver") }
+let profile = 0
+while profile < profiles.length {
+    let mode = 0
+    while mode < modes.length {
+        io.writeTextFile(module, source)
+        let phase = 0
+        while phase < 3 {
+            let expected = "443\n2\n2\n7\n"
+            if phase == 2 { io.writeTextFile(module, test.replace(source, "400 + 43", "400 + 44")); expected = "444\n2\n2\n7\n" }
+            llvm = tableProgram(compiler, entry, expected, profiles[profile], modes[mode], "imports-" + profiles[profile] + "-" + modes[mode])
+            checkStorage(llvm, false)
+            phase = phase + 1
+        }
+        mode = mode + 1
+    }
+    profile = profile + 1
+}
+
+llvm = tableProgram(compiler, io.readTextFile("examples/gallery/packet-tables.min"), "IPv4 version and header: 69\nProtocol: 17\nPrefix bytes: 20\nDocumentation address: 192.0.2.1\n", "release", "direct", "")
+checkStorage(llvm, false)
+test.removeTree(compiler.directory)
+print("Compile-time static tables: passed")
