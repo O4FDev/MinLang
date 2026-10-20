@@ -499,25 +499,64 @@ record Binding { original: Text; retained: Text; digest: Text; size: Integer; er
 function unbound(original: Text, failure: Text, message: Text): Binding {
     return Binding { original: original; retained: ""; digest: ""; size: 0; error: message; failure: failure }
 }
+// Reuse the host's existing streaming SHA-256 implementation without its
+// stop-on-error wrapper: a failed binding must still finalize link evidence.
+function hashFileNative(path: Text): Text { native "driverhost" }
+function makeTemporary(directory: Text, prefix: Text): Text { native "driverhost" }
+function registerTemporary(path: Text): Integer { native "driverhost" }
+function copyBinding(source: Text, destination: Text): Integer {
+    let input = files.open(source, files.READ)
+    if input < 0 { return input }
+    // Stage beside the retained path. Rebinding an existing path, a symlink or
+    // a hard link must never truncate the source before it has been copied.
+    let directory = makeTemporary(host.parentPath(destination), ".retain-")
+    if directory == "" { let error = host.lastError(); files.close(input); return -error }
+    let registered = registerTemporary(directory)
+    if registered < 0 { files.close(input); host.release(directory); return registered }
+    let staged = directory + "/input"
+    let output = files.open(staged, files.WRITE | files.CREATE | files.EXCLUSIVE)
+    if output < 0 { files.close(input); host.release(directory); return output }
+    let buffer = Bytes()
+    let position = 0
+    let error = 0
+    while true {
+        buffer.clear()
+        let count = files.readAppend(input, position, buffer, 65536)
+        if count < 0 { error = count; break }
+        if count == 0 { break }
+        let written = files.write(output, buffer, 0, count)
+        if written < 0 { error = written; break }
+        position += count
+    }
+    let inputClosed = files.close(input)
+    let outputClosed = files.close(output)
+    if error == 0 && inputClosed < 0 { error = inputClosed }
+    if error == 0 && outputClosed < 0 { error = outputClosed }
+    if error == 0 { error = files.rename(staged, destination) }
+    host.release(directory)
+    if error < 0 { return error }
+    return position
+}
 function binding(path: Text, retained: Text): Binding {
     let original = host.resolveName(path)
     let target = host.resolveName(retained)
-    let before = host.load(original)
-    if before.error != 0 { return unbound(original, host.osRepr(before.error), host.osError(before.error, original)) }
+    let first = hashFileNative(original)
+    if first == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, original)) }
     if original != target {
-        let stored = host.store(target, before.data)
+        let stored = copyBinding(original, target)
         if stored < 0 { return unbound(original, host.osRepr(stored), host.osError(stored, target)) }
     }
-    let copied = host.load(target)
-    if copied.error != 0 { return unbound(original, host.osRepr(copied.error), host.osError(copied.error, target)) }
-    let after = host.load(original)
-    if after.error != 0 { return unbound(original, host.osRepr(after.error), host.osError(after.error, original)) }
-    let first = host.hashBytes(before.data)
-    if first != host.hashBytes(copied.data) || first != host.hashBytes(after.data) {
+    let copied = hashFileNative(target)
+    if copied == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, target)) }
+    let after = hashFileNative(original)
+    if after == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, original)) }
+    if first != copied || first != after {
         let message = "link input changed while retaining evidence"
         return unbound(original, "ValueError(" + host.pythonText(message) + ")", message)
     }
-    return Binding { original: original; retained: host.baseName(target); digest: first; size: before.data.length; error: ""; failure: "" }
+    let size = files.pathSize(target)
+    if size < 0 { return unbound(original, host.osRepr(size), host.osError(size, target)) }
+    return Binding { original: original; retained: host.baseName(target); digest: first; size: size; error: ""; failure: "" }
 }
 function bindingFailed(link: Link, value: Binding): Boolean { return failedWith(link, value.failure, value.error) }
 function bindingObject(doc: host.Document, value: Binding): Integer {
