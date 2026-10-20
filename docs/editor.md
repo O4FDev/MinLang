@@ -61,7 +61,9 @@ truncated search. Closed sources are reread and open sources use their current
 buffer contents. Edits carry buffer versions when the client supports versioned
 workspace edits. The server returns edits for the editor to apply.
 
-Rename checks overlapping declarations and name capture. It accepts ASCII
+Rename checks overlapping declarations and name capture. Names shared by local
+values and types, functions or import aliases are declined because their uses
+can belong to different compiler namespaces. It accepts ASCII
 identifier names and declines unsupported bindings, choice cases, interpolated
 references and unresolved expressions that could make an edit incomplete.
 References currently omit interpolation bodies. These restrictions preserve a

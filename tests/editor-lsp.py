@@ -538,9 +538,8 @@ print(count + typed)
         client.diagnostics(shadow_uri, 1)
         definition = query("definition", "sky.light", text=shadow_source, document=shadow_uri, offset=5)["result"]
         assert definition["uri"] == shadow_uri and definition["range"]["start"] == point(shadow_source, "light: Integer"), definition
-        shadow_alias = query("rename", "as sky", text=shadow_source, document=shadow_uri, offset=3, extra={"newName": "heavens"})["result"]
-        shadow_text = apply_edits(shadow_source, shadow_alias["documentChanges"][0]["edits"])
-        assert "as heavens" in shadow_text and "return sky.light" in shadow_text, shadow_text
+        shadow_alias = query("rename", "as sky", text=shadow_source, document=shadow_uri, offset=3, extra={"newName": "heavens"})
+        assert shadow_alias["error"]["code"] == -32602, shadow_alias
         client.send("textDocument/didClose", {"textDocument": {"uri": shadow_uri}})
 
         # Hints are certain scalar literals only, with UTF-16 insertion points.
@@ -590,11 +589,17 @@ print(count + typed)
             ('function identity<Item>(value: Item): Item { return value }\n', "value:", "Item"),
             ('function step(value: Integer): Integer { let value = value + 1; return value }\n', "value:", "input"),
             ('record Lamp { light: Integer }\nfunction make(): Lamp { return Lamp { light: 1 } }\nprint(make().light)\n', "light:", "power"),
+            ('record Lamp { light: Integer }\nfunction read(Lamp: Integer): Integer { let lamp: Lamp = Lamp { light: 40 }; return lamp.light + Lamp }\nprint(read(2))\n', "read(Lamp", "amount"),
         ), start=10):
             client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": unsafe}]})
             client.diagnostics(uri, version)
-            rejected = query("rename", needle, text=unsafe, extra={"newName": new_name})
+            offset = 5 if needle == "read(Lamp" else 0
+            rejected = query("rename", needle, text=unsafe, offset=offset, extra={"newName": new_name})
             assert rejected["error"]["code"] == -32602, (unsafe, rejected)
+            if needle == "read(Lamp":
+                assert query("prepareRename", "record Lamp", text=unsafe, offset=7)["result"] is None
+                rejected_type = query("rename", "record Lamp", text=unsafe, offset=7, extra={"newName": "Lantern"})
+                assert rejected_type["error"]["code"] == -32602, rejected_type
         client.close()
 
         # Clients without documentChanges support receive the baseline changes
