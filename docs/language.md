@@ -1850,6 +1850,31 @@ These operations use release/acquire ordering. A flag carries no event count,
 payload access or DMA completion permission. Existing user callables with these
 names retain normal lookup precedence.
 
+### Inline assembly
+
+A kernel can write a few instructions directly. Each statement names the target
+it is written for:
+
+```minyar
+function writeSerial(character: Integer) {
+    assembly for x86_64 "outb %al, %dx" inputs(character in al, 0x3F8 in dx) changes(nothing)
+}
+```
+
+The text is passed to the target's assembler as written. `inputs(...)` binds
+Integer values to named general registers (`al` to `rax` and `r8` to `r15` on
+x86-64, `w0`/`x0` to `x30` on Arm64). Each value must fit its register's
+unsigned width, checked like a register field. `changes(...)` is required. It
+lists what the instructions change besides their inputs: `memory`, `flags`,
+named registers, or `nothing`. The compiler cannot check that list against the
+instructions, so it is the author's promise.
+
+The statement compiles only in a kernel build for its own target. It has no
+outputs, costs exactly its instructions, and is a native effect, so interrupt
+handlers reject it. `assembly` is contextual: it starts this statement only
+when followed by `for`, a target name and text. Other names called `assembly`
+keep working.
+
 The `dma` module separates CPU access from a device-owned pending request:
 
 ```minyar

@@ -74,7 +74,7 @@ check-osdev-seeds-host: build/minyarc build/minyar-runtime.o
 check-osdev-allocator: build/.toolchain.json
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-allocator.py
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign check-osdev-virtio check-osdev-interrupt-assembly
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign check-osdev-virtio check-osdev-interrupt-assembly check-osdev-assembly
 check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator check-osdev-devices-sanitize
 
 .PHONY: check-osdev-virtio
@@ -98,6 +98,14 @@ check-osdev-devices-sanitize: build/minyarc-sanitize build/minyar-runtime-saniti
 OSDEV_ARCH ?= arm64
 check-osdev-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/fields-kernel.min --expect "OSDEV FIELDS PASS" --timeout 30
+
+# Kernel inline assembly: lowering and rejections, then a live x86 serial write.
+.PHONY: check-osdev-assembly check-osdev-assembly-qemu
+check-osdev-assembly: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-assembly.py --no-qemu
+
+check-osdev-assembly-qemu: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-assembly.py
 
 # A Minyar interrupt function is the live timer entry on x86-64 and Arm64 QEMU.
 .PHONY: check-osdev-irq-qemu
