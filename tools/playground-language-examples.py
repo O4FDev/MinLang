@@ -163,10 +163,9 @@ POLICIES = {
         "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
         reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
     ),
-    "a84bd499c698": standalone(
-        "Hardware register fields", "64\n",
-        "field32(12, 10) describes bits 12..21. encode32 places 64 in that field and extract32 reads the same 64 back; the later replace32 result is not printed.",
-        reason="A complete program using the ordinary device library's pure field arithmetic; it touches no register or host memory.",
+    "a84bd499c698": contextual(
+        "Hardware register fields", "unsupported-host",
+        "This complete program imports device, whose register types depend on the native machine module. The browser bundle does not include device or machine, so it cannot run here yet; its field arithmetic is covered by the native osdev checks.",
     ),
     "582a51f40dc2": contextual(
         "Integer ranges in a nested pattern", "fragment",
