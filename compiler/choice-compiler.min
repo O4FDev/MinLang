@@ -143,6 +143,29 @@ function choicePayloadFields(context: CompilerContext, type: Integer, name: Text
     return fields
 }
 
+// Logical fields describe every case for type checking and cycle analysis.
+// Physical payload slots overlap: each case starts immediately after the tag.
+function choiceStorageField(context: CompilerContext, type: Integer, field: Integer): Integer {
+    if field == 0 || choiceCases(context, type).length == 0 { return field }
+    let first = functionParameterOffset(context.functionParameterCounts, type - 1000)
+    let parts = context.functionParameterNames[first + field].split("|")
+    let prefix = "minyar_choice_payload|" + parts[1] + "|"
+    let start = field
+    while start > 1 && resultPrefix(context.functionParameterNames[first + start - 1], prefix) { start = start - 1 }
+    return field - start + 1
+}
+
+function choiceStorageCount(context: CompilerContext, type: Integer): Integer {
+    let count = 1
+    let field = 1
+    while field < context.functionParameterCounts[type - 1000] {
+        let slot = choiceStorageField(context, type, field)
+        if slot + 1 > count { count = slot + 1 }
+        field = field + 1
+    }
+    return count
+}
+
 function choiceLocalType(context: CompilerContext, type: Integer, location: Integer): Boolean {
     let position = 0
     let name = context.functionNames[type - 1000]
@@ -214,7 +237,7 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let value = valueName(textState, newTemporary(state))
     noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, 0)
-    output.add("  " + value + " = call ptr @minyar_record_new(i64 " + Text(context.functionParameterCounts[record]) + ")\n")
+    output.add("  " + value + " = call ptr @minyar_record_new(i64 " + Text(choiceStorageCount(context, type)) + ")\n")
     output.add("  call void @minyar_record_set(ptr " + value + ", i64 0, i64 " + Text(tag - 1) + ")\n")
     let owned: List<Integer> = [type]
     ownResult(output, state, value, owned)
@@ -238,7 +261,7 @@ function parseChoiceConstructor(context: CompilerContext, localNames: List<Text>
                 if takeResult(output, state, payload, payloadType) { setter = "minyar_record_set_take" }
             }
             noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, expected)
-            output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(field) + ", i64 " + slot + ")\n")
+            output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(index + 1) + ", i64 " + slot + ")\n")
             index = index + 1
         }
         if fields.length > 0 && tokenIs(context.tokenKinds, context.tokenTexts, state, ",") { state[0] = state[0] + 1 }
@@ -276,7 +299,7 @@ function readChoiceMatchTag(context: CompilerContext, output: List<Text>, textSt
 }
 
 function readChoiceMatchPayload(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, input: Text, choiceType: Integer, field: Integer, type: Integer): Text {
-    return readRecordField(output, textState, state, input, field, type)
+    return readRecordField(output, textState, state, input, choiceStorageField(context, choiceType, field), type)
 }
 
 function parseMatchExpression(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {

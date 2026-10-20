@@ -870,12 +870,14 @@ The library also exposes choices through existing APIs. For example,
 `statusValue` and `statusError` helpers remain available; matching lets a caller
 handle both outcomes directly.
 
-Choices currently share the record representation and automatic memory
-management. Each value allocates a tag and slots for all declared payloads;
-inactive slots are empty. This includes choices with no payloads. Payloads can
-hold choices, records, Lists and callbacks, with the same ownership and cycle
-analysis as records. Cases and payload fields are accessed through constructors
-and matching. Patterns inspect only the active case and its payloads.
+Choices share record ownership and automatic memory management. A value stores
+a tag and a union large enough for its largest case: different cases share the
+same payload slots. Only the active case's reference payloads are retained and
+traced. A payload occupies one eight-byte slot, with reference tracking stored
+separately. Choices with no payloads still allocate a tag. Payloads can hold
+choices, records, Lists and callbacks, with the same ownership and cycle analysis
+as records. Cases and payload fields are accessed through constructors and
+matching. Patterns inspect only the active case and its payloads.
 
 ## Maps and Sets
 

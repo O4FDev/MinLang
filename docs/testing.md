@@ -196,6 +196,14 @@ O0/O2 with ownership cleanup assertions. It checks nested bindings after input
 mutation, failed guard cleanup, escaping closures, pattern type errors, binding
 scope, and missing-case example values. `check-patterns-sanitize` adds ASan/UBSan.
 
+`make check-choice-layout` checks shared payload storage, cross-case comparisons,
+Map key snapshots, mixed scalar/reference payloads, optional record lifetimes,
+recursive choice cycles and the lantern-walk gallery at O0/O2 with ownership
+assertions. A sixteen-case allocation benchmark intercepts actual constructor
+calls: 16,000 values reserve 48,000 eight-byte slots, compared with 528,000 in
+the former expanded layout. LLVM assertions independently require three slots
+per value. `check-choice-layout-sanitize` adds ASan/UBSan.
+
 `make check-choice-smoke` runs a quick construction, expression, generic,
 module and rejection subset against the built traced runtime for landing checks.
 The full `check-choice` target adds ownership cleanup contracts.

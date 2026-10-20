@@ -36,5 +36,12 @@ check-choice-library: build/minyarc build/minyar-runtime.o build/tooling/tests/c
 check-choice-library-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-library
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-library"
 
-check check-portable: check-choice check-choice-library check-patterns
-check-sanitize: check-choice-sanitize check-choice-library-sanitize check-patterns-sanitize
+.PHONY: check-choice-layout check-choice-layout-sanitize
+check-choice-layout: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-layout-check
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-layout-check"
+
+check-choice-layout-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-layout-check
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-layout-check"
+
+check check-portable: check-choice check-choice-library check-choice-layout check-patterns
+check-sanitize: check-choice-sanitize check-choice-library-sanitize check-choice-layout-sanitize check-patterns-sanitize
