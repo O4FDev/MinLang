@@ -14,6 +14,7 @@
 use "machine" as machine
 use "device" as device
 use "../pci.min" as pci
+use "./used.min" as used
 
 public constant BLOCK = 2
 public constant ENTROPY = 4
@@ -45,6 +46,7 @@ public record Queue {
     private used: device.Memory
     private offered: Integer
     private collected: Integer
+    private outstanding: List<Boolean>
     // The length the device reported for the last chain `collect` returned.
     length: Integer
 }
@@ -147,6 +149,8 @@ public function openQueue(opened: Device, index: Integer, size: Integer): Queue 
     let descriptors = device.allocate(count * 16, 16)
     let available = device.allocate(6 + count * 2, 2)
     let used = device.allocate(6 + count * 8, 4)
+    let outstanding: List<Boolean> = []
+    for slot in 0..count { outstanding.add(false) }
     writeAddress(common, 0x20, device.addressOf(descriptors, 0))
     writeAddress(common, 0x28, device.addressOf(available, 0))
     writeAddress(common, 0x30, device.addressOf(used, 0))
@@ -154,7 +158,8 @@ public function openQueue(opened: Device, index: Integer, size: Integer): Queue 
     device.writeAt16(common, 0x1C, 1)
     return Queue {
         size: count; index: index; notifyAddress: device.register16(device.registers(notifyAddress, 2), 0)
-        descriptors: descriptors; available: available; used: used; offered: 0; collected: 0; length: 0
+        descriptors: descriptors; available: available; used: used; offered: 0; collected: 0
+        outstanding: outstanding; length: 0
     }
 }
 
@@ -175,6 +180,14 @@ public function describe(queue: Queue, slot: Integer, address: Integer, length: 
 
 // Offer the chain starting at descriptor `head` to the device, without telling it yet.
 public function offer(queue: Queue, head: Integer) {
+    let headOutstanding = false
+    if head >= 0 && head < queue.size {
+        headOutstanding = queue.outstanding[head]
+    }
+    if !used.validOffer(queue.size, queue.offered, queue.collected, head, headOutstanding) {
+        fail("virtio queue is full or has an invalid descriptor head")
+    }
+    queue.outstanding[head] = true
     device.store16(queue.available, 4 + (queue.offered % queue.size) * 2, head)
     machine.fence()
     queue.offered = (queue.offered + 1) & 0xFFFF
@@ -190,13 +203,22 @@ public function notify(queue: Queue) {
 // The head of the next chain the device has finished, or -1 if none is
 // waiting; its length is then in queue.length.
 public function collect(queue: Queue): Integer {
-    machine.fence()
-    if device.load16(queue.used, 2) == queue.collected {
+    let usedIndex = device.load16(queue.used, 2)
+    if usedIndex == queue.collected {
         return -1
     }
+    machine.fence()
     let at = 4 + (queue.collected % queue.size) * 8
     let head = device.load32(queue.used, at)
+    let headOutstanding = false
+    if head >= 0 && head < queue.size {
+        headOutstanding = queue.outstanding[head]
+    }
+    if !used.validCompletion(queue.size, queue.offered, queue.collected, usedIndex, head, headOutstanding) {
+        fail("virtio device reported an invalid used-ring completion")
+    }
     queue.length = device.load32(queue.used, at + 4)
+    queue.outstanding[head] = false
     queue.collected = (queue.collected + 1) & 0xFFFF
     return head
 }

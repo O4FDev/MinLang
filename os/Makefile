@@ -176,7 +176,7 @@ $(OUT)/minyar-os.img: $(MKIMAGE) $(OUT)/config.txt $(wildcard assets/fonts/*.ttf
 # Hardware virtualization where the host is an Arm Mac or Linux with KVM.
 ACCEL ?= $(if $(filter Darwin-arm64,$(shell uname -s)-$(shell uname -m)),hvf,$(if $(wildcard /dev/kvm),kvm,tcg))
 CPU ?= $(if $(filter tcg,$(ACCEL)),max,host)
-QEMU_FLAGS ?= -M virt -accel $(ACCEL) -cpu $(CPU) -m 1G -smp 4 -serial stdio -display cocoa,full-screen=on,$(QEMU_ZOOM) \
+QEMU_FLAGS ?= -M virt,gic-version=3 -accel $(ACCEL) -cpu $(CPU) -m 1G -smp 4 -serial stdio -display cocoa,full-screen=on,$(QEMU_ZOOM) \
 	-kernel $(OUT)/kernel.elf -device bochs-display \
 	-drive if=none,id=disk,file=$(OUT)/minyar-os.img,format=raw -device virtio-blk-pci,drive=disk,disable-legacy=on \
 	-device virtio-keyboard-pci,disable-legacy=on -device virtio-tablet-pci,disable-legacy=on \

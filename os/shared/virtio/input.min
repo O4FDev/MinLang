@@ -5,6 +5,7 @@
 use "device" as device
 use "../pci.min" as pci
 use "./virtio.min" as virtio
+use "./used.min" as used
 
 public constant SYNCHRONIZE = 0
 public constant KEY = 1
@@ -46,16 +47,23 @@ public function openAll(devices: List<pci.Device>): List<Events> {
 // The events waiting since the last call, oldest first.
 public function take(source: Events): List<Event> {
     let taken: List<Event> = []
-    let head = virtio.collect(source.events)
-    while head >= 0 {
+    let completed: List<Integer> = []
+    // Do not re-offer buffers while draining: one poll can then consume at
+    // most one queue of events even if a hostile device keeps producing them.
+    while completed.length < source.events.size {
+        let head = virtio.collect(source.events)
+        if head < 0 { break }
+        if !used.validLength(source.events.length, 8, 8) {
+            fail("virtio input reported an invalid event length")
+        }
         let at = head * 8
         let value = device.load32(source.buffer, at + 4)
         if value >= 0x80000000 { value -= 0x100000000 }
         taken.add(Event { kind: device.load16(source.buffer, at); code: device.load16(source.buffer, at + 2); value: value })
-        virtio.offer(source.events, head)
-        head = virtio.collect(source.events)
+        completed.add(head)
     }
-    if taken.length > 0 {
+    if completed.length > 0 {
+        for head in completed { virtio.offer(source.events, head) }
         virtio.notify(source.events)
     }
     return taken
