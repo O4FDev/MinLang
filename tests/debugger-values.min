@@ -1,0 +1,118 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "io" as io
+use "system" as system
+use "files" as files
+
+record Fixture { root: Text; work: Text; serial: Integer }
+function frameOutput(output: Text): Text {
+    let result: List<Text> = []
+    let frame = false
+    for line in test.lines(output) {
+        if line.startsWith("(lldb) frame variable") { frame = true }
+        else if frame { result.add(line + "\n") }
+    }
+    return joinText(result)
+}
+function run(fixture: Fixture, command: List<Text>): test.Result {
+    fixture.serial += 1
+    let result = test.run(command, system.environment(), fixture.root, fixture.work + "/command-" + Text(fixture.serial), 120)
+    test.require(result, "debugger values command")
+    return result
+}
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "debugger root")
+let fixture = Fixture { root: test.lines(rootResult.output)[0]; work: work; serial: 0 }
+let clang = support.which(test.setting("MINYAR_TEST_CLANG", "clang"), work + "/clang")
+let directory = test.lines(run(fixture, ["dirname", clang]).output)[0]
+let dwarf = directory + "/llvm-dwarfdump"
+let darwin = test.contains(run(fixture, ["uname", "-s"]).output, "Darwin")
+let source = "examples/gallery/night-watch-values.min"
+let binary = work + "/values"
+let symbols = binary
+if darwin { symbols += ".dSYM" }
+let pause = 0
+let rows = test.lines(io.readTextFile(source))
+for index in 0..rows.length { if test.contains(rows[index], "debugger pause:") { pause = index + 1 } }
+test.check(pause > 0, "gallery has a debugger pause")
+for mode in ["direct", "incremental-cold", "incremental-warm"] {
+    let command = [fixture.root + "/minyar", "--debug"]
+    if mode != "direct" { command.add("--incremental") }
+    for item in [source, "-o", binary] { command.add(item) }
+    run(fixture, command)
+    test.check(run(fixture, [binary]).output == io.readTextFile("examples/gallery/night-watch-values.stdout"), "typed debugger gallery output " + mode)
+    run(fixture, [dwarf, "--verify", symbols])
+    let info = run(fixture, [dwarf, "--debug-info", symbols]).output
+    for name in ["Text", "Bytes", "Star", "Branch", "Reading", "List<Integer>", "List<Boolean>", "List<Character>", "Map<Text, Integer>", "minyar.choice<Sky>", "brightness", "children", "byte_length", "minyar.slot<Boolean>"] {
+        test.check(test.contains(info, "\"" + name + "\""), "semantic DWARF retains " + name + " in " + mode)
+    }
+    test.check(test.contains(info, "DW_TAG_enumeration_type") && test.contains(info, "\"Clouded\""), "choice discriminator has source case names")
+}
+run(fixture, ["python3", "tools/debugger/test_formatters.py"])
+let lldb = support.which(test.setting("MINYAR_TEST_LLDB", "/usr/bin/lldb"), work + "/lldb")
+if lldb == "" && io.fileExists(directory + "/lldb") { lldb = directory + "/lldb" }
+if test.setting("MINYAR_REQUIRE_DEBUGGERS", "0") == "1" { test.check(lldb != "", "LLDB is required") }
+if io.fileExists(lldb) {
+    let inspected = run(fixture, [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "command script import \"" + fixture.root + "/tools/debugger/minyar_lldb.py\"", "-o", "breakpoint set -f night-watch-values.min -l " + Text(pause), "-o", "run", "-o", "frame variable -P 2 -D 5 message star stars windows lights letters readings visitors sky branch bytes reading"])
+    for value in ["A quiet sky 🌙", "Sirius", "List<Integer>(length=3)", "List<Boolean>(length=3)", "List<Character>(length=2)", "Map<Text, Integer>(length=1)", "Ada", "Sky.Clouded", "cover = 0.25", "brightness = 1.5", "north", "[1] = false", "degrees = 2.5", "count = 7", "lit = true"] {
+        test.check(test.contains(frameOutput(inspected.output), value), "LLDB reads " + value + "\n" + inspected.output + inspected.errorOutput)
+    }
+} else { print("LLDB unavailable: live formatter verification skipped") }
+let gdb = support.which("gdb", work + "/gdb")
+if !darwin && test.setting("MINYAR_REQUIRE_DEBUGGERS", "0") == "1" { test.check(gdb != "", "GDB is required") }
+if gdb != "" && !darwin {
+    let inspected = run(fixture, [gdb, "--batch", binary, "-ex", "set auto-load python-scripts off", "-ex", "python import sys; sys.path.insert(0, " + "'" + fixture.root + "/tools/debugger')" + "; import minyar_gdb", "-ex", "break " + source + ":" + Text(pause), "-ex", "run", "-ex", "info locals"])
+    for value in ["A quiet sky 🌙", "List<Integer>(length=3)", "Map<Text, Integer>(length=1)", "Sky.Clouded", "cover = 0.25"] {
+        test.check(test.contains(inspected.output, value), "GDB reads " + value + "\n" + inspected.output + inspected.errorOutput)
+    }
+} else { print("GDB unavailable: live formatter verification skipped") }
+record SourceCase { name: Text; output: Text; pause: Integer; variables: Text; expected: List<Text> }
+let cases = [SourceCase { name: "closures"; output: "40\n42\n"; pause: 4; variables: ""; expected: ["base = 40", "step = 2", "answer = 42"] }, SourceCase { name: "parallel"; output: "40\n41\nfalse\n"; pause: 5; variables: ""; expected: ["base = 40", "index = 0", "bright = true"] }, SourceCase { name: "shadow"; output: "1\n2\n"; pause: 5; variables: "value"; expected: ["value = 2"] }, SourceCase { name: "unit-result"; output: "Clear\n"; pause: 0; variables: ""; expected: [] }]
+for item in cases {
+    let source = "tests/debugger/" + item.name + ".min"
+    let binary = work + "/" + item.name
+    run(fixture, [fixture.root + "/minyar", "--debug", source, "-o", binary])
+    let execution = test.run([binary], support.merge(system.environment(), ["MINYAR_PARALLEL_THREADS=1"]), fixture.root, work + "/execute-" + item.name, 30)
+    test.require(execution, "debugger " + item.name)
+    test.check(execution.output == item.output, "debugger fixture output " + item.name)
+    let symbols = binary
+    if darwin { symbols += ".dSYM" }
+    run(fixture, [dwarf, "--verify", symbols])
+    if item.pause > 0 && lldb != "" {
+        let command = [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "settings set target.env-vars MINYAR_PARALLEL_THREADS=1", "-o", "breakpoint set -f " + item.name + ".min -l " + Text(item.pause), "-o", "run", "-o", "frame variable " + item.variables]
+        let inspected = run(fixture, command)
+        for value in item.expected { test.check(test.contains(frameOutput(inspected.output), value), "LLDB " + item.name + " retains " + value + "\n" + inspected.output + inspected.errorOutput) }
+    }
+}
+// The launcher overrides arena-looking flags. A custom runtime can select arena
+// in its source instead, and an unknown prebuilt object must never imply a layout.
+let override = test.run([fixture.root + "/minyar", "--debug", "tests/debugger/layout.min", "-o", work + "/override"], support.merge(system.environment(), ["MINYAR_RUNTIME_FLAGS=-O0 -DMINYAR_COMPILER_ARENA=1"]), fixture.root, work + "/override-build", 120)
+test.require(override, "debug runtime flag override")
+let overrideSymbols = work + "/override"
+if darwin { overrideSymbols += ".dSYM" }
+let overrideInfo = run(fixture, [dwarf, "--debug-info", overrideSymbols]).output
+test.check(test.contains(overrideInfo, "\"name\"") && test.contains(overrideInfo, "\"count\""), "source undefines override command-line arena flags for debug layout")
+let arena = work + "/arena"
+test.check(files.makeDirectory(arena) == 0, "arena runtime fixture")
+io.writeTextFile(arena + "/runtime.c", "#define MINYAR_COMPILER_ARENA 1\n#include \"minyar_runtime.c\"\n")
+run(fixture, [clang, "-O0", "-iquote", fixture.root + "/runtime", "-c", arena + "/runtime.c", "-o", arena + "/runtime.o"])
+run(fixture, [fixture.root + "/build/minyarc", "tests/debugger/layout.min", work + "/layout.ll", "--library", "library"])
+for unknown in [false, true] {
+    let runtime = arena + "/runtime.o"
+    if unknown { runtime = arena + "/unknown.o"; run(fixture, ["cp", arena + "/runtime.o", runtime]) }
+    let binary = work + "/arena-" + Text(unknown)
+    run(fixture, [fixture.root + "/build/tooling/tools/clang-driver", "link", fixture.root, work + "/layout.ll", runtime, binary, "0", "1", "tests/debugger/layout.min"])
+    test.check(run(fixture, [binary]).output == "north\n7\n2.5\ntrue\n", "arena debug execution")
+    let symbols = binary
+    if darwin { symbols += ".dSYM" }
+    run(fixture, [dwarf, "--verify", symbols])
+    let info = run(fixture, [dwarf, "--debug-info", symbols]).output
+    test.check(!test.contains(info, "\"name\"") && !test.contains(info, "\"count\"") && test.contains(info, "\"degrees\""), "arena/unknown pointers stay opaque while scalar virtual records retain fields")
+    if lldb != "" {
+        let inspected = run(fixture, [lldb, "--batch", binary, "-o", "settings set target.disable-aslr false", "-o", "breakpoint set -f layout.min -l 5", "-o", "run", "-o", "frame variable reading"])
+        test.check(test.contains(frameOutput(inspected.output), "degrees = 2.5") && test.contains(frameOutput(inspected.output), "lit = true"), "arena scalar fragments retain source values\n" + inspected.output + inspected.errorOutput)
+    }
+}
+test.removeTree(work)
+print("Typed debugger values, recursive records, choices and bounded formatters: passed")

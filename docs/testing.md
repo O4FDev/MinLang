@@ -507,6 +507,13 @@ and the night-watch gallery. On macOS, LLDB resolves imported `.min` source line
 and reads mutated arguments, SSA arguments and shadowed bindings after temporary
 link inputs are removed. It also checks dSYM retention and failed-link preservation.
 
+`make check-debugger-values` checks semantic Text, Bytes, List, Map, recursive
+record and choice DWARF in direct and cold/warm cached builds. Live LLDB and
+Linux GDB check bounded previews and narrow collection slots; LLDB also checks
+scalarized record fragments, captured closure values and outlined worker locals.
+`MINYAR_REQUIRE_DEBUGGERS=1` requires those debuggers instead of reporting a skip.
+The independent Python formatter checks cover malformed values and bounded reads.
+
 `make check-thread-native-regions` runs Linux mapping, sharing, atomic access,
 ownership and rejection controls. Its real x86 guest test runs when `/dev/kvm`
 is accessible on x86-64; otherwise it reports the missing KVM coverage explicitly.

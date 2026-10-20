@@ -1,6 +1,7 @@
 // Source locations and variable descriptions for generated Minyar IR. No temporary LLVM filenames are
 // presented as source files, and this pass never changes release-mode IR.
 use "./driver-support.min" as host
+use "./llvm-debug-types.min" as debugTypes
 
 record Origin { line: Integer; column: Integer; file: Text }
 record Metadata { nodes: List<Text>; files: List<Text>; ids: List<Integer>; typeNames: List<Text>; typeIds: List<Integer> }
@@ -77,7 +78,7 @@ public function full(flags: List<Text>): Boolean {
     }
     return result
 }
-public function program(source: Text, path: Text, variablesEnabled: Boolean): Text {
+public function program(source: Text, path: Text, variablesEnabled: Boolean, opaqueRecords: Boolean): Text {
     if host.hasText(source, "!llvm.dbg.cu") { return source }
     let metadata = Metadata { nodes: []; files: []; ids: []; typeNames: []; typeIds: [] }
     let fallback = escaped(host.resolveName(path))
@@ -101,6 +102,9 @@ public function program(source: Text, path: Text, variablesEnabled: Boolean): Te
     let depth = 0
     let retained = -1
     let variables = ""
+    let types = debugTypes.graph(metadata.nodes, opaqueRecords)
+    let fragmentVariable = -1
+    let fragmentLocation = -1
     for original in host.lines(source) {
         let line = original
         if line.startsWith("; minyar-debug-function: ") {
@@ -108,6 +112,12 @@ public function program(source: Text, path: Text, variablesEnabled: Boolean): Te
             pending = true
         } else if line.startsWith("; minyar-debug-line: ") {
             current = origin(host.textAfter(line, "; minyar-debug-line: "), fallback)
+        } else if variablesEnabled && subprogram >= 0 && (line.startsWith("; minyar-debug-type: ") || line.startsWith("; minyar-debug-field: ") || line.startsWith("; minyar-debug-case: ")) {
+            debugTypes.describe(types, line)
+        } else if variablesEnabled && subprogram >= 0 && line.startsWith("; minyar-debug-fragment: ") {
+            let parts = fields(host.textAfter(line, "; minyar-debug-fragment: "))
+            if parts.length != 3 || fragmentVariable < 0 { host.stop("invalid compiler debug fragment") }
+            output.add("    #dbg_value(" + parts[0] + ", !" + Text(fragmentVariable) + ", !DIExpression(DW_OP_LLVM_fragment, " + parts[1] + ", " + parts[2] + "), !" + Text(fragmentLocation) + ")\n")
         } else if subprogram >= 0 && line == "; minyar-debug-scope: begin" {
             let block = node(metadata, "distinct !DILexicalBlock(scope: !" + Text(scope) + ", file: !" + Text(file(metadata, current.file)) + ", line: " + Text(current.line) + ", column: " + Text(current.column) + ")")
             if depth < scopes.length { scopes[depth] = scope } else { scopes.add(scope) }
@@ -121,19 +131,36 @@ public function program(source: Text, path: Text, variablesEnabled: Boolean): Te
             lastKey = ""
         } else if variablesEnabled && subprogram >= 0 && line.startsWith("; minyar-debug-local: ") {
             let parts = fields(host.textAfter(line, "; minyar-debug-local: "))
-            if parts.length != 6 { host.stop("invalid compiler debug local") }
+            if parts.length != 6 && parts.length != 7 { host.stop("invalid compiler debug local") }
             let fileId = file(metadata, current.file)
-            let variable = node(metadata, "!DILocalVariable(name: \"" + parts[4] + "\", arg: " + parts[5] + ", scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", line: " + Text(current.line) + ", type: !" + Text(variableType(metadata, parts[2], parts[3])) + ")")
+            if parts[5] == "0" && (parts[0] == "declare" || parts[0] == "aggregate") {
+                // A binding begins after its initializer. Nesting also preserves
+                // successive declarations with the same name in one source block.
+                scope = node(metadata, "distinct !DILexicalBlock(scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", line: " + Text(current.line) + ", column: " + Text(current.column) + ")")
+                lastKey = ""
+            }
+            let type = -1
+            if parts.length == 7 {
+                if parts[0] == "aggregate" { type = debugTypes.objectType(types, parts[6]) }
+                else { type = debugTypes.valueType(types, parts[6]) }
+            } else { type = variableType(metadata, parts[2], parts[3]) }
+            let variable = node(metadata, "!DILocalVariable(name: \"" + parts[4] + "\", arg: " + parts[5] + ", scope: !" + Text(scope) + ", file: !" + Text(fileId) + ", line: " + Text(current.line) + ", type: !" + Text(type) + ")")
             if variables != "" { variables += ", " }
             variables += "!" + Text(variable)
             let at = node(metadata, "!DILocation(line: " + Text(current.line) + ", column: " + Text(current.column) + ", scope: !" + Text(scope) + ")")
-            output.add("    #dbg_" + parts[0] + "(" + parts[1] + ", !" + Text(variable) + ", !DIExpression(), !" + Text(at) + ")\n")
+            fragmentVariable = variable
+            fragmentLocation = at
+            if parts[0] == "aggregate" {
+                output.add("    #dbg_value(" + parts[1] + ", !" + Text(variable) + ", !DIExpression(DW_OP_LLVM_fragment, 0, 64), !" + Text(at) + ")\n")
+            } else { output.add("    #dbg_" + parts[0] + "(" + parts[1] + ", !" + Text(variable) + ", !DIExpression(), !" + Text(at) + ")\n") }
         } else if line.startsWith("define ") {
             scope = -1
             subprogram = -1
             depth = 0
             variables = ""
             retained = -1
+            types = debugTypes.graph(metadata.nodes, opaqueRecords)
+            fragmentVariable = -1
             if pending {
                 let begin = host.findText(line, "@", 0)
                 let end = host.findText(line, "(", begin)

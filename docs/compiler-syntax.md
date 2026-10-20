@@ -321,6 +321,28 @@ representation-specific projections, shared by matches and test diagnostics.
 Cycle analysis retains the logical graph and projects nullable aliases only
 when selecting the runtime ownership entry points.
 
+## Debugger metadata
+
+`debug-types.min` records semantic type graphs in LLVM comments beside initialized
+bindings. Each function has its own numeric type namespace, preserved with its
+cached code. The debug linker materializes the graph only for debug builds;
+release builds keep ordinary executable LLVM. Parameters use their existing SSA
+values or stack slots. Small scalarized records use field fragments describing
+a virtual aggregate, without introducing stores or allocations.
+
+Lexical markers preserve nested, loop and match-arm scopes. Closure captures and
+parameters and outlined worker bindings carry the same descriptions; outlining
+regenerates its type graph and invalidates the parent's emission memo. List
+storage uses eight-byte slot wrappers whose `value` member has the semantic
+element type, preserving Boolean and Character stride. Choice tags retain case
+enumerators and payload field names for bounded debugger projections.
+
+Text and Bytes describe their shared runtime prefix. Managed records and Maps
+describe their inline storage; arena record/Map pointers, native C-layout
+records and callable values currently remain opaque. Optional Python adapters
+for LLDB and GDB read these types and inferior memory without evaluating program
+code. See the [debugging guide](debugging.md).
+
 ## Runtime trace metadata
 
 `runtime-traces.min` records readable names and original token locations while

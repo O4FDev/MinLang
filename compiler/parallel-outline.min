@@ -120,9 +120,18 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
     if used.length > 64 { parallelRace(context, start, "this loop captures more than 64 values; split the work into smaller loops") }
     let workerName = "@.minyar.parallel." + Text(start)
     let worker: List<Text> = []
+    let parentTypes = context.debugTypes
+    let workerTypes: List<Integer> = []
+    context.debugTypes = workerTypes
     let returned = "void"
     if parts[6] >= 0 { returned = "i64" }
+    emitDebugOrigin(worker, context.tokenLines, start, "function")
     worker.add("define internal " + returned + " " + workerName + "(i64 %parallel.first, i64 %parallel.after, ptr %parallel.environment) {\nentry:\n")
+    let debugType = 0
+    while debugType < parentTypes.length {
+        emitDebugType(context, worker, parentTypes[debugType])
+        debugType = debugType + 1
+    }
     if parts[6] >= 0 { worker.add("  %local." + Text(parts[6]) + " = alloca i64\n") }
     let local = firstLocal
     while local < state[4] {
@@ -143,7 +152,12 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
         if id < 0 { value = output[-id - 1] }
         if value.length > 0 && value[0] == '%' {
             parallelCaptureCast(worker, value, raw, type)
-            if id >= 0 { storeLocal(worker, id, type, value) }
+            if id >= 0 {
+                storeLocal(worker, id, type, value)
+                emitDebugBinding(context, worker, start, captures[capture], type, "ptr %local." + Text(id), 0, true)
+            } else {
+                emitDebugBinding(context, worker, start, captures[capture], type, llvmType(type) + " " + value, 0, false)
+            }
         }
         position = position + 1
     }
@@ -153,6 +167,7 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
         let zero = "0"
         if parts[7] == 7 { zero = "0.0" }
         storeLocal(worker, parts[6], parts[7], zero)
+        if parts[8] >= 0 && reduction != "" { emitDebugBinding(context, worker, parts[8], reduction, parts[7], "ptr %local." + Text(parts[6]), 0, true) }
     }
     let loop: List<Text> = []
     let piece = parts[0]
@@ -167,6 +182,7 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
         let raw = valueAsListSlot(worker, textState, state, value, parts[7])
         worker.add("  ret i64 " + raw + "\n}\n\n")
     } else { worker.add("  ret void\n}\n\n") }
+    context.debugTypes = parentTypes
     globals.add(joinText(worker))
     let declaration = "declare void @minyar_parallel_run(ptr, i64, i64, ptr)\n"
     if parts[6] >= 0 { declaration = "declare i64 @minyar_parallel_reduce(ptr, i64, i64, ptr, i64, i64)\n" }

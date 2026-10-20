@@ -157,8 +157,9 @@ format.
 Debug builds include Minyar source locations for breakpoints, stepping and
 backtraces, including imported modules. Named arguments and initialized local
 bindings carry their types and locations; nested blocks preserve shadowed
-bindings. Scalar values can be inspected in LLDB or GDB. Managed values currently
-show their source type and pointer. A value that is no longer used may be
+bindings. Scalars and ordinary record fields can be inspected in LLDB or GDB;
+optional [value formatters](debugging.md) preview Text, Bytes, Lists, Maps and
+choices without running program code. A value that is no longer used may be
 unavailable after its register is reused. On macOS the matching `.dSYM` bundle
 is kept beside each executable. `-gline-tables-only` retains source locations
 without variable descriptions. Release builds omit this debug information.

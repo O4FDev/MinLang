@@ -207,6 +207,28 @@ function configuredSource(project: Text, runtime: Text): Text {
     if host.countText(configuration, directive) != 1 { host.stop("cycle runtime configuration must include the engine once") }
     return host.replaceText(configuration, directive, engineSource(project))
 }
+function debugManagedRecords(project: Text, clang: Text, runtime: Text): Boolean {
+    let file = host.baseName(runtime)
+    let adjacent = host.parentPath(runtime) + "/runtime.c"
+    let known = (file == "runtime.o" || file == "runtime.ll") && host.isFile(adjacent)
+    known = known || file.startsWith("minyar-default-runtime") || file.startsWith("minyar-runtime-eager")
+    let standard = file == "minyar-runtime.o" || file == "minyar-runtime-release.ll" || file == "minyar-runtime-sanitize.o"
+    if standard && host.setting("PROGRAM_RUNTIME_FLAGS", "-DMINYAR_SYSTEM_HEAP=1") == "-DMINYAR_SYSTEM_HEAP=1" { known = true }
+    // Unknown prebuilt runtimes keep records opaque rather than guessing an ABI.
+    if !known { return false }
+    let directory = host.temporaryDirectory("", "minyar-debug-layout-")
+    let source = directory + "/runtime.c"
+    host.writeBytes(source, Bytes(runtimeConfiguration(project, runtime, "debug type layout")))
+    let command = [clang]
+    for option in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { command.add(option) }
+    for option in ["-iquote", project + "/runtime", "-E", "-dM", source] { command.add(option) }
+    let macros = host.captureOutput(command, 0)
+    host.release(directory)
+    for line in host.lines(macros) {
+        if line == "#define MINYAR_COMPILER_ARENA" || line.startsWith("#define MINYAR_COMPILER_ARENA ") { return false }
+    }
+    return true
+}
 function threadSource(project: Text, runtime: Text, cycles: Boolean): Text {
     let configuration = runtimeConfiguration(project, runtime, "thread memory policy")
     for macro in ["MINYAR_COMPILER_ARENA", "MINYAR_BOUNDED_HEAP", "MINYAR_LAZY_HEAP"] {
@@ -946,6 +968,8 @@ function linkCommand(arguments: List<Text>) {
     }
     libraries.sort()
     let isWindows = host.windows()
+    let opaqueDebugRecords = true
+    if debug && debugInfo.enabled(linkFlags) && debugInfo.full(linkFlags) { opaqueDebugRecords = !debugManagedRecords(project, clang, runtime) }
     if dataParallel && !isWindows { native.add("-pthread") }
     if threaded {
         let options = runtimeOptions(clang, release, linkFlags)
@@ -1104,7 +1128,7 @@ function linkCommand(arguments: List<Text>) {
         if annotated.error != "" { host.stop(annotated.error) }
         let directory = host.temporaryDirectory("", "minyar-debug-")
         program = directory + "/program.ll"
-        host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source, debugInfo.full(linkFlags))))
+        host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source, debugInfo.full(linkFlags), opaqueDebugRecords)))
     }
     linkProgram(clang, linkFlags, lto, program, runtime, native, math, output, source)
 }
