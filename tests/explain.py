@@ -123,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
     checked = 0
 
     def diagnostic(source, code, expected_help=None, has_excerpt=True,
-                   expected_message=None, expected_span=None):
+                   expected_message=None, expected_span=None, expected_source_lines=None):
         global checked
         checked += 1
         output = root / f"rejected-{checked}.ll"
@@ -154,6 +154,12 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         assert human.stderr.rstrip().endswith(f"= explain: minyar explain {code}"), (source, human.stderr)
         if has_excerpt:
             assert "^" in human.stderr and " | " in human.stderr, ("source excerpt and caret", source, human.stderr)
+        if expected_source_lines is not None:
+            assert value["line"] <= len(expected_source_lines), ("source line exists", source, value)
+            expected_source = expected_source_lines[value["line"] - 1]
+            assert value["sourceLine"] == expected_source, ("original JSON source excerpt", source, value)
+            assert f" {value['line']} | {expected_source}\n" in human.stderr, (
+                "same original source excerpt in text and JSON", source, value, human.stderr)
         if expected_span is not None:
             observed = (value["line"], value["column"], value["endLine"], value["endColumn"])
             assert observed == expected_span, ("independent complete token range", source, expected_span, value)
@@ -209,6 +215,40 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         path = root / f"{name}.min"
         path.write_text(source, encoding="utf-8")
         diagnostic(path, code)
+
+    # Existing rejection messages outside the golden corpus keep the same
+    # published families. Counts take precedence over builtin type expectations.
+    for name, source, code in (
+        ("octal-invalid-digit", "print(0o8)\n", "E0104"),
+        ("decimal-leading-zero", "print(0755)\n", "E0104"),
+        ("octal-decimal-point", "print(0o7.5)\n", "E0104"),
+        ("hex-decimal-point", "print(0xFF.5)\n", "E0104"),
+        ("float-missing-exponent", "print(1.5e)\n", "E0104"),
+        ("float-overflow", "print(1.0e999)\n", "E0104"),
+        ("and-left-type", "print(1 && true)\n", "E0406"),
+        ("and-right-type", "print(true && 1)\n", "E0406"),
+        ("or-left-type", "print(1 || false)\n", "E0406"),
+        ("or-right-type", "print(false || 1)\n", "E0406"),
+        ("print-value-type", "print([1])\n", "E0401"),
+        ("text-value-type", "Text([1])\n", "E0401"),
+        ("fail-value-type", "fail(42)\n", "E0401"),
+        ("exit-value-type", 'exit("zero")\n', "E0401"),
+        ("join-text-value-type", "joinText(1)\n", "E0401"),
+        ("builtin-count-precedence", "exit()\n", "E0404"),
+        ("callback-missing-argument",
+         "let callback = function(value: Integer): Integer { return value }\ncallback()\n", "E0404"),
+        ("callback-extra-argument",
+         "let callback = function(): Integer { return 1 }\ncallback(2)\n", "E0404"),
+        ("method-missing-argument",
+         "record Box { value: Integer }\nfunction Box.read(amount: Integer) {}\n"
+         "Box { value: 0 }.read()\n", "E0404"),
+        ("method-extra-argument",
+         "record Box { value: Integer }\nfunction Box.read(amount: Integer) {}\n"
+         "Box { value: 0 }.read(1, 2)\n", "E0404"),
+    ):
+        path = root / f"followup-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, code, expected_source_lines=source.splitlines())
 
     for index, literal in enumerate(("0b102", "1__0", "1.5_0", "0xFF_FF"), 1):
         path = root / f"malformed-number-{index}.min"
