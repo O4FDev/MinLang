@@ -47,13 +47,22 @@ command requires an explicit path; there is no PATH lookup or shell parsing.
 
 The backend requires Linux LP64 with its sixteen-resource ABI, usable clone3
 and pidfds, cgroup v2 memory/swap/OOM/kill interfaces, systemd 255 user delegation
-and a private owned `XDG_RUNTIME_DIR`. Python must provide byte environments,
-pidfd support and `hashlib.file_digest`. Control/helper/evidence paths currently
+and a private owned `XDG_RUNTIME_DIR`. Python 3.11 or newer must provide byte
+environments, pidfd support and `hashlib.file_digest`. Control/helper/evidence paths currently
 accept only absolute ASCII letters, digits, `/`, `.`, `_` and `-`; target argv,
 environment and cwd remain literal non-NUL byte strings. Only descriptors 0–2
 are passed to exec. The manager must support the caller's hard resource ceilings
 and supplementary groups. Denied setup, admission or state restoration fails
 before payload exec; no alternate backend or unbounded fallback runs.
+
+A running user manager can retain stale supplementary groups after account
+membership changes. Qualification observed an SSH caller with groups 986, 988
+and 1000, while its existing manager lacked group 986 (`ascii-streaming-audio`).
+The exact credential check rejected the launch before admission or exec. The
+runner owner reconciled the dedicated box's manager after confirming its work
+was idle; restarting that user manager refreshed its group set and the same
+launch passed. Reconcile this provisioning mismatch at the runner boundary.
+Keep the group check; the launcher never silently drops groups or changes them.
 
 This is containment for cooperating same-UID repository tests. The same UID can
 deliberately change its delegated controls, just as a payload can raise the old
