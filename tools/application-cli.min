@@ -1,0 +1,83 @@
+use "process" as processInfo
+use "system" as system
+use "./project.min" as project
+use "./driver-support.min" as host
+use "../scripts/macos-app.min" as app
+
+function help() {
+    print("""
+    Usage: minyar app [OPTIONS]
+
+    Build a project and package a signed macOS application in target/PROFILE/NAME.app.
+
+      --manifest-path PATH   Use a Minyar.toml or project directory
+      --release              Build with the release profile
+      --locked               Require an up-to-date Minyar.lock
+      --offline              Build using cached dependencies
+      --no-incremental       Disable the module cache
+      --bundle-id ID         Set a dotted identifier (default: org.minyar.NAME)
+      --icon FILE.icns       Include an application icon
+      --resources DIR        Copy this directory into the app's Resources
+      --sign IDENTITY        Certificate name/hash; default - signs locally
+      -h, --help             Show this help
+    """)
+}
+function run(command: List<Text>, directory: Text): Integer {
+    let handle = system.spawn(command[0], command, system.environment(), directory)
+    if handle < 0 { host.stop(host.osError(handle, command[0])) }
+    let status = system.wait(handle)
+    if status.state == system.SIGNALED { return 128 + status.signal }
+    if status.state != system.EXITED { host.stop("cannot wait for " + command[0]) }
+    return status.exitCode
+}
+function main(): Integer {
+    let manifest = ""
+    let identifier = ""
+    let icon = ""
+    let resources = ""
+    let identity = "-"
+    let profile = "debug"
+    let flags: List<Text> = []
+    let seen: List<Text> = []
+    let index = 0
+    while index < processInfo.argumentCount() {
+        let option = processInfo.argument(index)
+        if option == "--help" || option == "-h" { help(); return 0 }
+        if host.listed(seen, option) { host.stop("duplicate option: " + option) }
+        seen.add(option)
+        if option == "--release" || option == "--locked" || option == "--offline" || option == "--no-incremental" {
+            flags.add(option)
+            if option == "--release" { profile = "release" }
+        } else if option == "--manifest-path" || option == "--bundle-id" || option == "--icon" || option == "--resources" || option == "--sign" {
+            index += 1
+            if index >= processInfo.argumentCount() { host.stop(option + " requires a value") }
+            let value = processInfo.argument(index)
+            if value == "" || (value.startsWith("-") && !(option == "--sign" && value == "-")) { host.stop(option + " requires a value") }
+            if option == "--manifest-path" { manifest = value }
+            else if option == "--bundle-id" { identifier = value }
+            else if option == "--icon" { icon = host.resolveName(value) }
+            else if option == "--resources" { resources = host.resolveName(value) }
+            else { identity = value }
+        } else { host.stop("unknown app option: " + option) }
+        index += 1
+    }
+    if host.hostName() != "Darwin" { host.stop("minyar app currently requires macOS") }
+    let root = ""
+    if manifest == "" { root = project.find(".") }
+    else { root = project.at(manifest) }
+    let package = project.read(root)
+    if !project.isBinary(package) { host.stop("app requires a binary package with src/main.min") }
+    let toolchain = system.getenv("MINYAR_PROJECT_DIR")
+    if toolchain == "" { host.stop("cannot locate the Minyar toolchain; run this command through minyar app") }
+    if identifier == "" { identifier = "org.minyar." + host.replaceText(package.name, "_", "-") }
+    let command = [toolchain + "/minyar", "build", "--manifest-path", root]
+    for flag in flags { command.add(flag) }
+    let status = run(command, root)
+    if status != 0 { return status }
+    let binary = root + "/target/" + profile + "/" + package.name
+    let output = binary + ".app"
+    let error = app.packageSigned(binary, output, identifier, icon, resources, identity)
+    if error != "" { host.stop("application packaging failed: " + error) }
+    print("Packaged " + output)
+    return 0
+}

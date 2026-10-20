@@ -1,0 +1,164 @@
+// Declarative native AppKit views. The model and application state stay in Minyar;
+// native callbacks enqueue checked Integer handles, never managed closures.
+use "ui" as ui
+use "macos" as mac
+
+public constant ACTION = 1
+public constant CHANGE = 2
+public constant SUBMIT = 6
+
+record Mounted { view: ui.View; handle: Integer }
+// AppKit has one native event queue. This renderer owns one window at a time.
+global activeWindows: List<Integer> = []
+public record Application {
+    private window: Integer
+    private root: Integer
+    private nodes: List<Mounted>
+    private event: Integer
+    private source: Text
+    private snapshot: Text
+    private disposed: Boolean
+}
+
+/// Initialize AppKit once, on the main thread, before opening windows.
+public function initialize(name: Text) { mac.initialize(name) }
+
+function requireOpen(application: Application) {
+    if application.disposed { fail("this declarative window has been disposed") }
+}
+function validate(view: ui.View) {
+    let problem = ui.problem(view)
+    if problem != "" { fail("cannot show this view: " + problem) }
+}
+function properties(handle: Integer, view: ui.View) {
+    let kind = ui.kind(view)
+    if kind == ui.COLUMN || kind == ui.ROW {
+        mac.padding(handle, ui.padding(view))
+    } else {
+        if mac.text(handle) != ui.text(view) { mac.setText(handle, ui.text(view)) }
+        if kind == ui.TOGGLE && mac.checked(handle) != ui.isChecked(view) {
+            mac.setChecked(handle, ui.isChecked(view))
+        }
+    }
+}
+function mount(parent: Integer, view: ui.View, nodes: List<Mounted>) {
+    let kind = ui.kind(view)
+    let handle = 0
+    if kind == ui.COLUMN { handle = mac.column(parent, ui.spacing(view)); mac.fill(handle) }
+    else if kind == ui.ROW { handle = mac.row(parent, ui.spacing(view)) }
+    else if kind == ui.LABEL || kind == ui.HEADING {
+        handle = mac.label(parent, ui.text(view))
+        mac.lines(handle, 0)
+        mac.fill(handle)
+        if kind == ui.HEADING { mac.font(handle, "", 24.0, 600.0) }
+    }
+    else if kind == ui.BUTTON { handle = mac.button(parent, ui.text(view)) }
+    else if kind == ui.INPUT { handle = mac.textField(parent, ui.text(view)); mac.fill(handle) }
+    else if kind == ui.TOGGLE { handle = mac.checkbox(parent, ui.text(view), ui.isChecked(view)) }
+    nodes.add(Mounted { view: view; handle: handle })
+    properties(handle, view)
+    for child in ui.children(view) { mount(handle, child, nodes) }
+}
+function flatten(view: ui.View, nodes: List<ui.View>) {
+    nodes.add(view)
+    for child in ui.children(view) { flatten(child, nodes) }
+}
+
+/// Create and show a window. Call initialize once before the first open.
+public function open(title: Text, width: Integer, height: Integer, view: ui.View): Application {
+    let windows = activeWindows
+    if windows.length != 0 { fail("dispose the current declarative window before opening another") }
+    validate(view)
+    let window = mac.window(title, width, height)
+    windows.add(window)
+    let root = mac.column(window, 0)
+    mac.fill(root)
+    let application = Application { window: window; root: root; nodes: []; event: 0; source: ""; snapshot: ""; disposed: false }
+    mount(root, view, application.nodes)
+    mac.show(window)
+    return application
+}
+
+/// Apply a new description. Text/state changes keep native controls and focus.
+/// A changed kind, key, child order/count or spacing rebuilds the content.
+public function update(application: Application, view: ui.View) {
+    requireOpen(application)
+    validate(view)
+    let wanted: List<ui.View> = []
+    flatten(view, wanted)
+    let compatible = application.nodes.length == wanted.length
+    if compatible {
+        compatible = ui.sameStructure(application.nodes[0].view, view)
+        for index in 0..wanted.length {
+            if ui.spacing(application.nodes[index].view) != ui.spacing(wanted[index]) { compatible = false }
+        }
+    }
+    if !compatible {
+        mac.clear(application.root)
+        application.nodes = []
+        mount(application.root, view, application.nodes)
+        return
+    }
+    for index in 0..wanted.length {
+        let previous = application.nodes[index].view
+        let kind = ui.kind(wanted[index])
+        if (kind != ui.ROW && kind != ui.COLUMN) || ui.padding(previous) != ui.padding(wanted[index]) {
+            properties(application.nodes[index].handle, wanted[index])
+        }
+        application.nodes[index].view = wanted[index]
+    }
+}
+
+/// Dispatch one native event. False means this window closed or the app quit.
+/// The timeout is in seconds; zero checks without waiting.
+public function nextEvent(application: Application, timeout: Float): Boolean {
+    requireOpen(application)
+    application.event = 0
+    application.source = ""
+    application.snapshot = ""
+    if !mac.nextEvent(timeout) { return false }
+    let event = mac.eventType()
+    let source = mac.eventSource()
+    if event == mac.QUIT || (event == mac.CLOSED && source == application.window) { return false }
+    application.event = event
+    for node in application.nodes {
+        if node.handle == source {
+            application.source = ui.key(node.view)
+            application.snapshot = mac.eventText()
+            break
+        }
+    }
+    return true
+}
+public function eventKind(application: Application): Integer { return application.event }
+public function eventKey(application: Application): Text { return application.source }
+public function eventText(application: Application): Text { return application.snapshot }
+
+/// Return a native control handle for an explicit low-level AppKit operation.
+/// Handles end after a structural rebuild or dispose; unknown keys return zero.
+public function handle(application: Application, key: Text): Integer {
+    requireOpen(application)
+    if key == "" { return 0 }
+    for node in application.nodes { if ui.key(node.view) == key { return node.handle } }
+    return 0
+}
+public function windowHandle(application: Application): Integer { requireOpen(application); return application.window }
+public function text(application: Application, key: Text): Text {
+    let control = handle(application, key)
+    if control == 0 { fail("this view has no control named " + key) }
+    return mac.text(control)
+}
+public function isChecked(application: Application, key: Text): Boolean {
+    let control = handle(application, key)
+    if control == 0 { fail("this view has no control named " + key) }
+    return mac.checked(control)
+}
+/// Release this window and all its native controls. Repeated dispose is safe.
+public function dispose(application: Application) {
+    if application.disposed { return }
+    mac.destroy(application.window)
+    application.nodes = []
+    application.disposed = true
+    let windows = activeWindows
+    windows.clear()
+}

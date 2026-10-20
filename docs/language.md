@@ -1965,6 +1965,15 @@ errors beside the same mistakes in Rust, Swift and TypeScript. Underlines
 account for wide characters, combining marks and common joined emoji; source
 coordinates remain Unicode scalars. Terminal fonts may choose different widths.
 
+## Describing native views
+
+The `ui` module describes views with ordinary functions: `column` and `row`
+compose headings, labels, keyed buttons, text inputs and checkboxes. The pure
+description owns no native UI objects. `ui-macos` displays it through AppKit
+and updates text and values while keeping the same native controls. Application
+state stays in ordinary Minyar records. See [native desktop applications](desktop.md)
+for a complete example, update rules and `minyar app` bundling and signing.
+
 ## Formatting source
 
 `minyar fmt` lays out source with four-space blocks and consistent spacing.
