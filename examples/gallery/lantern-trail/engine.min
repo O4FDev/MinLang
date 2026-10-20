@@ -1,0 +1,254 @@
+// The trail has no clock or random source. A command returns a fresh state.
+public choice Direction {
+    North
+    South
+    East
+    West
+}
+
+public choice Command {
+    Walk(direction: Direction)
+    Look
+    Help
+    Restart
+    Quit
+    Unknown
+}
+
+public choice Phase {
+    Exploring
+    Rescued
+    Exhausted
+    LeftTrail
+}
+
+public record Game {
+    x: Integer
+    y: Integer
+    energy: Integer
+    amber: Boolean
+    blue: Boolean
+    steps: Integer
+    phase: Phase
+}
+
+public record Turn {
+    game: Game
+    message: Text
+    draw: Boolean
+}
+
+public function start(): Game {
+    return Game { x: 1; y: 1; energy: 10; amber: false; blue: false; steps: 0; phase: Exploring }
+}
+
+public function controls(): Text {
+    return "Commands: north/south/east/west (n/s/e/w), look, restart, help, quit."
+}
+
+public function command(line: Text): Command {
+    let first = 0
+    let after = line.length
+    while first < after {
+        let letter = line.slice(first, first + 1)
+        if letter != " " && letter != "\t" && letter != "\r" { break }
+        first += 1
+    }
+    while after > first {
+        let letter = line.slice(after - 1, after)
+        if letter != " " && letter != "\t" && letter != "\r" { break }
+        after -= 1
+    }
+    let word = line.slice(first, after)
+    if word == "north" || word == "n" { return Walk(North) }
+    if word == "south" || word == "s" { return Walk(South) }
+    if word == "east" || word == "e" { return Walk(East) }
+    if word == "west" || word == "w" { return Walk(West) }
+    if word == "look" { return Look }
+    if word == "help" { return Help }
+    if word == "restart" { return Restart }
+    if word == "quit" { return Quit }
+    return Unknown
+}
+
+public function Game.lanterns(): Integer {
+    let count = 0
+    if self.amber { count += 1 }
+    if self.blue { count += 1 }
+    return count
+}
+
+public function Game.status(): Text {
+    return "Energy \(self.energy) | Lanterns \(self.lanterns())/2 | Steps \(self.steps)"
+}
+
+function wall(x: Integer, y: Integer): Boolean {
+    return x <= 0 || x >= 6 || y <= 0 || y >= 4 || (y == 2 && (x == 2 || x == 4))
+}
+
+public function Game.board(): Text {
+    let picture = ""
+    for row in 0..5 {
+        if row > 0 { picture += "\n" }
+        for column in 0..7 {
+            if column == self.x && row == self.y { picture += "@" }
+            else if wall(column, row) { picture += "#" }
+            else if column == 4 && row == 1 && !self.amber { picture += "L" }
+            else if column == 1 && row == 3 && !self.blue { picture += "L" }
+            else if column == 4 && row == 3 { picture += "G" }
+            else { picture += "." }
+        }
+    }
+    return picture
+}
+
+public function Game.exploring(): Boolean {
+    return match self.phase {
+        Exploring { true }
+        Rescued { false }
+        Exhausted { false }
+        LeftTrail { false }
+    }
+}
+
+public function Game.left(): Boolean {
+    return match self.phase {
+        LeftTrail { true }
+        else { false }
+    }
+}
+
+public function Game.exitStatus(): Integer {
+    return match self.phase {
+        Exhausted { 1 }
+        else { 0 }
+    }
+}
+
+function Game.walk(direction: Direction): Turn {
+    let dx = 0
+    let dy = 0
+    let name = ""
+    match direction {
+        North { dy = -1; name = "north" }
+        South { dy = 1; name = "south" }
+        East { dx = 1; name = "east" }
+        West { dx = -1; name = "west" }
+    }
+    let x = self.x + dx
+    let y = self.y + dy
+    if wall(x, y) {
+        return Turn { game: self; message: "A stone wall blocks the way. No energy spent."; draw: false }
+    }
+    let energy = self.energy - 1
+    let amber = self.amber
+    let blue = self.blue
+    let message = "You move \(name)."
+    if x == 4 && y == 1 && !amber {
+        amber = true
+        energy += 2
+        message = "You collect the amber lantern. Two energy restored."
+    }
+    if x == 1 && y == 3 && !blue {
+        blue = true
+        energy += 2
+        message = "You collect the blue lantern. Two energy restored."
+    }
+    let phase: Phase = Exploring
+    if x == 4 && y == 3 {
+        if amber && blue {
+            phase = Rescued
+            message = "Both lanterns shine. The gate opens: you rescue the lost travellers!"
+        } else {
+            message = "The gate needs both lanterns. Keep searching."
+        }
+    }
+    // Reaching the gate with the last energy still rescues the travellers.
+    if energy == 0 && !(amber && blue && x == 4 && y == 3) {
+        phase = Exhausted
+        message = "Your light goes out. Type restart to try another route."
+    }
+    let next = Game { x: x; y: y; energy: energy; amber: amber; blue: blue; steps: self.steps + 1; phase: phase }
+    return Turn { game: next; message: message; draw: false }
+}
+
+public function Game.act(request: Command): Turn {
+    match request {
+        Restart { return Turn { game: start(); message: "A fresh light. The trail begins again."; draw: true } }
+        Quit {
+            let next = Game { x: self.x; y: self.y; energy: self.energy; amber: self.amber; blue: self.blue; steps: self.steps; phase: LeftTrail }
+            return Turn { game: next; message: "You leave the trail. Goodbye."; draw: false }
+        }
+        Look { return Turn { game: self; message: "@ you | # wall | L lantern | G rescue gate"; draw: true } }
+        Help { return Turn { game: self; message: controls(); draw: false } }
+        Unknown { return Turn { game: self; message: "Unknown command. Type help for the controls. No energy spent."; draw: false } }
+        Walk(direction) {
+            if !self.exploring() {
+                return Turn { game: self; message: "This trail is over. Type restart or quit."; draw: false }
+            }
+            return self.walk(direction)
+        }
+    }
+}
+
+test "walls and malformed commands leave the game unchanged" {
+    let game = start()
+    expect(game.act(command("north")).game == game)
+    expect(game.act(command("teleport")).game == game)
+    expect(game.act(command("")).game == game)
+    expect(game.act(command("help")).game == game)
+    expect(game.act(command("look")).game == game)
+    expect(game.act(command(" east \r")).game.x == 2)
+    expect(game.energy == 10)
+    expect(game.x == 1)
+}
+
+test "both lanterns rescue the travellers in eleven steps" {
+    let game = start()
+    for word in ["s", "s", "e", "e", "n", "n", "e", "e", "s", "s", "w"] {
+        game = game.act(command(word)).game
+    }
+    expect(game.lanterns() == 2)
+    expect(game.steps == 11)
+    expect(game.energy == 3)
+    expect(match game.phase { Rescued { true } else { false } })
+    expect(game.act(command("west")).game == game)
+    expect(game.act(command("restart")).game == start())
+}
+
+test "one lantern cannot open the gate and a lantern only restores energy once" {
+    let game = start()
+    for word in ["s", "s", "e", "e", "e"] { game = game.act(command(word)).game }
+    expect(game.x == 4 && game.y == 3)
+    expect(game.exploring())
+    expect(game.lanterns() == 1)
+    let lantern = start().act(command("s")).game.act(command("s")).game
+    let returned = lantern.act(command("n")).game.act(command("s")).game
+    expect(returned.energy == lantern.energy - 2)
+    expect(returned.lanterns() == 1)
+}
+
+test "energy exhaustion, restart and quit are explicit states" {
+    let game = start()
+    for word in ["e", "w", "e", "w", "e", "w", "e", "w", "e", "w"] {
+        game = game.act(command(word)).game
+    }
+    expect(game.energy == 0)
+    expect(game.steps == 10)
+    expect(game.exitStatus() == 1)
+    expect(match game.phase { Exhausted { true } else { false } })
+    expect(game.act(command("east")).game == game)
+    expect(game.act(command("restart")).game == start())
+    expect(game.act(command("quit")).game.left())
+}
+
+test "the last energy can collect a lantern or open the rescue gate" {
+    let nearLantern = Game { x: 3; y: 1; energy: 1; amber: false; blue: false; steps: 0; phase: Exploring }
+    let collected = nearLantern.act(command("east")).game
+    expect(collected.energy == 2)
+    expect(collected.exploring())
+    let nearGate = Game { x: 5; y: 3; energy: 1; amber: true; blue: true; steps: 10; phase: Exploring }
+    let rescued = nearGate.act(command("west")).game
+    expect(rescued.energy == 0)
+    expect(match rescued.phase { Rescued { true } else { false } })
+}

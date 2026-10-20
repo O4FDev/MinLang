@@ -1,0 +1,126 @@
+use "httpserver" as http
+use "errors" as errors
+use "process" as processInfo
+use "text" as text
+use "json" as json
+use "./model.min" as model
+use "./page.min" as page
+
+function reply(status: Integer, contentType: Text, body: Text): http.Response {
+    let response = http.response(status, contentType, Bytes(body))
+    response.headers.add(http.Header { name: "cache-control"; value: "no-store" })
+    response.headers.add(http.Header { name: "x-content-type-options"; value: "nosniff" })
+    return response
+}
+
+function problem(status: Integer, message: Text): http.Response {
+    return reply(status, "application/json; charset=utf-8", "{\"error\":\(json.quote(message))}")
+}
+
+function wrongMethod(allow: Text): http.Response {
+    let response = problem(405, "use the method named by the Allow header")
+    response.headers.add(http.Header { name: "allow"; value: allow })
+    return response
+}
+
+function pathOf(target: Text): Text {
+    let question = target.find("?")
+    if question >= 0 { return target.slice(0, question) }
+    return target
+}
+
+function handle(board: model.Board, request: http.Request): http.Response {
+    let path = pathOf(request.target)
+    if path == "/" {
+        if request.method != "GET" { return wrongMethod("GET") }
+        let response = reply(200, "text/html; charset=utf-8", page.html())
+        response.headers.add(http.Header { name: "content-security-policy"; value: "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" })
+        return response
+    }
+    if path == "/health" {
+        if request.method != "GET" { return wrongMethod("GET") }
+        return reply(200, "application/json; charset=utf-8", "{\"ok\":true,\"service\":\"tideboard\"}")
+    }
+    if path == "/tasks" {
+        if request.method == "GET" {
+            return reply(200, "application/json; charset=utf-8", board.json())
+        }
+        if request.method != "POST" { return wrongMethod("GET, POST") }
+        let contentType = http.header(request, "content-type")
+        if contentType != "text/plain" && contentType != "text/plain; charset=utf-8" {
+            return problem(415, "send text/plain or text/plain; charset=utf-8")
+        }
+        match board.create(request.body) {
+            Ok(task) { return reply(201, "application/json; charset=utf-8", task.json()) }
+            Err(error) { return problem(error.status, error.message) }
+        }
+    }
+    match model.completionId(path) {
+        None { return problem(404, "no route here") }
+        Some(id) {
+            if request.method != "POST" { return wrongMethod("POST") }
+            if request.body.length != 0 { return problem(400, "completion needs an empty body") }
+            match board.complete(id) {
+                None { return problem(404, "no task with that ID") }
+                Some(task) { return reply(200, "application/json; charset=utf-8", task.json()) }
+            }
+        }
+    }
+}
+
+function portArgument(): Result<Integer, Text> {
+    if processInfo.argumentCount() > 1 { return Err("usage: tideboard [port]") }
+    if processInfo.argumentCount() == 0 { return Ok(8080) }
+    let source = processInfo.argument(0)
+    if source.length == 0 || source.length > 5 { return Err("choose a decimal port from 0 to 65535") }
+    for character in source {
+        if character < '0' || character > '9' { return Err("choose a decimal port from 0 to 65535") }
+    }
+    match text.integer(source) {
+        Err(error) { return Err("choose a decimal port from 0 to 65535") }
+        Ok(port) {
+            if port > 65535 { return Err("choose a decimal port from 0 to 65535") }
+            return Ok(port)
+        }
+    }
+}
+
+function main(): Integer {
+    let port = 8080
+    match portArgument() {
+        Err(message) { print(message); return 2 }
+        Ok(chosen) { port = chosen }
+    }
+    let limits = http.defaults()
+    limits.maxConnections = 32
+    limits.maxHeaderBytes = 8192
+    limits.maxHeaders = 32
+    limits.maxBodyBytes = model.TITLE_BYTES
+    limits.maxResponseBytes = 524288
+    limits.maxRequestsPerConnection = 100
+    limits.idleMilliseconds = 5000
+    limits.headerMilliseconds = 3000
+    limits.bodyMilliseconds = 3000
+    limits.applicationMilliseconds = 3000
+    limits.writeMilliseconds = 5000
+    let server = http.listen("127.0.0.1", port, limits)
+    if !http.ok(server) {
+        print("Tideboard: \(errors.message(http.serverError(server)))")
+        return 1
+    }
+    let board = model.empty()
+    print("TIDEBOARD_READY http://127.0.0.1:\(http.port(server))")
+    while true {
+        let batch = http.poll(server, -1)
+        if errors.isError(http.batchError(batch)) {
+            print("Tideboard: \(errors.message(http.batchError(batch)))")
+            http.close(server)
+            return 1
+        }
+        for request in http.requests(batch) {
+            if !http.respond(server, request, handle(board, request)) {
+                http.abandon(server, request)
+            }
+        }
+    }
+}
