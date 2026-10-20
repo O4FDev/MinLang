@@ -166,9 +166,9 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
             rows = human.stderr.splitlines()
             underline = re.search(r"\^+", rows[4])
             assert underline and underline.start() == rows[3].find("| ") + 2 + value["column"] - 1, (
-                "caret starts at the numeric literal", source, human.stderr)
+                "caret starts at the offending token", source, human.stderr)
             assert len(underline.group()) == value["endColumn"] - value["column"], (
-                "entire malformed numeric literal is underlined", source, human.stderr)
+                "entire offending token is underlined", source, human.stderr)
         return value
 
     # Existing rejections prove code identities across unrelated front-end
@@ -249,6 +249,65 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         path = root / f"followup-{name}.min"
         path.write_text(source, encoding="utf-8")
         diagnostic(path, code, expected_source_lines=source.splitlines())
+
+    # Logical type failures use the offending operand's first token. Compound
+    # operands retain the single-token presentation, on their first source line.
+    for name, source, side, operator, span in (
+        ("and-left", "print(41 && true)\n", "left", "&&", (1, 7, 1, 9)),
+        ("and-right", "print(true && 41)\n", "right", "&&", (1, 15, 1, 17)),
+        ("or-left", "print(41 || false)\n", "left", "||", (1, 7, 1, 9)),
+        ("or-right", "print(false || 41)\n", "right", "||", (1, 16, 1, 18)),
+        ("multiline-and-left", "print(\n    41 && true\n)\n", "left", "&&", (2, 5, 2, 7)),
+        ("multiline-and-right", "print(\n    true &&\n    41\n)\n", "right", "&&", (3, 5, 3, 7)),
+        ("multiline-or-left", "print(\n    41 || false\n)\n", "left", "||", (2, 5, 2, 7)),
+        ("multiline-or-right", "print(\n    false ||\n    41\n)\n", "right", "||", (3, 5, 3, 7)),
+        ("grouped-and-left", "print((41 + 1) && true)\n", "left", "&&", (1, 7, 1, 8)),
+        ("grouped-and-right", "print(true && (41 + 1))\n", "right", "&&", (1, 15, 1, 16)),
+        ("grouped-or-left", "print((41 + 1) || false)\n", "left", "||", (1, 7, 1, 8)),
+        ("grouped-or-right", "print(false || (41 + 1))\n", "right", "||", (1, 16, 1, 17)),
+        ("chained-and", "print(true && false && 41)\n", "right", "&&", (1, 24, 1, 26)),
+        ("chained-or", "print(false || true || 41)\n", "right", "||", (1, 24, 1, 26)),
+        ("mixed-inner-left", "print(true || 41 && false)\n", "left", "&&", (1, 15, 1, 17)),
+        ("mixed-inner-right", "print(false && 41 || true)\n", "right", "&&", (1, 16, 1, 18)),
+        ("spanning-and-right", "print(\n    true && (41 +\n        1)\n)\n", "right", "&&", (2, 13, 2, 14)),
+        ("spanning-or-left", "print(\n    (41 +\n        1) || false\n)\n", "left", "||", (2, 5, 2, 6)),
+        ("nested-or-right", "print(true && (false || 41))\n", "right", "||", (1, 25, 1, 27)),
+        ("nested-and-right", "print(false || (true && 41))\n", "right", "&&", (1, 25, 1, 27)),
+    ):
+        path = root / f"boolean-span-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0406", expected_span=span, expected_source_lines=source.splitlines(),
+                   expected_message=f"the {side} side of {operator} must be Boolean; "
+                                    "expected Boolean, found Integer")
+
+    # Type failures point at the supplied value. Count failures continue to
+    # point at the call name and take precedence over type validation.
+    for name, source, primary, span in (
+        ("print-list", "print([1])\n",
+         "print expects one Integer, Float, Text, Character, or Boolean value; found List<Integer>",
+         (1, 7, 1, 8)),
+        ("text-list", "Text([1])\n",
+         "Text expects one Integer, Float, Text, Character, Boolean, or Bytes value; found List<Integer>",
+         (1, 6, 1, 7)),
+        ("fail-integer", "fail(42)\n", "fail expects one Text argument; found Integer",
+         (1, 6, 1, 8)),
+        ("exit-text", 'exit("zero")\n', "exit expects one Integer argument; found Text",
+         (1, 6, 1, 12)),
+        ("join-integer", "joinText(1)\n", "joinText expects one List<Text> argument; found Integer",
+         (1, 10, 1, 11)),
+        ("nested-call", 'print("first")\nfail(Integer("3"))\n',
+         "fail expects one Text argument; found Integer", (2, 6, 2, 13)),
+        ("record-name", "record Lantern { light: Integer }\nprint(Lantern { light: 3 })\n",
+         "print expects one Integer, Float, Text, Character, or Boolean value; found Lantern",
+         (2, 7, 2, 14)),
+        ("count-before-type", 'exit("zero", "one")\n',
+         "exit expects 1 argument, but received 2", (1, 1, 1, 5)),
+    ):
+        path = root / f"builtin-span-{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0404" if name == "count-before-type" else "E0401",
+                   expected_message=primary, expected_span=span,
+                   expected_source_lines=source.splitlines())
 
     for index, literal in enumerate(("0b102", "1__0", "1.5_0", "0xFF_FF"), 1):
         path = root / f"malformed-number-{index}.min"
