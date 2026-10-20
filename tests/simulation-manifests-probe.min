@@ -1,0 +1,268 @@
+use "simulation" as simulation
+use "./fixtures/neodb-simulation/lib/dbio.min" as dbio
+use "./fixtures/neodb-simulation/src/storage/snapshot.min" as snapshot
+use "./fixtures/neodb-simulation/src/storage/wal.min" as wal
+
+function check(world: simulation.World, condition: Boolean, message: Text) {
+    if !condition {
+        print("Manifest failure: " + message)
+        for line in simulation.transcript(world) { print(line) }
+        fail("NeoDB manifests: " + message)
+    }
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function chunks(length: Integer, marker: Integer): List<Bytes> {
+    let body = Bytes(length)
+    for index in 0..length { body[index] = (marker + index) % 251 }
+    return [body, Bytes(), Bytes("tail")]
+}
+function setup(world: simulation.World) {
+    dbio.bind(world)
+    check(world, dbio.mkdir("/db") == 0, "configure directory object")
+}
+function durableSlot(world: simulation.World, slot: Integer, lsn: Integer, length: Integer, marker: Integer) {
+    let bytes = snapshot.encodeManifest(lsn, chunks(length, marker))
+    let fd = snapshot.writeSlot("/db", slot, bytes)
+    check(world, dbio.fdatasync(fd) == 0, "sync slot " + Text(slot))
+    check(world, snapshot.verifySlot("/db", slot, lsn), "verify durable slot " + Text(slot))
+    dbio.close(fd)
+}
+function openedChunks(world: simulation.World, opened: snapshot.Opened, lsn: Integer, length: Integer, marker: Integer) {
+    check(world, opened.found && opened.lsn == lsn, "selected LSN " + Text(lsn))
+    check(world, opened.chunkCount == 3 && opened.payloadLength == length + 4, "chunk directory shape")
+    let expected = chunks(length, marker)
+    for index in 0..3 {
+        check(world, snapshot.chunkLength(opened, index) == expected[index].length, "chunk length " + Text(index))
+        check(world, same(snapshot.readChunk(opened, index), expected[index]), "read verified chunk " + Text(index))
+    }
+}
+function latest(world: simulation.World, lsn: Integer, length: Integer, marker: Integer, slot: Integer) {
+    let opened = snapshot.openLatest("/db")
+    openedChunks(world, opened, lsn, length, marker)
+    check(world, snapshot.slotOf(opened) == slot, "selected slot " + Text(slot))
+    snapshot.close(opened)
+}
+
+// Real writeSlot performs write + truncate + first-name directory sync, but
+// returns before data durability. persistPrefix overlays only a new prefix on
+// the old durable file; it never persists a truncate to a shorter length.
+function prefixes(oldLength: Integer, newLength: Integer): Integer {
+    let count = 0
+    let encodedLength = snapshot.HEADER_BYTES + newLength + 4 + 3 * snapshot.DIRECTORY_ENTRY_BYTES
+    for prefix in 0..(encodedLength + 1) {
+        let world = simulation.create(prefix + 101)
+        setup(world)
+        durableSlot(world, 1, 20, 8, 20)
+        if oldLength >= 0 { durableSlot(world, 0, 10, oldLength, 10) }
+        let bytes = snapshot.encodeManifest(30, chunks(newLength, 30))
+        check(world, bytes.length == encodedLength, "manifest byte boundary count")
+        let fd = snapshot.writeSlot("/db", 0, bytes)
+        check(world, snapshot.verifySlot("/db", 0, 30), "live verification alone promises no durability")
+        let file = simulation.openFile(world, snapshot.slotPath("/db", 0), false)
+        simulation.persistPrefix(world, file, prefix)
+        dbio.crash()
+        file = simulation.openFile(world, snapshot.slotPath("/db", 0), false)
+        check(world, file > 0, "slot name survives first-create directory sync")
+        let recovered = simulation.read(world, file, 0, simulation.size(world, file))
+        let complete = same(recovered, bytes)
+        check(world, snapshot.verifySlot("/db", 0, 30) == complete,
+            "prefix validation old=" + Text(oldLength) + " new=" + Text(newLength) + " prefix=" + Text(prefix))
+        let opened = snapshot.openLatestIn("/db", dbio.listDir("/db"))
+        let expectedLsn = 20
+        if complete { expectedLsn = 30 }
+        check(world, opened.found && opened.lsn == expectedLsn,
+            "prefix selection old=" + Text(oldLength) + " new=" + Text(newLength) + " prefix=" + Text(prefix))
+        if complete {
+            openedChunks(world, opened, 30, newLength, 30)
+            check(world, snapshot.slotOf(opened) == 0, "fully surviving image selected")
+        } else {
+            openedChunks(world, opened, 20, 8, 20)
+            check(world, snapshot.slotOf(opened) == 1, "torn image falls back to intact other slot")
+        }
+        snapshot.close(opened)
+        // Reopening and reading the fallback remains possible after rejection.
+        check(world, snapshot.verifySlot("/db", 1, 20), "fallback bytes remain usable")
+        let fallback = snapshot.openLatestIn("/db", ["manifest-1.db"])
+        openedChunks(world, fallback, 20, 8, 20)
+        snapshot.close(fallback)
+        if prefix == encodedLength {
+            if oldLength > newLength {
+                check(world, !complete && recovered.length > bytes.length, "prefix overlay retains old durable suffix")
+            }
+            // A successful real sync persists the truncate too, then restart
+            // selects the new image even in the shrinking case.
+            fd = snapshot.writeSlot("/db", 0, bytes)
+            check(world, dbio.fdatasync(fd) == 0, "durable rewrite includes exact length")
+            dbio.close(fd)
+            dbio.crash()
+            latest(world, 30, newLength, 30, 0)
+        }
+        count += 1
+    }
+    return count
+}
+
+function alternating() {
+    let world = simulation.create(73)
+    setup(world)
+    simulation.advance(world, 31)
+    simulation.jumpClock(world, 123)
+    check(world, dbio.wallClockMicros() == 154000, "virtual wall milliseconds convert to microseconds")
+    for generation in 1..7 {
+        let slot = (generation - 1) % 2
+        let lsn = generation * 10
+        let bytes = snapshot.encodeManifest(lsn, chunks(8, lsn))
+        check(world, bytes.getInt64(40) == dbio.wallClockMicros(), "real encoder uses virtual wall time")
+        let fd = snapshot.writeSlot("/db", slot, bytes)
+        let handle = dbio.syncerStart(fd)
+        check(world, dbio.syncerRequest(handle, bytes.length) == 0, "queue actual slot sync")
+        check(world, dbio.syncerSyncedOffset(handle) == 0 && simulation.pendingCount(world) == 1,
+            "a queued slot sync has not completed")
+        // A copy of the live bytes validates before the async durability event.
+        check(world, snapshot.verifySlot("/db", slot, lsn), "verify is distinct from sync")
+        check(world, dbio.completeNext() == handle && dbio.syncerSyncedOffset(handle) == bytes.length,
+            "actual scheduler completes slot durability")
+        check(world, snapshot.verifySlot("/db", slot, lsn), "verify after data sync")
+        dbio.close(fd)
+        check(world, dbio.syncerStop(handle) == 0, "close independent syncer identity")
+        dbio.crash()
+        latest(world, lsn, 8, lsn, slot)
+        if generation > 1 {
+            check(world, snapshot.verifySlot("/db", 1 - slot, lsn - 10), "previous durable slot retained")
+        }
+        // Recovery orders by LSN, independently of a backwards wall clock.
+        simulation.jumpClock(world, -100)
+    }
+}
+
+// Explicit configured corruption controls, NOT arbitrary persistence faults:
+// flip one bit at every byte of the encoded image, then durably store it.
+// Chunk flips leave the real header and directory byte-for-byte valid.
+function corruptionControls() {
+    let length = snapshot.HEADER_BYTES + 8 + 4 + 3 * snapshot.DIRECTORY_ENTRY_BYTES
+    for byte in 0..length {
+        let world = simulation.create(byte + 601)
+        setup(world)
+        durableSlot(world, 1, 20, 8, 20)
+        let good = snapshot.encodeManifest(30, chunks(8, 30))
+        let bad = good.slice(0, good.length)
+        bad[byte] = bad[byte] ^ 1
+        if byte >= snapshot.HEADER_BYTES && byte < snapshot.HEADER_BYTES + 12 {
+            check(world, same(bad.slice(0, 64), good.slice(0, 64)) && same(bad.slice(76, length), good.slice(76, length)),
+                "chunk corruption retains valid header and directory")
+        }
+        let fd = snapshot.writeSlot("/db", 0, bad)
+        check(world, dbio.fdatasync(fd) == 0, "persist configured corrupt image")
+        dbio.close(fd)
+        dbio.crash()
+        check(world, !snapshot.verifySlot("/db", 0, 30), "reject flipped byte " + Text(byte))
+        let opened = snapshot.openLatest("/db")
+        check(world, opened.found && opened.lsn == 20, "fallback after flipped byte " + Text(byte))
+        openedChunks(world, opened, 20, 8, 20)
+        if byte >= 64 && byte < 76 {
+            check(world, opened.skippedCorrupt == 1, "openLatest fully checks chunks before accepting a slot")
+        }
+        snapshot.close(opened)
+        check(world, dbio.pathSize(snapshot.slotPath("/db", 0)) == length, "bad slot remains reusable without rename")
+        durableSlot(world, 0, 40, 8, 40)
+        dbio.crash()
+        latest(world, 40, 8, 40, 0)
+    }
+}
+
+function writer(): wal.Wal {
+    let reader = wal.openReader("/db", 0)
+    while wal.next(reader) {}
+    return wal.openWriter("/db", reader, wal.Options { segmentBytes: 4096; preallocate: false; recycleKeep: 0 })
+}
+function event(lines: List<Text>, start: Integer, expected: Text): Integer {
+    for index in start..lines.length { if lines[index] == expected { return index } }
+    return -1
+}
+function publication() {
+    let world = simulation.create(81)
+    setup(world)
+    let log = writer()
+    let end = wal.append(log, Bytes("redo"))
+    wal.flush(log)
+    check(world, wal.durableLsn(log) == 0, "WAL is written but not durable before finishWal")
+    let sw = snapshot.begin("/db", end)
+    for chunk in chunks(8, 50) { snapshot.add(sw, chunk) }
+    let walFile = simulation.openFile(world, wal.segmentPath("/db", 0), false)
+    let temporary = "/db/snap-0000000000000014.tmp"
+    check(world, end == 20, "publication fixture WAL LSN")
+    let snapshotFile = simulation.openFile(world, temporary, false)
+    let start = simulation.transcript(world).length
+    check(world, snapshot.finishWal(sw, log) == 148, "real finishWal returns container length")
+    check(world, wal.durableLsn(log) == end && wal.verifiedSnapshot(log) == end, "WAL durable and snapshot verified")
+    let lines = simulation.transcript(world)
+    let walSync = event(lines, start, "sync " + Text(walFile))
+    let header = event(lines, start, "write " + Text(snapshotFile) + " 0 64")
+    let snapshotSync = event(lines, start, "sync " + Text(snapshotFile))
+    let rename = event(lines, start, "rename " + temporary + " " + snapshot.snapshotPath("/db", end))
+    let directory = event(lines, start, "directory /db")
+    check(world, walSync >= start && header > walSync && snapshotSync > header && rename > snapshotSync && directory > rename,
+        "real order: WAL sync, snapshot header, snapshot data sync, rename, name sync")
+    wal.close(log)
+    dbio.crash()
+    let opened = snapshot.openLatest("/db")
+    openedChunks(world, opened, end, 8, 50)
+    check(world, snapshot.slotOf(opened) == -1, "finishWal publishes ordinary snapshot")
+    snapshot.close(opened)
+    let reader = wal.openReader("/db", 0)
+    check(world, wal.next(reader) && Text(wal.payload(reader)) == "redo", "WAL bytes survive publication crash")
+    check(world, !wal.next(reader) && !wal.corruptionDetected(reader), "WAL prefix remains complete")
+}
+
+function slotWriteFailure() {
+    let world = simulation.create(91)
+    setup(world)
+    let bytes = snapshot.encodeManifest(10, chunks(8, 10))
+    simulation.injectError(world, simulation.WRITE, -5)
+    snapshot.writeSlot("/db", 0, bytes)
+    fail("NeoDB manifests: writeSlot ignored write failure")
+}
+function beyondWalFailure() {
+    let world = simulation.create(92)
+    setup(world)
+    let log = writer()
+    let sw = snapshot.begin("/db", 1)
+    snapshot.finishWal(sw, log)
+    fail("NeoDB manifests: snapshot exceeded WAL")
+}
+function walSyncFailure() {
+    let world = simulation.create(93)
+    setup(world)
+    let log = writer()
+    let end = wal.append(log, Bytes("redo"))
+    wal.flush(log)
+    let sw = snapshot.begin("/db", end)
+    snapshot.add(sw, Bytes("state"))
+    simulation.injectError(world, simulation.SYNC, -5)
+    snapshot.finishWal(sw, log)
+    fail("NeoDB manifests: snapshot ignored WAL sync failure")
+}
+function chunkReadFailure() {
+    let world = simulation.create(94)
+    setup(world)
+    durableSlot(world, 0, 10, 8, 10)
+    let opened = snapshot.openLatest("/db")
+    let fd = dbio.open(snapshot.slotPath("/db", 0), dbio.OPEN_WRITE)
+    dbio.pwrite(fd, Bytes("x"), 0, 1, 64)
+    snapshot.readChunk(opened, 0)
+    fail("NeoDB manifests: readChunk ignored changed bytes")
+}
+function suite() {
+    alternating()
+    let count = prefixes(-1, 8) + prefixes(8, 8) + prefixes(5, 11) + prefixes(13, 5)
+    corruptionControls()
+    publication()
+    print("NeoDB manifests: " + Text(count) + " prefix crashes, alternating slots, CRC fallback and WAL publication verified")
+}
+
+// selected entry
+suite()

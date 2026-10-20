@@ -93,7 +93,8 @@ runtime cost in applications that do not call the simulator.
 ownership cleanup assertions. `make check-simulation-neodb` runs neo-db's actual
 WAL, CRC and storage utility modules unchanged against a simulated `dbio` facade.
 The pinned sources and provenance live under `tests/fixtures/neodb-simulation`.
-The proof covers the WAL boundary; it does not qualify SQL transactions,
-checkpoint manifests or VM devices. The simulator is cooperative and explicit;
+The separate [manifest proof](simulation-manifests.md) checks real checkpoint
+encoding, publication and recovery. These proofs do not qualify SQL transactions
+or VM devices. The simulator is cooperative and explicit;
 it neither explores arbitrary native thread interleavings nor replaces a real
 kernel completion backend such as io_uring.

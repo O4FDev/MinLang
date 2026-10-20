@@ -1092,3 +1092,10 @@ recovery against acknowledged records and torn tails. The fixtures record their
 upstream revision and hashes. `check-simulation-sanitize` adds ASan/UBSan to the
 compiler and generated programs. See [simulation](simulation.md) for the model's
 limits; this is explicit cooperative testing, not native thread exploration.
+
+`make check-simulation-manifests` extends the real neo-db proof to snapshot
+encoding, alternating manifest slots, 596 prefix crashes, 148 configured byte
+corruptions and WAL-before-snapshot publication. It runs at O0/O2 with ownership
+checks and exact failure controls; `check-simulation-manifests-sanitize` adds
+ASan/UBSan. The [manifest contract](simulation-manifests.md) states the prefix
+overlay model and the engine/filesystem behavior outside this proof.
