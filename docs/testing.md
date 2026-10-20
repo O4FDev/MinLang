@@ -1648,3 +1648,9 @@ quiet ordinary and JSON success, byte-identical emitted LLVM, no success remarks
 on rejection, unsupported cached-mode rejection and O0/O2 alias-preserving
 execution with exact cleanup. Its sanitizer variant is
 `check-ownership-explanations-sanitize`.
+
+`make measure-ownership-explanations` is an optional standalone compiler cost
+measurement. Five alternating flag-on/flag-off pairs compile the same 200
+functions, verify every remark and source site, require identical LLVM and retain
+raw CPU/RSS samples. It has no performance threshold and is outside portable
+checks. The complete evidence directory and machine-readable report are printed.

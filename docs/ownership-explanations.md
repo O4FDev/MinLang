@@ -32,3 +32,10 @@ infer that a particular execution reused memory from source syntax alone.
 The feature adds no checks or counters to the generated application. Remark
 collection and source-location formatting cost time and memory only in the
 compiler when the option is selected.
+
+`make measure-ownership-explanations` records five alternating compilation pairs
+for the same 200-function source, with the option enabled and disabled. It checks
+100 retain and 100 transfer remarks with exact source sites, quiet default output
+and byte-identical LLVM across every pair. The printed artifact directory retains
+the source, raw process CPU/RSS samples, JSON remarks, LLVM and `report.json`.
+This optional measurement has no timing threshold or application speedup claim.

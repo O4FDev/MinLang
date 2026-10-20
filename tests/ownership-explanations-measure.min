@@ -1,0 +1,139 @@
+// Optional standalone compilation measurements; no threshold or speedup claim.
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "io" as io
+use "files" as files
+use "json" as json
+
+record OwnershipSample {
+    pair: Integer
+    ordinal: Integer
+    mode: Text
+    usage: Text
+    llvm: Text
+    llvmBytes: Integer
+    remarkCount: Integer
+    log: Text
+    output: Text
+}
+
+function verifyOwnershipUsage(raw: Text) {
+    let fields = test.words(raw)
+    test.check(fields.length == 3, "usage needs user seconds, system seconds and max RSS KiB: " + raw)
+    let user = json.decode(fields[0]).unwrap().asNumber().unwrap()
+    let system = json.decode(fields[1]).unwrap().asNumber().unwrap()
+    let rss = json.decode(fields[2]).unwrap().asInteger().unwrap()
+    // Preserve zero CPU observations when the host tool's timer rounds them.
+    test.check(user >= 0.0 && system >= 0.0 && rss > 0, "invalid raw CPU/RSS sample: " + raw)
+}
+
+function verifyOwnershipRemarks(stderr: Text, input: Text): Integer {
+    let seen: List<Boolean> = []
+    for index in 0..200 { seen.add(false) }
+    let retained = 0
+    let transferred = 0
+    let count = 0
+    for line in stderr.split("\n") {
+        if line != "" {
+            let remark = json.decode(line).unwrap()
+            test.check(remark.requireNumber("version").number == 1.0, "ownership remark version")
+            test.check(remark.requireString("severity").text == "remark", "ownership remark severity")
+            test.check(remark.requireString("pass").text == "terminal-ownership", "ownership remark pass")
+            test.check(remark.requireString("file").text == input, "ownership remark input identity")
+            let row = remark.get("line").unwrap().asInteger().unwrap()
+            let column = remark.get("column").unwrap().asInteger().unwrap()
+            test.check(row >= 3 && row < 800 && (row - 3) % 4 == 0 && column == 12, "ownership remark source site")
+            let index = (row - 3) / 4
+            test.check(!seen[index], "duplicate ownership remark site")
+            seen[index] = true
+            let decision = remark.requireString("decision").text
+            let reason = remark.requireString("reason").text
+            if index % 2 == 0 {
+                test.check(decision == "transfer" && test.contains(reason, "runtime uniqueness still decides storage reuse"), "direct local ownership decision")
+                transferred += 1
+            } else {
+                test.check(decision == "retain" && test.contains(reason, "no transferable local owner"), "borrowed parameter ownership decision")
+                retained += 1
+            }
+            count += 1
+        }
+    }
+    test.check(count == 200 && retained == 100 && transferred == 100, "complete ownership remark count and decisions")
+    for found in seen { test.check(found, "missing ownership remark site") }
+    return count
+}
+
+function ownershipSample(frontend: fixtures.Frontend, executable: Text, input: Text, pair: Integer, ordinal: Integer, explained: Boolean): OwnershipSample {
+    let mode = "plain"
+    if explained { mode = "explained" }
+    let log = frontend.compiler.directory + "/pair" + Text(pair) + "-" + mode
+    let output = log + ".ll"
+    let command = [executable, input, output, "--library", "library"]
+    if explained { command.add("--explain-ownership") }
+    let handle = test.monitoredStart(command, frontend.environment, "", log, test.scaledSeconds(frontend.compiler.compileTimeout))
+    let result = test.finish(handle, log)
+    test.require(result, "standalone compiler sample " + mode + " pair " + Text(pair))
+    test.check(result.output == "", "compiler sample stdout must stay empty")
+    let remarks = 0
+    if explained { remarks = verifyOwnershipRemarks(result.errorOutput, input) }
+    else { test.check(result.errorOutput == "", "ordinary compiler sample stderr must stay empty") }
+    test.check(files.pathSize(output) > 0, "compiler sample published no LLVM")
+    let llvm = io.readTextFile(output)
+    let usage = io.readTextFile(log + ".cpu").trim()
+    verifyOwnershipUsage(usage)
+    print("pair=" + Text(pair) + " ordinal=" + Text(ordinal) + " mode=" + mode + " user-s sys-s max-rss-kib=" + usage + " llvm-bytes=" + Text(llvm.byteLength) + " remarks=" + Text(remarks))
+    return OwnershipSample { pair: pair; ordinal: ordinal; mode: mode; usage: usage; llvm: llvm; llvmBytes: llvm.byteLength; remarkCount: remarks; log: log; output: output }
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+// Resource tools must use decimal points regardless of the invoking locale.
+let environment: List<Text> = []
+for setting in frontend.environment {
+    if !setting.startsWith("LC_ALL=") { environment.add(setting) }
+}
+environment.add("LC_ALL=C")
+frontend.environment = environment
+let executable = test.resolvePath(compiler.executable)
+test.check(executable != "", "measurement compiler executable is unavailable")
+let generated: List<Text> = []
+for index in 0..200 {
+    if index % 2 == 0 {
+        generated.add("function terminal" + Text(index) + "(seed: Text): Text {\n    let value = seed + \"?\"\n    return (value) + \"!\"\n}\n")
+    } else {
+        generated.add("function terminal" + Text(index) + "(value: Text): Text {\n    let ignored = 0\n    return value + \"!\"\n}\n")
+    }
+}
+generated.add("print(terminal0(\"Harbour\"))\n")
+let source = joinText(generated)
+let input = compiler.directory + "/ownership-workload.min"
+io.writeTextFile(input, source)
+print("ownership remarks measurement functions=200 pairs=5 source-bytes=" + Text(source.byteLength))
+print("artifacts=" + compiler.directory)
+let samples: List<OwnershipSample> = []
+let reference = ""
+for pair in 0..5 {
+    let pairSamples: List<OwnershipSample> = []
+    for position in 0..2 {
+        let explained = position == 1
+        if pair % 2 == 1 { explained = position == 0 }
+        let sample = ownershipSample(frontend, executable, input, pair, pair * 2 + position, explained)
+        samples.add(sample)
+        pairSamples.add(sample)
+    }
+    test.check(pairSamples[0].llvm == pairSamples[1].llvm, "ownership option changed LLVM in pair " + Text(pair))
+    if pair == 0 { reference = pairSamples[0].llvm }
+    test.check(pairSamples[0].llvm == reference, "compiler LLVM changed between identical-input pairs")
+}
+test.check(samples.length == 10, "retain every alternating paired sample")
+let report: List<Text> = ["{\"version\":1,\"status\":\"validated\",\"compiler\":" + json.quote(executable) + ",\"compiler_bytes\":" + Text(files.pathSize(executable)) + ",\"input\":" + json.quote(input) + ",\"source_bytes\":" + Text(source.byteLength) + ",\"functions\":200,\"pairs\":5,\"remarks_per_explained_sample\":200,\"retains_per_explained_sample\":100,\"transfers_per_explained_sample\":100,\"usage_fields\":[\"user_seconds\",\"system_seconds\",\"max_rss_kib\"],\"samples\":["]
+for index in 0..samples.length {
+    let sample = samples[index]
+    if index > 0 { report.add(",") }
+    report.add("{\"pair\":" + Text(sample.pair) + ",\"ordinal\":" + Text(sample.ordinal) + ",\"mode\":" + json.quote(sample.mode) + ",\"raw_usage\":" + json.quote(sample.usage) + ",\"llvm_bytes\":" + Text(sample.llvmBytes) + ",\"remarks\":" + Text(sample.remarkCount) + ",\"log\":" + json.quote(sample.log) + ",\"llvm\":" + json.quote(sample.output) + "}")
+}
+report.add("]}\n")
+let reportPath = compiler.directory + "/report.json"
+io.writeTextFile(reportPath, joinText(report))
+print("report=" + reportPath)
+// Deliberately retain source, all raw CPU/RSS files, stderr JSON and LLVM output.
