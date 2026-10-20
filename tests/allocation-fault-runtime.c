@@ -169,6 +169,16 @@ static void *fault_calloc(size_t count, size_t size) {
     return pointer;
 }
 
+/* Cold stack-symbol lookup is diagnostic bookkeeping, outside the target
+ * payload trace and budget. Keep both its allocations and frees on libc. */
+#if defined(__GNUC__) || defined(__clang__)
+#define MINYAR_COLD __attribute__((noinline, cold))
+#else
+#define MINYAR_COLD
+#endif
+#include "../runtime/minyar_traces.h"
+#undef MINYAR_COLD
+
 #define malloc fault_malloc
 #define calloc fault_calloc
 #define realloc fault_realloc
