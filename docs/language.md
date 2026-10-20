@@ -1811,12 +1811,17 @@ Compile this context with `--freestanding --kernel-target x86_64` or `arm64`.
 PIC vectors 32..47 and GIC IDs 16..1019 are accepted respectively. A handler
 takes one Integer and returns Nothing. Its complete direct call graph must use
 scalar, acyclic code: allocation, managed values, Float, blocking, locks,
-native calls, indirect calls, recursion and loops reject. A handler may read and
+unproved native calls, indirect calls, recursion and loops reject. A handler may read and
 acknowledge its device: fixed-width MMIO (`machine.read8` to `machine.write64`),
 x86 port I/O (`machine.in8` to `machine.out32`) and `machine.fence()` are allowed,
 because each is one access or barrier. Halting, waiting, pausing and changing the
-interrupt mask are not. Ordinary functions keep their ordinary behavior. This context proof is separate from hardware
-entry, register preservation and a physical stack bound.
+interrupt mask are not. Ordinary functions keep their ordinary behavior. On x86-64
+the compiler also emits the hardware entry `irq_N` for each bound vector: it saves
+the registers it uses, counts the interrupt, runs the checked handler, acknowledges
+the PIC and returns with `iretq`, replacing the kernel's weak assembly stub. On
+Arm64 the GIC entry calls a compiled `minyar_irq_dispatch` for IDs 16 to 1019,
+after saving every general register, ELR and SPSR. Handler code may not use x87,
+MMX, SSE or Arm FP/SIMD state. Neither target proves a physical stack bound.
 
 A rejection names the path from the handler to the unsafe operation:
 
@@ -1824,13 +1829,15 @@ A rejection names the path from the handler to the unsafe operation:
 error: interrupt context handles(42): linkChanged -> waitForLink -> sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep, take a lock or allocate
 ```
 
-The check costs nothing at run time. Programs without interrupt handlers compile
-to the same LLVM IR as before, and a handler that only signals a flag compiles
-to one release store.
+Context checking adds no run-time checks. Programs without interrupt handlers
+compile to the same LLVM IR as before. A handler body that only signals a flag
+has one release store; its hardware entry still counts the interrupt, preserves
+registers and acknowledges the controller.
 
 ```minyar
 use "machine" as machine
 
+// The entry acknowledges the PIC; the handler reads its device.
 interrupt function keyboard(vector: Integer) handles(33) {
     let key = machine.in8(0x60)
     if key != 0 { signalInterrupt(1) }

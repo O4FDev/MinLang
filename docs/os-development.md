@@ -183,6 +183,34 @@ frames may appear as `??`. The fault path resolves only the instruction
 addresses the guest reports; Minyar failures also print their call chain, as
 below.
 
+### Interrupt handlers
+
+An `interrupt function` is the real hardware entry on x86-64 and Arm64. The handler records work with `signalInterrupt`, and ordinary code
+collects it with `takeInterrupt`:
+
+```minyar
+constant TICK = 0
+
+interrupt function timerTick(vector: Integer) handles(32) {
+    signalInterrupt(TICK)
+}
+```
+
+The compiler checks the handler's whole call graph: it must be scalar and
+acyclic, with no allocation, locks, blocking, native calls or floating point.
+It then emits `irq_32`. That entry saves the registers it uses, counts the
+interrupt, runs the handler, acknowledges the PIC (the slave PIC too for
+vectors 40 to 47) and returns with `iretq`. The linker picks it over the weak
+stub in `os/arch/x86_64/boot/entry.S`; unbound vectors keep the stub.
+Acknowledging the device itself, such as reading the RTC's Register C, is port
+I/O, so ordinary code does it after `takeInterrupt`.
+`make check-osdev-irq-qemu` boots `os/tests/irq-kernel.min`. It checks the
+linked entry's instructions, delivery, counting, and that code interrupted mid-loop
+keeps its registers. On Arm64 the GIC entry in `os/arch/arm64/head.S` counts,
+rearms the timer and sends the EOI as before. For IDs 16 to 1019 it also calls the
+compiled `minyar_irq_dispatch`, after saving x5 to x30, ELR and SPSR. The same
+test boots the Arm64 kernel, whose handler uses `handles(arch.TIMER)`.
+
 ### Kernel failure call chains
 
 When kernel code stops, through `fail`, a failed check or a runtime range

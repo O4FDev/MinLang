@@ -184,8 +184,48 @@ function finishInterruptContexts(context: CompilerContext, output: List<Text>, g
     let index = 0
     while index < roots.length {
         output.add("; minyar-interrupt: vector=" + Text(vectors[index]) + " root=" + Text(roots[index]) + " clone=" + interruptCloneName(roots[index]) + " target=" + target + "\n")
+        if compilerKernelTarget() == 1 { output.add(x86InterruptEntry(roots[index], vectors[index])) }
         index = index + 1
     }
+    if compilerKernelTarget() == 1 && roots.length > 0 { output.add("@minyar_interrupt_counts = external global [48 x i64]\n") }
+    if compilerKernelTarget() == 2 && roots.length > 0 { output.add(armInterruptDispatch(roots, vectors)) }
+}
+
+// Arm64's GIC entry in os/arch/arm64/head.S counts, rearms the timer and
+// sends the EOI itself; it calls this ordinary-ABI dispatcher, when linked,
+// for IDs 16..1019 after saving every general register the call may change.
+function armInterruptDispatch(roots: List<Integer>, vectors: List<Integer>): Text {
+    let code: List<Text> = []
+    code.add("define void @minyar_irq_dispatch(i64 %id) noredzone noimplicitfloat" + interruptTargetAttributes() + " {\nentry:\n  switch i64 %id, label %done [")
+    let index = 0
+    while index < roots.length {
+        code.add(" i64 " + Text(vectors[index]) + ", label %vector." + Text(index))
+        index = index + 1
+    }
+    code.add(" ]\n")
+    index = 0
+    while index < roots.length {
+        code.add("vector." + Text(index) + ":\n  call void @" + interruptCloneName(roots[index]) + "(i64 " + Text(vectors[index]) + ")\n  br label %done\n")
+        index = index + 1
+    }
+    code.add("done:\n  ret void\n}\n")
+    return joinText(code)
+}
+
+// The hardware entry for one bound PIC vector. It replaces the weak stub of the
+// same name in os/arch/x86_64/boot/entry.S and keeps its contract: count the
+// interrupt, run the checked handler, then acknowledge the slave PIC for
+// vectors 40..47 and the master PIC. x86_intrcc saves every register it uses
+// and returns with iretq; the backend clears DF before the handler runs.
+function x86InterruptEntry(root: Integer, vector: Integer): Text {
+    let code: List<Text> = []
+    code.add("define x86_intrcc void @irq_" + Text(vector) + "(ptr byval([5 x i64]) align 8 %frame) noredzone noimplicitfloat" + interruptTargetAttributes() + " {\nentry:\n")
+    code.add("  %count = getelementptr inbounds [48 x i64], ptr @minyar_interrupt_counts, i64 0, i64 " + Text(vector) + "\n")
+    code.add("  %previous = atomicrmw add ptr %count, i64 1 monotonic, align 8\n")
+    code.add("  call void @" + interruptCloneName(root) + "(i64 " + Text(vector) + ")\n")
+    if vector >= 40 { code.add("  call void asm sideeffect \"outb %al, $$0xA0\", \"{al},~{memory}\"(i8 32)\n") }
+    code.add("  call void asm sideeffect \"outb %al, $$0x20\", \"{al},~{memory}\"(i8 32)\n  ret void\n}\n")
+    return joinText(code)
 }
 
 function appendNativeDeclarations(context: CompilerContext, output: List<Text>, runtimeDeclarations: List<Text>) {

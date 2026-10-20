@@ -31,8 +31,11 @@ _start:
     jmp 1b
 
     .text
-/* Hardware interrupts. */
+/* Hardware interrupts. Each stub is weak: a Minyar `interrupt function` bound to
+ * the vector supplies a strong irq_N with the same count/EOI/iretq contract. */
 .macro irq vector
+    .weak irq_\vector
+    .type irq_\vector, @function
 irq_\vector:
     lock incq minyar_interrupt_counts + 8 * \vector(%rip)
     pushq %rax
