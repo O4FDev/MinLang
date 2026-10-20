@@ -43,7 +43,7 @@ static const MinyarTraceRow *minyar_trace_find(uintptr_t region, uintptr_t *base
 
 #if defined(__APPLE__) && defined(__aarch64__) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
 #include "minyar_traces_darwin.h"
-#elif !defined(_WIN32) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
+#elif !defined(_WIN32) && !defined(__wasm__) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
 #include <unwind.h>
 static _Unwind_Reason_Code minyar_trace_frame(struct _Unwind_Context *context, void *data) {
     MinyarTrace *trace = data;
@@ -63,7 +63,7 @@ __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(
     trace.count = 0;
 #if defined(__APPLE__) && defined(__aarch64__) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
     minyar_trace_darwin(&trace, __builtin_frame_address(0));
-#elif !defined(_WIN32) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
+#elif !defined(_WIN32) && !defined(__wasm__) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__)
     _Unwind_Backtrace(minyar_trace_frame, &trace);
 #endif
     if (!trace.count) {

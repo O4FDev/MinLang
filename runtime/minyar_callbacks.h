@@ -14,13 +14,23 @@ long long minyar_callback_domain(void) {
     return minyar_freestanding_callback_domain(minyar_freestanding_callback_cpu());
 }
 #else
+#if defined(__wasm__) && !MINYAR_THREADED
+/* The browser target has one execution domain per isolated WASI instance.
+ * It neither shares linear memory nor requires WebAssembly atomics. */
+static uint64_t minyar_callback_next_domain = 1;
+#else
 static atomic_uint_fast64_t minyar_callback_next_domain = 1;
+#endif
 static _Thread_local uint64_t minyar_callback_current_domain;
 
 long long minyar_callback_domain(void) {
     uint64_t domain = minyar_callback_current_domain;
     if (!domain) {
+#if defined(__wasm__) && !MINYAR_THREADED
+        domain = minyar_callback_next_domain++;
+#else
         domain = atomic_fetch_add_explicit(&minyar_callback_next_domain, 1, memory_order_relaxed);
+#endif
         if (!domain || domain > INT64_MAX)
             minyar_stop("callback domain identity exhausted.");
         minyar_callback_current_domain = domain;

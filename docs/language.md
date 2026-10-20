@@ -13,6 +13,11 @@ iOS device and Simulator targets, and Android NDK embedding with a shared-view
 Activity renderer. These use ordinary functions, records and native calls;
 no separate mobile dialect is needed.
 
+The initial [WebAssembly target and static playground](wasm.md) use this
+same frontend and LLVM backend. They preserve the core types and reference
+semantics while using a sandboxed WASI host instead of native OS services.
+That page records the target's current limits and focused conformance checks.
+
 ## Tests beside the code
 
 A module can keep named tests beside its declarations. Tests can use private

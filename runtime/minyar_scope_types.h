@@ -8,8 +8,10 @@ typedef struct MinyarRcScope {
     void **values;
     size_t count;
 } MinyarRcScope;
-_Static_assert(sizeof(MinyarRcScope) == 24 && _Alignof(MinyarRcScope) <= 8,
-               "scope ownership ABI v1 requires an aligned 24-byte header");
+/* Generated code reserves an opaque 24-byte, eight-aligned header. */
+_Static_assert(sizeof(MinyarRcScope) == (sizeof(void *) == 4 ? 12 : 24) &&
+                   _Alignof(MinyarRcScope) <= 8,
+               "scope ownership ABI v1 requires an aligned header within 24 bytes");
 static MINYAR_THREAD_LOCAL MinyarRcScope *rc_scopes;
 #endif
 #endif

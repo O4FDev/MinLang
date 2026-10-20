@@ -36,13 +36,16 @@ void minyar_rc_release(void *value) { (void)value; }
 /* RC_TRACED marks a List or record with cycle metadata; see minyar_cycles.h. */
 enum { RC_TEXT = 1, RC_LIST = 2, RC_REFERENCES = 3, RC_RECORD = 4, RC_SCALAR_RECORD = 5, RC_REFERENCES_IMMORTAL = 6,
        RC_TRACED = 7 };
-typedef struct { size_t ownership; } RcObject;
-typedef struct { size_t size; } RcData;
+/* These headers share the generated literal ABI, including on wasm32. */
+typedef struct { uint64_t ownership; } RcObject;
+typedef struct { uint64_t size; } RcData;
 #if MINYAR_THREADED
 /* Private fieldless shell. Kind zero is reserved only in this profile. */
 typedef struct { void *control; void (*release)(void *); } RcThreadLeaf;
 #endif
 _Static_assert(sizeof(RcObject) == 8, "LLVM literal ownership header must match");
+_Static_assert(sizeof(RcData) == 8 && _Alignof(RcObject) >= 8,
+               "language data must retain eight-byte alignment");
 
 #ifdef MINYAR_BOUNDED_RC
 #define MINYAR_BOUNDED_TEMP_CHUNKS 1

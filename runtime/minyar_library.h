@@ -186,6 +186,12 @@ void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *part
 static void fill_random(unsigned char *out, size_t count) {
     arc4random_buf(out, count);
 }
+#elif defined(__wasi__)
+#include <wasi/api.h>
+static void fill_random(unsigned char *out, size_t count) {
+    if (__wasi_random_get(out, count) != 0)
+        minyar_stop("the system could not provide random bytes.");
+}
 #elif defined(__linux__)
 #include <sys/random.h>
 static void fill_random(unsigned char *out, size_t count) {
@@ -463,6 +469,8 @@ long long minyar_runtime_processId(void) {
     int saved_errno = errno;
 #ifdef _WIN32
     long long result = (long long)GetCurrentProcessId();
+#elif defined(__wasi__)
+    long long result = -38; /* WASI Preview 1 has no process identifier. */
 #elif defined(__STDC_HOSTED__) && __STDC_HOSTED__
     long long result = (long long)getpid();
 #else

@@ -166,6 +166,15 @@ argument lifetime, shared mutation, callable fields and rejection diagnostics.
 It runs the methods gallery and ownership assertions at O0/O2.
 `check-methods-sanitize` repeats these checks with ASan/UBSan.
 
+`make check-wasm` builds the real wasm32-WASI target and static playground.
+It executes O0/O2 target fixtures with cycle ownership assertions, every
+guided example through the wasm frontend and browser LLVM backend, native
+frontend LLVM parity, JSON diagnostic recovery and resource limits.
+`make prepare-playground-tests check-playground` adds Chromium editor, worker,
+Stop/timeout, draft, download and mobile-layout checks. All browser assets are
+local; external requests fail the browser gate. The separate WebAssembly CI
+job uploads the tested site and evidence. See [WebAssembly](wasm.md).
+
 `make check-iteration` checks user-record iteration through `iterator`, `advance`
 and `current`, including independent cursors, control flow, managed items, generic
 item inference, module visibility and rejected protocol signatures. Programs and

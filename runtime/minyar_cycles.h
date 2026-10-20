@@ -19,14 +19,14 @@
 typedef struct RcCycle {
     /* Registry links are unused after irreversible zero-count unlink. Only
      * issued full-MARK dead owners reuse them for exact job/anchor identity. */
-    union { struct RcCycle *previous; size_t retired_completed; };
-    union { struct RcCycle *next; uintptr_t retired_anchor_token; };
-    uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
+    union { struct RcCycle *previous; size_t retired_completed; uint64_t previous_word; };
+    union { struct RcCycle *next; uintptr_t retired_anchor_token; uint64_t next_word; };
+    uint64_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
                           * Unregistered: bit2 retains captured incoming-path exposure; bit3
                           * marks private bounded zero-count cleanup; bit4 distinguishes captured
                           * dead owners; bit5 distinguishes fresh local-MARK retirement. None is a
                           * live certificate. Bit6 distinguishes scanned full-MARK retirement. */
-    size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
+    uint64_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
 _Static_assert(sizeof(RcCycle) == 32, "cycle metadata must stay four words");
