@@ -1,7 +1,7 @@
 # Playground third-party notices
 
-The static playground redistributes an unmodified WebAssembly LLVM toolchain
-and a WASI JavaScript shim. Copy this file and the entire `licenses/`
+The static playground redistributes WebAssembly LLVM executables, a derived
+WASI link-resource archive and a WASI JavaScript shim. Copy this file and the entire `licenses/`
 directory into the built site alongside those assets. Full upstream license
 texts are retained there; `licenses/sources.json` records their source URLs
 and SHA-256 hashes.
@@ -37,6 +37,17 @@ The YoWASP sysroot includes WASI libc, C/C++ headers and static libraries,
 Clang builtins, and the LLVM C++ libraries. LLVM's license above covers its
 compiler-rt, libc++, libc++abi and libunwind components; retain any additional
 upstream notices when changing the packaged toolchain.
+
+The native build keeps the full pinned sysroot. The browser-published
+`vendor/clang/gen/llvm-resources.tar` is a deterministic subset produced by
+`tools/trim-wasm-resources.py`: WASI command/reactor startup objects, libc,
+libm, setjmp and compiler builtins. The browser compiles LLVM IR and links a
+prebuilt Minyar runtime, so C/C++ headers and other libraries are omitted.
+Retained file bytes are unchanged; archive ownership, permissions, order
+and timestamps are normalized. The built site's `resources-transform.json`
+records the upstream pin, original/derived archive hashes, transformation
+version and every retained file hash. LLVM executable and JavaScript bytes
+remain unmodified. Keep all retained notices with this subset.
 
 The release pins WASI libc commit
 [`2fc32bc81b9f07f8d9525edea59bfbaf760c06d6`](https://github.com/WebAssembly/wasi-libc/tree/2fc32bc81b9f07f8d9525edea59bfbaf760c06d6).

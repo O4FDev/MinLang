@@ -1,4 +1,6 @@
 import { tour } from './tour.mjs';
+import { createLearning } from './learning.mjs';
+import { createSharing } from './share-ui.mjs';
 
 export const MAX_SOURCE_BYTES = 64 * 1024;
 export const LIVE_CHECK_DELAY_MS = 600;
@@ -31,7 +33,7 @@ export function requestTimeout(value, fallback) {
     ? Math.trunc(number) : fallback;
 }
 
-function initialisePlayground() {
+async function initialisePlayground() {
   const get = (id) => document.getElementById(id);
   const source = get('source');
   const output = get('output');
@@ -57,11 +59,18 @@ function initialisePlayground() {
   let queuedType = null;
   let checkTimer = null;
   let saveTimer = null;
+  let draftShouldPersist = true;
   let requestTimer = null;
   let lastOutputRevision = null;
   let wasmBytes = null;
   let downloadUrl = null;
   const tourButtons = new Map();
+  let learning = null;
+  let sharing = null;
+
+  function customExample(program) {
+    return { id: 'shared', title: 'Your program', description: 'A thought to make your own. Review the source, then run it when you’re ready.', source: program };
+  }
 
   function status(message, state = 'ready') {
     get('status').textContent = message;
@@ -83,7 +92,8 @@ function initialisePlayground() {
     get('source-info').parentElement.dataset.overLimit = String(bytes > MAX_SOURCE_BYTES);
     lineNumbers.textContent = Array.from({ length: lines }, (_, index) => index + 1).join('\n');
     lineNumbers.style.transform = `translateY(${-source.scrollTop}px)`;
-    run.disabled = !supported || bytes > MAX_SOURCE_BYTES || activeRequest?.type === 'run' || queuedType === 'run';
+    run.disabled = !supported || bytes > MAX_SOURCE_BYTES || learning?.blocksRun(currentExample)
+      || activeRequest?.type === 'run' || queuedType === 'run';
     stop.disabled = !activeRequest && !queuedType;
     output.setAttribute('aria-busy', String(activeRequest?.type === 'run' && activeRequest.revision === sourceRevision));
     return bytes;
@@ -173,6 +183,10 @@ function initialisePlayground() {
 
   function persistDraft() {
     clearTimeout(saveTimer);
+    if (!draftShouldPersist) {
+      draftState.textContent = 'Shared program · local draft kept';
+      return;
+    }
     if (sourceByteLength(source.value) > MAX_SOURCE_BYTES) {
       draftState.textContent = 'Over limit · draft not saved';
       return;
@@ -188,10 +202,9 @@ function initialisePlayground() {
   function restoreDraft() {
     try {
       const draft = JSON.parse(localStorage.getItem(DRAFT_KEY));
-      const example = tour.find((entry) => entry.id === draft?.exampleId);
-      if (draft?.version !== 1 || !example || typeof draft.source !== 'string'
+      if (draft?.version !== 1 || typeof draft.source !== 'string'
           || draft.source.length > MAX_SOURCE_BYTES || sourceByteLength(draft.source) > MAX_SOURCE_BYTES) return false;
-      currentExample = example;
+      currentExample = learning.resolveExample(draft.exampleId) ?? customExample(draft.source);
       source.value = draft.source;
       return true;
     } catch {
@@ -202,13 +215,16 @@ function initialisePlayground() {
 
   function renderExampleHeading() {
     const index = tour.indexOf(currentExample);
-    get('example-position').textContent = `${String(index + 1).padStart(2, '0')} / ${String(tour.length).padStart(2, '0')}`;
+    get('example-position').textContent = index >= 0
+      ? `${String(index + 1).padStart(2, '0')} / ${String(tour.length).padStart(2, '0')}`
+      : currentExample.file ? 'GUIDE' : 'YOURS';
     get('example-title').textContent = currentExample.title;
     get('example-description').textContent = currentExample.description;
     for (const [id, button] of tourButtons) {
       if (id === currentExample.id) button.setAttribute('aria-current', 'step');
       else button.removeAttribute('aria-current');
     }
+    learning.render(currentExample);
   }
 
   function destroyWorker() {
@@ -296,6 +312,7 @@ function initialisePlayground() {
           wasmBytes = data.wasm;
           download.hidden = false;
         }
+        learning.recordRun(request.exampleId, request.lessonMode, { output: printed, diagnostics: problems, exitCode });
       }
       const timings = [];
       if (Number.isFinite(data.compileMs) && data.compileMs >= 0) timings.push(`compiled ${formatMilliseconds(data.compileMs)}`);
@@ -351,10 +368,17 @@ function initialisePlayground() {
 
   function startRequest(type) {
     if (!supported || !checkSize()) return;
+    if (learning.blocksRun(currentExample)) {
+      diagnosticNote('This excerpt needs surrounding code. Read its context, or edit it into a complete program.');
+      status('This guide excerpt is not a standalone program.');
+      renderSourceInformation();
+      return;
+    }
     try {
       const currentWorker = getWorker();
       const isStartup = type === 'run' ? !backendIsWarm : !frontendIsWarm;
-      const request = { id: ++nextRequestId, type, revision: sourceRevision, executionStarted: false };
+      const request = { id: ++nextRequestId, type, revision: sourceRevision, executionStarted: false,
+        exampleId: currentExample.id, lessonMode: learning.runMode() };
       activeRequest = request;
       status(isStartup ? 'Getting the compiler ready…' : type === 'run' ? 'Running your program…' : 'Checking your program…', 'busy');
       diagnosticCount.textContent = 'Checking…';
@@ -387,7 +411,10 @@ function initialisePlayground() {
   }
 
   function sourceChanged({ save = true, check = true } = {}) {
+    if (save) draftShouldPersist = true;
     sourceRevision += 1;
+    sharing?.invalidate({ clearFragment: save });
+    learning.sourceChanged();
     queuedType = null;
     clearTimeout(checkTimer);
     clearTimeout(saveTimer);
@@ -402,7 +429,11 @@ function initialisePlayground() {
       if (save) persistDraft();
       return;
     }
-    diagnosticNote(check ? 'Waiting to check your changes…' : 'Edit your program to check it, or run it when you’re ready.');
+    const contextual = learning.blocksRun(currentExample);
+    if (contextual) check = false;
+    diagnosticNote(contextual ? 'This excerpt needs surrounding code. Read its context, or edit it into a complete program.'
+      : check ? 'Waiting to check your changes…' : 'Edit your program to check it, or run it when you’re ready.');
+    if (contextual) status('This guide excerpt is not a standalone program.');
     if (check && supported) {
       status(activeRequest ? 'Your changes will be checked after the current task.' : 'Checking after you finish typing…', 'busy');
       checkTimer = setTimeout(() => queueRequest('check'), LIVE_CHECK_DELAY_MS);
@@ -416,6 +447,7 @@ function initialisePlayground() {
   function selectExample(example, reset = false) {
     if (currentExample === example && !reset) return;
     currentExample = example;
+    if (reset) learning.reset();
     source.value = example.source;
     source.scrollTop = 0;
     source.scrollLeft = 0;
@@ -428,6 +460,46 @@ function initialisePlayground() {
     sourceChanged();
     if (reset) source.focus();
   }
+
+  // Load only the small local catalog before restoring a draft. No compiler
+  // worker or toolchain asset is requested until an edit or an explicit Run.
+  let catalog = null;
+  try {
+    const response = await fetch(new URL('./language-examples.json', import.meta.url), { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) throw new Error('The language catalog could not be loaded.');
+    catalog = await response.json();
+  } catch {
+    get('language-unavailable').hidden = false;
+  }
+  learning = createLearning({ catalog, selectExample, getCurrent: () => currentExample, getSource: () => source.value });
+  sharing = createSharing({
+    getSource: () => source.value,
+    getRevision: () => sourceRevision,
+    getExampleId: () => currentExample.id,
+    loadShared(shared) {
+      persistDraft();
+      clearTimeout(checkTimer);
+      clearTimeout(saveTimer);
+      activeRequest = null;
+      queuedType = null;
+      destroyWorker();
+      draftShouldPersist = false;
+      currentExample = learning.resolveExample(shared.exampleId) ?? customExample(shared.source);
+      learning.reset();
+      source.value = shared.source;
+      source.scrollTop = 0;
+      source.scrollLeft = 0;
+      output.textContent = '';
+      outputPlaceholder.hidden = false;
+      outputPlaceholder.textContent = 'A shared thought,\nwaiting to happen.';
+      outputNote.textContent = 'Review the shared program, then choose Run code.';
+      lastOutputRevision = null;
+      renderExampleHeading();
+      sourceChanged({ save: false, check: false });
+      persistDraft();
+      status('Shared program ready. Review it, then choose Run code.');
+    },
+  });
 
   for (const [index, example] of tour.entries()) {
     const item = document.createElement('li');
@@ -449,9 +521,12 @@ function initialisePlayground() {
 
   source.value = currentExample.source;
   const restored = restoreDraft();
+  source.readOnly = false;
+  get('share').disabled = false;
+  get('reset').disabled = false;
   renderExampleHeading();
   renderSourceInformation();
-  if (restored) status('Your saved draft is ready when you are.');
+  status(restored ? 'Your saved draft is ready when you are.' : 'Ready when you are.');
   if (!supported) {
     renderDiagnostics([{ message: 'This browser needs WebAssembly and Web Workers to run Minyar.', help: 'Open the playground in a browser that supports both.' }]);
     status('This browser cannot run the playground.', 'error');
@@ -500,6 +575,7 @@ function initialisePlayground() {
     }
     renderSourceInformation();
   });
+  await sharing.load();
 }
 
-if (typeof document !== 'undefined') initialisePlayground();
+if (typeof document !== 'undefined') void initialisePlayground();

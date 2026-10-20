@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -13,7 +14,39 @@ const root = resolve(new URL('..', import.meta.url).pathname);
 const evidence = join(root, 'build/wasm-evidence');
 await mkdir(evidence, { recursive: true });
 const rows = [];
-const engine = await createEngine({ loadBytes: path => readFile(new URL(path, new URL('../build/playground/engine.mjs', import.meta.url))) });
+const site = join(root, 'build/playground');
+assert.equal((await stat(site)).mode & 0o777, 0o755, 'published site is traversable by a separate web-server user');
+for (const name of ['index.html', 'app.mjs', 'backend.json', 'resources-transform.json', 'library.json', 'build.json']) {
+  assert.equal((await stat(join(site, name))).mode & 0o777, 0o644, `${name}: public static asset mode`);
+}
+const backend = JSON.parse(await readFile(join(site, 'backend.json'), 'utf8'));
+assert.equal(backend.schemaVersion, 1);
+assert.deepEqual(Object.keys(backend.files).sort(), [
+  'llvm-resources.tar', 'llvm.core.wasm', 'llvm.core2.wasm', 'llvm.core3.wasm', 'llvm.core4.wasm',
+].map(name => `vendor/clang/gen/${name}`).sort());
+let actualBackendBytes = 0;
+for (const [name, bytes] of Object.entries(backend.files)) {
+  const info = await stat(join(site, name));
+  assert.equal(info.mode & 0o777, 0o644, `${name}: public backend asset mode`);
+  const actual = info.size;
+  assert.equal(bytes, actual, `${name}: published download size`);
+  actualBackendBytes += actual;
+}
+assert.equal(backend.totalBytes, actualBackendBytes);
+const transformation = JSON.parse(await readFile(join(site, 'resources-transform.json'), 'utf8'));
+const resourceBytes = await readFile(join(site, 'vendor/clang/gen/llvm-resources.tar'));
+assert.equal(transformation.source.matches_published_pin, true);
+assert.equal(transformation.output.sha256, createHash('sha256').update(resourceBytes).digest('hex'));
+assert.equal(transformation.output.size_bytes, resourceBytes.length);
+assert.ok(resourceBytes.length < transformation.source.size_bytes);
+const percentages = [];
+const engine = await createEngine({
+  loadBytes: path => readFile(new URL(path, new URL('../build/playground/engine.mjs', import.meta.url))),
+  progress(message) {
+    const match = /^Loading the browser tools… (\d+)%$/.exec(message);
+    if (match) percentages.push(Number(match[1]));
+  },
+});
 async function run(name, source, expected, exitCode = 0) {
   const result = await engine.request('run', source);
   assert.deepEqual(result.diagnostics, [], name);
@@ -100,5 +133,12 @@ try {
   assert.equal(normalizeLLVM(wasmFrontend.llvm), normalizeLLVM(await readFile(join(work, 'output.ll'), 'utf8')), 'wasm/native frontend LLVM parity');
 } finally { await rm(work, { recursive: true, force: true }); }
 
-await writeFile(join(evidence, 'engine.json'), JSON.stringify({ tests: rows, compilerBytes: (await readFile(join(root, 'build/wasm/compiler.wasm'))).length }, null, 2) + '\n');
+assert.equal(percentages[0], 0, 'cold toolchain download starts at zero');
+assert.equal(percentages.at(-1), 100, 'trimmed assets finish at 100%, independently of upstream package size');
+assert.ok(percentages.length >= 2 && percentages.length <= 101);
+assert.ok(percentages.every((value, index) => value >= 0 && value <= 100 && (!index || value > percentages[index - 1])));
+await writeFile(join(evidence, 'engine.json'), JSON.stringify({ tests: rows,
+  compilerBytes: (await readFile(join(root, 'build/wasm/compiler.wasm'))).length,
+  backendBytes: backend.totalBytes, downloadPercentages: percentages,
+}, null, 2) + '\n');
 console.log(`PASS ${rows.length} executable browser-engine cases; diagnostics, recovery, isolation limits and native LLVM parity`);

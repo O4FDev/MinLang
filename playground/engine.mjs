@@ -120,11 +120,16 @@ export async function createEngine({ loadBytes, progress = () => {} } = {}) {
     return new Uint8Array(await response.arrayBuffer());
   };
   progress('Loading the Minyar compiler…');
-  const [frontendBytes, runtime, libraryBytes] = await Promise.all([
-    loadBytes('./compiler.wasm'), loadBytes('./runtime.o'), loadBytes('./library.json'),
+  const [frontendBytes, runtime, libraryBytes, backendBytes] = await Promise.all([
+    loadBytes('./compiler.wasm'), loadBytes('./runtime.o'), loadBytes('./library.json'), loadBytes('./backend.json'),
   ]);
   const frontend = await WebAssembly.compile(frontendBytes);
   const library = JSON.parse(decoder.decode(libraryBytes));
+  const backend = JSON.parse(decoder.decode(backendBytes));
+  if (backend.schemaVersion !== 1 || !Number.isSafeInteger(backend.totalBytes) || backend.totalBytes <= 0) {
+    throw new Error('The browser toolchain manifest is incomplete. Reload and try again.');
+  }
+  let downloadPercent = -1;
   let previous;
 
   async function check(source) {
@@ -161,13 +166,25 @@ export async function createEngine({ loadBytes, progress = () => {} } = {}) {
         const started = performance.now();
         const stderr = capture();
         let files;
+        const compilerOptions = {
+          decodeASCII: false, stdout: () => {}, stderr: bytes => stderr.write(bytes),
+          fetchProgress: ({ doneLength }) => {
+            const percent = Math.min(100, Math.floor(doneLength / backend.totalBytes * 100));
+            if (percent !== downloadPercent) {
+              downloadPercent = percent;
+              progress(`Loading the browser tools… ${percent}%`, 'compiling');
+            }
+          },
+        };
         try {
+          // The package's driver does not forward fetchProgress to its dry-run
+          // discovery call. Its public null-argument API prepares resources
+          // with our measured progress before that discovery step.
+          await runClang(null, {}, compilerOptions);
           files = await runClang([
             'clang', '--target=wasm32-wasip1', '-O0', '-Wno-override-module', 'program.ll', 'runtime.o',
             '-Wl,-z,stack-size=8388608', '-Wl,--max-memory=268435456', '-lm', '-o', 'program.wasm',
-          ], { 'program.ll': encoder.encode(normalizeLLVM(checked.llvm)), 'runtime.o': runtime }, {
-            decodeASCII: false, stdout: () => {}, stderr: bytes => stderr.write(bytes),
-          });
+          ], { 'program.ll': encoder.encode(normalizeLLVM(checked.llvm)), 'runtime.o': runtime }, compilerOptions);
         } catch (error) {
           throw new Error(`WebAssembly compilation failed: ${stderr.text().trim() || error.message}`);
         }
