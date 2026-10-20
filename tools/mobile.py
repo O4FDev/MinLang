@@ -84,6 +84,8 @@ def validate(args: argparse.Namespace) -> None:
     if suffix == ".app" and args.output.exists() and not (args.output / "minyar-build.json").is_file():
         raise MobileError("refusing to replace an application not built by this tool")
     if suffix == ".a":
+        if args.output.exists() and not args.output.is_file():
+            raise MobileError("the archive output must be a regular file")
         args.metadata = args.output.with_suffix(".a.json")
         if args.metadata.is_symlink() or args.metadata.resolve() == args.source:
             raise MobileError("the archive metadata must not link to or replace the source")
@@ -166,6 +168,27 @@ def publish_app(staged: Path, output: Path) -> None:
         shutil.rmtree(backup)
 
 
+def publish_archive(archive: Path, metadata: Path, output: Path, sidecar: Path) -> None:
+    published = []
+    backups = []
+    try:
+        for index, (source, destination) in enumerate(((archive, output), (metadata, sidecar))):
+            if destination.exists():
+                backup = archive.parent / f"previous-{index}"
+                destination.rename(backup)
+                backups.append((backup, destination))
+            source.rename(destination)
+            published.append(destination)
+    except OSError:
+        for destination in reversed(published):
+            destination.unlink()
+        for backup, destination in reversed(backups):
+            backup.rename(destination)
+        raise
+    for backup, _ in backups:
+        backup.unlink()
+
+
 def build(args: argparse.Namespace, *, ios_provider: Path | None = None) -> Path:
     validate(args)
     tools = apple_tools(args) if args.target.startswith("ios-") else android_tools(args)
@@ -242,8 +265,7 @@ def build(args: argparse.Namespace, *, ios_provider: Path | None = None) -> Path
             run([tools["archive"], "rcs", str(archive), *objects, str(entry)])
             metadata_file = directory / "application.a.json"
             metadata_file.write_text(json.dumps(metadata, indent=2) + "\n")
-            archive.replace(args.output)
-            metadata_file.replace(args.metadata)
+            publish_archive(archive, metadata_file, args.output, args.metadata)
     return args.output
 
 

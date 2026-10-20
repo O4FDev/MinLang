@@ -85,6 +85,15 @@ class MobileTools(unittest.TestCase):
         with self.assertRaisesRegex(mobile.MobileError, "unrelated archive metadata"):
             mobile.validate(args)
 
+    def test_archive_output_cannot_replace_a_directory(self):
+        output = self.directory / "important.a"
+        output.mkdir()
+        (output / "data").write_text("preserve me")
+        args = self.args("--target", "android-arm64", "-o", str(output))
+        with self.assertRaisesRegex(mobile.MobileError, "regular file"):
+            mobile.validate(args)
+        self.assertEqual((output / "data").read_text(), "preserve me")
+
     def test_apple_sdk_and_triple_are_explicit(self):
         commands = []
         def run(command, **_):
@@ -133,6 +142,22 @@ class MobileTools(unittest.TestCase):
         mobile.publish_app(staged, output)
         self.assertEqual((output / "new").read_text(), "new")
         self.assertFalse((staging / "previous.app").exists())
+
+    def test_archive_and_metadata_roll_back_together(self):
+        output, sidecar = self.directory / "old.a", self.directory / "old.a.json"
+        archive, metadata = self.directory / "new.a", self.directory / "new.a.json"
+        for path, value in ((output, "old archive"), (sidecar, "old metadata"),
+                            (archive, "new archive"), (metadata, "new metadata")):
+            path.write_text(value)
+        rename = Path.rename
+        def fail_metadata(path, destination):
+            if path == metadata:
+                raise OSError("injected metadata publication failure")
+            return rename(path, destination)
+        with patch.object(Path, "rename", fail_metadata), self.assertRaises(OSError):
+            mobile.publish_archive(archive, metadata, output, sidecar)
+        self.assertEqual(output.read_text(), "old archive")
+        self.assertEqual(sidecar.read_text(), "old metadata")
 
 
 if __name__ == "__main__":
