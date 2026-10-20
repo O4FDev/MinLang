@@ -550,8 +550,12 @@ public function removeNetworkOf(daemon: Daemon, identity: Text): Result<Boolean,
 
 function octal(header: Bytes, start: Integer, size: Integer): Integer {
     if header[start] == 128 || header[start] == 255 {
+        if header[start] == 255 { return -1 }
         let value = 0
-        for index in (start + 1)..(start + size) { value = value * 256 + header[index] }
+        for index in (start + 1)..(start + size) {
+            if value > (common.MAX_BYTES - header[index]) / 256 { return common.MAX_BYTES + 1 }
+            value = value * 256 + header[index]
+        }
         return value
     }
     let value = 0
@@ -561,7 +565,9 @@ function octal(header: Bytes, start: Integer, size: Integer): Integer {
         if byte == 0 || byte == 32 { if seen { break }; continue }
         if byte < 48 || byte > 55 { return -1 }
         seen = true
-        value = value * 8 + byte - 48
+        let digit = byte - 48
+        if value > (common.MAX_BYTES - digit) / 8 { return common.MAX_BYTES + 1 }
+        value = value * 8 + digit
     }
     return value
 }
@@ -578,19 +584,21 @@ function checksumValid(header: Bytes): Boolean {
     }
     return expected == total
 }
-function paxPath(payload: Bytes): Text {
+function paxPath(payload: Bytes): List<Text> {
     let position = 0
     let result = ""
     while position < payload.length {
         let space = position
         while space < payload.length && payload[space] != 32 { space += 1 }
+        if space == payload.length { return [] }
         let length = common.integerText(Text(payload.slice(position, space)))
-        if length <= 0 || position + length > payload.length { return result }
-        let record = Text(payload.slice(space + 1, position + length - 1))
+        let after = position + length
+        if length <= 0 || after > payload.length || after < space + 2 || payload[after - 1] != 10 { return [] }
+        let record = Text(payload.slice(space + 1, after - 1))
         if record.startsWith("path=") { result = record.slice(5, record.length) }
-        position += length
+        position = after
     }
-    return result
+    return [result]
 }
 function readExact(fd: Integer, offset: Integer, size: Integer): Bytes {
     let result = Bytes()
@@ -625,7 +633,11 @@ function extractArchive(fd: Integer, target: Text, deadline: Integer): Result<Bo
             let payload = readExact(fd, payloadStart, size)
             if payload.length < size { return Err<Boolean, common.Failure>(common.ownership("truncated container archive")) }
             if kind == 76 { longName = terminated(payload, 0, payload.length) }
-            if kind == 120 { extended = paxPath(payload) }
+            if kind == 120 {
+                let path = paxPath(payload)
+                if path.length == 0 { return Err<Boolean, common.Failure>(common.ownership("malformed container archive metadata")) }
+                extended = path[0]
+            }
             offset = payloadStart + padded
             continue
         }
@@ -653,27 +665,20 @@ function extractArchive(fd: Integer, target: Text, deadline: Integer): Result<Bo
             if directory { offset = payloadStart + padded; continue }
             return Err<Boolean, common.Failure>(common.ownership("unsafe container archive member"))
         }
-        let output = common.joinPath(target, common.joinParts(parts))
-        let made = try common.makeDirectories(common.parentOf(output))
-        if common.exists(output) {
-            if directory && common.isDirectory(output) && !common.isSymlink(output) { offset = payloadStart + padded; continue }
-            return Err<Boolean, common.Failure>(common.ownership("colliding container archive member"))
-        }
-        if directory {
-            let created = try common.makeDirectory(output)
-            offset = payloadStart + padded
-            continue
-        }
+        let relative = common.joinParts(parts)
+        let output = common.joinPath(target, relative)
+        let out = common.archiveCreate(target, relative, directory, 438)
+        if out < 0 { return Err<Boolean, common.Failure>(common.ownership("unsafe or colliding container archive member")) }
+        if directory { offset = payloadStart + padded; continue }
         total += size
-        let out = common.openFile(output, common.OPEN_WRITE + common.OPEN_CREATE + common.OPEN_TRUNCATE, 438)
-        if out < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-out, output)) }
         let remaining = size
         let position = payloadStart
         while remaining > 0 {
             if common.now() > deadline { common.closeFd(out); return Err<Boolean, common.Failure>(common.ownership("container copy bound exceeded")) }
             let block = common.readAt(fd, position, min(common.CHUNK, remaining))
             if block.length == 0 { common.closeFd(out); return Err<Boolean, common.Failure>(common.ownership("truncated container archive")) }
-            common.writeAll(out, block)
+            let wrote = common.writeAll(out, block)
+            if wrote != block.length { common.closeFd(out); return Err<Boolean, common.Failure>(common.systemFailure(-wrote, output)) }
             remaining -= block.length
             position += block.length
         }
@@ -691,10 +696,9 @@ public function copyBounded(daemon: Daemon, identity: Text, source: Text, target
     let archive = try commandOf(daemon, ["cp", identity + ":" + source, "-"], settings)
     if archive.path == "" { return Err<Boolean, common.Failure>(common.ownership("container copy must retain bounded raw archive bytes")) }
     let bound = try common.streamBinding(archive.path, common.MAX_BYTES, deadline, "")
-    if common.isSymlink(target) || (common.present(target) && !common.isDirectory(target)) {
+    if common.archiveCreate(target, "", true, 511) < 0 {
         return Err<Boolean, common.Failure>(common.ownership("container copy destination is not an owned directory"))
     }
-    let made = try common.makeDirectories(target)
     let fd = common.openFile(archive.path, 0, 0)
     if fd < 0 { return Err<Boolean, common.Failure>(common.systemFailure(-fd, archive.path)) }
     let outcome = extractArchive(fd, target, deadline)

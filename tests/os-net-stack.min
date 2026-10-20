@@ -14,6 +14,49 @@ function put32(data: Bytes, at: Integer, value: Integer) {
     put16(data, at + 2, value & 0xFFFF)
 }
 
+function dhcpReply(hardware: Bytes, transaction: Integer, kind: Integer, offered: Integer, server: Integer): Bytes {
+    let message = Bytes(240)
+    message[0] = 2
+    message[1] = 1
+    message[2] = 6
+    put32(message, 4, transaction)
+    put32(message, 16, offered)
+    for index in 0..6 { message[28 + index] = hardware[index] }
+    put32(message, 236, 0x63825363)
+    message.add(53); message.add(1); message.add(kind)
+    message.add(54); message.add(4)
+    let serverBytes = Bytes(4)
+    put32(serverBytes, 0, server)
+    message.addBytes(serverBytes)
+    message.add(1); message.add(4)
+    let mask = Bytes(4)
+    put32(mask, 0, 0xFFFFFF00)
+    message.addBytes(mask)
+    message.add(3); message.add(4); message.addBytes(serverBytes)
+    message.add(6); message.add(4); message.addBytes(serverBytes)
+    message.add(255)
+    return message
+}
+
+function dnsResponse(name: Text, id: Integer, owner: Text, kind: Integer, address: Integer): Bytes {
+    let message = wire.dnsQuery(name, id)
+    put16(message, 2, 0x8180)
+    put16(message, 6, 1)
+    if owner == name {
+        message.add(0xC0); message.add(0x0C)
+    } else {
+        let ownerQuery = wire.dnsQuery(owner, 0)
+        message.addBytes(ownerQuery.slice(12, ownerQuery.length - 4))
+    }
+    let record = Bytes(14)
+    put16(record, 0, kind)
+    put16(record, 2, 1)
+    put16(record, 8, 4)
+    put32(record, 10, address)
+    message.addBytes(record)
+    return message
+}
+
 let udp = Bytes(8)
 put16(udp, 0, 67)
 put16(udp, 2, 68)
@@ -29,75 +72,91 @@ check(emptyUdp.valid && emptyUdp.sourcePort == 67 && emptyUdp.destinationPort ==
       "valid empty UDP datagram rejected")
 
 let transaction = 0x4D494E59
+let hardware = Bytes(6)
+for index in 0..6 { hardware[index] = index + 1 }
 let truncatedDhcp = Bytes(244)
+truncatedDhcp[0] = 2
+truncatedDhcp[1] = 1
+truncatedDhcp[2] = 6
 put32(truncatedDhcp, 4, transaction)
+for index in 0..6 { truncatedDhcp[28 + index] = hardware[index] }
 put32(truncatedDhcp, 236, 0x63825363)
 truncatedDhcp[240] = 1
 truncatedDhcp[241] = 4
-check(!wire.dhcp(truncatedDhcp, transaction).valid, "truncated DHCP address option accepted")
+check(!wire.dhcp(truncatedDhcp, transaction, hardware).valid, "truncated DHCP address option accepted")
 let missingKind = Bytes(244)
+missingKind[0] = 2
+missingKind[1] = 1
+missingKind[2] = 6
 put32(missingKind, 4, transaction)
+for index in 0..6 { missingKind[28 + index] = hardware[index] }
 put32(missingKind, 236, 0x63825363)
 missingKind[240] = 0
 missingKind[241] = 0
 missingKind[242] = 53
 missingKind[243] = 0
-check(!wire.dhcp(missingKind, transaction).valid, "empty DHCP message-kind option accepted")
-let validDhcp = Bytes(250)
-put32(validDhcp, 4, transaction)
-put32(validDhcp, 16, 0x0A00020F)
-put32(validDhcp, 236, 0x63825363)
-validDhcp[240] = 53
-validDhcp[241] = 1
-validDhcp[242] = 2
-validDhcp[243] = 1
-validDhcp[244] = 4
-put32(validDhcp, 245, 0xFFFFFF00)
-validDhcp[249] = 255
-let offer = wire.dhcp(validDhcp, transaction)
+check(!wire.dhcp(missingKind, transaction, hardware).valid, "empty DHCP message-kind option accepted")
+let server = 0x0A000202
+let offered = 0x0A00020F
+let validDhcp = dhcpReply(hardware, transaction, 2, offered, server)
+let offer = wire.dhcp(validDhcp, transaction, hardware)
 check(offer.valid && offer.kind == 2 && offer.offered == 0x0A00020F && offer.mask == 0xFFFFFF00,
       "valid DHCP offer rejected")
+check(wire.dhcpReplyAccepted(offer, 1, server, 67, 68, 0, 0, 0), "bound DHCP offer rejected")
+check(!wire.dhcpReplyAccepted(offer, 0, server, 67, 68, 0, 0, 0), "DHCP offer accepted outside discover state")
+let relay = server + 1
+check(wire.dhcpReplyAccepted(offer, 1, relay, 67, 68, 0, 0, 0), "relayed DHCP offer rejected")
+check(!wire.dhcpReplyAccepted(offer, 1, 0, 67, 68, 0, 0, 0), "DHCP offer without source accepted")
+check(!wire.dhcpReplyAccepted(offer, 1, server, 68, 67, 0, 0, 0), "DHCP offer accepted on wrong UDP ports")
+let multipleAddresses = dhcpReply(hardware, transaction, 2, offered, server)
+multipleAddresses[multipleAddresses.length - 1] = 3
+multipleAddresses.add(8)
+let addresses = Bytes(8)
+put32(addresses, 0, server)
+put32(addresses, 4, relay)
+multipleAddresses.addBytes(addresses)
+multipleAddresses.add(6); multipleAddresses.add(8); multipleAddresses.addBytes(addresses)
+multipleAddresses.add(255)
+check(wire.dhcp(multipleAddresses, transaction, hardware).valid, "DHCP router and DNS address lists rejected")
+validDhcp[0] = 1
+check(!wire.dhcp(validDhcp, transaction, hardware).valid, "DHCP request accepted as a reply")
+validDhcp[0] = 2
+validDhcp[28] = 99
+check(!wire.dhcp(validDhcp, transaction, hardware).valid, "DHCP reply for another client accepted")
+let ack = wire.dhcp(dhcpReply(hardware, transaction, 5, offered, server), transaction, hardware)
+check(wire.dhcpReplyAccepted(ack, 2, server, 67, 68, server, offered, relay), "bound DHCP acknowledgement rejected")
+check(wire.dhcpReplyAccepted(ack, 2, relay, 67, 68, server, offered, relay), "relayed DHCP acknowledgement rejected")
+check(!wire.dhcpReplyAccepted(ack, 2, relay + 1, 67, 68, server, offered, relay), "DHCP acknowledgement from an unselected source accepted")
+check(!wire.dhcpReplyAccepted(ack, 2, server, 67, 68, server + 1, offered, relay), "DHCP acknowledgement from an unselected server accepted")
+check(!wire.dhcpReplyAccepted(ack, 2, server, 67, 68, server, offered + 1, relay), "DHCP acknowledgement for an unselected address accepted")
 
-let hostileDns = Bytes(29)
-put16(hostileDns, 0, 7)
-put16(hostileDns, 2, 0x8180)
-put16(hostileDns, 4, 1)
-put16(hostileDns, 6, 1)
-hostileDns[12] = 0
-put16(hostileDns, 13, 1)
-put16(hostileDns, 15, 1)
-hostileDns[17] = 127
-check(!wire.dns(hostileDns).valid, "oversized DNS answer label accepted")
-let truncatedDns = Bytes(31)
-put16(truncatedDns, 0, 8)
-put16(truncatedDns, 2, 0x8180)
-put16(truncatedDns, 4, 1)
-put16(truncatedDns, 6, 1)
-truncatedDns[12] = 0
-put16(truncatedDns, 13, 1)
-put16(truncatedDns, 15, 1)
-truncatedDns[17] = 0xC0
-truncatedDns[18] = 0x0C
-put16(truncatedDns, 19, 1)
-put16(truncatedDns, 21, 1)
-put16(truncatedDns, 27, 4)
-check(!wire.dns(truncatedDns).valid, "truncated DNS A record accepted")
-let validDns = Bytes(33)
-put16(validDns, 0, 9)
-put16(validDns, 2, 0x8180)
-put16(validDns, 4, 1)
-put16(validDns, 6, 1)
-validDns[12] = 0
-put16(validDns, 13, 1)
-put16(validDns, 15, 1)
-validDns[17] = 0xC0
-validDns[18] = 0x0C
-put16(validDns, 19, 1)
-put16(validDns, 21, 1)
-put16(validDns, 27, 4)
-put32(validDns, 29, 0x01020304)
-let answer = wire.dns(validDns)
+let validDns = dnsResponse("example.com", 9, "example.com", 1, 0x01020304)
+let answer = wire.dns(validDns, 9, "example.com")
 check(answer.valid && answer.id == 9 && answer.address == 0x01020304, "valid DNS A answer rejected")
+check(!wire.dns(validDns, 8, "example.com").valid, "DNS answer with unexpected identifier accepted")
+check(!wire.dns(validDns, 9, "other.example").valid, "DNS answer with unexpected question accepted")
+let unrelatedDns = dnsResponse("example.com", 9, "attacker.invalid", 1, 0x05060708)
+let unrelatedAnswer = wire.dns(unrelatedDns, 9, "example.com")
+check(unrelatedAnswer.valid && unrelatedAnswer.address == 0, "unrelated DNS answer owner supplied an address")
+let wrongTypeDns = dnsResponse("example.com", 9, "example.com", 28, 0x05060708)
+let wrongTypeAnswer = wire.dns(wrongTypeDns, 9, "example.com")
+check(wrongTypeAnswer.valid && wrongTypeAnswer.address == 0, "non-A DNS answer supplied an IPv4 address")
+let truncatedDns = validDns.slice(0, validDns.length - 1)
+check(!wire.dns(truncatedDns, 9, "example.com").valid, "truncated DNS A record accepted")
+check(wire.dnsQuery("example.com", 9).length > 12, "valid DNS query rejected")
+check(wire.dnsQuery("bad..example", 9).length == 0, "empty DNS label accepted")
+check(wire.dnsQuery("", 9).length == 0, "empty DNS name accepted")
+check(wire.dnsTupleAccepted(0x0A000203, 53, 60000, 0x0A000203, 60000), "bound DNS response tuple rejected")
+check(!wire.dnsTupleAccepted(0x0A000204, 53, 60000, 0x0A000203, 60000), "DNS response from an unexpected resolver accepted")
+check(!wire.dnsTupleAccepted(0x0A000203, 54, 60000, 0x0A000203, 60000), "DNS response from an unexpected source port accepted")
+check(!wire.dnsTupleAccepted(0x0A000203, 53, 5353, 0x0A000203, 60000), "DNS response for an unexpected randomized port accepted")
+check(!wire.dnsTimedOut(-1, 100, 5099), "DNS query expired before its timeout")
+check(wire.dnsTimedOut(-1, 100, 5100), "DNS query retained after its timeout")
+check(wire.retainDnsQuery(-1, 100, -1, 5099), "pending DNS query removed before timeout")
+check(!wire.retainDnsQuery(-1, 100, -1, 5100), "expired pending DNS query retained")
+check(wire.retainDnsQuery(0, 100, 200, 30199), "completed DNS query removed before result retention elapsed")
+check(!wire.retainDnsQuery(0, 100, 200, 30200), "expired DNS result retained")
+check(wire.MAX_DNS_QUERIES == 64, "DNS query state is not capped")
 
 let localIp = 0x0A00020F
 let arp = Bytes(42)
@@ -157,4 +216,4 @@ check(!wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, false, 421), "ACK beyon
 check(wire.tcpAcknowledgmentAccepted(700, 700, 400, 20, true, 421), "FIN acknowledgement rejected")
 check(wire.tcpAcknowledgmentAccepted(700, 700, 0xFFFFFFF8, 16, false, 4), "wrapped in-range ACK rejected")
 
-print("OS network parsers: malformed UDP, DHCP, DNS, bounded ARP, TCP sequence, receive and terminal cleanup controls passed")
+print("OS network parsers: UDP, bound DHCP/DNS, bounded state, ARP, TCP sequence, receive and cleanup controls passed")

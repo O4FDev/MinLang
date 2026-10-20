@@ -15,7 +15,39 @@ io.writeTextFile(work + "/other.ll", io.readTextFile(work + "/one.ll"))
 function compile(tool: Text, real: Text, cache: Text, source: Text, output: Text, optimization: Text, log: Text): test.Result {
     return test.run([tool, tool, cache, real, optimization, "-Wno-override-module", source, "-o", output], system.environment(), "", log, 30)
 }
+function cacheEntry(directory: Text): Text {
+    for name in files.list(directory) { if Bytes(name).length == 64 { return directory + "/" + name } }
+    test.check(false, "expected a compiler cache entry")
+    return ""
+}
 test.require(compile(cacheTool, real, cache, work + "/one.ll", work + "/one", "-O0", work + "/first"), "first real compiler invocation")
+let restoreVictim = work + "/restore-victim"
+let restoreOutput = work + "/restore-output"
+let restoreWrapper = work + "/restore-wrapper"
+io.writeTextFile(restoreVictim, "SAFE restore\n")
+io.writeTextFile(restoreWrapper, "#!/bin/sh\nshift\n/bin/ln -s '" + restoreVictim + "' '" + restoreOutput + ".cache-'$$ || exit 91\nexec '" + cacheTool + "' '" + cacheTool + "' \"$@\"\n")
+test.require(test.run(["/bin/chmod", "+x", restoreWrapper], system.environment(), "", work + "/restore-wrapper-mode", 10), "restore attack wrapper permission")
+test.require(compile(restoreWrapper, real, cache, work + "/other.ll", restoreOutput, "-O0", work + "/restore-regression"), "cache restore through preplanted legacy symlink")
+test.check(io.readTextFile(restoreVictim) == "SAFE restore\n", "cache restore uses private unpredictable staging")
+let publishCache = work + "/publish-cache"
+test.require(compile(cacheTool, real, publishCache, work + "/one.ll", work + "/publish-seed", "-O0", work + "/publish-seed-log"), "seed cache publication regression")
+let publishEntry = cacheEntry(publishCache)
+test.check(files.remove(publishEntry) == 0, "remove seeded compiler cache entry")
+let publishVictim = work + "/publish-victim"
+let publishWrapper = work + "/publish-wrapper"
+io.writeTextFile(publishVictim, "SAFE publish\n")
+io.writeTextFile(publishWrapper, "#!/bin/sh\nshift\n/bin/ln -s '" + publishVictim + "' '" + publishEntry + ".tmp-'$$ || exit 91\nexec '" + cacheTool + "' '" + cacheTool + "' \"$@\"\n")
+test.require(test.run(["/bin/chmod", "+x", publishWrapper], system.environment(), "", work + "/publish-wrapper-mode", 10), "publish attack wrapper permission")
+test.require(compile(publishWrapper, real, publishCache, work + "/one.ll", work + "/publish-output", "-O0", work + "/publish-regression"), "cache entry publication through preplanted legacy symlink")
+test.check(io.readTextFile(publishVictim) == "SAFE publish\n" && files.pathSize(publishEntry) > 0, "cache entry publication uses private unpredictable staging")
+let linkedCache = work + "/linked-cache"
+test.require(compile(cacheTool, real, linkedCache, work + "/one.ll", work + "/linked-seed", "-O0", work + "/linked-seed-log"), "seed symlinked cache entry regression")
+let linkedEntry = cacheEntry(linkedCache)
+test.check(files.remove(linkedEntry) == 0, "remove cache entry before symlink fixture")
+test.require(test.run(["/bin/ln", "-s", work + "/one", linkedEntry], system.environment(), "", work + "/linked-entry-fixture", 10), "symlinked cache entry fixture")
+let linkedResult = compile(cacheTool, real, linkedCache, work + "/one.ll", work + "/linked-output", "-O0", work + "/linked-entry-log")
+test.check(linkedResult.status != 0 && files.pathSize(work + "/linked-output") < 0, "shared cache symlink entries are rejected without copying their targets")
+io.writeTextFile(work + "/calls", "compile\n")
 test.require(compile(cacheTool, real, cache, work + "/other.ll", work + "/two", "-O0", work + "/second"), "equivalent source cache hit")
 test.check(io.readTextFile(work + "/calls") == "compile\n", "equivalent LLVM links compile once")
 test.require(test.run([work + "/two"], system.environment(), "", work + "/run", 10), "cached executable executes")

@@ -81,6 +81,8 @@ for mode in ["timeout", "timeout-wall"] {
     test.check(timed.output == "TIMEOUT OK\n", mode + "\n" + timed.output)
     test.check(h2.trailers(h2.events(context, timed.encoded, true), "grpc-status", "4"), mode + " trailers")
 }
+let timeoutPressure = run(probe, h2.send(bounded, openMessage, false), "backpressure-timeout", "", false)
+test.check(timeoutPressure.output == "BACKPRESSURE TIMEOUT OK\n", "deadline backpressure lifecycle\n" + timeoutPressure.output)
 let echoData = h2.counting(100)
 let echoMessage = h2.envelope(encodedMessages[8])
 io.writeBytesFile(context.work + "/followup", h2.data(1, echoMessage, 8000, true))
@@ -93,6 +95,14 @@ test.check(fixtures.hex(joined) == fixtures.hex(echoData), "echoed data differs"
 let doneTrailers = false
 for event in echoed { if h2.kind(event) == "trailers" && h2.hasField(event, "grpc-status", "0") && h2.hasField(event, "grpc-message", "done %25%0A") { doneTrailers = true } }
 test.check(doneTrailers, "echo trailers")
+let churnMessages = h2.protos(context, [h2.dataSpec(Bytes()), h2.dataSpec(counting(0, 4096))])
+let churnPayload = Bytes()
+let tiny = h2.envelope(churnMessages[0])
+for index in 0..8000 { churnPayload.addBytes(tiny) }
+churnPayload.addBytes(h2.envelope(churnMessages[1]))
+io.writeBytesFile(context.work + "/churn-followup", h2.data(1, churnPayload, 16384, true))
+let churn = run(probe, h2.send(plain, openMessage, false), "churn", context.work + "/churn-followup", false)
+test.check(test.contains(churn.output, "CHURN OK\n"), "coalesced tiny messages and one-byte reads\n" + churn.output)
 test.check(run(probe, h2.send(plain, openMessage, false), "established", "", false).output == "ESTABLISHED OK\n", "established stream cut off by default deadline")
 let earlyData = h2.join([openMessage, h2.envelope(encodedMessages[6])])
 let malformed = [fromHex("0100000000"), fromHex("0000010005"), h2.envelope(encodedMessages[1]), h2.envelope(encodedMessages[2]), h2.envelope(encodedMessages[3]),
@@ -102,8 +112,12 @@ for bad in malformed {
     test.check(outcome.output == "ERROR 10\n", fixtures.hex(bad) + "\n" + outcome.output)
     test.check(h2.trailers(h2.events(context, outcome.encoded, true), "grpc-status", "13"), fixtures.hex(bad) + " trailers")
 }
+let pressure = run(probe, h2.send(plain, malformed[0], true), "backpressure-error", "", false)
+test.check(pressure.output == "BACKPRESSURE OK\n", "malformed request backpressure lifecycle\n" + pressure.output)
 let alias = h2.grpcClient(context, "", "/hearth.peer.v1.PeerGateway/Dial")
 test.check(run(probe, h2.send(alias, openMessage, false), "", "", false).output == "ERROR 10\n", "old private route aliased")
+let headerPressure = run(probe, h2.send(alias, openMessage, false), "backpressure-error", "", false)
+test.check(headerPressure.output == "BACKPRESSURE OK\n", "invalid header backpressure lifecycle\n" + headerPressure.output)
 let dataMessage = h2.envelope(encodedMessages[7])
 let prefixCount = 0
 for cut in 1..(dataMessage.length + 1) {
@@ -156,5 +170,5 @@ for row in rows {
     }
 }
 test.check(served.status == 0 && served.errorOutput == "", "native gRPC fixture exit (" + Text(served.status) + ")\n" + served.errorOutput)
-print("gRPC: " + Text(prefixCount) + " prefixes + 150 mutations, normative PeerEdgeDial schema/all nested statuses/details, early coalesced DATA rejection, immutable 500ms/default deadlines and concurrent grpc-go 64KiB binary streams passed")
+print("gRPC: " + Text(prefixCount) + " prefixes + 150 mutations, 8000 tiny messages and 4096 one-byte reads, normative PeerEdgeDial schema/all nested statuses/details, early coalesced DATA rejection, immutable 500ms/default deadlines and concurrent grpc-go 64KiB binary streams passed")
 fixtures.finish(context)

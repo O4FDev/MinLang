@@ -4,6 +4,7 @@ use "process" as processInfo
 // The generated server chain/key are real; forged CVs keep valid transcript
 // Finished MACs, so a Finished-only verifier cannot accidentally pass.
 use "tls" as tls
+use "tlsserver" as server
 use "tlsverify" as trust
 use "crypto" as crypto
 
@@ -14,6 +15,16 @@ function message(type: Integer, body: Bytes): Bytes {
     result.add(type)
     add24(result, body.length)
     result.addBytes(body)
+    return result
+}
+function appendToFirstRecord(records: Bytes, trailing: Bytes): Bytes {
+    if records.length < 5 { return Bytes() }
+    let length = (records[3] << 8) | records[4]
+    if length > records.length - 5 || length + trailing.length > 65535 { return Bytes() }
+    let result = records.slice(0, 5 + length)
+    length += trailing.length
+    result[3] = (length >> 8) & 255; result[4] = length & 255
+    result.addBytes(trailing)
     return result
 }
 function extension(type: Integer, body: Bytes): Bytes {
@@ -125,6 +136,31 @@ function main(): Integer {
     for mode in 0..20 {
         if !scenario(mode, root, leaf, key, other) { print("TLS protocol scenario failed: " + Text(mode)); return 1 }
     }
+    // TLS 1.3 key changes must coincide with record boundaries. In
+    // particular, the message following ServerHello is encrypted.
+    let boundaryClient = tls.clientWithTrust("localhost", Bytes(64), [root])
+    let boundaryServer = server.server(Bytes(64), "http/1.1", [leaf], key, [], false)
+    server.receive(boundaryServer, tls.takeOutgoing(boundaryClient))
+    let serverFlight = server.takeOutgoing(boundaryServer)
+    let protocol = Bytes("http/1.1")
+    let selected = Bytes(); add16(selected, protocol.length + 1); selected.add(protocol.length); selected.addBytes(protocol)
+    let extensions = extension(16, selected)
+    let body = Bytes(); add16(body, extensions.length); body.addBytes(extensions)
+    tls.receive(boundaryClient, appendToFirstRecord(serverFlight, message(8, body)))
+    if boundaryClient.state != tls.FAILED || boundaryClient.error != "TLS key change is not aligned to a record boundary" {
+        print("TLS client accepted a complete plaintext post-ServerHello message"); return 1
+    }
+    boundaryClient = tls.clientWithTrust("localhost", Bytes(64), [root])
+    tls.receive(boundaryClient, appendToFirstRecord(serverFlight, crypto.fromHex("08")))
+    if boundaryClient.state != tls.FAILED || boundaryClient.error != "TLS key change is not aligned to a record boundary" {
+        print("TLS client accepted a partial plaintext post-ServerHello message"); return 1
+    }
+    boundaryClient = tls.clientWithTrust("localhost", Bytes(64), [root])
+    boundaryServer = server.server(Bytes(64), "http/1.1", [leaf], key, [], false)
+    server.receive(boundaryServer, appendToFirstRecord(tls.takeOutgoing(boundaryClient), crypto.fromHex("14000020")))
+    if boundaryServer.state != server.FAILED || boundaryServer.error != "TLS key change is not aligned to a record boundary" {
+        print("TLS server accepted a plaintext Finished header after ClientHello"); return 1
+    }
     // Every truncation of a real certificate must fail trust validation.
     let anchors = certificate(root).slice(8, 8 + root.length + 5)
     for length in 0..leaf.length {
@@ -174,6 +210,48 @@ function main(): Integer {
             if tls.established(session) { print("TLS inner parser accepted fuzz input"); return 1 }
         }
     }
+    // Coalesced records are consumed without losing an incomplete trailing
+    // record. The client and server share the same framing invariant.
+    let changeCipherSpec = crypto.fromHex("140303000101")
+    let coalesced = Bytes()
+    for index in 0..4096 { coalesced.addBytes(changeCipherSpec) }
+    coalesced.addBytes(crypto.fromHex("1403030001"))
+    let framedClient = tls.none(); framedClient.state = tls.HANDSHAKE
+    tls.receive(framedClient, coalesced)
+    if framedClient.state != tls.HANDSHAKE || framedClient.authenticated || crypto.hex(framedClient.received) != "1403030001" {
+        print("TLS client lost a partial record after coalesced records"); return 1
+    }
+    tls.receive(framedClient, crypto.fromHex("01"))
+    if framedClient.state != tls.HANDSHAKE || framedClient.received.length != 0 { print("TLS client did not complete a retained record"); return 1 }
+    let framedServer = server.none(); framedServer.state = server.HANDSHAKE
+    server.receive(framedServer, coalesced)
+    if framedServer.state != server.HANDSHAKE || framedServer.authenticated || crypto.hex(framedServer.received) != "1403030001" {
+        print("TLS server lost a partial record after coalesced records"); return 1
+    }
+    server.receive(framedServer, crypto.fromHex("01"))
+    if framedServer.state != server.HANDSHAKE || framedServer.received.length != 0 { print("TLS server did not complete a retained record"); return 1 }
+    let rejected = server.none(); rejected.state = server.HANDSHAKE
+    server.receive(rejected, crypto.fromHex("14030300010114030300020101140303000101"))
+    if rejected.state != server.FAILED || rejected.received.length != 0 { print("TLS server retained bytes after record failure"); return 1 }
+    // Authenticated QUIC servers may coalesce many post-handshake tickets.
+    // Preserve a partial final message while consuming the complete prefix.
+    let ticket = crypto.fromHex("0400000e0000000100000000000001000000")
+    let tickets = Bytes()
+    for index in 0..4096 { tickets.addBytes(ticket) }
+    tickets.addBytes(ticket.slice(0, 3))
+    let ticketClient = tls.none(); ticketClient.quic = true; ticketClient.state = tls.ESTABLISHED; ticketClient.authenticated = true
+    tls.receiveHandshake(ticketClient, tickets, tls.APPLICATION_KEYS)
+    if ticketClient.state != tls.ESTABLISHED || !ticketClient.authenticated || crypto.hex(ticketClient.handshake) != "040000" {
+        print("TLS client lost a partial ticket after coalesced tickets"); return 1
+    }
+    tls.receiveHandshake(ticketClient, ticket.slice(3, ticket.length), tls.APPLICATION_KEYS)
+    if ticketClient.state != tls.ESTABLISHED || ticketClient.handshake.length != 0 { print("TLS client did not complete a retained ticket"); return 1 }
+    let rejectedTickets = ticket.slice(0, ticket.length); rejectedTickets.addBytes(crypto.fromHex("ff000000")); rejectedTickets.addBytes(ticket)
+    let rejectedTicketClient = tls.none(); rejectedTicketClient.quic = true; rejectedTicketClient.state = tls.ESTABLISHED; rejectedTicketClient.authenticated = true
+    tls.receiveHandshake(rejectedTicketClient, rejectedTickets, tls.APPLICATION_KEYS)
+    if rejectedTicketClient.state != tls.FAILED || rejectedTicketClient.handshake.length != 0 {
+        print("TLS client retained handshake bytes after ticket failure"); return 1
+    }
     // An authentic AEAD record carrying early application data must fail.
     let premature = tls.none()
     premature.state = tls.HANDSHAKE
@@ -189,8 +267,59 @@ function main(): Integer {
     if premature.state != tls.FAILED || tls.takeIncoming(premature).length != 0 {
         print("TLS released application data before authentication"); return 1
     }
+    // Minyar does not implement KeyUpdate, so every traffic key is retired
+    // before the conservative 2^24-record AES-GCM usage limit.
+    let recordLimit = 16777216
+    let clientSender = tls.none(); clientSender.state = tls.ESTABLISHED
+    clientSender.writeKey = Bytes(32); clientSender.writeIv = Bytes(12); clientSender.writeSequence = recordLimit - 1
+    tls.send(clientSender, Bytes("last client record"))
+    let clientRecord = tls.takeOutgoing(clientSender)
+    if clientSender.state != tls.ESTABLISHED || clientSender.writeSequence != recordLimit || clientRecord.length == 0 {
+        print("TLS client rejected the final record below its key usage limit"); return 1
+    }
+    let serverReceiver = server.none(); serverReceiver.state = server.ESTABLISHED; serverReceiver.cipherSuite = 0x1303
+    serverReceiver.readKey = Bytes(32); serverReceiver.readIv = Bytes(12); serverReceiver.readSequence = recordLimit - 1
+    server.receive(serverReceiver, clientRecord)
+    if serverReceiver.state != server.ESTABLISHED || serverReceiver.readSequence != recordLimit ||
+       crypto.hex(server.takeIncoming(serverReceiver)) != crypto.hex(Bytes("last client record")) {
+        print("TLS server rejected the final record below its key usage limit"); return 1
+    }
+    server.receive(serverReceiver, clientRecord)
+    if serverReceiver.state != server.FAILED || serverReceiver.error != "TLS record key usage limit reached" ||
+       serverReceiver.readKey.length != 0 || serverReceiver.incoming.length != 0 {
+        print("TLS server accepted a record beyond its key usage limit"); return 1
+    }
+    tls.send(clientSender, Bytes("over limit"))
+    if clientSender.state != tls.FAILED || clientSender.error != "TLS record key usage limit reached" ||
+       clientSender.writeKey.length != 0 || tls.takeOutgoing(clientSender).length != 0 {
+        print("TLS client sent a record beyond its key usage limit"); return 1
+    }
+    let serverSender = server.none(); serverSender.state = server.ESTABLISHED; serverSender.cipherSuite = 0x1303
+    serverSender.writeKey = Bytes(32); serverSender.writeIv = Bytes(12); serverSender.writeSequence = recordLimit - 1
+    server.send(serverSender, Bytes("last server record"))
+    let serverRecord = server.takeOutgoing(serverSender)
+    if serverSender.state != server.ESTABLISHED || serverSender.writeSequence != recordLimit || serverRecord.length == 0 {
+        print("TLS server rejected the final record below its key usage limit"); return 1
+    }
+    let clientReceiver = tls.none(); clientReceiver.state = tls.ESTABLISHED
+    clientReceiver.readKey = Bytes(32); clientReceiver.readIv = Bytes(12); clientReceiver.readSequence = recordLimit - 1
+    tls.receive(clientReceiver, serverRecord)
+    if clientReceiver.state != tls.ESTABLISHED || clientReceiver.readSequence != recordLimit ||
+       crypto.hex(tls.takeIncoming(clientReceiver)) != crypto.hex(Bytes("last server record")) {
+        print("TLS client rejected the final record below its key usage limit"); return 1
+    }
+    tls.receive(clientReceiver, serverRecord)
+    if clientReceiver.state != tls.FAILED || clientReceiver.error != "TLS record key usage limit reached" ||
+       clientReceiver.readKey.length != 0 || clientReceiver.incoming.length != 0 {
+        print("TLS client accepted a record beyond its key usage limit"); return 1
+    }
+    server.send(serverSender, Bytes("over limit"))
+    if serverSender.state != server.FAILED || serverSender.error != "TLS record key usage limit reached" ||
+       serverSender.writeKey.length != 0 || server.takeOutgoing(serverSender).length != 0 {
+        print("TLS server sent a record beyond its key usage limit"); return 1
+    }
     let shortEntropy = tls.client("localhost", Bytes(63))
     if shortEntropy.state != tls.FAILED { print("TLS accepted insufficient entropy"); return 1 }
-    print("TLS raw handshake: 20 state/signature/fragmentation cases, all DER truncations, 3584 parser fuzz cases, early application rejection passed")
+    print("TLS raw handshake: 20 state/signature/fragmentation cases, key-change record boundaries, all DER truncations, 3584 parser fuzz cases, record and ticket coalescing, early application rejection, and AEAD record limits passed")
     return 0
 }

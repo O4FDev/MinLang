@@ -12,6 +12,7 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs.min -o "$work/writer"
 MINYAR_CLANG="$clang" ./minyar tests/erofs-api.min -o "$work/api"
 "$clang" -std=c11 -O2 -Wall -Wextra -Werror -static tests/erofs-tree.c -o "$work/tree"
 "$work/tree" create "$work/source"
+"$work/tree" limits "$work/limits"
 "$work/api" "$work/source" "$work/api.erofs"
 test ! -e "$work/api.erofs"
 for kind in worker helper legacy legacy-helper; do
@@ -46,6 +47,10 @@ fi
 cp "$work/plain.erofs" "$work/unchanged.erofs"
 if "$work/writer" "$work/source" "$work/unchanged.erofs" 8192; then exit 1; fi
 cmp "$work/plain.erofs" "$work/unchanged.erofs"
+"$work/writer" "$work/limits/entries" "$work/entry-limit.erofs" 4096 none 27
+test ! -e "$work/entry-limit.erofs"
+(ulimit -v 262144; "$work/writer" "$work/limits/sparse" "$work/map-limit.erofs" 4096 lz4 27)
+test ! -e "$work/map-limit.erofs"
 test -z "$(find "$work" -name '*.erofs-??????')"
 if "$work/writer" "$work/missing" "$work/plain.erofs"; then exit 1; fi
 if "$work/writer" "$work/source/symlink" "$work/plain.erofs"; then exit 1; fi

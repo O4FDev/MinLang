@@ -94,6 +94,21 @@ static void create(const char *root) {
     require(!utimensat(AT_FDCWD,dir,times,AT_SYMLINK_NOFOLLOW), "directory time"); require(!utimensat(AT_FDCWD,root,times,AT_SYMLINK_NOFOLLOW), "root time");
     free(dir);free(first);free(hard);free(sym);free(fifo);
 }
+static void limits(const char *root) {
+    require(!mkdir(root,0751), "create limits root");
+    char *entries = join(root,"entries"); require(!mkdir(entries,0751), "create entries root");
+    char *path = entries;
+    for (unsigned n = 0; n < 257; ++n) {
+        char *next = join(path,"d"); require(!mkdir(next,0751), "create nested entry");
+        if (path != entries) free(path);
+        path = next;
+    }
+    free(path);free(entries);
+    char *sparse = join(root,"sparse"); require(!mkdir(sparse,0751), "create sparse root");
+    char *file = join(sparse,"huge"); int fd = open(file,O_CREAT | O_EXCL | O_WRONLY,0644);
+    require(fd >= 0 && !ftruncate(fd,1099511627776ll) && !close(fd), "create sparse file");
+    free(file);free(sparse);
+}
 static void ownership(const char *path, uid_t uid, gid_t gid) {
     struct stat st; require(!lstat(path,&st), "owner stat");
     require(!lchown(path,uid,gid), "fixture ownership");
@@ -179,6 +194,7 @@ int main(int argc, char **argv) {
     if (argc == 1) return guest();
     require(argc >= 3, "arguments");
     if (!strcmp(argv[1],"create")) create(argv[2]);
+    else if (!strcmp(argv[1],"limits")) limits(argv[2]);
     else { require(argc == 4, "compare arguments"); compare(argv[2],argv[3]); puts("EROFS_TREE_PASS"); }
     return 0;
 }

@@ -3,12 +3,30 @@ use "../tools/testing.min" as test
 use "../tools/check-runner.min" as runner
 use "system" as system
 use "files" as files
+
+function requirePrivateDirectory(path: Text, log: Text) {
+    let mode = test.run(["/bin/sh", "-c", "mode=$(/usr/bin/stat -c %a \"$1\" 2>/dev/null || /usr/bin/stat -f %Lp \"$1\"); test \"$mode\" = 700 && test ! -L \"$1\"", "minyar", path], system.environment(), "", log, 10)
+    test.require(mode, "verify private scratch directory")
+}
+
 let source = "# Files\n\n.PHONY: check-parent check-first check-second\n\ncheck-parent: check-first check-second | artifact\n\t@true\n\ncheck-first: artifact\n\t@true\n\ncheck-second: artifact\n\t@true\n\nartifact:\n\t@true\n\n# files hash-table stats:\n"
 let rules = runner.database(source)
 test.check(rules.length == 4, "make database rule count")
 test.check(rules[runner.findRule(rules, "check-parent")].prerequisites.length == 3, "order-only prerequisite")
 test.check(rules[runner.findRule(rules, "check-first")].phony, "phony declaration")
 let work = test.scratch()
+requirePrivateDirectory(work, work + "/private-mode")
+let collisionParent = work + "/scratch-collision"
+test.check(files.makeDirectory(collisionParent) == 0, "create scratch collision parent")
+let planted = collisionParent + "/minyar-tests-AAAAAA"
+test.require(test.run(["/bin/ln", "-s", "--", work, planted], system.environment(), "", work + "/scratch-collision-link", 10), "plant scratch symlink collision")
+let fresh = test.scratchIn(collisionParent)
+test.check(fresh != planted, "private scratch refuses a preexisting symlink name")
+requirePrivateDirectory(fresh, work + "/scratch-collision-private")
+test.require(test.run(["/bin/test", "-L", planted], system.environment(), "", work + "/scratch-collision-preserved", 10), "preserve refused scratch symlink")
+test.removeScratch(fresh)
+test.check(files.remove(planted) == 0, "remove scratch symlink collision")
+test.check(files.removeDirectory(collisionParent) == 0, "remove scratch collision parent")
 io.writeTextFile(work + "/Makefile", ".PHONY: check-parent check-first check-second FORCE\ncheck-parent: check-first check-second\n\t@test $$(wc -l < runs) -eq 2\ncheck-first: artifact\n\t@echo first >> runs; sleep 0.1\ncheck-second: artifact\n\t@echo second >> runs; sleep 0.1\nartifact:\n\t@echo build >> builds; touch artifact\nFORCE:\n")
 let plan = runner.plan(2, 5, 0)
 let variant = runner.addVariant(plan, "", work, system.environment(), ["/usr/bin/make", "-j1"])
@@ -51,7 +69,14 @@ runner.addCheck(known, knownVariant, "check-after-known")
 runner.prioritize(known, work + "/durations")
 test.check(runner.run(known), "history-ordered checks pass")
 test.check(io.readTextFile(work + "/known-order") == "first\nafter\nsecond\n", "longest recorded chains start first")
+let historyVictim = work + "/history-victim"
+io.writeTextFile(historyVictim, "SAFE\n")
+let historyTrap = work + "/durations.tmp-" + Text(system.processId())
+test.require(test.run(["/bin/ln", "-s", "--", historyVictim, historyTrap], system.environment(), "", work + "/history-symlink", 10), "plant history symlink collision")
 runner.remember(known, work + "/durations")
+test.check(io.readTextFile(historyVictim) == "SAFE\n", "history publication does not follow a planted temporary symlink")
+test.require(test.run(["/bin/test", "-L", historyTrap], system.environment(), "", work + "/history-symlink-preserved", 10), "preserve refused history symlink")
+test.check(files.remove(historyTrap) == 0, "remove history symlink collision")
 let remembered = test.lines(io.readTextFile(work + "/durations"))
 test.check(remembered.length == 3 && test.words(remembered[1])[0] == "check-first-known" && test.words(remembered[1])[1] != "10", "measured durations replace history")
 test.removeTree(known.scratch)
@@ -73,6 +98,7 @@ test.check(!runner.run(shortScratch), "failing scratch fixture fails")
 test.check(shortScratch.checks[0].state == 2, "short real scratch fits Unix socket paths")
 test.check(!io.fileExists(io.readTextFile(work + "/alias")) && !io.fileExists(shortScratch.scratch + "/tmp-1"), "passing check scratch removed")
 test.check(io.readTextFile(shortScratch.scratch + "/tmp-2/artifact") == "failed" && !io.fileExists(io.readTextFile(work + "/failed-alias")), "failed check scratch retained in the run")
+requirePrivateDirectory(shortScratch.scratch + "/tmp-2", work + "/retained-private-mode")
 test.removeTree(shortScratch.scratch)
 for jobs in [1, 2, 4] {
     if io.fileExists(work + "/mutation-done") { test.check(files.remove(work + "/mutation-done") == 0, "reset worker reservation fixture") }

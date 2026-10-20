@@ -93,6 +93,41 @@ void minyar_test_http_identity(const MinyarBytes *reference) { @autoreleasepool 
     assert(!http_same_origin(r.credentialOrigin,[NSURL URLWithString:@"http://device.example/path"]));
     assert(!http_same_origin(r.credentialOrigin,[NSURL URLWithString:@"https://device.example:8443/path"]));
     assert(!http_same_origin(r.credentialOrigin,[NSURL URLWithString:@"https://attacker.example/path"]));
+    /* Same-origin redirects retain caller data. Scheme, host and effective-port
+     * changes strip caller headers and reject a preserved 307/308 body. */
+    MHRequest *plain=[MHRequest new];
+    plain.callerHeaderNames=@[@"Authorization",@"Cookie",@"X-Secret"];
+    NSURL *sourceURL=[NSURL URLWithString:@"https://device.example/start"];
+    NSHTTPURLResponse *redirectResponse=[[NSHTTPURLResponse alloc] initWithURL:sourceURL statusCode:302
+        HTTPVersion:@"HTTP/1.1" headerFields:@{@"Location":@"/next"}];
+    NSMutableURLRequest *proposed=[NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"https://DEVICE.EXAMPLE:443/next"]];
+    [proposed setValue:@"Bearer secret" forHTTPHeaderField:@"Authorization"];
+    [proposed setValue:@"private=secret" forHTTPHeaderField:@"Cookie"];
+    [proposed setValue:@"secret" forHTTPHeaderField:@"X-Secret"];
+    NSString *redirectError=nil;
+    NSURLRequest *redirected=http_redirect_request(plain,redirectResponse,proposed,&redirectError);
+    assert(redirected==proposed && !redirectError && [redirected valueForHTTPHeaderField:@"X-Secret"]);
+    for (NSString *destination in @[@"http://device.example/next",@"https://device.example:8443/next",
+                                     @"https://attacker.example/next"]) {
+        proposed=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:destination]];
+        [proposed setValue:@"Bearer secret" forHTTPHeaderField:@"Authorization"];
+        [proposed setValue:@"private=secret" forHTTPHeaderField:@"Cookie"];
+        [proposed setValue:@"secret" forHTTPHeaderField:@"X-Secret"];
+        [proposed setValue:@"keep" forHTTPHeaderField:@"Accept"];
+        redirectError=nil; redirected=http_redirect_request(plain,redirectResponse,proposed,&redirectError);
+        assert(redirected && !redirectError && ![redirected valueForHTTPHeaderField:@"Authorization"] &&
+            ![redirected valueForHTTPHeaderField:@"Cookie"] && ![redirected valueForHTTPHeaderField:@"X-Secret"] &&
+            [[redirected valueForHTTPHeaderField:@"Accept"] isEqualToString:@"keep"]);
+    }
+    proposed=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://attacker.example/next"]];
+    proposed.HTTPMethod=@"POST";
+    proposed.HTTPBodyStream=[NSInputStream inputStreamWithData:[@"body=secret" dataUsingEncoding:NSUTF8StringEncoding]];
+    redirectError=nil; redirected=http_redirect_request(plain,redirectResponse,proposed,&redirectError);
+    assert(!redirected && redirectError.length);
+    proposed=[NSMutableURLRequest requestWithURL:[NSURL fileURLWithPath:@"/etc/passwd"]];
+    redirectError=nil; redirected=http_redirect_request(plain,redirectResponse,proposed,&redirectError);
+    assert(!redirected && redirectError.length);
     /* Completed/cancelled requests must not provide a certificate. */
     r.done=YES;
     challenge=http_challenge(@"device.example",443,@"https",NSURLAuthenticationMethodClientCertificate,0);

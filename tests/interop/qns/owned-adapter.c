@@ -40,6 +40,93 @@ static char *owned_text(const MinyarText *text) {
     return copy;
 }
 
+static int owned_directory_path(char *path, int create) {
+    int fd = open(path[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    char *part = path;
+    if (path[0] == '/') part++;
+    while (fd >= 0 && *part) {
+        char *slash = strchr(part, '/');
+        if (slash) *slash = 0;
+        if (!part[0] || !strcmp(part, ".") || !strcmp(part, "..")) {
+            errno = EINVAL;
+            close(fd);
+            return -1;
+        }
+        int next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 && create && errno == ENOENT) {
+            if (mkdirat(fd, part, 0777) != 0 && errno != EEXIST) {
+                int code = errno;
+                close(fd);
+                errno = code;
+                return -1;
+            }
+            next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        int code = errno;
+        close(fd);
+        errno = code;
+        fd = next;
+        if (!slash) break;
+        part = slash + 1;
+    }
+    return fd;
+}
+
+long long minyar_ownedadapter_archiveCreate(const MinyarText *root, const MinyarText *relative,
+                                             bool directory, long long mode) {
+    char *base = owned_text(root), *name = base ? owned_text(relative) : NULL;
+    if (!name) {
+        int code = errno;
+        free(base);
+        errno = code;
+        return failed();
+    }
+    int fd = owned_directory_path(base, 1);
+    char *part = name;
+    if (fd >= 0 && (!part[0] || part[0] == '/')) {
+        if (part[0]) errno = EINVAL;
+        if (part[0]) { close(fd); fd = -1; }
+    }
+    while (fd >= 0 && *part) {
+        char *slash = strchr(part, '/');
+        if (slash) *slash = 0;
+        if (!part[0] || !strcmp(part, ".") || !strcmp(part, "..")) {
+            errno = EINVAL;
+            close(fd);
+            fd = -1;
+            break;
+        }
+        int last = !slash;
+        int next;
+        if (last && !directory) {
+            next = openat(fd, part, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                          (mode_t)mode);
+        } else {
+            next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (next < 0 && errno == ENOENT) {
+                if (mkdirat(fd, part, 0777) != 0 && errno != EEXIST) next = -1;
+                else next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            }
+        }
+        int code = errno;
+        close(fd);
+        errno = code;
+        fd = next;
+        if (!slash) break;
+        part = slash + 1;
+    }
+    int code = errno;
+    free(base);
+    free(name);
+    errno = code;
+    if (fd < 0) return failed();
+    if (directory || !relative->byte_length) {
+        close(fd);
+        return 0;
+    }
+    return fd;
+}
+
 static MinyarText *result_text(const char *value) {
     return minyar_native_copy_text((const unsigned char *)value, (long long)strlen(value));
 }

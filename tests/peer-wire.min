@@ -37,6 +37,32 @@ if mode == "prefixes" {
         }
     }
     print("PREFIXES " + Text(bytes.length + 1))
+} else if mode == "cursor" {
+    let decoder = wire.create()
+    let fed = wire.feed(decoder, bytes)
+    if !errors.booleanOk(fed) || wire.bufferedBytes(decoder) != 1048576 { fail("exact decoder bound rejected") }
+    let frames = 0
+    while wire.bufferedBytes(decoder) > 4 {
+        let result = wire.take(decoder)
+        if !wire.frameOk(result) || wire.kind(result) != wire.HEARTBEAT || wire.streamID(result) != 0 || !same(wire.payload(result), Bytes("{}")) { fail("packed heartbeat changed") }
+        frames += 1
+    }
+    if wire.bufferedBytes(decoder) != 4 { fail("partial header count changed") }
+    let tail = Bytes()
+    for byte in [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 123, 125] { tail.add(byte) }
+    fed = wire.feed(decoder, tail)
+    if !errors.booleanOk(fed) || wire.bufferedBytes(decoder) != 18 { fail("cursor compaction changed buffered bytes") }
+    let result = wire.take(decoder)
+    if !wire.frameOk(result) || wire.kind(result) != wire.HEARTBEAT || !same(wire.payload(result), Bytes("{}")) || wire.bufferedBytes(decoder) != 0 { fail("frame spanning compaction changed") }
+    frames += 1
+    wire.finish(decoder)
+    fed = wire.feed(decoder, Bytes("x"))
+    if errors.booleanOk(fed) || errors.code(errors.booleanError(fed)) != errors.closedCode() || errors.code(wire.frameError(wire.take(decoder))) != errors.closedCode() { fail("completed decoder EOF changed") }
+    let truncated = wire.create()
+    fed = wire.feed(truncated, Bytes("HPW1")); wire.finish(truncated)
+    result = wire.take(truncated)
+    if !errors.booleanOk(fed) || wire.frameOk(result) || errors.code(wire.frameError(result)) != errors.truncatedCode() || wire.bufferedBytes(truncated) != 0 || errors.code(wire.frameError(wire.take(truncated))) != errors.truncatedCode() { fail("cursor truncation was not sticky") }
+    print("CURSOR " + Text(frames))
 } else {
     let decoder = wire.create()
     let piece = number(processInfo.argument(2)); if piece < 1 { piece = bytes.length + 1 }

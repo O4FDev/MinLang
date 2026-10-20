@@ -76,6 +76,17 @@ function main(): Integer {
     mux.write(remote,remoteId,Bytes(262144),false);mux.cancel(remotePeer,remoteId)
     mux.receive(remote,mux.takeOutgoing(remotePeer))
     if remote.state!=mux.READY || remote.outgoing.length!=0 || remote.streams[0].active { print("peer reset retained unsent payload");return 29 }
+    // A reset with no discardable frames leaves an unrelated DATA queue in
+    // place without rebuilding the shared buffer.
+    let cheap=mux.create(true);let victim=errors.integerValue(mux.open(cheap))
+    mux.receive(cheap,crypto.fromHex("000100010000000200000000"));mux.takeOutgoing(cheap)
+    if !errors.integerOk(mux.write(cheap,victim,Bytes(262144),false)) { return 34 }
+    let queuedLength=cheap.outgoing.length
+    if !cheap.streams[0].discardable || cheap.streams[1].discardable { return 35 }
+    mux.receive(cheap,crypto.fromHex("000100080000000200000000"))
+    if cheap.state!=mux.READY || cheap.outgoing.length!=queuedLength || cheap.streams[1].active || !cheap.streams[0].discardable { return 36 }
+    mux.takeOutgoing(cheap)
+    if cheap.streams[0].discardable { return 37 }
     // Payload on unrelated streams cannot consume the reserve needed to reset
     // a flow-blocked stream whose own queue was already sent.
     let full=mux.create(true);let fullPeer=mux.create(false);let target=errors.integerValue(mux.open(full))
@@ -85,7 +96,16 @@ function main(): Integer {
     let remainder=1048576-full.outgoing.length-48
     mux.write(full,others[3],Bytes(remainder),false)
     if !errors.booleanOk(mux.cancel(full,target)) || full.state!=mux.READY { print("unrelated payload blocked stream reset");return 31 }
+    // A coalesced batch of valid empty controls must be scanned once, and an
+    // incomplete last frame must be retained without replaying earlier ones.
+    let acknowledgements=Bytes();let acknowledgement=crypto.fromHex("000200020000000000000000")
+    for n in 0..60000 { acknowledgements.addBytes(acknowledgement) }
+    acknowledgements.addBytes(acknowledgement.slice(0,9))
+    let batch=mux.create(true);mux.receive(batch,acknowledgements)
+    if batch.state!=mux.READY || batch.received.length!=9 || batch.outgoing.length!=0 { return 32 }
+    mux.receive(batch,acknowledgement.slice(9,12))
+    if batch.state!=mux.READY || batch.received.length!=0 || batch.outgoing.length!=0 { return 33 }
     print("yamux: unread EOF, half-close/capacity, reset/reuse, out-of-order SYN, stale wire IDs and window overflow passed")
-    print("yamux: 1536 sequential RPCs, immutable increasing IDs, bounded slots, stale handles and half-close passed")
+    print("yamux: 1536 sequential RPCs and 60000 coalesced controls, bounded slots, stale handles and half-close passed")
     return 0
 }

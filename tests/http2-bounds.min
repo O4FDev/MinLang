@@ -3,6 +3,11 @@ use "process" as processInfo
 use "http2" as h2
 use "errors" as errors
 function require(value: Boolean, message: Text) { if !value { fail(message) } }
+function add32(bytes: Bytes, value: Integer) { for i in 0..4 { bytes.add((value >> ((3 - i) * 8)) & 255) } }
+function frame(kind: Integer, flags: Integer, id: Integer, body: Bytes): Bytes {
+    let result = Bytes(); result.add((body.length >> 16) & 255); result.add((body.length >> 8) & 255); result.add(body.length & 255)
+    result.add(kind); result.add(flags); add32(result, id); result.addBytes(body); return result
+}
 let server = h2.create()
 require(errors.booleanOk(h2.receive(server, io.readBytesFile(processInfo.argument(0)))), "independent headers rejected")
 let request = h2.requests(server)
@@ -30,4 +35,67 @@ let second = h2.create(); let excessive = Bytes(); for i in 0..1048577 { excessi
 let rejected = h2.receive(second, excessive)
 require(!errors.booleanOk(rejected) && errors.isWouldBlock(errors.booleanError(rejected)) && h2.bufferedInput(second) == 0 && !errors.isError(h2.connectionError(second)), "input overload was not recoverable")
 require(errors.booleanOk(h2.receive(second, io.readBytesFile(processInfo.argument(0)))), "retry after input backpressure failed")
+// Many legal extension frames in one read must leave only the trailing partial
+// header buffered. The next read completes it without replaying earlier frames.
+let coalesced = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+let settings = Bytes(); for byte in [0,0,0,4,0,0,0,0,0] { settings.add(byte) }
+let extension = Bytes(); for byte in [0,0,0,10,0,0,0,0,0] { extension.add(byte) }
+coalesced.addBytes(settings)
+for n in 0..70000 { coalesced.addBytes(extension) }
+coalesced.addBytes(extension.slice(0,5))
+let batch = h2.create()
+require(errors.booleanOk(h2.receive(batch, coalesced)) && h2.bufferedInput(batch) == 5, "coalesced HTTP/2 frames lost their partial tail")
+require(errors.booleanOk(h2.receive(batch, extension.slice(5,9))) && h2.bufferedInput(batch) == 0, "partial HTTP/2 extension was not completed")
+// Empty CONTINUATION frames are legal but cannot evade the 1 MiB input budget
+// indefinitely after their frame headers have been parsed and discarded.
+let progressless = h2.create(); let fragmented = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+fragmented.addBytes(frame(4, 0, 0, Bytes())); let first = Bytes(); first.add(130)
+fragmented.addBytes(frame(1, 0, 1, first)); require(errors.booleanOk(h2.receive(progressless, fragmented)), "fragmented HEADERS rejected")
+let emptyContinuation = frame(9, 0, 1, Bytes()); let emptyContinuations = Bytes()
+for unused in 0..116508 { emptyContinuations.addBytes(emptyContinuation) }
+let rejectedContinuation = h2.receive(progressless, emptyContinuations)
+require(!errors.booleanOk(rejectedContinuation) && errors.nativeCode(errors.booleanError(rejectedContinuation)) == 11, "progressless CONTINUATION was not bounded")
+// A maximum-size SETTINGS frame can repeat INITIAL_WINDOW_SIZE thousands of
+// times. Its ordered intermediate maximum is checked once per live stream,
+// and its final value is then applied once per stream.
+let settingsFlood = h2.create(); let opening = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+opening.addBytes(frame(4, 0, 0, Bytes())); require(errors.booleanOk(h2.receive(settingsFlood, opening)), "SETTINGS flood opening rejected")
+let requestBlock = Bytes(); for byte in [130,134,132,65,140,241,227,194,229,242,58,107,160,171,144,244,255] { requestBlock.add(byte) }
+for index in 0..64 { require(errors.booleanOk(h2.receive(settingsFlood, frame(1, 4, index * 2 + 1, requestBlock))), "SETTINGS flood stream rejected") }
+let repeated = Bytes(); for unused in 0..2730 { repeated.add(0); repeated.add(4); add32(repeated, 65535) }
+require(errors.booleanOk(h2.receive(settingsFlood, frame(4, 0, 0, repeated))) && h2.retainedStreams(settingsFlood) == 64, "maximum repeated SETTINGS rejected")
+// Preserve ordered overflow behavior even when the final duplicate restores
+// the original setting: the intermediate increase still overflows this stream.
+let ordered = h2.create(); let orderedOpening = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"); let zeroInitial = Bytes()
+zeroInitial.add(0); zeroInitial.add(4); add32(zeroInitial, 0); orderedOpening.addBytes(frame(4, 0, 0, zeroInitial)); orderedOpening.addBytes(frame(1, 4, 1, requestBlock))
+require(errors.booleanOk(h2.receive(ordered, orderedOpening)), "ordered SETTINGS opening rejected")
+let maximumCredit = Bytes(); add32(maximumCredit, 2147483647); require(errors.booleanOk(h2.receive(ordered, frame(8, 0, 1, maximumCredit))), "maximum stream credit rejected")
+let oscillating = Bytes(); oscillating.add(0); oscillating.add(4); add32(oscillating, 1); oscillating.add(0); oscillating.add(4); add32(oscillating, 0)
+let overflow = h2.receive(ordered, frame(4, 0, 0, oscillating))
+require(!errors.booleanOk(overflow) && errors.nativeCode(errors.booleanError(overflow)) == 3, "ordered SETTINGS overflow was lost")
+// A peer can grant one byte of stream credit per WINDOW_UPDATE. The pending
+// response must advance without copying its remaining 800+ KiB per byte.
+let slow = h2.create()
+require(errors.booleanOk(h2.receive(slow, io.readBytesFile(processInfo.argument(0)))), "small-credit request rejected")
+require(h2.requestOk(h2.requests(slow)), "small-credit request missing")
+require(errors.booleanOk(h2.respond(slow, 1, [h2.Header { name: ":status"; value: "200" }], false)), "small-credit response failed")
+h2.takeOutgoing(slow, 1048576)
+let patterned = Bytes(); for i in 0..65536 { patterned.add(i & 255) }
+for i in 0..13 { require(errors.booleanOk(h2.write(slow, 1, patterned)), "small-credit queue rejected") }
+let oneCredit = Bytes(); for byte in [0,0,4,8,0,0,0,0,1,0,0,0,1] { oneCredit.add(byte) }
+let grants = Bytes(); for i in 0..8192 { grants.addBytes(oneCredit) }
+require(errors.booleanOk(h2.receive(slow, grants)), "small-credit updates rejected")
+let emitted = h2.takeOutgoing(slow, 1048576)
+let position = 0; let dataBytes = Bytes()
+while position + 9 <= emitted.length {
+    let size = (emitted[position] << 16) | (emitted[position + 1] << 8) | emitted[position + 2]
+    require(position + 9 + size <= emitted.length, "truncated small-credit output frame")
+    if emitted[position + 3] == 0 {
+        require(size == 1, "small-credit DATA frame has wrong length")
+        dataBytes.add(emitted[position + 9])
+    }
+    position += 9 + size
+}
+require(position == emitted.length && dataBytes.length == 8192, "small-credit DATA byte count changed")
+for i in 0..dataBytes.length { require(dataBytes[i] == i % 256, "small-credit DATA order changed") }
 print("BOUNDS OK")

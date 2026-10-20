@@ -36,6 +36,66 @@ def write_index(path, value):
     path.write_text(json.dumps(value))
 
 
+def check_atomic_registry_write(registry_cli, env, root, records):
+    public = root / "atomic-public"
+    public.mkdir()
+    victim = root / "atomic-victim.txt"
+    victim.write_text("SAFE\n")
+    gate = root / "atomic-gate"
+    os.mkfifo(gate)
+    wrapper = root / "atomic-gate.py"
+    wrapper.write_text(
+        "import os, sys\n"
+        "with open(sys.argv[1], \"rb\") as gate: gate.read(1)\n"
+        "os.execv(sys.argv[2], sys.argv[2:])\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(wrapper), str(gate), str(registry_cli), "build", str(records), str(public)],
+        env=env,
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    planted = Path(str(public / "checksums.txt") + f".tmp-{process.pid}")
+    output = ""
+    errors = ""
+    try:
+        planted.symlink_to(victim)
+        with gate.open("wb", buffering=0) as opened:
+            opened.write(b"x")
+        output, errors = process.communicate(timeout=120)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+    assert process.returncode == 0, (output, errors)
+    assert victim.read_text() == "SAFE\n", "registry build followed a planted predictable temporary symlink"
+    assert planted.is_symlink(), "registry build reused the predictable legacy temporary path"
+
+
+def check_relative_path_tool_rejection(project_cli, env, root):
+    project = root / "relative-path-project"
+    (project / "src").mkdir(parents=True)
+    (project / "Minyar.toml").write_text("[package]\nname = \"path-probe\"\nversion = \"0.1.0\"\nkind = \"bin\"\n")
+    (project / "src/main.min").write_text("print(\"path probe\")\n")
+    hostile_marker = root / "project-git-ran"
+    safe_marker = root / "safe-git-ran"
+    hostile = project / "git"
+    hostile.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(hostile_marker)!r}).write_text(\"hostile\")\nraise SystemExit(1)\n")
+    hostile.chmod(0o755)
+    safe_bin = root / "absolute-safe-bin"
+    safe_bin.mkdir()
+    safe = safe_bin / "git"
+    safe.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(safe_marker)!r}).write_text(\"safe\")\nraise SystemExit(1)\n")
+    safe.chmod(0o755)
+    child_env = dict(env, PATH=os.pathsep.join([".", "relative", str(safe_bin), env.get("PATH", "/usr/bin:/bin")]), MINYAR_HOME=str(root / "relative-path-home"))
+    result = subprocess.run([str(project_cli), "add", "github.com/Fixtures/path-probe"], env=child_env, cwd=project, text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0, (result.stdout, result.stderr)
+    assert safe_marker.exists(), "package lookup did not reach the absolute PATH tool"
+    assert not hostile_marker.exists(), "package lookup executed Git from a relative PATH entry"
+
+
 def check_credential_isolation(launcher, env, root, application):
     authorizations = []
     requests = []
@@ -142,7 +202,8 @@ def main():
         os.utime(probe, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 2000000000))
         original_index = (package / ".git/index").read_bytes()
         real_git = shutil.which("git", path=env.get("PATH"))
-        assert real_git
+        real_curl = shutil.which("curl", path=env.get("PATH"))
+        assert real_git and real_curl
         git_log = root / "git-calls.jsonl"
         git_log.write_text("")
         history_log = root / "git-history.jsonl"
@@ -171,8 +232,19 @@ if arguments[-2:] == ['cat-file', '--batch'] and any(value.startswith('--git-dir
 os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT'], *arguments])
 """)
         wrapper.chmod(0o755)
-        env.update(PATH=str(wrappers) + os.pathsep + env.get("PATH", "/usr/bin:/bin"), MINYAR_TEST_GIT_LOG=str(git_log), MINYAR_TEST_REAL_GIT=real_git)
+        curl_wrapper = wrappers / "curl"
+        curl_wrapper.write_text(f"""#!{sys.executable}
+import os, pathlib, sys
+fixture = os.environ.get('MINYAR_TEST_REGISTRY_BODY')
+if fixture:
+    sys.stdout.buffer.write(pathlib.Path(fixture).read_bytes())
+    sys.exit(0)
+os.execv(os.environ['MINYAR_TEST_REAL_CURL'], [os.environ['MINYAR_TEST_REAL_CURL'], *sys.argv[1:]])
+""")
+        curl_wrapper.chmod(0o755)
+        env.update(PATH=str(wrappers) + os.pathsep + env.get("PATH", "/usr/bin:/bin"), MINYAR_TEST_GIT_LOG=str(git_log), MINYAR_TEST_REAL_GIT=real_git, MINYAR_TEST_REAL_CURL=real_curl)
         env.update(MINYAR_TEST_HISTORY_BLOB=historical_blob, MINYAR_TEST_HISTORY_LOG=str(history_log))
+        check_relative_path_tool_rejection(registry_cli.parent / "project-cli", env, root)
 
         def blob_calls():
             return [json.loads(line) for line in git_log.read_text().splitlines() if '"cat-file"' in line]
@@ -198,6 +270,7 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
         records = root / "records"
         records.mkdir()
         (records / "lumen.json").write_text(record_text)
+        check_atomic_registry_write(registry_cli, env, root, records)
         public = root / "public"
         run([launcher, "registry", "build", records, public], env, root)
         index_path = public / "index.json"
@@ -215,6 +288,14 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
         assert "lumen" in run([launcher, "search", "light", "--registry", public], env, root)
         assert record["checksum"] in run([launcher, "info", "lumen", "--registry", public], env, root)
         run([launcher, "info", "absent", "--registry", public], env, root, "package not found")
+        for control in ("\u009b", "\u2028", "\u202e"):
+            unsafe = dict(record, description="safe" + control + "spoofed")
+            write_index(index_path, dict(index, packages=[unsafe]))
+            run([launcher, "search", "--registry", public], env, root, "terminal controls or bidi formatting")
+        readable = dict(record, description="Café library")
+        write_index(index_path, dict(index, packages=[readable]))
+        assert "Café library" in run([launcher, "search", "--registry", public], env, root)
+        index_path.write_bytes(initial)
         history = [record, dict(record, version="0.2.0"), dict(record, name="new-lumen", version="0.10.0"), dict(record, name="new-lumen", version="1.0.0")]
         write_index(index_path, dict(index, packages=history))
         information = run([launcher, "info", "lumen", "--registry", public], env, root)
@@ -250,10 +331,12 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
         fallback_marker = root / "shallow-unavailable"
         fallback_env = dict(env, MINYAR_HOME=str(root / "fallback home"), MINYAR_TEST_REJECT_SHALLOW=str(fallback_marker))
         run([launcher, "new", fallback, "--name", "fallback"], fallback_env, root)
-        run([launcher, "add", "github.com/O4FDev/lumen"], fallback_env, fallback)
-        fallback_metadata = json.loads(run([launcher, "metadata", "--locked", "--offline"], fallback_env, fallback))
-        assert fallback_marker.exists() and fallback_metadata["packages"][1]["checksum"] == record["checksum"], "hosts without shallow fetch still produce the same verified source"
-        assert json.loads(history_log.read_text().splitlines()[-1])["historical_object"]
+        fallback_manifest = (fallback / "Minyar.toml").read_bytes()
+        fallback_history = history_log.read_bytes()
+        run([launcher, "add", "github.com/O4FDev/lumen"], fallback_env, fallback, "revision not found")
+        assert fallback_marker.exists(), "the shallow-fetch rejection fixture did not run"
+        assert (fallback / "Minyar.toml").read_bytes() == fallback_manifest and not (fallback / "Minyar.lock").exists(), "a rejected bounded fetch changed the project"
+        assert history_log.read_bytes() == fallback_history, "a rejected bounded fetch downloaded historical package data"
         raced = root / "raced consumer"
         race_marker = root / "tag-raced"
         race_env = dict(env, MINYAR_HOME=str(root / "race home"), MINYAR_REGISTRY="", MINYAR_TEST_RACE_MIRROR=str(mirror), MINYAR_TEST_RACE_COMMIT=historical_commit, MINYAR_TEST_RACE_MARKER=str(race_marker))
@@ -305,6 +388,49 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
             assert request("POST", "/index.json")[0] == 405
             url = f"http://127.0.0.1:{port}"
             assert "lumen" in run([launcher, "search", "--registry", url], env, root)
+
+            def concurrent_indexes(home, label, entries):
+                bodies = []
+                for number, packages in enumerate(entries):
+                    body = root / f"{label}-index-{number}.json"
+                    write_index(body, {"schema": 1, "checksum_root": "", "packages": packages})
+                    bodies.append(body)
+                barrier = root / f"{label}-barrier"
+                barrier.mkdir()
+                processes = []
+                for body in bodies:
+                    child_env = dict(env, MINYAR_HOME=str(home), MINYAR_TEST_REGISTRY_BODY=str(body), MINYAR_TEST_REGISTRY_WITNESS_BARRIER=str(barrier))
+                    processes.append(subprocess.Popen([str(launcher), "search", "--registry", url], env=child_env, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                return [(process.returncode, output, errors) for process in processes for output, errors in [process.communicate(timeout=120)]]
+
+            left = dict(record, name="left-light", repository="github.com/Fixtures/left-light", version="0.2.0", commit="1" * 40, checksum="1" * 64)
+            right = dict(record, name="right-light", repository="github.com/Fixtures/right-light", version="0.3.0", commit="2" * 40, checksum="2" * 64)
+            raced = concurrent_indexes(Path(env["MINYAR_HOME"]), "incomparable", [[record, left], [record, right]])
+            assert all(status == 0 for status, _, _ in raced), raced
+            cache = Path(env["MINYAR_HOME"]) / "packages/indexes" / hashlib.sha256(url.encode()).hexdigest()
+            witnesses = cache / "witnesses"
+            assert len([path for path in witnesses.rglob("*") if path.is_file()]) == 3, "per-release witnesses must stay bounded by release count"
+            (cache / "index.json").write_bytes(initial)
+            offline = run([launcher, "search", "--registry", url, "--offline"], env, root)
+            assert "left-light" in offline and "right-light" in offline, "a stale concurrent pointer discarded an append-only witness"
+
+            witness = next(path for path in witnesses.rglob("*") if path.is_file())
+            saved_witness = witness.read_bytes()
+            witness.write_bytes(b"corrupt")
+            run([launcher, "search", "--registry", url, "--offline"], env, root, "checksum mismatch")
+            witness.write_bytes(saved_witness)
+            malformed = witnesses / "not-a-witness"
+            malformed.symlink_to(next(path for path in witnesses.iterdir() if path.is_dir()), target_is_directory=True)
+            run([launcher, "search", "--registry", url, "--offline"], env, root, "invalid registry witness cache entry")
+            malformed.unlink()
+
+            conflict_home = root / "conflict home"
+            conflict_env = dict(env, MINYAR_HOME=str(conflict_home))
+            assert "lumen" in run([launcher, "search", "--registry", url], conflict_env, root)
+            changed = dict(left, commit="3" * 40, checksum="3" * 64)
+            concurrent_indexes(conflict_home, "conflicting", [[record, left], [record, changed]])
+            run([launcher, "search", "--registry", url, "--offline"], conflict_env, root, "conflicting witnessed release")
+
             index = json.loads(initial)
             index["packages"] = [altered]
             write_index(index_path, index)
@@ -315,7 +441,7 @@ os.execv(os.environ['MINYAR_TEST_REAL_GIT'], [os.environ['MINYAR_TEST_REAL_GIT']
             server.wait(timeout=10)
         assert "lumen" in run([launcher, "search", "--registry", url, "--offline"], env, root)
         check_credential_isolation(launcher, env, root, application)
-        print("Registry: dry runs, batched raw blobs, immutable sums, Git verification, discovery, HTTP, offline witness, paths and credential isolation passed")
+        print("Registry: dry runs, batched raw blobs, immutable sums, Git verification, discovery, HTTP, concurrent offline witnesses, paths and credential isolation passed")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,31 @@ MINYAR_CLANG="$clang" './minyar' 'tests/erofs-layer-driver.min' -o "$work/writer
 "$clang" -std=c11 -O2 -Wall -Wextra -Werror -static 'tests/erofs-tree.c' -o "$work/tree"
 "$work/tree" create "$work/source"
 tar --format=pax --xattrs --acls --numeric-owner --owner=70000 --group=80000 -cf "$work/base.tar" -C "$work/source" .
+
+# The image budget also bounds cumulative direct, decompressed, and expanded
+# sparse layer spool bytes. RLIMIT_FSIZE makes any write past that budget fatal.
+mkdir "$work/spool-regular" "$work/spool-sparse"
+dd if=/dev/zero of="$work/spool-regular/payload" bs=1048576 count=1 status=none
+tar --format=pax -cf "$work/spool-raw.tar" -C "$work/spool-regular" payload
+gzip -9 -c "$work/spool-raw.tar" > "$work/spool.tar.gz"
+truncate -s 1048576 "$work/spool-sparse/payload"
+tar --format=gnu --sparse -cf "$work/spool-sparse.tar" -C "$work/spool-sparse" payload
+test "$(stat -c %s "$work/spool-raw.tar")" -gt 65536
+test "$(stat -c %s "$work/spool.tar.gz")" -lt 65536
+test "$(stat -c %s "$work/spool-sparse.tar")" -lt 65536
+expect_spool_limit() {
+    name=$1
+    layer=$2
+    status=0
+    (ulimit -f 128; "$work/writer" bounded "$work/$name.erofs" "$layer") > "$work/$name.log" 2>&1 || status=$?
+    if test "$status" -ne 1; then cat "$work/$name.log"; return 1; fi
+    grep -F 'erofs layers: 27 File too large' "$work/$name.log"
+    test ! -e "$work/$name.erofs"
+}
+expect_spool_limit spool-raw "$work/spool-raw.tar"
+expect_spool_limit spool-gzip "$work/spool.tar.gz"
+expect_spool_limit spool-sparse "$work/spool-sparse.tar"
+
 "$work/fixtures" "$work"
 test ! -e "$work/invalid.erofs"
 "$work/writer" none "$work/unicode.erofs" "$work/unicode.tar"

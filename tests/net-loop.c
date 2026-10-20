@@ -34,6 +34,10 @@ static void operation_failed(MinyarBytes *b) {
     assert(loop_word(b, 0) == NET_FAILURE && loop_word(b, 4));
     minyar_rc_release(b);
 }
+static void operation_failed_with_code(MinyarBytes *b, int code) {
+    assert(loop_word(b, 0) == NET_FAILURE && loop_word(b, 4) == (uint32_t)code);
+    minyar_rc_release(b);
+}
 static size_t event_count(const MinyarBytes *b) {
     assert(b->byte_length >= 8 && (b->byte_length - 8) % 32 == 0);
     assert(loop_word(b, 0) == NET_OK && !loop_word(b, 4));
@@ -327,6 +331,43 @@ static void idle_blocking_and_interrupted_deadline(void) {
     printf("idle wait: %llu ms, %.4f CPU seconds\n", (unsigned long long)elapsed, cpu_seconds);
 }
 
+static void registration_generation_boundaries(void) {
+    long long loop = result_handle(minyar_net_loopCreate());
+    long long other = result_handle(minyar_net_loopCreate());
+
+    net_loop_registration_generation = INT32_MAX - 1;
+    long long old_boundary = result_handle(minyar_net_loopTimer(loop, 100000, 0, 1));
+    assert((uint64_t)old_boundary >> NET_LOOP_REGISTRATION_SLOT_BITS == INT32_MAX);
+    operation_ok(minyar_net_loopRemove(loop, old_boundary));
+    long long beyond = result_handle(minyar_net_loopTimer(loop, 100000, 0, 2));
+    assert((uint64_t)beyond >> NET_LOOP_REGISTRATION_SLOT_BITS == (uint64_t)INT32_MAX + 1);
+    assert(((uint64_t)old_boundary & NET_LOOP_REGISTRATION_SLOT_LIMIT) ==
+           ((uint64_t)beyond & NET_LOOP_REGISTRATION_SLOT_LIMIT));
+    operation_failed(minyar_net_loopRemove(loop, old_boundary));
+    operation_failed(minyar_net_loopRemove(other, beyond));
+    operation_ok(minyar_net_loopRemove(loop, beyond));
+
+    NetLoop *state = net_loop_find(loop);
+    assert(state && state->entry_count == 1 && state->free_entry == 1);
+    size_t saved_count = state->entry_count;
+    uint32_t saved_free = state->free_entry;
+    state->entry_count = NET_LOOP_REGISTRATION_SLOT_LIMIT;
+    state->free_entry = 0;
+    operation_failed_with_code(minyar_net_loopTimer(loop, 0, 0, 3), EOVERFLOW);
+    state->entry_count = saved_count;
+    state->free_entry = saved_free;
+
+    net_loop_registration_generation = NET_LOOP_REGISTRATION_GENERATION_LIMIT - 1;
+    long long last = result_handle(minyar_net_loopTimer(loop, 100000, 0, 4));
+    assert((uint64_t)last >> NET_LOOP_REGISTRATION_SLOT_BITS ==
+           NET_LOOP_REGISTRATION_GENERATION_LIMIT);
+    operation_failed_with_code(minyar_net_loopTimer(loop, 0, 0, 5), EOVERFLOW);
+    operation_failed_with_code(minyar_net_loopTimer(other, 0, 0, 6), EOVERFLOW);
+    operation_ok(minyar_net_loopRemove(loop, last));
+    operation_ok(minyar_net_loopClose(other));
+    operation_ok(minyar_net_loopClose(loop));
+}
+
 int main(void) {
 #ifdef MINYAR_APP_EVENT_LOOP
     app_observer_contract();
@@ -336,6 +377,7 @@ int main(void) {
     socket_interest_and_ownership();
     thousands_of_sockets_and_timer_fairness();
     idle_blocking_and_interrupted_deadline();
-    puts("event loop: timers, generation safety, 2048 sockets, fairness, idle deadlines verified");
+    registration_generation_boundaries();
+    puts("event loop: timers, 40-bit generation safety, 2048 sockets, fairness, idle deadlines verified");
     return 0;
 }
