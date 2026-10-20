@@ -69,7 +69,7 @@ function setUp(root: Text, scratch: Text, serial: Integer, logs: tf.Logs): Fixtu
     let environment = support.merge(system.environment(), ["PATH=" + bin + ":" + system.getenv("PATH"), "MINYAR_CLANG=" + clang,
         "TEST_CLANG_LOG=" + log, "TEST_GLFW_INCLUDE=" + include, "LIMITED=", "SANITIZER_LIMITED="])
     environment = tf.without(environment, ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_MAKE_FLAGS", "MAKEFLAGS", "MFLAGS",
-        "MINYAR_NATIVE_FLAGS", "MINYAR_LINK_ARTIFACTS", "MINYAR_TEST_HOST_SYSTEM"])
+        "MINYAR_NATIVE_FLAGS", "MINYAR_LINK_ARTIFACTS", "MINYAR_TEST_HOST_SYSTEM", "COMPILER_LTO_CACHE_DIR", "COMPILER_LTO_CACHE_POLICY"])
     let f = Fixture { root: root; work: work; project: project; bin: bin; log: log; clang: clang; include: include;
         source: work + "/source file.min"; output: work + "/output program"; env: environment; logs: logs }
     writeClang(f, defaultClang())
@@ -295,8 +295,48 @@ function linuxBootstrapBoundsThreads(f: Fixture) {
     let call = succeeded(bootstrapEnvironment(f, [], "Linux"))
     let flags = support.shellWords(tf.lookup(call.env, "COMPILER_LTO_FLAGS"))
     let expected = ["-flto=thin", "-fuse-ld=" + support.resolve(linker, tf.next(f.logs)), "-Wl,--threads=1"]
+    for option in ["-Xlinker", "--thinlto-cache-dir=build/thinlto-cache", "-Xlinker",
+        "--thinlto-cache-policy=cache_size=10%:cache_size_bytes=1g:cache_size_files=10000:prune_after=168h:prune_interval=0s"] { expected.add(option) }
     test.check(tf.equal(flags, expected), "Linux bootstrap LTO flags " + tf.show(flags) + " expected " + tf.show(expected))
     test.check(tf.present(call.env, "LIMITED") && tf.lookup(call.env, "LIMITED") == tf.lookup(f.env, "LIMITED"), "bootstrap must keep LIMITED")
+}
+function compilerLtoCache(f: Fixture) {
+    copyFile(f.root + "/Makefile", f.project + "/Makefile", f.logs)
+    let probe = f.project + "/probe.mk"
+    io.writeTextFile(probe, "print-lto:\n\t@printf '%s\\n' $(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_FLAGS))\n")
+    let cache = f.work + "/user's LTO cache, objects"
+    let policy = "cache_size=0%:cache_size_bytes=16m:cache_size_files=12:prune_after=1h:prune_interval=0s"
+    let scenarios: List<List<Text>> = [[], ["COMPILER_LTO_CACHE_DIR="],
+        ["COMPILER_LTO_CACHE_DIR=" + cache, "COMPILER_LTO_CACHE_POLICY=" + policy],
+        ["COMPILER_LTO_FLAGS="], ["COMPILER_LTO_FLAGS=  -flto=thin  '-fuse-ld=/custom path/ld.lld'  "],
+        ["LLVM_FLAGS=-O2 -fuse-ld=gold"], ["LLVM_FLAGS=-O2 -fuse-ld=lld --ld-path=/custom/linker"],
+        ["LLVM_FLAGS=-O2 -fuse-ld=lld -Wl,--threads=3"]]
+    for index in 0..scenarios.length {
+        let extras = scenarios[index]
+        let call = succeeded(bootstrapEnvironment(f, extras, "Linux"))
+        let actual = tf.lookup(call.env, "COMPILER_LTO_FLAGS")
+        let flags = support.shellWords(actual)
+        let environment = tf.without(f.env, ["COMPILER_LTO_FLAGS", "LLVM_FLAGS"])
+        environment = support.merge(environment, extras)
+        environment = support.merge(environment, ["LLVM_CC=" + f.clang, "MINYAR_TEST_HOST_SYSTEM=Linux"])
+        let made = run(f, ["make", "-s", "-C", f.project, "-f", "Makefile", "-f", probe, "print-lto"], environment, 10)
+        test.check(made.status == 0 && made.output == actual + "\n", "Make and bootstrap flags differ for case " + Text(index) + "\n" + made.output + made.errorOutput + "\n" + actual)
+        if index == 0 { test.check(support.has(flags, "--thinlto-cache-dir=build/thinlto-cache"), "default compiler cache is enabled") }
+        if index == 1 || index >= 3 { test.check(!containsAny(flags, "--thinlto-cache"), "disabled or custom compiler links must not gain cache flags") }
+        if index == 2 {
+            test.check(support.has(flags, "--thinlto-cache-dir=" + cache), "cache path is one literal argument, including apostrophe, comma and spaces")
+            test.check(support.has(flags, "--thinlto-cache-policy=" + policy), "explicit cache policy reaches lld unchanged")
+        }
+        if index == 3 || index == 4 { test.check(actual == tf.lookup(extras, "COMPILER_LTO_FLAGS"), "explicit LTO flags remain byte-for-byte unchanged") }
+        if index == 5 || index == 6 || index == 7 { test.check(tf.equal(flags, ["-flto=thin"]), "custom linker options stay under user control") }
+    }
+    for host in ["Darwin", "Windows"] {
+        tf.executable(f.bin + "/uname", "printf '%s\\n' " + support.shellQuote(host) + "\n", f.logs)
+        let environment = tf.without(f.env, ["COMPILER_LTO_FLAGS", "LLVM_FLAGS"])
+        environment = support.merge(environment, ["LLVM_CC=/unused/clang", "SDKROOT=explicit SDK"])
+        let made = run(f, ["make", "-s", "-C", f.project, "-f", "Makefile", "-f", probe, "print-lto"], environment, 10)
+        test.check(made.status == 0 && made.output == "-flto=thin\n", host + " Make defaults must remain unchanged\n" + made.output + made.errorOutput)
+    }
 }
 function linuxBootstrapRejectsLinker(f: Fixture) {
     let linker = f.work + "/ld.lld"
@@ -381,6 +421,7 @@ function elfThreadsStayOut(f: Fixture) {
     for host in ["Darwin", "Windows"] {
         let call = succeeded(bootstrapEnvironment(f, [], host))
         test.check(!test.contains(tf.lookup(call.env, "COMPILER_LTO_FLAGS"), "--threads"), host + " bootstrap must not add ELF linker threads: " + tf.lookup(call.env, "COMPILER_LTO_FLAGS"))
+        test.check(!test.contains(tf.lookup(call.env, "COMPILER_LTO_FLAGS"), "--thinlto-cache"), host + " bootstrap must not add ELF cache options")
     }
 }
 function incrementalWindows(f: Fixture) {
@@ -747,6 +788,7 @@ function macosCiRelease(f: Fixture) {
 
 let names = ["test_xcode_sdk_discovery_preserves_explicit_overrides", "test_cached_llvm_discovery_preserves_overrides_and_version_checks", "test_concurrent_cold_launches_share_a_complete_bootstrap", "test_selected_clang_bootstraps_both_c_and_llvm",
     "test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths", "test_linux_bootstrap_rejects_old_or_missing_matching_linker",
+    "test_compiler_lto_cache_defaults_overrides_and_make_bootstrap_parity",
     "test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged", "test_bootstrap_rejects_malformed_make_options_before_make",
     "test_bootstrap_assume_old_keeps_compiler_and_rebuilds_current_runtime", "test_windows_release_discovers_native_lld_exe_without_changing_explicit_linker",
     "test_bootstrap_preserves_explicit_limits_lto_and_linker_threads", "test_elf_thread_option_stays_out_of_apple_and_windows_bootstrap",
@@ -778,6 +820,7 @@ for name in names {
     else if name == "test_selected_clang_bootstraps_both_c_and_llvm" { selectedClangBootstrapsBoth(f) }
     else if name == "test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths" { linuxBootstrapBoundsThreads(f) }
     else if name == "test_linux_bootstrap_rejects_old_or_missing_matching_linker" { linuxBootstrapRejectsLinker(f) }
+    else if name == "test_compiler_lto_cache_defaults_overrides_and_make_bootstrap_parity" { compilerLtoCache(f) }
     else if name == "test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged" { makeOptionsLiteral(f) }
     else if name == "test_bootstrap_rejects_malformed_make_options_before_make" { malformedMakeOptions(f) }
     else if name == "test_bootstrap_assume_old_keeps_compiler_and_rebuilds_current_runtime" { assumeOldKeepsCompiler(f) }
