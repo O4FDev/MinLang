@@ -94,6 +94,30 @@ for item in named {
         test.check(frames == item.frames, "recursion stops at exactly twelve trace frames")
     }
 }
+let parallelSource = "let output = Bytes(256)\nlet divisor = 0\nparallel for index in 0..256 {\n    output[index] = 0\n    if index == 128 { output[index] = 1 / divisor }\n}\n"
+test.require(test.compile(compiler, parallelSource), "compile outlined worker source trace")
+let parallelPath = compiler.directory + "/case" + Text(compiler.serial)
+test.check(files.remove(parallelPath + ".min") == 0, "worker source trace survives removal of the original file")
+let parallelLevels = ["-O0", "-O2"]
+if !test.addressEnabled(compiler.flags) { parallelLevels.add("LTO") }
+for level in parallelLevels {
+    let command = [compiler.clang]
+    if level == "LTO" { command.add("-O2"); command.add("-flto=thin") } else { command.add(level) }
+    for flag in compiler.flags { command.add(flag) }
+    for part in ["-Wno-override-module", parallelPath + ".ll", compiler.runtime, "-pthread", "-lm", "-o", parallelPath + ".exe"] { command.add(part) }
+    test.require(test.run(command, system.environment(), "", parallelPath + ".link", 60), "link outlined worker source trace " + level)
+    for threads in ["1", "2"] {
+        let environment: List<Text> = []
+        for entry in system.environment() { if !entry.startsWith("MINYAR_PARALLEL_THREADS=") { environment.add(entry) } }
+        environment.add("MINYAR_PARALLEL_THREADS=" + threads)
+        let result = test.run([parallelPath + ".exe"], environment, "", parallelPath + ".run", 10)
+        let message = "Minyar stopped: an Integer cannot be divided by zero.\n"
+        let firstFrame = "Minyar stack trace:\n  at parallel loop (" + parallelPath + ".min:3:1)\n    | parallel for index in 0..256 {\n"
+        test.check(result.status == 1 && result.output == "", "outlined worker preserves failure status/stdout " + level + " " + threads)
+        test.check(test.runtimeDiagnostic(result.errorOutput) == message, "outlined worker preserves its exact diagnostic and valid trace " + level + " " + threads + "\n" + result.errorOutput)
+        test.check(result.errorOutput.startsWith(message + firstFrame), "independent first-frame worker source oracle " + level + " " + threads + "\n" + result.errorOutput)
+    }
+}
 let visibleHead = "    function portrait(): Integer { fail(\"The harbour has no light.\") } //     ���"
 let expectedExcerpt = visibleHead
 for index in visibleHead.length..159 { expectedExcerpt += "灯" }
